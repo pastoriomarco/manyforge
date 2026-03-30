@@ -28,8 +28,8 @@ class ExecutionStateMachine {
   Result<void> try_transition(ExecutionState new_state);
 
   /// Reset the state machine to kIdle.
-  /// Only valid from terminal states (kStopped, kCompleted, kFailed).
-  /// @return Result<void> - Ok() on success, Err(kInvalidStateTransition) if not in terminal state.
+  /// Valid from ANY non-Idle state (spec 230 §6.3).
+  /// @return Result<void> - Ok() on success, Err(kInvalidStateTransition) if already Idle.
   Result<void> reset();
 
   /// Get the current execution status.

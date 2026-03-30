@@ -10,58 +10,42 @@
 
 namespace manyforge::core {
 
-/// Stop types per ADR-0005.
-/// Soft: controller decelerates over a duration, then stops.
-/// Hard: controller halts immediately.
 enum class StopType { kSoft, kHard };
 
-/// Policy layer for stop/pause/resume operations.
-/// Wraps the ExecutionStateMachine and adds higher-level semantics:
-///   - Soft stop with scheduler-based deceleration timing
-///   - Hard stop with immediate halt (cancels pending soft stop)
-///   - Cache invalidation on any stop
-///   - Thread-safe stop request tracking
-/// ADR-0005: Kernel owns stop/pause semantics.
+/// Policy layer for stop/pause/resume/reset operations.
 class StopPolicy {
  public:
   using CacheInvalidationCallback = std::function<void()>;
   using StopCallback = std::function<void()>;
 
-  /// @param sm The state machine to drive.
-  /// @param scheduler Scheduler for deferred soft-stop completion.
-  /// @param clock Clock for computing deceleration deadlines.
-  /// @param on_invalidate Called when cache should be invalidated (on any stop).
   StopPolicy(ExecutionStateMachine& sm, IScheduler& scheduler, IClock& clock,
              CacheInvalidationCallback on_invalidate = nullptr);
 
-  /// Request a soft stop with deceleration.
-  /// From kExecuting: transitions to kStopping, schedules deferred kStopped.
-  /// From kPaused: transitions to kStopping then kStopped immediately
-  ///   (no deceleration needed when already stationary).
-  /// Triggers cache invalidation.
-  /// @param deceleration_ns Duration before completing the stop.
-  /// @return Ok on success, Err if transition is invalid.
+  /// Soft stop with deceleration.
+  /// From Executing: Executing → Stopping, schedules deferred Stopped.
+  /// From Paused: Paused → Stopping → Stopped immediately.
+  /// From Planning/Validating: direct → Stopped.
   Result<void> request_soft_stop(Duration deceleration_ns);
 
-  /// Request a hard stop (immediate halt).
-  /// Cancels any pending soft stop. Transitions to kStopping then kStopped.
-  /// Also valid from kStopping (to upgrade a soft stop to hard).
-  /// Triggers cache invalidation.
-  /// @return Ok on success, Err if transition is invalid.
+  /// Hard stop (immediate halt). Cancels pending soft stop.
+  /// From Executing/Paused: → Stopping → Stopped.
+  /// From Stopping: upgrades soft → hard (immediate Stopped).
+  /// From Planning/Validating: direct → Stopped.
   Result<void> request_hard_stop();
 
-  /// Request pause (kExecuting -> kPaused).
-  /// @return Ok on success, Err if transition is invalid.
+  /// Pause. Only from Executing.
+  /// Executing → Stopping → Paused (controlled deceleration via scheduler).
   Result<void> request_pause();
 
-  /// Resume from pause (kPaused -> kExecuting).
-  /// @return Ok on success, Err if transition is invalid.
+  /// Resume. Paused → Validating (re-validates before resuming).
   Result<void> request_resume();
 
-  /// Set a callback fired when any stop completes (soft or hard).
-  void set_stop_callback(StopCallback callback);
+  /// Reset to Idle. Valid from any non-Idle state.
+  /// From terminal states: direct → Idle.
+  /// From active states: stops first, then → Idle.
+  Result<void> request_reset();
 
-  /// Check if a stop has been requested (kStopping or kStopped).
+  void set_stop_callback(StopCallback callback);
   bool stop_requested() const;
 
  private:

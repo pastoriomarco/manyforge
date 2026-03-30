@@ -1,108 +1,260 @@
 #pragma once
 
+#include <map>
 #include <string>
 #include <variant>
+#include <optional>
+#include <stdexcept>
 
 namespace manyforge::core {
 
-/// Error codes for fallible operations throughout manyforge_core.
-/// ADR-0002: DTOs and error handling in core, no exceptions.
-enum class ErrorCode {
-  kSuccess = 0,
-
-  // Planning errors (100-199)
-  kPlanningFailed = 100,
-  kPlanningTimeout = 101,
-  kInvalidRequest = 102,
-  kNoSolution = 103,
-  kConstraintViolation = 104,
-
-  // Execution errors (200-299)
-  kExecutionFailed = 200,
-  kExecutionTimeout = 201,
-  kControllerUnavailable = 202,
-  kTrajectoryRejected = 203,
-
-  // Collision errors (300-399)
-  kCollisionDetected = 300,
-  kPreExecuteCollision = 301,
-
-  // Scene errors (400-499)
-  kSceneUnavailable = 400,
-  kSceneStale = 401,
-
-  // State errors (500-599)
-  kInvalidStateTransition = 500,
-  kNotIdle = 501,
-  kAlreadyStopped = 502,
-
-  // Cache errors (600-699)
-  kCacheMiss = 600,
-
-  // Internal errors (900-999)
-  kInternalError = 900,
+/// Error DTO (spec §5.1)
+struct ErrorDTO {
+    std::string code;
+    std::string message;
+    std::map<std::string, std::string> details;
 };
 
-/// Convert ErrorCode to a human-readable string.
+/// Error code enum (spec §5.2)
+enum class ErrorCode {
+    kSuccess,
+    kInvalidRequest,
+    kMissingReference,
+    kAmbiguousReference,
+    kUnsupportedCapability,
+    kPlanningFailed,
+    kPlanningTimeout,
+    kIkFailed,
+    kCartesianIncomplete,
+    kStartStateMismatch,
+    kValidationCollision,
+    kValidationLimitsViolation,
+    kObjectAlreadyExists,
+    kObjectNotFound,
+    kExecutionRejected,
+    kExecutionAborted,
+    kExecutionTimeout,
+    kStopFailed,
+    kPauseFailed,
+    kResumeFailed,
+    kResetFailed,
+    kInternalError,
+    kInvariantViolation,
+    kInvalidStateTransition,
+    kCacheMiss,
+    kCollisionDetected
+};
+
 inline const char* to_string(ErrorCode code) {
-  switch (code) {
-    case ErrorCode::kSuccess: return "Success";
-    case ErrorCode::kPlanningFailed: return "PlanningFailed";
-    case ErrorCode::kPlanningTimeout: return "PlanningTimeout";
-    case ErrorCode::kInvalidRequest: return "InvalidRequest";
-    case ErrorCode::kNoSolution: return "NoSolution";
-    case ErrorCode::kConstraintViolation: return "ConstraintViolation";
-    case ErrorCode::kExecutionFailed: return "ExecutionFailed";
-    case ErrorCode::kExecutionTimeout: return "ExecutionTimeout";
-    case ErrorCode::kControllerUnavailable: return "ControllerUnavailable";
-    case ErrorCode::kTrajectoryRejected: return "TrajectoryRejected";
-    case ErrorCode::kCollisionDetected: return "CollisionDetected";
-    case ErrorCode::kPreExecuteCollision: return "PreExecuteCollision";
-    case ErrorCode::kSceneUnavailable: return "SceneUnavailable";
-    case ErrorCode::kSceneStale: return "SceneStale";
-    case ErrorCode::kInvalidStateTransition: return "InvalidStateTransition";
-    case ErrorCode::kNotIdle: return "NotIdle";
-    case ErrorCode::kAlreadyStopped: return "AlreadyStopped";
-    case ErrorCode::kCacheMiss: return "CacheMiss";
-    case ErrorCode::kInternalError: return "InternalError";
-  }
-  return "Unknown";
+    switch (code) {
+        case ErrorCode::kSuccess: return "Success";
+        case ErrorCode::kInvalidRequest: return "InvalidRequest";
+        case ErrorCode::kMissingReference: return "MissingReference";
+        case ErrorCode::kAmbiguousReference: return "AmbiguousReference";
+        case ErrorCode::kUnsupportedCapability: return "UnsupportedCapability";
+        case ErrorCode::kPlanningFailed: return "PlanningFailed";
+        case ErrorCode::kPlanningTimeout: return "PlanningTimeout";
+        case ErrorCode::kIkFailed: return "IkFailed";
+        case ErrorCode::kCartesianIncomplete: return "CartesianIncomplete";
+        case ErrorCode::kStartStateMismatch: return "StartStateMismatch";
+        case ErrorCode::kValidationCollision: return "ValidationCollision";
+        case ErrorCode::kValidationLimitsViolation: return "ValidationLimitsViolation";
+        case ErrorCode::kObjectAlreadyExists: return "ObjectAlreadyExists";
+        case ErrorCode::kObjectNotFound: return "ObjectNotFound";
+        case ErrorCode::kExecutionRejected: return "ExecutionRejected";
+        case ErrorCode::kExecutionAborted: return "ExecutionAborted";
+        case ErrorCode::kExecutionTimeout: return "ExecutionTimeout";
+        case ErrorCode::kStopFailed: return "StopFailed";
+        case ErrorCode::kPauseFailed: return "PauseFailed";
+        case ErrorCode::kResumeFailed: return "ResumeFailed";
+        case ErrorCode::kResetFailed: return "ResetFailed";
+        case ErrorCode::kInternalError: return "InternalError";
+        case ErrorCode::kInvariantViolation: return "InvariantViolation";
+        case ErrorCode::kInvalidStateTransition: return "InvalidStateTransition";
+        case ErrorCode::kCacheMiss: return "CacheMiss";
+        case ErrorCode::kCollisionDetected: return "CollisionDetected";
+        default: return "Unknown";
+    }
 }
 
-/// Result type for fallible operations.
-/// Holds either a value of type T or an ErrorCode.
-/// ADR-0002: no exceptions in core; use Result<T> instead.
+/// Result type for fallible operations (spec §5)
 template <typename T>
-class Result {
- public:
-  static Result Ok(T value) { return Result(std::move(value)); }
-  static Result Err(ErrorCode code) { return Result(code); }
+struct Result {
+private:
+    std::optional<T> value_;
+    std::optional<ErrorDTO> error_;
 
-  bool ok() const { return std::holds_alternative<T>(data_); }
-  ErrorCode error() const { return std::get<ErrorCode>(data_); }
-  const T& value() const { return std::get<T>(data_); }
-  T& value() { return std::get<T>(data_); }
+public:
+    /// Create a successful result
+    static Result Ok(const T& val) {
+        Result r;
+        r.value_ = val;
+        return r;
+    }
 
- private:
-  explicit Result(T value) : data_(std::move(value)) {}
-  explicit Result(ErrorCode code) : data_(code) {}
+    static Result Ok(T&& val) {
+        Result r;
+        r.value_ = std::move(val);
+        return r;
+    }
 
-  std::variant<T, ErrorCode> data_;
+    /// Create an error result
+    static Result Err(const ErrorDTO& err) {
+        Result r;
+        r.error_ = err;
+        return r;
+    }
+
+    static Result Err(ErrorDTO&& err) {
+        Result r;
+        r.error_ = std::move(err);
+        return r;
+    }
+
+    /// Create an error result from ErrorCode
+    static Result Err(ErrorCode code) {
+        Result r;
+        r.error_ = ErrorDTO{std::string(to_string(code)), "", {}};
+        return r;
+    }
+
+    /// Check if result is ok
+    bool ok() const {
+        return value_.has_value();
+    }
+
+    /// Get the value (throws if error)
+    T& value() {
+        if (!value_.has_value()) {
+            throw std::runtime_error("Called value() on error Result");
+        }
+        return *value_;
+    }
+
+    const T& value() const {
+        if (!value_.has_value()) {
+            throw std::runtime_error("Called value() on error Result");
+        }
+        return *value_;
+    }
+
+    /// Get the error (throws if ok)
+    ErrorDTO& error() {
+        if (!error_.has_value()) {
+            throw std::runtime_error("Called error() on ok Result");
+        }
+        return *error_;
+    }
+
+    const ErrorDTO& error() const {
+        if (!error_.has_value()) {
+            throw std::runtime_error("Called error() on ok Result");
+        }
+        return *error_;
+    }
+
+    /// Get value or default
+    T value_or(T default_val) const {
+        if (value_.has_value()) {
+            return *value_;
+        }
+        return default_val;
+    }
 };
 
-/// Specialization for void results (success/failure with no value).
+// Specialization for void results
 template <>
-class Result<void> {
- public:
-  static Result Ok() { return Result(ErrorCode::kSuccess); }
-  static Result Err(ErrorCode code) { return Result(code); }
+struct Result<void> {
+private:
+    bool ok_;
+    ErrorDTO error_;
 
-  bool ok() const { return code_ == ErrorCode::kSuccess; }
-  ErrorCode error() const { return code_; }
+public:
+    /// Create a successful result
+    static Result Ok() {
+        Result r;
+        r.ok_ = true;
+        return r;
+    }
 
- private:
-  explicit Result(ErrorCode code) : code_(code) {}
-  ErrorCode code_;
+    /// Create an error result
+    static Result Err(const ErrorDTO& err) {
+        Result r;
+        r.ok_ = false;
+        r.error_ = err;
+        return r;
+    }
+
+    static Result Err(ErrorDTO&& err) {
+        Result r;
+        r.ok_ = false;
+        r.error_ = std::move(err);
+        return r;
+    }
+
+    /// Create an error result from ErrorCode
+    static Result Err(ErrorCode code) {
+        Result r;
+        r.ok_ = false;
+        r.error_ = ErrorDTO{std::string(to_string(code)), "", {}};
+        return r;
+    }
+
+    /// Check if result is ok
+    bool ok() const {
+        return ok_;
+    }
+
+    /// Get the error (throws if ok)
+    ErrorDTO& error() {
+        if (ok_) {
+            throw std::runtime_error("Called error() on ok Result");
+        }
+        return error_;
+    }
+
+    const ErrorDTO& error() const {
+        if (ok_) {
+            throw std::runtime_error("Called error() on ok Result");
+        }
+        return error_;
+    }
 };
+
+/// Error code string constants (spec §5.2)
+
+// Request / capability
+inline const char* kErrorInvalidRequest = "invalid_request";
+inline const char* kErrorMissingReference = "missing_reference";
+inline const char* kErrorAmbiguousReference = "ambiguous_reference";
+inline const char* kErrorUnsupportedCapability = "unsupported_capability";
+
+// Planning
+inline const char* kErrorPlanningFailed = "planning_failed";
+inline const char* kErrorPlanningTimeout = "planning_timeout";
+inline const char* kErrorIkFailed = "ik_failed";
+inline const char* kErrorCartesianIncomplete = "cartesian_incomplete";
+
+// Validation (pre-execution gate)
+inline const char* kErrorStartStateMismatch = "start_state_mismatch";
+inline const char* kErrorValidationCollision = "validation_collision";
+inline const char* kErrorValidationLimitsViolation = "validation_limits_violation";
+
+// Scene editing
+inline const char* kErrorObjectAlreadyExists = "object_already_exists";
+inline const char* kErrorObjectNotFound = "object_not_found";
+
+// Execution
+inline const char* kErrorExecutionRejected = "execution_rejected";
+inline const char* kErrorExecutionAborted = "execution_aborted";
+inline const char* kErrorExecutionTimeout = "execution_timeout";
+inline const char* kErrorStopFailed = "stop_failed";
+inline const char* kErrorPauseFailed = "pause_failed";
+inline const char* kErrorResumeFailed = "resume_failed";
+inline const char* kErrorResetFailed = "reset_failed";
+
+// Internal
+inline const char* kErrorInternalError = "internal_error";
+inline const char* kErrorInvariantViolation = "invariant_violation";
 
 }  // namespace manyforge::core

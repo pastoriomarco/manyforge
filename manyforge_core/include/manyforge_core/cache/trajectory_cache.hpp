@@ -1,57 +1,46 @@
 #pragma once
 
-#include <list>
+#include <deque>
 #include <mutex>
+#include <optional>
+#include <string>
 #include <unordered_map>
 
 #include <manyforge_core/cache/cache_policy.hpp>
-#include <manyforge_core/time/iclock.hpp>
-#include <manyforge_core/types/error_code.hpp>
 #include <manyforge_core/types/trajectory_dto.hpp>
 
 namespace manyforge::core {
 
-/// Bounded, scene-aware trajectory cache with LRU eviction and TTL.
-/// ADR-0008: deterministic invalidation on scene change, collision, or stop.
+/// Trajectory cache keyed by move_id (spec 230 §3.1).
+/// One trajectory per move_id. No LRU, no TTL.
+/// Thread-safe.
 class TrajectoryCache {
  public:
-  explicit TrajectoryCache(IClock& clock, CacheConfig config = {});
+  explicit TrajectoryCache(CacheConfig config = {});
 
-  /// Look up a cached trajectory.
-  /// @return Ok(trajectory) on hit, Err(kCacheMiss) on miss or expiry.
-  Result<TrajectoryDTO> lookup(const CacheKey& key);
+  /// Store trajectory for a move_id (overwrites existing).
+  void store(const std::string& move_id, TrajectoryDTO trajectory);
 
-  /// Store a trajectory in the cache.
-  /// Evicts LRU entry if at capacity.
-  void store(const CacheKey& key, TrajectoryDTO trajectory);
+  /// Look up trajectory by move_id.
+  std::optional<TrajectoryDTO> lookup(const std::string& move_id) const;
 
-  /// Remove all entries with scene_version != current_version.
-  /// ADR-0008: scene version change invalidates stale entries.
-  void invalidate_for_scene(uint64_t current_scene_version);
+  /// Invalidate a specific move_id entry.
+  void invalidate(const std::string& move_id);
 
-  /// Remove all entries. Called on stop/collision.
+  /// Remove all entries.
   void invalidate_all();
 
-  /// Current number of entries.
+  /// Number of cached entries.
   size_t size() const;
 
-  /// Maximum number of entries (from config).
+  /// Max entries (safety bound).
   size_t capacity() const;
 
  private:
-  struct CacheEntry {
-    TrajectoryDTO trajectory;
-    TimePoint stored_at;
-    std::list<CacheKey>::iterator lru_iter;
-  };
-
-  void evict_lru();
-
-  IClock& clock_;
   CacheConfig config_;
   mutable std::mutex mutex_;
-  std::list<CacheKey> lru_order_;
-  std::unordered_map<CacheKey, CacheEntry, CacheKeyHash> entries_;
+  std::unordered_map<std::string, TrajectoryDTO> entries_;
+  std::deque<std::string> insertion_order_;  // for FIFO eviction
 };
 
 }  // namespace manyforge::core

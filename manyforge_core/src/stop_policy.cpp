@@ -10,55 +10,53 @@ StopPolicy::StopPolicy(ExecutionStateMachine& sm, IScheduler& scheduler, IClock&
 Result<void> StopPolicy::request_soft_stop(Duration deceleration_ns) {
     auto current = sm_.status().state;
 
-    if (current == ExecutionState::kExecuting) {
-        auto result = sm_.try_transition(ExecutionState::kStopping);
+    // From Planning or Validating: direct to Stopped (cancel in-flight).
+    if (current == ExecutionState::kPlanning || current == ExecutionState::kValidating) {
+        auto result = sm_.try_transition(ExecutionState::kStopped);
         if (!result.ok()) return result;
-
         {
             std::lock_guard<std::mutex> lock(mutex_);
             stop_requested_ = true;
         }
+        if (on_invalidate_) on_invalidate_();
+        if (stop_callback_) stop_callback_();
+        return Result<void>::Ok();
+    }
 
-        if (on_invalidate_) {
-            on_invalidate_();
+    // From Executing: decelerate via scheduler.
+    if (current == ExecutionState::kExecuting) {
+        auto result = sm_.try_transition(ExecutionState::kStopping);
+        if (!result.ok()) return result;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stop_requested_ = true;
         }
+        if (on_invalidate_) on_invalidate_();
 
         auto deadline = clock_.now() + deceleration_ns;
         ScheduleHandle handle = scheduler_.schedule(deadline, [this]() {
             sm_.try_transition(ExecutionState::kStopped);
-            if (stop_callback_) {
-                stop_callback_();
-            }
+            if (stop_callback_) stop_callback_();
         });
-
         {
             std::lock_guard<std::mutex> lock(mutex_);
             pending_soft_stop_ = handle;
         }
-
         return Result<void>::Ok();
     }
 
+    // From Paused: no deceleration needed, stop immediately.
     if (current == ExecutionState::kPaused) {
-        // Already stationary — no deceleration needed, stop immediately.
         auto result = sm_.try_transition(ExecutionState::kStopping);
         if (!result.ok()) return result;
-
         {
             std::lock_guard<std::mutex> lock(mutex_);
             stop_requested_ = true;
         }
-
-        if (on_invalidate_) {
-            on_invalidate_();
-        }
-
+        if (on_invalidate_) on_invalidate_();
         auto result2 = sm_.try_transition(ExecutionState::kStopped);
         if (!result2.ok()) return result2;
-
-        if (stop_callback_) {
-            stop_callback_();
-        }
+        if (stop_callback_) stop_callback_();
         return Result<void>::Ok();
     }
 
@@ -66,9 +64,7 @@ Result<void> StopPolicy::request_soft_stop(Duration deceleration_ns) {
 }
 
 Result<void> StopPolicy::request_hard_stop() {
-    auto current = sm_.status().state;
-
-    // Cancel any pending soft stop deceleration.
+    // Cancel any pending soft stop.
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (pending_soft_stop_ != 0) {
@@ -77,17 +73,26 @@ Result<void> StopPolicy::request_hard_stop() {
         }
     }
 
-    if (current == ExecutionState::kStopping) {
-        // Already stopping (from soft stop) — complete immediately.
+    auto current = sm_.status().state;
+
+    // From Planning or Validating: direct to Stopped.
+    if (current == ExecutionState::kPlanning || current == ExecutionState::kValidating) {
         auto result = sm_.try_transition(ExecutionState::kStopped);
         if (!result.ok()) return result;
-    } else if (current == ExecutionState::kExecuting ||
-               current == ExecutionState::kPaused) {
+    }
+    // From Stopping: upgrade soft → hard (immediate Stopped).
+    else if (current == ExecutionState::kStopping) {
+        auto result = sm_.try_transition(ExecutionState::kStopped);
+        if (!result.ok()) return result;
+    }
+    // From Executing or Paused: → Stopping → Stopped.
+    else if (current == ExecutionState::kExecuting || current == ExecutionState::kPaused) {
         auto result = sm_.try_transition(ExecutionState::kStopping);
         if (!result.ok()) return result;
         auto result2 = sm_.try_transition(ExecutionState::kStopped);
         if (!result2.ok()) return result2;
-    } else {
+    }
+    else {
         return Result<void>::Err(ErrorCode::kInvalidStateTransition);
     }
 
@@ -95,22 +100,51 @@ Result<void> StopPolicy::request_hard_stop() {
         std::lock_guard<std::mutex> lock(mutex_);
         stop_requested_ = true;
     }
-
-    if (on_invalidate_) {
-        on_invalidate_();
-    }
-    if (stop_callback_) {
-        stop_callback_();
-    }
+    if (on_invalidate_) on_invalidate_();
+    if (stop_callback_) stop_callback_();
     return Result<void>::Ok();
 }
 
 Result<void> StopPolicy::request_pause() {
-    return sm_.try_transition(ExecutionState::kPaused);
+    auto current = sm_.status().state;
+    if (current != ExecutionState::kExecuting) {
+        return Result<void>::Err(ErrorCode::kInvalidStateTransition);
+    }
+
+    // Executing → Stopping (deceleration), then scheduler fires → Paused.
+    auto result = sm_.try_transition(ExecutionState::kStopping);
+    if (!result.ok()) return result;
+
+    auto deadline = clock_.now();
+    scheduler_.schedule(deadline, [this]() {
+        sm_.try_transition(ExecutionState::kPaused);
+    });
+
+    return Result<void>::Ok();
 }
 
 Result<void> StopPolicy::request_resume() {
-    return sm_.try_transition(ExecutionState::kExecuting);
+    // Paused → Validating (re-validates before resuming).
+    return sm_.try_transition(ExecutionState::kValidating);
+}
+
+Result<void> StopPolicy::request_reset() {
+    auto current = sm_.status().state;
+    if (current == ExecutionState::kIdle) {
+        return Result<void>::Err(ErrorCode::kInvalidStateTransition);
+    }
+
+    // Cancel any pending operations.
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (pending_soft_stop_ != 0) {
+            scheduler_.cancel(pending_soft_stop_);
+            pending_soft_stop_ = 0;
+        }
+        stop_requested_ = false;
+    }
+
+    return sm_.reset();
 }
 
 void StopPolicy::set_stop_callback(StopCallback callback) {

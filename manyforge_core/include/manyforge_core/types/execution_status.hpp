@@ -7,11 +7,11 @@
 
 namespace manyforge::core {
 
-/// Execution state machine states.
-/// ADR-0005: Kernel owns the state machine; BT/HMI observe via status.
+/// Execution state machine states (spec §3.10)
 enum class ExecutionState {
   kIdle,
   kPlanning,
+  kValidating,  // pre-execution validation phase
   kExecuting,
   kPaused,
   kStopping,
@@ -24,6 +24,7 @@ inline const char* to_string(ExecutionState state) {
   switch (state) {
     case ExecutionState::kIdle: return "Idle";
     case ExecutionState::kPlanning: return "Planning";
+    case ExecutionState::kValidating: return "Validating";
     case ExecutionState::kExecuting: return "Executing";
     case ExecutionState::kPaused: return "Paused";
     case ExecutionState::kStopping: return "Stopping";
@@ -34,8 +35,13 @@ inline const char* to_string(ExecutionState state) {
   return "Unknown";
 }
 
-/// Structured execution status published by the Kernel.
-/// ADR-0005: Kernel publishes structured status/events.
+/// Cache mode for trajectory caching (spec §3.1)
+enum class CacheMode {
+  kDefault,  // kernel MAY use and populate the trajectory cache
+  kDisable,   // kernel MUST NOT read from or write to the trajectory cache
+};
+
+/// Structured execution status published by the Kernel (spec §3.10)
 struct ExecutionStatus {
   ExecutionState state = ExecutionState::kIdle;
 

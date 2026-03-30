@@ -8,16 +8,32 @@ ExecutionStateMachine::ExecutionStateMachine(IClock& clock, TransitionCallback o
     status_.last_transition_ns = clock_.now();
 }
 
+// Spec 230 §6.3 — complete state transition table.
 bool ExecutionStateMachine::is_valid_transition(ExecutionState from, ExecutionState to) const {
     switch (from) {
-        case ExecutionState::kIdle: return to == ExecutionState::kPlanning;
-        case ExecutionState::kPlanning: return to == ExecutionState::kExecuting || to == ExecutionState::kFailed;
+        case ExecutionState::kIdle:
+            return to == ExecutionState::kPlanning ||
+                   to == ExecutionState::kValidating;  // cache hit
+        case ExecutionState::kPlanning:
+            return to == ExecutionState::kValidating ||
+                   to == ExecutionState::kFailed ||
+                   to == ExecutionState::kStopped;  // stop cancels in-flight
+        case ExecutionState::kValidating:
+            return to == ExecutionState::kExecuting ||
+                   to == ExecutionState::kFailed ||
+                   to == ExecutionState::kStopped;  // stop cancels in-flight
         case ExecutionState::kExecuting:
-            return to == ExecutionState::kPaused || to == ExecutionState::kStopping ||
-                   to == ExecutionState::kCompleted || to == ExecutionState::kFailed;
-        case ExecutionState::kPaused: return to == ExecutionState::kExecuting || to == ExecutionState::kStopping;
-        case ExecutionState::kStopping: return to == ExecutionState::kStopped;
-        default: return false;
+            return to == ExecutionState::kStopping ||
+                   to == ExecutionState::kCompleted ||
+                   to == ExecutionState::kFailed;
+        case ExecutionState::kPaused:
+            return to == ExecutionState::kValidating ||  // resume re-validates
+                   to == ExecutionState::kStopping;
+        case ExecutionState::kStopping:
+            return to == ExecutionState::kStopped ||
+                   to == ExecutionState::kPaused;  // deceleration complete from pause
+        default:
+            return false;
     }
 }
 
@@ -42,9 +58,7 @@ Result<void> ExecutionStateMachine::try_transition(ExecutionState new_state) {
 
 Result<void> ExecutionStateMachine::reset() {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (current_state_ != ExecutionState::kStopped &&
-        current_state_ != ExecutionState::kCompleted &&
-        current_state_ != ExecutionState::kFailed) {
+    if (current_state_ == ExecutionState::kIdle) {
         return Result<void>::Err(ErrorCode::kInvalidStateTransition);
     }
     do_transition(ExecutionState::kIdle);

@@ -1,78 +1,54 @@
 #include <manyforge_core/cache/trajectory_cache.hpp>
 
+#include <algorithm>
+
 namespace manyforge::core {
 
-TrajectoryCache::TrajectoryCache(IClock& clock, CacheConfig config)
-    : clock_(clock), config_(config) {}
+TrajectoryCache::TrajectoryCache(CacheConfig config)
+    : config_(config) {}
 
-Result<TrajectoryDTO> TrajectoryCache::lookup(const CacheKey& key) {
+void TrajectoryCache::store(const std::string& move_id, TrajectoryDTO trajectory) {
   std::lock_guard<std::mutex> lock(mutex_);
 
-  auto it = entries_.find(key);
-  if (it == entries_.end()) {
-    return Result<TrajectoryDTO>::Err(ErrorCode::kCacheMiss);
-  }
-
-  // Check TTL
-  if (config_.ttl_ns > 0) {
-    auto age = clock_.now() - it->second.stored_at;
-    if (age > config_.ttl_ns) {
-      lru_order_.erase(it->second.lru_iter);
-      entries_.erase(it);
-      return Result<TrajectoryDTO>::Err(ErrorCode::kCacheMiss);
-    }
-  }
-
-  // Move to front of LRU
-  lru_order_.erase(it->second.lru_iter);
-  lru_order_.push_front(key);
-  it->second.lru_iter = lru_order_.begin();
-
-  return Result<TrajectoryDTO>::Ok(it->second.trajectory);
-}
-
-void TrajectoryCache::store(const CacheKey& key, TrajectoryDTO trajectory) {
-  std::lock_guard<std::mutex> lock(mutex_);
-
-  auto it = entries_.find(key);
+  auto it = entries_.find(move_id);
   if (it != entries_.end()) {
-    // Update existing entry
-    it->second.trajectory = std::move(trajectory);
-    it->second.stored_at = clock_.now();
-    lru_order_.erase(it->second.lru_iter);
-    lru_order_.push_front(key);
-    it->second.lru_iter = lru_order_.begin();
+    it->second = std::move(trajectory);
     return;
   }
 
-  // Evict if at capacity
-  while (entries_.size() >= config_.max_entries && !entries_.empty()) {
-    evict_lru();
+  // Evict oldest if at capacity (FIFO).
+  while (entries_.size() >= config_.max_entries && !insertion_order_.empty()) {
+    entries_.erase(insertion_order_.front());
+    insertion_order_.pop_front();
   }
 
-  lru_order_.push_front(key);
-  entries_.insert(
-      {key, CacheEntry{std::move(trajectory), clock_.now(), lru_order_.begin()}});
+  entries_.emplace(move_id, std::move(trajectory));
+  insertion_order_.push_back(move_id);
 }
 
-void TrajectoryCache::invalidate_for_scene(uint64_t current_scene_version) {
+std::optional<TrajectoryDTO> TrajectoryCache::lookup(const std::string& move_id) const {
   std::lock_guard<std::mutex> lock(mutex_);
+  auto it = entries_.find(move_id);
+  if (it == entries_.end()) {
+    return std::nullopt;
+  }
+  return it->second;
+}
 
-  auto it = entries_.begin();
-  while (it != entries_.end()) {
-    if (it->first.scene_version != current_scene_version) {
-      lru_order_.erase(it->second.lru_iter);
-      it = entries_.erase(it);
-    } else {
-      ++it;
+void TrajectoryCache::invalidate(const std::string& move_id) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (entries_.erase(move_id) > 0) {
+    auto it = std::find(insertion_order_.begin(), insertion_order_.end(), move_id);
+    if (it != insertion_order_.end()) {
+      insertion_order_.erase(it);
     }
   }
 }
 
 void TrajectoryCache::invalidate_all() {
   std::lock_guard<std::mutex> lock(mutex_);
-  lru_order_.clear();
   entries_.clear();
+  insertion_order_.clear();
 }
 
 size_t TrajectoryCache::size() const {
@@ -82,13 +58,6 @@ size_t TrajectoryCache::size() const {
 
 size_t TrajectoryCache::capacity() const {
   return config_.max_entries;
-}
-
-void TrajectoryCache::evict_lru() {
-  if (lru_order_.empty()) return;
-  auto oldest_key = lru_order_.back();
-  lru_order_.pop_back();
-  entries_.erase(oldest_key);
 }
 
 }  // namespace manyforge::core

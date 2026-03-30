@@ -1,67 +1,53 @@
 #pragma once
 
 #include <functional>
-#include <map>
 #include <mutex>
 
 #include <manyforge_core/stop_policy.hpp>
-#include <manyforge_core/types/collision_event.hpp>
 #include <manyforge_core/types/error_code.hpp>
+#include <manyforge_core/types/validation.hpp>
 
 namespace manyforge::core {
 
-/// Configured response for a given collision severity.
-/// ADR-0009: collision response policy is explicit and configurable.
+/// Configurable collision response (spec 230 §6.3).
+/// Collision is binary — in_collision or not. No severity levels.
 struct CollisionResponse {
-  bool should_stop = true;
   StopType stop_type = StopType::kHard;
-  Duration deceleration_ns = 100'000'000;  ///< 100ms default for soft stops.
+  Duration deceleration_ns = 0;
   bool invalidate_cache = true;
-  ErrorCode error_code = ErrorCode::kCollisionDetected;
 };
 
 /// Policy layer for collision response.
-/// ADR-0009: on collision -> apply configured stop mode, invalidate cache,
-/// emit event.
+/// On collision: trigger stop + cache invalidation + emit error.
 class CollisionPolicy {
  public:
   using CacheInvalidationCallback = std::function<void()>;
-  using CollisionEventCallback =
-      std::function<void(const CollisionEvent&, const CollisionResponse&)>;
+  using CollisionEventCallback = std::function<void(const CollisionCheckResultDTO&)>;
 
-  /// @param stop_policy The stop policy to drive on collision.
-  /// @param invalidate_cache Called to invalidate the trajectory cache.
-  /// @param on_collision Called after handling each collision event.
   explicit CollisionPolicy(
       StopPolicy& stop_policy,
       CacheInvalidationCallback invalidate_cache = nullptr,
       CollisionEventCallback on_collision = nullptr);
 
-  /// Set the response for a given severity level.
-  void set_response(CollisionSeverity severity, CollisionResponse response);
+  void set_response(CollisionResponse response);
+  CollisionResponse get_response() const;
 
-  /// Get the configured response for a given severity level.
-  CollisionResponse get_response(CollisionSeverity severity) const;
+  /// Handle runtime collision detection (during execution monitoring).
+  /// If in_collision: triggers stop + cache invalidation + callback.
+  /// If not in_collision: no-op, returns Ok.
+  Result<void> handle_collision(const CollisionCheckResultDTO& check);
 
-  /// Handle a collision event. Applies the configured response policy:
-  /// stops if configured, invalidates cache if configured, fires callback.
-  /// @return Ok on success (or no-stop warning), Err if stop transition fails.
-  Result<void> handle_collision(const CollisionEvent& event);
-
-  /// Pre-execution collision check. If a collision is present, blocks
-  /// execution by returning an error.
-  /// @param event Pointer to a collision event, or nullptr if none.
-  /// @return Ok if no collision, Err(kCollisionDetected) if collision present.
-  Result<void> pre_execute_check(const CollisionEvent* event);
+  /// Pre-execution collision gate.
+  /// If in_collision: returns Err(kValidationCollision).
+  /// If not: returns Ok.
+  Result<void> pre_execute_check(const CollisionCheckResultDTO& check);
 
  private:
-  CollisionResponse default_response(CollisionSeverity severity) const;
-
   StopPolicy& stop_policy_;
   CacheInvalidationCallback invalidate_cache_;
   CollisionEventCallback on_collision_;
   mutable std::mutex mutex_;
-  std::map<CollisionSeverity, CollisionResponse> responses_;
+  CollisionResponse response_;
 };
 
 }  // namespace manyforge::core
