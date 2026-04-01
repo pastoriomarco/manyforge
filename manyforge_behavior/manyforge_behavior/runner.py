@@ -49,15 +49,18 @@ class OrchestratorRunner:
         program_path: str,
         kernel: KernelClient,
         overrides: Optional[dict[str, Any]] = None,
+        deployment_path: Optional[str] = None,
     ):
         self._catalog_path = catalog_path
         self._program_path = program_path
         self._kernel = kernel
         self._overrides = overrides or {}
+        self._deployment_path = deployment_path
         self._catalog: Optional[NodeCatalog] = None
         self._program: Optional[Program] = None
         self._resolver: Optional[ParameterResolver] = None
         self._tree: Optional[py_trees.trees.BehaviourTree] = None
+        self._deployment: Optional["Deployment"] = None
 
     def load(self) -> None:
         """Load catalog, program, validate, set up parameter resolver."""
@@ -67,6 +70,12 @@ class OrchestratorRunner:
             self._program.get_parameter_defaults(),
             self._overrides,
         )
+
+        # Load and validate deployment if provided
+        if self._deployment_path:
+            from manyforge_behavior.deployment import Deployment
+            self._deployment = Deployment(self._deployment_path)
+            self._deployment.validate_against_program(self._program)
 
     def build_tree(self) -> py_trees.trees.BehaviourTree:
         """Build a py_trees BehaviourTree from the loaded program."""
@@ -91,6 +100,11 @@ class OrchestratorRunner:
         bb.group_id = self._program.robot.group_id
         bb.base_frame = self._program.robot.base_frame
         bb.tcp_frame = self._program.robot.tcp_frame
+
+        # Write global TCP speed cap from deployment if available
+        if self._deployment:
+            bb.register_key(key="global_max_tcp_linear_speed_mps", access=py_trees.common.Access.WRITE)
+            bb.global_max_tcp_linear_speed_mps = self._deployment.robot_config.global_max_tcp_linear_speed_mps
 
         self._tree = tree
         return tree
@@ -140,6 +154,10 @@ class OrchestratorRunner:
     @property
     def program(self) -> Optional[Program]:
         return self._program
+
+    @property
+    def deployment(self) -> Optional["Deployment"]:
+        return self._deployment
 
     def _build_node(self, tree_node: TreeNode) -> py_trees.behaviour.Behaviour:
         """Recursively build a py_trees node from a TreeNode."""

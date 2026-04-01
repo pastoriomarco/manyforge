@@ -12,6 +12,9 @@ CATALOG_PATH = str(Path(__file__).parent.parent / "resources" / "node_catalog.ya
 FIXTURE_PATH = str(
     Path(__file__).parent / "fixtures" / "pick_and_place.program.yaml"
 )
+DEPLOYMENT_FIXTURE = str(
+    Path(__file__).parent / "fixtures" / "test.deployment.yaml"
+)
 
 
 @pytest.fixture(autouse=True)
@@ -119,3 +122,67 @@ class TestRunnerExecution:
         runner.build_tree()
         result = runner.run(max_ticks=0)
         assert result is False
+
+
+class TestRunnerDeployment:
+    def test_load_with_deployment(self, kernel):
+        """Runner loads deployment and validates against program."""
+        runner = OrchestratorRunner(
+            CATALOG_PATH, FIXTURE_PATH, kernel,
+            deployment_path=DEPLOYMENT_FIXTURE)
+        runner.load()
+        assert runner.deployment is not None
+        assert runner.deployment.robot_config.global_max_tcp_linear_speed_mps == 0.25
+
+    def test_deployment_profile_mismatch_raises(self, kernel):
+        """Deployment with wrong profile raises during load."""
+        import tempfile
+        import yaml
+        data = {
+            "api_version": "manyforge.deployment.v0",
+            "schema_version": "0.1.0",
+            "name": "bad",
+            "program_profile": "v99.0",  # mismatch
+            "robot_config": {
+                "robot_id": "ur5", "group_id": "arm",
+                "urdf_path": "test.urdf",
+                "global_max_tcp_linear_speed_mps": 0.25,
+            },
+            "adapters": {
+                "planning": {"adapter_id": "p", "adapter_version": "0.1.0", "config": {}},
+                "context": {"adapter_id": "c", "adapter_version": "0.1.0", "config": {}},
+                "execution": {"adapter_id": "e", "adapter_version": "0.1.0", "config": {}},
+            },
+            "orchestrator": {"engine": "py_trees", "config": {}},
+            "launch": {"runner": {"module": "m", "args": []}},
+        }
+        f = tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False)
+        yaml.dump(data, f)
+        f.close()
+        runner = OrchestratorRunner(
+            CATALOG_PATH, FIXTURE_PATH, kernel,
+            deployment_path=f.name)
+        from manyforge_behavior.deployment import DeploymentValidationError
+        with pytest.raises(DeploymentValidationError):
+            runner.load()
+        import os
+        os.unlink(f.name)
+
+    def test_global_tcp_speed_on_blackboard(self, kernel):
+        """After build_tree with deployment, global TCP speed is on blackboard."""
+        runner = OrchestratorRunner(
+            CATALOG_PATH, FIXTURE_PATH, kernel,
+            deployment_path=DEPLOYMENT_FIXTURE)
+        runner.load()
+        runner.build_tree()
+        bb = py_trees.blackboard.Client(name="test_tcp")
+        bb.register_key(key="global_max_tcp_linear_speed_mps",
+                        access=py_trees.common.Access.READ)
+        assert bb.global_max_tcp_linear_speed_mps == 0.25
+
+    def test_runner_without_deployment_still_works(self, kernel):
+        """Existing behavior unchanged when no deployment_path."""
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        runner.load()
+        assert runner.deployment is None
+        runner.build_tree()  # Should not raise

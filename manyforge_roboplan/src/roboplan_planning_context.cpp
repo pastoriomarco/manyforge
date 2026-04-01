@@ -2,6 +2,8 @@
 
 #include <Eigen/Dense>
 #include <cmath>
+#include <map>
+#include <string>
 #include <variant>
 
 namespace manyforge::roboplan_backend {
@@ -26,10 +28,11 @@ core::RobotStateDTO RoboPlanPlanningContext::get_current_state() {
 
 core::ValidationResultDTO RoboPlanPlanningContext::validate_trajectory(
     const core::TrajectoryDTO& trajectory,
-    const core::ValidationOptionsDTO& /*options*/) {
+    const core::ValidationOptionsDTO& options) {
   core::ValidationResultDTO result;
 
   try {
+    // Collision check at each waypoint.
     for (const auto& wp : trajectory.waypoints) {
       Eigen::VectorXd q(wp.positions_rad.size());
       for (size_t i = 0; i < wp.positions_rad.size(); ++i) {
@@ -42,6 +45,47 @@ core::ValidationResultDTO RoboPlanPlanningContext::validate_trajectory(
         return result;
       }
     }
+
+    // TCP linear speed limit check (spec 230 §3.3, ADR-0015).
+    if (options.max_tcp_linear_speed_mps > 0.0 &&
+        !options.tcp_frame.empty() && trajectory.waypoints.size() >= 2) {
+      Eigen::Vector3d prev_pos;
+      bool have_prev = false;
+
+      for (size_t i = 0; i < trajectory.waypoints.size(); ++i) {
+        const auto& wp = trajectory.waypoints[i];
+        Eigen::VectorXd q(wp.positions_rad.size());
+        for (size_t j = 0; j < wp.positions_rad.size(); ++j) {
+          q[j] = wp.positions_rad[j];
+        }
+
+        Eigen::Matrix4d tform = scene_->forwardKinematics(q, options.tcp_frame);
+        Eigen::Vector3d pos = tform.block<3, 1>(0, 3);
+
+        if (have_prev && i > 0) {
+          double dt = wp.time_from_start_s -
+                      trajectory.waypoints[i - 1].time_from_start_s;
+          if (dt > 1e-9) {
+            double speed = (pos - prev_pos).norm() / dt;
+            if (speed > options.max_tcp_linear_speed_mps) {
+              std::map<std::string, std::string> details;
+              details["limit_type"] = "tcp_linear_speed";
+              details["measured"] = std::to_string(speed);
+              details["limit"] = std::to_string(options.max_tcp_linear_speed_mps);
+              details["units"] = "m/s";
+              result.error = core::ErrorDTO{
+                  core::kErrorValidationLimitsViolation,
+                  "TCP linear speed exceeds limit", details};
+              return result;
+            }
+          }
+        }
+
+        prev_pos = pos;
+        have_prev = true;
+      }
+    }
+
     result.valid = true;
   } catch (const std::exception& e) {
     result.error = core::ErrorDTO{core::kErrorInternalError, e.what(), {}};

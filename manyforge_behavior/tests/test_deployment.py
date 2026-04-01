@@ -1,0 +1,296 @@
+"""Tests for deployment artifact loading and validation."""
+
+import os
+import tempfile
+from pathlib import Path
+
+import pytest
+import yaml
+
+from manyforge_behavior.catalog import NodeCatalog
+from manyforge_behavior.deployment import (
+    Deployment,
+    DeploymentValidationError,
+)
+from manyforge_behavior.program import Program
+
+CATALOG_PATH = Path(__file__).parent.parent / "resources" / "node_catalog.yaml"
+DEPLOYMENT_FIXTURE_PATH = (
+    Path(__file__).parent / "fixtures" / "ur5_roboplan.deployment.yaml"
+)
+PROGRAM_FIXTURE_PATH = (
+    Path(__file__).parent / "fixtures" / "pick_and_place.program.yaml"
+)
+
+
+@pytest.fixture
+def catalog():
+    return NodeCatalog(CATALOG_PATH)
+
+
+def _minimal_tree() -> dict:
+    """A minimal valid tree that passes catalog validation."""
+    return {
+        "id": "sequence",
+        "name": "root",
+        "children": [
+            {
+                "id": "set_key_bool_value",
+                "name": "noop",
+                "params": {"key": "done", "value": True},
+            }
+        ],
+    }
+
+
+def _write_deployment(data: dict) -> str:
+    f = tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False)
+    yaml.dump(data, f)
+    f.close()
+    return f.name
+
+
+def _minimal_deployment(**overrides) -> dict:
+    deploy = {
+        "api_version": "manyforge.deployment.v0",
+        "schema_version": "0.1.0",
+        "name": "test_deployment",
+        "program_profile": "v0.0",
+        "robot_config": {
+            "robot_id": "ur5",
+            "group_id": "arm",
+            "urdf_path": "package://test.urdf",
+            "global_max_tcp_linear_speed_mps": 0.5,
+        },
+        "adapters": {
+            "planning": {
+                "adapter_id": "planning.test",
+                "adapter_version": "0.1.0",
+                "config": {},
+            },
+            "context": {
+                "adapter_id": "context.test",
+                "adapter_version": "0.1.0",
+                "config": {},
+            },
+            "execution": {
+                "adapter_id": "execution.test",
+                "adapter_version": "0.1.0",
+                "config": {},
+            },
+        },
+        "orchestrator": {
+            "engine": "py_trees",
+            "config": {},
+        },
+        "launch": {
+            "runner": {
+                "module": "manyforge_behavior.runner",
+                "args": [],
+            },
+        },
+    }
+    deploy.update(overrides)
+    return deploy
+
+
+class TestDeploymentLoading:
+    def test_load_valid_deployment(self):
+        deploy = Deployment(DEPLOYMENT_FIXTURE_PATH)
+        assert deploy.name == "ur5_roboplan_local"
+        assert deploy.description == "Local deployment with RoboPlan planner and ros2_control JTC."
+        assert deploy.api_version == "manyforge.deployment.v0"
+        assert deploy.schema_version == "0.1.0"
+        assert deploy.program_profile == "v0.0"
+
+    def test_all_fields_parsed(self):
+        deploy = Deployment(DEPLOYMENT_FIXTURE_PATH)
+        assert deploy.name == "ur5_roboplan_local"
+        assert deploy.description == "Local deployment with RoboPlan planner and ros2_control JTC."
+        assert deploy.api_version == "manyforge.deployment.v0"
+        assert deploy.schema_version == "0.1.0"
+        assert deploy.program_profile == "v0.0"
+        assert deploy.robot_config is not None
+        assert len(deploy.adapters) == 3
+        assert deploy.orchestrator is not None
+        assert deploy.launch is not None
+
+    def test_robot_config_parsed(self):
+        deploy = Deployment(DEPLOYMENT_FIXTURE_PATH)
+        assert deploy.robot_config.robot_id == "ur5"
+        assert deploy.robot_config.group_id == "arm"
+        assert deploy.robot_config.urdf_path == "package://roboplan_example_models/models/ur_robot_model/ur5_gripper.urdf"
+        assert deploy.robot_config.srdf_path == "package://roboplan_example_models/models/ur_robot_model/ur5_gripper.srdf"
+        assert deploy.robot_config.global_max_tcp_linear_speed_mps == 0.25
+
+    def test_adapters_parsed(self):
+        deploy = Deployment(DEPLOYMENT_FIXTURE_PATH)
+        assert "planning" in deploy.adapters
+        assert "context" in deploy.adapters
+        assert "execution" in deploy.adapters
+        assert deploy.adapters["planning"].adapter_id == "planning.roboplan"
+        assert deploy.adapters["planning"].adapter_version == "0.1.0"
+        assert deploy.adapters["planning"].config["rng_seed"] == 12345
+        assert deploy.adapters["context"].adapter_id == "planning.roboplan_context"
+        assert deploy.adapters["execution"].adapter_id == "execution.ros2_control_fjt"
+
+    def test_orchestrator_parsed(self):
+        deploy = Deployment(DEPLOYMENT_FIXTURE_PATH)
+        assert deploy.orchestrator.engine == "py_trees"
+        assert deploy.orchestrator.config == {}
+
+    def test_launch_parsed(self):
+        deploy = Deployment(DEPLOYMENT_FIXTURE_PATH)
+        assert deploy.launch.runner.module == "manyforge_behavior.runner"
+        assert deploy.launch.runner.args == []
+        assert deploy.launch.ui_backend is not None
+        assert deploy.launch.ui_backend.module == "manyforge_hmi.backend"
+        assert deploy.launch.ui_backend.enabled is True
+
+
+class TestDeploymentValidation:
+    def test_invalid_api_version(self):
+        path = _write_deployment(_minimal_deployment(api_version="wrong"))
+        with pytest.raises(DeploymentValidationError, match="api_version"):
+            Deployment(path)
+        os.unlink(path)
+
+    def test_missing_program_profile(self):
+        path = _write_deployment(_minimal_deployment(program_profile=""))
+        with pytest.raises(DeploymentValidationError, match="program_profile"):
+            Deployment(path)
+        os.unlink(path)
+
+    def test_missing_robot_config(self):
+        data = _minimal_deployment()
+        del data["robot_config"]
+        path = _write_deployment(data)
+        with pytest.raises(DeploymentValidationError, match="robot_config"):
+            Deployment(path)
+        os.unlink(path)
+
+    def test_missing_adapter_slot(self):
+        data = _minimal_deployment()
+        del data["adapters"]["planning"]
+        path = _write_deployment(data)
+        with pytest.raises(DeploymentValidationError, match="adapters.planning"):
+            Deployment(path)
+        os.unlink(path)
+
+    def test_missing_adapter_id(self):
+        data = _minimal_deployment()
+        del data["adapters"]["planning"]["adapter_id"]
+        path = _write_deployment(data)
+        with pytest.raises(DeploymentValidationError, match="adapter_id"):
+            Deployment(path)
+        os.unlink(path)
+
+    def test_negative_tcp_speed(self):
+        data = _minimal_deployment()
+        data["robot_config"]["global_max_tcp_linear_speed_mps"] = -1.0
+        path = _write_deployment(data)
+        with pytest.raises(DeploymentValidationError, match="global_max_tcp_linear_speed_mps"):
+            Deployment(path)
+        os.unlink(path)
+
+    def test_zero_tcp_speed(self):
+        data = _minimal_deployment()
+        data["robot_config"]["global_max_tcp_linear_speed_mps"] = 0.0
+        path = _write_deployment(data)
+        with pytest.raises(DeploymentValidationError, match="global_max_tcp_linear_speed_mps"):
+            Deployment(path)
+        os.unlink(path)
+
+    def test_optional_description(self):
+        data = _minimal_deployment()
+        del data["name"]
+        path = _write_deployment(data)
+        deploy = Deployment(path)
+        assert deploy.name == ""
+        os.unlink(path)
+
+    def test_optional_srdf_path(self):
+        data = _minimal_deployment()
+        # srdf_path is not in minimal deployment, so it should default to ""
+        path = _write_deployment(data)
+        deploy = Deployment(path)
+        assert deploy.robot_config.srdf_path == ""
+        os.unlink(path)
+
+    def test_optional_ui_backend(self):
+        data = _minimal_deployment()
+        # ui_backend is not in minimal deployment, so it should be None
+        path = _write_deployment(data)
+        deploy = Deployment(path)
+        assert deploy.launch.ui_backend is None
+        os.unlink(path)
+
+
+class TestCrossArtifactValidation:
+    def test_validate_against_program_success(self, catalog):
+        deploy = Deployment(DEPLOYMENT_FIXTURE_PATH)
+        prog = Program(PROGRAM_FIXTURE_PATH, catalog)
+        deploy.validate_against_program(prog)
+
+    def test_validate_profile_mismatch(self, catalog):
+        deploy = Deployment(DEPLOYMENT_FIXTURE_PATH)
+        data = {
+            "api_version": "manyforge.program.v0",
+            "program_profile": "v0.1",  # different from deployment
+            "name": "test",
+            "catalog_version": "0.1.0",
+            "robot": {
+                "robot_id": "ur5",
+                "group_id": "arm",
+                "base_frame": "base_link",
+                "tcp_frame": "tool0",
+            },
+            "tree": _minimal_tree(),
+        }
+        path = _write_deployment(data)
+        prog = Program(path, catalog)
+        with pytest.raises(DeploymentValidationError, match="program_profile"):
+            deploy.validate_against_program(prog)
+        os.unlink(path)
+
+    def test_validate_robot_id_mismatch(self, catalog):
+        deploy = Deployment(DEPLOYMENT_FIXTURE_PATH)
+        data = {
+            "api_version": "manyforge.program.v0",
+            "program_profile": "v0.0",
+            "name": "test",
+            "catalog_version": "0.1.0",
+            "robot": {
+                "robot_id": "ur10",  # different from deployment
+                "group_id": "arm",
+                "base_frame": "base_link",
+                "tcp_frame": "tool0",
+            },
+            "tree": _minimal_tree(),
+        }
+        path = _write_deployment(data)
+        prog = Program(path, catalog)
+        with pytest.raises(DeploymentValidationError, match="robot_id"):
+            deploy.validate_against_program(prog)
+        os.unlink(path)
+
+    def test_validate_group_id_mismatch(self, catalog):
+        deploy = Deployment(DEPLOYMENT_FIXTURE_PATH)
+        data = {
+            "api_version": "manyforge.program.v0",
+            "program_profile": "v0.0",
+            "name": "test",
+            "catalog_version": "0.1.0",
+            "robot": {
+                "robot_id": "ur5",
+                "group_id": "manipulator",  # different from deployment
+                "base_frame": "base_link",
+                "tcp_frame": "tool0",
+            },
+            "tree": _minimal_tree(),
+        }
+        path = _write_deployment(data)
+        prog = Program(path, catalog)
+        with pytest.raises(DeploymentValidationError, match="group_id"):
+            deploy.validate_against_program(prog)
+        os.unlink(path)

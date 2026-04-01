@@ -261,5 +261,77 @@ class TestNativeBenchmark:
         print(f"  Native C++: {elapsed*1000:.0f}ms total, {elapsed/n*1000:.1f}ms/move")
 
 
+# ============================================================================
+# Native kernel: TCP speed enforcement
+# ============================================================================
+
+class TestTcpSpeedEnforcement:
+
+    def _make_speed_limited_request(self, move_id, goal, tcp_speed_mps,
+                                      cache_mode="default"):
+        return ExecuteRequest(
+            robot_id="robot1",
+            group_id="arm",
+            move_id=move_id,
+            base_frame="base_link",
+            tcp_frame="tool0",
+            motion_type="joint_goal",
+            joint_goal_names=UR5_JOINTS,
+            joint_goal_positions_rad=goal,
+            velocity_scale=1.0,
+            acceleration_scale=1.0,
+            max_tcp_linear_speed_mps=tcp_speed_mps,
+            planning_timeout_s=10.0,
+            execution_timeout_s=30.0,
+            cache_mode=cache_mode,
+        )
+
+    def test_speed_limited_succeeds(self, native_kernel):
+        """Plan with TCP speed limit succeeds."""
+        req = self._make_speed_limited_request("tcp_limit", GOAL_A, 0.25)
+        result = native_kernel.execute(req)
+        assert result.ok is True
+
+    def test_speed_limited_slower_than_unlimited(self, native_kernel):
+        """Speed-limited trajectory takes longer than unlimited."""
+        # Unlimited (use default cache so we can read trajectory duration)
+        r1 = native_kernel.execute(make_request("tcp_fast", GOAL_A))
+        assert r1.ok is True
+        t_unlimited = r1.trajectory_duration_s
+        assert t_unlimited is not None and t_unlimited > 0
+        native_kernel.reset()
+
+        # Speed-limited (0.10 m/s is very restrictive)
+        req = self._make_speed_limited_request("tcp_slow", GOAL_A, 0.10)
+        r2 = native_kernel.execute(req)
+        assert r2.ok is True
+        t_limited = r2.trajectory_duration_s
+        assert t_limited is not None and t_limited > 0
+
+        print(f"\n=== TCP Speed Enforcement ===")
+        print(f"  Unlimited traj duration: {t_unlimited:.3f}s")
+        print(f"  Limited (0.10 m/s) traj duration: {t_limited:.3f}s")
+        assert t_limited > t_unlimited, \
+            f"Limited trajectory ({t_limited:.3f}s) should be slower than unlimited ({t_unlimited:.3f}s)"
+
+    def test_no_limit_when_zero(self, native_kernel):
+        """TCP speed = 0 means no limit (same as no field)."""
+        req = self._make_speed_limited_request("tcp_zero_a", GOAL_A, 0.0)
+        r1 = native_kernel.execute(req)
+        assert r1.ok is True
+        t_zero = r1.trajectory_duration_s
+        assert t_zero is not None
+        native_kernel.reset()
+
+        r2 = native_kernel.execute(make_request("tcp_none_a", GOAL_A))
+        assert r2.ok is True
+        t_none = r2.trajectory_duration_s
+        assert t_none is not None
+
+        # Should be approximately the same (both unlimited)
+        assert abs(t_zero - t_none) < 0.01, \
+            f"Zero limit ({t_zero:.3f}s) should match no limit ({t_none:.3f}s)"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "--tb=short", "-s"])

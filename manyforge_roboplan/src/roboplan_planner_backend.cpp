@@ -97,21 +97,77 @@ core::PlanResultDTO RoboPlanPlannerBackend::plan(const core::PlanRequestDTO& req
     // Shortcut the path
     auto smoothed_path = shortcutter_->shortcut(path_result.value(), 0.05);
 
-    // Time-parameterize with TOPPRA
-    auto traj_result = toppra_->generate(
-        smoothed_path, 0.01,
-        roboplan::SplineFittingMode::Hermite,
-        request.speed_profile.velocity_scale,
-        request.speed_profile.acceleration_scale);
+    // Time-parameterize with TOPPRA, enforcing TCP speed limit if set.
+    // Iteratively reduce velocity_scale until TCP linear speed is within bounds.
+    const double tcp_limit = request.speed_profile.max_tcp_linear_speed_mps.value_or(0.0);
+    const std::string& tcp_frame = request.tcp_frame;
+    double vel_scale = request.speed_profile.velocity_scale;
+    constexpr int kMaxTcpIterations = 5;
+    constexpr double kTcpSpeedMargin = 0.99;  // aim slightly under the limit
 
-    if (!traj_result.has_value()) {
-      result.error = core::ErrorDTO{core::kErrorPlanningFailed,
-                                     "TOPPRA failed: " + traj_result.error(), {}};
-      return result;
+    roboplan::JointTrajectory final_traj;
+
+    for (int iter = 0; iter < kMaxTcpIterations; ++iter) {
+      auto traj_result = toppra_->generate(
+          smoothed_path, 0.01,
+          roboplan::SplineFittingMode::Hermite,
+          vel_scale,
+          request.speed_profile.acceleration_scale);
+
+      if (!traj_result.has_value()) {
+        result.error = core::ErrorDTO{core::kErrorPlanningFailed,
+                                       "TOPPRA failed: " + traj_result.error(), {}};
+        return result;
+      }
+
+      final_traj = traj_result.value();
+
+      // If no TCP speed limit, accept on first pass
+      if (tcp_limit <= 0.0 || tcp_frame.empty()) {
+        break;
+      }
+
+      // Compute max TCP linear speed across trajectory segments
+      double max_tcp_speed = 0.0;
+      Eigen::Vector3d prev_pos;
+      bool have_prev = false;
+
+      for (size_t i = 0; i < final_traj.times.size(); ++i) {
+        Eigen::Matrix4d tform = scene_->forwardKinematics(
+            final_traj.positions[i], tcp_frame);
+        Eigen::Vector3d pos = tform.block<3, 1>(0, 3);
+
+        if (have_prev && i > 0) {
+          double dt = final_traj.times[i] - final_traj.times[i - 1];
+          if (dt > 1e-9) {
+            double speed = (pos - prev_pos).norm() / dt;
+            if (speed > max_tcp_speed) {
+              max_tcp_speed = speed;
+            }
+          }
+        }
+
+        prev_pos = pos;
+        have_prev = true;
+      }
+
+      // If within limit, done
+      if (max_tcp_speed <= tcp_limit) {
+        break;
+      }
+
+      // Scale down proportionally: new_scale = old_scale * (limit / actual)
+      double ratio = (tcp_limit * kTcpSpeedMargin) / max_tcp_speed;
+      vel_scale *= ratio;
+
+      // Clamp to a reasonable minimum
+      if (vel_scale < 0.001) {
+        vel_scale = 0.001;
+      }
     }
 
     // Convert to TrajectoryDTO
-    result.trajectory = convert_trajectory(traj_result.value());
+    result.trajectory = convert_trajectory(final_traj);
 
   } catch (const std::exception& e) {
     result.error = core::ErrorDTO{core::kErrorPlanningFailed, e.what(), {}};

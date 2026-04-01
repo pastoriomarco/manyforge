@@ -66,6 +66,15 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
         // Speed profile
         req.speed_profile.velocity_scale = request.attr("get")("velocity_scale", 1.0).cast<double>();
         req.speed_profile.acceleration_scale = request.attr("get")("acceleration_scale", 1.0).cast<double>();
+        if (request.contains("max_tcp_linear_speed_mps")) {
+          auto val = request["max_tcp_linear_speed_mps"];
+          if (!val.is_none()) {
+            double tcp_speed = val.cast<double>();
+            if (tcp_speed > 0.0) {
+              req.speed_profile.max_tcp_linear_speed_mps = tcp_speed;
+            }
+          }
+        }
 
         // Timeouts
         req.timeouts.planning_timeout_s = request.attr("get")("planning_timeout_s", 5.0).cast<double>();
@@ -93,7 +102,16 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
         }
 
         auto result = self.kernel->execute(req);
-        return result_to_python(result);
+        auto d = result_to_python(result);
+        // Include trajectory duration for speed enforcement tests
+        if (result.ok()) {
+          auto cached = self.cache->lookup(req.move_id);
+          if (cached.has_value() && !cached->waypoints.empty()) {
+            d["trajectory_duration_s"] = cached->waypoints.back().time_from_start_s;
+            d["trajectory_waypoint_count"] = static_cast<int>(cached->waypoints.size());
+          }
+        }
+        return d;
       })
       .def("stop", [](NativeKernelBundle& self) -> py::dict {
         auto r = self.kernel->stop();

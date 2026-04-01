@@ -60,6 +60,8 @@ class ExecuteResult:
     ok: bool = False
     execution_id: int = 0
     error: Optional[str] = None
+    trajectory_duration_s: Optional[float] = None
+    trajectory_waypoint_count: Optional[int] = None
 
 
 @dataclass

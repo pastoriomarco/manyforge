@@ -1,0 +1,43 @@
+api_version: manyforge.deployment.v0
+schema_version: "0.1.0"
+name: ur5_roboplan_local
+description: Local deployment with RoboPlan planner and ros2_control JTC.
+
+program_profile: v0.0
+
+robot_config:
+  robot_id: ur5
+  group_id: arm
+  urdf_path: package://roboplan_example_models/models/ur_robot_model/ur5_gripper.urdf
+  srdf_path: package://roboplan_example_models/models/ur_robot_model/ur5_gripper.srdf
+  global_max_tcp_linear_speed_mps: 0.25
+
+adapters:
+  planning:
+    adapter_id: planning.roboplan
+    adapter_version: "0.1.0"
+    config:
+      rng_seed: 12345
+  context:
+    adapter_id: planning.roboplan_context
+    adapter_version: "0.1.0"
+    config: {}
+  execution:
+    adapter_id: execution.ros2_control_fjt
+    adapter_version: "0.1.0"
+    config:
+      action_name: /joint_trajectory_controller/follow_joint_trajectory
+      supports_pause_resume: true
+
+orchestrator:
+  engine: py_trees
+  config: {}
+
+launch:
+  runner:
+    module: manyforge_behavior.runner
+    args: []
+  ui_backend:
+    module: manyforge_hmi.backend
+    args: []
+    enabled: true

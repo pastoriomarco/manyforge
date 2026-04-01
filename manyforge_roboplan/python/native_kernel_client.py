@@ -63,6 +63,9 @@ class NativeKernelClient(KernelClient):
             "cache_mode": request.cache_mode,
         }
 
+        if request.max_tcp_linear_speed_mps is not None:
+            req_dict["max_tcp_linear_speed_mps"] = request.max_tcp_linear_speed_mps
+
         if request.motion_type == "joint_goal":
             req_dict["joint_goal_names"] = request.joint_goal_names
             req_dict["joint_goal_positions_rad"] = request.joint_goal_positions_rad
@@ -75,6 +78,8 @@ class NativeKernelClient(KernelClient):
             ok=result["ok"],
             execution_id=result.get("execution_id", 0),
             error=result.get("error"),
+            trajectory_duration_s=result.get("trajectory_duration_s"),
+            trajectory_waypoint_count=result.get("trajectory_waypoint_count"),
         )
 
     def stop(self) -> CommandResult:

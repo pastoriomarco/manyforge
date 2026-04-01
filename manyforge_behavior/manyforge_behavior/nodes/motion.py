@@ -58,6 +58,20 @@ class MoveManipulatorAction(py_trees.behaviour.Behaviour):
                 ),
                 cache_mode=self._params.get("cache_mode", "default"),
             )
+
+            # Clamp per-move TCP speed to global deployment cap
+            try:
+                cap_bb = py_trees.blackboard.Client(name=self.name + "_tcp_cap")
+                cap_bb.register_key(key="global_max_tcp_linear_speed_mps", access=py_trees.common.Access.READ)
+                global_cap = cap_bb.global_max_tcp_linear_speed_mps
+                if global_cap and global_cap > 0:
+                    if request.max_tcp_linear_speed_mps and request.max_tcp_linear_speed_mps > 0:
+                        request.max_tcp_linear_speed_mps = min(request.max_tcp_linear_speed_mps, global_cap)
+                    else:
+                        request.max_tcp_linear_speed_mps = global_cap
+            except (KeyError, AttributeError):
+                pass  # No deployment loaded, no clamping
+
             result = kernel.execute(request)
             self._started = True
             if not result.ok:
