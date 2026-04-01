@@ -3,41 +3,29 @@
 #include <pybind11/operators.h>
 #include <Python.h>
 
-#include <manyforge_core/execution_kernel.hpp>
-#include <manyforge_core/cache/trajectory_cache.hpp>
-#include <manyforge_core/state_machine.hpp>
-#include <manyforge_core/time/iclock.hpp>
-#include <manyforge_core/time/ischeduler.hpp>
-#include <manyforge_core/ports/iplanner_backend.hpp>
-#include <manyforge_core/ports/iplanning_context.hpp>
-#include <manyforge_core/ports/iexecution_backend.hpp>
-
-#include "trampoline.hpp"
+// Only DTO/enum types are bound — port interfaces and kernel are C++-only.
+// Python interacts with the kernel via NativeKernelClient (manyforge_roboplan_py).
+#include <manyforge_core/types/error_code.hpp>
+#include <manyforge_core/types/execution_status.hpp>
+#include <manyforge_core/types/execution_result.hpp>
+#include <manyforge_core/types/execute_request.hpp>
+#include <manyforge_core/types/geometry.hpp>
+#include <manyforge_core/types/robot_state.hpp>
+#include <manyforge_core/types/trajectory_dto.hpp>
+#include <manyforge_core/types/motion_spec.hpp>
+#include <manyforge_core/types/plan_request.hpp>
+#include <manyforge_core/types/validation.hpp>
+#include <manyforge_core/types/scene_edit.hpp>
+#include <manyforge_core/types/collision_event.hpp>
 
 namespace py = pybind11;
-
-// ============================================================================
-// Helper: Convert Result<T> to Python (raise exception on error)
-// ============================================================================
-
-template<typename T>
-py::object result_to_python(manyforge::core::Result<T> result) {
-    if (result.ok()) {
-        return py::cast(result.value());
-    } else {
-        const auto& err = result.error();
-        std::string msg = err.code + ": " + err.message;
-        PyErr_SetString(PyExc_RuntimeError, msg.c_str());
-        throw py::error_already_set();
-    }
-}
 
 // ============================================================================
 // Module definition
 // ============================================================================
 
 PYBIND11_MODULE(manyforge_core_py, m) {
-    m.doc() = "Python bindings for manyforge_core execution kernel";
+    m.doc() = "Python bindings for manyforge_core DTOs and enums";
 
     // ========================================================================
     // Enums
@@ -318,9 +306,10 @@ PYBIND11_MODULE(manyforge_core_py, m) {
         .def_readwrite("progress", &manyforge::core::ExecutionStatus::progress)
         .def_readwrite("last_transition_ns", &manyforge::core::ExecutionStatus::last_transition_ns)
         .def_readwrite("execution_id", &manyforge::core::ExecutionStatus::execution_id)
+        .def_readwrite("active_move_id", &manyforge::core::ExecutionStatus::active_move_id)
         .def("__repr__", [](const manyforge::core::ExecutionStatus& s) {
-            return py::str("ExecutionStatus(state={}, execution_id={}, progress={})")
-                .format(py::cast(s.state), s.execution_id, s.progress);
+            return py::str("ExecutionStatus(state={}, execution_id={}, progress={}, active_move_id='{}')")
+                .format(py::cast(s.state), s.execution_id, s.progress, s.active_move_id);
         });
 
     py::class_<manyforge::core::ExecuteRequestDTO>(m, "ExecuteRequestDTO")
@@ -585,115 +574,6 @@ PYBIND11_MODULE(manyforge_core_py, m) {
 
     // ========================================================================
     // Cache Config
-    // ========================================================================
-
-    py::class_<manyforge::core::CacheConfig>(m, "CacheConfig")
-        .def(py::init<>())
-        .def(py::init<size_t>(), py::arg("max_entries") = 1000)
-        .def_readwrite("max_entries", &manyforge::core::CacheConfig::max_entries)
-        .def("__repr__", [](const manyforge::core::CacheConfig& c) {
-            return py::str("CacheConfig(max_entries={})").format(c.max_entries);
-        });
-
-    // ========================================================================
-    // Port Interfaces (with trampoline classes)
-    // ========================================================================
-
-    py::class_<manyforge::core::IPlannerBackend, manyforge::core::PyPlannerBackend>(m, "IPlannerBackend")
-        .def(py::init<>())
-        .def("plan", &manyforge::core::IPlannerBackend::plan)
-        .def("__repr__", [](const manyforge::core::IPlannerBackend*) {
-            return "IPlannerBackend()";
-        });
-
-    py::class_<manyforge::core::IPlanningContext, manyforge::core::PyPlanningContext>(m, "IPlanningContext")
-        .def(py::init<>())
-        .def("get_current_state", &manyforge::core::IPlanningContext::get_current_state)
-        .def("validate_trajectory", &manyforge::core::IPlanningContext::validate_trajectory)
-        .def("collision_check", &manyforge::core::IPlanningContext::collision_check)
-        .def("forward_kinematics", &manyforge::core::IPlanningContext::forward_kinematics)
-        .def("get_joint_limits", &manyforge::core::IPlanningContext::get_joint_limits)
-        .def("add_object", &manyforge::core::IPlanningContext::add_object)
-        .def("remove_object", &manyforge::core::IPlanningContext::remove_object)
-        .def("update_object_pose", &manyforge::core::IPlanningContext::update_object_pose)
-        .def("__repr__", [](const manyforge::core::IPlanningContext*) {
-            return "IPlanningContext()";
-        });
-
-    py::class_<manyforge::core::IExecutionBackend, manyforge::core::PyExecutionBackend>(m, "IExecutionBackend")
-        .def(py::init<>())
-        .def("execute_trajectory", &manyforge::core::IExecutionBackend::execute_trajectory)
-        .def("stop", &manyforge::core::IExecutionBackend::stop)
-        .def("pause", &manyforge::core::IExecutionBackend::pause)
-        .def("resume", &manyforge::core::IExecutionBackend::resume)
-        .def("reset", &manyforge::core::IExecutionBackend::reset)
-        .def("__repr__", [](const manyforge::core::IExecutionBackend*) {
-            return "IExecutionBackend()";
-        });
-
-    py::class_<manyforge::core::IClock, manyforge::core::PyClock>(m, "IClock")
-        .def(py::init<>())
-        .def("now", &manyforge::core::IClock::now)
-        .def("__repr__", [](const manyforge::core::IClock*) {
-            return "IClock()";
-        });
-
-    py::class_<manyforge::core::IScheduler, manyforge::core::PyScheduler>(m, "IScheduler")
-        .def(py::init<>())
-        .def("schedule", &manyforge::core::IScheduler::schedule)
-        .def("cancel", &manyforge::core::IScheduler::cancel)
-        .def("__repr__", [](const manyforge::core::IScheduler*) {
-            return "IScheduler()";
-        });
-
-    // ========================================================================
-    // Core Classes
-    // ========================================================================
-
-    py::class_<manyforge::core::TrajectoryCache>(m, "TrajectoryCache")
-        .def(py::init<manyforge::core::CacheConfig>(), py::arg("config") = manyforge::core::CacheConfig{})
-        .def("store", &manyforge::core::TrajectoryCache::store)
-        .def("lookup", &manyforge::core::TrajectoryCache::lookup)
-        .def("invalidate", &manyforge::core::TrajectoryCache::invalidate)
-        .def("invalidate_all", &manyforge::core::TrajectoryCache::invalidate_all)
-        .def("size", &manyforge::core::TrajectoryCache::size)
-        .def("capacity", &manyforge::core::TrajectoryCache::capacity)
-        .def("__repr__", [](const manyforge::core::TrajectoryCache& c) {
-            return py::str("TrajectoryCache(size={}, capacity={})")
-                .format(c.size(), c.capacity());
-        });
-
-    py::class_<manyforge::core::ExecutionStateMachine>(m, "ExecutionStateMachine")
-        .def_property_readonly("state", [](const manyforge::core::ExecutionStateMachine& sm) {
-            return sm.status().state;
-        })
-        .def_property_readonly("status", [](const manyforge::core::ExecutionStateMachine& sm) {
-            return sm.status();
-        })
-        .def("__repr__", [](const manyforge::core::ExecutionStateMachine& sm) {
-            return py::str("ExecutionStateMachine(state={})").format(py::cast(sm.status().state));
-        });
-
-    py::class_<manyforge::core::ExecutionKernel>(m, "ExecutionKernel")
-        .def(py::init<manyforge::core::IPlannerBackend&, manyforge::core::IPlanningContext&,
-                      manyforge::core::IExecutionBackend&, manyforge::core::IClock&,
-                      manyforge::core::IScheduler&, manyforge::core::TrajectoryCache&>(),
-             py::arg("planner"), py::arg("context"), py::arg("execution_backend"),
-             py::arg("clock"), py::arg("scheduler"), py::arg("cache"))
-        .def("execute", [](manyforge::core::ExecutionKernel& self, manyforge::core::ExecuteRequestDTO request) {
-            auto result = self.execute(request);
-            return result_to_python(result);
-        }, py::call_guard<py::gil_scoped_release>())
-        .def("stop", &manyforge::core::ExecutionKernel::stop)
-        .def("pause", &manyforge::core::ExecutionKernel::pause)
-        .def("resume", &manyforge::core::ExecutionKernel::resume)
-        .def("reset", &manyforge::core::ExecutionKernel::reset)
-        .def("get_status", &manyforge::core::ExecutionKernel::get_status)
-        .def("collision_check_tick", &manyforge::core::ExecutionKernel::collision_check_tick,
-             py::call_guard<py::gil_scoped_release>())
-        .def("__repr__", [](const manyforge::core::ExecutionKernel& k) {
-            auto status = k.get_status();
-            return py::str("ExecutionKernel(state={}, execution_id={})")
-                .format(py::cast(status.state), status.execution_id);
-        });
+    // Port interfaces, kernel, cache, and state machine are C++-only.
+    // Python interacts with the kernel via NativeKernelClient (manyforge_roboplan_py).
 }

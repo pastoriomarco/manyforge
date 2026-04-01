@@ -302,14 +302,16 @@ TEST_F(ExecutionKernelTest, Execute_PreCollisionCheck_Blocks) {
   EXPECT_EQ(execution.execute_count, 0);
 }
 
-// --- Execute from non-Idle ---
+// --- Execute auto-resets from terminal states ---
 
-TEST_F(ExecutionKernelTest, Execute_FromNonIdle_Rejected) {
+TEST_F(ExecutionKernelTest, Execute_FromCompleted_AutoResets) {
   kernel.execute(make_test_request());
   EXPECT_EQ(kernel.get_status().state, ExecutionState::kCompleted);
 
+  // Auto-reset: execute from Completed should succeed (not reject)
   auto result = kernel.execute(make_test_request());
-  EXPECT_FALSE(result.ok());
+  EXPECT_TRUE(result.ok());
+  EXPECT_EQ(kernel.get_status().state, ExecutionState::kCompleted);
 }
 
 // --- Stop ---

@@ -1,5 +1,8 @@
 #include <manyforge_core/execution_kernel.hpp>
 
+#include <exception>
+#include <string>
+
 namespace manyforge::core {
 
 ExecutionKernel::ExecutionKernel(IPlannerBackend& planner,
@@ -22,6 +25,16 @@ ExecutionKernel::ExecutionKernel(IPlannerBackend& planner,
 Result<uint64_t> ExecutionKernel::execute(const ExecuteRequestDTO& request) {
   std::lock_guard<std::mutex> lock(execute_mutex_);
 
+  // Auto-reset from terminal states so sequential moves work without
+  // explicit reset() calls (e.g., behavior tree sequences).
+  auto current_state = sm_.status().state;
+  if (current_state == ExecutionState::kCompleted ||
+      current_state == ExecutionState::kFailed ||
+      current_state == ExecutionState::kStopped) {
+    stop_policy_.request_reset();
+    active_move_id_.clear();
+  }
+
   // Only valid from Idle.
   if (sm_.status().state != ExecutionState::kIdle) {
     return Result<uint64_t>::Err(ErrorCode::kExecutionRejected);
@@ -31,75 +44,118 @@ Result<uint64_t> ExecutionKernel::execute(const ExecuteRequestDTO& request) {
   sm_.set_execution_id(exec_id);
   active_move_id_ = request.move_id;
 
-  // Check trajectory cache for move_id.
-  TrajectoryDTO trajectory;
-  bool cache_hit = false;
+  try {
+    // Check trajectory cache for move_id.
+    TrajectoryDTO trajectory;
+    bool cache_hit = false;
 
-  if (request.cache_mode != CacheMode::kDisable) {
-    auto cached = cache_.lookup(request.move_id);
-    if (cached.has_value()) {
-      cache_hit = true;
-      trajectory = std::move(*cached);
-    }
-  }
-
-  if (cache_hit) {
-    // Cache hit: Idle → Validating directly.
-    auto r = sm_.try_transition(ExecutionState::kValidating);
-    if (!r.ok()) return Result<uint64_t>::Err(r.error());
-  } else {
-    // Cache miss: Idle → Planning.
-    auto r = sm_.try_transition(ExecutionState::kPlanning);
-    if (!r.ok()) return Result<uint64_t>::Err(r.error());
-
-    // Plan the trajectory.
-    auto plan_result = plan_trajectory(request);
-    if (!plan_result.ok()) {
-      sm_.set_last_error(ErrorCode::kPlanningFailed);
-      sm_.try_transition(ExecutionState::kFailed);
-      return Result<uint64_t>::Err(plan_result.error());
-    }
-    trajectory = std::move(plan_result.value());
-
-    // Check if stop was requested during planning.
-    if (stop_policy_.stop_requested()) {
-      return Result<uint64_t>::Err(ErrorCode::kExecutionAborted);
-    }
-
-    // Planning → Validating.
-    auto r2 = sm_.try_transition(ExecutionState::kValidating);
-    if (!r2.ok()) return Result<uint64_t>::Err(r2.error());
-  }
-
-  // Validate trajectory (start-state gate + full validation).
-  auto val_result = validate_trajectory(trajectory, request);
-  if (!val_result.ok()) {
-    sm_.set_last_error(ErrorCode::kValidationCollision);
-    sm_.try_transition(ExecutionState::kFailed);
-    // Invalidate cache entry on validation failure.
     if (request.cache_mode != CacheMode::kDisable) {
-      cache_.invalidate(request.move_id);
+      auto cached = cache_.lookup(request.move_id);
+      if (cached.has_value()) {
+        cache_hit = true;
+        trajectory = std::move(*cached);
+      }
     }
-    return Result<uint64_t>::Err(val_result.error());
+
+    if (cache_hit) {
+      // Goal-compatibility gate: verify cached trajectory end state matches
+      // the requested goal. On mismatch, invalidate and fall through to plan.
+      if (!trajectory.waypoints.empty()) {
+        const auto& end_wp = trajectory.waypoints.back();
+        bool goal_compat = true;
+
+        if (auto* jg = std::get_if<JointGoalDTO>(&request.motion)) {
+          // Compare end waypoint positions against joint goal within tolerance.
+          if (end_wp.positions_rad.size() == jg->positions_rad.size()) {
+            for (size_t i = 0; i < jg->positions_rad.size(); ++i) {
+              double diff = end_wp.positions_rad[i] - jg->positions_rad[i];
+              if (diff < 0) diff = -diff;
+              if (diff > request.tolerances.joint_position_tol_rad) {
+                goal_compat = false;
+                break;
+              }
+            }
+          } else {
+            goal_compat = false;
+          }
+        }
+        // PoseGoalDTO: cache keyed by move_id which encodes the goal;
+        // full FK comparison deferred to async kernel (v0.x).
+
+        if (!goal_compat) {
+          cache_.invalidate(request.move_id);
+          cache_hit = false;
+        }
+      }
+    }
+
+    if (cache_hit) {
+      // Cache hit: Idle → Validating directly.
+      auto r = sm_.try_transition(ExecutionState::kValidating);
+      if (!r.ok()) return Result<uint64_t>::Err(r.error());
+    } else {
+      // Cache miss: Idle → Planning.
+      auto r = sm_.try_transition(ExecutionState::kPlanning);
+      if (!r.ok()) return Result<uint64_t>::Err(r.error());
+
+      // Plan the trajectory.
+      auto plan_result = plan_trajectory(request);
+      if (!plan_result.ok()) {
+        sm_.set_last_error(ErrorCode::kPlanningFailed);
+        sm_.try_transition(ExecutionState::kFailed);
+        return Result<uint64_t>::Err(plan_result.error());
+      }
+      trajectory = std::move(plan_result.value());
+
+      // Check if stop was requested during planning.
+      if (stop_policy_.stop_requested()) {
+        return Result<uint64_t>::Err(ErrorCode::kExecutionAborted);
+      }
+
+      // Planning → Validating.
+      auto r2 = sm_.try_transition(ExecutionState::kValidating);
+      if (!r2.ok()) return Result<uint64_t>::Err(r2.error());
+    }
+
+    // Validate trajectory (start-state gate + full validation).
+    auto val_result = validate_trajectory(trajectory, request);
+    if (!val_result.ok()) {
+      sm_.set_last_error(ErrorCode::kValidationCollision);
+      sm_.try_transition(ExecutionState::kFailed);
+      // Invalidate cache entry on validation failure.
+      if (request.cache_mode != CacheMode::kDisable) {
+        cache_.invalidate(request.move_id);
+      }
+      return Result<uint64_t>::Err(val_result.error());
+    }
+
+    // Store in cache (if not disabled and not already cached).
+    if (request.cache_mode != CacheMode::kDisable && !cache_hit) {
+      cache_.store(request.move_id, trajectory);
+    }
+
+    // Validating → Executing.
+    auto r3 = sm_.try_transition(ExecutionState::kExecuting);
+    if (!r3.ok()) return Result<uint64_t>::Err(r3.error());
+
+    // Dispatch to execution backend.
+    execution_backend_.execute_trajectory(trajectory);
+
+    // Executing → Completed.
+    sm_.set_progress(1.0);
+    sm_.try_transition(ExecutionState::kCompleted);
+
+    return Result<uint64_t>::Ok(exec_id);
+
+  } catch (const std::exception& e) {
+    // Port implementation threw (e.g. Python override via pybind11 trampoline).
+    // Transition to Failed so the kernel can be reset and reused.
+    sm_.set_last_error(ErrorCode::kInternalError);
+    sm_.try_transition(ExecutionState::kFailed);
+    return Result<uint64_t>::Err(
+        ErrorDTO{kErrorInternalError,
+                 std::string("Backend exception: ") + e.what(), {}});
   }
-
-  // Store in cache (if not disabled and not already cached).
-  if (request.cache_mode != CacheMode::kDisable && !cache_hit) {
-    cache_.store(request.move_id, trajectory);
-  }
-
-  // Validating → Executing.
-  auto r3 = sm_.try_transition(ExecutionState::kExecuting);
-  if (!r3.ok()) return Result<uint64_t>::Err(r3.error());
-
-  // Dispatch to execution backend.
-  execution_backend_.execute_trajectory(trajectory);
-
-  // Executing → Completed.
-  sm_.set_progress(1.0);
-  sm_.try_transition(ExecutionState::kCompleted);
-
-  return Result<uint64_t>::Ok(exec_id);
 }
 
 StopResultDTO ExecutionKernel::stop() {
@@ -136,7 +192,9 @@ ResetResultDTO ExecutionKernel::reset() {
 }
 
 ExecutionStatus ExecutionKernel::get_status() const {
-  return sm_.status();
+  auto status = sm_.status();
+  status.active_move_id = active_move_id_;
+  return status;
 }
 
 Result<void> ExecutionKernel::collision_check_tick() {
@@ -144,12 +202,18 @@ Result<void> ExecutionKernel::collision_check_tick() {
     return Result<void>::Ok();
   }
 
-  auto state = context_.get_current_state();
-  CollisionCheckRequestDTO req;
-  req.robot_state = state;
-  auto check = context_.collision_check(req);
+  try {
+    auto state = context_.get_current_state();
+    CollisionCheckRequestDTO req;
+    req.robot_state = state;
+    auto check = context_.collision_check(req);
 
-  return collision_policy_.handle_collision(check);
+    return collision_policy_.handle_collision(check);
+  } catch (const std::exception& e) {
+    return Result<void>::Err(
+        ErrorDTO{kErrorInternalError,
+                 std::string("Collision check exception: ") + e.what(), {}});
+  }
 }
 
 Result<TrajectoryDTO> ExecutionKernel::plan_trajectory(

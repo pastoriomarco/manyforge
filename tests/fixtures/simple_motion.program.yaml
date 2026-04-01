@@ -1,0 +1,48 @@
+api_version: manyforge.program.v0
+program_profile: v0.0
+name: simple_motion_test
+description: Integration test program with motion only (no scene edits).
+catalog_version: "0.1.0"
+
+robot:
+  robot_id: robot1
+  group_id: arm
+  base_frame: base_link
+  tcp_frame: tcp
+
+scene: []
+
+parameters:
+  - name: velocity_scale
+    type: float
+    default: 0.5
+    constraints:
+      min_exclusive: 0.0
+      max_inclusive: 1.0
+    description: Velocity scale for all moves.
+
+tree:
+  id: sequence
+  name: main_sequence
+  children:
+    - id: move_manipulator_action
+      name: move_to_start
+      params:
+        move_id: move_start
+        motion_type: joint_goal
+        joint_goal_names: [j1, j2, j3, j4, j5, j6]
+        joint_goal_positions_rad: [0.1, 0.1, 0.1, 0.0, 0.0, 0.0]
+        velocity_scale: "${param:velocity_scale}"
+        planning_timeout_s: 5.0
+        execution_timeout_s: 10.0
+
+    - id: move_manipulator_action
+      name: move_to_end
+      params:
+        move_id: move_end
+        motion_type: joint_goal
+        joint_goal_names: [j1, j2, j3, j4, j5, j6]
+        joint_goal_positions_rad: [0.2, 0.2, 0.2, 0.0, 0.0, 0.0]
+        velocity_scale: "${param:velocity_scale}"
+        planning_timeout_s: 5.0
+        execution_timeout_s: 10.0

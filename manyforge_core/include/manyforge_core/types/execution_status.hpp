@@ -56,6 +56,9 @@ struct ExecutionStatus {
 
   /// Execution ID for correlation (ADR-0011).
   uint64_t execution_id = 0;
+
+  /// The move_id of the in-flight request (empty in Idle). Spec 230 §1.
+  std::string active_move_id;
 };
 
 }  // namespace manyforge::core

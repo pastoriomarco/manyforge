@@ -208,28 +208,6 @@ def test_plan_request_dto():
     assert req.planning_timeout_s == 2.0
 
 
-def test_trajectory_cache():
-    """Test TrajectoryCache creation and basic operations."""
-    import manyforge_core_py
-    
-    cache = manyforge_core_py.TrajectoryCache()
-    assert cache.size() == 0
-    assert cache.capacity() == 1000
-    
-    wp = manyforge_core_py.TrajectoryWaypointDTO(0.0, [0.0], [], [])
-    traj = manyforge_core_py.TrajectoryDTO(["j1"], [wp])
-    
-    cache.store("move1", traj)
-    assert cache.size() == 1
-    
-    retrieved = cache.lookup("move1")
-    assert retrieved is not None
-    assert retrieved.joint_names == ["j1"]
-    
-    cache.invalidate("move1")
-    assert cache.lookup("move1") is None
-
-
 def test_stop_result_dto():
     """Test StopResultDTO creation and attributes."""
     import manyforge_core_py
@@ -445,9 +423,3 @@ def test_collision_check_request_dto():
     assert c.robot_state.joint_names == ["j1"]
 
 
-def test_cache_config():
-    """Test CacheConfig creation and attributes."""
-    import manyforge_core_py
-    
-    c = manyforge_core_py.CacheConfig(500)
-    assert c.max_entries == 500

@@ -1,0 +1,126 @@
+api_version: manyforge.program.v0
+program_profile: v0.0
+name: pick_and_place_integration_test
+description: >-
+  Full pick-and-place pipeline exercising scene edits, multiple motions,
+  blackboard logic, timers, and cache invalidation via the kernel.
+catalog_version: "0.1.0"
+
+robot:
+  robot_id: robot1
+  group_id: arm
+  base_frame: base_link
+  tcp_frame: tcp
+
+scene:
+  - object_id: table
+    shape:
+      type: box
+      box_dimensions_m: [1.0, 0.6, 0.02]
+    pose:
+      frame_id: base_link
+      position_m: [0.5, 0.0, 0.4]
+      orientation_xyzw: [0.0, 0.0, 0.0, 1.0]
+
+parameters:
+  - name: velocity_scale
+    type: float
+    default: 0.8
+    constraints:
+      min_exclusive: 0.0
+      max_inclusive: 1.0
+    description: Velocity scale for all moves.
+
+tree:
+  id: sequence
+  name: pick_and_place
+  children:
+    # Phase 1: Add pick object to scene
+    - id: add_collision_object
+      name: add_pick_object
+      params:
+        object_id: pick_object
+        shape_type: sphere
+        sphere_radius_m: 0.03
+        pose:
+          position_m: [0.4, 0.0, 0.45]
+          orientation_xyzw: [0.0, 0.0, 0.0, 1.0]
+        frame_id: base_link
+
+    # Phase 2: Move to pick approach
+    - id: move_manipulator_action
+      name: move_to_pick_approach
+      params:
+        move_id: pick_approach
+        motion_type: joint_goal
+        joint_goal_names: [j1, j2, j3, j4, j5, j6]
+        joint_goal_positions_rad: [0.1, 0.1, 0.1, 0.0, 0.0, 0.0]
+        velocity_scale: "${param:velocity_scale}"
+        planning_timeout_s: 5.0
+        execution_timeout_s: 10.0
+
+    # Phase 3: Simulate gripper close
+    - id: set_key_bool_value
+      name: close_gripper
+      params:
+        key: gripper_closed
+        value: true
+
+    # Phase 4: Remove pick object from scene (attached to gripper)
+    - id: remove_collision_object
+      name: detach_pick_object
+      params:
+        object_id: pick_object
+
+    # Phase 5: Invalidate cached trajectories (scene changed)
+    - id: reset_trajectories
+      name: invalidate_after_pick
+
+    # Phase 6: Move to place approach
+    - id: move_manipulator_action
+      name: move_to_place_approach
+      params:
+        move_id: place_approach
+        motion_type: joint_goal
+        joint_goal_names: [j1, j2, j3, j4, j5, j6]
+        joint_goal_positions_rad: [0.2, 0.2, 0.2, 0.0, 0.0, 0.0]
+        velocity_scale: "${param:velocity_scale}"
+        planning_timeout_s: 5.0
+        execution_timeout_s: 10.0
+
+    # Phase 7: Re-add object at place location
+    - id: add_collision_object
+      name: add_placed_object
+      params:
+        object_id: placed_object
+        shape_type: sphere
+        sphere_radius_m: 0.03
+        pose:
+          position_m: [0.6, 0.2, 0.45]
+          orientation_xyzw: [0.0, 0.0, 0.0, 1.0]
+        frame_id: base_link
+
+    # Phase 8: Simulate gripper open
+    - id: set_key_bool_value
+      name: open_gripper
+      params:
+        key: gripper_closed
+        value: false
+
+    # Phase 9: Move to home
+    - id: move_manipulator_action
+      name: return_home
+      params:
+        move_id: return_home
+        motion_type: joint_goal
+        joint_goal_names: [j1, j2, j3, j4, j5, j6]
+        joint_goal_positions_rad: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        velocity_scale: "${param:velocity_scale}"
+        planning_timeout_s: 5.0
+        execution_timeout_s: 10.0
+
+    # Phase 10: Clean up scene
+    - id: remove_collision_object
+      name: remove_placed_object
+      params:
+        object_id: placed_object

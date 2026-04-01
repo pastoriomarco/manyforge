@@ -188,7 +188,7 @@ TEST(ContractsCompile, MotionSpecVariant) {
   EXPECT_TRUE(std::holds_alternative<JointGoalDTO>(m1));
 
   // Pose goal
-  PoseGoalDTO pose_goal;
+  PoseGoalDTO pose_goal{};
   MotionSpecDTO m2 = pose_goal;
   EXPECT_TRUE(std::holds_alternative<PoseGoalDTO>(m2));
 
