@@ -124,6 +124,10 @@ Result<void> StopPolicy::request_pause() {
 }
 
 Result<void> StopPolicy::request_resume() {
+    auto current = sm_.status().state;
+    if (current != ExecutionState::kPaused) {
+        return Result<void>::Err(ErrorCode::kInvalidStateTransition);
+    }
     // Paused → Validating (re-validates before resuming).
     return sm_.try_transition(ExecutionState::kValidating);
 }

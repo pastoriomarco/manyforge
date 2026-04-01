@@ -6,8 +6,8 @@
 # Usage: ./scripts/manyforge-session-start.sh [sandbox-name]
 #
 # Prerequisites:
-#   - vLLM is serving Qwen3.5-27B-FP8 on port 8000
-#   - Run: cd ~/workspaces/nemoclaw/src/NemoClaw-Thor && ./configure-local-provider.sh qwen3.5-27b-fp8
+#   - vLLM is serving a Qwen model on port 8000
+#   - Run: cd ~/workspaces/nemoclaw/src/NemoClaw-Thor && ./configure-local-provider.sh <profile>
 #   - Then run this script
 
 set -euo pipefail
@@ -24,9 +24,10 @@ echo ""
 
 # --- 1. Verify Thor is healthy ---
 echo ">>> [1/4] Checking Thor system status..."
-if ! "$NEMOCLAW_THOR/status.sh" qwen3.5-27b-fp8 2>&1 | grep -q "All 19 checks passed"; then
+MODEL_PROFILE="${THOR_MODEL_PROFILE:-qwen3.5-27b-claude-distilled-nvfp4}"
+if ! "$NEMOCLAW_THOR/status.sh" "$MODEL_PROFILE" 2>&1 | grep -q "All 19 checks passed"; then
     echo "    System not healthy. Run:"
-    echo "    cd $NEMOCLAW_THOR && ./configure-local-provider.sh qwen3.5-27b-fp8"
+    echo "    cd $NEMOCLAW_THOR && ./configure-local-provider.sh $MODEL_PROFILE"
     exit 1
 fi
 echo "    OK — all 19 checks passed."
@@ -59,8 +60,9 @@ echo ">>> [3/4] Restoring worker workspaces..."
 
 ACTIVE_TASKS=()
 # Add task IDs here when starting new Phase 1 batches, e.g.:
-# ACTIVE_TASKS=("p1-fakeclock" "p1-statemachine")
-ACTIVE_TASKS=("p1-fakeclock" "p1-statemachine")
+# Add task IDs here when starting new sessions, e.g.:
+# ACTIVE_TASKS=("s3-bindings")
+ACTIVE_TASKS=()
 
 for TASK_ID in "${ACTIVE_TASKS[@]}"; do
     if [[ -d "/tmp/manyforge-baseline-${TASK_ID}" ]]; then

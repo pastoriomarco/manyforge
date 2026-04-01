@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "manyforge_behavior"
+version = "0.0.1"
+description = "ManyForge orchestration runner (py_trees-based)"
+requires-python = ">=3.11"
+dependencies = [
+    "py_trees>=2.2",
+    "pyyaml>=6.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+
+[tool.setuptools.package-data]
+manyforge_behavior = ["../resources/*.yaml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

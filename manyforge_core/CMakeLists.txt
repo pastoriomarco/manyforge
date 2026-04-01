@@ -13,6 +13,7 @@ add_library(manyforge_core
   src/stop_policy.cpp
   src/trajectory_cache.cpp
   src/collision_policy.cpp
+  src/execution_kernel.cpp
 )
 target_include_directories(manyforge_core PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -57,4 +58,8 @@ if(BUILD_TESTING)
   add_executable(test_collision_policy test/test_collision_policy.cpp)
   target_link_libraries(test_collision_policy PRIVATE manyforge_core GTest::gtest_main)
   gtest_discover_tests(test_collision_policy)
+
+  add_executable(test_execution_kernel test/test_execution_kernel.cpp)
+  target_link_libraries(test_execution_kernel PRIVATE manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_execution_kernel)
 endif()

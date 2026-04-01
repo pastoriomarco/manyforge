@@ -1,0 +1,61 @@
+api_version: manyforge.program.v0
+program_profile: v0.0
+name: test_pick_and_place
+description: Test pick and place program.
+catalog_version: "0.1.0"
+
+robot:
+  robot_id: ur5
+  group_id: arm
+  base_frame: base_link
+  tcp_frame: tool0
+
+scene:
+  - object_id: table
+    shape:
+      type: box
+      box_dimensions_m: [1.0, 0.6, 0.02]
+    pose:
+      frame_id: base_link
+      position_m: [0.5, 0.0, 0.4]
+      orientation_xyzw: [0.0, 0.0, 0.0, 1.0]
+
+parameters:
+  - name: pick_velocity_scale
+    type: float
+    default: 0.5
+    constraints:
+      min_exclusive: 0.0
+      max_inclusive: 1.0
+    description: Velocity scale for pick moves.
+
+tree:
+  id: sequence
+  name: main_sequence
+  children:
+    - id: add_collision_object
+      name: add_table
+      params:
+        object_id: table
+        shape_type: box
+        box_dimensions_m: [1.0, 0.6, 0.02]
+        pose:
+          position_m: [0.5, 0.0, 0.4]
+          orientation_xyzw: [0.0, 0.0, 0.0, 1.0]
+        frame_id: base_link
+
+    - id: move_manipulator_action
+      name: move_to_pick
+      params:
+        move_id: pick_approach
+        motion_type: joint_goal
+        joint_goal_names: [j1, j2, j3, j4, j5, j6]
+        joint_goal_positions_rad: [0.2, -1.2, 1.0, -1.5, -1.3, 0.4]
+        velocity_scale: "${param:pick_velocity_scale}"
+        planning_timeout_s: 2.0
+        execution_timeout_s: 10.0
+
+    - id: remove_collision_object
+      name: remove_table
+      params:
+        object_id: table

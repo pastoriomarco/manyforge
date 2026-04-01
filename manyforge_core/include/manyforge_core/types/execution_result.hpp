@@ -22,6 +22,12 @@ struct PauseResultDTO {
   std::optional<ErrorDTO> error;
 };
 
+/// Resume result (spec 230 §1.1)
+struct ResumeResultDTO {
+  bool accepted = false;
+  std::optional<ErrorDTO> error;
+};
+
 /// Reset result (spec 220 §4.2)
 struct ResetResultDTO {
   bool accepted = false;

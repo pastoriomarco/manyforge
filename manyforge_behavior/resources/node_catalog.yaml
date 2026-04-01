@@ -1,0 +1,650 @@
+# ManyForge v0.0 Node Catalog (reference artifact)
+#
+# This is the canonical v0.0 catalog. Implementations copy this file into
+# manyforge_behavior/resources/node_catalog.yaml.
+#
+# Schema: docs/spec/440-node-catalog-format-and-versioning.md
+# Node semantics: docs/spec/410-node-catalog-and-orchestration-adapters.md
+# Capability keys: docs/spec/240-supported-backend-capability-profile.md
+
+api_version: manyforge.node_catalog.v0
+catalog_version: "0.1.0"
+
+entries:
+
+  # ---------------------------------------------------------------------------
+  # Control flow (engine-native)
+  # ---------------------------------------------------------------------------
+
+  - id: sequence
+    name: Sequence
+    category: control_flow
+    description: >-
+      Tick children left-to-right; succeed when all succeed, fail on first failure.
+      Memory-enabled (resumes from last running child).
+    tags: [control_flow, composite]
+    profiles:
+      min_profile: v0.0
+    kind: composite
+    children:
+      min: 1
+      max: unbounded
+    parameters: []
+    required_capabilities: []
+    execution:
+      blocking: false
+      cancellable: false
+    runners:
+      py_trees:
+        implementation_kind: native
+        engine_class: py_trees.composites.Sequence
+        options:
+          memory: true
+    observability:
+      emits_events: []
+      consumes_events: []
+
+  - id: fallback
+    name: Fallback
+    category: control_flow
+    description: >-
+      Tick children left-to-right; succeed on first success, fail when all fail.
+      Memory-enabled (resumes from last running child).
+    tags: [control_flow, composite, selector]
+    profiles:
+      min_profile: v0.0
+    kind: composite
+    children:
+      min: 1
+      max: unbounded
+    parameters: []
+    required_capabilities: []
+    execution:
+      blocking: false
+      cancellable: false
+    runners:
+      py_trees:
+        implementation_kind: native
+        engine_class: py_trees.composites.Selector
+        options:
+          memory: true
+    observability:
+      emits_events: []
+      consumes_events: []
+
+  - id: parallel
+    name: Parallel
+    category: control_flow
+    description: >-
+      Tick all children simultaneously. Succeed when all succeed; fail on any failure.
+    tags: [control_flow, composite]
+    profiles:
+      min_profile: v0.0
+    kind: composite
+    children:
+      min: 1
+      max: unbounded
+    parameters: []
+    required_capabilities: []
+    execution:
+      blocking: false
+      cancellable: false
+    runners:
+      py_trees:
+        implementation_kind: native
+        engine_class: py_trees.composites.Parallel
+        options:
+          policy: py_trees.common.ParallelPolicy.SuccessOnAll()
+    observability:
+      emits_events: []
+      consumes_events: []
+
+  - id: inverter
+    name: Inverter
+    category: control_flow
+    description: >-
+      Decorator that inverts the child's result (success becomes failure and vice versa).
+    tags: [control_flow, decorator]
+    profiles:
+      min_profile: v0.0
+    kind: decorator
+    children:
+      min: 1
+      max: 1
+    parameters: []
+    required_capabilities: []
+    execution:
+      blocking: false
+      cancellable: false
+    runners:
+      py_trees:
+        implementation_kind: native
+        engine_class: py_trees.decorators.Inverter
+    observability:
+      emits_events: []
+      consumes_events: []
+
+  - id: timer
+    name: Timer
+    category: control_flow
+    description: >-
+      Wait for a specified duration before succeeding.
+    tags: [control_flow, timing]
+    profiles:
+      min_profile: v0.0
+    kind: leaf
+    children:
+      min: 0
+      max: 0
+    parameters:
+      - name: duration_s
+        type: float
+        required: true
+        constraints:
+          min_exclusive: 0.0
+        parameterizable: true
+        description: Duration to wait in seconds.
+    required_capabilities: []
+    execution:
+      blocking: true
+      cancellable: true
+      timeout_param: duration_s
+    runners:
+      py_trees:
+        implementation_kind: native
+        engine_class: py_trees.timers.Timer
+    observability:
+      emits_events: []
+      consumes_events: []
+
+  # ---------------------------------------------------------------------------
+  # Motion (planning + execution through the kernel)
+  # ---------------------------------------------------------------------------
+
+  - id: move_manipulator_action
+    name: MoveManipulatorAction
+    category: motion
+    description: >-
+      Execute a motion request (plan + validate + execute) through the kernel.
+    tags: [motion, planning, execution]
+    profiles:
+      min_profile: v0.0
+    kind: leaf
+    children:
+      min: 0
+      max: 0
+    parameters:
+      - name: move_id
+        type: string
+        required: true
+        description: >-
+          Stable identifier for this move instance (used for trajectory caching).
+      - name: motion_type
+        type: enum
+        required: true
+        enum_values: [joint_goal, pose_goal]
+        description: The type of motion to plan.
+      - name: joint_goal_names
+        type: string_list
+        required: false
+        description: >-
+          Joint names for joint_goal motion type. Required when motion_type=joint_goal.
+      - name: joint_goal_positions_rad
+        type: float_list
+        required: false
+        description: >-
+          Joint positions in radians for joint_goal. Required when motion_type=joint_goal.
+      - name: pose_goal
+        type: pose
+        required: false
+        description: >-
+          Target end-effector pose in base_frame for pose_goal motion type.
+          Required when motion_type=pose_goal.
+      - name: velocity_scale
+        type: float
+        required: false
+        default: 1.0
+        constraints:
+          min_exclusive: 0.0
+          max_inclusive: 1.0
+        parameterizable: true
+        description: Velocity scaling factor.
+      - name: acceleration_scale
+        type: float
+        required: false
+        default: 1.0
+        constraints:
+          min_exclusive: 0.0
+          max_inclusive: 1.0
+        parameterizable: true
+        description: Acceleration scaling factor.
+      - name: max_tcp_linear_speed_mps
+        type: float
+        required: false
+        constraints:
+          min_exclusive: 0.0
+        parameterizable: true
+        description: >-
+          Per-move TCP linear speed cap (m/s). Effective limit is
+          min(global_max, this value). Omit to use global limit only.
+      - name: joint_position_tol_rad
+        type: float
+        required: false
+        default: 0.05
+        constraints:
+          min_inclusive: 0.0
+        parameterizable: true
+        description: Joint position tolerance in radians.
+      - name: translation_tol_m
+        type: float
+        required: false
+        default: 0.005
+        constraints:
+          min_inclusive: 0.0
+        parameterizable: true
+        description: Cartesian translation tolerance in meters.
+      - name: rotation_tol_rad
+        type: float
+        required: false
+        default: 0.05
+        constraints:
+          min_inclusive: 0.0
+        parameterizable: true
+        description: Cartesian rotation tolerance in radians.
+      - name: planning_timeout_s
+        type: float
+        required: false
+        default: 2.0
+        constraints:
+          min_exclusive: 0.0
+        parameterizable: true
+        description: Planning timeout in seconds.
+      - name: execution_timeout_s
+        type: float
+        required: false
+        default: 10.0
+        constraints:
+          min_exclusive: 0.0
+        parameterizable: true
+        description: Execution timeout in seconds.
+      - name: cache_mode
+        type: enum
+        required: false
+        default: default
+        enum_values: [default, disable]
+        description: Trajectory cache mode.
+    required_capabilities:
+      - planning.motion.joint_goal
+      - planning.motion.pose_goal
+      - planning.trajectory.time_parameterized
+      - context.state.current
+      - context.validation.trajectory
+      - context.collision.check
+      - execution.trajectory.execute
+      - execution.feedback.phase_events
+      - execution.stop.soft
+    execution:
+      blocking: true
+      cancellable: true
+      timeout_param: execution_timeout_s
+    runners:
+      py_trees:
+        implementation_kind: plugin
+        class: manyforge_behavior.nodes.MoveManipulatorAction
+    observability:
+      emits_events:
+        - plan_started
+        - plan_completed
+        - validation_started
+        - validation_passed
+        - execute_started
+        - execute_completed
+      consumes_events:
+        - stop_requested
+
+  - id: reset_trajectories
+    name: ResetTrajectories
+    category: motion
+    description: >-
+      Invalidate all cached trajectories for the current program execution.
+    tags: [motion, cache]
+    profiles:
+      min_profile: v0.0
+    kind: leaf
+    children:
+      min: 0
+      max: 0
+    parameters: []
+    required_capabilities: []
+    execution:
+      blocking: false
+      cancellable: false
+    runners:
+      py_trees:
+        implementation_kind: plugin
+        class: manyforge_behavior.nodes.ResetTrajectories
+    observability:
+      emits_events: []
+      consumes_events: []
+
+  # ---------------------------------------------------------------------------
+  # Scene / objects (v0.0: add, remove, update_pose only)
+  # ---------------------------------------------------------------------------
+
+  - id: add_collision_object
+    name: AddCollisionObject
+    category: scene
+    description: >-
+      Add a collision object to the backend-owned scene via IPlanningContext.
+    tags: [scene, collision]
+    profiles:
+      min_profile: v0.0
+    kind: leaf
+    children:
+      min: 0
+      max: 0
+    parameters:
+      - name: object_id
+        type: string
+        required: true
+        description: Unique identifier for the collision object.
+      - name: shape_type
+        type: enum
+        required: true
+        enum_values: [box, sphere]
+        description: Shape type (v0.0 supports box and sphere only).
+      - name: box_dimensions_m
+        type: float_list
+        required: false
+        description: >-
+          Box full dimensions [x, y, z] in meters (required when shape_type=box).
+      - name: sphere_radius_m
+        type: float
+        required: false
+        constraints:
+          min_exclusive: 0.0
+        description: Sphere radius in meters (required when shape_type=sphere).
+      - name: pose
+        type: pose
+        required: true
+        description: Object pose expressed in frame_id.
+      - name: frame_id
+        type: string
+        required: true
+        description: Reference frame for the object pose.
+    required_capabilities:
+      - scene.shape.box
+      - scene.shape.sphere
+      - scene.edit.add
+    execution:
+      blocking: true
+      cancellable: false
+    runners:
+      py_trees:
+        implementation_kind: plugin
+        class: manyforge_behavior.nodes.AddCollisionObject
+    observability:
+      emits_events: []
+      consumes_events: []
+
+  - id: remove_collision_object
+    name: RemoveCollisionObject
+    category: scene
+    description: >-
+      Remove a collision object from the backend-owned scene via IPlanningContext.
+    tags: [scene, collision]
+    profiles:
+      min_profile: v0.0
+    kind: leaf
+    children:
+      min: 0
+      max: 0
+    parameters:
+      - name: object_id
+        type: string
+        required: true
+        description: Identifier of the object to remove.
+    required_capabilities:
+      - scene.edit.remove
+    execution:
+      blocking: true
+      cancellable: false
+    runners:
+      py_trees:
+        implementation_kind: plugin
+        class: manyforge_behavior.nodes.RemoveCollisionObject
+    observability:
+      emits_events: []
+      consumes_events: []
+
+  - id: update_collision_object_pose
+    name: UpdateCollisionObjectPose
+    category: scene
+    description: >-
+      Update the pose of an existing collision object in the backend-owned scene.
+    tags: [scene, collision]
+    profiles:
+      min_profile: v0.0
+    kind: leaf
+    children:
+      min: 0
+      max: 0
+    parameters:
+      - name: object_id
+        type: string
+        required: true
+        description: Identifier of the object to update.
+      - name: pose
+        type: pose
+        required: true
+        description: New object pose expressed in frame_id.
+      - name: frame_id
+        type: string
+        required: true
+        description: Reference frame for the new pose.
+    required_capabilities:
+      - scene.edit.update_pose
+    execution:
+      blocking: true
+      cancellable: false
+    runners:
+      py_trees:
+        implementation_kind: plugin
+        class: manyforge_behavior.nodes.UpdateCollisionObjectPose
+    observability:
+      emits_events: []
+      consumes_events: []
+
+  # ---------------------------------------------------------------------------
+  # Logic / blackboard
+  # ---------------------------------------------------------------------------
+
+  - id: check_key_bool_value
+    name: CheckKeyBoolValue
+    category: logic
+    description: >-
+      Condition node that succeeds if a blackboard key holds the expected bool value.
+    tags: [logic, blackboard, condition]
+    profiles:
+      min_profile: v0.0
+    kind: leaf
+    children:
+      min: 0
+      max: 0
+    parameters:
+      - name: key
+        type: string
+        required: true
+        description: Blackboard key name.
+      - name: expected_value
+        type: bool
+        required: true
+        description: The expected boolean value.
+    required_capabilities: []
+    execution:
+      blocking: false
+      cancellable: false
+    runners:
+      py_trees:
+        implementation_kind: plugin
+        class: manyforge_behavior.nodes.CheckKeyBoolValue
+    observability:
+      emits_events: []
+      consumes_events: []
+
+  - id: set_key_bool_value
+    name: SetKeyBoolValue
+    category: logic
+    description: >-
+      Set a blackboard key to a boolean value and succeed.
+    tags: [logic, blackboard]
+    profiles:
+      min_profile: v0.0
+    kind: leaf
+    children:
+      min: 0
+      max: 0
+    parameters:
+      - name: key
+        type: string
+        required: true
+        description: Blackboard key name.
+      - name: value
+        type: bool
+        required: true
+        description: The boolean value to set.
+    required_capabilities: []
+    execution:
+      blocking: false
+      cancellable: false
+    runners:
+      py_trees:
+        implementation_kind: plugin
+        class: manyforge_behavior.nodes.SetKeyBoolValue
+    observability:
+      emits_events: []
+      consumes_events: []
+
+  - id: wait_for_key_bool
+    name: WaitForKeyBool
+    category: logic
+    description: >-
+      Block until a blackboard key holds the expected boolean value.
+    tags: [logic, blackboard, wait]
+    profiles:
+      min_profile: v0.0
+    kind: leaf
+    children:
+      min: 0
+      max: 0
+    parameters:
+      - name: key
+        type: string
+        required: true
+        description: Blackboard key name.
+      - name: expected_value
+        type: bool
+        required: true
+        description: The expected boolean value to wait for.
+    required_capabilities: []
+    execution:
+      blocking: true
+      cancellable: true
+    runners:
+      py_trees:
+        implementation_kind: plugin
+        class: manyforge_behavior.nodes.WaitForKeyBool
+    observability:
+      emits_events: []
+      consumes_events: []
+
+  # ---------------------------------------------------------------------------
+  # Geometry / frames (v0.0: FK-based queries only)
+  # ---------------------------------------------------------------------------
+
+  - id: get_link_pose
+    name: GetLinkPose
+    category: geometry
+    description: >-
+      Query forward kinematics for a link pose and store the result on the blackboard.
+    tags: [geometry, fk, pose]
+    profiles:
+      min_profile: v0.0
+    kind: leaf
+    children:
+      min: 0
+      max: 0
+    parameters:
+      - name: target_frame
+        type: string
+        required: true
+        description: The link/frame to compute the pose for.
+      - name: base_frame
+        type: string
+        required: true
+        description: The frame in which the result is expressed.
+      - name: output_key
+        type: string
+        required: true
+        description: Blackboard key to store the resulting Pose3DTO.
+    required_capabilities:
+      - context.kinematics.fk
+      - context.state.current
+    execution:
+      blocking: true
+      cancellable: false
+    runners:
+      py_trees:
+        implementation_kind: plugin
+        class: manyforge_behavior.nodes.GetLinkPose
+    observability:
+      emits_events: []
+      consumes_events: []
+
+  - id: check_pose_distance
+    name: CheckPoseDistance
+    category: geometry
+    description: >-
+      Condition that succeeds if the distance between two poses (from blackboard keys)
+      is within the specified thresholds.
+    tags: [geometry, condition, pose]
+    profiles:
+      min_profile: v0.0
+    kind: leaf
+    children:
+      min: 0
+      max: 0
+    parameters:
+      - name: pose_key_a
+        type: string
+        required: true
+        description: Blackboard key for the first pose.
+      - name: pose_key_b
+        type: string
+        required: true
+        description: Blackboard key for the second pose.
+      - name: translation_threshold_m
+        type: float
+        required: true
+        constraints:
+          min_inclusive: 0.0
+        parameterizable: true
+        description: Maximum translation distance in meters.
+      - name: rotation_threshold_rad
+        type: float
+        required: true
+        constraints:
+          min_inclusive: 0.0
+        parameterizable: true
+        description: Maximum rotation distance in radians.
+    required_capabilities: []
+    execution:
+      blocking: false
+      cancellable: false
+    runners:
+      py_trees:
+        implementation_kind: plugin
+        class: manyforge_behavior.nodes.CheckPoseDistance
+    observability:
+      emits_events: []
+      consumes_events: []
