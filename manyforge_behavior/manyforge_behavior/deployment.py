@@ -25,6 +25,8 @@ class AdapterConfig:
     adapter_id: str
     adapter_version: str
     config: dict[str, Any] = field(default_factory=dict)
+    supported_profiles: list[str] = field(default_factory=list)
+    capability_keys: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -142,6 +144,8 @@ class Deployment:
                 adapter_id=adapter_data["adapter_id"],
                 adapter_version=adapter_data["adapter_version"],
                 config=adapter_data.get("config", {}),
+                supported_profiles=adapter_data.get("supported_profiles", []),
+                capability_keys=adapter_data.get("capability_keys", []),
             )
 
         # Orchestrator
@@ -209,4 +213,47 @@ class Deployment:
             raise DeploymentValidationError(
                 f"group_id mismatch: deployment has '{self.robot_config.group_id}', "
                 f"program has '{program.robot.group_id}'"
+            )
+
+    def validate_capabilities(self) -> None:
+        """Verify adapter capabilities cover the program profile requirements.
+
+        Raises DeploymentValidationError if:
+        - Any adapter declares supported_profiles but doesn't include self.program_profile
+        - The union of all adapters' capability_keys doesn't cover all required keys
+        - Required keys are missing from the capability union
+
+        Silently passes if no adapter declares capability_keys (backwards compat).
+        """
+        from manyforge_behavior.capabilities import get_required_keys
+
+        # Collect all capability keys from all adapters (union)
+        all_capability_keys: set[str] = set()
+        for slot, adapter in self.adapters.items():
+            all_capability_keys.update(adapter.capability_keys)
+
+        # If no adapter declared capability_keys, skip validation (backwards compat)
+        if not all_capability_keys:
+            return
+
+        # Check that each adapter that declares supported_profiles includes our profile
+        for slot, adapter in self.adapters.items():
+            if adapter.supported_profiles:
+                if self.program_profile not in adapter.supported_profiles:
+                    raise DeploymentValidationError(
+                        f"Adapter '{slot}' declares supported_profiles but doesn't "
+                        f"include '{self.program_profile}': "
+                        f"{adapter.supported_profiles}"
+                    )
+
+        # Get required keys for the program profile
+        required_keys = get_required_keys(self.program_profile)
+
+        # Compute missing keys
+        missing = required_keys - all_capability_keys
+
+        if missing:
+            raise DeploymentValidationError(
+                f"Missing capability keys for profile '{self.program_profile}': "
+                f"{sorted(missing)}"
             )

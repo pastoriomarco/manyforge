@@ -294,3 +294,145 @@ class TestCrossArtifactValidation:
         with pytest.raises(DeploymentValidationError, match="group_id"):
             deploy.validate_against_program(prog)
         os.unlink(path)
+
+
+class TestAdapterCapabilityKeys:
+    def test_adapter_capability_keys_parsed(self):
+        """Load fixture, verify capability_keys are on each adapter."""
+        deploy = Deployment(DEPLOYMENT_FIXTURE_PATH)
+        
+        # Planning adapter
+        assert deploy.adapters["planning"].supported_profiles == ["v0.0"]
+        assert deploy.adapters["planning"].capability_keys == [
+            "planning.motion.joint_goal",
+            "planning.motion.pose_goal",
+            "planning.trajectory.time_parameterized",
+        ]
+        
+        # Context adapter
+        assert deploy.adapters["context"].supported_profiles == ["v0.0"]
+        assert deploy.adapters["context"].capability_keys == [
+            "context.state.current",
+            "context.validation.trajectory",
+            "context.collision.check",
+            "context.kinematics.fk",
+            "context.limits.joint",
+            "scene.shape.box",
+            "scene.shape.sphere",
+            "scene.edit.add",
+            "scene.edit.remove",
+            "scene.edit.update_pose",
+        ]
+        
+        # Execution adapter
+        assert deploy.adapters["execution"].supported_profiles == ["v0.0"]
+        assert deploy.adapters["execution"].capability_keys == [
+            "execution.trajectory.execute",
+            "execution.feedback.phase_events",
+            "execution.stop.soft",
+            "execution.pause",
+            "execution.resume",
+            "execution.reset",
+        ]
+
+
+class TestValidateCapabilities:
+    def test_validate_capabilities_success(self):
+        """Full coverage → no error."""
+        deploy = Deployment(DEPLOYMENT_FIXTURE_PATH)
+        deploy.validate_capabilities()  # Should not raise
+
+    def test_validate_capabilities_missing_key(self):
+        """Remove one key from fixture → DeploymentValidationError."""
+        data = _minimal_deployment()
+        # Add capability_keys but miss one required key
+        data["adapters"]["planning"]["capability_keys"] = [
+            "planning.motion.joint_goal",
+            "planning.motion.pose_goal",
+            # Missing: planning.trajectory.time_parameterized
+        ]
+        data["adapters"]["context"]["capability_keys"] = [
+            "context.state.current",
+            "context.validation.trajectory",
+            "context.collision.check",
+            "context.kinematics.fk",
+            "context.limits.joint",
+            "scene.shape.box",
+            "scene.shape.sphere",
+            "scene.edit.add",
+            "scene.edit.remove",
+            "scene.edit.update_pose",
+        ]
+        data["adapters"]["execution"]["capability_keys"] = [
+            "execution.trajectory.execute",
+            "execution.feedback.phase_events",
+            "execution.stop.soft",
+            "execution.pause",
+            "execution.resume",
+            "execution.reset",
+        ]
+        path = _write_deployment(data)
+        deploy = Deployment(path)
+        with pytest.raises(DeploymentValidationError, match="Missing capability keys"):
+            deploy.validate_capabilities()
+        os.unlink(path)
+
+    def test_validate_capabilities_wrong_profile(self):
+        """Adapter lists wrong profile → DeploymentValidationError."""
+        data = _minimal_deployment()
+        data["adapters"]["planning"]["supported_profiles"] = ["v99.0"]  # Wrong profile
+        data["adapters"]["planning"]["capability_keys"] = [
+            "planning.motion.joint_goal",
+            "planning.motion.pose_goal",
+            "planning.trajectory.time_parameterized",
+        ]
+        data["adapters"]["context"]["capability_keys"] = [
+            "context.state.current",
+            "context.validation.trajectory",
+            "context.collision.check",
+            "context.kinematics.fk",
+            "context.limits.joint",
+            "scene.shape.box",
+            "scene.shape.sphere",
+            "scene.edit.add",
+            "scene.edit.remove",
+            "scene.edit.update_pose",
+        ]
+        data["adapters"]["execution"]["capability_keys"] = [
+            "execution.trajectory.execute",
+            "execution.feedback.phase_events",
+            "execution.stop.soft",
+            "execution.pause",
+            "execution.resume",
+            "execution.reset",
+        ]
+        path = _write_deployment(data)
+        deploy = Deployment(path)
+        with pytest.raises(DeploymentValidationError, match="supported_profiles"):
+            deploy.validate_capabilities()
+        os.unlink(path)
+
+    def test_validate_capabilities_backwards_compat(self):
+        """No capability_keys on any adapter → passes silently."""
+        data = _minimal_deployment()
+        # Don't add capability_keys to any adapter
+        path = _write_deployment(data)
+        deploy = Deployment(path)
+        deploy.validate_capabilities()  # Should not raise (backwards compat)
+        os.unlink(path)
+
+    def test_validate_capabilities_partial_coverage(self):
+        """Some adapters have keys, missing total coverage → error."""
+        data = _minimal_deployment()
+        # Only planning adapter has capability_keys, others don't
+        data["adapters"]["planning"]["capability_keys"] = [
+            "planning.motion.joint_goal",
+            "planning.motion.pose_goal",
+            "planning.trajectory.time_parameterized",
+        ]
+        # context and execution have no capability_keys
+        path = _write_deployment(data)
+        deploy = Deployment(path)
+        with pytest.raises(DeploymentValidationError, match="Missing capability keys"):
+            deploy.validate_capabilities()
+        os.unlink(path)

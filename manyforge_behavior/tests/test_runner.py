@@ -186,3 +186,87 @@ class TestRunnerDeployment:
         runner.load()
         assert runner.deployment is None
         runner.build_tree()  # Should not raise
+
+
+class TestRunnerCapabilities:
+    def test_runner_validates_capabilities_on_load(self, kernel):
+        """Deployment with capability keys → load succeeds."""
+        runner = OrchestratorRunner(
+            CATALOG_PATH, FIXTURE_PATH, kernel,
+            deployment_path=DEPLOYMENT_FIXTURE)
+        runner.load()  # Should not raise
+        assert runner.deployment is not None
+
+    def test_runner_rejects_missing_capabilities(self, kernel):
+        """Deployment missing a key → load raises error."""
+        import tempfile
+        import yaml
+        data = {
+            "api_version": "manyforge.deployment.v0",
+            "schema_version": "0.1.0",
+            "name": "test",
+            "program_profile": "v0.0",
+            "robot_config": {
+                "robot_id": "ur5", "group_id": "arm",
+                "urdf_path": "test.urdf",
+                "global_max_tcp_linear_speed_mps": 0.25,
+            },
+            "adapters": {
+                "planning": {
+                    "adapter_id": "p",
+                    "adapter_version": "0.1.0",
+                    "supported_profiles": ["v0.0"],
+                    "capability_keys": [
+                        "planning.motion.joint_goal",
+                        "planning.motion.pose_goal",
+                        # Missing: planning.trajectory.time_parameterized
+                    ],
+                    "config": {},
+                },
+                "context": {
+                    "adapter_id": "c",
+                    "adapter_version": "0.1.0",
+                    "supported_profiles": ["v0.0"],
+                    "capability_keys": [
+                        "context.state.current",
+                        "context.validation.trajectory",
+                        "context.collision.check",
+                        "context.kinematics.fk",
+                        "context.limits.joint",
+                        "scene.shape.box",
+                        "scene.shape.sphere",
+                        "scene.edit.add",
+                        "scene.edit.remove",
+                        "scene.edit.update_pose",
+                    ],
+                    "config": {},
+                },
+                "execution": {
+                    "adapter_id": "e",
+                    "adapter_version": "0.1.0",
+                    "supported_profiles": ["v0.0"],
+                    "capability_keys": [
+                        "execution.trajectory.execute",
+                        "execution.feedback.phase_events",
+                        "execution.stop.soft",
+                        "execution.pause",
+                        "execution.resume",
+                        "execution.reset",
+                    ],
+                    "config": {},
+                },
+            },
+            "orchestrator": {"engine": "py_trees", "config": {}},
+            "launch": {"runner": {"module": "m", "args": []}},
+        }
+        f = tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False)
+        yaml.dump(data, f)
+        f.close()
+        runner = OrchestratorRunner(
+            CATALOG_PATH, FIXTURE_PATH, kernel,
+            deployment_path=f.name)
+        from manyforge_behavior.deployment import DeploymentValidationError
+        with pytest.raises(DeploymentValidationError, match="Missing capability keys"):
+            runner.load()
+        import os
+        os.unlink(f.name)

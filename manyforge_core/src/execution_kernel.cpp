@@ -73,6 +73,14 @@ void ExecutionKernel::async_execute_worker(const ExecuteRequestDTO& request,
       if (cached.has_value()) {
         cache_hit = true;
         trajectory = std::move(*cached);
+      } else {
+        // Cache miss - emit event and increment counter
+        emit_event({KernelEventType::kCacheMiss, exec_id, clock_.now(),
+                     {}, {}, std::nullopt, {{"move_id", request.move_id}}});
+        {
+          std::lock_guard<std::mutex> lock(metrics_mutex_);
+          metrics_.cache_misses++;
+        }
       }
     }
 
@@ -100,6 +108,13 @@ void ExecutionKernel::async_execute_worker(const ExecuteRequestDTO& request,
         if (!goal_compat) {
           cache_.invalidate(request.move_id);
           cache_hit = false;
+          // Emit cache invalidated event
+          emit_event({KernelEventType::kCacheInvalidated, exec_id, clock_.now(),
+                       {}, {}, std::nullopt, {{"move_id", request.move_id}}});
+          {
+            std::lock_guard<std::mutex> lock(metrics_mutex_);
+            metrics_.cache_invalidations++;
+          }
         }
       }
     }
@@ -110,54 +125,66 @@ void ExecutionKernel::async_execute_worker(const ExecuteRequestDTO& request,
       auto r = sm_.try_transition(ExecutionState::kValidating);
       if (!r.ok()) {
         emit_event({KernelEventType::kErrorRaised, exec_id, clock_.now(),
-                     {}, {}, ErrorDTO{kErrorInternalError, "State transition failed", {}}});
+                     {}, {}, ErrorDTO{kErrorInternalError, "State transition failed", {}}, {}});
         sm_.set_last_error(ErrorCode::kInternalError);
         sm_.try_transition(ExecutionState::kFailed);
         emit_event({KernelEventType::kStateTransition, exec_id, clock_.now(),
-                     prev_state, ExecutionState::kFailed, std::nullopt});
+                     prev_state, ExecutionState::kFailed, std::nullopt, {}});
         execution_complete_.store(true);
         completion_cv_.notify_all();
         return;
       }
 
       emit_event({KernelEventType::kStateTransition, exec_id, clock_.now(),
-                   prev_state, ExecutionState::kValidating, std::nullopt});
-      emit_event({KernelEventType::kCacheHit, exec_id, clock_.now(), {}, {}, std::nullopt});
+                   prev_state, ExecutionState::kValidating, std::nullopt, {}});
+      emit_event({KernelEventType::kCacheHit, exec_id, clock_.now(), {}, {}, std::nullopt, {}});
+      {
+        std::lock_guard<std::mutex> lock(metrics_mutex_);
+        metrics_.cache_hits++;
+      }
     } else {
       // Idle -> Planning
       auto prev_state = sm_.status().state;
       auto r = sm_.try_transition(ExecutionState::kPlanning);
       if (!r.ok()) {
         emit_event({KernelEventType::kErrorRaised, exec_id, clock_.now(),
-                     {}, {}, ErrorDTO{kErrorInternalError, "State transition failed", {}}});
+                     {}, {}, ErrorDTO{kErrorInternalError, "State transition failed", {}}, {}});
         sm_.set_last_error(ErrorCode::kInternalError);
         sm_.try_transition(ExecutionState::kFailed);
         emit_event({KernelEventType::kStateTransition, exec_id, clock_.now(),
-                     prev_state, ExecutionState::kFailed, std::nullopt});
+                     prev_state, ExecutionState::kFailed, std::nullopt, {}});
         execution_complete_.store(true);
         completion_cv_.notify_all();
         return;
       }
 
       emit_event({KernelEventType::kStateTransition, exec_id, clock_.now(),
-                   prev_state, ExecutionState::kPlanning, std::nullopt});
-      emit_event({KernelEventType::kPlanStarted, exec_id, clock_.now(), {}, {}, std::nullopt});
+                   prev_state, ExecutionState::kPlanning, std::nullopt, {}});
+      emit_event({KernelEventType::kPlanStarted, exec_id, clock_.now(), {}, {}, std::nullopt, {}});
 
       auto plan_result = plan_trajectory(request);
       if (!plan_result.ok()) {
         emit_event({KernelEventType::kErrorRaised, exec_id, clock_.now(),
-                     {}, {}, plan_result.error()});
+                     {}, {}, plan_result.error(), {}});
+        {
+          std::lock_guard<std::mutex> lock(metrics_mutex_);
+          metrics_.plans_failed++;
+        }
         sm_.set_last_error(ErrorCode::kPlanningFailed);
         sm_.try_transition(ExecutionState::kFailed);
         emit_event({KernelEventType::kStateTransition, exec_id, clock_.now(),
-                     ExecutionState::kPlanning, ExecutionState::kFailed, std::nullopt});
+                     ExecutionState::kPlanning, ExecutionState::kFailed, std::nullopt, {}});
         execution_complete_.store(true);
         completion_cv_.notify_all();
         return;
       }
       trajectory = std::move(plan_result.value());
 
-      emit_event({KernelEventType::kPlanCompleted, exec_id, clock_.now(), {}, {}, std::nullopt});
+      emit_event({KernelEventType::kPlanCompleted, exec_id, clock_.now(), {}, {}, std::nullopt, {}});
+      {
+        std::lock_guard<std::mutex> lock(metrics_mutex_);
+        metrics_.plans_succeeded++;
+      }
 
       // Check for stop/reset after planning (spec 230 §6.2)
       if (stop_policy_.stop_requested()) {
@@ -165,10 +192,10 @@ void ExecutionKernel::async_execute_worker(const ExecuteRequestDTO& request,
         // Stop -> go to Stopped with kPlanningTimeout
         sm_.set_last_error(ErrorCode::kPlanningTimeout);
         emit_event({KernelEventType::kErrorRaised, exec_id, clock_.now(),
-                     {}, {}, ErrorDTO{kErrorPlanningTimeout, "Planning interrupted by stop", {}}});
+                     {}, {}, ErrorDTO{kErrorPlanningTimeout, "Planning interrupted by stop", {}}, {}});
         sm_.try_transition(ExecutionState::kStopped);
         emit_event({KernelEventType::kStateTransition, exec_id, clock_.now(),
-                     prev, ExecutionState::kStopped, std::nullopt});
+                     prev, ExecutionState::kStopped, std::nullopt, {}});
         execution_complete_.store(true);
         completion_cv_.notify_all();
         return;
@@ -178,9 +205,9 @@ void ExecutionKernel::async_execute_worker(const ExecuteRequestDTO& request,
         auto prev = sm_.status().state;
         sm_.set_last_error(ErrorCode::kPlanningTimeout);
         emit_event({KernelEventType::kErrorRaised, exec_id, clock_.now(),
-                     {}, {}, ErrorDTO{kErrorPlanningTimeout, "Planning interrupted by reset", {}}});
+                     {}, {}, ErrorDTO{kErrorPlanningTimeout, "Planning interrupted by reset", {}}, {}});
         emit_event({KernelEventType::kStateTransition, exec_id, clock_.now(),
-                     prev, ExecutionState::kIdle, std::nullopt});
+                     prev, ExecutionState::kIdle, std::nullopt, {}});
         execution_complete_.store(true);
         completion_cv_.notify_all();
         return;
@@ -193,34 +220,52 @@ void ExecutionKernel::async_execute_worker(const ExecuteRequestDTO& request,
         sm_.set_last_error(ErrorCode::kInternalError);
         sm_.try_transition(ExecutionState::kFailed);
         emit_event({KernelEventType::kStateTransition, exec_id, clock_.now(),
-                     prev_state2, ExecutionState::kFailed, std::nullopt});
+                     prev_state2, ExecutionState::kFailed, std::nullopt, {}});
         execution_complete_.store(true);
         completion_cv_.notify_all();
         return;
       }
       emit_event({KernelEventType::kStateTransition, exec_id, clock_.now(),
-                   prev_state2, ExecutionState::kValidating, std::nullopt});
+                   prev_state2, ExecutionState::kValidating, std::nullopt, {}});
     }
 
-    emit_event({KernelEventType::kValidationStarted, exec_id, clock_.now(), {}, {}, std::nullopt});
+    emit_event({KernelEventType::kValidationStarted, exec_id, clock_.now(), {}, {}, std::nullopt, {}});
 
     auto val_result = validate_trajectory(trajectory, request);
     if (!val_result.ok()) {
+      // Emit validation failed event BEFORE error raised
+      emit_event({KernelEventType::kValidationFailed, exec_id, clock_.now(),
+                   {}, {}, std::nullopt, {{"reason", "validation failed"}}});
       emit_event({KernelEventType::kErrorRaised, exec_id, clock_.now(),
-                   {}, {}, val_result.error()});
+                   {}, {}, val_result.error(), {}});
+      {
+        std::lock_guard<std::mutex> lock(metrics_mutex_);
+        metrics_.validations_failed++;
+      }
       sm_.set_last_error(ErrorCode::kValidationCollision);
       sm_.try_transition(ExecutionState::kFailed);
       emit_event({KernelEventType::kStateTransition, exec_id, clock_.now(),
-                   ExecutionState::kValidating, ExecutionState::kFailed, std::nullopt});
+                   ExecutionState::kValidating, ExecutionState::kFailed, std::nullopt, {}});
       if (request.cache_mode != CacheMode::kDisable) {
         cache_.invalidate(request.move_id);
+        // Emit cache invalidated event
+        emit_event({KernelEventType::kCacheInvalidated, exec_id, clock_.now(),
+                     {}, {}, std::nullopt, {{"move_id", request.move_id}}});
+        {
+          std::lock_guard<std::mutex> lock(metrics_mutex_);
+          metrics_.cache_invalidations++;
+        }
       }
       execution_complete_.store(true);
       completion_cv_.notify_all();
       return;
     }
 
-    emit_event({KernelEventType::kValidationPassed, exec_id, clock_.now(), {}, {}, std::nullopt});
+    emit_event({KernelEventType::kValidationPassed, exec_id, clock_.now(), {}, {}, std::nullopt, {}});
+    {
+      std::lock_guard<std::mutex> lock(metrics_mutex_);
+      metrics_.validations_passed++;
+    }
 
     // Check for stop/reset after validation (spec 230 §6.2)
     if (stop_policy_.stop_requested()) {
@@ -228,10 +273,10 @@ void ExecutionKernel::async_execute_worker(const ExecuteRequestDTO& request,
       // Stop -> go to Stopped with kInternalError
       sm_.set_last_error(ErrorCode::kInternalError);
       emit_event({KernelEventType::kErrorRaised, exec_id, clock_.now(),
-                   {}, {}, ErrorDTO{kErrorInternalError, "Validation interrupted by stop", {}}});
+                   {}, {}, ErrorDTO{kErrorInternalError, "Validation interrupted by stop", {}}, {}});
       sm_.try_transition(ExecutionState::kStopped);
       emit_event({KernelEventType::kStateTransition, exec_id, clock_.now(),
-                   prev, ExecutionState::kStopped, std::nullopt});
+                   prev, ExecutionState::kStopped, std::nullopt, {}});
       execution_complete_.store(true);
       completion_cv_.notify_all();
       return;
@@ -241,9 +286,9 @@ void ExecutionKernel::async_execute_worker(const ExecuteRequestDTO& request,
       auto prev = sm_.status().state;
       sm_.set_last_error(ErrorCode::kInternalError);
       emit_event({KernelEventType::kErrorRaised, exec_id, clock_.now(),
-                   {}, {}, ErrorDTO{kErrorInternalError, "Validation interrupted by reset", {}}});
+                   {}, {}, ErrorDTO{kErrorInternalError, "Validation interrupted by reset", {}}, {}});
       emit_event({KernelEventType::kStateTransition, exec_id, clock_.now(),
-                   prev, ExecutionState::kIdle, std::nullopt});
+                   prev, ExecutionState::kIdle, std::nullopt, {}});
       execution_complete_.store(true);
       completion_cv_.notify_all();
       return;
@@ -261,32 +306,40 @@ void ExecutionKernel::async_execute_worker(const ExecuteRequestDTO& request,
       sm_.set_last_error(ErrorCode::kInternalError);
       sm_.try_transition(ExecutionState::kFailed);
       emit_event({KernelEventType::kStateTransition, exec_id, clock_.now(),
-                   prev_state3, ExecutionState::kFailed, std::nullopt});
+                   prev_state3, ExecutionState::kFailed, std::nullopt, {}});
       execution_complete_.store(true);
       completion_cv_.notify_all();
       return;
     }
     emit_event({KernelEventType::kStateTransition, exec_id, clock_.now(),
-                 prev_state3, ExecutionState::kExecuting, std::nullopt});
+                 prev_state3, ExecutionState::kExecuting, std::nullopt, {}});
 
-    emit_event({KernelEventType::kExecuteStarted, exec_id, clock_.now(), {}, {}, std::nullopt});
+    emit_event({KernelEventType::kExecuteStarted, exec_id, clock_.now(), {}, {}, std::nullopt, {}});
 
     execution_backend_.execute_trajectory(trajectory);
 
-    emit_event({KernelEventType::kExecuteCompleted, exec_id, clock_.now(), {}, {}, std::nullopt});
+    emit_event({KernelEventType::kExecuteCompleted, exec_id, clock_.now(), {}, {}, std::nullopt, {}});
 
     sm_.set_progress(1.0);
     auto prev_state4 = sm_.status().state;
     sm_.try_transition(ExecutionState::kCompleted);
     emit_event({KernelEventType::kStateTransition, exec_id, clock_.now(),
-                 prev_state4, ExecutionState::kCompleted, std::nullopt});
+                 prev_state4, ExecutionState::kCompleted, std::nullopt, {}});
+    {
+      std::lock_guard<std::mutex> metrics_lock(metrics_mutex_);
+      metrics_.executions_completed++;
+    }
 
   } catch (const std::exception& e) {
     sm_.set_last_error(ErrorCode::kInternalError);
     auto prev_state = sm_.status().state;
     sm_.try_transition(ExecutionState::kFailed);
     emit_event({KernelEventType::kStateTransition, exec_id, clock_.now(),
-                 prev_state, ExecutionState::kFailed, std::nullopt});
+                 prev_state, ExecutionState::kFailed, std::nullopt, {}});
+    {
+      std::lock_guard<std::mutex> metrics_lock(metrics_mutex_);
+      metrics_.executions_failed++;
+    }
   }
 
   execution_complete_.store(true);
@@ -332,11 +385,13 @@ StopResultDTO ExecutionKernel::stop() {
   if (result.ok()) {
     // Emit kStopIssued event
     emit_event({KernelEventType::kStopIssued, sm_.status().execution_id, clock_.now(),
-                {}, {}, std::nullopt});
+                {}, {}, std::nullopt, {}});
     // Emit state transition event
     auto new_state = sm_.status().state;
     emit_event({KernelEventType::kStateTransition, sm_.status().execution_id, clock_.now(),
-                prev_state, new_state, std::nullopt});
+                prev_state, new_state, std::nullopt, {}});
+    std::lock_guard<std::mutex> lock(metrics_mutex_);
+    metrics_.stops_issued++;
     return StopResultDTO{true, std::nullopt};
   }
   return StopResultDTO{false, result.error()};
@@ -347,7 +402,7 @@ PauseResultDTO ExecutionKernel::pause() {
   if (result.ok()) {
     // Emit kPauseRequested event
     emit_event({KernelEventType::kPauseRequested, sm_.status().execution_id, clock_.now(),
-                {}, {}, std::nullopt});
+                {}, {}, std::nullopt, {}});
     return PauseResultDTO{true, std::nullopt};
   }
   return PauseResultDTO{false, result.error()};
@@ -358,7 +413,7 @@ ResumeResultDTO ExecutionKernel::resume() {
   if (result.ok()) {
     // Emit kResumeRequested event
     emit_event({KernelEventType::kResumeRequested, sm_.status().execution_id, clock_.now(),
-                {}, {}, std::nullopt});
+                {}, {}, std::nullopt, {}});
     return ResumeResultDTO{true, std::nullopt};
   }
   return ResumeResultDTO{false, result.error()};
@@ -371,7 +426,7 @@ ResetResultDTO ExecutionKernel::reset() {
     active_move_id_.clear();
     // Emit state transition event to Idle
     emit_event({KernelEventType::kStateTransition, sm_.status().execution_id, clock_.now(),
-                prev_state, ExecutionState::kIdle, std::nullopt});
+                prev_state, ExecutionState::kIdle, std::nullopt, {}});
     return ResetResultDTO{true, std::nullopt};
   }
   return ResetResultDTO{false, result.error()};
@@ -381,6 +436,11 @@ ExecutionStatus ExecutionKernel::get_status() const {
   auto status = sm_.status();
   status.active_move_id = active_move_id_;
   return status;
+}
+
+MetricsSnapshot ExecutionKernel::get_metrics() const {
+  std::lock_guard<std::mutex> lock(metrics_mutex_);
+  return metrics_;
 }
 
 Result<void> ExecutionKernel::collision_check_tick() {
@@ -393,6 +453,21 @@ Result<void> ExecutionKernel::collision_check_tick() {
     CollisionCheckRequestDTO req;
     req.robot_state = state;
     auto check = context_.collision_check(req);
+
+    if (check.in_collision) {
+      // Emit collision detected event
+      KernelEvent collision_event;
+      collision_event.type = KernelEventType::kCollisionDetected;
+      collision_event.execution_id = sm_.status().execution_id;
+      collision_event.timestamp_ns = clock_.now();
+      collision_event.details["contact_a"] = check.contact_body_a.value_or("");
+      collision_event.details["contact_b"] = check.contact_body_b.value_or("");
+      emit_event(collision_event);
+      {
+        std::lock_guard<std::mutex> collision_metrics_lock(metrics_mutex_);
+        metrics_.collision_detections++;
+      }
+    }
 
     return collision_policy_.handle_collision(check);
   } catch (const std::exception& e) {

@@ -3,6 +3,8 @@
 #include <cstdint>
 #include <optional>
 #include <functional>
+#include <map>
+#include <string>
 
 #include <manyforge_core/types/execution_status.hpp>
 #include <manyforge_core/types/error_code.hpp>
@@ -15,8 +17,11 @@ enum class KernelEventType {
   kPlanStarted,      // planning phase started
   kPlanCompleted,    // planning phase completed
   kCacheHit,         // trajectory found in cache
+  kCacheMiss,        // cache lookup returned empty
+  kCacheInvalidated, // cached trajectory invalidated
   kValidationStarted,  // validation phase started
   kValidationPassed,   // validation passed
+  kValidationFailed,   // validation failed
   kExecuteStarted,     // execution phase started
   kExecuteCompleted,   // execution phase completed
   kStopRequested,      // stop requested
@@ -24,6 +29,7 @@ enum class KernelEventType {
   kPauseRequested,     // pause requested
   kResumeRequested,    // resume requested
   kErrorRaised,        // error occurred
+  kCollisionDetected,  // collision detected during execution
 };
 
 /// Kernel event structure (spec §6.1)
@@ -38,6 +44,9 @@ struct KernelEvent {
 
   // For kErrorRaised
   std::optional<ErrorDTO> error;
+
+  // General-purpose structured key-value data
+  std::map<std::string, std::string> details;
 };
 
 /// Event callback type. Must be thread-safe.

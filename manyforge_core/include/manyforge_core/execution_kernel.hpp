@@ -12,6 +12,7 @@
 #include <manyforge_core/types/execute_request.hpp>
 #include <manyforge_core/types/execution_result.hpp>
 #include <manyforge_core/types/kernel_event.hpp>
+#include <manyforge_core/types/metrics.hpp>
 
 #include <atomic>
 #include <cstdint>
@@ -80,6 +81,9 @@ class ExecutionKernel {
   /// @return true if execution completed, false if timed out.
   bool wait_for_completion(int64_t timeout_ns = 0);
 
+  /// Get current metrics snapshot.
+  MetricsSnapshot get_metrics() const;
+
  private:
   Result<TrajectoryDTO> plan_trajectory(const ExecuteRequestDTO& request);
   Result<void> validate_trajectory(const TrajectoryDTO& trajectory,
@@ -116,6 +120,10 @@ class ExecutionKernel {
   std::condition_variable completion_cv_;
   std::mutex completion_mutex_;
   std::atomic<bool> execution_complete_{false};
+
+  // Metrics (atomic counters for thread safety)
+  mutable std::mutex metrics_mutex_;
+  MetricsSnapshot metrics_;
 };
 
 }  // namespace manyforge::core

@@ -16,15 +16,40 @@ adapters:
   planning:
     adapter_id: planning.roboplan
     adapter_version: "0.1.0"
+    supported_profiles: ["v0.0"]
+    capability_keys:
+      - planning.motion.joint_goal
+      - planning.motion.pose_goal
+      - planning.trajectory.time_parameterized
     config:
       rng_seed: 12345
   context:
     adapter_id: planning.roboplan_context
     adapter_version: "0.1.0"
+    supported_profiles: ["v0.0"]
+    capability_keys:
+      - context.state.current
+      - context.validation.trajectory
+      - context.collision.check
+      - context.kinematics.fk
+      - context.limits.joint
+      - scene.shape.box
+      - scene.shape.sphere
+      - scene.edit.add
+      - scene.edit.remove
+      - scene.edit.update_pose
     config: {}
   execution:
     adapter_id: execution.ros2_control_fjt
     adapter_version: "0.1.0"
+    supported_profiles: ["v0.0"]
+    capability_keys:
+      - execution.trajectory.execute
+      - execution.feedback.phase_events
+      - execution.stop.soft
+      - execution.pause
+      - execution.resume
+      - execution.reset
     config:
       action_name: /joint_trajectory_controller/follow_joint_trajectory
       supports_pause_resume: true
