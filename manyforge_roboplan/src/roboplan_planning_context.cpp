@@ -49,7 +49,7 @@ core::ValidationResultDTO RoboPlanPlanningContext::validate_trajectory(
     // TCP linear speed limit check (spec 230 §3.3, ADR-0015).
     if (options.max_tcp_linear_speed_mps > 0.0 &&
         !options.tcp_frame.empty() && trajectory.waypoints.size() >= 2) {
-      Eigen::Vector3d prev_pos;
+      Eigen::Vector3d prev_pos = Eigen::Vector3d::Zero();
       bool have_prev = false;
 
       for (size_t i = 0; i < trajectory.waypoints.size(); ++i) {

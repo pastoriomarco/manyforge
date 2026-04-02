@@ -12,9 +12,14 @@ find_package(pybind11 CONFIG REQUIRED)
 
 # manyforge_core directory (passed from command line)
 set(MANYFORGE_CORE_DIR "${MANYFORGE_CORE_DIR}" CACHE PATH "Path to manyforge_core build")
+set(MANYFORGE_CORE_INCLUDE_DIR "${MANYFORGE_CORE_INCLUDE_DIR}" CACHE PATH "Path to manyforge_core headers")
 
-# Add manyforge_core headers
-include_directories(${MANYFORGE_CORE_DIR}/../include)
+# Add manyforge_core headers (try explicit include dir, then fall back to build-dir/../include)
+if(MANYFORGE_CORE_INCLUDE_DIR)
+  include_directories(${MANYFORGE_CORE_INCLUDE_DIR})
+else()
+  include_directories(${MANYFORGE_CORE_DIR}/../include)
+endif()
 
 # Python bindings module
 pybind11_add_module(manyforge_core_py

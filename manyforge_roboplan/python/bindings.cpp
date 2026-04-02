@@ -102,6 +102,10 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
         }
 
         auto result = self.kernel->execute(req);
+        // Wait for async execution to complete (Python clients expect sync)
+        if (result.ok()) {
+          self.kernel->wait_for_completion();
+        }
         auto d = result_to_python(result);
         // Include trajectory duration for speed enforcement tests
         if (result.ok()) {

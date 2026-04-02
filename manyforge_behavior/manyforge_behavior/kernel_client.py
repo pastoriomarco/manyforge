@@ -134,6 +134,10 @@ class MockKernelClient(KernelClient):
 
     def execute(self, request: ExecuteRequest) -> ExecuteResult:
         self.execute_count += 1
+        # Auto-reset from terminal states, matching C++ ExecutionKernel behavior
+        terminal_states = {ExecutionState.COMPLETED, ExecutionState.FAILED, ExecutionState.STOPPED}
+        if self._state in terminal_states:
+            self._state = ExecutionState.IDLE
         if self._state != ExecutionState.IDLE:
             return ExecuteResult(ok=False, error="Not in IDLE state")
         if self.fail_next_execute:

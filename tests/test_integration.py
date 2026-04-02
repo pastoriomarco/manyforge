@@ -393,7 +393,7 @@ class TestErrorPaths:
         assert result.accepted is False
 
     def test_auto_reset_on_sequential_execute(self, mock_kernel):
-        """Second execute after completed — MockKernelClient requires explicit reset."""
+        """Second execute after completed — auto-resets from terminal state (matches C++ kernel)."""
         request1 = ExecuteRequest(
             robot_id="robot1", group_id="arm", move_id="move1",
             base_frame="base_link", tcp_frame="tcp",
@@ -406,7 +406,7 @@ class TestErrorPaths:
         result1 = mock_kernel.execute(request1)
         assert result1.ok is True
 
-        # MockKernelClient doesn't auto-reset — second execute from COMPLETED fails
+        # Auto-reset from COMPLETED — sequential execute succeeds
         request2 = ExecuteRequest(
             robot_id="robot1", group_id="arm", move_id="move2",
             base_frame="base_link", tcp_frame="tcp",
@@ -417,12 +417,7 @@ class TestErrorPaths:
             planning_timeout_s=5.0, execution_timeout_s=10.0,
         )
         result2 = mock_kernel.execute(request2)
-        assert result2.ok is False  # Not in IDLE
-
-        # Explicit reset fixes it
-        mock_kernel.reset()
-        result3 = mock_kernel.execute(request2)
-        assert result3.ok is True
+        assert result2.ok is True
 
     def test_reset_recovers(self, mock_kernel):
         """After failure, reset returns to IDLE, can execute again."""

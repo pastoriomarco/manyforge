@@ -74,14 +74,9 @@ class TestMoveManipulatorAction:
         status = _tick_node(node)
         assert status == py_trees.common.Status.FAILURE
 
-    def test_from_non_idle(self, kernel, bb_with_kernel):
-        """Execute from non-IDLE should fail."""
-        kernel.execute(
-            __import__("manyforge_behavior.kernel_client", fromlist=["ExecuteRequest"]).ExecuteRequest(
-                robot_id="r", group_id="g", move_id="m0",
-                base_frame="b", tcp_frame="t", motion_type="joint_goal",
-            )
-        )
+    def test_from_non_idle_non_terminal(self, kernel, bb_with_kernel):
+        """Execute from non-terminal non-IDLE state (e.g. EXECUTING) should fail."""
+        kernel._state = ExecutionState.EXECUTING
         node = MoveManipulatorAction(
             name="test_move_busy",
             move_id="m1",

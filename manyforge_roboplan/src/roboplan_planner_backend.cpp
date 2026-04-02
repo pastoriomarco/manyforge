@@ -129,7 +129,7 @@ core::PlanResultDTO RoboPlanPlannerBackend::plan(const core::PlanRequestDTO& req
 
       // Compute max TCP linear speed across trajectory segments
       double max_tcp_speed = 0.0;
-      Eigen::Vector3d prev_pos;
+      Eigen::Vector3d prev_pos = Eigen::Vector3d::Zero();
       bool have_prev = false;
 
       for (size_t i = 0; i < final_traj.times.size(); ++i) {

@@ -1,0 +1,17 @@
+# Build artifacts
+manyforge_core/build/
+manyforge_core/python/build/
+manyforge_roboplan/build/
+
+# Python caches
+__pycache__/
+*.pyc
+*.egg-info/
+.eggs/
+
+# Git
+.git/
+
+# IDE
+.vscode/
+.idea/

@@ -134,6 +134,7 @@ TEST_F(NativeKernelTest, ExecuteJointGoalSucceeds) {
   EXPECT_TRUE(result.ok()) << "Execute failed: "
                            << (result.ok() ? "" : result.error().message);
 
+  bundle_->kernel->wait_for_completion();
   auto status = bundle_->kernel->get_status();
   EXPECT_EQ(status.state, ExecutionState::kCompleted);
 }
@@ -159,6 +160,7 @@ TEST_F(NativeKernelTest, ExecuteAndResetCycle) {
   // Execute
   auto result = bundle_->kernel->execute(req);
   EXPECT_TRUE(result.ok());
+  bundle_->kernel->wait_for_completion();
 
   // Reset
   auto reset_result = bundle_->kernel->reset();
@@ -169,6 +171,7 @@ TEST_F(NativeKernelTest, ExecuteAndResetCycle) {
   req.move_id = "native_cycle_2";
   auto result2 = bundle_->kernel->execute(req);
   EXPECT_TRUE(result2.ok());
+  bundle_->kernel->wait_for_completion();
 }
 
 TEST_F(NativeKernelTest, CacheHitSkipsPlanning) {
@@ -192,6 +195,7 @@ TEST_F(NativeKernelTest, CacheHitSkipsPlanning) {
   // First execute — plans and caches
   auto r1 = bundle_->kernel->execute(req);
   EXPECT_TRUE(r1.ok());
+  bundle_->kernel->wait_for_completion();
   EXPECT_EQ(bundle_->cache->size(), 1u);
 
   bundle_->kernel->reset();
@@ -199,6 +203,7 @@ TEST_F(NativeKernelTest, CacheHitSkipsPlanning) {
   // Second execute — should hit cache
   auto r2 = bundle_->kernel->execute(req);
   EXPECT_TRUE(r2.ok());
+  bundle_->kernel->wait_for_completion();
   EXPECT_EQ(bundle_->cache->size(), 1u);  // Still 1 entry
 }
 
