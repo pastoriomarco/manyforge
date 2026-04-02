@@ -455,6 +455,82 @@ entries:
       emits_events: []
       consumes_events: []
 
+  - id: attach_object_to_link
+    name: AttachObjectToLink
+    category: scene
+    description: >-
+      Attach a scene object to a robot link. Computes the relative transform
+      from the link's current FK pose, removes the object from world, and
+      re-adds it attached to the link frame for collision-aware planning.
+    tags: [scene, collision, attach]
+    profiles:
+      min_profile: v0.0
+    kind: leaf
+    children:
+      min: 0
+      max: 0
+    parameters:
+      - name: object_id
+        type: string
+        required: true
+        description: Object to attach (must exist in scene).
+      - name: link_frame
+        type: string
+        required: true
+        description: Robot link to attach to (e.g. "tool0").
+    required_capabilities:
+      - scene.edit.add
+      - scene.edit.remove
+      - context.kinematics.fk
+    execution:
+      blocking: true
+      cancellable: false
+    runners:
+      py_trees:
+        implementation_kind: plugin
+        class: manyforge_behavior.nodes.AttachObjectToLink
+    observability:
+      emits_events: []
+      consumes_events: []
+
+  - id: detach_object_from_link
+    name: DetachObjectFromLink
+    category: scene
+    description: >-
+      Detach an object from a robot link and place it in the world frame.
+      Computes the object's world pose from the link FK and stored relative
+      transform, then removes from link and re-adds at world position.
+    tags: [scene, collision, detach]
+    profiles:
+      min_profile: v0.0
+    kind: leaf
+    children:
+      min: 0
+      max: 0
+    parameters:
+      - name: object_id
+        type: string
+        required: true
+        description: Original object_id (attached version is object_id + "_attached").
+      - name: link_frame
+        type: string
+        required: true
+        description: Robot link it's attached to (e.g. "tool0").
+    required_capabilities:
+      - scene.edit.add
+      - scene.edit.remove
+      - context.kinematics.fk
+    execution:
+      blocking: true
+      cancellable: false
+    runners:
+      py_trees:
+        implementation_kind: plugin
+        class: manyforge_behavior.nodes.DetachObjectFromLink
+    observability:
+      emits_events: []
+      consumes_events: []
+
   # ---------------------------------------------------------------------------
   # Logic / blackboard
   # ---------------------------------------------------------------------------

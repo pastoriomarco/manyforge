@@ -2,6 +2,8 @@
 #include <pybind11/stl.h>
 #include <pybind11/functional.h>
 
+#include <Eigen/Dense>
+
 #include <manyforge_roboplan/native_kernel_factory.hpp>
 
 namespace py = pybind11;
@@ -29,6 +31,7 @@ py::dict status_to_python(const ExecutionStatus& status) {
   d["state_name"] = to_string(status.state);
   d["execution_id"] = status.execution_id;
   d["progress"] = status.progress;
+  d["last_error"] = to_string(status.last_error);
   return d;
 }
 
@@ -107,8 +110,13 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
           self.kernel->wait_for_completion();
         }
         auto d = result_to_python(result);
-        // Include trajectory duration for speed enforcement tests
+        // Include final execution status (captures async planning errors)
         if (result.ok()) {
+          auto final_status = self.kernel->get_status();
+          d["final_state"] = to_string(final_status.state);
+          d["final_error"] = to_string(final_status.last_error);
+
+          // Include trajectory duration for speed enforcement tests
           auto cached = self.cache->lookup(req.move_id);
           if (cached.has_value() && !cached->waypoints.empty()) {
             d["trajectory_duration_s"] = cached->waypoints.back().time_from_start_s;
@@ -202,6 +210,33 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
 
         return result;
       })
+      .def("set_joint_positions", [](NativeKernelBundle& self,
+                                      const std::vector<double>& positions) {
+        Eigen::VectorXd q(positions.size());
+        for (size_t i = 0; i < positions.size(); ++i) {
+          q[i] = positions[i];
+        }
+        self.scene->setJointPositions(q);
+      }, py::arg("positions"),
+      "Set the robot's current joint positions in the planning scene.")
+      .def("get_cached_trajectory", [](NativeKernelBundle& self,
+                                       const std::string& move_id) -> py::object {
+        auto cached = self.cache->lookup(move_id);
+        if (!cached.has_value() || cached->waypoints.empty()) {
+          return py::none();
+        }
+        py::dict result;
+        result["joint_names"] = cached->joint_names;
+        py::list waypoints;
+        for (const auto& wp : cached->waypoints) {
+          py::dict wp_dict;
+          wp_dict["time_from_start_s"] = wp.time_from_start_s;
+          wp_dict["positions_rad"] = wp.positions_rad;
+          waypoints.append(wp_dict);
+        }
+        result["waypoints"] = waypoints;
+        return result;
+      }, py::arg("move_id"), "Get cached trajectory waypoints for a move_id.")
       .def("get_link_pose", [](NativeKernelBundle& self,
                                 const std::string& target_frame,
                                 const std::string& base_frame) -> py::object {

@@ -16,6 +16,8 @@ from manyforge_behavior.kernel_client import (
     ExecutionStatus,
     SceneEditRequest,
     SceneEditResult,
+    Trajectory,
+    TrajectoryWaypoint,
 )
 
 # State int → ExecutionState mapping (matches C++ ExecutionState enum order)
@@ -80,6 +82,8 @@ class NativeKernelClient(KernelClient):
             error=result.get("error"),
             trajectory_duration_s=result.get("trajectory_duration_s"),
             trajectory_waypoint_count=result.get("trajectory_waypoint_count"),
+            final_state=result.get("final_state"),
+            final_error=result.get("final_error"),
         )
 
     def stop(self) -> CommandResult:
@@ -131,6 +135,22 @@ class NativeKernelClient(KernelClient):
         return SceneEditResult(
             success=result.get("success", False),
             error=result.get("error"),
+        )
+
+    def get_cached_trajectory(self, move_id: str) -> Optional[Trajectory]:
+        result = self._bundle.get_cached_trajectory(move_id)
+        if result is None:
+            return None
+        waypoints = [
+            TrajectoryWaypoint(
+                time_from_start_s=wp["time_from_start_s"],
+                positions_rad=list(wp["positions_rad"]),
+            )
+            for wp in result["waypoints"]
+        ]
+        return Trajectory(
+            joint_names=list(result["joint_names"]),
+            waypoints=waypoints,
         )
 
     def get_link_pose(

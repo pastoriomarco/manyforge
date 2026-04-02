@@ -1,7 +1,7 @@
 """ControlPanel - Viser GUI widgets for execution control."""
 
 import viser
-from typing import TYPE_CHECKING
+from typing import Callable, Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .state_bridge import StateBridge
@@ -63,14 +63,34 @@ class ControlPanel:
                 "Reset", color="blue"
             )
 
+        # Run Program button (green)
+        with self._buttons_folder:
+            self._run_button = server.gui.add_button(
+                "Run Program", color="green"
+            )
+
         # Wire up button click handlers
+        self._run_button.on_click(self._on_run_click)
         self._stop_button.on_click(self._on_stop_click)
         self._pause_button.on_click(self._on_pause_click)
         self._resume_button.on_click(self._on_resume_click)
         self._reset_button.on_click(self._on_reset_click)
 
+        # Callback for the Run button
+        self._run_callback: Optional[Callable[[], None]] = None
+
         # Initial update
         self.update()
+
+    def set_run_callback(self, callback: Callable[[], None]) -> None:
+        """Set callback invoked when the Run Program button is clicked."""
+        self._run_callback = callback
+
+    def _on_run_click(self, event: viser.GuiEvent) -> None:
+        """Handle Run Program button click."""
+        if self._run_callback:
+            self._run_button.disabled = True
+            self._run_callback()
 
     def _on_stop_click(self, event: viser.GuiEvent) -> None:
         """Handle Stop button click."""
@@ -112,6 +132,11 @@ class ControlPanel:
         self._pause_button.enabled = self._bridge.can_pause
         self._resume_button.enabled = self._bridge.can_resume
         self._reset_button.enabled = status.state != self._bridge.get_state().state or True  # Always enable reset
+
+    @property
+    def run_button(self) -> viser.GuiButtonHandle:
+        """Access the Run Program button."""
+        return self._run_button
 
     @property
     def stop_button(self) -> viser.GuiButtonHandle:

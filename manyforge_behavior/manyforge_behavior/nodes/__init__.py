@@ -1,6 +1,8 @@
 from manyforge_behavior.nodes.motion import MoveManipulatorAction, ResetTrajectories
 from manyforge_behavior.nodes.scene import (
     AddCollisionObject,
+    AttachObjectToLink,
+    DetachObjectFromLink,
     RemoveCollisionObject,
     UpdateCollisionObjectPose,
 )
@@ -15,6 +17,8 @@ __all__ = [
     "MoveManipulatorAction",
     "ResetTrajectories",
     "AddCollisionObject",
+    "AttachObjectToLink",
+    "DetachObjectFromLink",
     "RemoveCollisionObject",
     "UpdateCollisionObjectPose",
     "CheckKeyBoolValue",

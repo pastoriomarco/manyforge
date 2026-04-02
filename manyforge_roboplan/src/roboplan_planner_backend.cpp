@@ -1,8 +1,27 @@
 #include <manyforge_roboplan/roboplan_planner_backend.hpp>
 
 #include <Eigen/Dense>
+#include <cmath>
+#include <cstdio>
 #include <stdexcept>
 #include <variant>
+
+namespace {
+// Rotation matrix to RPY (ZYX convention, in degrees)
+void matrix_to_rpy_deg(const Eigen::Matrix4d& tform, double& roll, double& pitch, double& yaw) {
+  pitch = std::atan2(-tform(2,0), std::sqrt(tform(0,0)*tform(0,0) + tform(1,0)*tform(1,0)));
+  if (std::abs(std::cos(pitch)) > 1e-6) {
+    roll  = std::atan2(tform(2,1), tform(2,2));
+    yaw   = std::atan2(tform(1,0), tform(0,0));
+  } else {
+    roll  = std::atan2(-tform(1,2), tform(1,1));
+    yaw   = 0.0;
+  }
+  roll  *= 180.0 / M_PI;
+  pitch *= 180.0 / M_PI;
+  yaw   *= 180.0 / M_PI;
+}
+}  // namespace
 
 namespace manyforge::roboplan_backend {
 
@@ -22,6 +41,10 @@ core::PlanResultDTO RoboPlanPlannerBackend::plan(const core::PlanRequestDTO& req
   core::PlanResultDTO result;
 
   try {
+    fprintf(stderr, "[PLANNER] plan() called, move_id=%s, motion_type=%s\n",
+            request.move_id.c_str(),
+            std::holds_alternative<core::JointGoalDTO>(request.motion) ? "joint" : "pose");
+
     // Extract start state
     const auto& start = request.start_state;
     Eigen::VectorXd start_positions(start.positions_rad.size());
@@ -29,9 +52,27 @@ core::PlanResultDTO RoboPlanPlannerBackend::plan(const core::PlanRequestDTO& req
       start_positions[i] = start.positions_rad[i];
     }
 
+    fprintf(stderr, "[PLANNER] start joints: [");
+    for (size_t i = 0; i < start.positions_rad.size(); ++i)
+      fprintf(stderr, "%s%.4f", (i ? ", " : ""), start.positions_rad[i]);
+    fprintf(stderr, "]\n");
+
     roboplan::JointConfiguration start_config;
     start_config.joint_names = start.joint_names;
     start_config.positions = start_positions;
+
+    // Check start for self-collision
+    bool start_collision = scene_->hasCollisions(start_positions);
+
+    // FK of start pose
+    {
+      Eigen::Matrix4d start_fk = scene_->forwardKinematics(start_positions, request.tcp_frame);
+      double r, p, ya;
+      matrix_to_rpy_deg(start_fk, r, p, ya);
+      fprintf(stderr, "[PLANNER] start pose:  pos=(%.3f, %.3f, %.3f) rpy=(%.1f, %.1f, %.1f) collision=%s\n",
+              start_fk(0, 3), start_fk(1, 3), start_fk(2, 3), r, p, ya,
+              start_collision ? "YES" : "no");
+    }
 
     // Determine goal configuration based on motion type
     roboplan::JointConfiguration goal_config;
@@ -46,7 +87,6 @@ core::PlanResultDTO RoboPlanPlannerBackend::plan(const core::PlanRequestDTO& req
       goal_config.positions = goal_positions;
 
     } else if (auto* pose_goal = std::get_if<core::PoseGoalDTO>(&request.motion)) {
-      // Pose goal — solve IK first
       Eigen::Matrix4d tform = Eigen::Matrix4d::Identity();
       tform(0, 3) = pose_goal->goal.position_m.x_m;
       tform(1, 3) = pose_goal->goal.position_m.y_m;
@@ -67,6 +107,13 @@ core::PlanResultDTO RoboPlanPlannerBackend::plan(const core::PlanRequestDTO& req
       tform(2, 1) = 2*y*z + 2*x*w;
       tform(2, 2) = 1 - 2*x*x - 2*y*y;
 
+      {
+        double r, p, ya;
+        matrix_to_rpy_deg(tform, r, p, ya);
+        fprintf(stderr, "[PLANNER] goal pose:   pos=(%.3f, %.3f, %.3f) rpy=(%.1f, %.1f, %.1f)\n",
+                tform(0, 3), tform(1, 3), tform(2, 3), r, p, ya);
+      }
+
       roboplan::CartesianConfiguration cart_config;
       cart_config.base_frame = request.base_frame;
       cart_config.tip_frame = request.tcp_frame;
@@ -76,9 +123,30 @@ core::PlanResultDTO RoboPlanPlannerBackend::plan(const core::PlanRequestDTO& req
       goal_config.positions = start_positions;  // seed with current
 
       if (!ik_->solveIk(cart_config, start_config, goal_config)) {
-        result.error = core::ErrorDTO{core::kErrorIkFailed, "IK failed to find solution", {}};
+        double r, p, ya;
+        matrix_to_rpy_deg(tform, r, p, ya);
+        char buf[256];
+        snprintf(buf, sizeof(buf),
+                 "IK failed: goal pos=(%.3f,%.3f,%.3f) rpy=(%.1f,%.1f,%.1f) frame=%s->%s",
+                 tform(0,3), tform(1,3), tform(2,3), r, p, ya,
+                 request.base_frame.c_str(), request.tcp_frame.c_str());
+        result.error = core::ErrorDTO{core::kErrorIkFailed, std::string(buf), {}};
+        fprintf(stderr, "[PLANNER] IK FAILED\n");
         return result;
       }
+
+      fprintf(stderr, "[PLANNER] IK solved. goal: [");
+      for (int i = 0; i < goal_config.positions.size(); ++i)
+        fprintf(stderr, "%s%.4f", (i ? ", " : ""), goal_config.positions[i]);
+      fprintf(stderr, "]\n");
+
+      // Check goal for self-collision
+      bool goal_collision = scene_->hasCollisions(goal_config.positions);
+      fprintf(stderr, "[PLANNER] goal in collision: %s\n", goal_collision ? "YES" : "no");
+
+      // Compute joint-space distance
+      double jdist = (goal_config.positions - start_config.positions).norm();
+      fprintf(stderr, "[PLANNER] joint-space distance start→goal: %.4f rad\n", jdist);
 
     } else {
       result.error = core::ErrorDTO{core::kErrorInvalidRequest,
@@ -87,12 +155,31 @@ core::PlanResultDTO RoboPlanPlannerBackend::plan(const core::PlanRequestDTO& req
     }
 
     // Plan path with RRT
+    fprintf(stderr, "[PLANNER] calling RRT...\n");
     auto path_result = rrt_->plan(start_config, goal_config);
     if (!path_result.has_value()) {
-      result.error = core::ErrorDTO{core::kErrorPlanningFailed,
-                                     path_result.error(), {}};
+      fprintf(stderr, "[PLANNER] RRT FAILED: %s\n", path_result.error().c_str());
+
+      // Build detailed error message
+      std::string err_msg = "RRT failed: " + path_result.error();
+      err_msg += " | start=[";
+      for (int i = 0; i < start_config.positions.size(); ++i) {
+        if (i) err_msg += ",";
+        char buf[32]; snprintf(buf, sizeof(buf), "%.3f", start_config.positions[i]);
+        err_msg += buf;
+      }
+      err_msg += "] goal=[";
+      for (int i = 0; i < goal_config.positions.size(); ++i) {
+        if (i) err_msg += ",";
+        char buf[32]; snprintf(buf, sizeof(buf), "%.3f", goal_config.positions[i]);
+        err_msg += buf;
+      }
+      err_msg += "]";
+
+      result.error = core::ErrorDTO{core::kErrorPlanningFailed, err_msg, {}};
       return result;
     }
+    fprintf(stderr, "[PLANNER] RRT succeeded\n");
 
     // Shortcut the path
     auto smoothed_path = shortcutter_->shortcut(path_result.value(), 0.05);

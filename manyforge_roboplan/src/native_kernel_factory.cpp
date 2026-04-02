@@ -99,10 +99,12 @@ std::shared_ptr<NativeKernelBundle> create_native_kernel(
   bundle->toppra = std::make_shared<roboplan::PathParameterizerTOPPRA>(
       bundle->scene, group_name);
 
-  // Create IK
+  // Create IK (match roboplan example_ik.cpp settings)
   roboplan::SimpleIkOptions ik_opts;
   ik_opts.group_name = group_name;
+  ik_opts.step_size = 0.25;
   ik_opts.max_restarts = 50;
+  ik_opts.max_time = 1.0;
   bundle->ik = std::make_shared<roboplan::SimpleIk>(bundle->scene, ik_opts);
 
   // Create native backends
@@ -110,7 +112,7 @@ std::shared_ptr<NativeKernelBundle> create_native_kernel(
       bundle->scene, bundle->rrt, bundle->shortcutter, bundle->toppra, bundle->ik);
   bundle->context = std::make_unique<RoboPlanPlanningContext>(
       bundle->scene, group_name);
-  bundle->execution = std::make_unique<RoboPlanExecutionBackend>();
+  bundle->execution = std::make_unique<RoboPlanExecutionBackend>(bundle->scene);
   bundle->clock = std::make_unique<WallClock>();
   bundle->scheduler = std::make_unique<SimpleScheduler>();
   bundle->cache = std::make_unique<core::TrajectoryCache>();

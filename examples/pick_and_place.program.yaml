@@ -1,0 +1,192 @@
+api_version: manyforge.program.v0
+program_profile: v0.0
+name: pick_and_place_demo
+description: >-
+  Pick-and-place demo with UR5 + RoboPlan: approach/pick/retreat/drop sequence
+  using pose goals (IK), collision-aware motion planning (RRT + TOPPRA),
+  gripper simulation, and cache invalidation.
+  Sequence follows manymove pattern: approach → pick → retreat → approach drop → drop → retreat → rest.
+catalog_version: "0.1.0"
+
+robot:
+  robot_id: robot1
+  group_id: arm
+  base_frame: base_link
+  tcp_frame: tool0
+
+# Scene objects inspired by manymove bt_client_ur.cpp.
+# Positions adjusted for RoboPlan RRT clearance (no MoveIt allowed-collision pairs).
+scene:
+  - object_id: ground
+    shape:
+      type: box
+      box_dimensions_m: [1.0, 1.0, 0.2]
+    pose:
+      frame_id: universe
+      position_m: [0.0, 0.0, -0.11]
+      orientation_rpy_deg: [0, 0, 0]
+
+  - object_id: graspable
+    shape:
+      type: box
+      box_dimensions_m: [0.1, 0.01, 0.01]
+    pose:
+      frame_id: universe
+      position_m: [0.3, -0.3, 0.15]
+      orientation_rpy_deg: [0, 0, -45]
+
+parameters:
+  - name: velocity_scale
+    type: float
+    default: 0.5
+    constraints:
+      min_exclusive: 0.0
+      max_inclusive: 1.0
+    description: Velocity scale for all moves.
+
+# Tool-down orientation (RPY pi, 0, -pi/2 from manymove):
+#   xyzw: [0.7071, -0.7071, 0.0, 0.0]
+#
+# Pick object at:   [0.3, -0.3, 0.15]
+# Drop location at: [0.3,  0.3, 0.15]
+# Approach offset:  +0.1m in world Z
+
+tree:
+  id: sequence
+  name: pick_and_place
+  children:
+    # --- PICK PHASE ---
+
+    # 1. Move to pick approach (0.1m above graspable object)
+    - id: move_manipulator_action
+      name: move_to_pick_approach
+      params:
+        move_id: pick_approach
+        motion_type: pose_goal
+        pose_goal:
+          position_m: [0.3, -0.3, 0.25]
+          orientation_rpy_deg: [180, 0, -135]
+        velocity_scale: "${param:velocity_scale}"
+        planning_timeout_s: 10.0
+        execution_timeout_s: 30.0
+
+    # 2. Move down to pick pose (at the object)
+    - id: move_manipulator_action
+      name: move_to_pick
+      params:
+        move_id: pick_down
+        motion_type: pose_goal
+        pose_goal:
+          position_m: [0.3, -0.3, 0.2]
+          orientation_rpy_deg: [180, 0, -135]
+        velocity_scale: "${param:velocity_scale}"
+        planning_timeout_s: 10.0
+        execution_timeout_s: 30.0
+
+    # 3. Close gripper + attach object to tool
+    - id: set_key_bool_value
+      name: close_gripper
+      params:
+        key: gripper_closed
+        value: true
+
+    - id: attach_object_to_link
+      name: attach_graspable
+      params:
+        object_id: graspable
+        link_frame: tool0
+
+    # 4. Retreat to pick approach pose
+    - id: move_manipulator_action
+      name: pick_retreat
+      params:
+        move_id: pick_retreat
+        motion_type: pose_goal
+        pose_goal:
+          position_m: [0.3, -0.3, 0.25]
+          orientation_rpy_deg: [180, 0, -135]
+        velocity_scale: "${param:velocity_scale}"
+        planning_timeout_s: 10.0
+        execution_timeout_s: 30.0
+
+    # 5. Invalidate cached trajectories (scene changed — object removed)
+    - id: reset_trajectories
+      name: invalidate_after_pick
+
+    # --- DROP PHASE ---
+
+    # 6. Move to drop approach (0.1m above drop location)
+    - id: move_manipulator_action
+      name: move_to_drop_approach
+      params:
+        move_id: drop_approach
+        motion_type: pose_goal
+        pose_goal:
+          position_m: [0.3, 0.3, 0.25]
+          orientation_rpy_deg: [180, 0, -90]
+        velocity_scale: "${param:velocity_scale}"
+        planning_timeout_s: 10.0
+        execution_timeout_s: 30.0
+
+    # 7. Move down to drop pose
+    - id: move_manipulator_action
+      name: move_to_drop
+      params:
+        move_id: drop_down
+        motion_type: pose_goal
+        pose_goal:
+          position_m: [0.3, 0.3, 0.2]
+          orientation_rpy_deg: [180, 0, -90]
+        velocity_scale: "${param:velocity_scale}"
+        planning_timeout_s: 10.0
+        execution_timeout_s: 30.0
+
+    # 8. Open gripper + detach object to world
+    - id: set_key_bool_value
+      name: open_gripper
+      params:
+        key: gripper_closed
+        value: false
+
+    - id: detach_object_from_link
+      name: detach_graspable
+      params:
+        object_id: graspable
+        link_frame: tool0
+
+    # 9. Retreat to drop approach pose (object now in world at drop location)
+    - id: move_manipulator_action
+      name: drop_retreat
+      params:
+        move_id: drop_retreat
+        motion_type: pose_goal
+        pose_goal:
+          position_m: [0.3, 0.3, 0.25]
+          orientation_rpy_deg: [180, 0, -90]
+        velocity_scale: "${param:velocity_scale}"
+        planning_timeout_s: 10.0
+        execution_timeout_s: 30.0
+
+    # 10. Invalidate trajectories (scene changed — object detached)
+    - id: reset_trajectories
+      name: invalidate_after_drop
+
+    # --- RETURN PHASE ---
+
+    # 12. Return to rest pose (joint goal — known configuration)
+    - id: move_manipulator_action
+      name: return_rest
+      params:
+        move_id: return_rest
+        motion_type: joint_goal
+        joint_goal_names:
+          - shoulder_pan_joint
+          - shoulder_lift_joint
+          - elbow_joint
+          - wrist_1_joint
+          - wrist_2_joint
+          - wrist_3_joint
+        joint_goal_positions_rad: [0.0, -1.57, 1.57, -1.57, -1.57, 0.0]
+        velocity_scale: "${param:velocity_scale}"
+        planning_timeout_s: 10.0
+        execution_timeout_s: 30.0

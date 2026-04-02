@@ -62,6 +62,20 @@ class ExecuteResult:
     error: Optional[str] = None
     trajectory_duration_s: Optional[float] = None
     trajectory_waypoint_count: Optional[int] = None
+    final_state: Optional[str] = None
+    final_error: Optional[str] = None
+
+
+@dataclass
+class TrajectoryWaypoint:
+    time_from_start_s: float = 0.0
+    positions_rad: List[float] = field(default_factory=list)
+
+
+@dataclass
+class Trajectory:
+    joint_names: List[str] = field(default_factory=list)
+    waypoints: List[TrajectoryWaypoint] = field(default_factory=list)
 
 
 @dataclass
@@ -111,6 +125,10 @@ class KernelClient(ABC):
     def get_link_pose(
         self, target_frame: str, base_frame: str
     ) -> Optional[Dict[str, Any]]: ...
+
+    def get_cached_trajectory(self, move_id: str) -> Optional[Trajectory]:
+        """Get cached trajectory for a move. Returns None if not available."""
+        return None
 
 
 class MockKernelClient(KernelClient):

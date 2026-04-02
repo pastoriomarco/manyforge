@@ -1,5 +1,7 @@
 """SceneRenderer - Renders collision objects in the 3D scene."""
 
+import math
+
 import viser
 from typing import Optional
 
@@ -19,6 +21,20 @@ class SceneRenderer:
         """
         self._server = server
         self._objects: dict[str, str] = {}  # object_id -> scene name
+
+    @staticmethod
+    def _rpy_deg_to_xyzw(rpy_deg: list[float]) -> tuple[float, float, float, float]:
+        """Convert roll-pitch-yaw (degrees, ZYX convention) to quaternion xyzw."""
+        r, p, y = [math.radians(v) for v in rpy_deg]
+        cr, sr = math.cos(r / 2), math.sin(r / 2)
+        cp, sp = math.cos(p / 2), math.sin(p / 2)
+        cy, sy = math.cos(y / 2), math.sin(y / 2)
+        return (
+            sr * cp * cy - cr * sp * sy,
+            cr * sp * cy + sr * cp * sy,
+            cr * cp * sy - sr * sp * cy,
+            cr * cp * cy + sr * sp * sy,
+        )
 
     def _xyzw_to_wxyz(self, xyzw: tuple[float, float, float, float]) -> tuple[float, float, float, float]:
         """Convert quaternion from xyzw to wxyz format.
@@ -88,6 +104,37 @@ class SceneRenderer:
         )
         self._objects[object_id] = scene_name
 
+    def add_box_on_frame(
+        self,
+        object_id: str,
+        frame_path: str,
+        dimensions_m: tuple[float, float, float],
+        position_m: tuple[float, float, float],
+        orientation_xyzw: tuple[float, float, float, float],
+        color: tuple[int, int, int] = (200, 100, 50),
+    ) -> None:
+        """Add a box as a child of a Viser scene frame (e.g. a robot link).
+
+        Args:
+            object_id: Unique identifier for the object.
+            frame_path: Parent frame path in the Viser scene graph.
+            dimensions_m: Box dimensions (length, width, height) in meters.
+            position_m: Position relative to the parent frame.
+            orientation_xyzw: Orientation relative to the parent frame (xyzw).
+            color: RGB color tuple (0-255).
+        """
+        scene_name = f"{frame_path}/{object_id}"
+        wxyz = self._xyzw_to_wxyz(orientation_xyzw)
+
+        self._server.scene.add_box(
+            name=scene_name,
+            dimensions=dimensions_m,
+            color=color,
+            position=position_m,
+            wxyz=wxyz,
+        )
+        self._objects[object_id] = scene_name
+
     def remove_object(self, object_id: str) -> None:
         """Remove an object from the scene.
 
@@ -127,7 +174,10 @@ class SceneRenderer:
             # Get position and orientation
             if hasattr(pose, "get"):
                 position = tuple(pose.get("position_m", [0.0, 0.0, 0.0]))
-                orientation = tuple(pose.get("orientation_xyzw", [0.0, 0.0, 0.0, 1.0]))
+                orient_xyzw = pose.get("orientation_xyzw")
+                if not orient_xyzw and "orientation_rpy_deg" in pose:
+                    orient_xyzw = list(self._rpy_deg_to_xyzw(pose["orientation_rpy_deg"]))
+                orientation = tuple(orient_xyzw or [0.0, 0.0, 0.0, 1.0])
             else:
                 position = tuple(pose.get("position_m", [0.0, 0.0, 0.0])) if isinstance(pose, dict) else (0.0, 0.0, 0.0)
                 orientation = tuple(pose.get("orientation_xyzw", [0.0, 0.0, 0.0, 1.0])) if isinstance(pose, dict) else (0.0, 0.0, 0.0, 1.0)

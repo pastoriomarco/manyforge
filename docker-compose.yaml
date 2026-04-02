@@ -5,6 +5,10 @@ services:
       dockerfile: Dockerfile
     volumes:
       - .:/workspace
+      - build-cache:/tmp/manyforge-build
     working_dir: /workspace
     stdin_open: true
     tty: true
+
+volumes:
+  build-cache:

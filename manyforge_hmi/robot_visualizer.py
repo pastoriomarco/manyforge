@@ -1,5 +1,7 @@
 """RobotVisualizer - URDF rendering and joint state updates."""
 
+import time
+
 import viser
 from viser.extras import ViserUrdf
 from pathlib import Path
@@ -64,6 +66,26 @@ class RobotVisualizer:
         elif not self._viser_urdf:
             # Re-add if needed (simplified - in practice you'd want to cache)
             pass
+
+    def animate_trajectory(self, joint_names: list[str],
+                           waypoints: list, speed_scale: float = 1.0) -> None:
+        """Play back a trajectory by stepping through waypoints.
+
+        Args:
+            joint_names: Joint names matching the trajectory.
+            waypoints: List of TrajectoryWaypoint (time_from_start_s, positions_rad).
+            speed_scale: Playback speed multiplier (1.0 = real time).
+        """
+        if not waypoints:
+            return
+        prev_time = 0.0
+        for wp in waypoints:
+            positions = dict(zip(joint_names, wp.positions_rad))
+            self._viser_urdf.update_cfg(positions)
+            dt = (wp.time_from_start_s - prev_time) / speed_scale
+            if dt > 0:
+                time.sleep(dt)
+            prev_time = wp.time_from_start_s
 
     @property
     def viser_urdf(self) -> ViserUrdf:

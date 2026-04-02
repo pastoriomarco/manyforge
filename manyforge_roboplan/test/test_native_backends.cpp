@@ -200,6 +200,10 @@ TEST_F(NativeKernelTest, CacheHitSkipsPlanning) {
 
   bundle_->kernel->reset();
 
+  // Reset scene to original start so cached trajectory's start matches
+  Eigen::VectorXd origin = Eigen::VectorXd::Zero(6);
+  bundle_->scene->setJointPositions(origin);
+
   // Second execute — should hit cache
   auto r2 = bundle_->kernel->execute(req);
   EXPECT_TRUE(r2.ok());
