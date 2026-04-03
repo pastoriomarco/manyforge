@@ -11,6 +11,10 @@ from .models import (
     LoadDeploymentRequest,
     DeploymentResponse,
     RobotConfigResponse,
+    SaveProgramRequest,
+    UpdateTreeRequest,
+    UpdateDeploymentRequest,
+    SaveDeploymentRequest,
 )
 from .state import ComposerState
 
@@ -128,4 +132,46 @@ def create_program_router(state: ComposerState) -> APIRouter:
             ),
         ).model_dump(by_alias=True)
     
+    @router.put("/program/tree")
+    def update_program_tree(request: UpdateTreeRequest) -> dict:
+        if state.program is None:
+            raise HTTPException(status_code=404, detail="No program loaded")
+        try:
+            tree_dict = request.tree.model_dump()
+            state.program.update_tree(tree_dict)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        return {"status": "ok"}
+
+    @router.post("/program/save")
+    def save_program(request: SaveProgramRequest) -> dict:
+        if state.program is None:
+            raise HTTPException(status_code=404, detail="No program loaded")
+        try:
+            state.program.save(request.path)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+        return {"status": "ok", "path": request.path}
+
+    @router.put("/deployment")
+    def update_deployment(request: UpdateDeploymentRequest) -> dict:
+        if state.deployment is None:
+            raise HTTPException(status_code=404, detail="No deployment loaded")
+        try:
+            deployment_dict = request.model_dump(exclude_unset=True)
+            state.deployment.update_from_dict(deployment_dict)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        return {"status": "ok"}
+
+    @router.post("/deployment/save")
+    def save_deployment(request: SaveDeploymentRequest) -> dict:
+        if state.deployment is None:
+            raise HTTPException(status_code=404, detail="No deployment loaded")
+        try:
+            state.deployment.save(request.path)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+        return {"status": "ok", "path": request.path}
+
     return router

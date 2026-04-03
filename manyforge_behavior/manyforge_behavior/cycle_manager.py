@@ -19,6 +19,14 @@ class CycleState(Enum):
     STOPPED = "stopped"
 
 
+def _collect_statuses(node, result):
+    """Recursively collect node statuses from a py_trees node and its children."""
+    result[node.name] = node.status.value if node.status else "INVALID"
+    if hasattr(node, 'children'):
+        for child in node.children:
+            _collect_statuses(child, result)
+
+
 class CycleManager:
     """Runtime lifecycle controller for continuous robot programs.
     
@@ -56,6 +64,20 @@ class CycleManager:
     def velocity_scale(self) -> float:
         """Current velocity scale (0.0 to 1.0)."""
         return self._velocity_scale
+    
+    def get_node_statuses(self) -> dict[str, str]:
+        """Walk the py_trees tree and collect per-node status.
+        
+        Returns:
+            Dict mapping node instance name to status string.
+            Status values: "SUCCESS", "FAILURE", "RUNNING", "INVALID"
+        """
+        if self._tree is None:
+            return {}
+        
+        result: dict[str, str] = {}
+        _collect_statuses(self._tree.root, result)
+        return result
     
     def run(self) -> None:
         """

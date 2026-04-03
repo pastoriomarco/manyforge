@@ -1,9 +1,11 @@
 import { useCycleStore } from '../store/cycleStore';
 import { useComposerStore } from '../store/composerStore';
+import { useProgramStore } from '../store/programStore';
 
 export function ControlBar() {
   const { state, velocityScale, error, run, stop, reset, setVelocityScale } = useCycleStore();
   const { mode } = useComposerStore();
+  const { isDirty, saveProgram } = useProgramStore();
 
   const stateBadge = {
     idle: { label: 'IDLE', color: 'bg-gray-500' },
@@ -49,6 +51,15 @@ export function ControlBar() {
         className="px-4 py-1.5 bg-blue-600 hover:bg-blue-500 disabled:bg-gray-600 disabled:cursor-not-allowed rounded text-sm font-medium"
       >
         Reset
+      </button>
+
+      {/* Save button */}
+      <button
+        onClick={() => saveProgram('/workspace/agent-session/program.yaml')}
+        disabled={!isDirty || mode === 'run'}
+        className="px-4 py-1.5 bg-amber-600 hover:bg-amber-500 disabled:bg-gray-600 disabled:cursor-not-allowed rounded text-sm font-medium"
+      >
+        Save
       </button>
 
       {/* Velocity slider */}

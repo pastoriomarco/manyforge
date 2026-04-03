@@ -6,6 +6,7 @@ import type { CycleStatus } from '../types/api';
 interface CycleStore {
   state: CycleStatus['state'];
   velocityScale: number;
+  nodeStatuses: Record<string, string>;
   error: string | null;
   
   // Actions
@@ -23,6 +24,7 @@ interface CycleStore {
 export const useCycleStore = create<CycleStore>((set, get) => ({
   state: 'idle',
   velocityScale: 1.0,
+  nodeStatuses: {},
   error: null,
   _ws: null,
 
@@ -66,7 +68,11 @@ export const useCycleStore = create<CycleStore>((set, get) => ({
     const ws = new StateWebSocket();
     ws.connect();
     ws.subscribe((update) => {
-      set({ state: update.state, velocityScale: update.velocityScale });
+      set({
+        state: update.state,
+        velocityScale: update.velocityScale,
+        nodeStatuses: update.nodeStatuses || {},
+      });
     });
     set({ _ws: ws });
   },

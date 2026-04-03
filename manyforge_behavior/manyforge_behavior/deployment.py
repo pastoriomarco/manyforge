@@ -257,3 +257,115 @@ class Deployment:
                 f"Missing capability keys for profile '{self.program_profile}': "
                 f"{sorted(missing)}"
             )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize to dict matching manyforge.deployment.v0 schema."""
+        d: dict[str, Any] = {
+            "api_version": EXPECTED_API_VERSION,
+            "schema_version": self.schema_version,
+            "name": self.name,
+            "description": self.description,
+            "program_profile": self.program_profile,
+        }
+        if self.robot_config:
+            d["robot_config"] = {
+                "robot_id": self.robot_config.robot_id,
+                "group_id": self.robot_config.group_id,
+                "urdf_path": self.robot_config.urdf_path,
+                "srdf_path": self.robot_config.srdf_path,
+                "global_max_tcp_linear_speed_mps": self.robot_config.global_max_tcp_linear_speed_mps,
+            }
+        # adapters dict with slots: planning, context, execution
+        d["adapters"] = {}
+        for slot, adapter in self.adapters.items():
+            adapter_d = {
+                "adapter_id": adapter.adapter_id,
+                "adapter_version": adapter.adapter_version,
+            }
+            if adapter.supported_profiles:
+                adapter_d["supported_profiles"] = adapter.supported_profiles
+            if adapter.capability_keys:
+                adapter_d["capability_keys"] = adapter.capability_keys
+            adapter_d["config"] = adapter.config
+            d["adapters"][slot] = adapter_d
+        # orchestrator
+        if self.orchestrator:
+            d["orchestrator"] = {
+                "engine": self.orchestrator.engine,
+                "config": self.orchestrator.config,
+            }
+        # launch
+        if self.launch:
+            launch_d: dict[str, Any] = {
+                "runner": {
+                    "module": self.launch.runner.module,
+                    "args": self.launch.runner.args,
+                }
+            }
+            if self.launch.ui_backend:
+                launch_d["ui_backend"] = {
+                    "module": self.launch.ui_backend.module,
+                    "args": self.launch.ui_backend.args,
+                    "enabled": self.launch.ui_backend.enabled,
+                }
+            d["launch"] = launch_d
+        return d
+
+    def save(self, path: str | Path) -> None:
+        """Write deployment to YAML file."""
+        with open(path, "w") as f:
+            yaml.dump(self.to_dict(), f, sort_keys=False, default_flow_style=False)
+
+    def update_from_dict(self, data: dict[str, Any]) -> None:
+        """Update fields from a dict. Re-validates after update."""
+        if "name" in data:
+            self.name = data["name"]
+        if "description" in data:
+            self.description = data["description"]
+        if "program_profile" in data:
+            self.program_profile = data["program_profile"]
+        if "robot_config" in data:
+            rc = data["robot_config"]
+            self.robot_config = RobotConfig(
+                robot_id=rc.get("robot_id", self.robot_config.robot_id),
+                group_id=rc.get("group_id", self.robot_config.group_id),
+                urdf_path=rc.get("urdf_path", self.robot_config.urdf_path),
+                srdf_path=rc.get("srdf_path", self.robot_config.srdf_path),
+                global_max_tcp_linear_speed_mps=rc.get(
+                    "global_max_tcp_linear_speed_mps",
+                    self.robot_config.global_max_tcp_linear_speed_mps
+                ),
+            )
+        if "adapters" in data:
+            adapters_data = data["adapters"]
+            for slot, adapter_data in adapters_data.items():
+                if slot in self.adapters:
+                    self.adapters[slot] = AdapterConfig(
+                        adapter_id=adapter_data.get("adapter_id", self.adapters[slot].adapter_id),
+                        adapter_version=adapter_data.get("adapter_version", self.adapters[slot].adapter_version),
+                        config=adapter_data.get("config", self.adapters[slot].config),
+                        supported_profiles=adapter_data.get("supported_profiles", self.adapters[slot].supported_profiles),
+                        capability_keys=adapter_data.get("capability_keys", self.adapters[slot].capability_keys),
+                    )
+        if "orchestrator" in data:
+            oc = data["orchestrator"]
+            self.orchestrator = OrchestratorConfig(
+                engine=oc.get("engine", self.orchestrator.engine),
+                config=oc.get("config", self.orchestrator.config),
+            )
+        if "launch" in data:
+            lc = data["launch"]
+            runner_data = lc.get("runner", {})
+            runner = RunnerConfig(
+                module=runner_data.get("module", self.launch.runner.module),
+                args=runner_data.get("args", self.launch.runner.args),
+            )
+            ui_backend: Optional[UiBackendConfig] = None
+            ui_data = lc.get("ui_backend")
+            if ui_data is not None:
+                ui_backend = UiBackendConfig(
+                    module=ui_data.get("module", self.launch.ui_backend.module if self.launch.ui_backend else ""),
+                    args=ui_data.get("args", self.launch.ui_backend.args if self.launch.ui_backend else []),
+                    enabled=ui_data.get("enabled", self.launch.ui_backend.enabled if self.launch.ui_backend else True),
+                )
+            self.launch = LaunchConfig(runner=runner, ui_backend=ui_backend)

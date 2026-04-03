@@ -43,25 +43,32 @@ export function initComposerStore() {
     const cycleState = state.state;
     const newMode: 'compose' | 'run' = cycleState === 'idle' ? 'compose' : 'run';
     
-    // Update mode
     if (useComposerStore.getState().mode !== newMode) {
       useComposerStore.setState({ mode: newMode });
     }
     
-    // Update node statuses based on cycle state
-    if (cycleState === 'running') {
-      // When running, set all nodes to 'running'
+    if (cycleState === 'running' || cycleState === 'stopped') {
+      // Build label→flowId lookup from current program nodes
       const { nodes } = useProgramStore.getState();
-      const statuses: Record<string, string> = {};
+      const labelToId = new Map<string, string>();
       for (const node of nodes) {
-        statuses[node.id] = 'running';
+        const label = (node.data as { label?: string }).label;
+        if (label) labelToId.set(label, node.id);
       }
-      useComposerStore.getState().setNodeStatuses(statuses);
+      
+      // Map WS nodeStatuses (keyed by instance name) to flow node IDs
+      const wsStatuses = state.nodeStatuses || {};
+      const mapped: Record<string, string> = {};
+      for (const [instanceName, status] of Object.entries(wsStatuses)) {
+        const flowId = labelToId.get(instanceName);
+        if (flowId) {
+          mapped[flowId] = status.toLowerCase();
+        }
+      }
+      useComposerStore.getState().setNodeStatuses(mapped);
     } else if (cycleState === 'idle') {
-      // When idle, clear all statuses
       useComposerStore.getState().clearNodeStatuses();
     }
-    // When stopped, keep current statuses (paused state)
   });
   
   return unsubscribe;

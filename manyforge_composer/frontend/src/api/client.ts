@@ -6,6 +6,9 @@ import type {
   CatalogEntry,
   ProgramInfo,
   ProgramTree,
+  TreeNode,
+  DeploymentInfo,
+  FullDeployment,
 } from '../types/api';
 
 const BASE_URL = import.meta.env.VITE_API_URL || '';
@@ -41,5 +44,18 @@ export const api = {
       request<ProgramInfo>('POST', '/api/program/load', { path, deploymentPath }),
     get: () => request<ProgramInfo>('GET', '/api/program'),
     tree: () => request<ProgramTree>('GET', '/api/program/tree'),
+    updateTree: (tree: TreeNode) =>
+      request<unknown>('PUT', '/api/program/tree', { tree }),
+    save: (path: string) =>
+      request<unknown>('POST', '/api/program/save', { path }),
+  },
+  deployment: {
+    load: (path: string) =>
+      request<DeploymentInfo>('POST', '/api/deployment/load', { path }),
+    get: () => request<DeploymentInfo>('GET', '/api/deployment'),
+    update: (data: Partial<FullDeployment>) =>
+      request<{ status: string }>('PUT', '/api/deployment', data),
+    save: (path: string) =>
+      request<{ status: string; path: string }>('POST', '/api/deployment/save', { path }),
   },
 };

@@ -1,6 +1,8 @@
 """Cycle control routes - /api/cycle/*"""
 from __future__ import annotations
 
+import logging
+
 from fastapi import APIRouter, HTTPException
 from .models import (
     CycleStatusResponse,
@@ -9,6 +11,8 @@ from .models import (
     VelocityScaleResponse,
 )
 from .state import ComposerState
+
+logger = logging.getLogger(__name__)
 
 
 def create_cycle_router(state: ComposerState) -> APIRouter:
@@ -30,31 +34,38 @@ def create_cycle_router(state: ComposerState) -> APIRouter:
         """Start the cycle (IDLE→RUNNING or STOPPED→RUNNING)."""
         if state.cycle_manager is None:
             raise HTTPException(status_code=409, detail="No program loaded")
+        prev = state.cycle_manager.state.value
         state.cycle_manager.run()
+        logger.info("Cycle state: %s → %s", prev, state.cycle_manager.state.value)
         return {"state": state.cycle_manager.state.value}
-    
+
     @router.post("/stop", response_model=CycleCommandResponse, response_model_by_alias=True)
     def stop_cycle() -> dict:
         """Stop the cycle (RUNNING→STOPPED)."""
         if state.cycle_manager is None:
             raise HTTPException(status_code=409, detail="No program loaded")
+        prev = state.cycle_manager.state.value
         state.cycle_manager.stop()
+        logger.info("Cycle state: %s → %s", prev, state.cycle_manager.state.value)
         return {"state": state.cycle_manager.state.value}
-    
+
     @router.post("/reset", response_model=CycleCommandResponse, response_model_by_alias=True)
     def reset_cycle() -> dict:
         """Reset the cycle (any→IDLE)."""
         if state.cycle_manager is None:
             raise HTTPException(status_code=409, detail="No program loaded")
+        prev = state.cycle_manager.state.value
         state.cycle_manager.reset()
+        logger.info("Cycle state: %s → %s", prev, state.cycle_manager.state.value)
         return {"state": state.cycle_manager.state.value}
-    
+
     @router.put("/velocity-scale", response_model=VelocityScaleResponse, response_model_by_alias=True)
     def set_velocity_scale(request: VelocityScaleRequest) -> dict:
         """Set the velocity scale (0.0-1.0)."""
         if state.cycle_manager is None:
             raise HTTPException(status_code=409, detail="No program loaded")
         state.cycle_manager.set_velocity_scale(request.value)
+        logger.info("Velocity scale set to %.2f", request.value)
         return {"velocityScale": state.cycle_manager.velocity_scale}
     
     return router

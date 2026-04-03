@@ -37,6 +37,15 @@ class TreeNode:
     params: dict[str, Any] = field(default_factory=dict)
     children: list["TreeNode"] = field(default_factory=list)
 
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize to dict matching program YAML schema."""
+        d: dict[str, Any] = {"id": self.id, "name": self.name}
+        if self.params:
+            d["params"] = self.params
+        if self.children:
+            d["children"] = [c.to_dict() for c in self.children]
+        return d
+
 
 @dataclass
 class RobotProfile:
@@ -206,6 +215,55 @@ class Program:
         # Recurse
         for child in node.children:
             self._validate_node_recursive(child, names)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize to dict matching manyforge.program.v0 schema."""
+        d: dict[str, Any] = {
+            "api_version": EXPECTED_API_VERSION,
+            "program_profile": self.program_profile,
+            "name": self.name,
+            "description": self.description,
+        }
+        if self.catalog_version:
+            d["catalog_version"] = self.catalog_version
+        d["robot"] = {
+            "robot_id": self.robot.robot_id,
+            "group_id": self.robot.group_id,
+            "base_frame": self.robot.base_frame,
+            "tcp_frame": self.robot.tcp_frame,
+        }
+        d["scene"] = [
+            {
+                "object_id": s.object_id,
+                "shape": s.shape,
+                "pose": s.pose,
+            }
+            for s in self.scene
+        ]
+        d["parameters"] = [
+            {
+                "name": p.name,
+                "type": p.type,
+                "default": p.default,
+                "constraints": p.constraints,
+                "description": p.description,
+            }
+            for p in self.parameters.values()
+        ]
+        d["tree"] = self.tree.to_dict() if self.tree else {}
+        return d
+
+    def save(self, path: str | Path) -> None:
+        """Write program to YAML file."""
+        import yaml
+        with open(path, "w") as f:
+            yaml.dump(self.to_dict(), f, sort_keys=False, default_flow_style=False)
+
+    def update_tree(self, tree_data: dict[str, Any]) -> None:
+        """Replace current tree from dict. Re-validates against catalog."""
+        new_tree = self._parse_tree(tree_data)
+        self._validate_tree(new_tree)
+        self.tree = new_tree
 
     def get_parameter_defaults(self) -> dict[str, Any]:
         """Return {name: default_value} for all program parameters."""

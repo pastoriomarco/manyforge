@@ -10,6 +10,7 @@ interface ProgramStore {
   selectedNodeId: string | null;
   loading: boolean;
   error: string | null;
+  isDirty: boolean;
   
   loadProgram: (path: string) => Promise<void>;
   fetchTree: () => Promise<void>;
@@ -20,6 +21,8 @@ interface ProgramStore {
   selectNode: (id: string | null) => void;
   updateNodeParams: (nodeId: string, params: Record<string, unknown>) => void;
   updateNodeLabel: (nodeId: string, label: string) => void;
+  flowToTree: () => TreeNode | null;
+  saveProgram: (path: string) => Promise<void>;
 }
 
 // Helper: convert backend TreeNode → React Flow nodes + edges
@@ -68,6 +71,50 @@ function treeToFlow(
   });
 }
 
+// Helper: convert React Flow nodes + edges → backend TreeNode
+function flowToTree(nodes: Node[], edges: Edge[]): TreeNode | null {
+  if (nodes.length === 0) return null;
+  
+  // Build children map from edges: parentId → childIds[]
+  const childrenMap = new Map<string, string[]>();
+  const hasParent = new Set<string>();
+  
+  for (const edge of edges) {
+    const children = childrenMap.get(edge.source) || [];
+    children.push(edge.target);
+    childrenMap.set(edge.source, children);
+    hasParent.add(edge.target);
+  }
+  
+  // Find root: node with no incoming edge
+  const rootNode = nodes.find(n => !hasParent.has(n.id));
+  if (!rootNode) return null;
+  
+  // Sort children by x-position (left to right)
+  const nodeMap = new Map(nodes.map(n => [n.id, n]));
+  
+  function buildTree(nodeId: string): TreeNode {
+    const node = nodeMap.get(nodeId)!;
+    const childIds = childrenMap.get(nodeId) || [];
+    
+    // Sort children by x-position
+    childIds.sort((a, b) => {
+      const na = nodeMap.get(a)!;
+      const nb = nodeMap.get(b)!;
+      return na.position.x - nb.position.x;
+    });
+    
+    return {
+      id: (node.data as any).catalogId || node.id,
+      name: (node.data as any).label || '',
+      params: (node.data as any).params || {},
+      children: childIds.map(buildTree),
+    };
+  }
+  
+  return buildTree(rootNode.id);
+}
+
 export const useProgramStore = create<ProgramStore>((set, get) => ({
   programInfo: null,
   nodes: [],
@@ -75,12 +122,13 @@ export const useProgramStore = create<ProgramStore>((set, get) => ({
   selectedNodeId: null,
   loading: false,
   error: null,
+  isDirty: false,
 
   loadProgram: async (path: string) => {
     set({ loading: true, error: null });
     try {
       const info = await api.program.load(path);
-      set({ programInfo: info });
+      set({ programInfo: info, isDirty: false });
       // Fetch and render tree
       await get().fetchTree();
     } catch (e) {
@@ -94,14 +142,14 @@ export const useProgramStore = create<ProgramStore>((set, get) => ({
       const nodes: Node[] = [];
       const edges: Edge[] = [];
       treeToFlow(data.tree, null, { x: 400, y: 50 }, nodes, edges);
-      set({ nodes, edges, loading: false });
+      set({ nodes, edges, loading: false, isDirty: false });
     } catch (e) {
       set({ error: (e as Error).message, loading: false });
     }
   },
 
-  setNodes: (nodes) => set({ nodes }),
-  setEdges: (edges) => set({ edges }),
+  setNodes: (nodes) => set({ nodes, isDirty: true }),
+  setEdges: (edges) => set({ edges, isDirty: true }),
 
   addNode: (catalogId, position) => {
     const id = `node-${Date.now()}`;
@@ -115,7 +163,7 @@ export const useProgramStore = create<ProgramStore>((set, get) => ({
         params: {},
       },
     };
-    set({ nodes: [...get().nodes, newNode] });
+    set({ nodes: [...get().nodes, newNode], isDirty: true });
   },
 
   removeNode: (nodeId) => {
@@ -123,6 +171,7 @@ export const useProgramStore = create<ProgramStore>((set, get) => ({
       nodes: get().nodes.filter(n => n.id !== nodeId),
       edges: get().edges.filter(e => e.source !== nodeId && e.target !== nodeId),
       selectedNodeId: get().selectedNodeId === nodeId ? null : get().selectedNodeId,
+      isDirty: true,
     });
   },
 
@@ -135,6 +184,7 @@ export const useProgramStore = create<ProgramStore>((set, get) => ({
           ? { ...node, data: { ...node.data, params } }
           : node
       ),
+      isDirty: true,
     });
   },
 
@@ -145,6 +195,21 @@ export const useProgramStore = create<ProgramStore>((set, get) => ({
           ? { ...node, data: { ...node.data, label } }
           : node
       ),
+      isDirty: true,
     });
+  },
+
+  flowToTree: () => {
+    return flowToTree(get().nodes, get().edges);
+  },
+
+  saveProgram: async (path: string) => {
+    const tree = get().flowToTree();
+    if (!tree) {
+      throw new Error('No tree to save');
+    }
+    await api.program.updateTree(tree);
+    await api.program.save(path);
+    set({ isDirty: false });
   },
 }));

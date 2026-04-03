@@ -10,5 +10,46 @@ services:
     stdin_open: true
     tty: true
 
+  # Composer backend (FastAPI on 9000) — production mode serves built frontend
+  composer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "9000:9000"
+    volumes:
+      - .:/workspace
+      - build-cache:/tmp/manyforge-build
+    working_dir: /workspace
+    command: ["bash", "-lc", "python -m manyforge_composer --catalog-path /workspace/manyforge_behavior/resources/node_catalog.yaml --host 0.0.0.0 --port 9000"]
+    profiles:
+      - composer
+
+  # Composer dev mode: FastAPI + Vite dev server with hot reload
+  composer-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "9000:9000"
+    volumes:
+      - .:/workspace
+      - build-cache:/tmp/manyforge-build
+    working_dir: /workspace
+    command: ["bash", "-lc", "python -m manyforge_composer --catalog-path /workspace/manyforge_behavior/resources/node_catalog.yaml --host 0.0.0.0 --port 9000"]
+    profiles:
+      - dev-composer
+
+  composer-ui:
+    image: node:22-slim
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./manyforge_composer/frontend:/app
+    working_dir: /app
+    command: ["bash", "-c", "npm install && npm run dev -- --host 0.0.0.0"]
+    profiles:
+      - dev-composer
+
 volumes:
   build-cache:

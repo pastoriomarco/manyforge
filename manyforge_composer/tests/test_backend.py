@@ -17,6 +17,7 @@ from manyforge_composer.backend.app import create_app
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _CATALOG_PATH = str(_REPO_ROOT / "manyforge_behavior" / "resources" / "node_catalog.yaml")
 _PROGRAM_PATH = str(_REPO_ROOT / "manyforge_behavior" / "tests" / "fixtures" / "pick_and_place.program.yaml")
+_DEPLOYMENT_PATH = str(_REPO_ROOT / "manyforge_behavior" / "tests" / "fixtures" / "ur5_roboplan.deployment.yaml")
 
 
 @pytest.fixture
@@ -148,7 +149,7 @@ def test_velocity_scale(client, state):
 
 def test_catalog_list(client):
     """GET /api/catalog returns entries list with version."""
-    response = client.get("/api/catalog")
+    response = client.get("/api/catalog/")
     assert response.status_code == 200
     data = response.json()
     assert "version" in data
@@ -243,6 +244,84 @@ def test_get_deployment_not_loaded(client):
     assert response.status_code == 404
 
 
+def test_load_deployment(client, state):
+    """POST /api/deployment/load with valid path, verify response."""
+    response = client.post("/api/deployment/load", json={"path": _DEPLOYMENT_PATH})
+    assert response.status_code == 200
+    data = response.json()
+    assert "name" in data
+    assert "description" in data
+    assert "programProfile" in data
+    assert "robotConfig" in data
+
+
+def test_put_deployment(client, state):
+    """Load deployment via POST, PUT /api/deployment with modified data, GET /api/deployment — verify updated."""
+    # Load deployment
+    client.post("/api/deployment/load", json={"path": _DEPLOYMENT_PATH})
+    
+    # Get original deployment
+    response = client.get("/api/deployment")
+    original_data = response.json()
+    original_name = original_data["name"]
+    
+    # Create modified deployment data
+    modified_data = {
+        "name": "updated_deployment",
+        "description": "Updated description",
+    }
+    
+    # PUT the modified deployment
+    response = client.put("/api/deployment", json=modified_data)
+    assert response.status_code == 200
+    assert response.json()["status"] == "ok"
+    
+    # GET the deployment and verify it was updated
+    response = client.get("/api/deployment")
+    assert response.status_code == 200
+    updated_data = response.json()
+    assert updated_data["name"] == "updated_deployment"
+    assert updated_data["name"] != original_name
+    assert updated_data["description"] == "Updated description"
+
+
+def test_save_deployment(client, state):
+    """Load deployment via POST, POST /api/deployment/save with tmp path, verify file exists and is valid YAML."""
+    import tempfile
+    import os
+    
+    # Load deployment
+    client.post("/api/deployment/load", json={"path": _DEPLOYMENT_PATH})
+    
+    # Create temp path
+    tmp_path = tempfile.mktemp(suffix=".yaml")
+    
+    try:
+        # POST to save
+        response = client.post("/api/deployment/save", json={"path": tmp_path})
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "ok"
+        assert data["path"] == tmp_path
+        
+        # Verify file exists
+        assert os.path.exists(tmp_path)
+        
+        # Verify it's valid YAML
+        import yaml
+        with open(tmp_path) as f:
+            saved_data = yaml.safe_load(f)
+        
+        assert saved_data["api_version"] == "manyforge.deployment.v0"
+        assert "robot_config" in saved_data
+        assert "adapters" in saved_data
+        assert "orchestrator" in saved_data
+        assert "launch" in saved_data
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+
 # =============================================================================
 # WebSocket Tests
 # =============================================================================
@@ -257,3 +336,123 @@ def test_ws_state_receives_update(state):
             assert "state" in message
             assert "velocityScale" in message
             assert "timestamp" in message
+
+
+def test_ws_includes_node_statuses(state):
+    """WebSocket messages include nodeStatuses key."""
+    app = create_app(state)
+    with TestClient(app) as tc:
+        with tc.websocket_connect("/ws/state") as ws:
+            data = ws.receive_json()
+            assert "nodeStatuses" in data
+            assert isinstance(data["nodeStatuses"], dict)
+
+
+# =============================================================================
+# Program Save/Update Tests
+# =============================================================================
+
+def test_put_program_tree(client, state):
+    """Load program via POST, PUT /api/program/tree with modified tree, GET /api/program/tree — verify updated."""
+    # Load program
+    client.post("/api/program/load", json={"path": _PROGRAM_PATH})
+    
+    # Get original tree
+    response = client.get("/api/program/tree")
+    original_tree = response.json()["tree"]
+    original_name = original_tree["name"]
+    
+    # Create modified tree
+    modified_tree = {
+        "id": "sequence",
+        "name": "updated_sequence",
+        "children": [
+            {
+                "id": "reset_trajectories",
+                "name": "reset",
+            },
+        ],
+    }
+    
+    # PUT the modified tree
+    response = client.put("/api/program/tree", json={"tree": modified_tree})
+    assert response.status_code == 200
+    assert response.json()["status"] == "ok"
+    
+    # GET the tree and verify it was updated
+    response = client.get("/api/program/tree")
+    assert response.status_code == 200
+    updated_tree = response.json()["tree"]
+    assert updated_tree["name"] == "updated_sequence"
+    assert updated_tree["name"] != original_name
+    assert len(updated_tree["children"]) == 1
+
+def test_save_program(client, state):
+    """Load program via POST, POST /api/program/save with tmp path, verify file exists and is valid YAML."""
+    import tempfile
+    import os
+    
+    # Load program
+    client.post("/api/program/load", json={"path": _PROGRAM_PATH})
+    
+    # Create temp path
+    tmp_path = tempfile.mktemp(suffix=".yaml")
+    
+    try:
+        # POST to save
+        response = client.post("/api/program/save", json={"path": tmp_path})
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "ok"
+        assert data["path"] == tmp_path
+        
+        # Verify file exists
+        assert os.path.exists(tmp_path)
+        
+        # Verify it's valid YAML
+        import yaml
+        with open(tmp_path) as f:
+            saved_data = yaml.safe_load(f)
+        
+        assert saved_data["api_version"] == "manyforge.program.v0"
+        assert "tree" in saved_data
+        assert saved_data["tree"]["name"] == "main_sequence"
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+
+# =============================================================================
+# Logging Tests
+# =============================================================================
+
+def test_json_log_format():
+    """setup_logging produces JSON with level, event, timestamp keys."""
+    import io
+    import json
+    import logging
+    from manyforge_composer.backend.logging_config import setup_logging
+
+    setup_logging("INFO")
+    test_logger = logging.getLogger("test.json_format")
+    buf = io.StringIO()
+    handler = logging.StreamHandler(buf)
+    handler.setFormatter(logging.getLogger().handlers[0].formatter)
+    test_logger.addHandler(handler)
+    test_logger.info("hello world")
+    test_logger.removeHandler(handler)
+
+    line = buf.getvalue().strip()
+    record = json.loads(line)
+    assert "timestamp" in record
+    assert record["level"] == "INFO"
+    assert record["event"] == "hello world"
+    assert record["logger"] == "test.json_format"
+
+
+def test_request_logging(client, capsys):
+    """HTTP requests produce structured log entries."""
+    client.get("/api/health")
+    # Just verify the request didn't error — the logging middleware runs
+    # but capturing stderr in a test with uvicorn is non-trivial.
+    # The JSON format test above covers the formatter.

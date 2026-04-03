@@ -5,6 +5,7 @@
 #   - Python 3.11 (pytest, py_trees, pybind11, numpy, viser, pyyaml)
 #   - Pinocchio (robot kinematics/dynamics/collision)
 #   - RoboPlan (motion planning: RRT, TOPPRA, IK, collision checking)
+#   - Node.js 22 (React frontend build)
 #
 # Build:
 #   # One-time: pre-clone RoboPlan (recursive submodule clone fails inside Docker)
@@ -19,6 +20,15 @@
 #   cd /workspace/manyforge_core/build && cmake .. && make -j$(nproc) && ctest
 #   cd /workspace && pytest manyforge_behavior/tests/
 
+# --- Stage 1: Build React frontend ---
+FROM node:22-slim AS frontend-builder
+WORKDIR /build
+COPY manyforge_composer/frontend/package.json manyforge_composer/frontend/package-lock.json* ./
+RUN npm ci --ignore-scripts
+COPY manyforge_composer/frontend/ ./
+RUN npm run build
+
+# --- Stage 2: Python/C++ runtime ---
 FROM python:3.11-slim-bookworm
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -81,6 +91,9 @@ RUN PINOCCHIO_CMAKE_DIR=$(find /usr -name "pinocchioConfig.cmake" -printf '%h\n'
     && rm -rf /tmp/roboplan
 
 WORKDIR /workspace
+
+# Copy built frontend from Stage 1
+COPY --from=frontend-builder /build/dist/ /opt/manyforge-frontend/dist/
 
 # Install manyforge_behavior in editable mode (mounted at runtime)
 # This is done via an entrypoint script so the volume mount exists

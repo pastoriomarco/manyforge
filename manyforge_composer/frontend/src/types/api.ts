@@ -69,9 +69,66 @@ export interface ProgramTree {
   tree: TreeNode;
 }
 
+// Deployment
+export interface AdapterConfig {
+  adapterId: string;
+  adapterVersion: string;
+  config: Record<string, unknown>;
+  supportedProfiles: string[];
+  capabilityKeys: string[];
+}
+
+export interface OrchestratorConfig {
+  engine: string;
+  config: Record<string, unknown>;
+}
+
+export interface LaunchRunner {
+  module: string;
+  args: string[];
+}
+
+export interface LaunchUiBackend {
+  module: string;
+  args: string[];
+  enabled: boolean;
+}
+
+export interface LaunchConfig {
+  runner: LaunchRunner;
+  uiBackend?: LaunchUiBackend;
+}
+
+export interface RobotConfig {
+  robotId: string;
+  groupId: string;
+  urdfPath: string;
+  globalMaxTcpLinearSpeedMps: number;
+}
+
+export interface DeploymentInfo {
+  name: string;
+  description: string;
+  programProfile: string;
+  robotConfig: RobotConfig;
+}
+
+export interface FullDeployment {
+  apiVersion: string;
+  schemaVersion: string;
+  name: string;
+  description: string;
+  programProfile: string;
+  robotConfig: RobotConfig;
+  adapters: Record<string, AdapterConfig>;
+  orchestrator: OrchestratorConfig;
+  launch: LaunchConfig;
+}
+
 // WebSocket
 export interface StateUpdate {
   state: 'idle' | 'running' | 'stopped';
   velocityScale: number;
+  nodeStatuses?: Record<string, string>;
   timestamp: number;
 }
