@@ -1,174 +1,75 @@
-"""StateBridge - Bridges KernelClient and the UI layer.
+"""StateBridge - Bridges CycleManager and the UI layer.
 
 This is the testable core — no Viser dependency.
 """
 
-from typing import Optional
-from manyforge_behavior.kernel_client import (
-    KernelClient,
-    ExecutionState,
-    ExecutionStatus,
-    ExecuteRequest,
-    ExecuteResult,
-    CommandResult,
-    SceneEditRequest,
-    SceneEditResult,
-)
+from manyforge_behavior.cycle_manager import CycleManager, CycleState
 
 
 class StateBridge:
-    """Polls kernel status and provides state to the UI layer.
+    """Wraps CycleManager and provides state to the UI layer.
 
-    This class is the bridge between the ManyForge kernel client and the
+    This class is the bridge between the CycleManager and the
     Viser-based UI. It provides a clean interface for querying state and
     executing commands.
     """
 
-    def __init__(self, kernel: KernelClient) -> None:
-        """Initialize the StateBridge with a KernelClient.
+    def __init__(self, cycle_manager: CycleManager) -> None:
+        """Initialize the StateBridge with a CycleManager.
 
         Args:
-            kernel: The kernel client to communicate with.
+            cycle_manager: The cycle manager for lifecycle control.
         """
-        self._kernel = kernel
+        self._cm = cycle_manager
 
-    def get_state(self) -> ExecutionStatus:
-        """Get the current execution status from the kernel.
+    @property
+    def state(self) -> CycleState:
+        """Get the current lifecycle state.
 
         Returns:
-            ExecutionStatus containing state, execution_id, and progress.
+            CycleState enum value (IDLE, RUNNING, or STOPPED).
         """
-        return self._kernel.get_status()
+        return self._cm.state
 
-    def execute_stop(self) -> CommandResult:
-        """Execute a stop command.
+    @property
+    def velocity_scale(self) -> float:
+        """Get the current velocity scale (0.0 to 1.0).
 
         Returns:
-            CommandResult indicating if the stop was accepted.
+            Velocity scale value between 0.0 and 1.0.
         """
-        return self._kernel.stop()
+        return self._cm.velocity_scale
 
-    def execute_pause(self) -> CommandResult:
-        """Execute a pause command.
+    def run(self) -> None:
+        """Start or resume program execution.
 
-        Returns:
-            CommandResult indicating if the pause was accepted.
+        If IDLE: builds and starts everything.
+        If STOPPED: resumes from stopped state.
+        If RUNNING: no-op.
         """
-        return self._kernel.pause()
+        self._cm.run()
 
-    def execute_resume(self) -> CommandResult:
-        """Execute a resume command.
+    def stop(self) -> None:
+        """Stop program execution.
 
-        Returns:
-            CommandResult indicating if the resume was accepted.
+        If RUNNING: sets stop flag and suspends tick thread.
+        If STOPPED or IDLE: no-op.
         """
-        return self._kernel.resume()
+        self._cm.stop()
 
-    def execute_reset(self) -> CommandResult:
-        """Execute a reset command.
+    def reset(self) -> None:
+        """Reset program to initial state.
 
-        Returns:
-            CommandResult indicating if the reset was accepted.
+        If RUNNING: stops first, then resets.
+        If STOPPED: stops tick thread, resets kernel, rebuilds tree.
+        If IDLE: no-op.
         """
-        return self._kernel.reset()
+        self._cm.reset()
 
-    def execute_motion(self, request: ExecuteRequest) -> ExecuteResult:
-        """Execute a motion request.
+    def set_velocity_scale(self, scale: float) -> None:
+        """Set velocity scale on blackboard.
 
         Args:
-            request: The execute request containing motion parameters.
-
-        Returns:
-            ExecuteResult indicating if the motion was accepted.
+            scale: Velocity scale between 0.0 and 1.0.
         """
-        return self._kernel.execute(request)
-
-    def get_link_pose(self, target_frame: str, base_frame: str) -> Optional[dict]:
-        """Get the pose of a link relative to a base frame.
-
-        Args:
-            target_frame: The target link/frame name.
-            base_frame: The base frame name.
-
-        Returns:
-            Dictionary with position_m and orientation_xyzw, or None if not found.
-        """
-        return self._kernel.get_link_pose(target_frame, base_frame)
-
-    def scene_edit(self, request: SceneEditRequest) -> SceneEditResult:
-        """Execute a scene edit request.
-
-        Args:
-            request: The scene edit request.
-
-        Returns:
-            SceneEditResult indicating if the edit was successful.
-        """
-        return self._kernel.scene_edit(request)
-
-    @property
-    def is_executing(self) -> bool:
-        """Check if currently executing.
-
-        Returns:
-            True if state is EXECUTING.
-        """
-        status = self.get_state()
-        return status.state == ExecutionState.EXECUTING
-
-    @property
-    def is_idle(self) -> bool:
-        """Check if currently idle.
-
-        Returns:
-            True if state is IDLE.
-        """
-        status = self.get_state()
-        return status.state == ExecutionState.IDLE
-
-    @property
-    def can_pause(self) -> bool:
-        """Check if pause is possible.
-
-        Returns:
-            True if currently executing (can be paused).
-        """
-        return self.is_executing
-
-    @property
-    def can_resume(self) -> bool:
-        """Check if resume is possible.
-
-        Returns:
-            True if currently paused.
-        """
-        status = self.get_state()
-        return status.state == ExecutionState.PAUSED
-
-    @property
-    def can_stop(self) -> bool:
-        """Check if stop is possible.
-
-        Returns:
-            True if executing or paused.
-        """
-        status = self.get_state()
-        return status.state in (ExecutionState.EXECUTING, ExecutionState.PAUSED)
-
-    @property
-    def current_state(self) -> ExecutionState:
-        """Get the current execution state.
-
-        Returns:
-            The current ExecutionState enum value.
-        """
-        return self.get_state().state
-
-    @property
-    def progress(self) -> float:
-        """Get the current execution progress (0.0 to 1.0).
-
-        Returns:
-            Progress value between 0.0 and 1.0.
-        """
-        return self.get_state().progress
+        self._cm.set_velocity_scale(scale)

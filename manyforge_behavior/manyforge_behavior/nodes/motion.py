@@ -47,6 +47,25 @@ class MoveManipulatorAction(py_trees.behaviour.Behaviour):
         self._started = False
 
     def update(self) -> py_trees.common.Status:
+        # Check stop flag — block new motions if stop is requested
+        try:
+            stop_bb = py_trees.blackboard.Client(name=self.name + "_stop")
+            stop_bb.register_key(key="stop_requested", access=py_trees.common.Access.READ)
+            if stop_bb.stop_requested:
+                return py_trees.common.Status.RUNNING  # block, don't start new motion
+        except (KeyError, AttributeError):
+            pass  # No stop flag on blackboard, continue normally
+
+        # Read velocity_scale from blackboard and multiply with per-move scale
+        try:
+            vs_bb = py_trees.blackboard.Client(name=self.name + "_vs")
+            vs_bb.register_key(key="velocity_scale", access=py_trees.common.Access.READ)
+            bb_velocity_scale = vs_bb.velocity_scale
+            if bb_velocity_scale is not None and 0.0 < bb_velocity_scale <= 1.0:
+                self._params["velocity_scale"] = float(self._params.get("velocity_scale", 1.0)) * bb_velocity_scale
+        except (KeyError, AttributeError):
+            pass
+
         kernel: KernelClient = self.blackboard.kernel
 
         if not self._started:

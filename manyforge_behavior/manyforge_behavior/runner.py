@@ -22,6 +22,7 @@ from manyforge_behavior.nodes.scene import (
     RemoveCollisionObject,
     UpdateCollisionObjectPose,
 )
+from manyforge_behavior.nodes.control_flow import RepeatDecorator, RetryDecorator
 from manyforge_behavior.parameters import ParameterResolver
 from manyforge_behavior.program import Program, TreeNode
 
@@ -128,6 +129,12 @@ class OrchestratorRunner:
             bb.register_key(key="global_max_tcp_linear_speed_mps", access=py_trees.common.Access.WRITE)
             bb.global_max_tcp_linear_speed_mps = self._deployment.robot_config.global_max_tcp_linear_speed_mps
 
+        # Register stop flag and velocity scale keys for CycleManager
+        bb.register_key(key="stop_requested", access=py_trees.common.Access.WRITE)
+        bb.stop_requested = False
+        bb.register_key(key="velocity_scale", access=py_trees.common.Access.WRITE)
+        bb.velocity_scale = 1.0
+
         self._tree = tree
         return tree
 
@@ -222,6 +229,20 @@ class OrchestratorRunner:
             return py_trees.decorators.Inverter(
                 name=tree_node.name, child=children[0]
             )
+        if tree_node.id == "repeat":
+            if not children:
+                raise ValueError(
+                    f"Repeat '{tree_node.name}' requires exactly one child"
+                )
+            num_cycles = int(resolved_params.get("num_cycles", -1))
+            return RepeatDecorator(name=tree_node.name, child=children[0], num_cycles=num_cycles)
+        if tree_node.id == "retry":
+            if not children:
+                raise ValueError(
+                    f"Retry '{tree_node.name}' requires exactly one child"
+                )
+            num_attempts = int(resolved_params.get("num_attempts", -1))
+            return RetryDecorator(name=tree_node.name, child=children[0], num_attempts=num_attempts)
         if tree_node.id == "timer":
             duration = float(resolved_params.get("duration_s", 1.0))
             return py_trees.timers.Timer(

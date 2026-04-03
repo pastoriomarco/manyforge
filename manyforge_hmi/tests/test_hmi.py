@@ -21,8 +21,10 @@ from manyforge_behavior.kernel_client import (
     CommandResult,
     SceneEditRequest,
 )
+from manyforge_behavior.cycle_manager import CycleManager, CycleState
 from manyforge_behavior.program import Program
 from manyforge_behavior.catalog import NodeCatalog
+from manyforge_behavior.runner import OrchestratorRunner
 
 from manyforge_hmi import (
     StateBridge,
@@ -39,168 +41,241 @@ from manyforge_hmi import (
 # ============================================================================
 
 class TestStateBridge:
-    """Tests for StateBridge using MockKernelClient."""
+    """Tests for StateBridge using CycleManager."""
 
-    def test_bridge_get_state_idle(self):
+    def setup_method(self):
+        """Set up test fixtures."""
+        self.kernel = MockKernelClient()
+        self.runner = OrchestratorRunner(
+            catalog_path=_CATALOG_PATH,
+            program_path=_PROGRAM_PATH,
+            kernel=self.kernel,
+        )
+        self.cycle_manager = CycleManager(self.runner, self.kernel)
+
+    def test_initial_state_idle(self):
         """Test that initial state is IDLE."""
-        kernel = MockKernelClient()
-        bridge = StateBridge(kernel)
-        status = bridge.get_state()
-        assert status.state == ExecutionState.IDLE
+        bridge = StateBridge(self.cycle_manager)
+        assert bridge.state == CycleState.IDLE
 
-    def test_bridge_execute_stop(self):
-        """Test stop from executing state."""
-        kernel = MockKernelClient()
-        bridge = StateBridge(kernel)
+    def test_bridge_run(self):
+        """Test run command."""
+        bridge = StateBridge(self.cycle_manager)
 
-        # Manually set state to EXECUTING for testing
-        kernel._state = ExecutionState.EXECUTING
+        # Run from IDLE
+        bridge.run()
+        assert bridge.state == CycleState.RUNNING
+
+    def test_bridge_stop(self):
+        """Test stop from running state."""
+        bridge = StateBridge(self.cycle_manager)
+
+        # Run first
+        bridge.run()
+        assert bridge.state == CycleState.RUNNING
 
         # Now stop
-        result = bridge.execute_stop()
-        assert result.accepted is True
+        bridge.stop()
+        assert bridge.state == CycleState.STOPPED
 
-    def test_bridge_execute_pause(self):
-        """Test pause from executing state."""
-        kernel = MockKernelClient()
-        bridge = StateBridge(kernel)
+    def test_bridge_reset(self):
+        """Test reset command."""
+        bridge = StateBridge(self.cycle_manager)
 
-        # Manually set state to EXECUTING for testing
-        kernel._state = ExecutionState.EXECUTING
-
-        # Pause
-        result = bridge.execute_pause()
-        assert result.accepted is True
-
-        # Verify state is PAUSED
-        status = bridge.get_state()
-        assert status.state == ExecutionState.PAUSED
-
-    def test_bridge_execute_resume(self):
-        """Test resume from paused state."""
-        kernel = MockKernelClient()
-        bridge = StateBridge(kernel)
-
-        # Manually set state to PAUSED for testing
-        kernel._state = ExecutionState.PAUSED
-
-        # Resume
-        result = bridge.execute_resume()
-        assert result.accepted is True
-
-    def test_bridge_execute_reset(self):
-        """Test reset from completed state."""
-        kernel = MockKernelClient()
-        bridge = StateBridge(kernel)
-
-        # Start and complete
-        request = ExecuteRequest(
-            robot_id="test",
-            group_id="arm",
-            move_id="test_move",
-            base_frame="base",
-            tcp_frame="tool0",
-            motion_type="joint_goal",
-            joint_goal_names=["j1", "j2"],
-            joint_goal_positions_rad=[0.0, 0.0],
-        )
-        kernel.execute(request)
+        # Run first
+        bridge.run()
+        assert bridge.state == CycleState.RUNNING
 
         # Reset
-        result = bridge.execute_reset()
-        assert result.accepted is True
+        bridge.reset()
+        assert bridge.state == CycleState.IDLE
 
-        # Verify state is IDLE
-        status = bridge.get_state()
-        assert status.state == ExecutionState.IDLE
+    def test_bridge_velocity_scale(self):
+        """Test velocity scale property and setter."""
+        bridge = StateBridge(self.cycle_manager)
 
-    def test_bridge_is_idle(self):
-        """Test is_idle property."""
+        # Initial velocity scale is 1.0
+        assert bridge.velocity_scale == 1.0
+
+        # Set new velocity scale
+        bridge.set_velocity_scale(0.5)
+        assert bridge.velocity_scale == 0.5
+
+    def test_bridge_run_from_stopped(self):
+        """Test run from STOPPED state resumes execution."""
+        bridge = StateBridge(self.cycle_manager)
+
+        # Run then stop
+        bridge.run()
+        bridge.stop()
+        assert bridge.state == CycleState.STOPPED
+
+        # Run again (resume)
+        bridge.run()
+        assert bridge.state == CycleState.RUNNING
+
+
+# ============================================================================
+# ControlPanel Tests (uses Viser with port=0)
+# ============================================================================
+
+class TestControlPanel:
+    """Tests for ControlPanel using Viser."""
+
+    @pytest.fixture
+    def viser_server(self):
+        """Create a Viser server with random port."""
+        server = viser.ViserServer(host="127.0.0.1", port=0)
+        yield server
+        server.stop()
+
+    @pytest.fixture
+    def cycle_manager(self):
+        """Create a CycleManager for testing."""
         kernel = MockKernelClient()
-        bridge = StateBridge(kernel)
-
-        # Initially idle
-        assert bridge.is_idle is True
-
-        # Start execution
-        request = ExecuteRequest(
-            robot_id="test",
-            group_id="arm",
-            move_id="test_move",
-            base_frame="base",
-            tcp_frame="tool0",
-            motion_type="joint_goal",
-            joint_goal_names=["j1", "j2"],
-            joint_goal_positions_rad=[0.0, 0.0],
+        runner = OrchestratorRunner(
+            catalog_path=_CATALOG_PATH,
+            program_path=_PROGRAM_PATH,
+            kernel=kernel,
         )
-        kernel.execute(request)
+        return CycleManager(runner, kernel)
 
-        # No longer idle
-        assert bridge.is_idle is False
+    def test_3_buttons_only(self, viser_server, cycle_manager):
+        """Test that only Run, Stop, Reset buttons exist (no Pause/Resume/Run Program)."""
+        bridge = StateBridge(cycle_manager)
+        panel = ControlPanel(viser_server, bridge)
 
-    def test_bridge_can_pause(self):
-        """Test can_pause reflects state."""
-        kernel = MockKernelClient()
-        bridge = StateBridge(kernel)
+        # Verify the three buttons exist
+        assert panel.run_button is not None
+        assert panel.stop_button is not None
+        assert panel.reset_button is not None
 
-        # Initially cannot pause (idle)
-        assert bridge.can_pause is False
+        # Verify no pause/resume/run_program buttons exist
+        assert not hasattr(panel, 'pause_button')
+        assert not hasattr(panel, 'resume_button')
+        assert not hasattr(panel, 'run_program_button')
 
-        # Manually set state to EXECUTING for testing
-        kernel._state = ExecutionState.EXECUTING
+    def test_run_button_enabled_when_idle_or_stopped(self, viser_server, cycle_manager):
+        """Test Run button enabled state."""
+        bridge = StateBridge(cycle_manager)
+        panel = ControlPanel(viser_server, bridge)
 
-        # Now can pause
-        assert bridge.can_pause is True
+        # Initially IDLE - Run should be enabled
+        panel.update(CycleState.IDLE, 1.0)
+        assert panel.run_button.enabled is True
 
-    def test_bridge_can_stop(self):
-        """Test can_stop reflects state."""
-        kernel = MockKernelClient()
-        bridge = StateBridge(kernel)
+        # STOPPED - Run should be enabled
+        panel.update(CycleState.STOPPED, 1.0)
+        assert panel.run_button.enabled is True
 
-        # Initially cannot stop (idle)
-        assert bridge.can_stop is False
+        # RUNNING - Run should be disabled
+        panel.update(CycleState.RUNNING, 1.0)
+        assert panel.run_button.enabled is False
 
-        # Manually set state to EXECUTING for testing
-        kernel._state = ExecutionState.EXECUTING
+    def test_stop_button_enabled_when_running(self, viser_server, cycle_manager):
+        """Test Stop button enabled state."""
+        bridge = StateBridge(cycle_manager)
+        panel = ControlPanel(viser_server, bridge)
 
-        # Now can stop
-        assert bridge.can_stop is True
+        # IDLE - Stop should be disabled
+        panel.update(CycleState.IDLE, 1.0)
+        assert panel.stop_button.enabled is False
 
-    def test_bridge_execute_motion(self):
-        """Test motion request forwarding."""
-        kernel = MockKernelClient()
-        bridge = StateBridge(kernel)
+        # RUNNING - Stop should be enabled
+        panel.update(CycleState.RUNNING, 1.0)
+        assert panel.stop_button.enabled is True
 
-        request = ExecuteRequest(
-            robot_id="test",
-            group_id="arm",
-            move_id="test_move",
-            base_frame="base",
-            tcp_frame="tool0",
-            motion_type="joint_goal",
-            joint_goal_names=["j1", "j2"],
-            joint_goal_positions_rad=[0.0, 0.0],
-        )
+        # STOPPED - Stop should be disabled
+        panel.update(CycleState.STOPPED, 1.0)
+        assert panel.stop_button.enabled is False
 
-        result = bridge.execute_motion(request)
-        assert result.ok is True
+    def test_reset_button_enabled_when_running_or_stopped(self, viser_server, cycle_manager):
+        """Test Reset button enabled state."""
+        bridge = StateBridge(cycle_manager)
+        panel = ControlPanel(viser_server, bridge)
 
-    def test_bridge_scene_edit(self):
-        """Test scene edit forwarding."""
-        kernel = MockKernelClient()
-        bridge = StateBridge(kernel)
+        # IDLE - Reset should be disabled
+        panel.update(CycleState.IDLE, 1.0)
+        assert panel.reset_button.enabled is False
 
-        request = SceneEditRequest(
-            operation="add",
-            object_id="test_box",
-            shape_type="box",
-            box_dimensions_m=[0.1, 0.1, 0.1],
-            pose_position_m=[0.0, 0.0, 0.0],
-            pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
-        )
+        # RUNNING - Reset should be enabled
+        panel.update(CycleState.RUNNING, 1.0)
+        assert panel.reset_button.enabled is True
 
-        result = bridge.scene_edit(request)
-        assert result.success is True
+        # STOPPED - Reset should be enabled
+        panel.update(CycleState.STOPPED, 1.0)
+        assert panel.reset_button.enabled is True
+
+    def test_velocity_slider_exists(self, viser_server, cycle_manager):
+        """Test that velocity slider exists."""
+        bridge = StateBridge(cycle_manager)
+        panel = ControlPanel(viser_server, bridge)
+
+        assert panel.velocity_slider is not None
+
+    def test_velocity_slider_sets_scale(self, viser_server, cycle_manager):
+        """Test that velocity slider sets velocity scale."""
+        bridge = StateBridge(cycle_manager)
+        panel = ControlPanel(viser_server, bridge)
+
+        # Initial scale is 1.0
+        assert cycle_manager.velocity_scale == 1.0
+
+        # Simulate slider input at 50%
+        class MockTarget:
+            value = 50
+        class MockEvent:
+            target = MockTarget()
+
+        panel._on_velocity_slider_input(MockEvent())
+        assert cycle_manager.velocity_scale == 0.5
+
+    def test_run_delegates_to_cycle_manager(self, viser_server, cycle_manager):
+        """Test that Run button delegates to CycleManager.run()."""
+        bridge = StateBridge(cycle_manager)
+        panel = ControlPanel(viser_server, bridge)
+
+        # Initially IDLE
+        assert cycle_manager.state == CycleState.IDLE
+
+        # Click Run button
+        class MockEvent:
+            pass
+
+        panel._on_run_click(MockEvent())
+        assert cycle_manager.state == CycleState.RUNNING
+
+    def test_stop_delegates_to_cycle_manager(self, viser_server, cycle_manager):
+        """Test that Stop button delegates to CycleManager.stop()."""
+        bridge = StateBridge(cycle_manager)
+        panel = ControlPanel(viser_server, bridge)
+
+        # Run first
+        cycle_manager.run()
+        assert cycle_manager.state == CycleState.RUNNING
+
+        # Click Stop button
+        class MockEvent:
+            pass
+
+        panel._on_stop_click(MockEvent())
+        assert cycle_manager.state == CycleState.STOPPED
+
+    def test_reset_delegates_to_cycle_manager(self, viser_server, cycle_manager):
+        """Test that Reset button delegates to CycleManager.reset()."""
+        bridge = StateBridge(cycle_manager)
+        panel = ControlPanel(viser_server, bridge)
+
+        # Run first
+        cycle_manager.run()
+        assert cycle_manager.state == CycleState.RUNNING
+
+        # Click Reset button
+        class MockEvent:
+            pass
+
+        panel._on_reset_click(MockEvent())
+        assert cycle_manager.state == CycleState.IDLE
 
 
 # ============================================================================
@@ -286,13 +361,19 @@ class TestViserHmiServer:
     """Tests for ViserHmiServer."""
 
     @pytest.fixture
-    def kernel(self):
-        """Create a MockKernelClient."""
-        return MockKernelClient()
+    def cycle_manager(self):
+        """Create a CycleManager."""
+        kernel = MockKernelClient()
+        runner = OrchestratorRunner(
+            catalog_path=_CATALOG_PATH,
+            program_path=_PROGRAM_PATH,
+            kernel=kernel,
+        )
+        return CycleManager(runner, kernel)
 
-    def test_server_creates(self, kernel):
-        """Test that server creates with MockKernelClient."""
-        server = ViserHmiServer(kernel, host="127.0.0.1", port=0)
+    def test_server_creates(self, cycle_manager):
+        """Test that server creates with CycleManager."""
+        server = ViserHmiServer(cycle_manager, host="127.0.0.1", port=0)
 
         # Verify components exist
         assert server.viser_server is not None
@@ -303,9 +384,9 @@ class TestViserHmiServer:
 
         server.stop()
 
-    def test_server_load_program(self, kernel):
+    def test_server_load_program(self, cycle_manager):
         """Test that server loads program."""
-        server = ViserHmiServer(kernel, host="127.0.0.1", port=0)
+        server = ViserHmiServer(cycle_manager, host="127.0.0.1", port=0)
 
         catalog_path = _CATALOG_PATH
         program_path = _PROGRAM_PATH
@@ -320,17 +401,19 @@ class TestViserHmiServer:
 
         server.stop()
 
-    def test_control_panel_creates(self, kernel):
-        """Test that control panel has buttons."""
-        server = ViserHmiServer(kernel, host="127.0.0.1", port=0)
+    def test_control_panel_has_3_buttons(self, cycle_manager):
+        """Test that control panel has exactly 3 buttons."""
+        server = ViserHmiServer(cycle_manager, host="127.0.0.1", port=0)
 
         panel = server.control_panel
 
-        # Verify buttons exist
+        # Verify the three buttons exist
+        assert panel.run_button is not None
         assert panel.stop_button is not None
-        assert panel.pause_button is not None
-        assert panel.resume_button is not None
         assert panel.reset_button is not None
+
+        # Verify velocity slider exists
+        assert panel.velocity_slider is not None
 
         server.stop()
 

@@ -124,6 +124,66 @@ entries:
       emits_events: []
       consumes_events: []
 
+  - id: repeat
+    name: Repeat
+    category: control_flow
+    description: >-
+      Decorator that repeats its child a fixed number of times. num_cycles=-1 means forever.
+    tags: [control_flow, decorator]
+    profiles:
+      min_profile: v0.0
+    kind: decorator
+    children:
+      min: 1
+      max: 1
+    parameters:
+      - name: num_cycles
+        type: int
+        required: true
+        default: -1
+        description: Number of cycles. -1 for infinite.
+    required_capabilities: []
+    execution:
+      blocking: false
+      cancellable: false
+    runners:
+      py_trees:
+        implementation_kind: plugin
+        class: manyforge_behavior.nodes.control_flow.RepeatDecorator
+    observability:
+      emits_events: []
+      consumes_events: []
+
+  - id: retry
+    name: Retry
+    category: control_flow
+    description: >-
+      Decorator that retries its child on FAILURE. num_attempts=-1 means forever.
+    tags: [control_flow, decorator]
+    profiles:
+      min_profile: v0.0
+    kind: decorator
+    children:
+      min: 1
+      max: 1
+    parameters:
+      - name: num_attempts
+        type: int
+        required: true
+        default: -1
+        description: Max retry attempts. -1 for infinite.
+    required_capabilities: []
+    execution:
+      blocking: false
+      cancellable: false
+    runners:
+      py_trees:
+        implementation_kind: plugin
+        class: manyforge_behavior.nodes.control_flow.RetryDecorator
+    observability:
+      emits_events: []
+      consumes_events: []
+
   - id: timer
     name: Timer
     category: control_flow

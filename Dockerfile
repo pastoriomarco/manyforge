@@ -43,6 +43,7 @@ RUN pip install --no-cache-dir --upgrade pip setuptools && \
         nanobind scikit-build-core \
         pin==3.7.0 \
         "viser>=1.0.1" \
+        fastapi "uvicorn[standard]" httpx websockets \
     && CMEEL_LIB=$(python3 -c "import site; print(site.getsitepackages()[0])")/cmeel.prefix/lib \
     && if [ -d "$CMEEL_LIB" ]; then echo "$CMEEL_LIB" > /etc/ld.so.conf.d/cmeel.conf && ldconfig; fi
 

@@ -11,7 +11,7 @@ from .robot_visualizer import RobotVisualizer
 from .scene_renderer import SceneRenderer
 from .program_panel import ProgramPanel
 
-from manyforge_behavior.kernel_client import KernelClient
+from manyforge_behavior.cycle_manager import CycleManager
 
 
 class ViserHmiServer:
@@ -23,7 +23,7 @@ class ViserHmiServer:
 
     def __init__(
         self,
-        kernel: KernelClient,
+        cycle_manager: CycleManager,
         host: str = "0.0.0.0",
         port: int = 8080,
         urdf_path: Optional[str] = None,
@@ -32,7 +32,7 @@ class ViserHmiServer:
         """Initialize the ViserHmiServer.
 
         Args:
-            kernel: The kernel client for execution control.
+            cycle_manager: The cycle manager for lifecycle control.
             host: Host address to bind to.
             port: Port to bind to (use 0 for random port).
             urdf_path: Optional path to robot URDF file.
@@ -42,7 +42,7 @@ class ViserHmiServer:
         self._viser_server = viser.ViserServer(host=host, port=port)
 
         # Create the StateBridge
-        self._bridge = StateBridge(kernel)
+        self._bridge = StateBridge(cycle_manager)
 
         # Create the ControlPanel
         self._control_panel = ControlPanel(self._viser_server, self._bridge)
@@ -103,7 +103,10 @@ class ViserHmiServer:
         while self._running:
             try:
                 if self._control_panel:
-                    self._control_panel.update()
+                    # Poll CycleManager state via bridge
+                    state = self._bridge.state
+                    velocity_scale = self._bridge.velocity_scale
+                    self._control_panel.update(state, velocity_scale)
             except Exception:
                 pass
             time.sleep(0.1)  # 100ms update rate

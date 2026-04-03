@@ -1,18 +1,19 @@
 """ControlPanel - Viser GUI widgets for execution control."""
 
 import viser
-from typing import Callable, Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .state_bridge import StateBridge
+from manyforge_behavior.cycle_manager import CycleState
 
 
 class ControlPanel:
-    """Stop/Pause/Resume/Reset buttons + status display in Viser GUI.
+    """Run/Stop/Reset buttons + velocity slider + status display in Viser GUI.
 
     This class creates and manages the execution control widgets in the
-    Viser sidebar, including buttons for Stop, Pause, Resume, and Reset,
-    as well as status display and progress bar.
+    Viser sidebar, including buttons for Run, Stop, and Reset,
+    a velocity slider, as well as status display.
     """
 
     def __init__(self, server: viser.ViserServer, bridge: "StateBridge") -> None:
@@ -24,6 +25,7 @@ class ControlPanel:
         """
         self._server = server
         self._bridge = bridge
+        self._updating = False
 
         # Create the "Execution Control" folder
         self._folder = server.gui.add_folder("Execution Control", expand_by_default=True)
@@ -32,29 +34,30 @@ class ControlPanel:
         with self._folder:
             self._status_header = server.gui.add_markdown("## Execution Status")
             self._status_text = server.gui.add_markdown("State: IDLE")
-            self._progress_bar = server.gui.add_progress_bar(
-                value=0, animated=False
+
+        # Create velocity slider
+        with self._folder:
+            self._velocity_slider = server.gui.add_slider(
+                label="Velocity Scale",
+                min=0,
+                max=100,
+                step=1,
+                initial_value=100,
             )
 
         # Create buttons folder
         self._buttons_folder = server.gui.add_folder("Controls", expand_by_default=True)
 
+        # Run button (green)
+        with self._buttons_folder:
+            self._run_button = server.gui.add_button(
+                "Run", color="green"
+            )
+
         # Stop button (red)
         with self._buttons_folder:
             self._stop_button = server.gui.add_button(
                 "Stop", color="red"
-            )
-
-        # Pause button (yellow)
-        with self._buttons_folder:
-            self._pause_button = server.gui.add_button(
-                "Pause", color="yellow"
-            )
-
-        # Resume button (green)
-        with self._buttons_folder:
-            self._resume_button = server.gui.add_button(
-                "Resume", color="green"
             )
 
         # Reset button (blue)
@@ -63,79 +66,66 @@ class ControlPanel:
                 "Reset", color="blue"
             )
 
-        # Run Program button (green)
-        with self._buttons_folder:
-            self._run_button = server.gui.add_button(
-                "Run Program", color="green"
-            )
-
         # Wire up button click handlers
         self._run_button.on_click(self._on_run_click)
         self._stop_button.on_click(self._on_stop_click)
-        self._pause_button.on_click(self._on_pause_click)
-        self._resume_button.on_click(self._on_resume_click)
         self._reset_button.on_click(self._on_reset_click)
 
-        # Callback for the Run button
-        self._run_callback: Optional[Callable[[], None]] = None
+        # Wire up velocity slider handler
+        self._velocity_slider.on_update(self._on_velocity_slider_input)
 
         # Initial update
-        self.update()
-
-    def set_run_callback(self, callback: Callable[[], None]) -> None:
-        """Set callback invoked when the Run Program button is clicked."""
-        self._run_callback = callback
+        self.update(CycleState.IDLE, 1.0)
 
     def _on_run_click(self, event: viser.GuiEvent) -> None:
-        """Handle Run Program button click."""
-        if self._run_callback:
-            self._run_button.disabled = True
-            self._run_callback()
+        """Handle Run button click."""
+        self._bridge.run()
 
     def _on_stop_click(self, event: viser.GuiEvent) -> None:
         """Handle Stop button click."""
-        result = self._bridge.execute_stop()
-        if not result.accepted:
-            self._status_text.content = f"Stop failed: {result.error}"
-
-    def _on_pause_click(self, event: viser.GuiEvent) -> None:
-        """Handle Pause button click."""
-        result = self._bridge.execute_pause()
-        if not result.accepted:
-            self._status_text.content = f"Pause failed: {result.error}"
-
-    def _on_resume_click(self, event: viser.GuiEvent) -> None:
-        """Handle Resume button click."""
-        result = self._bridge.execute_resume()
-        if not result.accepted:
-            self._status_text.content = f"Resume failed: {result.error}"
+        self._bridge.stop()
 
     def _on_reset_click(self, event: viser.GuiEvent) -> None:
         """Handle Reset button click."""
-        result = self._bridge.execute_reset()
-        if not result.accepted:
-            self._status_text.content = f"Reset failed: {result.error}"
+        self._bridge.reset()
 
-    def update(self) -> None:
-        """Update status display and button states from bridge."""
-        status = self._bridge.get_state()
+    def _on_velocity_slider_input(self, event: viser.GuiEvent) -> None:
+        """Handle velocity slider input."""
+        if self._updating:
+            return  # Ignore programmatic updates
+        # Convert 0-100 integer to 0.0-1.0 float
+        scale = event.target.value / 100.0
+        self._bridge.set_velocity_scale(scale)
 
+    def update(self, state: CycleState, velocity_scale: float) -> None:
+        """Update status display and button states.
+
+        Args:
+            state: Current CycleState (IDLE, RUNNING, or STOPPED).
+            velocity_scale: Current velocity scale (0.0 to 1.0).
+        """
         # Update status text
-        state_name = status.state.value.upper() if status.state else "UNKNOWN"
+        state_name = state.value.upper()
         self._status_text.content = f"State: {state_name}"
 
-        # Update progress bar
-        self._progress_bar.value = int(status.progress * 100)
+        # Update velocity slider value (guarded to avoid triggering on_update)
+        self._updating = True
+        self._velocity_slider.value = int(velocity_scale * 100)
+        self._updating = False
 
         # Update button enabled states
-        self._stop_button.enabled = self._bridge.can_stop
-        self._pause_button.enabled = self._bridge.can_pause
-        self._resume_button.enabled = self._bridge.can_resume
-        self._reset_button.enabled = status.state != self._bridge.get_state().state or True  # Always enable reset
+        # Run: enabled when state is IDLE or STOPPED
+        self._run_button.enabled = state in (CycleState.IDLE, CycleState.STOPPED)
+
+        # Stop: enabled when state is RUNNING
+        self._stop_button.enabled = state == CycleState.RUNNING
+
+        # Reset: enabled when RUNNING or STOPPED
+        self._reset_button.enabled = state in (CycleState.RUNNING, CycleState.STOPPED)
 
     @property
     def run_button(self) -> viser.GuiButtonHandle:
-        """Access the Run Program button."""
+        """Access the Run button."""
         return self._run_button
 
     @property
@@ -144,26 +134,16 @@ class ControlPanel:
         return self._stop_button
 
     @property
-    def pause_button(self) -> viser.GuiButtonHandle:
-        """Access the Pause button."""
-        return self._pause_button
-
-    @property
-    def resume_button(self) -> viser.GuiButtonHandle:
-        """Access the Resume button."""
-        return self._resume_button
-
-    @property
     def reset_button(self) -> viser.GuiButtonHandle:
         """Access the Reset button."""
         return self._reset_button
 
     @property
+    def velocity_slider(self) -> viser.GuiSliderHandle:
+        """Access the velocity slider widget."""
+        return self._velocity_slider
+
+    @property
     def status_text(self) -> viser.GuiMarkdownHandle:
         """Access the status text widget."""
         return self._status_text
-
-    @property
-    def progress_bar(self) -> viser.GuiSliderHandle:
-        """Access the progress bar widget."""
-        return self._progress_bar

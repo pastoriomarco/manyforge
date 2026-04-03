@@ -12,6 +12,7 @@ from manyforge_behavior.nodes.logic import (
     WaitForKeyBool,
 )
 from manyforge_behavior.nodes.geometry import GetLinkPose, CheckPoseDistance
+from manyforge_behavior.nodes.control_flow import RepeatDecorator, RetryDecorator
 
 __all__ = [
     "MoveManipulatorAction",
@@ -26,4 +27,6 @@ __all__ = [
     "WaitForKeyBool",
     "GetLinkPose",
     "CheckPoseDistance",
+    "RepeatDecorator",
+    "RetryDecorator",
 ]

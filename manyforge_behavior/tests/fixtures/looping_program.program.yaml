@@ -1,0 +1,34 @@
+api_version: manyforge.program.v0
+program_profile: v0.0
+name: test_looping_program
+description: Test program with repeat and retry.
+catalog_version: "0.1.0"
+
+robot:
+  robot_id: ur5
+  group_id: arm
+  base_frame: base_link
+  tcp_frame: tool0
+
+scene: []
+parameters: []
+
+tree:
+  id: retry
+  name: cycle_manager
+  params:
+    num_attempts: -1
+  children:
+    - id: repeat
+      name: work_cycle
+      params:
+        num_cycles: 3
+      children:
+        - id: sequence
+          name: cycle_body
+          children:
+            - id: set_key_bool_value
+              name: mark_done
+              params:
+                key: cycle_ran
+                value: true
