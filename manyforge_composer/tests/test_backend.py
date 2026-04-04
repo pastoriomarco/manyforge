@@ -149,7 +149,7 @@ def test_velocity_scale(client, state):
 
 def test_catalog_list(client):
     """GET /api/catalog returns entries list with version."""
-    response = client.get("/api/catalog/")
+    response = client.get("/api/catalog")
     assert response.status_code == 200
     data = response.json()
     assert "version" in data

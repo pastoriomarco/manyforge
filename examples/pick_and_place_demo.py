@@ -2,7 +2,7 @@
 """Pick-and-place demo with real RoboPlan planning and Viser 3D visualization.
 
 Runs inside the Docker container:
-    docker compose run --rm -p 8081:8080 dev bash -c \\
+    docker compose run --rm -p 8081:8081 dev bash -c \\
         './scripts/test-all.sh roboplan && python3 examples/pick_and_place_demo.py'
 
 Then open http://localhost:8081 in your browser to see the 3D scene.
@@ -41,7 +41,7 @@ try:
     URDF_PATH = str(Path(MODELS_DIR) / "ur_robot_model" / "ur5_gripper.urdf")
 except ImportError:
     print("ERROR: roboplan not available. Run inside the Docker container:")
-    print("  docker compose run --rm -p 8081:8080 dev python3 examples/pick_and_place_demo.py")
+    print("  docker compose run --rm -p 8081:8081 dev python3 examples/pick_and_place_demo.py")
     sys.exit(1)
 
 # ---------------------------------------------------------------------------
@@ -94,11 +94,11 @@ def main():
     kernel = NativeKernelClient(bundle)
 
     # --- 2. Start Viser HMI ---
-    print("Starting Viser 3D server on http://0.0.0.0:8080 ...", flush=True)
+    print("Starting Viser 3D server on http://0.0.0.0:8081 ...", flush=True)
     hmi = ViserHmiServer(
         kernel=kernel,
         host="0.0.0.0",
-        port=8080,
+        port=8081,
         urdf_path=URDF_PATH,
         joint_names=JOINT_NAMES,
     )

@@ -105,8 +105,8 @@ def _find_static_dir(explicit: str | None) -> Path | None:
     """Find the frontend dist directory."""
     candidates = [
         Path(explicit) if explicit else None,
-        Path("/opt/manyforge-frontend/dist"),  # Docker image
         Path(__file__).parent.parent / "frontend" / "dist",  # Dev (relative to backend/)
+        Path("/opt/manyforge-frontend/dist"),  # Docker image (fallback)
     ]
     for p in candidates:
         if p and p.is_dir() and (p / "index.html").exists():

@@ -3,7 +3,6 @@ import {
   ReactFlow,
   Background,
   Controls,
-  MiniMap,
   addEdge,
 } from '@xyflow/react';
 import type { Connection, NodeTypes, Node } from '@xyflow/react';
@@ -112,15 +111,11 @@ export function TreeCanvas() {
         fitView
         nodesDraggable={isComposeMode}
         nodesConnectable={isComposeMode}
+        proOptions={{ hideAttribution: true }}
         className="bg-gray-900"
       >
         <Background color="#374151" gap={20} />
-        <Controls className="!bg-gray-800 !border-gray-600" />
-        <MiniMap
-          className="!bg-gray-800"
-          nodeColor="#4B5563"
-          maskColor="rgba(0,0,0,0.5)"
-        />
+        <Controls />
       </ReactFlow>
     </div>
   );

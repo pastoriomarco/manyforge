@@ -25,18 +25,20 @@ class ViserHmiServer:
         self,
         cycle_manager: CycleManager,
         host: str = "0.0.0.0",
-        port: int = 8080,
+        port: int = 8081,
         urdf_path: Optional[str] = None,
         joint_names: Optional[list[str]] = None,
+        package_dirs: Optional[list[str]] = None,
     ) -> None:
         """Initialize the ViserHmiServer.
 
         Args:
             cycle_manager: The cycle manager for lifecycle control.
             host: Host address to bind to.
-            port: Port to bind to (use 0 for random port).
+            port: Port to bind to (default 8081; use 0 for random port).
             urdf_path: Optional path to robot URDF file.
             joint_names: Optional list of joint names for the robot.
+            package_dirs: Directories to search for package:// URI resolution.
         """
         # Create the Viser server
         self._viser_server = viser.ViserServer(host=host, port=port)
@@ -57,7 +59,8 @@ class ViserHmiServer:
         self._robot_visualizer: Optional[RobotVisualizer] = None
         if urdf_path:
             self._robot_visualizer = RobotVisualizer(
-                self._viser_server, urdf_path, joint_names
+                self._viser_server, urdf_path, joint_names,
+                package_dirs=package_dirs,
             )
 
         # Add grid floor

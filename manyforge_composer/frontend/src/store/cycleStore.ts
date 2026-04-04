@@ -1,20 +1,22 @@
 import { create } from 'zustand';
 import { api } from '../api/client';
 import { StateWebSocket } from '../api/websocket';
+import { useProgramStore } from './programStore';
 import type { CycleStatus } from '../types/api';
 
 interface CycleStore {
   state: CycleStatus['state'];
   velocityScale: number;
   nodeStatuses: Record<string, string>;
+  programLoaded: boolean;
   error: string | null;
-  
+
   // Actions
   run: () => Promise<void>;
   stop: () => Promise<void>;
   reset: () => Promise<void>;
   setVelocityScale: (value: number) => Promise<void>;
-  
+
   // WebSocket
   _ws: StateWebSocket | null;
   connectWs: () => void;
@@ -25,6 +27,7 @@ export const useCycleStore = create<CycleStore>((set, get) => ({
   state: 'idle',
   velocityScale: 1.0,
   nodeStatuses: {},
+  programLoaded: false,
   error: null,
   _ws: null,
 
@@ -68,11 +71,17 @@ export const useCycleStore = create<CycleStore>((set, get) => ({
     const ws = new StateWebSocket();
     ws.connect();
     ws.subscribe((update) => {
+      const prev = get();
       set({
         state: update.state,
         velocityScale: update.velocityScale,
         nodeStatuses: update.nodeStatuses || {},
+        programLoaded: update.programLoaded ?? false,
       });
+      // Auto-fetch tree when program becomes available
+      if (update.programLoaded && !prev.programLoaded) {
+        useProgramStore.getState().fetchTree();
+      }
     });
     set({ _ws: ws });
   },

@@ -56,11 +56,13 @@ class StateHub:
     async def _broadcast_loop(self):
         """Poll state at ~10Hz and broadcast to all connected clients."""
         while self._running:
+            has_program = self._state and self._state.program is not None
             if self._state and self._state.cycle_manager is not None:
                 data = {
                     "state": self._state.cycle_manager.state.value,
                     "velocityScale": self._state.cycle_manager.velocity_scale,
                     "nodeStatuses": self._state.cycle_manager.get_node_statuses(),
+                    "programLoaded": bool(has_program),
                     "timestamp": time.time(),
                 }
             else:
@@ -68,6 +70,7 @@ class StateHub:
                     "state": "idle",
                     "velocityScale": 1.0,
                     "nodeStatuses": {},
+                    "programLoaded": bool(has_program),
                     "timestamp": time.time(),
                 }
             await self.broadcast(data)

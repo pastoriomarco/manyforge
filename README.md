@@ -75,10 +75,10 @@ Program YAML --> Behavior Runner --> ExecutionKernel (C++) --> Planner/Execution
 Run the end-to-end demo with real RoboPlan motion planning and Viser 3D visualization:
 
 ```bash
-docker compose run --rm -p 8080:8080 dev python3 examples/pick_and_place_demo.py
+docker compose run --rm -p 8081:8081 dev python3 examples/pick_and_place_demo.py
 ```
 
-Then open http://localhost:8080 in your browser to see the UR5 robot, collision objects, and control panel. The behavior tree plans 3 collision-aware motions (RRT + TOPPRA) with scene edits and gripper simulation.
+Then open http://localhost:8081 in your browser to see the UR5 robot, collision objects, and control panel. The behavior tree plans 3 collision-aware motions (RRT + TOPPRA) with scene edits and gripper simulation.
 
 ## Docker Details
 

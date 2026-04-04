@@ -130,5 +130,6 @@ export interface StateUpdate {
   state: 'idle' | 'running' | 'stopped';
   velocityScale: number;
   nodeStatuses?: Record<string, string>;
+  programLoaded?: boolean;
   timestamp: number;
 }

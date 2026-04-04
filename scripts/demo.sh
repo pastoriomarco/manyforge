@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# demo.sh — One-command pick-and-place demo
+#
+# Usage:
+#   ./scripts/demo.sh                     # Full pick-and-place (12-step)
+#   ./scripts/demo.sh --simple            # Minimal 3-step test fixture
+#
+# Then open:
+#   http://localhost:9000        Composer UI (behavior tree editor)
+#   http://localhost:8081        Viser 3D view (robot visualization)
+#
+# API cheat sheet:
+#   curl -X POST localhost:9000/api/cycle/run     # start cycle
+#   curl -X POST localhost:9000/api/cycle/stop    # stop
+#   curl -X POST localhost:9000/api/cycle/reset   # reset
+#   curl localhost:9000/api/program/tree           # get behavior tree
+
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+CATALOG=/workspace/manyforge_behavior/resources/node_catalog.yaml
+DEPLOY=/workspace/manyforge_behavior/tests/fixtures/ur5_roboplan.deployment.yaml
+
+if [[ "${1:-}" == "--simple" ]]; then
+  PROGRAM=/workspace/manyforge_behavior/tests/fixtures/pick_and_place.program.yaml
+else
+  PROGRAM=/workspace/examples/pick_and_place.program.yaml
+fi
+
+LOAD_JSON='{"path":"'"$PROGRAM"'","deploymentPath":"'"$DEPLOY"'"}'
+
+echo "Starting ManyForge Composer..."
+echo "Program: $PROGRAM"
+echo ""
+
+exec docker compose run --rm -p 9000:9000 -p 8081:8081 dev bash -lc '
+  # Remove stale frontend from Docker image — use volume-mounted dev build
+  rm -rf /opt/manyforge-frontend/dist 2>/dev/null
+
+  # Build C++ backends (manyforge_core → manyforge_roboplan_py)
+  echo "Building C++ backends..."
+  ./scripts/test-all.sh cpp 2>&1 | tail -3
+  ./scripts/test-all.sh roboplan 2>&1 | tail -3
+  echo ""
+
+  # Ensure roboplan Python paths are available
+  export PYTHONPATH="/tmp/manyforge-build/roboplan:/workspace/manyforge_roboplan/python:${PYTHONPATH:-}"
+
+  python -m manyforge_composer --catalog-path '"$CATALOG"' --port 9000 --hmi-port 8081 &
+  PID=$!
+
+  for i in $(seq 1 30); do
+    curl -sf http://localhost:9000/api/health > /dev/null 2>&1 && break
+    sleep 0.5
+  done
+
+  curl -sf -X POST http://localhost:9000/api/program/load \
+    -H "Content-Type: application/json" \
+    -d '"'$LOAD_JSON'"' | python3 -m json.tool
+
+  echo ""
+  echo "=== ManyForge Composer ready ==="
+  echo "Composer UI:  http://localhost:9000"
+  echo "Viser 3D:     http://localhost:8081"
+  echo "Health:       http://localhost:9000/api/health"
+  echo ""
+  echo "Press Ctrl+C to stop."
+
+  wait $PID
+'

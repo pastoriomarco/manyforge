@@ -1,2 +1,16 @@
 @import "tailwindcss";
 @import "@xyflow/react/dist/style.css";
+
+/* React Flow controls — dark theme */
+.react-flow__controls {
+  background: #1f2937;
+  border-color: #4b5563;
+}
+.react-flow__controls button {
+  background: #1f2937;
+  border-color: #4b5563;
+  fill: #d1d5db;
+}
+.react-flow__controls button:hover {
+  background: #374151;
+}

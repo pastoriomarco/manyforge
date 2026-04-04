@@ -10,7 +10,7 @@ def create_catalog_router(state: ComposerState) -> APIRouter:
     """Create the catalog router with the given state."""
     router = APIRouter()
     
-    @router.get("/", response_model=CatalogResponse, response_model_by_alias=True)
+    @router.get("", response_model=CatalogResponse, response_model_by_alias=True)
     def get_catalog() -> dict:
         """Get all catalog entries."""
         entries = []

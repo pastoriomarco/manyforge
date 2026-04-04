@@ -46,12 +46,12 @@ def start_hmi(deployment: Deployment, kernel: KernelClient, runner: Orchestrator
         hmi = ViserHmiServer(
             kernel=kernel,
             host="0.0.0.0",
-            port=8080,
+            port=8081,
         )
         if runner.program:
             hmi.load_program(runner.program)
         hmi.start()
-        print("HMI started on http://0.0.0.0:8080")
+        print("HMI started on http://0.0.0.0:8081")
         return hmi
     except ImportError:
         print("WARNING: manyforge_hmi not available, skipping HMI")

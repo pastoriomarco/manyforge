@@ -1,11 +1,27 @@
 """RobotVisualizer - URDF rendering and joint state updates."""
 
+import os
 import time
 
 import viser
+import yourdfpy
 from viser.extras import ViserUrdf
 from pathlib import Path
 from typing import Optional
+
+
+def _make_package_handler(package_dirs: list[str]):
+    """Create a filename_handler that resolves package:// URIs."""
+    def handler(fname: str) -> str:
+        if not fname.startswith("package://"):
+            return fname
+        remainder = fname[len("package://"):]  # e.g. "roboplan_example_models/models/..."
+        for d in package_dirs:
+            resolved = os.path.join(d, remainder)
+            if os.path.exists(resolved):
+                return resolved
+        return fname  # fall through unchanged
+    return handler
 
 
 class RobotVisualizer:
@@ -20,6 +36,7 @@ class RobotVisualizer:
         server: viser.ViserServer,
         urdf_path: str,
         joint_names: Optional[list[str]] = None,
+        package_dirs: Optional[list[str]] = None,
     ) -> None:
         """Initialize the RobotVisualizer.
 
@@ -27,15 +44,24 @@ class RobotVisualizer:
             server: The Viser server instance.
             urdf_path: Path to the URDF file.
             joint_names: List of joint names for updates (optional).
+            package_dirs: Directories to search for package:// URI resolution.
         """
         self._server = server
         self._urdf_path = Path(urdf_path)
         self._joint_names = joint_names or []
 
-        # Load URDF using ViserUrdf
+        # Load URDF — resolve package:// URIs if package_dirs provided
+        if package_dirs:
+            urdf_model = yourdfpy.URDF.load(
+                str(self._urdf_path),
+                filename_handler=_make_package_handler(package_dirs),
+            )
+        else:
+            urdf_model = self._urdf_path
+
         self._viser_urdf = ViserUrdf(
             server,
-            self._urdf_path,
+            urdf_model,
             root_node_name="/robot",
             mesh_color_override=None,  # Use mesh colors from URDF
         )

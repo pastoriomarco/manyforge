@@ -92,6 +92,12 @@ RUN PINOCCHIO_CMAKE_DIR=$(find /usr -name "pinocchioConfig.cmake" -printf '%h\n'
 
 WORKDIR /workspace
 
+# Node.js 22 for frontend rebuilds in the dev container
+COPY --from=frontend-builder /usr/local/bin/node /usr/local/bin/node
+COPY --from=frontend-builder /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/npm
+RUN ln -sf /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
+    && ln -sf /usr/local/lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx
+
 # Copy built frontend from Stage 1
 COPY --from=frontend-builder /build/dist/ /opt/manyforge-frontend/dist/
 

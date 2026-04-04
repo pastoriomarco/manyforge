@@ -132,12 +132,20 @@ class KernelClient(ABC):
 
 
 class MockKernelClient(KernelClient):
-    """Mock kernel for testing. Simulates state transitions and records calls."""
+    """Mock kernel for testing. Simulates state transitions and records calls.
 
-    def __init__(self) -> None:
+    Args:
+        execute_duration_s: Simulated execution time per move. When > 0, execute()
+            transitions to EXECUTING and get_status() returns COMPLETED only after
+            the duration elapses. Set to 0 (default) for instant completion in tests.
+    """
+
+    def __init__(self, execute_duration_s: float = 0.0) -> None:
         self._state = ExecutionState.IDLE
         self._execution_id = 0
         self._next_id = 1
+        self._execute_duration_s = execute_duration_s
+        self._execute_start: Optional[float] = None
         self.execute_count = 0
         self.stop_count = 0
         self.pause_count = 0
@@ -151,6 +159,7 @@ class MockKernelClient(KernelClient):
         self.fail_next_scene_edit = False
 
     def execute(self, request: ExecuteRequest) -> ExecuteResult:
+        import time
         self.execute_count += 1
         # Auto-reset from terminal states, matching C++ ExecutionKernel behavior
         terminal_states = {ExecutionState.COMPLETED, ExecutionState.FAILED, ExecutionState.STOPPED}
@@ -165,7 +174,11 @@ class MockKernelClient(KernelClient):
         eid = self._next_id
         self._next_id += 1
         self._execution_id = eid
-        self._state = ExecutionState.COMPLETED
+        if self._execute_duration_s > 0:
+            self._state = ExecutionState.EXECUTING
+            self._execute_start = time.monotonic()
+        else:
+            self._state = ExecutionState.COMPLETED
         return ExecuteResult(ok=True, execution_id=eid)
 
     def stop(self) -> CommandResult:
@@ -210,6 +223,21 @@ class MockKernelClient(KernelClient):
         return CommandResult(accepted=True)
 
     def get_status(self) -> ExecutionStatus:
+        import time
+        # Transition EXECUTING → COMPLETED when duration elapses
+        if (self._state == ExecutionState.EXECUTING
+                and self._execute_start is not None
+                and self._execute_duration_s > 0):
+            elapsed = time.monotonic() - self._execute_start
+            if elapsed >= self._execute_duration_s:
+                self._state = ExecutionState.COMPLETED
+                self._execute_start = None
+                return ExecutionStatus(state=self._state, execution_id=self._execution_id, progress=1.0)
+            return ExecutionStatus(
+                state=self._state,
+                execution_id=self._execution_id,
+                progress=min(elapsed / self._execute_duration_s, 1.0),
+            )
         progress = 1.0 if self._state == ExecutionState.COMPLETED else 0.0
         return ExecutionStatus(
             state=self._state,

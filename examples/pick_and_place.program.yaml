@@ -9,7 +9,7 @@ description: >-
 catalog_version: "0.1.0"
 
 robot:
-  robot_id: robot1
+  robot_id: ur5
   group_id: arm
   base_frame: base_link
   tcp_frame: tool0

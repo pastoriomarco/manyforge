@@ -5,10 +5,11 @@ from __future__ import annotations
 import threading
 import time
 from enum import Enum
+from typing import Callable, Optional
 
 import py_trees
 
-from manyforge_behavior.kernel_client import ExecutionState, KernelClient
+from manyforge_behavior.kernel_client import ExecutionState, KernelClient, SceneEditRequest
 from manyforge_behavior.runner import OrchestratorRunner
 
 
@@ -51,7 +52,8 @@ class CycleManager:
         self._tick_pause_event = threading.Event()  # cleared = paused, set = running
         self._velocity_scale = 1.0
         self._lock = threading.Lock()
-        
+        self._on_run_from_idle: Optional[Callable[[], None]] = None
+
         # Set initial pause event to set (not paused)
         self._tick_pause_event.set()
     
@@ -99,7 +101,11 @@ class CycleManager:
                 self._tree = self._runner.build_tree()
                 self._runner.apply_scene()
                 self._write_bb_keys()
-                
+
+                # Notify listener (e.g. Viser scene refresh)
+                if self._on_run_from_idle:
+                    self._on_run_from_idle()
+
                 # Start tick thread
                 self._tick_stop_event.clear()
                 self._tick_pause_event.set()
@@ -184,19 +190,25 @@ class CycleManager:
             
             # Reset kernel
             self._kernel.reset()
-            
-            # Rebuild tree and apply scene
-            self._runner.load()
-            self._tree = self._runner.build_tree()
-            self._runner.apply_scene()
-            
-            # Write initial BB keys
-            self._write_bb_keys()
-            
+
+            # Clear scene objects from the previous run (C++ kernel reset
+            # doesn't clear the planning scene, so apply_scene() would fail
+            # with "already exists" on re-add).
+            # Also remove "_attached" variants left by AttachObjectToLink.
+            if self._runner.program:
+                for res in self._runner.program.scene:
+                    for suffix in ("", "_attached"):
+                        self._kernel.scene_edit(SceneEditRequest(
+                            operation="remove",
+                            object_id=res.object_id + suffix))
+
+            # Clear tree — run() from IDLE will rebuild fresh
+            self._tree = None
+
             # Reset events
             self._tick_stop_event.clear()
             self._tick_pause_event.set()
-            
+
             self._state = CycleState.IDLE
     
     def set_velocity_scale(self, scale: float) -> None:
