@@ -74,7 +74,7 @@ def make_relative_request(
         tcp_frame="tool0",
         motion_type="relative_move",
         relative_move={
-            "reference": {"type": "object", "id": object_id},
+            "target_reference": {"type": "object", "id": object_id},
             "offset": {
                 "position_m": list(offset_position_m),
                 "orientation_rpy_deg": list(offset_orientation_rpy_deg),
@@ -86,6 +86,53 @@ def make_relative_request(
         execution_timeout_s=30.0,
         cache_mode=cache_mode,
     )
+
+
+def make_relative_reference_request(
+    move_id,
+    reference,
+    offset_position_m,
+    offset_orientation_rpy_deg,
+    offset_reference=None,
+    cache_mode="disable",
+):
+    relative_move = {
+        "target_reference": reference,
+        "offset": {
+            "position_m": list(offset_position_m),
+            "orientation_rpy_deg": list(offset_orientation_rpy_deg),
+        },
+    }
+    if offset_reference is not None:
+        relative_move["offset_reference"] = offset_reference
+
+    return ExecuteRequest(
+        robot_id="robot1",
+        group_id="arm",
+        move_id=move_id,
+        base_frame="base_link",
+        tcp_frame="tool0",
+        motion_type="relative_move",
+        relative_move=relative_move,
+        velocity_scale=1.0,
+        acceleration_scale=1.0,
+        planning_timeout_s=10.0,
+        execution_timeout_s=30.0,
+        cache_mode=cache_mode,
+    )
+
+
+def rotate_vector_by_quaternion(vector, quaternion_xyzw):
+    x, y, z, w = quaternion_xyzw
+    vx, vy, vz = vector
+    tx = 2.0 * (y * vz - z * vy)
+    ty = 2.0 * (z * vx - x * vz)
+    tz = 2.0 * (x * vy - y * vx)
+    return [
+        vx + w * tx + (y * tz - z * ty),
+        vy + w * ty + (z * tx - x * tz),
+        vz + w * tz + (x * ty - y * tx),
+    ]
 
 
 def wait_for_terminal(native_kernel, timeout_s=15.0):
@@ -459,6 +506,106 @@ class TestNativeSceneEdits:
         assert pose_a["position_m"][1] == pytest.approx(-0.3, abs=0.03)
         assert pose_b["position_m"][0] == pytest.approx(0.38, abs=0.03)
         assert pose_b["position_m"][1] == pytest.approx(-0.18, abs=0.03)
+
+    def test_relative_move_resolves_robot_link_reference_at_execute_time(self, native_kernel):
+        reset_to_demo_rest(native_kernel)
+        start_pose = native_kernel.get_link_pose("tool0", "base_link")
+        assert start_pose is not None
+        expected_delta = rotate_vector_by_quaternion(
+            [0.0, 0.0, 0.05], start_pose["orientation_xyzw"]
+        )
+
+        result = native_kernel.execute(
+            make_relative_reference_request(
+                "native_relative_tcp",
+                {"type": "robot_link", "id": "tool0"},
+                [0.0, 0.0, 0.05],
+                [0.0, 0.0, 0.0],
+            )
+        )
+        assert result.ok is True
+        assert wait_for_terminal(native_kernel).state == ExecutionState.COMPLETED
+
+        final_pose = native_kernel.get_link_pose("tool0", "base_link")
+        assert final_pose is not None
+        for axis in range(3):
+            assert final_pose["position_m"][axis] == pytest.approx(
+                start_pose["position_m"][axis] + expected_delta[axis], abs=0.03
+            )
+
+    def test_relative_move_resolves_frame_reference_at_execute_time(self, native_kernel):
+        reset_to_demo_rest(native_kernel)
+
+        result = native_kernel.execute(
+            make_relative_reference_request(
+                "native_relative_frame",
+                {"type": "frame", "id": "base_link"},
+                [0.3, -0.3, 0.25],
+                [180.0, 0.0, -90.0],
+            )
+        )
+        assert result.ok is True
+        assert wait_for_terminal(native_kernel).state == ExecutionState.COMPLETED
+
+        pose = native_kernel.get_link_pose("tool0", "base_link")
+        assert pose is not None
+        assert pose["position_m"][0] == pytest.approx(0.3, abs=0.03)
+        assert pose["position_m"][1] == pytest.approx(-0.3, abs=0.03)
+        assert pose["position_m"][2] == pytest.approx(0.25, abs=0.03)
+
+    def test_relative_move_resolves_pose_reference_at_execute_time(self, native_kernel):
+        reset_to_demo_rest(native_kernel)
+
+        result = native_kernel.execute(
+            make_relative_reference_request(
+                "native_relative_pose",
+                {
+                    "type": "pose",
+                    "pose": {
+                        "position_m": [0.3, -0.3, 0.15],
+                        "orientation_rpy_deg": [0.0, 0.0, -45.0],
+                    },
+                },
+                [0.0, 0.0, 0.10],
+                [180.0, 0.0, -90.0],
+            )
+        )
+        assert result.ok is True
+        assert wait_for_terminal(native_kernel).state == ExecutionState.COMPLETED
+
+        pose = native_kernel.get_link_pose("tool0", "universe")
+        assert pose is not None
+        assert pose["position_m"][0] == pytest.approx(0.3, abs=0.03)
+        assert pose["position_m"][1] == pytest.approx(-0.3, abs=0.03)
+        assert pose["position_m"][2] == pytest.approx(0.25, abs=0.03)
+
+    def test_relative_move_uses_independent_offset_reference_at_execute_time(self, native_kernel):
+        reset_to_demo_rest(native_kernel)
+        native_kernel.scene_edit(SceneEditRequest(
+            operation="add", object_id="dynamic_box", shape_type="box",
+            box_dimensions_m=[0.05, 0.05, 0.05],
+            pose_position_m=[0.30, -0.30, 0.15],
+            pose_orientation_xyzw=[0.0, 0.0, -0.38268343, 0.92387953],
+            frame_id="universe",
+        ))
+
+        result = native_kernel.execute(
+            make_relative_reference_request(
+                "native_relative_offset_basis",
+                {"type": "object", "id": "dynamic_box"},
+                [0.10, 0.0, 0.10],
+                [180.0, 0.0, -90.0],
+                offset_reference={"type": "frame", "id": "base_link"},
+            )
+        )
+        assert result.ok is True
+        assert wait_for_terminal(native_kernel).state == ExecutionState.COMPLETED
+
+        pose = native_kernel.get_link_pose("tool0", "base_link")
+        assert pose is not None
+        assert pose["position_m"][0] == pytest.approx(0.40, abs=0.03)
+        assert pose["position_m"][1] == pytest.approx(-0.30, abs=0.03)
+        assert pose["position_m"][2] == pytest.approx(0.25, abs=0.03)
 
 
 # ============================================================================

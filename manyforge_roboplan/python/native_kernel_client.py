@@ -81,6 +81,18 @@ class NativeKernelClient(KernelClient):
         relative_move = request.relative_move
         if relative_move is not None:
             relative_move = dict(relative_move)
+            target_reference = relative_move.get("target_reference")
+            if target_reference is not None:
+                target_reference = dict(target_reference)
+                if target_reference.get("type") == "pose":
+                    target_reference["pose"] = _normalize_pose_dict(target_reference.get("pose"))
+                relative_move["target_reference"] = target_reference
+            offset_reference = relative_move.get("offset_reference")
+            if offset_reference is not None:
+                offset_reference = dict(offset_reference)
+                if offset_reference.get("type") == "pose":
+                    offset_reference["pose"] = _normalize_pose_dict(offset_reference.get("pose"))
+                relative_move["offset_reference"] = offset_reference
             relative_move["offset"] = _normalize_pose_dict(relative_move.get("offset"))
 
         req_dict = {

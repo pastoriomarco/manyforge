@@ -208,6 +208,7 @@ PYBIND11_MODULE(manyforge_core_py, m) {
         .value("kFrame", manyforge::core::ReferenceDTO::Type::kFrame)
         .value("kObject", manyforge::core::ReferenceDTO::Type::kObject)
         .value("kRobotLink", manyforge::core::ReferenceDTO::Type::kRobotLink)
+        .value("kPose", manyforge::core::ReferenceDTO::Type::kPose)
         .export_values();
 
     py::class_<manyforge::core::ReferenceDTO>(m, "ReferenceDTO")
@@ -216,19 +217,32 @@ PYBIND11_MODULE(manyforge_core_py, m) {
              py::arg("type"), py::arg("id"))
         .def_readwrite("type", &manyforge::core::ReferenceDTO::type)
         .def_readwrite("id", &manyforge::core::ReferenceDTO::id)
+        .def_readwrite("pose", &manyforge::core::ReferenceDTO::pose)
         .def("__repr__", [](const manyforge::core::ReferenceDTO& r) {
-            return py::str("ReferenceDTO(type={}, id='{}')").format(py::cast(r.type), r.id);
+            return py::str("ReferenceDTO(type={}, id='{}', pose={})")
+                .format(py::cast(r.type), r.id, py::cast(r.pose));
         });
 
     py::class_<manyforge::core::RelativeMoveDTO>(m, "RelativeMoveDTO")
         .def(py::init<>())
-        .def(py::init<manyforge::core::ReferenceDTO, manyforge::core::Pose3DTO>(),
-             py::arg("reference"), py::arg("offset"))
-        .def_readwrite("reference", &manyforge::core::RelativeMoveDTO::reference)
+        .def(py::init([](manyforge::core::ReferenceDTO target_reference,
+                         manyforge::core::Pose3DTO offset,
+                         std::optional<manyforge::core::ReferenceDTO> offset_reference) {
+            manyforge::core::RelativeMoveDTO move;
+            move.target_reference = std::move(target_reference);
+            move.offset = std::move(offset);
+            move.offset_reference = std::move(offset_reference);
+            return move;
+        }),
+             py::arg("target_reference"),
+             py::arg("offset"),
+             py::arg("offset_reference") = std::nullopt)
+        .def_readwrite("target_reference", &manyforge::core::RelativeMoveDTO::target_reference)
+        .def_readwrite("offset_reference", &manyforge::core::RelativeMoveDTO::offset_reference)
         .def_readwrite("offset", &manyforge::core::RelativeMoveDTO::offset)
         .def("__repr__", [](const manyforge::core::RelativeMoveDTO& r) {
-            return py::str("RelativeMoveDTO(reference={}, offset={})")
-                .format(py::cast(r.reference), py::cast(r.offset));
+            return py::str("RelativeMoveDTO(target_reference={}, offset_reference={}, offset={})")
+                .format(py::cast(r.target_reference), py::cast(r.offset_reference), py::cast(r.offset));
         });
 
     py::class_<manyforge::core::CartesianPathDTO>(m, "CartesianPathDTO")

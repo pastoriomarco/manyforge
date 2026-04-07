@@ -201,18 +201,45 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
         } else if (motion_type == "relative_move") {
           RelativeMoveDTO goal;
           auto rel_dict = request["relative_move"];
-          auto ref_dict = rel_dict["reference"];
-          const std::string ref_type = ref_dict["type"].cast<std::string>();
-          if (ref_type == "frame") {
-            goal.reference.type = ReferenceDTO::Type::kFrame;
-          } else if (ref_type == "object") {
-            goal.reference.type = ReferenceDTO::Type::kObject;
-          } else if (ref_type == "robot_link") {
-            goal.reference.type = ReferenceDTO::Type::kRobotLink;
-          } else {
-            throw std::runtime_error("Unsupported reference type: " + ref_type);
+          auto parse_reference_dict = [](const py::dict& ref_dict,
+                                         const std::string& field_name) {
+            ReferenceDTO reference;
+            const std::string ref_type = ref_dict["type"].cast<std::string>();
+            if (ref_type == "frame") {
+              reference.type = ReferenceDTO::Type::kFrame;
+            } else if (ref_type == "object") {
+              reference.type = ReferenceDTO::Type::kObject;
+            } else if (ref_type == "robot_link") {
+              reference.type = ReferenceDTO::Type::kRobotLink;
+            } else if (ref_type == "pose") {
+              reference.type = ReferenceDTO::Type::kPose;
+            } else {
+              throw std::runtime_error("Unsupported reference type: " + ref_type);
+            }
+            if (ref_dict.contains("id")) {
+              reference.id = ref_dict["id"].cast<std::string>();
+            }
+            if (reference.type == ReferenceDTO::Type::kPose) {
+              if (!ref_dict.contains("pose")) {
+                throw std::runtime_error(
+                    "Pose reference requires " + field_name + ".pose");
+              }
+              auto pose_dict = ref_dict["pose"];
+              auto pos = pose_dict["position_m"].cast<std::vector<double>>();
+              auto orient = pose_dict["orientation_xyzw"].cast<std::vector<double>>();
+              reference.pose = Pose3DTO{};
+              reference.pose->position_m = {pos[0], pos[1], pos[2]};
+              reference.pose->orientation = {orient[0], orient[1], orient[2], orient[3]};
+            }
+            return reference;
+          };
+
+          goal.target_reference = parse_reference_dict(
+              rel_dict["target_reference"].cast<py::dict>(), "target_reference");
+          if (rel_dict.contains("offset_reference")) {
+            goal.offset_reference = parse_reference_dict(
+                rel_dict["offset_reference"].cast<py::dict>(), "offset_reference");
           }
-          goal.reference.id = ref_dict["id"].cast<std::string>();
 
           auto offset_dict = rel_dict["offset"];
           auto pos = offset_dict["position_m"].cast<std::vector<double>>();

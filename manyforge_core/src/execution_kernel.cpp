@@ -88,6 +88,15 @@ Pose3DTO multiply_poses(const Pose3DTO& a, const Pose3DTO& b) {
   return matrix_to_pose(out);
 }
 
+Pose3DTO pose_with_position_and_orientation(
+    const Vector3DTO& position,
+    const QuaternionDTO& orientation) {
+  Pose3DTO pose;
+  pose.position_m = position;
+  pose.orientation = orientation;
+  return pose;
+}
+
 ErrorCode error_code_from_dto(const ErrorDTO& error) {
   if (error.code == kErrorStartStateMismatch) {
     return ErrorCode::kStartStateMismatch;
@@ -1191,14 +1200,28 @@ Result<TrajectoryDTO> ExecutionKernel::plan_trajectory(
 Result<MotionSpecDTO> ExecutionKernel::resolve_motion_spec(
     const ExecuteRequestDTO& request) {
   if (auto* relative_move = std::get_if<RelativeMoveDTO>(&request.motion)) {
-    auto reference_pose =
-        context_.resolve_reference_pose(relative_move->reference, request.base_frame);
-    if (!reference_pose.ok()) {
-      return Result<MotionSpecDTO>::Err(reference_pose.error());
+    auto target_pose =
+        context_.resolve_reference_pose(relative_move->target_reference, request.base_frame);
+    if (!target_pose.ok()) {
+      return Result<MotionSpecDTO>::Err(target_pose.error());
+    }
+
+    Pose3DTO offset_basis_pose = target_pose.value();
+    if (relative_move->offset_reference.has_value()) {
+      auto offset_reference_pose = context_.resolve_reference_pose(
+          *relative_move->offset_reference, request.base_frame);
+      if (!offset_reference_pose.ok()) {
+        return Result<MotionSpecDTO>::Err(offset_reference_pose.error());
+      }
+      offset_basis_pose = offset_reference_pose.value();
     }
 
     PoseGoalDTO pose_goal;
-    pose_goal.goal = multiply_poses(reference_pose.value(), relative_move->offset);
+    pose_goal.goal = multiply_poses(
+        pose_with_position_and_orientation(
+            target_pose.value().position_m,
+            offset_basis_pose.orientation),
+        relative_move->offset);
     return Result<MotionSpecDTO>::Ok(MotionSpecDTO{pose_goal});
   }
 

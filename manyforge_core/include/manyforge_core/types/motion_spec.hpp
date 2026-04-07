@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <optional>
 #include <variant>
 #include <vector>
 
@@ -24,21 +25,24 @@ struct NamedTargetDTO {
   std::string name;
 };
 
-/// Reference to a frame, object, or robot link (spec §4.4)
+/// Reference to a frame, object, robot link, or inline pose (spec §4.4)
 struct ReferenceDTO {
   enum class Type {
     kFrame,
     kObject,
     kRobotLink,
+    kPose,
   };
   Type type;
   std::string id;
+  std::optional<Pose3DTO> pose;
 };
 
 /// Relative move goal (spec §4.4)
 struct RelativeMoveDTO {
-  ReferenceDTO reference;
-  Pose3DTO offset;  // T_ref_to_goal, expressed in the reference frame
+  ReferenceDTO target_reference;
+  std::optional<ReferenceDTO> offset_reference;
+  Pose3DTO offset;  // delta pose expressed in the offset reference frame
 };
 
 /// Cartesian path goal (spec §4.5)

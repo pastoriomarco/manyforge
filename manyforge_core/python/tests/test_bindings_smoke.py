@@ -352,6 +352,21 @@ def test_reference_dto():
     r = manyforge_core_py.ReferenceDTO(manyforge_core_py.ReferenceType.kFrame, "base_link")
     assert r.type == manyforge_core_py.ReferenceType.kFrame
     assert r.id == "base_link"
+    assert r.pose is None
+
+
+def test_reference_dto_pose():
+    """ReferenceDTO can carry an inline pose reference."""
+    import manyforge_core_py
+
+    r = manyforge_core_py.ReferenceDTO()
+    r.type = manyforge_core_py.ReferenceType.kPose
+    r.pose = manyforge_core_py.Pose3DTO(
+        manyforge_core_py.Vector3DTO(0.3, -0.2, 0.1),
+        manyforge_core_py.QuaternionDTO(0.0, 0.0, 0.0, 1.0),
+    )
+    assert r.type == manyforge_core_py.ReferenceType.kPose
+    assert r.pose.position_m.x_m == 0.3
 
 
 def test_relative_move_dto():
@@ -365,7 +380,8 @@ def test_relative_move_dto():
     )
     
     r = manyforge_core_py.RelativeMoveDTO(ref, offset)
-    assert r.reference.id == "base_link"
+    assert r.target_reference.id == "base_link"
+    assert r.offset_reference is None
 
 
 def test_cartesian_path_dto():
@@ -432,4 +448,3 @@ def test_collision_check_request_dto():
     state = manyforge_core_py.RobotStateDTO(["j1"], [0.0], [])
     c = manyforge_core_py.CollisionCheckRequestDTO(state)
     assert c.robot_state.joint_names == ["j1"]
-

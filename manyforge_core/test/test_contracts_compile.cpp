@@ -210,10 +210,20 @@ TEST(ContractsCompile, MotionSpecVariant) {
 
   // Relative move
   RelativeMoveDTO relative_move;
-  relative_move.reference.type = ReferenceDTO::Type::kFrame;
-  relative_move.reference.id = "world";
+  relative_move.target_reference.type = ReferenceDTO::Type::kFrame;
+  relative_move.target_reference.id = "world";
   MotionSpecDTO m4 = relative_move;
   EXPECT_TRUE(std::holds_alternative<RelativeMoveDTO>(m4));
+
+  ReferenceDTO pose_ref;
+  pose_ref.type = ReferenceDTO::Type::kPose;
+  pose_ref.pose = Pose3DTO{};
+  pose_ref.pose->position_m = {0.1, 0.2, 0.3};
+  pose_ref.pose->orientation = {0.0, 0.0, 0.0, 1.0};
+  relative_move.target_reference = pose_ref;
+  relative_move.offset_reference = pose_ref;
+  MotionSpecDTO m4_pose = relative_move;
+  EXPECT_TRUE(std::holds_alternative<RelativeMoveDTO>(m4_pose));
 
   // Cartesian path
   CartesianPathDTO cartesian_path;

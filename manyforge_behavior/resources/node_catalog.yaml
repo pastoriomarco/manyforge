@@ -265,9 +265,13 @@ entries:
         required: false
         description: >-
           Relative move goal for motion_type=relative_move. Structure:
-          {reference: {type: frame|object|robot_link, id: ...},
+          {target_reference: {type: frame|object|robot_link|pose, id?: ..., pose?: ...},
+          offset_reference?: {type: frame|object|robot_link|pose, id?: ..., pose?: ...},
           offset: {position_m: [...], orientation_xyzw|orientation_rpy_deg: [...]}}.
-          The reference is resolved against current backend state at execute time.
+          target_reference selects the target origin pose. offset_reference selects the axes in
+          which the xyz/rpy offset is expressed; if omitted, it defaults to target_reference.
+          Use `robot_link` for current TCP/link-relative moves, `frame` for arbitrary scene
+          frames, and `pose` for an inline reference pose expressed in base_frame.
       - name: velocity_scale
         type: float
         required: false

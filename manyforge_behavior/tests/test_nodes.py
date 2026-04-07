@@ -165,7 +165,7 @@ class TestMoveManipulatorAction:
             move_id="m_rel",
             motion_type="relative_move",
             relative_move={
-                "reference": {"type": "object", "id": "graspable"},
+                "target_reference": {"type": "object", "id": "graspable"},
                 "offset": {
                     "position_m": [0.0, 0.0, 0.1],
                     "orientation_rpy_deg": [180.0, 0.0, -90.0],
@@ -178,13 +178,79 @@ class TestMoveManipulatorAction:
         assert kernel.last_execute_request is not None
         assert kernel.last_execute_request.motion_type == "relative_move"
         assert kernel.last_execute_request.relative_move is not None
-        assert kernel.last_execute_request.relative_move["reference"] == {
+        assert kernel.last_execute_request.relative_move["target_reference"] == {
             "type": "object",
             "id": "graspable",
         }
+        assert "offset_reference" not in kernel.last_execute_request.relative_move
         assert "orientation_rpy_deg" not in kernel.last_execute_request.relative_move["offset"]
         assert kernel.last_execute_request.relative_move["offset"]["orientation_xyzw"] == pytest.approx(
             [0.70710678, -0.70710678, -4.32978028e-17, 4.32978028e-17],
+            abs=1e-6,
+        )
+
+    def test_relative_move_pose_reference_normalizes_inline_pose_orientation(self, kernel, bb_with_kernel):
+        node = MoveManipulatorAction(
+            name="test_relative_move_pose_ref",
+            move_id="m_rel_pose",
+            motion_type="relative_move",
+            relative_move={
+                "target_reference": {
+                    "type": "pose",
+                    "pose": {
+                        "position_m": [0.3, -0.2, 0.15],
+                        "orientation_rpy_deg": [180.0, 0.0, -90.0],
+                    },
+                },
+                "offset": {
+                    "position_m": [0.0, 0.0, 0.1],
+                    "orientation_rpy_deg": [0.0, 0.0, 0.0],
+                },
+            },
+        )
+
+        status = _tick_node(node)
+        assert status == py_trees.common.Status.SUCCESS
+        assert kernel.last_execute_request is not None
+        assert kernel.last_execute_request.relative_move is not None
+        ref = kernel.last_execute_request.relative_move["target_reference"]
+        assert ref["type"] == "pose"
+        assert "orientation_rpy_deg" not in ref["pose"]
+        assert ref["pose"]["orientation_xyzw"] == pytest.approx(
+            [0.70710678, -0.70710678, -4.32978028e-17, 4.32978028e-17],
+            abs=1e-6,
+        )
+
+    def test_relative_move_offset_reference_normalizes_inline_pose_orientation(self, kernel, bb_with_kernel):
+        node = MoveManipulatorAction(
+            name="test_relative_move_offset_ref",
+            move_id="m_rel_offset_ref",
+            motion_type="relative_move",
+            relative_move={
+                "target_reference": {"type": "object", "id": "graspable"},
+                "offset_reference": {
+                    "type": "pose",
+                    "pose": {
+                        "position_m": [0.0, 0.0, 0.0],
+                        "orientation_rpy_deg": [0.0, 0.0, 90.0],
+                    },
+                },
+                "offset": {
+                    "position_m": [0.1, 0.0, 0.0],
+                    "orientation_rpy_deg": [0.0, 0.0, 0.0],
+                },
+            },
+        )
+
+        status = _tick_node(node)
+        assert status == py_trees.common.Status.SUCCESS
+        assert kernel.last_execute_request is not None
+        assert kernel.last_execute_request.relative_move is not None
+        ref = kernel.last_execute_request.relative_move["offset_reference"]
+        assert ref["type"] == "pose"
+        assert "orientation_rpy_deg" not in ref["pose"]
+        assert ref["pose"]["orientation_xyzw"] == pytest.approx(
+            [0.0, 0.0, 0.70710678, 0.70710678],
             abs=1e-6,
         )
 

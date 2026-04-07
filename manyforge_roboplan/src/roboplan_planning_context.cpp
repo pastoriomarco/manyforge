@@ -182,7 +182,7 @@ core::Result<core::Pose3DTO> RoboPlanPlanningContext::resolve_reference_pose(
   try {
     std::lock_guard<std::mutex> scene_lock(*scene_mutex_);
     std::map<std::string, std::string> details;
-    details["reference_id"] = reference.id;
+    details["reference_id"] = reference.id.empty() ? "inline_pose" : reference.id;
 
     switch (reference.type) {
       case core::ReferenceDTO::Type::kObject: {
@@ -222,6 +222,16 @@ core::Result<core::Pose3DTO> RoboPlanPlanningContext::resolve_reference_pose(
               core::ErrorDTO{core::kErrorMissingReference,
                              "Reference frame not found", details});
         }
+      }
+
+      case core::ReferenceDTO::Type::kPose: {
+        details["reference_type"] = "pose";
+        if (!reference.pose.has_value()) {
+          return core::Result<core::Pose3DTO>::Err(
+              core::ErrorDTO{core::kErrorMissingReference,
+                             "Pose reference is missing inline pose data", details});
+        }
+        return core::Result<core::Pose3DTO>::Ok(reference.pose.value());
       }
     }
   } catch (const std::exception& e) {

@@ -64,7 +64,7 @@ tree:
         move_id: pick_approach
         motion_type: relative_move
         relative_move:
-          reference:
+          target_reference:
             type: object
             id: graspable
           offset:
@@ -81,7 +81,7 @@ tree:
         move_id: pick_down
         motion_type: relative_move
         relative_move:
-          reference:
+          target_reference:
             type: object
             id: graspable
           offset:
@@ -104,15 +104,22 @@ tree:
         object_id: graspable
         link_frame: tool0
 
-    # 4. Retreat to pick approach pose
+    # 4. Retreat 5 cm upward from the current pick pose
     - id: move_manipulator_action
       name: pick_retreat
       params:
         move_id: pick_retreat
-        motion_type: pose_goal
-        pose_goal:
-          position_m: [0.3, -0.3, 0.25]
-          orientation_rpy_deg: [180, 0, -135]
+        motion_type: relative_move
+        relative_move:
+          target_reference:
+            type: robot_link
+            id: tool0
+          offset_reference:
+            type: frame
+            id: base_link
+          offset:
+            position_m: [0.0, 0.0, 0.05]
+            orientation_rpy_deg: [180, 0, -90]
         velocity_scale: "${param:velocity_scale}"
         planning_timeout_s: 10.0
         execution_timeout_s: 30.0
@@ -123,20 +130,29 @@ tree:
 
     # --- DROP PHASE ---
 
-    # 6. Move to drop approach (0.1m above drop location)
+    # 6. Move to drop approach (5 cm above fixed drop pose)
     - id: move_manipulator_action
       name: move_to_drop_approach
       params:
         move_id: drop_approach
-        motion_type: pose_goal
-        pose_goal:
-          position_m: [0.3, 0.3, 0.25]
-          orientation_rpy_deg: [180, 0, -90]
+        motion_type: relative_move
+        relative_move:
+          target_reference:
+            type: pose
+            pose:
+              position_m: [0.3, 0.3, 0.2]
+              orientation_rpy_deg: [180, 0, -90]
+          offset_reference:
+            type: frame
+            id: base_link
+          offset:
+            position_m: [0.0, 0.0, 0.05]
+            orientation_rpy_deg: [180, 0, -90]
         velocity_scale: "${param:velocity_scale}"
         planning_timeout_s: 10.0
         execution_timeout_s: 30.0
 
-    # 7. Move down to drop pose
+    # 7. Move down to fixed drop pose
     - id: move_manipulator_action
       name: move_to_drop
       params:
@@ -162,15 +178,24 @@ tree:
         object_id: graspable
         link_frame: tool0
 
-    # 9. Retreat to drop approach pose (object now in world at drop location)
+    # 9. Retreat 5 cm upward from the fixed drop pose
     - id: move_manipulator_action
       name: drop_retreat
       params:
         move_id: drop_retreat
-        motion_type: pose_goal
-        pose_goal:
-          position_m: [0.3, 0.3, 0.25]
-          orientation_rpy_deg: [180, 0, -90]
+        motion_type: relative_move
+        relative_move:
+          target_reference:
+            type: pose
+            pose:
+              position_m: [0.3, 0.3, 0.2]
+              orientation_rpy_deg: [180, 0, -90]
+          offset_reference:
+            type: frame
+            id: base_link
+          offset:
+            position_m: [0.0, 0.0, 0.05]
+            orientation_rpy_deg: [180, 0, -90]
         velocity_scale: "${param:velocity_scale}"
         planning_timeout_s: 10.0
         execution_timeout_s: 30.0

@@ -95,6 +95,7 @@ class MockContext : public IPlanningContext {
   Pose3DTO next_object_pose;
   ObjectStateDTO next_object_state;
   Result<Pose3DTO> next_reference_pose = Result<Pose3DTO>::Ok(Pose3DTO{});
+  std::vector<Result<Pose3DTO>> reference_pose_sequence;
   JointLimitsDTO next_limits;
   SceneEditResultDTO next_scene_edit;
 
@@ -140,6 +141,11 @@ class MockContext : public IPlanningContext {
 
   Result<Pose3DTO> resolve_reference_pose(const ReferenceDTO& /*reference*/,
                                           const std::string& /*base_frame*/) override {
+    if (!reference_pose_sequence.empty()) {
+      auto result = reference_pose_sequence.front();
+      reference_pose_sequence.erase(reference_pose_sequence.begin());
+      return result;
+    }
     return next_reference_pose;
   }
 
@@ -545,8 +551,8 @@ TEST_F(ExecutionKernelTest, Execute_HappyPath_CallsPlanner) {
 TEST_F(ExecutionKernelTest, Execute_RelativeMove_ResolvesToPoseGoalBeforePlanning) {
   ExecuteRequestDTO req = make_test_request("relative_move");
   RelativeMoveDTO relative_move;
-  relative_move.reference.type = ReferenceDTO::Type::kObject;
-  relative_move.reference.id = "graspable";
+  relative_move.target_reference.type = ReferenceDTO::Type::kObject;
+  relative_move.target_reference.id = "graspable";
   relative_move.offset.position_m = {0.0, 0.0, 0.1};
   relative_move.offset.orientation = {0.0, 0.0, 0.0, 1.0};
   req.motion = relative_move;
@@ -564,6 +570,69 @@ TEST_F(ExecutionKernelTest, Execute_RelativeMove_ResolvesToPoseGoalBeforePlannin
   EXPECT_DOUBLE_EQ(pose_goal.goal.position_m.y_m, -0.2);
   EXPECT_DOUBLE_EQ(pose_goal.goal.position_m.z_m, 0.25);
   EXPECT_DOUBLE_EQ(pose_goal.goal.orientation.w, 1.0);
+}
+
+TEST_F(ExecutionKernelTest, Execute_RelativeMove_PoseReference_ResolvesToPoseGoalBeforePlanning) {
+  ExecuteRequestDTO req = make_test_request("relative_move");
+  RelativeMoveDTO relative_move;
+  relative_move.target_reference.type = ReferenceDTO::Type::kPose;
+  relative_move.target_reference.pose = Pose3DTO{};
+  relative_move.target_reference.pose->position_m = {0.25, -0.15, 0.2};
+  relative_move.target_reference.pose->orientation = {0.0, 0.0, 0.0, 1.0};
+  relative_move.offset.position_m = {0.0, 0.0, 0.1};
+  relative_move.offset.orientation = {0.0, 0.0, 0.0, 1.0};
+  req.motion = relative_move;
+
+  context.next_reference_pose = Result<Pose3DTO>::Ok(relative_move.target_reference.pose.value());
+
+  auto result = execute_sync(req);
+  ASSERT_TRUE(result.ok());
+  ASSERT_TRUE(std::holds_alternative<PoseGoalDTO>(planner.last_request.motion));
+  const auto& pose_goal = std::get<PoseGoalDTO>(planner.last_request.motion);
+  EXPECT_DOUBLE_EQ(pose_goal.goal.position_m.x_m, 0.25);
+  EXPECT_DOUBLE_EQ(pose_goal.goal.position_m.y_m, -0.15);
+  EXPECT_DOUBLE_EQ(pose_goal.goal.position_m.z_m, 0.3);
+  EXPECT_DOUBLE_EQ(pose_goal.goal.orientation.w, 1.0);
+}
+
+TEST_F(ExecutionKernelTest, Execute_RelativeMove_OffsetReference_UsesIndependentBasis) {
+  constexpr double kInvSqrt2 = 0.7071067811865476;
+  ExecuteRequestDTO req = make_test_request("relative_move");
+  RelativeMoveDTO relative_move;
+  relative_move.target_reference.type = ReferenceDTO::Type::kObject;
+  relative_move.target_reference.id = "graspable";
+
+  ReferenceDTO offset_reference;
+  offset_reference.type = ReferenceDTO::Type::kFrame;
+  offset_reference.id = "base_link";
+  relative_move.offset_reference = offset_reference;
+
+  relative_move.offset.position_m = {0.1, 0.0, 0.0};
+  relative_move.offset.orientation = {0.0, 0.0, 0.0, 1.0};
+  req.motion = relative_move;
+
+  Pose3DTO target_pose;
+  target_pose.position_m = {0.3, -0.2, 0.15};
+  target_pose.orientation = {0.0, 0.0, 0.0, 1.0};
+
+  Pose3DTO offset_basis_pose;
+  offset_basis_pose.position_m = {0.0, 0.0, 0.0};
+  offset_basis_pose.orientation = {0.0, 0.0, kInvSqrt2, kInvSqrt2};
+
+  context.reference_pose_sequence = {
+      Result<Pose3DTO>::Ok(target_pose),
+      Result<Pose3DTO>::Ok(offset_basis_pose),
+  };
+
+  auto result = execute_sync(req);
+  ASSERT_TRUE(result.ok());
+  ASSERT_TRUE(std::holds_alternative<PoseGoalDTO>(planner.last_request.motion));
+  const auto& pose_goal = std::get<PoseGoalDTO>(planner.last_request.motion);
+  EXPECT_NEAR(pose_goal.goal.position_m.x_m, 0.3, 1e-9);
+  EXPECT_NEAR(pose_goal.goal.position_m.y_m, -0.1, 1e-9);
+  EXPECT_NEAR(pose_goal.goal.position_m.z_m, 0.15, 1e-9);
+  EXPECT_NEAR(pose_goal.goal.orientation.z, kInvSqrt2, 1e-9);
+  EXPECT_NEAR(pose_goal.goal.orientation.w, kInvSqrt2, 1e-9);
 }
 
 TEST_F(ExecutionKernelTest, Execute_HappyPath_ValidatesTrajectory) {
