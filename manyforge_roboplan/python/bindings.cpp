@@ -55,6 +55,63 @@ py::dict snapshot_to_python(const ExecutionSnapshot& snapshot) {
   return d;
 }
 
+// Helper: convert Pose3DTO to Python dict
+py::dict pose_to_python(const Pose3DTO& pose) {
+  py::dict d;
+  d["position_m"] = py::make_tuple(
+      pose.position_m.x_m, pose.position_m.y_m, pose.position_m.z_m);
+  d["orientation_xyzw"] = py::make_tuple(
+      pose.orientation.x, pose.orientation.y,
+      pose.orientation.z, pose.orientation.w);
+  return d;
+}
+
+// Helper: convert ObjectStateDTO to Python dict
+py::dict object_state_to_python(const ObjectStateDTO& state) {
+  py::dict d;
+  d["object_id"] = state.object_id;
+  d["exists"] = state.exists;
+  d["attached"] = state.attached;
+  if (state.frame_id.has_value()) {
+    d["frame_id"] = *state.frame_id;
+  } else {
+    d["frame_id"] = py::none();
+  }
+  return d;
+}
+
+py::dict scene_trace_event_to_python(
+    const RoboPlanPlanningContext::SceneTraceEvent& event) {
+  py::dict d;
+  d["timestamp_ns"] = event.timestamp_ns;
+  d["source"] = "backend";
+  d["event"] = event.event;
+  d["object_id"] = event.object_id;
+  d["success"] = event.success;
+  if (event.frame_id.has_value()) {
+    d["frame_id"] = *event.frame_id;
+  } else {
+    d["frame_id"] = py::none();
+  }
+  d["attached"] = event.attached;
+  if (event.pose_in_frame.has_value()) {
+    d["pose_in_frame"] = pose_to_python(*event.pose_in_frame);
+  } else {
+    d["pose_in_frame"] = py::none();
+  }
+  if (event.pose_in_universe.has_value()) {
+    d["pose_in_universe"] = pose_to_python(*event.pose_in_universe);
+  } else {
+    d["pose_in_universe"] = py::none();
+  }
+  if (event.error.has_value()) {
+    d["error"] = *event.error;
+  } else {
+    d["error"] = py::none();
+  }
+  return d;
+}
+
 // Helper: convert stop/pause/resume/reset results
 py::dict command_result(bool accepted, const std::optional<ErrorDTO>& error) {
   py::dict d;
@@ -140,6 +197,28 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
           auto orient = pose_dict["orientation_xyzw"].cast<std::vector<double>>();
           goal.goal.position_m = {pos[0], pos[1], pos[2]};
           goal.goal.orientation = {orient[0], orient[1], orient[2], orient[3]};
+          req.motion = goal;
+        } else if (motion_type == "relative_move") {
+          RelativeMoveDTO goal;
+          auto rel_dict = request["relative_move"];
+          auto ref_dict = rel_dict["reference"];
+          const std::string ref_type = ref_dict["type"].cast<std::string>();
+          if (ref_type == "frame") {
+            goal.reference.type = ReferenceDTO::Type::kFrame;
+          } else if (ref_type == "object") {
+            goal.reference.type = ReferenceDTO::Type::kObject;
+          } else if (ref_type == "robot_link") {
+            goal.reference.type = ReferenceDTO::Type::kRobotLink;
+          } else {
+            throw std::runtime_error("Unsupported reference type: " + ref_type);
+          }
+          goal.reference.id = ref_dict["id"].cast<std::string>();
+
+          auto offset_dict = rel_dict["offset"];
+          auto pos = offset_dict["position_m"].cast<std::vector<double>>();
+          auto orient = offset_dict["orientation_xyzw"].cast<std::vector<double>>();
+          goal.offset.position_m = {pos[0], pos[1], pos[2]};
+          goal.offset.orientation = {orient[0], orient[1], orient[2], orient[3]};
           req.motion = goal;
         }
 
@@ -233,6 +312,20 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
           auto r = self.context->update_object_pose(req);
           result["success"] = r.success;
           if (r.error.has_value()) result["error"] = r.error->message;
+        } else if (op == "attach") {
+          AttachObjectRequestDTO req;
+          req.object_id = request["object_id"].cast<std::string>();
+          req.frame_id = request.attr("get")("frame_id", "").cast<std::string>();
+          auto r = self.context->attach_object(req);
+          result["success"] = r.success;
+          if (r.error.has_value()) result["error"] = r.error->message;
+        } else if (op == "detach") {
+          DetachObjectRequestDTO req;
+          req.object_id = request["object_id"].cast<std::string>();
+          req.frame_id = request.attr("get")("frame_id", "universe").cast<std::string>();
+          auto r = self.context->detach_object(req);
+          result["success"] = r.success;
+          if (r.error.has_value()) result["error"] = r.error->message;
         }
 
         return result;
@@ -244,6 +337,9 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
           q[i] = positions[i];
         }
         self.scene->setJointPositions(q);
+        if (self.kernel) {
+          self.kernel->sync_snapshot_from_context();
+        }
       }, py::arg("positions"),
       "Set the robot's current joint positions in the planning scene.")
       .def("get_cached_trajectory", [](NativeKernelBundle& self,
@@ -287,6 +383,30 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
         } catch (...) {
           return py::none();
         }
+      })
+      .def("get_object_pose", [](NativeKernelBundle& self,
+                                  const std::string& object_id,
+                                  const std::string& base_frame) -> py::object {
+        try {
+          return pose_to_python(self.context->get_object_pose(object_id, base_frame));
+        } catch (...) {
+          return py::none();
+        }
+      })
+      .def("get_object_state", [](NativeKernelBundle& self,
+                                   const std::string& object_id) -> py::dict {
+        return object_state_to_python(self.context->get_object_state(object_id));
+      })
+      .def("get_scene_trace", [](NativeKernelBundle& self, int limit) -> py::list {
+        py::list result;
+        size_t bounded_limit = limit < 0 ? 0 : static_cast<size_t>(limit);
+        for (const auto& event : self.context->get_scene_trace(bounded_limit)) {
+          result.append(scene_trace_event_to_python(event));
+        }
+        return result;
+      }, py::arg("limit") = -1)
+      .def("clear_scene_trace", [](NativeKernelBundle& self) {
+        self.context->clear_scene_trace();
       });
 
   // Factory function

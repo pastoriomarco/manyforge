@@ -21,6 +21,12 @@ DEPLOYMENT_FIXTURE_PATH = (
 PROGRAM_FIXTURE_PATH = (
     Path(__file__).parent / "fixtures" / "pick_and_place.program.yaml"
 )
+EXAMPLE_DEPLOYMENT_PATH = (
+    Path(__file__).resolve().parents[2] / "examples" / "pick_and_place.deployment.yaml"
+)
+EXAMPLE_PROGRAM_PATH = (
+    Path(__file__).resolve().parents[2] / "examples" / "pick_and_place.program.yaml"
+)
 
 
 @pytest.fixture
@@ -294,6 +300,13 @@ class TestCrossArtifactValidation:
         with pytest.raises(DeploymentValidationError, match="group_id"):
             deploy.validate_against_program(prog)
         os.unlink(path)
+
+    def test_validate_against_example_v0_1_program_success(self, catalog):
+        """The real pick-and-place demo deployment matches the v0.1 example program."""
+        deploy = Deployment(EXAMPLE_DEPLOYMENT_PATH)
+        prog = Program(EXAMPLE_PROGRAM_PATH, catalog)
+        deploy.validate_against_program(prog)
+        deploy.validate_capabilities()
 
 
 class TestAdapterCapabilityKeys:

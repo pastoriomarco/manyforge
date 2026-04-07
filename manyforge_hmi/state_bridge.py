@@ -4,7 +4,7 @@ This is the testable core — no Viser dependency.
 """
 
 from manyforge_behavior.cycle_manager import CycleManager, CycleState
-from manyforge_behavior.kernel_client import ExecutionSnapshot
+from manyforge_behavior.kernel_client import ExecutionSnapshot, ObjectState
 
 
 class StateBridge:
@@ -46,6 +46,22 @@ class StateBridge:
         """Get the latest execution snapshot for observer-side visualization."""
         return self._cm.get_execution_snapshot()
 
+    def get_object_pose(self, object_id: str, base_frame: str):
+        """Get the current backend-authoritative object pose."""
+        return self._cm.get_object_pose(object_id, base_frame)
+
+    def get_object_state(self, object_id: str) -> ObjectState:
+        """Get the current backend-authoritative object state."""
+        return self._cm.get_object_state(object_id)
+
+    def get_scene_trace(self, limit: int | None = None) -> list[dict]:
+        """Get recent backend scene trace events."""
+        return self._cm.get_scene_trace(limit=limit)
+
+    def clear_scene_trace(self) -> None:
+        """Clear retained backend scene trace events."""
+        self._cm.clear_scene_trace()
+
     def run(self) -> None:
         """Start or resume program execution.
 
@@ -66,9 +82,7 @@ class StateBridge:
     def reset(self) -> None:
         """Reset program to initial state.
 
-        If RUNNING: stops first, then resets.
-        If STOPPED: stops tick thread, resets kernel, rebuilds tree.
-        If IDLE: no-op.
+        Rebuilds the software/runtime cycle state without teleporting the robot.
         """
         self._cm.reset()
 

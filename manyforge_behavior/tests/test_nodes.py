@@ -6,10 +6,13 @@ import py_trees
 from manyforge_behavior.kernel_client import (
     ExecutionState,
     MockKernelClient,
+    SceneEditRequest,
 )
 from manyforge_behavior.nodes.motion import MoveManipulatorAction, ResetTrajectories
 from manyforge_behavior.nodes.scene import (
     AddCollisionObject,
+    AttachObjectToLink,
+    DetachObjectFromLink,
     RemoveCollisionObject,
     UpdateCollisionObjectPose,
 )
@@ -156,6 +159,35 @@ class TestMoveManipulatorAction:
         assert kernel.last_execute_request is not None
         assert kernel.last_execute_request.velocity_scale == pytest.approx(0.4)
 
+    def test_relative_move_request_normalizes_offset_orientation(self, kernel, bb_with_kernel):
+        node = MoveManipulatorAction(
+            name="test_relative_move",
+            move_id="m_rel",
+            motion_type="relative_move",
+            relative_move={
+                "reference": {"type": "object", "id": "graspable"},
+                "offset": {
+                    "position_m": [0.0, 0.0, 0.1],
+                    "orientation_rpy_deg": [180.0, 0.0, -90.0],
+                },
+            },
+        )
+
+        status = _tick_node(node)
+        assert status == py_trees.common.Status.SUCCESS
+        assert kernel.last_execute_request is not None
+        assert kernel.last_execute_request.motion_type == "relative_move"
+        assert kernel.last_execute_request.relative_move is not None
+        assert kernel.last_execute_request.relative_move["reference"] == {
+            "type": "object",
+            "id": "graspable",
+        }
+        assert "orientation_rpy_deg" not in kernel.last_execute_request.relative_move["offset"]
+        assert kernel.last_execute_request.relative_move["offset"]["orientation_xyzw"] == pytest.approx(
+            [0.70710678, -0.70710678, -4.32978028e-17, 4.32978028e-17],
+            abs=1e-6,
+        )
+
 
 class TestResetTrajectories:
     def test_success(self, kernel, bb_with_kernel):
@@ -206,6 +238,87 @@ class TestUpdateCollisionObjectPose:
         status = _tick_node(node)
         assert status == py_trees.common.Status.SUCCESS
         assert kernel.scene_edits[0].operation == "update_pose"
+
+
+class TestAttachDetachObjectNodes:
+    def test_attach_delegates_to_backend_and_preserves_current_pose(self, kernel, bb_with_kernel):
+        bb_with_kernel.register_key(key="scene_objects", access=py_trees.common.Access.WRITE)
+        bb_with_kernel.scene_objects = {
+            "box1": {
+                "shape_type": "box",
+                "box_dimensions_m": [0.1, 0.1, 0.1],
+                "position_m": [1.5, 0.0, 0.6],
+                "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+                "frame_id": "universe",
+            }
+        }
+        kernel.scene_edit(
+            SceneEditRequest(
+                operation="add",
+                object_id="box1",
+                shape_type="box",
+                box_dimensions_m=[0.1, 0.1, 0.1],
+                pose_position_m=[0.6, 0.0, 0.6],
+                pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
+                frame_id="base_link",
+            )
+        )
+
+        node = AttachObjectToLink(name="attach_box", object_id="box1", link_frame="tool0")
+        status = _tick_node(node)
+
+        assert status == py_trees.common.Status.SUCCESS
+        attach_req = kernel.scene_edits[-1]
+        assert attach_req.operation == "attach"
+        assert attach_req.object_id == "box1"
+        assert attach_req.frame_id == "tool0"
+        state = kernel.get_object_state("box1")
+        assert state.exists is True
+        assert state.attached is True
+        assert state.frame_id == "tool0"
+        pose = kernel.get_object_pose("box1", "tool0")
+        assert pose is not None
+        assert pose["position_m"] == pytest.approx([0.1, 0.0, 0.0])
+        assert pose["orientation_xyzw"] == pytest.approx([0.0, 0.0, 0.0, 1.0])
+
+    def test_detach_delegates_to_backend_and_preserves_current_pose(
+        self, kernel, bb_with_kernel
+    ):
+        bb_with_kernel.register_key(key="scene_objects", access=py_trees.common.Access.WRITE)
+        bb_with_kernel.scene_objects = {
+            "box1": {
+                "shape_type": "box",
+                "box_dimensions_m": [0.1, 0.1, 0.1],
+            }
+        }
+        kernel.scene_edit(
+            SceneEditRequest(
+                operation="add",
+                object_id="box1",
+                shape_type="box",
+                box_dimensions_m=[0.1, 0.1, 0.1],
+                pose_position_m=[0.1, 0.0, 0.0],
+                pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
+                frame_id="tool0",
+            )
+        )
+
+        node = DetachObjectFromLink(name="detach_box", object_id="box1", link_frame="tool0")
+        status = _tick_node(node)
+
+        assert status == py_trees.common.Status.SUCCESS
+        detach_req = kernel.scene_edits[-1]
+        assert detach_req.operation == "detach"
+        assert detach_req.object_id == "box1"
+        assert detach_req.frame_id == "universe"
+        state = kernel.get_object_state("box1")
+        assert state.exists is True
+        assert state.attached is False
+        assert state.frame_id == "universe"
+        pose = kernel.get_object_pose("box1", "universe")
+        assert pose is not None
+        assert pose["position_m"] == pytest.approx([0.6, 0.0, 0.6])
+        assert pose["orientation_xyzw"] == pytest.approx([0.0, 0.0, 0.0, 1.0])
 
 
 class TestCheckKeyBoolValue:

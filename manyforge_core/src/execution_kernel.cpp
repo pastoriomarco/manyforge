@@ -1,6 +1,8 @@
 #include <manyforge_core/execution_kernel.hpp>
 
 #include <algorithm>
+#include <array>
+#include <cmath>
 #include <exception>
 #include <string>
 
@@ -11,9 +13,90 @@ double clamp_unit_interval(double value) {
   return std::max(0.0, std::min(1.0, value));
 }
 
+Pose3DTO multiply_poses(const Pose3DTO& a, const Pose3DTO& b) {
+  auto pose_to_matrix = [](const Pose3DTO& pose) {
+    std::array<std::array<double, 4>, 4> m{{
+        {{1.0, 0.0, 0.0, 0.0}},
+        {{0.0, 1.0, 0.0, 0.0}},
+        {{0.0, 0.0, 1.0, 0.0}},
+        {{0.0, 0.0, 0.0, 1.0}},
+    }};
+    const double x = pose.orientation.x;
+    const double y = pose.orientation.y;
+    const double z = pose.orientation.z;
+    const double w = pose.orientation.w;
+    m[0][0] = 1 - 2 * y * y - 2 * z * z;
+    m[0][1] = 2 * x * y - 2 * z * w;
+    m[0][2] = 2 * x * z + 2 * y * w;
+    m[1][0] = 2 * x * y + 2 * z * w;
+    m[1][1] = 1 - 2 * x * x - 2 * z * z;
+    m[1][2] = 2 * y * z - 2 * x * w;
+    m[2][0] = 2 * x * z - 2 * y * w;
+    m[2][1] = 2 * y * z + 2 * x * w;
+    m[2][2] = 1 - 2 * x * x - 2 * y * y;
+    m[0][3] = pose.position_m.x_m;
+    m[1][3] = pose.position_m.y_m;
+    m[2][3] = pose.position_m.z_m;
+    return m;
+  };
+
+  auto matrix_to_pose = [](const std::array<std::array<double, 4>, 4>& m) {
+    Pose3DTO pose;
+    pose.position_m = {m[0][3], m[1][3], m[2][3]};
+
+    const double trace = m[0][0] + m[1][1] + m[2][2];
+    if (trace > 0.0) {
+      const double s = std::sqrt(trace + 1.0) * 2.0;
+      pose.orientation.w = 0.25 * s;
+      pose.orientation.x = (m[2][1] - m[1][2]) / s;
+      pose.orientation.y = (m[0][2] - m[2][0]) / s;
+      pose.orientation.z = (m[1][0] - m[0][1]) / s;
+    } else if (m[0][0] > m[1][1] && m[0][0] > m[2][2]) {
+      const double s = std::sqrt(1.0 + m[0][0] - m[1][1] - m[2][2]) * 2.0;
+      pose.orientation.w = (m[2][1] - m[1][2]) / s;
+      pose.orientation.x = 0.25 * s;
+      pose.orientation.y = (m[0][1] + m[1][0]) / s;
+      pose.orientation.z = (m[0][2] + m[2][0]) / s;
+    } else if (m[1][1] > m[2][2]) {
+      const double s = std::sqrt(1.0 + m[1][1] - m[0][0] - m[2][2]) * 2.0;
+      pose.orientation.w = (m[0][2] - m[2][0]) / s;
+      pose.orientation.x = (m[0][1] + m[1][0]) / s;
+      pose.orientation.y = 0.25 * s;
+      pose.orientation.z = (m[1][2] + m[2][1]) / s;
+    } else {
+      const double s = std::sqrt(1.0 + m[2][2] - m[0][0] - m[1][1]) * 2.0;
+      pose.orientation.w = (m[1][0] - m[0][1]) / s;
+      pose.orientation.x = (m[0][2] + m[2][0]) / s;
+      pose.orientation.y = (m[1][2] + m[2][1]) / s;
+      pose.orientation.z = 0.25 * s;
+    }
+    return pose;
+  };
+
+  const auto ma = pose_to_matrix(a);
+  const auto mb = pose_to_matrix(b);
+  std::array<std::array<double, 4>, 4> out{};
+  for (size_t i = 0; i < 4; ++i) {
+    for (size_t j = 0; j < 4; ++j) {
+      double sum = 0.0;
+      for (size_t k = 0; k < 4; ++k) {
+        sum += ma[i][k] * mb[k][j];
+      }
+      out[i][j] = sum;
+    }
+  }
+  return matrix_to_pose(out);
+}
+
 ErrorCode error_code_from_dto(const ErrorDTO& error) {
   if (error.code == kErrorStartStateMismatch) {
     return ErrorCode::kStartStateMismatch;
+  }
+  if (error.code == kErrorMissingReference) {
+    return ErrorCode::kMissingReference;
+  }
+  if (error.code == kErrorAmbiguousReference) {
+    return ErrorCode::kAmbiguousReference;
   }
   if (error.code == kErrorValidationLimitsViolation) {
     return ErrorCode::kValidationLimitsViolation;
@@ -52,8 +135,7 @@ ExecutionKernel::ExecutionKernel(IPlannerBackend& planner,
       collision_policy_(stop_policy_,
                         [this]() { cache_.invalidate_all(); }) {
   stop_policy_.set_stop_callback([this]() { (void)execution_backend_.stop(); });
-  published_snapshot_.timestamp_ns = clock_.now();
-  published_snapshot_.state = ExecutionState::kIdle;
+  sync_snapshot_from_context();
 }
 
 ExecutionKernel::~ExecutionKernel() {
@@ -433,7 +515,7 @@ void ExecutionKernel::async_execute_worker(const ExecuteRequestDTO& request,
           std::lock_guard<std::mutex> lock(metrics_mutex_);
           metrics_.plans_failed++;
         }
-        sm_.set_last_error(ErrorCode::kPlanningFailed);
+        sm_.set_last_error(error_code_from_dto(plan_result.error()));
         sm_.try_transition(ExecutionState::kFailed);
         auto failed_snapshot = get_execution_snapshot();
         failed_snapshot.timestamp_ns = clock_.now();
@@ -1005,6 +1087,21 @@ ExecutionSnapshot ExecutionKernel::get_execution_snapshot() const {
   return snapshot;
 }
 
+void ExecutionKernel::sync_snapshot_from_context() {
+  ExecutionSnapshot snapshot;
+  snapshot.timestamp_ns = clock_.now();
+  snapshot.execution_id = sm_.status().execution_id;
+  snapshot.move_id = active_move_id_;
+  snapshot.state = sm_.status().state;
+  snapshot.progress = sm_.status().progress;
+  try {
+    snapshot.joint_positions_rad = context_.get_current_state().positions_rad;
+  } catch (...) {
+    snapshot.joint_positions_rad.clear();
+  }
+  publish_execution_snapshot(std::move(snapshot));
+}
+
 MetricsSnapshot ExecutionKernel::get_metrics() const {
   std::lock_guard<std::mutex> lock(metrics_mutex_);
   return metrics_;
@@ -1061,6 +1158,10 @@ Result<void> ExecutionKernel::collision_check_tick() {
 Result<TrajectoryDTO> ExecutionKernel::plan_trajectory(
     const ExecuteRequestDTO& request) {
   auto current_state = context_.get_current_state();
+  auto resolved_motion = resolve_motion_spec(request);
+  if (!resolved_motion.ok()) {
+    return Result<TrajectoryDTO>::Err(resolved_motion.error());
+  }
 
   PlanRequestDTO plan_req;
   plan_req.robot_id = request.robot_id;
@@ -1069,7 +1170,7 @@ Result<TrajectoryDTO> ExecutionKernel::plan_trajectory(
   plan_req.base_frame = request.base_frame;
   plan_req.tcp_frame = request.tcp_frame;
   plan_req.start_state = current_state;
-  plan_req.motion = request.motion;
+  plan_req.motion = std::move(resolved_motion.value());
   plan_req.tolerances = request.tolerances;
   plan_req.speed_profile = request.speed_profile;
   plan_req.planning_timeout_s = request.timeouts.planning_timeout_s;
@@ -1085,6 +1186,23 @@ Result<TrajectoryDTO> ExecutionKernel::plan_trajectory(
   }
 
   return Result<TrajectoryDTO>::Err(ErrorCode::kPlanningFailed);
+}
+
+Result<MotionSpecDTO> ExecutionKernel::resolve_motion_spec(
+    const ExecuteRequestDTO& request) {
+  if (auto* relative_move = std::get_if<RelativeMoveDTO>(&request.motion)) {
+    auto reference_pose =
+        context_.resolve_reference_pose(relative_move->reference, request.base_frame);
+    if (!reference_pose.ok()) {
+      return Result<MotionSpecDTO>::Err(reference_pose.error());
+    }
+
+    PoseGoalDTO pose_goal;
+    pose_goal.goal = multiply_poses(reference_pose.value(), relative_move->offset);
+    return Result<MotionSpecDTO>::Ok(MotionSpecDTO{pose_goal});
+  }
+
+  return Result<MotionSpecDTO>::Ok(request.motion);
 }
 
 Result<void> ExecutionKernel::validate_trajectory(

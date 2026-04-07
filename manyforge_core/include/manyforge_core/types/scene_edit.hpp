@@ -54,6 +54,26 @@ struct UpdateObjectPoseRequestDTO {
   std::string frame_id;
 };
 
+/// Attach an existing object to a frame while preserving its current world pose.
+struct AttachObjectRequestDTO {
+  std::string object_id;
+  std::string frame_id;
+};
+
+/// Detach/reparent an existing object into a target frame while preserving world pose.
+struct DetachObjectRequestDTO {
+  std::string object_id;
+  std::string frame_id;
+};
+
+/// Object state query result (spec §3.9)
+struct ObjectStateDTO {
+  std::string object_id;
+  bool exists = false;
+  bool attached = false;
+  std::optional<std::string> frame_id;
+};
+
 /// Scene edit result (spec §3.9)
 struct SceneEditResultDTO {
   bool success = false;

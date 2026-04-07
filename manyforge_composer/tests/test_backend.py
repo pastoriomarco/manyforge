@@ -10,7 +10,7 @@ import httpx
 import asyncio
 import py_trees
 
-from manyforge_behavior.kernel_client import MockKernelClient
+from manyforge_behavior.kernel_client import MockKernelClient, SceneEditRequest
 from manyforge_composer.backend.state import ComposerState
 from manyforge_composer.backend.app import create_app
 from manyforge_composer.__main__ import build_program_loaded_callback
@@ -21,6 +21,8 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 _CATALOG_PATH = str(_REPO_ROOT / "manyforge_behavior" / "resources" / "node_catalog.yaml")
 _PROGRAM_PATH = str(_REPO_ROOT / "manyforge_behavior" / "tests" / "fixtures" / "pick_and_place.program.yaml")
 _DEPLOYMENT_PATH = str(_REPO_ROOT / "manyforge_behavior" / "tests" / "fixtures" / "ur5_roboplan.deployment.yaml")
+_EXAMPLE_PROGRAM_PATH = str(_REPO_ROOT / "examples" / "pick_and_place.program.yaml")
+_EXAMPLE_DEPLOYMENT_PATH = str(_REPO_ROOT / "examples" / "pick_and_place.deployment.yaml")
 
 
 @pytest.fixture
@@ -476,12 +478,19 @@ def test_program_load_callback_registers_scene_edit_callback(caplog):
         def __init__(self):
             self.cleared = False
             self.loaded_scene = None
+            self.sync_calls = 0
 
         def clear(self):
             self.cleared = True
 
         def load_from_program(self, scene):
             self.loaded_scene = scene
+
+        def sync_box(self, *args, **kwargs):
+            self.sync_calls += 1
+
+        def sync_sphere(self, *args, **kwargs):
+            self.sync_calls += 1
 
         def remove_object(self, object_id):
             self.last_removed = object_id
@@ -505,10 +514,17 @@ def test_program_load_callback_registers_scene_edit_callback(caplog):
             self.started = False
             self.stopped = False
             self.program = None
+            self.scene_sync_requested = 0
             DummyHmiServer.instances.append(self)
 
         def load_program(self, program):
             self.program = program
+
+        def request_scene_sync(self, **kwargs):
+            self.scene_sync_requested += 1
+
+        def sync_scene_from_backend(self):
+            self.scene_sync_requested += 1
 
         def start(self):
             self.started = True
@@ -517,12 +533,20 @@ def test_program_load_callback_registers_scene_edit_callback(caplog):
             self.stopped = True
 
     state = ComposerState(catalog_path=_CATALOG_PATH, kernel=MockKernelClient())
+    class DummyBundle:
+        def __init__(self):
+            self.set_calls = 0
+
+        def set_joint_positions(self, positions):
+            self.set_calls += 1
+
+    bundle = DummyBundle()
     state._on_program_loaded = build_program_loaded_callback(
         host="127.0.0.1",
         hmi_port=0,
         urdf_path=None,
         package_dirs=[],
-        bundle=None,
+        bundle=bundle,
         hmi_server_factory=DummyHmiServer,
     )
 
@@ -535,6 +559,8 @@ def test_program_load_callback_registers_scene_edit_callback(caplog):
     assert server.started
     assert server.program is not None
     assert state.cycle_manager._on_run_from_idle is not None
+    assert state.cycle_manager._tree is not None
+    assert bundle.set_calls == 0
 
     bb = py_trees.blackboard.Client(name="test_scene_edit_callback")
     bb.register_key(key="scene_edit_callback", access=py_trees.common.Access.READ)
@@ -542,4 +568,102 @@ def test_program_load_callback_registers_scene_edit_callback(caplog):
 
     state.cycle_manager._on_run_from_idle()
     assert server.scene_renderer.cleared
-    assert server.scene_renderer.loaded_scene == state.program.scene
+    assert server.scene_sync_requested > 0
+
+
+def test_program_load_callback_applies_simulator_bootstrap_from_deployment(caplog):
+    """Program-load callback applies explicit simulator-only startup joint positions."""
+    py_trees.blackboard.Blackboard.clear()
+
+    class DummySceneRenderer:
+        def clear(self):
+            self.cleared = True
+
+    class DummyHmiServer:
+        instances = []
+
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.scene_renderer = DummySceneRenderer()
+            self.robot_visualizer = None
+            self.started = False
+            self.program = None
+            DummyHmiServer.instances.append(self)
+
+        def load_program(self, program):
+            self.program = program
+
+        def request_scene_sync(self, **kwargs):
+            pass
+
+        def sync_scene_from_backend(self):
+            pass
+
+        def start(self):
+            self.started = True
+
+        def stop(self):
+            pass
+
+    class DummyBundle:
+        def __init__(self):
+            self.set_calls = []
+
+        def set_joint_positions(self, positions):
+            self.set_calls.append(list(positions))
+
+    bundle = DummyBundle()
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=MockKernelClient())
+    state._on_program_loaded = build_program_loaded_callback(
+        host="127.0.0.1",
+        hmi_port=0,
+        urdf_path=None,
+        package_dirs=[],
+        bundle=bundle,
+        hmi_server_factory=DummyHmiServer,
+    )
+
+    with caplog.at_level(logging.ERROR):
+        state.load_program(_EXAMPLE_PROGRAM_PATH, deployment_path=_EXAMPLE_DEPLOYMENT_PATH)
+
+    assert not any("on_program_loaded callback failed" in rec.message for rec in caplog.records)
+    assert bundle.set_calls == [[0.0, -1.57, 1.57, -1.57, -1.57, 0.0]]
+
+
+def test_debug_scene_trace_endpoint_returns_backend_and_hmi_observability():
+    """Debug scene trace endpoint exposes current backend/HMI trace and scope."""
+    kernel = MockKernelClient()
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state.load_program(_PROGRAM_PATH)
+
+    kernel.scene_edit(
+        SceneEditRequest(
+            operation="add",
+            object_id="trace_box",
+            pose_position_m=[0.4, 0.1, 0.2],
+            pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
+            frame_id="universe",
+        )
+    )
+
+    class DummyHmiServer:
+        def get_scene_trace(self, limit=None):
+            return [{"source": "hmi", "event": "reconcile_render", "object_id": "trace_box"}]
+
+        def get_object_render_diagnostics(self, object_id):
+            return {"object_id": object_id, "exists": object_id == "trace_box"}
+
+    state.hmi_server = DummyHmiServer()
+    app = create_app(state)
+
+    with TestClient(app) as client:
+        response = client.get("/api/debug/scene-trace?limit=10")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert "included" in data["scope"]
+    assert data["backend"]
+    assert data["backend"][-1]["event"] == "add"
+    assert data["hmi"][0]["event"] == "reconcile_render"
+    assert data["objects"]
+    assert "table" in data["objects"]

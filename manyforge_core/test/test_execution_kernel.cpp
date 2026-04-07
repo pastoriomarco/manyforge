@@ -92,6 +92,9 @@ class MockContext : public IPlanningContext {
   CollisionCheckResultDTO next_collision;
   std::vector<CollisionCheckResultDTO> collision_sequence;
   Pose3DTO next_fk;
+  Pose3DTO next_object_pose;
+  ObjectStateDTO next_object_state;
+  Result<Pose3DTO> next_reference_pose = Result<Pose3DTO>::Ok(Pose3DTO{});
   JointLimitsDTO next_limits;
   SceneEditResultDTO next_scene_edit;
 
@@ -126,6 +129,20 @@ class MockContext : public IPlanningContext {
     return next_fk;
   }
 
+  Pose3DTO get_object_pose(const std::string& /*object_id*/,
+                           const std::string& /*base_frame*/) override {
+    return next_object_pose;
+  }
+
+  ObjectStateDTO get_object_state(const std::string& /*object_id*/) override {
+    return next_object_state;
+  }
+
+  Result<Pose3DTO> resolve_reference_pose(const ReferenceDTO& /*reference*/,
+                                          const std::string& /*base_frame*/) override {
+    return next_reference_pose;
+  }
+
   JointLimitsDTO get_joint_limits(const std::string& /*robot_id*/,
                                    const std::string& /*group_id*/) override {
     return next_limits;
@@ -141,6 +158,16 @@ class MockContext : public IPlanningContext {
 
   SceneEditResultDTO update_object_pose(
       const UpdateObjectPoseRequestDTO& /*request*/) override {
+    return next_scene_edit;
+  }
+
+  SceneEditResultDTO attach_object(
+      const AttachObjectRequestDTO& /*request*/) override {
+    return next_scene_edit;
+  }
+
+  SceneEditResultDTO detach_object(
+      const DetachObjectRequestDTO& /*request*/) override {
     return next_scene_edit;
   }
 };
@@ -513,6 +540,30 @@ TEST_F(ExecutionKernelTest, Execute_HappyPath_CallsPlanner) {
   EXPECT_EQ(planner.plan_count, 1);
   EXPECT_EQ(planner.last_request.robot_id, "robot1");
   EXPECT_EQ(planner.last_request.move_id, "move_1");
+}
+
+TEST_F(ExecutionKernelTest, Execute_RelativeMove_ResolvesToPoseGoalBeforePlanning) {
+  ExecuteRequestDTO req = make_test_request("relative_move");
+  RelativeMoveDTO relative_move;
+  relative_move.reference.type = ReferenceDTO::Type::kObject;
+  relative_move.reference.id = "graspable";
+  relative_move.offset.position_m = {0.0, 0.0, 0.1};
+  relative_move.offset.orientation = {0.0, 0.0, 0.0, 1.0};
+  req.motion = relative_move;
+
+  Pose3DTO resolved_reference;
+  resolved_reference.position_m = {0.3, -0.2, 0.15};
+  resolved_reference.orientation = {0.0, 0.0, 0.0, 1.0};
+  context.next_reference_pose = Result<Pose3DTO>::Ok(resolved_reference);
+
+  auto result = execute_sync(req);
+  ASSERT_TRUE(result.ok());
+  ASSERT_TRUE(std::holds_alternative<PoseGoalDTO>(planner.last_request.motion));
+  const auto& pose_goal = std::get<PoseGoalDTO>(planner.last_request.motion);
+  EXPECT_DOUBLE_EQ(pose_goal.goal.position_m.x_m, 0.3);
+  EXPECT_DOUBLE_EQ(pose_goal.goal.position_m.y_m, -0.2);
+  EXPECT_DOUBLE_EQ(pose_goal.goal.position_m.z_m, 0.25);
+  EXPECT_DOUBLE_EQ(pose_goal.goal.orientation.w, 1.0);
 }
 
 TEST_F(ExecutionKernelTest, Execute_HappyPath_ValidatesTrajectory) {

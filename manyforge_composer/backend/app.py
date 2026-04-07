@@ -79,6 +79,42 @@ def create_app(state: ComposerState, static_dir: str | None = None) -> FastAPI:
             "timestamp": time.time(),
         }
 
+    @app.get("/api/debug/scene-trace")
+    def debug_scene_trace(limit: int = 200):
+        backend_trace = []
+        if state.cycle_manager is not None:
+            backend_trace = state.cycle_manager.get_scene_trace(limit=limit)
+
+        hmi_trace = []
+        object_diagnostics = {}
+        hmi_server = getattr(state, "hmi_server", None)
+        if hmi_server is not None:
+            if hasattr(hmi_server, "get_scene_trace"):
+                hmi_trace = hmi_server.get_scene_trace(limit=limit)
+            if state.program is not None and hasattr(hmi_server, "get_object_render_diagnostics"):
+                for resource in state.program.scene or []:
+                    object_diagnostics[resource.object_id] = (
+                        hmi_server.get_object_render_diagnostics(resource.object_id)
+                    )
+
+        return {
+            "scope": {
+                "included": [
+                    "backend scene mutation trace (add/remove/update_pose/attach/detach)",
+                    "HMI invalidation hints and per-object reconciliation decisions",
+                    "current per-object backend-vs-render diagnostics",
+                ],
+                "excluded": [
+                    "browser-side WebGL/client rendering and pixels",
+                    "persistent trace storage",
+                    "planner/collision internals beyond scene mutations and queried scene state",
+                ],
+            },
+            "backend": backend_trace,
+            "hmi": hmi_trace,
+            "objects": object_diagnostics,
+        }
+
     app.include_router(create_cycle_router(state), prefix="/api/cycle", tags=["cycle"])
     app.include_router(create_catalog_router(state), prefix="/api/catalog", tags=["catalog"])
     app.include_router(create_program_router(state), prefix="/api", tags=["program"])

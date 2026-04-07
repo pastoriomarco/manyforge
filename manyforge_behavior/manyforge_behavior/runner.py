@@ -107,20 +107,15 @@ class OrchestratorRunner:
         bb.base_frame = self._program.robot.base_frame
         bb.tcp_frame = self._program.robot.tcp_frame
 
-        # Build scene object registry for attach/detach nodes
+        # Build static scene metadata registry for attach/detach nodes.
+        # Runtime object pose/frame always comes from backend queries.
         bb.register_key(key="scene_objects", access=py_trees.common.Access.WRITE)
         scene_registry = {}
         for resource in (self._program.scene or []):
-            orient = resource.pose.get("orientation_xyzw")
-            if not orient and "orientation_rpy_deg" in resource.pose:
-                orient = _rpy_deg_to_xyzw(resource.pose["orientation_rpy_deg"])
             scene_registry[resource.object_id] = {
                 "shape_type": resource.shape.get("type"),
                 "box_dimensions_m": resource.shape.get("box_dimensions_m"),
                 "sphere_radius_m": resource.shape.get("sphere_radius_m"),
-                "position_m": resource.pose.get("position_m", [0, 0, 0]),
-                "orientation_xyzw": orient or [0, 0, 0, 1],
-                "frame_id": resource.pose.get("frame_id", "universe"),
             }
         bb.scene_objects = scene_registry
 

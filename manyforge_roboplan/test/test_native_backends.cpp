@@ -118,11 +118,22 @@ TEST_F(NativeKernelTest, AddAndRemoveBoxObject) {
 
   auto add_result = bundle_->context->add_object(add_req);
   EXPECT_TRUE(add_result.success);
+  auto state = bundle_->context->get_object_state("test_box");
+  EXPECT_TRUE(state.exists);
+  ASSERT_TRUE(state.frame_id.has_value());
+  EXPECT_EQ(*state.frame_id, "universe");
+
+  auto pose = bundle_->context->get_object_pose("test_box", "universe");
+  EXPECT_NEAR(pose.position_m.x_m, 0.5, 1e-9);
+  EXPECT_NEAR(pose.position_m.y_m, 0.0, 1e-9);
+  EXPECT_NEAR(pose.position_m.z_m, 0.5, 1e-9);
 
   RemoveObjectRequestDTO rem_req;
   rem_req.object_id = "test_box";
   auto rem_result = bundle_->context->remove_object(rem_req);
   EXPECT_TRUE(rem_result.success);
+  auto removed_state = bundle_->context->get_object_state("test_box");
+  EXPECT_FALSE(removed_state.exists);
 }
 
 TEST_F(NativeKernelTest, AddSphereObject) {
@@ -135,6 +146,94 @@ TEST_F(NativeKernelTest, AddSphereObject) {
 
   auto result = bundle_->context->add_object(req);
   EXPECT_TRUE(result.success);
+}
+
+TEST_F(NativeKernelTest, AttachedFrameObjectPoseResolvesFromBackendState) {
+  auto link_state = bundle_->context->get_current_state();
+  FkRequestDTO fk_req;
+  fk_req.robot_state = link_state;
+  fk_req.target_frame = "tool0";
+  fk_req.base_frame = "universe";
+  auto tool_pose = bundle_->context->forward_kinematics(fk_req);
+
+  AddObjectRequestDTO add_req;
+  add_req.object_id = "carried_box";
+  add_req.frame_id = "tool0";
+  add_req.shape = BoxShapeDTO{{0.05, 0.05, 0.05}};
+  add_req.pose.position_m = {0.0, 0.0, 0.0};
+  add_req.pose.orientation = {0.0, 0.0, 0.0, 1.0};
+
+  auto add_result = bundle_->context->add_object(add_req);
+  ASSERT_TRUE(add_result.success);
+
+  auto state = bundle_->context->get_object_state("carried_box");
+  EXPECT_TRUE(state.exists);
+  EXPECT_TRUE(state.attached);
+  ASSERT_TRUE(state.frame_id.has_value());
+  EXPECT_EQ(*state.frame_id, "tool0");
+
+  auto pose = bundle_->context->get_object_pose("carried_box", "universe");
+  EXPECT_NEAR(pose.position_m.x_m, tool_pose.position_m.x_m, 1e-6);
+  EXPECT_NEAR(pose.position_m.y_m, tool_pose.position_m.y_m, 1e-6);
+  EXPECT_NEAR(pose.position_m.z_m, tool_pose.position_m.z_m, 1e-6);
+}
+
+TEST_F(NativeKernelTest, AttachObjectReparentsWhilePreservingWorldPose) {
+  AddObjectRequestDTO add_req;
+  add_req.object_id = "carried_box";
+  add_req.frame_id = "universe";
+  add_req.shape = BoxShapeDTO{{0.05, 0.05, 0.05}};
+  add_req.pose.position_m = {0.45, 0.0, 0.55};
+  add_req.pose.orientation = {0.0, 0.0, 0.0, 1.0};
+  ASSERT_TRUE(bundle_->context->add_object(add_req).success);
+
+  auto pose_before = bundle_->context->get_object_pose("carried_box", "universe");
+
+  AttachObjectRequestDTO attach_req;
+  attach_req.object_id = "carried_box";
+  attach_req.frame_id = "tool0";
+  auto attach_result = bundle_->context->attach_object(attach_req);
+  ASSERT_TRUE(attach_result.success);
+
+  auto state = bundle_->context->get_object_state("carried_box");
+  EXPECT_TRUE(state.exists);
+  EXPECT_TRUE(state.attached);
+  ASSERT_TRUE(state.frame_id.has_value());
+  EXPECT_EQ(*state.frame_id, "tool0");
+
+  auto pose_after = bundle_->context->get_object_pose("carried_box", "universe");
+  EXPECT_NEAR(pose_after.position_m.x_m, pose_before.position_m.x_m, 1e-6);
+  EXPECT_NEAR(pose_after.position_m.y_m, pose_before.position_m.y_m, 1e-6);
+  EXPECT_NEAR(pose_after.position_m.z_m, pose_before.position_m.z_m, 1e-6);
+}
+
+TEST_F(NativeKernelTest, DetachObjectReparentsBackToUniverseWhilePreservingWorldPose) {
+  AddObjectRequestDTO add_req;
+  add_req.object_id = "carried_box";
+  add_req.frame_id = "tool0";
+  add_req.shape = BoxShapeDTO{{0.05, 0.05, 0.05}};
+  add_req.pose.position_m = {0.01, 0.0, 0.0};
+  add_req.pose.orientation = {0.0, 0.0, 0.0, 1.0};
+  ASSERT_TRUE(bundle_->context->add_object(add_req).success);
+
+  auto pose_before = bundle_->context->get_object_pose("carried_box", "universe");
+
+  DetachObjectRequestDTO detach_req;
+  detach_req.object_id = "carried_box";
+  detach_req.frame_id = "universe";
+  auto detach_result = bundle_->context->detach_object(detach_req);
+  ASSERT_TRUE(detach_result.success);
+
+  auto state = bundle_->context->get_object_state("carried_box");
+  EXPECT_TRUE(state.exists);
+  EXPECT_FALSE(state.attached);
+  ASSERT_TRUE(state.frame_id.has_value());
+  EXPECT_EQ(*state.frame_id, "universe");
+
+  auto pose_after = bundle_->context->get_object_pose("carried_box", "universe");
+  EXPECT_NEAR(pose_after.position_m.x_m, pose_before.position_m.x_m, 1e-6);
+  EXPECT_NEAR(pose_after.position_m.y_m, pose_before.position_m.y_m, 1e-6);
+  EXPECT_NEAR(pose_after.position_m.z_m, pose_before.position_m.z_m, 1e-6);
 }
 
 // --- Full Execute Cycle ---

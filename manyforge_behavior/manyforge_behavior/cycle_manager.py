@@ -17,6 +17,7 @@ from manyforge_behavior.kernel_client import (
     ExecutionSnapshot,
     ExecutionState,
     KernelClient,
+    ObjectState,
     SceneEditRequest,
 )
 from manyforge_behavior.runner import OrchestratorRunner
@@ -67,6 +68,37 @@ class CycleManager:
 
         # Set initial pause event to set (not paused)
         self._tick_pause_event.set()
+
+    def _tree_is_terminal(self) -> bool:
+        """True when the current tree has already reached a terminal status."""
+        if self._tree is None:
+            return False
+        return self._tree.root.status in (
+            py_trees.common.Status.SUCCESS,
+            py_trees.common.Status.FAILURE,
+        )
+
+    def _clear_runtime_scene(self) -> None:
+        """Best-effort removal of program-scoped scene objects from the backend."""
+        program = self._runner.program
+        if program is None:
+            return
+        for resource in program.scene:
+            self._kernel.scene_edit(
+                SceneEditRequest(operation="remove", object_id=resource.object_id)
+            )
+
+    def _prepare_fresh_cycle(self) -> None:
+        """Rebuild tree and reapply the program scene without touching robot state."""
+        if self._runner.program is None:
+            self._runner.load()
+
+        self._clear_runtime_scene()
+        self._tree = self._runner.build_tree()
+        self._runner.apply_scene()
+        self._write_bb_keys()
+        with self._lock:
+            self._node_statuses = {}
     
     @property
     def state(self) -> CycleState:
@@ -86,6 +118,22 @@ class CycleManager:
     def get_execution_snapshot(self) -> ExecutionSnapshot:
         """Get the latest observer-safe execution snapshot from the kernel."""
         return self._kernel.get_execution_snapshot()
+
+    def get_object_pose(self, object_id: str, base_frame: str) -> Optional[dict]:
+        """Get the current backend-authoritative object pose."""
+        return self._kernel.get_object_pose(object_id, base_frame)
+
+    def get_object_state(self, object_id: str) -> ObjectState:
+        """Get the current backend-authoritative object state."""
+        return self._kernel.get_object_state(object_id)
+
+    def get_scene_trace(self, limit: Optional[int] = None) -> list[dict]:
+        """Get recent backend scene trace events."""
+        return self._kernel.get_scene_trace(limit=limit)
+
+    def clear_scene_trace(self) -> None:
+        """Clear retained backend scene trace events."""
+        self._kernel.clear_scene_trace()
     
     def get_node_statuses(self) -> dict[str, str]:
         """Return the latest atomically-collected node status snapshot.
@@ -102,11 +150,17 @@ class CycleManager:
         Start or resume program execution.
         
         If IDLE: runner.load(), runner.build_tree(), runner.apply_scene(),
-                 write BB keys, start tick thread. State → RUNNING.
+                 write BB keys, start tick thread. If the previous tree
+                 already reached SUCCESS/FAILURE, a fresh tree/scene is
+                 prepared before starting. State → RUNNING.
         If STOPPED: clear stop_requested on BB, resume tick thread. State → RUNNING.
                     If kernel is PAUSED, call kernel.resume().
         If RUNNING: no-op.
         """
+        prepare_fresh = False
+        start_from_idle = False
+        on_run_from_idle: Optional[Callable[[], None]] = None
+
         with self._lock:
             if self._state == CycleState.RUNNING:
                 return  # Already running, no-op
@@ -117,40 +171,39 @@ class CycleManager:
                 # Guard: refuse to start if a zombie tick thread is still alive
                 if self._tick_thread is not None and self._tick_thread.is_alive():
                     raise RuntimeError("Cannot start new cycle: previous tick thread is still alive")
-                # First run — load/build/apply only when not already prepared
-                if self._runner.program is None:
-                    self._runner.load()
-                if self._tree is None:
-                    self._tree = self._runner.build_tree()
-                    self._runner.apply_scene()
+                prepare_fresh = self._tree is None or self._tree_is_terminal()
+                start_from_idle = True
+                on_run_from_idle = self._on_run_from_idle
+
+            elif self._state == CycleState.STOPPED:
+                # Resuming from stopped state
+                bb = py_trees.blackboard.Client(name="cycle_manager_resume")
+                bb.register_key(key="stop_requested", access=py_trees.common.Access.WRITE)
+                bb.stop_requested = False
+
+                kernel_status = self._kernel.get_status()
+                if kernel_status.state == ExecutionState.PAUSED:
+                    self._kernel.resume()
+
+                self._tick_pause_event.set()
+                self._state = CycleState.RUNNING
+                return
+
+        if start_from_idle:
+            if prepare_fresh:
+                self._prepare_fresh_cycle()
+            else:
                 self._write_bb_keys()
 
-                # Notify listener (e.g. Viser scene refresh)
-                if self._on_run_from_idle:
-                    self._on_run_from_idle()
+            if on_run_from_idle:
+                on_run_from_idle()
 
-                # Start tick thread
+            with self._lock:
                 self._tick_stop_event.clear()
                 self._tick_pause_event.set()
                 self._tick_thread = threading.Thread(target=self._tick_loop, daemon=True)
                 self._tick_thread.start()
-                
-            elif self._state == CycleState.STOPPED:
-                # Resuming from stopped state
-                # Clear stop flag on blackboard
-                bb = py_trees.blackboard.Client(name="cycle_manager_resume")
-                bb.register_key(key="stop_requested", access=py_trees.common.Access.WRITE)
-                bb.stop_requested = False
-                
-                # Resume kernel if paused
-                kernel_status = self._kernel.get_status()
-                if kernel_status.state == ExecutionState.PAUSED:
-                    self._kernel.resume()
-                
-                # Resume tick thread
-                self._tick_pause_event.set()
-            
-            self._state = CycleState.RUNNING
+                self._state = CycleState.RUNNING
     
     def stop(self) -> None:
         """
@@ -185,14 +238,10 @@ class CycleManager:
         Reset program to initial state.
         
         If RUNNING: stop() first.
-        If STOPPED or RUNNING: stop tick thread, kernel.reset(),
-                               runner.build_tree(), runner.apply_scene(),
-                               write BB keys. State → IDLE.
-        If IDLE: no-op.
+        Rebuilds the software/runtime scene state for the currently-loaded
+        program without teleporting the robot.
         """
         with self._lock:
-            if self._state == CycleState.IDLE:
-                return  # Already idle, no-op
             need_stop = (self._state == CycleState.RUNNING)
 
         if need_stop:
@@ -213,30 +262,21 @@ class CycleManager:
                 if thread_to_join.is_alive():
                     logger.error("Tick thread did not terminate within timeout — zombie thread detected")
                     self._error = "tick thread did not terminate"
-                elif self._tick_thread is thread_to_join:
+                    self._state = CycleState.IDLE
+                    return
+                if self._tick_thread is thread_to_join:
                     self._tick_thread = None
-            
-            # Reset kernel
+
+        kernel_status = self._kernel.get_status()
+        if kernel_status.state != ExecutionState.IDLE:
             self._kernel.reset()
 
-            # Clear scene objects from the previous run (C++ kernel reset
-            # doesn't clear the planning scene, so apply_scene() would fail
-            # with "already exists" on re-add).
-            # Also remove "_attached" variants left by AttachObjectToLink.
-            if self._runner.program:
-                for res in self._runner.program.scene:
-                    for suffix in ("", "_attached"):
-                        self._kernel.scene_edit(SceneEditRequest(
-                            operation="remove",
-                            object_id=res.object_id + suffix))
+        self._prepare_fresh_cycle()
 
-            # Clear tree — run() from IDLE will rebuild fresh
-            self._tree = None
-
-            # Reset events
+        with self._lock:
             self._tick_stop_event.clear()
             self._tick_pause_event.set()
-
+            self._error = None
             self._state = CycleState.IDLE
     
     def set_velocity_scale(self, scale: float) -> None:

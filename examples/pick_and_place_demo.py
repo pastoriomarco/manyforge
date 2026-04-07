@@ -22,6 +22,7 @@ import os
 import sys
 import time
 from pathlib import Path
+import yaml
 
 # Unbuffered output so prints appear immediately
 os.environ["PYTHONUNBUFFERED"] = "1"
@@ -32,6 +33,7 @@ os.environ["PYTHONUNBUFFERED"] = "1"
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CATALOG_PATH = str(REPO_ROOT / "manyforge_behavior" / "resources" / "node_catalog.yaml")
 PROGRAM_PATH = str(REPO_ROOT / "examples" / "pick_and_place.program.yaml")
+DEPLOYMENT_PATH = str(REPO_ROOT / "examples" / "pick_and_place.deployment.yaml")
 
 # URDF from roboplan example models (installed in the container)
 try:
@@ -76,15 +78,24 @@ JOINT_NAMES = [
     "wrist_1_joint", "wrist_2_joint", "wrist_3_joint",
 ]
 
-# UR rest pose from manymove bt_client_ur.cpp
-REST_POSE = {
-    "shoulder_pan_joint": 0.0,
-    "shoulder_lift_joint": -1.57,
-    "elbow_joint": 1.57,
-    "wrist_1_joint": -1.57,
-    "wrist_2_joint": -1.57,
-    "wrist_3_joint": 0.0,
-}
+
+def _load_simulator_initial_joint_positions() -> list[float] | None:
+    """Read explicit simulator bootstrap joint positions from the example deployment."""
+    try:
+        with open(DEPLOYMENT_PATH) as f:
+            data = yaml.safe_load(f)
+    except Exception:
+        return None
+
+    execution = (data or {}).get("adapters", {}).get("execution", {})
+    if execution.get("adapter_id") != "execution.roboplan_native":
+        return None
+    if execution.get("config", {}).get("mode") != "simulated":
+        return None
+    positions = execution.get("config", {}).get("initial_joint_positions_rad")
+    if not isinstance(positions, list) or not positions:
+        return None
+    return [float(v) for v in positions]
 
 
 def main():
@@ -117,67 +128,32 @@ def main():
     # Load program into HMI (scene objects + program panel)
     hmi.load_program(runner.program)
 
-    # --- 4. Set robot to rest position (both visualization AND planner) ---
-    bundle.set_joint_positions(list(REST_POSE.values()))
-    if hmi.robot_visualizer:
-        hmi.robot_visualizer.update_joints(REST_POSE)
-
-    # --- 5. Register scene edit callback for Viser sync ---
+    # --- 4. Register scene edit callback as backend-scene invalidation hint ---
     bb = py_trees.blackboard.Client(name="demo_scene_callback")
-    # Build link-name → Viser scene path map for attaching objects to robot frames
-    _link_viser_paths: dict[str, str] = {}
-    if hmi.robot_visualizer:
-        import viser.extras._urdf as _urdf_module
-        _urdf_scene = hmi.robot_visualizer.viser_urdf._urdf.scene
-        if _urdf_scene is not None:
-            for frame_name in ("tool0", "wrist_3_link"):
-                try:
-                    _link_viser_paths[frame_name] = _urdf_module._viser_name_from_frame(
-                        _urdf_scene, frame_name, "/robot/visual"
-                    )
-                except Exception:
-                    pass
 
     def on_scene_edit(operation: str, request):
-        """Update Viser scene when planning scene changes."""
-        renderer = hmi.scene_renderer
-        if operation == "remove":
-            renderer.remove_object(request.object_id)
-            print(f"  Scene: removed '{request.object_id}'", flush=True)
-        elif operation == "add":
-            frame = request.frame_id or "universe"
-            orient = tuple(request.pose_orientation_xyzw or [0, 0, 0, 1])
-            pos = tuple(request.pose_position_m or [0, 0, 0])
-            if frame != "universe":
-                # Attach to robot link frame in Viser scene graph
-                viser_path = _link_viser_paths.get(frame)
-                if viser_path and request.shape_type == "box" and request.box_dimensions_m:
-                    renderer.add_box_on_frame(
-                        request.object_id, viser_path,
-                        tuple(request.box_dimensions_m), pos, orient,
-                    )
-                    print(f"  Scene: '{request.object_id}' attached to {frame}", flush=True)
-                else:
-                    print(f"  Scene: '{request.object_id}' attached to {frame} (no Viser path)", flush=True)
-                return
-            if request.shape_type == "box" and request.box_dimensions_m:
-                renderer.add_box(request.object_id, tuple(request.box_dimensions_m),
-                                 pos, orient)
-            elif request.shape_type == "sphere" and request.sphere_radius_m:
-                renderer.add_sphere(request.object_id, request.sphere_radius_m, pos)
-            print(f"  Scene: added '{request.object_id}' at {pos}", flush=True)
+        """Request a backend-authoritative scene resync."""
+        hmi.request_scene_sync()
+        print(f"  Scene sync requested after {operation} '{request.object_id}'", flush=True)
 
     bb.register_key(key="scene_edit_callback", access=py_trees.common.Access.WRITE)
     bb.scene_edit_callback = on_scene_edit
 
     def refresh_viser_scene():
         hmi.scene_renderer.clear()
-        if runner.program:
-            hmi.scene_renderer.load_from_program(runner.program.scene)
+        hmi.sync_scene_from_backend()
+        hmi.sync_robot_from_backend(force=True)
 
+    cycle_manager.reset()
+    initial_positions = _load_simulator_initial_joint_positions()
+    if initial_positions:
+        bundle.set_joint_positions(initial_positions)
+        print("Applied simulator-only initial joint positions from deployment.", flush=True)
     cycle_manager._on_run_from_idle = refresh_viser_scene
+    hmi.sync_scene_from_backend()
+    hmi.sync_robot_from_backend(force=True)
 
-    # --- 6. Start HMI and wait ---
+    # --- 5. Start HMI and wait ---
     hmi.start()
     print()
     print("Open the Viser URL in your browser to see the 3D scene.")

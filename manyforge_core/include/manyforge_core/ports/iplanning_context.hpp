@@ -2,7 +2,9 @@
 
 #include <string>
 
+#include <manyforge_core/types/error_code.hpp>
 #include <manyforge_core/types/geometry.hpp>
+#include <manyforge_core/types/motion_spec.hpp>
 #include <manyforge_core/types/robot_state.hpp>
 #include <manyforge_core/types/trajectory_dto.hpp>
 #include <manyforge_core/types/validation.hpp>
@@ -59,6 +61,34 @@ class IPlanningContext {
     /// @return Pose3DTO with the computed pose
     virtual Pose3DTO forward_kinematics(const FkRequestDTO& request) = 0;
 
+    /// Get the current pose of a runtime scene object in the requested base frame.
+    ///
+    /// This is a backend-authoritative object query surface intended for
+    /// object-relative runtime flows and live-connected HMI reconciliation.
+    ///
+    /// @param object_id Stable object identifier in the backend-owned scene
+    /// @param base_frame Requested reference frame for the returned pose
+    /// @return Pose3DTO with the current object pose
+    virtual Pose3DTO get_object_pose(const std::string& object_id,
+                                     const std::string& base_frame) = 0;
+
+    /// Get the current backend-owned existence/attachment state of an object.
+    ///
+    /// @param object_id Stable object identifier in the backend-owned scene
+    /// @return ObjectStateDTO with existence, attachment, and frame identity
+    virtual ObjectStateDTO get_object_state(const std::string& object_id) = 0;
+
+    /// Resolve a reference to a backend-authoritative pose in the requested base frame.
+    ///
+    /// This is the execute-time reference-resolution contract for relative/object-based
+    /// motion requests. It MUST resolve against the backend-owned current state/scene.
+    ///
+    /// @param reference The frame/object/link reference to resolve
+    /// @param base_frame Requested reference frame for the returned pose
+    /// @return Result<Pose3DTO> with structured missing/ambiguous reference errors
+    virtual Result<Pose3DTO> resolve_reference_pose(const ReferenceDTO& reference,
+                                                    const std::string& base_frame) = 0;
+
     /// Get joint limits for a robot/group (spec 220 §3)
     /// 
     /// @param robot_id The robot identifier
@@ -84,6 +114,19 @@ class IPlanningContext {
     /// @param request The update object pose request
     /// @return SceneEditResultDTO indicating success/failure
     virtual SceneEditResultDTO update_object_pose(const UpdateObjectPoseRequestDTO& request) = 0;
+
+    /// Attach/reparent an object into a new frame while preserving its current world pose.
+    ///
+    /// @param request The attach request with target frame
+    /// @return SceneEditResultDTO indicating success/failure
+    virtual SceneEditResultDTO attach_object(const AttachObjectRequestDTO& request) = 0;
+
+    /// Detach/reparent an object into a target frame (typically "universe")
+    /// while preserving its current world pose.
+    ///
+    /// @param request The detach request with target frame
+    /// @return SceneEditResultDTO indicating success/failure
+    virtual SceneEditResultDTO detach_object(const DetachObjectRequestDTO& request) = 0;
 };
 
 }  // namespace manyforge::core

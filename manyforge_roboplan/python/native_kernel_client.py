@@ -5,6 +5,7 @@ Only 1 Python↔C++ boundary crossing per call (no trampolines).
 
 from __future__ import annotations
 
+import math
 from typing import Any, Dict, Optional
 
 from manyforge_behavior.kernel_client import (
@@ -15,6 +16,7 @@ from manyforge_behavior.kernel_client import (
     CommandResult,
     ExecutionStatus,
     ExecutionSnapshot,
+    ObjectState,
     SceneEditRequest,
     SceneEditResult,
     Trajectory,
@@ -35,6 +37,31 @@ _STATE_MAP = {
 }
 
 
+def _rpy_deg_to_xyzw(rpy_deg):
+    r, p, y = [math.radians(v) for v in rpy_deg]
+    cr, sr = math.cos(r / 2), math.sin(r / 2)
+    cp, sp = math.cos(p / 2), math.sin(p / 2)
+    cy, sy = math.cos(y / 2), math.sin(y / 2)
+    return [
+        sr * cp * cy - cr * sp * sy,
+        cr * sp * cy + sr * cp * sy,
+        cr * cp * sy - sr * sp * cy,
+        cr * cp * cy + sr * sp * sy,
+    ]
+
+
+def _normalize_pose_dict(pose: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if pose is None:
+        return None
+    if "orientation_rpy_deg" in pose and "orientation_xyzw" not in pose:
+        normalized = dict(pose)
+        normalized["orientation_xyzw"] = _rpy_deg_to_xyzw(
+            normalized.pop("orientation_rpy_deg")
+        )
+        return normalized
+    return pose
+
+
 class NativeKernelClient(KernelClient):
     """KernelClient backed by an all-C++ NativeKernelBundle.
 
@@ -51,6 +78,11 @@ class NativeKernelClient(KernelClient):
         self._bundle = bundle
 
     def execute(self, request: ExecuteRequest) -> ExecuteResult:
+        relative_move = request.relative_move
+        if relative_move is not None:
+            relative_move = dict(relative_move)
+            relative_move["offset"] = _normalize_pose_dict(relative_move.get("offset"))
+
         req_dict = {
             "robot_id": request.robot_id,
             "group_id": request.group_id,
@@ -74,6 +106,8 @@ class NativeKernelClient(KernelClient):
             req_dict["joint_goal_positions_rad"] = request.joint_goal_positions_rad
         elif request.motion_type == "pose_goal":
             req_dict["pose_goal"] = request.pose_goal
+        elif request.motion_type == "relative_move":
+            req_dict["relative_move"] = relative_move
 
         result = self._bundle.execute(req_dict)
 
@@ -123,6 +157,12 @@ class NativeKernelClient(KernelClient):
 
     def get_metrics(self) -> Dict[str, int]:
         return dict(self._bundle.get_metrics())
+
+    def get_scene_trace(self, limit: Optional[int] = None) -> list[dict]:
+        return list(self._bundle.get_scene_trace(-1 if limit is None else int(limit)))
+
+    def clear_scene_trace(self) -> None:
+        self._bundle.clear_scene_trace()
 
     def invalidate_trajectories(self) -> None:
         self._bundle.invalidate_trajectories()
@@ -177,3 +217,23 @@ class NativeKernelClient(KernelClient):
             "position_m": list(result["position_m"]),
             "orientation_xyzw": list(result["orientation_xyzw"]),
         }
+
+    def get_object_pose(
+        self, object_id: str, base_frame: str
+    ) -> Optional[Dict[str, Any]]:
+        result = self._bundle.get_object_pose(object_id, base_frame)
+        if result is None:
+            return None
+        return {
+            "position_m": list(result["position_m"]),
+            "orientation_xyzw": list(result["orientation_xyzw"]),
+        }
+
+    def get_object_state(self, object_id: str) -> ObjectState:
+        result = self._bundle.get_object_state(object_id)
+        return ObjectState(
+            object_id=result.get("object_id", object_id),
+            exists=result.get("exists", False),
+            attached=result.get("attached", False),
+            frame_id=result.get("frame_id"),
+        )

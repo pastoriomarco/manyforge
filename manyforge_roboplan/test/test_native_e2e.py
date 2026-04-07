@@ -26,6 +26,7 @@ UR5_JOINTS = [
 
 GOAL_A = [0.1, -0.5, 0.5, -0.5, -0.5, 0.0]
 GOAL_B = [0.3, -0.8, 0.8, -0.3, -0.8, 0.1]
+DEMO_REST = [0.0, -1.57, 1.57, -1.57, -1.57, 0.0]
 
 
 # ============================================================================
@@ -50,6 +51,35 @@ def make_request(move_id, goal, cache_mode="default"):
         motion_type="joint_goal",
         joint_goal_names=UR5_JOINTS,
         joint_goal_positions_rad=goal,
+        velocity_scale=1.0,
+        acceleration_scale=1.0,
+        planning_timeout_s=10.0,
+        execution_timeout_s=30.0,
+        cache_mode=cache_mode,
+    )
+
+
+def make_relative_request(
+    move_id,
+    object_id,
+    offset_position_m,
+    offset_orientation_rpy_deg,
+    cache_mode="disable",
+):
+    return ExecuteRequest(
+        robot_id="robot1",
+        group_id="arm",
+        move_id=move_id,
+        base_frame="base_link",
+        tcp_frame="tool0",
+        motion_type="relative_move",
+        relative_move={
+            "reference": {"type": "object", "id": object_id},
+            "offset": {
+                "position_m": list(offset_position_m),
+                "orientation_rpy_deg": list(offset_orientation_rpy_deg),
+            },
+        },
         velocity_scale=1.0,
         acceleration_scale=1.0,
         planning_timeout_s=10.0,
@@ -96,6 +126,11 @@ def get_cached_duration_s(native_kernel, move_id):
 def reset_to_home(native_kernel):
     native_kernel.reset()
     native_kernel._bundle.set_joint_positions([0.0] * len(UR5_JOINTS))
+
+
+def reset_to_demo_rest(native_kernel):
+    native_kernel.reset()
+    native_kernel._bundle.set_joint_positions(DEMO_REST)
 
 
 # ============================================================================
@@ -148,6 +183,12 @@ class TestNativeKernelBasics:
         metrics = native_kernel.get_metrics()
         assert metrics["snapshots_published"] > 0
         assert metrics["observer_lag_max_ns"] > 0
+
+    def test_set_joint_positions_refreshes_idle_execution_snapshot(self, native_kernel):
+        native_kernel._bundle.set_joint_positions(DEMO_REST)
+        snapshot = native_kernel.get_execution_snapshot()
+        assert snapshot.state == ExecutionState.IDLE
+        assert snapshot.joint_positions_rad == pytest.approx(DEMO_REST)
 
     def test_reset_to_idle(self, native_kernel):
         native_kernel.execute(make_request("native_reset", GOAL_A))
@@ -234,6 +275,190 @@ class TestNativeSceneEdits:
         assert "orientation_xyzw" in pose
         assert len(pose["position_m"]) == 3
         assert len(pose["orientation_xyzw"]) == 4
+
+    def test_get_object_pose_and_state(self, native_kernel):
+        result = native_kernel.scene_edit(SceneEditRequest(
+            operation="add", object_id="query_box", shape_type="box",
+            box_dimensions_m=[0.1, 0.2, 0.3],
+            pose_position_m=[0.45, -0.1, 0.55],
+            pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
+            frame_id="universe",
+        ))
+        assert result.success is True
+
+        pose = native_kernel.get_object_pose("query_box", "universe")
+        assert pose is not None
+        assert pose["position_m"] == [0.45, -0.1, 0.55]
+        assert pose["orientation_xyzw"] == [0.0, 0.0, 0.0, 1.0]
+
+        state = native_kernel.get_object_state("query_box")
+        assert state.object_id == "query_box"
+        assert state.exists is True
+        assert state.attached is False
+        assert state.frame_id == "universe"
+
+    def test_attached_frame_object_pose_follows_backend_link_frame(self, native_kernel):
+        link_pose = native_kernel.get_link_pose("tool0", "universe")
+        assert link_pose is not None
+
+        result = native_kernel.scene_edit(SceneEditRequest(
+            operation="add", object_id="query_box_attached", shape_type="box",
+            box_dimensions_m=[0.05, 0.05, 0.05],
+            pose_position_m=[0.0, 0.0, 0.0],
+            pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
+            frame_id="tool0",
+        ))
+        assert result.success is True
+
+        pose = native_kernel.get_object_pose("query_box_attached", "universe")
+        assert pose is not None
+        for actual, expected in zip(pose["position_m"], link_pose["position_m"]):
+            assert actual == pytest.approx(expected, abs=1e-6)
+
+        state = native_kernel.get_object_state("query_box_attached")
+        assert state.exists is True
+        assert state.attached is True
+        assert state.frame_id == "tool0"
+
+    def test_scene_edit_attach_preserves_world_pose_with_stable_object_id(self, native_kernel):
+        add_result = native_kernel.scene_edit(SceneEditRequest(
+            operation="add", object_id="attach_box", shape_type="box",
+            box_dimensions_m=[0.05, 0.05, 0.05],
+            pose_position_m=[0.42, -0.08, 0.52],
+            pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
+            frame_id="universe",
+        ))
+        assert add_result.success is True
+        pose_before = native_kernel.get_object_pose("attach_box", "universe")
+        assert pose_before is not None
+
+        attach_result = native_kernel.scene_edit(SceneEditRequest(
+            operation="attach", object_id="attach_box", frame_id="tool0"
+        ))
+        assert attach_result.success is True
+
+        state = native_kernel.get_object_state("attach_box")
+        assert state.exists is True
+        assert state.attached is True
+        assert state.frame_id == "tool0"
+        pose_after = native_kernel.get_object_pose("attach_box", "universe")
+        assert pose_after is not None
+        for actual, expected in zip(pose_after["position_m"], pose_before["position_m"]):
+            assert actual == pytest.approx(expected, abs=1e-6)
+
+    def test_scene_edit_detach_preserves_world_pose_with_stable_object_id(self, native_kernel):
+        add_result = native_kernel.scene_edit(SceneEditRequest(
+            operation="add", object_id="detach_box", shape_type="box",
+            box_dimensions_m=[0.05, 0.05, 0.05],
+            pose_position_m=[0.01, 0.0, 0.0],
+            pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
+            frame_id="tool0",
+        ))
+        assert add_result.success is True
+        pose_before = native_kernel.get_object_pose("detach_box", "universe")
+        assert pose_before is not None
+
+        detach_result = native_kernel.scene_edit(SceneEditRequest(
+            operation="detach", object_id="detach_box", frame_id="universe"
+        ))
+        assert detach_result.success is True
+
+        state = native_kernel.get_object_state("detach_box")
+        assert state.exists is True
+        assert state.attached is False
+        assert state.frame_id == "universe"
+        pose_after = native_kernel.get_object_pose("detach_box", "universe")
+        assert pose_after is not None
+        for actual, expected in zip(pose_after["position_m"], pose_before["position_m"]):
+            assert actual == pytest.approx(expected, abs=1e-6)
+
+    def test_scene_trace_reports_backend_scene_mutations(self, native_kernel):
+        native_kernel.clear_scene_trace()
+        native_kernel.scene_edit(SceneEditRequest(
+            operation="add", object_id="trace_box", shape_type="box",
+            box_dimensions_m=[0.05, 0.05, 0.05],
+            pose_position_m=[0.42, -0.08, 0.52],
+            pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
+            frame_id="universe",
+        ))
+        native_kernel.scene_edit(SceneEditRequest(
+            operation="attach", object_id="trace_box", frame_id="tool0"
+        ))
+        trace = native_kernel.get_scene_trace()
+        assert [event["event"] for event in trace][-2:] == ["add", "attach"]
+        assert trace[-1]["source"] == "backend"
+        assert trace[-1]["success"] is True
+        assert trace[-1]["frame_id"] == "tool0"
+        assert trace[-1]["pose_in_frame"] is not None
+        assert trace[-1]["pose_in_universe"] is not None
+
+    def test_relative_move_resolves_object_reference_at_execute_time(self, native_kernel):
+        reset_to_demo_rest(native_kernel)
+        native_kernel.scene_edit(SceneEditRequest(
+            operation="add", object_id="ref_box", shape_type="box",
+            box_dimensions_m=[0.05, 0.05, 0.05],
+            pose_position_m=[0.3, -0.3, 0.15],
+            pose_orientation_xyzw=[0.0, 0.0, -0.38268343, 0.92387953],
+            frame_id="universe",
+        ))
+
+        result = native_kernel.execute(
+            make_relative_request(
+                "native_relative_object",
+                "ref_box",
+                [0.0, 0.0, 0.10],
+                [180.0, 0.0, -90.0],
+            )
+        )
+        assert result.ok is True
+        terminal = wait_for_terminal(native_kernel)
+        assert terminal.state == ExecutionState.COMPLETED
+
+        pose = native_kernel.get_link_pose("tool0", "universe")
+        assert pose is not None
+        assert pose["position_m"][0] == pytest.approx(0.3, abs=0.03)
+        assert pose["position_m"][1] == pytest.approx(-0.3, abs=0.03)
+        assert pose["position_m"][2] == pytest.approx(0.25, abs=0.03)
+
+    def test_relative_move_recomputes_goal_after_object_pose_changes(self, native_kernel):
+        reset_to_demo_rest(native_kernel)
+        native_kernel.scene_edit(SceneEditRequest(
+            operation="add", object_id="dynamic_box", shape_type="box",
+            box_dimensions_m=[0.05, 0.05, 0.05],
+            pose_position_m=[0.3, -0.3, 0.15],
+            pose_orientation_xyzw=[0.0, 0.0, -0.38268343, 0.92387953],
+            frame_id="universe",
+        ))
+
+        req = make_relative_request(
+            "native_relative_dynamic",
+            "dynamic_box",
+            [0.0, 0.0, 0.10],
+            [180.0, 0.0, -90.0],
+        )
+        result = native_kernel.execute(req)
+        assert result.ok is True
+        assert wait_for_terminal(native_kernel).state == ExecutionState.COMPLETED
+        pose_a = native_kernel.get_link_pose("tool0", "universe")
+        assert pose_a is not None
+
+        reset_to_demo_rest(native_kernel)
+        native_kernel.scene_edit(SceneEditRequest(
+            operation="update_pose", object_id="dynamic_box",
+            pose_position_m=[0.38, -0.18, 0.15],
+            pose_orientation_xyzw=[0.0, 0.0, -0.38268343, 0.92387953],
+            frame_id="universe",
+        ))
+        result = native_kernel.execute(req)
+        assert result.ok is True
+        assert wait_for_terminal(native_kernel).state == ExecutionState.COMPLETED
+        pose_b = native_kernel.get_link_pose("tool0", "universe")
+        assert pose_b is not None
+
+        assert pose_a["position_m"][0] == pytest.approx(0.3, abs=0.03)
+        assert pose_a["position_m"][1] == pytest.approx(-0.3, abs=0.03)
+        assert pose_b["position_m"][0] == pytest.approx(0.38, abs=0.03)
+        assert pose_b["position_m"][1] == pytest.approx(-0.18, abs=0.03)
 
 
 # ============================================================================

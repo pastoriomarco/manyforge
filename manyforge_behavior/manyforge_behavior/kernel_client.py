@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional
+import math
+import time
+from typing import Any, Deque, Dict, List, Optional
 
 
 class ExecutionState(Enum):
@@ -27,10 +30,11 @@ class ExecuteRequest:
     move_id: str
     base_frame: str
     tcp_frame: str
-    motion_type: str  # "joint_goal" or "pose_goal"
+    motion_type: str  # "joint_goal", "pose_goal", or "relative_move"
     joint_goal_names: List[str] = field(default_factory=list)
     joint_goal_positions_rad: List[float] = field(default_factory=list)
     pose_goal: Optional[Dict[str, Any]] = None
+    relative_move: Optional[Dict[str, Any]] = None
     velocity_scale: float = 1.0
     acceleration_scale: float = 1.0
     max_tcp_linear_speed_mps: Optional[float] = None
@@ -60,6 +64,14 @@ class ExecutionSnapshot:
     progress: float = 0.0
     joint_positions_rad: List[float] = field(default_factory=list)
     error: Optional[str] = None
+
+
+@dataclass
+class ObjectState:
+    object_id: str = ""
+    exists: bool = False
+    attached: bool = False
+    frame_id: Optional[str] = None
 
 
 @dataclass
@@ -93,7 +105,7 @@ class Trajectory:
 
 @dataclass
 class SceneEditRequest:
-    operation: str  # "add", "remove", "update_pose"
+    operation: str  # "add", "remove", "update_pose", "attach", "detach"
     object_id: str
     shape_type: Optional[str] = None
     box_dimensions_m: Optional[List[float]] = None
@@ -107,6 +119,69 @@ class SceneEditRequest:
 class SceneEditResult:
     success: bool = False
     error: Optional[str] = None
+
+
+def _pose_to_matrix(pos: List[float], orient_xyzw: List[float]) -> List[List[float]]:
+    """Build 4x4 matrix from position + quaternion (xyzw)."""
+    x, y, z, w = orient_xyzw
+    return [
+        [1 - 2 * y * y - 2 * z * z, 2 * x * y - 2 * z * w, 2 * x * z + 2 * y * w, pos[0]],
+        [2 * x * y + 2 * z * w, 1 - 2 * x * x - 2 * z * z, 2 * y * z - 2 * x * w, pos[1]],
+        [2 * x * z - 2 * y * w, 2 * y * z + 2 * x * w, 1 - 2 * x * x - 2 * y * y, pos[2]],
+        [0, 0, 0, 1],
+    ]
+
+
+def _matrix_to_pose(m: List[List[float]]) -> tuple[List[float], List[float]]:
+    """Extract position + quaternion (xyzw) from 4x4 matrix."""
+    pos = [m[0][3], m[1][3], m[2][3]]
+    trace = m[0][0] + m[1][1] + m[2][2]
+    if trace > 0:
+        s = math.sqrt(trace + 1.0) * 2
+        w = 0.25 * s
+        x = (m[2][1] - m[1][2]) / s
+        y = (m[0][2] - m[2][0]) / s
+        z = (m[1][0] - m[0][1]) / s
+    elif m[0][0] > m[1][1] and m[0][0] > m[2][2]:
+        s = math.sqrt(1.0 + m[0][0] - m[1][1] - m[2][2]) * 2
+        w = (m[2][1] - m[1][2]) / s
+        x = 0.25 * s
+        y = (m[0][1] + m[1][0]) / s
+        z = (m[0][2] + m[2][0]) / s
+    elif m[1][1] > m[2][2]:
+        s = math.sqrt(1.0 + m[1][1] - m[0][0] - m[2][2]) * 2
+        w = (m[0][2] - m[2][0]) / s
+        x = (m[0][1] + m[1][0]) / s
+        y = 0.25 * s
+        z = (m[1][2] + m[2][1]) / s
+    else:
+        s = math.sqrt(1.0 + m[2][2] - m[0][0] - m[1][1]) * 2
+        w = (m[1][0] - m[0][1]) / s
+        x = (m[0][2] + m[2][0]) / s
+        y = (m[1][2] + m[2][1]) / s
+        z = 0.25 * s
+    return pos, [x, y, z, w]
+
+
+def _multiply_matrices(a: List[List[float]], b: List[List[float]]) -> List[List[float]]:
+    """Multiply two 4x4 matrices."""
+    return [
+        [sum(a[i][k] * b[k][j] for k in range(4)) for j in range(4)]
+        for i in range(4)
+    ]
+
+
+def _invert_matrix(m: List[List[float]]) -> List[List[float]]:
+    """Invert a rigid 4x4 transform."""
+    rt = [[m[j][i] for j in range(3)] for i in range(3)]
+    t = [m[0][3], m[1][3], m[2][3]]
+    nt = [-(rt[i][0] * t[0] + rt[i][1] * t[1] + rt[i][2] * t[2]) for i in range(3)]
+    return [
+        [rt[0][0], rt[0][1], rt[0][2], nt[0]],
+        [rt[1][0], rt[1][1], rt[1][2], nt[1]],
+        [rt[2][0], rt[2][1], rt[2][2], nt[2]],
+        [0, 0, 0, 1],
+    ]
 
 
 class KernelClient(ABC):
@@ -142,6 +217,21 @@ class KernelClient(ABC):
         self, target_frame: str, base_frame: str
     ) -> Optional[Dict[str, Any]]: ...
 
+    @abstractmethod
+    def get_object_pose(
+        self, object_id: str, base_frame: str
+    ) -> Optional[Dict[str, Any]]: ...
+
+    @abstractmethod
+    def get_object_state(self, object_id: str) -> ObjectState: ...
+
+    def get_scene_trace(self, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Return recent backend scene trace events, newest last."""
+        return []
+
+    def clear_scene_trace(self) -> None:
+        """Clear any retained backend scene trace events."""
+
     def get_cached_trajectory(self, move_id: str) -> Optional[Trajectory]:
         """Get cached trajectory for a move. Returns None if not available."""
         return None
@@ -176,6 +266,35 @@ class MockKernelClient(KernelClient):
         # Allow tests to inject failures
         self.fail_next_execute = False
         self.fail_next_scene_edit = False
+        self._objects: Dict[str, Dict[str, Any]] = {}
+        self._scene_trace: Deque[Dict[str, Any]] = deque(maxlen=4096)
+
+    def _record_scene_trace(
+        self,
+        *,
+        event: str,
+        object_id: str,
+        success: bool,
+        frame_id: Optional[str] = None,
+        attached: Optional[bool] = None,
+        pose_in_frame: Optional[Dict[str, Any]] = None,
+        pose_in_universe: Optional[Dict[str, Any]] = None,
+        error: Optional[str] = None,
+    ) -> None:
+        self._scene_trace.append(
+            {
+                "timestamp_ns": time.monotonic_ns(),
+                "source": "backend",
+                "event": event,
+                "object_id": object_id,
+                "success": success,
+                "frame_id": frame_id,
+                "attached": attached,
+                "pose_in_frame": pose_in_frame,
+                "pose_in_universe": pose_in_universe,
+                "error": error,
+            }
+        )
 
     def execute(self, request: ExecuteRequest) -> ExecuteResult:
         import time
@@ -292,16 +411,228 @@ class MockKernelClient(KernelClient):
 
     def scene_edit(self, request: SceneEditRequest) -> SceneEditResult:
         self.scene_edits.append(request)
+        state_before = self.get_object_state(request.object_id)
+        pose_before = self.get_object_pose(request.object_id, "universe")
         if self.fail_next_scene_edit:
             self.fail_next_scene_edit = False
-            return SceneEditResult(success=False, error="Scene edit failed (injected)")
-        return SceneEditResult(success=True)
+            error = "Scene edit failed (injected)"
+            self._record_scene_trace(
+                event=request.operation,
+                object_id=request.object_id,
+                success=False,
+                frame_id=request.frame_id,
+                attached=state_before.attached if state_before.exists else None,
+                pose_in_frame=None,
+                pose_in_universe=pose_before,
+                error=error,
+            )
+            return SceneEditResult(success=False, error=error)
+        error: Optional[str] = None
+        if request.operation == "add":
+            self._objects[request.object_id] = {
+                "position_m": list(request.pose_position_m or [0.0, 0.0, 0.0]),
+                "orientation_xyzw": list(request.pose_orientation_xyzw or [0.0, 0.0, 0.0, 1.0]),
+                "frame_id": request.frame_id or "universe",
+            }
+        elif request.operation == "update_pose":
+            tracked = self._objects.setdefault(request.object_id, {})
+            tracked["position_m"] = list(request.pose_position_m or [0.0, 0.0, 0.0])
+            tracked["orientation_xyzw"] = list(
+                request.pose_orientation_xyzw or [0.0, 0.0, 0.0, 1.0]
+            )
+            tracked["frame_id"] = request.frame_id or tracked.get("frame_id", "universe")
+        elif request.operation == "remove":
+            self._objects.pop(request.object_id, None)
+        elif request.operation == "attach":
+            tracked = self._objects.get(request.object_id)
+            if tracked is None:
+                error = "Object not found"
+                self._record_scene_trace(
+                    event=request.operation,
+                    object_id=request.object_id,
+                    success=False,
+                    frame_id=request.frame_id,
+                    attached=state_before.attached if state_before.exists else None,
+                    pose_in_frame=None,
+                    pose_in_universe=pose_before,
+                    error=error,
+                )
+                return SceneEditResult(success=False, error=error)
+            target_frame = request.frame_id or "tool0"
+            world_pose = self.get_object_pose(request.object_id, "universe")
+            frame_pose = self.get_link_pose(target_frame, "universe")
+            if world_pose is None or frame_pose is None:
+                error = "Failed to resolve attach frames"
+                self._record_scene_trace(
+                    event=request.operation,
+                    object_id=request.object_id,
+                    success=False,
+                    frame_id=target_frame,
+                    attached=state_before.attached if state_before.exists else None,
+                    pose_in_frame=None,
+                    pose_in_universe=world_pose,
+                    error=error,
+                )
+                return SceneEditResult(success=False, error=error)
+            t_frame = _pose_to_matrix(
+                list(frame_pose["position_m"]),
+                list(frame_pose["orientation_xyzw"]),
+            )
+            t_world_object = _pose_to_matrix(
+                list(world_pose["position_m"]),
+                list(world_pose["orientation_xyzw"]),
+            )
+            local_pos, local_orient = _matrix_to_pose(
+                _multiply_matrices(_invert_matrix(t_frame), t_world_object)
+            )
+            tracked["position_m"] = local_pos
+            tracked["orientation_xyzw"] = local_orient
+            tracked["frame_id"] = target_frame
+        elif request.operation == "detach":
+            tracked = self._objects.get(request.object_id)
+            if tracked is None:
+                error = "Object not found"
+                self._record_scene_trace(
+                    event=request.operation,
+                    object_id=request.object_id,
+                    success=False,
+                    frame_id=request.frame_id,
+                    attached=state_before.attached if state_before.exists else None,
+                    pose_in_frame=None,
+                    pose_in_universe=pose_before,
+                    error=error,
+                )
+                return SceneEditResult(success=False, error=error)
+            target_frame = request.frame_id or "universe"
+            world_pose = self.get_object_pose(request.object_id, "universe")
+            if world_pose is None:
+                error = "Failed to resolve world pose"
+                self._record_scene_trace(
+                    event=request.operation,
+                    object_id=request.object_id,
+                    success=False,
+                    frame_id=target_frame,
+                    attached=state_before.attached if state_before.exists else None,
+                    pose_in_frame=None,
+                    pose_in_universe=None,
+                    error=error,
+                )
+                return SceneEditResult(success=False, error=error)
+            if target_frame == "universe":
+                tracked["position_m"] = list(world_pose["position_m"])
+                tracked["orientation_xyzw"] = list(world_pose["orientation_xyzw"])
+                tracked["frame_id"] = target_frame
+            else:
+                frame_pose = self.get_link_pose(target_frame, "universe")
+                if frame_pose is None:
+                    error = "Failed to resolve detach frame"
+                    self._record_scene_trace(
+                        event=request.operation,
+                        object_id=request.object_id,
+                        success=False,
+                        frame_id=target_frame,
+                        attached=state_before.attached if state_before.exists else None,
+                        pose_in_frame=None,
+                        pose_in_universe=world_pose,
+                        error=error,
+                    )
+                    return SceneEditResult(success=False, error=error)
+                t_frame = _pose_to_matrix(
+                    list(frame_pose["position_m"]),
+                    list(frame_pose["orientation_xyzw"]),
+                )
+                t_world_object = _pose_to_matrix(
+                    list(world_pose["position_m"]),
+                    list(world_pose["orientation_xyzw"]),
+                )
+                local_pos, local_orient = _matrix_to_pose(
+                    _multiply_matrices(_invert_matrix(t_frame), t_world_object)
+                )
+                tracked["position_m"] = local_pos
+                tracked["orientation_xyzw"] = local_orient
+                tracked["frame_id"] = target_frame
+        result = SceneEditResult(success=True)
+        state_after = self.get_object_state(request.object_id)
+        pose_in_frame = None
+        pose_in_universe = None
+        frame_id = request.frame_id
+        attached = None
+        if request.operation == "remove":
+            frame_id = state_before.frame_id
+            attached = state_before.attached if state_before.exists else None
+            pose_in_universe = pose_before
+        elif state_after.exists:
+            frame_id = state_after.frame_id
+            attached = state_after.attached
+            if frame_id is not None:
+                pose_in_frame = self.get_object_pose(request.object_id, frame_id)
+            pose_in_universe = self.get_object_pose(request.object_id, "universe")
+        self._record_scene_trace(
+            event=request.operation,
+            object_id=request.object_id,
+            success=True,
+            frame_id=frame_id,
+            attached=attached,
+            pose_in_frame=pose_in_frame,
+            pose_in_universe=pose_in_universe,
+        )
+        return result
 
     def get_link_pose(
         self, target_frame: str, base_frame: str
     ) -> Optional[Dict[str, Any]]:
         self.link_pose_calls.append((target_frame, base_frame))
+        if target_frame in ("", "universe", base_frame, "base_link"):
+            return {
+                "position_m": [0.0, 0.0, 0.0],
+                "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+            }
         return {
             "position_m": [0.5, 0.0, 0.6],
             "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
         }
+
+    def get_object_pose(
+        self, object_id: str, base_frame: str
+    ) -> Optional[Dict[str, Any]]:
+        tracked = self._objects.get(object_id)
+        if tracked is None:
+            return None
+        position = list(tracked.get("position_m", [0.0, 0.0, 0.0]))
+        orientation = list(tracked.get("orientation_xyzw", [0.0, 0.0, 0.0, 1.0]))
+        frame_id = tracked.get("frame_id", "universe")
+        if frame_id not in ("", "universe", base_frame):
+            frame_pose = self.get_link_pose(frame_id, base_frame)
+            if frame_pose is None:
+                return None
+            t_frame = _pose_to_matrix(
+                list(frame_pose["position_m"]),
+                list(frame_pose["orientation_xyzw"]),
+            )
+            t_local = _pose_to_matrix(position, orientation)
+            position, orientation = _matrix_to_pose(_multiply_matrices(t_frame, t_local))
+        return {
+            "position_m": position,
+            "orientation_xyzw": orientation,
+        }
+
+    def get_object_state(self, object_id: str) -> ObjectState:
+        tracked = self._objects.get(object_id)
+        if tracked is None:
+            return ObjectState(object_id=object_id)
+        frame_id = tracked.get("frame_id", "universe")
+        return ObjectState(
+            object_id=object_id,
+            exists=True,
+            attached=frame_id not in ("", "universe", "base_link"),
+            frame_id=frame_id,
+        )
+
+    def get_scene_trace(self, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        trace = list(self._scene_trace)
+        if limit is not None and limit >= 0:
+            return trace[-limit:]
+        return trace
+
+    def clear_scene_trace(self) -> None:
+        self._scene_trace.clear()

@@ -1,9 +1,10 @@
 """SceneRenderer - Renders collision objects in the 3D scene."""
 
 import math
-
-import viser
 from typing import Optional
+
+import numpy as np
+import viser
 
 
 class SceneRenderer:
@@ -21,6 +22,39 @@ class SceneRenderer:
         """
         self._server = server
         self._objects: dict[str, str] = {}  # object_id -> scene name
+        self._render_state: dict[str, tuple] = {}
+
+    @staticmethod
+    def _position_close(
+        lhs: tuple[float, float, float],
+        rhs: tuple[float, float, float],
+        *,
+        atol: float = 1e-9,
+    ) -> bool:
+        return bool(np.allclose(lhs, rhs, atol=atol, rtol=0.0))
+
+    @staticmethod
+    def _orientation_close(
+        lhs: tuple[float, float, float, float],
+        rhs: tuple[float, float, float, float],
+        *,
+        atol: float = 1e-9,
+    ) -> bool:
+        lhs_arr = np.asarray(lhs, dtype=float)
+        rhs_arr = np.asarray(rhs, dtype=float)
+        return bool(
+            np.allclose(lhs_arr, rhs_arr, atol=atol, rtol=0.0)
+            or np.allclose(lhs_arr, -rhs_arr, atol=atol, rtol=0.0)
+        )
+
+    @staticmethod
+    def _scene_name_for(object_id: str, frame_path: Optional[str]) -> str:
+        return f"{frame_path}/{object_id}" if frame_path else f"/scene/{object_id}"
+
+    @property
+    def object_ids(self) -> list[str]:
+        """Return currently-rendered object ids."""
+        return list(self._objects.keys())
 
     @staticmethod
     def _rpy_deg_to_xyzw(rpy_deg: list[float]) -> tuple[float, float, float, float]:
@@ -104,6 +138,24 @@ class SceneRenderer:
         )
         self._objects[object_id] = scene_name
 
+    def add_sphere_on_frame(
+        self,
+        object_id: str,
+        frame_path: str,
+        radius_m: float,
+        position_m: tuple[float, float, float],
+        color: tuple[int, int, int] = (50, 200, 50),
+    ) -> None:
+        """Add a sphere as a child of a Viser scene frame."""
+        scene_name = f"{frame_path}/{object_id}"
+        self._server.scene.add_icosphere(
+            name=scene_name,
+            radius=radius_m,
+            color=color,
+            position=position_m,
+        )
+        self._objects[object_id] = scene_name
+
     def add_box_on_frame(
         self,
         object_id: str,
@@ -135,16 +187,171 @@ class SceneRenderer:
         )
         self._objects[object_id] = scene_name
 
-    def remove_object(self, object_id: str) -> None:
+    def remove_object(self, object_id: str) -> dict:
         """Remove an object from the scene.
 
         Args:
             object_id: The object identifier to remove.
         """
+        scene_name = self._objects.get(object_id)
+        removed = False
         if object_id in self._objects:
-            scene_name = self._objects[object_id]
             self._server.scene.remove_by_name(scene_name)
             del self._objects[object_id]
+            removed = True
+        self._render_state.pop(object_id, None)
+        return {
+            "action": "remove" if removed else "noop",
+            "object_id": object_id,
+            "scene_name": scene_name,
+            "scene_node_present": (
+                self._server.scene.get_handle_by_name(scene_name) is not None
+                if scene_name else False
+            ),
+        }
+
+    def get_render_info(self, object_id: str) -> dict:
+        """Return renderer-side diagnostics for an object."""
+        scene_name = self._objects.get(object_id)
+        handle = self._server.scene.get_handle_by_name(scene_name) if scene_name else None
+        return {
+            "object_id": object_id,
+            "scene_name": scene_name,
+            "render_state": self._render_state.get(object_id),
+            "scene_node_present": handle is not None,
+        }
+
+    def sync_box(
+        self,
+        object_id: str,
+        dimensions_m: tuple[float, float, float],
+        position_m: tuple[float, float, float],
+        orientation_xyzw: tuple[float, float, float, float],
+        *,
+        frame_path: Optional[str] = None,
+        color: tuple[int, int, int] = (200, 100, 50),
+    ) -> dict:
+        """Render or update a box only when its authoritative state changes."""
+        scene_name = self._scene_name_for(object_id, frame_path)
+        render_state = ("box", frame_path, dimensions_m, position_m, orientation_xyzw, color)
+        previous_state = self._render_state.get(object_id)
+        previous_scene_name = self._objects.get(object_id)
+        handle = (
+            self._server.scene.get_handle_by_name(previous_scene_name)
+            if previous_scene_name else None
+        )
+
+        if (
+            previous_state is not None
+            and previous_state[0] == "box"
+            and previous_scene_name == scene_name
+            and previous_state[2] == dimensions_m
+            and previous_state[5] == color
+            and handle is not None
+        ):
+            position_changed = not self._position_close(previous_state[3], position_m)
+            orientation_changed = not self._orientation_close(previous_state[4], orientation_xyzw)
+            if position_changed:
+                handle.position = position_m
+            if orientation_changed:
+                handle.wxyz = self._xyzw_to_wxyz(orientation_xyzw)
+            self._render_state[object_id] = render_state
+            return {
+                "action": "updated_pose" if position_changed or orientation_changed else "unchanged",
+                "object_id": object_id,
+                "scene_name": scene_name,
+                "scene_node_present": True,
+            }
+
+        if previous_state == render_state:
+            return {
+                "action": "unchanged",
+                "object_id": object_id,
+                "scene_name": scene_name,
+                "scene_node_present": handle is not None,
+            }
+
+        removal = self.remove_object(object_id)
+        if frame_path:
+            self.add_box_on_frame(
+                object_id, frame_path, dimensions_m, position_m, orientation_xyzw, color
+            )
+        else:
+            self.add_box(object_id, dimensions_m, position_m, orientation_xyzw, color)
+        self._render_state[object_id] = render_state
+        return {
+            "action": "rendered",
+            "object_id": object_id,
+            "scene_name": scene_name,
+            "previous_scene_name": removal.get("scene_name"),
+            "scene_node_present": (
+                self._server.scene.get_handle_by_name(scene_name) is not None
+                if scene_name else False
+            ),
+        }
+
+    def sync_sphere(
+        self,
+        object_id: str,
+        radius_m: float,
+        position_m: tuple[float, float, float],
+        *,
+        frame_path: Optional[str] = None,
+        color: tuple[int, int, int] = (50, 200, 50),
+    ) -> dict:
+        """Render or update a sphere only when its authoritative state changes."""
+        scene_name = self._scene_name_for(object_id, frame_path)
+        render_state = ("sphere", frame_path, radius_m, position_m, color)
+        previous_state = self._render_state.get(object_id)
+        previous_scene_name = self._objects.get(object_id)
+        handle = (
+            self._server.scene.get_handle_by_name(previous_scene_name)
+            if previous_scene_name else None
+        )
+
+        if (
+            previous_state is not None
+            and previous_state[0] == "sphere"
+            and previous_scene_name == scene_name
+            and previous_state[2] == radius_m
+            and previous_state[4] == color
+            and handle is not None
+        ):
+            position_changed = not self._position_close(previous_state[3], position_m)
+            if position_changed:
+                handle.position = position_m
+            self._render_state[object_id] = render_state
+            return {
+                "action": "updated_pose" if position_changed else "unchanged",
+                "object_id": object_id,
+                "scene_name": scene_name,
+                "scene_node_present": True,
+            }
+
+        if previous_state == render_state:
+            return {
+                "action": "unchanged",
+                "object_id": object_id,
+                "scene_name": scene_name,
+                "scene_node_present": handle is not None,
+            }
+
+        removal = self.remove_object(object_id)
+        if frame_path:
+            self.add_sphere_on_frame(object_id, frame_path, radius_m, position_m, color)
+        else:
+            self.add_sphere(object_id, radius_m, position_m, color)
+        self._render_state[object_id] = render_state
+        return {
+            "action": "rendered",
+            "object_id": object_id,
+            "scene_name": scene_name,
+            "previous_scene_name": removal.get("scene_name"),
+            "scene_node_present": (
+                self._server.scene.get_handle_by_name(scene_name) is not None
+                if scene_name else False
+            ),
+        }
 
     def load_from_program(self, scene_resources: list) -> None:
         """Load all scene objects from a Program's scene list.

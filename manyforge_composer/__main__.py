@@ -14,19 +14,28 @@ from manyforge_composer.backend.app import create_app
 
 logger = logging.getLogger(__name__)
 
-# UR5 joint names and rest pose (from manymove bt_client_ur.cpp)
+# UR5 joint names
 JOINT_NAMES = [
     "shoulder_pan_joint", "shoulder_lift_joint", "elbow_joint",
     "wrist_1_joint", "wrist_2_joint", "wrist_3_joint",
 ]
-REST_POSE = {
-    "shoulder_pan_joint": 0.0,
-    "shoulder_lift_joint": -1.57,
-    "elbow_joint": 1.57,
-    "wrist_1_joint": -1.57,
-    "wrist_2_joint": -1.57,
-    "wrist_3_joint": 0.0,
-}
+
+
+def _get_simulator_initial_joint_positions(state: ComposerState) -> list[float] | None:
+    """Return explicit simulator-only startup joint positions from deployment config."""
+    if state.deployment is None:
+        return None
+    execution = state.deployment.adapters.get("execution")
+    if execution is None:
+        return None
+    if execution.adapter_id != "execution.roboplan_native":
+        return None
+    if execution.config.get("mode") != "simulated":
+        return None
+    positions = execution.config.get("initial_joint_positions_rad")
+    if not isinstance(positions, list) or not positions:
+        return None
+    return [float(v) for v in positions]
 
 
 def build_program_loaded_callback(
@@ -55,6 +64,7 @@ def build_program_loaded_callback(
         # Stop previous HMI if reloading a program
         if _hmi_server is not None:
             _hmi_server.stop()
+            st.hmi_server = None
 
         _hmi_server = hmi_server_factory(
             cycle_manager=st.cycle_manager,
@@ -64,71 +74,43 @@ def build_program_loaded_callback(
             joint_names=JOINT_NAMES,
             package_dirs=package_dirs or None,
         )
+        st.hmi_server = _hmi_server
         _hmi_server.load_program(st.program)
 
-        # Set initial joint positions (both planner and visualization)
-        if bundle is not None:
-            bundle.set_joint_positions(list(REST_POSE.values()))
-            logger.info("Set planner joint positions to rest pose")
-        if _hmi_server.robot_visualizer:
-            _hmi_server.robot_visualizer.update_joints(REST_POSE)
-
-        # --- Register scene_edit_callback for Viser scene sync ---
-        # Build link-name -> Viser scene path map for frame-attached objects
-        _link_viser_paths: dict[str, str] = {}
-        if _hmi_server.robot_visualizer:
-            try:
-                import viser.extras._urdf as _urdf_module
-                _urdf_scene = _hmi_server.robot_visualizer.viser_urdf._urdf.scene
-                if _urdf_scene is not None:
-                    for frame_name in ("tool0", "wrist_3_link"):
-                        try:
-                            _link_viser_paths[frame_name] = _urdf_module._viser_name_from_frame(
-                                _urdf_scene, frame_name, "/robot/visual"
-                            )
-                        except Exception:
-                            pass
-            except Exception:
-                pass
-
         def on_scene_edit(operation: str, request):
-            renderer = _hmi_server.scene_renderer
-            if operation == "remove":
-                renderer.remove_object(request.object_id)
-                logger.debug("Scene: removed '%s'", request.object_id)
-                return
-            # Add operation
-            frame = request.frame_id or "universe"
-            pos = tuple(request.pose_position_m or [0, 0, 0])
-            orient = tuple(request.pose_orientation_xyzw or [0, 0, 0, 1])
-            if frame != "universe":
-                viser_path = _link_viser_paths.get(frame)
-                if viser_path and request.shape_type == "box" and request.box_dimensions_m:
-                    renderer.add_box_on_frame(
-                        request.object_id, viser_path,
-                        tuple(request.box_dimensions_m), pos, orient,
-                    )
-                logger.debug("Scene: '%s' attached to %s", request.object_id, frame)
-                return
-            if request.shape_type == "box" and request.box_dimensions_m:
-                renderer.add_box(request.object_id, tuple(request.box_dimensions_m), pos, orient)
-            elif request.shape_type == "sphere" and request.sphere_radius_m:
-                renderer.add_sphere(request.object_id, request.sphere_radius_m, pos)
-            logger.debug("Scene: added '%s' at %s", operation, request.object_id)
+            _hmi_server.request_scene_sync(
+                reason="scene_edit_callback",
+                operation=operation,
+                object_id=request.object_id,
+            )
+            logger.debug("Scene invalidation requested after %s '%s'", operation, request.object_id)
 
         bb = py_trees.blackboard.Client(name="composer_scene_sync")
         bb.register_key(key="scene_edit_callback", access=py_trees.common.Access.WRITE)
         bb.scene_edit_callback = on_scene_edit
 
+        def _sync_runtime_views(force_robot: bool = False):
+            if _hmi_server and hasattr(_hmi_server, "sync_scene_from_backend"):
+                _hmi_server.sync_scene_from_backend()
+            if (
+                _hmi_server
+                and hasattr(_hmi_server, "sync_robot_from_backend")
+            ):
+                _hmi_server.sync_robot_from_backend(force=force_robot)
+
         # Reset Viser scene on each run from IDLE (e.g. after reset)
-        # so objects return to their initial YAML positions.
         def _refresh_viser_scene():
             if _hmi_server and _hmi_server.scene_renderer:
                 _hmi_server.scene_renderer.clear()
-                if st.program:
-                    _hmi_server.scene_renderer.load_from_program(st.program.scene)
+                _sync_runtime_views(force_robot=True)
 
         st.cycle_manager._on_run_from_idle = _refresh_viser_scene
+        st.cycle_manager.reset()
+        initial_positions = _get_simulator_initial_joint_positions(st)
+        if bundle is not None and initial_positions:
+            bundle.set_joint_positions(initial_positions)
+            logger.info("Applied simulator-only initial joint positions from deployment")
+        _sync_runtime_views(force_robot=True)
 
         _hmi_server.start()
         logger.info("Viser HMI started on port %d", hmi_port)

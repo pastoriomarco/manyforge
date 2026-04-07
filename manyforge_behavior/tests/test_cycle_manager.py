@@ -174,7 +174,7 @@ class TestCycleManagerReset:
         assert manager._tick_thread is None or not manager._tick_thread.is_alive()
     
     def test_reset_from_idle_is_noop(self, kernel):
-        """reset() from IDLE is a no-op."""
+        """reset() from IDLE prepares a fresh software/runtime cycle state."""
         runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
         manager = CycleManager(runner, kernel)
         
@@ -183,7 +183,9 @@ class TestCycleManagerReset:
         
         manager.reset()
         assert manager.state == CycleState.IDLE
-        # Reset count should not have increased
+        assert manager._tree is not None
+        assert kernel.get_object_state("table").exists is True
+        # Kernel reset is not used as a synthetic state-assignment path when already idle.
         assert kernel.reset_count == initial_reset_count
 
 
@@ -259,3 +261,20 @@ class TestCycleManagerProgramCompletion:
         
         # Kernel should have been called
         assert kernel.execute_count >= 1
+
+    def test_run_from_idle_after_completion_rebuilds_tree(self, kernel):
+        """A new run after terminal completion prepares a fresh cycle."""
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        manager = CycleManager(runner, kernel)
+
+        manager.run()
+        time.sleep(1.0)
+        first_tree = manager._tree
+        assert first_tree is not None
+        assert manager.state == CycleState.IDLE
+
+        manager.run()
+
+        assert manager.state == CycleState.RUNNING
+        assert manager._tree is not None
+        assert manager._tree is not first_tree

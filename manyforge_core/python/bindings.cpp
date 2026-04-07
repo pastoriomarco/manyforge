@@ -564,6 +564,23 @@ PYBIND11_MODULE(manyforge_core_py, m) {
             return py::str("UpdateObjectPoseRequestDTO(object_id='{}')").format(u.object_id);
         });
 
+    py::class_<manyforge::core::ObjectStateDTO>(m, "ObjectStateDTO")
+        .def(py::init<>())
+        .def(py::init<const std::string&, bool, bool, std::optional<std::string>>(),
+             py::arg("object_id"),
+             py::arg("exists"),
+             py::arg("attached"),
+             py::arg("frame_id") = std::nullopt)
+        .def_readwrite("object_id", &manyforge::core::ObjectStateDTO::object_id)
+        .def_readwrite("exists", &manyforge::core::ObjectStateDTO::exists)
+        .def_readwrite("attached", &manyforge::core::ObjectStateDTO::attached)
+        .def_readwrite("frame_id", &manyforge::core::ObjectStateDTO::frame_id)
+        .def("__repr__", [](const manyforge::core::ObjectStateDTO& o) {
+            return py::str("ObjectStateDTO(object_id='{}', exists={}, attached={}, frame_id={})")
+                .format(o.object_id, o.exists, o.attached,
+                        o.frame_id.has_value() ? py::cast(*o.frame_id) : py::none());
+        });
+
     py::class_<manyforge::core::SceneEditResultDTO>(m, "SceneEditResultDTO")
         .def(py::init<>())
         .def_readwrite("success", &manyforge::core::SceneEditResultDTO::success)

@@ -134,6 +134,16 @@ TEST(ContractsCompile, DefaultDTOs) {
   manyforge::core::UpdateObjectPoseRequestDTO update_object_pose_request;
   EXPECT_TRUE(update_object_pose_request.object_id.empty());
 
+  manyforge::core::AttachObjectRequestDTO attach_object_request;
+  EXPECT_TRUE(attach_object_request.object_id.empty());
+
+  manyforge::core::DetachObjectRequestDTO detach_object_request;
+  EXPECT_TRUE(detach_object_request.object_id.empty());
+
+  manyforge::core::ObjectStateDTO object_state;
+  EXPECT_FALSE(object_state.exists);
+  EXPECT_FALSE(object_state.attached);
+
   manyforge::core::SceneEditResultDTO scene_edit_result;
   EXPECT_FALSE(scene_edit_result.success);
   EXPECT_FALSE(scene_edit_result.error.has_value());

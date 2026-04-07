@@ -136,6 +136,24 @@ class TestStateBridge:
         snapshot = bridge.execution_snapshot
         assert isinstance(snapshot, ExecutionSnapshot)
 
+    def test_bridge_exposes_backend_object_queries(self):
+        """Object query surface is reachable through the bridge."""
+        self.kernel.scene_edit(SceneEditRequest(
+            operation="add",
+            object_id="box1",
+            pose_position_m=[0.3, 0.0, 0.2],
+            pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
+            frame_id="universe",
+        ))
+        bridge = StateBridge(self.cycle_manager)
+        pose = bridge.get_object_pose("box1", "base_link")
+        state = bridge.get_object_state("box1")
+
+        assert pose is not None
+        assert pose["position_m"] == [0.3, 0.0, 0.2]
+        assert state.exists is True
+        assert state.frame_id == "universe"
+
 
 # ============================================================================
 # ControlPanel Tests (uses Viser with port=0)
@@ -194,6 +212,26 @@ class TestControlPanel:
         panel.update(CycleState.RUNNING, 1.0)
         assert panel.run_button.enabled is False
 
+    def test_status_text_prefers_backend_snapshot(self, viser_server, cycle_manager):
+        """Visible status text is backend-first."""
+        bridge = StateBridge(cycle_manager)
+        panel = ControlPanel(viser_server, bridge)
+        snapshot = ExecutionSnapshot(
+            timestamp_ns=1,
+            sequence_number=2,
+            execution_id=3,
+            move_id="pick_move",
+            state=ExecutionState.EXECUTING,
+            progress=0.5,
+            joint_positions_rad=[],
+        )
+
+        panel.update(CycleState.RUNNING, 1.0, snapshot)
+
+        assert "Backend: EXECUTING" in panel.status_text.content
+        assert "Move: pick_move" in panel.status_text.content
+        assert "Progress: 50%" in panel.status_text.content
+
     def test_stop_button_enabled_when_running(self, viser_server, cycle_manager):
         """Test Stop button enabled state."""
         bridge = StateBridge(cycle_manager)
@@ -211,20 +249,20 @@ class TestControlPanel:
         panel.update(CycleState.STOPPED, 1.0)
         assert panel.stop_button.enabled is False
 
-    def test_reset_button_enabled_when_running_or_stopped(self, viser_server, cycle_manager):
+    def test_reset_button_enabled_in_all_cycle_states(self, viser_server, cycle_manager):
         """Test Reset button enabled state."""
         bridge = StateBridge(cycle_manager)
         panel = ControlPanel(viser_server, bridge)
 
-        # IDLE - Reset should be disabled
+        # IDLE - Reset should remain enabled so operators can prepare a fresh cycle
         panel.update(CycleState.IDLE, 1.0)
-        assert panel.reset_button.enabled is False
+        assert panel.reset_button.enabled is True
 
         # RUNNING - Reset should be enabled
         panel.update(CycleState.RUNNING, 1.0)
         assert panel.reset_button.enabled is True
 
-        # STOPPED - Reset should be enabled
+        # STOPPED - Reset should still be enabled
         panel.update(CycleState.STOPPED, 1.0)
         assert panel.reset_button.enabled is True
 
@@ -381,6 +419,62 @@ class TestSceneRenderer:
         # Verify objects were loaded
         assert renderer.object_count > 0
 
+    def test_sync_box_updates_pose_in_place_when_parent_is_unchanged(self, viser_server):
+        """Pose updates under the same parent must not tear down and recreate the node."""
+        renderer = SceneRenderer(viser_server)
+
+        first = renderer.sync_box(
+            "box1",
+            (0.1, 0.2, 0.3),
+            (0.1, 0.2, 0.3),
+            (0.0, 0.0, 0.0, 1.0),
+            frame_path="/robot/visual/tool0",
+        )
+        second = renderer.sync_box(
+            "box1",
+            (0.1, 0.2, 0.3),
+            (0.2, 0.25, 0.35),
+            (0.0, 0.0, 0.0, 1.0),
+            frame_path="/robot/visual/tool0",
+        )
+        third = renderer.sync_box(
+            "box1",
+            (0.1, 0.2, 0.3),
+            (0.2, 0.25, 0.35),
+            (0.0, 0.0, 0.0, 1.0),
+            frame_path="/robot/visual/tool0",
+        )
+
+        assert first["action"] == "rendered"
+        assert second["action"] == "updated_pose"
+        assert third["action"] == "unchanged"
+        assert second["scene_name"] == "/robot/visual/tool0/box1"
+        assert renderer.get_render_info("box1")["scene_node_present"] is True
+
+    def test_sync_box_recreates_when_parent_frame_changes(self, viser_server):
+        """World-to-attached transitions should recreate once under the new parent."""
+        renderer = SceneRenderer(viser_server)
+
+        first = renderer.sync_box(
+            "box1",
+            (0.1, 0.2, 0.3),
+            (0.1, 0.2, 0.3),
+            (0.0, 0.0, 0.0, 1.0),
+            frame_path=None,
+        )
+        second = renderer.sync_box(
+            "box1",
+            (0.1, 0.2, 0.3),
+            (0.0, 0.0, 0.05),
+            (0.0, 0.0, 0.0, 1.0),
+            frame_path="/robot/visual/tool0",
+        )
+
+        assert first["action"] == "rendered"
+        assert second["action"] == "rendered"
+        assert second["previous_scene_name"] == "/scene/box1"
+        assert second["scene_name"] == "/robot/visual/tool0/box1"
+
 
 # ============================================================================
 # Server Tests (uses Viser with port=0)
@@ -423,10 +517,85 @@ class TestViserHmiServer:
         catalog = NodeCatalog(catalog_path)
         program = Program(program_path, catalog)
 
+        first = program.scene[0]
+        cycle_manager._kernel.scene_edit(SceneEditRequest(
+            operation="add",
+            object_id=first.object_id,
+            shape_type=first.shape.get("type"),
+            box_dimensions_m=first.shape.get("box_dimensions_m"),
+            sphere_radius_m=first.shape.get("sphere_radius_m"),
+            pose_position_m=first.pose.get("position_m"),
+            pose_orientation_xyzw=first.pose.get("orientation_xyzw", [0.0, 0.0, 0.0, 1.0]),
+            frame_id=first.pose.get("frame_id", "universe"),
+        ))
+
         server.load_program(program)
 
-        # Verify program was loaded
-        assert server.scene_renderer.object_count > 0
+        # Verify backend-authored scene object was rendered
+        assert server.scene_renderer.object_count == 1
+
+        server.stop()
+
+    def test_rebuild_link_viser_paths_uses_visual_root(self, cycle_manager, monkeypatch):
+        """Attached-object frame paths must use the URDF visual joint-frame root."""
+        server = ViserHmiServer(cycle_manager, host="127.0.0.1", port=0)
+
+        class FakeUrdfWrapper:
+            def __init__(self):
+                self._urdf = type("FakeUrdf", (), {"scene": object()})()
+
+        class FakeVisualizer:
+            def __init__(self):
+                self.viser_urdf = FakeUrdfWrapper()
+
+        calls = []
+
+        def fake_name_from_frame(scene, frame_name, root_node_name="/"):
+            calls.append((frame_name, root_node_name))
+            return f"{root_node_name}/{frame_name}"
+
+        import viser.extras._urdf as _urdf_module
+
+        monkeypatch.setattr(_urdf_module, "_viser_name_from_frame", fake_name_from_frame)
+        server._robot_visualizer = FakeVisualizer()
+        server._rebuild_link_viser_paths()
+
+        assert calls
+        assert all(root_node_name == "/robot/visual" for _, root_node_name in calls)
+        assert server._link_viser_paths["tool0"] == "/robot/visual/tool0"
+
+        server.stop()
+
+    def test_load_program_syncs_robot_from_backend_snapshot(self, cycle_manager):
+        """Program load bootstraps robot visualization from backend state, not a hardcoded pose."""
+        server = ViserHmiServer(cycle_manager, host="127.0.0.1", port=0)
+
+        class FakeVisualizer:
+            joint_names = ["joint_a", "joint_b"]
+
+            def __init__(self):
+                self.updated = None
+
+            def update_joints(self, positions):
+                self.updated = positions
+
+        server._robot_visualizer = FakeVisualizer()
+        cycle_manager.get_execution_snapshot = lambda: ExecutionSnapshot(
+            timestamp_ns=11,
+            sequence_number=5,
+            execution_id=7,
+            move_id="",
+            state=ExecutionState.IDLE,
+            progress=0.0,
+            joint_positions_rad=[0.25, -0.5],
+        )
+
+        catalog = NodeCatalog(_CATALOG_PATH)
+        program = Program(_PROGRAM_PATH, catalog)
+        server.load_program(program)
+
+        assert server._robot_visualizer.updated == {"joint_a": 0.25, "joint_b": -0.5}
+        assert server._last_snapshot_sequence == 5
 
         server.stop()
 
@@ -477,6 +646,157 @@ class TestViserHmiServer:
 
         assert fake_visualizer.updated == {"joint_a": 0.1, "joint_b": -0.2}
         assert server._last_snapshot_sequence == 7
+
+        server.stop()
+
+    def test_update_once_syncs_objects_from_backend_queries(self, cycle_manager):
+        """Object rendering is reconciled from backend object queries."""
+        server = ViserHmiServer(cycle_manager, host="127.0.0.1", port=0)
+        catalog = NodeCatalog(_CATALOG_PATH)
+        program = Program(_PROGRAM_PATH, catalog)
+        server.load_program(program)
+
+        first = program.scene[0]
+        cycle_manager._kernel.scene_edit(SceneEditRequest(
+            operation="add",
+            object_id=first.object_id,
+            shape_type=first.shape.get("type"),
+            box_dimensions_m=first.shape.get("box_dimensions_m"),
+            sphere_radius_m=first.shape.get("sphere_radius_m"),
+            pose_position_m=first.pose.get("position_m"),
+            pose_orientation_xyzw=first.pose.get("orientation_xyzw", [0.0, 0.0, 0.0, 1.0]),
+            frame_id=first.pose.get("frame_id", "universe"),
+        ))
+
+        server._update_once()
+        assert server.scene_renderer.object_count == 1
+
+        cycle_manager._kernel.scene_edit(
+            SceneEditRequest(operation="remove", object_id=first.object_id)
+        )
+        server._update_once()
+        assert server.scene_renderer.object_count == 0
+
+        server.stop()
+
+    def test_object_render_diagnostics_report_backend_and_scene_presence(self, cycle_manager):
+        """Runtime diagnostics expose backend state, frame path, and scene-node presence."""
+        server = ViserHmiServer(cycle_manager, host="127.0.0.1", port=0)
+        catalog = NodeCatalog(_CATALOG_PATH)
+        program = Program(_PROGRAM_PATH, catalog)
+        server.load_program(program)
+
+        first = program.scene[0]
+        cycle_manager._kernel.scene_edit(SceneEditRequest(
+            operation="add",
+            object_id=first.object_id,
+            shape_type=first.shape.get("type"),
+            box_dimensions_m=first.shape.get("box_dimensions_m"),
+            sphere_radius_m=first.shape.get("sphere_radius_m"),
+            pose_position_m=first.pose.get("position_m"),
+            pose_orientation_xyzw=first.pose.get("orientation_xyzw", [0.0, 0.0, 0.0, 1.0]),
+            frame_id=first.pose.get("frame_id", "universe"),
+        ))
+        server._update_once()
+
+        diagnostics = server.get_object_render_diagnostics(first.object_id)
+        assert diagnostics["exists"] is True
+        assert diagnostics["state"]["frame_id"] == first.pose.get("frame_id", "universe")
+        assert diagnostics["backend_pose_in_universe"] is not None
+        assert diagnostics["render"]["scene_name"] == f"/scene/{first.object_id}"
+        assert diagnostics["render"]["scene_node_present"] is True
+
+        cycle_manager._kernel.scene_edit(
+            SceneEditRequest(operation="attach", object_id=first.object_id, frame_id="tool0")
+        )
+        server._update_once()
+
+        diagnostics = server.get_object_render_diagnostics(first.object_id)
+        assert diagnostics["state"]["attached"] is True
+        assert diagnostics["state"]["frame_id"] == "tool0"
+        assert diagnostics["backend_pose_in_frame"] is not None
+        assert diagnostics["render"]["scene_name"] is not None
+        assert diagnostics["render"]["scene_node_present"] is True
+
+        server.stop()
+
+    def test_scene_trace_records_invalidation_and_reconcile_events(self, cycle_manager):
+        """HMI scene trace captures invalidation hints and backend reconciliation."""
+        server = ViserHmiServer(cycle_manager, host="127.0.0.1", port=0)
+        catalog = NodeCatalog(_CATALOG_PATH)
+        program = Program(_PROGRAM_PATH, catalog)
+        server.load_program(program)
+
+        first = program.scene[0]
+        cycle_manager._kernel.scene_edit(SceneEditRequest(
+            operation="add",
+            object_id=first.object_id,
+            shape_type=first.shape.get("type"),
+            box_dimensions_m=first.shape.get("box_dimensions_m"),
+            sphere_radius_m=first.shape.get("sphere_radius_m"),
+            pose_position_m=first.pose.get("position_m"),
+            pose_orientation_xyzw=first.pose.get("orientation_xyzw", [0.0, 0.0, 0.0, 1.0]),
+            frame_id=first.pose.get("frame_id", "universe"),
+        ))
+        server.request_scene_sync(
+            reason="scene_edit_callback",
+            operation="add",
+            object_id=first.object_id,
+        )
+        server._update_once()
+
+        trace = server.get_scene_trace()
+        assert any(
+            event["event"] == "invalidation_hint"
+            and event["object_id"] == first.object_id
+            and event["operation"] == "add"
+            for event in trace
+        )
+        reconcile = next(
+            event for event in reversed(trace)
+            if event["event"] == "reconcile_render" and event["object_id"] == first.object_id
+        )
+        assert reconcile["backend_state"]["exists"] is True
+        assert reconcile["render"]["scene_node_present"] is True
+
+        server.stop()
+
+    def test_attached_reconcile_is_stable_after_first_render(self, cycle_manager):
+        """Once attached, repeated reconciles should not emit no-op trace churn."""
+        server = ViserHmiServer(cycle_manager, host="127.0.0.1", port=0)
+        server._link_viser_paths["tool0"] = "/robot/visual/tool0"
+        catalog = NodeCatalog(_CATALOG_PATH)
+        program = Program(_PROGRAM_PATH, catalog)
+        server.load_program(program)
+
+        first = program.scene[0]
+        cycle_manager._kernel.scene_edit(SceneEditRequest(
+            operation="add",
+            object_id=first.object_id,
+            shape_type=first.shape.get("type"),
+            box_dimensions_m=first.shape.get("box_dimensions_m"),
+            sphere_radius_m=first.shape.get("sphere_radius_m"),
+            pose_position_m=first.pose.get("position_m"),
+            pose_orientation_xyzw=first.pose.get("orientation_xyzw", [0.0, 0.0, 0.0, 1.0]),
+            frame_id=first.pose.get("frame_id", "universe"),
+        ))
+        cycle_manager._kernel.scene_edit(
+            SceneEditRequest(operation="attach", object_id=first.object_id, frame_id="tool0")
+        )
+
+        server._update_once()
+        server.clear_scene_trace()
+        server._update_once()
+
+        assert not any(
+            event["event"] == "reconcile_render" and event["object_id"] == first.object_id
+            for event in server.get_scene_trace()
+        )
+        diagnostics = server.get_object_render_diagnostics(first.object_id)
+        assert diagnostics["state"]["attached"] is True
+        assert diagnostics["frame_path"] == "/robot/visual/tool0"
+        assert diagnostics["render"]["scene_name"] == f"/robot/visual/tool0/{first.object_id}"
+        assert diagnostics["render"]["scene_node_present"] is True
 
         server.stop()
 

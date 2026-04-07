@@ -28,6 +28,19 @@ def _rpy_deg_to_xyzw(rpy_deg: list[float]) -> list[float]:
     ]
 
 
+def _normalize_pose_dict(pose: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Return a pose dict with orientation normalized to orientation_xyzw."""
+    if pose is None:
+        return None
+    if "orientation_rpy_deg" in pose and "orientation_xyzw" not in pose:
+        normalized = dict(pose)
+        normalized["orientation_xyzw"] = _rpy_deg_to_xyzw(
+            normalized.pop("orientation_rpy_deg")
+        )
+        return normalized
+    return pose
+
+
 class MoveManipulatorAction(py_trees.behaviour.Behaviour):
     """Execute a motion request through the kernel (plan + validate + execute)."""
 
@@ -71,11 +84,13 @@ class MoveManipulatorAction(py_trees.behaviour.Behaviour):
         kernel: KernelClient = self.blackboard.kernel
 
         if not self._started:
-            # Convert orientation_rpy_deg to orientation_xyzw if needed
-            pose_goal = self._params.get("pose_goal")
-            if pose_goal and "orientation_rpy_deg" in pose_goal and "orientation_xyzw" not in pose_goal:
-                pose_goal = dict(pose_goal)
-                pose_goal["orientation_xyzw"] = _rpy_deg_to_xyzw(pose_goal.pop("orientation_rpy_deg"))
+            pose_goal = _normalize_pose_dict(self._params.get("pose_goal"))
+            relative_move = self._params.get("relative_move")
+            if relative_move:
+                relative_move = dict(relative_move)
+                relative_move["offset"] = _normalize_pose_dict(
+                    relative_move.get("offset")
+                )
 
             request = ExecuteRequest(
                 robot_id=self._params.get("robot_id", ""),
@@ -89,6 +104,7 @@ class MoveManipulatorAction(py_trees.behaviour.Behaviour):
                     "joint_goal_positions_rad", []
                 ),
                 pose_goal=pose_goal,
+                relative_move=relative_move,
                 velocity_scale=effective_velocity_scale,
                 acceleration_scale=float(
                     self._params.get("acceleration_scale", 1.0)

@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .state_bridge import StateBridge
 from manyforge_behavior.cycle_manager import CycleState
+from manyforge_behavior.kernel_client import ExecutionSnapshot
 
 
 class ControlPanel:
@@ -75,7 +76,7 @@ class ControlPanel:
         self._velocity_slider.on_update(self._on_velocity_slider_input)
 
         # Initial update
-        self.update(CycleState.IDLE, 1.0)
+        self.update(CycleState.IDLE, 1.0, None)
 
     def _on_run_click(self, event: viser.GuiEvent) -> None:
         """Handle Run button click."""
@@ -97,16 +98,29 @@ class ControlPanel:
         scale = event.target.value / 100.0
         self._bridge.set_velocity_scale(scale)
 
-    def update(self, state: CycleState, velocity_scale: float) -> None:
+    def update(
+        self,
+        state: CycleState,
+        velocity_scale: float,
+        execution_snapshot: ExecutionSnapshot | None = None,
+    ) -> None:
         """Update status display and button states.
 
         Args:
             state: Current CycleState (IDLE, RUNNING, or STOPPED).
             velocity_scale: Current velocity scale (0.0 to 1.0).
+            execution_snapshot: Latest backend execution snapshot if available.
         """
-        # Update status text
-        state_name = state.value.upper()
-        self._status_text.content = f"State: {state_name}"
+        if execution_snapshot is not None:
+            backend_state = execution_snapshot.state.value.upper()
+            lines = [f"Backend: {backend_state}"]
+            if execution_snapshot.move_id:
+                lines.append(f"Move: {execution_snapshot.move_id}")
+            lines.append(f"Progress: {int(execution_snapshot.progress * 100)}%")
+            self._status_text.content = "\n".join(lines)
+        else:
+            state_name = state.value.upper()
+            self._status_text.content = f"Backend: {state_name}"
 
         # Update velocity slider value (guarded to avoid triggering on_update)
         self._updating = True
@@ -120,8 +134,9 @@ class ControlPanel:
         # Stop: enabled when state is RUNNING
         self._stop_button.enabled = state == CycleState.RUNNING
 
-        # Reset: enabled when RUNNING or STOPPED
-        self._reset_button.enabled = state in (CycleState.RUNNING, CycleState.STOPPED)
+        # Reset: always enabled so operators can rebuild software/runtime
+        # state even after a cycle has completed back to IDLE.
+        self._reset_button.enabled = True
 
     @property
     def run_button(self) -> viser.GuiButtonHandle:

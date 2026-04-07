@@ -66,6 +66,11 @@ class ExecutionKernel {
   /// Get the latest observer-safe execution snapshot published by the kernel.
   ExecutionSnapshot get_execution_snapshot() const;
 
+  /// Refresh the observer-facing snapshot from the current planning-context
+  /// state. Intended for explicit simulator/bootstrap paths, not motion
+  /// execution semantics.
+  void sync_snapshot_from_context();
+
   /// Run a single collision monitoring tick.
   /// Called externally (e.g., by a scheduler) during Executing.
   Result<void> collision_check_tick();
@@ -88,6 +93,7 @@ class ExecutionKernel {
   MetricsSnapshot get_metrics() const;
 
  private:
+  Result<MotionSpecDTO> resolve_motion_spec(const ExecuteRequestDTO& request);
   Result<TrajectoryDTO> plan_trajectory(const ExecuteRequestDTO& request);
   Result<void> validate_trajectory(const TrajectoryDTO& trajectory,
                                    const ExecuteRequestDTO& request);

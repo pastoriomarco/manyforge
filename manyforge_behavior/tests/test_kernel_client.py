@@ -6,6 +6,7 @@ from manyforge_behavior.kernel_client import (
     ExecuteRequest,
     ExecutionState,
     MockKernelClient,
+    ObjectState,
     SceneEditRequest,
 )
 
@@ -117,6 +118,27 @@ class TestMockKernelSceneEdit:
         result = kernel.scene_edit(req)
         assert not result.success
 
+    def test_scene_trace_records_scene_mutations(self, kernel):
+        kernel.scene_edit(SceneEditRequest(
+            operation="add",
+            object_id="box1",
+            pose_position_m=[0.4, 0.1, 0.2],
+            pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
+            frame_id="universe",
+        ))
+        kernel.scene_edit(SceneEditRequest(
+            operation="attach",
+            object_id="box1",
+            frame_id="tool0",
+        ))
+        trace = kernel.get_scene_trace()
+        assert [event["event"] for event in trace][-2:] == ["add", "attach"]
+        assert trace[-1]["success"] is True
+        assert trace[-1]["frame_id"] == "tool0"
+        assert trace[-1]["attached"] is True
+        assert trace[-1]["pose_in_frame"] is not None
+        assert trace[-1]["pose_in_universe"] is not None
+
 
 class TestMockKernelMisc:
     def test_invalidate_trajectories(self, kernel):
@@ -130,6 +152,66 @@ class TestMockKernelMisc:
         assert "position_m" in pose
         assert "orientation_xyzw" in pose
         assert len(kernel.link_pose_calls) == 1
+
+    def test_get_object_pose_and_state_follow_backend_scene_edits(self, kernel):
+        kernel.scene_edit(SceneEditRequest(
+            operation="add",
+            object_id="box1",
+            pose_position_m=[0.4, 0.1, 0.2],
+            pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
+            frame_id="universe",
+        ))
+
+        pose = kernel.get_object_pose("box1", "base_link")
+        assert pose is not None
+        assert pose["position_m"] == [0.4, 0.1, 0.2]
+
+        state = kernel.get_object_state("box1")
+        assert isinstance(state, ObjectState)
+        assert state.exists is True
+        assert state.attached is False
+        assert state.frame_id == "universe"
+
+    def test_get_object_state_reports_missing_object(self, kernel):
+        state = kernel.get_object_state("missing_box")
+        assert state.object_id == "missing_box"
+        assert state.exists is False
+        assert kernel.get_object_pose("missing_box", "base_link") is None
+
+    def test_attach_and_detach_preserve_world_pose_with_stable_object_id(self, kernel):
+        kernel.scene_edit(
+            SceneEditRequest(
+                operation="add",
+                object_id="box1",
+                pose_position_m=[0.4, 0.1, 0.2],
+                pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
+                frame_id="universe",
+            )
+        )
+        pose_before = kernel.get_object_pose("box1", "universe")
+        assert pose_before is not None
+
+        attach_result = kernel.scene_edit(
+            SceneEditRequest(operation="attach", object_id="box1", frame_id="tool0")
+        )
+        assert attach_result.success is True
+        attached_state = kernel.get_object_state("box1")
+        assert attached_state.attached is True
+        assert attached_state.frame_id == "tool0"
+        pose_attached = kernel.get_object_pose("box1", "universe")
+        assert pose_attached is not None
+        assert pose_attached["position_m"] == pytest.approx(pose_before["position_m"])
+
+        detach_result = kernel.scene_edit(
+            SceneEditRequest(operation="detach", object_id="box1", frame_id="universe")
+        )
+        assert detach_result.success is True
+        detached_state = kernel.get_object_state("box1")
+        assert detached_state.attached is False
+        assert detached_state.frame_id == "universe"
+        pose_detached = kernel.get_object_pose("box1", "universe")
+        assert pose_detached is not None
+        assert pose_detached["position_m"] == pytest.approx(pose_attached["position_m"])
 
     def test_initial_status(self, kernel):
         status = kernel.get_status()

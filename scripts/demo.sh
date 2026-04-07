@@ -19,7 +19,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 CATALOG=/workspace/manyforge_behavior/resources/node_catalog.yaml
-DEPLOY=/workspace/manyforge_behavior/tests/fixtures/ur5_roboplan.deployment.yaml
+DEPLOY=/workspace/examples/pick_and_place.deployment.yaml
 
 if [[ "${1:-}" == "--simple" ]]; then
   PROGRAM=/workspace/manyforge_behavior/tests/fixtures/pick_and_place.program.yaml
@@ -27,13 +27,17 @@ else
   PROGRAM=/workspace/examples/pick_and_place.program.yaml
 fi
 
-LOAD_JSON='{"path":"'"$PROGRAM"'","deploymentPath":"'"$DEPLOY"'"}'
-
 echo "Starting ManyForge Composer..."
 echo "Program: $PROGRAM"
 echo ""
 
-exec docker compose run --rm -p 9000:9000 -p 8081:8081 dev bash -lc '
+exec docker compose run --rm \
+  -e MANYFORGE_CATALOG_PATH="$CATALOG" \
+  -e MANYFORGE_PROGRAM_PATH="$PROGRAM" \
+  -e MANYFORGE_DEPLOY_PATH="$DEPLOY" \
+  -p 9000:9000 -p 8081:8081 dev bash -lc '
+  set -euo pipefail
+
   # Remove stale frontend from Docker image — use volume-mounted dev build
   rm -rf /opt/manyforge-frontend/dist 2>/dev/null
 
@@ -46,7 +50,7 @@ exec docker compose run --rm -p 9000:9000 -p 8081:8081 dev bash -lc '
   # Ensure roboplan Python paths are available
   export PYTHONPATH="/tmp/manyforge-build/roboplan:/workspace/manyforge_roboplan/python:${PYTHONPATH:-}"
 
-  python -m manyforge_composer --catalog-path '"$CATALOG"' --port 9000 --hmi-port 8081 &
+  python -m manyforge_composer --catalog-path "$MANYFORGE_CATALOG_PATH" --port 9000 --hmi-port 8081 &
   PID=$!
 
   for i in $(seq 1 30); do
@@ -54,9 +58,17 @@ exec docker compose run --rm -p 9000:9000 -p 8081:8081 dev bash -lc '
     sleep 0.5
   done
 
+  python3 - <<PY >/tmp/manyforge-demo-load.json
+import json
+print(json.dumps({
+    "path": "${MANYFORGE_PROGRAM_PATH}",
+    "deploymentPath": "${MANYFORGE_DEPLOY_PATH}",
+}))
+PY
+
   curl -sf -X POST http://localhost:9000/api/program/load \
     -H "Content-Type: application/json" \
-    -d '"'$LOAD_JSON'"' | python3 -m json.tool
+    --data-binary @/tmp/manyforge-demo-load.json | python3 -m json.tool
 
   echo ""
   echo "=== ManyForge Composer ready ==="

@@ -1,10 +1,10 @@
 api_version: manyforge.program.v0
-program_profile: v0.0
+program_profile: v0.1
 name: pick_and_place_demo
 description: >-
   Pick-and-place demo with UR5 + RoboPlan: approach/pick/retreat/drop sequence
-  using pose goals (IK), collision-aware motion planning (RRT + TOPPRA),
-  gripper simulation, and cache invalidation.
+  using backend-resolved relative pick goals, collision-aware motion planning
+  (RRT + TOPPRA), gripper simulation, and cache invalidation.
   Sequence follows manymove pattern: approach → pick → retreat → approach drop → drop → retreat → rest.
 catalog_version: "0.1.0"
 
@@ -57,28 +57,36 @@ tree:
   children:
     # --- PICK PHASE ---
 
-    # 1. Move to pick approach (0.1m above graspable object)
+    # 1. Move to pick approach (0.1m above graspable object, resolved at execute time)
     - id: move_manipulator_action
       name: move_to_pick_approach
       params:
         move_id: pick_approach
-        motion_type: pose_goal
-        pose_goal:
-          position_m: [0.3, -0.3, 0.25]
-          orientation_rpy_deg: [180, 0, -135]
+        motion_type: relative_move
+        relative_move:
+          reference:
+            type: object
+            id: graspable
+          offset:
+            position_m: [0.0, 0.0, 0.10]
+            orientation_rpy_deg: [180, 0, -90]
         velocity_scale: "${param:velocity_scale}"
         planning_timeout_s: 10.0
         execution_timeout_s: 30.0
 
-    # 2. Move down to pick pose (at the object)
+    # 2. Move down to pick pose (at the object, resolved at execute time)
     - id: move_manipulator_action
       name: move_to_pick
       params:
         move_id: pick_down
-        motion_type: pose_goal
-        pose_goal:
-          position_m: [0.3, -0.3, 0.2]
-          orientation_rpy_deg: [180, 0, -135]
+        motion_type: relative_move
+        relative_move:
+          reference:
+            type: object
+            id: graspable
+          offset:
+            position_m: [0.0, 0.0, 0.05]
+            orientation_rpy_deg: [180, 0, -90]
         velocity_scale: "${param:velocity_scale}"
         planning_timeout_s: 10.0
         execution_timeout_s: 30.0

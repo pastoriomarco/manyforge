@@ -242,7 +242,7 @@ entries:
       - name: motion_type
         type: enum
         required: true
-        enum_values: [joint_goal, pose_goal]
+        enum_values: [joint_goal, pose_goal, relative_move]
         description: The type of motion to plan.
       - name: joint_goal_names
         type: string_list
@@ -260,6 +260,14 @@ entries:
         description: >-
           Target end-effector pose in base_frame for pose_goal motion type.
           Required when motion_type=pose_goal.
+      - name: relative_move
+        type: dict
+        required: false
+        description: >-
+          Relative move goal for motion_type=relative_move. Structure:
+          {reference: {type: frame|object|robot_link, id: ...},
+          offset: {position_m: [...], orientation_xyzw|orientation_rpy_deg: [...]}}.
+          The reference is resolved against current backend state at execute time.
       - name: velocity_scale
         type: float
         required: false

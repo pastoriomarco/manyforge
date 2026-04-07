@@ -1,4 +1,4 @@
-"""Capability key registry and profile definitions for ManyForge v0.0."""
+"""Capability key registry and profile definitions for ManyForge v0.0/v0.1."""
 
 # v0.0 required capability keys (from SPEC-240)
 V0_0_REQUIRED_KEYS: frozenset[str] = frozenset({
@@ -30,6 +30,17 @@ V0_0_REQUIRED_KEYS: frozenset[str] = frozenset({
 PROFILE_REQUIRED_KEYS: dict[str, frozenset[str]] = {
     "v0.0": V0_0_REQUIRED_KEYS,
 }
+
+V0_1_REQUIRED_KEYS: frozenset[str] = frozenset(
+    set(V0_0_REQUIRED_KEYS)
+    | {
+        "context.pose.resolve_reference",
+        "context.scene.object_query",
+        "scene.edit.attach_detach",
+    }
+)
+
+PROFILE_REQUIRED_KEYS["v0.1"] = V0_1_REQUIRED_KEYS
 
 
 def get_required_keys(profile: str) -> frozenset[str]:

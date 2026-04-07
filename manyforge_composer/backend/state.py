@@ -26,6 +26,7 @@ class ComposerState:
         self.program_source_path: str = ""
         self.deployment: Optional[Deployment] = None
         self.cycle_manager: Optional[CycleManager] = None
+        self.hmi_server = None
         self._on_program_loaded: Optional[Callable[["ComposerState"], None]] = None
 
     def load_program(self, program_path: str, deployment_path: Optional[str] = None) -> Program:

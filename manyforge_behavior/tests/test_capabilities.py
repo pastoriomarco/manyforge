@@ -4,6 +4,7 @@ import pytest
 
 from manyforge_behavior.capabilities import (
     V0_0_REQUIRED_KEYS,
+    V0_1_REQUIRED_KEYS,
     get_required_keys,
 )
 
@@ -54,6 +55,18 @@ class TestGetRequiredKeys:
         """Returns V0_0_REQUIRED_KEYS for v0.0 profile."""
         result = get_required_keys("v0.0")
         assert result == V0_0_REQUIRED_KEYS
+
+    def test_get_required_keys_v0_1(self):
+        """Returns V0_1_REQUIRED_KEYS for v0.1 profile."""
+        result = get_required_keys("v0.1")
+        assert result == V0_1_REQUIRED_KEYS
+
+    def test_v0_1_includes_v0_0_plus_object_relative_keys(self):
+        """v0.1 is additive over v0.0 for object-relative manipulation."""
+        assert V0_0_REQUIRED_KEYS.issubset(V0_1_REQUIRED_KEYS)
+        assert "context.pose.resolve_reference" in V0_1_REQUIRED_KEYS
+        assert "context.scene.object_query" in V0_1_REQUIRED_KEYS
+        assert "scene.edit.attach_detach" in V0_1_REQUIRED_KEYS
 
     def test_get_required_keys_unknown_profile(self):
         """Raises ValueError for unknown profile."""

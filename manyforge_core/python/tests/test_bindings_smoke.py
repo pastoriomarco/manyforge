@@ -334,6 +334,17 @@ def test_update_object_pose_request_dto():
     assert req.object_id == "obj1"
 
 
+def test_object_state_dto():
+    """Test ObjectStateDTO creation and attributes."""
+    import manyforge_core_py
+
+    state = manyforge_core_py.ObjectStateDTO("obj1", True, False, "universe")
+    assert state.object_id == "obj1"
+    assert state.exists is True
+    assert state.attached is False
+    assert state.frame_id == "universe"
+
+
 def test_reference_dto():
     """Test ReferenceDTO creation and attributes."""
     import manyforge_core_py
@@ -421,5 +432,4 @@ def test_collision_check_request_dto():
     state = manyforge_core_py.RobotStateDTO(["j1"], [0.0], [])
     c = manyforge_core_py.CollisionCheckRequestDTO(state)
     assert c.robot_state.joint_names == ["j1"]
-
 
