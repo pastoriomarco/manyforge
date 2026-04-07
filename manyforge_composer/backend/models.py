@@ -88,6 +88,7 @@ class ProgramResponse(BaseModel):
     robot: RobotResponse
     scene_count: int = Field(alias="sceneCount")
     parameter_count: int = Field(alias="parameterCount")
+    source_path: str = Field(alias="sourcePath", default="")
 
 
 class ProgramTreeResponse(BaseModel):

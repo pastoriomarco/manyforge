@@ -89,7 +89,9 @@ def create_app(state: ComposerState, static_dir: str | None = None) -> FastAPI:
         await hub.connect(ws)
         try:
             while True:
-                await ws.receive_text()  # keep alive
+                msg = await ws.receive_text()
+                if msg == "ping":
+                    await ws.send_text("pong")
         except Exception:
             hub.disconnect(ws)
 

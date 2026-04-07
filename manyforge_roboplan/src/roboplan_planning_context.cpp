@@ -9,10 +9,18 @@
 namespace manyforge::roboplan_backend {
 
 RoboPlanPlanningContext::RoboPlanPlanningContext(
-    std::shared_ptr<roboplan::Scene> scene, std::string group_name)
-    : scene_(std::move(scene)), group_name_(std::move(group_name)) {}
+    std::shared_ptr<roboplan::Scene> scene, std::string group_name,
+    std::shared_ptr<std::mutex> scene_mutex)
+    : scene_(std::move(scene)),
+      group_name_(std::move(group_name)),
+      scene_mutex_(std::move(scene_mutex)) {
+  if (!scene_mutex_) {
+    scene_mutex_ = std::make_shared<std::mutex>();
+  }
+}
 
 core::RobotStateDTO RoboPlanPlanningContext::get_current_state() {
+  std::lock_guard<std::mutex> scene_lock(*scene_mutex_);
   core::RobotStateDTO state;
   state.joint_names = scene_->getActuatedJointNames();
 
@@ -34,6 +42,7 @@ core::ValidationResultDTO RoboPlanPlanningContext::validate_trajectory(
   try {
     // Collision check at each waypoint.
     for (const auto& wp : trajectory.waypoints) {
+      std::lock_guard<std::mutex> scene_lock(*scene_mutex_);
       Eigen::VectorXd q(wp.positions_rad.size());
       for (size_t i = 0; i < wp.positions_rad.size(); ++i) {
         q[i] = wp.positions_rad[i];
@@ -54,6 +63,7 @@ core::ValidationResultDTO RoboPlanPlanningContext::validate_trajectory(
 
       for (size_t i = 0; i < trajectory.waypoints.size(); ++i) {
         const auto& wp = trajectory.waypoints[i];
+        std::lock_guard<std::mutex> scene_lock(*scene_mutex_);
         Eigen::VectorXd q(wp.positions_rad.size());
         for (size_t j = 0; j < wp.positions_rad.size(); ++j) {
           q[j] = wp.positions_rad[j];
@@ -98,6 +108,7 @@ core::CollisionCheckResultDTO RoboPlanPlanningContext::collision_check(
     const core::CollisionCheckRequestDTO& request) {
   core::CollisionCheckResultDTO result;
 
+  std::lock_guard<std::mutex> scene_lock(*scene_mutex_);
   Eigen::VectorXd q(request.robot_state.positions_rad.size());
   for (size_t i = 0; i < request.robot_state.positions_rad.size(); ++i) {
     q[i] = request.robot_state.positions_rad[i];
@@ -109,6 +120,7 @@ core::CollisionCheckResultDTO RoboPlanPlanningContext::collision_check(
 
 core::Pose3DTO RoboPlanPlanningContext::forward_kinematics(
     const core::FkRequestDTO& request) {
+  std::lock_guard<std::mutex> scene_lock(*scene_mutex_);
   Eigen::VectorXd q(request.robot_state.positions_rad.size());
   for (size_t i = 0; i < request.robot_state.positions_rad.size(); ++i) {
     q[i] = request.robot_state.positions_rad[i];
@@ -162,6 +174,7 @@ core::Pose3DTO RoboPlanPlanningContext::forward_kinematics(
 
 core::JointLimitsDTO RoboPlanPlanningContext::get_joint_limits(
     const std::string& /*robot_id*/, const std::string& /*group_id*/) {
+  std::lock_guard<std::mutex> scene_lock(*scene_mutex_);
   core::JointLimitsDTO limits;
   limits.joint_names = scene_->getActuatedJointNames();
 
@@ -225,6 +238,7 @@ core::SceneEditResultDTO RoboPlanPlanningContext::add_object(
   core::SceneEditResultDTO result;
 
   try {
+    std::lock_guard<std::mutex> scene_lock(*scene_mutex_);
     Eigen::Matrix4d tform = pose_to_matrix(request.pose);
     Eigen::Vector4d color(1.0, 0.0, 0.0, 1.0);
 
@@ -261,6 +275,7 @@ core::SceneEditResultDTO RoboPlanPlanningContext::remove_object(
   core::SceneEditResultDTO result;
 
   try {
+    std::lock_guard<std::mutex> scene_lock(*scene_mutex_);
     auto r = scene_->removeGeometry(request.object_id);
     if (!r.has_value()) {
       result.error = core::ErrorDTO{core::kErrorObjectNotFound, r.error(), {}};
@@ -279,6 +294,7 @@ core::SceneEditResultDTO RoboPlanPlanningContext::update_object_pose(
   core::SceneEditResultDTO result;
 
   try {
+    std::lock_guard<std::mutex> scene_lock(*scene_mutex_);
     Eigen::Matrix4d tform = pose_to_matrix(request.pose);
     auto r = scene_->updateGeometryPlacement(request.object_id, request.frame_id, tform);
     if (!r.has_value()) {

@@ -11,6 +11,15 @@ export PYTHONPATH="/workspace/manyforge_behavior:/workspace:${PYTHONPATH:-}"
 # when the same source tree is also built on the host)
 export MANYFORGE_BUILD_DIR="/tmp/manyforge-build"
 
+# Make cmeel-installed CMake packages discoverable for standalone native builds.
+# Pinocchio/coal/eigenpy install under a Python-managed prefix rather than a
+# standard system prefix, so plain `cmake -S manyforge_roboplan` needs help.
+PINOCCHIO_CMAKE_DIR=$(find /usr -name "pinocchioConfig.cmake" -printf '%h\n' 2>/dev/null | head -1 || true)
+if [ -n "${PINOCCHIO_CMAKE_DIR:-}" ]; then
+    PINOCCHIO_PREFIX=$(dirname "$(dirname "$(dirname "$PINOCCHIO_CMAKE_DIR")")")
+    export CMAKE_PREFIX_PATH="/usr/local:${PINOCCHIO_PREFIX}:${CMAKE_PREFIX_PATH:-}"
+fi
+
 # Build pybind11 module if manyforge_core library exists
 CORE_BUILD="$MANYFORGE_BUILD_DIR/core"
 PYBIND_BUILD="$MANYFORGE_BUILD_DIR/pybind"

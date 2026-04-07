@@ -2,6 +2,10 @@
 
 #include <manyforge_roboplan/native_kernel_factory.hpp>
 
+#include <atomic>
+#include <chrono>
+#include <thread>
+
 using namespace manyforge::roboplan_backend;
 using namespace manyforge::core;
 
@@ -36,6 +40,30 @@ TEST_F(NativeKernelTest, FactoryCreatesAllComponents) {
 TEST_F(NativeKernelTest, InitialStateIsIdle) {
   auto status = bundle_->kernel->get_status();
   EXPECT_EQ(status.state, ExecutionState::kIdle);
+}
+
+TEST(NativeSchedulerTest, SimpleSchedulerHonorsFutureDeadline) {
+  SimpleScheduler scheduler;
+  std::atomic<bool> fired{false};
+
+  const auto now = std::chrono::steady_clock::now();
+  const auto deadline =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          now.time_since_epoch())
+          .count() +
+      50'000'000LL;
+
+  scheduler.schedule(deadline, [&fired]() { fired.store(true); });
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  EXPECT_FALSE(fired.load());
+
+  const auto timeout = std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
+  while (!fired.load() && std::chrono::steady_clock::now() < timeout) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+
+  EXPECT_TRUE(fired.load());
 }
 
 // --- Planning Context ---
@@ -137,6 +165,136 @@ TEST_F(NativeKernelTest, ExecuteJointGoalSucceeds) {
   bundle_->kernel->wait_for_completion();
   auto status = bundle_->kernel->get_status();
   EXPECT_EQ(status.state, ExecutionState::kCompleted);
+}
+
+TEST_F(NativeKernelTest, PlannerUsesPerRequestPlanningTimeout) {
+  roboplan::RRTOptions rrt_opts;
+  rrt_opts.group_name = "arm";
+  rrt_opts.max_planning_time = 5.0;
+  rrt_opts.max_nodes = 5000;
+  rrt_opts.max_connection_distance = 0.1;  // force the planner into the RRT loop
+
+  RoboPlanPlannerBackend planner(bundle_->scene, rrt_opts, bundle_->shortcutter,
+                                 bundle_->toppra, bundle_->ik);
+
+  PlanRequestDTO req;
+  req.robot_id = "robot1";
+  req.group_id = "arm";
+  req.move_id = "native_planning_timeout";
+  req.base_frame = "base_link";
+  req.tcp_frame = "tool0";
+  req.start_state = bundle_->context->get_current_state();
+  req.tolerances = {0.05, 0.005, 0.05};
+  req.speed_profile = {1.0, 1.0, std::nullopt};
+  req.planning_timeout_s = 1e-6;
+
+  JointGoalDTO goal;
+  goal.joint_names = req.start_state.joint_names;
+  goal.positions_rad = {0.3, -0.8, 0.8, -0.3, -0.8, 0.1};
+  req.motion = goal;
+
+  auto result = planner.plan(req);
+  ASSERT_FALSE(result.trajectory.has_value());
+  ASSERT_TRUE(result.error.has_value());
+  EXPECT_EQ(result.error->code, kErrorPlanningFailed);
+  EXPECT_NE(result.error->message.find("timed out"), std::string::npos);
+}
+
+TEST_F(NativeKernelTest, ExecutionBackendPublishesProgressAndInterpolatesSceneState) {
+  auto start_state = bundle_->context->get_current_state();
+  ASSERT_FALSE(start_state.positions_rad.empty());
+
+  std::vector<double> goal = start_state.positions_rad;
+  goal[0] += 0.25;
+  if (goal.size() > 1) {
+    goal[1] -= 0.2;
+  }
+
+  TrajectoryDTO traj;
+  traj.joint_names = start_state.joint_names;
+  traj.waypoints.push_back(
+      TrajectoryWaypointDTO{0.0, start_state.positions_rad, {}, {}});
+  traj.waypoints.push_back(TrajectoryWaypointDTO{0.3, goal, {}, {}});
+
+  auto handle = bundle_->execution->execute_trajectory(traj);
+  auto initial = bundle_->execution->get_execution_snapshot();
+  EXPECT_EQ(initial.state, ExecutionState::kExecuting);
+  EXPECT_DOUBLE_EQ(initial.progress, 0.0);
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(120));
+
+  auto mid = bundle_->execution->get_execution_snapshot();
+  EXPECT_EQ(mid.state, ExecutionState::kExecuting);
+  EXPECT_GT(mid.sequence_number, initial.sequence_number);
+  EXPECT_GT(mid.progress, initial.progress);
+  EXPECT_LT(mid.progress, 1.0);
+  ASSERT_EQ(mid.joint_positions_rad.size(), goal.size());
+  EXPECT_NEAR(mid.joint_positions_rad[0], start_state.positions_rad[0], 0.2);
+  EXPECT_NE(mid.joint_positions_rad[0], goal[0]);
+
+  ASSERT_TRUE(handle.wait_for_completion(2'000'000'000LL));
+
+  auto final = bundle_->execution->get_execution_snapshot();
+  EXPECT_EQ(final.state, ExecutionState::kCompleted);
+  EXPECT_DOUBLE_EQ(final.progress, 1.0);
+  ASSERT_EQ(final.joint_positions_rad.size(), goal.size());
+
+  auto final_state = bundle_->context->get_current_state();
+  ASSERT_EQ(final_state.positions_rad.size(), goal.size());
+  EXPECT_NEAR(final_state.positions_rad[0], goal[0], 1e-3);
+  if (goal.size() > 1) {
+    EXPECT_NEAR(final_state.positions_rad[1], goal[1], 1e-3);
+  }
+}
+
+TEST_F(NativeKernelTest, KernelExecuteWaitsForTimedBackendCompletion) {
+  ExecuteRequestDTO req;
+  req.robot_id = "robot1";
+  req.group_id = "arm";
+  req.move_id = "native_async_kernel";
+  req.base_frame = "base_link";
+  req.tcp_frame = "tool0";
+  req.tolerances = {0.05, 0.005, 0.05};
+  req.speed_profile = {1.0, 1.0, std::nullopt};
+  req.timeouts = {10.0, 30.0};
+  req.cache_mode = CacheMode::kDisable;
+
+  JointGoalDTO goal;
+  goal.joint_names = {"shoulder_pan_joint", "shoulder_lift_joint", "elbow_joint",
+                      "wrist_1_joint", "wrist_2_joint", "wrist_3_joint"};
+  goal.positions_rad = {0.3, -0.8, 0.7, -0.8, -0.4, 0.1};
+  req.motion = goal;
+
+  auto result = bundle_->kernel->execute(req);
+  ASSERT_TRUE(result.ok());
+
+  bool saw_executing = false;
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (std::chrono::steady_clock::now() < deadline) {
+    auto status = bundle_->kernel->get_status();
+    if (status.state == ExecutionState::kExecuting) {
+      saw_executing = true;
+      EXPECT_LT(status.progress, 1.0);
+      break;
+    }
+    if (status.state == ExecutionState::kCompleted ||
+        status.state == ExecutionState::kFailed ||
+        status.state == ExecutionState::kStopped) {
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
+
+  EXPECT_TRUE(saw_executing);
+  ASSERT_TRUE(bundle_->kernel->wait_for_completion(15'000'000'000LL));
+  EXPECT_EQ(bundle_->kernel->get_status().state, ExecutionState::kCompleted);
+
+  auto snapshot = bundle_->kernel->get_execution_snapshot();
+  EXPECT_EQ(snapshot.execution_id, result.value());
+  EXPECT_EQ(snapshot.move_id, "native_async_kernel");
+  EXPECT_EQ(snapshot.state, ExecutionState::kCompleted);
+  EXPECT_DOUBLE_EQ(snapshot.progress, 1.0);
+  EXPECT_FALSE(snapshot.joint_positions_rad.empty());
 }
 
 TEST_F(NativeKernelTest, ExecuteAndResetCycle) {

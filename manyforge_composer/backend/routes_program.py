@@ -54,14 +54,15 @@ def create_program_router(state: ComposerState) -> APIRouter:
             ),
             sceneCount=len(program.scene),
             parameterCount=len(program.parameters),
+            sourcePath=state.program_source_path,
         ).model_dump(by_alias=True)
-    
+
     @router.get("/program", response_model=ProgramResponse, response_model_by_alias=True)
     def get_program() -> dict:
         """Get the currently loaded program."""
         if state.program is None:
             raise HTTPException(status_code=404, detail="No program loaded")
-        
+
         program = state.program
         robot = program.robot
         return ProgramResponse(
@@ -76,6 +77,7 @@ def create_program_router(state: ComposerState) -> APIRouter:
             ),
             sceneCount=len(program.scene),
             parameterCount=len(program.parameters),
+            sourcePath=state.program_source_path,
         ).model_dump(by_alias=True)
     
     @router.get("/program/tree", response_model=ProgramTreeResponse, response_model_by_alias=True)

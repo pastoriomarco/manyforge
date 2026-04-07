@@ -4,6 +4,7 @@ This is the testable core — no Viser dependency.
 """
 
 from manyforge_behavior.cycle_manager import CycleManager, CycleState
+from manyforge_behavior.kernel_client import ExecutionSnapshot
 
 
 class StateBridge:
@@ -39,6 +40,11 @@ class StateBridge:
             Velocity scale value between 0.0 and 1.0.
         """
         return self._cm.velocity_scale
+
+    @property
+    def execution_snapshot(self) -> ExecutionSnapshot:
+        """Get the latest execution snapshot for observer-side visualization."""
+        return self._cm.get_execution_snapshot()
 
     def run(self) -> None:
         """Start or resume program execution.

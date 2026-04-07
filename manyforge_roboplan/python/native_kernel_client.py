@@ -14,6 +14,7 @@ from manyforge_behavior.kernel_client import (
     ExecuteResult,
     CommandResult,
     ExecutionStatus,
+    ExecutionSnapshot,
     SceneEditRequest,
     SceneEditResult,
     Trajectory,
@@ -80,10 +81,6 @@ class NativeKernelClient(KernelClient):
             ok=result["ok"],
             execution_id=result.get("execution_id", 0),
             error=result.get("error"),
-            trajectory_duration_s=result.get("trajectory_duration_s"),
-            trajectory_waypoint_count=result.get("trajectory_waypoint_count"),
-            final_state=result.get("final_state"),
-            final_error=result.get("final_error"),
         )
 
     def stop(self) -> CommandResult:
@@ -108,7 +105,24 @@ class NativeKernelClient(KernelClient):
             state=_STATE_MAP.get(s["state"], ExecutionState.IDLE),
             execution_id=s.get("execution_id", 0),
             progress=s.get("progress", 0.0),
+            active_move_id=s.get("active_move_id", ""),
         )
+
+    def get_execution_snapshot(self) -> ExecutionSnapshot:
+        s = self._bundle.get_execution_snapshot()
+        return ExecutionSnapshot(
+            timestamp_ns=s.get("timestamp_ns", 0),
+            sequence_number=s.get("sequence_number", 0),
+            execution_id=s.get("execution_id", 0),
+            move_id=s.get("move_id", ""),
+            state=_STATE_MAP.get(s.get("state", 0), ExecutionState.IDLE),
+            progress=s.get("progress", 0.0),
+            joint_positions_rad=list(s.get("joint_positions_rad", [])),
+            error=s.get("error"),
+        )
+
+    def get_metrics(self) -> Dict[str, int]:
+        return dict(self._bundle.get_metrics())
 
     def invalidate_trajectories(self) -> None:
         self._bundle.invalidate_trajectories()

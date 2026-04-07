@@ -8,6 +8,7 @@ execution to the kernel layer.
 """
 
 from pathlib import Path
+import time
 import pytest
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -17,6 +18,7 @@ from manyforge_behavior.kernel_client import (
     MockKernelClient, ExecuteRequest, ExecuteResult,
     CommandResult, ExecutionState, ExecutionStatus, SceneEditRequest,
 )
+from manyforge_behavior.cycle_manager import CycleManager, CycleState
 from manyforge_behavior.runner import OrchestratorRunner
 from manyforge_behavior.catalog import NodeCatalog
 from manyforge_behavior.program import Program
@@ -308,56 +310,70 @@ class TestRunnerWithNativeKernel:
 class TestHmiWithMockKernel:
     """Tests for ViserHmiServer with MockKernelClient."""
 
-    def test_hmi_creates(self, mock_kernel):
-        """ViserHmiServer(kernel=mock_kernel, port=0) works."""
-        server = ViserHmiServer(kernel=mock_kernel, port=0)
-        assert server is not None
-        assert server.viser_server is not None
-        server.stop()
-
-    def test_hmi_bridge_status(self, mock_kernel):
-        """StateBridge.get_state() returns IDLE."""
-        bridge = StateBridge(mock_kernel)
-        state = bridge.get_state()
-        assert state.state == ExecutionState.IDLE
-
-    def test_hmi_bridge_execute(self, mock_kernel):
-        """Execute motion via bridge, status changes."""
-        bridge = StateBridge(mock_kernel)
-
-        initial_state = bridge.get_state()
-        assert initial_state.state == ExecutionState.IDLE
-
-        request = ExecuteRequest(
-            robot_id="robot1", group_id="arm", move_id="test_move",
-            base_frame="base_link", tcp_frame="tcp",
-            motion_type="joint_goal",
-            joint_goal_names=["j1", "j2", "j3", "j4", "j5", "j6"],
-            joint_goal_positions_rad=[0.1, 0.1, 0.1, 0.0, 0.0, 0.0],
-            velocity_scale=1.0, acceleration_scale=1.0,
-            planning_timeout_s=5.0, execution_timeout_s=10.0,
-        )
-        result = bridge.execute_motion(request)
-        assert result.ok is True
-
-        new_state = bridge.get_state()
-        assert new_state.state == ExecutionState.COMPLETED
-
-    def test_hmi_load_program(
+    def _make_cycle_manager(
         self, simple_motion_program_path, node_catalog_path, mock_kernel
-    ):
-        """Load program into HMI server."""
-        server = ViserHmiServer(kernel=mock_kernel, port=0)
-
+    ) -> CycleManager:
         runner = OrchestratorRunner(
             catalog_path=node_catalog_path,
             program_path=simple_motion_program_path,
             kernel=mock_kernel,
         )
         runner.load()
-        program = runner.program
+        return CycleManager(runner, mock_kernel)
 
-        server.load_program(program)
+    def test_hmi_creates(
+        self, simple_motion_program_path, node_catalog_path, mock_kernel
+    ):
+        """ViserHmiServer(cycle_manager=..., port=0) works."""
+        cycle_manager = self._make_cycle_manager(
+            simple_motion_program_path, node_catalog_path, mock_kernel
+        )
+        server = ViserHmiServer(cycle_manager=cycle_manager, port=0)
+        assert server is not None
+        assert server.viser_server is not None
+        server.stop()
+
+    def test_hmi_bridge_status(
+        self, simple_motion_program_path, node_catalog_path, mock_kernel
+    ):
+        """StateBridge exposes IDLE state before a cycle starts."""
+        cycle_manager = self._make_cycle_manager(
+            simple_motion_program_path, node_catalog_path, mock_kernel
+        )
+        bridge = StateBridge(cycle_manager)
+        assert bridge.state == CycleState.IDLE
+
+    def test_hmi_bridge_run(
+        self, simple_motion_program_path, node_catalog_path, mock_kernel
+    ):
+        """Bridge run() starts a cycle and the kernel executes motions."""
+        cycle_manager = self._make_cycle_manager(
+            simple_motion_program_path, node_catalog_path, mock_kernel
+        )
+        bridge = StateBridge(cycle_manager)
+
+        assert bridge.state == CycleState.IDLE
+        bridge.run()
+        assert bridge.state == CycleState.RUNNING
+
+        deadline = time.monotonic() + 1.0
+        while bridge.state == CycleState.RUNNING and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        assert mock_kernel.execute_count >= 1
+        assert mock_kernel.get_status().state == ExecutionState.COMPLETED
+        assert bridge.state == CycleState.IDLE
+
+    def test_hmi_load_program(
+        self, simple_motion_program_path, node_catalog_path, mock_kernel
+    ):
+        """Load program into HMI server."""
+        cycle_manager = self._make_cycle_manager(
+            simple_motion_program_path, node_catalog_path, mock_kernel
+        )
+        server = ViserHmiServer(cycle_manager=cycle_manager, port=0)
+
+        server.load_program(cycle_manager._runner.program)
         server.stop()
 
 

@@ -23,6 +23,7 @@ class ComposerState:
         self._catalog_path = str(Path(catalog_path).resolve())
         self._kernel = kernel
         self.program: Optional[Program] = None
+        self.program_source_path: str = ""
         self.deployment: Optional[Deployment] = None
         self.cycle_manager: Optional[CycleManager] = None
         self._on_program_loaded: Optional[Callable[["ComposerState"], None]] = None
@@ -49,6 +50,7 @@ class ComposerState:
         runner.load()
 
         self.program = runner.program
+        self.program_source_path = program_path
         self.cycle_manager = CycleManager(runner, self._kernel)
 
         # Notify listeners (e.g. Viser HMI)

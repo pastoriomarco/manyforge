@@ -31,7 +31,27 @@ py::dict status_to_python(const ExecutionStatus& status) {
   d["state_name"] = to_string(status.state);
   d["execution_id"] = status.execution_id;
   d["progress"] = status.progress;
+  d["active_move_id"] = status.active_move_id;
   d["last_error"] = to_string(status.last_error);
+  return d;
+}
+
+// Helper: convert ExecutionSnapshot to Python dict
+py::dict snapshot_to_python(const ExecutionSnapshot& snapshot) {
+  py::dict d;
+  d["timestamp_ns"] = snapshot.timestamp_ns;
+  d["sequence_number"] = snapshot.sequence_number;
+  d["execution_id"] = snapshot.execution_id;
+  d["move_id"] = snapshot.move_id;
+  d["state"] = static_cast<int>(snapshot.state);
+  d["state_name"] = to_string(snapshot.state);
+  d["progress"] = snapshot.progress;
+  d["joint_positions_rad"] = snapshot.joint_positions_rad;
+  if (snapshot.error.has_value()) {
+    d["error"] = snapshot.error->message;
+  } else {
+    d["error"] = py::none();
+  }
   return d;
 }
 
@@ -42,6 +62,25 @@ py::dict command_result(bool accepted, const std::optional<ErrorDTO>& error) {
   if (error.has_value()) {
     d["error"] = error->message;
   }
+  return d;
+}
+
+// Helper: convert MetricsSnapshot to Python dict
+py::dict metrics_to_python(const MetricsSnapshot& metrics) {
+  py::dict d;
+  d["cache_hits"] = metrics.cache_hits;
+  d["cache_misses"] = metrics.cache_misses;
+  d["cache_invalidations"] = metrics.cache_invalidations;
+  d["plans_succeeded"] = metrics.plans_succeeded;
+  d["plans_failed"] = metrics.plans_failed;
+  d["validations_passed"] = metrics.validations_passed;
+  d["validations_failed"] = metrics.validations_failed;
+  d["executions_completed"] = metrics.executions_completed;
+  d["executions_failed"] = metrics.executions_failed;
+  d["stops_issued"] = metrics.stops_issued;
+  d["collision_detections"] = metrics.collision_detections;
+  d["snapshots_published"] = metrics.snapshots_published;
+  d["observer_lag_max_ns"] = metrics.observer_lag_max_ns;
   return d;
 }
 
@@ -105,25 +144,7 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
         }
 
         auto result = self.kernel->execute(req);
-        // Wait for async execution to complete (Python clients expect sync)
-        if (result.ok()) {
-          self.kernel->wait_for_completion();
-        }
-        auto d = result_to_python(result);
-        // Include final execution status (captures async planning errors)
-        if (result.ok()) {
-          auto final_status = self.kernel->get_status();
-          d["final_state"] = to_string(final_status.state);
-          d["final_error"] = to_string(final_status.last_error);
-
-          // Include trajectory duration for speed enforcement tests
-          auto cached = self.cache->lookup(req.move_id);
-          if (cached.has_value() && !cached->waypoints.empty()) {
-            d["trajectory_duration_s"] = cached->waypoints.back().time_from_start_s;
-            d["trajectory_waypoint_count"] = static_cast<int>(cached->waypoints.size());
-          }
-        }
-        return d;
+        return result_to_python(result);
       })
       .def("stop", [](NativeKernelBundle& self) -> py::dict {
         auto r = self.kernel->stop();
@@ -143,6 +164,12 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
       })
       .def("get_status", [](NativeKernelBundle& self) -> py::dict {
         return status_to_python(self.kernel->get_status());
+      })
+      .def("get_execution_snapshot", [](NativeKernelBundle& self) -> py::dict {
+        return snapshot_to_python(self.kernel->get_execution_snapshot());
+      })
+      .def("get_metrics", [](NativeKernelBundle& self) -> py::dict {
+        return metrics_to_python(self.kernel->get_metrics());
       })
       .def("invalidate_trajectories", [](NativeKernelBundle& self) {
         self.cache->invalidate_all();

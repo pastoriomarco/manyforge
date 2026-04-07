@@ -36,6 +36,7 @@ class MoveManipulatorAction(py_trees.behaviour.Behaviour):
         self._params = kwargs
         self._started = False
         self._move_id = kwargs.get("move_id", "")
+        self._base_velocity_scale = float(kwargs.get("velocity_scale", 1.0))
 
     def setup(self, **kwargs: Any) -> None:
         self.blackboard = self.attach_blackboard_client()
@@ -45,6 +46,7 @@ class MoveManipulatorAction(py_trees.behaviour.Behaviour):
 
     def initialise(self) -> None:
         self._started = False
+        self._base_velocity_scale = float(self._params.get("velocity_scale", 1.0))
 
     def update(self) -> py_trees.common.Status:
         # Check stop flag — block new motions if stop is requested
@@ -56,13 +58,13 @@ class MoveManipulatorAction(py_trees.behaviour.Behaviour):
         except (KeyError, AttributeError):
             pass  # No stop flag on blackboard, continue normally
 
-        # Read velocity_scale from blackboard and multiply with per-move scale
+        effective_velocity_scale = self._base_velocity_scale
         try:
             vs_bb = py_trees.blackboard.Client(name=self.name + "_vs")
             vs_bb.register_key(key="velocity_scale", access=py_trees.common.Access.READ)
             bb_velocity_scale = vs_bb.velocity_scale
             if bb_velocity_scale is not None and 0.0 < bb_velocity_scale <= 1.0:
-                self._params["velocity_scale"] = float(self._params.get("velocity_scale", 1.0)) * bb_velocity_scale
+                effective_velocity_scale *= float(bb_velocity_scale)
         except (KeyError, AttributeError):
             pass
 
@@ -87,9 +89,23 @@ class MoveManipulatorAction(py_trees.behaviour.Behaviour):
                     "joint_goal_positions_rad", []
                 ),
                 pose_goal=pose_goal,
-                velocity_scale=float(self._params.get("velocity_scale", 1.0)),
+                velocity_scale=effective_velocity_scale,
                 acceleration_scale=float(
                     self._params.get("acceleration_scale", 1.0)
+                ),
+                max_tcp_linear_speed_mps=(
+                    None
+                    if self._params.get("max_tcp_linear_speed_mps") is None
+                    else float(self._params.get("max_tcp_linear_speed_mps"))
+                ),
+                joint_position_tol_rad=float(
+                    self._params.get("joint_position_tol_rad", 0.05)
+                ),
+                translation_tol_m=float(
+                    self._params.get("translation_tol_m", 0.005)
+                ),
+                rotation_tol_rad=float(
+                    self._params.get("rotation_tol_rad", 0.05)
                 ),
                 planning_timeout_s=float(
                     self._params.get("planning_timeout_s", 2.0)
@@ -120,17 +136,6 @@ class MoveManipulatorAction(py_trees.behaviour.Behaviour):
 
         status = kernel.get_status()
         if status.state == ExecutionState.COMPLETED:
-            # Fire move-complete callback for trajectory animation
-            try:
-                cb_bb = py_trees.blackboard.Client(name=self.name + "_cb_read")
-                cb_bb.register_key(
-                    key="move_complete_callback", access=py_trees.common.Access.READ
-                )
-                callback = cb_bb.move_complete_callback
-                if callback and self._move_id:
-                    callback(self._move_id, kernel)
-            except (KeyError, AttributeError):
-                pass
             return py_trees.common.Status.SUCCESS
         if status.state == ExecutionState.FAILED:
             return py_trees.common.Status.FAILURE

@@ -78,9 +78,15 @@ export const useCycleStore = create<CycleStore>((set, get) => ({
         nodeStatuses: update.nodeStatuses || {},
         programLoaded: update.programLoaded ?? false,
       });
-      // Auto-fetch tree when program becomes available
-      if (update.programLoaded && !prev.programLoaded) {
-        useProgramStore.getState().fetchTree();
+      // Keep the canvas hydrated even if startup ordering or reconnect timing
+      // causes the initial load edge to be missed.
+      const programStore = useProgramStore.getState();
+      const needsHydration = programStore.programInfo === null || programStore.nodes.length === 0;
+      if (update.programLoaded && (!prev.programLoaded || needsHydration)) {
+        void programStore.hydrateLoadedProgram({
+          retries: prev.programLoaded ? 1 : 4,
+          retryDelayMs: 500,
+        });
       }
     });
     set({ _ws: ws });

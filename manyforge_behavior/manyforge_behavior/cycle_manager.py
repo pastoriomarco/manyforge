@@ -2,14 +2,23 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
+import traceback
 from enum import Enum
 from typing import Callable, Optional
 
 import py_trees
 
-from manyforge_behavior.kernel_client import ExecutionState, KernelClient, SceneEditRequest
+logger = logging.getLogger(__name__)
+
+from manyforge_behavior.kernel_client import (
+    ExecutionSnapshot,
+    ExecutionState,
+    KernelClient,
+    SceneEditRequest,
+)
 from manyforge_behavior.runner import OrchestratorRunner
 
 
@@ -53,6 +62,8 @@ class CycleManager:
         self._velocity_scale = 1.0
         self._lock = threading.Lock()
         self._on_run_from_idle: Optional[Callable[[], None]] = None
+        self._error: Optional[str] = None
+        self._node_statuses: dict[str, str] = {}
 
         # Set initial pause event to set (not paused)
         self._tick_pause_event.set()
@@ -66,20 +77,25 @@ class CycleManager:
     def velocity_scale(self) -> float:
         """Current velocity scale (0.0 to 1.0)."""
         return self._velocity_scale
+
+    @property
+    def error(self) -> Optional[str]:
+        """Last error from the tick loop, or None."""
+        return self._error
+
+    def get_execution_snapshot(self) -> ExecutionSnapshot:
+        """Get the latest observer-safe execution snapshot from the kernel."""
+        return self._kernel.get_execution_snapshot()
     
     def get_node_statuses(self) -> dict[str, str]:
-        """Walk the py_trees tree and collect per-node status.
-        
+        """Return the latest atomically-collected node status snapshot.
+
         Returns:
             Dict mapping node instance name to status string.
             Status values: "SUCCESS", "FAILURE", "RUNNING", "INVALID"
         """
-        if self._tree is None:
-            return {}
-        
-        result: dict[str, str] = {}
-        _collect_statuses(self._tree.root, result)
-        return result
+        with self._lock:
+            return dict(self._node_statuses)
     
     def run(self) -> None:
         """
@@ -94,12 +110,19 @@ class CycleManager:
         with self._lock:
             if self._state == CycleState.RUNNING:
                 return  # Already running, no-op
-            
+
+            self._error = None
+
             if self._state == CycleState.IDLE:
-                # First run — build and start everything
-                self._runner.load()
-                self._tree = self._runner.build_tree()
-                self._runner.apply_scene()
+                # Guard: refuse to start if a zombie tick thread is still alive
+                if self._tick_thread is not None and self._tick_thread.is_alive():
+                    raise RuntimeError("Cannot start new cycle: previous tick thread is still alive")
+                # First run — load/build/apply only when not already prepared
+                if self._runner.program is None:
+                    self._runner.load()
+                if self._tree is None:
+                    self._tree = self._runner.build_tree()
+                    self._runner.apply_scene()
                 self._write_bb_keys()
 
                 # Notify listener (e.g. Viser scene refresh)
@@ -170,23 +193,28 @@ class CycleManager:
         with self._lock:
             if self._state == CycleState.IDLE:
                 return  # Already idle, no-op
-            
-            # If running, stop first
-            if self._state == CycleState.RUNNING:
-                # We need to stop without holding the lock to avoid deadlock
-                # since stop() also acquires the lock
-                pass  # Will handle below
-            
-            # Release lock temporarily to call stop()
-        if self._state == CycleState.RUNNING:
+            need_stop = (self._state == CycleState.RUNNING)
+
+        if need_stop:
             self.stop()
-        
+
+        thread_to_join = None
         with self._lock:
             # Stop tick thread if running
             if self._tick_thread is not None and self._tick_thread.is_alive():
                 self._tick_stop_event.set()
-                self._tick_thread.join(timeout=1.0)
-                self._tick_thread = None
+                thread_to_join = self._tick_thread
+
+        if thread_to_join is not None:
+            thread_to_join.join(timeout=1.0)
+
+        with self._lock:
+            if thread_to_join is not None:
+                if thread_to_join.is_alive():
+                    logger.error("Tick thread did not terminate within timeout — zombie thread detected")
+                    self._error = "tick thread did not terminate"
+                elif self._tick_thread is thread_to_join:
+                    self._tick_thread = None
             
             # Reset kernel
             self._kernel.reset()
@@ -239,13 +267,32 @@ class CycleManager:
             
             # Tick the tree
             start_time = time.monotonic()
-            self._tree.tick()
+            try:
+                self._tree.tick()
+            except Exception:
+                error_msg = traceback.format_exc()
+                logger.error("Tick loop exception: %s", error_msg)
+                self._tick_stop_event.set()
+                with self._lock:
+                    self._error = error_msg
+                    self._state = CycleState.IDLE
+                    self._tick_thread = None
+                break
             
+            # Collect node statuses atomically (F-6: thread-safe observer snapshot)
+            statuses: dict[str, str] = {}
+            _collect_statuses(self._tree.root, statuses)
+            with self._lock:
+                self._node_statuses = statuses
+
             # Check if tree completed
             status = self._tree.root.status
             if status in (py_trees.common.Status.SUCCESS, py_trees.common.Status.FAILURE):
                 # Program completed — stop
                 self._tick_stop_event.set()
+                with self._lock:
+                    self._state = CycleState.IDLE
+                    self._tick_thread = None
                 break
             
             # Sleep remainder of period
@@ -253,6 +300,10 @@ class CycleManager:
             sleep_time = period_s - elapsed
             if sleep_time > 0:
                 time.sleep(sleep_time)
+
+        with self._lock:
+            if self._tick_thread is threading.current_thread():
+                self._tick_thread = None
     
     def _write_bb_keys(self) -> None:
         """Write stop_requested=False and velocity_scale to blackboard."""

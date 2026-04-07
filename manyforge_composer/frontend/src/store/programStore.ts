@@ -13,7 +13,9 @@ interface ProgramStore {
   isDirty: boolean;
   
   loadProgram: (path: string) => Promise<void>;
-  fetchTree: () => Promise<void>;
+  fetchProgramInfo: () => Promise<boolean>;
+  fetchTree: () => Promise<boolean>;
+  hydrateLoadedProgram: (options?: { retries?: number; retryDelayMs?: number }) => Promise<boolean>;
   setNodes: (nodes: Node[]) => void;
   setEdges: (edges: Edge[]) => void;
   addNode: (catalogId: string, position: { x: number; y: number }) => void;
@@ -115,6 +117,18 @@ function flowToTree(nodes: Node[], edges: Edge[]): TreeNode | null {
   return buildTree(rootNode.id);
 }
 
+function isProgramNotLoadedError(error: Error): boolean {
+  return error.message.includes('No program loaded');
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    window.setTimeout(resolve, ms);
+  });
+}
+
+let hydratePromise: Promise<boolean> | null = null;
+
 export const useProgramStore = create<ProgramStore>((set, get) => ({
   programInfo: null,
   nodes: [],
@@ -132,19 +146,67 @@ export const useProgramStore = create<ProgramStore>((set, get) => ({
       // Fetch and render tree
       await get().fetchTree();
     } catch (e) {
+      console.error('Failed to load program', e);
       set({ error: (e as Error).message, loading: false });
     }
   },
 
+  fetchProgramInfo: async () => {
+    try {
+      const info = await api.program.get();
+      set({ programInfo: info, error: null });
+      return true;
+    } catch (e) {
+      const error = e as Error;
+      if (isProgramNotLoadedError(error)) {
+        return false;
+      }
+      console.error('Failed to fetch program info', e);
+      set({ error: error.message, loading: false });
+      return false;
+    }
+  },
+
   fetchTree: async () => {
+    set({ loading: true });
     try {
       const data = await api.program.tree();
       const nodes: Node[] = [];
       const edges: Edge[] = [];
       treeToFlow(data.tree, null, { x: 400, y: 50 }, nodes, edges);
-      set({ nodes, edges, loading: false, isDirty: false });
+      set({ nodes, edges, loading: false, isDirty: false, error: null });
+      return true;
     } catch (e) {
+      console.error('Failed to fetch program tree', e);
       set({ error: (e as Error).message, loading: false });
+      return false;
+    }
+  },
+
+  hydrateLoadedProgram: async ({ retries = 4, retryDelayMs = 500 } = {}) => {
+    if (hydratePromise) {
+      return hydratePromise;
+    }
+
+    hydratePromise = (async () => {
+      for (let attempt = 0; attempt <= retries; attempt += 1) {
+        const hasProgram = await get().fetchProgramInfo();
+        if (hasProgram) {
+          return get().fetchTree();
+        }
+
+        if (attempt < retries) {
+          await sleep(retryDelayMs);
+        }
+      }
+
+      return false;
+    })();
+
+    try {
+      return await hydratePromise;
+    } finally {
+      hydratePromise = null;
     }
   },
 

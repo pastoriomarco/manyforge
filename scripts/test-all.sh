@@ -25,6 +25,24 @@ FAIL=0
 section() { echo -e "\n${GREEN}=== $1 ===${NC}"; }
 skip()    { echo -e "${YELLOW}  SKIP: $1${NC}"; }
 
+setup_pythonpath() {
+    export PYTHONPATH="$WORKSPACE:$WORKSPACE/manyforge_behavior:${PYTHONPATH:-}"
+}
+
+python_has_modules() {
+    python3 - "$@" <<'PY'
+import importlib
+import sys
+
+for name in sys.argv[1:]:
+    try:
+        importlib.import_module(name)
+    except Exception:
+        raise SystemExit(1)
+raise SystemExit(0)
+PY
+}
+
 run_cpp_tests() {
     section "C++ manyforge_core tests"
     local build="$BUILD_DIR/core"
@@ -44,6 +62,10 @@ run_roboplan_tests() {
     mkdir -p "$build" && cd "$build"
 
     PINOCCHIO_CMAKE_DIR=$(find /usr -name "pinocchioConfig.cmake" -printf '%h\n' 2>/dev/null | head -1)
+    if [ -z "$PINOCCHIO_CMAKE_DIR" ]; then
+        skip "Pinocchio CMake package not found; run roboplan tests in manyforge-dev or install pinocchio locally"
+        return
+    fi
     PINOCCHIO_PREFIX=$(dirname "$(dirname "$(dirname "$PINOCCHIO_CMAKE_DIR")")")
     local pybind11_dir
     pybind11_dir=$(python3 -c "import pybind11; print(pybind11.get_cmake_dir())" 2>/dev/null || echo "")
@@ -95,6 +117,7 @@ run_pybind_tests() {
 run_python_tests() {
     section "Python manyforge_behavior tests"
     cd "$WORKSPACE"
+    setup_pythonpath
     if pytest manyforge_behavior/tests/ -v; then
         PASS=$((PASS + 1))
     else
@@ -105,6 +128,7 @@ run_python_tests() {
 run_hmi_tests() {
     section "Python manyforge_hmi tests"
     cd "$WORKSPACE"
+    setup_pythonpath
     if pytest manyforge_hmi/tests/ -v; then
         PASS=$((PASS + 1))
     else
@@ -115,7 +139,42 @@ run_hmi_tests() {
 run_integration_tests() {
     section "Integration tests"
     cd "$WORKSPACE"
+    setup_pythonpath
     if pytest tests/ -v; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+    fi
+}
+
+run_composer_backend_tests() {
+    section "Composer backend tests"
+    cd "$WORKSPACE"
+    setup_pythonpath
+    if ! python_has_modules fastapi py_trees httpx; then
+        skip "Missing Python deps for composer backend tests (need fastapi, py_trees, httpx)"
+        return
+    fi
+    if pytest manyforge_composer/tests/ -v; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+    fi
+}
+
+run_composer_frontend_build() {
+    section "Composer frontend build"
+    local frontend_dir="$WORKSPACE/manyforge_composer/frontend"
+    if ! command -v npm >/dev/null 2>&1; then
+        skip "npm not available"
+        return
+    fi
+    if [ ! -f "$frontend_dir/package.json" ]; then
+        skip "Composer frontend package.json not found"
+        return
+    fi
+    cd "$frontend_dir"
+    if npm run build; then
         PASS=$((PASS + 1))
     else
         FAIL=$((FAIL + 1))
@@ -136,6 +195,10 @@ case "$FILTER" in
         run_python_tests
         run_hmi_tests
         ;;
+    composer)
+        run_composer_backend_tests
+        run_composer_frontend_build
+        ;;
     integration)
         run_integration_tests
         ;;
@@ -146,9 +209,11 @@ case "$FILTER" in
         run_python_tests
         run_hmi_tests
         run_integration_tests
+        run_composer_backend_tests
+        run_composer_frontend_build
         ;;
     *)
-        echo "Usage: $0 [all|cpp|roboplan|bindings|python|integration]"
+        echo "Usage: $0 [all|cpp|roboplan|bindings|python|composer|integration]"
         exit 1
         ;;
 esac

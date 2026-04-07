@@ -3,7 +3,16 @@ import pytest
 import py_trees
 from unittest.mock import MagicMock
 
-from manyforge_behavior.cycle_manager import CycleManager
+from manyforge_behavior.cycle_manager import CycleManager, _collect_statuses
+
+
+def _simulate_tick_status_collection(cm):
+    """Simulate what the tick loop does: collect statuses and store atomically."""
+    if cm._tree is None:
+        return
+    statuses = {}
+    _collect_statuses(cm._tree.root, statuses)
+    cm._node_statuses = statuses
 
 
 def test_get_node_statuses_no_tree():
@@ -37,9 +46,10 @@ def test_get_node_statuses_after_tick():
     runner = MagicMock()
     cm = CycleManager(runner, kernel)
     cm._tree = tree
-    
+    _simulate_tick_status_collection(cm)
+
     statuses = cm.get_node_statuses()
-    
+
     assert "main_seq" in statuses
     assert "always_success" in statuses
     assert "always_running" in statuses
@@ -71,16 +81,17 @@ def test_get_node_statuses_nested_tree():
     runner = MagicMock()
     cm = CycleManager(runner, kernel)
     cm._tree = tree
-    
+    _simulate_tick_status_collection(cm)
+
     statuses = cm.get_node_statuses()
-    
+
     # All nodes should be present
     assert "root_seq" in statuses
     assert "seq1" in statuses
     assert "action1" in statuses
     assert "seq2" in statuses
     assert "action2" in statuses
-    
+
     # Check statuses
     assert statuses["action1"] == "SUCCESS"
     assert statuses["action2"] == "FAILURE"
@@ -105,9 +116,10 @@ def test_get_node_statuses_with_decorator():
     runner = MagicMock()
     cm = CycleManager(runner, kernel)
     cm._tree = tree
-    
+    _simulate_tick_status_collection(cm)
+
     statuses = cm.get_node_statuses()
-    
+
     # All nodes should be present
     assert "root_seq" in statuses
     assert "inverter_node" in statuses
@@ -130,9 +142,10 @@ def test_get_node_statuses_invalid_status():
     runner = MagicMock()
     cm = CycleManager(runner, kernel)
     cm._tree = tree
-    
+    _simulate_tick_status_collection(cm)
+
     statuses = cm.get_node_statuses()
-    
+
     assert "main_seq" in statuses
     assert "always_success" in statuses
     assert statuses["main_seq"] == "INVALID"

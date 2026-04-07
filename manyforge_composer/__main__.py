@@ -3,8 +3,6 @@ from __future__ import annotations
 
 import argparse
 import logging
-import queue
-import threading
 
 import py_trees
 import uvicorn
@@ -29,6 +27,113 @@ REST_POSE = {
     "wrist_2_joint": -1.57,
     "wrist_3_joint": 0.0,
 }
+
+
+def build_program_loaded_callback(
+    *,
+    host: str,
+    hmi_port: int,
+    urdf_path: str | None,
+    package_dirs: list[str],
+    bundle,
+    hmi_server_factory=None,
+):
+    """Build the Composer program-load callback that wires Viser HMI state.
+
+    Extracted for testability so backend tests can validate the callback
+    without spawning uvicorn or a real Viser server.
+    """
+    if hmi_server_factory is None:
+        from manyforge_hmi.server import ViserHmiServer
+        hmi_server_factory = ViserHmiServer
+
+    _hmi_server = None
+
+    def on_program_loaded(st: ComposerState):
+        nonlocal _hmi_server
+
+        # Stop previous HMI if reloading a program
+        if _hmi_server is not None:
+            _hmi_server.stop()
+
+        _hmi_server = hmi_server_factory(
+            cycle_manager=st.cycle_manager,
+            host=host,
+            port=hmi_port,
+            urdf_path=urdf_path,
+            joint_names=JOINT_NAMES,
+            package_dirs=package_dirs or None,
+        )
+        _hmi_server.load_program(st.program)
+
+        # Set initial joint positions (both planner and visualization)
+        if bundle is not None:
+            bundle.set_joint_positions(list(REST_POSE.values()))
+            logger.info("Set planner joint positions to rest pose")
+        if _hmi_server.robot_visualizer:
+            _hmi_server.robot_visualizer.update_joints(REST_POSE)
+
+        # --- Register scene_edit_callback for Viser scene sync ---
+        # Build link-name -> Viser scene path map for frame-attached objects
+        _link_viser_paths: dict[str, str] = {}
+        if _hmi_server.robot_visualizer:
+            try:
+                import viser.extras._urdf as _urdf_module
+                _urdf_scene = _hmi_server.robot_visualizer.viser_urdf._urdf.scene
+                if _urdf_scene is not None:
+                    for frame_name in ("tool0", "wrist_3_link"):
+                        try:
+                            _link_viser_paths[frame_name] = _urdf_module._viser_name_from_frame(
+                                _urdf_scene, frame_name, "/robot/visual"
+                            )
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+        def on_scene_edit(operation: str, request):
+            renderer = _hmi_server.scene_renderer
+            if operation == "remove":
+                renderer.remove_object(request.object_id)
+                logger.debug("Scene: removed '%s'", request.object_id)
+                return
+            # Add operation
+            frame = request.frame_id or "universe"
+            pos = tuple(request.pose_position_m or [0, 0, 0])
+            orient = tuple(request.pose_orientation_xyzw or [0, 0, 0, 1])
+            if frame != "universe":
+                viser_path = _link_viser_paths.get(frame)
+                if viser_path and request.shape_type == "box" and request.box_dimensions_m:
+                    renderer.add_box_on_frame(
+                        request.object_id, viser_path,
+                        tuple(request.box_dimensions_m), pos, orient,
+                    )
+                logger.debug("Scene: '%s' attached to %s", request.object_id, frame)
+                return
+            if request.shape_type == "box" and request.box_dimensions_m:
+                renderer.add_box(request.object_id, tuple(request.box_dimensions_m), pos, orient)
+            elif request.shape_type == "sphere" and request.sphere_radius_m:
+                renderer.add_sphere(request.object_id, request.sphere_radius_m, pos)
+            logger.debug("Scene: added '%s' at %s", operation, request.object_id)
+
+        bb = py_trees.blackboard.Client(name="composer_scene_sync")
+        bb.register_key(key="scene_edit_callback", access=py_trees.common.Access.WRITE)
+        bb.scene_edit_callback = on_scene_edit
+
+        # Reset Viser scene on each run from IDLE (e.g. after reset)
+        # so objects return to their initial YAML positions.
+        def _refresh_viser_scene():
+            if _hmi_server and _hmi_server.scene_renderer:
+                _hmi_server.scene_renderer.clear()
+                if st.program:
+                    _hmi_server.scene_renderer.load_from_program(st.program.scene)
+
+        st.cycle_manager._on_run_from_idle = _refresh_viser_scene
+
+        _hmi_server.start()
+        logger.info("Viser HMI started on port %d", hmi_port)
+
+    return on_program_loaded
 
 
 def _make_kernel():
@@ -101,124 +206,13 @@ def main():
 
     # Wire up Viser HMI if --hmi-port is set
     if args.hmi_port is not None:
-        _hmi_server = None
-
-        def on_program_loaded(st: ComposerState):
-            nonlocal _hmi_server
-            from manyforge_hmi.server import ViserHmiServer
-
-            # Stop previous HMI if reloading a program
-            if _hmi_server is not None:
-                _hmi_server.stop()
-
-            _hmi_server = ViserHmiServer(
-                cycle_manager=st.cycle_manager,
-                host=args.host,
-                port=args.hmi_port,
-                urdf_path=urdf_path,
-                joint_names=JOINT_NAMES,
-                package_dirs=package_dirs or None,
-            )
-            _hmi_server.load_program(st.program)
-
-            # Set initial joint positions (both planner and visualization)
-            if bundle is not None:
-                bundle.set_joint_positions(list(REST_POSE.values()))
-                logger.info("Set planner joint positions to rest pose")
-            if _hmi_server.robot_visualizer:
-                _hmi_server.robot_visualizer.update_joints(REST_POSE)
-
-            # --- Register move_complete_callback on blackboard ---
-            # Animations run in a single background thread via a FIFO queue.
-            # This ensures: (1) execution is NEVER blocked by animation,
-            # (2) animations play in order (no concurrent overlaps),
-            # (3) no risk of deadlocks or slow-downs in the tick loop.
-            _anim_queue: queue.SimpleQueue = queue.SimpleQueue()
-
-            def _run_animations():
-                while True:
-                    item = _anim_queue.get()
-                    if item is None:
-                        break
-                    joint_names, waypoints = item
-                    if _hmi_server and _hmi_server.robot_visualizer:
-                        _hmi_server.robot_visualizer.animate_trajectory(
-                            joint_names, waypoints, speed_scale=1.0)
-
-            threading.Thread(target=_run_animations, daemon=True).start()
-
-            def on_move_complete(move_id: str, kernel_client):
-                traj = kernel_client.get_cached_trajectory(move_id)
-                if traj:
-                    logger.info("Queuing animation: %s (%d waypoints, %.2fs)",
-                                move_id, len(traj.waypoints),
-                                traj.waypoints[-1].time_from_start_s if traj.waypoints else 0)
-                    _anim_queue.put((traj.joint_names, traj.waypoints))
-
-            bb = py_trees.blackboard.Client(name="composer_callbacks")
-            bb.register_key(key="move_complete_callback", access=py_trees.common.Access.WRITE)
-            bb.move_complete_callback = on_move_complete
-
-            # --- Register scene_edit_callback for Viser scene sync ---
-            # Build link-name -> Viser scene path map for frame-attached objects
-            _link_viser_paths: dict[str, str] = {}
-            if _hmi_server.robot_visualizer:
-                try:
-                    import viser.extras._urdf as _urdf_module
-                    _urdf_scene = _hmi_server.robot_visualizer.viser_urdf._urdf.scene
-                    if _urdf_scene is not None:
-                        for frame_name in ("tool0", "wrist_3_link"):
-                            try:
-                                _link_viser_paths[frame_name] = _urdf_module._viser_name_from_frame(
-                                    _urdf_scene, frame_name, "/robot/visual"
-                                )
-                            except Exception:
-                                pass
-                except Exception:
-                    pass
-
-            def on_scene_edit(operation: str, request):
-                renderer = _hmi_server.scene_renderer
-                if operation == "remove":
-                    renderer.remove_object(request.object_id)
-                    logger.debug("Scene: removed '%s'", request.object_id)
-                    return
-                # Add operation
-                frame = request.frame_id or "universe"
-                pos = tuple(request.pose_position_m or [0, 0, 0])
-                orient = tuple(request.pose_orientation_xyzw or [0, 0, 0, 1])
-                if frame != "universe":
-                    viser_path = _link_viser_paths.get(frame)
-                    if viser_path and request.shape_type == "box" and request.box_dimensions_m:
-                        renderer.add_box_on_frame(
-                            request.object_id, viser_path,
-                            tuple(request.box_dimensions_m), pos, orient,
-                        )
-                    logger.debug("Scene: '%s' attached to %s", request.object_id, frame)
-                    return
-                if request.shape_type == "box" and request.box_dimensions_m:
-                    renderer.add_box(request.object_id, tuple(request.box_dimensions_m), pos, orient)
-                elif request.shape_type == "sphere" and request.sphere_radius_m:
-                    renderer.add_sphere(request.object_id, request.sphere_radius_m, pos)
-                logger.debug("Scene: added '%s' at %s", operation, request.object_id)
-
-            bb.register_key(key="scene_edit_callback", access=py_trees.common.Access.WRITE)
-            bb.scene_edit_callback = on_scene_edit
-
-            # Reset Viser scene on each run from IDLE (e.g. after reset)
-            # so objects return to their initial YAML positions.
-            def _refresh_viser_scene():
-                if _hmi_server and _hmi_server.scene_renderer:
-                    _hmi_server.scene_renderer.clear()
-                    if st.program:
-                        _hmi_server.scene_renderer.load_from_program(st.program.scene)
-
-            st.cycle_manager._on_run_from_idle = _refresh_viser_scene
-
-            _hmi_server.start()
-            logger.info("Viser HMI started on port %d", args.hmi_port)
-
-        state._on_program_loaded = on_program_loaded
+        state._on_program_loaded = build_program_loaded_callback(
+            host=args.host,
+            hmi_port=args.hmi_port,
+            urdf_path=urdf_path,
+            package_dirs=package_dirs,
+            bundle=bundle,
+        )
 
     app = create_app(state)
     uvicorn.run(app, host=args.host, port=args.port)

@@ -74,8 +74,9 @@ class TestCycleManagerRun:
     
     def test_run_from_stopped_resumes(self, kernel):
         """run() from STOPPED resumes execution."""
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
-        manager = CycleManager(runner, kernel)
+        slow_kernel = MockKernelClient(execute_duration_s=1.0)
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, slow_kernel)
+        manager = CycleManager(runner, slow_kernel)
         
         # Run then stop
         manager.run()
@@ -93,19 +94,22 @@ class TestCycleManagerStop:
     
     def test_stop_from_running(self, kernel):
         """stop() from RUNNING sets state to STOPPED."""
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
-        manager = CycleManager(runner, kernel)
+        slow_kernel = MockKernelClient(execute_duration_s=1.0)
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, slow_kernel)
+        manager = CycleManager(runner, slow_kernel)
         
         manager.run()
         assert manager.state == CycleState.RUNNING
+        time.sleep(0.05)
         
         manager.stop()
         assert manager.state == CycleState.STOPPED
     
     def test_stop_from_stopped_is_noop(self, kernel):
         """stop() from STOPPED is a no-op."""
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
-        manager = CycleManager(runner, kernel)
+        slow_kernel = MockKernelClient(execute_duration_s=1.0)
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, slow_kernel)
+        manager = CycleManager(runner, slow_kernel)
         
         manager.run()
         time.sleep(0.2)
@@ -127,18 +131,16 @@ class TestCycleManagerStop:
     
     def test_stop_calls_kernel_pause_if_executing(self, kernel):
         """stop() calls kernel.pause() if kernel is EXECUTING."""
-        # Create a kernel that's in EXECUTING state
-        kernel._state = ExecutionState.EXECUTING
-        
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
-        manager = CycleManager(runner, kernel)
+        slow_kernel = MockKernelClient(execute_duration_s=1.0)
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, slow_kernel)
+        manager = CycleManager(runner, slow_kernel)
         
         manager.run()
-        time.sleep(0.1)
+        time.sleep(0.05)
         manager.stop()
         
         # Kernel should have been paused
-        assert kernel.pause_count == 1
+        assert slow_kernel.pause_count == 1
 
 
 class TestCycleManagerReset:
@@ -157,8 +159,9 @@ class TestCycleManagerReset:
     
     def test_reset_from_stopped(self, kernel):
         """reset() from STOPPED resets to IDLE."""
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
-        manager = CycleManager(runner, kernel)
+        slow_kernel = MockKernelClient(execute_duration_s=1.0)
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, slow_kernel)
+        manager = CycleManager(runner, slow_kernel)
         
         manager.run()
         time.sleep(0.2)
@@ -167,6 +170,8 @@ class TestCycleManagerReset:
         
         manager.reset()
         assert manager.state == CycleState.IDLE
+        assert manager.error is None
+        assert manager._tick_thread is None or not manager._tick_thread.is_alive()
     
     def test_reset_from_idle_is_noop(self, kernel):
         """reset() from IDLE is a no-op."""
@@ -216,8 +221,9 @@ class TestCycleManagerVelocityScale:
     
     def test_stop_flag_blocks_new_motion(self, kernel):
         """stop_requested flag is written to blackboard."""
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
-        manager = CycleManager(runner, kernel)
+        slow_kernel = MockKernelClient(execute_duration_s=1.0)
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, slow_kernel)
+        manager = CycleManager(runner, slow_kernel)
         
         manager.run()
         time.sleep(0.1)
@@ -249,6 +255,7 @@ class TestCycleManagerProgramCompletion:
         # Program should have completed (tree ticked to SUCCESS)
         # The tick thread exits when tree completes
         assert manager._tick_thread is None or not manager._tick_thread.is_alive()
+        assert manager.state == CycleState.IDLE
         
         # Kernel should have been called
         assert kernel.execute_count >= 1

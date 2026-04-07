@@ -63,6 +63,7 @@ export interface ProgramInfo {
   robot: Robot;
   sceneCount: number;
   parameterCount: number;
+  sourcePath: string;
 }
 
 export interface ProgramTree {

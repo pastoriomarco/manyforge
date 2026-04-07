@@ -3,6 +3,10 @@
 #include <manyforge_core/time/fake_clock.hpp>
 #include <manyforge_core/time/manual_scheduler.hpp>
 
+#include <chrono>
+#include <condition_variable>
+#include <map>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -86,6 +90,7 @@ class MockContext : public IPlanningContext {
   RobotStateDTO current_state;
   ValidationResultDTO next_validation;
   CollisionCheckResultDTO next_collision;
+  std::vector<CollisionCheckResultDTO> collision_sequence;
   Pose3DTO next_fk;
   JointLimitsDTO next_limits;
   SceneEditResultDTO next_scene_edit;
@@ -109,6 +114,11 @@ class MockContext : public IPlanningContext {
   CollisionCheckResultDTO collision_check(
       const CollisionCheckRequestDTO& /*request*/) override {
     ++collision_count;
+    if (!collision_sequence.empty()) {
+      auto result = collision_sequence.front();
+      collision_sequence.erase(collision_sequence.begin());
+      return result;
+    }
     return next_collision;
   }
 
@@ -143,11 +153,19 @@ class MockExecution : public IExecutionBackend {
   int resume_count = 0;
   int reset_count = 0;
   TrajectoryDTO last_trajectory;
+  ExecutionSnapshot snapshot;
 
   ExecutionHandle execute_trajectory(const TrajectoryDTO& trajectory) override {
     ++execute_count;
     last_trajectory = trajectory;
-    return ExecutionHandle{};
+    snapshot.state = ExecutionState::kCompleted;
+    snapshot.progress = 1.0;
+    if (!trajectory.waypoints.empty()) {
+      snapshot.joint_positions_rad = trajectory.waypoints.back().positions_rad;
+    }
+    return ExecutionHandle{
+        [](int64_t /*timeout_ns*/) { return true; },
+        [this]() { return snapshot; }};
   }
 
   StopResultDTO stop() override {
@@ -163,13 +181,245 @@ class MockExecution : public IExecutionBackend {
   ExecutionHandle resume(const TrajectoryDTO& trajectory) override {
     ++resume_count;
     last_trajectory = trajectory;
-    return ExecutionHandle{};
+    snapshot.state = ExecutionState::kCompleted;
+    snapshot.progress = 1.0;
+    if (!trajectory.waypoints.empty()) {
+      snapshot.joint_positions_rad = trajectory.waypoints.back().positions_rad;
+    }
+    return ExecutionHandle{
+        [](int64_t /*timeout_ns*/) { return true; },
+        [this]() { return snapshot; }};
   }
 
   ResetResultDTO reset() override {
     ++reset_count;
     return ResetResultDTO{true, std::nullopt};
   }
+};
+
+class ControlledExecution : public IExecutionBackend {
+ public:
+  int execute_count = 0;
+  int stop_count = 0;
+  int pause_count = 0;
+  int resume_count = 0;
+  int reset_count = 0;
+  TrajectoryDTO last_execute_trajectory;
+  TrajectoryDTO last_resume_trajectory;
+  ExecutionSnapshot snapshot;
+
+  ExecutionHandle execute_trajectory(const TrajectoryDTO& trajectory) override {
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      ++execute_count;
+      last_execute_trajectory = trajectory;
+      running_ = true;
+      paused_ = false;
+      snapshot.state = ExecutionState::kExecuting;
+      snapshot.progress = 0.0;
+      if (!trajectory.waypoints.empty()) {
+        snapshot.joint_positions_rad = trajectory.waypoints.front().positions_rad;
+      }
+    }
+    cv_.notify_all();
+    return make_handle();
+  }
+
+  StopResultDTO stop() override {
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      if (!running_) {
+        return StopResultDTO{
+            false,
+            ErrorDTO{kErrorInvalidRequest, "No execution in flight", {}}};
+      }
+      ++stop_count;
+      running_ = false;
+      paused_ = false;
+      snapshot.state = ExecutionState::kStopped;
+    }
+    cv_.notify_all();
+    return StopResultDTO{true, std::nullopt};
+  }
+
+  PauseResultDTO pause() override {
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      if (!running_) {
+        return PauseResultDTO{
+            false,
+            ErrorDTO{kErrorInvalidRequest, "No execution in flight", {}}};
+      }
+      ++pause_count;
+      paused_ = true;
+      snapshot.state = ExecutionState::kPaused;
+    }
+    cv_.notify_all();
+    return PauseResultDTO{true, std::nullopt};
+  }
+
+  ExecutionHandle resume(const TrajectoryDTO& trajectory) override {
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      ++resume_count;
+      last_resume_trajectory = trajectory;
+      paused_ = false;
+      if (running_) {
+        snapshot.state = ExecutionState::kExecuting;
+      }
+    }
+    cv_.notify_all();
+    return make_handle();
+  }
+
+  ResetResultDTO reset() override {
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      ++reset_count;
+      running_ = false;
+      paused_ = false;
+      snapshot.state = ExecutionState::kIdle;
+      snapshot.progress = 0.0;
+      snapshot.joint_positions_rad.clear();
+    }
+    cv_.notify_all();
+    return ResetResultDTO{true, std::nullopt};
+  }
+
+  void set_progress(double progress, std::vector<double> joint_positions) {
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      snapshot.progress = progress;
+      snapshot.joint_positions_rad = std::move(joint_positions);
+      snapshot.state = paused_ ? ExecutionState::kPaused : ExecutionState::kExecuting;
+    }
+    cv_.notify_all();
+  }
+
+  void complete() {
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      running_ = false;
+      paused_ = false;
+      snapshot.state = ExecutionState::kCompleted;
+      snapshot.progress = 1.0;
+      const auto* source = !last_resume_trajectory.waypoints.empty()
+                               ? &last_resume_trajectory
+                               : &last_execute_trajectory;
+      if (!source->waypoints.empty()) {
+        snapshot.joint_positions_rad = source->waypoints.back().positions_rad;
+      }
+    }
+    cv_.notify_all();
+  }
+
+  void release() {
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      running_ = false;
+      paused_ = false;
+    }
+    cv_.notify_all();
+  }
+
+  void wait_until_execute_called() {
+    std::unique_lock<std::mutex> lock(mu_);
+    cv_.wait(lock, [this]() { return execute_count > 0; });
+  }
+
+  void wait_until_paused() {
+    std::unique_lock<std::mutex> lock(mu_);
+    cv_.wait(lock, [this]() { return paused_; });
+  }
+
+  void wait_until_resume_called() {
+    std::unique_lock<std::mutex> lock(mu_);
+    cv_.wait(lock, [this]() { return resume_count > 0; });
+  }
+
+ private:
+  ExecutionHandle make_handle() {
+    return ExecutionHandle{
+        [this](int64_t timeout_ns) {
+          std::unique_lock<std::mutex> lock(mu_);
+          if (timeout_ns > 0) {
+            return cv_.wait_for(lock, std::chrono::nanoseconds(timeout_ns),
+                                [this]() { return !running_; });
+          }
+          cv_.wait(lock, [this]() { return !running_; });
+          return true;
+        },
+        [this]() {
+          std::lock_guard<std::mutex> lock(mu_);
+          return snapshot;
+        }};
+  }
+
+  std::mutex mu_;
+  std::condition_variable cv_;
+  bool running_ = false;
+  bool paused_ = false;
+};
+
+class ThreadSafeManualScheduler final : public IScheduler {
+ public:
+  ScheduleHandle schedule(TimePoint deadline, std::function<void()> callback) override {
+    std::lock_guard<std::mutex> lock(mu_);
+    ScheduleHandle handle = next_handle_++;
+    pending_.emplace(deadline, std::make_pair(handle, std::move(callback)));
+    return handle;
+  }
+
+  void cancel(ScheduleHandle handle) override {
+    std::lock_guard<std::mutex> lock(mu_);
+    for (auto it = pending_.begin(); it != pending_.end(); ++it) {
+      if (it->second.first == handle) {
+        pending_.erase(it);
+        return;
+      }
+    }
+  }
+
+  void advance_to(TimePoint t) {
+    std::vector<std::function<void()>> to_fire;
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      for (auto it = pending_.begin(); it != pending_.end();) {
+        if (it->first <= t) {
+          to_fire.push_back(std::move(it->second.second));
+          it = pending_.erase(it);
+        } else {
+          ++it;
+        }
+      }
+    }
+
+    for (auto& callback : to_fire) {
+      callback();
+    }
+  }
+
+ private:
+  mutable std::mutex mu_;
+  std::multimap<TimePoint, std::pair<ScheduleHandle, std::function<void()>>> pending_;
+  uint64_t next_handle_ = 1;
+};
+
+class ThreadSafeFakeClock final : public IClock {
+ public:
+  TimePoint now() const override {
+    std::lock_guard<std::mutex> lock(mu_);
+    return current_time_;
+  }
+
+  void advance(Duration duration) {
+    std::lock_guard<std::mutex> lock(mu_);
+    current_time_ += duration;
+  }
+
+ private:
+  mutable std::mutex mu_;
+  TimePoint current_time_ = 0;
 };
 
 // --- Helper ---
@@ -200,6 +450,17 @@ ExecuteRequestDTO make_test_request(const std::string& move_id = "move_1") {
   req.cache_mode = CacheMode::kDefault;
   req.motion = JointGoalDTO{{"j1", "j2"}, {1.0, 1.0}};
   return req;
+}
+
+bool wait_for_state(ExecutionKernel& kernel, ExecutionState target_state,
+                    int max_attempts = 200) {
+  for (int attempt = 0; attempt < max_attempts; ++attempt) {
+    if (kernel.get_status().state == target_state) {
+      return true;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  return false;
 }
 
 // --- Test fixture ---
@@ -397,6 +658,83 @@ TEST_F(ExecutionKernelTest, Resume_FromIdle_NotAccepted) {
   EXPECT_FALSE(result.accepted);
 }
 
+TEST_F(ExecutionKernelTest, Resume_FromPaused_RevalidatesRemainingTrajectory) {
+  ControlledExecution controlled_execution;
+  FakeClock local_clock;
+  ManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  ExecutionKernel controlled_kernel{
+      planner, context, controlled_execution, local_clock, local_scheduler, local_cache};
+
+  auto result = controlled_kernel.execute(make_test_request());
+  ASSERT_TRUE(result.ok());
+  controlled_execution.wait_until_execute_called();
+  ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kExecuting));
+
+  controlled_execution.set_progress(0.5, {0.5, 0.5});
+  auto pause_result = controlled_kernel.pause();
+  ASSERT_TRUE(pause_result.accepted);
+  local_scheduler.advance_to(local_clock.now());
+  controlled_execution.wait_until_paused();
+  ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kPaused));
+
+  context.current_state.positions_rad = {0.5, 0.5};
+
+  auto resume_result = controlled_kernel.resume();
+  ASSERT_TRUE(resume_result.accepted);
+  controlled_execution.wait_until_resume_called();
+  ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kExecuting));
+
+  EXPECT_GE(context.validate_count, 2);
+  ASSERT_FALSE(controlled_execution.last_resume_trajectory.waypoints.empty());
+  EXPECT_DOUBLE_EQ(
+      controlled_execution.last_resume_trajectory.waypoints.front().positions_rad[0], 0.5);
+  EXPECT_DOUBLE_EQ(
+      controlled_execution.last_resume_trajectory.waypoints.front().positions_rad[1], 0.5);
+  EXPECT_GE(controlled_execution.last_resume_trajectory.waypoints.size(), 2u);
+  EXPECT_DOUBLE_EQ(
+      controlled_execution.last_resume_trajectory.waypoints.back().positions_rad[0], 1.0);
+  EXPECT_DOUBLE_EQ(
+      controlled_execution.last_resume_trajectory.waypoints.back().positions_rad[1], 1.0);
+
+  controlled_execution.complete();
+  controlled_kernel.wait_for_completion();
+  EXPECT_EQ(controlled_kernel.get_status().state, ExecutionState::kCompleted);
+}
+
+TEST_F(ExecutionKernelTest, Resume_FromPaused_ValidationFailureTransitionsToFailed) {
+  ControlledExecution controlled_execution;
+  FakeClock local_clock;
+  ManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  ExecutionKernel controlled_kernel{
+      planner, context, controlled_execution, local_clock, local_scheduler, local_cache};
+
+  auto result = controlled_kernel.execute(make_test_request());
+  ASSERT_TRUE(result.ok());
+  controlled_execution.wait_until_execute_called();
+  ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kExecuting));
+
+  controlled_execution.set_progress(0.5, {0.5, 0.5});
+  auto pause_result = controlled_kernel.pause();
+  ASSERT_TRUE(pause_result.accepted);
+  local_scheduler.advance_to(local_clock.now());
+  controlled_execution.wait_until_paused();
+  ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kPaused));
+
+  context.current_state.positions_rad = {0.5, 0.5};
+  context.next_validation = ValidationResultDTO{
+      false, ErrorDTO{kErrorValidationCollision, "Resume collision", {}}};
+
+  auto resume_result = controlled_kernel.resume();
+  ASSERT_TRUE(resume_result.accepted);
+  controlled_kernel.wait_for_completion();
+
+  EXPECT_EQ(controlled_execution.resume_count, 0);
+  EXPECT_EQ(controlled_execution.stop_count, 1);
+  EXPECT_EQ(controlled_kernel.get_status().state, ExecutionState::kFailed);
+}
+
 // --- Reset ---
 
 TEST_F(ExecutionKernelTest, Reset_FromCompleted_ToIdle) {
@@ -439,6 +777,47 @@ TEST_F(ExecutionKernelTest, CollisionCheckTick_NotExecuting_NoOp) {
   auto result = kernel.collision_check_tick();
   EXPECT_TRUE(result.ok());
   EXPECT_EQ(context.collision_count, 0);
+}
+
+TEST_F(ExecutionKernelTest, CollisionMonitoring_SchedulerTickChecksCollisionAndStopsExecution) {
+  ControlledExecution controlled_execution;
+  ThreadSafeFakeClock local_clock;
+  ThreadSafeManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  ExecutionKernel controlled_kernel{
+      planner, context, controlled_execution, local_clock, local_scheduler, local_cache};
+
+  context.collision_sequence = {
+      CollisionCheckResultDTO{false, std::nullopt, std::nullopt},
+      CollisionCheckResultDTO{true, "link1", "box"},
+  };
+
+  auto result = controlled_kernel.execute(make_test_request());
+  ASSERT_TRUE(result.ok());
+  controlled_execution.wait_until_execute_called();
+  ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kExecuting));
+  std::this_thread::sleep_for(std::chrono::milliseconds(5));
+
+  local_clock.advance(10'000'000);
+  local_scheduler.advance_to(local_clock.now());
+  for (int attempt = 0;
+       attempt < 100 &&
+       context.collision_count == 0 &&
+       controlled_execution.stop_count == 0;
+       ++attempt) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    local_scheduler.advance_to(local_clock.now());
+  }
+  bool completed = controlled_kernel.wait_for_completion(200'000'000);
+  if (!completed) {
+    controlled_execution.release();
+    completed = controlled_kernel.wait_for_completion(1'000'000'000);
+  }
+  EXPECT_TRUE(completed);
+
+  EXPECT_GE(context.collision_count, 1);
+  EXPECT_EQ(controlled_execution.stop_count, 1);
+  EXPECT_EQ(controlled_kernel.get_status().state, ExecutionState::kStopped);
 }
 
 // --- Full cycle test ---
@@ -490,6 +869,19 @@ TEST_F(ExecutionKernelTest, GetStatus_AfterExecute_HasExecutionId) {
   auto status = kernel.get_status();
   EXPECT_EQ(status.execution_id, 1u);
   EXPECT_EQ(status.progress, 1.0);
+}
+
+TEST_F(ExecutionKernelTest, GetExecutionSnapshot_AfterExecute_ContainsIdsAndFinalState) {
+  execute_sync(make_test_request("snapshot_move"));
+  auto snapshot = kernel.get_execution_snapshot();
+  EXPECT_EQ(snapshot.execution_id, 1u);
+  EXPECT_EQ(snapshot.move_id, "snapshot_move");
+  EXPECT_EQ(snapshot.state, ExecutionState::kCompleted);
+  EXPECT_DOUBLE_EQ(snapshot.progress, 1.0);
+  ASSERT_EQ(snapshot.joint_positions_rad.size(), 2u);
+  EXPECT_EQ(snapshot.joint_positions_rad[0], 1.0);
+  EXPECT_EQ(snapshot.joint_positions_rad[1], 1.0);
+  EXPECT_GT(snapshot.sequence_number, 0u);
 }
 
 // ============================================================================
@@ -1111,6 +1503,21 @@ TEST_F(ExecutionKernelTest, MetricsAfterStop) {
   EXPECT_EQ(metrics.stops_issued, 1u);
 }
 
+TEST_F(ExecutionKernelTest, Metrics_RecordObserverLagOnSnapshotRead) {
+  clock.set(1);
+  execute_sync(make_test_request("metrics_lag_move"));
+
+  auto before = kernel.get_metrics();
+  const auto published = kernel.get_execution_snapshot();
+  EXPECT_GT(published.sequence_number, 0u);
+
+  clock.advance(25'000'000);  // 25 ms after publication
+  (void)kernel.get_execution_snapshot();  // records observer lag
+  auto after = kernel.get_metrics();
+  EXPECT_GE(after.snapshots_published, before.snapshots_published);
+  EXPECT_GE(after.observer_lag_max_ns, 25'000'000u);
+}
+
 TEST_F(ExecutionKernelTest, Metrics_CollisionDetections) {
   // Test collision_detections metric
   // We need to be in Executing state to call collision_check_tick()
@@ -1140,6 +1547,115 @@ TEST_F(ExecutionKernelTest, Metrics_CollisionDetections) {
 
   // Note: collision_check_tick() is called externally, not during execute
   // So we need to test it separately
+}
+
+// =============================================================================
+// Timeout Tests (W-1, W-2)
+// =============================================================================
+
+TEST_F(ExecutionKernelTest, ExecutionTimeout_TransitionsToFailed) {
+  // ControlledExecution never completes — timeout should trigger
+  ControlledExecution controlled_execution;
+  // Need a separate kernel with ThreadSafe clock/scheduler for concurrency
+  ThreadSafeFakeClock ts_clock;
+  ThreadSafeManualScheduler ts_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  ExecutionKernel timeout_kernel{
+      planner, context, controlled_execution, ts_clock, ts_scheduler, local_cache};
+
+  auto req = make_test_request();
+  req.timeouts.execution_timeout_s = 0.5;
+
+  auto result = timeout_kernel.execute(req);
+  ASSERT_TRUE(result.ok());
+
+  // Wait until execution starts
+  controlled_execution.wait_until_execute_called();
+  ASSERT_TRUE(wait_for_state(timeout_kernel, ExecutionState::kExecuting));
+
+  // Advance clock past the timeout
+  ts_clock.advance(600'000'000);  // 600ms > 500ms timeout
+
+  // The timeout check happens in the polling loop — need a brief real-time wait
+  // for the worker thread to process
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+  auto status = timeout_kernel.get_status();
+  EXPECT_EQ(status.state, ExecutionState::kFailed);
+
+  auto snapshot = timeout_kernel.get_execution_snapshot();
+  EXPECT_TRUE(snapshot.error.has_value());
+  if (snapshot.error) {
+    EXPECT_EQ(snapshot.error->code, "execution_timeout");
+  }
+
+  // Backend stop should have been called
+  EXPECT_GE(controlled_execution.stop_count, 1);
+}
+
+TEST_F(ExecutionKernelTest, PlanningTimeout_TriggersStop) {
+  SlowMockPlanner slow_planner;
+  ThreadSafeFakeClock ts_clock;
+  ThreadSafeManualScheduler ts_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  ExecutionKernel timeout_kernel{
+      slow_planner, context, execution, ts_clock, ts_scheduler, local_cache};
+
+  auto req = make_test_request();
+  req.timeouts.planning_timeout_s = 0.1;
+
+  auto result = timeout_kernel.execute(req);
+  ASSERT_TRUE(result.ok());
+
+  // Wait until planning starts
+  slow_planner.wait_until_in_plan();
+
+  // Advance scheduler past the planning timeout — fires the callback
+  ts_scheduler.advance_to(ts_clock.now() + 200'000'000);  // 200ms > 100ms timeout
+
+  // Release the planner (it will return, then the worker checks stop_requested)
+  slow_planner.release();
+
+  // Wait for kernel to settle
+  timeout_kernel.wait_for_completion();
+
+  auto status = timeout_kernel.get_status();
+  EXPECT_EQ(status.state, ExecutionState::kStopped);
+}
+
+// =============================================================================
+// prev_state Capture Test (B-2)
+// =============================================================================
+
+TEST_F(ExecutionKernelTest, ResetDuringPlanning_PrevStateIsPlanning) {
+  SlowMockPlanner slow_planner;
+  ThreadSafeFakeClock ts_clock;
+  ThreadSafeManualScheduler ts_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  ExecutionKernel local_kernel{
+      slow_planner, context, execution, ts_clock, ts_scheduler, local_cache};
+
+  std::vector<KernelEvent> events;
+  local_kernel.subscribe_events([&](const KernelEvent& e) { events.push_back(e); });
+
+  auto result = local_kernel.execute(make_test_request());
+  ASSERT_TRUE(result.ok());
+  slow_planner.wait_until_in_plan();
+
+  // Reset during planning
+  auto reset_result = local_kernel.reset();
+  EXPECT_TRUE(reset_result.accepted);
+  slow_planner.release();
+  local_kernel.wait_for_completion();
+
+  // Find the transition to Idle
+  for (const auto& e : events) {
+    if (e.type == KernelEventType::kStateTransition && e.to_state == ExecutionState::kIdle) {
+      EXPECT_EQ(e.from_state, ExecutionState::kPlanning)
+          << "prev_state should be Planning, not " << static_cast<int>(e.from_state);
+      break;
+    }
+  }
 }
 
 }  // namespace

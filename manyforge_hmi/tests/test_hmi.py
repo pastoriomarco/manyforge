@@ -11,9 +11,11 @@ import numpy as np
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _CATALOG_PATH = str(_REPO_ROOT / "manyforge_behavior" / "resources" / "node_catalog.yaml")
 _PROGRAM_PATH = str(_REPO_ROOT / "manyforge_behavior" / "tests" / "fixtures" / "pick_and_place.program.yaml")
+_DEFAULT_URDF_PATH = "/usr/local/share/roboplan_example_models/models/ur_robot_model/ur5_gripper.urdf"
 
 from manyforge_behavior.kernel_client import (
     MockKernelClient,
+    ExecutionSnapshot,
     ExecutionState,
     ExecutionStatus,
     ExecuteRequest,
@@ -68,7 +70,14 @@ class TestStateBridge:
 
     def test_bridge_stop(self):
         """Test stop from running state."""
-        bridge = StateBridge(self.cycle_manager)
+        kernel = MockKernelClient(execute_duration_s=1.0)
+        runner = OrchestratorRunner(
+            catalog_path=_CATALOG_PATH,
+            program_path=_PROGRAM_PATH,
+            kernel=kernel,
+        )
+        cycle_manager = CycleManager(runner, kernel)
+        bridge = StateBridge(cycle_manager)
 
         # Run first
         bridge.run()
@@ -103,7 +112,14 @@ class TestStateBridge:
 
     def test_bridge_run_from_stopped(self):
         """Test run from STOPPED state resumes execution."""
-        bridge = StateBridge(self.cycle_manager)
+        kernel = MockKernelClient(execute_duration_s=1.0)
+        runner = OrchestratorRunner(
+            catalog_path=_CATALOG_PATH,
+            program_path=_PROGRAM_PATH,
+            kernel=kernel,
+        )
+        cycle_manager = CycleManager(runner, kernel)
+        bridge = StateBridge(cycle_manager)
 
         # Run then stop
         bridge.run()
@@ -113,6 +129,12 @@ class TestStateBridge:
         # Run again (resume)
         bridge.run()
         assert bridge.state == CycleState.RUNNING
+
+    def test_bridge_execution_snapshot(self):
+        """Execution snapshot is exposed through the bridge."""
+        bridge = StateBridge(self.cycle_manager)
+        snapshot = bridge.execution_snapshot
+        assert isinstance(snapshot, ExecutionSnapshot)
 
 
 # ============================================================================
@@ -247,19 +269,26 @@ class TestControlPanel:
 
     def test_stop_delegates_to_cycle_manager(self, viser_server, cycle_manager):
         """Test that Stop button delegates to CycleManager.stop()."""
-        bridge = StateBridge(cycle_manager)
+        slow_kernel = MockKernelClient(execute_duration_s=1.0)
+        slow_runner = OrchestratorRunner(
+            catalog_path=_CATALOG_PATH,
+            program_path=_PROGRAM_PATH,
+            kernel=slow_kernel,
+        )
+        slow_cycle_manager = CycleManager(slow_runner, slow_kernel)
+        bridge = StateBridge(slow_cycle_manager)
         panel = ControlPanel(viser_server, bridge)
 
         # Run first
-        cycle_manager.run()
-        assert cycle_manager.state == CycleState.RUNNING
+        slow_cycle_manager.run()
+        assert slow_cycle_manager.state == CycleState.RUNNING
 
         # Click Stop button
         class MockEvent:
             pass
 
         panel._on_stop_click(MockEvent())
-        assert cycle_manager.state == CycleState.STOPPED
+        assert slow_cycle_manager.state == CycleState.STOPPED
 
     def test_reset_delegates_to_cycle_manager(self, viser_server, cycle_manager):
         """Test that Reset button delegates to CycleManager.reset()."""
@@ -417,6 +446,40 @@ class TestViserHmiServer:
 
         server.stop()
 
+    def test_update_once_drives_robot_from_execution_snapshot(self, cycle_manager):
+        """Robot visualization is driven from execution snapshots, not replay callbacks."""
+        server = ViserHmiServer(cycle_manager, host="127.0.0.1", port=0)
+
+        class FakeVisualizer:
+            joint_names = ["joint_a", "joint_b"]
+
+            def __init__(self):
+                self.updated = None
+
+            def update_joints(self, positions):
+                self.updated = positions
+
+        fake_visualizer = FakeVisualizer()
+        server._robot_visualizer = fake_visualizer
+
+        snapshot = ExecutionSnapshot(
+            timestamp_ns=123,
+            sequence_number=7,
+            execution_id=9,
+            move_id="move_1",
+            state=ExecutionState.EXECUTING,
+            progress=0.5,
+            joint_positions_rad=[0.1, -0.2],
+        )
+        cycle_manager.get_execution_snapshot = lambda: snapshot
+
+        server._update_once()
+
+        assert fake_visualizer.updated == {"joint_a": 0.1, "joint_b": -0.2}
+        assert server._last_snapshot_sequence == 7
+
+        server.stop()
+
 
 # ============================================================================
 # ProgramPanel Tests
@@ -466,7 +529,9 @@ class TestRobotVisualizer:
 
     def test_robot_visualizer_creates(self, viser_server):
         """Test that robot visualizer creates with URDF."""
-        urdf_path = "/usr/local/share/roboplan_example_models/models/ur_robot_model/ur5_gripper.urdf"
+        urdf_path = _DEFAULT_URDF_PATH
+        if not os.path.exists(urdf_path):
+            pytest.skip(f"URDF fixture not available on host: {urdf_path}")
 
         joint_names = [
             "shoulder_pan_joint",
@@ -485,7 +550,9 @@ class TestRobotVisualizer:
 
     def test_robot_visualizer_update_joints(self, viser_server):
         """Test updating joint positions."""
-        urdf_path = "/usr/local/share/roboplan_example_models/models/ur_robot_model/ur5_gripper.urdf"
+        urdf_path = _DEFAULT_URDF_PATH
+        if not os.path.exists(urdf_path):
+            pytest.skip(f"URDF fixture not available on host: {urdf_path}")
 
         joint_names = [
             "shoulder_pan_joint",

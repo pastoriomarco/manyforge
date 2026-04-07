@@ -1,16 +1,19 @@
 """Tests for ManyForge Composer Backend."""
 from __future__ import annotations
 
+import logging
 import pytest
 from pathlib import Path
 from fastapi.testclient import TestClient
 from httpx import AsyncClient
 import httpx
 import asyncio
+import py_trees
 
 from manyforge_behavior.kernel_client import MockKernelClient
 from manyforge_composer.backend.state import ComposerState
 from manyforge_composer.backend.app import create_app
+from manyforge_composer.__main__ import build_program_loaded_callback
 
 
 # Test fixture paths (relative to repo root, same as existing tests)
@@ -30,6 +33,14 @@ def state():
 @pytest.fixture
 def client(state):
     """Create a TestClient for the app."""
+    app = create_app(state)
+    return TestClient(app)
+
+
+def make_client(execute_duration_s: float = 0.0) -> TestClient:
+    """Create a TestClient with a configurable mock execution duration."""
+    kernel = MockKernelClient(execute_duration_s=execute_duration_s)
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
     app = create_app(state)
     return TestClient(app)
 
@@ -83,19 +94,18 @@ def test_run_from_idle(client, state):
     assert data["state"] == "running"
 
 
-def test_stop_from_running(client, state):
+def test_stop_from_running():
     """Run then stop, verify state=stopped."""
-    # Load program
-    client.post("/api/program/load", json={"path": _PROGRAM_PATH})
-    
-    # Run cycle
-    client.post("/api/cycle/run")
-    
-    # Stop cycle
-    response = client.post("/api/cycle/stop")
-    assert response.status_code == 200
-    data = response.json()
-    assert data["state"] == "stopped"
+    with make_client(execute_duration_s=1.0) as client:
+        client.post("/api/program/load", json={"path": _PROGRAM_PATH})
+        run_response = client.post("/api/cycle/run")
+        assert run_response.status_code == 200
+        assert run_response.json()["state"] == "running"
+
+        response = client.post("/api/cycle/stop")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["state"] == "stopped"
 
 
 def test_reset_from_running(client, state):
@@ -113,22 +123,22 @@ def test_reset_from_running(client, state):
     assert data["state"] == "idle"
 
 
-def test_run_from_stopped(client, state):
+def test_run_from_stopped():
     """Run, stop, run again, verify state=running."""
-    # Load program
-    client.post("/api/program/load", json={"path": _PROGRAM_PATH})
-    
-    # Run cycle
-    client.post("/api/cycle/run")
-    
-    # Stop cycle
-    client.post("/api/cycle/stop")
-    
-    # Run again
-    response = client.post("/api/cycle/run")
-    assert response.status_code == 200
-    data = response.json()
-    assert data["state"] == "running"
+    with make_client(execute_duration_s=1.0) as client:
+        client.post("/api/program/load", json={"path": _PROGRAM_PATH})
+        first_run = client.post("/api/cycle/run")
+        assert first_run.status_code == 200
+        assert first_run.json()["state"] == "running"
+
+        stop_response = client.post("/api/cycle/stop")
+        assert stop_response.status_code == 200
+        assert stop_response.json()["state"] == "stopped"
+
+        response = client.post("/api/cycle/run")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["state"] == "running"
 
 
 def test_velocity_scale(client, state):
@@ -456,3 +466,80 @@ def test_request_logging(client, capsys):
     # Just verify the request didn't error — the logging middleware runs
     # but capturing stderr in a test with uvicorn is non-trivial.
     # The JSON format test above covers the formatter.
+
+
+def test_program_load_callback_registers_scene_edit_callback(caplog):
+    """Program-load callback wires scene sync without raising or logging errors."""
+    py_trees.blackboard.Blackboard.clear()
+
+    class DummySceneRenderer:
+        def __init__(self):
+            self.cleared = False
+            self.loaded_scene = None
+
+        def clear(self):
+            self.cleared = True
+
+        def load_from_program(self, scene):
+            self.loaded_scene = scene
+
+        def remove_object(self, object_id):
+            self.last_removed = object_id
+
+        def add_box_on_frame(self, *args, **kwargs):
+            self.last_box_on_frame = (args, kwargs)
+
+        def add_box(self, *args, **kwargs):
+            self.last_box = (args, kwargs)
+
+        def add_sphere(self, *args, **kwargs):
+            self.last_sphere = (args, kwargs)
+
+    class DummyHmiServer:
+        instances = []
+
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.scene_renderer = DummySceneRenderer()
+            self.robot_visualizer = None
+            self.started = False
+            self.stopped = False
+            self.program = None
+            DummyHmiServer.instances.append(self)
+
+        def load_program(self, program):
+            self.program = program
+
+        def start(self):
+            self.started = True
+
+        def stop(self):
+            self.stopped = True
+
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=MockKernelClient())
+    state._on_program_loaded = build_program_loaded_callback(
+        host="127.0.0.1",
+        hmi_port=0,
+        urdf_path=None,
+        package_dirs=[],
+        bundle=None,
+        hmi_server_factory=DummyHmiServer,
+    )
+
+    with caplog.at_level(logging.ERROR):
+        state.load_program(_PROGRAM_PATH)
+
+    assert not any("on_program_loaded callback failed" in rec.message for rec in caplog.records)
+    assert DummyHmiServer.instances
+    server = DummyHmiServer.instances[-1]
+    assert server.started
+    assert server.program is not None
+    assert state.cycle_manager._on_run_from_idle is not None
+
+    bb = py_trees.blackboard.Client(name="test_scene_edit_callback")
+    bb.register_key(key="scene_edit_callback", access=py_trees.common.Access.READ)
+    assert callable(bb.scene_edit_callback)
+
+    state.cycle_manager._on_run_from_idle()
+    assert server.scene_renderer.cleared
+    assert server.scene_renderer.loaded_scene == state.program.scene

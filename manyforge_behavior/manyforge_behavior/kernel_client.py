@@ -47,6 +47,19 @@ class ExecutionStatus:
     state: ExecutionState = ExecutionState.IDLE
     execution_id: int = 0
     progress: float = 0.0
+    active_move_id: str = ""
+
+
+@dataclass
+class ExecutionSnapshot:
+    timestamp_ns: int = 0
+    sequence_number: int = 0
+    execution_id: int = 0
+    move_id: str = ""
+    state: ExecutionState = ExecutionState.IDLE
+    progress: float = 0.0
+    joint_positions_rad: List[float] = field(default_factory=list)
+    error: Optional[str] = None
 
 
 @dataclass
@@ -116,6 +129,9 @@ class KernelClient(ABC):
     def get_status(self) -> ExecutionStatus: ...
 
     @abstractmethod
+    def get_execution_snapshot(self) -> ExecutionSnapshot: ...
+
+    @abstractmethod
     def invalidate_trajectories(self) -> None: ...
 
     @abstractmethod
@@ -143,9 +159,12 @@ class MockKernelClient(KernelClient):
     def __init__(self, execute_duration_s: float = 0.0) -> None:
         self._state = ExecutionState.IDLE
         self._execution_id = 0
+        self._active_move_id = ""
         self._next_id = 1
+        self._snapshot_sequence = 0
         self._execute_duration_s = execute_duration_s
         self._execute_start: Optional[float] = None
+        self.last_execute_request: Optional[ExecuteRequest] = None
         self.execute_count = 0
         self.stop_count = 0
         self.pause_count = 0
@@ -161,6 +180,7 @@ class MockKernelClient(KernelClient):
     def execute(self, request: ExecuteRequest) -> ExecuteResult:
         import time
         self.execute_count += 1
+        self.last_execute_request = request
         # Auto-reset from terminal states, matching C++ ExecutionKernel behavior
         terminal_states = {ExecutionState.COMPLETED, ExecutionState.FAILED, ExecutionState.STOPPED}
         if self._state in terminal_states:
@@ -174,6 +194,7 @@ class MockKernelClient(KernelClient):
         eid = self._next_id
         self._next_id += 1
         self._execution_id = eid
+        self._active_move_id = request.move_id
         if self._execute_duration_s > 0:
             self._state = ExecutionState.EXECUTING
             self._execute_start = time.monotonic()
@@ -220,6 +241,7 @@ class MockKernelClient(KernelClient):
                 accepted=False, error="Already in IDLE"
             )
         self._state = ExecutionState.IDLE
+        self._active_move_id = ""
         return CommandResult(accepted=True)
 
     def get_status(self) -> ExecutionStatus:
@@ -232,17 +254,37 @@ class MockKernelClient(KernelClient):
             if elapsed >= self._execute_duration_s:
                 self._state = ExecutionState.COMPLETED
                 self._execute_start = None
-                return ExecutionStatus(state=self._state, execution_id=self._execution_id, progress=1.0)
+                return ExecutionStatus(
+                    state=self._state,
+                    execution_id=self._execution_id,
+                    progress=1.0,
+                    active_move_id=self._active_move_id,
+                )
             return ExecutionStatus(
                 state=self._state,
                 execution_id=self._execution_id,
                 progress=min(elapsed / self._execute_duration_s, 1.0),
+                active_move_id=self._active_move_id,
             )
         progress = 1.0 if self._state == ExecutionState.COMPLETED else 0.0
         return ExecutionStatus(
             state=self._state,
             execution_id=self._execution_id,
             progress=progress,
+            active_move_id=self._active_move_id,
+        )
+
+    def get_execution_snapshot(self) -> ExecutionSnapshot:
+        import time
+        status = self.get_status()
+        self._snapshot_sequence += 1
+        return ExecutionSnapshot(
+            timestamp_ns=time.monotonic_ns(),
+            sequence_number=self._snapshot_sequence,
+            execution_id=status.execution_id,
+            move_id=self._active_move_id,
+            state=status.state,
+            progress=status.progress,
         )
 
     def invalidate_trajectories(self) -> None:

@@ -2,8 +2,10 @@
 
 #include <roboplan_example_models/resources.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <filesystem>
+#include <mutex>
 #include <stdexcept>
 #include <thread>
 
@@ -20,16 +22,81 @@ core::TimePoint WallClock::now() const {
 
 // --- SimpleScheduler ---
 
+namespace {
+
+core::TimePoint steady_now_ns() {
+  auto tp = std::chrono::steady_clock::now();
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             tp.time_since_epoch())
+      .count();
+}
+
+}  // namespace
+
+SimpleScheduler::SimpleScheduler() : worker_thread_(&SimpleScheduler::worker_loop, this) {}
+
+SimpleScheduler::~SimpleScheduler() {
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    shutdown_ = true;
+    tasks_.clear();
+  }
+  cv_.notify_all();
+  if (worker_thread_.joinable()) {
+    worker_thread_.join();
+  }
+}
+
 core::ScheduleHandle SimpleScheduler::schedule(
-    core::TimePoint /*deadline*/, std::function<void()> callback) {
-  // v0.0: fire immediately (no deferred scheduling needed for sync kernel)
+    core::TimePoint deadline, std::function<void()> callback) {
   auto handle = next_handle_.fetch_add(1);
-  if (callback) callback();
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    tasks_.emplace(handle, ScheduledTask{deadline, std::move(callback)});
+  }
+  cv_.notify_all();
   return handle;
 }
 
-void SimpleScheduler::cancel(core::ScheduleHandle /*handle*/) {
-  // No-op in v0.0 sync mode
+void SimpleScheduler::cancel(core::ScheduleHandle handle) {
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    tasks_.erase(handle);
+  }
+  cv_.notify_all();
+}
+
+void SimpleScheduler::worker_loop() {
+  while (true) {
+    std::function<void()> callback;
+
+    {
+      std::unique_lock<std::mutex> lock(mutex_);
+      cv_.wait(lock, [this]() { return shutdown_ || !tasks_.empty(); });
+      if (shutdown_) {
+        return;
+      }
+
+      const auto next_it = std::min_element(
+          tasks_.begin(), tasks_.end(),
+          [](const auto& lhs, const auto& rhs) {
+            return lhs.second.deadline < rhs.second.deadline;
+          });
+
+      const auto now = steady_now_ns();
+      if (next_it->second.deadline > now) {
+        cv_.wait_for(lock, std::chrono::nanoseconds(next_it->second.deadline - now));
+        continue;
+      }
+
+      callback = std::move(next_it->second.callback);
+      tasks_.erase(next_it);
+    }
+
+    if (callback) {
+      callback();
+    }
+  }
 }
 
 // --- Model path resolution ---
@@ -108,12 +175,14 @@ std::shared_ptr<NativeKernelBundle> create_native_kernel(
   bundle->ik = std::make_shared<roboplan::SimpleIk>(bundle->scene, ik_opts);
 
   // Create native backends
+  auto scene_mutex = std::make_shared<std::mutex>();
   bundle->planner = std::make_unique<RoboPlanPlannerBackend>(
-      bundle->scene, bundle->rrt, bundle->shortcutter, bundle->toppra, bundle->ik);
+      bundle->scene, rrt_opts, bundle->shortcutter, bundle->toppra, bundle->ik);
   bundle->context = std::make_unique<RoboPlanPlanningContext>(
-      bundle->scene, group_name);
-  bundle->execution = std::make_unique<RoboPlanExecutionBackend>(bundle->scene);
+      bundle->scene, group_name, scene_mutex);
   bundle->clock = std::make_unique<WallClock>();
+  bundle->execution = std::make_unique<RoboPlanExecutionBackend>(
+      bundle->scene, *bundle->clock, scene_mutex);
   bundle->scheduler = std::make_unique<SimpleScheduler>();
   bundle->cache = std::make_unique<core::TrajectoryCache>();
 

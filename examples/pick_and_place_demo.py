@@ -6,13 +6,13 @@ Runs inside the Docker container:
         './scripts/test-all.sh roboplan && python3 examples/pick_and_place_demo.py'
 
 Then open http://localhost:8081 in your browser to see the 3D scene.
-Click "Run Program" in the Viser control panel to start the pick-and-place sequence.
+Click "Run" in the Viser control panel to start the pick-and-place sequence.
 
 What it does:
   1. Creates a UR5 robot with real RoboPlan motion planning (RRT + TOPPRA)
   2. Starts a Viser 3D server showing the robot URDF, collision objects, and control panel
   3. Loads a pick-and-place behavior tree program with scene objects from manymove examples
-  4. Waits for user to click "Run Program" — then executes with animated trajectory playback
+  4. Waits for user to click "Run" — then executes through the CycleManager
   5. Keeps the server running so you can inspect the scene
 """
 
@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import os
 import sys
-import threading
 import time
 from pathlib import Path
 
@@ -67,6 +66,7 @@ except ImportError:
 # ManyForge imports
 # ---------------------------------------------------------------------------
 import py_trees
+from manyforge_behavior.cycle_manager import CycleManager
 from manyforge_behavior.runner import OrchestratorRunner
 from manyforge_hmi import ViserHmiServer
 
@@ -93,17 +93,7 @@ def main():
     bundle = manyforge_roboplan_py.create_native_kernel("ur5_gripper", "arm")
     kernel = NativeKernelClient(bundle)
 
-    # --- 2. Start Viser HMI ---
-    print("Starting Viser 3D server on http://0.0.0.0:8081 ...", flush=True)
-    hmi = ViserHmiServer(
-        kernel=kernel,
-        host="0.0.0.0",
-        port=8081,
-        urdf_path=URDF_PATH,
-        joint_names=JOINT_NAMES,
-    )
-
-    # --- 3. Load the pick-and-place program ---
+    # --- 2. Load the pick-and-place program ---
     print(f"Loading program: {Path(PROGRAM_PATH).name}", flush=True)
     runner = OrchestratorRunner(
         catalog_path=CATALOG_PATH,
@@ -112,36 +102,28 @@ def main():
         overrides={"velocity_scale": 0.5},
     )
     runner.load()
-    runner.build_tree()
+    cycle_manager = CycleManager(runner, kernel)
+
+    # --- 3. Start Viser HMI ---
+    print("Starting Viser 3D server on http://0.0.0.0:8081 ...", flush=True)
+    hmi = ViserHmiServer(
+        cycle_manager=cycle_manager,
+        host="0.0.0.0",
+        port=8081,
+        urdf_path=URDF_PATH,
+        joint_names=JOINT_NAMES,
+    )
 
     # Load program into HMI (scene objects + program panel)
-    hmi.load_program(runner._program)
-
-    # Apply scene to the planning context (collision objects)
-    runner.apply_scene()
+    hmi.load_program(runner.program)
 
     # --- 4. Set robot to rest position (both visualization AND planner) ---
     bundle.set_joint_positions(list(REST_POSE.values()))
     if hmi.robot_visualizer:
         hmi.robot_visualizer.update_joints(REST_POSE)
 
-    # --- 5. Register trajectory animation callback ---
-    # When a move completes, retrieve the trajectory and animate the robot.
-    def on_move_complete(move_id: str, kernel_client):
-        traj = kernel_client.get_cached_trajectory(move_id)
-        if traj and hmi.robot_visualizer:
-            print(f"  Animating: {move_id} ({len(traj.waypoints)} waypoints, "
-                  f"{traj.waypoints[-1].time_from_start_s:.2f}s)", flush=True)
-            hmi.robot_visualizer.animate_trajectory(
-                traj.joint_names, traj.waypoints, speed_scale=1.0
-            )
-
-    # Store callback on blackboard for MoveManipulatorAction to find
-    bb = py_trees.blackboard.Client(name="demo_callback")
-    bb.register_key(key="move_complete_callback", access=py_trees.common.Access.WRITE)
-    bb.move_complete_callback = on_move_complete
-
-    # --- 5b. Register scene edit callback for Viser sync ---
+    # --- 5. Register scene edit callback for Viser sync ---
+    bb = py_trees.blackboard.Client(name="demo_scene_callback")
     # Build link-name → Viser scene path map for attaching objects to robot frames
     _link_viser_paths: dict[str, str] = {}
     if hmi.robot_visualizer:
@@ -188,38 +170,14 @@ def main():
     bb.register_key(key="scene_edit_callback", access=py_trees.common.Access.WRITE)
     bb.scene_edit_callback = on_scene_edit
 
-    # --- 6. Wire up the Run Program button ---
-    def run_program():
-        """Run the behavior tree in a background thread."""
-        def _run():
-            print("Running pick-and-place program...", flush=True)
-            t0 = time.time()
-            success = runner.run(max_ticks=300, tick_period_s=0.0)
-            elapsed = time.time() - t0
+    def refresh_viser_scene():
+        hmi.scene_renderer.clear()
+        if runner.program:
+            hmi.scene_renderer.load_from_program(runner.program.scene)
 
-            final_status = kernel.get_status()
-            print(f"  {final_status.execution_id} moves planned and executed "
-                  f"in {elapsed:.2f}s", flush=True)
+    cycle_manager._on_run_from_idle = refresh_viser_scene
 
-            # Show final TCP pose
-            pose = bundle.get_link_pose("tool0", "base_link")
-            if pose:
-                p = pose["position_m"]
-                print(f"  Final TCP position: ({p[0]:.3f}, {p[1]:.3f}, {p[2]:.3f})",
-                      flush=True)
-
-            hmi.control_panel.update()
-            status = "succeeded" if success else "FAILED"
-            print(f"Program {status} ({final_status.state.value})", flush=True)
-
-            # Re-enable Run button for another run
-            hmi.control_panel.run_button.disabled = False
-
-        threading.Thread(target=_run, daemon=True).start()
-
-    hmi.control_panel.set_run_callback(run_program)
-
-    # --- 7. Start HMI and wait ---
+    # --- 6. Start HMI and wait ---
     hmi.start()
     print()
     print("Open the Viser URL in your browser to see the 3D scene.")
@@ -229,7 +187,7 @@ def main():
     if "--auto" in sys.argv:
         # Auto-run for testing (no user interaction)
         time.sleep(0.5)
-        run_program()
+        cycle_manager.run()
 
     try:
         while True:

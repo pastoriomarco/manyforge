@@ -27,12 +27,12 @@ namespace manyforge::roboplan_backend {
 
 RoboPlanPlannerBackend::RoboPlanPlannerBackend(
     std::shared_ptr<roboplan::Scene> scene,
-    std::shared_ptr<roboplan::RRT> rrt,
+    const roboplan::RRTOptions& rrt_options,
     std::shared_ptr<roboplan::PathShortcutter> shortcutter,
     std::shared_ptr<roboplan::PathParameterizerTOPPRA> toppra,
     std::shared_ptr<roboplan::SimpleIk> ik)
     : scene_(std::move(scene)),
-      rrt_(std::move(rrt)),
+      rrt_options_(rrt_options),
       shortcutter_(std::move(shortcutter)),
       toppra_(std::move(toppra)),
       ik_(std::move(ik)) {}
@@ -154,9 +154,24 @@ core::PlanResultDTO RoboPlanPlannerBackend::plan(const core::PlanRequestDTO& req
       return result;
     }
 
+    // Plan path with an RRT instance configured for this request's timeout.
+    // This gives the native backend a hard, cooperative planning bound instead
+    // of relying only on a post-hoc stop request in the kernel.
+    auto request_rrt_options = rrt_options_;
+    if (request.planning_timeout_s > 0.0) {
+      if (request_rrt_options.max_planning_time > 0.0) {
+        request_rrt_options.max_planning_time =
+            std::min(request_rrt_options.max_planning_time,
+                     request.planning_timeout_s);
+      } else {
+        request_rrt_options.max_planning_time = request.planning_timeout_s;
+      }
+    }
+    roboplan::RRT request_rrt(scene_, request_rrt_options);
+
     // Plan path with RRT
     fprintf(stderr, "[PLANNER] calling RRT...\n");
-    auto path_result = rrt_->plan(start_config, goal_config);
+    auto path_result = request_rrt.plan(start_config, goal_config);
     if (!path_result.has_value()) {
       fprintf(stderr, "[PLANNER] RRT FAILED: %s\n", path_result.error().c_str());
 

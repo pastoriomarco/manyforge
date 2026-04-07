@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <mutex>
 #include <string>
 
 #include <roboplan/core/scene.hpp>
@@ -14,7 +15,8 @@ namespace manyforge::roboplan_backend {
 class RoboPlanPlanningContext final : public core::IPlanningContext {
  public:
   explicit RoboPlanPlanningContext(std::shared_ptr<roboplan::Scene> scene,
-                                  std::string group_name = "");
+                                  std::string group_name = "",
+                                  std::shared_ptr<std::mutex> scene_mutex = nullptr);
 
   core::RobotStateDTO get_current_state() override;
 
@@ -39,6 +41,7 @@ class RoboPlanPlanningContext final : public core::IPlanningContext {
 
   std::shared_ptr<roboplan::Scene> scene_;
   std::string group_name_;
+  std::shared_ptr<std::mutex> scene_mutex_;
 };
 
 }  // namespace manyforge::roboplan_backend

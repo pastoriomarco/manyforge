@@ -1,7 +1,12 @@
 #pragma once
 
+#include <atomic>
+#include <condition_variable>
+#include <map>
+#include <mutex>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <roboplan/core/scene.hpp>
@@ -25,12 +30,27 @@ class WallClock final : public core::IClock {
 /// Simple scheduler using std::thread for deferred callbacks.
 class SimpleScheduler final : public core::IScheduler {
  public:
+  SimpleScheduler();
+  ~SimpleScheduler() override;
+
   core::ScheduleHandle schedule(core::TimePoint deadline,
                                 std::function<void()> callback) override;
   void cancel(core::ScheduleHandle handle) override;
 
  private:
+  struct ScheduledTask {
+    core::TimePoint deadline = 0;
+    std::function<void()> callback;
+  };
+
+  void worker_loop();
+
   std::atomic<uint64_t> next_handle_{1};
+  std::mutex mutex_;
+  std::condition_variable cv_;
+  std::map<core::ScheduleHandle, ScheduledTask> tasks_;
+  bool shutdown_ = false;
+  std::thread worker_thread_;
 };
 
 /// Bundle that owns all components. Kernel is destroyed first (declared last).
@@ -45,10 +65,10 @@ struct NativeKernelBundle {
 
   std::unique_ptr<RoboPlanPlannerBackend> planner;
   std::unique_ptr<RoboPlanPlanningContext> context;
-  std::unique_ptr<RoboPlanExecutionBackend> execution;
   std::unique_ptr<WallClock> clock;
   std::unique_ptr<SimpleScheduler> scheduler;
   std::unique_ptr<core::TrajectoryCache> cache;
+  std::unique_ptr<RoboPlanExecutionBackend> execution;
 
   // Kernel MUST be last — it holds references to everything above
   std::unique_ptr<core::ExecutionKernel> kernel;

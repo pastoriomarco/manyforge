@@ -40,7 +40,10 @@ ENV LD_LIBRARY_PATH=/usr/local/lib/python3.11/site-packages/cmeel.prefix/lib:/us
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential cmake ninja-build \
         libgtest-dev libgmock-dev \
+        libboost-filesystem-dev libboost-serialization-dev libboost-system-dev \
+        libboost-python-dev libboost-chrono-dev libboost-thread-dev libboost-date-time-dev \
         libeigen3-dev libyaml-cpp-dev liburdfdom-dev \
+        liboctomap-dev \
         git curl ca-certificates \
     && cd /usr/src/googletest && cmake . && make \
     && cp lib/*.a /usr/lib/ \

@@ -1,9 +1,12 @@
 """ViserHmiServer - Main entry point for the Viser-based HMI."""
 
+import logging
 import viser
 import threading
 import time
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 from .state_bridge import StateBridge
 from .control_panel import ControlPanel
@@ -78,6 +81,8 @@ class ViserHmiServer:
         # Update loop state
         self._running = False
         self._update_thread: Optional[threading.Thread] = None
+        self._last_snapshot_sequence = 0
+        self._stale_count: int = 0
 
     def load_program(self, program) -> None:
         """Load a program: display in panel + render scene objects.
@@ -101,18 +106,44 @@ class ViserHmiServer:
         self._update_thread = threading.Thread(target=self._update_loop, daemon=True)
         self._update_thread.start()
 
+    @property
+    def is_stale(self) -> bool:
+        """True if recent updates have been failing."""
+        return self._stale_count > 3
+
     def _update_loop(self) -> None:
         """Background update loop that polls status and updates UI."""
         while self._running:
             try:
-                if self._control_panel:
-                    # Poll CycleManager state via bridge
-                    state = self._bridge.state
-                    velocity_scale = self._bridge.velocity_scale
-                    self._control_panel.update(state, velocity_scale)
+                self._update_once()
+                self._stale_count = 0
             except Exception:
-                pass
+                logger.warning("HMI update error", exc_info=True)
+                self._stale_count += 1
             time.sleep(0.1)  # 100ms update rate
+
+    def _update_once(self) -> None:
+        """Poll runtime state once and update the UI."""
+        if self._control_panel:
+            state = self._bridge.state
+            velocity_scale = self._bridge.velocity_scale
+            self._control_panel.update(state, velocity_scale)
+
+        if not self._robot_visualizer:
+            return
+
+        snapshot = self._bridge.execution_snapshot
+        if snapshot.sequence_number <= self._last_snapshot_sequence:
+            return
+        self._last_snapshot_sequence = snapshot.sequence_number
+
+        joint_names = self._robot_visualizer.joint_names
+        if not joint_names or len(snapshot.joint_positions_rad) != len(joint_names):
+            return
+
+        self._robot_visualizer.update_joints(
+            dict(zip(joint_names, snapshot.joint_positions_rad))
+        )
 
     def stop(self) -> None:
         """Stop the server."""

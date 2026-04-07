@@ -17,7 +17,7 @@ namespace manyforge::roboplan_backend {
 class RoboPlanPlannerBackend final : public core::IPlannerBackend {
  public:
   RoboPlanPlannerBackend(std::shared_ptr<roboplan::Scene> scene,
-                         std::shared_ptr<roboplan::RRT> rrt,
+                         const roboplan::RRTOptions& rrt_options,
                          std::shared_ptr<roboplan::PathShortcutter> shortcutter,
                          std::shared_ptr<roboplan::PathParameterizerTOPPRA> toppra,
                          std::shared_ptr<roboplan::SimpleIk> ik);
@@ -28,7 +28,7 @@ class RoboPlanPlannerBackend final : public core::IPlannerBackend {
   core::TrajectoryDTO convert_trajectory(const roboplan::JointTrajectory& traj);
 
   std::shared_ptr<roboplan::Scene> scene_;
-  std::shared_ptr<roboplan::RRT> rrt_;
+  roboplan::RRTOptions rrt_options_;
   std::shared_ptr<roboplan::PathShortcutter> shortcutter_;
   std::shared_ptr<roboplan::PathParameterizerTOPPRA> toppra_;
   std::shared_ptr<roboplan::SimpleIk> ik_;

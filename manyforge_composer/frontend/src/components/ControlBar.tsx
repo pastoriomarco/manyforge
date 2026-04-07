@@ -5,7 +5,8 @@ import { useProgramStore } from '../store/programStore';
 export function ControlBar() {
   const { state, velocityScale, error, run, stop, reset, setVelocityScale } = useCycleStore();
   const { mode } = useComposerStore();
-  const { isDirty, saveProgram } = useProgramStore();
+  const { isDirty, saveProgram, programInfo, error: programError, loading: programLoading } = useProgramStore();
+  const activeError = error || programError;
 
   const stateBadge = {
     idle: { label: 'IDLE', color: 'bg-gray-500' },
@@ -55,8 +56,8 @@ export function ControlBar() {
 
       {/* Save button */}
       <button
-        onClick={() => saveProgram('/workspace/agent-session/program.yaml')}
-        disabled={!isDirty || mode === 'run'}
+        onClick={() => programInfo?.sourcePath && saveProgram(programInfo.sourcePath)}
+        disabled={!isDirty || mode === 'run' || !programInfo?.sourcePath}
         className="px-4 py-1.5 bg-amber-600 hover:bg-amber-500 disabled:bg-gray-600 disabled:cursor-not-allowed rounded text-sm font-medium"
       >
         Save
@@ -76,9 +77,13 @@ export function ControlBar() {
         <span className="text-sm font-mono w-10">{Math.round(velocityScale * 100)}%</span>
       </div>
 
+      {programLoading && (
+        <span className="text-gray-400 text-sm ml-auto">Loading program...</span>
+      )}
+
       {/* Error display */}
-      {error && (
-        <span className="text-red-400 text-sm ml-auto">{error}</span>
+      {activeError && (
+        <span className="text-red-400 text-sm ml-auto">{activeError}</span>
       )}
     </div>
   );

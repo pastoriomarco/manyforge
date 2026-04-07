@@ -85,6 +85,77 @@ class TestMoveManipulatorAction:
         status = _tick_node(node)
         assert status == py_trees.common.Status.FAILURE
 
+    def test_request_includes_tolerances_and_tcp_cap(self, kernel, bb_with_kernel):
+        cap_bb = py_trees.blackboard.Client(name="tcp_cap_writer")
+        cap_bb.register_key(
+            key="global_max_tcp_linear_speed_mps",
+            access=py_trees.common.Access.WRITE,
+        )
+        cap_bb.global_max_tcp_linear_speed_mps = 0.25
+
+        vs_bb = py_trees.blackboard.Client(name="velocity_writer")
+        vs_bb.register_key(key="velocity_scale", access=py_trees.common.Access.WRITE)
+        vs_bb.velocity_scale = 0.8
+
+        node = MoveManipulatorAction(
+            name="test_move_params",
+            move_id="m_tcp",
+            motion_type="joint_goal",
+            joint_goal_names=["j1"],
+            joint_goal_positions_rad=[1.0],
+            velocity_scale=0.5,
+            acceleration_scale=0.6,
+            max_tcp_linear_speed_mps=0.5,
+            joint_position_tol_rad=0.02,
+            translation_tol_m=0.003,
+            rotation_tol_rad=0.04,
+        )
+
+        status = _tick_node(node)
+        assert status == py_trees.common.Status.SUCCESS
+        assert kernel.last_execute_request is not None
+        assert kernel.last_execute_request.velocity_scale == pytest.approx(0.4)
+        assert kernel.last_execute_request.acceleration_scale == pytest.approx(0.6)
+        assert kernel.last_execute_request.max_tcp_linear_speed_mps == pytest.approx(0.25)
+        assert kernel.last_execute_request.joint_position_tol_rad == pytest.approx(0.02)
+        assert kernel.last_execute_request.translation_tol_m == pytest.approx(0.003)
+        assert kernel.last_execute_request.rotation_tol_rad == pytest.approx(0.04)
+
+    def test_velocity_scale_does_not_compound_across_async_ticks(self, bb_with_kernel):
+        kernel = MockKernelClient(execute_duration_s=0.05)
+        bb_with_kernel.kernel = kernel
+
+        vs_bb = py_trees.blackboard.Client(name="velocity_writer")
+        vs_bb.register_key(key="velocity_scale", access=py_trees.common.Access.WRITE)
+        vs_bb.velocity_scale = 0.8
+
+        node = MoveManipulatorAction(
+            name="test_move_async",
+            move_id="m_async",
+            motion_type="joint_goal",
+            joint_goal_names=["j1"],
+            joint_goal_positions_rad=[1.0],
+            velocity_scale=0.5,
+        )
+        node.setup()
+        node.initialise()
+
+        assert node.update() == py_trees.common.Status.RUNNING
+        for _ in range(5):
+            node.update()
+
+        assert kernel.last_execute_request is not None
+        assert kernel.last_execute_request.velocity_scale == pytest.approx(0.4)
+        assert node._params["velocity_scale"] == pytest.approx(0.5)
+
+        while node.update() == py_trees.common.Status.RUNNING:
+            pass
+
+        node.initialise()
+        assert node.update() == py_trees.common.Status.RUNNING
+        assert kernel.last_execute_request is not None
+        assert kernel.last_execute_request.velocity_scale == pytest.approx(0.4)
+
 
 class TestResetTrajectories:
     def test_success(self, kernel, bb_with_kernel):

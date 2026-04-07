@@ -1,9 +1,39 @@
 #include <manyforge_core/execution_kernel.hpp>
 
+#include <algorithm>
 #include <exception>
 #include <string>
 
 namespace manyforge::core {
+namespace {
+
+double clamp_unit_interval(double value) {
+  return std::max(0.0, std::min(1.0, value));
+}
+
+ErrorCode error_code_from_dto(const ErrorDTO& error) {
+  if (error.code == kErrorStartStateMismatch) {
+    return ErrorCode::kStartStateMismatch;
+  }
+  if (error.code == kErrorValidationLimitsViolation) {
+    return ErrorCode::kValidationLimitsViolation;
+  }
+  if (error.code == kErrorValidationCollision) {
+    return ErrorCode::kValidationCollision;
+  }
+  if (error.code == kErrorPauseFailed) {
+    return ErrorCode::kPauseFailed;
+  }
+  if (error.code == kErrorResumeFailed) {
+    return ErrorCode::kResumeFailed;
+  }
+  if (error.code == kErrorInvalidRequest) {
+    return ErrorCode::kInvalidRequest;
+  }
+  return ErrorCode::kInternalError;
+}
+
+}  // namespace
 
 ExecutionKernel::ExecutionKernel(IPlannerBackend& planner,
                                  IPlanningContext& context,
@@ -20,7 +50,11 @@ ExecutionKernel::ExecutionKernel(IPlannerBackend& planner,
       sm_(clock),
       stop_policy_(sm_, scheduler, clock, [this]() { cache_.invalidate_all(); }),
       collision_policy_(stop_policy_,
-                        [this]() { cache_.invalidate_all(); }) {}
+                        [this]() { cache_.invalidate_all(); }) {
+  stop_policy_.set_stop_callback([this]() { (void)execution_backend_.stop(); });
+  published_snapshot_.timestamp_ns = clock_.now();
+  published_snapshot_.state = ExecutionState::kIdle;
+}
 
 ExecutionKernel::~ExecutionKernel() {
   if (worker_thread_.joinable()) {
@@ -51,6 +85,20 @@ void ExecutionKernel::unsubscribe_events(SubscriptionHandle handle) {
   subscribers_.erase(handle.id);
 }
 
+void ExecutionKernel::publish_execution_snapshot(ExecutionSnapshot snapshot) {
+  std::lock_guard<std::mutex> lock(snapshot_mutex_);
+  if (snapshot.timestamp_ns == 0) {
+    snapshot.timestamp_ns = clock_.now();
+  }
+  snapshot.sequence_number = next_snapshot_sequence_++;
+  published_snapshot_ = std::move(snapshot);
+
+  {
+    std::lock_guard<std::mutex> mlock(metrics_mutex_);
+    metrics_.snapshots_published++;
+  }
+}
+
 bool ExecutionKernel::wait_for_completion(int64_t timeout_ns) {
   std::unique_lock<std::mutex> lock(completion_mutex_);
   if (timeout_ns > 0) {
@@ -62,9 +110,143 @@ bool ExecutionKernel::wait_for_completion(int64_t timeout_ns) {
   return true;
 }
 
+void ExecutionKernel::start_collision_monitoring() {
+  std::lock_guard<std::mutex> lock(collision_monitor_mutex_);
+  collision_monitor_active_ = true;
+  ++collision_monitor_generation_;
+  if (collision_monitor_handle_ != 0) {
+    scheduler_.cancel(collision_monitor_handle_);
+    collision_monitor_handle_ = 0;
+  }
+  schedule_next_collision_monitor_tick(collision_monitor_generation_);
+}
+
+void ExecutionKernel::stop_collision_monitoring() {
+  std::lock_guard<std::mutex> lock(collision_monitor_mutex_);
+  collision_monitor_active_ = false;
+  ++collision_monitor_generation_;
+  if (collision_monitor_handle_ != 0) {
+    scheduler_.cancel(collision_monitor_handle_);
+    collision_monitor_handle_ = 0;
+  }
+}
+
+void ExecutionKernel::schedule_next_collision_monitor_tick(uint64_t generation) {
+  collision_monitor_handle_ = scheduler_.schedule(
+      clock_.now() + kCollisionMonitorPeriodNs, [this, generation]() {
+        {
+          std::lock_guard<std::mutex> lock(collision_monitor_mutex_);
+          if (!collision_monitor_active_ || collision_monitor_generation_ != generation) {
+            return;
+          }
+          collision_monitor_handle_ = 0;
+        }
+
+        (void)collision_check_tick();
+
+        std::lock_guard<std::mutex> lock(collision_monitor_mutex_);
+        if (!collision_monitor_active_ ||
+            collision_monitor_generation_ != generation ||
+            sm_.status().state != ExecutionState::kExecuting) {
+          return;
+        }
+        schedule_next_collision_monitor_tick(generation);
+      });
+}
+
+std::vector<double> ExecutionKernel::interpolate_joint_positions(
+    const TrajectoryDTO& trajectory, double time_s) const {
+  if (trajectory.waypoints.empty()) {
+    return {};
+  }
+
+  if (trajectory.waypoints.size() == 1 ||
+      time_s <= trajectory.waypoints.front().time_from_start_s) {
+    return trajectory.waypoints.front().positions_rad;
+  }
+
+  if (time_s >= trajectory.waypoints.back().time_from_start_s) {
+    return trajectory.waypoints.back().positions_rad;
+  }
+
+  for (size_t i = 1; i < trajectory.waypoints.size(); ++i) {
+    const auto& prev = trajectory.waypoints[i - 1];
+    const auto& next = trajectory.waypoints[i];
+    if (time_s > next.time_from_start_s) {
+      continue;
+    }
+
+    const double dt = next.time_from_start_s - prev.time_from_start_s;
+    if (dt <= 1e-9) {
+      return next.positions_rad;
+    }
+
+    const double alpha =
+        clamp_unit_interval((time_s - prev.time_from_start_s) / dt);
+    std::vector<double> interpolated(prev.positions_rad.size(), 0.0);
+    for (size_t joint = 0; joint < prev.positions_rad.size(); ++joint) {
+      interpolated[joint] =
+          prev.positions_rad[joint] +
+          alpha * (next.positions_rad[joint] - prev.positions_rad[joint]);
+    }
+    return interpolated;
+  }
+
+  return trajectory.waypoints.back().positions_rad;
+}
+
+TrajectoryDTO ExecutionKernel::build_remaining_trajectory(
+    const TrajectoryDTO& trajectory, const ExecutionSnapshot& snapshot) const {
+  if (trajectory.waypoints.empty()) {
+    return trajectory;
+  }
+
+  TrajectoryDTO remaining;
+  remaining.joint_names = trajectory.joint_names;
+
+  const double total_duration_s = trajectory.waypoints.back().time_from_start_s;
+  const double elapsed_s =
+      total_duration_s <= 1e-9
+          ? 0.0
+          : clamp_unit_interval(snapshot.progress) * total_duration_s;
+
+  std::vector<double> current_positions = snapshot.joint_positions_rad;
+  if (current_positions.empty()) {
+    current_positions = interpolate_joint_positions(trajectory, elapsed_s);
+  }
+
+  TrajectoryWaypointDTO current_wp;
+  current_wp.time_from_start_s = 0.0;
+  current_wp.positions_rad = current_positions;
+  remaining.waypoints.push_back(current_wp);
+
+  for (const auto& waypoint : trajectory.waypoints) {
+    if (waypoint.time_from_start_s <= elapsed_s + 1e-9) {
+      continue;
+    }
+    auto shifted = waypoint;
+    shifted.time_from_start_s -= elapsed_s;
+    remaining.waypoints.push_back(std::move(shifted));
+  }
+
+  if (remaining.waypoints.size() == 1) {
+    auto final_wp = trajectory.waypoints.back();
+    final_wp.time_from_start_s = std::max(0.0, total_duration_s - elapsed_s);
+    if (final_wp.positions_rad != current_positions ||
+        final_wp.time_from_start_s > 1e-9) {
+      remaining.waypoints.push_back(std::move(final_wp));
+    }
+  }
+
+  return remaining;
+}
+
 void ExecutionKernel::async_execute_worker(const ExecuteRequestDTO& request,
                                             uint64_t exec_id) {
   try {
+    // Capture initial state for correct prev_state in events (B-2)
+    const auto worker_entry_state = sm_.status().state;
+
     TrajectoryDTO trajectory;
     bool cache_hit = false;
 
@@ -138,6 +320,13 @@ void ExecutionKernel::async_execute_worker(const ExecuteRequestDTO& request,
       emit_event({KernelEventType::kStateTransition, exec_id, clock_.now(),
                    prev_state, ExecutionState::kValidating, std::nullopt, {}});
       emit_event({KernelEventType::kCacheHit, exec_id, clock_.now(), {}, {}, std::nullopt, {}});
+      auto snapshot = get_execution_snapshot();
+      snapshot.timestamp_ns = clock_.now();
+      snapshot.execution_id = exec_id;
+      snapshot.move_id = request.move_id;
+      snapshot.state = ExecutionState::kValidating;
+      snapshot.progress = 0.0;
+      publish_execution_snapshot(std::move(snapshot));
       {
         std::lock_guard<std::mutex> lock(metrics_mutex_);
         metrics_.cache_hits++;
@@ -161,8 +350,82 @@ void ExecutionKernel::async_execute_worker(const ExecuteRequestDTO& request,
       emit_event({KernelEventType::kStateTransition, exec_id, clock_.now(),
                    prev_state, ExecutionState::kPlanning, std::nullopt, {}});
       emit_event({KernelEventType::kPlanStarted, exec_id, clock_.now(), {}, {}, std::nullopt, {}});
+      auto planning_snapshot = get_execution_snapshot();
+      planning_snapshot.timestamp_ns = clock_.now();
+      planning_snapshot.execution_id = exec_id;
+      planning_snapshot.move_id = request.move_id;
+      planning_snapshot.state = ExecutionState::kPlanning;
+      planning_snapshot.progress = 0.0;
+      publish_execution_snapshot(std::move(planning_snapshot));
+
+      // Schedule planning timeout (W-2)
+      ScheduleHandle planning_timeout_handle = 0;
+      const auto planning_start_ns = clock_.now();
+      const int64_t planning_timeout_ns =
+          (request.timeouts.planning_timeout_s > 0)
+              ? static_cast<int64_t>(request.timeouts.planning_timeout_s * 1e9)
+              : 0;
+      if (planning_timeout_ns > 0) {
+        const int64_t deadline = planning_start_ns + planning_timeout_ns;
+        planning_timeout_handle = scheduler_.schedule(deadline, [this]() {
+          stop_policy_.request_hard_stop();
+        });
+      }
 
       auto plan_result = plan_trajectory(request);
+      const bool planning_timed_out =
+          planning_timeout_ns > 0 &&
+          (clock_.now() - planning_start_ns) >= planning_timeout_ns;
+
+      // Cancel planning timeout (may have already fired)
+      if (planning_timeout_handle != 0) {
+        scheduler_.cancel(planning_timeout_handle);
+      }
+
+      // Check for stop/reset after planning (spec 230 §6.2)
+      if (planning_timed_out || stop_policy_.stop_requested()) {
+        auto prev = worker_entry_state;  // B-2: use captured state
+        const auto message = planning_timed_out
+                                 ? "Planning timed out"
+                                 : "Planning interrupted by stop";
+        sm_.set_last_error(ErrorCode::kPlanningTimeout);
+        emit_event({KernelEventType::kErrorRaised, exec_id, clock_.now(),
+                     {}, {}, ErrorDTO{kErrorPlanningTimeout, message, {}}, {}});
+        sm_.try_transition(ExecutionState::kStopped);
+        auto stopped_snapshot = get_execution_snapshot();
+        stopped_snapshot.timestamp_ns = clock_.now();
+        stopped_snapshot.execution_id = exec_id;
+        stopped_snapshot.move_id = request.move_id;
+        stopped_snapshot.state = ExecutionState::kStopped;
+        stopped_snapshot.error = ErrorDTO{kErrorPlanningTimeout, message, {}};
+        publish_execution_snapshot(std::move(stopped_snapshot));
+        emit_event({KernelEventType::kStateTransition, exec_id, clock_.now(),
+                     prev, ExecutionState::kStopped, std::nullopt, {}});
+        execution_complete_.store(true);
+        completion_cv_.notify_all();
+        return;
+      }
+      // Check if reset was requested (state would be Idle)
+      if (sm_.status().state == ExecutionState::kIdle) {
+        auto prev = worker_entry_state;  // B-2: use captured state
+        sm_.set_last_error(ErrorCode::kPlanningTimeout);
+        emit_event({KernelEventType::kErrorRaised, exec_id, clock_.now(),
+                     {}, {}, ErrorDTO{kErrorPlanningTimeout, "Planning interrupted by reset", {}}, {}});
+        auto idle_snapshot = get_execution_snapshot();
+        idle_snapshot.timestamp_ns = clock_.now();
+        idle_snapshot.execution_id = 0;
+        idle_snapshot.move_id.clear();
+        idle_snapshot.state = ExecutionState::kIdle;
+        idle_snapshot.progress = 0.0;
+        idle_snapshot.error = ErrorDTO{kErrorPlanningTimeout, "Planning interrupted by reset", {}};
+        publish_execution_snapshot(std::move(idle_snapshot));
+        emit_event({KernelEventType::kStateTransition, exec_id, clock_.now(),
+                     prev, ExecutionState::kIdle, std::nullopt, {}});
+        execution_complete_.store(true);
+        completion_cv_.notify_all();
+        return;
+      }
+
       if (!plan_result.ok()) {
         emit_event({KernelEventType::kErrorRaised, exec_id, clock_.now(),
                      {}, {}, plan_result.error(), {}});
@@ -172,6 +435,13 @@ void ExecutionKernel::async_execute_worker(const ExecuteRequestDTO& request,
         }
         sm_.set_last_error(ErrorCode::kPlanningFailed);
         sm_.try_transition(ExecutionState::kFailed);
+        auto failed_snapshot = get_execution_snapshot();
+        failed_snapshot.timestamp_ns = clock_.now();
+        failed_snapshot.execution_id = exec_id;
+        failed_snapshot.move_id = request.move_id;
+        failed_snapshot.state = ExecutionState::kFailed;
+        failed_snapshot.error = plan_result.error();
+        publish_execution_snapshot(std::move(failed_snapshot));
         emit_event({KernelEventType::kStateTransition, exec_id, clock_.now(),
                      ExecutionState::kPlanning, ExecutionState::kFailed, std::nullopt, {}});
         execution_complete_.store(true);
@@ -184,33 +454,6 @@ void ExecutionKernel::async_execute_worker(const ExecuteRequestDTO& request,
       {
         std::lock_guard<std::mutex> lock(metrics_mutex_);
         metrics_.plans_succeeded++;
-      }
-
-      // Check for stop/reset after planning (spec 230 §6.2)
-      if (stop_policy_.stop_requested()) {
-        auto prev = sm_.status().state;
-        // Stop -> go to Stopped with kPlanningTimeout
-        sm_.set_last_error(ErrorCode::kPlanningTimeout);
-        emit_event({KernelEventType::kErrorRaised, exec_id, clock_.now(),
-                     {}, {}, ErrorDTO{kErrorPlanningTimeout, "Planning interrupted by stop", {}}, {}});
-        sm_.try_transition(ExecutionState::kStopped);
-        emit_event({KernelEventType::kStateTransition, exec_id, clock_.now(),
-                     prev, ExecutionState::kStopped, std::nullopt, {}});
-        execution_complete_.store(true);
-        completion_cv_.notify_all();
-        return;
-      }
-      // Check if reset was requested (state would be Idle)
-      if (sm_.status().state == ExecutionState::kIdle) {
-        auto prev = sm_.status().state;
-        sm_.set_last_error(ErrorCode::kPlanningTimeout);
-        emit_event({KernelEventType::kErrorRaised, exec_id, clock_.now(),
-                     {}, {}, ErrorDTO{kErrorPlanningTimeout, "Planning interrupted by reset", {}}, {}});
-        emit_event({KernelEventType::kStateTransition, exec_id, clock_.now(),
-                     prev, ExecutionState::kIdle, std::nullopt, {}});
-        execution_complete_.store(true);
-        completion_cv_.notify_all();
-        return;
       }
 
       // Planning -> Validating
@@ -227,6 +470,13 @@ void ExecutionKernel::async_execute_worker(const ExecuteRequestDTO& request,
       }
       emit_event({KernelEventType::kStateTransition, exec_id, clock_.now(),
                    prev_state2, ExecutionState::kValidating, std::nullopt, {}});
+      auto validating_snapshot = get_execution_snapshot();
+      validating_snapshot.timestamp_ns = clock_.now();
+      validating_snapshot.execution_id = exec_id;
+      validating_snapshot.move_id = request.move_id;
+      validating_snapshot.state = ExecutionState::kValidating;
+      validating_snapshot.progress = 0.0;
+      publish_execution_snapshot(std::move(validating_snapshot));
     }
 
     emit_event({KernelEventType::kValidationStarted, exec_id, clock_.now(), {}, {}, std::nullopt, {}});
@@ -244,6 +494,13 @@ void ExecutionKernel::async_execute_worker(const ExecuteRequestDTO& request,
       }
       sm_.set_last_error(ErrorCode::kValidationCollision);
       sm_.try_transition(ExecutionState::kFailed);
+      auto snapshot = get_execution_snapshot();
+      snapshot.timestamp_ns = clock_.now();
+      snapshot.execution_id = exec_id;
+      snapshot.move_id = request.move_id;
+      snapshot.state = ExecutionState::kFailed;
+      snapshot.error = val_result.error();
+      publish_execution_snapshot(std::move(snapshot));
       emit_event({KernelEventType::kStateTransition, exec_id, clock_.now(),
                    ExecutionState::kValidating, ExecutionState::kFailed, std::nullopt, {}});
       if (request.cache_mode != CacheMode::kDisable) {
@@ -275,6 +532,13 @@ void ExecutionKernel::async_execute_worker(const ExecuteRequestDTO& request,
       emit_event({KernelEventType::kErrorRaised, exec_id, clock_.now(),
                    {}, {}, ErrorDTO{kErrorInternalError, "Validation interrupted by stop", {}}, {}});
       sm_.try_transition(ExecutionState::kStopped);
+      auto snapshot = get_execution_snapshot();
+      snapshot.timestamp_ns = clock_.now();
+      snapshot.execution_id = exec_id;
+      snapshot.move_id = request.move_id;
+      snapshot.state = ExecutionState::kStopped;
+      snapshot.error = ErrorDTO{kErrorInternalError, "Validation interrupted by stop", {}};
+      publish_execution_snapshot(std::move(snapshot));
       emit_event({KernelEventType::kStateTransition, exec_id, clock_.now(),
                    prev, ExecutionState::kStopped, std::nullopt, {}});
       execution_complete_.store(true);
@@ -287,6 +551,14 @@ void ExecutionKernel::async_execute_worker(const ExecuteRequestDTO& request,
       sm_.set_last_error(ErrorCode::kInternalError);
       emit_event({KernelEventType::kErrorRaised, exec_id, clock_.now(),
                    {}, {}, ErrorDTO{kErrorInternalError, "Validation interrupted by reset", {}}, {}});
+      auto snapshot = get_execution_snapshot();
+      snapshot.timestamp_ns = clock_.now();
+      snapshot.execution_id = 0;
+      snapshot.move_id.clear();
+      snapshot.state = ExecutionState::kIdle;
+      snapshot.progress = 0.0;
+      snapshot.error = ErrorDTO{kErrorInternalError, "Validation interrupted by reset", {}};
+      publish_execution_snapshot(std::move(snapshot));
       emit_event({KernelEventType::kStateTransition, exec_id, clock_.now(),
                    prev, ExecutionState::kIdle, std::nullopt, {}});
       execution_complete_.store(true);
@@ -315,25 +587,257 @@ void ExecutionKernel::async_execute_worker(const ExecuteRequestDTO& request,
                  prev_state3, ExecutionState::kExecuting, std::nullopt, {}});
 
     emit_event({KernelEventType::kExecuteStarted, exec_id, clock_.now(), {}, {}, std::nullopt, {}});
+    auto snapshot = get_execution_snapshot();
+    snapshot.timestamp_ns = clock_.now();
+    snapshot.execution_id = exec_id;
+    snapshot.move_id = request.move_id;
+    snapshot.state = ExecutionState::kExecuting;
+    publish_execution_snapshot(std::move(snapshot));
 
-    execution_backend_.execute_trajectory(trajectory);
+    auto execution_handle = execution_backend_.execute_trajectory(trajectory);
+    auto active_trajectory = trajectory;
+    core::ExecutionSnapshot final_snapshot;
+    core::ExecutionSnapshot latest_backend_snapshot;
+    constexpr int64_t kExecutionPollNs = 10'000'000;  // 10 ms
+    start_collision_monitoring();
 
-    emit_event({KernelEventType::kExecuteCompleted, exec_id, clock_.now(), {}, {}, std::nullopt, {}});
+    // Execution timeout enforcement (W-1)
+    const auto exec_start_ns = clock_.now();
+    const int64_t exec_timeout_ns = (request.timeouts.execution_timeout_s > 0)
+        ? static_cast<int64_t>(request.timeouts.execution_timeout_s * 1e9) : 0;
 
-    sm_.set_progress(1.0);
+    while (true) {
+      bool completed = true;
+      if (execution_handle.wait_for_completion) {
+        completed = execution_handle.wait_for_completion(kExecutionPollNs);
+      }
+
+      if (execution_handle.get_snapshot) {
+        latest_backend_snapshot = execution_handle.get_snapshot();
+        latest_backend_snapshot.execution_id = exec_id;
+        latest_backend_snapshot.move_id = request.move_id;
+        publish_execution_snapshot(latest_backend_snapshot);
+        sm_.set_progress(latest_backend_snapshot.progress);
+      }
+
+      // Check execution timeout (W-1)
+      if (exec_timeout_ns > 0 && (clock_.now() - exec_start_ns) >= exec_timeout_ns) {
+        stop_collision_monitoring();
+        (void)execution_backend_.stop();
+        // Drain any remaining execution
+        if (execution_handle.wait_for_completion) {
+          while (!execution_handle.wait_for_completion(kExecutionPollNs)) {}
+        }
+        auto prev = sm_.status().state;
+        sm_.set_last_error(ErrorCode::kExecutionTimeout);
+        sm_.try_transition(ExecutionState::kFailed);
+
+        auto to_snapshot = latest_backend_snapshot;
+        to_snapshot.timestamp_ns = clock_.now();
+        to_snapshot.execution_id = exec_id;
+        to_snapshot.move_id = request.move_id;
+        to_snapshot.state = ExecutionState::kFailed;
+        to_snapshot.error = ErrorDTO{kErrorExecutionTimeout, "Execution timeout exceeded", {}};
+        publish_execution_snapshot(std::move(to_snapshot));
+
+        emit_event({KernelEventType::kErrorRaised, exec_id, clock_.now(),
+                     {}, {}, ErrorDTO{kErrorExecutionTimeout, "Execution timeout exceeded", {}}, {}});
+        emit_event({KernelEventType::kStateTransition, exec_id, clock_.now(),
+                     prev, ExecutionState::kFailed, std::nullopt, {}});
+
+        {
+          std::lock_guard<std::mutex> lock(metrics_mutex_);
+          metrics_.executions_failed++;
+        }
+        execution_complete_.store(true);
+        completion_cv_.notify_all();
+        return;
+      }
+
+      if (latest_backend_snapshot.state == ExecutionState::kPaused ||
+          sm_.status().state == ExecutionState::kPaused) {
+        stop_collision_monitoring();
+
+        if (resume_requested_.exchange(false)) {
+          emit_event({KernelEventType::kValidationStarted, exec_id, clock_.now(),
+                      {}, {}, std::nullopt, {}});
+
+          auto resumed_trajectory =
+              build_remaining_trajectory(active_trajectory, latest_backend_snapshot);
+          auto resume_validation = validate_trajectory(resumed_trajectory, request);
+          if (!resume_validation.ok()) {
+            emit_event({KernelEventType::kValidationFailed, exec_id, clock_.now(),
+                        {}, {}, std::nullopt,
+                        {{"reason", "resume validation failed"}}});
+            emit_event({KernelEventType::kErrorRaised, exec_id, clock_.now(),
+                        {}, {}, resume_validation.error(), {}});
+            {
+              std::lock_guard<std::mutex> lock(metrics_mutex_);
+              metrics_.validations_failed++;
+            }
+            sm_.set_last_error(error_code_from_dto(resume_validation.error()));
+            (void)execution_backend_.stop();
+            if (execution_handle.wait_for_completion) {
+              while (!execution_handle.wait_for_completion(kExecutionPollNs)) {
+              }
+            }
+            auto prev_state = sm_.status().state;
+            sm_.try_transition(ExecutionState::kFailed);
+            auto failed_snapshot = latest_backend_snapshot;
+            failed_snapshot.timestamp_ns = clock_.now();
+            failed_snapshot.execution_id = exec_id;
+            failed_snapshot.move_id = request.move_id;
+            failed_snapshot.state = ExecutionState::kFailed;
+            failed_snapshot.error = resume_validation.error();
+            publish_execution_snapshot(std::move(failed_snapshot));
+            emit_event({KernelEventType::kStateTransition, exec_id, clock_.now(),
+                        prev_state, ExecutionState::kFailed, std::nullopt, {}});
+            execution_complete_.store(true);
+            completion_cv_.notify_all();
+            return;
+          }
+
+          emit_event({KernelEventType::kValidationPassed, exec_id, clock_.now(),
+                      {}, {}, std::nullopt, {}});
+          {
+            std::lock_guard<std::mutex> lock(metrics_mutex_);
+            metrics_.validations_passed++;
+          }
+
+          auto prev_state = sm_.status().state;
+          auto resume_transition = sm_.try_transition(ExecutionState::kExecuting);
+          if (!resume_transition.ok()) {
+            sm_.set_last_error(ErrorCode::kResumeFailed);
+            emit_event({KernelEventType::kErrorRaised, exec_id, clock_.now(),
+                        {}, {},
+                        ErrorDTO{kErrorResumeFailed,
+                                 "Resume transition to Executing failed", {}},
+                        {}});
+            sm_.try_transition(ExecutionState::kFailed);
+            auto failed_snapshot = latest_backend_snapshot;
+            failed_snapshot.timestamp_ns = clock_.now();
+            failed_snapshot.execution_id = exec_id;
+            failed_snapshot.move_id = request.move_id;
+            failed_snapshot.state = ExecutionState::kFailed;
+            failed_snapshot.error = ErrorDTO{kErrorResumeFailed,
+                                             "Resume transition to Executing failed", {}};
+            publish_execution_snapshot(std::move(failed_snapshot));
+            emit_event({KernelEventType::kStateTransition, exec_id, clock_.now(),
+                        prev_state, ExecutionState::kFailed, std::nullopt, {}});
+            execution_complete_.store(true);
+            completion_cv_.notify_all();
+            return;
+          }
+
+          emit_event({KernelEventType::kStateTransition, exec_id, clock_.now(),
+                      prev_state, ExecutionState::kExecuting, std::nullopt, {}});
+          emit_event({KernelEventType::kExecuteStarted, exec_id, clock_.now(),
+                      {}, {}, std::nullopt, {}});
+
+          auto resumed_snapshot = latest_backend_snapshot;
+          resumed_snapshot.timestamp_ns = clock_.now();
+          resumed_snapshot.execution_id = exec_id;
+          resumed_snapshot.move_id = request.move_id;
+          resumed_snapshot.state = ExecutionState::kExecuting;
+          resumed_snapshot.error.reset();
+          publish_execution_snapshot(std::move(resumed_snapshot));
+
+          execution_handle = execution_backend_.resume(resumed_trajectory);
+          active_trajectory = std::move(resumed_trajectory);
+          start_collision_monitoring();
+        }
+
+        continue;
+      }
+
+      if (completed) {
+        break;
+      }
+    }
+
+    stop_collision_monitoring();
+
+    if (execution_handle.get_snapshot) {
+      final_snapshot = execution_handle.get_snapshot();
+      final_snapshot.execution_id = exec_id;
+      final_snapshot.move_id = request.move_id;
+      publish_execution_snapshot(final_snapshot);
+      sm_.set_progress(final_snapshot.progress);
+    } else {
+      final_snapshot.execution_id = exec_id;
+      final_snapshot.move_id = request.move_id;
+      final_snapshot.state = ExecutionState::kCompleted;
+      final_snapshot.progress = 1.0;
+      publish_execution_snapshot(final_snapshot);
+      sm_.set_progress(1.0);
+    }
+
+    if (final_snapshot.state == ExecutionState::kStopped ||
+        sm_.status().state == ExecutionState::kStopped ||
+        sm_.status().state == ExecutionState::kIdle) {
+      execution_complete_.store(true);
+      completion_cv_.notify_all();
+      return;
+    }
+
+    if (final_snapshot.state == ExecutionState::kFailed) {
+      if (final_snapshot.error.has_value()) {
+        emit_event({KernelEventType::kErrorRaised, exec_id, clock_.now(),
+                    {}, {}, final_snapshot.error, {}});
+        sm_.set_last_error(error_code_from_dto(*final_snapshot.error));
+      } else {
+        sm_.set_last_error(ErrorCode::kInternalError);
+      }
+      auto prev_state4 = sm_.status().state;
+      sm_.try_transition(ExecutionState::kFailed);
+      auto snapshot = final_snapshot;
+      snapshot.timestamp_ns = clock_.now();
+      snapshot.execution_id = exec_id;
+      snapshot.move_id = request.move_id;
+      snapshot.state = ExecutionState::kFailed;
+      publish_execution_snapshot(std::move(snapshot));
+      emit_event({KernelEventType::kStateTransition, exec_id, clock_.now(),
+                  prev_state4, ExecutionState::kFailed, std::nullopt, {}});
+      {
+        std::lock_guard<std::mutex> metrics_lock(metrics_mutex_);
+        metrics_.executions_failed++;
+      }
+      execution_complete_.store(true);
+      completion_cv_.notify_all();
+      return;
+    }
+
+    emit_event({KernelEventType::kExecuteCompleted, exec_id, clock_.now(),
+                {}, {}, std::nullopt, {}});
+
     auto prev_state4 = sm_.status().state;
     sm_.try_transition(ExecutionState::kCompleted);
+    auto snapshot2 = final_snapshot;
+    snapshot2.timestamp_ns = clock_.now();
+    snapshot2.execution_id = exec_id;
+    snapshot2.move_id = request.move_id;
+    snapshot2.state = ExecutionState::kCompleted;
+    snapshot2.progress = 1.0;
+    publish_execution_snapshot(std::move(snapshot2));
     emit_event({KernelEventType::kStateTransition, exec_id, clock_.now(),
-                 prev_state4, ExecutionState::kCompleted, std::nullopt, {}});
+                prev_state4, ExecutionState::kCompleted, std::nullopt, {}});
     {
       std::lock_guard<std::mutex> metrics_lock(metrics_mutex_);
       metrics_.executions_completed++;
     }
 
   } catch (const std::exception& e) {
+    stop_collision_monitoring();
     sm_.set_last_error(ErrorCode::kInternalError);
     auto prev_state = sm_.status().state;
     sm_.try_transition(ExecutionState::kFailed);
+    auto snapshot = get_execution_snapshot();
+    snapshot.timestamp_ns = clock_.now();
+    snapshot.execution_id = exec_id;
+    snapshot.move_id = request.move_id;
+    snapshot.state = ExecutionState::kFailed;
+    snapshot.error = ErrorDTO{kErrorInternalError, e.what(), {}};
+    publish_execution_snapshot(std::move(snapshot));
     emit_event({KernelEventType::kStateTransition, exec_id, clock_.now(),
                  prev_state, ExecutionState::kFailed, std::nullopt, {}});
     {
@@ -372,6 +876,21 @@ Result<uint64_t> ExecutionKernel::execute(const ExecuteRequestDTO& request) {
   active_move_id_ = request.move_id;
 
   execution_complete_.store(false);
+  resume_requested_.store(false);
+  stop_collision_monitoring();
+
+  ExecutionSnapshot snapshot;
+  snapshot.timestamp_ns = clock_.now();
+  snapshot.execution_id = exec_id;
+  snapshot.move_id = request.move_id;
+  snapshot.state = sm_.status().state;
+  snapshot.progress = 0.0;
+  try {
+    snapshot.joint_positions_rad = context_.get_current_state().positions_rad;
+  } catch (...) {
+    // Leave joints empty if the planning context cannot provide state here.
+  }
+  publish_execution_snapshot(std::move(snapshot));
 
   worker_thread_ = std::thread(&ExecutionKernel::async_execute_worker, this,
                                request, exec_id);
@@ -383,6 +902,11 @@ StopResultDTO ExecutionKernel::stop() {
   auto prev_state = sm_.status().state;
   auto result = stop_policy_.request_hard_stop();
   if (result.ok()) {
+    stop_collision_monitoring();
+    auto snapshot = get_execution_snapshot();
+    snapshot.timestamp_ns = clock_.now();
+    snapshot.state = sm_.status().state;
+    publish_execution_snapshot(std::move(snapshot));
     // Emit kStopIssued event
     emit_event({KernelEventType::kStopIssued, sm_.status().execution_id, clock_.now(),
                 {}, {}, std::nullopt, {}});
@@ -400,6 +924,12 @@ StopResultDTO ExecutionKernel::stop() {
 PauseResultDTO ExecutionKernel::pause() {
   auto result = stop_policy_.request_pause();
   if (result.ok()) {
+    stop_collision_monitoring();
+    (void)execution_backend_.pause();
+    auto snapshot = get_execution_snapshot();
+    snapshot.timestamp_ns = clock_.now();
+    snapshot.state = sm_.status().state;
+    publish_execution_snapshot(std::move(snapshot));
     // Emit kPauseRequested event
     emit_event({KernelEventType::kPauseRequested, sm_.status().execution_id, clock_.now(),
                 {}, {}, std::nullopt, {}});
@@ -409,11 +939,21 @@ PauseResultDTO ExecutionKernel::pause() {
 }
 
 ResumeResultDTO ExecutionKernel::resume() {
+  auto prev_state = sm_.status().state;
   auto result = stop_policy_.request_resume();
   if (result.ok()) {
+    resume_requested_.store(true);
+    auto snapshot = get_execution_snapshot();
+    snapshot.timestamp_ns = clock_.now();
+    snapshot.state = ExecutionState::kValidating;
+    snapshot.error.reset();
+    snapshot.state = sm_.status().state;
+    publish_execution_snapshot(std::move(snapshot));
     // Emit kResumeRequested event
     emit_event({KernelEventType::kResumeRequested, sm_.status().execution_id, clock_.now(),
                 {}, {}, std::nullopt, {}});
+    emit_event({KernelEventType::kStateTransition, sm_.status().execution_id, clock_.now(),
+                prev_state, sm_.status().state, std::nullopt, {}});
     return ResumeResultDTO{true, std::nullopt};
   }
   return ResumeResultDTO{false, result.error()};
@@ -423,7 +963,15 @@ ResetResultDTO ExecutionKernel::reset() {
   auto prev_state = sm_.status().state;
   auto result = stop_policy_.request_reset();
   if (result.ok()) {
+    stop_collision_monitoring();
+    resume_requested_.store(false);
+    (void)execution_backend_.reset();
     active_move_id_.clear();
+    ExecutionSnapshot snapshot;
+    snapshot.timestamp_ns = clock_.now();
+    snapshot.state = ExecutionState::kIdle;
+    snapshot.progress = 0.0;
+    publish_execution_snapshot(std::move(snapshot));
     // Emit state transition event to Idle
     emit_event({KernelEventType::kStateTransition, sm_.status().execution_id, clock_.now(),
                 prev_state, ExecutionState::kIdle, std::nullopt, {}});
@@ -438,13 +986,33 @@ ExecutionStatus ExecutionKernel::get_status() const {
   return status;
 }
 
+ExecutionSnapshot ExecutionKernel::get_execution_snapshot() const {
+  ExecutionSnapshot snapshot;
+  {
+    std::lock_guard<std::mutex> lock(snapshot_mutex_);
+    snapshot = published_snapshot_;
+  }
+  if (snapshot.timestamp_ns > 0) {
+    const auto now_ns = clock_.now();
+    if (now_ns >= snapshot.timestamp_ns) {
+      const auto lag_ns =
+          static_cast<uint64_t>(now_ns - snapshot.timestamp_ns);
+      std::lock_guard<std::mutex> lock(metrics_mutex_);
+      metrics_.observer_lag_max_ns =
+          std::max(metrics_.observer_lag_max_ns, lag_ns);
+    }
+  }
+  return snapshot;
+}
+
 MetricsSnapshot ExecutionKernel::get_metrics() const {
   std::lock_guard<std::mutex> lock(metrics_mutex_);
   return metrics_;
 }
 
 Result<void> ExecutionKernel::collision_check_tick() {
-  if (sm_.status().state != ExecutionState::kExecuting) {
+  auto prev_state = sm_.status().state;
+  if (prev_state != ExecutionState::kExecuting) {
     return Result<void>::Ok();
   }
 
@@ -469,7 +1037,20 @@ Result<void> ExecutionKernel::collision_check_tick() {
       }
     }
 
-    return collision_policy_.handle_collision(check);
+    auto result = collision_policy_.handle_collision(check);
+    auto new_state = sm_.status().state;
+    if (new_state != prev_state) {
+      auto snapshot = get_execution_snapshot();
+      snapshot.timestamp_ns = clock_.now();
+      snapshot.state = new_state;
+      publish_execution_snapshot(std::move(snapshot));
+      emit_event({KernelEventType::kStateTransition, sm_.status().execution_id, clock_.now(),
+                  prev_state, new_state, std::nullopt, {}});
+      if (new_state == ExecutionState::kStopped) {
+        stop_collision_monitoring();
+      }
+    }
+    return result;
   } catch (const std::exception& e) {
     return Result<void>::Err(
         ErrorDTO{kErrorInternalError,

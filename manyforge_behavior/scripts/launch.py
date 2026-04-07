@@ -7,7 +7,10 @@ import argparse
 import sys
 import time
 
+import py_trees
+
 from manyforge_behavior.catalog import NodeCatalog
+from manyforge_behavior.cycle_manager import CycleManager, CycleState
 from manyforge_behavior.deployment import Deployment
 from manyforge_behavior.kernel_client import KernelClient, MockKernelClient
 from manyforge_behavior.program import Program
@@ -39,12 +42,12 @@ def create_kernel(deployment: Deployment) -> KernelClient:
     return MockKernelClient()
 
 
-def start_hmi(deployment: Deployment, kernel: KernelClient, runner: OrchestratorRunner):
+def start_hmi(cycle_manager: CycleManager, runner: OrchestratorRunner):
     """Start the HMI server if available."""
     try:
         from manyforge_hmi import ViserHmiServer
         hmi = ViserHmiServer(
-            kernel=kernel,
+            cycle_manager=cycle_manager,
             host="0.0.0.0",
             port=8081,
         )
@@ -90,18 +93,23 @@ def main():
         deployment_path=args.deployment,
     )
     runner.load()
-    runner.build_tree()
-    runner.apply_scene()
+    cycle_manager = CycleManager(runner, kernel)
 
     # 4. Optionally start HMI
     hmi = None
     if deployment.launch and deployment.launch.ui_backend and deployment.launch.ui_backend.enabled:
-        hmi = start_hmi(deployment, kernel, runner)
+        hmi = start_hmi(cycle_manager, runner)
 
     # 5. Run
     if args.auto_run:
         print("Running program...")
-        success = runner.run(max_ticks=args.max_ticks)
+        cycle_manager.run()
+        while cycle_manager.state == CycleState.RUNNING:
+            time.sleep(0.01)
+        success = bool(
+            runner._tree is not None
+            and runner._tree.root.status == py_trees.common.Status.SUCCESS
+        )
         status = "SUCCESS" if success else "FAILED"
         print(f"Program {status}")
         sys.exit(0 if success else 1)

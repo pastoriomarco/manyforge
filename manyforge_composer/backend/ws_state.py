@@ -62,6 +62,7 @@ class StateHub:
                     "state": self._state.cycle_manager.state.value,
                     "velocityScale": self._state.cycle_manager.velocity_scale,
                     "nodeStatuses": self._state.cycle_manager.get_node_statuses(),
+                    "error": self._state.cycle_manager.error,
                     "programLoaded": bool(has_program),
                     "timestamp": time.time(),
                 }
