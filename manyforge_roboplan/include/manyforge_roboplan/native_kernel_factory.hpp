@@ -87,11 +87,13 @@ std::shared_ptr<NativeKernelBundle> create_native_kernel(
     const std::string& group_name,
     const std::string& urdf_path,
     const std::string& srdf_path,
-    const std::vector<std::string>& package_paths);
+    const std::vector<std::string>& package_paths,
+    const core::ExecutionKernelConfig& kernel_config = {});
 
 /// Convenience overload using roboplan example_models to resolve paths.
 std::shared_ptr<NativeKernelBundle> create_native_kernel(
     const std::string& model_name = "ur5_gripper",
-    const std::string& group_name = "arm");
+    const std::string& group_name = "arm",
+    const core::ExecutionKernelConfig& kernel_config = {});
 
 }  // namespace manyforge::roboplan_backend

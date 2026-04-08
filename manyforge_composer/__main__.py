@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import argparse
 import logging
+from pathlib import Path
 
 import py_trees
 import uvicorn
 
+from manyforge_behavior.deployment import Deployment
 from manyforge_behavior.kernel_client import MockKernelClient
 from manyforge_composer.backend.logging_config import setup_logging
 from manyforge_composer.backend.state import ComposerState
@@ -107,8 +109,9 @@ def build_program_loaded_callback(
         st.cycle_manager._on_run_from_idle = _refresh_viser_scene
         st.cycle_manager.reset()
         initial_positions = _get_simulator_initial_joint_positions(st)
-        if bundle is not None and initial_positions:
-            bundle.set_joint_positions(initial_positions)
+        runtime_bundle = getattr(st, "kernel_bundle", None) or bundle
+        if runtime_bundle is not None and initial_positions:
+            runtime_bundle.set_joint_positions(initial_positions)
             logger.info("Applied simulator-only initial joint positions from deployment")
         _sync_runtime_views(force_robot=True)
 
@@ -118,19 +121,60 @@ def build_program_loaded_callback(
     return on_program_loaded
 
 
-def _make_kernel():
+def _collision_monitor_period_ns_from_deployment(
+    deployment: Deployment | None,
+) -> int | None:
+    if deployment is None or deployment.orchestrator is None:
+        return None
+    raw_value = deployment.orchestrator.config.get("collision_monitor_period_ms")
+    if raw_value is None:
+        return None
+    period_ms = float(raw_value)
+    if period_ms <= 0.0:
+        raise ValueError("orchestrator.config.collision_monitor_period_ms must be > 0")
+    return int(period_ms * 1_000_000.0)
+
+
+def _native_model_and_group_from_deployment(
+    deployment: Deployment | None,
+) -> tuple[str, str]:
+    if deployment is None or deployment.robot_config is None:
+        return "ur5_gripper", "arm"
+    model_name = Path(deployment.robot_config.urdf_path).stem or "ur5_gripper"
+    group_name = deployment.robot_config.group_id or "arm"
+    return model_name, group_name
+
+
+def _make_kernel(deployment: Deployment | None = None):
     """Try NativeKernelClient backed by real RoboPlan C++; fall back to Mock.
 
     Returns:
         (kernel, bundle) — bundle is None when using MockKernelClient.
     """
+    model_name, group_name = _native_model_and_group_from_deployment(deployment)
+    collision_monitor_period_ns = _collision_monitor_period_ns_from_deployment(
+        deployment
+    )
     try:
         import manyforge_roboplan_py
         from native_kernel_client import NativeKernelClient
 
-        bundle = manyforge_roboplan_py.create_native_kernel("ur5_gripper", "arm")
+        kernel_config = None
+        if collision_monitor_period_ns is not None:
+            kernel_config = {
+                "collision_monitor_period_ns": collision_monitor_period_ns,
+            }
+        bundle = manyforge_roboplan_py.create_native_kernel(
+            model_name, group_name, kernel_config
+        )
         kernel = NativeKernelClient(bundle)
-        logger.info("Using NativeKernelClient (real RoboPlan planning)")
+        if collision_monitor_period_ns is not None:
+            logger.info(
+                "Using NativeKernelClient (real RoboPlan planning), collision monitor period=%d ns",
+                collision_monitor_period_ns,
+            )
+        else:
+            logger.info("Using NativeKernelClient (real RoboPlan planning)")
         return kernel, bundle
     except Exception as e:
         logger.info("NativeKernelClient unavailable (%s), using MockKernelClient", e)
@@ -184,7 +228,12 @@ def main():
             package_dirs = [roboplan_share]
             logger.info("Package dir auto-resolved from roboplan: %s", roboplan_share)
 
-    state = ComposerState(catalog_path=args.catalog_path, kernel=kernel)
+    state = ComposerState(
+        catalog_path=args.catalog_path,
+        kernel=kernel,
+        kernel_factory=_make_kernel,
+        kernel_bundle=bundle,
+    )
 
     # Wire up Viser HMI if --hmi-port is set
     if args.hmi_port is not None:

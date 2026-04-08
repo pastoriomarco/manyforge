@@ -17,6 +17,16 @@ from manyforge_behavior.program import Program
 from manyforge_behavior.runner import OrchestratorRunner
 
 
+def _native_kernel_config_from_deployment(deployment: Deployment) -> dict[str, int]:
+    period_ms = deployment.orchestrator.config.get("collision_monitor_period_ms")
+    if period_ms is None:
+        return {}
+    period_ms = float(period_ms)
+    if period_ms <= 0.0:
+        raise ValueError("orchestrator.config.collision_monitor_period_ms must be > 0")
+    return {"collision_monitor_period_ns": int(period_ms * 1_000_000.0)}
+
+
 def create_kernel(deployment: Deployment) -> KernelClient:
     """Create a kernel based on deployment adapter configuration.
 
@@ -33,7 +43,9 @@ def create_kernel(deployment: Deployment) -> KernelClient:
             # Extract model/group from robot config
             urdf_stem = deployment.robot_config.urdf_path.rsplit("/", 1)[-1].replace(".urdf", "")
             group = deployment.robot_config.group_id
-            bundle = manyforge_roboplan_py.create_native_kernel(urdf_stem, group)
+            bundle = manyforge_roboplan_py.create_native_kernel(
+                urdf_stem, group, _native_kernel_config_from_deployment(deployment)
+            )
             return NativeKernelClient(bundle)
         except ImportError:
             print("WARNING: manyforge_roboplan_py not available, using MockKernelClient")

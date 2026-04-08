@@ -136,7 +136,8 @@ std::shared_ptr<NativeKernelBundle> create_native_kernel(
     const std::string& group_name,
     const std::string& urdf_path,
     const std::string& srdf_path,
-    const std::vector<std::string>& package_paths) {
+    const std::vector<std::string>& package_paths,
+    const core::ExecutionKernelConfig& kernel_config) {
 
   auto bundle = std::make_shared<NativeKernelBundle>();
 
@@ -189,7 +190,7 @@ std::shared_ptr<NativeKernelBundle> create_native_kernel(
   // Wire kernel — references to owned components
   bundle->kernel = std::make_unique<core::ExecutionKernel>(
       *bundle->planner, *bundle->context, *bundle->execution,
-      *bundle->clock, *bundle->scheduler, *bundle->cache);
+      *bundle->clock, *bundle->scheduler, *bundle->cache, kernel_config);
 
   return bundle;
 }
@@ -198,7 +199,8 @@ std::shared_ptr<NativeKernelBundle> create_native_kernel(
 
 std::shared_ptr<NativeKernelBundle> create_native_kernel(
     const std::string& model_name,
-    const std::string& group_name) {
+    const std::string& group_name,
+    const core::ExecutionKernelConfig& kernel_config) {
 
   auto it = model_configs().find(model_name);
   if (it == model_configs().end()) {
@@ -215,7 +217,7 @@ std::shared_ptr<NativeKernelBundle> create_native_kernel(
   std::string srdf = (models_dir / config.srdf_rel).string();
 
   return create_native_kernel(model_name, actual_group, urdf, srdf,
-                               {pkg_share.string()});
+                              {pkg_share.string()}, kernel_config);
 }
 
 }  // namespace manyforge::roboplan_backend

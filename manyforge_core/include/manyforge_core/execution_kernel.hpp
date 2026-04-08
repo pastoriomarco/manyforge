@@ -26,6 +26,10 @@
 
 namespace manyforge::core {
 
+struct ExecutionKernelConfig {
+  Duration collision_monitor_period_ns = 10'000'000;  // 10 ms
+};
+
 /// Execution Kernel — single authority for motion execution governance.
 /// Ties together: state machine, stop/collision policies, trajectory cache,
 /// planner backend, planning context, and execution backend.
@@ -39,7 +43,8 @@ class ExecutionKernel {
                   IExecutionBackend& execution_backend,
                   IClock& clock,
                   IScheduler& scheduler,
-                  TrajectoryCache& cache);
+                  TrajectoryCache& cache,
+                  ExecutionKernelConfig config = {});
 
   ~ExecutionKernel();
 
@@ -122,6 +127,7 @@ class ExecutionKernel {
   IClock& clock_;
   IScheduler& scheduler_;
   TrajectoryCache& cache_;
+  ExecutionKernelConfig config_;
 
   ExecutionStateMachine sm_;
   StopPolicy stop_policy_;
@@ -156,8 +162,6 @@ class ExecutionKernel {
   // Metrics (atomic counters for thread safety)
   mutable std::mutex metrics_mutex_;
   mutable MetricsSnapshot metrics_;
-
-  static constexpr Duration kCollisionMonitorPeriodNs = 10'000'000;  // 10 ms
 };
 
 }  // namespace manyforge::core

@@ -940,6 +940,40 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_SchedulerTickChecksCollisionAndS
   EXPECT_EQ(controlled_kernel.get_status().state, ExecutionState::kStopped);
 }
 
+TEST_F(ExecutionKernelTest, CollisionMonitoring_UsesConfiguredPeriod) {
+  ControlledExecution controlled_execution;
+  ThreadSafeFakeClock local_clock;
+  ThreadSafeManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  ExecutionKernelConfig config;
+  config.collision_monitor_period_ns = 50'000'000;  // 50 ms
+  ExecutionKernel controlled_kernel{planner,
+                                    context,
+                                    controlled_execution,
+                                    local_clock,
+                                    local_scheduler,
+                                    local_cache,
+                                    config};
+
+  auto result = controlled_kernel.execute(make_test_request());
+  ASSERT_TRUE(result.ok());
+  controlled_execution.wait_until_execute_called();
+  ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kExecuting));
+  const int baseline_collision_count = context.collision_count;
+
+  local_clock.advance(49'000'000);
+  local_scheduler.advance_to(local_clock.now());
+  EXPECT_EQ(context.collision_count, baseline_collision_count);
+
+  local_clock.advance(1'000'000);
+  local_scheduler.advance_to(local_clock.now());
+  EXPECT_EQ(context.collision_count, baseline_collision_count + 1);
+
+  controlled_execution.complete();
+  controlled_kernel.wait_for_completion();
+  EXPECT_EQ(controlled_kernel.get_status().state, ExecutionState::kCompleted);
+}
+
 // --- Full cycle test ---
 
 TEST_F(ExecutionKernelTest, FullCycle_ExecuteResetExecute) {

@@ -18,10 +18,18 @@ logger = logging.getLogger(__name__)
 class ComposerState:
     """Holds the runtime state shared across all API routes."""
 
-    def __init__(self, catalog_path: str, kernel: KernelClient):
+    def __init__(
+        self,
+        catalog_path: str,
+        kernel: KernelClient,
+        kernel_factory: Optional[Callable[[Optional[Deployment]], tuple[KernelClient, Any]]] = None,
+        kernel_bundle: Any = None,
+    ):
         self.catalog = NodeCatalog(catalog_path)
         self._catalog_path = str(Path(catalog_path).resolve())
         self._kernel = kernel
+        self._kernel_factory = kernel_factory
+        self.kernel_bundle = kernel_bundle
         self.program: Optional[Program] = None
         self.program_source_path: str = ""
         self.deployment: Optional[Deployment] = None
@@ -36,10 +44,13 @@ class ComposerState:
             self.cycle_manager.reset()
 
         # Load deployment first (if provided)
-        deployment = None
+        deployment = self.deployment
         if deployment_path:
             deployment = Deployment(deployment_path)
             self.deployment = deployment
+
+        if deployment is not None and self._kernel_factory is not None:
+            self._kernel, self.kernel_bundle = self._kernel_factory(deployment)
 
         # Create runner
         runner = OrchestratorRunner(

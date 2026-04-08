@@ -98,10 +98,37 @@ def _load_simulator_initial_joint_positions() -> list[float] | None:
     return [float(v) for v in positions]
 
 
+def _load_collision_monitor_period_ns() -> int | None:
+    """Read collision monitor cadence from the example deployment."""
+    try:
+        with open(DEPLOYMENT_PATH) as f:
+            data = yaml.safe_load(f)
+    except Exception:
+        return None
+
+    raw_value = (data or {}).get("orchestrator", {}).get("config", {}).get(
+        "collision_monitor_period_ms"
+    )
+    if raw_value is None:
+        return None
+    period_ms = float(raw_value)
+    if period_ms <= 0.0:
+        raise ValueError("orchestrator.config.collision_monitor_period_ms must be > 0")
+    return int(period_ms * 1_000_000.0)
+
+
 def main():
     # --- 1. Create the native kernel (real RoboPlan planning) ---
     print("Creating UR5 robot with RoboPlan backends...")
-    bundle = manyforge_roboplan_py.create_native_kernel("ur5_gripper", "arm")
+    kernel_config = None
+    collision_monitor_period_ns = _load_collision_monitor_period_ns()
+    if collision_monitor_period_ns is not None:
+        kernel_config = {
+            "collision_monitor_period_ns": collision_monitor_period_ns,
+        }
+    bundle = manyforge_roboplan_py.create_native_kernel(
+        "ur5_gripper", "arm", kernel_config
+    )
     kernel = NativeKernelClient(bundle)
 
     # --- 2. Load the pick-and-place program ---

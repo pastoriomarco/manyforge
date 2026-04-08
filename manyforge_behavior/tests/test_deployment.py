@@ -143,7 +143,7 @@ class TestDeploymentLoading:
     def test_orchestrator_parsed(self):
         deploy = Deployment(DEPLOYMENT_FIXTURE_PATH)
         assert deploy.orchestrator.engine == "py_trees"
-        assert deploy.orchestrator.config == {}
+        assert deploy.orchestrator.config == {"collision_monitor_period_ms": 10.0}
 
     def test_launch_parsed(self):
         deploy = Deployment(DEPLOYMENT_FIXTURE_PATH)

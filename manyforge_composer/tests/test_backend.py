@@ -267,6 +267,42 @@ def test_load_deployment(client, state):
     assert "robotConfig" in data
 
 
+def test_load_program_rebuilds_kernel_from_deployment_config():
+    """Program load rebuilds the kernel from deployment-derived config when a factory is set."""
+    calls = []
+
+    class RebuiltKernel(MockKernelClient):
+        pass
+
+    def kernel_factory(deployment):
+        calls.append(deployment)
+        return RebuiltKernel(), {"bundle": len(calls)}
+
+    state = ComposerState(
+        catalog_path=_CATALOG_PATH,
+        kernel=MockKernelClient(),
+        kernel_factory=kernel_factory,
+    )
+    app = create_app(state)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/program/load",
+            json={
+                "path": _EXAMPLE_PROGRAM_PATH,
+                "deployment_path": _EXAMPLE_DEPLOYMENT_PATH,
+            },
+        )
+
+    assert response.status_code == 200
+    assert len(calls) == 1
+    assert calls[0] is state.deployment
+    assert state.deployment is not None
+    assert state.deployment.orchestrator.config["collision_monitor_period_ms"] == 10.0
+    assert isinstance(state._kernel, RebuiltKernel)
+    assert state.kernel_bundle == {"bundle": 1}
+
+
 def test_put_deployment(client, state):
     """Load deployment via POST, PUT /api/deployment with modified data, GET /api/deployment — verify updated."""
     # Load deployment

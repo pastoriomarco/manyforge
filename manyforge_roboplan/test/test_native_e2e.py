@@ -41,6 +41,21 @@ def native_kernel():
     return NativeKernelClient(bundle)
 
 
+def test_create_native_kernel_accepts_collision_monitor_config():
+    if not HAS_NATIVE:
+        pytest.skip("manyforge_roboplan_py not available")
+
+    bundle = manyforge_roboplan_py.create_native_kernel(
+        "ur5_gripper",
+        "arm",
+        {"collision_monitor_period_ns": 25_000_000},
+    )
+    kernel = NativeKernelClient(bundle)
+    status = kernel.get_status()
+
+    assert status.state == ExecutionState.IDLE
+
+
 def make_request(move_id, goal, cache_mode="default"):
     return ExecuteRequest(
         robot_id="robot1",

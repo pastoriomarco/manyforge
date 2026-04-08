@@ -56,7 +56,8 @@ adapters:
 
 orchestrator:
   engine: py_trees
-  config: {}
+  config:
+    collision_monitor_period_ms: 10.0
 
 launch:
   runner:

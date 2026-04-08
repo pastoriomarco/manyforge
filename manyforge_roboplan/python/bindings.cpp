@@ -2,6 +2,8 @@
 #include <pybind11/stl.h>
 #include <pybind11/functional.h>
 
+#include <cstdint>
+
 #include <Eigen/Dense>
 
 #include <manyforge_roboplan/native_kernel_factory.hpp>
@@ -139,6 +141,21 @@ py::dict metrics_to_python(const MetricsSnapshot& metrics) {
   d["snapshots_published"] = metrics.snapshots_published;
   d["observer_lag_max_ns"] = metrics.observer_lag_max_ns;
   return d;
+}
+
+ExecutionKernelConfig kernel_config_from_python(const py::object& config_obj) {
+  ExecutionKernelConfig config;
+  if (config_obj.is_none()) {
+    return config;
+  }
+
+  py::dict config_dict = config_obj.cast<py::dict>();
+  if (config_dict.contains("collision_monitor_period_ns")) {
+    config.collision_monitor_period_ns =
+        static_cast<int64_t>(
+            config_dict["collision_monitor_period_ns"].cast<double>());
+  }
+  return config;
 }
 
 }  // namespace
@@ -438,9 +455,13 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
 
   // Factory function
   m.def("create_native_kernel",
-        py::overload_cast<const std::string&, const std::string&>(
-            &create_native_kernel),
+        [](const std::string& model_name, const std::string& group_name,
+           py::object config) {
+          return create_native_kernel(
+              model_name, group_name, kernel_config_from_python(config));
+        },
         py::arg("model_name") = "ur5_gripper",
         py::arg("group_name") = "arm",
+        py::arg("config") = py::none(),
         "Create a native C++ kernel with real RoboPlan backends.");
 }

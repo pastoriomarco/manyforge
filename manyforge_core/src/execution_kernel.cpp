@@ -132,13 +132,15 @@ ExecutionKernel::ExecutionKernel(IPlannerBackend& planner,
                                  IExecutionBackend& execution_backend,
                                  IClock& clock,
                                  IScheduler& scheduler,
-                                 TrajectoryCache& cache)
+                                 TrajectoryCache& cache,
+                                 ExecutionKernelConfig config)
     : planner_(planner),
       context_(context),
       execution_backend_(execution_backend),
       clock_(clock),
       scheduler_(scheduler),
       cache_(cache),
+      config_(std::move(config)),
       sm_(clock),
       stop_policy_(sm_, scheduler, clock, [this]() { cache_.invalidate_all(); }),
       collision_policy_(stop_policy_,
@@ -224,7 +226,7 @@ void ExecutionKernel::stop_collision_monitoring() {
 
 void ExecutionKernel::schedule_next_collision_monitor_tick(uint64_t generation) {
   collision_monitor_handle_ = scheduler_.schedule(
-      clock_.now() + kCollisionMonitorPeriodNs, [this, generation]() {
+      clock_.now() + config_.collision_monitor_period_ns, [this, generation]() {
         {
           std::lock_guard<std::mutex> lock(collision_monitor_mutex_);
           if (!collision_monitor_active_ || collision_monitor_generation_ != generation) {
