@@ -29,6 +29,17 @@ setup_pythonpath() {
     export PYTHONPATH="$WORKSPACE:$WORKSPACE/manyforge_behavior:${PYTHONPATH:-}"
 }
 
+reset_stale_python_build_dir() {
+    local build_dir="$1"
+    local cache_file="$build_dir/CMakeCache.txt"
+    local current_site
+    current_site=$(python3 -c "import site; print(site.getsitepackages()[0])")
+
+    if [ -f "$cache_file" ] && grep -q "/usr/local/lib/python3\\." "$cache_file" && ! grep -q "$current_site" "$cache_file"; then
+        rm -rf "$build_dir"
+    fi
+}
+
 python_has_modules() {
     python3 - "$@" <<'PY'
 import importlib
@@ -46,6 +57,7 @@ PY
 run_cpp_tests() {
     section "C++ manyforge_core tests"
     local build="$BUILD_DIR/core"
+    reset_stale_python_build_dir "$build"
     mkdir -p "$build" && cd "$build"
     cmake "$WORKSPACE/manyforge_core" -DCMAKE_BUILD_TYPE=Release 2>&1 | tail -3
     make -j"$(nproc)" 2>&1 | tail -5
@@ -59,6 +71,7 @@ run_cpp_tests() {
 run_roboplan_tests() {
     section "C++ manyforge_roboplan tests"
     local build="$BUILD_DIR/roboplan"
+    reset_stale_python_build_dir "$build"
     mkdir -p "$build" && cd "$build"
 
     PINOCCHIO_CMAKE_DIR=$(find /usr -name "pinocchioConfig.cmake" -printf '%h\n' 2>/dev/null | head -1)
@@ -67,9 +80,16 @@ run_roboplan_tests() {
         return
     fi
     PINOCCHIO_PREFIX=$(dirname "$(dirname "$(dirname "$PINOCCHIO_CMAKE_DIR")")")
+    local boost_root=""
+    if [ -f "${PINOCCHIO_PREFIX}/include/boost/version.hpp" ]; then
+        boost_root="${PINOCCHIO_PREFIX}"
+    fi
     local pybind11_dir
     pybind11_dir=$(python3 -c "import pybind11; print(pybind11.get_cmake_dir())" 2>/dev/null || echo "")
     CMAKE_PREFIX_PATH="/usr/local:${PINOCCHIO_PREFIX}:${CMAKE_PREFIX_PATH:-}" \
+        BOOST_ROOT="${boost_root}" \
+        BOOST_INCLUDEDIR="${boost_root:+${boost_root}/include}" \
+        BOOST_LIBRARYDIR="${boost_root:+${boost_root}/lib}" \
         cmake "$WORKSPACE/manyforge_roboplan" -DCMAKE_BUILD_TYPE=Release \
         ${pybind11_dir:+-Dpybind11_DIR="$pybind11_dir"} 2>&1 | tail -3
     make -j"$(nproc)" 2>&1 | tail -5
@@ -89,6 +109,7 @@ run_pybind_tests() {
     section "pybind11 bindings tests"
     local core_build="$BUILD_DIR/core"
     local pybind_build="$BUILD_DIR/pybind"
+    reset_stale_python_build_dir "$pybind_build"
 
     if [ ! -f "$core_build/libmanyforge_core.a" ]; then
         skip "Build manyforge_core first (run with 'all' or 'cpp')"

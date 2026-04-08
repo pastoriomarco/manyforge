@@ -4,6 +4,8 @@
 #include <condition_variable>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <stop_token>
 #include <thread>
 
 #include <roboplan/core/scene.hpp>
@@ -33,18 +35,16 @@ class RoboPlanExecutionBackend final : public core::IExecutionBackend {
   struct ExecutionStateData {
     core::ExecutionSnapshot snapshot;
     std::atomic<bool> running{false};
-    std::atomic<bool> stop_requested{false};
     std::atomic<bool> pause_requested{false};
   };
 
-  void join_worker_if_needed();
   void publish_snapshot(core::ExecutionState state, double progress,
                         const std::vector<double>& joint_positions,
                         std::optional<core::ErrorDTO> error = std::nullopt);
   void update_scene_positions(const std::vector<double>& joint_positions);
   std::vector<double> interpolate_joint_positions(
       const core::TrajectoryDTO& trajectory, double time_s) const;
-  void execution_worker(core::TrajectoryDTO trajectory);
+  void execution_worker(std::stop_token st, core::TrajectoryDTO trajectory);
 
   std::shared_ptr<roboplan::Scene> scene_;
   core::IClock& clock_;
@@ -53,7 +53,7 @@ class RoboPlanExecutionBackend final : public core::IExecutionBackend {
   mutable std::mutex execution_mutex_;
   mutable std::mutex state_mutex_;
   std::condition_variable execution_cv_;
-  std::thread worker_thread_;
+  std::jthread worker_thread_;
   ExecutionStateData state_;
 };
 

@@ -384,13 +384,13 @@ TEST_F(StateMachineTest, ConcurrentTransitionsDontCorrupt) {
   shared_sm.try_transition(ExecutionState::kValidating);
   shared_sm.try_transition(ExecutionState::kExecuting);
 
-  std::vector<std::thread> threads;
+  std::vector<std::jthread> threads;
   for (int i = 0; i < 10; ++i) {
     threads.emplace_back([&shared_sm]() {
       shared_sm.try_transition(ExecutionState::kCompleted);
     });
   }
-  for (auto& t : threads) t.join();
+  // jthreads auto-join when destroyed
 
   auto state = shared_sm.status().state;
   EXPECT_EQ(state, ExecutionState::kCompleted);

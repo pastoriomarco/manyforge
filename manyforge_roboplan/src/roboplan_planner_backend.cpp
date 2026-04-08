@@ -2,7 +2,7 @@
 
 #include <Eigen/Dense>
 #include <cmath>
-#include <cstdio>
+#include <fmt/format.h>
 #include <stdexcept>
 #include <variant>
 
@@ -41,8 +41,8 @@ core::PlanResultDTO RoboPlanPlannerBackend::plan(const core::PlanRequestDTO& req
   core::PlanResultDTO result;
 
   try {
-    fprintf(stderr, "[PLANNER] plan() called, move_id=%s, motion_type=%s\n",
-            request.move_id.c_str(),
+    fmt::print(stderr, "[PLANNER] plan() called, move_id={}, motion_type={}\n",
+            request.move_id,
             std::holds_alternative<core::JointGoalDTO>(request.motion) ? "joint" : "pose");
 
     // Extract start state
@@ -52,10 +52,10 @@ core::PlanResultDTO RoboPlanPlannerBackend::plan(const core::PlanRequestDTO& req
       start_positions[i] = start.positions_rad[i];
     }
 
-    fprintf(stderr, "[PLANNER] start joints: [");
+    fmt::print(stderr, "[PLANNER] start joints: [");
     for (size_t i = 0; i < start.positions_rad.size(); ++i)
-      fprintf(stderr, "%s%.4f", (i ? ", " : ""), start.positions_rad[i]);
-    fprintf(stderr, "]\n");
+      fmt::print(stderr, "{}{:.4f}", (i ? ", " : ""), start.positions_rad[i]);
+    fmt::print(stderr, "]\n");
 
     roboplan::JointConfiguration start_config;
     start_config.joint_names = start.joint_names;
@@ -69,7 +69,7 @@ core::PlanResultDTO RoboPlanPlannerBackend::plan(const core::PlanRequestDTO& req
       Eigen::Matrix4d start_fk = scene_->forwardKinematics(start_positions, request.tcp_frame);
       double r, p, ya;
       matrix_to_rpy_deg(start_fk, r, p, ya);
-      fprintf(stderr, "[PLANNER] start pose:  pos=(%.3f, %.3f, %.3f) rpy=(%.1f, %.1f, %.1f) collision=%s\n",
+      fmt::print(stderr, "[PLANNER] start pose:  pos=({:.3f}, {:.3f}, {:.3f}) rpy=({:.1f}, {:.1f}, {:.1f}) collision={}\n",
               start_fk(0, 3), start_fk(1, 3), start_fk(2, 3), r, p, ya,
               start_collision ? "YES" : "no");
     }
@@ -110,7 +110,7 @@ core::PlanResultDTO RoboPlanPlannerBackend::plan(const core::PlanRequestDTO& req
       {
         double r, p, ya;
         matrix_to_rpy_deg(tform, r, p, ya);
-        fprintf(stderr, "[PLANNER] goal pose:   pos=(%.3f, %.3f, %.3f) rpy=(%.1f, %.1f, %.1f)\n",
+        fmt::print(stderr, "[PLANNER] goal pose:   pos=({:.3f}, {:.3f}, {:.3f}) rpy=({:.1f}, {:.1f}, {:.1f})\n",
                 tform(0, 3), tform(1, 3), tform(2, 3), r, p, ya);
       }
 
@@ -125,28 +125,27 @@ core::PlanResultDTO RoboPlanPlannerBackend::plan(const core::PlanRequestDTO& req
       if (!ik_->solveIk(cart_config, start_config, goal_config)) {
         double r, p, ya;
         matrix_to_rpy_deg(tform, r, p, ya);
-        char buf[256];
-        snprintf(buf, sizeof(buf),
-                 "IK failed: goal pos=(%.3f,%.3f,%.3f) rpy=(%.1f,%.1f,%.1f) frame=%s->%s",
+        auto str = fmt::format(
+                 "IK failed: goal pos=({:.3f},{:.3f},{:.3f}) rpy=({:.1f},{:.1f},{:.1f}) frame={}->{}",
                  tform(0,3), tform(1,3), tform(2,3), r, p, ya,
-                 request.base_frame.c_str(), request.tcp_frame.c_str());
-        result.error = core::ErrorDTO{core::kErrorIkFailed, std::string(buf), {}};
-        fprintf(stderr, "[PLANNER] IK FAILED\n");
+                 request.base_frame, request.tcp_frame);
+        result.error = core::ErrorDTO{core::kErrorIkFailed, str, {}};
+        fmt::print(stderr, "[PLANNER] IK FAILED\n");
         return result;
       }
 
-      fprintf(stderr, "[PLANNER] IK solved. goal: [");
+      fmt::print(stderr, "[PLANNER] IK solved. goal: [");
       for (int i = 0; i < goal_config.positions.size(); ++i)
-        fprintf(stderr, "%s%.4f", (i ? ", " : ""), goal_config.positions[i]);
-      fprintf(stderr, "]\n");
+        fmt::print(stderr, "{}{:.4f}", (i ? ", " : ""), goal_config.positions[i]);
+      fmt::print(stderr, "]\n");
 
       // Check goal for self-collision
       bool goal_collision = scene_->hasCollisions(goal_config.positions);
-      fprintf(stderr, "[PLANNER] goal in collision: %s\n", goal_collision ? "YES" : "no");
+      fmt::print(stderr, "[PLANNER] goal in collision: {}\n", goal_collision ? "YES" : "no");
 
       // Compute joint-space distance
       double jdist = (goal_config.positions - start_config.positions).norm();
-      fprintf(stderr, "[PLANNER] joint-space distance start→goal: %.4f rad\n", jdist);
+      fmt::print(stderr, "[PLANNER] joint-space distance start->goal: {:.4f} rad\n", jdist);
 
     } else {
       result.error = core::ErrorDTO{core::kErrorInvalidRequest,
@@ -170,31 +169,29 @@ core::PlanResultDTO RoboPlanPlannerBackend::plan(const core::PlanRequestDTO& req
     roboplan::RRT request_rrt(scene_, request_rrt_options);
 
     // Plan path with RRT
-    fprintf(stderr, "[PLANNER] calling RRT...\n");
+    fmt::print(stderr, "[PLANNER] calling RRT...\n");
     auto path_result = request_rrt.plan(start_config, goal_config);
     if (!path_result.has_value()) {
-      fprintf(stderr, "[PLANNER] RRT FAILED: %s\n", path_result.error().c_str());
+      fmt::print(stderr, "[PLANNER] RRT FAILED: {}\n", path_result.error());
 
       // Build detailed error message
       std::string err_msg = "RRT failed: " + path_result.error();
       err_msg += " | start=[";
       for (int i = 0; i < start_config.positions.size(); ++i) {
         if (i) err_msg += ",";
-        char buf[32]; snprintf(buf, sizeof(buf), "%.3f", start_config.positions[i]);
-        err_msg += buf;
+        err_msg += fmt::format("{:.3f}", start_config.positions[i]);
       }
       err_msg += "] goal=[";
       for (int i = 0; i < goal_config.positions.size(); ++i) {
         if (i) err_msg += ",";
-        char buf[32]; snprintf(buf, sizeof(buf), "%.3f", goal_config.positions[i]);
-        err_msg += buf;
+        err_msg += fmt::format("{:.3f}", goal_config.positions[i]);
       }
       err_msg += "]";
 
       result.error = core::ErrorDTO{core::kErrorPlanningFailed, err_msg, {}};
       return result;
     }
-    fprintf(stderr, "[PLANNER] RRT succeeded\n");
+    fmt::print(stderr, "[PLANNER] RRT succeeded\n");
 
     // Shortcut the path
     auto smoothed_path = shortcutter_->shortcut(path_result.value(), 0.05);

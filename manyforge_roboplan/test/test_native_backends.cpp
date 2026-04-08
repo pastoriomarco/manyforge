@@ -346,6 +346,40 @@ TEST_F(NativeKernelTest, ExecutionBackendPublishesProgressAndInterpolatesSceneSt
   }
 }
 
+TEST_F(NativeKernelTest, ExecutionBackendResetPublishesAuthoritativeIdleSnapshot) {
+  auto start_state = bundle_->context->get_current_state();
+  ASSERT_FALSE(start_state.positions_rad.empty());
+
+  std::vector<double> goal = start_state.positions_rad;
+  goal[0] += 0.25;
+  if (goal.size() > 1) {
+    goal[1] -= 0.2;
+  }
+
+  TrajectoryDTO traj;
+  traj.joint_names = start_state.joint_names;
+  traj.waypoints.push_back(
+      TrajectoryWaypointDTO{0.0, start_state.positions_rad, {}, {}});
+  traj.waypoints.push_back(TrajectoryWaypointDTO{0.3, goal, {}, {}});
+
+  auto handle = bundle_->execution->execute_trajectory(traj);
+  (void)handle;
+  auto reset_result = bundle_->execution->reset();
+  EXPECT_TRUE(reset_result.accepted);
+
+  auto reset_snapshot = bundle_->execution->get_execution_snapshot();
+  EXPECT_EQ(reset_snapshot.state, ExecutionState::kIdle);
+  EXPECT_DOUBLE_EQ(reset_snapshot.progress, 0.0);
+  EXPECT_TRUE(reset_snapshot.joint_positions_rad.empty());
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+  auto later_snapshot = bundle_->execution->get_execution_snapshot();
+  EXPECT_EQ(later_snapshot.state, ExecutionState::kIdle);
+  EXPECT_DOUBLE_EQ(later_snapshot.progress, 0.0);
+  EXPECT_TRUE(later_snapshot.joint_positions_rad.empty());
+}
+
 TEST_F(NativeKernelTest, KernelExecuteWaitsForTimedBackendCompletion) {
   ExecuteRequestDTO req;
   req.robot_id = "robot1";
@@ -464,6 +498,7 @@ TEST_F(NativeKernelTest, CacheHitSkipsPlanning) {
   // Second execute — should hit cache
   auto r2 = bundle_->kernel->execute(req);
   EXPECT_TRUE(r2.ok());
+  EXPECT_EQ(bundle_->kernel->get_status().state, ExecutionState::kValidating);
   bundle_->kernel->wait_for_completion();
   EXPECT_EQ(bundle_->cache->size(), 1u);  // Still 1 entry
 }

@@ -22,15 +22,16 @@ enum class ExecutionState {
 
 inline const char* to_string(ExecutionState state) {
   switch (state) {
-    case ExecutionState::kIdle: return "Idle";
-    case ExecutionState::kPlanning: return "Planning";
-    case ExecutionState::kValidating: return "Validating";
-    case ExecutionState::kExecuting: return "Executing";
-    case ExecutionState::kPaused: return "Paused";
-    case ExecutionState::kStopping: return "Stopping";
-    case ExecutionState::kStopped: return "Stopped";
-    case ExecutionState::kCompleted: return "Completed";
-    case ExecutionState::kFailed: return "Failed";
+    using enum ExecutionState;
+    case kIdle: return "Idle";
+    case kPlanning: return "Planning";
+    case kValidating: return "Validating";
+    case kExecuting: return "Executing";
+    case kPaused: return "Paused";
+    case kStopping: return "Stopping";
+    case kStopped: return "Stopped";
+    case kCompleted: return "Completed";
+    case kFailed: return "Failed";
   }
   return "Unknown";
 }

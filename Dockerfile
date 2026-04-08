@@ -1,8 +1,8 @@
 # ManyForge v0.0 Development Environment
 #
 # Provides the complete build/test toolchain:
-#   - C++17 (g++, cmake, gtest, eigen3)
-#   - Python 3.11 (pytest, py_trees, pybind11, numpy, viser, pyyaml)
+#   - C++20 (g++, cmake, gtest, eigen3)
+#   - Python 3.12 (pytest, py_trees, pybind11, numpy, viser, pyyaml)
 #   - Pinocchio (robot kinematics/dynamics/collision)
 #   - RoboPlan (motion planning: RRT, TOPPRA, IK, collision checking)
 #   - Node.js 22 (React frontend build)
@@ -17,8 +17,7 @@
 # Usage:
 #   docker compose run --rm dev bash
 #   # Inside container:
-#   cd /workspace/manyforge_core/build && cmake .. && make -j$(nproc) && ctest
-#   cd /workspace && pytest manyforge_behavior/tests/
+#   cd /workspace && ./scripts/test-all.sh all
 
 # --- Stage 1: Build React frontend ---
 FROM node:22-slim AS frontend-builder
@@ -29,12 +28,13 @@ COPY manyforge_composer/frontend/ ./
 RUN npm run build
 
 # --- Stage 2: Python/C++ runtime ---
-FROM python:3.11-slim-bookworm
+FROM python:3.12-slim-bookworm
 
 ENV DEBIAN_FRONTEND=noninteractive
-# Pinocchio (cmeel package) installs shared libs under site-packages/cmeel.prefix.
-# We add both site-packages and dist-packages paths for portability.
-ENV LD_LIBRARY_PATH=/usr/local/lib/python3.11/site-packages/cmeel.prefix/lib:/usr/local/lib/python3.11/dist-packages/cmeel.prefix/lib:/usr/local/lib
+# Pinocchio (cmeel package) installs shared libs under a Python-managed prefix.
+# The cmeel lib dir is added to the dynamic linker cache below; keep LD_LIBRARY_PATH
+# minimal so the image does not depend on a specific Python minor version in its paths.
+ENV LD_LIBRARY_PATH=/usr/local/lib
 
 # C++ build toolchain
 RUN apt-get update && apt-get install -y --no-install-recommends \

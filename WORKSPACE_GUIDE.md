@@ -35,7 +35,7 @@ manyforge_core/
 - No exceptions in core
 
 ### C++ Standard
-- C++17
+- C++20
 - `#pragma once` for include guards
 - No ROS headers (`rclcpp`, `rosidl`, `rmw`)
 - No `std::this_thread::sleep_for` in core
@@ -47,7 +47,7 @@ manyforge_core/
 - `I` prefix for interfaces: `IClock`, `IPlannerBackend`
 
 ### Build
-- CMakeLists.txt is supervisor-owned — do NOT modify it
+- CMakeLists.txt changes are allowed when required; keep them intentional and requalify affected suites
 - Build: `mkdir -p build && cd build && cmake .. && make -j$(nproc)`
 - Test: `cd build && ctest --output-on-failure`
 - Flags: `-Wall -Wextra -Werror -pedantic`

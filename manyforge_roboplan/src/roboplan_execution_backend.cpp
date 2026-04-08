@@ -31,13 +31,7 @@ RoboPlanExecutionBackend::RoboPlanExecutionBackend(
 
 RoboPlanExecutionBackend::~RoboPlanExecutionBackend() {
   (void)reset();
-  join_worker_if_needed();
-}
-
-void RoboPlanExecutionBackend::join_worker_if_needed() {
-  if (worker_thread_.joinable()) {
-    worker_thread_.join();
-  }
+  // jthread auto-joins
 }
 
 void RoboPlanExecutionBackend::publish_snapshot(
@@ -107,13 +101,19 @@ std::vector<double> RoboPlanExecutionBackend::interpolate_joint_positions(
   return trajectory.waypoints.back().positions_rad;
 }
 
-void RoboPlanExecutionBackend::execution_worker(core::TrajectoryDTO trajectory) {
+void RoboPlanExecutionBackend::execution_worker(std::stop_token st, core::TrajectoryDTO trajectory) {
   const double total_duration_s = trajectory.waypoints.empty()
                                       ? 0.0
                                       : trajectory.waypoints.back().time_from_start_s;
   std::vector<double> latest_positions =
       trajectory.waypoints.empty() ? std::vector<double>{}
                                    : trajectory.waypoints.front().positions_rad;
+
+  if (st.stop_requested()) {
+    state_.running.store(false);
+    execution_cv_.notify_all();
+    return;
+  }
 
   update_scene_positions(latest_positions);
   publish_snapshot(core::ExecutionState::kExecuting, 0.0, latest_positions);
@@ -122,10 +122,9 @@ void RoboPlanExecutionBackend::execution_worker(core::TrajectoryDTO trajectory) 
   int64_t accumulated_pause_ns = 0;
 
   while (true) {
-    const bool stop_requested = state_.stop_requested.load();
     const bool pause_requested = state_.pause_requested.load();
 
-    if (stop_requested) {
+    if (st.stop_requested()) {
       publish_snapshot(core::ExecutionState::kStopped,
                        get_execution_snapshot().progress, latest_positions);
       break;
@@ -136,11 +135,11 @@ void RoboPlanExecutionBackend::execution_worker(core::TrajectoryDTO trajectory) 
                        get_execution_snapshot().progress, latest_positions);
       const int64_t pause_started_ns = clock_.now();
       std::unique_lock<std::mutex> lock(execution_mutex_);
-      execution_cv_.wait(lock, [this]() {
-        return state_.stop_requested.load() || !state_.pause_requested.load();
+      execution_cv_.wait(lock, [this, &st]() {
+        return st.stop_requested() || !state_.pause_requested.load();
       });
       accumulated_pause_ns += clock_.now() - pause_started_ns;
-      if (state_.stop_requested.load()) {
+      if (st.stop_requested()) {
         continue;
       }
       publish_snapshot(core::ExecutionState::kExecuting,
@@ -172,33 +171,34 @@ void RoboPlanExecutionBackend::execution_worker(core::TrajectoryDTO trajectory) 
     }
 
     std::unique_lock<std::mutex> lock(execution_mutex_);
-    execution_cv_.wait_for(lock, kExecutionTick, [this]() {
-      return state_.stop_requested.load() || state_.pause_requested.load();
+    execution_cv_.wait_for(lock, kExecutionTick, [this, &st]() {
+      return st.stop_requested() || state_.pause_requested.load();
     });
   }
 
   state_.running.store(false);
-  state_.stop_requested.store(false);
   state_.pause_requested.store(false);
   execution_cv_.notify_all();
 }
 
 core::ExecutionHandle RoboPlanExecutionBackend::execute_trajectory(
     const core::TrajectoryDTO& trajectory) {
-  join_worker_if_needed();
+  // jthread auto-joins, no need to call join_worker_if_needed()
 
   const std::vector<double> initial_positions =
       trajectory.waypoints.empty() ? std::vector<double>{}
                                    : trajectory.waypoints.front().positions_rad;
 
   state_.running.store(true);
-  state_.stop_requested.store(false);
   state_.pause_requested.store(false);
   publish_snapshot(core::ExecutionState::kExecuting, 0.0, initial_positions);
   update_scene_positions(initial_positions);
 
-  worker_thread_ = std::thread(&RoboPlanExecutionBackend::execution_worker, this,
-                               trajectory);
+  worker_thread_ = std::jthread(
+      [this, trajectory_copy = core::TrajectoryDTO(trajectory)](
+          std::stop_token st) mutable {
+        execution_worker(st, std::move(trajectory_copy));
+      });
 
   return core::ExecutionHandle{
       [this](int64_t timeout_ns) {
@@ -219,8 +219,8 @@ core::StopResultDTO RoboPlanExecutionBackend::stop() {
     return core::StopResultDTO{
         false, core::ErrorDTO{core::kErrorInvalidRequest, "No execution in flight", {}}};
   }
-  state_.stop_requested.store(true);
   state_.pause_requested.store(false);
+  worker_thread_.request_stop();
   execution_cv_.notify_all();
   return core::StopResultDTO{true, std::nullopt};
 }
@@ -257,10 +257,15 @@ core::ExecutionHandle RoboPlanExecutionBackend::resume(
 }
 
 core::ResetResultDTO RoboPlanExecutionBackend::reset() {
-  state_.stop_requested.store(true);
   state_.pause_requested.store(false);
+  if (worker_thread_.joinable()) {
+    worker_thread_.request_stop();
+  }
   execution_cv_.notify_all();
-  join_worker_if_needed();
+  {
+    std::unique_lock<std::mutex> lock(execution_mutex_);
+    execution_cv_.wait(lock, [this]() { return !state_.running.load(); });
+  }
   publish_snapshot(core::ExecutionState::kIdle, 0.0, {});
   return core::ResetResultDTO{true, std::nullopt};
 }

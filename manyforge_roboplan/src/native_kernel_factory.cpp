@@ -33,18 +33,20 @@ core::TimePoint steady_now_ns() {
 
 }  // namespace
 
-SimpleScheduler::SimpleScheduler() : worker_thread_(&SimpleScheduler::worker_loop, this) {}
+SimpleScheduler::SimpleScheduler() = default;
 
 SimpleScheduler::~SimpleScheduler() {
-  {
-    std::lock_guard<std::mutex> lock(mutex_);
-    shutdown_ = true;
-    tasks_.clear();
-  }
-  cv_.notify_all();
   if (worker_thread_.joinable()) {
-    worker_thread_.join();
+    worker_thread_.request_stop();
+    cv_.notify_all();
   }
+}
+
+void SimpleScheduler::ensure_worker_started_locked() {
+  if (worker_thread_.joinable()) {
+    return;
+  }
+  worker_thread_ = std::jthread([this](std::stop_token st) { worker_loop(st); });
 }
 
 core::ScheduleHandle SimpleScheduler::schedule(
@@ -52,6 +54,7 @@ core::ScheduleHandle SimpleScheduler::schedule(
   auto handle = next_handle_.fetch_add(1);
   {
     std::lock_guard<std::mutex> lock(mutex_);
+    ensure_worker_started_locked();
     tasks_.emplace(handle, ScheduledTask{deadline, std::move(callback)});
   }
   cv_.notify_all();
@@ -66,14 +69,14 @@ void SimpleScheduler::cancel(core::ScheduleHandle handle) {
   cv_.notify_all();
 }
 
-void SimpleScheduler::worker_loop() {
-  while (true) {
+void SimpleScheduler::worker_loop(std::stop_token st) {
+  while (!st.stop_requested()) {
     std::function<void()> callback;
 
     {
       std::unique_lock<std::mutex> lock(mutex_);
-      cv_.wait(lock, [this]() { return shutdown_ || !tasks_.empty(); });
-      if (shutdown_) {
+      cv_.wait(lock, [this, &st]() { return st.stop_requested() || !tasks_.empty(); });
+      if (st.stop_requested()) {
         return;
       }
 

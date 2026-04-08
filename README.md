@@ -22,15 +22,16 @@ docker compose run --rm dev bash
 All commands run inside the container (`docker compose run --rm dev bash`).
 
 ```bash
-# Full suite (C++ build + all Python tests)
-./scripts/test-all.sh
+# Full suite (all supported test/build suites)
+./scripts/test-all.sh all
 
 # Individual suites
-./scripts/test-all.sh cpp          # manyforge_core C++ (185 tests)
-./scripts/test-all.sh roboplan     # manyforge_roboplan C++ (197 tests)
-./scripts/test-all.sh bindings     # pybind11 bindings (40 tests)
-./scripts/test-all.sh python       # manyforge_behavior + manyforge_hmi (128 tests)
-./scripts/test-all.sh integration  # end-to-end integration (39 tests)
+./scripts/test-all.sh cpp          # manyforge_core C++ tests
+./scripts/test-all.sh roboplan     # manyforge_roboplan C++ tests
+./scripts/test-all.sh bindings     # pybind11 bindings
+./scripts/test-all.sh python       # manyforge_behavior + manyforge_hmi
+./scripts/test-all.sh integration  # end-to-end integration
+./scripts/test-all.sh composer     # Composer backend tests + frontend build
 ```
 
 To build C++ manually:
@@ -65,20 +66,24 @@ Program YAML --> Behavior Runner --> ExecutionKernel (C++) --> Planner/Execution
                                     Collision Policy
 ```
 
-- **manyforge_core** is ROS-free, pure C++17. All robot-framework-specific code lives in adapter packages.
+- **manyforge_core** is ROS-free, pure C++20. All robot-framework-specific code lives in adapter packages.
 - **manyforge_roboplan** provides real motion planning via RoboPlan (RRT + TOPPRA + IK).
 - Python code calls C++ through pybind11 bindings -- no duplicate state machines.
 - The Docker container includes all dependencies (Pinocchio, RoboPlan, Viser, pybind11).
 
 ## Pick-and-Place Demo
 
-Run the end-to-end demo with real RoboPlan motion planning and Viser 3D visualization:
+Run the validated end-to-end demo with real RoboPlan motion planning, Composer, and Viser 3D visualization:
 
 ```bash
-docker compose run --rm -p 8081:8081 dev python3 examples/pick_and_place_demo.py
+./scripts/demo.sh
 ```
 
-Then open http://localhost:8081 in your browser to see the UR5 robot, collision objects, and control panel. The behavior tree plans 3 collision-aware motions (RRT + TOPPRA) with scene edits and gripper simulation.
+Then open:
+- `http://localhost:9000` for the Composer UI
+- `http://localhost:8081` for the Viser 3D view
+
+The pick-and-place demo exercises the full program load, native planning, scene-edit, run, reset, and rerun flow through the supported container path.
 
 ## Docker Details
 

@@ -1025,6 +1025,26 @@ TEST_F(ExecutionKernelTest, GetStatus_AfterExecute_HasExecutionId) {
   EXPECT_EQ(status.progress, 1.0);
 }
 
+TEST_F(ExecutionKernelTest, Execute_ImmediatelyTransitionsToPlanningOnCacheMiss) {
+  auto result = kernel.execute(make_test_request("cache_miss_move"));
+  ASSERT_TRUE(result.ok());
+  auto status = kernel.get_status();
+  EXPECT_EQ(status.execution_id, result.value());
+  EXPECT_EQ(status.state, ExecutionState::kPlanning);
+  kernel.wait_for_completion();
+}
+
+TEST_F(ExecutionKernelTest, Execute_ImmediatelyTransitionsToValidatingOnCacheHit) {
+  cache.store("cached_move", make_test_trajectory());
+
+  auto result = kernel.execute(make_test_request("cached_move"));
+  ASSERT_TRUE(result.ok());
+  auto status = kernel.get_status();
+  EXPECT_EQ(status.execution_id, result.value());
+  EXPECT_EQ(status.state, ExecutionState::kValidating);
+  kernel.wait_for_completion();
+}
+
 TEST_F(ExecutionKernelTest, GetExecutionSnapshot_AfterExecute_ContainsIdsAndFinalState) {
   execute_sync(make_test_request("snapshot_move"));
   auto snapshot = kernel.get_execution_snapshot();
@@ -1069,13 +1089,13 @@ TEST_F(ExecutionKernelTest, Events_HappyPath_PlanAndExecute) {
 
   execute_sync(make_test_request());
 
-  // Spec 230 §6.1: cache_miss -> state_transition -> plan_started ->
+  // Spec 230 §6.1: state_transition -> cache_miss -> plan_started ->
   //   plan_completed -> state_transition -> validation_started ->
   //   validation_passed -> state_transition -> execute_started ->
   //   execute_completed -> state_transition
   ASSERT_GE(events.size(), 11u);
-  EXPECT_EQ(events[0], KernelEventType::kCacheMiss);
-  EXPECT_EQ(events[1], KernelEventType::kStateTransition);
+  EXPECT_EQ(events[0], KernelEventType::kStateTransition);
+  EXPECT_EQ(events[1], KernelEventType::kCacheMiss);
   EXPECT_EQ(events[2], KernelEventType::kPlanStarted);
   EXPECT_EQ(events[3], KernelEventType::kPlanCompleted);
   EXPECT_EQ(events[4], KernelEventType::kStateTransition);
@@ -1123,11 +1143,11 @@ TEST_F(ExecutionKernelTest, Events_PlanningFailure) {
 
   execute_sync(make_test_request());
 
-  // Spec 230 §6.1 (failure): cache_miss -> state_transition -> plan_started ->
+  // Spec 230 §6.1 (failure): state_transition -> cache_miss -> plan_started ->
   //   error_raised -> state_transition
   ASSERT_GE(events.size(), 5u);
-  EXPECT_EQ(events[0], KernelEventType::kCacheMiss);
-  EXPECT_EQ(events[1], KernelEventType::kStateTransition);
+  EXPECT_EQ(events[0], KernelEventType::kStateTransition);
+  EXPECT_EQ(events[1], KernelEventType::kCacheMiss);
   EXPECT_EQ(events[2], KernelEventType::kPlanStarted);
   EXPECT_EQ(events[3], KernelEventType::kErrorRaised);
   EXPECT_EQ(events[4], KernelEventType::kStateTransition);
@@ -1144,12 +1164,12 @@ TEST_F(ExecutionKernelTest, Events_ValidationFailure) {
 
   execute_sync(make_test_request());
 
-  // cache_miss -> state_transition -> plan_started -> plan_completed ->
+  // state_transition -> cache_miss -> plan_started -> plan_completed ->
   //   state_transition -> validation_started -> validation_failed ->
   //   error_raised -> state_transition
   ASSERT_GE(events.size(), 9u);
-  EXPECT_EQ(events[0], KernelEventType::kCacheMiss);
-  EXPECT_EQ(events[1], KernelEventType::kStateTransition);
+  EXPECT_EQ(events[0], KernelEventType::kStateTransition);
+  EXPECT_EQ(events[1], KernelEventType::kCacheMiss);
   EXPECT_EQ(events[2], KernelEventType::kPlanStarted);
   EXPECT_EQ(events[3], KernelEventType::kPlanCompleted);
   EXPECT_EQ(events[4], KernelEventType::kStateTransition);

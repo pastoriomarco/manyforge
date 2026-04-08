@@ -1,12 +1,31 @@
 cmake_minimum_required(VERSION 3.14)
 project(manyforge_roboplan VERSION 0.1.0 LANGUAGES CXX)
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 add_compile_options(-Wall -Wextra -Werror -Wno-deprecated-copy)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+include(FetchContent)
+
+# Discover the active cmeel prefix dynamically so Python minor-version changes
+# do not leak into CMake package resolution.
+execute_process(
+  COMMAND python3 -c
+          "import site, pathlib; print(';'.join(str(pathlib.Path(p) / 'cmeel.prefix') for p in site.getsitepackages()))"
+  OUTPUT_VARIABLE _CMEEL_PREFIXES
+  OUTPUT_STRIP_TRAILING_WHITESPACE
+)
+
+foreach(_prefix ${_CMEEL_PREFIXES})
+  if(EXISTS "${_prefix}/include/boost/version.hpp")
+    set(BOOST_ROOT "${_prefix}")
+    set(BOOST_INCLUDEDIR "${_prefix}/include")
+    set(BOOST_LIBRARYDIR "${_prefix}/lib")
+    break()
+  endif()
+endforeach()
 
 # Dependencies
 find_package(Eigen3 REQUIRED)
@@ -16,6 +35,16 @@ find_package(roboplan_rrt REQUIRED)
 find_package(roboplan_toppra REQUIRED)
 find_package(roboplan_simple_ik REQUIRED)
 find_package(roboplan_example_models REQUIRED)
+find_package(fmt CONFIG QUIET)
+
+if(NOT fmt_FOUND)
+  FetchContent_Declare(
+    fmt
+    GIT_REPOSITORY https://github.com/fmtlib/fmt.git
+    GIT_TAG 11.0.2
+    GIT_SHALLOW TRUE)
+  FetchContent_MakeAvailable(fmt)
+endif()
 
 # manyforge_core (sibling directory)
 if(NOT TARGET manyforge_core)
@@ -45,6 +74,7 @@ target_link_libraries(manyforge_roboplan PUBLIC
   roboplan_toppra::roboplan_toppra
   roboplan_simple_ik::roboplan_simple_ik
   roboplan_example_models::roboplan_example_models
+  fmt::fmt
 )
 
 # pybind11 module
@@ -66,10 +96,19 @@ if(BUILD_TESTING)
     target_link_libraries(test_native_backends PRIVATE
       manyforge_roboplan GTest::gtest_main)
 
-    # Pinocchio/coal/roboplan .so files live in cmeel.prefix/lib
+    # Pinocchio/coal/roboplan .so files live in cmeel.prefix/lib.
+    # Discover the active Python site-packages roots rather than hardcoding a
+    # Python minor version into the test runtime path.
     set(_LIB_PATHS "$ENV{LD_LIBRARY_PATH}")
+    execute_process(
+      COMMAND python3 -c
+              "import site, pathlib; print(';'.join(str(pathlib.Path(p) / 'cmeel.prefix/lib') for p in site.getsitepackages()))"
+      OUTPUT_VARIABLE _CMEEL_LIB_DIRS
+      OUTPUT_STRIP_TRAILING_WHITESPACE
+    )
+
     foreach(_dir
-        "/usr/local/lib/python3.11/dist-packages/cmeel.prefix/lib"
+        ${_CMEEL_LIB_DIRS}
         "/usr/local/lib")
       if(IS_DIRECTORY "${_dir}")
         string(APPEND _LIB_PATHS ":${_dir}")

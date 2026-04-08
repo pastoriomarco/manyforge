@@ -125,6 +125,37 @@ ErrorCode error_code_from_dto(const ErrorDTO& error) {
   return ErrorCode::kInternalError;
 }
 
+bool cached_trajectory_matches_request_goal(const TrajectoryDTO& trajectory,
+                                            const ExecuteRequestDTO& request) {
+  if (trajectory.waypoints.empty()) {
+    return true;
+  }
+
+  if (auto* joint_goal = std::get_if<JointGoalDTO>(&request.motion)) {
+    const auto& end_wp = trajectory.waypoints.back();
+    if (end_wp.positions_rad.size() != joint_goal->positions_rad.size()) {
+      return false;
+    }
+
+    for (size_t i = 0; i < joint_goal->positions_rad.size(); ++i) {
+      const double diff =
+          std::abs(end_wp.positions_rad[i] - joint_goal->positions_rad[i]);
+      if (diff > request.tolerances.joint_position_tol_rad) {
+        return false;
+      }
+    }
+  }
+
+  return true;
+}
+
+struct PreparedExecutionStart {
+  bool cache_hit = false;
+  bool cache_miss = false;
+  bool cache_invalidated = false;
+  TrajectoryDTO trajectory;
+};
+
 }  // namespace
 
 ExecutionKernel::ExecutionKernel(IPlannerBackend& planner,
@@ -150,9 +181,7 @@ ExecutionKernel::ExecutionKernel(IPlannerBackend& planner,
 }
 
 ExecutionKernel::~ExecutionKernel() {
-  if (worker_thread_.joinable()) {
-    worker_thread_.join();
-  }
+  // std::jthread automatically joins on destruction
 }
 
 void ExecutionKernel::emit_event(const KernelEvent& event) {
@@ -334,123 +363,25 @@ TrajectoryDTO ExecutionKernel::build_remaining_trajectory(
   return remaining;
 }
 
-void ExecutionKernel::async_execute_worker(const ExecuteRequestDTO& request,
-                                            uint64_t exec_id) {
+void ExecutionKernel::async_execute_worker(
+    std::stop_token st, ExecuteRequestDTO request, uint64_t exec_id,
+    std::optional<TrajectoryDTO> cached_trajectory) {
   try {
     // Capture initial state for correct prev_state in events (B-2)
     const auto worker_entry_state = sm_.status().state;
 
+    // Check for early cancellation
+    if (st.stop_requested()) {
+      execution_complete_.store(true);
+      completion_cv_.notify_all();
+      return;
+    }
+
     TrajectoryDTO trajectory;
-    bool cache_hit = false;
-
-    if (request.cache_mode != CacheMode::kDisable) {
-      auto cached = cache_.lookup(request.move_id);
-      if (cached.has_value()) {
-        cache_hit = true;
-        trajectory = std::move(*cached);
-      } else {
-        // Cache miss - emit event and increment counter
-        emit_event({KernelEventType::kCacheMiss, exec_id, clock_.now(),
-                     {}, {}, std::nullopt, {{"move_id", request.move_id}}});
-        {
-          std::lock_guard<std::mutex> lock(metrics_mutex_);
-          metrics_.cache_misses++;
-        }
-      }
-    }
-
+    const bool cache_hit = cached_trajectory.has_value();
     if (cache_hit) {
-      // Goal-compatibility gate
-      if (!trajectory.waypoints.empty()) {
-        const auto& end_wp = trajectory.waypoints.back();
-        bool goal_compat = true;
-
-        if (auto* jg = std::get_if<JointGoalDTO>(&request.motion)) {
-          if (end_wp.positions_rad.size() == jg->positions_rad.size()) {
-            for (size_t i = 0; i < jg->positions_rad.size(); ++i) {
-              double diff = end_wp.positions_rad[i] - jg->positions_rad[i];
-              if (diff < 0) diff = -diff;
-              if (diff > request.tolerances.joint_position_tol_rad) {
-                goal_compat = false;
-                break;
-              }
-            }
-          } else {
-            goal_compat = false;
-          }
-        }
-
-        if (!goal_compat) {
-          cache_.invalidate(request.move_id);
-          cache_hit = false;
-          // Emit cache invalidated event
-          emit_event({KernelEventType::kCacheInvalidated, exec_id, clock_.now(),
-                       {}, {}, std::nullopt, {{"move_id", request.move_id}}});
-          {
-            std::lock_guard<std::mutex> lock(metrics_mutex_);
-            metrics_.cache_invalidations++;
-          }
-        }
-      }
-    }
-
-    if (cache_hit) {
-      // Idle -> Validating directly
-      auto prev_state = sm_.status().state;
-      auto r = sm_.try_transition(ExecutionState::kValidating);
-      if (!r.ok()) {
-        emit_event({KernelEventType::kErrorRaised, exec_id, clock_.now(),
-                     {}, {}, ErrorDTO{kErrorInternalError, "State transition failed", {}}, {}});
-        sm_.set_last_error(ErrorCode::kInternalError);
-        sm_.try_transition(ExecutionState::kFailed);
-        emit_event({KernelEventType::kStateTransition, exec_id, clock_.now(),
-                     prev_state, ExecutionState::kFailed, std::nullopt, {}});
-        execution_complete_.store(true);
-        completion_cv_.notify_all();
-        return;
-      }
-
-      emit_event({KernelEventType::kStateTransition, exec_id, clock_.now(),
-                   prev_state, ExecutionState::kValidating, std::nullopt, {}});
-      emit_event({KernelEventType::kCacheHit, exec_id, clock_.now(), {}, {}, std::nullopt, {}});
-      auto snapshot = get_execution_snapshot();
-      snapshot.timestamp_ns = clock_.now();
-      snapshot.execution_id = exec_id;
-      snapshot.move_id = request.move_id;
-      snapshot.state = ExecutionState::kValidating;
-      snapshot.progress = 0.0;
-      publish_execution_snapshot(std::move(snapshot));
-      {
-        std::lock_guard<std::mutex> lock(metrics_mutex_);
-        metrics_.cache_hits++;
-      }
+      trajectory = std::move(*cached_trajectory);
     } else {
-      // Idle -> Planning
-      auto prev_state = sm_.status().state;
-      auto r = sm_.try_transition(ExecutionState::kPlanning);
-      if (!r.ok()) {
-        emit_event({KernelEventType::kErrorRaised, exec_id, clock_.now(),
-                     {}, {}, ErrorDTO{kErrorInternalError, "State transition failed", {}}, {}});
-        sm_.set_last_error(ErrorCode::kInternalError);
-        sm_.try_transition(ExecutionState::kFailed);
-        emit_event({KernelEventType::kStateTransition, exec_id, clock_.now(),
-                     prev_state, ExecutionState::kFailed, std::nullopt, {}});
-        execution_complete_.store(true);
-        completion_cv_.notify_all();
-        return;
-      }
-
-      emit_event({KernelEventType::kStateTransition, exec_id, clock_.now(),
-                   prev_state, ExecutionState::kPlanning, std::nullopt, {}});
-      emit_event({KernelEventType::kPlanStarted, exec_id, clock_.now(), {}, {}, std::nullopt, {}});
-      auto planning_snapshot = get_execution_snapshot();
-      planning_snapshot.timestamp_ns = clock_.now();
-      planning_snapshot.execution_id = exec_id;
-      planning_snapshot.move_id = request.move_id;
-      planning_snapshot.state = ExecutionState::kPlanning;
-      planning_snapshot.progress = 0.0;
-      publish_execution_snapshot(std::move(planning_snapshot));
-
       // Schedule planning timeout (W-2)
       ScheduleHandle planning_timeout_handle = 0;
       const auto planning_start_ns = clock_.now();
@@ -946,11 +877,6 @@ void ExecutionKernel::async_execute_worker(const ExecuteRequestDTO& request,
 Result<uint64_t> ExecutionKernel::execute(const ExecuteRequestDTO& request) {
   std::lock_guard<std::mutex> lock(execute_mutex_);
 
-  // Join previous worker if still joinable
-  if (worker_thread_.joinable()) {
-    worker_thread_.join();
-  }
-
   // Auto-reset from terminal states
   auto current_state = sm_.status().state;
   if (current_state == ExecutionState::kCompleted ||
@@ -964,19 +890,71 @@ Result<uint64_t> ExecutionKernel::execute(const ExecuteRequestDTO& request) {
     return Result<uint64_t>::Err(ErrorCode::kExecutionRejected);
   }
 
+  PreparedExecutionStart prepared;
+  if (request.cache_mode != CacheMode::kDisable) {
+    auto cached = cache_.lookup(request.move_id);
+    if (cached.has_value()) {
+      if (cached_trajectory_matches_request_goal(*cached, request)) {
+        prepared.cache_hit = true;
+        prepared.trajectory = std::move(*cached);
+      } else {
+        cache_.invalidate(request.move_id);
+        prepared.cache_invalidated = true;
+      }
+    } else {
+      prepared.cache_miss = true;
+    }
+  }
+
   uint64_t exec_id = next_execution_id_++;
+  auto prev_state = sm_.status().state;
   sm_.set_execution_id(exec_id);
   active_move_id_ = request.move_id;
+  const auto initial_state =
+      prepared.cache_hit ? ExecutionState::kValidating
+                         : ExecutionState::kPlanning;
+  auto transition = sm_.try_transition(initial_state);
+  if (!transition.ok()) {
+    active_move_id_.clear();
+    sm_.set_execution_id(0);
+    return Result<uint64_t>::Err(ErrorCode::kInternalError);
+  }
 
   execution_complete_.store(false);
   resume_requested_.store(false);
   stop_collision_monitoring();
 
+  emit_event({KernelEventType::kStateTransition, exec_id, clock_.now(),
+              prev_state, initial_state, std::nullopt, {}});
+
+  if (prepared.cache_invalidated) {
+    emit_event({KernelEventType::kCacheInvalidated, exec_id, clock_.now(),
+                {}, {}, std::nullopt, {{"move_id", request.move_id}}});
+    std::lock_guard<std::mutex> metrics_lock(metrics_mutex_);
+    metrics_.cache_invalidations++;
+  }
+
+  if (prepared.cache_hit) {
+    emit_event(
+        {KernelEventType::kCacheHit, exec_id, clock_.now(), {}, {}, std::nullopt, {}});
+    std::lock_guard<std::mutex> metrics_lock(metrics_mutex_);
+    metrics_.cache_hits++;
+  } else {
+    if (prepared.cache_miss) {
+      emit_event({KernelEventType::kCacheMiss, exec_id, clock_.now(),
+                  {}, {}, std::nullopt, {{"move_id", request.move_id}}});
+      std::lock_guard<std::mutex> metrics_lock(metrics_mutex_);
+      metrics_.cache_misses++;
+    }
+    emit_event({KernelEventType::kPlanStarted, exec_id, clock_.now(),
+                {}, {}, std::nullopt, {}});
+  }
+
   ExecutionSnapshot snapshot;
   snapshot.timestamp_ns = clock_.now();
   snapshot.execution_id = exec_id;
   snapshot.move_id = request.move_id;
-  snapshot.state = sm_.status().state;
+  snapshot.state = initial_state;
   snapshot.progress = 0.0;
   try {
     snapshot.joint_positions_rad = context_.get_current_state().positions_rad;
@@ -985,8 +963,15 @@ Result<uint64_t> ExecutionKernel::execute(const ExecuteRequestDTO& request) {
   }
   publish_execution_snapshot(std::move(snapshot));
 
-  worker_thread_ = std::thread(&ExecutionKernel::async_execute_worker, this,
-                               request, exec_id);
+  worker_thread_ = std::jthread(
+      [this, request_copy = ExecuteRequestDTO(request),
+       exec_id,
+       cached_trajectory = prepared.cache_hit
+                               ? std::make_optional(std::move(prepared.trajectory))
+                               : std::nullopt](std::stop_token st) mutable {
+        async_execute_worker(st, std::move(request_copy), exec_id,
+                             std::move(cached_trajectory));
+      });
 
   return Result<uint64_t>::Ok(exec_id);
 }

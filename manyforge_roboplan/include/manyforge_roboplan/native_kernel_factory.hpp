@@ -8,6 +8,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <stop_token>
 
 #include <roboplan/core/scene.hpp>
 #include <roboplan_rrt/rrt.hpp>
@@ -27,7 +28,7 @@ class WallClock final : public core::IClock {
   core::TimePoint now() const override;
 };
 
-/// Simple scheduler using std::thread for deferred callbacks.
+/// Simple scheduler using std::jthread for deferred callbacks.
 class SimpleScheduler final : public core::IScheduler {
  public:
   SimpleScheduler();
@@ -35,22 +36,23 @@ class SimpleScheduler final : public core::IScheduler {
 
   core::ScheduleHandle schedule(core::TimePoint deadline,
                                 std::function<void()> callback) override;
-  void cancel(core::ScheduleHandle handle) override;
+ void cancel(core::ScheduleHandle handle) override;
 
  private:
+  void ensure_worker_started_locked();
+
   struct ScheduledTask {
     core::TimePoint deadline = 0;
     std::function<void()> callback;
   };
 
-  void worker_loop();
+  void worker_loop(std::stop_token st);
 
   std::atomic<uint64_t> next_handle_{1};
   std::mutex mutex_;
   std::condition_variable cv_;
   std::map<core::ScheduleHandle, ScheduledTask> tasks_;
-  bool shutdown_ = false;
-  std::thread worker_thread_;
+  std::jthread worker_thread_;
 };
 
 /// Bundle that owns all components. Kernel is destroyed first (declared last).

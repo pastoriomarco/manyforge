@@ -47,32 +47,33 @@ enum class ErrorCode {
 
 inline const char* to_string(ErrorCode code) {
     switch (code) {
-        case ErrorCode::kSuccess: return "Success";
-        case ErrorCode::kInvalidRequest: return "InvalidRequest";
-        case ErrorCode::kMissingReference: return "MissingReference";
-        case ErrorCode::kAmbiguousReference: return "AmbiguousReference";
-        case ErrorCode::kUnsupportedCapability: return "UnsupportedCapability";
-        case ErrorCode::kPlanningFailed: return "PlanningFailed";
-        case ErrorCode::kPlanningTimeout: return "PlanningTimeout";
-        case ErrorCode::kIkFailed: return "IkFailed";
-        case ErrorCode::kCartesianIncomplete: return "CartesianIncomplete";
-        case ErrorCode::kStartStateMismatch: return "StartStateMismatch";
-        case ErrorCode::kValidationCollision: return "ValidationCollision";
-        case ErrorCode::kValidationLimitsViolation: return "ValidationLimitsViolation";
-        case ErrorCode::kObjectAlreadyExists: return "ObjectAlreadyExists";
-        case ErrorCode::kObjectNotFound: return "ObjectNotFound";
-        case ErrorCode::kExecutionRejected: return "ExecutionRejected";
-        case ErrorCode::kExecutionAborted: return "ExecutionAborted";
-        case ErrorCode::kExecutionTimeout: return "ExecutionTimeout";
-        case ErrorCode::kStopFailed: return "StopFailed";
-        case ErrorCode::kPauseFailed: return "PauseFailed";
-        case ErrorCode::kResumeFailed: return "ResumeFailed";
-        case ErrorCode::kResetFailed: return "ResetFailed";
-        case ErrorCode::kInternalError: return "InternalError";
-        case ErrorCode::kInvariantViolation: return "InvariantViolation";
-        case ErrorCode::kInvalidStateTransition: return "InvalidStateTransition";
-        case ErrorCode::kCacheMiss: return "CacheMiss";
-        case ErrorCode::kCollisionDetected: return "CollisionDetected";
+        using enum ErrorCode;
+        case kSuccess: return "Success";
+        case kInvalidRequest: return "InvalidRequest";
+        case kMissingReference: return "MissingReference";
+        case kAmbiguousReference: return "AmbiguousReference";
+        case kUnsupportedCapability: return "UnsupportedCapability";
+        case kPlanningFailed: return "PlanningFailed";
+        case kPlanningTimeout: return "PlanningTimeout";
+        case kIkFailed: return "IkFailed";
+        case kCartesianIncomplete: return "CartesianIncomplete";
+        case kStartStateMismatch: return "StartStateMismatch";
+        case kValidationCollision: return "ValidationCollision";
+        case kValidationLimitsViolation: return "ValidationLimitsViolation";
+        case kObjectAlreadyExists: return "ObjectAlreadyExists";
+        case kObjectNotFound: return "ObjectNotFound";
+        case kExecutionRejected: return "ExecutionRejected";
+        case kExecutionAborted: return "ExecutionAborted";
+        case kExecutionTimeout: return "ExecutionTimeout";
+        case kStopFailed: return "StopFailed";
+        case kPauseFailed: return "PauseFailed";
+        case kResumeFailed: return "ResumeFailed";
+        case kResetFailed: return "ResetFailed";
+        case kInternalError: return "InternalError";
+        case kInvariantViolation: return "InvariantViolation";
+        case kInvalidStateTransition: return "InvalidStateTransition";
+        case kCacheMiss: return "CacheMiss";
+        case kCollisionDetected: return "CollisionDetected";
         default: return "Unknown";
     }
 }
@@ -119,19 +120,19 @@ public:
     }
 
     /// Check if result is ok
-    bool ok() const {
+    [[nodiscard]] bool ok() const {
         return value_.has_value();
     }
 
     /// Get the value (throws if error)
-    T& value() {
+    [[nodiscard]] T& value() {
         if (!value_.has_value()) {
             throw std::runtime_error("Called value() on error Result");
         }
         return *value_;
     }
 
-    const T& value() const {
+    [[nodiscard]] const T& value() const {
         if (!value_.has_value()) {
             throw std::runtime_error("Called value() on error Result");
         }
@@ -139,14 +140,14 @@ public:
     }
 
     /// Get the error (throws if ok)
-    ErrorDTO& error() {
+    [[nodiscard]] ErrorDTO& error() {
         if (!error_.has_value()) {
             throw std::runtime_error("Called error() on ok Result");
         }
         return *error_;
     }
 
-    const ErrorDTO& error() const {
+    [[nodiscard]] const ErrorDTO& error() const {
         if (!error_.has_value()) {
             throw std::runtime_error("Called error() on ok Result");
         }
@@ -201,19 +202,19 @@ public:
     }
 
     /// Check if result is ok
-    bool ok() const {
+    [[nodiscard]] bool ok() const {
         return ok_;
     }
 
     /// Get the error (throws if ok)
-    ErrorDTO& error() {
+    [[nodiscard]] ErrorDTO& error() {
         if (ok_) {
             throw std::runtime_error("Called error() on ok Result");
         }
         return error_;
     }
 
-    const ErrorDTO& error() const {
+    [[nodiscard]] const ErrorDTO& error() const {
         if (ok_) {
             throw std::runtime_error("Called error() on ok Result");
         }

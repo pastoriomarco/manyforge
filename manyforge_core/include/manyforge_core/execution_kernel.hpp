@@ -15,13 +15,15 @@
 #include <manyforge_core/types/metrics.hpp>
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <map>
 #include <mutex>
+#include <optional>
+#include <stop_token>
 #include <string>
 #include <thread>
-#include <condition_variable>
 #include <vector>
 
 namespace manyforge::core {
@@ -110,7 +112,10 @@ class ExecutionKernel {
       double time_s) const;
 
   /// Async execution worker function.
-  void async_execute_worker(const ExecuteRequestDTO& request, uint64_t exec_id);
+  void async_execute_worker(std::stop_token st,
+                            ExecuteRequestDTO request,
+                            uint64_t exec_id,
+                            std::optional<TrajectoryDTO> cached_trajectory);
 
   /// Emit an event to all subscribers.
   void emit_event(const KernelEvent& event);
@@ -148,7 +153,7 @@ class ExecutionKernel {
   uint64_t next_snapshot_sequence_ = 1;
 
   // Async execution state
-  std::thread worker_thread_;
+  std::jthread worker_thread_;
   std::condition_variable completion_cv_;
   std::mutex completion_mutex_;
   std::atomic<bool> execution_complete_{false};
