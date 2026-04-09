@@ -124,6 +124,26 @@ export interface FullDeployment {
   adapters: Record<string, AdapterConfig>;
   orchestrator: OrchestratorConfig;
   launch: LaunchConfig;
+  sourcePath: string;
+}
+
+export interface ApplySessionResponse {
+  status: string;
+}
+
+// Filesystem browser
+export interface FileBrowserEntry {
+  name: string;
+  path: string;
+  entryType: 'directory' | 'file';
+  selectable: boolean;
+}
+
+export interface FileBrowserResponse {
+  currentPath: string;
+  parentPath: string | null;
+  roots: string[];
+  entries: FileBrowserEntry[];
 }
 
 // WebSocket

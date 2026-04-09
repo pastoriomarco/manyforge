@@ -75,9 +75,38 @@ class Deployment:
         self.launch: Optional[LaunchConfig] = None
         self._load_and_validate()
 
+    @classmethod
+    def from_dict(
+        cls,
+        data: dict[str, Any],
+        path: str | Path = "<memory>",
+    ) -> "Deployment":
+        """Construct and validate a deployment directly from a mapping."""
+        self = cls.__new__(cls)
+        self._path = Path(path)
+        self.name = ""
+        self.description = ""
+        self.api_version = ""
+        self.schema_version = ""
+        self.program_profile = ""
+        self.robot_config = None
+        self.adapters = {}
+        self.orchestrator = None
+        self.launch = None
+        self._load_from_data_and_validate(data)
+        return self
+
     def _load_and_validate(self) -> None:
         with open(self._path) as f:
             data = yaml.safe_load(f)
+
+        self._load_from_data_and_validate(data)
+
+    def _load_from_data_and_validate(self, data: dict[str, Any]) -> None:
+        self.adapters = {}
+        self.robot_config = None
+        self.orchestrator = None
+        self.launch = None
 
         if not isinstance(data, dict):
             raise DeploymentValidationError("Deployment must be a YAML mapping")

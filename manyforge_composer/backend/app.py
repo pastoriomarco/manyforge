@@ -16,6 +16,7 @@ from .ws_state import StateHub
 from .routes_cycle import create_cycle_router
 from .routes_catalog import create_catalog_router
 from .routes_program import create_program_router
+from .routes_filesystem import create_filesystem_router
 
 logger = logging.getLogger(__name__)
 
@@ -118,6 +119,7 @@ def create_app(state: ComposerState, static_dir: str | None = None) -> FastAPI:
     app.include_router(create_cycle_router(state), prefix="/api/cycle", tags=["cycle"])
     app.include_router(create_catalog_router(state), prefix="/api/catalog", tags=["catalog"])
     app.include_router(create_program_router(state), prefix="/api", tags=["program"])
+    app.include_router(create_filesystem_router(), prefix="/api/files", tags=["files"])
 
     # WebSocket endpoint
     @app.websocket("/ws/state")

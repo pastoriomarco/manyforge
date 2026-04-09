@@ -1,7 +1,7 @@
 import { useCallback } from 'react';
 import { useProgramStore } from '../store/programStore';
 import { useCatalogStore } from '../store/catalogStore';
-import { useComposerStore } from '../store/composerStore';
+import { useCycleStore } from '../store/cycleStore';
 
 const KIND_COLORS: Record<string, string> = {
   sequence: 'border-blue-500 bg-blue-900/50',
@@ -13,35 +13,24 @@ const KIND_COLORS: Record<string, string> = {
   default: 'border-green-500 bg-green-900/50',
 };
 
-export function PropertyPanel() {
+export function PropertyPanel({ onCollapse }: { onCollapse: () => void }) {
   const { selectedNodeId, nodes, updateNodeParams, updateNodeLabel, removeNode } = useProgramStore();
   const { entries } = useCatalogStore();
-  const { mode } = useComposerStore();
-
-  if (!selectedNodeId) {
-    return null;
-  }
-
-  const selectedNode = nodes.find(n => n.id === selectedNodeId);
-  if (!selectedNode) {
-    return null;
-  }
-
-  const catalogEntry = entries.find(e => e.id === selectedNode.data.catalogId);
-  const colorClass = KIND_COLORS[selectedNode.data.catalogId as string] || KIND_COLORS.default;
-
-  // Type-safe access to params
-  const nodeParams = selectedNode.data.params as Record<string, unknown> || {};
-
-  const isRunMode = mode === 'run';
+  const cycleState = useCycleStore((state) => state.state);
+  const selectedNode = selectedNodeId ? nodes.find(n => n.id === selectedNodeId) : undefined;
+  const catalogEntry = selectedNode ? entries.find(e => e.id === selectedNode.data.catalogId) : undefined;
+  const colorClass = selectedNode ? (KIND_COLORS[selectedNode.data.catalogId as string] || KIND_COLORS.default) : KIND_COLORS.default;
+  const nodeParams = (selectedNode?.data.params as Record<string, unknown> | undefined) ?? {};
+  const isRunMode = cycleState === 'running';
 
   const handleDelete = useCallback(() => {
+    if (!selectedNodeId) return;
     removeNode(selectedNodeId);
   }, [selectedNodeId, removeNode]);
 
   const handleLabelChange = useCallback(
     (e: React.ChangeEvent<HTMLInputElement>) => {
-      if (isRunMode) return;
+      if (isRunMode || !selectedNodeId) return;
       updateNodeLabel(selectedNodeId, e.target.value);
     },
     [selectedNodeId, updateNodeLabel, isRunMode],
@@ -49,11 +38,48 @@ export function PropertyPanel() {
 
   const handleParamChange = useCallback(
     (paramName: string, value: unknown) => {
-      if (isRunMode) return;
+      if (isRunMode || !selectedNodeId) return;
       updateNodeParams(selectedNodeId, { ...nodeParams, [paramName]: value });
     },
     [selectedNodeId, updateNodeParams, nodeParams, isRunMode],
   );
+
+  if (!selectedNodeId) {
+    return (
+      <div className="relative flex h-full w-full flex-col items-center justify-center bg-gray-800">
+        <button
+          type="button"
+          onClick={onCollapse}
+          className="absolute right-2 top-2 rounded bg-gray-700 px-2 py-1 text-sm font-medium text-gray-200 hover:bg-gray-600"
+          title="Collapse properties"
+        >
+          ›
+        </button>
+        <div className="text-gray-500 text-sm text-center px-4">
+          <div className="text-2xl mb-2">←</div>
+          <p>Select a node to view and edit its properties</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (!selectedNode) {
+    return (
+      <div className="relative flex h-full w-full flex-col items-center justify-center bg-gray-800">
+        <button
+          type="button"
+          onClick={onCollapse}
+          className="absolute right-2 top-2 rounded bg-gray-700 px-2 py-1 text-sm font-medium text-gray-200 hover:bg-gray-600"
+          title="Collapse properties"
+        >
+          ›
+        </button>
+        <div className="text-gray-500 text-sm text-center px-4">
+          <p>Node not found</p>
+        </div>
+      </div>
+    );
+  }
 
   const renderParameterInput = (param: {
     name: string;
@@ -139,7 +165,7 @@ export function PropertyPanel() {
   };
 
   return (
-    <div className="w-72 bg-gray-800 border-l border-gray-700 flex flex-col overflow-hidden">
+    <div className="flex h-full w-full flex-col overflow-hidden bg-gray-800">
       {/* Read-only banner in run mode */}
       {isRunMode && (
         <div className="bg-yellow-900/50 border-b border-yellow-700 px-3 py-2">
@@ -154,15 +180,25 @@ export function PropertyPanel() {
       <div className={`p-3 border-b border-gray-700 ${colorClass}`}>
         <div className="flex items-center justify-between mb-2">
           <span className="text-xs text-gray-400 uppercase">{selectedNode.data.catalogId as string}</span>
-          {!isRunMode && (
+          <div className="flex items-center gap-2">
+            {!isRunMode && (
+              <button
+                onClick={handleDelete}
+                className="text-red-400 hover:text-red-300 font-bold text-lg"
+                title="Delete node"
+              >
+                ×
+              </button>
+            )}
             <button
-              onClick={handleDelete}
-              className="text-red-400 hover:text-red-300 font-bold text-lg"
-              title="Delete node"
+              type="button"
+              onClick={onCollapse}
+              className="rounded bg-gray-700 px-2 py-1 text-sm font-medium text-gray-200 hover:bg-gray-600"
+              title="Collapse properties"
             >
-              ×
+              ›
             </button>
-          )}
+          </div>
         </div>
         <input
           type="text"

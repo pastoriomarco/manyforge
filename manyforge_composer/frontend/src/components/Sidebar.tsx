@@ -62,12 +62,12 @@ function NodePaletteContent() {
   );
 }
 
-export function Sidebar() {
+export function Sidebar({ onCollapse }: { onCollapse: () => void }) {
   const [tab, setTab] = useState<'nodes' | 'deployment'>('nodes');
 
   return (
-    <div className="w-60 bg-gray-800 border-r border-gray-700 flex flex-col overflow-hidden">
-      <div className="flex border-b border-gray-700">
+    <div className="flex h-full w-full flex-col overflow-hidden bg-gray-800">
+      <div className="flex items-center border-b border-gray-700">
         <button
           onClick={() => setTab('nodes')}
           className={`flex-1 px-3 py-2 text-xs font-semibold uppercase tracking-wide ${
@@ -87,6 +87,14 @@ export function Sidebar() {
           }`}
         >
           Deployment
+        </button>
+        <button
+          type="button"
+          onClick={onCollapse}
+          className="shrink-0 px-2 py-2 text-lg leading-none text-gray-400 hover:text-white"
+          title="Collapse sidebar"
+        >
+          ‹
         </button>
       </div>
 

@@ -14,6 +14,7 @@ from manyforge_behavior.kernel_client import MockKernelClient, SceneEditRequest
 from manyforge_composer.backend.state import ComposerState
 from manyforge_composer.backend.app import create_app
 from manyforge_composer.__main__ import build_program_loaded_callback
+from manyforge_composer.backend import routes_filesystem
 
 
 # Test fixture paths (relative to repo root, same as existing tests)
@@ -188,6 +189,55 @@ def test_catalog_entry_not_found(client):
 
 
 # =============================================================================
+# Filesystem Browser Tests
+# =============================================================================
+
+def test_browse_program_files_filters_to_compatible_extensions(client, tmp_path):
+    (tmp_path / "alpha.program.yaml").write_text("apiVersion: manyforge/v1\n", encoding="utf-8")
+    (tmp_path / "beta.program.yml").write_text("apiVersion: manyforge/v1\n", encoding="utf-8")
+    (tmp_path / "ignore.txt").write_text("hello\n", encoding="utf-8")
+    (tmp_path / "subdir").mkdir()
+
+    response = client.get("/api/files/browse", params={"path": str(tmp_path), "kind": "program"})
+    assert response.status_code == 200
+    data = response.json()
+
+    entry_names = [entry["name"] for entry in data["entries"]]
+    assert "subdir" in entry_names
+    assert "alpha.program.yaml" in entry_names
+    assert "beta.program.yml" in entry_names
+    assert "ignore.txt" not in entry_names
+
+
+def test_browse_deployment_files_filters_to_compatible_extensions(client, tmp_path):
+    (tmp_path / "robot.deployment.yaml").write_text("apiVersion: manyforge/v1\n", encoding="utf-8")
+    (tmp_path / "robot.deployment.yml").write_text("apiVersion: manyforge/v1\n", encoding="utf-8")
+    (tmp_path / "other.program.yaml").write_text("apiVersion: manyforge/v1\n", encoding="utf-8")
+
+    response = client.get("/api/files/browse", params={"path": str(tmp_path), "kind": "deployment"})
+    assert response.status_code == 200
+    data = response.json()
+
+    entry_names = [entry["name"] for entry in data["entries"]]
+    assert "robot.deployment.yaml" in entry_names
+    assert "robot.deployment.yml" in entry_names
+    assert "other.program.yaml" not in entry_names
+
+
+def test_file_browser_roots_skip_container_root_home(monkeypatch, tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    monkeypatch.setattr(routes_filesystem.Path, "cwd", staticmethod(lambda: workspace))
+    monkeypatch.setattr(routes_filesystem.Path, "home", staticmethod(lambda: Path("/root")))
+
+    roots = routes_filesystem._root_shortcuts()
+    assert str(workspace.resolve()) in roots
+    assert "/" in roots
+    assert "/root" not in roots
+
+
+# =============================================================================
 # Program Tests
 # =============================================================================
 
@@ -246,6 +296,29 @@ def test_get_program_tree(client, state):
     assert "children" in tree
 
 
+def test_get_saved_program_tree_reflects_disk_not_applied_runtime(client):
+    """GET /api/program/saved/tree returns the on-disk artifact even after an unsaved apply."""
+    client.post("/api/program/load", json={"path": _PROGRAM_PATH})
+
+    modified_tree = {
+        "id": "sequence",
+        "name": "applied_not_saved_sequence",
+        "children": [
+            {
+                "id": "reset_trajectories",
+                "name": "reset_once",
+            },
+        ],
+    }
+    response = client.post("/api/session/apply", json={"tree": modified_tree})
+    assert response.status_code == 200
+
+    runtime_tree = client.get("/api/program/tree").json()["tree"]
+    saved_tree = client.get("/api/program/saved/tree").json()["tree"]
+    assert runtime_tree["name"] == "applied_not_saved_sequence"
+    assert saved_tree["name"] == "main_sequence"
+
+
 # =============================================================================
 # Deployment Tests
 # =============================================================================
@@ -265,6 +338,35 @@ def test_load_deployment(client, state):
     assert "description" in data
     assert "programProfile" in data
     assert "robotConfig" in data
+
+
+def test_get_full_deployment(client):
+    """GET /api/deployment/full returns the full loaded artifact plus source path."""
+    client.post("/api/deployment/load", json={"path": _DEPLOYMENT_PATH})
+
+    response = client.get("/api/deployment/full")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["sourcePath"] == _DEPLOYMENT_PATH
+    assert data["apiVersion"] == "manyforge.deployment.v0"
+    assert "adapters" in data
+    assert "orchestrator" in data
+    assert "launch" in data
+
+
+def test_get_saved_full_deployment_reflects_disk_not_applied_runtime(client):
+    """GET /api/deployment/saved/full returns the on-disk artifact even after an unsaved apply."""
+    client.post("/api/program/load", json={"path": _PROGRAM_PATH, "deployment_path": _DEPLOYMENT_PATH})
+    full_deployment = client.get("/api/deployment/full").json()
+    modified_deployment = {**full_deployment, "name": "applied_not_saved_deployment"}
+
+    response = client.post("/api/session/apply", json={"deployment": modified_deployment})
+    assert response.status_code == 200
+
+    runtime_deployment = client.get("/api/deployment/full").json()
+    saved_deployment = client.get("/api/deployment/saved/full").json()
+    assert runtime_deployment["name"] == "applied_not_saved_deployment"
+    assert saved_deployment["name"] == full_deployment["name"]
 
 
 def test_load_program_rebuilds_kernel_from_deployment_config():
@@ -370,6 +472,32 @@ def test_save_deployment(client, state):
             os.unlink(tmp_path)
 
 
+def test_save_deployment_payload_does_not_apply_runtime_state(client):
+    """Saving a modified deployment payload writes disk only and does not mutate loaded runtime state."""
+    import os
+    import tempfile
+    import yaml
+
+    client.post("/api/program/load", json={"path": _PROGRAM_PATH, "deployment_path": _DEPLOYMENT_PATH})
+    original = client.get("/api/deployment/full").json()
+    modified = {**original, "name": "saved_only_deployment"}
+
+    tmp_path = tempfile.mktemp(suffix=".yaml")
+    try:
+      response = client.post("/api/deployment/save", json={"path": tmp_path, "deployment": modified})
+      assert response.status_code == 200
+
+      current = client.get("/api/deployment/full").json()
+      assert current["name"] == original["name"]
+
+      with open(tmp_path) as f:
+          saved_data = yaml.safe_load(f)
+      assert saved_data["name"] == "saved_only_deployment"
+    finally:
+      if os.path.exists(tmp_path):
+          os.unlink(tmp_path)
+
+
 # =============================================================================
 # WebSocket Tests
 # =============================================================================
@@ -468,6 +596,70 @@ def test_save_program(client, state):
     finally:
         if os.path.exists(tmp_path):
             os.unlink(tmp_path)
+
+
+def test_save_program_tree_payload_does_not_apply_runtime_state(client):
+    """Saving a modified tree payload writes disk only and does not mutate loaded runtime state."""
+    import os
+    import tempfile
+    import yaml
+
+    client.post("/api/program/load", json={"path": _PROGRAM_PATH})
+    original_tree = client.get("/api/program/tree").json()["tree"]
+    modified_tree = {
+        "id": "sequence",
+        "name": "saved_only_sequence",
+        "children": [
+            {
+                "id": "reset_trajectories",
+                "name": "reset_once",
+            },
+        ],
+    }
+
+    tmp_path = tempfile.mktemp(suffix=".yaml")
+    try:
+        response = client.post("/api/program/save", json={"path": tmp_path, "tree": modified_tree})
+        assert response.status_code == 200
+
+        current_tree = client.get("/api/program/tree").json()["tree"]
+        assert current_tree == original_tree
+
+        with open(tmp_path) as f:
+            saved_data = yaml.safe_load(f)
+        assert saved_data["tree"]["name"] == "saved_only_sequence"
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+
+def test_apply_session_updates_program_and_deployment_together(client):
+    """POST /api/session/apply updates the runtime models atomically."""
+    client.post("/api/program/load", json={"path": _PROGRAM_PATH, "deployment_path": _DEPLOYMENT_PATH})
+    full_deployment = client.get("/api/deployment/full").json()
+
+    modified_tree = {
+        "id": "sequence",
+        "name": "applied_sequence",
+        "children": [
+            {
+                "id": "reset_trajectories",
+                "name": "reset_once",
+            },
+        ],
+    }
+    modified_deployment = {**full_deployment, "name": "applied_deployment"}
+
+    response = client.post(
+        "/api/session/apply",
+        json={"tree": modified_tree, "deployment": modified_deployment},
+    )
+    assert response.status_code == 200
+
+    current_tree = client.get("/api/program/tree").json()["tree"]
+    current_deployment = client.get("/api/deployment/full").json()
+    assert current_tree["name"] == "applied_sequence"
+    assert current_deployment["name"] == "applied_deployment"
 
 
 # =============================================================================

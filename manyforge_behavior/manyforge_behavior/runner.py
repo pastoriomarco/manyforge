@@ -55,12 +55,16 @@ class OrchestratorRunner:
         kernel: KernelClient,
         overrides: Optional[dict[str, Any]] = None,
         deployment_path: Optional[str] = None,
+        program: Optional[Program] = None,
+        deployment: Optional["Deployment"] = None,
     ):
         self._catalog_path = catalog_path
         self._program_path = program_path
         self._kernel = kernel
         self._overrides = overrides or {}
         self._deployment_path = deployment_path
+        self._provided_program = program
+        self._provided_deployment = deployment
         self._catalog: Optional[NodeCatalog] = None
         self._program: Optional[Program] = None
         self._resolver: Optional[ParameterResolver] = None
@@ -70,14 +74,18 @@ class OrchestratorRunner:
     def load(self) -> None:
         """Load catalog, program, validate, set up parameter resolver."""
         self._catalog = NodeCatalog(self._catalog_path)
-        self._program = Program(self._program_path, self._catalog)
+        self._program = self._provided_program or Program(self._program_path, self._catalog)
         self._resolver = ParameterResolver(
             self._program.get_parameter_defaults(),
             self._overrides,
         )
 
         # Load and validate deployment if provided
-        if self._deployment_path:
+        if self._provided_deployment is not None:
+            self._deployment = self._provided_deployment
+            self._deployment.validate_against_program(self._program)
+            self._deployment.validate_capabilities()
+        elif self._deployment_path:
             from manyforge_behavior.deployment import Deployment
             self._deployment = Deployment(self._deployment_path)
             self._deployment.validate_against_program(self._program)

@@ -75,9 +75,38 @@ class Program:
         self.tree: Optional[TreeNode] = None
         self._load_and_validate()
 
+    @classmethod
+    def from_dict(
+        cls,
+        data: dict[str, Any],
+        catalog: NodeCatalog,
+        path: str | Path = "<memory>",
+    ) -> "Program":
+        """Construct and validate a program directly from a mapping."""
+        self = cls.__new__(cls)
+        self._path = Path(path)
+        self._catalog = catalog
+        self.name = ""
+        self.description = ""
+        self.program_profile = ""
+        self.catalog_version = ""
+        self.robot = None
+        self.scene = []
+        self.parameters = {}
+        self.tree = None
+        self._load_from_data_and_validate(data)
+        return self
+
     def _load_and_validate(self) -> None:
         with open(self._path) as f:
             data = yaml.safe_load(f)
+
+        self._load_from_data_and_validate(data)
+
+    def _load_from_data_and_validate(self, data: dict[str, Any]) -> None:
+        self.scene = []
+        self.parameters = {}
+        self.tree = None
 
         if not isinstance(data, dict):
             raise ProgramValidationError("Program must be a YAML mapping")

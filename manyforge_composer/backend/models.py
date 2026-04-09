@@ -97,6 +97,7 @@ class ProgramTreeResponse(BaseModel):
 
 class SaveProgramRequest(BaseModel):
     path: str
+    tree: Optional[TreeNodeResponse] = None
 
 
 class UpdateTreeRequest(BaseModel):
@@ -169,6 +170,7 @@ class FullDeploymentResponse(BaseModel):
     adapters: Dict[str, AdapterConfigResponse]
     orchestrator: OrchestratorConfigResponse
     launch: LaunchConfigResponse
+    source_path: str = Field(alias="sourcePath", default="")
 
 
 class UpdateDeploymentRequest(BaseModel):
@@ -184,6 +186,34 @@ class UpdateDeploymentRequest(BaseModel):
 
 class SaveDeploymentRequest(BaseModel):
     path: str
+    deployment: Optional[FullDeploymentResponse] = None
+
+
+class ApplySessionRequest(BaseModel):
+    model_config = _ALIAS_CFG
+    tree: Optional[TreeNodeResponse] = None
+    deployment: Optional[FullDeploymentResponse] = None
+
+
+class ApplySessionResponse(BaseModel):
+    status: str
+
+
+# --- File Browser ---
+class FileBrowserEntryResponse(BaseModel):
+    model_config = _ALIAS_CFG
+    name: str
+    path: str
+    entry_type: str = Field(alias="entryType")
+    selectable: bool
+
+
+class FileBrowserResponse(BaseModel):
+    model_config = _ALIAS_CFG
+    current_path: str = Field(alias="currentPath")
+    parent_path: Optional[str] = Field(default=None, alias="parentPath")
+    roots: List[str] = Field(default_factory=list)
+    entries: List[FileBrowserEntryResponse]
 
 
 # --- WebSocket ---

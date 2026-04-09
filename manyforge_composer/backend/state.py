@@ -33,9 +33,50 @@ class ComposerState:
         self.program: Optional[Program] = None
         self.program_source_path: str = ""
         self.deployment: Optional[Deployment] = None
+        self.deployment_source_path: str = ""
         self.cycle_manager: Optional[CycleManager] = None
         self.hmi_server = None
         self._on_program_loaded: Optional[Callable[["ComposerState"], None]] = None
+
+    def _rebuild_runtime(
+        self,
+        program: Program,
+        deployment: Optional[Deployment],
+    ) -> None:
+        """Rebuild runner + cycle manager from already-validated in-memory models."""
+        if self.cycle_manager is not None:
+            self.cycle_manager.reset()
+
+        if deployment is not None and self._kernel_factory is not None:
+            self._kernel, self.kernel_bundle = self._kernel_factory(deployment)
+
+        runner = OrchestratorRunner(
+            catalog_path=self._catalog_path,
+            program_path=self.program_source_path or "<memory>",
+            kernel=self._kernel,
+            deployment_path=self.deployment_source_path or None,
+            program=program,
+            deployment=deployment,
+        )
+        runner.load()
+
+        self.program = program
+        self.deployment = deployment
+        self.cycle_manager = CycleManager(runner, self._kernel)
+
+        if self._on_program_loaded:
+            try:
+                self._on_program_loaded(self)
+            except Exception:
+                logger.exception("on_program_loaded callback failed")
+
+    def apply_models(
+        self,
+        program: Program,
+        deployment: Optional[Deployment],
+    ) -> None:
+        """Apply validated program/deployment models to the runtime session."""
+        self._rebuild_runtime(program, deployment)
 
     def load_program(self, program_path: str, deployment_path: Optional[str] = None) -> Program:
         """Load a program (and optional deployment). Creates new runner + CycleManager."""
@@ -48,6 +89,7 @@ class ComposerState:
         if deployment_path:
             deployment = Deployment(deployment_path)
             self.deployment = deployment
+            self.deployment_source_path = deployment_path
 
         if deployment is not None and self._kernel_factory is not None:
             self._kernel, self.kernel_bundle = self._kernel_factory(deployment)

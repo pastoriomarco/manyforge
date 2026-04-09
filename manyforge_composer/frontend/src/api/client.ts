@@ -9,6 +9,8 @@ import type {
   TreeNode,
   DeploymentInfo,
   FullDeployment,
+  ApplySessionResponse,
+  FileBrowserResponse,
 } from '../types/api';
 
 const BASE_URL = import.meta.env.VITE_API_URL || '';
@@ -44,18 +46,38 @@ export const api = {
       request<ProgramInfo>('POST', '/api/program/load', { path, deploymentPath }),
     get: () => request<ProgramInfo>('GET', '/api/program'),
     tree: () => request<ProgramTree>('GET', '/api/program/tree'),
+    savedTree: () => request<ProgramTree>('GET', '/api/program/saved/tree'),
     updateTree: (tree: TreeNode) =>
       request<unknown>('PUT', '/api/program/tree', { tree }),
     save: (path: string) =>
       request<unknown>('POST', '/api/program/save', { path }),
+    saveTree: (path: string, tree: TreeNode) =>
+      request<unknown>('POST', '/api/program/save', { path, tree }),
   },
   deployment: {
     load: (path: string) =>
       request<DeploymentInfo>('POST', '/api/deployment/load', { path }),
     get: () => request<DeploymentInfo>('GET', '/api/deployment'),
+    getFull: () => request<FullDeployment>('GET', '/api/deployment/full'),
+    getSavedFull: () => request<FullDeployment>('GET', '/api/deployment/saved/full'),
     update: (data: Partial<FullDeployment>) =>
       request<{ status: string }>('PUT', '/api/deployment', data),
     save: (path: string) =>
       request<{ status: string; path: string }>('POST', '/api/deployment/save', { path }),
+    saveFull: (path: string, deployment: FullDeployment) =>
+      request<{ status: string; path: string }>('POST', '/api/deployment/save', { path, deployment }),
+  },
+  session: {
+    apply: (payload: { tree?: TreeNode; deployment?: FullDeployment }) =>
+      request<ApplySessionResponse>('POST', '/api/session/apply', payload),
+  },
+  files: {
+    browse: (kind: 'program' | 'deployment', path?: string) => {
+      const params = new URLSearchParams({ kind });
+      if (path) {
+        params.set('path', path);
+      }
+      return request<FileBrowserResponse>('GET', `/api/files/browse?${params.toString()}`);
+    },
   },
 };
