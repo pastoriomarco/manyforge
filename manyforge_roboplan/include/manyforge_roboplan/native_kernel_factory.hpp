@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <deque>
 #include <map>
 #include <mutex>
 #include <memory>
@@ -55,6 +56,28 @@ class SimpleScheduler final : public core::IScheduler {
   std::jthread worker_thread_;
 };
 
+/// Thread-safe kernel event collector.
+/// Subscribes to ExecutionKernel events and buffers them for polling.
+class KernelEventCollector {
+ public:
+  static constexpr size_t kMaxBufferedEvents = 4096;
+
+  /// Start collecting events from the given kernel.
+  void subscribe(core::ExecutionKernel& kernel);
+
+  /// Unsubscribe from the kernel (safe to call if not subscribed).
+  void unsubscribe(core::ExecutionKernel& kernel);
+
+  /// Drain all buffered events (returns and clears the buffer).
+  std::vector<core::KernelEvent> drain();
+
+ private:
+  std::mutex mutex_;
+  std::deque<core::KernelEvent> buffer_;
+  core::SubscriptionHandle subscription_{0};
+  bool subscribed_ = false;
+};
+
 /// Bundle that owns all components. Kernel is destroyed first (declared last).
 /// Python holds a shared_ptr to this bundle to keep everything alive.
 struct NativeKernelBundle {
@@ -72,8 +95,13 @@ struct NativeKernelBundle {
   std::unique_ptr<core::TrajectoryCache> cache;
   std::unique_ptr<RoboPlanExecutionBackend> execution;
 
+  // Event collector — subscribes to kernel, must be destroyed before kernel
+  KernelEventCollector event_collector;
+
   // Kernel MUST be last — it holds references to everything above
   std::unique_ptr<core::ExecutionKernel> kernel;
+
+  ~NativeKernelBundle();
 };
 
 /// Create a fully wired native kernel with real RoboPlan backends.

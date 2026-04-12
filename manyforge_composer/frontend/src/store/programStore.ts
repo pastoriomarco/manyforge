@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 import { api } from '../api/client';
-import type { TreeNode, ProgramInfo } from '../types/api';
+import type { TreeNode, ProgramInfo, RuntimeOverrideStatus } from '../types/api';
 import { Position } from '@xyflow/react';
 import type { Node, Edge } from '@xyflow/react';
 
@@ -28,6 +28,7 @@ interface ProgramStore {
   layoutDirection: LayoutDirection;
   layoutRevision: number;
   selectedNodeId: string | null;
+  runtimeOverrideStatus: RuntimeOverrideStatus | null;
   loading: boolean;
   error: string | null;
   isDirty: boolean;
@@ -35,6 +36,7 @@ interface ProgramStore {
   loadProgram: (path: string, deploymentPath?: string) => Promise<void>;
   fetchProgramInfo: () => Promise<boolean>;
   fetchTree: () => Promise<boolean>;
+  fetchRuntimeOverrideStatus: () => Promise<RuntimeOverrideStatus | null>;
   hydrateLoadedProgram: (options?: { retries?: number; retryDelayMs?: number }) => Promise<boolean>;
   setNodes: (
     nodes: Node[] | ((current: Node[]) => Node[]),
@@ -57,6 +59,8 @@ interface ProgramStore {
   discardToApplied: () => void;
   setAppliedToDraft: () => void;
   setSavedToDraft: () => void;
+  activateRuntimeOverrides: () => Promise<void>;
+  clearRuntimeOverrides: () => Promise<void>;
   saveProgram: (path: string) => Promise<void>;
 }
 
@@ -97,6 +101,8 @@ function collectTreeToFlow(
       label: node.name,
       catalogId: node.id,
       params: node.params,
+      modificationPolicy: node.modificationPolicy ?? {},
+      recoveryPolicy: node.recoveryPolicy ?? {},
     },
   });
   
@@ -248,6 +254,8 @@ function flowToTree(nodes: Node[], edges: Edge[], direction: LayoutDirection): T
       id: (node.data as any).catalogId || node.id,
       name: (node.data as any).label || '',
       params: (node.data as any).params || {},
+      modificationPolicy: (node.data as any).modificationPolicy || {},
+      recoveryPolicy: (node.data as any).recoveryPolicy || {},
       children: childIds.map(buildTree),
     };
   }
@@ -276,6 +284,7 @@ export const useProgramStore = create<ProgramStore>((set, get) => ({
   layoutDirection: 'horizontal',
   layoutRevision: 0,
   selectedNodeId: null,
+  runtimeOverrideStatus: null,
   loading: false,
   error: null,
   isDirty: false,
@@ -301,6 +310,7 @@ export const useProgramStore = create<ProgramStore>((set, get) => ({
     } catch (e) {
       const error = e as Error;
       if (isProgramNotLoadedError(error)) {
+        set({ runtimeOverrideStatus: null });
         return false;
       }
       console.error('Failed to fetch program info', e);
@@ -312,9 +322,10 @@ export const useProgramStore = create<ProgramStore>((set, get) => ({
   fetchTree: async () => {
     set({ loading: true });
     try {
-      const [data, savedData] = await Promise.all([
+      const [data, savedData, runtimeOverrideStatus] = await Promise.all([
         api.program.tree(),
         api.program.savedTree().catch(() => null),
+        api.program.runtimeOverrides().catch(() => null),
       ]);
       const nodes: Node[] = [];
       const edges: Edge[] = [];
@@ -325,6 +336,7 @@ export const useProgramStore = create<ProgramStore>((set, get) => ({
         edges,
         appliedTree: data.tree,
         savedTree: savedData?.tree ?? data.tree,
+        runtimeOverrideStatus,
         layoutRevision: get().layoutRevision + 1,
         loading: false,
         isDirty: false,
@@ -335,6 +347,23 @@ export const useProgramStore = create<ProgramStore>((set, get) => ({
       console.error('Failed to fetch program tree', e);
       set({ error: (e as Error).message, loading: false });
       return false;
+    }
+  },
+
+  fetchRuntimeOverrideStatus: async () => {
+    try {
+      const status = await api.program.runtimeOverrides();
+      set({ runtimeOverrideStatus: status, error: null });
+      return status;
+    } catch (e) {
+      const error = e as Error;
+      if (isProgramNotLoadedError(error)) {
+        set({ runtimeOverrideStatus: null });
+        return null;
+      }
+      console.error('Failed to fetch runtime override status', e);
+      set({ error: error.message });
+      return null;
     }
   },
 
@@ -399,6 +428,7 @@ export const useProgramStore = create<ProgramStore>((set, get) => ({
         label: catalogId,
         catalogId,
         params: {},
+        modificationPolicy: {},
       },
     };
     set({ nodes: [...get().nodes, newNode], isDirty: true });
@@ -499,6 +529,16 @@ export const useProgramStore = create<ProgramStore>((set, get) => ({
   setSavedToDraft: () => {
     const tree = get().flowToTree();
     set({ savedTree: tree, isDirty: false });
+  },
+
+  activateRuntimeOverrides: async () => {
+    await api.program.activateRuntimeOverrides();
+    await get().fetchTree();
+  },
+
+  clearRuntimeOverrides: async () => {
+    await api.program.clearRuntimeOverrides();
+    await get().fetchTree();
   },
 
   saveProgram: async (path: string) => {

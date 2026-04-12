@@ -359,6 +359,38 @@ class TestNativeSceneEdits:
         assert state.attached is False
         assert state.frame_id == "universe"
 
+    def test_scene_object_enumeration_exposes_shape_and_joint_names(self, native_kernel):
+        result = native_kernel.scene_edit(SceneEditRequest(
+            operation="add", object_id="enumerated_box", shape_type="box",
+            box_dimensions_m=[0.1, 0.2, 0.3],
+            pose_position_m=[0.45, -0.1, 0.55],
+            pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
+            frame_id="universe",
+        ))
+        assert result.success is True
+
+        object_ids = native_kernel.get_scene_object_ids()
+        assert "enumerated_box" in object_ids
+
+        joint_names = native_kernel.get_joint_names()
+        assert joint_names == UR5_JOINTS
+
+        objects = native_kernel.get_scene_objects()
+        enumerated = next(obj for obj in objects if obj.object_id == "enumerated_box")
+        assert enumerated.shape is not None
+        assert enumerated.shape.type == "box"
+        assert enumerated.shape.box_dimensions_m == pytest.approx([0.1, 0.2, 0.3])
+        assert enumerated.pose_in_universe is not None
+        assert enumerated.pose_in_universe["position_m"] == pytest.approx([0.45, -0.1, 0.55])
+
+    def test_invalid_scene_edit_operation_returns_error(self, native_kernel):
+        result = native_kernel.scene_edit(SceneEditRequest(
+            operation="teleport",
+            object_id="query_box",
+        ))
+        assert result.success is False
+        assert "Unsupported scene edit operation" in (result.error or "")
+
     def test_attached_frame_object_pose_follows_backend_link_frame(self, native_kernel):
         link_pose = native_kernel.get_link_pose("tool0", "universe")
         assert link_pose is not None

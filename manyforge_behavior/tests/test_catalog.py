@@ -45,6 +45,16 @@ class TestCatalogLoading:
         move_id_param = next(p for p in move.parameters if p.name == "move_id")
         assert move_id_param.required is True
 
+    def test_blackboard_metadata_loaded_for_shipped_entries(self):
+        catalog = NodeCatalog(CATALOG_PATH)
+        set_key = catalog.get("set_key_bool_value")
+        check_pose = catalog.get("check_pose_distance")
+
+        assert set_key.bb_writer_params == ["key"]
+        assert set_key.bb_reader_params == []
+        assert check_pose.bb_reader_params == ["pose_key_a", "pose_key_b"]
+        assert check_pose.bb_writer_params == []
+
     def test_get_nonexistent_raises(self):
         catalog = NodeCatalog(CATALOG_PATH)
         with pytest.raises(KeyError):
@@ -189,5 +199,49 @@ class TestCatalogValidation:
             ],
         })
         with pytest.raises(CatalogValidationError, match="py_trees"):
+            NodeCatalog(path)
+        os.unlink(path)
+
+    def test_rejects_blackboard_metadata_for_unknown_parameter(self):
+        path = self._write_catalog({
+            "api_version": "manyforge.node_catalog.v0",
+            "catalog_version": "0.1.0",
+            "entries": [
+                {
+                    "id": "bb_bad",
+                    "name": "BadBlackboardNode",
+                    "kind": "leaf",
+                    "children": {"min": 0, "max": 0},
+                    "parameters": [
+                        {"name": "known", "type": "string", "required": True},
+                    ],
+                    "bb_reader_params": ["missing"],
+                    "runners": {"py_trees": {"implementation_kind": "plugin"}},
+                },
+            ],
+        })
+        with pytest.raises(CatalogValidationError, match="unknown parameter 'missing'"):
+            NodeCatalog(path)
+        os.unlink(path)
+
+    def test_rejects_duplicate_blackboard_metadata_names(self):
+        path = self._write_catalog({
+            "api_version": "manyforge.node_catalog.v0",
+            "catalog_version": "0.1.0",
+            "entries": [
+                {
+                    "id": "bb_dup",
+                    "name": "DuplicateBlackboardNode",
+                    "kind": "leaf",
+                    "children": {"min": 0, "max": 0},
+                    "parameters": [
+                        {"name": "key", "type": "string", "required": True},
+                    ],
+                    "bb_writer_params": ["key", "key"],
+                    "runners": {"py_trees": {"implementation_kind": "plugin"}},
+                },
+            ],
+        })
+        with pytest.raises(CatalogValidationError, match="duplicate parameter names"):
             NodeCatalog(path)
         os.unlink(path)

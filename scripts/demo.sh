@@ -39,18 +39,19 @@ exec docker compose run --rm \
   set -euo pipefail
 
   # Remove stale frontend from Docker image — use volume-mounted dev build
-  rm -rf /opt/manyforge-frontend/dist 2>/dev/null
+  rm -rf /opt/manyforge-frontend/dist 2>/dev/null || true
 
   # Build C++ backends (manyforge_core → manyforge_roboplan_py)
+  # These are best-effort: if roboplan fails, the composer falls back to MockKernelClient
   echo "Building C++ backends..."
-  ./scripts/test-all.sh cpp 2>&1 | tail -3
-  ./scripts/test-all.sh roboplan 2>&1 | tail -3
+  ./scripts/test-all.sh cpp 2>&1 | tail -3 || echo "  (core build had warnings — continuing)"
+  ./scripts/test-all.sh roboplan 2>&1 | tail -3 || echo "  (roboplan build failed — will use MockKernelClient)"
   echo ""
 
   # Ensure roboplan Python paths are available
   export PYTHONPATH="/tmp/manyforge-build/roboplan:/workspace/manyforge_roboplan/python:${PYTHONPATH:-}"
 
-  python -m manyforge_composer --catalog-path "$MANYFORGE_CATALOG_PATH" --port 9000 --hmi-port 8081 &
+  python -m manyforge_composer --catalog-path "$MANYFORGE_CATALOG_PATH" --host 0.0.0.0 --port 9000 --hmi-port 8081 &
   PID=$!
 
   for i in $(seq 1 30); do

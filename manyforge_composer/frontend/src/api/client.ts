@@ -7,6 +7,7 @@ import type {
   ProgramInfo,
   ProgramTree,
   TreeNode,
+  RuntimeOverrideStatus,
   DeploymentInfo,
   FullDeployment,
   ApplySessionResponse,
@@ -49,6 +50,12 @@ export const api = {
     savedTree: () => request<ProgramTree>('GET', '/api/program/saved/tree'),
     updateTree: (tree: TreeNode) =>
       request<unknown>('PUT', '/api/program/tree', { tree }),
+    runtimeOverrides: () =>
+      request<RuntimeOverrideStatus>('GET', '/api/program/runtime-overrides'),
+    activateRuntimeOverrides: () =>
+      request<RuntimeOverrideStatus>('POST', '/api/program/runtime-overrides/activate'),
+    clearRuntimeOverrides: () =>
+      request<RuntimeOverrideStatus>('POST', '/api/program/runtime-overrides/clear'),
     save: (path: string) =>
       request<unknown>('POST', '/api/program/save', { path }),
     saveTree: (path: string, tree: TreeNode) =>

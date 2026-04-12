@@ -1,8 +1,8 @@
 # ManyForge Workspace Guide
 
-## Frozen Conventions (Phase 0.5)
+## C++ Core Conventions
 
-These conventions are frozen for the duration of Phase 1. Do not deviate.
+These conventions apply to all `manyforge_core` and `manyforge_roboplan` code.
 
 ### Namespace
 ```cpp

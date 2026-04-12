@@ -60,13 +60,13 @@ def start_hmi(cycle_manager: CycleManager, runner: OrchestratorRunner):
         from manyforge_hmi import ViserHmiServer
         hmi = ViserHmiServer(
             cycle_manager=cycle_manager,
-            host="0.0.0.0",
+            host="127.0.0.1",
             port=8081,
         )
         if runner.program:
             hmi.load_program(runner.program)
         hmi.start()
-        print("HMI started on http://0.0.0.0:8081")
+        print("HMI started on http://127.0.0.1:8081")
         return hmi
     except ImportError:
         print("WARNING: manyforge_hmi not available, skipping HMI")

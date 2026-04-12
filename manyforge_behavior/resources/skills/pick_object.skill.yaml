@@ -1,0 +1,132 @@
+api_version: manyforge.skill.v0
+skill_id: pick_object
+version: "0.1.0"
+name: Pick Object
+description: >-
+  Pick an object from the scene by approaching from above, closing the gripper,
+  attaching the object to the TCP, retreating upward, and invalidating the
+  trajectory cache after the scene geometry changes.
+compatible_profiles: [v0.0]
+
+requires:
+  - "object must exist in the backend scene"
+  - "robot must be able to reach the approach and grasp poses"
+  - "gripper_closed blackboard key is false or unset"
+
+provides:
+  - "object is attached to the TCP link"
+  - "gripper_closed blackboard key is true"
+  - "robot is at the retreat position above the grasp pose"
+  - "trajectory cache is invalidated"
+
+modifies:
+  - scene_object_attachment
+  - trajectory_cache
+  - blackboard
+
+requires_capabilities:
+  - planning.motion.pose_goal
+  - context.kinematics.fk
+  - scene.edit.add
+  - scene.edit.remove
+  - execution.trajectory.execute
+
+parameters:
+  - name: object_id
+    type: string
+    required: true
+    description: ID of the object to pick.
+  - name: approach_height_m
+    type: float
+    required: false
+    default: 0.05
+    description: Vertical offset above the target object for approach and retreat.
+  - name: grasp_offset_z_m
+    type: float
+    required: false
+    default: 0.0
+    description: Additional Z offset for the grasp pose relative to the object center.
+  - name: tool_orientation_rpy_deg
+    type: float_list
+    required: false
+    default: [180.0, 0.0, -90.0]
+    description: Tool orientation for the approach, grasp, and retreat moves.
+  - name: velocity_scale
+    type: float
+    required: false
+    default: 0.5
+    description: Velocity scale for all moves in this skill.
+  - name: tcp_frame
+    type: string
+    required: false
+    default: tool0
+    description: TCP link frame for attachment.
+
+body:
+  id: sequence
+  name: pick_sequence
+  children:
+    - id: move_manipulator_action
+      name: approach
+      params:
+        move_id: "pick_approach_${param:object_id}"
+        motion_type: relative_move
+        relative_move:
+          target_reference:
+            type: object
+            id: "${param:object_id}"
+          offset:
+            position_m: [0.0, 0.0, "${param:approach_height_m}"]
+            orientation_rpy_deg: "${param:tool_orientation_rpy_deg}"
+        velocity_scale: "${param:velocity_scale}"
+    - id: move_manipulator_action
+      name: descend
+      params:
+        move_id: "pick_descend_${param:object_id}"
+        motion_type: relative_move
+        relative_move:
+          target_reference:
+            type: object
+            id: "${param:object_id}"
+          offset:
+            position_m: [0.0, 0.0, "${param:grasp_offset_z_m}"]
+            orientation_rpy_deg: "${param:tool_orientation_rpy_deg}"
+        velocity_scale: "${param:velocity_scale}"
+    - id: set_key_bool_value
+      name: close_gripper
+      params:
+        key: gripper_closed
+        value: true
+    - id: attach_object_to_link
+      name: attach
+      params:
+        object_id: "${param:object_id}"
+        link_frame: "${param:tcp_frame}"
+    - id: move_manipulator_action
+      name: retreat
+      params:
+        move_id: "pick_retreat_${param:object_id}"
+        motion_type: relative_move
+        relative_move:
+          target_reference:
+            type: robot_link
+            id: "${param:tcp_frame}"
+          offset_reference:
+            type: frame
+            id: base_link
+          offset:
+            position_m: [0.0, 0.0, "${param:approach_height_m}"]
+            orientation_rpy_deg: "${param:tool_orientation_rpy_deg}"
+        velocity_scale: "${param:velocity_scale}"
+    - id: reset_trajectories
+      name: invalidate_after_pick
+
+example:
+  object_id: graspable
+  approach_height_m: 0.05
+  grasp_offset_z_m: 0.0
+  tool_orientation_rpy_deg: [180.0, 0.0, -90.0]
+  velocity_scale: 0.5
+  tcp_frame: tool0
+
+validated_by: tests/fixtures/pick_and_place.program.yaml

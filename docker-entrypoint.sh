@@ -11,6 +11,15 @@ export PYTHONPATH="/workspace/manyforge_behavior:/workspace:${PYTHONPATH:-}"
 # when the same source tree is also built on the host)
 export MANYFORGE_BUILD_DIR="/tmp/manyforge-build"
 
+# Fix ownership if the build-cache volume was created by an older root-based
+# image.  The Dockerfile now runs as uid 1000 (manyforge), but Docker named
+# volumes preserve the ownership from their first creation.
+if [ -d "$MANYFORGE_BUILD_DIR" ] && [ ! -w "$MANYFORGE_BUILD_DIR" ]; then
+    echo "Build cache not writable by $(whoami) — clearing stale root-owned files..."
+    echo "Run:  docker compose down -v  to remove the stale volume, then retry."
+    exit 1
+fi
+
 reset_stale_python_build_dir() {
     local build_dir="$1"
     local cache_file="$build_dir/CMakeCache.txt"

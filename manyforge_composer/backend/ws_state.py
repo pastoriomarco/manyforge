@@ -22,6 +22,8 @@ class StateHub:
         self._running = False
         self._task: asyncio.Task | None = None
         self._state: ComposerState | None = None
+        self._last_broadcast_event_index = 0
+        self._last_kernel_event_index = 0
 
     async def connect(self, ws: WebSocket):
         await ws.accept()
@@ -47,6 +49,8 @@ class StateHub:
         """Start background broadcasting task."""
         self._running = True
         self._state = state
+        self._last_broadcast_event_index = 0
+        self._last_kernel_event_index = 0
     
     def stop(self):
         self._running = False
@@ -57,11 +61,32 @@ class StateHub:
         """Poll state at ~10Hz and broadcast to all connected clients."""
         while self._running:
             has_program = self._state and self._state.program is not None
+            kernel_events = []
+            if self._state is not None and hasattr(self._state, "event_recorder"):
+                self._state.event_recorder.observe(self._state)
+                kernel_events = self._state.event_recorder.get_events_since(
+                    self._last_broadcast_event_index,
+                    include_node_transitions=False,
+                )
+                if kernel_events:
+                    self._last_broadcast_event_index = kernel_events[-1]["event_index"]
+            native_kernel_events = []
+            if self._state and self._state.cycle_manager is not None:
+                native_kernel_events = self._state.cycle_manager.get_kernel_events_since(
+                    self._last_kernel_event_index
+                )
+                if native_kernel_events:
+                    self._last_kernel_event_index = native_kernel_events[-1].get(
+                        "event_index", self._last_kernel_event_index
+                    )
+
             if self._state and self._state.cycle_manager is not None:
                 data = {
                     "state": self._state.cycle_manager.state.value,
                     "velocityScale": self._state.cycle_manager.velocity_scale,
                     "nodeStatuses": self._state.cycle_manager.get_node_statuses(),
+                    "kernelEvents": kernel_events,
+                    "nativeKernelEvents": native_kernel_events,
                     "error": self._state.cycle_manager.error,
                     "programLoaded": bool(has_program),
                     "timestamp": time.time(),
@@ -71,6 +96,8 @@ class StateHub:
                     "state": "idle",
                     "velocityScale": 1.0,
                     "nodeStatuses": {},
+                    "kernelEvents": kernel_events,
+                    "nativeKernelEvents": [],
                     "programLoaded": bool(has_program),
                     "timestamp": time.time(),
                 }

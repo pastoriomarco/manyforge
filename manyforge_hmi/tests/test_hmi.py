@@ -138,13 +138,16 @@ class TestStateBridge:
 
     def test_bridge_exposes_backend_object_queries(self):
         """Object query surface is reachable through the bridge."""
-        self.kernel.scene_edit(SceneEditRequest(
+        result = self.kernel.scene_edit(SceneEditRequest(
             operation="add",
             object_id="box1",
+            shape_type="box",
+            box_dimensions_m=[0.1, 0.1, 0.1],
             pose_position_m=[0.3, 0.0, 0.2],
             pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
             frame_id="universe",
         ))
+        assert result.success is True
         bridge = StateBridge(self.cycle_manager)
         pose = bridge.get_object_pose("box1", "base_link")
         state = bridge.get_object_state("box1")

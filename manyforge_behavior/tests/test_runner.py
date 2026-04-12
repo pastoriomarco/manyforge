@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 import py_trees
+import yaml
 
 from manyforge_behavior.kernel_client import ExecutionState, MockKernelClient
 from manyforge_behavior.runner import OrchestratorRunner
@@ -70,9 +71,8 @@ class TestRunnerExecution:
         runner.apply_scene()
         result = runner.run(max_ticks=100)
         assert result is True
-        # Scene edit from tree (add_table) + scene edit from apply_scene (table)
-        # + remove_table from tree = 3 total scene edits
-        assert len(kernel.scene_edits) >= 2  # at least apply_scene + add_table
+        # apply_scene() adds the static table, and the tree removes it after the move.
+        assert len(kernel.scene_edits) >= 2
         assert kernel.execute_count >= 1  # move_to_pick
 
     def test_run_with_override(self, kernel):
@@ -84,6 +84,7 @@ class TestRunnerExecution:
         )
         runner.load()
         runner.build_tree()
+        runner.apply_scene()
         result = runner.run(max_ticks=100)
         assert result is True
 
@@ -92,14 +93,7 @@ class TestRunnerExecution:
         runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
         runner.load()
         runner.build_tree()
-        # Scene add will succeed, but move will fail (kernel rejects execute)
-        # Actually the add_table scene node calls scene_edit, not execute
-        # The move_to_pick calls execute which will fail
-        # But we need kernel to be in IDLE for the scene edit (add_table), then
-        # fail on the move. MockKernelClient.execute() sets state to FAILED on failure,
-        # so we need reset to get back to IDLE for the move. Actually MockKernelClient
-        # execute fails if not IDLE, and fail_next_execute triggers from IDLE.
-        # The sequence: add_table (scene_edit, succeeds) -> move_to_pick (execute, fails)
+        runner.apply_scene()
         result = runner.run(max_ticks=100)
         assert result is False
 
@@ -122,6 +116,58 @@ class TestRunnerExecution:
         runner.build_tree()
         result = runner.run(max_ticks=0)
         assert result is False
+
+    def test_run_with_skill_authored_program(self, kernel, tmp_path):
+        """Runner expands shipped skills into executable runtime nodes."""
+        program_path = tmp_path / "skill.program.yaml"
+        program_path.write_text(
+            yaml.safe_dump(
+                {
+                    "api_version": "manyforge.program.v0",
+                    "program_profile": "v0.0",
+                    "name": "skill_program",
+                    "description": "skill-authored test program",
+                    "robot": {
+                        "robot_id": "ur5",
+                        "group_id": "arm",
+                        "base_frame": "base_link",
+                        "tcp_frame": "tool0",
+                    },
+                    "scene": [],
+                    "parameters": [],
+                    "tree": {
+                        "id": "move_to_named_config",
+                        "name": "go_home",
+                        "params": {
+                            "config_name": "home",
+                            "joint_names": [
+                                "shoulder_pan_joint",
+                                "shoulder_lift_joint",
+                                "elbow_joint",
+                                "wrist_1_joint",
+                                "wrist_2_joint",
+                                "wrist_3_joint",
+                            ],
+                            "joint_positions_rad": [0.0, -1.0, 1.0, -1.0, -1.0, 0.0],
+                            "velocity_scale": 0.25,
+                        },
+                    },
+                },
+                sort_keys=False,
+            ),
+            encoding="utf-8",
+        )
+
+        runner = OrchestratorRunner(CATALOG_PATH, str(program_path), kernel)
+        runner.load()
+        tree = runner.build_tree()
+
+        assert tree.root.name == "go_home"
+        result = runner.run(max_ticks=10)
+        assert result is True
+        assert kernel.execute_count == 1
+        assert kernel.last_execute_request is not None
+        assert kernel.last_execute_request.move_id == "move_to_home"
 
 
 class TestRunnerDeployment:

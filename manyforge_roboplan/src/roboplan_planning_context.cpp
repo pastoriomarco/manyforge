@@ -282,6 +282,40 @@ core::JointLimitsDTO RoboPlanPlanningContext::get_joint_limits(
   return limits;
 }
 
+std::vector<std::string> RoboPlanPlanningContext::get_scene_object_ids() {
+  std::lock_guard<std::mutex> scene_lock(*scene_mutex_);
+  std::vector<std::string> object_ids;
+  object_ids.reserve(object_states_.size());
+  for (const auto& [object_id, tracked] : object_states_) {
+    static_cast<void>(tracked);
+    object_ids.push_back(object_id);
+  }
+  return object_ids;
+}
+
+std::vector<std::string> RoboPlanPlanningContext::get_joint_names() {
+  std::lock_guard<std::mutex> scene_lock(*scene_mutex_);
+  return scene_->getActuatedJointNames();
+}
+
+std::vector<RoboPlanPlanningContext::SceneObjectSnapshot>
+RoboPlanPlanningContext::get_scene_objects() {
+  std::lock_guard<std::mutex> scene_lock(*scene_mutex_);
+  std::vector<SceneObjectSnapshot> objects;
+  objects.reserve(object_states_.size());
+  for (const auto& [object_id, tracked] : object_states_) {
+    objects.push_back(SceneObjectSnapshot{
+        object_id,
+        tracked.shape,
+        tracked.pose,
+        pose_in_base_from_tracked_locked(tracked, "universe"),
+        tracked.frame_id,
+        tracked.attached,
+    });
+  }
+  return objects;
+}
+
 Eigen::Matrix4d RoboPlanPlanningContext::pose_to_matrix(const core::Pose3DTO& pose) {
   Eigen::Matrix4d tform = Eigen::Matrix4d::Identity();
   tform(0, 3) = pose.position_m.x_m;
@@ -473,7 +507,8 @@ core::SceneEditResultDTO RoboPlanPlanningContext::add_object(
     }
 
     object_states_[request.object_id] = TrackedObjectState{
-        request.pose, request.frame_id, infer_attached_from_frame(request.frame_id)};
+        request.pose, request.shape, request.frame_id,
+        infer_attached_from_frame(request.frame_id)};
     result.success = true;
     const auto& tracked = object_states_.at(request.object_id);
     SceneTraceEvent event;

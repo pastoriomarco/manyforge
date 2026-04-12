@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { api } from '../api/client';
 import { useCycleStore } from '../store/cycleStore';
 import { useComposerStore } from '../store/composerStore';
@@ -40,7 +40,11 @@ export function ControlBar() {
     loadProgram,
     fetchProgramInfo,
     fetchTree,
+    fetchRuntimeOverrideStatus,
     programInfo,
+    runtimeOverrideStatus,
+    activateRuntimeOverrides,
+    clearRuntimeOverrides,
     error: programError,
     loading: programLoading,
   } = useProgramStore();
@@ -75,6 +79,14 @@ export function ControlBar() {
   const savedBadge = hasUnsavedChanges
     ? { label: 'UNSAVED', color: 'bg-amber-700' }
     : { label: 'SAVED', color: 'bg-slate-700' };
+  const runtimeOverrideLocked =
+    state === 'running' ||
+    state === 'direct_control' ||
+    busy ||
+    hasUnappliedChanges ||
+    hasUnsavedChanges;
+  const hasRuntimeOverrides =
+    !!runtimeOverrideStatus && (runtimeOverrideStatus.hasActive || runtimeOverrideStatus.hasStaged);
   const edgeStyleOptions: { value: EdgeStyle; label: string }[] = [
     { value: 'smoothstep', label: 'Orthogonal' },
     { value: 'simplebezier', label: 'Smooth' },
@@ -289,7 +301,44 @@ export function ControlBar() {
     discardDrafts();
   }, [discardDrafts]);
 
-  const editLocked = state === 'running' || busy;
+  const handleActivateOverrides = useCallback(async () => {
+    try {
+      setBusy(true);
+      setActionError(null);
+      await activateRuntimeOverrides();
+    } catch (e) {
+      setActionError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }, [activateRuntimeOverrides]);
+
+  const handleClearOverrides = useCallback(async () => {
+    try {
+      setBusy(true);
+      setActionError(null);
+      await clearRuntimeOverrides();
+    } catch (e) {
+      setActionError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }, [clearRuntimeOverrides]);
+
+  useEffect(() => {
+    if (!programInfo) {
+      return undefined;
+    }
+    void fetchRuntimeOverrideStatus();
+    const handle = window.setInterval(() => {
+      void fetchRuntimeOverrideStatus();
+    }, 2000);
+    return () => {
+      window.clearInterval(handle);
+    };
+  }, [fetchRuntimeOverrideStatus, programInfo?.sourcePath]);
+
+  const editLocked = state === 'running' || state === 'direct_control' || busy;
   const canSaveAs = (!editLocked && !!programInfo) || (!editLocked && !!deployment);
 
   return (
@@ -356,12 +405,56 @@ export function ControlBar() {
         >
           Load
         </button>
+        <button
+          onClick={handleActivateOverrides}
+          disabled={
+            !runtimeOverrideStatus?.hasStaged ||
+            runtimeOverrideLocked ||
+            !runtimeOverrideStatus.canActivateNow
+          }
+          title={
+            runtimeOverrideStatus?.requiresResetToActivate
+              ? 'Reset the cycle in Viser before activating staged runtime overrides.'
+              : 'Bind staged runtime overrides into the effective runtime tree.'
+          }
+          className="px-4 py-1.5 bg-cyan-700 hover:bg-cyan-600 disabled:bg-gray-600 disabled:cursor-not-allowed rounded text-sm font-medium"
+        >
+          Use Staged
+        </button>
+        <button
+          onClick={handleClearOverrides}
+          disabled={!hasRuntimeOverrides || runtimeOverrideLocked}
+          title="Drop all active and staged runtime overrides."
+          className="px-4 py-1.5 bg-rose-800 hover:bg-rose-700 disabled:bg-gray-600 disabled:cursor-not-allowed rounded text-sm font-medium"
+        >
+          Clear Overrides
+        </button>
         <span className={`px-3 py-1 rounded text-xs font-mono ${modifiedBadge.color}`}>
           {modifiedBadge.label}
         </span>
         <span className={`px-3 py-1 rounded text-xs font-mono ${savedBadge.color}`}>
           {savedBadge.label}
         </span>
+        {runtimeOverrideStatus && !runtimeOverrideStatus.hasActive && !runtimeOverrideStatus.hasStaged && (
+          <span className="px-3 py-1 rounded text-xs font-mono bg-slate-700">
+            RUNTIME BASELINE
+          </span>
+        )}
+        {runtimeOverrideStatus?.hasActive && (
+          <span className="px-3 py-1 rounded text-xs font-mono bg-emerald-700">
+            {runtimeOverrideStatus.activeCount} ACTIVE OVERRIDE{runtimeOverrideStatus.activeCount === 1 ? '' : 'S'}
+          </span>
+        )}
+        {runtimeOverrideStatus?.hasStaged && (
+          <span className="px-3 py-1 rounded text-xs font-mono bg-amber-700 text-black">
+            {runtimeOverrideStatus.stagedCount} STAGED OVERRIDE{runtimeOverrideStatus.stagedCount === 1 ? '' : 'S'}
+          </span>
+        )}
+        {runtimeOverrideStatus?.requiresResetToActivate && (
+          <span className="px-3 py-1 rounded text-xs font-mono bg-red-700">
+            RESET TO ACTIVATE
+          </span>
+        )}
 
         {programLoading && (
           <span className="text-gray-400 text-sm ml-auto">Loading program...</span>

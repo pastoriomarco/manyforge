@@ -8,7 +8,12 @@ import pytest
 import yaml
 
 from manyforge_behavior.catalog import NodeCatalog
-from manyforge_behavior.program import Program, ProgramValidationError
+from manyforge_behavior.program import (
+    Program,
+    ProgramValidationError,
+    TreeNode,
+    compute_program_tree_hash,
+)
 
 CATALOG_PATH = Path(__file__).parent.parent / "resources" / "node_catalog.yaml"
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "pick_and_place.program.yaml"
@@ -60,14 +65,13 @@ class TestProgramLoading:
         assert "pick_velocity_scale" in prog.parameters
         assert prog.tree is not None
         assert prog.tree.id == "sequence"
-        assert len(prog.tree.children) == 3
+        assert len(prog.tree.children) == 2
 
     def test_tree_node_names(self, catalog):
         prog = Program(FIXTURE_PATH, catalog)
         names = []
         self._collect_names(prog.tree, names)
         assert "main_sequence" in names
-        assert "add_table" in names
         assert "move_to_pick" in names
         assert "remove_table" in names
 
@@ -196,3 +200,119 @@ class TestProgramValidation:
         with pytest.raises(ProgramValidationError, match="missing required"):
             Program(path, catalog)
         os.unlink(path)
+
+    def test_rejects_invalid_parameter_reference(self, catalog):
+        data = _minimal_program(
+            parameters=[
+                {"name": "pick_velocity_scale", "type": "float", "default": 0.5},
+            ]
+        )
+        data["tree"] = {
+            "id": "sequence",
+            "name": "root",
+            "children": [
+                {
+                    "id": "move_manipulator_action",
+                    "name": "bad_move",
+                    "params": {
+                        "move_id": "pick",
+                        "motion_type": "joint_goal",
+                        "joint_goal_names": ["j1"],
+                        "joint_goal_positions_rad": [0.1],
+                        "velocity_scale": "${param:missing_velocity_scale}",
+                    },
+                },
+            ],
+        }
+        path = _write_program(data)
+        with pytest.raises(ProgramValidationError, match="Unknown parameter reference"):
+            Program(path, catalog)
+        os.unlink(path)
+
+    def test_rejects_out_of_range_parameter_value(self, catalog):
+        data = _minimal_program()
+        data["tree"] = {
+            "id": "sequence",
+            "name": "root",
+            "children": [
+                {
+                    "id": "move_manipulator_action",
+                    "name": "bad_move",
+                    "params": {
+                        "move_id": "pick",
+                        "motion_type": "joint_goal",
+                        "joint_goal_names": ["j1"],
+                        "joint_goal_positions_rad": [0.1],
+                        "velocity_scale": -0.1,
+                    },
+                },
+            ],
+        }
+        path = _write_program(data)
+        with pytest.raises(ProgramValidationError, match="velocity_scale must be > 0.0"):
+            Program(path, catalog)
+        os.unlink(path)
+
+    def test_rejects_joint_goal_without_joint_targets(self, catalog):
+        data = _minimal_program()
+        data["tree"] = {
+            "id": "sequence",
+            "name": "root",
+            "children": [
+                {
+                    "id": "move_manipulator_action",
+                    "name": "bad_move",
+                    "params": {
+                        "move_id": "pick",
+                        "motion_type": "joint_goal",
+                    },
+                },
+            ],
+        }
+        path = _write_program(data)
+        with pytest.raises(ProgramValidationError, match="joint_goal_names is required"):
+            Program(path, catalog)
+        os.unlink(path)
+
+
+# ── compute_program_tree_hash ────────────────────────────────────────────
+
+
+class TestComputeProgramTreeHash:
+    def test_deterministic(self):
+        tree = TreeNode(id="move_to_waypoint", name="move_to_pick", params={"speed": 1.0})
+        assert compute_program_tree_hash(tree) == compute_program_tree_hash(tree)
+
+    def test_different_params_produce_different_hash(self):
+        t1 = TreeNode(id="move_to_waypoint", name="move_to_pick", params={"speed": 1.0})
+        t2 = TreeNode(id="move_to_waypoint", name="move_to_pick", params={"speed": 2.0})
+        assert compute_program_tree_hash(t1) != compute_program_tree_hash(t2)
+
+    def test_different_children_produce_different_hash(self):
+        child_a = TreeNode(id="move_to_waypoint", name="a")
+        child_b = TreeNode(id="move_to_waypoint", name="b")
+        t1 = TreeNode(id="sequence", name="root", children=[child_a])
+        t2 = TreeNode(id="sequence", name="root", children=[child_b])
+        assert compute_program_tree_hash(t1) != compute_program_tree_hash(t2)
+
+    def test_same_structure_same_hash(self):
+        t1 = TreeNode(
+            id="sequence", name="root",
+            children=[TreeNode(id="move_to_waypoint", name="m", params={"x": 1})],
+        )
+        t2 = TreeNode(
+            id="sequence", name="root",
+            children=[TreeNode(id="move_to_waypoint", name="m", params={"x": 1})],
+        )
+        assert compute_program_tree_hash(t1) == compute_program_tree_hash(t2)
+
+    def test_modification_policy_affects_hash(self):
+        t1 = TreeNode(id="move_to_waypoint", name="m")
+        t2 = TreeNode(id="move_to_waypoint", name="m", modification_policy={"runtime_override": "llm_allowed"})
+        assert compute_program_tree_hash(t1) != compute_program_tree_hash(t2)
+
+    def test_hash_is_hex_sha256(self):
+        tree = TreeNode(id="move_to_waypoint", name="m")
+        h = compute_program_tree_hash(tree)
+        assert len(h) == 64
+        assert all(c in "0123456789abcdef" for c in h)

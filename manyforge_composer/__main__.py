@@ -13,6 +13,7 @@ from manyforge_behavior.kernel_client import MockKernelClient
 from manyforge_composer.backend.logging_config import setup_logging
 from manyforge_composer.backend.state import ComposerState
 from manyforge_composer.backend.app import create_app
+from manyforge_composer.backend.security import SecurityConfig
 
 logger = logging.getLogger(__name__)
 
@@ -77,7 +78,7 @@ def build_program_loaded_callback(
             package_dirs=package_dirs or None,
         )
         st.hmi_server = _hmi_server
-        _hmi_server.load_program(st.program)
+        _hmi_server.load_program(st.effective_program or st.program)
 
         def on_scene_edit(operation: str, request):
             _hmi_server.request_scene_sync(
@@ -198,10 +199,33 @@ def _resolve_roboplan_paths():
         return None, None
 
 
+def _run_mcp(args):
+    """Run ManyForge as an MCP server over stdio."""
+    from manyforge_composer.backend.mcp_server import create_mcp_server
+
+    security = SecurityConfig.from_env()
+    kernel, bundle = _make_kernel()
+    state = ComposerState(
+        catalog_path=args.catalog_path,
+        kernel=kernel,
+        kernel_factory=_make_kernel,
+        kernel_bundle=bundle,
+        trace_dir="/tmp/manyforge-traces",
+        allowed_fs_roots=security.allowed_fs_roots,
+    )
+    try:
+        mcp_server = create_mcp_server(state)
+    except RuntimeError as exc:
+        logger.error("%s", exc)
+        raise SystemExit(2) from exc
+    logger.info("Starting ManyForge MCP server (stdio transport)")
+    mcp_server.run(transport="stdio")
+
+
 def main():
     parser = argparse.ArgumentParser(description="ManyForge Composer Backend")
     parser.add_argument("--catalog-path", required=True, help="Path to node_catalog.yaml")
-    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=9000)
     parser.add_argument("--hmi-port", type=int, default=None,
                         help="Enable Viser 3D HMI on this port (e.g. 8081)")
@@ -210,10 +234,23 @@ def main():
     parser.add_argument("--package-dir", action="append", default=[],
                         help="Directory for package:// URI resolution (repeatable)")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    parser.add_argument("--mcp", action="store_true",
+                        help="Run as MCP server over stdio (no HTTP)")
+    parser.add_argument("--mcp-http", action="store_true",
+                        help="Enable HTTP/SSE MCP transport on /api/mcp (alongside REST)")
     args = parser.parse_args()
 
     setup_logging(args.log_level)
 
+    if args.mcp and args.mcp_http:
+        logger.error("--mcp (stdio) and --mcp-http cannot be used together")
+        raise SystemExit(2)
+
+    if args.mcp:
+        _run_mcp(args)
+        return
+
+    security = SecurityConfig.from_env()
     kernel, bundle = _make_kernel()
 
     # Auto-resolve URDF and package dirs from roboplan if not specified via CLI
@@ -233,6 +270,8 @@ def main():
         kernel=kernel,
         kernel_factory=_make_kernel,
         kernel_bundle=bundle,
+        trace_dir="/tmp/manyforge-traces",
+        allowed_fs_roots=security.allowed_fs_roots,
     )
 
     # Wire up Viser HMI if --hmi-port is set
@@ -245,7 +284,12 @@ def main():
             bundle=bundle,
         )
 
-    app = create_app(state)
+    if not security.api_token and args.host != "127.0.0.1":
+        logger.warning(
+            "No MANYFORGE_API_TOKEN set — API is unauthenticated on %s:%d",
+            args.host, args.port,
+        )
+    app = create_app(state, security=security, enable_mcp_http=args.mcp_http)
     uvicorn.run(app, host=args.host, port=args.port)
 
 

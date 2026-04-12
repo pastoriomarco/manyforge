@@ -36,6 +36,8 @@ class CatalogEntry:
     children_min: int
     children_max: int  # -1 means unbounded
     parameters: list[CatalogParameter] = field(default_factory=list)
+    bb_reader_params: list[str] = field(default_factory=list)
+    bb_writer_params: list[str] = field(default_factory=list)
     required_capabilities: list[str] = field(default_factory=list)
     profiles_min: str = "v0.0"
     runners: dict[str, Any] = field(default_factory=dict)
@@ -111,19 +113,50 @@ class NodeCatalog:
                 )
             )
 
+        entry_id = raw["id"]
+        bb_reader_params = self._parse_blackboard_param_names(
+            raw.get("bb_reader_params", []),
+            field_name="bb_reader_params",
+            entry_id=entry_id,
+        )
+        bb_writer_params = self._parse_blackboard_param_names(
+            raw.get("bb_writer_params", []),
+            field_name="bb_writer_params",
+            entry_id=entry_id,
+        )
+
         return CatalogEntry(
-            id=raw["id"],
-            name=raw.get("name", raw["id"]),
+            id=entry_id,
+            name=raw.get("name", entry_id),
             category=raw.get("category", ""),
             description=raw.get("description", ""),
             kind=raw.get("kind", "leaf"),
             children_min=children.get("min", 0),
             children_max=max_children,
             parameters=params,
+            bb_reader_params=bb_reader_params,
+            bb_writer_params=bb_writer_params,
             required_capabilities=raw.get("required_capabilities", []),
             profiles_min=raw.get("profiles", {}).get("min_profile", "v0.0"),
             runners=raw.get("runners", {}),
         )
+
+    @staticmethod
+    def _parse_blackboard_param_names(
+        raw_value: Any,
+        *,
+        field_name: str,
+        entry_id: str,
+    ) -> list[str]:
+        if raw_value in (None, []):
+            return []
+        if not isinstance(raw_value, list) or not all(
+            isinstance(item, str) and item.strip() for item in raw_value
+        ):
+            raise CatalogValidationError(
+                f"Entry '{entry_id}': {field_name} must be a list of non-empty strings"
+            )
+        return list(raw_value)
 
     def _validate_entry(self, entry: CatalogEntry) -> None:
         # Kind/children consistency
@@ -144,6 +177,21 @@ class NodeCatalog:
                     f"Entry '{entry.id}', param '{p.name}': "
                     "enum type requires non-empty enum_values"
                 )
+
+        declared_params = {p.name for p in entry.parameters}
+        for field_name, param_names in (
+            ("bb_reader_params", entry.bb_reader_params),
+            ("bb_writer_params", entry.bb_writer_params),
+        ):
+            if len(param_names) != len(set(param_names)):
+                raise CatalogValidationError(
+                    f"Entry '{entry.id}': {field_name} contains duplicate parameter names"
+                )
+            for param_name in param_names:
+                if param_name not in declared_params:
+                    raise CatalogValidationError(
+                        f"Entry '{entry.id}': {field_name} references unknown parameter '{param_name}'"
+                    )
 
         # Must have py_trees runner
         if "py_trees" not in entry.runners:

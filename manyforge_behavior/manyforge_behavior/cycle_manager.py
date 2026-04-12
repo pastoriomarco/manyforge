@@ -3,19 +3,26 @@
 from __future__ import annotations
 
 import logging
+import json
 import threading
 import time
 import traceback
+import uuid
+from copy import deepcopy
+from dataclasses import dataclass, field
 from enum import Enum
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 import py_trees
 
 logger = logging.getLogger(__name__)
 
+from collections import deque
+
 from manyforge_behavior.kernel_client import (
     ExecutionSnapshot,
     ExecutionState,
+    ExecutionStatus,
     KernelClient,
     ObjectState,
     SceneEditRequest,
@@ -28,6 +35,116 @@ class CycleState(Enum):
     IDLE = "idle"
     RUNNING = "running"
     STOPPED = "stopped"
+    DIRECT_CONTROL = "direct_control"
+
+
+class GrantType:
+    """Authority grant types for intervention sessions.
+
+    These are checked grants, not advisory labels.  The CycleManager enforces
+    the rules described in OP-4.
+    """
+    HUMAN_APPROVED = "human_approved"
+    POLICY_GRANTED = "policy_granted"
+    # Reserved — does NOT authorise IDLE -> DIRECT_CONTROL in the baseline
+    # industrial product.  Only usable for STOPPED -> DIRECT_CONTROL when a
+    # deployment-level policy explicitly allows it.
+    DEPLOYMENT_GRANTED = "deployment_granted"
+
+    ALL = {HUMAN_APPROVED, POLICY_GRANTED, DEPLOYMENT_GRANTED}
+    ACTIVE = {HUMAN_APPROVED, POLICY_GRANTED}  # baseline product
+
+
+class RecoveryTrigger(Enum):
+    """Closed enum of recovery trigger reasons (OP-6).
+
+    Replaces ad-hoc string trigger reasons with a typed, bounded taxonomy.
+    """
+    PLANNING_FAILED = "planning_failed"
+    VALIDATION_FAILED = "validation_failed"
+    EXECUTE_FAILED = "execute_failed"
+    TIMEOUT = "timeout"
+    SCENE_MISMATCH = "scene_mismatch"
+    NODE_FAILURE = "node_failure"
+    PRECONDITION_FAILED = "precondition_failed"
+
+
+@dataclass
+class InterventionSession:
+    """Tracks a direct-control intervention session."""
+    session_id: str
+    parent_run_id: Optional[str]
+    entry_state: str
+    lease_timeout_ms: int
+    lease_expires_at_ns: int
+    resume_target: str
+    session_kind: str = "manual_intervention"
+    authority_source: str = "human"
+    principal_id: str = ""
+    grant_type: str = "human_approved"
+    trigger_reason: str = "manual_request"
+    trigger_node_instance: Optional[str] = None
+    approval_mode: str = "human_approved"
+    artifact_origin: str = "saved_program"
+    status: str = "running"  # running, completed, failed, aborted, expired
+    actual_outcome: Optional[str] = None
+    error: Optional[str] = None
+    started_at_ns: int = field(default_factory=time.monotonic_ns)
+    finished_at_ns: Optional[int] = None
+    events: list[dict[str, Any]] = field(default_factory=list)
+    promotions: list[dict[str, Any]] = field(default_factory=list)
+    _event_index: int = field(default=0, init=False, repr=False)
+
+    def record_event(self, event_type: str, **details: Any) -> None:
+        self._event_index += 1
+        self.events.append(
+            {
+                "event_index": self._event_index,
+                "timestamp_ns": time.monotonic_ns(),
+                "type": event_type,
+                "details": details,
+            }
+        )
+
+    def renew_lease(self, lease_timeout_ms: Optional[int] = None) -> None:
+        if lease_timeout_ms is not None:
+            self.lease_timeout_ms = lease_timeout_ms
+        self.lease_expires_at_ns = time.monotonic_ns() + (
+            self.lease_timeout_ms * 1_000_000
+        )
+        self.record_event(
+            "lease_renewed",
+            lease_timeout_ms=self.lease_timeout_ms,
+            lease_expires_at_ns=self.lease_expires_at_ns,
+        )
+
+
+@dataclass
+class DelegatedRecoveryRequest:
+    """Structured request created when a node policy delegates recovery authority."""
+
+    request_id: str
+    parent_run_id: Optional[str]
+    requested_from_state: str
+    trigger_node_instance: str
+    trigger_node_id: str
+    trigger_reason: RecoveryTrigger
+    delegate_policy: str
+    allowed_authority_sources: tuple[str, ...]
+    allowed_actions: tuple[str, ...]
+    allowed_resume_targets: tuple[str, ...] = ("resume", "stop", "reset")
+    default_resume_target: str = "resume"
+    runtime_override_policy: str = "forbidden"
+    persistent_edit_policy: str = "forbidden"
+    requested_at_ns: int = field(default_factory=time.monotonic_ns)
+
+
+@dataclass
+class _InterventionContext:
+    tree: Any
+    node_statuses: dict[str, str]
+    stop_requested: bool
+    velocity_scale: float
 
 
 def _collect_statuses(node, result):
@@ -65,6 +182,18 @@ class CycleManager:
         self._on_run_from_idle: Optional[Callable[[], None]] = None
         self._error: Optional[str] = None
         self._node_statuses: dict[str, str] = {}
+        self._intervention: Optional[InterventionSession] = None
+        self._intervention_context: Optional[_InterventionContext] = None
+        self._pending_delegated_recovery: Optional[DelegatedRecoveryRequest] = None
+        self._on_delegated_recovery_requested: Optional[
+            Callable[[DelegatedRecoveryRequest], None]
+        ] = None
+        self._on_recovery_exhausted: Optional[
+            Callable[[str, str, str], None]
+        ] = None
+        self._parent_run_id_provider: Optional[Callable[[], Optional[str]]] = None
+        self._kernel_events: deque[dict[str, Any]] = deque(maxlen=4096)
+        self._kernel_event_index: int = 0
 
         # Set initial pause event to set (not paused)
         self._tick_pause_event.set()
@@ -99,6 +228,7 @@ class CycleManager:
         self._write_bb_keys()
         with self._lock:
             self._node_statuses = {}
+            self._pending_delegated_recovery = None
     
     @property
     def state(self) -> CycleState:
@@ -118,6 +248,10 @@ class CycleManager:
     def get_execution_snapshot(self) -> ExecutionSnapshot:
         """Get the latest observer-safe execution snapshot from the kernel."""
         return self._kernel.get_execution_snapshot()
+
+    def get_status(self) -> ExecutionStatus:
+        """Get the current kernel execution status."""
+        return self._kernel.get_status()
 
     def get_object_pose(self, object_id: str, base_frame: str) -> Optional[dict]:
         """Get the current backend-authoritative object pose."""
@@ -144,7 +278,140 @@ class CycleManager:
         """
         with self._lock:
             return dict(self._node_statuses)
-    
+
+    def _drain_kernel_events(self) -> None:
+        """Pull native kernel events from the kernel and buffer them."""
+        events = self._kernel.drain_kernel_events()
+        if not events:
+            return
+        with self._lock:
+            for event in events:
+                self._kernel_event_index += 1
+                event["event_index"] = self._kernel_event_index
+                self._kernel_events.append(event)
+
+    def get_kernel_events_since(self, event_index: int) -> list[dict[str, Any]]:
+        """Return kernel events with event_index greater than the given value."""
+        with self._lock:
+            return [
+                dict(event)
+                for event in self._kernel_events
+                if event.get("event_index", 0) > event_index
+            ]
+
+    @staticmethod
+    def _blackboard_value_to_json_safe(value):
+        """Best-effort JSON-safe conversion for blackboard values."""
+        try:
+            json.dumps(value)
+            return value
+        except TypeError:
+            pass
+
+        if hasattr(value, "model_dump"):
+            try:
+                dumped = value.model_dump()
+                json.dumps(dumped)
+                return dumped
+            except Exception:
+                return None
+
+        if isinstance(value, dict):
+            converted = {}
+            for key, item in value.items():
+                if not isinstance(key, str):
+                    return None
+                converted_item = CycleManager._blackboard_value_to_json_safe(item)
+                if converted_item is None and item is not None:
+                    return None
+                converted[key] = converted_item
+            return converted
+
+        if isinstance(value, (list, tuple)):
+            converted = []
+            for item in value:
+                converted_item = CycleManager._blackboard_value_to_json_safe(item)
+                if converted_item is None and item is not None:
+                    return None
+                converted.append(converted_item)
+            return converted
+
+        return None
+
+    def get_blackboard_snapshot(self) -> dict[str, dict]:
+        """Return a JSON-safe snapshot of the shared py_trees blackboard."""
+        snapshot: dict[str, dict] = {}
+        for key in sorted(py_trees.blackboard.Blackboard.keys()):
+            try:
+                value = py_trees.blackboard.Blackboard.get(key)
+            except KeyError:
+                continue
+            value_json = self._blackboard_value_to_json_safe(value)
+            entry = {
+                "value_json": value_json,
+                "type": type(value).__name__,
+            }
+            if value_json is None:
+                value_repr = repr(value)
+                truncated = len(value_repr) > 256
+                if truncated:
+                    value_repr = value_repr[:253] + "..."
+                entry["value_repr"] = value_repr
+                if truncated:
+                    entry["truncated"] = True
+            snapshot[key.lstrip("/")] = entry
+        return snapshot
+
+    def _current_stop_requested(self) -> bool:
+        try:
+            bb = py_trees.blackboard.Client(name="cycle_manager_stop_read")
+            bb.register_key(key="stop_requested", access=py_trees.common.Access.READ)
+            return bool(bb.stop_requested)
+        except (KeyError, AttributeError):
+            return False
+
+    def _restore_blackboard_runtime_state(
+        self,
+        *,
+        stop_requested: bool,
+        velocity_scale: float,
+    ) -> None:
+        bb = py_trees.blackboard.Client(name="cycle_manager_restore")
+        bb.register_key(key="stop_requested", access=py_trees.common.Access.WRITE)
+        bb.register_key(key="velocity_scale", access=py_trees.common.Access.WRITE)
+        bb.stop_requested = stop_requested
+        bb.velocity_scale = velocity_scale
+
+    def _start_tick_thread(self, target) -> None:
+        self._tick_stop_event.clear()
+        self._tick_pause_event.set()
+        self._tick_thread = threading.Thread(target=target, daemon=True)
+        self._tick_thread.start()
+
+    def set_parent_run_id_provider(
+        self,
+        provider: Optional[Callable[[], Optional[str]]],
+    ) -> None:
+        """Install a callback used to correlate delegated recovery requests to runs."""
+        self._parent_run_id_provider = provider
+
+    def set_on_delegated_recovery_requested(
+        self,
+        callback: Optional[Callable[[DelegatedRecoveryRequest], None]],
+    ) -> None:
+        """Install a callback invoked when a delegated recovery request is raised."""
+        self._on_delegated_recovery_requested = callback
+
+    def set_on_recovery_exhausted(
+        self,
+        callback: Optional[Callable[[str, str, str], None]],
+    ) -> None:
+        """Install a callback invoked when program_only recovery is exhausted.
+
+        Callback receives (node_instance, node_id, trigger_reason_value).
+        """
+        self._on_recovery_exhausted = callback
+
     def run(self) -> None:
         """
         Start or resume program execution.
@@ -177,6 +444,7 @@ class CycleManager:
 
             elif self._state == CycleState.STOPPED:
                 # Resuming from stopped state
+                self._pending_delegated_recovery = None
                 bb = py_trees.blackboard.Client(name="cycle_manager_resume")
                 bb.register_key(key="stop_requested", access=py_trees.common.Access.WRITE)
                 bb.stop_requested = False
@@ -186,6 +454,10 @@ class CycleManager:
                     self._kernel.resume()
 
                 self._tick_pause_event.set()
+                if self._tick_thread is None or not self._tick_thread.is_alive():
+                    if self._tree is None:
+                        raise RuntimeError("Cannot resume stopped cycle without a tree")
+                    self._start_tick_thread(self._tick_loop)
                 self._state = CycleState.RUNNING
                 return
 
@@ -199,10 +471,7 @@ class CycleManager:
                 on_run_from_idle()
 
             with self._lock:
-                self._tick_stop_event.clear()
-                self._tick_pause_event.set()
-                self._tick_thread = threading.Thread(target=self._tick_loop, daemon=True)
-                self._tick_thread.start()
+                self._start_tick_thread(self._tick_loop)
                 self._state = CycleState.RUNNING
     
     def stop(self) -> None:
@@ -263,6 +532,7 @@ class CycleManager:
                     logger.error("Tick thread did not terminate within timeout — zombie thread detected")
                     self._error = "tick thread did not terminate"
                     self._state = CycleState.IDLE
+                    self._pending_delegated_recovery = None
                     return
                 if self._tick_thread is thread_to_join:
                     self._tick_thread = None
@@ -278,10 +548,17 @@ class CycleManager:
             self._tick_pause_event.set()
             self._error = None
             self._state = CycleState.IDLE
+            self._pending_delegated_recovery = None
     
     def set_velocity_scale(self, scale: float) -> None:
-        """Set velocity_scale on blackboard. Clamped to [0.0, 1.0]."""
-        scale = max(0.0, min(1.0, scale))
+        """Set velocity_scale on blackboard. Clamped to [0.0, 1.0].
+
+        Rejects NaN and infinity — these would propagate to the robot.
+        """
+        import math
+        if not isinstance(scale, (int, float)) or math.isnan(scale) or math.isinf(scale):
+            raise ValueError(f"velocity_scale must be a finite number, got {scale!r}")
+        scale = max(0.0, min(1.0, float(scale)))
         self._velocity_scale = scale
         
         bb = py_trees.blackboard.Client(name="cycle_manager_vs")
@@ -319,6 +596,9 @@ class CycleManager:
                     self._tick_thread = None
                 break
             
+            # Drain native kernel events
+            self._drain_kernel_events()
+
             # Collect node statuses atomically (F-6: thread-safe observer snapshot)
             statuses: dict[str, str] = {}
             _collect_statuses(self._tree.root, statuses)
@@ -328,8 +608,53 @@ class CycleManager:
             # Check if tree completed
             status = self._tree.root.status
             if status in (py_trees.common.Status.SUCCESS, py_trees.common.Status.FAILURE):
-                # Program completed — stop
                 self._tick_stop_event.set()
+                if status == py_trees.common.Status.FAILURE:
+                    delegated_candidate = self._find_delegated_recovery_candidate(statuses)
+                    if delegated_candidate is not None:
+                        delegate_policy = delegated_candidate.modification_policy.get(
+                            "intervention_delegate", "forbidden"
+                        )
+                        trigger = self._derive_delegated_trigger_reason()
+                        if delegate_policy == "program_only":
+                            # program_only recovery is handled by in-tree recovery
+                            # decorators. If the tree still failed, recovery is
+                            # exhausted — stop without external delegation request.
+                            logger.warning(
+                                "program_only recovery exhausted for node '%s' "
+                                "(trigger=%s) — stopping",
+                                delegated_candidate.name,
+                                trigger.value,
+                            )
+                            bb = py_trees.blackboard.Client(name="cycle_manager_recovery_exhausted")
+                            bb.register_key(
+                                key="stop_requested",
+                                access=py_trees.common.Access.WRITE,
+                            )
+                            bb.stop_requested = True
+                            with self._lock:
+                                self._state = CycleState.STOPPED
+                                self._tick_thread = None
+                            self._notify_recovery_exhausted(
+                                delegated_candidate, trigger
+                            )
+                            break
+                        request = self._build_delegated_recovery_request(
+                            delegated_candidate,
+                            trigger_reason=trigger,
+                        )
+                        bb = py_trees.blackboard.Client(name="cycle_manager_delegate_stop")
+                        bb.register_key(
+                            key="stop_requested",
+                            access=py_trees.common.Access.WRITE,
+                        )
+                        bb.stop_requested = True
+                        with self._lock:
+                            self._pending_delegated_recovery = request
+                            self._state = CycleState.STOPPED
+                            self._tick_thread = None
+                        self._notify_delegated_recovery_requested(request)
+                        break
                 with self._lock:
                     self._state = CycleState.IDLE
                     self._tick_thread = None
@@ -345,6 +670,720 @@ class CycleManager:
             if self._tick_thread is threading.current_thread():
                 self._tick_thread = None
     
+    @property
+    def intervention(self) -> Optional[InterventionSession]:
+        """Current or most recent intervention session, or None."""
+        return self._intervention
+
+    @property
+    def pending_delegated_recovery(self) -> Optional[DelegatedRecoveryRequest]:
+        """Current delegated recovery request waiting to be serviced, if any."""
+        return self._pending_delegated_recovery
+
+    @staticmethod
+    def _normalize_blackboard_key(key: str) -> str:
+        return key.lstrip("/").replace(".", "/")
+
+    @classmethod
+    def _scoped_intervention_key(cls, session_id: str, key: str) -> str:
+        normalized = cls._normalize_blackboard_key(key)
+        if normalized.startswith("_intervention/"):
+            return normalized
+        return f"_intervention/{session_id}/{normalized}"
+
+    def _rewrite_intervention_tree(
+        self,
+        tree_dict: dict[str, Any],
+        session_id: str,
+    ) -> dict[str, Any]:
+        catalog = self._runner.catalog
+        if catalog is None:
+            raise RuntimeError("Runner catalog must be loaded before intervention rewriting")
+
+        local_keys: set[str] = set()
+
+        def blackboard_param_names(node_id: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
+            try:
+                entry = catalog.get(node_id)
+            except KeyError:
+                return (), ()
+            return tuple(entry.bb_writer_params), tuple(entry.bb_reader_params)
+
+        def collect_keys(node: dict[str, Any]) -> None:
+            params = node.get("params", {})
+            writer_params, _ = blackboard_param_names(node.get("id", ""))
+            for param_name in writer_params:
+                value = params.get(param_name)
+                if isinstance(value, str):
+                    local_keys.add(self._normalize_blackboard_key(value))
+            for child in node.get("children", []) or []:
+                collect_keys(child)
+
+        def rewrite(node: dict[str, Any]) -> dict[str, Any]:
+            rewritten = deepcopy(node)
+            params = dict(rewritten.get("params", {}))
+            node_id = rewritten.get("id", "")
+            writer_params, reader_params = blackboard_param_names(node_id)
+            for param_name in writer_params:
+                value = params.get(param_name)
+                if isinstance(value, str):
+                    params[param_name] = self._scoped_intervention_key(session_id, value)
+            for param_name in reader_params:
+                value = params.get(param_name)
+                if isinstance(value, str) and self._normalize_blackboard_key(value) in local_keys:
+                    params[param_name] = self._scoped_intervention_key(session_id, value)
+            rewritten["params"] = params
+            rewritten["children"] = [rewrite(child) for child in rewritten.get("children", []) or []]
+            return rewritten
+
+        collect_keys(tree_dict)
+        return rewrite(tree_dict)
+
+    def renew_intervention_lease(
+        self,
+        lease_timeout_ms: Optional[int] = None,
+    ) -> InterventionSession:
+        with self._lock:
+            if self._intervention is None or self._intervention.status != "running":
+                raise RuntimeError("No running intervention session")
+            self._intervention.renew_lease(lease_timeout_ms=lease_timeout_ms)
+            return self._intervention
+
+    def promote_intervention_values(
+        self,
+        promote_keys: dict[str, str],
+        *,
+        session_id: Optional[str] = None,
+    ) -> InterventionSession:
+        """Promote scoped intervention blackboard values back to parent keys."""
+        if not isinstance(promote_keys, dict) or not promote_keys:
+            raise RuntimeError("promote_keys must be a non-empty mapping")
+
+        with self._lock:
+            session = self._intervention
+
+        if session is None:
+            raise RuntimeError("No intervention session")
+        if session_id is not None and session.session_id != session_id:
+            raise RuntimeError("session_id does not match the current or most recent intervention")
+
+        resolved_values: list[tuple[str, str, Any]] = []
+        missing_sources: list[str] = []
+        for source_key, target_key in promote_keys.items():
+            if not isinstance(source_key, str) or not source_key.strip():
+                raise RuntimeError("promote_keys source keys must be non-empty strings")
+            if not isinstance(target_key, str) or not target_key.strip():
+                raise RuntimeError("promote_keys target values must be non-empty strings")
+            scoped_source = self._scoped_intervention_key(session.session_id, source_key)
+            try:
+                value = py_trees.blackboard.Blackboard.get(scoped_source)
+            except KeyError:
+                missing_sources.append(source_key)
+                continue
+            resolved_values.append(
+                (
+                    source_key,
+                    self._normalize_blackboard_key(target_key),
+                    deepcopy(value),
+                )
+            )
+
+        if missing_sources:
+            raise RuntimeError(
+                "Cannot promote missing intervention blackboard keys: "
+                + ", ".join(sorted(missing_sources))
+            )
+
+        timestamp_ns = time.monotonic_ns()
+        promoted_entries: list[dict[str, Any]] = []
+        for source_key, target_key, value in resolved_values:
+            py_trees.blackboard.Blackboard.set(target_key, value)
+            promoted_entries.append(
+                {
+                    "source_key": self._scoped_intervention_key(session.session_id, source_key),
+                    "target_key": target_key,
+                    "timestamp_ns": timestamp_ns,
+                }
+            )
+
+        session.promotions.extend(promoted_entries)
+        session.record_event(
+            "blackboard_promoted",
+            promoted=[
+                {
+                    "source_key": entry["source_key"],
+                    "target_key": entry["target_key"],
+                }
+                for entry in promoted_entries
+            ],
+        )
+        return session
+
+    def _current_parent_run_id(self) -> Optional[str]:
+        if self._parent_run_id_provider is None:
+            return None
+        try:
+            return self._parent_run_id_provider()
+        except Exception:
+            logger.exception("parent_run_id provider failed")
+            return None
+
+    def _notify_delegated_recovery_requested(
+        self,
+        request: DelegatedRecoveryRequest,
+    ) -> None:
+        if self._on_delegated_recovery_requested is None:
+            return
+        try:
+            self._on_delegated_recovery_requested(request)
+        except Exception:
+            logger.exception("delegated recovery callback failed")
+
+    def _notify_recovery_exhausted(
+        self,
+        node,
+        trigger: RecoveryTrigger,
+    ) -> None:
+        """Notify that program_only recovery was exhausted for a node."""
+        if self._on_recovery_exhausted is None:
+            return
+        try:
+            self._on_recovery_exhausted(node.name, node.id, trigger.value)
+        except Exception:
+            logger.exception("recovery exhausted callback failed")
+
+    def _find_delegated_recovery_candidate(
+        self,
+        statuses: dict[str, str],
+    ):
+        program = self._runner.program
+        if program is None or program.tree is None:
+            return None
+
+        def visit(node):
+            for child in node.children:
+                candidate = visit(child)
+                if candidate is not None:
+                    return candidate
+            if statuses.get(node.name) != py_trees.common.Status.FAILURE.value:
+                return None
+            if node.modification_policy.get("intervention_delegate", "forbidden") == "forbidden":
+                return None
+            return node
+
+        return visit(program.tree)
+
+    def _derive_delegated_trigger_reason(self) -> RecoveryTrigger:
+        _EVENT_TO_TRIGGER = {
+            "planning_failed": RecoveryTrigger.PLANNING_FAILED,
+            "validation_failed": RecoveryTrigger.VALIDATION_FAILED,
+            "execute_failed": RecoveryTrigger.EXECUTE_FAILED,
+            "timeout": RecoveryTrigger.TIMEOUT,
+            "scene_mismatch": RecoveryTrigger.SCENE_MISMATCH,
+        }
+        with self._lock:
+            for event in reversed(self._kernel_events):
+                event_type = event.get("type")
+                trigger = _EVENT_TO_TRIGGER.get(event_type)
+                if trigger is not None:
+                    return trigger
+                if event_type == "error_raised":
+                    return RecoveryTrigger.EXECUTE_FAILED
+                if (
+                    event_type == "state_transition"
+                    and event.get("to_state") == "failed"
+                ):
+                    return RecoveryTrigger.EXECUTE_FAILED
+        return RecoveryTrigger.NODE_FAILURE
+
+    def _build_delegated_recovery_request(
+        self,
+        node,
+        *,
+        trigger_reason: RecoveryTrigger,
+    ) -> DelegatedRecoveryRequest:
+        delegate_policy = node.modification_policy.get("intervention_delegate", "forbidden")
+        authority_map = {
+            "human_only": ("human",),
+            "llm_allowed": ("human", "llm"),
+            "program_only": ("program_node",),
+        }
+        allowed_actions = ["intervention"]
+        runtime_override_policy = node.modification_policy.get("runtime_override", "forbidden")
+        persistent_edit_policy = node.modification_policy.get("persistent_edit", "forbidden")
+        if runtime_override_policy != "forbidden":
+            allowed_actions.append("runtime_override")
+        if persistent_edit_policy != "forbidden":
+            allowed_actions.append("draft_patch")
+        return DelegatedRecoveryRequest(
+            request_id=uuid.uuid4().hex[:12],
+            parent_run_id=self._current_parent_run_id(),
+            requested_from_state=CycleState.RUNNING.value,
+            trigger_node_instance=node.name,
+            trigger_node_id=node.id,
+            trigger_reason=trigger_reason,
+            delegate_policy=delegate_policy,
+            allowed_authority_sources=authority_map.get(delegate_policy, tuple()),
+            allowed_actions=tuple(allowed_actions),
+            runtime_override_policy=runtime_override_policy,
+            persistent_edit_policy=persistent_edit_policy,
+        )
+
+    def _finish_intervention(
+        self,
+        session: InterventionSession,
+        *,
+        status: str,
+        actual_outcome: Optional[str] = None,
+        error: Optional[str] = None,
+    ) -> None:
+        session.status = status
+        session.error = error
+        session.finished_at_ns = time.monotonic_ns()
+        session.actual_outcome = actual_outcome
+        session.record_event(
+            "session_finished",
+            status=status,
+            actual_outcome=actual_outcome,
+            error=error,
+        )
+
+    def _restore_after_intervention(
+        self,
+        session: InterventionSession,
+        *,
+        requested_outcome: Optional[str] = None,
+        forced_state: Optional[CycleState] = None,
+    ) -> None:
+        context = self._intervention_context
+        base_state = (
+            forced_state
+            if forced_state is not None
+            else (
+                CycleState.IDLE
+                if session.entry_state == CycleState.IDLE.value
+                else CycleState.STOPPED
+            )
+        )
+        with self._lock:
+            if context is not None:
+                self._tree = context.tree
+                self._node_statuses = dict(context.node_statuses)
+                self._restore_blackboard_runtime_state(
+                    stop_requested=context.stop_requested,
+                    velocity_scale=context.velocity_scale,
+                )
+            self._state = base_state
+            self._tick_thread = None
+            self._tick_stop_event.clear()
+            self._tick_pause_event.set()
+            self._intervention_context = None
+
+        if forced_state is not None:
+            if session.actual_outcome is None:
+                session.actual_outcome = forced_state.value
+            return
+
+        if requested_outcome == "resume" and session.entry_state == CycleState.STOPPED.value:
+            self.run()
+            session.actual_outcome = "resumed"
+            session.record_event("resume_completed", state=self._state.value)
+            return
+
+        if requested_outcome == "reset":
+            self.reset()
+            session.actual_outcome = "reset"
+            session.record_event("reset_completed", state=self._state.value)
+            return
+
+        if session.actual_outcome is None:
+            session.actual_outcome = (
+                "stay_idle"
+                if session.entry_state == CycleState.IDLE.value
+                else "stopped"
+            )
+
+    def execute_intervention(
+        self,
+        tree_dict: dict[str, Any],
+        *,
+        parent_run_id: Optional[str] = None,
+        lease_timeout_ms: int = 60_000,
+        resume_target: Optional[str] = None,
+        session_kind: Optional[str] = None,
+        authority_source: Optional[str] = None,
+        principal_id: Optional[str] = None,
+        grant_type: Optional[str] = None,
+        trigger_reason: Optional[str] = None,
+        trigger_node_instance: Optional[str] = None,
+        approval_mode: Optional[str] = None,
+        artifact_origin: str = "saved_program",
+    ) -> InterventionSession:
+        """Execute a temporary subtree as a direct-control intervention."""
+        from manyforge_behavior.program import tree_node_from_dict
+
+        if self._runner.catalog is None or self._runner.program is None:
+            self._runner.load()
+
+        allowed_session_kinds = {"manual_intervention", "delegated_recovery"}
+        allowed_authority_sources = {"human", "llm", "program_node", "policy"}
+        allowed_approval_modes = {"human_approved", "policy_granted", "not_required"}
+        allowed_artifact_origins = {"saved_program", "runtime_override"}
+
+        if lease_timeout_ms <= 0:
+            raise RuntimeError("lease_timeout_ms must be > 0")
+
+        # -- principal_id is required (may be a placeholder token in dev) --
+        if not principal_id or not principal_id.strip():
+            raise RuntimeError(
+                "principal_id is required: identify the human operator or agent runtime"
+            )
+        principal_id = principal_id.strip()
+
+        session_kind = session_kind or "manual_intervention"
+        if session_kind not in allowed_session_kinds:
+            raise RuntimeError(
+                "session_kind must be one of: manual_intervention, delegated_recovery"
+            )
+        if authority_source not in allowed_authority_sources:
+            raise RuntimeError(
+                "authority_source is required and must be one of: human, llm, program_node, policy"
+            )
+
+        # -- grant_type enforcement (OP-4 scoped grants) --
+        if grant_type is None:
+            # Derive grant_type from authority_source for backward compat
+            if authority_source == "human":
+                grant_type = GrantType.HUMAN_APPROVED
+            elif authority_source in {"llm", "program_node", "policy"}:
+                grant_type = GrantType.POLICY_GRANTED
+            else:
+                grant_type = GrantType.HUMAN_APPROVED
+        if grant_type not in GrantType.ACTIVE:
+            raise RuntimeError(
+                f"grant_type must be one of: {', '.join(sorted(GrantType.ACTIVE))}"
+            )
+        if grant_type == GrantType.HUMAN_APPROVED and authority_source != "human":
+            raise RuntimeError(
+                "grant_type=human_approved requires authority_source=human"
+            )
+        if grant_type == GrantType.POLICY_GRANTED and authority_source == "human":
+            raise RuntimeError(
+                "grant_type=policy_granted is not valid for authority_source=human"
+            )
+
+        # -- approval_mode (kept for backward compat, forced to match grant_type) --
+        if approval_mode is None:
+            approval_mode = grant_type  # human_approved or policy_granted
+        elif approval_mode != grant_type:
+            raise RuntimeError(
+                f"approval_mode={approval_mode} contradicts grant_type={grant_type}; "
+                "omit approval_mode to let it be derived from grant_type, "
+                "or set it to match grant_type"
+            )
+        if approval_mode not in allowed_approval_modes:
+            raise RuntimeError(
+                "approval_mode is required and must be one of: human_approved, policy_granted, not_required"
+            )
+        if artifact_origin not in allowed_artifact_origins:
+            raise RuntimeError(
+                "artifact_origin must be one of: saved_program, runtime_override"
+            )
+        if session_kind == "manual_intervention" and authority_source not in {"human", "llm"}:
+            raise RuntimeError(
+                "manual_intervention authority_source must be human or llm"
+            )
+        if authority_source == "human" and approval_mode != "human_approved":
+            raise RuntimeError("human authority_source requires approval_mode=human_approved")
+        if authority_source == "policy" and approval_mode != "policy_granted":
+            raise RuntimeError("policy authority_source requires approval_mode=policy_granted")
+        if authority_source in {"llm", "program_node"} and approval_mode == "human_approved":
+            raise RuntimeError(
+                "approval_mode=human_approved is only valid for human authority_source"
+            )
+        if trigger_node_instance is not None and not trigger_reason:
+            raise RuntimeError(
+                "trigger_reason is required when trigger_node_instance is provided"
+            )
+        if authority_source == "program_node" and not trigger_node_instance:
+            raise RuntimeError(
+                "trigger_node_instance is required for authority_source=program_node"
+            )
+        if trigger_reason is None:
+            trigger_reason = "manual_request"
+
+        pending_request: Optional[DelegatedRecoveryRequest] = None
+        thread_to_join = None
+        with self._lock:
+            if self._state not in (CycleState.IDLE, CycleState.STOPPED):
+                raise RuntimeError(
+                    f"Cannot start intervention from state {self._state.value}"
+                )
+
+            entry_state = self._state.value
+            if (
+                entry_state == CycleState.IDLE.value
+                and (session_kind != "manual_intervention"
+                     or authority_source != "human"
+                     or approval_mode != "human_approved")
+            ):
+                raise RuntimeError(
+                    "Entering DIRECT_CONTROL from IDLE requires explicit human-approved manual intervention"
+                )
+            pending_request = self._pending_delegated_recovery
+            if session_kind == "delegated_recovery":
+                if entry_state != CycleState.STOPPED.value:
+                    raise RuntimeError(
+                        "delegated_recovery may only start from STOPPED"
+                    )
+                if pending_request is None:
+                    raise RuntimeError(
+                        "No delegated recovery request is pending"
+                    )
+                if authority_source not in pending_request.allowed_authority_sources:
+                    allowed = ", ".join(pending_request.allowed_authority_sources) or "none"
+                    raise RuntimeError(
+                        "delegated_recovery authority_source must be one of: "
+                        f"{allowed}"
+                    )
+                if trigger_node_instance is not None and (
+                    trigger_node_instance != pending_request.trigger_node_instance
+                ):
+                    raise RuntimeError(
+                        "trigger_node_instance does not match the pending delegated recovery request"
+                    )
+                if trigger_reason is not None and (
+                    trigger_reason != "manual_request"
+                    and trigger_reason != pending_request.trigger_reason.value
+                ):
+                    raise RuntimeError(
+                        "trigger_reason does not match the pending delegated recovery request"
+                    )
+                if resume_target is not None and (
+                    resume_target not in pending_request.allowed_resume_targets
+                ):
+                    raise RuntimeError(
+                        "resume_target is not allowed for the pending delegated recovery request"
+                    )
+            kernel_state = self._kernel.get_status().state
+            if entry_state == CycleState.STOPPED.value and kernel_state == ExecutionState.PAUSED:
+                raise RuntimeError(
+                    "Cannot start intervention from STOPPED while the kernel holds a paused motion; reset the cycle first"
+                )
+            saved_context = _InterventionContext(
+                tree=self._tree,
+                node_statuses=dict(self._node_statuses),
+                stop_requested=self._current_stop_requested(),
+                velocity_scale=self._velocity_scale,
+            )
+            if self._tick_thread is not None and self._tick_thread.is_alive():
+                self._tick_stop_event.set()
+                thread_to_join = self._tick_thread
+
+        if thread_to_join is not None:
+            thread_to_join.join(timeout=2.0)
+            if thread_to_join.is_alive():
+                raise RuntimeError(
+                    "Cannot start intervention: previous tick thread is still alive"
+                )
+
+        with self._lock:
+            if self._tick_thread is thread_to_join:
+                self._tick_thread = None
+            default_resume_target = (
+                "stay_idle"
+                if entry_state == CycleState.IDLE.value
+                else (
+                    pending_request.default_resume_target
+                    if session_kind == "delegated_recovery" and pending_request is not None
+                    else "stop"
+                )
+            )
+            session = InterventionSession(
+                session_id=uuid.uuid4().hex[:12],
+                session_kind=session_kind,
+                authority_source=authority_source,
+                principal_id=principal_id,
+                grant_type=grant_type,
+                parent_run_id=(
+                    (
+                        pending_request.parent_run_id
+                        if session_kind == "delegated_recovery" and pending_request is not None
+                        else parent_run_id
+                    )
+                    if entry_state == CycleState.STOPPED.value
+                    else None
+                ),
+                entry_state=entry_state,
+                lease_timeout_ms=lease_timeout_ms,
+                lease_expires_at_ns=time.monotonic_ns() + (lease_timeout_ms * 1_000_000),
+                resume_target=resume_target or default_resume_target,
+                trigger_reason=(
+                    pending_request.trigger_reason.value
+                    if session_kind == "delegated_recovery" and pending_request is not None
+                    else trigger_reason
+                ),
+                trigger_node_instance=(
+                    pending_request.trigger_node_instance
+                    if session_kind == "delegated_recovery" and pending_request is not None
+                    else trigger_node_instance
+                ),
+                approval_mode=approval_mode,
+                artifact_origin=artifact_origin,
+            )
+            session.record_event(
+                "session_started",
+                session_kind=session.session_kind,
+                authority_source=session.authority_source,
+                principal_id=session.principal_id,
+                grant_type=session.grant_type,
+                entry_state=entry_state,
+                parent_run_id=session.parent_run_id,
+                lease_timeout_ms=lease_timeout_ms,
+                resume_target=session.resume_target,
+                trigger_reason=session.trigger_reason,
+                trigger_node_instance=session.trigger_node_instance,
+                approval_mode=session.approval_mode,
+                artifact_origin=session.artifact_origin,
+            )
+            self._intervention = session
+            self._intervention_context = saved_context
+            self._error = None
+            if session_kind == "delegated_recovery":
+                self._pending_delegated_recovery = None
+
+        rewritten_tree = self._rewrite_intervention_tree(tree_dict, session.session_id)
+
+        # Set intervention context on the runner so nodes like QueryModelNode
+        # attribute audit events to this session, not to the base program run.
+        self._runner._intervention_context = {
+            "session_id": session.session_id,
+            "principal_id": session.principal_id,
+            "run_id": session.parent_run_id or f"intervention-{session.session_id}",
+        }
+        try:
+            tree_node = tree_node_from_dict(rewritten_tree)
+            root = self._runner._build_node(tree_node)
+            tree = py_trees.trees.BehaviourTree(root=root)
+            tree.setup()
+        except Exception as e:
+            self._finish_intervention(
+                session,
+                status="failed",
+                actual_outcome="build_failed",
+                error=str(e),
+            )
+            self._restore_after_intervention(session)
+            raise RuntimeError(f"Failed to build intervention tree: {e}") from e
+        finally:
+            self._runner._intervention_context = None
+
+        self._write_bb_keys()
+
+        with self._lock:
+            self._tree = tree
+            self._start_tick_thread(lambda: self._intervention_tick_loop(session))
+            self._state = CycleState.DIRECT_CONTROL
+        session.record_event("tree_started")
+
+        return session
+
+    def _intervention_tick_loop(self, session: InterventionSession) -> None:
+        """Tick loop for intervention subtrees. Same cadence as _tick_loop."""
+        period_s = 0.010
+
+        while not self._tick_stop_event.is_set():
+            if time.monotonic_ns() >= session.lease_expires_at_ns:
+                logger.warning("Intervention session %s lease expired", session.session_id)
+                self._tick_stop_event.set()
+                self._finish_intervention(
+                    session,
+                    status="expired",
+                    actual_outcome="stopped",
+                    error="Intervention lease expired",
+                )
+                self._restore_after_intervention(
+                    session,
+                    forced_state=CycleState.STOPPED,
+                )
+                return
+
+            if not self._tick_pause_event.wait(timeout=0.001):
+                continue
+
+            start_time = time.monotonic()
+            try:
+                self._tree.tick()
+            except Exception:
+                error_msg = traceback.format_exc()
+                logger.error("Intervention tick exception: %s", error_msg)
+                self._tick_stop_event.set()
+                with self._lock:
+                    self._error = error_msg
+                self._finish_intervention(
+                    session,
+                    status="failed",
+                    error=error_msg,
+                )
+                self._restore_after_intervention(session)
+                return
+
+            self._drain_kernel_events()
+
+            statuses: dict[str, str] = {}
+            _collect_statuses(self._tree.root, statuses)
+            with self._lock:
+                self._node_statuses = statuses
+
+            status = self._tree.root.status
+            if status in (py_trees.common.Status.SUCCESS, py_trees.common.Status.FAILURE):
+                self._tick_stop_event.set()
+                if status == py_trees.common.Status.SUCCESS:
+                    self._finish_intervention(
+                        session,
+                        status="completed",
+                    )
+                    self._restore_after_intervention(
+                        session,
+                        requested_outcome=session.resume_target,
+                    )
+                else:
+                    self._finish_intervention(
+                        session,
+                        status="failed",
+                        error="Intervention subtree returned FAILURE",
+                    )
+                    self._restore_after_intervention(session)
+                return
+
+            elapsed = time.monotonic() - start_time
+            sleep_time = period_s - elapsed
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+
+        if session.status == "running":
+            self._finish_intervention(
+                session,
+                status="aborted",
+            )
+            self._restore_after_intervention(session)
+
+    def abort_intervention(self) -> None:
+        """Abort a running intervention and restore the saved parent context."""
+        with self._lock:
+            if self._state != CycleState.DIRECT_CONTROL:
+                return
+            self._tick_stop_event.set()
+            thread_to_join = self._tick_thread
+
+        if thread_to_join is not None:
+            thread_to_join.join(timeout=2.0)
+
+        with self._lock:
+            if thread_to_join is not None and thread_to_join.is_alive():
+                logger.error("Intervention tick thread did not terminate — zombie detected")
+                self._error = "intervention tick thread did not terminate"
+
     def _write_bb_keys(self) -> None:
         """Write stop_requested=False and velocity_scale to blackboard."""
         bb = py_trees.blackboard.Client(name="cycle_manager_init")

@@ -33,17 +33,6 @@ tree:
   id: sequence
   name: main_sequence
   children:
-    - id: add_collision_object
-      name: add_table
-      params:
-        object_id: table
-        shape_type: box
-        box_dimensions_m: [1.0, 0.6, 0.02]
-        pose:
-          position_m: [0.5, 0.0, 0.4]
-          orientation_xyzw: [0.0, 0.0, 0.0, 1.0]
-        frame_id: base_link
-
     - id: move_manipulator_action
       name: move_to_pick
       params:

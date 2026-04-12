@@ -628,6 +628,7 @@ entries:
         type: bool
         required: true
         description: The expected boolean value.
+    bb_reader_params: [key]
     required_capabilities: []
     execution:
       blocking: false
@@ -661,6 +662,7 @@ entries:
         type: bool
         required: true
         description: The boolean value to set.
+    bb_writer_params: [key]
     required_capabilities: []
     execution:
       blocking: false
@@ -694,6 +696,7 @@ entries:
         type: bool
         required: true
         description: The expected boolean value to wait for.
+    bb_reader_params: [key]
     required_capabilities: []
     execution:
       blocking: true
@@ -735,6 +738,7 @@ entries:
         type: string
         required: true
         description: Blackboard key to store the resulting Pose3DTO.
+    bb_writer_params: [output_key]
     required_capabilities:
       - context.kinematics.fk
       - context.state.current
@@ -785,6 +789,7 @@ entries:
           min_inclusive: 0.0
         parameterizable: true
         description: Maximum rotation distance in radians.
+    bb_reader_params: [pose_key_a, pose_key_b]
     required_capabilities: []
     execution:
       blocking: false
@@ -795,4 +800,164 @@ entries:
         class: manyforge_behavior.nodes.CheckPoseDistance
     observability:
       emits_events: []
+      consumes_events: []
+
+  # --- Recovery nodes (OP-6) ---
+
+  - id: fallback_override_node
+    name: Fallback Override
+    category: recovery
+    description: >-
+      Decorator that retries its child with overridden blackboard parameters
+      on failure. Deterministic recovery — no model calls or external
+      delegation. Never produces "skip" as an outcome.
+    tags: [recovery, deterministic, decorator]
+    profiles:
+      min_profile: v0.0
+    kind: decorator
+    children:
+      min: 1
+      max: 1
+    parameters:
+      - name: fallback_params
+        type: object
+        required: true
+        description: >-
+          Parameter overrides to apply to the blackboard on child failure.
+          Keys are blackboard key paths, values are the fallback values.
+      - name: max_retries
+        type: int
+        required: false
+        default: 1
+        description: >-
+          Maximum retry attempts after applying overrides.
+          0 means apply overrides and run once without further retries.
+        constraints:
+          min_inclusive: 0
+    required_capabilities: []
+    execution:
+      blocking: false
+      cancellable: false
+    runners:
+      py_trees:
+        implementation_kind: plugin
+        class: manyforge_behavior.nodes.recovery.FallbackOverrideNode
+    observability:
+      emits_events: []
+      consumes_events: []
+
+  - id: recovery_skill_node
+    name: Recovery Skill
+    category: recovery
+    description: >-
+      Decorator that runs a named recovery skill when its child fails, then
+      retries the child. Deterministic recovery — the skill must be a catalog
+      skill, not a model call. Never produces "skip" as an outcome.
+    tags: [recovery, deterministic, decorator]
+    profiles:
+      min_profile: v0.0
+    kind: decorator
+    children:
+      min: 1
+      max: 1
+    parameters:
+      - name: recovery_skill_id
+        type: string
+        required: true
+        description: Skill catalog ID to run as recovery action.
+      - name: recovery_params
+        type: object
+        required: false
+        default: {}
+        description: Parameters to pass to the recovery skill.
+      - name: max_retries
+        type: int
+        required: false
+        default: 1
+        description: Maximum retry attempts with recovery skill.
+        constraints:
+          min_inclusive: 0
+    required_capabilities: []
+    execution:
+      blocking: false
+      cancellable: false
+    runners:
+      py_trees:
+        implementation_kind: plugin
+        class: manyforge_behavior.nodes.recovery.RecoverySkillNode
+    observability:
+      emits_events: []
+      consumes_events: []
+
+  # --- Model nodes (OP-7) ---
+
+  - id: query_model
+    name: Query Model
+    category: model
+    description: >-
+      Non-blocking leaf node that queries a deployment-configured model endpoint
+      with a versioned prompt template. Writes validated structured output to the
+      blackboard atomically. Supports JSON-schema output validation, wall-clock
+      timeout, and clean cancellation via the BT stop path.
+    tags: [model, perception, reasoning]
+    profiles:
+      min_profile: v0.0
+    kind: leaf
+    children:
+      min: 0
+      max: 0
+    parameters:
+      - name: model_endpoint_alias
+        type: string
+        required: true
+        description: >-
+          Deployment-configured model endpoint alias.
+          Must match a key in deployment.model_endpoints.
+      - name: prompt_template_id
+        type: string
+        required: true
+        description: >-
+          Deployment-side prompt template ID.
+          Must match a key in deployment.prompt_templates.
+      - name: template_variables
+        type: object
+        required: false
+        default: {}
+        description: >-
+          Map of template variable names to blackboard key paths.
+          Variables in the template text ({{var_name}}) are replaced with
+          the current blackboard value at the given key path.
+      - name: output_key_prefix
+        type: string
+        required: true
+        description: >-
+          Blackboard key prefix for writing validated model outputs.
+          Outputs are written under {prefix}/response, {prefix}/confidence, etc.
+      - name: timeout_s
+        type: float
+        required: false
+        default: 30.0
+        description: Wall-clock timeout for the model call in seconds.
+        constraints:
+          min_exclusive: 0.0
+      - name: min_confidence
+        type: float
+        required: false
+        default: 0.0
+        description: >-
+          Minimum confidence threshold. If the response confidence is below
+          this threshold, the node returns FAILURE.
+        constraints:
+          min_inclusive: 0.0
+          max_inclusive: 1.0
+    required_capabilities: []
+    execution:
+      blocking: false
+      cancellable: true
+    runners:
+      py_trees:
+        implementation_kind: plugin
+        class: manyforge_behavior.nodes.model.QueryModelNode
+    observability:
+      emits_events: [model_call_started, model_call_completed, model_call_failed]
       consumes_events: []

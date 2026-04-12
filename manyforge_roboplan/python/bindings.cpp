@@ -3,6 +3,8 @@
 #include <pybind11/functional.h>
 
 #include <cstdint>
+#include <cmath>
+#include <stdexcept>
 
 #include <Eigen/Dense>
 
@@ -114,6 +116,56 @@ py::dict scene_trace_event_to_python(
   return d;
 }
 
+// Helper: KernelEventType to string
+const char* kernel_event_type_to_string(KernelEventType type) {
+  switch (type) {
+    case KernelEventType::kStateTransition: return "state_transition";
+    case KernelEventType::kPlanStarted: return "plan_started";
+    case KernelEventType::kPlanCompleted: return "plan_completed";
+    case KernelEventType::kCacheHit: return "cache_hit";
+    case KernelEventType::kCacheMiss: return "cache_miss";
+    case KernelEventType::kCacheInvalidated: return "cache_invalidated";
+    case KernelEventType::kValidationStarted: return "validation_started";
+    case KernelEventType::kValidationPassed: return "validation_passed";
+    case KernelEventType::kValidationFailed: return "validation_failed";
+    case KernelEventType::kExecuteStarted: return "execute_started";
+    case KernelEventType::kExecuteCompleted: return "execute_completed";
+    case KernelEventType::kStopRequested: return "stop_requested";
+    case KernelEventType::kStopIssued: return "stop_issued";
+    case KernelEventType::kPauseRequested: return "pause_requested";
+    case KernelEventType::kResumeRequested: return "resume_requested";
+    case KernelEventType::kErrorRaised: return "error_raised";
+    case KernelEventType::kCollisionDetected: return "collision_detected";
+    default: return "unknown";
+  }
+}
+
+// Helper: convert KernelEvent to Python dict
+py::dict kernel_event_to_python(const KernelEvent& event) {
+  py::dict d;
+  d["type"] = kernel_event_type_to_string(event.type);
+  d["execution_id"] = event.execution_id;
+  d["timestamp_ns"] = event.timestamp_ns;
+  if (event.type == KernelEventType::kStateTransition) {
+    d["from_state"] = to_string(event.from_state);
+    d["to_state"] = to_string(event.to_state);
+  }
+  if (event.error.has_value()) {
+    py::dict err;
+    err["code"] = event.error->code;
+    err["message"] = event.error->message;
+    d["error"] = err;
+  }
+  if (!event.details.empty()) {
+    py::dict details;
+    for (const auto& [key, value] : event.details) {
+      details[py::cast(key)] = value;
+    }
+    d["details"] = details;
+  }
+  return d;
+}
+
 // Helper: convert stop/pause/resume/reset results
 py::dict command_result(bool accepted, const std::optional<ErrorDTO>& error) {
   py::dict d;
@@ -143,6 +195,55 @@ py::dict metrics_to_python(const MetricsSnapshot& metrics) {
   return d;
 }
 
+py::dict shape_to_python(const CollisionShapeDTO& shape) {
+  py::dict d;
+  if (const auto* box = std::get_if<BoxShapeDTO>(&shape)) {
+    d["type"] = "box";
+    d["box_dimensions_m"] = py::make_tuple(
+        box->dimensions_m.x_m, box->dimensions_m.y_m, box->dimensions_m.z_m);
+    return d;
+  }
+  if (const auto* sphere = std::get_if<SphereShapeDTO>(&shape)) {
+    d["type"] = "sphere";
+    d["sphere_radius_m"] = sphere->radius_m;
+    return d;
+  }
+  if (const auto* cylinder = std::get_if<CylinderShapeDTO>(&shape)) {
+    d["type"] = "cylinder";
+    d["cylinder_radius_m"] = cylinder->radius_m;
+    d["cylinder_height_m"] = cylinder->height_m;
+    return d;
+  }
+  if (const auto* mesh = std::get_if<MeshShapeDTO>(&shape)) {
+    d["type"] = "mesh";
+    d["mesh_resource_uri"] = mesh->resource_uri;
+    d["mesh_scale"] = py::make_tuple(mesh->scale.x_m, mesh->scale.y_m, mesh->scale.z_m);
+    return d;
+  }
+  d["type"] = "unknown";
+  return d;
+}
+
+py::dict scene_object_snapshot_to_python(
+    const RoboPlanPlanningContext::SceneObjectSnapshot& object) {
+  py::dict d;
+  d["object_id"] = object.object_id;
+  d["shape"] = shape_to_python(object.shape);
+  d["pose_in_frame"] = pose_to_python(object.pose_in_frame);
+  d["pose_in_universe"] = pose_to_python(object.pose_in_universe);
+  d["frame_id"] = object.frame_id;
+  d["attached"] = object.attached;
+  return d;
+}
+
+double finite_scale_from_python(const py::handle& value, const char* field_name) {
+  const double result = value.cast<double>();
+  if (!std::isfinite(result)) {
+    throw std::invalid_argument(std::string(field_name) + " must be finite");
+  }
+  return result;
+}
+
 ExecutionKernelConfig kernel_config_from_python(const py::object& config_obj) {
   ExecutionKernelConfig config;
   if (config_obj.is_none()) {
@@ -151,9 +252,15 @@ ExecutionKernelConfig kernel_config_from_python(const py::object& config_obj) {
 
   py::dict config_dict = config_obj.cast<py::dict>();
   if (config_dict.contains("collision_monitor_period_ns")) {
+    const double period_ns =
+        finite_scale_from_python(config_dict["collision_monitor_period_ns"],
+                                 "collision_monitor_period_ns");
+    if (period_ns <= 0.0) {
+      throw std::invalid_argument(
+          "collision_monitor_period_ns must be > 0");
+    }
     config.collision_monitor_period_ns =
-        static_cast<int64_t>(
-            config_dict["collision_monitor_period_ns"].cast<double>());
+        static_cast<int64_t>(period_ns);
   }
   return config;
 }
@@ -180,8 +287,12 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
         req.tolerances.rotation_tol_rad = request.attr("get")("rotation_tol_rad", 0.05).cast<double>();
 
         // Speed profile
-        req.speed_profile.velocity_scale = request.attr("get")("velocity_scale", 1.0).cast<double>();
-        req.speed_profile.acceleration_scale = request.attr("get")("acceleration_scale", 1.0).cast<double>();
+        req.speed_profile.velocity_scale = finite_scale_from_python(
+            request.attr("get")("velocity_scale", 1.0),
+            "velocity_scale");
+        req.speed_profile.acceleration_scale = finite_scale_from_python(
+            request.attr("get")("acceleration_scale", 1.0),
+            "acceleration_scale");
         if (request.contains("max_tcp_linear_speed_mps")) {
           auto val = request["max_tcp_linear_speed_mps"];
           if (!val.is_none()) {
@@ -294,6 +405,19 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
       .def("get_metrics", [](NativeKernelBundle& self) -> py::dict {
         return metrics_to_python(self.kernel->get_metrics());
       })
+      .def("get_scene_object_ids", [](NativeKernelBundle& self) {
+        return self.context->get_scene_object_ids();
+      })
+      .def("get_joint_names", [](NativeKernelBundle& self) {
+        return self.context->get_joint_names();
+      })
+      .def("get_scene_objects", [](NativeKernelBundle& self) -> py::list {
+        py::list result;
+        for (const auto& object : self.context->get_scene_objects()) {
+          result.append(scene_object_snapshot_to_python(object));
+        }
+        return result;
+      })
       .def("invalidate_trajectories", [](NativeKernelBundle& self) {
         self.cache->invalidate_all();
       })
@@ -321,11 +445,30 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
           // Shape
           std::string shape_type = request.attr("get")("shape_type", "box").cast<std::string>();
           if (shape_type == "box") {
+            if (!request.contains("box_dimensions_m")) {
+              result["success"] = false;
+              result["error"] = "add with shape_type=box requires box_dimensions_m";
+              return result;
+            }
             auto dims = request["box_dimensions_m"].cast<std::vector<double>>();
+            if (dims.size() != 3) {
+              result["success"] = false;
+              result["error"] = "box_dimensions_m must have exactly 3 elements";
+              return result;
+            }
             req.shape = BoxShapeDTO{{dims[0], dims[1], dims[2]}};
           } else if (shape_type == "sphere") {
+            if (!request.contains("sphere_radius_m")) {
+              result["success"] = false;
+              result["error"] = "add with shape_type=sphere requires sphere_radius_m";
+              return result;
+            }
             double radius = request["sphere_radius_m"].cast<double>();
             req.shape = SphereShapeDTO{radius};
+          } else {
+            result["success"] = false;
+            result["error"] = "Unsupported shape_type for native backend: " + shape_type;
+            return result;
           }
 
           auto r = self.context->add_object(req);
@@ -370,6 +513,9 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
           auto r = self.context->detach_object(req);
           result["success"] = r.success;
           if (r.error.has_value()) result["error"] = r.error->message;
+        } else {
+          result["success"] = false;
+          result["error"] = "Unsupported scene edit operation: " + op;
         }
 
         return result;
@@ -451,6 +597,13 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
       }, py::arg("limit") = -1)
       .def("clear_scene_trace", [](NativeKernelBundle& self) {
         self.context->clear_scene_trace();
+      })
+      .def("drain_kernel_events", [](NativeKernelBundle& self) -> py::list {
+        py::list result;
+        for (const auto& event : self.event_collector.drain()) {
+          result.append(kernel_event_to_python(event));
+        }
+        return result;
       });
 
   // Factory function

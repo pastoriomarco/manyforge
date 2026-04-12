@@ -86,7 +86,7 @@ export function DeploymentPanel() {
   } =
     useDeploymentStore();
   const { state } = useCycleStore();
-  const editLocked = state === 'running';
+  const editLocked = state === 'running' || state === 'direct_control';
   const runtimeApplied = signature(deployment) === signature(appliedDeployment);
   const diskSaved = signature(deployment) === signature(savedDeployment);
 

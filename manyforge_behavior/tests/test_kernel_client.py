@@ -7,6 +7,7 @@ from manyforge_behavior.kernel_client import (
     ExecutionState,
     MockKernelClient,
     ObjectState,
+    SceneObjectSnapshot,
     SceneEditRequest,
 )
 
@@ -106,7 +107,12 @@ class TestMockKernelReset:
 
 class TestMockKernelSceneEdit:
     def test_scene_edit_records(self, kernel):
-        req = SceneEditRequest(operation="add", object_id="box1")
+        req = SceneEditRequest(
+            operation="add",
+            object_id="box1",
+            shape_type="box",
+            box_dimensions_m=[0.1, 0.1, 0.1],
+        )
         result = kernel.scene_edit(req)
         assert result.success
         assert len(kernel.scene_edits) == 1
@@ -114,14 +120,31 @@ class TestMockKernelSceneEdit:
 
     def test_scene_edit_failure_injection(self, kernel):
         kernel.fail_next_scene_edit = True
-        req = SceneEditRequest(operation="add", object_id="box1")
+        req = SceneEditRequest(
+            operation="add",
+            object_id="box1",
+            shape_type="box",
+            box_dimensions_m=[0.1, 0.1, 0.1],
+        )
         result = kernel.scene_edit(req)
         assert not result.success
+
+    def test_scene_edit_invalid_operation_fails(self, kernel):
+        result = kernel.scene_edit(SceneEditRequest(operation="teleport", object_id="box1"))
+        assert result.success is False
+        assert "Unsupported scene edit operation" in (result.error or "")
+
+    def test_scene_edit_remove_missing_fails(self, kernel):
+        result = kernel.scene_edit(SceneEditRequest(operation="remove", object_id="missing"))
+        assert result.success is False
+        assert result.error == "Object not found"
 
     def test_scene_trace_records_scene_mutations(self, kernel):
         kernel.scene_edit(SceneEditRequest(
             operation="add",
             object_id="box1",
+            shape_type="box",
+            box_dimensions_m=[0.05, 0.05, 0.05],
             pose_position_m=[0.4, 0.1, 0.2],
             pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
             frame_id="universe",
@@ -157,6 +180,8 @@ class TestMockKernelMisc:
         kernel.scene_edit(SceneEditRequest(
             operation="add",
             object_id="box1",
+            shape_type="box",
+            box_dimensions_m=[0.05, 0.05, 0.05],
             pose_position_m=[0.4, 0.1, 0.2],
             pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
             frame_id="universe",
@@ -178,11 +203,36 @@ class TestMockKernelMisc:
         assert state.exists is False
         assert kernel.get_object_pose("missing_box", "base_link") is None
 
+    def test_get_scene_objects_returns_authoritative_shape_and_pose(self, kernel):
+        kernel.scene_edit(
+            SceneEditRequest(
+                operation="add",
+                object_id="sphere1",
+                shape_type="sphere",
+                sphere_radius_m=0.05,
+                pose_position_m=[0.1, 0.2, 0.3],
+                pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
+                frame_id="universe",
+            )
+        )
+
+        objects = kernel.get_scene_objects()
+        assert len(objects) == 1
+        assert isinstance(objects[0], SceneObjectSnapshot)
+        assert objects[0].object_id == "sphere1"
+        assert objects[0].shape is not None
+        assert objects[0].shape.type == "sphere"
+        assert objects[0].shape.sphere_radius_m == pytest.approx(0.05)
+        assert objects[0].pose_in_universe is not None
+        assert objects[0].pose_in_universe["position_m"] == pytest.approx([0.1, 0.2, 0.3])
+
     def test_attach_and_detach_preserve_world_pose_with_stable_object_id(self, kernel):
         kernel.scene_edit(
             SceneEditRequest(
                 operation="add",
                 object_id="box1",
+                shape_type="box",
+                box_dimensions_m=[0.05, 0.05, 0.05],
                 pose_position_m=[0.4, 0.1, 0.2],
                 pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
                 frame_id="universe",

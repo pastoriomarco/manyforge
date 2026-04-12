@@ -34,6 +34,26 @@ def create_cycle_router(state: ComposerState) -> APIRouter:
         """Start the cycle (IDLE→RUNNING or STOPPED→RUNNING)."""
         if state.cycle_manager is None:
             raise HTTPException(status_code=409, detail="No program loaded")
+        override_status = state.runtime_override_status()
+        if (
+            state.cycle_manager.state.value == "stopped"
+            and override_status["has_staged"]
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Staged runtime overrides cannot be activated while resuming from STOPPED; "
+                    "reset the cycle first"
+                ),
+            )
+        if (
+            state.cycle_manager.state.value == "idle"
+            and override_status["has_staged"]
+        ):
+            try:
+                state.activate_staged_runtime_overrides()
+            except RuntimeError as exc:
+                raise HTTPException(status_code=409, detail=str(exc))
         prev = state.cycle_manager.state.value
         state.cycle_manager.run()
         logger.info("Cycle state: %s → %s", prev, state.cycle_manager.state.value)
@@ -54,8 +74,15 @@ def create_cycle_router(state: ComposerState) -> APIRouter:
         """Reset the cycle (any→IDLE)."""
         if state.cycle_manager is None:
             raise HTTPException(status_code=409, detail="No program loaded")
+        override_status = state.runtime_override_status()
         prev = state.cycle_manager.state.value
-        state.cycle_manager.reset()
+        if override_status["has_staged"]:
+            try:
+                state.activate_staged_runtime_overrides()
+            except RuntimeError as exc:
+                raise HTTPException(status_code=409, detail=str(exc))
+        else:
+            state.cycle_manager.reset()
         logger.info("Cycle state: %s → %s", prev, state.cycle_manager.state.value)
         return {"state": state.cycle_manager.state.value}
 

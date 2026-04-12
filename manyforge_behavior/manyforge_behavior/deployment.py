@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -59,6 +60,43 @@ class DeploymentValidationError(Exception):
     pass
 
 
+_ALLOWED_HASH_ALGORITHMS = {"sha256", "sha384", "sha512"}
+
+
+@dataclass
+class ModelAuditPolicy:
+    """Deployment-level audit and redaction policy for model calls (OP-9)."""
+    store_full_prompts: bool = False
+    store_full_responses: bool = False
+    hash_algorithm: str = "sha256"
+    redact_argument_values: bool = True
+
+
+@dataclass
+class ModelEndpoint:
+    """Deployment-configured model endpoint alias (OP-7)."""
+    alias: str
+    provider: str  # "openai", "anthropic", "local", etc.
+    model_id: str
+    base_url: Optional[str] = None
+    api_key_env: Optional[str] = None  # env var name, never the key itself
+    default_timeout_s: float = 30.0
+    max_tokens: int = 4096
+
+
+@dataclass
+class PromptTemplate:
+    """Deployment-side versioned prompt template (OP-7)."""
+    template_id: str
+    version: str
+    template_text: str
+    output_schema: Optional[dict[str, Any]] = None
+
+    @property
+    def content_hash(self) -> str:
+        return hashlib.sha256(self.template_text.encode()).hexdigest()[:16]
+
+
 class Deployment:
     """Loads and validates a ManyForge deployment artifact from YAML."""
 
@@ -73,6 +111,9 @@ class Deployment:
         self.adapters: dict[str, AdapterConfig] = {}
         self.orchestrator: Optional[OrchestratorConfig] = None
         self.launch: Optional[LaunchConfig] = None
+        self.model_audit_policy: Optional[ModelAuditPolicy] = None
+        self.model_endpoints: dict[str, ModelEndpoint] = {}
+        self.prompt_templates: dict[str, PromptTemplate] = {}
         self._load_and_validate()
 
     @classmethod
@@ -93,6 +134,9 @@ class Deployment:
         self.adapters = {}
         self.orchestrator = None
         self.launch = None
+        self.model_audit_policy = None
+        self.model_endpoints = {}
+        self.prompt_templates = {}
         self._load_from_data_and_validate(data)
         return self
 
@@ -217,6 +261,70 @@ class Deployment:
             )
 
         self.launch = LaunchConfig(runner=runner, ui_backend=ui_backend)
+
+        # Model audit policy (optional)
+        audit_data = data.get("model_audit_policy")
+        if audit_data is not None:
+            if not isinstance(audit_data, dict):
+                raise DeploymentValidationError(
+                    "model_audit_policy must be a mapping"
+                )
+            hash_algo = audit_data.get("hash_algorithm", "sha256")
+            if hash_algo not in _ALLOWED_HASH_ALGORITHMS:
+                allowed = ", ".join(sorted(_ALLOWED_HASH_ALGORITHMS))
+                raise DeploymentValidationError(
+                    f"model_audit_policy.hash_algorithm must be one of: {allowed}"
+                )
+            self.model_audit_policy = ModelAuditPolicy(
+                store_full_prompts=bool(audit_data.get("store_full_prompts", False)),
+                store_full_responses=bool(audit_data.get("store_full_responses", False)),
+                hash_algorithm=hash_algo,
+                redact_argument_values=bool(audit_data.get("redact_argument_values", True)),
+            )
+
+        # Model endpoints (optional)
+        endpoints_data = data.get("model_endpoints", {})
+        if endpoints_data and not isinstance(endpoints_data, dict):
+            raise DeploymentValidationError("model_endpoints must be a mapping")
+        for alias, ep_data in (endpoints_data or {}).items():
+            if not isinstance(ep_data, dict):
+                raise DeploymentValidationError(
+                    f"model_endpoints.{alias} must be a mapping"
+                )
+            for req_field in ("provider", "model_id"):
+                if req_field not in ep_data:
+                    raise DeploymentValidationError(
+                        f"model_endpoints.{alias}.{req_field} is required"
+                    )
+            self.model_endpoints[alias] = ModelEndpoint(
+                alias=alias,
+                provider=ep_data["provider"],
+                model_id=ep_data["model_id"],
+                base_url=ep_data.get("base_url"),
+                api_key_env=ep_data.get("api_key_env"),
+                default_timeout_s=float(ep_data.get("default_timeout_s", 30.0)),
+                max_tokens=int(ep_data.get("max_tokens", 4096)),
+            )
+
+        # Prompt templates (optional)
+        templates_data = data.get("prompt_templates", {})
+        if templates_data and not isinstance(templates_data, dict):
+            raise DeploymentValidationError("prompt_templates must be a mapping")
+        for tid, tmpl_data in (templates_data or {}).items():
+            if not isinstance(tmpl_data, dict):
+                raise DeploymentValidationError(
+                    f"prompt_templates.{tid} must be a mapping"
+                )
+            if "template_text" not in tmpl_data:
+                raise DeploymentValidationError(
+                    f"prompt_templates.{tid}.template_text is required"
+                )
+            self.prompt_templates[tid] = PromptTemplate(
+                template_id=tid,
+                version=tmpl_data.get("version", "1"),
+                template_text=tmpl_data["template_text"],
+                output_schema=tmpl_data.get("output_schema"),
+            )
 
     def validate_against_program(self, program: Any) -> None:
         """Cross-artifact validation against a Program.

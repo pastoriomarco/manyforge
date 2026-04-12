@@ -18,6 +18,15 @@ namespace manyforge::roboplan_backend {
 /// Provides state queries, FK, collision checks, validation, and scene edits.
 class RoboPlanPlanningContext final : public core::IPlanningContext {
  public:
+  struct SceneObjectSnapshot {
+    std::string object_id;
+    core::CollisionShapeDTO shape;
+    core::Pose3DTO pose_in_frame;
+    core::Pose3DTO pose_in_universe;
+    std::string frame_id;
+    bool attached = false;
+  };
+
   struct SceneTraceEvent {
     uint64_t timestamp_ns = 0;
     std::string event;
@@ -60,12 +69,16 @@ class RoboPlanPlanningContext final : public core::IPlanningContext {
   core::SceneEditResultDTO attach_object(const core::AttachObjectRequestDTO& request) override;
   core::SceneEditResultDTO detach_object(const core::DetachObjectRequestDTO& request) override;
 
+  std::vector<std::string> get_scene_object_ids();
+  std::vector<std::string> get_joint_names();
+  std::vector<SceneObjectSnapshot> get_scene_objects();
   std::vector<SceneTraceEvent> get_scene_trace(size_t limit = 0);
   void clear_scene_trace();
 
  private:
   struct TrackedObjectState {
     core::Pose3DTO pose;
+    core::CollisionShapeDTO shape;
     std::string frame_id;
     bool attached = false;
   };

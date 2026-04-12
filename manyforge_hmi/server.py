@@ -43,7 +43,7 @@ class ViserHmiServer:
     def __init__(
         self,
         cycle_manager: CycleManager,
-        host: str = "0.0.0.0",
+        host: str = "127.0.0.1",
         port: int = 8081,
         urdf_path: Optional[str] = None,
         joint_names: Optional[list[str]] = None,
@@ -401,6 +401,8 @@ class ViserHmiServer:
         self._running = False
         if self._update_thread:
             self._update_thread.join(timeout=1.0)
+            self._update_thread = None
+        self._viser_server.stop()
 
     @property
     def viser_server(self) -> viser.ViserServer:
@@ -431,3 +433,35 @@ class ViserHmiServer:
     def robot_visualizer(self) -> Optional[RobotVisualizer]:
         """Access the RobotVisualizer if created."""
         return self._robot_visualizer
+
+    def render_scene(
+        self,
+        width: int = 640,
+        height: int = 480,
+        format: str = "jpeg",
+    ) -> Optional[bytes]:
+        """Render the current Viser scene as an image.
+
+        Requires at least one connected Viser client. Returns JPEG or PNG
+        bytes, or None if no client is connected.
+        """
+        clients = self._viser_server.get_clients()
+        if not clients:
+            return None
+
+        # Use the first connected client
+        client = next(iter(clients.values()))
+        try:
+            import io
+            import numpy as np
+            from PIL import Image
+
+            rgb_array = client.get_render(height=height, width=width)
+            img = Image.fromarray(rgb_array)
+            buf = io.BytesIO()
+            img_format = "JPEG" if format.lower() == "jpeg" else "PNG"
+            img.save(buf, format=img_format)
+            return buf.getvalue()
+        except Exception:
+            logger.warning("Failed to render scene", exc_info=True)
+            return None

@@ -11,18 +11,40 @@ from fastapi import FastAPI, Request, Response, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
+from .security import (
+    BearerAuthMiddleware,
+    SecurityConfig,
+    WS_MAX_MESSAGE_SIZE,
+    check_ws_bearer_token,
+)
 from .state import ComposerState
 from .ws_state import StateHub
 from .routes_cycle import create_cycle_router
 from .routes_catalog import create_catalog_router
 from .routes_program import create_program_router
 from .routes_filesystem import create_filesystem_router
+from .routes_kernel import create_kernel_router
+from .routes_scene import create_scene_router
+from .routes_execution import create_execution_router
+from .routes_debug import create_debug_router
+from .routes_skills import create_skills_router
+from .routes_direct import create_direct_router
+from .routes_mcp import create_mcp_router
 
 logger = logging.getLogger(__name__)
 
 
-def create_app(state: ComposerState, static_dir: str | None = None) -> FastAPI:
+def create_app(
+    state: ComposerState,
+    static_dir: str | None = None,
+    security: SecurityConfig | None = None,
+    enable_mcp_http: bool = False,
+) -> FastAPI:
     """Create the FastAPI application with the given state."""
+    if security is None:
+        security = SecurityConfig()
+    state.allowed_fs_roots = security.allowed_fs_roots
+
     hub = StateHub()
 
     @asynccontextmanager
@@ -36,12 +58,16 @@ def create_app(state: ComposerState, static_dir: str | None = None) -> FastAPI:
 
     app = FastAPI(title="ManyForge Composer", lifespan=lifespan)
 
-    # CORS for dev mode (Vite on port 3000 → FastAPI on 9000)
+    # Bearer-token auth (when configured)
+    if security.api_token:
+        app.add_middleware(BearerAuthMiddleware, token=security.api_token)
+
+    # CORS — restricted to configured origins
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
-        allow_methods=["*"],
-        allow_headers=["*"],
+        allow_origins=security.cors_origins,
+        allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+        allow_headers=["Authorization", "Content-Type"],
     )
 
     # Request logging middleware
@@ -66,7 +92,7 @@ def create_app(state: ComposerState, static_dir: str | None = None) -> FastAPI:
         )
         return response
 
-    # Health endpoint
+    # Health endpoint (always public — used by liveness probes)
     @app.get("/api/health")
     def health():
         return {
@@ -80,54 +106,40 @@ def create_app(state: ComposerState, static_dir: str | None = None) -> FastAPI:
             "timestamp": time.time(),
         }
 
-    @app.get("/api/debug/scene-trace")
-    def debug_scene_trace(limit: int = 200):
-        backend_trace = []
-        if state.cycle_manager is not None:
-            backend_trace = state.cycle_manager.get_scene_trace(limit=limit)
-
-        hmi_trace = []
-        object_diagnostics = {}
-        hmi_server = getattr(state, "hmi_server", None)
-        if hmi_server is not None:
-            if hasattr(hmi_server, "get_scene_trace"):
-                hmi_trace = hmi_server.get_scene_trace(limit=limit)
-            if state.program is not None and hasattr(hmi_server, "get_object_render_diagnostics"):
-                for resource in state.program.scene or []:
-                    object_diagnostics[resource.object_id] = (
-                        hmi_server.get_object_render_diagnostics(resource.object_id)
-                    )
-
-        return {
-            "scope": {
-                "included": [
-                    "backend scene mutation trace (add/remove/update_pose/attach/detach)",
-                    "HMI invalidation hints and per-object reconciliation decisions",
-                    "current per-object backend-vs-render diagnostics",
-                ],
-                "excluded": [
-                    "browser-side WebGL/client rendering and pixels",
-                    "persistent trace storage",
-                    "planner/collision internals beyond scene mutations and queried scene state",
-                ],
-            },
-            "backend": backend_trace,
-            "hmi": hmi_trace,
-            "objects": object_diagnostics,
-        }
-
     app.include_router(create_cycle_router(state), prefix="/api/cycle", tags=["cycle"])
     app.include_router(create_catalog_router(state), prefix="/api/catalog", tags=["catalog"])
     app.include_router(create_program_router(state), prefix="/api", tags=["program"])
-    app.include_router(create_filesystem_router(), prefix="/api/files", tags=["files"])
+    app.include_router(
+        create_filesystem_router(allowed_roots=security.allowed_fs_roots),
+        prefix="/api/files",
+        tags=["files"],
+    )
+    app.include_router(create_kernel_router(state), prefix="/api/kernel", tags=["kernel"])
+    app.include_router(create_scene_router(state), prefix="/api/scene", tags=["scene"])
+    app.include_router(create_execution_router(state), prefix="/api/execution", tags=["execution"])
+    app.include_router(create_skills_router(state), prefix="/api", tags=["skills"])
+    app.include_router(create_debug_router(state), prefix="/api/debug", tags=["debug"])
+    app.include_router(create_direct_router(state), prefix="/api/direct", tags=["direct"])
+
+    if enable_mcp_http:
+        app.include_router(create_mcp_router(state), prefix="/api/mcp", tags=["mcp"])
+        logger.info("HTTP/SSE MCP transport enabled on /api/mcp")
 
     # WebSocket endpoint
     @app.websocket("/ws/state")
     async def ws_state(ws: WebSocket):
+        # Authenticate WebSocket upgrades when token is configured
+        if security.api_token and not check_ws_bearer_token(ws, security.api_token):
+            await ws.close(code=4401, reason="Unauthorized")
+            return
+
         await hub.connect(ws)
         try:
             while True:
                 msg = await ws.receive_text()
+                if len(msg) > WS_MAX_MESSAGE_SIZE:
+                    await ws.close(code=1009, reason="Message too large")
+                    break
                 if msg == "ping":
                     await ws.send_text("pong")
         except Exception:

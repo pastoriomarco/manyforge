@@ -13,6 +13,8 @@ from manyforge_behavior.nodes.logic import (
 )
 from manyforge_behavior.nodes.geometry import GetLinkPose, CheckPoseDistance
 from manyforge_behavior.nodes.control_flow import RepeatDecorator, RetryDecorator
+from manyforge_behavior.nodes.model import QueryModelNode
+from manyforge_behavior.nodes.recovery import FallbackOverrideNode, RecoverySkillNode
 
 __all__ = [
     "MoveManipulatorAction",
@@ -29,4 +31,7 @@ __all__ = [
     "CheckPoseDistance",
     "RepeatDecorator",
     "RetryDecorator",
+    "FallbackOverrideNode",
+    "RecoverySkillNode",
+    "QueryModelNode",
 ]

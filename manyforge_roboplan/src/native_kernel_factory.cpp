@@ -11,6 +11,45 @@
 
 namespace manyforge::roboplan_backend {
 
+// --- KernelEventCollector ---
+
+void KernelEventCollector::subscribe(core::ExecutionKernel& kernel) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (subscribed_) return;
+  subscription_ = kernel.subscribe_events(
+      [this](const core::KernelEvent& event) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (buffer_.size() >= kMaxBufferedEvents) {
+          buffer_.pop_front();
+        }
+        buffer_.push_back(event);
+      });
+  subscribed_ = true;
+}
+
+void KernelEventCollector::unsubscribe(core::ExecutionKernel& kernel) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!subscribed_) return;
+  kernel.unsubscribe_events(subscription_);
+  subscribed_ = false;
+}
+
+std::vector<core::KernelEvent> KernelEventCollector::drain() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  std::vector<core::KernelEvent> result(buffer_.begin(), buffer_.end());
+  buffer_.clear();
+  return result;
+}
+
+// --- NativeKernelBundle ---
+
+NativeKernelBundle::~NativeKernelBundle() {
+  // Unsubscribe before kernel destruction to avoid dangling callback
+  if (kernel) {
+    event_collector.unsubscribe(*kernel);
+  }
+}
+
 // --- WallClock ---
 
 core::TimePoint WallClock::now() const {
@@ -194,6 +233,9 @@ std::shared_ptr<NativeKernelBundle> create_native_kernel(
   bundle->kernel = std::make_unique<core::ExecutionKernel>(
       *bundle->planner, *bundle->context, *bundle->execution,
       *bundle->clock, *bundle->scheduler, *bundle->cache, kernel_config);
+
+  // Auto-subscribe event collector
+  bundle->event_collector.subscribe(*bundle->kernel);
 
   return bundle;
 }

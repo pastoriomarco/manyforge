@@ -52,8 +52,13 @@ manyforge_roboplan/      C++ RoboPlan adapters: planner, planning context, execu
   python/                pybind11 bindings + NativeKernelClient wrapper
 manyforge_behavior/      Python behavior tree runner (py_trees), node catalog, program loader
 manyforge_hmi/           Python Viser-based HMI: robot visualization, control panel
+manyforge_composer/      Composer: FastAPI backend, React frontend, MCP server
+  backend/               REST API routes, state management, security middleware
+  frontend/              React + ReactFlow program editor UI
+  tests/                 Backend + MCP server tests
 tests/                   End-to-end integration and benchmark tests
 scripts/                 Build/test/setup scripts
+docs/                    Architecture reference
 ```
 
 ## Architecture
@@ -85,12 +90,26 @@ Then open:
 
 The pick-and-place demo exercises the full program load, native planning, scene-edit, run, reset, and rerun flow through the supported container path.
 
+## LLM Operability
+
+ManyForge exposes a full API surface for autonomous LLM agent operation:
+
+- **REST API** — FastAPI backend at `http://localhost:9000/api/`. See [`LLM_GUIDE.md`](LLM_GUIDE.md) for endpoint reference and composition patterns.
+- **MCP Server** — Model Context Protocol interface over stdio. See [`MCP_SCHEMA.md`](MCP_SCHEMA.md) for tool schemas.
+
+```bash
+# Start the MCP server
+python -m manyforge_composer --mcp --catalog-path /workspace/manyforge_behavior/resources/node_catalog.yaml
+```
+
 ## Docker Details
 
-The entrypoint (`docker-entrypoint.sh`) automatically:
+The container runs as a non-root user (`manyforge`, uid 1000). The entrypoint
+(`docker-entrypoint.sh`) automatically:
 - Sets `PYTHONPATH` for `manyforge_behavior` and `manyforge_hmi`
 - Builds pybind11 bindings if the C++ core library exists
 - Uses `/tmp/manyforge-build/` for out-of-tree builds (avoids conflicts with host build dirs)
+- Detects stale root-owned build cache volumes and asks you to remove them
 
 To rebuild the image after Dockerfile changes:
 
@@ -104,3 +123,18 @@ To rebuild from scratch (e.g. after RoboPlan update):
 rm -rf .docker/roboplan
 ./scripts/setup-docker.sh
 ```
+
+### Upgrading from root-based images
+
+Older images ran as root. After rebuilding with the current Dockerfile, the
+`build-cache` Docker volume may still contain root-owned files that the new
+non-root user cannot write to. If you see "Build cache not writable" on
+startup, run:
+
+```bash
+docker compose down -v
+```
+
+This removes the stale volume. The next container start will recreate it with
+the correct ownership. The C++ build cache will be rebuilt automatically (~2
+min).

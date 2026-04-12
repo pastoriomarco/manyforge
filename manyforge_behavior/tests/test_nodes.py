@@ -287,14 +287,30 @@ class TestAddCollisionObject:
 
 class TestRemoveCollisionObject:
     def test_success(self, kernel, bb_with_kernel):
+        kernel.scene_edit(
+            SceneEditRequest(
+                operation="add",
+                object_id="box1",
+                shape_type="box",
+                box_dimensions_m=[0.1, 0.1, 0.1],
+            )
+        )
         node = RemoveCollisionObject(name="remove_box", object_id="box1")
         status = _tick_node(node)
         assert status == py_trees.common.Status.SUCCESS
-        assert kernel.scene_edits[0].operation == "remove"
+        assert kernel.scene_edits[-1].operation == "remove"
 
 
 class TestUpdateCollisionObjectPose:
     def test_success(self, kernel, bb_with_kernel):
+        kernel.scene_edit(
+            SceneEditRequest(
+                operation="add",
+                object_id="box1",
+                shape_type="box",
+                box_dimensions_m=[0.1, 0.1, 0.1],
+            )
+        )
         node = UpdateCollisionObjectPose(
             name="update_box",
             object_id="box1",
@@ -303,7 +319,7 @@ class TestUpdateCollisionObjectPose:
         )
         status = _tick_node(node)
         assert status == py_trees.common.Status.SUCCESS
-        assert kernel.scene_edits[0].operation == "update_pose"
+        assert kernel.scene_edits[-1].operation == "update_pose"
 
 
 class TestAttachDetachObjectNodes:

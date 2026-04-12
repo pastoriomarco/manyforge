@@ -23,8 +23,15 @@ from manyforge_behavior.nodes.scene import (
     UpdateCollisionObjectPose,
 )
 from manyforge_behavior.nodes.control_flow import RepeatDecorator, RetryDecorator
+from manyforge_behavior.nodes.model import QueryModelNode
+from manyforge_behavior.nodes.recovery import FallbackOverrideNode, RecoverySkillNode
 from manyforge_behavior.parameters import ParameterResolver
-from manyforge_behavior.program import Program, TreeNode
+from manyforge_behavior.program import Program, TreeNode, tree_node_from_dict
+from manyforge_behavior.skill_loader import (
+    SkillCatalog,
+    default_skills_dir,
+    load_skill_catalog,
+)
 
 
 # Map catalog IDs to node constructors.
@@ -57,6 +64,8 @@ class OrchestratorRunner:
         deployment_path: Optional[str] = None,
         program: Optional[Program] = None,
         deployment: Optional["Deployment"] = None,
+        skill_catalog: Optional[SkillCatalog] = None,
+        event_recorder: Optional[Any] = None,
     ):
         self._catalog_path = catalog_path
         self._program_path = program_path
@@ -65,16 +74,36 @@ class OrchestratorRunner:
         self._deployment_path = deployment_path
         self._provided_program = program
         self._provided_deployment = deployment
+        self._provided_skill_catalog = skill_catalog
         self._catalog: Optional[NodeCatalog] = None
         self._program: Optional[Program] = None
         self._resolver: Optional[ParameterResolver] = None
         self._tree: Optional[py_trees.trees.BehaviourTree] = None
         self._deployment: Optional["Deployment"] = None
+        self._skill_catalog: Optional[SkillCatalog] = skill_catalog
+        self._event_recorder = event_recorder
+        # Intervention context — set by cycle_manager before building
+        # intervention subtrees so nodes like QueryModelNode can attribute
+        # audit events to the active session.
+        self._intervention_context: Optional[dict[str, str]] = None
 
     def load(self) -> None:
         """Load catalog, program, validate, set up parameter resolver."""
         self._catalog = NodeCatalog(self._catalog_path)
-        self._program = self._provided_program or Program(self._program_path, self._catalog)
+        if self._provided_skill_catalog is None:
+            self._skill_catalog = load_skill_catalog(
+                default_skills_dir(),
+                catalog=self._catalog,
+                strict=True,
+            )
+        if self._provided_program is not None:
+            self._program = self._provided_program
+        else:
+            self._program = Program(
+                self._program_path,
+                self._catalog,
+                skill_catalog=self._skill_catalog,
+            )
         self._resolver = ParameterResolver(
             self._program.get_parameter_defaults(),
             self._overrides,
@@ -193,8 +222,43 @@ class OrchestratorRunner:
     def deployment(self) -> Optional["Deployment"]:
         return self._deployment
 
+    @property
+    def skill_catalog(self) -> Optional[SkillCatalog]:
+        return self._skill_catalog
+
+    def _expand_tree_node(self, tree_node: TreeNode) -> TreeNode:
+        """Expand a skill invocation into a concrete subtree when needed."""
+        if self._skill_catalog is None or not self._skill_catalog.contains(tree_node.id):
+            return tree_node
+
+        resolved_params = self._resolver.resolve(tree_node.params)
+        expanded_dict = self._skill_catalog.expand_node_dict(
+            {
+                "id": tree_node.id,
+                "name": tree_node.name,
+                "params": resolved_params,
+                "children": [child.to_dict() for child in tree_node.children],
+            }
+        )
+        return tree_node_from_dict(expanded_dict)
+
+    def _make_skill_expander(self):
+        """Return a callable that expands a skill ID into a py_trees subtree."""
+        def _expand(skill_id: str, params: dict):
+            if self._skill_catalog is None:
+                return None
+            if not self._skill_catalog.contains(skill_id):
+                return None
+            expanded_dict = self._skill_catalog.expand_node_dict(
+                {"id": skill_id, "name": f"_recovery_{skill_id}", "params": params, "children": []}
+            )
+            recovery_tree_node = tree_node_from_dict(expanded_dict)
+            return self._build_node(recovery_tree_node)
+        return _expand
+
     def _build_node(self, tree_node: TreeNode) -> py_trees.behaviour.Behaviour:
         """Recursively build a py_trees node from a TreeNode."""
+        tree_node = self._expand_tree_node(tree_node)
         resolved_params = self._resolver.resolve(tree_node.params)
         children = [self._build_node(c) for c in tree_node.children]
 
@@ -246,6 +310,66 @@ class OrchestratorRunner:
                 )
             num_attempts = int(resolved_params.get("num_attempts", -1))
             return RetryDecorator(name=tree_node.name, child=children[0], num_attempts=num_attempts)
+        if tree_node.id == "fallback_override_node":
+            if not children:
+                raise ValueError(
+                    f"FallbackOverride '{tree_node.name}' requires exactly one child"
+                )
+            fallback_params = resolved_params.get("fallback_params", {})
+            max_retries = int(resolved_params.get("max_retries", 1))
+            return FallbackOverrideNode(
+                name=tree_node.name,
+                child=children[0],
+                fallback_params=fallback_params,
+                max_retries=max_retries,
+            )
+        if tree_node.id == "recovery_skill_node":
+            if not children:
+                raise ValueError(
+                    f"RecoverySkill '{tree_node.name}' requires exactly one child"
+                )
+            recovery_skill_id = resolved_params.get("recovery_skill_id", "")
+            recovery_params = resolved_params.get("recovery_params", {})
+            max_retries = int(resolved_params.get("max_retries", 1))
+            skill_expander = self._make_skill_expander()
+            return RecoverySkillNode(
+                name=tree_node.name,
+                child=children[0],
+                recovery_skill_id=recovery_skill_id,
+                recovery_params=recovery_params,
+                max_retries=max_retries,
+                skill_expander=skill_expander,
+            )
+        if tree_node.id == "query_model":
+            endpoint_alias = resolved_params.get("model_endpoint_alias", "")
+            template_id = resolved_params.get("prompt_template_id", "")
+            endpoint = None
+            template = None
+            audit_policy = None
+            if self._deployment is not None:
+                endpoint = self._deployment.model_endpoints.get(endpoint_alias)
+                template = self._deployment.prompt_templates.get(template_id)
+                audit_policy = self._deployment.model_audit_policy
+            event_recorder = self._event_recorder
+            # Thread intervention context (session_id, principal_id, run_id)
+            # into the node so audit events are correctly attributed.
+            ctx = self._intervention_context or {}
+            return QueryModelNode(
+                name=tree_node.name,
+                model_endpoint_alias=endpoint_alias,
+                prompt_template_id=template_id,
+                template_variables=resolved_params.get("template_variables", {}),
+                output_key_prefix=resolved_params.get("output_key_prefix", f"model/{tree_node.name}"),
+                timeout_s=float(resolved_params.get("timeout_s", 30.0)),
+                min_confidence=float(resolved_params.get("min_confidence", 0.0)),
+                endpoint=endpoint,
+                template=template,
+                event_recorder=event_recorder,
+                audit_policy=audit_policy,
+                run_id=ctx.get("run_id"),
+                session_id=ctx.get("session_id"),
+                principal_id=ctx.get("principal_id"),
+            )
         if tree_node.id == "timer":
             duration = float(resolved_params.get("duration_s", 1.0))
             return py_trees.timers.Timer(

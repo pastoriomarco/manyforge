@@ -17,6 +17,8 @@ from manyforge_behavior.kernel_client import (
     ExecutionStatus,
     ExecutionSnapshot,
     ObjectState,
+    SceneObjectSnapshot,
+    SceneShape,
     SceneEditRequest,
     SceneEditResult,
     Trajectory,
@@ -167,8 +169,53 @@ class NativeKernelClient(KernelClient):
             error=s.get("error"),
         )
 
+    def get_scene_object_ids(self) -> list[str]:
+        return list(self._bundle.get_scene_object_ids())
+
+    def get_joint_names(self) -> list[str]:
+        return list(self._bundle.get_joint_names())
+
+    def get_scene_objects(self) -> list[SceneObjectSnapshot]:
+        objects: list[SceneObjectSnapshot] = []
+        for object_data in self._bundle.get_scene_objects():
+            shape_data = object_data.get("shape")
+            shape = None
+            if shape_data is not None:
+                shape = SceneShape(
+                    type=shape_data["type"],
+                    box_dimensions_m=list(shape_data["box_dimensions_m"])
+                    if shape_data.get("box_dimensions_m") is not None
+                    else None,
+                    sphere_radius_m=shape_data.get("sphere_radius_m"),
+                    cylinder_radius_m=shape_data.get("cylinder_radius_m"),
+                    cylinder_height_m=shape_data.get("cylinder_height_m"),
+                    mesh_resource_uri=shape_data.get("mesh_resource_uri"),
+                    mesh_scale=list(shape_data["mesh_scale"])
+                    if shape_data.get("mesh_scale") is not None
+                    else None,
+                )
+            pose_in_universe = object_data.get("pose_in_universe")
+            if pose_in_universe is not None:
+                pose_in_universe = {
+                    "position_m": list(pose_in_universe["position_m"]),
+                    "orientation_xyzw": list(pose_in_universe["orientation_xyzw"]),
+                }
+            objects.append(
+                SceneObjectSnapshot(
+                    object_id=object_data["object_id"],
+                    shape=shape,
+                    pose_in_universe=pose_in_universe,
+                    attached=bool(object_data.get("attached", False)),
+                    frame_id=object_data.get("frame_id"),
+                )
+            )
+        return objects
+
     def get_metrics(self) -> Dict[str, int]:
         return dict(self._bundle.get_metrics())
+
+    def drain_kernel_events(self) -> list[dict]:
+        return list(self._bundle.drain_kernel_events())
 
     def get_scene_trace(self, limit: Optional[int] = None) -> list[dict]:
         return list(self._bundle.get_scene_trace(-1 if limit is None else int(limit)))
@@ -197,7 +244,10 @@ class NativeKernelClient(KernelClient):
         if request.frame_id:
             req_dict["frame_id"] = request.frame_id
 
-        result = self._bundle.scene_edit(req_dict)
+        try:
+            result = self._bundle.scene_edit(req_dict)
+        except Exception as exc:
+            return SceneEditResult(success=False, error=str(exc))
         return SceneEditResult(
             success=result.get("success", False),
             error=result.get("error"),

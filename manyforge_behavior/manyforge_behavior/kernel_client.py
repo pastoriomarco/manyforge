@@ -121,6 +121,26 @@ class SceneEditResult:
     error: Optional[str] = None
 
 
+@dataclass
+class SceneShape:
+    type: str
+    box_dimensions_m: Optional[List[float]] = None
+    sphere_radius_m: Optional[float] = None
+    cylinder_radius_m: Optional[float] = None
+    cylinder_height_m: Optional[float] = None
+    mesh_resource_uri: Optional[str] = None
+    mesh_scale: Optional[List[float]] = None
+
+
+@dataclass
+class SceneObjectSnapshot:
+    object_id: str
+    shape: Optional[SceneShape] = None
+    pose_in_universe: Optional[Dict[str, Any]] = None
+    attached: bool = False
+    frame_id: Optional[str] = None
+
+
 def _pose_to_matrix(pos: List[float], orient_xyzw: List[float]) -> List[List[float]]:
     """Build 4x4 matrix from position + quaternion (xyzw)."""
     x, y, z, w = orient_xyzw
@@ -184,6 +204,47 @@ def _invert_matrix(m: List[List[float]]) -> List[List[float]]:
     ]
 
 
+def _is_vector(values: Optional[List[float]], length: int) -> bool:
+    return values is not None and len(values) == length
+
+
+def _validate_scene_edit_request(request: SceneEditRequest) -> Optional[str]:
+    if not request.object_id:
+        return "object_id must not be empty"
+
+    if request.operation not in {"add", "remove", "update_pose", "attach", "detach"}:
+        return f"Unsupported scene edit operation: {request.operation}"
+
+    if request.operation == "add":
+        if request.shape_type not in {"box", "sphere"}:
+            return "add requires shape_type to be one of: box, sphere"
+        if request.shape_type == "box":
+            if not _is_vector(request.box_dimensions_m, 3):
+                return "add with shape_type=box requires box_dimensions_m=[x, y, z]"
+            if any(v <= 0.0 for v in request.box_dimensions_m):
+                return "box_dimensions_m values must be > 0"
+        if request.shape_type == "sphere":
+            if request.sphere_radius_m is None or request.sphere_radius_m <= 0.0:
+                return "add with shape_type=sphere requires sphere_radius_m > 0"
+        if request.pose_position_m is not None and not _is_vector(request.pose_position_m, 3):
+            return "pose_position_m must have exactly 3 elements"
+        if request.pose_orientation_xyzw is not None and not _is_vector(request.pose_orientation_xyzw, 4):
+            return "pose_orientation_xyzw must have exactly 4 elements"
+
+    if request.operation == "update_pose":
+        if request.pose_position_m is None:
+            return "update_pose requires pose_position_m"
+        if not _is_vector(request.pose_position_m, 3):
+            return "pose_position_m must have exactly 3 elements"
+        if request.pose_orientation_xyzw is not None and not _is_vector(request.pose_orientation_xyzw, 4):
+            return "pose_orientation_xyzw must have exactly 4 elements"
+
+    if request.operation == "attach" and not request.frame_id:
+        return "attach requires frame_id"
+
+    return None
+
+
 class KernelClient(ABC):
     @abstractmethod
     def execute(self, request: ExecuteRequest) -> ExecuteResult: ...
@@ -225,6 +286,11 @@ class KernelClient(ABC):
     @abstractmethod
     def get_object_state(self, object_id: str) -> ObjectState: ...
 
+    @abstractmethod
+    def get_scene_objects(self) -> list[SceneObjectSnapshot]:
+        """Return backend-authoritative scene objects with current shape and pose."""
+        ...
+
     def get_scene_trace(self, limit: Optional[int] = None) -> List[Dict[str, Any]]:
         """Return recent backend scene trace events, newest last."""
         return []
@@ -232,9 +298,32 @@ class KernelClient(ABC):
     def clear_scene_trace(self) -> None:
         """Clear any retained backend scene trace events."""
 
+    def drain_kernel_events(self) -> List[Dict[str, Any]]:
+        """Drain buffered native kernel events (returns and clears buffer).
+
+        Returns a list of event dicts with keys: type, execution_id,
+        timestamp_ns, and optionally from_state/to_state, error, details.
+        """
+        return []
+
     def get_cached_trajectory(self, move_id: str) -> Optional[Trajectory]:
         """Get cached trajectory for a move. Returns None if not available."""
         return None
+
+    @abstractmethod
+    def get_scene_object_ids(self) -> list[str]:
+        """Return IDs of all collision objects currently in the scene."""
+        ...
+
+    @abstractmethod
+    def get_joint_names(self) -> list[str]:
+        """Return ordered joint names for the active robot group."""
+        ...
+
+    @abstractmethod
+    def get_metrics(self) -> dict[str, int]:
+        """Return performance/diagnostic counters."""
+        ...
 
 
 class MockKernelClient(KernelClient):
@@ -246,7 +335,7 @@ class MockKernelClient(KernelClient):
             the duration elapses. Set to 0 (default) for instant completion in tests.
     """
 
-    def __init__(self, execute_duration_s: float = 0.0) -> None:
+    def __init__(self, execute_duration_s: float = 0.0, joint_names: Optional[List[str]] = None) -> None:
         self._state = ExecutionState.IDLE
         self._execution_id = 0
         self._active_move_id = ""
@@ -268,6 +357,51 @@ class MockKernelClient(KernelClient):
         self.fail_next_scene_edit = False
         self._objects: Dict[str, Dict[str, Any]] = {}
         self._scene_trace: Deque[Dict[str, Any]] = deque(maxlen=4096)
+        # Metrics counters
+        self._metrics = {
+            "cache_hits": 0,
+            "cache_misses": 0,
+            "cache_invalidations": 0,
+            "plans_succeeded": 0,
+            "plans_failed": 0,
+            "validations_passed": 0,
+            "validations_failed": 0,
+            "executions_completed": 0,
+            "executions_failed": 0,
+            "stops_issued": 0,
+            "collision_detections": 0,
+            "snapshots_published": 0,
+        }
+        # Joint names (configurable for tests)
+        self._joint_names = joint_names if joint_names is not None else ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6"]
+        # Kernel event buffer (mirrors C++ KernelEventCollector)
+        self._kernel_events: Deque[Dict[str, Any]] = deque(maxlen=4096)
+
+    def _emit_kernel_event(
+        self,
+        event_type: str,
+        *,
+        from_state: Optional[str] = None,
+        to_state: Optional[str] = None,
+        error: Optional[str] = None,
+    ) -> None:
+        event: Dict[str, Any] = {
+            "type": event_type,
+            "execution_id": self._execution_id,
+            "timestamp_ns": time.monotonic_ns(),
+        }
+        if from_state is not None:
+            event["from_state"] = from_state
+        if to_state is not None:
+            event["to_state"] = to_state
+        if error is not None:
+            event["error"] = {"code": -1, "message": error}
+        self._kernel_events.append(event)
+
+    def drain_kernel_events(self) -> List[Dict[str, Any]]:
+        events = list(self._kernel_events)
+        self._kernel_events.clear()
+        return events
 
     def _record_scene_trace(
         self,
@@ -303,22 +437,33 @@ class MockKernelClient(KernelClient):
         # Auto-reset from terminal states, matching C++ ExecutionKernel behavior
         terminal_states = {ExecutionState.COMPLETED, ExecutionState.FAILED, ExecutionState.STOPPED}
         if self._state in terminal_states:
+            prev = self._state.value
             self._state = ExecutionState.IDLE
+            self._emit_kernel_event("state_transition", from_state=prev, to_state="idle")
         if self._state != ExecutionState.IDLE:
             return ExecuteResult(ok=False, error="Not in IDLE state")
         if self.fail_next_execute:
             self.fail_next_execute = False
             self._state = ExecutionState.FAILED
+            self._metrics["executions_failed"] += 1
+            self._emit_kernel_event("state_transition", from_state="idle", to_state="failed")
+            self._emit_kernel_event("error_raised", error="Execution failed (injected)")
             return ExecuteResult(ok=False, error="Execution failed (injected)")
         eid = self._next_id
         self._next_id += 1
         self._execution_id = eid
         self._active_move_id = request.move_id
+        self._emit_kernel_event("plan_started")
         if self._execute_duration_s > 0:
             self._state = ExecutionState.EXECUTING
             self._execute_start = time.monotonic()
+            self._emit_kernel_event("state_transition", from_state="idle", to_state="executing")
+            self._emit_kernel_event("execute_started")
         else:
             self._state = ExecutionState.COMPLETED
+            self._metrics["executions_completed"] += 1
+            self._emit_kernel_event("state_transition", from_state="idle", to_state="completed")
+            self._emit_kernel_event("execute_completed")
         return ExecuteResult(ok=True, execution_id=eid)
 
     def stop(self) -> CommandResult:
@@ -332,7 +477,11 @@ class MockKernelClient(KernelClient):
         }
         if self._state not in stoppable:
             return CommandResult(accepted=False, error="Cannot stop from current state")
+        prev = self._state.value
+        self._metrics["stops_issued"] += 1
         self._state = ExecutionState.STOPPED
+        self._emit_kernel_event("stop_requested")
+        self._emit_kernel_event("state_transition", from_state=prev, to_state="stopped")
         return CommandResult(accepted=True)
 
     def pause(self) -> CommandResult:
@@ -342,6 +491,8 @@ class MockKernelClient(KernelClient):
                 accepted=False, error="Can only pause from EXECUTING"
             )
         self._state = ExecutionState.PAUSED
+        self._emit_kernel_event("pause_requested")
+        self._emit_kernel_event("state_transition", from_state="executing", to_state="paused")
         return CommandResult(accepted=True)
 
     def resume(self) -> CommandResult:
@@ -351,6 +502,8 @@ class MockKernelClient(KernelClient):
                 accepted=False, error="Can only resume from PAUSED"
             )
         self._state = ExecutionState.EXECUTING
+        self._emit_kernel_event("resume_requested")
+        self._emit_kernel_event("state_transition", from_state="paused", to_state="executing")
         return CommandResult(accepted=True)
 
     def reset(self) -> CommandResult:
@@ -359,8 +512,10 @@ class MockKernelClient(KernelClient):
             return CommandResult(
                 accepted=False, error="Already in IDLE"
             )
+        prev = self._state.value
         self._state = ExecutionState.IDLE
         self._active_move_id = ""
+        self._emit_kernel_event("state_transition", from_state=prev, to_state="idle")
         return CommandResult(accepted=True)
 
     def get_status(self) -> ExecutionStatus:
@@ -373,6 +528,9 @@ class MockKernelClient(KernelClient):
             if elapsed >= self._execute_duration_s:
                 self._state = ExecutionState.COMPLETED
                 self._execute_start = None
+                self._metrics["executions_completed"] += 1
+                self._emit_kernel_event("execute_completed")
+                self._emit_kernel_event("state_transition", from_state="executing", to_state="completed")
                 return ExecutionStatus(
                     state=self._state,
                     execution_id=self._execution_id,
@@ -397,6 +555,7 @@ class MockKernelClient(KernelClient):
         import time
         status = self.get_status()
         self._snapshot_sequence += 1
+        self._metrics["snapshots_published"] += 1
         return ExecutionSnapshot(
             timestamp_ns=time.monotonic_ns(),
             sequence_number=self._snapshot_sequence,
@@ -408,6 +567,7 @@ class MockKernelClient(KernelClient):
 
     def invalidate_trajectories(self) -> None:
         self.invalidate_count += 1
+        self._metrics["cache_invalidations"] += 1
 
     def scene_edit(self, request: SceneEditRequest) -> SceneEditResult:
         self.scene_edits.append(request)
@@ -427,21 +587,76 @@ class MockKernelClient(KernelClient):
                 error=error,
             )
             return SceneEditResult(success=False, error=error)
+        validation_error = _validate_scene_edit_request(request)
+        if validation_error is not None:
+            self._record_scene_trace(
+                event=request.operation,
+                object_id=request.object_id,
+                success=False,
+                frame_id=request.frame_id,
+                attached=state_before.attached if state_before.exists else None,
+                pose_in_frame=None,
+                pose_in_universe=pose_before,
+                error=validation_error,
+            )
+            return SceneEditResult(success=False, error=validation_error)
         error: Optional[str] = None
         if request.operation == "add":
+            if request.object_id in self._objects:
+                error = "Object already exists"
+                self._record_scene_trace(
+                    event=request.operation,
+                    object_id=request.object_id,
+                    success=False,
+                    frame_id=request.frame_id,
+                    attached=state_before.attached if state_before.exists else None,
+                    pose_in_frame=None,
+                    pose_in_universe=pose_before,
+                    error=error,
+                )
+                return SceneEditResult(success=False, error=error)
             self._objects[request.object_id] = {
+                "shape_type": request.shape_type,
+                "box_dimensions_m": list(request.box_dimensions_m or []) or None,
+                "sphere_radius_m": request.sphere_radius_m,
                 "position_m": list(request.pose_position_m or [0.0, 0.0, 0.0]),
                 "orientation_xyzw": list(request.pose_orientation_xyzw or [0.0, 0.0, 0.0, 1.0]),
                 "frame_id": request.frame_id or "universe",
             }
         elif request.operation == "update_pose":
-            tracked = self._objects.setdefault(request.object_id, {})
+            tracked = self._objects.get(request.object_id)
+            if tracked is None:
+                error = "Object not found"
+                self._record_scene_trace(
+                    event=request.operation,
+                    object_id=request.object_id,
+                    success=False,
+                    frame_id=request.frame_id,
+                    attached=state_before.attached if state_before.exists else None,
+                    pose_in_frame=None,
+                    pose_in_universe=pose_before,
+                    error=error,
+                )
+                return SceneEditResult(success=False, error=error)
             tracked["position_m"] = list(request.pose_position_m or [0.0, 0.0, 0.0])
             tracked["orientation_xyzw"] = list(
                 request.pose_orientation_xyzw or [0.0, 0.0, 0.0, 1.0]
             )
             tracked["frame_id"] = request.frame_id or tracked.get("frame_id", "universe")
         elif request.operation == "remove":
+            if request.object_id not in self._objects:
+                error = "Object not found"
+                self._record_scene_trace(
+                    event=request.operation,
+                    object_id=request.object_id,
+                    success=False,
+                    frame_id=request.frame_id,
+                    attached=state_before.attached if state_before.exists else None,
+                    pose_in_frame=None,
+                    pose_in_universe=pose_before,
+                    error=error,
+                )
+                return SceneEditResult(success=False, error=error)
             self._objects.pop(request.object_id, None)
         elif request.operation == "attach":
             tracked = self._objects.get(request.object_id)
@@ -551,6 +766,19 @@ class MockKernelClient(KernelClient):
                 tracked["position_m"] = local_pos
                 tracked["orientation_xyzw"] = local_orient
                 tracked["frame_id"] = target_frame
+        else:
+            error = f"Unsupported scene edit operation: {request.operation}"
+            self._record_scene_trace(
+                event=request.operation,
+                object_id=request.object_id,
+                success=False,
+                frame_id=request.frame_id,
+                attached=state_before.attached if state_before.exists else None,
+                pose_in_frame=None,
+                pose_in_universe=pose_before,
+                error=error,
+            )
+            return SceneEditResult(success=False, error=error)
         result = SceneEditResult(success=True)
         state_after = self.get_object_state(request.object_id)
         pose_in_frame = None
@@ -636,3 +864,42 @@ class MockKernelClient(KernelClient):
 
     def clear_scene_trace(self) -> None:
         self._scene_trace.clear()
+
+    def get_scene_objects(self) -> list[SceneObjectSnapshot]:
+        """Return authoritative object snapshots for the current mock scene."""
+        objects: list[SceneObjectSnapshot] = []
+        for object_id in sorted(self._objects):
+            tracked = self._objects[object_id]
+            shape = None
+            if tracked.get("shape_type") == "box":
+                shape = SceneShape(
+                    type="box",
+                    box_dimensions_m=list(tracked.get("box_dimensions_m") or []),
+                )
+            elif tracked.get("shape_type") == "sphere":
+                shape = SceneShape(
+                    type="sphere",
+                    sphere_radius_m=tracked.get("sphere_radius_m"),
+                )
+            objects.append(
+                SceneObjectSnapshot(
+                    object_id=object_id,
+                    shape=shape,
+                    pose_in_universe=self.get_object_pose(object_id, "universe"),
+                    attached=tracked.get("frame_id") not in {None, "universe", "base_link"},
+                    frame_id=tracked.get("frame_id"),
+                )
+            )
+        return objects
+
+    def get_scene_object_ids(self) -> list[str]:
+        """Return IDs of all collision objects currently in the scene."""
+        return [scene_object.object_id for scene_object in self.get_scene_objects()]
+
+    def get_joint_names(self) -> list[str]:
+        """Return ordered joint names for the active robot group."""
+        return self._joint_names
+
+    def get_metrics(self) -> dict[str, int]:
+        """Return performance/diagnostic counters."""
+        return dict(self._metrics)

@@ -36,6 +36,8 @@ def create_catalog_router(state: ComposerState) -> APIRouter:
                 childrenMin=entry.children_min,
                 childrenMax=entry.children_max,
                 parameters=params,
+                bbReaderParams=entry.bb_reader_params,
+                bbWriterParams=entry.bb_writer_params,
                 requiredCapabilities=entry.required_capabilities,
             ).model_dump(by_alias=True))
         return {
@@ -73,6 +75,8 @@ def create_catalog_router(state: ComposerState) -> APIRouter:
             childrenMin=entry.children_min,
             childrenMax=entry.children_max,
             parameters=params,
+            bbReaderParams=entry.bb_reader_params,
+            bbWriterParams=entry.bb_writer_params,
             requiredCapabilities=entry.required_capabilities,
         ).model_dump(by_alias=True)
     

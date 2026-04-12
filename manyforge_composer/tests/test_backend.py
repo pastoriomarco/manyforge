@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import time
 import pytest
 from pathlib import Path
 from fastapi.testclient import TestClient
@@ -9,12 +10,22 @@ from httpx import AsyncClient
 import httpx
 import asyncio
 import py_trees
+import yaml
 
 from manyforge_behavior.kernel_client import MockKernelClient, SceneEditRequest
+from manyforge_behavior.cycle_manager import CycleState
 from manyforge_composer.backend.state import ComposerState
 from manyforge_composer.backend.app import create_app
+from manyforge_composer.backend.security import SecurityConfig
 from manyforge_composer.__main__ import build_program_loaded_callback
 from manyforge_composer.backend import routes_filesystem
+
+# Test security config: no auth, permissive filesystem roots for tmp_path access
+_TEST_SECURITY = SecurityConfig(
+    cors_origins=["http://localhost:3000"],
+    api_token=None,
+    allowed_fs_roots=["/workspace", "/tmp"],
+)
 
 
 # Test fixture paths (relative to repo root, same as existing tests)
@@ -24,6 +35,25 @@ _PROGRAM_PATH = str(_REPO_ROOT / "manyforge_behavior" / "tests" / "fixtures" / "
 _DEPLOYMENT_PATH = str(_REPO_ROOT / "manyforge_behavior" / "tests" / "fixtures" / "ur5_roboplan.deployment.yaml")
 _EXAMPLE_PROGRAM_PATH = str(_REPO_ROOT / "examples" / "pick_and_place.program.yaml")
 _EXAMPLE_DEPLOYMENT_PATH = str(_REPO_ROOT / "examples" / "pick_and_place.deployment.yaml")
+
+
+def _write_program_with_runtime_policy(
+    tmp_path: Path,
+    *,
+    runtime_override: str = "llm_allowed",
+    persistent_edit: str = "human_approval",
+    intervention_delegate: str = "forbidden",
+) -> str:
+    data = yaml.safe_load(Path(_PROGRAM_PATH).read_text(encoding="utf-8"))
+    move_node = data["tree"]["children"][0]
+    move_node["modification_policy"] = {
+        "runtime_override": runtime_override,
+        "persistent_edit": persistent_edit,
+        "intervention_delegate": intervention_delegate,
+    }
+    target = tmp_path / "runtime_override.program.yaml"
+    target.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    return str(target)
 
 
 @pytest.fixture
@@ -36,7 +66,7 @@ def state():
 @pytest.fixture
 def client(state):
     """Create a TestClient for the app."""
-    app = create_app(state)
+    app = create_app(state, security=_TEST_SECURITY)
     return TestClient(app)
 
 
@@ -44,7 +74,7 @@ def make_client(execute_duration_s: float = 0.0) -> TestClient:
     """Create a TestClient with a configurable mock execution duration."""
     kernel = MockKernelClient(execute_duration_s=execute_duration_s)
     state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
-    app = create_app(state)
+    app = create_app(state, security=_TEST_SECURITY)
     return TestClient(app)
 
 
@@ -182,6 +212,15 @@ def test_catalog_entry(client):
     assert "kind" in data
 
 
+def test_catalog_entry_includes_blackboard_metadata(client):
+    """Catalog entry surfaces declared blackboard reader/writer parameter metadata."""
+    response = client.get("/api/catalog/set_key_bool_value")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["bbReaderParams"] == []
+    assert data["bbWriterParams"] == ["key"]
+
+
 def test_catalog_entry_not_found(client):
     """GET /api/catalog/nonexistent returns 404."""
     response = client.get("/api/catalog/nonexistent")
@@ -231,9 +270,9 @@ def test_file_browser_roots_skip_container_root_home(monkeypatch, tmp_path):
     monkeypatch.setattr(routes_filesystem.Path, "cwd", staticmethod(lambda: workspace))
     monkeypatch.setattr(routes_filesystem.Path, "home", staticmethod(lambda: Path("/root")))
 
-    roots = routes_filesystem._root_shortcuts()
+    allowed = [str(workspace), "/workspace"]
+    roots = routes_filesystem._root_shortcuts(allowed)
     assert str(workspace.resolve()) in roots
-    assert "/" in roots
     assert "/root" not in roots
 
 
@@ -255,9 +294,9 @@ def test_load_program(client, state):
 
 
 def test_load_program_invalid_path(client, state):
-    """POST with bad path returns 400."""
+    """POST with a path outside the allowlist returns 403."""
     response = client.post("/api/program/load", json={"path": "/nonexistent/path.yaml"})
-    assert response.status_code == 400
+    assert response.status_code == 403
 
 
 def test_get_program(client, state):
@@ -296,6 +335,662 @@ def test_get_program_tree(client, state):
     assert "children" in tree
 
 
+def test_get_program_tree_preserves_modification_policy(client, tmp_path):
+    program_path = _write_program_with_runtime_policy(tmp_path)
+    client.post("/api/program/load", json={"path": program_path})
+
+    response = client.get("/api/program/tree")
+    assert response.status_code == 200
+    move_node = response.json()["tree"]["children"][0]
+    assert move_node["modificationPolicy"]["runtime_override"] == "llm_allowed"
+
+
+def test_runtime_override_apply_updates_effective_tree_but_not_saved_artifact(client, tmp_path):
+    program_path = _write_program_with_runtime_policy(tmp_path)
+    client.post("/api/program/load", json={"path": program_path})
+
+    response = client.post(
+        "/api/program/runtime-overrides",
+        json={
+            "nodeName": "move_to_pick",
+            "params": {"planning_timeout_s": 3.5},
+            "authoritySource": "llm",
+            "approvalMode": "not_required",
+            "reason": "path planning degraded",
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["hasActive"] is True
+    assert data["currentTreeOrigin"] == "runtime_override"
+
+    runtime_tree = client.get("/api/program/tree").json()["tree"]
+    move_node = runtime_tree["children"][0]
+    assert move_node["params"]["planning_timeout_s"] == 3.5
+    assert move_node["modificationPolicy"]["runtime_override"] == "llm_allowed"
+
+    save_path = str(tmp_path / "saved_copy")
+    save_response = client.post("/api/program/save", json={"path": save_path})
+    assert save_response.status_code == 200
+    saved_yaml = yaml.safe_load(
+        Path(save_response.json()["path"]).read_text(encoding="utf-8")
+    )
+    assert saved_yaml["tree"]["children"][0]["params"]["planning_timeout_s"] == 2.0
+
+
+def test_runtime_override_requires_node_policy(client, tmp_path):
+    program_path = _write_program_with_runtime_policy(tmp_path, runtime_override="forbidden")
+    client.post("/api/program/load", json={"path": program_path})
+
+    response = client.post(
+        "/api/program/runtime-overrides",
+        json={
+            "nodeName": "move_to_pick",
+            "params": {"planning_timeout_s": 3.5},
+            "authoritySource": "llm",
+            "approvalMode": "not_required",
+        },
+    )
+    assert response.status_code == 409
+    assert "does not allow runtime overrides" in response.json()["detail"]
+
+
+def test_runtime_override_staged_in_direct_control_requires_reset_before_stopped_resume(tmp_path):
+    kernel = MockKernelClient()
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    app = create_app(state, security=_TEST_SECURITY)
+    program_path = _write_program_with_runtime_policy(tmp_path)
+
+    with TestClient(app) as client:
+        client.post("/api/program/load", json={"path": program_path})
+        state.cycle_manager._state = CycleState.DIRECT_CONTROL
+
+        response = client.post(
+            "/api/program/runtime-overrides",
+            json={
+                "nodeName": "move_to_pick",
+                "params": {"planning_timeout_s": 4.0},
+                "authoritySource": "llm",
+                "approvalMode": "not_required",
+            },
+        )
+        assert response.status_code == 200
+        assert response.json()["hasStaged"] is True
+        assert response.json()["hasActive"] is False
+
+        state.cycle_manager._state = CycleState.STOPPED
+        run_response = client.post("/api/cycle/run")
+        assert run_response.status_code == 409
+        assert "reset the cycle first" in run_response.json()["detail"]
+
+
+def test_runtime_override_activate_from_idle_promotes_staged_override(tmp_path):
+    kernel = MockKernelClient()
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    app = create_app(state, security=_TEST_SECURITY)
+    program_path = _write_program_with_runtime_policy(tmp_path)
+
+    with TestClient(app) as client:
+        client.post("/api/program/load", json={"path": program_path})
+        state.cycle_manager._state = CycleState.DIRECT_CONTROL
+        client.post(
+            "/api/program/runtime-overrides",
+            json={
+                "nodeName": "move_to_pick",
+                "params": {"planning_timeout_s": 4.0},
+                "authoritySource": "llm",
+                "approvalMode": "not_required",
+            },
+        )
+
+        state.cycle_manager._state = CycleState.IDLE
+        activate_response = client.post("/api/program/runtime-overrides/activate")
+        assert activate_response.status_code == 200
+        assert activate_response.json()["hasActive"] is True
+        assert activate_response.json()["hasStaged"] is False
+
+        runtime_tree = client.get("/api/program/tree").json()["tree"]
+        assert runtime_tree["children"][0]["params"]["planning_timeout_s"] == 4.0
+
+
+def test_runtime_override_materialized_tree_supports_staged_view(tmp_path):
+    kernel = MockKernelClient()
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    app = create_app(state, security=_TEST_SECURITY)
+    program_path = _write_program_with_runtime_policy(tmp_path)
+
+    with TestClient(app) as client:
+        client.post("/api/program/load", json={"path": program_path})
+        state.cycle_manager._state = CycleState.DIRECT_CONTROL
+        client.post(
+            "/api/program/runtime-overrides",
+            json={
+                "nodeName": "move_to_pick",
+                "params": {"planning_timeout_s": 4.0},
+                "authoritySource": "llm",
+                "approvalMode": "not_required",
+            },
+        )
+
+        current_tree = client.get("/api/program/runtime-overrides/materialized-tree").json()["tree"]
+        staged_tree = client.get(
+            "/api/program/runtime-overrides/materialized-tree",
+            params={"includeStaged": "true"},
+        ).json()["tree"]
+
+        assert current_tree["children"][0]["params"]["planning_timeout_s"] == 2.0
+        assert staged_tree["children"][0]["params"]["planning_timeout_s"] == 4.0
+
+
+def test_runtime_override_promote_loaded_program_materializes_and_clears_ledger(client, tmp_path):
+    program_path = _write_program_with_runtime_policy(tmp_path)
+    client.post("/api/program/load", json={"path": program_path})
+
+    client.post(
+        "/api/program/runtime-overrides",
+        json={
+            "nodeName": "move_to_pick",
+            "params": {"planning_timeout_s": 3.5},
+            "authoritySource": "llm",
+            "approvalMode": "not_required",
+        },
+    )
+
+    response = client.post(
+        "/api/program/runtime-overrides/promote",
+        json={"target": "loaded_program"},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["runtimeOverrideStatus"]["hasActive"] is False
+    assert data["tree"]["children"][0]["params"]["planning_timeout_s"] == 3.5
+
+    runtime_tree = client.get("/api/program/tree").json()["tree"]
+    assert runtime_tree["children"][0]["params"]["planning_timeout_s"] == 3.5
+
+
+def test_runtime_override_promote_loaded_program_rejects_dropping_staged_overrides(tmp_path):
+    kernel = MockKernelClient()
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    app = create_app(state, security=_TEST_SECURITY)
+    program_path = _write_program_with_runtime_policy(tmp_path)
+
+    with TestClient(app) as client:
+        client.post("/api/program/load", json={"path": program_path})
+        state.cycle_manager._state = CycleState.DIRECT_CONTROL
+        client.post(
+            "/api/program/runtime-overrides",
+            json={
+                "nodeName": "move_to_pick",
+                "params": {"planning_timeout_s": 4.0},
+                "authoritySource": "llm",
+                "approvalMode": "not_required",
+            },
+        )
+
+        state.cycle_manager._state = CycleState.STOPPED
+        response = client.post(
+            "/api/program/runtime-overrides/promote",
+            json={"target": "loaded_program"},
+        )
+        assert response.status_code == 409
+        assert "include staged overrides" in response.json()["detail"]
+
+
+def test_runtime_override_promote_save_requires_persistent_edit_policy(client, tmp_path):
+    program_path = _write_program_with_runtime_policy(
+        tmp_path,
+        persistent_edit="forbidden",
+    )
+    client.post("/api/program/load", json={"path": program_path})
+    client.post(
+        "/api/program/runtime-overrides",
+        json={
+            "nodeName": "move_to_pick",
+            "params": {"planning_timeout_s": 3.5},
+            "authoritySource": "llm",
+            "approvalMode": "not_required",
+        },
+    )
+
+    response = client.post(
+        "/api/program/runtime-overrides/promote",
+        json={
+            "target": "save",
+            "path": str(tmp_path / "saved_materialized"),
+            "includeStaged": False,
+            "authoritySource": "llm",
+            "approvalMode": "not_required",
+        },
+    )
+    assert response.status_code == 409
+    assert "does not allow persistent edits" in response.json()["detail"]
+
+
+def test_runtime_override_promote_save_materializes_to_disk_with_explicit_authority(client, tmp_path):
+    program_path = _write_program_with_runtime_policy(
+        tmp_path,
+        persistent_edit="llm_allowed",
+    )
+    client.post("/api/program/load", json={"path": program_path})
+    client.post(
+        "/api/program/runtime-overrides",
+        json={
+            "nodeName": "move_to_pick",
+            "params": {"planning_timeout_s": 3.5},
+            "authoritySource": "llm",
+            "approvalMode": "not_required",
+        },
+    )
+
+    response = client.post(
+        "/api/program/runtime-overrides/promote",
+        json={
+            "target": "save",
+            "path": str(tmp_path / "saved_materialized"),
+            "authoritySource": "llm",
+            "approvalMode": "not_required",
+        },
+    )
+    assert response.status_code == 200
+    saved_path = Path(response.json()["path"])
+    saved_yaml = yaml.safe_load(saved_path.read_text(encoding="utf-8"))
+    assert saved_yaml["tree"]["children"][0]["params"]["planning_timeout_s"] == 3.5
+    status = client.get("/api/program/runtime-overrides").json()
+    assert status["hasActive"] is True
+
+
+# =============================================================================
+# Runtime Override Revision Binding Tests (OP-5)
+# =============================================================================
+
+
+def test_runtime_override_status_includes_base_program_hash(client, tmp_path):
+    program_path = _write_program_with_runtime_policy(tmp_path)
+    client.post("/api/program/load", json={"path": program_path})
+
+    response = client.post(
+        "/api/program/runtime-overrides",
+        json={
+            "nodeName": "move_to_pick",
+            "params": {"planning_timeout_s": 3.5},
+            "authoritySource": "llm",
+            "approvalMode": "not_required",
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert "baseProgramHash" in data
+    assert len(data["baseProgramHash"]) == 64
+    assert data["active"][0]["baseProgramHash"] == data["baseProgramHash"]
+    assert data["active"][0]["isStale"] is False
+    assert data["staleCount"] == 0
+    assert data["hasStale"] is False
+
+
+def test_load_program_rejects_when_overrides_exist(client, tmp_path):
+    program_path = _write_program_with_runtime_policy(tmp_path)
+    client.post("/api/program/load", json={"path": program_path})
+
+    client.post(
+        "/api/program/runtime-overrides",
+        json={
+            "nodeName": "move_to_pick",
+            "params": {"planning_timeout_s": 3.5},
+            "authoritySource": "llm",
+            "approvalMode": "not_required",
+        },
+    )
+
+    response = client.post("/api/program/load", json={"path": program_path})
+    assert response.status_code == 409
+    assert "runtime overrides exist" in response.json()["detail"].lower()
+
+
+def test_load_program_with_force_discard_overrides(client, tmp_path):
+    program_path = _write_program_with_runtime_policy(tmp_path)
+    client.post("/api/program/load", json={"path": program_path})
+
+    client.post(
+        "/api/program/runtime-overrides",
+        json={
+            "nodeName": "move_to_pick",
+            "params": {"planning_timeout_s": 3.5},
+            "authoritySource": "llm",
+            "approvalMode": "not_required",
+        },
+    )
+
+    response = client.post(
+        "/api/program/load",
+        json={"path": program_path, "forceDiscardOverrides": True},
+    )
+    assert response.status_code == 200
+
+    status = client.get("/api/program/runtime-overrides").json()
+    assert status["activeCount"] == 0
+
+
+def test_update_tree_rejects_when_overrides_exist(client, tmp_path):
+    program_path = _write_program_with_runtime_policy(tmp_path)
+    client.post("/api/program/load", json={"path": program_path})
+    original_tree = client.get("/api/program/tree").json()["tree"]
+
+    client.post(
+        "/api/program/runtime-overrides",
+        json={
+            "nodeName": "move_to_pick",
+            "params": {"planning_timeout_s": 3.5},
+            "authoritySource": "llm",
+            "approvalMode": "not_required",
+        },
+    )
+
+    modified_tree = dict(original_tree)
+    modified_tree["params"] = {"new_param": True}
+    response = client.put(
+        "/api/program/tree",
+        json={"tree": modified_tree, "forceDiscardOverrides": False},
+    )
+    assert response.status_code == 409
+    assert "runtime overrides exist" in response.json()["detail"].lower()
+
+
+def test_update_tree_with_force_discard_overrides(client, tmp_path):
+    program_path = _write_program_with_runtime_policy(tmp_path)
+    client.post("/api/program/load", json={"path": program_path})
+    original_tree = client.get("/api/program/tree").json()["tree"]
+
+    client.post(
+        "/api/program/runtime-overrides",
+        json={
+            "nodeName": "move_to_pick",
+            "params": {"planning_timeout_s": 3.5},
+            "authoritySource": "llm",
+            "approvalMode": "not_required",
+        },
+    )
+
+    response = client.put(
+        "/api/program/tree",
+        json={"tree": original_tree, "forceDiscardOverrides": True},
+    )
+    assert response.status_code == 200
+
+    status = client.get("/api/program/runtime-overrides").json()
+    assert status["activeCount"] == 0
+
+
+def test_runtime_override_revalidate_endpoint_no_stale(client, tmp_path):
+    program_path = _write_program_with_runtime_policy(tmp_path)
+    client.post("/api/program/load", json={"path": program_path})
+
+    client.post(
+        "/api/program/runtime-overrides",
+        json={
+            "nodeName": "move_to_pick",
+            "params": {"planning_timeout_s": 3.5},
+            "authoritySource": "llm",
+            "approvalMode": "not_required",
+        },
+    )
+
+    response = client.post("/api/program/runtime-overrides/revalidate")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["staleCount"] == 0
+
+
+def test_stale_override_detected_after_hash_change(tmp_path):
+    """Simulate a program change by mutating _program_tree_hash; override becomes stale."""
+    kernel = MockKernelClient()
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    app = create_app(state, security=_TEST_SECURITY)
+    program_path = _write_program_with_runtime_policy(tmp_path)
+
+    with TestClient(app) as client:
+        client.post("/api/program/load", json={"path": program_path})
+
+        client.post(
+            "/api/program/runtime-overrides",
+            json={
+                "nodeName": "move_to_pick",
+                "params": {"planning_timeout_s": 3.5},
+                "authoritySource": "llm",
+                "approvalMode": "not_required",
+            },
+        )
+
+        status = client.get("/api/program/runtime-overrides").json()
+        assert status["hasStale"] is False
+        original_hash = status["baseProgramHash"]
+
+        # Simulate a program change by mutating the hash.
+        state._program_tree_hash = "0" * 64
+
+        status = client.get("/api/program/runtime-overrides").json()
+        assert status["hasStale"] is True
+        assert status["staleCount"] == 1
+        assert status["stale"][0]["nodeName"] == "move_to_pick"
+        assert status["stale"][0]["isStale"] is True
+        assert status["stale"][0]["baseProgramHash"] == original_hash
+        assert status["canActivateNow"] is False
+
+
+def test_stale_override_blocks_materialized_tree(tmp_path):
+    """Stale overrides prevent materialized-tree preview."""
+    kernel = MockKernelClient()
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    app = create_app(state, security=_TEST_SECURITY)
+    program_path = _write_program_with_runtime_policy(tmp_path)
+
+    with TestClient(app) as client:
+        client.post("/api/program/load", json={"path": program_path})
+
+        client.post(
+            "/api/program/runtime-overrides",
+            json={
+                "nodeName": "move_to_pick",
+                "params": {"planning_timeout_s": 3.5},
+                "authoritySource": "llm",
+                "approvalMode": "not_required",
+            },
+        )
+
+        state._program_tree_hash = "0" * 64
+
+        response = client.get("/api/program/runtime-overrides/materialized-tree")
+        assert response.status_code == 404
+        assert "stale" in response.json()["detail"].lower()
+
+
+def test_stale_override_revalidation_succeeds(tmp_path):
+    """Revalidation updates the hash when the override is still valid."""
+    kernel = MockKernelClient()
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    app = create_app(state, security=_TEST_SECURITY)
+    program_path = _write_program_with_runtime_policy(tmp_path)
+
+    with TestClient(app) as client:
+        client.post("/api/program/load", json={"path": program_path})
+
+        client.post(
+            "/api/program/runtime-overrides",
+            json={
+                "nodeName": "move_to_pick",
+                "params": {"planning_timeout_s": 3.5},
+                "authoritySource": "llm",
+                "approvalMode": "not_required",
+            },
+        )
+
+        original_hash = state._program_tree_hash
+
+        # Force-discard overrides and reload the same program to get a new
+        # tree hash that is identical to the original.  Then re-apply the
+        # override and simulate a hash change followed by reverting to the
+        # real hash so the node still exists and validates.
+        client.post(
+            "/api/program/runtime-overrides/clear",
+        )
+        client.post("/api/program/load", json={"path": program_path})
+        client.post(
+            "/api/program/runtime-overrides",
+            json={
+                "nodeName": "move_to_pick",
+                "params": {"planning_timeout_s": 3.5},
+                "authoritySource": "llm",
+                "approvalMode": "not_required",
+            },
+        )
+
+        # Simulate staleness then restore the real hash (like loading a
+        # compatible program revision).
+        state._program_tree_hash = "0" * 64
+        assert state._has_stale_overrides()
+
+        # Restore real hash so the node exists and override validates.
+        state._program_tree_hash = original_hash
+        # The override still has its old hash from apply time which equals
+        # original_hash, so it is NOT stale now.  To test revalidation we
+        # must make the override hash differ from current.
+        for record in state._runtime_overrides.values():
+            record.base_program_hash = "0" * 64
+
+        response = client.post("/api/program/runtime-overrides/revalidate")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["revalidation_results"]["move_to_pick"] == "revalidated"
+        assert data["staleCount"] == 0
+        assert data["activeCount"] == 1
+        assert data["active"][0]["baseProgramHash"] == original_hash
+
+
+def test_stale_override_invalidation_removes_from_ledger(tmp_path):
+    """Revalidation removes overrides whose target node no longer exists."""
+    kernel = MockKernelClient()
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    app = create_app(state, security=_TEST_SECURITY)
+    program_path = _write_program_with_runtime_policy(tmp_path)
+
+    with TestClient(app) as client:
+        client.post("/api/program/load", json={"path": program_path})
+
+        client.post(
+            "/api/program/runtime-overrides",
+            json={
+                "nodeName": "move_to_pick",
+                "params": {"planning_timeout_s": 3.5},
+                "authoritySource": "llm",
+                "approvalMode": "not_required",
+            },
+        )
+
+        # Simulate staleness.
+        for record in state._runtime_overrides.values():
+            record.base_program_hash = "0" * 64
+        # Also rename the node in the tree so it can't be found.
+        state.program.tree.children[0].name = "renamed_node"
+
+        response = client.post("/api/program/runtime-overrides/revalidate")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["revalidation_results"]["move_to_pick"] == "invalid"
+        assert data["activeCount"] == 0
+        assert data["staleCount"] == 0
+
+
+def test_force_discard_overrides_unconditional_same_tree(client, tmp_path):
+    """forceDiscardOverrides=true clears overrides even when the tree is unchanged."""
+    program_path = _write_program_with_runtime_policy(tmp_path)
+    client.post("/api/program/load", json={"path": program_path})
+    original_tree = client.get("/api/program/tree").json()["tree"]
+
+    client.post(
+        "/api/program/runtime-overrides",
+        json={
+            "nodeName": "move_to_pick",
+            "params": {"planning_timeout_s": 3.5},
+            "authoritySource": "llm",
+            "approvalMode": "not_required",
+        },
+    )
+
+    # Re-apply the same tree with forceDiscardOverrides.
+    response = client.put(
+        "/api/program/tree",
+        json={"tree": original_tree, "forceDiscardOverrides": True},
+    )
+    assert response.status_code == 200
+
+    status = client.get("/api/program/runtime-overrides").json()
+    assert status["activeCount"] == 0
+    assert status["hasActive"] is False
+
+
+def test_validate_program_tree_accepts_current_tree(client):
+    client.post("/api/program/load", json={"path": _PROGRAM_PATH})
+    current_tree = client.get("/api/program/tree").json()["tree"]
+
+    response = client.post("/api/program/validate", json={"tree": current_tree})
+    assert response.status_code == 200
+    data = response.json()
+    assert data["valid"] is True
+    assert data["errors"] == []
+
+
+def test_validate_program_tree_reports_structural_errors(client):
+    bad_tree = {
+        "id": "sequence",
+        "name": "root",
+        "children": [
+            {
+                "id": "nonexistent_node",
+                "name": "bad_child",
+            },
+        ],
+    }
+
+    response = client.post("/api/program/validate", json={"tree": bad_tree})
+    assert response.status_code == 200
+    data = response.json()
+    assert data["valid"] is False
+    assert data["errors"]
+    assert data["errors"][0]["path"] == "tree.children[0]"
+    assert "Unknown catalog entry" in data["errors"][0]["message"]
+
+
+def test_validate_program_tree_reports_parameter_errors(client):
+    client.post("/api/program/load", json={"path": _PROGRAM_PATH})
+    bad_tree = {
+        "id": "sequence",
+        "name": "root",
+        "children": [
+            {
+                "id": "move_manipulator_action",
+                "name": "bad_move",
+                "params": {
+                    "move_id": "pick",
+                    "motion_type": "joint_goal",
+                    "joint_goal_names": ["j1"],
+                    "joint_goal_positions_rad": [0.1],
+                    "velocity_scale": -0.1,
+                },
+            },
+        ],
+    }
+
+    response = client.post("/api/program/validate", json={"tree": bad_tree})
+    assert response.status_code == 200
+    data = response.json()
+    assert data["valid"] is False
+    assert any(
+        error["path"] == "tree.children[0].params.velocity_scale"
+        and "must be > 0.0" in error["message"]
+        for error in data["errors"]
+    )
+
+
 def test_get_saved_program_tree_reflects_disk_not_applied_runtime(client):
     """GET /api/program/saved/tree returns the on-disk artifact even after an unsaved apply."""
     client.post("/api/program/load", json={"path": _PROGRAM_PATH})
@@ -329,6 +1024,11 @@ def test_get_deployment_not_loaded(client):
     assert response.status_code == 404
 
 
+def test_get_capabilities_requires_loaded_deployment(client):
+    response = client.get("/api/capabilities")
+    assert response.status_code == 404
+
+
 def test_load_deployment(client, state):
     """POST /api/deployment/load with valid path, verify response."""
     response = client.post("/api/deployment/load", json={"path": _DEPLOYMENT_PATH})
@@ -338,6 +1038,46 @@ def test_load_deployment(client, state):
     assert "description" in data
     assert "programProfile" in data
     assert "robotConfig" in data
+
+
+def test_get_capabilities_returns_deployment_capability_summary(client):
+    client.post("/api/program/load", json={"path": _PROGRAM_PATH, "deployment_path": _DEPLOYMENT_PATH})
+
+    response = client.get("/api/capabilities")
+    assert response.status_code == 200
+    data = response.json()
+    assert "planning.motion.joint_goal" in data["planning"]
+    assert "context.state.current" in data["context"]
+    assert "scene.edit.add" in data["scene"]
+    assert "execution.trajectory.execute" in data["execution"]
+    assert data["sensing"] == []
+    assert data["contactTier"] == "unsupported"
+    assert data["adapterIds"]["planning"] == "planning.roboplan"
+    assert data["programProfile"] == "v0.0"
+    assert data["timestampNs"] > 0
+
+
+def test_get_skills_returns_catalog(client):
+    """GET /api/skills returns the skill catalog with at least the default skills."""
+    response = client.get("/api/skills")
+    assert response.status_code == 200
+    data = response.json()
+    assert "skills" in data
+    assert len(data["skills"]) >= 3
+    skill_ids = [s["id"] for s in data["skills"]]
+    assert "pick_object" in skill_ids
+    assert "place_object" in skill_ids
+    assert "move_to_named_config" in skill_ids
+
+    pick = next(s for s in data["skills"] if s["id"] == "pick_object")
+    assert pick["compatibleProfiles"] == ["v0.0"]
+    assert len(pick["requires"]) > 0
+    assert len(pick["provides"]) > 0
+    assert len(pick["requiresCapabilities"]) > 0
+    assert len(pick["parameters"]) >= 1
+    assert "expandsTo" in pick
+    assert pick["expandsTo"]["id"] == "sequence"
+    assert data["timestampNs"] > 0
 
 
 def test_get_full_deployment(client):
@@ -452,14 +1192,16 @@ def test_save_deployment(client, state):
         assert response.status_code == 200
         data = response.json()
         assert data["status"] == "ok"
-        assert data["path"] == tmp_path
+        saved_path = data["path"]
+        assert saved_path.endswith(".deployment.yaml")
+        assert saved_path == f"{tmp_path}.deployment.yaml"
         
         # Verify file exists
-        assert os.path.exists(tmp_path)
+        assert os.path.exists(saved_path)
         
         # Verify it's valid YAML
         import yaml
-        with open(tmp_path) as f:
+        with open(saved_path) as f:
             saved_data = yaml.safe_load(f)
         
         assert saved_data["api_version"] == "manyforge.deployment.v0"
@@ -470,6 +1212,9 @@ def test_save_deployment(client, state):
     finally:
         if os.path.exists(tmp_path):
             os.unlink(tmp_path)
+        suffixed_path = f"{tmp_path}.deployment.yaml"
+        if os.path.exists(suffixed_path):
+            os.unlink(suffixed_path)
 
 
 def test_save_deployment_payload_does_not_apply_runtime_state(client):
@@ -486,16 +1231,21 @@ def test_save_deployment_payload_does_not_apply_runtime_state(client):
     try:
       response = client.post("/api/deployment/save", json={"path": tmp_path, "deployment": modified})
       assert response.status_code == 200
+      saved_path = response.json()["path"]
+      assert saved_path == f"{tmp_path}.deployment.yaml"
 
       current = client.get("/api/deployment/full").json()
       assert current["name"] == original["name"]
 
-      with open(tmp_path) as f:
+      with open(saved_path) as f:
           saved_data = yaml.safe_load(f)
       assert saved_data["name"] == "saved_only_deployment"
     finally:
       if os.path.exists(tmp_path):
           os.unlink(tmp_path)
+      suffixed_path = f"{tmp_path}.deployment.yaml"
+      if os.path.exists(suffixed_path):
+          os.unlink(suffixed_path)
 
 
 # =============================================================================
@@ -511,6 +1261,8 @@ def test_ws_state_receives_update(state):
             message = ws.receive_json()
             assert "state" in message
             assert "velocityScale" in message
+            assert "kernelEvents" in message
+            assert isinstance(message["kernelEvents"], list)
             assert "timestamp" in message
 
 
@@ -580,14 +1332,16 @@ def test_save_program(client, state):
         assert response.status_code == 200
         data = response.json()
         assert data["status"] == "ok"
-        assert data["path"] == tmp_path
+        saved_path = data["path"]
+        assert saved_path.endswith(".program.yaml")
+        assert saved_path == f"{tmp_path}.program.yaml"
         
         # Verify file exists
-        assert os.path.exists(tmp_path)
+        assert os.path.exists(saved_path)
         
         # Verify it's valid YAML
         import yaml
-        with open(tmp_path) as f:
+        with open(saved_path) as f:
             saved_data = yaml.safe_load(f)
         
         assert saved_data["api_version"] == "manyforge.program.v0"
@@ -596,6 +1350,9 @@ def test_save_program(client, state):
     finally:
         if os.path.exists(tmp_path):
             os.unlink(tmp_path)
+        suffixed_path = f"{tmp_path}.program.yaml"
+        if os.path.exists(suffixed_path):
+            os.unlink(suffixed_path)
 
 
 def test_save_program_tree_payload_does_not_apply_runtime_state(client):
@@ -621,16 +1378,21 @@ def test_save_program_tree_payload_does_not_apply_runtime_state(client):
     try:
         response = client.post("/api/program/save", json={"path": tmp_path, "tree": modified_tree})
         assert response.status_code == 200
+        saved_path = response.json()["path"]
+        assert saved_path == f"{tmp_path}.program.yaml"
 
         current_tree = client.get("/api/program/tree").json()["tree"]
         assert current_tree == original_tree
 
-        with open(tmp_path) as f:
+        with open(saved_path) as f:
             saved_data = yaml.safe_load(f)
         assert saved_data["tree"]["name"] == "saved_only_sequence"
     finally:
         if os.path.exists(tmp_path):
             os.unlink(tmp_path)
+        suffixed_path = f"{tmp_path}.program.yaml"
+        if os.path.exists(suffixed_path):
+            os.unlink(suffixed_path)
 
 
 def test_apply_session_updates_program_and_deployment_together(client):
@@ -895,3 +1657,404 @@ def test_debug_scene_trace_endpoint_returns_backend_and_hmi_observability():
     assert data["hmi"][0]["event"] == "reconcile_render"
     assert data["objects"]
     assert "table" in data["objects"]
+
+
+def test_scene_snapshot_returns_503_without_hmi():
+    """GET /api/scene/snapshot returns 503 when HMI is not running."""
+    kernel = MockKernelClient()
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    app = create_app(state)
+    with TestClient(app) as client:
+        response = client.get("/api/scene/snapshot")
+    assert response.status_code == 503
+    assert "HMI server not running" in response.json()["detail"]
+
+
+def test_scene_snapshot_returns_503_without_client():
+    """GET /api/scene/snapshot returns 503 when no Viser client is connected."""
+    kernel = MockKernelClient()
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+
+    class MockHmi:
+        def render_scene(self, width=640, height=480, format="jpeg"):
+            return None  # No client connected
+
+    state.hmi_server = MockHmi()
+    app = create_app(state)
+    with TestClient(app) as client:
+        response = client.get("/api/scene/snapshot")
+    assert response.status_code == 503
+    assert "No Viser client" in response.json()["detail"]
+
+
+def test_scene_snapshot_returns_image():
+    """GET /api/scene/snapshot returns JPEG image bytes when HMI renders."""
+    kernel = MockKernelClient()
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+
+    # Create a minimal valid JPEG (1x1 pixel)
+    import io
+    from PIL import Image
+    img = Image.new("RGB", (1, 1), color=(128, 128, 128))
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG")
+    fake_jpeg = buf.getvalue()
+
+    class MockHmi:
+        def render_scene(self, width=640, height=480, format="jpeg"):
+            return fake_jpeg
+
+    state.hmi_server = MockHmi()
+    app = create_app(state)
+    with TestClient(app) as client:
+        response = client.get("/api/scene/snapshot?width=320&height=240&format=jpeg")
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "image/jpeg"
+    assert len(response.content) > 0
+
+
+# =============================================================================
+# Direct Control / Intervention Tests
+# =============================================================================
+
+def test_direct_execute_no_program_409(client):
+    """POST /api/direct/execute returns 409 when no program loaded."""
+    response = client.post("/api/direct/execute", json={
+        "tree": {"id": "timer", "name": "t", "params": {"duration_s": 0.01}, "children": []},
+        "principalId": "human:test-operator",
+    })
+    assert response.status_code == 409
+
+
+def test_direct_status_no_program_409(client):
+    """GET /api/direct/status returns 409 when no program loaded."""
+    response = client.get("/api/direct/status")
+    assert response.status_code == 409
+
+
+def test_direct_abort_no_program_409(client):
+    """POST /api/direct/abort returns 409 when no program loaded."""
+    response = client.post("/api/direct/abort")
+    assert response.status_code == 409
+
+
+def test_direct_status_no_session_404():
+    """GET /api/direct/status returns 404 when no intervention has run."""
+    kernel = MockKernelClient()
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    app = create_app(state, security=_TEST_SECURITY)
+    with TestClient(app) as client:
+        client.post("/api/program/load", json={"path": _PROGRAM_PATH})
+        response = client.get("/api/direct/status")
+    assert response.status_code == 404
+
+
+def test_direct_pending_recovery_404_when_no_request():
+    kernel = MockKernelClient()
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    app = create_app(state, security=_TEST_SECURITY)
+    with TestClient(app) as client:
+        client.post("/api/program/load", json={"path": _PROGRAM_PATH})
+        response = client.get("/api/direct/pending-recovery")
+    assert response.status_code == 404
+
+
+def test_delegated_recovery_request_created_on_node_failure(tmp_path):
+    kernel = MockKernelClient()
+    kernel.fail_next_execute = True
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    app = create_app(state, security=_TEST_SECURITY)
+    program_path = _write_program_with_runtime_policy(
+        tmp_path,
+        intervention_delegate="llm_allowed",
+        persistent_edit="llm_allowed",
+    )
+    with TestClient(app) as client:
+        client.post("/api/program/load", json={"path": program_path})
+        client.post("/api/cycle/run")
+        time.sleep(0.2)
+
+        pending = client.get("/api/direct/pending-recovery")
+        assert pending.status_code == 200
+        data = pending.json()
+        assert data["triggerNodeInstance"] == "move_to_pick"
+        assert data["triggerReason"] == "execute_failed"
+        assert data["delegatePolicy"] == "llm_allowed"
+        assert data["allowedAuthoritySources"] == ["human", "llm"]
+        assert "runtime_override" in data["allowedActions"]
+        assert "draft_patch" in data["allowedActions"]
+
+        digest = client.get("/api/execution/digest").json()
+        assert digest["state"] == "stopped"
+        assert digest["delegatedRecoveryRequest"]["triggerNodeInstance"] == "move_to_pick"
+
+
+def test_direct_execute_delegated_recovery_consumes_pending_request(tmp_path):
+    kernel = MockKernelClient()
+    kernel.fail_next_execute = True
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    app = create_app(state, security=_TEST_SECURITY)
+    program_path = _write_program_with_runtime_policy(
+        tmp_path,
+        intervention_delegate="llm_allowed",
+    )
+    with TestClient(app) as client:
+        client.post("/api/program/load", json={"path": program_path})
+        client.post("/api/cycle/run")
+        time.sleep(0.2)
+
+        response = client.post("/api/direct/execute", json={
+            "tree": {
+                "id": "timer",
+                "name": "delegated_pause",
+                "params": {"duration_s": 0.05},
+                "children": [],
+            },
+            "sessionKind": "delegated_recovery",
+            "authoritySource": "llm",
+            "principalId": "agent:test-llm",
+            "grantType": "policy_granted",
+            "resumeTarget": "stop",
+        })
+        assert response.status_code == 200
+        assert response.json()["sessionKind"] == "delegated_recovery"
+        assert response.json()["triggerNodeInstance"] == "move_to_pick"
+        assert response.json()["principalId"] == "agent:test-llm"
+        assert response.json()["grantType"] == "policy_granted"
+
+        time.sleep(0.2)
+        pending = client.get("/api/direct/pending-recovery")
+        assert pending.status_code == 404
+
+
+def test_direct_execute_delegated_recovery_enforces_pending_authority(tmp_path):
+    kernel = MockKernelClient()
+    kernel.fail_next_execute = True
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    app = create_app(state, security=_TEST_SECURITY)
+    program_path = _write_program_with_runtime_policy(
+        tmp_path,
+        intervention_delegate="human_only",
+    )
+    with TestClient(app) as client:
+        client.post("/api/program/load", json={"path": program_path})
+        client.post("/api/cycle/run")
+        time.sleep(0.2)
+
+        response = client.post("/api/direct/execute", json={
+            "tree": {
+                "id": "timer",
+                "name": "delegated_pause",
+                "params": {"duration_s": 0.05},
+                "children": [],
+            },
+            "sessionKind": "delegated_recovery",
+            "authoritySource": "llm",
+            "principalId": "agent:test-llm",
+            "grantType": "policy_granted",
+            "resumeTarget": "stop",
+        })
+        assert response.status_code == 409
+        assert "authority_source must be one of: human" in response.json()["error"]
+
+
+def test_direct_execute_and_status():
+    """POST /api/direct/execute starts intervention; GET status returns session."""
+    import time
+
+    kernel = MockKernelClient()
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    app = create_app(state, security=_TEST_SECURITY)
+    with TestClient(app) as client:
+        client.post("/api/program/load", json={"path": _PROGRAM_PATH})
+
+        response = client.post("/api/direct/execute", json={
+            "tree": {
+                "id": "timer",
+                "name": "brief_timer",
+                "params": {"duration_s": 0.05},
+                "children": [],
+            },
+            "sessionKind": "manual_intervention",
+            "authoritySource": "human",
+            "principalId": "human:test-operator",
+            "approvalMode": "human_approved",
+        })
+        assert response.status_code == 200
+        data = response.json()
+        assert "sessionId" in data
+        assert data["sessionKind"] == "manual_intervention"
+        assert data["authoritySource"] == "human"
+        assert data["principalId"] == "human:test-operator"
+        assert data["grantType"] == "human_approved"
+        assert data["status"] == "running"
+
+        # Wait for completion
+        time.sleep(0.3)
+
+        status_resp = client.get("/api/direct/status")
+        assert status_resp.status_code == 200
+        status_data = status_resp.json()
+        assert status_data["sessionId"] == data["sessionId"]
+        assert status_data["status"] in ("completed", "failed")
+
+
+def test_direct_promote_blackboard_value_after_intervention():
+    import time
+
+    kernel = MockKernelClient()
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    app = create_app(state, security=_TEST_SECURITY)
+    with TestClient(app) as client:
+        client.post("/api/program/load", json={"path": _PROGRAM_PATH})
+
+        execute_response = client.post("/api/direct/execute", json={
+            "tree": {
+                "id": "set_key_bool_value",
+                "name": "publish_detection",
+                "params": {"key": "detected_ok", "value": True},
+                "children": [],
+            },
+            "sessionKind": "manual_intervention",
+            "authoritySource": "human",
+            "principalId": "human:test-operator",
+            "approvalMode": "human_approved",
+        })
+        assert execute_response.status_code == 200
+        session_id = execute_response.json()["sessionId"]
+
+        time.sleep(0.1)
+
+        promote_response = client.post("/api/direct/promote", json={
+            "sessionId": session_id,
+            "promoteKeys": {"detected_ok": "recovery.detected_ok"},
+        })
+        assert promote_response.status_code == 200
+        assert promote_response.json()["promotions"]
+
+        blackboard = client.get("/api/execution/blackboard").json()["keys"]
+        assert blackboard["recovery/detected_ok"]["valueJson"] is True
+
+
+def test_direct_execute_from_idle_requires_human_approval():
+    """POST /api/direct/execute rejects unapproved IDLE direct control."""
+    kernel = MockKernelClient()
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    app = create_app(state, security=_TEST_SECURITY)
+    with TestClient(app) as client:
+        client.post("/api/program/load", json={"path": _PROGRAM_PATH})
+
+        response = client.post("/api/direct/execute", json={
+            "tree": {
+                "id": "timer",
+                "name": "brief_timer",
+                "params": {"duration_s": 0.05},
+                "children": [],
+            },
+            "sessionKind": "manual_intervention",
+            "authoritySource": "llm",
+            "principalId": "agent:test-llm",
+            "grantType": "policy_granted",
+        })
+    assert response.status_code == 409
+    assert "human-approved manual intervention" in response.json()["error"]
+
+
+def test_direct_execute_while_running_409():
+    """POST /api/direct/execute returns 409 when cycle is RUNNING."""
+    kernel = MockKernelClient(execute_duration_s=1.0)
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    app = create_app(state, security=_TEST_SECURITY)
+    with TestClient(app) as client:
+        client.post("/api/program/load", json={"path": _PROGRAM_PATH})
+        client.post("/api/cycle/run")
+
+        response = client.post("/api/direct/execute", json={
+            "tree": {
+                "id": "timer",
+                "name": "t",
+                "params": {"duration_s": 0.01},
+                "children": [],
+            },
+            "sessionKind": "manual_intervention",
+            "authoritySource": "human",
+            "principalId": "human:test-operator",
+        })
+        assert response.status_code == 409
+
+        client.post("/api/cycle/stop")
+        client.post("/api/cycle/reset")
+
+
+def test_direct_abort_no_running_intervention():
+    """POST /api/direct/abort returns 409 when no intervention is running."""
+    kernel = MockKernelClient()
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    app = create_app(state, security=_TEST_SECURITY)
+    with TestClient(app) as client:
+        client.post("/api/program/load", json={"path": _PROGRAM_PATH})
+        response = client.post("/api/direct/abort")
+    assert response.status_code == 409
+
+
+# =============================================================================
+# Kernel Event Bridge Tests
+# =============================================================================
+
+def test_kernel_events_no_program(client):
+    """GET /api/kernel/events returns empty when no program loaded."""
+    response = client.get("/api/kernel/events")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["events"] == []
+    assert data["last_event_index"] == 0
+
+
+def test_kernel_events_after_execution():
+    """GET /api/kernel/events returns events after program execution."""
+    import time
+
+    kernel = MockKernelClient()
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    app = create_app(state, security=_TEST_SECURITY)
+    with TestClient(app) as client:
+        client.post("/api/program/load", json={"path": _PROGRAM_PATH})
+        client.post("/api/cycle/run")
+        time.sleep(0.3)  # let tree tick
+
+        response = client.get("/api/kernel/events?since=0")
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data["events"]) > 0
+        assert data["last_event_index"] > 0
+
+        # Polling with last index returns no new events
+        last = data["last_event_index"]
+        response2 = client.get(f"/api/kernel/events?since={last}")
+        data2 = response2.json()
+        assert len(data2["events"]) == 0
+
+        client.post("/api/cycle/reset")
+
+
+def test_kernel_events_have_correct_structure():
+    """Kernel events have required fields: type, execution_id, timestamp_ns."""
+    import time
+
+    kernel = MockKernelClient()
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    app = create_app(state, security=_TEST_SECURITY)
+    with TestClient(app) as client:
+        client.post("/api/program/load", json={"path": _PROGRAM_PATH})
+        client.post("/api/cycle/run")
+        time.sleep(0.3)
+
+        response = client.get("/api/kernel/events?since=0")
+        data = response.json()
+        for event in data["events"]:
+            assert "type" in event
+            assert "execution_id" in event
+            assert "timestamp_ns" in event
+            assert "event_index" in event
+
+        client.post("/api/cycle/reset")

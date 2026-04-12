@@ -1,6 +1,6 @@
 // Cycle
 export interface CycleStatus {
-  state: 'idle' | 'running' | 'stopped';
+  state: 'idle' | 'running' | 'stopped' | 'direct_control';
   velocityScale: number;
 }
 
@@ -53,6 +53,8 @@ export interface TreeNode {
   id: string;
   name: string;
   params: Record<string, unknown>;
+  modificationPolicy?: Record<string, string>;
+  recoveryPolicy?: Record<string, unknown>;
   children: TreeNode[];
 }
 
@@ -68,6 +70,33 @@ export interface ProgramInfo {
 
 export interface ProgramTree {
   tree: TreeNode;
+}
+
+export interface RuntimeOverrideEntry {
+  nodeName: string;
+  params: Record<string, unknown>;
+  authoritySource: string;
+  approvalMode: string;
+  reason: string;
+  sessionId?: string | null;
+  triggerNodeInstance?: string | null;
+  requestedAtNs: number;
+  activationState: 'active' | 'staged';
+  activatedAtNs?: number | null;
+}
+
+export interface RuntimeOverrideStatus {
+  active: RuntimeOverrideEntry[];
+  staged: RuntimeOverrideEntry[];
+  activeCount: number;
+  stagedCount: number;
+  hasActive: boolean;
+  hasStaged: boolean;
+  canActivateNow: boolean;
+  requiresResetToActivate: boolean;
+  currentTreeOrigin: 'saved_program' | 'runtime_override';
+  nextEffectiveTree?: TreeNode | null;
+  timestampNs: number;
 }
 
 // Deployment
@@ -148,7 +177,7 @@ export interface FileBrowserResponse {
 
 // WebSocket
 export interface StateUpdate {
-  state: 'idle' | 'running' | 'stopped';
+  state: 'idle' | 'running' | 'stopped' | 'direct_control';
   velocityScale: number;
   nodeStatuses?: Record<string, string>;
   programLoaded?: boolean;

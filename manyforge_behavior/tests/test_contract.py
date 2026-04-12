@@ -352,10 +352,9 @@ class TestSceneEditInvariants:
             object_id="nonexistent_object",
         )
         result = kernel.scene_edit(request)
-        # Note: MockKernelClient always returns success=True for scene edits
-        # A real implementation would return success=False for nonexistent objects
-        # This test documents the expected invariant for real backends
         assert isinstance(result, SceneEditResult)
+        assert result.success is False
+        assert result.error is not None
 
     def test_scene_update_pose(self, kernel: KernelClient) -> None:
         """
@@ -407,10 +406,9 @@ class TestSceneEditInvariants:
             box_dimensions_m=[0.2, 0.2, 0.2],
         )
         result = kernel.scene_edit(add_request2)
-        # Note: MockKernelClient always returns success=True for scene edits
-        # A real implementation would return success=False for duplicates
-        # This test documents the expected invariant for real backends
         assert isinstance(result, SceneEditResult)
+        assert result.success is False
+        assert result.error is not None
 
 
 # =============================================================================
