@@ -30,6 +30,7 @@ from .routes_debug import create_debug_router
 from .routes_skills import create_skills_router
 from .routes_direct import create_direct_router
 from .routes_mcp import create_mcp_router
+from .routes_infra import create_infra_router
 
 logger = logging.getLogger(__name__)
 
@@ -120,6 +121,7 @@ def create_app(
     app.include_router(create_skills_router(state), prefix="/api", tags=["skills"])
     app.include_router(create_debug_router(state), prefix="/api/debug", tags=["debug"])
     app.include_router(create_direct_router(state), prefix="/api/direct", tags=["direct"])
+    app.include_router(create_infra_router(state), prefix="/api/infra", tags=["infra"])
 
     if enable_mcp_http:
         app.include_router(create_mcp_router(state), prefix="/api/mcp", tags=["mcp"])

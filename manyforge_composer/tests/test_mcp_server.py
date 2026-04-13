@@ -86,6 +86,12 @@ class TestToolDiscovery:
             "manyforge_execution_status",
             "manyforge_debug_export",
             "manyforge_catalog",
+            "manyforge_scene_snapshot",
+            "manyforge_program_save",
+            "manyforge_files",
+            "manyforge_deployment",
+            "manyforge_kernel",
+            "manyforge_session",
         ])
         assert tool_names == expected
 
@@ -1004,3 +1010,199 @@ class TestRuntimeOverrideRevisionBinding:
 
         status = _call(mcp, "manyforge_runtime_override", {"action": "status"})
         assert status["active_count"] == 0
+
+
+# =============================================================================
+# Scene Snapshot
+# =============================================================================
+
+class TestSceneSnapshot:
+
+    def test_no_hmi_server(self):
+        state = _make_state()
+        mcp = create_mcp_server(state)
+        result = _call(mcp, "manyforge_scene_snapshot")
+        assert "error" in result
+        assert "HMI" in result["error"]
+
+    def test_invalid_format(self):
+        state = _make_state()
+        mcp = create_mcp_server(state)
+        result = _call(mcp, "manyforge_scene_snapshot", {"format": "bmp"})
+        assert "error" in result
+        assert "format" in result["error"]
+
+
+# =============================================================================
+# Program Save
+# =============================================================================
+
+class TestProgramSave:
+
+    def test_no_program_loaded(self):
+        state = _make_state()
+        mcp = create_mcp_server(state)
+        result = _call(mcp, "manyforge_program_save")
+        assert "error" in result
+        assert "No program" in result["error"]
+
+    def test_save_loaded_program(self, tmp_path):
+        state = _make_state()
+        mcp = create_mcp_server(state)
+        _call(mcp, "manyforge_program_load", {"program_path": _PROGRAM_PATH})
+        target = str(tmp_path / "saved.program.yaml")
+        result = _call(mcp, "manyforge_program_save", {"path": target})
+        assert result["status"] == "ok"
+        assert result["path"] == target
+        assert Path(target).exists()
+
+
+# =============================================================================
+# File Browser
+# =============================================================================
+
+class TestFileBrowser:
+
+    def test_browse_default(self, tmp_path):
+        state = ComposerState(
+            catalog_path=_CATALOG_PATH,
+            kernel=MockKernelClient(),
+            allowed_fs_roots=[str(tmp_path)],
+        )
+        # Create a test program file
+        (tmp_path / "test.program.yaml").write_text("tree: {}")
+        (tmp_path / "subdir").mkdir()
+        mcp = create_mcp_server(state)
+        result = _call(mcp, "manyforge_files", {"path": str(tmp_path)})
+        assert "entries" in result
+        names = [e["name"] for e in result["entries"]]
+        assert "subdir" in names
+        assert "test.program.yaml" in names
+
+    def test_browse_kind_filter(self, tmp_path):
+        state = ComposerState(
+            catalog_path=_CATALOG_PATH,
+            kernel=MockKernelClient(),
+            allowed_fs_roots=[str(tmp_path)],
+        )
+        (tmp_path / "test.program.yaml").write_text("tree: {}")
+        (tmp_path / "test.deployment.yaml").write_text("name: test")
+        mcp = create_mcp_server(state)
+
+        # Program kind should not include deployment files
+        result = _call(mcp, "manyforge_files", {"path": str(tmp_path), "kind": "program"})
+        file_names = [e["name"] for e in result["entries"] if e["type"] == "file"]
+        assert "test.program.yaml" in file_names
+        assert "test.deployment.yaml" not in file_names
+
+        # Deployment kind should not include program files
+        result = _call(mcp, "manyforge_files", {"path": str(tmp_path), "kind": "deployment"})
+        file_names = [e["name"] for e in result["entries"] if e["type"] == "file"]
+        assert "test.deployment.yaml" in file_names
+        assert "test.program.yaml" not in file_names
+
+    def test_browse_invalid_kind(self):
+        state = _make_state()
+        mcp = create_mcp_server(state)
+        result = _call(mcp, "manyforge_files", {"kind": "invalid"})
+        assert "error" in result
+
+    def test_browse_outside_roots(self):
+        state = _make_state()
+        mcp = create_mcp_server(state)
+        result = _call(mcp, "manyforge_files", {"path": "/etc"})
+        assert "error" in result
+
+
+# =============================================================================
+# Deployment Reader
+# =============================================================================
+
+class TestDeploymentReader:
+
+    def test_no_deployment_loaded(self):
+        state = _make_state()
+        mcp = create_mcp_server(state)
+        result = _call(mcp, "manyforge_deployment")
+        assert "error" in result
+        assert "No deployment" in result["error"]
+
+    def test_read_deployment(self):
+        state = _make_state()
+        mcp = create_mcp_server(state)
+        _call(mcp, "manyforge_program_load", {
+            "program_path": _PROGRAM_PATH,
+            "deployment_path": _DEPLOYMENT_PATH,
+        })
+        result = _call(mcp, "manyforge_deployment")
+        assert "error" not in result
+        assert "name" in result or "robot_config" in result
+
+
+class TestKernel:
+    """Tests for manyforge_kernel tool."""
+
+    def test_kernel_snapshot_no_kernel(self):
+        state = _make_state()
+        mcp = create_mcp_server(state)
+        result = _call(mcp, "manyforge_kernel", {"include": "snapshot"})
+        assert "snapshot" in result
+        assert result["snapshot"]["state"] == "idle"
+
+    def test_kernel_snapshot_with_program(self):
+        state = _make_state()
+        mcp = create_mcp_server(state)
+        _call(mcp, "manyforge_program_load", {"program_path": _PROGRAM_PATH})
+        result = _call(mcp, "manyforge_kernel", {"include": "snapshot"})
+        assert "snapshot" in result
+
+    def test_kernel_metrics(self):
+        state = _make_state()
+        mcp = create_mcp_server(state)
+        _call(mcp, "manyforge_program_load", {"program_path": _PROGRAM_PATH})
+        result = _call(mcp, "manyforge_kernel", {"include": "metrics"})
+        assert "metrics" in result
+
+    def test_kernel_all(self):
+        state = _make_state()
+        mcp = create_mcp_server(state)
+        result = _call(mcp, "manyforge_kernel", {"include": "all"})
+        assert "snapshot" in result
+
+    def test_kernel_invalid_include(self):
+        state = _make_state()
+        mcp = create_mcp_server(state)
+        result = _call(mcp, "manyforge_kernel", {"include": "invalid"})
+        assert "error" in result
+
+
+class TestSession:
+    """Tests for manyforge_session tool."""
+
+    def test_session_status_no_program(self):
+        state = _make_state()
+        mcp = create_mcp_server(state)
+        result = _call(mcp, "manyforge_session", {"action": "status"})
+        assert result["program_loaded"] is False
+        assert result["cycle_state"] == "none"
+
+    def test_session_status_with_program(self):
+        state = _make_state()
+        mcp = create_mcp_server(state)
+        _call(mcp, "manyforge_program_load", {"program_path": _PROGRAM_PATH})
+        result = _call(mcp, "manyforge_session", {"action": "status"})
+        assert result["program_loaded"] is True
+        assert result["program_name"] is not None
+
+    def test_session_reset(self):
+        state = _make_state()
+        mcp = create_mcp_server(state)
+        _call(mcp, "manyforge_program_load", {"program_path": _PROGRAM_PATH})
+        result = _call(mcp, "manyforge_session", {"action": "reset"})
+        assert result["status"] == "ok"
+
+    def test_session_invalid_action(self):
+        state = _make_state()
+        mcp = create_mcp_server(state)
+        result = _call(mcp, "manyforge_session", {"action": "invalid"})
+        assert "error" in result

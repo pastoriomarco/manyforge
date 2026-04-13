@@ -1,0 +1,37 @@
+# ManyForge network policy fragment for NemoClaw sandbox.
+# Merge into the sandbox's existing policy — do NOT apply standalone.
+#
+# IMPORTANT: OpenShell 0.0.26 does NOT hot-reload policies via
+# `openshell policy set`. The sandbox must be recreated with the
+# merged policy at creation time (`--policy merged.yaml`).
+#
+# Allows the sandbox agent to reach:
+#   - ManyForge dedicated TLS route (port 443, end-to-end TLS via access: full)
+#   - ManyForge Composer REST API + MCP server (port 9000)
+#   - ManyForge Viser HMI for scene snapshots (port 8081)
+
+network_policies:
+  manyforge:
+    name: manyforge
+    endpoints:
+      - host: host.openshell.internal
+        port: 443
+        access: full
+      - host: host.openshell.internal
+        port: 9000
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow: { method: "*", path: "/**" }
+      - host: host.openshell.internal
+        port: 8081
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow: { method: "*", path: "/**" }
+    binaries:
+      - { path: /usr/local/bin/openclaw }
+      - { path: /usr/local/bin/node }
+      - { path: /usr/bin/curl }
+      - { path: /usr/bin/python3 }
+      - { path: /usr/local/bin/python3 }

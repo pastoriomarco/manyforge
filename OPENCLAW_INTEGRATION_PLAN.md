@@ -6,7 +6,17 @@ decision-making, delegated failure recovery, and interactive program
 composition assistance — while keeping deterministic behavior tree execution
 as the authority for robot motion.
 
-**Date**: 2026-04-11
+**Date**: 2026-04-12 (revised)
+
+**Architecture decision**: Option B — ManyForge and OpenClaw run in separate
+containers/processes. ManyForge keeps host hardware access (robot, GPU, ROS2).
+OpenClaw runs inside a NemoClaw sandbox. They communicate exclusively through
+ManyForge's HTTP API (REST + MCP). The sandbox is a safety feature, not
+overhead.
+
+**Deterministic mode**: ManyForge remains fully operational without any LLM
+dependency. All LLM integration points are opt-in via CLI flags, deployment
+configuration, and node selection. See Section 10 for details.
 
 ---
 
@@ -22,15 +32,23 @@ ManyForge is a self-contained robotics execution framework with:
 - **ExecutionKernel** — C++ motion planner and trajectory executor
   (RoboPlan: RRT + TOPPRA + IK, or MockKernelClient)
 - **Composer** — FastAPI REST API + React frontend + Viser 3D HMI
-- **MCP server** — 12 tool interface for LLM agents (stdio transport)
-- **EventRecorder** — execution history with ring buffer + JSONL file sink
+- **MCP server** — 12+ tool interface for LLM agents (stdio + HTTP/SSE
+  transport, implemented in OP-8)
+- **EventRecorder** — execution history with ring buffer + JSONL file sink,
+  model-call audit events (OP-9)
 - **Intervention mode** — temporary subtree execution without modifying the
   saved program, with authority provenance, blackboard scoping, lease
   management, and promotion
 - **Runtime overrides** — per-node parameter patching with active/staged
   lifecycle and modification_policy enforcement
+- **Recovery infrastructure** — `RecoveryTrigger` enum, `recovery_policy`
+  on TreeNode, `FallbackOverrideNode` and `RecoverySkillNode` decorators
+  for deterministic in-tree recovery (OP-6)
 - **Skill catalog** — `pick_object`, `place_object`, `move_to_named_config`
   with pre/postconditions, capability requirements, and parameter contracts
+- **QueryModelNode** — non-blocking leaf node for model endpoint queries
+  with ThreadPoolExecutor, schema validation, confidence gating, and
+  model audit event integration (OP-7)
 
 The LLM agent today is the human operator using Claude Code or the MCP
 server. There is no autonomous agent loop.
@@ -75,8 +93,19 @@ not yet validated for runtime robot operation):
 
 ### 1.3 What Exists Between Them
 
-The current integration is ad-hoc and offline:
+Current integration state (partially ad-hoc, partially implemented):
 
+**Implemented (OP-6/7/8/9)**:
+- MCP HTTP/SSE transport on `/api/mcp` + `/api/mcp/sse` (OP-8)
+- `QueryModelNode` with non-blocking execution, schema validation,
+  confidence gating (OP-7)
+- Model audit event infrastructure: `record_model_event()` with redaction
+  via `ModelAuditPolicy` (OP-9)
+- Recovery infrastructure: `RecoveryTrigger` enum, `recovery_policy` on
+  TreeNode, `FallbackOverrideNode`, `RecoverySkillNode` (OP-6)
+- X-Principal-ID validation and auth boundary hardening
+
+**Ad-hoc (offline coding, not runtime)**:
 - `manyforge-session-start.sh` uploads specs, contract headers, and worker
   workspaces to the NemoClaw sandbox
 - Claude Code on the host dispatches OpenClaw agents via kubectl exec to
@@ -108,10 +137,24 @@ The current integration is ad-hoc and offline:
    distinction between `saved_program` and `runtime_override` must be
    maintained in all surfaces.
 
-5. **Sandboxing is a feature, not overhead.** In an industrial environment,
-   an LLM agent that can execute arbitrary code must be isolated. OpenShell's
-   Landlock/seccomp/netns sandbox provides this. The agent communicates with
-   ManyForge only through explicitly allowed API surfaces.
+5. **Sandboxing is a safety feature.** In an industrial environment, an LLM
+   agent that can reason about and affect robot motion must be constrained
+   at the OS level. OpenShell's Landlock/seccomp/netns sandbox provides
+   hardware-enforced isolation. The agent's only path to the robot is
+   through ManyForge's validated API — two layers of enforcement: sandbox
+   prevents bypass, ManyForge prevents misuse.
+
+6. **Operational answers should not rely on free text.** When a workflow
+   requires a machine-checked result, the completion contract should be a
+   typed tool call or schema-validated structured payload, not a plain-text
+   answer that merely "looks correct". This is especially important for
+   supervisory and recovery flows in an industrial setting.
+
+7. **LLM is optional.** ManyForge must remain fully functional without any
+   LLM dependency. All four integration modes are opt-in. A fully
+   deterministic deployment — manual composition, no `query_model` nodes,
+   no delegation, no assistant — must be a first-class supported
+   configuration. See Section 10.
 
 ---
 
@@ -119,7 +162,7 @@ The current integration is ad-hoc and offline:
 
 The integration defines four operational modes, each serving a distinct
 industrial need. They share infrastructure but differ in trigger, authority,
-and latency requirements.
+and latency requirements. All modes are opt-in.
 
 ### Mode A: Delegated Recovery (Runtime — Tree-Triggered)
 
@@ -165,6 +208,11 @@ blackboard writes. The agent cannot exceed this scope.
 
 **Latency budget**: Seconds to minutes. The tree is paused (kernel PAUSED)
 while the agent works. Lease timeout enforces an upper bound.
+
+**Deterministic alternative**: Without this mode, the tree author uses
+`FallbackOverrideNode` or `RecoverySkillNode` (OP-6) for deterministic
+recovery. `delegate_to_llm` is only needed when deterministic recovery
+logic is insufficient.
 
 ### Mode B: Perception-Driven Cycle Targets (Runtime — Per-Cycle)
 
@@ -219,6 +267,10 @@ like any other node. The behavior tree author decides where to place it.
 **Latency budget**: Hundreds of milliseconds to low single-digit seconds.
 The tree tick loop waits for the model response (the node returns RUNNING
 until the response arrives, then SUCCESS/FAILURE).
+
+**Deterministic alternative**: Without this mode, the tree author
+hard-codes target parameters in the tree or uses blackboard values set by
+other deterministic nodes (sensor readings, fixed configurations).
 
 ### Mode C: Emergency / Supervisory Operator (Runtime — External)
 
@@ -294,6 +346,37 @@ doesn't depend on cloud connectivity (industrial reliability requirement).
 monitoring poll is non-blocking. The robot is stopped before the agent
 reasons about recovery.
 
+#### Structured Terminal Answer Pattern
+
+For operational workflows where the final result must be consumed by another
+machine step, the final answer should be emitted through a narrow typed tool,
+not free text.
+
+Example:
+
+- a monitoring workflow may use ManyForge read-only tools freely
+- but it must complete with a terminal tool such as:
+  - `report_lifecycle_state(lifecycle_state: enum[idle, running, stopped, direct_control])`
+  - `report_recovery_outcome(outcome: enum[resolved, unresolved, escalated], summary_code: string)`
+  - `report_program_operation(action: enum[load, validate, save, run, stop, intervene], result: enum[success, failure], summary_code: string)`
+
+Rules:
+
+1. plain-text completion does not count as success when a terminal answer tool
+   is required
+2. the terminal answer tool schema must be narrow and typed
+3. retries must be bounded; if the agent does not produce a valid terminal
+   tool call, the workflow fails closed
+4. the terminal answer tool itself must not grant additional operational
+   authority — it is a reporting contract, not a capability expansion
+
+This pattern is recommended for:
+
+- Mode C supervisory monitoring loops
+- delegated recovery outcomes in Mode A
+- smoke/integration checks that must return deterministic machine-readable
+  results
+
 ### Mode D: Composer Assistant (Design-Time — Interactive)
 
 **Use case**: A human operator uses a chat interface in the Composer UI to
@@ -301,27 +384,68 @@ interactively construct, debug, and refine behavior trees with an LLM that
 deeply understands ManyForge's node catalog, skill system, program structure,
 and composition rules.
 
-**Trigger**: User types in the Composer's prompt panel.
+**Trigger**: User types in the Composer's chat overlay panel.
 
 **Flow**:
 ```
 User opens Composer UI (localhost:9000)
-  → Prompt panel visible alongside the tree editor and property panel
+  → Chat overlay panel visible (resizable, minimizable)
   → User types: "Add a bin picking sequence that uses vision to find parts"
-  → LLM responds with:
+  → Composer backend proxies to OpenClaw agent in sandbox:
+      - Agent has ManyForge MCP tools for live state queries
+      - Agent has domain knowledge (AGENTS.md, LLM_GUIDE.md, catalog)
+      - Agent can validate proposals via POST /api/program/validate
+  → Agent responds with:
       - Explanation of the approach
       - Proposed tree structure (rendered as a preview diff in the editor)
       - Parameter suggestions with rationale
   → User reviews, modifies, accepts or rejects
   → On accept: tree is applied to the editor canvas
   → User can continue: "Make the approach height configurable as a
-    runtime override" → LLM adjusts modification_policy + params
-  → User validates: "Check if this tree is valid" → LLM calls
+    runtime override" → agent adjusts modification_policy + params
+  → User validates: "Check if this tree is valid" → agent calls
     POST /api/program/validate and explains any issues
 ```
 
+**Chat overlay panel**: A resizable, minimizable overlay in the Composer UI
+that floats over the existing interface. It can be:
+- Resized by dragging edges (minimum 300px wide, 200px tall)
+- Minimized to a rail button (like existing panels)
+- Maximized to take half the viewport
+- Repositioned (bottom-right default, draggable)
+
+```
+┌──────────────────────────────────────────────────────────┐
+│  TreeCanvas (behavior tree editor)  │  Properties │ Viser│
+│                                     │  Panel      │ Panel│
+│                                     │             │      │
+│                                     │             │      │
+│                         ┌───────────┤             │      │
+│                         │ Chat ≡  ─ │             │      │
+│                         │ User: Add │             │      │
+│                         │ bin pick..│             │      │
+│                         │ Agent: .. │             │      │
+│                         │ [Apply]   │             │      │
+│                         ├───────────┤             │      │
+│                         │ Type... ⏎ │             │      │
+│                         └───────────┘             │      │
+└──────────────────────────────────────────────────────────┘
+```
+
+**Implementation**: The Composer backend proxies chat to the OpenClaw agent
+running in the NemoClaw sandbox. This gives the assistant full agent
+capabilities — tool use, MCP access to ManyForge, multi-step reasoning,
+session memory — rather than a simple LLM chat endpoint. The backend
+manages session lifecycle and injects ManyForge context.
+
+Two interaction surfaces:
+- **Conversational**: "explain why the last cycle failed" → agent queries
+  debug export, reasons, responds
+- **Actionable**: "add a recovery fallback to the pick node" → agent
+  proposes tree edit, user approves/dismisses in the UI
+
 **LLM context**: The assistant must have deep knowledge of:
-- Node catalog (all 19 node types, their parameters, constraints,
+- Node catalog (all node types, their parameters, constraints,
   required capabilities)
 - Skill catalog (pick_object, place_object, move_to_named_config — their
   pre/postconditions, parameter contracts, expansion rules)
@@ -329,26 +453,8 @@ User opens Composer UI (localhost:9000)
 - Current program state (loaded tree, deployment, capabilities)
 - Scene state (objects, robot configuration)
 
-**Implementation options**:
-
-- **Option 1 (Backend-served, recommended)**: New REST endpoint
-  `POST /api/assistant/chat` that wraps an LLM call with ManyForge context
-  injected as system prompt. The frontend sends user messages; the backend
-  appends catalog, current tree, scene state, and composition rules as
-  context, calls the LLM, and returns the response with optional structured
-  actions (tree diffs, validation requests).
-
-- **Option 2 (OpenClaw as MCP server)**: OpenClaw can run as an MCP server
-  (`openclaw mcp serve`). The Composer backend connects to this MCP server,
-  giving the assistant access to OpenClaw's full tool suite (ManyForge MCP
-  tools, file read/write, workspace knowledge) while the Composer backend
-  handles context injection and UI integration. More powerful than Option 1
-  (agent can validate, load examples, read docs) but introduces an
-  OpenClaw dependency for the Composer assistant surface.
-
-- **Option 3 (Frontend-only)**: The React frontend calls an OpenAI-
-  compatible endpoint directly with a static system prompt. Simplest, but
-  the LLM has no access to live ManyForge state.
+This context is provided via OpenClaw's workspace knowledge system
+(`AGENTS.md`, `SOUL.md`) and live queries through ManyForge MCP tools.
 
 **Authority model**: Design-time only. The assistant proposes changes; the
 human applies them via the existing PUT /api/program/tree flow. No special
@@ -361,62 +467,110 @@ vLLM instance used by NemoClaw-Thor.
 
 ---
 
-## 3. Infrastructure
+## 3. Architecture
 
-### 3.1 Network Topology
+### 3.1 Architecture Decision: Option B (Separate Containers)
+
+ManyForge and OpenClaw run in separate containers/processes, communicating
+exclusively through HTTP APIs. This is the only architecture that maintains
+the safety invariant: an LLM agent cannot directly affect robot motion
+except through ManyForge's validated API.
+
+**Why not inside the sandbox?** ManyForge needs:
+- Host device access (USB/serial for robot hardware)
+- GPU access for C++ motion planner (CUDA, not just inference)
+- ROS2 DDS multicast for sensor discovery — netns blocks this
+- Low-latency kernel tick loop (10 Hz) — sandbox overhead adds jitter
+
+**Why not shared pod / sidecar?** Defeats sandbox isolation. If the LLM
+agent escapes the sidecar, it has localhost access to the kernel.
+
+**Why not ROS2 in the sandbox?** ROS2 DDS uses multicast UDP for
+discovery, which netns blocks. Workarounds (Fast-DDS Discovery Server,
+Zenoh RMW) add fragile complexity for no gain. The agent needs robot
+state and sensor data, which ManyForge already exposes through its API
+(`scene_state`, `kernel_snapshot`, `execution_status`). If raw ROS2 topics
+are needed (point cloud, force/torque), a ManyForge bridge node subscribes
+to topics and exposes them via API — keeping the data flow auditable.
+
+### 3.2 Network Topology
 
 ```
-┌────────────────────────────────────────────────────────────────────┐
-│  HOST (Jetson AGX Thor)                                            │
-│                                                                    │
-│  ┌─────────────────────┐     ┌──────────────────────────────────┐ │
-│  │  vLLM (port 8000)   │     │  ManyForge Composer              │ │
-│  │  Qwen 3.5 / Gemma 4 │     │  REST API      :9000             │ │
-│  │  Local inference     │     │  Viser HMI     :8081             │ │
-│  └────────┬────────────┘     │  MCP (stdio)                     │ │
-│           │                   │  Kernel (C++ / Mock)             │ │
-│           │                   └───────┬──────────────────────────┘ │
-│           │                           │                            │
-│  ┌────────┴───────────────────────────┴────────────────────────┐  │
-│  │  OpenShell (K3s)                                            │  │
-│  │  Provider: vllm-local → host:8000/v1                       │  │
-│  │  Policy:   manyforge → host:9000, host:8081 (REST/WS)     │  │
-│  │                                                             │  │
-│  │  ┌───────────────────────────────────────────────────────┐ │  │
-│  │  │  Sandbox Pod                                          │ │  │
-│  │  │                                                       │ │  │
-│  │  │  OpenClaw Agent (Pi runtime)                           │ │  │
-│  │  │    ├── ManyForge MCP tools (12 tools, SSE/HTTP)       │ │  │
-│  │  │    ├── Bash/Read/Write (workspace ops)                │ │  │
-│  │  │    └── Domain knowledge (AGENTS.md, LLM_GUIDE.md)     │ │  │
-│  │  └───────────────────────────────────────────────────────┘ │  │
-│  └─────────────────────────────────────────────────────────────┘  │
-│                                                                    │
-│  ┌─────────────────────────────────────────────────────────────┐  │
-│  │  ManyForge Docker Container (optional, or bare-metal)       │  │
-│  │  Kernel, Runner, CycleManager, EventRecorder               │  │
-│  │  Binds 0.0.0.0:9000 and 0.0.0.0:8081                      │  │
-│  └─────────────────────────────────────────────────────────────┘  │
-└────────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│  HOST (Jetson AGX Thor)                                              │
+│                                                                      │
+│  ┌─────────────────────┐     ┌────────────────────────────────────┐ │
+│  │  vLLM (port 8000)   │     │  ManyForge Container               │ │
+│  │  Qwen 3.5 / Gemma 4 │     │  (host network, device access)     │ │
+│  │  Local inference     │     │                                    │ │
+│  └────────┬────────────┘     │  Composer Backend  :9000            │ │
+│           │                   │  ├── REST API (existing)           │ │
+│           │                   │  ├── MCP Server (HTTP/SSE, OP-8)   │ │
+│           │                   │  ├── /api/assistant/chat (proxy)   │ │
+│           │                   │  └── /api/infra/status (health)    │ │
+│           │                   │  Viser HMI         :8081           │ │
+│           │                   │  Kernel (C++ / Mock / CUDA)        │ │
+│           │                   │  ROS2 nodes (sensors, actuators)   │ │
+│           │                   │  EventRecorder (audit trail)       │ │
+│           │                   └───────┬────────────────────────────┘ │
+│           │                           │                              │
+│  ┌────────┴───────────────────────────┴──────────────────────────┐  │
+│  │  OpenShell (K3s)                                              │  │
+│  │  Provider: vllm-local → host:8000/v1 (direct) or             │  │
+│  │                       → host:8888/v1 (ManyForge mux mode)    │  │
+│  │  Policy:   manyforge  → host:9000 (REST/MCP)                 │  │
+│  │            viser-hmi  → host:8081 (WebSocket, snapshots)      │  │
+│  │                                                               │  │
+│  │  ┌─────────────────────────────────────────────────────────┐ │  │
+│  │  │  Sandbox Pod (Landlock + seccomp + netns)               │ │  │
+│  │  │                                                         │ │  │
+│  │  │  OpenClaw Agent (Pi runtime)                             │ │  │
+│  │  │    ├── ManyForge MCP tools (12+ tools, SSE/HTTP)        │ │  │
+│  │  │    ├── Bash/Read/Write (workspace ops only)             │ │  │
+│  │  │    ├── Gateway (Telegram/Slack/WhatsApp for escalation) │ │  │
+│  │  │    └── Domain knowledge (AGENTS.md, SOUL.md)            │ │  │
+│  │  │                                                         │ │  │
+│  │  │  Agent capabilities:                                    │ │  │
+│  │  │    CAN:  reason, plan, propose, query ManyForge API     │ │  │
+│  │  │    CAN:  call vLLM for inference                        │ │  │
+│  │  │    CAN:  escalate to human via Gateway                  │ │  │
+│  │  │    CANNOT: access host filesystem (Landlock)            │ │  │
+│  │  │    CANNOT: open arbitrary sockets (netns + policy)      │ │  │
+│  │  │    CANNOT: reach ROS2 DDS (multicast blocked)           │ │  │
+│  │  │    CANNOT: access USB/serial devices                    │ │  │
+│  │  │    CANNOT: escalate privileges (seccomp)                │ │  │
+│  │  └─────────────────────────────────────────────────────────┘ │  │
+│  └───────────────────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
-### 3.2 MCP Connectivity
+### 3.3 MCP Connectivity
 
-ManyForge's MCP server currently runs over stdio only. OpenClaw's MCP
-client natively supports stdio, SSE/HTTP, and streamable-HTTP transports —
-so the work is on ManyForge's side to expose an HTTP-based MCP endpoint.
+**Decision: Strategy A (workspace plugin over HTTP MCP transport) for the
+current OpenClaw build. Direct native `mcp.servers` SSE remains a longer-term
+target when the runtime actually supports it.**
 
-**Strategy A (SSE/HTTP MCP transport — recommended for production)**:
+ManyForge's MCP server runs on `/api/mcp` (POST, JSON-RPC) and
+`/api/mcp/sse` (GET, Server-Sent Events). The MCP server shares the same
+in-process ComposerState — no subprocess needed. Session management,
+principal propagation, and auth are implemented.
 
-Add an SSE-based MCP transport to ManyForge's Composer backend:
-```
-GET /api/mcp/sse  →  Server-Sent Events MCP transport
-POST /api/mcp     →  MCP message endpoint
-```
+In the currently installed OpenClaw runtime, the embedded main agent does
+not accept a root-level `mcp.servers` block in `openclaw.json`. The verified
+main-agent path is:
 
-The MCP server shares the same in-process ComposerState — no subprocess
-needed. OpenShell policy allows the sandbox to reach host:9000. OpenClaw
-registers ManyForge as an MCP server via its native config:
+- workspace plugin under `/sandbox/.openclaw/workspace/.openclaw/extensions`
+- `plugins.allow += ["manyforge-mcp"]`
+- `plugins.entries.manyforge-mcp.enabled = true`
+- `tools.alsoAllow += ["manyforge-mcp"]`
+- plugin endpoint `https://inference.local/v1/completions`
+- provider behind `inference.local` pointed at `http://host.openshell.internal:8888/v1`
+
+The host mux on `:8888` then forwards:
+- normal OpenAI traffic -> vLLM on `:8000`
+- ManyForge-marked MCP traffic -> ManyForge `/api/mcp`
+
+The older direct-config idea is kept here only as the eventual simpler target:
 ```json
 {
   "mcp": {
@@ -424,7 +578,8 @@ registers ManyForge as an MCP server via its native config:
       "manyforge": {
         "url": "http://host.openshell.internal:9000/api/mcp/sse",
         "headers": {
-          "Authorization": "Bearer ${MANYFORGE_API_TOKEN}"
+          "Authorization": "Bearer ${MANYFORGE_API_TOKEN}",
+          "X-Principal-ID": "llm:openclaw-agent"
         }
       }
     }
@@ -432,64 +587,363 @@ registers ManyForge as an MCP server via its native config:
 }
 ```
 
-OpenClaw's MCP client auto-discovers all ManyForge tools at startup and
-namespaces them as `mcp_manyforge_<tool_name>` (e.g.,
-`mcp_manyforge_scene_state`, `mcp_manyforge_cycle_control`).
+That direct native MCP registration is not the current production baseline for
+this build. The current baseline is workspace-plugin registration exposing
+`manyforge_*` tools directly to the embedded agent.
 
-**Strategy B (stdio via SSH — works today, fragile)**:
+### 3.3.1 Current Baseline vs. Long-Term Industrial Target
 
-Register ManyForge as a stdio MCP server using SSH through the OpenShell
-proxy. This requires ManyForge to be installed (or its Python path set)
-in the sandbox, which is heavy:
-```json
-{
-  "mcp": {
-    "servers": {
-      "manyforge": {
-        "command": "ssh",
-        "args": [
-          "-o", "StrictHostKeyChecking=no",
-          "-o", "UserKnownHostsFile=/dev/null",
-          "-o", "LogLevel=ERROR",
-          "-o", "ProxyCommand=openshell ssh-proxy --gateway-name nemoclaw --name <sandbox>",
-          "sandbox@openshell-<sandbox>",
-          "python -m manyforge_composer --mcp --catalog-path /workspace/manyforge_behavior/resources/node_catalog.yaml"
-        ]
-      }
-    }
-  }
-}
-```
+The currently validated baseline is:
 
-**Strategy C (REST via curl — fallback for prototyping)**:
+- sandbox/OpenClaw client base URL: `https://inference.local/v1`
+- OpenShell provider target:
+  - direct mode -> `http://host.openshell.internal:8000/v1`
+  - ManyForge mode -> `http://host.openshell.internal:8888/v1`
+- workspace plugin endpoint -> `https://inference.local/v1/completions`
+- host mux on `:8888` forwarding:
+  - normal inference -> vLLM on `:8000`
+  - `x_manyforge` MCP traffic -> ManyForge `/api/mcp`
 
-The agent uses ManyForge's REST API directly via `curl` in Bash tool calls.
-No MCP machinery needed. Lower ergonomics but zero infrastructure changes
-on ManyForge's side. Viable for early prototyping before Strategy A is
-implemented.
+This baseline is now proven end to end, including a real embedded agent turn
+that executes `manyforge_execution_status`. It is acceptable as the current
+operational baseline, but it is **not** the final industrial topology.
 
-### 3.3 OpenShell Policy Extension
+The long-term industrial target is a split-path design:
 
-Add ManyForge service endpoints to the NemoClaw-Thor policy:
+- normal model inference remains on the direct vLLM path
+- ManyForge tool transport gets its own dedicated route
+- the mux is removed from the inference critical path
+
+The preferred direction is:
+
+- keep sandbox/OpenClaw client base URL on `https://inference.local/v1`
+- keep OpenShell provider target on `http://host.openshell.internal:8000/v1`
+- give ManyForge a dedicated routed endpoint of its own, ideally TLS on a
+  proxy-allowed route that does not share the inference path
+- repoint the ManyForge workspace plugin to that dedicated route
+
+This is preferred over keeping the mux in place because:
+
+1. inference latency and failure domains stay isolated from ManyForge tool
+   transport
+2. audit and service identity can be reasoned about per-route
+3. the resulting deployment is simpler to operate and easier to certify in an
+   industrial environment
+
+Until that dedicated route exists and is validated from the actual sandbox
+process, the mux remains the blessed baseline.
+
+### 3.3.2 Dedicated ManyForge Route Design
+
+This section fixes the target topology for Phase I.B. The goal is to remove
+the ManyForge mux from the inference critical path while preserving the
+currently validated workspace-plugin integration model.
+
+#### Final Route Shape
+
+The preferred industrial route is:
+
+- normal model inference remains on `https://inference.local/v1`
+- the OpenShell provider behind `inference.local` remains pointed at direct
+  vLLM on `http://host.openshell.internal:8000/v1`
+- ManyForge gets a dedicated HTTPS endpoint on a proxy-allowed host/port
+  distinct from the inference route
+- the plugin talks to ManyForge over `POST /api/mcp`
+- `GET /api/health` and `GET /api/infra/status` may also be exposed on the
+  same dedicated endpoint for operational checks
+
+The preferred transport for the plugin is direct JSON-RPC over
+`POST /api/mcp`, not SSE. SSE remains valuable for future native OpenClaw MCP
+registration when the runtime supports it, but it is not required for the
+productized plugin path.
+
+#### Host-Side Topology
+
+ManyForge itself should continue to serve its internal HTTP API on `:9000`.
+The dedicated industrial route should be a narrow TLS front end that proxies
+only the allowed endpoints to the ManyForge backend.
+
+Preferred layout:
+
+- ManyForge backend: `http://127.0.0.1:9000`
+- dedicated ManyForge TLS front end: proxy-allowed HTTPS listener
+- allowed upstream paths:
+  - `/api/mcp`
+  - `/api/mcp/sse`
+  - `/api/health`
+  - `/api/infra/status`
+- disallowed from the sandbox on the dedicated route:
+  - Composer write APIs unrelated to the plugin
+  - arbitrary file access routes
+  - any path not explicitly allowlisted
+
+This can be implemented with a small reverse proxy sidecar or host service.
+The important property is not the exact proxy product; it is that inference
+traffic and ManyForge tool traffic become separate network paths.
+
+#### TLS and Trust Model
+
+For industrial use, the route should not rely on plain HTTP from the sandbox.
+
+Baseline target:
+
+- terminate TLS on the dedicated ManyForge front end
+- use a pinned certificate or pinned local CA bundle distributed by the setup
+  tooling
+- fail closed on certificate mismatch
+
+Preferred operational model:
+
+- generate a dedicated ManyForge route certificate during setup
+- install the corresponding trust anchor into the sandbox/plugin environment
+- rotate that certificate intentionally as part of setup/update tooling
+
+If certificate management proves too heavy for the first implementation,
+pinning a self-signed certificate is acceptable as an intermediate hardening
+step. Plain HTTP on the final direct route is not acceptable for the target
+industrial topology.
+
+#### Auth and Identity Model
+
+The dedicated route should have a distinct service identity contract from the
+human/operator-facing Composer APIs.
+
+Required request properties:
+
+- `Authorization: Bearer <manyforge_plugin_token>`
+- `X-Principal-ID: llm:openclaw-agent` or another explicit service principal
+
+Rules:
+
+1. the plugin token is scoped to the dedicated ManyForge route and is not
+   reused as a general operator token
+2. the route only accepts the headers and methods needed for MCP and health
+   checks
+3. ManyForge continues to record principal identity and authority provenance in
+   its event/audit model
+4. the terminal-answer pattern for machine-consumed outcomes remains separate
+   from route authorization; reporting tools do not grant authority
+
+Future hardening such as mutual TLS may be added later, but bearer token plus
+TLS plus explicit principal identity is sufficient for the first dedicated
+route implementation.
+
+#### OpenShell Policy Shape
+
+Once the dedicated route exists, the preferred policy is:
+
+- allow sandbox egress to the dedicated ManyForge TLS route with termination
+- keep inference on the existing sanctioned `inference.local` path
+- remove the requirement for sandbox access to the mux path in normal
+  operation
+
+The old mux-backed policy remains valid only as fallback/debug support until
+the dedicated route is proven from the live sandbox process.
+
+#### Plugin Behavior After Repoint
+
+After the dedicated route is implemented:
+
+- the workspace/plugin tool wrappers stop calling
+  `https://inference.local/v1/completions` for ManyForge tools
+- they call the dedicated ManyForge HTTPS `/api/mcp` route directly
+- normal agent inference continues to use the ordinary OpenClaw/OpenShell
+  provider path
+- smoke tests requiring deterministic machine-readable outcomes should use the
+  structured terminal-answer pattern rather than free-text assertions
+
+This preserves the currently validated OpenClaw-side integration surface
+(plugin tools) while removing the inference mux dependency.
+
+#### Rollout Sequence
+
+Implementation should proceed in this order:
+
+1. add the dedicated TLS front end on the chosen proxy-allowed route
+2. expose only `/api/mcp`, `/api/mcp/sse`, `/api/health`, and
+   `/api/infra/status`
+3. provision trust material and plugin token through setup tooling
+4. update the plugin generator/deployment logic to point at the dedicated route
+5. keep the mux baseline available as fallback during migration
+6. verify from a real sandbox process that:
+   - the plugin can call `manyforge_execution_status`
+   - normal inference still uses direct `:8000`
+   - the provider target no longer needs `:8888`
+7. only after that, demote the mux from primary path
+
+#### Success Condition For I.B.1
+
+The route design is considered complete when:
+
+- the final route shape is fixed to a dedicated proxy-allowed TLS route
+- the auth and trust model are explicit
+- the plugin transport target is explicit
+- the OpenShell policy target is explicit
+- I.B.2 can be implemented without further topology ambiguity
+
+#### Current Platform Constraint
+
+Live validation on OpenShell `0.0.26` shows that sandbox egress does not
+currently provide a viable second HTTPS route to `host.openshell.internal`:
+
+- `https://host.openshell.internal:9443/...` fails at the proxy layer with
+  `HTTP/1.1 403 Forbidden` on the `CONNECT` tunnel even when the `9443`
+  `tls: terminate` policy entry is present and loaded
+- `https://host.openshell.internal:443/...` also fails with `CONNECT 403` even
+  when the `443` `access: full` policy entry is present and loaded
+- bypassing the proxy from inside the sandbox and connecting directly to
+  `172.17.0.1:443` fails with `connection refused`
+
+That means:
+
+- host-side TLS front end + plugin direct transport support can be implemented
+- but `host.openshell.internal` is not currently a viable final second route on
+  this platform, even on `:443`
+- the mux remains the only validated sandbox-to-ManyForge transport today
+- the final industrial route now depends on either:
+  - a platform-sanctioned second route from OpenShell, or
+  - an alternative routable hostname/interface that the sandbox can actually
+    reach outside the inference-local path
+
+Until that route exists and is validated from the live sandbox process, the
+mux remains the required primary transport.
+
+### 3.4 OpenShell Policy
+
+The sandbox is tight by default. Only the specific ports ManyForge needs
+are opened:
 
 ```yaml
 # policies/static/manyforge-services.yaml
 name: manyforge_services
-description: Allow sandbox to reach ManyForge Composer and Viser HMI
+description: >
+  Allow sandbox agents to reach ManyForge Composer API and Viser HMI.
+  All robot-affecting actions are gated by ManyForge's authority model
+  (velocity limits, collision monitoring, lease timeout, modification
+  policy, authority provenance).
 endpoints:
   - host: "host.openshell.internal"
     port: 9000
     protocol: rest
-    description: "ManyForge Composer REST API"
+    description: "ManyForge Composer REST API + MCP server"
   - host: "host.openshell.internal"
     port: 8081
-    protocol: rest
-    description: "ManyForge Viser 3D HMI"
+    protocol: websocket
+    description: "ManyForge Viser 3D HMI (scene snapshots)"
 ```
 
-Applied during configure-local-provider.sh or via a separate setup script.
+The sandbox still cannot:
+- Access host filesystem (Landlock)
+- Open arbitrary network connections (netns + OpenShell policy)
+- Escalate privileges (seccomp)
+- Reach ROS2 DDS (multicast blocked by netns)
+- Touch USB/serial devices (no device access in pod)
 
-### 3.4 Model Allocation
+Applied during `manyforge-stack up --with-nemoclaw` provisioning.
+
+### 3.5 Seamless Setup
+
+A single entry point provisions both ManyForge and NemoClaw:
+
+```bash
+# Full stack — ManyForge + NemoClaw + sandbox + agent
+manyforge-stack up --with-nemoclaw
+
+# ManyForge only — fully deterministic, no LLM
+manyforge-stack up
+
+# Teardown
+manyforge-stack down
+```
+
+`manyforge-stack up --with-nemoclaw` performs:
+
+1. Start ManyForge container (Composer + Kernel + ROS2, host networking)
+2. Verify vLLM is reachable on host:8000 (or start it)
+3. Write OpenShell `manyforge-services.yaml` policy
+4. Run `openshell policy apply`
+5. Provision sandbox with ManyForge agent workspace:
+   - Copy `AGENTS.md` (ManyForge domain knowledge)
+   - Copy `SOUL.md` (industrial safety boundaries)
+   - Generate/enable the ManyForge workspace plugin
+   - Repoint the provider behind `inference.local` to `host:8888`
+   - Install ManyForge AgentSkills (see Section 8)
+6. Start OpenClaw agent in sandbox
+7. Verify connectivity:
+   - Sandbox → ManyForge MCP: tool discovery check
+   - Sandbox → vLLM: model availability check
+   - ManyForge → sandbox: health endpoint check
+8. Report status (green/yellow/red for each component)
+
+Configuration lives in a single file:
+
+```yaml
+# manyforge-stack.yaml
+manyforge:
+  port: 9000
+  hmi_port: 8081
+  catalog: manyforge_behavior/resources/node_catalog.yaml
+  api_token: "${MANYFORGE_API_TOKEN}"
+
+nemoclaw:
+  enabled: true
+  vllm_endpoint: "http://localhost:8000/v1"
+  manyforge_mux_endpoint: "http://localhost:8888/v1"
+  model_id: "qwen-3.5-27b-a3b"
+  vision_model_id: "gemma-4-31b-it-nvfp4"  # optional
+  sandbox_name: "manyforge-agent"
+  agent_skills:
+    - manyforge-monitor-execution
+    - manyforge-diagnose-failure
+    - manyforge-intervene-recovery
+
+composer:
+  assistant_enabled: true  # false for deterministic-only
+  assistant_via: "sandbox"  # "sandbox" (OpenClaw) or "direct" (vLLM)
+```
+
+### 3.6 Infrastructure Health Monitoring
+
+New Composer endpoints for monitoring the full stack:
+
+```
+GET /api/infra/status
+```
+
+Returns:
+```json
+{
+  "manyforge": {
+    "status": "healthy",
+    "version": "0.9.0",
+    "kernel": "connected",
+    "ros2": "connected"
+  },
+  "vllm": {
+    "status": "healthy",
+    "endpoint": "http://localhost:8000/v1",
+    "models_loaded": ["qwen-3.5-27b-a3b"],
+    "gpu_memory_used_gb": 26.4
+  },
+  "sandbox": {
+    "status": "healthy",
+    "name": "manyforge-agent",
+    "agent_state": "idle",
+    "mcp_connected": true,
+    "uptime_s": 3421
+  }
+}
+```
+
+When any component is unhealthy or absent, the status degrades gracefully:
+- vLLM down → Modes A/B/C/D unavailable, deterministic execution unaffected
+- Sandbox down → Modes A/C/D unavailable, Mode B (direct vLLM) still works
+- ManyForge is always the authority — if it's down, everything stops
+
+The Composer frontend shows a status indicator (top bar) with expandable
+diagnostics on click.
+
+### 3.7 Model Allocation
 
 For concurrent operation of all four modes on a single Thor:
 
@@ -513,7 +967,40 @@ separate Gemma 4 instance handles vision.
 
 ## 4. Authority and Safety Model
 
-### 4.1 Authority Provenance Matrix
+### 4.1 Two-Layer Safety Architecture
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  Layer 1: Sandbox Isolation (prevents bypass)           │
+│                                                         │
+│  Agent CANNOT reach the robot except through             │
+│  ManyForge's API. Enforced by:                          │
+│  - Landlock (filesystem isolation)                      │
+│  - seccomp (syscall filtering)                          │
+│  - netns + OpenShell policy (network isolation)         │
+│  - No device access in pod                              │
+│                                                         │
+│  Only exits: host:9000 (ManyForge), host:8000 (vLLM),  │
+│              host:8081 (Viser, optional)                 │
+└────────────────────────┬────────────────────────────────┘
+                         │ HTTP only
+┌────────────────────────▼────────────────────────────────┐
+│  Layer 2: ManyForge Authority Model (prevents misuse)   │
+│                                                         │
+│  Every agent action is validated:                       │
+│  - Authority provenance (who, why, what policy)        │
+│  - Modification policy (which params are mutable)      │
+│  - Lease timeout (agent can't hold control forever)    │
+│  - Scope constraints (delegation contract limits)      │
+│  - Velocity limits (kernel-enforced, non-bypassable)   │
+│  - Collision monitoring (kernel, always active)        │
+│  - Event recording (full audit trail)                  │
+│                                                         │
+│  Only this layer touches the robot.                     │
+└─────────────────────────────────────────────────────────┘
+```
+
+### 4.2 Authority Provenance Matrix
 
 | Mode | session_kind | authority_source | approval_mode | trigger_reason |
 |------|-------------|-----------------|---------------|----------------|
@@ -523,7 +1010,7 @@ separate Gemma 4 instance handles vision.
 | C (supervisor) from IDLE | manual_intervention | llm | policy_granted | operational_decision |
 | D (assistant) | — (no session) | — | — | — (design-time only) |
 
-### 4.2 Safety Invariants
+### 4.3 Safety Invariants
 
 These invariants must hold regardless of what the LLM decides:
 
@@ -548,7 +1035,14 @@ These invariants must hold regardless of what the LLM decides:
    program YAML. Runtime overrides are tracked separately. The operator can
    always reload the original program.
 
-### 4.3 OP-4 / OP-6 Requirements
+6. **Graceful degradation**: If any LLM component fails (vLLM down, sandbox
+   crash, network partition), ManyForge continues in deterministic mode.
+   `query_model` nodes return FAILURE (handled by fallback logic in the
+   tree). `delegate_to_llm` nodes time out (lease expiry → STOPPED).
+   The Composer assistant becomes unavailable but the tree editor and
+   execution controls remain functional.
+
+### 4.4 OP-4 / OP-6 Requirements
 
 Mode A requires implementing OP-6 (delegated recovery contracts):
 
@@ -640,148 +1134,70 @@ A new behavior tree node type that delegates execution to an LLM agent.
 
 ### 5.2 `query_model` Catalog Node (Mode B)
 
-A new behavior tree node that calls a model endpoint and writes structured
-results to the blackboard.
+**Implemented in OP-7.** The `QueryModelNode` exists with:
+- Non-blocking execution via ThreadPoolExecutor
+- Deployment-side prompt templates with `{{variable}}` substitution
+- Template variable resolution from blackboard keys
+- JSON Schema validation of model responses
+- Confidence gating (`min_confidence` threshold)
+- Model audit event recording with redaction
+- Catalog entry in `node_catalog.yaml`
 
-```yaml
-- id: query_model
-  name: Query Model
-  category: integration
-  description: >-
-    Call an LLM or VLM endpoint with a prompt and optional image, parse the
-    structured response, and write results to blackboard keys. Designed for
-    per-cycle perception and decision-making in variable environments.
-  tags: [integration, llm, vlm, perception]
-  profiles:
-    min_profile: v0.0
-  kind: action
-  children:
-    min: 0
-    max: 0
-  parameters:
-    - name: endpoint
-      type: string
-      required: true
-      description: >-
-        URL of the model endpoint (OpenAI-compatible chat/completions).
-    - name: model
-      type: string
-      required: true
-      description: Model ID.
-    - name: prompt_template
-      type: string
-      required: true
-      description: >-
-        Prompt template. Supports ${bb:key} for blackboard value
-        substitution and ${scene:state} / ${scene:snapshot} for automatic
-        scene context injection.
-    - name: include_scene_snapshot
-      type: boolean
-      required: false
-      default: false
-      description: >-
-        If true, capture a scene snapshot (JPEG) and include it as an image
-        in the model request. Requires a VLM endpoint.
-    - name: response_format
-      type: string
-      required: false
-      default: json
-      description: >-
-        Expected response format. "json" parses the response as JSON and
-        writes each top-level key to the blackboard. "text" writes the raw
-        response to a single blackboard key.
-    - name: output_key_prefix
-      type: string
-      required: false
-      default: ""
-      description: >-
-        Prefix for blackboard keys written from the response. Example:
-        "perception." writes keys as "perception.target_object_id".
-    - name: min_confidence
-      type: float
-      required: false
-      default: 0.0
-      description: >-
-        If the response includes a "confidence" field and its value is below
-        this threshold, the node returns FAILURE.
-    - name: timeout_ms
-      type: integer
-      required: false
-      default: 5000
-      description: Maximum time to wait for the model response.
-  required_capabilities: []
-  execution:
-    blocking: true
-    cancellable: true
-```
+**Remaining work**: Scene snapshot injection for VLM (`include_scene_snapshot`
+parameter, in-process `ViserHmiServer.get_render()` call).
 
 ### 5.3 Composer Chat Backend (Mode D)
 
-New REST endpoint for the Composer assistant:
+New REST endpoints for the Composer assistant, proxying to the OpenClaw
+agent in the sandbox:
 
 ```
-POST /api/assistant/chat
-```
-
-Request:
-```json
-{
-  "message": "Add a bin picking loop with vision",
-  "conversationId": "conv-001"
-}
-```
-
-Response (streamed via SSE):
-```json
-{
-  "role": "assistant",
-  "content": "Here's a bin picking sequence that uses a VLM...",
-  "actions": [
-    {
-      "type": "tree_proposal",
-      "tree": { ... },
-      "description": "Proposed tree modification"
-    }
-  ],
-  "conversationId": "conv-001"
-}
+POST /api/assistant/chat     — send message, receive streamed response
+GET  /api/assistant/sessions — list active conversations
+DELETE /api/assistant/sessions/{id} — end conversation
+POST /api/assistant/actions/{id}/apply — apply a proposed tree change
+POST /api/assistant/actions/{id}/dismiss — dismiss a proposal
 ```
 
 The backend:
-1. Maintains a conversation history per `conversationId`
-2. Injects as system context: node catalog, skill catalog, current tree,
-   deployment capabilities, composition rules from LLM_GUIDE.md
-3. Calls the configured model endpoint (vLLM on Thor or cloud)
-4. Parses structured actions from the model response
-5. Returns the response with optional tree proposals that the frontend can
+1. Maintains a conversation history per session
+2. Proxies messages to the OpenClaw agent via its API (the agent has
+   ManyForge MCP tools and domain knowledge already)
+3. Parses structured actions from the agent response (tree proposals,
+   validation requests, parameter suggestions)
+4. Returns the response with optional tree proposals that the frontend can
    render as diffs
+5. SSE streaming for real-time response delivery
+
+When `assistant_via: "direct"` in config, the backend calls vLLM directly
+with injected ManyForge context (catalog, current tree, scene state) as
+system prompt. This is simpler but less capable (no tool use, no multi-step
+reasoning).
 
 ### 5.4 Composer Chat Frontend Panel
 
-A new collapsible panel in the Composer UI, alongside the existing
-PropertyPanel and ViserPanel:
+A resizable, minimizable chat overlay in the Composer UI:
+
+- **Resize**: drag edges, minimum 300px x 200px
+- **Minimize**: collapse to a rail button with unread indicator
+- **Maximize**: half-viewport width
+- **Reposition**: draggable, bottom-right default
+- **Connection indicator**: shows sandbox/LLM health status
+- **Tree proposals**: rendered inline with Apply/Dismiss buttons
+- **Manual trigger**: "Run monitoring cycle" button for Mode C ad-hoc use
+
+### 5.5 Infrastructure Status Panel
+
+A top-bar status indicator in the Composer UI showing:
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│  TreeCanvas (behavior tree editor)  │  Properties │  Viser  │
-│                                     │  Panel      │  Panel  │
-│                                     │             │         │
-│                                     │             │         │
-│─────────────────────────────────────┤             │         │
-│  Assistant Chat Panel               │             │         │
-│  ┌────────────────────────────────┐ │             │         │
-│  │ User: Add bin picking with... │ │             │         │
-│  │ Assistant: Here's a sequence  │ │             │         │
-│  │ that uses query_model for...  │ │             │         │
-│  │ [Apply to Tree] [Dismiss]     │ │             │         │
-│  ├────────────────────────────────┤ │             │         │
-│  │ Type a message...         [⏎] │ │             │         │
-│  └────────────────────────────────┘ │             │         │
-└──────────────────────────────────────────────────────────────┘
+[● ManyForge] [● vLLM] [● Sandbox]
 ```
 
-The panel is a bottom drawer that shares horizontal space with the
-TreeCanvas, collapsible via a rail button like the existing panels.
+Click expands to show diagnostics: model loaded, GPU usage, sandbox uptime,
+MCP connection status, last agent activity. When a component is missing
+(e.g., no NemoClaw configured), the indicator shows "—" (not red — absent
+is not an error in deterministic mode).
 
 ---
 
@@ -791,17 +1207,75 @@ TreeCanvas, collapsible via a rail button like the existing panels.
 
 Establish the infrastructure that all four modes depend on.
 
-| # | Deliverable | Work |
-|---|-------------|------|
-| I.1 | OpenShell policy for ManyForge | Write `manyforge-services.yaml` policy, integrate into `configure-local-provider.sh` |
-| I.2 | ManyForge SSE MCP transport | Add `/api/mcp/sse` + `/api/mcp` endpoints to the Composer backend, sharing the existing ComposerState |
-| I.3 | ManyForge as OpenClaw MCP provider | Register ManyForge's SSE endpoint in OpenClaw's `mcp.servers` config (JSON format, `url` + `headers`), verify tool auto-discovery and namespaced invocation (`mcp_manyforge_*`) from sandbox |
-| I.4 | Agent domain knowledge | Create `AGENTS.md` for the sandbox workspace with ManyForge domain knowledge (LLM_GUIDE.md content, MCP_SCHEMA.md content, composition rules, recovery patterns) and `SOUL.md` with industrial safety boundaries |
-| I.5 | Connectivity verification | End-to-end test: OpenClaw agent in sandbox → ManyForge MCP tools → load program → read tree → run cycle → poll digest → stop |
+| # | Deliverable | Status | Work |
+|---|-------------|--------|------|
+| I.1 | OpenShell policy for ManyForge | PARTIAL | Policy fragments and merge flow exist. Direct host reachability is still not the blessed baseline, so final policy shape remains tied to the dedicated-route work in Phase I.B. |
+| I.2 | ManyForge SSE MCP transport | **DONE** (OP-8) | `/api/mcp/sse` + `/api/mcp` endpoints, session management, auth, principal propagation |
+| I.3 | ManyForge tool exposure to OpenClaw main agent | **DONE** (baseline) | Workspace plugin + `tools.alsoAllow` over the muxed `inference.local` path is validated. Native `mcp.servers` remains a future simplification only after the runtime supports it. |
+| I.4 | Agent domain knowledge | **DONE** (baseline) | `AGENTS.md`, `SOUL.md`, and ManyForge-specific skills are generated and deployed into the sandbox workspace. |
+| I.5 | Connectivity verification | **DONE** (baseline) | Real embedded agent turns can enumerate `manyforge_*` tools and execute `manyforge_execution_status`. Full run/load/stop smoke coverage still belongs in I.B and later phases. |
+| I.6 | Seamless setup tooling | **DONE** (baseline) | `configure-manyforge-provider.sh`, `manyforge-stack.sh`, plugin generation, and setup docs exist. Productized packaging and smoke automation move to Phase I.B. |
+| I.7 | Infrastructure health endpoint | **DONE** (baseline) | `GET /api/infra/status` exists in ManyForge; follow-on operational checks still need to be wired into the full stack smoke path. |
 
-**Exit criteria**: An OpenClaw agent in the NemoClaw sandbox can discover
-all 12+ ManyForge MCP tools, load a program, and execute a complete
-run/monitor/stop cycle.
+**Exit criteria (baseline)**: the current stack can provision the workspace
+plugin + mux baseline, an embedded OpenClaw agent can discover `manyforge_*`
+tools, and at least one real ManyForge tool call succeeds from the embedded
+agent in the sandbox.
+
+### Phase I.B: Industrial Transport Hardening (next)
+
+Move from the validated mux baseline to the long-term industrial topology.
+
+| # | Deliverable | Status | Work |
+|---|-------------|--------|------|
+| I.B.1 | Dedicated ManyForge route design | **DONE** (design) | Final target documented in Section 3.3.2: dedicated proxy-allowed TLS route, direct JSON-RPC plugin transport to `/api/mcp`, direct inference preserved on `:8000`, explicit auth/trust/policy model. |
+| I.B.2 | Dedicated ManyForge route implementation | PARTIAL | Host-side TLS front end, plugin direct-route transport, token/CA provisioning, and fallback logic are implemented. Live sandbox validation shows `host.openshell.internal` is not currently a viable second route on this OpenShell stack: `:9443` fails with proxy `CONNECT 403`, `:443` with `access: full` also fails with proxy `CONNECT 403`, and direct no-proxy TCP to `172.17.0.1:443` is refused. |
+| I.B.3 | Plugin repoint to dedicated route | TODO | Change the workspace plugin so its endpoint is the dedicated ManyForge route rather than `https://inference.local/v1/completions`. |
+| I.B.4 | Restore direct inference in ManyForge mode | TODO | Keep the sandbox/OpenClaw client on `https://inference.local/v1`, but restore the OpenShell provider target to direct vLLM on `http://host.openshell.internal:8000/v1` even when ManyForge integration is enabled. |
+| I.B.5 | Plugin productization | **DONE** (baseline) | `build-manyforge-openclaw-plugin.py` now produces a versioned/pinned plugin artifact plus sha/metadata, and `configure-manyforge-provider.sh` installs it into OpenClaw global extensions using `OPENCLAW_STATE_DIR=/sandbox/.openclaw-data` with a writable install-time config path. Runtime origin is now `global`; workspace fallback remains only as a compatibility path if install fails on another stack. |
+| I.B.6 | End-to-end smoke tests and operational checks | **DONE** (baseline) | `manyforge-openclaw-smoke.sh` and `manyforge-stack.sh smoke` now validate direct mode and mux mode end to end: provider target, sandbox base URL, pinned plugin version, ManyForge health through `inference.local`, one real embedded `manyforge_*` tool call, and a structured terminal answer instead of free-text success. |
+| I.B.7 | Mux retirement | DEFERRED (upstream dependency) | The mux cannot leave the primary path on OpenShell `0.0.26` because no second sandbox-routable route has been validated and the embedded agent still needs the current plugin/MCP workaround surface. Keep mux as the production baseline until the upstream platform exposes the required capabilities. See `PLATFORM_REQUIREMENTS.md`. |
+
+**Acceptance criteria (industrial target)**:
+
+1. normal inference traffic no longer traverses the ManyForge mux
+2. ManyForge tool traffic uses a dedicated route distinct from the inference
+   route
+3. an embedded OpenClaw agent can call `manyforge_*` tools with the provider
+   target still set to direct vLLM on `:8000`
+4. the plugin is deployed from a versioned/pinned artifact rather than ad hoc
+   workspace-local code
+5. a single smoke command proves direct mode and ManyForge mode end to end
+
+**Current baseline after I.B.5/I.B.6**:
+
+- plugin build/provenance is versioned and pinned, and runtime loading now uses
+  an installed plugin from `~/.openclaw-data/extensions/manyforge-mcp`
+- the installer path requires `OPENCLAW_STATE_DIR=/sandbox/.openclaw-data` and a
+  writable install-time `OPENCLAW_CONFIG_PATH`; `configure-manyforge-provider.sh`
+  handles that and then merges the install provenance back into the runtime
+  config managed under `/sandbox/.openclaw/openclaw.json`
+- plugin lifecycle is operationalized on the host:
+  - versioned archives in `~/.manyforge/plugin-artifacts/`
+  - `manyforge-mcp-current.*` tracks the deployed artifact
+  - deploy/rollback surface via `manyforge-stack.sh plugin ...`
+- smoke automation is in place and should be treated as the operational gate for
+  this platform baseline
+- mux smoke validates the current deployed plugin artifact by default, so
+  rollback candidates can be verified without silently replacing them with the
+  newest build
+- the structured terminal-answer pattern is implemented in the plugin surface
+  and should be used for machine-consumed smoke/supervisory outcomes
+- smoke runs now persist machine-readable state under `~/.manyforge/smoke/`
+  and `/sandbox/.manyforge/smoke/` so operational status can report the last
+  validated baseline
+- mux retirement is not an active local engineering item on this platform
+  baseline; it is deferred to upstream OpenShell/OpenClaw capability work as
+  captured in `PLATFORM_REQUIREMENTS.md`
+
+**Fallback rule**: the muxed baseline remains supported until all I.B
+acceptance criteria are met from the live sandbox process, not just from host
+probes.
 
 ### Phase II: Composer Assistant — Mode D (2-3 weeks)
 
@@ -810,27 +1284,29 @@ for program construction.
 
 | # | Deliverable | Work |
 |---|-------------|------|
-| II.1 | Assistant chat backend | `POST /api/assistant/chat` endpoint with conversation management, context injection (catalog, skills, current tree, capabilities), model endpoint call, SSE streaming response |
-| II.2 | Assistant chat frontend | React panel component in Composer UI: message list, input field, tree proposal rendering with Apply/Dismiss buttons, conversation reset |
+| II.1 | Assistant chat backend | `POST /api/assistant/chat` endpoint proxying to OpenClaw agent in sandbox, conversation management, SSE streaming response. Fallback: direct vLLM with context injection. |
+| II.2 | Assistant chat frontend | React overlay panel: resizable, minimizable, draggable. Message list, input field, connection indicator, conversation reset. |
 | II.3 | Tree proposal integration | When the assistant proposes a tree modification, render it as a visual diff in the TreeCanvas. On "Apply", call `PUT /api/program/tree`. On "Dismiss", discard. |
-| II.4 | Model endpoint configuration | Add `--assistant-endpoint` and `--assistant-model` CLI args to `manyforge_composer`. Default to the Thor vLLM endpoint. |
-| II.5 | System prompt engineering | Develop and test the system prompt that gives the assistant deep ManyForge knowledge. Validate on tree construction tasks: build a pick-and-place, add a fallback, parameterize for runtime override, etc. |
+| II.4 | Model endpoint configuration | `assistant_enabled`, `assistant_via` in `manyforge-stack.yaml`. CLI args `--assistant-endpoint` and `--assistant-model` for direct mode. |
+| II.5 | System prompt / AGENTS.md engineering | Develop and test the agent workspace knowledge that gives the assistant deep ManyForge understanding. Validate on tree construction tasks: build a pick-and-place, add a fallback, parameterize for runtime override, etc. |
+| II.6 | Manual agent trigger | "Run once" button in chat panel that sends a one-shot request to the sandbox agent (e.g., "analyze current tree", "check execution status"). Basis for Mode C manual trigger. |
 
 **Exit criteria**: A user can open the Composer UI, type "build a
 pick-and-place program for the graspable object", and receive a valid,
-applicable tree proposal that passes validation.
+applicable tree proposal that passes validation. The chat overlay is
+resizable and minimizable.
 
 ### Phase III: Per-Cycle Perception — Mode B (2-3 weeks)
 
 Enable model-in-the-loop execution for variable-environment tasks.
 
-| # | Deliverable | Work |
-|---|-------------|------|
-| III.1 | `query_model` node implementation | New py_trees action node in `manyforge_behavior/nodes/integration.py`. Implements: HTTP call to model endpoint, prompt template rendering with blackboard/scene substitution, response parsing, blackboard write, confidence gating. |
-| III.2 | `query_model` catalog entry | Add to `node_catalog.yaml` with full parameter schema. |
-| III.3 | Scene snapshot for VLM | Ensure `GET /api/scene/snapshot` is callable from within the behavior tree tick context (in-process, no HTTP needed — direct call to ViserHmiServer.get_render()). |
-| III.4 | Example: vision-guided bin picking | A program YAML that uses `query_model` with Gemma 4 to select a target object and compute a grasp pose, then executes a parameterized pick sequence. |
-| III.5 | Tests | Unit tests with mocked model endpoint. Integration test with the real vLLM endpoint (Gemma 4 or Qwen) in the Docker container. |
+| # | Deliverable | Status | Work |
+|---|-------------|--------|------|
+| III.1 | `query_model` node implementation | **DONE** (OP-7) | `QueryModelNode` with ThreadPoolExecutor, schema validation, confidence gating, audit events |
+| III.2 | `query_model` catalog entry | **DONE** (OP-7) | Entry in `node_catalog.yaml` |
+| III.3 | Scene snapshot for VLM | TODO | In-process `ViserHmiServer.get_render()` callable from tree tick context, base64 encoding for model requests, `include_scene_snapshot` parameter |
+| III.4 | Example: vision-guided bin picking | TODO | A program YAML that uses `query_model` with Gemma 4 to select a target object and compute a grasp pose, then executes a parameterized pick sequence |
+| III.5 | Tests | PARTIAL | Unit tests with mocked endpoint exist (OP-7). Integration test with real vLLM endpoint needed. |
 
 **Exit criteria**: A bin-picking program runs multiple cycles, each time
 calling Gemma 4 to select a target, and the robot picks the selected
@@ -842,12 +1318,12 @@ The autonomous monitoring and intervention agent.
 
 | # | Deliverable | Work |
 |---|-------------|------|
-| IV.1 | Supervisory agent AGENTS.md and skills | OpenClaw `AGENTS.md` with ManyForge domain knowledge and AgentSkills-spec skills for: `monitor-execution`, `diagnose-failure`, `intervene-recovery`, `adapt-program`, `escalate-to-human`. Each skill is a deterministic, version-pinned artifact (SKILL.md with YAML frontmatter) encoding a multi-step workflow using ManyForge MCP tools. Skills should be publishable to ClawHub for reuse across deployments. |
-| IV.2 | Monitoring loop pattern | Validated agent prompt that implements: load → run → poll → detect → decide → act cycle. Test with induced failures (remove an object mid-run, inject a planning timeout). |
-| IV.3 | Authority model for LLM supervisor | Decide on IDLE gating: either keep the run→stop→intervene pattern, or implement a `llm_operator` policy. If the latter, implement OP-4 relaxation with explicit policy authorization. |
-| IV.4 | Session persistence | Extend `manyforge-session-start.sh` to restore agent state and ManyForge traces. OpenClaw stores session transcripts as JSONL under `~/.openclaw/agents/<agentId>/sessions/`; checkpoint agent conversation at key decision points. |
-| IV.5 | Escalation path | When the agent cannot resolve an issue, it produces a structured diagnostic report and sends it to the human operator via OpenClaw Gateway messaging (Telegram, Slack, WhatsApp, or configured platform). Operator responds through the same channel. Optionally also show agent diagnosis in a Composer UI notification panel. |
-| IV.6 | End-to-end integration test | Automated test: start ManyForge → start OpenClaw agent → load pick-and-place → run → induce failure → agent detects → agent recovers → program completes successfully. |
+| IV.1 | Supervisory agent skills | OpenClaw AgentSkills for ManyForge (see Section 8): `manyforge-monitor-execution`, `manyforge-diagnose-failure`, `manyforge-intervene-recovery`, `manyforge-adapt-program`, `manyforge-escalate-to-human`. Published to ClawHub. |
+| IV.2 | Monitoring loop pattern | Validated agent prompt implementing load → run → poll → detect → decide → act cycle. Test with induced failures (remove object, inject planning timeout). |
+| IV.3 | Authority model for LLM supervisor | Decide on IDLE gating: keep run→stop→intervene or implement `llm_operator` policy. If the latter, implement OP-4 relaxation with explicit policy authorization. |
+| IV.4 | Session persistence | Extend `manyforge-stack` to restore agent state and ManyForge traces across restarts. OpenClaw JSONL transcripts + ManyForge event history. |
+| IV.5 | Escalation path | Structured diagnostic → OpenClaw Gateway messaging (Telegram/Slack/etc). Composer UI notification panel for in-app escalation visibility. |
+| IV.6 | End-to-end integration test | Automated: start stack → agent loads program → runs → induced failure → agent detects → recovers → completes. Full audit trail verification. |
 
 **Exit criteria**: An OpenClaw agent autonomously supervises a pick-and-place
 execution, detects an induced failure (object removed from scene), stops
@@ -861,13 +1337,14 @@ The deepest integration — behavior tree nodes that trigger LLM agents.
 
 | # | Deliverable | Work |
 |---|-------------|------|
-| V.1 | Delegation contract format | Spec for the `delegate_to_llm` node's contract: allowed actions, scope, timeout, escalation policy. Integrate with OP-6. |
-| V.2 | `delegate_to_llm` node implementation | New py_trees action node. Implements: transition to DIRECT_CONTROL, agent invocation (via configured endpoint), scope enforcement, lease management, blackboard promotion, return to tree. |
+| V.1 | Delegation contract format | Spec for the `delegate_to_llm` node's contract: allowed actions, scope, timeout, escalation policy. Integrates with OP-6 `recovery_policy`. |
+| V.2 | `delegate_to_llm` node implementation | New py_trees action node. Transition to DIRECT_CONTROL, agent invocation via sandbox, scope enforcement, lease management, blackboard promotion, return to tree. |
 | V.3 | `delegate_to_llm` catalog entry | Add to `node_catalog.yaml`. |
-| V.4 | OP-6 implementation | `delegated_recovery` session kind accepted in CycleManager when the request carries a valid delegation contract from a tree node. |
-| V.5 | Scope enforcement | The delegate_to_llm node restricts which MCP tools the agent can call based on `allowed_actions`. Unauthorized tool calls are rejected with a clear error. |
-| V.6 | Example: pick-and-place with fallback delegation | A program that attempts pick_object, falls back to delegate_to_llm on planning failure, and the agent reasons about and resolves the obstruction. |
-| V.7 | Tests | Unit tests with mocked agent endpoint. Integration test with real agent and induced failures. |
+| V.4 | OP-6 completion | `delegated_recovery` session kind accepted in CycleManager when the request carries a valid delegation contract from a tree node. |
+| V.5 | Scope enforcement | Authorization middleware in ManyForge that checks the active delegation contract before allowing each MCP tool call. Unauthorized tool calls rejected with clear error. |
+| V.6 | Recovery skill integration | `manyforge-delegated-recovery` AgentSkill (see Section 8) that the `delegate_to_llm` node invokes. Deterministic workflow with model reasoning. |
+| V.7 | Example: pick-and-place with fallback delegation | A program that attempts pick_object, falls back to delegate_to_llm on planning failure, agent resolves obstruction. |
+| V.8 | Tests | Unit tests with mocked agent. Integration test with real agent and induced failures. |
 
 **Exit criteria**: A behavior tree with a `delegate_to_llm` fallback node
 encounters a planning failure, delegates to an LLM agent, the agent
@@ -882,61 +1359,444 @@ Every LLM interaction that affects robot behavior must be recorded.
 
 ### 7.1 Event Types
 
-New event types in the EventRecorder:
-
-| Event Type | Mode | Payload |
-|------------|------|---------|
-| `model_query_started` | B | endpoint, model, prompt_hash, include_snapshot |
-| `model_query_completed` | B | response_keys, confidence, latency_ms |
-| `model_query_failed` | B | error, latency_ms |
-| `delegation_started` | A | trigger_reason, allowed_actions, lease_timeout_ms |
-| `delegation_completed` | A | outcome, actions_taken, duration_ms |
-| `delegation_failed` | A | error, actions_attempted |
-| `delegation_expired` | A | actions_taken_before_expiry |
-| `supervisor_intervention_started` | C | anomaly_type, diagnosis_summary |
-| `supervisor_intervention_completed` | C | resolution, actions_taken |
-| `supervisor_escalated` | C | diagnosis, recommendation |
+| Event Type | Mode | Status | Payload |
+|------------|------|--------|---------|
+| `model_call_started` | B | **DONE** (OP-9) | endpoint, model, prompt_hash, template_id |
+| `model_call_completed` | B | **DONE** (OP-9) | response_hash, confidence, latency_ms, token_counts |
+| `model_call_failed` | B | **DONE** (OP-9) | error, latency_ms |
+| `delegation_started` | A | TODO | trigger_reason, allowed_actions, lease_timeout_ms |
+| `delegation_completed` | A | TODO | outcome, actions_taken, duration_ms |
+| `delegation_failed` | A | TODO | error, actions_attempted |
+| `delegation_expired` | A | TODO | actions_taken_before_expiry |
+| `supervisor_intervention_started` | C | TODO | anomaly_type, diagnosis_summary |
+| `supervisor_intervention_completed` | C | TODO | resolution, actions_taken |
+| `supervisor_escalated` | C | TODO | diagnosis, recommendation |
+| `assistant_chat_message` | D | TODO | conversation_id, message_hash, has_proposal |
+| `assistant_proposal_applied` | D | TODO | conversation_id, tree_diff_hash |
 
 ### 7.2 Debug Export Extension
 
-`GET /api/debug/export` extended with:
+`GET /api/debug/export` already includes `modelEvents` (OP-9). Extend with:
 
 ```json
 {
-  "model_queries": [
-    {
-      "timestamp_ns": ...,
-      "node_instance": "perceive_bin",
-      "endpoint": "http://host:8000/v1",
-      "model": "gemma-4-31b-it-nvfp4",
-      "prompt_hash": "sha256:abc...",
-      "response_keys": ["target_object_id", "grasp_pose"],
-      "confidence": 0.92,
-      "latency_ms": 340
-    }
-  ],
+  "modelEvents": [...],
   "delegations": [...],
-  "supervisor_actions": [...]
+  "supervisorActions": [...]
 }
 ```
 
 ### 7.3 Prompt and Response Logging
 
-For auditability in industrial settings, model prompts and responses must be
-logged to durable storage (JSONL trace sink). The event recorder writes:
+**Implemented in OP-9**: `ModelAuditPolicy` controls redaction. By default:
+- Prompts: only template_id + hash stored (not raw text)
+- Responses: only validated/structured fields + hash (not raw text)
+- Arguments: only key names + value hashes (not raw values)
 
-- Full prompt text (or hash + reference to a prompt template)
-- Full response text
-- Parsed structured output
-- Model ID, endpoint, latency, token counts
-- Correlation: run_id, session_id, node_instance
-
-Sensitive prompts (containing proprietary process parameters) should be
-flagged and stored in a separate access-controlled log.
+Full prompt/response logging can be enabled per-deployment by setting
+`store_full_prompts: true` and `store_full_responses: true` in the
+deployment YAML's `model_audit_policy`.
 
 ---
 
-## 8. Open Questions
+## 8. OpenClaw AgentSkills for ManyForge
+
+OpenClaw skills are deterministic, versioned artifacts (SKILL.md with YAML
+frontmatter) that encode multi-step workflows. They are not self-improving
+— each skill is a fixed procedure that the agent follows. This makes them
+auditable and reproducible.
+
+ManyForge needs a set of purpose-built skills that the OpenClaw agent
+uses to interact with ManyForge reliably. Without these skills, the agent
+would need to reason from scratch about ManyForge's API semantics on every
+interaction — slower, less reliable, and harder to audit.
+
+### 8.1 Skill: `manyforge-monitor-execution`
+
+**Purpose**: Structured monitoring loop for autonomous supervision (Mode C).
+
+```markdown
+---
+name: manyforge-monitor-execution
+version: 1.0.0
+description: >
+  Monitor a ManyForge execution session. Poll execution digest at a
+  configurable interval, detect anomalies, and report status changes.
+  Returns structured monitoring result with any detected issues.
+parameters:
+  poll_interval_s:
+    type: number
+    default: 3.0
+    description: Seconds between status polls
+  max_duration_s:
+    type: number
+    default: 300.0
+    description: Maximum monitoring duration before returning
+  anomaly_thresholds:
+    type: object
+    default:
+      stall_timeout_s: 30
+      error_count_limit: 3
+      cycle_time_deviation_factor: 2.0
+    description: Thresholds for anomaly detection
+tags: [manyforge, monitoring, supervision]
+---
+
+# Monitor ManyForge Execution
+
+## Steps
+
+1. Call `mcp_manyforge_execution_status` with `include: "digest"`.
+2. Record baseline: cycle count, state, timestamp.
+3. Loop every `poll_interval_s` seconds:
+   a. Call `mcp_manyforge_execution_status` with `include: "digest"`.
+   b. Compare against baseline and previous poll:
+      - State changed? Record transition.
+      - Cycle count unchanged for > `stall_timeout_s`? Flag STALL.
+      - Error count increased? Flag ERROR.
+      - Cycle time > baseline * `cycle_time_deviation_factor`? Flag SLOW.
+      - State is STOPPED and was RUNNING? Flag UNEXPECTED_STOP.
+   c. If any flag is set, return immediately with the anomaly report.
+   d. If `max_duration_s` exceeded, return with "monitoring_complete".
+4. Return structured result:
+   ```json
+   {
+     "status": "anomaly_detected" | "monitoring_complete",
+     "anomalies": [{"type": "STALL", "details": "..."}],
+     "cycles_observed": 42,
+     "duration_s": 126.3
+   }
+   ```
+
+## Error handling
+
+- If ManyForge is unreachable, retry 3 times with 2s backoff.
+- If retries exhausted, return `{"status": "connection_lost"}`.
+- Never modify ManyForge state — this skill is read-only.
+```
+
+### 8.2 Skill: `manyforge-diagnose-failure`
+
+**Purpose**: Structured failure diagnosis (Mode C, Mode A).
+
+```markdown
+---
+name: manyforge-diagnose-failure
+version: 1.0.0
+description: >
+  Diagnose a ManyForge execution failure. Collects debug export, execution
+  history, scene state, and node statuses to produce a structured diagnosis.
+parameters:
+  run_id:
+    type: string
+    required: false
+    description: Specific run ID to diagnose (default: latest)
+tags: [manyforge, diagnosis, recovery]
+---
+
+# Diagnose ManyForge Failure
+
+## Steps
+
+1. Call `mcp_manyforge_debug_export` to get the full diagnostic bundle.
+2. Extract from the export:
+   a. `executionDigest.state` — current cycle state
+   b. `executionHistory` — sequence of node executions, find the failed node
+   c. `nodeStatuses` — current status of all tree nodes
+   d. `sceneState` — current scene objects and robot configuration
+   e. `blackboard` — current blackboard state
+   f. `modelEvents` — any model calls that preceded the failure
+3. Identify the root cause:
+   a. Which node failed? What was its status message?
+   b. Was it a planning failure (object unreachable, collision)?
+   c. Was it a precondition failure (missing object, wrong config)?
+   d. Was it a timeout (model call, motion execution)?
+   e. Was it a scene mismatch (expected vs actual)?
+4. Return structured diagnosis:
+   ```json
+   {
+     "failed_node": "pick_object_1",
+     "failure_type": "planning_failed",
+     "root_cause": "Object 'part_0042' is behind collision object 'wall_1'",
+     "scene_context": {"object_pose": [...], "obstacles": [...]},
+     "suggested_actions": [
+       {"action": "scene_edit", "description": "Remove obstacle or reposition object"},
+       {"action": "runtime_override", "description": "Change approach direction"}
+     ],
+     "confidence": 0.85
+   }
+   ```
+
+## Error handling
+
+- If debug export fails, fall back to individual API calls
+  (execution_status, scene_state, kernel_snapshot).
+- Never modify ManyForge state — this skill is read-only.
+```
+
+### 8.3 Skill: `manyforge-intervene-recovery`
+
+**Purpose**: Execute a recovery intervention (Mode C).
+
+```markdown
+---
+name: manyforge-intervene-recovery
+version: 1.0.0
+description: >
+  Execute a recovery intervention on ManyForge based on a diagnosis.
+  Applies scene edits, runtime overrides, or intervention subtrees,
+  then resumes execution. Requires ManyForge to be in STOPPED state.
+parameters:
+  diagnosis:
+    type: object
+    required: true
+    description: Structured diagnosis from manyforge-diagnose-failure
+  allowed_actions:
+    type: string_list
+    default: [scene_edit, runtime_override]
+    description: Actions this recovery is allowed to take
+  auto_resume:
+    type: boolean
+    default: false
+    description: If true, resume execution after recovery. If false, leave in STOPPED.
+tags: [manyforge, recovery, intervention]
+---
+
+# Intervene and Recover
+
+## Preconditions
+
+- ManyForge must be in STOPPED state.
+- A diagnosis object must be provided.
+
+## Steps
+
+1. Verify ManyForge state is STOPPED:
+   - Call `mcp_manyforge_execution_status`.
+   - If not STOPPED, abort with error.
+
+2. Based on diagnosis.suggested_actions, execute recovery:
+
+   **If scene_edit is needed and allowed:**
+   a. Call `mcp_manyforge_scene_state` to get current scene.
+   b. Determine required edits (move object, remove obstacle, add object).
+   c. Call `mcp_manyforge_scene_edit` with the edit payload.
+   d. Call `mcp_manyforge_scene_state` again to verify the edit took effect.
+
+   **If runtime_override is needed and allowed:**
+   a. Determine which node parameters to override.
+   b. Call `mcp_manyforge_runtime_override` with action="apply",
+      node_name, params, authority_source="llm".
+   c. Verify override was accepted (check response).
+
+   **If intervention_subtree is needed and allowed:**
+   a. Build a recovery subtree (e.g., move to safe position first).
+   b. Call `mcp_manyforge_intervention` with action="execute",
+      the subtree, session_kind="manual_intervention",
+      authority_source="llm".
+   c. Monitor intervention via `mcp_manyforge_intervention(action="status")`
+      until complete.
+
+3. If auto_resume:
+   a. Call `mcp_manyforge_cycle_control(command="reset")`.
+   b. Call `mcp_manyforge_cycle_control(command="run")`.
+
+4. Return recovery result:
+   ```json
+   {
+     "status": "recovered" | "partially_recovered" | "failed",
+     "actions_taken": [{"type": "scene_edit", "details": "..."}],
+     "resumed": true
+   }
+   ```
+
+## Error handling
+
+- If any action fails, do NOT continue with remaining actions.
+- Return with status "failed" and the error details.
+- Never leave ManyForge in an inconsistent state — if a scene edit
+  succeeds but a subsequent override fails, log both results.
+```
+
+### 8.4 Skill: `manyforge-escalate-to-human`
+
+**Purpose**: Structured escalation when autonomous recovery fails (Mode C).
+
+```markdown
+---
+name: manyforge-escalate-to-human
+version: 1.0.0
+description: >
+  Escalate a ManyForge issue to a human operator via the configured
+  messaging platform. Includes structured diagnosis, recovery attempts,
+  and recommended actions.
+parameters:
+  diagnosis:
+    type: object
+    required: true
+    description: Structured diagnosis from manyforge-diagnose-failure
+  recovery_attempts:
+    type: array
+    default: []
+    description: Previous recovery attempts and their outcomes
+  urgency:
+    type: string
+    default: normal
+    enum: [low, normal, high, critical]
+    description: Urgency level for the escalation
+tags: [manyforge, escalation, operator]
+---
+
+# Escalate to Human Operator
+
+## Steps
+
+1. Format a structured escalation message:
+   ```
+   ⚠️ ManyForge Escalation [{urgency}]
+
+   System: {program_name} on {deployment_name}
+   State: STOPPED (was RUNNING)
+   Failed node: {diagnosis.failed_node}
+   Failure: {diagnosis.failure_type}
+
+   Root cause: {diagnosis.root_cause}
+
+   Recovery attempted:
+   {for each attempt: - {action}: {outcome}}
+
+   Recommended actions:
+   {for each suggestion: - {description}}
+
+   Reply with:
+   • "retry" — retry the failed operation
+   • "skip" — skip this cycle and continue
+   • "stop" — keep stopped, I'll investigate
+   • Or describe a custom action
+   ```
+
+2. Send the message via the configured platform (the OpenClaw Gateway
+   handles platform routing — Telegram, Slack, WhatsApp, etc.).
+
+3. Wait for operator response (with configurable timeout, default 30 min).
+
+4. Parse operator response and return:
+   ```json
+   {
+     "operator_decision": "retry" | "skip" | "stop" | "custom",
+     "custom_instruction": "Move the obstacle to the left",
+     "response_time_s": 45.2,
+     "operator_id": "human:alice"
+   }
+   ```
+
+## Error handling
+
+- If the messaging platform is unreachable, retry 3 times.
+- If operator doesn't respond within timeout, return
+  `{"operator_decision": "timeout"}`.
+- The agent should NOT take autonomous action after escalation timeout
+  unless explicitly authorized.
+```
+
+### 8.5 Skill: `manyforge-delegated-recovery`
+
+**Purpose**: Full recovery workflow invoked by `delegate_to_llm` node
+(Mode A). Combines diagnosis + intervention in a single skill.
+
+```markdown
+---
+name: manyforge-delegated-recovery
+version: 1.0.0
+description: >
+  Complete delegated recovery workflow for a failed behavior tree node.
+  Diagnoses the failure, attempts recovery within the allowed scope,
+  and reports the outcome. Designed to be invoked by the delegate_to_llm
+  behavior tree node.
+parameters:
+  trigger_reason:
+    type: string
+    required: true
+    description: Why this delegation was triggered (from RecoveryTrigger enum)
+  failed_node:
+    type: string
+    required: true
+    description: Instance name of the failed node
+  allowed_actions:
+    type: string_list
+    required: true
+    description: Actions this recovery is allowed to take
+  lease_timeout_ms:
+    type: integer
+    default: 120000
+    description: Maximum time for recovery
+  promote_keys:
+    type: string_list
+    default: []
+    description: Blackboard keys to promote on success
+tags: [manyforge, recovery, delegated, tree-triggered]
+---
+
+# Delegated Recovery
+
+## Preconditions
+
+- ManyForge is in DIRECT_CONTROL state (set by delegate_to_llm node).
+- The lease timeout is active — work must complete before it expires.
+
+## Steps
+
+1. **Diagnose** — run `manyforge-diagnose-failure` skill.
+2. **Plan recovery** — based on diagnosis and allowed_actions:
+   a. Filter suggested_actions by allowed_actions scope.
+   b. If no allowed actions match, return FAILURE immediately.
+   c. Rank remaining actions by likelihood of success.
+3. **Execute recovery** — run `manyforge-intervene-recovery` skill
+   with auto_resume=false (the delegate_to_llm node handles resumption).
+4. **Verify** — call `mcp_manyforge_scene_state` and
+   `mcp_manyforge_execution_status` to confirm recovery worked.
+5. **Promote blackboard keys** if specified in promote_keys.
+6. Return result:
+   ```json
+   {
+     "status": "recovered" | "failed",
+     "diagnosis": {...},
+     "actions_taken": [...],
+     "promoted_keys": [...],
+     "duration_ms": 4200
+   }
+   ```
+
+## Error handling
+
+- Monitor elapsed time against lease_timeout_ms.
+- If approaching timeout (>80% elapsed), abort current action and return.
+- Never exceed the allowed_actions scope — unauthorized actions are
+  not attempted, not even logged as "considered".
+```
+
+### 8.6 Skill Installation
+
+Skills are installed in the sandbox workspace via `openclaw skills install`:
+
+```bash
+# During manyforge-stack provisioning
+openclaw skills install manyforge-monitor-execution
+openclaw skills install manyforge-diagnose-failure
+openclaw skills install manyforge-intervene-recovery
+openclaw skills install manyforge-escalate-to-human
+openclaw skills install manyforge-delegated-recovery
+```
+
+Or published to ClawHub for cross-deployment reuse:
+
+```bash
+openclaw skills publish --hub manyforge-monitor-execution
+```
+
+---
+
+## 9. Open Questions
 
 ### Q1: Single vLLM instance or multi-model serving?
 
@@ -949,50 +1809,140 @@ The choice affects all four modes:
 
 **Decision needed before Phase III.**
 
-### Q2: MCP transport for OpenClaw → ManyForge
-
-OpenClaw's MCP client already supports SSE/HTTP and streamable-HTTP
-transports natively. The remaining work is on ManyForge's side: add
-`/api/mcp/sse` + `/api/mcp` endpoints to the Composer backend. This is
-the recommended path (Strategy A). SSH-bridged stdio (Strategy B) is a
-working fallback. REST via curl (Strategy C) is viable for early
-prototyping.
-
-**Decision: Strategy A (SSE/HTTP). Implementation in Phase I.2.**
-
-### Q3: Scope enforcement mechanism for delegate_to_llm
+### Q2: Scope enforcement mechanism for delegate_to_llm
 
 How does the delegate_to_llm node restrict the agent's tool access?
-Options:
-- MCP tool filtering at the transport level (server only exposes allowed
-  tools)
-- Authorization middleware in ManyForge that checks the active delegation
-  contract before allowing each tool call
-- Trust-based: the agent's system prompt says "only use these tools" (not
-  enforceable, not suitable for industrial use)
 
-**Decision needed before Phase V.**
+**Decision: Authorization middleware in ManyForge.** When a `delegate_to_llm`
+node activates, it registers a delegation contract with the MCP session.
+The MCP transport layer checks each incoming tool call against the contract's
+`allowed_actions` before forwarding to the tool handler. Unauthorized calls
+are rejected with a JSON-RPC error (`-32600`, "Action not permitted by
+delegation contract"). This is enforceable (not prompt-based), auditable
+(logged in event stream), and does not require MCP protocol changes.
 
-### Q4: Composer assistant — where does the model run?
-
-Options:
-- Same vLLM instance on Thor (shared with runtime modes)
-- Separate cloud endpoint (e.g., Claude API) for better design-time
-  reasoning
-- User-configurable (support both)
-
-**Decision needed in Phase II.**
-
-### Q5: IDLE → DIRECT_CONTROL for LLM supervisor
+### Q3: IDLE → DIRECT_CONTROL for LLM supervisor
 
 Keep the human-approval gate (safe, more steps for Mode C) or implement an
 explicit `llm_operator` policy (OP-4 relaxation)?
 
-**Decision needed before Phase IV.**
+**Decision needed before Phase IV.** Recommendation: keep the gate for now,
+implement `llm_operator` policy as a Phase IV.3 deliverable if the
+run→stop→intervene workflow proves too cumbersome.
+
+### Q4: Composer assistant — where does the model run?
+
+**Decision: User-configurable.** Default to sandbox (OpenClaw agent with
+full tool access). Fallback to direct vLLM when sandbox is not available.
+Configurable via `assistant_via` in `manyforge-stack.yaml`.
 
 ---
 
-## 9. Success Criteria
+## 10. Fully Deterministic Mode
+
+ManyForge must remain fully operational without any LLM dependency. This
+section defines the deterministic-only configuration and guarantees.
+
+### 10.1 What "Deterministic Mode" Means
+
+A deployment where:
+- No `query_model` nodes appear in any behavior tree
+- No `delegate_to_llm` nodes appear in any behavior tree
+- The Composer assistant is disabled (`assistant_enabled: false`)
+- No NemoClaw/OpenClaw sandbox is provisioned
+- No vLLM instance is required
+
+The operator composes behavior trees manually in the Composer UI (tree
+editor, property panel), runs them via the existing cycle controls, and
+monitors execution through the Composer UI and Viser HMI.
+
+### 10.2 Startup
+
+```bash
+# Deterministic-only — no LLM, no sandbox
+manyforge-stack up
+
+# Or directly
+python -m manyforge_composer \
+  --catalog-path manyforge_behavior/resources/node_catalog.yaml \
+  --port 9000
+```
+
+No `--mcp-http`, no `--assistant-endpoint`, no NemoClaw configuration.
+
+### 10.3 What Works Without LLM
+
+| Feature | Available? | Notes |
+|---------|-----------|-------|
+| Composer REST API | Yes | Full API, all endpoints |
+| Tree editor (frontend) | Yes | Manual composition |
+| Property panel | Yes | Manual parameter editing |
+| Viser 3D HMI | Yes | Scene visualization |
+| Cycle control (run/stop/reset) | Yes | Manual operation |
+| Execution history | Yes | EventRecorder, debug export |
+| MCP server (stdio) | Yes | For Claude Code or other MCP clients |
+| MCP server (HTTP/SSE) | Optional | Enabled via `--mcp-http` flag |
+| Runtime overrides | Yes | Manual parameter patching |
+| Intervention mode | Yes | Manual intervention subtrees |
+| Recovery nodes | Yes | FallbackOverrideNode, RecoverySkillNode (deterministic) |
+| Skill expansion | Yes | pick_object, place_object, etc. |
+| Program validation | Yes | Full tree validation |
+| Chat assistant | **No** | Requires LLM |
+| `query_model` nodes | **No** | Requires vLLM endpoint |
+| `delegate_to_llm` nodes | **No** | Requires sandbox + LLM |
+| Autonomous supervision | **No** | Requires sandbox + LLM |
+| Infrastructure status | Partial | Shows ManyForge only, vLLM/sandbox show "—" |
+
+### 10.4 Validation
+
+When `query_model` or `delegate_to_llm` nodes are present in a tree but
+no model endpoint is configured, `POST /api/program/validate` returns a
+warning (not an error):
+
+```json
+{
+  "valid": true,
+  "warnings": [
+    {
+      "node": "perceive_bin",
+      "type": "query_model",
+      "message": "No model endpoint configured. This node will return FAILURE at runtime."
+    }
+  ]
+}
+```
+
+At runtime, `query_model` returns FAILURE immediately when no endpoint is
+configured (the node's `_endpoint` is None → FAILURE on first tick). The
+tree's fallback logic handles this like any other node failure.
+
+### 10.5 Upgrade Path
+
+Moving from deterministic to LLM-assisted is additive:
+
+1. Install vLLM and load a model
+2. Add `model_endpoints` and `prompt_templates` to the deployment YAML
+3. Add `query_model` nodes to the tree where perception is needed
+4. Optionally: provision NemoClaw sandbox for Modes A/C/D
+
+No existing functionality breaks. No existing configuration changes. The
+deterministic tree continues to work exactly as before — LLM nodes are
+additions, not replacements.
+
+### 10.6 Downgrade Path
+
+Removing LLM integration is also clean:
+
+1. Remove `query_model` and `delegate_to_llm` nodes from trees
+2. Stop NemoClaw sandbox and vLLM
+3. Run `manyforge-stack up` (without `--with-nemoclaw`)
+
+Or: keep the nodes in the tree but don't configure endpoints. They return
+FAILURE, fallback logic handles it, deterministic execution continues.
+
+---
+
+## 11. Success Criteria
 
 The integration is complete when:
 
@@ -1008,9 +1958,9 @@ The integration is complete when:
    activates an LLM agent for recovery when deterministic fallback logic
    is insufficient, with scope enforcement and lease management. (Mode A)
 
-4. A human operator can use the Composer UI chat panel to interactively
-   construct valid behavior trees with an LLM assistant that understands
-   ManyForge's full node and skill catalog. (Mode D)
+4. A human operator can use the Composer UI chat overlay to interactively
+   construct valid behavior trees with an LLM assistant that has full
+   ManyForge domain knowledge and tool access. (Mode D)
 
 5. All LLM interactions that affect robot behavior are recorded with full
    authority provenance and are queryable via the existing execution
@@ -1022,3 +1972,16 @@ The integration is complete when:
 7. The saved program artifact is never silently modified by any LLM
    interaction. Runtime overrides and intervention subtrees remain
    distinguishable from persisted edits.
+
+8. ManyForge is fully operational in deterministic mode without any LLM
+   dependency. All LLM integration points are opt-in. Startup without
+   NemoClaw/vLLM does not degrade existing functionality.
+
+9. `manyforge-stack up --with-nemoclaw` provisions the full stack (ManyForge
+   + NemoClaw + sandbox + agent + skills) in a single command. The
+   Composer UI shows health status for all components.
+
+10. OpenClaw AgentSkills for ManyForge are published, versioned, and
+    deterministic. The agent follows structured workflows (monitor →
+    diagnose → intervene → escalate) rather than reasoning from scratch
+    on every interaction.

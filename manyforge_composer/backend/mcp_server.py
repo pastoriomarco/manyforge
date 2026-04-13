@@ -10,10 +10,12 @@ The server communicates over stdio using the MCP protocol.
 """
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import re
 import time
+from pathlib import Path
 from typing import Any, Optional
 
 from .state import ComposerState
@@ -805,6 +807,252 @@ def create_mcp_server(state: ComposerState):
 
         entries = [_catalog_entry_dict(entry) for entry in state.catalog.entries]
         return json.dumps({"version": state.catalog.version, "entries": entries})
+
+    # ── Scene Snapshot ──────────────────────────────────────────────────
+
+    @mcp.tool()
+    def manyforge_scene_snapshot(
+        width: int = 640,
+        height: int = 480,
+        format: str = "jpeg",
+    ) -> str:
+        """Render the 3D scene as a base64-encoded image.
+
+        Requires HMI server running (--hmi-port). Returns base64 string
+        and metadata, or error if no Viser client is connected.
+
+        Args:
+            width: Image width in pixels (64-1920, default 640)
+            height: Image height in pixels (64-1080, default 480)
+            format: Image format - "jpeg" or "png" (default "jpeg")
+        """
+        if format not in ("jpeg", "png"):
+            return json.dumps({"error": "format must be 'jpeg' or 'png'"})
+        width = max(64, min(1920, width))
+        height = max(64, min(1080, height))
+
+        hmi = state.hmi_server
+        if hmi is None:
+            return json.dumps({"error": "HMI server not running (start with --hmi-port)"})
+
+        image_bytes = hmi.render_scene(width=width, height=height, format=format)
+        if image_bytes is None:
+            return json.dumps({"error": "No Viser client connected for rendering"})
+
+        return json.dumps({
+            "image_base64": base64.b64encode(image_bytes).decode("ascii"),
+            "width": width,
+            "height": height,
+            "format": format,
+            "timestamp_ns": time.monotonic_ns(),
+        })
+
+    # ── Program Save ────────────────────────────────────────────────────
+
+    @mcp.tool()
+    def manyforge_program_save(path: Optional[str] = None) -> str:
+        """Save the currently loaded program to a YAML file.
+
+        If path is omitted, saves to the original source path.
+        Path must be within allowed filesystem roots.
+
+        Args:
+            path: Optional target path for the saved file.
+        """
+        if state.program is None:
+            return json.dumps({"error": "No program loaded"})
+
+        from .routes_program import _PROGRAM_SUFFIXES, _coerce_artifact_save_path
+
+        try:
+            target_path = _coerce_artifact_save_path(
+                path,
+                allowed_roots=state.allowed_fs_roots,
+                suffixes=_PROGRAM_SUFFIXES,
+                default_suffix=".program.yaml",
+                kind_label="Program path",
+            )
+            state.program.save(target_path)
+        except Exception as e:
+            return json.dumps({"error": str(e)})
+
+        return json.dumps({"status": "ok", "path": target_path})
+
+    # ── File Browser ────────────────────────────────────────────────────
+
+    @mcp.tool()
+    def manyforge_files(
+        path: Optional[str] = None,
+        kind: Optional[str] = None,
+    ) -> str:
+        """Browse files on disk. Returns directory listing with file metadata.
+
+        Use kind="program" or kind="deployment" to filter for artifact files.
+        Path must be within allowed filesystem roots.
+
+        Args:
+            path: Directory path to browse (default: working directory)
+            kind: Filter type - "program" or "deployment" (default: "program")
+        """
+        from .routes_filesystem import (
+            _matches_kind,
+            _normalize_browse_path,
+            _root_shortcuts,
+        )
+        from .security import normalize_allowed_roots
+
+        kind = kind or "program"
+        if kind not in ("program", "deployment"):
+            return json.dumps({"error": "kind must be 'program' or 'deployment'"})
+
+        roots = normalize_allowed_roots(state.allowed_fs_roots)
+        try:
+            current_dir = _normalize_browse_path(path, roots)
+        except Exception as e:
+            return json.dumps({"error": str(e)})
+
+        try:
+            children = list(current_dir.iterdir())
+        except PermissionError:
+            return json.dumps({"error": "Permission denied"})
+        except OSError:
+            return json.dumps({"error": "Filesystem error"})
+
+        entries = []
+        for child in children:
+            try:
+                is_dir = child.is_dir()
+            except OSError:
+                continue
+            if is_dir:
+                entries.append({"name": child.name, "path": str(child), "type": "directory"})
+            elif _matches_kind(child, kind):
+                entries.append({"name": child.name, "path": str(child), "type": "file"})
+
+        entries.sort(key=lambda e: (e["type"] != "directory", e["name"].casefold()))
+
+        parent_path = None
+        parent_dir = current_dir.parent
+        if parent_dir != current_dir:
+            from .security import is_path_within_roots
+            if is_path_within_roots(parent_dir, roots):
+                parent_path = str(parent_dir)
+
+        return json.dumps({
+            "path": str(current_dir),
+            "parent_path": parent_path,
+            "entries": entries,
+            "root_shortcuts": _root_shortcuts(roots),
+        })
+
+    # ── Deployment Reader ───────────────────────────────────────────────
+
+    @mcp.tool()
+    def manyforge_deployment() -> str:
+        """Get the currently loaded deployment configuration.
+
+        Includes robot adapters, capability keys, model endpoints,
+        prompt templates, and audit policy.
+        """
+        if state.deployment is None:
+            return json.dumps({"error": "No deployment loaded"})
+
+        from .routes_program import _deployment_to_full_response
+
+        try:
+            result = _deployment_to_full_response(
+                state.deployment, state.deployment_source_path
+            )
+        except Exception as e:
+            return json.dumps({"error": str(e)})
+
+        return json.dumps(_snakecase_keys(result))
+
+    # ── Kernel ─────────────────────────────────────────────────────────
+
+    @mcp.tool()
+    def manyforge_kernel(include: str = "snapshot") -> str:
+        """Get kernel execution state and metrics.
+
+        Args:
+            include: What to return — "snapshot", "metrics", or "all"
+
+        - snapshot: Current execution state (joint positions, active move, progress)
+        - metrics: Accumulated counters (moves executed, planning time, etc.)
+        - all: Both combined
+        """
+        from .routes_kernel import (
+            build_kernel_snapshot_payload,
+            build_kernel_metrics_payload,
+        )
+
+        result: dict[str, Any] = {}
+        if include in ("snapshot", "all"):
+            result["snapshot"] = _snakecase_keys(build_kernel_snapshot_payload(state))
+        if include in ("metrics", "all"):
+            try:
+                result["metrics"] = build_kernel_metrics_payload(state)
+            except Exception as e:
+                result["metrics"] = {"error": str(e)}
+
+        if not result:
+            return json.dumps({"error": f"Unknown include value: {include}"})
+        return json.dumps(result)
+
+    # ── Session ────────────────────────────────────────────────────────
+
+    @mcp.tool()
+    def manyforge_session(action: str = "status") -> str:
+        """Manage the composer session state.
+
+        Args:
+            action: One of "status", "reset"
+
+        - status: Return current session info (loaded program, deployment,
+          cycle state, override count, event count)
+        - reset: Unload the current program and reset all state. Use with
+          caution — this discards all runtime overrides and execution history.
+        """
+        if action == "status":
+            override_status = (
+                state.runtime_override_status()
+                if state.program is not None
+                else None
+            )
+            return json.dumps({
+                "program_loaded": state.program is not None,
+                "program_name": state.program.name if state.program else None,
+                "program_source_path": state.program_source_path,
+                "deployment_loaded": state.deployment is not None,
+                "deployment_source_path": state.deployment_source_path,
+                "cycle_state": (
+                    state.cycle_manager.state.value
+                    if state.cycle_manager
+                    else "none"
+                ),
+                "runtime_overrides": override_status,
+                "event_count": (
+                    len(state.event_recorder.history())
+                    if state.event_recorder
+                    else 0
+                ),
+            })
+
+        if action == "reset":
+            if (
+                state.cycle_manager is not None
+                and state.cycle_manager.state.value == "running"
+            ):
+                return json.dumps(
+                    {"error": "Cannot reset session while RUNNING — stop first"}
+                )
+            # Reset cycle and overrides; program stays loaded
+            if state.cycle_manager is not None:
+                state.cycle_manager.reset()
+            state.clear_runtime_overrides()
+            return json.dumps({"status": "ok", "message": "Session reset (cycle + overrides cleared)"})
+
+        return json.dumps({"error": f"Unknown action: {action}"})
 
     return mcp
 
