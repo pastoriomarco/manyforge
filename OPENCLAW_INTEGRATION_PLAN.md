@@ -240,7 +240,8 @@ Cycle start (IDLE → RUNNING)
          - approach_height_m = 0.08
       4. Node returns SUCCESS (or FAILURE if model confidence is too low)
   → tree continues with parameterized pick sequence:
-      - move_manipulator_action reads grasp_pose from blackboard
+      - move_manipulator_action reads grasp_pose from blackboard via
+        `pose_goal: "${bb:...}"`
       - pick_object skill uses target_object_id
   → deterministic execution of the planned trajectory
   → cycle completes, repeat from top
@@ -1142,9 +1143,14 @@ A new behavior tree node type that delegates execution to an LLM agent.
 - Confidence gating (`min_confidence` threshold)
 - Model audit event recording with redaction
 - Catalog entry in `node_catalog.yaml`
-
-**Remaining work**: Scene snapshot injection for VLM (`include_scene_snapshot`
-parameter, in-process `ViserHmiServer.get_render()` call).
+- Optional live scene snapshot attachment via the HMI render path
+- Mirrored structured output fields under `{output_key_prefix}/fields/...`
+  so downstream tree nodes can branch on validated model outputs
+- Fenced-JSON tolerant parsing for models that wrap valid JSON in harmless
+  markdown code fences
+- Runtime `${bb:...}` binding for `move_manipulator_action.pose_goal` and
+  `move_manipulator_action.relative_move`, so validated VLM pose outputs can
+  flow directly into motion execution without a custom adapter layer
 
 ### 5.3 Composer Chat Backend (Mode D)
 
@@ -1282,12 +1288,20 @@ probes.
 The lowest-risk mode. Design-time only, no robot motion, highest user value
 for program construction.
 
+Current baseline before Phase II work:
+- Composer already exposes deployment model endpoint aliases, prompt templates,
+  live `/v1/models` discovery, and deployment-side endpoint editing.
+- `query_model` node fields now show resolved read-only info when there is only
+  one valid deployment alias/template instead of pretending there is a choice.
+- The assistant itself is still not implemented; only the supporting model
+  configuration surfaces are now in place.
+
 | # | Deliverable | Work |
 |---|-------------|------|
 | II.1 | Assistant chat backend | `POST /api/assistant/chat` endpoint proxying to OpenClaw agent in sandbox, conversation management, SSE streaming response. Fallback: direct vLLM with context injection. |
 | II.2 | Assistant chat frontend | React overlay panel: resizable, minimizable, draggable. Message list, input field, connection indicator, conversation reset. |
 | II.3 | Tree proposal integration | When the assistant proposes a tree modification, render it as a visual diff in the TreeCanvas. On "Apply", call `PUT /api/program/tree`. On "Dismiss", discard. |
-| II.4 | Model endpoint configuration | `assistant_enabled`, `assistant_via` in `manyforge-stack.yaml`. CLI args `--assistant-endpoint` and `--assistant-model` for direct mode. |
+| II.4 | Assistant model endpoint configuration | Build on the current Composer/deployment model-endpoint surfaces. Add explicit assistant configuration (`assistant_enabled`, `assistant_via`, assistant endpoint alias/model) without conflating assistant model choice with per-node `query_model` endpoint selection. |
 | II.5 | System prompt / AGENTS.md engineering | Develop and test the agent workspace knowledge that gives the assistant deep ManyForge understanding. Validate on tree construction tasks: build a pick-and-place, add a fallback, parameterize for runtime override, etc. |
 | II.6 | Manual agent trigger | "Run once" button in chat panel that sends a one-shot request to the sandbox agent (e.g., "analyze current tree", "check execution status"). Basis for Mode C manual trigger. |
 
@@ -1302,15 +1316,99 @@ Enable model-in-the-loop execution for variable-environment tasks.
 
 | # | Deliverable | Status | Work |
 |---|-------------|--------|------|
-| III.1 | `query_model` node implementation | **DONE** (OP-7) | `QueryModelNode` with ThreadPoolExecutor, schema validation, confidence gating, audit events |
+| III.1 | `query_model` node implementation | **DONE** (OP-7) | `QueryModelNode` with ThreadPoolExecutor, schema validation, confidence gating, audit events, deployment-bound prompt templates, and response-tool support for model families that behave more reliably through tool calls than through direct JSON formatting |
 | III.2 | `query_model` catalog entry | **DONE** (OP-7) | Entry in `node_catalog.yaml` |
-| III.3 | Scene snapshot for VLM | TODO | In-process `ViserHmiServer.get_render()` callable from tree tick context, base64 encoding for model requests, `include_scene_snapshot` parameter |
-| III.4 | Example: vision-guided bin picking | TODO | A program YAML that uses `query_model` with Gemma 4 to select a target object and compute a grasp pose, then executes a parameterized pick sequence |
-| III.5 | Tests | PARTIAL | Unit tests with mocked endpoint exist (OP-7). Integration test with real vLLM endpoint needed. |
+| III.3 | Scene snapshot for VLM | **DONE** | In-process HMI render provider wired into `QueryModelNode`, OpenAI-compatible image attachment support, `include_scene_snapshot` + width/height/format parameters |
+| III.4 | Example: vision-guided perception-to-motion | **PARTIAL / INFRASTRUCTURE DEMO** | `examples/vision_guided_bin_pick.*` covers the recommended constrained pattern: VLM selects between fixed targets and deterministic motion/skills execute the pick. `examples/vision_guided_pose_pick.*` remains only as a plumbing demonstration that validated model outputs can flow through `${bb:...}` into motion nodes; it is not a recommended grasp-planning direction. |
+| III.5 | Tests | **DONE** | Unit coverage expanded for scene snapshots, multimodal request shape, structured field mirroring, blackboard-to-motion pose binding, shipped example execution, and an opt-in live vLLM vision test against the local OpenAI-compatible endpoint |
+| III.6 | Deterministic pick-planning redesign | **IN PROGRESS** | The direction is now fixed in code and plan: the model performs semantic selection only, while deterministic backend planning owns approach/pick pose synthesis and preview validation. The old pose-emission path remains scaffold only. |
+| III.7 | Scene/object source abstraction | **PARTIAL** | Initial contract is implemented: `plan_pick_sequence` supports `object_source=backend_scene` and `image_source=none|hmi_snapshot`. External detector / ROS2 / blackboard-fed sources remain future work. |
+| III.8 | Deterministic pick-plan node/service | **PARTIAL** | `plan_pick_sequence` now exists as a planning-only runtime node. It reads a selected object, bounded XYZ/RPY envelopes, previews the pick-only sequence `current -> approach -> pick -> approach` through backend planning, and writes a structured pick plan (`selected_object_id`, `approach_pose`, `pick_pose`, `attempted_candidates`, `planning_score`, `outcome`) to the blackboard. Place logic is intentionally out of scope for this node. The current implementation uses one fixed top-down planning convention internally. |
+| III.9 | Example: object-type selection + deterministic pick plan | **DONE (initial baseline)** | `examples/semantic_shape_pick.*` and `scripts/demo-shape-pick.sh` now demonstrate the intended architecture: the model performs bounded object selection through the `select_scene_object` response tool, the backend computes the actual pick-only sequence deterministically, and any later placement logic remains ordinary downstream tree logic rather than part of the planner contract. The demo currently defaults to text-only selection context; image input remains disabled by default pending better multimodal reliability. |
+| III.10 | Transition cleanup | **PLANNED** | Keep the current pose-pick implementation only as temporary scaffold while the deterministic replacement is developed. Once the new path lands, remove or refactor the out-of-spec model-to-tool-pose example/prompt/demo surfaces. |
 
 **Exit criteria**: A bin-picking program runs multiple cycles, each time
-calling Gemma 4 to select a target, and the robot picks the selected
-object at the VLM-determined pose.
+calling the configured selection model to choose a target and route into the
+corresponding pick sequence. For the industrial path, the model is limited to bounded semantic
+selection or bounded approach preferences, while the backend deterministically
+computes and validates the actual approach/grasp plan before execution. Direct
+VLM-computed grasp-pose injection is treated only as an infrastructure demo,
+not as a production direction.
+
+### Phase III.A: Industrial Pick-Planning Hardening
+
+Direct "infer final grasp pose from an RGB snapshot" is useful only as a stress
+test for the `query_model` plumbing, but it is not a credible production
+contract and should not be pursued as the main grasp-planning direction. For
+industrial use, the LLM should not own final motion-authority values. The
+preferred direction is:
+
+1. Retrieve scene context from configured sources.
+   - Optional image source: HMI/Viser snapshot initially; later camera,
+     simulator, ROS2, or blackboard image source.
+   - Mandatory object snapshot: initially privileged backend object state;
+     later blackboard snapshots from external detectors such as FoundationPose.
+   - Robot/tool context: active TCP/tool frame plus allowed offset/orientation
+     envelopes.
+2. Let the model perform bounded semantic work only.
+   - Select object ID or object class.
+   - Optionally select bounded approach family / preference ordering.
+   - Never emit unconstrained final TCP poses as the preferred production
+     path.
+3. Use deterministic backend planning for all numeric motion authority.
+   - Generate candidate approach/grasp poses from object pose, object size,
+     tool frame, and configured approach envelopes.
+   - Plan the sequence without moving the robot.
+   - Evaluate a two-step sequence where the pick-leg starts from the approach
+     leg's terminal state.
+   - Return the first feasible or best feasible plan according to a declared
+     search strategy.
+
+Current implementation baseline:
+
+- `plan_pick_sequence` is implemented in the behavior layer and backed by a
+  native `preview_motion` path in the RoboPlan bridge.
+- The initial supported contract is intentionally narrow:
+  - object source: `backend_scene`
+  - image source: `none` or `hmi_snapshot`
+  - search strategies: `first_feasible_grid`, `best_cost_grid`
+- The node writes a structured pick plan to the blackboard and does not move
+  the robot itself.
+- The semantic demo path is `semantic_shape_pick.*`, where the model chooses
+  the requested object class through a deterministic response-tool contract and
+  the backend owns numeric planning.
+- The demo currently defaults to text-only selection context because the
+  multimodal path was less reliable on the currently exercised local models.
+  Re-enabling image input remains an explicit open investigation item, not the
+  default path.
+
+This direction is specified in
+`manyforge_specs/docs/spec/475-perception-guided-pick-planning.md`.
+
+Transition rule:
+
+- The existing `vision_guided_pose_pick.*` example and related model-to-tool-pose
+  scaffolding may remain in the repo temporarily so the integration plumbing is
+  not lost during the redesign.
+- That scaffold is not a supported production workflow and must not be treated
+  as the target contract.
+- When the deterministic pick-planning path is implemented, the out-of-spec
+  pieces of the current scaffold should be refactored or removed.
+
+### Future Investigation: Learned Pose/Policy Models
+
+This work is explicitly **future investigation**, not the current production
+direction.
+
+- **3D pose-estimation models** such as FoundationPose are the more credible
+  learned path for recovering object pose/alignment from sensor data.
+- **VLA-style policy motion generation** may be worth exploring later as a
+  separate execution mode with its own authority, safety, and validation
+  contract.
+
+Neither of these should be conflated with the current `query_model` contract.
+The current production direction remains: bounded semantic selection from the
+model, deterministic pose synthesis and planning in the backend.
 
 ### Phase IV: Supervisory Operator — Mode C (3-4 weeks)
 
@@ -1916,7 +2014,38 @@ At runtime, `query_model` returns FAILURE immediately when no endpoint is
 configured (the node's `_endpoint` is None → FAILURE on first tick). The
 tree's fallback logic handles this like any other node failure.
 
-### 10.5 Upgrade Path
+### 10.5 Remaining Gaps To Close
+
+The deterministic / llm-free architecture is correct, but enforcement is not
+fully finished yet. The following gaps remain and should be tracked as
+implementation work:
+
+1. **Catalog/UI gating**: `query_model` is still exposed as a normal catalog
+   node even when no model endpoints are configured. The Composer now exposes
+   deployment model endpoints, prompt templates, and resolved single-option
+   fields more coherently, but it should still hide or clearly disable LLM-only
+   nodes in deterministic deployments.
+2. **Validation context**: tree validation must always run with the loaded
+   deployment context so missing `model_endpoint_alias` / `prompt_template_id`
+   is surfaced during authoring, not only at runtime.
+3. **Capability expression**: model-facing nodes still have no dedicated
+   capability keys, and deployments still lack explicit model-endpoint
+   capability flags such as response-tool support, image-input support, and
+   JSON-object support. Today this remains inferred operationally instead of
+   declared deterministically.
+4. **Explicit mode surface**: the backend/UI still lacks an explicit
+   deterministic vs LLM-enabled mode switch that disables assistant/model
+   affordances by configuration rather than by convention.
+5. **Assistant configuration**: deployment-side model endpoint editing now
+   exists in Composer, but assistant-specific endpoint/model configuration is
+   still not implemented and should remain distinct from per-node
+   `query_model` alias selection.
+
+Runtime fail-closed behavior is already in place, but the authoring-time
+experience should be tightened so deterministic deployments cannot drift into
+partially configured LLM usage.
+
+### 10.6 Upgrade Path
 
 Moving from deterministic to LLM-assisted is additive:
 
@@ -1929,7 +2058,7 @@ No existing functionality breaks. No existing configuration changes. The
 deterministic tree continues to work exactly as before — LLM nodes are
 additions, not replacements.
 
-### 10.6 Downgrade Path
+### 10.7 Downgrade Path
 
 Removing LLM integration is also clean:
 

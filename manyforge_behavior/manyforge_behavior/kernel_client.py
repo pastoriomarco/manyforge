@@ -141,6 +141,24 @@ class SceneObjectSnapshot:
     frame_id: Optional[str] = None
 
 
+@dataclass
+class RobotStateSnapshot:
+    joint_names: List[str] = field(default_factory=list)
+    positions_rad: List[float] = field(default_factory=list)
+    velocities_rad_s: List[float] = field(default_factory=list)
+
+
+@dataclass
+class MotionPreviewResult:
+    ok: bool = False
+    error: Optional[str] = None
+    error_details: Optional[Dict[str, Any]] = None
+    trajectory_duration_s: Optional[float] = None
+    trajectory_waypoint_count: Optional[int] = None
+    final_state: Optional[RobotStateSnapshot] = None
+    final_tcp_pose: Optional[Dict[str, Any]] = None
+
+
 def _pose_to_matrix(pos: List[float], orient_xyzw: List[float]) -> List[List[float]]:
     """Build 4x4 matrix from position + quaternion (xyzw)."""
     x, y, z, w = orient_xyzw
@@ -269,6 +287,15 @@ class KernelClient(ABC):
 
     @abstractmethod
     def invalidate_trajectories(self) -> None: ...
+
+    @abstractmethod
+    def preview_motion(
+        self,
+        request: ExecuteRequest,
+        start_state: Optional[RobotStateSnapshot] = None,
+    ) -> MotionPreviewResult:
+        """Plan + validate a motion without executing it."""
+        ...
 
     @abstractmethod
     def scene_edit(self, request: SceneEditRequest) -> SceneEditResult: ...
@@ -465,6 +492,43 @@ class MockKernelClient(KernelClient):
             self._emit_kernel_event("state_transition", from_state="idle", to_state="completed")
             self._emit_kernel_event("execute_completed")
         return ExecuteResult(ok=True, execution_id=eid)
+
+    def preview_motion(
+        self,
+        request: ExecuteRequest,
+        start_state: Optional[RobotStateSnapshot] = None,
+    ) -> MotionPreviewResult:
+        """Preview a motion without mutating execution state.
+
+        The mock keeps this deliberately simple: it accepts all requests unless
+        a failure has been injected via ``fail_next_execute`` and returns the
+        requested pose as the final TCP pose for pose-goal motions.
+        """
+        if self.fail_next_execute:
+            self.fail_next_execute = False
+            self._metrics["plans_failed"] += 1
+            return MotionPreviewResult(ok=False, error="Preview planning failed (injected)")
+
+        self._metrics["plans_succeeded"] += 1
+        self._metrics["validations_passed"] += 1
+        final_state = start_state or RobotStateSnapshot(
+            joint_names=list(self._joint_names),
+            positions_rad=[0.0 for _ in self._joint_names],
+            velocities_rad_s=[],
+        )
+        final_tcp_pose: Optional[Dict[str, Any]] = None
+        if request.motion_type == "pose_goal" and request.pose_goal is not None:
+            final_tcp_pose = {
+                "position_m": list(request.pose_goal.get("position_m", [])),
+                "orientation_xyzw": list(request.pose_goal.get("orientation_xyzw", [])),
+            }
+        return MotionPreviewResult(
+            ok=True,
+            trajectory_duration_s=1.0,
+            trajectory_waypoint_count=2,
+            final_state=final_state,
+            final_tcp_pose=final_tcp_pose,
+        )
 
     def stop(self) -> CommandResult:
         self.stop_count += 1

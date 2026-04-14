@@ -9,6 +9,7 @@ interface CycleStore {
   velocityScale: number;
   nodeStatuses: Record<string, string>;
   programLoaded: boolean;
+  programSessionGeneration: number;
   error: string | null;
 
   // Actions
@@ -28,6 +29,7 @@ export const useCycleStore = create<CycleStore>((set, get) => ({
   velocityScale: 1.0,
   nodeStatuses: {},
   programLoaded: false,
+  programSessionGeneration: 0,
   error: null,
   _ws: null,
 
@@ -72,16 +74,25 @@ export const useCycleStore = create<CycleStore>((set, get) => ({
     ws.connect();
     ws.subscribe((update) => {
       const prev = get();
+      const nextProgramSessionGeneration = update.programSessionGeneration ?? 0;
       set({
         state: update.state,
         velocityScale: update.velocityScale,
         nodeStatuses: update.nodeStatuses || {},
         programLoaded: update.programLoaded ?? false,
+        programSessionGeneration: nextProgramSessionGeneration,
+        error: update.error ?? null,
       });
       // Keep the canvas hydrated even if startup ordering or reconnect timing
       // causes the initial load edge to be missed.
       const programStore = useProgramStore.getState();
-      const needsHydration = programStore.programInfo === null || programStore.nodes.length === 0;
+      useProgramStore.setState({
+        runtimeOverrideStatus: update.runtimeOverrideStatus ?? null,
+      });
+      const needsHydration =
+        programStore.programInfo === null ||
+        programStore.nodes.length === 0 ||
+        nextProgramSessionGeneration !== prev.programSessionGeneration;
       if (update.programLoaded && (!prev.programLoaded || needsHydration)) {
         void programStore.hydrateLoadedProgram({
           retries: prev.programLoaded ? 1 : 4,

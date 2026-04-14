@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useMemo, useState } from 'react';
 import { api } from '../api/client';
 import { useCycleStore } from '../store/cycleStore';
 import { useComposerStore } from '../store/composerStore';
@@ -40,7 +40,6 @@ export function ControlBar() {
     loadProgram,
     fetchProgramInfo,
     fetchTree,
-    fetchRuntimeOverrideStatus,
     programInfo,
     runtimeOverrideStatus,
     activateRuntimeOverrides,
@@ -324,19 +323,6 @@ export function ControlBar() {
       setBusy(false);
     }
   }, [clearRuntimeOverrides]);
-
-  useEffect(() => {
-    if (!programInfo) {
-      return undefined;
-    }
-    void fetchRuntimeOverrideStatus();
-    const handle = window.setInterval(() => {
-      void fetchRuntimeOverrideStatus();
-    }, 2000);
-    return () => {
-      window.clearInterval(handle);
-    };
-  }, [fetchRuntimeOverrideStatus, programInfo?.sourcePath]);
 
   const editLocked = state === 'running' || state === 'direct_control' || busy;
   const canSaveAs = (!editLocked && !!programInfo) || (!editLocked && !!deployment);

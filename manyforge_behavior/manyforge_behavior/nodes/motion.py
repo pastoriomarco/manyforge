@@ -12,6 +12,7 @@ from manyforge_behavior.kernel_client import (
     ExecutionState,
     KernelClient,
 )
+from manyforge_behavior.parameters import BLACKBOARD_REF_RE
 
 
 def _rpy_deg_to_xyzw(rpy_deg: list[float]) -> list[float]:
@@ -39,6 +40,29 @@ def _normalize_pose_dict(pose: dict[str, Any] | None) -> dict[str, Any] | None:
         )
         return normalized
     return pose
+
+
+def _resolve_blackboard_reference(
+    blackboard: py_trees.blackboard.Client, value: Any
+) -> Any:
+    """Resolve ${bb:key} references recursively inside motion pose parameters."""
+    if isinstance(value, str):
+        match = BLACKBOARD_REF_RE.match(value)
+        if match is None:
+            return value
+        key = match.group(1)
+        blackboard.register_key(key=key, access=py_trees.common.Access.READ)
+        if not blackboard.exists(key):
+            raise KeyError(f"Missing blackboard key '{key}'")
+        return blackboard.get(key)
+    if isinstance(value, list):
+        return [_resolve_blackboard_reference(blackboard, item) for item in value]
+    if isinstance(value, dict):
+        return {
+            item_key: _resolve_blackboard_reference(blackboard, item_value)
+            for item_key, item_value in value.items()
+        }
+    return value
 
 
 class MoveManipulatorAction(py_trees.behaviour.Behaviour):
@@ -84,22 +108,66 @@ class MoveManipulatorAction(py_trees.behaviour.Behaviour):
         kernel: KernelClient = self.blackboard.kernel
 
         if not self._started:
-            pose_goal = _normalize_pose_dict(self._params.get("pose_goal"))
-            relative_move = self._params.get("relative_move")
+            try:
+                pose_goal = _resolve_blackboard_reference(
+                    self.blackboard, self._params.get("pose_goal")
+                )
+                relative_move = _resolve_blackboard_reference(
+                    self.blackboard, self._params.get("relative_move")
+                )
+            except (AttributeError, KeyError) as exc:
+                self.feedback_message = str(exc)
+                return py_trees.common.Status.FAILURE
+
+            if pose_goal is not None and not isinstance(pose_goal, dict):
+                self.feedback_message = "pose_goal blackboard reference must resolve to a mapping"
+                return py_trees.common.Status.FAILURE
+            pose_goal = _normalize_pose_dict(pose_goal)
+
             if relative_move:
+                if not isinstance(relative_move, dict):
+                    self.feedback_message = "relative_move blackboard reference must resolve to a mapping"
+                    return py_trees.common.Status.FAILURE
                 relative_move = dict(relative_move)
                 target_reference = relative_move.get("target_reference")
                 if target_reference:
+                    if not isinstance(target_reference, dict):
+                        self.feedback_message = "relative_move.target_reference must be a mapping"
+                        return py_trees.common.Status.FAILURE
                     target_reference = dict(target_reference)
                     if target_reference.get("type") == "pose":
+                        if (
+                            target_reference.get("pose") is not None
+                            and not isinstance(target_reference.get("pose"), dict)
+                        ):
+                            self.feedback_message = (
+                                "relative_move.target_reference.pose must resolve to a mapping"
+                            )
+                            return py_trees.common.Status.FAILURE
                         target_reference["pose"] = _normalize_pose_dict(target_reference.get("pose"))
                     relative_move["target_reference"] = target_reference
                 offset_reference = relative_move.get("offset_reference")
                 if offset_reference:
+                    if not isinstance(offset_reference, dict):
+                        self.feedback_message = "relative_move.offset_reference must be a mapping"
+                        return py_trees.common.Status.FAILURE
                     offset_reference = dict(offset_reference)
                     if offset_reference.get("type") == "pose":
+                        if (
+                            offset_reference.get("pose") is not None
+                            and not isinstance(offset_reference.get("pose"), dict)
+                        ):
+                            self.feedback_message = (
+                                "relative_move.offset_reference.pose must resolve to a mapping"
+                            )
+                            return py_trees.common.Status.FAILURE
                         offset_reference["pose"] = _normalize_pose_dict(offset_reference.get("pose"))
                     relative_move["offset_reference"] = offset_reference
+                if relative_move.get("offset") is not None and not isinstance(
+                    relative_move.get("offset"), dict
+                ):
+                    self.feedback_message = "relative_move.offset must be a mapping"
+                    return py_trees.common.Status.FAILURE
                 relative_move["offset"] = _normalize_pose_dict(
                     relative_move.get("offset")
                 )

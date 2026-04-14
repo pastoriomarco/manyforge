@@ -11,17 +11,26 @@ fields are applied together or not at all.
 
 from __future__ import annotations
 
+import base64
+import copy
 import hashlib
 import json
 import logging
+import math
 import os
+import re
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import py_trees
 
 logger = logging.getLogger(__name__)
+
+_FENCED_JSON_RE = re.compile(
+    r"^\s*```(?:json)?\s*(.*?)\s*```\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
 
 # Shared executor — max 2 workers to avoid thread explosion in the tick loop
 _MODEL_EXECUTOR: Optional[ThreadPoolExecutor] = None
@@ -69,6 +78,9 @@ def _call_model(
     max_tokens: int,
     timeout_s: float,
     output_schema: Optional[dict] = None,
+    response_tool: Optional[dict[str, Any]] = None,
+    scene_snapshot_bytes: Optional[bytes] = None,
+    scene_snapshot_format: str = "jpeg",
 ) -> dict[str, Any]:
     """Execute a model call synchronously (runs in thread pool).
 
@@ -80,25 +92,70 @@ def _call_model(
     """
     api_key = os.environ.get(api_key_env, "") if api_key_env else ""
 
-    if provider in ("openai", "anthropic"):
+    if provider in ("openai", "local", "anthropic"):
         import httpx
         headers: dict[str, str] = {"Content-Type": "application/json"}
         body: dict[str, Any] = {
             "model": model_id,
             "max_tokens": max_tokens,
         }
+        media_type = "image/png" if scene_snapshot_format.lower() == "png" else "image/jpeg"
+        image_b64 = (
+            base64.b64encode(scene_snapshot_bytes).decode("ascii")
+            if scene_snapshot_bytes is not None
+            else None
+        )
 
-        if provider == "openai":
+        if provider in ("openai", "local"):
             url = (base_url or "https://api.openai.com/v1") + "/chat/completions"
-            headers["Authorization"] = f"Bearer {api_key}"
-            body["messages"] = [{"role": "user", "content": prompt}]
-            if output_schema:
+            if api_key:
+                headers["Authorization"] = f"Bearer {api_key}"
+            if image_b64 is not None:
+                body["messages"] = [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:{media_type};base64,{image_b64}",
+                            },
+                        },
+                    ],
+                }]
+            else:
+                body["messages"] = [{"role": "user", "content": prompt}]
+            if response_tool is not None:
+                body["tools"] = [{
+                    "type": "function",
+                    "function": response_tool,
+                }]
+                body["tool_choice"] = "required"
+            elif output_schema:
                 body["response_format"] = {"type": "json_object"}
         else:  # anthropic
             url = (base_url or "https://api.anthropic.com/v1") + "/messages"
             headers["x-api-key"] = api_key
             headers["anthropic-version"] = "2023-06-01"
-            body["messages"] = [{"role": "user", "content": prompt}]
+            if response_tool is not None:
+                raise ValueError("response_tool is only supported for openai/local providers")
+            if image_b64 is not None:
+                body["messages"] = [{
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": media_type,
+                                "data": image_b64,
+                            },
+                        },
+                        {"type": "text", "text": prompt},
+                    ],
+                }]
+            else:
+                body["messages"] = [{"role": "user", "content": prompt}]
 
         client = _get_http_client()
         resp = client.post(
@@ -109,8 +166,10 @@ def _call_model(
         data = resp.json()
 
         # Extract text from response
-        if provider == "openai":
-            text = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+        if provider in ("openai", "local"):
+            message = data.get("choices", [{}])[0].get("message", {})
+            text = message.get("content", "")
+            tool_calls = message.get("tool_calls", [])
             model_version = data.get("model", model_id)
             usage = data.get("usage", {})
         else:
@@ -118,19 +177,30 @@ def _call_model(
             text = "".join(
                 b.get("text", "") for b in content_blocks if b.get("type") == "text"
             )
+            tool_calls = []
             model_version = data.get("model", model_id)
             usage = data.get("usage", {})
 
-        parsed = None
-        try:
-            parsed = json.loads(text)
-        except (json.JSONDecodeError, TypeError):
-            pass
+        tool_call_payload: Optional[dict[str, Any]] = None
+        if response_tool is not None and tool_calls:
+            first_call = tool_calls[0]
+            function_payload = first_call.get("function", {})
+            arguments_text = function_payload.get("arguments", "")
+            parsed = _parse_json_text(arguments_text)
+            tool_call_payload = {
+                "name": function_payload.get("name", ""),
+                "arguments_text": arguments_text,
+                "id": first_call.get("id"),
+                "raw": first_call,
+            }
+        else:
+            parsed = _parse_json_text(text)
 
         return {
             "text": text,
             "parsed": parsed,
             "model_version": model_version,
+            "tool_call": tool_call_payload,
             "usage": {
                 "input_tokens": usage.get("input_tokens") or usage.get("prompt_tokens", 0),
                 "output_tokens": usage.get("output_tokens") or usage.get("completion_tokens", 0),
@@ -138,6 +208,119 @@ def _call_model(
         }
     else:
         raise ValueError(f"Unsupported model provider: {provider}")
+
+
+def _parse_json_text(text: Any) -> Optional[Any]:
+    """Parse JSON text, tolerating fenced ```json wrappers from compliant-ish models."""
+    if not isinstance(text, str):
+        return None
+
+    candidates = [text]
+    fenced = _FENCED_JSON_RE.match(text)
+    if fenced:
+        candidates.append(fenced.group(1))
+
+    for candidate in candidates:
+        try:
+            return json.loads(candidate)
+        except (json.JSONDecodeError, TypeError):
+            continue
+    return None
+
+
+def _stringify_template_value(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=True)
+    return str(value)
+
+
+def _render_prompt_template(template_text: str, template_variables: dict[str, str]) -> str:
+    """Render ``{{ variable }}`` placeholders with optional inner whitespace."""
+    rendered = template_text
+    for var_name, var_value in template_variables.items():
+        pattern = re.compile(r"\{\{\s*" + re.escape(var_name) + r"\s*\}\}")
+        rendered = pattern.sub(var_value, rendered)
+    return rendered
+
+
+def _resolve_response_tool_template(
+    response_tool: Optional[dict[str, Any]],
+    template_variables: dict[str, Any],
+) -> Optional[dict[str, Any]]:
+    if response_tool is None:
+        return None
+    if not isinstance(response_tool, dict):
+        raise ValueError("response_tool must be a mapping")
+
+    resolved = copy.deepcopy(response_tool)
+    name = resolved.get("name")
+    if not isinstance(name, str) or not name:
+        raise ValueError("response_tool.name must be a non-empty string")
+
+    description = resolved.get("description", "")
+    if description is not None and not isinstance(description, str):
+        raise ValueError("response_tool.description must be a string")
+
+    parameters = resolved.get("parameters")
+    if parameters is not None and not isinstance(parameters, dict):
+        raise ValueError("response_tool.parameters must be a mapping when provided")
+
+    resolved["parameters"] = _resolve_output_schema_template(
+        parameters,
+        template_variables,
+    )
+    return resolved
+
+
+def _resolve_output_schema_template(
+    schema: Optional[dict[str, Any]],
+    template_variables: dict[str, Any],
+) -> Optional[dict[str, Any]]:
+    if schema is None:
+        return None
+
+    resolved = copy.deepcopy(schema)
+
+    def _walk(node: Any) -> Any:
+        if isinstance(node, dict):
+            resolved_node = {key: _walk(value) for key, value in node.items()}
+            enum_var = resolved_node.pop("x-manyforge-enum-template-variable", None)
+            allow_empty_string = bool(
+                resolved_node.pop("x-manyforge-enum-allow-empty-string", False)
+            )
+            if enum_var is not None:
+                enum_source = template_variables.get(str(enum_var))
+                if not isinstance(enum_source, list):
+                    raise ValueError(
+                        "x-manyforge-enum-template-variable must resolve to a list, "
+                        f"got {type(enum_source).__name__}"
+                    )
+                if not enum_source:
+                    raise ValueError(
+                        "x-manyforge-enum-template-variable resolved to an empty list"
+                    )
+                enum_values: list[Any] = []
+                for item in enum_source:
+                    if isinstance(item, (str, int, float, bool)) and not (
+                        isinstance(item, float) and not math.isfinite(item)
+                    ):
+                        enum_values.append(item)
+                    else:
+                        raise ValueError(
+                            "x-manyforge-enum-template-variable items must be finite "
+                            "JSON scalars"
+                        )
+                if allow_empty_string and "" not in enum_values:
+                    enum_values.append("")
+                resolved_node["enum"] = enum_values
+            return resolved_node
+        if isinstance(node, list):
+            return [_walk(item) for item in node]
+        return node
+
+    return _walk(resolved)
 
 
 class QueryModelNode(py_trees.behaviour.Behaviour):
@@ -156,11 +339,18 @@ class QueryModelNode(py_trees.behaviour.Behaviour):
         output_key_prefix: str,
         timeout_s: float = 30.0,
         min_confidence: float = 0.0,
+        include_scene_snapshot: bool = False,
+        scene_snapshot_width: int = 640,
+        scene_snapshot_height: int = 480,
+        scene_snapshot_format: str = "jpeg",
         # Injected by runner — not from program params
         endpoint: Any = None,
         template: Any = None,
         event_recorder: Any = None,
         audit_policy: Any = None,
+        scene_snapshot_provider: Optional[
+            Callable[[int, int, str], Optional[bytes]]
+        ] = None,
         # Execution context — injected by runner for audit correlation
         run_id: Optional[str] = None,
         session_id: Optional[str] = None,
@@ -173,16 +363,23 @@ class QueryModelNode(py_trees.behaviour.Behaviour):
         self._output_key_prefix = output_key_prefix
         self._timeout_s = timeout_s
         self._min_confidence = min_confidence
+        self._include_scene_snapshot = include_scene_snapshot
+        self._scene_snapshot_width = scene_snapshot_width
+        self._scene_snapshot_height = scene_snapshot_height
+        self._scene_snapshot_format = scene_snapshot_format
         self._endpoint = endpoint
         self._template = template
         self._event_recorder = event_recorder
         self._audit_policy = audit_policy
+        self._scene_snapshot_provider = scene_snapshot_provider
         self._run_id = run_id
         self._session_id = session_id
         self._principal_id = principal_id
         self._future: Optional[Future] = None
         self._call_start_ns: int = 0
         self._resolved_prompt: str = ""
+        self._resolved_output_schema: Optional[dict[str, Any]] = None
+        self._resolved_response_tool: Optional[dict[str, Any]] = None
         self._bb = py_trees.blackboard.Client(name=f"query_model_{name}")
         self._output_keys_registered = False
 
@@ -196,6 +393,7 @@ class QueryModelNode(py_trees.behaviour.Behaviour):
             f"{prefix}/timestamp_ns",
             f"{prefix}/model_version",
             f"{prefix}/status",
+            f"{prefix}/field_keys",
         ):
             self._bb.register_key(
                 key=key,
@@ -224,6 +422,8 @@ class QueryModelNode(py_trees.behaviour.Behaviour):
         self._ensure_output_keys()
         self._future = None
         self._call_start_ns = 0
+        self._resolved_output_schema = None
+        self._resolved_response_tool = None
 
         if self._endpoint is None or self._template is None:
             logger.error(
@@ -232,31 +432,79 @@ class QueryModelNode(py_trees.behaviour.Behaviour):
             return
 
         # Resolve template variables from blackboard
-        resolved_vars: dict[str, str] = {}
+        resolved_vars_raw: dict[str, Any] = {}
+        resolved_vars_prompt: dict[str, str] = {}
         for var_name, bb_key in self._template_variables.items():
             try:
                 value = self._bb.get(bb_key)
-                resolved_vars[var_name] = str(value) if value is not None else ""
+                resolved_vars_raw[var_name] = value
+                resolved_vars_prompt[var_name] = _stringify_template_value(value)
             except KeyError:
-                resolved_vars[var_name] = ""
+                resolved_vars_raw[var_name] = ""
+                resolved_vars_prompt[var_name] = ""
+
+        try:
+            self._resolved_output_schema = _resolve_output_schema_template(
+                self._template.output_schema,
+                resolved_vars_raw,
+            )
+            self._resolved_response_tool = _resolve_response_tool_template(
+                getattr(self._template, "response_tool", None),
+                resolved_vars_raw,
+            )
+        except ValueError as exc:
+            logger.error("%s: failed to resolve output contract: %s", self.name, exc)
+            self.feedback_message = f"output_contract_resolution_failed: {exc}"
+            return
 
         # Build prompt from template
-        prompt = self._template.template_text
-        for var_name, var_value in resolved_vars.items():
-            prompt = prompt.replace("{{" + var_name + "}}", var_value)
-        self._resolved_prompt = prompt
+        self._resolved_prompt = _render_prompt_template(
+            self._template.template_text,
+            resolved_vars_prompt,
+        )
+
+        scene_snapshot_bytes: Optional[bytes] = None
+        scene_snapshot_metadata: Optional[dict[str, Any]] = None
+        if self._include_scene_snapshot:
+            provider = self._scene_snapshot_provider
+            if provider is None:
+                logger.error(
+                    "%s: scene snapshot requested but no HMI render provider configured",
+                    self.name,
+                )
+                return
+            scene_snapshot_bytes = provider(
+                self._scene_snapshot_width,
+                self._scene_snapshot_height,
+                self._scene_snapshot_format,
+            )
+            if scene_snapshot_bytes is None:
+                logger.error(
+                    "%s: scene snapshot requested but no render is available",
+                    self.name,
+                )
+                return
+            scene_snapshot_metadata = {
+                "format": self._scene_snapshot_format,
+                "width": self._scene_snapshot_width,
+                "height": self._scene_snapshot_height,
+                "sha256": hashlib.sha256(scene_snapshot_bytes).hexdigest(),
+            }
 
         # Record started event
         self._call_start_ns = time.monotonic_ns()
         if self._event_recorder is not None:
+            audit_arguments = dict(resolved_vars_raw)
+            if scene_snapshot_metadata is not None:
+                audit_arguments["_scene_snapshot"] = scene_snapshot_metadata
             self._event_recorder.record_model_event(
                 action="started",
                 model_endpoint_alias=self._model_endpoint_alias,
                 prompt_template_id=self._prompt_template_id,
                 prompt_template_hash=self._template.content_hash,
                 prompt_text=self._resolved_prompt,
-                argument_keys=list(resolved_vars.keys()),
-                argument_values=resolved_vars,
+                argument_keys=list(audit_arguments.keys()),
+                argument_values=audit_arguments,
                 node_instance=self.name,
                 audit_policy=self._audit_policy,
                 **self._event_context(),
@@ -272,7 +520,10 @@ class QueryModelNode(py_trees.behaviour.Behaviour):
             prompt=self._resolved_prompt,
             max_tokens=self._endpoint.max_tokens,
             timeout_s=self._timeout_s,
-            output_schema=self._template.output_schema,
+            output_schema=self._resolved_output_schema,
+            response_tool=self._resolved_response_tool,
+            scene_snapshot_bytes=scene_snapshot_bytes,
+            scene_snapshot_format=self._scene_snapshot_format,
         )
 
     def update(self) -> py_trees.common.Status:
@@ -305,12 +556,84 @@ class QueryModelNode(py_trees.behaviour.Behaviour):
                 )
             return py_trees.common.Status.FAILURE
 
-        # Validate response against output schema if provided
+        # Validate response against output contract if provided
         parsed = result.get("parsed")
-        if self._template and self._template.output_schema and parsed is not None:
+        tool_call = result.get("tool_call")
+        if self._resolved_response_tool is not None:
+            expected_tool_name = str(self._resolved_response_tool.get("name", ""))
+            actual_tool_name = ""
+            if isinstance(tool_call, dict):
+                actual_tool_name = str(tool_call.get("name", "") or "")
+            if actual_tool_name != expected_tool_name:
+                self.feedback_message = (
+                    f"tool_call_missing_or_mismatched: expected {expected_tool_name!r}, "
+                    f"got {actual_tool_name!r}"
+                )
+                logger.error("%s: %s", self.name, self.feedback_message)
+                self._write_output("status", "tool_call_failed")
+                if self._event_recorder is not None:
+                    self._event_recorder.record_model_event(
+                        action="failed",
+                        model_endpoint_alias=self._model_endpoint_alias,
+                        prompt_template_id=self._prompt_template_id,
+                        prompt_template_hash=self._template.content_hash,
+                        response_text=result.get("text"),
+                        error=self.feedback_message,
+                        latency_ms=latency_ms,
+                        node_instance=self.name,
+                        audit_policy=self._audit_policy,
+                        **self._event_context(),
+                    )
+                return py_trees.common.Status.FAILURE
+            if parsed is None:
+                self.feedback_message = "tool_call_arguments_not_valid_json"
+                logger.error("%s: %s", self.name, self.feedback_message)
+                self._write_output("status", "tool_call_parse_failed")
+                if self._event_recorder is not None:
+                    self._event_recorder.record_model_event(
+                        action="failed",
+                        model_endpoint_alias=self._model_endpoint_alias,
+                        prompt_template_id=self._prompt_template_id,
+                        prompt_template_hash=self._template.content_hash,
+                        response_text=result.get("text"),
+                        error=self.feedback_message,
+                        latency_ms=latency_ms,
+                        node_instance=self.name,
+                        audit_policy=self._audit_policy,
+                        **self._event_context(),
+                    )
+                return py_trees.common.Status.FAILURE
             try:
-                _validate_json_schema(parsed, self._template.output_schema)
+                parameters_schema = self._resolved_response_tool.get("parameters")
+                if parameters_schema is not None:
+                    _validate_json_schema(parsed, parameters_schema)
             except ValueError as exc:
+                self.feedback_message = f"tool_schema_validation: {exc}"
+                logger.error(
+                    "%s: tool arguments schema validation failed: %s",
+                    self.name,
+                    exc,
+                )
+                self._write_output("status", "validation_failed")
+                if self._event_recorder is not None:
+                    self._event_recorder.record_model_event(
+                        action="failed",
+                        model_endpoint_alias=self._model_endpoint_alias,
+                        prompt_template_id=self._prompt_template_id,
+                        prompt_template_hash=self._template.content_hash,
+                        response_text=result.get("text"),
+                        error=f"tool_schema_validation: {exc}",
+                        latency_ms=latency_ms,
+                        node_instance=self.name,
+                        audit_policy=self._audit_policy,
+                        **self._event_context(),
+                    )
+                return py_trees.common.Status.FAILURE
+        elif self._resolved_output_schema is not None and parsed is not None:
+            try:
+                _validate_json_schema(parsed, self._resolved_output_schema)
+            except ValueError as exc:
+                self.feedback_message = f"schema_validation: {exc}"
                 logger.error(
                     "%s: response JSON schema validation failed: %s",
                     self.name,
@@ -331,7 +654,8 @@ class QueryModelNode(py_trees.behaviour.Behaviour):
                         **self._event_context(),
                     )
                 return py_trees.common.Status.FAILURE
-        elif self._template and self._template.output_schema and parsed is None:
+        elif self._resolved_output_schema is not None and parsed is None:
+            self.feedback_message = "response is not valid JSON"
             logger.error(
                 "%s: response is not valid JSON but output_schema requires it",
                 self.name,
@@ -358,8 +682,9 @@ class QueryModelNode(py_trees.behaviour.Behaviour):
         self._write_output("timestamp_ns", time.monotonic_ns())
         self._write_output("model_version", result.get("model_version", ""))
         self._write_output("status", "succeeded")
-        # confidence is derived from presence of valid structured output
-        confidence = 1.0 if parsed is not None else 0.5
+        self._write_output_fields(parsed)
+        # Confidence comes from the validated payload when available.
+        confidence = self._derive_confidence(parsed)
         self._write_output("confidence", confidence)
 
         # Record completed event
@@ -380,12 +705,23 @@ class QueryModelNode(py_trees.behaviour.Behaviour):
             )
 
         if confidence < self._min_confidence:
-            logger.warning(
-                "%s: confidence %.2f below threshold %.2f",
-                self.name,
-                confidence,
-                self._min_confidence,
-            )
+            message_parts = [
+                f"confidence {confidence:.2f} below threshold {self._min_confidence:.2f}"
+            ]
+            if isinstance(parsed, dict):
+                outcome = parsed.get("outcome")
+                if isinstance(outcome, str) and outcome:
+                    message_parts.append(f"outcome={outcome}")
+                reason = parsed.get("reason")
+                if isinstance(reason, str) and reason:
+                    message_parts.append(f"reason={reason}")
+                request_interpretation = parsed.get("request_interpretation")
+                if isinstance(request_interpretation, str) and request_interpretation:
+                    message_parts.append(
+                        f"request_interpretation={request_interpretation}"
+                    )
+            self.feedback_message = " | ".join(message_parts)
+            logger.warning("%s: %s", self.name, self.feedback_message)
             return py_trees.common.Status.FAILURE
 
         return py_trees.common.Status.SUCCESS
@@ -409,6 +745,58 @@ class QueryModelNode(py_trees.behaviour.Behaviour):
                 self._output_key_prefix,
                 key,
             )
+
+    def _write_output_fields(self, parsed: Any) -> None:
+        previous_keys = self._read_previous_field_keys()
+        field_items: list[tuple[str, Any]] = []
+        if isinstance(parsed, (dict, list)):
+            field_items = list(self._flatten_output_fields(
+                f"{self._output_key_prefix}/fields",
+                parsed,
+            ))
+
+        next_keys = [key for key, _ in field_items]
+        for key in previous_keys:
+            if key not in next_keys:
+                py_trees.blackboard.Blackboard.unset(key)
+
+        for key, value in field_items:
+            py_trees.blackboard.Blackboard.set(key, value)
+
+        self._write_output("field_keys", next_keys)
+
+    def _read_previous_field_keys(self) -> list[str]:
+        try:
+            value = self._bb.get(f"{self._output_key_prefix}/field_keys")
+        except KeyError:
+            return []
+        if isinstance(value, list):
+            return [str(item) for item in value]
+        return []
+
+    def _flatten_output_fields(
+        self,
+        prefix: str,
+        value: Any,
+    ) -> list[tuple[str, Any]]:
+        if isinstance(value, dict):
+            items: list[tuple[str, Any]] = [(prefix, value)]
+            for key, child in value.items():
+                items.extend(self._flatten_output_fields(f"{prefix}/{key}", child))
+            return items
+        if isinstance(value, list):
+            items: list[tuple[str, Any]] = [(prefix, value)]
+            for index, child in enumerate(value):
+                items.extend(self._flatten_output_fields(f"{prefix}/{index}", child))
+            return items
+        return [(prefix, value)]
+
+    def _derive_confidence(self, parsed: Any) -> float:
+        if isinstance(parsed, dict):
+            raw_confidence = parsed.get("confidence")
+            if isinstance(raw_confidence, (int, float)) and not isinstance(raw_confidence, bool):
+                return float(raw_confidence)
+        return 1.0 if parsed is not None else 0.5
 
 
 def _validate_json_schema(data: Any, schema: dict[str, Any]) -> None:
@@ -451,3 +839,6 @@ def _validate_json_schema(data: Any, schema: dict[str, Any]) -> None:
     elif schema_type == "boolean":
         if not isinstance(data, bool):
             raise ValueError(f"Expected boolean, got {type(data).__name__}")
+
+    if "enum" in schema and data not in schema["enum"]:
+        raise ValueError(f"Expected one of {schema['enum']}, got {data!r}")

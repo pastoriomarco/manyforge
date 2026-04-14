@@ -257,6 +257,7 @@ entries:
       - name: pose_goal
         type: pose
         required: false
+        ui_editor: pose
         description: >-
           Target end-effector pose in base_frame for pose_goal motion type.
           Required when motion_type=pose_goal.
@@ -910,12 +911,14 @@ entries:
       - name: model_endpoint_alias
         type: string
         required: true
+        ui_editor: deployment_model_endpoint_alias
         description: >-
           Deployment-configured model endpoint alias.
           Must match a key in deployment.model_endpoints.
       - name: prompt_template_id
         type: string
         required: true
+        ui_editor: deployment_prompt_template_id
         description: >-
           Deployment-side prompt template ID.
           Must match a key in deployment.prompt_templates.
@@ -923,6 +926,7 @@ entries:
         type: object
         required: false
         default: {}
+        ui_editor: template_variable_map
         description: >-
           Map of template variable names to blackboard key paths.
           Variables in the template text ({{var_name}}) are replaced with
@@ -950,6 +954,36 @@ entries:
         constraints:
           min_inclusive: 0.0
           max_inclusive: 1.0
+      - name: include_scene_snapshot
+        type: bool
+        required: false
+        default: false
+        description: >-
+          When true, capture a live HMI scene snapshot and attach it to the
+          model request as an image input. Requires a running HMI with at least
+          one connected Viser client.
+      - name: scene_snapshot_width
+        type: int
+        required: false
+        default: 640
+        description: Render width in pixels when include_scene_snapshot=true.
+        constraints:
+          min_inclusive: 64
+          max_inclusive: 1920
+      - name: scene_snapshot_height
+        type: int
+        required: false
+        default: 480
+        description: Render height in pixels when include_scene_snapshot=true.
+        constraints:
+          min_inclusive: 64
+          max_inclusive: 1080
+      - name: scene_snapshot_format
+        type: enum
+        required: false
+        default: jpeg
+        enum_values: [jpeg, png]
+        description: Image format for the attached scene snapshot.
     required_capabilities: []
     execution:
       blocking: false
@@ -960,4 +994,312 @@ entries:
         class: manyforge_behavior.nodes.model.QueryModelNode
     observability:
       emits_events: [model_call_started, model_call_completed, model_call_failed]
+      consumes_events: []
+
+  - id: build_scene_selection_context
+    name: Build Scene Selection Context
+    category: perception
+    description: >-
+      Deterministically build an authoritative object-selection context from
+      backend scene state. Writes candidate IDs, privileged object metadata,
+      spatial semantics, and a prompt-ready JSON manifest to the blackboard for
+      downstream model selection.
+    tags: [selection, perception, context, deterministic, blackboard]
+    profiles:
+      min_profile: v0.0
+    kind: leaf
+    children:
+      min: 0
+      max: 0
+    parameters:
+      - name: selection_request_text
+        type: string
+        required: true
+        description: >-
+          Human-authored selection request to resolve, for example "select the
+          red object" or "select the sphere". May be a literal string or a
+          ${bb:...} reference.
+      - name: output_key_prefix
+        type: string
+        required: true
+        description: >-
+          Blackboard prefix for the generated selection context.
+      - name: object_source
+        type: enum
+        required: false
+        default: backend_scene
+        enum_values: [backend_scene]
+        description: >-
+          Authoritative scene-object source. Initial implementation supports
+          backend_scene only.
+      - name: candidate_object_ids
+        type: string_list
+        required: false
+        default: []
+        description: >-
+          Optional explicit candidate object IDs. When omitted, all scene
+          objects are exposed as candidates.
+      - name: image_source
+        type: enum
+        required: false
+        default: none
+        enum_values: [none, hmi_snapshot]
+        description: >-
+          Optional auxiliary image source. When hmi_snapshot is used, the node
+          verifies that an HMI render is available and records metadata for the
+          prompt context.
+      - name: image_snapshot_width
+        type: int
+        required: false
+        default: 640
+        description: Render width in pixels when image_source=hmi_snapshot.
+        constraints:
+          min_inclusive: 64
+          max_inclusive: 1920
+      - name: image_snapshot_height
+        type: int
+        required: false
+        default: 480
+        description: Render height in pixels when image_source=hmi_snapshot.
+        constraints:
+          min_inclusive: 64
+          max_inclusive: 1080
+      - name: image_snapshot_format
+        type: enum
+        required: false
+        default: jpeg
+        enum_values: [jpeg, png]
+        description: Image format for the optional HMI snapshot metadata.
+    required_capabilities: []
+    execution:
+      blocking: true
+      cancellable: false
+    runners:
+      py_trees:
+        implementation_kind: plugin
+        class: manyforge_behavior.nodes.selection.BuildSceneSelectionContextNode
+    observability:
+      emits_events: []
+      consumes_events: []
+
+  - id: validate_scene_selection
+    name: Validate Scene Selection
+    category: perception
+    description: >-
+      Validate a model-selected object against a deterministic candidate
+      manifest built from backend scene data. Writes a validated selected
+      candidate to the blackboard and fails closed when the model output is not
+      coherent with the candidate set.
+    tags: [selection, perception, validation, deterministic, blackboard]
+    profiles:
+      min_profile: v0.0
+    kind: leaf
+    children:
+      min: 0
+      max: 0
+    parameters:
+      - name: selection_context_prefix
+        type: string
+        required: true
+        description: >-
+          Blackboard prefix produced by build_scene_selection_context.
+      - name: selection_response_prefix
+        type: string
+        required: true
+        description: >-
+          Blackboard prefix produced by query_model for the selection response.
+      - name: output_key_prefix
+        type: string
+        required: true
+        description: Blackboard prefix for the validated selection result.
+      - name: allow_no_match
+        type: bool
+        required: false
+        default: false
+        description: >-
+          When true, a valid no_match response is accepted. The node still
+          writes the no_match outcome to the blackboard.
+      - name: allow_ambiguous
+        type: bool
+        required: false
+        default: false
+        description: >-
+          When true, a valid ambiguous response is accepted. The node still
+          writes the ambiguous outcome to the blackboard.
+    required_capabilities: []
+    execution:
+      blocking: true
+      cancellable: false
+    runners:
+      py_trees:
+        implementation_kind: plugin
+        class: manyforge_behavior.nodes.selection.ValidateSceneSelectionNode
+    observability:
+      emits_events: []
+      consumes_events: []
+
+  - id: plan_pick_sequence
+    name: Plan Pick Sequence
+    category: motion
+    description: >-
+      Deterministically synthesize and preview a three-leg pick sequence for a
+      selected object using backend-authoritative scene data and bounded
+      approach envelopes. The validated sequence is current pose -> approach
+      pose -> pick pose -> approach pose. Does not execute motion; writes a
+      validated pick plan to the blackboard.
+    tags: [planning, pick, deterministic, blackboard]
+    profiles:
+      min_profile: v0.0
+    kind: leaf
+    children:
+      min: 0
+      max: 0
+    parameters:
+      - name: selected_object_id
+        type: string
+        required: true
+        description: >-
+          Object ID to plan against. May be a literal ID or a ${bb:...}
+          blackboard reference.
+      - name: output_key_prefix
+        type: string
+        required: true
+        description: >-
+          Blackboard prefix for the generated plan. The node writes
+          {prefix}/response and validated fields under {prefix}/fields/....
+      - name: object_source
+        type: enum
+        required: false
+        default: backend_scene
+        enum_values: [backend_scene]
+        description: >-
+          Authoritative object snapshot source. Initial implementation supports
+          backend_scene only.
+      - name: image_source
+        type: enum
+        required: false
+        default: none
+        enum_values: [none, hmi_snapshot]
+        description: >-
+          Optional image-source hook kept for future perception-backed planning
+          variants. The deterministic planner does not currently derive poses
+          from the image.
+      - name: image_snapshot_width
+        type: int
+        required: false
+        default: 640
+        description: Render width in pixels when image_source=hmi_snapshot.
+        constraints:
+          min_inclusive: 64
+          max_inclusive: 1920
+      - name: image_snapshot_height
+        type: int
+        required: false
+        default: 480
+        description: Render height in pixels when image_source=hmi_snapshot.
+        constraints:
+          min_inclusive: 64
+          max_inclusive: 1080
+      - name: image_snapshot_format
+        type: enum
+        required: false
+        default: jpeg
+        enum_values: [jpeg, png]
+        description: Image format for the optional HMI snapshot.
+      - name: tcp_frame
+        type: string
+        required: false
+        default: tool0
+        description: Target TCP/tool frame for the planned pick.
+      - name: pick_offset_envelope
+        type: dict
+        required: false
+        ui_editor: pose_envelope
+        default:
+          position_min_m: [0.0, 0.0, 0.0]
+          position_max_m: [0.0, 0.0, 0.0]
+          orientation_rpy_min_deg: [0.0, 0.0, 0.0]
+          orientation_rpy_max_deg: [0.0, 0.0, 0.0]
+        description: >-
+          Min/max XYZ and RPY offsets applied to the nominal grasp pose at the
+          object top surface.
+      - name: approach_offset_envelope
+        type: dict
+        required: false
+        ui_editor: pose_envelope
+        default:
+          position_min_m: [0.0, 0.0, 0.05]
+          position_max_m: [0.0, 0.0, 0.10]
+          orientation_rpy_min_deg: [0.0, 0.0, 0.0]
+          orientation_rpy_max_deg: [0.0, 0.0, 0.0]
+        description: >-
+          Min/max XYZ and RPY offsets applied to the nominal approach pose
+          relative to the candidate pick pose.
+      - name: search_strategy
+        type: enum
+        required: false
+        default: first_feasible_grid
+        enum_values: [first_feasible_grid, best_cost_grid]
+        description: Deterministic candidate search policy.
+      - name: translation_step_m
+        type: float
+        required: false
+        default: 0.01
+        description: Grid step size for translational envelope sampling.
+        constraints:
+          min_exclusive: 0.0
+      - name: rotation_step_deg
+        type: float
+        required: false
+        default: 15.0
+        description: Grid step size for rotational envelope sampling.
+        constraints:
+          min_exclusive: 0.0
+      - name: planning_timeout_s
+        type: float
+        required: false
+        default: 2.0
+        description: Planning timeout per previewed motion leg.
+        constraints:
+          min_exclusive: 0.0
+      - name: velocity_scale
+        type: float
+        required: false
+        default: 0.35
+        description: Velocity scale used for motion previews.
+        constraints:
+          min_exclusive: 0.0
+          max_inclusive: 1.0
+      - name: acceleration_scale
+        type: float
+        required: false
+        default: 1.0
+        description: Acceleration scale used for motion previews.
+        constraints:
+          min_exclusive: 0.0
+          max_inclusive: 1.0
+      - name: max_tcp_linear_speed_mps
+        type: float
+        required: false
+        description: Optional TCP speed cap enforced during preview validation.
+        constraints:
+          min_exclusive: 0.0
+    required_capabilities:
+      - planning.motion.pose_goal
+      - planning.trajectory.time_parameterized
+      - context.state.current
+      - context.validation.trajectory
+      - context.collision.check
+      - context.kinematics.fk
+      - scene.shape.box
+      - scene.shape.sphere
+    execution:
+      blocking: true
+      cancellable: false
+    runners:
+      py_trees:
+        implementation_kind: plugin
+        class: manyforge_behavior.nodes.pick_planning.PlanPickSequenceNode
+    observability:
+      emits_events: []
       consumes_events: []

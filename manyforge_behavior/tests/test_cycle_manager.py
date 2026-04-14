@@ -89,6 +89,54 @@ class TestCycleManagerRun:
         manager.run()
         assert manager.state == CycleState.RUNNING
 
+    def test_node_failure_feedback_is_exposed_as_cycle_error(self, kernel, tmp_path):
+        """Clean node failures should surface node feedback in manager.error."""
+        failing_program = tmp_path / "missing_bb.program.yaml"
+        failing_program.write_text(
+            """api_version: manyforge.program.v0
+program_profile: v0.0
+name: missing_bb_failure
+description: Motion node fails on missing blackboard key.
+catalog_version: "0.1.0"
+
+robot:
+  robot_id: ur5
+  group_id: arm
+  base_frame: base_link
+  tcp_frame: tool0
+
+scene: []
+
+parameters: []
+
+tree:
+  id: sequence
+  name: main_sequence
+  children:
+    - id: move_manipulator_action
+      name: move_missing_pose_goal
+      params:
+        move_id: missing_pose
+        motion_type: pose_goal
+        pose_goal: "${bb:missing/pose}"
+        planning_timeout_s: 0.5
+        execution_timeout_s: 0.5
+""",
+            encoding="utf-8",
+        )
+        runner = OrchestratorRunner(CATALOG_PATH, str(failing_program), kernel)
+        manager = CycleManager(runner, kernel)
+
+        manager.run()
+        deadline = time.time() + 1.0
+        while manager.state == CycleState.RUNNING and time.time() < deadline:
+            time.sleep(0.01)
+
+        assert manager.state == CycleState.IDLE
+        assert manager.error is not None
+        assert "move_missing_pose_goal" in manager.error
+        assert "Missing blackboard key 'missing/pose'" in manager.error
+
 
 class TestCycleManagerStop:
     """Test stop() method."""

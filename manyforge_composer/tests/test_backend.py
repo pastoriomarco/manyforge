@@ -18,7 +18,7 @@ from manyforge_composer.backend.state import ComposerState
 from manyforge_composer.backend.app import create_app
 from manyforge_composer.backend.security import SecurityConfig
 from manyforge_composer.__main__ import build_program_loaded_callback
-from manyforge_composer.backend import routes_filesystem
+from manyforge_composer.backend import routes_filesystem, routes_infra
 
 # Test security config: no auth, permissive filesystem roots for tmp_path access
 _TEST_SECURITY = SecurityConfig(
@@ -35,6 +35,7 @@ _PROGRAM_PATH = str(_REPO_ROOT / "manyforge_behavior" / "tests" / "fixtures" / "
 _DEPLOYMENT_PATH = str(_REPO_ROOT / "manyforge_behavior" / "tests" / "fixtures" / "ur5_roboplan.deployment.yaml")
 _EXAMPLE_PROGRAM_PATH = str(_REPO_ROOT / "examples" / "pick_and_place.program.yaml")
 _EXAMPLE_DEPLOYMENT_PATH = str(_REPO_ROOT / "examples" / "pick_and_place.deployment.yaml")
+_SEMANTIC_DEPLOYMENT_PATH = str(_REPO_ROOT / "examples" / "semantic_shape_pick.deployment.yaml")
 
 
 def _write_program_with_runtime_policy(
@@ -89,6 +90,27 @@ def test_status_no_program(client):
     data = response.json()
     assert data["state"] == "idle"
     assert data["velocityScale"] == 1.0
+
+
+def test_runtime_override_status_no_program_returns_empty_state(client):
+    """GET /api/program/runtime-overrides should be stable before any program is loaded."""
+    response = client.get("/api/program/runtime-overrides")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["active"] == []
+    assert data["staged"] == []
+    assert data["stale"] == []
+    assert data["activeCount"] == 0
+    assert data["stagedCount"] == 0
+    assert data["staleCount"] == 0
+    assert data["hasActive"] is False
+    assert data["hasStaged"] is False
+    assert data["hasStale"] is False
+    assert data["canActivateNow"] is False
+    assert data["requiresResetToActivate"] is False
+    assert data["currentTreeOrigin"] == "saved_program"
+    assert data["baseProgramHash"] == ""
+    assert data["nextEffectiveTree"] is None
 
 
 def test_run_no_program_409(client):
@@ -219,6 +241,17 @@ def test_catalog_entry_includes_blackboard_metadata(client):
     data = response.json()
     assert data["bbReaderParams"] == []
     assert data["bbWriterParams"] == ["key"]
+
+
+def test_catalog_entry_includes_ui_editor_hints(client):
+    """Catalog entry surfaces UI editor hints for structured parameters."""
+    response = client.get("/api/catalog/plan_pick_sequence")
+    assert response.status_code == 200
+    data = response.json()
+    params = {param["name"]: param for param in data["parameters"]}
+    assert params["pick_offset_envelope"]["uiEditor"] == "pose_envelope"
+    assert params["approach_offset_envelope"]["uiEditor"] == "pose_envelope"
+    assert "place_pose_map" not in params
 
 
 def test_catalog_entry_not_found(client):
@@ -1092,6 +1125,41 @@ def test_get_full_deployment(client):
     assert "adapters" in data
     assert "orchestrator" in data
     assert "launch" in data
+
+
+def test_get_full_deployment_includes_model_metadata(client):
+    """GET /api/deployment/full includes model endpoints and prompt templates when configured."""
+    client.post("/api/deployment/load", json={"path": _SEMANTIC_DEPLOYMENT_PATH})
+
+    response = client.get("/api/deployment/full")
+    assert response.status_code == 200
+    data = response.json()
+    assert "modelEndpoints" in data
+    assert "promptTemplates" in data
+    assert "selection_model" in data["modelEndpoints"]
+    assert "select_scene_object_v1" in data["promptTemplates"]
+    assert data["modelEndpoints"]["selection_model"]["modelId"] == "gemma-4-E4B-it"
+    assert data["promptTemplates"]["select_scene_object_v1"]["responseTool"]["name"] == "select_scene_object"
+
+
+def test_infra_model_endpoints_reports_configured_and_live_models(client, monkeypatch):
+    """GET /api/infra/model-endpoints exposes deployment aliases plus deterministic /v1/models discovery."""
+    client.post("/api/deployment/load", json={"path": _SEMANTIC_DEPLOYMENT_PATH})
+
+    monkeypatch.setattr(
+        routes_infra,
+        "_probe_openai_compatible_models",
+        lambda base_url: (["Qwen3.5-9B-Claude-Distilled-NVFP4", "gemma-4-E4B-it"], None),
+    )
+
+    response = client.get("/api/infra/model-endpoints")
+    assert response.status_code == 200
+    data = response.json()
+    assert "selection_model" in data["endpoints"]
+    endpoint = data["endpoints"]["selection_model"]
+    assert endpoint["configuredModelId"] == "gemma-4-E4B-it"
+    assert endpoint["probeStatus"] == "ok"
+    assert "Qwen3.5-9B-Claude-Distilled-NVFP4" in endpoint["availableModelIds"]
 
 
 def test_get_saved_full_deployment_reflects_disk_not_applied_runtime(client):

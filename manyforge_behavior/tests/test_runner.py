@@ -1,12 +1,16 @@
 """Tests for the orchestrator runner."""
 
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 import py_trees
 import yaml
 
+from manyforge_behavior.catalog import NodeCatalog
+from manyforge_behavior.deployment import Deployment
 from manyforge_behavior.kernel_client import ExecutionState, MockKernelClient
+from manyforge_behavior.program import Program
 from manyforge_behavior.runner import OrchestratorRunner
 
 CATALOG_PATH = str(Path(__file__).parent.parent / "resources" / "node_catalog.yaml")
@@ -15,6 +19,24 @@ FIXTURE_PATH = str(
 )
 DEPLOYMENT_FIXTURE = str(
     Path(__file__).parent / "fixtures" / "test.deployment.yaml"
+)
+VISION_PROGRAM_EXAMPLE = str(
+    Path(__file__).parent.parent.parent / "examples" / "vision_guided_bin_pick.program.yaml"
+)
+VISION_DEPLOYMENT_EXAMPLE = str(
+    Path(__file__).parent.parent.parent / "examples" / "vision_guided_bin_pick.deployment.yaml"
+)
+VISION_POSE_PROGRAM_EXAMPLE = str(
+    Path(__file__).parent.parent.parent / "examples" / "vision_guided_pose_pick.program.yaml"
+)
+VISION_POSE_DEPLOYMENT_EXAMPLE = str(
+    Path(__file__).parent.parent.parent / "examples" / "vision_guided_pose_pick.deployment.yaml"
+)
+SEMANTIC_SHAPE_PROGRAM_EXAMPLE = str(
+    Path(__file__).parent.parent.parent / "examples" / "semantic_shape_pick.program.yaml"
+)
+SEMANTIC_SHAPE_DEPLOYMENT_EXAMPLE = str(
+    Path(__file__).parent.parent.parent / "examples" / "semantic_shape_pick.deployment.yaml"
 )
 
 
@@ -232,6 +254,363 @@ class TestRunnerDeployment:
         runner.load()
         assert runner.deployment is None
         runner.build_tree()  # Should not raise
+
+    def test_query_model_receives_scene_snapshot_provider(self, kernel):
+        """Runner threads the configured HMI render callback into query_model nodes."""
+        catalog = NodeCatalog(CATALOG_PATH)
+        program = Program.from_dict(
+            {
+                "api_version": "manyforge.program.v0",
+                "program_profile": "v0.0",
+                "name": "query_model_program",
+                "catalog_version": "0.1.0",
+                "robot": {
+                    "robot_id": "ur5",
+                    "group_id": "arm",
+                    "base_frame": "base_link",
+                    "tcp_frame": "tool0",
+                },
+                "tree": {
+                    "id": "query_model",
+                    "name": "pick_target",
+                    "params": {
+                        "model_endpoint_alias": "local_vlm",
+                        "prompt_template_id": "pick_target_v1",
+                        "output_key_prefix": "vlm/target",
+                        "include_scene_snapshot": True,
+                    },
+                },
+            },
+            catalog,
+        )
+        deployment = Deployment.from_dict(
+            {
+                "api_version": "manyforge.deployment.v0",
+                "schema_version": "0.1.0",
+                "name": "query_model_deployment",
+                "program_profile": "v0.0",
+                "robot_config": {
+                    "robot_id": "ur5",
+                    "group_id": "arm",
+                    "urdf_path": "package://test.urdf",
+                    "global_max_tcp_linear_speed_mps": 0.25,
+                },
+                "adapters": {
+                    "planning": {"adapter_id": "planning.test", "adapter_version": "0.1.0", "config": {}},
+                    "context": {"adapter_id": "context.test", "adapter_version": "0.1.0", "config": {}},
+                    "execution": {"adapter_id": "execution.test", "adapter_version": "0.1.0", "config": {}},
+                },
+                "orchestrator": {"engine": "py_trees", "config": {}},
+                "launch": {"runner": {"module": "manyforge_behavior.runner", "args": []}},
+                "model_endpoints": {
+                    "local_vlm": {
+                        "provider": "openai",
+                        "model_id": "gemma-test",
+                        "base_url": "http://localhost:8000/v1",
+                    }
+                },
+                "prompt_templates": {
+                    "pick_target_v1": {
+                        "version": "1",
+                        "template_text": "Pick a target",
+                        "output_schema": {
+                            "type": "object",
+                            "required": ["pick_left_bin"],
+                            "properties": {"pick_left_bin": {"type": "boolean"}},
+                        },
+                    }
+                },
+            }
+        )
+
+        def render_scene(width: int, height: int, format: str):
+            return b"fake-image"
+
+        runner = OrchestratorRunner(
+            CATALOG_PATH,
+            FIXTURE_PATH,
+            kernel,
+            program=program,
+            deployment=deployment,
+            scene_snapshot_provider=render_scene,
+        )
+        runner.load()
+        tree = runner.build_tree()
+
+        assert tree.root.name == "pick_target"
+        assert getattr(tree.root, "_include_scene_snapshot") is True
+        assert getattr(tree.root, "_scene_snapshot_provider") is render_scene
+
+    @patch("manyforge_behavior.nodes.model._call_model")
+    def test_vision_guided_example_runs_on_mock_kernel(self, mock_call, kernel):
+        """The shipped vision-guided example validates and executes one branch."""
+        mock_call.return_value = {
+            "text": '{"pick_left_bin": true, "selected_object_id": "left_part", "confidence": 0.91, "reason": "left object is clearer"}',
+            "parsed": {
+                "pick_left_bin": True,
+                "selected_object_id": "left_part",
+                "confidence": 0.91,
+                "reason": "left object is clearer",
+            },
+            "model_version": "gemma-test",
+            "usage": {"input_tokens": 12, "output_tokens": 8},
+        }
+
+        runner = OrchestratorRunner(
+            CATALOG_PATH,
+            VISION_PROGRAM_EXAMPLE,
+            kernel,
+            deployment_path=VISION_DEPLOYMENT_EXAMPLE,
+            scene_snapshot_provider=lambda width, height, format: b"fake-image",
+        )
+        runner.load()
+        runner.build_tree()
+        runner.apply_scene()
+
+        result = runner.run(max_ticks=200)
+
+        assert result is True
+        assert kernel.execute_count >= 1
+
+    @patch("manyforge_behavior.nodes.model._call_model")
+    def test_vision_guided_pose_example_runs_on_mock_kernel(self, mock_call, kernel):
+        """The shipped pose-injection example executes motion from VLM pose output."""
+        mock_call.return_value = {
+            "text": (
+                '{"selected_object_id": "left_part", '
+                '"approach_pose": {"position_m": [0.40, -0.14, 0.34], '
+                '"orientation_rpy_deg": [180.0, 0.0, -90.0]}, '
+                '"grasp_pose": {"position_m": [0.40, -0.14, 0.26], '
+                '"orientation_rpy_deg": [180.0, 0.0, -90.0]}, '
+                '"confidence": 0.92, "reason": "left part is isolated"}'
+            ),
+            "parsed": {
+                "selected_object_id": "left_part",
+                "approach_pose": {
+                    "position_m": [0.40, -0.14, 0.34],
+                    "orientation_rpy_deg": [180.0, 0.0, -90.0],
+                },
+                "grasp_pose": {
+                    "position_m": [0.40, -0.14, 0.26],
+                    "orientation_rpy_deg": [180.0, 0.0, -90.0],
+                },
+                "confidence": 0.92,
+                "reason": "left part is isolated",
+            },
+            "model_version": "gemma-test",
+            "usage": {"input_tokens": 24, "output_tokens": 16},
+        }
+
+        runner = OrchestratorRunner(
+            CATALOG_PATH,
+            VISION_POSE_PROGRAM_EXAMPLE,
+            kernel,
+            deployment_path=VISION_POSE_DEPLOYMENT_EXAMPLE,
+            scene_snapshot_provider=lambda width, height, format: b"fake-image",
+        )
+        runner.load()
+        runner.build_tree()
+        runner.apply_scene()
+
+        result = runner.run(max_ticks=200)
+
+        assert result is True
+        assert kernel.execute_count >= 4
+        assert kernel.last_execute_request is not None
+        assert kernel.last_execute_request.move_id == "vlm_place_pose"
+        assert kernel.last_execute_request.pose_goal is not None
+        assert kernel.last_execute_request.pose_goal["position_m"] == [0.22, 0.0, 0.30]
+
+    @patch("manyforge_behavior.nodes.model._call_model")
+    def test_semantic_shape_pick_example_runs_on_mock_kernel(self, mock_call, kernel):
+        """The semantic shape-pick example uses deterministic planning after model selection."""
+        mock_call.return_value = {
+            "text": "",
+            "parsed": {
+                "outcome": "selected",
+                "selected_object_id": "sphere_part",
+                "matched_attributes": ["shape=sphere"],
+                "confidence": 0.95,
+                "reason": "sphere requested",
+            },
+            "tool_call": {
+                "name": "select_scene_object",
+                "arguments_text": (
+                    '{"outcome": "selected", "selected_object_id": "sphere_part", '
+                    '"matched_attributes": ["shape=sphere"], '
+                    '"confidence": 0.95, "reason": "sphere requested"}'
+                ),
+                "id": "call_1",
+                "raw": {},
+            },
+            "model_version": "gemma-test",
+            "usage": {"input_tokens": 20, "output_tokens": 10},
+        }
+
+        runner = OrchestratorRunner(
+            CATALOG_PATH,
+            SEMANTIC_SHAPE_PROGRAM_EXAMPLE,
+            kernel,
+            deployment_path=SEMANTIC_SHAPE_DEPLOYMENT_EXAMPLE,
+            scene_snapshot_provider=lambda width, height, format: b"fake-image",
+        )
+        runner.load()
+        runner.build_tree()
+        runner.apply_scene()
+
+        result = runner.run(max_ticks=300)
+
+        assert result is True
+        assert kernel.execute_count >= 6
+        assert kernel.last_execute_request is not None
+        assert kernel.last_execute_request.move_id == "planned_place_retreat"
+        assert kernel.get_metrics()["plans_succeeded"] >= 2
+
+    @patch("manyforge_behavior.nodes.model._call_model")
+    def test_query_model_can_drive_motion_pose_goal_via_blackboard(self, mock_call, kernel):
+        """Structured VLM output can feed a downstream move_manipulator pose goal."""
+        mock_call.return_value = {
+            "text": (
+                '{"grasp_pose": {"position_m": [0.42, -0.05, 0.31], '
+                '"orientation_rpy_deg": [180.0, 0.0, -90.0]}, "confidence": 0.94}'
+            ),
+            "parsed": {
+                "grasp_pose": {
+                    "position_m": [0.42, -0.05, 0.31],
+                    "orientation_rpy_deg": [180.0, 0.0, -90.0],
+                },
+                "confidence": 0.94,
+            },
+            "model_version": "gemma-test",
+            "usage": {"input_tokens": 18, "output_tokens": 12},
+        }
+
+        program = Program.from_dict(
+            {
+                "api_version": "manyforge.program.v0",
+                "program_profile": "v0.0",
+                "name": "vlm_pose_goal_program",
+                "catalog_version": "0.1.0",
+                "robot": {
+                    "robot_id": "ur5",
+                    "group_id": "arm",
+                    "base_frame": "base_link",
+                    "tcp_frame": "tool0",
+                },
+                "tree": {
+                    "id": "sequence",
+                    "name": "root",
+                    "children": [
+                        {
+                            "id": "query_model",
+                            "name": "infer_grasp_pose",
+                            "params": {
+                                "model_endpoint_alias": "local_vlm",
+                                "prompt_template_id": "grasp_pose_v1",
+                                "output_key_prefix": "vlm/grasp",
+                                "min_confidence": 0.80,
+                            },
+                        },
+                        {
+                            "id": "move_manipulator_action",
+                            "name": "execute_grasp_pose",
+                            "params": {
+                                "move_id": "vlm_pose_goal",
+                                "motion_type": "pose_goal",
+                                "pose_goal": "${bb:vlm/grasp/fields/grasp_pose}",
+                            },
+                        },
+                    ],
+                },
+            },
+            NodeCatalog(CATALOG_PATH),
+        )
+        deployment = Deployment.from_dict(
+            {
+                "api_version": "manyforge.deployment.v0",
+                "schema_version": "0.1.0",
+                "name": "vlm_pose_goal_deployment",
+                "program_profile": "v0.0",
+                "robot_config": {
+                    "robot_id": "ur5",
+                    "group_id": "arm",
+                    "urdf_path": "package://test.urdf",
+                    "global_max_tcp_linear_speed_mps": 0.25,
+                },
+                "adapters": {
+                    "planning": {"adapter_id": "planning.test", "adapter_version": "0.1.0", "config": {}},
+                    "context": {"adapter_id": "context.test", "adapter_version": "0.1.0", "config": {}},
+                    "execution": {"adapter_id": "execution.test", "adapter_version": "0.1.0", "config": {}},
+                },
+                "orchestrator": {"engine": "py_trees", "config": {}},
+                "launch": {"runner": {"module": "manyforge_behavior.runner", "args": []}},
+                "model_endpoints": {
+                    "local_vlm": {
+                        "provider": "openai",
+                        "model_id": "gemma-test",
+                        "base_url": "http://localhost:8000/v1",
+                    }
+                },
+                "prompt_templates": {
+                    "grasp_pose_v1": {
+                        "version": "1",
+                        "template_text": "Return a grasp pose",
+                        "output_schema": {
+                            "type": "object",
+                            "required": ["grasp_pose", "confidence"],
+                            "properties": {
+                                "grasp_pose": {
+                                    "type": "object",
+                                    "required": ["position_m"],
+                                    "properties": {
+                                        "position_m": {
+                                            "type": "array",
+                                            "minItems": 3,
+                                            "maxItems": 3,
+                                            "items": {"type": "number"},
+                                        },
+                                        "orientation_rpy_deg": {
+                                            "type": "array",
+                                            "minItems": 3,
+                                            "maxItems": 3,
+                                            "items": {"type": "number"},
+                                        },
+                                        "orientation_xyzw": {
+                                            "type": "array",
+                                            "minItems": 4,
+                                            "maxItems": 4,
+                                            "items": {"type": "number"},
+                                        },
+                                    },
+                                },
+                                "confidence": {"type": "number"},
+                            },
+                        },
+                    }
+                },
+            }
+        )
+
+        runner = OrchestratorRunner(
+            CATALOG_PATH,
+            FIXTURE_PATH,
+            kernel,
+            program=program,
+            deployment=deployment,
+        )
+        runner.load()
+        runner.build_tree()
+
+        result = runner.run(max_ticks=200)
+
+        assert result is True
+        assert kernel.last_execute_request is not None
+        assert kernel.last_execute_request.pose_goal is not None
+        assert kernel.last_execute_request.pose_goal["position_m"] == [0.42, -0.05, 0.31]
+        assert kernel.last_execute_request.pose_goal["orientation_xyzw"] == pytest.approx(
+            [0.70710678, -0.70710678, -4.32978028e-17, 4.32978028e-17],
+            abs=1e-6,
+        )
 
 
 class TestRunnerCapabilities:

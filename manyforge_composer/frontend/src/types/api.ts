@@ -21,6 +21,7 @@ export interface CatalogParameter {
   enumValues: string[];
   constraints: Record<string, unknown>;
   parameterizable: boolean;
+  uiEditor?: string | null;
   description: string;
 }
 
@@ -129,6 +130,29 @@ export interface LaunchConfig {
   uiBackend?: LaunchUiBackend;
 }
 
+export interface ModelAuditPolicy {
+  storeFullPrompts: boolean;
+  storeFullResponses: boolean;
+  hashAlgorithm: string;
+  redactArgumentValues: boolean;
+}
+
+export interface ModelEndpointConfig {
+  provider: string;
+  modelId: string;
+  baseUrl?: string | null;
+  apiKeyEnv?: string | null;
+  defaultTimeoutS: number;
+  maxTokens: number;
+}
+
+export interface PromptTemplateConfig {
+  version: string;
+  templateText: string;
+  outputSchema?: Record<string, unknown> | null;
+  responseTool?: Record<string, unknown> | null;
+}
+
 export interface RobotConfig {
   robotId: string;
   groupId: string;
@@ -153,6 +177,9 @@ export interface FullDeployment {
   adapters: Record<string, AdapterConfig>;
   orchestrator: OrchestratorConfig;
   launch: LaunchConfig;
+  modelAuditPolicy?: ModelAuditPolicy | null;
+  modelEndpoints: Record<string, ModelEndpointConfig>;
+  promptTemplates: Record<string, PromptTemplateConfig>;
   sourcePath: string;
 }
 
@@ -175,11 +202,43 @@ export interface FileBrowserResponse {
   entries: FileBrowserEntry[];
 }
 
+// Infrastructure
+export interface InfraComponentStatus {
+  status: string;
+  port?: number | null;
+  [key: string]: unknown;
+}
+
+export interface InfraStatus {
+  status: string;
+  components: Record<string, InfraComponentStatus>;
+  timestamp: number;
+}
+
+export interface ModelEndpointProbe {
+  alias: string;
+  provider: string;
+  configuredModelId: string;
+  baseUrl?: string | null;
+  probeStatus: string;
+  availableModelIds: string[];
+  error?: string | null;
+}
+
+export interface ModelEndpointCatalog {
+  endpoints: Record<string, ModelEndpointProbe>;
+  timestamp: number;
+}
+
 // WebSocket
 export interface StateUpdate {
   state: 'idle' | 'running' | 'stopped' | 'direct_control';
   velocityScale: number;
   nodeStatuses?: Record<string, string>;
+  nativeKernelEvents?: Record<string, unknown>[];
+  runtimeOverrideStatus?: RuntimeOverrideStatus | null;
+  error?: string | null;
   programLoaded?: boolean;
+  programSessionGeneration?: number;
   timestamp: number;
 }

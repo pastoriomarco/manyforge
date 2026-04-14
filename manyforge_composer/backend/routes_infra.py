@@ -6,10 +6,33 @@ import time
 from typing import Any
 
 from fastapi import APIRouter
+from fastapi.concurrency import run_in_threadpool
 
 from .state import ComposerState
+from .models import ModelEndpointCatalogResponse
 
 logger = logging.getLogger(__name__)
+
+
+def _probe_openai_compatible_models(base_url: str | None) -> tuple[list[str], str | None]:
+    if not base_url:
+        return [], "No base_url configured"
+    try:
+        import httpx
+    except Exception as exc:  # pragma: no cover - dependency issue
+        return [], f"httpx unavailable: {exc}"
+    models_url = f"{base_url.rstrip('/')}/models"
+    with httpx.Client(timeout=5.0) as client:
+        response = client.get(models_url)
+        response.raise_for_status()
+        payload = response.json()
+    data = payload.get("data", [])
+    model_ids = [
+        item.get("id")
+        for item in data
+        if isinstance(item, dict) and isinstance(item.get("id"), str)
+    ]
+    return sorted(set(model_ids)), None
 
 
 def build_infra_status_payload(state: ComposerState) -> dict[str, Any]:
@@ -51,6 +74,18 @@ def build_infra_status_payload(state: ComposerState) -> dict[str, Any]:
         "status": "enabled" if hasattr(state, "_mcp_http_enabled") else "unknown",
     }
 
+    # HMI / Viser
+    if state.hmi_server is not None:
+        components["hmi"] = {
+            "status": "healthy",
+            "port": state.hmi_public_port,
+        }
+    else:
+        components["hmi"] = {
+            "status": "unavailable",
+            "port": None,
+        }
+
     # Deployment
     if state.deployment is not None:
         components["deployment"] = {
@@ -76,5 +111,43 @@ def create_infra_router(state: ComposerState) -> APIRouter:
     def infra_status():
         """Get infrastructure health status for all components."""
         return build_infra_status_payload(state)
+
+    @router.get(
+        "/model-endpoints",
+        response_model=ModelEndpointCatalogResponse,
+        response_model_by_alias=True,
+    )
+    async def infra_model_endpoints():
+        """Return configured model endpoints plus best-effort live /v1/models discovery."""
+        endpoints: dict[str, Any] = {}
+        deployment = state.deployment
+        if deployment is not None:
+            for alias, endpoint in deployment.model_endpoints.items():
+                probe_status = "skipped"
+                available_model_ids: list[str] = []
+                error: str | None = None
+                if endpoint.provider in {"openai", "local"}:
+                    try:
+                        available_model_ids, error = await run_in_threadpool(
+                            _probe_openai_compatible_models,
+                            endpoint.base_url,
+                        )
+                        probe_status = "ok" if error is None else "error"
+                    except Exception as exc:  # pragma: no cover - defensive
+                        probe_status = "error"
+                        error = str(exc)
+                endpoints[alias] = {
+                    "alias": alias,
+                    "provider": endpoint.provider,
+                    "configuredModelId": endpoint.model_id,
+                    "baseUrl": endpoint.base_url,
+                    "probeStatus": probe_status,
+                    "availableModelIds": available_model_ids,
+                    "error": error,
+                }
+        return {
+            "endpoints": endpoints,
+            "timestamp": time.time(),
+        }
 
     return router

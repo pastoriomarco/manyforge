@@ -12,6 +12,8 @@ import type {
   FullDeployment,
   ApplySessionResponse,
   FileBrowserResponse,
+  InfraStatus,
+  ModelEndpointCatalog,
 } from '../types/api';
 
 const BASE_URL = import.meta.env.VITE_API_URL || '';
@@ -86,5 +88,9 @@ export const api = {
       }
       return request<FileBrowserResponse>('GET', `/api/files/browse?${params.toString()}`);
     },
+  },
+  infra: {
+    status: () => request<InfraStatus>('GET', '/api/infra/status'),
+    modelEndpoints: () => request<ModelEndpointCatalog>('GET', '/api/infra/model-endpoints'),
   },
 };

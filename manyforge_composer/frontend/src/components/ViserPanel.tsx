@@ -1,16 +1,19 @@
+import { useEffect, useMemo, useState } from 'react';
+import { api } from '../api/client';
+
 const DEFAULT_HMI_PORT = '8081';
 
-function getViserUrl(): string {
+function getViserUrl(port: string): string {
   if (import.meta.env.VITE_HMI_URL) {
     return import.meta.env.VITE_HMI_URL;
   }
 
   if (typeof window === 'undefined') {
-    return `http://localhost:${DEFAULT_HMI_PORT}`;
+    return `http://localhost:${port}`;
   }
 
   const { protocol, hostname } = window.location;
-  return `${protocol}//${hostname}:${DEFAULT_HMI_PORT}`;
+  return `${protocol}//${hostname}:${port}`;
 }
 
 interface ViserPanelProps {
@@ -20,7 +23,28 @@ interface ViserPanelProps {
 }
 
 export function ViserPanel({ onCollapse, blocked, resizing = false }: ViserPanelProps) {
-  const viserUrl = getViserUrl();
+  const [hmiPort, setHmiPort] = useState(DEFAULT_HMI_PORT);
+
+  useEffect(() => {
+    let active = true;
+
+    void api.infra.status()
+      .then((status) => {
+        const port = status.components.hmi?.port;
+        if (active && typeof port === 'number' && port > 0) {
+          setHmiPort(String(port));
+        }
+      })
+      .catch(() => {
+        // Fall back to the default HMI port when infra status is unavailable.
+      });
+
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  const viserUrl = useMemo(() => getViserUrl(hmiPort), [hmiPort]);
 
   return (
     <div className="flex h-full w-full flex-col overflow-hidden bg-gray-900">

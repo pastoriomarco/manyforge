@@ -78,6 +78,13 @@ def build_program_loaded_callback(
             package_dirs=package_dirs or None,
         )
         st.hmi_server = _hmi_server
+        st.hmi_public_port = hmi_port
+        if (
+            st.cycle_manager is not None
+            and hasattr(st.cycle_manager, "_runner")
+            and hasattr(_hmi_server, "render_scene")
+        ):
+            st.cycle_manager._runner.set_scene_snapshot_provider(_hmi_server.render_scene)
         _hmi_server.load_program(st.effective_program or st.program)
 
         def on_scene_edit(operation: str, request):

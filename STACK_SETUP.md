@@ -969,6 +969,16 @@ Operational notes:
 - The runtime plugin should report `Origin: global`; `workspace` is fallback
   only.
 
+Current model-in-the-loop baseline:
+- The semantic ManyForge demo now uses a role-based deployment alias
+  `selection_model` rather than a model-family-specific alias.
+- The demo currently defaults to text-only semantic selection because the
+  multimodal path remains under investigation for the local model families
+  currently in use.
+- Composer now surfaces deployment model endpoints, prompt templates, and live
+  `/v1/models` discovery directly in the UI; assistant chat is still future
+  work.
+
 **Smoke state**:
 
 - Host-side latest smoke result: `~/.manyforge/smoke/latest.json`

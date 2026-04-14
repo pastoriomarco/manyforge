@@ -65,12 +65,14 @@ class ComposerState:
         self.deployment_source_path: str = ""
         self.cycle_manager: Optional[CycleManager] = None
         self.hmi_server = None
+        self.hmi_public_port: int | None = None
         self._on_program_loaded: Optional[Callable[["ComposerState"], None]] = None
         self.event_recorder = EventRecorder(trace_dir=trace_dir)
         self.scene_edit_lock = threading.Lock()
         self.allowed_fs_roots = normalize_allowed_roots(allowed_fs_roots)
         self._runtime_overrides: dict[str, RuntimeOverrideRecord] = {}
         self._program_tree_hash: str = ""
+        self._program_session_generation: int = 0
         self.skill_catalog: SkillCatalog = load_skill_catalog(
             default_skills_dir(),
             catalog=self.catalog,
@@ -108,6 +110,11 @@ class ComposerState:
     def program_tree_hash(self) -> str:
         """Current base program tree hash."""
         return self._program_tree_hash
+
+    @property
+    def program_session_generation(self) -> int:
+        """Monotonic generation for the loaded/applied program snapshot."""
+        return self._program_session_generation
 
     @property
     def runtime_overrides(self) -> dict[str, RuntimeOverrideRecord]:
@@ -748,6 +755,7 @@ class ComposerState:
             deployment=deployment,
             skill_catalog=self.skill_catalog,
             event_recorder=self.event_recorder,
+            scene_snapshot_provider=getattr(self.hmi_server, "render_scene", None),
         )
         runner.load()
 
@@ -755,6 +763,7 @@ class ComposerState:
         self._effective_program = effective_program or program
         self.deployment = deployment
         self._update_program_tree_hash()
+        self._program_session_generation += 1
         self.cycle_manager = CycleManager(runner, self._kernel)
         self._bind_cycle_manager_callbacks()
 
@@ -832,6 +841,7 @@ class ComposerState:
             deployment_path=deployment_path,
             skill_catalog=self.skill_catalog,
             event_recorder=self.event_recorder,
+            scene_snapshot_provider=getattr(self.hmi_server, "render_scene", None),
         )
         runner.load()
 
@@ -839,6 +849,7 @@ class ComposerState:
         self._effective_program = runner.program
         self.program_source_path = program_path
         self._update_program_tree_hash()
+        self._program_session_generation += 1
         self.cycle_manager = CycleManager(runner, self._kernel)
         self._bind_cycle_manager_callbacks()
 

@@ -7,6 +7,7 @@ from typing import Any, Optional
 
 
 PARAM_REF_RE = re.compile(r"^\$\{param:([^}]+)\}$")
+BLACKBOARD_REF_RE = re.compile(r"^\$\{bb:([^}]+)\}$")
 
 
 class ParameterResolver:

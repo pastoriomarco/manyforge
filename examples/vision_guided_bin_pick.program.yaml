@@ -1,0 +1,125 @@
+api_version: manyforge.program.v0
+program_profile: v0.0
+name: vision_guided_bin_pick
+description: >-
+  Vision-guided pick-and-place example. A `query_model` node captures the live
+  HMI scene snapshot, asks a Gemma 4 VLM which of two candidate objects should
+  be picked next, and mirrors the validated decision onto the blackboard. The
+  tree then routes into one of two fixed pick/place sequences.
+catalog_version: "0.1.0"
+
+robot:
+  robot_id: ur5
+  group_id: arm
+  base_frame: base_link
+  tcp_frame: tool0
+
+scene:
+  - object_id: table
+    shape:
+      type: box
+      box_dimensions_m: [0.8, 0.6, 0.04]
+    pose:
+      frame_id: base_link
+      position_m: [0.45, 0.0, -0.021]
+      orientation_xyzw: [0.0, 0.0, 0.0, 1.0]
+
+  - object_id: left_part
+    shape:
+      type: box
+      box_dimensions_m: [0.02, 0.02, 0.02]
+    pose:
+      frame_id: base_link
+      position_m: [0.40, -0.14, 0.009]
+      orientation_rpy_deg: [0.0, 0.0, 0.0]
+
+  - object_id: right_part
+    shape:
+      type: box
+      box_dimensions_m: [0.02, 0.02, 0.02]
+    pose:
+      frame_id: base_link
+      position_m: [0.40, 0.14, 0.009]
+      orientation_rpy_deg: [0.0, 0.0, 0.0]
+
+tree:
+  id: sequence
+  name: vision_guided_pick_cycle
+  children:
+    - id: query_model
+      name: choose_pick_target
+      params:
+        model_endpoint_alias: gemma4_vlm
+        prompt_template_id: choose_bin_target_v1
+        output_key_prefix: perception/pick_target
+        include_scene_snapshot: true
+        scene_snapshot_width: 640
+        scene_snapshot_height: 480
+        scene_snapshot_format: jpeg
+        timeout_s: 5.0
+        min_confidence: 0.70
+
+    - id: fallback
+      name: execute_selected_pick
+      children:
+        - id: sequence
+          name: pick_left_branch
+          children:
+            - id: check_key_bool_value
+              name: left_was_selected
+              params:
+                key: perception/pick_target/fields/pick_left_bin
+                expected_value: true
+
+            - id: pick_object
+              name: pick_left_part
+              params:
+                object_id: left_part
+                approach_height_m: 0.08
+                grasp_offset_z_m: 0.0
+                tool_orientation_rpy_deg: [180.0, 0.0, -90.0]
+                velocity_scale: 0.4
+                tcp_frame: tool0
+
+            - id: place_object
+              name: place_left_part
+              params:
+                object_id: left_part
+                place_pose:
+                  position_m: [0.22, 0.26, 0.28]
+                  orientation_rpy_deg: [180.0, 0.0, -90.0]
+                approach_height_m: 0.08
+                tool_orientation_rpy_deg: [180.0, 0.0, -90.0]
+                velocity_scale: 0.4
+                tcp_frame: tool0
+
+        - id: sequence
+          name: pick_right_branch
+          children:
+            - id: check_key_bool_value
+              name: right_was_selected
+              params:
+                key: perception/pick_target/fields/pick_left_bin
+                expected_value: false
+
+            - id: pick_object
+              name: pick_right_part
+              params:
+                object_id: right_part
+                approach_height_m: 0.08
+                grasp_offset_z_m: 0.0
+                tool_orientation_rpy_deg: [180.0, 0.0, -90.0]
+                velocity_scale: 0.4
+                tcp_frame: tool0
+
+            - id: place_object
+              name: place_right_part
+              params:
+                object_id: right_part
+                place_pose:
+                  position_m: [0.22, -0.26, 0.28]
+                  orientation_rpy_deg: [180.0, 0.0, -90.0]
+                approach_height_m: 0.08
+                tool_orientation_rpy_deg: [180.0, 0.0, -90.0]
+                velocity_scale: 0.4
+                tcp_frame: tool0

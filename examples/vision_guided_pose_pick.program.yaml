@@ -1,0 +1,116 @@
+api_version: manyforge.program.v0
+program_profile: v0.0
+name: vision_guided_pose_pick
+description: >-
+  Vision-guided pick demonstration that exercises direct `${bb:...}` motion
+  binding. A `query_model` node captures the live HMI scene snapshot, returns
+  validated `approach_pose` and `grasp_pose` values in the robot base frame,
+  and downstream `move_manipulator_action` nodes consume those poses directly
+  from the blackboard.
+catalog_version: "0.1.0"
+
+robot:
+  robot_id: ur5
+  group_id: arm
+  base_frame: base_link
+  tcp_frame: tool0
+
+scene:
+  - object_id: table
+    shape:
+      type: box
+      box_dimensions_m: [0.8, 0.6, 0.04]
+    pose:
+      frame_id: base_link
+      position_m: [0.45, 0.0, -0.021]
+      orientation_xyzw: [0.0, 0.0, 0.0, 1.0]
+
+  - object_id: left_part
+    shape:
+      type: box
+      box_dimensions_m: [0.02, 0.02, 0.02]
+    pose:
+      frame_id: base_link
+      position_m: [0.40, -0.14, 0.009]
+      orientation_rpy_deg: [0.0, 0.0, 0.0]
+
+  - object_id: right_part
+    shape:
+      type: box
+      box_dimensions_m: [0.02, 0.02, 0.02]
+    pose:
+      frame_id: base_link
+      position_m: [0.40, 0.14, 0.009]
+      orientation_rpy_deg: [0.0, 0.0, 0.0]
+
+tree:
+  id: sequence
+  name: vision_guided_pose_pick_cycle
+  children:
+    - id: query_model
+      name: infer_grasp_pose
+      params:
+        model_endpoint_alias: gemma4_vlm
+        prompt_template_id: infer_grasp_pose_v1
+        output_key_prefix: perception/grasp_plan
+        include_scene_snapshot: true
+        scene_snapshot_width: 640
+        scene_snapshot_height: 480
+        scene_snapshot_format: jpeg
+        timeout_s: 5.0
+        min_confidence: 0.70
+
+    - id: move_manipulator_action
+      name: move_to_approach_pose
+      params:
+        move_id: vlm_approach_pose
+        motion_type: pose_goal
+        pose_goal: "${bb:perception/grasp_plan/fields/approach_pose}"
+        velocity_scale: 0.35
+
+    - id: move_manipulator_action
+      name: move_to_grasp_pose
+      params:
+        move_id: vlm_grasp_pose
+        motion_type: pose_goal
+        pose_goal: "${bb:perception/grasp_plan/fields/grasp_pose}"
+        velocity_scale: 0.20
+
+    - id: set_key_bool_value
+      name: close_gripper
+      params:
+        key: gripper_closed
+        value: true
+
+    - id: move_manipulator_action
+      name: retreat_after_grasp
+      params:
+        move_id: vlm_retreat_pose
+        motion_type: relative_move
+        relative_move:
+          target_reference:
+            type: robot_link
+            id: tool0
+          offset_reference:
+            type: frame
+            id: base_link
+          offset:
+            position_m: [0.0, 0.0, 0.08]
+            orientation_rpy_deg: [180.0, 0.0, -90.0]
+        velocity_scale: 0.35
+
+    - id: move_manipulator_action
+      name: move_to_place_pose
+      params:
+        move_id: vlm_place_pose
+        motion_type: pose_goal
+        pose_goal:
+          position_m: [0.22, 0.0, 0.30]
+          orientation_rpy_deg: [180.0, 0.0, -90.0]
+        velocity_scale: 0.35
+
+    - id: set_key_bool_value
+      name: open_gripper
+      params:
+        key: gripper_closed
+        value: false

@@ -6,17 +6,19 @@ import type { Node, Edge } from '@xyflow/react';
 
 export type LayoutDirection = 'vertical' | 'horizontal';
 
-const SIBLING_SPACING: Record<LayoutDirection, number> = {
-  vertical: 220,
-  horizontal: 140,
+const DEFAULT_NODE_WIDTH = 180;
+const DEFAULT_NODE_HEIGHT = 64;
+const PRIMARY_GAP: Record<LayoutDirection, number> = {
+  vertical: 72,
+  horizontal: 88,
 };
-const LEVEL_SPACING: Record<LayoutDirection, number> = {
-  vertical: 150,
-  horizontal: 180,
+const DEPTH_GAP: Record<LayoutDirection, number> = {
+  vertical: 84,
+  horizontal: 112,
 };
-const ROOT_LAYOUT_POSITION: Record<LayoutDirection, { primary: number; depth: number }> = {
-  vertical: { primary: 400, depth: 60 },
-  horizontal: { primary: 260, depth: 140 },
+const ROOT_LAYOUT_CENTER: Record<LayoutDirection, { primary: number; depth: number }> = {
+  vertical: { primary: 420, depth: 72 },
+  horizontal: { primary: 320, depth: 124 },
 };
 
 interface ProgramStore {
@@ -64,8 +66,30 @@ interface ProgramStore {
   saveProgram: (path: string) => Promise<void>;
 }
 
-function getPrimaryCoordinate(position: { x: number; y: number }, direction: LayoutDirection): number {
-  return direction === 'vertical' ? position.x : position.y;
+function getNodeWidth(node: Node): number {
+  return typeof node.width === 'number' && Number.isFinite(node.width)
+    ? node.width
+    : DEFAULT_NODE_WIDTH;
+}
+
+function getNodeHeight(node: Node): number {
+  return typeof node.height === 'number' && Number.isFinite(node.height)
+    ? node.height
+    : DEFAULT_NODE_HEIGHT;
+}
+
+function getPrimarySize(node: Node, direction: LayoutDirection): number {
+  return direction === 'vertical' ? getNodeWidth(node) : getNodeHeight(node);
+}
+
+function getDepthSize(node: Node, direction: LayoutDirection): number {
+  return direction === 'vertical' ? getNodeHeight(node) : getNodeWidth(node);
+}
+
+function getPrimaryCoordinate(node: Node, direction: LayoutDirection): number {
+  return direction === 'vertical'
+    ? node.position.x + getNodeWidth(node) / 2
+    : node.position.y + getNodeHeight(node) / 2;
 }
 
 function getNodeHandlePositions(direction: LayoutDirection): Pick<Node, 'sourcePosition' | 'targetPosition'> {
@@ -80,8 +104,17 @@ function getNodeHandlePositions(direction: LayoutDirection): Pick<Node, 'sourceP
       };
 }
 
-function makePosition(primary: number, depth: number, direction: LayoutDirection): { x: number; y: number } {
-  return direction === 'vertical' ? { x: primary, y: depth } : { x: depth, y: primary };
+function makePosition(
+  primaryCenter: number,
+  depthCenter: number,
+  direction: LayoutDirection,
+  node: Node,
+): { x: number; y: number } {
+  const width = getNodeWidth(node);
+  const height = getNodeHeight(node);
+  return direction === 'vertical'
+    ? { x: primaryCenter - width / 2, y: depthCenter - height / 2 }
+    : { x: depthCenter - width / 2, y: primaryCenter - height / 2 };
 }
 
 function collectTreeToFlow(
@@ -159,8 +192,8 @@ function layoutFlow(
         return 0;
       }
       return (
-        getPrimaryCoordinate(left.position, orderingDirection) -
-        getPrimaryCoordinate(right.position, orderingDirection)
+        getPrimaryCoordinate(left, orderingDirection) -
+        getPrimaryCoordinate(right, orderingDirection)
       );
     });
     childrenMap.set(parentId, childIds);
@@ -177,8 +210,19 @@ function layoutFlow(
     if (cached !== undefined) {
       return cached;
     }
+    const currentNode = nodeMap.get(nodeId);
+    if (!currentNode) {
+      return 0;
+    }
     const childIds = childrenMap.get(nodeId) || [];
-    const span = childIds.length === 0 ? 1 : childIds.reduce((sum, childId) => sum + measureSpan(childId), 0);
+    const ownSpan = getPrimarySize(currentNode, direction);
+    let span = ownSpan;
+    if (childIds.length > 0) {
+      const childSpan = childIds.reduce((sum, childId, index) => {
+        return sum + measureSpan(childId) + (index > 0 ? PRIMARY_GAP[direction] : 0);
+      }, 0);
+      span = Math.max(ownSpan, childSpan);
+    }
     spanCache.set(nodeId, span);
     return span;
   };
@@ -186,23 +230,38 @@ function layoutFlow(
   measureSpan(rootNode.id);
 
   const positions = new Map<string, { x: number; y: number }>();
-  const { primary: rootPrimary, depth: rootDepth } = ROOT_LAYOUT_POSITION[direction];
+  const { primary: rootPrimary, depth: rootDepth } = ROOT_LAYOUT_CENTER[direction];
 
-  const placeNode = (nodeId: string, primaryCenter: number, depth: number) => {
-    positions.set(nodeId, makePosition(primaryCenter, depth, direction));
+  const placeNode = (nodeId: string, primaryCenter: number, depthCenter: number) => {
+    const currentNode = nodeMap.get(nodeId);
+    if (!currentNode) {
+      return;
+    }
+    positions.set(nodeId, makePosition(primaryCenter, depthCenter, direction, currentNode));
     const childIds = childrenMap.get(nodeId) || [];
     if (childIds.length === 0) {
       return;
     }
 
-    const totalSpan = childIds.reduce((sum, childId) => sum + measureSpan(childId), 0);
-    let cursor = primaryCenter - ((totalSpan - 1) * SIBLING_SPACING[direction]) / 2;
+    const totalSpan = childIds.reduce((sum, childId, index) => {
+      return sum + measureSpan(childId) + (index > 0 ? PRIMARY_GAP[direction] : 0);
+    }, 0);
+    let cursor = primaryCenter - totalSpan / 2;
 
     for (const childId of childIds) {
+      const childNode = nodeMap.get(childId);
+      if (!childNode) {
+        continue;
+      }
       const childSpan = measureSpan(childId);
-      const childPrimary = cursor + ((childSpan - 1) * SIBLING_SPACING[direction]) / 2;
-      placeNode(childId, childPrimary, depth + LEVEL_SPACING[direction]);
-      cursor += childSpan * SIBLING_SPACING[direction];
+      const childPrimary = cursor + childSpan / 2;
+      const nextDepthCenter =
+        depthCenter
+        + getDepthSize(currentNode, direction) / 2
+        + DEPTH_GAP[direction]
+        + getDepthSize(childNode, direction) / 2;
+      placeNode(childId, childPrimary, nextDepthCenter);
+      cursor += childSpan + PRIMARY_GAP[direction];
     }
   };
 
@@ -247,7 +306,7 @@ function flowToTree(nodes: Node[], edges: Edge[], direction: LayoutDirection): T
     childIds.sort((a, b) => {
       const na = nodeMap.get(a)!;
       const nb = nodeMap.get(b)!;
-      return getPrimaryCoordinate(na.position, direction) - getPrimaryCoordinate(nb.position, direction);
+      return getPrimaryCoordinate(na, direction) - getPrimaryCoordinate(nb, direction);
     });
     
     return {

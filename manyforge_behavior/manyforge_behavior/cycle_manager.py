@@ -155,6 +155,21 @@ def _collect_statuses(node, result):
             _collect_statuses(child, result)
 
 
+def _find_failure_feedback(node) -> Optional[str]:
+    """Return the deepest failure feedback message available in the tree."""
+    if hasattr(node, "children"):
+        for child in reversed(node.children):
+            child_feedback = _find_failure_feedback(child)
+            if child_feedback:
+                return child_feedback
+    if node.status == py_trees.common.Status.FAILURE:
+        feedback = getattr(node, "feedback_message", None)
+        if feedback:
+            return f"{node.name}: {feedback}"
+        return node.name
+    return None
+
+
 class CycleManager:
     """Runtime lifecycle controller for continuous robot programs.
     
@@ -242,7 +257,7 @@ class CycleManager:
 
     @property
     def error(self) -> Optional[str]:
-        """Last error from the tick loop, or None."""
+        """Last tick-loop exception or surfaced terminal node failure, or None."""
         return self._error
 
     def get_execution_snapshot(self) -> ExecutionSnapshot:
@@ -610,6 +625,7 @@ class CycleManager:
             if status in (py_trees.common.Status.SUCCESS, py_trees.common.Status.FAILURE):
                 self._tick_stop_event.set()
                 if status == py_trees.common.Status.FAILURE:
+                    failure_feedback = _find_failure_feedback(self._tree.root)
                     delegated_candidate = self._find_delegated_recovery_candidate(statuses)
                     if delegated_candidate is not None:
                         delegate_policy = delegated_candidate.modification_policy.get(
@@ -633,6 +649,7 @@ class CycleManager:
                             )
                             bb.stop_requested = True
                             with self._lock:
+                                self._error = failure_feedback
                                 self._state = CycleState.STOPPED
                                 self._tick_thread = None
                             self._notify_recovery_exhausted(
@@ -650,12 +667,14 @@ class CycleManager:
                         )
                         bb.stop_requested = True
                         with self._lock:
+                            self._error = failure_feedback
                             self._pending_delegated_recovery = request
                             self._state = CycleState.STOPPED
                             self._tick_thread = None
                         self._notify_delegated_recovery_requested(request)
                         break
                 with self._lock:
+                    self._error = failure_feedback if status == py_trees.common.Status.FAILURE else None
                     self._state = CycleState.IDLE
                     self._tick_thread = None
                 break

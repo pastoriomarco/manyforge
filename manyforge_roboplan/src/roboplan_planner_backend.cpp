@@ -63,6 +63,7 @@ core::PlanResultDTO RoboPlanPlannerBackend::plan(const core::PlanRequestDTO& req
 
     // Check start for self-collision
     bool start_collision = scene_->hasCollisions(start_positions);
+    bool goal_collision = false;
 
     // FK of start pose
     {
@@ -72,6 +73,19 @@ core::PlanResultDTO RoboPlanPlannerBackend::plan(const core::PlanRequestDTO& req
       fmt::print(stderr, "[PLANNER] start pose:  pos=({:.3f}, {:.3f}, {:.3f}) rpy=({:.1f}, {:.1f}, {:.1f}) collision={}\n",
               start_fk(0, 3), start_fk(1, 3), start_fk(2, 3), r, p, ya,
               start_collision ? "YES" : "no");
+    }
+
+    if (start_collision) {
+      scene_->hasCollisions(start_positions, true);
+      result.error = core::ErrorDTO{
+          core::kErrorPlanningFailed,
+          "Planning preview rejected: start state is already in collision",
+          {
+              {"failure_stage", "start_state"},
+              {"start_in_collision", "true"},
+          },
+      };
+      return result;
     }
 
     // Determine goal configuration based on motion type
@@ -140,8 +154,22 @@ core::PlanResultDTO RoboPlanPlannerBackend::plan(const core::PlanRequestDTO& req
       fmt::print(stderr, "]\n");
 
       // Check goal for self-collision
-      bool goal_collision = scene_->hasCollisions(goal_config.positions);
+      goal_collision = scene_->hasCollisions(goal_config.positions);
       fmt::print(stderr, "[PLANNER] goal in collision: {}\n", goal_collision ? "YES" : "no");
+
+      if (goal_collision) {
+        scene_->hasCollisions(goal_config.positions, true);
+        result.error = core::ErrorDTO{
+            core::kErrorPlanningFailed,
+            "Planning preview rejected: goal state is in collision",
+            {
+                {"failure_stage", "goal_state"},
+                {"start_in_collision", "false"},
+                {"goal_in_collision", "true"},
+            },
+        };
+        return result;
+      }
 
       // Compute joint-space distance
       double jdist = (goal_config.positions - start_config.positions).norm();
@@ -188,7 +216,15 @@ core::PlanResultDTO RoboPlanPlannerBackend::plan(const core::PlanRequestDTO& req
       }
       err_msg += "]";
 
-      result.error = core::ErrorDTO{core::kErrorPlanningFailed, err_msg, {}};
+      result.error = core::ErrorDTO{
+          core::kErrorPlanningFailed,
+          err_msg,
+          {
+              {"failure_stage", "rrt"},
+              {"start_in_collision", start_collision ? "true" : "false"},
+              {"goal_in_collision", goal_collision ? "true" : "false"},
+          },
+      };
       return result;
     }
     fmt::print(stderr, "[PLANNER] RRT succeeded\n");

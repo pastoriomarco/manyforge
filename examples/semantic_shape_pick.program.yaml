@@ -1,0 +1,214 @@
+api_version: manyforge.program.v0
+program_profile: v0.0
+name: semantic_shape_pick
+description: >-
+  Semantic object-selection demo. A deterministic node builds an
+  authoritative scene-selection context from backend scene data, the model
+  selects one candidate using that manifest, and a deterministic validation
+  node confirms the selection before planning a pick sequence. The planner
+  validates current->approach, approach->pick, and pick->approach; later
+  place logic stays outside the planner.
+catalog_version: "0.1.0"
+
+robot:
+  robot_id: ur5
+  group_id: arm
+  base_frame: base_link
+  tcp_frame: tool0
+
+scene:
+  - object_id: table
+    shape:
+      type: box
+      box_dimensions_m: [0.8, 0.6, 0.04]
+    pose:
+      frame_id: base_link
+      position_m: [0.45, 0.0, -0.121]
+      orientation_xyzw: [0.0, 0.0, 0.0, 1.0]
+
+  - object_id: sphere_part
+    shape:
+      type: sphere
+      sphere_radius_m: 0.01
+    pose:
+      frame_id: base_link
+      position_m: [0.40, -0.14, 0.009]
+      orientation_rpy_deg: [0.0, 0.0, 0.0]
+
+  - object_id: cube_part
+    shape:
+      type: box
+      box_dimensions_m: [0.02, 0.02, 0.02]
+    pose:
+      frame_id: base_link
+      position_m: [0.40, 0.14, 0.009]
+      orientation_rpy_deg: [0.0, 0.0, 0.0]
+
+parameters:
+  - name: selection_request_text
+    type: string
+    default: Select the sphere object.
+    description: Selection request for the semantic object-selection demo.
+
+tree:
+  id: sequence
+  name: semantic_shape_pick_cycle
+  children:
+    - id: build_scene_selection_context
+      name: build_selection_context
+      params:
+        selection_request_text: "${param:selection_request_text}"
+        output_key_prefix: selection/context
+        object_source: backend_scene
+        candidate_object_ids: [sphere_part, cube_part]
+        image_source: none
+
+    - id: query_model
+      name: choose_scene_object
+      params:
+        model_endpoint_alias: selection_model
+        prompt_template_id: select_scene_object_v1
+        template_variables:
+          selection_request_text: selection/context/fields/selection_request_text
+          scene_context_json: selection/context/fields/scene_context_json
+          candidate_object_ids: selection/context/fields/candidate_object_ids
+        output_key_prefix: perception/object_selection
+        include_scene_snapshot: false
+        timeout_s: 20.0
+        min_confidence: 0.70
+
+    - id: validate_scene_selection
+      name: validate_selected_object
+      params:
+        selection_context_prefix: selection/context
+        selection_response_prefix: perception/object_selection
+        output_key_prefix: selection/validated
+        allow_no_match: false
+        allow_ambiguous: false
+
+    - id: plan_pick_sequence
+      name: plan_selected_object_pick
+      params:
+        selected_object_id: "${bb:selection/validated/fields/selected_object_id}"
+        output_key_prefix: planning/pick_plan
+        object_source: backend_scene
+        image_source: none
+        tcp_frame: tool0
+        pick_offset_envelope:
+          position_min_m: [0.0, 0.0, 0.04]
+          position_max_m: [0.0, 0.0, 0.04]
+          orientation_rpy_min_deg: [0.0, 0.0, 0.0]
+          orientation_rpy_max_deg: [0.0, 0.0, 0.0]
+        approach_offset_envelope:
+          position_min_m: [0.0, 0.0, 0.05]
+          position_max_m: [0.0, 0.0, 0.10]
+          orientation_rpy_min_deg: [0.0, 0.0, 0.0]
+          orientation_rpy_max_deg: [0.0, 0.0, 0.0]
+        search_strategy: best_cost_grid
+        translation_step_m: 0.025
+        rotation_step_deg: 15.0
+        planning_timeout_s: 5.0
+        velocity_scale: 0.30
+
+    - id: move_manipulator_action
+      name: move_to_planned_approach_pose
+      params:
+        move_id: planned_pick_approach
+        motion_type: pose_goal
+        pose_goal: "${bb:planning/pick_plan/fields/approach_pose}"
+        velocity_scale: 0.30
+
+    - id: move_manipulator_action
+      name: move_to_planned_pick_pose
+      params:
+        move_id: planned_pick_descend
+        motion_type: pose_goal
+        pose_goal: "${bb:planning/pick_plan/fields/pick_pose}"
+        velocity_scale: 0.20
+
+    - id: set_key_bool_value
+      name: close_gripper
+      params:
+        key: gripper_closed
+        value: true
+
+    - id: attach_object_to_link
+      name: attach_selected_object
+      params:
+        object_id: "${bb:planning/pick_plan/fields/selected_object_id}"
+        link_frame: tool0
+
+    - id: reset_trajectories
+      name: invalidate_after_attach
+
+    - id: move_manipulator_action
+      name: retreat_after_pick
+      params:
+        move_id: planned_pick_exit
+        motion_type: pose_goal
+        pose_goal: "${bb:planning/pick_plan/fields/approach_pose}"
+        velocity_scale: 0.30
+
+    - id: move_manipulator_action
+      name: move_to_place_approach
+      params:
+        move_id: planned_place_approach
+        motion_type: relative_move
+        relative_move:
+          target_reference:
+            type: pose
+            pose:
+              position_m: [0.22, 0.0, 0.30]
+              orientation_rpy_deg: [180.0, 0.0, 0.0]
+          offset_reference:
+            type: frame
+            id: base_link
+          offset:
+            position_m: [0.0, 0.0, 0.08]
+            orientation_rpy_deg: [180.0, 0.0, 0.0]
+        velocity_scale: 0.30
+
+    - id: move_manipulator_action
+      name: move_to_place_pose
+      params:
+        move_id: planned_place_descend
+        motion_type: pose_goal
+        pose_goal:
+          position_m: [0.22, 0.0, 0.30]
+          orientation_rpy_deg: [180.0, 0.0, 0.0]
+        velocity_scale: 0.20
+
+    - id: set_key_bool_value
+      name: open_gripper
+      params:
+        key: gripper_closed
+        value: false
+
+    - id: detach_object_from_link
+      name: detach_selected_object
+      params:
+        object_id: "${bb:planning/pick_plan/fields/selected_object_id}"
+        link_frame: tool0
+        frame_id: universe
+
+    - id: reset_trajectories
+      name: invalidate_after_detach
+
+    - id: move_manipulator_action
+      name: retreat_after_place
+      params:
+        move_id: planned_place_retreat
+        motion_type: relative_move
+        relative_move:
+          target_reference:
+            type: pose
+            pose:
+              position_m: [0.22, 0.0, 0.30]
+              orientation_rpy_deg: [180.0, 0.0, 0.0]
+          offset_reference:
+            type: frame
+            id: base_link
+          offset:
+            position_m: [0.0, 0.0, 0.08]
+            orientation_rpy_deg: [180.0, 0.0, 0.0]
+        velocity_scale: 0.30

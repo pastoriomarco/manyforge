@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from typing import Any, Callable, Optional
 
 import py_trees
@@ -24,7 +25,12 @@ from manyforge_behavior.nodes.scene import (
 )
 from manyforge_behavior.nodes.control_flow import RepeatDecorator, RetryDecorator
 from manyforge_behavior.nodes.model import QueryModelNode
+from manyforge_behavior.nodes.pick_planning import PlanPickSequenceNode
 from manyforge_behavior.nodes.recovery import FallbackOverrideNode, RecoverySkillNode
+from manyforge_behavior.nodes.selection import (
+    BuildSceneSelectionContextNode,
+    ValidateSceneSelectionNode,
+)
 from manyforge_behavior.parameters import ParameterResolver
 from manyforge_behavior.program import Program, TreeNode, tree_node_from_dict
 from manyforge_behavior.skill_loader import (
@@ -49,6 +55,8 @@ PLUGIN_FACTORY: dict[str, type] = {
     "wait_for_key_bool": WaitForKeyBool,
     "get_link_pose": GetLinkPose,
     "check_pose_distance": CheckPoseDistance,
+    "plan_pick_sequence": PlanPickSequenceNode,
+    "validate_scene_selection": ValidateSceneSelectionNode,
 }
 
 
@@ -66,6 +74,7 @@ class OrchestratorRunner:
         deployment: Optional["Deployment"] = None,
         skill_catalog: Optional[SkillCatalog] = None,
         event_recorder: Optional[Any] = None,
+        scene_snapshot_provider: Optional[Callable[[int, int, str], Optional[bytes]]] = None,
     ):
         self._catalog_path = catalog_path
         self._program_path = program_path
@@ -82,6 +91,7 @@ class OrchestratorRunner:
         self._deployment: Optional["Deployment"] = None
         self._skill_catalog: Optional[SkillCatalog] = skill_catalog
         self._event_recorder = event_recorder
+        self._scene_snapshot_provider = scene_snapshot_provider
         # Intervention context — set by cycle_manager before building
         # intervention subtrees so nodes like QueryModelNode can attribute
         # audit events to the active session.
@@ -208,6 +218,11 @@ class OrchestratorRunner:
                 return True
             if status == py_trees.common.Status.FAILURE:
                 return False
+            if status == py_trees.common.Status.RUNNING:
+                # Yield to background workers used by non-blocking nodes such as
+                # QueryModelNode. A zero-period run is still allowed, but should not
+                # busy-spin so tightly that futures never get CPU time.
+                time.sleep(tick_period_s if tick_period_s > 0.0 else 0.001)
         return False
 
     @property
@@ -225,6 +240,13 @@ class OrchestratorRunner:
     @property
     def skill_catalog(self) -> Optional[SkillCatalog]:
         return self._skill_catalog
+
+    def set_scene_snapshot_provider(
+        self,
+        provider: Optional[Callable[[int, int, str], Optional[bytes]]],
+    ) -> None:
+        """Update the HMI-backed render provider used by query_model nodes."""
+        self._scene_snapshot_provider = provider
 
     def _expand_tree_node(self, tree_node: TreeNode) -> TreeNode:
         """Expand a skill invocation into a concrete subtree when needed."""
@@ -272,6 +294,20 @@ class OrchestratorRunner:
                 resolved_params["base_frame"] = self._program.robot.base_frame
             if "tcp_frame" not in resolved_params:
                 resolved_params["tcp_frame"] = self._program.robot.tcp_frame
+        if tree_node.id == "plan_pick_sequence":
+            if "robot_id" not in resolved_params:
+                resolved_params["robot_id"] = self._program.robot.robot_id
+            if "group_id" not in resolved_params:
+                resolved_params["group_id"] = self._program.robot.group_id
+            if "base_frame" not in resolved_params:
+                resolved_params["base_frame"] = self._program.robot.base_frame
+            if "tcp_frame" not in resolved_params:
+                resolved_params["tcp_frame"] = self._program.robot.tcp_frame
+            resolved_params["scene_snapshot_provider"] = self._scene_snapshot_provider
+        if tree_node.id == "build_scene_selection_context":
+            if "base_frame" not in resolved_params:
+                resolved_params["base_frame"] = self._program.robot.base_frame
+            resolved_params["scene_snapshot_provider"] = self._scene_snapshot_provider
 
         # Control flow composites
         if tree_node.id == "sequence":
@@ -362,13 +398,23 @@ class OrchestratorRunner:
                 output_key_prefix=resolved_params.get("output_key_prefix", f"model/{tree_node.name}"),
                 timeout_s=float(resolved_params.get("timeout_s", 30.0)),
                 min_confidence=float(resolved_params.get("min_confidence", 0.0)),
+                include_scene_snapshot=bool(resolved_params.get("include_scene_snapshot", False)),
+                scene_snapshot_width=int(resolved_params.get("scene_snapshot_width", 640)),
+                scene_snapshot_height=int(resolved_params.get("scene_snapshot_height", 480)),
+                scene_snapshot_format=str(resolved_params.get("scene_snapshot_format", "jpeg")),
                 endpoint=endpoint,
                 template=template,
                 event_recorder=event_recorder,
                 audit_policy=audit_policy,
+                scene_snapshot_provider=self._scene_snapshot_provider,
                 run_id=ctx.get("run_id"),
                 session_id=ctx.get("session_id"),
                 principal_id=ctx.get("principal_id"),
+            )
+        if tree_node.id == "build_scene_selection_context":
+            return BuildSceneSelectionContextNode(
+                name=tree_node.name,
+                **resolved_params,
             )
         if tree_node.id == "timer":
             duration = float(resolved_params.get("duration_s", 1.0))

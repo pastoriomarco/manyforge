@@ -66,6 +66,7 @@ def start_hmi(cycle_manager: CycleManager, runner: OrchestratorRunner):
         if runner.program:
             hmi.load_program(runner.program)
         hmi.start()
+        runner.set_scene_snapshot_provider(hmi.render_scene)
         print("HMI started on http://127.0.0.1:8081")
         return hmi
     except ImportError:

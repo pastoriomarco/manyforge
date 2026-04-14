@@ -11,7 +11,11 @@ from typing import Any, Mapping, Optional
 import yaml
 
 from manyforge_behavior.catalog import NodeCatalog
-from manyforge_behavior.parameters import PARAM_REF_RE, ParameterResolver
+from manyforge_behavior.parameters import (
+    BLACKBOARD_REF_RE,
+    PARAM_REF_RE,
+    ParameterResolver,
+)
 from manyforge_behavior.skill_loader import (
     SkillCatalog,
     default_skills_dir,
@@ -294,6 +298,28 @@ def _contains_parameter_reference(value: Any) -> bool:
     if isinstance(value, dict):
         return any(_contains_parameter_reference(item) for item in value.values())
     return False
+
+
+def _contains_blackboard_reference(value: Any) -> bool:
+    if isinstance(value, str):
+        return BLACKBOARD_REF_RE.match(value) is not None
+    if isinstance(value, list):
+        return any(_contains_blackboard_reference(item) for item in value)
+    if isinstance(value, dict):
+        return any(_contains_blackboard_reference(item) for item in value.values())
+    return False
+
+
+def _allows_runtime_blackboard_reference(
+    node_id: str,
+    param_name: str,
+    raw_value: Any,
+) -> bool:
+    if not _contains_blackboard_reference(raw_value):
+        return False
+    if node_id != "move_manipulator_action":
+        return False
+    return param_name in {"pose_goal", "relative_move"}
 
 
 def _is_numeric(value: Any) -> bool:
@@ -704,6 +730,9 @@ def collect_tree_validation_issues(
                         ),
                     )
                 )
+                continue
+
+            if _allows_runtime_blackboard_reference(current.id, param.name, raw_value):
                 continue
 
             value = resolved_params.get(param.name, raw_value)

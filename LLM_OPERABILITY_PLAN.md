@@ -11,6 +11,100 @@ of those surfaces, not prerequisites for core operability.
 
 **Date**: 2026-04-11
 
+## Open Points
+
+- Semantic object selection demo currently runs with image input disabled by
+  default because `gemma-4-E4B-it` behaved more reliably on the same selection
+  task in direct text-only tests than in the current multimodal path.
+- The image path remains an open investigation item. Compare at least:
+  - current base64 `data:` URL transport
+  - HTTP-served temporary snapshot URLs
+  - local-media-path server configuration in vLLM when/if enabled
+- Do not re-enable image-based selection in the demo until one of those paths
+  shows stable behavior and traceability that is better than the text-only
+  baseline.
+- The new response-tool path for `query_model` is currently verified with
+  `Qwen3.5-9B-Claude-Distilled-NVFP4`. Tool-call compatibility across other
+  allowed local models remains an explicit open point.
+- Do not assume tool-call compatibility from the provider name alone. Models
+  such as `gemma-4-E4B-it` may require a different chat template, parser, or
+  fallback mode than Qwen-family models. ManyForge should maintain a
+  deterministic compatibility matrix or per-endpoint capability flags rather
+  than asking an LLM which models are safe to use.
+- Composer should expose deployment endpoint aliases, configured model IDs, and
+  deterministic `/v1/models` discovery directly in the UI. Assistant model
+  selection must remain separate from per-node model selection.
+
+---
+
+## Recent Findings and Resolutions
+
+### 2026-04-13 to 2026-04-14: Semantic Selection + Composer Model UX
+
+- **Problem**: The semantic selection path was too brittle when the model was
+  asked to emit a large structured JSON response directly.
+  **Resolution**: `query_model` now supports a deployment-defined
+  `response_tool`, and the semantic selection demo uses a deterministic
+  `select_scene_object` response tool instead of relying on free-form JSON
+  formatting.
+
+- **Problem**: Prompt placeholders written as `{{ variable }}` with whitespace
+  were not being rendered, which made the model behave as if the selection
+  request had not been provided.
+  **Resolution**: prompt rendering now supports whitespace-tolerant placeholder
+  substitution in `query_model`.
+
+- **Problem**: The multimodal text+image selection path was less reliable than
+  the text-only path for the current local models.
+  **Resolution**: the semantic selection demo currently runs text-only by
+  default; the image path remains an explicit open investigation item rather
+  than a silently degraded default.
+
+- **Problem**: The old output schema was strict in the wrong place; the model
+  often selected the right object but failed on non-critical diagnostic field
+  formatting.
+  **Resolution**: the execution-critical contract is now enforced through the
+  response tool arguments, while optional diagnostics remain looser.
+
+- **Problem**: Tool-call success is model-specific. Qwen-family local models
+  worked with the current tool-call setup, but that does not imply Gemma-family
+  compatibility.
+  **Resolution**: this is now tracked explicitly as a compatibility/open-point
+  item. ManyForge should maintain deterministic per-endpoint capability
+  knowledge instead of assuming compatibility from provider type alone.
+
+- **Problem**: Composer’s `query_model` node UI was misleading. The node
+  referenced a deployment alias, but the deployment metadata was not surfaced,
+  so the field looked ignored when the demo script rewrote the actual model ID
+  at launch.
+  **Resolution**: Composer now exposes deployment `model_endpoints` and
+  `prompt_templates`, adds deterministic `/v1/models` discovery, and shows the
+  resolved provider/base URL/configured model for the selected alias.
+
+- **Problem**: The semantic demo alias name `gemma4_vlm` became misleading once
+  the launch script started swapping model IDs at runtime.
+  **Resolution**: the semantic demo now uses a role-based alias
+  `selection_model`, which matches what the node actually means.
+
+- **Problem**: The `template_variables` parameter in Composer rendered as
+  `[object Object]`, making it effectively unusable.
+  **Resolution**: `template_variables` now has a typed row editor with explicit
+  variable-name and blackboard-path fields instead of a raw string fallback.
+
+- **Problem**: The `model_endpoint_alias` and `prompt_template_id` fields in
+  Composer looked interactive even when only one valid deployment option
+  existed.
+  **Resolution**: when only one valid deployment alias/template exists, the UI
+  now renders resolved read-only info rather than a meaningless single-option
+  dropdown. If multiple aliases/templates exist, the UI still renders a real
+  selector.
+
+- **Problem**: Deployment-side model endpoint configuration could not be edited
+  coherently in Composer, so aliases were effectively fixed by the demo script.
+  **Resolution**: the Deployment panel now exposes model endpoint aliases and
+  their configurable fields (`provider`, `modelId`, `baseUrl`, `apiKeyEnv`,
+  `defaultTimeoutS`, `maxTokens`) directly in the Composer UI.
+
 ---
 
 ## 1. Current State Inventory
@@ -58,7 +152,7 @@ of those surfaces, not prerequisites for core operability.
 | Use contact-aware execution policies | No contact-policy model or API; collision handling is still binary | **High** |
 | Perceive the real-world scene | No camera integration in ManyForge itself | **Low** (camera_vllm_bridge exists separately) |
 | Serve MCP over an external-agent-friendly transport | MCP exists in-process/stdin only; no HTTP/SSE transport for sandboxed remote agents | **Medium** |
-| Query a model from inside the tree as a first-class runtime node | No cataloged `query_model` node with deployment-bound endpoint aliases, versioned prompt templates, JSON-schema output validation, timeout semantics, or atomic blackboard writes | **Medium** |
+| Use multi-model `query_model` safely across deployment/model families | Initial `query_model` support exists, but per-endpoint capability flags, formal response-tool compatibility rules, and assistant-vs-node model separation are still incomplete | **Medium** |
 | Offer a design-time Composer chat assistant | No assistant endpoint or UI panel for tree proposals/interactive debugging | **Low** |
 | Provide closed, typed delegated-recovery contracts across all recovery paths | Pending recovery is enforced today, but typed recovery nodes, closed trigger taxonomy, and per-node recovery policy are not yet implemented | **High** |
 
@@ -1616,7 +1710,7 @@ first implementation is still externally serviced. A saved program can raise a
 recovery request; it cannot yet execute typed deterministic recovery nodes or a
 future model-assisted in-tree recovery path.
 
-### OP-7: `query_model` contract direction is converged; spec and implementation work remain
+### OP-7: `query_model` initial implementation is landed; spec alignment and multi-model hardening remain
 
 OpenClaw-style per-cycle perception is useful, but it introduces a new class of
 runtime node that mixes prompt templating, structured output parsing, blackboard
@@ -1634,21 +1728,28 @@ writes, timeout handling, and optional scene-snapshot attachment.
 - all effective model activity must be durably traced with enough references or
   hashes to reconstruct what the model saw without storing full prompt text by
   default
+- structured output may use either direct JSON-schema validation or a
+  deployment-defined deterministic `response_tool` when the model family
+  supports tool calls more reliably than free-form JSON
 
 **Remaining**:
-- define the catalog/schema contract for `query_model`
+- align the normative specs to the shipped `query_model` contract
 - define prompt-template variable rules and the deployment-side template
-  registry contract
+  registry contract in the specs
+- define formal `response_tool` schema rules and the compatibility policy for
+  model families that differ in tool-call behavior
+- add per-endpoint capability flags so deployments can declare whether an
+  endpoint supports response tools, image input, JSON-object output, and any
+  model-family-specific parser requirements
 - define attachment hashing/reference rules for scene snapshots / scene-state
   payloads
-- define non-blocking runtime semantics:
-  - `RUNNING` while waiting
-  - clean timeout/failure
-  - clean stop/cancel interruption
-- implement tests against mocked and real model endpoints
+- keep assistant model configuration separate from per-node model configuration
+  in the deployment/UI contract
+- extend tests across mocked and real model endpoints, including a
+  compatibility matrix for the supported local model families
 
-**Impact**: Without this, “perception-driven cycle targets” remains an
-integration idea rather than a reliable runtime feature.
+**Impact**: Without this hardening, `query_model` works as a runtime feature
+but remains weaker than it should be as an industrial multi-model surface.
 
 ### OP-8: External-agent transport direction is converged; transport/auth implementation remains
 
@@ -1761,19 +1862,19 @@ Proceed in this order:
    - implement per-node bounded `recovery_policy`
    - keep current external stop-and-request path as fallback
 
-4. **OP-7 `query_model` contract + implementation**
-   - deployment-side template registry
-   - endpoint alias resolution
-   - JSON-schema validation
-   - atomic namespace writes
-   - non-blocking runtime semantics
-
-5. **OP-9 model-event/audit implementation**
+4. **OP-9 model-event/audit implementation**
    - structured model event family
    - default redacted/hash-based logging
    - debug-export alignment
    - must land before or alongside `query_model` so auditable events are
      recorded from the first model call
+
+5. **Model capability + assistant configuration hardening**
+   - add per-endpoint capability flags (`supports_response_tools`,
+     `supports_image_input`, `supports_json_object`, etc.)
+   - separate assistant endpoint/model configuration from per-node
+     `query_model` endpoint selection
+   - add `/api/assistant/chat` plus the initial Composer assistant surface
 
 6. **OP-8 HTTP/SSE MCP transport**
    - expose `/api/mcp` + `/api/mcp/sse`

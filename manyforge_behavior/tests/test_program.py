@@ -274,6 +274,64 @@ class TestProgramValidation:
             Program(path, catalog)
         os.unlink(path)
 
+    def test_allows_pose_goal_blackboard_reference_for_motion_nodes(self, catalog):
+        data = _minimal_program()
+        data["tree"] = {
+            "id": "sequence",
+            "name": "root",
+            "children": [
+                {
+                    "id": "move_manipulator_action",
+                    "name": "dynamic_pose_goal",
+                    "params": {
+                        "move_id": "pick_pose",
+                        "motion_type": "pose_goal",
+                        "pose_goal": "${bb:perception/grasp_pose}",
+                    },
+                },
+            ],
+        }
+        path = _write_program(data)
+        try:
+            program = Program(path, catalog)
+            assert program.tree.children[0].params["pose_goal"] == "${bb:perception/grasp_pose}"
+        finally:
+            os.unlink(path)
+
+    def test_allows_relative_move_blackboard_reference_for_motion_nodes(self, catalog):
+        data = _minimal_program()
+        data["tree"] = {
+            "id": "sequence",
+            "name": "root",
+            "children": [
+                {
+                    "id": "move_manipulator_action",
+                    "name": "dynamic_relative_move",
+                    "params": {
+                        "move_id": "pick_pose",
+                        "motion_type": "relative_move",
+                        "relative_move": {
+                            "target_reference": {
+                                "type": "pose",
+                                "pose": "${bb:perception/approach_pose}",
+                            },
+                            "offset": {
+                                "position_m": [0.0, 0.0, 0.1],
+                                "orientation_rpy_deg": [0.0, 0.0, 0.0],
+                            },
+                        },
+                    },
+                },
+            ],
+        }
+        path = _write_program(data)
+        try:
+            program = Program(path, catalog)
+            relative_move = program.tree.children[0].params["relative_move"]
+            assert relative_move["target_reference"]["pose"] == "${bb:perception/approach_pose}"
+        finally:
+            os.unlink(path)
+
 
 # ── compute_program_tree_hash ────────────────────────────────────────────
 

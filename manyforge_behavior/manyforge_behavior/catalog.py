@@ -23,6 +23,7 @@ class CatalogParameter:
     enum_values: list[str] = field(default_factory=list)
     constraints: dict[str, Any] = field(default_factory=dict)
     parameterizable: bool = False
+    ui_editor: Optional[str] = None
     description: str = ""
 
 
@@ -109,6 +110,7 @@ class NodeCatalog:
                     enum_values=p.get("enum_values", []),
                     constraints=p.get("constraints", {}),
                     parameterizable=p.get("parameterizable", False),
+                    ui_editor=p.get("ui_editor"),
                     description=p.get("description", ""),
                 )
             )

@@ -254,6 +254,88 @@ class TestMoveManipulatorAction:
             abs=1e-6,
         )
 
+    def test_pose_goal_blackboard_reference_resolves_runtime_pose(self, kernel, bb_with_kernel):
+        bb_with_kernel.register_key(
+            key="perception/grasp_pose",
+            access=py_trees.common.Access.WRITE,
+        )
+        bb_with_kernel.set(
+            "perception/grasp_pose",
+            {
+                "position_m": [0.42, -0.05, 0.31],
+                "orientation_rpy_deg": [180.0, 0.0, -90.0],
+            },
+        )
+
+        node = MoveManipulatorAction(
+            name="test_pose_goal_bb_ref",
+            move_id="m_pose_bb",
+            motion_type="pose_goal",
+            pose_goal="${bb:perception/grasp_pose}",
+        )
+
+        status = _tick_node(node)
+        assert status == py_trees.common.Status.SUCCESS
+        assert kernel.last_execute_request is not None
+        assert kernel.last_execute_request.pose_goal == {
+            "position_m": [0.42, -0.05, 0.31],
+            "orientation_xyzw": pytest.approx(
+                [0.70710678, -0.70710678, -4.32978028e-17, 4.32978028e-17],
+                abs=1e-6,
+            ),
+        }
+
+    def test_pose_goal_blackboard_reference_missing_key_fails_closed(self, kernel, bb_with_kernel):
+        node = MoveManipulatorAction(
+            name="test_pose_goal_bb_missing",
+            move_id="m_pose_missing",
+            motion_type="pose_goal",
+            pose_goal="${bb:perception/missing_grasp_pose}",
+        )
+
+        status = _tick_node(node)
+        assert status == py_trees.common.Status.FAILURE
+        assert kernel.execute_count == 0
+
+    def test_relative_move_pose_reference_can_resolve_blackboard_pose(self, kernel, bb_with_kernel):
+        bb_with_kernel.register_key(
+            key="perception/approach_pose",
+            access=py_trees.common.Access.WRITE,
+        )
+        bb_with_kernel.set(
+            "perception/approach_pose",
+            {
+                "position_m": [0.3, -0.2, 0.15],
+                "orientation_rpy_deg": [180.0, 0.0, -90.0],
+            },
+        )
+
+        node = MoveManipulatorAction(
+            name="test_relative_move_bb_ref",
+            move_id="m_rel_bb",
+            motion_type="relative_move",
+            relative_move={
+                "target_reference": {
+                    "type": "pose",
+                    "pose": "${bb:perception/approach_pose}",
+                },
+                "offset": {
+                    "position_m": [0.0, 0.0, 0.1],
+                    "orientation_rpy_deg": [0.0, 0.0, 0.0],
+                },
+            },
+        )
+
+        status = _tick_node(node)
+        assert status == py_trees.common.Status.SUCCESS
+        assert kernel.last_execute_request is not None
+        ref = kernel.last_execute_request.relative_move["target_reference"]
+        assert ref["type"] == "pose"
+        assert ref["pose"]["orientation_xyzw"] == pytest.approx(
+            [0.70710678, -0.70710678, -4.32978028e-17, 4.32978028e-17],
+            abs=1e-6,
+        )
+
 
 class TestResetTrajectories:
     def test_success(self, kernel, bb_with_kernel):
@@ -276,6 +358,49 @@ class TestAddCollisionObject:
         status = _tick_node(node)
         assert status == py_trees.common.Status.SUCCESS
         assert len(kernel.scene_edits) == 1
+
+
+class TestSceneNodeBlackboardReferences:
+    def test_attach_object_to_link_resolves_object_id_from_blackboard(self, kernel, bb_with_kernel):
+        add_request = SceneEditRequest(
+            operation="add",
+            object_id="sphere_part",
+            shape_type="sphere",
+            sphere_radius_m=0.01,
+            pose_position_m=[0.40, -0.14, 0.009],
+            pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
+            frame_id="base_link",
+        )
+        assert kernel.scene_edit(add_request).success is True
+
+        bb_with_kernel.register_key(
+            key="planning/pick_plan/fields/selected_object_id",
+            access=py_trees.common.Access.WRITE,
+        )
+        bb_with_kernel.set(
+            "planning/pick_plan/fields/selected_object_id",
+            "sphere_part",
+        )
+
+        registry_bb = py_trees.blackboard.Client(name="scene_registry")
+        registry_bb.register_key(key="scene_objects", access=py_trees.common.Access.WRITE)
+        registry_bb.scene_objects = {
+            "sphere_part": {
+                "shape_type": "sphere",
+                "sphere_radius_m": 0.01,
+            }
+        }
+
+        node = AttachObjectToLink(
+            name="attach_selected",
+            object_id="${bb:planning/pick_plan/fields/selected_object_id}",
+            link_frame="tool0",
+        )
+
+        status = _tick_node(node)
+
+        assert status == py_trees.common.Status.SUCCESS
+        assert kernel.get_object_state("sphere_part").attached is True
         assert kernel.scene_edits[0].operation == "add"
 
     def test_failure(self, kernel, bb_with_kernel):

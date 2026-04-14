@@ -25,6 +25,7 @@ def create_catalog_router(state: ComposerState) -> APIRouter:
                     enumValues=param.enum_values,
                     constraints=param.constraints,
                     parameterizable=param.parameterizable,
+                    uiEditor=param.ui_editor,
                     description=param.description,
                 ).model_dump(by_alias=True))
             entries.append(CatalogEntryResponse(
@@ -63,6 +64,7 @@ def create_catalog_router(state: ComposerState) -> APIRouter:
                 enumValues=param.enum_values,
                 constraints=param.constraints,
                 parameterizable=param.parameterizable,
+                uiEditor=param.ui_editor,
                 description=param.description,
             ).model_dump(by_alias=True))
         

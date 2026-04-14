@@ -37,6 +37,7 @@ class CatalogParameterResponse(BaseModel):
     enum_values: List[str] = Field(default_factory=list, alias="enumValues")
     constraints: Dict[str, Any] = Field(default_factory=dict)
     parameterizable: bool = False
+    ui_editor: Optional[str] = Field(default=None, alias="uiEditor")
     description: str = ""
 
 
@@ -387,6 +388,32 @@ class LaunchConfigResponse(BaseModel):
     ui_backend: Optional[LaunchUiBackendResponse] = Field(None, alias="uiBackend")
 
 
+class ModelAuditPolicyResponse(BaseModel):
+    model_config = _ALIAS_CFG
+    store_full_prompts: bool = Field(default=False, alias="storeFullPrompts")
+    store_full_responses: bool = Field(default=False, alias="storeFullResponses")
+    hash_algorithm: str = Field(default="sha256", alias="hashAlgorithm")
+    redact_argument_values: bool = Field(default=True, alias="redactArgumentValues")
+
+
+class ModelEndpointResponse(BaseModel):
+    model_config = _ALIAS_CFG
+    provider: str
+    model_id: str = Field(alias="modelId")
+    base_url: Optional[str] = Field(default=None, alias="baseUrl")
+    api_key_env: Optional[str] = Field(default=None, alias="apiKeyEnv")
+    default_timeout_s: float = Field(default=30.0, alias="defaultTimeoutS")
+    max_tokens: int = Field(default=4096, alias="maxTokens")
+
+
+class PromptTemplateResponse(BaseModel):
+    model_config = _ALIAS_CFG
+    version: str
+    template_text: str = Field(alias="templateText")
+    output_schema: Optional[Dict[str, Any]] = Field(default=None, alias="outputSchema")
+    response_tool: Optional[Dict[str, Any]] = Field(default=None, alias="responseTool")
+
+
 class FullDeploymentResponse(BaseModel):
     model_config = _ALIAS_CFG
     api_version: str = Field(alias="apiVersion")
@@ -398,7 +425,36 @@ class FullDeploymentResponse(BaseModel):
     adapters: Dict[str, AdapterConfigResponse]
     orchestrator: OrchestratorConfigResponse
     launch: LaunchConfigResponse
+    model_audit_policy: Optional[ModelAuditPolicyResponse] = Field(
+        default=None,
+        alias="modelAuditPolicy",
+    )
+    model_endpoints: Dict[str, ModelEndpointResponse] = Field(
+        default_factory=dict,
+        alias="modelEndpoints",
+    )
+    prompt_templates: Dict[str, PromptTemplateResponse] = Field(
+        default_factory=dict,
+        alias="promptTemplates",
+    )
     source_path: str = Field(alias="sourcePath", default="")
+
+
+class ModelEndpointProbeResponse(BaseModel):
+    model_config = _ALIAS_CFG
+    alias: str
+    provider: str
+    configured_model_id: str = Field(alias="configuredModelId")
+    base_url: Optional[str] = Field(default=None, alias="baseUrl")
+    probe_status: str = Field(alias="probeStatus")
+    available_model_ids: List[str] = Field(default_factory=list, alias="availableModelIds")
+    error: Optional[str] = None
+
+
+class ModelEndpointCatalogResponse(BaseModel):
+    model_config = _ALIAS_CFG
+    endpoints: Dict[str, ModelEndpointProbeResponse]
+    timestamp: float
 
 
 class UpdateDeploymentRequest(BaseModel):
@@ -705,4 +761,11 @@ class StateUpdate(BaseModel):
     velocity_scale: float = Field(alias="velocityScale")
     node_statuses: Dict[str, str] = Field(default_factory=dict, alias="nodeStatuses")
     kernel_events: List[ExecutionEventResponse] = Field(default_factory=list, alias="kernelEvents")
+    native_kernel_events: List[Dict[str, Any]] = Field(default_factory=list, alias="nativeKernelEvents")
+    program_loaded: bool = Field(default=False, alias="programLoaded")
+    program_session_generation: int = Field(default=0, alias="programSessionGeneration")
+    runtime_override_status: Optional[RuntimeOverrideStatusResponse] = Field(
+        default=None, alias="runtimeOverrideStatus"
+    )
+    error: Optional[str] = None
     timestamp: float

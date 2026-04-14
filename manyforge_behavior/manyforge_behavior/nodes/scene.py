@@ -8,6 +8,7 @@ import py_trees
 
 from manyforge_behavior.kernel_client import KernelClient, SceneEditRequest
 from manyforge_behavior.nodes.motion import _rpy_deg_to_xyzw
+from manyforge_behavior.parameters import BLACKBOARD_REF_RE
 
 
 def _get_scene_callback() -> Optional[Callable]:
@@ -18,6 +19,28 @@ def _get_scene_callback() -> Optional[Callable]:
         return bb.scene_edit_callback
     except (KeyError, AttributeError):
         return None
+
+
+def _resolve_blackboard_reference(
+    blackboard: py_trees.blackboard.Client, value: Any
+) -> Any:
+    if isinstance(value, str):
+        match = BLACKBOARD_REF_RE.match(value)
+        if match is None:
+            return value
+        key = match.group(1)
+        blackboard.register_key(key=key, access=py_trees.common.Access.READ)
+        if not blackboard.exists(key):
+            raise KeyError(f"Missing blackboard key '{key}'")
+        return blackboard.get(key)
+    if isinstance(value, list):
+        return [_resolve_blackboard_reference(blackboard, item) for item in value]
+    if isinstance(value, dict):
+        return {
+            item_key: _resolve_blackboard_reference(blackboard, item_value)
+            for item_key, item_value in value.items()
+        }
+    return value
 
 
 class AddCollisionObject(py_trees.behaviour.Behaviour):
@@ -35,20 +58,41 @@ class AddCollisionObject(py_trees.behaviour.Behaviour):
 
     def update(self) -> py_trees.common.Status:
         kernel: KernelClient = self.blackboard.kernel
-        pose = self._params.get("pose", {})
+        try:
+            object_id = _resolve_blackboard_reference(
+                self.blackboard, self._params.get("object_id", "")
+            )
+            shape_type = _resolve_blackboard_reference(
+                self.blackboard, self._params.get("shape_type")
+            )
+            box_dimensions_m = _resolve_blackboard_reference(
+                self.blackboard, self._params.get("box_dimensions_m")
+            )
+            sphere_radius_m = _resolve_blackboard_reference(
+                self.blackboard, self._params.get("sphere_radius_m")
+            )
+            pose = _resolve_blackboard_reference(
+                self.blackboard, self._params.get("pose", {})
+            )
+            frame_id = _resolve_blackboard_reference(
+                self.blackboard, self._params.get("frame_id")
+            )
+        except (AttributeError, KeyError) as exc:
+            self.feedback_message = str(exc)
+            return py_trees.common.Status.FAILURE
         orient = pose.get("orientation_xyzw") or (
             _rpy_deg_to_xyzw(pose["orientation_rpy_deg"])
             if "orientation_rpy_deg" in pose else None
         )
         request = SceneEditRequest(
             operation="add",
-            object_id=self._params.get("object_id", ""),
-            shape_type=self._params.get("shape_type"),
-            box_dimensions_m=self._params.get("box_dimensions_m"),
-            sphere_radius_m=self._params.get("sphere_radius_m"),
+            object_id=object_id,
+            shape_type=shape_type,
+            box_dimensions_m=box_dimensions_m,
+            sphere_radius_m=sphere_radius_m,
             pose_position_m=pose.get("position_m"),
             pose_orientation_xyzw=orient,
-            frame_id=self._params.get("frame_id"),
+            frame_id=frame_id,
         )
         result = kernel.scene_edit(request)
         if result.success:
@@ -74,9 +118,16 @@ class RemoveCollisionObject(py_trees.behaviour.Behaviour):
 
     def update(self) -> py_trees.common.Status:
         kernel: KernelClient = self.blackboard.kernel
+        try:
+            object_id = _resolve_blackboard_reference(
+                self.blackboard, self._params.get("object_id", "")
+            )
+        except (AttributeError, KeyError) as exc:
+            self.feedback_message = str(exc)
+            return py_trees.common.Status.FAILURE
         request = SceneEditRequest(
             operation="remove",
-            object_id=self._params.get("object_id", ""),
+            object_id=object_id,
         )
         result = kernel.scene_edit(request)
         if result.success:
@@ -102,17 +153,29 @@ class UpdateCollisionObjectPose(py_trees.behaviour.Behaviour):
 
     def update(self) -> py_trees.common.Status:
         kernel: KernelClient = self.blackboard.kernel
-        pose = self._params.get("pose", {})
+        try:
+            object_id = _resolve_blackboard_reference(
+                self.blackboard, self._params.get("object_id", "")
+            )
+            pose = _resolve_blackboard_reference(
+                self.blackboard, self._params.get("pose", {})
+            )
+            frame_id = _resolve_blackboard_reference(
+                self.blackboard, self._params.get("frame_id")
+            )
+        except (AttributeError, KeyError) as exc:
+            self.feedback_message = str(exc)
+            return py_trees.common.Status.FAILURE
         orient = pose.get("orientation_xyzw") or (
             _rpy_deg_to_xyzw(pose["orientation_rpy_deg"])
             if "orientation_rpy_deg" in pose else None
         )
         request = SceneEditRequest(
             operation="update_pose",
-            object_id=self._params.get("object_id", ""),
+            object_id=object_id,
             pose_position_m=pose.get("position_m"),
             pose_orientation_xyzw=orient,
-            frame_id=self._params.get("frame_id"),
+            frame_id=frame_id,
         )
         result = kernel.scene_edit(request)
         if result.success:
@@ -142,8 +205,16 @@ class AttachObjectToLink(py_trees.behaviour.Behaviour):
 
     def update(self) -> py_trees.common.Status:
         kernel: KernelClient = self.blackboard.kernel
-        object_id = self._params.get("object_id", "")
-        link_frame = self._params.get("link_frame", "tool0")
+        try:
+            object_id = _resolve_blackboard_reference(
+                self.blackboard, self._params.get("object_id", "")
+            )
+            link_frame = _resolve_blackboard_reference(
+                self.blackboard, self._params.get("link_frame", "tool0")
+            )
+        except (AttributeError, KeyError) as exc:
+            self.feedback_message = str(exc)
+            return py_trees.common.Status.FAILURE
 
         registry: dict = getattr(self.blackboard, "scene_objects", {})
         obj_info = registry.get(object_id, {})
@@ -204,8 +275,16 @@ class DetachObjectFromLink(py_trees.behaviour.Behaviour):
 
     def update(self) -> py_trees.common.Status:
         kernel: KernelClient = self.blackboard.kernel
-        object_id = self._params.get("object_id", "")
-        target_frame = self._params.get("frame_id", "universe")
+        try:
+            object_id = _resolve_blackboard_reference(
+                self.blackboard, self._params.get("object_id", "")
+            )
+            target_frame = _resolve_blackboard_reference(
+                self.blackboard, self._params.get("frame_id", "universe")
+            )
+        except (AttributeError, KeyError) as exc:
+            self.feedback_message = str(exc)
+            return py_trees.common.Status.FAILURE
         registry: dict = getattr(self.blackboard, "scene_objects", {})
         obj_info = registry.get(object_id, {})
 

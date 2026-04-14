@@ -16,7 +16,9 @@ from manyforge_behavior.kernel_client import (
     CommandResult,
     ExecutionStatus,
     ExecutionSnapshot,
+    MotionPreviewResult,
     ObjectState,
+    RobotStateSnapshot,
     SceneObjectSnapshot,
     SceneShape,
     SceneEditRequest,
@@ -129,6 +131,95 @@ class NativeKernelClient(KernelClient):
             ok=result["ok"],
             execution_id=result.get("execution_id", 0),
             error=result.get("error"),
+        )
+
+    def preview_motion(
+        self,
+        request: ExecuteRequest,
+        start_state: Optional[RobotStateSnapshot] = None,
+    ) -> MotionPreviewResult:
+        relative_move = request.relative_move
+        if relative_move is not None:
+            relative_move = dict(relative_move)
+            target_reference = relative_move.get("target_reference")
+            if target_reference is not None:
+                target_reference = dict(target_reference)
+                if target_reference.get("type") == "pose":
+                    target_reference["pose"] = _normalize_pose_dict(target_reference.get("pose"))
+                relative_move["target_reference"] = target_reference
+            offset_reference = relative_move.get("offset_reference")
+            if offset_reference is not None:
+                offset_reference = dict(offset_reference)
+                if offset_reference.get("type") == "pose":
+                    offset_reference["pose"] = _normalize_pose_dict(offset_reference.get("pose"))
+                relative_move["offset_reference"] = offset_reference
+            relative_move["offset"] = _normalize_pose_dict(relative_move.get("offset"))
+
+        req_dict = {
+            "robot_id": request.robot_id,
+            "group_id": request.group_id,
+            "move_id": request.move_id,
+            "base_frame": request.base_frame,
+            "tcp_frame": request.tcp_frame,
+            "motion_type": request.motion_type,
+            "velocity_scale": request.velocity_scale,
+            "acceleration_scale": request.acceleration_scale,
+            "planning_timeout_s": request.planning_timeout_s,
+            "execution_timeout_s": request.execution_timeout_s,
+            "joint_position_tol_rad": request.joint_position_tol_rad,
+            "translation_tol_m": request.translation_tol_m,
+            "rotation_tol_rad": request.rotation_tol_rad,
+            "cache_mode": request.cache_mode,
+        }
+
+        if request.max_tcp_linear_speed_mps is not None:
+            req_dict["max_tcp_linear_speed_mps"] = request.max_tcp_linear_speed_mps
+
+        if request.motion_type == "joint_goal":
+            req_dict["joint_goal_names"] = request.joint_goal_names
+            req_dict["joint_goal_positions_rad"] = request.joint_goal_positions_rad
+        elif request.motion_type == "pose_goal":
+            req_dict["pose_goal"] = request.pose_goal
+        elif request.motion_type == "relative_move":
+            req_dict["relative_move"] = relative_move
+
+        start_state_dict = None
+        if start_state is not None:
+            start_state_dict = {
+                "joint_names": list(start_state.joint_names),
+                "positions_rad": list(start_state.positions_rad),
+                "velocities_rad_s": list(start_state.velocities_rad_s),
+            }
+
+        result = self._bundle.preview_motion(req_dict, start_state_dict)
+        final_state = result.get("final_state")
+        return MotionPreviewResult(
+            ok=result.get("ok", False),
+            error=result.get("error"),
+            error_details=(
+                None
+                if result.get("error_details") is None
+                else dict(result.get("error_details", {}))
+            ),
+            trajectory_duration_s=result.get("trajectory_duration_s"),
+            trajectory_waypoint_count=result.get("trajectory_waypoint_count"),
+            final_state=(
+                None
+                if final_state is None
+                else RobotStateSnapshot(
+                    joint_names=list(final_state.get("joint_names", [])),
+                    positions_rad=list(final_state.get("positions_rad", [])),
+                    velocities_rad_s=list(final_state.get("velocities_rad_s", [])),
+                )
+            ),
+            final_tcp_pose=(
+                None
+                if result.get("final_tcp_pose") is None
+                else {
+                    "position_m": list(result["final_tcp_pose"]["position_m"]),
+                    "orientation_xyzw": list(result["final_tcp_pose"]["orientation_xyzw"]),
+                }
+            ),
         )
 
     def stop(self) -> CommandResult:

@@ -16,6 +16,15 @@ using namespace manyforge::core;
 
 namespace {
 
+py::dict error_details_to_python(
+    const std::map<std::string, std::string>& details) {
+  py::dict d;
+  for (const auto& [key, value] : details) {
+    d[py::cast(key)] = value;
+  }
+  return d;
+}
+
 // Helper: convert Result<uint64_t> to Python dict
 py::dict result_to_python(const Result<uint64_t>& result) {
   py::dict d;
@@ -67,6 +76,15 @@ py::dict pose_to_python(const Pose3DTO& pose) {
   d["orientation_xyzw"] = py::make_tuple(
       pose.orientation.x, pose.orientation.y,
       pose.orientation.z, pose.orientation.w);
+  return d;
+}
+
+// Helper: convert RobotStateDTO to Python dict
+py::dict robot_state_to_python(const RobotStateDTO& state) {
+  py::dict d;
+  d["joint_names"] = state.joint_names;
+  d["positions_rad"] = state.positions_rad;
+  d["velocities_rad_s"] = state.velocities_rad_s;
   return d;
 }
 
@@ -380,6 +398,194 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
         auto result = self.kernel->execute(req);
         return result_to_python(result);
       })
+      .def("preview_motion", [](NativeKernelBundle& self,
+                                 py::dict request,
+                                 py::object start_state_obj) -> py::dict {
+        ExecuteRequestDTO req;
+        req.robot_id = request["robot_id"].cast<std::string>();
+        req.group_id = request["group_id"].cast<std::string>();
+        req.move_id = request["move_id"].cast<std::string>();
+        req.base_frame = request["base_frame"].cast<std::string>();
+        req.tcp_frame = request["tcp_frame"].cast<std::string>();
+
+        req.tolerances.joint_position_tol_rad = request.attr("get")("joint_position_tol_rad", 0.05).cast<double>();
+        req.tolerances.translation_tol_m = request.attr("get")("translation_tol_m", 0.005).cast<double>();
+        req.tolerances.rotation_tol_rad = request.attr("get")("rotation_tol_rad", 0.05).cast<double>();
+
+        req.speed_profile.velocity_scale = finite_scale_from_python(
+            request.attr("get")("velocity_scale", 1.0),
+            "velocity_scale");
+        req.speed_profile.acceleration_scale = finite_scale_from_python(
+            request.attr("get")("acceleration_scale", 1.0),
+            "acceleration_scale");
+        if (request.contains("max_tcp_linear_speed_mps")) {
+          auto val = request["max_tcp_linear_speed_mps"];
+          if (!val.is_none()) {
+            double tcp_speed = val.cast<double>();
+            if (tcp_speed > 0.0) {
+              req.speed_profile.max_tcp_linear_speed_mps = tcp_speed;
+            }
+          }
+        }
+
+        req.timeouts.planning_timeout_s = request.attr("get")("planning_timeout_s", 5.0).cast<double>();
+        req.timeouts.execution_timeout_s = request.attr("get")("execution_timeout_s", 10.0).cast<double>();
+
+        std::string cache_mode_str = request.attr("get")("cache_mode", "default").cast<std::string>();
+        req.cache_mode = (cache_mode_str == "disable") ? CacheMode::kDisable : CacheMode::kDefault;
+
+        std::string motion_type = request["motion_type"].cast<std::string>();
+        if (motion_type == "joint_goal") {
+          JointGoalDTO goal;
+          goal.joint_names = request["joint_goal_names"].cast<std::vector<std::string>>();
+          goal.positions_rad = request["joint_goal_positions_rad"].cast<std::vector<double>>();
+          req.motion = goal;
+        } else if (motion_type == "pose_goal") {
+          PoseGoalDTO goal;
+          auto pose_dict = request["pose_goal"];
+          auto pos = pose_dict["position_m"].cast<std::vector<double>>();
+          auto orient = pose_dict["orientation_xyzw"].cast<std::vector<double>>();
+          goal.goal.position_m = {pos[0], pos[1], pos[2]};
+          goal.goal.orientation = {orient[0], orient[1], orient[2], orient[3]};
+          req.motion = goal;
+        } else if (motion_type == "relative_move") {
+          RelativeMoveDTO goal;
+          auto rel_dict = request["relative_move"];
+          auto parse_reference_dict = [](const py::dict& ref_dict,
+                                         const std::string& field_name) {
+            ReferenceDTO reference;
+            const std::string ref_type = ref_dict["type"].cast<std::string>();
+            if (ref_type == "frame") {
+              reference.type = ReferenceDTO::Type::kFrame;
+            } else if (ref_type == "object") {
+              reference.type = ReferenceDTO::Type::kObject;
+            } else if (ref_type == "robot_link") {
+              reference.type = ReferenceDTO::Type::kRobotLink;
+            } else if (ref_type == "pose") {
+              reference.type = ReferenceDTO::Type::kPose;
+            } else {
+              throw std::runtime_error("Unsupported reference type: " + ref_type);
+            }
+            if (ref_dict.contains("id")) {
+              reference.id = ref_dict["id"].cast<std::string>();
+            }
+            if (reference.type == ReferenceDTO::Type::kPose) {
+              if (!ref_dict.contains("pose")) {
+                throw std::runtime_error(
+                    "Pose reference requires " + field_name + ".pose");
+              }
+              auto pose_dict = ref_dict["pose"];
+              auto pos = pose_dict["position_m"].cast<std::vector<double>>();
+              auto orient = pose_dict["orientation_xyzw"].cast<std::vector<double>>();
+              reference.pose = Pose3DTO{};
+              reference.pose->position_m = {pos[0], pos[1], pos[2]};
+              reference.pose->orientation = {orient[0], orient[1], orient[2], orient[3]};
+            }
+            return reference;
+          };
+
+          goal.target_reference = parse_reference_dict(
+              rel_dict["target_reference"].cast<py::dict>(), "target_reference");
+          if (rel_dict.contains("offset_reference")) {
+            goal.offset_reference = parse_reference_dict(
+                rel_dict["offset_reference"].cast<py::dict>(), "offset_reference");
+          }
+
+          auto offset_dict = rel_dict["offset"];
+          auto pos = offset_dict["position_m"].cast<std::vector<double>>();
+          auto orient = offset_dict["orientation_xyzw"].cast<std::vector<double>>();
+          goal.offset.position_m = {pos[0], pos[1], pos[2]};
+          goal.offset.orientation = {orient[0], orient[1], orient[2], orient[3]};
+          req.motion = goal;
+        }
+
+        RobotStateDTO start_state;
+        if (start_state_obj.is_none()) {
+          start_state = self.context->get_current_state();
+        } else {
+          py::dict start_dict = start_state_obj.cast<py::dict>();
+          start_state.joint_names =
+              start_dict["joint_names"].cast<std::vector<std::string>>();
+          start_state.positions_rad =
+              start_dict["positions_rad"].cast<std::vector<double>>();
+          if (start_dict.contains("velocities_rad_s")) {
+            start_state.velocities_rad_s =
+                start_dict["velocities_rad_s"].cast<std::vector<double>>();
+          }
+        }
+
+        PlanRequestDTO plan_request;
+        plan_request.robot_id = req.robot_id;
+        plan_request.group_id = req.group_id;
+        plan_request.move_id = req.move_id;
+        plan_request.base_frame = req.base_frame;
+        plan_request.tcp_frame = req.tcp_frame;
+        plan_request.start_state = start_state;
+        plan_request.motion = req.motion;
+        plan_request.tolerances = req.tolerances;
+        plan_request.speed_profile = req.speed_profile;
+        plan_request.planning_timeout_s = req.timeouts.planning_timeout_s;
+
+        auto plan_result = self.planner->plan(plan_request);
+        py::dict result;
+        if (!plan_result.trajectory.has_value()) {
+          result["ok"] = false;
+          if (plan_result.error.has_value()) {
+            result["error"] = plan_result.error->message;
+            result["error_details"] =
+                error_details_to_python(plan_result.error->details);
+          } else {
+            result["error"] = "Planning preview failed";
+          }
+          return result;
+        }
+
+        ValidationOptionsDTO validation_options;
+        if (req.speed_profile.max_tcp_linear_speed_mps.has_value()) {
+          validation_options.max_tcp_linear_speed_mps =
+              *req.speed_profile.max_tcp_linear_speed_mps;
+          validation_options.tcp_frame = req.tcp_frame;
+          validation_options.base_frame = req.base_frame;
+        }
+        auto validation_result = self.context->validate_trajectory(
+            *plan_result.trajectory, validation_options);
+        if (!validation_result.valid) {
+          result["ok"] = false;
+          if (validation_result.error.has_value()) {
+            result["error"] = validation_result.error->message;
+            result["error_details"] =
+                error_details_to_python(validation_result.error->details);
+          } else {
+            result["error"] = "Trajectory validation failed";
+          }
+          return result;
+        }
+
+        const auto& trajectory = *plan_result.trajectory;
+        RobotStateDTO final_state;
+        final_state.joint_names = trajectory.joint_names;
+        if (!trajectory.waypoints.empty()) {
+          const auto& final_wp = trajectory.waypoints.back();
+          final_state.positions_rad = final_wp.positions_rad;
+          final_state.velocities_rad_s = final_wp.velocities_rad_s;
+        } else {
+          final_state = start_state;
+        }
+
+        FkRequestDTO fk_request;
+        fk_request.robot_state = final_state;
+        fk_request.target_frame = req.tcp_frame;
+        fk_request.base_frame = req.base_frame;
+        auto final_tcp_pose = self.context->forward_kinematics(fk_request);
+
+        result["ok"] = true;
+        result["trajectory_duration_s"] =
+            trajectory.waypoints.empty() ? 0.0 : trajectory.waypoints.back().time_from_start_s;
+        result["trajectory_waypoint_count"] = trajectory.waypoints.size();
+        result["final_state"] = robot_state_to_python(final_state);
+        result["final_tcp_pose"] = pose_to_python(final_tcp_pose);
+        return result;
+      }, py::arg("request"), py::arg("start_state") = py::none())
       .def("stop", [](NativeKernelBundle& self) -> py::dict {
         auto r = self.kernel->stop();
         return command_result(r.accepted, r.error);

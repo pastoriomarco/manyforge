@@ -91,6 +91,7 @@ class PromptTemplate:
     version: str
     template_text: str
     output_schema: Optional[dict[str, Any]] = None
+    response_tool: Optional[dict[str, Any]] = None
 
     @property
     def content_hash(self) -> str:
@@ -324,6 +325,7 @@ class Deployment:
                 version=tmpl_data.get("version", "1"),
                 template_text=tmpl_data["template_text"],
                 output_schema=tmpl_data.get("output_schema"),
+                response_tool=tmpl_data.get("response_tool"),
             )
 
     def validate_against_program(self, program: Any) -> None:
@@ -446,6 +448,43 @@ class Deployment:
                     "enabled": self.launch.ui_backend.enabled,
                 }
             d["launch"] = launch_d
+        if self.model_audit_policy is not None:
+            d["model_audit_policy"] = {
+                "store_full_prompts": self.model_audit_policy.store_full_prompts,
+                "store_full_responses": self.model_audit_policy.store_full_responses,
+                "hash_algorithm": self.model_audit_policy.hash_algorithm,
+                "redact_argument_values": self.model_audit_policy.redact_argument_values,
+            }
+        if self.model_endpoints:
+            d["model_endpoints"] = {
+                alias: {
+                    "provider": endpoint.provider,
+                    "model_id": endpoint.model_id,
+                    "base_url": endpoint.base_url,
+                    "api_key_env": endpoint.api_key_env,
+                    "default_timeout_s": endpoint.default_timeout_s,
+                    "max_tokens": endpoint.max_tokens,
+                }
+                for alias, endpoint in self.model_endpoints.items()
+            }
+        if self.prompt_templates:
+            d["prompt_templates"] = {
+                template_id: {
+                    "version": template.version,
+                    "template_text": template.template_text,
+                    **(
+                        {"output_schema": template.output_schema}
+                        if template.output_schema is not None
+                        else {}
+                    ),
+                    **(
+                        {"response_tool": template.response_tool}
+                        if template.response_tool is not None
+                        else {}
+                    ),
+                }
+                for template_id, template in self.prompt_templates.items()
+            }
         return d
 
     def save(self, path: str | Path) -> None:

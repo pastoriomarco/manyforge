@@ -1,3 +1,6 @@
+import { useCallback, useEffect, useState } from 'react';
+import { api } from '../api/client';
+import type { ModelEndpointCatalog, ModelEndpointConfig } from '../types/api';
 import { useDeploymentStore } from '../store/deploymentStore';
 import { useCycleStore } from '../store/cycleStore';
 
@@ -74,6 +77,124 @@ function ConfigTextarea({
   );
 }
 
+function nextEndpointAlias(existingAliases: string[]): string {
+  let index = existingAliases.length + 1;
+  while (existingAliases.includes(`model_${index}`)) {
+    index += 1;
+  }
+  return `model_${index}`;
+}
+
+function ModelEndpointCard({
+  alias,
+  endpoint,
+  availableModelIds,
+  probeStatus,
+  probeError,
+  disabled,
+  onAliasChange,
+  onFieldChange,
+  onRemove,
+}: {
+  alias: string;
+  endpoint: ModelEndpointConfig;
+  availableModelIds: string[];
+  probeStatus?: string;
+  probeError?: string | null;
+  disabled: boolean;
+  onAliasChange: (nextAlias: string) => void;
+  onFieldChange: <K extends keyof ModelEndpointConfig>(key: K, value: ModelEndpointConfig[K]) => void;
+  onRemove: () => void;
+}) {
+  return (
+    <div className="rounded border border-gray-700 bg-gray-900/40 p-3">
+      <div className="mb-2 flex items-center justify-between">
+        <div className="text-xs font-medium uppercase tracking-wide text-gray-400">Endpoint Alias</div>
+        <button
+          type="button"
+          onClick={onRemove}
+          disabled={disabled}
+          className="rounded border border-gray-600 px-2 py-1 text-xs text-gray-200 hover:bg-gray-700 disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          Remove
+        </button>
+      </div>
+      <FieldInput
+        label="Alias"
+        value={alias}
+        onChange={onAliasChange}
+        disabled={disabled}
+      />
+      <FieldInput
+        label="Provider"
+        value={endpoint.provider}
+        onChange={(value) => onFieldChange('provider', value)}
+        disabled={disabled}
+      />
+      <FieldInput
+        label="Configured Model ID"
+        value={endpoint.modelId}
+        onChange={(value) => onFieldChange('modelId', value)}
+        disabled={disabled}
+      />
+      {availableModelIds.length > 0 && (
+        <label className="block mb-2">
+          <span className="text-xs text-gray-400">Advertised models</span>
+          <select
+            value={availableModelIds.includes(endpoint.modelId) ? endpoint.modelId : ''}
+            onChange={(e) => {
+              if (e.target.value) {
+                onFieldChange('modelId', e.target.value);
+              }
+            }}
+            disabled={disabled}
+            className="w-full mt-0.5 px-2 py-1 bg-gray-700 border border-gray-600 rounded text-sm text-gray-200 focus:border-blue-500 focus:outline-none disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            <option value="">Select advertised model</option>
+            {availableModelIds.map((modelId) => (
+              <option key={modelId} value={modelId}>
+                {modelId}
+              </option>
+            ))}
+          </select>
+        </label>
+      )}
+      <FieldInput
+        label="Base URL"
+        value={endpoint.baseUrl ?? ''}
+        onChange={(value) => onFieldChange('baseUrl', value)}
+        disabled={disabled}
+      />
+      <FieldInput
+        label="API Key Env"
+        value={endpoint.apiKeyEnv ?? ''}
+        onChange={(value) => onFieldChange('apiKeyEnv', value)}
+        disabled={disabled}
+      />
+      <FieldInput
+        label="Default Timeout (s)"
+        value={endpoint.defaultTimeoutS}
+        onChange={(value) => onFieldChange('defaultTimeoutS', Number(value) || 0)}
+        type="number"
+        disabled={disabled}
+      />
+      <FieldInput
+        label="Max Tokens"
+        value={endpoint.maxTokens}
+        onChange={(value) => onFieldChange('maxTokens', Math.max(0, Math.trunc(Number(value) || 0)))}
+        type="number"
+        disabled={disabled}
+      />
+      <div className="mt-1 text-[11px] text-gray-500">
+        Live probe: {probeStatus ?? 'not loaded'}
+      </div>
+      {probeError && (
+        <div className="mt-1 text-[11px] text-red-400">{probeError}</div>
+      )}
+    </div>
+  );
+}
+
 export function DeploymentPanel() {
   const {
     deployment,
@@ -86,9 +207,108 @@ export function DeploymentPanel() {
   } =
     useDeploymentStore();
   const { state } = useCycleStore();
+  const [modelEndpointCatalog, setModelEndpointCatalog] = useState<ModelEndpointCatalog | null>(null);
   const editLocked = state === 'running' || state === 'direct_control';
   const runtimeApplied = signature(deployment) === signature(appliedDeployment);
   const diskSaved = signature(deployment) === signature(savedDeployment);
+  const deploymentModelEndpointSignature = signature(deployment?.modelEndpoints);
+
+  useEffect(() => {
+    if (!deployment || Object.keys(deployment.modelEndpoints ?? {}).length === 0) {
+      setModelEndpointCatalog(null);
+      return;
+    }
+    let cancelled = false;
+    void api.infra.modelEndpoints()
+      .then((result) => {
+        if (!cancelled) {
+          setModelEndpointCatalog(result);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setModelEndpointCatalog(null);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [deploymentModelEndpointSignature, deployment?.sourcePath]);
+
+  const setModelEndpoints = useCallback((nextModelEndpoints: Record<string, ModelEndpointConfig>) => {
+    setField('modelEndpoints', nextModelEndpoints);
+  }, [setField]);
+
+  const updateModelEndpointAlias = useCallback((currentAlias: string, nextAliasRaw: string) => {
+    if (!deployment) {
+      return;
+    }
+    const nextAlias = nextAliasRaw.trim();
+    if (!nextAlias || nextAlias === currentAlias) {
+      return;
+    }
+    if (Object.prototype.hasOwnProperty.call(deployment.modelEndpoints ?? {}, nextAlias)) {
+      return;
+    }
+    const nextModelEndpoints: Record<string, ModelEndpointConfig> = {};
+    for (const [alias, endpoint] of Object.entries(deployment.modelEndpoints ?? {})) {
+      if (alias === currentAlias) {
+        nextModelEndpoints[nextAlias] = endpoint;
+      } else {
+        nextModelEndpoints[alias] = endpoint;
+      }
+    }
+    setModelEndpoints(nextModelEndpoints);
+  }, [deployment, setModelEndpoints]);
+
+  const updateModelEndpointField = useCallback(<K extends keyof ModelEndpointConfig>(
+    alias: string,
+    key: K,
+    value: ModelEndpointConfig[K],
+  ) => {
+    if (!deployment) {
+      return;
+    }
+    const currentEndpoint = deployment.modelEndpoints?.[alias];
+    if (!currentEndpoint) {
+      return;
+    }
+    setModelEndpoints({
+      ...deployment.modelEndpoints,
+      [alias]: {
+        ...currentEndpoint,
+        [key]: value,
+      },
+    });
+  }, [deployment, setModelEndpoints]);
+
+  const removeModelEndpoint = useCallback((alias: string) => {
+    if (!deployment) {
+      return;
+    }
+    const nextModelEndpoints = { ...deployment.modelEndpoints };
+    delete nextModelEndpoints[alias];
+    setModelEndpoints(nextModelEndpoints);
+  }, [deployment, setModelEndpoints]);
+
+  const addModelEndpoint = useCallback(() => {
+    if (!deployment) {
+      return;
+    }
+    const aliases = Object.keys(deployment.modelEndpoints ?? {});
+    const alias = nextEndpointAlias(aliases);
+    setModelEndpoints({
+      ...deployment.modelEndpoints,
+      [alias]: {
+        provider: 'openai',
+        modelId: '',
+        baseUrl: '',
+        apiKeyEnv: '',
+        defaultTimeoutS: 30,
+        maxTokens: 4096,
+      },
+    });
+  }, [deployment, setModelEndpoints]);
 
   if (!deployment) {
     return (
@@ -226,6 +446,42 @@ export function DeploymentPanel() {
             />
           </>
         )}
+      </Section>
+
+      <Section title="Model Endpoints">
+        <div className="mb-2 text-xs text-gray-500">
+          Deployment aliases are what nodes reference. They should describe the task role, not the raw model family.
+        </div>
+        {Object.entries(deployment.modelEndpoints ?? {}).length === 0 && (
+          <div className="rounded border border-gray-700 bg-gray-900/40 p-3 text-xs text-gray-500">
+            No model endpoints configured.
+          </div>
+        )}
+        {Object.entries(deployment.modelEndpoints ?? {}).map(([alias, endpoint]) => {
+          const probe = modelEndpointCatalog?.endpoints?.[alias];
+          return (
+            <ModelEndpointCard
+              key={alias}
+              alias={alias}
+              endpoint={endpoint}
+              availableModelIds={probe?.availableModelIds ?? []}
+              probeStatus={probe?.probeStatus}
+              probeError={probe?.error}
+              disabled={editLocked}
+              onAliasChange={(nextAlias) => updateModelEndpointAlias(alias, nextAlias)}
+              onFieldChange={(key, value) => updateModelEndpointField(alias, key, value)}
+              onRemove={() => removeModelEndpoint(alias)}
+            />
+          );
+        })}
+        <button
+          type="button"
+          onClick={addModelEndpoint}
+          disabled={editLocked}
+          className="w-full rounded border border-gray-600 px-3 py-2 text-sm text-gray-200 hover:bg-gray-700 disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          Add Model Endpoint Alias
+        </button>
       </Section>
 
       <button

@@ -7,6 +7,7 @@ import time
 from typing import TYPE_CHECKING, List
 
 from fastapi import WebSocket, WebSocketDisconnect
+from .models import StateUpdate, RuntimeOverrideStatusResponse
 
 if TYPE_CHECKING:
     from .state import ComposerState
@@ -81,25 +82,41 @@ class StateHub:
                     )
 
             if self._state and self._state.cycle_manager is not None:
-                data = {
-                    "state": self._state.cycle_manager.state.value,
-                    "velocityScale": self._state.cycle_manager.velocity_scale,
-                    "nodeStatuses": self._state.cycle_manager.get_node_statuses(),
-                    "kernelEvents": kernel_events,
-                    "nativeKernelEvents": native_kernel_events,
-                    "error": self._state.cycle_manager.error,
-                    "programLoaded": bool(has_program),
-                    "timestamp": time.time(),
-                }
+                runtime_override_status = None
+                if self._state.program is not None:
+                    runtime_override_status = RuntimeOverrideStatusResponse(
+                        **self._state.runtime_override_status()
+                    ).model_dump(by_alias=True)
+                data = StateUpdate(
+                    state=self._state.cycle_manager.state.value,
+                    velocityScale=self._state.cycle_manager.velocity_scale,
+                    nodeStatuses=self._state.cycle_manager.get_node_statuses(),
+                    kernelEvents=kernel_events,
+                    nativeKernelEvents=native_kernel_events,
+                    error=self._state.cycle_manager.error,
+                    programLoaded=bool(has_program),
+                    programSessionGeneration=self._state.program_session_generation,
+                    runtimeOverrideStatus=runtime_override_status,
+                    timestamp=time.time(),
+                ).model_dump(by_alias=True)
             else:
-                data = {
-                    "state": "idle",
-                    "velocityScale": 1.0,
-                    "nodeStatuses": {},
-                    "kernelEvents": kernel_events,
-                    "nativeKernelEvents": [],
-                    "programLoaded": bool(has_program),
-                    "timestamp": time.time(),
-                }
+                runtime_override_status = None
+                if self._state is not None and self._state.program is not None:
+                    runtime_override_status = RuntimeOverrideStatusResponse(
+                        **self._state.runtime_override_status()
+                    ).model_dump(by_alias=True)
+                data = StateUpdate(
+                    state="idle",
+                    velocityScale=1.0,
+                    nodeStatuses={},
+                    kernelEvents=kernel_events,
+                    nativeKernelEvents=[],
+                    programLoaded=bool(has_program),
+                    programSessionGeneration=(
+                        self._state.program_session_generation if self._state is not None else 0
+                    ),
+                    runtimeOverrideStatus=runtime_override_status,
+                    timestamp=time.time(),
+                ).model_dump(by_alias=True)
             await self.broadcast(data)
             await asyncio.sleep(0.1)  # 10 Hz

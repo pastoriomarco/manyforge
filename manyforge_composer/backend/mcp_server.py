@@ -1127,6 +1127,7 @@ def _catalog_entry_dict(entry) -> dict[str, Any]:
                 "enum_values": p.enum_values,
                 "constraints": p.constraints,
                 "parameterizable": p.parameterizable,
+                "ui_editor": p.ui_editor,
                 "description": p.description,
             }
             for p in entry.parameters

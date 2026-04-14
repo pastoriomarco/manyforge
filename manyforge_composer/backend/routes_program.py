@@ -171,6 +171,36 @@ def _deployment_to_full_response(deployment: Deployment, source_path: str) -> di
                 else None
             ),
         },
+        modelAuditPolicy=(
+            {
+                "storeFullPrompts": deployment.model_audit_policy.store_full_prompts,
+                "storeFullResponses": deployment.model_audit_policy.store_full_responses,
+                "hashAlgorithm": deployment.model_audit_policy.hash_algorithm,
+                "redactArgumentValues": deployment.model_audit_policy.redact_argument_values,
+            }
+            if deployment.model_audit_policy is not None
+            else None
+        ),
+        modelEndpoints={
+            alias: {
+                "provider": endpoint.provider,
+                "modelId": endpoint.model_id,
+                "baseUrl": endpoint.base_url,
+                "apiKeyEnv": endpoint.api_key_env,
+                "defaultTimeoutS": endpoint.default_timeout_s,
+                "maxTokens": endpoint.max_tokens,
+            }
+            for alias, endpoint in deployment.model_endpoints.items()
+        },
+        promptTemplates={
+            template_id: {
+                "version": template.version,
+                "templateText": template.template_text,
+                "outputSchema": template.output_schema,
+                "responseTool": template.response_tool,
+            }
+            for template_id, template in deployment.prompt_templates.items()
+        },
         sourcePath=source_path,
     ).model_dump(by_alias=True)
 
@@ -296,8 +326,6 @@ def create_program_router(state: ComposerState) -> APIRouter:
     @router.get("/program/runtime-overrides", response_model=RuntimeOverrideStatusResponse, response_model_by_alias=True)
     def get_runtime_override_status() -> dict:
         """Get the current runtime override ledger."""
-        if state.program is None:
-            raise HTTPException(status_code=404, detail="No program loaded")
         return _runtime_override_status_response(state)
 
     @router.get("/program/runtime-overrides/materialized-tree", response_model=ProgramTreeResponse, response_model_by_alias=True)
