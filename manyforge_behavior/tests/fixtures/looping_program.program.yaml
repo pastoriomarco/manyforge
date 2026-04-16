@@ -12,6 +12,11 @@ robot:
 
 scene: []
 parameters: []
+blackboard:
+  keys:
+    - id: cycle_ran
+      type: bool
+      key: cycle_ran
 
 tree:
   id: retry
@@ -30,5 +35,6 @@ tree:
             - id: set_key_bool_value
               name: mark_done
               params:
-                key: cycle_ran
+                key:
+                  key_ref: cycle_ran
                 value: true

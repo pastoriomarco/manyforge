@@ -166,6 +166,12 @@ function ModelEndpointCard({
         disabled={disabled}
       />
       <FieldInput
+        label="Image Fetch Base URL"
+        value={endpoint.imageFetchBaseUrl ?? ''}
+        onChange={(value) => onFieldChange('imageFetchBaseUrl', value)}
+        disabled={disabled}
+      />
+      <FieldInput
         label="API Key Env"
         value={endpoint.apiKeyEnv ?? ''}
         onChange={(value) => onFieldChange('apiKeyEnv', value)}
@@ -233,7 +239,7 @@ export function DeploymentPanel() {
     return () => {
       cancelled = true;
     };
-  }, [deploymentModelEndpointSignature, deployment?.sourcePath]);
+  }, [deployment, deploymentModelEndpointSignature]);
 
   const setModelEndpoints = useCallback((nextModelEndpoints: Record<string, ModelEndpointConfig>) => {
     setField('modelEndpoints', nextModelEndpoints);
@@ -303,6 +309,7 @@ export function DeploymentPanel() {
         provider: 'openai',
         modelId: '',
         baseUrl: '',
+        imageFetchBaseUrl: '',
         apiKeyEnv: '',
         defaultTimeoutS: 30,
         maxTokens: 4096,

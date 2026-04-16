@@ -2,11 +2,11 @@ api_version: manyforge.program.v0
 program_profile: v0.0
 name: vision_guided_pose_pick
 description: >-
-  Vision-guided pick demonstration that exercises direct `${bb:...}` motion
+  Vision-guided pick demonstration that exercises typed blackboard field
   binding. A `query_model` node captures the live HMI scene snapshot, returns
   validated `approach_pose` and `grasp_pose` values in the robot base frame,
-  and downstream `move_manipulator_action` nodes consume those poses directly
-  from the blackboard.
+  and downstream `move_manipulator_action` nodes consume those poses through
+  declared blackboard field refs.
 catalog_version: "0.1.0"
 
 robot:
@@ -43,6 +43,29 @@ scene:
       position_m: [0.40, 0.14, 0.009]
       orientation_rpy_deg: [0.0, 0.0, 0.0]
 
+blackboard:
+  namespaces:
+    - id: grasp_plan
+      contract: query_model_output_v1
+      prefix: perception/grasp_plan
+      description: QueryModel grasp inference output namespace.
+      fields:
+        - name: selected_object_id
+          type: string
+        - name: approach_pose
+          type: pose
+        - name: grasp_pose
+          type: pose
+        - name: confidence
+          type: float
+        - name: reason
+          type: string
+  keys:
+    - id: gripper_closed
+      type: bool
+      key: gripper_closed
+      description: Simulated gripper closed/open flag.
+
 tree:
   id: sequence
   name: vision_guided_pose_pick_cycle
@@ -52,7 +75,8 @@ tree:
       params:
         model_endpoint_alias: gemma4_vlm
         prompt_template_id: infer_grasp_pose_v1
-        output_key_prefix: perception/grasp_plan
+        output_key_prefix:
+          namespace_ref: grasp_plan
         include_scene_snapshot: true
         scene_snapshot_width: 640
         scene_snapshot_height: 480
@@ -65,7 +89,10 @@ tree:
       params:
         move_id: vlm_approach_pose
         motion_type: pose_goal
-        pose_goal: "${bb:perception/grasp_plan/fields/approach_pose}"
+        pose_goal:
+          field_ref:
+            namespace: grasp_plan
+            field: approach_pose
         velocity_scale: 0.35
 
     - id: move_manipulator_action
@@ -73,13 +100,17 @@ tree:
       params:
         move_id: vlm_grasp_pose
         motion_type: pose_goal
-        pose_goal: "${bb:perception/grasp_plan/fields/grasp_pose}"
+        pose_goal:
+          field_ref:
+            namespace: grasp_plan
+            field: grasp_pose
         velocity_scale: 0.20
 
     - id: set_key_bool_value
       name: close_gripper
       params:
-        key: gripper_closed
+        key:
+          key_ref: gripper_closed
         value: true
 
     - id: move_manipulator_action
@@ -112,5 +143,6 @@ tree:
     - id: set_key_bool_value
       name: open_gripper
       params:
-        key: gripper_closed
+        key:
+          key_ref: gripper_closed
         value: false

@@ -110,6 +110,10 @@ class _StubState:
         self._kernel = kernel
 
 
+def _memory_events(rec: EventRecorder) -> list[dict[str, Any]]:
+    return [rec._decode_stored_event(event) for event in rec._events]
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -184,7 +188,7 @@ class TestSemanticEvents:
         cm_to = _StubCycleManager("running", kernel_status=status_to, kernel_snapshot=snap)
         rec.observe(_StubState(cycle_manager=cm_to, kernel=kernel_to))
 
-        return [e for e in rec._events if e["event_index"] > idx_before]
+        return [e for e in _memory_events(rec) if e["event_index"] > idx_before]
 
     def test_planning_to_validating_emits_plan_completed(self):
         rec = EventRecorder()
@@ -286,6 +290,21 @@ class TestJSONLSink:
         assert result["run_id"] == run_id
         assert len(result["events"]) > 0
 
+    def test_events_include_operational_envelope_fields(self, tmp_path):
+        rec = EventRecorder(trace_dir=tmp_path)
+        rec.observe(_StubState(cycle_manager=_StubCycleManager("idle")))
+        rec.observe(_StubState(cycle_manager=_StubCycleManager("running")))
+
+        event = _memory_events(rec)[-1]
+        assert event["sequence"] == event["event_index"]
+        assert isinstance(event["timestamp"], str)
+        assert isinstance(event["timestamp_wall"], str)
+        assert event["severity"] == "INFO"
+        assert isinstance(event["component"], str)
+        assert isinstance(event["message"], str)
+        assert event["event"] == event["type"]
+        assert event["program_run_id"] == event["run_id"]
+
 
 class TestBoundedRetention:
     """Ring buffer eviction."""
@@ -307,7 +326,7 @@ class TestBoundedRetention:
             state_val = "running" if i % 2 == 0 else "stopped"
             rec.observe(_StubState(cycle_manager=_StubCycleManager(state_val)))
 
-        indices = [e["event_index"] for e in rec._events]
+        indices = [e["event_index"] for e in _memory_events(rec)]
         assert indices == sorted(indices)
         assert len(set(indices)) == len(indices)  # all unique
 
@@ -337,7 +356,7 @@ class TestInterventionProjection:
         rec.observe(_StubState(cycle_manager=cm))
 
         matching = [
-            e for e in rec._events
+            e for e in _memory_events(rec)
             if e["type"] == "intervention_session_started"
         ]
         assert len(matching) == 1
@@ -370,7 +389,7 @@ class TestInterventionProjection:
         rec.observe(_StubState(cycle_manager=cm))
 
         matching = [
-            e for e in rec._events
+            e for e in _memory_events(rec)
             if e["type"] == "intervention_session_started"
         ]
         assert len(matching) == 1
@@ -405,7 +424,7 @@ class TestInterventionProjection:
         rec.record_delegated_recovery_requested(request)
 
         matching = [
-            event for event in rec._events
+            event for event in _memory_events(rec)
             if event["type"] == "delegated_recovery_requested"
         ]
         assert len(matching) == 1

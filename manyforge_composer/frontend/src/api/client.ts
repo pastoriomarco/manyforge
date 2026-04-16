@@ -5,6 +5,8 @@ import type {
   CatalogResponse,
   CatalogEntry,
   ProgramInfo,
+  ProgramParameter,
+  ProgramBlackboard,
   ProgramTree,
   TreeNode,
   RuntimeOverrideStatus,
@@ -14,6 +16,7 @@ import type {
   FileBrowserResponse,
   InfraStatus,
   ModelEndpointCatalog,
+  SceneStateResponse,
 } from '../types/api';
 
 const BASE_URL = import.meta.env.VITE_API_URL || '';
@@ -45,9 +48,10 @@ export const api = {
     get: (id: string) => request<CatalogEntry>('GET', `/api/catalog/${id}`),
   },
   program: {
-    load: (path: string, deploymentPath?: string) =>
-      request<ProgramInfo>('POST', '/api/program/load', { path, deploymentPath }),
+    load: (path: string, deploymentPath?: string, forceDiscardOverrides = false) =>
+      request<ProgramInfo>('POST', '/api/program/load', { path, deploymentPath, forceDiscardOverrides }),
     get: () => request<ProgramInfo>('GET', '/api/program'),
+    saved: () => request<ProgramInfo>('GET', '/api/program/saved'),
     tree: () => request<ProgramTree>('GET', '/api/program/tree'),
     savedTree: () => request<ProgramTree>('GET', '/api/program/saved/tree'),
     updateTree: (tree: TreeNode) =>
@@ -58,10 +62,15 @@ export const api = {
       request<RuntimeOverrideStatus>('POST', '/api/program/runtime-overrides/activate'),
     clearRuntimeOverrides: () =>
       request<RuntimeOverrideStatus>('POST', '/api/program/runtime-overrides/clear'),
-    save: (path: string) =>
-      request<unknown>('POST', '/api/program/save', { path }),
-    saveTree: (path: string, tree: TreeNode) =>
-      request<unknown>('POST', '/api/program/save', { path, tree }),
+    save: (path: string, parameters?: ProgramInfo['parameters'], blackboard?: ProgramBlackboard) =>
+      request<unknown>('POST', '/api/program/save', { path, parameters, blackboard }),
+    saveTree: (
+      path: string,
+      tree: TreeNode,
+      parameters?: ProgramInfo['parameters'],
+      blackboard?: ProgramBlackboard,
+    ) =>
+      request<unknown>('POST', '/api/program/save', { path, tree, parameters, blackboard }),
   },
   deployment: {
     load: (path: string) =>
@@ -77,7 +86,13 @@ export const api = {
       request<{ status: string; path: string }>('POST', '/api/deployment/save', { path, deployment }),
   },
   session: {
-    apply: (payload: { tree?: TreeNode; deployment?: FullDeployment }) =>
+    apply: (payload: {
+      tree?: TreeNode;
+      deployment?: FullDeployment;
+      programParameters?: ProgramParameter[];
+      blackboard?: ProgramBlackboard;
+      forceDiscardOverrides?: boolean;
+    }) =>
       request<ApplySessionResponse>('POST', '/api/session/apply', payload),
   },
   files: {
@@ -92,5 +107,8 @@ export const api = {
   infra: {
     status: () => request<InfraStatus>('GET', '/api/infra/status'),
     modelEndpoints: () => request<ModelEndpointCatalog>('GET', '/api/infra/model-endpoints'),
+  },
+  scene: {
+    state: () => request<SceneStateResponse>('GET', '/api/scene/state'),
   },
 };

@@ -38,6 +38,9 @@ class CatalogParameterResponse(BaseModel):
     constraints: Dict[str, Any] = Field(default_factory=dict)
     parameterizable: bool = False
     ui_editor: Optional[str] = Field(default=None, alias="uiEditor")
+    blackboard_role: Optional[str] = Field(default=None, alias="blackboardRole")
+    blackboard_contract: Optional[str] = Field(default=None, alias="blackboardContract")
+    blackboard_value_type: Optional[str] = Field(default=None, alias="blackboardValueType")
     description: str = ""
 
 
@@ -101,7 +104,48 @@ class ProgramResponse(BaseModel):
     robot: RobotResponse
     scene_count: int = Field(alias="sceneCount")
     parameter_count: int = Field(alias="parameterCount")
+    parameters: List["ProgramParameterResponse"] = Field(default_factory=list)
+    blackboard: "ProgramBlackboardResponse" = Field(default_factory=lambda: ProgramBlackboardResponse())
     source_path: str = Field(alias="sourcePath", default="")
+
+
+class ProgramParameterResponse(BaseModel):
+    model_config = _ALIAS_CFG
+    name: str
+    type: str
+    default: Any = None
+    constraints: Dict[str, Any] = Field(default_factory=dict)
+    description: str = ""
+
+
+class BlackboardNamespaceResponse(BaseModel):
+    model_config = _ALIAS_CFG
+    id: str
+    contract: str
+    prefix: str
+    description: str = ""
+    fields: List["BlackboardNamespaceFieldResponse"] = Field(default_factory=list)
+
+
+class BlackboardNamespaceFieldResponse(BaseModel):
+    model_config = _ALIAS_CFG
+    name: str
+    type: str
+    description: str = ""
+
+
+class BlackboardKeyResponse(BaseModel):
+    model_config = _ALIAS_CFG
+    id: str
+    type: str
+    key: str
+    description: str = ""
+
+
+class ProgramBlackboardResponse(BaseModel):
+    model_config = _ALIAS_CFG
+    namespaces: List[BlackboardNamespaceResponse] = Field(default_factory=list)
+    keys: List[BlackboardKeyResponse] = Field(default_factory=list)
 
 
 class ProgramTreeResponse(BaseModel):
@@ -111,6 +155,8 @@ class ProgramTreeResponse(BaseModel):
 class SaveProgramRequest(BaseModel):
     path: str
     tree: Optional[TreeNodeResponse] = None
+    parameters: Optional[List[ProgramParameterResponse]] = None
+    blackboard: Optional[ProgramBlackboardResponse] = None
 
 
 class UpdateTreeRequest(BaseModel):
@@ -126,6 +172,8 @@ class ProgramValidationIssueResponse(BaseModel):
 
 class ProgramValidateRequest(BaseModel):
     tree: TreeNodeResponse
+    parameters: Optional[List[ProgramParameterResponse]] = None
+    blackboard: Optional[ProgramBlackboardResponse] = None
 
 
 class ProgramValidateResponse(BaseModel):
@@ -401,6 +449,7 @@ class ModelEndpointResponse(BaseModel):
     provider: str
     model_id: str = Field(alias="modelId")
     base_url: Optional[str] = Field(default=None, alias="baseUrl")
+    image_fetch_base_url: Optional[str] = Field(default=None, alias="imageFetchBaseUrl")
     api_key_env: Optional[str] = Field(default=None, alias="apiKeyEnv")
     default_timeout_s: float = Field(default=30.0, alias="defaultTimeoutS")
     max_tokens: int = Field(default=4096, alias="maxTokens")
@@ -476,6 +525,11 @@ class SaveDeploymentRequest(BaseModel):
 class ApplySessionRequest(BaseModel):
     model_config = _ALIAS_CFG
     tree: Optional[TreeNodeResponse] = None
+    program_parameters: Optional[List[ProgramParameterResponse]] = Field(
+        default=None,
+        alias="programParameters",
+    )
+    blackboard: Optional[ProgramBlackboardResponse] = None
     deployment: Optional[FullDeploymentResponse] = None
     force_discard_overrides: bool = Field(default=False, alias="forceDiscardOverrides")
 
@@ -519,6 +573,7 @@ class SceneRobotResponse(BaseModel):
     group_id: Optional[str] = None
     base_frame: str
     tcp_frame: str
+    joint_names: List[str] = Field(default_factory=list)
     joint_positions: Dict[str, float] = Field(default_factory=dict)
     tcp_pose_in_base: Optional[Dict[str, Any]] = None
 

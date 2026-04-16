@@ -5,34 +5,18 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import time
 from typing import Any, Callable, Optional
 
 import py_trees
 
 from manyforge_behavior.kernel_client import KernelClient, SceneObjectSnapshot
-from manyforge_behavior.parameters import BLACKBOARD_REF_RE
+from manyforge_behavior.blackboard_namespace import read_namespace_value
+from manyforge_behavior.nodes.blackboard_output import BlackboardOutputMixin
+from manyforge_behavior.parameters import resolve_blackboard_value
 
 
-def _resolve_blackboard_reference(
-    blackboard: py_trees.blackboard.Client, value: Any
-) -> Any:
-    if isinstance(value, str):
-        match = BLACKBOARD_REF_RE.match(value)
-        if match is None:
-            return value
-        key = match.group(1)
-        blackboard.register_key(key=key, access=py_trees.common.Access.READ)
-        if not blackboard.exists(key):
-            raise KeyError(f"Missing blackboard key '{key}'")
-        return blackboard.get(key)
-    if isinstance(value, list):
-        return [_resolve_blackboard_reference(blackboard, item) for item in value]
-    if isinstance(value, dict):
-        return {
-            item_key: _resolve_blackboard_reference(blackboard, item_value)
-            for item_key, item_value in value.items()
-        }
-    return value
+_SCENE_SNAPSHOT_WAIT_TIMEOUT_S = 2.0
 
 
 def _xyzw_to_rpy_deg(orientation_xyzw: list[float]) -> list[float]:
@@ -93,60 +77,7 @@ def _shape_top_height(snapshot: SceneObjectSnapshot, object_pose: dict[str, Any]
         return base_z + float(shape.cylinder_height_m) / 2.0
     return base_z
 
-
-def _flatten_output_fields(prefix: str, value: Any) -> list[tuple[str, Any]]:
-    if isinstance(value, dict):
-        items: list[tuple[str, Any]] = [(prefix, value)]
-        for key, child in value.items():
-            items.extend(_flatten_output_fields(f"{prefix}/{key}", child))
-        return items
-    if isinstance(value, list):
-        items: list[tuple[str, Any]] = [(prefix, value)]
-        for index, child in enumerate(value):
-            items.extend(_flatten_output_fields(f"{prefix}/{index}", child))
-        return items
-    return [(prefix, value)]
-
-
-class _BlackboardOutputMixin:
-    _bb: py_trees.blackboard.Client
-    _output_key_prefix: str
-
-    def _write_output(self, key: str, value: Any) -> None:
-        self._bb.set(f"{self._output_key_prefix}/{key}", value)
-
-    def _write_output_fields(self, parsed: Any) -> None:
-        previous_keys = self._read_previous_field_keys()
-        field_items: list[tuple[str, Any]] = []
-        if isinstance(parsed, (dict, list)):
-            field_items = list(
-                _flatten_output_fields(
-                    f"{self._output_key_prefix}/fields",
-                    parsed,
-                )
-            )
-
-        next_keys = [key for key, _ in field_items]
-        for key in previous_keys:
-            if key not in next_keys:
-                py_trees.blackboard.Blackboard.unset(key)
-
-        for key, value in field_items:
-            py_trees.blackboard.Blackboard.set(key, value)
-
-        self._write_output("field_keys", next_keys)
-
-    def _read_previous_field_keys(self) -> list[str]:
-        try:
-            value = self._bb.get(f"{self._output_key_prefix}/field_keys")
-        except KeyError:
-            return []
-        if isinstance(value, list):
-            return [str(item) for item in value]
-        return []
-
-
-class BuildSceneSelectionContextNode(_BlackboardOutputMixin, py_trees.behaviour.Behaviour):
+class BuildSceneSelectionContextNode(BlackboardOutputMixin, py_trees.behaviour.Behaviour):
     """Build an authoritative object-selection context from backend scene state."""
 
     def __init__(
@@ -179,29 +110,31 @@ class BuildSceneSelectionContextNode(_BlackboardOutputMixin, py_trees.behaviour.
         self._scene_snapshot_provider = scene_snapshot_provider
         self._bb = py_trees.blackboard.Client(name=f"build_scene_selection_context_{name}")
         self._output_keys_registered = False
+        self._awaiting_scene_snapshot = False
+        self._scene_snapshot_wait_started_ns = 0
 
     def _ensure_output_keys(self) -> None:
         if self._output_keys_registered:
             return
-        for key in (
-            f"{self._output_key_prefix}/response",
-            f"{self._output_key_prefix}/status",
-            f"{self._output_key_prefix}/field_keys",
-        ):
-            self._bb.register_key(key=key, access=py_trees.common.Access.WRITE)
+        self._bb.register_key(
+            key=self._output_key_prefix,
+            access=py_trees.common.Access.WRITE,
+        )
         self._bb.register_key(key="kernel", access=py_trees.common.Access.READ)
         self._output_keys_registered = True
 
     def initialise(self) -> None:
         self._ensure_output_keys()
+        self._awaiting_scene_snapshot = False
+        self._scene_snapshot_wait_started_ns = 0
 
     def update(self) -> py_trees.common.Status:
         kernel: KernelClient = self._bb.kernel
         try:
             selection_request_text = str(
-                _resolve_blackboard_reference(self._bb, self._selection_request_text)
+                resolve_blackboard_value(self._bb, self._selection_request_text)
             )
-            candidate_object_ids = _resolve_blackboard_reference(
+            candidate_object_ids = resolve_blackboard_value(
                 self._bb, self._candidate_object_ids
             )
         except (AttributeError, KeyError) as exc:
@@ -281,19 +214,45 @@ class BuildSceneSelectionContextNode(_BlackboardOutputMixin, py_trees.behaviour.
                     outcome="image_source_unavailable",
                 )
                 return py_trees.common.Status.FAILURE
-            snapshot_bytes = provider(
-                self._image_snapshot_width,
-                self._image_snapshot_height,
-                self._image_snapshot_format,
-            )
-            if snapshot_bytes is None:
-                self.feedback_message = "image_source=hmi_snapshot requested but no render is available"
+            try:
+                snapshot_bytes = provider(
+                    self._image_snapshot_width,
+                    self._image_snapshot_height,
+                    self._image_snapshot_format,
+                )
+            except Exception as exc:
+                self.feedback_message = f"image_snapshot_unavailable: {exc}"
                 self._write_failure_response(
                     selection_request_text=selection_request_text,
                     candidate_count=0,
                     outcome="image_snapshot_unavailable",
                 )
                 return py_trees.common.Status.FAILURE
+            if snapshot_bytes is None:
+                if self._scene_snapshot_wait_started_ns == 0:
+                    self._scene_snapshot_wait_started_ns = time.monotonic_ns()
+                elapsed_s = (
+                    time.monotonic_ns() - self._scene_snapshot_wait_started_ns
+                ) / 1_000_000_000
+                if elapsed_s >= _SCENE_SNAPSHOT_WAIT_TIMEOUT_S:
+                    self.feedback_message = (
+                        f"image_snapshot_unavailable_after_{_SCENE_SNAPSHOT_WAIT_TIMEOUT_S:.1f}s"
+                    )
+                    self._write_failure_response(
+                        selection_request_text=selection_request_text,
+                        candidate_count=0,
+                        outcome="image_snapshot_unavailable",
+                    )
+                    return py_trees.common.Status.FAILURE
+                self._awaiting_scene_snapshot = True
+                self.feedback_message = "waiting_for_scene_snapshot"
+                self._write_namespace_output(
+                    None,
+                    status="waiting_for_scene_snapshot",
+                )
+                return py_trees.common.Status.RUNNING
+            self._awaiting_scene_snapshot = False
+            self._scene_snapshot_wait_started_ns = 0
             image_context.update(
                 {
                     "available": True,
@@ -396,9 +355,7 @@ class BuildSceneSelectionContextNode(_BlackboardOutputMixin, py_trees.behaviour.
         self.feedback_message = (
             f"Built selection context with {len(candidates)} candidate object(s)"
         )
-        self._write_output("response", response)
-        self._write_output("status", "built")
-        self._write_output_fields(response)
+        self._write_namespace_output(response, status="built")
         return py_trees.common.Status.SUCCESS
 
     def _write_failure_response(
@@ -413,12 +370,10 @@ class BuildSceneSelectionContextNode(_BlackboardOutputMixin, py_trees.behaviour.
             "candidate_count": candidate_count,
             "outcome": outcome,
         }
-        self._write_output("response", response)
-        self._write_output("status", "failed")
-        self._write_output_fields(response)
+        self._write_namespace_output(response, status="failed")
 
 
-class ValidateSceneSelectionNode(_BlackboardOutputMixin, py_trees.behaviour.Behaviour):
+class ValidateSceneSelectionNode(BlackboardOutputMixin, py_trees.behaviour.Behaviour):
     """Validate a model-selected object against a deterministic candidate manifest."""
 
     def __init__(
@@ -443,18 +398,16 @@ class ValidateSceneSelectionNode(_BlackboardOutputMixin, py_trees.behaviour.Beha
     def _ensure_output_keys(self) -> None:
         if self._output_keys_registered:
             return
-        for key in (
-            f"{self._output_key_prefix}/response",
-            f"{self._output_key_prefix}/status",
-            f"{self._output_key_prefix}/field_keys",
-        ):
-            self._bb.register_key(key=key, access=py_trees.common.Access.WRITE)
         self._bb.register_key(
-            key=f"{self._selection_context_prefix}/fields",
+            key=self._output_key_prefix,
+            access=py_trees.common.Access.WRITE,
+        )
+        self._bb.register_key(
+            key=self._selection_context_prefix,
             access=py_trees.common.Access.READ,
         )
         self._bb.register_key(
-            key=f"{self._selection_response_prefix}/fields",
+            key=self._selection_response_prefix,
             access=py_trees.common.Access.READ,
         )
         self._output_keys_registered = True
@@ -464,8 +417,8 @@ class ValidateSceneSelectionNode(_BlackboardOutputMixin, py_trees.behaviour.Beha
 
     def update(self) -> py_trees.common.Status:
         try:
-            context = self._bb.get(f"{self._selection_context_prefix}/fields")
-            response = self._bb.get(f"{self._selection_response_prefix}/fields")
+            context = read_namespace_value(self._bb, self._selection_context_prefix)
+            response = read_namespace_value(self._bb, self._selection_response_prefix)
         except KeyError as exc:
             self.feedback_message = str(exc)
             self._write_failure_response(
@@ -598,9 +551,7 @@ class ValidateSceneSelectionNode(_BlackboardOutputMixin, py_trees.behaviour.Beha
             "reason": reason,
         }
         self.feedback_message = f"Validated selection of '{selected_object_id}'"
-        self._write_output("response", validated)
-        self._write_output("status", "validated")
-        self._write_output_fields(validated)
+        self._write_namespace_output(validated, status="validated")
         return py_trees.common.Status.SUCCESS
 
     def _write_failure_response(
@@ -621,6 +572,4 @@ class ValidateSceneSelectionNode(_BlackboardOutputMixin, py_trees.behaviour.Beha
             "reason": reason,
             "matched_attributes": matched_attributes,
         }
-        self._write_output("response", response)
-        self._write_output("status", "failed")
-        self._write_output_fields(response)
+        self._write_namespace_output(response, status="failed")

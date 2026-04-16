@@ -1,3 +1,5 @@
+> Docs entrypoint: [`../INDEX.md`](../INDEX.md)
+
 # ManyForge MCP Tool Schema
 
 Machine-readable interface contract for the ManyForge MCP server. Each tool

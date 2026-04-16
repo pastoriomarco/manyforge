@@ -4,15 +4,25 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
 import yaml
 
+from manyforge_behavior.blackboard_bindings import (
+    field_ref_target as _field_ref_target,
+    field_type_compatible as _field_type_compatible,
+    key_ref_id as _key_ref_id,
+    namespace_ref_id as _namespace_ref_id,
+    resolve_field_binding as _resolve_field_binding,
+    resolve_key_binding as _resolve_key_binding,
+    resolve_namespace_binding as _resolve_namespace_binding,
+    validate_declared_field_ref as _validate_declared_field_ref,
+)
 from manyforge_behavior.catalog import NodeCatalog
 from manyforge_behavior.parameters import (
-    BLACKBOARD_REF_RE,
     PARAM_REF_RE,
     ParameterResolver,
 )
@@ -24,6 +34,7 @@ from manyforge_behavior.skill_loader import (
 
 
 EXPECTED_API_VERSION = "manyforge.program.v0"
+BLACKBOARD_REF_RE = re.compile(r"^\$\{bb:([^}]+)\}$")
 
 
 @dataclass
@@ -39,6 +50,30 @@ class ProgramParameter:
     type: str
     default: Any
     constraints: dict[str, Any] = field(default_factory=dict)
+    description: str = ""
+
+
+@dataclass
+class BlackboardNamespace:
+    id: str
+    contract: str
+    prefix: str
+    description: str = ""
+    fields: list["BlackboardNamespaceField"] = field(default_factory=list)
+
+
+@dataclass
+class BlackboardNamespaceField:
+    name: str
+    type: str
+    description: str = ""
+
+
+@dataclass
+class BlackboardKey:
+    id: str
+    type: str
+    key: str
     description: str = ""
 
 
@@ -91,6 +126,26 @@ class ProgramValidationError(Exception):
 class TreeValidationIssue:
     path: str
     message: str
+
+
+@dataclass
+class _BlackboardNamespaceProducer:
+    path: str
+    node_id: str
+    node_name: str
+    namespace_id: str
+    contract: str
+    prefix: str
+
+
+@dataclass
+class _BlackboardNamespaceReference:
+    path: str
+    param_name: str
+    namespace_id: str
+    expected_contract: str
+    expected_label: str
+    prefix: str
 
 
 _MODIFICATION_POLICY_ALLOWED_VALUES: dict[str, set[str]] = {
@@ -300,26 +355,8 @@ def _contains_parameter_reference(value: Any) -> bool:
     return False
 
 
-def _contains_blackboard_reference(value: Any) -> bool:
-    if isinstance(value, str):
-        return BLACKBOARD_REF_RE.match(value) is not None
-    if isinstance(value, list):
-        return any(_contains_blackboard_reference(item) for item in value)
-    if isinstance(value, dict):
-        return any(_contains_blackboard_reference(item) for item in value.values())
-    return False
-
-
-def _allows_runtime_blackboard_reference(
-    node_id: str,
-    param_name: str,
-    raw_value: Any,
-) -> bool:
-    if not _contains_blackboard_reference(raw_value):
-        return False
-    if node_id != "move_manipulator_action":
-        return False
-    return param_name in {"pose_goal", "relative_move"}
+def _is_blackboard_reference_string(value: Any) -> bool:
+    return isinstance(value, str) and BLACKBOARD_REF_RE.match(value) is not None
 
 
 def _is_numeric(value: Any) -> bool:
@@ -346,6 +383,140 @@ def _validate_pose_value(value: Any) -> str | None:
     return None
 
 
+_RELATIVE_MOVE_REFERENCE_TYPES = {"frame", "object", "robot_link", "pose"}
+
+
+def _validate_relative_move_reference(
+    value: Any,
+    path_label: str,
+    namespace_by_id: Mapping[str, BlackboardNamespace],
+    namespace_fields_by_id: Mapping[str, Mapping[str, BlackboardNamespaceField]],
+) -> str | None:
+    if not isinstance(value, dict):
+        return f"{path_label} must be a mapping"
+
+    reference_type = value.get("type")
+    if reference_type not in _RELATIVE_MOVE_REFERENCE_TYPES:
+        return (
+            f"{path_label}.type must be one of "
+            f"{sorted(_RELATIVE_MOVE_REFERENCE_TYPES)}, got {reference_type!r}"
+        )
+
+    if reference_type == "pose":
+        pose_value = value.get("pose")
+        if pose_value is None:
+            return f"{path_label}.pose is required when {path_label}.type='pose'"
+        field_ref_target = _field_ref_target(pose_value)
+        if field_ref_target is not None:
+            namespace_id, field_name = field_ref_target
+            return _validate_declared_field_ref(
+                path_label=f"{path_label}.pose",
+                namespace_id=namespace_id,
+                field_name=field_name,
+                namespace_by_id=namespace_by_id,
+                namespace_fields_by_id=namespace_fields_by_id,
+                expected_type="pose",
+            )
+        if _is_blackboard_reference_string(pose_value):
+            return (
+                f"{path_label}.pose must use a field_ref binding instead of a raw "
+                "blackboard reference string"
+            )
+        pose_error = _validate_pose_value(pose_value)
+        if pose_error is not None:
+            return f"{path_label}.pose {pose_error}"
+        return None
+
+    reference_id = value.get("id")
+    if not isinstance(reference_id, str) or not reference_id.strip():
+        return f"{path_label}.id is required when {path_label}.type={reference_type!r}"
+    return None
+
+
+def _validate_relative_move_value(
+    value: Any,
+    namespace_by_id: Mapping[str, BlackboardNamespace],
+    namespace_fields_by_id: Mapping[str, Mapping[str, BlackboardNamespaceField]],
+) -> str | None:
+    if not isinstance(value, dict):
+        return "must be a mapping"
+
+    target_reference = value.get("target_reference")
+    if target_reference is None:
+        return "target_reference is required"
+    target_error = _validate_relative_move_reference(
+        target_reference,
+        "relative_move.target_reference",
+        namespace_by_id,
+        namespace_fields_by_id,
+    )
+    if target_error is not None:
+        return target_error
+
+    offset_reference = value.get("offset_reference")
+    if offset_reference is not None:
+        offset_ref_error = _validate_relative_move_reference(
+            offset_reference,
+            "relative_move.offset_reference",
+            namespace_by_id,
+            namespace_fields_by_id,
+        )
+        if offset_ref_error is not None:
+            return offset_ref_error
+
+    offset = value.get("offset")
+    if offset is None:
+        return "offset is required"
+    offset_error = _validate_pose_value(offset)
+    if offset_error is not None:
+        return f"offset {offset_error}"
+
+    return None
+
+
+def _validate_template_variable_map(
+    value: Any,
+    namespace_by_id: Mapping[str, BlackboardNamespace],
+    namespace_fields_by_id: Mapping[str, Mapping[str, BlackboardNamespaceField]],
+    key_by_id: Mapping[str, BlackboardKey],
+) -> str | None:
+    if not isinstance(value, Mapping):
+        return "template_variables must be a mapping"
+
+    for variable_name, binding in value.items():
+        if not isinstance(variable_name, str) or not variable_name.strip():
+            return "template_variables keys must be non-empty strings"
+        if _is_blackboard_reference_string(binding):
+            return (
+                f"template_variables.{variable_name} must use a key_ref or field_ref "
+                "binding instead of a raw blackboard reference string"
+            )
+        if _key_ref_id(binding) is not None:
+            _, binding_error = _resolve_key_binding(
+                param_name=f"template_variables.{variable_name}",
+                value=binding,
+                key_by_id=key_by_id,
+                expected_type=None,
+            )
+            return binding_error
+        field_ref_target = _field_ref_target(binding)
+        if field_ref_target is not None:
+            namespace_id, field_name = field_ref_target
+            return _validate_declared_field_ref(
+                path_label=f"template_variables.{variable_name}",
+                namespace_id=namespace_id,
+                field_name=field_name,
+                namespace_by_id=namespace_by_id,
+                namespace_fields_by_id=namespace_fields_by_id,
+                expected_type=None,
+            )
+        return (
+            f"template_variables.{variable_name} must be a key_ref or field_ref binding"
+        )
+
+    return None
+
+
 def _validate_constraints(value: float, constraints: dict[str, Any]) -> str | None:
     min_inclusive = constraints.get("min_inclusive")
     if min_inclusive is not None and value < min_inclusive:
@@ -365,6 +536,27 @@ def _validate_constraints(value: float, constraints: dict[str, Any]) -> str | No
 
     return None
 
+
+def _blackboard_contract_label(contract: str) -> str:
+    labels = {
+        "selection_context_v1": "BuildSceneSelectionContext output namespace",
+        "query_model_output_v1": "QueryModel output namespace",
+        "validated_selection_v1": "ValidateSceneSelection output namespace",
+        "pick_plan_v1": "PlanPickSequence output namespace",
+    }
+    return labels.get(contract, f"contract '{contract}'")
+
+
+_BLACKBOARD_FIELD_TYPES = {
+    "string",
+    "float",
+    "int",
+    "bool",
+    "pose",
+    "float_list",
+    "string_list",
+    "dict",
+}
 
 def _validate_param_type(param_type: str, value: Any) -> str | None:
     if param_type == "string":
@@ -417,6 +609,8 @@ def _validate_tree_node_semantics(
     node: TreeNode,
     resolved_params: dict[str, Any],
     path: str,
+    namespace_by_id: Mapping[str, BlackboardNamespace],
+    namespace_fields_by_id: Mapping[str, Mapping[str, BlackboardNamespaceField]],
 ) -> list[TreeValidationIssue]:
     issues: list[TreeValidationIssue] = []
 
@@ -468,6 +662,19 @@ def _validate_tree_node_semantics(
                     message="relative_move is required when motion_type=relative_move",
                 )
             )
+        elif motion_type == "relative_move":
+            relative_move_error = _validate_relative_move_value(
+                resolved_params.get("relative_move"),
+                namespace_by_id,
+                namespace_fields_by_id,
+            )
+            if relative_move_error is not None:
+                issues.append(
+                    TreeValidationIssue(
+                        path=f"{path}.params.relative_move",
+                        message=relative_move_error,
+                    )
+                )
 
     if node.id == "add_collision_object":
         shape_type = resolved_params.get("shape_type")
@@ -514,6 +721,8 @@ def collect_tree_validation_issues(
     catalog: NodeCatalog,
     *,
     parameter_defaults: dict[str, Any] | None = None,
+    blackboard_namespaces: dict[str, BlackboardNamespace] | None = None,
+    blackboard_keys: dict[str, BlackboardKey] | None = None,
     skill_catalog: SkillCatalog | None = None,
     program_profile: str | None = None,
     deployment_capability_keys: set[str] | None = None,
@@ -523,7 +732,15 @@ def collect_tree_validation_issues(
     errors: list[TreeValidationIssue] = []
     warnings: list[TreeValidationIssue] = []
     seen_names: dict[str, str] = {}
+    blackboard_namespace_producers: list[_BlackboardNamespaceProducer] = []
+    blackboard_namespace_references: list[_BlackboardNamespaceReference] = []
     resolver = ParameterResolver(parameter_defaults) if parameter_defaults is not None else None
+    namespace_by_id = dict(blackboard_namespaces or {})
+    key_by_id = dict(blackboard_keys or {})
+    namespace_fields_by_id = {
+        namespace_id: {field.name: field for field in namespace.fields}
+        for namespace_id, namespace in namespace_by_id.items()
+    }
 
     def visit(current: TreeNode, path: str) -> None:
         registered_name = False
@@ -732,19 +949,113 @@ def collect_tree_validation_issues(
                 )
                 continue
 
-            if _allows_runtime_blackboard_reference(current.id, param.name, raw_value):
-                continue
-
             value = resolved_params.get(param.name, raw_value)
-            type_error = _validate_param_type(param.type, value)
-            if type_error is not None:
-                errors.append(
-                    TreeValidationIssue(
-                        path=f"{path}.params.{param.name}",
-                        message=f"{param.name} {type_error}",
-                    )
+            skip_type_validation = False
+            if param.blackboard_role in {"namespace_writer", "namespace_reader"}:
+                value, binding_error = _resolve_namespace_binding(
+                    param_name=param.name,
+                    value=value,
+                    namespace_by_id=namespace_by_id,
+                    expected_contract=param.blackboard_contract,
                 )
-                continue
+                if binding_error is not None:
+                    errors.append(
+                        TreeValidationIssue(
+                            path=f"{path}.params.{param.name}",
+                            message=binding_error,
+                        )
+                    )
+                    continue
+                resolved_params[param.name] = value
+
+            if param.blackboard_role in {"key_reader", "key_writer"}:
+                if _key_ref_id(value) is not None:
+                    value, binding_error = _resolve_key_binding(
+                        param_name=param.name,
+                        value=value,
+                        key_by_id=key_by_id,
+                        expected_type=param.blackboard_value_type,
+                    )
+                elif param.blackboard_role == "key_reader":
+                    value, binding_error = _resolve_field_binding(
+                        param_name=param.name,
+                        value=value,
+                        namespace_by_id=namespace_by_id,
+                        namespace_fields_by_id=namespace_fields_by_id,
+                        expected_type=param.blackboard_value_type,
+                        expected_contract=param.blackboard_contract,
+                    )
+                    skip_type_validation = True
+                else:
+                    value, binding_error = None, f"{param.name} must be a key_ref binding"
+                if binding_error is not None:
+                    errors.append(
+                        TreeValidationIssue(
+                            path=f"{path}.params.{param.name}",
+                            message=binding_error,
+                        )
+                    )
+                    continue
+                resolved_params[param.name] = value
+
+            if param.blackboard_role == "field_reader":
+                if _is_blackboard_reference_string(raw_value):
+                    errors.append(
+                        TreeValidationIssue(
+                            path=f"{path}.params.{param.name}",
+                            message=(
+                                f"{param.name} must use a field_ref binding instead of a raw "
+                                "blackboard reference string"
+                            ),
+                        )
+                    )
+                    continue
+                if _field_ref_target(value) is not None:
+                    value, binding_error = _resolve_field_binding(
+                        param_name=param.name,
+                        value=value,
+                        namespace_by_id=namespace_by_id,
+                        namespace_fields_by_id=namespace_fields_by_id,
+                        expected_type=param.blackboard_value_type or param.type,
+                        expected_contract=param.blackboard_contract,
+                    )
+                    if binding_error is not None:
+                        errors.append(
+                            TreeValidationIssue(
+                                path=f"{path}.params.{param.name}",
+                                message=binding_error,
+                            )
+                        )
+                        continue
+                    resolved_params[param.name] = value
+                    skip_type_validation = True
+
+            if param.ui_editor == "template_variable_map":
+                template_variables_error = _validate_template_variable_map(
+                    value,
+                    namespace_by_id,
+                    namespace_fields_by_id,
+                    key_by_id,
+                )
+                if template_variables_error is not None:
+                    errors.append(
+                        TreeValidationIssue(
+                            path=f"{path}.params.{param.name}",
+                            message=template_variables_error,
+                        )
+                    )
+                    continue
+
+            if not skip_type_validation:
+                type_error = _validate_param_type(param.type, value)
+                if type_error is not None:
+                    errors.append(
+                        TreeValidationIssue(
+                            path=f"{path}.params.{param.name}",
+                            message=f"{param.name} {type_error}",
+                        )
+                    )
+                    continue
 
             if param.type == "enum" and value not in param.enum_values:
                 errors.append(
@@ -767,6 +1078,40 @@ def collect_tree_validation_issues(
                         )
                     )
 
+            if (
+                param.blackboard_role == "namespace_writer"
+                and isinstance(value, str)
+                and value.strip()
+            ):
+                blackboard_namespace_producers.append(
+                    _BlackboardNamespaceProducer(
+                        path=f"{path}.params.{param.name}",
+                        node_id=current.id,
+                        node_name=current.name,
+                        namespace_id=str(_namespace_ref_id(raw_value)),
+                        contract=str(param.blackboard_contract or ""),
+                        prefix=value.strip(),
+                    )
+                )
+
+            if (
+                param.blackboard_role == "namespace_reader"
+                and isinstance(value, str)
+                and value.strip()
+            ):
+                blackboard_namespace_references.append(
+                    _BlackboardNamespaceReference(
+                        path=f"{path}.params.{param.name}",
+                        param_name=param.name,
+                        namespace_id=str(_namespace_ref_id(raw_value)),
+                        expected_contract=str(param.blackboard_contract or ""),
+                        expected_label=_blackboard_contract_label(
+                            str(param.blackboard_contract or "")
+                        ),
+                        prefix=value.strip(),
+                    )
+                )
+
         for param_name in current.params:
             if param_name not in declared_params:
                 warnings.append(
@@ -778,8 +1123,15 @@ def collect_tree_validation_issues(
                     )
                 )
 
-        errors.extend(_validate_tree_node_semantics(current, resolved_params, path))
-
+        errors.extend(
+            _validate_tree_node_semantics(
+                current,
+                resolved_params,
+                path,
+                namespace_by_id,
+                namespace_fields_by_id,
+            )
+        )
         # query_model deployment cross-validation (OP-7)
         if current.id == "query_model" and deployment is not None:
             ep_alias = resolved_params.get("model_endpoint_alias", "")
@@ -805,6 +1157,76 @@ def collect_tree_validation_issues(
             visit(child, f"{path}.children[{index}]")
 
     visit(node, "tree")
+
+    producers_by_namespace_id: dict[str, list[_BlackboardNamespaceProducer]] = {}
+    for producer in blackboard_namespace_producers:
+        producers_by_namespace_id.setdefault(producer.namespace_id, []).append(producer)
+
+    for namespace_id, producers in producers_by_namespace_id.items():
+        if len(producers) <= 1:
+            continue
+        producer_list = ", ".join(
+            f"'{producer.node_name}' ({producer.node_id})" for producer in producers
+        )
+        for producer in producers:
+            errors.append(
+                TreeValidationIssue(
+                    path=producer.path,
+                    message=(
+                        f"output_key_prefix namespace_ref '{namespace_id}' is used by multiple producer nodes: "
+                        f"{producer_list}"
+                    ),
+                )
+            )
+
+    for reference in blackboard_namespace_references:
+        matching_producers = producers_by_namespace_id.get(reference.namespace_id, [])
+        if matching_producers:
+            continue
+        declared_namespace = namespace_by_id.get(reference.namespace_id)
+        if declared_namespace is None:
+            message = (
+                f"{reference.param_name} namespace_ref '{reference.namespace_id}' is not declared in "
+                "program.blackboard.namespaces"
+            )
+        else:
+            message = (
+                f"{reference.param_name} namespace_ref '{reference.namespace_id}' "
+                f"({declared_namespace.prefix}) does not match any {reference.expected_label} "
+                "producer in the current tree"
+            )
+        errors.append(
+            TreeValidationIssue(
+                path=reference.path,
+                message=message,
+            )
+        )
+
+    for producer in blackboard_namespace_producers:
+        declared_namespace = namespace_by_id.get(producer.namespace_id)
+        if declared_namespace is None:
+            errors.append(
+                TreeValidationIssue(
+                    path=producer.path,
+                    message=(
+                        f"output_key_prefix namespace_ref '{producer.namespace_id}' is not declared in "
+                        "program.blackboard.namespaces"
+                    ),
+                )
+            )
+            continue
+        if declared_namespace.contract != producer.contract:
+            errors.append(
+                TreeValidationIssue(
+                    path=producer.path,
+                    message=(
+                        f"output_key_prefix namespace_ref '{producer.namespace_id}' is declared as contract "
+                        f"'{declared_namespace.contract}', but node '{producer.node_name}' "
+                        f"requires contract '{producer.contract}'"
+                    ),
+                )
+            )
+
     return errors, warnings
 
 
@@ -834,6 +1256,8 @@ class Program:
         self.robot: Optional[RobotProfile] = None
         self.scene: list[SceneResource] = []
         self.parameters: dict[str, ProgramParameter] = {}
+        self.blackboard_namespaces: dict[str, BlackboardNamespace] = {}
+        self.blackboard_keys: dict[str, BlackboardKey] = {}
         self.tree: Optional[TreeNode] = None
         self._load_and_validate()
 
@@ -864,6 +1288,8 @@ class Program:
         self.robot = None
         self.scene = []
         self.parameters = {}
+        self.blackboard_namespaces = {}
+        self.blackboard_keys = {}
         self.tree = None
         self._load_from_data_and_validate(data)
         return self
@@ -877,6 +1303,8 @@ class Program:
     def _load_from_data_and_validate(self, data: dict[str, Any]) -> None:
         self.scene = []
         self.parameters = {}
+        self.blackboard_namespaces = {}
+        self.blackboard_keys = {}
         self.tree = None
 
         if not isinstance(data, dict):
@@ -947,6 +1375,110 @@ class Program:
                 description=p.get("description", ""),
             )
 
+        # Blackboard declarations
+        blackboard_data = data.get("blackboard", {}) or {}
+        if blackboard_data and not isinstance(blackboard_data, Mapping):
+            raise ProgramValidationError("blackboard must be a mapping")
+
+        namespace_ids: set[str] = set()
+        namespace_prefixes: set[str] = set()
+        for namespace in blackboard_data.get("namespaces", []):
+            namespace_id = str(namespace.get("id", "")).strip()
+            contract = str(namespace.get("contract", "")).strip()
+            prefix = str(namespace.get("prefix", "")).strip()
+            if not namespace_id:
+                raise ProgramValidationError("blackboard.namespaces[].id is required")
+            if not contract:
+                raise ProgramValidationError(
+                    f"blackboard.namespaces[{namespace_id!r}].contract is required"
+                )
+            if not prefix:
+                raise ProgramValidationError(
+                    f"blackboard.namespaces[{namespace_id!r}].prefix is required"
+                )
+            if namespace_id in namespace_ids:
+                raise ProgramValidationError(
+                    f"Duplicate blackboard namespace id: '{namespace_id}'"
+                )
+            if prefix in namespace_prefixes:
+                raise ProgramValidationError(
+                    f"Duplicate blackboard namespace prefix: '{prefix}'"
+                )
+            raw_fields = namespace.get("fields", []) or []
+            if not isinstance(raw_fields, list):
+                raise ProgramValidationError(
+                    f"blackboard.namespaces[{namespace_id!r}].fields must be a list"
+                )
+            field_entries: list[BlackboardNamespaceField] = []
+            seen_field_names: set[str] = set()
+            for field_decl in raw_fields:
+                field_name = str(field_decl.get("name", "")).strip()
+                field_type = str(field_decl.get("type", "")).strip()
+                if not field_name:
+                    raise ProgramValidationError(
+                        f"blackboard.namespaces[{namespace_id!r}].fields[].name is required"
+                    )
+                if field_name in seen_field_names:
+                    raise ProgramValidationError(
+                        f"Duplicate blackboard field '{field_name}' in namespace '{namespace_id}'"
+                    )
+                if field_type not in _BLACKBOARD_FIELD_TYPES:
+                    allowed = ", ".join(sorted(_BLACKBOARD_FIELD_TYPES))
+                    raise ProgramValidationError(
+                        f"blackboard.namespaces[{namespace_id!r}].fields[{field_name!r}].type "
+                        f"must be one of: {allowed}"
+                    )
+                seen_field_names.add(field_name)
+                field_entries.append(
+                    BlackboardNamespaceField(
+                        name=field_name,
+                        type=field_type,
+                        description=str(field_decl.get("description", "")),
+                    )
+                )
+            namespace_ids.add(namespace_id)
+            namespace_prefixes.add(prefix)
+            self.blackboard_namespaces[namespace_id] = BlackboardNamespace(
+                id=namespace_id,
+                contract=contract,
+                prefix=prefix,
+                description=str(namespace.get("description", "")),
+                fields=field_entries,
+            )
+
+        key_ids: set[str] = set()
+        key_names: set[str] = set()
+        for key_decl in blackboard_data.get("keys", []):
+            key_id = str(key_decl.get("id", "")).strip()
+            key_type = str(key_decl.get("type", "")).strip()
+            key_name = str(key_decl.get("key", "")).strip()
+            if not key_id:
+                raise ProgramValidationError("blackboard.keys[].id is required")
+            if not key_type:
+                raise ProgramValidationError(
+                    f"blackboard.keys[{key_id!r}].type is required"
+                )
+            if not key_name:
+                raise ProgramValidationError(
+                    f"blackboard.keys[{key_id!r}].key is required"
+                )
+            if key_id in key_ids:
+                raise ProgramValidationError(
+                    f"Duplicate blackboard key id: '{key_id}'"
+                )
+            if key_name in key_names:
+                raise ProgramValidationError(
+                    f"Duplicate blackboard key: '{key_name}'"
+                )
+            key_ids.add(key_id)
+            key_names.add(key_name)
+            self.blackboard_keys[key_id] = BlackboardKey(
+                id=key_id,
+                type=key_type,
+                key=key_name,
+                description=str(key_decl.get("description", "")),
+            )
+
         # Tree
         tree_data = data.get("tree")
         if not tree_data:
@@ -965,6 +1497,8 @@ class Program:
             node,
             self._catalog,
             parameter_defaults=self.get_parameter_defaults(),
+            blackboard_namespaces=self.blackboard_namespaces,
+            blackboard_keys=self.blackboard_keys,
             skill_catalog=self._skill_catalog,
             program_profile=self.program_profile,
             deployment_capability_keys=self._deployment_capability_keys,
@@ -1006,6 +1540,35 @@ class Program:
             }
             for p in self.parameters.values()
         ]
+        if self.blackboard_namespaces or self.blackboard_keys:
+            d["blackboard"] = {
+                "namespaces": [
+                    {
+                        "id": namespace.id,
+                        "contract": namespace.contract,
+                        "prefix": namespace.prefix,
+                        "description": namespace.description,
+                        "fields": [
+                            {
+                                "name": field.name,
+                                "type": field.type,
+                                "description": field.description,
+                            }
+                            for field in namespace.fields
+                        ],
+                    }
+                    for namespace in self.blackboard_namespaces.values()
+                ],
+                "keys": [
+                    {
+                        "id": key.id,
+                        "type": key.type,
+                        "key": key.key,
+                        "description": key.description,
+                    }
+                    for key in self.blackboard_keys.values()
+                ],
+            }
         d["tree"] = self.tree.to_dict() if self.tree else {}
         return d
 

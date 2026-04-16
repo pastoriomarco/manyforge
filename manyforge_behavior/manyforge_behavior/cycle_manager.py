@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import json
+import sys
 import threading
 import time
 import traceback
@@ -18,6 +19,8 @@ import py_trees
 logger = logging.getLogger(__name__)
 
 from collections import deque
+
+from manyforge_behavior.blackboard_bindings import key_ref_id
 
 from manyforge_behavior.kernel_client import (
     ExecutionSnapshot,
@@ -190,7 +193,9 @@ class CycleManager:
         self._state = CycleState.IDLE
         self._tree = None
         self._tick_thread = None
+        self._tick_cleanup_thread: Optional[threading.Thread] = None
         self._tick_stop_event = threading.Event()  # signals tick thread to exit
+        self._tick_exit_event = threading.Event()
         self._tick_pause_event = threading.Event()  # cleared = paused, set = running
         self._velocity_scale = 1.0
         self._lock = threading.Lock()
@@ -212,6 +217,7 @@ class CycleManager:
 
         # Set initial pause event to set (not paused)
         self._tick_pause_event.set()
+        self._tick_exit_event.set()
 
     def _tree_is_terminal(self) -> bool:
         """True when the current tree has already reached a terminal status."""
@@ -399,6 +405,7 @@ class CycleManager:
 
     def _start_tick_thread(self, target) -> None:
         self._tick_stop_event.clear()
+        self._tick_exit_event.clear()
         self._tick_pause_event.set()
         self._tick_thread = threading.Thread(target=target, daemon=True)
         self._tick_thread.start()
@@ -516,6 +523,14 @@ class CycleManager:
                 self._kernel.pause()
             
             self._state = CycleState.STOPPED
+
+    def _await_zombie_thread_exit(self, thread_to_join) -> None:
+        thread_to_join.join()
+        with self._lock:
+            if self._tick_cleanup_thread is threading.current_thread():
+                self._tick_cleanup_thread = None
+            if self._tick_thread is thread_to_join:
+                self._tick_thread = None
     
     def reset(self) -> None:
         """
@@ -539,16 +554,40 @@ class CycleManager:
                 thread_to_join = self._tick_thread
 
         if thread_to_join is not None:
-            thread_to_join.join(timeout=1.0)
-
-        with self._lock:
-            if thread_to_join is not None:
-                if thread_to_join.is_alive():
-                    logger.error("Tick thread did not terminate within timeout — zombie thread detected")
+            if not self._tick_exit_event.wait(timeout=0.025):
+                blocked_stack = None
+                if thread_to_join.ident is not None:
+                    frame = sys._current_frames().get(thread_to_join.ident)
+                    if frame is not None:
+                        blocked_stack = "".join(traceback.format_stack(frame))
+                if blocked_stack:
+                    logger.error(
+                        "Tick thread did not terminate during reset grace window — zombie thread detected\n"
+                        "Blocked tick thread stack follows:\n%s",
+                        blocked_stack,
+                    )
+                else:
+                    logger.error(
+                        "Tick thread did not terminate during reset grace window — zombie thread detected"
+                    )
+                with self._lock:
                     self._error = "tick thread did not terminate"
                     self._state = CycleState.IDLE
                     self._pending_delegated_recovery = None
-                    return
+                    cleanup_alive = (
+                        self._tick_cleanup_thread is not None
+                        and self._tick_cleanup_thread.is_alive()
+                    )
+                    if not cleanup_alive:
+                        self._tick_cleanup_thread = threading.Thread(
+                            target=self._await_zombie_thread_exit,
+                            args=(thread_to_join,),
+                            name="manyforge_tick_cleanup",
+                            daemon=True,
+                        )
+                        self._tick_cleanup_thread.start()
+                return
+            with self._lock:
                 if self._tick_thread is thread_to_join:
                     self._tick_thread = None
 
@@ -688,6 +727,7 @@ class CycleManager:
         with self._lock:
             if self._tick_thread is threading.current_thread():
                 self._tick_thread = None
+        self._tick_exit_event.set()
     
     @property
     def intervention(self) -> Optional[InterventionSession]:
@@ -718,6 +758,8 @@ class CycleManager:
         catalog = self._runner.catalog
         if catalog is None:
             raise RuntimeError("Runner catalog must be loaded before intervention rewriting")
+        program = self._runner.program
+        declared_keys = {} if program is None else program.blackboard_keys
 
         local_keys: set[str] = set()
 
@@ -728,13 +770,33 @@ class CycleManager:
                 return (), ()
             return tuple(entry.bb_writer_params), tuple(entry.bb_reader_params)
 
+        def extract_key_ref(value: Any) -> str | None:
+            if isinstance(value, str):
+                return value
+            if (
+                isinstance(value, dict)
+                and isinstance(value.get("key_ref"), str)
+            ):
+                return value["key_ref"]
+            return None
+
+        def resolve_runtime_key(value: Any) -> str | None:
+            key_ref = extract_key_ref(value)
+            if key_ref is None:
+                return None
+            declared = declared_keys.get(key_ref)
+            if declared is not None:
+                return declared.key
+            return key_ref
+
         def collect_keys(node: dict[str, Any]) -> None:
             params = node.get("params", {})
             writer_params, _ = blackboard_param_names(node.get("id", ""))
             for param_name in writer_params:
                 value = params.get(param_name)
-                if isinstance(value, str):
-                    local_keys.add(self._normalize_blackboard_key(value))
+                runtime_key = resolve_runtime_key(value)
+                if runtime_key is not None:
+                    local_keys.add(self._normalize_blackboard_key(runtime_key))
             for child in node.get("children", []) or []:
                 collect_keys(child)
 
@@ -745,12 +807,18 @@ class CycleManager:
             writer_params, reader_params = blackboard_param_names(node_id)
             for param_name in writer_params:
                 value = params.get(param_name)
-                if isinstance(value, str):
-                    params[param_name] = self._scoped_intervention_key(session_id, value)
+                runtime_key = resolve_runtime_key(value)
+                if runtime_key is not None:
+                    params[param_name] = self._scoped_intervention_key(session_id, runtime_key)
             for param_name in reader_params:
                 value = params.get(param_name)
-                if isinstance(value, str) and self._normalize_blackboard_key(value) in local_keys:
-                    params[param_name] = self._scoped_intervention_key(session_id, value)
+                runtime_key = resolve_runtime_key(value)
+                if runtime_key is not None:
+                    normalized = self._normalize_blackboard_key(runtime_key)
+                    if normalized in local_keys:
+                        params[param_name] = self._scoped_intervention_key(session_id, runtime_key)
+                    elif key_ref_id(value) is not None:
+                        params[param_name] = runtime_key
             rewritten["params"] = params
             rewritten["children"] = [rewrite(child) for child in rewritten.get("children", []) or []]
             return rewritten
@@ -1278,7 +1346,8 @@ class CycleManager:
         self._runner._intervention_context = {
             "session_id": session.session_id,
             "principal_id": session.principal_id,
-            "run_id": session.parent_run_id or f"intervention-{session.session_id}",
+            "run_id": f"intervention-{session.session_id}",
+            "parent_run_id": session.parent_run_id,
         }
         try:
             tree_node = tree_node_from_dict(rewritten_tree)

@@ -7,6 +7,9 @@ from pathlib import Path
 from fastapi import APIRouter, HTTPException, Query
 from manyforge_behavior.deployment import Deployment
 from manyforge_behavior.program import (
+    BlackboardKey,
+    BlackboardNamespaceField,
+    BlackboardNamespace,
     Program,
     collect_tree_validation_issues,
     tree_node_from_dict,
@@ -186,6 +189,7 @@ def _deployment_to_full_response(deployment: Deployment, source_path: str) -> di
                 "provider": endpoint.provider,
                 "modelId": endpoint.model_id,
                 "baseUrl": endpoint.base_url,
+                "imageFetchBaseUrl": endpoint.image_fetch_base_url,
                 "apiKeyEnv": endpoint.api_key_env,
                 "defaultTimeoutS": endpoint.default_timeout_s,
                 "maxTokens": endpoint.max_tokens,
@@ -203,6 +207,50 @@ def _deployment_to_full_response(deployment: Deployment, source_path: str) -> di
         },
         sourcePath=source_path,
     ).model_dump(by_alias=True)
+
+
+def _program_parameters_to_response(program: Program) -> list[dict]:
+    return [
+        {
+            "name": parameter.name,
+            "type": parameter.type,
+            "default": parameter.default,
+            "constraints": parameter.constraints,
+            "description": parameter.description,
+        }
+        for parameter in program.parameters.values()
+    ]
+
+
+def _program_blackboard_to_response(program: Program) -> dict:
+    return {
+        "namespaces": [
+            {
+                "id": namespace.id,
+                "contract": namespace.contract,
+                "prefix": namespace.prefix,
+                "description": namespace.description,
+                "fields": [
+                    {
+                        "name": field.name,
+                        "type": field.type,
+                        "description": field.description,
+                    }
+                    for field in namespace.fields
+                ],
+            }
+            for namespace in program.blackboard_namespaces.values()
+        ],
+        "keys": [
+            {
+                "id": key.id,
+                "type": key.type,
+                "key": key.key,
+                "description": key.description,
+            }
+            for key in program.blackboard_keys.values()
+        ],
+    }
 
 
 def create_program_router(state: ComposerState) -> APIRouter:
@@ -253,6 +301,8 @@ def create_program_router(state: ComposerState) -> APIRouter:
             ),
             sceneCount=len(program.scene),
             parameterCount=len(program.parameters),
+            parameters=_program_parameters_to_response(program),
+            blackboard=_program_blackboard_to_response(program),
             sourcePath=state.program_source_path,
         ).model_dump(by_alias=True)
 
@@ -276,6 +326,41 @@ def create_program_router(state: ComposerState) -> APIRouter:
             ),
             sceneCount=len(program.scene),
             parameterCount=len(program.parameters),
+            parameters=_program_parameters_to_response(program),
+            blackboard=_program_blackboard_to_response(program),
+            sourcePath=state.program_source_path,
+        ).model_dump(by_alias=True)
+
+    @router.get("/program/saved", response_model=ProgramResponse, response_model_by_alias=True)
+    def get_saved_program() -> dict:
+        """Get the saved program artifact from disk."""
+        if not state.program_source_path:
+            raise HTTPException(status_code=404, detail="No saved program path available")
+        try:
+            saved_program = Program(
+                state.program_source_path,
+                state.catalog,
+                skill_catalog=state.skill_catalog,
+                deployment_capability_keys=_deployment_capability_keys(state),
+            )
+        except Exception as e:
+            logger.error("Failed to read saved program: %s", e)
+            raise HTTPException(status_code=500, detail="Failed to read saved program")
+        robot = saved_program.robot
+        return ProgramResponse(
+            name=saved_program.name,
+            description=saved_program.description,
+            programProfile=saved_program.program_profile,
+            robot=RobotResponse(
+                robotId=robot.robot_id,
+                groupId=robot.group_id,
+                baseFrame=robot.base_frame,
+                tcpFrame=robot.tcp_frame,
+            ),
+            sceneCount=len(saved_program.scene),
+            parameterCount=len(saved_program.parameters),
+            parameters=_program_parameters_to_response(saved_program),
+            blackboard=_program_blackboard_to_response(saved_program),
             sourcePath=state.program_source_path,
         ).model_dump(by_alias=True)
     
@@ -298,15 +383,51 @@ def create_program_router(state: ComposerState) -> APIRouter:
             logger.warning("Invalid tree structure: %s", e)
             raise HTTPException(status_code=400, detail="Invalid tree structure")
 
-        parameter_defaults = (
-            state.program.get_parameter_defaults()
-            if state.program is not None
-            else None
-        )
+        parameter_defaults = None
+        blackboard_namespaces = None
+        blackboard_keys = None
+        if state.program is not None:
+            parameter_defaults = state.program.get_parameter_defaults()
+            blackboard_namespaces = state.program.blackboard_namespaces
+            blackboard_keys = state.program.blackboard_keys
+        if request.parameters is not None:
+            parameter_defaults = {
+                parameter.name: parameter.default
+                for parameter in request.parameters
+            }
+        if request.blackboard is not None:
+            blackboard_namespaces = {
+                namespace.id: BlackboardNamespace(
+                    id=namespace.id,
+                    contract=namespace.contract,
+                    prefix=namespace.prefix,
+                    description=namespace.description,
+                    fields=[
+                        BlackboardNamespaceField(
+                            name=field.name,
+                            type=field.type,
+                            description=field.description,
+                        )
+                        for field in namespace.fields
+                    ],
+                )
+                for namespace in request.blackboard.namespaces
+            }
+            blackboard_keys = {
+                key.id: BlackboardKey(
+                    id=key.id,
+                    type=key.type,
+                    key=key.key,
+                    description=key.description,
+                )
+                for key in request.blackboard.keys
+            }
         errors, warnings = collect_tree_validation_issues(
             tree,
             state.catalog,
             parameter_defaults=parameter_defaults,
+            blackboard_namespaces=blackboard_namespaces,
+            blackboard_keys=blackboard_keys,
             skill_catalog=state.skill_catalog,
             program_profile=state.program.program_profile if state.program is not None else None,
             deployment_capability_keys=_deployment_capability_keys(state),
@@ -617,11 +738,19 @@ def create_program_router(state: ComposerState) -> APIRouter:
                 default_suffix=".program.yaml",
                 kind_label="Program path",
             )
-            if request.tree is None:
+            if request.tree is None and request.parameters is None:
                 state.program.save(target_path)
             else:
                 program_data = state.program.to_dict()
-                program_data["tree"] = request.tree.model_dump()
+                if request.tree is not None:
+                    program_data["tree"] = request.tree.model_dump()
+                if request.parameters is not None:
+                    program_data["parameters"] = [
+                        parameter.model_dump()
+                        for parameter in request.parameters
+                    ]
+                if request.blackboard is not None:
+                    program_data["blackboard"] = request.blackboard.model_dump(by_alias=True)
                 Program.from_dict(
                     program_data,
                     state.catalog,
@@ -702,9 +831,21 @@ def create_program_router(state: ComposerState) -> APIRouter:
 
         try:
             program = state.program
-            if request.tree is not None:
+            if (
+                request.tree is not None
+                or request.program_parameters is not None
+                or request.blackboard is not None
+            ):
                 program_data = state.program.to_dict()
-                program_data["tree"] = request.tree.model_dump()
+                if request.tree is not None:
+                    program_data["tree"] = request.tree.model_dump()
+                if request.program_parameters is not None:
+                    program_data["parameters"] = [
+                        parameter.model_dump()
+                        for parameter in request.program_parameters
+                    ]
+                if request.blackboard is not None:
+                    program_data["blackboard"] = request.blackboard.model_dump(by_alias=True)
                 program = Program.from_dict(
                     program_data,
                     state.catalog,

@@ -11,6 +11,9 @@ import time
 from pathlib import Path
 
 import pytest
+
+pytest.importorskip("fastapi")
+
 from fastapi.testclient import TestClient
 
 from manyforge_behavior.kernel_client import MockKernelClient
@@ -299,3 +302,45 @@ class TestMcpWithAuth:
             },
         )
         assert resp.status_code == 200
+
+    def test_tools_call_rejects_principal_mismatch(self, state):
+        """Authenticated MCP sessions reject tool-call principal spoofing."""
+        sec = SecurityConfig(api_token="test-secret-token")
+        app = create_app(state, security=sec, enable_mcp_http=True)
+        c = TestClient(app)
+
+        init = c.post(
+            "/api/mcp",
+            json={"jsonrpc": "2.0", "method": "initialize", "id": 1},
+            headers={
+                "Authorization": "Bearer test-secret-token",
+                "X-Principal-ID": "human:alice",
+            },
+        )
+        session_id = init.headers["x-mcp-session-id"]
+
+        resp = c.post(
+            "/api/mcp",
+            json={
+                "jsonrpc": "2.0",
+                "method": "tools/call",
+                "params": {
+                    "name": "manyforge_intervention",
+                    "arguments": {
+                        "action": "status",
+                        "principal_id": "human:bob",
+                    },
+                },
+                "id": 2,
+            },
+            headers={
+                "Authorization": "Bearer test-secret-token",
+                "X-Principal-ID": "human:alice",
+                "x-mcp-session-id": session_id,
+            },
+        )
+
+        assert resp.status_code == 200
+        payload = resp.json()["result"]
+        assert payload["isError"] is True
+        assert "principal_id does not match" in payload["content"][0]["text"]

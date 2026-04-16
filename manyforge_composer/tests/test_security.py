@@ -4,6 +4,9 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+
+pytest.importorskip("fastapi")
+
 from fastapi.testclient import TestClient
 
 from manyforge_behavior.kernel_client import MockKernelClient

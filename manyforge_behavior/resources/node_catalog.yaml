@@ -141,6 +141,7 @@ entries:
         type: int
         required: true
         default: -1
+        parameterizable: true
         description: Number of cycles. -1 for infinite.
     required_capabilities: []
     execution:
@@ -171,6 +172,7 @@ entries:
         type: int
         required: true
         default: -1
+        parameterizable: true
         description: Max retry attempts. -1 for infinite.
     required_capabilities: []
     execution:
@@ -257,22 +259,26 @@ entries:
       - name: pose_goal
         type: pose
         required: false
-        ui_editor: pose
+        ui_editor: pose_or_blackboard_field_selector
+        blackboard_role: field_reader
+        blackboard_value_type: pose
         description: >-
           Target end-effector pose in base_frame for pose_goal motion type.
-          Required when motion_type=pose_goal.
+          Required when motion_type=pose_goal. May be an inline pose or a
+          declared blackboard field_ref.
       - name: relative_move
         type: dict
         required: false
+        ui_editor: relative_move
         description: >-
           Relative move goal for motion_type=relative_move. Structure:
-          {target_reference: {type: frame|object|robot_link|pose, id?: ..., pose?: ...},
-          offset_reference?: {type: frame|object|robot_link|pose, id?: ..., pose?: ...},
+          {target_reference: {type: frame|object|robot_link|pose, id?: ..., pose?: inline_pose|field_ref},
+          offset_reference?: {type: frame|object|robot_link|pose, id?: ..., pose?: inline_pose|field_ref},
           offset: {position_m: [...], orientation_xyzw|orientation_rpy_deg: [...]}}.
           target_reference selects the target origin pose. offset_reference selects the axes in
           which the xyz/rpy offset is expressed; if omitted, it defaults to target_reference.
           Use `robot_link` for current TCP/link-relative moves, `frame` for arbitrary scene
-          frames, and `pose` for an inline reference pose expressed in base_frame.
+          frames, and `pose` for either an inline reference pose or a declared pose field_ref.
       - name: velocity_scale
         type: float
         required: false
@@ -476,7 +482,11 @@ entries:
       - name: object_id
         type: string
         required: true
-        description: Identifier of the object to remove.
+        ui_editor: string_or_blackboard_field_selector
+        blackboard_role: field_reader
+        blackboard_value_type: string
+        description: Identifier of the object to remove. May be a literal ID
+          or a declared blackboard field_ref.
     required_capabilities:
       - scene.edit.remove
     execution:
@@ -506,7 +516,11 @@ entries:
       - name: object_id
         type: string
         required: true
-        description: Identifier of the object to update.
+        ui_editor: string_or_blackboard_field_selector
+        blackboard_role: field_reader
+        blackboard_value_type: string
+        description: Identifier of the object to update. May be a literal ID
+          or a declared blackboard field_ref.
       - name: pose
         type: pose
         required: true
@@ -546,7 +560,11 @@ entries:
       - name: object_id
         type: string
         required: true
-        description: Object to attach (must exist in scene).
+        ui_editor: string_or_blackboard_field_selector
+        blackboard_role: field_reader
+        blackboard_value_type: string
+        description: Object to attach (must exist in scene). May be a literal
+          ID or a declared blackboard field_ref.
       - name: link_frame
         type: string
         required: true
@@ -584,7 +602,11 @@ entries:
       - name: object_id
         type: string
         required: true
-        description: Original object_id (attached version is object_id + "_attached").
+        ui_editor: string_or_blackboard_field_selector
+        blackboard_role: field_reader
+        blackboard_value_type: string
+        description: Original object_id (attached version is object_id +
+          "_attached"). May be a literal ID or a declared blackboard field_ref.
       - name: link_frame
         type: string
         required: true
@@ -624,6 +646,9 @@ entries:
       - name: key
         type: string
         required: true
+        ui_editor: blackboard_key_selector
+        blackboard_role: key_reader
+        blackboard_value_type: bool
         description: Blackboard key name.
       - name: expected_value
         type: bool
@@ -658,6 +683,9 @@ entries:
       - name: key
         type: string
         required: true
+        ui_editor: blackboard_key_selector
+        blackboard_role: key_writer
+        blackboard_value_type: bool
         description: Blackboard key name.
       - name: value
         type: bool
@@ -692,6 +720,9 @@ entries:
       - name: key
         type: string
         required: true
+        ui_editor: blackboard_key_selector
+        blackboard_role: key_reader
+        blackboard_value_type: bool
         description: Blackboard key name.
       - name: expected_value
         type: bool
@@ -738,6 +769,9 @@ entries:
       - name: output_key
         type: string
         required: true
+        ui_editor: blackboard_key_selector
+        blackboard_role: key_writer
+        blackboard_value_type: pose
         description: Blackboard key to store the resulting Pose3DTO.
     bb_writer_params: [output_key]
     required_capabilities:
@@ -771,10 +805,16 @@ entries:
       - name: pose_key_a
         type: string
         required: true
+        ui_editor: blackboard_key_selector
+        blackboard_role: key_reader
+        blackboard_value_type: pose
         description: Blackboard key for the first pose.
       - name: pose_key_b
         type: string
         required: true
+        ui_editor: blackboard_key_selector
+        blackboard_role: key_reader
+        blackboard_value_type: pose
         description: Blackboard key for the second pose.
       - name: translation_threshold_m
         type: float
@@ -830,6 +870,7 @@ entries:
         type: int
         required: false
         default: 1
+        parameterizable: true
         description: >-
           Maximum retry attempts after applying overrides.
           0 means apply overrides and run once without further retries.
@@ -843,6 +884,14 @@ entries:
       py_trees:
         implementation_kind: plugin
         class: manyforge_behavior.nodes.recovery.FallbackOverrideNode
+    outcomes:
+      success_criteria:
+        - Child succeeds after deterministic fallback parameters are applied.
+      failure_classes:
+        - child_failed_after_retries
+        - invalid_fallback_parameters
+      verification_evidence:
+        - child subtree terminal status
     observability:
       emits_events: []
       consumes_events: []
@@ -875,6 +924,7 @@ entries:
         type: int
         required: false
         default: 1
+        parameterizable: true
         description: Maximum retry attempts with recovery skill.
         constraints:
           min_inclusive: 0
@@ -886,6 +936,15 @@ entries:
       py_trees:
         implementation_kind: plugin
         class: manyforge_behavior.nodes.recovery.RecoverySkillNode
+    outcomes:
+      success_criteria:
+        - Recovery skill completes and child succeeds within retry budget.
+      failure_classes:
+        - recovery_skill_failed
+        - child_failed_after_retries
+        - recovery_skill_not_found
+      verification_evidence:
+        - child subtree terminal status
     observability:
       emits_events: []
       consumes_events: []
@@ -928,19 +987,25 @@ entries:
         default: {}
         ui_editor: template_variable_map
         description: >-
-          Map of template variable names to blackboard key paths.
-          Variables in the template text ({{var_name}}) are replaced with
-          the current blackboard value at the given key path.
+          Map of template variable names to declared blackboard bindings.
+          Each value must be a key_ref or field_ref binding. Variables in the
+          template text ({{var_name}}) are replaced with the current value of
+          the referenced key or namespace field.
       - name: output_key_prefix
         type: string
         required: true
+        ui_editor: output_key_prefix_selector
+        blackboard_role: namespace_writer
+        blackboard_contract: query_model_output_v1
         description: >-
-          Blackboard key prefix for writing validated model outputs.
-          Outputs are written under {prefix}/response, {prefix}/confidence, etc.
+          Blackboard namespace prefix for writing the validated model output bundle.
+          The node publishes a single bundle at {prefix} with meta/status data
+          under {prefix}.meta and the validated response under {prefix}.value.
       - name: timeout_s
         type: float
         required: false
         default: 30.0
+        parameterizable: true
         description: Wall-clock timeout for the model call in seconds.
         constraints:
           min_exclusive: 0.0
@@ -948,12 +1013,21 @@ entries:
         type: float
         required: false
         default: 0.0
+        parameterizable: true
         description: >-
           Minimum confidence threshold. If the response confidence is below
           this threshold, the node returns FAILURE.
         constraints:
           min_inclusive: 0.0
           max_inclusive: 1.0
+      - name: retry_on_parse_failure
+        type: bool
+        required: false
+        default: false
+        parameterizable: true
+        description: >-
+          When true, allow at most one repair retry if the first model response
+          cannot be parsed as the required structured output.
       - name: include_scene_snapshot
         type: bool
         required: false
@@ -962,6 +1036,16 @@ entries:
           When true, capture a live HMI scene snapshot and attach it to the
           model request as an image input. Requires a running HMI with at least
           one connected Viser client.
+      - name: scene_snapshot_transport
+        type: enum
+        required: false
+        default: inline_data_url
+        enum_values: [inline_data_url, http_url]
+        description: >-
+          Transport used when attaching the scene snapshot to the model
+          request. `inline_data_url` embeds the bytes directly in the request.
+          `http_url` publishes the captured bytes under a temporary Composer URL
+          and passes that URL to the model instead.
       - name: scene_snapshot_width
         type: int
         required: false
@@ -992,6 +1076,21 @@ entries:
       py_trees:
         implementation_kind: plugin
         class: manyforge_behavior.nodes.model.QueryModelNode
+    outcomes:
+      success_criteria:
+        - Validated structured output written under output_key_prefix.
+        - Confidence meets or exceeds min_confidence.
+      failure_classes:
+        - configuration_error
+        - timeout
+        - cancelled
+        - parse_failed
+        - schema_validation_failed
+        - confidence_below_threshold
+        - output_commit_failed
+      verification_evidence:
+        - blackboard output namespace under output_key_prefix
+        - model_call_started/model_call_completed/model_call_failed events
     observability:
       emits_events: [model_call_started, model_call_completed, model_call_failed]
       consumes_events: []
@@ -1017,11 +1116,14 @@ entries:
         required: true
         description: >-
           Human-authored selection request to resolve, for example "select the
-          red object" or "select the sphere". May be a literal string or a
-          ${bb:...} reference.
+          red object" or "select the sphere". This is authored as a literal
+          string in the program.
       - name: output_key_prefix
         type: string
         required: true
+        ui_editor: output_key_prefix_selector
+        blackboard_role: namespace_writer
+        blackboard_contract: selection_context_v1
         description: >-
           Blackboard prefix for the generated selection context.
       - name: object_source
@@ -1078,6 +1180,15 @@ entries:
       py_trees:
         implementation_kind: plugin
         class: manyforge_behavior.nodes.selection.BuildSceneSelectionContextNode
+    outcomes:
+      success_criteria:
+        - Authoritative candidate manifest written under output_key_prefix.
+      failure_classes:
+        - selection_request_missing
+        - scene_snapshot_unavailable
+        - scene_state_unavailable
+      verification_evidence:
+        - blackboard output namespace under output_key_prefix
     observability:
       emits_events: []
       consumes_events: []
@@ -1101,21 +1212,31 @@ entries:
       - name: selection_context_prefix
         type: string
         required: true
+        ui_editor: selection_context_prefix_selector
+        blackboard_role: namespace_reader
+        blackboard_contract: selection_context_v1
         description: >-
           Blackboard prefix produced by build_scene_selection_context.
       - name: selection_response_prefix
         type: string
         required: true
+        ui_editor: selection_response_prefix_selector
+        blackboard_role: namespace_reader
+        blackboard_contract: query_model_output_v1
         description: >-
           Blackboard prefix produced by query_model for the selection response.
       - name: output_key_prefix
         type: string
         required: true
+        ui_editor: output_key_prefix_selector
+        blackboard_role: namespace_writer
+        blackboard_contract: validated_selection_v1
         description: Blackboard prefix for the validated selection result.
       - name: allow_no_match
         type: bool
         required: false
         default: false
+        parameterizable: true
         description: >-
           When true, a valid no_match response is accepted. The node still
           writes the no_match outcome to the blackboard.
@@ -1123,6 +1244,7 @@ entries:
         type: bool
         required: false
         default: false
+        parameterizable: true
         description: >-
           When true, a valid ambiguous response is accepted. The node still
           writes the ambiguous outcome to the blackboard.
@@ -1134,6 +1256,16 @@ entries:
       py_trees:
         implementation_kind: plugin
         class: manyforge_behavior.nodes.selection.ValidateSceneSelectionNode
+    outcomes:
+      success_criteria:
+        - Selected object ID is coherent with the deterministic candidate set.
+      failure_classes:
+        - no_match_rejected
+        - ambiguous_rejected
+        - invalid_selected_object
+        - malformed_selection_payload
+      verification_evidence:
+        - validated selection under output_key_prefix
     observability:
       emits_events: []
       consumes_events: []
@@ -1158,15 +1290,22 @@ entries:
       - name: selected_object_id
         type: string
         required: true
+        ui_editor: string_or_blackboard_field_selector
+        blackboard_role: field_reader
+        blackboard_value_type: string
         description: >-
-          Object ID to plan against. May be a literal ID or a ${bb:...}
-          blackboard reference.
+          Object ID to plan against. May be a literal ID or a declared
+          blackboard field_ref.
       - name: output_key_prefix
         type: string
         required: true
+        ui_editor: output_key_prefix_selector
+        blackboard_role: namespace_writer
+        blackboard_contract: pick_plan_v1
         description: >-
-          Blackboard prefix for the generated plan. The node writes
-          {prefix}/response and validated fields under {prefix}/fields/....
+          Blackboard namespace prefix for the generated plan bundle. The node
+          publishes the validated plan at {prefix}.value with status/meta data
+          under {prefix}.meta.
       - name: object_source
         type: enum
         required: false
@@ -1245,6 +1384,7 @@ entries:
         type: float
         required: false
         default: 0.01
+        parameterizable: true
         description: Grid step size for translational envelope sampling.
         constraints:
           min_exclusive: 0.0
@@ -1252,6 +1392,7 @@ entries:
         type: float
         required: false
         default: 15.0
+        parameterizable: true
         description: Grid step size for rotational envelope sampling.
         constraints:
           min_exclusive: 0.0
@@ -1259,6 +1400,7 @@ entries:
         type: float
         required: false
         default: 2.0
+        parameterizable: true
         description: Planning timeout per previewed motion leg.
         constraints:
           min_exclusive: 0.0
@@ -1266,6 +1408,7 @@ entries:
         type: float
         required: false
         default: 0.35
+        parameterizable: true
         description: Velocity scale used for motion previews.
         constraints:
           min_exclusive: 0.0
@@ -1274,6 +1417,7 @@ entries:
         type: float
         required: false
         default: 1.0
+        parameterizable: true
         description: Acceleration scale used for motion previews.
         constraints:
           min_exclusive: 0.0
@@ -1281,6 +1425,7 @@ entries:
       - name: max_tcp_linear_speed_mps
         type: float
         required: false
+        parameterizable: true
         description: Optional TCP speed cap enforced during preview validation.
         constraints:
           min_exclusive: 0.0
@@ -1300,6 +1445,16 @@ entries:
       py_trees:
         implementation_kind: plugin
         class: manyforge_behavior.nodes.pick_planning.PlanPickSequenceNode
+    outcomes:
+      success_criteria:
+        - Feasible approach, pick, and exit previews found for the selected object.
+      failure_classes:
+        - selected_object_missing
+        - start_state_invalid
+        - planning_failed
+        - collision_detected
+      verification_evidence:
+        - pick plan response under output_key_prefix
     observability:
       emits_events: []
       consumes_events: []

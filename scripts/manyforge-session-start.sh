@@ -39,14 +39,11 @@ openshell sandbox upload "$SANDBOX_NAME" \
     "$REPO_DIR/../manyforge_specs/" /sandbox/specs/ 2>&1 | grep -E "✓|Error"
 
 openshell sandbox upload "$SANDBOX_NAME" \
-    "$REPO_DIR/WORKSPACE_GUIDE.md" /sandbox/WORKSPACE_GUIDE.md 2>&1 | grep -E "✓|Error"
-
-openshell sandbox upload "$SANDBOX_NAME" \
     "$REPO_DIR/manyforge_core/include/manyforge_core/" \
     /sandbox/contracts/manyforge_core/include/manyforge_core/ 2>&1 | grep -E "✓|Error"
 
-# Upload manymove reference if available
-REFERENCE="$REPO_DIR/docs/reference/REFERENCE.md"  # permanent location
+# Upload engineering reference if available
+REFERENCE="$REPO_DIR/docs/reference/REFERENCE.md"
 if [[ -f "$REFERENCE" ]]; then
     openshell sandbox upload "$SANDBOX_NAME" "$REFERENCE" /sandbox/reference/REFERENCE.md 2>&1 | grep -E "✓|Error"
 else
@@ -85,8 +82,7 @@ echo ""
 echo "  Sandbox shared resources:"
 echo "    /sandbox/specs/           — manyforge ADRs and specs"
 echo "    /sandbox/contracts/       — frozen contract headers"
-echo "    /sandbox/reference/       — manymove reference patterns"
-echo "    /sandbox/WORKSPACE_GUIDE.md"
+echo "    /sandbox/reference/       — ManyForge engineering reference"
 echo ""
 echo "  Active task workspaces:"
 for TASK_ID in "${ACTIVE_TASKS[@]}"; do

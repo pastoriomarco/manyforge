@@ -7,6 +7,7 @@ construction, tree.tick() assertions, blackboard verification.
 import py_trees
 import pytest
 
+from manyforge_behavior.blackboard_namespace import read_namespace_bundle
 from manyforge_behavior.nodes.recovery import FallbackOverrideNode, RecoverySkillNode
 
 
@@ -174,16 +175,9 @@ class TestFallbackOverrideNode:
         tree.tick()  # succeed
 
         bb = py_trees.blackboard.Client(name="reader")
-        bb.register_key(
-            key="_recovery/fallback/status",
-            access=py_trees.common.Access.READ,
-        )
-        bb.register_key(
-            key="_recovery/fallback/retry_count",
-            access=py_trees.common.Access.READ,
-        )
-        assert bb.get("_recovery/fallback/status") == "succeeded"
-        assert bb.get("_recovery/fallback/retry_count") == 1
+        bundle = read_namespace_bundle(bb, "_recovery/fallback")
+        assert bundle["meta"]["status"] == "succeeded"
+        assert bundle["value"]["retry_count"] == 1
 
     def test_child_running_propagated(self):
         """When child returns RUNNING, decorator also returns RUNNING."""
@@ -343,16 +337,9 @@ class TestRecoverySkillNode:
         tree.tick()  # succeed
 
         bb = py_trees.blackboard.Client(name="reader")
-        bb.register_key(
-            key="_recovery/recovery_node/status",
-            access=py_trees.common.Access.READ,
-        )
-        bb.register_key(
-            key="_recovery/recovery_node/recovery_skill_id",
-            access=py_trees.common.Access.READ,
-        )
-        assert bb.get("_recovery/recovery_node/status") == "succeeded"
-        assert bb.get("_recovery/recovery_node/recovery_skill_id") == "fix_it"
+        bundle = read_namespace_bundle(bb, "_recovery/recovery_node")
+        assert bundle["meta"]["status"] == "succeeded"
+        assert bundle["value"]["recovery_skill_id"] == "fix_it"
 
     def test_child_running_propagated(self):
         """When child returns RUNNING, decorator also returns RUNNING."""

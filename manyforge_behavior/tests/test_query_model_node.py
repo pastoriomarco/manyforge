@@ -8,6 +8,7 @@ audit event recording, and error handling.
 from __future__ import annotations
 
 import json
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -16,6 +17,11 @@ from unittest.mock import MagicMock, patch
 import py_trees
 import pytest
 
+from manyforge_behavior.blackboard_namespace import (
+    make_runtime_field_ref,
+    read_namespace_bundle,
+    write_namespace_bundle,
+)
 from manyforge_behavior.deployment import (
     ModelAuditPolicy,
     ModelEndpoint,
@@ -121,8 +127,14 @@ def _mock_call_result(text="hello", parsed=None, model_version="test-v1"):
         "text": text,
         "parsed": parsed,
         "model_version": model_version,
+        "tool_call": None,
         "usage": {"input_tokens": 10, "output_tokens": 5},
     }
+
+
+def _read_model_bundle(prefix: str = "model/test") -> dict[str, Any]:
+    bb = py_trees.blackboard.Client(name=f"reader_{prefix.replace('/', '_')}")
+    return read_namespace_bundle(bb, prefix)
 
 
 # ---------------------------------------------------------------------------
@@ -142,13 +154,10 @@ class TestQueryModelNodeLifecycle:
         status = _tick_until_done(tree)
         assert status == py_trees.common.Status.SUCCESS
 
-        bb = py_trees.blackboard.Client(name="reader")
-        bb.register_key(key="model/test/response", access=py_trees.common.Access.READ)
-        bb.register_key(key="model/test/status", access=py_trees.common.Access.READ)
-        bb.register_key(key="model/test/model_version", access=py_trees.common.Access.READ)
-        assert bb.get("model/test/response") == "world"
-        assert bb.get("model/test/status") == "succeeded"
-        assert bb.get("model/test/model_version") == "test-v1"
+        bundle = _read_model_bundle()
+        assert bundle["value"] == "world"
+        assert bundle["meta"]["status"] == "succeeded"
+        assert bundle["meta"]["model_version"] == "test-v1"
 
     @patch("manyforge_behavior.nodes.model._call_model")
     def test_success_json_response(self, mock_call):
@@ -164,11 +173,9 @@ class TestQueryModelNodeLifecycle:
         status = _tick_until_done(tree)
         assert status == py_trees.common.Status.SUCCESS
 
-        bb = py_trees.blackboard.Client(name="reader")
-        bb.register_key(key="model/test/response", access=py_trees.common.Access.READ)
-        bb.register_key(key="model/test/confidence", access=py_trees.common.Access.READ)
-        assert bb.get("model/test/response") == result_data
-        assert bb.get("model/test/confidence") == 0.95
+        bundle = _read_model_bundle()
+        assert bundle["value"] == result_data
+        assert bundle["meta"]["confidence"] == 0.95
 
     @patch("manyforge_behavior.nodes.model._call_model")
     def test_no_endpoint_returns_failure(self, mock_call):
@@ -263,12 +270,14 @@ class TestQueryModelSchemaValidation:
         """selected_object_id can be constrained by a runtime enum sourced from blackboard."""
         writer = py_trees.blackboard.Client(name="writer_runtime_enum")
         writer.register_key(
-            key="selection/context/candidate_object_ids",
+            key="selection/context",
             access=py_trees.common.Access.WRITE,
         )
-        writer.set(
-            "selection/context/candidate_object_ids",
-            ["sphere_part", "cube_part"],
+        write_namespace_bundle(
+            writer,
+            "selection/context",
+            value={"candidate_object_ids": ["sphere_part", "cube_part"]},
+            status="built",
         )
 
         schema = {
@@ -290,7 +299,10 @@ class TestQueryModelSchemaValidation:
         node = _make_node(
             template=template,
             template_variables={
-                "candidate_object_ids": "selection/context/candidate_object_ids",
+                "candidate_object_ids": make_runtime_field_ref(
+                    "selection/context",
+                    "candidate_object_ids",
+                ),
             },
         )
         tree = py_trees.trees.BehaviourTree(root=node)
@@ -304,12 +316,14 @@ class TestQueryModelSchemaValidation:
         """Dynamic enum validation fails closed when model invents an object id."""
         writer = py_trees.blackboard.Client(name="writer_runtime_enum_invalid")
         writer.register_key(
-            key="selection/context/candidate_object_ids",
+            key="selection/context",
             access=py_trees.common.Access.WRITE,
         )
-        writer.set(
-            "selection/context/candidate_object_ids",
-            ["sphere_part", "cube_part"],
+        write_namespace_bundle(
+            writer,
+            "selection/context",
+            value={"candidate_object_ids": ["sphere_part", "cube_part"]},
+            status="built",
         )
 
         schema = {
@@ -331,7 +345,10 @@ class TestQueryModelSchemaValidation:
         node = _make_node(
             template=template,
             template_variables={
-                "candidate_object_ids": "selection/context/candidate_object_ids",
+                "candidate_object_ids": make_runtime_field_ref(
+                    "selection/context",
+                    "candidate_object_ids",
+                ),
             },
         )
         tree = py_trees.trees.BehaviourTree(root=node)
@@ -345,12 +362,14 @@ class TestQueryModelSchemaValidation:
         """Dynamic enum can explicitly allow empty string for no_match/ambiguous paths."""
         writer = py_trees.blackboard.Client(name="writer_runtime_enum_empty")
         writer.register_key(
-            key="selection/context/candidate_object_ids",
+            key="selection/context",
             access=py_trees.common.Access.WRITE,
         )
-        writer.set(
-            "selection/context/candidate_object_ids",
-            ["sphere_part", "cube_part"],
+        write_namespace_bundle(
+            writer,
+            "selection/context",
+            value={"candidate_object_ids": ["sphere_part", "cube_part"]},
+            status="built",
         )
 
         schema = {
@@ -377,7 +396,10 @@ class TestQueryModelSchemaValidation:
         node = _make_node(
             template=template,
             template_variables={
-                "candidate_object_ids": "selection/context/candidate_object_ids",
+                "candidate_object_ids": make_runtime_field_ref(
+                    "selection/context",
+                    "candidate_object_ids",
+                ),
             },
         )
         tree = py_trees.trees.BehaviourTree(root=node)
@@ -391,12 +413,14 @@ class TestQueryModelSchemaValidation:
         """Tool-call arguments can use the same runtime enum expansion path."""
         writer = py_trees.blackboard.Client(name="writer_response_tool")
         writer.register_key(
-            key="selection/context/candidate_object_ids",
+            key="selection/context",
             access=py_trees.common.Access.WRITE,
         )
-        writer.set(
-            "selection/context/candidate_object_ids",
-            ["sphere_part", "cube_part"],
+        write_namespace_bundle(
+            writer,
+            "selection/context",
+            value={"candidate_object_ids": ["sphere_part", "cube_part"]},
+            status="built",
         )
 
         response_tool = {
@@ -442,7 +466,10 @@ class TestQueryModelSchemaValidation:
         node = _make_node(
             template=template,
             template_variables={
-                "candidate_object_ids": "selection/context/candidate_object_ids",
+                "candidate_object_ids": make_runtime_field_ref(
+                    "selection/context",
+                    "candidate_object_ids",
+                ),
             },
         )
         tree = py_trees.trees.BehaviourTree(root=node)
@@ -642,11 +669,112 @@ class TestQueryModelTemplateVars:
         assert render_calls == [(320, 240, "png")]
         call_kwargs = mock_call.call_args[1]
         assert call_kwargs["scene_snapshot_bytes"] == b"fake-image"
+        assert call_kwargs["scene_snapshot_url"] is None
         assert call_kwargs["scene_snapshot_format"] == "png"
 
     @patch("manyforge_behavior.nodes.model._call_model")
-    def test_structured_fields_are_written_under_blackboard_prefix(self, mock_call):
-        """Validated JSON fields are mirrored to exact blackboard keys."""
+    def test_scene_snapshot_waits_non_blockingly_for_cached_frame(self, mock_call):
+        """Snapshot-backed queries stay RUNNING until a cached frame becomes available."""
+        mock_call.return_value = _mock_call_result(text="ok")
+        render_results = [None, b"fake-image"]
+
+        def render(width, height, format):
+            assert (width, height, format) == (320, 240, "png")
+            return render_results.pop(0)
+
+        node = _make_node(
+            include_scene_snapshot=True,
+            scene_snapshot_provider=render,
+            scene_snapshot_width=320,
+            scene_snapshot_height=240,
+            scene_snapshot_format="png",
+        )
+        tree = py_trees.trees.BehaviourTree(root=node)
+        tree.setup()
+
+        tree.tick()
+        assert tree.root.status == py_trees.common.Status.RUNNING
+        assert node.feedback_message == "waiting_for_scene_snapshot"
+        assert not mock_call.called
+
+        status = _tick_until_done(tree)
+        assert status == py_trees.common.Status.SUCCESS
+        call_kwargs = mock_call.call_args[1]
+        assert call_kwargs["scene_snapshot_bytes"] == b"fake-image"
+        assert call_kwargs["scene_snapshot_url"] is None
+
+    @patch("manyforge_behavior.nodes.model._call_model")
+    def test_scene_snapshot_can_be_published_as_http_url(self, mock_call):
+        """HTTP transport publishes the exact snapshot and passes the URL downstream."""
+        mock_call.return_value = _mock_call_result(text="ok")
+
+        def render(width, height, format):
+            assert (width, height, format) == (320, 240, "png")
+            return b"fake-image"
+
+        published = []
+
+        endpoint = _make_endpoint(
+            base_url="http://172.17.0.1:8000/v1",
+            image_fetch_base_url="http://172.17.0.1:9000",
+        )
+
+        def publish(image_bytes, width, height, format, **kwargs):
+            published.append((image_bytes, width, height, format, kwargs))
+            return {
+                "snapshot_id": "snap-123",
+                "url": "http://172.17.0.1:9000/api/scene/snapshots/snap-123",
+            }
+
+        node = _make_node(
+            endpoint=endpoint,
+            include_scene_snapshot=True,
+            scene_snapshot_transport="http_url",
+            scene_snapshot_provider=render,
+            scene_snapshot_url_publisher=publish,
+            scene_snapshot_width=320,
+            scene_snapshot_height=240,
+            scene_snapshot_format="png",
+        )
+        tree = py_trees.trees.BehaviourTree(root=node)
+        tree.setup()
+
+        status = _tick_until_done(tree)
+        assert status == py_trees.common.Status.SUCCESS
+        assert published == [(
+            b"fake-image",
+            320,
+            240,
+            "png",
+            {
+                "fetch_base_url": "http://172.17.0.1:9000",
+                "model_base_url": "http://172.17.0.1:8000/v1",
+            },
+        )]
+        call_kwargs = mock_call.call_args[1]
+        assert call_kwargs["scene_snapshot_bytes"] == b"fake-image"
+        assert call_kwargs["scene_snapshot_url"] == "http://172.17.0.1:9000/api/scene/snapshots/snap-123"
+        assert call_kwargs["scene_snapshot_format"] == "png"
+
+    @patch("manyforge_behavior.nodes.model._call_model")
+    def test_http_scene_snapshot_transport_fails_without_publisher(self, mock_call):
+        """HTTP transport fails closed when no URL publisher is available."""
+        node = _make_node(
+            include_scene_snapshot=True,
+            scene_snapshot_transport="http_url",
+            scene_snapshot_provider=lambda width, height, format: b"fake-image",
+        )
+        tree = py_trees.trees.BehaviourTree(root=node)
+        tree.setup()
+
+        status = _tick_until_done(tree)
+        assert status == py_trees.common.Status.FAILURE
+        assert node.feedback_message == "scene_snapshot_url_publisher_unavailable"
+        assert not mock_call.called
+
+    @patch("manyforge_behavior.nodes.model._call_model")
+    def test_structured_response_is_written_to_namespace_value_bundle(self, mock_call):
+        """Validated JSON fields are published under the namespace root bundle."""
         result_data = {
             "pick_left_bin": True,
             "selected_object_id": "left_part",
@@ -663,17 +791,14 @@ class TestQueryModelTemplateVars:
         status = _tick_until_done(tree)
         assert status == py_trees.common.Status.SUCCESS
 
-        bb = py_trees.blackboard.Client(name="reader")
-        bb.register_key(key="model/test/fields/pick_left_bin", access=py_trees.common.Access.READ)
-        bb.register_key(key="model/test/fields/selected_object_id", access=py_trees.common.Access.READ)
-        bb.register_key(key="model/test/confidence", access=py_trees.common.Access.READ)
-        assert bb.get("model/test/fields/pick_left_bin") is True
-        assert bb.get("model/test/fields/selected_object_id") == "left_part"
-        assert bb.get("model/test/confidence") == pytest.approx(0.82)
+        bundle = _read_model_bundle()
+        assert bundle["value"]["pick_left_bin"] is True
+        assert bundle["value"]["selected_object_id"] == "left_part"
+        assert bundle["meta"]["confidence"] == pytest.approx(0.82)
 
     @patch("manyforge_behavior.nodes.model._call_model")
-    def test_nested_structured_object_field_is_written_as_aggregate_and_leaves(self, mock_call):
-        """Object-valued fields are mirrored both as whole objects and nested leaves."""
+    def test_nested_structured_object_field_is_written_inside_bundle_value(self, mock_call):
+        """Object-valued fields stay nested inside the published bundle value."""
         result_data = {
             "grasp_pose": {
                 "position_m": [0.42, -0.05, 0.31],
@@ -692,15 +817,13 @@ class TestQueryModelTemplateVars:
         status = _tick_until_done(tree)
         assert status == py_trees.common.Status.SUCCESS
 
-        bb = py_trees.blackboard.Client(name="reader_nested")
-        bb.register_key(key="model/test/fields/grasp_pose", access=py_trees.common.Access.READ)
-        bb.register_key(key="model/test/fields/grasp_pose/position_m", access=py_trees.common.Access.READ)
-        assert bb.get("model/test/fields/grasp_pose") == result_data["grasp_pose"]
-        assert bb.get("model/test/fields/grasp_pose/position_m") == [0.42, -0.05, 0.31]
+        bundle = _read_model_bundle()
+        assert bundle["value"]["grasp_pose"] == result_data["grasp_pose"]
+        assert bundle["value"]["grasp_pose"]["position_m"] == [0.42, -0.05, 0.31]
 
     @patch("manyforge_behavior.nodes.model._call_model")
-    def test_stale_structured_fields_are_cleared_on_next_success(self, mock_call):
-        """Old mirrored field keys are removed when a later response changes shape."""
+    def test_next_success_replaces_prior_bundle_value_shape(self, mock_call):
+        """A later success replaces the entire namespace bundle value."""
         first = {"pick_left_bin": True, "selected_object_id": "left_part"}
         second = {"pick_left_bin": False}
         mock_call.side_effect = [
@@ -718,8 +841,9 @@ class TestQueryModelTemplateVars:
         second_tree.setup()
         assert _tick_until_done(second_tree) == py_trees.common.Status.SUCCESS
 
-        assert py_trees.blackboard.Blackboard.get("model/test/fields/pick_left_bin") is False
-        assert not py_trees.blackboard.Blackboard.exists("model/test/fields/selected_object_id")
+        bundle = _read_model_bundle()
+        assert bundle["value"]["pick_left_bin"] is False
+        assert "selected_object_id" not in bundle["value"]
 
 
 # ---------------------------------------------------------------------------
@@ -786,6 +910,83 @@ class TestQueryModelAudit:
             assert kwargs.get("principal_id") == "llm:planner-v2"
 
 
+class TestQueryModelComplianceFixes:
+
+    @patch("manyforge_behavior.nodes.model._call_model")
+    def test_retry_on_parse_failure_retries_once_and_succeeds(self, mock_call):
+        """A single repair retry is allowed when structured parsing fails."""
+        schema = {
+            "type": "object",
+            "required": ["action"],
+            "properties": {"action": {"type": "string"}},
+        }
+        template = _make_template(output_schema=schema)
+        mock_call.side_effect = [
+            _mock_call_result(text="not-json", parsed=None),
+            _mock_call_result(text='{"action":"pick"}', parsed={"action": "pick"}),
+        ]
+        node = _make_node(
+            template=template,
+            retry_on_parse_failure=True,
+        )
+        tree = py_trees.trees.BehaviourTree(root=node)
+        tree.setup()
+
+        status = _tick_until_done(tree)
+        assert status == py_trees.common.Status.SUCCESS
+        assert mock_call.call_count == 2
+
+    @patch("manyforge_behavior.nodes.model._call_model")
+    def test_stop_requested_cancels_running_node(self, mock_call):
+        """The BT stop_requested path causes QueryModelNode to fail closed."""
+        release = threading.Event()
+
+        def delayed_call(*args, **kwargs):
+            release.wait(timeout=1.0)
+            return _mock_call_result(text="ok")
+
+        mock_call.side_effect = delayed_call
+        node = _make_node()
+        tree = py_trees.trees.BehaviourTree(root=node)
+        tree.setup()
+
+        tree.tick()
+        assert tree.root.status == py_trees.common.Status.RUNNING
+
+        stopper = py_trees.blackboard.Client(name="stop_writer")
+        stopper.register_key(key="stop_requested", access=py_trees.common.Access.WRITE)
+        stopper.stop_requested = True
+
+        tree.tick()
+        release.set()
+
+        assert tree.root.status == py_trees.common.Status.FAILURE
+        assert node.feedback_message == "stop_requested"
+
+    @patch("manyforge_behavior.nodes.model._call_model")
+    def test_output_commit_rolls_back_on_failure(self, mock_call):
+        """Namespace writes are rolled back if any write fails mid-commit."""
+        result = {"action": "pick", "confidence": 0.9}
+        mock_call.return_value = _mock_call_result(
+            text=json.dumps(result),
+            parsed=result,
+        )
+        node = _make_node()
+        tree = py_trees.trees.BehaviourTree(root=node)
+        tree.setup()
+
+        with patch(
+            "manyforge_behavior.nodes.model.write_namespace_bundle",
+            side_effect=RuntimeError("simulated write failure"),
+        ):
+            status = _tick_until_done(tree)
+
+        assert status == py_trees.common.Status.FAILURE
+
+        with pytest.raises(KeyError):
+            _read_model_bundle()
+
+
 # ---------------------------------------------------------------------------
 # _call_model unit tests (provider dispatch)
 # ---------------------------------------------------------------------------
@@ -845,3 +1046,36 @@ class TestCallModelFunction:
         image_part = payload["messages"][0]["content"][1]
         assert image_part["type"] == "image_url"
         assert image_part["image_url"]["url"].startswith("data:image/jpeg;base64,")
+
+    def test_openai_multimodal_request_can_use_http_snapshot_url(self):
+        """OpenAI-compatible calls may attach an HTTP-served snapshot URL."""
+        client = MagicMock()
+        response = MagicMock()
+        response.json.return_value = {
+            "choices": [{"message": {"content": "ok"}}],
+            "model": "gemma-test",
+            "usage": {"prompt_tokens": 12, "completion_tokens": 3},
+        }
+        response.raise_for_status.return_value = None
+        client.post.return_value = response
+
+        with patch("manyforge_behavior.nodes.model._get_http_client", return_value=client):
+            result = _call_model(
+                provider="openai",
+                model_id="gemma-test",
+                base_url="http://localhost:8000/v1",
+                api_key_env=None,
+                prompt="Describe the scene",
+                max_tokens=128,
+                timeout_s=5.0,
+                scene_snapshot_bytes=b"\xff\xd8fake",
+                scene_snapshot_url="http://localhost:9000/api/scene/snapshots/snap-123",
+                scene_snapshot_format="jpeg",
+            )
+
+        assert result["text"] == "ok"
+        _, kwargs = client.post.call_args
+        payload = kwargs["json"]
+        image_part = payload["messages"][0]["content"][1]
+        assert image_part["type"] == "image_url"
+        assert image_part["image_url"]["url"] == "http://localhost:9000/api/scene/snapshots/snap-123"

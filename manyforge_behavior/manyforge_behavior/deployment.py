@@ -79,6 +79,7 @@ class ModelEndpoint:
     provider: str  # "openai", "anthropic", "local", etc.
     model_id: str
     base_url: Optional[str] = None
+    image_fetch_base_url: Optional[str] = None
     api_key_env: Optional[str] = None  # env var name, never the key itself
     default_timeout_s: float = 30.0
     max_tokens: int = 4096
@@ -302,6 +303,7 @@ class Deployment:
                 provider=ep_data["provider"],
                 model_id=ep_data["model_id"],
                 base_url=ep_data.get("base_url"),
+                image_fetch_base_url=ep_data.get("image_fetch_base_url"),
                 api_key_env=ep_data.get("api_key_env"),
                 default_timeout_s=float(ep_data.get("default_timeout_s", 30.0)),
                 max_tokens=int(ep_data.get("max_tokens", 4096)),
@@ -461,6 +463,7 @@ class Deployment:
                     "provider": endpoint.provider,
                     "model_id": endpoint.model_id,
                     "base_url": endpoint.base_url,
+                    "image_fetch_base_url": endpoint.image_fetch_base_url,
                     "api_key_env": endpoint.api_key_env,
                     "default_timeout_s": endpoint.default_timeout_s,
                     "max_tokens": endpoint.max_tokens,

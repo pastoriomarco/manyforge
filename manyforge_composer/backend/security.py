@@ -21,6 +21,10 @@ _PRINCIPAL_ID_RE = re.compile(r"^[\x20-\x7E]{1,128}$")
 _PRINCIPAL_ID_MAX_LEN = 128
 
 
+def is_valid_principal_id(value: str) -> bool:
+    return bool(_PRINCIPAL_ID_RE.match(value))
+
+
 @dataclass
 class SecurityConfig:
     """Runtime security settings for the Composer backend."""
@@ -95,7 +99,7 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
         # header is supplied, fall back to a token-derived sentinel so that
         # every authenticated request carries a non-empty principal_id.
         principal_header = request.headers.get("x-principal-id", "").strip()
-        if principal_header and not _PRINCIPAL_ID_RE.match(principal_header):
+        if principal_header and not is_valid_principal_id(principal_header):
             return JSONResponse(
                 status_code=400,
                 content={

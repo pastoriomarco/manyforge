@@ -69,7 +69,7 @@ export const useDeploymentStore = create<DeploymentStore>((set, get) => ({
         error: null,
       });
       return true;
-    } catch (e) {
+    } catch {
       set({ loading: false });
       return false;
     }

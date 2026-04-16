@@ -5,6 +5,10 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import MagicMock
 
+import pytest
+
+pytest.importorskip("fastapi")
+
 from fastapi.testclient import TestClient
 
 from manyforge_behavior.cycle_manager import CycleState
@@ -87,6 +91,7 @@ def test_scene_state_includes_robot_metadata_after_program_load():
     assert data["robot"]["group_id"] == "arm"
     assert data["robot"]["base_frame"] == "base_link"
     assert data["robot"]["tcp_frame"] == "tool0"
+    assert data["robot"]["joint_names"] == ["joint_a", "joint_b", "joint_c"]
     assert isinstance(data["robot"]["joint_positions"], dict)
 
 

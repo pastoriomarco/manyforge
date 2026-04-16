@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 from pathlib import Path
 
 import py_trees
@@ -41,6 +42,14 @@ def _get_simulator_initial_joint_positions(state: ComposerState) -> list[float] 
     return [float(v) for v in positions]
 
 
+def _default_public_api_base_url(host: str, port: int) -> str:
+    override = os.environ.get("MANYFORGE_PUBLIC_API_BASE_URL", "").strip()
+    if override:
+        return override.rstrip("/")
+    resolved_host = "localhost" if host in {"0.0.0.0", "::"} else host
+    return f"http://{resolved_host}:{port}"
+
+
 def build_program_loaded_callback(
     *,
     host: str,
@@ -60,6 +69,12 @@ def build_program_loaded_callback(
         hmi_server_factory = ViserHmiServer
 
     _hmi_server = None
+
+    def _snapshot_provider_for_runtime(hmi_server):
+        return (
+            getattr(hmi_server, "get_cached_scene_snapshot", None)
+            or getattr(hmi_server, "render_scene", None)
+        )
 
     def on_program_loaded(st: ComposerState):
         nonlocal _hmi_server
@@ -82,9 +97,21 @@ def build_program_loaded_callback(
         if (
             st.cycle_manager is not None
             and hasattr(st.cycle_manager, "_runner")
-            and hasattr(_hmi_server, "render_scene")
+            and _snapshot_provider_for_runtime(_hmi_server) is not None
         ):
-            st.cycle_manager._runner.set_scene_snapshot_provider(_hmi_server.render_scene)
+            st.cycle_manager._runner.set_scene_snapshot_provider(
+                _snapshot_provider_for_runtime(_hmi_server)
+            )
+            st.cycle_manager._runner.set_scene_snapshot_url_publisher(
+                lambda image_bytes, width, height, format, **kwargs: st.publish_scene_snapshot(
+                    image_bytes,
+                    width=width,
+                    height=height,
+                    format=format,
+                    fetch_base_url=kwargs.get("fetch_base_url"),
+                    model_base_url=kwargs.get("model_base_url"),
+                )
+            )
         _hmi_server.load_program(st.effective_program or st.program)
 
         def on_scene_edit(operation: str, request):
@@ -220,6 +247,7 @@ def _run_mcp(args):
         trace_dir="/tmp/manyforge-traces",
         allowed_fs_roots=security.allowed_fs_roots,
     )
+    state.public_api_base_url = _default_public_api_base_url(args.host, args.port)
     try:
         mcp_server = create_mcp_server(state)
     except RuntimeError as exc:
@@ -280,6 +308,7 @@ def main():
         trace_dir="/tmp/manyforge-traces",
         allowed_fs_roots=security.allowed_fs_roots,
     )
+    state.public_api_base_url = _default_public_api_base_url(args.host, args.port)
 
     # Wire up Viser HMI if --hmi-port is set
     if args.hmi_port is not None:

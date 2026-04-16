@@ -247,7 +247,7 @@ class TestFixtureProgram:
         sequence_child = repeat_child.children[0]
         assert sequence_child.id == "set_key_bool_value"
         assert sequence_child.name == "mark_done"
-        assert sequence_child.params["key"] == "cycle_ran"
+        assert sequence_child.params["key"] == {"key_ref": "cycle_ran"}
         assert sequence_child.params["value"] is True
 
         # Build and run via the runner

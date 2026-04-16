@@ -7,6 +7,7 @@ from typing import Any, Callable, Optional
 
 import py_trees
 
+from manyforge_behavior.blackboard_bindings import resolve_runtime_blackboard_bindings
 from manyforge_behavior.catalog import NodeCatalog
 from manyforge_behavior.kernel_client import KernelClient, SceneEditRequest
 from manyforge_behavior.nodes.geometry import CheckPoseDistance, GetLinkPose
@@ -58,8 +59,6 @@ PLUGIN_FACTORY: dict[str, type] = {
     "plan_pick_sequence": PlanPickSequenceNode,
     "validate_scene_selection": ValidateSceneSelectionNode,
 }
-
-
 class OrchestratorRunner:
     """Main entry point: load, build, and run a ManyForge program."""
 
@@ -75,6 +74,9 @@ class OrchestratorRunner:
         skill_catalog: Optional[SkillCatalog] = None,
         event_recorder: Optional[Any] = None,
         scene_snapshot_provider: Optional[Callable[[int, int, str], Optional[bytes]]] = None,
+        scene_snapshot_url_publisher: Optional[
+            Callable[..., Optional[dict[str, Any]]]
+        ] = None,
     ):
         self._catalog_path = catalog_path
         self._program_path = program_path
@@ -92,6 +94,7 @@ class OrchestratorRunner:
         self._skill_catalog: Optional[SkillCatalog] = skill_catalog
         self._event_recorder = event_recorder
         self._scene_snapshot_provider = scene_snapshot_provider
+        self._scene_snapshot_url_publisher = scene_snapshot_url_publisher
         # Intervention context — set by cycle_manager before building
         # intervention subtrees so nodes like QueryModelNode can attribute
         # audit events to the active session.
@@ -248,6 +251,13 @@ class OrchestratorRunner:
         """Update the HMI-backed render provider used by query_model nodes."""
         self._scene_snapshot_provider = provider
 
+    def set_scene_snapshot_url_publisher(
+        self,
+        publisher: Optional[Callable[..., Optional[dict[str, Any]]]],
+    ) -> None:
+        """Update the URL publisher used for HTTP-served snapshot experiments."""
+        self._scene_snapshot_url_publisher = publisher
+
     def _expand_tree_node(self, tree_node: TreeNode) -> TreeNode:
         """Expand a skill invocation into a concrete subtree when needed."""
         if self._skill_catalog is None or not self._skill_catalog.contains(tree_node.id):
@@ -281,7 +291,25 @@ class OrchestratorRunner:
     def _build_node(self, tree_node: TreeNode) -> py_trees.behaviour.Behaviour:
         """Recursively build a py_trees node from a TreeNode."""
         tree_node = self._expand_tree_node(tree_node)
+        entry = self._catalog.get(tree_node.id)
+        n_children = len(tree_node.children)
+        if n_children < entry.children_min:
+            raise ValueError(
+                f"Node '{tree_node.name}' ({tree_node.id}) requires at least "
+                f"{entry.children_min} child{'ren' if entry.children_min != 1 else ''}, got {n_children}"
+            )
+        if entry.children_max >= 0 and n_children > entry.children_max:
+            raise ValueError(
+                f"Node '{tree_node.name}' ({tree_node.id}) allows at most "
+                f"{entry.children_max} child{'ren' if entry.children_max != 1 else ''}, got {n_children}"
+            )
         resolved_params = self._resolver.resolve(tree_node.params)
+        resolved_params = resolve_runtime_blackboard_bindings(
+            entry,
+            resolved_params,
+            blackboard_namespaces=self._program.blackboard_namespaces,
+            blackboard_keys=self._program.blackboard_keys,
+        )
         children = [self._build_node(c) for c in tree_node.children]
 
         # Inject robot profile defaults for motion nodes
@@ -398,7 +426,13 @@ class OrchestratorRunner:
                 output_key_prefix=resolved_params.get("output_key_prefix", f"model/{tree_node.name}"),
                 timeout_s=float(resolved_params.get("timeout_s", 30.0)),
                 min_confidence=float(resolved_params.get("min_confidence", 0.0)),
+                retry_on_parse_failure=bool(
+                    resolved_params.get("retry_on_parse_failure", False)
+                ),
                 include_scene_snapshot=bool(resolved_params.get("include_scene_snapshot", False)),
+                scene_snapshot_transport=str(
+                    resolved_params.get("scene_snapshot_transport", "inline_data_url")
+                ),
                 scene_snapshot_width=int(resolved_params.get("scene_snapshot_width", 640)),
                 scene_snapshot_height=int(resolved_params.get("scene_snapshot_height", 480)),
                 scene_snapshot_format=str(resolved_params.get("scene_snapshot_format", "jpeg")),
@@ -407,9 +441,11 @@ class OrchestratorRunner:
                 event_recorder=event_recorder,
                 audit_policy=audit_policy,
                 scene_snapshot_provider=self._scene_snapshot_provider,
+                scene_snapshot_url_publisher=self._scene_snapshot_url_publisher,
                 run_id=ctx.get("run_id"),
                 session_id=ctx.get("session_id"),
                 principal_id=ctx.get("principal_id"),
+                parent_run_id=ctx.get("parent_run_id"),
             )
         if tree_node.id == "build_scene_selection_context":
             return BuildSceneSelectionContextNode(

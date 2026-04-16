@@ -259,6 +259,25 @@ async def _handle_jsonrpc(mcp_server, body: dict, session: _McpSession) -> dict:
         # Server-authoritative principal: always override with session identity.
         # The session principal comes from the auth middleware, not from the
         # client, so it cannot be spoofed via tool arguments.
+        if (
+            session.principal_id
+            and isinstance(tool_args, dict)
+            and "principal_id" in tool_args
+            and tool_args["principal_id"] != session.principal_id
+        ):
+            return {
+                "jsonrpc": "2.0",
+                "result": {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "principal_id does not match authenticated session principal",
+                        }
+                    ],
+                    "isError": True,
+                },
+                "id": request_id,
+            }
         if session.principal_id:
             tool_args["principal_id"] = session.principal_id
         try:

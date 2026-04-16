@@ -10,7 +10,7 @@ import yaml
 from manyforge_behavior.catalog import NodeCatalog
 from manyforge_behavior.deployment import Deployment
 from manyforge_behavior.kernel_client import ExecutionState, MockKernelClient
-from manyforge_behavior.program import Program
+from manyforge_behavior.program import Program, ProgramValidationError
 from manyforge_behavior.runner import OrchestratorRunner
 
 CATALOG_PATH = str(Path(__file__).parent.parent / "resources" / "node_catalog.yaml")
@@ -192,6 +192,191 @@ class TestRunnerExecution:
         assert kernel.last_execute_request.move_id == "move_to_home"
 
 
+class TestRunnerChildCardinality:
+    def test_runner_rejects_leaf_with_children(self, kernel):
+        catalog = NodeCatalog(CATALOG_PATH)
+        program = Program.from_dict(
+            {
+                "api_version": "manyforge.program.v0",
+                "program_profile": "v0.0",
+                "name": "invalid_leaf_children",
+                "catalog_version": "0.1.0",
+                "robot": {
+                    "robot_id": "ur5",
+                    "group_id": "arm",
+                    "base_frame": "base_link",
+                    "tcp_frame": "tool0",
+                },
+                "tree": {
+                    "id": "timer",
+                    "name": "timer_leaf",
+                    "params": {"duration_s": 0.1},
+                },
+            },
+            catalog,
+        )
+        program.tree.children.append(
+            Program.from_dict(
+                {
+                    "api_version": "manyforge.program.v0",
+                    "program_profile": "v0.0",
+                    "name": "single_wait",
+                    "catalog_version": "0.1.0",
+                    "robot": {
+                        "robot_id": "ur5",
+                        "group_id": "arm",
+                        "base_frame": "base_link",
+                        "tcp_frame": "tool0",
+                    },
+                    "tree": {
+                        "id": "timer",
+                        "name": "unexpected_child",
+                        "params": {"duration_s": 0.1},
+                    },
+                },
+                catalog,
+            ).tree
+        )
+
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel, program=program)
+        runner.load()
+
+        with pytest.raises(ValueError, match="allows at most 0 children"):
+            runner.build_tree()
+
+    def test_runner_rejects_decorator_with_multiple_children(self, kernel):
+        catalog = NodeCatalog(CATALOG_PATH)
+        program = Program.from_dict(
+            {
+                "api_version": "manyforge.program.v0",
+                "program_profile": "v0.0",
+                "name": "invalid_decorator_children",
+                "catalog_version": "0.1.0",
+                "robot": {
+                    "robot_id": "ur5",
+                    "group_id": "arm",
+                    "base_frame": "base_link",
+                    "tcp_frame": "tool0",
+                },
+                "tree": {
+                    "id": "inverter",
+                    "name": "invert_once",
+                    "children": [
+                        {"id": "timer", "name": "first", "params": {"duration_s": 0.1}},
+                    ],
+                },
+            },
+            catalog,
+        )
+        program.tree.children.append(
+            Program.from_dict(
+                {
+                    "api_version": "manyforge.program.v0",
+                    "program_profile": "v0.0",
+                    "name": "second_wait",
+                    "catalog_version": "0.1.0",
+                    "robot": {
+                        "robot_id": "ur5",
+                        "group_id": "arm",
+                        "base_frame": "base_link",
+                        "tcp_frame": "tool0",
+                    },
+                    "tree": {
+                        "id": "timer",
+                        "name": "second",
+                        "params": {"duration_s": 0.2},
+                    },
+                },
+                catalog,
+            ).tree
+        )
+
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel, program=program)
+        runner.load()
+
+        with pytest.raises(ValueError, match="allows at most 1 child"):
+            runner.build_tree()
+
+
+class TestRelativeMoveValidation:
+    @staticmethod
+    def _base_program_dict(relative_move: dict) -> dict:
+        return {
+            "api_version": "manyforge.program.v0",
+            "program_profile": "v0.0",
+            "name": "relative_move_validation",
+            "catalog_version": "0.1.0",
+            "robot": {
+                "robot_id": "ur5",
+                "group_id": "arm",
+                "base_frame": "base_link",
+                "tcp_frame": "tool0",
+            },
+            "tree": {
+                "id": "move_manipulator_action",
+                "name": "relative_move_step",
+                "params": {
+                    "move_id": "move_1",
+                    "motion_type": "relative_move",
+                    "relative_move": relative_move,
+                },
+            },
+        }
+
+    def test_program_rejects_relative_move_pose_reference_without_pose(self):
+        catalog = NodeCatalog(CATALOG_PATH)
+
+        with pytest.raises(
+            ProgramValidationError,
+            match="relative_move.target_reference.pose is required when relative_move.target_reference.type='pose'",
+        ):
+            Program.from_dict(
+                self._base_program_dict(
+                    {
+                        "target_reference": {"type": "pose"},
+                        "offset": {
+                            "position_m": [0.0, 0.0, 0.08],
+                            "orientation_rpy_deg": [180.0, 0.0, 0.0],
+                        },
+                    }
+                ),
+                catalog,
+            )
+
+    def test_program_rejects_relative_move_frame_reference_without_id(self):
+        catalog = NodeCatalog(CATALOG_PATH)
+
+        with pytest.raises(
+            ProgramValidationError,
+            match="relative_move.target_reference.id is required when relative_move.target_reference.type='frame'",
+        ):
+            Program.from_dict(
+                self._base_program_dict(
+                    {
+                        "target_reference": {"type": "frame"},
+                        "offset": {
+                            "position_m": [0.0, 0.0, 0.08],
+                            "orientation_rpy_deg": [180.0, 0.0, 0.0],
+                        },
+                    }
+                ),
+                catalog,
+            )
+
+    def test_program_rejects_relative_move_without_offset(self):
+        catalog = NodeCatalog(CATALOG_PATH)
+
+        with pytest.raises(ProgramValidationError, match="offset is required"):
+            Program.from_dict(
+                self._base_program_dict(
+                    {
+                        "target_reference": {"type": "object", "id": "target_object"},
+                    }
+                ),
+                catalog,
+            )
+
+
 class TestRunnerDeployment:
     def test_load_with_deployment(self, kernel):
         """Runner loads deployment and validates against program."""
@@ -270,13 +455,25 @@ class TestRunnerDeployment:
                     "base_frame": "base_link",
                     "tcp_frame": "tool0",
                 },
+                "blackboard": {
+                    "namespaces": [
+                        {
+                            "id": "vlm_target",
+                            "contract": "query_model_output_v1",
+                            "prefix": "vlm/target",
+                            "fields": [
+                                {"name": "pick_left_bin", "type": "bool"},
+                            ],
+                        },
+                    ],
+                },
                 "tree": {
                     "id": "query_model",
                     "name": "pick_target",
                     "params": {
                         "model_endpoint_alias": "local_vlm",
                         "prompt_template_id": "pick_target_v1",
-                        "output_key_prefix": "vlm/target",
+                        "output_key_prefix": {"namespace_ref": "vlm_target"},
                         "include_scene_snapshot": True,
                     },
                 },
@@ -497,6 +694,19 @@ class TestRunnerDeployment:
                     "base_frame": "base_link",
                     "tcp_frame": "tool0",
                 },
+                "blackboard": {
+                    "namespaces": [
+                        {
+                            "id": "vlm_grasp",
+                            "contract": "query_model_output_v1",
+                            "prefix": "vlm/grasp",
+                            "fields": [
+                                {"name": "grasp_pose", "type": "pose"},
+                                {"name": "confidence", "type": "float"},
+                            ],
+                        },
+                    ],
+                },
                 "tree": {
                     "id": "sequence",
                     "name": "root",
@@ -507,7 +717,7 @@ class TestRunnerDeployment:
                             "params": {
                                 "model_endpoint_alias": "local_vlm",
                                 "prompt_template_id": "grasp_pose_v1",
-                                "output_key_prefix": "vlm/grasp",
+                                "output_key_prefix": {"namespace_ref": "vlm_grasp"},
                                 "min_confidence": 0.80,
                             },
                         },
@@ -517,7 +727,12 @@ class TestRunnerDeployment:
                             "params": {
                                 "move_id": "vlm_pose_goal",
                                 "motion_type": "pose_goal",
-                                "pose_goal": "${bb:vlm/grasp/fields/grasp_pose}",
+                                "pose_goal": {
+                                    "field_ref": {
+                                        "namespace": "vlm_grasp",
+                                        "field": "grasp_pose",
+                                    }
+                                },
                             },
                         },
                     ],

@@ -7,6 +7,10 @@ from typing import Any
 
 import py_trees
 
+from manyforge_behavior.blackboard_namespace import (
+    read_blackboard_binding_value,
+    register_blackboard_binding_read,
+)
 from manyforge_behavior.kernel_client import KernelClient
 
 
@@ -53,17 +57,13 @@ class CheckPoseDistance(py_trees.behaviour.Behaviour):
 
     def setup(self, **kwargs: Any) -> None:
         self.blackboard = self.attach_blackboard_client()
-        self.blackboard.register_key(
-            key=self._pose_key_a, access=py_trees.common.Access.READ
-        )
-        self.blackboard.register_key(
-            key=self._pose_key_b, access=py_trees.common.Access.READ
-        )
+        register_blackboard_binding_read(self.blackboard, self._pose_key_a)
+        register_blackboard_binding_read(self.blackboard, self._pose_key_b)
 
     def update(self) -> py_trees.common.Status:
         try:
-            pose_a = self.blackboard.get(self._pose_key_a)
-            pose_b = self.blackboard.get(self._pose_key_b)
+            pose_a = read_blackboard_binding_value(self.blackboard, self._pose_key_a)
+            pose_b = read_blackboard_binding_value(self.blackboard, self._pose_key_b)
         except KeyError:
             return py_trees.common.Status.FAILURE
 

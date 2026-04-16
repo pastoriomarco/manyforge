@@ -3,6 +3,10 @@
 import pytest
 import py_trees
 
+from manyforge_behavior.blackboard_namespace import (
+    make_runtime_field_ref,
+    write_namespace_bundle,
+)
 from manyforge_behavior.kernel_client import (
     ExecutionState,
     MockKernelClient,
@@ -256,22 +260,26 @@ class TestMoveManipulatorAction:
 
     def test_pose_goal_blackboard_reference_resolves_runtime_pose(self, kernel, bb_with_kernel):
         bb_with_kernel.register_key(
-            key="perception/grasp_pose",
+            key="perception",
             access=py_trees.common.Access.WRITE,
         )
-        bb_with_kernel.set(
-            "perception/grasp_pose",
-            {
-                "position_m": [0.42, -0.05, 0.31],
-                "orientation_rpy_deg": [180.0, 0.0, -90.0],
+        write_namespace_bundle(
+            bb_with_kernel,
+            "perception",
+            value={
+                "grasp_pose": {
+                    "position_m": [0.42, -0.05, 0.31],
+                    "orientation_rpy_deg": [180.0, 0.0, -90.0],
+                },
             },
+            status="available",
         )
 
         node = MoveManipulatorAction(
             name="test_pose_goal_bb_ref",
             move_id="m_pose_bb",
             motion_type="pose_goal",
-            pose_goal="${bb:perception/grasp_pose}",
+            pose_goal=make_runtime_field_ref("perception", "grasp_pose"),
         )
 
         status = _tick_node(node)
@@ -290,7 +298,7 @@ class TestMoveManipulatorAction:
             name="test_pose_goal_bb_missing",
             move_id="m_pose_missing",
             motion_type="pose_goal",
-            pose_goal="${bb:perception/missing_grasp_pose}",
+            pose_goal=make_runtime_field_ref("perception", "missing_grasp_pose"),
         )
 
         status = _tick_node(node)
@@ -299,15 +307,19 @@ class TestMoveManipulatorAction:
 
     def test_relative_move_pose_reference_can_resolve_blackboard_pose(self, kernel, bb_with_kernel):
         bb_with_kernel.register_key(
-            key="perception/approach_pose",
+            key="perception",
             access=py_trees.common.Access.WRITE,
         )
-        bb_with_kernel.set(
-            "perception/approach_pose",
-            {
-                "position_m": [0.3, -0.2, 0.15],
-                "orientation_rpy_deg": [180.0, 0.0, -90.0],
+        write_namespace_bundle(
+            bb_with_kernel,
+            "perception",
+            value={
+                "approach_pose": {
+                    "position_m": [0.3, -0.2, 0.15],
+                    "orientation_rpy_deg": [180.0, 0.0, -90.0],
+                },
             },
+            status="available",
         )
 
         node = MoveManipulatorAction(
@@ -317,7 +329,7 @@ class TestMoveManipulatorAction:
             relative_move={
                 "target_reference": {
                     "type": "pose",
-                    "pose": "${bb:perception/approach_pose}",
+                    "pose": make_runtime_field_ref("perception", "approach_pose"),
                 },
                 "offset": {
                     "position_m": [0.0, 0.0, 0.1],
@@ -374,12 +386,14 @@ class TestSceneNodeBlackboardReferences:
         assert kernel.scene_edit(add_request).success is True
 
         bb_with_kernel.register_key(
-            key="planning/pick_plan/fields/selected_object_id",
+            key="planning/pick_plan",
             access=py_trees.common.Access.WRITE,
         )
-        bb_with_kernel.set(
-            "planning/pick_plan/fields/selected_object_id",
-            "sphere_part",
+        write_namespace_bundle(
+            bb_with_kernel,
+            "planning/pick_plan",
+            value={"selected_object_id": "sphere_part"},
+            status="planned",
         )
 
         registry_bb = py_trees.blackboard.Client(name="scene_registry")
@@ -393,7 +407,10 @@ class TestSceneNodeBlackboardReferences:
 
         node = AttachObjectToLink(
             name="attach_selected",
-            object_id="${bb:planning/pick_plan/fields/selected_object_id}",
+            object_id=make_runtime_field_ref(
+                "planning/pick_plan",
+                "selected_object_id",
+            ),
             link_frame="tool0",
         )
 

@@ -12,6 +12,23 @@ import yaml
 
 SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+$")
 EXPECTED_API_VERSION = "manyforge.node_catalog.v0"
+_BLACKBOARD_ROLES = {
+    "namespace_writer",
+    "namespace_reader",
+    "key_writer",
+    "key_reader",
+    "field_reader",
+}
+_BLACKBOARD_VALUE_TYPES = {
+    "string",
+    "float",
+    "int",
+    "bool",
+    "pose",
+    "float_list",
+    "string_list",
+    "dict",
+}
 
 
 @dataclass
@@ -24,6 +41,9 @@ class CatalogParameter:
     constraints: dict[str, Any] = field(default_factory=dict)
     parameterizable: bool = False
     ui_editor: Optional[str] = None
+    blackboard_role: Optional[str] = None
+    blackboard_contract: Optional[str] = None
+    blackboard_value_type: Optional[str] = None
     description: str = ""
 
 
@@ -111,6 +131,9 @@ class NodeCatalog:
                     constraints=p.get("constraints", {}),
                     parameterizable=p.get("parameterizable", False),
                     ui_editor=p.get("ui_editor"),
+                    blackboard_role=p.get("blackboard_role"),
+                    blackboard_contract=p.get("blackboard_contract"),
+                    blackboard_value_type=p.get("blackboard_value_type"),
                     description=p.get("description", ""),
                 )
             )
@@ -178,6 +201,21 @@ class NodeCatalog:
                 raise CatalogValidationError(
                     f"Entry '{entry.id}', param '{p.name}': "
                     "enum type requires non-empty enum_values"
+                )
+            if p.blackboard_role is not None and p.blackboard_role not in _BLACKBOARD_ROLES:
+                allowed = ", ".join(sorted(_BLACKBOARD_ROLES))
+                raise CatalogValidationError(
+                    f"Entry '{entry.id}', param '{p.name}': "
+                    f"blackboard_role must be one of: {allowed}"
+                )
+            if (
+                p.blackboard_value_type is not None
+                and p.blackboard_value_type not in _BLACKBOARD_VALUE_TYPES
+            ):
+                allowed = ", ".join(sorted(_BLACKBOARD_VALUE_TYPES))
+                raise CatalogValidationError(
+                    f"Entry '{entry.id}', param '{p.name}': "
+                    f"blackboard_value_type must be one of: {allowed}"
                 )
 
         declared_params = {p.name for p in entry.parameters}

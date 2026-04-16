@@ -5,6 +5,9 @@ import logging
 import time
 import pytest
 from pathlib import Path
+
+pytest.importorskip("fastapi")
+
 from fastapi.testclient import TestClient
 from httpx import AsyncClient
 import httpx
@@ -324,6 +327,8 @@ def test_load_program(client, state):
     assert "robot" in data
     assert "sceneCount" in data
     assert "parameterCount" in data
+    assert "parameters" in data
+    assert data["parameters"][0]["name"] == "pick_velocity_scale"
 
 
 def test_load_program_invalid_path(client, state):
@@ -343,6 +348,17 @@ def test_get_program(client, state):
     data = response.json()
     assert "name" in data
     assert "robot" in data
+    assert data["parameters"][0]["name"] == "pick_velocity_scale"
+
+
+def test_get_saved_program_returns_saved_parameters(client):
+    client.post("/api/program/load", json={"path": _PROGRAM_PATH})
+
+    response = client.get("/api/program/saved")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["parameters"][0]["name"] == "pick_velocity_scale"
+    assert data["parameters"][0]["default"] == 0.5
 
 
 def test_get_program_not_loaded(client):
@@ -1492,6 +1508,61 @@ def test_apply_session_updates_program_and_deployment_together(client):
     assert current_deployment["name"] == "applied_deployment"
 
 
+def test_apply_session_updates_program_parameters_without_touching_saved_artifact(client):
+    client.post("/api/program/load", json={"path": _PROGRAM_PATH, "deployment_path": _DEPLOYMENT_PATH})
+
+    response = client.post(
+        "/api/session/apply",
+        json={
+            "programParameters": [
+                {
+                    "name": "pick_velocity_scale",
+                    "type": "float",
+                    "default": 0.8,
+                    "constraints": {
+                        "min_exclusive": 0.0,
+                        "max_inclusive": 1.0,
+                    },
+                    "description": "Velocity scale for pick moves.",
+                }
+            ]
+        },
+    )
+    assert response.status_code == 200
+
+    current_program = client.get("/api/program").json()
+    saved_program = client.get("/api/program/saved").json()
+    assert current_program["parameters"][0]["default"] == 0.8
+    assert saved_program["parameters"][0]["default"] == 0.5
+
+
+def test_save_program_persists_updated_parameters(client, tmp_path):
+    client.post("/api/program/load", json={"path": _PROGRAM_PATH})
+
+    save_target = tmp_path / "parameterized"
+    response = client.post(
+        "/api/program/save",
+        json={
+            "path": str(save_target),
+            "parameters": [
+                {
+                    "name": "pick_velocity_scale",
+                    "type": "float",
+                    "default": 0.75,
+                    "constraints": {
+                        "min_exclusive": 0.0,
+                        "max_inclusive": 1.0,
+                    },
+                    "description": "Velocity scale for pick moves.",
+                }
+            ],
+        },
+    )
+    assert response.status_code == 200
+    saved_yaml = yaml.safe_load(Path(response.json()["path"]).read_text(encoding="utf-8"))
+    assert saved_yaml["parameters"][0]["default"] == 0.75
+
+
 # =============================================================================
 # Logging Tests
 # =============================================================================
@@ -1781,6 +1852,36 @@ def test_scene_snapshot_returns_image():
     assert len(response.content) > 0
 
 
+def test_published_scene_snapshot_returns_stored_image():
+    """GET /api/scene/snapshots/{id} serves the exact published bytes."""
+    kernel = MockKernelClient()
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state.public_api_base_url = "http://localhost:9000"
+    published = state.publish_scene_snapshot(
+        b"\xff\xd8fake-jpeg",
+        width=320,
+        height=240,
+        format="jpeg",
+    )
+    app = create_app(state)
+    with TestClient(app) as client:
+        response = client.get(f"/api/scene/snapshots/{published['snapshot_id']}")
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "image/jpeg"
+    assert response.headers["etag"] == published["sha256"]
+    assert response.content == b"\xff\xd8fake-jpeg"
+
+
+def test_published_scene_snapshot_404_for_missing_id():
+    """GET /api/scene/snapshots/{id} returns 404 for unknown ids."""
+    kernel = MockKernelClient()
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    app = create_app(state)
+    with TestClient(app) as client:
+        response = client.get("/api/scene/snapshots/missing")
+    assert response.status_code == 404
+
+
 # =============================================================================
 # Direct Control / Intervention Tests
 # =============================================================================
@@ -1980,7 +2081,7 @@ def test_direct_promote_blackboard_value_after_intervention():
             "tree": {
                 "id": "set_key_bool_value",
                 "name": "publish_detection",
-                "params": {"key": "detected_ok", "value": True},
+                "params": {"key": {"key_ref": "detected_ok"}, "value": True},
                 "children": [],
             },
             "sessionKind": "manual_intervention",

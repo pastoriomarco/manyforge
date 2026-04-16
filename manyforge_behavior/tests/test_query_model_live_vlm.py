@@ -15,6 +15,7 @@ import time
 import py_trees
 import pytest
 
+from manyforge_behavior.blackboard_namespace import read_namespace_bundle
 from manyforge_behavior.deployment import ModelEndpoint, PromptTemplate
 from manyforge_behavior.nodes.model import QueryModelNode
 
@@ -132,12 +133,8 @@ def test_live_query_model_with_scene_snapshot():
     assert status == py_trees.common.Status.SUCCESS
 
     bb = py_trees.blackboard.Client(name="live_vlm_reader")
-    bb.register_key(key="live_vlm/probe/fields/left_is_red", access=py_trees.common.Access.READ)
-    bb.register_key(key="live_vlm/probe/fields/right_is_blue", access=py_trees.common.Access.READ)
-    bb.register_key(key="live_vlm/probe/confidence", access=py_trees.common.Access.READ)
-    bb.register_key(key="live_vlm/probe/model_version", access=py_trees.common.Access.READ)
-
-    assert bb.get("live_vlm/probe/fields/left_is_red") is True
-    assert bb.get("live_vlm/probe/fields/right_is_blue") is True
-    assert float(bb.get("live_vlm/probe/confidence")) >= 0.5
-    assert bb.get("live_vlm/probe/model_version")
+    bundle = read_namespace_bundle(bb, "live_vlm/probe")
+    assert bundle["value"]["left_is_red"] is True
+    assert bundle["value"]["right_is_blue"] is True
+    assert float(bundle["meta"]["confidence"]) >= 0.5
+    assert bundle["meta"]["model_version"]

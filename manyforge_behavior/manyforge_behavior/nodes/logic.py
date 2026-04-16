@@ -6,6 +6,11 @@ from typing import Any
 
 import py_trees
 
+from manyforge_behavior.blackboard_namespace import (
+    read_blackboard_binding_value,
+    register_blackboard_binding_read,
+)
+
 
 class CheckKeyBoolValue(py_trees.behaviour.Behaviour):
     """Condition: succeeds if blackboard key holds the expected bool value."""
@@ -17,13 +22,11 @@ class CheckKeyBoolValue(py_trees.behaviour.Behaviour):
 
     def setup(self, **kwargs: Any) -> None:
         self.blackboard = self.attach_blackboard_client()
-        self.blackboard.register_key(
-            key=self._key, access=py_trees.common.Access.READ
-        )
+        register_blackboard_binding_read(self.blackboard, self._key)
 
     def update(self) -> py_trees.common.Status:
         try:
-            value = self.blackboard.get(self._key)
+            value = read_blackboard_binding_value(self.blackboard, self._key)
         except KeyError:
             return py_trees.common.Status.FAILURE
         if value == self._expected:
@@ -60,13 +63,11 @@ class WaitForKeyBool(py_trees.behaviour.Behaviour):
 
     def setup(self, **kwargs: Any) -> None:
         self.blackboard = self.attach_blackboard_client()
-        self.blackboard.register_key(
-            key=self._key, access=py_trees.common.Access.READ
-        )
+        register_blackboard_binding_read(self.blackboard, self._key)
 
     def update(self) -> py_trees.common.Status:
         try:
-            value = self.blackboard.get(self._key)
+            value = read_blackboard_binding_value(self.blackboard, self._key)
         except KeyError:
             return py_trees.common.Status.RUNNING
         if value == self._expected:

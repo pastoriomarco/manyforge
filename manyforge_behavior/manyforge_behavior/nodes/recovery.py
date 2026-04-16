@@ -15,6 +15,8 @@ import time
 
 import py_trees
 
+from manyforge_behavior.blackboard_namespace import write_namespace_bundle
+
 logger = logging.getLogger(__name__)
 
 
@@ -31,9 +33,8 @@ class FallbackOverrideNode(py_trees.decorators.Decorator):
     On child SUCCESS, returns SUCCESS immediately.  When retries are exhausted,
     returns FAILURE.
 
-    Recovery metadata is recorded on the blackboard under
-    ``_recovery/{node_name}/`` so tracing and downstream logic can inspect
-    what happened.
+    Recovery metadata is recorded on the blackboard under the root namespace
+    bundle ``_recovery/{node_name}``.
     """
 
     def __init__(
@@ -57,18 +58,30 @@ class FallbackOverrideNode(py_trees.decorators.Decorator):
     def _ensure_bb_keys(self) -> None:
         if self._keys_registered:
             return
-        recovery_prefix = f"_recovery/{self.name}"
-        for key in (
-            f"{recovery_prefix}/retry_count",
-            f"{recovery_prefix}/status",
-            f"{recovery_prefix}/timestamp_ns",
-            f"{recovery_prefix}/applied_overrides",
-        ):
-            self._bb.register_key(
-                key=key,
-                access=py_trees.common.Access.WRITE,
-            )
+        self._bb.register_key(
+            key=f"_recovery/{self.name}",
+            access=py_trees.common.Access.WRITE,
+        )
         self._keys_registered = True
+
+    def _write_recovery_state(
+        self,
+        *,
+        status: str,
+        retry_count: int,
+        applied_overrides: dict | None = None,
+    ) -> None:
+        value = {
+            "retry_count": retry_count,
+            "applied_overrides": dict(applied_overrides or {}),
+        }
+        write_namespace_bundle(
+            self._bb,
+            f"_recovery/{self.name}",
+            value=value,
+            status=status,
+            timestamp_ns=time.monotonic_ns(),
+        )
 
     def initialise(self):
         self._retry_count = 0
@@ -103,12 +116,13 @@ class FallbackOverrideNode(py_trees.decorators.Decorator):
 
     def update(self) -> py_trees.common.Status:
         self._ensure_bb_keys()
-        recovery_prefix = f"_recovery/{self.name}"
 
         if self.decorated.status == py_trees.common.Status.SUCCESS:
-            self._bb.set(f"{recovery_prefix}/status", "succeeded")
-            self._bb.set(f"{recovery_prefix}/retry_count", self._retry_count)
-            self._bb.set(f"{recovery_prefix}/timestamp_ns", time.monotonic_ns())
+            self._write_recovery_state(
+                status="succeeded",
+                retry_count=self._retry_count,
+                applied_overrides=self._fallback_params if self._retry_count > 0 else {},
+            )
             return py_trees.common.Status.SUCCESS
 
         if self.decorated.status == py_trees.common.Status.FAILURE:
@@ -120,18 +134,16 @@ class FallbackOverrideNode(py_trees.decorators.Decorator):
                     self._retry_count - 1,
                     self._max_retries,
                 )
-                self._bb.set(f"{recovery_prefix}/status", "exhausted")
-                self._bb.set(f"{recovery_prefix}/retry_count", self._retry_count - 1)
-                self._bb.set(f"{recovery_prefix}/timestamp_ns", time.monotonic_ns())
+                self._write_recovery_state(
+                    status="exhausted",
+                    retry_count=self._retry_count - 1,
+                    applied_overrides=self._fallback_params if self._retry_count > 1 else {},
+                )
                 return py_trees.common.Status.FAILURE
 
             # Apply fallback overrides to child's _params dict
             self._apply_fallback_to_child()
             # Mirror to blackboard for traceability
-            self._bb.set(
-                f"{recovery_prefix}/applied_overrides",
-                dict(self._fallback_params),
-            )
             logger.info(
                 "%s: applying fallback overrides (attempt %d/%d): %s",
                 self.name,
@@ -139,9 +151,11 @@ class FallbackOverrideNode(py_trees.decorators.Decorator):
                 self._max_retries,
                 list(self._fallback_params.keys()),
             )
-            self._bb.set(f"{recovery_prefix}/status", "retrying")
-            self._bb.set(f"{recovery_prefix}/retry_count", self._retry_count)
-            self._bb.set(f"{recovery_prefix}/timestamp_ns", time.monotonic_ns())
+            self._write_recovery_state(
+                status="retrying",
+                retry_count=self._retry_count,
+                applied_overrides=self._fallback_params,
+            )
             # Return RUNNING to re-tick the child on the next tree tick
             return py_trees.common.Status.RUNNING
 
@@ -161,8 +175,8 @@ class RecoverySkillNode(py_trees.decorators.Decorator):
     It takes ``(skill_id, params)`` and returns a ``py_trees.behaviour.Behaviour``
     subtree, or ``None`` if the skill is unknown.
 
-    Recovery metadata is recorded on the blackboard under
-    ``_recovery/{node_name}/``.
+    Recovery metadata is recorded on the blackboard under the root namespace
+    bundle ``_recovery/{node_name}``.
     """
 
     def __init__(
@@ -189,18 +203,30 @@ class RecoverySkillNode(py_trees.decorators.Decorator):
     def _ensure_bb_keys(self) -> None:
         if self._keys_registered:
             return
-        recovery_prefix = f"_recovery/{self.name}"
-        for key in (
-            f"{recovery_prefix}/retry_count",
-            f"{recovery_prefix}/status",
-            f"{recovery_prefix}/timestamp_ns",
-            f"{recovery_prefix}/recovery_skill_id",
-        ):
-            self._bb.register_key(
-                key=key,
-                access=py_trees.common.Access.WRITE,
-            )
+        self._bb.register_key(
+            key=f"_recovery/{self.name}",
+            access=py_trees.common.Access.WRITE,
+        )
         self._keys_registered = True
+
+    def _write_recovery_state(
+        self,
+        *,
+        status: str,
+        retry_count: int,
+        recovery_skill_id: str | None = None,
+    ) -> None:
+        value = {
+            "retry_count": retry_count,
+            "recovery_skill_id": recovery_skill_id,
+        }
+        write_namespace_bundle(
+            self._bb,
+            f"_recovery/{self.name}",
+            value=value,
+            status=status,
+            timestamp_ns=time.monotonic_ns(),
+        )
 
     def initialise(self):
         self._retry_count = 0
@@ -209,7 +235,6 @@ class RecoverySkillNode(py_trees.decorators.Decorator):
 
     def update(self) -> py_trees.common.Status:
         self._ensure_bb_keys()
-        recovery_prefix = f"_recovery/{self.name}"
 
         # If we're currently running a recovery skill subtree
         if self._running_recovery and self._recovery_subtree is not None:
@@ -224,8 +249,11 @@ class RecoverySkillNode(py_trees.decorators.Decorator):
                     self.name,
                     self._recovery_skill_id,
                 )
-                self._bb.set(f"{recovery_prefix}/status", "retrying")
-                self._bb.set(f"{recovery_prefix}/timestamp_ns", time.monotonic_ns())
+                self._write_recovery_state(
+                    status="retrying",
+                    retry_count=self._retry_count,
+                    recovery_skill_id=self._recovery_skill_id,
+                )
                 return py_trees.common.Status.RUNNING
             elif recovery_status == py_trees.common.Status.FAILURE:
                 # Recovery skill failed
@@ -236,9 +264,11 @@ class RecoverySkillNode(py_trees.decorators.Decorator):
                     self.name,
                     self._recovery_skill_id,
                 )
-                self._bb.set(f"{recovery_prefix}/status", "recovery_failed")
-                self._bb.set(f"{recovery_prefix}/retry_count", self._retry_count)
-                self._bb.set(f"{recovery_prefix}/timestamp_ns", time.monotonic_ns())
+                self._write_recovery_state(
+                    status="recovery_failed",
+                    retry_count=self._retry_count,
+                    recovery_skill_id=self._recovery_skill_id,
+                )
                 return py_trees.common.Status.FAILURE
             else:
                 # Recovery skill is still running
@@ -246,9 +276,11 @@ class RecoverySkillNode(py_trees.decorators.Decorator):
 
         # Normal path: check child status
         if self.decorated.status == py_trees.common.Status.SUCCESS:
-            self._bb.set(f"{recovery_prefix}/status", "succeeded")
-            self._bb.set(f"{recovery_prefix}/retry_count", self._retry_count)
-            self._bb.set(f"{recovery_prefix}/timestamp_ns", time.monotonic_ns())
+            self._write_recovery_state(
+                status="succeeded",
+                retry_count=self._retry_count,
+                recovery_skill_id=self._recovery_skill_id,
+            )
             return py_trees.common.Status.SUCCESS
 
         if self.decorated.status == py_trees.common.Status.FAILURE:
@@ -260,9 +292,11 @@ class RecoverySkillNode(py_trees.decorators.Decorator):
                     self._retry_count - 1,
                     self._max_retries,
                 )
-                self._bb.set(f"{recovery_prefix}/status", "exhausted")
-                self._bb.set(f"{recovery_prefix}/retry_count", self._retry_count - 1)
-                self._bb.set(f"{recovery_prefix}/timestamp_ns", time.monotonic_ns())
+                self._write_recovery_state(
+                    status="exhausted",
+                    retry_count=self._retry_count - 1,
+                    recovery_skill_id=self._recovery_skill_id,
+                )
                 return py_trees.common.Status.FAILURE
 
             # Build and start recovery skill subtree
@@ -272,8 +306,11 @@ class RecoverySkillNode(py_trees.decorators.Decorator):
                     self.name,
                     self._recovery_skill_id,
                 )
-                self._bb.set(f"{recovery_prefix}/status", "no_expander")
-                self._bb.set(f"{recovery_prefix}/timestamp_ns", time.monotonic_ns())
+                self._write_recovery_state(
+                    status="no_expander",
+                    retry_count=self._retry_count,
+                    recovery_skill_id=self._recovery_skill_id,
+                )
                 return py_trees.common.Status.FAILURE
 
             subtree = self._skill_expander(
@@ -286,8 +323,11 @@ class RecoverySkillNode(py_trees.decorators.Decorator):
                     self.name,
                     self._recovery_skill_id,
                 )
-                self._bb.set(f"{recovery_prefix}/status", "skill_not_found")
-                self._bb.set(f"{recovery_prefix}/timestamp_ns", time.monotonic_ns())
+                self._write_recovery_state(
+                    status="skill_not_found",
+                    retry_count=self._retry_count,
+                    recovery_skill_id=self._recovery_skill_id,
+                )
                 return py_trees.common.Status.FAILURE
 
             self._recovery_subtree = subtree
@@ -299,10 +339,11 @@ class RecoverySkillNode(py_trees.decorators.Decorator):
                 self._retry_count,
                 self._max_retries,
             )
-            self._bb.set(f"{recovery_prefix}/status", "recovering")
-            self._bb.set(f"{recovery_prefix}/recovery_skill_id", self._recovery_skill_id)
-            self._bb.set(f"{recovery_prefix}/retry_count", self._retry_count)
-            self._bb.set(f"{recovery_prefix}/timestamp_ns", time.monotonic_ns())
+            self._write_recovery_state(
+                status="recovering",
+                retry_count=self._retry_count,
+                recovery_skill_id=self._recovery_skill_id,
+            )
             # Tick the recovery subtree once to start it
             self._recovery_subtree.tick_once()
             if self._recovery_subtree.status == py_trees.common.Status.SUCCESS:
@@ -312,8 +353,11 @@ class RecoverySkillNode(py_trees.decorators.Decorator):
             elif self._recovery_subtree.status == py_trees.common.Status.FAILURE:
                 self._running_recovery = False
                 self._recovery_subtree = None
-                self._bb.set(f"{recovery_prefix}/status", "recovery_failed")
-                self._bb.set(f"{recovery_prefix}/timestamp_ns", time.monotonic_ns())
+                self._write_recovery_state(
+                    status="recovery_failed",
+                    retry_count=self._retry_count,
+                    recovery_skill_id=self._recovery_skill_id,
+                )
                 return py_trees.common.Status.FAILURE
             return py_trees.common.Status.RUNNING
 

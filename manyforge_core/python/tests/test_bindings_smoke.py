@@ -2,17 +2,16 @@
 
 import pytest
 
+manyforge_core_py = pytest.importorskip("manyforge_core_py")
+
 
 def test_import_module():
     """Test that the module can be imported."""
-    import manyforge_core_py
     assert manyforge_core_py is not None
 
 
 def test_execution_state_enum():
     """Test ExecutionState enum values."""
-    import manyforge_core_py
-    
     assert manyforge_core_py.ExecutionState.kIdle == manyforge_core_py.kIdle
     assert manyforge_core_py.ExecutionState.kPlanning == manyforge_core_py.kPlanning
     assert manyforge_core_py.ExecutionState.kValidating == manyforge_core_py.kValidating
@@ -26,16 +25,12 @@ def test_execution_state_enum():
 
 def test_cache_mode_enum():
     """Test CacheMode enum values."""
-    import manyforge_core_py
-    
     assert manyforge_core_py.CacheMode.kDefault == manyforge_core_py.kDefault
     assert manyforge_core_py.CacheMode.kDisable == manyforge_core_py.kDisable
 
 
 def test_error_code_enum():
     """Test ErrorCode enum values."""
-    import manyforge_core_py
-    
     assert manyforge_core_py.ErrorCode.kSuccess == manyforge_core_py.kSuccess
     assert manyforge_core_py.ErrorCode.kInvalidRequest == manyforge_core_py.kInvalidRequest
     assert manyforge_core_py.ErrorCode.kPlanningFailed == manyforge_core_py.kPlanningFailed
@@ -43,8 +38,6 @@ def test_error_code_enum():
 
 def test_vector3_dto():
     """Test Vector3DTO creation and attributes."""
-    import manyforge_core_py
-    
     v = manyforge_core_py.Vector3DTO(1.0, 2.0, 3.0)
     assert v.x_m == 1.0
     assert v.y_m == 2.0
@@ -54,8 +47,6 @@ def test_vector3_dto():
 
 def test_quaternion_dto():
     """Test QuaternionDTO creation and attributes."""
-    import manyforge_core_py
-    
     q = manyforge_core_py.QuaternionDTO(0.0, 0.0, 0.0, 1.0)
     assert q.x == 0.0
     assert q.y == 0.0
@@ -65,8 +56,6 @@ def test_quaternion_dto():
 
 def test_pose3_dto():
     """Test Pose3DTO creation and attributes."""
-    import manyforge_core_py
-    
     pos = manyforge_core_py.Vector3DTO(1.0, 2.0, 3.0)
     orient = manyforge_core_py.QuaternionDTO(0.0, 0.0, 0.0, 1.0)
     p = manyforge_core_py.Pose3DTO(pos, orient)

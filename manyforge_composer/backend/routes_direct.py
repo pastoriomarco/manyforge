@@ -8,6 +8,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 from manyforge_behavior.program import collect_tree_validation_issues, tree_node_from_dict
 
+from .intervention_validation import merged_intervention_blackboard_keys
 from .models import (
     DelegatedRecoveryRequestResponse,
     InterventionExecuteRequest,
@@ -139,6 +140,20 @@ def create_direct_router(state: ComposerState) -> APIRouter:
                 state.program.get_parameter_defaults()
                 if state.program is not None
                 else None
+            ),
+            blackboard_namespaces=(
+                state.program.blackboard_namespaces
+                if state.program is not None
+                else None
+            ),
+            blackboard_keys=merged_intervention_blackboard_keys(
+                tree,
+                state.catalog,
+                base_keys=(
+                    state.program.blackboard_keys
+                    if state.program is not None
+                    else None
+                ),
             ),
             skill_catalog=state.skill_catalog,
             program_profile=(

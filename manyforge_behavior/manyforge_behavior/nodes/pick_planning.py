@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import hashlib
 import itertools
 import math
+import time
 from typing import Any, Callable, Optional
 
 import py_trees
@@ -14,7 +14,11 @@ from manyforge_behavior.kernel_client import (
     KernelClient,
     SceneObjectSnapshot,
 )
-from manyforge_behavior.parameters import BLACKBOARD_REF_RE
+from manyforge_behavior.nodes.blackboard_output import BlackboardOutputMixin
+from manyforge_behavior.parameters import resolve_blackboard_value
+
+
+_SCENE_SNAPSHOT_WAIT_TIMEOUT_S = 2.0
 
 
 def _rpy_deg_to_xyzw(rpy_deg: list[float]) -> list[float]:
@@ -28,28 +32,6 @@ def _rpy_deg_to_xyzw(rpy_deg: list[float]) -> list[float]:
         cr * cp * sy - sr * sp * cy,
         cr * cp * cy + sr * sp * sy,
     ]
-
-
-def _resolve_blackboard_reference(
-    blackboard: py_trees.blackboard.Client, value: Any
-) -> Any:
-    if isinstance(value, str):
-        match = BLACKBOARD_REF_RE.match(value)
-        if match is None:
-            return value
-        key = match.group(1)
-        blackboard.register_key(key=key, access=py_trees.common.Access.READ)
-        if not blackboard.exists(key):
-            raise KeyError(f"Missing blackboard key '{key}'")
-        return blackboard.get(key)
-    if isinstance(value, list):
-        return [_resolve_blackboard_reference(blackboard, item) for item in value]
-    if isinstance(value, dict):
-        return {
-            item_key: _resolve_blackboard_reference(blackboard, item_value)
-            for item_key, item_value in value.items()
-        }
-    return value
 
 
 def _default_pick_offset_envelope() -> dict[str, Any]:
@@ -188,7 +170,7 @@ def _preview_failure_message(
     return " | ".join(parts)
 
 
-class PlanPickSequenceNode(py_trees.behaviour.Behaviour):
+class PlanPickSequenceNode(BlackboardOutputMixin, py_trees.behaviour.Behaviour):
     """Deterministically generate and preview a three-leg pick sequence."""
 
     def __init__(
@@ -247,28 +229,29 @@ class PlanPickSequenceNode(py_trees.behaviour.Behaviour):
         self._scene_snapshot_provider = scene_snapshot_provider
         self._bb = py_trees.blackboard.Client(name=f"plan_pick_sequence_{name}")
         self._output_keys_registered = False
+        self._awaiting_scene_snapshot = False
+        self._scene_snapshot_wait_started_ns = 0
 
     def _ensure_output_keys(self) -> None:
         if self._output_keys_registered:
             return
-        prefix = self._output_key_prefix
-        for key in (
-            f"{prefix}/response",
-            f"{prefix}/status",
-            f"{prefix}/field_keys",
-        ):
-            self._bb.register_key(key=key, access=py_trees.common.Access.WRITE)
+        self._bb.register_key(
+            key=self._output_key_prefix,
+            access=py_trees.common.Access.WRITE,
+        )
         self._bb.register_key(key="kernel", access=py_trees.common.Access.READ)
         self._output_keys_registered = True
 
     def initialise(self) -> None:
         self._ensure_output_keys()
+        self._awaiting_scene_snapshot = False
+        self._scene_snapshot_wait_started_ns = 0
 
     def update(self) -> py_trees.common.Status:
         kernel: KernelClient = self._bb.kernel
         try:
             selected_object_id = str(
-                _resolve_blackboard_reference(self._bb, self._selected_object_id)
+                resolve_blackboard_value(self._bb, self._selected_object_id)
             )
         except (AttributeError, KeyError) as exc:
             self.feedback_message = str(exc)
@@ -320,23 +303,47 @@ class PlanPickSequenceNode(py_trees.behaviour.Behaviour):
                     outcome="image_source_unavailable",
                 )
                 return py_trees.common.Status.FAILURE
-            snapshot_bytes = provider(
-                self._image_snapshot_width,
-                self._image_snapshot_height,
-                self._image_snapshot_format,
-            )
-            if snapshot_bytes is None:
-                self.feedback_message = "image_source=hmi_snapshot requested but no render is available"
+            try:
+                snapshot_bytes = provider(
+                    self._image_snapshot_width,
+                    self._image_snapshot_height,
+                    self._image_snapshot_format,
+                )
+            except Exception as exc:
+                self.feedback_message = f"image_snapshot_unavailable: {exc}"
                 self._write_failure_response(
                     selected_object_id=selected_object_id,
                     attempted_candidates=0,
                     outcome="image_snapshot_unavailable",
                 )
                 return py_trees.common.Status.FAILURE
+            if snapshot_bytes is None:
+                if self._scene_snapshot_wait_started_ns == 0:
+                    self._scene_snapshot_wait_started_ns = time.monotonic_ns()
+                elapsed_s = (
+                    time.monotonic_ns() - self._scene_snapshot_wait_started_ns
+                ) / 1_000_000_000
+                if elapsed_s >= _SCENE_SNAPSHOT_WAIT_TIMEOUT_S:
+                    self.feedback_message = (
+                        f"image_snapshot_unavailable_after_{_SCENE_SNAPSHOT_WAIT_TIMEOUT_S:.1f}s"
+                    )
+                    self._write_failure_response(
+                        selected_object_id=selected_object_id,
+                        attempted_candidates=0,
+                        outcome="image_snapshot_unavailable",
+                    )
+                    return py_trees.common.Status.FAILURE
+                self._awaiting_scene_snapshot = True
+                self.feedback_message = "waiting_for_scene_snapshot"
+                self._write_namespace_output(
+                    None,
+                    status="waiting_for_scene_snapshot",
+                )
+                return py_trees.common.Status.RUNNING
+            self._awaiting_scene_snapshot = False
+            self._scene_snapshot_wait_started_ns = 0
             # The current deterministic planner does not consume the image yet,
-            # but capturing it here keeps the contract shape stable for future
-            # perception-backed planning variants.
-            hashlib.sha256(snapshot_bytes).hexdigest()
+            # but successful acquisition still exercises the image-backed path.
         elif self._image_source != "none":
             self.feedback_message = f"Unsupported image_source: {self._image_source}"
             self._write_failure_response(
@@ -544,31 +551,8 @@ class PlanPickSequenceNode(py_trees.behaviour.Behaviour):
             cache_mode="disable",
         )
 
-    def _write_output(self, key: str, value: Any) -> None:
-        self._bb.set(f"{self._output_key_prefix}/{key}", value)
-
     def _write_response(self, response: dict[str, Any]) -> None:
-        previous_keys = self._read_previous_field_keys()
-        field_keys = []
-        for key, value in response.items():
-            field_key = f"{self._output_key_prefix}/fields/{key}"
-            py_trees.blackboard.Blackboard.set(field_key, value)
-            field_keys.append(field_key)
-        for key in previous_keys:
-            if key not in field_keys:
-                py_trees.blackboard.Blackboard.unset(key)
-        self._write_output("response", response)
-        self._write_output("status", "planned")
-        self._write_output("field_keys", field_keys)
-
-    def _read_previous_field_keys(self) -> list[str]:
-        try:
-            value = self._bb.get(f"{self._output_key_prefix}/field_keys")
-        except KeyError:
-            return []
-        if isinstance(value, list):
-            return [str(item) for item in value]
-        return []
+        self._write_namespace_output(response, status="planned")
 
     def _write_failure_response(
         self,
@@ -587,5 +571,4 @@ class PlanPickSequenceNode(py_trees.behaviour.Behaviour):
             "outcome": outcome,
             "failure_detail": failure_detail,
         }
-        self._write_response(response)
-        self._write_output("status", "failed")
+        self._write_namespace_output(response, status="failed")

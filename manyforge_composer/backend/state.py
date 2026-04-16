@@ -1,12 +1,15 @@
 """ComposerState - Holds the runtime state shared across all API routes."""
 from __future__ import annotations
 
+import hashlib
 import logging
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
+from urllib.parse import urlparse
 
 from manyforge_behavior.catalog import NodeCatalog
 from manyforge_behavior.program import (
@@ -41,6 +44,18 @@ class RuntimeOverrideRecord:
     activated_at_ns: Optional[int] = None
 
 
+@dataclass
+class PublishedSceneSnapshot:
+    snapshot_id: str
+    image_bytes: bytes
+    media_type: str
+    width: int
+    height: int
+    format: str
+    sha256: str
+    created_at_ns: int = field(default_factory=time.monotonic_ns)
+
+
 class ComposerState:
     """Holds the runtime state shared across all API routes."""
 
@@ -66,6 +81,7 @@ class ComposerState:
         self.cycle_manager: Optional[CycleManager] = None
         self.hmi_server = None
         self.hmi_public_port: int | None = None
+        self.public_api_base_url: str | None = None
         self._on_program_loaded: Optional[Callable[["ComposerState"], None]] = None
         self.event_recorder = EventRecorder(trace_dir=trace_dir)
         self.scene_edit_lock = threading.Lock()
@@ -73,11 +89,125 @@ class ComposerState:
         self._runtime_overrides: dict[str, RuntimeOverrideRecord] = {}
         self._program_tree_hash: str = ""
         self._program_session_generation: int = 0
+        self._scene_snapshot_lock = threading.Lock()
+        self._published_scene_snapshots: dict[str, PublishedSceneSnapshot] = {}
         self.skill_catalog: SkillCatalog = load_skill_catalog(
             default_skills_dir(),
             catalog=self.catalog,
             strict=True,
         )
+
+    def _clear_published_scene_snapshots(self) -> None:
+        with self._scene_snapshot_lock:
+            self._published_scene_snapshots.clear()
+
+    def _prune_published_scene_snapshots(self, *, now_ns: Optional[int] = None) -> None:
+        now = now_ns or time.monotonic_ns()
+        ttl_ns = 10 * 60 * 1_000_000_000
+        max_entries = 64
+        expired_ids = [
+            snapshot_id
+            for snapshot_id, snapshot in self._published_scene_snapshots.items()
+            if now - snapshot.created_at_ns > ttl_ns
+        ]
+        for snapshot_id in expired_ids:
+            self._published_scene_snapshots.pop(snapshot_id, None)
+        if len(self._published_scene_snapshots) <= max_entries:
+            return
+        oldest_first = sorted(
+            self._published_scene_snapshots.values(),
+            key=lambda item: item.created_at_ns,
+        )
+        while len(oldest_first) > max_entries:
+            stale = oldest_first.pop(0)
+            self._published_scene_snapshots.pop(stale.snapshot_id, None)
+
+    def publish_scene_snapshot(
+        self,
+        image_bytes: bytes,
+        *,
+        width: int,
+        height: int,
+        format: str,
+        fetch_base_url: Optional[str] = None,
+        model_base_url: Optional[str] = None,
+    ) -> dict[str, Any]:
+        resolved_fetch_base_url = self.resolve_scene_snapshot_fetch_base_url(
+            fetch_base_url=fetch_base_url,
+            model_base_url=model_base_url,
+        )
+        media_type = "image/png" if format.lower() == "png" else "image/jpeg"
+        snapshot_id = uuid.uuid4().hex
+        snapshot = PublishedSceneSnapshot(
+            snapshot_id=snapshot_id,
+            image_bytes=bytes(image_bytes),
+            media_type=media_type,
+            width=width,
+            height=height,
+            format=format,
+            sha256=hashlib.sha256(image_bytes).hexdigest(),
+        )
+        with self._scene_snapshot_lock:
+            self._prune_published_scene_snapshots()
+            self._published_scene_snapshots[snapshot_id] = snapshot
+            self._prune_published_scene_snapshots()
+        return {
+            "snapshot_id": snapshot_id,
+            "url": f"{resolved_fetch_base_url.rstrip('/')}/api/scene/snapshots/{snapshot_id}",
+            "sha256": snapshot.sha256,
+            "format": format,
+            "width": width,
+            "height": height,
+            "byte_size": len(image_bytes),
+        }
+
+    def resolve_scene_snapshot_fetch_base_url(
+        self,
+        *,
+        fetch_base_url: Optional[str] = None,
+        model_base_url: Optional[str] = None,
+    ) -> str:
+        explicit = (fetch_base_url or "").strip()
+        if explicit:
+            return explicit.rstrip("/")
+
+        public_base = (self.public_api_base_url or "").strip()
+        if model_base_url and public_base:
+            model_parts = urlparse(model_base_url)
+            public_parts = urlparse(public_base)
+            if (
+                model_parts.scheme
+                and model_parts.hostname
+                and public_parts.scheme
+                and public_parts.hostname
+            ):
+                auth_host = model_parts.hostname
+                if model_parts.port is not None:
+                    auth_host = f"{auth_host}:{model_parts.port}"
+                public_host = public_parts.hostname
+                if public_parts.port is not None:
+                    public_host = f"{public_host}:{public_parts.port}"
+                derived = public_parts._replace(
+                    netloc=auth_host,
+                    path="",
+                    params="",
+                    query="",
+                    fragment="",
+                )
+                return derived.geturl().rstrip("/")
+
+        if public_base:
+            return public_base.rstrip("/")
+
+        raise RuntimeError("No scene snapshot fetch base URL is configured")
+
+    def get_published_scene_snapshot(
+        self,
+        snapshot_id: str,
+    ) -> Optional[PublishedSceneSnapshot]:
+        with self._scene_snapshot_lock:
+            self._prune_published_scene_snapshots()
+            return self._published_scene_snapshots.get(snapshot_id)
 
     def _bind_cycle_manager_callbacks(self) -> None:
         if self.cycle_manager is None:
@@ -740,6 +870,10 @@ class ComposerState:
         effective_program: Optional[Program] = None,
     ) -> None:
         """Rebuild runner + cycle manager from already-validated in-memory models."""
+        scene_snapshot_provider = (
+            getattr(self.hmi_server, "get_cached_scene_snapshot", None)
+            or getattr(self.hmi_server, "render_scene", None)
+        )
         if self.cycle_manager is not None:
             self.cycle_manager.reset()
 
@@ -755,7 +889,8 @@ class ComposerState:
             deployment=deployment,
             skill_catalog=self.skill_catalog,
             event_recorder=self.event_recorder,
-            scene_snapshot_provider=getattr(self.hmi_server, "render_scene", None),
+            scene_snapshot_provider=scene_snapshot_provider,
+            scene_snapshot_url_publisher=self.publish_scene_snapshot,
         )
         runner.load()
 
@@ -764,6 +899,7 @@ class ComposerState:
         self.deployment = deployment
         self._update_program_tree_hash()
         self._program_session_generation += 1
+        self._clear_published_scene_snapshots()
         self.cycle_manager = CycleManager(runner, self._kernel)
         self._bind_cycle_manager_callbacks()
 
@@ -824,6 +960,10 @@ class ComposerState:
             self.cycle_manager.reset()
 
         # Load deployment first (if provided)
+        scene_snapshot_provider = (
+            getattr(self.hmi_server, "get_cached_scene_snapshot", None)
+            or getattr(self.hmi_server, "render_scene", None)
+        )
         deployment = self.deployment
         if deployment_path:
             deployment = Deployment(deployment_path)
@@ -841,7 +981,8 @@ class ComposerState:
             deployment_path=deployment_path,
             skill_catalog=self.skill_catalog,
             event_recorder=self.event_recorder,
-            scene_snapshot_provider=getattr(self.hmi_server, "render_scene", None),
+            scene_snapshot_provider=scene_snapshot_provider,
+            scene_snapshot_url_publisher=self.publish_scene_snapshot,
         )
         runner.load()
 
@@ -850,6 +991,7 @@ class ComposerState:
         self.program_source_path = program_path
         self._update_program_tree_hash()
         self._program_session_generation += 1
+        self._clear_published_scene_snapshots()
         self.cycle_manager = CycleManager(runner, self._kernel)
         self._bind_cycle_manager_callbacks()
 

@@ -105,9 +105,8 @@ def _minimal_program(**overrides) -> dict:
             "name": "root",
             "children": [
                 {
-                    "id": "set_key_bool_value",
+                    "id": "reset_trajectories",
                     "name": "noop",
-                    "params": {"key": "done", "value": True},
                 }
             ],
         },

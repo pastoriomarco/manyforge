@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 from collections import deque
-from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
@@ -12,12 +11,117 @@ import threading
 import time
 from typing import Any, Optional
 
+_ALLOWED_EVENT_TYPES = {
+    "cache_hit",
+    "cycle_error",
+    "cycle_state_changed",
+    "delegated_recovery_requested",
+    "execute_completed",
+    "execute_failed",
+    "execute_started",
+    "kernel_error",
+    "kernel_state_transition",
+    "node_status_transition",
+    "pause_completed",
+    "plan_completed",
+    "plan_failed",
+    "plan_started",
+    "stop_completed",
+    "validation_failed",
+    "validation_started",
+}
+_ALLOWED_EVENT_PREFIXES = (
+    "intervention_",
+    "model_call_",
+    "runtime_override_",
+)
+
+
+def _wall_timestamp_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _validate_event_type(event_type: str) -> None:
+    if event_type in _ALLOWED_EVENT_TYPES:
+        return
+    if any(event_type.startswith(prefix) for prefix in _ALLOWED_EVENT_PREFIXES):
+        return
+    raise ValueError(f"Unsupported event type: {event_type}")
+
+
+def _severity_for_event(event_type: str, details: Optional[dict[str, Any]]) -> str:
+    if event_type in {"cycle_error", "kernel_error"}:
+        return "ERROR"
+    if event_type.endswith("_failed"):
+        return "ERROR"
+    if details and details.get("error"):
+        return "ERROR"
+    return "INFO"
+
+
+def _component_for_event(event_type: str) -> str:
+    if event_type.startswith("model_call_"):
+        return "manyforge.model"
+    if event_type.startswith("runtime_override_"):
+        return "manyforge.runtime_override"
+    if event_type.startswith("intervention_"):
+        return "manyforge.intervention"
+    if event_type.startswith("cycle_"):
+        return "manyforge.cycle"
+    if event_type.startswith("kernel_") or event_type in {
+        "plan_started",
+        "plan_completed",
+        "plan_failed",
+        "validation_started",
+        "validation_failed",
+        "execute_started",
+        "execute_completed",
+        "execute_failed",
+        "pause_completed",
+        "stop_completed",
+        "cache_hit",
+    }:
+        return "manyforge.execution"
+    if event_type == "node_status_transition":
+        return "manyforge.behavior_tree"
+    if event_type == "delegated_recovery_requested":
+        return "manyforge.recovery"
+    return "manyforge.runtime"
+
+
+def _message_for_event(
+    event_type: str,
+    *,
+    details: Optional[dict[str, Any]],
+    node: Optional[str],
+    previous_status: Optional[str],
+    current_status: Optional[str],
+) -> str:
+    if event_type == "node_status_transition" and node is not None:
+        return f"{node}: {previous_status or 'UNKNOWN'} -> {current_status or 'UNKNOWN'}"
+    if event_type in {"cycle_state_changed", "kernel_state_transition"} and details:
+        return (
+            f"{event_type}: {details.get('from', 'unknown')} -> "
+            f"{details.get('to', 'unknown')}"
+        )
+    if details and isinstance(details.get("error"), str) and details["error"]:
+        return details["error"]
+    return event_type.replace("_", " ")
+
 
 @dataclass
 class _RunInfo:
     run_id: str
     started_at_ns: int
     file_path: Optional[Path] = None
+
+
+@dataclass(frozen=True)
+class _StoredEvent:
+    event_index: int
+    run_id: Optional[str]
+    event_type: str
+    json_text: str
 
 
 class EventRecorder:
@@ -33,7 +137,7 @@ class EventRecorder:
         if self._trace_dir is not None:
             self._trace_dir.mkdir(parents=True, exist_ok=True)
 
-        self._events: deque[dict[str, Any]] = deque(maxlen=max_events)
+        self._events: deque[_StoredEvent] = deque(maxlen=max_events)
         self._event_index = 0
         self._run_counter = 0
         self._current_run: Optional[_RunInfo] = None
@@ -49,7 +153,7 @@ class EventRecorder:
         self._last_intervention_session_id: Optional[str] = None
         self._last_intervention_event_index: int = 0
 
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
 
     @property
     def current_run_id(self) -> Optional[str]:
@@ -173,10 +277,10 @@ class EventRecorder:
     ) -> list[dict[str, Any]]:
         with self._lock:
             result = [
-                deepcopy(event)
+                self._decode_stored_event(event)
                 for event in self._events
-                if event["event_index"] > event_index
-                and (include_node_transitions or event["type"] != "node_status_transition")
+                if event.event_index > event_index
+                and (include_node_transitions or event.event_type != "node_status_transition")
             ]
         return result
 
@@ -193,7 +297,10 @@ class EventRecorder:
         node_transitions = [
             {
                 "timestamp_ns": event["timestamp_ns"],
+                "timestamp": event.get("timestamp"),
                 "run_id": event.get("run_id"),
+                "program_run_id": event.get("program_run_id"),
+                "intervention_run_id": event.get("intervention_run_id"),
                 "session_id": event.get("session_id"),
                 "session_kind": event.get("session_kind"),
                 "authority_source": event.get("authority_source"),
@@ -252,7 +359,7 @@ class EventRecorder:
         if node_name is not None:
             payload["node_name"] = node_name
         if params is not None:
-            payload["params"] = deepcopy(params)
+            payload["params"] = params
         if activation_state is not None:
             payload["activation_state"] = activation_state
         if base_program_hash is not None:
@@ -313,6 +420,7 @@ class EventRecorder:
         run_id: Optional[str] = None,
         session_id: Optional[str] = None,
         principal_id: Optional[str] = None,
+        parent_run_id: Optional[str] = None,
         execution_mode: Optional[str] = None,
         audit_policy: Any = None,
     ) -> None:
@@ -366,7 +474,7 @@ class EventRecorder:
                     for k, v in argument_values.items()
                 }
             else:
-                payload["argument_values"] = deepcopy(argument_values)
+                payload["argument_values"] = argument_values
 
         # Prompt redaction
         if prompt_text is not None:
@@ -386,7 +494,7 @@ class EventRecorder:
                 payload["response_text"] = response_text
         if response_fields is not None:
             if store_full_responses:
-                payload["response_fields"] = deepcopy(response_fields)
+                payload["response_fields"] = response_fields
             else:
                 # Store field keys only, not values
                 payload["response_field_keys"] = sorted(response_fields.keys())
@@ -404,6 +512,7 @@ class EventRecorder:
             run_id=run_id,
             session_id=session_id,
             principal_id=principal_id,
+            parent_run_id=parent_run_id,
             trigger_node_instance=node_instance,
             execution_mode=effective_mode,
         )
@@ -422,7 +531,7 @@ class EventRecorder:
         """
         with self._lock:
             if run_id is None:
-                events = [deepcopy(event) for event in self._events]
+                events = [self._decode_stored_event(event) for event in self._events]
                 if limit is not None and limit >= 0:
                     return events[-limit:]
                 return events
@@ -436,7 +545,11 @@ class EventRecorder:
                         continue
                     events.append(json.loads(line))
                 return events
-            events = [deepcopy(event) for event in self._events if event.get("run_id") == run_id]
+            events = [
+                self._decode_stored_event(event)
+                for event in self._events
+                if event.run_id == run_id
+            ]
             if limit is not None and limit >= 0:
                 return events[-limit:]
             return events
@@ -662,7 +775,9 @@ class EventRecorder:
         execution_mode: Optional[str] = None,
         timestamp_ns: Optional[int] = None,
     ) -> None:
+        _validate_event_type(event_type)
         timestamp_ns = timestamp_ns or time.monotonic_ns()
+        wall_timestamp = _wall_timestamp_iso()
         with self._lock:
             if run_id is None:
                 run_id = self._current_run.run_id if self._current_run is not None else (
@@ -678,17 +793,33 @@ class EventRecorder:
                 )
 
             self._event_index += 1
+            program_run_id = run_id if (execution_mode in (None, "program") and run_id is not None) else None
+            intervention_run_id = None
+            if execution_mode == "intervention":
+                program_run_id = parent_run_id
+                intervention_run_id = run_id
+
+            details_payload = dict(details) if details else None
             event: dict[str, Any] = {
                 "event_index": self._event_index,
+                "sequence": self._event_index,
                 "timestamp_ns": timestamp_ns,
+                "timestamp": wall_timestamp,
+                "timestamp_wall": wall_timestamp,
                 "run_id": run_id,
+                "program_run_id": program_run_id,
                 "execution_id": execution_id,
                 "type": event_type,
+                "event": event_type,
+                "severity": _severity_for_event(event_type, details_payload),
+                "component": _component_for_event(event_type),
             }
+            if intervention_run_id is not None:
+                event["intervention_run_id"] = intervention_run_id
             if move_id:
                 event["move_id"] = move_id
-            if details:
-                event["details"] = details
+            if details_payload:
+                event["details"] = details_payload
             if session_id is not None:
                 event["session_id"] = session_id
             if session_kind is not None:
@@ -713,9 +844,24 @@ class EventRecorder:
                 event["node"] = node
                 event["from"] = previous_status
                 event["to"] = current_status
+            event["message"] = _message_for_event(
+                event_type,
+                details=details_payload,
+                node=node,
+                previous_status=previous_status,
+                current_status=current_status,
+            )
 
-            self._events.append(deepcopy(event))
-            self._append_jsonl_locked(event)
+            json_text = self._serialize_event(event)
+            self._events.append(
+                _StoredEvent(
+                    event_index=self._event_index,
+                    run_id=run_id,
+                    event_type=event_type,
+                    json_text=json_text,
+                )
+            )
+            self._append_jsonl_locked(run_id=run_id, json_text=json_text)
 
     def _intervention_run_id(self, session) -> str:
         """Return the correlated run_id for an intervention session."""
@@ -726,43 +872,46 @@ class EventRecorder:
         if session is None:
             return
 
-        if session.session_id != self._last_intervention_session_id:
-            self._last_intervention_session_id = session.session_id
-            self._last_intervention_event_index = 0
+        with self._lock:
+            if session.session_id != self._last_intervention_session_id:
+                self._last_intervention_session_id = session.session_id
+                self._last_intervention_event_index = 0
 
-        run_id = self._intervention_run_id(session)
-        new_events = [
-            event
-            for event in session.events
-            if event.get("event_index", 0) > self._last_intervention_event_index
-        ]
-        if not new_events:
-            return
+            run_id = self._intervention_run_id(session)
+            new_events = [
+                event
+                for event in session.events
+                if event.get("event_index", 0) > self._last_intervention_event_index
+            ]
+            if not new_events:
+                return
 
-        for event in new_events:
-            details = dict(event.get("details", {}))
-            details.setdefault("entry_state", session.entry_state)
-            details.setdefault("resume_target", session.resume_target)
-            self._record_event(
-                event_type=f"intervention_{event['type']}",
-                execution_id=self._last_execution_id,
-                details=details,
-                run_id=run_id,
-                session_id=session.session_id,
-                session_kind=session.session_kind,
-                authority_source=session.authority_source,
-                principal_id=getattr(session, "principal_id", None),
-                grant_type=getattr(session, "grant_type", None),
-                parent_run_id=session.parent_run_id,
-                trigger_reason=session.trigger_reason,
-                trigger_node_instance=session.trigger_node_instance,
-                execution_mode="intervention",
-                timestamp_ns=event.get("timestamp_ns"),
-            )
-            self._last_intervention_event_index = max(
-                self._last_intervention_event_index,
-                int(event.get("event_index", 0)),
-            )
+            max_event_index = self._last_intervention_event_index
+            for event in new_events:
+                details = dict(event.get("details", {}))
+                details.setdefault("entry_state", session.entry_state)
+                details.setdefault("resume_target", session.resume_target)
+                self._record_event(
+                    event_type=f"intervention_{event['type']}",
+                    execution_id=self._last_execution_id,
+                    details=details,
+                    run_id=run_id,
+                    session_id=session.session_id,
+                    session_kind=session.session_kind,
+                    authority_source=session.authority_source,
+                    principal_id=getattr(session, "principal_id", None),
+                    grant_type=getattr(session, "grant_type", None),
+                    parent_run_id=session.parent_run_id,
+                    trigger_reason=session.trigger_reason,
+                    trigger_node_instance=session.trigger_node_instance,
+                    execution_mode="intervention",
+                    timestamp_ns=event.get("timestamp_ns"),
+                )
+                max_event_index = max(
+                    max_event_index,
+                    int(event.get("event_index", 0)),
+                )
+            self._last_intervention_event_index = max_event_index
 
     def _start_run(self) -> None:
         now_ns = time.monotonic_ns()
@@ -783,11 +932,18 @@ class EventRecorder:
             return None
         return self._trace_dir / f"{run_id}.events.jsonl"
 
-    def _append_jsonl_locked(self, event: dict[str, Any]) -> None:
-        run_id = event.get("run_id")
+    @staticmethod
+    def _serialize_event(event: dict[str, Any]) -> str:
+        return json.dumps(event, sort_keys=True)
+
+    @staticmethod
+    def _decode_stored_event(event: _StoredEvent) -> dict[str, Any]:
+        return json.loads(event.json_text)
+
+    def _append_jsonl_locked(self, *, run_id: Optional[str], json_text: str) -> None:
         file_path = self._path_for_run(run_id)
         if file_path is None:
             return
         with file_path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(event, sort_keys=True))
+            handle.write(json_text)
             handle.write("\n")

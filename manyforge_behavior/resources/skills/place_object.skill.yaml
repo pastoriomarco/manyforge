@@ -91,7 +91,8 @@ body:
     - id: set_key_bool_value
       name: open_gripper
       params:
-        key: gripper_closed
+        key:
+          key_ref: gripper_closed
         value: false
     - id: detach_object_from_link
       name: detach

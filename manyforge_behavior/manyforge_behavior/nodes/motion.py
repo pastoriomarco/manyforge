@@ -12,7 +12,7 @@ from manyforge_behavior.kernel_client import (
     ExecutionState,
     KernelClient,
 )
-from manyforge_behavior.parameters import BLACKBOARD_REF_RE
+from manyforge_behavior.parameters import resolve_blackboard_value
 
 
 def _rpy_deg_to_xyzw(rpy_deg: list[float]) -> list[float]:
@@ -42,29 +42,6 @@ def _normalize_pose_dict(pose: dict[str, Any] | None) -> dict[str, Any] | None:
     return pose
 
 
-def _resolve_blackboard_reference(
-    blackboard: py_trees.blackboard.Client, value: Any
-) -> Any:
-    """Resolve ${bb:key} references recursively inside motion pose parameters."""
-    if isinstance(value, str):
-        match = BLACKBOARD_REF_RE.match(value)
-        if match is None:
-            return value
-        key = match.group(1)
-        blackboard.register_key(key=key, access=py_trees.common.Access.READ)
-        if not blackboard.exists(key):
-            raise KeyError(f"Missing blackboard key '{key}'")
-        return blackboard.get(key)
-    if isinstance(value, list):
-        return [_resolve_blackboard_reference(blackboard, item) for item in value]
-    if isinstance(value, dict):
-        return {
-            item_key: _resolve_blackboard_reference(blackboard, item_value)
-            for item_key, item_value in value.items()
-        }
-    return value
-
-
 class MoveManipulatorAction(py_trees.behaviour.Behaviour):
     """Execute a motion request through the kernel (plan + validate + execute)."""
 
@@ -80,39 +57,41 @@ class MoveManipulatorAction(py_trees.behaviour.Behaviour):
         self.blackboard.register_key(
             key="kernel", access=py_trees.common.Access.READ
         )
+        for key in (
+            "stop_requested",
+            "velocity_scale",
+            "global_max_tcp_linear_speed_mps",
+        ):
+            self.blackboard.register_key(key=key, access=py_trees.common.Access.READ)
 
     def initialise(self) -> None:
         self._started = False
         self._base_velocity_scale = float(self._params.get("velocity_scale", 1.0))
 
-    def update(self) -> py_trees.common.Status:
-        # Check stop flag — block new motions if stop is requested
+    def _read_optional_blackboard_value(self, key: str) -> Any | None:
         try:
-            stop_bb = py_trees.blackboard.Client(name=self.name + "_stop")
-            stop_bb.register_key(key="stop_requested", access=py_trees.common.Access.READ)
-            if stop_bb.stop_requested:
-                return py_trees.common.Status.RUNNING  # block, don't start new motion
+            return self.blackboard.get(key)
         except (KeyError, AttributeError):
-            pass  # No stop flag on blackboard, continue normally
+            return None
+
+    def update(self) -> py_trees.common.Status:
+        stop_requested = self._read_optional_blackboard_value("stop_requested")
+        if stop_requested:
+            return py_trees.common.Status.RUNNING  # block, don't start new motion
 
         effective_velocity_scale = self._base_velocity_scale
-        try:
-            vs_bb = py_trees.blackboard.Client(name=self.name + "_vs")
-            vs_bb.register_key(key="velocity_scale", access=py_trees.common.Access.READ)
-            bb_velocity_scale = vs_bb.velocity_scale
-            if bb_velocity_scale is not None and 0.0 < bb_velocity_scale <= 1.0:
-                effective_velocity_scale *= float(bb_velocity_scale)
-        except (KeyError, AttributeError):
-            pass
+        bb_velocity_scale = self._read_optional_blackboard_value("velocity_scale")
+        if bb_velocity_scale is not None and 0.0 < bb_velocity_scale <= 1.0:
+            effective_velocity_scale *= float(bb_velocity_scale)
 
         kernel: KernelClient = self.blackboard.kernel
 
         if not self._started:
             try:
-                pose_goal = _resolve_blackboard_reference(
+                pose_goal = resolve_blackboard_value(
                     self.blackboard, self._params.get("pose_goal")
                 )
-                relative_move = _resolve_blackboard_reference(
+                relative_move = resolve_blackboard_value(
                     self.blackboard, self._params.get("relative_move")
                 )
             except (AttributeError, KeyError) as exc:
@@ -212,18 +191,16 @@ class MoveManipulatorAction(py_trees.behaviour.Behaviour):
                 cache_mode=self._params.get("cache_mode", "default"),
             )
 
-            # Clamp per-move TCP speed to global deployment cap
-            try:
-                cap_bb = py_trees.blackboard.Client(name=self.name + "_tcp_cap")
-                cap_bb.register_key(key="global_max_tcp_linear_speed_mps", access=py_trees.common.Access.READ)
-                global_cap = cap_bb.global_max_tcp_linear_speed_mps
-                if global_cap and global_cap > 0:
-                    if request.max_tcp_linear_speed_mps and request.max_tcp_linear_speed_mps > 0:
-                        request.max_tcp_linear_speed_mps = min(request.max_tcp_linear_speed_mps, global_cap)
-                    else:
-                        request.max_tcp_linear_speed_mps = global_cap
-            except (KeyError, AttributeError):
-                pass  # No deployment loaded, no clamping
+            global_cap = self._read_optional_blackboard_value(
+                "global_max_tcp_linear_speed_mps"
+            )
+            if global_cap and global_cap > 0:
+                if request.max_tcp_linear_speed_mps and request.max_tcp_linear_speed_mps > 0:
+                    request.max_tcp_linear_speed_mps = min(
+                        request.max_tcp_linear_speed_mps, global_cap
+                    )
+                else:
+                    request.max_tcp_linear_speed_mps = global_cap
 
             result = kernel.execute(request)
             self._started = True

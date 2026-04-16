@@ -31,6 +31,10 @@ def _write_program(data: dict) -> str:
     return f.name
 
 
+def _raw_blackboard_reference(path: str) -> str:
+    return "$" + "{bb:" + path + "}"
+
+
 def _minimal_program(**overrides) -> dict:
     prog = {
         "api_version": "manyforge.program.v0",
@@ -126,6 +130,126 @@ class TestProgramValidation:
         ]
         path = _write_program(data)
         with pytest.raises(ProgramValidationError, match="Duplicate parameter"):
+            Program(path, catalog)
+        os.unlink(path)
+
+    def test_allows_declared_blackboard_namespaces_and_keys(self, catalog):
+        data = _minimal_program(
+            blackboard={
+                "namespaces": [
+                    {
+                        "id": "selection_context",
+                        "contract": "selection_context_v1",
+                        "prefix": "selection/context",
+                    },
+                ],
+                "keys": [
+                    {
+                        "id": "gripper_closed",
+                        "type": "bool",
+                        "key": "gripper/closed",
+                    },
+                ],
+            },
+        )
+        data["tree"] = {
+            "id": "sequence",
+            "name": "root",
+            "children": [
+                {
+                    "id": "build_scene_selection_context",
+                    "name": "build_selection_context",
+                    "params": {
+                        "selection_request_text": "Select the sphere object.",
+                        "output_key_prefix": {"namespace_ref": "selection_context"},
+                    },
+                },
+                {
+                    "id": "set_key_bool_value",
+                    "name": "mark_gripper_closed",
+                    "params": {
+                        "key": {"key_ref": "gripper_closed"},
+                        "value": True,
+                    },
+                },
+            ],
+        }
+        path = _write_program(data)
+        try:
+            program = Program(path, catalog)
+            assert "selection_context" in program.blackboard_namespaces
+            assert "gripper_closed" in program.blackboard_keys
+        finally:
+            os.unlink(path)
+
+    def test_rejects_undeclared_blackboard_key_when_declarations_exist(self, catalog):
+        data = _minimal_program(
+            blackboard={
+                "keys": [
+                    {
+                        "id": "other_key",
+                        "type": "bool",
+                        "key": "other/key",
+                    },
+                ],
+            },
+        )
+        data["tree"] = {
+            "id": "sequence",
+            "name": "root",
+            "children": [
+                {
+                    "id": "set_key_bool_value",
+                    "name": "mark_gripper_closed",
+                    "params": {
+                        "key": {"key_ref": "gripper_closed"},
+                        "value": True,
+                    },
+                },
+            ],
+        }
+        path = _write_program(data)
+        with pytest.raises(
+            ProgramValidationError,
+            match="key_ref 'gripper_closed' is not declared in program.blackboard.keys",
+        ):
+            Program(path, catalog)
+        os.unlink(path)
+
+    def test_rejects_declared_namespace_contract_mismatch(self, catalog):
+        data = _minimal_program(
+            blackboard={
+                "namespaces": [
+                    {
+                        "id": "selection_context",
+                        "contract": "validated_selection_v1",
+                        "prefix": "selection/context",
+                    },
+                ],
+            },
+        )
+        data["tree"] = {
+            "id": "sequence",
+            "name": "root",
+            "children": [
+                {
+                    "id": "build_scene_selection_context",
+                    "name": "build_selection_context",
+                    "params": {
+                        "selection_request_text": "Select the sphere object.",
+                        "output_key_prefix": {"namespace_ref": "selection_context"},
+                    },
+                },
+            ],
+        }
+        path = _write_program(data)
+        with pytest.raises(
+            ProgramValidationError,
+            match=(
+                "output_key_prefix namespace_ref 'selection_context' is declared as contract "
+                "'validated_selection_v1', expected 'selection_context_v1'"
+            ),
+        ):
             Program(path, catalog)
         os.unlink(path)
 
@@ -229,6 +353,87 @@ class TestProgramValidation:
             Program(path, catalog)
         os.unlink(path)
 
+    def test_rejects_duplicate_output_key_prefixes(self, catalog):
+        data = _minimal_program(
+            blackboard={
+                "namespaces": [
+                    {"id": "shared_output", "contract": "selection_context_v1", "prefix": "shared/output"},
+                ],
+            },
+        )
+        data["tree"] = {
+            "id": "sequence",
+            "name": "root",
+            "children": [
+                {
+                    "id": "build_scene_selection_context",
+                    "name": "build_selection_context_a",
+                    "params": {
+                        "selection_request_text": "Select the sphere object.",
+                        "output_key_prefix": {"namespace_ref": "shared_output"},
+                    },
+                },
+                {
+                    "id": "build_scene_selection_context",
+                    "name": "build_selection_context_b",
+                    "params": {
+                        "selection_request_text": "Select the cube object.",
+                        "output_key_prefix": {"namespace_ref": "shared_output"},
+                    },
+                },
+            ],
+        }
+        path = _write_program(data)
+        with pytest.raises(
+            ProgramValidationError,
+            match="output_key_prefix namespace_ref 'shared_output' is used by multiple producer nodes",
+        ):
+            Program(path, catalog)
+        os.unlink(path)
+
+    def test_rejects_selection_response_prefix_from_wrong_producer_type(self, catalog):
+        data = _minimal_program(
+            blackboard={
+                "namespaces": [
+                    {"id": "selection_context", "contract": "selection_context_v1", "prefix": "selection/context"},
+                    {"id": "validated_selection", "contract": "validated_selection_v1", "prefix": "selection/validated"},
+                ],
+            },
+        )
+        data["tree"] = {
+            "id": "sequence",
+            "name": "root",
+            "children": [
+                {
+                    "id": "build_scene_selection_context",
+                    "name": "build_selection_context",
+                    "params": {
+                        "selection_request_text": "Select the sphere object.",
+                        "output_key_prefix": {"namespace_ref": "selection_context"},
+                    },
+                },
+                {
+                    "id": "validate_scene_selection",
+                    "name": "validate_selected_object",
+                    "params": {
+                        "selection_context_prefix": {"namespace_ref": "selection_context"},
+                        "selection_response_prefix": {"namespace_ref": "selection_context"},
+                        "output_key_prefix": {"namespace_ref": "validated_selection"},
+                    },
+                },
+            ],
+        }
+        path = _write_program(data)
+        with pytest.raises(
+            ProgramValidationError,
+            match=(
+                "selection_response_prefix namespace_ref 'selection_context' is declared as contract "
+                "'selection_context_v1', expected 'query_model_output_v1'"
+            ),
+        ):
+            Program(path, catalog)
+        os.unlink(path)
+
     def test_rejects_out_of_range_parameter_value(self, catalog):
         data = _minimal_program()
         data["tree"] = {
@@ -286,20 +491,52 @@ class TestProgramValidation:
                     "params": {
                         "move_id": "pick_pose",
                         "motion_type": "pose_goal",
-                        "pose_goal": "${bb:perception/grasp_pose}",
+                        "pose_goal": {
+                            "field_ref": {
+                                "namespace": "grasp_plan",
+                                "field": "grasp_pose",
+                            }
+                        },
                     },
+                },
+            ],
+        }
+        data["blackboard"] = {
+            "namespaces": [
+                {
+                    "id": "grasp_plan",
+                    "contract": "query_model_output_v1",
+                    "prefix": "perception/grasp_plan",
+                    "fields": [
+                        {"name": "grasp_pose", "type": "pose"},
+                    ],
                 },
             ],
         }
         path = _write_program(data)
         try:
             program = Program(path, catalog)
-            assert program.tree.children[0].params["pose_goal"] == "${bb:perception/grasp_pose}"
+            assert program.tree.children[0].params["pose_goal"] == {
+                "field_ref": {"namespace": "grasp_plan", "field": "grasp_pose"},
+            }
         finally:
             os.unlink(path)
 
-    def test_allows_relative_move_blackboard_reference_for_motion_nodes(self, catalog):
-        data = _minimal_program()
+    def test_allows_relative_move_field_ref_for_motion_nodes(self, catalog):
+        data = _minimal_program(
+            blackboard={
+                "namespaces": [
+                    {
+                        "id": "approach_pose",
+                        "contract": "pick_plan_v1",
+                        "prefix": "perception/approach",
+                        "fields": [
+                            {"name": "pose", "type": "pose"},
+                        ],
+                    },
+                ],
+            },
+        )
         data["tree"] = {
             "id": "sequence",
             "name": "root",
@@ -313,7 +550,12 @@ class TestProgramValidation:
                         "relative_move": {
                             "target_reference": {
                                 "type": "pose",
-                                "pose": "${bb:perception/approach_pose}",
+                                "pose": {
+                                    "field_ref": {
+                                        "namespace": "approach_pose",
+                                        "field": "pose",
+                                    },
+                                },
                             },
                             "offset": {
                                 "position_m": [0.0, 0.0, 0.1],
@@ -328,9 +570,160 @@ class TestProgramValidation:
         try:
             program = Program(path, catalog)
             relative_move = program.tree.children[0].params["relative_move"]
-            assert relative_move["target_reference"]["pose"] == "${bb:perception/approach_pose}"
+            assert relative_move["target_reference"]["pose"] == {
+                "field_ref": {"namespace": "approach_pose", "field": "pose"}
+            }
         finally:
             os.unlink(path)
+
+    def test_allows_typed_query_model_template_variable_bindings(self, catalog):
+        data = _minimal_program(
+            blackboard={
+                "namespaces": [
+                    {
+                        "id": "selection_context",
+                        "contract": "selection_context_v1",
+                        "prefix": "selection/context",
+                        "fields": [
+                            {"name": "scene_context_json", "type": "string"},
+                        ],
+                    },
+                    {
+                        "id": "object_selection",
+                        "contract": "query_model_output_v1",
+                        "prefix": "selection/output",
+                        "fields": [],
+                    },
+                ],
+                "keys": [
+                    {
+                        "id": "selection_request_text",
+                        "type": "string",
+                        "key": "selection_request_text",
+                    },
+                ],
+            },
+        )
+        data["tree"] = {
+            "id": "sequence",
+            "name": "root",
+            "children": [
+                {
+                    "id": "query_model",
+                    "name": "choose_scene_object",
+                    "params": {
+                        "model_endpoint_alias": "selection_model",
+                        "prompt_template_id": "select_scene_object_v1",
+                        "template_variables": {
+                            "selection_request_text": {
+                                "key_ref": "selection_request_text",
+                            },
+                            "scene_context_json": {
+                                "field_ref": {
+                                    "namespace": "selection_context",
+                                    "field": "scene_context_json",
+                                },
+                            },
+                        },
+                        "output_key_prefix": {
+                            "namespace_ref": "object_selection",
+                        },
+                    },
+                },
+            ],
+        }
+        path = _write_program(data)
+        try:
+            program = Program(path, catalog)
+            assert program.tree.children[0].params["template_variables"] == {
+                "selection_request_text": {"key_ref": "selection_request_text"},
+                "scene_context_json": {
+                    "field_ref": {
+                        "namespace": "selection_context",
+                        "field": "scene_context_json",
+                    }
+                },
+            }
+        finally:
+            os.unlink(path)
+
+    def test_rejects_raw_query_model_template_variable_blackboard_string(self, catalog):
+        data = _minimal_program(
+            blackboard={
+                "namespaces": [
+                    {
+                        "id": "object_selection",
+                        "contract": "query_model_output_v1",
+                        "prefix": "selection/output",
+                        "fields": [],
+                    },
+                ],
+            },
+        )
+        data["tree"] = {
+            "id": "sequence",
+            "name": "root",
+            "children": [
+                {
+                    "id": "query_model",
+                    "name": "choose_scene_object",
+                    "params": {
+                        "model_endpoint_alias": "selection_model",
+                        "prompt_template_id": "select_scene_object_v1",
+                        "template_variables": {
+                            "scene_context_json": _raw_blackboard_reference(
+                                "selection/context/value/scene_context_json"
+                            ),
+                        },
+                        "output_key_prefix": {"namespace_ref": "object_selection"},
+                    },
+                },
+            ],
+        }
+        path = _write_program(data)
+        with pytest.raises(
+            ProgramValidationError,
+            match=(
+                r"template_variables\.scene_context_json must use a key_ref or field_ref "
+                r"binding"
+            ),
+        ):
+            Program(path, catalog)
+        os.unlink(path)
+
+    def test_rejects_relative_move_raw_blackboard_reference_for_motion_nodes(self, catalog):
+        data = _minimal_program()
+        data["tree"] = {
+            "id": "sequence",
+            "name": "root",
+            "children": [
+                {
+                    "id": "move_manipulator_action",
+                    "name": "dynamic_relative_move",
+                    "params": {
+                        "move_id": "pick_pose",
+                        "motion_type": "relative_move",
+                        "relative_move": {
+                            "target_reference": {
+                                "type": "pose",
+                                "pose": _raw_blackboard_reference("perception/approach_pose"),
+                            },
+                            "offset": {
+                                "position_m": [0.0, 0.0, 0.1],
+                                "orientation_rpy_deg": [0.0, 0.0, 0.0],
+                            },
+                        },
+                    },
+                },
+            ],
+        }
+        path = _write_program(data)
+        with pytest.raises(
+            ProgramValidationError,
+            match=r"relative_move\.target_reference\.pose must use a field_ref binding",
+        ):
+            Program(path, catalog)
+        os.unlink(path)
 
 
 # ── compute_program_tree_hash ────────────────────────────────────────────

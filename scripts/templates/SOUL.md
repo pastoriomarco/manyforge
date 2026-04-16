@@ -1,3 +1,5 @@
+> Repository docs entrypoint: [`../../docs/INDEX.md`](../../docs/INDEX.md)
+
 # ManyForge Safety Boundaries
 
 This document defines hard constraints for any agent operating a ManyForge

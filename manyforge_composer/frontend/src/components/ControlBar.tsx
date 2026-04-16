@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useState } from 'react';
+import { useCallback, useState } from 'react';
 import { api } from '../api/client';
 import { useCycleStore } from '../store/cycleStore';
 import { useComposerStore } from '../store/composerStore';
@@ -27,10 +27,18 @@ export function ControlBar() {
   const { edgeStyle, setEdgeStyle } = useComposerStore();
   const {
     nodes,
-    edges,
     flowToTree,
     appliedTree,
     savedTree,
+    programParameters,
+    appliedProgramParameters,
+    savedProgramParameters,
+    blackboardNamespaces,
+    appliedBlackboardNamespaces,
+    savedBlackboardNamespaces,
+    blackboardKeys,
+    appliedBlackboardKeys,
+    savedBlackboardKeys,
     layoutDirection,
     setLayoutDirection,
     autoLayout,
@@ -40,10 +48,9 @@ export function ControlBar() {
     loadProgram,
     fetchProgramInfo,
     fetchTree,
+    validateDraftGraph,
     programInfo,
     runtimeOverrideStatus,
-    activateRuntimeOverrides,
-    clearRuntimeOverrides,
     error: programError,
     loading: programLoading,
   } = useProgramStore();
@@ -63,13 +70,42 @@ export function ControlBar() {
   const [busy, setBusy] = useState(false);
   const [browserSession, setBrowserSession] = useState<BrowserSession | null>(null);
 
-  const draftTree = useMemo(() => flowToTree(), [nodes, edges, flowToTree]);
+  const draftTree = flowToTree();
   const programApplied = signature(draftTree) === signature(appliedTree);
   const programSaved = signature(draftTree) === signature(savedTree);
+  const programParametersApplied =
+    signature(programParameters) === signature(appliedProgramParameters);
+  const programParametersSaved =
+    signature(programParameters) === signature(savedProgramParameters);
+  const blackboardNamespacesApplied =
+    signature(blackboardNamespaces) === signature(appliedBlackboardNamespaces);
+  const blackboardNamespacesSaved =
+    signature(blackboardNamespaces) === signature(savedBlackboardNamespaces);
+  const blackboardKeysApplied =
+    signature(blackboardKeys) === signature(appliedBlackboardKeys);
+  const blackboardKeysSaved =
+    signature(blackboardKeys) === signature(savedBlackboardKeys);
+  const programAppliedMatchesSaved =
+    signature(appliedTree) === signature(savedTree)
+    && signature(appliedProgramParameters) === signature(savedProgramParameters)
+    && signature(appliedBlackboardNamespaces) === signature(savedBlackboardNamespaces)
+    && signature(appliedBlackboardKeys) === signature(savedBlackboardKeys);
   const deploymentApplied = signature(deployment) === signature(appliedDeployment);
   const deploymentSaved = signature(deployment) === signature(savedDeployment);
-  const hasUnappliedChanges = !programApplied || !deploymentApplied;
-  const hasUnsavedChanges = !programSaved || !deploymentSaved;
+  const deploymentAppliedMatchesSaved = signature(appliedDeployment) === signature(savedDeployment);
+  const hasUnappliedChanges =
+    !programApplied
+    || !programParametersApplied
+    || !blackboardNamespacesApplied
+    || !blackboardKeysApplied
+    || !deploymentApplied;
+  const hasUnsavedChanges =
+    !programSaved
+    || !programParametersSaved
+    || !blackboardNamespacesSaved
+    || !blackboardKeysSaved
+    || !deploymentSaved;
+  const hasAppliedUnsavedChanges = !programAppliedMatchesSaved || !deploymentAppliedMatchesSaved;
   const activeError = actionError || error || programError || deploymentError;
 
   const modifiedBadge = hasUnappliedChanges
@@ -78,14 +114,6 @@ export function ControlBar() {
   const savedBadge = hasUnsavedChanges
     ? { label: 'UNSAVED', color: 'bg-amber-700' }
     : { label: 'SAVED', color: 'bg-slate-700' };
-  const runtimeOverrideLocked =
-    state === 'running' ||
-    state === 'direct_control' ||
-    busy ||
-    hasUnappliedChanges ||
-    hasUnsavedChanges;
-  const hasRuntimeOverrides =
-    !!runtimeOverrideStatus && (runtimeOverrideStatus.hasActive || runtimeOverrideStatus.hasStaged);
   const edgeStyleOptions: { value: EdgeStyle; label: string }[] = [
     { value: 'smoothstep', label: 'Orthogonal' },
     { value: 'simplebezier', label: 'Smooth' },
@@ -95,19 +123,47 @@ export function ControlBar() {
   ];
 
   const applyDrafts = useCallback(async () => {
-    const payload: { tree?: TreeNode; deployment?: FullDeployment } = {};
+    const hasRuntimeOverrides = !!runtimeOverrideStatus && (runtimeOverrideStatus.hasActive || runtimeOverrideStatus.hasStaged);
+    const payload: {
+      tree?: TreeNode;
+      deployment?: FullDeployment;
+      programParameters?: typeof programParameters;
+      blackboard?: { namespaces: typeof blackboardNamespaces; keys: typeof blackboardKeys };
+    } = {};
+    const draftGraphError = validateDraftGraph();
+    if (!programApplied && draftGraphError) {
+      throw new Error(draftGraphError);
+    }
     if (!programApplied && draftTree) {
       payload.tree = draftTree;
+    } else if (!programApplied) {
+      throw new Error('Draft tree is empty or invalid');
     }
     if (!deploymentApplied && deployment) {
       payload.deployment = deployment;
     }
-    if (!payload.tree && !payload.deployment) {
+    if (!programParametersApplied) {
+      payload.programParameters = programParameters;
+    }
+    if (!blackboardNamespacesApplied || !blackboardKeysApplied) {
+      payload.blackboard = {
+        namespaces: blackboardNamespaces,
+        keys: blackboardKeys,
+      };
+    }
+    if (!payload.tree && !payload.deployment && !payload.programParameters && !payload.blackboard) {
       return;
     }
 
-    await api.session.apply(payload);
+    await api.session.apply({
+      ...payload,
+      forceDiscardOverrides: hasRuntimeOverrides,
+    });
     if (payload.tree) {
+      setAppliedToDraft();
+    } else if (payload.programParameters) {
+      setAppliedToDraft();
+    } else if (payload.blackboard) {
       setAppliedToDraft();
     }
     if (payload.deployment) {
@@ -118,8 +174,16 @@ export function ControlBar() {
     deploymentApplied,
     draftTree,
     programApplied,
+    programParameters,
+    programParametersApplied,
+    blackboardNamespaces,
+    blackboardNamespacesApplied,
+    blackboardKeys,
+    blackboardKeysApplied,
+    validateDraftGraph,
     setAppliedDeploymentToDraft,
     setAppliedToDraft,
+    runtimeOverrideStatus,
   ]);
 
   const saveDrafts = useCallback(async () => {
@@ -183,9 +247,18 @@ export function ControlBar() {
 
   const handleLoad = useCallback(async () => {
     const hasDraftChanges = hasUnappliedChanges || hasUnsavedChanges;
+    const hasRuntimeOverrides = !!runtimeOverrideStatus && (runtimeOverrideStatus.hasActive || runtimeOverrideStatus.hasStaged);
     if (
       hasDraftChanges &&
       !window.confirm('Discard current draft changes and load another program?')
+    ) {
+      return;
+    }
+    if (
+      hasRuntimeOverrides &&
+      !window.confirm(
+        'Loading a different program will discard active runtime-only patches created by recovery/LLM workflows. Continue?',
+      )
     ) {
       return;
     }
@@ -201,6 +274,7 @@ export function ControlBar() {
     hasUnappliedChanges,
     hasUnsavedChanges,
     programInfo?.sourcePath,
+    runtimeOverrideStatus,
   ]);
 
   const finalizeBrowserSession = useCallback(
@@ -210,9 +284,11 @@ export function ControlBar() {
         setActionError(null);
 
         if (session.intent === 'load') {
+          const hasRuntimeOverrides = !!runtimeOverrideStatus && (runtimeOverrideStatus.hasActive || runtimeOverrideStatus.hasStaged);
           await loadProgram(
             session.programPath,
             session.deploymentPath.trim() === '' ? undefined : session.deploymentPath,
+            hasRuntimeOverrides,
           );
           await Promise.all([fetchProgramInfo(), fetchTree(), fetchDeployment()]);
         } else {
@@ -239,6 +315,7 @@ export function ControlBar() {
       fetchTree,
       loadProgram,
       programInfo,
+      runtimeOverrideStatus,
       saveDeployment,
       saveProgram,
     ],
@@ -300,29 +377,92 @@ export function ControlBar() {
     discardDrafts();
   }, [discardDrafts]);
 
-  const handleActivateOverrides = useCallback(async () => {
+  const handleRevert = useCallback(async () => {
+    const hasRuntimeOverrides = !!runtimeOverrideStatus && (runtimeOverrideStatus.hasActive || runtimeOverrideStatus.hasStaged);
+    if (!hasAppliedUnsavedChanges) {
+      return;
+    }
+    if (
+      !window.confirm(
+        'Revert the applied session back to the last saved program/deployment and discard current draft changes?',
+      )
+    ) {
+      return;
+    }
+    if (
+      hasRuntimeOverrides &&
+      !window.confirm(
+        'Reverting to the saved baseline will also discard active runtime-only patches created by recovery/LLM workflows. Continue?',
+      )
+    ) {
+      return;
+    }
+    const payload: {
+      tree?: TreeNode;
+      deployment?: FullDeployment;
+      programParameters?: typeof programParameters;
+      blackboard?: {
+        namespaces: typeof savedBlackboardNamespaces;
+        keys: typeof savedBlackboardKeys;
+      };
+      forceDiscardOverrides?: boolean;
+    } = {
+      forceDiscardOverrides: hasRuntimeOverrides,
+    };
+    if (!programAppliedMatchesSaved && savedTree) {
+      payload.tree = savedTree;
+    }
+    if (signature(appliedProgramParameters) !== signature(savedProgramParameters)) {
+      payload.programParameters = savedProgramParameters;
+    }
+    if (
+      signature(appliedBlackboardNamespaces) !== signature(savedBlackboardNamespaces)
+      || signature(appliedBlackboardKeys) !== signature(savedBlackboardKeys)
+    ) {
+      payload.blackboard = {
+        namespaces: savedBlackboardNamespaces,
+        keys: savedBlackboardKeys,
+      };
+    }
+    if (!deploymentAppliedMatchesSaved && savedDeployment) {
+      payload.deployment = savedDeployment;
+    }
+    if (!payload.tree && !payload.deployment && !payload.programParameters && !payload.blackboard) {
+      return;
+    }
     try {
       setBusy(true);
       setActionError(null);
-      await activateRuntimeOverrides();
+      await api.session.apply(payload);
+      await Promise.all([
+        payload.tree ? fetchTree() : Promise.resolve(true),
+        payload.deployment ? fetchDeployment() : Promise.resolve(true),
+        payload.tree || payload.programParameters || payload.blackboard
+          ? fetchProgramInfo()
+          : Promise.resolve(true),
+      ]);
     } catch (e) {
       setActionError((e as Error).message);
     } finally {
       setBusy(false);
     }
-  }, [activateRuntimeOverrides]);
-
-  const handleClearOverrides = useCallback(async () => {
-    try {
-      setBusy(true);
-      setActionError(null);
-      await clearRuntimeOverrides();
-    } catch (e) {
-      setActionError((e as Error).message);
-    } finally {
-      setBusy(false);
-    }
-  }, [clearRuntimeOverrides]);
+  }, [
+    deploymentAppliedMatchesSaved,
+    fetchDeployment,
+    fetchProgramInfo,
+    fetchTree,
+    hasAppliedUnsavedChanges,
+    appliedProgramParameters,
+    appliedBlackboardKeys,
+    appliedBlackboardNamespaces,
+    programAppliedMatchesSaved,
+    runtimeOverrideStatus,
+    savedDeployment,
+    savedBlackboardKeys,
+    savedBlackboardNamespaces,
+    savedProgramParameters,
+    savedTree,
+  ]);
 
   const editLocked = state === 'running' || state === 'direct_control' || busy;
   const canSaveAs = (!editLocked && !!programInfo) || (!editLocked && !!deployment);
@@ -364,6 +504,14 @@ export function ControlBar() {
           Apply
         </button>
         <button
+          onClick={handleRevert}
+          disabled={!hasAppliedUnsavedChanges || editLocked}
+          className="px-4 py-1.5 bg-fuchsia-700 hover:bg-fuchsia-600 disabled:bg-gray-600 disabled:cursor-not-allowed rounded text-sm font-medium"
+          title="Restore the applied runtime session to the last saved program/deployment."
+        >
+          Revert
+        </button>
+        <button
           onClick={handleDiscard}
           disabled={!hasUnappliedChanges || editLocked}
           className="px-4 py-1.5 bg-red-700 hover:bg-red-600 disabled:bg-gray-600 disabled:cursor-not-allowed rounded text-sm font-medium"
@@ -391,56 +539,12 @@ export function ControlBar() {
         >
           Load
         </button>
-        <button
-          onClick={handleActivateOverrides}
-          disabled={
-            !runtimeOverrideStatus?.hasStaged ||
-            runtimeOverrideLocked ||
-            !runtimeOverrideStatus.canActivateNow
-          }
-          title={
-            runtimeOverrideStatus?.requiresResetToActivate
-              ? 'Reset the cycle in Viser before activating staged runtime overrides.'
-              : 'Bind staged runtime overrides into the effective runtime tree.'
-          }
-          className="px-4 py-1.5 bg-cyan-700 hover:bg-cyan-600 disabled:bg-gray-600 disabled:cursor-not-allowed rounded text-sm font-medium"
-        >
-          Use Staged
-        </button>
-        <button
-          onClick={handleClearOverrides}
-          disabled={!hasRuntimeOverrides || runtimeOverrideLocked}
-          title="Drop all active and staged runtime overrides."
-          className="px-4 py-1.5 bg-rose-800 hover:bg-rose-700 disabled:bg-gray-600 disabled:cursor-not-allowed rounded text-sm font-medium"
-        >
-          Clear Overrides
-        </button>
         <span className={`px-3 py-1 rounded text-xs font-mono ${modifiedBadge.color}`}>
           {modifiedBadge.label}
         </span>
         <span className={`px-3 py-1 rounded text-xs font-mono ${savedBadge.color}`}>
           {savedBadge.label}
         </span>
-        {runtimeOverrideStatus && !runtimeOverrideStatus.hasActive && !runtimeOverrideStatus.hasStaged && (
-          <span className="px-3 py-1 rounded text-xs font-mono bg-slate-700">
-            RUNTIME BASELINE
-          </span>
-        )}
-        {runtimeOverrideStatus?.hasActive && (
-          <span className="px-3 py-1 rounded text-xs font-mono bg-emerald-700">
-            {runtimeOverrideStatus.activeCount} ACTIVE OVERRIDE{runtimeOverrideStatus.activeCount === 1 ? '' : 'S'}
-          </span>
-        )}
-        {runtimeOverrideStatus?.hasStaged && (
-          <span className="px-3 py-1 rounded text-xs font-mono bg-amber-700 text-black">
-            {runtimeOverrideStatus.stagedCount} STAGED OVERRIDE{runtimeOverrideStatus.stagedCount === 1 ? '' : 'S'}
-          </span>
-        )}
-        {runtimeOverrideStatus?.requiresResetToActivate && (
-          <span className="px-3 py-1 rounded text-xs font-mono bg-red-700">
-            RESET TO ACTIVATE
-          </span>
-        )}
 
         {programLoading && (
           <span className="text-gray-400 text-sm ml-auto">Loading program...</span>

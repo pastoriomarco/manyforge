@@ -42,6 +42,27 @@ scene:
       position_m: [0.40, 0.14, 0.009]
       orientation_rpy_deg: [0.0, 0.0, 0.0]
 
+blackboard:
+  namespaces:
+    - id: pick_target
+      contract: query_model_output_v1
+      prefix: perception/pick_target
+      description: QueryModel target-selection response namespace.
+      fields:
+        - name: pick_left_bin
+          type: bool
+        - name: selected_object_id
+          type: string
+        - name: confidence
+          type: float
+        - name: reason
+          type: string
+  keys:
+    - id: gripper_closed
+      type: bool
+      key: gripper_closed
+      description: Simulated gripper closed/open flag.
+
 tree:
   id: sequence
   name: vision_guided_pick_cycle
@@ -51,7 +72,8 @@ tree:
       params:
         model_endpoint_alias: gemma4_vlm
         prompt_template_id: choose_bin_target_v1
-        output_key_prefix: perception/pick_target
+        output_key_prefix:
+          namespace_ref: pick_target
         include_scene_snapshot: true
         scene_snapshot_width: 640
         scene_snapshot_height: 480
@@ -68,7 +90,10 @@ tree:
             - id: check_key_bool_value
               name: left_was_selected
               params:
-                key: perception/pick_target/fields/pick_left_bin
+                key:
+                  field_ref:
+                    namespace: pick_target
+                    field: pick_left_bin
                 expected_value: true
 
             - id: pick_object
@@ -99,7 +124,10 @@ tree:
             - id: check_key_bool_value
               name: right_was_selected
               params:
-                key: perception/pick_target/fields/pick_left_bin
+                key:
+                  field_ref:
+                    namespace: pick_target
+                    field: pick_left_bin
                 expected_value: false
 
             - id: pick_object

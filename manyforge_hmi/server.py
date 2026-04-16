@@ -15,6 +15,7 @@ from .control_panel import ControlPanel
 from .robot_visualizer import RobotVisualizer
 from .scene_renderer import SceneRenderer
 from .program_panel import ProgramPanel
+from .snapshot_service import SceneSnapshotService
 
 from manyforge_behavior.cycle_manager import CycleManager
 
@@ -103,6 +104,7 @@ class ViserHmiServer:
         self._scene_specs: dict[str, object] = {}
         self._link_viser_paths: dict[str, str] = {}
         self._scene_trace: deque[dict[str, Any]] = deque(maxlen=4096)
+        self._scene_snapshot_service = SceneSnapshotService(self._render_scene_sync)
         self._rebuild_link_viser_paths()
 
     def load_program(self, program) -> None:
@@ -402,6 +404,7 @@ class ViserHmiServer:
         if self._update_thread:
             self._update_thread.join(timeout=1.0)
             self._update_thread = None
+        self._scene_snapshot_service.shutdown()
         self._viser_server.stop()
 
     @property
@@ -434,7 +437,7 @@ class ViserHmiServer:
         """Access the RobotVisualizer if created."""
         return self._robot_visualizer
 
-    def render_scene(
+    def _render_scene_sync(
         self,
         width: int = 640,
         height: int = 480,
@@ -465,3 +468,25 @@ class ViserHmiServer:
         except Exception:
             logger.warning("Failed to render scene", exc_info=True)
             return None
+
+    def render_scene(
+        self,
+        width: int = 640,
+        height: int = 480,
+        format: str = "jpeg",
+    ) -> Optional[bytes]:
+        """Blocking one-shot render for debug/manual API routes."""
+        return self._render_scene_sync(width=width, height=height, format=format)
+
+    def get_cached_scene_snapshot(
+        self,
+        width: int = 640,
+        height: int = 480,
+        format: str = "jpeg",
+    ) -> Optional[bytes]:
+        """Return a cached scene snapshot without blocking the caller."""
+        return self._scene_snapshot_service.get_snapshot(
+            width=width,
+            height=height,
+            format=format,
+        )

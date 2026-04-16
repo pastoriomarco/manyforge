@@ -20,10 +20,15 @@ import math
 import os
 import re
 import time
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from typing import Any, Callable, Optional
 
 import py_trees
+
+from manyforge_behavior.blackboard_namespace import (
+    read_blackboard_binding_value,
+    write_namespace_bundle,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +44,12 @@ _MODEL_EXECUTOR: Optional[ThreadPoolExecutor] = None
 # Timeout is set per-request via the ``timeout`` kwarg on ``client.post()``.
 _HTTP_CLIENT: Optional["httpx.Client"] = None
 _HTTP_CLIENT_LOCK = __import__("threading").Lock()
+_SCENE_SNAPSHOT_WAIT_TIMEOUT_S = 2.0
+_PARSE_RETRY_SUFFIX = (
+    "\n\nThe previous response did not satisfy the required structured output contract. "
+    "Return ONLY valid structured output for this request. Do not include markdown "
+    "fences, prose, or any extra text."
+)
 
 
 def _get_executor() -> ThreadPoolExecutor:
@@ -80,6 +91,7 @@ def _call_model(
     output_schema: Optional[dict] = None,
     response_tool: Optional[dict[str, Any]] = None,
     scene_snapshot_bytes: Optional[bytes] = None,
+    scene_snapshot_url: Optional[str] = None,
     scene_snapshot_format: str = "jpeg",
 ) -> dict[str, Any]:
     """Execute a model call synchronously (runs in thread pool).
@@ -102,7 +114,7 @@ def _call_model(
         media_type = "image/png" if scene_snapshot_format.lower() == "png" else "image/jpeg"
         image_b64 = (
             base64.b64encode(scene_snapshot_bytes).decode("ascii")
-            if scene_snapshot_bytes is not None
+            if scene_snapshot_bytes is not None and scene_snapshot_url is None
             else None
         )
 
@@ -110,7 +122,7 @@ def _call_model(
             url = (base_url or "https://api.openai.com/v1") + "/chat/completions"
             if api_key:
                 headers["Authorization"] = f"Bearer {api_key}"
-            if image_b64 is not None:
+            if image_b64 is not None or scene_snapshot_url is not None:
                 body["messages"] = [{
                     "role": "user",
                     "content": [
@@ -118,7 +130,11 @@ def _call_model(
                         {
                             "type": "image_url",
                             "image_url": {
-                                "url": f"data:{media_type};base64,{image_b64}",
+                                "url": (
+                                    scene_snapshot_url
+                                    if scene_snapshot_url is not None
+                                    else f"data:{media_type};base64,{image_b64}"
+                                ),
                             },
                         },
                     ],
@@ -139,6 +155,10 @@ def _call_model(
             headers["anthropic-version"] = "2023-06-01"
             if response_tool is not None:
                 raise ValueError("response_tool is only supported for openai/local providers")
+            if scene_snapshot_url is not None:
+                raise ValueError(
+                    "scene_snapshot_url transport is only supported for openai/local providers"
+                )
             if image_b64 is not None:
                 body["messages"] = [{
                     "role": "user",
@@ -335,11 +355,13 @@ class QueryModelNode(py_trees.behaviour.Behaviour):
         *,
         model_endpoint_alias: str,
         prompt_template_id: str,
-        template_variables: Optional[dict[str, str]] = None,
+        template_variables: Optional[dict[str, Any]] = None,
         output_key_prefix: str,
         timeout_s: float = 30.0,
         min_confidence: float = 0.0,
+        retry_on_parse_failure: bool = False,
         include_scene_snapshot: bool = False,
+        scene_snapshot_transport: str = "inline_data_url",
         scene_snapshot_width: int = 640,
         scene_snapshot_height: int = 480,
         scene_snapshot_format: str = "jpeg",
@@ -351,10 +373,14 @@ class QueryModelNode(py_trees.behaviour.Behaviour):
         scene_snapshot_provider: Optional[
             Callable[[int, int, str], Optional[bytes]]
         ] = None,
+        scene_snapshot_url_publisher: Optional[
+            Callable[..., Optional[dict[str, Any]]]
+        ] = None,
         # Execution context — injected by runner for audit correlation
         run_id: Optional[str] = None,
         session_id: Optional[str] = None,
         principal_id: Optional[str] = None,
+        parent_run_id: Optional[str] = None,
     ):
         super().__init__(name=name)
         self._model_endpoint_alias = model_endpoint_alias
@@ -363,7 +389,9 @@ class QueryModelNode(py_trees.behaviour.Behaviour):
         self._output_key_prefix = output_key_prefix
         self._timeout_s = timeout_s
         self._min_confidence = min_confidence
+        self._retry_on_parse_failure = retry_on_parse_failure
         self._include_scene_snapshot = include_scene_snapshot
+        self._scene_snapshot_transport = scene_snapshot_transport
         self._scene_snapshot_width = scene_snapshot_width
         self._scene_snapshot_height = scene_snapshot_height
         self._scene_snapshot_format = scene_snapshot_format
@@ -372,40 +400,48 @@ class QueryModelNode(py_trees.behaviour.Behaviour):
         self._event_recorder = event_recorder
         self._audit_policy = audit_policy
         self._scene_snapshot_provider = scene_snapshot_provider
+        self._scene_snapshot_url_publisher = scene_snapshot_url_publisher
         self._run_id = run_id
         self._session_id = session_id
         self._principal_id = principal_id
+        self._parent_run_id = parent_run_id
         self._future: Optional[Future] = None
         self._call_start_ns: int = 0
         self._resolved_prompt: str = ""
         self._resolved_output_schema: Optional[dict[str, Any]] = None
         self._resolved_response_tool: Optional[dict[str, Any]] = None
+        self._resolved_template_vars_raw: dict[str, Any] = {}
+        self._awaiting_scene_snapshot = False
+        self._scene_snapshot_wait_started_ns: int = 0
+        self._skip_snapshot_retry_once = False
+        self._parse_retry_attempted = False
+        self._call_generation = 0
+        self._active_call_generation: Optional[int] = None
+        self._terminated_call_generation: Optional[int] = None
+        self._last_scene_snapshot_bytes: Optional[bytes] = None
+        self._last_scene_snapshot_url: Optional[str] = None
+        self._last_scene_snapshot_metadata: Optional[dict[str, Any]] = None
         self._bb = py_trees.blackboard.Client(name=f"query_model_{name}")
         self._output_keys_registered = False
 
     def _ensure_output_keys(self) -> None:
         if self._output_keys_registered:
             return
-        prefix = self._output_key_prefix
-        for key in (
-            f"{prefix}/response",
-            f"{prefix}/confidence",
-            f"{prefix}/timestamp_ns",
-            f"{prefix}/model_version",
-            f"{prefix}/status",
-            f"{prefix}/field_keys",
-        ):
-            self._bb.register_key(
-                key=key,
-                access=py_trees.common.Access.WRITE,
-            )
-        # Register read access for template variables
-        for bb_key in self._template_variables.values():
-            self._bb.register_key(
-                key=bb_key,
-                access=py_trees.common.Access.READ,
-            )
+        self._bb.register_key(
+            key=self._output_key_prefix,
+            access=py_trees.common.Access.WRITE,
+        )
+        self._bb.register_key(
+            key="stop_requested",
+            access=py_trees.common.Access.READ,
+        )
         self._output_keys_registered = True
+
+    def _stop_requested(self) -> bool:
+        try:
+            return bool(self._bb.get("stop_requested"))
+        except KeyError:
+            return False
 
     def _event_context(self) -> dict[str, Any]:
         """Return execution context kwargs for record_model_event calls."""
@@ -416,7 +452,188 @@ class QueryModelNode(py_trees.behaviour.Behaviour):
             ctx["session_id"] = self._session_id
         if self._principal_id is not None:
             ctx["principal_id"] = self._principal_id
+        if self._parent_run_id is not None:
+            ctx["parent_run_id"] = self._parent_run_id
         return ctx
+
+    def _maybe_prepare_scene_snapshot(
+        self,
+    ) -> tuple[Optional[bytes], Optional[str], Optional[dict[str, Any]], Optional[str], bool]:
+        """Try to prepare an optional scene snapshot without blocking for availability."""
+        if not self._include_scene_snapshot:
+            return None, None, None, None, True
+
+        provider = self._scene_snapshot_provider
+        if provider is None:
+            return (
+                None,
+                None,
+                None,
+                "scene snapshot requested but no HMI render provider configured",
+                False,
+            )
+
+        try:
+            scene_snapshot_bytes = provider(
+                self._scene_snapshot_width,
+                self._scene_snapshot_height,
+                self._scene_snapshot_format,
+            )
+        except Exception as exc:
+            return (
+                None,
+                None,
+                None,
+                f"scene_snapshot_unavailable: {exc}",
+                False,
+            )
+        if scene_snapshot_bytes is None:
+            return None, None, None, None, False
+
+        scene_snapshot_metadata: dict[str, Any] = {
+            "format": self._scene_snapshot_format,
+            "width": self._scene_snapshot_width,
+            "height": self._scene_snapshot_height,
+            "sha256": hashlib.sha256(scene_snapshot_bytes).hexdigest(),
+            "byte_size": len(scene_snapshot_bytes),
+            "transport": self._scene_snapshot_transport,
+        }
+        scene_snapshot_url: Optional[str] = None
+        if self._scene_snapshot_transport == "http_url":
+            publisher = self._scene_snapshot_url_publisher
+            if publisher is None:
+                return (
+                    None,
+                    None,
+                    None,
+                    "scene_snapshot_url_publisher_unavailable",
+                    False,
+                )
+            try:
+                published = publisher(
+                    scene_snapshot_bytes,
+                    self._scene_snapshot_width,
+                    self._scene_snapshot_height,
+                    self._scene_snapshot_format,
+                    fetch_base_url=getattr(self._endpoint, "image_fetch_base_url", None),
+                    model_base_url=getattr(self._endpoint, "base_url", None),
+                )
+            except TypeError:
+                published = publisher(
+                    scene_snapshot_bytes,
+                    self._scene_snapshot_width,
+                    self._scene_snapshot_height,
+                    self._scene_snapshot_format,
+                )
+            except Exception as exc:
+                return None, None, None, f"scene_snapshot_publish_failed: {exc}", False
+            if not isinstance(published, dict):
+                return None, None, None, "scene_snapshot_publish_failed", False
+            scene_snapshot_url = str(published.get("url", "") or "")
+            if not scene_snapshot_url:
+                return None, None, None, "scene_snapshot_publish_failed", False
+            scene_snapshot_metadata["url"] = scene_snapshot_url
+            if published.get("snapshot_id"):
+                scene_snapshot_metadata["snapshot_id"] = published["snapshot_id"]
+        elif self._scene_snapshot_transport != "inline_data_url":
+            return (
+                None,
+                None,
+                None,
+                f"unsupported_scene_snapshot_transport: {self._scene_snapshot_transport}",
+                False,
+            )
+
+        return scene_snapshot_bytes, scene_snapshot_url, scene_snapshot_metadata, None, True
+
+    def _submit_model_call(
+        self,
+        *,
+        scene_snapshot_bytes: Optional[bytes],
+        scene_snapshot_url: Optional[str],
+        scene_snapshot_metadata: Optional[dict[str, Any]],
+        prompt_override: Optional[str] = None,
+    ) -> None:
+        self._call_start_ns = time.monotonic_ns()
+        self._call_generation += 1
+        self._active_call_generation = self._call_generation
+        self._last_scene_snapshot_bytes = scene_snapshot_bytes
+        self._last_scene_snapshot_url = scene_snapshot_url
+        self._last_scene_snapshot_metadata = (
+            dict(scene_snapshot_metadata)
+            if scene_snapshot_metadata is not None
+            else None
+        )
+        prompt_text = prompt_override if prompt_override is not None else self._resolved_prompt
+        if self._event_recorder is not None:
+            audit_arguments = dict(self._resolved_template_vars_raw)
+            if scene_snapshot_metadata is not None:
+                audit_arguments["_scene_snapshot"] = scene_snapshot_metadata
+            self._event_recorder.record_model_event(
+                action="started",
+                model_endpoint_alias=self._model_endpoint_alias,
+                prompt_template_id=self._prompt_template_id,
+                prompt_template_hash=self._template.content_hash,
+                prompt_text=prompt_text,
+                argument_keys=list(audit_arguments.keys()),
+                argument_values=audit_arguments,
+                node_instance=self.name,
+                audit_policy=self._audit_policy,
+                **self._event_context(),
+            )
+
+        self._future = _get_executor().submit(
+            _call_model,
+            provider=self._endpoint.provider,
+            model_id=self._endpoint.model_id,
+            base_url=self._endpoint.base_url,
+            api_key_env=self._endpoint.api_key_env,
+            prompt=prompt_text,
+            max_tokens=self._endpoint.max_tokens,
+            timeout_s=self._timeout_s,
+            output_schema=self._resolved_output_schema,
+            response_tool=self._resolved_response_tool,
+            scene_snapshot_bytes=scene_snapshot_bytes,
+            scene_snapshot_url=scene_snapshot_url,
+            scene_snapshot_format=self._scene_snapshot_format,
+        )
+
+    def _advance_preflight(self) -> py_trees.common.Status | None:
+        scene_snapshot_bytes, scene_snapshot_url, scene_snapshot_metadata, error, ready = (
+            self._maybe_prepare_scene_snapshot()
+        )
+        if error is not None:
+            self.feedback_message = error
+            self._write_namespace_output(value=None, status="failed")
+            return py_trees.common.Status.FAILURE
+        if not ready:
+            if self._scene_snapshot_wait_started_ns == 0:
+                self._scene_snapshot_wait_started_ns = time.monotonic_ns()
+            elapsed_s = (
+                time.monotonic_ns() - self._scene_snapshot_wait_started_ns
+            ) / 1_000_000_000
+            if elapsed_s >= _SCENE_SNAPSHOT_WAIT_TIMEOUT_S:
+                self.feedback_message = (
+                    f"scene_snapshot_unavailable_after_{_SCENE_SNAPSHOT_WAIT_TIMEOUT_S:.1f}s"
+                )
+                self._write_namespace_output(value=None, status="failed")
+                return py_trees.common.Status.FAILURE
+            self._awaiting_scene_snapshot = True
+            self.feedback_message = "waiting_for_scene_snapshot"
+            self._write_namespace_output(
+                value=None,
+                status="waiting_for_scene_snapshot",
+            )
+            return py_trees.common.Status.RUNNING
+
+        self._awaiting_scene_snapshot = False
+        self.feedback_message = ""
+        self._submit_model_call(
+            scene_snapshot_bytes=scene_snapshot_bytes,
+            scene_snapshot_url=scene_snapshot_url,
+            scene_snapshot_metadata=scene_snapshot_metadata,
+        )
+        return None
 
     def initialise(self) -> None:
         self._ensure_output_keys()
@@ -424,6 +641,16 @@ class QueryModelNode(py_trees.behaviour.Behaviour):
         self._call_start_ns = 0
         self._resolved_output_schema = None
         self._resolved_response_tool = None
+        self._resolved_template_vars_raw = {}
+        self._awaiting_scene_snapshot = False
+        self._scene_snapshot_wait_started_ns = 0
+        self._skip_snapshot_retry_once = False
+        self._parse_retry_attempted = False
+        self._terminated_call_generation = None
+        self._active_call_generation = None
+        self._last_scene_snapshot_bytes = None
+        self._last_scene_snapshot_url = None
+        self._last_scene_snapshot_metadata = None
 
         if self._endpoint is None or self._template is None:
             logger.error(
@@ -434,9 +661,9 @@ class QueryModelNode(py_trees.behaviour.Behaviour):
         # Resolve template variables from blackboard
         resolved_vars_raw: dict[str, Any] = {}
         resolved_vars_prompt: dict[str, str] = {}
-        for var_name, bb_key in self._template_variables.items():
+        for var_name, binding in self._template_variables.items():
             try:
-                value = self._bb.get(bb_key)
+                value = read_blackboard_binding_value(self._bb, binding)
                 resolved_vars_raw[var_name] = value
                 resolved_vars_prompt[var_name] = _stringify_template_value(value)
             except KeyError:
@@ -462,98 +689,131 @@ class QueryModelNode(py_trees.behaviour.Behaviour):
             self._template.template_text,
             resolved_vars_prompt,
         )
+        self._resolved_template_vars_raw = dict(resolved_vars_raw)
+        preflight_status = self._advance_preflight()
+        if preflight_status == py_trees.common.Status.RUNNING:
+            self._skip_snapshot_retry_once = True
 
-        scene_snapshot_bytes: Optional[bytes] = None
-        scene_snapshot_metadata: Optional[dict[str, Any]] = None
-        if self._include_scene_snapshot:
-            provider = self._scene_snapshot_provider
-            if provider is None:
-                logger.error(
-                    "%s: scene snapshot requested but no HMI render provider configured",
-                    self.name,
-                )
-                return
-            scene_snapshot_bytes = provider(
-                self._scene_snapshot_width,
-                self._scene_snapshot_height,
-                self._scene_snapshot_format,
-            )
-            if scene_snapshot_bytes is None:
-                logger.error(
-                    "%s: scene snapshot requested but no render is available",
-                    self.name,
-                )
-                return
-            scene_snapshot_metadata = {
-                "format": self._scene_snapshot_format,
-                "width": self._scene_snapshot_width,
-                "height": self._scene_snapshot_height,
-                "sha256": hashlib.sha256(scene_snapshot_bytes).hexdigest(),
-            }
+    def _record_failed_model_event(
+        self,
+        *,
+        result: Optional[dict[str, Any]],
+        error: str,
+        latency_ms: float,
+    ) -> None:
+        if self._event_recorder is None:
+            return
+        self._event_recorder.record_model_event(
+            action="failed",
+            model_endpoint_alias=self._model_endpoint_alias,
+            prompt_template_id=self._prompt_template_id,
+            prompt_template_hash=self._template.content_hash if self._template else None,
+            response_text=result.get("text") if isinstance(result, dict) else None,
+            error=error,
+            latency_ms=latency_ms,
+            node_instance=self.name,
+            audit_policy=self._audit_policy,
+            **self._event_context(),
+        )
 
-        # Record started event
-        self._call_start_ns = time.monotonic_ns()
-        if self._event_recorder is not None:
-            audit_arguments = dict(resolved_vars_raw)
-            if scene_snapshot_metadata is not None:
-                audit_arguments["_scene_snapshot"] = scene_snapshot_metadata
-            self._event_recorder.record_model_event(
-                action="started",
-                model_endpoint_alias=self._model_endpoint_alias,
-                prompt_template_id=self._prompt_template_id,
-                prompt_template_hash=self._template.content_hash,
-                prompt_text=self._resolved_prompt,
-                argument_keys=list(audit_arguments.keys()),
-                argument_values=audit_arguments,
-                node_instance=self.name,
-                audit_policy=self._audit_policy,
-                **self._event_context(),
-            )
+    def _retry_parse_failure(
+        self,
+        *,
+        result: dict[str, Any],
+        latency_ms: float,
+        reason: str,
+    ) -> bool:
+        if not self._retry_on_parse_failure or self._parse_retry_attempted:
+            return False
+        self._parse_retry_attempted = True
+        logger.warning("%s: %s; retrying once with repair prompt", self.name, reason)
+        self._record_failed_model_event(
+            result=result,
+            error=f"{reason}; retrying_once",
+            latency_ms=latency_ms,
+        )
+        self.feedback_message = f"{reason}; retrying_once"
+        self._submit_model_call(
+            scene_snapshot_bytes=self._last_scene_snapshot_bytes,
+            scene_snapshot_url=self._last_scene_snapshot_url,
+            scene_snapshot_metadata=self._last_scene_snapshot_metadata,
+            prompt_override=self._resolved_prompt + _PARSE_RETRY_SUFFIX,
+        )
+        return True
 
-        # Submit to thread pool
-        self._future = _get_executor().submit(
-            _call_model,
-            provider=self._endpoint.provider,
-            model_id=self._endpoint.model_id,
-            base_url=self._endpoint.base_url,
-            api_key_env=self._endpoint.api_key_env,
-            prompt=self._resolved_prompt,
-            max_tokens=self._endpoint.max_tokens,
-            timeout_s=self._timeout_s,
-            output_schema=self._resolved_output_schema,
-            response_tool=self._resolved_response_tool,
-            scene_snapshot_bytes=scene_snapshot_bytes,
-            scene_snapshot_format=self._scene_snapshot_format,
+    def _write_namespace_output(self, *, value: Any, status: str, **meta: Any) -> None:
+        write_namespace_bundle(
+            self._bb,
+            self._output_key_prefix,
+            value=value,
+            status=status,
+            **meta,
         )
 
     def update(self) -> py_trees.common.Status:
+        if self._stop_requested():
+            self.feedback_message = "stop_requested"
+            if self._future is not None and not self._future.done():
+                self._future.cancel()
+            self._future = None
+            self._active_call_generation = None
+            self._write_namespace_output(value=None, status="failed")
+            return py_trees.common.Status.FAILURE
+
         if self._future is None:
-            # Configuration error in initialise
-            self._write_output("status", "error")
+            if self._awaiting_scene_snapshot:
+                if self._skip_snapshot_retry_once:
+                    self._skip_snapshot_retry_once = False
+                    return py_trees.common.Status.RUNNING
+                status = self._advance_preflight()
+                if status is not None:
+                    return status
+            if self._future is None:
+                # Configuration or preflight error in initialise/update
+                self._write_namespace_output(value=None, status="error")
+                return py_trees.common.Status.FAILURE
+
+        if self._future is None:
+            self._write_namespace_output(value=None, status="error")
             return py_trees.common.Status.FAILURE
 
         if not self._future.done():
             return py_trees.common.Status.RUNNING
 
         latency_ms = (time.monotonic_ns() - self._call_start_ns) / 1_000_000
+        active_generation = self._active_call_generation
 
         try:
+            if self._future.cancelled():
+                self.feedback_message = "model_call_cancelled"
+                self._write_namespace_output(value=None, status="failed")
+                return py_trees.common.Status.FAILURE
             result = self._future.result()
+        except CancelledError:
+            self.feedback_message = "model_call_cancelled"
+            self._write_namespace_output(value=None, status="failed")
+            return py_trees.common.Status.FAILURE
         except Exception as exc:
             logger.error("%s: model call failed: %s", self.name, exc)
-            self._write_output("status", "failed")
-            if self._event_recorder is not None:
-                self._event_recorder.record_model_event(
-                    action="failed",
-                    model_endpoint_alias=self._model_endpoint_alias,
-                    prompt_template_id=self._prompt_template_id,
-                    prompt_template_hash=self._template.content_hash if self._template else None,
-                    error=str(exc),
-                    latency_ms=latency_ms,
-                    node_instance=self.name,
-                    audit_policy=self._audit_policy,
-                    **self._event_context(),
-                )
+            self._write_namespace_output(value=None, status="failed")
+            self._record_failed_model_event(
+                result=None,
+                error=str(exc),
+                latency_ms=latency_ms,
+            )
+            return py_trees.common.Status.FAILURE
+
+        if (
+            active_generation is None
+            or self._active_call_generation != active_generation
+            or self._terminated_call_generation == active_generation
+        ):
+            logger.info(
+                "%s: dropping stale model result for generation %s",
+                self.name,
+                active_generation,
+            )
+            self._future = None
             return py_trees.common.Status.FAILURE
 
         # Validate response against output contract if provided
@@ -570,38 +830,32 @@ class QueryModelNode(py_trees.behaviour.Behaviour):
                     f"got {actual_tool_name!r}"
                 )
                 logger.error("%s: %s", self.name, self.feedback_message)
-                self._write_output("status", "tool_call_failed")
-                if self._event_recorder is not None:
-                    self._event_recorder.record_model_event(
-                        action="failed",
-                        model_endpoint_alias=self._model_endpoint_alias,
-                        prompt_template_id=self._prompt_template_id,
-                        prompt_template_hash=self._template.content_hash,
-                        response_text=result.get("text"),
-                        error=self.feedback_message,
-                        latency_ms=latency_ms,
-                        node_instance=self.name,
-                        audit_policy=self._audit_policy,
-                        **self._event_context(),
-                    )
+                self._write_namespace_output(value=None, status="tool_call_failed")
+                self._record_failed_model_event(
+                    result=result,
+                    error=self.feedback_message,
+                    latency_ms=latency_ms,
+                )
                 return py_trees.common.Status.FAILURE
             if parsed is None:
                 self.feedback_message = "tool_call_arguments_not_valid_json"
                 logger.error("%s: %s", self.name, self.feedback_message)
-                self._write_output("status", "tool_call_parse_failed")
-                if self._event_recorder is not None:
-                    self._event_recorder.record_model_event(
-                        action="failed",
-                        model_endpoint_alias=self._model_endpoint_alias,
-                        prompt_template_id=self._prompt_template_id,
-                        prompt_template_hash=self._template.content_hash,
-                        response_text=result.get("text"),
-                        error=self.feedback_message,
-                        latency_ms=latency_ms,
-                        node_instance=self.name,
-                        audit_policy=self._audit_policy,
-                        **self._event_context(),
+                if self._retry_parse_failure(
+                    result=result,
+                    latency_ms=latency_ms,
+                    reason=self.feedback_message,
+                ):
+                    self._write_namespace_output(
+                        value=None,
+                        status="retrying_after_parse_failure",
                     )
+                    return py_trees.common.Status.RUNNING
+                self._write_namespace_output(value=None, status="tool_call_parse_failed")
+                self._record_failed_model_event(
+                    result=result,
+                    error=self.feedback_message,
+                    latency_ms=latency_ms,
+                )
                 return py_trees.common.Status.FAILURE
             try:
                 parameters_schema = self._resolved_response_tool.get("parameters")
@@ -614,20 +868,12 @@ class QueryModelNode(py_trees.behaviour.Behaviour):
                     self.name,
                     exc,
                 )
-                self._write_output("status", "validation_failed")
-                if self._event_recorder is not None:
-                    self._event_recorder.record_model_event(
-                        action="failed",
-                        model_endpoint_alias=self._model_endpoint_alias,
-                        prompt_template_id=self._prompt_template_id,
-                        prompt_template_hash=self._template.content_hash,
-                        response_text=result.get("text"),
-                        error=f"tool_schema_validation: {exc}",
-                        latency_ms=latency_ms,
-                        node_instance=self.name,
-                        audit_policy=self._audit_policy,
-                        **self._event_context(),
-                    )
+                self._write_namespace_output(value=None, status="validation_failed")
+                self._record_failed_model_event(
+                    result=result,
+                    error=f"tool_schema_validation: {exc}",
+                    latency_ms=latency_ms,
+                )
                 return py_trees.common.Status.FAILURE
         elif self._resolved_output_schema is not None and parsed is not None:
             try:
@@ -639,20 +885,12 @@ class QueryModelNode(py_trees.behaviour.Behaviour):
                     self.name,
                     exc,
                 )
-                self._write_output("status", "validation_failed")
-                if self._event_recorder is not None:
-                    self._event_recorder.record_model_event(
-                        action="failed",
-                        model_endpoint_alias=self._model_endpoint_alias,
-                        prompt_template_id=self._prompt_template_id,
-                        prompt_template_hash=self._template.content_hash,
-                        response_text=result.get("text"),
-                        error=f"schema_validation: {exc}",
-                        latency_ms=latency_ms,
-                        node_instance=self.name,
-                        audit_policy=self._audit_policy,
-                        **self._event_context(),
-                    )
+                self._write_namespace_output(value=None, status="validation_failed")
+                self._record_failed_model_event(
+                    result=result,
+                    error=f"schema_validation: {exc}",
+                    latency_ms=latency_ms,
+                )
                 return py_trees.common.Status.FAILURE
         elif self._resolved_output_schema is not None and parsed is None:
             self.feedback_message = "response is not valid JSON"
@@ -660,32 +898,52 @@ class QueryModelNode(py_trees.behaviour.Behaviour):
                 "%s: response is not valid JSON but output_schema requires it",
                 self.name,
             )
-            self._write_output("status", "parse_failed")
-            if self._event_recorder is not None:
-                self._event_recorder.record_model_event(
-                    action="failed",
-                    model_endpoint_alias=self._model_endpoint_alias,
-                    prompt_template_id=self._prompt_template_id,
-                    prompt_template_hash=self._template.content_hash,
-                    response_text=result.get("text"),
-                    error="response is not valid JSON",
-                    latency_ms=latency_ms,
-                    node_instance=self.name,
-                    audit_policy=self._audit_policy,
-                    **self._event_context(),
+            if self._retry_parse_failure(
+                result=result,
+                latency_ms=latency_ms,
+                reason=self.feedback_message,
+            ):
+                self._write_namespace_output(
+                    value=None,
+                    status="retrying_after_parse_failure",
                 )
+                return py_trees.common.Status.RUNNING
+            self._write_namespace_output(value=None, status="parse_failed")
+            self._record_failed_model_event(
+                result=result,
+                error="response is not valid JSON",
+                latency_ms=latency_ms,
+            )
             return py_trees.common.Status.FAILURE
 
-        # Atomic blackboard writes
+        if (
+            self._stop_requested()
+            or self._terminated_call_generation == active_generation
+            or self._active_call_generation != active_generation
+        ):
+            self.feedback_message = "model_call_result_discarded"
+            self._future = None
+            return py_trees.common.Status.FAILURE
+
         output = parsed if parsed is not None else result.get("text", "")
-        self._write_output("response", output)
-        self._write_output("timestamp_ns", time.monotonic_ns())
-        self._write_output("model_version", result.get("model_version", ""))
-        self._write_output("status", "succeeded")
-        self._write_output_fields(parsed)
-        # Confidence comes from the validated payload when available.
         confidence = self._derive_confidence(parsed)
-        self._write_output("confidence", confidence)
+        write_status = "succeeded" if confidence >= self._min_confidence else "failed"
+        try:
+            self._write_namespace_output(
+                value=output,
+                status=write_status,
+                confidence=confidence,
+                model_version=result.get("model_version", ""),
+            )
+        except Exception as exc:
+            self.feedback_message = f"output_commit_failed: {exc}"
+            logger.error("%s: %s", self.name, self.feedback_message)
+            self._record_failed_model_event(
+                result=result,
+                error=self.feedback_message,
+                latency_ms=latency_ms,
+            )
+            return py_trees.common.Status.FAILURE
 
         # Record completed event
         if self._event_recorder is not None:
@@ -695,7 +953,7 @@ class QueryModelNode(py_trees.behaviour.Behaviour):
                 prompt_template_id=self._prompt_template_id,
                 prompt_template_hash=self._template.content_hash if self._template else None,
                 response_text=result.get("text"),
-                response_fields=parsed,
+                response_fields=parsed if isinstance(parsed, dict) else None,
                 model_version=result.get("model_version"),
                 latency_ms=latency_ms,
                 token_counts=result.get("usage"),
@@ -727,6 +985,8 @@ class QueryModelNode(py_trees.behaviour.Behaviour):
         return py_trees.common.Status.SUCCESS
 
     def terminate(self, new_status: py_trees.common.Status) -> None:
+        if self._active_call_generation is not None:
+            self._terminated_call_generation = self._active_call_generation
         if (
             self._future is not None
             and not self._future.done()
@@ -734,62 +994,7 @@ class QueryModelNode(py_trees.behaviour.Behaviour):
         ):
             self._future.cancel()
             self._future = None
-
-    def _write_output(self, key: str, value: Any) -> None:
-        try:
-            self._bb.set(f"{self._output_key_prefix}/{key}", value)
-        except Exception:
-            logger.debug(
-                "%s: failed to write blackboard key %s/%s",
-                self.name,
-                self._output_key_prefix,
-                key,
-            )
-
-    def _write_output_fields(self, parsed: Any) -> None:
-        previous_keys = self._read_previous_field_keys()
-        field_items: list[tuple[str, Any]] = []
-        if isinstance(parsed, (dict, list)):
-            field_items = list(self._flatten_output_fields(
-                f"{self._output_key_prefix}/fields",
-                parsed,
-            ))
-
-        next_keys = [key for key, _ in field_items]
-        for key in previous_keys:
-            if key not in next_keys:
-                py_trees.blackboard.Blackboard.unset(key)
-
-        for key, value in field_items:
-            py_trees.blackboard.Blackboard.set(key, value)
-
-        self._write_output("field_keys", next_keys)
-
-    def _read_previous_field_keys(self) -> list[str]:
-        try:
-            value = self._bb.get(f"{self._output_key_prefix}/field_keys")
-        except KeyError:
-            return []
-        if isinstance(value, list):
-            return [str(item) for item in value]
-        return []
-
-    def _flatten_output_fields(
-        self,
-        prefix: str,
-        value: Any,
-    ) -> list[tuple[str, Any]]:
-        if isinstance(value, dict):
-            items: list[tuple[str, Any]] = [(prefix, value)]
-            for key, child in value.items():
-                items.extend(self._flatten_output_fields(f"{prefix}/{key}", child))
-            return items
-        if isinstance(value, list):
-            items: list[tuple[str, Any]] = [(prefix, value)]
-            for index, child in enumerate(value):
-                items.extend(self._flatten_output_fields(f"{prefix}/{index}", child))
-            return items
-        return [(prefix, value)]
+            self._active_call_generation = None
 
     def _derive_confidence(self, parsed: Any) -> float:
         if isinstance(parsed, dict):

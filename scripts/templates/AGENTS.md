@@ -1,3 +1,5 @@
+> Repository docs entrypoint: [`../../docs/INDEX.md`](../../docs/INDEX.md)
+
 # ManyForge Agent Reference
 
 You are interacting with **ManyForge**, a behavior-tree execution engine for

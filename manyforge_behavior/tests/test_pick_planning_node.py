@@ -5,6 +5,12 @@ from __future__ import annotations
 import py_trees
 import pytest
 
+from manyforge_behavior.blackboard_namespace import (
+    make_runtime_field_ref,
+    read_namespace_bundle,
+    read_namespace_value,
+    write_namespace_bundle,
+)
 from manyforge_behavior.kernel_client import (
     MockKernelClient,
     MotionPreviewResult,
@@ -39,6 +45,18 @@ def _tick_node(node: py_trees.behaviour.Behaviour) -> py_trees.common.Status:
     return node.update()
 
 
+def _tick_tree_until_done(
+    node: py_trees.behaviour.Behaviour, max_ticks: int = 30
+) -> py_trees.common.Status:
+    tree = py_trees.trees.BehaviourTree(root=node)
+    tree.setup()
+    for _ in range(max_ticks):
+        tree.tick()
+        if tree.root.status != py_trees.common.Status.RUNNING:
+            return tree.root.status
+    return tree.root.status
+
+
 def _seed_scene(kernel: MockKernelClient) -> None:
     requests = [
         SceneEditRequest(
@@ -69,17 +87,22 @@ class TestPlanPickSequenceNode:
     def test_plans_pick_from_backend_scene(self, kernel, bb_with_kernel):
         _seed_scene(kernel)
         bb_with_kernel.register_key(
-            key="perception/shape_target/fields/selected_object_id",
+            key="perception/shape_target",
             access=py_trees.common.Access.WRITE,
         )
-        bb_with_kernel.set(
-            "perception/shape_target/fields/selected_object_id",
-            "sphere_part",
+        write_namespace_bundle(
+            bb_with_kernel,
+            "perception/shape_target",
+            value={"selected_object_id": "sphere_part"},
+            status="selected",
         )
 
         node = PlanPickSequenceNode(
             name="plan_pick",
-            selected_object_id="${bb:perception/shape_target/fields/selected_object_id}",
+            selected_object_id=make_runtime_field_ref(
+                "perception/shape_target",
+                "selected_object_id",
+            ),
             output_key_prefix="planning/pick_plan",
             object_source="backend_scene",
             image_source="none",
@@ -110,34 +133,16 @@ class TestPlanPickSequenceNode:
 
         assert status == py_trees.common.Status.SUCCESS
         reader = py_trees.blackboard.Client(name="reader")
-        reader.register_key(
-            key="planning/pick_plan/fields/selected_object_id",
-            access=py_trees.common.Access.READ,
-        )
-        reader.register_key(
-            key="planning/pick_plan/fields/approach_pose",
-            access=py_trees.common.Access.READ,
-        )
-        reader.register_key(
-            key="planning/pick_plan/fields/pick_pose",
-            access=py_trees.common.Access.READ,
-        )
-        reader.register_key(
-            key="planning/pick_plan/fields/planning_score",
-            access=py_trees.common.Access.READ,
-        )
-        reader.register_key(
-            key="planning/pick_plan/status",
-            access=py_trees.common.Access.READ,
-        )
-        assert reader.get("planning/pick_plan/fields/selected_object_id") == "sphere_part"
-        approach_pose = reader.get("planning/pick_plan/fields/approach_pose")
-        pick_pose = reader.get("planning/pick_plan/fields/pick_pose")
+        plan_bundle = read_namespace_bundle(reader, "planning/pick_plan")
+        plan_value = plan_bundle["value"]
+        assert plan_value["selected_object_id"] == "sphere_part"
+        approach_pose = plan_value["approach_pose"]
+        pick_pose = plan_value["pick_pose"]
         assert approach_pose["position_m"][2] > pick_pose["position_m"][2]
         assert pick_pose["position_m"] == pytest.approx([0.40, -0.14, 0.059], abs=1e-6)
         assert pick_pose["orientation_xyzw"] == pytest.approx([1.0, 0.0, 0.0, 0.0], abs=1e-6)
-        assert reader.get("planning/pick_plan/fields/planning_score") == pytest.approx(3.06)
-        assert reader.get("planning/pick_plan/status") == "planned"
+        assert plan_value["planning_score"] == pytest.approx(3.06)
+        assert plan_bundle["meta"]["status"] == "planned"
         metrics = kernel.get_metrics()
         assert metrics["plans_succeeded"] == 3
         assert metrics["validations_passed"] == 3
@@ -160,16 +165,41 @@ class TestPlanPickSequenceNode:
 
         assert status == py_trees.common.Status.FAILURE
         reader = py_trees.blackboard.Client(name="reader")
-        reader.register_key(
-            key="planning/pick_plan/fields/outcome",
-            access=py_trees.common.Access.READ,
+        plan_bundle = read_namespace_bundle(reader, "planning/pick_plan")
+        assert plan_bundle["value"]["outcome"] == "image_source_unavailable"
+        assert plan_bundle["meta"]["status"] == "failed"
+
+    def test_hmi_snapshot_waits_for_cached_frame_without_blocking(self, kernel, bb_with_kernel):
+        _seed_scene(kernel)
+        renders = [None, b"fake-image"]
+        node = PlanPickSequenceNode(
+            name="plan_pick",
+            selected_object_id="sphere_part",
+            output_key_prefix="planning/pick_plan",
+            object_source="backend_scene",
+            image_source="hmi_snapshot",
+            robot_id="ur5",
+            group_id="arm",
+            base_frame="base_link",
+            tcp_frame="tool0",
+            pick_offset_envelope={
+                "position_min_m": [0.0, 0.0, 0.04],
+                "position_max_m": [0.0, 0.0, 0.04],
+                "orientation_rpy_min_deg": [0.0, 0.0, 0.0],
+                "orientation_rpy_max_deg": [0.0, 0.0, 0.0],
+            },
+            approach_offset_envelope={
+                "position_min_m": [0.0, 0.0, 0.05],
+                "position_max_m": [0.0, 0.0, 0.05],
+                "orientation_rpy_min_deg": [0.0, 0.0, 0.0],
+                "orientation_rpy_max_deg": [0.0, 0.0, 0.0],
+            },
+            scene_snapshot_provider=lambda width, height, format: renders.pop(0),
         )
-        reader.register_key(
-            key="planning/pick_plan/status",
-            access=py_trees.common.Access.READ,
-        )
-        assert reader.get("planning/pick_plan/fields/outcome") == "image_source_unavailable"
-        assert reader.get("planning/pick_plan/status") == "failed"
+
+        status = _tick_tree_until_done(node)
+
+        assert status == py_trees.common.Status.SUCCESS
 
     def test_unknown_object_fails_closed(self, kernel, bb_with_kernel):
         node = PlanPickSequenceNode(
@@ -188,11 +218,7 @@ class TestPlanPickSequenceNode:
 
         assert status == py_trees.common.Status.FAILURE
         reader = py_trees.blackboard.Client(name="reader")
-        reader.register_key(
-            key="planning/pick_plan/fields/outcome",
-            access=py_trees.common.Access.READ,
-        )
-        assert reader.get("planning/pick_plan/fields/outcome") == "object_not_found"
+        assert read_namespace_value(reader, "planning/pick_plan")["outcome"] == "object_not_found"
 
     def test_invalid_pick_offset_envelope_fails_closed(self, kernel, bb_with_kernel):
         _seed_scene(kernel)
@@ -218,19 +244,9 @@ class TestPlanPickSequenceNode:
 
         assert status == py_trees.common.Status.FAILURE
         reader = py_trees.blackboard.Client(name="reader")
-        reader.register_key(
-            key="planning/pick_plan/fields/outcome",
-            access=py_trees.common.Access.READ,
-        )
-        reader.register_key(
-            key="planning/pick_plan/status",
-            access=py_trees.common.Access.READ,
-        )
-        assert (
-            reader.get("planning/pick_plan/fields/outcome")
-            == "invalid_pick_offset_envelope"
-        )
-        assert reader.get("planning/pick_plan/status") == "failed"
+        plan_bundle = read_namespace_bundle(reader, "planning/pick_plan")
+        assert plan_bundle["value"]["outcome"] == "invalid_pick_offset_envelope"
+        assert plan_bundle["meta"]["status"] == "failed"
 
     def test_start_state_collision_surfaces_detailed_failure(self, kernel, bb_with_kernel):
         class StartCollisionKernel(MockKernelClient):
@@ -263,15 +279,6 @@ class TestPlanPickSequenceNode:
 
         assert status == py_trees.common.Status.FAILURE
         reader = py_trees.blackboard.Client(name="reader")
-        reader.register_key(
-            key="planning/pick_plan/fields/outcome",
-            access=py_trees.common.Access.READ,
-        )
-        reader.register_key(
-            key="planning/pick_plan/fields/failure_detail",
-            access=py_trees.common.Access.READ,
-        )
-        assert reader.get("planning/pick_plan/fields/outcome") == "start_state_in_collision"
-        assert "start_state_in_collision=true" in reader.get(
-            "planning/pick_plan/fields/failure_detail"
-        )
+        plan_value = read_namespace_value(reader, "planning/pick_plan")
+        assert plan_value["outcome"] == "start_state_in_collision"
+        assert "start_state_in_collision=true" in plan_value["failure_detail"]

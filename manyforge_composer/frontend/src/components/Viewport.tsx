@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useState } from 'react';
+import { useCallback, useState } from 'react';
 import type { PointerEvent as ReactPointerEvent } from 'react';
 import { TreeCanvas } from './TreeCanvas';
 import { PropertyPanel } from './PropertyPanel';
@@ -27,13 +27,11 @@ export function Viewport() {
   const [propertyCollapsed, setPropertyCollapsed] = useState(false);
   const [activeResize, setActiveResize] = useState<'properties' | 'viser' | null>(null);
 
-  const programNodes = useProgramStore((state) => state.nodes);
-  const programEdges = useProgramStore((state) => state.edges);
   const flowToTree = useProgramStore((state) => state.flowToTree);
   const appliedTree = useProgramStore((state) => state.appliedTree);
   const deployment = useDeploymentStore((state) => state.deployment);
   const appliedDeployment = useDeploymentStore((state) => state.appliedDeployment);
-  const draftTree = useMemo(() => flowToTree(), [flowToTree, programEdges, programNodes]);
+  const draftTree = flowToTree();
   const hasUnappliedChanges =
     signature(draftTree) !== signature(appliedTree) ||
     signature(deployment) !== signature(appliedDeployment);

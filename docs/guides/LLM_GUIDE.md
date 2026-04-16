@@ -1,10 +1,12 @@
+> Docs entrypoint: [`../INDEX.md`](../INDEX.md)
+
 # ManyForge LLM Composition Guide
 
 Machine-readable guide for LLM agents composing and operating ManyForge robot
 programs. Each pattern references an executable example or integration test.
 
 > **MCP alternative**: All endpoints below are also available as MCP tools
-> via `python -m manyforge_composer --mcp`. See [`MCP_SCHEMA.md`](MCP_SCHEMA.md)
+> via `python -m manyforge_composer --mcp`. See [`../reference/MCP_SCHEMA.md`](../reference/MCP_SCHEMA.md)
 > for the tool interface contract.
 
 ---
@@ -105,6 +107,8 @@ Current override rules:
 - Runtime overrides are parameter patches on a specific node instance name, not
   arbitrary tree rewrites.
 - They are allowed only in `IDLE` and `DIRECT_CONTROL`.
+- They are reserved for agent/recovery/runtime workflows and are not exposed as
+  standard user-facing Composer toolbar actions.
 - `STOPPED` may hold staged overrides, but they cannot take effect until reset.
 - Active runtime overrides change what `GET /api/program/tree` returns and what
   the runner/HMI execute, but they do not silently modify the saved artifact.

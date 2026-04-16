@@ -26,6 +26,9 @@ def create_catalog_router(state: ComposerState) -> APIRouter:
                     constraints=param.constraints,
                     parameterizable=param.parameterizable,
                     uiEditor=param.ui_editor,
+                    blackboardRole=param.blackboard_role,
+                    blackboardContract=param.blackboard_contract,
+                    blackboardValueType=param.blackboard_value_type,
                     description=param.description,
                 ).model_dump(by_alias=True))
             entries.append(CatalogEntryResponse(
@@ -65,6 +68,9 @@ def create_catalog_router(state: ComposerState) -> APIRouter:
                 constraints=param.constraints,
                 parameterizable=param.parameterizable,
                 uiEditor=param.ui_editor,
+                blackboardRole=param.blackboard_role,
+                blackboardContract=param.blackboard_contract,
+                blackboardValueType=param.blackboard_value_type,
                 description=param.description,
             ).model_dump(by_alias=True))
         

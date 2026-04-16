@@ -3,11 +3,17 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Optional
+from typing import Any
+
+import py_trees
+
+from manyforge_behavior.blackboard_namespace import (
+    RuntimeFieldRef,
+    read_blackboard_binding_value,
+)
 
 
 PARAM_REF_RE = re.compile(r"^\$\{param:([^}]+)\}$")
-BLACKBOARD_REF_RE = re.compile(r"^\$\{bb:([^}]+)\}$")
 
 
 class ParameterResolver:
@@ -16,7 +22,7 @@ class ParameterResolver:
     def __init__(
         self,
         program_params: dict[str, Any],
-        overrides: Optional[dict[str, Any]] = None,
+        overrides: dict[str, Any] | None = None,
     ):
         self._defaults = dict(program_params)
         self._overrides = dict(overrides) if overrides else {}
@@ -50,3 +56,22 @@ class ParameterResolver:
         if isinstance(value, dict):
             return {k: self._resolve_recursive(v) for k, v in value.items()}
         return value
+
+
+def resolve_blackboard_value(
+    blackboard: py_trees.blackboard.Client,
+    value: Any,
+) -> Any:
+    """Resolve typed runtime blackboard bindings recursively."""
+    if isinstance(value, RuntimeFieldRef):
+        return read_blackboard_binding_value(blackboard, value)
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return [resolve_blackboard_value(blackboard, item) for item in value]
+    if isinstance(value, dict):
+        return {
+            item_key: resolve_blackboard_value(blackboard, item_value)
+            for item_key, item_value in value.items()
+        }
+    return value

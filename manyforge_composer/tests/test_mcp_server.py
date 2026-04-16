@@ -10,6 +10,8 @@ from pathlib import Path
 import pytest
 import yaml
 
+pytest.importorskip("fastapi")
+
 from manyforge_behavior.cycle_manager import CycleState
 from manyforge_behavior.kernel_client import MockKernelClient
 from manyforge_composer.backend.mcp_server import create_mcp_server
@@ -575,6 +577,47 @@ class TestIntervention:
         result = _call(mcp, "manyforge_intervention", {"action": "execute"})
         assert "error" in result
 
+    def test_intervention_rejects_invalid_principal_id_format(self):
+        state = _make_state()
+        state.load_program(_PROGRAM_PATH, _DEPLOYMENT_PATH)
+        mcp = create_mcp_server(state)
+        result = _call(mcp, "manyforge_intervention", {
+            "action": "execute",
+            "tree": {
+                "id": "timer",
+                "name": "test_wait",
+                "params": {"duration_s": 0.01},
+                "children": [],
+            },
+            "session_kind": "manual_intervention",
+            "authority_source": "human",
+            "principal_id": "bad\x00principal",
+            "approval_mode": "human_approved",
+        })
+        assert "error" in result
+        assert "principal_id must be" in result["error"]
+
+    def test_intervention_rejects_invalid_trigger_reason(self):
+        state = _make_state()
+        state.load_program(_PROGRAM_PATH, _DEPLOYMENT_PATH)
+        mcp = create_mcp_server(state)
+        result = _call(mcp, "manyforge_intervention", {
+            "action": "execute",
+            "tree": {
+                "id": "timer",
+                "name": "test_wait",
+                "params": {"duration_s": 0.01},
+                "children": [],
+            },
+            "session_kind": "manual_intervention",
+            "authority_source": "human",
+            "principal_id": "human:test-operator",
+            "approval_mode": "human_approved",
+            "trigger_reason": "made_up_reason",
+        })
+        assert "error" in result
+        assert "trigger_reason must be one of" in result["error"]
+
     def test_intervention_abort_no_session(self):
         state = _make_state()
         state.load_program(_PROGRAM_PATH, _DEPLOYMENT_PATH)
@@ -651,7 +694,7 @@ class TestIntervention:
             "tree": {
                 "id": "set_key_bool_value",
                 "name": "publish_detection",
-                "params": {"key": "detected_ok", "value": True},
+                "params": {"key": {"key_ref": "detected_ok"}, "value": True},
                 "children": [],
             },
             "session_kind": "manual_intervention",

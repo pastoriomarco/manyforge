@@ -1,3 +1,5 @@
+> Docs entrypoint: [`../INDEX.md`](../INDEX.md)
+
 # Platform Requirements for Industrial ManyForge Integration
 
 This document describes the concrete platform changes needed in OpenShell,

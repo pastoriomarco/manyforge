@@ -9,6 +9,7 @@
 #   ./scripts/demo-shape-pick.sh
 #   ./scripts/demo-shape-pick.sh --requested-shape cube
 #   ./scripts/demo-shape-pick.sh --selection-request "Select the object on the left"
+#   ./scripts/demo-shape-pick.sh --selection-image-mode http
 #   ./scripts/demo-shape-pick.sh --api-port 9010 --hmi-port 8082
 #   ./scripts/demo-shape-pick.sh --model-base-url http://172.17.0.1:8000/v1
 #   ./scripts/demo-shape-pick.sh --model-id gemma-4-E4B-it
@@ -31,6 +32,7 @@ MODEL_ID=gemma-4-E4B-it
 REQUESTED_SHAPE=sphere
 SELECTION_REQUEST=""
 BOOTSTRAP_MODE=auto
+SELECTION_IMAGE_MODE=text
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -58,6 +60,10 @@ while [[ $# -gt 0 ]]; do
       SELECTION_REQUEST="$2"
       shift 2
       ;;
+    --selection-image-mode)
+      SELECTION_IMAGE_MODE="$2"
+      shift 2
+      ;;
     --skip-bootstrap)
       BOOTSTRAP_MODE=skip
       shift
@@ -82,6 +88,11 @@ if [[ "$REQUESTED_SHAPE" != "sphere" && "$REQUESTED_SHAPE" != "cube" ]]; then
   exit 2
 fi
 
+if [[ "$SELECTION_IMAGE_MODE" != "text" && "$SELECTION_IMAGE_MODE" != "inline" && "$SELECTION_IMAGE_MODE" != "http" ]]; then
+  echo "selection image mode must be one of: text, inline, http" >&2
+  exit 2
+fi
+
 if [[ -z "$SELECTION_REQUEST" ]]; then
   SELECTION_REQUEST="Select the ${REQUESTED_SHAPE} object."
 fi
@@ -91,6 +102,7 @@ echo "Program:         $PROGRAM"
 echo "Deployment:      $DEPLOY"
 echo "Requested shape: $REQUESTED_SHAPE"
 echo "Selection req:   $SELECTION_REQUEST"
+echo "Image mode:      $SELECTION_IMAGE_MODE"
 echo "API port:        $API_PORT"
 echo "HMI port:        $HMI_PORT"
 echo "Model base URL:  $MODEL_BASE_URL"
@@ -106,6 +118,7 @@ exec docker compose run --rm \
   -e MANYFORGE_MODEL_ID="$MODEL_ID" \
   -e MANYFORGE_REQUESTED_SHAPE="$REQUESTED_SHAPE" \
   -e MANYFORGE_SELECTION_REQUEST="$SELECTION_REQUEST" \
+  -e MANYFORGE_SELECTION_IMAGE_MODE="$SELECTION_IMAGE_MODE" \
   -e MANYFORGE_BOOTSTRAP_MODE="$BOOTSTRAP_MODE" \
   -e MANYFORGE_API_PORT="$API_PORT" \
   -e MANYFORGE_HMI_PORT="$HMI_PORT" \
@@ -169,9 +182,21 @@ with open(deploy_dst, "w", encoding="utf-8") as f:
 with open(program_src, "r", encoding="utf-8") as f:
     program = yaml.safe_load(f)
 
-for param in program.get("parameters", []):
-    if param.get("name") == "selection_request_text":
-        param["default"] = "${MANYFORGE_SELECTION_REQUEST}"
+for child in program.get("tree", {}).get("children", []):
+    if child.get("id") == "build_scene_selection_context" and child.get("name") == "build_selection_context":
+        params = child.setdefault("params", {})
+        params["selection_request_text"] = "${MANYFORGE_SELECTION_REQUEST}"
+    if child.get("id") == "query_model" and child.get("name") == "choose_scene_object":
+        params = child.setdefault("params", {})
+        image_mode = "${MANYFORGE_SELECTION_IMAGE_MODE}"
+        if image_mode == "text":
+            params["include_scene_snapshot"] = False
+            params.pop("scene_snapshot_transport", None)
+        else:
+            params["include_scene_snapshot"] = True
+            params["scene_snapshot_transport"] = (
+                "http_url" if image_mode == "http" else "inline_data_url"
+            )
 
 with open(program_dst, "w", encoding="utf-8") as f:
     yaml.safe_dump(program, f, sort_keys=False)

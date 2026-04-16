@@ -1,6 +1,14 @@
 import { create } from 'zustand';
 import { api } from '../api/client';
-import type { TreeNode, ProgramInfo, RuntimeOverrideStatus } from '../types/api';
+import type {
+  TreeNode,
+  ProgramInfo,
+  ProgramParameter,
+  ProgramBlackboard,
+  BlackboardNamespace,
+  BlackboardKey,
+  RuntimeOverrideStatus,
+} from '../types/api';
 import { Position } from '@xyflow/react';
 import type { Node, Edge } from '@xyflow/react';
 
@@ -27,15 +35,25 @@ interface ProgramStore {
   edges: Edge[];
   appliedTree: TreeNode | null;
   savedTree: TreeNode | null;
+  programParameters: ProgramParameter[];
+  appliedProgramParameters: ProgramParameter[];
+  savedProgramParameters: ProgramParameter[];
+  blackboardNamespaces: BlackboardNamespace[];
+  appliedBlackboardNamespaces: BlackboardNamespace[];
+  savedBlackboardNamespaces: BlackboardNamespace[];
+  blackboardKeys: BlackboardKey[];
+  appliedBlackboardKeys: BlackboardKey[];
+  savedBlackboardKeys: BlackboardKey[];
   layoutDirection: LayoutDirection;
   layoutRevision: number;
   selectedNodeId: string | null;
   runtimeOverrideStatus: RuntimeOverrideStatus | null;
   loading: boolean;
   error: string | null;
+  setError: (error: string | null) => void;
   isDirty: boolean;
   
-  loadProgram: (path: string, deploymentPath?: string) => Promise<void>;
+  loadProgram: (path: string, deploymentPath?: string, forceDiscardOverrides?: boolean) => Promise<void>;
   fetchProgramInfo: () => Promise<boolean>;
   fetchTree: () => Promise<boolean>;
   fetchRuntimeOverrideStatus: () => Promise<RuntimeOverrideStatus | null>;
@@ -55,6 +73,15 @@ interface ProgramStore {
   selectNode: (id: string | null) => void;
   updateNodeParams: (nodeId: string, params: Record<string, unknown>) => void;
   updateNodeLabel: (nodeId: string, label: string) => void;
+  updateProgramParameter: (name: string, patch: Partial<ProgramParameter>) => void;
+  addProgramParameter: (parameter: ProgramParameter) => void;
+  deleteProgramParameter: (name: string) => void;
+  updateBlackboardNamespace: (id: string, patch: Partial<BlackboardNamespace>) => void;
+  addBlackboardNamespace: (namespace: BlackboardNamespace) => void;
+  deleteBlackboardNamespace: (id: string) => void;
+  updateBlackboardKey: (id: string, patch: Partial<BlackboardKey>) => void;
+  addBlackboardKey: (key: BlackboardKey) => void;
+  deleteBlackboardKey: (id: string) => void;
   flowToTree: () => TreeNode | null;
   setLayoutDirection: (direction: LayoutDirection) => void;
   autoLayout: () => void;
@@ -64,6 +91,19 @@ interface ProgramStore {
   activateRuntimeOverrides: () => Promise<void>;
   clearRuntimeOverrides: () => Promise<void>;
   saveProgram: (path: string) => Promise<void>;
+  validateDraftGraph: () => string | null;
+}
+
+interface FlowTreeBuildResult {
+  tree: TreeNode | null;
+  error: string | null;
+}
+
+function cloneBlackboard(blackboard?: ProgramBlackboard | null): ProgramBlackboard {
+  return {
+    namespaces: structuredClone(blackboard?.namespaces ?? []),
+    keys: structuredClone(blackboard?.keys ?? []),
+  };
 }
 
 function getNodeWidth(node: Node): number {
@@ -102,6 +142,11 @@ function getNodeHandlePositions(direction: LayoutDirection): Pick<Node, 'sourceP
         sourcePosition: Position.Right,
         targetPosition: Position.Left,
       };
+}
+
+function getNodeLabel(node: Node): string {
+  const data = node.data as { label?: string; catalogId?: string };
+  return String(data.label || data.catalogId || node.id);
 }
 
 function makePosition(
@@ -277,49 +322,106 @@ function layoutFlow(
   });
 }
 
-// Helper: convert React Flow nodes + edges → backend TreeNode
-function flowToTree(nodes: Node[], edges: Edge[], direction: LayoutDirection): TreeNode | null {
-  if (nodes.length === 0) return null;
-  
-  // Build children map from edges: parentId → childIds[]
+function buildFlowTree(
+  nodes: Node[],
+  edges: Edge[],
+  direction: LayoutDirection,
+): FlowTreeBuildResult {
+  if (nodes.length === 0) {
+    return { tree: null, error: null };
+  }
+
+  const nodeMap = new Map(nodes.map((node) => [node.id, node]));
   const childrenMap = new Map<string, string[]>();
-  const hasParent = new Set<string>();
-  
+  const parentMap = new Map<string, string>();
+
   for (const edge of edges) {
+    if (!nodeMap.has(edge.source) || !nodeMap.has(edge.target)) {
+      return { tree: null, error: "Draft tree contains dangling edges" };
+    }
+    if (parentMap.has(edge.target)) {
+      return {
+        tree: null,
+        error: `Node '${getNodeLabel(nodeMap.get(edge.target)!)}' cannot have multiple parents`,
+      };
+    }
+    parentMap.set(edge.target, edge.source);
     const children = childrenMap.get(edge.source) || [];
     children.push(edge.target);
     childrenMap.set(edge.source, children);
-    hasParent.add(edge.target);
   }
-  
-  // Find root: node with no incoming edge
-  const rootNode = nodes.find(n => !hasParent.has(n.id));
-  if (!rootNode) return null;
-  
-  const nodeMap = new Map(nodes.map(n => [n.id, n]));
-  
-  function buildTree(nodeId: string): TreeNode {
-    const node = nodeMap.get(nodeId)!;
-    const childIds = childrenMap.get(nodeId) || [];
-    
-    // Preserve semantic sibling order from the active layout axis.
-    childIds.sort((a, b) => {
-      const na = nodeMap.get(a)!;
-      const nb = nodeMap.get(b)!;
-      return getPrimaryCoordinate(na, direction) - getPrimaryCoordinate(nb, direction);
-    });
-    
+
+  const roots = nodes.filter((node) => !parentMap.has(node.id));
+  if (roots.length === 0) {
+    return { tree: null, error: "Draft tree must contain exactly one root node" };
+  }
+  if (roots.length > 1) {
     return {
-      id: (node.data as any).catalogId || node.id,
-      name: (node.data as any).label || '',
-      params: (node.data as any).params || {},
-      modificationPolicy: (node.data as any).modificationPolicy || {},
-      recoveryPolicy: (node.data as any).recoveryPolicy || {},
-      children: childIds.map(buildTree),
+      tree: null,
+      error: `Draft tree must contain exactly one root node; found ${roots.length}`,
     };
   }
-  
-  return buildTree(rootNode.id);
+
+  const visited = new Set<string>();
+  const visiting = new Set<string>();
+
+  function buildTree(nodeId: string): TreeNode {
+    const node = nodeMap.get(nodeId)!;
+    if (visiting.has(nodeId)) {
+      throw new Error(`Cycle detected at node '${getNodeLabel(node)}'`);
+    }
+    if (visited.has(nodeId)) {
+      throw new Error(`Node '${getNodeLabel(node)}' is referenced more than once`);
+    }
+    visiting.add(nodeId);
+    visited.add(nodeId);
+
+    const childIds = [...(childrenMap.get(nodeId) || [])];
+    childIds.sort((a, b) => {
+      const left = nodeMap.get(a)!;
+      const right = nodeMap.get(b)!;
+      return getPrimaryCoordinate(left, direction) - getPrimaryCoordinate(right, direction);
+    });
+
+    const data = node.data as {
+      catalogId?: string;
+      label?: string;
+      params?: Record<string, unknown>;
+      modificationPolicy?: Record<string, string>;
+      recoveryPolicy?: Record<string, unknown>;
+    };
+    const built: TreeNode = {
+      id: data.catalogId || node.id,
+      name: data.label || "",
+      params: data.params || {},
+      modificationPolicy: data.modificationPolicy || {},
+      recoveryPolicy: data.recoveryPolicy || {},
+      children: childIds.map(buildTree),
+    };
+    visiting.delete(nodeId);
+    return built;
+  }
+
+  try {
+    const tree = buildTree(roots[0].id);
+    if (visited.size !== nodes.length) {
+      return {
+        tree: null,
+        error: "Draft tree must be fully connected; disconnected nodes are present",
+      };
+    }
+    return { tree, error: null };
+  } catch (error) {
+    return {
+      tree: null,
+      error: error instanceof Error ? error.message : "Draft tree is invalid",
+    };
+  }
+}
+
+// Helper: convert React Flow nodes + edges → backend TreeNode
+function flowToTree(nodes: Node[], edges: Edge[], direction: LayoutDirection): TreeNode | null {
+  return buildFlowTree(nodes, edges, direction).tree;
 }
 
 function isProgramNotLoadedError(error: Error): boolean {
@@ -340,6 +442,15 @@ export const useProgramStore = create<ProgramStore>((set, get) => ({
   edges: [],
   appliedTree: null,
   savedTree: null,
+  programParameters: [],
+  appliedProgramParameters: [],
+  savedProgramParameters: [],
+  blackboardNamespaces: [],
+  appliedBlackboardNamespaces: [],
+  savedBlackboardNamespaces: [],
+  blackboardKeys: [],
+  appliedBlackboardKeys: [],
+  savedBlackboardKeys: [],
   layoutDirection: 'horizontal',
   layoutRevision: 0,
   selectedNodeId: null,
@@ -347,12 +458,25 @@ export const useProgramStore = create<ProgramStore>((set, get) => ({
   loading: false,
   error: null,
   isDirty: false,
+  setError: (error) => set({ error }),
 
-  loadProgram: async (path: string, deploymentPath?: string) => {
+  loadProgram: async (path: string, deploymentPath?: string, forceDiscardOverrides = false) => {
     set({ loading: true, error: null });
     try {
-      const info = await api.program.load(path, deploymentPath);
-      set({ programInfo: info, isDirty: false });
+      const info = await api.program.load(path, deploymentPath, forceDiscardOverrides);
+      set({
+        programInfo: info,
+        programParameters: structuredClone(info.parameters ?? []),
+        appliedProgramParameters: structuredClone(info.parameters ?? []),
+        savedProgramParameters: structuredClone(info.parameters ?? []),
+        blackboardNamespaces: cloneBlackboard(info.blackboard).namespaces,
+        appliedBlackboardNamespaces: cloneBlackboard(info.blackboard).namespaces,
+        savedBlackboardNamespaces: cloneBlackboard(info.blackboard).namespaces,
+        blackboardKeys: cloneBlackboard(info.blackboard).keys,
+        appliedBlackboardKeys: cloneBlackboard(info.blackboard).keys,
+        savedBlackboardKeys: cloneBlackboard(info.blackboard).keys,
+        isDirty: false,
+      });
       // Fetch and render tree
       await get().fetchTree();
     } catch (e) {
@@ -363,8 +487,23 @@ export const useProgramStore = create<ProgramStore>((set, get) => ({
 
   fetchProgramInfo: async () => {
     try {
-      const info = await api.program.get();
-      set({ programInfo: info, error: null });
+      const [info, savedInfo] = await Promise.all([
+        api.program.get(),
+        api.program.saved().catch(() => null),
+      ]);
+      set({
+        programInfo: info,
+        programParameters: structuredClone(info.parameters ?? []),
+        appliedProgramParameters: structuredClone(info.parameters ?? []),
+        savedProgramParameters: structuredClone(savedInfo?.parameters ?? info.parameters ?? []),
+        blackboardNamespaces: cloneBlackboard(info.blackboard).namespaces,
+        appliedBlackboardNamespaces: cloneBlackboard(info.blackboard).namespaces,
+        savedBlackboardNamespaces: cloneBlackboard(savedInfo?.blackboard ?? info.blackboard).namespaces,
+        blackboardKeys: cloneBlackboard(info.blackboard).keys,
+        appliedBlackboardKeys: cloneBlackboard(info.blackboard).keys,
+        savedBlackboardKeys: cloneBlackboard(savedInfo?.blackboard ?? info.blackboard).keys,
+        error: null,
+      });
       return true;
     } catch (e) {
       const error = e as Error;
@@ -381,9 +520,11 @@ export const useProgramStore = create<ProgramStore>((set, get) => ({
   fetchTree: async () => {
     set({ loading: true });
     try {
-      const [data, savedData, runtimeOverrideStatus] = await Promise.all([
+      const [data, savedData, programInfo, savedProgramInfo, runtimeOverrideStatus] = await Promise.all([
         api.program.tree(),
         api.program.savedTree().catch(() => null),
+        api.program.get(),
+        api.program.saved().catch(() => null),
         api.program.runtimeOverrides().catch(() => null),
       ]);
       const nodes: Node[] = [];
@@ -393,8 +534,18 @@ export const useProgramStore = create<ProgramStore>((set, get) => ({
       set({
         nodes: layoutFlow(nodes, edges, layoutDirection),
         edges,
+        programInfo,
         appliedTree: data.tree,
         savedTree: savedData?.tree ?? data.tree,
+        programParameters: structuredClone(programInfo.parameters ?? []),
+        appliedProgramParameters: structuredClone(programInfo.parameters ?? []),
+        savedProgramParameters: structuredClone(savedProgramInfo?.parameters ?? programInfo.parameters ?? []),
+        blackboardNamespaces: cloneBlackboard(programInfo.blackboard).namespaces,
+        appliedBlackboardNamespaces: cloneBlackboard(programInfo.blackboard).namespaces,
+        savedBlackboardNamespaces: cloneBlackboard(savedProgramInfo?.blackboard ?? programInfo.blackboard).namespaces,
+        blackboardKeys: cloneBlackboard(programInfo.blackboard).keys,
+        appliedBlackboardKeys: cloneBlackboard(programInfo.blackboard).keys,
+        savedBlackboardKeys: cloneBlackboard(savedProgramInfo?.blackboard ?? programInfo.blackboard).keys,
         runtimeOverrideStatus,
         layoutRevision: get().layoutRevision + 1,
         loading: false,
@@ -461,6 +612,7 @@ export const useProgramStore = create<ProgramStore>((set, get) => ({
           : nodesOrUpdater;
       return {
         nodes,
+        error: options?.dirty === false ? state.error : null,
         isDirty: options?.dirty === false ? state.isDirty : true,
       };
     }),
@@ -472,6 +624,7 @@ export const useProgramStore = create<ProgramStore>((set, get) => ({
           : edgesOrUpdater;
       return {
         edges,
+        error: options?.dirty === false ? state.error : null,
         isDirty: options?.dirty === false ? state.isDirty : true,
       };
     }),
@@ -490,7 +643,7 @@ export const useProgramStore = create<ProgramStore>((set, get) => ({
         modificationPolicy: {},
       },
     };
-    set({ nodes: [...get().nodes, newNode], isDirty: true });
+    set({ nodes: [...get().nodes, newNode], isDirty: true, error: null });
   },
 
   removeNode: (nodeId) => {
@@ -498,6 +651,7 @@ export const useProgramStore = create<ProgramStore>((set, get) => ({
       nodes: get().nodes.filter(n => n.id !== nodeId),
       edges: get().edges.filter(e => e.source !== nodeId && e.target !== nodeId),
       selectedNodeId: get().selectedNodeId === nodeId ? null : get().selectedNodeId,
+      error: null,
       isDirty: true,
     });
   },
@@ -505,6 +659,7 @@ export const useProgramStore = create<ProgramStore>((set, get) => ({
   removeEdge: (edgeId) => {
     set({
       edges: get().edges.filter(e => e.id !== edgeId),
+      error: null,
       isDirty: true,
     });
   },
@@ -512,6 +667,7 @@ export const useProgramStore = create<ProgramStore>((set, get) => ({
   disconnectNode: (nodeId) => {
     set({
       edges: get().edges.filter(e => e.source !== nodeId && e.target !== nodeId),
+      error: null,
       isDirty: true,
     });
   },
@@ -525,6 +681,7 @@ export const useProgramStore = create<ProgramStore>((set, get) => ({
           ? { ...node, data: { ...node.data, params } }
           : node
       ),
+      error: null,
       isDirty: true,
     });
   },
@@ -536,12 +693,201 @@ export const useProgramStore = create<ProgramStore>((set, get) => ({
           ? { ...node, data: { ...node.data, label } }
           : node
       ),
+      error: null,
       isDirty: true,
+    });
+  },
+
+  updateProgramParameter: (name, patch) => {
+    set((state) => ({
+      programParameters: state.programParameters.map((parameter) =>
+        parameter.name === name
+          ? { ...parameter, ...patch }
+          : parameter
+      ),
+      error: null,
+      isDirty: true,
+    }));
+  },
+
+  addProgramParameter: (parameter) => {
+    set((state) => {
+      if (state.programParameters.some((existing) => existing.name === parameter.name)) {
+        return state;
+      }
+      const programParameters = [...state.programParameters, parameter];
+      return {
+        programParameters,
+        programInfo: state.programInfo
+          ? {
+              ...state.programInfo,
+              parameters: structuredClone(programParameters),
+              parameterCount: programParameters.length,
+            }
+          : state.programInfo,
+        error: null,
+        isDirty: true,
+      };
+    });
+  },
+
+  deleteProgramParameter: (name) => {
+    set((state) => {
+      const programParameters = state.programParameters.filter((parameter) => parameter.name !== name);
+      if (programParameters.length === state.programParameters.length) {
+        return state;
+      }
+      return {
+        programParameters,
+        programInfo: state.programInfo
+          ? {
+              ...state.programInfo,
+              parameters: structuredClone(programParameters),
+              parameterCount: programParameters.length,
+            }
+          : state.programInfo,
+        error: null,
+        isDirty: true,
+      };
+    });
+  },
+
+  updateBlackboardNamespace: (id, patch) => {
+    set((state) => {
+      const blackboardNamespaces = state.blackboardNamespaces.map((namespace) =>
+        namespace.id === id ? { ...namespace, ...patch } : namespace,
+      );
+      return {
+        blackboardNamespaces,
+        programInfo: state.programInfo
+          ? {
+              ...state.programInfo,
+              blackboard: {
+                namespaces: structuredClone(blackboardNamespaces),
+                keys: structuredClone(state.blackboardKeys),
+              },
+            }
+          : state.programInfo,
+        error: null,
+        isDirty: true,
+      };
+    });
+  },
+
+  addBlackboardNamespace: (namespace) => {
+    set((state) => {
+      if (state.blackboardNamespaces.some((existing) => existing.id === namespace.id)) {
+        return state;
+      }
+      const blackboardNamespaces = [...state.blackboardNamespaces, namespace];
+      return {
+        blackboardNamespaces,
+        programInfo: state.programInfo
+          ? {
+              ...state.programInfo,
+              blackboard: {
+                namespaces: structuredClone(blackboardNamespaces),
+                keys: structuredClone(state.blackboardKeys),
+              },
+            }
+          : state.programInfo,
+        error: null,
+        isDirty: true,
+      };
+    });
+  },
+
+  deleteBlackboardNamespace: (id) => {
+    set((state) => {
+      const blackboardNamespaces = state.blackboardNamespaces.filter((namespace) => namespace.id !== id);
+      return {
+        blackboardNamespaces,
+        programInfo: state.programInfo
+          ? {
+              ...state.programInfo,
+              blackboard: {
+                namespaces: structuredClone(blackboardNamespaces),
+                keys: structuredClone(state.blackboardKeys),
+              },
+            }
+          : state.programInfo,
+        error: null,
+        isDirty: true,
+      };
+    });
+  },
+
+  updateBlackboardKey: (id, patch) => {
+    set((state) => {
+      const blackboardKeys = state.blackboardKeys.map((key) =>
+        key.id === id ? { ...key, ...patch } : key,
+      );
+      return {
+        blackboardKeys,
+        programInfo: state.programInfo
+          ? {
+              ...state.programInfo,
+              blackboard: {
+                namespaces: structuredClone(state.blackboardNamespaces),
+                keys: structuredClone(blackboardKeys),
+              },
+            }
+          : state.programInfo,
+        error: null,
+        isDirty: true,
+      };
+    });
+  },
+
+  addBlackboardKey: (key) => {
+    set((state) => {
+      if (state.blackboardKeys.some((existing) => existing.id === key.id)) {
+        return state;
+      }
+      const blackboardKeys = [...state.blackboardKeys, key];
+      return {
+        blackboardKeys,
+        programInfo: state.programInfo
+          ? {
+              ...state.programInfo,
+              blackboard: {
+                namespaces: structuredClone(state.blackboardNamespaces),
+                keys: structuredClone(blackboardKeys),
+              },
+            }
+          : state.programInfo,
+        error: null,
+        isDirty: true,
+      };
+    });
+  },
+
+  deleteBlackboardKey: (id) => {
+    set((state) => {
+      const blackboardKeys = state.blackboardKeys.filter((key) => key.id !== id);
+      return {
+        blackboardKeys,
+        programInfo: state.programInfo
+          ? {
+              ...state.programInfo,
+              blackboard: {
+                namespaces: structuredClone(state.blackboardNamespaces),
+                keys: structuredClone(blackboardKeys),
+              },
+            }
+          : state.programInfo,
+        error: null,
+        isDirty: true,
+      };
     });
   },
 
   flowToTree: () => {
     return flowToTree(get().nodes, get().edges, get().layoutDirection);
+  },
+
+  validateDraftGraph: () => {
+    return buildFlowTree(get().nodes, get().edges, get().layoutDirection).error;
   },
 
   setLayoutDirection: (direction) => {
@@ -560,6 +906,7 @@ export const useProgramStore = create<ProgramStore>((set, get) => ({
   autoLayout: () => {
     set((state) => ({
       nodes: layoutFlow(state.nodes, state.edges, state.layoutDirection),
+      error: null,
       layoutRevision: state.layoutRevision + 1,
     }));
   },
@@ -573,6 +920,9 @@ export const useProgramStore = create<ProgramStore>((set, get) => ({
     set({
       nodes,
       edges,
+      programParameters: structuredClone(get().appliedProgramParameters),
+      blackboardNamespaces: structuredClone(get().appliedBlackboardNamespaces),
+      blackboardKeys: structuredClone(get().appliedBlackboardKeys),
       selectedNodeId: null,
       isDirty: false,
       error: null,
@@ -582,12 +932,34 @@ export const useProgramStore = create<ProgramStore>((set, get) => ({
 
   setAppliedToDraft: () => {
     const tree = get().flowToTree();
-    set({ appliedTree: tree });
+    set((state) => ({
+      appliedTree: tree,
+      appliedProgramParameters: structuredClone(get().programParameters),
+      appliedBlackboardNamespaces: structuredClone(get().blackboardNamespaces),
+      appliedBlackboardKeys: structuredClone(get().blackboardKeys),
+      programInfo: state.programInfo
+        ? {
+            ...state.programInfo,
+            parameters: structuredClone(state.programParameters),
+            parameterCount: state.programParameters.length,
+            blackboard: {
+              namespaces: structuredClone(state.blackboardNamespaces),
+              keys: structuredClone(state.blackboardKeys),
+            },
+          }
+        : state.programInfo,
+    }));
   },
 
   setSavedToDraft: () => {
     const tree = get().flowToTree();
-    set({ savedTree: tree, isDirty: false });
+    set({
+      savedTree: tree,
+      savedProgramParameters: structuredClone(get().programParameters),
+      savedBlackboardNamespaces: structuredClone(get().blackboardNamespaces),
+      savedBlackboardKeys: structuredClone(get().blackboardKeys),
+      isDirty: false,
+    });
   },
 
   activateRuntimeOverrides: async () => {
@@ -601,16 +973,35 @@ export const useProgramStore = create<ProgramStore>((set, get) => ({
   },
 
   saveProgram: async (path: string) => {
+    const validationError = get().validateDraftGraph();
+    if (validationError) {
+      throw new Error(validationError);
+    }
     const tree = get().flowToTree();
     if (!tree) {
-      throw new Error('No tree to save');
+      throw new Error('Draft tree is invalid');
     }
-    await api.program.saveTree(path, tree);
+    await api.program.saveTree(path, tree, get().programParameters, {
+      namespaces: get().blackboardNamespaces,
+      keys: get().blackboardKeys,
+    });
     set((state) => ({
       savedTree: tree,
+      savedProgramParameters: structuredClone(state.programParameters),
+      savedBlackboardNamespaces: structuredClone(state.blackboardNamespaces),
+      savedBlackboardKeys: structuredClone(state.blackboardKeys),
       isDirty: false,
       programInfo: state.programInfo
-        ? { ...state.programInfo, sourcePath: path }
+        ? {
+            ...state.programInfo,
+            sourcePath: path,
+            parameters: structuredClone(state.programParameters),
+            parameterCount: state.programParameters.length,
+            blackboard: {
+              namespaces: structuredClone(state.blackboardNamespaces),
+              keys: structuredClone(state.blackboardKeys),
+            },
+          }
         : state.programInfo,
     }));
   },

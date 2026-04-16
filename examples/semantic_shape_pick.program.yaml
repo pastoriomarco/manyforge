@@ -44,11 +44,65 @@ scene:
       position_m: [0.40, 0.14, 0.009]
       orientation_rpy_deg: [0.0, 0.0, 0.0]
 
-parameters:
-  - name: selection_request_text
-    type: string
-    default: Select the sphere object.
-    description: Selection request for the semantic object-selection demo.
+blackboard:
+  namespaces:
+    - id: selection_context
+      contract: selection_context_v1
+      prefix: selection/context
+      description: Structured scene-selection context bundle.
+      fields:
+        - name: selection_request_text
+          type: string
+        - name: candidate_object_ids
+          type: string_list
+        - name: scene_context_json
+          type: string
+    - id: object_selection
+      contract: query_model_output_v1
+      prefix: perception/object_selection
+      description: QueryModel response namespace for object selection.
+      fields:
+        - name: outcome
+          type: string
+        - name: selected_object_id
+          type: string
+        - name: matched_attributes
+          type: string_list
+        - name: confidence
+          type: float
+        - name: reason
+          type: string
+    - id: validated_selection
+      contract: validated_selection_v1
+      prefix: selection/validated
+      description: Deterministically validated selection bundle.
+      fields:
+        - name: outcome
+          type: string
+        - name: selected_object_id
+          type: string
+        - name: matched_attributes
+          type: string_list
+        - name: confidence
+          type: float
+        - name: reason
+          type: string
+    - id: pick_plan
+      contract: pick_plan_v1
+      prefix: planning/pick_plan
+      description: Planned pick approach and pick poses.
+      fields:
+        - name: selected_object_id
+          type: string
+        - name: approach_pose
+          type: pose
+        - name: pick_pose
+          type: pose
+  keys:
+    - id: gripper_closed
+      type: bool
+      key: gripper_closed
+      description: Simulated gripper closed/open flag.
 
 tree:
   id: sequence
@@ -57,8 +111,9 @@ tree:
     - id: build_scene_selection_context
       name: build_selection_context
       params:
-        selection_request_text: "${param:selection_request_text}"
-        output_key_prefix: selection/context
+        selection_request_text: Select the sphere object.
+        output_key_prefix:
+          namespace_ref: selection_context
         object_source: backend_scene
         candidate_object_ids: [sphere_part, cube_part]
         image_source: none
@@ -69,10 +124,20 @@ tree:
         model_endpoint_alias: selection_model
         prompt_template_id: select_scene_object_v1
         template_variables:
-          selection_request_text: selection/context/fields/selection_request_text
-          scene_context_json: selection/context/fields/scene_context_json
-          candidate_object_ids: selection/context/fields/candidate_object_ids
-        output_key_prefix: perception/object_selection
+          selection_request_text:
+            field_ref:
+              namespace: selection_context
+              field: selection_request_text
+          scene_context_json:
+            field_ref:
+              namespace: selection_context
+              field: scene_context_json
+          candidate_object_ids:
+            field_ref:
+              namespace: selection_context
+              field: candidate_object_ids
+        output_key_prefix:
+          namespace_ref: object_selection
         include_scene_snapshot: false
         timeout_s: 20.0
         min_confidence: 0.70
@@ -80,17 +145,24 @@ tree:
     - id: validate_scene_selection
       name: validate_selected_object
       params:
-        selection_context_prefix: selection/context
-        selection_response_prefix: perception/object_selection
-        output_key_prefix: selection/validated
+        selection_context_prefix:
+          namespace_ref: selection_context
+        selection_response_prefix:
+          namespace_ref: object_selection
+        output_key_prefix:
+          namespace_ref: validated_selection
         allow_no_match: false
         allow_ambiguous: false
 
     - id: plan_pick_sequence
       name: plan_selected_object_pick
       params:
-        selected_object_id: "${bb:selection/validated/fields/selected_object_id}"
-        output_key_prefix: planning/pick_plan
+        selected_object_id:
+          field_ref:
+            namespace: validated_selection
+            field: selected_object_id
+        output_key_prefix:
+          namespace_ref: pick_plan
         object_source: backend_scene
         image_source: none
         tcp_frame: tool0
@@ -115,7 +187,10 @@ tree:
       params:
         move_id: planned_pick_approach
         motion_type: pose_goal
-        pose_goal: "${bb:planning/pick_plan/fields/approach_pose}"
+        pose_goal:
+          field_ref:
+            namespace: pick_plan
+            field: approach_pose
         velocity_scale: 0.30
 
     - id: move_manipulator_action
@@ -123,19 +198,26 @@ tree:
       params:
         move_id: planned_pick_descend
         motion_type: pose_goal
-        pose_goal: "${bb:planning/pick_plan/fields/pick_pose}"
+        pose_goal:
+          field_ref:
+            namespace: pick_plan
+            field: pick_pose
         velocity_scale: 0.20
 
     - id: set_key_bool_value
       name: close_gripper
       params:
-        key: gripper_closed
+        key:
+          key_ref: gripper_closed
         value: true
 
     - id: attach_object_to_link
       name: attach_selected_object
       params:
-        object_id: "${bb:planning/pick_plan/fields/selected_object_id}"
+        object_id:
+          field_ref:
+            namespace: pick_plan
+            field: selected_object_id
         link_frame: tool0
 
     - id: reset_trajectories
@@ -146,7 +228,10 @@ tree:
       params:
         move_id: planned_pick_exit
         motion_type: pose_goal
-        pose_goal: "${bb:planning/pick_plan/fields/approach_pose}"
+        pose_goal:
+          field_ref:
+            namespace: pick_plan
+            field: approach_pose
         velocity_scale: 0.30
 
     - id: move_manipulator_action
@@ -181,13 +266,17 @@ tree:
     - id: set_key_bool_value
       name: open_gripper
       params:
-        key: gripper_closed
+        key:
+          key_ref: gripper_closed
         value: false
 
     - id: detach_object_from_link
       name: detach_selected_object
       params:
-        object_id: "${bb:planning/pick_plan/fields/selected_object_id}"
+        object_id:
+          field_ref:
+            namespace: pick_plan
+            field: selected_object_id
         link_frame: tool0
         frame_id: universe
 

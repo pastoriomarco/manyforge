@@ -95,7 +95,8 @@ body:
     - id: set_key_bool_value
       name: close_gripper
       params:
-        key: gripper_closed
+        key:
+          key_ref: gripper_closed
         value: true
     - id: attach_object_to_link
       name: attach

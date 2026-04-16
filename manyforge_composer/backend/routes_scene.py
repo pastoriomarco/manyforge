@@ -57,6 +57,7 @@ def build_scene_state_payload(state: ComposerState) -> dict[str, Any]:
         tcp_frame = state.program.robot.tcp_frame
 
     joint_positions_by_name: dict[str, float] = {}
+    joint_names: list[str] = []
     if state.kernel is not None:
         joint_names = state.kernel.get_joint_names()
         snapshot = (
@@ -86,6 +87,7 @@ def build_scene_state_payload(state: ComposerState) -> dict[str, Any]:
             group_id=group_id,
             base_frame=base_frame,
             tcp_frame=tcp_frame,
+            joint_names=joint_names,
             joint_positions=joint_positions_by_name,
             tcp_pose_in_base=tcp_pose_in_base,
         )
@@ -258,5 +260,23 @@ def create_scene_router(state: ComposerState) -> APIRouter:
 
         media_type = "image/jpeg" if format == "jpeg" else "image/png"
         return Response(content=image_bytes, media_type=media_type)
+
+    @router.get("/snapshots/{snapshot_id}")
+    def get_published_scene_snapshot(snapshot_id: str) -> Response:
+        """Serve a previously captured scene snapshot by stable id."""
+        snapshot = state.get_published_scene_snapshot(snapshot_id)
+        if snapshot is None:
+            return JSONResponse(
+                status_code=404,
+                content={"detail": "Snapshot not found"},
+            )
+        return Response(
+            content=snapshot.image_bytes,
+            media_type=snapshot.media_type,
+            headers={
+                "Cache-Control": "no-store, max-age=0",
+                "ETag": snapshot.sha256,
+            },
+        )
 
     return router

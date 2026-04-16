@@ -109,6 +109,15 @@ scene: []
 
 parameters: []
 
+blackboard:
+  namespaces:
+    - id: missing_pose
+      contract: query_model_output_v1
+      prefix: missing
+      fields:
+        - name: pose
+          type: pose
+
 tree:
   id: sequence
   name: main_sequence
@@ -118,7 +127,10 @@ tree:
       params:
         move_id: missing_pose
         motion_type: pose_goal
-        pose_goal: "${bb:missing/pose}"
+        pose_goal:
+          field_ref:
+            namespace: missing_pose
+            field: pose
         planning_timeout_s: 0.5
         execution_timeout_s: 0.5
 """,
@@ -135,7 +147,7 @@ tree:
         assert manager.state == CycleState.IDLE
         assert manager.error is not None
         assert "move_missing_pose_goal" in manager.error
-        assert "Missing blackboard key 'missing/pose'" in manager.error
+        assert "Missing blackboard key 'missing/value/pose'" in manager.error
 
 
 class TestCycleManagerStop:
@@ -923,12 +935,12 @@ class TestIntervention:
                 {
                     "id": "set_key_bool_value",
                     "name": "write_flag",
-                    "params": {"key": "shared.flag", "value": True},
+                    "params": {"key": {"key_ref": "shared.flag"}, "value": True},
                 },
                 {
                     "id": "check_key_bool_value",
                     "name": "read_flag",
-                    "params": {"key": "shared.flag", "expected_value": True},
+                    "params": {"key": {"key_ref": "shared.flag"}, "expected_value": True},
                 },
             ],
         }
@@ -944,7 +956,7 @@ class TestIntervention:
         writer_params = rewritten["children"][0]["params"]
         reader_params = rewritten["children"][1]["params"]
         assert writer_params["key"] == "_intervention/sess123/shared/flag"
-        assert reader_params["key"] == "shared.flag"
+        assert reader_params["key"] == {"key_ref": "shared.flag"}
 
 
 class TestKernelEventBridge:

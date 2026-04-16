@@ -18,9 +18,19 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
+from .intervention_validation import merged_intervention_blackboard_keys
 from .state import ComposerState
+from .security import is_valid_principal_id
 
 logger = logging.getLogger(__name__)
+
+
+def _valid_trigger_reasons() -> set[str]:
+    from manyforge_behavior.cycle_manager import RecoveryTrigger
+
+    reasons = {member.value for member in RecoveryTrigger}
+    reasons.add("manual_request")
+    return reasons
 
 
 def create_mcp_server(state: ComposerState):
@@ -479,8 +489,26 @@ def create_mcp_server(state: ComposerState):
                 return json.dumps({"error": "tree is required for execute action"})
             if not principal_id or not principal_id.strip():
                 return json.dumps({"error": "principal_id is required for execute action"})
+            principal_id = principal_id.strip()
+            if not is_valid_principal_id(principal_id):
+                return json.dumps(
+                    {
+                        "error": (
+                            "principal_id must be 1-128 printable ASCII characters"
+                        )
+                    }
+                )
             if grant_type is not None and grant_type not in ("human_approved", "policy_granted"):
                 return json.dumps({"error": "grant_type must be one of: human_approved, policy_granted"})
+            if trigger_reason is not None and trigger_reason not in _valid_trigger_reasons():
+                return json.dumps(
+                    {
+                        "error": (
+                            "trigger_reason must be one of: "
+                            + ", ".join(sorted(_valid_trigger_reasons()))
+                        )
+                    }
+                )
             from manyforge_behavior.program import (
                 collect_tree_validation_issues,
                 tree_node_from_dict,
@@ -505,6 +533,20 @@ def create_mcp_server(state: ComposerState):
                     state.program.get_parameter_defaults()
                     if state.program is not None
                     else None
+                ),
+                blackboard_namespaces=(
+                    state.program.blackboard_namespaces
+                    if state.program is not None
+                    else None
+                ),
+                blackboard_keys=merged_intervention_blackboard_keys(
+                    tree_node,
+                    state.catalog,
+                    base_keys=(
+                        state.program.blackboard_keys
+                        if state.program is not None
+                        else None
+                    ),
                 ),
                 skill_catalog=state.skill_catalog,
                 program_profile=(

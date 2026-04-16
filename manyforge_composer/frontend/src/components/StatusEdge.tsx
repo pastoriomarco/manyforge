@@ -39,8 +39,10 @@ export function StatusEdge(props: EdgeProps) {
     <BaseEdge
       path={path}
       markerEnd={props.markerEnd}
+      interactionWidth={28}
       style={{
         ...props.style,
+        cursor: 'pointer',
         stroke,
         strokeWidth: 2,
       }}
