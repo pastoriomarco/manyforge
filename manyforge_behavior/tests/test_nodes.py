@@ -22,8 +22,15 @@ from manyforge_behavior.nodes.scene import (
 )
 from manyforge_behavior.nodes.logic import (
     CheckKeyBoolValue,
+    CheckSignalBool,
+    CheckGripperState,
     SetKeyBoolValue,
+    SetSignalBool,
+    SetGripperState,
     WaitForKeyBool,
+    WaitForSignalBool,
+    WaitForSignalEdge,
+    WaitForGripperState,
 )
 from manyforge_behavior.nodes.geometry import GetLinkPose, CheckPoseDistance
 
@@ -586,6 +593,113 @@ class TestWaitForKeyBool:
         node = WaitForKeyBool(name="wait_flag", key="wait_key", expected_value=True)
         status = _tick_node(node)
         assert status == py_trees.common.Status.RUNNING
+
+
+class TestSignalNodes:
+    def test_check_signal_bool(self, bb_with_kernel):
+        writer = py_trees.blackboard.Client(name="writer")
+        writer.register_key(key="cell/fixture_ready", access=py_trees.common.Access.WRITE)
+        writer.set("cell/fixture_ready", True)
+
+        node = CheckSignalBool(
+            name="check_fixture_ready",
+            key="cell/fixture_ready",
+            expected_value=True,
+        )
+        assert _tick_node(node) == py_trees.common.Status.SUCCESS
+
+    def test_set_signal_bool(self, bb_with_kernel):
+        node = SetSignalBool(
+            name="set_cycle_complete",
+            key="cell/cycle_complete",
+            value=True,
+        )
+        assert _tick_node(node) == py_trees.common.Status.SUCCESS
+
+        reader = py_trees.blackboard.Client(name="reader")
+        reader.register_key(key="cell/cycle_complete", access=py_trees.common.Access.READ)
+        assert reader.get("cell/cycle_complete") is True
+
+    def test_wait_for_signal_bool(self, bb_with_kernel):
+        writer = py_trees.blackboard.Client(name="writer")
+        writer.register_key(key="cell/permit", access=py_trees.common.Access.WRITE)
+        writer.set("cell/permit", True)
+
+        node = WaitForSignalBool(
+            name="wait_permit",
+            key="cell/permit",
+            expected_value=True,
+        )
+        assert _tick_node(node) == py_trees.common.Status.SUCCESS
+
+    def test_wait_for_signal_edge_rising(self, bb_with_kernel):
+        writer = py_trees.blackboard.Client(name="writer")
+        writer.register_key(key="cell/permit", access=py_trees.common.Access.WRITE)
+        writer.set("cell/permit", False)
+
+        node = WaitForSignalEdge(
+            name="wait_edge",
+            key="cell/permit",
+            edge="rising",
+        )
+        node.setup()
+        node.initialise()
+        assert node.update() == py_trees.common.Status.RUNNING
+
+        writer.set("cell/permit", True)
+        assert node.update() == py_trees.common.Status.SUCCESS
+
+    def test_wait_for_signal_edge_fails_on_non_bool(self, bb_with_kernel):
+        writer = py_trees.blackboard.Client(name="writer")
+        writer.register_key(key="cell/count", access=py_trees.common.Access.WRITE)
+        writer.set("cell/count", 1)
+
+        node = WaitForSignalEdge(
+            name="wait_edge",
+            key="cell/count",
+            edge="any",
+        )
+        node.setup()
+        node.initialise()
+        assert node.update() == py_trees.common.Status.FAILURE
+
+
+class TestGripperStateNodes:
+    def test_set_gripper_state_closed(self, bb_with_kernel):
+        node = SetGripperState(
+            name="close_gripper",
+            state_key="gripper_closed",
+            state="closed",
+        )
+        assert _tick_node(node) == py_trees.common.Status.SUCCESS
+
+        reader = py_trees.blackboard.Client(name="reader")
+        reader.register_key(key="gripper_closed", access=py_trees.common.Access.READ)
+        assert reader.get("gripper_closed") is True
+
+    def test_check_gripper_state(self, bb_with_kernel):
+        writer = py_trees.blackboard.Client(name="writer")
+        writer.register_key(key="gripper_closed", access=py_trees.common.Access.WRITE)
+        writer.set("gripper_closed", False)
+
+        node = CheckGripperState(
+            name="check_open",
+            state_key="gripper_closed",
+            expected_state="open",
+        )
+        assert _tick_node(node) == py_trees.common.Status.SUCCESS
+
+    def test_wait_for_gripper_state(self, bb_with_kernel):
+        writer = py_trees.blackboard.Client(name="writer")
+        writer.register_key(key="gripper_closed", access=py_trees.common.Access.WRITE)
+        writer.set("gripper_closed", False)
+
+        node = WaitForGripperState(
+            name="wait_open",
+            state_key="gripper_closed",
+            expected_state="open",
+        )
+        assert _tick_node(node) == py_trees.common.Status.SUCCESS
 
     def test_returns_success_when_matched(self, bb_with_kernel):
         writer = py_trees.blackboard.Client(name="writer")

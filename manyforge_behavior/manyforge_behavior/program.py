@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -75,6 +76,27 @@ class BlackboardKey:
     type: str
     key: str
     description: str = ""
+
+
+@dataclass
+class InterruptPolicy:
+    id: str
+    source: str
+    applies_to: dict[str, Any]
+    preemption_mode: str
+    handler: str
+    after_handler: str
+    condition: dict[str, Any] = field(default_factory=dict)
+    description: str = ""
+
+
+@dataclass
+class InterruptHandler:
+    id: str
+    root: "TreeNode"
+    description: str = ""
+    resource_claims: tuple[str, ...] = field(default_factory=tuple)
+    timeout_s: Optional[float] = None
 
 
 @dataclass
@@ -182,6 +204,68 @@ def _parse_modification_policy(
 
 _RECOVERY_POLICY_ALLOWED_ACTIONS = {"runtime_override", "intervention"}
 _RECOVERY_POLICY_PERSISTENCE_CEILINGS = {"session_only", "runtime_override", "draft_patch"}
+_ALLOWED_INTERRUPT_PREEMPTION_MODES = {
+    "abort_active_node",
+    "abort_subtree",
+    "hold_cycle",
+    "kernel_stop_only",
+    "latched_fault",
+}
+_ALLOWED_INTERRUPT_DISPOSITIONS = {
+    "resume_node",
+    "resume_subtree",
+    "restart_subtree",
+    "halted",
+    "failed",
+    "escalate",
+    "resumable_hold",
+}
+_ALLOWED_INTERRUPT_APPLIES_TO_FIELDS = {
+    "subtree_root",
+    "node_kinds",
+    "node_names",
+    "node_ids",
+    "interruptible_only",
+}
+_ALLOWED_INTERRUPT_RESOURCE_CLAIMS = {
+    "blackboard",
+    "gripper",
+    "model",
+    "motion",
+    "planner",
+    "scene",
+    "signals",
+    "timers",
+}
+_NON_RESUMABLE_INTERRUPT_RESOURCE_CLAIMS = {
+    "motion",
+}
+_INTERRUPT_NODE_RESOURCE_CLAIMS: dict[str, tuple[str, ...]] = {
+    "add_collision_object": ("scene",),
+    "attach_object_to_link": ("scene", "gripper"),
+    "build_scene_selection_context": ("scene",),
+    "check_gripper_state": ("gripper",),
+    "check_key_bool_value": ("blackboard",),
+    "check_pose_distance": ("scene",),
+    "check_signal_bool": ("signals",),
+    "detach_object_from_link": ("scene", "gripper"),
+    "get_link_pose": ("scene",),
+    "move_manipulator_action": ("motion",),
+    "plan_pick_sequence": ("planner", "scene"),
+    "query_model": ("model",),
+    "remove_collision_object": ("scene",),
+    "reset_trajectories": ("planner",),
+    "set_gripper_state": ("gripper",),
+    "set_key_bool_value": ("blackboard",),
+    "set_signal_bool": ("signals",),
+    "timer": ("timers",),
+    "update_collision_object_pose": ("scene",),
+    "validate_scene_selection": ("model", "scene"),
+    "wait_for_gripper_state": ("gripper",),
+    "wait_for_key_bool": ("blackboard",),
+    "wait_for_signal_bool": ("signals",),
+    "wait_for_signal_edge": ("signals",),
+}
 
 
 def _parse_recovery_policy(
@@ -260,6 +344,13 @@ def _parse_recovery_policy(
         parsed["persistence_ceiling"] = persistence_ceiling
 
     return parsed
+
+
+def _infer_interrupt_handler_resource_claims(node: TreeNode) -> set[str]:
+    claims = set(_INTERRUPT_NODE_RESOURCE_CLAIMS.get(node.id, ()))
+    for child in node.children:
+        claims.update(_infer_interrupt_handler_resource_claims(child))
+    return claims
 
 
 def tree_node_from_dict(
@@ -1258,6 +1349,8 @@ class Program:
         self.parameters: dict[str, ProgramParameter] = {}
         self.blackboard_namespaces: dict[str, BlackboardNamespace] = {}
         self.blackboard_keys: dict[str, BlackboardKey] = {}
+        self.interrupt_policies: dict[str, InterruptPolicy] = {}
+        self.interrupt_handlers: dict[str, InterruptHandler] = {}
         self.tree: Optional[TreeNode] = None
         self._load_and_validate()
 
@@ -1290,6 +1383,8 @@ class Program:
         self.parameters = {}
         self.blackboard_namespaces = {}
         self.blackboard_keys = {}
+        self.interrupt_policies = {}
+        self.interrupt_handlers = {}
         self.tree = None
         self._load_from_data_and_validate(data)
         return self
@@ -1305,6 +1400,8 @@ class Program:
         self.parameters = {}
         self.blackboard_namespaces = {}
         self.blackboard_keys = {}
+        self.interrupt_policies = {}
+        self.interrupt_handlers = {}
         self.tree = None
 
         if not isinstance(data, dict):
@@ -1485,8 +1582,203 @@ class Program:
             raise ProgramValidationError("tree section is required")
         self.tree = self._parse_tree(tree_data)
 
+        # Interrupt handlers / policies
+        self._load_interrupt_handlers(data.get("interrupt_handlers"))
+        self._load_interrupt_policies(data.get("interrupt_policies"))
+
         # Structural validation
         self._validate_tree(self.tree)
+        self._validate_interrupt_handlers()
+        self._validate_interrupt_policies()
+
+    def _load_interrupt_handlers(self, raw_handlers: Any) -> None:
+        handlers_data = raw_handlers or {}
+        if handlers_data and not isinstance(handlers_data, Mapping):
+            raise ProgramValidationError("interrupt_handlers must be a mapping")
+        self.interrupt_handlers = {}
+        for handler_id, handler_data in handlers_data.items():
+            normalized_handler_id = str(handler_id).strip()
+            if not normalized_handler_id:
+                raise ProgramValidationError("interrupt_handlers keys must be non-empty strings")
+            if not isinstance(handler_data, Mapping):
+                raise ProgramValidationError(
+                    f"interrupt_handlers[{normalized_handler_id!r}] must be a mapping"
+                )
+            root_data = handler_data.get("root")
+            if root_data is None:
+                raise ProgramValidationError(
+                    f"interrupt_handlers[{normalized_handler_id!r}].root is required"
+                )
+            handler_root = tree_node_from_dict(
+                root_data,
+                path=f"interrupt_handlers[{normalized_handler_id!r}].root",
+            )
+            raw_resource_claims = handler_data.get("resource_claims", []) or []
+            if raw_resource_claims and not isinstance(raw_resource_claims, list):
+                raise ProgramValidationError(
+                    f"interrupt_handlers[{normalized_handler_id!r}].resource_claims must be a list"
+                )
+            resource_claims: list[str] = []
+            for claim in raw_resource_claims:
+                if not isinstance(claim, str) or not claim.strip():
+                    raise ProgramValidationError(
+                        f"interrupt_handlers[{normalized_handler_id!r}].resource_claims entries must be non-empty strings"
+                    )
+                normalized_claim = claim.strip()
+                if normalized_claim not in _ALLOWED_INTERRUPT_RESOURCE_CLAIMS:
+                    allowed = ", ".join(sorted(_ALLOWED_INTERRUPT_RESOURCE_CLAIMS))
+                    raise ProgramValidationError(
+                        f"interrupt_handlers[{normalized_handler_id!r}].resource_claims contains unsupported claim "
+                        f"'{normalized_claim}'. Allowed claims: {allowed}"
+                    )
+                if normalized_claim not in resource_claims:
+                    resource_claims.append(normalized_claim)
+            raw_timeout_s = handler_data.get("timeout_s")
+            timeout_s: Optional[float] = None
+            if raw_timeout_s is not None:
+                if not isinstance(raw_timeout_s, (int, float)):
+                    raise ProgramValidationError(
+                        f"interrupt_handlers[{normalized_handler_id!r}].timeout_s must be a positive number"
+                    )
+                timeout_s = float(raw_timeout_s)
+                if not math.isfinite(timeout_s) or timeout_s <= 0.0:
+                    raise ProgramValidationError(
+                        f"interrupt_handlers[{normalized_handler_id!r}].timeout_s must be > 0"
+                    )
+            self.interrupt_handlers[normalized_handler_id] = InterruptHandler(
+                id=normalized_handler_id,
+                root=handler_root,
+                description=str(handler_data.get("description", "")),
+                resource_claims=tuple(resource_claims),
+                timeout_s=timeout_s,
+            )
+
+    def _load_interrupt_policies(self, raw_policies: Any) -> None:
+        policies_data = raw_policies or []
+        if policies_data and not isinstance(policies_data, list):
+            raise ProgramValidationError("interrupt_policies must be a list")
+        self.interrupt_policies = {}
+        for index, raw_policy in enumerate(policies_data):
+            path = f"interrupt_policies[{index}]"
+            if not isinstance(raw_policy, Mapping):
+                raise ProgramValidationError(f"{path} must be a mapping")
+            policy_id = str(raw_policy.get("id", "")).strip()
+            source = str(raw_policy.get("source", "")).strip()
+            preemption_mode = str(raw_policy.get("preemption_mode", "")).strip()
+            handler = str(raw_policy.get("handler", "")).strip()
+            after_handler = str(raw_policy.get("after_handler", "")).strip()
+            if not policy_id:
+                raise ProgramValidationError(f"{path}.id is required")
+            if policy_id in self.interrupt_policies:
+                raise ProgramValidationError(
+                    f"Duplicate interrupt policy id: '{policy_id}'"
+                )
+            if not source:
+                raise ProgramValidationError(f"{path}.source is required")
+            if preemption_mode not in _ALLOWED_INTERRUPT_PREEMPTION_MODES:
+                allowed = ", ".join(sorted(_ALLOWED_INTERRUPT_PREEMPTION_MODES))
+                raise ProgramValidationError(
+                    f"{path}.preemption_mode must be one of: {allowed}"
+                )
+            if not handler:
+                raise ProgramValidationError(f"{path}.handler is required")
+            if handler not in self.interrupt_handlers:
+                raise ProgramValidationError(
+                    f"{path}.handler refers to unknown interrupt handler '{handler}'"
+                )
+            if after_handler not in _ALLOWED_INTERRUPT_DISPOSITIONS:
+                allowed = ", ".join(sorted(_ALLOWED_INTERRUPT_DISPOSITIONS))
+                raise ProgramValidationError(
+                    f"{path}.after_handler must be one of: {allowed}"
+                )
+
+            applies_to_raw = raw_policy.get("applies_to", {}) or {}
+            if not isinstance(applies_to_raw, Mapping):
+                raise ProgramValidationError(f"{path}.applies_to must be a mapping")
+            unknown_fields = sorted(
+                field_name
+                for field_name in applies_to_raw
+                if field_name not in _ALLOWED_INTERRUPT_APPLIES_TO_FIELDS
+            )
+            if unknown_fields:
+                raise ProgramValidationError(
+                    f"{path}.applies_to contains unsupported fields: {unknown_fields}"
+                )
+            applies_to: dict[str, Any] = {}
+
+            subtree_root = applies_to_raw.get("subtree_root")
+            if subtree_root is not None:
+                if not isinstance(subtree_root, str) or not subtree_root.strip():
+                    raise ProgramValidationError(
+                        f"{path}.applies_to.subtree_root must be a non-empty string"
+                    )
+                if self.tree is not None and find_tree_node_by_name(self.tree, subtree_root) is None:
+                    raise ProgramValidationError(
+                        f"{path}.applies_to.subtree_root refers to unknown node instance '{subtree_root}'"
+                    )
+                applies_to["subtree_root"] = subtree_root
+
+            for list_field in ("node_kinds", "node_names", "node_ids"):
+                raw_value = applies_to_raw.get(list_field)
+                if raw_value is None:
+                    continue
+                if not isinstance(raw_value, list) or not raw_value:
+                    raise ProgramValidationError(
+                        f"{path}.applies_to.{list_field} must be a non-empty list"
+                    )
+                normalized_values: list[str] = []
+                for item in raw_value:
+                    if not isinstance(item, str) or not item.strip():
+                        raise ProgramValidationError(
+                            f"{path}.applies_to.{list_field} entries must be non-empty strings"
+                        )
+                    normalized_values.append(item)
+                if list_field == "node_kinds":
+                    for node_kind in normalized_values:
+                        try:
+                            self._catalog.get(node_kind)
+                        except KeyError as exc:
+                            raise ProgramValidationError(
+                                f"{path}.applies_to.node_kinds contains unknown catalog entry '{node_kind}'"
+                            ) from exc
+                if list_field == "node_names" and self.tree is not None:
+                    for node_name in normalized_values:
+                        if find_tree_node_by_name(self.tree, node_name) is None:
+                            raise ProgramValidationError(
+                                f"{path}.applies_to.node_names contains unknown node instance '{node_name}'"
+                            )
+                if list_field == "node_ids":
+                    for node_id in normalized_values:
+                        try:
+                            self._catalog.get(node_id)
+                        except KeyError as exc:
+                            raise ProgramValidationError(
+                                f"{path}.applies_to.node_ids contains unknown catalog entry '{node_id}'"
+                            ) from exc
+                applies_to[list_field] = normalized_values
+
+            interruptible_only = applies_to_raw.get("interruptible_only")
+            if interruptible_only is not None:
+                if not isinstance(interruptible_only, bool):
+                    raise ProgramValidationError(
+                        f"{path}.applies_to.interruptible_only must be a boolean"
+                    )
+                applies_to["interruptible_only"] = interruptible_only
+
+            condition = raw_policy.get("condition", {}) or {}
+            if not isinstance(condition, Mapping):
+                raise ProgramValidationError(f"{path}.condition must be a mapping")
+
+            self.interrupt_policies[policy_id] = InterruptPolicy(
+                id=policy_id,
+                source=source,
+                applies_to=applies_to,
+                preemption_mode=preemption_mode,
+                handler=handler,
+                after_handler=after_handler,
+                condition=dict(condition),
+                description=str(raw_policy.get("description", "")),
+            )
 
     def _parse_tree(self, data: dict[str, Any]) -> TreeNode:
         return tree_node_from_dict(data)
@@ -1505,6 +1797,56 @@ class Program:
         )
         if errors:
             raise ProgramValidationError(errors[0].message)
+
+    def _validate_interrupt_handlers(self) -> None:
+        for handler in self.interrupt_handlers.values():
+            inferred_claims = _infer_interrupt_handler_resource_claims(handler.root)
+            declared_claims = set(handler.resource_claims)
+            if declared_claims and not inferred_claims.issubset(declared_claims):
+                missing = ", ".join(sorted(inferred_claims - declared_claims))
+                raise ProgramValidationError(
+                    f"interrupt_handlers[{handler.id!r}].resource_claims must include inferred claims: {missing}"
+                )
+            if not declared_claims and inferred_claims:
+                handler.resource_claims = tuple(sorted(inferred_claims))
+            errors, _warnings = collect_tree_validation_issues(
+                handler.root,
+                self._catalog,
+                parameter_defaults=self.get_parameter_defaults(),
+                blackboard_namespaces=self.blackboard_namespaces,
+                blackboard_keys=self.blackboard_keys,
+                skill_catalog=self._skill_catalog,
+                program_profile=self.program_profile,
+                deployment_capability_keys=self._deployment_capability_keys,
+            )
+            if errors:
+                raise ProgramValidationError(
+                    f"interrupt_handlers[{handler.id!r}].root: {errors[0].message}"
+                )
+
+    def _validate_interrupt_policies(self) -> None:
+        resumable_dispositions = {"resume_node", "resume_subtree", "resumable_hold"}
+        for policy in self.interrupt_policies.values():
+            handler = self.interrupt_handlers[policy.handler]
+            handler_claims = set(handler.resource_claims)
+            if (
+                policy.after_handler in resumable_dispositions
+                and policy.preemption_mode != "hold_cycle"
+            ):
+                raise ProgramValidationError(
+                    f"interrupt_policies[{policy.id!r}].after_handler={policy.after_handler!r} "
+                    "requires preemption_mode='hold_cycle'"
+                )
+            incompatible_claims = sorted(
+                handler_claims & _NON_RESUMABLE_INTERRUPT_RESOURCE_CLAIMS
+            )
+            if incompatible_claims and policy.after_handler in resumable_dispositions:
+                claims = ", ".join(incompatible_claims)
+                raise ProgramValidationError(
+                    f"interrupt_policies[{policy.id!r}] uses resumable disposition "
+                    f"{policy.after_handler!r} with handler resource claims that require "
+                    f"exclusive restart/reset semantics: {claims}"
+                )
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to dict matching manyforge.program.v0 schema."""
@@ -1569,6 +1911,34 @@ class Program:
                     for key in self.blackboard_keys.values()
                 ],
             }
+        if self.interrupt_handlers:
+            d["interrupt_handlers"] = {
+                handler_id: {
+                    "description": handler.description,
+                    "root": handler.root.to_dict(),
+                    **({"timeout_s": handler.timeout_s} if handler.timeout_s is not None else {}),
+                    **(
+                        {"resource_claims": list(handler.resource_claims)}
+                        if handler.resource_claims
+                        else {}
+                    ),
+                }
+                for handler_id, handler in self.interrupt_handlers.items()
+            }
+        if self.interrupt_policies:
+            d["interrupt_policies"] = [
+                {
+                    "id": policy.id,
+                    "source": policy.source,
+                    "applies_to": policy.applies_to,
+                    "preemption_mode": policy.preemption_mode,
+                    "handler": policy.handler,
+                    "after_handler": policy.after_handler,
+                    "condition": policy.condition,
+                    "description": policy.description,
+                }
+                for policy in self.interrupt_policies.values()
+            ]
         d["tree"] = self.tree.to_dict() if self.tree else {}
         return d
 

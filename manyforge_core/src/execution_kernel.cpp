@@ -629,6 +629,9 @@ void ExecutionKernel::async_execute_worker(
     const auto exec_start_ns = clock_.now();
     const int64_t exec_timeout_ns = (request.timeouts.execution_timeout_s > 0)
         ? static_cast<int64_t>(request.timeouts.execution_timeout_s * 1e9) : 0;
+    int64_t paused_accumulated_ns = 0;
+    bool pause_in_progress = false;
+    int64_t pause_started_ns = 0;
 
     while (true) {
       bool completed = true;
@@ -644,8 +647,27 @@ void ExecutionKernel::async_execute_worker(
         sm_.set_progress(latest_backend_snapshot.progress);
       }
 
+      const auto now_ns = clock_.now();
+      const bool paused =
+          latest_backend_snapshot.state == ExecutionState::kPaused ||
+          sm_.status().state == ExecutionState::kPaused;
+      if (paused) {
+        if (!pause_in_progress) {
+          pause_in_progress = true;
+          pause_started_ns = now_ns;
+        }
+      } else if (pause_in_progress) {
+        paused_accumulated_ns += now_ns - pause_started_ns;
+        pause_in_progress = false;
+      }
+
+      const int64_t current_pause_ns =
+          pause_in_progress ? now_ns - pause_started_ns : 0;
+      const int64_t effective_elapsed_ns =
+          now_ns - exec_start_ns - paused_accumulated_ns - current_pause_ns;
+
       // Check execution timeout (W-1)
-      if (exec_timeout_ns > 0 && (clock_.now() - exec_start_ns) >= exec_timeout_ns) {
+      if (exec_timeout_ns > 0 && effective_elapsed_ns >= exec_timeout_ns) {
         stop_collision_monitoring();
         (void)execution_backend_.stop();
         // Drain any remaining execution
@@ -883,6 +905,7 @@ Result<uint64_t> ExecutionKernel::execute(const ExecuteRequestDTO& request) {
       current_state == ExecutionState::kFailed ||
       current_state == ExecutionState::kStopped) {
     stop_policy_.request_reset();
+    std::lock_guard<std::mutex> move_lock(active_move_id_mutex_);
     active_move_id_.clear();
   }
 
@@ -909,12 +932,16 @@ Result<uint64_t> ExecutionKernel::execute(const ExecuteRequestDTO& request) {
   uint64_t exec_id = next_execution_id_++;
   auto prev_state = sm_.status().state;
   sm_.set_execution_id(exec_id);
-  active_move_id_ = request.move_id;
+  {
+    std::lock_guard<std::mutex> move_lock(active_move_id_mutex_);
+    active_move_id_ = request.move_id;
+  }
   const auto initial_state =
       prepared.cache_hit ? ExecutionState::kValidating
                          : ExecutionState::kPlanning;
   auto transition = sm_.try_transition(initial_state);
   if (!transition.ok()) {
+    std::lock_guard<std::mutex> move_lock(active_move_id_mutex_);
     active_move_id_.clear();
     sm_.set_execution_id(0);
     return Result<uint64_t>::Err(ErrorCode::kInternalError);
@@ -1044,7 +1071,10 @@ ResetResultDTO ExecutionKernel::reset() {
     stop_collision_monitoring();
     resume_requested_.store(false);
     (void)execution_backend_.reset();
-    active_move_id_.clear();
+    {
+      std::lock_guard<std::mutex> move_lock(active_move_id_mutex_);
+      active_move_id_.clear();
+    }
     ExecutionSnapshot snapshot;
     snapshot.timestamp_ns = clock_.now();
     snapshot.state = ExecutionState::kIdle;
@@ -1060,7 +1090,10 @@ ResetResultDTO ExecutionKernel::reset() {
 
 ExecutionStatus ExecutionKernel::get_status() const {
   auto status = sm_.status();
-  status.active_move_id = active_move_id_;
+  {
+    std::lock_guard<std::mutex> move_lock(active_move_id_mutex_);
+    status.active_move_id = active_move_id_;
+  }
   return status;
 }
 
@@ -1087,7 +1120,10 @@ void ExecutionKernel::sync_snapshot_from_context() {
   ExecutionSnapshot snapshot;
   snapshot.timestamp_ns = clock_.now();
   snapshot.execution_id = sm_.status().execution_id;
-  snapshot.move_id = active_move_id_;
+  {
+    std::lock_guard<std::mutex> move_lock(active_move_id_mutex_);
+    snapshot.move_id = active_move_id_;
+  }
   snapshot.state = sm_.status().state;
   snapshot.progress = sm_.status().progress;
   try {

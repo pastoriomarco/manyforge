@@ -43,6 +43,8 @@ def create_catalog_router(state: ComposerState) -> APIRouter:
                 bbReaderParams=entry.bb_reader_params,
                 bbWriterParams=entry.bb_writer_params,
                 requiredCapabilities=entry.required_capabilities,
+                interruptible=entry.interruptible,
+                defaultInterruptScope=entry.default_interrupt_scope,
             ).model_dump(by_alias=True))
         return {
             "version": state.catalog.version,
@@ -86,6 +88,8 @@ def create_catalog_router(state: ComposerState) -> APIRouter:
             bbReaderParams=entry.bb_reader_params,
             bbWriterParams=entry.bb_writer_params,
             requiredCapabilities=entry.required_capabilities,
+            interruptible=entry.interruptible,
+            defaultInterruptScope=entry.default_interrupt_scope,
         ).model_dump(by_alias=True)
     
     return router

@@ -214,7 +214,7 @@ export function DeploymentPanel() {
     useDeploymentStore();
   const { state } = useCycleStore();
   const [modelEndpointCatalog, setModelEndpointCatalog] = useState<ModelEndpointCatalog | null>(null);
-  const editLocked = state === 'running' || state === 'direct_control';
+  const editLocked = state === 'running' || state === 'interrupt_handler' || state === 'direct_control';
   const runtimeApplied = signature(deployment) === signature(appliedDeployment);
   const diskSaved = signature(deployment) === signature(savedDeployment);
   const deploymentModelEndpointSignature = signature(deployment?.modelEndpoints);

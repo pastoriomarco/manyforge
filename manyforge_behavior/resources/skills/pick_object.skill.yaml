@@ -92,12 +92,12 @@ body:
             position_m: [0.0, 0.0, "${param:grasp_offset_z_m}"]
             orientation_rpy_deg: "${param:tool_orientation_rpy_deg}"
         velocity_scale: "${param:velocity_scale}"
-    - id: set_key_bool_value
+    - id: set_gripper_state
       name: close_gripper
       params:
-        key:
+        state_key:
           key_ref: gripper_closed
-        value: true
+        state: closed
     - id: attach_object_to_link
       name: attach
       params:

@@ -211,6 +211,8 @@ entries:
       blocking: true
       cancellable: true
       timeout_param: duration_s
+    interruptible: true
+    default_interrupt_scope: active_node
     runners:
       py_trees:
         implementation_kind: native
@@ -366,6 +368,8 @@ entries:
       blocking: true
       cancellable: true
       timeout_param: execution_timeout_s
+    interruptible: true
+    default_interrupt_scope: kernel_motion
     runners:
       py_trees:
         implementation_kind: plugin
@@ -576,6 +580,8 @@ entries:
     execution:
       blocking: true
       cancellable: false
+    interruptible: true
+    default_interrupt_scope: active_node
     runners:
       py_trees:
         implementation_kind: plugin
@@ -618,6 +624,8 @@ entries:
     execution:
       blocking: true
       cancellable: false
+    interruptible: true
+    default_interrupt_scope: active_node
     runners:
       py_trees:
         implementation_kind: plugin
@@ -733,10 +741,299 @@ entries:
     execution:
       blocking: true
       cancellable: true
+    interruptible: true
+    default_interrupt_scope: active_node
     runners:
       py_trees:
         implementation_kind: plugin
         class: manyforge_behavior.nodes.WaitForKeyBool
+    observability:
+      emits_events: []
+      consumes_events: []
+
+  # ---------------------------------------------------------------------------
+  # Signals / IO
+  # ---------------------------------------------------------------------------
+
+  - id: check_signal_bool
+    name: CheckSignalBool
+    category: signals
+    description: >-
+      Condition node that succeeds if a declared boolean signal holds the expected level.
+      This is the preferred v1 surface for industrial-style signal gating.
+    tags: [signals, io, condition]
+    profiles:
+      min_profile: v0.0
+    kind: leaf
+    children:
+      min: 0
+      max: 0
+    parameters:
+      - name: key
+        type: string
+        required: true
+        ui_editor: blackboard_key_selector
+        blackboard_role: key_reader
+        blackboard_value_type: bool
+        description: Declared boolean signal key.
+      - name: expected_value
+        type: bool
+        required: true
+        description: The expected signal level.
+    bb_reader_params: [key]
+    required_capabilities: []
+    execution:
+      blocking: false
+      cancellable: false
+    runners:
+      py_trees:
+        implementation_kind: plugin
+        class: manyforge_behavior.nodes.CheckSignalBool
+    observability:
+      emits_events: []
+      consumes_events: []
+
+  - id: set_signal_bool
+    name: SetSignalBool
+    category: signals
+    description: >-
+      Write a declared boolean signal level and succeed.
+    tags: [signals, io]
+    profiles:
+      min_profile: v0.0
+    kind: leaf
+    children:
+      min: 0
+      max: 0
+    parameters:
+      - name: key
+        type: string
+        required: true
+        ui_editor: blackboard_key_selector
+        blackboard_role: key_writer
+        blackboard_value_type: bool
+        description: Declared boolean signal key.
+      - name: value
+        type: bool
+        required: true
+        description: The signal level to set.
+    bb_writer_params: [key]
+    required_capabilities: []
+    execution:
+      blocking: false
+      cancellable: false
+    runners:
+      py_trees:
+        implementation_kind: plugin
+        class: manyforge_behavior.nodes.SetSignalBool
+    observability:
+      emits_events: []
+      consumes_events: []
+
+  - id: wait_for_signal_bool
+    name: WaitForSignalBool
+    category: signals
+    description: >-
+      Block until a declared boolean signal reaches the expected level.
+    tags: [signals, io, wait]
+    profiles:
+      min_profile: v0.0
+    kind: leaf
+    children:
+      min: 0
+      max: 0
+    parameters:
+      - name: key
+        type: string
+        required: true
+        ui_editor: blackboard_key_selector
+        blackboard_role: key_reader
+        blackboard_value_type: bool
+        description: Declared boolean signal key.
+      - name: expected_value
+        type: bool
+        required: true
+        description: The signal level to wait for.
+    bb_reader_params: [key]
+    required_capabilities: []
+    execution:
+      blocking: true
+      cancellable: true
+    interruptible: true
+    default_interrupt_scope: active_node
+    runners:
+      py_trees:
+        implementation_kind: plugin
+        class: manyforge_behavior.nodes.WaitForSignalBool
+    observability:
+      emits_events: []
+      consumes_events: []
+
+  - id: wait_for_signal_edge
+    name: WaitForSignalEdge
+    category: signals
+    description: >-
+      Block until a declared boolean signal produces a rising, falling, or any edge.
+      The node latches the first observed level and succeeds only when a later tick
+      observes the configured transition.
+    tags: [signals, io, edge, wait]
+    profiles:
+      min_profile: v0.0
+    kind: leaf
+    children:
+      min: 0
+      max: 0
+    parameters:
+      - name: key
+        type: string
+        required: true
+        ui_editor: blackboard_key_selector
+        blackboard_role: key_reader
+        blackboard_value_type: bool
+        description: Declared boolean signal key.
+      - name: edge
+        type: enum
+        required: true
+        default: rising
+        enum_values: [rising, falling, any]
+        description: Edge transition to wait for.
+    bb_reader_params: [key]
+    required_capabilities: []
+    execution:
+      blocking: true
+      cancellable: true
+    interruptible: true
+    default_interrupt_scope: active_node
+    runners:
+      py_trees:
+        implementation_kind: plugin
+        class: manyforge_behavior.nodes.WaitForSignalEdge
+    observability:
+      emits_events: []
+      consumes_events: []
+
+  # ---------------------------------------------------------------------------
+  # End effector / logical gripper state
+  # ---------------------------------------------------------------------------
+
+  - id: check_gripper_state
+    name: CheckGripperState
+    category: end_effector
+    description: >-
+      Condition node that succeeds if the declared logical gripper state matches
+      the expected state. This v1 abstraction is state-based; it does not yet
+      imply a dedicated hardware driver or URDF swap.
+    tags: [end_effector, gripper, state, condition]
+    profiles:
+      min_profile: v0.0
+    kind: leaf
+    children:
+      min: 0
+      max: 0
+    parameters:
+      - name: state_key
+        type: string
+        required: true
+        ui_editor: blackboard_key_selector
+        blackboard_role: key_reader
+        blackboard_value_type: bool
+        description: Declared boolean key representing gripper closed/open state.
+      - name: expected_state
+        type: enum
+        required: true
+        default: closed
+        enum_values: [open, closed]
+        description: Expected logical gripper state.
+    bb_reader_params: [state_key]
+    required_capabilities: []
+    execution:
+      blocking: false
+      cancellable: false
+    runners:
+      py_trees:
+        implementation_kind: plugin
+        class: manyforge_behavior.nodes.CheckGripperState
+    observability:
+      emits_events: []
+      consumes_events: []
+
+  - id: set_gripper_state
+    name: SetGripperState
+    category: end_effector
+    description: >-
+      Set the declared logical gripper state. This is the preferred v1 authored
+      surface over writing the raw gripper state key directly.
+    tags: [end_effector, gripper, state]
+    profiles:
+      min_profile: v0.0
+    kind: leaf
+    children:
+      min: 0
+      max: 0
+    parameters:
+      - name: state_key
+        type: string
+        required: true
+        ui_editor: blackboard_key_selector
+        blackboard_role: key_writer
+        blackboard_value_type: bool
+        description: Declared boolean key representing gripper closed/open state.
+      - name: state
+        type: enum
+        required: true
+        default: closed
+        enum_values: [open, closed]
+        description: Logical gripper state to write.
+    bb_writer_params: [state_key]
+    required_capabilities: []
+    execution:
+      blocking: false
+      cancellable: false
+    runners:
+      py_trees:
+        implementation_kind: plugin
+        class: manyforge_behavior.nodes.SetGripperState
+    observability:
+      emits_events: []
+      consumes_events: []
+
+  - id: wait_for_gripper_state
+    name: WaitForGripperState
+    category: end_effector
+    description: >-
+      Block until the declared logical gripper state matches the expected state.
+    tags: [end_effector, gripper, state, wait]
+    profiles:
+      min_profile: v0.0
+    kind: leaf
+    children:
+      min: 0
+      max: 0
+    parameters:
+      - name: state_key
+        type: string
+        required: true
+        ui_editor: blackboard_key_selector
+        blackboard_role: key_reader
+        blackboard_value_type: bool
+        description: Declared boolean key representing gripper closed/open state.
+      - name: expected_state
+        type: enum
+        required: true
+        default: closed
+        enum_values: [open, closed]
+        description: Logical gripper state to wait for.
+    bb_reader_params: [state_key]
+    required_capabilities: []
+    execution:
+      blocking: true
+      cancellable: true
+    interruptible: true
+    default_interrupt_scope: active_node
+    runners:
+      py_trees:
+        implementation_kind: plugin
+        class: manyforge_behavior.nodes.WaitForGripperState
     observability:
       emits_events: []
       consumes_events: []
@@ -1072,6 +1369,8 @@ entries:
     execution:
       blocking: false
       cancellable: true
+    interruptible: true
+    default_interrupt_scope: active_node
     runners:
       py_trees:
         implementation_kind: plugin

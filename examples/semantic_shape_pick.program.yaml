@@ -204,12 +204,12 @@ tree:
             field: pick_pose
         velocity_scale: 0.20
 
-    - id: set_key_bool_value
+    - id: set_gripper_state
       name: close_gripper
       params:
-        key:
+        state_key:
           key_ref: gripper_closed
-        value: true
+        state: closed
 
     - id: attach_object_to_link
       name: attach_selected_object
@@ -263,12 +263,12 @@ tree:
           orientation_rpy_deg: [180.0, 0.0, 0.0]
         velocity_scale: 0.20
 
-    - id: set_key_bool_value
+    - id: set_gripper_state
       name: open_gripper
       params:
-        key:
+        state_key:
           key_ref: gripper_closed
-        value: false
+        state: open
 
     - id: detach_object_from_link
       name: detach_selected_object

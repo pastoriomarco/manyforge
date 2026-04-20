@@ -273,6 +273,8 @@ TEST(ContractsCompile, ErrorCodeConstants) {
   EXPECT_STREQ(kErrorStopFailed, "stop_failed");
   EXPECT_STREQ(kErrorInternalError, "internal_error");
   EXPECT_STREQ(kErrorInvariantViolation, "invariant_violation");
+  EXPECT_STREQ(to_string(ErrorCode::kInvalidRequest), kErrorInvalidRequest);
+  EXPECT_STREQ(to_string(ErrorCode::kPlanningFailed), kErrorPlanningFailed);
 }
 
 // Test CacheMode enum values

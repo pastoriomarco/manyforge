@@ -57,6 +57,11 @@ class CatalogEntryResponse(BaseModel):
     bb_reader_params: List[str] = Field(default_factory=list, alias="bbReaderParams")
     bb_writer_params: List[str] = Field(default_factory=list, alias="bbWriterParams")
     required_capabilities: List[str] = Field(default_factory=list, alias="requiredCapabilities")
+    interruptible: bool = False
+    default_interrupt_scope: Optional[str] = Field(
+        default=None,
+        alias="defaultInterruptScope",
+    )
 
 
 class CatalogResponse(BaseModel):
@@ -106,6 +111,14 @@ class ProgramResponse(BaseModel):
     parameter_count: int = Field(alias="parameterCount")
     parameters: List["ProgramParameterResponse"] = Field(default_factory=list)
     blackboard: "ProgramBlackboardResponse" = Field(default_factory=lambda: ProgramBlackboardResponse())
+    interrupt_handlers: List["ProgramInterruptHandlerResponse"] = Field(
+        default_factory=list,
+        alias="interruptHandlers",
+    )
+    interrupt_policies: List["ProgramInterruptPolicyResponse"] = Field(
+        default_factory=list,
+        alias="interruptPolicies",
+    )
     source_path: str = Field(alias="sourcePath", default="")
 
 
@@ -146,6 +159,25 @@ class ProgramBlackboardResponse(BaseModel):
     model_config = _ALIAS_CFG
     namespaces: List[BlackboardNamespaceResponse] = Field(default_factory=list)
     keys: List[BlackboardKeyResponse] = Field(default_factory=list)
+
+
+class ProgramInterruptHandlerResponse(BaseModel):
+    model_config = _ALIAS_CFG
+    id: str
+    description: str = ""
+    root: TreeNodeResponse
+
+
+class ProgramInterruptPolicyResponse(BaseModel):
+    model_config = _ALIAS_CFG
+    id: str
+    source: str
+    applies_to: Dict[str, Any] = Field(default_factory=dict, alias="appliesTo")
+    preemption_mode: str = Field(alias="preemptionMode")
+    handler: str
+    after_handler: str = Field(alias="afterHandler")
+    condition: Dict[str, Any] = Field(default_factory=dict)
+    description: str = ""
 
 
 class ProgramTreeResponse(BaseModel):
@@ -463,6 +495,23 @@ class PromptTemplateResponse(BaseModel):
     response_tool: Optional[Dict[str, Any]] = Field(default=None, alias="responseTool")
 
 
+class InterruptSourceResponse(BaseModel):
+    model_config = _ALIAS_CFG
+    adapter: str
+    signal: str
+    kind: Literal["edge", "level"]
+    priority: int
+    maskable: bool
+    description: str = ""
+
+
+class AuthorityDomainResponse(BaseModel):
+    model_config = _ALIAS_CFG
+    owner: str
+    on_disconnect: str = Field(alias="onDisconnect")
+    description: str = ""
+
+
 class FullDeploymentResponse(BaseModel):
     model_config = _ALIAS_CFG
     api_version: str = Field(alias="apiVersion")
@@ -485,6 +534,14 @@ class FullDeploymentResponse(BaseModel):
     prompt_templates: Dict[str, PromptTemplateResponse] = Field(
         default_factory=dict,
         alias="promptTemplates",
+    )
+    interrupt_sources: Dict[str, InterruptSourceResponse] = Field(
+        default_factory=dict,
+        alias="interruptSources",
+    )
+    authority_matrix: Dict[str, AuthorityDomainResponse] = Field(
+        default_factory=dict,
+        alias="authorityMatrix",
     )
     source_path: str = Field(alias="sourcePath", default="")
 
@@ -515,6 +572,10 @@ class UpdateDeploymentRequest(BaseModel):
     adapters: Optional[Dict[str, Dict[str, Any]]] = None
     orchestrator: Optional[Dict[str, Any]] = None
     launch: Optional[Dict[str, Any]] = None
+    authority_matrix: Optional[Dict[str, Dict[str, Any]]] = Field(
+        None,
+        alias="authorityMatrix",
+    )
 
 
 class SaveDeploymentRequest(BaseModel):
@@ -668,8 +729,20 @@ class SceneDiagnosticsResponse(BaseModel):
 
 
 class ExecutionEventResponse(BaseModel):
+    event_index: int = 0
+    sequence: int = 0
     timestamp_ns: int
+    timestamp: Optional[str] = None
+    timestamp_wall: Optional[str] = None
+    schema_version: Optional[str] = None
+    trace_source: Optional[str] = None
+    severity: Optional[str] = None
+    component: Optional[str] = None
+    message: Optional[str] = None
+    event: Optional[str] = None
     run_id: Optional[str] = None
+    program_run_id: Optional[str] = None
+    intervention_run_id: Optional[str] = None
     session_id: Optional[str] = None
     session_kind: Optional[str] = None
     authority_source: Optional[str] = None
@@ -722,6 +795,31 @@ class ExecutionDigestObjectResponse(BaseModel):
     position_m: Optional[List[float]] = None
 
 
+class PendingInterruptResponse(BaseModel):
+    model_config = _ALIAS_CFG
+    interrupt_id: str = Field(alias="interruptId")
+    source_id: str = Field(alias="sourceId")
+    source_adapter: str = Field(alias="sourceAdapter")
+    signal: str
+    kind: str
+    priority: int
+    maskable: bool
+    policy_id: Optional[str] = Field(default=None, alias="policyId")
+    handler_id: Optional[str] = Field(default=None, alias="handlerId")
+    preemption_mode: str = Field(alias="preemptionMode")
+    after_handler: str = Field(alias="afterHandler")
+    active_node_name: Optional[str] = Field(default=None, alias="activeNodeName")
+    active_node_id: Optional[str] = Field(default=None, alias="activeNodeId")
+    active_move_id: Optional[str] = Field(default=None, alias="activeMoveId")
+    latched_at_ns: int = Field(alias="latchedAtNs")
+    required_action: str = Field(alias="requiredAction")
+    resume_allowed: bool = Field(alias="resumeAllowed")
+    reset_required: bool = Field(alias="resetRequired")
+    ack_required: bool = Field(alias="ackRequired")
+    timing: Dict[str, Any] = Field(default_factory=dict)
+    details: Dict[str, Any] = Field(default_factory=dict)
+
+
 class ExecutionDigestResponse(BaseModel):
     model_config = _ALIAS_CFG
     state: str
@@ -743,6 +841,14 @@ class ExecutionDigestResponse(BaseModel):
         default=None,
         alias="delegatedRecoveryRequest",
     )
+    pending_interrupt: Optional[PendingInterruptResponse] = Field(
+        default=None,
+        alias="pendingInterrupt",
+    )
+    required_operator_action: str = Field(alias="requiredOperatorAction")
+    resume_allowed: bool = Field(alias="resumeAllowed")
+    reset_required: bool = Field(alias="resetRequired")
+    ack_required: bool = Field(alias="ackRequired")
     timestamp_ns: int = Field(alias="timestampNs")
 
 
@@ -772,6 +878,41 @@ class DebugExportDeploymentResponse(BaseModel):
     source_path: str = Field(default="", alias="sourcePath")
 
 
+class Ros2MedkitTraceRecordResponse(BaseModel):
+    model_config = _ALIAS_CFG
+    record_id: str = Field(alias="recordId")
+    timeline_id: Optional[str] = Field(default=None, alias="timelineId")
+    parent_timeline_id: Optional[str] = Field(default=None, alias="parentTimelineId")
+    event_index: int = Field(alias="eventIndex")
+    monotonic_ns: int = Field(alias="monotonicNs")
+    wall_time: Optional[str] = Field(default=None, alias="wallTime")
+    level: str
+    component: str
+    event_type: str = Field(alias="eventType")
+    message: str
+    execution_mode: Optional[str] = Field(default=None, alias="executionMode")
+    execution_id: int = Field(default=0, alias="executionId")
+    move_id: Optional[str] = Field(default=None, alias="moveId")
+    node: Optional[str] = None
+    session_id: Optional[str] = Field(default=None, alias="sessionId")
+    principal_id: Optional[str] = Field(default=None, alias="principalId")
+    trigger_reason: Optional[str] = Field(default=None, alias="triggerReason")
+    trigger_node_instance: Optional[str] = Field(default=None, alias="triggerNodeInstance")
+    attributes: Dict[str, Any] = Field(default_factory=dict)
+
+
+class Ros2MedkitTraceResponse(BaseModel):
+    model_config = _ALIAS_CFG
+    schema_version: str = Field(alias="schemaVersion")
+    trace_source: str = Field(alias="traceSource")
+    exported_at_ns: int = Field(alias="exportedAtNs")
+    run_id: Optional[str] = Field(default=None, alias="runId")
+    program_run_id: Optional[str] = Field(default=None, alias="programRunId")
+    intervention_run_ids: List[str] = Field(default_factory=list, alias="interventionRunIds")
+    parent_run_ids: List[str] = Field(default_factory=list, alias="parentRunIds")
+    records: List[Ros2MedkitTraceRecordResponse] = Field(default_factory=list)
+
+
 class DebugExportResponse(BaseModel):
     model_config = _ALIAS_CFG
     exported_at_ns: int = Field(alias="exportedAtNs")
@@ -786,10 +927,23 @@ class DebugExportResponse(BaseModel):
     scene_diagnostics: Dict[str, Any] = Field(alias="sceneDiagnostics")
     scene_trace: Dict[str, Any] = Field(alias="sceneTrace")
     blackboard: Dict[str, Any]
+    signal_snapshot: Dict[str, Any] = Field(default_factory=dict, alias="signalSnapshot")
     node_statuses: Dict[str, str] = Field(alias="nodeStatuses")
     intervention_session: Optional[Dict[str, Any]] = Field(default=None, alias="interventionSession")
     runtime_overrides: Dict[str, Any] = Field(default_factory=dict, alias="runtimeOverrides")
     model_events: List[Dict[str, Any]] = Field(default_factory=list, alias="modelEvents")
+    medkit_trace: Dict[str, Any] = Field(default_factory=dict, alias="medkitTrace")
+
+
+class DebugSignalPublishRequest(BaseModel):
+    model_config = _ALIAS_CFG
+    adapter: str
+    signal: str
+    value: Any
+    stale_after_ms: Optional[int] = Field(default=1500, alias="staleAfterMs", ge=0)
+    mirror_key: Optional[str] = Field(default=None, alias="mirrorKey")
+    clear_on_stale: bool = Field(default=True, alias="clearOnStale")
+    metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
 # --- File Browser ---

@@ -60,6 +60,35 @@ def _write_program_with_runtime_policy(
     return str(target)
 
 
+def _write_program_with_interrupt_policy(tmp_path: Path) -> str:
+    data = yaml.safe_load(Path(_PROGRAM_PATH).read_text(encoding="utf-8"))
+    data["interrupt_handlers"] = {
+        "pause_announce": {
+            "description": "Minimal handler for pause hold.",
+            "root": {
+                "id": "sequence",
+                "name": "pause_announce",
+                "children": [
+                    {"id": "reset_trajectories", "name": "noop_interrupt"},
+                ],
+            },
+        },
+    }
+    data["interrupt_policies"] = [
+        {
+            "id": "operator_pause_hold",
+            "source": "operator_pause",
+            "applies_to": {"subtree_root": "main_sequence", "interruptible_only": True},
+            "preemption_mode": "hold_cycle",
+            "handler": "pause_announce",
+            "after_handler": "resumable_hold",
+        },
+    ]
+    target = tmp_path / "interrupts.program.yaml"
+    target.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    return str(target)
+
+
 @pytest.fixture
 def state():
     """Create a fresh ComposerState for each test."""
@@ -255,6 +284,26 @@ def test_catalog_entry_includes_ui_editor_hints(client):
     assert params["pick_offset_envelope"]["uiEditor"] == "pose_envelope"
     assert params["approach_offset_envelope"]["uiEditor"] == "pose_envelope"
     assert "place_pose_map" not in params
+
+
+def test_catalog_entry_includes_interrupt_metadata(client):
+    """Catalog entry surfaces interruptibility metadata for runtime policy authors."""
+    response = client.get("/api/catalog/move_manipulator_action")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["interruptible"] is True
+    assert data["defaultInterruptScope"] == "kernel_motion"
+
+
+def test_program_response_includes_interrupt_metadata(client, tmp_path):
+    """Program load surfaces declared interrupt handlers and policies."""
+    program_path = _write_program_with_interrupt_policy(tmp_path)
+    response = client.post("/api/program/load", json={"path": program_path})
+    assert response.status_code == 200
+    data = response.json()
+    assert data["interruptHandlers"][0]["id"] == "pause_announce"
+    assert data["interruptPolicies"][0]["id"] == "operator_pause_hold"
+    assert data["interruptPolicies"][0]["preemptionMode"] == "hold_cycle"
 
 
 def test_catalog_entry_not_found(client):
@@ -1439,6 +1488,40 @@ def test_save_program(client, state):
             os.unlink(suffixed_path)
 
 
+def test_save_program_no_diff_revalidates_loaded_program(client, monkeypatch):
+    """Saving without an explicit patch still rebuilds and revalidates the artifact."""
+    import os
+    import tempfile
+
+    from manyforge_behavior.program import Program as RealProgram
+    from manyforge_composer.backend import routes_program as routes_program_module
+
+    client.post("/api/program/load", json={"path": _PROGRAM_PATH, "deployment_path": _DEPLOYMENT_PATH})
+
+    called = False
+
+    class ObservedProgram:
+        @staticmethod
+        def from_dict(*args, **kwargs):
+            nonlocal called
+            called = True
+            return RealProgram.from_dict(*args, **kwargs)
+
+    monkeypatch.setattr(routes_program_module, "Program", ObservedProgram)
+
+    tmp_path = tempfile.mktemp(suffix=".yaml")
+    try:
+        response = client.post("/api/program/save", json={"path": tmp_path})
+        assert response.status_code == 200
+        assert called is True
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        suffixed_path = f"{tmp_path}.program.yaml"
+        if os.path.exists(suffixed_path):
+            os.unlink(suffixed_path)
+
+
 def test_save_program_tree_payload_does_not_apply_runtime_state(client):
     """Saving a modified tree payload writes disk only and does not mutate loaded runtime state."""
     import os
@@ -1870,6 +1953,36 @@ def test_published_scene_snapshot_returns_stored_image():
     assert response.headers["content-type"] == "image/jpeg"
     assert response.headers["etag"] == published["sha256"]
     assert response.content == b"\xff\xd8fake-jpeg"
+
+
+def test_publish_scene_snapshot_rejects_invalid_explicit_fetch_base_url():
+    """Explicit fetch_base_url must be an absolute HTTP(S) URL with a host."""
+    kernel = MockKernelClient()
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+
+    with pytest.raises(RuntimeError, match="absolute http\\(s\\) URL with a host"):
+        state.publish_scene_snapshot(
+            b"\xff\xd8fake-jpeg",
+            width=320,
+            height=240,
+            format="jpeg",
+            fetch_base_url="javascript:alert(1)",
+        )
+
+
+def test_publish_scene_snapshot_rejects_invalid_public_api_base_url():
+    """Configured public_api_base_url must also be an absolute HTTP(S) URL with a host."""
+    kernel = MockKernelClient()
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state.public_api_base_url = "/relative/base"
+
+    with pytest.raises(RuntimeError, match="absolute http\\(s\\) URL with a host"):
+        state.publish_scene_snapshot(
+            b"\xff\xd8fake-jpeg",
+            width=320,
+            height=240,
+            format="jpeg",
+        )
 
 
 def test_published_scene_snapshot_404_for_missing_id():

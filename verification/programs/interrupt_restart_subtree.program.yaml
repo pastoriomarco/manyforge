@@ -1,0 +1,47 @@
+api_version: manyforge.program.v0
+program_profile: v0.1
+name: interrupt_restart_subtree
+catalog_version: "0.1.0"
+
+robot:
+  robot_id: ur5
+  group_id: arm
+  base_frame: base_link
+  tcp_frame: tool0
+
+blackboard:
+  keys:
+    - id: done_marker
+      type: bool
+      key: cycle/done
+
+interrupt_handlers:
+  pause_announce:
+    root:
+      id: reset_trajectories
+      name: noop
+
+interrupt_policies:
+  - id: operator_pause_restart
+    source: operator_pause
+    applies_to:
+      subtree_root: main_sequence
+      interruptible_only: true
+    preemption_mode: hold_cycle
+    handler: pause_announce
+    after_handler: restart_subtree
+
+tree:
+  id: sequence
+  name: main_sequence
+  children:
+    - id: timer
+      name: wait_here
+      params:
+        duration_s: 1.0
+    - id: set_signal_bool
+      name: mark_done
+      params:
+        key:
+          key_ref: done_marker
+        value: true

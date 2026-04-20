@@ -1,0 +1,56 @@
+scenario_id: interrupt_deferred_priority_queue
+description: Qualification scenario for deferred stacked interrupts and higher-priority selection after handler completion.
+program: verification/programs/interrupt_deferred_priority.program.yaml
+deployment: verification/deployments/interrupt_qualification.deployment.yaml
+timeouts:
+  scenario_s: 60
+  poll_interval_ms: 50
+steps:
+  - action: load_program
+  - action: cycle_run
+  - action: wait_for
+    endpoint: digest
+    path: state
+    equals: running
+    timeout_s: 10
+  - action: publish_signal
+    adapter: demo_ui
+    signal: pause_request
+    value: true
+    stale_after_ms: 1500
+    metadata:
+      reason: deferred_pause_qualification
+  - action: wait_for
+    endpoint: digest
+    path: state
+    equals: interrupt_handler
+    timeout_s: 10
+  - action: publish_signal
+    adapter: demo_ui
+    signal: fault_request
+    value: true
+    stale_after_ms: 1500
+    metadata:
+      reason: deferred_fault_qualification
+  - action: wait_for
+    endpoint: digest
+    path: pendingInterrupt.sourceId
+    equals: operator_fault
+    timeout_s: 15
+  - action: wait_for
+    endpoint: digest
+    path: requiredOperatorAction
+    equals: reset
+    timeout_s: 5
+assertions:
+  - endpoint: history
+    event_type: interrupt_deferred
+  - endpoint: digest
+    path: pendingInterrupt.timing.deferredWaitNs
+    greater_equal: 1
+  - endpoint: digest
+    path: pendingInterrupt.sourceId
+    equals: operator_fault
+  - endpoint: history
+    event_type: kernel_error
+    absent: true

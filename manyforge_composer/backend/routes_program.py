@@ -205,6 +205,25 @@ def _deployment_to_full_response(deployment: Deployment, source_path: str) -> di
             }
             for template_id, template in deployment.prompt_templates.items()
         },
+        interruptSources={
+            source_id: {
+                "adapter": source.adapter,
+                "signal": source.signal,
+                "kind": source.kind,
+                "priority": source.priority,
+                "maskable": source.maskable,
+                "description": source.description,
+            }
+            for source_id, source in deployment.interrupt_sources.items()
+        },
+        authorityMatrix={
+            domain: {
+                "owner": config.owner,
+                "onDisconnect": config.on_disconnect,
+                "description": config.description,
+            }
+            for domain, config in deployment.authority_matrix.items()
+        },
         sourcePath=source_path,
     ).model_dump(by_alias=True)
 
@@ -251,6 +270,33 @@ def _program_blackboard_to_response(program: Program) -> dict:
             for key in program.blackboard_keys.values()
         ],
     }
+
+
+def _program_interrupt_handlers_to_response(program: Program) -> list[dict]:
+    return [
+        {
+            "id": handler.id,
+            "description": handler.description,
+            "root": _tree_to_response(handler.root),
+        }
+        for handler in program.interrupt_handlers.values()
+    ]
+
+
+def _program_interrupt_policies_to_response(program: Program) -> list[dict]:
+    return [
+        {
+            "id": policy.id,
+            "source": policy.source,
+            "appliesTo": policy.applies_to,
+            "preemptionMode": policy.preemption_mode,
+            "handler": policy.handler,
+            "afterHandler": policy.after_handler,
+            "condition": policy.condition,
+            "description": policy.description,
+        }
+        for policy in program.interrupt_policies.values()
+    ]
 
 
 def create_program_router(state: ComposerState) -> APIRouter:
@@ -303,6 +349,8 @@ def create_program_router(state: ComposerState) -> APIRouter:
             parameterCount=len(program.parameters),
             parameters=_program_parameters_to_response(program),
             blackboard=_program_blackboard_to_response(program),
+            interruptHandlers=_program_interrupt_handlers_to_response(program),
+            interruptPolicies=_program_interrupt_policies_to_response(program),
             sourcePath=state.program_source_path,
         ).model_dump(by_alias=True)
 
@@ -328,6 +376,8 @@ def create_program_router(state: ComposerState) -> APIRouter:
             parameterCount=len(program.parameters),
             parameters=_program_parameters_to_response(program),
             blackboard=_program_blackboard_to_response(program),
+            interruptHandlers=_program_interrupt_handlers_to_response(program),
+            interruptPolicies=_program_interrupt_policies_to_response(program),
             sourcePath=state.program_source_path,
         ).model_dump(by_alias=True)
 
@@ -361,6 +411,8 @@ def create_program_router(state: ComposerState) -> APIRouter:
             parameterCount=len(saved_program.parameters),
             parameters=_program_parameters_to_response(saved_program),
             blackboard=_program_blackboard_to_response(saved_program),
+            interruptHandlers=_program_interrupt_handlers_to_response(saved_program),
+            interruptPolicies=_program_interrupt_policies_to_response(saved_program),
             sourcePath=state.program_source_path,
         ).model_dump(by_alias=True)
     
@@ -698,8 +750,8 @@ def create_program_router(state: ComposerState) -> APIRouter:
     def update_program_tree(request: UpdateTreeRequest) -> dict:
         if state.program is None:
             raise HTTPException(status_code=404, detail="No program loaded")
-        if state.cycle_manager is not None and state.cycle_manager.state.value == "running":
-            raise HTTPException(status_code=409, detail="Cannot apply program changes while running")
+        if state.cycle_manager is not None and state.cycle_manager.state.value in {"running", "interrupt_handler"}:
+            raise HTTPException(status_code=409, detail="Cannot apply program changes while execution is active")
         try:
             program_data = state.program.to_dict()
             program_data["tree"] = request.tree.model_dump()
@@ -738,26 +790,23 @@ def create_program_router(state: ComposerState) -> APIRouter:
                 default_suffix=".program.yaml",
                 kind_label="Program path",
             )
-            if request.tree is None and request.parameters is None:
-                state.program.save(target_path)
-            else:
-                program_data = state.program.to_dict()
-                if request.tree is not None:
-                    program_data["tree"] = request.tree.model_dump()
-                if request.parameters is not None:
-                    program_data["parameters"] = [
-                        parameter.model_dump()
-                        for parameter in request.parameters
-                    ]
-                if request.blackboard is not None:
-                    program_data["blackboard"] = request.blackboard.model_dump(by_alias=True)
-                Program.from_dict(
-                    program_data,
-                    state.catalog,
-                    path=target_path,
-                    skill_catalog=state.skill_catalog,
-                    deployment_capability_keys=_deployment_capability_keys(state),
-                ).save(target_path)
+            program_data = state.program.to_dict()
+            if request.tree is not None:
+                program_data["tree"] = request.tree.model_dump()
+            if request.parameters is not None:
+                program_data["parameters"] = [
+                    parameter.model_dump()
+                    for parameter in request.parameters
+                ]
+            if request.blackboard is not None:
+                program_data["blackboard"] = request.blackboard.model_dump(by_alias=True)
+            Program.from_dict(
+                program_data,
+                state.catalog,
+                path=target_path,
+                skill_catalog=state.skill_catalog,
+                deployment_capability_keys=_deployment_capability_keys(state),
+            ).save(target_path)
         except HTTPException:
             raise
         except Exception as e:
@@ -769,8 +818,8 @@ def create_program_router(state: ComposerState) -> APIRouter:
     def update_deployment(request: UpdateDeploymentRequest) -> dict:
         if state.deployment is None:
             raise HTTPException(status_code=404, detail="No deployment loaded")
-        if state.cycle_manager is not None and state.cycle_manager.state.value == "running":
-            raise HTTPException(status_code=409, detail="Cannot apply deployment changes while running")
+        if state.cycle_manager is not None and state.cycle_manager.state.value in {"running", "interrupt_handler"}:
+            raise HTTPException(status_code=409, detail="Cannot apply deployment changes while execution is active")
         try:
             deployment_dict = state.deployment.to_dict()
             patch_dict = request.model_dump(exclude_unset=True)
@@ -826,8 +875,8 @@ def create_program_router(state: ComposerState) -> APIRouter:
     def apply_session(request: ApplySessionRequest) -> dict:
         if state.program is None:
             raise HTTPException(status_code=404, detail="No program loaded")
-        if state.cycle_manager is not None and state.cycle_manager.state.value == "running":
-            raise HTTPException(status_code=409, detail="Cannot apply changes while running")
+        if state.cycle_manager is not None and state.cycle_manager.state.value in {"running", "interrupt_handler"}:
+            raise HTTPException(status_code=409, detail="Cannot apply changes while execution is active")
 
         try:
             program = state.program

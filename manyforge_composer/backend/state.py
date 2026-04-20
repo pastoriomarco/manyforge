@@ -29,6 +29,23 @@ from .security import normalize_allowed_roots
 logger = logging.getLogger(__name__)
 
 
+def _normalize_scene_snapshot_base_url(value: str, *, field_name: str) -> str:
+    candidate = value.strip().rstrip("/")
+    if not candidate:
+        raise RuntimeError(f"{field_name} is empty")
+
+    parsed = urlparse(candidate)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise RuntimeError(
+            f"{field_name} must be an absolute http(s) URL with a host"
+        )
+    if parsed.username or parsed.password:
+        raise RuntimeError(
+            f"{field_name} must not include embedded credentials"
+        )
+    return candidate
+
+
 @dataclass
 class RuntimeOverrideRecord:
     node_name: str
@@ -169,7 +186,10 @@ class ComposerState:
     ) -> str:
         explicit = (fetch_base_url or "").strip()
         if explicit:
-            return explicit.rstrip("/")
+            return _normalize_scene_snapshot_base_url(
+                explicit,
+                field_name="Scene snapshot fetch base URL",
+            )
 
         public_base = (self.public_api_base_url or "").strip()
         if model_base_url and public_base:
@@ -194,10 +214,16 @@ class ComposerState:
                     query="",
                     fragment="",
                 )
-                return derived.geturl().rstrip("/")
+                return _normalize_scene_snapshot_base_url(
+                    derived.geturl(),
+                    field_name="Derived scene snapshot fetch base URL",
+                )
 
         if public_base:
-            return public_base.rstrip("/")
+            return _normalize_scene_snapshot_base_url(
+                public_base,
+                field_name="Composer public API base URL",
+            )
 
         raise RuntimeError("No scene snapshot fetch base URL is configured")
 
@@ -218,6 +244,7 @@ class ComposerState:
         self.cycle_manager.set_on_delegated_recovery_requested(
             self._record_delegated_recovery_requested,
         )
+        self.cycle_manager.set_on_interrupt_event(self._record_interrupt_event)
 
     def _current_or_last_run_id_for_recovery(self) -> Optional[str]:
         self.event_recorder.observe(self)
@@ -225,6 +252,14 @@ class ComposerState:
 
     def _record_delegated_recovery_requested(self, request) -> None:
         self.event_recorder.record_delegated_recovery_requested(request)
+
+    def _record_interrupt_event(self, **payload: Any) -> None:
+        self.event_recorder.observe(self)
+        self.event_recorder.record_interrupt_event(
+            run_id=self.event_recorder.current_run_id or self.event_recorder.last_run_id,
+            execution_mode="program",
+            **payload,
+        )
 
     @property
     def kernel(self) -> Optional[KernelClient]:
@@ -523,9 +558,9 @@ class ComposerState:
     ) -> Program:
         """Save a materialized program view produced from runtime overrides."""
         cycle_state = self._current_cycle_state()
-        if cycle_state == "running":
+        if cycle_state in {"running", "interrupt_handler"}:
             raise RuntimeError(
-                "Materialized runtime override saves are not allowed while the program is RUNNING"
+                "Materialized runtime override saves are not allowed while execution is active"
             )
         selected_records = self._selected_runtime_override_records(
             include_staged=include_staged,

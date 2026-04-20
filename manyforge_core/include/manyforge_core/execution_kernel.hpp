@@ -140,6 +140,7 @@ class ExecutionKernel {
 
   std::mutex execute_mutex_;
   std::atomic<uint64_t> next_execution_id_{1};
+  mutable std::mutex active_move_id_mutex_;
   std::string active_move_id_;
 
   // Event subscription

@@ -1,11 +1,13 @@
 cmake_minimum_required(VERSION 3.14)
 project(manyforge_roboplan VERSION 0.1.0 LANGUAGES CXX)
+set(COAL_DISABLE_HPP_FCL_WARNINGS ON)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 add_compile_options(-Wall -Wextra -Werror -Wno-deprecated-copy)
+add_compile_definitions(COAL_DISABLE_HPP_FCL_WARNINGS)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 include(FetchContent)
 

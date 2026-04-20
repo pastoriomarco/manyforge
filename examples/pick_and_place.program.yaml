@@ -99,12 +99,12 @@ tree:
         execution_timeout_s: 30.0
 
     # 3. Close gripper + attach object to tool
-    - id: set_key_bool_value
+    - id: set_gripper_state
       name: close_gripper
       params:
-        key:
+        state_key:
           key_ref: gripper_closed
-        value: true
+        state: closed
 
     - id: attach_object_to_link
       name: attach_graspable
@@ -174,12 +174,12 @@ tree:
         execution_timeout_s: 30.0
 
     # 8. Open gripper + detach object to world
-    - id: set_key_bool_value
+    - id: set_gripper_state
       name: open_gripper
       params:
-        key:
+        state_key:
           key_ref: gripper_closed
-        value: false
+        state: open
 
     - id: detach_object_from_link
       name: detach_graspable

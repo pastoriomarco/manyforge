@@ -32,9 +32,11 @@ _ALLOWED_EVENT_TYPES = {
 }
 _ALLOWED_EVENT_PREFIXES = (
     "intervention_",
+    "interrupt_",
     "model_call_",
     "runtime_override_",
 )
+_SEVERITY_ORDER = {"DEBUG": 10, "INFO": 20, "WARN": 30, "WARNING": 30, "ERROR": 40, "CRITICAL": 50}
 
 
 def _wall_timestamp_iso() -> str:
@@ -66,6 +68,8 @@ def _component_for_event(event_type: str) -> str:
         return "manyforge.runtime_override"
     if event_type.startswith("intervention_"):
         return "manyforge.intervention"
+    if event_type.startswith("interrupt_"):
+        return "manyforge.interrupt"
     if event_type.startswith("cycle_"):
         return "manyforge.cycle"
     if event_type.startswith("kernel_") or event_type in {
@@ -289,9 +293,30 @@ class EventRecorder:
         *,
         run_id: Optional[str] = None,
         limit: Optional[int] = None,
+        start_ns: Optional[int] = None,
+        end_ns: Optional[int] = None,
+        min_severity: Optional[str] = None,
+        components: Optional[list[str]] = None,
+        event_types: Optional[list[str]] = None,
+        execution_id: Optional[int] = None,
+        program_run_id: Optional[str] = None,
+        intervention_run_id: Optional[str] = None,
     ) -> dict[str, Any]:
         selected_run_id = run_id or self.last_run_id
-        events = self._load_events_for_run(selected_run_id, limit=limit)
+        events = self._load_events_for_run(selected_run_id)
+        events = self._filter_events(
+            events,
+            start_ns=start_ns,
+            end_ns=end_ns,
+            min_severity=min_severity,
+            components=components,
+            event_types=event_types,
+            execution_id=execution_id,
+            program_run_id=program_run_id,
+            intervention_run_id=intervention_run_id,
+        )
+        if limit is not None and limit >= 0:
+            events = events[-limit:]
 
         regular_events = [event for event in events if event["type"] != "node_status_transition"]
         node_transitions = [
@@ -336,8 +361,165 @@ class EventRecorder:
         self,
         *,
         run_id: Optional[str] = None,
+        start_ns: Optional[int] = None,
+        end_ns: Optional[int] = None,
+        min_severity: Optional[str] = None,
+        components: Optional[list[str]] = None,
+        event_types: Optional[list[str]] = None,
+        execution_id: Optional[int] = None,
+        program_run_id: Optional[str] = None,
+        intervention_run_id: Optional[str] = None,
     ) -> list[dict[str, Any]]:
-        return self._load_events_for_run(run_id or self.last_run_id)
+        return self._filter_events(
+            self._load_events_for_run(run_id or self.last_run_id),
+            start_ns=start_ns,
+            end_ns=end_ns,
+            min_severity=min_severity,
+            components=components,
+            event_types=event_types,
+            execution_id=execution_id,
+            program_run_id=program_run_id,
+            intervention_run_id=intervention_run_id,
+        )
+
+    def export_ros2_medkit_trace(
+        self,
+        *,
+        run_id: Optional[str] = None,
+        exported_at_ns: Optional[int] = None,
+    ) -> dict[str, Any]:
+        """Export a normalized trace bundle shaped for ros2_medkit-style correlation."""
+        selected_run_id = run_id or self.last_run_id
+        events = self.export_events(run_id=selected_run_id)
+        program_run_id = next(
+            (
+                event.get("program_run_id")
+                for event in events
+                if isinstance(event.get("program_run_id"), str)
+                and event.get("program_run_id")
+            ),
+            selected_run_id,
+        )
+        intervention_run_ids = sorted(
+            {
+                event["intervention_run_id"]
+                for event in events
+                if isinstance(event.get("intervention_run_id"), str)
+                and event.get("intervention_run_id")
+            }
+        )
+        parent_run_ids = sorted(
+            {
+                event["parent_run_id"]
+                for event in events
+                if isinstance(event.get("parent_run_id"), str)
+                and event.get("parent_run_id")
+            }
+        )
+
+        records: list[dict[str, Any]] = []
+        for event in events:
+            timeline_id = (
+                event.get("intervention_run_id")
+                or event.get("program_run_id")
+                or event.get("run_id")
+            )
+            attributes: dict[str, Any] = {}
+            if isinstance(event.get("details"), dict):
+                attributes.update(event["details"])
+            if isinstance(event.get("authority_source"), str):
+                attributes["authority_source"] = event["authority_source"]
+            if isinstance(event.get("grant_type"), str):
+                attributes["grant_type"] = event["grant_type"]
+            if isinstance(event.get("session_kind"), str):
+                attributes["session_kind"] = event["session_kind"]
+
+            records.append(
+                {
+                    "record_id": (
+                        f"{timeline_id or 'unknown'}:{event.get('event_index', 0)}"
+                    ),
+                    "timeline_id": timeline_id,
+                    "parent_timeline_id": event.get("parent_run_id"),
+                    "event_index": int(event.get("event_index", 0)),
+                    "monotonic_ns": int(event.get("timestamp_ns", 0)),
+                    "wall_time": event.get("timestamp_wall") or event.get("timestamp"),
+                    "level": event.get("severity", "INFO"),
+                    "component": event.get("component", "manyforge.runtime"),
+                    "event_type": event.get("type", "unknown"),
+                    "message": event.get("message", ""),
+                    "execution_mode": event.get("execution_mode"),
+                    "execution_id": int(event.get("execution_id") or 0),
+                    "move_id": event.get("move_id"),
+                    "node": event.get("node"),
+                    "session_id": event.get("session_id"),
+                    "principal_id": event.get("principal_id"),
+                    "trigger_reason": event.get("trigger_reason"),
+                    "trigger_node_instance": event.get("trigger_node_instance"),
+                    "attributes": attributes,
+                }
+            )
+
+        return {
+            "schema_version": "manyforge.ros2_medkit_trace.v1",
+            "trace_source": "manyforge_composer",
+            "exported_at_ns": exported_at_ns or time.monotonic_ns(),
+            "run_id": selected_run_id,
+            "program_run_id": program_run_id,
+            "intervention_run_ids": intervention_run_ids,
+            "parent_run_ids": parent_run_ids,
+            "records": records,
+        }
+
+    def _filter_events(
+        self,
+        events: list[dict[str, Any]],
+        *,
+        start_ns: Optional[int] = None,
+        end_ns: Optional[int] = None,
+        min_severity: Optional[str] = None,
+        components: Optional[list[str]] = None,
+        event_types: Optional[list[str]] = None,
+        execution_id: Optional[int] = None,
+        program_run_id: Optional[str] = None,
+        intervention_run_id: Optional[str] = None,
+    ) -> list[dict[str, Any]]:
+        """Apply server-side query filters to decoded event dictionaries."""
+        normalized_components = [item for item in (components or []) if item]
+        normalized_event_types = {item for item in (event_types or []) if item}
+        severity_floor = None
+        if min_severity is not None:
+            severity_floor = _SEVERITY_ORDER.get(min_severity.upper())
+            if severity_floor is None:
+                raise ValueError(f"Unsupported severity level: {min_severity}")
+
+        filtered: list[dict[str, Any]] = []
+        for event in events:
+            timestamp_ns = event.get("timestamp_ns")
+            if start_ns is not None and (not isinstance(timestamp_ns, int) or timestamp_ns < start_ns):
+                continue
+            if end_ns is not None and (not isinstance(timestamp_ns, int) or timestamp_ns > end_ns):
+                continue
+            if severity_floor is not None:
+                current = _SEVERITY_ORDER.get(str(event.get("severity", "")).upper(), 0)
+                if current < severity_floor:
+                    continue
+            component = str(event.get("component", ""))
+            if normalized_components and not any(
+                component == prefix or component.startswith(f"{prefix}.")
+                for prefix in normalized_components
+            ):
+                continue
+            if normalized_event_types and event.get("type") not in normalized_event_types:
+                continue
+            if execution_id is not None and int(event.get("execution_id") or 0) != execution_id:
+                continue
+            if program_run_id is not None and event.get("program_run_id") != program_run_id:
+                continue
+            if intervention_run_id is not None and event.get("intervention_run_id") != intervention_run_id:
+                continue
+            filtered.append(event)
+        return filtered
 
     def record_runtime_override_event(
         self,
@@ -398,6 +580,45 @@ class EventRecorder:
                 "persistent_edit_policy": request.persistent_edit_policy,
                 "requested_from_state": request.requested_from_state,
             },
+        )
+
+    def record_interrupt_event(
+        self,
+        *,
+        action: str,
+        interrupt_id: str,
+        source: str,
+        policy_id: Optional[str] = None,
+        preemption_mode: Optional[str] = None,
+        disposition: Optional[str] = None,
+        active_node_id: Optional[str] = None,
+        active_move_id: Optional[str] = None,
+        run_id: Optional[str] = None,
+        parent_run_id: Optional[str] = None,
+        execution_mode: Optional[str] = None,
+        details: Optional[dict[str, Any]] = None,
+    ) -> None:
+        """Record an interrupt lifecycle event with a stable envelope."""
+        payload = dict(details or {})
+        payload["interrupt_id"] = interrupt_id
+        payload["source"] = source
+        if policy_id is not None:
+            payload["policy_id"] = policy_id
+        if preemption_mode is not None:
+            payload["preemption_mode"] = preemption_mode
+        if disposition is not None:
+            payload["disposition"] = disposition
+        if active_node_id is not None:
+            payload["active_node_id"] = active_node_id
+        if active_move_id is not None:
+            payload["active_move_id"] = active_move_id
+        self._record_event(
+            event_type=f"interrupt_{action}",
+            details=payload,
+            move_id=active_move_id,
+            run_id=run_id,
+            parent_run_id=parent_run_id,
+            execution_mode=execution_mode,
         )
 
     def record_model_event(
@@ -806,6 +1027,8 @@ class EventRecorder:
                 "timestamp_ns": timestamp_ns,
                 "timestamp": wall_timestamp,
                 "timestamp_wall": wall_timestamp,
+                "schema_version": "manyforge.execution_event.v1",
+                "trace_source": "event_recorder",
                 "run_id": run_id,
                 "program_run_id": program_run_id,
                 "execution_id": execution_id,

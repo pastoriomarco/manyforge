@@ -66,12 +66,12 @@ tree:
         execution_timeout_s: 10.0
 
     # Phase 3: Simulate gripper close
-    - id: set_key_bool_value
+    - id: set_gripper_state
       name: close_gripper
       params:
-        key:
+        state_key:
           key_ref: gripper_closed
-        value: true
+        state: closed
 
     # Phase 4: Remove pick object from scene (attached to gripper)
     - id: remove_collision_object
@@ -108,12 +108,12 @@ tree:
         frame_id: base_link
 
     # Phase 8: Simulate gripper open
-    - id: set_key_bool_value
+    - id: set_gripper_state
       name: open_gripper
       params:
-        key:
+        state_key:
           key_ref: gripper_closed
-        value: false
+        state: open
 
     # Phase 9: Move to home
     - id: move_manipulator_action

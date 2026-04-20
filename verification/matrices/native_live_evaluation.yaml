@@ -1,0 +1,7 @@
+matrix_id: native_live_evaluation
+description: Native live planner/executor qualification batch.
+scenarios:
+  - path: verification/scenarios/native_simple_motion_complete.scenario.yaml
+    tags: [native, live]
+  - path: verification/scenarios/native_simple_motion_reset_and_rerun.scenario.yaml
+    tags: [native, live]

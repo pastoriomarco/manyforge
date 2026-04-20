@@ -180,12 +180,23 @@ def _native_model_and_group_from_deployment(
     return model_name, group_name
 
 
-def _make_kernel(deployment: Deployment | None = None):
+def _make_kernel(
+    deployment: Deployment | None = None,
+    *,
+    kernel_mode: str = "auto",
+    mock_execute_duration_s: float = 1.5,
+):
     """Try NativeKernelClient backed by real RoboPlan C++; fall back to Mock.
 
     Returns:
         (kernel, bundle) — bundle is None when using MockKernelClient.
     """
+    if kernel_mode == "mock":
+        logger.info(
+            "Using MockKernelClient (forced), execute_duration_s=%.3f",
+            mock_execute_duration_s,
+        )
+        return MockKernelClient(execute_duration_s=mock_execute_duration_s), None
     model_name, group_name = _native_model_and_group_from_deployment(deployment)
     collision_monitor_period_ns = _collision_monitor_period_ns_from_deployment(
         deployment
@@ -213,7 +224,7 @@ def _make_kernel(deployment: Deployment | None = None):
         return kernel, bundle
     except Exception as e:
         logger.info("NativeKernelClient unavailable (%s), using MockKernelClient", e)
-        return MockKernelClient(execute_duration_s=1.5), None
+        return MockKernelClient(execute_duration_s=mock_execute_duration_s), None
 
 
 def _resolve_roboplan_paths():
@@ -269,6 +280,18 @@ def main():
     parser.add_argument("--package-dir", action="append", default=[],
                         help="Directory for package:// URI resolution (repeatable)")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    parser.add_argument(
+        "--kernel-mode",
+        default="auto",
+        choices=["auto", "mock"],
+        help="Kernel selection mode for REST/qualification runs",
+    )
+    parser.add_argument(
+        "--mock-execute-duration-s",
+        type=float,
+        default=1.5,
+        help="Per-move execution duration for mock-kernel runs and native fallback",
+    )
     parser.add_argument("--mcp", action="store_true",
                         help="Run as MCP server over stdio (no HTTP)")
     parser.add_argument("--mcp-http", action="store_true",
@@ -286,7 +309,10 @@ def main():
         return
 
     security = SecurityConfig.from_env()
-    kernel, bundle = _make_kernel()
+    kernel, bundle = _make_kernel(
+        kernel_mode=args.kernel_mode,
+        mock_execute_duration_s=args.mock_execute_duration_s,
+    )
 
     # Auto-resolve URDF and package dirs from roboplan if not specified via CLI
     urdf_path = args.urdf
@@ -303,7 +329,11 @@ def main():
     state = ComposerState(
         catalog_path=args.catalog_path,
         kernel=kernel,
-        kernel_factory=_make_kernel,
+        kernel_factory=lambda deployment=None: _make_kernel(
+            deployment,
+            kernel_mode=args.kernel_mode,
+            mock_execute_duration_s=args.mock_execute_duration_s,
+        ),
         kernel_bundle=bundle,
         trace_dir="/tmp/manyforge-traces",
         allowed_fs_roots=security.allowed_fs_roots,

@@ -1,0 +1,34 @@
+scenario_id: interrupt_signal_stale_before_run_no_effect
+description: Qualification scenario that proves a stale pre-run interrupt signal does not latch once execution starts.
+program: examples/interrupt_pick_and_place.program.yaml
+deployment: examples/interrupt_pick_and_place.deployment.yaml
+timeouts:
+  scenario_s: 60
+  poll_interval_ms: 50
+steps:
+  - action: load_program
+  - action: publish_signal
+    adapter: demo_ui
+    signal: pause_request
+    value: true
+    stale_after_ms: 50
+    mirror_key: demo/pause_request
+    metadata:
+      reason: stale_before_run_qualification
+  - action: sleep
+    seconds: 0.25
+  - action: cycle_run
+  - action: wait_for
+    endpoint: digest
+    path: state
+    equals: idle
+    timeout_s: 30
+assertions:
+  - endpoint: history
+    event_type: execute_started
+  - endpoint: history
+    event_type: interrupt_latched
+    absent: true
+  - endpoint: history
+    event_type: kernel_error
+    absent: true

@@ -20,6 +20,14 @@ map.
   - Agent/operator guide for using the ManyForge API and composing programs.
   - Practical patterns, rules, and endpoint quick reference.
 
+- [`guides/INTERRUPT_DEMO.md`](guides/INTERRUPT_DEMO.md)
+  - Operator guide for the interrupt-focused pick-and-place demo.
+  - Launcher, trigger commands, expected behavior, and observability workflow.
+
+- [`guides/HMI_QUALIFICATION_CHECKLIST.md`](guides/HMI_QUALIFICATION_CHECKLIST.md)
+  - Manual browser/HMI qualification checklist for release candidates and showcase runs.
+  - Defines what remains manual after automated scene diagnostics and snapshot checks.
+
 - [`reference/MCP_SCHEMA.md`](reference/MCP_SCHEMA.md)
   - Contract reference for the ManyForge MCP server.
   - Tool-by-tool interface schema, parameters, and semantics.
@@ -39,6 +47,50 @@ map.
 - [`plans/INTERRUPT_MODEL_PLAN.md`](plans/INTERRUPT_MODEL_PLAN.md)
   - Execution-model plan for industrial runtime interrupts.
   - Interrupt sources, handler chains, required spec changes, and runtime impact.
+
+- [`plans/PRODUCT_DIRECTION_PLAN.md`](plans/PRODUCT_DIRECTION_PLAN.md)
+  - Product and engineering direction for the next phase of ManyForge.
+  - Industrial positioning, 5-month priorities, ROS/PLC/perception workstreams,
+    and `ros2_medkit` compatibility goals.
+
+- [`plans/INDUSTRIAL_READINESS_GAP.md`](plans/INDUSTRIAL_READINESS_GAP.md)
+  - Current gap assessment between the present baseline and industrial readiness.
+  - Tracks what is still missing in runtime integration, qualification, GUI testing, and compliance posture.
+
+- [`plans/VERIFICATION_PLAN.md`](plans/VERIFICATION_PLAN.md)
+  - Verification and qualification strategy for ManyForge.
+  - Defines scenario-based production-run testing, visual verification layers,
+  CI tiers, and retained evidence requirements.
+
+- [`../verification/scenarios/basic_pick_and_place_complete.scenario.yaml`](../verification/scenarios/basic_pick_and_place_complete.scenario.yaml)
+  - Baseline end-to-end pick-and-place qualification scenario.
+  - Smallest initial scenario artifact for the new verification harness.
+
+- [`../verification/scenarios/interrupt_pick_and_place_pause_resume.scenario.yaml`](../verification/scenarios/interrupt_pick_and_place_pause_resume.scenario.yaml)
+  - Interrupt hold/resume qualification scenario for the interrupt pick-and-place flow.
+  - Verifies handler execution, resumable hold, and clean completion.
+
+- [`../verification/matrices/core_qualification.yaml`](../verification/matrices/core_qualification.yaml)
+  - Initial deterministic qualification batch.
+  - Groups the core end-to-end scenarios used by the first industrial qualification tier.
+
+- [`../verification/matrices/native_live_evaluation.yaml`](../verification/matrices/native_live_evaluation.yaml)
+  - Native planner/executor qualification batch.
+  - Exercises a UR5 joint-goal program against the real RoboPlan/native kernel path.
+
+- [`../verification/matrices/soak_qualification.yaml`](../verification/matrices/soak_qualification.yaml)
+  - Repeated deterministic qualification batch.
+  - Used for liveness and deadlock detection across repeated runs.
+
+- [`plans/REVIEW_CHECKPOINT_2026-04-17.md`](plans/REVIEW_CHECKPOINT_2026-04-17.md)
+  - Review checkpoint for the current industrial runtime milestone.
+  - Records what actually landed, what was deferred intentionally, and the
+  container-based validation status before the next workstream starts.
+
+- [`plans/REVIEW_CHECKPOINT_2026-04-20.md`](plans/REVIEW_CHECKPOINT_2026-04-20.md)
+  - Review checkpoint for the qualification-system and interrupt-runtime-completion milestone.
+  - Records the real post-`5e5af09` delta, the remaining external proof work,
+    and the container-backed validation completed before the next adapter phase.
 
 - [`operations/STACK_SETUP.md`](operations/STACK_SETUP.md)
   - Compact operational runbook for local bring-up and current stack modes.

@@ -422,7 +422,7 @@ void RoboPlanPlanningContext::record_scene_event_locked(SceneTraceEvent event) {
 }
 
 core::SceneEditResultDTO RoboPlanPlanningContext::reparent_object_locked(
-    const std::string& object_id, const std::string& target_frame_id) {
+    const std::string& object_id, const std::string& target_frame_id, bool emit_event) {
   core::SceneEditResultDTO result;
   const auto it = object_states_.find(object_id);
   if (it == object_states_.end()) {
@@ -434,7 +434,9 @@ core::SceneEditResultDTO RoboPlanPlanningContext::reparent_object_locked(
     event.success = false;
     event.frame_id = target_frame_id;
     event.error = result.error->message;
-    record_scene_event_locked(std::move(event));
+    if (emit_event) {
+      record_scene_event_locked(std::move(event));
+    }
     return result;
   }
 
@@ -456,7 +458,9 @@ core::SceneEditResultDTO RoboPlanPlanningContext::reparent_object_locked(
     event.pose_in_frame = it->second.pose;
     event.pose_in_universe = pose_in_base_from_tracked_locked(it->second, "universe");
     event.error = result.error->message;
-    record_scene_event_locked(std::move(event));
+    if (emit_event) {
+      record_scene_event_locked(std::move(event));
+    }
     return result;
   }
 
@@ -473,7 +477,9 @@ core::SceneEditResultDTO RoboPlanPlanningContext::reparent_object_locked(
   event.attached = tracked.attached;
   event.pose_in_frame = tracked.pose;
   event.pose_in_universe = pose_in_base_from_tracked_locked(tracked, "universe");
-  record_scene_event_locked(std::move(event));
+  if (emit_event) {
+    record_scene_event_locked(std::move(event));
+  }
   return result;
 }
 
@@ -483,19 +489,24 @@ core::SceneEditResultDTO RoboPlanPlanningContext::add_object(
 
   try {
     std::lock_guard<std::mutex> scene_lock(*scene_mutex_);
+    const bool attached_request = infer_attached_from_frame(request.frame_id);
+    const std::string add_frame_id = attached_request ? "universe" : request.frame_id;
     Eigen::Matrix4d tform = pose_to_matrix(request.pose);
+    if (attached_request) {
+      tform = frame_to_world_matrix_locked(request.frame_id) * tform;
+    }
     Eigen::Vector4d color(1.0, 0.0, 0.0, 1.0);
 
     if (auto* box = std::get_if<core::BoxShapeDTO>(&request.shape)) {
       roboplan::Box b(box->dimensions_m.x_m, box->dimensions_m.y_m, box->dimensions_m.z_m);
-      auto r = scene_->addBoxGeometry(request.object_id, request.frame_id, b, tform, color);
+      auto r = scene_->addBoxGeometry(request.object_id, add_frame_id, b, tform, color);
       if (!r.has_value()) {
         result.error = core::ErrorDTO{core::kErrorInternalError, r.error(), {}};
         return result;
       }
     } else if (auto* sphere = std::get_if<core::SphereShapeDTO>(&request.shape)) {
       roboplan::Sphere s(sphere->radius_m);
-      auto r = scene_->addSphereGeometry(request.object_id, request.frame_id, s, tform, color);
+      auto r = scene_->addSphereGeometry(request.object_id, add_frame_id, s, tform, color);
       if (!r.has_value()) {
         result.error = core::ErrorDTO{core::kErrorInternalError, r.error(), {}};
         return result;
@@ -507,8 +518,19 @@ core::SceneEditResultDTO RoboPlanPlanningContext::add_object(
     }
 
     object_states_[request.object_id] = TrackedObjectState{
-        request.pose, request.shape, request.frame_id,
-        infer_attached_from_frame(request.frame_id)};
+        matrix_to_pose(tform), request.shape, add_frame_id, false};
+
+    if (attached_request) {
+      auto reparent_result =
+          reparent_object_locked(request.object_id, request.frame_id, false);
+      if (!reparent_result.success) {
+        const auto cleanup_result = scene_->removeGeometry(request.object_id);
+        (void)cleanup_result;
+        object_states_.erase(request.object_id);
+        return reparent_result;
+      }
+    }
+
     result.success = true;
     const auto& tracked = object_states_.at(request.object_id);
     SceneTraceEvent event;

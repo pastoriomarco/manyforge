@@ -202,6 +202,71 @@ run_composer_frontend_build() {
     fi
 }
 
+run_qualification_tests() {
+    section "Qualification scenario matrix"
+    cd "$WORKSPACE"
+    setup_pythonpath
+    if ! python_has_modules fastapi py_trees httpx uvicorn yaml; then
+        skip "Missing Python deps for qualification runner"
+        return
+    fi
+    chmod +x ./scripts/qualify-scenarios.sh ./scripts/run-scenarios.py
+    if ./scripts/qualify-scenarios.sh; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+    fi
+}
+
+run_qualification_interrupt_tests() {
+    section "Advanced interrupt qualification matrix"
+    cd "$WORKSPACE"
+    setup_pythonpath
+    if ! python_has_modules fastapi py_trees httpx uvicorn yaml; then
+        skip "Missing Python deps for interrupt qualification runner"
+        return
+    fi
+    chmod +x ./scripts/qualify-interrupt-scenarios.sh ./scripts/run-scenarios.py
+    if ./scripts/qualify-interrupt-scenarios.sh; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+    fi
+}
+
+run_qualification_native_tests() {
+    section "Native live-evaluation qualification matrix"
+    cd "$WORKSPACE"
+    setup_pythonpath
+    export PYTHONPATH="$WORKSPACE/manyforge_roboplan/python:${PYTHONPATH:-}"
+    if ! python_has_modules fastapi py_trees httpx uvicorn yaml manyforge_roboplan_py native_kernel_client; then
+        skip "Missing Python deps for native qualification runner (need manyforge_roboplan_py, native_kernel_client)"
+        return
+    fi
+    chmod +x ./scripts/qualify-native-scenarios.sh ./scripts/run-scenarios.py
+    if ./scripts/qualify-native-scenarios.sh; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+    fi
+}
+
+run_qualification_soak_tests() {
+    section "Soak qualification matrix"
+    cd "$WORKSPACE"
+    setup_pythonpath
+    if ! python_has_modules fastapi py_trees httpx uvicorn yaml; then
+        skip "Missing Python deps for soak qualification runner"
+        return
+    fi
+    chmod +x ./scripts/qualify-soak-scenarios.sh ./scripts/run-scenarios.py
+    if ./scripts/qualify-soak-scenarios.sh; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+    fi
+}
+
 case "$FILTER" in
     cpp)
         run_cpp_tests
@@ -220,6 +285,24 @@ case "$FILTER" in
         run_composer_backend_tests
         run_composer_frontend_build
         ;;
+    qualification)
+        run_qualification_tests
+        ;;
+    qualification-interrupt)
+        run_qualification_interrupt_tests
+        ;;
+    qualification-native)
+        run_qualification_native_tests
+        ;;
+    qualification-soak)
+        run_qualification_soak_tests
+        ;;
+    qualification-all)
+        run_qualification_tests
+        run_qualification_interrupt_tests
+        run_qualification_native_tests
+        run_qualification_soak_tests
+        ;;
     integration)
         run_integration_tests
         ;;
@@ -232,9 +315,12 @@ case "$FILTER" in
         run_integration_tests
         run_composer_backend_tests
         run_composer_frontend_build
+        run_qualification_tests
+        run_qualification_interrupt_tests
+        run_qualification_native_tests
         ;;
     *)
-        echo "Usage: $0 [all|cpp|roboplan|bindings|python|composer|integration]"
+        echo "Usage: $0 [all|cpp|roboplan|bindings|python|composer|qualification|qualification-interrupt|qualification-native|qualification-soak|qualification-all|integration]"
         exit 1
         ;;
 esac

@@ -1771,6 +1771,41 @@ TEST_F(ExecutionKernelTest, ExecutionTimeout_TransitionsToFailed) {
   EXPECT_GE(controlled_execution.stop_count, 1);
 }
 
+TEST_F(ExecutionKernelTest, ExecutionTimeout_DoesNotAdvanceWhilePaused) {
+  ControlledExecution controlled_execution;
+  ThreadSafeFakeClock ts_clock;
+  ThreadSafeManualScheduler ts_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  ExecutionKernel timeout_kernel{
+      planner, context, controlled_execution, ts_clock, ts_scheduler, local_cache};
+
+  auto req = make_test_request();
+  req.timeouts.execution_timeout_s = 0.5;
+
+  auto result = timeout_kernel.execute(req);
+  ASSERT_TRUE(result.ok());
+
+  controlled_execution.wait_until_execute_called();
+  ASSERT_TRUE(wait_for_state(timeout_kernel, ExecutionState::kExecuting));
+
+  auto pause_result = timeout_kernel.pause();
+  ASSERT_TRUE(pause_result.accepted);
+  ts_scheduler.advance_to(ts_clock.now());
+  controlled_execution.wait_until_paused();
+  ASSERT_TRUE(wait_for_state(timeout_kernel, ExecutionState::kPaused));
+
+  ts_clock.advance(1'000'000'000);  // 1s > 500ms timeout, but fully paused
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+  auto paused_status = timeout_kernel.get_status();
+  EXPECT_EQ(paused_status.state, ExecutionState::kPaused);
+
+  auto stop_result = timeout_kernel.stop();
+  ASSERT_TRUE(stop_result.accepted);
+  timeout_kernel.wait_for_completion();
+  EXPECT_EQ(timeout_kernel.get_status().state, ExecutionState::kStopped);
+}
+
 TEST_F(ExecutionKernelTest, PlanningTimeout_TriggersStop) {
   SlowMockPlanner slow_planner;
   ThreadSafeFakeClock ts_clock;

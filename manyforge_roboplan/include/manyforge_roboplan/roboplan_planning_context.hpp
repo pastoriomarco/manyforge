@@ -90,7 +90,8 @@ class RoboPlanPlanningContext final : public core::IPlanningContext {
                                                   const std::string& base_frame);
   bool infer_attached_from_frame(const std::string& frame_id) const;
   core::SceneEditResultDTO reparent_object_locked(const std::string& object_id,
-                                                  const std::string& target_frame_id);
+                                                  const std::string& target_frame_id,
+                                                  bool emit_event = true);
   void record_scene_event_locked(SceneTraceEvent event);
 
   std::shared_ptr<roboplan::Scene> scene_;

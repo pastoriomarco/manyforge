@@ -159,7 +159,28 @@ def test_scene_edit_rejected_during_running():
     assert response.status_code == 409
     data = response.json()
     assert data["success"] is False
+    assert data["cycleState"] == "running"
     assert "RUNNING" in data["error"]
+
+
+def test_scene_edit_rejected_during_interrupt_handler():
+    client, state, kernel = make_client()
+    state.cycle_manager = MagicMock()
+    state.cycle_manager.state = CycleState.INTERRUPT_HANDLER
+
+    response = client.post(
+        "/api/scene/edit",
+        json={
+            "operation": "remove",
+            "object_id": "missing",
+        },
+    )
+
+    assert response.status_code == 409
+    data = response.json()
+    assert data["success"] is False
+    assert data["cycleState"] == "interrupt_handler"
+    assert "INTERRUPT_HANDLER" in data["error"]
 
 
 def test_kernel_snapshot_reports_idle_when_no_program_loaded():

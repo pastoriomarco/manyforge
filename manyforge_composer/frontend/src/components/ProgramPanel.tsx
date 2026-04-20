@@ -535,7 +535,7 @@ export function ProgramPanel() {
   } = useProgramStore();
   const { entries } = useCatalogStore();
   const { state } = useCycleStore();
-  const editLocked = state === 'running' || state === 'direct_control';
+  const editLocked = state === 'running' || state === 'interrupt_handler' || state === 'direct_control';
 
   const parameterUsageMap = useMemo(() => collectParameterUsages(nodes), [nodes]);
   const { namespaceUsages, keyUsages, fieldUsages } = useMemo(

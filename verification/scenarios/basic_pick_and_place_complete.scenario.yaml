@@ -1,0 +1,21 @@
+scenario_id: basic_pick_and_place_complete
+description: End-to-end baseline qualification for the standard pick-and-place application.
+program: examples/pick_and_place.program.yaml
+deployment: examples/pick_and_place.deployment.yaml
+timeouts:
+  scenario_s: 60
+  poll_interval_ms: 50
+steps:
+  - action: load_program
+  - action: cycle_run
+  - action: wait_for
+    endpoint: digest
+    path: state
+    equals: idle
+    timeout_s: 30
+assertions:
+  - endpoint: history
+    event_type: execute_started
+  - endpoint: history
+    event_type: kernel_error
+    absent: true

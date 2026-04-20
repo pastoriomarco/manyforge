@@ -1,0 +1,31 @@
+scenario_id: native_simple_motion_complete
+description: Native live-evaluation qualification for the UR5 simple-motion program.
+program: verification/programs/native_simple_motion_ur5.program.yaml
+deployment: verification/deployments/native_simple_motion_ur5.deployment.yaml
+timeouts:
+  scenario_s: 90
+  poll_interval_ms: 50
+steps:
+  - action: load_program
+  - action: cycle_run
+  - action: wait_for
+    endpoint: digest
+    path: state
+    equals: idle
+    timeout_s: 60
+assertions:
+  - endpoint: history
+    event_type: plan_started
+    greater_equal: 1
+  - endpoint: history
+    event_type: execute_completed
+    greater_equal: 1
+  - endpoint: digest
+    path: completedNodes
+    contains: move_to_end
+  - endpoint: history
+    event_type: kernel_error
+    absent: true
+forbidden:
+  - endpoint: history
+    event_type: cycle_error

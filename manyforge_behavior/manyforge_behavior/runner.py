@@ -13,8 +13,15 @@ from manyforge_behavior.kernel_client import KernelClient, SceneEditRequest
 from manyforge_behavior.nodes.geometry import CheckPoseDistance, GetLinkPose
 from manyforge_behavior.nodes.logic import (
     CheckKeyBoolValue,
+    CheckSignalBool,
+    CheckGripperState,
     SetKeyBoolValue,
+    SetSignalBool,
+    SetGripperState,
     WaitForKeyBool,
+    WaitForSignalBool,
+    WaitForSignalEdge,
+    WaitForGripperState,
 )
 from manyforge_behavior.nodes.motion import MoveManipulatorAction, ResetTrajectories, _rpy_deg_to_xyzw
 from manyforge_behavior.nodes.scene import (
@@ -54,6 +61,13 @@ PLUGIN_FACTORY: dict[str, type] = {
     "check_key_bool_value": CheckKeyBoolValue,
     "set_key_bool_value": SetKeyBoolValue,
     "wait_for_key_bool": WaitForKeyBool,
+    "check_signal_bool": CheckSignalBool,
+    "set_signal_bool": SetSignalBool,
+    "wait_for_signal_bool": WaitForSignalBool,
+    "wait_for_signal_edge": WaitForSignalEdge,
+    "check_gripper_state": CheckGripperState,
+    "set_gripper_state": SetGripperState,
+    "wait_for_gripper_state": WaitForGripperState,
     "get_link_pose": GetLinkPose,
     "check_pose_distance": CheckPoseDistance,
     "plan_pick_sequence": PlanPickSequenceNode,
@@ -181,6 +195,21 @@ class OrchestratorRunner:
         bb.velocity_scale = 1.0
 
         self._tree = tree
+        return tree
+
+    def build_interrupt_handler_tree(
+        self,
+        handler_id: str,
+    ) -> py_trees.trees.BehaviourTree:
+        """Build a dedicated behaviour tree for a named interrupt handler."""
+        if self._program is None or self._resolver is None:
+            raise RuntimeError("Call load() first")
+        handler = self._program.interrupt_handlers.get(handler_id)
+        if handler is None:
+            raise KeyError(f"Unknown interrupt handler: {handler_id}")
+        root = self._build_node(handler.root)
+        tree = py_trees.trees.BehaviourTree(root=root)
+        tree.setup()
         return tree
 
     def apply_scene(self) -> None:

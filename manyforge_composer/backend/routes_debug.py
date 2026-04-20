@@ -4,12 +4,14 @@ from __future__ import annotations
 import time
 from typing import Any
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 
 from .models import (
+    DebugSignalPublishRequest,
     DebugExportDeploymentResponse,
     DebugExportProgramResponse,
     DebugExportResponse,
+    Ros2MedkitTraceResponse,
 )
 from .routes_execution import (
     build_blackboard_snapshot_payload,
@@ -69,6 +71,7 @@ def build_debug_export_payload(state: ComposerState, *, run_id: str | None = Non
     """Build single-call trace/debug export payload."""
     state.event_recorder.observe(state)
     selected_run_id = run_id or state.event_recorder.last_run_id
+    medkit_trace = build_ros2_medkit_trace_payload(state, run_id=selected_run_id)
     history = build_execution_history_payload(state, run_id=selected_run_id)
     intervention_session = None
     if state.cycle_manager is not None and state.cycle_manager.intervention is not None:
@@ -123,6 +126,11 @@ def build_debug_export_payload(state: ComposerState, *, run_id: str | None = Non
         sceneDiagnostics=build_scene_diagnostics_payload(state),
         sceneTrace=build_scene_trace_payload(state),
         blackboard=build_blackboard_snapshot_payload(state),
+        signalSnapshot=(
+            state.cycle_manager.get_signal_snapshot()
+            if state.cycle_manager is not None
+            else {"providers": {}, "signals": {}}
+        ),
         nodeStatuses=(state.cycle_manager.get_node_statuses() if state.cycle_manager is not None else {}),
         interventionSession=intervention_session,
         runtimeOverrides=(
@@ -131,6 +139,30 @@ def build_debug_export_payload(state: ComposerState, *, run_id: str | None = Non
             else {}
         ),
         modelEvents=model_events,
+        medkitTrace=medkit_trace,
+    ).model_dump(by_alias=True)
+
+
+def build_ros2_medkit_trace_payload(
+    state: ComposerState,
+    *,
+    run_id: str | None = None,
+) -> dict[str, Any]:
+    """Build a normalized execution trace for ros2_medkit-style correlation tooling."""
+    state.event_recorder.observe(state)
+    payload = state.event_recorder.export_ros2_medkit_trace(
+        run_id=run_id,
+        exported_at_ns=time.monotonic_ns(),
+    )
+    return Ros2MedkitTraceResponse(
+        schemaVersion=payload["schema_version"],
+        traceSource=payload["trace_source"],
+        exportedAtNs=payload["exported_at_ns"],
+        runId=payload["run_id"],
+        programRunId=payload["program_run_id"],
+        interventionRunIds=payload["intervention_run_ids"],
+        parentRunIds=payload["parent_run_ids"],
+        records=payload["records"],
     ).model_dump(by_alias=True)
 
 
@@ -147,5 +179,34 @@ def create_debug_router(state: ComposerState) -> APIRouter:
     def debug_export(run_id: str | None = None) -> dict[str, Any]:
         """Return single-call debug export bundle."""
         return build_debug_export_payload(state, run_id=run_id)
+
+    @router.get("/export/ros2-medkit")
+    def debug_export_ros2_medkit(run_id: str | None = None) -> dict[str, Any]:
+        """Return normalized trace export for ros2_medkit-style tooling."""
+        return build_ros2_medkit_trace_payload(state, run_id=run_id)
+
+    @router.post("/signals/publish")
+    def debug_publish_signal(request: DebugSignalPublishRequest) -> dict[str, Any]:
+        """Publish one manual signal sample into the runtime signal registry."""
+        if state.cycle_manager is None:
+            raise HTTPException(status_code=503, detail="Cycle manager is not available")
+
+        adapter = request.adapter.strip()
+        signal = request.signal.strip()
+        if not adapter:
+            raise HTTPException(status_code=400, detail="adapter is required")
+        if not signal:
+            raise HTTPException(status_code=400, detail="signal is required")
+
+        state.cycle_manager.publish_signal(
+            adapter=adapter,
+            signal=signal,
+            value=request.value,
+            stale_after_ms=request.stale_after_ms,
+            mirror_key=request.mirror_key,
+            clear_on_stale=request.clear_on_stale,
+            metadata=dict(request.metadata),
+        )
+        return state.cycle_manager.get_signal_snapshot()
 
     return router

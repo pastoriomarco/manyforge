@@ -725,6 +725,233 @@ class TestProgramValidation:
             Program(path, catalog)
         os.unlink(path)
 
+    def test_allows_interrupt_policies_and_handlers(self, catalog):
+        data = _minimal_program(
+            tree={
+                "id": "sequence",
+                "name": "root",
+                "children": [
+                    {"id": "reset_trajectories", "name": "noop"},
+                ],
+            },
+            interrupt_handlers={
+                "pause_announce": {
+                    "description": "Minimal handler for pause hold.",
+                    "timeout_s": 1.5,
+                    "root": {
+                        "id": "sequence",
+                        "name": "pause_announce",
+                        "children": [
+                            {"id": "reset_trajectories", "name": "noop"},
+                        ],
+                    },
+                },
+            },
+            interrupt_policies=[
+                {
+                    "id": "operator_pause_hold",
+                    "source": "operator_pause",
+                    "applies_to": {"subtree_root": "root", "interruptible_only": True},
+                    "preemption_mode": "hold_cycle",
+                    "handler": "pause_announce",
+                    "after_handler": "resumable_hold",
+                },
+            ],
+        )
+        path = _write_program(data)
+        try:
+            program = Program(path, catalog)
+            assert "operator_pause_hold" in program.interrupt_policies
+            assert "pause_announce" in program.interrupt_handlers
+            assert program.interrupt_handlers["pause_announce"].resource_claims == ("planner",)
+            assert program.interrupt_handlers["pause_announce"].timeout_s == 1.5
+        finally:
+            os.unlink(path)
+
+    def test_rejects_non_positive_interrupt_handler_timeout(self, catalog):
+        data = _minimal_program(
+            tree={
+                "id": "sequence",
+                "name": "root",
+                "children": [
+                    {"id": "reset_trajectories", "name": "noop"},
+                ],
+            },
+            interrupt_handlers={
+                "pause_announce": {
+                    "timeout_s": 0,
+                    "root": {
+                        "id": "sequence",
+                        "name": "pause_announce",
+                        "children": [
+                            {"id": "reset_trajectories", "name": "noop"},
+                        ],
+                    },
+                },
+            },
+            interrupt_policies=[
+                {
+                    "id": "operator_pause_hold",
+                    "source": "operator_pause",
+                    "applies_to": {"subtree_root": "root"},
+                    "preemption_mode": "hold_cycle",
+                    "handler": "pause_announce",
+                    "after_handler": "resumable_hold",
+                },
+            ],
+        )
+        path = _write_program(data)
+        with pytest.raises(ProgramValidationError, match=r"timeout_s must be > 0"):
+            Program(path, catalog)
+        os.unlink(path)
+
+    def test_rejects_unknown_interrupt_handler_resource_claim(self, catalog):
+        data = _minimal_program(
+            tree={
+                "id": "sequence",
+                "name": "root",
+                "children": [
+                    {"id": "reset_trajectories", "name": "noop"},
+                ],
+            },
+            interrupt_handlers={
+                "pause_announce": {
+                    "resource_claims": ["unsupported_claim"],
+                    "root": {
+                        "id": "sequence",
+                        "name": "pause_announce",
+                        "children": [
+                            {"id": "reset_trajectories", "name": "noop"},
+                        ],
+                    },
+                },
+            },
+            interrupt_policies=[
+                {
+                    "id": "operator_pause_hold",
+                    "source": "operator_pause",
+                    "applies_to": {"subtree_root": "root"},
+                    "preemption_mode": "hold_cycle",
+                    "handler": "pause_announce",
+                    "after_handler": "resumable_hold",
+                },
+            ],
+        )
+        path = _write_program(data)
+        with pytest.raises(ProgramValidationError, match="unsupported claim"):
+            Program(path, catalog)
+        os.unlink(path)
+
+    def test_rejects_interrupt_policy_with_unknown_handler(self, catalog):
+        data = _minimal_program(
+            tree={
+                "id": "sequence",
+                "name": "root",
+                "children": [
+                    {"id": "reset_trajectories", "name": "noop"},
+                ],
+            },
+            interrupt_policies=[
+                {
+                    "id": "operator_pause_hold",
+                    "source": "operator_pause",
+                    "applies_to": {"subtree_root": "root"},
+                    "preemption_mode": "hold_cycle",
+                    "handler": "missing_handler",
+                    "after_handler": "resumable_hold",
+                },
+            ],
+        )
+        path = _write_program(data)
+        with pytest.raises(ProgramValidationError, match="unknown interrupt handler"):
+            Program(path, catalog)
+        os.unlink(path)
+
+    def test_rejects_interrupt_policy_with_unknown_subtree_root(self, catalog):
+        data = _minimal_program(
+            tree={
+                "id": "sequence",
+                "name": "root",
+                "children": [
+                    {"id": "reset_trajectories", "name": "noop"},
+                ],
+            },
+            interrupt_handlers={
+                "pause_announce": {
+                    "root": {
+                        "id": "sequence",
+                        "name": "pause_announce",
+                        "children": [
+                            {"id": "reset_trajectories", "name": "noop"},
+                        ],
+                    },
+                },
+            },
+            interrupt_policies=[
+                {
+                    "id": "operator_pause_hold",
+                    "source": "operator_pause",
+                    "applies_to": {"subtree_root": "missing_node"},
+                    "preemption_mode": "hold_cycle",
+                    "handler": "pause_announce",
+                    "after_handler": "resumable_hold",
+                },
+            ],
+        )
+        path = _write_program(data)
+        with pytest.raises(ProgramValidationError, match="unknown node instance 'missing_node'"):
+            Program(path, catalog)
+        os.unlink(path)
+
+    def test_rejects_resumable_motion_interrupt_handler_policy(self, catalog):
+        data = _minimal_program(
+            tree={
+                "id": "sequence",
+                "name": "root",
+                "children": [
+                    {
+                        "id": "move_manipulator_action",
+                        "name": "move_here",
+                        "params": {
+                            "move_id": "move_here",
+                            "motion_type": "joint_goal",
+                            "joint_goal_names": ["joint1"],
+                            "joint_goal_positions_rad": [0.1],
+                        },
+                    },
+                ],
+            },
+            interrupt_handlers={
+                "retreat": {
+                    "resource_claims": ["motion"],
+                    "root": {
+                        "id": "move_manipulator_action",
+                        "name": "retreat",
+                        "params": {
+                            "move_id": "retreat_move",
+                            "motion_type": "joint_goal",
+                            "joint_goal_names": ["joint1"],
+                            "joint_goal_positions_rad": [0.0],
+                        },
+                    },
+                },
+            },
+            interrupt_policies=[
+                {
+                    "id": "operator_pause_hold",
+                    "source": "operator_pause",
+                    "applies_to": {"node_names": ["move_here"], "interruptible_only": True},
+                    "preemption_mode": "hold_cycle",
+                    "handler": "retreat",
+                    "after_handler": "resumable_hold",
+                },
+            ],
+        )
+        path = _write_program(data)
+        with pytest.raises(ProgramValidationError, match="require exclusive restart/reset semantics: motion"):
+            Program(path, catalog)
+        os.unlink(path)
+
 
 # ── compute_program_tree_hash ────────────────────────────────────────────
 

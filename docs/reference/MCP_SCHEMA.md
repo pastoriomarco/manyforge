@@ -295,6 +295,9 @@ Get execution status information.
   completed/remaining nodes, object positions, errors, warnings). Poll every
   2-5 seconds during execution.
 - **history**: Event log for current/last run.
+  Supports backend-side filtering via REST query parameters such as
+  `minSeverity`, `components`, `eventTypes`, `executionId`,
+  `programRunId`, and `interventionRunId`.
 - **blackboard**: py_trees blackboard key-value state.
 - **all**: Everything combined.
 
@@ -312,8 +315,8 @@ Export a full debug/trace bundle for post-mortem analysis.
 | `run_id` | string | no | Specific run ID (defaults to most recent) |
 
 **Returns**: Complete bundle including kernel snapshot, metrics, execution
-digest, history, scene state, diagnostics, scene trace, blackboard, and
-node statuses.
+digest, history, scene state, diagnostics, scene trace, blackboard, node
+statuses, and a normalized `medkitTrace` correlation export.
 
 **REST equivalent**: `GET /api/debug/export`
 

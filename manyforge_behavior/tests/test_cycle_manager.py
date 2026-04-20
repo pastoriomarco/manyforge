@@ -3,8 +3,11 @@
 from pathlib import Path
 import threading
 import time
+import tempfile
+import os
 import pytest
 import py_trees
+import yaml
 
 from manyforge_behavior.kernel_client import ExecutionState, MockKernelClient
 from manyforge_behavior.runner import OrchestratorRunner
@@ -14,6 +17,116 @@ CATALOG_PATH = str(Path(__file__).parent.parent / "resources" / "node_catalog.ya
 FIXTURE_PATH = str(
     Path(__file__).parent / "fixtures" / "pick_and_place.program.yaml"
 )
+
+
+def _write_yaml_file(data: dict) -> str:
+    handle = tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False)
+    yaml.safe_dump(data, handle, sort_keys=False)
+    handle.close()
+    return handle.name
+
+
+def _interrupt_program(
+    *,
+    after_handler: str = "resumable_hold",
+    preemption_mode: str = "hold_cycle",
+    handler_root: dict | None = None,
+    handler_resource_claims: list[str] | None = None,
+    handler_timeout_s: float | None = None,
+    blackboard: dict | None = None,
+) -> dict:
+    return {
+        "api_version": "manyforge.program.v0",
+        "program_profile": "v0.0",
+        "name": "interrupt_program",
+        "catalog_version": "0.1.0",
+        "robot": {
+            "robot_id": "ur5",
+            "group_id": "arm",
+            "base_frame": "base_link",
+            "tcp_frame": "tool0",
+        },
+        **({"blackboard": blackboard} if blackboard is not None else {}),
+        "interrupt_handlers": {
+            "pause_announce": {
+                **(
+                    {"timeout_s": handler_timeout_s}
+                    if handler_timeout_s is not None
+                    else {}
+                ),
+                **(
+                    {"resource_claims": handler_resource_claims}
+                    if handler_resource_claims is not None
+                    else {}
+                ),
+                "root": handler_root or {
+                    "id": "sequence",
+                    "name": "pause_announce",
+                    "children": [
+                        {"id": "reset_trajectories", "name": "noop"},
+                    ],
+                },
+            },
+        },
+        "interrupt_policies": [
+            {
+                "id": "operator_pause_hold",
+                "source": "operator_pause",
+                "applies_to": {"node_names": ["wait_here"], "interruptible_only": True},
+                "preemption_mode": preemption_mode,
+                "handler": "pause_announce",
+                "after_handler": after_handler,
+            },
+        ],
+        "tree": {
+            "id": "sequence",
+            "name": "root",
+            "children": [
+                {
+                    "id": "timer",
+                    "name": "wait_here",
+                    "params": {"duration_s": 5.0},
+                },
+            ],
+        },
+    }
+
+
+def _interrupt_deployment(
+    *,
+    adapter: str = "composer_ui",
+    signal: str = "pause_request",
+    kind: str = "edge",
+    maskable: bool = True,
+) -> dict:
+    return {
+        "api_version": "manyforge.deployment.v0",
+        "schema_version": "0.1.0",
+        "name": "interrupt_deployment",
+        "program_profile": "v0.0",
+        "robot_config": {
+            "robot_id": "ur5",
+            "group_id": "arm",
+            "urdf_path": "package://test.urdf",
+            "global_max_tcp_linear_speed_mps": 0.5,
+        },
+        "adapters": {
+            "planning": {"adapter_id": "planning.test", "adapter_version": "0.1.0", "config": {}},
+            "context": {"adapter_id": "context.test", "adapter_version": "0.1.0", "config": {}},
+            "execution": {"adapter_id": "execution.test", "adapter_version": "0.1.0", "config": {}},
+        },
+        "orchestrator": {"engine": "py_trees", "config": {}},
+        "launch": {"runner": {"module": "manyforge_behavior.runner", "args": []}},
+        "interrupt_sources": {
+            "operator_pause": {
+                "adapter": adapter,
+                "signal": signal,
+                "kind": kind,
+                "priority": 30,
+                "maskable": maskable,
+            }
+        },
+    }
 
 
 @pytest.fixture(autouse=True)
@@ -248,6 +361,675 @@ class TestCycleManagerReset:
         assert kernel.get_object_state("table").exists is True
         # Kernel reset is not used as a synthetic state-assignment path when already idle.
         assert kernel.reset_count == initial_reset_count
+
+
+class TestCycleManagerInterrupts:
+    """Test conservative runtime interrupt latching and resume/reset semantics."""
+
+    def test_blackboard_interrupt_latches_and_resumes_resumable_hold(self, kernel):
+        program_path = _write_yaml_file(_interrupt_program())
+        deployment_path = _write_yaml_file(_interrupt_deployment())
+        try:
+            runner = OrchestratorRunner(
+                CATALOG_PATH,
+                program_path,
+                kernel,
+                deployment_path=deployment_path,
+            )
+            manager = CycleManager(runner, kernel)
+
+            manager.run()
+            time.sleep(0.05)
+            py_trees.blackboard.Blackboard.set("pause_request", True)
+            deadline = time.time() + 1.0
+            while (
+                (
+                    manager.pending_interrupt is None
+                    or manager.state != CycleState.STOPPED
+                    or manager.pending_interrupt.details.get("handler_state") != "completed"
+                )
+                and time.time() < deadline
+            ):
+                time.sleep(0.01)
+
+            assert manager.state == CycleState.STOPPED
+            assert manager.pending_interrupt is not None
+            assert manager.pending_interrupt.source_id == "operator_pause"
+            assert manager.pending_interrupt.preemption_mode == "hold_cycle"
+            assert manager.pending_interrupt.after_handler == "resumable_hold"
+            assert manager.pending_interrupt.details["quiesce_latency_ns"] >= 0
+            assert manager.pending_interrupt.details["handler_completion_latency_ns"] >= 0
+
+            py_trees.blackboard.Blackboard.set("pause_request", False)
+            manager.run()
+            assert manager.pending_interrupt is None
+            assert manager.state == CycleState.RUNNING
+            manager.stop()
+            manager.reset()
+        finally:
+            os.unlink(program_path)
+            os.unlink(deployment_path)
+
+    def test_interrupt_handler_executes_in_dedicated_runtime_state(self, kernel):
+        program_path = _write_yaml_file(
+            _interrupt_program(
+                handler_root={
+                    "id": "timer",
+                    "name": "pause_delay",
+                    "params": {"duration_s": 0.2},
+                },
+            )
+        )
+        deployment_path = _write_yaml_file(_interrupt_deployment())
+        try:
+            runner = OrchestratorRunner(
+                CATALOG_PATH,
+                program_path,
+                kernel,
+                deployment_path=deployment_path,
+            )
+            manager = CycleManager(runner, kernel)
+
+            manager.run()
+            time.sleep(0.05)
+            py_trees.blackboard.Blackboard.set("pause_request", True)
+
+            deadline = time.time() + 1.0
+            while manager.state != CycleState.INTERRUPT_HANDLER and time.time() < deadline:
+                time.sleep(0.01)
+
+            assert manager.state == CycleState.INTERRUPT_HANDLER
+            assert manager.pending_interrupt is not None
+            assert manager.pending_interrupt.details["handler_state"] == "running"
+            assert manager.pending_interrupt.details["handler_start_latency_ns"] >= 0
+
+            deadline = time.time() + 1.0
+            while (
+                manager.pending_interrupt is None
+                or manager.pending_interrupt.details.get("handler_state") != "completed"
+            ) and time.time() < deadline:
+                time.sleep(0.01)
+
+            assert manager.state == CycleState.STOPPED
+            assert manager.pending_interrupt is not None
+            assert manager.pending_interrupt.details["handler_state"] == "completed"
+            assert manager.pending_interrupt.details["handler_root_status"] == "SUCCESS"
+            assert manager.pending_interrupt.details["handler_duration_ns"] >= 0
+            manager.reset()
+        finally:
+            os.unlink(program_path)
+            os.unlink(deployment_path)
+
+    def test_interrupt_handler_can_auto_resume_subtree(self, kernel):
+        blackboard = {
+            "keys": [
+                {"id": "pause_marker", "type": "bool", "key": "cell/pause_marker"},
+            ]
+        }
+        handler_root = {
+            "id": "sequence",
+            "name": "pause_announce",
+            "children": [
+                {
+                    "id": "set_signal_bool",
+                    "name": "mark_pause_signal",
+                    "params": {
+                        "key": {"key_ref": "pause_marker"},
+                        "value": True,
+                    },
+                },
+            ],
+        }
+        program_path = _write_yaml_file(
+            _interrupt_program(
+                after_handler="resume_subtree",
+                handler_root=handler_root,
+                handler_resource_claims=["signals"],
+                blackboard=blackboard,
+            )
+        )
+        deployment_path = _write_yaml_file(_interrupt_deployment())
+        try:
+            runner = OrchestratorRunner(
+                CATALOG_PATH,
+                program_path,
+                kernel,
+                deployment_path=deployment_path,
+            )
+            manager = CycleManager(runner, kernel)
+
+            manager.run()
+            time.sleep(0.05)
+            py_trees.blackboard.Blackboard.set("pause_request", True)
+
+            deadline = time.time() + 1.0
+            pause_marker = False
+            while True:
+                try:
+                    pause_marker = bool(py_trees.blackboard.Blackboard.get("cell/pause_marker"))
+                except KeyError:
+                    pause_marker = False
+                if (
+                    pause_marker
+                    and manager.pending_interrupt is None
+                    and manager.state == CycleState.RUNNING
+                ) or time.time() >= deadline:
+                    break
+                if time.time() >= deadline:
+                    break
+                time.sleep(0.01)
+
+            assert manager.state == CycleState.RUNNING
+            assert manager.pending_interrupt is None
+            assert pause_marker is True
+            manager.stop()
+            manager.reset()
+        finally:
+            os.unlink(program_path)
+            os.unlink(deployment_path)
+
+    def test_kernel_interrupt_requires_reset_when_not_resumable(self, kernel):
+        program_path = _write_yaml_file(
+            _interrupt_program(
+                after_handler="halted",
+                preemption_mode="kernel_stop_only",
+            )
+        )
+        deployment_path = _write_yaml_file(
+            _interrupt_deployment(adapter="kernel", signal="collision_detected")
+        )
+        try:
+            runner = OrchestratorRunner(
+                CATALOG_PATH,
+                program_path,
+                kernel,
+                deployment_path=deployment_path,
+            )
+            manager = CycleManager(runner, kernel)
+
+            manager.run()
+            time.sleep(0.05)
+            kernel._emit_kernel_event("collision_detected")
+            deadline = time.time() + 1.0
+            while manager.pending_interrupt is None and time.time() < deadline:
+                time.sleep(0.01)
+
+            assert manager.state == CycleState.STOPPED
+            assert manager.pending_interrupt is not None
+            assert manager.pending_interrupt.after_handler == "halted"
+            with pytest.raises(RuntimeError, match="requires reset"):
+                manager.run()
+
+            manager.reset()
+            assert manager.pending_interrupt is None
+            assert manager.state == CycleState.IDLE
+        finally:
+            os.unlink(program_path)
+            os.unlink(deployment_path)
+
+    def test_unhandled_non_maskable_interrupt_latches_fault(self, kernel):
+        program = _interrupt_program()
+        program.pop("interrupt_handlers", None)
+        program.pop("interrupt_policies", None)
+        program_path = _write_yaml_file(program)
+        deployment_path = _write_yaml_file(
+            _interrupt_deployment(maskable=False)
+        )
+        try:
+            runner = OrchestratorRunner(
+                CATALOG_PATH,
+                program_path,
+                kernel,
+                deployment_path=deployment_path,
+            )
+            manager = CycleManager(runner, kernel)
+
+            manager.run()
+            time.sleep(0.05)
+            py_trees.blackboard.Blackboard.set("pause_request", True)
+            deadline = time.time() + 1.0
+            while manager.pending_interrupt is None and time.time() < deadline:
+                time.sleep(0.01)
+
+            assert manager.state == CycleState.STOPPED
+            assert manager.pending_interrupt is not None
+            assert manager.pending_interrupt.preemption_mode == "latched_fault"
+            assert manager.pending_interrupt.after_handler == "halted"
+            assert manager.pending_interrupt.policy_id is None
+            assert manager.pending_interrupt.details["reason"] == "unhandled_non_maskable_source"
+        finally:
+            os.unlink(program_path)
+            os.unlink(deployment_path)
+
+    def test_interrupt_handler_auto_execution_is_blocked_for_missing_handler_definition(self, kernel):
+        program_path = _write_yaml_file(_interrupt_program())
+        deployment_path = _write_yaml_file(_interrupt_deployment())
+        try:
+            runner = OrchestratorRunner(
+                CATALOG_PATH,
+                program_path,
+                kernel,
+                deployment_path=deployment_path,
+            )
+            runner.load()
+            runner.program.interrupt_handlers.pop("pause_announce", None)
+            manager = CycleManager(runner, kernel)
+
+            manager.run()
+            time.sleep(0.05)
+            py_trees.blackboard.Blackboard.set("pause_request", True)
+            deadline = time.time() + 1.0
+            while manager.pending_interrupt is None and time.time() < deadline:
+                time.sleep(0.01)
+
+            assert manager.state == CycleState.STOPPED
+            assert manager.pending_interrupt is not None
+            assert manager.pending_interrupt.details["handler_state"] == "blocked"
+            assert (
+                manager.pending_interrupt.details["handler_blocked_reason"]
+                == "missing_handler_definition"
+            )
+        finally:
+            os.unlink(program_path)
+            os.unlink(deployment_path)
+
+    def test_interrupt_handler_timeout_fails_closed_and_requires_reset(self, kernel):
+        program_path = _write_yaml_file(
+            _interrupt_program(
+                handler_root={
+                    "id": "timer",
+                    "name": "pause_delay",
+                    "params": {"duration_s": 5.0},
+                },
+                handler_timeout_s=0.05,
+            )
+        )
+        deployment_path = _write_yaml_file(_interrupt_deployment())
+        try:
+            runner = OrchestratorRunner(
+                CATALOG_PATH,
+                program_path,
+                kernel,
+                deployment_path=deployment_path,
+            )
+            manager = CycleManager(runner, kernel)
+
+            manager.run()
+            time.sleep(0.05)
+            py_trees.blackboard.Blackboard.set("pause_request", True)
+
+            deadline = time.time() + 1.5
+            while (
+                (
+                    manager.pending_interrupt is None
+                    or manager.pending_interrupt.details.get("handler_state") != "failed"
+                )
+                and time.time() < deadline
+            ):
+                time.sleep(0.01)
+
+            assert manager.state == CycleState.STOPPED
+            assert manager.pending_interrupt is not None
+            assert manager.pending_interrupt.details["handler_state"] == "failed"
+            assert manager.pending_interrupt.details["handler_failure_reason"] == "timeout"
+            assert manager.pending_interrupt.details["handler_timeout_s"] == 0.05
+            assert manager.pending_interrupt.details["handler_duration_ns"] >= 0
+            assert "timed out after 0.050s" in manager.pending_interrupt.details["handler_last_error"]
+            assert manager.error is not None
+            assert "timed out after 0.050s" in manager.error
+            with pytest.raises(RuntimeError, match="requires reset"):
+                manager.run()
+
+            manager.reset()
+            assert manager.pending_interrupt is None
+            assert manager.state == CycleState.IDLE
+        finally:
+            os.unlink(program_path)
+            os.unlink(deployment_path)
+
+    def test_motion_interrupt_handler_auto_executes_after_kernel_recovery(self, kernel):
+        program = {
+            "api_version": "manyforge.program.v0",
+            "program_profile": "v0.0",
+            "name": "interrupt_motion_handler",
+            "catalog_version": "0.1.0",
+            "robot": {
+                "robot_id": "ur5",
+                "group_id": "arm",
+                "base_frame": "base_link",
+                "tcp_frame": "tool0",
+            },
+            "interrupt_handlers": {
+                "retreat": {
+                    "resource_claims": ["motion"],
+                    "root": {
+                        "id": "move_manipulator_action",
+                        "name": "retreat_move",
+                        "params": {
+                            "move_id": "retreat_move",
+                            "motion_type": "joint_goal",
+                            "joint_goal_names": ["joint1"],
+                            "joint_goal_positions_rad": [0.0],
+                            "execution_timeout_s": 1.0,
+                        },
+                    },
+                },
+            },
+            "interrupt_policies": [
+                {
+                    "id": "operator_pause_hold",
+                    "source": "operator_pause",
+                    "applies_to": {"node_names": ["move_here"], "interruptible_only": True},
+                    "preemption_mode": "hold_cycle",
+                    "handler": "retreat",
+                    "after_handler": "halted",
+                },
+            ],
+            "tree": {
+                "id": "sequence",
+                "name": "root",
+                "children": [
+                    {
+                        "id": "move_manipulator_action",
+                        "name": "move_here",
+                        "params": {
+                            "move_id": "move_here",
+                            "motion_type": "joint_goal",
+                            "joint_goal_names": ["joint1"],
+                            "joint_goal_positions_rad": [0.1],
+                            "execution_timeout_s": 1.0,
+                        },
+                    },
+                ],
+            },
+        }
+        program_path = _write_yaml_file(program)
+        deployment_path = _write_yaml_file(_interrupt_deployment())
+        slow_kernel = MockKernelClient(execute_duration_s=0.2)
+        try:
+            runner = OrchestratorRunner(
+                CATALOG_PATH,
+                program_path,
+                slow_kernel,
+                deployment_path=deployment_path,
+            )
+            manager = CycleManager(runner, slow_kernel)
+
+            manager.run()
+            time.sleep(0.05)
+            py_trees.blackboard.Blackboard.set("pause_request", True)
+
+            deadline = time.time() + 2.0
+            while (
+                (
+                    manager.pending_interrupt is None
+                    or manager.pending_interrupt.details.get("handler_state") != "completed"
+                )
+                and time.time() < deadline
+            ):
+                time.sleep(0.01)
+
+            assert manager.state == CycleState.STOPPED
+            assert manager.pending_interrupt is not None
+            assert manager.pending_interrupt.details["handler_state"] == "completed"
+            assert manager.pending_interrupt.details["handler_resource_claims"] == ["motion"]
+            assert manager.pending_interrupt.details["handler_kernel_preparation"] == "stop_and_reset_to_idle"
+            assert manager.pending_interrupt.details["handler_kernel_ready_state"] == "idle"
+            assert slow_kernel.execute_count == 2
+            assert slow_kernel.stop_count >= 1
+            assert slow_kernel.reset_count >= 1
+        finally:
+            os.unlink(program_path)
+            os.unlink(deployment_path)
+
+    def test_interrupt_handler_can_restart_subtree(self, kernel):
+        program = {
+            "api_version": "manyforge.program.v0",
+            "program_profile": "v0.0",
+            "name": "interrupt_restart_subtree",
+            "catalog_version": "0.1.0",
+            "robot": {
+                "robot_id": "ur5",
+                "group_id": "arm",
+                "base_frame": "base_link",
+                "tcp_frame": "tool0",
+            },
+            "blackboard": {
+                "keys": [
+                    {"id": "done_marker", "type": "bool", "key": "cycle/done"},
+                ],
+            },
+            "interrupt_handlers": {
+                "pause_announce": {
+                    "root": {
+                        "id": "reset_trajectories",
+                        "name": "noop",
+                    },
+                },
+            },
+            "interrupt_policies": [
+                {
+                    "id": "operator_pause_restart",
+                    "source": "operator_pause",
+                    "applies_to": {"subtree_root": "main_sequence", "interruptible_only": True},
+                    "preemption_mode": "hold_cycle",
+                    "handler": "pause_announce",
+                    "after_handler": "restart_subtree",
+                },
+            ],
+            "tree": {
+                "id": "sequence",
+                "name": "main_sequence",
+                "children": [
+                    {
+                        "id": "timer",
+                        "name": "wait_here",
+                        "params": {"duration_s": 0.2},
+                    },
+                    {
+                        "id": "set_key_bool_value",
+                        "name": "mark_done",
+                        "params": {"key": {"key_ref": "done_marker"}, "value": True},
+                    },
+                ],
+            },
+        }
+        program_path = _write_yaml_file(program)
+        deployment_path = _write_yaml_file(_interrupt_deployment())
+        try:
+            runner = OrchestratorRunner(
+                CATALOG_PATH,
+                program_path,
+                kernel,
+                deployment_path=deployment_path,
+            )
+            manager = CycleManager(runner, kernel)
+
+            manager.run()
+            time.sleep(0.05)
+            py_trees.blackboard.Blackboard.set("pause_request", True)
+
+            deadline = time.time() + 2.0
+            while manager.state != CycleState.IDLE and time.time() < deadline:
+                time.sleep(0.01)
+
+            assert manager.state == CycleState.IDLE
+            assert manager.pending_interrupt is None
+            assert py_trees.blackboard.Blackboard.get("cycle/done") is True
+        finally:
+            os.unlink(program_path)
+            os.unlink(deployment_path)
+
+    def test_interrupt_deferred_while_handler_active_is_latched_after_resume(self, kernel):
+        program = {
+            "api_version": "manyforge.program.v0",
+            "program_profile": "v0.0",
+            "name": "interrupt_deferred_queue",
+            "catalog_version": "0.1.0",
+            "robot": {
+                "robot_id": "ur5",
+                "group_id": "arm",
+                "base_frame": "base_link",
+                "tcp_frame": "tool0",
+            },
+            "interrupt_handlers": {
+                "pause_delay": {
+                    "root": {
+                        "id": "timer",
+                        "name": "pause_delay",
+                        "params": {"duration_s": 0.2},
+                    },
+                },
+                "fault_hold": {
+                    "root": {
+                        "id": "reset_trajectories",
+                        "name": "fault_hold",
+                    },
+                },
+            },
+            "interrupt_policies": [
+                {
+                    "id": "operator_pause_hold",
+                    "source": "operator_pause",
+                    "applies_to": {"node_names": ["wait_here"], "interruptible_only": True},
+                    "preemption_mode": "hold_cycle",
+                    "handler": "pause_delay",
+                    "after_handler": "resume_subtree",
+                },
+                {
+                    "id": "operator_fault_halt",
+                    "source": "operator_fault",
+                    "applies_to": {"node_names": ["wait_here"], "interruptible_only": True},
+                    "preemption_mode": "hold_cycle",
+                    "handler": "fault_hold",
+                    "after_handler": "halted",
+                },
+            ],
+            "tree": {
+                "id": "sequence",
+                "name": "root",
+                "children": [
+                    {
+                        "id": "timer",
+                        "name": "wait_here",
+                        "params": {"duration_s": 5.0},
+                    },
+                ],
+            },
+        }
+        deployment = {
+            **_interrupt_deployment(signal="pause_request"),
+            "interrupt_sources": {
+                "operator_pause": {
+                    "adapter": "composer_ui",
+                    "signal": "pause_request",
+                    "kind": "edge",
+                    "priority": 20,
+                    "maskable": True,
+                },
+                "operator_fault": {
+                    "adapter": "composer_ui",
+                    "signal": "fault_request",
+                    "kind": "edge",
+                    "priority": 30,
+                    "maskable": True,
+                },
+            },
+        }
+        program_path = _write_yaml_file(program)
+        deployment_path = _write_yaml_file(deployment)
+        try:
+            runner = OrchestratorRunner(
+                CATALOG_PATH,
+                program_path,
+                kernel,
+                deployment_path=deployment_path,
+            )
+            manager = CycleManager(runner, kernel)
+
+            manager.run()
+            time.sleep(0.05)
+            py_trees.blackboard.Blackboard.set("pause_request", True)
+
+            deadline = time.time() + 1.0
+            while manager.state != CycleState.INTERRUPT_HANDLER and time.time() < deadline:
+                time.sleep(0.01)
+            assert manager.state == CycleState.INTERRUPT_HANDLER
+
+            py_trees.blackboard.Blackboard.set("fault_request", True)
+
+            deadline = time.time() + 2.0
+            while (
+                (manager.pending_interrupt is None or manager.pending_interrupt.source_id != "operator_fault")
+                and time.time() < deadline
+            ):
+                time.sleep(0.01)
+
+            assert manager.state == CycleState.STOPPED
+            assert manager.pending_interrupt is not None
+            assert manager.pending_interrupt.source_id == "operator_fault"
+            assert manager.pending_interrupt.details.get("deferred_consumed_at_ns") is not None
+            assert manager.pending_interrupt.details.get("deferred_wait_ns") is not None
+        finally:
+            os.unlink(program_path)
+            os.unlink(deployment_path)
+
+
+class TestCycleManagerSignalRegistry:
+    def test_external_signal_mirrors_to_blackboard_and_clears_when_stale(self, kernel):
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        manager = CycleManager(runner, kernel)
+
+        manager.publish_signal(
+            adapter="plc",
+            signal="cell.ready",
+            value=True,
+            stale_after_ms=1,
+            mirror_key="cell/ready",
+        )
+
+        assert py_trees.blackboard.Blackboard.get("cell/ready") is True
+
+        time.sleep(0.01)
+        manager._refresh_signal_registry()
+
+        with pytest.raises(KeyError):
+            py_trees.blackboard.Blackboard.get("cell/ready")
+        snapshot = manager.get_signal_snapshot()
+        assert snapshot["signals"]["plc:cell.ready"]["freshness"] == "stale"
+
+    def test_interrupt_source_can_resolve_external_registry_signal(self, kernel):
+        program_path = _write_yaml_file(_interrupt_program())
+        deployment_path = _write_yaml_file(_interrupt_deployment(adapter="plc"))
+        try:
+            runner = OrchestratorRunner(
+                CATALOG_PATH,
+                program_path,
+                kernel,
+                deployment_path=deployment_path,
+            )
+            manager = CycleManager(runner, kernel)
+
+            manager.run()
+            time.sleep(0.05)
+            manager.publish_signal(
+                adapter="plc",
+                signal="pause_request",
+                value=True,
+                stale_after_ms=500,
+            )
+
+            deadline = time.time() + 1.0
+            while manager.pending_interrupt is None and time.time() < deadline:
+                time.sleep(0.01)
+
+            assert manager.pending_interrupt is not None
+            assert manager.pending_interrupt.source_adapter == "plc"
+            assert manager.pending_interrupt.details["registry_freshness"] == "fresh"
+            manager.reset()
+        finally:
+            os.unlink(program_path)
+            os.unlink(deployment_path)
 
 
 class TestCycleManagerVelocityScale:

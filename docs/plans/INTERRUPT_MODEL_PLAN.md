@@ -53,6 +53,74 @@ This plan does not replace:
 - [`OPENCLAW_INTEGRATION_PLAN.md`](OPENCLAW_INTEGRATION_PLAN.md) for OpenClaw
   integration boundaries
 
+## Current Implementation Status
+
+The following interrupt-adjacent groundwork is now in place:
+
+- node catalog entries may declare `interruptible` and `default_interrupt_scope`
+- deployment artifacts may declare `interrupt_sources`
+- program artifacts may declare `interrupt_handlers` and `interrupt_policies`
+- execution events now expose a richer stable envelope suitable for later
+  interrupt causality and external trace alignment
+- `CycleManager` now performs conservative runtime interrupt detection,
+  arbitration, latching, and deterministic cycle stop/hold
+- execution digest and history now expose the pending interrupt and interrupt
+  lifecycle events
+
+Current execution-pass decision:
+
+- interrupt runtime v1 is now complete for the cooperative ManyForge runtime contract:
+  - detect sources
+  - arbitrate policies
+  - latch one active interrupt plus queue deferred stacked interrupts by priority
+  - stop/hold the cycle deterministically
+  - compile named handler trees separately from the main tree
+  - auto-execute handlers across the declared resource-claim model:
+    - `blackboard`
+    - `signals`
+    - `gripper`
+    - `planner`
+    - `timers`
+    - `scene`
+    - `model`
+    - `motion`
+  - prepare the kernel/runtime explicitly for motion-bearing handlers so they
+    can claim exclusive authority instead of depending on the interrupted move
+  - enforce optional per-handler execution budgets via `interrupt_handlers.*.timeout_s`
+    so a RUNNING handler cannot stall indefinitely without being failed closed
+  - support `restart_subtree` by invalidating the targeted live subtree and
+    resuming the main runtime from that point
+  - publish the active interrupt context in the reserved
+    `_interrupt/current` namespace bundle
+  - expose the latched interrupt to operators and external trace tooling
+  - fail safe for unhandled non-maskable sources by latching a faulted hold
+
+There is now also a concrete runtime demo for this baseline:
+
+- launcher:
+  [`../../scripts/demo-interrupt-pick-place.sh`](../../scripts/demo-interrupt-pick-place.sh)
+- operator guide:
+  [`../guides/INTERRUPT_DEMO.md`](../guides/INTERRUPT_DEMO.md)
+
+That demo exercises:
+
+- external signal publication through the runtime signal registry
+- `hold_cycle` interrupt preemption
+- bounded handler execution
+- `resumable_hold` operator resume
+- digest / blackboard / debug-export observability
+
+The remaining work is no longer core interrupt-model completion. It is mainly:
+
+- proving stop/hold/abort semantics on real adapters and hardware, not just in
+  the cooperative runtime and mock/native test environments
+- mapping ROS/PLC/ROXSIE sources cleanly onto deployment interrupt sources
+- implementing an explicit acknowledgement workflow if `ackRequired` is meant
+  to become load-bearing; today it remains a reserved API scaffold and is
+  always false
+- future enhancements such as true preemption of a blocking handler tick rather
+  than timeout detection between cooperative ticks
+
 ## Functional Target
 
 ManyForge should support this runtime pattern:
@@ -216,6 +284,8 @@ Pragmatic v1 approach:
 
 - handler references a named recovery/intervention subtree
 - runtime executes it in a dedicated interrupt context
+- handlers declare or infer resource claims for runtime arbitration
+- unsupported claims block automatic execution instead of being treated as safe
 
 Example:
 
@@ -273,6 +343,16 @@ Not every preemption mode can legally pair with every disposition. For example:
 - `latched_fault` should not auto-resume
 - `kernel_stop_only` may be compatible with `resume_node` only if the node
   declares resumability
+
+Current runtime baseline:
+
+- `resume_node` and `resume_subtree` auto-resume only for handlers completed
+  successfully after `hold_cycle`
+- `resumable_hold` leaves the cycle stopped with the completed interrupt still
+  latched until operator resume
+- `halted`, `failed`, and `escalate` stay latched and stopped
+- `restart_subtree` is currently treated conservatively as
+  "requires explicit reset"
 
 ## Spec Changes Required
 
@@ -342,8 +422,9 @@ Event recording must gain explicit interrupt event types, for example:
 - `interrupt_policy_selected`
 - `interrupt_preemption_requested`
 - `interrupt_handler_started`
-- `interrupt_handler_step`
 - `interrupt_handler_completed`
+- `interrupt_handler_failed`
+- `interrupt_handler_auto_execution_blocked`
 - `interrupt_resume_requested`
 - `interrupt_escalated`
 
@@ -514,10 +595,10 @@ Implement a narrow v1 that solves the real industrial gap without over-design:
 
 1. deployment-defined interrupt sources
 2. program-defined interrupt policies
-3. runtime support for `abort_active_node`, `hold_cycle`, and `halted`
-   dispositions
+3. conservative runtime latching, stop/hold, and observability
 4. deterministic handler subtrees
-5. interrupt event recording
+5. broader disposition support (`restart_subtree`, `resume_subtree`,
+   `failed`, `escalate`)
 
 That will give ManyForge a real interrupt model and a clean base for later
 resume/escalation work.

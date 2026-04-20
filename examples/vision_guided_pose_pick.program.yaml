@@ -106,12 +106,12 @@ tree:
             field: grasp_pose
         velocity_scale: 0.20
 
-    - id: set_key_bool_value
+    - id: set_gripper_state
       name: close_gripper
       params:
-        key:
+        state_key:
           key_ref: gripper_closed
-        value: true
+        state: closed
 
     - id: move_manipulator_action
       name: retreat_after_grasp
@@ -140,9 +140,9 @@ tree:
           orientation_rpy_deg: [180.0, 0.0, -90.0]
         velocity_scale: 0.35
 
-    - id: set_key_bool_value
+    - id: set_gripper_state
       name: open_gripper
       params:
-        key:
+        state_key:
           key_ref: gripper_closed
-        value: false
+        state: open

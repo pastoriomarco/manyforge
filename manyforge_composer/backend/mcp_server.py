@@ -106,8 +106,21 @@ def create_mcp_server(state: ComposerState):
         from manyforge_behavior.cycle_manager import CycleState
         from manyforge_behavior.kernel_client import SceneEditRequest
 
-        if state.cycle_manager is not None and state.cycle_manager.state == CycleState.RUNNING:
-            return json.dumps({"success": False, "error": "Scene edits not allowed while RUNNING"})
+        if state.cycle_manager is not None and state.cycle_manager.state in {
+            CycleState.RUNNING,
+            CycleState.INTERRUPT_HANDLER,
+        }:
+            cycle_state = state.cycle_manager.state
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": (
+                        "Scene edits not allowed while execution is active "
+                        f"(state={cycle_state.name})"
+                    ),
+                    "cycle_state": cycle_state.value,
+                }
+            )
 
         kernel = state.kernel
         if kernel is None:
@@ -230,8 +243,8 @@ def create_mcp_server(state: ComposerState):
         if action == "write":
             if tree is None:
                 return json.dumps({"error": "tree is required for write action"})
-            if state.cycle_manager is not None and state.cycle_manager.state.value == "running":
-                return json.dumps({"error": "Cannot modify tree while RUNNING"})
+            if state.cycle_manager is not None and state.cycle_manager.state.value in {"running", "interrupt_handler"}:
+                return json.dumps({"error": "Cannot modify tree while execution is active"})
             try:
                 from manyforge_behavior.program import Program
                 capability_keys: set[str] | None = None
@@ -1083,10 +1096,10 @@ def create_mcp_server(state: ComposerState):
         if action == "reset":
             if (
                 state.cycle_manager is not None
-                and state.cycle_manager.state.value == "running"
+                and state.cycle_manager.state.value in {"running", "interrupt_handler"}
             ):
                 return json.dumps(
-                    {"error": "Cannot reset session while RUNNING — stop first"}
+                    {"error": "Cannot reset session while execution is active — stop or wait for the handler first"}
                 )
             # Reset cycle and overrides; program stays loaded
             if state.cycle_manager is not None:

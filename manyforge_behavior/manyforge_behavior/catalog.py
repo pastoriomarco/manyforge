@@ -29,6 +29,12 @@ _BLACKBOARD_VALUE_TYPES = {
     "string_list",
     "dict",
 }
+_INTERRUPT_SCOPES = {
+    "active_node",
+    "active_subtree",
+    "cycle",
+    "kernel_motion",
+}
 
 
 @dataclass
@@ -62,6 +68,8 @@ class CatalogEntry:
     required_capabilities: list[str] = field(default_factory=list)
     profiles_min: str = "v0.0"
     runners: dict[str, Any] = field(default_factory=dict)
+    interruptible: bool = False
+    default_interrupt_scope: Optional[str] = None
 
 
 class CatalogValidationError(Exception):
@@ -164,6 +172,8 @@ class NodeCatalog:
             required_capabilities=raw.get("required_capabilities", []),
             profiles_min=raw.get("profiles", {}).get("min_profile", "v0.0"),
             runners=raw.get("runners", {}),
+            interruptible=bool(raw.get("interruptible", False)),
+            default_interrupt_scope=raw.get("default_interrupt_scope"),
         )
 
     @staticmethod
@@ -237,6 +247,15 @@ class NodeCatalog:
         if "py_trees" not in entry.runners:
             raise CatalogValidationError(
                 f"Entry '{entry.id}': must have a 'py_trees' runner"
+            )
+        if entry.default_interrupt_scope is not None and entry.default_interrupt_scope not in _INTERRUPT_SCOPES:
+            allowed = ", ".join(sorted(_INTERRUPT_SCOPES))
+            raise CatalogValidationError(
+                f"Entry '{entry.id}': default_interrupt_scope must be one of: {allowed}"
+            )
+        if entry.default_interrupt_scope is not None and not entry.interruptible:
+            raise CatalogValidationError(
+                f"Entry '{entry.id}': default_interrupt_scope requires interruptible=true"
             )
 
     def get(self, node_id: str) -> CatalogEntry:

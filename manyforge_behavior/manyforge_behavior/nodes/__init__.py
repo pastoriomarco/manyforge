@@ -8,8 +8,15 @@ from manyforge_behavior.nodes.scene import (
 )
 from manyforge_behavior.nodes.logic import (
     CheckKeyBoolValue,
+    CheckSignalBool,
+    CheckGripperState,
     SetKeyBoolValue,
+    SetSignalBool,
+    SetGripperState,
     WaitForKeyBool,
+    WaitForSignalBool,
+    WaitForSignalEdge,
+    WaitForGripperState,
 )
 from manyforge_behavior.nodes.geometry import GetLinkPose, CheckPoseDistance
 from manyforge_behavior.nodes.control_flow import RepeatDecorator, RetryDecorator
@@ -26,8 +33,15 @@ __all__ = [
     "RemoveCollisionObject",
     "UpdateCollisionObjectPose",
     "CheckKeyBoolValue",
+    "CheckSignalBool",
+    "CheckGripperState",
     "SetKeyBoolValue",
+    "SetSignalBool",
+    "SetGripperState",
     "WaitForKeyBool",
+    "WaitForSignalBool",
+    "WaitForSignalEdge",
+    "WaitForGripperState",
     "GetLinkPose",
     "CheckPoseDistance",
     "RepeatDecorator",

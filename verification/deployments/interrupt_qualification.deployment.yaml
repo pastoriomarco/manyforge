@@ -1,0 +1,107 @@
+api_version: manyforge.deployment.v0
+schema_version: "0.1.0"
+name: interrupt_qualification
+description: >-
+  Verification deployment for advanced interrupt qualification scenarios. Uses
+  native RoboPlan capability declarations while the qualification runner forces
+  a mock kernel for deterministic control-path coverage.
+
+program_profile: v0.1
+
+robot_config:
+  robot_id: ur5
+  group_id: arm
+  urdf_path: package://roboplan_example_models/models/ur_robot_model/ur5_gripper.urdf
+  srdf_path: package://roboplan_example_models/models/ur_robot_model/ur5_gripper.srdf
+  global_max_tcp_linear_speed_mps: 0.25
+
+adapters:
+  planning:
+    adapter_id: planning.roboplan
+    adapter_version: "0.1.0"
+    supported_profiles: ["v0.1"]
+    capability_keys:
+      - planning.motion.joint_goal
+      - planning.motion.pose_goal
+      - planning.trajectory.time_parameterized
+    config:
+      rng_seed: 12345
+  context:
+    adapter_id: planning.roboplan_context
+    adapter_version: "0.1.0"
+    supported_profiles: ["v0.1"]
+    capability_keys:
+      - context.state.current
+      - context.validation.trajectory
+      - context.collision.check
+      - context.kinematics.fk
+      - context.limits.joint
+      - context.pose.resolve_reference
+      - context.scene.object_query
+      - scene.shape.box
+      - scene.shape.sphere
+      - scene.edit.add
+      - scene.edit.remove
+      - scene.edit.update_pose
+      - scene.edit.attach_detach
+    config: {}
+  execution:
+    adapter_id: execution.roboplan_native
+    adapter_version: "0.1.0"
+    supported_profiles: ["v0.1"]
+    capability_keys:
+      - execution.trajectory.execute
+      - execution.feedback.phase_events
+      - execution.feedback.state_snapshots
+      - execution.stop.soft
+      - execution.pause
+      - execution.resume
+      - execution.reset
+    config:
+      mode: simulated
+      execution_tick_hz: 100
+
+orchestrator:
+  engine: py_trees
+  config:
+    collision_monitor_period_ms: 10.0
+
+interrupt_sources:
+  operator_pause:
+    adapter: demo_ui
+    signal: pause_request
+    kind: edge
+    priority: 20
+    maskable: true
+    description: Deterministic operator pause signal for qualification.
+  operator_fault:
+    adapter: demo_ui
+    signal: fault_request
+    kind: edge
+    priority: 30
+    maskable: true
+    description: Higher-priority operator fault signal for deferred-interrupt qualification.
+
+authority_matrix:
+  motion:
+    owner: manyforge
+    on_disconnect: hold
+    description: ManyForge owns motion commands during qualification execution.
+  plc_signals:
+    owner: plc
+    on_disconnect: latched_fault
+    description: PLC-originated signals must fail closed on disconnect.
+  gripper:
+    owner: manyforge
+    on_disconnect: reset_required
+    description: Gripper state is runtime-owned but requires reset after transport loss.
+
+launch:
+  ros_wrapper_nodes: []
+  runner:
+    module: manyforge_behavior.runner
+    args: []
+  ui_backend:
+    module: manyforge_composer
+    args: []
+    enabled: true

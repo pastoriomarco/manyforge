@@ -55,6 +55,16 @@ class TestCatalogLoading:
         assert check_pose.bb_reader_params == ["pose_key_a", "pose_key_b"]
         assert check_pose.bb_writer_params == []
 
+    def test_interrupt_metadata_loaded_for_shipped_entries(self):
+        catalog = NodeCatalog(CATALOG_PATH)
+        move = catalog.get("move_manipulator_action")
+        wait_signal = catalog.get("wait_for_signal_edge")
+
+        assert move.interruptible is True
+        assert move.default_interrupt_scope == "kernel_motion"
+        assert wait_signal.interruptible is True
+        assert wait_signal.default_interrupt_scope == "active_node"
+
     def test_get_nonexistent_raises(self):
         catalog = NodeCatalog(CATALOG_PATH)
         with pytest.raises(KeyError):
@@ -243,5 +253,24 @@ class TestCatalogValidation:
             ],
         })
         with pytest.raises(CatalogValidationError, match="duplicate parameter names"):
+            NodeCatalog(path)
+        os.unlink(path)
+
+    def test_rejects_default_interrupt_scope_without_interruptible(self):
+        path = self._write_catalog({
+            "api_version": "manyforge.node_catalog.v0",
+            "catalog_version": "0.1.0",
+            "entries": [
+                {
+                    "id": "interrupt_bad",
+                    "name": "InterruptBad",
+                    "kind": "leaf",
+                    "children": {"min": 0, "max": 0},
+                    "default_interrupt_scope": "active_node",
+                    "runners": {"py_trees": {"implementation_kind": "plugin"}},
+                },
+            ],
+        })
+        with pytest.raises(CatalogValidationError, match="requires interruptible=true"):
             NodeCatalog(path)
         os.unlink(path)

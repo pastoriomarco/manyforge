@@ -50,6 +50,23 @@ class UiBackendConfig:
 
 
 @dataclass
+class InterruptSource:
+    adapter: str
+    signal: str
+    kind: str
+    priority: int
+    maskable: bool
+    description: str = ""
+
+
+@dataclass
+class AuthorityDomain:
+    owner: str
+    on_disconnect: str
+    description: str = ""
+
+
+@dataclass
 class LaunchConfig:
     runner: RunnerConfig
     ui_backend: Optional[UiBackendConfig] = None
@@ -61,6 +78,29 @@ class DeploymentValidationError(Exception):
 
 
 _ALLOWED_HASH_ALGORITHMS = {"sha256", "sha384", "sha512"}
+_ALLOWED_INTERRUPT_KINDS = {"edge", "level"}
+_ALLOWED_AUTHORITY_DOMAINS = {
+    "motion",
+    "scene",
+    "gripper",
+    "plc_signals",
+    "robot_signals",
+    "perception",
+}
+_ALLOWED_AUTHORITY_OWNERS = {
+    "manyforge",
+    "plc",
+    "robot_controller",
+    "perception_service",
+    "operator",
+    "shared",
+}
+_ALLOWED_AUTHORITY_DISCONNECT_POLICIES = {
+    "ignore",
+    "hold",
+    "reset_required",
+    "latched_fault",
+}
 
 
 @dataclass
@@ -113,6 +153,8 @@ class Deployment:
         self.adapters: dict[str, AdapterConfig] = {}
         self.orchestrator: Optional[OrchestratorConfig] = None
         self.launch: Optional[LaunchConfig] = None
+        self.interrupt_sources: dict[str, InterruptSource] = {}
+        self.authority_matrix: dict[str, AuthorityDomain] = {}
         self.model_audit_policy: Optional[ModelAuditPolicy] = None
         self.model_endpoints: dict[str, ModelEndpoint] = {}
         self.prompt_templates: dict[str, PromptTemplate] = {}
@@ -136,6 +178,8 @@ class Deployment:
         self.adapters = {}
         self.orchestrator = None
         self.launch = None
+        self.interrupt_sources = {}
+        self.authority_matrix = {}
         self.model_audit_policy = None
         self.model_endpoints = {}
         self.prompt_templates = {}
@@ -148,11 +192,98 @@ class Deployment:
 
         self._load_from_data_and_validate(data)
 
+    def _parse_interrupt_sources(
+        self,
+        interrupt_sources_data: dict[str, Any] | None,
+    ) -> dict[str, InterruptSource]:
+        if interrupt_sources_data and not isinstance(interrupt_sources_data, dict):
+            raise DeploymentValidationError("interrupt_sources must be a mapping")
+        parsed: dict[str, InterruptSource] = {}
+        for source_id, source_data in (interrupt_sources_data or {}).items():
+            if not isinstance(source_data, dict):
+                raise DeploymentValidationError(
+                    f"interrupt_sources.{source_id} must be a mapping"
+                )
+            adapter = str(source_data.get("adapter", "")).strip()
+            signal = str(source_data.get("signal", "")).strip()
+            kind = str(source_data.get("kind", "")).strip()
+            priority = source_data.get("priority")
+            maskable = source_data.get("maskable")
+            if not adapter:
+                raise DeploymentValidationError(
+                    f"interrupt_sources.{source_id}.adapter is required"
+                )
+            if not signal:
+                raise DeploymentValidationError(
+                    f"interrupt_sources.{source_id}.signal is required"
+                )
+            if kind not in _ALLOWED_INTERRUPT_KINDS:
+                allowed = ", ".join(sorted(_ALLOWED_INTERRUPT_KINDS))
+                raise DeploymentValidationError(
+                    f"interrupt_sources.{source_id}.kind must be one of: {allowed}"
+                )
+            if not isinstance(priority, int) or isinstance(priority, bool):
+                raise DeploymentValidationError(
+                    f"interrupt_sources.{source_id}.priority must be an integer"
+                )
+            if not isinstance(maskable, bool):
+                raise DeploymentValidationError(
+                    f"interrupt_sources.{source_id}.maskable must be a boolean"
+                )
+            parsed[source_id] = InterruptSource(
+                adapter=adapter,
+                signal=signal,
+                kind=kind,
+                priority=priority,
+                maskable=maskable,
+                description=str(source_data.get("description", "")),
+            )
+        return parsed
+
+    def _parse_authority_matrix(
+        self,
+        authority_matrix_data: dict[str, Any] | None,
+    ) -> dict[str, AuthorityDomain]:
+        if authority_matrix_data and not isinstance(authority_matrix_data, dict):
+            raise DeploymentValidationError("authority_matrix must be a mapping")
+        parsed: dict[str, AuthorityDomain] = {}
+        for domain, domain_data in (authority_matrix_data or {}).items():
+            if domain not in _ALLOWED_AUTHORITY_DOMAINS:
+                allowed = ", ".join(sorted(_ALLOWED_AUTHORITY_DOMAINS))
+                raise DeploymentValidationError(
+                    f"authority_matrix.{domain} is not a supported domain; "
+                    f"allowed domains: {allowed}"
+                )
+            if not isinstance(domain_data, dict):
+                raise DeploymentValidationError(
+                    f"authority_matrix.{domain} must be a mapping"
+                )
+            owner = str(domain_data.get("owner", "")).strip()
+            on_disconnect = str(domain_data.get("on_disconnect", "")).strip()
+            if owner not in _ALLOWED_AUTHORITY_OWNERS:
+                allowed = ", ".join(sorted(_ALLOWED_AUTHORITY_OWNERS))
+                raise DeploymentValidationError(
+                    f"authority_matrix.{domain}.owner must be one of: {allowed}"
+                )
+            if on_disconnect not in _ALLOWED_AUTHORITY_DISCONNECT_POLICIES:
+                allowed = ", ".join(sorted(_ALLOWED_AUTHORITY_DISCONNECT_POLICIES))
+                raise DeploymentValidationError(
+                    f"authority_matrix.{domain}.on_disconnect must be one of: {allowed}"
+                )
+            parsed[domain] = AuthorityDomain(
+                owner=owner,
+                on_disconnect=on_disconnect,
+                description=str(domain_data.get("description", "")),
+            )
+        return parsed
+
     def _load_from_data_and_validate(self, data: dict[str, Any]) -> None:
         self.adapters = {}
         self.robot_config = None
         self.orchestrator = None
         self.launch = None
+        self.interrupt_sources = {}
+        self.authority_matrix = {}
 
         if not isinstance(data, dict):
             raise DeploymentValidationError("Deployment must be a YAML mapping")
@@ -264,6 +395,14 @@ class Deployment:
 
         self.launch = LaunchConfig(runner=runner, ui_backend=ui_backend)
 
+        # Interrupt sources (optional)
+        interrupt_sources_data = data.get("interrupt_sources", {})
+        self.interrupt_sources = self._parse_interrupt_sources(interrupt_sources_data)
+
+        # Authority matrix (optional)
+        authority_matrix_data = data.get("authority_matrix", {})
+        self.authority_matrix = self._parse_authority_matrix(authority_matrix_data)
+
         # Model audit policy (optional)
         audit_data = data.get("model_audit_policy")
         if audit_data is not None:
@@ -337,6 +476,7 @@ class Deployment:
         - program_profile doesn't match
         - robot_config.robot_id doesn't match program.robot.robot_id
         - robot_config.group_id doesn't match program.robot.group_id
+        - program interrupt policies reference undeclared deployment interrupt sources
         """
         if self.program_profile != program.program_profile:
             raise DeploymentValidationError(
@@ -355,6 +495,13 @@ class Deployment:
                 f"group_id mismatch: deployment has '{self.robot_config.group_id}', "
                 f"program has '{program.robot.group_id}'"
             )
+
+        for policy in getattr(program, "interrupt_policies", {}).values():
+            if policy.source not in self.interrupt_sources:
+                raise DeploymentValidationError(
+                    f"interrupt policy '{policy.id}' references undeclared deployment interrupt source "
+                    f"'{policy.source}'"
+                )
 
     def validate_capabilities(self) -> None:
         """Verify adapter capabilities cover the program profile requirements.
@@ -488,6 +635,27 @@ class Deployment:
                 }
                 for template_id, template in self.prompt_templates.items()
             }
+        if self.interrupt_sources:
+            d["interrupt_sources"] = {
+                source_id: {
+                    "adapter": source.adapter,
+                    "signal": source.signal,
+                    "kind": source.kind,
+                    "priority": source.priority,
+                    "maskable": source.maskable,
+                    "description": source.description,
+                }
+                for source_id, source in self.interrupt_sources.items()
+            }
+        if self.authority_matrix:
+            d["authority_matrix"] = {
+                domain: {
+                    "owner": config.owner,
+                    "on_disconnect": config.on_disconnect,
+                    "description": config.description,
+                }
+                for domain, config in self.authority_matrix.items()
+            }
         return d
 
     def save(self, path: str | Path) -> None:
@@ -548,3 +716,60 @@ class Deployment:
                     enabled=ui_data.get("enabled", self.launch.ui_backend.enabled if self.launch.ui_backend else True),
                 )
             self.launch = LaunchConfig(runner=runner, ui_backend=ui_backend)
+        if "interrupt_sources" in data:
+            merged_sources = {
+                source_id: {
+                    "adapter": source.adapter,
+                    "signal": source.signal,
+                    "kind": source.kind,
+                    "priority": source.priority,
+                    "maskable": source.maskable,
+                    "description": source.description,
+                }
+                for source_id, source in self.interrupt_sources.items()
+            }
+            for source_id, source_data in data["interrupt_sources"].items():
+                if not isinstance(source_data, dict):
+                    raise DeploymentValidationError(
+                        f"interrupt_sources.{source_id} must be a mapping"
+                    )
+                current = merged_sources.get(source_id, {})
+                merged_sources[source_id] = {
+                    "adapter": source_data.get("adapter", current.get("adapter", "")),
+                    "signal": source_data.get("signal", current.get("signal", "")),
+                    "kind": source_data.get("kind", current.get("kind", "")),
+                    "priority": source_data.get("priority", current.get("priority", 0)),
+                    "maskable": source_data.get("maskable", current.get("maskable", False)),
+                    "description": source_data.get(
+                        "description",
+                        current.get("description", ""),
+                    ),
+                }
+            self.interrupt_sources = self._parse_interrupt_sources(merged_sources)
+        if "authority_matrix" in data:
+            merged_matrix = {
+                domain: {
+                    "owner": config.owner,
+                    "on_disconnect": config.on_disconnect,
+                    "description": config.description,
+                }
+                for domain, config in self.authority_matrix.items()
+            }
+            for domain, domain_data in data["authority_matrix"].items():
+                if not isinstance(domain_data, dict):
+                    raise DeploymentValidationError(
+                        f"authority_matrix.{domain} must be a mapping"
+                    )
+                current = merged_matrix.get(domain, {})
+                merged_matrix[domain] = {
+                    "owner": domain_data.get("owner", current.get("owner", "")),
+                    "on_disconnect": domain_data.get(
+                        "on_disconnect",
+                        current.get("on_disconnect", ""),
+                    ),
+                    "description": domain_data.get(
+                        "description",
+                        current.get("description", ""),
+                    ),
+                }
+            self.authority_matrix = self._parse_authority_matrix(merged_matrix)

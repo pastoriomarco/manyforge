@@ -60,7 +60,7 @@ RUN pip install --no-cache-dir --upgrade pip setuptools && \
         pillow==10.2.0 \
         nanobind==2.12.0 \
         scikit-build-core==0.12.2 \
-        pin==3.7.0 \
+        pin==3.9.0 \
         viser==1.0.26 \
         fastapi==0.135.3 \
         "uvicorn[standard]==0.44.0" \

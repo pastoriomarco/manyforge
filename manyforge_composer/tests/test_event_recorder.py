@@ -299,11 +299,77 @@ class TestJSONLSink:
         assert event["sequence"] == event["event_index"]
         assert isinstance(event["timestamp"], str)
         assert isinstance(event["timestamp_wall"], str)
+        assert event["schema_version"] == "manyforge.execution_event.v1"
+        assert event["trace_source"] == "event_recorder"
         assert event["severity"] == "INFO"
         assert isinstance(event["component"], str)
         assert isinstance(event["message"], str)
         assert event["event"] == event["type"]
         assert event["program_run_id"] == event["run_id"]
+
+    def test_export_ros2_medkit_trace_normalizes_records(self, tmp_path):
+        rec = EventRecorder(trace_dir=tmp_path)
+        rec.observe(_StubState(cycle_manager=_StubCycleManager("idle")))
+        rec.observe(_StubState(cycle_manager=_StubCycleManager("running")))
+        run_id = rec.current_run_id
+        rec.record_interrupt_event(
+            action="latched",
+            interrupt_id="int-001",
+            source="operator_pause",
+            policy_id="operator_pause_hold",
+            preemption_mode="hold_cycle",
+            disposition="resumable_hold",
+            active_node_id="timer",
+            run_id=run_id,
+            details={"active_node_name": "wait_here"},
+        )
+
+        exported = rec.export_ros2_medkit_trace(run_id=run_id, exported_at_ns=123456789)
+        assert exported["schema_version"] == "manyforge.ros2_medkit_trace.v1"
+        assert exported["trace_source"] == "manyforge_composer"
+        assert exported["exported_at_ns"] == 123456789
+        assert exported["run_id"] == run_id
+        assert exported["program_run_id"] == run_id
+        assert exported["records"]
+        interrupt_records = [
+            record for record in exported["records"]
+            if record["event_type"] == "interrupt_latched"
+        ]
+        assert interrupt_records
+        record = interrupt_records[-1]
+        assert record["timeline_id"] == run_id
+        assert record["attributes"]["interrupt_id"] == "int-001"
+        assert record["attributes"]["preemption_mode"] == "hold_cycle"
+
+    def test_history_filters_by_severity_component_and_type(self):
+        rec = EventRecorder()
+        rec.observe(_StubState(cycle_manager=_StubCycleManager("idle")))
+        rec.observe(_StubState(cycle_manager=_StubCycleManager("running")))
+        run_id = rec.current_run_id
+        rec.record_interrupt_event(
+            action="latched",
+            interrupt_id="int-002",
+            source="operator_pause",
+            policy_id="operator_pause_hold",
+            preemption_mode="hold_cycle",
+            disposition="resumable_hold",
+            run_id=run_id,
+            details={},
+        )
+        rec._record_event(
+            event_type="cycle_error",
+            run_id=run_id,
+            details={"error": "boom"},
+        )
+
+        result = rec.history(
+            run_id=run_id,
+            min_severity="ERROR",
+            components=["manyforge.cycle"],
+            event_types=["cycle_error"],
+        )
+        assert len(result["events"]) == 1
+        assert result["events"][0]["type"] == "cycle_error"
 
 
 class TestBoundedRetention:
@@ -432,6 +498,36 @@ class TestInterventionProjection:
         assert matching[0]["session_kind"] == "delegated_recovery"
         assert matching[0]["authority_source"] == "program_node"
         assert matching[0]["trigger_node_instance"] == "move_to_pick"
+
+    def test_interrupt_event_is_recorded_with_stable_fields(self):
+        rec = EventRecorder()
+
+        rec.record_interrupt_event(
+            action="detected",
+            interrupt_id="int-001",
+            source="operator_pause",
+            policy_id="pause_hold",
+            preemption_mode="hold_cycle",
+            disposition="resumable_hold",
+            active_node_id="move_to_pick",
+            active_move_id="pick_approach",
+            run_id="run-123",
+            details={"latched": True},
+        )
+
+        matching = [
+            event for event in _memory_events(rec)
+            if event["type"] == "interrupt_detected"
+        ]
+        assert len(matching) == 1
+        event = matching[0]
+        assert event["component"] == "manyforge.interrupt"
+        assert event["details"]["interrupt_id"] == "int-001"
+        assert event["details"]["source"] == "operator_pause"
+        assert event["details"]["policy_id"] == "pause_hold"
+        assert event["details"]["preemption_mode"] == "hold_cycle"
+        assert event["details"]["disposition"] == "resumable_hold"
+        assert event["details"]["active_node_id"] == "move_to_pick"
 
 
 class TestGetEventsSince:

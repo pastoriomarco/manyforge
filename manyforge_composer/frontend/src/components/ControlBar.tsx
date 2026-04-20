@@ -464,7 +464,7 @@ export function ControlBar() {
     savedTree,
   ]);
 
-  const editLocked = state === 'running' || state === 'direct_control' || busy;
+  const editLocked = state === 'running' || state === 'interrupt_handler' || state === 'direct_control' || busy;
   const canSaveAs = (!editLocked && !!programInfo) || (!editLocked && !!deployment);
 
   return (

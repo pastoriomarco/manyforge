@@ -1,0 +1,7 @@
+matrix_id: interrupt_qualification
+description: Advanced interrupt qualification batch for timing, restart, motion, and deferred-priority semantics.
+scenarios:
+  - verification/scenarios/interrupt_handler_timeout_requires_reset.scenario.yaml
+  - verification/scenarios/interrupt_restart_subtree_complete.scenario.yaml
+  - verification/scenarios/interrupt_motion_handler_halt.scenario.yaml
+  - verification/scenarios/interrupt_deferred_priority_queue.scenario.yaml

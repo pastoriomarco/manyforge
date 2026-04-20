@@ -1,6 +1,6 @@
 // Cycle
 export interface CycleStatus {
-  state: 'idle' | 'running' | 'stopped' | 'direct_control';
+  state: 'idle' | 'running' | 'stopped' | 'interrupt_handler' | 'direct_control';
   velocityScale: number;
 }
 
@@ -193,6 +193,21 @@ export interface PromptTemplateConfig {
   responseTool?: Record<string, unknown> | null;
 }
 
+export interface InterruptSourceConfig {
+  adapter: string;
+  signal: string;
+  kind: 'edge' | 'level';
+  priority: number;
+  maskable: boolean;
+  description: string;
+}
+
+export interface AuthorityDomainConfig {
+  owner: string;
+  onDisconnect: string;
+  description: string;
+}
+
 export interface RobotConfig {
   robotId: string;
   groupId: string;
@@ -220,6 +235,8 @@ export interface FullDeployment {
   modelAuditPolicy?: ModelAuditPolicy | null;
   modelEndpoints: Record<string, ModelEndpointConfig>;
   promptTemplates: Record<string, PromptTemplateConfig>;
+  interruptSources: Record<string, InterruptSourceConfig>;
+  authorityMatrix: Record<string, AuthorityDomainConfig>;
   sourcePath: string;
 }
 
@@ -296,7 +313,7 @@ export interface ModelEndpointCatalog {
 
 // WebSocket
 export interface StateUpdate {
-  state: 'idle' | 'running' | 'stopped' | 'direct_control';
+  state: 'idle' | 'running' | 'stopped' | 'interrupt_handler' | 'direct_control';
   velocityScale: number;
   nodeStatuses?: Record<string, string>;
   nativeKernelEvents?: Record<string, unknown>[];

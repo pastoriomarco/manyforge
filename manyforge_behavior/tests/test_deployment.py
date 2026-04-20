@@ -27,6 +27,12 @@ EXAMPLE_DEPLOYMENT_PATH = (
 EXAMPLE_PROGRAM_PATH = (
     Path(__file__).resolve().parents[2] / "examples" / "pick_and_place.program.yaml"
 )
+INTERRUPT_EXAMPLE_DEPLOYMENT_PATH = (
+    Path(__file__).resolve().parents[2] / "examples" / "interrupt_pick_and_place.deployment.yaml"
+)
+INTERRUPT_EXAMPLE_PROGRAM_PATH = (
+    Path(__file__).resolve().parents[2] / "examples" / "interrupt_pick_and_place.program.yaml"
+)
 
 
 @pytest.fixture
@@ -53,6 +59,24 @@ def _write_deployment(data: dict) -> str:
     yaml.dump(data, f)
     f.close()
     return f.name
+
+
+def _minimal_program(**overrides) -> dict:
+    program = {
+        "api_version": "manyforge.program.v0",
+        "program_profile": "v0.0",
+        "name": "test_program",
+        "catalog_version": "0.1.0",
+        "robot": {
+            "robot_id": "ur5",
+            "group_id": "arm",
+            "base_frame": "base_link",
+            "tcp_frame": "tool0",
+        },
+        "tree": _minimal_tree(),
+    }
+    program.update(overrides)
+    return program
 
 
 def _minimal_deployment(**overrides) -> dict:
@@ -152,11 +176,84 @@ class TestDeploymentLoading:
         assert deploy.launch.ui_backend.module == "manyforge_hmi.backend"
         assert deploy.launch.ui_backend.enabled is True
 
+    def test_interrupt_sources_parsed(self):
+        data = _minimal_deployment(
+            interrupt_sources={
+                "operator_pause": {
+                    "adapter": "composer_ui",
+                    "signal": "pause_request",
+                    "kind": "edge",
+                    "priority": 30,
+                    "maskable": True,
+                },
+            },
+        )
+        path = _write_deployment(data)
+        try:
+            deploy = Deployment(path)
+            assert "operator_pause" in deploy.interrupt_sources
+            assert deploy.interrupt_sources["operator_pause"].kind == "edge"
+        finally:
+            os.unlink(path)
+
+    def test_authority_matrix_parsed(self):
+        data = _minimal_deployment(
+            authority_matrix={
+                "motion": {
+                    "owner": "manyforge",
+                    "on_disconnect": "hold",
+                    "description": "ManyForge owns motion commands during runtime.",
+                },
+                "plc_signals": {
+                    "owner": "plc",
+                    "on_disconnect": "latched_fault",
+                },
+            },
+        )
+        path = _write_deployment(data)
+        try:
+            deploy = Deployment(path)
+            assert deploy.authority_matrix["motion"].owner == "manyforge"
+            assert deploy.authority_matrix["motion"].on_disconnect == "hold"
+            assert deploy.authority_matrix["plc_signals"].owner == "plc"
+        finally:
+            os.unlink(path)
+
 
 class TestDeploymentValidation:
     def test_invalid_api_version(self):
         path = _write_deployment(_minimal_deployment(api_version="wrong"))
         with pytest.raises(DeploymentValidationError, match="api_version"):
+            Deployment(path)
+        os.unlink(path)
+
+    def test_invalid_authority_matrix_domain(self):
+        path = _write_deployment(
+            _minimal_deployment(
+                authority_matrix={
+                    "camera": {
+                        "owner": "manyforge",
+                        "on_disconnect": "hold",
+                    }
+                },
+            )
+        )
+        with pytest.raises(DeploymentValidationError, match="supported domain"):
+            Deployment(path)
+        os.unlink(path)
+
+    def test_invalid_authority_matrix_owner(self):
+        path = _write_deployment(
+            _minimal_deployment(
+                authority_matrix={
+                    "motion": {
+                        "owner": "robot",
+                        "on_disconnect": "hold",
+                    }
+                },
+            )
+        )
+        with pytest.raises(DeploymentValidationError, match="owner must be one of"):
             Deployment(path)
         os.unlink(path)
 
@@ -222,6 +319,37 @@ class TestDeploymentValidation:
         assert deploy.robot_config.srdf_path == ""
         os.unlink(path)
 
+    def test_update_from_dict_validates_authority_matrix(self):
+        deploy = Deployment.from_dict(_minimal_deployment())
+        with pytest.raises(DeploymentValidationError, match="owner must be one of"):
+            deploy.update_from_dict(
+                {
+                    "authority_matrix": {
+                        "motion": {
+                            "owner": "robot",
+                            "on_disconnect": "hold",
+                        }
+                    }
+                }
+            )
+
+    def test_update_from_dict_validates_interrupt_sources(self):
+        deploy = Deployment.from_dict(_minimal_deployment())
+        with pytest.raises(DeploymentValidationError, match="kind must be one of"):
+            deploy.update_from_dict(
+                {
+                    "interrupt_sources": {
+                        "operator_pause": {
+                            "adapter": "composer_ui",
+                            "signal": "pause_request",
+                            "kind": "pulse",
+                            "priority": 30,
+                            "maskable": True,
+                        }
+                    }
+                }
+            )
+
     def test_optional_ui_backend(self):
         data = _minimal_deployment()
         # ui_backend is not in minimal deployment, so it should be None
@@ -230,12 +358,37 @@ class TestDeploymentValidation:
         assert deploy.launch.ui_backend is None
         os.unlink(path)
 
+    def test_rejects_interrupt_source_with_invalid_kind(self):
+        data = _minimal_deployment(
+            interrupt_sources={
+                "safety_stop": {
+                    "adapter": "plc",
+                    "signal": "safety.stop",
+                    "kind": "pulse",
+                    "priority": 100,
+                    "maskable": False,
+                },
+            },
+        )
+        path = _write_deployment(data)
+        with pytest.raises(DeploymentValidationError, match="kind must be one of"):
+            Deployment(path)
+        os.unlink(path)
+
 
 class TestCrossArtifactValidation:
     def test_validate_against_program_success(self, catalog):
         deploy = Deployment(DEPLOYMENT_FIXTURE_PATH)
         prog = Program(PROGRAM_FIXTURE_PATH, catalog)
         deploy.validate_against_program(prog)
+
+    def test_interrupt_example_program_and_deployment_validate(self, catalog):
+        deploy = Deployment(INTERRUPT_EXAMPLE_DEPLOYMENT_PATH)
+        prog = Program(INTERRUPT_EXAMPLE_PROGRAM_PATH, catalog)
+        deploy.validate_against_program(prog)
+        assert "operator_pause" in deploy.interrupt_sources
+        assert "operator_pause_hold" in prog.interrupt_policies
+        assert "operator_pause_hold_handler" in prog.interrupt_handlers
 
     def test_validate_profile_mismatch(self, catalog):
         deploy = Deployment(DEPLOYMENT_FIXTURE_PATH)
@@ -257,6 +410,87 @@ class TestCrossArtifactValidation:
         with pytest.raises(DeploymentValidationError, match="program_profile"):
             deploy.validate_against_program(prog)
         os.unlink(path)
+
+    def test_validate_interrupt_source_reference(self, catalog):
+        deployment_data = _minimal_deployment(
+            interrupt_sources={
+                "operator_pause": {
+                    "adapter": "composer_ui",
+                    "signal": "pause_request",
+                    "kind": "edge",
+                    "priority": 30,
+                    "maskable": True,
+                },
+            },
+        )
+        program_data = _minimal_program(
+            interrupt_handlers={
+                "pause_announce": {
+                    "root": {
+                        "id": "sequence",
+                        "name": "pause_announce",
+                        "children": [
+                            {"id": "reset_trajectories", "name": "noop"},
+                        ],
+                    },
+                },
+            },
+            interrupt_policies=[
+                {
+                    "id": "pause_hold",
+                    "source": "operator_pause",
+                    "applies_to": {"subtree_root": "root"},
+                    "preemption_mode": "hold_cycle",
+                    "handler": "pause_announce",
+                    "after_handler": "resumable_hold",
+                },
+            ],
+        )
+        deploy_path = _write_deployment(deployment_data)
+        program_path = _write_deployment(program_data)
+        try:
+            deploy = Deployment(deploy_path)
+            prog = Program(program_path, catalog)
+            deploy.validate_against_program(prog)
+        finally:
+            os.unlink(deploy_path)
+            os.unlink(program_path)
+
+    def test_rejects_program_interrupt_policy_for_unknown_deployment_source(self, catalog):
+        deployment_data = _minimal_deployment()
+        program_data = _minimal_program(
+            interrupt_handlers={
+                "pause_announce": {
+                    "root": {
+                        "id": "sequence",
+                        "name": "pause_announce",
+                        "children": [
+                            {"id": "reset_trajectories", "name": "noop"},
+                        ],
+                    },
+                },
+            },
+            interrupt_policies=[
+                {
+                    "id": "pause_hold",
+                    "source": "operator_pause",
+                    "applies_to": {"subtree_root": "root"},
+                    "preemption_mode": "hold_cycle",
+                    "handler": "pause_announce",
+                    "after_handler": "resumable_hold",
+                },
+            ],
+        )
+        deploy_path = _write_deployment(deployment_data)
+        program_path = _write_deployment(program_data)
+        try:
+            deploy = Deployment(deploy_path)
+            prog = Program(program_path, catalog)
+            with pytest.raises(DeploymentValidationError, match="undeclared deployment interrupt source"):
+                deploy.validate_against_program(prog)
+        finally:
+            os.unlink(deploy_path)
+            os.unlink(program_path)
 
     def test_validate_robot_id_mismatch(self, catalog):
         deploy = Deployment(DEPLOYMENT_FIXTURE_PATH)

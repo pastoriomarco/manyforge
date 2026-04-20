@@ -88,12 +88,12 @@ body:
         motion_type: pose_goal
         pose_goal: "${param:place_pose}"
         velocity_scale: "${param:velocity_scale}"
-    - id: set_key_bool_value
+    - id: set_gripper_state
       name: open_gripper
       params:
-        key:
+        state_key:
           key_ref: gripper_closed
-        value: false
+        state: open
     - id: detach_object_from_link
       name: detach
       params:

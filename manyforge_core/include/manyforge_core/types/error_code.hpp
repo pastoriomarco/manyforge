@@ -48,33 +48,33 @@ enum class ErrorCode {
 inline const char* to_string(ErrorCode code) {
     switch (code) {
         using enum ErrorCode;
-        case kSuccess: return "Success";
-        case kInvalidRequest: return "InvalidRequest";
-        case kMissingReference: return "MissingReference";
-        case kAmbiguousReference: return "AmbiguousReference";
-        case kUnsupportedCapability: return "UnsupportedCapability";
-        case kPlanningFailed: return "PlanningFailed";
-        case kPlanningTimeout: return "PlanningTimeout";
-        case kIkFailed: return "IkFailed";
-        case kCartesianIncomplete: return "CartesianIncomplete";
-        case kStartStateMismatch: return "StartStateMismatch";
-        case kValidationCollision: return "ValidationCollision";
-        case kValidationLimitsViolation: return "ValidationLimitsViolation";
-        case kObjectAlreadyExists: return "ObjectAlreadyExists";
-        case kObjectNotFound: return "ObjectNotFound";
-        case kExecutionRejected: return "ExecutionRejected";
-        case kExecutionAborted: return "ExecutionAborted";
-        case kExecutionTimeout: return "ExecutionTimeout";
-        case kStopFailed: return "StopFailed";
-        case kPauseFailed: return "PauseFailed";
-        case kResumeFailed: return "ResumeFailed";
-        case kResetFailed: return "ResetFailed";
-        case kInternalError: return "InternalError";
-        case kInvariantViolation: return "InvariantViolation";
-        case kInvalidStateTransition: return "InvalidStateTransition";
-        case kCacheMiss: return "CacheMiss";
-        case kCollisionDetected: return "CollisionDetected";
-        default: return "Unknown";
+        case kSuccess: return "success";
+        case kInvalidRequest: return "invalid_request";
+        case kMissingReference: return "missing_reference";
+        case kAmbiguousReference: return "ambiguous_reference";
+        case kUnsupportedCapability: return "unsupported_capability";
+        case kPlanningFailed: return "planning_failed";
+        case kPlanningTimeout: return "planning_timeout";
+        case kIkFailed: return "ik_failed";
+        case kCartesianIncomplete: return "cartesian_incomplete";
+        case kStartStateMismatch: return "start_state_mismatch";
+        case kValidationCollision: return "validation_collision";
+        case kValidationLimitsViolation: return "validation_limits_violation";
+        case kObjectAlreadyExists: return "object_already_exists";
+        case kObjectNotFound: return "object_not_found";
+        case kExecutionRejected: return "execution_rejected";
+        case kExecutionAborted: return "execution_aborted";
+        case kExecutionTimeout: return "execution_timeout";
+        case kStopFailed: return "stop_failed";
+        case kPauseFailed: return "pause_failed";
+        case kResumeFailed: return "resume_failed";
+        case kResetFailed: return "reset_failed";
+        case kInternalError: return "internal_error";
+        case kInvariantViolation: return "invariant_violation";
+        case kInvalidStateTransition: return "invalid_state_transition";
+        case kCacheMiss: return "cache_miss";
+        case kCollisionDetected: return "collision_detected";
+        default: return "unknown";
     }
 }
 

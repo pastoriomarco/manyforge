@@ -55,10 +55,11 @@ GET /api/execution/digest    — High-level status for polling (every 2-5s)
 GET /api/kernel/snapshot     — Execution state + joint positions
 GET /api/kernel/metrics      — Performance counters
 GET /api/kernel/events       — Native kernel events (since=N for polling)
-GET /api/execution/history   — Event log for current/last run
+GET /api/execution/history   — Event log for current/last run (supports filters like `minSeverity`, `components`, `eventTypes`, `executionId`)
 GET /api/execution/blackboard — py_trees blackboard key-value state
 GET /api/scene/diagnostics   — Backend vs HMI comparison
 GET /api/debug/export        — Full trace bundle for post-mortem
+GET /api/debug/export/ros2-medkit — Normalized correlation trace for ros2_medkit-style tooling
 GET /api/debug/scene-trace   — Scene edit audit trail
 ```
 
@@ -218,9 +219,9 @@ children:
         offset: {position_m: [0.0, 0.0, 0.0]}
       velocity_scale: 0.5
 
-  - id: set_key_bool_value
+  - id: set_gripper_state
     name: close_gripper
-    params: {key: gripper_closed, value: true}
+    params: {state_key: gripper_closed, state: closed}
 
   - id: attach_object_to_link
     name: attach_graspable
@@ -270,9 +271,9 @@ children:
         orientation_xyzw: [0.0, 0.0, 0.0, 1.0]
       velocity_scale: 0.5
 
-  - id: set_key_bool_value
+  - id: set_gripper_state
     name: open_gripper
-    params: {key: gripper_closed, value: false}
+    params: {state_key: gripper_closed, state: open}
 
   - id: detach_object_from_link
     name: detach_graspable
@@ -311,15 +312,23 @@ params:
 ### Pattern: Conditional Retry with Fallback
 
 ```yaml
+blackboard:
+  keys:
+    - id: sensor_ready
+      type: bool
+      key: io/sensor_ready
+
 id: fallback
 name: robust_pick
 children:
   - id: sequence
     name: try_primary
     children:
-      - id: check_key_bool_value
+      - id: check_signal_bool
         name: check_sensor_ready
-        params: {key: sensor_ready, expected_value: true}
+        params:
+          key: {key_ref: sensor_ready}
+          expected_value: true
       - id: move_manipulator_action
         name: primary_approach
         params:
@@ -429,8 +438,20 @@ Retrieve the full catalog via `GET /api/catalog`. Key nodes for composition:
 | `set_key_bool_value` | logic | Set a blackboard boolean |
 | `check_key_bool_value` | logic | Condition: check blackboard boolean |
 | `wait_for_key_bool` | logic | Block until blackboard boolean matches |
+| `check_signal_bool` | signals | Condition: check a declared industrial signal level |
+| `set_signal_bool` | signals | Write a declared industrial signal level |
+| `wait_for_signal_bool` | signals | Block until a declared signal reaches a level |
+| `wait_for_signal_edge` | signals | Block until a declared signal produces an edge |
+| `check_gripper_state` | end_effector | Condition: check logical gripper state |
+| `set_gripper_state` | end_effector | Write logical gripper state |
+| `wait_for_gripper_state` | end_effector | Block until logical gripper state matches |
 | `get_link_pose` | geometry | Query FK and store pose on blackboard |
 | `check_pose_distance` | geometry | Condition: check distance between poses |
+
+The `set_key_bool_value` / `check_key_bool_value` / `wait_for_key_bool` nodes
+remain useful as low-level typed blackboard primitives. For application-facing
+industrial logic, prefer the signal and gripper nodes because their intent is
+clearer in traces, review, and future PLC/ROS wrapper work.
 
 ---
 

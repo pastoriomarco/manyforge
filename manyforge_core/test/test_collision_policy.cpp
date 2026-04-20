@@ -104,7 +104,7 @@ TEST_F(CollisionPolicyTest, PreExecuteCheck_Collision_Error) {
   check.in_collision = true;
   auto result = policy.pre_execute_check(check);
   EXPECT_FALSE(result.ok());
-  EXPECT_EQ(result.error().code, "ValidationCollision");
+  EXPECT_EQ(result.error().code, "validation_collision");
 }
 
 // --- Custom response configuration ---

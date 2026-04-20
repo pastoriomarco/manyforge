@@ -1,0 +1,43 @@
+scenario_id: interrupt_pick_and_place_reset_after_hold
+description: Qualification scenario for interrupt hold followed by explicit cycle reset.
+program: examples/interrupt_pick_and_place.program.yaml
+deployment: examples/interrupt_pick_and_place.deployment.yaml
+timeouts:
+  scenario_s: 60
+  poll_interval_ms: 50
+steps:
+  - action: load_program
+  - action: cycle_run
+  - action: wait_for
+    endpoint: digest
+    path: state
+    equals: running
+    timeout_s: 15
+  - action: publish_signal
+    adapter: demo_ui
+    signal: pause_request
+    value: true
+    stale_after_ms: 1500
+    mirror_key: demo/pause_request
+    metadata:
+      reason: operator_pause_reset_qualification
+  - action: wait_for
+    endpoint: digest
+    path: state
+    equals: stopped
+    timeout_s: 10
+  - action: cycle_reset
+  - action: wait_for
+    endpoint: cycle_status
+    path: state
+    equals: idle
+    timeout_s: 5
+assertions:
+  - endpoint: history
+    event_type: interrupt_latched
+  - endpoint: digest
+    path: pendingInterrupt
+    equals: null
+  - endpoint: history
+    event_type: kernel_error
+    absent: true
