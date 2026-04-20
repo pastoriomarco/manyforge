@@ -82,6 +82,27 @@ integration concept. It is not the industrial target:
 - it is topology-sensitive
 - it is harder to explain, audit, and operate than a native service route
 
+### 4. External embodied-agent work supports a layered split, not a merger
+
+Recent OpenClaw-adjacent embodied-agent work such as *ABot-Claw: A Foundation
+for Persistent, Cooperative, and Self-Evolving Robotic Agents* supports a
+three-layer architecture:
+
+- supervisory/agentic orchestration
+- shared services such as perception, memory, and evaluation
+- embodiment-specific execution
+
+That is consistent with this plan:
+
+- OpenClaw remains the supervisory layer
+- ManyForge remains the bounded execution/application layer
+- shared services should sit between them where needed, rather than collapsing
+  ManyForge into an all-purpose agent runtime
+
+Reference:
+
+- https://arxiv.org/abs/2604.10096
+
 ## Integration Modes
 
 ### Mode A: Composer assistant

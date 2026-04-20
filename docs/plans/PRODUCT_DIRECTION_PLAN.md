@@ -125,6 +125,26 @@ reasoning only where:
 - deterministic fallbacks remain possible
 - auditability is preserved
 
+### 5. External architecture references support layering, not redirection
+
+Recent embodied-agent work around OpenClaw, including *ABot-Claw: A Foundation
+for Persistent, Cooperative, and Self-Evolving Robotic Agents*, is useful as an
+external signal that the right long-term structure is layered:
+
+- execution/application authority
+- shared services such as perception, memory, and evaluation
+- supervisory/agentic orchestration
+
+For ManyForge, that reinforces the current direction:
+
+- ManyForge should stay the industrial execution and application layer
+- shared services should become explicit subsystem boundaries
+- OpenClaw-style orchestration should remain above that layer, not replace it
+
+Reference:
+
+- https://arxiv.org/abs/2604.10096
+
 ## 5-Month Objective
 
 By ROSCon 2026, ManyForge should be able to support and demonstrate:

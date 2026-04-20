@@ -183,6 +183,19 @@ Evaluation boundary:
 - they are not candidates to replace ManyForge runtime execution authority
 - they are not a replacement for lightweight HMI/debug rendering such as Viser
 
+External architecture note:
+
+- embodied-agent work such as *ABot-Claw: A Foundation for Persistent,
+  Cooperative, and Self-Evolving Robotic Agents* reinforces the same boundary:
+  perception, memory, and evaluation belong in shared services, not inside the
+  deterministic execution core
+- that is supporting evidence for moving image-based runtime capabilities out
+  of browser/HMI paths and into explicit sidecar/service layers
+
+Reference:
+
+- https://arxiv.org/abs/2604.10096
+
 ### 4. Tick-thread and runtime hardening
 
 Still open:
