@@ -6,10 +6,14 @@ Only 1 Python↔C++ boundary crossing per call (no trampolines).
 from __future__ import annotations
 
 import math
+import time
 from typing import Any, Dict, Optional
 
 from manyforge_behavior.kernel_client import (
     KernelClient,
+    GripperCommandRequest,
+    GripperCommandState,
+    GripperCommandStatus,
     ExecutionState,
     ExecuteRequest,
     ExecuteResult,
@@ -80,6 +84,57 @@ class NativeKernelClient(KernelClient):
             bundle: NativeKernelBundle returned by create_native_kernel()
         """
         self._bundle = bundle
+        self._active_gripper_commands: Dict[str, Dict[str, Any]] = {}
+        self._gripper_status_cache: Dict[str, GripperCommandStatus] = {}
+
+    def _get_group_joint_index(self, group_id: str, joint_name: str) -> int:
+        joint_names = list(self._bundle.get_group_joint_names(group_id))
+        if joint_name not in joint_names:
+            raise ValueError(
+                f"Joint '{joint_name}' was not found in gripper group '{group_id}'"
+            )
+        return joint_names.index(joint_name)
+
+    def _get_group_joint_positions(self, group_id: str) -> list[float]:
+        return list(self._bundle.get_group_joint_positions(group_id))
+
+    def _advance_gripper_command(self, gripper_id: str) -> GripperCommandStatus:
+        command = self._active_gripper_commands.get(gripper_id)
+        if command is None:
+            return self._gripper_status_cache.get(
+                gripper_id,
+                GripperCommandStatus(
+                    state=GripperCommandState.IDLE,
+                    gripper_id=gripper_id,
+                ),
+            )
+
+        elapsed = time.monotonic() - float(command["start_time"])
+        duration = float(command["duration_s"])
+        progress = min(max(elapsed / duration, 0.0), 1.0)
+        current_position = (
+            float(command["start_position"])
+            + (float(command["target_position"]) - float(command["start_position"])) * progress
+        )
+        group_positions = self._get_group_joint_positions(command["group_id"])
+        group_positions[command["joint_index"]] = current_position
+        self._bundle.set_group_joint_positions(command["group_id"], group_positions)
+
+        status = GripperCommandStatus(
+            state=(
+                GripperCommandState.COMPLETED
+                if progress >= 1.0
+                else GripperCommandState.EXECUTING
+            ),
+            gripper_id=gripper_id,
+            progress=progress,
+            current_position=current_position,
+            target_position=float(command["target_position"]),
+        )
+        self._gripper_status_cache[gripper_id] = status
+        if status.state == GripperCommandState.COMPLETED:
+            self._active_gripper_commands.pop(gripper_id, None)
+        return status
 
     def execute(self, request: ExecuteRequest) -> ExecuteResult:
         relative_move = request.relative_move
@@ -305,6 +360,58 @@ class NativeKernelClient(KernelClient):
     def get_metrics(self) -> Dict[str, int]:
         return dict(self._bundle.get_metrics())
 
+    def command_gripper(self, request: GripperCommandRequest) -> CommandResult:
+        current = self.get_gripper_status(request.gripper_id)
+        if current.state == GripperCommandState.EXECUTING:
+            return CommandResult(
+                accepted=False,
+                error=f"Gripper '{request.gripper_id}' is already executing a command",
+            )
+
+        try:
+            joint_index = self._get_group_joint_index(
+                request.group_id,
+                request.joint_name,
+            )
+            group_positions = self._get_group_joint_positions(request.group_id)
+        except Exception as exc:
+            return CommandResult(accepted=False, error=str(exc))
+
+        start_position = float(group_positions[joint_index])
+        if request.duration_s <= 0.0:
+            group_positions[joint_index] = float(request.target_position)
+            self._bundle.set_group_joint_positions(request.group_id, group_positions)
+            self._gripper_status_cache[request.gripper_id] = GripperCommandStatus(
+                state=GripperCommandState.COMPLETED,
+                gripper_id=request.gripper_id,
+                progress=1.0,
+                current_position=float(request.target_position),
+                target_position=float(request.target_position),
+            )
+            self._active_gripper_commands.pop(request.gripper_id, None)
+            return CommandResult(accepted=True)
+
+        self._active_gripper_commands[request.gripper_id] = {
+            "group_id": request.group_id,
+            "joint_name": request.joint_name,
+            "joint_index": joint_index,
+            "start_position": start_position,
+            "target_position": float(request.target_position),
+            "duration_s": float(request.duration_s),
+            "start_time": time.monotonic(),
+        }
+        self._gripper_status_cache[request.gripper_id] = GripperCommandStatus(
+            state=GripperCommandState.EXECUTING,
+            gripper_id=request.gripper_id,
+            progress=0.0,
+            current_position=start_position,
+            target_position=float(request.target_position),
+        )
+        return CommandResult(accepted=True)
+
+    def get_gripper_status(self, gripper_id: str) -> GripperCommandStatus:
+        return self._advance_gripper_command(gripper_id)
+
     def drain_kernel_events(self) -> list[dict]:
         return list(self._bundle.drain_kernel_events())
 
@@ -334,6 +441,8 @@ class NativeKernelClient(KernelClient):
             req_dict["pose_orientation_xyzw"] = request.pose_orientation_xyzw
         if request.frame_id:
             req_dict["frame_id"] = request.frame_id
+        if request.touch_links is not None:
+            req_dict["touch_links"] = list(request.touch_links)
 
         try:
             result = self._bundle.scene_edit(req_dict)

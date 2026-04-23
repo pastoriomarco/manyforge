@@ -1,0 +1,272 @@
+api_version: manyforge.program.v0
+program_profile: v0.1
+name: pick_and_place_ur10e_robotiq_demo
+description: 'Pick-and-place demo with UR10e + Robotiq 2F-140: approach/pick/retreat/drop
+  sequence using backend-resolved relative pick goals, collision-aware motion planning
+  (RRT + TOPPRA), simulated Robotiq finger actuation, and scene attach/detach semantics.
+  Sequence follows the existing ManyForge pattern: approach -> pick -> retreat ->
+  approach drop -> drop -> retreat -> rest.'
+catalog_version: 0.1.0
+robot:
+  robot_id: ur10e
+  group_id: arm
+  base_frame: base_link
+  tcp_frame: grasp_frame
+scene:
+- object_id: ground
+  shape:
+    type: box
+    box_dimensions_m:
+    - 1
+    - 1
+    - 0.2
+  pose:
+    frame_id: universe
+    position_m:
+    - 0
+    - 0
+    - -0.11
+    orientation_rpy_deg:
+    - 0
+    - 0
+    - 0
+- object_id: graspable
+  shape:
+    type: box
+    box_dimensions_m:
+    - 0.1
+    - 0.01
+    - 0.01
+  pose:
+    frame_id: universe
+    position_m:
+    - 0.3
+    - -0.3
+    - 0.15
+    orientation_xyzw:
+    - 0
+    - 0
+    - -0.3826834323650898
+    - 0.9238795325112867
+parameters:
+- name: velocity_scale
+  type: float
+  default: 0.5
+  constraints:
+    min_exclusive: 0
+    max_inclusive: 1
+  description: Velocity scale for all moves.
+blackboard:
+  namespaces: []
+  keys:
+  - id: gripper_closed
+    type: bool
+    key: gripper_closed
+    description: Logical gripper closed/open flag written after actuation succeeds.
+tree:
+  id: sequence
+  name: pick_and_place
+  children:
+  - id: command_gripper
+    name: command_gripper
+    params:
+      gripper_id: primary
+      command: open
+  - id: move_manipulator_action
+    name: move_to_pick_approach
+    params:
+      move_id: pick_approach
+      motion_type: relative_move
+      relative_move:
+        target_reference:
+          type: object
+          id: graspable
+        offset:
+          position_m:
+          - 0
+          - 0
+          - 0.1
+          orientation_rpy_deg:
+          - 180
+          - 0
+          - -180
+      velocity_scale: ${param:velocity_scale}
+      planning_timeout_s: 10
+      execution_timeout_s: 30
+  - id: move_manipulator_action
+    name: move_to_pick
+    params:
+      move_id: pick_down
+      motion_type: relative_move
+      relative_move:
+        target_reference:
+          type: object
+          id: graspable
+        offset:
+          position_m:
+          - 0
+          - 0
+          - 0.025
+          orientation_rpy_deg:
+          - 180
+          - 0
+          - -180
+      velocity_scale: ${param:velocity_scale}
+      planning_timeout_s: 10
+      execution_timeout_s: 30
+  - id: command_gripper
+    name: close_gripper
+    params:
+      gripper_id: primary
+      command: close
+      state_key:
+        key_ref: gripper_closed
+      timeout_s: 5
+  - id: attach_object_to_link
+    name: attach_graspable
+    params:
+      object_id: graspable
+      link_frame: grasp_frame
+      gripper_id: primary
+  - id: move_manipulator_action
+    name: pick_retreat
+    params:
+      move_id: pick_retreat
+      motion_type: relative_move
+      relative_move:
+        target_reference:
+          type: robot_link
+          id: grasp_frame
+        offset:
+          position_m:
+          - 0
+          - 0
+          - -0.1
+          orientation_rpy_deg:
+          - 0
+          - 0
+          - 0
+      velocity_scale: ${param:velocity_scale}
+      planning_timeout_s: 10
+      execution_timeout_s: 30
+  - id: reset_trajectories
+    name: invalidate_after_pick
+  - id: move_manipulator_action
+    name: move_to_drop_approach
+    params:
+      move_id: drop_approach
+      motion_type: relative_move
+      relative_move:
+        target_reference:
+          type: pose
+          pose:
+            position_m:
+            - 0.3
+            - 0.3
+            - 0.05
+            orientation_rpy_deg:
+            - 180
+            - 0
+            - -180
+        offset:
+          position_m:
+          - 0
+          - 0
+          - 0.1
+          orientation_rpy_deg:
+          - 180
+          - 0
+          - -180
+        offset_reference:
+          type: frame
+          id: base_link
+      velocity_scale: ${param:velocity_scale}
+      planning_timeout_s: 10
+      execution_timeout_s: 30
+  - id: move_manipulator_action
+    name: move_to_drop
+    params:
+      move_id: drop_down
+      motion_type: pose_goal
+      pose_goal:
+        position_m:
+        - 0.3
+        - 0.3
+        - 0.05
+        orientation_rpy_deg:
+        - 180
+        - 0
+        - -180
+      velocity_scale: ${param:velocity_scale}
+      planning_timeout_s: 10
+      execution_timeout_s: 30
+      joint_position_tol_rad: 0.05
+  - id: command_gripper
+    name: open_gripper
+    params:
+      gripper_id: primary
+      command: open
+      state_key:
+        key_ref: gripper_closed
+      timeout_s: 5
+  - id: detach_object_from_link
+    name: detach_graspable
+    params:
+      object_id: graspable
+      link_frame: grasp_frame
+  - id: move_manipulator_action
+    name: drop_retreat
+    params:
+      move_id: drop_retreat
+      motion_type: relative_move
+      relative_move:
+        target_reference:
+          type: pose
+          pose:
+            position_m:
+            - 0.3
+            - 0.3
+            - 0.05
+            orientation_rpy_deg:
+            - 180
+            - 0
+            - -180
+        offset:
+          position_m:
+          - 0
+          - 0
+          - 0.1
+          orientation_rpy_deg:
+          - 180
+          - 0
+          - -180
+        offset_reference:
+          type: frame
+          id: base_link
+      velocity_scale: ${param:velocity_scale}
+      planning_timeout_s: 10
+      execution_timeout_s: 30
+  - id: reset_trajectories
+    name: invalidate_after_drop
+  - id: move_manipulator_action
+    name: return_rest
+    params:
+      move_id: return_rest
+      motion_type: joint_goal
+      joint_goal_names:
+      - shoulder_pan_joint
+      - shoulder_lift_joint
+      - elbow_joint
+      - wrist_1_joint
+      - wrist_2_joint
+      - wrist_3_joint
+      joint_goal_positions_rad:
+      - 0
+      - -1.57
+      - 1.57
+      - -1.57
+      - -1.57
+      - 0
+      velocity_scale: ${param:velocity_scale}
+      planning_timeout_s: 10
+      execution_timeout_s: 30

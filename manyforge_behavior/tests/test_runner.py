@@ -433,6 +433,60 @@ class TestRunnerDeployment:
                         access=py_trees.common.Access.READ)
         assert bb.global_max_tcp_linear_speed_mps == 0.25
 
+    def test_gripper_configs_on_blackboard(self, kernel, tmp_path):
+        deployment_path = tmp_path / "with_gripper.deployment.yaml"
+        deployment_path.write_text(
+            yaml.safe_dump(
+                {
+                    "api_version": "manyforge.deployment.v0",
+                    "schema_version": "0.1.0",
+                    "name": "with_gripper",
+                    "program_profile": "v0.0",
+                    "robot_config": {
+                        "robot_id": "ur5",
+                        "group_id": "arm",
+                        "urdf_path": "package://roboplan_example_models/models/ur_robot_model/ur5_gripper.urdf",
+                        "srdf_path": "package://roboplan_example_models/models/ur_robot_model/ur5_gripper.srdf",
+                        "global_max_tcp_linear_speed_mps": 0.25,
+                    },
+                    "grippers": {
+                        "primary": {
+                            "command_mode": "simulated_joint",
+                            "group_id": "gripper",
+                            "joint_name": "finger_joint",
+                            "open_position": 0.0,
+                            "closed_position": 0.7,
+                            "motion_time_s": 0.8,
+                            "touch_links": ["left_inner_finger_pad", "right_inner_finger_pad"],
+                        }
+                    },
+                    "adapters": {
+                        "planning": {"adapter_id": "p", "adapter_version": "0.1.0", "config": {}},
+                        "context": {"adapter_id": "c", "adapter_version": "0.1.0", "config": {}},
+                        "execution": {"adapter_id": "e", "adapter_version": "0.1.0", "config": {}},
+                    },
+                    "orchestrator": {"engine": "py_trees", "config": {}},
+                    "launch": {"runner": {"module": "manyforge_behavior.runner", "args": []}},
+                }
+            )
+        )
+        runner = OrchestratorRunner(
+            CATALOG_PATH,
+            FIXTURE_PATH,
+            kernel,
+            deployment_path=str(deployment_path),
+        )
+        runner.load()
+        runner.build_tree()
+        bb = py_trees.blackboard.Client(name="test_gripper_configs")
+        bb.register_key(key="gripper_configs", access=py_trees.common.Access.READ)
+        assert bb.gripper_configs["primary"]["group_id"] == "gripper"
+        assert bb.gripper_configs["primary"]["joint_name"] == "finger_joint"
+        assert bb.gripper_configs["primary"]["touch_links"] == [
+            "left_inner_finger_pad",
+            "right_inner_finger_pad",
+        ]
+
     def test_runner_without_deployment_still_works(self, kernel):
         """Existing behavior unchanged when no deployment_path."""
         runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)

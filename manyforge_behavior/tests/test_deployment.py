@@ -27,6 +27,12 @@ EXAMPLE_DEPLOYMENT_PATH = (
 EXAMPLE_PROGRAM_PATH = (
     Path(__file__).resolve().parents[2] / "examples" / "pick_and_place.program.yaml"
 )
+UR10E_ROBOTIQ_EXAMPLE_DEPLOYMENT_PATH = (
+    Path(__file__).resolve().parents[2] / "examples" / "pick_and_place_ur10e_robotiq.deployment.yaml"
+)
+UR10E_ROBOTIQ_EXAMPLE_PROGRAM_PATH = (
+    Path(__file__).resolve().parents[2] / "examples" / "pick_and_place_ur10e_robotiq.program.yaml"
+)
 INTERRUPT_EXAMPLE_DEPLOYMENT_PATH = (
     Path(__file__).resolve().parents[2] / "examples" / "interrupt_pick_and_place.deployment.yaml"
 )
@@ -150,7 +156,65 @@ class TestDeploymentLoading:
         assert deploy.robot_config.group_id == "arm"
         assert deploy.robot_config.urdf_path == "package://roboplan_example_models/models/ur_robot_model/ur5_gripper.urdf"
         assert deploy.robot_config.srdf_path == "package://roboplan_example_models/models/ur_robot_model/ur5_gripper.srdf"
+        assert deploy.robot_config.package_paths == []
         assert deploy.robot_config.global_max_tcp_linear_speed_mps == 0.25
+
+    def test_robot_config_package_paths_parsed(self):
+        data = _minimal_deployment(
+            robot_config={
+                "robot_id": "ur5",
+                "group_id": "arm",
+                "urdf_path": "package://custom_pkg/models/robot.urdf",
+                "srdf_path": "package://custom_pkg/models/robot.srdf",
+                "package_paths": ["./assets", "/opt/shared_models"],
+                "global_max_tcp_linear_speed_mps": 0.5,
+            }
+        )
+        path = _write_deployment(data)
+        try:
+            deploy = Deployment(path)
+            assert deploy.robot_config.package_paths == ["./assets", "/opt/shared_models"]
+        finally:
+            os.unlink(path)
+
+    def test_grippers_parsed(self):
+        data = _minimal_deployment(
+            grippers={
+                "primary": {
+                    "command_mode": "simulated_joint",
+                    "group_id": "gripper",
+                    "joint_name": "finger_joint",
+                    "open_position": 0.0,
+                    "closed_position": 0.7,
+                    "motion_time_s": 0.8,
+                    "touch_links": ["left_inner_finger_pad", "right_inner_finger_pad"],
+                    "mount_frame": "tool0",
+                    "attach_frame": "grasp_frame",
+                    "tcp_frame": "grasp_frame",
+                    "auxiliary_frames": ["gripper_frame", "insertion_frame"],
+                }
+            }
+        )
+        path = _write_deployment(data)
+        try:
+            deploy = Deployment(path)
+            assert "primary" in deploy.grippers
+            assert deploy.grippers["primary"].group_id == "gripper"
+            assert deploy.grippers["primary"].joint_name == "finger_joint"
+            assert deploy.grippers["primary"].closed_position == pytest.approx(0.7)
+            assert deploy.grippers["primary"].touch_links == [
+                "left_inner_finger_pad",
+                "right_inner_finger_pad",
+            ]
+            assert deploy.grippers["primary"].mount_frame == "tool0"
+            assert deploy.grippers["primary"].attach_frame == "grasp_frame"
+            assert deploy.grippers["primary"].tcp_frame == "grasp_frame"
+            assert deploy.grippers["primary"].auxiliary_frames == [
+                "gripper_frame",
+                "insertion_frame",
+            ]
+        finally:
+            os.unlink(path)
 
     def test_adapters_parsed(self):
         deploy = Deployment(DEPLOYMENT_FIXTURE_PATH)
@@ -319,6 +383,14 @@ class TestDeploymentValidation:
         assert deploy.robot_config.srdf_path == ""
         os.unlink(path)
 
+    def test_invalid_robot_config_package_paths(self):
+        data = _minimal_deployment()
+        data["robot_config"]["package_paths"] = "not-a-list"
+        path = _write_deployment(data)
+        with pytest.raises(DeploymentValidationError, match="package_paths"):
+            Deployment(path)
+        os.unlink(path)
+
     def test_update_from_dict_validates_authority_matrix(self):
         deploy = Deployment.from_dict(_minimal_deployment())
         with pytest.raises(DeploymentValidationError, match="owner must be one of"):
@@ -346,6 +418,31 @@ class TestDeploymentValidation:
                             "priority": 30,
                             "maskable": True,
                         }
+                    }
+                }
+            )
+
+    def test_update_from_dict_validates_robot_config_package_paths(self):
+        deploy = Deployment.from_dict(_minimal_deployment())
+        deploy.update_from_dict(
+            {
+                "robot_config": {
+                    "srdf_path": "package://custom_pkg/models/robot.srdf",
+                    "package_paths": ["./robot_models", "../shared_models"],
+                }
+            }
+        )
+
+        assert deploy.robot_config.srdf_path == "package://custom_pkg/models/robot.srdf"
+        assert deploy.robot_config.package_paths == ["./robot_models", "../shared_models"]
+
+    def test_update_from_dict_rejects_invalid_robot_config_package_paths(self):
+        deploy = Deployment.from_dict(_minimal_deployment())
+        with pytest.raises(DeploymentValidationError, match="package_paths"):
+            deploy.update_from_dict(
+                {
+                    "robot_config": {
+                        "package_paths": ["/valid", ""],
                     }
                 }
             )
@@ -541,6 +638,19 @@ class TestCrossArtifactValidation:
         deploy.validate_against_program(prog)
         deploy.validate_capabilities()
 
+    def test_validate_against_ur10e_robotiq_preview_program_success(self, catalog):
+        """The UR10e + Robotiq preview deployment matches its paired example program."""
+        deploy = Deployment(UR10E_ROBOTIQ_EXAMPLE_DEPLOYMENT_PATH)
+        prog = Program(UR10E_ROBOTIQ_EXAMPLE_PROGRAM_PATH, catalog)
+        assert "primary" in deploy.grippers
+        assert deploy.grippers["primary"].command_mode == "simulated_joint"
+        assert deploy.grippers["primary"].mount_frame == "tool0"
+        assert deploy.grippers["primary"].attach_frame == "grasp_frame"
+        assert deploy.grippers["primary"].tcp_frame == "grasp_frame"
+        assert deploy.grippers["primary"].auxiliary_frames == ["gripper_frame"]
+        deploy.validate_against_program(prog)
+        deploy.validate_capabilities()
+
 
 class TestAdapterCapabilityKeys:
     def test_adapter_capability_keys_parsed(self):
@@ -682,3 +792,61 @@ class TestValidateCapabilities:
         with pytest.raises(DeploymentValidationError, match="Missing capability keys"):
             deploy.validate_capabilities()
         os.unlink(path)
+
+    def test_validate_capabilities_checks_program_node_requirements(self, catalog):
+        data = _minimal_deployment()
+        data["adapters"]["planning"]["capability_keys"] = [
+            "planning.motion.joint_goal",
+            "planning.motion.pose_goal",
+            "planning.trajectory.time_parameterized",
+        ]
+        data["adapters"]["context"]["capability_keys"] = [
+            "context.state.current",
+            "context.validation.trajectory",
+            "context.collision.check",
+            "context.kinematics.fk",
+            "context.limits.joint",
+            "scene.shape.box",
+            "scene.shape.sphere",
+            "scene.edit.add",
+            "scene.edit.remove",
+            "scene.edit.update_pose",
+        ]
+        data["adapters"]["execution"]["capability_keys"] = [
+            "execution.trajectory.execute",
+            "execution.feedback.phase_events",
+            "execution.stop.soft",
+            "execution.pause",
+            "execution.resume",
+            "execution.reset",
+        ]
+        deploy_path = _write_deployment(data)
+        program_path = _write_deployment(
+            _minimal_program(
+                tree={
+                    "id": "sequence",
+                    "name": "root",
+                    "children": [
+                        {
+                            "id": "command_gripper",
+                            "name": "close_gripper",
+                            "params": {
+                                "gripper_id": "primary",
+                                "command": "close",
+                            },
+                        }
+                    ],
+                }
+            )
+        )
+        try:
+            deploy = Deployment(deploy_path)
+            program = Program(program_path, catalog)
+            with pytest.raises(
+                DeploymentValidationError,
+                match="Missing capability keys for program nodes",
+            ):
+                deploy.validate_capabilities(program)
+        finally:
+            os.unlink(deploy_path)
+            os.unlink(program_path)

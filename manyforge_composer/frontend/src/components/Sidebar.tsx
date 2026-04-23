@@ -4,6 +4,7 @@ import { NodePaletteItem } from './NodePaletteItem';
 import { useComposerStore } from '../store/composerStore';
 import { DeploymentPanel } from './DeploymentPanel';
 import { ProgramPanel } from './ProgramPanel';
+import { SceneDraftMirror, ScenePanel } from './ScenePanel';
 
 function NodePaletteContent() {
   const { loading, error, fetchCatalog, getByCategory } = useCatalogStore();
@@ -64,10 +65,11 @@ function NodePaletteContent() {
 }
 
 export function Sidebar({ onCollapse }: { onCollapse: () => void }) {
-  const [tab, setTab] = useState<'nodes' | 'params' | 'deployment'>('nodes');
+  const [tab, setTab] = useState<'nodes' | 'params' | 'scene' | 'deployment'>('nodes');
 
   return (
     <div className="flex h-full w-full flex-col overflow-hidden bg-gray-800">
+      <SceneDraftMirror />
       <div className="flex items-center border-b border-gray-700">
         <button
           onClick={() => setTab('nodes')}
@@ -88,6 +90,16 @@ export function Sidebar({ onCollapse }: { onCollapse: () => void }) {
           }`}
         >
           Params
+        </button>
+        <button
+          onClick={() => setTab('scene')}
+          className={`flex-1 px-3 py-2 text-xs font-semibold uppercase tracking-wide ${
+            tab === 'scene'
+              ? 'text-white border-b-2 border-blue-500'
+              : 'text-gray-500 hover:text-gray-300'
+          }`}
+        >
+          Scene
         </button>
         <button
           onClick={() => setTab('deployment')}
@@ -113,7 +125,9 @@ export function Sidebar({ onCollapse }: { onCollapse: () => void }) {
         ? <NodePaletteContent />
         : tab === 'params'
           ? <ProgramPanel />
-          : <DeploymentPanel />}
+          : tab === 'scene'
+            ? <ScenePanel />
+            : <DeploymentPanel />}
     </div>
   );
 }

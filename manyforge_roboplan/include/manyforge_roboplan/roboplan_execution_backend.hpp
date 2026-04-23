@@ -20,6 +20,7 @@ namespace manyforge::roboplan_backend {
 class RoboPlanExecutionBackend final : public core::IExecutionBackend {
  public:
   RoboPlanExecutionBackend(std::shared_ptr<roboplan::Scene> scene,
+                           std::string group_name,
                            core::IClock& clock,
                            std::shared_ptr<std::mutex> scene_mutex = nullptr);
   ~RoboPlanExecutionBackend() override;
@@ -47,6 +48,7 @@ class RoboPlanExecutionBackend final : public core::IExecutionBackend {
   void execution_worker(std::stop_token st, core::TrajectoryDTO trajectory);
 
   std::shared_ptr<roboplan::Scene> scene_;
+  std::string group_name_;
   core::IClock& clock_;
   std::shared_ptr<std::mutex> scene_mutex_;
 

@@ -81,6 +81,7 @@ class RoboPlanPlanningContext final : public core::IPlanningContext {
     core::CollisionShapeDTO shape;
     std::string frame_id;
     bool attached = false;
+    std::vector<std::string> touch_links;
   };
 
   Eigen::Matrix4d pose_to_matrix(const core::Pose3DTO& pose);
@@ -89,6 +90,13 @@ class RoboPlanPlanningContext final : public core::IPlanningContext {
   core::Pose3DTO pose_in_base_from_tracked_locked(const TrackedObjectState& state,
                                                   const std::string& base_frame);
   bool infer_attached_from_frame(const std::string& frame_id) const;
+  tl::expected<void, std::string> set_touch_links_locked(
+      const std::string& object_id,
+      const std::vector<std::string>& touch_links,
+      bool enable);
+  tl::expected<void, std::string> clear_touch_links_locked(
+      const std::string& object_id,
+      TrackedObjectState& tracked);
   core::SceneEditResultDTO reparent_object_locked(const std::string& object_id,
                                                   const std::string& target_frame_id,
                                                   bool emit_event = true);

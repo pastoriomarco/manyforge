@@ -244,6 +244,7 @@ _INTERRUPT_NODE_RESOURCE_CLAIMS: dict[str, tuple[str, ...]] = {
     "add_collision_object": ("scene",),
     "attach_object_to_link": ("scene", "gripper"),
     "build_scene_selection_context": ("scene",),
+    "command_gripper": ("gripper",),
     "check_gripper_state": ("gripper",),
     "check_key_bool_value": ("blackboard",),
     "check_pose_distance": ("scene",),
@@ -471,6 +472,66 @@ def _validate_pose_value(value: Any) -> str | None:
         return "orientation_xyzw must be a list of 4 numeric values"
     if "orientation_rpy_deg" in value and not _is_numeric_list(value["orientation_rpy_deg"], 3):
         return "orientation_rpy_deg must be a list of 3 numeric values"
+    return None
+
+
+def _validate_scene_shape_value(value: Any) -> str | None:
+    if not isinstance(value, Mapping):
+        return "shape must be a mapping"
+
+    shape_type = value.get("type")
+    if shape_type not in {"box", "sphere"}:
+        return "shape.type must be one of: box, sphere"
+
+    if shape_type == "box":
+        dimensions = value.get("box_dimensions_m")
+        if not _is_numeric_list(dimensions, 3):
+            return "shape.box_dimensions_m must be a list of 3 numeric values"
+        if any(float(component) <= 0.0 for component in dimensions):
+            return "shape.box_dimensions_m values must be > 0"
+
+    if shape_type == "sphere":
+        radius = value.get("sphere_radius_m")
+        if not _is_numeric(radius) or float(radius) <= 0.0:
+            return "shape.sphere_radius_m must be > 0"
+
+    return None
+
+
+def _validate_scene_resource_value(value: Any) -> str | None:
+    if not isinstance(value, Mapping):
+        return "must be a mapping"
+
+    object_id = value.get("object_id")
+    if not isinstance(object_id, str) or not object_id.strip():
+        return "object_id is required"
+
+    shape_error = _validate_scene_shape_value(value.get("shape"))
+    if shape_error is not None:
+        return shape_error
+
+    pose = value.get("pose")
+    if not isinstance(pose, Mapping):
+        return "pose must be a mapping"
+
+    frame_id = pose.get("frame_id")
+    if not isinstance(frame_id, str) or not frame_id.strip():
+        return "pose.frame_id is required"
+
+    position = pose.get("position_m")
+    if not _is_numeric_list(position, 3):
+        return "pose.position_m must be a list of 3 numeric values"
+
+    has_xyzw = "orientation_xyzw" in pose
+    has_rpy = "orientation_rpy_deg" in pose
+    if has_xyzw == has_rpy:
+        return "pose must define exactly one of orientation_xyzw or orientation_rpy_deg"
+
+    if has_xyzw and not _is_numeric_list(pose["orientation_xyzw"], 4):
+        return "pose.orientation_xyzw must be a list of 4 numeric values"
+    if has_rpy and not _is_numeric_list(pose["orientation_rpy_deg"], 3):
+        return "pose.orientation_rpy_deg must be a list of 3 numeric values"
+
     return None
 
 
@@ -952,6 +1013,23 @@ def collect_tree_validation_issues(
             )
             return
 
+        if deployment_capability_keys is not None:
+            missing_capabilities = sorted(
+                capability
+                for capability in entry.required_capabilities
+                if capability not in deployment_capability_keys
+            )
+            if missing_capabilities:
+                errors.append(
+                    TreeValidationIssue(
+                        path=path,
+                        message=(
+                            f"Node '{current.name}' ({current.id}) requires capabilities "
+                            f"{missing_capabilities}"
+                        ),
+                    )
+                )
+
         if current.modification_policy.get("intervention_delegate") == "program_only":
             # program_only is valid with recovery decorators; validate constraints
             rp = current.recovery_policy
@@ -1079,6 +1157,46 @@ def collect_tree_validation_issues(
                     skip_type_validation = True
                 else:
                     value, binding_error = None, f"{param.name} must be a key_ref binding"
+                if binding_error is not None:
+                    errors.append(
+                        TreeValidationIssue(
+                            path=f"{path}.params.{param.name}",
+                            message=binding_error,
+                        )
+                    )
+                    continue
+                resolved_params[param.name] = value
+
+            if param.blackboard_role == "literal_or_key_reader":
+                if _is_blackboard_reference_string(raw_value):
+                    errors.append(
+                        TreeValidationIssue(
+                            path=f"{path}.params.{param.name}",
+                            message=(
+                                f"{param.name} must use a key_ref or field_ref binding instead of a raw "
+                                "blackboard reference string"
+                            ),
+                        )
+                    )
+                    continue
+                binding_error = None
+                if _key_ref_id(value) is not None:
+                    value, binding_error = _resolve_key_binding(
+                        param_name=param.name,
+                        value=value,
+                        key_by_id=key_by_id,
+                        expected_type=param.blackboard_value_type,
+                    )
+                elif _field_ref_target(value) is not None:
+                    value, binding_error = _resolve_field_binding(
+                        param_name=param.name,
+                        value=value,
+                        namespace_by_id=namespace_by_id,
+                        namespace_fields_by_id=namespace_fields_by_id,
+                        expected_type=param.blackboard_value_type,
+                        expected_contract=param.blackboard_contract,
+                    )
+                    skip_type_validation = True
                 if binding_error is not None:
                     errors.append(
                         TreeValidationIssue(
@@ -1389,6 +1507,48 @@ class Program:
         self._load_from_data_and_validate(data)
         return self
 
+    def required_capabilities(self) -> set[str]:
+        """Return the union of capability keys required by the current tree."""
+        if self.tree is None:
+            return set()
+
+        resolver = (
+            ParameterResolver(self.get_parameter_defaults())
+            if self.parameters
+            else None
+        )
+        required: set[str] = set()
+
+        def visit(current: TreeNode) -> None:
+            if self._skill_catalog is not None and self._skill_catalog.contains(current.id):
+                skill = self._skill_catalog.get(current.id)
+                assert skill is not None
+                required.update(skill.requires_capabilities)
+                resolved_params = dict(current.params)
+                if resolver is not None:
+                    resolved_params = resolver.resolve(current.params)
+                expanded_tree = tree_node_from_dict(
+                    self._skill_catalog.expand_node_dict(
+                        {
+                            "id": current.id,
+                            "name": current.name,
+                            "params": resolved_params,
+                            "children": [],
+                        }
+                    ),
+                    path="tree",
+                )
+                visit(expanded_tree)
+                return
+
+            entry = self._catalog.get(current.id)
+            required.update(entry.required_capabilities)
+            for child in current.children:
+                visit(child)
+
+        visit(self.tree)
+        return required
+
     def _load_and_validate(self) -> None:
         with open(self._path) as f:
             data = yaml.safe_load(f)
@@ -1439,8 +1599,14 @@ class Program:
         )
 
         # Scene resources
+        scene_data = data.get("scene", [])
+        if not isinstance(scene_data, list):
+            raise ProgramValidationError("scene must be a list")
         scene_ids: set[str] = set()
-        for s in data.get("scene", []):
+        for index, s in enumerate(scene_data):
+            scene_error = _validate_scene_resource_value(s)
+            if scene_error is not None:
+                raise ProgramValidationError(f"scene[{index}] {scene_error}")
             oid = s.get("object_id", "")
             if oid in scene_ids:
                 raise ProgramValidationError(

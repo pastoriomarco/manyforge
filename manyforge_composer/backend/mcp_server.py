@@ -264,7 +264,7 @@ def create_mcp_server(state: ComposerState):
                 deployment = state.deployment
                 if deployment is not None:
                     deployment.validate_against_program(updated_program)
-                    deployment.validate_capabilities()
+                    deployment.validate_capabilities(updated_program)
                 state.apply_models(
                     updated_program,
                     deployment,
@@ -1170,6 +1170,7 @@ def _catalog_entry_dict(entry) -> dict[str, Any]:
         "name": entry.name,
         "category": entry.category,
         "description": entry.description,
+        "stability": entry.stability,
         "kind": entry.kind,
         "children_min": entry.children_min,
         "children_max": entry.children_max,

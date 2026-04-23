@@ -2,457 +2,276 @@
 
 # ManyForge Product Direction Plan
 
-This plan records the product and engineering direction that ManyForge should
-follow over the next few months. It is intentionally broader than the
-LLM-specific and OpenClaw-specific plans.
+This is the top-level roadmap for ManyForge.
 
-This document exists to answer a practical question:
+Use this file to answer the practical product question:
 
-- what should ManyForge become to be credible in industrial robotics,
-  compelling at ROSCon 2026, and strong enough to serve as the flagship of the
-  next phase of work
+- what ManyForge should become over the next phase of work
+- what is core, what is next, and what is optional
+- what the first public version should prioritize
 
-This plan does not replace:
+This document is intentionally broader than the subsystem plans.
 
-- [`../../README.md`](../../README.md) for user-facing project entry
-- [`LLM_OPERABILITY_PLAN.md`](LLM_OPERABILITY_PLAN.md) for ManyForge-internal
-  LLM/runtime behavior
-- [`OPENCLAW_INTEGRATION_PLAN.md`](OPENCLAW_INTEGRATION_PLAN.md) for
-  NemoClaw/OpenClaw integration
-- [`INTERRUPT_MODEL_PLAN.md`](INTERRUPT_MODEL_PLAN.md) for detailed interrupt
-  execution-model work
-- [`INDUSTRIAL_READINESS_GAP.md`](INDUSTRIAL_READINESS_GAP.md) for the current
-  gap register between the present baseline and industrial readiness
-- [`../operations/STACK_SETUP.md`](../operations/STACK_SETUP.md) for local
-  bring-up and operations
+Use these companion plans for the detailed execution layers:
 
-## Readiness Baseline
-
-This document is the roadmap and positioning layer.
-
-For the current industrial-readiness gap register, use:
-
-- [`INDUSTRIAL_READINESS_GAP.md`](INDUSTRIAL_READINESS_GAP.md)
-
-That document is the canonical source for what is still missing right now in:
-
-- external integration
-- qualification maturity
-- GUI qualification
-- compliance and governance hardening
-
-## Scope
-
-This plan covers:
-
-- product positioning for ManyForge
-- the engineering order of operations for the next 5 months
-- the work needed to make ManyForge suitable for real industrial manipulation
-  applications
-- the role of ROS, PLC integration, perception, and physical AI in that story
-
-This plan does not cover:
-
-- detailed schema-level design for every subsystem
-- historical sprint notes
-- sandbox transport details
+- [`INDUSTRIAL_EXECUTION_READINESS_PLAN.md`](INDUSTRIAL_EXECUTION_READINESS_PLAN.md)
+- [`PREVIEW_AND_ADOPTION_PLAN.md`](PREVIEW_AND_ADOPTION_PLAN.md)
+- [`AI_ASSISTANT_INTEGRATION_PLAN.md`](AI_ASSISTANT_INTEGRATION_PLAN.md)
+- [`INTERRUPT_MODEL_PLAN.md`](INTERRUPT_MODEL_PLAN.md)
+- [`../operations/STACK_SETUP.md`](../operations/STACK_SETUP.md)
 
 ## Product Thesis
 
 ManyForge should become a deterministic industrial application runtime for
-manipulation, with bounded physical-AI extensions.
+manipulation, with bounded AI and perception extensions layered on top.
 
 It should sit between:
 
-- low-level robot execution and planning
+- robot execution and planning
 - ROS2 ecosystems
 - PLC / signal / cell-level automation
-- perception and scene understanding
-- bounded AI assistance
+- perception and scene understanding services
+- bounded assistant and supervisory workflows
 
 It should not become:
 
 - a generic robotics playground
-- a simulator-first framework
+- a simulator-only framework
 - an agent shell that bypasses execution authority
 - a loose collection of demos without a strong runtime model
 
 ## Strategic Positioning
 
-### 1. Industrial runtime authority comes first
+### 1. Runtime authority comes first
 
 ManyForge should own:
 
 - application execution semantics
-- behavior orchestration
-- scene and task-level manipulation flows
+- scene and task-level orchestration
 - bounded runtime state and auditability
-- explicit authority boundaries for intervention, recovery, and AI usage
+- explicit intervention and recovery boundaries
 
-This is the foundation. Physical AI is an extension on top of this runtime, not
-its replacement.
+AI, perception, and supervisory layers should extend this runtime, not replace
+it.
 
-### 2. ROS and PLC interoperability are core, not peripheral
+### 2. ROS and PLC interoperability are core
 
-The near-term public story is not just “ManyForge plus AI.”
+The serious public story is not “ManyForge plus AI.”
 
 It is:
 
-- ManyForge as the application layer for industrial manipulation
+- ManyForge as the industrial manipulation application layer
 - interoperable with ROS2
 - interoperable with PLC-oriented factory control paths
 - able to fit into Siemens / ROXSIE-style deployments without giving up runtime
   clarity
 
+Important constraint:
+
+- ROS integration is not a narrow signal-adapter task
+- per the specs, it is a repo-wide adapter story spanning execution,
+  controller management, robot-state/recovery, gripper/tooling, observability,
+  and later IO/perception integration
+- PLC and ROXSIE work comes after the real robot control and observability
+  substrate exists
+
 ### 3. Perception must become a real subsystem boundary
 
-Browser-backed HMI snapshots are not a production perception path. The long-term
-shape should be:
+Browser-backed HMI capture is useful for demos and debugging. It is not the
+production perception path.
+
+The long-term shape should be:
 
 - a dedicated perception/service boundary
 - ROS2-compatible when ROS is the right integration path
 - usable without ROS when a simpler deployment is justified
-- capable of consuming modern vision pipelines without destabilizing the
-  deterministic execution layer
+- cleanly separated from deterministic execution authority
 
-### 4. Physical AI should be bounded and auditable
+### 4. Simulation is a first-class deployment mode
 
-ManyForge should support physical-AI-assisted application building and runtime
-reasoning only where:
+Simulation is not just a temporary demo target.
 
-- the contract is explicit
-- side effects are reviewable or bounded
+ManyForge can become genuinely useful for:
+
+- simulator scene operation
+- scenario automation
+- assistant-backed program authoring
+- regression and qualification workflows
+- sim-first application development before hardware availability
+
+The constraint is:
+
+- simulation work must preserve cross-compatibility with real deployments as
+  much as possible
+- simulator-specific paths must not introduce throwaway artifacts or bypass the
+  normal runtime authority model
+
+### 5. AI must stay bounded and auditable
+
+ManyForge should support assistant and physical-AI workflows only where:
+
+- contracts are explicit
+- side effects are bounded or reviewable
 - deterministic fallbacks remain possible
 - auditability is preserved
 
-### 5. External architecture references support layering, not redirection
+## Near-Term Objective
 
-Recent embodied-agent work around OpenClaw, including *ABot-Claw: A Foundation
-for Persistent, Cooperative, and Self-Evolving Robotic Agents*, is useful as an
-external signal that the right long-term structure is layered:
+The next presentable ManyForge version should show:
 
-- execution/application authority
-- shared services such as perception, memory, and evaluation
-- supervisory/agentic orchestration
+- a credible manipulation application runtime
+- a useful simulation-operator story
+- a real gripper-aware embodiment in simulation
+- clear state, errors, and traceability
+- a useful but bounded assistant workflow
 
-For ManyForge, that reinforces the current direction:
+The first public version does not need full industrial proof. It does need a
+credible product shape.
 
-- ManyForge should stay the industrial execution and application layer
-- shared services should become explicit subsystem boundaries
-- OpenClaw-style orchestration should remain above that layer, not replace it
+## Priority Bands
 
-Reference:
+### Core now
 
-- https://arxiv.org/abs/2604.10096
+These themes are on the critical path:
 
-## 5-Month Objective
+1. industrial execution substrate
+2. real robot adapter substrate
+3. one polished preview and adoption path
+4. qualification and readiness proof
 
-By ROSCon 2026, ManyForge should be able to support and demonstrate:
+### Next
 
-- real manipulation applications built on a strong behavior/runtime substrate
-- ROS2 integration that looks native rather than bolted on
-- PLC/signal-aware orchestration that aligns with Siemens and ROXSIE narratives
-- credible observability and traceability
-- at least one perception-guided application path
+These matter, but should not destabilize the core path:
 
-The story should be:
+1. repo-wide ROS integration on top of the real robot substrate
+2. assistant integration
+3. delegated recovery
+4. production perception boundary definition
 
-- ManyForge is the industrial manipulation application layer
-- ROS2 and PLC systems plug into it cleanly
-- perception and bounded AI augment it without eroding determinism
+### Optional or deferred
 
-## Priority Order
+These are useful, but not on the immediate critical path:
 
-1. Industrial execution core
-2. ROS2 and PLC interoperability
-3. Real application building blocks and examples
-4. Perception / vision pipeline boundary
-5. Physical AI and assistant workflows
+1. browser-backed runtime image features
+2. broad simulator-first expansion
+3. forcing all model traffic through an agent layer
+4. general “physical AI” breadth before the runtime and adapter story is solid
+5. PLC/ROXSIE-specific wiring before the robot-control substrate is complete
 
-This order is intentional. The system should first be good at building and
-running real applications before it tries to become broader or more agentic.
+## Main Workstreams
 
-## Workstreams
+### Workstream A: Industrial execution and readiness
 
-### Workstream A: Industrial execution core
+This is the main delivery track.
 
-This is the highest-priority work.
+Priority content:
 
-Required capabilities:
+- execution semantics and runtime authority
+- real robot adapter contracts
+- observability and traceability at the adapter boundary
+- interrupt proof at the real integration boundary
+- verification and qualification expansion
+- GUI/browser qualification
+- auditability and compliance posture
 
-- signal handling
-- interrupts
-- gripper abstraction
-- explicit IO/event semantics
-- reusable behavior patterns for real applications
+Detailed execution plan:
 
-#### A1. Signals and IO model
-
-Still needed:
-
-- typed signal model for inputs, outputs, and events
-- level-triggered and edge-triggered semantics
-- wait/guard/trigger nodes
-- mapping between ManyForge signals and ROS / PLC / operator-originated events
-- traceable signal transitions
-
-Why this is critical:
-
-- industrial cells are not driven by motion requests alone
-- PLC coordination and operator-facing automation require explicit signal logic
-- real applications need waits, guards, interlocks, acknowledgements, and
-  handshakes
-
-Current execution-pass decision:
-
-- v1 signal handling will build on declared typed blackboard keys plus
-  signal-specific nodes, rather than introducing a separate top-level `signals`
-  artifact immediately
-- this keeps authored/runtime semantics consistent with the typed binding model
-  already in place while still giving applications an explicit signal-oriented
-  surface
-- a runtime signal registry/provider substrate now exists for external adapter
-  integration, including:
-  - adapter-scoped signal publication
-  - provider health tracking
-  - freshness/staleness handling
-  - fail-closed blackboard mirroring for stale/disconnected signals
-- the remaining review item is not the registry itself, but the deployment/authored
-  contract that future ROS/PLC/ROXSIE adapters will target
-
-#### A2. Interrupts
-
-Still needed:
-
-- deterministic interrupt sources
-- interrupt policies at program level
-- abort/hold/resume semantics
-- handler trees with explicit authority boundaries
-- runtime and audit visibility for interrupt cause and resolution
-
-This work is tracked in detail in [`INTERRUPT_MODEL_PLAN.md`](INTERRUPT_MODEL_PLAN.md),
-but it is a product-level priority, not a side project.
-
-Current execution-pass decision:
-
-- v1 interrupt work now includes explicit deployment/program schema, trace
-  surfaces, conservative `CycleManager` arbitration, and named handler-tree
-  execution for safe resource claims
-- deployment owns `interrupt_sources`
-- program owns `interrupt_policies` and `interrupt_handlers`
-- catalog entries should expose interruptibility metadata so policy authoring
-  does not rely on implicit node-type assumptions
-- execution history should expose a stable trace envelope rich enough to align
-  with `ros2_medkit`-style observability and later interrupt causality
-- handlers that claim unsupported domains such as `motion`, `scene`, or
-  `model` remain blocked and latched until stronger preemption/resource
-  contracts are implemented
-
-#### A3. Gripper and end-effector abstraction
-
-Still needed:
-
-- pluggable gripper representation
-- end-effector-specific URDF/config packaging instead of hardwiring it into each
-  robot description
-- scene-visible gripper state and graspable-object interactions
-- clean attach/detach/contact semantics
-- support for swapping end-effectors without rewriting application logic
-
-Why this matters:
-
-- ManyForge should be able to build real manipulation applications, not just arm
-  trajectory demos
-- end-effector behavior is a first-class part of the application layer
-
-Current execution-pass decision:
-
-- v1 gripper abstraction is a logical-state layer with explicit gripper-state
-  nodes and declared state keys
-- attachment/detachment remains explicit scene authority through
-  `attach_object_to_link` / `detach_object_from_link`
-- pluggable URDF packaging and true hardware-driver abstraction remain later
-  review items, not solved by this pass
-
-#### A4. Reusable behavior base
-
-Still needed:
-
-- stronger library of industrial manipulation patterns
-- reusable pick/place, machine-tending, inspection, and recovery structures
-- clearer separation between low-level motion nodes and application-level skills
-- examples that demonstrate the intended engineering style, not just isolated
-  node usage
+- [`INDUSTRIAL_EXECUTION_READINESS_PLAN.md`](INDUSTRIAL_EXECUTION_READINESS_PLAN.md)
 
 ### Workstream B: ROS2 and PLC interoperability
 
-This is the second priority because it is central to both adoption and the
-ROSCon 2026 story.
+This is part of the core path, not an optional add-on.
 
-#### B1. ROS2 wrappers and integration surface
+But the dependency order matters.
 
-Still needed:
+Priority content, in order:
 
-- ManyForge-facing ROS2 wrappers for topics, services, actions, and structured
-  state exchange
-- examples that look like real ROS2 applications rather than ad hoc bridges
-- a clear decision on what belongs in ManyForge vs what remains in ROS-only
-  infrastructure
+1. repo-wide ROS integration for the real robot control surface:
+   - execution backend / controller interface
+   - robot state / recovery
+   - controller management
+   - gripper / tooling
+   - observability and trace export
+2. only after that:
+   - IO / GPIO signal adapters
+   - PLC-facing permit/fault/ack flows
+   - ROXSIE-specific mapping
+3. later:
+   - perception / pose-source adapters where they support real applications
 
-The target is not “wrap everything in ROS2.” The target is a clean contract
-between ManyForge application semantics and ROS2 communication/runtime surfaces.
+This should be delivered as part of industrial readiness, not as a separate
+demo branch.
 
-#### B2. PLC-oriented interoperability
+### Workstream C: First public preview
 
-Still needed:
+The preview track should now be treated as a product milestone with its own
+execution detail, not as a peer architecture plan and not as a loose demo
+branch.
 
-- signal and event mapping that can align with PLC-driven automation
-- examples shaped around coordination with external control authority
-- ROXSIE-relevant application flows where PLC/state changes drive ManyForge
-  behaviors or interrupts
+Target shape:
 
-This should be designed so the Siemens / ROXSIE story is credible without
-turning ManyForge into a PLC runtime.
+- one useful simulation-operator workflow
+- one real robot embodiment in simulation
+- gripper-aware manipulation
+- useful Composer/HMI and assistant workflow
+- repeatable demo and qualification evidence
 
-#### B3. `ros2_medkit` compatibility
+High-level steps:
 
-This is now an explicit direction, not an optional nice-to-have.
+1. define the preview/adoption milestone and success criteria
+2. confirm the simulation embodiment/integration path from local evidence
+3. keep the gripper-aware manipulation baseline
+4. implement a narrow scene-bootstrap / authoring-assistant workflow
+5. polish one repeatable, presentable scenario
 
-ManyForge has already leaned on `ros2_medkit` for observability and
-traceability. Over the next few months, ManyForge should stay closely
-compatible with it and cooperate cleanly with its model.
+This work should support the broader product direction, not fork it.
 
-Required outcomes:
+Detailed execution plans:
 
-- keep observability and traceability concepts aligned with `ros2_medkit`
-- avoid inventing a competing tracing story where `ros2_medkit` already offers
-  a good substrate
-- make ManyForge events, execution traces, and runtime diagnostics easy to
-  relate to `ros2_medkit` timelines and tooling
-- prefer integration points that help joint ROSCon 2026 presentation work with
-  Siemens and future collaboration
+- [`PREVIEW_AND_ADOPTION_PLAN.md`](PREVIEW_AND_ADOPTION_PLAN.md)
+- [`ISAAC_SIM_PREVIEW_PLAN.md`](ISAAC_SIM_PREVIEW_PLAN.md)
 
-Practical implication:
+### Workstream D: AI and assistant integration
 
-- when designing ManyForge event schemas, runtime traces, ROS wrappers, and
-  execution diagnostics, treat `ros2_medkit` compatibility as a first-class
-  design constraint
+This remains important, but it is not allowed to outrun the runtime and
+adapter substrate.
 
-### Workstream C: Perception and vision pipeline
+Priority content:
 
-This is important, but should follow the execution and integration substrate.
+- model capability contracts
+- Composer assistant with proposal/apply
+- delegated recovery with explicit authority
+- runtime hardening for model/perception-adjacent work
+- perception/service boundary definition
 
-#### C1. Perception boundary
+Detailed execution plan:
 
-Still needed:
-
-- a dedicated perception/service boundary
-- deterministic ingestion of perception outputs into ManyForge scene/task state
-- typed outputs for selection, localization, or pose-estimation style results
-- clear authority boundaries between perception output and execution decisions
-
-#### C2. ROS and non-ROS paths
-
-ManyForge should support:
-
-- a ROS2-native perception integration path for industrial robotics stacks
-- a non-ROS path when a simpler deployment is justified
-
-This should be one conceptual subsystem with two integration modes, not two
-unrelated perception strategies.
-
-#### C3. NVIDIA and simulation-adjacent options
-
-Given the broader stack context, future evaluation targets may include:
-
-- Isaac ROS-backed perception pipelines
-- Isaac Sim / Isaac Lab for development and validation workflows
-- high-fidelity sidecar rendering or digital-twin options such as NVIDIA
-  Omniverse modular libraries
-
-These are candidates for future development, not replacements for ManyForge
-runtime authority.
-
-### Workstream D: Physical AI and assistant workflows
-
-This work is valuable, but it should sit on top of a strong runtime substrate.
-
-Still needed:
-
-- application-building assistance that proposes edits rather than mutating trees
-  silently
-- bounded runtime model usage for well-scoped tasks
-- delegated diagnosis and recovery where authority remains explicit
-- AI-assisted application authoring that helps integrators build cells faster
-  without weakening the deterministic base
-
-The product message should be:
-
-- ManyForge makes industrial manipulation application building easier
-- AI helps where it is bounded and auditable
-- AI does not replace runtime discipline
-
-## What Not To Prioritize On The Critical Path
-
-These areas may still matter, but they should not displace the core product
-trajectory over the next few months:
-
-- broad generic assistant UX before the industrial runtime gaps are closed
-- replacing lightweight HMI/debug tooling with a heavy visualization stack
-- making simulation the center of the product story
-- adding more demos before the underlying runtime semantics are strong enough
-
-The next milestone should be a smaller number of stronger applications, not a
-larger number of weaker ones.
+- [`AI_ASSISTANT_INTEGRATION_PLAN.md`](AI_ASSISTANT_INTEGRATION_PLAN.md)
 
 ## Recommended Execution Order
 
-1. Finish the industrial execution substrate:
-   - signals / IO
-   - interrupts v1
-   - gripper abstraction
-   - reusable behavior patterns
-2. Build ROS2 and PLC-facing wrappers and examples.
-3. Keep observability and traceability aligned with `ros2_medkit`.
-4. Build the real perception boundary and one strong vision pipeline.
-5. Layer assistant and physical-AI workflows on top.
-6. Use ROSCon 2026 demos as validation targets, not as substitutes for product
-   architecture.
+1. keep finishing the industrial execution and readiness substrate
+2. build the real robot adapter substrate:
+   - execution
+   - robot-state/recovery
+   - controller management
+   - gripper/tooling
+   - observability
+3. deliver the preview/adoption milestone without violating the same runtime
+   and artifact boundaries
+4. build repo-wide ROS integration on top of the substrate where required
+5. only then add PLC/ROXSIE and richer signal-facing industrial control work
+6. prove the stack through qualification and one polished public preview
+7. add broader assistant integration without weakening runtime authority
+8. move perception toward an explicit sidecar/service boundary
+9. expand broader AI and supervisory workflows only after the above is stable
 
-## Flagship Demo Targets
+## Exit Criteria For This Plan
 
-The near-term demo portfolio should stay focused.
+This roadmap is in a good state when:
 
-Recommended targets:
-
-- machine tending or pick-place with signals and interrupts
-- perception-guided pick with a real perception handoff
-- ROS2 plus PLC-coordinated cell example aligned with Siemens / ROXSIE
-
-These demos should be built to showcase the intended product shape:
-
-- industrial orchestration
-- application reuse
-- observability and traceability
-- bounded AI/perception augmentation
-
-## Exit Criteria For This Direction
-
-This plan is substantially satisfied when:
-
-- ManyForge can support real manipulation applications with signals,
-  interrupts, and pluggable end-effectors
-- ROS2 and PLC-facing integration flows look productized rather than ad hoc
-- observability and traceability stay meaningfully compatible with
-  `ros2_medkit`
-- at least one perception-guided application path is credible for industrial
-  use
-- the public story is clearly about industrial application building, not just a
-  pile of demos or isolated AI features
-
-## Related Documents
-
-- [`LLM_OPERABILITY_PLAN.md`](LLM_OPERABILITY_PLAN.md)
-- [`OPENCLAW_INTEGRATION_PLAN.md`](OPENCLAW_INTEGRATION_PLAN.md)
-- [`INTERRUPT_MODEL_PLAN.md`](INTERRUPT_MODEL_PLAN.md)
-- [`../operations/STACK_SETUP.md`](../operations/STACK_SETUP.md)
+- the active plan set is small and non-overlapping
+- ManyForge has one clear industrial story
+- the public-preview target supports that story instead of distracting from it
+- AI and perception work are framed as bounded extensions, not as the product
+  center of gravity

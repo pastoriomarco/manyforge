@@ -18,7 +18,24 @@ class RobotConfig:
     group_id: str
     urdf_path: str
     srdf_path: str = ""
+    package_paths: list[str] = field(default_factory=list)
     global_max_tcp_linear_speed_mps: float = 0.0
+
+
+@dataclass
+class GripperConfig:
+    command_mode: str
+    group_id: str
+    joint_name: str
+    open_position: float
+    closed_position: float
+    motion_time_s: float
+    description: str = ""
+    touch_links: list[str] = field(default_factory=list)
+    mount_frame: str = ""
+    attach_frame: str = ""
+    tcp_frame: str = ""
+    auxiliary_frames: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -79,6 +96,12 @@ class DeploymentValidationError(Exception):
 
 _ALLOWED_HASH_ALGORITHMS = {"sha256", "sha384", "sha512"}
 _ALLOWED_INTERRUPT_KINDS = {"edge", "level"}
+_ALLOWED_GRIPPER_COMMAND_MODES = {
+    "simulated_joint",
+    "ros_gripper_command",
+    "ros_follow_joint_trajectory",
+    "ros_joint_state_publish",
+}
 _ALLOWED_AUTHORITY_DOMAINS = {
     "motion",
     "scene",
@@ -150,6 +173,7 @@ class Deployment:
         self.schema_version: str = ""
         self.program_profile: str = ""
         self.robot_config: Optional[RobotConfig] = None
+        self.grippers: dict[str, GripperConfig] = {}
         self.adapters: dict[str, AdapterConfig] = {}
         self.orchestrator: Optional[OrchestratorConfig] = None
         self.launch: Optional[LaunchConfig] = None
@@ -159,6 +183,10 @@ class Deployment:
         self.model_endpoints: dict[str, ModelEndpoint] = {}
         self.prompt_templates: dict[str, PromptTemplate] = {}
         self._load_and_validate()
+
+    @property
+    def source_path(self) -> Path:
+        return self._path
 
     @classmethod
     def from_dict(
@@ -175,6 +203,7 @@ class Deployment:
         self.schema_version = ""
         self.program_profile = ""
         self.robot_config = None
+        self.grippers = {}
         self.adapters = {}
         self.orchestrator = None
         self.launch = None
@@ -240,6 +269,64 @@ class Deployment:
             )
         return parsed
 
+    def _parse_robot_config(
+        self,
+        robot_data: dict[str, Any] | None,
+        *,
+        current: RobotConfig | None = None,
+    ) -> RobotConfig:
+        if not isinstance(robot_data, dict):
+            raise DeploymentValidationError("robot_config must be a mapping")
+
+        merged = {
+            "robot_id": current.robot_id if current is not None else "",
+            "group_id": current.group_id if current is not None else "",
+            "urdf_path": current.urdf_path if current is not None else "",
+            "srdf_path": current.srdf_path if current is not None else "",
+            "package_paths": list(current.package_paths) if current is not None else [],
+            "global_max_tcp_linear_speed_mps": (
+                current.global_max_tcp_linear_speed_mps if current is not None else 0.0
+            ),
+        }
+        merged.update(robot_data)
+
+        for field_name in ("robot_id", "group_id", "urdf_path"):
+            if not str(merged.get(field_name, "")).strip():
+                raise DeploymentValidationError(
+                    f"robot_config.{field_name} is required"
+                )
+
+        tcp_speed = merged.get("global_max_tcp_linear_speed_mps", 0.0)
+        try:
+            tcp_speed = float(tcp_speed)
+        except (TypeError, ValueError) as exc:
+            raise DeploymentValidationError(
+                "robot_config.global_max_tcp_linear_speed_mps must be a number"
+            ) from exc
+        if tcp_speed <= 0:
+            raise DeploymentValidationError(
+                "robot_config.global_max_tcp_linear_speed_mps must be > 0"
+            )
+
+        package_paths = merged.get("package_paths", [])
+        if package_paths is None:
+            package_paths = []
+        if not isinstance(package_paths, list) or any(
+            not isinstance(value, str) or not value.strip() for value in package_paths
+        ):
+            raise DeploymentValidationError(
+                "robot_config.package_paths must be a list of non-empty strings"
+            )
+
+        return RobotConfig(
+            robot_id=str(merged["robot_id"]),
+            group_id=str(merged["group_id"]),
+            urdf_path=str(merged["urdf_path"]),
+            srdf_path=str(merged.get("srdf_path", "")),
+            package_paths=[value.strip() for value in package_paths],
+            global_max_tcp_linear_speed_mps=tcp_speed,
+        )
+
     def _parse_authority_matrix(
         self,
         authority_matrix_data: dict[str, Any] | None,
@@ -277,9 +364,137 @@ class Deployment:
             )
         return parsed
 
+    def _parse_grippers(
+        self,
+        grippers_data: dict[str, Any] | None,
+    ) -> dict[str, GripperConfig]:
+        if grippers_data and not isinstance(grippers_data, dict):
+            raise DeploymentValidationError("grippers must be a mapping")
+        parsed: dict[str, GripperConfig] = {}
+        for gripper_id, gripper_data in (grippers_data or {}).items():
+            if not isinstance(gripper_data, dict):
+                raise DeploymentValidationError(f"grippers.{gripper_id} must be a mapping")
+
+            command_mode = str(gripper_data.get("command_mode", "")).strip()
+            group_id = str(gripper_data.get("group_id", "")).strip()
+            joint_name = str(gripper_data.get("joint_name", "")).strip()
+
+            if command_mode not in _ALLOWED_GRIPPER_COMMAND_MODES:
+                allowed = ", ".join(sorted(_ALLOWED_GRIPPER_COMMAND_MODES))
+                raise DeploymentValidationError(
+                    f"grippers.{gripper_id}.command_mode must be one of: {allowed}"
+                )
+            if not group_id:
+                raise DeploymentValidationError(f"grippers.{gripper_id}.group_id is required")
+            if not joint_name:
+                raise DeploymentValidationError(f"grippers.{gripper_id}.joint_name is required")
+
+            try:
+                open_position = float(gripper_data.get("open_position"))
+            except (TypeError, ValueError) as exc:
+                raise DeploymentValidationError(
+                    f"grippers.{gripper_id}.open_position must be a number"
+                ) from exc
+            try:
+                closed_position = float(gripper_data.get("closed_position"))
+            except (TypeError, ValueError) as exc:
+                raise DeploymentValidationError(
+                    f"grippers.{gripper_id}.closed_position must be a number"
+                ) from exc
+            try:
+                motion_time_s = float(gripper_data.get("motion_time_s", 0.0))
+            except (TypeError, ValueError) as exc:
+                raise DeploymentValidationError(
+                    f"grippers.{gripper_id}.motion_time_s must be a number"
+                ) from exc
+            if motion_time_s <= 0.0:
+                raise DeploymentValidationError(
+                    f"grippers.{gripper_id}.motion_time_s must be > 0"
+                )
+            touch_links_data = gripper_data.get("touch_links", [])
+            if not isinstance(touch_links_data, list):
+                raise DeploymentValidationError(
+                    f"grippers.{gripper_id}.touch_links must be a list of strings"
+                )
+            touch_links: list[str] = []
+            for index, link_name in enumerate(touch_links_data):
+                link_name_str = str(link_name).strip()
+                if not link_name_str:
+                    raise DeploymentValidationError(
+                        f"grippers.{gripper_id}.touch_links[{index}] must be a non-empty string"
+                    )
+                touch_links.append(link_name_str)
+
+            mount_frame = self._parse_optional_frame_name(
+                gripper_data.get("mount_frame"),
+                f"grippers.{gripper_id}.mount_frame",
+            )
+            attach_frame = self._parse_optional_frame_name(
+                gripper_data.get("attach_frame"),
+                f"grippers.{gripper_id}.attach_frame",
+            )
+            tcp_frame = self._parse_optional_frame_name(
+                gripper_data.get("tcp_frame"),
+                f"grippers.{gripper_id}.tcp_frame",
+            )
+            auxiliary_frames = self._parse_frame_name_list(
+                gripper_data.get("auxiliary_frames", []),
+                f"grippers.{gripper_id}.auxiliary_frames",
+            )
+
+            parsed[gripper_id] = GripperConfig(
+                command_mode=command_mode,
+                group_id=group_id,
+                joint_name=joint_name,
+                open_position=open_position,
+                closed_position=closed_position,
+                motion_time_s=motion_time_s,
+                description=str(gripper_data.get("description", "")),
+                touch_links=touch_links,
+                mount_frame=mount_frame,
+                attach_frame=attach_frame,
+                tcp_frame=tcp_frame,
+                auxiliary_frames=auxiliary_frames,
+            )
+        return parsed
+
+    def _parse_optional_frame_name(
+        self,
+        value: Any,
+        field_path: str,
+    ) -> str:
+        if value is None:
+            return ""
+        if not isinstance(value, str):
+            raise DeploymentValidationError(f"{field_path} must be a string")
+        return value.strip()
+
+    def _parse_frame_name_list(
+        self,
+        values: Any,
+        field_path: str,
+    ) -> list[str]:
+        if values is None:
+            return []
+        if not isinstance(values, list):
+            raise DeploymentValidationError(f"{field_path} must be a list of strings")
+        parsed: list[str] = []
+        for index, frame_name in enumerate(values):
+            frame_name_str = self._parse_optional_frame_name(
+                frame_name,
+                f"{field_path}[{index}]",
+            )
+            if not frame_name_str:
+                raise DeploymentValidationError(
+                    f"{field_path}[{index}] must be a non-empty string"
+                )
+            parsed.append(frame_name_str)
+        return parsed
+
     def _load_from_data_and_validate(self, data: dict[str, Any]) -> None:
         self.adapters = {}
         self.robot_config = None
+        self.grippers = {}
         self.orchestrator = None
         self.launch = None
         self.interrupt_sources = {}
@@ -311,23 +526,11 @@ class Deployment:
         robot_data = data.get("robot_config")
         if not robot_data:
             raise DeploymentValidationError("robot_config section is required")
-        for field_name in ("robot_id", "group_id", "urdf_path"):
-            if field_name not in robot_data:
-                raise DeploymentValidationError(
-                    f"robot_config.{field_name} is required"
-                )
-        tcp_speed = robot_data.get("global_max_tcp_linear_speed_mps", 0.0)
-        if tcp_speed <= 0:
-            raise DeploymentValidationError(
-                "robot_config.global_max_tcp_linear_speed_mps must be > 0"
-            )
-        self.robot_config = RobotConfig(
-            robot_id=robot_data["robot_id"],
-            group_id=robot_data["group_id"],
-            urdf_path=robot_data["urdf_path"],
-            srdf_path=robot_data.get("srdf_path", ""),
-            global_max_tcp_linear_speed_mps=tcp_speed,
-        )
+        self.robot_config = self._parse_robot_config(robot_data)
+
+        # Grippers (optional)
+        grippers_data = data.get("grippers", {})
+        self.grippers = self._parse_grippers(grippers_data)
 
         # Adapters
         adapters_data = data.get("adapters", {})
@@ -503,13 +706,14 @@ class Deployment:
                     f"'{policy.source}'"
                 )
 
-    def validate_capabilities(self) -> None:
+    def validate_capabilities(self, program: Any | None = None) -> None:
         """Verify adapter capabilities cover the program profile requirements.
 
         Raises DeploymentValidationError if:
         - Any adapter declares supported_profiles but doesn't include self.program_profile
         - The union of all adapters' capability_keys doesn't cover all required keys
         - Required keys are missing from the capability union
+        - Program node/skill capability keys are missing from the capability union
 
         Silently passes if no adapter declares capability_keys (backwards compat).
         """
@@ -546,6 +750,15 @@ class Deployment:
                 f"{sorted(missing)}"
             )
 
+        if program is not None:
+            required_program_keys = set(program.required_capabilities())
+            missing_program_keys = required_program_keys - all_capability_keys
+            if missing_program_keys:
+                raise DeploymentValidationError(
+                    "Missing capability keys for program nodes: "
+                    f"{sorted(missing_program_keys)}"
+                )
+
     def to_dict(self) -> dict[str, Any]:
         """Serialize to dict matching manyforge.deployment.v0 schema."""
         d: dict[str, Any] = {
@@ -561,7 +774,26 @@ class Deployment:
                 "group_id": self.robot_config.group_id,
                 "urdf_path": self.robot_config.urdf_path,
                 "srdf_path": self.robot_config.srdf_path,
+                "package_paths": self.robot_config.package_paths,
                 "global_max_tcp_linear_speed_mps": self.robot_config.global_max_tcp_linear_speed_mps,
+            }
+        if self.grippers:
+            d["grippers"] = {
+                gripper_id: {
+                    "command_mode": gripper.command_mode,
+                    "group_id": gripper.group_id,
+                    "joint_name": gripper.joint_name,
+                    "open_position": gripper.open_position,
+                    "closed_position": gripper.closed_position,
+                    "motion_time_s": gripper.motion_time_s,
+                    "description": gripper.description,
+                    "touch_links": list(gripper.touch_links),
+                    "mount_frame": gripper.mount_frame,
+                    "attach_frame": gripper.attach_frame,
+                    "tcp_frame": gripper.tcp_frame,
+                    "auxiliary_frames": list(gripper.auxiliary_frames),
+                }
+                for gripper_id, gripper in self.grippers.items()
             }
         # adapters dict with slots: planning, context, execution
         d["adapters"] = {}
@@ -672,17 +904,67 @@ class Deployment:
         if "program_profile" in data:
             self.program_profile = data["program_profile"]
         if "robot_config" in data:
-            rc = data["robot_config"]
-            self.robot_config = RobotConfig(
-                robot_id=rc.get("robot_id", self.robot_config.robot_id),
-                group_id=rc.get("group_id", self.robot_config.group_id),
-                urdf_path=rc.get("urdf_path", self.robot_config.urdf_path),
-                srdf_path=rc.get("srdf_path", self.robot_config.srdf_path),
-                global_max_tcp_linear_speed_mps=rc.get(
-                    "global_max_tcp_linear_speed_mps",
-                    self.robot_config.global_max_tcp_linear_speed_mps
-                ),
+            self.robot_config = self._parse_robot_config(
+                data["robot_config"],
+                current=self.robot_config,
             )
+        if "grippers" in data:
+            merged_grippers = {
+                gripper_id: {
+                    "command_mode": config.command_mode,
+                    "group_id": config.group_id,
+                    "joint_name": config.joint_name,
+                    "open_position": config.open_position,
+                    "closed_position": config.closed_position,
+                    "motion_time_s": config.motion_time_s,
+                    "description": config.description,
+                    "touch_links": list(config.touch_links),
+                }
+                for gripper_id, config in self.grippers.items()
+            }
+            for gripper_id, gripper_data in data["grippers"].items():
+                if not isinstance(gripper_data, dict):
+                    raise DeploymentValidationError(
+                        f"grippers.{gripper_id} must be a mapping"
+                    )
+                current = merged_grippers.get(gripper_id, {})
+                merged_grippers[gripper_id] = {
+                    "command_mode": gripper_data.get(
+                        "command_mode", current.get("command_mode", "")
+                    ),
+                    "group_id": gripper_data.get("group_id", current.get("group_id", "")),
+                    "joint_name": gripper_data.get(
+                        "joint_name", current.get("joint_name", "")
+                    ),
+                    "open_position": gripper_data.get(
+                        "open_position", current.get("open_position")
+                    ),
+                    "closed_position": gripper_data.get(
+                        "closed_position", current.get("closed_position")
+                    ),
+                    "motion_time_s": gripper_data.get(
+                        "motion_time_s", current.get("motion_time_s", 0.0)
+                    ),
+                    "description": gripper_data.get(
+                        "description", current.get("description", "")
+                    ),
+                    "touch_links": gripper_data.get(
+                        "touch_links", current.get("touch_links", [])
+                    ),
+                    "mount_frame": gripper_data.get(
+                        "mount_frame", current.get("mount_frame", "")
+                    ),
+                    "attach_frame": gripper_data.get(
+                        "attach_frame", current.get("attach_frame", "")
+                    ),
+                    "tcp_frame": gripper_data.get(
+                        "tcp_frame", current.get("tcp_frame", "")
+                    ),
+                    "auxiliary_frames": gripper_data.get(
+                        "auxiliary_frames", current.get("auxiliary_frames", [])
+                    ),
+                }
+            self.grippers = self._parse_grippers(merged_grippers)
         if "adapters" in data:
             adapters_data = data["adapters"]
             for slot, adapter_data in adapters_data.items():

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 
 import {
   getFieldRefTarget,
@@ -26,6 +26,12 @@ interface RelativeMoveValue {
   target_reference: RelativeMoveReferenceValue;
   offset_reference?: RelativeMoveReferenceValue;
   offset: Record<string, unknown>;
+}
+
+interface RelativeMoveReferenceInventory {
+  frameOptions: string[];
+  objectOptions: string[];
+  robotLinkOptions: string[];
 }
 
 interface JointGoalRow {
@@ -129,9 +135,36 @@ function normalizeRelativeMove(value: unknown): RelativeMoveValue {
   };
 }
 
+function normalizeReferenceOptions(values: string[]): string[] {
+  return Array.from(
+    new Set(
+      values
+        .map((value) => String(value).trim())
+        .filter((value) => value.length > 0),
+    ),
+  ).sort((left, right) => left.localeCompare(right));
+}
+
+function referenceOptionsForType(
+  type: RelativeMoveReferenceType,
+  inventory: RelativeMoveReferenceInventory,
+): string[] {
+  if (type === 'frame') {
+    return inventory.frameOptions;
+  }
+  if (type === 'robot_link') {
+    return inventory.robotLinkOptions;
+  }
+  if (type === 'object') {
+    return inventory.objectOptions;
+  }
+  return [];
+}
+
 function validateRelativeMoveReference(
   value: RelativeMoveReferenceValue,
   label: string,
+  inventory: RelativeMoveReferenceInventory,
 ): string | null {
   if (!RELATIVE_MOVE_REFERENCE_TYPES.includes(value.type)) {
     return `${label} type is invalid`;
@@ -167,17 +200,29 @@ function validateRelativeMoveReference(
   if (!(value.id ?? '').trim()) {
     return `${label} id is required when type=${value.type}`;
   }
+  const validIds = referenceOptionsForType(value.type, inventory);
+  if (validIds.length > 0 && !validIds.includes((value.id ?? '').trim())) {
+    const idKind = value.type === 'object'
+      ? 'object'
+      : value.type === 'robot_link'
+        ? 'robot link'
+        : 'frame';
+    return `${label} ${idKind} must be selected from the known ${idKind} list`;
+  }
   return null;
 }
 
-function validateRelativeMove(value: RelativeMoveValue): string | null {
-  const targetError = validateRelativeMoveReference(value.target_reference, 'Target reference');
+function validateRelativeMove(
+  value: RelativeMoveValue,
+  inventory: RelativeMoveReferenceInventory,
+): string | null {
+  const targetError = validateRelativeMoveReference(value.target_reference, 'Target reference', inventory);
   if (targetError) {
     return targetError;
   }
 
   if (value.offset_reference) {
-    const offsetReferenceError = validateRelativeMoveReference(value.offset_reference, 'Offset reference');
+    const offsetReferenceError = validateRelativeMoveReference(value.offset_reference, 'Offset reference', inventory);
     if (offsetReferenceError) {
       return offsetReferenceError;
     }
@@ -514,12 +559,14 @@ function RelativeMoveReferenceEditor({
   isRunMode,
   onChange,
   fieldOptions,
+  inventory,
 }: {
   label: string;
   value: RelativeMoveReferenceValue;
   isRunMode: boolean;
   onChange: (value: RelativeMoveReferenceValue) => void;
   fieldOptions: BlackboardFieldOption[];
+  inventory: RelativeMoveReferenceInventory;
 }) {
   const disabledClasses = isRunMode ? 'opacity-50 cursor-not-allowed bg-gray-800' : '';
   const idLabel = value.type === 'robot_link'
@@ -527,6 +574,17 @@ function RelativeMoveReferenceEditor({
     : value.type === 'frame'
       ? 'Frame id'
       : 'Object id';
+  const options = normalizeReferenceOptions(referenceOptionsForType(value.type, inventory));
+  const currentId = (value.id ?? '').trim();
+  const currentIdIsKnown = currentId.length === 0 || options.includes(currentId);
+  const selectOptions = currentId.length > 0 && !currentIdIsKnown
+    ? [currentId, ...options]
+    : options;
+  const placeholder = value.type === 'robot_link'
+    ? 'Select a robot link'
+    : value.type === 'frame'
+      ? 'Select a frame'
+      : 'Select an object';
 
   return (
     <div className="space-y-2 rounded border border-gray-700 p-2">
@@ -584,13 +642,29 @@ function RelativeMoveReferenceEditor({
       ) : (
         <div>
           <div className="mb-1 text-[11px] text-gray-500">{idLabel}</div>
-          <input
-            type="text"
-            value={value.id ?? ''}
+          <select
+            value={currentId}
             onChange={(event) => onChange({ type: value.type, id: event.target.value })}
-            disabled={isRunMode}
+            disabled={isRunMode || selectOptions.length === 0}
             className={`w-full rounded border border-gray-600 bg-gray-700 px-2 py-1 text-sm text-white ${disabledClasses}`}
-          />
+          >
+            <option value="">{placeholder}</option>
+            {selectOptions.map((option) => (
+              <option key={option} value={option}>
+                {option === currentId && !currentIdIsKnown ? `${option} (invalid)` : option}
+              </option>
+            ))}
+          </select>
+          {!currentIdIsKnown && (
+            <div className="mt-1 text-[11px] text-amber-400">
+              Current value is not part of the known {value.type === 'object' ? 'object' : value.type === 'robot_link' ? 'robot link' : 'frame'} inventory.
+            </div>
+          )}
+          {selectOptions.length === 0 && (
+            <div className="mt-1 text-[11px] text-gray-500">
+              No known {value.type === 'object' ? 'objects' : value.type === 'robot_link' ? 'robot links' : 'frames'} are available.
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -602,24 +676,38 @@ export function RelativeMoveEditor({
   isRunMode,
   onCommit,
   fieldOptions,
+  frameOptions,
+  objectOptions,
+  robotLinkOptions,
 }: {
   currentValue: unknown;
   isRunMode: boolean;
   onCommit: (value: unknown) => void;
   fieldOptions: BlackboardFieldOption[];
+  frameOptions: string[];
+  objectOptions: string[];
+  robotLinkOptions: string[];
 }) {
+  const inventory = useMemo<RelativeMoveReferenceInventory>(
+    () => ({
+      frameOptions: normalizeReferenceOptions(frameOptions),
+      objectOptions: normalizeReferenceOptions(objectOptions),
+      robotLinkOptions: normalizeReferenceOptions(robotLinkOptions),
+    }),
+    [frameOptions, objectOptions, robotLinkOptions],
+  );
   const [draft, setDraft] = useState<RelativeMoveValue>(() => normalizeRelativeMove(currentValue));
-  const [error, setError] = useState<string | null>(() => validateRelativeMove(normalizeRelativeMove(currentValue)));
+  const [error, setError] = useState<string | null>(() => validateRelativeMove(normalizeRelativeMove(currentValue), inventory));
 
   useEffect(() => {
     const normalized = normalizeRelativeMove(currentValue);
     setDraft(normalized);
-    setError(validateRelativeMove(normalized));
-  }, [currentValue]);
+    setError(validateRelativeMove(normalized, inventory));
+  }, [currentValue, inventory.frameOptions, inventory.objectOptions, inventory.robotLinkOptions]);
 
   const commit = (nextDraft: RelativeMoveValue) => {
     setDraft(nextDraft);
-    const validationError = validateRelativeMove(nextDraft);
+    const validationError = validateRelativeMove(nextDraft, inventory);
     setError(validationError);
     if (!validationError) {
       onCommit(sanitizeRelativeMove(nextDraft));
@@ -634,6 +722,7 @@ export function RelativeMoveEditor({
         isRunMode={isRunMode}
         onChange={(nextValue) => commit({ ...draft, target_reference: nextValue })}
         fieldOptions={fieldOptions}
+        inventory={inventory}
       />
 
       <div className="space-y-2 rounded border border-gray-700 p-2">
@@ -666,6 +755,7 @@ export function RelativeMoveEditor({
             isRunMode={isRunMode}
             onChange={(nextValue) => commit({ ...draft, offset_reference: nextValue })}
             fieldOptions={fieldOptions}
+            inventory={inventory}
           />
         ) : (
           <div className="text-[11px] text-gray-500">

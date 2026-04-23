@@ -349,6 +349,10 @@ class CycleManager:
         """Get the current kernel execution status."""
         return self._kernel.get_status()
 
+    def get_link_pose(self, target_frame: str, base_frame: str) -> Optional[dict]:
+        """Get the current backend-authoritative pose of a named robot frame."""
+        return self._kernel.get_link_pose(target_frame, base_frame)
+
     def get_object_pose(self, object_id: str, base_frame: str) -> Optional[dict]:
         """Get the current backend-authoritative object pose."""
         return self._kernel.get_object_pose(object_id, base_frame)
@@ -356,6 +360,33 @@ class CycleManager:
     def get_object_state(self, object_id: str) -> ObjectState:
         """Get the current backend-authoritative object state."""
         return self._kernel.get_object_state(object_id)
+
+    def get_gripper_status(self, gripper_id: str):
+        """Get the current status of an actuated gripper command channel."""
+        return self._kernel.get_gripper_status(gripper_id)
+
+    def get_gripper_configs(self) -> dict[str, dict]:
+        """Get deployment gripper configs as JSON-safe dictionaries."""
+        deployment = getattr(self._runner, "deployment", None)
+        if deployment is None:
+            return {}
+        return {
+            gripper_id: {
+                "command_mode": config.command_mode,
+                "group_id": config.group_id,
+                "joint_name": config.joint_name,
+                "open_position": config.open_position,
+                "closed_position": config.closed_position,
+                "motion_time_s": config.motion_time_s,
+                "description": config.description,
+                "touch_links": list(config.touch_links),
+                "mount_frame": config.mount_frame,
+                "attach_frame": config.attach_frame,
+                "tcp_frame": config.tcp_frame,
+                "auxiliary_frames": list(config.auxiliary_frames),
+            }
+            for gripper_id, config in deployment.grippers.items()
+        }
 
     def get_scene_trace(self, limit: Optional[int] = None) -> list[dict]:
         """Get recent backend scene trace events."""
@@ -654,10 +685,13 @@ class CycleManager:
         """
         Start or resume program execution.
         
-        If IDLE: runner.load(), runner.build_tree(), runner.apply_scene(),
-                 write BB keys, start tick thread. If the previous tree
-                 already reached SUCCESS/FAILURE, a fresh tree/scene is
-                 prepared before starting. State → RUNNING.
+        If IDLE with no prepared tree: runner.load(), runner.build_tree(),
+                 runner.apply_scene(), write BB keys, start tick thread.
+                 State → RUNNING.
+        If IDLE with a prepared non-terminal tree (for example after Reset):
+                 write BB keys, start tick thread. State → RUNNING.
+        If IDLE with a terminal tree (SUCCESS/FAILURE): no-op. A fresh cycle
+                 must be prepared explicitly via Reset before another run.
         If STOPPED: clear stop_requested on BB, resume tick thread. State → RUNNING.
                     If kernel is PAUSED, call kernel.resume().
         If INTERRUPT_HANDLER: reject resume while a handler is still executing.
@@ -679,7 +713,10 @@ class CycleManager:
                 # Guard: refuse to start if a zombie tick thread is still alive
                 if self._tick_thread is not None and self._tick_thread.is_alive():
                     raise RuntimeError("Cannot start new cycle: previous tick thread is still alive")
-                prepare_fresh = self._tree is None or self._tree_is_terminal()
+                if self._tree is None:
+                    prepare_fresh = True
+                elif self._tree_is_terminal():
+                    return
                 start_from_idle = True
                 on_run_from_idle = self._on_run_from_idle
 

@@ -82,6 +82,23 @@ function normalizePrimitiveListValue(
   return value.map((item) => (typeof item === 'number' && Number.isFinite(item) ? item : Number(item)));
 }
 
+function normalizeFixedNumericDrafts(
+  currentValue: unknown,
+  length: number,
+): string[] {
+  if (!Array.isArray(currentValue)) {
+    return Array.from({ length }, () => '');
+  }
+  return Array.from({ length }, (_, index) => {
+    const rawValue = currentValue[index];
+    return typeof rawValue === 'number' && Number.isFinite(rawValue)
+      ? String(rawValue)
+      : rawValue !== undefined && rawValue !== null
+        ? String(rawValue)
+        : '';
+  });
+}
+
 function parseStructuredValue(paramType: string, text: string): unknown {
   const parsed = JSON.parse(text);
   if (paramType === 'dict' || paramType === 'pose' || paramType === 'object') {
@@ -499,6 +516,84 @@ export function ListParamEditor({
           {error ?? extraError}
         </div>
       )}
+    </div>
+  );
+}
+
+export function FixedFloatListEditor({
+  currentValue,
+  isRunMode,
+  onCommit,
+  labels,
+  requirePositive = false,
+}: {
+  currentValue: unknown;
+  isRunMode: boolean;
+  onCommit: (value: number[]) => void;
+  labels: string[];
+  requirePositive?: boolean;
+}) {
+  const labelsSignature = labels.join('|');
+  const [drafts, setDrafts] = useState<string[]>(() =>
+    normalizeFixedNumericDrafts(currentValue, labels.length),
+  );
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    setDrafts(normalizeFixedNumericDrafts(currentValue, labels.length));
+    setError(null);
+  }, [currentValue, labels.length, labelsSignature]);
+
+  const validateAndCommit = useCallback((nextDrafts: string[]) => {
+    setDrafts(nextDrafts);
+    const parsedValues: number[] = [];
+    for (let index = 0; index < nextDrafts.length; index += 1) {
+      const trimmed = nextDrafts[index].trim();
+      if (!trimmed) {
+        setError(`${labels[index]} is required`);
+        return;
+      }
+      const parsed = Number(trimmed);
+      if (!Number.isFinite(parsed)) {
+        setError(`${labels[index]} must be a finite number`);
+        return;
+      }
+      if (requirePositive && parsed <= 0) {
+        setError(`${labels[index]} must be > 0`);
+        return;
+      }
+      parsedValues.push(parsed);
+    }
+    setError(null);
+    const baseline = Array.isArray(currentValue)
+      ? currentValue.filter((value): value is number => typeof value === 'number' && Number.isFinite(value))
+      : [];
+    if (!primitiveListValuesEqual(parsedValues, baseline)) {
+      onCommit(parsedValues);
+    }
+  }, [currentValue, labels, onCommit, requirePositive]);
+
+  return (
+    <div className="space-y-2">
+      {labels.map((label, index) => (
+        <div key={label} className="grid grid-cols-[72px_1fr] items-center gap-2">
+          <div className="text-[11px] text-gray-400">{label}</div>
+          <input
+            type="text"
+            inputMode="decimal"
+            value={drafts[index] ?? ''}
+            onChange={(event) => {
+              const nextDrafts = drafts.map((value, draftIndex) =>
+                draftIndex === index ? event.target.value : value,
+              );
+              validateAndCommit(nextDrafts);
+            }}
+            disabled={isRunMode}
+            className={`w-full rounded border border-gray-600 bg-gray-700 px-2 py-1 text-sm text-white ${isRunMode ? 'opacity-50 cursor-not-allowed bg-gray-800' : ''}`}
+          />
+        </div>
+      ))}
+      {error && <div className="text-[11px] text-red-400">{error}</div>}
     </div>
   );
 }

@@ -9,6 +9,7 @@ from manyforge_behavior.nodes.scene import (
 from manyforge_behavior.nodes.logic import (
     CheckKeyBoolValue,
     CheckSignalBool,
+    CommandGripper,
     CheckGripperState,
     SetKeyBoolValue,
     SetSignalBool,
@@ -34,6 +35,7 @@ __all__ = [
     "UpdateCollisionObjectPose",
     "CheckKeyBoolValue",
     "CheckSignalBool",
+    "CommandGripper",
     "CheckGripperState",
     "SetKeyBoolValue",
     "SetSignalBool",

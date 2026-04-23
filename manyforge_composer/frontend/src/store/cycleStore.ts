@@ -55,6 +55,13 @@ export const useCycleStore = create<CycleStore>((set, get) => ({
     try {
       const result = await api.cycle.reset();
       set({ state: result.state as CycleStatus['state'], error: null });
+      const programStore = useProgramStore.getState();
+      if (get().programLoaded || programStore.programInfo !== null) {
+        await Promise.all([
+          programStore.fetchProgramInfo(),
+          programStore.fetchTree(),
+        ]);
+      }
     } catch (e) {
       set({ error: (e as Error).message });
     }

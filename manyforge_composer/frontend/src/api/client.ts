@@ -8,6 +8,7 @@ import type {
   ProgramParameter,
   ProgramBlackboard,
   ProgramTree,
+  ProgramValidateResponse,
   TreeNode,
   RuntimeOverrideStatus,
   DeploymentInfo,
@@ -17,6 +18,10 @@ import type {
   InfraStatus,
   ModelEndpointCatalog,
   SceneStateResponse,
+  SceneEditRequest,
+  SceneEditResponse,
+  SceneFramesResponse,
+  SceneFrameVisibilityResponse,
 } from '../types/api';
 
 const BASE_URL = import.meta.env.VITE_API_URL || '';
@@ -54,6 +59,16 @@ export const api = {
     saved: () => request<ProgramInfo>('GET', '/api/program/saved'),
     tree: () => request<ProgramTree>('GET', '/api/program/tree'),
     savedTree: () => request<ProgramTree>('GET', '/api/program/saved/tree'),
+    validate: (
+      tree: TreeNode,
+      parameters?: ProgramInfo['parameters'],
+      blackboard?: ProgramBlackboard,
+    ) =>
+      request<ProgramValidateResponse>('POST', '/api/program/validate', {
+        tree,
+        parameters,
+        blackboard,
+      }),
     updateTree: (tree: TreeNode) =>
       request<unknown>('PUT', '/api/program/tree', { tree }),
     runtimeOverrides: () =>
@@ -63,14 +78,25 @@ export const api = {
     clearRuntimeOverrides: () =>
       request<RuntimeOverrideStatus>('POST', '/api/program/runtime-overrides/clear'),
     save: (path: string, parameters?: ProgramInfo['parameters'], blackboard?: ProgramBlackboard) =>
-      request<unknown>('POST', '/api/program/save', { path, parameters, blackboard }),
+      request<unknown>('POST', '/api/program/save', {
+        path,
+        parameters,
+        blackboard,
+      }),
     saveTree: (
       path: string,
       tree: TreeNode,
+      scene?: ProgramInfo['sceneResources'],
       parameters?: ProgramInfo['parameters'],
       blackboard?: ProgramBlackboard,
     ) =>
-      request<unknown>('POST', '/api/program/save', { path, tree, parameters, blackboard }),
+      request<unknown>('POST', '/api/program/save', {
+        path,
+        tree,
+        scene,
+        parameters,
+        blackboard,
+      }),
   },
   deployment: {
     load: (path: string) =>
@@ -88,6 +114,7 @@ export const api = {
   session: {
     apply: (payload: {
       tree?: TreeNode;
+      scene?: ProgramInfo['sceneResources'];
       deployment?: FullDeployment;
       programParameters?: ProgramParameter[];
       blackboard?: ProgramBlackboard;
@@ -110,5 +137,10 @@ export const api = {
   },
   scene: {
     state: () => request<SceneStateResponse>('GET', '/api/scene/state'),
+    edit: (payload: SceneEditRequest) =>
+      request<SceneEditResponse>('POST', '/api/scene/edit', payload),
+    frames: () => request<SceneFramesResponse>('GET', '/api/scene/frames'),
+    setFrameVisibility: (frameName: string, visible: boolean) =>
+      request<SceneFrameVisibilityResponse>('POST', '/api/scene/frames/visibility', { frameName, visible }),
   },
 };

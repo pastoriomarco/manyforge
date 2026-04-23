@@ -143,8 +143,27 @@ def _deployment_to_full_response(deployment: Deployment, source_path: str) -> di
             robotId=deployment.robot_config.robot_id,
             groupId=deployment.robot_config.group_id,
             urdfPath=deployment.robot_config.urdf_path,
+            srdfPath=deployment.robot_config.srdf_path,
+            packagePaths=deployment.robot_config.package_paths,
             globalMaxTcpLinearSpeedMps=deployment.robot_config.global_max_tcp_linear_speed_mps,
         ),
+        grippers={
+            gripper_id: {
+                "commandMode": gripper.command_mode,
+                "groupId": gripper.group_id,
+                "jointName": gripper.joint_name,
+                "openPosition": gripper.open_position,
+                "closedPosition": gripper.closed_position,
+                "motionTimeS": gripper.motion_time_s,
+                "description": gripper.description,
+                "touchLinks": list(gripper.touch_links),
+                "mountFrame": gripper.mount_frame,
+                "attachFrame": gripper.attach_frame,
+                "tcpFrame": gripper.tcp_frame,
+                "auxiliaryFrames": list(gripper.auxiliary_frames),
+            }
+            for gripper_id, gripper in deployment.grippers.items()
+        },
         adapters={
             slot: {
                 "adapterId": adapter.adapter_id,
@@ -238,6 +257,17 @@ def _program_parameters_to_response(program: Program) -> list[dict]:
             "description": parameter.description,
         }
         for parameter in program.parameters.values()
+    ]
+
+
+def _program_scene_to_response(program: Program) -> list[dict]:
+    return [
+        {
+            "objectId": resource.object_id,
+            "shape": resource.shape,
+            "pose": resource.pose,
+        }
+        for resource in program.scene
     ]
 
 
@@ -346,6 +376,7 @@ def create_program_router(state: ComposerState) -> APIRouter:
                 tcpFrame=robot.tcp_frame,
             ),
             sceneCount=len(program.scene),
+            sceneResources=_program_scene_to_response(program),
             parameterCount=len(program.parameters),
             parameters=_program_parameters_to_response(program),
             blackboard=_program_blackboard_to_response(program),
@@ -373,6 +404,7 @@ def create_program_router(state: ComposerState) -> APIRouter:
                 tcpFrame=robot.tcp_frame,
             ),
             sceneCount=len(program.scene),
+            sceneResources=_program_scene_to_response(program),
             parameterCount=len(program.parameters),
             parameters=_program_parameters_to_response(program),
             blackboard=_program_blackboard_to_response(program),
@@ -408,6 +440,7 @@ def create_program_router(state: ComposerState) -> APIRouter:
                 tcpFrame=robot.tcp_frame,
             ),
             sceneCount=len(saved_program.scene),
+            sceneResources=_program_scene_to_response(saved_program),
             parameterCount=len(saved_program.parameters),
             parameters=_program_parameters_to_response(saved_program),
             blackboard=_program_blackboard_to_response(saved_program),
@@ -703,8 +736,27 @@ def create_program_router(state: ComposerState) -> APIRouter:
                 robotId=robot_config.robot_id,
                 groupId=robot_config.group_id,
                 urdfPath=robot_config.urdf_path,
+                srdfPath=robot_config.srdf_path,
+                packagePaths=robot_config.package_paths,
                 globalMaxTcpLinearSpeedMps=robot_config.global_max_tcp_linear_speed_mps,
             ),
+            grippers={
+                gripper_id: {
+                    "commandMode": gripper.command_mode,
+                    "groupId": gripper.group_id,
+                    "jointName": gripper.joint_name,
+                    "openPosition": gripper.open_position,
+                    "closedPosition": gripper.closed_position,
+                    "motionTimeS": gripper.motion_time_s,
+                    "description": gripper.description,
+                    "touchLinks": list(gripper.touch_links),
+                    "mountFrame": gripper.mount_frame,
+                    "attachFrame": gripper.attach_frame,
+                    "tcpFrame": gripper.tcp_frame,
+                    "auxiliaryFrames": list(gripper.auxiliary_frames),
+                }
+                for gripper_id, gripper in deployment.grippers.items()
+            },
         ).model_dump(by_alias=True)
     
     @router.get("/deployment", response_model=DeploymentResponse, response_model_by_alias=True)
@@ -723,8 +775,27 @@ def create_program_router(state: ComposerState) -> APIRouter:
                 robotId=robot_config.robot_id,
                 groupId=robot_config.group_id,
                 urdfPath=robot_config.urdf_path,
+                srdfPath=robot_config.srdf_path,
+                packagePaths=robot_config.package_paths,
                 globalMaxTcpLinearSpeedMps=robot_config.global_max_tcp_linear_speed_mps,
             ),
+            grippers={
+                gripper_id: {
+                    "commandMode": gripper.command_mode,
+                    "groupId": gripper.group_id,
+                    "jointName": gripper.joint_name,
+                    "openPosition": gripper.open_position,
+                    "closedPosition": gripper.closed_position,
+                    "motionTimeS": gripper.motion_time_s,
+                    "description": gripper.description,
+                    "touchLinks": list(gripper.touch_links),
+                    "mountFrame": gripper.mount_frame,
+                    "attachFrame": gripper.attach_frame,
+                    "tcpFrame": gripper.tcp_frame,
+                    "auxiliaryFrames": list(gripper.auxiliary_frames),
+                }
+                for gripper_id, gripper in deployment.grippers.items()
+            },
         ).model_dump(by_alias=True)
 
     @router.get("/deployment/full", response_model=FullDeploymentResponse, response_model_by_alias=True)
@@ -765,7 +836,7 @@ def create_program_router(state: ComposerState) -> APIRouter:
             deployment = state.deployment
             if deployment is not None:
                 deployment.validate_against_program(updated_program)
-                deployment.validate_capabilities()
+                deployment.validate_capabilities(updated_program)
             state.apply_models(
                 updated_program,
                 deployment,
@@ -793,6 +864,11 @@ def create_program_router(state: ComposerState) -> APIRouter:
             program_data = state.program.to_dict()
             if request.tree is not None:
                 program_data["tree"] = request.tree.model_dump()
+            if request.scene is not None:
+                program_data["scene"] = [
+                    resource.model_dump(by_alias=False)
+                    for resource in request.scene
+                ]
             if request.parameters is not None:
                 program_data["parameters"] = [
                     parameter.model_dump()
@@ -831,7 +907,7 @@ def create_program_router(state: ComposerState) -> APIRouter:
             )
             if state.program is not None:
                 updated_deployment.validate_against_program(state.program)
-                updated_deployment.validate_capabilities()
+                updated_deployment.validate_capabilities(state.program)
                 state.apply_models(
                     state.program,
                     updated_deployment,
@@ -862,7 +938,7 @@ def create_program_router(state: ComposerState) -> APIRouter:
                 candidate = Deployment.from_dict(deployment_data, path=target_path)
                 if state.program is not None:
                     candidate.validate_against_program(state.program)
-                    candidate.validate_capabilities()
+                    candidate.validate_capabilities(state.program)
                 candidate.save(target_path)
         except HTTPException:
             raise
@@ -882,12 +958,18 @@ def create_program_router(state: ComposerState) -> APIRouter:
             program = state.program
             if (
                 request.tree is not None
+                or request.scene is not None
                 or request.program_parameters is not None
                 or request.blackboard is not None
             ):
                 program_data = state.program.to_dict()
                 if request.tree is not None:
                     program_data["tree"] = request.tree.model_dump()
+                if request.scene is not None:
+                    program_data["scene"] = [
+                        resource.model_dump(by_alias=False)
+                        for resource in request.scene
+                    ]
                 if request.program_parameters is not None:
                     program_data["parameters"] = [
                         parameter.model_dump()
@@ -912,7 +994,7 @@ def create_program_router(state: ComposerState) -> APIRouter:
 
             if deployment is not None:
                 deployment.validate_against_program(program)
-                deployment.validate_capabilities()
+                deployment.validate_capabilities(program)
 
             state.apply_models(
                 program,
@@ -923,7 +1005,7 @@ def create_program_router(state: ComposerState) -> APIRouter:
             raise HTTPException(status_code=409, detail=str(exc))
         except Exception as e:
             logger.warning("Failed to apply session: %s", e)
-            raise HTTPException(status_code=400, detail="Failed to apply session")
+            raise HTTPException(status_code=400, detail=f"Failed to apply session: {e}")
 
         return {"status": "ok"}
 

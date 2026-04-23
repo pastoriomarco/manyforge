@@ -3,6 +3,7 @@
 #include <optional>
 #include <string>
 #include <variant>
+#include <vector>
 
 #include <manyforge_core/types/error_code.hpp>
 #include <manyforge_core/types/geometry.hpp>
@@ -58,6 +59,7 @@ struct UpdateObjectPoseRequestDTO {
 struct AttachObjectRequestDTO {
   std::string object_id;
   std::string frame_id;
+  std::vector<std::string> touch_links;
 };
 
 /// Detach/reparent an existing object into a target frame while preserving world pose.

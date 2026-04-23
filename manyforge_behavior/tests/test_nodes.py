@@ -1,5 +1,7 @@
 """Tests for py_trees behavior node implementations."""
 
+import time
+
 import pytest
 import py_trees
 
@@ -9,6 +11,8 @@ from manyforge_behavior.blackboard_namespace import (
 )
 from manyforge_behavior.kernel_client import (
     ExecutionState,
+    GripperCommandRequest,
+    GripperCommandState,
     MockKernelClient,
     SceneEditRequest,
 )
@@ -23,6 +27,7 @@ from manyforge_behavior.nodes.scene import (
 from manyforge_behavior.nodes.logic import (
     CheckKeyBoolValue,
     CheckSignalBool,
+    CommandGripper,
     CheckGripperState,
     SetKeyBoolValue,
     SetSignalBool,
@@ -474,6 +479,7 @@ class TestUpdateCollisionObjectPose:
 class TestAttachDetachObjectNodes:
     def test_attach_delegates_to_backend_and_preserves_current_pose(self, kernel, bb_with_kernel):
         bb_with_kernel.register_key(key="scene_objects", access=py_trees.common.Access.WRITE)
+        bb_with_kernel.register_key(key="gripper_configs", access=py_trees.common.Access.WRITE)
         bb_with_kernel.scene_objects = {
             "box1": {
                 "shape_type": "box",
@@ -481,6 +487,11 @@ class TestAttachDetachObjectNodes:
                 "position_m": [1.5, 0.0, 0.6],
                 "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
                 "frame_id": "universe",
+            }
+        }
+        bb_with_kernel.gripper_configs = {
+            "primary": {
+                "touch_links": ["left_inner_finger_pad", "right_inner_finger_pad"],
             }
         }
         kernel.scene_edit(
@@ -495,7 +506,12 @@ class TestAttachDetachObjectNodes:
             )
         )
 
-        node = AttachObjectToLink(name="attach_box", object_id="box1", link_frame="tool0")
+        node = AttachObjectToLink(
+            name="attach_box",
+            object_id="box1",
+            link_frame="tool0",
+            gripper_id="primary",
+        )
         status = _tick_node(node)
 
         assert status == py_trees.common.Status.SUCCESS
@@ -503,6 +519,10 @@ class TestAttachDetachObjectNodes:
         assert attach_req.operation == "attach"
         assert attach_req.object_id == "box1"
         assert attach_req.frame_id == "tool0"
+        assert attach_req.touch_links == [
+            "left_inner_finger_pad",
+            "right_inner_finger_pad",
+        ]
         state = kernel.get_object_state("box1")
         assert state.exists is True
         assert state.attached is True
@@ -718,6 +738,113 @@ class TestGripperStateNodes:
         node = WaitForKeyBool(name="wait_flag", key="wait_key", expected_value=True)
         status = _tick_node(node)
         assert status == py_trees.common.Status.RUNNING
+
+
+class TestCommandGripper:
+    def test_command_gripper_closes_and_updates_logical_state(self, kernel, bb_with_kernel):
+        writer = py_trees.blackboard.Client(name="gripper_setup")
+        writer.register_key(key="gripper_configs", access=py_trees.common.Access.WRITE)
+        writer.gripper_configs = {
+            "primary": {
+                "command_mode": "simulated_joint",
+                "group_id": "gripper",
+                "joint_name": "finger_joint",
+                "open_position": 0.0,
+                "closed_position": 0.7,
+                "motion_time_s": 0.02,
+            }
+        }
+
+        node = CommandGripper(
+            name="close_gripper",
+            gripper_id="primary",
+            command="close",
+            state_key="gripper_closed",
+            timeout_s=1.0,
+        )
+        node.setup()
+        node.initialise()
+
+        status = node.update()
+        assert status == py_trees.common.Status.RUNNING
+
+        deadline = time.monotonic() + 1.0
+        while status == py_trees.common.Status.RUNNING and time.monotonic() < deadline:
+            time.sleep(0.01)
+            status = node.update()
+
+        assert status == py_trees.common.Status.SUCCESS
+        assert kernel.last_gripper_command_request is not None
+        assert kernel.last_gripper_command_request.gripper_id == "primary"
+        assert kernel.last_gripper_command_request.target_position == pytest.approx(0.7)
+
+        reader = py_trees.blackboard.Client(name="gripper_reader")
+        reader.register_key(key="gripper_closed", access=py_trees.common.Access.READ)
+        assert reader.get("gripper_closed") is True
+
+    def test_command_gripper_fails_when_gripper_is_missing(self, kernel, bb_with_kernel):
+        writer = py_trees.blackboard.Client(name="gripper_setup")
+        writer.register_key(key="gripper_configs", access=py_trees.common.Access.WRITE)
+        writer.gripper_configs = {}
+
+        node = CommandGripper(
+            name="close_gripper",
+            gripper_id="missing",
+            command="close",
+            timeout_s=1.0,
+        )
+        assert _tick_node(node) == py_trees.common.Status.FAILURE
+
+    def test_mock_kernel_rejects_overlapping_gripper_commands(self, kernel):
+        first = kernel.command_gripper(
+            GripperCommandRequest(
+                gripper_id="primary",
+                group_id="gripper",
+                joint_name="finger_joint",
+                target_position=0.7,
+                duration_s=0.2,
+            )
+        )
+        second = kernel.command_gripper(
+            GripperCommandRequest(
+                gripper_id="primary",
+                group_id="gripper",
+                joint_name="finger_joint",
+                target_position=0.0,
+                duration_s=0.2,
+            )
+        )
+
+        assert first.accepted is True
+        assert second.accepted is False
+        assert "already executing" in (second.error or "")
+
+    def test_mock_kernel_status_reads_do_not_persist_inflight_position(self, kernel):
+        accepted = kernel.command_gripper(
+            GripperCommandRequest(
+                gripper_id="primary",
+                group_id="gripper",
+                joint_name="finger_joint",
+                target_position=0.7,
+                duration_s=0.05,
+            )
+        )
+        assert accepted.accepted is True
+
+        time.sleep(0.01)
+        status = kernel.get_gripper_status("primary")
+
+        assert status.state == GripperCommandState.EXECUTING
+        assert status.current_position is not None
+        assert 0.0 < status.current_position < 0.7
+        assert kernel._gripper_positions.get("primary") is None
+
+        time.sleep(0.05)
+        completed = kernel.get_gripper_status("primary")
+
+        assert completed.state == GripperCommandState.COMPLETED
+        assert completed.current_position == pytest.approx(0.7)
+        assert kernel._gripper_positions["primary"] == pytest.approx(0.7)
 
 
 class TestGetLinkPose:

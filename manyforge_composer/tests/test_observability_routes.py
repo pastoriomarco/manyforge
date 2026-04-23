@@ -77,6 +77,8 @@ def test_scene_state_uses_backend_authoritative_objects_for_runtime_additions():
     assert obj["pose_in_universe"]["position_m"] == [0.5, -0.2, 0.4]
     assert obj["attached"] is False
     assert obj["attached_to"] is None
+    assert obj["source"] == "runtime"
+    assert obj["persistable"] is False
 
 
 def test_scene_state_includes_robot_metadata_after_program_load():
@@ -93,6 +95,44 @@ def test_scene_state_includes_robot_metadata_after_program_load():
     assert data["robot"]["tcp_frame"] == "tool0"
     assert data["robot"]["joint_names"] == ["joint_a", "joint_b", "joint_c"]
     assert isinstance(data["robot"]["joint_positions"], dict)
+
+
+def test_scene_frames_expose_model_inventory_and_visibility_control():
+    client, state, kernel = make_client()
+    state.load_program(_PROGRAM_PATH, deployment_path=_DEPLOYMENT_PATH)
+
+    class DummyHmi:
+        def __init__(self):
+            self.visible: dict[str, bool] = {}
+
+        def get_frame_visibility(self, frame_name: str) -> bool:
+            return self.visible.get(frame_name, frame_name == "tool0")
+
+        def set_frame_visibility(self, frame_name: str, visible: bool) -> None:
+            self.visible[frame_name] = visible
+
+    state.hmi_server = DummyHmi()
+
+    response = client.get("/api/scene/frames")
+    assert response.status_code == 200
+    data = response.json()
+
+    assert data["hmiAvailable"] is True
+    frame_names = {frame["name"] for frame in data["frames"]}
+    assert "universe" in frame_names
+    assert "base_link" in frame_names
+    assert "tool0" in frame_names
+    tool0 = next(frame for frame in data["frames"] if frame["name"] == "tool0")
+    assert "program_tcp" in tool0["roles"]
+    assert tool0["viewerVisible"] is True
+    assert tool0["poseAvailable"] is True
+
+    toggle = client.post(
+        "/api/scene/frames/visibility",
+        json={"frameName": "base_link", "visible": True},
+    )
+    assert toggle.status_code == 200
+    assert state.hmi_server.visible["base_link"] is True
 
 
 def test_scene_edit_rejects_invalid_operation_with_422():
@@ -181,6 +221,26 @@ def test_scene_edit_rejected_during_interrupt_handler():
     assert data["success"] is False
     assert data["cycleState"] == "interrupt_handler"
     assert "INTERRUPT_HANDLER" in data["error"]
+
+
+def test_scene_edit_rejected_during_direct_control():
+    client, state, kernel = make_client()
+    state.cycle_manager = MagicMock()
+    state.cycle_manager.state = CycleState.DIRECT_CONTROL
+
+    response = client.post(
+        "/api/scene/edit",
+        json={
+            "operation": "remove",
+            "object_id": "missing",
+        },
+    )
+
+    assert response.status_code == 409
+    data = response.json()
+    assert data["success"] is False
+    assert data["cycleState"] == "direct_control"
+    assert "DIRECT_CONTROL" in data["error"]
 
 
 def test_kernel_snapshot_reports_idle_when_no_program_loaded():

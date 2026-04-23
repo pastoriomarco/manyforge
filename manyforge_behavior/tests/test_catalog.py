@@ -41,6 +41,7 @@ class TestCatalogLoading:
         move = catalog.get("move_manipulator_action")
         assert move.kind == "leaf"
         assert move.children_max == 0
+        assert move.stability == "stable"
         assert len(move.parameters) > 0
         move_id_param = next(p for p in move.parameters if p.name == "move_id")
         assert move_id_param.required is True
@@ -73,7 +74,14 @@ class TestCatalogLoading:
     def test_filter_by_profile_v0(self):
         catalog = NodeCatalog(CATALOG_PATH)
         v0_entries = catalog.filter_by_profile("v0.0")
-        assert len(v0_entries) == len(catalog.entries)  # all are min v0.0
+        assert all(entry.profiles_min == "v0.0" for entry in v0_entries)
+        assert "command_gripper" not in {entry.id for entry in v0_entries}
+        assert len(v0_entries) == len(catalog.entries) - 1
+
+    def test_command_gripper_is_marked_experimental(self):
+        catalog = NodeCatalog(CATALOG_PATH)
+        command_gripper = catalog.get("command_gripper")
+        assert command_gripper.stability == "experimental"
 
     def test_all_entries_have_py_trees_runner(self):
         catalog = NodeCatalog(CATALOG_PATH)
@@ -209,6 +217,25 @@ class TestCatalogValidation:
             ],
         })
         with pytest.raises(CatalogValidationError, match="py_trees"):
+            NodeCatalog(path)
+        os.unlink(path)
+
+    def test_rejects_unknown_stability(self):
+        path = self._write_catalog({
+            "api_version": "manyforge.node_catalog.v0",
+            "catalog_version": "0.1.0",
+            "entries": [
+                {
+                    "id": "bad_stability",
+                    "name": "BadStability",
+                    "stability": "preview",
+                    "kind": "leaf",
+                    "children": {"min": 0, "max": 0},
+                    "runners": {"py_trees": {"implementation_kind": "plugin"}},
+                },
+            ],
+        })
+        with pytest.raises(CatalogValidationError, match="stability"):
             NodeCatalog(path)
         os.unlink(path)
 

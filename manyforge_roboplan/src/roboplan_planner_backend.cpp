@@ -61,13 +61,17 @@ core::PlanResultDTO RoboPlanPlannerBackend::plan(const core::PlanRequestDTO& req
     start_config.joint_names = start.joint_names;
     start_config.positions = start_positions;
 
+    const Eigen::VectorXd start_positions_full =
+        scene_->toFullJointPositions(rrt_options_.group_name, start_positions);
+
     // Check start for self-collision
-    bool start_collision = scene_->hasCollisions(start_positions);
+    bool start_collision = scene_->hasCollisions(start_positions_full);
     bool goal_collision = false;
 
     // FK of start pose
     {
-      Eigen::Matrix4d start_fk = scene_->forwardKinematics(start_positions, request.tcp_frame);
+      Eigen::Matrix4d start_fk =
+          scene_->forwardKinematics(start_positions_full, request.tcp_frame);
       double r, p, ya;
       matrix_to_rpy_deg(start_fk, r, p, ya);
       fmt::print(stderr, "[PLANNER] start pose:  pos=({:.3f}, {:.3f}, {:.3f}) rpy=({:.1f}, {:.1f}, {:.1f}) collision={}\n",
@@ -76,7 +80,7 @@ core::PlanResultDTO RoboPlanPlannerBackend::plan(const core::PlanRequestDTO& req
     }
 
     if (start_collision) {
-      scene_->hasCollisions(start_positions, true);
+      scene_->hasCollisions(start_positions_full, true);
       result.error = core::ErrorDTO{
           core::kErrorPlanningFailed,
           "Planning preview rejected: start state is already in collision",
@@ -154,11 +158,13 @@ core::PlanResultDTO RoboPlanPlannerBackend::plan(const core::PlanRequestDTO& req
       fmt::print(stderr, "]\n");
 
       // Check goal for self-collision
-      goal_collision = scene_->hasCollisions(goal_config.positions);
+      const Eigen::VectorXd goal_positions_full =
+          scene_->toFullJointPositions(rrt_options_.group_name, goal_config.positions);
+      goal_collision = scene_->hasCollisions(goal_positions_full);
       fmt::print(stderr, "[PLANNER] goal in collision: {}\n", goal_collision ? "YES" : "no");
 
       if (goal_collision) {
-        scene_->hasCollisions(goal_config.positions, true);
+        scene_->hasCollisions(goal_positions_full, true);
         result.error = core::ErrorDTO{
             core::kErrorPlanningFailed,
             "Planning preview rejected: goal state is in collision",
@@ -268,8 +274,9 @@ core::PlanResultDTO RoboPlanPlannerBackend::plan(const core::PlanRequestDTO& req
       bool have_prev = false;
 
       for (size_t i = 0; i < final_traj.times.size(); ++i) {
-        Eigen::Matrix4d tform = scene_->forwardKinematics(
-            final_traj.positions[i], tcp_frame);
+        const Eigen::VectorXd q_full =
+            scene_->toFullJointPositions(rrt_options_.group_name, final_traj.positions[i]);
+        Eigen::Matrix4d tform = scene_->forwardKinematics(q_full, tcp_frame);
         Eigen::Vector3d pos = tform.block<3, 1>(0, 3);
 
         if (have_prev && i > 0) {

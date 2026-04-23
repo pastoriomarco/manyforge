@@ -430,7 +430,12 @@ entries:
       - name: object_id
         type: string
         required: true
-        description: Unique identifier for the collision object.
+        parameterizable: true
+        ui_editor: blackboard_key_selector
+        blackboard_role: literal_or_key_reader
+        blackboard_value_type: string
+        description: Unique identifier for the collision object. May be a literal
+          ID, a program parameter, or a declared blackboard key/field binding.
       - name: shape_type
         type: enum
         required: true
@@ -486,11 +491,12 @@ entries:
       - name: object_id
         type: string
         required: true
-        ui_editor: string_or_blackboard_field_selector
-        blackboard_role: field_reader
+        parameterizable: true
+        ui_editor: blackboard_key_selector
+        blackboard_role: literal_or_key_reader
         blackboard_value_type: string
         description: Identifier of the object to remove. May be a literal ID
-          or a declared blackboard field_ref.
+          a program parameter, or a declared blackboard key/field binding.
     required_capabilities:
       - scene.edit.remove
     execution:
@@ -520,11 +526,12 @@ entries:
       - name: object_id
         type: string
         required: true
-        ui_editor: string_or_blackboard_field_selector
-        blackboard_role: field_reader
+        parameterizable: true
+        ui_editor: blackboard_key_selector
+        blackboard_role: literal_or_key_reader
         blackboard_value_type: string
         description: Identifier of the object to update. May be a literal ID
-          or a declared blackboard field_ref.
+          a program parameter, or a declared blackboard key/field binding.
       - name: pose
         type: pose
         required: true
@@ -564,15 +571,24 @@ entries:
       - name: object_id
         type: string
         required: true
-        ui_editor: string_or_blackboard_field_selector
-        blackboard_role: field_reader
+        parameterizable: true
+        ui_editor: blackboard_key_selector
+        blackboard_role: literal_or_key_reader
         blackboard_value_type: string
         description: Object to attach (must exist in scene). May be a literal
-          ID or a declared blackboard field_ref.
+          ID, a program parameter, or a declared blackboard key/field binding.
       - name: link_frame
         type: string
         required: true
         description: Robot link to attach to (e.g. "tool0").
+      - name: gripper_id
+        type: string
+        required: false
+        description: Optional gripper identifier. When provided, attach uses the gripper's deployment-defined touch_links for allowable grasp contact.
+      - name: touch_links
+        type: string_list
+        required: false
+        description: Optional explicit list of robot link names that are allowed to touch the attached object during planning. Overrides gripper_id-derived touch_links when provided.
     required_capabilities:
       - scene.edit.add
       - scene.edit.remove
@@ -608,11 +624,13 @@ entries:
       - name: object_id
         type: string
         required: true
-        ui_editor: string_or_blackboard_field_selector
-        blackboard_role: field_reader
+        parameterizable: true
+        ui_editor: blackboard_key_selector
+        blackboard_role: literal_or_key_reader
         blackboard_value_type: string
         description: Original object_id (attached version is object_id +
-          "_attached"). May be a literal ID or a declared blackboard field_ref.
+          "_attached"). May be a literal ID, a program parameter, or a
+          declared blackboard key/field binding.
       - name: link_frame
         type: string
         required: true
@@ -915,6 +933,62 @@ entries:
   # ---------------------------------------------------------------------------
   # End effector / logical gripper state
   # ---------------------------------------------------------------------------
+
+  - id: command_gripper
+    name: CommandGripper
+    category: end_effector
+    description: >-
+      Command an actuated gripper to open or close and block until the motion
+      completes. This is the transport-aware actuated sibling of the logical
+      set/check/wait gripper-state nodes.
+    stability: experimental
+    tags: [end_effector, gripper, actuation]
+    profiles:
+      min_profile: v0.1
+    kind: leaf
+    children:
+      min: 0
+      max: 0
+    parameters:
+      - name: gripper_id
+        type: string
+        required: true
+        description: Deployment gripper identifier to command.
+      - name: command
+        type: enum
+        required: true
+        default: close
+        enum_values: [open, close]
+        description: High-level gripper command to execute.
+      - name: state_key
+        type: string
+        required: false
+        ui_editor: blackboard_key_selector
+        blackboard_role: key_writer
+        blackboard_value_type: bool
+        description: Optional logical gripper-state key to write on success.
+      - name: timeout_s
+        type: float
+        required: false
+        default: 5.0
+        constraints:
+          min_exclusive: 0
+        description: Maximum time to wait for the gripper command to complete.
+    bb_writer_params: [state_key]
+    required_capabilities:
+      - execution.gripper.command
+    execution:
+      blocking: true
+      cancellable: true
+    interruptible: true
+    default_interrupt_scope: active_node
+    runners:
+      py_trees:
+        implementation_kind: plugin
+        class: manyforge_behavior.nodes.CommandGripper
+    observability:
+      emits_events: []
+      consumes_events: []
 
   - id: check_gripper_state
     name: CheckGripperState

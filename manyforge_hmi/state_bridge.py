@@ -4,7 +4,11 @@ This is the testable core — no Viser dependency.
 """
 
 from manyforge_behavior.cycle_manager import CycleManager, CycleState
-from manyforge_behavior.kernel_client import ExecutionSnapshot, ObjectState
+from manyforge_behavior.kernel_client import (
+    ExecutionSnapshot,
+    GripperCommandStatus,
+    ObjectState,
+)
 
 
 class StateBridge:
@@ -50,9 +54,21 @@ class StateBridge:
         """Get the current backend-authoritative object pose."""
         return self._cm.get_object_pose(object_id, base_frame)
 
+    def get_link_pose(self, target_frame: str, base_frame: str):
+        """Get the current backend-authoritative pose for a named frame."""
+        return self._cm.get_link_pose(target_frame, base_frame)
+
     def get_object_state(self, object_id: str) -> ObjectState:
         """Get the current backend-authoritative object state."""
         return self._cm.get_object_state(object_id)
+
+    def get_gripper_status(self, gripper_id: str) -> GripperCommandStatus:
+        """Get the latest actuated gripper status from the kernel."""
+        return self._cm.get_gripper_status(gripper_id)
+
+    def get_gripper_configs(self) -> dict[str, dict]:
+        """Get deployment gripper configs for HMI-side rendering helpers."""
+        return self._cm.get_gripper_configs()
 
     def get_scene_trace(self, limit: int | None = None) -> list[dict]:
         """Get recent backend scene trace events."""

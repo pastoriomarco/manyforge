@@ -50,6 +50,7 @@ class CatalogEntryResponse(BaseModel):
     name: str
     category: str
     description: str
+    stability: str = "stable"
     kind: str
     children_min: int = Field(alias="childrenMin")
     children_max: int = Field(alias="childrenMax")
@@ -108,6 +109,10 @@ class ProgramResponse(BaseModel):
     program_profile: str = Field(alias="programProfile")
     robot: RobotResponse
     scene_count: int = Field(alias="sceneCount")
+    scene_resources: List["ProgramSceneResourceResponse"] = Field(
+        default_factory=list,
+        alias="sceneResources",
+    )
     parameter_count: int = Field(alias="parameterCount")
     parameters: List["ProgramParameterResponse"] = Field(default_factory=list)
     blackboard: "ProgramBlackboardResponse" = Field(default_factory=lambda: ProgramBlackboardResponse())
@@ -129,6 +134,13 @@ class ProgramParameterResponse(BaseModel):
     default: Any = None
     constraints: Dict[str, Any] = Field(default_factory=dict)
     description: str = ""
+
+
+class ProgramSceneResourceResponse(BaseModel):
+    model_config = _ALIAS_CFG
+    object_id: str = Field(alias="objectId")
+    shape: Dict[str, Any] = Field(default_factory=dict)
+    pose: Dict[str, Any] = Field(default_factory=dict)
 
 
 class BlackboardNamespaceResponse(BaseModel):
@@ -187,6 +199,7 @@ class ProgramTreeResponse(BaseModel):
 class SaveProgramRequest(BaseModel):
     path: str
     tree: Optional[TreeNodeResponse] = None
+    scene: Optional[List[ProgramSceneResourceResponse]] = None
     parameters: Optional[List[ProgramParameterResponse]] = None
     blackboard: Optional[ProgramBlackboardResponse] = None
 
@@ -423,7 +436,25 @@ class RobotConfigResponse(BaseModel):
     robot_id: str = Field(alias="robotId")
     group_id: str = Field(alias="groupId")
     urdf_path: str = Field(alias="urdfPath")
+    srdf_path: str = Field(default="", alias="srdfPath")
+    package_paths: List[str] = Field(default_factory=list, alias="packagePaths")
     global_max_tcp_linear_speed_mps: float = Field(alias="globalMaxTcpLinearSpeedMps")
+
+
+class GripperConfigResponse(BaseModel):
+    model_config = _ALIAS_CFG
+    command_mode: str = Field(alias="commandMode")
+    group_id: str = Field(alias="groupId")
+    joint_name: str = Field(alias="jointName")
+    open_position: float = Field(alias="openPosition")
+    closed_position: float = Field(alias="closedPosition")
+    motion_time_s: float = Field(alias="motionTimeS")
+    description: str = ""
+    touch_links: List[str] = Field(default_factory=list, alias="touchLinks")
+    mount_frame: str = Field(default="", alias="mountFrame")
+    attach_frame: str = Field(default="", alias="attachFrame")
+    tcp_frame: str = Field(default="", alias="tcpFrame")
+    auxiliary_frames: List[str] = Field(default_factory=list, alias="auxiliaryFrames")
 
 
 class DeploymentResponse(BaseModel):
@@ -432,6 +463,7 @@ class DeploymentResponse(BaseModel):
     description: str
     program_profile: str = Field(alias="programProfile")
     robot_config: RobotConfigResponse = Field(alias="robotConfig")
+    grippers: Dict[str, GripperConfigResponse] = Field(default_factory=dict)
 
 
 class AdapterConfigResponse(BaseModel):
@@ -520,6 +552,7 @@ class FullDeploymentResponse(BaseModel):
     description: str
     program_profile: str = Field(alias="programProfile")
     robot_config: RobotConfigResponse = Field(alias="robotConfig")
+    grippers: Dict[str, GripperConfigResponse] = Field(default_factory=dict)
     adapters: Dict[str, AdapterConfigResponse]
     orchestrator: OrchestratorConfigResponse
     launch: LaunchConfigResponse
@@ -569,6 +602,7 @@ class UpdateDeploymentRequest(BaseModel):
     description: Optional[str] = None
     program_profile: Optional[str] = Field(None, alias="programProfile")
     robot_config: Optional[Dict[str, Any]] = Field(None, alias="robotConfig")
+    grippers: Optional[Dict[str, Dict[str, Any]]] = None
     adapters: Optional[Dict[str, Dict[str, Any]]] = None
     orchestrator: Optional[Dict[str, Any]] = None
     launch: Optional[Dict[str, Any]] = None
@@ -586,6 +620,7 @@ class SaveDeploymentRequest(BaseModel):
 class ApplySessionRequest(BaseModel):
     model_config = _ALIAS_CFG
     tree: Optional[TreeNodeResponse] = None
+    scene: Optional[List[ProgramSceneResourceResponse]] = None
     program_parameters: Optional[List[ProgramParameterResponse]] = Field(
         default=None,
         alias="programParameters",
@@ -627,6 +662,8 @@ class SceneObjectResponse(BaseModel):
     pose_in_universe: Optional[Dict[str, Any]] = None
     attached: bool
     attached_to: Optional[str] = None
+    source: str = "runtime"
+    persistable: bool = False
 
 
 class SceneRobotResponse(BaseModel):
@@ -643,6 +680,37 @@ class SceneStateResponse(BaseModel):
     robot: Optional[SceneRobotResponse] = None
     objects: List[SceneObjectResponse] = Field(default_factory=list)
     timestamp_ns: int
+
+
+class SceneFrameResponse(BaseModel):
+    model_config = _ALIAS_CFG
+    name: str
+    roles: List[str] = Field(default_factory=list)
+    viewer_visible: bool = Field(alias="viewerVisible")
+    pose_available: bool = Field(alias="poseAvailable")
+
+
+class SceneFramesResponse(BaseModel):
+    model_config = _ALIAS_CFG
+    frames: List[SceneFrameResponse] = Field(default_factory=list)
+    hmi_available: bool = Field(alias="hmiAvailable")
+    timestamp_ns: int = Field(alias="timestampNs")
+
+
+class SceneFrameVisibilityRequest(BaseModel):
+    model_config = _ALIAS_CFG
+    frame_name: str = Field(alias="frameName", min_length=1)
+    visible: bool
+
+
+class SceneFrameVisibilityResponse(BaseModel):
+    model_config = _ALIAS_CFG
+    success: bool
+    frame_name: str = Field(alias="frameName")
+    visible: bool
+    hmi_available: bool = Field(alias="hmiAvailable")
+    timestamp_ns: int = Field(alias="timestampNs")
+    error: Optional[str] = None
 
 
 class SceneEditApiRequest(BaseModel):

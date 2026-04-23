@@ -25,9 +25,9 @@ It does not cover:
 
 See also:
 
-- [`../plans/OPENCLAW_INTEGRATION_PLAN.md`](../plans/OPENCLAW_INTEGRATION_PLAN.md)
+- [`../plans/AI_ASSISTANT_INTEGRATION_PLAN.md`](../plans/AI_ASSISTANT_INTEGRATION_PLAN.md)
 - [`../integration/PLATFORM_REQUIREMENTS.md`](../integration/PLATFORM_REQUIREMENTS.md)
-- [`../plans/LLM_OPERABILITY_PLAN.md`](../plans/LLM_OPERABILITY_PLAN.md)
+- [`../plans/PRODUCT_DIRECTION_PLAN.md`](../plans/PRODUCT_DIRECTION_PLAN.md)
 
 ## Current Supported Modes
 
@@ -219,7 +219,7 @@ alias; the deployment maps that alias to the actual provider/model endpoint.
 
 That is expected on the current platform baseline. See:
 
-- [`../plans/OPENCLAW_INTEGRATION_PLAN.md`](../plans/OPENCLAW_INTEGRATION_PLAN.md)
+- [`../plans/AI_ASSISTANT_INTEGRATION_PLAN.md`](../plans/AI_ASSISTANT_INTEGRATION_PLAN.md)
 - [`../integration/PLATFORM_REQUIREMENTS.md`](../integration/PLATFORM_REQUIREMENTS.md)
 
 ## Keep This File Small

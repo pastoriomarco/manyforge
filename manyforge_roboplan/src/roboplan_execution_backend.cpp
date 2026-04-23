@@ -18,9 +18,11 @@ double clamp_progress(double progress) {
 }  // namespace
 
 RoboPlanExecutionBackend::RoboPlanExecutionBackend(
-    std::shared_ptr<roboplan::Scene> scene, core::IClock& clock,
+    std::shared_ptr<roboplan::Scene> scene, std::string group_name,
+    core::IClock& clock,
     std::shared_ptr<std::mutex> scene_mutex)
     : scene_(std::move(scene)),
+      group_name_(std::move(group_name)),
       clock_(clock),
       scene_mutex_(std::move(scene_mutex)) {
   if (!scene_mutex_) {
@@ -58,6 +60,11 @@ void RoboPlanExecutionBackend::update_scene_positions(
   for (size_t i = 0; i < joint_positions.size(); ++i) {
     q[static_cast<Eigen::Index>(i)] = joint_positions[i];
   }
+
+  if (q.size() != scene_->getCurrentJointPositions().size()) {
+    q = scene_->toFullJointPositions(group_name_, q);
+  }
+
   scene_->setJointPositions(q);
 }
 

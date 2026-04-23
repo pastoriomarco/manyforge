@@ -1,6 +1,10 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { api } from '../api/client';
-import type { ModelEndpointCatalog, ModelEndpointConfig } from '../types/api';
+import type {
+  ModelEndpointCatalog,
+  ModelEndpointConfig,
+  SceneFrameState,
+} from '../types/api';
 import { useDeploymentStore } from '../store/deploymentStore';
 import { useCycleStore } from '../store/cycleStore';
 
@@ -74,6 +78,138 @@ function ConfigTextarea({
         className="w-full mt-0.5 px-2 py-1 bg-gray-700 border border-gray-600 rounded text-xs text-gray-200 font-mono focus:border-blue-500 focus:outline-none disabled:opacity-50 disabled:cursor-not-allowed"
       />
     </label>
+  );
+}
+
+function FrameSelectInput({
+  label,
+  value,
+  options,
+  onChange,
+  disabled = false,
+}: {
+  label: string;
+  value: string;
+  options: string[];
+  onChange: (value: string) => void;
+  disabled?: boolean;
+}) {
+  const selectOptions = Array.from(new Set([value, ...options].filter(Boolean))).sort();
+
+  if (selectOptions.length === 0) {
+    return (
+      <FieldInput
+        label={label}
+        value={value}
+        onChange={onChange}
+        disabled={disabled}
+      />
+    );
+  }
+
+  return (
+    <label className="block mb-2">
+      <span className="text-xs text-gray-400">{label}</span>
+      <select
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        disabled={disabled}
+        className="w-full mt-0.5 px-2 py-1 bg-gray-700 border border-gray-600 rounded text-sm text-gray-200 focus:border-blue-500 focus:outline-none disabled:opacity-50 disabled:cursor-not-allowed"
+      >
+        <option value="">Select frame</option>
+        {selectOptions.map((frameName) => (
+          <option key={frameName} value={frameName}>
+            {frameName}
+          </option>
+        ))}
+      </select>
+    </label>
+  );
+}
+
+function StringListInput({
+  label,
+  values,
+  onChange,
+  disabled = false,
+}: {
+  label: string;
+  values: string[];
+  onChange: (values: string[]) => void;
+  disabled?: boolean;
+}) {
+  return (
+    <label className="block mb-2">
+      <span className="text-xs text-gray-400">{label}</span>
+      <input
+        type="text"
+        value={values.join(', ')}
+        onChange={(e) => {
+          onChange(
+            e.target.value
+              .split(',')
+              .map((value) => value.trim())
+              .filter(Boolean),
+          );
+        }}
+        disabled={disabled}
+        className="w-full mt-0.5 px-2 py-1 bg-gray-700 border border-gray-600 rounded text-sm text-gray-200 focus:border-blue-500 focus:outline-none disabled:opacity-50 disabled:cursor-not-allowed"
+      />
+    </label>
+  );
+}
+
+function FrameMultiSelect({
+  label,
+  options,
+  selected,
+  onChange,
+  disabled = false,
+}: {
+  label: string;
+  options: string[];
+  selected: string[];
+  onChange: (values: string[]) => void;
+  disabled?: boolean;
+}) {
+  const knownOptions = Array.from(new Set([...selected, ...options].filter(Boolean))).sort();
+
+  if (knownOptions.length === 0) {
+    return (
+      <StringListInput
+        label={label}
+        values={selected}
+        onChange={onChange}
+        disabled={disabled}
+      />
+    );
+  }
+
+  return (
+    <div className="mb-2">
+      <div className="text-xs text-gray-400">{label}</div>
+      <div className="mt-1 rounded border border-gray-700 bg-gray-900/40 p-2 space-y-1">
+        {knownOptions.map((frameName) => {
+          const checked = selected.includes(frameName);
+          return (
+            <label key={frameName} className="flex items-center gap-2 text-sm text-gray-200">
+              <input
+                type="checkbox"
+                checked={checked}
+                disabled={disabled}
+                onChange={(event) => {
+                  const next = event.target.checked
+                    ? [...selected, frameName]
+                    : selected.filter((value) => value !== frameName);
+                  onChange(Array.from(new Set(next)).sort());
+                }}
+              />
+              <span>{frameName}</span>
+            </label>
+          );
+        })}
+      </div>
+    </div>
   );
 }
 
@@ -214,6 +350,7 @@ export function DeploymentPanel() {
     useDeploymentStore();
   const { state } = useCycleStore();
   const [modelEndpointCatalog, setModelEndpointCatalog] = useState<ModelEndpointCatalog | null>(null);
+  const [sceneFrames, setSceneFrames] = useState<SceneFrameState[]>([]);
   const editLocked = state === 'running' || state === 'interrupt_handler' || state === 'direct_control';
   const runtimeApplied = signature(deployment) === signature(appliedDeployment);
   const diskSaved = signature(deployment) === signature(savedDeployment);
@@ -240,6 +377,29 @@ export function DeploymentPanel() {
       cancelled = true;
     };
   }, [deployment, deploymentModelEndpointSignature]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void api.scene.frames()
+      .then((result) => {
+        if (!cancelled) {
+          setSceneFrames(result.frames);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setSceneFrames([]);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [deployment?.sourcePath, deployment?.robotConfig?.urdfPath]);
+
+  const frameOptions = useMemo(
+    () => sceneFrames.map((frame) => frame.name).filter((frameName) => frameName !== 'universe'),
+    [sceneFrames],
+  );
 
   const setModelEndpoints = useCallback((nextModelEndpoints: Record<string, ModelEndpointConfig>) => {
     setField('modelEndpoints', nextModelEndpoints);
@@ -387,6 +547,12 @@ export function DeploymentPanel() {
           onChange={(v) => setNestedField('robotConfig.urdfPath', v)}
           disabled={editLocked}
         />
+        <StringListInput
+          label="Package Paths"
+          values={deployment.robotConfig.packagePaths}
+          onChange={(values) => setNestedField('robotConfig.packagePaths', values)}
+          disabled={editLocked}
+        />
         <FieldInput
           label="Max TCP Speed (m/s)"
           value={deployment.robotConfig.globalMaxTcpLinearSpeedMps}
@@ -397,6 +563,90 @@ export function DeploymentPanel() {
           disabled={editLocked}
         />
       </Section>
+
+      {Object.entries(deployment.grippers ?? {}).map(([gripperId, gripper]) => (
+        <Section key={gripperId} title={`Gripper: ${gripperId}`}>
+          <FieldInput
+            label="Description"
+            value={gripper.description}
+            onChange={(value) => setNestedField(`grippers.${gripperId}.description`, value)}
+            disabled={editLocked}
+          />
+          <FieldInput
+            label="Command Mode"
+            value={gripper.commandMode}
+            onChange={(value) => setNestedField(`grippers.${gripperId}.commandMode`, value)}
+            disabled={editLocked}
+          />
+          <FieldInput
+            label="Group ID"
+            value={gripper.groupId}
+            onChange={(value) => setNestedField(`grippers.${gripperId}.groupId`, value)}
+            disabled={editLocked}
+          />
+          <FieldInput
+            label="Joint Name"
+            value={gripper.jointName}
+            onChange={(value) => setNestedField(`grippers.${gripperId}.jointName`, value)}
+            disabled={editLocked}
+          />
+          <FieldInput
+            label="Open Position"
+            value={gripper.openPosition}
+            onChange={(value) => setNestedField(`grippers.${gripperId}.openPosition`, Number(value) || 0)}
+            type="number"
+            disabled={editLocked}
+          />
+          <FieldInput
+            label="Closed Position"
+            value={gripper.closedPosition}
+            onChange={(value) => setNestedField(`grippers.${gripperId}.closedPosition`, Number(value) || 0)}
+            type="number"
+            disabled={editLocked}
+          />
+          <FieldInput
+            label="Motion Time (s)"
+            value={gripper.motionTimeS}
+            onChange={(value) => setNestedField(`grippers.${gripperId}.motionTimeS`, Number(value) || 0)}
+            type="number"
+            disabled={editLocked}
+          />
+          <StringListInput
+            label="Touch Links"
+            values={gripper.touchLinks}
+            onChange={(values) => setNestedField(`grippers.${gripperId}.touchLinks`, values)}
+            disabled={editLocked}
+          />
+          <FrameSelectInput
+            label="Mount Frame"
+            value={gripper.mountFrame}
+            options={frameOptions}
+            onChange={(value) => setNestedField(`grippers.${gripperId}.mountFrame`, value)}
+            disabled={editLocked}
+          />
+          <FrameSelectInput
+            label="Attach Frame"
+            value={gripper.attachFrame}
+            options={frameOptions}
+            onChange={(value) => setNestedField(`grippers.${gripperId}.attachFrame`, value)}
+            disabled={editLocked}
+          />
+          <FrameSelectInput
+            label="TCP Frame"
+            value={gripper.tcpFrame}
+            options={frameOptions}
+            onChange={(value) => setNestedField(`grippers.${gripperId}.tcpFrame`, value)}
+            disabled={editLocked}
+          />
+          <FrameMultiSelect
+            label="Auxiliary Frames"
+            options={frameOptions}
+            selected={gripper.auxiliaryFrames}
+            onChange={(values) => setNestedField(`grippers.${gripperId}.auxiliaryFrames`, values)}
+            disabled={editLocked}
+          />
+        </Section>
+      ))}
 
       {Object.entries(deployment.adapters).map(([slot, adapter]) => (
         <Section key={slot} title={`Adapter: ${slot}`}>

@@ -1,0 +1,98 @@
+api_version: manyforge.deployment.v0
+schema_version: "0.1.0"
+name: ur10e_robotiq_pick_place_preview
+description: Preview deployment for UR10e + Robotiq 2F-140 native RoboPlan pick-and-place demo.
+
+program_profile: v0.1
+
+robot_config:
+  robot_id: ur10e
+  group_id: arm
+  urdf_path: package://manyforge_example_models/models/ur10e_robotiq_2f_140/ur10e_robotiq_2f_140.urdf
+  srdf_path: package://manyforge_example_models/models/ur10e_robotiq_2f_140/ur10e_robotiq_2f_140.srdf
+  package_paths:
+    - ..
+  global_max_tcp_linear_speed_mps: 0.25
+
+grippers:
+  primary:
+    command_mode: simulated_joint
+    group_id: gripper
+    joint_name: finger_joint
+    open_position: 0.0
+    closed_position: 0.66
+    motion_time_s: 0.8
+    touch_links:
+      - left_inner_finger
+      - right_inner_finger
+      - left_inner_finger_pad
+      - right_inner_finger_pad
+    mount_frame: tool0
+    attach_frame: grasp_frame
+    tcp_frame: grasp_frame
+    auxiliary_frames:
+      - gripper_frame
+    description: Native simulated Robotiq 2F-140 finger actuation.
+
+adapters:
+  planning:
+    adapter_id: planning.roboplan
+    adapter_version: "0.1.0"
+    supported_profiles: ["v0.1"]
+    capability_keys:
+      - planning.motion.joint_goal
+      - planning.motion.pose_goal
+      - planning.trajectory.time_parameterized
+    config:
+      rng_seed: 12345
+  context:
+    adapter_id: planning.roboplan_context
+    adapter_version: "0.1.0"
+    supported_profiles: ["v0.1"]
+    capability_keys:
+      - context.state.current
+      - context.validation.trajectory
+      - context.collision.check
+      - context.kinematics.fk
+      - context.limits.joint
+      - context.pose.resolve_reference
+      - context.scene.object_query
+      - scene.shape.box
+      - scene.shape.sphere
+      - scene.edit.add
+      - scene.edit.remove
+      - scene.edit.update_pose
+      - scene.edit.attach_detach
+    config: {}
+  execution:
+    adapter_id: execution.roboplan_native
+    adapter_version: "0.1.0"
+    supported_profiles: ["v0.1"]
+    capability_keys:
+      - execution.trajectory.execute
+      - execution.gripper.command
+      - execution.feedback.phase_events
+      - execution.feedback.state_snapshots
+      - execution.stop.soft
+      - execution.pause
+      - execution.resume
+      - execution.reset
+    config:
+      mode: simulated
+      execution_tick_hz: 100
+      initial_joint_positions_rad: [0.0, -1.57, 1.57, -1.57, -1.57, 0.0]
+
+orchestrator:
+  engine: py_trees
+  config:
+    collision_monitor_period_ms: 10.0
+
+launch:
+  ros_wrapper_nodes: []
+  runner:
+    module: manyforge_behavior.runner
+    args: []
+  ui_backend:
+    module: manyforge_composer
+    args: []
+    enabled: true

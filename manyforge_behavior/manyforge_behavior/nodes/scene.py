@@ -190,6 +190,7 @@ class AttachObjectToLink(_SceneCallbackMixin, py_trees.behaviour.Behaviour):
         self.blackboard = self.attach_blackboard_client()
         self.blackboard.register_key(key="kernel", access=py_trees.common.Access.READ)
         self.blackboard.register_key(key="scene_objects", access=py_trees.common.Access.READ)
+        self.blackboard.register_key(key="gripper_configs", access=py_trees.common.Access.READ)
         self._register_scene_callback_key()
 
     def update(self) -> py_trees.common.Status:
@@ -201,12 +202,45 @@ class AttachObjectToLink(_SceneCallbackMixin, py_trees.behaviour.Behaviour):
             link_frame = resolve_blackboard_value(
                 self.blackboard, self._params.get("link_frame", "tool0")
             )
+            explicit_touch_links = resolve_blackboard_value(
+                self.blackboard, self._params.get("touch_links")
+            )
+            gripper_id = resolve_blackboard_value(
+                self.blackboard, self._params.get("gripper_id", "")
+            )
         except (AttributeError, KeyError) as exc:
             self.feedback_message = str(exc)
             return py_trees.common.Status.FAILURE
 
         registry: dict = getattr(self.blackboard, "scene_objects", {})
         obj_info = registry.get(object_id, {})
+        touch_links = None
+        if explicit_touch_links is not None:
+            if not isinstance(explicit_touch_links, list) or any(
+                not isinstance(link_name, str) or not link_name
+                for link_name in explicit_touch_links
+            ):
+                self.feedback_message = (
+                    "attach_object_to_link.touch_links must resolve to a list of non-empty strings"
+                )
+                return py_trees.common.Status.FAILURE
+            touch_links = list(explicit_touch_links)
+        elif isinstance(gripper_id, str) and gripper_id:
+            configs = getattr(self.blackboard, "gripper_configs", {})
+            config = configs.get(gripper_id)
+            if not isinstance(config, dict):
+                self.feedback_message = f"Unknown gripper_id '{gripper_id}'"
+                return py_trees.common.Status.FAILURE
+            config_touch_links = config.get("touch_links", [])
+            if not isinstance(config_touch_links, list) or any(
+                not isinstance(link_name, str) or not link_name
+                for link_name in config_touch_links
+            ):
+                self.feedback_message = (
+                    f"gripper '{gripper_id}' has invalid touch_links configuration"
+                )
+                return py_trees.common.Status.FAILURE
+            touch_links = list(config_touch_links)
 
         request = SceneEditRequest(
             operation="attach",
@@ -215,6 +249,7 @@ class AttachObjectToLink(_SceneCallbackMixin, py_trees.behaviour.Behaviour):
             box_dimensions_m=obj_info.get("box_dimensions_m"),
             sphere_radius_m=obj_info.get("sphere_radius_m"),
             frame_id=link_frame,
+            touch_links=touch_links,
         )
         result = kernel.scene_edit(request)
         if not result.success:

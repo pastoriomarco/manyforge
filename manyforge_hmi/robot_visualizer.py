@@ -1,12 +1,12 @@
 """RobotVisualizer - URDF rendering and joint state updates."""
 
-import os
-
 import viser
 import yourdfpy
 from viser.extras import ViserUrdf
 from pathlib import Path
 from typing import Optional
+
+from manyforge_behavior.model_paths import resolve_package_uri
 
 
 def _make_package_handler(package_dirs: list[str]):
@@ -14,11 +14,9 @@ def _make_package_handler(package_dirs: list[str]):
     def handler(fname: str) -> str:
         if not fname.startswith("package://"):
             return fname
-        remainder = fname[len("package://"):]  # e.g. "roboplan_example_models/models/..."
-        for d in package_dirs:
-            resolved = os.path.join(d, remainder)
-            if os.path.exists(resolved):
-                return resolved
+        resolved = resolve_package_uri(fname, package_dirs)
+        if resolved is not None:
+            return resolved
         return fname  # fall through unchanged
     return handler
 
@@ -47,7 +45,26 @@ class RobotVisualizer:
         """
         self._server = server
         self._urdf_path = Path(urdf_path)
-        self._joint_names = joint_names or []
+        self._joint_names = list(joint_names or [])
+
+        if not self._joint_names:
+            try:
+                if package_dirs:
+                    metadata_model = yourdfpy.URDF.load(
+                        str(self._urdf_path),
+                        filename_handler=_make_package_handler(package_dirs),
+                        load_meshes=False,
+                    )
+                else:
+                    metadata_model = yourdfpy.URDF.load(
+                        str(self._urdf_path),
+                        load_meshes=False,
+                    )
+                self._joint_names = list(
+                    getattr(metadata_model, "actuated_joint_names", []) or []
+                )
+            except Exception:
+                self._joint_names = []
 
         # Load URDF — resolve package:// URIs if package_dirs provided
         if package_dirs:

@@ -18,6 +18,7 @@ _BLACKBOARD_ROLES = {
     "key_writer",
     "key_reader",
     "field_reader",
+    "literal_or_key_reader",
 }
 _BLACKBOARD_VALUE_TYPES = {
     "string",
@@ -34,6 +35,11 @@ _INTERRUPT_SCOPES = {
     "active_subtree",
     "cycle",
     "kernel_motion",
+}
+_STABILITY_LEVELS = {
+    "stable",
+    "experimental",
+    "deprecated",
 }
 
 
@@ -62,6 +68,7 @@ class CatalogEntry:
     kind: str  # leaf, decorator, composite, macro
     children_min: int
     children_max: int  # -1 means unbounded
+    stability: str = "stable"
     parameters: list[CatalogParameter] = field(default_factory=list)
     bb_reader_params: list[str] = field(default_factory=list)
     bb_writer_params: list[str] = field(default_factory=list)
@@ -163,6 +170,7 @@ class NodeCatalog:
             name=raw.get("name", entry_id),
             category=raw.get("category", ""),
             description=raw.get("description", ""),
+            stability=raw.get("stability", "stable"),
             kind=raw.get("kind", "leaf"),
             children_min=children.get("min", 0),
             children_max=max_children,
@@ -195,6 +203,11 @@ class NodeCatalog:
 
     def _validate_entry(self, entry: CatalogEntry) -> None:
         # Kind/children consistency
+        if entry.stability not in _STABILITY_LEVELS:
+            allowed = ", ".join(sorted(_STABILITY_LEVELS))
+            raise CatalogValidationError(
+                f"Entry '{entry.id}': stability must be one of: {allowed}"
+            )
         if entry.kind == "leaf" and entry.children_max != 0:
             raise CatalogValidationError(
                 f"Entry '{entry.id}': leaf must have children.max=0"

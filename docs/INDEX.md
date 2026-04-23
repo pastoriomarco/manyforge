@@ -36,35 +36,34 @@ map.
   - Engineering reference for contributors and sandboxed coding agents.
   - Core C++ conventions and design patterns carried forward from ManyMove.
 
-- [`plans/LLM_OPERABILITY_PLAN.md`](plans/LLM_OPERABILITY_PLAN.md)
-  - Main ManyForge-side plan for LLM/runtime behavior.
-  - Current baseline, settled decisions, open work, and exit criteria.
+- [`plans/PRODUCT_DIRECTION_PLAN.md`](plans/PRODUCT_DIRECTION_PLAN.md)
+  - Top-level roadmap for the next phase of ManyForge.
+  - Product thesis, priority bands, public-preview target, and execution order.
 
-- [`plans/OPENCLAW_INTEGRATION_PLAN.md`](plans/OPENCLAW_INTEGRATION_PLAN.md)
-  - Companion integration plan for NemoClaw/OpenClaw-specific work.
-  - Routing boundaries, integration modes, and remaining integration work.
+- [`plans/INDUSTRIAL_EXECUTION_READINESS_PLAN.md`](plans/INDUSTRIAL_EXECUTION_READINESS_PLAN.md)
+  - Main execution/readiness plan for industrial credibility.
+  - External integration, interrupt proof, verification layers, GUI qualification,
+    and evidence-backed readiness criteria.
+
+- [`plans/AI_ASSISTANT_INTEGRATION_PLAN.md`](plans/AI_ASSISTANT_INTEGRATION_PLAN.md)
+  - Live plan for bounded model use, Composer assistant work, and OpenClaw/NemoClaw integration.
+  - Defines what stays in ManyForge, what belongs to supervisory layers, and what is optional or deferred.
+
+- [`plans/PREVIEW_AND_ADOPTION_PLAN.md`](plans/PREVIEW_AND_ADOPTION_PLAN.md)
+  - Short-term milestone plan for the first useful, presentable ManyForge story.
+  - Coordinates simulation-backed adoption and assistant-backed authoring without conflicting with the longer-term roadmap.
+
+- [`plans/ISAAC_SIM_PREVIEW_PLAN.md`](plans/ISAAC_SIM_PREVIEW_PLAN.md)
+  - Tactical simulator-backed sub-plan for the first preview implementation.
+  - Keeps the simulator control path open between direct, ROS-wrapped, and hybrid approaches.
 
 - [`plans/INTERRUPT_MODEL_PLAN.md`](plans/INTERRUPT_MODEL_PLAN.md)
-  - Execution-model plan for industrial runtime interrupts.
-  - Interrupt sources, handler chains, required spec changes, and runtime impact.
-
-- [`plans/PRODUCT_DIRECTION_PLAN.md`](plans/PRODUCT_DIRECTION_PLAN.md)
-  - Product and engineering direction for the next phase of ManyForge.
-  - Industrial positioning, 5-month priorities, ROS/PLC/perception workstreams,
-    and `ros2_medkit` compatibility goals.
-
-- [`plans/INDUSTRIAL_READINESS_GAP.md`](plans/INDUSTRIAL_READINESS_GAP.md)
-  - Current gap assessment between the present baseline and industrial readiness.
-  - Tracks what is still missing in runtime integration, qualification, GUI testing, and compliance posture.
-
-- [`plans/VERIFICATION_PLAN.md`](plans/VERIFICATION_PLAN.md)
-  - Verification and qualification strategy for ManyForge.
-  - Defines scenario-based production-run testing, visual verification layers,
-  CI tiers, and retained evidence requirements.
+  - Technical reference for the interrupt execution model.
+  - Interrupt sources, required semantics, current baseline, and remaining proof work.
 
 - [`../verification/scenarios/basic_pick_and_place_complete.scenario.yaml`](../verification/scenarios/basic_pick_and_place_complete.scenario.yaml)
   - Baseline end-to-end pick-and-place qualification scenario.
-  - Smallest initial scenario artifact for the new verification harness.
+  - Smallest initial scenario artifact for the qualification harness.
 
 - [`../verification/scenarios/interrupt_pick_and_place_pause_resume.scenario.yaml`](../verification/scenarios/interrupt_pick_and_place_pause_resume.scenario.yaml)
   - Interrupt hold/resume qualification scenario for the interrupt pick-and-place flow.
@@ -72,7 +71,7 @@ map.
 
 - [`../verification/matrices/core_qualification.yaml`](../verification/matrices/core_qualification.yaml)
   - Initial deterministic qualification batch.
-  - Groups the core end-to-end scenarios used by the first industrial qualification tier.
+  - Groups the core end-to-end scenarios used by the first qualification tier.
 
 - [`../verification/matrices/native_live_evaluation.yaml`](../verification/matrices/native_live_evaluation.yaml)
   - Native planner/executor qualification batch.
@@ -81,16 +80,6 @@ map.
 - [`../verification/matrices/soak_qualification.yaml`](../verification/matrices/soak_qualification.yaml)
   - Repeated deterministic qualification batch.
   - Used for liveness and deadlock detection across repeated runs.
-
-- [`plans/REVIEW_CHECKPOINT_2026-04-17.md`](plans/REVIEW_CHECKPOINT_2026-04-17.md)
-  - Review checkpoint for the current industrial runtime milestone.
-  - Records what actually landed, what was deferred intentionally, and the
-  container-based validation status before the next workstream starts.
-
-- [`plans/REVIEW_CHECKPOINT_2026-04-20.md`](plans/REVIEW_CHECKPOINT_2026-04-20.md)
-  - Review checkpoint for the qualification-system and interrupt-runtime-completion milestone.
-  - Records the real post-`5e5af09` delta, the remaining external proof work,
-    and the container-backed validation completed before the next adapter phase.
 
 - [`operations/STACK_SETUP.md`](operations/STACK_SETUP.md)
   - Compact operational runbook for local bring-up and current stack modes.

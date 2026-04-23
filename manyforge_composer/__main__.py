@@ -11,19 +11,19 @@ import uvicorn
 
 from manyforge_behavior.deployment import Deployment
 from manyforge_behavior.kernel_client import MockKernelClient
+from manyforge_behavior.model_paths import (
+    ResolvedRobotModel,
+    default_package_paths,
+    normalize_package_paths,
+    resolve_resource_path,
+    resolve_robot_model,
+)
 from manyforge_composer.backend.logging_config import setup_logging
 from manyforge_composer.backend.state import ComposerState
 from manyforge_composer.backend.app import create_app
 from manyforge_composer.backend.security import SecurityConfig
 
 logger = logging.getLogger(__name__)
-
-# UR5 joint names
-JOINT_NAMES = [
-    "shoulder_pan_joint", "shoulder_lift_joint", "elbow_joint",
-    "wrist_1_joint", "wrist_2_joint", "wrist_3_joint",
-]
-
 
 def _get_simulator_initial_joint_positions(state: ComposerState) -> list[float] | None:
     """Return explicit simulator-only startup joint positions from deployment config."""
@@ -48,6 +48,39 @@ def _default_public_api_base_url(host: str, port: int) -> str:
         return override.rstrip("/")
     resolved_host = "localhost" if host in {"0.0.0.0", "::"} else host
     return f"http://{resolved_host}:{port}"
+
+
+def _resolved_robot_model_from_deployment(
+    deployment: Deployment | None,
+) -> ResolvedRobotModel | None:
+    if deployment is None or deployment.robot_config is None:
+        return None
+    if not deployment.robot_config.srdf_path:
+        return None
+    extra_package_paths = (
+        []
+        if deployment.robot_config.package_paths
+        else default_package_paths()
+    )
+    return resolve_robot_model(
+        urdf_path=deployment.robot_config.urdf_path,
+        srdf_path=deployment.robot_config.srdf_path,
+        package_paths=deployment.robot_config.package_paths,
+        deployment_path=deployment.source_path,
+        extra_package_paths=extra_package_paths,
+    )
+
+
+def _resolved_hmi_robot_paths(
+    deployment: Deployment | None,
+    *,
+    default_urdf_path: str | None,
+    default_package_dirs: list[str],
+) -> tuple[str | None, list[str]]:
+    resolved_model = _resolved_robot_model_from_deployment(deployment)
+    if resolved_model is not None:
+        return resolved_model.urdf_path, resolved_model.package_paths
+    return default_urdf_path, default_package_dirs
 
 
 def build_program_loaded_callback(
@@ -79,6 +112,12 @@ def build_program_loaded_callback(
     def on_program_loaded(st: ComposerState):
         nonlocal _hmi_server
 
+        runtime_urdf_path, runtime_package_dirs = _resolved_hmi_robot_paths(
+            st.deployment,
+            default_urdf_path=urdf_path,
+            default_package_dirs=package_dirs,
+        )
+
         # Stop previous HMI if reloading a program
         if _hmi_server is not None:
             _hmi_server.stop()
@@ -88,9 +127,9 @@ def build_program_loaded_callback(
             cycle_manager=st.cycle_manager,
             host=host,
             port=hmi_port,
-            urdf_path=urdf_path,
-            joint_names=JOINT_NAMES,
-            package_dirs=package_dirs or None,
+            urdf_path=runtime_urdf_path,
+            joint_names=None,
+            package_dirs=runtime_package_dirs or None,
         )
         st.hmi_server = _hmi_server
         st.hmi_public_port = hmi_port
@@ -151,6 +190,7 @@ def build_program_loaded_callback(
         _sync_runtime_views(force_robot=True)
 
         _hmi_server.start()
+        _sync_runtime_views(force_robot=True)
         logger.info("Viser HMI started on port %d", hmi_port)
 
     return on_program_loaded
@@ -210,9 +250,20 @@ def _make_kernel(
             kernel_config = {
                 "collision_monitor_period_ns": collision_monitor_period_ns,
             }
-        bundle = manyforge_roboplan_py.create_native_kernel(
-            model_name, group_name, kernel_config
-        )
+        resolved_model = _resolved_robot_model_from_deployment(deployment)
+        if resolved_model is not None:
+            bundle = manyforge_roboplan_py.create_native_kernel_from_paths(
+                resolved_model.model_name,
+                group_name,
+                resolved_model.urdf_path,
+                resolved_model.srdf_path,
+                resolved_model.package_paths,
+                kernel_config,
+            )
+        else:
+            bundle = manyforge_roboplan_py.create_native_kernel(
+                model_name, group_name, kernel_config
+            )
         kernel = NativeKernelClient(bundle)
         if collision_monitor_period_ns is not None:
             logger.info(
@@ -316,7 +367,10 @@ def main():
 
     # Auto-resolve URDF and package dirs from roboplan if not specified via CLI
     urdf_path = args.urdf
-    package_dirs = args.package_dir or []
+    package_dirs = normalize_package_paths(
+        args.package_dir or [],
+        base_dir=Path.cwd(),
+    )
     if not urdf_path or not package_dirs:
         roboplan_urdf, roboplan_share = _resolve_roboplan_paths()
         if not urdf_path and roboplan_urdf:
@@ -325,6 +379,15 @@ def main():
         if not package_dirs and roboplan_share:
             package_dirs = [roboplan_share]
             logger.info("Package dir auto-resolved from roboplan: %s", roboplan_share)
+    if urdf_path and package_dirs:
+        try:
+            urdf_path = resolve_resource_path(
+                urdf_path,
+                base_dir=Path.cwd(),
+                package_paths=package_dirs,
+            )
+        except FileNotFoundError:
+            pass
 
     state = ComposerState(
         catalog_path=args.catalog_path,

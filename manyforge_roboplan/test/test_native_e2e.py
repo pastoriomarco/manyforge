@@ -5,10 +5,12 @@ error recovery, caching, and benchmarks.
 """
 
 import time
+from pathlib import Path
 import pytest
 
 from manyforge_behavior.kernel_client import (
-    ExecuteRequest, ExecutionState, SceneEditRequest,
+    ExecuteRequest, ExecutionState, GripperCommandRequest,
+    GripperCommandState, SceneEditRequest,
 )
 
 try:
@@ -27,6 +29,17 @@ UR5_JOINTS = [
 GOAL_A = [0.1, -0.5, 0.5, -0.5, -0.5, 0.0]
 GOAL_B = [0.3, -0.8, 0.8, -0.3, -0.8, 0.1]
 DEMO_REST = [0.0, -1.57, 1.57, -1.57, -1.57, 0.0]
+UR10E_ARM_JOINTS = [
+    "shoulder_pan_joint",
+    "shoulder_lift_joint",
+    "elbow_joint",
+    "wrist_1_joint",
+    "wrist_2_joint",
+    "wrist_3_joint",
+]
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_UR10E_URDF = _REPO_ROOT / "manyforge_example_models" / "models" / "ur10e_robotiq_2f_140" / "ur10e_robotiq_2f_140.urdf"
+_UR10E_SRDF = _REPO_ROOT / "manyforge_example_models" / "models" / "ur10e_robotiq_2f_140" / "ur10e_robotiq_2f_140.srdf"
 
 
 # ============================================================================
@@ -38,6 +51,20 @@ def native_kernel():
     if not HAS_NATIVE:
         pytest.skip("manyforge_roboplan_py not available")
     bundle = manyforge_roboplan_py.create_native_kernel("ur5_gripper", "arm")
+    return NativeKernelClient(bundle)
+
+
+@pytest.fixture
+def native_kernel_ur10e_robotiq():
+    if not HAS_NATIVE:
+        pytest.skip("manyforge_roboplan_py not available")
+    bundle = manyforge_roboplan_py.create_native_kernel_from_paths(
+        "ur10e_robotiq_2f_140",
+        "arm",
+        str(_UR10E_URDF),
+        str(_UR10E_SRDF),
+        [str(_REPO_ROOT)],
+    )
     return NativeKernelClient(bundle)
 
 
@@ -68,6 +95,31 @@ def make_request(move_id, goal, cache_mode="default"):
         joint_goal_positions_rad=goal,
         velocity_scale=1.0,
         acceleration_scale=1.0,
+        planning_timeout_s=10.0,
+        execution_timeout_s=30.0,
+        cache_mode=cache_mode,
+    )
+
+
+def make_request_for_joints(
+    move_id,
+    joint_names,
+    goal,
+    cache_mode="default",
+    max_tcp_linear_speed_mps=None,
+):
+    return ExecuteRequest(
+        robot_id="robot1",
+        group_id="arm",
+        move_id=move_id,
+        base_frame="base_link",
+        tcp_frame="tool0",
+        motion_type="joint_goal",
+        joint_goal_names=joint_names,
+        joint_goal_positions_rad=goal,
+        velocity_scale=1.0,
+        acceleration_scale=1.0,
+        max_tcp_linear_speed_mps=max_tcp_linear_speed_mps,
         planning_timeout_s=10.0,
         execution_timeout_s=30.0,
         cache_mode=cache_mode,
@@ -251,6 +303,63 @@ class TestNativeKernelBasics:
         snapshot = native_kernel.get_execution_snapshot()
         assert snapshot.state == ExecutionState.IDLE
         assert snapshot.joint_positions_rad == pytest.approx(DEMO_REST)
+
+    def test_custom_ur10e_bundle_reports_arm_group_state(self, native_kernel_ur10e_robotiq):
+        assert native_kernel_ur10e_robotiq.get_joint_names() == UR10E_ARM_JOINTS
+
+        native_kernel_ur10e_robotiq._bundle.set_joint_positions(DEMO_REST)
+        snapshot = native_kernel_ur10e_robotiq.get_execution_snapshot()
+
+        assert snapshot.state == ExecutionState.IDLE
+        assert snapshot.joint_positions_rad == pytest.approx(DEMO_REST)
+
+    def test_custom_ur10e_bundle_reports_gripper_group_state(self, native_kernel_ur10e_robotiq):
+        joint_names = native_kernel_ur10e_robotiq._bundle.get_group_joint_names("gripper")
+        positions = native_kernel_ur10e_robotiq._bundle.get_group_joint_positions("gripper")
+
+        assert joint_names == ["finger_joint"]
+        assert positions == pytest.approx([0.0])
+
+    def test_custom_ur10e_bundle_commands_gripper(self, native_kernel_ur10e_robotiq):
+        result = native_kernel_ur10e_robotiq.command_gripper(
+            GripperCommandRequest(
+                gripper_id="primary",
+                group_id="gripper",
+                joint_name="finger_joint",
+                target_position=0.7,
+                duration_s=0.02,
+            )
+        )
+        assert result.accepted is True, result.error
+
+        deadline = time.monotonic() + 1.0
+        status = native_kernel_ur10e_robotiq.get_gripper_status("primary")
+        while status.state == GripperCommandState.EXECUTING and time.monotonic() < deadline:
+            time.sleep(0.01)
+            status = native_kernel_ur10e_robotiq.get_gripper_status("primary")
+
+        assert status.state == GripperCommandState.COMPLETED
+        assert status.current_position == pytest.approx(0.7, abs=1e-3)
+        assert native_kernel_ur10e_robotiq._bundle.get_group_joint_positions("gripper") == pytest.approx([0.7], abs=1e-3)
+
+    def test_custom_ur10e_bundle_executes_speed_limited_joint_goal(
+        self, native_kernel_ur10e_robotiq
+    ):
+        native_kernel_ur10e_robotiq._bundle.set_joint_positions(DEMO_REST)
+
+        result = native_kernel_ur10e_robotiq.execute(
+            make_request_for_joints(
+                "ur10e_speed_limited",
+                UR10E_ARM_JOINTS,
+                GOAL_A,
+                cache_mode="disable",
+                max_tcp_linear_speed_mps=0.25,
+            )
+        )
+
+        assert result.ok is True, result.error
+        terminal = wait_for_terminal(native_kernel_ur10e_robotiq)
+        assert terminal.state == ExecutionState.COMPLETED
 
     def test_reset_to_idle(self, native_kernel):
         native_kernel.execute(make_request("native_reset", GOAL_A))

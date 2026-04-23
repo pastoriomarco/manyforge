@@ -7,6 +7,7 @@ import os
 import sys
 import tempfile
 from pathlib import Path
+from types import ModuleType
 from unittest.mock import patch
 
 import pytest
@@ -222,6 +223,92 @@ class TestLauncherKernelCreation:
 
         # Should return MockKernelClient (fallback)
         assert isinstance(kernel, MockKernelClient)
+
+    def test_create_kernel_uses_explicit_bundle_paths_for_custom_model(self):
+        data = _minimal_deployment(
+            robot_config={
+                "robot_id": "ur5",
+                "group_id": "arm",
+                "urdf_path": "robots/custom.urdf",
+                "srdf_path": "robots/custom.srdf",
+                "package_paths": ["./assets", "../shared_assets"],
+                "global_max_tcp_linear_speed_mps": 0.5,
+            },
+            adapters={
+                "planning": {
+                    "adapter_id": "planning.roboplan",
+                    "adapter_version": "0.1.0",
+                    "config": {},
+                },
+                "context": {
+                    "adapter_id": "context.test",
+                    "adapter_version": "0.1.0",
+                    "config": {},
+                },
+                "execution": {
+                    "adapter_id": "execution.test",
+                    "adapter_version": "0.1.0",
+                    "config": {},
+                },
+            },
+        )
+        deploy_path = _write_yaml(data)
+
+        recorded: dict[str, object] = {}
+        fake_bundle = object()
+
+        fake_roboplan = ModuleType("manyforge_roboplan_py")
+
+        def fake_create_native_kernel_from_paths(
+            model_name,
+            group_name,
+            urdf_path,
+            srdf_path,
+            package_paths,
+            config,
+        ):
+            recorded["model_name"] = model_name
+            recorded["group_name"] = group_name
+            recorded["urdf_path"] = urdf_path
+            recorded["srdf_path"] = srdf_path
+            recorded["package_paths"] = package_paths
+            recorded["config"] = config
+            return fake_bundle
+
+        fake_roboplan.create_native_kernel_from_paths = fake_create_native_kernel_from_paths
+
+        fake_client_module = ModuleType("native_kernel_client")
+
+        class FakeNativeKernelClient:
+            def __init__(self, bundle):
+                self.bundle = bundle
+
+        fake_client_module.NativeKernelClient = FakeNativeKernelClient
+
+        try:
+            deployment = Deployment(deploy_path)
+            with patch.dict(
+                sys.modules,
+                {
+                    "manyforge_roboplan_py": fake_roboplan,
+                    "native_kernel_client": fake_client_module,
+                },
+            ), patch("scripts.launch.default_package_paths", return_value=["/usr/local/share"]):
+                kernel = create_kernel(deployment)
+
+            assert isinstance(kernel, FakeNativeKernelClient)
+            assert kernel.bundle is fake_bundle
+            assert recorded["model_name"] == "custom"
+            assert recorded["group_name"] == "arm"
+            assert recorded["urdf_path"] == str(Path(deploy_path).parent / "robots" / "custom.urdf")
+            assert recorded["srdf_path"] == str(Path(deploy_path).parent / "robots" / "custom.srdf")
+            assert recorded["package_paths"] == [
+                str((Path(deploy_path).parent / "assets").resolve()),
+                str((Path(deploy_path).parent / "../shared_assets").resolve()),
+            ]
+            assert recorded["config"] == {}
+        finally:
+            os.unlink(deploy_path)
 
 
 class TestLauncherValidation:

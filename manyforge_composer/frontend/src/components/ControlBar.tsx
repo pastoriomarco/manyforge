@@ -33,6 +33,9 @@ export function ControlBar() {
     programParameters,
     appliedProgramParameters,
     savedProgramParameters,
+    sceneResources,
+    appliedSceneResources,
+    savedSceneResources,
     blackboardNamespaces,
     appliedBlackboardNamespaces,
     savedBlackboardNamespaces,
@@ -73,6 +76,8 @@ export function ControlBar() {
   const draftTree = flowToTree();
   const programApplied = signature(draftTree) === signature(appliedTree);
   const programSaved = signature(draftTree) === signature(savedTree);
+  const sceneApplied = signature(sceneResources) === signature(appliedSceneResources);
+  const sceneSaved = signature(sceneResources) === signature(savedSceneResources);
   const programParametersApplied =
     signature(programParameters) === signature(appliedProgramParameters);
   const programParametersSaved =
@@ -87,6 +92,7 @@ export function ControlBar() {
     signature(blackboardKeys) === signature(savedBlackboardKeys);
   const programAppliedMatchesSaved =
     signature(appliedTree) === signature(savedTree)
+    && signature(appliedSceneResources) === signature(savedSceneResources)
     && signature(appliedProgramParameters) === signature(savedProgramParameters)
     && signature(appliedBlackboardNamespaces) === signature(savedBlackboardNamespaces)
     && signature(appliedBlackboardKeys) === signature(savedBlackboardKeys);
@@ -95,18 +101,31 @@ export function ControlBar() {
   const deploymentAppliedMatchesSaved = signature(appliedDeployment) === signature(savedDeployment);
   const hasUnappliedChanges =
     !programApplied
+    || !sceneApplied
     || !programParametersApplied
     || !blackboardNamespacesApplied
     || !blackboardKeysApplied
     || !deploymentApplied;
   const hasUnsavedChanges =
     !programSaved
+    || !sceneSaved
     || !programParametersSaved
     || !blackboardNamespacesSaved
     || !blackboardKeysSaved
     || !deploymentSaved;
   const hasAppliedUnsavedChanges = !programAppliedMatchesSaved || !deploymentAppliedMatchesSaved;
   const activeError = actionError || error || programError || deploymentError;
+
+  const summarizeValidationErrors = (errors: Array<{ path: string; message: string }>): string => {
+    const summary = errors
+      .slice(0, 3)
+      .map((issue) => `${issue.path}: ${issue.message}`)
+      .join(' | ');
+    if (errors.length <= 3) {
+      return summary;
+    }
+    return `${summary} | …and ${errors.length - 3} more`;
+  };
 
   const modifiedBadge = hasUnappliedChanges
     ? { label: 'MODIFIED', color: 'bg-orange-600' }
@@ -126,6 +145,7 @@ export function ControlBar() {
     const hasRuntimeOverrides = !!runtimeOverrideStatus && (runtimeOverrideStatus.hasActive || runtimeOverrideStatus.hasStaged);
     const payload: {
       tree?: TreeNode;
+      scene?: typeof sceneResources;
       deployment?: FullDeployment;
       programParameters?: typeof programParameters;
       blackboard?: { namespaces: typeof blackboardNamespaces; keys: typeof blackboardKeys };
@@ -139,6 +159,9 @@ export function ControlBar() {
     } else if (!programApplied) {
       throw new Error('Draft tree is empty or invalid');
     }
+    if (!sceneApplied) {
+      payload.scene = sceneResources;
+    }
     if (!deploymentApplied && deployment) {
       payload.deployment = deployment;
     }
@@ -151,19 +174,29 @@ export function ControlBar() {
         keys: blackboardKeys,
       };
     }
-    if (!payload.tree && !payload.deployment && !payload.programParameters && !payload.blackboard) {
+    if (!payload.tree && !payload.scene && !payload.deployment && !payload.programParameters && !payload.blackboard) {
       return;
+    }
+
+    if (payload.tree || payload.programParameters || payload.blackboard) {
+      const validation = await api.program.validate(
+        draftTree!,
+        programParameters,
+        {
+          namespaces: blackboardNamespaces,
+          keys: blackboardKeys,
+        },
+      );
+      if (!validation.valid) {
+        throw new Error(summarizeValidationErrors(validation.errors));
+      }
     }
 
     await api.session.apply({
       ...payload,
       forceDiscardOverrides: hasRuntimeOverrides,
     });
-    if (payload.tree) {
-      setAppliedToDraft();
-    } else if (payload.programParameters) {
-      setAppliedToDraft();
-    } else if (payload.blackboard) {
+    if (payload.tree || payload.scene || payload.programParameters || payload.blackboard) {
       setAppliedToDraft();
     }
     if (payload.deployment) {
@@ -174,6 +207,8 @@ export function ControlBar() {
     deploymentApplied,
     draftTree,
     programApplied,
+    sceneApplied,
+    sceneResources,
     programParameters,
     programParametersApplied,
     blackboardNamespaces,
@@ -184,11 +219,18 @@ export function ControlBar() {
     setAppliedDeploymentToDraft,
     setAppliedToDraft,
     runtimeOverrideStatus,
+    summarizeValidationErrors,
   ]);
 
   const saveDrafts = useCallback(async () => {
     const operations: Promise<unknown>[] = [];
-    if (!programSaved && programInfo?.sourcePath) {
+    const programArtifactSaved =
+      programSaved
+      && sceneSaved
+      && programParametersSaved
+      && blackboardNamespacesSaved
+      && blackboardKeysSaved;
+    if (!programArtifactSaved && programInfo?.sourcePath) {
       operations.push(saveProgram(programInfo.sourcePath));
     }
     if (!deploymentSaved && deployment && deploymentSourcePath) {
@@ -202,6 +244,10 @@ export function ControlBar() {
     deployment,
     deploymentSaved,
     deploymentSourcePath,
+    sceneSaved,
+    programParametersSaved,
+    blackboardNamespacesSaved,
+    blackboardKeysSaved,
     programInfo?.sourcePath,
     programSaved,
     saveDeployment,
@@ -399,6 +445,7 @@ export function ControlBar() {
     }
     const payload: {
       tree?: TreeNode;
+      scene?: typeof sceneResources;
       deployment?: FullDeployment;
       programParameters?: typeof programParameters;
       blackboard?: {
@@ -411,6 +458,9 @@ export function ControlBar() {
     };
     if (!programAppliedMatchesSaved && savedTree) {
       payload.tree = savedTree;
+    }
+    if (signature(appliedSceneResources) !== signature(savedSceneResources)) {
+      payload.scene = savedSceneResources;
     }
     if (signature(appliedProgramParameters) !== signature(savedProgramParameters)) {
       payload.programParameters = savedProgramParameters;
@@ -427,7 +477,7 @@ export function ControlBar() {
     if (!deploymentAppliedMatchesSaved && savedDeployment) {
       payload.deployment = savedDeployment;
     }
-    if (!payload.tree && !payload.deployment && !payload.programParameters && !payload.blackboard) {
+    if (!payload.tree && !payload.scene && !payload.deployment && !payload.programParameters && !payload.blackboard) {
       return;
     }
     try {
@@ -438,6 +488,7 @@ export function ControlBar() {
         payload.tree ? fetchTree() : Promise.resolve(true),
         payload.deployment ? fetchDeployment() : Promise.resolve(true),
         payload.tree || payload.programParameters || payload.blackboard
+          || payload.scene
           ? fetchProgramInfo()
           : Promise.resolve(true),
       ]);
@@ -453,11 +504,13 @@ export function ControlBar() {
     fetchTree,
     hasAppliedUnsavedChanges,
     appliedProgramParameters,
+    appliedSceneResources,
     appliedBlackboardKeys,
     appliedBlackboardNamespaces,
     programAppliedMatchesSaved,
     runtimeOverrideStatus,
     savedDeployment,
+    savedSceneResources,
     savedBlackboardKeys,
     savedBlackboardNamespaces,
     savedProgramParameters,
@@ -468,7 +521,14 @@ export function ControlBar() {
   const canSaveAs = (!editLocked && !!programInfo) || (!editLocked && !!deployment);
 
   return (
-      <div className="flex h-16 items-center gap-4 border-t border-gray-700 bg-gray-800 px-4">
+      <div className="border-t border-gray-700 bg-gray-800 px-4 py-2">
+        {activeError && (
+          <div className="mb-2 rounded border border-red-700 bg-red-950/60 px-3 py-2 text-sm text-red-200">
+            <div className="font-semibold text-red-100">Session change failed</div>
+            <div className="break-words">{activeError}</div>
+          </div>
+        )}
+        <div className="flex min-h-12 items-center gap-4">
         <button
           onClick={() => setLayoutDirection(layoutDirection === 'vertical' ? 'horizontal' : 'vertical')}
           disabled={editLocked || nodes.length === 0}
@@ -550,10 +610,6 @@ export function ControlBar() {
           <span className="text-gray-400 text-sm ml-auto">Loading program...</span>
         )}
 
-        {activeError && (
-          <span className="text-red-400 text-sm ml-auto">{activeError}</span>
-        )}
-
         {browserSession && (
           <FileBrowserDialog
             open={true}
@@ -584,6 +640,7 @@ export function ControlBar() {
             onSkip={skipBrowserDeployment}
           />
         )}
+        </div>
       </div>
   );
 }

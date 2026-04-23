@@ -81,6 +81,8 @@ class KernelEventCollector {
 /// Bundle that owns all components. Kernel is destroyed first (declared last).
 /// Python holds a shared_ptr to this bundle to keep everything alive.
 struct NativeKernelBundle {
+  std::string group_name;
+
   // Owned components — order matters for destruction
   std::shared_ptr<roboplan::Scene> scene;
   std::shared_ptr<roboplan::RRT> rrt;

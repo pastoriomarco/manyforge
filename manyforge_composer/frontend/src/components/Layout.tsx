@@ -13,7 +13,7 @@ function clamp(value: number, min: number, max: number): number {
 }
 
 export function Layout() {
-  const [sidebarWidth, setSidebarWidth] = useState(260);
+  const [sidebarWidth, setSidebarWidth] = useState(340);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
 
   const beginResize = useCallback(

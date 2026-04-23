@@ -182,6 +182,7 @@ std::shared_ptr<NativeKernelBundle> create_native_kernel(
     const core::ExecutionKernelConfig& kernel_config) {
 
   auto bundle = std::make_shared<NativeKernelBundle>();
+  bundle->group_name = group_name;
 
   // Convert string paths to filesystem paths
   std::vector<std::filesystem::path> pkg_paths;
@@ -225,7 +226,7 @@ std::shared_ptr<NativeKernelBundle> create_native_kernel(
       bundle->scene, group_name, scene_mutex);
   bundle->clock = std::make_unique<WallClock>();
   bundle->execution = std::make_unique<RoboPlanExecutionBackend>(
-      bundle->scene, *bundle->clock, scene_mutex);
+      bundle->scene, group_name, *bundle->clock, scene_mutex);
   bundle->scheduler = std::make_unique<SimpleScheduler>();
   bundle->cache = std::make_unique<core::TrajectoryCache>();
 

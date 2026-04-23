@@ -709,6 +709,10 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
           AttachObjectRequestDTO req;
           req.object_id = request["object_id"].cast<std::string>();
           req.frame_id = request.attr("get")("frame_id", "").cast<std::string>();
+          if (request.contains("touch_links") &&
+              !request["touch_links"].is_none()) {
+            req.touch_links = request["touch_links"].cast<std::vector<std::string>>();
+          }
           auto r = self.context->attach_object(req);
           result["success"] = r.success;
           if (r.error.has_value()) result["error"] = r.error->message;
@@ -732,12 +736,60 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
         for (size_t i = 0; i < positions.size(); ++i) {
           q[i] = positions[i];
         }
+        if (self.scene && q.size() != self.scene->getCurrentJointPositions().size()) {
+          q = self.scene->toFullJointPositions(self.group_name, q);
+        }
         self.scene->setJointPositions(q);
         if (self.kernel) {
           self.kernel->sync_snapshot_from_context();
         }
       }, py::arg("positions"),
       "Set the robot's current joint positions in the planning scene.")
+      .def("get_group_joint_names", [](NativeKernelBundle& self,
+                                        const std::string& group_name) {
+        const auto maybe_group_info = self.scene->getJointGroupInfo(group_name);
+        if (!maybe_group_info) {
+          throw std::runtime_error(
+              "Failed to get joint names for group '" + group_name + "': " +
+              maybe_group_info.error());
+        }
+        return maybe_group_info->joint_names;
+      }, py::arg("group_name"),
+      "Get ordered joint names for a specific SRDF group.")
+      .def("get_group_joint_positions", [](NativeKernelBundle& self,
+                                           const std::string& group_name) {
+        const auto maybe_group_info = self.scene->getJointGroupInfo(group_name);
+        if (!maybe_group_info) {
+          throw std::runtime_error(
+              "Failed to get joint positions for group '" + group_name + "': " +
+              maybe_group_info.error());
+        }
+        const auto& group_info = *maybe_group_info;
+        const auto q = self.scene->getCurrentJointPositions();
+        std::vector<double> result;
+        result.reserve(group_info.q_indices.size());
+        for (int i = 0; i < group_info.q_indices.size(); ++i) {
+          result.push_back(q[group_info.q_indices[i]]);
+        }
+        return result;
+      }, py::arg("group_name"),
+      "Get current joint positions for a specific SRDF group.")
+      .def("set_group_joint_positions", [](NativeKernelBundle& self,
+                                           const std::string& group_name,
+                                           const std::vector<double>& positions) {
+        Eigen::VectorXd q(positions.size());
+        for (size_t i = 0; i < positions.size(); ++i) {
+          q[i] = positions[i];
+        }
+        if (self.scene && q.size() != self.scene->getCurrentJointPositions().size()) {
+          q = self.scene->toFullJointPositions(group_name, q);
+        }
+        self.scene->setJointPositions(q);
+        if (self.kernel) {
+          self.kernel->sync_snapshot_from_context();
+        }
+      }, py::arg("group_name"), py::arg("positions"),
+      "Set joint positions for a specific SRDF group in the planning scene.")
       .def("get_cached_trajectory", [](NativeKernelBundle& self,
                                        const std::string& move_id) -> py::object {
         auto cached = self.cache->lookup(move_id);
@@ -823,4 +875,20 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
         py::arg("group_name") = "arm",
         py::arg("config") = py::none(),
         "Create a native C++ kernel with real RoboPlan backends.");
+
+  m.def("create_native_kernel_from_paths",
+        [](const std::string& model_name, const std::string& group_name,
+           const std::string& urdf_path, const std::string& srdf_path,
+           const std::vector<std::string>& package_paths, py::object config) {
+          return create_native_kernel(
+              model_name, group_name, urdf_path, srdf_path, package_paths,
+              kernel_config_from_python(config));
+        },
+        py::arg("model_name"),
+        py::arg("group_name"),
+        py::arg("urdf_path"),
+        py::arg("srdf_path"),
+        py::arg("package_paths") = std::vector<std::string>{},
+        py::arg("config") = py::none(),
+        "Create a native C++ kernel from explicit URDF/SRDF/package bundle paths.");
 }

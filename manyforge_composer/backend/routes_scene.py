@@ -10,6 +10,11 @@ from fastapi.responses import JSONResponse, Response
 
 from manyforge_behavior.cycle_manager import CycleState
 from manyforge_behavior.kernel_client import SceneEditRequest
+from manyforge_behavior.model_paths import (
+    default_package_paths,
+    resolve_package_uri,
+    resolve_robot_model,
+)
 
 from .models import (
     SceneDiagnosticBackendResponse,
@@ -19,12 +24,143 @@ from .models import (
     SceneDiagnosticsSummaryResponse,
     SceneEditApiRequest,
     SceneEditResponse,
+    SceneFrameResponse,
+    SceneFramesResponse,
+    SceneFrameVisibilityRequest,
+    SceneFrameVisibilityResponse,
     SceneObjectResponse,
     SceneRobotResponse,
     SceneShapeResponse,
     SceneStateResponse,
 )
 from .state import ComposerState
+
+logger = logging.getLogger(__name__)
+
+
+def _make_package_handler(package_dirs: list[str]):
+    def handler(fname: str) -> str:
+        if not fname.startswith("package://"):
+            return fname
+        resolved = resolve_package_uri(fname, package_dirs)
+        if resolved is not None:
+            return resolved
+        return fname
+
+    return handler
+
+
+def _load_model_frame_names(state: ComposerState) -> list[str]:
+    deployment = state.deployment
+    if deployment is None:
+        return []
+    if not state.deployment_source_path:
+        return []
+
+    robot_config = deployment.robot_config
+    if not robot_config.urdf_path:
+        return []
+
+    try:
+        resolved_model = resolve_robot_model(
+            urdf_path=robot_config.urdf_path,
+            srdf_path=robot_config.srdf_path,
+            package_paths=robot_config.package_paths,
+            deployment_path=state.deployment_source_path,
+            extra_package_paths=default_package_paths(),
+        )
+    except Exception:
+        logger.debug("Could not resolve robot model while building frame inventory", exc_info=True)
+        return []
+
+    try:
+        import yourdfpy
+
+        if resolved_model.package_paths:
+            model = yourdfpy.URDF.load(
+                resolved_model.urdf_path,
+                filename_handler=_make_package_handler(resolved_model.package_paths),
+                load_meshes=False,
+            )
+        else:
+            model = yourdfpy.URDF.load(
+                resolved_model.urdf_path,
+                load_meshes=False,
+            )
+    except Exception:
+        logger.debug("Could not load URDF while building frame inventory", exc_info=True)
+        return []
+
+    link_map = getattr(model, "link_map", {}) or {}
+    frame_names = sorted(str(name) for name in link_map.keys())
+    return frame_names
+
+
+def _scene_frame_roles(state: ComposerState) -> dict[str, set[str]]:
+    roles: dict[str, set[str]] = {"universe": {"world"}}
+
+    def add_role(frame_name: str, role: str) -> None:
+        name = str(frame_name).strip()
+        if not name:
+            return
+        roles.setdefault(name, set()).add(role)
+
+    if state.program is not None and state.program.robot is not None:
+        add_role(state.program.robot.base_frame, "robot_base")
+        add_role(state.program.robot.tcp_frame, "program_tcp")
+
+    if state.deployment is not None:
+        for gripper_id, config in state.deployment.grippers.items():
+            add_role(config.mount_frame, f"{gripper_id}:mount")
+            add_role(config.attach_frame, f"{gripper_id}:attach")
+            add_role(config.tcp_frame, f"{gripper_id}:tcp")
+            for frame_name in config.auxiliary_frames:
+                add_role(frame_name, f"{gripper_id}:auxiliary")
+
+    return roles
+
+
+def build_scene_frames_payload(state: ComposerState) -> dict[str, Any]:
+    """Build known frame inventory plus current viewer visibility."""
+    timestamp_ns = time.monotonic_ns()
+    frame_roles = _scene_frame_roles(state)
+    frame_names = set(frame_roles.keys())
+    frame_names.update(_load_model_frame_names(state))
+
+    hmi = getattr(state, "hmi_server", None)
+    hmi_available = bool(hmi and hasattr(hmi, "get_frame_visibility"))
+    kernel = state.kernel
+
+    frames: list[SceneFrameResponse] = []
+    for frame_name in sorted(frame_names):
+        pose_available = frame_name == "universe"
+        if not pose_available and kernel is not None:
+            try:
+                pose_available = kernel.get_link_pose(frame_name, "universe") is not None
+            except Exception:
+                pose_available = False
+
+        viewer_visible = False
+        if hmi_available:
+            try:
+                viewer_visible = bool(hmi.get_frame_visibility(frame_name))
+            except Exception:
+                viewer_visible = False
+
+        frames.append(
+            SceneFrameResponse(
+                name=frame_name,
+                roles=sorted(frame_roles.get(frame_name, set())),
+                viewerVisible=viewer_visible,
+                poseAvailable=pose_available,
+            )
+        )
+
+    return SceneFramesResponse(
+        frames=frames,
+        hmiAvailable=hmi_available,
+        timestampNs=timestamp_ns,
+    ).model_dump(by_alias=True)
 
 
 def _scene_shape_response(scene_object) -> SceneShapeResponse | None:
@@ -93,8 +229,18 @@ def build_scene_state_payload(state: ComposerState) -> dict[str, Any]:
         )
 
     objects: list[SceneObjectResponse] = []
+    authored_object_ids = {
+        resource.object_id
+        for resource in (state.program.scene if state.program is not None else [])
+    }
     if state.kernel is not None:
         for scene_object in state.kernel.get_scene_objects():
+            if scene_object.attached:
+                source = "attached"
+            elif scene_object.object_id in authored_object_ids:
+                source = "authored"
+            else:
+                source = "runtime"
             objects.append(
                 SceneObjectResponse(
                     object_id=scene_object.object_id,
@@ -102,6 +248,8 @@ def build_scene_state_payload(state: ComposerState) -> dict[str, Any]:
                     pose_in_universe=scene_object.pose_in_universe,
                     attached=scene_object.attached,
                     attached_to=scene_object.frame_id if scene_object.attached else None,
+                    source=source,
+                    persistable=source == "authored",
                 )
             )
     objects.sort(key=lambda obj: obj.object_id)
@@ -191,6 +339,29 @@ def create_scene_router(state: ComposerState) -> APIRouter:
         """Compare backend-authoritative scene truth with HMI render state."""
         return build_scene_diagnostics_payload(state)
 
+    @router.get("/frames")
+    def get_scene_frames() -> dict[str, Any]:
+        """Get known robot/tool frames plus current viewer visibility."""
+        return build_scene_frames_payload(state)
+
+    @router.post("/frames/visibility")
+    def set_frame_visibility(validated: SceneFrameVisibilityRequest) -> dict[str, Any]:
+        """Show/hide a named frame axis in the HMI viewer without mutating deployment."""
+        hmi = getattr(state, "hmi_server", None)
+        if hmi is None or not hasattr(hmi, "set_frame_visibility"):
+            return JSONResponse(
+                status_code=503,
+                content={"detail": "HMI server not running or does not support frame visibility control"},
+            )
+        hmi.set_frame_visibility(validated.frame_name, validated.visible)
+        return SceneFrameVisibilityResponse(
+            success=True,
+            frameName=validated.frame_name,
+            visible=validated.visible,
+            hmiAvailable=True,
+            timestampNs=time.monotonic_ns(),
+        ).model_dump(by_alias=True)
+
     @router.post("/edit")
     def edit_scene(validated: SceneEditApiRequest) -> dict[str, Any]:
         """Edit the scene at runtime (add, remove, update_pose, attach, detach)."""
@@ -198,6 +369,7 @@ def create_scene_router(state: ComposerState) -> APIRouter:
             if state.cycle_manager is not None and state.cycle_manager.state in {
                 CycleState.RUNNING,
                 CycleState.INTERRUPT_HANDLER,
+                CycleState.DIRECT_CONTROL,
             }:
                 cycle_state = state.cycle_manager.state
                 return JSONResponse(

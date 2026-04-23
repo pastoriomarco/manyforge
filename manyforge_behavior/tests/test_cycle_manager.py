@@ -173,6 +173,23 @@ class TestCycleManagerRun:
         time.sleep(0.2)
         # Tree should complete quickly, so state may change
         # But we know it started running
+
+    def test_run_from_idle_after_reset_reuses_prepared_tree_and_scene(self, kernel):
+        """Idle start after Reset uses the prepared baseline without rebuilding scene/tree again."""
+        slow_kernel = MockKernelClient(execute_duration_s=1.0)
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, slow_kernel)
+        manager = CycleManager(runner, slow_kernel)
+
+        manager.reset()
+        initial_tree = manager._tree
+        initial_scene_edit_count = len(slow_kernel.scene_edits)
+
+        manager.run()
+
+        assert manager.state == CycleState.RUNNING
+        assert manager._tree is not None
+        assert manager._tree is initial_tree
+        assert len(slow_kernel.scene_edits) == initial_scene_edit_count
     
     def test_run_from_running_is_noop(self, kernel):
         """run() from RUNNING state is a no-op."""
@@ -1114,8 +1131,8 @@ class TestCycleManagerProgramCompletion:
         # Kernel should have been called
         assert kernel.execute_count >= 1
 
-    def test_run_from_idle_after_completion_rebuilds_tree(self, kernel):
-        """A new run after terminal completion prepares a fresh cycle."""
+    def test_run_from_idle_after_completion_is_noop_until_reset(self, kernel):
+        """A terminal idle tree requires Reset before another run can start."""
         runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
         manager = CycleManager(runner, kernel)
 
@@ -1124,12 +1141,14 @@ class TestCycleManagerProgramCompletion:
         first_tree = manager._tree
         assert first_tree is not None
         assert manager.state == CycleState.IDLE
+        execute_count_after_completion = kernel.execute_count
 
         manager.run()
+        time.sleep(0.1)
 
-        assert manager.state == CycleState.RUNNING
-        assert manager._tree is not None
-        assert manager._tree is not first_tree
+        assert manager.state == CycleState.IDLE
+        assert manager._tree is first_tree
+        assert kernel.execute_count == execute_count_after_completion
 
 
 # =========================================================================

@@ -1,9 +1,11 @@
 import { create } from 'zustand';
 import { api } from '../api/client';
+import { useCatalogStore } from './catalogStore';
 import type {
   TreeNode,
   ProgramInfo,
   ProgramParameter,
+  ProgramSceneResource,
   ProgramBlackboard,
   BlackboardNamespace,
   BlackboardKey,
@@ -38,6 +40,9 @@ interface ProgramStore {
   programParameters: ProgramParameter[];
   appliedProgramParameters: ProgramParameter[];
   savedProgramParameters: ProgramParameter[];
+  sceneResources: ProgramSceneResource[];
+  appliedSceneResources: ProgramSceneResource[];
+  savedSceneResources: ProgramSceneResource[];
   blackboardNamespaces: BlackboardNamespace[];
   appliedBlackboardNamespaces: BlackboardNamespace[];
   savedBlackboardNamespaces: BlackboardNamespace[];
@@ -76,6 +81,7 @@ interface ProgramStore {
   updateProgramParameter: (name: string, patch: Partial<ProgramParameter>) => void;
   addProgramParameter: (parameter: ProgramParameter) => void;
   deleteProgramParameter: (name: string) => void;
+  setSceneResources: (sceneResources: ProgramSceneResource[]) => void;
   updateBlackboardNamespace: (id: string, patch: Partial<BlackboardNamespace>) => void;
   addBlackboardNamespace: (namespace: BlackboardNamespace) => void;
   deleteBlackboardNamespace: (id: string) => void;
@@ -104,6 +110,65 @@ function cloneBlackboard(blackboard?: ProgramBlackboard | null): ProgramBlackboa
     namespaces: structuredClone(blackboard?.namespaces ?? []),
     keys: structuredClone(blackboard?.keys ?? []),
   };
+}
+
+function cloneSceneResources(sceneResources?: ProgramSceneResource[] | null): ProgramSceneResource[] {
+  return structuredClone(sceneResources ?? []);
+}
+
+function buildDefaultNodeParams(catalogId: string): Record<string, unknown> {
+  const entry = useCatalogStore.getState().entries.find((candidate) => candidate.id === catalogId);
+  const defaults: Record<string, unknown> = {};
+
+  for (const param of entry?.parameters ?? []) {
+    if (param.default !== undefined && param.default !== null) {
+      defaults[param.name] = structuredClone(param.default);
+      continue;
+    }
+    if (param.required && param.type === 'enum' && param.enumValues.length > 0) {
+      defaults[param.name] = param.enumValues[0];
+    }
+  }
+
+  if (catalogId === 'add_collision_object') {
+    defaults.shape_type = typeof defaults.shape_type === 'string' ? defaults.shape_type : 'box';
+    if (!Array.isArray(defaults.box_dimensions_m) || defaults.box_dimensions_m.length !== 3) {
+      defaults.box_dimensions_m = [0.1, 0.1, 0.1];
+    }
+    if (
+      defaults.pose === undefined
+      || defaults.pose === null
+      || typeof defaults.pose !== 'object'
+      || Array.isArray(defaults.pose)
+    ) {
+      defaults.pose = {
+        position_m: [0, 0, 0],
+        orientation_rpy_deg: [0, 0, 0],
+      };
+    }
+    defaults.frame_id = typeof defaults.frame_id === 'string' && defaults.frame_id.trim()
+      ? defaults.frame_id
+      : 'universe';
+  }
+
+  if (catalogId === 'update_collision_object_pose') {
+    if (
+      defaults.pose === undefined
+      || defaults.pose === null
+      || typeof defaults.pose !== 'object'
+      || Array.isArray(defaults.pose)
+    ) {
+      defaults.pose = {
+        position_m: [0, 0, 0],
+        orientation_rpy_deg: [0, 0, 0],
+      };
+    }
+    defaults.frame_id = typeof defaults.frame_id === 'string' && defaults.frame_id.trim()
+      ? defaults.frame_id
+      : 'universe';
+  }
+
+  return defaults;
 }
 
 function getNodeWidth(node: Node): number {
@@ -445,6 +510,9 @@ export const useProgramStore = create<ProgramStore>((set, get) => ({
   programParameters: [],
   appliedProgramParameters: [],
   savedProgramParameters: [],
+  sceneResources: [],
+  appliedSceneResources: [],
+  savedSceneResources: [],
   blackboardNamespaces: [],
   appliedBlackboardNamespaces: [],
   savedBlackboardNamespaces: [],
@@ -466,6 +534,9 @@ export const useProgramStore = create<ProgramStore>((set, get) => ({
       const info = await api.program.load(path, deploymentPath, forceDiscardOverrides);
       set({
         programInfo: info,
+        sceneResources: cloneSceneResources(info.sceneResources),
+        appliedSceneResources: cloneSceneResources(info.sceneResources),
+        savedSceneResources: cloneSceneResources(info.sceneResources),
         programParameters: structuredClone(info.parameters ?? []),
         appliedProgramParameters: structuredClone(info.parameters ?? []),
         savedProgramParameters: structuredClone(info.parameters ?? []),
@@ -493,6 +564,9 @@ export const useProgramStore = create<ProgramStore>((set, get) => ({
       ]);
       set({
         programInfo: info,
+        sceneResources: cloneSceneResources(info.sceneResources),
+        appliedSceneResources: cloneSceneResources(info.sceneResources),
+        savedSceneResources: cloneSceneResources(savedInfo?.sceneResources ?? info.sceneResources),
         programParameters: structuredClone(info.parameters ?? []),
         appliedProgramParameters: structuredClone(info.parameters ?? []),
         savedProgramParameters: structuredClone(savedInfo?.parameters ?? info.parameters ?? []),
@@ -537,6 +611,9 @@ export const useProgramStore = create<ProgramStore>((set, get) => ({
         programInfo,
         appliedTree: data.tree,
         savedTree: savedData?.tree ?? data.tree,
+        sceneResources: cloneSceneResources(programInfo.sceneResources),
+        appliedSceneResources: cloneSceneResources(programInfo.sceneResources),
+        savedSceneResources: cloneSceneResources(savedProgramInfo?.sceneResources ?? programInfo.sceneResources),
         programParameters: structuredClone(programInfo.parameters ?? []),
         appliedProgramParameters: structuredClone(programInfo.parameters ?? []),
         savedProgramParameters: structuredClone(savedProgramInfo?.parameters ?? programInfo.parameters ?? []),
@@ -639,7 +716,7 @@ export const useProgramStore = create<ProgramStore>((set, get) => ({
       data: {
         label: catalogId,
         catalogId,
-        params: {},
+        params: buildDefaultNodeParams(catalogId),
         modificationPolicy: {},
       },
     };
@@ -750,6 +827,21 @@ export const useProgramStore = create<ProgramStore>((set, get) => ({
         isDirty: true,
       };
     });
+  },
+
+  setSceneResources: (sceneResources) => {
+    set((state) => ({
+      sceneResources: cloneSceneResources(sceneResources),
+      programInfo: state.programInfo
+        ? {
+            ...state.programInfo,
+            sceneResources: cloneSceneResources(sceneResources),
+            sceneCount: sceneResources.length,
+          }
+        : state.programInfo,
+      error: null,
+      isDirty: true,
+    }));
   },
 
   updateBlackboardNamespace: (id, patch) => {
@@ -920,6 +1012,7 @@ export const useProgramStore = create<ProgramStore>((set, get) => ({
     set({
       nodes,
       edges,
+      sceneResources: cloneSceneResources(get().appliedSceneResources),
       programParameters: structuredClone(get().appliedProgramParameters),
       blackboardNamespaces: structuredClone(get().appliedBlackboardNamespaces),
       blackboardKeys: structuredClone(get().appliedBlackboardKeys),
@@ -934,12 +1027,15 @@ export const useProgramStore = create<ProgramStore>((set, get) => ({
     const tree = get().flowToTree();
     set((state) => ({
       appliedTree: tree,
+      appliedSceneResources: cloneSceneResources(get().sceneResources),
       appliedProgramParameters: structuredClone(get().programParameters),
       appliedBlackboardNamespaces: structuredClone(get().blackboardNamespaces),
       appliedBlackboardKeys: structuredClone(get().blackboardKeys),
       programInfo: state.programInfo
         ? {
             ...state.programInfo,
+            sceneResources: cloneSceneResources(state.sceneResources),
+            sceneCount: state.sceneResources.length,
             parameters: structuredClone(state.programParameters),
             parameterCount: state.programParameters.length,
             blackboard: {
@@ -955,6 +1051,7 @@ export const useProgramStore = create<ProgramStore>((set, get) => ({
     const tree = get().flowToTree();
     set({
       savedTree: tree,
+      savedSceneResources: cloneSceneResources(get().sceneResources),
       savedProgramParameters: structuredClone(get().programParameters),
       savedBlackboardNamespaces: structuredClone(get().blackboardNamespaces),
       savedBlackboardKeys: structuredClone(get().blackboardKeys),
@@ -981,12 +1078,17 @@ export const useProgramStore = create<ProgramStore>((set, get) => ({
     if (!tree) {
       throw new Error('Draft tree is invalid');
     }
-    await api.program.saveTree(path, tree, get().programParameters, {
+    const result = await api.program.saveTree(path, tree, get().sceneResources, get().programParameters, {
       namespaces: get().blackboardNamespaces,
       keys: get().blackboardKeys,
     });
+    const savedPath =
+      typeof result === 'object' && result !== null && 'path' in result && typeof result.path === 'string'
+        ? result.path
+        : path;
     set((state) => ({
       savedTree: tree,
+      savedSceneResources: cloneSceneResources(state.sceneResources),
       savedProgramParameters: structuredClone(state.programParameters),
       savedBlackboardNamespaces: structuredClone(state.blackboardNamespaces),
       savedBlackboardKeys: structuredClone(state.blackboardKeys),
@@ -994,7 +1096,9 @@ export const useProgramStore = create<ProgramStore>((set, get) => ({
       programInfo: state.programInfo
         ? {
             ...state.programInfo,
-            sourcePath: path,
+            sourcePath: savedPath,
+            sceneResources: cloneSceneResources(state.sceneResources),
+            sceneCount: state.sceneResources.length,
             parameters: structuredClone(state.programParameters),
             parameterCount: state.programParameters.length,
             blackboard: {

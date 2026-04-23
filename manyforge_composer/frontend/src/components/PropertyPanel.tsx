@@ -8,12 +8,15 @@ import type {
   CatalogParameter,
   FullDeployment,
   ModelEndpointCatalog,
+  SceneFramesResponse,
   SceneStateResponse,
 } from '../types/api';
 import {
   collectBlackboardFieldOptions,
   collectBlackboardKeyOptions,
   collectDeclaredBlackboardOutputOptions,
+  getFieldRefTarget,
+  getKeyRefId,
   LiteralOrFieldReferenceEditor,
   NamespaceBindingEditor,
   BlackboardKeySelectorEditor,
@@ -26,6 +29,7 @@ import {
   RelativeMoveEditor,
 } from './property/MotionEditors';
 import {
+  FixedFloatListEditor,
   ListParamEditor,
   NumericParamEditor,
   StructuredParamEditor,
@@ -46,6 +50,36 @@ const KIND_COLORS: Record<string, string> = {
   retry: 'border-cyan-500 bg-cyan-900/50',
   default: 'border-green-500 bg-green-900/50',
 };
+
+const SCENE_NODE_IDS_REQUIRING_SCENE_CONTEXT = new Set([
+  'move_manipulator_action',
+  'add_collision_object',
+  'update_collision_object_pose',
+  'attach_object_to_link',
+  'detach_object_from_link',
+]);
+
+const SCENE_OBJECT_ID_NODE_IDS = new Set([
+  'add_collision_object',
+  'remove_collision_object',
+  'update_collision_object_pose',
+  'attach_object_to_link',
+  'detach_object_from_link',
+]);
+
+function normalizeSelectOptions(
+  options: string[],
+  currentValue: string,
+  invalidLabelSuffix = ' (not available)',
+): { value: string; label: string }[] {
+  const normalized = Array.from(new Set(options.filter((option) => option.trim().length > 0))).sort(
+    (left, right) => left.localeCompare(right),
+  );
+  if (currentValue.trim().length > 0 && !normalized.includes(currentValue)) {
+    return [{ value: currentValue, label: `${currentValue}${invalidLabelSuffix}` }, ...normalized.map((value) => ({ value, label: value }))];
+  }
+  return normalized.map((value) => ({ value, label: value }));
+}
 
 
 function DeploymentModelEndpointAliasEditor({
@@ -245,6 +279,7 @@ export function PropertyPanel({ onCollapse }: { onCollapse: () => void }) {
     selectedNodeId,
     nodes,
     programParameters,
+    sceneResources,
     blackboardNamespaces,
     blackboardKeys,
     updateNodeParams,
@@ -258,6 +293,7 @@ export function PropertyPanel({ onCollapse }: { onCollapse: () => void }) {
   const selectedNode = selectedNodeId ? nodes.find(n => n.id === selectedNodeId) : undefined;
   const catalogEntry = selectedNode ? entries.find(e => e.id === selectedNode.data.catalogId) : undefined;
   const colorClass = selectedNode ? (KIND_COLORS[selectedNode.data.catalogId as string] || KIND_COLORS.default) : KIND_COLORS.default;
+  const selectedCatalogId = String(selectedNode?.data.catalogId ?? '');
   const nodeParams = useMemo(
     () => (selectedNode?.data.params as Record<string, unknown> | undefined) ?? {},
     [selectedNode?.data.params],
@@ -265,8 +301,10 @@ export function PropertyPanel({ onCollapse }: { onCollapse: () => void }) {
   const isRunMode = cycleState === 'running';
   const [modelEndpointCatalog, setModelEndpointCatalog] = useState<ModelEndpointCatalog | null>(null);
   const [sceneState, setSceneState] = useState<SceneStateResponse | null>(null);
+  const [sceneFrames, setSceneFrames] = useState<SceneFramesResponse | null>(null);
   const [expandedProgramParameterBinding, setExpandedProgramParameterBinding] = useState<string | null>(null);
   const deploymentModelEndpointSignature = JSON.stringify(deployment?.modelEndpoints ?? {});
+  const sceneContextRequired = SCENE_NODE_IDS_REQUIRING_SCENE_CONTEXT.has(selectedCatalogId);
 
   useEffect(() => {
     if (!deployment || Object.keys(deployment.modelEndpoints ?? {}).length === 0) {
@@ -295,7 +333,7 @@ export function PropertyPanel({ onCollapse }: { onCollapse: () => void }) {
   }, [selectedNodeId]);
 
   useEffect(() => {
-    if (selectedNode?.data.catalogId !== 'move_manipulator_action' || nodeParams.motion_type !== 'joint_goal') {
+    if (!sceneContextRequired) {
       setSceneState(null);
       return;
     }
@@ -314,7 +352,56 @@ export function PropertyPanel({ onCollapse }: { onCollapse: () => void }) {
     return () => {
       cancelled = true;
     };
-  }, [selectedNode?.data.catalogId, selectedNodeId, nodeParams.motion_type]);
+  }, [sceneContextRequired, selectedNodeId]);
+
+  useEffect(() => {
+    if (!sceneContextRequired) {
+      setSceneFrames(null);
+      return;
+    }
+    let cancelled = false;
+    void api.scene.frames()
+      .then((result) => {
+        if (!cancelled) {
+          setSceneFrames(result);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setSceneFrames(null);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [sceneContextRequired, selectedNodeId]);
+
+  const sceneReferenceOptions = useMemo(() => {
+    const frameNames = Array.from(
+      new Set(
+        (sceneFrames?.frames ?? [])
+          .filter((frame) => frame.poseAvailable)
+          .map((frame) => frame.name),
+      ),
+    ).sort((left, right) => left.localeCompare(right));
+    const robotLinkNames = frameNames.filter((name) => name !== 'universe');
+    const objectIds = Array.from(
+      new Set([
+        ...sceneResources.map((resource) => resource.objectId).filter((value) => value.trim().length > 0),
+        ...(sceneState?.objects ?? []).map((object) => object.object_id).filter((value) => value.trim().length > 0),
+      ]),
+    ).sort((left, right) => left.localeCompare(right));
+
+    return {
+      frameOptions: frameNames,
+      robotLinkOptions: robotLinkNames,
+      objectOptions: objectIds,
+    };
+  }, [sceneFrames, sceneResources, sceneState]);
+  const deploymentGripperOptions = useMemo(
+    () => Object.keys(deployment?.grippers ?? {}).sort((left, right) => left.localeCompare(right)),
+    [deployment?.grippers],
+  );
 
   const handleDelete = useCallback(() => {
     if (!selectedNodeId) return;
@@ -345,8 +432,68 @@ export function PropertyPanel({ onCollapse }: { onCollapse: () => void }) {
     [selectedNodeId, updateNodeParams, nodeParams, isRunMode],
   );
 
+  useEffect(() => {
+    if (isRunMode || !selectedNodeId) {
+      return;
+    }
+
+    if (selectedCatalogId === 'add_collision_object') {
+      const patch: Record<string, unknown> = {};
+      if (typeof nodeParams.shape_type !== 'string' || nodeParams.shape_type.length === 0) {
+        patch.shape_type = 'box';
+      }
+      if (!Array.isArray(nodeParams.box_dimensions_m) || nodeParams.box_dimensions_m.length !== 3) {
+        patch.box_dimensions_m = [0.1, 0.1, 0.1];
+      }
+      if (
+        nodeParams.pose === undefined
+        || nodeParams.pose === null
+        || typeof nodeParams.pose !== 'object'
+        || Array.isArray(nodeParams.pose)
+      ) {
+        patch.pose = { position_m: [0, 0, 0], orientation_rpy_deg: [0, 0, 0] };
+      }
+      if (typeof nodeParams.frame_id !== 'string' || nodeParams.frame_id.trim().length === 0) {
+        patch.frame_id = 'universe';
+      }
+      if (Object.keys(patch).length > 0) {
+        handleParamPatch(patch);
+      }
+      return;
+    }
+
+    if (selectedCatalogId === 'update_collision_object_pose') {
+      const patch: Record<string, unknown> = {};
+      if (
+        nodeParams.pose === undefined
+        || nodeParams.pose === null
+        || typeof nodeParams.pose !== 'object'
+        || Array.isArray(nodeParams.pose)
+      ) {
+        patch.pose = { position_m: [0, 0, 0], orientation_rpy_deg: [0, 0, 0] };
+      }
+      if (typeof nodeParams.frame_id !== 'string' || nodeParams.frame_id.trim().length === 0) {
+        patch.frame_id = 'universe';
+      }
+      if (Object.keys(patch).length > 0) {
+        handleParamPatch(patch);
+      }
+    }
+  }, [handleParamPatch, isRunMode, nodeParams.box_dimensions_m, nodeParams.frame_id, nodeParams.pose, nodeParams.shape_type, selectedCatalogId, selectedNodeId]);
+
   const isParameterVisible = useCallback((paramName: string): boolean => {
-    if (selectedNode?.data.catalogId !== 'move_manipulator_action') {
+    if (selectedCatalogId === 'add_collision_object') {
+      const shapeType = String(nodeParams.shape_type ?? '');
+      if (paramName === 'box_dimensions_m') {
+        return shapeType === 'box';
+      }
+      if (paramName === 'sphere_radius_m') {
+        return shapeType === 'sphere';
+      }
+      return true;
+    }
+
+    if (selectedCatalogId !== 'move_manipulator_action') {
       return true;
     }
 
@@ -361,10 +508,141 @@ export function PropertyPanel({ onCollapse }: { onCollapse: () => void }) {
       return motionType === 'relative_move';
     }
     return true;
-  }, [nodeParams.motion_type, selectedNode?.data.catalogId]);
+  }, [nodeParams.motion_type, nodeParams.shape_type, selectedCatalogId]);
   const blackboardOutputOptions = collectDeclaredBlackboardOutputOptions(blackboardNamespaces);
   const blackboardKeyOptions = collectBlackboardKeyOptions(blackboardKeys);
   const blackboardFieldOptions = collectBlackboardFieldOptions(blackboardNamespaces);
+  const renderConstrainedSelect = (
+    value: unknown,
+    options: string[],
+    onCommit: (nextValue: string) => void,
+    placeholder: string,
+  ) => {
+    const normalizedCurrentValue = typeof value === 'string' ? value : '';
+    const normalizedOptions = normalizeSelectOptions(options, normalizedCurrentValue);
+    return (
+      <select
+        value={normalizedCurrentValue}
+        onChange={(event) => onCommit(event.target.value)}
+        disabled={isRunMode}
+        className={`w-full bg-gray-700 border border-gray-600 text-white rounded px-2 py-1 text-sm ${isRunMode ? 'opacity-50 cursor-not-allowed bg-gray-800' : ''}`}
+      >
+        <option value="">{placeholder}</option>
+        {normalizedOptions.map((option) => (
+          <option key={option.value} value={option.value}>
+            {option.label}
+          </option>
+        ))}
+      </select>
+    );
+  };
+  const renderSceneObjectIdEditor = (param: CatalogParameter, currentValue: unknown) => {
+    const currentFieldRef = getFieldRefTarget(currentValue);
+    const currentKeyRefId = getKeyRefId(currentValue);
+    const mode = currentKeyRefId || currentFieldRef ? 'blackboard' : 'literal';
+    const compatibleKeyOptions = blackboardKeyOptions.filter((option) => option.type === 'string');
+    const compatibleFieldOptions = blackboardFieldOptions.filter((option) => option.fieldType === 'string');
+    const bindingKey = `${selectedNodeId}:${param.name}`;
+    const isExpanded = expandedProgramParameterBinding === bindingKey;
+    const isBound = getProgramParameterReferenceName(currentValue) !== null;
+
+    const activateFirstBlackboardBinding = () => {
+      const firstKey = compatibleKeyOptions[0];
+      if (firstKey) {
+        handleParamChange(param.name, { key_ref: firstKey.id });
+        return;
+      }
+      const firstField = compatibleFieldOptions[0];
+      if (firstField) {
+        handleParamChange(param.name, {
+          field_ref: { namespace: firstField.namespaceId, field: firstField.fieldName },
+        });
+      }
+    };
+
+    return (
+      <div className="space-y-2">
+        <div className="flex items-center gap-2">
+          <select
+            value={mode}
+            disabled={isRunMode}
+            onChange={(event) => {
+              if (event.target.value === 'literal') {
+                handleParamChange(param.name, '');
+                return;
+              }
+              activateFirstBlackboardBinding();
+            }}
+            className={`flex-1 rounded border border-gray-600 bg-gray-700 px-2 py-1 text-sm text-white ${isRunMode ? 'opacity-50 cursor-not-allowed bg-gray-800' : ''}`}
+          >
+            <option value="literal">Literal</option>
+            <option value="blackboard">Blackboard</option>
+          </select>
+          {mode === 'literal' && (
+            <button
+              type="button"
+              onClick={() => {
+                setExpandedProgramParameterBinding((current) =>
+                  current === bindingKey ? null : bindingKey,
+                );
+              }}
+              disabled={isRunMode}
+              title="Program parameter binding"
+              className={`h-8 w-8 rounded border text-[11px] font-semibold ${
+                isRunMode
+                  ? 'cursor-not-allowed border-gray-700 bg-gray-800 text-gray-500'
+                  : isExpanded || isBound
+                    ? 'border-blue-500 bg-blue-900/60 text-blue-100'
+                    : 'border-gray-600 bg-gray-700 text-gray-200 hover:bg-gray-600'
+              }`}
+            >
+              P
+            </button>
+          )}
+        </div>
+        {mode === 'literal' ? (
+          <ParameterBindingEditor
+            paramName={param.name}
+            paramType={param.type}
+            paramDefault={param.default ?? ''}
+            constraints={param.constraints}
+            currentValue={currentValue}
+            programParameters={programParameters}
+            expanded={isExpanded}
+            isRunMode={isRunMode}
+            onCommitLiteral={(value) => handleParamChange(param.name, value)}
+            onBindProgramParameter={(parameterName) =>
+              handleParamChange(param.name, `\${param:${parameterName}}`)
+            }
+            onCreateProgramParameter={addProgramParameter}
+          >
+            <input
+              type="text"
+              value={
+                typeof currentValue === 'string' && !currentKeyRefId && !currentFieldRef
+                  ? currentValue
+                  : ''
+              }
+              onChange={(event) => handleParamChange(param.name, event.target.value)}
+              disabled={isRunMode}
+              className={`w-full rounded border border-gray-600 bg-gray-700 px-2 py-1 text-sm text-white ${isRunMode ? 'opacity-50 cursor-not-allowed bg-gray-800' : ''}`}
+              placeholder="object_id"
+            />
+          </ParameterBindingEditor>
+        ) : (
+          <BlackboardKeySelectorEditor
+            currentValue={currentValue}
+            isRunMode={isRunMode}
+            onCommit={(value) => handleParamChange(param.name, value)}
+            keyOptions={compatibleKeyOptions}
+            fieldOptions={compatibleFieldOptions}
+            expectedType="string"
+            allowFieldRefs={true}
+          />
+        )}
+      </div>
+    );
+  };
 
   if (!selectedNodeId) {
     return (
@@ -405,6 +683,8 @@ export function PropertyPanel({ onCollapse }: { onCollapse: () => void }) {
 
   const renderParameterInput = (param: CatalogParameter) => {
     const currentValue = nodeParams[param.name] ?? param.default;
+    const isSceneObjectIdParam =
+      param.name === 'object_id' && SCENE_OBJECT_ID_NODE_IDS.has(selectedCatalogId);
     const getJointGoalExtraError = (): string | null => {
       if (selectedNode?.data.catalogId !== 'move_manipulator_action') {
         return null;
@@ -515,6 +795,10 @@ export function PropertyPanel({ onCollapse }: { onCollapse: () => void }) {
       );
     }
 
+    if (isSceneObjectIdParam) {
+      return renderSceneObjectIdEditor(param, currentValue);
+    }
+
     if (param.uiEditor === 'blackboard_key_selector') {
       return (
         <BlackboardKeySelectorEditor
@@ -592,7 +876,100 @@ export function PropertyPanel({ onCollapse }: { onCollapse: () => void }) {
           isRunMode={isRunMode}
           onCommit={(value) => handleParamChange(param.name, value)}
           fieldOptions={blackboardFieldOptions.filter((option) => option.fieldType === 'pose')}
+          frameOptions={sceneReferenceOptions.frameOptions}
+          robotLinkOptions={sceneReferenceOptions.robotLinkOptions}
+          objectOptions={sceneReferenceOptions.objectOptions}
         />
+      );
+    }
+
+    if (selectedCatalogId === 'add_collision_object') {
+      if (param.name === 'shape_type') {
+        const currentShape = typeof currentValue === 'string' && currentValue.length > 0
+          ? currentValue
+          : 'box';
+        return (
+          <select
+            value={currentShape}
+            onChange={(event) => {
+              const nextShape = event.target.value;
+              const patch: Record<string, unknown> = { shape_type: nextShape };
+              if (nextShape === 'box') {
+                patch.box_dimensions_m = Array.isArray(nodeParams.box_dimensions_m) && nodeParams.box_dimensions_m.length === 3
+                  ? nodeParams.box_dimensions_m
+                  : [0.1, 0.1, 0.1];
+              }
+              if (nextShape === 'sphere') {
+                patch.sphere_radius_m = typeof nodeParams.sphere_radius_m === 'number'
+                  ? nodeParams.sphere_radius_m
+                  : 0.05;
+              }
+              handleParamPatch(patch);
+            }}
+            disabled={isRunMode}
+            className={`w-full bg-gray-700 border border-gray-600 text-white rounded px-2 py-1 text-sm ${disabledClasses}`}
+          >
+            <option value="box">box</option>
+            <option value="sphere">sphere</option>
+          </select>
+        );
+      }
+
+      if (param.name === 'box_dimensions_m') {
+        return (
+          <FixedFloatListEditor
+            currentValue={currentValue}
+            isRunMode={isRunMode}
+            onCommit={(value) => handleParamChange(param.name, value)}
+            labels={['Dim x', 'Dim y', 'Dim z']}
+            requirePositive={true}
+          />
+        );
+      }
+
+      if (param.name === 'sphere_radius_m') {
+        return (
+          <NumericParamEditor
+            currentValue={currentValue}
+            isRunMode={isRunMode}
+            onCommit={(value) => handleParamChange(param.name, value)}
+            paramType="float"
+            constraints={param.constraints}
+          />
+        );
+      }
+    }
+
+    if (
+      (selectedCatalogId === 'add_collision_object' || selectedCatalogId === 'update_collision_object_pose')
+      && param.name === 'frame_id'
+    ) {
+      return renderConstrainedSelect(
+        currentValue,
+        sceneReferenceOptions.frameOptions,
+        (value) => handleParamChange(param.name, value),
+        'Select reference frame',
+      );
+    }
+
+    if (
+      (selectedCatalogId === 'attach_object_to_link' || selectedCatalogId === 'detach_object_from_link')
+      && param.name === 'link_frame'
+    ) {
+      return renderConstrainedSelect(
+        currentValue,
+        sceneReferenceOptions.robotLinkOptions,
+        (value) => handleParamChange(param.name, value),
+        'Select robot link',
+      );
+    }
+
+    if (selectedCatalogId === 'attach_object_to_link' && param.name === 'gripper_id') {
+      return renderConstrainedSelect(
+        currentValue,
+        deploymentGripperOptions,
+        (value) => handleParamChange(param.name, value),
+        'Optional gripper id',
       );
     }
 
@@ -661,13 +1038,19 @@ export function PropertyPanel({ onCollapse }: { onCollapse: () => void }) {
         );
 
       case 'enum':
+        {
+          const normalizedEnumValue =
+            typeof currentValue === 'string' && param.enumValues.includes(currentValue)
+              ? currentValue
+              : '';
         return (
           <select
-            value={String(currentValue) || ''}
+            value={normalizedEnumValue}
             onChange={(e) => handleParamChange(param.name, e.target.value)}
             disabled={isRunMode}
             className={`w-full bg-gray-700 border border-gray-600 text-white rounded px-2 py-1 text-sm ${disabledClasses}`}
           >
+            <option value="">Select {param.name}</option>
             {param.enumValues.map((value) => (
               <option key={value} value={value}>
                 {value}
@@ -675,6 +1058,7 @@ export function PropertyPanel({ onCollapse }: { onCollapse: () => void }) {
             ))}
           </select>
         );
+        }
 
       case 'dict':
       case 'object':
@@ -785,8 +1169,12 @@ export function PropertyPanel({ onCollapse }: { onCollapse: () => void }) {
           <div className="space-y-3">
             {catalogEntry.parameters.filter((param) => isParameterVisible(param.name)).map((param) => {
               const currentValue = nodeParams[param.name] ?? param.default;
+              const usesInlineProgramParameterBinding =
+                param.name === 'object_id' && SCENE_OBJECT_ID_NODE_IDS.has(selectedCatalogId);
               const supportsProgramParameterBinding =
-                param.parameterizable && SUPPORTED_PROGRAM_PARAMETER_TYPES.has(param.type);
+                !usesInlineProgramParameterBinding
+                && param.parameterizable
+                && SUPPORTED_PROGRAM_PARAMETER_TYPES.has(param.type);
 
               return (
                 <div key={param.name} className="space-y-3">

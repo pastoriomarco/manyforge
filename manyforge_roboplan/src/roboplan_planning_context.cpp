@@ -5,6 +5,7 @@
 #include <cmath>
 #include <deque>
 #include <map>
+#include <roboplan/core/scene_utils.hpp>
 #include <stdexcept>
 #include <string>
 #include <variant>
@@ -18,6 +19,14 @@ uint64_t steady_now_ns() {
   return std::chrono::duration_cast<std::chrono::nanoseconds>(
              tp.time_since_epoch())
       .count();
+}
+
+Eigen::VectorXd vector_from_std(const std::vector<double>& positions) {
+  Eigen::VectorXd q(positions.size());
+  for (size_t i = 0; i < positions.size(); ++i) {
+    q[static_cast<Eigen::Index>(i)] = positions[i];
+  }
+  return q;
 }
 
 }  // namespace
@@ -36,9 +45,23 @@ RoboPlanPlanningContext::RoboPlanPlanningContext(
 core::RobotStateDTO RoboPlanPlanningContext::get_current_state() {
   std::lock_guard<std::mutex> scene_lock(*scene_mutex_);
   core::RobotStateDTO state;
-  state.joint_names = scene_->getActuatedJointNames();
+  const auto maybe_group_info = scene_->getJointGroupInfo(group_name_);
+  if (!maybe_group_info) {
+    throw std::runtime_error("Failed to get current state: " + maybe_group_info.error());
+  }
+  const auto& group_info = maybe_group_info.value();
+  state.joint_names = group_info.joint_names;
 
-  const auto& positions = scene_->getCurrentJointPositions();
+  Eigen::VectorXd positions = scene_->getCurrentJointPositions()(group_info.q_indices);
+  if (group_info.has_continuous_dofs) {
+    auto maybe_collapsed =
+        roboplan::collapseContinuousJointPositions(*scene_, group_name_, positions);
+    if (!maybe_collapsed) {
+      throw std::runtime_error("Failed to get current state: " + maybe_collapsed.error());
+    }
+    positions = maybe_collapsed.value();
+  }
+
   state.positions_rad.resize(positions.size());
   for (Eigen::Index i = 0; i < positions.size(); ++i) {
     state.positions_rad[i] = positions[i];
@@ -57,9 +80,9 @@ core::ValidationResultDTO RoboPlanPlanningContext::validate_trajectory(
     // Collision check at each waypoint.
     for (const auto& wp : trajectory.waypoints) {
       std::lock_guard<std::mutex> scene_lock(*scene_mutex_);
-      Eigen::VectorXd q(wp.positions_rad.size());
-      for (size_t i = 0; i < wp.positions_rad.size(); ++i) {
-        q[i] = wp.positions_rad[i];
+      Eigen::VectorXd q = vector_from_std(wp.positions_rad);
+      if (q.size() != scene_->getCurrentJointPositions().size()) {
+        q = scene_->toFullJointPositions(group_name_, q);
       }
       if (scene_->hasCollisions(q)) {
         result.error = core::ErrorDTO{
@@ -78,9 +101,9 @@ core::ValidationResultDTO RoboPlanPlanningContext::validate_trajectory(
       for (size_t i = 0; i < trajectory.waypoints.size(); ++i) {
         const auto& wp = trajectory.waypoints[i];
         std::lock_guard<std::mutex> scene_lock(*scene_mutex_);
-        Eigen::VectorXd q(wp.positions_rad.size());
-        for (size_t j = 0; j < wp.positions_rad.size(); ++j) {
-          q[j] = wp.positions_rad[j];
+        Eigen::VectorXd q = vector_from_std(wp.positions_rad);
+        if (q.size() != scene_->getCurrentJointPositions().size()) {
+          q = scene_->toFullJointPositions(group_name_, q);
         }
 
         Eigen::Matrix4d tform = scene_->forwardKinematics(q, options.tcp_frame);
@@ -123,9 +146,9 @@ core::CollisionCheckResultDTO RoboPlanPlanningContext::collision_check(
   core::CollisionCheckResultDTO result;
 
   std::lock_guard<std::mutex> scene_lock(*scene_mutex_);
-  Eigen::VectorXd q(request.robot_state.positions_rad.size());
-  for (size_t i = 0; i < request.robot_state.positions_rad.size(); ++i) {
-    q[i] = request.robot_state.positions_rad[i];
+  Eigen::VectorXd q = vector_from_std(request.robot_state.positions_rad);
+  if (q.size() != scene_->getCurrentJointPositions().size()) {
+    q = scene_->toFullJointPositions(group_name_, q);
   }
   result.in_collision = scene_->hasCollisions(q);
 
@@ -135,9 +158,9 @@ core::CollisionCheckResultDTO RoboPlanPlanningContext::collision_check(
 core::Pose3DTO RoboPlanPlanningContext::forward_kinematics(
     const core::FkRequestDTO& request) {
   std::lock_guard<std::mutex> scene_lock(*scene_mutex_);
-  Eigen::VectorXd q(request.robot_state.positions_rad.size());
-  for (size_t i = 0; i < request.robot_state.positions_rad.size(); ++i) {
-    q[i] = request.robot_state.positions_rad[i];
+  Eigen::VectorXd q = vector_from_std(request.robot_state.positions_rad);
+  if (q.size() != scene_->getCurrentJointPositions().size()) {
+    q = scene_->toFullJointPositions(group_name_, q);
   }
 
   Eigen::Matrix4d tform = scene_->forwardKinematics(q, request.target_frame);
@@ -248,7 +271,11 @@ core::JointLimitsDTO RoboPlanPlanningContext::get_joint_limits(
     const std::string& /*robot_id*/, const std::string& /*group_id*/) {
   std::lock_guard<std::mutex> scene_lock(*scene_mutex_);
   core::JointLimitsDTO limits;
-  limits.joint_names = scene_->getActuatedJointNames();
+  const auto maybe_group_info = scene_->getJointGroupInfo(group_name_);
+  if (!maybe_group_info) {
+    throw std::runtime_error("Failed to get joint limits: " + maybe_group_info.error());
+  }
+  limits.joint_names = maybe_group_info->joint_names;
 
   auto pos_limits = scene_->getPositionLimitVectors(group_name_);
   if (pos_limits.has_value()) {
@@ -295,7 +322,11 @@ std::vector<std::string> RoboPlanPlanningContext::get_scene_object_ids() {
 
 std::vector<std::string> RoboPlanPlanningContext::get_joint_names() {
   std::lock_guard<std::mutex> scene_lock(*scene_mutex_);
-  return scene_->getActuatedJointNames();
+  const auto maybe_group_info = scene_->getJointGroupInfo(group_name_);
+  if (!maybe_group_info) {
+    throw std::runtime_error("Failed to get joint names: " + maybe_group_info.error());
+  }
+  return maybe_group_info->joint_names;
 }
 
 std::vector<RoboPlanPlanningContext::SceneObjectSnapshot>
@@ -410,6 +441,33 @@ bool RoboPlanPlanningContext::infer_attached_from_frame(
   return !frame_id.empty() && frame_id != "universe" && frame_id != "base_link";
 }
 
+tl::expected<void, std::string> RoboPlanPlanningContext::set_touch_links_locked(
+    const std::string& object_id,
+    const std::vector<std::string>& touch_links,
+    bool enable) {
+  for (const auto& link_name : touch_links) {
+    auto result = scene_->setCollisions(object_id, link_name, enable);
+    if (!result.has_value()) {
+      return tl::make_unexpected(result.error());
+    }
+  }
+  return {};
+}
+
+tl::expected<void, std::string> RoboPlanPlanningContext::clear_touch_links_locked(
+    const std::string& object_id,
+    TrackedObjectState& tracked) {
+  if (tracked.touch_links.empty()) {
+    return {};
+  }
+  auto result = set_touch_links_locked(object_id, tracked.touch_links, true);
+  if (!result.has_value()) {
+    return result;
+  }
+  tracked.touch_links.clear();
+  return {};
+}
+
 void RoboPlanPlanningContext::record_scene_event_locked(SceneTraceEvent event) {
   if (event.timestamp_ns == 0) {
     event.timestamp_ns = steady_now_ns();
@@ -518,7 +576,7 @@ core::SceneEditResultDTO RoboPlanPlanningContext::add_object(
     }
 
     object_states_[request.object_id] = TrackedObjectState{
-        matrix_to_pose(tform), request.shape, add_frame_id, false};
+        matrix_to_pose(tform), request.shape, add_frame_id, false, {}};
 
     if (attached_request) {
       auto reparent_result =
@@ -665,7 +723,53 @@ core::SceneEditResultDTO RoboPlanPlanningContext::attach_object(
       record_scene_event_locked(std::move(event));
       return result;
     }
-    return reparent_object_locked(request.object_id, request.frame_id);
+    const auto it = object_states_.find(request.object_id);
+    if (it == object_states_.end()) {
+      auto result = core::SceneEditResultDTO{
+          false,
+          core::ErrorDTO{core::kErrorObjectNotFound,
+                         "Object not found: " + request.object_id, {}}};
+      SceneTraceEvent event;
+      event.event = "attach";
+      event.object_id = request.object_id;
+      event.success = false;
+      event.frame_id = request.frame_id;
+      event.error = result.error->message;
+      record_scene_event_locked(std::move(event));
+      return result;
+    }
+    auto& tracked = it->second;
+    auto clear_result = clear_touch_links_locked(request.object_id, tracked);
+    if (!clear_result.has_value()) {
+      return core::SceneEditResultDTO{
+          false,
+          core::ErrorDTO{
+              core::kErrorInternalError,
+              "Failed to clear existing touch links before attach: " + clear_result.error(),
+              {},
+          },
+      };
+    }
+    auto result = reparent_object_locked(request.object_id, request.frame_id);
+    if (!result.success) {
+      return result;
+    }
+    if (!request.touch_links.empty()) {
+      auto collision_result =
+          set_touch_links_locked(request.object_id, request.touch_links, false);
+      if (!collision_result.has_value()) {
+        return core::SceneEditResultDTO{
+            false,
+            core::ErrorDTO{
+                core::kErrorInternalError,
+                "Failed to set touch links for attached object: " + collision_result.error(),
+                {},
+            },
+        };
+      }
+      tracked.touch_links = request.touch_links;
+    }
+    return result;
   } catch (const std::exception& e) {
     std::lock_guard<std::mutex> scene_lock(*scene_mutex_);
     SceneTraceEvent event;
@@ -685,6 +789,26 @@ core::SceneEditResultDTO RoboPlanPlanningContext::detach_object(
   try {
     std::lock_guard<std::mutex> scene_lock(*scene_mutex_);
     const std::string target_frame = request.frame_id.empty() ? "universe" : request.frame_id;
+    const auto it = object_states_.find(request.object_id);
+    if (it == object_states_.end()) {
+      return core::SceneEditResultDTO{
+          false,
+          core::ErrorDTO{core::kErrorObjectNotFound,
+                         "Object not found: " + request.object_id, {}},
+      };
+    }
+    auto& tracked = it->second;
+    auto clear_result = clear_touch_links_locked(request.object_id, tracked);
+    if (!clear_result.has_value()) {
+      return core::SceneEditResultDTO{
+          false,
+          core::ErrorDTO{
+              core::kErrorInternalError,
+              "Failed to clear touch links before detach: " + clear_result.error(),
+              {},
+          },
+      };
+    }
     return reparent_object_locked(request.object_id, target_frame);
   } catch (const std::exception& e) {
     std::lock_guard<std::mutex> scene_lock(*scene_mutex_);

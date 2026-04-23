@@ -33,6 +33,7 @@ export interface CatalogEntry {
   name: string;
   category: string;
   description: string;
+  stability: 'stable' | 'experimental' | 'deprecated';
   kind: string;
   childrenMin: number;
   childrenMax: number;
@@ -68,10 +69,17 @@ export interface ProgramInfo {
   programProfile: string;
   robot: Robot;
   sceneCount: number;
+  sceneResources: ProgramSceneResource[];
   parameterCount: number;
   parameters: ProgramParameter[];
   blackboard: ProgramBlackboard;
   sourcePath: string;
+}
+
+export interface ProgramSceneResource {
+  objectId: string;
+  shape: Record<string, unknown>;
+  pose: Record<string, unknown>;
 }
 
 export interface ProgramParameter {
@@ -110,6 +118,17 @@ export interface ProgramBlackboard {
 
 export interface ProgramTree {
   tree: TreeNode;
+}
+
+export interface ProgramValidationIssue {
+  path: string;
+  message: string;
+}
+
+export interface ProgramValidateResponse {
+  valid: boolean;
+  errors: ProgramValidationIssue[];
+  warnings: ProgramValidationIssue[];
 }
 
 export interface RuntimeOverrideEntry {
@@ -212,7 +231,24 @@ export interface RobotConfig {
   robotId: string;
   groupId: string;
   urdfPath: string;
+  srdfPath: string;
+  packagePaths: string[];
   globalMaxTcpLinearSpeedMps: number;
+}
+
+export interface GripperConfig {
+  commandMode: string;
+  groupId: string;
+  jointName: string;
+  openPosition: number;
+  closedPosition: number;
+  motionTimeS: number;
+  description: string;
+  touchLinks: string[];
+  mountFrame: string;
+  attachFrame: string;
+  tcpFrame: string;
+  auxiliaryFrames: string[];
 }
 
 export interface DeploymentInfo {
@@ -220,6 +256,7 @@ export interface DeploymentInfo {
   description: string;
   programProfile: string;
   robotConfig: RobotConfig;
+  grippers: Record<string, GripperConfig>;
 }
 
 export interface FullDeployment {
@@ -229,6 +266,7 @@ export interface FullDeployment {
   description: string;
   programProfile: string;
   robotConfig: RobotConfig;
+  grippers: Record<string, GripperConfig>;
   adapters: Record<string, AdapterConfig>;
   orchestrator: OrchestratorConfig;
   launch: LaunchConfig;
@@ -288,12 +326,53 @@ export interface SceneObjectState {
   pose_in_universe?: Record<string, unknown> | null;
   attached: boolean;
   attached_to?: string | null;
+  source: 'authored' | 'runtime' | 'attached' | 'sensed';
+  persistable: boolean;
 }
 
 export interface SceneStateResponse {
   robot?: SceneRobotState | null;
   objects: SceneObjectState[];
   timestamp_ns: number;
+}
+
+export interface SceneEditRequest {
+  operation: 'add' | 'remove' | 'update_pose' | 'attach' | 'detach';
+  object_id: string;
+  shape_type?: 'box' | 'sphere';
+  box_dimensions_m?: number[];
+  sphere_radius_m?: number;
+  pose_position_m?: number[];
+  pose_orientation_xyzw?: number[];
+  frame_id?: string;
+}
+
+export interface SceneEditResponse {
+  success: boolean;
+  error?: string | null;
+  timestamp_ns: number;
+}
+
+export interface SceneFrameState {
+  name: string;
+  roles: string[];
+  viewerVisible: boolean;
+  poseAvailable: boolean;
+}
+
+export interface SceneFramesResponse {
+  frames: SceneFrameState[];
+  hmiAvailable: boolean;
+  timestampNs: number;
+}
+
+export interface SceneFrameVisibilityResponse {
+  success: boolean;
+  frameName: string;
+  visible: boolean;
+  hmiAvailable: boolean;
+  timestampNs: number;
+  error?: string | null;
 }
 
 export interface ModelEndpointProbe {

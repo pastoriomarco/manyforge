@@ -14,6 +14,7 @@ from manyforge_behavior.nodes.geometry import CheckPoseDistance, GetLinkPose
 from manyforge_behavior.nodes.logic import (
     CheckKeyBoolValue,
     CheckSignalBool,
+    CommandGripper,
     CheckGripperState,
     SetKeyBoolValue,
     SetSignalBool,
@@ -65,6 +66,7 @@ PLUGIN_FACTORY: dict[str, type] = {
     "set_signal_bool": SetSignalBool,
     "wait_for_signal_bool": WaitForSignalBool,
     "wait_for_signal_edge": WaitForSignalEdge,
+    "command_gripper": CommandGripper,
     "check_gripper_state": CheckGripperState,
     "set_gripper_state": SetGripperState,
     "wait_for_gripper_state": WaitForGripperState,
@@ -140,12 +142,12 @@ class OrchestratorRunner:
         if self._provided_deployment is not None:
             self._deployment = self._provided_deployment
             self._deployment.validate_against_program(self._program)
-            self._deployment.validate_capabilities()
+            self._deployment.validate_capabilities(self._program)
         elif self._deployment_path:
             from manyforge_behavior.deployment import Deployment
             self._deployment = Deployment(self._deployment_path)
             self._deployment.validate_against_program(self._program)
-            self._deployment.validate_capabilities()
+            self._deployment.validate_capabilities(self._program)
 
     def build_tree(self) -> py_trees.trees.BehaviourTree:
         """Build a py_trees BehaviourTree from the loaded program."""
@@ -182,6 +184,24 @@ class OrchestratorRunner:
                 "sphere_radius_m": resource.shape.get("sphere_radius_m"),
             }
         bb.scene_objects = scene_registry
+
+        bb.register_key(key="gripper_configs", access=py_trees.common.Access.WRITE)
+        if self._deployment is not None:
+            bb.gripper_configs = {
+                gripper_id: {
+                    "command_mode": config.command_mode,
+                    "group_id": config.group_id,
+                    "joint_name": config.joint_name,
+                    "open_position": config.open_position,
+                    "closed_position": config.closed_position,
+                    "motion_time_s": config.motion_time_s,
+                    "description": config.description,
+                    "touch_links": list(config.touch_links),
+                }
+                for gripper_id, config in self._deployment.grippers.items()
+            }
+        else:
+            bb.gripper_configs = {}
 
         # Write global TCP speed cap from deployment if available
         if self._deployment:

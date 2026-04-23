@@ -114,13 +114,129 @@ class TestProgramValidation:
     def test_rejects_duplicate_scene_ids(self, catalog):
         data = _minimal_program()
         data["scene"] = [
-            {"object_id": "dup", "shape": {"type": "box"}, "pose": {}},
-            {"object_id": "dup", "shape": {"type": "sphere"}, "pose": {}},
+            {
+                "object_id": "dup",
+                "shape": {"type": "box", "box_dimensions_m": [0.1, 0.1, 0.1]},
+                "pose": {
+                    "frame_id": "base_link",
+                    "position_m": [0.0, 0.0, 0.0],
+                    "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+                },
+            },
+            {
+                "object_id": "dup",
+                "shape": {"type": "sphere", "sphere_radius_m": 0.05},
+                "pose": {
+                    "frame_id": "base_link",
+                    "position_m": [0.0, 0.0, 0.0],
+                    "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+                },
+            },
         ]
         path = _write_program(data)
         with pytest.raises(ProgramValidationError, match="Duplicate scene"):
             Program(path, catalog)
         os.unlink(path)
+
+    def test_rejects_scene_resource_missing_object_id(self, catalog):
+        data = _minimal_program(
+            scene=[
+                {
+                    "shape": {"type": "box", "box_dimensions_m": [0.1, 0.1, 0.1]},
+                    "pose": {
+                        "frame_id": "base_link",
+                        "position_m": [0.0, 0.0, 0.0],
+                        "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+                    },
+                }
+            ]
+        )
+        with pytest.raises(ProgramValidationError, match=r"scene\[0\] object_id is required"):
+            Program.from_dict(data, catalog)
+
+    def test_rejects_scene_resource_missing_pose_frame_id(self, catalog):
+        data = _minimal_program(
+            scene=[
+                {
+                    "object_id": "box1",
+                    "shape": {"type": "box", "box_dimensions_m": [0.1, 0.1, 0.1]},
+                    "pose": {
+                        "position_m": [0.0, 0.0, 0.0],
+                        "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+                    },
+                }
+            ]
+        )
+        with pytest.raises(ProgramValidationError, match=r"scene\[0\] pose\.frame_id is required"):
+            Program.from_dict(data, catalog)
+
+    def test_rejects_scene_resource_invalid_orientation_arity(self, catalog):
+        data = _minimal_program(
+            scene=[
+                {
+                    "object_id": "box1",
+                    "shape": {"type": "box", "box_dimensions_m": [0.1, 0.1, 0.1]},
+                    "pose": {
+                        "frame_id": "base_link",
+                        "position_m": [0.0, 0.0, 0.0],
+                        "orientation_xyzw": [0.0, 0.0, 1.0],
+                    },
+                }
+            ]
+        )
+        with pytest.raises(
+            ProgramValidationError,
+            match=r"scene\[0\] pose\.orientation_xyzw must be a list of 4 numeric values",
+        ):
+            Program.from_dict(data, catalog)
+
+    def test_rejects_scene_resource_with_both_orientation_encodings(self, catalog):
+        data = _minimal_program(
+            scene=[
+                {
+                    "object_id": "box1",
+                    "shape": {"type": "box", "box_dimensions_m": [0.1, 0.1, 0.1]},
+                    "pose": {
+                        "frame_id": "base_link",
+                        "position_m": [0.0, 0.0, 0.0],
+                        "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+                        "orientation_rpy_deg": [0.0, 0.0, 0.0],
+                    },
+                }
+            ]
+        )
+        with pytest.raises(
+            ProgramValidationError,
+            match=r"scene\[0\] pose must define exactly one of orientation_xyzw or orientation_rpy_deg",
+        ):
+            Program.from_dict(data, catalog)
+
+    def test_allows_scene_resource_with_orientation_rpy_deg(self, catalog):
+        data = _minimal_program(
+            scene=[
+                {
+                    "object_id": "box1",
+                    "shape": {"type": "box", "box_dimensions_m": [0.1, 0.1, 0.1]},
+                    "pose": {
+                        "frame_id": "base_link",
+                        "position_m": [0.0, 0.0, 0.0],
+                        "orientation_rpy_deg": [0.0, 0.0, 45.0],
+                    },
+                }
+            ],
+            tree={
+                "id": "sequence",
+                "name": "root",
+                "children": [
+                    {
+                        "id": "reset_trajectories",
+                        "name": "reset",
+                    }
+                ],
+            },
+        )
+        program = Program.from_dict(data, catalog)
+        assert program.scene[0].pose["orientation_rpy_deg"] == [0.0, 0.0, 45.0]
 
     def test_rejects_duplicate_param_names(self, catalog):
         data = _minimal_program()
@@ -216,6 +332,85 @@ class TestProgramValidation:
             Program(path, catalog)
         os.unlink(path)
 
+    def test_allows_add_collision_object_object_id_from_declared_blackboard_key(self, catalog):
+        data = _minimal_program(
+            blackboard={
+                "keys": [
+                    {
+                        "id": "target_object_id",
+                        "type": "string",
+                        "key": "scene/target_object_id",
+                    },
+                ],
+            },
+        )
+        data["tree"] = {
+            "id": "sequence",
+            "name": "root",
+            "children": [
+                {
+                    "id": "add_collision_object",
+                    "name": "spawn_selected",
+                    "params": {
+                        "object_id": {"key_ref": "target_object_id"},
+                        "shape_type": "box",
+                        "box_dimensions_m": [0.1, 0.1, 0.1],
+                        "pose": {
+                            "position_m": [0.0, 0.0, 0.0],
+                            "orientation_rpy_deg": [0.0, 0.0, 0.0],
+                        },
+                        "frame_id": "base_link",
+                    },
+                },
+            ],
+        }
+        path = _write_program(data)
+        try:
+            program = Program(path, catalog)
+            assert program.tree.children[0].params["object_id"] == {"key_ref": "target_object_id"}
+        finally:
+            os.unlink(path)
+
+    def test_rejects_add_collision_object_object_id_from_undeclared_blackboard_key(self, catalog):
+        data = _minimal_program(
+            blackboard={
+                "keys": [
+                    {
+                        "id": "other_object_id",
+                        "type": "string",
+                        "key": "scene/other_object_id",
+                    },
+                ],
+            },
+        )
+        data["tree"] = {
+            "id": "sequence",
+            "name": "root",
+            "children": [
+                {
+                    "id": "add_collision_object",
+                    "name": "spawn_selected",
+                    "params": {
+                        "object_id": {"key_ref": "target_object_id"},
+                        "shape_type": "box",
+                        "box_dimensions_m": [0.1, 0.1, 0.1],
+                        "pose": {
+                            "position_m": [0.0, 0.0, 0.0],
+                            "orientation_rpy_deg": [0.0, 0.0, 0.0],
+                        },
+                        "frame_id": "base_link",
+                    },
+                },
+            ],
+        }
+        path = _write_program(data)
+        with pytest.raises(
+            ProgramValidationError,
+            match="key_ref 'target_object_id' is not declared in program.blackboard.keys",
+        ):
+            Program(path, catalog)
+        os.unlink(path)
+
     def test_rejects_declared_namespace_contract_mismatch(self, catalog):
         data = _minimal_program(
             blackboard={
@@ -263,6 +458,59 @@ class TestProgramValidation:
         with pytest.raises(ProgramValidationError, match="Unknown catalog"):
             Program(path, catalog)
         os.unlink(path)
+
+    def test_rejects_node_when_deployment_capability_missing(self, catalog):
+        data = _minimal_program()
+        data["tree"] = {
+            "id": "sequence",
+            "name": "root",
+            "children": [
+                {
+                    "id": "command_gripper",
+                    "name": "close_gripper",
+                    "params": {
+                        "gripper_id": "primary",
+                        "command": "close",
+                    },
+                }
+            ],
+        }
+        path = _write_program(data)
+        try:
+            with pytest.raises(
+                ProgramValidationError,
+                match=r"requires capabilities \['execution\.gripper\.command'\]",
+            ):
+                Program(path, catalog, deployment_capability_keys=set())
+        finally:
+            os.unlink(path)
+
+    def test_allows_node_when_deployment_capability_present(self, catalog):
+        data = _minimal_program()
+        data["tree"] = {
+            "id": "sequence",
+            "name": "root",
+            "children": [
+                {
+                    "id": "command_gripper",
+                    "name": "close_gripper",
+                    "params": {
+                        "gripper_id": "primary",
+                        "command": "close",
+                    },
+                }
+            ],
+        }
+        path = _write_program(data)
+        try:
+            program = Program(
+                path,
+                catalog,
+                deployment_capability_keys={"execution.gripper.command"},
+            )
+            assert "execution.gripper.command" in program.required_capabilities()
+        finally:
+            os.unlink(path)
 
     def test_rejects_duplicate_node_names(self, catalog):
         data = _minimal_program()

@@ -263,6 +263,7 @@ def test_catalog_entry(client):
     assert "name" in data
     assert "category" in data
     assert "description" in data
+    assert data["stability"] == "stable"
     assert "kind" in data
 
 
@@ -293,6 +294,14 @@ def test_catalog_entry_includes_interrupt_metadata(client):
     data = response.json()
     assert data["interruptible"] is True
     assert data["defaultInterruptScope"] == "kernel_motion"
+
+
+def test_catalog_entry_includes_stability_metadata(client):
+    """Catalog entry surfaces experimental/stable lifecycle metadata."""
+    response = client.get("/api/catalog/command_gripper")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["stability"] == "experimental"
 
 
 def test_program_response_includes_interrupt_metadata(client, tmp_path):
@@ -375,6 +384,21 @@ def test_load_program(client, state):
     assert "programProfile" in data
     assert "robot" in data
     assert "sceneCount" in data
+    assert "sceneResources" in data
+    assert data["sceneResources"] == [
+        {
+            "objectId": "table",
+            "shape": {
+                "type": "box",
+                "box_dimensions_m": [1.0, 0.6, 0.02],
+            },
+            "pose": {
+                "frame_id": "base_link",
+                "position_m": [0.5, 0.0, 0.4],
+                "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+            },
+        }
+    ]
     assert "parameterCount" in data
     assert "parameters" in data
     assert data["parameters"][0]["name"] == "pick_velocity_scale"
@@ -397,6 +421,7 @@ def test_get_program(client, state):
     data = response.json()
     assert "name" in data
     assert "robot" in data
+    assert data["sceneResources"][0]["objectId"] == "table"
     assert data["parameters"][0]["name"] == "pick_velocity_scale"
 
 
@@ -408,6 +433,7 @@ def test_get_saved_program_returns_saved_parameters(client):
     data = response.json()
     assert data["parameters"][0]["name"] == "pick_velocity_scale"
     assert data["parameters"][0]["default"] == 0.5
+    assert data["sceneResources"][0]["objectId"] == "table"
 
 
 def test_get_program_not_loaded(client):
@@ -1112,6 +1138,35 @@ def test_get_saved_program_tree_reflects_disk_not_applied_runtime(client):
     assert saved_tree["name"] == "main_sequence"
 
 
+def test_session_apply_surfaces_validation_reason(client):
+    """POST /api/session/apply includes the concrete validation failure in the response detail."""
+    client.post("/api/program/load", json={"path": _PROGRAM_PATH})
+
+    invalid_tree = {
+        "id": "sequence",
+        "name": "invalid_sequence",
+        "children": [
+            {
+                "id": "add_collision_object",
+                "name": "add_object",
+                "params": {
+                    "object_id": "graspable_copy",
+                    "frame_id": "universe",
+                    "pose": {
+                        "position_m": [0.0, 0.0, 0.0],
+                        "orientation_rpy_deg": [0.0, 0.0, 0.0],
+                    },
+                },
+                "children": [],
+            },
+        ],
+    }
+
+    response = client.post("/api/session/apply", json={"tree": invalid_tree})
+    assert response.status_code == 400
+    assert "missing required parameter 'shape_type'" in response.json()["detail"]
+
+
 # =============================================================================
 # Deployment Tests
 # =============================================================================
@@ -1619,6 +1674,35 @@ def test_apply_session_updates_program_parameters_without_touching_saved_artifac
     assert saved_program["parameters"][0]["default"] == 0.5
 
 
+def test_apply_session_updates_scene_without_touching_saved_artifact(client):
+    client.post("/api/program/load", json={"path": _PROGRAM_PATH, "deployment_path": _DEPLOYMENT_PATH})
+
+    response = client.post(
+        "/api/session/apply",
+        json={
+            "scene": [
+                {
+                    "objectId": "runtime_box",
+                    "shape": {
+                        "type": "box",
+                        "box_dimensions_m": [0.08, 0.08, 0.12],
+                    },
+                    "pose": {
+                        "position_m": [0.45, 0.0, 0.06],
+                        "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+                    },
+                }
+            ]
+        },
+    )
+    assert response.status_code == 200
+
+    current_program = client.get("/api/program").json()
+    saved_program = client.get("/api/program/saved").json()
+    assert current_program["sceneResources"][0]["objectId"] == "runtime_box"
+    assert saved_program["sceneResources"][0]["objectId"] == "table"
+
+
 def test_save_program_persists_updated_parameters(client, tmp_path):
     client.post("/api/program/load", json={"path": _PROGRAM_PATH})
 
@@ -1644,6 +1728,35 @@ def test_save_program_persists_updated_parameters(client, tmp_path):
     assert response.status_code == 200
     saved_yaml = yaml.safe_load(Path(response.json()["path"]).read_text(encoding="utf-8"))
     assert saved_yaml["parameters"][0]["default"] == 0.75
+
+
+def test_save_program_persists_updated_scene_resources(client, tmp_path):
+    client.post("/api/program/load", json={"path": _PROGRAM_PATH})
+
+    save_target = tmp_path / "scene_promoted"
+    response = client.post(
+        "/api/program/save",
+        json={
+            "path": str(save_target),
+            "scene": [
+                {
+                    "objectId": "runtime_box",
+                    "shape": {
+                        "type": "box",
+                        "box_dimensions_m": [0.1, 0.2, 0.3],
+                    },
+                    "pose": {
+                        "position_m": [0.4, 0.1, 0.2],
+                        "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+                    },
+                }
+            ],
+        },
+    )
+    assert response.status_code == 200
+    saved_yaml = yaml.safe_load(Path(response.json()["path"]).read_text(encoding="utf-8"))
+    assert saved_yaml["scene"][0]["object_id"] == "runtime_box"
+    assert saved_yaml["scene"][0]["shape"]["box_dimensions_m"] == [0.1, 0.2, 0.3]
 
 
 # =============================================================================

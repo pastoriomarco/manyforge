@@ -13,6 +13,10 @@ from manyforge_behavior.catalog import NodeCatalog
 from manyforge_behavior.cycle_manager import CycleManager, CycleState
 from manyforge_behavior.deployment import Deployment
 from manyforge_behavior.kernel_client import KernelClient, MockKernelClient
+from manyforge_behavior.model_paths import (
+    default_package_paths,
+    resolve_robot_model,
+)
 from manyforge_behavior.program import Program
 from manyforge_behavior.runner import OrchestratorRunner
 
@@ -40,12 +44,34 @@ def create_kernel(deployment: Deployment) -> KernelClient:
             import manyforge_roboplan_py
             from native_kernel_client import NativeKernelClient
 
-            # Extract model/group from robot config
-            urdf_stem = deployment.robot_config.urdf_path.rsplit("/", 1)[-1].replace(".urdf", "")
-            group = deployment.robot_config.group_id
-            bundle = manyforge_roboplan_py.create_native_kernel(
-                urdf_stem, group, _native_kernel_config_from_deployment(deployment)
-            )
+            robot_config = deployment.robot_config
+            group = robot_config.group_id
+            if robot_config.srdf_path:
+                extra_package_paths = (
+                    []
+                    if robot_config.package_paths
+                    else default_package_paths()
+                )
+                resolved_model = resolve_robot_model(
+                    urdf_path=robot_config.urdf_path,
+                    srdf_path=robot_config.srdf_path,
+                    package_paths=robot_config.package_paths,
+                    deployment_path=deployment.source_path,
+                    extra_package_paths=extra_package_paths,
+                )
+                bundle = manyforge_roboplan_py.create_native_kernel_from_paths(
+                    resolved_model.model_name,
+                    group,
+                    resolved_model.urdf_path,
+                    resolved_model.srdf_path,
+                    resolved_model.package_paths,
+                    _native_kernel_config_from_deployment(deployment),
+                )
+            else:
+                model_name = robot_config.urdf_path.rsplit("/", 1)[-1].replace(".urdf", "")
+                bundle = manyforge_roboplan_py.create_native_kernel(
+                    model_name, group, _native_kernel_config_from_deployment(deployment)
+                )
             return NativeKernelClient(bundle)
         except ImportError:
             print("WARNING: manyforge_roboplan_py not available, using MockKernelClient")
@@ -94,8 +120,9 @@ def main():
     catalog = NodeCatalog(args.catalog)
 
     # Cross-validate
-    deployment.validate_against_program(Program(args.program, catalog))
-    deployment.validate_capabilities()
+    program = Program(args.program, catalog)
+    deployment.validate_against_program(program)
+    deployment.validate_capabilities(program)
 
     # 2. Create kernel based on deployment adapter config
     kernel = create_kernel(deployment)

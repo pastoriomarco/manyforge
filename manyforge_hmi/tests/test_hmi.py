@@ -21,6 +21,8 @@ from manyforge_behavior.kernel_client import (
     ExecuteRequest,
     ExecuteResult,
     CommandResult,
+    GripperCommandState,
+    GripperCommandStatus,
     SceneEditRequest,
 )
 from manyforge_behavior.cycle_manager import CycleManager, CycleState
@@ -156,6 +158,7 @@ class TestStateBridge:
         assert pose["position_m"] == [0.3, 0.0, 0.2]
         assert state.exists is True
         assert state.frame_id == "universe"
+        assert bridge.get_link_pose("tool0", "universe") is not None
 
 
 # ============================================================================
@@ -561,11 +564,21 @@ class TestViserHmiServer:
 
         monkeypatch.setattr(_urdf_module, "_viser_name_from_frame", fake_name_from_frame)
         server._robot_visualizer = FakeVisualizer()
+        server._bridge.get_gripper_configs = lambda: {
+            "primary": {
+                "mount_frame": "tool0",
+                "attach_frame": "grasp_frame",
+                "tcp_frame": "grasp_frame",
+                "auxiliary_frames": ["insertion_frame"],
+            }
+        }
         server._rebuild_link_viser_paths()
 
         assert calls
         assert all(root_node_name == "/robot/visual" for _, root_node_name in calls)
         assert server._link_viser_paths["tool0"] == "/robot/visual/tool0"
+        assert server._link_viser_paths["grasp_frame"] == "/robot/visual/grasp_frame"
+        assert server._link_viser_paths["insertion_frame"] == "/robot/visual/insertion_frame"
 
         server.stop()
 
@@ -649,6 +662,189 @@ class TestViserHmiServer:
 
         assert fake_visualizer.updated == {"joint_a": 0.1, "joint_b": -0.2}
         assert server._last_snapshot_sequence == 7
+
+        server.stop()
+
+    def test_update_once_maps_arm_only_snapshots_around_configured_gripper_joint(self, cycle_manager):
+        """Shorter arm-only snapshots exclude configured gripper joints instead of assuming a prefix."""
+        server = ViserHmiServer(cycle_manager, host="127.0.0.1", port=0)
+
+        class FakeVisualizer:
+            joint_names = ["joint_a", "finger_joint", "joint_b"]
+
+            def __init__(self):
+                self.updates = []
+
+            def update_joints(self, positions):
+                self.updates.append(dict(positions))
+
+        fake_visualizer = FakeVisualizer()
+        server._robot_visualizer = fake_visualizer
+        server._bridge.get_gripper_configs = lambda: {
+            "primary": {"joint_name": "finger_joint"}
+        }
+
+        snapshot = ExecutionSnapshot(
+            timestamp_ns=123,
+            sequence_number=8,
+            execution_id=9,
+            move_id="move_1",
+            state=ExecutionState.EXECUTING,
+            progress=0.5,
+            joint_positions_rad=[0.1, -0.2],
+        )
+        cycle_manager.get_execution_snapshot = lambda: snapshot
+
+        server._update_once()
+
+        assert fake_visualizer.updates[0] == {"joint_a": 0.1, "joint_b": -0.2}
+        assert server._last_snapshot_sequence == 8
+
+        server.stop()
+
+    def test_update_once_ignores_partial_snapshot_when_joint_mapping_is_ambiguous(self, cycle_manager):
+        """Short snapshots without a resolvable arm-only mapping should not update the visualizer."""
+        server = ViserHmiServer(cycle_manager, host="127.0.0.1", port=0)
+
+        class FakeVisualizer:
+            joint_names = ["joint_a", "joint_b", "joint_c"]
+
+            def __init__(self):
+                self.updates = []
+
+            def update_joints(self, positions):
+                self.updates.append(dict(positions))
+
+        fake_visualizer = FakeVisualizer()
+        server._robot_visualizer = fake_visualizer
+        server._bridge.get_gripper_configs = lambda: {"primary": {"joint_name": "finger_joint"}}
+        cycle_manager.get_execution_snapshot = lambda: ExecutionSnapshot(
+            timestamp_ns=123,
+            sequence_number=9,
+            execution_id=9,
+            move_id="move_1",
+            state=ExecutionState.EXECUTING,
+            progress=0.5,
+            joint_positions_rad=[0.1, -0.2],
+        )
+
+        server._update_once()
+
+        assert fake_visualizer.updates == []
+        assert server._last_snapshot_sequence == 9
+
+        server.stop()
+
+    def test_update_once_applies_actuated_gripper_position(self, cycle_manager):
+        """Actuated gripper positions are rendered from kernel gripper status."""
+        server = ViserHmiServer(cycle_manager, host="127.0.0.1", port=0)
+
+        class FakeVisualizer:
+            joint_names = ["joint_a", "joint_b", "finger_joint"]
+
+            def __init__(self):
+                self.updates = []
+
+            def update_joints(self, positions):
+                self.updates.append(dict(positions))
+
+        fake_visualizer = FakeVisualizer()
+        server._robot_visualizer = fake_visualizer
+        cycle_manager.get_execution_snapshot = lambda: ExecutionSnapshot(
+            timestamp_ns=123,
+            sequence_number=9,
+            execution_id=9,
+            move_id="move_1",
+            state=ExecutionState.IDLE,
+            progress=0.0,
+            joint_positions_rad=[0.0, 0.0],
+        )
+        server._bridge.get_gripper_configs = lambda: {
+            "primary": {"joint_name": "finger_joint"}
+        }
+        server._bridge.get_gripper_status = lambda _gripper_id: GripperCommandStatus(
+            state=GripperCommandState.EXECUTING,
+            gripper_id="primary",
+            progress=0.5,
+            current_position=0.35,
+            target_position=0.7,
+        )
+
+        server._update_once()
+
+        assert fake_visualizer.updates[-1] == {"finger_joint": 0.35}
+
+        server.stop()
+
+    def test_update_once_skips_gripper_update_when_status_fetch_fails(self, cycle_manager):
+        """Backend gripper status errors should not break the HMI update loop."""
+        server = ViserHmiServer(cycle_manager, host="127.0.0.1", port=0)
+
+        class FakeVisualizer:
+            joint_names = ["joint_a", "joint_b", "finger_joint"]
+
+            def __init__(self):
+                self.updates = []
+
+            def update_joints(self, positions):
+                self.updates.append(dict(positions))
+
+        fake_visualizer = FakeVisualizer()
+        server._robot_visualizer = fake_visualizer
+        cycle_manager.get_execution_snapshot = lambda: ExecutionSnapshot(
+            timestamp_ns=123,
+            sequence_number=10,
+            execution_id=9,
+            move_id="move_1",
+            state=ExecutionState.IDLE,
+            progress=0.0,
+            joint_positions_rad=[0.0, 0.0],
+        )
+        server._bridge.get_gripper_configs = lambda: {
+            "primary": {"joint_name": "finger_joint"}
+        }
+        server._bridge.get_gripper_status = lambda _gripper_id: (_ for _ in ()).throw(
+            RuntimeError("backend unavailable")
+        )
+
+        server._update_once()
+
+        assert fake_visualizer.updates[0] == {"joint_a": 0.0, "joint_b": 0.0}
+
+        server.stop()
+
+    def test_update_once_syncs_configured_tool_frames_from_backend(self, cycle_manager):
+        """Configured tool frames are rendered as standalone axes from backend poses."""
+        server = ViserHmiServer(cycle_manager, host="127.0.0.1", port=0)
+        cycle_manager.get_execution_snapshot = lambda: ExecutionSnapshot(
+            timestamp_ns=123,
+            sequence_number=10,
+            execution_id=9,
+            move_id="move_1",
+            state=ExecutionState.IDLE,
+            progress=0.0,
+            joint_positions_rad=[],
+        )
+        server._bridge.get_gripper_configs = lambda: {
+            "primary": {
+                "joint_name": "",
+                "mount_frame": "tool0",
+                "attach_frame": "grasp_frame",
+                "tcp_frame": "grasp_frame",
+                "auxiliary_frames": ["insertion_frame"],
+            }
+        }
+
+        server._update_once()
+
+        assert "grasp_frame" in server._frame_handles
+        assert tuple(server._frame_handles["grasp_frame"].position) == pytest.approx(
+            (0.5, 0.0, 0.6)
+        )
+        assert tuple(server._frame_handles["grasp_frame"].wxyz) == pytest.approx(
+            (1.0, 0.0, 0.0, 0.0)
+        )
+        assert server._link_viser_paths["grasp_frame"] == "/frames/grasp_frame"
 
         server.stop()
 
@@ -797,9 +993,29 @@ class TestViserHmiServer:
         )
         diagnostics = server.get_object_render_diagnostics(first.object_id)
         assert diagnostics["state"]["attached"] is True
-        assert diagnostics["frame_path"] == "/robot/visual/tool0"
-        assert diagnostics["render"]["scene_name"] == f"/robot/visual/tool0/{first.object_id}"
+        assert diagnostics["frame_path"] == "/frames/tool0"
+        assert diagnostics["render"]["scene_name"] == f"/frames/tool0/{first.object_id}"
         assert diagnostics["render"]["scene_node_present"] is True
+
+        server.stop()
+
+    def test_frame_visibility_supports_semantic_hide_and_extra_frame_show(self, cycle_manager):
+        """Viewer visibility can hide semantic frames and enable arbitrary model frames."""
+        server = ViserHmiServer(cycle_manager, host="127.0.0.1", port=0)
+        catalog = NodeCatalog(_CATALOG_PATH)
+        program = Program(_PROGRAM_PATH, catalog)
+        server.load_program(program)
+        server._update_once()
+
+        assert server.get_frame_visibility("tool0") is True
+        server.set_frame_visibility("tool0", False)
+        assert server.get_frame_visibility("tool0") is False
+        assert server._frame_handles["tool0"].visible is False
+
+        assert "base_link" not in server._frame_handles
+        server.set_frame_visibility("base_link", True)
+        assert server.get_frame_visibility("base_link") is True
+        assert "base_link" in server._frame_handles
 
         server.stop()
 

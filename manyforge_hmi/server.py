@@ -10,6 +10,14 @@ import viser
 
 logger = logging.getLogger(__name__)
 
+_BACKEND_SYNC_EXCEPTIONS = (
+    AttributeError,
+    KeyError,
+    RuntimeError,
+    TypeError,
+    ValueError,
+)
+
 from .state_bridge import StateBridge
 from .control_panel import ControlPanel
 from .robot_visualizer import RobotVisualizer
@@ -103,6 +111,8 @@ class ViserHmiServer:
         self._program = None
         self._scene_specs: dict[str, object] = {}
         self._link_viser_paths: dict[str, str] = {}
+        self._frame_handles: dict[str, Any] = {}
+        self._frame_visibility_overrides: dict[str, bool] = {}
         self._scene_trace: deque[dict[str, Any]] = deque(maxlen=4096)
         self._scene_snapshot_service = SceneSnapshotService(self._render_scene_sync)
         self._rebuild_link_viser_paths()
@@ -123,6 +133,8 @@ class ViserHmiServer:
             resource.object_id: resource
             for resource in (program.scene or [])
         }
+        self._rebuild_link_viser_paths()
+        self._sync_tool_frames_from_backend()
         self._scene_renderer.clear()
         self.sync_scene_from_backend()
         self.sync_robot_from_backend(force=True)
@@ -162,6 +174,8 @@ class ViserHmiServer:
             self._control_panel.update(state, velocity_scale, snapshot)
 
         self._sync_robot_from_snapshot(snapshot)
+        self._sync_grippers_from_backend()
+        self._sync_tool_frames_from_backend()
 
         if self._scene_specs:
             self.sync_scene_from_backend(snapshot_sequence=snapshot.sequence_number)
@@ -174,38 +188,201 @@ class ViserHmiServer:
             return
 
         joint_names = self._robot_visualizer.joint_names
-        if joint_names and len(snapshot.joint_positions_rad) == len(joint_names):
-            self._robot_visualizer.update_joints(
-                dict(zip(joint_names, snapshot.joint_positions_rad))
-            )
+        if joint_names and snapshot.joint_positions_rad:
+            if len(snapshot.joint_positions_rad) == len(joint_names):
+                self._robot_visualizer.update_joints(
+                    dict(zip(joint_names, snapshot.joint_positions_rad))
+                )
+            elif len(snapshot.joint_positions_rad) < len(joint_names):
+                gripper_joint_names = self._configured_gripper_joint_names()
+                arm_joint_names = [
+                    joint_name
+                    for joint_name in joint_names
+                    if joint_name not in gripper_joint_names
+                ]
+                if len(snapshot.joint_positions_rad) == len(arm_joint_names):
+                    self._robot_visualizer.update_joints(
+                        dict(zip(arm_joint_names, snapshot.joint_positions_rad))
+                    )
+                else:
+                    logger.debug(
+                        "Skipping partial joint snapshot with %s values for visualizer joints=%s arm_joints=%s",
+                        len(snapshot.joint_positions_rad),
+                        len(joint_names),
+                        len(arm_joint_names),
+                    )
             self._last_snapshot_sequence = max(
                 self._last_snapshot_sequence, snapshot.sequence_number
             )
+
+    def _configured_gripper_joint_names(self) -> set[str]:
+        """Return actuated gripper joints declared by deployment config."""
+        try:
+            gripper_configs = self._bridge.get_gripper_configs()
+        except _BACKEND_SYNC_EXCEPTIONS:
+            logger.debug("Could not fetch gripper configs from backend", exc_info=True)
+            return set()
+
+        joint_names: set[str] = set()
+        for config in gripper_configs.values():
+            joint_name = str(config.get("joint_name", "")).strip()
+            if joint_name:
+                joint_names.add(joint_name)
+        return joint_names
+
+    def _sync_grippers_from_backend(self) -> None:
+        """Apply current actuated gripper positions to the robot visualizer."""
+        if not self._robot_visualizer:
+            return
+        try:
+            gripper_configs = self._bridge.get_gripper_configs()
+        except _BACKEND_SYNC_EXCEPTIONS:
+            logger.debug("Could not fetch gripper configs from backend", exc_info=True)
+            return
+        joint_updates: dict[str, float] = {}
+        for gripper_id, config in gripper_configs.items():
+            joint_name = str(config.get("joint_name", "")).strip()
+            if not joint_name:
+                continue
+            try:
+                status = self._bridge.get_gripper_status(gripper_id)
+            except _BACKEND_SYNC_EXCEPTIONS:
+                logger.debug("Could not fetch gripper status for '%s'", gripper_id, exc_info=True)
+                continue
+            if status.current_position is None:
+                continue
+            joint_updates[joint_name] = float(status.current_position)
+        if joint_updates:
+            self._robot_visualizer.update_joints(joint_updates)
 
     def sync_robot_from_backend(self, *, force: bool = False) -> None:
         """Synchronize the robot visualizer from backend state immediately."""
         self._sync_robot_from_snapshot(self._bridge.execution_snapshot, force=force)
 
+    def _semantic_tool_frames(self) -> set[str]:
+        """Collect deployment/program frames with semantic meaning."""
+        frames: set[str] = set()
+        if self._program is not None:
+            tcp_frame = str(getattr(self._program.robot, "tcp_frame", "")).strip()
+            if tcp_frame:
+                frames.add(tcp_frame)
+        try:
+            gripper_configs = self._bridge.get_gripper_configs()
+        except _BACKEND_SYNC_EXCEPTIONS:
+            logger.debug("Could not fetch gripper configs for tool frame tracking", exc_info=True)
+            return frames
+
+        for config in gripper_configs.values():
+            for key in ("mount_frame", "attach_frame", "tcp_frame"):
+                frame_name = str(config.get(key, "")).strip()
+                if frame_name:
+                    frames.add(frame_name)
+            for frame_name in config.get("auxiliary_frames", []) or []:
+                frame_name_str = str(frame_name).strip()
+                if frame_name_str:
+                    frames.add(frame_name_str)
+        return frames
+
+    def _tracked_tool_frames(self) -> set[str]:
+        """Collect all frames currently tracked in the viewer."""
+        semantic_frames = self._semantic_tool_frames()
+        extra_visible_frames = {
+            frame_name
+            for frame_name, visible in self._frame_visibility_overrides.items()
+            if visible and frame_name not in semantic_frames
+        }
+        return semantic_frames | extra_visible_frames
+
+    @staticmethod
+    def _xyzw_to_wxyz(
+        quaternion_xyzw: tuple[float, float, float, float],
+    ) -> tuple[float, float, float, float]:
+        x, y, z, w = quaternion_xyzw
+        return (w, x, y, z)
+
     def _rebuild_link_viser_paths(self) -> None:
         """Build link-name -> Viser scene path map for attached-object rendering."""
         self._link_viser_paths = {}
-        if not self._robot_visualizer:
-            return
+        tracked_frames = sorted(self._tracked_tool_frames())
         try:
-            import viser.extras._urdf as _urdf_module
+            if self._robot_visualizer:
+                import viser.extras._urdf as _urdf_module
 
-            _urdf_scene = self._robot_visualizer.viser_urdf._urdf.scene
-            if _urdf_scene is None:
-                return
-            for frame_name in ("tool0", "wrist_3_link"):
-                try:
-                    self._link_viser_paths[frame_name] = _urdf_module._viser_name_from_frame(
-                        _urdf_scene, frame_name, "/robot/visual"
-                    )
-                except Exception:
-                    pass
+                _urdf_scene = self._robot_visualizer.viser_urdf._urdf.scene
+                if _urdf_scene is not None:
+                    for frame_name in tracked_frames:
+                        try:
+                            self._link_viser_paths[frame_name] = _urdf_module._viser_name_from_frame(
+                                _urdf_scene, frame_name, "/robot/visual"
+                            )
+                        except Exception:
+                            pass
         except Exception:
             logger.debug("Could not rebuild Viser link path map", exc_info=True)
+        for frame_name in tracked_frames:
+            self._link_viser_paths.setdefault(frame_name, f"/frames/{frame_name}")
+
+    def _sync_tool_frames_from_backend(self) -> None:
+        """Render configured tool/end-effector frames as standalone axes."""
+        tracked_frames = self._tracked_tool_frames()
+        for frame_name in list(self._frame_handles):
+            if frame_name not in tracked_frames:
+                self._frame_handles.pop(frame_name).remove()
+                self._frame_visibility_overrides.pop(frame_name, None)
+        self._rebuild_link_viser_paths()
+        for frame_name in sorted(tracked_frames):
+            handle = self._frame_handles.get(frame_name)
+            if handle is None:
+                handle = self._viser_server.scene.add_frame(
+                    f"/frames/{frame_name}",
+                    axes_length=0.08,
+                    axes_radius=0.004,
+                    origin_radius=0.01,
+                    visible=False,
+                )
+                self._frame_handles[frame_name] = handle
+            try:
+                pose = self._bridge.get_link_pose(frame_name, "universe")
+            except _BACKEND_SYNC_EXCEPTIONS:
+                logger.debug("Could not fetch tool frame pose for '%s'", frame_name, exc_info=True)
+                handle.visible = False
+                continue
+            if pose is None:
+                handle.visible = False
+                continue
+            handle.position = tuple(float(value) for value in pose["position_m"])
+            handle.wxyz = self._xyzw_to_wxyz(tuple(float(value) for value in pose["orientation_xyzw"]))
+            if frame_name in self._semantic_tool_frames():
+                visible = self._frame_visibility_overrides.get(frame_name, True)
+            else:
+                visible = self._frame_visibility_overrides.get(frame_name, False)
+            handle.visible = bool(visible)
+
+    def get_frame_visibility(self, frame_name: str) -> bool:
+        """Return the current viewer visibility for a named frame."""
+        if frame_name in self._semantic_tool_frames():
+            return self._frame_visibility_overrides.get(frame_name, True)
+        return self._frame_visibility_overrides.get(frame_name, False)
+
+    def set_frame_visibility(self, frame_name: str, visible: bool) -> None:
+        """Set viewer visibility for a named frame without mutating deployment semantics."""
+        frame_name = str(frame_name).strip()
+        if not frame_name:
+            raise ValueError("frame_name must not be empty")
+
+        semantic_frames = self._semantic_tool_frames()
+        if frame_name in semantic_frames:
+            if visible:
+                self._frame_visibility_overrides.pop(frame_name, None)
+            else:
+                self._frame_visibility_overrides[frame_name] = False
+        else:
+            if visible:
+                self._frame_visibility_overrides[frame_name] = True
+            else:
+                self._frame_visibility_overrides.pop(frame_name, None)
+
+        self._sync_tool_frames_from_backend()
 
     def request_scene_sync(
         self,
