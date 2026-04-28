@@ -36,6 +36,16 @@ All commands run inside the container (`docker compose run --rm dev bash`).
 ./scripts/test-all.sh composer     # Composer backend tests + frontend build
 ```
 
+ROS adapter tests use the separate ROS Jazzy image:
+
+```bash
+docker compose --profile ros run --rm ros-jazzy ./scripts/test-ros.sh
+```
+
+The ROS image starts from `ros:jazzy-ros-base-noble` and keeps ROS Python
+dependencies apt-managed. The default development image remains ROS-free; ROS
+wrappers/adapters live in the `manyforge_ros` lane.
+
 To build C++ manually:
 
 ```bash
@@ -58,6 +68,7 @@ manyforge_composer/      Composer: FastAPI backend, React frontend, MCP server
   backend/               REST API routes, state management, security middleware
   frontend/              React + ReactFlow program editor UI
   tests/                 Backend + MCP server tests
+manyforge_ros/           ROS adapters/wrappers and deterministic ROS test targets
 tests/                   End-to-end integration and benchmark tests
 scripts/                 Build/test/setup scripts
 docs/                    Architecture reference

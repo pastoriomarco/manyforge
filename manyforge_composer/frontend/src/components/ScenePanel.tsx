@@ -5,15 +5,32 @@ import { useProgramStore } from '../store/programStore';
 import type {
   ProgramSceneResource,
   SceneEditRequest,
+  SceneEditResponse,
   SceneFrameState,
   SceneObjectState,
   SceneStateResponse,
 } from '../types/api';
 
 const SCENE_MUTATED_EVENT = 'manyforge:scene-mutated';
+const SCENE_SYNC_STATUS_EVENT = 'manyforge:scene-sync-status';
+const SCENE_SYNC_ERROR_PREFIX = 'Live scene sync failed: ';
 
 function emitSceneMutated(): void {
   window.dispatchEvent(new CustomEvent(SCENE_MUTATED_EVENT));
+}
+
+function emitSceneSyncStatus(error: string | null): void {
+  window.dispatchEvent(new CustomEvent(SCENE_SYNC_STATUS_EVENT, { detail: { error } }));
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function assertSceneEditSuccess(response: SceneEditResponse): void {
+  if (!response.success) {
+    throw new Error(response.error ?? 'Scene edit failed');
+  }
 }
 
 function Section({ title, children }: { title: string; children: React.ReactNode }) {
@@ -483,6 +500,7 @@ export function SceneDraftMirror() {
   const programInfo = useProgramStore((state) => state.programInfo);
   const loading = useProgramStore((state) => state.loading);
   const sceneResources = useProgramStore((state) => state.sceneResources);
+  const setProgramError = useProgramStore((state) => state.setError);
   const sceneSignature = useMemo(() => authoredSceneSignature(sceneResources), [sceneResources]);
   const inFlightRef = useRef(false);
   const lastMirroredKeyRef = useRef<string | null>(null);
@@ -514,14 +532,16 @@ export function SceneDraftMirror() {
 
         for (const objectState of liveState.objects) {
           if (objectState.source === 'authored' && !desiredById.has(objectState.object_id)) {
-            await api.scene.edit({ operation: 'remove', object_id: objectState.object_id });
+            assertSceneEditSuccess(
+              await api.scene.edit({ operation: 'remove', object_id: objectState.object_id }),
+            );
           }
         }
 
         for (const resource of sceneResources) {
           const liveObject = liveById.get(resource.objectId);
           if (liveObject == null) {
-            await api.scene.edit(buildAddPayload(resource));
+            assertSceneEditSuccess(await api.scene.edit(buildAddPayload(resource)));
             continue;
           }
 
@@ -531,17 +551,26 @@ export function SceneDraftMirror() {
             || !sameShape(liveObject.shape as Record<string, unknown> | null | undefined, resource.shape);
 
           if (requiresRecreate) {
-            await api.scene.edit({ operation: 'remove', object_id: resource.objectId });
-            await api.scene.edit(buildAddPayload(resource));
+            assertSceneEditSuccess(
+              await api.scene.edit({ operation: 'remove', object_id: resource.objectId }),
+            );
+            assertSceneEditSuccess(await api.scene.edit(buildAddPayload(resource)));
             continue;
           }
 
-          await api.scene.edit(buildUpdatePosePayload(resource));
+          assertSceneEditSuccess(await api.scene.edit(buildUpdatePosePayload(resource)));
         }
 
         emitSceneMutated();
+        emitSceneSyncStatus(null);
+        if (useProgramStore.getState().error?.startsWith(SCENE_SYNC_ERROR_PREFIX)) {
+          setProgramError(null);
+        }
         lastMirroredKeyRef.current = mirrorKey;
       } catch (error) {
+        const message = `${SCENE_SYNC_ERROR_PREFIX}${errorMessage(error)}`;
+        emitSceneSyncStatus(message);
+        setProgramError(message);
         console.error('Failed to mirror authored scene into live scene', error);
       } finally {
         inFlightRef.current = false;
@@ -552,7 +581,7 @@ export function SceneDraftMirror() {
     return () => {
       cancelled = true;
     };
-  }, [cycleState, loading, programInfo, sceneResources, sceneSignature]);
+  }, [cycleState, loading, programInfo, sceneResources, sceneSignature, setProgramError]);
 
   return null;
 }
@@ -568,6 +597,7 @@ export function ScenePanel() {
   const [hmiAvailable, setHmiAvailable] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [syncError, setSyncError] = useState<string | null>(null);
   const [newObjectId, setNewObjectId] = useState('');
   const [newShapeType, setNewShapeType] = useState<'box' | 'sphere'>('box');
   const [newBoxDimensions, setNewBoxDimensions] = useState<number[]>([0.05, 0.05, 0.1]);
@@ -608,6 +638,17 @@ export function ScenePanel() {
       window.removeEventListener(SCENE_MUTATED_EVENT, handle);
     };
   }, [refresh]);
+
+  useEffect(() => {
+    const handle = (event: Event) => {
+      const detail = (event as CustomEvent<{ error?: string | null }>).detail;
+      setSyncError(detail?.error ?? null);
+    };
+    window.addEventListener(SCENE_SYNC_STATUS_EVENT, handle);
+    return () => {
+      window.removeEventListener(SCENE_SYNC_STATUS_EVENT, handle);
+    };
+  }, []);
 
   const frameOptions = useMemo(() => {
     const names = new Set<string>(['universe', 'base_link', 'tool0']);
@@ -701,6 +742,9 @@ export function ScenePanel() {
         )}
         {error && (
           <div className="rounded bg-red-900/60 px-2 py-1 text-red-200">{error}</div>
+        )}
+        {syncError && (
+          <div className="rounded bg-red-900/60 px-2 py-1 text-red-200">{syncError}</div>
         )}
       </div>
 

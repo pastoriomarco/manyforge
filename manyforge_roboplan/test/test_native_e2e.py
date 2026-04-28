@@ -333,13 +333,41 @@ class TestNativeKernelBasics:
         assert result.accepted is True, result.error
 
         deadline = time.monotonic() + 1.0
+        native_kernel_ur10e_robotiq.update_gripper_commands()
         status = native_kernel_ur10e_robotiq.get_gripper_status("primary")
         while status.state == GripperCommandState.EXECUTING and time.monotonic() < deadline:
             time.sleep(0.01)
+            native_kernel_ur10e_robotiq.update_gripper_commands()
             status = native_kernel_ur10e_robotiq.get_gripper_status("primary")
 
         assert status.state == GripperCommandState.COMPLETED
         assert status.current_position == pytest.approx(0.7, abs=1e-3)
+        assert native_kernel_ur10e_robotiq._bundle.get_group_joint_positions("gripper") == pytest.approx([0.7], abs=1e-3)
+
+    def test_custom_ur10e_gripper_status_read_is_side_effect_free(
+        self, native_kernel_ur10e_robotiq
+    ):
+        result = native_kernel_ur10e_robotiq.command_gripper(
+            GripperCommandRequest(
+                gripper_id="primary",
+                group_id="gripper",
+                joint_name="finger_joint",
+                target_position=0.7,
+                duration_s=0.02,
+            )
+        )
+        assert result.accepted is True, result.error
+
+        time.sleep(0.03)
+        status = native_kernel_ur10e_robotiq.get_gripper_status("primary")
+
+        assert status.state == GripperCommandState.EXECUTING
+        assert native_kernel_ur10e_robotiq._bundle.get_group_joint_positions("gripper") == pytest.approx([0.0])
+
+        native_kernel_ur10e_robotiq.update_gripper_commands()
+        completed = native_kernel_ur10e_robotiq.get_gripper_status("primary")
+
+        assert completed.state == GripperCommandState.COMPLETED
         assert native_kernel_ur10e_robotiq._bundle.get_group_joint_positions("gripper") == pytest.approx([0.7], abs=1e-3)
 
     def test_custom_ur10e_bundle_executes_speed_limited_joint_goal(
@@ -376,12 +404,23 @@ class TestNativeKernelBasics:
             wait_for_terminal(native_kernel)
             native_kernel.reset()
 
-    def test_auto_reset_on_sequential_execute(self, native_kernel):
-        """Second execute auto-resets from COMPLETED."""
+    def test_bound_acknowledgement_required_for_sequential_execute(self, native_kernel):
+        """Second execute requires exact acknowledgement of Completed execution."""
         r1 = native_kernel.execute(make_request("native_auto_1", GOAL_A))
         assert r1.ok is True
         wait_for_terminal(native_kernel)
-        # Don't reset — should auto-reset
+
+        r2 = native_kernel.execute(make_request("native_auto_2", GOAL_B))
+        assert r2.ok is False
+
+        stale_ack = native_kernel.acknowledge_completed(r1.execution_id + 1)
+        assert stale_ack.accepted is False
+        assert native_kernel.get_status().state == ExecutionState.COMPLETED
+
+        ack = native_kernel.acknowledge_completed(r1.execution_id)
+        assert ack.accepted is True
+        assert native_kernel.get_status().state == ExecutionState.IDLE
+
         r2 = native_kernel.execute(make_request("native_auto_2", GOAL_B))
         assert r2.ok is True
         wait_for_terminal(native_kernel)

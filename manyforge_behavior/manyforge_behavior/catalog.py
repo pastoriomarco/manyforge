@@ -307,6 +307,11 @@ def _profile_satisfied(min_profile: str, target: str) -> bool:
     return target_parts >= min_parts
 
 
+def profile_satisfied(min_profile: str, target: str) -> bool:
+    """Public profile compatibility check used by validators and UIs."""
+    return _profile_satisfied(min_profile, target)
+
+
 def _parse_profile(profile: str) -> Optional[tuple[int, int]]:
     """Parse 'vX.Y' into (X, Y). Returns None if unparseable."""
     m = re.match(r"^v(\d+)\.(\d+)$", profile)

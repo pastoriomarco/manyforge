@@ -899,16 +899,6 @@ void ExecutionKernel::async_execute_worker(
 Result<uint64_t> ExecutionKernel::execute(const ExecuteRequestDTO& request) {
   std::lock_guard<std::mutex> lock(execute_mutex_);
 
-  // Auto-reset from terminal states
-  auto current_state = sm_.status().state;
-  if (current_state == ExecutionState::kCompleted ||
-      current_state == ExecutionState::kFailed ||
-      current_state == ExecutionState::kStopped) {
-    stop_policy_.request_reset();
-    std::lock_guard<std::mutex> move_lock(active_move_id_mutex_);
-    active_move_id_.clear();
-  }
-
   if (sm_.status().state != ExecutionState::kIdle) {
     return Result<uint64_t>::Err(ErrorCode::kExecutionRejected);
   }
@@ -1086,6 +1076,62 @@ ResetResultDTO ExecutionKernel::reset() {
     return ResetResultDTO{true, std::nullopt};
   }
   return ResetResultDTO{false, result.error()};
+}
+
+AcknowledgeCompletedResultDTO ExecutionKernel::acknowledge_completed(
+    uint64_t execution_id) {
+  std::lock_guard<std::mutex> lock(execute_mutex_);
+
+  const auto status = sm_.status();
+  if (status.state != ExecutionState::kCompleted) {
+    return AcknowledgeCompletedResultDTO{
+        false,
+        ErrorDTO{kErrorInvalidRequest,
+                 "Can only acknowledge a Completed execution",
+                 {{"state", to_string(status.state)}}}};
+  }
+  if (status.execution_id != execution_id) {
+    return AcknowledgeCompletedResultDTO{
+        false,
+        ErrorDTO{kErrorInvalidRequest,
+                 "Execution acknowledgement id mismatch",
+                 {{"current_execution_id", std::to_string(status.execution_id)},
+                  {"requested_execution_id", std::to_string(execution_id)}}}};
+  }
+
+  auto result = sm_.reset();
+  if (!result.ok()) {
+    return AcknowledgeCompletedResultDTO{false, result.error()};
+  }
+  sm_.set_execution_id(0);
+  {
+    std::lock_guard<std::mutex> move_lock(active_move_id_mutex_);
+    active_move_id_.clear();
+  }
+
+  ExecutionSnapshot snapshot;
+  snapshot.timestamp_ns = clock_.now();
+  snapshot.execution_id = 0;
+  snapshot.state = ExecutionState::kIdle;
+  snapshot.progress = 0.0;
+  publish_execution_snapshot(std::move(snapshot));
+
+  emit_event({KernelEventType::kCompletedAcknowledged,
+              execution_id,
+              clock_.now(),
+              {},
+              {},
+              std::nullopt,
+              {{"acknowledged_execution_id", std::to_string(execution_id)}}});
+  emit_event({KernelEventType::kStateTransition,
+              execution_id,
+              clock_.now(),
+              ExecutionState::kCompleted,
+              ExecutionState::kIdle,
+              std::nullopt,
+              {}});
+
+  return AcknowledgeCompletedResultDTO{true, std::nullopt};
 }
 
 ExecutionStatus ExecutionKernel::get_status() const {

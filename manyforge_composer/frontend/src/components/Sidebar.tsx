@@ -5,10 +5,32 @@ import { useComposerStore } from '../store/composerStore';
 import { DeploymentPanel } from './DeploymentPanel';
 import { ProgramPanel } from './ProgramPanel';
 import { SceneDraftMirror, ScenePanel } from './ScenePanel';
+import { useProgramStore } from '../store/programStore';
+
+function parseProfile(profile: string | null | undefined): [number, number] | null {
+  const match = /^v(\d+)(?:\.(\d+))?$/.exec(profile ?? '');
+  if (!match) {
+    return null;
+  }
+  return [Number(match[1]), Number(match[2] ?? '0')];
+}
+
+function profileSatisfies(minProfile: string | null | undefined, targetProfile: string | null | undefined): boolean {
+  if (!minProfile || !targetProfile || minProfile === targetProfile) {
+    return true;
+  }
+  const min = parseProfile(minProfile);
+  const target = parseProfile(targetProfile);
+  if (min == null || target == null) {
+    return minProfile === targetProfile;
+  }
+  return target[0] > min[0] || (target[0] === min[0] && target[1] >= min[1]);
+}
 
 function NodePaletteContent() {
   const { loading, error, fetchCatalog, getByCategory } = useCatalogStore();
   const { mode } = useComposerStore();
+  const programProfile = useProgramStore((state) => state.programInfo?.programProfile ?? null);
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
 
   useEffect(() => {
@@ -19,7 +41,14 @@ function NodePaletteContent() {
     setCollapsed(prev => ({ ...prev, [cat]: !prev[cat] }));
   };
 
-  const grouped = getByCategory();
+  const grouped = Object.fromEntries(
+    Object.entries(getByCategory()).map(([category, items]) => [
+      category,
+      programProfile == null
+        ? items
+        : items.filter((entry) => profileSatisfies(entry.profilesMin, programProfile)),
+    ]),
+  );
   const isRunMode = mode === 'run';
 
   return (
@@ -30,6 +59,9 @@ function NodePaletteContent() {
         </h2>
         {isRunMode && (
           <p className="text-xs text-yellow-500 mt-1">Editing disabled while running</p>
+        )}
+        {programProfile && (
+          <p className="text-xs text-gray-500 mt-1">Profile filter: {programProfile}</p>
         )}
       </div>
 

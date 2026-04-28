@@ -312,6 +312,9 @@ class KernelClient(ABC):
     def reset(self) -> CommandResult: ...
 
     @abstractmethod
+    def acknowledge_completed(self, execution_id: int) -> CommandResult: ...
+
+    @abstractmethod
     def get_status(self) -> ExecutionStatus: ...
 
     @abstractmethod
@@ -387,6 +390,14 @@ class KernelClient(ABC):
     @abstractmethod
     def command_gripper(self, request: GripperCommandRequest) -> CommandResult: ...
 
+    def update_gripper_commands(self) -> None:
+        """Advance any client-owned simulated gripper commands.
+
+        Real adapters should normally publish state independently and may leave
+        this as a no-op. Mock/simulated clients use it to keep status reads
+        side-effect free while still supporting time-based command progress.
+        """
+
     @abstractmethod
     def get_gripper_status(self, gripper_id: str) -> GripperCommandStatus: ...
 
@@ -454,6 +465,7 @@ class MockKernelClient(KernelClient):
         from_state: Optional[str] = None,
         to_state: Optional[str] = None,
         error: Optional[str] = None,
+        details: Optional[Dict[str, Any]] = None,
     ) -> None:
         event: Dict[str, Any] = {
             "type": event_type,
@@ -466,6 +478,8 @@ class MockKernelClient(KernelClient):
             event["to_state"] = to_state
         if error is not None:
             event["error"] = {"code": -1, "message": error}
+        if details:
+            event["details"] = dict(details)
         self._kernel_events.append(event)
 
     def drain_kernel_events(self) -> List[Dict[str, Any]]:
@@ -504,12 +518,6 @@ class MockKernelClient(KernelClient):
         import time
         self.execute_count += 1
         self.last_execute_request = request
-        # Auto-reset from terminal states, matching C++ ExecutionKernel behavior
-        terminal_states = {ExecutionState.COMPLETED, ExecutionState.FAILED, ExecutionState.STOPPED}
-        if self._state in terminal_states:
-            prev = self._state.value
-            self._state = ExecutionState.IDLE
-            self._emit_kernel_event("state_transition", from_state=prev, to_state="idle")
         if self._state != ExecutionState.IDLE:
             return ExecuteResult(ok=False, error="Not in IDLE state")
         if self.fail_next_execute:
@@ -622,6 +630,31 @@ class MockKernelClient(KernelClient):
         prev = self._state.value
         self._state = ExecutionState.IDLE
         self._active_move_id = ""
+        self._emit_kernel_event("state_transition", from_state=prev, to_state="idle")
+        return CommandResult(accepted=True)
+
+    def acknowledge_completed(self, execution_id: int) -> CommandResult:
+        status = self.get_status()
+        if status.state != ExecutionState.COMPLETED:
+            return CommandResult(
+                accepted=False,
+                error="Can only acknowledge a COMPLETED execution",
+            )
+        if status.execution_id != int(execution_id):
+            return CommandResult(
+                accepted=False,
+                error=(
+                    "Execution acknowledgement id mismatch: "
+                    f"current={status.execution_id}, requested={execution_id}"
+                ),
+            )
+        prev = self._state.value
+        self._state = ExecutionState.IDLE
+        self._active_move_id = ""
+        self._emit_kernel_event(
+            "acknowledge_completed",
+            details={"acknowledged_execution_id": int(execution_id)},
+        )
         self._emit_kernel_event("state_transition", from_state=prev, to_state="idle")
         return CommandResult(accepted=True)
 
@@ -1057,6 +1090,7 @@ class MockKernelClient(KernelClient):
             self.fail_next_gripper_command = False
             return CommandResult(accepted=False, error="Gripper command failed (injected)")
 
+        self.update_gripper_commands()
         current_status = self.get_gripper_status(request.gripper_id)
         if current_status.state == GripperCommandState.EXECUTING:
             return CommandResult(
@@ -1092,17 +1126,36 @@ class MockKernelClient(KernelClient):
         }
         return CommandResult(accepted=True)
 
-    def get_gripper_status(self, gripper_id: str) -> GripperCommandStatus:
-        status = self._compute_gripper_status(gripper_id)
-        if status.state == GripperCommandState.COMPLETED:
-            self._gripper_positions[gripper_id] = (
-                float(status.current_position)
-                if status.current_position is not None
-                else self._gripper_positions.get(gripper_id, 0.0)
-            )
+    def update_gripper_commands(self) -> None:
+        for gripper_id in list(self._gripper_commands):
+            status = self._compute_gripper_status(gripper_id)
             command = self._gripper_commands.get(gripper_id)
-            if command is not None:
-                command["state"] = GripperCommandState.COMPLETED
-                command["current_position"] = status.current_position
-                command["progress"] = 1.0
-        return status
+            if command is None:
+                continue
+            command["state"] = status.state
+            command["current_position"] = status.current_position
+            command["progress"] = status.progress
+            if status.state == GripperCommandState.COMPLETED:
+                self._gripper_positions[gripper_id] = (
+                    float(status.current_position)
+                    if status.current_position is not None
+                    else self._gripper_positions.get(gripper_id, 0.0)
+                )
+
+    def get_gripper_status(self, gripper_id: str) -> GripperCommandStatus:
+        command = self._gripper_commands.get(gripper_id)
+        if command is None:
+            return GripperCommandStatus(
+                state=GripperCommandState.IDLE,
+                gripper_id=gripper_id,
+                current_position=self._gripper_positions.get(gripper_id),
+            )
+
+        return GripperCommandStatus(
+            state=command["state"],
+            gripper_id=gripper_id,
+            progress=float(command.get("progress", 0.0)),
+            current_position=command.get("current_position"),
+            target_position=command.get("target_position"),
+            error=command.get("error"),
+        )

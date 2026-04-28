@@ -22,7 +22,7 @@ from manyforge_behavior.blackboard_bindings import (
     resolve_namespace_binding as _resolve_namespace_binding,
     validate_declared_field_ref as _validate_declared_field_ref,
 )
-from manyforge_behavior.catalog import NodeCatalog
+from manyforge_behavior.catalog import NodeCatalog, profile_satisfied
 from manyforge_behavior.parameters import (
     PARAM_REF_RE,
     ParameterResolver,
@@ -1012,6 +1012,17 @@ def collect_tree_validation_issues(
                 )
             )
             return
+
+        if program_profile is not None and not profile_satisfied(entry.profiles_min, program_profile):
+            errors.append(
+                TreeValidationIssue(
+                    path=path,
+                    message=(
+                        f"Node '{current.name}' ({current.id}) requires program profile "
+                        f">= {entry.profiles_min}, got {program_profile}"
+                    ),
+                )
+            )
 
         if deployment_capability_keys is not None:
             missing_capabilities = sorted(

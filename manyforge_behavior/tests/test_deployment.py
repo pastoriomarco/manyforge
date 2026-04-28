@@ -823,6 +823,7 @@ class TestValidateCapabilities:
         deploy_path = _write_deployment(data)
         program_path = _write_deployment(
             _minimal_program(
+                program_profile="v0.1",
                 tree={
                     "id": "sequence",
                     "name": "root",

@@ -61,13 +61,18 @@ def _load_model_frame_names(state: ComposerState) -> list[str]:
     if not robot_config.urdf_path:
         return []
 
+    extra_package_paths = (
+        []
+        if robot_config.package_paths
+        else default_package_paths()
+    )
     try:
         resolved_model = resolve_robot_model(
             urdf_path=robot_config.urdf_path,
             srdf_path=robot_config.srdf_path,
             package_paths=robot_config.package_paths,
             deployment_path=state.deployment_source_path,
-            extra_package_paths=default_package_paths(),
+            extra_package_paths=extra_package_paths,
         )
     except Exception:
         logger.debug("Could not resolve robot model while building frame inventory", exc_info=True)

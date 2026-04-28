@@ -29,6 +29,7 @@ See also:
 
 - [`../plans/AI_ASSISTANT_INTEGRATION_PLAN.md`](../plans/AI_ASSISTANT_INTEGRATION_PLAN.md)
 - [`../plans/PRODUCT_DIRECTION_PLAN.md`](../plans/PRODUCT_DIRECTION_PLAN.md)
+- [`SIMULATOR_ADAPTER_CONTRACT_DRAFT.md`](SIMULATOR_ADAPTER_CONTRACT_DRAFT.md)
 - [`../operations/STACK_SETUP.md`](../operations/STACK_SETUP.md)
 - [`../integration/PLATFORM_REQUIREMENTS.md`](../integration/PLATFORM_REQUIREMENTS.md)
 

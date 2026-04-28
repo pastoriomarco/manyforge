@@ -9,9 +9,9 @@ import py_trees
 
 from manyforge_behavior.kernel_client import (
     ExecuteRequest,
-    ExecutionState,
     KernelClient,
 )
+from manyforge_behavior.motion_runtime import MotionExecutionCoordinator
 from manyforge_behavior.parameters import resolve_blackboard_value
 
 
@@ -49,6 +49,8 @@ class MoveManipulatorAction(py_trees.behaviour.Behaviour):
         super().__init__(name=name)
         self._params = kwargs
         self._started = False
+        self._execution_id: int | None = None
+        self._motion_coordinator: MotionExecutionCoordinator | None = None
         self._move_id = kwargs.get("move_id", "")
         self._base_velocity_scale = float(kwargs.get("velocity_scale", 1.0))
 
@@ -56,6 +58,9 @@ class MoveManipulatorAction(py_trees.behaviour.Behaviour):
         self.blackboard = self.attach_blackboard_client()
         self.blackboard.register_key(
             key="kernel", access=py_trees.common.Access.READ
+        )
+        self.blackboard.register_key(
+            key="motion_coordinator", access=py_trees.common.Access.READ
         )
         for key in (
             "stop_requested",
@@ -66,6 +71,8 @@ class MoveManipulatorAction(py_trees.behaviour.Behaviour):
 
     def initialise(self) -> None:
         self._started = False
+        self._execution_id = None
+        self._motion_coordinator = None
         self._base_velocity_scale = float(self._params.get("velocity_scale", 1.0))
 
     def _read_optional_blackboard_value(self, key: str) -> Any | None:
@@ -85,6 +92,14 @@ class MoveManipulatorAction(py_trees.behaviour.Behaviour):
             effective_velocity_scale *= float(bb_velocity_scale)
 
         kernel: KernelClient = self.blackboard.kernel
+        if self._motion_coordinator is None:
+            coordinator = self._read_optional_blackboard_value("motion_coordinator")
+            self._motion_coordinator = (
+                coordinator
+                if isinstance(coordinator, MotionExecutionCoordinator)
+                and coordinator.kernel is kernel
+                else MotionExecutionCoordinator(kernel)
+            )
 
         if not self._started:
             try:
@@ -202,15 +217,21 @@ class MoveManipulatorAction(py_trees.behaviour.Behaviour):
                 else:
                     request.max_tcp_linear_speed_mps = global_cap
 
-            result = kernel.execute(request)
+            result = self._motion_coordinator.execute(request)
             self._started = True
             if not result.ok:
+                self.feedback_message = result.error or "Motion execution rejected"
                 return py_trees.common.Status.FAILURE
+            self._execution_id = result.execution_id
 
-        status = kernel.get_status()
-        if status.state == ExecutionState.COMPLETED:
+        if self._execution_id is None:
+            self.feedback_message = "Motion execution id was not recorded"
+            return py_trees.common.Status.FAILURE
+        update = self._motion_coordinator.update(self._execution_id)
+        if update.state == "succeeded":
             return py_trees.common.Status.SUCCESS
-        if status.state == ExecutionState.FAILED:
+        if update.state == "failed":
+            self.feedback_message = update.error or "Motion execution failed"
             return py_trees.common.Status.FAILURE
         return py_trees.common.Status.RUNNING
 

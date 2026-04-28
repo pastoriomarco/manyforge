@@ -51,5 +51,23 @@ services:
     profiles:
       - dev-composer
 
+  # ROS Jazzy lane for ROS adapter/wrapper development and validation.
+  # Host networking is intentional for ROS 2 DDS discovery during development.
+  ros-jazzy:
+    build:
+      context: .
+      dockerfile: Dockerfile.ros-jazzy
+    network_mode: host
+    ipc: host
+    volumes:
+      - .:/workspace
+      - ros-build-cache:/tmp/manyforge-build
+    working_dir: /workspace
+    stdin_open: true
+    tty: true
+    profiles:
+      - ros
+
 volumes:
   build-cache:
+  ros-build-cache:

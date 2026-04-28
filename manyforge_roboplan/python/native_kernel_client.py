@@ -98,7 +98,7 @@ class NativeKernelClient(KernelClient):
     def _get_group_joint_positions(self, group_id: str) -> list[float]:
         return list(self._bundle.get_group_joint_positions(group_id))
 
-    def _advance_gripper_command(self, gripper_id: str) -> GripperCommandStatus:
+    def _compute_gripper_command_status(self, gripper_id: str) -> GripperCommandStatus:
         command = self._active_gripper_commands.get(gripper_id)
         if command is None:
             return self._gripper_status_cache.get(
@@ -135,6 +135,10 @@ class NativeKernelClient(KernelClient):
         if status.state == GripperCommandState.COMPLETED:
             self._active_gripper_commands.pop(gripper_id, None)
         return status
+
+    def update_gripper_commands(self) -> None:
+        for gripper_id in list(self._active_gripper_commands):
+            self._compute_gripper_command_status(gripper_id)
 
     def execute(self, request: ExecuteRequest) -> ExecuteResult:
         relative_move = request.relative_move
@@ -293,6 +297,10 @@ class NativeKernelClient(KernelClient):
         r = self._bundle.reset()
         return CommandResult(accepted=r["accepted"], error=r.get("error"))
 
+    def acknowledge_completed(self, execution_id: int) -> CommandResult:
+        r = self._bundle.acknowledge_completed(int(execution_id))
+        return CommandResult(accepted=r["accepted"], error=r.get("error"))
+
     def get_status(self) -> ExecutionStatus:
         s = self._bundle.get_status()
         return ExecutionStatus(
@@ -361,6 +369,7 @@ class NativeKernelClient(KernelClient):
         return dict(self._bundle.get_metrics())
 
     def command_gripper(self, request: GripperCommandRequest) -> CommandResult:
+        self.update_gripper_commands()
         current = self.get_gripper_status(request.gripper_id)
         if current.state == GripperCommandState.EXECUTING:
             return CommandResult(
@@ -410,7 +419,13 @@ class NativeKernelClient(KernelClient):
         return CommandResult(accepted=True)
 
     def get_gripper_status(self, gripper_id: str) -> GripperCommandStatus:
-        return self._advance_gripper_command(gripper_id)
+        return self._gripper_status_cache.get(
+            gripper_id,
+            GripperCommandStatus(
+                state=GripperCommandState.IDLE,
+                gripper_id=gripper_id,
+            ),
+        )
 
     def drain_kernel_events(self) -> list[dict]:
         return list(self._bundle.drain_kernel_events())

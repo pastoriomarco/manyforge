@@ -43,11 +43,22 @@ class TestMockKernelExecute:
         result = kernel.execute(make_request("move_2"))
         assert result.execution_id == 2
 
-    def test_auto_reset_from_terminal_state(self, kernel):
-        kernel.execute(make_request())
+    def test_execute_from_terminal_state_requires_acknowledgement(self, kernel):
+        first = kernel.execute(make_request())
         assert kernel.get_status().state == ExecutionState.COMPLETED
         result = kernel.execute(make_request("move_2"))
-        assert result.ok  # Auto-reset from COMPLETED
+        assert not result.ok
+
+        stale_ack = kernel.acknowledge_completed(first.execution_id + 1)
+        assert not stale_ack.accepted
+        assert kernel.get_status().state == ExecutionState.COMPLETED
+
+        ack = kernel.acknowledge_completed(first.execution_id)
+        assert ack.accepted
+        assert kernel.get_status().state == ExecutionState.IDLE
+
+        result = kernel.execute(make_request("move_2"))
+        assert result.ok
 
     def test_execute_from_non_terminal_non_idle_fails(self, kernel):
         kernel._state = ExecutionState.EXECUTING

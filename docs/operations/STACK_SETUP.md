@@ -185,6 +185,19 @@ For current selection/model/planning flows:
 - when inspecting `/api/execution/blackboard`, expect bundle-shaped values with
   `meta` and `value`, not the old scattered `response/status/fields/...` form
 
+### RoboPlan planner trace logging
+
+Native RoboPlan planner traces are disabled by default to keep normal demo and
+qualification logs readable. Enable them only while diagnosing planner behavior:
+
+```bash
+MANYFORGE_ROBOPLAN_PLANNER_DEBUG=1 ./scripts/demo-ur10e-robotiq-pick-place.sh
+```
+
+Accepted disabled values are unset, `0`, `false`, and `FALSE`. Any other
+non-empty value enables `[PLANNER]` stderr traces from the native RoboPlan
+backend.
+
 ### Runtime image modes
 
 Current status:

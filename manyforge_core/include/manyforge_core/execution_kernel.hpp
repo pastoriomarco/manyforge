@@ -67,6 +67,12 @@ class ExecutionKernel {
   /// Non-blocking reset. Valid from any state except Idle.
   ResetResultDTO reset();
 
+  /// Acknowledge a successful terminal execution and return to Idle.
+  ///
+  /// Valid only when the kernel is currently Completed for exactly the supplied
+  /// execution_id. Failed and Stopped executions require Reset/recovery instead.
+  AcknowledgeCompletedResultDTO acknowledge_completed(uint64_t execution_id);
+
   /// Get current kernel status.
   ExecutionStatus get_status() const;
 

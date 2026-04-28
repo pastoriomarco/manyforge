@@ -30,7 +30,7 @@ The goal is:
 The target presentable workflow is:
 
 1. a simulator such as Isaac Sim has a loaded scene
-2. ManyForge reads the relevant scene state through deterministic tools
+2. ManyForge reads the relevant live scene state through deterministic tools
 3. ManyForge reproduces the relevant scene/resources in its own backend/HMI
    model
 4. a NemoClaw/OpenClaw-served assistant uses predefined tools to propose a
@@ -85,7 +85,7 @@ This plan therefore treats simulation as:
 
 This track owns:
 
-- scene reading and bootstrap
+- initial live scene capture and scene reading
 - simulator-side world/entity operations
 - ManyForge-side scene/resource reconstruction
 - simulator execution of the authored/generated program
@@ -93,6 +93,7 @@ This track owns:
 Detailed tactical plan:
 
 - [`ISAAC_SIM_PREVIEW_PLAN.md`](ISAAC_SIM_PREVIEW_PLAN.md)
+- [`../reference/SIMULATOR_ADAPTER_CONTRACT_DRAFT.md`](../reference/SIMULATOR_ADAPTER_CONTRACT_DRAFT.md)
 
 ### Track B: Assistant-backed authoring path
 
@@ -119,6 +120,12 @@ Both tracks must reuse the same:
 
 That is what prevents the preview path from turning into dead-end work.
 
+Current baseline assumption for the simulator route:
+
+- one live simulator observation path should provide both initial bootstrap and
+  ongoing runtime scene updates
+- offline/static scene parsing is not part of the baseline preview flow
+
 ## Simulation Path Options
 
 The simulator control path is still an open implementation decision.
@@ -135,6 +142,10 @@ multiple simulators and could reduce simulator-specific throwaway work.
 
 But this plan does **not** commit ManyForge to building the ROS wrapper path
 immediately. It stays an option, not a locked implementation decision.
+
+The current draft reference for evaluating those options is:
+
+- [`../reference/SIMULATOR_ADAPTER_CONTRACT_DRAFT.md`](../reference/SIMULATOR_ADAPTER_CONTRACT_DRAFT.md)
 
 ## Recommended Short-Term Order
 

@@ -459,7 +459,7 @@ class TestProgramValidation:
             Program(path, catalog)
         os.unlink(path)
 
-    def test_rejects_node_when_deployment_capability_missing(self, catalog):
+    def test_rejects_node_when_program_profile_below_catalog_min_profile(self, catalog):
         data = _minimal_program()
         data["tree"] = {
             "id": "sequence",
@@ -479,14 +479,43 @@ class TestProgramValidation:
         try:
             with pytest.raises(
                 ProgramValidationError,
-                match=r"requires capabilities \['execution\.gripper\.command'\]",
+                match=r"requires program profile >= v0\.1, got v0\.0",
+            ):
+                Program(path, catalog)
+        finally:
+            os.unlink(path)
+
+    def test_rejects_node_when_deployment_capability_missing(self, catalog):
+        data = _minimal_program(program_profile="v0.1")
+        data["tree"] = {
+            "id": "sequence",
+            "name": "root",
+            "children": [
+                {
+                    "id": "command_gripper",
+                    "name": "close_gripper",
+                    "params": {
+                        "gripper_id": "primary",
+                        "command": "close",
+                    },
+                }
+            ],
+        }
+        path = _write_program(data)
+        try:
+            with pytest.raises(
+                ProgramValidationError,
+                match=(
+                    r"requires capabilities "
+                    r"\['tool\.gripper\.command', 'tool\.gripper\.feedback'\]"
+                ),
             ):
                 Program(path, catalog, deployment_capability_keys=set())
         finally:
             os.unlink(path)
 
     def test_allows_node_when_deployment_capability_present(self, catalog):
-        data = _minimal_program()
+        data = _minimal_program(program_profile="v0.1")
         data["tree"] = {
             "id": "sequence",
             "name": "root",
@@ -506,9 +535,13 @@ class TestProgramValidation:
             program = Program(
                 path,
                 catalog,
-                deployment_capability_keys={"execution.gripper.command"},
+                deployment_capability_keys={
+                    "tool.gripper.command",
+                    "tool.gripper.feedback",
+                },
             )
-            assert "execution.gripper.command" in program.required_capabilities()
+            assert "tool.gripper.command" in program.required_capabilities()
+            assert "tool.gripper.feedback" in program.required_capabilities()
         finally:
             os.unlink(path)
 

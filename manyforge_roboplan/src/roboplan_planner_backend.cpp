@@ -2,11 +2,34 @@
 
 #include <Eigen/Dense>
 #include <cmath>
+#include <cstdlib>
 #include <fmt/format.h>
 #include <stdexcept>
+#include <string>
+#include <utility>
 #include <variant>
 
 namespace {
+bool planner_debug_enabled() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("MANYFORGE_ROBOPLAN_PLANNER_DEBUG");
+    if (value == nullptr) {
+      return false;
+    }
+    const std::string flag(value);
+    return !(flag.empty() || flag == "0" || flag == "false" || flag == "FALSE");
+  }();
+  return enabled;
+}
+
+template <typename... Args>
+void planner_debug(fmt::format_string<Args...> format, Args&&... args) {
+  if (!planner_debug_enabled()) {
+    return;
+  }
+  fmt::print(stderr, format, std::forward<Args>(args)...);
+}
+
 // Rotation matrix to RPY (ZYX convention, in degrees)
 void matrix_to_rpy_deg(const Eigen::Matrix4d& tform, double& roll, double& pitch, double& yaw) {
   pitch = std::atan2(-tform(2,0), std::sqrt(tform(0,0)*tform(0,0) + tform(1,0)*tform(1,0)));
@@ -41,7 +64,7 @@ core::PlanResultDTO RoboPlanPlannerBackend::plan(const core::PlanRequestDTO& req
   core::PlanResultDTO result;
 
   try {
-    fmt::print(stderr, "[PLANNER] plan() called, move_id={}, motion_type={}\n",
+    planner_debug("[PLANNER] plan() called, move_id={}, motion_type={}\n",
             request.move_id,
             std::holds_alternative<core::JointGoalDTO>(request.motion) ? "joint" : "pose");
 
@@ -52,10 +75,10 @@ core::PlanResultDTO RoboPlanPlannerBackend::plan(const core::PlanRequestDTO& req
       start_positions[i] = start.positions_rad[i];
     }
 
-    fmt::print(stderr, "[PLANNER] start joints: [");
+    planner_debug("[PLANNER] start joints: [");
     for (size_t i = 0; i < start.positions_rad.size(); ++i)
-      fmt::print(stderr, "{}{:.4f}", (i ? ", " : ""), start.positions_rad[i]);
-    fmt::print(stderr, "]\n");
+      planner_debug("{}{:.4f}", (i ? ", " : ""), start.positions_rad[i]);
+    planner_debug("]\n");
 
     roboplan::JointConfiguration start_config;
     start_config.joint_names = start.joint_names;
@@ -74,7 +97,7 @@ core::PlanResultDTO RoboPlanPlannerBackend::plan(const core::PlanRequestDTO& req
           scene_->forwardKinematics(start_positions_full, request.tcp_frame);
       double r, p, ya;
       matrix_to_rpy_deg(start_fk, r, p, ya);
-      fmt::print(stderr, "[PLANNER] start pose:  pos=({:.3f}, {:.3f}, {:.3f}) rpy=({:.1f}, {:.1f}, {:.1f}) collision={}\n",
+      planner_debug("[PLANNER] start pose:  pos=({:.3f}, {:.3f}, {:.3f}) rpy=({:.1f}, {:.1f}, {:.1f}) collision={}\n",
               start_fk(0, 3), start_fk(1, 3), start_fk(2, 3), r, p, ya,
               start_collision ? "YES" : "no");
     }
@@ -128,7 +151,7 @@ core::PlanResultDTO RoboPlanPlannerBackend::plan(const core::PlanRequestDTO& req
       {
         double r, p, ya;
         matrix_to_rpy_deg(tform, r, p, ya);
-        fmt::print(stderr, "[PLANNER] goal pose:   pos=({:.3f}, {:.3f}, {:.3f}) rpy=({:.1f}, {:.1f}, {:.1f})\n",
+        planner_debug("[PLANNER] goal pose:   pos=({:.3f}, {:.3f}, {:.3f}) rpy=({:.1f}, {:.1f}, {:.1f})\n",
                 tform(0, 3), tform(1, 3), tform(2, 3), r, p, ya);
       }
 
@@ -148,20 +171,20 @@ core::PlanResultDTO RoboPlanPlannerBackend::plan(const core::PlanRequestDTO& req
                  tform(0,3), tform(1,3), tform(2,3), r, p, ya,
                  request.base_frame, request.tcp_frame);
         result.error = core::ErrorDTO{core::kErrorIkFailed, str, {}};
-        fmt::print(stderr, "[PLANNER] IK FAILED\n");
+        planner_debug("[PLANNER] IK FAILED\n");
         return result;
       }
 
-      fmt::print(stderr, "[PLANNER] IK solved. goal: [");
+      planner_debug("[PLANNER] IK solved. goal: [");
       for (int i = 0; i < goal_config.positions.size(); ++i)
-        fmt::print(stderr, "{}{:.4f}", (i ? ", " : ""), goal_config.positions[i]);
-      fmt::print(stderr, "]\n");
+        planner_debug("{}{:.4f}", (i ? ", " : ""), goal_config.positions[i]);
+      planner_debug("]\n");
 
       // Check goal for self-collision
       const Eigen::VectorXd goal_positions_full =
           scene_->toFullJointPositions(rrt_options_.group_name, goal_config.positions);
       goal_collision = scene_->hasCollisions(goal_positions_full);
-      fmt::print(stderr, "[PLANNER] goal in collision: {}\n", goal_collision ? "YES" : "no");
+      planner_debug("[PLANNER] goal in collision: {}\n", goal_collision ? "YES" : "no");
 
       if (goal_collision) {
         scene_->hasCollisions(goal_positions_full, true);
@@ -179,7 +202,7 @@ core::PlanResultDTO RoboPlanPlannerBackend::plan(const core::PlanRequestDTO& req
 
       // Compute joint-space distance
       double jdist = (goal_config.positions - start_config.positions).norm();
-      fmt::print(stderr, "[PLANNER] joint-space distance start->goal: {:.4f} rad\n", jdist);
+      planner_debug("[PLANNER] joint-space distance start->goal: {:.4f} rad\n", jdist);
 
     } else {
       result.error = core::ErrorDTO{core::kErrorInvalidRequest,
@@ -203,10 +226,10 @@ core::PlanResultDTO RoboPlanPlannerBackend::plan(const core::PlanRequestDTO& req
     roboplan::RRT request_rrt(scene_, request_rrt_options);
 
     // Plan path with RRT
-    fmt::print(stderr, "[PLANNER] calling RRT...\n");
+    planner_debug("[PLANNER] calling RRT...\n");
     auto path_result = request_rrt.plan(start_config, goal_config);
     if (!path_result.has_value()) {
-      fmt::print(stderr, "[PLANNER] RRT FAILED: {}\n", path_result.error());
+      planner_debug("[PLANNER] RRT FAILED: {}\n", path_result.error());
 
       // Build detailed error message
       std::string err_msg = "RRT failed: " + path_result.error();
@@ -233,7 +256,7 @@ core::PlanResultDTO RoboPlanPlannerBackend::plan(const core::PlanRequestDTO& req
       };
       return result;
     }
-    fmt::print(stderr, "[PLANNER] RRT succeeded\n");
+    planner_debug("[PLANNER] RRT succeeded\n");
 
     // Shortcut the path
     auto smoothed_path = shortcutter_->shortcut(path_result.value(), 0.05);

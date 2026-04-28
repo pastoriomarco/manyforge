@@ -5,12 +5,13 @@ import logging
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Query
-from manyforge_behavior.deployment import Deployment
+from manyforge_behavior.deployment import Deployment, DeploymentValidationError
 from manyforge_behavior.program import (
     BlackboardKey,
     BlackboardNamespaceField,
     BlackboardNamespace,
     Program,
+    ProgramValidationError,
     collect_tree_validation_issues,
     tree_node_from_dict,
 )
@@ -360,6 +361,8 @@ def create_program_router(state: ComposerState) -> APIRouter:
             raise
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc))
+        except (ProgramValidationError, DeploymentValidationError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
         except Exception as e:
             logger.warning("Failed to load program: %s", e)
             raise HTTPException(status_code=400, detail="Failed to load program")
@@ -466,7 +469,7 @@ def create_program_router(state: ComposerState) -> APIRouter:
             tree = tree_node_from_dict(request.tree.model_dump())
         except Exception as e:
             logger.warning("Invalid tree structure: %s", e)
-            raise HTTPException(status_code=400, detail="Invalid tree structure")
+            raise HTTPException(status_code=400, detail=f"Invalid tree structure: {e}")
 
         parameter_defaults = None
         blackboard_namespaces = None
@@ -722,6 +725,8 @@ def create_program_router(state: ComposerState) -> APIRouter:
             state.deployment_source_path = deployment_path
         except HTTPException:
             raise
+        except DeploymentValidationError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
         except Exception as e:
             logger.warning("Failed to load deployment: %s", e)
             raise HTTPException(status_code=400, detail="Failed to load deployment")
@@ -844,6 +849,8 @@ def create_program_router(state: ComposerState) -> APIRouter:
             )
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc))
+        except (ProgramValidationError, DeploymentValidationError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
         except Exception as e:
             logger.warning("Failed to apply tree update: %s", e)
             raise HTTPException(status_code=400, detail="Failed to apply tree update")
@@ -885,6 +892,9 @@ def create_program_router(state: ComposerState) -> APIRouter:
             ).save(target_path)
         except HTTPException:
             raise
+        except (ProgramValidationError, DeploymentValidationError) as exc:
+            logger.warning("Rejected program save: %s", exc)
+            raise HTTPException(status_code=400, detail=str(exc))
         except Exception as e:
             logger.error("Failed to save program: %s", e)
             raise HTTPException(status_code=500, detail="Failed to save program")
@@ -914,6 +924,8 @@ def create_program_router(state: ComposerState) -> APIRouter:
                 )
             else:
                 state.deployment = updated_deployment
+        except (ProgramValidationError, DeploymentValidationError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
         except Exception as e:
             logger.warning("Failed to apply deployment update: %s", e)
             raise HTTPException(status_code=400, detail="Failed to apply deployment update")
@@ -942,6 +954,9 @@ def create_program_router(state: ComposerState) -> APIRouter:
                 candidate.save(target_path)
         except HTTPException:
             raise
+        except (ProgramValidationError, DeploymentValidationError) as exc:
+            logger.warning("Rejected deployment save: %s", exc)
+            raise HTTPException(status_code=400, detail=str(exc))
         except Exception as e:
             logger.error("Failed to save deployment: %s", e)
             raise HTTPException(status_code=500, detail="Failed to save deployment")
@@ -1003,6 +1018,8 @@ def create_program_router(state: ComposerState) -> APIRouter:
             )
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc))
+        except (ProgramValidationError, DeploymentValidationError) as exc:
+            raise HTTPException(status_code=400, detail=f"Failed to apply session: {exc}")
         except Exception as e:
             logger.warning("Failed to apply session: %s", e)
             raise HTTPException(status_code=400, detail=f"Failed to apply session: {e}")

@@ -22,9 +22,9 @@ export interface CatalogParameter {
   constraints: Record<string, unknown>;
   parameterizable: boolean;
   uiEditor?: string | null;
-   blackboardRole?: string | null;
-   blackboardContract?: string | null;
-   blackboardValueType?: string | null;
+  blackboardRole?: string | null;
+  blackboardContract?: string | null;
+  blackboardValueType?: string | null;
   description: string;
 }
 
@@ -39,6 +39,7 @@ export interface CatalogEntry {
   childrenMax: number;
   parameters: CatalogParameter[];
   requiredCapabilities: string[];
+  profilesMin: string;
 }
 
 export interface CatalogResponse {

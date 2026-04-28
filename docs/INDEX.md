@@ -36,6 +36,10 @@ map.
   - Engineering reference for contributors and sandboxed coding agents.
   - Core C++ conventions and design patterns carried forward from ManyMove.
 
+- [`reference/SIMULATOR_ADAPTER_CONTRACT_DRAFT.md`](reference/SIMULATOR_ADAPTER_CONTRACT_DRAFT.md)
+  - Draft architectural reference for simulator integration.
+  - Defines the current boundary for scene bootstrap, runtime world/entity operations, and simulator-backed robot/gripper integration without changing the kernel-facing contracts.
+
 - [`plans/PRODUCT_DIRECTION_PLAN.md`](plans/PRODUCT_DIRECTION_PLAN.md)
   - Top-level roadmap for the next phase of ManyForge.
   - Product thesis, priority bands, public-preview target, and execution order.

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock
+import sys
 
 import pytest
 
@@ -14,6 +16,7 @@ from fastapi.testclient import TestClient
 from manyforge_behavior.cycle_manager import CycleState
 from manyforge_behavior.kernel_client import MockKernelClient, SceneEditRequest
 from manyforge_composer.backend.app import create_app
+from manyforge_composer.backend import routes_scene
 from manyforge_composer.backend.state import ComposerState
 
 
@@ -133,6 +136,44 @@ def test_scene_frames_expose_model_inventory_and_visibility_control():
     )
     assert toggle.status_code == 200
     assert state.hmi_server.visible["base_link"] is True
+
+
+def test_scene_frames_do_not_append_default_package_paths_when_deployment_declares_package_paths(monkeypatch):
+    client, state, kernel = make_client()
+    state.load_program(_PROGRAM_PATH, deployment_path=_DEPLOYMENT_PATH)
+    state.deployment.robot_config.package_paths = ["/declared/share"]
+
+    calls: dict[str, object] = {}
+
+    def fail_default_package_paths() -> list[str]:
+        raise AssertionError("default package paths must not be used when deployment declares package_paths")
+
+    def fake_resolve_robot_model(**kwargs):
+        calls["extra_package_paths"] = kwargs["extra_package_paths"]
+        calls["package_paths"] = kwargs["package_paths"]
+        return SimpleNamespace(
+            urdf_path="/declared/share/test.urdf",
+            package_paths=list(kwargs["package_paths"]),
+        )
+
+    class FakeUrdf:
+        @staticmethod
+        def load(*args, **kwargs):
+            calls["filename_handler_present"] = "filename_handler" in kwargs
+            return SimpleNamespace(link_map={"base_link": object(), "tool0": object()})
+
+    monkeypatch.setattr(routes_scene, "default_package_paths", fail_default_package_paths)
+    monkeypatch.setattr(routes_scene, "resolve_robot_model", fake_resolve_robot_model)
+    monkeypatch.setitem(sys.modules, "yourdfpy", SimpleNamespace(URDF=FakeUrdf))
+
+    response = client.get("/api/scene/frames")
+
+    assert response.status_code == 200
+    assert calls["extra_package_paths"] == []
+    assert calls["package_paths"] == ["/declared/share"]
+    assert calls["filename_handler_present"] is True
+    frame_names = {frame["name"] for frame in response.json()["frames"]}
+    assert {"base_link", "tool0"}.issubset(frame_names)
 
 
 def test_scene_edit_rejects_invalid_operation_with_422():

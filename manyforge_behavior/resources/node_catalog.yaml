@@ -495,7 +495,7 @@ entries:
         ui_editor: blackboard_key_selector
         blackboard_role: literal_or_key_reader
         blackboard_value_type: string
-        description: Identifier of the object to remove. May be a literal ID
+        description: Identifier of the object to remove. May be a literal ID,
           a program parameter, or a declared blackboard key/field binding.
     required_capabilities:
       - scene.edit.remove
@@ -530,7 +530,7 @@ entries:
         ui_editor: blackboard_key_selector
         blackboard_role: literal_or_key_reader
         blackboard_value_type: string
-        description: Identifier of the object to update. May be a literal ID
+        description: Identifier of the object to update. May be a literal ID,
           a program parameter, or a declared blackboard key/field binding.
       - name: pose
         type: pose
@@ -970,13 +970,15 @@ entries:
       - name: timeout_s
         type: float
         required: false
-        default: 5.0
         constraints:
           min_exclusive: 0
-        description: Maximum time to wait for the gripper command to complete.
+        description: >-
+          Maximum time to wait for the gripper command to complete. If omitted,
+          the runtime derives a timeout from the deployment gripper motion_time_s.
     bb_writer_params: [state_key]
     required_capabilities:
-      - execution.gripper.command
+      - tool.gripper.command
+      - tool.gripper.feedback
     execution:
       blocking: true
       cancellable: true

@@ -28,6 +28,7 @@ enum class KernelEventType {
   kStopIssued,         // stop issued to backend
   kPauseRequested,     // pause requested
   kResumeRequested,    // resume requested
+  kCompletedAcknowledged,  // completed terminal outcome acknowledged
   kErrorRaised,        // error occurred
   kCollisionDetected,  // collision detected during execution
 };

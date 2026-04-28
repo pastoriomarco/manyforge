@@ -58,6 +58,7 @@ class CatalogEntryResponse(BaseModel):
     bb_reader_params: List[str] = Field(default_factory=list, alias="bbReaderParams")
     bb_writer_params: List[str] = Field(default_factory=list, alias="bbWriterParams")
     required_capabilities: List[str] = Field(default_factory=list, alias="requiredCapabilities")
+    profiles_min: str = Field(default="v0.0", alias="profilesMin")
     interruptible: bool = False
     default_interrupt_scope: Optional[str] = Field(
         default=None,

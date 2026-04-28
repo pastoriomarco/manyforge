@@ -152,6 +152,7 @@ const char* kernel_event_type_to_string(KernelEventType type) {
     case KernelEventType::kStopIssued: return "stop_issued";
     case KernelEventType::kPauseRequested: return "pause_requested";
     case KernelEventType::kResumeRequested: return "resume_requested";
+    case KernelEventType::kCompletedAcknowledged: return "acknowledge_completed";
     case KernelEventType::kErrorRaised: return "error_raised";
     case KernelEventType::kCollisionDetected: return "collision_detected";
     default: return "unknown";
@@ -600,6 +601,11 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
       })
       .def("reset", [](NativeKernelBundle& self) -> py::dict {
         auto r = self.kernel->reset();
+        return command_result(r.accepted, r.error);
+      })
+      .def("acknowledge_completed", [](NativeKernelBundle& self,
+                                        uint64_t execution_id) -> py::dict {
+        auto r = self.kernel->acknowledge_completed(execution_id);
         return command_result(r.accepted, r.error);
       })
       .def("get_status", [](NativeKernelBundle& self) -> py::dict {

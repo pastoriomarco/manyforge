@@ -302,6 +302,7 @@ def test_catalog_entry_includes_stability_metadata(client):
     assert response.status_code == 200
     data = response.json()
     assert data["stability"] == "experimental"
+    assert data["profilesMin"] == "v0.1"
 
 
 def test_program_response_includes_interrupt_metadata(client, tmp_path):
@@ -408,6 +409,18 @@ def test_load_program_invalid_path(client, state):
     """POST with a path outside the allowlist returns 403."""
     response = client.post("/api/program/load", json={"path": "/nonexistent/path.yaml"})
     assert response.status_code == 403
+
+
+def test_load_program_validation_error_includes_reason(client, tmp_path):
+    data = yaml.safe_load(Path(_PROGRAM_PATH).read_text(encoding="utf-8"))
+    del data["scene"][0]["pose"]["frame_id"]
+    program_path = tmp_path / "invalid_scene.program.yaml"
+    program_path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+
+    response = client.post("/api/program/load", json={"path": str(program_path)})
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "scene[0] pose.frame_id is required"
 
 
 def test_get_program(client, state):
@@ -1688,6 +1701,7 @@ def test_apply_session_updates_scene_without_touching_saved_artifact(client):
                         "box_dimensions_m": [0.08, 0.08, 0.12],
                     },
                     "pose": {
+                        "frame_id": "universe",
                         "position_m": [0.45, 0.0, 0.06],
                         "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
                     },
@@ -1746,6 +1760,7 @@ def test_save_program_persists_updated_scene_resources(client, tmp_path):
                         "box_dimensions_m": [0.1, 0.2, 0.3],
                     },
                     "pose": {
+                        "frame_id": "universe",
                         "position_m": [0.4, 0.1, 0.2],
                         "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
                     },

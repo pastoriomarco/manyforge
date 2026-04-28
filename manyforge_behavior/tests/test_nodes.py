@@ -782,6 +782,36 @@ class TestCommandGripper:
         reader.register_key(key="gripper_closed", access=py_trees.common.Access.READ)
         assert reader.get("gripper_closed") is True
 
+    def test_command_gripper_derives_default_timeout_from_motion_time(self, kernel, bb_with_kernel):
+        writer = py_trees.blackboard.Client(name="gripper_setup")
+        writer.register_key(key="gripper_configs", access=py_trees.common.Access.WRITE)
+        writer.gripper_configs = {
+            "primary": {
+                "command_mode": "simulated_joint",
+                "group_id": "gripper",
+                "joint_name": "finger_joint",
+                "open_position": 0.0,
+                "closed_position": 0.7,
+                "motion_time_s": 0.02,
+            }
+        }
+
+        node = CommandGripper(
+            name="close_gripper",
+            gripper_id="primary",
+            command="close",
+        )
+        node.setup()
+        node.initialise()
+
+        status = node.update()
+        deadline = time.monotonic() + 1.0
+        while status == py_trees.common.Status.RUNNING and time.monotonic() < deadline:
+            time.sleep(0.01)
+            status = node.update()
+
+        assert status == py_trees.common.Status.SUCCESS
+
     def test_command_gripper_fails_when_gripper_is_missing(self, kernel, bb_with_kernel):
         writer = py_trees.blackboard.Client(name="gripper_setup")
         writer.register_key(key="gripper_configs", access=py_trees.common.Access.WRITE)
@@ -819,7 +849,7 @@ class TestCommandGripper:
         assert second.accepted is False
         assert "already executing" in (second.error or "")
 
-    def test_mock_kernel_status_reads_do_not_persist_inflight_position(self, kernel):
+    def test_mock_kernel_status_reads_do_not_advance_inflight_command(self, kernel):
         accepted = kernel.command_gripper(
             GripperCommandRequest(
                 gripper_id="primary",
@@ -831,20 +861,45 @@ class TestCommandGripper:
         )
         assert accepted.accepted is True
 
-        time.sleep(0.01)
-        status = kernel.get_gripper_status("primary")
+        time.sleep(0.06)
+        stale_status = kernel.get_gripper_status("primary")
 
-        assert status.state == GripperCommandState.EXECUTING
-        assert status.current_position is not None
-        assert 0.0 < status.current_position < 0.7
+        assert stale_status.state == GripperCommandState.EXECUTING
+        assert stale_status.current_position == pytest.approx(0.0)
         assert kernel._gripper_positions.get("primary") is None
 
-        time.sleep(0.05)
+        kernel.update_gripper_commands()
         completed = kernel.get_gripper_status("primary")
 
         assert completed.state == GripperCommandState.COMPLETED
         assert completed.current_position == pytest.approx(0.7)
         assert kernel._gripper_positions["primary"] == pytest.approx(0.7)
+
+    def test_mock_kernel_accepts_next_gripper_command_after_update(self, kernel):
+        first = kernel.command_gripper(
+            GripperCommandRequest(
+                gripper_id="primary",
+                group_id="gripper",
+                joint_name="finger_joint",
+                target_position=0.7,
+                duration_s=0.01,
+            )
+        )
+        assert first.accepted is True
+
+        time.sleep(0.02)
+        second = kernel.command_gripper(
+            GripperCommandRequest(
+                gripper_id="primary",
+                group_id="gripper",
+                joint_name="finger_joint",
+                target_position=0.0,
+                duration_s=0.01,
+            )
+        )
+
+        assert second.accepted is True
+        assert kernel.get_gripper_status("primary").target_position == pytest.approx(0.0)
 
 
 class TestGetLinkPose:

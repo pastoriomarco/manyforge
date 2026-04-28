@@ -201,7 +201,10 @@ class CommandGripper(py_trees.behaviour.Behaviour):
         self._gripper_id = kwargs.get("gripper_id", "")
         self._command = kwargs.get("command", "close")
         self._state_key = kwargs.get("state_key", "")
-        self._timeout_s = float(kwargs.get("timeout_s", 5.0))
+        raw_timeout_s = kwargs.get("timeout_s")
+        self._timeout_s_override = (
+            None if raw_timeout_s is None else float(raw_timeout_s)
+        )
         self._started = False
         self._deadline = 0.0
 
@@ -261,6 +264,15 @@ class CommandGripper(py_trees.behaviour.Behaviour):
             if self._command == "close"
             else float(config["open_position"])
         )
+        motion_time_s = float(config["motion_time_s"])
+        timeout_s = (
+            self._timeout_s_override
+            if self._timeout_s_override is not None
+            else motion_time_s + max(1.0, motion_time_s * 0.2)
+        )
+        if timeout_s <= 0.0:
+            self.feedback_message = "command_gripper.timeout_s must be > 0"
+            return py_trees.common.Status.FAILURE
 
         if not self._started:
             result = kernel.command_gripper(
@@ -269,15 +281,16 @@ class CommandGripper(py_trees.behaviour.Behaviour):
                     group_id=str(config["group_id"]),
                     joint_name=str(config["joint_name"]),
                     target_position=target_position,
-                    duration_s=float(config["motion_time_s"]),
+                    duration_s=motion_time_s,
                 )
             )
             self._started = True
-            self._deadline = time.monotonic() + self._timeout_s
+            self._deadline = time.monotonic() + timeout_s
             if not result.accepted:
                 self.feedback_message = result.error or "Gripper command was rejected"
                 return py_trees.common.Status.FAILURE
 
+        kernel.update_gripper_commands()
         status = kernel.get_gripper_status(self._gripper_id)
         if status.state == GripperCommandState.COMPLETED:
             if self._state_key:

@@ -740,15 +740,41 @@ TEST_F(ExecutionKernelTest, Execute_PreCollisionCheck_Blocks) {
   EXPECT_EQ(execution.execute_count, 0);
 }
 
-// --- Execute auto-resets from terminal states ---
+// --- Execute requires bound acknowledgement from terminal success ---
 
-TEST_F(ExecutionKernelTest, Execute_FromCompleted_AutoResets) {
-  execute_sync(make_test_request());
+TEST_F(ExecutionKernelTest, Execute_FromCompleted_RequiresAcknowledgement) {
+  auto first = execute_sync(make_test_request());
+  ASSERT_TRUE(first.ok());
   EXPECT_EQ(kernel.get_status().state, ExecutionState::kCompleted);
+
+  auto rejected = kernel.execute(make_test_request());
+  EXPECT_FALSE(rejected.ok());
+  EXPECT_EQ(kernel.get_status().state, ExecutionState::kCompleted);
+
+  auto stale_ack = kernel.acknowledge_completed(first.value() + 1);
+  EXPECT_FALSE(stale_ack.accepted);
+  EXPECT_EQ(kernel.get_status().state, ExecutionState::kCompleted);
+
+  auto ack = kernel.acknowledge_completed(first.value());
+  ASSERT_TRUE(ack.accepted);
+  EXPECT_EQ(kernel.get_status().state, ExecutionState::kIdle);
 
   auto result = execute_sync(make_test_request());
   EXPECT_TRUE(result.ok());
   EXPECT_EQ(kernel.get_status().state, ExecutionState::kCompleted);
+}
+
+TEST_F(ExecutionKernelTest, AcknowledgeCompleted_FromFailed_Rejected) {
+  PlanResultDTO plan_err;
+  plan_err.error = ErrorDTO{kErrorPlanningFailed, "No solution", {}};
+  planner.next_result = plan_err;
+  auto result = execute_sync(make_test_request());
+  ASSERT_TRUE(result.ok());
+  EXPECT_EQ(kernel.get_status().state, ExecutionState::kFailed);
+
+  auto ack = kernel.acknowledge_completed(result.value());
+  EXPECT_FALSE(ack.accepted);
+  EXPECT_EQ(kernel.get_status().state, ExecutionState::kFailed);
 }
 
 // --- Stop ---
@@ -1624,11 +1650,15 @@ TEST_F(ExecutionKernelTest, MetricsCounters) {
 
 TEST_F(ExecutionKernelTest, MetricsAfterCacheHitAndMiss) {
   // Execute twice (miss then hit) -> verify both counters
-  execute_sync(make_test_request("first_move"));
+  auto first = execute_sync(make_test_request("first_move"));
+  ASSERT_TRUE(first.ok());
   
   auto metrics_after_miss = kernel.get_metrics();
   EXPECT_EQ(metrics_after_miss.cache_misses, 1u);
   EXPECT_EQ(metrics_after_miss.cache_hits, 0u);
+
+  auto ack = kernel.acknowledge_completed(first.value());
+  ASSERT_TRUE(ack.accepted);
 
   // Second execution should be a cache hit
   execute_sync(make_test_request("first_move"));

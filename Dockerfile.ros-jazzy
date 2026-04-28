@@ -1,0 +1,54 @@
+# ManyForge ROS Jazzy Development/Test Environment
+#
+# Purpose:
+#   - Validate ROS wrappers/adapters without polluting the ROS-free core image.
+#   - Provide a generic Ubuntu Noble + ROS Jazzy lane that can talk to Isaac Sim,
+#     Isaac ROS, Gazebo, real robot drivers, or deterministic fake ROS targets.
+#
+# This is not the Isaac ROS deployment image.  Isaac ROS should become a
+# downstream overlay that reuses the same manyforge_ros adapter code.
+
+FROM ros:jazzy-ros-base-noble
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV ROS_DISTRO=jazzy
+
+SHELL ["/bin/bash", "-c"]
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        cmake \
+        curl \
+        git \
+        ninja-build \
+        python3-colcon-common-extensions \
+        python3-pytest \
+        ros-${ROS_DISTRO}-control-msgs \
+        ros-${ROS_DISTRO}-sensor-msgs \
+        ros-${ROS_DISTRO}-simulation-interfaces \
+        ros-${ROS_DISTRO}-trajectory-msgs \
+        ros-${ROS_DISTRO}-controller-manager \
+        ros-${ROS_DISTRO}-joint-state-broadcaster \
+        ros-${ROS_DISTRO}-joint-trajectory-controller \
+        ros-${ROS_DISTRO}-ros2-control \
+        ros-${ROS_DISTRO}-ros2-controllers \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+
+RUN set -eux; \
+    if ! getent group 1000 >/dev/null; then groupadd --gid 1000 manyforge; fi; \
+    if ! getent passwd 1000 >/dev/null; then \
+        useradd --create-home --shell /bin/bash --uid 1000 --gid 1000 manyforge; \
+    fi; \
+    mkdir -p /tmp/manyforge-build /workspace; \
+    chown -R 1000:1000 /tmp/manyforge-build /workspace
+
+COPY docker-entrypoint.ros-jazzy.sh /usr/local/bin/
+RUN chmod +x /usr/local/bin/docker-entrypoint.ros-jazzy.sh
+
+USER 1000:1000
+
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.ros-jazzy.sh"]
+CMD ["bash"]

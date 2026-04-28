@@ -18,6 +18,7 @@ Use these companion plans for the detailed execution layers:
 - [`PREVIEW_AND_ADOPTION_PLAN.md`](PREVIEW_AND_ADOPTION_PLAN.md)
 - [`AI_ASSISTANT_INTEGRATION_PLAN.md`](AI_ASSISTANT_INTEGRATION_PLAN.md)
 - [`INTERRUPT_MODEL_PLAN.md`](INTERRUPT_MODEL_PLAN.md)
+- [`../reference/SIMULATOR_ADAPTER_CONTRACT_DRAFT.md`](../reference/SIMULATOR_ADAPTER_CONTRACT_DRAFT.md)
 - [`../operations/STACK_SETUP.md`](../operations/STACK_SETUP.md)
 
 ## Product Thesis
@@ -105,6 +106,10 @@ The constraint is:
   much as possible
 - simulator-specific paths must not introduce throwaway artifacts or bypass the
   normal runtime authority model
+
+Current technical reference for that boundary:
+
+- [`../reference/SIMULATOR_ADAPTER_CONTRACT_DRAFT.md`](../reference/SIMULATOR_ADAPTER_CONTRACT_DRAFT.md)
 
 ### 5. AI must stay bounded and auditable
 

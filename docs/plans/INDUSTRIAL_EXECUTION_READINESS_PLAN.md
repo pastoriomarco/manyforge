@@ -215,6 +215,10 @@ runtime story.
 Still needed:
 
 - reviewed authentication and authorization policy for remote control surfaces
+- pre-release hardening for development/demo server defaults:
+  - localhost binding by default
+  - explicit opt-in for unauthenticated non-loopback binds
+  - token required or fail-fast before public or shared-network use
 - complete operator/API audit coverage
 - reproducible release inputs and version pinning across the stack
 - requirement traceability:

@@ -53,4 +53,14 @@ struct ResetResultDTO {
   std::optional<ErrorDTO> error;
 };
 
+/// Successful terminal acknowledgement result.
+///
+/// This is intentionally narrower than Reset: it is valid only for the exact
+/// Completed execution_id observed by the runtime, and must not clear Failed or
+/// Stopped terminal states.
+struct AcknowledgeCompletedResultDTO {
+  bool accepted = false;
+  std::optional<ErrorDTO> error;
+};
+
 }  // namespace manyforge::core

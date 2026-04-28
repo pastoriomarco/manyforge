@@ -10,6 +10,7 @@ import py_trees
 from manyforge_behavior.blackboard_bindings import resolve_runtime_blackboard_bindings
 from manyforge_behavior.catalog import NodeCatalog
 from manyforge_behavior.kernel_client import KernelClient, SceneEditRequest
+from manyforge_behavior.motion_runtime import MotionExecutionCoordinator
 from manyforge_behavior.nodes.geometry import CheckPoseDistance, GetLinkPose
 from manyforge_behavior.nodes.logic import (
     CheckKeyBoolValue,
@@ -111,6 +112,7 @@ class OrchestratorRunner:
         self._event_recorder = event_recorder
         self._scene_snapshot_provider = scene_snapshot_provider
         self._scene_snapshot_url_publisher = scene_snapshot_url_publisher
+        self._motion_coordinator = MotionExecutionCoordinator(kernel)
         # Intervention context — set by cycle_manager before building
         # intervention subtrees so nodes like QueryModelNode can attribute
         # audit events to the active session.
@@ -162,6 +164,8 @@ class OrchestratorRunner:
         bb = py_trees.blackboard.Client(name="runner")
         bb.register_key(key="kernel", access=py_trees.common.Access.WRITE)
         bb.kernel = self._kernel
+        bb.register_key(key="motion_coordinator", access=py_trees.common.Access.WRITE)
+        bb.motion_coordinator = self._motion_coordinator
 
         # Inject robot profile defaults for motion nodes
         bb.register_key(key="robot_id", access=py_trees.common.Access.WRITE)

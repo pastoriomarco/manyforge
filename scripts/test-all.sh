@@ -267,6 +267,22 @@ run_qualification_soak_tests() {
     fi
 }
 
+run_ros_tests() {
+    section "ROS adapter tests"
+    cd "$WORKSPACE"
+    setup_pythonpath
+    export PYTHONPATH="$WORKSPACE/manyforge_ros:${PYTHONPATH:-}"
+    if ! python_has_modules rclpy control_msgs trajectory_msgs action_msgs; then
+        skip "Missing ROS 2 Python deps; run in the ros-jazzy image"
+        return
+    fi
+    if pytest manyforge_ros/tests/ -v; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+    fi
+}
+
 case "$FILTER" in
     cpp)
         run_cpp_tests
@@ -297,6 +313,9 @@ case "$FILTER" in
     qualification-soak)
         run_qualification_soak_tests
         ;;
+    ros)
+        run_ros_tests
+        ;;
     qualification-all)
         run_qualification_tests
         run_qualification_interrupt_tests
@@ -320,7 +339,7 @@ case "$FILTER" in
         run_qualification_native_tests
         ;;
     *)
-        echo "Usage: $0 [all|cpp|roboplan|bindings|python|composer|qualification|qualification-interrupt|qualification-native|qualification-soak|qualification-all|integration]"
+        echo "Usage: $0 [all|cpp|roboplan|bindings|python|composer|qualification|qualification-interrupt|qualification-native|qualification-soak|qualification-all|integration|ros]"
         exit 1
         ;;
 esac

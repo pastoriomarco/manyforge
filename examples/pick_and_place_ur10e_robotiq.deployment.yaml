@@ -70,13 +70,14 @@ adapters:
     supported_profiles: ["v0.1"]
     capability_keys:
       - execution.trajectory.execute
-      - execution.gripper.command
       - execution.feedback.phase_events
       - execution.feedback.state_snapshots
       - execution.stop.soft
       - execution.pause
       - execution.resume
       - execution.reset
+      - tool.gripper.command
+      - tool.gripper.feedback
     config:
       mode: simulated
       execution_tick_hz: 100

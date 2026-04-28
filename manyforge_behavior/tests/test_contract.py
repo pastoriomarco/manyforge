@@ -113,21 +113,32 @@ class TestStateMachineInvariants:
         status = kernel.get_status()
         assert status.state == ExecutionState.COMPLETED
 
-    def test_execute_from_completed_auto_resets(self, kernel: KernelClient) -> None:
+    def test_execute_from_completed_requires_bound_acknowledgement(
+        self, kernel: KernelClient
+    ) -> None:
         """
-        INVARIANT: Second execute from COMPLETED must succeed (auto-reset).
-        
-        The kernel must auto-reset from terminal states (COMPLETED, FAILED,
-        STOPPED) to allow consecutive execute calls without explicit reset.
+        INVARIANT: Execute must not clear a terminal COMPLETED state.
+
+        The runtime must acknowledge the exact completed execution_id before
+        the kernel returns to IDLE and accepts another execute.
         """
-        # First execute
         request1 = make_joint_goal_request("move1")
         result1 = kernel.execute(request1)
         assert result1.ok is True
         assert kernel.get_status().state == ExecutionState.COMPLETED
-        
-        # Second execute should succeed (auto-reset from COMPLETED)
+
         request2 = make_joint_goal_request("move2")
+        result2 = kernel.execute(request2)
+        assert result2.ok is False
+
+        stale_ack = kernel.acknowledge_completed(result1.execution_id + 1)
+        assert stale_ack.accepted is False
+        assert kernel.get_status().state == ExecutionState.COMPLETED
+
+        ack = kernel.acknowledge_completed(result1.execution_id)
+        assert ack.accepted is True
+        assert kernel.get_status().state == ExecutionState.IDLE
+
         result2 = kernel.execute(request2)
         assert result2.ok is True
 
@@ -269,6 +280,7 @@ class TestExecuteRequestInvariants:
         """
         request1 = make_joint_goal_request("move1")
         result1 = kernel.execute(request1)
+        kernel.acknowledge_completed(result1.execution_id)
         
         request2 = make_joint_goal_request("move2")
         result2 = kernel.execute(request2)
@@ -516,22 +528,28 @@ class TestErrorHandlingInvariants:
         status = kernel.get_status()
         assert status.state == ExecutionState.FAILED
 
-    def test_execute_after_failure_auto_resets(self, kernel: MockKernelClient) -> None:
+    def test_execute_after_failure_requires_reset(self, kernel: MockKernelClient) -> None:
         """
-        INVARIANT: Execute after FAILED must work (auto-reset).
-        
-        After a failed execute, the kernel must auto-reset to allow
-        subsequent execute calls to succeed.
+        INVARIANT: Execute must not clear a FAILED terminal state.
+
+        Failed executions require reset/recovery; successful-completion
+        acknowledgement must not apply to failures.
         """
-        # First execute fails
         kernel.fail_next_execute = True
         request1 = make_joint_goal_request("fail_move")
         result1 = kernel.execute(request1)
         assert result1.ok is False
         assert kernel.get_status().state == ExecutionState.FAILED
-        
-        # Second execute should succeed (auto-reset from FAILED)
+
+        ack = kernel.acknowledge_completed(result1.execution_id)
+        assert ack.accepted is False
+
         request2 = make_joint_goal_request("success_move")
+        result2 = kernel.execute(request2)
+        assert result2.ok is False
+
+        reset = kernel.reset()
+        assert reset.accepted is True
         result2 = kernel.execute(request2)
         assert result2.ok is True
 
