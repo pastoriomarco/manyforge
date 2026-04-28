@@ -1015,6 +1015,127 @@ class DebugSignalPublishRequest(BaseModel):
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
+# --- Assistant ---
+class AssistantChatRequest(BaseModel):
+    model_config = _ALIAS_CFG
+    message: str = Field(min_length=1)
+    mode: Literal["mock"] = "mock"
+    conversation_id: Optional[str] = Field(default=None, alias="conversationId")
+    context: Dict[str, Any] = Field(default_factory=dict)
+    requested_tools: List[str] = Field(default_factory=list, alias="requestedTools")
+
+    @model_validator(mode="after")
+    def _validate_message(self) -> "AssistantChatRequest":
+        if not self.message.strip():
+            raise ValueError("message must not be blank")
+        return self
+
+
+class AssistantProposalResponse(BaseModel):
+    model_config = _ALIAS_CFG
+    id: str
+    type: str
+    title: str
+    summary: str
+    status: Literal["draft"] = "draft"
+    review_required: bool = Field(default=True, alias="reviewRequired")
+    payload: Dict[str, Any] = Field(default_factory=dict)
+    warnings: List[str] = Field(default_factory=list)
+    source: Dict[str, Any] = Field(default_factory=dict)
+
+
+class AssistantToolCallResponse(BaseModel):
+    model_config = _ALIAS_CFG
+    name: str
+    status: Literal["proposed", "skipped", "completed", "failed"]
+    arguments: Dict[str, Any] = Field(default_factory=dict)
+    result: Optional[Dict[str, Any]] = None
+    error: Optional[str] = None
+
+
+class AssistantChatResponse(BaseModel):
+    model_config = _ALIAS_CFG
+    conversation_id: str = Field(alias="conversationId")
+    mode: Literal["mock"]
+    message: str
+    proposals: List[AssistantProposalResponse] = Field(default_factory=list)
+    tool_calls: List[AssistantToolCallResponse] = Field(default_factory=list, alias="toolCalls")
+    warnings: List[str] = Field(default_factory=list)
+    mutated: bool = False
+    requires_review: bool = Field(default=True, alias="requiresReview")
+    program_loaded: bool = Field(alias="programLoaded")
+    cycle_state: str = Field(alias="cycleState")
+    timestamp_ns: int = Field(alias="timestampNs")
+
+
+class AssistantToolDescriptorResponse(BaseModel):
+    model_config = _ALIAS_CFG
+    name: str
+    description: str
+    mutates_state: bool = Field(alias="mutatesState")
+    requires_review: bool = Field(alias="requiresReview")
+    input_schema: Dict[str, Any] = Field(default_factory=dict, alias="inputSchema")
+
+
+class AssistantToolCatalogResponse(BaseModel):
+    model_config = _ALIAS_CFG
+    tools: List[AssistantToolDescriptorResponse] = Field(default_factory=list)
+
+
+class AssistantInspectIsaacSceneRequest(BaseModel):
+    model_config = _ALIAS_CFG
+    include_subtrees: List[str] = Field(default_factory=list, alias="includeSubtrees")
+    exclude_subtrees: List[str] = Field(default_factory=list, alias="excludeSubtrees")
+    probe_prims: List[str] = Field(default_factory=list, alias="probePrims")
+    include_hidden: bool = Field(default=False, alias="includeHidden")
+    include_cooked_convex: bool = Field(default=True, alias="includeCookedConvex")
+    include_cooked_samples: bool = Field(default=False, alias="includeCookedSamples")
+    max_colliders: Optional[int] = Field(default=None, alias="maxColliders", ge=1)
+    purpose: List[Literal["default", "render", "proxy", "guide", "all"]] = Field(
+        default_factory=list,
+    )
+    output_profile: Literal["llm_scene_authoring", "raw_inventory"] = Field(
+        default="llm_scene_authoring",
+        alias="outputProfile",
+    )
+    timeout_s: float = Field(default=10.0, alias="timeoutS", gt=0.0, le=120.0)
+    request_topic: Optional[str] = Field(default=None, alias="requestTopic")
+    response_topic: Optional[str] = Field(default=None, alias="responseTopic")
+    node_name: str = Field(default="manyforge_composer_inspect_isaac_scene", alias="nodeName")
+
+
+class AssistantInspectIsaacSceneResponse(BaseModel):
+    model_config = _ALIAS_CFG
+    tool_name: str = Field(alias="toolName")
+    success: bool
+    report: Dict[str, Any]
+    summary: Dict[str, Any] = Field(default_factory=dict)
+    warnings: List[str] = Field(default_factory=list)
+    mutated: bool = False
+    timestamp_ns: int = Field(alias="timestampNs")
+
+
+class AssistantProposeSceneObjectsRequest(BaseModel):
+    model_config = _ALIAS_CFG
+    inspection_report: Dict[str, Any] = Field(alias="inspectionReport")
+    source_roots: List[str] = Field(default_factory=list, alias="sourceRoots")
+    object_id_prefix: str = Field(default="", alias="objectIdPrefix")
+    max_proposals: Optional[int] = Field(default=None, alias="maxProposals", ge=1)
+
+
+class AssistantProposeSceneObjectsResponse(BaseModel):
+    model_config = _ALIAS_CFG
+    tool_name: str = Field(alias="toolName")
+    proposals: List[AssistantProposalResponse] = Field(default_factory=list)
+    scene_resources: List[ProgramSceneResourceResponse] = Field(
+        default_factory=list,
+        alias="sceneResources",
+    )
+    warnings: List[str] = Field(default_factory=list)
+    mutated: bool = False
+    timestamp_ns: int = Field(alias="timestampNs")
+
+
 # --- File Browser ---
 class FileBrowserEntryResponse(BaseModel):
     model_config = _ALIAS_CFG

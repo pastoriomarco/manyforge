@@ -609,6 +609,12 @@ Target image families:
    - primary development and validation lane for ROS wrappers/adapters
    - keeps Python/ROS dependencies apt-managed; it must not pip-install or
      override the ROS/colcon interpreter stack
+   - current scaffold is adapter/test oriented and does not yet include the
+     full Composer web/runtime dependency set
+   - target next evolution is a ROS-capable full ManyForge runtime/test image,
+     using a pinned ManyForge application venv with `--system-site-packages`
+     so ROS remains apt-managed while Composer and ManyForge Python app deps
+     stay reproducible
    - contains ROS packages required for:
      - `FollowJointTrajectory`
      - `simulation_interfaces`
@@ -654,13 +660,19 @@ Near-real-time implication:
 Initial repo scaffold:
 
 - add a separate `Dockerfile.ros-jazzy`
+- add a separate `Dockerfile.ros-jazzy-full` for full Composer + ROS runtime
+  validation once simulator/assistant work needs the unified image
 - add a `ros` docker compose profile using host networking for development DDS
   discovery
+- add a `ros-full` docker compose profile for unified ManyForge + ROS checks
 - add `manyforge_ros` as the home for ROS adapters and deterministic fake ROS
   targets
 - add a first fake `FollowJointTrajectory` action server test target
 - keep default `test-all.sh all` unchanged; ROS tests are opt-in through the
   ROS image/lane
+- defer the full ROS-capable ManyForge runtime image until the current
+  assistant/simulator smoke path is checkpointed; do not rely on ad hoc
+  smoke-time dependency installation as a production or qualification strategy
 
 Validation note:
 
@@ -902,6 +914,25 @@ Assistant implementation direction:
 - Start the assistant workflow before implementing the direct simulator-import
   UI because the assisted scene-understanding route is strategically higher
   impact and may change the base review/apply workflow.
+- The first Composer backend step is a model-free assistant chat scaffold that
+  returns reviewable draft proposals and proves the route can be exercised
+  without mutating Composer state or touching the active inference stack.
+- The next deterministic tool layer now exists as Composer endpoints:
+  - `GET /api/assistant/tools`
+  - `POST /api/assistant/tools/inspect-isaac-scene`
+  - `POST /api/assistant/tools/propose-scene-objects`
+- `inspect-isaac-scene` lazily uses the ROS-capable
+  `manyforge_ros.inspect_isaac_scene` client and stays unavailable with a clear
+  error in ROS-free environments.
+- `propose-scene-objects` consumes a validated inspection report and returns
+  ManyForge scene-resource draft proposals only. It does not apply scene edits.
+- `scripts/smoke-assistant-scene-authoring.py` exercises the same
+  inspect-to-propose path. In live mode it calls the Isaac extension through
+  ROS. By default it calls the deterministic tool functions directly so it can
+  run in the ROS-capable image without Composer web dependencies; `--transport
+  api` exercises the Composer endpoints in-process. In fixture mode it uses a
+  committed representative Isaac report so CI and local Composer tests remain
+  deterministic without requiring Isaac Sim.
 - The assistant is an assisted route, not an autonomous route. It should answer
   user questions about the inspected scene, propose candidate roots and
   conservative planning geometry, and explain uncertainty, while the user
@@ -931,9 +962,10 @@ Omniverse Libraries relevance:
 
 Following next steps after service plumbing:
 
-1. Define the assistant tool contract for simulator-backed scene authoring.
-   Start with read-only inspection and non-mutating proposal tools, then add
-   constrained mutation tools that operate on Composer/program drafts.
+1. Wire the model-backed assistant to the deterministic tool layer while
+   preserving the explicit proposal/review/apply contract.
+   The model should choose tools and explain proposals, not mutate Composer
+   state directly.
 2. Define explicit scene binding rules before relying on entity names or
    collider roots.
    The live entity graph is noisy and includes visual, collision, prototype,

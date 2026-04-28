@@ -46,6 +46,17 @@ The ROS image starts from `ros:jazzy-ros-base-noble` and keeps ROS Python
 dependencies apt-managed. The default development image remains ROS-free; ROS
 wrappers/adapters live in the `manyforge_ros` lane.
 
+Full ManyForge + ROS integration checks use the heavier ROS Jazzy full image:
+
+```bash
+docker compose --profile ros-full run --rm ros-jazzy-full ./scripts/test-ros-full.sh
+```
+
+The full image also starts from `ros:jazzy-ros-base-noble`, but adds a pinned
+ManyForge application venv with `--system-site-packages` so ROS Python remains
+apt-managed while Composer/FastAPI/Pydantic/RoboPlan app dependencies are
+reproducible.
+
 To build C++ manually:
 
 ```bash

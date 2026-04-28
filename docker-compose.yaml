@@ -68,6 +68,24 @@ services:
     profiles:
       - ros
 
+  # Full ROS-capable ManyForge runtime/test image.
+  # Host networking is intentional for ROS 2 DDS discovery during development.
+  ros-jazzy-full:
+    build:
+      context: .
+      dockerfile: Dockerfile.ros-jazzy-full
+    network_mode: host
+    ipc: host
+    volumes:
+      - .:/workspace
+      - ros-full-build-cache:/tmp/manyforge-build
+    working_dir: /workspace
+    stdin_open: true
+    tty: true
+    profiles:
+      - ros-full
+
 volumes:
   build-cache:
   ros-build-cache:
+  ros-full-build-cache:

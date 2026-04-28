@@ -142,12 +142,26 @@ Required fields include:
 
 ### 2. Composer assistant
 
+Current status:
+
+- a model-free `POST /api/assistant/chat` scaffold exists
+- the route returns reviewable draft proposals only
+- the route does not call NemoClaw/OpenClaw, invoke tools, or mutate Composer
+  state
+- deterministic assistant tool endpoints exist under `/api/assistant/tools`
+- the first tools are read-only Isaac scene inspection and non-mutating
+  scene-resource proposal generation
+- deterministic fixture-backed smoke coverage exists for the
+  `inspect_isaac_scene` -> `propose_scene_objects` path, so normal tests do
+  not require a live Isaac Sim process
+
 Still needed:
 
 - deployment-level assistant endpoint alias
-- `POST /api/assistant/chat`
+- model-backed `/api/assistant/chat` execution behind explicit capability and
+  endpoint selection
 - Composer assistant panel
-- structured proposal/apply flow for tree edits
+- structured proposal/apply flow for scene and tree edits
 - practical scene-to-program proposal flows useful for simulation-backed
   adoption work
 
@@ -199,7 +213,7 @@ This depends on:
 
 1. continued runtime hardening for remaining synchronous work
 2. deployment-level model capability fields and Composer warnings
-3. assistant endpoint configuration and `/api/assistant/chat`
+3. assistant endpoint configuration and model-backed `/api/assistant/chat`
 4. structured proposal/apply flow in Composer
 
 ### Next

@@ -1,0 +1,312 @@
+{
+  "errors": [],
+  "filters": {
+    "cooked_convex": true,
+    "exclude_subtree": [
+      "/World/ur10e_robotiq2f_140_ROS"
+    ],
+    "include_cooked_samples": false,
+    "include_hidden": false,
+    "include_subtree": [],
+    "max_colliders": null,
+    "probe_prim": [
+      "/World/ur10e_robotiq2f_140_ROS"
+    ],
+    "purpose": []
+  },
+  "objects": [
+    {
+      "collider_count": 2,
+      "collider_paths": [
+        "/World/soup_can",
+        "/World/soup_can/_05_tomato_soup_can"
+      ],
+      "cooked_convex_valid_count": 1,
+      "geometry_schema_counts": {
+        "Xform": 1,
+        "mesh": 1
+      },
+      "id_hint": "World__soup_can",
+      "mesh_approximation_counts": {
+        "convexDecomposition": 1,
+        "convexHull": 1
+      },
+      "purpose": [
+        "default"
+      ],
+      "recommended_manyforge_shape": {
+        "confidence": "medium",
+        "pose": {
+          "frame_id": "universe",
+          "orientation_rpy_deg": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "position_m": [
+            0.085469,
+            -0.004781,
+            0.060786
+          ]
+        },
+        "reason": "ManyForge currently supports box/sphere scene resources; using world AABB as a conservative box.",
+        "shape": {
+          "box_dimensions_m": [
+            0.074928,
+            0.07488,
+            0.101855
+          ],
+          "type": "box"
+        },
+        "source_root": "/World/soup_can"
+      },
+      "runtime_pose_source_hint": "/World/soup_can",
+      "source_root": "/World/soup_can",
+      "type_counts": {
+        "Mesh": 1,
+        "Xform": 1
+      },
+      "visibility": [
+        "inherited"
+      ],
+      "warnings": [
+        "Source uses complex mesh approximation; box/sphere export is an approximation.",
+        "Cooked convex data was not available for one or more colliders."
+      ],
+      "world_aabb": {
+        "center": [
+          0.085469,
+          -0.004781,
+          0.060786
+        ],
+        "max": [
+          0.122933,
+          0.032659,
+          0.111714
+        ],
+        "min": [
+          0.048005,
+          -0.042221,
+          0.009859
+        ],
+        "size": [
+          0.074928,
+          0.07488,
+          0.101855
+        ]
+      }
+    },
+    {
+      "collider_count": 1,
+      "collider_paths": [
+        "/background/table_low_327/table_low"
+      ],
+      "cooked_convex_valid_count": 1,
+      "geometry_schema_counts": {
+        "mesh": 1
+      },
+      "id_hint": "background__table_low_327",
+      "mesh_approximation_counts": {
+        "convexDecomposition": 1
+      },
+      "purpose": [
+        "default"
+      ],
+      "recommended_manyforge_shape": {
+        "confidence": "medium",
+        "pose": {
+          "frame_id": "universe",
+          "orientation_rpy_deg": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "position_m": [
+            0.000281,
+            0.000321,
+            -0.379574
+          ]
+        },
+        "reason": "ManyForge currently supports box/sphere scene resources; using world AABB as a conservative box.",
+        "shape": {
+          "box_dimensions_m": [
+            3.184742,
+            1.62577,
+            0.779963
+          ],
+          "type": "box"
+        },
+        "source_root": "/background/table_low_327"
+      },
+      "runtime_pose_source_hint": "/background/table_low_327",
+      "source_root": "/background/table_low_327",
+      "type_counts": {
+        "Mesh": 1
+      },
+      "visibility": [
+        "inherited"
+      ],
+      "warnings": [
+        "Source uses complex mesh approximation; box/sphere export is an approximation."
+      ],
+      "world_aabb": {
+        "center": [
+          0.000281,
+          0.000321,
+          -0.379574
+        ],
+        "max": [
+          1.592652,
+          0.813206,
+          0.010408
+        ],
+        "min": [
+          -1.59209,
+          -0.812563,
+          -0.769555
+        ],
+        "size": [
+          3.184742,
+          1.62577,
+          0.779963
+        ]
+      }
+    },
+    {
+      "collider_count": 1,
+      "collider_paths": [
+        "/mac_n_cheese_centered"
+      ],
+      "cooked_convex_valid_count": 0,
+      "geometry_schema_counts": {
+        "Xform": 1
+      },
+      "id_hint": "mac_n_cheese_centered",
+      "mesh_approximation_counts": {
+        "convexDecomposition": 1
+      },
+      "purpose": [
+        "default"
+      ],
+      "recommended_manyforge_shape": {
+        "confidence": "medium",
+        "pose": {
+          "frame_id": "universe",
+          "orientation_rpy_deg": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "position_m": [
+            -0.447992,
+            0.069114,
+            0.119863
+          ]
+        },
+        "reason": "ManyForge currently supports box/sphere scene resources; using world AABB as a conservative box.",
+        "shape": {
+          "box_dimensions_m": [
+            0.041539,
+            0.093166,
+            0.184927
+          ],
+          "type": "box"
+        },
+        "source_root": "/mac_n_cheese_centered"
+      },
+      "runtime_pose_source_hint": "/mac_n_cheese_centered",
+      "source_root": "/mac_n_cheese_centered",
+      "type_counts": {
+        "Xform": 1
+      },
+      "visibility": [
+        "inherited"
+      ],
+      "warnings": [
+        "Source uses complex mesh approximation; box/sphere export is an approximation.",
+        "Cooked convex data was not available for one or more colliders."
+      ],
+      "world_aabb": {
+        "center": [
+          -0.447992,
+          0.069114,
+          0.119863
+        ],
+        "max": [
+          -0.427222,
+          0.115697,
+          0.212327
+        ],
+        "min": [
+          -0.468761,
+          0.022531,
+          0.0274
+        ],
+        "size": [
+          0.041539,
+          0.093166,
+          0.184927
+        ]
+      }
+    }
+  ],
+  "output_profile": "llm_scene_authoring",
+  "probed_prims": [
+    {
+      "active": true,
+      "name": "ur10e_robotiq2f_140_ROS",
+      "parent_path": "/World",
+      "path": "/World/ur10e_robotiq2f_140_ROS",
+      "purpose": "default",
+      "type_name": "Xform",
+      "visibility": "inherited",
+      "world_transform": [
+        [
+          -3.42285420007471e-08,
+          -0.9999999999999993,
+          0.0,
+          0.0
+        ],
+        [
+          0.9999999999999993,
+          -3.42285420007471e-08,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          1.0,
+          0.0
+        ],
+        [
+          -0.21814000606536865,
+          -0.571590006351471,
+          0.12999999523162842,
+          1.0
+        ]
+      ],
+      "xformable": true
+    }
+  ],
+  "stage": {
+    "default_prim": "/World",
+    "meters_per_unit": 1.0,
+    "root_layer": "file:/home/tndlux/workspaces/isaac_ros-dev/src/isaac_sim_custom_examples/Scenario/IsaacManipulator/UniversalRobots/isaac_manipulator_scene_light.usda",
+    "session_layer": "anon:0x739f6c083dd0",
+    "stage_id": 9223002,
+    "up_axis": "Z"
+  },
+  "success": true,
+  "summary": {
+    "collider_count": 4,
+    "error_count": 0,
+    "object_count": 3,
+    "probed_prim_count": 1,
+    "recommended_review": true
+  },
+  "version": "manyforge.isaac.collider_report.v0.1",
+  "warnings": [
+    "Representative fixture derived from a live Isaac Sim llm_scene_authoring report."
+  ]
+}
