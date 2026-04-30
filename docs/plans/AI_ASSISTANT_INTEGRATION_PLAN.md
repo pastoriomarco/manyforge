@@ -37,6 +37,18 @@ Use these for that:
 - [`INDUSTRIAL_EXECUTION_READINESS_PLAN.md`](INDUSTRIAL_EXECUTION_READINESS_PLAN.md)
 - [`PREVIEW_AND_ADOPTION_PLAN.md`](PREVIEW_AND_ADOPTION_PLAN.md)
 
+External model-serving profiles, memory budgets, and Thor/Orin deployment
+experiments are tracked in NemoClaw-Thor:
+
+- `/home/tndlux/workspaces/nemoclaw/src/NemoClaw-Thor/MANYFORGE-ASSISTANT-DEPLOYMENT-PLAN.md`
+
+That document decides how NemoClaw serves models. This ManyForge plan decides
+what provider contract, tool contract, and workflow tests those models must
+satisfy before being trusted by Composer or runtime workflows.
+Current examples should use role-based endpoint aliases and resolve concrete
+model IDs through deployment-owned profile registries that track the
+NemoClaw-Thor-selected profiles.
+
 ## Current Baseline
 
 Validated today:
@@ -46,6 +58,10 @@ Validated today:
 - response-tool mode is supported and preferred for bounded selection tasks
 - runtime blackboard contracts are typed and bundle-based
 - deployment-configured model aliases are exposed in Composer
+- deployment-configured model capabilities are parsed, validated, exposed in
+  Composer, and surfaced as compatibility warnings
+- deployment-configured assistant provider settings can select deterministic
+  local mode or a NemoClaw/OpenClaw endpoint alias
 - the text-only semantic selection demo works
 - ManyForge can run fully without OpenClaw/NemoClaw
 - current integrated agent flows still rely on the mux-based workaround
@@ -126,11 +142,20 @@ trees silently.
 
 ### 1. Model capability contracts
 
+Current status:
+
+- deployment-visible capability flags exist in deployment artifacts
+- compatibility warnings are shown in Composer for selected endpoint/model
+  capabilities
+- assistant-model policy and runtime-model policy are separated by deployment
+  aliases and provider settings
+
 Still needed:
 
-- deployment-visible capability flags
-- compatibility checks in Composer
-- clear separation between assistant-model policy and runtime-model policy
+- live provider capability negotiation against the active NemoClaw/OpenClaw
+  endpoint
+- live smoke coverage for response-tool support, image input, latency budget,
+  and tool-call parser family using the NemoClaw-Thor-selected profile
 
 Required fields include:
 
@@ -146,22 +171,66 @@ Current status:
 
 - a model-free `POST /api/assistant/chat` scaffold exists
 - the route returns reviewable draft proposals only
-- the route does not call NemoClaw/OpenClaw, invoke tools, or mutate Composer
-  state
+- `mock` mode does not call NemoClaw/OpenClaw, invoke tools, or mutate Composer
+  state; explicit `provider` mode can call a configured live adapter
 - deterministic assistant tool endpoints exist under `/api/assistant/tools`
 - the first tools are read-only Isaac scene inspection and non-mutating
   scene-resource proposal generation
 - deterministic fixture-backed smoke coverage exists for the
   `inspect_isaac_scene` -> `propose_scene_objects` path, so normal tests do
   not require a live Isaac Sim process
+- fixture-backed proposal lifecycle smoke coverage exists for
+  `inspect_isaac_scene` -> `propose_scene_objects` -> `stage proposal` ->
+  `materialize session patch`, proving the review/apply boundary without
+  mutating the loaded program
+- backend assistant provider routing exists:
+  - `mock` mode remains the deterministic default
+  - `provider` mode is explicit and fails closed when no provider is configured
+  - provider results are normalized into messages, tool-call records, warnings,
+    and reviewable proposals
+  - `deterministic-scene-authoring` is available as a local stand-in for the
+    future NemoClaw/OpenClaw tool loop; it consumes an Isaac scene report from
+    request context and does not call live model or simulator services
+  - `nemoclaw`/`openclaw` live HTTP provider adapters exist behind the same
+    provider interface and reject mutation claims or malformed response records
+  - a fake live HTTP provider fixture exists for exercising the real
+    NemoClaw/OpenClaw adapter contract without running model inference,
+    including negative mutation, malformed response, timeout, and HTTP-error
+    cases
+- v0.1 assistant mode plumbing exists on the ManyForge side:
+  - deployment artifacts parse `assistant_modes` and `tool_catalog`
+  - skill manifests parse optional `requires_tools`
+  - deployment load/update paths fail closed on unknown mode skills/nodes,
+    unknown tools, query-mode non-read-only tools, incompatible
+    skill/tool requirements, and instrument ID namespace collisions
+  - provider requests for mode-declared deployments carry
+    `schemaVersion: "0.1.0"`, `assistantMode`, and the resolved mode catalog
+  - provider requests and responses are rejected when they reference tools
+    outside the active mode catalog
+- backend proposal staging exists:
+  - assistant proposals can be staged server-side without changing the program
+  - scene-resource add proposals can be materialized into validated session
+    patches for Composer's normal review/apply path
+  - staged proposals can be listed and discarded
+- deterministic tree-node proposal tooling exists for scene-object operations:
+  - add collision object
+  - remove collision object
+  - attach object to link
+  - detach object from link
+  - generated nodes are proposals only; insertion point selection and program
+    application remain explicit user-reviewed steps
 
 Still needed:
 
-- deployment-level assistant endpoint alias
-- model-backed `/api/assistant/chat` execution behind explicit capability and
-  endpoint selection
+- live NemoClaw/OpenClaw bridge endpoint smoke with the real model/tool loop
+- model capability negotiation against the live endpoint, including
+  response-tool support, image input, latency budget, and tool-call parser
+  family
+- NemoClaw/OpenClaw live provider validation against the same deterministic
+  workflow harness before model-specific behavior is accepted
 - Composer assistant panel
-- structured proposal/apply flow for scene and tree edits
+- frontend wiring for proposal review/materialize/apply/discard
+- tree-edit proposal materialization with explicit insertion point selection
 - practical scene-to-program proposal flows useful for simulation-backed
   adoption work
 
@@ -212,8 +281,8 @@ This depends on:
 ### Core now
 
 1. continued runtime hardening for remaining synchronous work
-2. deployment-level model capability fields and Composer warnings
-3. assistant endpoint configuration and model-backed `/api/assistant/chat`
+2. live bridge smoke coverage for model-backed `/api/assistant/chat`
+3. Composer assistant panel and active-mode selection UI
 4. structured proposal/apply flow in Composer
 
 ### Next

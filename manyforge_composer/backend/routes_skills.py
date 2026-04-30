@@ -88,6 +88,7 @@ def create_skills_router(state: ComposerState) -> APIRouter:
                 provides=skill.provides,
                 modifies=skill.modifies,
                 requiresCapabilities=skill.requires_capabilities,
+                requiresTools=skill.requires_tools,
                 parameters=[
                     SkillParameterResponse(
                         name=p.name,

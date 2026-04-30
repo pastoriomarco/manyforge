@@ -60,3 +60,11 @@ pytest manyforge_composer/tests/test_assistant_routes.py -q
   --include-subtree /World/soup_can \
   --source-root /World/soup_can \
   --object-id-prefix sim_
+
+./scripts/smoke-assistant-scene-authoring.py \
+  --transport api \
+  --workflow proposal-lifecycle \
+  --fixture manyforge_composer/tests/fixtures/isaac_scene_authoring_soup_can.json \
+  --include-subtree /World/soup_can \
+  --source-root /World/soup_can \
+  --object-id-prefix sim_

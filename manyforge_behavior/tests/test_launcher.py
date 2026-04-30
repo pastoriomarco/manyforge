@@ -344,7 +344,7 @@ class TestLauncherValidation:
 
     def test_launcher_rejects_profile_mismatch(self):
         """Deployment with wrong profile → error."""
-        data = _minimal_deployment(program_profile="v99.0")
+        data = _minimal_deployment(program_profile="v0.1")
         deploy_path = _write_yaml(data)
         
         try:
@@ -381,6 +381,7 @@ class TestLauncherValidation:
         data["adapters"]["execution"]["capability_keys"] = [
             "execution.trajectory.execute",
             "execution.feedback.phase_events",
+            "execution.feedback.state_snapshots",
             "execution.stop.soft",
             "execution.pause",
             "execution.resume",

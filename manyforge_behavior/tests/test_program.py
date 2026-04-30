@@ -103,6 +103,30 @@ class TestProgramValidation:
             Program(path, catalog)
         os.unlink(path)
 
+    def test_rejects_unknown_profile(self, catalog):
+        path = _write_program(_minimal_program(program_profile="v9.9"))
+        with pytest.raises(ProgramValidationError, match="Unknown program profile"):
+            Program(path, catalog)
+        os.unlink(path)
+
+    def test_rejects_missing_name(self, catalog):
+        path = _write_program(_minimal_program(name=""))
+        with pytest.raises(ProgramValidationError, match="name"):
+            Program(path, catalog)
+        os.unlink(path)
+
+    def test_rejects_missing_catalog_version(self, catalog):
+        path = _write_program(_minimal_program(catalog_version=""))
+        with pytest.raises(ProgramValidationError, match="catalog_version"):
+            Program(path, catalog)
+        os.unlink(path)
+
+    def test_rejects_invalid_catalog_version(self, catalog):
+        path = _write_program(_minimal_program(catalog_version="not-semver"))
+        with pytest.raises(ProgramValidationError, match="catalog_version must match X.Y.Z"):
+            Program(path, catalog)
+        os.unlink(path)
+
     def test_rejects_missing_robot(self, catalog):
         data = _minimal_program()
         del data["robot"]
@@ -485,6 +509,42 @@ class TestProgramValidation:
         finally:
             os.unlink(path)
 
+    def test_rejects_relative_move_when_program_profile_below_v0_1(self, catalog):
+        data = _minimal_program()
+        data["tree"] = {
+            "id": "sequence",
+            "name": "root",
+            "children": [
+                {
+                    "id": "move_manipulator_action",
+                    "name": "relative_move_step",
+                    "params": {
+                        "move_id": "move_1",
+                        "motion_type": "relative_move",
+                        "relative_move": {
+                            "target_reference": {
+                                "type": "frame",
+                                "id": "base_link",
+                            },
+                            "offset": {
+                                "position_m": [0.0, 0.0, 0.1],
+                                "orientation_rpy_deg": [0.0, 0.0, 0.0],
+                            },
+                        },
+                    },
+                }
+            ],
+        }
+        path = _write_program(data)
+        try:
+            with pytest.raises(
+                ProgramValidationError,
+                match=r"motion_type value 'relative_move' requires program profile >= v0\.1, got v0\.0",
+            ):
+                Program(path, catalog)
+        finally:
+            os.unlink(path)
+
     def test_rejects_node_when_deployment_capability_missing(self, catalog):
         data = _minimal_program(program_profile="v0.1")
         data["tree"] = {
@@ -805,6 +865,7 @@ class TestProgramValidation:
 
     def test_allows_relative_move_field_ref_for_motion_nodes(self, catalog):
         data = _minimal_program(
+            program_profile="v0.1",
             blackboard={
                 "namespaces": [
                     {
@@ -856,6 +917,29 @@ class TestProgramValidation:
             }
         finally:
             os.unlink(path)
+
+    def test_relative_move_required_capabilities_include_reference_resolution(self, catalog):
+        data = _minimal_program(program_profile="v0.1")
+        data["tree"] = {
+            "id": "move_manipulator_action",
+            "name": "relative_move_step",
+            "params": {
+                "move_id": "move_1",
+                "motion_type": "relative_move",
+                "relative_move": {
+                    "target_reference": {
+                        "type": "frame",
+                        "id": "base_link",
+                    },
+                    "offset": {
+                        "position_m": [0.0, 0.0, 0.1],
+                        "orientation_rpy_deg": [0.0, 0.0, 0.0],
+                    },
+                },
+            },
+        }
+        program = Program.from_dict(data, catalog)
+        assert "context.pose.resolve_reference" in program.required_capabilities()
 
     def test_allows_typed_query_model_template_variable_bindings(self, catalog):
         data = _minimal_program(
@@ -973,7 +1057,7 @@ class TestProgramValidation:
         os.unlink(path)
 
     def test_rejects_relative_move_raw_blackboard_reference_for_motion_nodes(self, catalog):
-        data = _minimal_program()
+        data = _minimal_program(program_profile="v0.1")
         data["tree"] = {
             "id": "sequence",
             "name": "root",

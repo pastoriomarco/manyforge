@@ -42,6 +42,7 @@ adapters:
       - scene.edit.remove
       - scene.edit.update_pose
       - scene.edit.attach_detach
+      - observability.trace.scene
     config: {}
   execution:
     adapter_id: execution.roboplan_native

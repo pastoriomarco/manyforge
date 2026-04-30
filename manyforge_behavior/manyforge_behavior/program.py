@@ -22,7 +22,8 @@ from manyforge_behavior.blackboard_bindings import (
     resolve_namespace_binding as _resolve_namespace_binding,
     validate_declared_field_ref as _validate_declared_field_ref,
 )
-from manyforge_behavior.catalog import NodeCatalog, profile_satisfied
+from manyforge_behavior.capabilities import get_required_keys
+from manyforge_behavior.catalog import NodeCatalog, SEMVER_RE, profile_satisfied
 from manyforge_behavior.parameters import (
     PARAM_REF_RE,
     ParameterResolver,
@@ -868,6 +869,27 @@ def _validate_tree_node_semantics(
     return issues
 
 
+def _effective_node_required_capabilities(
+    entry: Any,
+    resolved_params: Mapping[str, Any],
+) -> set[str]:
+    required = set(entry.required_capabilities)
+    for param in getattr(entry, "parameters", []):
+        if getattr(param, "type", None) != "enum" or param.name not in resolved_params:
+            continue
+        option = _enum_option_for_value(param, resolved_params.get(param.name))
+        if option is not None:
+            required.update(option.required_capabilities)
+    return required
+
+
+def _enum_option_for_value(param: Any, value: Any) -> Any | None:
+    for option in getattr(param, "enum_options", []):
+        if option.value == value:
+            return option
+    return None
+
+
 def collect_tree_validation_issues(
     node: TreeNode,
     catalog: NodeCatalog,
@@ -1024,23 +1046,6 @@ def collect_tree_validation_issues(
                 )
             )
 
-        if deployment_capability_keys is not None:
-            missing_capabilities = sorted(
-                capability
-                for capability in entry.required_capabilities
-                if capability not in deployment_capability_keys
-            )
-            if missing_capabilities:
-                errors.append(
-                    TreeValidationIssue(
-                        path=path,
-                        message=(
-                            f"Node '{current.name}' ({current.id}) requires capabilities "
-                            f"{missing_capabilities}"
-                        ),
-                    )
-                )
-
         if current.modification_policy.get("intervention_delegate") == "program_only":
             # program_only is valid with recovery decorators; validate constraints
             rp = current.recovery_policy
@@ -1101,6 +1106,23 @@ def collect_tree_validation_issues(
 
         declared_params = {param.name: param for param in entry.parameters}
         for param in entry.parameters:
+            param_profile_available = program_profile is None or profile_satisfied(
+                param.profiles_min,
+                program_profile,
+            )
+            if not param_profile_available:
+                if param.name in current.params:
+                    errors.append(
+                        TreeValidationIssue(
+                            path=f"{path}.params.{param.name}",
+                            message=(
+                                f"Parameter '{param.name}' requires program profile "
+                                f">= {param.profiles_min}, got {program_profile}"
+                            ),
+                        )
+                    )
+                continue
+
             if param.required and param.name not in current.params and param.default is None:
                 errors.append(
                     TreeValidationIssue(
@@ -1287,6 +1309,23 @@ def collect_tree_validation_issues(
                     )
                 )
                 continue
+            if param.type == "enum":
+                option = _enum_option_for_value(param, value)
+                if (
+                    option is not None
+                    and program_profile is not None
+                    and not profile_satisfied(option.profiles_min, program_profile)
+                ):
+                    errors.append(
+                        TreeValidationIssue(
+                            path=f"{path}.params.{param.name}",
+                            message=(
+                                f"{param.name} value {value!r} requires program profile "
+                                f">= {option.profiles_min}, got {program_profile}"
+                            ),
+                        )
+                    )
+                    continue
 
             if param.type in {"float", "int"} and param.constraints:
                 constraint_error = _validate_constraints(float(value), param.constraints)
@@ -1339,6 +1378,26 @@ def collect_tree_validation_issues(
                         path=f"{path}.params.{param_name}",
                         message=(
                             f"Unexpected parameter '{param_name}' for node '{current.id}'"
+                        ),
+                    )
+                )
+
+        if deployment_capability_keys is not None:
+            missing_capabilities = sorted(
+                capability
+                for capability in _effective_node_required_capabilities(
+                    entry,
+                    resolved_params,
+                )
+                if capability not in deployment_capability_keys
+            )
+            if missing_capabilities:
+                errors.append(
+                    TreeValidationIssue(
+                        path=path,
+                        message=(
+                            f"Node '{current.name}' ({current.id}) requires capabilities "
+                            f"{missing_capabilities}"
                         ),
                     )
                 )
@@ -1553,7 +1612,15 @@ class Program:
                 return
 
             entry = self._catalog.get(current.id)
-            required.update(entry.required_capabilities)
+            resolved_params = dict(current.params)
+            if resolver is not None:
+                resolved_params = resolver.resolve(current.params)
+            required.update(
+                _effective_node_required_capabilities(
+                    entry,
+                    resolved_params,
+                )
+            )
             for child in current.children:
                 visit(child)
 
@@ -1586,11 +1653,23 @@ class Program:
             )
 
         self.program_profile = data.get("program_profile", "")
-        if not self.program_profile:
+        if not isinstance(self.program_profile, str) or not self.program_profile.strip():
             raise ProgramValidationError("program_profile is required")
+        try:
+            get_required_keys(self.program_profile)
+        except ValueError as exc:
+            raise ProgramValidationError(str(exc)) from exc
 
         self.catalog_version = data.get("catalog_version", "")
         self.name = data.get("name", "")
+        if not isinstance(self.catalog_version, str) or not self.catalog_version.strip():
+            raise ProgramValidationError("catalog_version is required")
+        if not SEMVER_RE.match(self.catalog_version):
+            raise ProgramValidationError(
+                f"catalog_version must match X.Y.Z, got '{self.catalog_version}'"
+            )
+        if not isinstance(self.name, str) or not self.name.strip():
+            raise ProgramValidationError("name is required")
         self.description = data.get("description", "")
 
         # Robot profile

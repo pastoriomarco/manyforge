@@ -11,14 +11,40 @@ adapters:
   planning:
     adapter_id: planning.test
     adapter_version: "0.1.0"
+    supported_profiles: ["v0.0"]
+    capability_keys:
+      - planning.motion.joint_goal
+      - planning.motion.pose_goal
+      - planning.trajectory.time_parameterized
     config: {}
   context:
     adapter_id: context.test
     adapter_version: "0.1.0"
+    supported_profiles: ["v0.0"]
+    capability_keys:
+      - context.state.current
+      - context.validation.trajectory
+      - context.collision.check
+      - context.kinematics.fk
+      - context.limits.joint
+      - scene.shape.box
+      - scene.shape.sphere
+      - scene.edit.add
+      - scene.edit.remove
+      - scene.edit.update_pose
     config: {}
   execution:
     adapter_id: execution.test
     adapter_version: "0.1.0"
+    supported_profiles: ["v0.0"]
+    capability_keys:
+      - execution.trajectory.execute
+      - execution.feedback.phase_events
+      - execution.feedback.state_snapshots
+      - execution.stop.soft
+      - execution.pause
+      - execution.resume
+      - execution.reset
     config: {}
 orchestrator:
   engine: py_trees

@@ -12,7 +12,7 @@
 #   ./scripts/demo-shape-pick.sh --selection-image-mode http
 #   ./scripts/demo-shape-pick.sh --api-port 9010 --hmi-port 8082
 #   ./scripts/demo-shape-pick.sh --model-base-url http://172.17.0.1:8000/v1
-#   ./scripts/demo-shape-pick.sh --model-id gemma-4-E4B-it
+#   ./scripts/demo-shape-pick.sh --model-id qwen3.6-35b-a3b-nvfp4-tq-mtp-manyforge
 #   ./scripts/demo-shape-pick.sh --rebuild
 #
 # Then open:
@@ -28,7 +28,7 @@ DEPLOY=/workspace/examples/semantic_shape_pick.deployment.yaml
 API_PORT=9000
 HMI_PORT=8081
 MODEL_BASE_URL=http://172.17.0.1:8000/v1
-MODEL_ID=gemma-4-E4B-it
+MODEL_ID=qwen3.6-35b-a3b-nvfp4-tq-mtp-manyforge
 REQUESTED_SHAPE=sphere
 SELECTION_REQUEST=""
 BOOTSTRAP_MODE=auto
@@ -163,6 +163,7 @@ exec docker compose run --rm \
 
   python3 - <<PY
 import yaml
+from pathlib import Path
 
 deploy_src = "${MANYFORGE_DEPLOY_PATH}"
 deploy_dst = "${TMP_DEPLOY}"
@@ -171,6 +172,12 @@ program_dst = "${TMP_PROGRAM}"
 
 with open(deploy_src, "r", encoding="utf-8") as f:
     deploy = yaml.safe_load(f)
+
+registry_path = deploy.get("model_endpoint_profile_registry")
+if registry_path and not Path(registry_path).is_absolute():
+    deploy["model_endpoint_profile_registry"] = str(
+        (Path(deploy_src).parent / registry_path).resolve()
+    )
 
 for endpoint in deploy.get("model_endpoints", {}).values():
     endpoint["base_url"] = "${MANYFORGE_MODEL_BASE_URL}"

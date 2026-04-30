@@ -26,7 +26,7 @@ resolution, produce a structured escalation report for the human operator.
    - `manyforge_debug_export()`
 
 2. **Ensure safe state** — Make sure the robot is stopped:
-   - If RUNNING: `manyforge_cycle_control(command="stop")`
+   - If `running`: `manyforge_cycle_control(command="stop")`
    - Verify velocity is 0
 
 3. **Produce escalation report** — Format as below
@@ -51,7 +51,7 @@ resolution, produce a structured escalation report for the human operator.
 <list of what was tried and why it failed>
 
 ### Current state
-- Cycle: STOPPED
+- Cycle: stopped
 - Robot TCP: [x, y, z]
 - Scene objects: <count>
 - Attached objects: <any>

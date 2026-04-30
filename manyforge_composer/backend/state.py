@@ -73,6 +73,17 @@ class PublishedSceneSnapshot:
     created_at_ns: int = field(default_factory=time.monotonic_ns)
 
 
+@dataclass
+class AssistantProposalRecord:
+    proposal_id: str
+    conversation_id: str
+    proposal: dict[str, Any]
+    source: dict[str, Any] = field(default_factory=dict)
+    lifecycle_status: str = "staged"
+    created_at_ns: int = field(default_factory=time.monotonic_ns)
+    updated_at_ns: int = field(default_factory=time.monotonic_ns)
+
+
 class ComposerState:
     """Holds the runtime state shared across all API routes."""
 
@@ -108,11 +119,81 @@ class ComposerState:
         self._program_session_generation: int = 0
         self._scene_snapshot_lock = threading.Lock()
         self._published_scene_snapshots: dict[str, PublishedSceneSnapshot] = {}
+        self.assistant_provider: Any = None
+        self._assistant_proposal_lock = threading.Lock()
+        self._assistant_proposals: dict[str, AssistantProposalRecord] = {}
         self.skill_catalog: SkillCatalog = load_skill_catalog(
             default_skills_dir(),
             catalog=self.catalog,
             strict=True,
         )
+
+    def stage_assistant_proposals(
+        self,
+        *,
+        conversation_id: str,
+        proposals: list[dict[str, Any]],
+        source: dict[str, Any] | None = None,
+    ) -> list[AssistantProposalRecord]:
+        """Store reviewable assistant proposals without changing program state."""
+        now_ns = time.monotonic_ns()
+        staged: list[AssistantProposalRecord] = []
+        source_payload = dict(source or {})
+        with self._assistant_proposal_lock:
+            for proposal in proposals:
+                proposal_id = str(proposal["id"])
+                record = AssistantProposalRecord(
+                    proposal_id=proposal_id,
+                    conversation_id=conversation_id,
+                    proposal=dict(proposal),
+                    source=source_payload,
+                    lifecycle_status="staged",
+                    created_at_ns=now_ns,
+                    updated_at_ns=now_ns,
+                )
+                self._assistant_proposals[proposal_id] = record
+                staged.append(record)
+        return staged
+
+    def list_assistant_proposals(
+        self,
+        *,
+        lifecycle_status: str | None = None,
+        conversation_id: str | None = None,
+    ) -> list[AssistantProposalRecord]:
+        with self._assistant_proposal_lock:
+            records = list(self._assistant_proposals.values())
+        if lifecycle_status:
+            records = [
+                record for record in records
+                if record.lifecycle_status == lifecycle_status
+            ]
+        if conversation_id:
+            records = [
+                record for record in records
+                if record.conversation_id == conversation_id
+            ]
+        return sorted(records, key=lambda item: (item.created_at_ns, item.proposal_id))
+
+    def get_assistant_proposal(self, proposal_id: str) -> AssistantProposalRecord | None:
+        with self._assistant_proposal_lock:
+            return self._assistant_proposals.get(proposal_id)
+
+    def discard_assistant_proposal(
+        self,
+        proposal_id: str,
+        *,
+        reason: str = "",
+    ) -> AssistantProposalRecord | None:
+        with self._assistant_proposal_lock:
+            record = self._assistant_proposals.get(proposal_id)
+            if record is None:
+                return None
+            record.lifecycle_status = "discarded"
+            record.updated_at_ns = time.monotonic_ns()
+            if reason:
+                record.source = {**record.source, "discardReason": reason}
+            return record
 
     def _clear_published_scene_snapshots(self) -> None:
         with self._scene_snapshot_lock:
@@ -1002,8 +1083,11 @@ class ComposerState:
         deployment = self.deployment
         if deployment_path:
             deployment = Deployment(deployment_path)
+            deployment.validate_assistant_modes(self.catalog, self.skill_catalog)
             self.deployment = deployment
             self.deployment_source_path = deployment_path
+        elif deployment is not None:
+            deployment.validate_assistant_modes(self.catalog, self.skill_catalog)
 
         if deployment is not None and self._kernel_factory is not None:
             self._kernel, self.kernel_bundle = self._kernel_factory(deployment)
@@ -1014,6 +1098,7 @@ class ComposerState:
             program_path=program_path,
             kernel=self._kernel,
             deployment_path=deployment_path,
+            deployment=deployment,
             skill_catalog=self.skill_catalog,
             event_recorder=self.event_recorder,
             scene_snapshot_provider=scene_snapshot_provider,

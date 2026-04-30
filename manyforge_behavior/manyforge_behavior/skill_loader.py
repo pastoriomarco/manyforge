@@ -11,6 +11,7 @@ from typing import Any, Optional
 
 import yaml
 
+from manyforge_behavior.capabilities import CAPABILITY_REGISTRY
 from manyforge_behavior.catalog import NodeCatalog
 from manyforge_behavior.parameters import PARAM_REF_RE
 
@@ -45,6 +46,7 @@ class SkillDefinition:
     provides: list[str]
     modifies: list[str]
     requires_capabilities: list[str]
+    requires_tools: list[str]
     parameters: list[SkillParameter]
     body: dict[str, Any]
     example: dict[str, Any]
@@ -203,6 +205,45 @@ def _parse_parameter(raw: dict[str, Any]) -> SkillParameter:
     )
 
 
+def _validate_requires_capabilities(value: Any, path_name: str) -> list[str]:
+    if value is None:
+        return []
+    if not isinstance(value, list) or not all(
+        isinstance(capability, str) and capability.strip()
+        for capability in value
+    ):
+        raise ValueError(
+            f"{path_name}: requires_capabilities must be a list of non-empty strings"
+        )
+    unknown_capabilities = sorted(
+        capability
+        for capability in value
+        if capability not in CAPABILITY_REGISTRY
+    )
+    if unknown_capabilities:
+        raise ValueError(
+            f"{path_name}: unknown requires_capabilities {unknown_capabilities}"
+        )
+    return list(value)
+
+
+def _validate_requires_tools(value: Any, path_name: str) -> list[str]:
+    if value is None:
+        return []
+    if not isinstance(value, list) or not all(
+        isinstance(tool_id, str) and tool_id.strip()
+        for tool_id in value
+    ):
+        raise ValueError(
+            f"{path_name}: requires_tools must be a list of non-empty strings"
+        )
+    normalized = [tool_id.strip() for tool_id in value]
+    duplicates = sorted({tool_id for tool_id in normalized if normalized.count(tool_id) > 1})
+    if duplicates:
+        raise ValueError(f"{path_name}: duplicate requires_tools {duplicates}")
+    return normalized
+
+
 def _render_string(template: str, args: dict[str, Any]) -> Any:
     exact_match = PARAM_REF_RE.match(template)
     if exact_match:
@@ -257,6 +298,14 @@ def load_skill(path: Path) -> SkillDefinition:
         raise ValueError(f"{path.name}: body must be a mapping")
 
     parameters = [_parse_parameter(p) for p in data.get("parameters", [])]
+    requires_capabilities = _validate_requires_capabilities(
+        data.get("requires_capabilities", []),
+        path.name,
+    )
+    requires_tools = _validate_requires_tools(
+        data.get("requires_tools", []),
+        path.name,
+    )
 
     return SkillDefinition(
         skill_id=skill_id,
@@ -267,7 +316,8 @@ def load_skill(path: Path) -> SkillDefinition:
         requires=list(data.get("requires", [])),
         provides=list(data.get("provides", [])),
         modifies=list(data.get("modifies", [])),
-        requires_capabilities=list(data.get("requires_capabilities", [])),
+        requires_capabilities=requires_capabilities,
+        requires_tools=requires_tools,
         parameters=parameters,
         body=body,
         example=dict(data.get("example", {})),

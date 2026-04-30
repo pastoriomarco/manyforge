@@ -9,6 +9,8 @@ from typing import Any, Optional
 
 import yaml
 
+from manyforge_behavior.capabilities import CAPABILITY_REGISTRY
+
 
 SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+$")
 EXPECTED_API_VERSION = "manyforge.node_catalog.v0"
@@ -44,14 +46,32 @@ _STABILITY_LEVELS = {
 
 
 @dataclass
+class CatalogEnumOption:
+    value: str
+    label: Optional[str] = None
+    description: str = ""
+    profiles_min: str = "v0.0"
+    required_capabilities: list[str] = field(default_factory=list)
+
+
+@dataclass
+class CatalogVisibleWhen:
+    param: str
+    equals: Any
+
+
+@dataclass
 class CatalogParameter:
     name: str
     type: str
     required: bool
     default: Any = None
     enum_values: list[str] = field(default_factory=list)
+    enum_options: list[CatalogEnumOption] = field(default_factory=list)
     constraints: dict[str, Any] = field(default_factory=dict)
     parameterizable: bool = False
+    profiles_min: str = "v0.0"
+    visible_when: Optional[CatalogVisibleWhen] = None
     ui_editor: Optional[str] = None
     blackboard_role: Optional[str] = None
     blackboard_contract: Optional[str] = None
@@ -129,6 +149,7 @@ class NodeCatalog:
             self._entries[entry.id] = entry
 
     def _parse_entry(self, raw: dict[str, Any]) -> CatalogEntry:
+        entry_id = raw["id"]
         children = raw.get("children", {})
         max_children = children.get("max", 0)
         if max_children == "unbounded":
@@ -136,15 +157,30 @@ class NodeCatalog:
 
         params = []
         for p in raw.get("parameters", []):
+            enum_values, enum_options = self._parse_enum_metadata(
+                p,
+                entry_id=entry_id,
+            )
             params.append(
                 CatalogParameter(
                     name=p["name"],
                     type=p["type"],
                     required=p.get("required", False),
                     default=p.get("default"),
-                    enum_values=p.get("enum_values", []),
+                    enum_values=enum_values,
+                    enum_options=enum_options,
                     constraints=p.get("constraints", {}),
                     parameterizable=p.get("parameterizable", False),
+                    profiles_min=self._parse_profile_min(
+                        p.get("profiles"),
+                        entry_id=entry_id,
+                        param_name=p["name"],
+                    ),
+                    visible_when=self._parse_visible_when(
+                        p.get("visible_when"),
+                        entry_id=entry_id,
+                        param_name=p["name"],
+                    ),
                     ui_editor=p.get("ui_editor"),
                     blackboard_role=p.get("blackboard_role"),
                     blackboard_contract=p.get("blackboard_contract"),
@@ -153,7 +189,6 @@ class NodeCatalog:
                 )
             )
 
-        entry_id = raw["id"]
         bb_reader_params = self._parse_blackboard_param_names(
             raw.get("bb_reader_params", []),
             field_name="bb_reader_params",
@@ -178,10 +213,160 @@ class NodeCatalog:
             bb_reader_params=bb_reader_params,
             bb_writer_params=bb_writer_params,
             required_capabilities=raw.get("required_capabilities", []),
-            profiles_min=raw.get("profiles", {}).get("min_profile", "v0.0"),
+            profiles_min=self._parse_profile_min(raw.get("profiles"), entry_id=entry_id),
             runners=raw.get("runners", {}),
             interruptible=bool(raw.get("interruptible", False)),
             default_interrupt_scope=raw.get("default_interrupt_scope"),
+        )
+
+    @staticmethod
+    def _parse_profile_min(
+        profiles: Any,
+        *,
+        entry_id: str,
+        param_name: str | None = None,
+    ) -> str:
+        if profiles is None:
+            return "v0.0"
+        if not isinstance(profiles, dict):
+            context = f"Entry '{entry_id}'"
+            if param_name is not None:
+                context += f", param '{param_name}'"
+            raise CatalogValidationError(f"{context}: profiles must be a mapping")
+        value = profiles.get("min_profile", "v0.0")
+        if not isinstance(value, str) or not value.strip():
+            context = f"Entry '{entry_id}'"
+            if param_name is not None:
+                context += f", param '{param_name}'"
+            raise CatalogValidationError(
+                f"{context}: profiles.min_profile must be a non-empty string"
+            )
+        return value
+
+    @staticmethod
+    def _parse_visible_when(
+        raw_value: Any,
+        *,
+        entry_id: str,
+        param_name: str,
+    ) -> CatalogVisibleWhen | None:
+        if raw_value is None:
+            return None
+        if not isinstance(raw_value, dict):
+            raise CatalogValidationError(
+                f"Entry '{entry_id}', param '{param_name}': visible_when must be a mapping"
+            )
+        ref_param = raw_value.get("param")
+        if not isinstance(ref_param, str) or not ref_param.strip():
+            raise CatalogValidationError(
+                f"Entry '{entry_id}', param '{param_name}': visible_when.param "
+                "must be a non-empty string"
+            )
+        if "equals" not in raw_value:
+            raise CatalogValidationError(
+                f"Entry '{entry_id}', param '{param_name}': visible_when.equals is required"
+            )
+        return CatalogVisibleWhen(param=ref_param, equals=raw_value["equals"])
+
+    def _parse_enum_metadata(
+        self,
+        raw_param: dict[str, Any],
+        *,
+        entry_id: str,
+    ) -> tuple[list[str], list[CatalogEnumOption]]:
+        param_name = raw_param["name"]
+        raw_enum_values = raw_param.get("enum_values", [])
+        raw_enum_options = raw_param.get("enum_options", [])
+        if raw_enum_values is None:
+            raw_enum_values = []
+        if raw_enum_options is None:
+            raw_enum_options = []
+
+        if not isinstance(raw_enum_values, list):
+            raise CatalogValidationError(
+                f"Entry '{entry_id}', param '{param_name}': enum_values must be a list"
+            )
+        enum_values = list(raw_enum_values)
+
+        if raw_enum_options:
+            if not isinstance(raw_enum_options, list):
+                raise CatalogValidationError(
+                    f"Entry '{entry_id}', param '{param_name}': enum_options must be a list"
+                )
+            enum_options = [
+                self._parse_enum_option(
+                    raw_option,
+                    entry_id=entry_id,
+                    param_name=param_name,
+                )
+                for raw_option in raw_enum_options
+            ]
+            option_values = [option.value for option in enum_options]
+            if enum_values and enum_values != option_values:
+                raise CatalogValidationError(
+                    f"Entry '{entry_id}', param '{param_name}': enum_values must match "
+                    "enum_options values"
+                )
+            if not enum_values:
+                enum_values = option_values
+            return enum_values, enum_options
+
+        return enum_values, [
+            CatalogEnumOption(value=value)
+            for value in enum_values
+        ]
+
+    def _parse_enum_option(
+        self,
+        raw_option: Any,
+        *,
+        entry_id: str,
+        param_name: str,
+    ) -> CatalogEnumOption:
+        if not isinstance(raw_option, dict):
+            raise CatalogValidationError(
+                f"Entry '{entry_id}', param '{param_name}': enum_options items "
+                "must be mappings"
+            )
+        value = raw_option.get("value")
+        if not isinstance(value, str) or not value.strip():
+            raise CatalogValidationError(
+                f"Entry '{entry_id}', param '{param_name}': enum option value "
+                "must be a non-empty string"
+            )
+        required_capabilities = raw_option.get("required_capabilities", [])
+        if required_capabilities is None:
+            required_capabilities = []
+        if not isinstance(required_capabilities, list) or not all(
+            isinstance(capability, str) and capability.strip()
+            for capability in required_capabilities
+        ):
+            raise CatalogValidationError(
+                f"Entry '{entry_id}', param '{param_name}', enum option '{value}': "
+                "required_capabilities must be a list of non-empty strings"
+            )
+        label = raw_option.get("label")
+        if label is not None and not isinstance(label, str):
+            raise CatalogValidationError(
+                f"Entry '{entry_id}', param '{param_name}', enum option '{value}': "
+                "label must be a string"
+            )
+        description = raw_option.get("description", "")
+        if not isinstance(description, str):
+            raise CatalogValidationError(
+                f"Entry '{entry_id}', param '{param_name}', enum option '{value}': "
+                "description must be a string"
+            )
+        return CatalogEnumOption(
+            value=value,
+            label=label,
+            description=description,
+            profiles_min=self._parse_profile_min(
+                raw_option.get("profiles"),
+                entry_id=entry_id,
+                param_name=param_name,
+            ),
+            required_capabilities=list(required_capabilities),
         )
 
     @staticmethod
@@ -220,11 +405,67 @@ class NodeCatalog:
 
         # Enum parameters must have enum_values
         for p in entry.parameters:
+            self._validate_profile_min(
+                p.profiles_min,
+                f"Entry '{entry.id}', param '{p.name}'",
+            )
+            if p.type != "enum" and (p.enum_values or p.enum_options):
+                raise CatalogValidationError(
+                    f"Entry '{entry.id}', param '{p.name}': enum metadata "
+                    "requires type=enum"
+                )
             if p.type == "enum" and not p.enum_values:
                 raise CatalogValidationError(
                     f"Entry '{entry.id}', param '{p.name}': "
-                    "enum type requires non-empty enum_values"
+                    "enum type requires non-empty enum_values or enum_options"
                 )
+            if p.type == "enum":
+                if not all(isinstance(value, str) and value.strip() for value in p.enum_values):
+                    raise CatalogValidationError(
+                        f"Entry '{entry.id}', param '{p.name}': "
+                        "enum_values must be a list of non-empty strings"
+                    )
+                if len(p.enum_values) != len(set(p.enum_values)):
+                    raise CatalogValidationError(
+                        f"Entry '{entry.id}', param '{p.name}': "
+                        "enum_values contains duplicate values"
+                    )
+                if not p.enum_options:
+                    raise CatalogValidationError(
+                        f"Entry '{entry.id}', param '{p.name}': "
+                        "enum_options must not be empty"
+                    )
+                option_values = [option.value for option in p.enum_options]
+                if option_values != p.enum_values:
+                    raise CatalogValidationError(
+                        f"Entry '{entry.id}', param '{p.name}': "
+                        "enum_values must match enum_options values"
+                    )
+                if len(option_values) != len(set(option_values)):
+                    raise CatalogValidationError(
+                        f"Entry '{entry.id}', param '{p.name}': "
+                        "enum_options contains duplicate values"
+                    )
+                for option in p.enum_options:
+                    self._validate_profile_min(
+                        option.profiles_min,
+                        (
+                            f"Entry '{entry.id}', param '{p.name}', "
+                            f"enum option '{option.value}'"
+                        ),
+                    )
+                    unknown_option_capabilities = sorted(
+                        capability
+                        for capability in option.required_capabilities
+                        if capability not in CAPABILITY_REGISTRY
+                    )
+                    if unknown_option_capabilities:
+                        raise CatalogValidationError(
+                            f"Entry '{entry.id}', param '{p.name}', "
+                            f"enum option '{option.value}': "
+                            "unknown required_capabilities "
+                            f"{unknown_option_capabilities}"
+                        )
             if p.blackboard_role is not None and p.blackboard_role not in _BLACKBOARD_ROLES:
                 allowed = ", ".join(sorted(_BLACKBOARD_ROLES))
                 raise CatalogValidationError(
@@ -242,6 +483,32 @@ class NodeCatalog:
                 )
 
         declared_params = {p.name for p in entry.parameters}
+        self._validate_profile_min(entry.profiles_min, f"Entry '{entry.id}'")
+        for p in entry.parameters:
+            if p.visible_when is None:
+                continue
+            if p.visible_when.param == p.name or p.visible_when.param not in declared_params:
+                raise CatalogValidationError(
+                    f"Entry '{entry.id}', param '{p.name}': visible_when.param "
+                    f"references unknown parameter '{p.visible_when.param}'"
+                )
+        if not isinstance(entry.required_capabilities, list) or not all(
+            isinstance(capability, str) and capability.strip()
+            for capability in entry.required_capabilities
+        ):
+            raise CatalogValidationError(
+                f"Entry '{entry.id}': required_capabilities must be a list of non-empty strings"
+            )
+        unknown_capabilities = sorted(
+            capability
+            for capability in entry.required_capabilities
+            if capability not in CAPABILITY_REGISTRY
+        )
+        if unknown_capabilities:
+            raise CatalogValidationError(
+                f"Entry '{entry.id}': unknown required_capabilities {unknown_capabilities}"
+            )
+
         for field_name, param_names in (
             ("bb_reader_params", entry.bb_reader_params),
             ("bb_writer_params", entry.bb_writer_params),
@@ -269,6 +536,13 @@ class NodeCatalog:
         if entry.default_interrupt_scope is not None and not entry.interruptible:
             raise CatalogValidationError(
                 f"Entry '{entry.id}': default_interrupt_scope requires interruptible=true"
+            )
+
+    @staticmethod
+    def _validate_profile_min(value: str, context: str) -> None:
+        if not isinstance(value, str) or not value.strip() or _parse_profile(value) is None:
+            raise CatalogValidationError(
+                f"{context}: profiles.min_profile must be a valid profile string"
             )
 
     def get(self, node_id: str) -> CatalogEntry:

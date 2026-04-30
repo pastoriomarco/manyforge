@@ -1,5 +1,5 @@
 api_version: manyforge.program.v0
-program_profile: v0.0
+program_profile: v0.1
 name: semantic_shape_pick
 description: >-
   Semantic object-selection demo. A deterministic node builds an

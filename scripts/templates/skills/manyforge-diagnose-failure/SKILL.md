@@ -11,14 +11,14 @@ a structured diagnosis.
 
 ## When to use
 
-- Program transitioned to STOPPED unexpectedly
+- Program transitioned to `stopped` unexpectedly
 - Execution status shows errors
 - After the monitoring skill reports a failure
 
 ## Steps
 
 1. **Confirm stopped state** — Call `manyforge_cycle_control(command="status")`.
-   If still RUNNING, stop first with `manyforge_cycle_control(command="stop")`.
+   If still `running`, stop first with `manyforge_cycle_control(command="stop")`.
 
 2. **Get execution digest** — Call `manyforge_execution_status(include="all")`.
    Extract:
@@ -62,7 +62,7 @@ Report the diagnosis as:
 ```
 ## Failure Diagnosis
 
-**State**: STOPPED
+**State**: stopped
 **Failed node**: <node_name> (<node_type>)
 **Failure type**: <classification>
 **Error**: <error message>

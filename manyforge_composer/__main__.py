@@ -21,9 +21,36 @@ from manyforge_behavior.model_paths import (
 from manyforge_composer.backend.logging_config import setup_logging
 from manyforge_composer.backend.state import ComposerState
 from manyforge_composer.backend.app import create_app
+from manyforge_composer.backend.assistant_provider import (
+    AssistantProviderError,
+    build_assistant_provider,
+)
 from manyforge_composer.backend.security import SecurityConfig
 
 logger = logging.getLogger(__name__)
+
+
+def _configure_assistant_provider(
+    state: ComposerState,
+    provider_id: str | None,
+    *,
+    endpoint_url: str | None = None,
+    timeout_s: float | None = None,
+    api_token: str | None = None,
+) -> None:
+    configured = (provider_id or os.environ.get("MANYFORGE_ASSISTANT_PROVIDER", "")).strip()
+    try:
+        state.assistant_provider = build_assistant_provider(
+            configured,
+            endpoint_url=endpoint_url,
+            timeout_s=timeout_s,
+            api_token=api_token,
+        )
+    except AssistantProviderError as exc:
+        logger.error("%s", exc)
+        raise SystemExit(2) from exc
+    if state.assistant_provider is not None:
+        logger.info("Assistant provider configured: %s", state.assistant_provider.provider_id)
 
 def _get_simulator_initial_joint_positions(state: ComposerState) -> list[float] | None:
     """Return explicit simulator-only startup joint positions from deployment config."""
@@ -309,6 +336,13 @@ def _run_mcp(args):
         trace_dir="/tmp/manyforge-traces",
         allowed_fs_roots=security.allowed_fs_roots,
     )
+    _configure_assistant_provider(
+        state,
+        args.assistant_provider,
+        endpoint_url=args.assistant_endpoint,
+        timeout_s=args.assistant_timeout_s,
+        api_token=args.assistant_api_token,
+    )
     state.public_api_base_url = _default_public_api_base_url(args.host, args.port)
     try:
         mcp_server = create_mcp_server(state)
@@ -342,6 +376,47 @@ def main():
         type=float,
         default=1.5,
         help="Per-move execution duration for mock-kernel runs and native fallback",
+    )
+    parser.add_argument(
+        "--assistant-provider",
+        default=None,
+        choices=[
+            "mock",
+            "none",
+            "deterministic",
+            "deterministic-scene-authoring",
+            "nemoclaw",
+            "openclaw",
+        ],
+        help=(
+            "Optional assistant provider. Defaults to MANYFORGE_ASSISTANT_PROVIDER "
+            "or mock-only mode."
+        ),
+    )
+    parser.add_argument(
+        "--assistant-endpoint",
+        default=None,
+        help=(
+            "HTTP endpoint for the NemoClaw/OpenClaw assistant provider. "
+            "Defaults to MANYFORGE_ASSISTANT_ENDPOINT_URL."
+        ),
+    )
+    parser.add_argument(
+        "--assistant-timeout-s",
+        type=float,
+        default=None,
+        help=(
+            "Timeout for live assistant provider calls. Defaults to "
+            "MANYFORGE_ASSISTANT_TIMEOUT_S or 30s."
+        ),
+    )
+    parser.add_argument(
+        "--assistant-api-token",
+        default=None,
+        help=(
+            "Bearer token for the live assistant provider. Defaults to "
+            "MANYFORGE_ASSISTANT_API_TOKEN."
+        ),
     )
     parser.add_argument("--mcp", action="store_true",
                         help="Run as MCP server over stdio (no HTTP)")
@@ -400,6 +475,13 @@ def main():
         kernel_bundle=bundle,
         trace_dir="/tmp/manyforge-traces",
         allowed_fs_roots=security.allowed_fs_roots,
+    )
+    _configure_assistant_provider(
+        state,
+        args.assistant_provider,
+        endpoint_url=args.assistant_endpoint,
+        timeout_s=args.assistant_timeout_s,
+        api_token=args.assistant_api_token,
     )
     state.public_api_base_url = _default_public_api_base_url(args.host, args.port)
 

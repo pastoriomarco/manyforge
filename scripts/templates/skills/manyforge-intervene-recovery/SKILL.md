@@ -16,9 +16,11 @@ Apply a recovery action to fix a failed program execution and resume.
 
 ## Prerequisites
 
-- Program must be in STOPPED state
+- Program must be in `stopped` or `idle` state, depending on recovery action
 - Failure must be diagnosed (know the cause)
 - Recovery attempt count must be under 3
+- Runtime overrides can only be changed from `idle` or `direct_control`; reset
+  a stopped cycle to `idle` before applying an override.
 
 ## Recovery strategies
 
@@ -42,12 +44,17 @@ temporary objects or adjust poses of objects you understand.
 Use when node parameters need adjustment (wrong target pose, speed, etc).
 
 ```
-1. manyforge_runtime_override(action="apply",
+1. manyforge_cycle_control(command="status")
+2. manyforge_cycle_control(command="reset")  # if currently stopped
+3. manyforge_runtime_override(action="apply",
       node_name="<failed_node>",
-      params={"<param>": <new_value>})
-2. manyforge_cycle_control(command="reset")
-3. manyforge_cycle_control(command="run")
-4. Monitor with manyforge_execution_status(include="digest")
+      params={"<param>": <new_value>},
+      authority_source="llm",
+      approval_mode="not_required",
+      reason="<diagnosis summary>")
+4. manyforge_runtime_override(action="status")
+5. manyforge_cycle_control(command="run")
+6. Monitor with manyforge_execution_status(include="digest")
 ```
 
 ### Strategy C: Intervention subtree
@@ -64,17 +71,17 @@ Use when the failure requires running a custom recovery sequence.
       grant_type="policy_granted",
       trigger_reason="<from diagnosis>")
 4. Poll manyforge_intervention(action="status") until complete
-5. manyforge_cycle_control(command="reset")
-6. manyforge_cycle_control(command="run")
+5. manyforge_execution_status(include="digest")
+6. Resume with reset/run only if the reported state and recovery policy allow it
 ```
 
 ## Safety rules
 
 1. **Max 3 recovery attempts** — if 3 attempts fail, escalate to human
-2. **Save before modifying** — call `manyforge_program_save()` before
-   applying any tree changes
+2. **Save before persistent edits** — call `manyforge_program_save()` before
+   intentional saved tree changes
 3. **Validate before executing** — always validate intervention trees
-4. **Monitor after recovery** — watch at least 2 ticks after resume
+4. **Monitor after recovery** — watch at least 2 digest polls after resume
 5. **Don't remove original scene objects** — only add or adjust
 6. **Identify yourself** — always use `principal_id="llm:openclaw-agent"`
 
@@ -88,5 +95,5 @@ Report each recovery attempt as:
 **Strategy**: <A/B/C>
 **Action**: <what was done>
 **Result**: <SUCCESS/FAILURE>
-**New state**: <RUNNING/STOPPED/IDLE>
+**New state**: <running/stopped/idle>
 ```

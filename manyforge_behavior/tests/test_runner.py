@@ -40,6 +40,55 @@ SEMANTIC_SHAPE_DEPLOYMENT_EXAMPLE = str(
 )
 
 
+def _v0_0_adapter_configs() -> dict:
+    return {
+        "planning": {
+            "adapter_id": "planning.test",
+            "adapter_version": "0.1.0",
+            "supported_profiles": ["v0.0"],
+            "capability_keys": [
+                "planning.motion.joint_goal",
+                "planning.motion.pose_goal",
+                "planning.trajectory.time_parameterized",
+            ],
+            "config": {},
+        },
+        "context": {
+            "adapter_id": "context.test",
+            "adapter_version": "0.1.0",
+            "supported_profiles": ["v0.0"],
+            "capability_keys": [
+                "context.state.current",
+                "context.validation.trajectory",
+                "context.collision.check",
+                "context.kinematics.fk",
+                "context.limits.joint",
+                "scene.shape.box",
+                "scene.shape.sphere",
+                "scene.edit.add",
+                "scene.edit.remove",
+                "scene.edit.update_pose",
+            ],
+            "config": {},
+        },
+        "execution": {
+            "adapter_id": "execution.test",
+            "adapter_version": "0.1.0",
+            "supported_profiles": ["v0.0"],
+            "capability_keys": [
+                "execution.trajectory.execute",
+                "execution.feedback.phase_events",
+                "execution.feedback.state_snapshots",
+                "execution.stop.soft",
+                "execution.pause",
+                "execution.resume",
+                "execution.reset",
+            ],
+            "config": {},
+        },
+    }
+
+
 @pytest.fixture(autouse=True)
 def reset_blackboard():
     py_trees.blackboard.Blackboard.enable_activity_stream()
@@ -148,6 +197,7 @@ class TestRunnerExecution:
                     "api_version": "manyforge.program.v0",
                     "program_profile": "v0.0",
                     "name": "skill_program",
+                    "catalog_version": "0.1.0",
                     "description": "skill-authored test program",
                     "robot": {
                         "robot_id": "ur5",
@@ -303,7 +353,7 @@ class TestRelativeMoveValidation:
     def _base_program_dict(relative_move: dict) -> dict:
         return {
             "api_version": "manyforge.program.v0",
-            "program_profile": "v0.0",
+            "program_profile": "v0.1",
             "name": "relative_move_validation",
             "catalog_version": "0.1.0",
             "robot": {
@@ -395,7 +445,7 @@ class TestRunnerDeployment:
             "api_version": "manyforge.deployment.v0",
             "schema_version": "0.1.0",
             "name": "bad",
-            "program_profile": "v99.0",  # mismatch
+            "program_profile": "v0.1",  # mismatch
             "robot_config": {
                 "robot_id": "ur5", "group_id": "arm",
                 "urdf_path": "test.urdf",
@@ -460,11 +510,7 @@ class TestRunnerDeployment:
                             "touch_links": ["left_inner_finger_pad", "right_inner_finger_pad"],
                         }
                     },
-                    "adapters": {
-                        "planning": {"adapter_id": "p", "adapter_version": "0.1.0", "config": {}},
-                        "context": {"adapter_id": "c", "adapter_version": "0.1.0", "config": {}},
-                        "execution": {"adapter_id": "e", "adapter_version": "0.1.0", "config": {}},
-                    },
+                    "adapters": _v0_0_adapter_configs(),
                     "orchestrator": {"engine": "py_trees", "config": {}},
                     "launch": {"runner": {"module": "manyforge_behavior.runner", "args": []}},
                 }
@@ -546,11 +592,7 @@ class TestRunnerDeployment:
                     "urdf_path": "package://test.urdf",
                     "global_max_tcp_linear_speed_mps": 0.25,
                 },
-                "adapters": {
-                    "planning": {"adapter_id": "planning.test", "adapter_version": "0.1.0", "config": {}},
-                    "context": {"adapter_id": "context.test", "adapter_version": "0.1.0", "config": {}},
-                    "execution": {"adapter_id": "execution.test", "adapter_version": "0.1.0", "config": {}},
-                },
+                "adapters": _v0_0_adapter_configs(),
                 "orchestrator": {"engine": "py_trees", "config": {}},
                 "launch": {"runner": {"module": "manyforge_behavior.runner", "args": []}},
                 "model_endpoints": {
@@ -806,11 +848,7 @@ class TestRunnerDeployment:
                     "urdf_path": "package://test.urdf",
                     "global_max_tcp_linear_speed_mps": 0.25,
                 },
-                "adapters": {
-                    "planning": {"adapter_id": "planning.test", "adapter_version": "0.1.0", "config": {}},
-                    "context": {"adapter_id": "context.test", "adapter_version": "0.1.0", "config": {}},
-                    "execution": {"adapter_id": "execution.test", "adapter_version": "0.1.0", "config": {}},
-                },
+                "adapters": _v0_0_adapter_configs(),
                 "orchestrator": {"engine": "py_trees", "config": {}},
                 "launch": {"runner": {"module": "manyforge_behavior.runner", "args": []}},
                 "model_endpoints": {
@@ -942,6 +980,7 @@ class TestRunnerCapabilities:
                     "capability_keys": [
                         "execution.trajectory.execute",
                         "execution.feedback.phase_events",
+                        "execution.feedback.state_snapshots",
                         "execution.stop.soft",
                         "execution.pause",
                         "execution.resume",

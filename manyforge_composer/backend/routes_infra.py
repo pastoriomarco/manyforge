@@ -35,6 +35,18 @@ def _probe_openai_compatible_models(base_url: str | None) -> tuple[list[str], st
     return sorted(set(model_ids)), None
 
 
+def _model_endpoint_capabilities_payload(endpoint) -> dict[str, Any]:
+    capabilities = endpoint.capabilities
+    return {
+        "supportsResponseTools": capabilities.supports_response_tools,
+        "supportsJsonObject": capabilities.supports_json_object,
+        "supportsImageInput": capabilities.supports_image_input,
+        "supportedImageTransports": list(capabilities.supported_image_transports),
+        "toolCallFamily": capabilities.tool_call_family,
+        "latencyBudgetMs": capabilities.latency_budget_ms,
+    }
+
+
 def build_infra_status_payload(state: ComposerState) -> dict[str, Any]:
     """Build infrastructure health status."""
     now = time.time()
@@ -141,6 +153,7 @@ def create_infra_router(state: ComposerState) -> APIRouter:
                     "provider": endpoint.provider,
                     "configuredModelId": endpoint.model_id,
                     "baseUrl": endpoint.base_url,
+                    "capabilities": _model_endpoint_capabilities_payload(endpoint),
                     "probeStatus": probe_status,
                     "availableModelIds": available_model_ids,
                     "error": error,

@@ -77,7 +77,7 @@ class TestPickAndPlacePipeline:
         assert success is True
 
     def test_pick_place_state_after_completion(self, kernel):
-        """Kernel is in COMPLETED state after full run."""
+        """Runtime acknowledges completed motions and leaves kernel idle after full run."""
         runner = OrchestratorRunner(
             catalog_path=CATALOG_PATH,
             program_path=PICK_PLACE_PROGRAM,
@@ -89,7 +89,8 @@ class TestPickAndPlacePipeline:
         runner.run(max_ticks=200, tick_period_s=0.0)
 
         status = kernel.get_status()
-        assert status.state == ExecutionState.COMPLETED
+        assert status.state == ExecutionState.IDLE
+        assert status.active_move_id == ""
 
     def test_pick_place_reset_and_rerun(self, kernel):
         """Program can be reset and run again."""

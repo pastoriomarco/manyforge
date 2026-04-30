@@ -9,7 +9,7 @@
 #   ./scripts/demo-vision-pose.sh
 #   ./scripts/demo-vision-pose.sh --api-port 9010 --hmi-port 8082
 #   ./scripts/demo-vision-pose.sh --model-base-url http://172.17.0.1:8000/v1
-#   ./scripts/demo-vision-pose.sh --model-id gemma-4-E4B-it
+#   ./scripts/demo-vision-pose.sh --model-id qwen3.6-35b-a3b-nvfp4-tq-mtp-manyforge
 #   ./scripts/demo-vision-pose.sh --rebuild
 #
 # Then open:
@@ -25,7 +25,7 @@ DEPLOY=/workspace/examples/vision_guided_pose_pick.deployment.yaml
 API_PORT=9000
 HMI_PORT=8081
 MODEL_BASE_URL=http://172.17.0.1:8000/v1
-MODEL_ID=gemma-4-E4B-it
+MODEL_ID=qwen3.6-35b-a3b-nvfp4-tq-mtp-manyforge
 BOOTSTRAP_MODE=auto
 
 while [[ $# -gt 0 ]]; do
@@ -124,12 +124,19 @@ exec docker compose run --rm \
 
   python3 - <<PY
 import yaml
+from pathlib import Path
 
 src = "${MANYFORGE_DEPLOY_PATH}"
 dst = "${TMP_DEPLOY}"
 
 with open(src, "r", encoding="utf-8") as f:
     data = yaml.safe_load(f)
+
+registry_path = data.get("model_endpoint_profile_registry")
+if registry_path and not Path(registry_path).is_absolute():
+    data["model_endpoint_profile_registry"] = str(
+        (Path(src).parent / registry_path).resolve()
+    )
 
 for endpoint in data.get("model_endpoints", {}).values():
     endpoint["base_url"] = "${MANYFORGE_MODEL_BASE_URL}"

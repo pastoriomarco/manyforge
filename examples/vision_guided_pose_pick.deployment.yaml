@@ -6,7 +6,7 @@ description: >-
   to be running with at least one connected Viser client so `query_model` can
   attach a live scene snapshot.
 
-program_profile: v0.0
+program_profile: v0.1
 
 robot_config:
   robot_id: ur5
@@ -19,7 +19,7 @@ adapters:
   planning:
     adapter_id: planning.roboplan
     adapter_version: "0.1.0"
-    supported_profiles: ["v0.0"]
+    supported_profiles: ["v0.1"]
     capability_keys:
       - planning.motion.joint_goal
       - planning.motion.pose_goal
@@ -29,12 +29,14 @@ adapters:
   context:
     adapter_id: planning.roboplan_context
     adapter_version: "0.1.0"
-    supported_profiles: ["v0.0"]
+    supported_profiles: ["v0.1"]
     capability_keys:
       - context.state.current
       - context.validation.trajectory
       - context.collision.check
       - context.kinematics.fk
+      - context.pose.resolve_reference
+      - context.scene.object_query
       - context.limits.joint
       - scene.shape.box
       - scene.shape.sphere
@@ -42,11 +44,12 @@ adapters:
       - scene.edit.remove
       - scene.edit.update_pose
       - scene.edit.attach_detach
+      - observability.trace.scene
     config: {}
   execution:
     adapter_id: execution.roboplan_native
     adapter_version: "0.1.0"
-    supported_profiles: ["v0.0"]
+    supported_profiles: ["v0.1"]
     capability_keys:
       - execution.trajectory.execute
       - execution.feedback.phase_events
@@ -79,11 +82,11 @@ model_audit_policy:
   store_full_responses: false
   redact_argument_values: true
 
+model_endpoint_profile_registry: model_endpoint_profiles.yaml
+
 model_endpoints:
-  gemma4_vlm:
-    provider: openai
-    model_id: gemma-4-E4B-it
-    base_url: http://127.0.0.1:8000/v1
+  vision_model:
+    profile_ref: thor_manyforge_qwen36
     max_tokens: 512
 
 prompt_templates:

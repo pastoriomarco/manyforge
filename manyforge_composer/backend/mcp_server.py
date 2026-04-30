@@ -229,7 +229,7 @@ def create_mcp_server(state: ComposerState):
             force_discard_overrides: If true, discard any existing runtime
                   overrides when writing a new tree
 
-        The tree cannot be modified while execution is RUNNING (returns error).
+        The tree cannot be modified while cycle state is running.
         Always call manyforge_program_validate before writing.
         """
         if state.program is None:
@@ -346,7 +346,9 @@ def create_mcp_server(state: ComposerState):
             velocity_scale: Required when command is "velocity" (0.0 to 1.0).
                            0.0 will stall the robot — use "stop" to pause instead.
 
-        State machine: IDLE → RUNNING → STOPPED → IDLE (via reset)
+        Cycle states include idle, running, stopped, interrupt_handler, and
+        direct_control. Kernel terminal acknowledgement is runtime-owned and is
+        not a behavior-tree authoring action.
         """
         if command == "status":
             if state.cycle_manager is None:
@@ -449,6 +451,7 @@ def create_mcp_server(state: ComposerState):
                 "provides": skill.provides,
                 "modifies": skill.modifies,
                 "requires_capabilities": skill.requires_capabilities,
+                "requires_tools": skill.requires_tools,
                 "parameters": [
                     {
                         "name": p.name,
@@ -486,7 +489,7 @@ def create_mcp_server(state: ComposerState):
         """Execute, monitor, or abort a temporary intervention subtree.
 
         Interventions run a validated one-shot subtree without modifying the
-        saved program. The cycle must be IDLE or STOPPED to start an
+        saved program. The cycle must be idle or stopped to start an
         intervention.
 
         Args:
@@ -665,7 +668,7 @@ def create_mcp_server(state: ComposerState):
         - "materialized_tree": return the tree produced by materializing runtime overrides
         - "apply": apply or stage an override for one node instance
         - "promote": materialize selected overrides into the loaded program or save them
-        - "activate": activate staged overrides from IDLE
+        - "activate": activate staged overrides from idle
         - "revalidate": re-check stale overrides against the current program
         - "remove": remove one override by node instance name
         - "clear": clear all overrides
@@ -1065,8 +1068,9 @@ def create_mcp_server(state: ComposerState):
 
         - status: Return current session info (loaded program, deployment,
           cycle state, override count, event count)
-        - reset: Unload the current program and reset all state. Use with
-          caution — this discards all runtime overrides and execution history.
+        - reset: Reset cycle state and clear runtime overrides while keeping
+          the loaded program. Not allowed while execution or an interrupt
+          handler is active.
         """
         if action == "status":
             override_status = (
@@ -1181,9 +1185,31 @@ def _catalog_entry_dict(entry) -> dict[str, Any]:
                 "required": p.required,
                 "default": p.default,
                 "enum_values": p.enum_values,
+                "enum_options": [
+                    {
+                        "value": option.value,
+                        "label": option.label,
+                        "description": option.description,
+                        "profiles_min": option.profiles_min,
+                        "required_capabilities": list(option.required_capabilities),
+                    }
+                    for option in p.enum_options
+                ],
                 "constraints": p.constraints,
                 "parameterizable": p.parameterizable,
+                "profiles_min": p.profiles_min,
+                "visible_when": (
+                    {
+                        "param": p.visible_when.param,
+                        "equals": p.visible_when.equals,
+                    }
+                    if p.visible_when is not None
+                    else None
+                ),
                 "ui_editor": p.ui_editor,
+                "blackboard_role": p.blackboard_role,
+                "blackboard_contract": p.blackboard_contract,
+                "blackboard_value_type": p.blackboard_value_type,
                 "description": p.description,
             }
             for p in entry.parameters
@@ -1191,6 +1217,7 @@ def _catalog_entry_dict(entry) -> dict[str, Any]:
         "bb_reader_params": list(entry.bb_reader_params),
         "bb_writer_params": list(entry.bb_writer_params),
         "required_capabilities": entry.required_capabilities,
+        "profiles_min": entry.profiles_min,
     }
 
 

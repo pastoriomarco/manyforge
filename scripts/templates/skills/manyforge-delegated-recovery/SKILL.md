@@ -13,13 +13,13 @@ runs the full recovery workflow: diagnose, intervene, and escalate if needed.
 
 - When `manyforge_intervention(action="pending_recovery")` returns a
   recovery request
-- When execution monitoring detects a STOPPED state with errors
+- When execution monitoring detects a `stopped` state with errors
 
 ## Workflow
 
 ```
 ┌─────────────┐
-│   Detect     │  execution_status shows STOPPED + errors
+│   Detect     │  execution_status shows stopped + errors
 └──────┬──────┘
        │
 ┌──────▼──────┐
@@ -41,7 +41,7 @@ runs the full recovery workflow: diagnose, intervene, and escalate if needed.
       yes
        │
 ┌──────▼──────┐
-│   Resume     │  reset → run → monitor
+│   Resume     │  reset/run when allowed, then monitor
 └─────────────┘
 ```
 
@@ -93,4 +93,4 @@ runs the full recovery workflow: diagnose, intervene, and escalate if needed.
 - Always use `grant_type="policy_granted"` (the tree delegated to you)
 - Renew intervention leases with `manyforge_intervention(action="heartbeat")`
   if recovery takes more than 30 seconds
-- Save the program before making any changes
+- Save the program before intentional persistent tree changes

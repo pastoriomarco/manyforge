@@ -32,6 +32,10 @@ map.
   - Contract reference for the ManyForge MCP server.
   - Tool-by-tool interface schema, parameters, and semantics.
 
+- [`reference/ASSISTANT_BACKEND_CONTRACT.md`](reference/ASSISTANT_BACKEND_CONTRACT.md)
+  - Contract reference for Composer assistant providers, tools, and proposal staging.
+  - Defines the non-mutating backend boundary for deterministic scene-authoring and future NemoClaw/OpenClaw integration.
+
 - [`reference/REFERENCE.md`](reference/REFERENCE.md)
   - Engineering reference for contributors and sandboxed coding agents.
   - Core C++ conventions and design patterns carried forward from ManyMove.

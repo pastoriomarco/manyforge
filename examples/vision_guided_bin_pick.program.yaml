@@ -1,11 +1,11 @@
 api_version: manyforge.program.v0
-program_profile: v0.0
+program_profile: v0.1
 name: vision_guided_bin_pick
 description: >-
   Vision-guided pick-and-place example. A `query_model` node captures the live
-  HMI scene snapshot, asks a Gemma 4 VLM which of two candidate objects should
-  be picked next, and mirrors the validated decision onto the blackboard. The
-  tree then routes into one of two fixed pick/place sequences.
+  HMI scene snapshot, asks the configured vision model which of two candidate
+  objects should be picked next, and mirrors the validated decision onto the
+  blackboard. The tree then routes into one of two fixed pick/place sequences.
 catalog_version: "0.1.0"
 
 robot:
@@ -70,7 +70,7 @@ tree:
     - id: query_model
       name: choose_pick_target
       params:
-        model_endpoint_alias: gemma4_vlm
+        model_endpoint_alias: vision_model
         prompt_template_id: choose_bin_target_v1
         output_key_prefix:
           namespace_ref: pick_target

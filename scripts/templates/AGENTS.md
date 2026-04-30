@@ -1,12 +1,20 @@
-> Repository docs entrypoint: [`../../docs/INDEX.md`](../../docs/INDEX.md)
+> Runtime template. When editing this file in the repository, follow
+> [`../../AGENTS.md`](../../AGENTS.md) and [`../../docs/INDEX.md`](../../docs/INDEX.md).
 
-# ManyForge Agent Reference
+# ManyForge Runtime Agent Reference
+
+This file is copied into ManyForge/OpenClaw MCP runtime sandboxes for
+downstream LLM agents. It is not the ManyForge repository development workflow.
+
+At runtime, the live MCP tool schemas, tool results, and current session state
+are the immediate authority. If they contradict this file, use safe read-only
+inspection tools and report the mismatch before taking state-changing actions.
 
 You are interacting with **ManyForge**, a behavior-tree execution engine for
 robotic manipulation. Programs are YAML-defined behavior trees that compose
-deterministic nodes (sequences, selectors, conditions, actions) and optional
-model-query nodes. Programs run against a deployment that describes the robot
-hardware, adapters, and capabilities.
+deterministic nodes and optional model-query nodes. Programs run against a
+deployment that describes robot hardware, adapters, capabilities, model
+endpoints, and audit policy.
 
 ## Architecture
 
@@ -16,16 +24,23 @@ Program (.program.yaml)
 Deployment (.deployment.yaml)
   └─ Robot adapter, capabilities, model endpoints
 CycleManager
-  └─ States: IDLE → RUNNING → STOPPED → IDLE (via reset)
+  └─ Runtime states: idle, running, stopped, interrupt_handler, direct_control
 Kernel
-  └─ Motion planner (C++ or MockKernelClient)
+  └─ Execution state, validation, cache, collision monitoring, motion backend
 ```
 
-- **Tick rate**: 10 Hz (100 ms per tick)
+- **Tick cadence**: Runtime-owned; do not assume a fixed rate unless the loaded
+  deployment or runtime status reports one.
 - **Execution**: CycleManager ticks the behavior tree. Nodes return SUCCESS,
   FAILURE, or RUNNING each tick.
+- **Motion acknowledgement**: The runtime owns successful kernel terminal
+  acknowledgement. Authored behavior-tree nodes must not auto-reset or
+  acknowledge completed kernel executions. A successful acknowledgement is bound
+  to the exact completed kernel `execution_id`; failed or stopped kernel
+  executions require reset or recovery authority.
 - **Runtime overrides**: Parameter changes applied without reloading the program.
-  Staged overrides activate on the next run/reset.
+  Staged overrides activate only from `idle`; do not resume a stopped cycle
+  against a different effective program.
 - **Interventions**: One-shot subtrees that run without modifying the saved
   program. Used for recovery and diagnostics.
 
@@ -33,12 +48,17 @@ Kernel
 
 | Command | From state | To state | Notes |
 |---------|-----------|----------|-------|
-| `run` | IDLE | RUNNING | Activates staged overrides if present |
-| `stop` | RUNNING | STOPPED | Halts the tree mid-tick |
-| `reset` | STOPPED | IDLE | Resets tree state; activates staged overrides |
-| `velocity` | any | — | Scales execution speed (0.0–1.0) |
+| `status` | any | unchanged | Inspect state before acting |
+| `run` | `idle` | `running` | Activates staged overrides if present |
+| `run` | `stopped` | `running` | Resumes without activating staged overrides |
+| `stop` | `running` | `stopped` | Requests a halt/quiesce |
+| `reset` | `running`/`stopped`/`idle` | `idle` | Rebuilds cycle state; staged overrides require `idle` |
+| `velocity` | any | unchanged | Scales execution speed (0.0–1.0) |
 
-## MCP Tools (19 total)
+## MCP Tools
+
+The runtime currently exposes 19 tools. Prefer the live `tools/list` schema
+when exact parameters matter.
 
 ### Scene
 
@@ -47,7 +67,7 @@ Get robot joint positions, TCP pose, and all collision objects.
 Returns: `{robot: {joints, tcp_pose, robot_id, group_id}, objects: [...], timestamp_ns}`
 
 **`manyforge_scene_edit(operation, object_id, ...)`**
-Edit the collision scene. Not allowed while RUNNING.
+Edit the collision scene. Not allowed while cycle state is `running`.
 - `operation`: "add", "remove", "update_pose", "attach", "detach"
 - For "add": provide `shape_type` ("box"/"sphere"), dimensions, and pose
 - For "attach"/"detach": provide `frame_id` (robot link)
@@ -68,7 +88,7 @@ Returns: `{name, description, robot: {...}, scene_count, parameter_count, source
 Read or replace the behavior tree.
 - `action="read"`: returns current tree
 - `action="write"`: replaces tree (validate first!)
-Cannot write while RUNNING.
+Cannot write while cycle state is `running`.
 
 **`manyforge_program_validate(tree)`**
 Dry-run validation of a candidate tree. No side effects.
@@ -82,7 +102,9 @@ Save the loaded program to YAML. Defaults to original source path.
 
 **`manyforge_cycle_control(command, velocity_scale=None)`**
 Control execution: "run", "stop", "reset", "status", "velocity".
-State machine: IDLE → RUNNING → STOPPED → IDLE (via reset).
+Returned cycle states include `idle`, `running`, `stopped`,
+`interrupt_handler`, and `direct_control`. Kernel terminal acknowledgement is
+runtime-owned and is not a behavior-tree authoring action.
 
 **`manyforge_execution_status(include="digest")`**
 Get execution information.
@@ -101,7 +123,7 @@ scene trace, blackboard, node statuses. Use for post-mortem analysis.
 Inspect or mutate the runtime override ledger.
 - `"status"`: list active/staged/stale overrides
 - `"apply"`: stage a parameter override for a node instance
-- `"activate"`: activate staged overrides (from IDLE)
+- `"activate"`: activate staged overrides from `idle`
 - `"promote"`: materialize overrides into the loaded program or save to disk
 - `"remove"`: remove one override
 - `"clear"`: clear all overrides
@@ -129,12 +151,15 @@ parameters, children constraints, and required capabilities.
 Query deployment-declared capabilities grouped by category.
 
 **`manyforge_skills()`**
-Get the skill catalog — validated subtree templates for standard operations
-(pick, place, move, etc.). Prefer skills over raw nodes.
+Get the skill catalog: validated subtree templates for standard operations
+(pick, place, move, etc.), including capability and assistant-tool
+requirements. Prefer skills over raw nodes.
 
 **`manyforge_deployment()`**
 Get the loaded deployment configuration: adapters, capabilities,
-model endpoints, prompt templates, audit policy.
+the optional model endpoint profile registry reference, resolved model
+endpoints with declared model capabilities, assistant config, assistant modes,
+tool catalog, prompt templates, audit policy.
 
 ### Kernel & Session
 
@@ -147,7 +172,8 @@ Get kernel execution state and metrics.
 **`manyforge_session(action="status")`**
 Manage the composer session.
 - `"status"`: current session info (loaded program, deployment, overrides, events)
-- `"reset"`: reset cycle state and clear runtime overrides (program stays loaded)
+- `"reset"`: reset cycle state and clear runtime overrides while keeping the
+  loaded program; not allowed while execution or an interrupt handler is active
 
 ### Filesystem
 
@@ -163,9 +189,19 @@ Returns: `{path, parent_path, entries: [{name, path, type}], root_shortcuts}`
 1. manyforge_files(kind="program")           # find .program.yaml files
 2. manyforge_program_load(program_path=...,  # load program + deployment
       deployment_path=...)
-3. manyforge_program_validate(tree=...)      # optional: validate tree
+3. manyforge_cycle_control(command="status") # confirm idle before running
 4. manyforge_cycle_control(command="run")    # start execution
 5. manyforge_execution_status(include="digest")  # poll for progress
+```
+
+### Edit a program safely
+
+```
+1. manyforge_cycle_control(command="status") # stop/reset first if running
+2. manyforge_program_tree(action="read")     # inspect current tree
+3. manyforge_program_validate(tree=...)      # validate candidate tree
+4. manyforge_program_tree(action="write", tree=...)
+5. manyforge_program_save()                  # persist only when intended
 ```
 
 ### Stop and diagnose
@@ -180,11 +216,14 @@ Returns: `{path, parent_path, entries: [{name, path, type}], root_shortcuts}`
 ### Apply a runtime override
 
 ```
-1. manyforge_runtime_override(action="apply",
+1. manyforge_cycle_control(command="status")
+2. manyforge_cycle_control(command="stop")   # only if currently running
+3. manyforge_cycle_control(command="reset")  # only if not already idle
+4. manyforge_runtime_override(action="apply",
       node_name="pick_object_1",
       params={"target_pose": [0.5, 0.0, 0.1, 0, 0, 0, 1]})
-2. manyforge_cycle_control(command="reset")  # reset to IDLE
-3. manyforge_cycle_control(command="run")    # re-run with override
+5. manyforge_runtime_override(action="status") # confirm staged override
+6. manyforge_cycle_control(command="run")    # activates staged override from idle
 ```
 
 ### Recovery via intervention
@@ -198,25 +237,31 @@ Returns: `{path, parent_path, entries: [{name, path, type}], root_shortcuts}`
       grant_type="policy_granted",
       trigger_reason="node_failure")
 4. manyforge_intervention(action="status")            # poll until complete
-5. manyforge_cycle_control(command="reset")
-6. manyforge_cycle_control(command="run")
+5. manyforge_execution_status(include="digest")       # inspect recovery outcome
+6. manyforge_cycle_control(command="reset")           # or run, only if status allows it
 ```
 
 ## Safety Rules
 
-1. **Never modify the tree while RUNNING.** Stop first, then edit.
+1. **Never modify the tree while cycle state is `running`.** Stop first, then edit.
 2. **Always validate before writing a tree.** Call `manyforge_program_validate`
    before `manyforge_program_tree(action="write")`.
-3. **Scene edits are blocked while RUNNING.** Stop execution first.
+3. **Scene edits are blocked while cycle state is `running`.** Stop execution first.
 4. **Velocity 0.0 stalls the robot — use "stop" to pause.**
 5. **Runtime overrides are staged, not immediate.** They activate on the next
-   run or reset. Check `manyforge_runtime_override(action="status")` to confirm.
+   run/reset only from `idle`. Check `manyforge_runtime_override(action="status")`
+   before resuming or rerunning.
 6. **Interventions require a principal_id.** Use your agent identity
    (e.g., `"llm:openclaw-agent"`).
 7. **Do not run concurrent interventions.** Only one intervention session at a time.
 8. **Poll execution status, don't assume completion.** Use
    `manyforge_execution_status(include="digest")` to check progress.
-9. **When in doubt, stop first.** A stopped program can always be reset and
-   re-run. A corrupt running program may require manual intervention.
+9. **When in doubt, stop first.** Then inspect status and follow the runtime
+   recovery/reset path for the reported state.
 10. **Save before making destructive changes.** Use `manyforge_program_save()`
     before replacing the tree or clearing overrides.
+11. **Do not fake terminal acknowledgement.** Successful kernel terminal
+    acknowledgement is runtime-owned and bound to the completed execution ID;
+    failed or stopped kernel executions require reset or recovery authority.
+12. **Treat model output as advisory.** Validate proposed trees and inspect
+    runtime state before applying, running, or saving changes.

@@ -133,6 +133,68 @@ def _runtime_override_status_response(state: ComposerState) -> dict:
     ).model_dump(by_alias=True)
 
 
+def _model_endpoint_capabilities_payload(endpoint) -> dict:
+    capabilities = endpoint.capabilities
+    return {
+        "supportsResponseTools": capabilities.supports_response_tools,
+        "supportsJsonObject": capabilities.supports_json_object,
+        "supportsImageInput": capabilities.supports_image_input,
+        "supportedImageTransports": list(capabilities.supported_image_transports),
+        "toolCallFamily": capabilities.tool_call_family,
+        "latencyBudgetMs": capabilities.latency_budget_ms,
+    }
+
+
+def _assistant_config_payload(deployment: Deployment) -> dict | None:
+    if deployment.assistant is None:
+        return None
+    return {
+        "provider": deployment.assistant.provider,
+        "endpointAlias": deployment.assistant.endpoint_alias,
+        "enabled": deployment.assistant.enabled,
+    }
+
+
+def _assistant_modes_payload(deployment: Deployment) -> dict:
+    return {
+        mode_id: {
+            "enabled": mode.enabled,
+            "description": mode.description,
+            "authority": {
+                "sessionKind": mode.authority.session_kind,
+                "approvalMode": mode.authority.approval_mode,
+                "review": mode.authority.review,
+            },
+            "catalog": {
+                "skills": list(mode.catalog.skills),
+                "tools": list(mode.catalog.tools),
+                "nodes": list(mode.catalog.nodes),
+            },
+        }
+        for mode_id, mode in deployment.assistant_modes.items()
+    }
+
+
+def _tool_catalog_payload(deployment: Deployment) -> list[dict]:
+    tools: list[dict] = []
+    for tool in deployment.tool_catalog.values():
+        raw = {
+            "id": tool.tool_id,
+            "effect": tool.effect,
+            "description": tool.description,
+        }
+        raw.update(tool.extra)
+        tools.append(raw)
+    return tools
+
+
+def _validate_deployment_against_catalogs(
+    state: ComposerState,
+    deployment: Deployment,
+) -> None:
+    deployment.validate_assistant_modes(state.catalog, state.skill_catalog)
+
+
 def _deployment_to_full_response(deployment: Deployment, source_path: str) -> dict:
     return FullDeploymentResponse(
         apiVersion=deployment.api_version,
@@ -204,8 +266,10 @@ def _deployment_to_full_response(deployment: Deployment, source_path: str) -> di
             if deployment.model_audit_policy is not None
             else None
         ),
+        modelEndpointProfileRegistry=deployment.model_endpoint_profile_registry,
         modelEndpoints={
             alias: {
+                "profileRef": endpoint.profile_ref,
                 "provider": endpoint.provider,
                 "modelId": endpoint.model_id,
                 "baseUrl": endpoint.base_url,
@@ -213,9 +277,13 @@ def _deployment_to_full_response(deployment: Deployment, source_path: str) -> di
                 "apiKeyEnv": endpoint.api_key_env,
                 "defaultTimeoutS": endpoint.default_timeout_s,
                 "maxTokens": endpoint.max_tokens,
+                "capabilities": _model_endpoint_capabilities_payload(endpoint),
             }
             for alias, endpoint in deployment.model_endpoints.items()
         },
+        assistant=_assistant_config_payload(deployment),
+        assistantModes=_assistant_modes_payload(deployment),
+        toolCatalog=_tool_catalog_payload(deployment),
         promptTemplates={
             template_id: {
                 "version": template.version,
@@ -721,6 +789,7 @@ def create_program_router(state: ComposerState) -> APIRouter:
                 kind_label="Deployment path",
             )
             deployment = Deployment(deployment_path)
+            _validate_deployment_against_catalogs(state, deployment)
             state.deployment = deployment
             state.deployment_source_path = deployment_path
         except HTTPException:
@@ -915,6 +984,7 @@ def create_program_router(state: ComposerState) -> APIRouter:
                 deployment_dict,
                 path=state.deployment_source_path or "<memory>",
             )
+            _validate_deployment_against_catalogs(state, updated_deployment)
             if state.program is not None:
                 updated_deployment.validate_against_program(state.program)
                 updated_deployment.validate_capabilities(state.program)
@@ -944,10 +1014,12 @@ def create_program_router(state: ComposerState) -> APIRouter:
                 kind_label="Deployment path",
             )
             if request.deployment is None:
+                _validate_deployment_against_catalogs(state, state.deployment)
                 state.deployment.save(target_path)
             else:
                 deployment_data = request.deployment.model_dump()
                 candidate = Deployment.from_dict(deployment_data, path=target_path)
+                _validate_deployment_against_catalogs(state, candidate)
                 if state.program is not None:
                     candidate.validate_against_program(state.program)
                     candidate.validate_capabilities(state.program)
@@ -1006,6 +1078,7 @@ def create_program_router(state: ComposerState) -> APIRouter:
                     request.deployment.model_dump(),
                     path=state.deployment_source_path or "<memory>",
                 )
+                _validate_deployment_against_catalogs(state, deployment)
 
             if deployment is not None:
                 deployment.validate_against_program(program)

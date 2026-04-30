@@ -45,6 +45,21 @@ def assistant_tool_catalog() -> list[dict[str, Any]]:
                 "objectIdPrefix": "string, optional",
             },
         },
+        {
+            "name": "propose_scene_object_nodes",
+            "description": (
+                "Build reviewable tree-node draft proposals for scene object "
+                "operations such as add/remove/attach/detach."
+            ),
+            "mutatesState": False,
+            "requiresReview": True,
+            "inputSchema": {
+                "sceneResources": "list[ProgramSceneResource]",
+                "operations": "add_collision_object | remove_collision_object | attach_object_to_link | detach_object_from_link",
+                "linkFrame": "string, required for attach/detach",
+                "gripperId": "string, optional",
+            },
+        },
     ]
 
 
@@ -147,6 +162,68 @@ def propose_scene_object_resources(
     }
 
 
+def propose_scene_object_nodes(
+    scene_resources: list[dict[str, Any]],
+    *,
+    operations: list[str] | None = None,
+    link_frame: str = "tool0",
+    gripper_id: str | None = None,
+    name_prefix: str = "",
+) -> dict[str, Any]:
+    """Build non-mutating tree-node proposals for scene object operations."""
+    if not isinstance(scene_resources, list):
+        raise AssistantToolError("sceneResources must be a list")
+    selected_operations = operations or ["add_collision_object"]
+    for operation in selected_operations:
+        if operation not in _SCENE_OBJECT_NODE_OPERATIONS:
+            raise AssistantToolError(f"unsupported scene object node operation: {operation}")
+    if any(
+        operation in {"attach_object_to_link", "detach_object_from_link"}
+        for operation in selected_operations
+    ) and not link_frame.strip():
+        raise AssistantToolError("linkFrame is required for attach/detach operations")
+
+    proposals: list[dict[str, Any]] = []
+    tree_nodes: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    used_names: set[str] = set()
+
+    for resource in scene_resources:
+        if not isinstance(resource, dict):
+            warnings.append("Skipped a non-object entry in sceneResources.")
+            continue
+        try:
+            object_id = _required_string(resource, "objectId")
+            shape = _validated_shape(resource.get("shape"))
+            pose = _validated_pose(resource.get("pose"))
+        except AssistantToolError as exc:
+            warnings.append(f"Skipped invalid scene resource: {exc}")
+            continue
+
+        for operation in selected_operations:
+            node = _scene_object_tree_node(
+                operation=operation,
+                object_id=object_id,
+                shape=shape,
+                pose=pose,
+                link_frame=link_frame,
+                gripper_id=gripper_id,
+                name_prefix=name_prefix,
+                used_names=used_names,
+            )
+            proposals.append(_proposal_from_tree_node(object_id, operation, node))
+            tree_nodes.append(node)
+
+    return {
+        "toolName": "propose_scene_object_nodes",
+        "proposals": proposals,
+        "treeNodes": tree_nodes,
+        "warnings": warnings,
+        "mutated": False,
+        "timestampNs": time.monotonic_ns(),
+    }
+
+
 def _import_manyforge_ros_inspector() -> Any:
     try:
         return importlib.import_module("manyforge_ros.inspect_isaac_scene")
@@ -221,6 +298,86 @@ def _proposal_from_scene_resource(
         "source": {
             "kind": "isaac_scene_inspection",
             "sourceRoot": source_root,
+        },
+    }
+
+
+_SCENE_OBJECT_NODE_OPERATIONS = {
+    "add_collision_object",
+    "remove_collision_object",
+    "attach_object_to_link",
+    "detach_object_from_link",
+}
+
+
+def _scene_object_tree_node(
+    *,
+    operation: str,
+    object_id: str,
+    shape: dict[str, Any],
+    pose: dict[str, Any],
+    link_frame: str,
+    gripper_id: str | None,
+    name_prefix: str,
+    used_names: set[str],
+) -> dict[str, Any]:
+    safe_id = _sanitize_object_id(object_id)
+    node_name = _unique_id(
+        _sanitize_object_id(f"{name_prefix}{operation}_{safe_id}"),
+        used_names,
+    )
+    params: dict[str, Any] = {"object_id": object_id}
+    if operation == "add_collision_object":
+        params.update(
+            {
+                "shape_type": shape["type"],
+                "pose": pose,
+                "frame_id": pose["frame_id"],
+            }
+        )
+        if shape["type"] == "box":
+            params["box_dimensions_m"] = shape["box_dimensions_m"]
+        elif shape["type"] == "sphere":
+            params["sphere_radius_m"] = shape["sphere_radius_m"]
+    elif operation in {"attach_object_to_link", "detach_object_from_link"}:
+        params["link_frame"] = link_frame
+        if operation == "attach_object_to_link" and gripper_id:
+            params["gripper_id"] = gripper_id
+    return {
+        "id": operation,
+        "name": node_name,
+        "params": params,
+        "children": [],
+    }
+
+
+def _proposal_from_tree_node(
+    object_id: str,
+    operation: str,
+    tree_node: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "id": f"proposal-tree-node-{tree_node['name']}",
+        "type": "tree_node_add",
+        "title": f"Add {operation} node for {object_id}",
+        "summary": (
+            "Draft behavior-tree node for a scene object operation. "
+            "This is not inserted into the tree until reviewed."
+        ),
+        "status": "draft",
+        "reviewRequired": True,
+        "payload": {
+            "action": "add_tree_node",
+            "treeNode": tree_node,
+            "sourceObjectId": object_id,
+            "operation": operation,
+        },
+        "warnings": [
+            "Tree-node proposal is not applied. User review and insertion point selection are required."
+        ],
+        "source": {
+            "kind": "assistant_scene_object_node",
+            "sourceObjectId": object_id,
         },
     }
 

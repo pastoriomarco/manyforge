@@ -3,9 +3,10 @@ set -e
 
 # Add Python packages to PYTHONPATH
 # manyforge_behavior lives at /workspace/manyforge_behavior/manyforge_behavior/
+# manyforge_ros lives at /workspace/manyforge_ros/manyforge_ros/
 # manyforge_hmi lives at /workspace/manyforge_hmi/ (flat layout)
 # manyforge_composer lives at /workspace/manyforge_composer/ (flat layout)
-export PYTHONPATH="/workspace/manyforge_behavior:/workspace:${PYTHONPATH:-}"
+export PYTHONPATH="/workspace/manyforge_ros:/workspace/manyforge_behavior:/workspace:${PYTHONPATH:-}"
 
 # Use container-specific build directories (avoids cmake cache conflicts
 # when the same source tree is also built on the host)

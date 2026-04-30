@@ -5,6 +5,7 @@ import { useCycleStore } from '../store/cycleStore';
 import { useDeploymentStore } from '../store/deploymentStore';
 import { api } from '../api/client';
 import type {
+  CatalogEnumOption,
   CatalogParameter,
   FullDeployment,
   ModelEndpointCatalog,
@@ -40,6 +41,7 @@ import {
   ParameterBindingEditor,
   SUPPORTED_PROGRAM_PARAMETER_TYPES,
 } from './property/ProgramParameterBindingEditor';
+import { profileSatisfies } from '../utils/profiles';
 
 const KIND_COLORS: Record<string, string> = {
   sequence: 'border-blue-500 bg-blue-900/50',
@@ -66,6 +68,38 @@ const SCENE_OBJECT_ID_NODE_IDS = new Set([
   'attach_object_to_link',
   'detach_object_from_link',
 ]);
+
+function enumOptionsForProgramProfile(
+  param: CatalogParameter,
+  programProfile: string | null | undefined,
+): { value: string; label: string }[] {
+  const options: CatalogEnumOption[] = param.enumOptions.length > 0
+    ? param.enumOptions
+    : param.enumValues.map((value) => ({
+        value,
+        label: value,
+        description: '',
+        profilesMin: 'v0.0',
+        requiredCapabilities: [],
+      }));
+  return options
+    .filter((option) => profileSatisfies(option.profilesMin, programProfile))
+    .map((option) => ({
+      value: option.value,
+      label: option.label || option.value,
+    }));
+}
+
+function valuesEqual(left: unknown, right: unknown): boolean {
+  if (left === right) {
+    return true;
+  }
+  try {
+    return JSON.stringify(left) === JSON.stringify(right);
+  } catch {
+    return false;
+  }
+}
 
 function normalizeSelectOptions(
   options: string[],
@@ -286,6 +320,7 @@ export function PropertyPanel({ onCollapse }: { onCollapse: () => void }) {
     updateNodeLabel,
     removeNode,
     addProgramParameter,
+    programInfo,
   } = useProgramStore();
   const { entries } = useCatalogStore();
   const cycleState = useCycleStore((state) => state.state);
@@ -294,6 +329,7 @@ export function PropertyPanel({ onCollapse }: { onCollapse: () => void }) {
   const catalogEntry = selectedNode ? entries.find(e => e.id === selectedNode.data.catalogId) : undefined;
   const colorClass = selectedNode ? (KIND_COLORS[selectedNode.data.catalogId as string] || KIND_COLORS.default) : KIND_COLORS.default;
   const selectedCatalogId = String(selectedNode?.data.catalogId ?? '');
+  const programProfile = programInfo?.programProfile ?? null;
   const nodeParams = useMemo(
     () => (selectedNode?.data.params as Record<string, unknown> | undefined) ?? {},
     [selectedNode?.data.params],
@@ -481,34 +517,20 @@ export function PropertyPanel({ onCollapse }: { onCollapse: () => void }) {
     }
   }, [handleParamPatch, isRunMode, nodeParams.box_dimensions_m, nodeParams.frame_id, nodeParams.pose, nodeParams.shape_type, selectedCatalogId, selectedNodeId]);
 
-  const isParameterVisible = useCallback((paramName: string): boolean => {
-    if (selectedCatalogId === 'add_collision_object') {
-      const shapeType = String(nodeParams.shape_type ?? '');
-      if (paramName === 'box_dimensions_m') {
-        return shapeType === 'box';
-      }
-      if (paramName === 'sphere_radius_m') {
-        return shapeType === 'sphere';
-      }
-      return true;
-    }
-
-    if (selectedCatalogId !== 'move_manipulator_action') {
-      return true;
-    }
-
-    const motionType = String(nodeParams.motion_type ?? '');
-    if (paramName === 'joint_goal_names' || paramName === 'joint_goal_positions_rad') {
+  const isParameterVisible = useCallback((param: CatalogParameter): boolean => {
+    if (!profileSatisfies(param.profilesMin, programProfile)) {
       return false;
     }
-    if (paramName === 'pose_goal') {
-      return motionType === 'pose_goal';
+    if (param.visibleWhen == null) {
+      return true;
     }
-    if (paramName === 'relative_move') {
-      return motionType === 'relative_move';
-    }
-    return true;
-  }, [nodeParams.motion_type, nodeParams.shape_type, selectedCatalogId]);
+
+    const controllingParam = catalogEntry?.parameters.find(
+      (candidate) => candidate.name === param.visibleWhen?.param,
+    );
+    const controllingValue = nodeParams[param.visibleWhen.param] ?? controllingParam?.default;
+    return valuesEqual(controllingValue, param.visibleWhen.equals);
+  }, [catalogEntry?.parameters, nodeParams, programProfile]);
   const blackboardOutputOptions = collectDeclaredBlackboardOutputOptions(blackboardNamespaces);
   const blackboardKeyOptions = collectBlackboardKeyOptions(blackboardKeys);
   const blackboardFieldOptions = collectBlackboardFieldOptions(blackboardNamespaces);
@@ -1039,8 +1061,13 @@ export function PropertyPanel({ onCollapse }: { onCollapse: () => void }) {
 
       case 'enum':
         {
+          const enumOptions = enumOptionsForProgramProfile(
+            param,
+            programProfile,
+          );
+          const enumValues = enumOptions.map((option) => option.value);
           const normalizedEnumValue =
-            typeof currentValue === 'string' && param.enumValues.includes(currentValue)
+            typeof currentValue === 'string' && enumValues.includes(currentValue)
               ? currentValue
               : '';
         return (
@@ -1051,9 +1078,9 @@ export function PropertyPanel({ onCollapse }: { onCollapse: () => void }) {
             className={`w-full bg-gray-700 border border-gray-600 text-white rounded px-2 py-1 text-sm ${disabledClasses}`}
           >
             <option value="">Select {param.name}</option>
-            {param.enumValues.map((value) => (
-              <option key={value} value={value}>
-                {value}
+            {enumOptions.map((option) => (
+              <option key={option.value} value={option.value}>
+                {option.label}
               </option>
             ))}
           </select>
@@ -1167,7 +1194,7 @@ export function PropertyPanel({ onCollapse }: { onCollapse: () => void }) {
             </div>
           )}
           <div className="space-y-3">
-            {catalogEntry.parameters.filter((param) => isParameterVisible(param.name)).map((param) => {
+            {catalogEntry.parameters.filter((param) => isParameterVisible(param)).map((param) => {
               const currentValue = nodeParams[param.name] ?? param.default;
               const usesInlineProgramParameterBinding =
                 param.name === 'object_id' && SCENE_OBJECT_ID_NODE_IDS.has(selectedCatalogId);

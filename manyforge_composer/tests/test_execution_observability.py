@@ -15,6 +15,7 @@ pytest.importorskip("fastapi")
 
 from fastapi.testclient import TestClient
 
+from manyforge_behavior.capabilities import V0_0_REQUIRED_KEYS
 from manyforge_behavior.kernel_client import MockKernelClient, SceneEditRequest
 from manyforge_composer.backend.app import create_app
 from manyforge_composer.backend.security import SecurityConfig
@@ -103,9 +104,27 @@ def _interrupt_deployment(
             "global_max_tcp_linear_speed_mps": 0.5,
         },
         "adapters": {
-            "planning": {"adapter_id": "planning.test", "adapter_version": "0.1.0", "config": {}},
-            "context": {"adapter_id": "context.test", "adapter_version": "0.1.0", "config": {}},
-            "execution": {"adapter_id": "execution.test", "adapter_version": "0.1.0", "config": {}},
+            "planning": {
+                "adapter_id": "planning.test",
+                "adapter_version": "0.1.0",
+                "supported_profiles": ["v0.0"],
+                "capability_keys": sorted(V0_0_REQUIRED_KEYS),
+                "config": {},
+            },
+            "context": {
+                "adapter_id": "context.test",
+                "adapter_version": "0.1.0",
+                "supported_profiles": ["v0.0"],
+                "capability_keys": [],
+                "config": {},
+            },
+            "execution": {
+                "adapter_id": "execution.test",
+                "adapter_version": "0.1.0",
+                "supported_profiles": ["v0.0"],
+                "capability_keys": [],
+                "config": {},
+            },
         },
         "orchestrator": {"engine": "py_trees", "config": {}},
         "launch": {"runner": {"module": "manyforge_behavior.runner", "args": []}},

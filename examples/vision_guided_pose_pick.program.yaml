@@ -1,5 +1,5 @@
 api_version: manyforge.program.v0
-program_profile: v0.0
+program_profile: v0.1
 name: vision_guided_pose_pick
 description: >-
   Vision-guided pick demonstration that exercises typed blackboard field
@@ -73,7 +73,7 @@ tree:
     - id: query_model
       name: infer_grasp_pose
       params:
-        model_endpoint_alias: gemma4_vlm
+        model_endpoint_alias: vision_model
         prompt_template_id: infer_grasp_pose_v1
         output_key_prefix:
           namespace_ref: grasp_plan

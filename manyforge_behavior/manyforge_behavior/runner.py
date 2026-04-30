@@ -145,11 +145,13 @@ class OrchestratorRunner:
             self._deployment = self._provided_deployment
             self._deployment.validate_against_program(self._program)
             self._deployment.validate_capabilities(self._program)
+            self._deployment.validate_assistant_modes(self._catalog, self._skill_catalog)
         elif self._deployment_path:
             from manyforge_behavior.deployment import Deployment
             self._deployment = Deployment(self._deployment_path)
             self._deployment.validate_against_program(self._program)
             self._deployment.validate_capabilities(self._program)
+            self._deployment.validate_assistant_modes(self._catalog, self._skill_catalog)
 
     def build_tree(self) -> py_trees.trees.BehaviourTree:
         """Build a py_trees BehaviourTree from the loaded program."""

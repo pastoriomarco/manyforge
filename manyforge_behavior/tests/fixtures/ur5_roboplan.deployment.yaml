@@ -46,6 +46,7 @@ adapters:
     capability_keys:
       - execution.trajectory.execute
       - execution.feedback.phase_events
+      - execution.feedback.state_snapshots
       - execution.stop.soft
       - execution.pause
       - execution.resume

@@ -1,6 +1,9 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { api } from '../api/client';
 import type {
+  AssistantConfig,
+  FullDeployment,
+  ModelEndpointCapabilities,
   ModelEndpointCatalog,
   ModelEndpointConfig,
   SceneFrameState,
@@ -159,6 +162,100 @@ function StringListInput({
   );
 }
 
+function CheckboxInput({
+  label,
+  checked,
+  onChange,
+  disabled = false,
+}: {
+  label: string;
+  checked: boolean;
+  onChange: (value: boolean) => void;
+  disabled?: boolean;
+}) {
+  return (
+    <label className="mb-2 flex items-center gap-2 text-sm text-gray-200">
+      <input
+        type="checkbox"
+        checked={checked}
+        onChange={(event) => onChange(event.target.checked)}
+        disabled={disabled}
+      />
+      <span>{label}</span>
+    </label>
+  );
+}
+
+const DEFAULT_MODEL_ENDPOINT_CAPABILITIES: ModelEndpointCapabilities = {
+  supportsResponseTools: false,
+  supportsJsonObject: false,
+  supportsImageInput: false,
+  supportedImageTransports: [],
+  toolCallFamily: '',
+  latencyBudgetMs: null,
+};
+
+function modelEndpointCapabilities(
+  endpoint: ModelEndpointConfig,
+): ModelEndpointCapabilities {
+  return {
+    ...DEFAULT_MODEL_ENDPOINT_CAPABILITIES,
+    ...(endpoint.capabilities ?? {}),
+  };
+}
+
+function deploymentWarnings(deployment: FullDeployment): string[] {
+  const warnings: string[] = [];
+  const endpoints = deployment.modelEndpoints ?? {};
+  const endpointValues = Object.values(endpoints);
+  const anyResponseTools = endpointValues.some(
+    (endpoint) => modelEndpointCapabilities(endpoint).supportsResponseTools,
+  );
+  const anyJsonObject = endpointValues.some(
+    (endpoint) => modelEndpointCapabilities(endpoint).supportsJsonObject,
+  );
+
+  const templates = Object.values(deployment.promptTemplates ?? {});
+  if (templates.some((template) => template.responseTool) && !anyResponseTools) {
+    warnings.push('A prompt template declares a response tool but no model endpoint declares response-tool support.');
+  }
+  if (templates.some((template) => template.outputSchema) && !anyJsonObject) {
+    warnings.push('A prompt template declares JSON schema output but no model endpoint declares JSON-object support.');
+  }
+  for (const [alias, endpoint] of Object.entries(endpoints)) {
+    const capabilities = modelEndpointCapabilities(endpoint);
+    if (endpoint.imageFetchBaseUrl && !capabilities.supportsImageInput) {
+      warnings.push(`Endpoint ${alias} has an image fetch base URL but does not declare image input support.`);
+    }
+    if (
+      capabilities.supportsImageInput
+      && capabilities.supportedImageTransports.length === 0
+    ) {
+      warnings.push(`Endpoint ${alias} declares image input support but no supported image transports.`);
+    }
+  }
+
+  const assistant = deployment.assistant;
+  if (assistant?.enabled && ['nemoclaw', 'openclaw'].includes(assistant.provider)) {
+    const endpoint = endpoints[assistant.endpointAlias];
+    if (!assistant.endpointAlias) {
+      warnings.push(`Assistant provider ${assistant.provider} requires an endpoint alias.`);
+    } else if (!endpoint) {
+      warnings.push(`Assistant endpoint alias ${assistant.endpointAlias} is not configured.`);
+    } else {
+      const capabilities = modelEndpointCapabilities(endpoint);
+      if (!endpoint.baseUrl) {
+        warnings.push(`Assistant endpoint ${assistant.endpointAlias} needs a base URL.`);
+      }
+      if (!capabilities.supportsResponseTools) {
+        warnings.push(`Assistant endpoint ${assistant.endpointAlias} should declare response-tool support.`);
+      }
+    }
+  }
+
+  return warnings;
+}
+
 function FrameMultiSelect({
   label,
   options,
@@ -242,6 +339,16 @@ function ModelEndpointCard({
   onFieldChange: <K extends keyof ModelEndpointConfig>(key: K, value: ModelEndpointConfig[K]) => void;
   onRemove: () => void;
 }) {
+  const capabilities = modelEndpointCapabilities(endpoint);
+  const updateCapabilities = (
+    nextCapabilities: Partial<ModelEndpointCapabilities>,
+  ) => {
+    onFieldChange('capabilities', {
+      ...capabilities,
+      ...nextCapabilities,
+    });
+  };
+
   return (
     <div className="rounded border border-gray-700 bg-gray-900/40 p-3">
       <div className="mb-2 flex items-center justify-between">
@@ -259,6 +366,12 @@ function ModelEndpointCard({
         label="Alias"
         value={alias}
         onChange={onAliasChange}
+        disabled={disabled}
+      />
+      <FieldInput
+        label="Profile Ref"
+        value={endpoint.profileRef ?? ''}
+        onChange={(value) => onFieldChange('profileRef', value)}
         disabled={disabled}
       />
       <FieldInput
@@ -327,6 +440,50 @@ function ModelEndpointCard({
         type="number"
         disabled={disabled}
       />
+      <div className="mt-3 border-t border-gray-700 pt-3">
+        <div className="mb-2 text-xs font-medium uppercase tracking-wide text-gray-400">
+          Declared Capabilities
+        </div>
+        <CheckboxInput
+          label="Response tools"
+          checked={capabilities.supportsResponseTools}
+          onChange={(value) => updateCapabilities({ supportsResponseTools: value })}
+          disabled={disabled}
+        />
+        <CheckboxInput
+          label="JSON object output"
+          checked={capabilities.supportsJsonObject}
+          onChange={(value) => updateCapabilities({ supportsJsonObject: value })}
+          disabled={disabled}
+        />
+        <CheckboxInput
+          label="Image input"
+          checked={capabilities.supportsImageInput}
+          onChange={(value) => updateCapabilities({ supportsImageInput: value })}
+          disabled={disabled}
+        />
+        <StringListInput
+          label="Image Transports"
+          values={capabilities.supportedImageTransports}
+          onChange={(values) => updateCapabilities({ supportedImageTransports: values })}
+          disabled={disabled}
+        />
+        <FieldInput
+          label="Tool Call Family"
+          value={capabilities.toolCallFamily}
+          onChange={(value) => updateCapabilities({ toolCallFamily: value })}
+          disabled={disabled}
+        />
+        <FieldInput
+          label="Latency Budget (ms)"
+          value={capabilities.latencyBudgetMs ?? ''}
+          onChange={(value) => updateCapabilities({
+            latencyBudgetMs: value ? Math.max(1, Math.trunc(Number(value) || 0)) : null,
+          })}
+          type="number"
+          disabled={disabled}
+        />
+      </div>
       <div className="mt-1 text-[11px] text-gray-500">
         Live probe: {probeStatus ?? 'not loaded'}
       </div>
@@ -355,6 +512,14 @@ export function DeploymentPanel() {
   const runtimeApplied = signature(deployment) === signature(appliedDeployment);
   const diskSaved = signature(deployment) === signature(savedDeployment);
   const deploymentModelEndpointSignature = signature(deployment?.modelEndpoints);
+  const endpointAliases = useMemo(
+    () => Object.keys(deployment?.modelEndpoints ?? {}).sort(),
+    [deploymentModelEndpointSignature],
+  );
+  const warnings = useMemo(
+    () => (deployment ? deploymentWarnings(deployment) : []),
+    [deployment],
+  );
 
   useEffect(() => {
     if (!deployment || Object.keys(deployment.modelEndpoints ?? {}).length === 0) {
@@ -466,6 +631,7 @@ export function DeploymentPanel() {
     setModelEndpoints({
       ...deployment.modelEndpoints,
       [alias]: {
+        profileRef: '',
         provider: 'openai',
         modelId: '',
         baseUrl: '',
@@ -473,9 +639,34 @@ export function DeploymentPanel() {
         apiKeyEnv: '',
         defaultTimeoutS: 30,
         maxTokens: 4096,
+        capabilities: { ...DEFAULT_MODEL_ENDPOINT_CAPABILITIES },
       },
     });
   }, [deployment, setModelEndpoints]);
+
+  const updateAssistantField = useCallback(<K extends keyof AssistantConfig>(
+    key: K,
+    value: AssistantConfig[K],
+  ) => {
+    if (!deployment) {
+      return;
+    }
+    setField('assistant', {
+      provider: 'deterministic-scene-authoring',
+      endpointAlias: '',
+      enabled: true,
+      ...(deployment.assistant ?? {}),
+      [key]: value,
+    });
+  }, [deployment, setField]);
+
+  const enableAssistantConfig = useCallback(() => {
+    setField('assistant', {
+      provider: 'deterministic-scene-authoring',
+      endpointAlias: '',
+      enabled: true,
+    });
+  }, [setField]);
 
   if (!deployment) {
     return (
@@ -506,6 +697,14 @@ export function DeploymentPanel() {
           )}
         </div>
       </div>
+
+      {warnings.length > 0 && (
+        <div className="rounded border border-amber-800 bg-amber-950/40 p-3 text-xs text-amber-100 space-y-1">
+          {warnings.map((warning) => (
+            <div key={warning}>{warning}</div>
+          ))}
+        </div>
+      )}
 
       <Section title="General">
         <FieldInput
@@ -709,6 +908,12 @@ export function DeploymentPanel() {
         <div className="mb-2 text-xs text-gray-500">
           Deployment aliases are what nodes reference. They should describe the task role, not the raw model family.
         </div>
+        <FieldInput
+          label="Profile Registry"
+          value={deployment.modelEndpointProfileRegistry ?? ''}
+          onChange={(value) => setField('modelEndpointProfileRegistry', value || null)}
+          disabled={editLocked}
+        />
         {Object.entries(deployment.modelEndpoints ?? {}).length === 0 && (
           <div className="rounded border border-gray-700 bg-gray-900/40 p-3 text-xs text-gray-500">
             No model endpoints configured.
@@ -739,6 +944,58 @@ export function DeploymentPanel() {
         >
           Add Model Endpoint Alias
         </button>
+      </Section>
+
+      <Section title="Assistant">
+        {!deployment.assistant ? (
+          <button
+            type="button"
+            onClick={enableAssistantConfig}
+            disabled={editLocked}
+            className="w-full rounded border border-gray-600 px-3 py-2 text-sm text-gray-200 hover:bg-gray-700 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            Add Assistant Config
+          </button>
+        ) : (
+          <div className="rounded border border-gray-700 bg-gray-900/40 p-3">
+            <CheckboxInput
+              label="Enabled"
+              checked={deployment.assistant.enabled}
+              onChange={(value) => updateAssistantField('enabled', value)}
+              disabled={editLocked}
+            />
+            <label className="block mb-2">
+              <span className="text-xs text-gray-400">Provider</span>
+              <select
+                value={deployment.assistant.provider}
+                onChange={(event) => updateAssistantField('provider', event.target.value)}
+                disabled={editLocked}
+                className="w-full mt-0.5 px-2 py-1 bg-gray-700 border border-gray-600 rounded text-sm text-gray-200 focus:border-blue-500 focus:outline-none disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                <option value="mock">mock</option>
+                <option value="deterministic-scene-authoring">deterministic-scene-authoring</option>
+                <option value="nemoclaw">nemoclaw</option>
+                <option value="openclaw">openclaw</option>
+              </select>
+            </label>
+            <label className="block mb-2">
+              <span className="text-xs text-gray-400">Endpoint Alias</span>
+              <select
+                value={deployment.assistant.endpointAlias}
+                onChange={(event) => updateAssistantField('endpointAlias', event.target.value)}
+                disabled={editLocked || endpointAliases.length === 0}
+                className="w-full mt-0.5 px-2 py-1 bg-gray-700 border border-gray-600 rounded text-sm text-gray-200 focus:border-blue-500 focus:outline-none disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                <option value="">No endpoint</option>
+                {endpointAliases.map((alias) => (
+                  <option key={alias} value={alias}>
+                    {alias}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </div>
+        )}
       </Section>
 
       <button

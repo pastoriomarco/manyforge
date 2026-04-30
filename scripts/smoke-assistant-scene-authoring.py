@@ -7,8 +7,11 @@ The script exercises the deterministic assistant path:
 
 By default it calls the tool functions directly, so live ROS smoke checks can
 run in the ROS-capable image without FastAPI installed.  Use --transport api to
-exercise the Composer assistant endpoints in-process.  With --fixture it uses a
-committed Isaac report fixture, which is the mode used by deterministic tests.
+exercise the Composer assistant endpoints in-process.  Use
+--workflow proposal-lifecycle with --transport api to also validate
+proposal staging and session-patch materialization without mutating the loaded
+program.  With --fixture it uses a committed Isaac report fixture, which is the
+mode used by deterministic tests.
 """
 
 from __future__ import annotations
@@ -17,6 +20,7 @@ import argparse
 import copy
 import json
 import sys
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -47,6 +51,15 @@ def _parse_args() -> argparse.Namespace:
         choices=["direct", "api"],
         default="direct",
         help="direct calls assistant tool functions; api calls Composer endpoints in-process.",
+    )
+    parser.add_argument(
+        "--workflow",
+        choices=["tools", "proposal-lifecycle"],
+        default="tools",
+        help=(
+            "tools validates inspect->propose; proposal-lifecycle additionally "
+            "stages and materializes a scene-resource proposal through Composer."
+        ),
     )
     parser.add_argument(
         "--fixture",
@@ -105,6 +118,8 @@ def _parse_args() -> argparse.Namespace:
 
 
 def _run_smoke(args: argparse.Namespace, repo_root: Path) -> dict[str, Any]:
+    if args.workflow == "proposal-lifecycle" and args.transport != "api":
+        raise RuntimeError("--workflow proposal-lifecycle requires --transport api")
     if args.transport == "direct":
         return _run_direct_smoke(args)
     return _run_api_smoke(args, repo_root)
@@ -203,16 +218,93 @@ def _run_api_smoke(args: argparse.Namespace, repo_root: Path) -> dict[str, Any]:
                 json=propose_payload,
             )
             propose_data = _checked_response(propose_response, "propose_scene_objects")
+            lifecycle_data = (
+                _run_proposal_lifecycle(client, state, propose_data)
+                if args.workflow == "proposal-lifecycle"
+                else None
+            )
 
         return _smoke_result(
+            workflow=args.workflow,
             mode="fixture" if fixture_report is not None else "live",
             transport="api",
             report=report,
             propose_data=propose_data,
             inspect_mutated=inspect_data.get("mutated"),
+            lifecycle_data=lifecycle_data,
         )
     finally:
         routes_assistant.inspect_isaac_scene_report = original_inspector
+
+
+def _run_proposal_lifecycle(
+    client: Any,
+    state: Any,
+    propose_data: dict[str, Any],
+) -> dict[str, Any]:
+    proposals = list(propose_data.get("proposals") or [])
+    scene_resource_proposals = [
+        proposal
+        for proposal in proposals
+        if isinstance(proposal, dict) and proposal.get("type") == "scene_resource_add"
+    ]
+    if not scene_resource_proposals:
+        raise RuntimeError("proposal-lifecycle requires at least one scene_resource_add proposal")
+
+    with tempfile.TemporaryDirectory(prefix="manyforge-assistant-smoke-") as tmp_dir:
+        program_path = _write_minimal_program(Path(tmp_dir))
+        state.load_program(str(program_path))
+
+        before_generation = state.program_session_generation
+        before_scene_count = len(state.program.scene) if state.program else None
+        proposal = scene_resource_proposals[0]
+
+        stage_response = client.post(
+            "/api/assistant/proposals/stage",
+            json={
+                "conversationId": "smoke-assistant-scene-authoring",
+                "proposals": [proposal],
+                "source": {
+                    "kind": "smoke",
+                    "workflow": "proposal-lifecycle",
+                    "transport": "api",
+                },
+            },
+        )
+        stage_data = _checked_response(stage_response, "stage_assistant_proposals")
+        staged = stage_data.get("proposals") or []
+        if len(staged) != 1:
+            raise RuntimeError("proposal staging did not return exactly one proposal")
+
+        proposal_id = staged[0]["proposalId"]
+        materialize_response = client.post(f"/api/assistant/proposals/{proposal_id}/materialize")
+        materialize_data = _checked_response(materialize_response, "materialize_assistant_proposal")
+
+        after_scene_count = len(state.program.scene) if state.program else None
+        if state.program_session_generation != before_generation:
+            raise RuntimeError("proposal lifecycle smoke mutated program session generation")
+        if after_scene_count != before_scene_count:
+            raise RuntimeError("proposal lifecycle smoke mutated loaded program scene")
+
+    return {
+        "stage": {
+            "proposalId": proposal_id,
+            "proposalCount": len(staged),
+            "mutated": stage_data.get("mutated"),
+            "programMutated": stage_data.get("programMutated"),
+        },
+        "materialize": {
+            "proposalId": materialize_data.get("proposalId"),
+            "sessionPatch": materialize_data.get("sessionPatch"),
+            "mutated": materialize_data.get("mutated"),
+            "programMutated": materialize_data.get("programMutated"),
+        },
+        "loadedProgram": {
+            "sceneCountBefore": before_scene_count,
+            "sceneCountAfter": after_scene_count,
+            "sessionGenerationUnchanged": state.program_session_generation == before_generation,
+        },
+    }
 
 
 def _inspection_request(args: argparse.Namespace) -> SimpleNamespace:
@@ -240,9 +332,12 @@ def _smoke_result(
     report: dict[str, Any],
     propose_data: dict[str, Any],
     inspect_mutated: bool | None = False,
+    workflow: str = "tools",
+    lifecycle_data: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    return {
+    result = {
         "success": True,
+        "workflow": workflow,
         "mode": mode,
         "transport": transport,
         "inspect": {
@@ -257,6 +352,9 @@ def _smoke_result(
             "mutated": propose_data.get("mutated"),
         },
     }
+    if lifecycle_data is not None:
+        result["proposalLifecycle"] = lifecycle_data
+    return result
 
 
 def _checked_response(response: Any, label: str) -> dict[str, Any]:
@@ -279,6 +377,32 @@ def _load_fixture(path: str) -> dict[str, Any]:
     if not isinstance(data.get("objects"), list):
         raise RuntimeError("fixture must contain an objects list")
     return data
+
+
+def _write_minimal_program(directory: Path) -> Path:
+    program_path = directory / "assistant_smoke_minimal.program.yaml"
+    program_path.write_text(
+        "\n".join(
+            [
+                "api_version: manyforge.program.v0",
+                "program_profile: v0.0",
+                "name: assistant_smoke_minimal",
+                'catalog_version: "0.1.0"',
+                "description: Minimal program for assistant proposal lifecycle smoke.",
+                "robot:",
+                "  robot_id: ur5",
+                "  group_id: arm",
+                "  base_frame: base_link",
+                "  tcp_frame: tool0",
+                "tree:",
+                "  id: reset_trajectories",
+                "  name: reset_trajectories",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    return program_path
 
 
 def _filter_report_for_request(report: dict[str, Any], request: Any) -> dict[str, Any]:

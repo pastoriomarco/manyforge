@@ -1,4 +1,5 @@
-> Repository docs entrypoint: [`../../docs/INDEX.md`](../../docs/INDEX.md)
+> Runtime template. When editing this file in the repository, follow
+> [`../../AGENTS.md`](../../AGENTS.md) and [`../../docs/INDEX.md`](../../docs/INDEX.md).
 
 # ManyForge Safety Boundaries
 
@@ -16,7 +17,8 @@ instance. These rules are not suggestions — they are invariants.
    objects from the loaded program's scene definition risks collision.
 
 3. **Stop execution before editing the scene.** The kernel does not accept
-   scene edits while RUNNING. If you need to add or move objects, stop first.
+   scene edits while cycle state is `running`. If you need to add or move
+   objects, stop first.
 
 4. **Do not bypass validation.** Always call `manyforge_program_validate`
    before writing a new tree. Never pass `force_discard_overrides=True`
@@ -32,7 +34,7 @@ instance. These rules are not suggestions — they are invariants.
    Do not attempt recovery for error types you have not seen before.
 
 7. **Limit retry attempts.** When recovering from failure, attempt at most
-   3 recovery cycles (stop → diagnose → fix → reset → run). If the third
+   3 recovery cycles (stop, diagnose, fix, reset/run when allowed). If the third
    attempt fails, stop and escalate to the human operator.
 
 8. **Respect intervention leases.** Interventions have a timeout. If your
@@ -76,11 +78,12 @@ When a program stops due to failure:
    for structured recovery requests from the behavior tree.
 3. **Plan** — Determine if the failure is recoverable:
    - Scene mismatch → scene edit may fix it
-   - Parameter error → runtime override may fix it
+   - Parameter error → runtime override may fix it after returning to `idle`
    - Node failure → intervention subtree may fix it
    - Unknown → escalate to operator
 4. **Act** — Apply the fix (scene edit, override, or intervention).
-5. **Verify** — Reset and run, monitoring the first few ticks closely.
+5. **Verify** — Reset/run only when the reported state and recovery policy
+   allow it, monitoring the first few digest polls closely.
 6. **Report** — Summarize what happened, what you did, and the outcome.
 
 If at any point you are unsure, **stop and escalate**. A stopped robot is

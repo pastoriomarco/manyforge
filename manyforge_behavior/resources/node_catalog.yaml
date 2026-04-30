@@ -247,20 +247,37 @@ entries:
         type: enum
         required: true
         enum_values: [joint_goal, pose_goal, relative_move]
+        enum_options:
+          - value: joint_goal
+          - value: pose_goal
+          - value: relative_move
+            profiles:
+              min_profile: v0.1
+            required_capabilities:
+              - context.pose.resolve_reference
         description: The type of motion to plan.
       - name: joint_goal_names
         type: string_list
         required: false
+        visible_when:
+          param: motion_type
+          equals: joint_goal
         description: >-
           Joint names for joint_goal motion type. Required when motion_type=joint_goal.
       - name: joint_goal_positions_rad
         type: float_list
         required: false
+        visible_when:
+          param: motion_type
+          equals: joint_goal
         description: >-
           Joint positions in radians for joint_goal. Required when motion_type=joint_goal.
       - name: pose_goal
         type: pose
         required: false
+        visible_when:
+          param: motion_type
+          equals: pose_goal
         ui_editor: pose_or_blackboard_field_selector
         blackboard_role: field_reader
         blackboard_value_type: pose
@@ -271,6 +288,11 @@ entries:
       - name: relative_move
         type: dict
         required: false
+        profiles:
+          min_profile: v0.1
+        visible_when:
+          param: motion_type
+          equals: relative_move
         ui_editor: relative_move
         description: >-
           Relative move goal for motion_type=relative_move. Structure:
@@ -444,11 +466,17 @@ entries:
       - name: box_dimensions_m
         type: float_list
         required: false
+        visible_when:
+          param: shape_type
+          equals: box
         description: >-
           Box full dimensions [x, y, z] in meters (required when shape_type=box).
       - name: sphere_radius_m
         type: float
         required: false
+        visible_when:
+          param: shape_type
+          equals: sphere
         constraints:
           min_exclusive: 0.0
         description: Sphere radius in meters (required when shape_type=sphere).
@@ -562,7 +590,7 @@ entries:
       re-adds it attached to the link frame for collision-aware planning.
     tags: [scene, collision, attach]
     profiles:
-      min_profile: v0.0
+      min_profile: v0.1
     kind: leaf
     children:
       min: 0
@@ -592,6 +620,7 @@ entries:
     required_capabilities:
       - scene.edit.add
       - scene.edit.remove
+      - scene.edit.attach_detach
       - context.kinematics.fk
     execution:
       blocking: true
@@ -615,7 +644,7 @@ entries:
       transform, then removes from link and re-adds at world position.
     tags: [scene, collision, detach]
     profiles:
-      min_profile: v0.0
+      min_profile: v0.1
     kind: leaf
     children:
       min: 0
@@ -638,6 +667,7 @@ entries:
     required_capabilities:
       - scene.edit.add
       - scene.edit.remove
+      - scene.edit.attach_detach
       - context.kinematics.fk
     execution:
       blocking: true

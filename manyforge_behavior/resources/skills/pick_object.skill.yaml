@@ -6,7 +6,7 @@ description: >-
   Pick an object from the scene by approaching from above, closing the gripper,
   attaching the object to the TCP, retreating upward, and invalidating the
   trajectory cache after the scene geometry changes.
-compatible_profiles: [v0.0]
+compatible_profiles: [v0.1]
 
 requires:
   - "object must exist in the backend scene"
@@ -27,8 +27,10 @@ modifies:
 requires_capabilities:
   - planning.motion.pose_goal
   - context.kinematics.fk
+  - context.pose.resolve_reference
   - scene.edit.add
   - scene.edit.remove
+  - scene.edit.attach_detach
   - execution.trajectory.execute
 
 parameters:

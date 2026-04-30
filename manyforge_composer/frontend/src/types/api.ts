@@ -13,14 +13,30 @@ export interface VelocityScaleResponse {
 }
 
 // Catalog
+export interface CatalogEnumOption {
+  value: string;
+  label?: string | null;
+  description: string;
+  profilesMin: string;
+  requiredCapabilities: string[];
+}
+
+export interface CatalogVisibleWhen {
+  param: string;
+  equals: unknown;
+}
+
 export interface CatalogParameter {
   name: string;
   type: string;
   required: boolean;
   default: unknown;
   enumValues: string[];
+  enumOptions: CatalogEnumOption[];
   constraints: Record<string, unknown>;
   parameterizable: boolean;
+  profilesMin: string;
+  visibleWhen?: CatalogVisibleWhen | null;
   uiEditor?: string | null;
   blackboardRole?: string | null;
   blackboardContract?: string | null;
@@ -196,7 +212,17 @@ export interface ModelAuditPolicy {
   redactArgumentValues: boolean;
 }
 
+export interface ModelEndpointCapabilities {
+  supportsResponseTools: boolean;
+  supportsJsonObject: boolean;
+  supportsImageInput: boolean;
+  supportedImageTransports: string[];
+  toolCallFamily: string;
+  latencyBudgetMs?: number | null;
+}
+
 export interface ModelEndpointConfig {
+  profileRef?: string;
   provider: string;
   modelId: string;
   baseUrl?: string | null;
@@ -204,6 +230,41 @@ export interface ModelEndpointConfig {
   apiKeyEnv?: string | null;
   defaultTimeoutS: number;
   maxTokens: number;
+  capabilities: ModelEndpointCapabilities;
+}
+
+export interface AssistantConfig {
+  provider: string;
+  endpointAlias: string;
+  enabled: boolean;
+}
+
+export type AssistantToolEffect = 'read_only' | 'proposal' | 'runtime_mutating';
+
+export interface AssistantToolDefinition {
+  id: string;
+  effect: AssistantToolEffect;
+  description: string;
+  [key: string]: unknown;
+}
+
+export interface AssistantModeAuthority {
+  sessionKind: 'manual_intervention' | 'delegated_recovery' | 'not_applicable';
+  approvalMode: 'human_approved' | 'policy_granted';
+  review: 'required' | 'bounded_by_recovery_profile' | 'not_required';
+}
+
+export interface AssistantModeCatalog {
+  skills: string[];
+  tools: string[];
+  nodes: string[];
+}
+
+export interface AssistantModeDefinition {
+  enabled: boolean;
+  description: string;
+  authority: AssistantModeAuthority;
+  catalog: AssistantModeCatalog;
 }
 
 export interface PromptTemplateConfig {
@@ -272,7 +333,11 @@ export interface FullDeployment {
   orchestrator: OrchestratorConfig;
   launch: LaunchConfig;
   modelAuditPolicy?: ModelAuditPolicy | null;
+  modelEndpointProfileRegistry?: string | null;
   modelEndpoints: Record<string, ModelEndpointConfig>;
+  assistant?: AssistantConfig | null;
+  assistantModes: Record<string, AssistantModeDefinition>;
+  toolCatalog: AssistantToolDefinition[];
   promptTemplates: Record<string, PromptTemplateConfig>;
   interruptSources: Record<string, InterruptSourceConfig>;
   authorityMatrix: Record<string, AuthorityDomainConfig>;
@@ -381,6 +446,7 @@ export interface ModelEndpointProbe {
   provider: string;
   configuredModelId: string;
   baseUrl?: string | null;
+  capabilities: ModelEndpointCapabilities;
   probeStatus: string;
   availableModelIds: string[];
   error?: string | null;

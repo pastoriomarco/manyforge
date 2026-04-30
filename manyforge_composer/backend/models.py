@@ -5,6 +5,7 @@ from typing import Any, Optional, List, Dict, Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 _ALIAS_CFG = ConfigDict(populate_by_name=True)
+_ALIAS_EXTRA_CFG = ConfigDict(populate_by_name=True, extra="allow")
 
 
 # --- Cycle ---
@@ -28,6 +29,20 @@ class CycleCommandResponse(BaseModel):
 
 
 # --- Catalog ---
+class CatalogEnumOptionResponse(BaseModel):
+    model_config = _ALIAS_CFG
+    value: str
+    label: Optional[str] = None
+    description: str = ""
+    profiles_min: str = Field(default="v0.0", alias="profilesMin")
+    required_capabilities: List[str] = Field(default_factory=list, alias="requiredCapabilities")
+
+
+class CatalogVisibleWhenResponse(BaseModel):
+    param: str
+    equals: Any
+
+
 class CatalogParameterResponse(BaseModel):
     model_config = _ALIAS_CFG
     name: str
@@ -35,8 +50,17 @@ class CatalogParameterResponse(BaseModel):
     required: bool
     default: Any = None
     enum_values: List[str] = Field(default_factory=list, alias="enumValues")
+    enum_options: List[CatalogEnumOptionResponse] = Field(
+        default_factory=list,
+        alias="enumOptions",
+    )
     constraints: Dict[str, Any] = Field(default_factory=dict)
     parameterizable: bool = False
+    profiles_min: str = Field(default="v0.0", alias="profilesMin")
+    visible_when: Optional[CatalogVisibleWhenResponse] = Field(
+        default=None,
+        alias="visibleWhen",
+    )
     ui_editor: Optional[str] = Field(default=None, alias="uiEditor")
     blackboard_role: Optional[str] = Field(default=None, alias="blackboardRole")
     blackboard_contract: Optional[str] = Field(default=None, alias="blackboardContract")
@@ -337,6 +361,7 @@ class SkillResponse(BaseModel):
     provides: List[str]
     modifies: List[str]
     requires_capabilities: List[str] = Field(alias="requiresCapabilities")
+    requires_tools: List[str] = Field(default_factory=list, alias="requiresTools")
     parameters: List[SkillParameterResponse]
     body: Dict[str, Any]
     expands_to: Dict[str, Any] = Field(alias="expandsTo")
@@ -509,8 +534,22 @@ class ModelAuditPolicyResponse(BaseModel):
     redact_argument_values: bool = Field(default=True, alias="redactArgumentValues")
 
 
+class ModelEndpointCapabilitiesResponse(BaseModel):
+    model_config = _ALIAS_CFG
+    supports_response_tools: bool = Field(default=False, alias="supportsResponseTools")
+    supports_json_object: bool = Field(default=False, alias="supportsJsonObject")
+    supports_image_input: bool = Field(default=False, alias="supportsImageInput")
+    supported_image_transports: List[str] = Field(
+        default_factory=list,
+        alias="supportedImageTransports",
+    )
+    tool_call_family: str = Field(default="", alias="toolCallFamily")
+    latency_budget_ms: Optional[int] = Field(default=None, alias="latencyBudgetMs")
+
+
 class ModelEndpointResponse(BaseModel):
     model_config = _ALIAS_CFG
+    profile_ref: str = Field(default="", alias="profileRef")
     provider: str
     model_id: str = Field(alias="modelId")
     base_url: Optional[str] = Field(default=None, alias="baseUrl")
@@ -518,6 +557,56 @@ class ModelEndpointResponse(BaseModel):
     api_key_env: Optional[str] = Field(default=None, alias="apiKeyEnv")
     default_timeout_s: float = Field(default=30.0, alias="defaultTimeoutS")
     max_tokens: int = Field(default=4096, alias="maxTokens")
+    capabilities: ModelEndpointCapabilitiesResponse = Field(
+        default_factory=ModelEndpointCapabilitiesResponse,
+    )
+
+
+class AssistantConfigResponse(BaseModel):
+    model_config = _ALIAS_CFG
+    provider: str
+    endpoint_alias: str = Field(default="", alias="endpointAlias")
+    enabled: bool = True
+
+
+class AssistantToolDefinitionResponse(BaseModel):
+    model_config = _ALIAS_EXTRA_CFG
+    id: str
+    effect: Literal["read_only", "proposal", "runtime_mutating"]
+    description: str = ""
+
+
+class AssistantModeAuthorityResponse(BaseModel):
+    model_config = _ALIAS_CFG
+    session_kind: Literal[
+        "manual_intervention",
+        "delegated_recovery",
+        "not_applicable",
+    ] = Field(alias="sessionKind")
+    approval_mode: Literal[
+        "human_approved",
+        "policy_granted",
+    ] = Field(alias="approvalMode")
+    review: Literal[
+        "required",
+        "bounded_by_recovery_profile",
+        "not_required",
+    ]
+
+
+class AssistantModeCatalogResponse(BaseModel):
+    model_config = _ALIAS_CFG
+    skills: List[str] = Field(default_factory=list)
+    tools: List[str] = Field(default_factory=list)
+    nodes: List[str] = Field(default_factory=list)
+
+
+class AssistantModeResponse(BaseModel):
+    model_config = _ALIAS_CFG
+    enabled: bool = True
+    description: str
+    authority: AssistantModeAuthorityResponse
+    catalog: AssistantModeCatalogResponse
 
 
 class PromptTemplateResponse(BaseModel):
@@ -561,9 +650,22 @@ class FullDeploymentResponse(BaseModel):
         default=None,
         alias="modelAuditPolicy",
     )
+    model_endpoint_profile_registry: Optional[str] = Field(
+        default=None,
+        alias="modelEndpointProfileRegistry",
+    )
     model_endpoints: Dict[str, ModelEndpointResponse] = Field(
         default_factory=dict,
         alias="modelEndpoints",
+    )
+    assistant: Optional[AssistantConfigResponse] = None
+    assistant_modes: Dict[str, AssistantModeResponse] = Field(
+        default_factory=dict,
+        alias="assistantModes",
+    )
+    tool_catalog: List[AssistantToolDefinitionResponse] = Field(
+        default_factory=list,
+        alias="toolCatalog",
     )
     prompt_templates: Dict[str, PromptTemplateResponse] = Field(
         default_factory=dict,
@@ -586,6 +688,9 @@ class ModelEndpointProbeResponse(BaseModel):
     provider: str
     configured_model_id: str = Field(alias="configuredModelId")
     base_url: Optional[str] = Field(default=None, alias="baseUrl")
+    capabilities: ModelEndpointCapabilitiesResponse = Field(
+        default_factory=ModelEndpointCapabilitiesResponse,
+    )
     probe_status: str = Field(alias="probeStatus")
     available_model_ids: List[str] = Field(default_factory=list, alias="availableModelIds")
     error: Optional[str] = None
@@ -607,6 +712,19 @@ class UpdateDeploymentRequest(BaseModel):
     adapters: Optional[Dict[str, Dict[str, Any]]] = None
     orchestrator: Optional[Dict[str, Any]] = None
     launch: Optional[Dict[str, Any]] = None
+    model_endpoints: Optional[Dict[str, Dict[str, Any]]] = Field(
+        None,
+        alias="modelEndpoints",
+    )
+    assistant: Optional[Dict[str, Any]] = None
+    assistant_modes: Optional[Dict[str, Dict[str, Any]]] = Field(
+        None,
+        alias="assistantModes",
+    )
+    tool_catalog: Optional[List[Dict[str, Any]]] = Field(
+        None,
+        alias="toolCatalog",
+    )
     authority_matrix: Optional[Dict[str, Dict[str, Any]]] = Field(
         None,
         alias="authorityMatrix",
@@ -1019,8 +1137,10 @@ class DebugSignalPublishRequest(BaseModel):
 class AssistantChatRequest(BaseModel):
     model_config = _ALIAS_CFG
     message: str = Field(min_length=1)
-    mode: Literal["mock"] = "mock"
+    mode: Literal["mock", "provider"] = "mock"
+    provider_id: Optional[str] = Field(default=None, alias="providerId")
     conversation_id: Optional[str] = Field(default=None, alias="conversationId")
+    assistant_mode: Optional[str] = Field(default=None, alias="assistantMode")
     context: Dict[str, Any] = Field(default_factory=dict)
     requested_tools: List[str] = Field(default_factory=list, alias="requestedTools")
 
@@ -1056,7 +1176,9 @@ class AssistantToolCallResponse(BaseModel):
 class AssistantChatResponse(BaseModel):
     model_config = _ALIAS_CFG
     conversation_id: str = Field(alias="conversationId")
-    mode: Literal["mock"]
+    mode: Literal["mock", "provider"]
+    provider_id: str = Field(alias="providerId")
+    assistant_mode: Optional[str] = Field(default=None, alias="assistantMode")
     message: str
     proposals: List[AssistantProposalResponse] = Field(default_factory=list)
     tool_calls: List[AssistantToolCallResponse] = Field(default_factory=list, alias="toolCalls")
@@ -1080,6 +1202,40 @@ class AssistantToolDescriptorResponse(BaseModel):
 class AssistantToolCatalogResponse(BaseModel):
     model_config = _ALIAS_CFG
     tools: List[AssistantToolDescriptorResponse] = Field(default_factory=list)
+
+
+class AssistantBridgeToolRequest(BaseModel):
+    model_config = _ALIAS_CFG
+    request_id: str = Field(alias="requestId", min_length=1)
+    conversation_id: Optional[str] = Field(default=None, alias="conversationId")
+    assistant_mode: str = Field(alias="assistantMode", min_length=1)
+    catalog_hash: str = Field(alias="catalogHash", min_length=1)
+    arguments: Dict[str, Any] = Field(default_factory=dict)
+
+
+class AssistantBridgeToolResponse(BaseModel):
+    model_config = _ALIAS_CFG
+    tool_id: str = Field(alias="toolId")
+    success: bool
+    result: Dict[str, Any] = Field(default_factory=dict)
+    error: Optional[str] = None
+    mutated: bool = False
+    timestamp_ns: int = Field(alias="timestampNs")
+
+
+class AssistantProviderDescriptorResponse(BaseModel):
+    model_config = _ALIAS_CFG
+    id: str
+    description: str
+    configured: bool = False
+    requires_live_model: bool = Field(default=False, alias="requiresLiveModel")
+    requires_live_isaac_sim: bool = Field(default=False, alias="requiresLiveIsaacSim")
+
+
+class AssistantProviderCatalogResponse(BaseModel):
+    model_config = _ALIAS_CFG
+    providers: List[AssistantProviderDescriptorResponse] = Field(default_factory=list)
+    configured_provider_id: Optional[str] = Field(default=None, alias="configuredProviderId")
 
 
 class AssistantInspectIsaacSceneRequest(BaseModel):
@@ -1133,6 +1289,80 @@ class AssistantProposeSceneObjectsResponse(BaseModel):
     )
     warnings: List[str] = Field(default_factory=list)
     mutated: bool = False
+    timestamp_ns: int = Field(alias="timestampNs")
+
+
+class AssistantProposeSceneObjectNodesRequest(BaseModel):
+    model_config = _ALIAS_CFG
+    scene_resources: List[ProgramSceneResourceResponse] = Field(alias="sceneResources")
+    operations: List[
+        Literal[
+            "add_collision_object",
+            "remove_collision_object",
+            "attach_object_to_link",
+            "detach_object_from_link",
+        ]
+    ] = Field(default_factory=lambda: ["add_collision_object"])
+    link_frame: str = Field(default="tool0", alias="linkFrame")
+    gripper_id: Optional[str] = Field(default=None, alias="gripperId")
+    name_prefix: str = Field(default="", alias="namePrefix")
+
+
+class AssistantProposeSceneObjectNodesResponse(BaseModel):
+    model_config = _ALIAS_CFG
+    tool_name: str = Field(alias="toolName")
+    proposals: List[AssistantProposalResponse] = Field(default_factory=list)
+    tree_nodes: List[TreeNodeResponse] = Field(default_factory=list, alias="treeNodes")
+    warnings: List[str] = Field(default_factory=list)
+    mutated: bool = False
+    timestamp_ns: int = Field(alias="timestampNs")
+
+
+class AssistantProposalStageRequest(BaseModel):
+    model_config = _ALIAS_CFG
+    conversation_id: str = Field(alias="conversationId", min_length=1)
+    proposals: List[AssistantProposalResponse] = Field(min_length=1)
+    source: Dict[str, Any] = Field(default_factory=dict)
+
+
+class AssistantProposalRecordResponse(BaseModel):
+    model_config = _ALIAS_CFG
+    proposal_id: str = Field(alias="proposalId")
+    conversation_id: str = Field(alias="conversationId")
+    lifecycle_status: Literal["staged", "discarded", "applied"] = Field(alias="lifecycleStatus")
+    proposal: AssistantProposalResponse
+    source: Dict[str, Any] = Field(default_factory=dict)
+    created_at_ns: int = Field(alias="createdAtNs")
+    updated_at_ns: int = Field(alias="updatedAtNs")
+
+
+class AssistantProposalStageResponse(BaseModel):
+    model_config = _ALIAS_CFG
+    conversation_id: str = Field(alias="conversationId")
+    proposals: List[AssistantProposalRecordResponse] = Field(default_factory=list)
+    mutated: bool = False
+    program_mutated: bool = Field(default=False, alias="programMutated")
+    timestamp_ns: int = Field(alias="timestampNs")
+
+
+class AssistantProposalListResponse(BaseModel):
+    model_config = _ALIAS_CFG
+    proposals: List[AssistantProposalRecordResponse] = Field(default_factory=list)
+    timestamp_ns: int = Field(alias="timestampNs")
+
+
+class AssistantProposalDiscardRequest(BaseModel):
+    model_config = _ALIAS_CFG
+    reason: str = ""
+
+
+class AssistantProposalMaterializeResponse(BaseModel):
+    model_config = _ALIAS_CFG
+    proposal_id: str = Field(alias="proposalId")
+    proposal: AssistantProposalResponse
+    session_patch: Dict[str, Any] = Field(alias="sessionPatch")
+    mutated: bool = False
+    program_mutated: bool = Field(default=False, alias="programMutated")
     timestamp_ns: int = Field(alias="timestampNs")
 
 

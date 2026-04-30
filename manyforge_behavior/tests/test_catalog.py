@@ -45,6 +45,21 @@ class TestCatalogLoading:
         assert len(move.parameters) > 0
         move_id_param = next(p for p in move.parameters if p.name == "move_id")
         assert move_id_param.required is True
+        motion_type_param = next(p for p in move.parameters if p.name == "motion_type")
+        relative_move_option = next(
+            option
+            for option in motion_type_param.enum_options
+            if option.value == "relative_move"
+        )
+        assert relative_move_option.profiles_min == "v0.1"
+        assert relative_move_option.required_capabilities == [
+            "context.pose.resolve_reference"
+        ]
+        relative_move_param = next(p for p in move.parameters if p.name == "relative_move")
+        assert relative_move_param.profiles_min == "v0.1"
+        assert relative_move_param.visible_when is not None
+        assert relative_move_param.visible_when.param == "motion_type"
+        assert relative_move_param.visible_when.equals == "relative_move"
 
     def test_blackboard_metadata_loaded_for_shipped_entries(self):
         catalog = NodeCatalog(CATALOG_PATH)
@@ -75,8 +90,11 @@ class TestCatalogLoading:
         catalog = NodeCatalog(CATALOG_PATH)
         v0_entries = catalog.filter_by_profile("v0.0")
         assert all(entry.profiles_min == "v0.0" for entry in v0_entries)
-        assert "command_gripper" not in {entry.id for entry in v0_entries}
-        assert len(v0_entries) == len(catalog.entries) - 1
+        v0_ids = {entry.id for entry in v0_entries}
+        assert "command_gripper" not in v0_ids
+        assert "attach_object_to_link" not in v0_ids
+        assert "detach_object_from_link" not in v0_ids
+        assert len(v0_entries) == len(catalog.entries) - 3
 
     def test_command_gripper_is_marked_experimental(self):
         catalog = NodeCatalog(CATALOG_PATH)
@@ -202,6 +220,149 @@ class TestCatalogValidation:
             NodeCatalog(path)
         os.unlink(path)
 
+    def test_derives_enum_values_from_enum_options(self):
+        path = self._write_catalog({
+            "api_version": "manyforge.node_catalog.v0",
+            "catalog_version": "0.1.0",
+            "entries": [
+                {
+                    "id": "enum_options_node",
+                    "name": "EnumOptionsNode",
+                    "kind": "leaf",
+                    "children": {"min": 0, "max": 0},
+                    "parameters": [
+                        {
+                            "name": "mode",
+                            "type": "enum",
+                            "required": True,
+                            "enum_options": [
+                                {"value": "a"},
+                                {"value": "b", "profiles": {"min_profile": "v0.1"}},
+                            ],
+                        },
+                    ],
+                    "runners": {"py_trees": {"implementation_kind": "plugin"}},
+                },
+            ],
+        })
+        try:
+            param = NodeCatalog(path).get("enum_options_node").parameters[0]
+            assert param.enum_values == ["a", "b"]
+            assert [option.value for option in param.enum_options] == ["a", "b"]
+            assert param.enum_options[1].profiles_min == "v0.1"
+        finally:
+            os.unlink(path)
+
+    def test_rejects_enum_values_that_do_not_match_enum_options(self):
+        path = self._write_catalog({
+            "api_version": "manyforge.node_catalog.v0",
+            "catalog_version": "0.1.0",
+            "entries": [
+                {
+                    "id": "bad_enum_options",
+                    "name": "BadEnumOptions",
+                    "kind": "leaf",
+                    "children": {"min": 0, "max": 0},
+                    "parameters": [
+                        {
+                            "name": "mode",
+                            "type": "enum",
+                            "required": True,
+                            "enum_values": ["a", "b"],
+                            "enum_options": [{"value": "a"}, {"value": "c"}],
+                        },
+                    ],
+                    "runners": {"py_trees": {"implementation_kind": "plugin"}},
+                },
+            ],
+        })
+        with pytest.raises(CatalogValidationError, match="enum_values must match"):
+            NodeCatalog(path)
+        os.unlink(path)
+
+    def test_rejects_duplicate_enum_options(self):
+        path = self._write_catalog({
+            "api_version": "manyforge.node_catalog.v0",
+            "catalog_version": "0.1.0",
+            "entries": [
+                {
+                    "id": "bad_duplicate_enum_options",
+                    "name": "BadDuplicateEnumOptions",
+                    "kind": "leaf",
+                    "children": {"min": 0, "max": 0},
+                    "parameters": [
+                        {
+                            "name": "mode",
+                            "type": "enum",
+                            "required": True,
+                            "enum_options": [{"value": "a"}, {"value": "a"}],
+                        },
+                    ],
+                    "runners": {"py_trees": {"implementation_kind": "plugin"}},
+                },
+            ],
+        })
+        with pytest.raises(CatalogValidationError, match="duplicate"):
+            NodeCatalog(path)
+        os.unlink(path)
+
+    def test_rejects_unknown_enum_option_required_capability(self):
+        path = self._write_catalog({
+            "api_version": "manyforge.node_catalog.v0",
+            "catalog_version": "0.1.0",
+            "entries": [
+                {
+                    "id": "bad_enum_option_capability",
+                    "name": "BadEnumOptionCapability",
+                    "kind": "leaf",
+                    "children": {"min": 0, "max": 0},
+                    "parameters": [
+                        {
+                            "name": "mode",
+                            "type": "enum",
+                            "required": True,
+                            "enum_options": [
+                                {
+                                    "value": "a",
+                                    "required_capabilities": ["unknown.capability.key"],
+                                },
+                            ],
+                        },
+                    ],
+                    "runners": {"py_trees": {"implementation_kind": "plugin"}},
+                },
+            ],
+        })
+        with pytest.raises(CatalogValidationError, match="unknown required_capabilities"):
+            NodeCatalog(path)
+        os.unlink(path)
+
+    def test_rejects_visible_when_unknown_parameter(self):
+        path = self._write_catalog({
+            "api_version": "manyforge.node_catalog.v0",
+            "catalog_version": "0.1.0",
+            "entries": [
+                {
+                    "id": "bad_visible_when",
+                    "name": "BadVisibleWhen",
+                    "kind": "leaf",
+                    "children": {"min": 0, "max": 0},
+                    "parameters": [
+                        {
+                            "name": "value",
+                            "type": "string",
+                            "required": False,
+                            "visible_when": {"param": "missing", "equals": "x"},
+                        },
+                    ],
+                    "runners": {"py_trees": {"implementation_kind": "plugin"}},
+                },
+            ],
+        })
+        with pytest.raises(CatalogValidationError, match="visible_when.param"):
+            NodeCatalog(path)
+        os.unlink(path)
+
     def test_rejects_missing_py_trees_runner(self):
         path = self._write_catalog({
             "api_version": "manyforge.node_catalog.v0",
@@ -217,6 +378,25 @@ class TestCatalogValidation:
             ],
         })
         with pytest.raises(CatalogValidationError, match="py_trees"):
+            NodeCatalog(path)
+        os.unlink(path)
+
+    def test_rejects_unknown_required_capability(self):
+        path = self._write_catalog({
+            "api_version": "manyforge.node_catalog.v0",
+            "catalog_version": "0.1.0",
+            "entries": [
+                {
+                    "id": "bad_capability",
+                    "name": "BadCapability",
+                    "kind": "leaf",
+                    "children": {"min": 0, "max": 0},
+                    "required_capabilities": ["unknown.capability.key"],
+                    "runners": {"py_trees": {"implementation_kind": "plugin"}},
+                },
+            ],
+        })
+        with pytest.raises(CatalogValidationError, match="unknown required_capabilities"):
             NodeCatalog(path)
         os.unlink(path)
 

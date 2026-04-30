@@ -31,6 +31,10 @@ client's server list:
 
 ## Tools
 
+The live MCP `tools/list` response is the source of truth for exact input
+schemas. Keep this reference and `scripts/templates/AGENTS.md` aligned with
+`manyforge_composer/backend/mcp_server.py` when the tool surface changes.
+
 ### manyforge_scene_state
 
 Get the full scene state including robot joint positions, TCP pose, and all
@@ -72,6 +76,23 @@ motion node.
 
 ---
 
+### manyforge_scene_snapshot
+
+Render the current 3D scene as a base64-encoded image.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `width` | integer | no | Image width in pixels, default 640 |
+| `height` | integer | no | Image height in pixels, default 480 |
+| `format` | string | no | Image format, default `"jpeg"` |
+
+**Returns**: `image_base64`, `width`, `height`, `format`, and `timestamp_ns`.
+Requires an HMI/rendering backend.
+
+**REST equivalent**: `GET /api/scene/snapshot`
+
+---
+
 ### manyforge_program_load
 
 Load a program and optional deployment from YAML files on disk.
@@ -80,6 +101,7 @@ Load a program and optional deployment from YAML files on disk.
 |-----------|------|----------|-------------|
 | `program_path` | string | yes | Absolute path to `.program.yaml` |
 | `deployment_path` | string | no | Absolute path to `.deployment.yaml` |
+| `force_discard_overrides` | boolean | no | Discard existing runtime overrides when loading |
 
 **Returns**: Program metadata (name, description, robot config, counts).
 
@@ -95,13 +117,14 @@ Read or replace the current behavior tree.
 |-----------|------|----------|-------------|
 | `action` | string | yes | `"read"` or `"write"` |
 | `tree` | object | for write | Nested tree dict with `id`, `name`, `params`, `children` |
+| `force_discard_overrides` | boolean | no | Discard existing runtime overrides when writing |
 
 **Returns**: For read: `{"tree": {...}}`. For write: `{"status": "ok"}`.
 
 **REST equivalents**: `GET /api/program/tree`, `PUT /api/program/tree`
 
 **Rules**:
-- Cannot write while execution is RUNNING (returns error)
+- Cannot write while cycle state is `running`
 - Always call `manyforge_program_validate` before writing
 
 ---
@@ -122,6 +145,20 @@ Validate a candidate behavior tree without applying it (dry-run).
 
 ---
 
+### manyforge_program_save
+
+Save the currently loaded program to disk.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `path` | string | no | Target `.program.yaml` path; defaults to the loaded source path |
+
+**Returns**: `{"status": "ok", "path": "..."}` or an `"error"` key.
+
+**REST equivalent**: `POST /api/program/save`
+
+---
+
 ### manyforge_cycle_control
 
 Control program execution lifecycle.
@@ -131,11 +168,12 @@ Control program execution lifecycle.
 | `command` | string | yes | `"run"`, `"stop"`, `"reset"`, `"status"`, `"velocity"` |
 | `velocity_scale` | float | for velocity | 0.0 to 1.0 |
 
-**State machine**: `IDLE` -> `RUNNING` -> `STOPPED` -> `IDLE` (via reset).
-During interventions, state is `DIRECT_CONTROL`.
+Returned cycle states include `idle`, `running`, `stopped`,
+`interrupt_handler`, and `direct_control`. Kernel terminal acknowledgement is
+runtime-owned and is not a behavior-tree authoring action.
 
 **Returns**: Current state (`"idle"`, `"running"`, `"stopped"`,
-`"direct_control"`) or velocity scale.
+`"interrupt_handler"`, `"direct_control"`) or velocity scale.
 
 **REST equivalents**: `POST /api/cycle/run`, `POST /api/cycle/stop`,
 `POST /api/cycle/reset`, `GET /api/cycle/status`,
@@ -145,8 +183,8 @@ During interventions, state is `DIRECT_CONTROL`.
 to pause execution instead.
 
 **Runtime-override interaction**:
-- `run` auto-activates staged runtime overrides only from `IDLE`.
-- `run` from `STOPPED` is rejected if staged runtime overrides exist; reset
+- `run` auto-activates staged runtime overrides only from `idle`.
+- `run` from `stopped` is rejected if staged runtime overrides exist; reset
   first so the paused tree is not resumed against a different effective
   program snapshot.
 
@@ -179,12 +217,31 @@ Get the skill catalog — validated subtree templates for common operations.
 | *(none)* | | | |
 
 **Returns**: List of skills with `id`, `name`, `description`, `parameters`,
-`requires`/`provides`/`modifies` contracts, `body` (raw node subtree),
-legacy alias `expands_to`, and `example`.
+`requires`/`provides`/`modifies` contracts, `requires_capabilities`,
+`requires_tools`, `body` (raw node subtree), legacy alias `expands_to`, and
+`example`.
 
 **REST equivalent**: `GET /api/skills`
 
 **Prefer skills over raw nodes** for standard operations like pick/place.
+
+---
+
+### manyforge_deployment
+
+Get the currently loaded deployment configuration.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| *(none)* | | | |
+
+**Returns**: Robot adapters, capability keys, the optional model endpoint
+profile registry reference, resolved model endpoints with declared model
+capability metadata, Composer assistant config, prompt templates, audit policy,
+and deployment source metadata. Returns an `"error"` key when no deployment is
+loaded.
+
+**REST equivalent**: `GET /api/deployment/full`
 
 ---
 
@@ -194,23 +251,26 @@ Execute, monitor, or abort a temporary intervention subtree.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `action` | string | yes | `"execute"`, `"status"`, `"pending_recovery"`, `"abort"`, `"heartbeat"` |
+| `action` | string | yes | `"execute"`, `"status"`, `"pending_recovery"`, `"abort"`, `"heartbeat"`, `"promote"` |
 | `tree` | object | for execute | Subtree dict to run |
 | `lease_timeout_ms` | integer | no | Lease duration override / heartbeat renewal |
 | `resume_target` | string | no | `resume`, `stop`, `reset`, or `stay_idle` |
+| `promote_keys` | object | for promote | Mapping of promoted recovery keys |
 | `session_kind` | string | recommended for execute | Currently `manual_intervention` only |
 | `authority_source` | string | recommended for execute | `human`, `llm`, `program_node`, or `policy` |
+| `principal_id` | string | recommended for execute | Agent/operator identity for audit records |
+| `grant_type` | string | recommended for execute | `human_approved`, `policy_granted`, or deployment grant |
 | `approval_mode` | string | recommended for execute | `human_approved`, `policy_granted`, or `not_required` |
 | `trigger_reason` | string | no | Why the session was requested |
 | `trigger_node_instance` | string | no | Node instance that triggered delegated recovery |
 | `artifact_origin` | string | no | `saved_program` or `runtime_override` |
 
 Interventions run a one-shot subtree without modifying the saved program.
-Requires IDLE or STOPPED state.
+Requires `idle` or `stopped` cycle state.
 
 Important gating rules:
 
-- `IDLE -> DIRECT_CONTROL` is rejected unless the request is an explicitly
+- `idle -> direct_control` is rejected unless the request is an explicitly
   human-approved `manual_intervention`.
 - `delegated_recovery` is accepted only when a pending delegated-recovery
   request already exists from an explicit node policy hook.
@@ -239,7 +299,7 @@ Inspect or mutate the runtime-override ledger.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `action` | string | yes | `"status"`, `"materialized_tree"`, `"apply"`, `"promote"`, `"activate"`, `"remove"`, `"clear"` |
+| `action` | string | yes | `"status"`, `"materialized_tree"`, `"apply"`, `"promote"`, `"activate"`, `"revalidate"`, `"remove"`, `"clear"` |
 | `node_name` | string | for apply/remove | Node instance name targeted by the override |
 | `params` | object | for apply | Param patch to merge onto that node instance |
 | `include_staged` | boolean | no | Include staged overrides when materializing/promoting |
@@ -256,10 +316,10 @@ Override rules:
 - Runtime overrides are param-level patches on a named node instance.
 - The targeted node instance must allow them via
   `modification_policy.runtime_override`.
-- Mutation is allowed only in `IDLE` and `DIRECT_CONTROL`.
-- Applying in `IDLE` activates immediately by rebuilding the effective program.
-- Applying in `DIRECT_CONTROL` stages the override for later activation.
-- Staged overrides cannot be activated while resuming from `STOPPED`; reset
+- Mutation is allowed only in `idle` and `direct_control`.
+- Applying in `idle` activates immediately by rebuilding the effective program.
+- Applying in `direct_control` stages the override for later activation.
+- Staged overrides cannot be activated while resuming from `stopped`; reset
   first.
 - `promote` with `target=loaded_program` materializes selected overrides into
   the loaded in-memory program and clears the corresponding ledger entries.
@@ -332,9 +392,59 @@ Query the behavior tree node catalog.
 
 **Returns**: Node type entries with `id`, `name`, `category`, `description`,
 `kind`, children constraints, parameters with types/constraints/defaults,
+parameter and enum-option profile metadata, `visible_when` authoring hints,
 and required capabilities.
 
 **REST equivalents**: `GET /api/catalog`, `GET /api/catalog/{id}`
+
+---
+
+### manyforge_kernel
+
+Get kernel execution state and metrics.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `include` | string | no | `"snapshot"`, `"metrics"`, or `"all"` |
+
+**Returns**: Kernel snapshot data, metrics data, or both. Snapshot data is the
+kernel/runtime execution view; use it instead of inferring kernel state from
+CycleManager state alone.
+
+**REST equivalents**: `GET /api/kernel/snapshot`, `GET /api/kernel/metrics`
+
+---
+
+### manyforge_session
+
+Inspect or reset the current Composer session.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `action` | string | no | `"status"` or `"reset"`; default `"status"` |
+
+**Returns**:
+- `status`: loaded program/deployment paths, cycle state, runtime override
+  status, and event count.
+- `reset`: resets cycle state and clears runtime overrides while keeping the
+  loaded program. It is rejected while execution or an interrupt handler is
+  active.
+
+---
+
+### manyforge_files
+
+Browse allowed filesystem roots for program or deployment artifacts.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `path` | string | no | Directory to browse; defaults to the working directory/root |
+| `kind` | string | no | `"program"` or `"deployment"`; default `"program"` |
+
+**Returns**: `path`, `parent_path`, matching directory/file entries, and
+allowed root shortcuts.
+
+**REST equivalent**: `GET /api/files/browse`
 
 ---
 
@@ -381,14 +491,15 @@ and decide how to recover.
 
 Common error patterns:
 - `"No program loaded"` — call `manyforge_program_load` first
-- `"Cannot modify tree while RUNNING"` — stop or reset first
-- `"Scene edits not allowed while RUNNING"` — stop or reset first
+- `"Cannot modify tree while execution is active"`: stop or reset first
+- `"Scene edits not allowed while execution is active"`: stop or reset first
 - `"No deployment loaded"` — load a deployment for capability queries
 
 ## Key Naming Convention
 
 MCP tool responses use **snake_case** keys (e.g. `expands_to`,
-`compatible_profiles`, `requires_capabilities`). The equivalent REST API
-responses use **camelCase** aliases (e.g. `expandsTo`, `compatibleProfiles`).
+`compatible_profiles`, `requires_capabilities`, `requires_tools`). The
+equivalent REST API responses use **camelCase** aliases (e.g. `expandsTo`,
+`compatibleProfiles`, `requiresTools`).
 Wrapped REST payloads are normalized to snake_case before being returned over
 MCP so LLM agents can treat the MCP surface as internally consistent.

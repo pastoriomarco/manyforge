@@ -18,6 +18,15 @@ Technical reference for the simulator boundary:
 
 - [`../reference/SIMULATOR_ADAPTER_CONTRACT_DRAFT.md`](../reference/SIMULATOR_ADAPTER_CONTRACT_DRAFT.md)
 
+External model-serving profile selection for assistant-backed Isaac preview
+flows is tracked in:
+
+- `/home/tndlux/workspaces/nemoclaw/src/NemoClaw-Thor/MANYFORGE-ASSISTANT-DEPLOYMENT-PLAN.md`
+
+This Isaac plan owns the simulator workflow and ManyForge boundaries, not the
+choice of Cosmos, Qwen3.6, Omni, or later NemoClaw/OpenClaw model-serving
+profiles.
+
 ## Purpose
 
 Use Isaac Sim as the first serious simulator-backed implementation of the

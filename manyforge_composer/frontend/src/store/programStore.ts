@@ -2,6 +2,7 @@ import { create } from 'zustand';
 import { api } from '../api/client';
 import { useCatalogStore } from './catalogStore';
 import type {
+  CatalogParameter,
   TreeNode,
   ProgramInfo,
   ProgramParameter,
@@ -13,6 +14,7 @@ import type {
 } from '../types/api';
 import { Position } from '@xyflow/react';
 import type { Node, Edge } from '@xyflow/react';
+import { profileSatisfies } from '../utils/profiles';
 
 export type LayoutDirection = 'vertical' | 'horizontal';
 
@@ -116,17 +118,42 @@ function cloneSceneResources(sceneResources?: ProgramSceneResource[] | null): Pr
   return structuredClone(sceneResources ?? []);
 }
 
-function buildDefaultNodeParams(catalogId: string): Record<string, unknown> {
+function defaultEnumValue(
+  param: CatalogParameter,
+  programProfile: string | null | undefined,
+): string | null {
+  const options = param.enumOptions.length > 0
+    ? param.enumOptions
+    : param.enumValues.map((value) => ({
+        value,
+        label: value,
+        description: '',
+        profilesMin: 'v0.0',
+        requiredCapabilities: [],
+      }));
+  return options.find((option) => profileSatisfies(option.profilesMin, programProfile))?.value ?? null;
+}
+
+function buildDefaultNodeParams(
+  catalogId: string,
+  programProfile: string | null | undefined,
+): Record<string, unknown> {
   const entry = useCatalogStore.getState().entries.find((candidate) => candidate.id === catalogId);
   const defaults: Record<string, unknown> = {};
 
   for (const param of entry?.parameters ?? []) {
+    if (!profileSatisfies(param.profilesMin, programProfile)) {
+      continue;
+    }
     if (param.default !== undefined && param.default !== null) {
       defaults[param.name] = structuredClone(param.default);
       continue;
     }
-    if (param.required && param.type === 'enum' && param.enumValues.length > 0) {
-      defaults[param.name] = param.enumValues[0];
+    if (param.required && param.type === 'enum') {
+      const value = defaultEnumValue(param, programProfile);
+      if (value != null) {
+        defaults[param.name] = value;
+      }
     }
   }
 
@@ -716,7 +743,7 @@ export const useProgramStore = create<ProgramStore>((set, get) => ({
       data: {
         label: catalogId,
         catalogId,
-        params: buildDefaultNodeParams(catalogId),
+        params: buildDefaultNodeParams(catalogId, get().programInfo?.programProfile ?? null),
         modificationPolicy: {},
       },
     };

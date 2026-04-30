@@ -426,7 +426,15 @@ class TestSkills:
         mcp = create_mcp_server(state)
         result = _call(mcp, "manyforge_skills")
         skill = result["skills"][0]
-        for field in ("id", "name", "description", "parameters", "body", "expands_to"):
+        for field in (
+            "id",
+            "name",
+            "description",
+            "parameters",
+            "requires_tools",
+            "body",
+            "expands_to",
+        ):
             assert field in skill, f"Skill missing field: {field}"
 
 

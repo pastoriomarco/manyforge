@@ -2,8 +2,50 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException
-from .models import CatalogResponse, CatalogEntryResponse, CatalogParameterResponse
+from .models import (
+    CatalogResponse,
+    CatalogEntryResponse,
+    CatalogParameterResponse,
+    CatalogEnumOptionResponse,
+    CatalogVisibleWhenResponse,
+)
 from .state import ComposerState
+
+
+def _parameter_response(param) -> dict:
+    """Convert a catalog parameter to an API response dictionary."""
+    visible_when = None
+    if param.visible_when is not None:
+        visible_when = CatalogVisibleWhenResponse(
+            param=param.visible_when.param,
+            equals=param.visible_when.equals,
+        )
+    return CatalogParameterResponse(
+        name=param.name,
+        type=param.type,
+        required=param.required,
+        default=param.default,
+        enumValues=param.enum_values,
+        enumOptions=[
+            CatalogEnumOptionResponse(
+                value=option.value,
+                label=option.label,
+                description=option.description,
+                profilesMin=option.profiles_min,
+                requiredCapabilities=option.required_capabilities,
+            )
+            for option in param.enum_options
+        ],
+        constraints=param.constraints,
+        parameterizable=param.parameterizable,
+        profilesMin=param.profiles_min,
+        visibleWhen=visible_when,
+        uiEditor=param.ui_editor,
+        blackboardRole=param.blackboard_role,
+        blackboardContract=param.blackboard_contract,
+        blackboardValueType=param.blackboard_value_type,
+        description=param.description,
+    ).model_dump(by_alias=True)
 
 
 def create_catalog_router(state: ComposerState) -> APIRouter:
@@ -15,22 +57,7 @@ def create_catalog_router(state: ComposerState) -> APIRouter:
         """Get all catalog entries."""
         entries = []
         for entry in state.catalog.entries:
-            params = []
-            for param in entry.parameters:
-                params.append(CatalogParameterResponse(
-                    name=param.name,
-                    type=param.type,
-                    required=param.required,
-                    default=param.default,
-                    enumValues=param.enum_values,
-                    constraints=param.constraints,
-                    parameterizable=param.parameterizable,
-                    uiEditor=param.ui_editor,
-                    blackboardRole=param.blackboard_role,
-                    blackboardContract=param.blackboard_contract,
-                    blackboardValueType=param.blackboard_value_type,
-                    description=param.description,
-                ).model_dump(by_alias=True))
+            params = [_parameter_response(param) for param in entry.parameters]
             entries.append(CatalogEntryResponse(
                 id=entry.id,
                 name=entry.name,
@@ -61,22 +88,7 @@ def create_catalog_router(state: ComposerState) -> APIRouter:
         except KeyError:
             raise HTTPException(status_code=404, detail=f"Entry '{entry_id}' not found")
         
-        params = []
-        for param in entry.parameters:
-            params.append(CatalogParameterResponse(
-                name=param.name,
-                type=param.type,
-                required=param.required,
-                default=param.default,
-                enumValues=param.enum_values,
-                constraints=param.constraints,
-                parameterizable=param.parameterizable,
-                uiEditor=param.ui_editor,
-                blackboardRole=param.blackboard_role,
-                blackboardContract=param.blackboard_contract,
-                blackboardValueType=param.blackboard_value_type,
-                description=param.description,
-            ).model_dump(by_alias=True))
+        params = [_parameter_response(param) for param in entry.parameters]
         
         return CatalogEntryResponse(
             id=entry.id,

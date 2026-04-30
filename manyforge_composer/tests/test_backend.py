@@ -294,6 +294,22 @@ def test_catalog_entry_includes_interrupt_metadata(client):
     data = response.json()
     assert data["interruptible"] is True
     assert data["defaultInterruptScope"] == "kernel_motion"
+    params = {param["name"]: param for param in data["parameters"]}
+    motion_type = params["motion_type"]
+    relative_move_option = next(
+        option
+        for option in motion_type["enumOptions"]
+        if option["value"] == "relative_move"
+    )
+    assert relative_move_option["profilesMin"] == "v0.1"
+    assert relative_move_option["requiredCapabilities"] == [
+        "context.pose.resolve_reference"
+    ]
+    assert params["relative_move"]["profilesMin"] == "v0.1"
+    assert params["relative_move"]["visibleWhen"] == {
+        "param": "motion_type",
+        "equals": "relative_move",
+    }
 
 
 def test_catalog_entry_includes_stability_metadata(client):
@@ -1236,10 +1252,11 @@ def test_get_skills_returns_catalog(client):
     assert "move_to_named_config" in skill_ids
 
     pick = next(s for s in data["skills"] if s["id"] == "pick_object")
-    assert pick["compatibleProfiles"] == ["v0.0"]
+    assert pick["compatibleProfiles"] == ["v0.1"]
     assert len(pick["requires"]) > 0
     assert len(pick["provides"]) > 0
     assert len(pick["requiresCapabilities"]) > 0
+    assert pick["requiresTools"] == []
     assert len(pick["parameters"]) >= 1
     assert "expandsTo" in pick
     assert pick["expandsTo"]["id"] == "sequence"
@@ -1269,9 +1286,18 @@ def test_get_full_deployment_includes_model_metadata(client):
     data = response.json()
     assert "modelEndpoints" in data
     assert "promptTemplates" in data
+    assert data["modelEndpointProfileRegistry"] == "model_endpoint_profiles.yaml"
     assert "selection_model" in data["modelEndpoints"]
     assert "select_scene_object_v1" in data["promptTemplates"]
-    assert data["modelEndpoints"]["selection_model"]["modelId"] == "gemma-4-E4B-it"
+    assert data["modelEndpoints"]["selection_model"]["profileRef"] == "thor_manyforge_qwen36"
+    assert (
+        data["modelEndpoints"]["selection_model"]["modelId"]
+        == "qwen3.6-35b-a3b-nvfp4-tq-mtp-manyforge"
+    )
+    assert data["modelEndpoints"]["selection_model"]["capabilities"][
+        "supportsResponseTools"
+    ] is True
+    assert data["assistant"]["provider"] == "deterministic-scene-authoring"
     assert data["promptTemplates"]["select_scene_object_v1"]["responseTool"]["name"] == "select_scene_object"
 
 
@@ -1282,7 +1308,14 @@ def test_infra_model_endpoints_reports_configured_and_live_models(client, monkey
     monkeypatch.setattr(
         routes_infra,
         "_probe_openai_compatible_models",
-        lambda base_url: (["Qwen3.5-9B-Claude-Distilled-NVFP4", "gemma-4-E4B-it"], None),
+        lambda base_url: (
+            [
+                "Qwen3.5-9B-Claude-Distilled-NVFP4",
+                "qwen3.6-35b-a3b-nvfp4-tq-mtp-manyforge",
+                "cosmos-reason2-8b",
+            ],
+            None,
+        ),
     )
 
     response = client.get("/api/infra/model-endpoints")
@@ -1290,7 +1323,8 @@ def test_infra_model_endpoints_reports_configured_and_live_models(client, monkey
     data = response.json()
     assert "selection_model" in data["endpoints"]
     endpoint = data["endpoints"]["selection_model"]
-    assert endpoint["configuredModelId"] == "gemma-4-E4B-it"
+    assert endpoint["configuredModelId"] == "qwen3.6-35b-a3b-nvfp4-tq-mtp-manyforge"
+    assert endpoint["capabilities"]["supportsResponseTools"] is True
     assert endpoint["probeStatus"] == "ok"
     assert "Qwen3.5-9B-Claude-Distilled-NVFP4" in endpoint["availableModelIds"]
 

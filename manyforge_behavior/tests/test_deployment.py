@@ -13,6 +13,12 @@ from manyforge_behavior.deployment import (
     DeploymentValidationError,
 )
 from manyforge_behavior.program import Program
+from manyforge_behavior.skill_loader import (
+    SkillCatalog,
+    default_skills_dir,
+    load_skill,
+    load_skill_catalog,
+)
 
 CATALOG_PATH = Path(__file__).parent.parent / "resources" / "node_catalog.yaml"
 DEPLOYMENT_FIXTURE_PATH = (
@@ -38,6 +44,11 @@ INTERRUPT_EXAMPLE_DEPLOYMENT_PATH = (
 )
 INTERRUPT_EXAMPLE_PROGRAM_PATH = (
     Path(__file__).resolve().parents[2] / "examples" / "interrupt_pick_and_place.program.yaml"
+)
+ASSISTANT_MODES_EXAMPLE_DEPLOYMENT_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "examples"
+    / "assistant_modes_scene_authoring.deployment.yaml"
 )
 
 
@@ -127,6 +138,60 @@ def _minimal_deployment(**overrides) -> dict:
     }
     deploy.update(overrides)
     return deploy
+
+
+def _assistant_mode_block(
+    *,
+    skills: list[str] | None = None,
+    tools: list[str] | None = None,
+    nodes: list[str] | None = None,
+    session_kind: str = "not_applicable",
+    approval_mode: str = "human_approved",
+    review: str = "required",
+) -> dict:
+    return {
+        "enabled": True,
+        "description": "Mode under test.",
+        "authority": {
+            "session_kind": session_kind,
+            "approval_mode": approval_mode,
+            "review": review,
+        },
+        "catalog": {
+            "skills": skills or [],
+            "tools": tools or [],
+            "nodes": nodes or [],
+        },
+    }
+
+
+def _tool_catalog(*tool_ids: str, effect: str = "read_only") -> list[dict]:
+    return [
+        {
+            "id": tool_id,
+            "effect": effect,
+            "description": f"{tool_id} fixture tool",
+        }
+        for tool_id in tool_ids
+    ]
+
+
+def _skill_catalog(tmp_path: Path, *, requires_tools: list[str] | None = None) -> SkillCatalog:
+    skill_path = tmp_path / "assist_skill.skill.yaml"
+    requires_tools_yaml = ""
+    if requires_tools is not None:
+        requires_tools_yaml = (
+            "requires_tools:\n"
+            + "".join(f"  - {tool_id}\n" for tool_id in requires_tools)
+        )
+    skill_path.write_text(
+        "api_version: manyforge.skill.v0\n"
+        "skill_id: assist_skill\n"
+        f"{requires_tools_yaml}"
+        "body: {id: reset_trajectories, name: noop}\n",
+    )
+    skill = load_skill(skill_path)
+    return SkillCatalog(skills=[skill], _by_id={skill.id: skill})
 
 
 class TestDeploymentLoading:
@@ -283,6 +348,129 @@ class TestDeploymentLoading:
         finally:
             os.unlink(path)
 
+    def test_model_endpoint_capabilities_and_assistant_parsed(self):
+        deploy = Deployment.from_dict(
+            _minimal_deployment(
+                model_endpoints={
+                    "assistant_model": {
+                        "provider": "openai",
+                        "model_id": "qwen3.6-35b-a3b-nvfp4-tq-mtp-manyforge",
+                        "base_url": "http://127.0.0.1:8000/v1",
+                        "default_timeout_s": 12.5,
+                        "max_tokens": 512,
+                        "capabilities": {
+                            "supports_response_tools": True,
+                            "supports_json_object": True,
+                            "supports_image_input": True,
+                            "supported_image_transports": [
+                                "inline_data_url",
+                                "http_url",
+                            ],
+                            "tool_call_family": "openai_chat_tools",
+                            "latency_budget_ms": 2500,
+                        },
+                    },
+                },
+                assistant={
+                    "provider": "nemoclaw",
+                    "endpoint_alias": "assistant_model",
+                    "enabled": True,
+                },
+            )
+        )
+
+        endpoint = deploy.model_endpoints["assistant_model"]
+        assert endpoint.default_timeout_s == pytest.approx(12.5)
+        assert endpoint.max_tokens == 512
+        assert endpoint.capabilities.supports_response_tools is True
+        assert endpoint.capabilities.supported_image_transports == [
+            "inline_data_url",
+            "http_url",
+        ]
+        assert endpoint.capabilities.tool_call_family == "openai_chat_tools"
+        assert endpoint.capabilities.latency_budget_ms == 2500
+        assert deploy.assistant is not None
+        assert deploy.assistant.provider == "nemoclaw"
+        assert deploy.assistant.endpoint_alias == "assistant_model"
+
+        serialized = deploy.to_dict()
+        assert serialized["model_endpoints"]["assistant_model"]["capabilities"][
+            "supports_response_tools"
+        ] is True
+        assert serialized["assistant"]["endpoint_alias"] == "assistant_model"
+
+    def test_model_endpoint_profile_registry_resolves_relative_profile_ref(self, tmp_path):
+        registry_path = tmp_path / "model_endpoint_profiles.yaml"
+        registry_path.write_text(
+            yaml.safe_dump(
+                {
+                    "api_version": "manyforge.model_endpoint_profiles.v0",
+                    "schema_version": "0.1.0",
+                    "profiles": {
+                        "thor_manyforge_qwen36": {
+                            "provider": "openai",
+                            "model_id": "qwen3.6-35b-a3b-nvfp4-tq-mtp-manyforge",
+                            "base_url": "http://127.0.0.1:8000/v1",
+                            "max_tokens": 512,
+                            "capabilities": {
+                                "supports_response_tools": True,
+                                "supports_json_object": True,
+                                "supports_image_input": True,
+                                "supported_image_transports": [
+                                    "inline_data_url",
+                                    "http_url",
+                                ],
+                                "tool_call_family": "openai_chat_tools",
+                            },
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        deployment_path = tmp_path / "demo.deployment.yaml"
+        deployment_path.write_text(
+            yaml.safe_dump(
+                _minimal_deployment(
+                    model_endpoint_profile_registry="model_endpoint_profiles.yaml",
+                    model_endpoints={
+                        "selection_model": {
+                            "profile_ref": "thor_manyforge_qwen36",
+                            "max_tokens": 384,
+                            "capabilities": {
+                                "supports_image_input": False,
+                                "supported_image_transports": [],
+                            },
+                        }
+                    },
+                )
+            ),
+            encoding="utf-8",
+        )
+
+        deploy = Deployment(deployment_path)
+
+        endpoint = deploy.model_endpoints["selection_model"]
+        assert endpoint.profile_ref == "thor_manyforge_qwen36"
+        assert endpoint.provider == "openai"
+        assert endpoint.model_id == "qwen3.6-35b-a3b-nvfp4-tq-mtp-manyforge"
+        assert endpoint.base_url == "http://127.0.0.1:8000/v1"
+        assert endpoint.max_tokens == 384
+        assert endpoint.capabilities.supports_response_tools is True
+        assert endpoint.capabilities.supports_image_input is False
+        assert endpoint.capabilities.supported_image_transports == []
+
+        serialized = deploy.to_dict()
+        assert serialized["model_endpoint_profile_registry"] == (
+            "model_endpoint_profiles.yaml"
+        )
+        assert serialized["model_endpoints"]["selection_model"]["profile_ref"] == (
+            "thor_manyforge_qwen36"
+        )
+        assert serialized["model_endpoints"]["selection_model"]["model_id"] == (
+            "qwen3.6-35b-a3b-nvfp4-tq-mtp-manyforge"
+        )
+
 
 class TestDeploymentValidation:
     def test_invalid_api_version(self):
@@ -327,6 +515,24 @@ class TestDeploymentValidation:
             Deployment(path)
         os.unlink(path)
 
+    def test_invalid_schema_version(self):
+        path = _write_deployment(_minimal_deployment(schema_version="not-semver"))
+        with pytest.raises(DeploymentValidationError, match="schema_version must match X.Y.Z"):
+            Deployment(path)
+        os.unlink(path)
+
+    def test_unknown_program_profile(self):
+        path = _write_deployment(_minimal_deployment(program_profile="v9.9"))
+        with pytest.raises(DeploymentValidationError, match="Unknown program profile"):
+            Deployment(path)
+        os.unlink(path)
+
+    def test_missing_name(self):
+        path = _write_deployment(_minimal_deployment(name=""))
+        with pytest.raises(DeploymentValidationError, match="name"):
+            Deployment(path)
+        os.unlink(path)
+
     def test_missing_robot_config(self):
         data = _minimal_deployment()
         del data["robot_config"]
@@ -351,6 +557,105 @@ class TestDeploymentValidation:
             Deployment(path)
         os.unlink(path)
 
+    def test_rejects_adapter_capability_keys_when_not_list(self):
+        data = _minimal_deployment()
+        data["adapters"]["planning"]["capability_keys"] = "planning.motion.joint_goal"
+        path = _write_deployment(data)
+        with pytest.raises(
+            DeploymentValidationError,
+            match=r"adapters\.planning\.capability_keys must be a list",
+        ):
+            Deployment(path)
+        os.unlink(path)
+
+    def test_rejects_unknown_adapter_capability_keys(self):
+        data = _minimal_deployment()
+        data["adapters"]["planning"]["capability_keys"] = ["unknown.capability"]
+        path = _write_deployment(data)
+        with pytest.raises(
+            DeploymentValidationError,
+            match=r"adapters\.planning\.capability_keys contains unknown capability keys",
+        ):
+            Deployment(path)
+        os.unlink(path)
+
+    def test_rejects_unknown_model_image_transport(self):
+        data = _minimal_deployment(
+            model_endpoints={
+                "vlm": {
+                    "provider": "openai",
+                    "model_id": "qwen3.6-35b-a3b-nvfp4-tq-mtp-manyforge",
+                    "capabilities": {
+                        "supported_image_transports": ["ftp_url"],
+                    },
+                },
+            },
+        )
+        with pytest.raises(
+            DeploymentValidationError,
+            match="supported_image_transports.*must be one of",
+        ):
+            Deployment.from_dict(data)
+
+    def test_rejects_unknown_model_endpoint_profile_ref(self, tmp_path):
+        registry_path = tmp_path / "model_endpoint_profiles.yaml"
+        registry_path.write_text(
+            yaml.safe_dump(
+                {
+                    "api_version": "manyforge.model_endpoint_profiles.v0",
+                    "schema_version": "0.1.0",
+                    "profiles": {},
+                }
+            ),
+            encoding="utf-8",
+        )
+        deployment_path = tmp_path / "demo.deployment.yaml"
+        deployment_path.write_text(
+            yaml.safe_dump(
+                _minimal_deployment(
+                    model_endpoint_profile_registry="model_endpoint_profiles.yaml",
+                    model_endpoints={
+                        "vision_model": {
+                            "profile_ref": "missing_profile",
+                        }
+                    },
+                )
+            ),
+            encoding="utf-8",
+        )
+        with pytest.raises(
+            DeploymentValidationError,
+            match="references unknown model endpoint profile",
+        ):
+            Deployment(deployment_path)
+
+    def test_rejects_live_assistant_without_endpoint_alias(self):
+        data = _minimal_deployment(assistant={"provider": "nemoclaw"})
+        with pytest.raises(
+            DeploymentValidationError,
+            match="assistant.endpoint_alias is required",
+        ):
+            Deployment.from_dict(data)
+
+    def test_rejects_live_assistant_endpoint_without_base_url(self):
+        data = _minimal_deployment(
+            model_endpoints={
+                "assistant_model": {
+                    "provider": "openai",
+                    "model_id": "qwen3.6-35b-a3b-nvfp4-tq-mtp-manyforge",
+                },
+            },
+            assistant={
+                "provider": "openclaw",
+                "endpoint_alias": "assistant_model",
+            },
+        )
+        with pytest.raises(
+            DeploymentValidationError,
+            match="must reference a model endpoint with base_url",
+        ):
+            Deployment.from_dict(data)
+
     def test_negative_tcp_speed(self):
         data = _minimal_deployment()
         data["robot_config"]["global_max_tcp_linear_speed_mps"] = -1.0
@@ -369,10 +674,9 @@ class TestDeploymentValidation:
 
     def test_optional_description(self):
         data = _minimal_deployment()
-        del data["name"]
         path = _write_deployment(data)
         deploy = Deployment(path)
-        assert deploy.name == ""
+        assert deploy.description == ""
         os.unlink(path)
 
     def test_optional_srdf_path(self):
@@ -471,6 +775,158 @@ class TestDeploymentValidation:
         with pytest.raises(DeploymentValidationError, match="kind must be one of"):
             Deployment(path)
         os.unlink(path)
+
+
+class TestAssistantModeValidation:
+    def test_parses_assistant_modes_and_tool_catalog(self):
+        deployment = Deployment.from_dict(
+            _minimal_deployment(
+                assistant_modes={
+                    "composer-assistant": _assistant_mode_block(
+                        tools=["program.read", "tree.insert_node"],
+                    ),
+                },
+                tool_catalog=_tool_catalog("program.read", "tree.insert_node"),
+            )
+        )
+
+        assert "composer-assistant" in deployment.assistant_modes
+        assert deployment.assistant_modes["composer-assistant"].catalog.tools == [
+            "program.read",
+            "tree.insert_node",
+        ]
+        assert deployment.tool_catalog["program.read"].effect == "read_only"
+        assert deployment.to_dict()["assistant_modes"]["composer-assistant"]["catalog"]["tools"] == [
+            "program.read",
+            "tree.insert_node",
+        ]
+
+    def test_rejects_assistant_modes_without_tool_catalog(self):
+        with pytest.raises(DeploymentValidationError, match="tool_catalog is required"):
+            Deployment.from_dict(
+                _minimal_deployment(
+                    assistant_modes={
+                        "composer-assistant": _assistant_mode_block(
+                            tools=["program.read"],
+                        ),
+                    },
+                )
+            )
+
+    def test_rejects_assistant_modes_when_not_mapping(self):
+        with pytest.raises(DeploymentValidationError, match="assistant_modes must be a mapping"):
+            Deployment.from_dict(
+                _minimal_deployment(
+                    assistant_modes=[],
+                )
+            )
+
+    def test_rejects_assistant_mode_unknown_tool(self):
+        with pytest.raises(DeploymentValidationError, match="unknown tool 'missing.tool'"):
+            Deployment.from_dict(
+                _minimal_deployment(
+                    assistant_modes={
+                        "composer-assistant": _assistant_mode_block(
+                            tools=["missing.tool"],
+                        ),
+                    },
+                    tool_catalog=_tool_catalog("program.read"),
+                )
+            )
+
+    def test_rejects_query_mode_with_non_read_only_tool(self):
+        with pytest.raises(DeploymentValidationError, match="query.*read_only"):
+            Deployment.from_dict(
+                _minimal_deployment(
+                    assistant_modes={
+                        "query": _assistant_mode_block(tools=["tree.insert_node"]),
+                    },
+                    tool_catalog=_tool_catalog("tree.insert_node", effect="proposal"),
+                )
+            )
+
+    def test_validates_mode_skill_requires_tools(self, catalog, tmp_path):
+        deployment = Deployment.from_dict(
+            _minimal_deployment(
+                assistant_modes={
+                    "composer-assistant": _assistant_mode_block(
+                        skills=["assist_skill"],
+                        tools=["program.read"],
+                    ),
+                },
+                tool_catalog=_tool_catalog("program.read"),
+            )
+        )
+        skills = _skill_catalog(tmp_path, requires_tools=["program.read"])
+
+        deployment.validate_assistant_modes(catalog, skills)
+
+    def test_rejects_mode_skill_missing_required_tools(self, catalog, tmp_path):
+        deployment = Deployment.from_dict(
+            _minimal_deployment(
+                assistant_modes={
+                    "composer-assistant": _assistant_mode_block(
+                        skills=["assist_skill"],
+                        tools=["program.read"],
+                    ),
+                },
+                tool_catalog=_tool_catalog("program.read", "tree.insert_node"),
+            )
+        )
+        skills = _skill_catalog(tmp_path, requires_tools=["tree.insert_node"])
+
+        with pytest.raises(DeploymentValidationError, match="without required tools"):
+            deployment.validate_assistant_modes(catalog, skills)
+
+    def test_rejects_unknown_mode_skill(self, catalog, tmp_path):
+        deployment = Deployment.from_dict(
+            _minimal_deployment(
+                assistant_modes={
+                    "composer-assistant": _assistant_mode_block(
+                        skills=["missing_skill"],
+                        tools=["program.read"],
+                    ),
+                },
+                tool_catalog=_tool_catalog("program.read"),
+            )
+        )
+        skills = _skill_catalog(tmp_path, requires_tools=[])
+
+        with pytest.raises(DeploymentValidationError, match="unknown skills"):
+            deployment.validate_assistant_modes(catalog, skills)
+
+    def test_rejects_unknown_mode_node(self, catalog, tmp_path):
+        deployment = Deployment.from_dict(
+            _minimal_deployment(
+                assistant_modes={
+                    "composer-assistant": _assistant_mode_block(
+                        tools=["program.read"],
+                        nodes=["missing_node"],
+                    ),
+                },
+                tool_catalog=_tool_catalog("program.read"),
+            )
+        )
+        skills = _skill_catalog(tmp_path, requires_tools=[])
+
+        with pytest.raises(DeploymentValidationError, match="unknown nodes"):
+            deployment.validate_assistant_modes(catalog, skills)
+
+    def test_rejects_instrument_namespace_collision(self, catalog, tmp_path):
+        deployment = Deployment.from_dict(
+            _minimal_deployment(
+                assistant_modes={
+                    "composer-assistant": _assistant_mode_block(
+                        tools=["reset_trajectories"],
+                    ),
+                },
+                tool_catalog=_tool_catalog("reset_trajectories"),
+            )
+        )
+        skills = _skill_catalog(tmp_path, requires_tools=[])
+
+        with pytest.raises(DeploymentValidationError, match="globally disjoint"):
+            deployment.validate_assistant_modes(catalog, skills)
 
 
 class TestCrossArtifactValidation:
@@ -651,6 +1107,23 @@ class TestCrossArtifactValidation:
         deploy.validate_against_program(prog)
         deploy.validate_capabilities()
 
+    def test_assistant_modes_example_deployment_validates(self, catalog):
+        """The assistant-mode example validates against node and skill catalogs."""
+        deploy = Deployment(ASSISTANT_MODES_EXAMPLE_DEPLOYMENT_PATH)
+        skills = load_skill_catalog(default_skills_dir(), catalog=catalog, strict=True)
+
+        deploy.validate_capabilities()
+        deploy.validate_assistant_modes(catalog, skills)
+        assert sorted(deploy.assistant_modes) == ["composer-assistant", "query"]
+        resolved_catalog = deploy.resolve_assistant_mode_catalog("composer-assistant")
+        assert resolved_catalog["skills"] == []
+        assert [tool["id"] for tool in resolved_catalog["tools"]] == [
+            "inspect_isaac_scene",
+            "propose_scene_objects",
+            "propose_scene_object_nodes",
+        ]
+        assert resolved_catalog["nodes"] == []
+
 
 class TestAdapterCapabilityKeys:
     def test_adapter_capability_keys_parsed(self):
@@ -685,6 +1158,7 @@ class TestAdapterCapabilityKeys:
         assert deploy.adapters["execution"].capability_keys == [
             "execution.trajectory.execute",
             "execution.feedback.phase_events",
+            "execution.feedback.state_snapshots",
             "execution.stop.soft",
             "execution.pause",
             "execution.resume",
@@ -722,6 +1196,7 @@ class TestValidateCapabilities:
         data["adapters"]["execution"]["capability_keys"] = [
             "execution.trajectory.execute",
             "execution.feedback.phase_events",
+            "execution.feedback.state_snapshots",
             "execution.stop.soft",
             "execution.pause",
             "execution.resume",
@@ -757,6 +1232,7 @@ class TestValidateCapabilities:
         data["adapters"]["execution"]["capability_keys"] = [
             "execution.trajectory.execute",
             "execution.feedback.phase_events",
+            "execution.feedback.state_snapshots",
             "execution.stop.soft",
             "execution.pause",
             "execution.resume",
@@ -768,13 +1244,13 @@ class TestValidateCapabilities:
             deploy.validate_capabilities()
         os.unlink(path)
 
-    def test_validate_capabilities_backwards_compat(self):
-        """No capability_keys on any adapter → passes silently."""
+    def test_validate_capabilities_requires_declared_keys(self):
+        """No capability_keys on any adapter fails closed."""
         data = _minimal_deployment()
-        # Don't add capability_keys to any adapter
         path = _write_deployment(data)
         deploy = Deployment(path)
-        deploy.validate_capabilities()  # Should not raise (backwards compat)
+        with pytest.raises(DeploymentValidationError, match="Missing capability keys"):
+            deploy.validate_capabilities()
         os.unlink(path)
 
     def test_validate_capabilities_partial_coverage(self):
@@ -815,6 +1291,7 @@ class TestValidateCapabilities:
         data["adapters"]["execution"]["capability_keys"] = [
             "execution.trajectory.execute",
             "execution.feedback.phase_events",
+            "execution.feedback.state_snapshots",
             "execution.stop.soft",
             "execution.pause",
             "execution.resume",

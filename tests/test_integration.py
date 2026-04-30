@@ -118,7 +118,7 @@ class TestRunnerWithMockKernel:
     def test_runner_state_transitions(
         self, simple_motion_program_path, node_catalog_path, mock_kernel
     ):
-        """Status goes IDLE → COMPLETED after execute."""
+        """Runner acknowledges completed kernel moves back to IDLE."""
         status = mock_kernel.get_status()
         assert status.state == ExecutionState.IDLE
 
@@ -132,7 +132,7 @@ class TestRunnerWithMockKernel:
         runner.run(max_ticks=100)
 
         status = mock_kernel.get_status()
-        assert status.state == ExecutionState.COMPLETED
+        assert status.state == ExecutionState.IDLE
 
     def test_runner_parameter_override(
         self, simple_motion_program_path, node_catalog_path, mock_kernel
@@ -152,7 +152,7 @@ class TestRunnerWithMockKernel:
     def test_runner_reset_between_runs(
         self, simple_motion_program_path, node_catalog_path, mock_kernel
     ):
-        """Execute, reset, execute again works."""
+        """Execute, rebuild the tree, execute again works."""
         runner = OrchestratorRunner(
             catalog_path=node_catalog_path,
             program_path=simple_motion_program_path,
@@ -163,9 +163,9 @@ class TestRunnerWithMockKernel:
 
         success1 = runner.run(max_ticks=100)
         assert success1 is True
+        assert mock_kernel.get_status().state == ExecutionState.IDLE
 
-        reset_result = mock_kernel.reset()
-        assert reset_result.accepted is True
+        runner.build_tree()
 
         success2 = runner.run(max_ticks=100)
         assert success2 is True
@@ -361,7 +361,7 @@ class TestHmiWithMockKernel:
             time.sleep(0.01)
 
         assert mock_kernel.execute_count >= 1
-        assert mock_kernel.get_status().state == ExecutionState.COMPLETED
+        assert mock_kernel.get_status().state == ExecutionState.IDLE
         assert bridge.state == CycleState.IDLE
 
     def test_hmi_load_program(
@@ -408,8 +408,8 @@ class TestErrorPaths:
         result = mock_kernel.stop()
         assert result.accepted is False
 
-    def test_auto_reset_on_sequential_execute(self, mock_kernel):
-        """Second execute after completed — auto-resets from terminal state (matches C++ kernel)."""
+    def test_execute_from_completed_requires_bound_acknowledgement(self, mock_kernel):
+        """Completed executions require exact-id acknowledgement before the next execute."""
         request1 = ExecuteRequest(
             robot_id="robot1", group_id="arm", move_id="move1",
             base_frame="base_link", tcp_frame="tcp",
@@ -422,7 +422,6 @@ class TestErrorPaths:
         result1 = mock_kernel.execute(request1)
         assert result1.ok is True
 
-        # Auto-reset from COMPLETED — sequential execute succeeds
         request2 = ExecuteRequest(
             robot_id="robot1", group_id="arm", move_id="move2",
             base_frame="base_link", tcp_frame="tcp",
@@ -433,7 +432,19 @@ class TestErrorPaths:
             planning_timeout_s=5.0, execution_timeout_s=10.0,
         )
         result2 = mock_kernel.execute(request2)
-        assert result2.ok is True
+        assert result2.ok is False
+        assert result2.error == "Not in IDLE state"
+
+        stale_ack = mock_kernel.acknowledge_completed(result1.execution_id + 1)
+        assert stale_ack.accepted is False
+        assert mock_kernel.get_status().state == ExecutionState.COMPLETED
+
+        ack = mock_kernel.acknowledge_completed(result1.execution_id)
+        assert ack.accepted is True
+        assert mock_kernel.get_status().state == ExecutionState.IDLE
+
+        result3 = mock_kernel.execute(request2)
+        assert result3.ok is True
 
     def test_reset_recovers(self, mock_kernel):
         """After failure, reset returns to IDLE, can execute again."""

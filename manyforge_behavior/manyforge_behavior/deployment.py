@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -9,7 +10,13 @@ from typing import Any, Optional
 
 import yaml
 
+from manyforge_behavior.capabilities import CAPABILITY_REGISTRY, get_required_keys
+from manyforge_behavior.catalog import SEMVER_RE
+
 EXPECTED_API_VERSION = "manyforge.deployment.v0"
+EXPECTED_MODEL_ENDPOINT_PROFILE_REGISTRY_API_VERSION = (
+    "manyforge.model_endpoint_profiles.v0"
+)
 
 
 @dataclass
@@ -124,6 +131,56 @@ _ALLOWED_AUTHORITY_DISCONNECT_POLICIES = {
     "reset_required",
     "latched_fault",
 }
+_ALLOWED_IMAGE_TRANSPORTS = {"inline_data_url", "http_url"}
+_ALLOWED_ASSISTANT_PROVIDERS = {
+    "mock",
+    "deterministic-scene-authoring",
+    "nemoclaw",
+    "openclaw",
+}
+_ASSISTANT_PROVIDERS_REQUIRING_ENDPOINT = {"nemoclaw", "openclaw"}
+_ALLOWED_ASSISTANT_TOOL_EFFECTS = {
+    "read_only",
+    "proposal",
+    "runtime_mutating",
+}
+_ALLOWED_ASSISTANT_SESSION_KINDS = {
+    "manual_intervention",
+    "delegated_recovery",
+    "not_applicable",
+}
+_ALLOWED_ASSISTANT_APPROVAL_MODES = {
+    "human_approved",
+    "policy_granted",
+}
+_ALLOWED_ASSISTANT_REVIEW_POLICIES = {
+    "required",
+    "bounded_by_recovery_profile",
+    "not_required",
+}
+_QUERY_ASSISTANT_MODE_ID = "query"
+
+
+def _validate_capability_keys(value: Any, path: str) -> list[str]:
+    if value is None:
+        return []
+    if not isinstance(value, list) or not all(
+        isinstance(capability, str) and capability.strip()
+        for capability in value
+    ):
+        raise DeploymentValidationError(
+            f"{path} must be a list of non-empty strings"
+        )
+    unknown_capabilities = sorted(
+        capability
+        for capability in value
+        if capability not in CAPABILITY_REGISTRY
+    )
+    if unknown_capabilities:
+        raise DeploymentValidationError(
+            f"{path} contains unknown capability keys: {unknown_capabilities}"
+        )
+    return list(value)
 
 
 @dataclass
@@ -136,16 +193,74 @@ class ModelAuditPolicy:
 
 
 @dataclass
+class ModelEndpointCapabilities:
+    """Declared capabilities for a deployment-configured model endpoint."""
+    supports_response_tools: bool = False
+    supports_json_object: bool = False
+    supports_image_input: bool = False
+    supported_image_transports: list[str] = field(default_factory=list)
+    tool_call_family: str = ""
+    latency_budget_ms: Optional[int] = None
+
+
+@dataclass
 class ModelEndpoint:
     """Deployment-configured model endpoint alias (OP-7)."""
     alias: str
     provider: str  # "openai", "anthropic", "local", etc.
     model_id: str
+    profile_ref: str = ""
     base_url: Optional[str] = None
     image_fetch_base_url: Optional[str] = None
     api_key_env: Optional[str] = None  # env var name, never the key itself
     default_timeout_s: float = 30.0
     max_tokens: int = 4096
+    capabilities: ModelEndpointCapabilities = field(
+        default_factory=ModelEndpointCapabilities
+    )
+
+
+@dataclass
+class AssistantConfig:
+    """Deployment-selected Composer assistant provider."""
+    provider: str
+    endpoint_alias: str = ""
+    enabled: bool = True
+
+
+@dataclass(frozen=True)
+class AssistantToolDefinition:
+    """Deployment-declared model-visible assistant tool."""
+    tool_id: str
+    effect: str
+    description: str = ""
+    extra: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class AssistantModeAuthority:
+    """Authority and review policy declared by an assistant mode."""
+    session_kind: str
+    approval_mode: str
+    review: str
+
+
+@dataclass(frozen=True)
+class AssistantModeCatalog:
+    """Finite instrument allowlist declared by an assistant mode."""
+    skills: list[str] = field(default_factory=list)
+    tools: list[str] = field(default_factory=list)
+    nodes: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class AssistantModeDefinition:
+    """Deployment-declared assistant mode."""
+    mode_id: str
+    enabled: bool
+    description: str
+    authority: AssistantModeAuthority
+    catalog: AssistantModeCatalog
 
 
 @dataclass
@@ -180,7 +295,11 @@ class Deployment:
         self.interrupt_sources: dict[str, InterruptSource] = {}
         self.authority_matrix: dict[str, AuthorityDomain] = {}
         self.model_audit_policy: Optional[ModelAuditPolicy] = None
+        self.model_endpoint_profile_registry: Optional[str] = None
         self.model_endpoints: dict[str, ModelEndpoint] = {}
+        self.assistant: Optional[AssistantConfig] = None
+        self.assistant_modes: dict[str, AssistantModeDefinition] = {}
+        self.tool_catalog: dict[str, AssistantToolDefinition] = {}
         self.prompt_templates: dict[str, PromptTemplate] = {}
         self._load_and_validate()
 
@@ -210,7 +329,11 @@ class Deployment:
         self.interrupt_sources = {}
         self.authority_matrix = {}
         self.model_audit_policy = None
+        self.model_endpoint_profile_registry = None
         self.model_endpoints = {}
+        self.assistant = None
+        self.assistant_modes = {}
+        self.tool_catalog = {}
         self.prompt_templates = {}
         self._load_from_data_and_validate(data)
         return self
@@ -491,6 +614,610 @@ class Deployment:
             parsed.append(frame_name_str)
         return parsed
 
+    def _parse_required_string(self, value: Any, field_path: str) -> str:
+        if not isinstance(value, str) or not value.strip():
+            raise DeploymentValidationError(f"{field_path} must be a non-empty string")
+        return value.strip()
+
+    def _parse_string_list(self, values: Any, field_path: str) -> list[str]:
+        if values is None:
+            return []
+        if not isinstance(values, list):
+            raise DeploymentValidationError(f"{field_path} must be a list of strings")
+        parsed: list[str] = []
+        for index, value in enumerate(values):
+            if not isinstance(value, str) or not value.strip():
+                raise DeploymentValidationError(
+                    f"{field_path}[{index}] must be a non-empty string"
+                )
+            parsed.append(value.strip())
+        duplicates = sorted({item for item in parsed if parsed.count(item) > 1})
+        if duplicates:
+            raise DeploymentValidationError(
+                f"{field_path} contains duplicate entries: {duplicates}"
+            )
+        return parsed
+
+    def _parse_optional_string(self, value: Any, field_path: str) -> Optional[str]:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise DeploymentValidationError(f"{field_path} must be a string")
+        return value.strip()
+
+    def _parse_positive_float(self, value: Any, field_path: str) -> float:
+        if isinstance(value, bool):
+            raise DeploymentValidationError(f"{field_path} must be a number > 0")
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError) as exc:
+            raise DeploymentValidationError(f"{field_path} must be a number > 0") from exc
+        if parsed <= 0.0:
+            raise DeploymentValidationError(f"{field_path} must be a number > 0")
+        return parsed
+
+    def _parse_positive_int(self, value: Any, field_path: str) -> int:
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise DeploymentValidationError(f"{field_path} must be an integer > 0")
+        if value <= 0:
+            raise DeploymentValidationError(f"{field_path} must be an integer > 0")
+        return value
+
+    def _parse_model_endpoint_capabilities(
+        self,
+        raw_capabilities: Any,
+        field_path: str,
+    ) -> ModelEndpointCapabilities:
+        if raw_capabilities is None:
+            return ModelEndpointCapabilities()
+        if not isinstance(raw_capabilities, dict):
+            raise DeploymentValidationError(f"{field_path} must be a mapping")
+
+        bool_fields = {
+            "supports_response_tools": False,
+            "supports_json_object": False,
+            "supports_image_input": False,
+        }
+        parsed_bool_fields: dict[str, bool] = {}
+        for key, default in bool_fields.items():
+            value = raw_capabilities.get(key, default)
+            if not isinstance(value, bool):
+                raise DeploymentValidationError(f"{field_path}.{key} must be a boolean")
+            parsed_bool_fields[key] = value
+
+        image_transports = raw_capabilities.get("supported_image_transports", [])
+        if image_transports is None:
+            image_transports = []
+        if not isinstance(image_transports, list):
+            raise DeploymentValidationError(
+                f"{field_path}.supported_image_transports must be a list of strings"
+            )
+        parsed_transports: list[str] = []
+        for index, transport in enumerate(image_transports):
+            if not isinstance(transport, str) or not transport.strip():
+                raise DeploymentValidationError(
+                    f"{field_path}.supported_image_transports[{index}] must be a non-empty string"
+                )
+            normalized = transport.strip()
+            if normalized not in _ALLOWED_IMAGE_TRANSPORTS:
+                allowed = ", ".join(sorted(_ALLOWED_IMAGE_TRANSPORTS))
+                raise DeploymentValidationError(
+                    f"{field_path}.supported_image_transports[{index}] must be one of: {allowed}"
+                )
+            parsed_transports.append(normalized)
+
+        latency_budget_ms = raw_capabilities.get("latency_budget_ms")
+        if latency_budget_ms is not None:
+            latency_budget_ms = self._parse_positive_int(
+                latency_budget_ms,
+                f"{field_path}.latency_budget_ms",
+            )
+
+        return ModelEndpointCapabilities(
+            supports_response_tools=parsed_bool_fields["supports_response_tools"],
+            supports_json_object=parsed_bool_fields["supports_json_object"],
+            supports_image_input=parsed_bool_fields["supports_image_input"],
+            supported_image_transports=parsed_transports,
+            tool_call_family=self._parse_optional_string(
+                raw_capabilities.get("tool_call_family", ""),
+                f"{field_path}.tool_call_family",
+            ) or "",
+            latency_budget_ms=latency_budget_ms,
+        )
+
+    def _model_endpoint_to_raw(self, endpoint: ModelEndpoint) -> dict[str, Any]:
+        return {
+            "provider": endpoint.provider,
+            "model_id": endpoint.model_id,
+            "base_url": endpoint.base_url,
+            "image_fetch_base_url": endpoint.image_fetch_base_url,
+            "api_key_env": endpoint.api_key_env,
+            "default_timeout_s": endpoint.default_timeout_s,
+            "max_tokens": endpoint.max_tokens,
+            "capabilities": {
+                "supports_response_tools": (
+                    endpoint.capabilities.supports_response_tools
+                ),
+                "supports_json_object": endpoint.capabilities.supports_json_object,
+                "supports_image_input": endpoint.capabilities.supports_image_input,
+                "supported_image_transports": list(
+                    endpoint.capabilities.supported_image_transports
+                ),
+                "tool_call_family": endpoint.capabilities.tool_call_family,
+                **(
+                    {"latency_budget_ms": endpoint.capabilities.latency_budget_ms}
+                    if endpoint.capabilities.latency_budget_ms is not None
+                    else {}
+                ),
+            },
+        }
+
+    def _merge_model_endpoint_profile(
+        self,
+        base: dict[str, Any],
+        override: dict[str, Any],
+    ) -> dict[str, Any]:
+        merged = copy.deepcopy(base)
+        for key, value in override.items():
+            if key == "profile_ref":
+                continue
+            if (
+                key == "capabilities"
+                and isinstance(merged.get("capabilities"), dict)
+                and isinstance(value, dict)
+            ):
+                capabilities = copy.deepcopy(merged["capabilities"])
+                capabilities.update(copy.deepcopy(value))
+                merged["capabilities"] = capabilities
+            else:
+                merged[key] = copy.deepcopy(value)
+        return merged
+
+    def _parse_model_endpoint_entry(
+        self,
+        alias: str,
+        endpoint_data: Any,
+        field_path: str,
+        *,
+        profile_registry: dict[str, dict[str, Any]] | None = None,
+        allow_profile_ref: bool = True,
+    ) -> ModelEndpoint:
+        if not isinstance(endpoint_data, dict):
+            raise DeploymentValidationError(f"{field_path} must be a mapping")
+
+        profile_ref = ""
+        resolved_data = endpoint_data
+        if allow_profile_ref:
+            profile_ref = self._parse_optional_string(
+                endpoint_data.get("profile_ref", ""),
+                f"{field_path}.profile_ref",
+            ) or ""
+            if profile_ref:
+                if profile_registry is None or profile_ref not in profile_registry:
+                    raise DeploymentValidationError(
+                        f"{field_path}.profile_ref references unknown model endpoint profile '{profile_ref}'"
+                    )
+                resolved_data = self._merge_model_endpoint_profile(
+                    profile_registry[profile_ref],
+                    endpoint_data,
+                )
+        elif "profile_ref" in endpoint_data:
+            raise DeploymentValidationError(
+                f"{field_path}.profile_ref is not allowed in model endpoint profile entries"
+            )
+
+        for req_field in ("provider", "model_id"):
+            if req_field not in resolved_data:
+                raise DeploymentValidationError(
+                    f"{field_path}.{req_field} is required"
+                )
+        return ModelEndpoint(
+            alias=alias,
+            profile_ref=profile_ref,
+            provider=self._parse_required_string(
+                resolved_data["provider"],
+                f"{field_path}.provider",
+            ),
+            model_id=self._parse_required_string(
+                resolved_data["model_id"],
+                f"{field_path}.model_id",
+            ),
+            base_url=self._parse_optional_string(
+                resolved_data.get("base_url"),
+                f"{field_path}.base_url",
+            ),
+            image_fetch_base_url=self._parse_optional_string(
+                resolved_data.get("image_fetch_base_url"),
+                f"{field_path}.image_fetch_base_url",
+            ),
+            api_key_env=self._parse_optional_string(
+                resolved_data.get("api_key_env"),
+                f"{field_path}.api_key_env",
+            ),
+            default_timeout_s=self._parse_positive_float(
+                resolved_data.get("default_timeout_s", 30.0),
+                f"{field_path}.default_timeout_s",
+            ),
+            max_tokens=self._parse_positive_int(
+                resolved_data.get("max_tokens", 4096),
+                f"{field_path}.max_tokens",
+            ),
+            capabilities=self._parse_model_endpoint_capabilities(
+                resolved_data.get("capabilities"),
+                f"{field_path}.capabilities",
+            ),
+        )
+
+    def _load_model_endpoint_profile_registry(
+        self,
+        registry_path_data: Any,
+    ) -> dict[str, dict[str, Any]]:
+        self.model_endpoint_profile_registry = self._parse_optional_string(
+            registry_path_data,
+            "model_endpoint_profile_registry",
+        )
+        if not self.model_endpoint_profile_registry:
+            return {}
+
+        registry_path = Path(self.model_endpoint_profile_registry)
+        if not registry_path.is_absolute() and str(self._path) != "<memory>":
+            registry_path = self._path.parent / registry_path
+
+        try:
+            with open(registry_path, encoding="utf-8") as f:
+                registry_data = yaml.safe_load(f)
+        except OSError as exc:
+            raise DeploymentValidationError(
+                f"model_endpoint_profile_registry could not be read: {registry_path}"
+            ) from exc
+
+        if not isinstance(registry_data, dict):
+            raise DeploymentValidationError(
+                "model_endpoint_profile_registry file must be a YAML mapping"
+            )
+        api_version = registry_data.get("api_version")
+        if api_version != EXPECTED_MODEL_ENDPOINT_PROFILE_REGISTRY_API_VERSION:
+            raise DeploymentValidationError(
+                "model_endpoint_profile_registry.api_version must be "
+                f"'{EXPECTED_MODEL_ENDPOINT_PROFILE_REGISTRY_API_VERSION}'"
+            )
+        schema_version = registry_data.get("schema_version", "")
+        if not isinstance(schema_version, str) or not SEMVER_RE.match(schema_version):
+            raise DeploymentValidationError(
+                "model_endpoint_profile_registry.schema_version must match X.Y.Z"
+            )
+        profiles_data = registry_data.get("profiles")
+        if not isinstance(profiles_data, dict):
+            raise DeploymentValidationError(
+                "model_endpoint_profile_registry.profiles must be a mapping"
+            )
+
+        profiles: dict[str, dict[str, Any]] = {}
+        for profile_id, profile_data in profiles_data.items():
+            if not isinstance(profile_id, str) or not profile_id.strip():
+                raise DeploymentValidationError(
+                    "model_endpoint_profile_registry.profiles keys must be non-empty strings"
+                )
+            profile_id = profile_id.strip()
+            parsed = self._parse_model_endpoint_entry(
+                profile_id,
+                profile_data,
+                f"model_endpoint_profile_registry.profiles.{profile_id}",
+                allow_profile_ref=False,
+            )
+            profiles[profile_id] = self._model_endpoint_to_raw(parsed)
+        return profiles
+
+    def _parse_model_endpoints(
+        self,
+        endpoints_data: Any,
+        profile_registry: dict[str, dict[str, Any]] | None = None,
+    ) -> dict[str, ModelEndpoint]:
+        if endpoints_data is None:
+            return {}
+        if not isinstance(endpoints_data, dict):
+            raise DeploymentValidationError("model_endpoints must be a mapping")
+
+        parsed: dict[str, ModelEndpoint] = {}
+        for alias, endpoint_data in endpoints_data.items():
+            if not isinstance(alias, str) or not alias.strip():
+                raise DeploymentValidationError(
+                    "model_endpoints keys must be non-empty strings"
+                )
+            alias = alias.strip()
+            parsed[alias] = self._parse_model_endpoint_entry(
+                alias,
+                endpoint_data,
+                f"model_endpoints.{alias}",
+                profile_registry=profile_registry or {},
+            )
+        return parsed
+
+    def _parse_assistant_config(
+        self,
+        assistant_data: Any,
+        model_endpoints: dict[str, ModelEndpoint],
+    ) -> Optional[AssistantConfig]:
+        if assistant_data is None:
+            return None
+        if assistant_data == {}:
+            return None
+        if not isinstance(assistant_data, dict):
+            raise DeploymentValidationError("assistant must be a mapping")
+
+        provider = self._parse_required_string(
+            assistant_data.get("provider"),
+            "assistant.provider",
+        )
+        if provider == "deterministic":
+            provider = "deterministic-scene-authoring"
+        if provider not in _ALLOWED_ASSISTANT_PROVIDERS:
+            allowed = ", ".join(sorted(_ALLOWED_ASSISTANT_PROVIDERS))
+            raise DeploymentValidationError(
+                f"assistant.provider must be one of: {allowed}"
+            )
+
+        enabled = assistant_data.get("enabled", True)
+        if not isinstance(enabled, bool):
+            raise DeploymentValidationError("assistant.enabled must be a boolean")
+
+        endpoint_alias = self._parse_optional_string(
+            assistant_data.get("endpoint_alias", ""),
+            "assistant.endpoint_alias",
+        ) or ""
+        if enabled and provider in _ASSISTANT_PROVIDERS_REQUIRING_ENDPOINT:
+            if not endpoint_alias:
+                raise DeploymentValidationError(
+                    f"assistant.endpoint_alias is required for provider '{provider}'"
+                )
+            endpoint = model_endpoints.get(endpoint_alias)
+            if endpoint is None:
+                raise DeploymentValidationError(
+                    f"assistant.endpoint_alias references unknown model endpoint '{endpoint_alias}'"
+                )
+            if not endpoint.base_url:
+                raise DeploymentValidationError(
+                    f"assistant.endpoint_alias '{endpoint_alias}' must reference a model endpoint with base_url"
+                )
+
+        return AssistantConfig(
+            provider=provider,
+            endpoint_alias=endpoint_alias,
+            enabled=enabled,
+        )
+
+    def _parse_tool_catalog(
+        self,
+        tool_catalog_data: Any,
+        *,
+        assistant_modes_present: bool,
+    ) -> dict[str, AssistantToolDefinition]:
+        if tool_catalog_data is None:
+            if assistant_modes_present:
+                raise DeploymentValidationError(
+                    "tool_catalog is required when assistant_modes is non-empty"
+                )
+            return {}
+        if not isinstance(tool_catalog_data, list):
+            raise DeploymentValidationError("tool_catalog must be a list")
+
+        parsed: dict[str, AssistantToolDefinition] = {}
+        for index, raw_tool in enumerate(tool_catalog_data):
+            field_path = f"tool_catalog[{index}]"
+            if not isinstance(raw_tool, dict):
+                raise DeploymentValidationError(f"{field_path} must be a mapping")
+            tool_id = self._parse_required_string(
+                raw_tool.get("id"),
+                f"{field_path}.id",
+            )
+            if tool_id in parsed:
+                raise DeploymentValidationError(
+                    f"tool_catalog contains duplicate tool id '{tool_id}'"
+                )
+            effect = self._parse_required_string(
+                raw_tool.get("effect"),
+                f"{field_path}.effect",
+            )
+            if effect not in _ALLOWED_ASSISTANT_TOOL_EFFECTS:
+                allowed = ", ".join(sorted(_ALLOWED_ASSISTANT_TOOL_EFFECTS))
+                raise DeploymentValidationError(
+                    f"{field_path}.effect must be one of: {allowed}"
+                )
+            description = self._parse_optional_string(
+                raw_tool.get("description", ""),
+                f"{field_path}.description",
+            ) or ""
+            extra = {
+                key: copy.deepcopy(value)
+                for key, value in raw_tool.items()
+                if key not in {"id", "effect", "description"}
+            }
+            parsed[tool_id] = AssistantToolDefinition(
+                tool_id=tool_id,
+                effect=effect,
+                description=description,
+                extra=extra,
+            )
+        return parsed
+
+    def _assistant_tool_to_raw(self, tool: AssistantToolDefinition) -> dict[str, Any]:
+        raw = {
+            "id": tool.tool_id,
+            "effect": tool.effect,
+        }
+        if tool.description:
+            raw["description"] = tool.description
+        raw.update(copy.deepcopy(tool.extra))
+        return raw
+
+    def _parse_assistant_mode_authority(
+        self,
+        authority_data: Any,
+        field_path: str,
+    ) -> AssistantModeAuthority:
+        if not isinstance(authority_data, dict):
+            raise DeploymentValidationError(f"{field_path} must be a mapping")
+
+        session_kind = self._parse_required_string(
+            authority_data.get("session_kind", authority_data.get("sessionKind")),
+            f"{field_path}.session_kind",
+        )
+        if session_kind not in _ALLOWED_ASSISTANT_SESSION_KINDS:
+            allowed = ", ".join(sorted(_ALLOWED_ASSISTANT_SESSION_KINDS))
+            raise DeploymentValidationError(
+                f"{field_path}.session_kind must be one of: {allowed}"
+            )
+
+        approval_mode = self._parse_required_string(
+            authority_data.get("approval_mode", authority_data.get("approvalMode")),
+            f"{field_path}.approval_mode",
+        )
+        if approval_mode not in _ALLOWED_ASSISTANT_APPROVAL_MODES:
+            allowed = ", ".join(sorted(_ALLOWED_ASSISTANT_APPROVAL_MODES))
+            raise DeploymentValidationError(
+                f"{field_path}.approval_mode must be one of: {allowed}"
+            )
+
+        review = self._parse_required_string(
+            authority_data.get("review"),
+            f"{field_path}.review",
+        )
+        if review not in _ALLOWED_ASSISTANT_REVIEW_POLICIES:
+            allowed = ", ".join(sorted(_ALLOWED_ASSISTANT_REVIEW_POLICIES))
+            raise DeploymentValidationError(
+                f"{field_path}.review must be one of: {allowed}"
+            )
+        if review == "bounded_by_recovery_profile" and session_kind != "delegated_recovery":
+            raise DeploymentValidationError(
+                f"{field_path}.review='bounded_by_recovery_profile' requires "
+                "session_kind='delegated_recovery'"
+            )
+        if approval_mode == "policy_granted" and session_kind != "delegated_recovery":
+            raise DeploymentValidationError(
+                f"{field_path}.approval_mode='policy_granted' requires "
+                "session_kind='delegated_recovery'"
+            )
+        return AssistantModeAuthority(
+            session_kind=session_kind,
+            approval_mode=approval_mode,
+            review=review,
+        )
+
+    def _parse_assistant_modes(
+        self,
+        assistant_modes_data: Any,
+        tool_catalog: dict[str, AssistantToolDefinition],
+    ) -> dict[str, AssistantModeDefinition]:
+        if assistant_modes_data is None:
+            return {}
+        if not isinstance(assistant_modes_data, dict):
+            raise DeploymentValidationError("assistant_modes must be a mapping")
+
+        parsed: dict[str, AssistantModeDefinition] = {}
+        for mode_id, raw_mode in assistant_modes_data.items():
+            if not isinstance(mode_id, str) or not mode_id.strip():
+                raise DeploymentValidationError(
+                    "assistant_modes keys must be non-empty strings"
+                )
+            mode_id = mode_id.strip()
+            field_path = f"assistant_modes.{mode_id}"
+            if not isinstance(raw_mode, dict):
+                raise DeploymentValidationError(f"{field_path} must be a mapping")
+
+            enabled = raw_mode.get("enabled", True)
+            if not isinstance(enabled, bool):
+                raise DeploymentValidationError(f"{field_path}.enabled must be a boolean")
+            description = self._parse_required_string(
+                raw_mode.get("description"),
+                f"{field_path}.description",
+            )
+            authority = self._parse_assistant_mode_authority(
+                raw_mode.get("authority"),
+                f"{field_path}.authority",
+            )
+            catalog_data = raw_mode.get("catalog")
+            if not isinstance(catalog_data, dict):
+                raise DeploymentValidationError(f"{field_path}.catalog must be a mapping")
+            if "skills" not in catalog_data:
+                raise DeploymentValidationError(f"{field_path}.catalog.skills is required")
+            if "tools" not in catalog_data:
+                raise DeploymentValidationError(f"{field_path}.catalog.tools is required")
+            skills = self._parse_string_list(
+                catalog_data.get("skills"),
+                f"{field_path}.catalog.skills",
+            )
+            tools = self._parse_string_list(
+                catalog_data.get("tools"),
+                f"{field_path}.catalog.tools",
+            )
+            nodes = self._parse_string_list(
+                catalog_data.get("nodes", []),
+                f"{field_path}.catalog.nodes",
+            )
+            for tool_id in tools:
+                if tool_id not in tool_catalog:
+                    raise DeploymentValidationError(
+                        f"{field_path}.catalog.tools references unknown tool '{tool_id}'"
+                    )
+
+            parsed[mode_id] = AssistantModeDefinition(
+                mode_id=mode_id,
+                enabled=enabled,
+                description=description,
+                authority=authority,
+                catalog=AssistantModeCatalog(
+                    skills=skills,
+                    tools=tools,
+                    nodes=nodes,
+                ),
+            )
+
+        self._validate_query_assistant_mode(parsed, tool_catalog)
+        return parsed
+
+    def _validate_query_assistant_mode(
+        self,
+        assistant_modes: dict[str, AssistantModeDefinition],
+        tool_catalog: dict[str, AssistantToolDefinition],
+    ) -> None:
+        query_mode = assistant_modes.get(_QUERY_ASSISTANT_MODE_ID)
+        if query_mode is None or not query_mode.enabled:
+            return
+        if query_mode.catalog.skills:
+            raise DeploymentValidationError(
+                "assistant_modes.query.catalog.skills must be empty"
+            )
+        if query_mode.catalog.nodes:
+            raise DeploymentValidationError(
+                "assistant_modes.query.catalog.nodes must be empty"
+            )
+        non_read_only = sorted(
+            tool_id
+            for tool_id in query_mode.catalog.tools
+            if tool_catalog[tool_id].effect != "read_only"
+        )
+        if non_read_only:
+            raise DeploymentValidationError(
+                "assistant_modes.query.catalog.tools must contain only read_only tools: "
+                f"{non_read_only}"
+            )
+
+    def _assistant_mode_to_raw(self, mode: AssistantModeDefinition) -> dict[str, Any]:
+        return {
+            "enabled": mode.enabled,
+            "description": mode.description,
+            "authority": {
+                "session_kind": mode.authority.session_kind,
+                "approval_mode": mode.authority.approval_mode,
+                "review": mode.authority.review,
+            },
+            "catalog": {
+                "skills": list(mode.catalog.skills),
+                "tools": list(mode.catalog.tools),
+                "nodes": list(mode.catalog.nodes),
+            },
+        }
+
     def _load_from_data_and_validate(self, data: dict[str, Any]) -> None:
         self.adapters = {}
         self.robot_config = None
@@ -499,6 +1226,13 @@ class Deployment:
         self.launch = None
         self.interrupt_sources = {}
         self.authority_matrix = {}
+        self.model_audit_policy = None
+        self.model_endpoint_profile_registry = None
+        self.model_endpoints = {}
+        self.assistant = None
+        self.assistant_modes = {}
+        self.tool_catalog = {}
+        self.prompt_templates = {}
 
         if not isinstance(data, dict):
             raise DeploymentValidationError("Deployment must be a YAML mapping")
@@ -512,14 +1246,24 @@ class Deployment:
         self.api_version = api_version
 
         self.schema_version = data.get("schema_version", "")
-        if not self.schema_version:
+        if not isinstance(self.schema_version, str) or not self.schema_version.strip():
             raise DeploymentValidationError("schema_version is required")
+        if not SEMVER_RE.match(self.schema_version):
+            raise DeploymentValidationError(
+                f"schema_version must match X.Y.Z, got '{self.schema_version}'"
+            )
 
         self.program_profile = data.get("program_profile", "")
-        if not self.program_profile:
+        if not isinstance(self.program_profile, str) or not self.program_profile.strip():
             raise DeploymentValidationError("program_profile is required")
+        try:
+            get_required_keys(self.program_profile)
+        except ValueError as exc:
+            raise DeploymentValidationError(str(exc)) from exc
 
         self.name = data.get("name", "")
+        if not isinstance(self.name, str) or not self.name.strip():
+            raise DeploymentValidationError("name is required")
         self.description = data.get("description", "")
 
         # Robot config
@@ -554,7 +1298,10 @@ class Deployment:
                 adapter_version=adapter_data["adapter_version"],
                 config=adapter_data.get("config", {}),
                 supported_profiles=adapter_data.get("supported_profiles", []),
-                capability_keys=adapter_data.get("capability_keys", []),
+                capability_keys=_validate_capability_keys(
+                    adapter_data.get("capability_keys", []),
+                    f"adapters.{slot}.capability_keys",
+                ),
             )
 
         # Orchestrator
@@ -626,30 +1373,29 @@ class Deployment:
                 redact_argument_values=bool(audit_data.get("redact_argument_values", True)),
             )
 
-        # Model endpoints (optional)
-        endpoints_data = data.get("model_endpoints", {})
-        if endpoints_data and not isinstance(endpoints_data, dict):
-            raise DeploymentValidationError("model_endpoints must be a mapping")
-        for alias, ep_data in (endpoints_data or {}).items():
-            if not isinstance(ep_data, dict):
-                raise DeploymentValidationError(
-                    f"model_endpoints.{alias} must be a mapping"
-                )
-            for req_field in ("provider", "model_id"):
-                if req_field not in ep_data:
-                    raise DeploymentValidationError(
-                        f"model_endpoints.{alias}.{req_field} is required"
-                    )
-            self.model_endpoints[alias] = ModelEndpoint(
-                alias=alias,
-                provider=ep_data["provider"],
-                model_id=ep_data["model_id"],
-                base_url=ep_data.get("base_url"),
-                image_fetch_base_url=ep_data.get("image_fetch_base_url"),
-                api_key_env=ep_data.get("api_key_env"),
-                default_timeout_s=float(ep_data.get("default_timeout_s", 30.0)),
-                max_tokens=int(ep_data.get("max_tokens", 4096)),
-            )
+        # Model endpoints and assistant selection (optional)
+        model_endpoint_profiles = self._load_model_endpoint_profile_registry(
+            data.get("model_endpoint_profile_registry")
+        )
+        self.model_endpoints = self._parse_model_endpoints(
+            data.get("model_endpoints", {}),
+            model_endpoint_profiles,
+        )
+        self.assistant = self._parse_assistant_config(
+            data.get("assistant"),
+            self.model_endpoints,
+        )
+        assistant_modes_data = data.get("assistant_modes")
+        if assistant_modes_data is not None and not isinstance(assistant_modes_data, dict):
+            raise DeploymentValidationError("assistant_modes must be a mapping")
+        self.tool_catalog = self._parse_tool_catalog(
+            data.get("tool_catalog"),
+            assistant_modes_present=bool(assistant_modes_data),
+        )
+        self.assistant_modes = self._parse_assistant_modes(
+            assistant_modes_data,
+            self.tool_catalog,
+        )
 
         # Prompt templates (optional)
         templates_data = data.get("prompt_templates", {})
@@ -715,18 +1461,13 @@ class Deployment:
         - Required keys are missing from the capability union
         - Program node/skill capability keys are missing from the capability union
 
-        Silently passes if no adapter declares capability_keys (backwards compat).
+        Missing capability declarations fail closed; supported backends must
+        declare the capability keys they provide.
         """
-        from manyforge_behavior.capabilities import get_required_keys
-
         # Collect all capability keys from all adapters (union)
         all_capability_keys: set[str] = set()
         for slot, adapter in self.adapters.items():
             all_capability_keys.update(adapter.capability_keys)
-
-        # If no adapter declared capability_keys, skip validation (backwards compat)
-        if not all_capability_keys:
-            return
 
         # Check that each adapter that declares supported_profiles includes our profile
         for slot, adapter in self.adapters.items():
@@ -740,6 +1481,12 @@ class Deployment:
 
         # Get required keys for the program profile
         required_keys = get_required_keys(self.program_profile)
+
+        if not all_capability_keys:
+            raise DeploymentValidationError(
+                f"Missing capability keys for profile '{self.program_profile}': "
+                f"{sorted(required_keys)}"
+            )
 
         # Compute missing keys
         missing = required_keys - all_capability_keys
@@ -758,6 +1505,101 @@ class Deployment:
                     "Missing capability keys for program nodes: "
                     f"{sorted(missing_program_keys)}"
                 )
+
+    def validate_assistant_modes(
+        self,
+        node_catalog: Any | None,
+        skill_catalog: Any | None,
+    ) -> None:
+        """Validate assistant modes against the loaded node and skill catalogs."""
+        if not self.assistant_modes:
+            return
+        if node_catalog is None:
+            raise DeploymentValidationError(
+                "assistant_modes validation requires the loaded node catalog"
+            )
+        if skill_catalog is None:
+            raise DeploymentValidationError(
+                "assistant_modes validation requires the loaded skill catalog"
+            )
+
+        node_ids = {entry.id for entry in getattr(node_catalog, "entries", [])}
+        skill_ids = set(getattr(skill_catalog, "skill_ids", []))
+        tool_ids = set(self.tool_catalog)
+
+        tool_skill_collisions = sorted(tool_ids & skill_ids)
+        tool_node_collisions = sorted(tool_ids & node_ids)
+        skill_node_collisions = sorted(skill_ids & node_ids)
+        if tool_skill_collisions or tool_node_collisions or skill_node_collisions:
+            details: list[str] = []
+            if tool_skill_collisions:
+                details.append(f"tool/skill={tool_skill_collisions}")
+            if tool_node_collisions:
+                details.append(f"tool/node={tool_node_collisions}")
+            if skill_node_collisions:
+                details.append(f"skill/node={skill_node_collisions}")
+            raise DeploymentValidationError(
+                "assistant instrument IDs must be globally disjoint: "
+                + ", ".join(details)
+            )
+
+        for mode_id, mode in self.assistant_modes.items():
+            mode_tools = set(mode.catalog.tools)
+            missing_skills = sorted(
+                skill_id
+                for skill_id in mode.catalog.skills
+                if skill_id not in skill_ids
+            )
+            if missing_skills:
+                raise DeploymentValidationError(
+                    f"assistant_modes.{mode_id}.catalog.skills references unknown skills: "
+                    f"{missing_skills}"
+                )
+            missing_nodes = sorted(
+                node_id
+                for node_id in mode.catalog.nodes
+                if node_id not in node_ids
+            )
+            if missing_nodes:
+                raise DeploymentValidationError(
+                    f"assistant_modes.{mode_id}.catalog.nodes references unknown nodes: "
+                    f"{missing_nodes}"
+                )
+            for skill_id in mode.catalog.skills:
+                skill = skill_catalog.get(skill_id)
+                if skill is None:
+                    continue
+                required_tools = set(getattr(skill, "requires_tools", []))
+                missing_tools = sorted(required_tools - mode_tools)
+                if missing_tools:
+                    raise DeploymentValidationError(
+                        f"assistant_modes.{mode_id}.catalog.skills includes skill "
+                        f"'{skill_id}' without required tools: {missing_tools}"
+                    )
+
+        self._validate_query_assistant_mode(self.assistant_modes, self.tool_catalog)
+
+    def resolve_assistant_mode_catalog(self, mode_id: str) -> dict[str, Any]:
+        """Return the request-visible catalog for an enabled assistant mode."""
+        mode = self.assistant_modes.get(mode_id)
+        if mode is None:
+            raise DeploymentValidationError(f"Unknown assistant mode: '{mode_id}'")
+        if not mode.enabled:
+            raise DeploymentValidationError(f"Assistant mode is disabled: '{mode_id}'")
+        return {
+            "modeId": mode.mode_id,
+            "authority": {
+                "sessionKind": mode.authority.session_kind,
+                "approvalMode": mode.authority.approval_mode,
+                "review": mode.authority.review,
+            },
+            "skills": list(mode.catalog.skills),
+            "tools": [
+                self._assistant_tool_to_raw(self.tool_catalog[tool_id])
+                for tool_id in mode.catalog.tools
+            ],
+            "nodes": list(mode.catalog.nodes),
+        }
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to dict matching manyforge.deployment.v0 schema."""
@@ -836,9 +1678,18 @@ class Deployment:
                 "hash_algorithm": self.model_audit_policy.hash_algorithm,
                 "redact_argument_values": self.model_audit_policy.redact_argument_values,
             }
+        if self.model_endpoint_profile_registry:
+            d["model_endpoint_profile_registry"] = (
+                self.model_endpoint_profile_registry
+            )
         if self.model_endpoints:
             d["model_endpoints"] = {
                 alias: {
+                    **(
+                        {"profile_ref": endpoint.profile_ref}
+                        if endpoint.profile_ref
+                        else {}
+                    ),
                     "provider": endpoint.provider,
                     "model_id": endpoint.model_id,
                     "base_url": endpoint.base_url,
@@ -846,9 +1697,49 @@ class Deployment:
                     "api_key_env": endpoint.api_key_env,
                     "default_timeout_s": endpoint.default_timeout_s,
                     "max_tokens": endpoint.max_tokens,
+                    "capabilities": {
+                        "supports_response_tools": (
+                            endpoint.capabilities.supports_response_tools
+                        ),
+                        "supports_json_object": (
+                            endpoint.capabilities.supports_json_object
+                        ),
+                        "supports_image_input": (
+                            endpoint.capabilities.supports_image_input
+                        ),
+                        "supported_image_transports": list(
+                            endpoint.capabilities.supported_image_transports
+                        ),
+                        "tool_call_family": endpoint.capabilities.tool_call_family,
+                        **(
+                            {
+                                "latency_budget_ms": (
+                                    endpoint.capabilities.latency_budget_ms
+                                )
+                            }
+                            if endpoint.capabilities.latency_budget_ms is not None
+                            else {}
+                        ),
+                    },
                 }
                 for alias, endpoint in self.model_endpoints.items()
             }
+        if self.assistant is not None:
+            d["assistant"] = {
+                "provider": self.assistant.provider,
+                "endpoint_alias": self.assistant.endpoint_alias,
+                "enabled": self.assistant.enabled,
+            }
+        if self.assistant_modes:
+            d["assistant_modes"] = {
+                mode_id: self._assistant_mode_to_raw(mode)
+                for mode_id, mode in self.assistant_modes.items()
+            }
+        if self.tool_catalog:
+            d["tool_catalog"] = [
+                self._assistant_tool_to_raw(tool)
+                for tool in self.tool_catalog.values()
+            ]
         if self.prompt_templates:
             d["prompt_templates"] = {
                 template_id: {
@@ -998,6 +1889,57 @@ class Deployment:
                     enabled=ui_data.get("enabled", self.launch.ui_backend.enabled if self.launch.ui_backend else True),
                 )
             self.launch = LaunchConfig(runner=runner, ui_backend=ui_backend)
+        if (
+            "model_endpoint_profile_registry" in data
+            or "model_endpoints" in data
+        ):
+            if "model_endpoint_profile_registry" in data:
+                profile_registry = self._load_model_endpoint_profile_registry(
+                    data.get("model_endpoint_profile_registry")
+                )
+            else:
+                profile_registry = self._load_model_endpoint_profile_registry(
+                    self.model_endpoint_profile_registry
+                )
+            endpoint_data = data.get("model_endpoints", self.to_dict().get("model_endpoints", {}))
+            self.model_endpoints = self._parse_model_endpoints(
+                endpoint_data,
+                profile_registry,
+            )
+            if self.assistant is not None and "assistant" not in data:
+                self.assistant = self._parse_assistant_config(
+                    {
+                        "provider": self.assistant.provider,
+                        "endpoint_alias": self.assistant.endpoint_alias,
+                        "enabled": self.assistant.enabled,
+                    },
+                    self.model_endpoints,
+                )
+        if "assistant" in data:
+            self.assistant = self._parse_assistant_config(
+                data["assistant"],
+                self.model_endpoints,
+            )
+        if "tool_catalog" in data or "assistant_modes" in data:
+            current_raw = self.to_dict()
+            assistant_modes_data = data.get(
+                "assistant_modes",
+                current_raw.get("assistant_modes", {}),
+            )
+            if assistant_modes_data is not None and not isinstance(assistant_modes_data, dict):
+                raise DeploymentValidationError("assistant_modes must be a mapping")
+            tool_catalog_data = data.get(
+                "tool_catalog",
+                current_raw.get("tool_catalog"),
+            )
+            self.tool_catalog = self._parse_tool_catalog(
+                tool_catalog_data,
+                assistant_modes_present=bool(assistant_modes_data),
+            )
+            self.assistant_modes = self._parse_assistant_modes(
+                assistant_modes_data,
+                self.tool_catalog,
+            )
         if "interrupt_sources" in data:
             merged_sources = {
                 source_id: {

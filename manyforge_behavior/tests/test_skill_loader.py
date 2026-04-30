@@ -21,7 +21,9 @@ class TestLoadSkill:
         skill = load_skill(SKILLS_DIR / "pick_object.skill.yaml")
         assert skill.id == "pick_object"
         assert skill.version == "0.1.0"
-        assert "v0.0" in skill.compatible_profiles
+        assert "v0.1" in skill.compatible_profiles
+        assert "scene.edit.attach_detach" in skill.requires_capabilities
+        assert skill.requires_tools == []
         assert len(skill.parameters) >= 1
         assert skill.body["id"] == "sequence"
         assert len(skill.requires) > 0
@@ -31,6 +33,7 @@ class TestLoadSkill:
         skill = load_skill(SKILLS_DIR / "place_object.skill.yaml")
         assert skill.id == "place_object"
         assert "planning.motion.pose_goal" in skill.requires_capabilities
+        assert "context.pose.resolve_reference" in skill.requires_capabilities
 
     def test_loads_move_to_named_config(self):
         skill = load_skill(SKILLS_DIR / "move_to_named_config.skill.yaml")
@@ -53,6 +56,63 @@ class TestLoadSkill:
         bad = tmp_path / "bad.skill.yaml"
         bad.write_text("api_version: manyforge.skill.v0\nskill_id: test\n")
         with pytest.raises(ValueError, match="body"):
+            load_skill(bad)
+
+    def test_rejects_requires_capabilities_when_not_list(self, tmp_path):
+        bad = tmp_path / "bad.skill.yaml"
+        bad.write_text(
+            "api_version: manyforge.skill.v0\n"
+            "skill_id: test\n"
+            "requires_capabilities: planning.motion.pose_goal\n"
+            "body: {id: reset_trajectories, name: noop}\n",
+        )
+        with pytest.raises(ValueError, match="requires_capabilities must be a list"):
+            load_skill(bad)
+
+    def test_rejects_unknown_requires_capabilities(self, tmp_path):
+        bad = tmp_path / "bad.skill.yaml"
+        bad.write_text(
+            "api_version: manyforge.skill.v0\n"
+            "skill_id: test\n"
+            "requires_capabilities: [unknown.capability]\n"
+            "body: {id: reset_trajectories, name: noop}\n",
+        )
+        with pytest.raises(ValueError, match="unknown requires_capabilities"):
+            load_skill(bad)
+
+    def test_parses_requires_tools(self, tmp_path):
+        skill_path = tmp_path / "tool_skill.skill.yaml"
+        skill_path.write_text(
+            "api_version: manyforge.skill.v0\n"
+            "skill_id: tool_skill\n"
+            "requires_tools: [program.read, tree.insert_node]\n"
+            "body: {id: reset_trajectories, name: noop}\n",
+        )
+
+        skill = load_skill(skill_path)
+
+        assert skill.requires_tools == ["program.read", "tree.insert_node"]
+
+    def test_rejects_requires_tools_when_not_list(self, tmp_path):
+        bad = tmp_path / "bad.skill.yaml"
+        bad.write_text(
+            "api_version: manyforge.skill.v0\n"
+            "skill_id: test\n"
+            "requires_tools: program.read\n"
+            "body: {id: reset_trajectories, name: noop}\n",
+        )
+        with pytest.raises(ValueError, match="requires_tools must be a list"):
+            load_skill(bad)
+
+    def test_rejects_duplicate_requires_tools(self, tmp_path):
+        bad = tmp_path / "bad.skill.yaml"
+        bad.write_text(
+            "api_version: manyforge.skill.v0\n"
+            "skill_id: test\n"
+            "requires_tools: [program.read, program.read]\n"
+            "body: {id: reset_trajectories, name: noop}\n",
+        )
+        with pytest.raises(ValueError, match="duplicate requires_tools"):
             load_skill(bad)
 
 

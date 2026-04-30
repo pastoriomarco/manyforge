@@ -1,0 +1,127 @@
+api_version: manyforge.deployment.v0
+schema_version: "0.1.0"
+name: ur5_roboplan_local_assistant_modes_scene_authoring
+description: >-
+  Local deployment fixture for v0.1 assistant-mode catalog plumbing. It keeps
+  the deterministic scene-authoring provider enabled while declaring the
+  finite tools visible to query and composer-assistant requests.
+
+program_profile: v0.1
+
+robot_config:
+  robot_id: ur5
+  group_id: arm
+  urdf_path: package://roboplan_example_models/models/ur_robot_model/ur5_gripper.urdf
+  srdf_path: package://roboplan_example_models/models/ur_robot_model/ur5_gripper.srdf
+  global_max_tcp_linear_speed_mps: 0.25
+
+adapters:
+  planning:
+    adapter_id: planning.roboplan
+    adapter_version: "0.1.0"
+    supported_profiles: ["v0.1"]
+    capability_keys:
+      - planning.motion.joint_goal
+      - planning.motion.pose_goal
+      - planning.trajectory.time_parameterized
+    config:
+      rng_seed: 12345
+  context:
+    adapter_id: planning.roboplan_context
+    adapter_version: "0.1.0"
+    supported_profiles: ["v0.1"]
+    capability_keys:
+      - context.state.current
+      - context.validation.trajectory
+      - context.collision.check
+      - context.kinematics.fk
+      - context.pose.resolve_reference
+      - context.scene.object_query
+      - context.limits.joint
+      - scene.shape.box
+      - scene.shape.sphere
+      - scene.edit.add
+      - scene.edit.remove
+      - scene.edit.update_pose
+      - scene.edit.attach_detach
+      - observability.trace.scene
+    config: {}
+  execution:
+    adapter_id: execution.roboplan_native
+    adapter_version: "0.1.0"
+    supported_profiles: ["v0.1"]
+    capability_keys:
+      - execution.trajectory.execute
+      - execution.feedback.phase_events
+      - execution.feedback.state_snapshots
+      - execution.stop.soft
+      - execution.pause
+      - execution.resume
+      - execution.reset
+    config:
+      mode: simulated
+      execution_tick_hz: 100
+      initial_joint_positions_rad: [0.0, -1.57, 1.57, -1.57, -1.57, 0.0]
+
+orchestrator:
+  engine: py_trees
+  config:
+    collision_monitor_period_ms: 10.0
+
+launch:
+  ros_wrapper_nodes: []
+  runner:
+    module: manyforge_behavior.runner
+    args: []
+  ui_backend:
+    module: manyforge_composer
+    args: []
+    enabled: true
+
+model_audit_policy:
+  store_full_prompts: false
+  store_full_responses: false
+  redact_argument_values: true
+
+assistant:
+  provider: deterministic-scene-authoring
+  enabled: true
+
+assistant_modes:
+  query:
+    enabled: true
+    description: Read-only inspection mode for assistant questions.
+    authority:
+      session_kind: not_applicable
+      approval_mode: human_approved
+      review: not_required
+    catalog:
+      skills: []
+      tools:
+        - inspect_isaac_scene
+      nodes: []
+  composer-assistant:
+    enabled: true
+    description: Offline scene-authoring proposal mode for Composer.
+    authority:
+      session_kind: not_applicable
+      approval_mode: human_approved
+      review: required
+    catalog:
+      skills: []
+      tools:
+        - inspect_isaac_scene
+        - propose_scene_objects
+        - propose_scene_object_nodes
+      nodes: []
+
+tool_catalog:
+  - id: inspect_isaac_scene
+    effect: read_only
+    description: Inspect the current simulator scene snapshot.
+  - id: propose_scene_objects
+    effect: proposal
+    description: Propose reviewable scene-resource additions from simulator objects.
+  - id: propose_scene_object_nodes
+    effect: proposal
+    description: Propose reviewable Composer scene nodes from simulator objects.

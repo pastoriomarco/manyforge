@@ -115,6 +115,7 @@ export function ControlBar() {
     || !deploymentSaved;
   const hasAppliedUnsavedChanges = !programAppliedMatchesSaved || !deploymentAppliedMatchesSaved;
   const activeError = actionError || error || programError || deploymentError;
+  const hasRuntimeOverrides = !!runtimeOverrideStatus && (runtimeOverrideStatus.hasActive || runtimeOverrideStatus.hasStaged);
 
   const summarizeValidationErrors = (errors: Array<{ path: string; message: string }>): string => {
     const summary = errors
@@ -141,8 +142,7 @@ export function ControlBar() {
     { value: 'step', label: 'Step' },
   ];
 
-  const applyDrafts = useCallback(async () => {
-    const hasRuntimeOverrides = !!runtimeOverrideStatus && (runtimeOverrideStatus.hasActive || runtimeOverrideStatus.hasStaged);
+  const applyDrafts = useCallback(async (forceDiscardOverrides: boolean) => {
     const payload: {
       tree?: TreeNode;
       scene?: typeof sceneResources;
@@ -194,7 +194,7 @@ export function ControlBar() {
 
     await api.session.apply({
       ...payload,
-      forceDiscardOverrides: hasRuntimeOverrides,
+      forceDiscardOverrides,
     });
     if (payload.tree || payload.scene || payload.programParameters || payload.blackboard) {
       setAppliedToDraft();
@@ -218,7 +218,6 @@ export function ControlBar() {
     validateDraftGraph,
     setAppliedDeploymentToDraft,
     setAppliedToDraft,
-    runtimeOverrideStatus,
     summarizeValidationErrors,
   ]);
 
@@ -255,16 +254,24 @@ export function ControlBar() {
   ]);
 
   const handleApply = useCallback(async () => {
+    if (
+      hasRuntimeOverrides
+      && !window.confirm(
+        'Applying draft changes will discard active runtime-only patches created by recovery/LLM workflows. Continue?',
+      )
+    ) {
+      return;
+    }
     try {
       setBusy(true);
       setActionError(null);
-      await applyDrafts();
+      await applyDrafts(hasRuntimeOverrides);
     } catch (e) {
       setActionError((e as Error).message);
     } finally {
       setBusy(false);
     }
-  }, [applyDrafts]);
+  }, [applyDrafts, hasRuntimeOverrides]);
 
   const handleSaveAll = useCallback(async () => {
     try {
@@ -293,7 +300,6 @@ export function ControlBar() {
 
   const handleLoad = useCallback(async () => {
     const hasDraftChanges = hasUnappliedChanges || hasUnsavedChanges;
-    const hasRuntimeOverrides = !!runtimeOverrideStatus && (runtimeOverrideStatus.hasActive || runtimeOverrideStatus.hasStaged);
     if (
       hasDraftChanges &&
       !window.confirm('Discard current draft changes and load another program?')
@@ -320,7 +326,7 @@ export function ControlBar() {
     hasUnappliedChanges,
     hasUnsavedChanges,
     programInfo?.sourcePath,
-    runtimeOverrideStatus,
+    hasRuntimeOverrides,
   ]);
 
   const finalizeBrowserSession = useCallback(
@@ -330,7 +336,6 @@ export function ControlBar() {
         setActionError(null);
 
         if (session.intent === 'load') {
-          const hasRuntimeOverrides = !!runtimeOverrideStatus && (runtimeOverrideStatus.hasActive || runtimeOverrideStatus.hasStaged);
           await loadProgram(
             session.programPath,
             session.deploymentPath.trim() === '' ? undefined : session.deploymentPath,
@@ -361,7 +366,7 @@ export function ControlBar() {
       fetchTree,
       loadProgram,
       programInfo,
-      runtimeOverrideStatus,
+      hasRuntimeOverrides,
       saveDeployment,
       saveProgram,
     ],
@@ -424,7 +429,6 @@ export function ControlBar() {
   }, [discardDrafts]);
 
   const handleRevert = useCallback(async () => {
-    const hasRuntimeOverrides = !!runtimeOverrideStatus && (runtimeOverrideStatus.hasActive || runtimeOverrideStatus.hasStaged);
     if (!hasAppliedUnsavedChanges) {
       return;
     }
@@ -503,12 +507,12 @@ export function ControlBar() {
     fetchProgramInfo,
     fetchTree,
     hasAppliedUnsavedChanges,
+    hasRuntimeOverrides,
     appliedProgramParameters,
     appliedSceneResources,
     appliedBlackboardKeys,
     appliedBlackboardNamespaces,
     programAppliedMatchesSaved,
-    runtimeOverrideStatus,
     savedDeployment,
     savedSceneResources,
     savedBlackboardKeys,

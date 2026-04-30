@@ -108,6 +108,16 @@ Detailed domain plan:
 
 - [`AI_ASSISTANT_INTEGRATION_PLAN.md`](AI_ASSISTANT_INTEGRATION_PLAN.md)
 
+Model-serving profile selection for the NemoClaw/OpenClaw-backed assistant is
+owned outside this repository by:
+
+- `/home/tndlux/workspaces/nemoclaw/src/NemoClaw-Thor/MANYFORGE-ASSISTANT-DEPLOYMENT-PLAN.md`
+
+This preview plan should reference role-based model endpoint aliases and the
+assistant provider contract. It should not hard-code a specific model family;
+the external plan currently evaluates Cosmos, Qwen3.6, and Nemotron Omni
+profiles against Thor/Orin deployment budgets.
+
 ## Shared Technical Requirements
 
 Both tracks must reuse the same:

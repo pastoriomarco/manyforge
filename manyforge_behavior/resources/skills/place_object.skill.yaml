@@ -6,7 +6,7 @@ description: >-
   Place an attached object at a target pose by approaching from above,
   descending to the target pose, opening the gripper, detaching the object,
   retreating upward, and invalidating the trajectory cache.
-compatible_profiles: [v0.0]
+compatible_profiles: [v0.1]
 
 requires:
   - "object must already be attached to the TCP"
@@ -27,8 +27,10 @@ modifies:
 requires_capabilities:
   - planning.motion.pose_goal
   - context.kinematics.fk
+  - context.pose.resolve_reference
   - scene.edit.add
   - scene.edit.remove
+  - scene.edit.attach_detach
   - execution.trajectory.execute
 
 parameters:

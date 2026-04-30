@@ -1,0 +1,41 @@
+api_version: manyforge.model_endpoint_profiles.v0
+schema_version: "0.1.0"
+profiles:
+  thor_manyforge_qwen36:
+    provider: openai
+    model_id: qwen3.6-35b-a3b-nvfp4-tq-mtp-manyforge
+    base_url: http://127.0.0.1:8000/v1
+    default_timeout_s: 30.0
+    max_tokens: 512
+    capabilities:
+      supports_response_tools: true
+      supports_json_object: true
+      supports_image_input: true
+      supported_image_transports: [inline_data_url, http_url]
+      tool_call_family: openai_chat_tools
+
+  thor_cosmos_reason2_8b:
+    provider: openai
+    model_id: cosmos-reason2-8b
+    base_url: http://127.0.0.1:8001/v1
+    default_timeout_s: 30.0
+    max_tokens: 512
+    capabilities:
+      supports_response_tools: true
+      supports_json_object: true
+      supports_image_input: true
+      supported_image_transports: [inline_data_url, http_url]
+      tool_call_family: openai_chat_tools
+
+  thor_nemotron3_nano_omni:
+    provider: openai
+    model_id: nemotron3-nano-omni-30b-a3b-nvfp4
+    base_url: http://127.0.0.1:8000/v1
+    default_timeout_s: 30.0
+    max_tokens: 512
+    capabilities:
+      supports_response_tools: true
+      supports_json_object: true
+      supports_image_input: true
+      supported_image_transports: [inline_data_url, http_url]
+      tool_call_family: qwen3_coder
