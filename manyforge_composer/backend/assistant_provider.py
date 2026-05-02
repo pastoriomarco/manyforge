@@ -1,7 +1,9 @@
 """Assistant provider boundary for model-backed Composer workflows.
 
 The provider boundary intentionally deals in reviewable proposals and tool-call
-records only.  Providers must not mutate Composer state directly.
+records only. Providers must not mutate runtime or saved state directly.
+Composer-authorized callbacks may update the in-memory Composer draft and report
+that separately from provider mutation.
 """
 from __future__ import annotations
 
@@ -10,6 +12,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Protocol
+from urllib.parse import quote
 
 from .assistant_tools import (
     AssistantToolError,
@@ -21,6 +24,17 @@ from .assistant_tools import (
 class AssistantProviderError(RuntimeError):
     """Raised when an assistant provider cannot complete a request."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str = "provider_error",
+        detail: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = code.strip() or "provider_error"
+        self.detail = (detail or message).strip()
+
 
 @dataclass(frozen=True)
 class AssistantProviderContext:
@@ -29,6 +43,7 @@ class AssistantProviderContext:
     conversation_id: str
     program_loaded: bool
     cycle_state: str
+    request_id: str = ""
     assistant_mode: str | None = None
     schema_version: str = "0.1.0"
     tool_catalog: list[dict[str, Any]] = field(default_factory=list)
@@ -47,6 +62,7 @@ class AssistantProviderResult:
     warnings: list[str] = field(default_factory=list)
     requires_review: bool = True
     mutated: bool = False
+    draft_mutated: bool = False
     timestamp_ns: int = field(default_factory=time.monotonic_ns)
 
 
@@ -356,9 +372,10 @@ class NemoClawAssistantProvider:
         request: Any,
         context: AssistantProviderContext,
     ) -> dict[str, Any]:
+        request_id = context.request_id or f"mf-{uuid.uuid4().hex[:12]}"
         payload = {
             "version": "manyforge.assistant.provider_request.v0",
-            "requestId": f"mf-{uuid.uuid4().hex[:12]}",
+            "requestId": request_id,
             "providerId": self.provider_id,
             "conversationId": context.conversation_id,
             "message": request.message,
@@ -398,12 +415,64 @@ class NemoClawAssistantProvider:
             )
         return payload
 
+    def cancel(self, request_id: str) -> dict[str, Any]:
+        """Ask the external bridge to cancel a running request."""
+        normalized_request_id = request_id.strip()
+        if not normalized_request_id:
+            raise AssistantProviderError(
+                "NemoClaw assistant cancel request_id is required",
+                code="invalid_request",
+            )
+        try:
+            import httpx
+        except ModuleNotFoundError as exc:
+            raise AssistantProviderError(
+                "httpx is required for the NemoClaw assistant provider",
+                code="missing_dependency",
+            ) from exc
+
+        headers = {"Content-Type": "application/json"}
+        if self._api_token:
+            headers["Authorization"] = f"Bearer {self._api_token}"
+        cancel_url = f"{self.endpoint_url}/{quote(normalized_request_id, safe='')}/cancel"
+        try:
+            response = httpx.post(
+                cancel_url,
+                headers=headers,
+                timeout=min(self._timeout_s, 5.0),
+            )
+            response.raise_for_status()
+            data = response.json()
+        except httpx.TimeoutException as exc:
+            raise AssistantProviderError(
+                f"NemoClaw assistant cancel timed out after {min(self._timeout_s, 5.0):.3f}s",
+                code="timeout",
+            ) from exc
+        except httpx.HTTPStatusError as exc:
+            raise AssistantProviderError(
+                "NemoClaw assistant cancel returned HTTP "
+                f"{exc.response.status_code}: {exc.response.text[:500]}",
+                code="http_error",
+            ) from exc
+        except ValueError as exc:
+            raise AssistantProviderError(
+                "NemoClaw assistant cancel returned a non-JSON response",
+                code="malformed_response",
+            ) from exc
+        if not isinstance(data, dict):
+            raise AssistantProviderError(
+                "NemoClaw assistant cancel response must be an object",
+                code="malformed_response",
+            )
+        return data
+
     def _post_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
         try:
             import httpx
         except ModuleNotFoundError as exc:
             raise AssistantProviderError(
-                "httpx is required for the NemoClaw assistant provider"
+                "httpx is required for the NemoClaw assistant provider",
+                code="missing_dependency",
             ) from exc
 
         headers = {"Content-Type": "application/json"}
@@ -420,19 +489,28 @@ class NemoClawAssistantProvider:
             data = response.json()
         except httpx.TimeoutException as exc:
             raise AssistantProviderError(
-                f"NemoClaw assistant timed out after {self._timeout_s:.3f}s"
+                f"NemoClaw assistant timed out after {self._timeout_s:.3f}s",
+                code="timeout",
             ) from exc
         except httpx.HTTPStatusError as exc:
+            provider_error = _error_from_response_json(exc.response)
+            if provider_error is not None:
+                raise provider_error from exc
             raise AssistantProviderError(
                 "NemoClaw assistant returned HTTP "
-                f"{exc.response.status_code}: {exc.response.text[:500]}"
+                f"{exc.response.status_code}: {exc.response.text[:500]}",
+                code="http_error",
             ) from exc
         except ValueError as exc:
             raise AssistantProviderError(
-                "NemoClaw assistant returned a non-JSON response"
+                "NemoClaw assistant returned a non-JSON response",
+                code="malformed_response",
             ) from exc
         if not isinstance(data, dict):
-            raise AssistantProviderError("NemoClaw assistant response must be an object")
+            raise AssistantProviderError(
+                "NemoClaw assistant response must be an object",
+                code="malformed_response",
+            )
         return data
 
     def _normalize_response(
@@ -454,7 +532,7 @@ class NemoClawAssistantProvider:
             message = f"NemoClaw assistant rejected request: {code}"
             if detail:
                 message += f": {detail}"
-            raise AssistantProviderError(message)
+            raise AssistantProviderError(message, code=code, detail=detail or message)
         if bool(data.get("mutated")):
             raise AssistantProviderError(
                 "NemoClaw assistant responses must not report state mutation"
@@ -483,6 +561,7 @@ class NemoClawAssistantProvider:
             warnings=warnings,
             requires_review=requires_review,
             mutated=False,
+            draft_mutated=bool(data.get("draftMutated", data.get("draft_mutated", False))),
         )
 
 
@@ -510,6 +589,28 @@ def build_assistant_provider(
             api_token=api_token or os.environ.get("MANYFORGE_ASSISTANT_API_TOKEN"),
         )
     raise AssistantProviderError(f"Unsupported assistant provider: {provider_id}")
+
+
+def _error_from_response_json(response: Any) -> AssistantProviderError | None:
+    try:
+        data = response.json()
+    except ValueError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    provider_error = data.get("error")
+    if not isinstance(provider_error, dict):
+        return None
+    code = str(provider_error.get("code") or "provider_error").strip()
+    detail = str(provider_error.get("detail") or "").strip()
+    message = f"NemoClaw assistant rejected request: {code}"
+    if detail:
+        message += f": {detail}"
+    return AssistantProviderError(
+        message,
+        code=code,
+        detail=detail or message,
+    )
 
 
 def assistant_provider_catalog(configured_provider: AssistantProvider | None) -> list[dict[str, Any]]:

@@ -23,6 +23,7 @@ from manyforge_behavior.nodes.scene import (
     DetachObjectFromLink,
     RemoveCollisionObject,
     UpdateCollisionObjectPose,
+    UpsertCollisionObject,
 )
 from manyforge_behavior.nodes.logic import (
     CheckKeyBoolValue,
@@ -382,6 +383,46 @@ class TestAddCollisionObject:
         status = _tick_node(node)
         assert status == py_trees.common.Status.SUCCESS
         assert len(kernel.scene_edits) == 1
+
+
+class TestUpsertCollisionObject:
+    def test_inserts_missing_object(self, kernel, bb_with_kernel):
+        node = UpsertCollisionObject(
+            name="upsert_box",
+            object_id="box1",
+            shape_type="box",
+            box_dimensions_m=[1.0, 0.5, 0.1],
+            pose={"position_m": [0.5, 0, 0.4], "orientation_xyzw": [0, 0, 0, 1]},
+            frame_id="base_link",
+        )
+        status = _tick_node(node)
+        assert status == py_trees.common.Status.SUCCESS
+        assert kernel.scene_edits[-1].operation == "upsert"
+        assert kernel.get_object_state("box1").exists is True
+
+    def test_replaces_existing_object(self, kernel, bb_with_kernel):
+        kernel.scene_edit(
+            SceneEditRequest(
+                operation="add",
+                object_id="box1",
+                shape_type="box",
+                box_dimensions_m=[0.1, 0.1, 0.1],
+                pose_position_m=[0.0, 0.0, 0.0],
+            )
+        )
+        node = UpsertCollisionObject(
+            name="upsert_box",
+            object_id="box1",
+            shape_type="sphere",
+            sphere_radius_m=0.05,
+            pose={"position_m": [0.5, 0, 0.4], "orientation_xyzw": [0, 0, 0, 1]},
+            frame_id="base_link",
+        )
+        status = _tick_node(node)
+        assert status == py_trees.common.Status.SUCCESS
+        snapshot = kernel.get_scene_objects()[0]
+        assert snapshot.shape is not None
+        assert snapshot.shape.type == "sphere"
 
 
 class TestSceneNodeBlackboardReferences:

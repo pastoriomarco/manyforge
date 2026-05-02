@@ -118,8 +118,11 @@ The pick-and-place demo exercises the full program load, native planning, scene-
 
 ManyForge exposes a full API surface for autonomous LLM agent operation:
 
-- **REST API** — FastAPI backend at `http://localhost:9000/api/`. See [`docs/guides/LLM_GUIDE.md`](docs/guides/LLM_GUIDE.md) for endpoint reference and composition patterns.
-- **MCP Server** — Model Context Protocol interface over stdio. See [`docs/reference/MCP_SCHEMA.md`](docs/reference/MCP_SCHEMA.md) for tool schemas.
+- **REST API** — FastAPI backend at `http://localhost:9000/api/`. Development
+  guidance for LLM composition lives in
+  `../manyforge_specs/docs/guides/LLM_GUIDE.md`.
+- **MCP Server** — Model Context Protocol interface over stdio. The MCP tool
+  contract lives in `../manyforge_specs/docs/reference/MCP_SCHEMA.md`.
 
 ```bash
 # Start the MCP server

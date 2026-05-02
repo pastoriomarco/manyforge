@@ -32,6 +32,7 @@ from manyforge_behavior.nodes.scene import (
     DetachObjectFromLink,
     RemoveCollisionObject,
     UpdateCollisionObjectPose,
+    UpsertCollisionObject,
 )
 from manyforge_behavior.nodes.control_flow import RepeatDecorator, RetryDecorator
 from manyforge_behavior.nodes.model import QueryModelNode
@@ -56,6 +57,7 @@ PLUGIN_FACTORY: dict[str, type] = {
     "move_manipulator_action": MoveManipulatorAction,
     "reset_trajectories": ResetTrajectories,
     "add_collision_object": AddCollisionObject,
+    "upsert_collision_object": UpsertCollisionObject,
     "remove_collision_object": RemoveCollisionObject,
     "update_collision_object_pose": UpdateCollisionObjectPose,
     "attach_object_to_link": AttachObjectToLink,

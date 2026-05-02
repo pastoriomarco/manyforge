@@ -56,6 +56,7 @@ const KIND_COLORS: Record<string, string> = {
 const SCENE_NODE_IDS_REQUIRING_SCENE_CONTEXT = new Set([
   'move_manipulator_action',
   'add_collision_object',
+  'upsert_collision_object',
   'update_collision_object_pose',
   'attach_object_to_link',
   'detach_object_from_link',
@@ -63,6 +64,7 @@ const SCENE_NODE_IDS_REQUIRING_SCENE_CONTEXT = new Set([
 
 const SCENE_OBJECT_ID_NODE_IDS = new Set([
   'add_collision_object',
+  'upsert_collision_object',
   'remove_collision_object',
   'update_collision_object_pose',
   'attach_object_to_link',
@@ -473,7 +475,7 @@ export function PropertyPanel({ onCollapse }: { onCollapse: () => void }) {
       return;
     }
 
-    if (selectedCatalogId === 'add_collision_object') {
+    if (selectedCatalogId === 'add_collision_object' || selectedCatalogId === 'upsert_collision_object') {
       const patch: Record<string, unknown> = {};
       if (typeof nodeParams.shape_type !== 'string' || nodeParams.shape_type.length === 0) {
         patch.shape_type = 'box';
@@ -905,7 +907,7 @@ export function PropertyPanel({ onCollapse }: { onCollapse: () => void }) {
       );
     }
 
-    if (selectedCatalogId === 'add_collision_object') {
+    if (selectedCatalogId === 'add_collision_object' || selectedCatalogId === 'upsert_collision_object') {
       if (param.name === 'shape_type') {
         const currentShape = typeof currentValue === 'string' && currentValue.length > 0
           ? currentValue
@@ -963,7 +965,11 @@ export function PropertyPanel({ onCollapse }: { onCollapse: () => void }) {
     }
 
     if (
-      (selectedCatalogId === 'add_collision_object' || selectedCatalogId === 'update_collision_object_pose')
+      (
+        selectedCatalogId === 'add_collision_object'
+        || selectedCatalogId === 'upsert_collision_object'
+        || selectedCatalogId === 'update_collision_object_pose'
+      )
       && param.name === 'frame_id'
     ) {
       return renderConstrainedSelect(

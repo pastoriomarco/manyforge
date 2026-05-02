@@ -68,8 +68,8 @@ Returns: `{robot: {joints, tcp_pose, robot_id, group_id}, objects: [...], timest
 
 **`manyforge_scene_edit(operation, object_id, ...)`**
 Edit the collision scene. Not allowed while cycle state is `running`.
-- `operation`: "add", "remove", "update_pose", "attach", "detach"
-- For "add": provide `shape_type` ("box"/"sphere"), dimensions, and pose
+- `operation`: "add", "upsert", "remove", "update_pose", "attach", "detach"
+- For "add"/"upsert": provide `shape_type` ("box"/"sphere"), dimensions, and pose
 - For "attach"/"detach": provide `frame_id` (robot link)
 Returns: `{success, error, timestamp_ns}`
 

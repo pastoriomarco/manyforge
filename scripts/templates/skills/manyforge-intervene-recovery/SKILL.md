@@ -29,7 +29,7 @@ Apply a recovery action to fix a failed program execution and resume.
 Use when objects are missing, misplaced, or blocking the path.
 
 ```
-1. manyforge_scene_edit(operation="add"|"remove"|"update_pose",
+1. manyforge_scene_edit(operation="add"|"upsert"|"remove"|"update_pose",
       object_id="...", ...)
 2. manyforge_cycle_control(command="reset")
 3. manyforge_cycle_control(command="run")

@@ -154,6 +154,20 @@ class TestSceneEdit:
         })
         assert result["success"] is True
 
+    def test_upsert_object(self):
+        state = _make_state()
+        state.load_program(_PROGRAM_PATH, _DEPLOYMENT_PATH)
+        mcp = create_mcp_server(state)
+        result = _call(mcp, "manyforge_scene_edit", {
+            "operation": "upsert",
+            "object_id": "test_box",
+            "shape_type": "box",
+            "box_dimensions_m": [0.05, 0.05, 0.05],
+            "pose_position_m": [0.3, 0.0, 0.15],
+            "pose_orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+        })
+        assert result["success"] is True
+
     def test_remove_nonexistent_object(self):
         state = _make_state()
         state.load_program(_PROGRAM_PATH, _DEPLOYMENT_PATH)

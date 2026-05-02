@@ -16,6 +16,7 @@ from manyforge_behavior.program import (
     tree_node_from_dict,
 )
 
+from .assistant_tool_schemas import enrich_assistant_tool_descriptor
 from .models import (
     LoadProgramRequest,
     ProgramResponse,
@@ -184,7 +185,7 @@ def _tool_catalog_payload(deployment: Deployment) -> list[dict]:
             "description": tool.description,
         }
         raw.update(tool.extra)
-        tools.append(raw)
+        tools.append(enrich_assistant_tool_descriptor(raw))
     return tools
 
 

@@ -4,13 +4,18 @@ Implements the assistant-provider HTTP contract against a local
 OpenAI-compatible LLM endpoint (typically vLLM on the deployment host).
 Receives ManyForge envelopes, validates them per the bounded-autonomy
 spec, runs a bounded multi-turn loop against the upstream LLM, executes
-only `effect: read_only` tools through ManyForge callbacks, and returns
-ManyForge-shaped responses.
+callback-safe tools through ManyForge callbacks, and returns ManyForge-shaped
+responses.
 
 This is the local enforcement point for the bounded-autonomy invariant
-defined in `manyforge_specs/docs/spec/480-assistant-modes-and-bounded-autonomy.md`.
-Architectural design: `manyforge_specs/docs/spec/485-assistant-bridge-architecture.md`.
-Wire contract: `../docs/reference/ASSISTANT_BACKEND_CONTRACT.md`.
+defined in
+[`../../manyforge_specs/docs/spec/480-assistant-modes-and-bounded-autonomy.md`](../../manyforge_specs/docs/spec/480-assistant-modes-and-bounded-autonomy.md).
+Architectural design:
+[`../../manyforge_specs/docs/spec/485-assistant-bridge-architecture.md`](../../manyforge_specs/docs/spec/485-assistant-bridge-architecture.md).
+Wire contract:
+[`../../manyforge_specs/docs/reference/ASSISTANT_BACKEND_CONTRACT.md`](../../manyforge_specs/docs/reference/ASSISTANT_BACKEND_CONTRACT.md).
+Cold-boot and live E2E cookbook:
+`../docs/operations/ASSISTANT_E2E_COOKBOOK.md`.
 
 ## What this does
 
@@ -19,13 +24,14 @@ Wire contract: `../docs/reference/ASSISTANT_BACKEND_CONTRACT.md`.
   malformed catalog, etc.), filters `tools[]` to the embedded catalog,
   converts ManyForge tool descriptors to OpenAI shape, maps ManyForge
   ids such as `program.read` to model-safe function names, dispatches
-  to the upstream LLM, executes in-catalog `effect: read_only` calls via
+  to the upstream LLM, executes in-catalog callback-safe calls via
   Composer callbacks, hard-rejects any out-of-catalog tool calls, and
   returns a ManyForge-shaped envelope with `mutated: false`,
-  `requiresReview: true`.
+  `requiresReview: true`, and `draftMutated: true` when a Composer
+  draft callback changed the in-memory session.
 - `POST /v1/manyforge/assistant/{requestId}/cancel` — marks a running
   or not-yet-started request as cancelled. The bridge checks this before
-  each model turn and before each read-only callback; cancelled requests
+  each model turn and before each callback; cancelled requests
   return an error envelope with `error.code: "cancelled"`.
 - `GET /healthz` — liveness + upstream URL + resolved model identifier.
 
@@ -34,10 +40,21 @@ Wire contract: `../docs/reference/ASSISTANT_BACKEND_CONTRACT.md`.
 - `read_only` — executed in-loop through
   `POST <manyforge>/api/assistant/bridge/tools/{toolId}`. Callback
   results are fed back to the model as tool results.
+- `composer_draft_mutating` — executed in-loop only in
+  `composer-assistant`. These callbacks may change the in-memory
+  Composer draft/session and are reported with `draftMutated: true`.
 - `proposal` — never executed by the bridge. The bridge stops the loop
   and returns draft proposals for ManyForge review.
 - `runtime_mutating` — never executed by the bridge. These are runtime
   action descriptors for ManyForge policy/recovery paths.
+
+When a tool descriptor includes `inputSchema`, `input_schema`, or
+`parameters` as a JSON Schema object, the bridge forwards that schema to
+the upstream model as the OpenAI-compatible function `parameters`. Known
+ManyForge callback tools are also enriched by Composer with built-in
+schemas. Tools without a declared or built-in schema use a permissive
+object schema for compatibility, but callback execution remains validated
+by ManyForge.
 
 ## Setup
 
@@ -64,13 +81,26 @@ Environment overrides:
 | `BRIDGE_HOST` | `127.0.0.1` | bind address |
 | `BRIDGE_PORT` | `8100` | bind port |
 | `BRIDGE_UPSTREAM_BASE_URL` | `http://127.0.0.1:8000/v1` | OpenAI-compatible LLM endpoint |
-| `BRIDGE_MANYFORGE_BASE_URL` | `http://127.0.0.1:9000` | ManyForge Composer API base URL for read-only callbacks |
+| `BRIDGE_MANYFORGE_BASE_URL` | `http://127.0.0.1:9000` | ManyForge Composer API base URL for callbacks |
 | `BRIDGE_MODEL` | _auto-discovered_ | model identifier sent in chat-completion requests; auto-discovery picks the first model from `/v1/models` if unset |
 | `BRIDGE_AUDIT_LOG` | `manyforge_assistant_bridge/audit.log` | JSONL audit trail |
 | `BRIDGE_REQUEST_TIMEOUT_S` | `60` | per-upstream-call timeout cap |
-| `BRIDGE_CALLBACK_TIMEOUT_S` | `10` | per-read-only-callback timeout |
+| `BRIDGE_CALLBACK_TIMEOUT_S` | `10` | per-callback timeout |
 | `BRIDGE_MAX_TURNS` | `4` | maximum model turns per request |
 | `BRIDGE_MAX_WALL_TIME_S` | `60` | maximum wall time per bridge request |
+| `BRIDGE_UPSTREAM_MAX_TOKENS` | `512` | upstream chat-completion output token cap |
+| `BRIDGE_UPSTREAM_TEMPERATURE` | `0.0` | upstream sampling temperature |
+| `BRIDGE_UPSTREAM_TOP_P` | _unset_ | optional upstream nucleus-sampling cap |
+| `BRIDGE_UPSTREAM_TOP_K` | _unset_ | optional upstream top-k sampling cap |
+| `BRIDGE_UPSTREAM_ENABLE_THINKING` | _unset_ | optional `chat_template_kwargs.enable_thinking` boolean for runtimes that support it |
+| `BRIDGE_UPSTREAM_THINKING_TOKEN_BUDGET` | _unset_ | optional `chat_template_kwargs.thinking_token_budget` integer |
+
+For Nemotron 3 Nano Omni quick tool-call smoke tests, the observed useful
+non-thinking profile is `BRIDGE_UPSTREAM_ENABLE_THINKING=false`,
+`BRIDGE_UPSTREAM_TEMPERATURE=0.2`, and `BRIDGE_UPSTREAM_TOP_K=1`. Reasoning
+mode should use a larger token budget; with a small `max_tokens` cap the model
+can spend the whole response in the reasoning channel before emitting a tool
+call.
 
 ## Wiring ManyForge to the bridge
 

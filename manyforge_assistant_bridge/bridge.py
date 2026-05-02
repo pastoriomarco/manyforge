@@ -3,16 +3,17 @@
 Receives `manyforge.assistant.provider_request.v0` envelopes with the v0.1
 `schemaVersion`, `assistantMode`, and embedded mode catalog fields. The bridge
 enforces the bounded catalog, runs a small multi-turn loop against an
-OpenAI-compatible upstream model, and executes only `effect: read_only` tools
+OpenAI-compatible upstream model, and executes only callback-safe tool effects
 through ManyForge callbacks.
 
 Architecture: see `manyforge_specs/docs/spec/485-assistant-bridge-architecture.md`.
-Wire contract: see `manyforge/docs/reference/ASSISTANT_BACKEND_CONTRACT.md`.
+Wire contract: see `manyforge_specs/docs/reference/ASSISTANT_BACKEND_CONTRACT.md`.
 Mode/catalog spec: see `manyforge_specs/docs/spec/480-assistant-modes-and-bounded-autonomy.md`.
 """
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import logging
@@ -52,6 +53,22 @@ REQUEST_TIMEOUT_S = float(os.environ.get("BRIDGE_REQUEST_TIMEOUT_S", "60"))
 CALLBACK_TIMEOUT_S = float(os.environ.get("BRIDGE_CALLBACK_TIMEOUT_S", "10"))
 MAX_TURNS = max(1, int(os.environ.get("BRIDGE_MAX_TURNS", "4")))
 MAX_WALL_TIME_S = float(os.environ.get("BRIDGE_MAX_WALL_TIME_S", str(REQUEST_TIMEOUT_S)))
+UPSTREAM_MAX_TOKENS = max(1, int(os.environ.get("BRIDGE_UPSTREAM_MAX_TOKENS", "512")))
+UPSTREAM_TEMPERATURE = float(os.environ.get("BRIDGE_UPSTREAM_TEMPERATURE", "0.0"))
+UPSTREAM_TOP_P_RAW = os.environ.get("BRIDGE_UPSTREAM_TOP_P", "").strip()
+UPSTREAM_TOP_P = float(UPSTREAM_TOP_P_RAW) if UPSTREAM_TOP_P_RAW else None
+UPSTREAM_TOP_K_RAW = os.environ.get("BRIDGE_UPSTREAM_TOP_K", "").strip()
+UPSTREAM_TOP_K = int(UPSTREAM_TOP_K_RAW) if UPSTREAM_TOP_K_RAW else None
+UPSTREAM_ENABLE_THINKING_RAW = os.environ.get("BRIDGE_UPSTREAM_ENABLE_THINKING", "").strip()
+UPSTREAM_THINKING_TOKEN_BUDGET_RAW = os.environ.get(
+    "BRIDGE_UPSTREAM_THINKING_TOKEN_BUDGET",
+    "",
+).strip()
+UPSTREAM_THINKING_TOKEN_BUDGET = (
+    int(UPSTREAM_THINKING_TOKEN_BUDGET_RAW)
+    if UPSTREAM_THINKING_TOKEN_BUDGET_RAW
+    else None
+)
 
 # Model selection: explicit env var preferred; auto-discovery from upstream
 # as fallback. The bridge does not read the deployment artifact; ManyForge
@@ -63,6 +80,7 @@ SUPPORTED_SCHEMA_VERSION_MIN = (0, 1, 0)
 SUPPORTED_VERSION_FAMILY = "manyforge.assistant.provider_request.v0"
 READ_ONLY_EFFECT = "read_only"
 PROPOSAL_EFFECT = "proposal"
+COMPOSER_DRAFT_MUTATING_EFFECT = "composer_draft_mutating"
 RUNTIME_MUTATING_EFFECT = "runtime_mutating"
 
 _CANCELLED_REQUESTS: set[str] = set()
@@ -151,6 +169,7 @@ def _envelope_error(
         "proposals": [],
         "warnings": [detail],
         "mutated": False,
+        "draftMutated": False,
         "requiresReview": True,
     }
     return JSONResponse(status_code=http_status, content=body)
@@ -281,6 +300,20 @@ def _safe_model_tool_name(tool_id: str, used: set[str]) -> str:
     return alias
 
 
+def _optional_bool_from_env(raw: str) -> bool | None:
+    if not raw:
+        return None
+    normalized = raw.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(
+        "BRIDGE_UPSTREAM_ENABLE_THINKING must be one of: "
+        "1, true, yes, on, 0, false, no, off"
+    )
+
+
 def _manyforge_tool_to_openai(
     tool: dict[str, Any],
     *,
@@ -301,12 +334,39 @@ def _manyforge_tool_to_openai(
         "function": {
             "name": model_name,
             "description": description,
-            "parameters": {
-                "type": "object",
-                "properties": {},
-                "additionalProperties": True,
-            },
+            "parameters": _tool_parameters_schema(tool),
         },
+    }
+
+
+_JSON_SCHEMA_MARKER_KEYS = {
+    "$schema",
+    "$defs",
+    "additionalProperties",
+    "allOf",
+    "anyOf",
+    "oneOf",
+    "properties",
+    "required",
+    "type",
+}
+
+
+def _tool_parameters_schema(tool: dict[str, Any]) -> dict[str, Any]:
+    """Return the OpenAI function parameters schema for a ManyForge tool."""
+    for key in ("parameters", "inputSchema", "input_schema"):
+        raw_schema = tool.get(key)
+        if isinstance(raw_schema, dict) and (
+            _JSON_SCHEMA_MARKER_KEYS.intersection(raw_schema)
+        ):
+            schema = copy.deepcopy(raw_schema)
+            schema.setdefault("type", "object")
+            schema.setdefault("properties", {})
+            return schema
+    return {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": True,
     }
 
 
@@ -354,7 +414,7 @@ def _build_tool_bindings(
 
 
 # ---------------------------------------------------------------------------
-# Upstream LLM dispatch and ManyForge read-only callback
+# Upstream LLM dispatch and ManyForge callback execution
 # ---------------------------------------------------------------------------
 
 
@@ -369,8 +429,21 @@ async def _call_upstream(
     body: dict[str, Any] = {
         "model": model,
         "messages": messages,
-        "temperature": 0.0,
+        "temperature": UPSTREAM_TEMPERATURE,
+        "max_tokens": UPSTREAM_MAX_TOKENS,
     }
+    if UPSTREAM_TOP_P is not None:
+        body["top_p"] = UPSTREAM_TOP_P
+    if UPSTREAM_TOP_K is not None:
+        body["top_k"] = UPSTREAM_TOP_K
+    chat_template_kwargs: dict[str, Any] = {}
+    enable_thinking = _optional_bool_from_env(UPSTREAM_ENABLE_THINKING_RAW)
+    if enable_thinking is not None:
+        chat_template_kwargs["enable_thinking"] = enable_thinking
+    if UPSTREAM_THINKING_TOKEN_BUDGET is not None:
+        chat_template_kwargs["thinking_token_budget"] = UPSTREAM_THINKING_TOKEN_BUDGET
+    if chat_template_kwargs:
+        body["chat_template_kwargs"] = chat_template_kwargs
     if tools:
         body["tools"] = tools
         body["tool_choice"] = "auto"
@@ -382,7 +455,7 @@ async def _call_upstream(
         return resp.json()
 
 
-async def _execute_read_only_tool(
+async def _execute_callback_tool(
     *,
     request_id: str,
     conversation_id: str | None,
@@ -390,8 +463,9 @@ async def _execute_read_only_tool(
     catalog_hash: str,
     tool_id: str,
     arguments: dict[str, Any],
+    effect: str,
 ) -> dict[str, Any]:
-    """Execute one read-only tool through ManyForge's callback surface."""
+    """Execute one callback-safe tool through ManyForge's callback surface."""
     url = (
         f"{MANYFORGE_BASE_URL.rstrip('/')}/api/assistant/bridge/tools/"
         f"{quote(tool_id, safe='')}"
@@ -409,14 +483,16 @@ async def _execute_read_only_tool(
     except httpx.TimeoutException:
         return {
             "success": False,
-            "error": f"read-only callback for {tool_id} timed out after {CALLBACK_TIMEOUT_S}s",
+            "error": f"callback for {tool_id} timed out after {CALLBACK_TIMEOUT_S}s",
             "mutated": False,
+            "draftMutated": False,
         }
     except Exception as exc:
         return {
             "success": False,
-            "error": f"read-only callback for {tool_id} failed: {exc!r}",
+            "error": f"callback for {tool_id} failed: {exc!r}",
             "mutated": False,
+            "draftMutated": False,
         }
 
     if resp.status_code >= 400:
@@ -424,6 +500,7 @@ async def _execute_read_only_tool(
             "success": False,
             "error": f"ManyForge callback returned HTTP {resp.status_code}: {resp.text[:300]}",
             "mutated": False,
+            "draftMutated": False,
         }
 
     try:
@@ -433,21 +510,35 @@ async def _execute_read_only_tool(
             "success": False,
             "error": f"ManyForge callback returned non-JSON response: {exc!r}",
             "mutated": False,
+            "draftMutated": False,
         }
     if not isinstance(data, dict):
         return {
             "success": False,
             "error": "ManyForge callback response must be a JSON object",
             "mutated": False,
+            "draftMutated": False,
         }
-    if data.get("mutated") is True:
+    if data.get("mutated") is True and effect != COMPOSER_DRAFT_MUTATING_EFFECT:
         return {
             "success": False,
             "error": f"ManyForge callback for {tool_id} reported mutation; rejected",
             "mutated": False,
+            "draftMutated": False,
         }
+    if effect == COMPOSER_DRAFT_MUTATING_EFFECT:
+        data["draftMutated"] = bool(data.get("mutated") or data.get("draftMutated"))
+    else:
+        data["draftMutated"] = False
     data["mutated"] = False
     return data
+
+
+async def _execute_read_only_tool(
+    **kwargs: Any,
+) -> dict[str, Any]:
+    """Compatibility wrapper for tests and older imports."""
+    return await _execute_callback_tool(effect=READ_ONLY_EFFECT, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -605,16 +696,19 @@ def _success_envelope(
     proposals: list[dict[str, Any]],
     tool_calls: list[dict[str, Any]],
     warnings: list[str] | None = None,
+    draft_mutated: bool = False,
 ) -> dict[str, Any]:
+    message = message_text.strip() or "Assistant completed without a text response."
     return {
         "version": SUPPORTED_VERSION_FAMILY,
         "schemaVersion": "0.1.0",
         "requestId": request_id,
-        "message": message_text,
+        "message": message,
         "toolCalls": tool_calls,
         "proposals": proposals,
         "warnings": list(warnings or []),
         "mutated": False,
+        "draftMutated": draft_mutated,
         "requiresReview": True,
     }
 
@@ -779,7 +873,8 @@ async def assistant(request: Request) -> JSONResponse:
         request_tools = []
     bindings = _build_tool_bindings(request_tools, allowed_tool_ids)
 
-    completed_read_only_calls: list[dict[str, Any]] = []
+    completed_callback_calls: list[dict[str, Any]] = []
+    draft_mutated = False
     warnings: list[str] = []
 
     try:
@@ -877,24 +972,58 @@ async def assistant(request: Request) -> JSONResponse:
                     http_status=200,
                 )
 
-            read_only_calls = [
-                call for call in accepted_calls if call.effect == READ_ONLY_EFFECT
-            ]
+            callback_calls: list[ClassifiedCall] = []
+            invalid_callback_calls: list[ClassifiedCall] = []
+            for call in accepted_calls:
+                if call.effect == READ_ONLY_EFFECT:
+                    callback_calls.append(call)
+                elif call.effect == COMPOSER_DRAFT_MUTATING_EFFECT:
+                    if assistant_mode == "composer-assistant":
+                        callback_calls.append(call)
+                    else:
+                        invalid_callback_calls.append(call)
+
+            if invalid_callback_calls:
+                detail = (
+                    "composer_draft_mutating tools may only execute in "
+                    "assistantMode 'composer-assistant': "
+                    + ", ".join(call.canonical_name for call in invalid_callback_calls)
+                )
+                _audit_record(
+                    {
+                        "ts": time.time(),
+                        "requestId": request_id,
+                        "assistantMode": assistant_mode,
+                        "catalogHash": catalog_hash,
+                        "model": model,
+                        "turnCount": turn_index,
+                        "durationMs": round(duration_ms, 1),
+                        "exitReason": "response_rejected",
+                        "detail": detail,
+                    }
+                )
+                return _envelope_error(
+                    request_id=request_id,
+                    code="response_rejected",
+                    detail=detail,
+                    http_status=200,
+                )
+
             descriptor_calls = [
-                call for call in accepted_calls if call.effect != READ_ONLY_EFFECT
+                call for call in accepted_calls if call not in callback_calls
             ]
 
             if descriptor_calls:
-                if read_only_calls:
+                if callback_calls:
                     warnings.append(
-                        "model returned read_only calls together with proposal/runtime "
+                        "model returned callback-safe calls together with proposal/runtime "
                         "descriptors; descriptor response ended the loop"
                     )
                 proposals = [
                     _shape_proposal_from_tool_call(call.canonical_call)
                     for call in descriptor_calls
                 ]
-                tool_calls = completed_read_only_calls + [
+                tool_calls = completed_callback_calls + [
                     _shape_tool_call_record(call.canonical_call)
                     for call in descriptor_calls
                 ]
@@ -909,6 +1038,7 @@ async def assistant(request: Request) -> JSONResponse:
                             "toolCallNames": [call["name"] for call in tool_calls],
                             "proposalCount": len(proposals),
                             "warnings": len(warnings),
+                            "draftMutated": draft_mutated,
                         },
                         "turnCount": turn_index,
                         "durationMs": round(duration_ms, 1),
@@ -923,10 +1053,11 @@ async def assistant(request: Request) -> JSONResponse:
                         proposals=proposals,
                         tool_calls=tool_calls,
                         warnings=warnings,
+                        draft_mutated=draft_mutated,
                     ),
                 )
 
-            if not read_only_calls:
+            if not callback_calls:
                 _audit_record(
                     {
                         "ts": time.time(),
@@ -935,9 +1066,10 @@ async def assistant(request: Request) -> JSONResponse:
                         "catalogHash": catalog_hash,
                         "model": model,
                         "responseShape": {
-                            "toolCallNames": [call["name"] for call in completed_read_only_calls],
+                            "toolCallNames": [call["name"] for call in completed_callback_calls],
                             "proposalCount": 0,
                             "warnings": len(warnings),
+                            "draftMutated": draft_mutated,
                         },
                         "turnCount": turn_index,
                         "durationMs": round(duration_ms, 1),
@@ -950,15 +1082,16 @@ async def assistant(request: Request) -> JSONResponse:
                         request_id=request_id,
                         message_text=message_text,
                         proposals=[],
-                        tool_calls=completed_read_only_calls,
+                        tool_calls=completed_callback_calls,
                         warnings=warnings,
+                        draft_mutated=draft_mutated,
                     ),
                 )
 
             if turn_index >= MAX_TURNS:
                 detail = (
                     f"bridge reached maxTurns={MAX_TURNS} while the model still "
-                    "requested read-only tools"
+                    "requested callback tools"
                 )
                 _audit_record(
                     {
@@ -981,17 +1114,20 @@ async def assistant(request: Request) -> JSONResponse:
                 )
 
             messages.append(assistant_msg)
-            for call in read_only_calls:
+            for call in callback_calls:
                 _raise_if_cancelled(request_id)
-                result = await _execute_read_only_tool(
+                result = await _execute_callback_tool(
                     request_id=request_id,
                     conversation_id=conversation_id,
                     assistant_mode=assistant_mode,
                     catalog_hash=catalog_hash,
                     tool_id=call.canonical_name,
                     arguments=call.arguments,
+                    effect=call.effect,
                 )
-                completed_read_only_calls.append(
+                if result.get("draftMutated") is True:
+                    draft_mutated = True
+                completed_callback_calls.append(
                     _shape_tool_call_record(
                         call.canonical_call,
                         status="completed" if result.get("success") is not False else "failed",

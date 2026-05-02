@@ -422,6 +422,30 @@ class TestSceneEditInvariants:
         assert result.success is False
         assert result.error is not None
 
+    def test_scene_upsert_insert_or_replace(self, kernel: KernelClient) -> None:
+        """
+        INVARIANT: Upsert inserts missing objects and replaces existing objects.
+        """
+        insert_request = SceneEditRequest(
+            operation="upsert",
+            object_id="ensure_obj",
+            shape_type="box",
+            box_dimensions_m=[0.1, 0.1, 0.1],
+            pose_position_m=[0.0, 0.0, 0.0],
+        )
+        insert_result = kernel.scene_edit(insert_request)
+        assert insert_result.success is True
+
+        replace_request = SceneEditRequest(
+            operation="upsert",
+            object_id="ensure_obj",
+            shape_type="sphere",
+            sphere_radius_m=0.03,
+            pose_position_m=[0.2, 0.0, 0.1],
+        )
+        replace_result = kernel.scene_edit(replace_request)
+        assert replace_result.success is True
+
 
 # =============================================================================
 # D. Cache Invariants (4+ tests)

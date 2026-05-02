@@ -32,6 +32,34 @@ class _SceneCallbackMixin:
             callback(operation, request)
 
 
+def _resolve_collision_object_request(
+    blackboard: py_trees.blackboard.Client,
+    params: dict[str, Any],
+    *,
+    operation: str,
+) -> SceneEditRequest:
+    object_id = resolve_blackboard_value(blackboard, params.get("object_id", ""))
+    shape_type = resolve_blackboard_value(blackboard, params.get("shape_type"))
+    box_dimensions_m = resolve_blackboard_value(blackboard, params.get("box_dimensions_m"))
+    sphere_radius_m = resolve_blackboard_value(blackboard, params.get("sphere_radius_m"))
+    pose = resolve_blackboard_value(blackboard, params.get("pose", {}))
+    frame_id = resolve_blackboard_value(blackboard, params.get("frame_id"))
+    orient = pose.get("orientation_xyzw") or (
+        _rpy_deg_to_xyzw(pose["orientation_rpy_deg"])
+        if "orientation_rpy_deg" in pose else None
+    )
+    return SceneEditRequest(
+        operation=operation,
+        object_id=object_id,
+        shape_type=shape_type,
+        box_dimensions_m=box_dimensions_m,
+        sphere_radius_m=sphere_radius_m,
+        pose_position_m=pose.get("position_m"),
+        pose_orientation_xyzw=orient,
+        frame_id=frame_id,
+    )
+
+
 class AddCollisionObject(_SceneCallbackMixin, py_trees.behaviour.Behaviour):
     """Add a collision object to the backend scene via the kernel."""
 
@@ -49,44 +77,49 @@ class AddCollisionObject(_SceneCallbackMixin, py_trees.behaviour.Behaviour):
     def update(self) -> py_trees.common.Status:
         kernel: KernelClient = self.blackboard.kernel
         try:
-            object_id = resolve_blackboard_value(
-                self.blackboard, self._params.get("object_id", "")
-            )
-            shape_type = resolve_blackboard_value(
-                self.blackboard, self._params.get("shape_type")
-            )
-            box_dimensions_m = resolve_blackboard_value(
-                self.blackboard, self._params.get("box_dimensions_m")
-            )
-            sphere_radius_m = resolve_blackboard_value(
-                self.blackboard, self._params.get("sphere_radius_m")
-            )
-            pose = resolve_blackboard_value(
-                self.blackboard, self._params.get("pose", {})
-            )
-            frame_id = resolve_blackboard_value(
-                self.blackboard, self._params.get("frame_id")
+            request = _resolve_collision_object_request(
+                self.blackboard,
+                self._params,
+                operation="add",
             )
         except (AttributeError, KeyError) as exc:
             self.feedback_message = str(exc)
             return py_trees.common.Status.FAILURE
-        orient = pose.get("orientation_xyzw") or (
-            _rpy_deg_to_xyzw(pose["orientation_rpy_deg"])
-            if "orientation_rpy_deg" in pose else None
-        )
-        request = SceneEditRequest(
-            operation="add",
-            object_id=object_id,
-            shape_type=shape_type,
-            box_dimensions_m=box_dimensions_m,
-            sphere_radius_m=sphere_radius_m,
-            pose_position_m=pose.get("position_m"),
-            pose_orientation_xyzw=orient,
-            frame_id=frame_id,
-        )
         result = kernel.scene_edit(request)
         if result.success:
             self._emit_scene_callback("add", request)
+            return py_trees.common.Status.SUCCESS
+        return py_trees.common.Status.FAILURE
+
+
+class UpsertCollisionObject(_SceneCallbackMixin, py_trees.behaviour.Behaviour):
+    """Insert or replace a collision object in the backend scene via the kernel."""
+
+    def __init__(self, name: str, **kwargs: Any):
+        super().__init__(name=name)
+        self._params = kwargs
+
+    def setup(self, **kwargs: Any) -> None:
+        self.blackboard = self.attach_blackboard_client()
+        self.blackboard.register_key(
+            key="kernel", access=py_trees.common.Access.READ
+        )
+        self._register_scene_callback_key()
+
+    def update(self) -> py_trees.common.Status:
+        kernel: KernelClient = self.blackboard.kernel
+        try:
+            request = _resolve_collision_object_request(
+                self.blackboard,
+                self._params,
+                operation="upsert",
+            )
+        except (AttributeError, KeyError) as exc:
+            self.feedback_message = str(exc)
+            return py_trees.common.Status.FAILURE
+        result = kernel.scene_edit(request)
+        if result.success:
+            self._emit_scene_callback("upsert", request)
             return py_trees.common.Status.SUCCESS
         return py_trees.common.Status.FAILURE
 

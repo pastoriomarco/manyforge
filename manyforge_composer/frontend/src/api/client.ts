@@ -22,6 +22,11 @@ import type {
   SceneEditResponse,
   SceneFramesResponse,
   SceneFrameVisibilityResponse,
+  AssistantChatRequest,
+  AssistantChatResponse,
+  AssistantProviderCatalog,
+  AssistantRequestStatus,
+  AssistantCancelResponse,
 } from '../types/api';
 
 const BASE_URL = import.meta.env.VITE_API_URL || '';
@@ -142,5 +147,22 @@ export const api = {
     frames: () => request<SceneFramesResponse>('GET', '/api/scene/frames'),
     setFrameVisibility: (frameName: string, visible: boolean) =>
       request<SceneFrameVisibilityResponse>('POST', '/api/scene/frames/visibility', { frameName, visible }),
+  },
+  assistant: {
+    providers: () =>
+      request<AssistantProviderCatalog>('GET', '/api/assistant/providers'),
+    chat: (payload: AssistantChatRequest) =>
+      request<AssistantChatResponse>('POST', '/api/assistant/chat', payload),
+    status: (requestId: string) =>
+      request<AssistantRequestStatus>(
+        'GET',
+        `/api/assistant/requests/${encodeURIComponent(requestId)}`,
+      ),
+    cancel: (requestId: string) =>
+      request<AssistantCancelResponse>(
+        'POST',
+        `/api/assistant/requests/${encodeURIComponent(requestId)}/cancel`,
+        {},
+      ),
   },
 };

@@ -88,15 +88,16 @@ def create_mcp_server(state: ComposerState):
 
         Operations:
         - "add": Add a collision object (requires shape_type, pose)
+        - "upsert": Add or replace a collision object (requires shape_type, pose)
         - "remove": Remove a collision object
         - "update_pose": Move an existing object
         - "attach": Attach object to a robot link (frame_id required)
         - "detach": Detach object from robot link (frame_id required)
 
         Args:
-            operation: One of "add", "remove", "update_pose", "attach", "detach"
+            operation: One of "add", "upsert", "remove", "update_pose", "attach", "detach"
             object_id: Unique identifier for the scene object
-            shape_type: Shape type for "add" — "box" or "sphere"
+            shape_type: Shape type for "add"/"upsert" — "box" or "sphere"
             box_dimensions_m: [x, y, z] dimensions for box shapes
             sphere_radius_m: Radius for sphere shapes
             pose_position_m: [x, y, z] position in meters

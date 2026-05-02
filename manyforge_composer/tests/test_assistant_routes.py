@@ -74,6 +74,7 @@ def test_assistant_chat_returns_reviewable_mock_scene_proposal(
 
     assert response.status_code == 200
     data = response.json()
+    assert data["requestId"].startswith("mf-")
     assert data["mode"] == "mock"
     assert data["mutated"] is False
     assert data["requiresReview"] is True
@@ -197,6 +198,25 @@ def test_assistant_chat_provider_mode_uses_configured_provider(
     assert data["mutated"] is False
 
 
+def test_assistant_chat_rejects_unconfigured_provider_id(
+    client: TestClient,
+    state: ComposerState,
+) -> None:
+    state.assistant_provider = DeterministicSceneAuthoringProvider()
+
+    response = client.post(
+        "/api/assistant/chat",
+        json={
+            "message": "inspect scene",
+            "mode": "provider",
+            "providerId": "nemoclaw",
+        },
+    )
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Requested assistant provider is not configured"
+
+
 def test_assistant_chat_provider_mode_uses_deployment_assistant_config(
     client: TestClient,
     state: ComposerState,
@@ -276,16 +296,19 @@ def test_nemoclaw_provider_sends_v01_assistant_mode_catalog(
             "mode": "provider",
             "providerId": "nemoclaw",
             "assistantMode": "query",
+            "requestId": "req-v01-catalog",
             "requestedTools": ["program.read"],
         },
     )
 
     assert response.status_code == 200
     data = response.json()
+    assert data["requestId"] == "req-v01-catalog"
     assert data["assistantMode"] == "query"
     assert data["toolCalls"][0]["name"] == "program.read"
     payload = payloads[0]
     assert payload["version"] == "manyforge.assistant.provider_request.v0"
+    assert payload["requestId"] == "req-v01-catalog"
     assert payload["schemaVersion"] == "0.1.0"
     assert payload["assistantMode"] == "query"
     assert payload["catalog"] == {
@@ -293,28 +316,19 @@ def test_nemoclaw_provider_sends_v01_assistant_mode_catalog(
         "tools": ["program.read", "program.validate", "status.read", "scene.inspect"],
         "nodes": [],
     }
-    assert payload["tools"] == [
-        {
-            "id": "program.read",
-            "effect": "read_only",
-            "description": "Read the loaded program.",
-        },
-        {
-            "id": "program.validate",
-            "effect": "read_only",
-            "description": "Validate the loaded program.",
-        },
-        {
-            "id": "status.read",
-            "effect": "read_only",
-            "description": "Read runtime status.",
-        },
-        {
-            "id": "scene.inspect",
-            "effect": "read_only",
-            "description": "Inspect backend scene state.",
-        },
+    assert [tool["id"] for tool in payload["tools"]] == [
+        "program.read",
+        "program.validate",
+        "status.read",
+        "scene.inspect",
     ]
+    assert payload["tools"][0]["effect"] == "read_only"
+    assert payload["tools"][0]["description"] == "Read the loaded program."
+    assert payload["tools"][0]["inputSchema"] == {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": False,
+    }
 
 
 def test_assistant_mode_rejects_requested_tools_outside_catalog(
@@ -343,14 +357,7 @@ def test_assistant_bridge_read_only_callback_returns_program_state(
     state: ComposerState,
 ) -> None:
     state.deployment = _assistant_mode_deployment()
-    catalog_hash = routes_assistant._compute_assistant_catalog_hash(
-        {
-            "skills": [],
-            "tools": ["program.read", "program.validate", "status.read", "scene.inspect"],
-            "nodes": [],
-        },
-        "query",
-    )
+    catalog_hash = _assistant_catalog_hash(state, "query")
 
     response = client.post(
         "/api/assistant/bridge/tools/program.read",
@@ -377,14 +384,7 @@ def test_assistant_bridge_read_only_callback_rejects_proposal_tools(
     state: ComposerState,
 ) -> None:
     state.deployment = _assistant_mode_deployment()
-    catalog_hash = routes_assistant._compute_assistant_catalog_hash(
-        {
-            "skills": [],
-            "tools": ["program.read", "tree.insert_node"],
-            "nodes": [],
-        },
-        "composer-assistant",
-    )
+    catalog_hash = _assistant_catalog_hash(state, "composer-assistant")
 
     response = client.post(
         "/api/assistant/bridge/tools/tree.insert_node",
@@ -397,7 +397,454 @@ def test_assistant_bridge_read_only_callback_rejects_proposal_tools(
     )
 
     assert response.status_code == 403
-    assert "read_only tools only" in response.json()["detail"]
+    assert "bridge callbacks may execute only" in response.json()["detail"]
+
+
+def test_assistant_bridge_composer_draft_callback_applies_scene_resource(
+    client: TestClient,
+    state: ComposerState,
+    tmp_path: Path,
+) -> None:
+    program_path = _write_minimal_program(tmp_path)
+    state.load_program(str(program_path))
+    state.deployment = _assistant_mode_deployment()
+    before_generation = state.program_session_generation
+    catalog_hash = _assistant_catalog_hash(state, "composer-assistant")
+
+    response = client.post(
+        "/api/assistant/bridge/tools/scene.draft.add_object",
+        json={
+            "requestId": "req-bridge-draft",
+            "assistantMode": "composer-assistant",
+            "catalogHash": catalog_hash,
+            "arguments": {
+                "sceneResource": _scene_resource_proposal()["payload"]["sceneResource"],
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["toolId"] == "scene.draft.add_object"
+    assert data["success"] is True
+    assert data["mutated"] is True
+    assert data["draftMutated"] is True
+    assert data["result"]["draftMutation"] == "scene_resource_add"
+    assert data["result"]["objectId"] == "sim_soup_can"
+    assert state.program is not None
+    assert [resource.object_id for resource in state.program.scene] == ["sim_soup_can"]
+    assert state.program_session_generation == before_generation + 1
+
+
+def test_assistant_bridge_composer_draft_callback_updates_scene_resource(
+    client: TestClient,
+    state: ComposerState,
+    tmp_path: Path,
+) -> None:
+    program_path = _write_minimal_program(tmp_path)
+    state.load_program(str(program_path))
+    state.deployment = _assistant_mode_deployment()
+    catalog_hash = _assistant_catalog_hash(state, "composer-assistant")
+    resource = _scene_resource_proposal()["payload"]["sceneResource"]
+    add_response = client.post(
+        "/api/assistant/bridge/tools/scene.draft.add_object",
+        json={
+            "requestId": "req-bridge-add-before-update",
+            "assistantMode": "composer-assistant",
+            "catalogHash": catalog_hash,
+            "arguments": {"sceneResource": resource},
+        },
+    )
+    assert add_response.status_code == 200
+
+    updated_resource = {
+        **resource,
+        "shape": {"type": "box", "box_dimensions_m": [0.08, 0.06, 0.12]},
+        "pose": {
+            "frame_id": "universe",
+            "position_m": [0.2, -0.1, 0.06],
+            "orientation_rpy_deg": [0.0, 0.0, 15.0],
+        },
+    }
+    response = client.post(
+        "/api/assistant/bridge/tools/scene.draft.update_object",
+        json={
+            "requestId": "req-bridge-update",
+            "assistantMode": "composer-assistant",
+            "catalogHash": catalog_hash,
+            "arguments": {"sceneResource": updated_resource},
+        },
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["toolId"] == "scene.draft.update_object"
+    assert data["success"] is True
+    assert data["result"]["draftMutation"] == "scene_resource_update"
+    assert data["result"]["updated"] == ["sim_soup_can"]
+    assert state.program is not None
+    assert state.program.scene[0].shape["box_dimensions_m"] == [0.08, 0.06, 0.12]
+
+
+def test_assistant_bridge_composer_draft_callback_upserts_scene_resources(
+    client: TestClient,
+    state: ComposerState,
+    tmp_path: Path,
+) -> None:
+    program_path = _write_minimal_program(tmp_path)
+    state.load_program(str(program_path))
+    state.deployment = _assistant_mode_deployment()
+    catalog_hash = _assistant_catalog_hash(state, "composer-assistant")
+    resource = _scene_resource_proposal()["payload"]["sceneResource"]
+    assert client.post(
+        "/api/assistant/bridge/tools/scene.draft.add_object",
+        json={
+            "requestId": "req-bridge-add-before-upsert",
+            "assistantMode": "composer-assistant",
+            "catalogHash": catalog_hash,
+            "arguments": {"sceneResource": resource},
+        },
+    ).status_code == 200
+
+    replacement = {
+        **resource,
+        "shape": {"type": "sphere", "sphere_radius_m": 0.04},
+    }
+    inserted = {
+        "objectId": "sim_marker",
+        "shape": {"type": "box", "box_dimensions_m": [0.03, 0.04, 0.05]},
+        "pose": {
+            "frame_id": "universe",
+            "position_m": [0.3, 0.1, 0.025],
+            "orientation_rpy_deg": [0.0, 0.0, 0.0],
+        },
+    }
+    response = client.post(
+        "/api/assistant/bridge/tools/scene.draft.upsert_objects",
+        json={
+            "requestId": "req-bridge-upsert",
+            "assistantMode": "composer-assistant",
+            "catalogHash": catalog_hash,
+            "arguments": {"sceneResources": [replacement, inserted]},
+        },
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["toolId"] == "scene.draft.upsert_objects"
+    assert data["success"] is True
+    assert data["result"]["draftMutation"] == "scene_resources_upsert"
+    assert data["result"]["updated"] == ["sim_soup_can"]
+    assert data["result"]["inserted"] == ["sim_marker"]
+    assert state.program is not None
+    scene_by_id = {resource.object_id: resource for resource in state.program.scene}
+    assert scene_by_id["sim_soup_can"].shape["type"] == "sphere"
+    assert scene_by_id["sim_marker"].shape["box_dimensions_m"] == [0.03, 0.04, 0.05]
+
+
+def test_assistant_bridge_composer_draft_callback_rejects_duplicate_upsert_ids(
+    client: TestClient,
+    state: ComposerState,
+    tmp_path: Path,
+) -> None:
+    program_path = _write_minimal_program(tmp_path)
+    state.load_program(str(program_path))
+    state.deployment = _assistant_mode_deployment()
+    catalog_hash = _assistant_catalog_hash(state, "composer-assistant")
+    resource = _scene_resource_proposal()["payload"]["sceneResource"]
+
+    response = client.post(
+        "/api/assistant/bridge/tools/scene.draft.upsert_objects",
+        json={
+            "requestId": "req-bridge-upsert-duplicates",
+            "assistantMode": "composer-assistant",
+            "catalogHash": catalog_hash,
+            "arguments": {"sceneResources": [resource, resource]},
+        },
+    )
+
+    assert response.status_code == 400
+    assert "duplicate objectId" in response.json()["detail"]
+
+
+def test_assistant_bridge_discovery_callbacks_return_catalog_skills_and_capabilities(
+    client: TestClient,
+    state: ComposerState,
+) -> None:
+    state.deployment = _assistant_mode_deployment()
+    catalog_hash = _assistant_catalog_hash(state, "composer-assistant")
+
+    catalog_response = client.post(
+        "/api/assistant/bridge/tools/catalog.read",
+        json={
+            "requestId": "req-catalog-read",
+            "assistantMode": "composer-assistant",
+            "catalogHash": catalog_hash,
+            "arguments": {"entryIds": ["reset_trajectories"]},
+        },
+    )
+    assert catalog_response.status_code == 200
+    catalog_payload = catalog_response.json()["result"]
+    assert catalog_payload["entryCount"] == 1
+    assert catalog_payload["entries"][0]["id"] == "reset_trajectories"
+
+    skills_response = client.post(
+        "/api/assistant/bridge/tools/skills.read",
+        json={
+            "requestId": "req-skills-read",
+            "assistantMode": "composer-assistant",
+            "catalogHash": catalog_hash,
+            "arguments": {"includeBodies": False},
+        },
+    )
+    assert skills_response.status_code == 200
+    assert skills_response.json()["result"]["skillCount"] > 0
+
+    capabilities_response = client.post(
+        "/api/assistant/bridge/tools/deployment.capabilities.read",
+        json={
+            "requestId": "req-capabilities-read",
+            "assistantMode": "composer-assistant",
+            "catalogHash": catalog_hash,
+            "arguments": {},
+        },
+    )
+    assert capabilities_response.status_code == 200
+    result = capabilities_response.json()["result"]
+    assert "scene.edit.remove" in result["scene"]
+    assert result["adapterIds"]["context"] == "context.test"
+
+
+def test_assistant_bridge_composer_draft_callback_removes_scene_resources(
+    client: TestClient,
+    state: ComposerState,
+    tmp_path: Path,
+) -> None:
+    program_path = _write_minimal_program(tmp_path)
+    state.load_program(str(program_path))
+    state.deployment = _assistant_mode_deployment()
+    catalog_hash = _assistant_catalog_hash(state, "composer-assistant")
+    resource = _scene_resource_proposal()["payload"]["sceneResource"]
+    assert client.post(
+        "/api/assistant/bridge/tools/scene.draft.add_object",
+        json={
+            "requestId": "req-add-before-remove",
+            "assistantMode": "composer-assistant",
+            "catalogHash": catalog_hash,
+            "arguments": {"sceneResource": resource},
+        },
+    ).status_code == 200
+
+    response = client.post(
+        "/api/assistant/bridge/tools/scene.draft.remove_objects",
+        json={
+            "requestId": "req-remove-scene",
+            "assistantMode": "composer-assistant",
+            "catalogHash": catalog_hash,
+            "arguments": {"objectIds": ["sim_soup_can"]},
+        },
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["toolId"] == "scene.draft.remove_objects"
+    assert data["result"]["draftMutation"] == "scene_resources_remove"
+    assert data["result"]["removed"] == ["sim_soup_can"]
+    assert state.program is not None
+    assert state.program.scene == []
+
+
+def test_assistant_bridge_composer_draft_tree_callbacks_mutate_validated_tree(
+    client: TestClient,
+    state: ComposerState,
+    tmp_path: Path,
+) -> None:
+    program_path = _write_minimal_program(tmp_path)
+    state.load_program(str(program_path))
+    state.deployment = _assistant_mode_deployment()
+    catalog_hash = _assistant_catalog_hash(state, "composer-assistant")
+
+    insert_response = client.post(
+        "/api/assistant/bridge/tools/tree.draft.insert_node",
+        json={
+            "requestId": "req-tree-insert",
+            "assistantMode": "composer-assistant",
+            "catalogHash": catalog_hash,
+            "arguments": {
+                "parentName": "root",
+                "index": 1,
+                "node": {
+                    "id": "remove_collision_object",
+                    "name": "remove_temp_object",
+                    "params": {"object_id": "temp_object"},
+                },
+            },
+        },
+    )
+    assert insert_response.status_code == 200
+    assert insert_response.json()["result"]["draftMutation"] == "tree_node_insert"
+
+    update_response = client.post(
+        "/api/assistant/bridge/tools/tree.draft.update_node_params",
+        json={
+            "requestId": "req-tree-update",
+            "assistantMode": "composer-assistant",
+            "catalogHash": _assistant_catalog_hash(state, "composer-assistant"),
+            "arguments": {
+                "nodeName": "remove_temp_object",
+                "params": {"object_id": "renamed_temp_object"},
+            },
+        },
+    )
+    assert update_response.status_code == 200
+    assert state.program is not None
+    assert state.program.tree.children[1].params["object_id"] == "renamed_temp_object"
+
+    replace_response = client.post(
+        "/api/assistant/bridge/tools/tree.draft.replace_subtree",
+        json={
+            "requestId": "req-tree-replace",
+            "assistantMode": "composer-assistant",
+            "catalogHash": _assistant_catalog_hash(state, "composer-assistant"),
+            "arguments": {
+                "nodeName": "remove_temp_object",
+                "subtree": {"id": "reset_trajectories", "name": "reset_replacement"},
+            },
+        },
+    )
+    assert replace_response.status_code == 200
+    assert state.program.tree.children[1].name == "reset_replacement"
+
+    move_response = client.post(
+        "/api/assistant/bridge/tools/tree.draft.move_node",
+        json={
+            "requestId": "req-tree-move",
+            "assistantMode": "composer-assistant",
+            "catalogHash": _assistant_catalog_hash(state, "composer-assistant"),
+            "arguments": {
+                "nodeName": "reset_replacement",
+                "newParentName": "root",
+                "index": 0,
+            },
+        },
+    )
+    assert move_response.status_code == 200
+    assert state.program.tree.children[0].name == "reset_replacement"
+
+    delete_response = client.post(
+        "/api/assistant/bridge/tools/tree.draft.delete_node",
+        json={
+            "requestId": "req-tree-delete",
+            "assistantMode": "composer-assistant",
+            "catalogHash": _assistant_catalog_hash(state, "composer-assistant"),
+            "arguments": {"nodeName": "reset_replacement"},
+        },
+    )
+    assert delete_response.status_code == 200
+    assert [child.name for child in state.program.tree.children] == ["reset_trajectories"]
+
+
+def test_assistant_bridge_composer_draft_parameter_and_blackboard_callbacks(
+    client: TestClient,
+    state: ComposerState,
+    tmp_path: Path,
+) -> None:
+    program_path = _write_minimal_program(tmp_path)
+    state.load_program(str(program_path))
+    state.deployment = _assistant_mode_deployment()
+    catalog_hash = _assistant_catalog_hash(state, "composer-assistant")
+
+    parameter_response = client.post(
+        "/api/assistant/bridge/tools/program.draft.upsert_parameters",
+        json={
+            "requestId": "req-param-upsert",
+            "assistantMode": "composer-assistant",
+            "catalogHash": catalog_hash,
+            "arguments": {
+                "parameters": [
+                    {
+                        "name": "target_object",
+                        "type": "string",
+                        "default": "gear",
+                        "description": "Object to manipulate.",
+                    }
+                ]
+            },
+        },
+    )
+    assert parameter_response.status_code == 200
+    assert "target_object" in state.program.parameters
+
+    namespace_response = client.post(
+        "/api/assistant/bridge/tools/blackboard.draft.upsert_namespaces",
+        json={
+            "requestId": "req-bb-ns-upsert",
+            "assistantMode": "composer-assistant",
+            "catalogHash": _assistant_catalog_hash(state, "composer-assistant"),
+            "arguments": {
+                "namespaces": [
+                    {
+                        "id": "selection",
+                        "contract": "selection_context_v1",
+                        "prefix": "/selection",
+                        "fields": [{"name": "object_id", "type": "string"}],
+                    }
+                ]
+            },
+        },
+    )
+    assert namespace_response.status_code == 200
+    assert "selection" in state.program.blackboard_namespaces
+
+    key_response = client.post(
+        "/api/assistant/bridge/tools/blackboard.draft.upsert_keys",
+        json={
+            "requestId": "req-bb-key-upsert",
+            "assistantMode": "composer-assistant",
+            "catalogHash": _assistant_catalog_hash(state, "composer-assistant"),
+            "arguments": {
+                "keys": [{"id": "ready_flag", "type": "bool", "key": "/ready"}]
+            },
+        },
+    )
+    assert key_response.status_code == 200
+    assert "ready_flag" in state.program.blackboard_keys
+
+    remove_key_response = client.post(
+        "/api/assistant/bridge/tools/blackboard.draft.remove_keys",
+        json={
+            "requestId": "req-bb-key-remove",
+            "assistantMode": "composer-assistant",
+            "catalogHash": _assistant_catalog_hash(state, "composer-assistant"),
+            "arguments": {"ids": ["ready_flag"]},
+        },
+    )
+    assert remove_key_response.status_code == 200
+    assert "ready_flag" not in state.program.blackboard_keys
+
+    remove_namespace_response = client.post(
+        "/api/assistant/bridge/tools/blackboard.draft.remove_namespaces",
+        json={
+            "requestId": "req-bb-ns-remove",
+            "assistantMode": "composer-assistant",
+            "catalogHash": _assistant_catalog_hash(state, "composer-assistant"),
+            "arguments": {"ids": ["selection"]},
+        },
+    )
+    assert remove_namespace_response.status_code == 200
+    assert "selection" not in state.program.blackboard_namespaces
+
+    remove_parameter_response = client.post(
+        "/api/assistant/bridge/tools/program.draft.remove_parameters",
+        json={
+            "requestId": "req-param-remove",
+            "assistantMode": "composer-assistant",
+            "catalogHash": _assistant_catalog_hash(state, "composer-assistant"),
+            "arguments": {"names": ["target_object"]},
+        },
+    )
+    assert remove_parameter_response.status_code == 200
+    assert "target_object" not in state.program.parameters
 
 
 def test_assistant_bridge_read_only_callback_rejects_stale_catalog_hash(
@@ -450,7 +897,9 @@ def test_nemoclaw_provider_rejects_out_of_catalog_tool_response(
     )
 
     assert response.status_code == 502
-    assert "outside assistantMode 'query'" in response.json()["detail"]
+    data = response.json()
+    assert data["error"]["code"] == "provider_error"
+    assert "outside assistantMode 'query'" in data["error"]["detail"]
 
 
 def test_assistant_tools_catalog_is_review_only(client: TestClient) -> None:
@@ -639,7 +1088,221 @@ def test_nemoclaw_provider_rejects_mutating_response(
     )
 
     assert response.status_code == 502
-    assert "must not report state mutation" in response.json()["detail"]
+    data = response.json()
+    assert data["error"]["code"] == "provider_error"
+    assert "must not report state mutation" in data["error"]["detail"]
+
+
+def test_assistant_chat_records_success_status(
+    client: TestClient,
+    state: ComposerState,
+) -> None:
+    state.assistant_provider = DeterministicSceneAuthoringProvider()
+
+    response = client.post(
+        "/api/assistant/chat",
+        json={
+            "requestId": "req-status-ok",
+            "message": "Inspect Isaac and propose planning objects",
+            "mode": "provider",
+        },
+    )
+
+    assert response.status_code == 200
+    status_response = client.get("/api/assistant/requests/req-status-ok")
+    assert status_response.status_code == 200
+    status = status_response.json()
+    assert status["requestId"] == "req-status-ok"
+    assert status["status"] == "completed"
+    assert status["providerId"] == "deterministic-scene-authoring"
+    assert status["toolCallCount"] == 1
+    assert status["error"] is None
+
+
+def test_assistant_chat_records_draft_mutation_status(
+    client: TestClient,
+    state: ComposerState,
+    tmp_path: Path,
+) -> None:
+    program_path = _write_minimal_program(tmp_path)
+    state.load_program(str(program_path))
+    state.deployment = _assistant_mode_deployment()
+    before_generation = state.program_session_generation
+
+    class DraftMutatingProvider:
+        provider_id = "nemoclaw"
+
+        def run(self, request, context):
+            resource = {
+                "objectId": "ui_demo_box",
+                "shape": {"type": "box", "box_dimensions_m": [0.04, 0.05, 0.06]},
+                "pose": {
+                    "frame_id": "universe",
+                    "position_m": [0.42, -0.12, 0.03],
+                    "orientation_rpy_deg": [0.0, 0.0, 0.0],
+                },
+            }
+            result = routes_assistant._apply_scene_draft_resources_upsert(
+                state,
+                arguments={"sceneResources": [resource]},
+            )
+            return AssistantProviderResult(
+                mode="provider",
+                message="Added ui_demo_box to the Composer draft.",
+                tool_calls=[
+                    {
+                        "name": "scene.draft.upsert_objects",
+                        "status": "completed",
+                        "arguments": {"sceneResources": [resource]},
+                        "result": result,
+                    }
+                ],
+                proposals=[],
+                draft_mutated=True,
+                mutated=False,
+                requires_review=True,
+            )
+
+    state.assistant_provider = DraftMutatingProvider()
+
+    response = client.post(
+        "/api/assistant/chat",
+        json={
+            "requestId": "req-draft-mutated",
+            "message": "add a UI demo box",
+            "mode": "provider",
+            "providerId": "nemoclaw",
+            "assistantMode": "composer-assistant",
+            "requestedTools": ["scene.draft.upsert_objects"],
+        },
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["draftMutated"] is True
+    assert data["toolCalls"][0]["name"] == "scene.draft.upsert_objects"
+    assert data["toolCalls"][0]["status"] == "completed"
+    assert data["toolCalls"][0]["result"]["draftMutation"] == "scene_resources_upsert"
+    assert state.program is not None
+    assert [resource.object_id for resource in state.program.scene] == ["ui_demo_box"]
+    assert state.program_session_generation == before_generation + 1
+
+    status_response = client.get("/api/assistant/requests/req-draft-mutated")
+    assert status_response.status_code == 200
+    status = status_response.json()
+    assert status["status"] == "completed"
+    assert status["providerId"] == "nemoclaw"
+    assert status["assistantMode"] == "composer-assistant"
+    assert status["draftMutated"] is True
+    assert status["toolCallCount"] == 1
+    assert status["error"] is None
+
+
+def test_assistant_chat_returns_structured_provider_error_status(
+    client: TestClient,
+    state: ComposerState,
+) -> None:
+    state.assistant_provider = NemoClawAssistantProvider(
+        endpoint_url="http://nemoclaw.local/assistant",
+        request_fn=lambda payload: {
+            "message": None,
+            "error": {
+                "code": "response_rejected",
+                "detail": "out-of-catalog action requested",
+            },
+            "toolCalls": [],
+            "proposals": [],
+            "mutated": False,
+        },
+    )
+
+    response = client.post(
+        "/api/assistant/chat",
+        json={
+            "requestId": "req-status-fail",
+            "message": "read the program",
+            "mode": "provider",
+            "providerId": "nemoclaw",
+        },
+    )
+
+    assert response.status_code == 502
+    data = response.json()
+    assert data["requestId"] == "req-status-fail"
+    assert data["error"] == {
+        "code": "response_rejected",
+        "detail": "out-of-catalog action requested",
+    }
+    status_response = client.get("/api/assistant/requests/req-status-fail")
+    assert status_response.status_code == 200
+    status = status_response.json()
+    assert status["status"] == "failed"
+    assert status["error"] == data["error"]
+
+
+def test_assistant_cancel_route_proxies_to_configured_provider(
+    client: TestClient,
+    state: ComposerState,
+) -> None:
+    class CancellableProvider:
+        provider_id = "fake-cancellable"
+
+        def __init__(self) -> None:
+            self.cancelled_request_id = ""
+
+        def run(self, request, context):
+            return AssistantProviderResult(
+                mode="provider",
+                message="queued",
+                tool_calls=[],
+                proposals=[],
+            )
+
+        def cancel(self, request_id: str) -> dict:
+            self.cancelled_request_id = request_id
+            return {"requestId": request_id, "cancelled": True, "detail": "queued"}
+
+    provider = CancellableProvider()
+    state.assistant_provider = provider
+    state.start_assistant_request(
+        request_id="req-cancel-proxy",
+        conversation_id="conv-cancel",
+        provider_id=provider.provider_id,
+        assistant_mode="query",
+    )
+
+    response = client.post("/api/assistant/requests/req-cancel-proxy/cancel")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["requestId"] == "req-cancel-proxy"
+    assert data["cancelled"] is True
+    assert data["status"] == "cancel_requested"
+    assert provider.cancelled_request_id == "req-cancel-proxy"
+    status = client.get("/api/assistant/requests/req-cancel-proxy").json()
+    assert status["status"] == "cancel_requested"
+
+
+def test_assistant_cancel_route_does_not_mark_when_provider_lacks_cancel(
+    client: TestClient,
+    state: ComposerState,
+) -> None:
+    state.assistant_provider = DeterministicSceneAuthoringProvider()
+    state.start_assistant_request(
+        request_id="req-cancel-unsupported",
+        conversation_id="conv-cancel",
+        provider_id="deterministic-scene-authoring",
+    )
+
+    response = client.post("/api/assistant/requests/req-cancel-unsupported/cancel")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["cancelled"] is False
+    assert data["status"] == "running"
+    assert "does not support cancellation" in data["detail"]
+    status = client.get("/api/assistant/requests/req-cancel-unsupported").json()
+    assert status["status"] == "running"
 
 
 def test_deterministic_provider_calls_proposal_tool_without_live_services(
@@ -865,7 +1528,11 @@ def test_propose_scene_object_nodes_returns_tree_node_drafts(client: TestClient)
         "/api/assistant/tools/propose-scene-object-nodes",
         json={
             "sceneResources": [resource],
-            "operations": ["add_collision_object", "remove_collision_object"],
+            "operations": [
+                "add_collision_object",
+                "upsert_collision_object",
+                "remove_collision_object",
+            ],
         },
     )
 
@@ -874,7 +1541,7 @@ def test_propose_scene_object_nodes_returns_tree_node_drafts(client: TestClient)
     assert data["toolName"] == "propose_scene_object_nodes"
     assert data["mutated"] is False
     assert data["warnings"] == []
-    assert len(data["treeNodes"]) == 2
+    assert len(data["treeNodes"]) == 3
     add_node = data["treeNodes"][0]
     assert add_node["id"] == "add_collision_object"
     assert add_node["params"]["object_id"] == "sim_soup_can"
@@ -884,6 +1551,11 @@ def test_propose_scene_object_nodes_returns_tree_node_drafts(client: TestClient)
     assert data["proposals"][0]["type"] == "tree_node_add"
     assert data["proposals"][0]["payload"]["treeNode"]["id"] == add_node["id"]
     assert data["proposals"][0]["payload"]["treeNode"]["params"] == add_node["params"]
+    upsert_node = data["treeNodes"][1]
+    assert upsert_node["id"] == "upsert_collision_object"
+    assert upsert_node["params"]["object_id"] == "sim_soup_can"
+    assert upsert_node["params"]["shape_type"] == "box"
+    assert upsert_node["params"]["box_dimensions_m"] == [0.075, 0.075, 0.102]
 
 
 def test_stage_accepts_valid_tree_node_proposal(client: TestClient) -> None:
@@ -1143,6 +1815,23 @@ def _scene_resource_proposal() -> dict:
     }
 
 
+def _assistant_catalog_hash(state: ComposerState, assistant_mode: str) -> str:
+    assert state.deployment is not None
+    resolved = state.deployment.resolve_assistant_mode_catalog(assistant_mode)
+    return routes_assistant._compute_assistant_catalog_hash(
+        {
+            "skills": list(resolved["skills"]),
+            "tools": [
+                tool.get("id")
+                for tool in resolved["tools"]
+                if isinstance(tool.get("id"), str)
+            ],
+            "nodes": list(resolved["nodes"]),
+        },
+        assistant_mode,
+    )
+
+
 def _assistant_mode_deployment() -> Deployment:
     return Deployment.from_dict(
         {
@@ -1160,16 +1849,42 @@ def _assistant_mode_deployment() -> Deployment:
                 "planning": {
                     "adapter_id": "planning.test",
                     "adapter_version": "0.1.0",
+                    "capability_keys": [
+                        "planning.motion.joint_goal",
+                        "planning.motion.pose_goal",
+                        "planning.trajectory.time_parameterized",
+                    ],
                     "config": {},
                 },
                 "context": {
                     "adapter_id": "context.test",
                     "adapter_version": "0.1.0",
+                    "capability_keys": [
+                        "context.collision.check",
+                        "context.kinematics.fk",
+                        "context.limits.joint",
+                        "context.state.current",
+                        "context.validation.trajectory",
+                        "scene.edit.add",
+                        "scene.edit.remove",
+                        "scene.edit.update_pose",
+                        "scene.shape.box",
+                        "scene.shape.sphere",
+                    ],
                     "config": {},
                 },
                 "execution": {
                     "adapter_id": "execution.test",
                     "adapter_version": "0.1.0",
+                    "capability_keys": [
+                        "execution.feedback.phase_events",
+                        "execution.feedback.state_snapshots",
+                        "execution.pause",
+                        "execution.reset",
+                        "execution.resume",
+                        "execution.stop.soft",
+                        "execution.trajectory.execute",
+                    ],
                     "config": {},
                 },
             },
@@ -1210,7 +1925,28 @@ def _assistant_mode_deployment() -> Deployment:
                     },
                     "catalog": {
                         "skills": [],
-                        "tools": ["program.read", "tree.insert_node"],
+                        "tools": [
+                            "program.read",
+                            "catalog.read",
+                            "skills.read",
+                            "deployment.capabilities.read",
+                            "tree.insert_node",
+                            "scene.draft.add_object",
+                            "scene.draft.update_object",
+                            "scene.draft.upsert_objects",
+                            "scene.draft.remove_objects",
+                            "tree.draft.insert_node",
+                            "tree.draft.update_node_params",
+                            "tree.draft.delete_node",
+                            "tree.draft.move_node",
+                            "tree.draft.replace_subtree",
+                            "program.draft.upsert_parameters",
+                            "program.draft.remove_parameters",
+                            "blackboard.draft.upsert_namespaces",
+                            "blackboard.draft.remove_namespaces",
+                            "blackboard.draft.upsert_keys",
+                            "blackboard.draft.remove_keys",
+                        ],
                         "nodes": [],
                     },
                 },
@@ -1237,9 +1973,99 @@ def _assistant_mode_deployment() -> Deployment:
                     "description": "Inspect backend scene state.",
                 },
                 {
+                    "id": "catalog.read",
+                    "effect": "read_only",
+                    "description": "Read node catalog entries.",
+                },
+                {
+                    "id": "skills.read",
+                    "effect": "read_only",
+                    "description": "Read skill catalog entries.",
+                },
+                {
+                    "id": "deployment.capabilities.read",
+                    "effect": "read_only",
+                    "description": "Read deployment capabilities.",
+                },
+                {
                     "id": "tree.insert_node",
                     "effect": "proposal",
                     "description": "Propose a tree insertion.",
+                },
+                {
+                    "id": "scene.draft.add_object",
+                    "effect": "composer_draft_mutating",
+                    "description": "Apply a scene-object addition to the Composer draft.",
+                },
+                {
+                    "id": "scene.draft.update_object",
+                    "effect": "composer_draft_mutating",
+                    "description": "Apply a scene-object replacement to the Composer draft.",
+                },
+                {
+                    "id": "scene.draft.upsert_objects",
+                    "effect": "composer_draft_mutating",
+                    "description": "Insert or replace scene objects in the Composer draft.",
+                },
+                {
+                    "id": "scene.draft.remove_objects",
+                    "effect": "composer_draft_mutating",
+                    "description": "Remove scene objects from the Composer draft.",
+                },
+                {
+                    "id": "tree.draft.insert_node",
+                    "effect": "composer_draft_mutating",
+                    "description": "Insert a node into the Composer draft tree.",
+                },
+                {
+                    "id": "tree.draft.update_node_params",
+                    "effect": "composer_draft_mutating",
+                    "description": "Update node parameters in the Composer draft tree.",
+                },
+                {
+                    "id": "tree.draft.delete_node",
+                    "effect": "composer_draft_mutating",
+                    "description": "Delete a node from the Composer draft tree.",
+                },
+                {
+                    "id": "tree.draft.move_node",
+                    "effect": "composer_draft_mutating",
+                    "description": "Move a node in the Composer draft tree.",
+                },
+                {
+                    "id": "tree.draft.replace_subtree",
+                    "effect": "composer_draft_mutating",
+                    "description": "Replace a subtree in the Composer draft tree.",
+                },
+                {
+                    "id": "program.draft.upsert_parameters",
+                    "effect": "composer_draft_mutating",
+                    "description": "Insert or replace program parameters.",
+                },
+                {
+                    "id": "program.draft.remove_parameters",
+                    "effect": "composer_draft_mutating",
+                    "description": "Remove program parameters.",
+                },
+                {
+                    "id": "blackboard.draft.upsert_namespaces",
+                    "effect": "composer_draft_mutating",
+                    "description": "Insert or replace blackboard namespaces.",
+                },
+                {
+                    "id": "blackboard.draft.remove_namespaces",
+                    "effect": "composer_draft_mutating",
+                    "description": "Remove blackboard namespaces.",
+                },
+                {
+                    "id": "blackboard.draft.upsert_keys",
+                    "effect": "composer_draft_mutating",
+                    "description": "Insert or replace blackboard keys.",
+                },
+                {
+                    "id": "blackboard.draft.remove_keys",
+                    "effect": "composer_draft_mutating",
+                    "description": "Remove blackboard keys.",
                 },
             ],
         }

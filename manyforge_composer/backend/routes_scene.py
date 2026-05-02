@@ -369,7 +369,7 @@ def create_scene_router(state: ComposerState) -> APIRouter:
 
     @router.post("/edit")
     def edit_scene(validated: SceneEditApiRequest) -> dict[str, Any]:
-        """Edit the scene at runtime (add, remove, update_pose, attach, detach)."""
+        """Edit the scene at runtime (add, upsert, remove, update_pose, attach, detach)."""
         with state.scene_edit_lock:
             if state.cycle_manager is not None and state.cycle_manager.state in {
                 CycleState.RUNNING,

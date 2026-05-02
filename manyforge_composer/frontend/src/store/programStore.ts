@@ -157,7 +157,7 @@ function buildDefaultNodeParams(
     }
   }
 
-  if (catalogId === 'add_collision_object') {
+  if (catalogId === 'add_collision_object' || catalogId === 'upsert_collision_object') {
     defaults.shape_type = typeof defaults.shape_type === 'string' ? defaults.shape_type : 'box';
     if (!Array.isArray(defaults.box_dimensions_m) || defaults.box_dimensions_m.length !== 3) {
       defaults.box_dimensions_m = [0.1, 0.1, 0.1];

@@ -6,21 +6,29 @@
 # Usage: ./scripts/manyforge-session-start.sh [sandbox-name]
 #
 # Prerequisites:
-#   - vLLM is serving a Qwen model on port 8000
-#   - Run: cd ~/workspaces/nemoclaw/src/NemoClaw-Thor && ./configure-local-provider.sh <profile>
+#   - vLLM is serving the selected local model on port 8000
+#   - Run the relevant NemoClaw-Thor local-provider/profile setup first
 #   - Then run this script
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+SPECS_DIR="${MANYFORGE_SPECS_ROOT:-$REPO_DIR/../manyforge_specs}"
 SANDBOX_NAME="${1:-thor-assistant}"
 NEMOCLAW_THOR="$HOME/workspaces/nemoclaw/src/NemoClaw-Thor"
 
 echo "=== ManyForge Session Startup ==="
 echo "Sandbox: $SANDBOX_NAME"
 echo "Repo:    $REPO_DIR"
+echo "Specs:   $SPECS_DIR"
 echo ""
+
+if [[ ! -d "$SPECS_DIR" ]]; then
+    echo "ERROR: manyforge_specs not found at $SPECS_DIR"
+    echo "Set MANYFORGE_SPECS_ROOT to the specs checkout before seeding an agent sandbox."
+    exit 1
+fi
 
 # --- 1. Verify Thor is healthy ---
 echo ">>> [1/4] Checking Thor system status..."
@@ -36,14 +44,14 @@ echo "    OK — all 19 checks passed."
 echo ">>> [2/4] Uploading shared resources to sandbox..."
 
 openshell sandbox upload "$SANDBOX_NAME" \
-    "$REPO_DIR/../manyforge_specs/" /sandbox/specs/ 2>&1 | grep -E "✓|Error"
+    "$SPECS_DIR/" /sandbox/specs/ 2>&1 | grep -E "✓|Error"
 
 openshell sandbox upload "$SANDBOX_NAME" \
     "$REPO_DIR/manyforge_core/include/manyforge_core/" \
     /sandbox/contracts/manyforge_core/include/manyforge_core/ 2>&1 | grep -E "✓|Error"
 
 # Upload engineering reference if available
-REFERENCE="$REPO_DIR/docs/reference/REFERENCE.md"
+REFERENCE="$SPECS_DIR/docs/reference/REFERENCE.md"
 if [[ -f "$REFERENCE" ]]; then
     openshell sandbox upload "$SANDBOX_NAME" "$REFERENCE" /sandbox/reference/REFERENCE.md 2>&1 | grep -E "✓|Error"
 else

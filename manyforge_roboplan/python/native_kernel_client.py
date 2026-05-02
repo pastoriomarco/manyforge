@@ -440,6 +440,30 @@ class NativeKernelClient(KernelClient):
         self._bundle.invalidate_trajectories()
 
     def scene_edit(self, request: SceneEditRequest) -> SceneEditResult:
+        if request.operation == "upsert":
+            state = self.get_object_state(request.object_id)
+            if state.exists and state.attached:
+                return SceneEditResult(success=False, error="Cannot upsert attached object")
+            if state.exists:
+                remove_result = self.scene_edit(
+                    SceneEditRequest(operation="remove", object_id=request.object_id)
+                )
+                if not remove_result.success:
+                    return remove_result
+            return self.scene_edit(
+                SceneEditRequest(
+                    operation="add",
+                    object_id=request.object_id,
+                    shape_type=request.shape_type,
+                    box_dimensions_m=request.box_dimensions_m,
+                    sphere_radius_m=request.sphere_radius_m,
+                    pose_position_m=request.pose_position_m,
+                    pose_orientation_xyzw=request.pose_orientation_xyzw,
+                    frame_id=request.frame_id,
+                    touch_links=request.touch_links,
+                )
+            )
+
         req_dict = {
             "operation": request.operation,
             "object_id": request.object_id,

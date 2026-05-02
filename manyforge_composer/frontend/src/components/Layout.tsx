@@ -4,6 +4,7 @@ import { Sidebar } from './Sidebar';
 import { Viewport } from './Viewport';
 import { ControlBar } from './ControlBar';
 import { CollapsedRail } from './CollapsedRail';
+import { AssistantOverlay } from './AssistantOverlay';
 
 const MIN_SIDEBAR_WIDTH = 220;
 const MAX_SIDEBAR_WIDTH = 420;
@@ -74,6 +75,7 @@ export function Layout() {
         <Viewport />
       </div>
       <ControlBar />
+      <AssistantOverlay />
     </div>
   );
 }

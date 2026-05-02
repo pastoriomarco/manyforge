@@ -262,6 +262,7 @@ _INTERRUPT_NODE_RESOURCE_CLAIMS: dict[str, tuple[str, ...]] = {
     "set_signal_bool": ("signals",),
     "timer": ("timers",),
     "update_collision_object_pose": ("scene",),
+    "upsert_collision_object": ("scene",),
     "validate_scene_selection": ("model", "scene"),
     "wait_for_gripper_state": ("gripper",),
     "wait_for_key_bool": ("blackboard",),
@@ -829,14 +830,14 @@ def _validate_tree_node_semantics(
                     )
                 )
 
-    if node.id == "add_collision_object":
+    if node.id in {"add_collision_object", "upsert_collision_object"}:
         shape_type = resolved_params.get("shape_type")
         pose = resolved_params.get("pose")
         if pose is None:
             issues.append(
                 TreeValidationIssue(
                     path=f"{path}.params.pose",
-                    message="pose is required for add_collision_object",
+                    message=f"pose is required for {node.id}",
                 )
             )
         if shape_type == "box":

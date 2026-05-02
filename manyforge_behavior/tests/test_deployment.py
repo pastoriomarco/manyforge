@@ -779,6 +779,11 @@ class TestDeploymentValidation:
 
 class TestAssistantModeValidation:
     def test_parses_assistant_modes_and_tool_catalog(self):
+        no_args_schema = {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        }
         deployment = Deployment.from_dict(
             _minimal_deployment(
                 assistant_modes={
@@ -786,7 +791,19 @@ class TestAssistantModeValidation:
                         tools=["program.read", "tree.insert_node"],
                     ),
                 },
-                tool_catalog=_tool_catalog("program.read", "tree.insert_node"),
+                tool_catalog=[
+                    {
+                        "id": "program.read",
+                        "effect": "read_only",
+                        "description": "Read the loaded program.",
+                        "input_schema": no_args_schema,
+                    },
+                    {
+                        "id": "tree.insert_node",
+                        "effect": "proposal",
+                        "description": "Propose a tree insertion.",
+                    },
+                ],
             )
         )
 
@@ -796,10 +813,15 @@ class TestAssistantModeValidation:
             "tree.insert_node",
         ]
         assert deployment.tool_catalog["program.read"].effect == "read_only"
+        assert deployment.tool_catalog["program.read"].extra["input_schema"] == no_args_schema
+        assert deployment.resolve_assistant_mode_catalog("composer-assistant")["tools"][0][
+            "input_schema"
+        ] == no_args_schema
         assert deployment.to_dict()["assistant_modes"]["composer-assistant"]["catalog"]["tools"] == [
             "program.read",
             "tree.insert_node",
         ]
+        assert deployment.to_dict()["tool_catalog"][0]["input_schema"] == no_args_schema
 
     def test_rejects_assistant_modes_without_tool_catalog(self):
         with pytest.raises(DeploymentValidationError, match="tool_catalog is required"):
@@ -810,6 +832,25 @@ class TestAssistantModeValidation:
                             tools=["program.read"],
                         ),
                     },
+                )
+            )
+
+    def test_rejects_invalid_assistant_tool_input_schema(self):
+        with pytest.raises(DeploymentValidationError, match="input_schema.type"):
+            Deployment.from_dict(
+                _minimal_deployment(
+                    assistant_modes={
+                        "composer-assistant": _assistant_mode_block(
+                            tools=["program.read"],
+                        ),
+                    },
+                    tool_catalog=[
+                        {
+                            "id": "program.read",
+                            "effect": "read_only",
+                            "input_schema": {"type": "array"},
+                        },
+                    ],
                 )
             )
 
@@ -842,6 +883,48 @@ class TestAssistantModeValidation:
                         "query": _assistant_mode_block(tools=["tree.insert_node"]),
                     },
                     tool_catalog=_tool_catalog("tree.insert_node", effect="proposal"),
+                )
+            )
+
+    def test_allows_composer_draft_mutating_tools_only_in_composer_assistant(self):
+        deployment = Deployment.from_dict(
+            _minimal_deployment(
+                assistant_modes={
+                    "composer-assistant": _assistant_mode_block(
+                        tools=["scene.draft.add_object"],
+                    ),
+                },
+                tool_catalog=_tool_catalog(
+                    "scene.draft.add_object",
+                    effect="composer_draft_mutating",
+                ),
+            )
+        )
+
+        assert (
+            deployment.tool_catalog["scene.draft.add_object"].effect
+            == "composer_draft_mutating"
+        )
+
+    def test_rejects_composer_draft_mutating_tools_outside_composer_assistant(self):
+        with pytest.raises(
+            DeploymentValidationError,
+            match="composer draft mutating tool",
+        ):
+            Deployment.from_dict(
+                _minimal_deployment(
+                    assistant_modes={
+                        "error-recovery": _assistant_mode_block(
+                            session_kind="delegated_recovery",
+                            approval_mode="policy_granted",
+                            review="bounded_by_recovery_profile",
+                            tools=["scene.draft.add_object"],
+                        ),
+                    },
+                    tool_catalog=_tool_catalog(
+                        "scene.draft.add_object",
+                        effect="composer_draft_mutating",
+                    ),
                 )
             )
 
@@ -1118,9 +1201,27 @@ class TestCrossArtifactValidation:
         resolved_catalog = deploy.resolve_assistant_mode_catalog("composer-assistant")
         assert resolved_catalog["skills"] == []
         assert [tool["id"] for tool in resolved_catalog["tools"]] == [
+            "catalog.read",
+            "skills.read",
+            "deployment.capabilities.read",
             "inspect_isaac_scene",
             "propose_scene_objects",
             "propose_scene_object_nodes",
+            "scene.draft.add_object",
+            "scene.draft.update_object",
+            "scene.draft.upsert_objects",
+            "scene.draft.remove_objects",
+            "tree.draft.insert_node",
+            "tree.draft.update_node_params",
+            "tree.draft.delete_node",
+            "tree.draft.move_node",
+            "tree.draft.replace_subtree",
+            "program.draft.upsert_parameters",
+            "program.draft.remove_parameters",
+            "blackboard.draft.upsert_namespaces",
+            "blackboard.draft.remove_namespaces",
+            "blackboard.draft.upsert_keys",
+            "blackboard.draft.remove_keys",
         ]
         assert resolved_catalog["nodes"] == []
 

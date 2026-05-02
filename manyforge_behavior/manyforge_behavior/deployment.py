@@ -142,6 +142,7 @@ _ASSISTANT_PROVIDERS_REQUIRING_ENDPOINT = {"nemoclaw", "openclaw"}
 _ALLOWED_ASSISTANT_TOOL_EFFECTS = {
     "read_only",
     "proposal",
+    "composer_draft_mutating",
     "runtime_mutating",
 }
 _ALLOWED_ASSISTANT_SESSION_KINDS = {
@@ -159,6 +160,7 @@ _ALLOWED_ASSISTANT_REVIEW_POLICIES = {
     "not_required",
 }
 _QUERY_ASSISTANT_MODE_ID = "query"
+_COMPOSER_ASSISTANT_MODE_ID = "composer-assistant"
 
 
 def _validate_capability_keys(value: Any, path: str) -> list[str]:
@@ -1032,6 +1034,12 @@ class Deployment:
                 for key, value in raw_tool.items()
                 if key not in {"id", "effect", "description"}
             }
+            for schema_key in ("input_schema", "inputSchema", "parameters"):
+                if schema_key in extra:
+                    self._validate_assistant_tool_input_schema(
+                        extra[schema_key],
+                        f"{field_path}.{schema_key}",
+                    )
             parsed[tool_id] = AssistantToolDefinition(
                 tool_id=tool_id,
                 effect=effect,
@@ -1039,6 +1047,27 @@ class Deployment:
                 extra=extra,
             )
         return parsed
+
+    def _validate_assistant_tool_input_schema(
+        self,
+        input_schema: Any,
+        field_path: str,
+    ) -> None:
+        if not isinstance(input_schema, dict):
+            raise DeploymentValidationError(f"{field_path} must be a mapping")
+        schema_type = input_schema.get("type", "object")
+        if schema_type != "object":
+            raise DeploymentValidationError(f"{field_path}.type must be 'object'")
+        properties = input_schema.get("properties", {})
+        if not isinstance(properties, dict):
+            raise DeploymentValidationError(f"{field_path}.properties must be a mapping")
+        required = input_schema.get("required", [])
+        if not isinstance(required, list) or not all(
+            isinstance(item, str) for item in required
+        ):
+            raise DeploymentValidationError(
+                f"{field_path}.required must be a list of strings"
+            )
 
     def _assistant_tool_to_raw(self, tool: AssistantToolDefinition) -> dict[str, Any]:
         raw = {
@@ -1158,6 +1187,15 @@ class Deployment:
                 if tool_id not in tool_catalog:
                     raise DeploymentValidationError(
                         f"{field_path}.catalog.tools references unknown tool '{tool_id}'"
+                    )
+                if (
+                    tool_catalog[tool_id].effect == "composer_draft_mutating"
+                    and mode_id != _COMPOSER_ASSISTANT_MODE_ID
+                ):
+                    raise DeploymentValidationError(
+                        f"{field_path}.catalog.tools references composer draft "
+                        f"mutating tool '{tool_id}', which is only allowed in "
+                        f"assistant_modes.{_COMPOSER_ASSISTANT_MODE_ID}"
                     )
 
             parsed[mode_id] = AssistantModeDefinition(

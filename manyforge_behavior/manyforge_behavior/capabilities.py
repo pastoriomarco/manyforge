@@ -22,6 +22,7 @@ CAPABILITY_REGISTRY: frozenset[str] = frozenset({
     "scene.shape.cylinder",
     "scene.shape.mesh",
     "scene.edit.add",
+    "scene.edit.upsert",
     "scene.edit.remove",
     "scene.edit.update_pose",
     "scene.edit.attach_detach",

@@ -79,6 +79,7 @@ class TestGetRequiredKeys:
 
     def test_registry_contains_optional_node_capabilities(self):
         assert "planning.motion.cartesian_path" in CAPABILITY_REGISTRY
+        assert "scene.edit.upsert" in CAPABILITY_REGISTRY
         assert "tool.gripper.command" in CAPABILITY_REGISTRY
         assert "execution.contact.force_torque" in CAPABILITY_REGISTRY
 

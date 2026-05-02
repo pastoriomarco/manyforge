@@ -433,7 +433,7 @@ entries:
       consumes_events: []
 
   # ---------------------------------------------------------------------------
-  # Scene / objects (v0.0: add, remove, update_pose only)
+  # Scene / objects
   # ---------------------------------------------------------------------------
 
   - id: add_collision_object
@@ -499,6 +499,75 @@ entries:
       py_trees:
         implementation_kind: plugin
         class: manyforge_behavior.nodes.AddCollisionObject
+    observability:
+      emits_events: []
+      consumes_events: []
+
+  - id: upsert_collision_object
+    name: UpsertCollisionObject
+    category: scene
+    description: >-
+      Insert a collision object when missing or replace its shape and pose when
+      it already exists in the backend-owned scene.
+    tags: [scene, collision]
+    profiles:
+      min_profile: v0.1
+    kind: leaf
+    children:
+      min: 0
+      max: 0
+    parameters:
+      - name: object_id
+        type: string
+        required: true
+        parameterizable: true
+        ui_editor: blackboard_key_selector
+        blackboard_role: literal_or_key_reader
+        blackboard_value_type: string
+        description: Identifier for the collision object to insert or replace.
+          May be a literal ID, a program parameter, or a declared blackboard
+          key/field binding.
+      - name: shape_type
+        type: enum
+        required: true
+        enum_values: [box, sphere]
+        description: Shape type (v0.1 supports box and sphere only).
+      - name: box_dimensions_m
+        type: float_list
+        required: false
+        visible_when:
+          param: shape_type
+          equals: box
+        description: >-
+          Box full dimensions [x, y, z] in meters (required when shape_type=box).
+      - name: sphere_radius_m
+        type: float
+        required: false
+        visible_when:
+          param: shape_type
+          equals: sphere
+        constraints:
+          min_exclusive: 0.0
+        description: Sphere radius in meters (required when shape_type=sphere).
+      - name: pose
+        type: pose
+        required: true
+        description: Object pose expressed in frame_id.
+      - name: frame_id
+        type: string
+        required: true
+        description: Reference frame for the object pose.
+    required_capabilities:
+      - scene.shape.box
+      - scene.shape.sphere
+      - scene.edit.upsert
+    execution:
+      blocking: true
+      cancellable: false
+    runners:
+      py_trees:
+        implementation_kind: plugin
+        class: manyforge_behavior.nodes.UpsertCollisionObject
     observability:
       emits_events: []
       consumes_events: []

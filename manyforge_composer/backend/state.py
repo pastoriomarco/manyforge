@@ -84,6 +84,23 @@ class AssistantProposalRecord:
     updated_at_ns: int = field(default_factory=time.monotonic_ns)
 
 
+@dataclass
+class AssistantRequestRecord:
+    request_id: str
+    conversation_id: str
+    provider_id: str
+    assistant_mode: Optional[str] = None
+    status: str = "running"
+    message: str = ""
+    error: dict[str, Any] | None = None
+    warnings: list[str] = field(default_factory=list)
+    draft_mutated: bool = False
+    tool_call_count: int = 0
+    started_at_ns: int = field(default_factory=time.monotonic_ns)
+    updated_at_ns: int = field(default_factory=time.monotonic_ns)
+    finished_at_ns: Optional[int] = None
+
+
 class ComposerState:
     """Holds the runtime state shared across all API routes."""
 
@@ -122,11 +139,82 @@ class ComposerState:
         self.assistant_provider: Any = None
         self._assistant_proposal_lock = threading.Lock()
         self._assistant_proposals: dict[str, AssistantProposalRecord] = {}
+        self._assistant_request_lock = threading.Lock()
+        self._assistant_requests: dict[str, AssistantRequestRecord] = {}
         self.skill_catalog: SkillCatalog = load_skill_catalog(
             default_skills_dir(),
             catalog=self.catalog,
             strict=True,
         )
+
+    def start_assistant_request(
+        self,
+        *,
+        request_id: str,
+        conversation_id: str,
+        provider_id: str,
+        assistant_mode: str | None = None,
+    ) -> AssistantRequestRecord:
+        now_ns = time.monotonic_ns()
+        record = AssistantRequestRecord(
+            request_id=request_id,
+            conversation_id=conversation_id,
+            provider_id=provider_id,
+            assistant_mode=assistant_mode,
+            status="running",
+            started_at_ns=now_ns,
+            updated_at_ns=now_ns,
+        )
+        with self._assistant_request_lock:
+            self._assistant_requests[request_id] = record
+        return record
+
+    def finish_assistant_request(
+        self,
+        request_id: str,
+        *,
+        status: str,
+        message: str = "",
+        error: dict[str, Any] | None = None,
+        warnings: list[str] | None = None,
+        draft_mutated: bool = False,
+        tool_call_count: int = 0,
+    ) -> AssistantRequestRecord | None:
+        now_ns = time.monotonic_ns()
+        with self._assistant_request_lock:
+            record = self._assistant_requests.get(request_id)
+            if record is None:
+                return None
+            record.status = status
+            record.message = message
+            record.error = error
+            record.warnings = list(warnings or [])
+            record.draft_mutated = draft_mutated
+            record.tool_call_count = tool_call_count
+            record.updated_at_ns = now_ns
+            record.finished_at_ns = now_ns
+            return record
+
+    def mark_assistant_request_cancel_requested(
+        self,
+        request_id: str,
+        *,
+        message: str = "Cancellation requested.",
+    ) -> AssistantRequestRecord | None:
+        now_ns = time.monotonic_ns()
+        with self._assistant_request_lock:
+            record = self._assistant_requests.get(request_id)
+            if record is None:
+                return None
+            if record.status == "running":
+                record.status = "cancel_requested"
+                record.message = message
+                record.updated_at_ns = now_ns
+            return record
+
+    def get_assistant_request(self, request_id: str) -> AssistantRequestRecord | None:
+        with self._assistant_request_lock:
+            return self._assistant_requests.get(request_id)
 
     def stage_assistant_proposals(
         self,

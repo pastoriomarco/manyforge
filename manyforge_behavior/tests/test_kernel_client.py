@@ -150,6 +150,29 @@ class TestMockKernelSceneEdit:
         assert result.success is False
         assert result.error == "Object not found"
 
+    def test_scene_edit_upsert_inserts_or_replaces_object(self, kernel):
+        insert = SceneEditRequest(
+            operation="upsert",
+            object_id="box1",
+            shape_type="box",
+            box_dimensions_m=[0.05, 0.05, 0.05],
+            pose_position_m=[0.1, 0.2, 0.3],
+        )
+        assert kernel.scene_edit(insert).success is True
+        replace = SceneEditRequest(
+            operation="upsert",
+            object_id="box1",
+            shape_type="sphere",
+            sphere_radius_m=0.04,
+            pose_position_m=[0.4, 0.5, 0.6],
+        )
+        assert kernel.scene_edit(replace).success is True
+        snapshot = kernel.get_scene_objects()[0]
+        assert snapshot.shape is not None
+        assert snapshot.shape.type == "sphere"
+        assert snapshot.pose_in_universe is not None
+        assert snapshot.pose_in_universe["position_m"] == pytest.approx([0.4, 0.5, 0.6])
+
     def test_scene_trace_records_scene_mutations(self, kernel):
         kernel.scene_edit(SceneEditRequest(
             operation="add",

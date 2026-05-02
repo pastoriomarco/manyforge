@@ -25,10 +25,26 @@ def assistant_tool_catalog() -> list[dict[str, Any]]:
             "mutatesState": False,
             "requiresReview": True,
             "inputSchema": {
-                "includeSubtrees": "list[str]",
-                "excludeSubtrees": "list[str]",
-                "probePrims": "list[str]",
-                "outputProfile": "llm_scene_authoring | raw_inventory",
+                "type": "object",
+                "properties": {
+                    "includeSubtrees": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "excludeSubtrees": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "probePrims": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "outputProfile": {
+                        "type": "string",
+                        "enum": ["llm_scene_authoring", "raw_inventory"],
+                    },
+                },
+                "additionalProperties": False,
             },
         },
         {
@@ -40,24 +56,52 @@ def assistant_tool_catalog() -> list[dict[str, Any]]:
             "mutatesState": False,
             "requiresReview": True,
             "inputSchema": {
-                "inspectionReport": "inspect_isaac_scene response",
-                "sourceRoots": "list[str], optional explicit selection",
-                "objectIdPrefix": "string, optional",
+                "type": "object",
+                "required": ["inspectionReport"],
+                "properties": {
+                    "inspectionReport": {"type": "object"},
+                    "sourceRoots": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "objectIdPrefix": {"type": "string"},
+                },
+                "additionalProperties": False,
             },
         },
         {
             "name": "propose_scene_object_nodes",
             "description": (
                 "Build reviewable tree-node draft proposals for scene object "
-                "operations such as add/remove/attach/detach."
+                "operations such as add/upsert/remove/attach/detach."
             ),
             "mutatesState": False,
             "requiresReview": True,
             "inputSchema": {
-                "sceneResources": "list[ProgramSceneResource]",
-                "operations": "add_collision_object | remove_collision_object | attach_object_to_link | detach_object_from_link",
-                "linkFrame": "string, required for attach/detach",
-                "gripperId": "string, optional",
+                "type": "object",
+                "required": ["sceneResources", "operations"],
+                "properties": {
+                    "sceneResources": {
+                        "type": "array",
+                        "items": {"type": "object"},
+                    },
+                    "operations": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "enum": [
+                                "add_collision_object",
+                                "upsert_collision_object",
+                                "remove_collision_object",
+                                "attach_object_to_link",
+                                "detach_object_from_link",
+                            ],
+                        },
+                    },
+                    "linkFrame": {"type": "string"},
+                    "gripperId": {"type": "string"},
+                },
+                "additionalProperties": False,
             },
         },
     ]
@@ -304,6 +348,7 @@ def _proposal_from_scene_resource(
 
 _SCENE_OBJECT_NODE_OPERATIONS = {
     "add_collision_object",
+    "upsert_collision_object",
     "remove_collision_object",
     "attach_object_to_link",
     "detach_object_from_link",
@@ -327,7 +372,7 @@ def _scene_object_tree_node(
         used_names,
     )
     params: dict[str, Any] = {"object_id": object_id}
-    if operation == "add_collision_object":
+    if operation in {"add_collision_object", "upsert_collision_object"}:
         params.update(
             {
                 "shape_type": shape["type"],

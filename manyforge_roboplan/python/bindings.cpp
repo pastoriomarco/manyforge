@@ -637,7 +637,7 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
         py::dict result;
         std::string op = request["operation"].cast<std::string>();
 
-        if (op == "add") {
+        if (op == "add" || op == "upsert") {
           AddObjectRequestDTO req;
           req.object_id = request["object_id"].cast<std::string>();
           req.frame_id = request.attr("get")("frame_id", "universe").cast<std::string>();
@@ -681,6 +681,29 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
             result["success"] = false;
             result["error"] = "Unsupported shape_type for native backend: " + shape_type;
             return result;
+          }
+
+          if (op == "upsert") {
+            auto state = self.context->get_object_state(req.object_id);
+            if (state.exists && state.attached) {
+              result["success"] = false;
+              result["error"] = "Cannot upsert attached object";
+              return result;
+            }
+            if (state.exists) {
+              RemoveObjectRequestDTO remove_req;
+              remove_req.object_id = req.object_id;
+              auto remove_result = self.context->remove_object(remove_req);
+              if (!remove_result.success) {
+                result["success"] = false;
+                if (remove_result.error.has_value()) {
+                  result["error"] = remove_result.error->message;
+                } else {
+                  result["error"] = "Failed to remove existing object before upsert";
+                }
+                return result;
+              }
+            }
           }
 
           auto r = self.context->add_object(req);

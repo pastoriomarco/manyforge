@@ -119,6 +119,83 @@ def test_bridge_rejects_out_of_catalog_tool_calls(
     assert audit_record["outOfMode"][0]["argumentsHash"]
 
 
+def test_bridge_forwards_tool_input_schema_to_upstream(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    captured: dict[str, Any] = {}
+    input_schema = {
+        "type": "object",
+        "required": ["sceneResource"],
+        "properties": {
+            "sceneResource": {
+                "type": "object",
+                "required": ["objectId"],
+                "properties": {"objectId": {"type": "string"}},
+                "additionalProperties": True,
+            }
+        },
+        "additionalProperties": False,
+    }
+
+    async def resolve_model() -> str:
+        return "test-model"
+
+    async def call_upstream(
+        *,
+        tools: list[dict[str, Any]],
+        **_: Any,
+    ) -> dict[str, Any]:
+        captured["tools"] = tools
+        return {"choices": [{"message": {"content": "No change needed."}}]}
+
+    monkeypatch.setattr(bridge, "AUDIT_LOG_PATH", tmp_path / "audit.jsonl")
+    monkeypatch.setattr(bridge, "_resolve_model", resolve_model)
+    monkeypatch.setattr(bridge, "_call_upstream", call_upstream)
+
+    response = TestClient(bridge.app).post(
+        "/v1/manyforge/assistant",
+        json=_bridge_payload(
+            catalog_tools=["scene.draft.add_object"],
+            tools=[
+                {
+                    "id": "scene.draft.add_object",
+                    "effect": "composer_draft_mutating",
+                    "description": "Add an object to the Composer draft scene.",
+                    "inputSchema": input_schema,
+                }
+            ],
+        ),
+    )
+
+    assert response.status_code == 200
+    assert captured["tools"][0]["function"]["name"] == "scene_draft_add_object"
+    assert captured["tools"][0]["function"]["parameters"] == input_schema
+
+
+def test_bridge_success_envelope_always_includes_message(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    async def resolve_model() -> str:
+        return "test-model"
+
+    async def call_upstream(**_: Any) -> dict[str, Any]:
+        return {"choices": [{"message": {"content": None, "tool_calls": []}}]}
+
+    monkeypatch.setattr(bridge, "AUDIT_LOG_PATH", tmp_path / "audit.jsonl")
+    monkeypatch.setattr(bridge, "_resolve_model", resolve_model)
+    monkeypatch.setattr(bridge, "_call_upstream", call_upstream)
+
+    response = TestClient(bridge.app).post(
+        "/v1/manyforge/assistant",
+        json=_bridge_payload(),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["message"] == "Assistant completed without a text response."
+
+
 def test_bridge_returns_descriptor_tool_calls_as_proposals(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -216,14 +293,14 @@ def test_bridge_executes_read_only_tools_in_loop(
         assert upstream_messages[-1][-1]["tool_call_id"] == "call-program"
         return {"choices": [{"message": {"content": "The program is loaded."}}]}
 
-    async def execute_read_only_tool(**kwargs: Any) -> dict[str, Any]:
+    async def execute_callback_tool(**kwargs: Any) -> dict[str, Any]:
         callbacks.append(kwargs)
         return {"success": True, "result": {"programLoaded": True}, "mutated": False}
 
     monkeypatch.setattr(bridge, "AUDIT_LOG_PATH", audit_log)
     monkeypatch.setattr(bridge, "_resolve_model", resolve_model)
     monkeypatch.setattr(bridge, "_call_upstream", call_upstream)
-    monkeypatch.setattr(bridge, "_execute_read_only_tool", execute_read_only_tool)
+    monkeypatch.setattr(bridge, "_execute_callback_tool", execute_callback_tool)
 
     response = TestClient(bridge.app).post(
         "/v1/manyforge/assistant",
@@ -251,10 +328,149 @@ def test_bridge_executes_read_only_tools_in_loop(
     assert payload["toolCalls"][0]["result"] == {"programLoaded": True}
     assert len(upstream_messages) == 2
     assert callbacks[0]["tool_id"] == "program.read"
+    assert callbacks[0]["effect"] == "read_only"
 
     audit_record = json.loads(audit_log.read_text(encoding="utf-8").splitlines()[-1])
     assert audit_record["exitReason"] == "ok"
     assert audit_record["turnCount"] == 2
+
+
+def test_bridge_executes_composer_draft_mutating_tools_in_composer_mode(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    audit_log = tmp_path / "audit.jsonl"
+    upstream_messages: list[list[dict[str, Any]]] = []
+    callbacks: list[dict[str, Any]] = []
+
+    async def resolve_model() -> str:
+        return "test-model"
+
+    async def call_upstream(
+        *,
+        messages: list[dict[str, Any]],
+        **_: Any,
+    ) -> dict[str, Any]:
+        upstream_messages.append(messages)
+        if len(upstream_messages) == 1:
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "",
+                            "tool_calls": [
+                                {
+                                    "id": "call-draft-add",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "scene_draft_add_object",
+                                        "arguments": json.dumps(
+                                            {"sceneResource": {"objectId": "box_1"}}
+                                        ),
+                                    },
+                                }
+                            ],
+                        }
+                    }
+                ]
+            }
+        assert upstream_messages[-1][-1]["role"] == "tool"
+        return {"choices": [{"message": {"content": "I added box_1 to the draft."}}]}
+
+    async def execute_callback_tool(**kwargs: Any) -> dict[str, Any]:
+        callbacks.append(kwargs)
+        return {
+            "success": True,
+            "result": {"draftMutation": "scene_resource_add", "objectId": "box_1"},
+            "mutated": True,
+            "draftMutated": True,
+        }
+
+    monkeypatch.setattr(bridge, "AUDIT_LOG_PATH", audit_log)
+    monkeypatch.setattr(bridge, "_resolve_model", resolve_model)
+    monkeypatch.setattr(bridge, "_call_upstream", call_upstream)
+    monkeypatch.setattr(bridge, "_execute_callback_tool", execute_callback_tool)
+
+    response = TestClient(bridge.app).post(
+        "/v1/manyforge/assistant",
+        json=_bridge_payload(
+            request_id="req-draft-loop",
+            assistant_mode="composer-assistant",
+            catalog_tools=["scene.draft.add_object"],
+            tools=[
+                {
+                    "id": "scene.draft.add_object",
+                    "effect": "composer_draft_mutating",
+                    "description": "Add an object to the Composer draft scene.",
+                }
+            ],
+        ),
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert "error" not in payload
+    assert payload["message"] == "I added box_1 to the draft."
+    assert payload["draftMutated"] is True
+    assert payload["mutated"] is False
+    assert payload["toolCalls"][0]["name"] == "scene.draft.add_object"
+    assert payload["toolCalls"][0]["status"] == "completed"
+    assert callbacks[0]["effect"] == "composer_draft_mutating"
+    assert len(upstream_messages) == 2
+
+
+def test_bridge_rejects_composer_draft_mutating_tool_in_query_mode(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    async def resolve_model() -> str:
+        return "test-model"
+
+    async def call_upstream(**_: Any) -> dict[str, Any]:
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "call-draft-add",
+                                "type": "function",
+                                "function": {
+                                    "name": "scene_draft_add_object",
+                                    "arguments": "{}",
+                                },
+                            }
+                        ],
+                    }
+                }
+            ]
+        }
+
+    monkeypatch.setattr(bridge, "AUDIT_LOG_PATH", tmp_path / "audit.jsonl")
+    monkeypatch.setattr(bridge, "_resolve_model", resolve_model)
+    monkeypatch.setattr(bridge, "_call_upstream", call_upstream)
+
+    response = TestClient(bridge.app).post(
+        "/v1/manyforge/assistant",
+        json=_bridge_payload(
+            request_id="req-draft-query",
+            assistant_mode="query",
+            catalog_tools=["scene.draft.add_object"],
+            tools=[
+                {
+                    "id": "scene.draft.add_object",
+                    "effect": "composer_draft_mutating",
+                    "description": "Add an object to the Composer draft scene.",
+                }
+            ],
+        ),
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["error"]["code"] == "response_rejected"
+    assert "composer_draft_mutating tools may only execute" in payload["error"]["detail"]
 
 
 def test_bridge_cancel_endpoint_rejects_matching_request(

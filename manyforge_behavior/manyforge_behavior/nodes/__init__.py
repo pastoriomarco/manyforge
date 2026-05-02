@@ -5,6 +5,7 @@ from manyforge_behavior.nodes.scene import (
     DetachObjectFromLink,
     RemoveCollisionObject,
     UpdateCollisionObjectPose,
+    UpsertCollisionObject,
 )
 from manyforge_behavior.nodes.logic import (
     CheckKeyBoolValue,
@@ -33,6 +34,7 @@ __all__ = [
     "DetachObjectFromLink",
     "RemoveCollisionObject",
     "UpdateCollisionObjectPose",
+    "UpsertCollisionObject",
     "CheckKeyBoolValue",
     "CheckSignalBool",
     "CommandGripper",

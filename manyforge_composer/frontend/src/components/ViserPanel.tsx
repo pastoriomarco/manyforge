@@ -24,19 +24,34 @@ interface ViserPanelProps {
 
 export function ViserPanel({ onCollapse, blocked, resizing = false }: ViserPanelProps) {
   const [hmiPort, setHmiPort] = useState(DEFAULT_HMI_PORT);
+  const [hmiAvailable, setHmiAvailable] = useState<boolean | null>(null);
+  const [hmiDetail, setHmiDetail] = useState<string | null>(null);
 
   useEffect(() => {
     let active = true;
 
     void api.infra.status()
       .then((status) => {
-        const port = status.components.hmi?.port;
-        if (active && typeof port === 'number' && port > 0) {
-          setHmiPort(String(port));
+        if (!active) {
+          return;
         }
+        const hmi = status.components.hmi;
+        const port = hmi?.port;
+        if (hmi?.status === 'healthy' && typeof port === 'number' && port > 0) {
+          setHmiPort(String(port));
+          setHmiAvailable(true);
+          setHmiDetail(null);
+          return;
+        }
+        setHmiAvailable(false);
+        setHmiDetail('Start Composer with --hmi-port 8081 to enable the embedded Viser view.');
       })
       .catch(() => {
-        // Fall back to the default HMI port when infra status is unavailable.
+        if (active) {
+          // Fall back to the default HMI port when infra status is unavailable.
+          setHmiAvailable(null);
+          setHmiDetail(null);
+        }
       });
 
     return () => {
@@ -51,17 +66,25 @@ export function ViserPanel({ onCollapse, blocked, resizing = false }: ViserPanel
       <div className="flex h-10 items-center justify-between border-b border-gray-700 bg-gray-800 px-3">
         <div className="min-w-0">
           <div className="text-xs font-semibold uppercase tracking-wide text-gray-300">Viser HMI</div>
-          <div className="truncate text-[10px] text-gray-500">{viserUrl}</div>
+          <div className="truncate text-[10px] text-gray-500">
+            {hmiAvailable === false ? 'HMI unavailable' : viserUrl}
+          </div>
         </div>
         <div className="flex items-center gap-2">
-          <a
-            href={viserUrl}
-            target="_blank"
-            rel="noreferrer"
-            className="rounded bg-gray-700 px-2 py-1 text-[11px] font-medium text-gray-200 hover:bg-gray-600"
-          >
-            Open
-          </a>
+          {hmiAvailable === false ? (
+            <span className="rounded bg-gray-800 px-2 py-1 text-[11px] font-medium text-gray-500">
+              Open
+            </span>
+          ) : (
+            <a
+              href={viserUrl}
+              target="_blank"
+              rel="noreferrer"
+              className="rounded bg-gray-700 px-2 py-1 text-[11px] font-medium text-gray-200 hover:bg-gray-600"
+            >
+              Open
+            </a>
+          )}
           <button
             type="button"
             onClick={onCollapse}
@@ -92,11 +115,24 @@ export function ViserPanel({ onCollapse, blocked, resizing = false }: ViserPanel
             </div>
           </div>
         )}
-        <iframe
-          title="Viser HMI"
-          src={viserUrl}
-          className={`h-full w-full border-0 bg-gray-950 ${resizing ? 'pointer-events-none' : ''}`}
-        />
+        {hmiAvailable === false ? (
+          <div className="flex h-full items-center justify-center p-6 text-center">
+            <div className="max-w-sm rounded-lg border border-gray-700 bg-gray-900/95 p-4 shadow-xl">
+              <div className="mb-2 text-sm font-semibold text-gray-200">
+                Viser HMI Not Running
+              </div>
+              <p className="text-sm text-gray-400">
+                {hmiDetail}
+              </p>
+            </div>
+          </div>
+        ) : (
+          <iframe
+            title="Viser HMI"
+            src={viserUrl}
+            className={`h-full w-full border-0 bg-gray-950 ${resizing ? 'pointer-events-none' : ''}`}
+          />
+        )}
       </div>
     </div>
   );

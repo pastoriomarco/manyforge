@@ -207,6 +207,25 @@ def test_scene_edit_rejects_invalid_add_payload_with_422():
     assert response.status_code == 422
 
 
+def test_scene_edit_accepts_upsert_operation():
+    client, state, kernel = make_client()
+
+    response = client.post(
+        "/api/scene/edit",
+        json={
+            "operation": "upsert",
+            "object_id": "box1",
+            "shape_type": "box",
+            "box_dimensions_m": [0.05, 0.05, 0.05],
+            "pose_position_m": [0.3, 0.0, 0.15],
+            "pose_orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["success"] is True
+
+
 def test_scene_edit_returns_domain_failure_for_missing_object():
     client, state, kernel = make_client()
 

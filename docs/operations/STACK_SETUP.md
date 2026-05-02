@@ -25,9 +25,9 @@ It does not cover:
 
 See also:
 
-- [`../plans/AI_ASSISTANT_INTEGRATION_PLAN.md`](../plans/AI_ASSISTANT_INTEGRATION_PLAN.md)
-- [`../integration/PLATFORM_REQUIREMENTS.md`](../integration/PLATFORM_REQUIREMENTS.md)
-- [`../plans/PRODUCT_DIRECTION_PLAN.md`](../plans/PRODUCT_DIRECTION_PLAN.md)
+- [`../../../manyforge_specs/docs/plans/AI_ASSISTANT_INTEGRATION_PLAN.md`](../../../manyforge_specs/docs/plans/AI_ASSISTANT_INTEGRATION_PLAN.md)
+- [`../../../manyforge_specs/docs/integration/PLATFORM_REQUIREMENTS.md`](../../../manyforge_specs/docs/integration/PLATFORM_REQUIREMENTS.md)
+- [`../../../manyforge_specs/docs/plans/PRODUCT_DIRECTION_PLAN.md`](../../../manyforge_specs/docs/plans/PRODUCT_DIRECTION_PLAN.md)
 
 ## Current Supported Modes
 
@@ -54,7 +54,7 @@ Use when:
 ### 3. ManyForge plus NemoClaw/OpenClaw
 
 Current validated agent path still uses the mux-based workaround described in
-[`../integration/PLATFORM_REQUIREMENTS.md`](../integration/PLATFORM_REQUIREMENTS.md).
+[`../../../manyforge_specs/docs/integration/PLATFORM_REQUIREMENTS.md`](../../../manyforge_specs/docs/integration/PLATFORM_REQUIREMENTS.md).
 
 Use when:
 
@@ -232,8 +232,8 @@ alias; the deployment maps that alias to the actual provider/model endpoint.
 
 That is expected on the current platform baseline. See:
 
-- [`../plans/AI_ASSISTANT_INTEGRATION_PLAN.md`](../plans/AI_ASSISTANT_INTEGRATION_PLAN.md)
-- [`../integration/PLATFORM_REQUIREMENTS.md`](../integration/PLATFORM_REQUIREMENTS.md)
+- [`../../../manyforge_specs/docs/plans/AI_ASSISTANT_INTEGRATION_PLAN.md`](../../../manyforge_specs/docs/plans/AI_ASSISTANT_INTEGRATION_PLAN.md)
+- [`../../../manyforge_specs/docs/integration/PLATFORM_REQUIREMENTS.md`](../../../manyforge_specs/docs/integration/PLATFORM_REQUIREMENTS.md)
 
 ## Keep This File Small
 

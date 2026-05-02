@@ -239,7 +239,11 @@ export interface AssistantConfig {
   enabled: boolean;
 }
 
-export type AssistantToolEffect = 'read_only' | 'proposal' | 'runtime_mutating';
+export type AssistantToolEffect =
+  | 'read_only'
+  | 'proposal'
+  | 'composer_draft_mutating'
+  | 'runtime_mutating';
 
 export interface AssistantToolDefinition {
   id: string;
@@ -265,6 +269,99 @@ export interface AssistantModeDefinition {
   description: string;
   authority: AssistantModeAuthority;
   catalog: AssistantModeCatalog;
+}
+
+export interface AssistantToolCall {
+  name: string;
+  status: 'proposed' | 'skipped' | 'completed' | 'failed';
+  arguments: Record<string, unknown>;
+  result?: Record<string, unknown> | null;
+  error?: string | null;
+}
+
+export interface AssistantError {
+  code: string;
+  detail: string;
+}
+
+export interface AssistantChatRequest {
+  message: string;
+  mode: 'mock' | 'provider';
+  requestId?: string;
+  providerId?: string;
+  conversationId?: string;
+  assistantMode?: string;
+  context?: Record<string, unknown>;
+  requestedTools?: string[];
+}
+
+export interface AssistantProposal {
+  id: string;
+  type: string;
+  title: string;
+  summary: string;
+  status: 'draft';
+  reviewRequired: boolean;
+  payload: Record<string, unknown>;
+  warnings: string[];
+  source: Record<string, unknown>;
+}
+
+export interface AssistantChatResponse {
+  requestId: string;
+  conversationId: string;
+  mode: 'mock' | 'provider';
+  providerId: string;
+  assistantMode?: string | null;
+  message: string;
+  proposals: AssistantProposal[];
+  toolCalls: AssistantToolCall[];
+  warnings: string[];
+  mutated: boolean;
+  draftMutated: boolean;
+  requiresReview: boolean;
+  programLoaded: boolean;
+  cycleState: string;
+  timestampNs: number;
+  error?: AssistantError | null;
+}
+
+export interface AssistantProviderDescriptor {
+  id: string;
+  description: string;
+  configured: boolean;
+  requiresLiveModel: boolean;
+  requiresLiveIsaacSim: boolean;
+}
+
+export interface AssistantProviderCatalog {
+  providers: AssistantProviderDescriptor[];
+  configuredProviderId?: string | null;
+}
+
+export interface AssistantRequestStatus {
+  requestId: string;
+  conversationId: string;
+  providerId: string;
+  assistantMode?: string | null;
+  status: 'running' | 'cancel_requested' | 'completed' | 'failed' | 'cancelled';
+  message: string;
+  error?: AssistantError | null;
+  warnings: string[];
+  draftMutated: boolean;
+  toolCallCount: number;
+  startedAtNs: number;
+  updatedAtNs: number;
+  finishedAtNs?: number | null;
+}
+
+export interface AssistantCancelResponse {
+  requestId: string;
+  cancelled: boolean;
+  status: 'running' | 'cancel_requested' | 'completed' | 'failed' | 'cancelled' | 'unknown';
+  detail: string;
+  providerResponse: Record<string, unknown>;
+  timestampNs: number;
 }
 
 export interface PromptTemplateConfig {
@@ -403,7 +500,7 @@ export interface SceneStateResponse {
 }
 
 export interface SceneEditRequest {
-  operation: 'add' | 'remove' | 'update_pose' | 'attach' | 'detach';
+  operation: 'add' | 'upsert' | 'remove' | 'update_pose' | 'attach' | 'detach';
   object_id: string;
   shape_type?: 'box' | 'sphere';
   box_dimensions_m?: number[];

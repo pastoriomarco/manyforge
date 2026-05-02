@@ -452,6 +452,26 @@ class TestNativeSceneEdits:
         ))
         assert result.success is True
 
+    def test_upsert_replaces_existing_object(self, native_kernel):
+        insert = native_kernel.scene_edit(SceneEditRequest(
+            operation="upsert", object_id="upsert_box", shape_type="box",
+            box_dimensions_m=[0.1, 0.1, 0.1],
+            pose_position_m=[0.5, 0.0, 0.5],
+            pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
+            frame_id="universe",
+        ))
+        assert insert.success is True
+        replace = native_kernel.scene_edit(SceneEditRequest(
+            operation="upsert", object_id="upsert_box", shape_type="sphere",
+            sphere_radius_m=0.04,
+            pose_position_m=[0.4, 0.1, 0.6],
+            pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
+            frame_id="universe",
+        ))
+        assert replace.success is True
+        state = native_kernel.get_object_state("upsert_box")
+        assert state.exists is True
+
     def test_add_remove(self, native_kernel):
         native_kernel.scene_edit(SceneEditRequest(
             operation="add", object_id="temp", shape_type="box",

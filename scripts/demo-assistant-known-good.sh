@@ -1,0 +1,528 @@
+#!/usr/bin/env bash
+# demo-assistant-known-good.sh — Omni-first ManyForge assistant demo launcher.
+#
+# Usage:
+#   ./scripts/demo-assistant-known-good.sh start
+#   ./scripts/demo-assistant-known-good.sh smoke
+#   ./scripts/demo-assistant-known-good.sh preflight
+#   ./scripts/demo-assistant-known-good.sh status
+#   ./scripts/demo-assistant-known-good.sh stop
+#
+# Defaults target the current single-model assistant candidate:
+#   nemotron3-nano-omni-30b-a3b-nvfp4
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MANYFORGE_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+NEMOCLAW_THOR="${NEMOCLAW_THOR:-/home/tndlux/workspaces/nemoclaw/src/NemoClaw-Thor}"
+
+MODEL_PROFILE="${MODEL_PROFILE:-nemotron3-nano-omni-30b-a3b-nvfp4}"
+SAMPLING_PROFILE="${SAMPLING_PROFILE:-omni-instruct-no-think-32768}"
+VLLM_CONTAINER="${VLLM_CONTAINER:-manyforge-e2e-vllm}"
+COMPOSER_CONTAINER="${COMPOSER_CONTAINER:-manyforge-e2e-composer}"
+LOG_DIR="${LOG_DIR:-/tmp/manyforge-assistant-e2e}"
+BRIDGE_PID_FILE="${BRIDGE_PID_FILE:-${LOG_DIR}/known-good-bridge.pid}"
+BRIDGE_LOG="${BRIDGE_LOG:-${LOG_DIR}/known-good-bridge.log}"
+BRIDGE_AUDIT_LOG="${BRIDGE_AUDIT_LOG:-${LOG_DIR}/known-good-bridge-audit.jsonl}"
+COMPOSER_URL="${COMPOSER_URL:-http://127.0.0.1:9000}"
+BRIDGE_URL="${BRIDGE_URL:-http://127.0.0.1:8100}"
+UPSTREAM_BASE_URL="${UPSTREAM_BASE_URL:-http://127.0.0.1:8000/v1}"
+ASSISTANT_TIMEOUT_S="${ASSISTANT_TIMEOUT_S:-180}"
+DROP_CACHES="${DROP_CACHES:-true}"
+PRESERVE_OPENSHELL="${PRESERVE_OPENSHELL:-true}"
+
+usage() {
+    cat <<EOF
+Usage: $0 {start|smoke|preflight|status|stop|restart}
+
+Environment overrides:
+  MODEL_PROFILE=${MODEL_PROFILE}
+  SAMPLING_PROFILE=${SAMPLING_PROFILE}
+  NEMOCLAW_THOR=${NEMOCLAW_THOR}
+  DROP_CACHES=${DROP_CACHES}
+  PRESERVE_OPENSHELL=${PRESERVE_OPENSHELL}
+
+By default, stop/restart preserves the OpenShell gateway because the gateway
+owns the live sandbox state. Set PRESERVE_OPENSHELL=false only when you
+intentionally want to delete and recreate that gateway.
+EOF
+}
+
+container_running() {
+    local name="$1"
+    docker ps --format '{{.Names}}' | grep -qx "${name}"
+}
+
+bridge_pid_alive() {
+    if [[ ! -f "${BRIDGE_PID_FILE}" ]]; then
+        return 1
+    fi
+    local pid
+    pid="$(cat "${BRIDGE_PID_FILE}" 2>/dev/null || true)"
+    if [[ -n "${pid}" ]] && kill -0 "${pid}" >/dev/null 2>&1; then
+        return 0
+    fi
+    rm -f "${BRIDGE_PID_FILE}"
+    return 1
+}
+
+port_listeners() {
+    local port="$1"
+    ss -ltnp | grep -E ":${port}\\b" || true
+}
+
+port_is_listening() {
+    local port="$1"
+    [[ -n "$(port_listeners "${port}")" ]]
+}
+
+expected_port_owner() {
+    local port="$1"
+    case "${port}" in
+        8000) container_running "${VLLM_CONTAINER}" ;;
+        8080) container_running "openshell-cluster-nemoclaw" ;;
+        8081) container_running "${COMPOSER_CONTAINER}" ;;
+        8100) bridge_pid_alive ;;
+        9000) container_running "${COMPOSER_CONTAINER}" ;;
+        *) return 1 ;;
+    esac
+}
+
+preflight() {
+    local errors=0
+    local port lines
+    for port in 8000 8080 8081 8100 9000; do
+        if ! port_is_listening "${port}"; then
+            continue
+        fi
+        if expected_port_owner "${port}"; then
+            continue
+        fi
+        echo "Unexpected listener on port ${port}; refusing to start duplicate demo services." >&2
+        lines="$(port_listeners "${port}")"
+        [[ -n "${lines}" ]] && echo "${lines}" >&2
+        errors=1
+    done
+    if (( errors != 0 )); then
+        cat >&2 <<EOF
+
+Run './scripts/demo-assistant-known-good.sh stop' to clean known demo services.
+If a manual Composer, bridge, vLLM, or OpenShell instance owns one of these
+ports, stop it explicitly before starting the known-good demo.
+EOF
+        return 1
+    fi
+    echo "Preflight ok: no unmanaged listeners on ports 8000, 8080, 8081, 8100, or 9000."
+}
+
+step() {
+    printf '\n==> %s\n' "$*"
+}
+
+ensure_dirs() {
+    mkdir -p "${LOG_DIR}"
+}
+
+drop_caches() {
+    if [[ "${DROP_CACHES}" != "true" ]]; then
+        return
+    fi
+    sync
+    sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'
+}
+
+print_truncated() {
+    local value="${1//$'\r'/ }"
+    local columns="${COLUMNS:-120}"
+    if ! [[ "${columns}" =~ ^[0-9]+$ ]]; then
+        columns=120
+    fi
+    local max=$((columns - 6))
+    if (( max < 40 )); then
+        max=40
+    fi
+    printf '%.*s' "${max}" "${value}"
+}
+
+wait_json() {
+    local url="$1"
+    local timeout_s="${2:-60}"
+    local label="${3:-Waiting for ${url}}"
+    local hint="${4:-}"
+    local log_container="${5:-}"
+    local start=$SECONDS
+    local deadline=$((start + timeout_s))
+    local next_log_at=0
+    local elapsed rendered_lines=0
+
+    render_wait() {
+        local current_elapsed="$1"
+        local line
+        local log_lines=()
+        if [[ -n "${log_container}" ]]; then
+            while IFS= read -r line; do
+                log_lines+=("${line}")
+            done < <(docker logs --tail 3 "${log_container}" 2>&1 || true)
+        fi
+
+        if [[ -t 1 ]]; then
+            if (( rendered_lines > 0 )); then
+                printf '\033[%sA\033[J' "${rendered_lines}"
+            fi
+            rendered_lines=0
+            printf '%s\n' "${label}"
+            rendered_lines=$((rendered_lines + 1))
+            if [[ -n "${hint}" ]]; then
+                printf '  %s\n' "${hint}"
+                rendered_lines=$((rendered_lines + 1))
+            fi
+            printf '  Loading, please wait... elapsed %ds\n' "${current_elapsed}"
+            rendered_lines=$((rendered_lines + 1))
+            if [[ -n "${log_container}" ]]; then
+                printf '  Latest %s logs:\n' "${log_container}"
+                rendered_lines=$((rendered_lines + 1))
+                if (( ${#log_lines[@]} == 0 )); then
+                    printf '    (no logs yet)\n'
+                    rendered_lines=$((rendered_lines + 1))
+                else
+                    for line in "${log_lines[@]}"; do
+                        printf '    '
+                        print_truncated "${line}"
+                        printf '\n'
+                        rendered_lines=$((rendered_lines + 1))
+                    done
+                fi
+            fi
+            return
+        fi
+
+        if (( current_elapsed < next_log_at )); then
+            return
+        fi
+        printf '%s\n' "${label}"
+        if [[ -n "${hint}" ]]; then
+            printf '  %s\n' "${hint}"
+        fi
+        printf '  Loading, please wait... elapsed %ds\n' "${current_elapsed}"
+        if [[ -n "${log_container}" ]]; then
+            printf '  Latest %s logs:\n' "${log_container}"
+            if (( ${#log_lines[@]} == 0 )); then
+                printf '    (no logs yet)\n'
+            else
+                for line in "${log_lines[@]}"; do
+                    printf '    '
+                    print_truncated "${line}"
+                    printf '\n'
+                done
+            fi
+        fi
+        next_log_at=$((current_elapsed + 30))
+    }
+
+    until curl -fsS "${url}" >/dev/null 2>&1; do
+        if (( SECONDS >= deadline )); then
+            if [[ -t 1 ]] && (( rendered_lines > 0 )); then
+                printf '\033[%sA\033[J' "${rendered_lines}"
+            fi
+            echo "Timed out waiting for ${label}" >&2
+            return 1
+        fi
+        elapsed=$((SECONDS - start))
+        render_wait "${elapsed}"
+        sleep 1
+    done
+    elapsed=$((SECONDS - start))
+    if [[ -t 1 ]] && (( rendered_lines > 0 )); then
+        printf '\033[%sA\033[J' "${rendered_lines}"
+    fi
+    printf '%s\n' "${label}"
+    printf '  ready after %ds\n' "${elapsed}"
+}
+
+served_model_id() {
+    curl -fsS "${UPSTREAM_BASE_URL}/models" 2>/dev/null | python3 -c '
+import json
+import sys
+
+try:
+    data = json.load(sys.stdin)
+    models = data.get("data") or []
+    if models:
+        print(models[0].get("id", ""))
+except Exception:
+    pass
+'
+}
+
+print_json_if_available() {
+    local url="$1"
+    local raw
+    raw="$(curl -fsS "${url}" 2>/dev/null || true)"
+    if [[ -z "${raw}" ]]; then
+        return
+    fi
+    python3 -m json.tool <<<"${raw}" || true
+}
+
+bridge_python() {
+    local venv_python="${MANYFORGE_ROOT}/manyforge_assistant_bridge/.venv/bin/python"
+    if [[ -x "${venv_python}" ]]; then
+        printf '%s\n' "${venv_python}"
+    else
+        printf '%s\n' "python3"
+    fi
+}
+
+install_bridge_deps() {
+    local venv_python="${MANYFORGE_ROOT}/manyforge_assistant_bridge/.venv/bin/python"
+    if [[ -x "${venv_python}" ]]; then
+        return
+    fi
+    (cd "${MANYFORGE_ROOT}" && python3 -m venv manyforge_assistant_bridge/.venv)
+    "${venv_python}" -m pip install -r "${MANYFORGE_ROOT}/manyforge_assistant_bridge/requirements.txt"
+}
+
+start_model() {
+    step "Preparing vLLM model: ${MODEL_PROFILE}"
+    if container_running "${VLLM_CONTAINER}"; then
+        local current_model
+        current_model="$(served_model_id || true)"
+        if [[ "${current_model}" != "${MODEL_PROFILE}" ]]; then
+            echo "Existing ${VLLM_CONTAINER} serves ${current_model:-unknown}; restarting for ${MODEL_PROFILE}."
+            docker rm -f "${VLLM_CONTAINER}" >/dev/null 2>&1 || true
+        else
+            echo "Reusing ${VLLM_CONTAINER}; it already serves ${MODEL_PROFILE}."
+        fi
+    fi
+
+    if ! container_running "${VLLM_CONTAINER}"; then
+        echo "Starting ${VLLM_CONTAINER}; first launch can take several minutes while vLLM loads/compiles."
+        docker rm -f "${VLLM_CONTAINER}" >/dev/null 2>&1 || true
+        drop_caches
+        (
+            cd "${NEMOCLAW_THOR}"
+            THOR_DETACH=1 \
+            THOR_CONTAINER_NAME="${VLLM_CONTAINER}" \
+            ./start-model.sh "${MODEL_PROFILE}"
+        )
+    fi
+    wait_json \
+        "${UPSTREAM_BASE_URL}/models" \
+        900 \
+        "Waiting for vLLM /v1/models on ${UPSTREAM_BASE_URL}" \
+        "Inspect full details in another terminal with: docker logs -f ${VLLM_CONTAINER}" \
+        "${VLLM_CONTAINER}"
+    local served
+    served="$(served_model_id || true)"
+    if [[ "${served}" != "${MODEL_PROFILE}" ]]; then
+        echo "vLLM served model mismatch: ${served:-unknown} (expected ${MODEL_PROFILE})" >&2
+        return 1
+    fi
+    echo "vLLM ready: ${served}"
+}
+
+configure_nemoclaw() {
+    step "Configuring NemoClaw/OpenShell provider"
+    local configure_log="${LOG_DIR}/configure-local-provider.log"
+    if (cd "${NEMOCLAW_THOR}" && ./configure-local-provider.sh "${MODEL_PROFILE}") \
+        2>&1 | tee "${configure_log}"; then
+        return
+    fi
+
+    if openshell sandbox list 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' | grep -Eq '^No sandboxes found\.?$'; then
+        cat <<EOF
+NemoClaw/OpenShell provider route was configured, but no live sandbox exists.
+Continuing because the ManyForge Composer assistant path uses the host bridge
+and local vLLM endpoint directly. Re-run NemoClaw onboarding later if you need
+interactive OpenClaw inside the sandbox.
+EOF
+        return
+    fi
+
+    echo "NemoClaw/OpenShell provider configuration failed; see ${configure_log}" >&2
+    return 1
+}
+
+start_composer() {
+    step "Starting ManyForge Composer and HMI"
+    if container_running "${COMPOSER_CONTAINER}"; then
+        echo "Reusing ${COMPOSER_CONTAINER}."
+        return
+    fi
+    docker rm -f "${COMPOSER_CONTAINER}" >/dev/null 2>&1 || true
+    docker run -d --rm \
+        --name "${COMPOSER_CONTAINER}" \
+        --network host \
+        -v "${MANYFORGE_ROOT}:/workspace" \
+        -v manyforge_build-cache:/tmp/manyforge-build \
+        -w /workspace \
+        -e MANYFORGE_ASSISTANT_PROVIDER=nemoclaw \
+        -e MANYFORGE_ASSISTANT_ENDPOINT_URL="${BRIDGE_URL}/v1/manyforge/assistant" \
+        -e MANYFORGE_ASSISTANT_TIMEOUT_S="${ASSISTANT_TIMEOUT_S}" \
+        manyforge-dev:latest \
+        bash -lc "python -m manyforge_composer \
+          --catalog-path /workspace/manyforge_behavior/resources/node_catalog.yaml \
+          --host 127.0.0.1 \
+          --port 9000 \
+          --hmi-port 8081 \
+          --assistant-provider nemoclaw \
+          --assistant-endpoint ${BRIDGE_URL}/v1/manyforge/assistant \
+          --assistant-timeout-s ${ASSISTANT_TIMEOUT_S}" >/dev/null
+    wait_json \
+        "${COMPOSER_URL}/api/infra/status" \
+        120 \
+        "Waiting for Composer infra status on ${COMPOSER_URL}" \
+        "Inspect full details in another terminal with: docker logs -f ${COMPOSER_CONTAINER}" \
+        "${COMPOSER_CONTAINER}"
+}
+
+start_bridge() {
+    step "Starting ManyForge assistant bridge"
+    if bridge_pid_alive; then
+        echo "Reusing bridge from ${BRIDGE_PID_FILE}."
+        return
+    fi
+    if port_is_listening 8100; then
+        echo "Port 8100 is already in use by an unmanaged process; refusing to start another bridge." >&2
+        port_listeners 8100 >&2
+        return 1
+    fi
+    install_bridge_deps
+    local python
+    python="$(bridge_python)"
+    (
+        cd "${MANYFORGE_ROOT}"
+        env \
+          BRIDGE_HOST=127.0.0.1 \
+          BRIDGE_PORT=8100 \
+          BRIDGE_UPSTREAM_BASE_URL="${UPSTREAM_BASE_URL}" \
+          BRIDGE_MANYFORGE_BASE_URL="${COMPOSER_URL}" \
+          BRIDGE_MODEL="${MODEL_PROFILE}" \
+          BRIDGE_REQUEST_TIMEOUT_S="${ASSISTANT_TIMEOUT_S}" \
+          BRIDGE_MAX_WALL_TIME_S="${ASSISTANT_TIMEOUT_S}" \
+          BRIDGE_MAX_TURNS=4 \
+          BRIDGE_UPSTREAM_MAX_TOKENS=32768 \
+          BRIDGE_UPSTREAM_ENABLE_THINKING=false \
+          BRIDGE_UPSTREAM_TEMPERATURE=0.2 \
+          BRIDGE_UPSTREAM_TOP_K=1 \
+          BRIDGE_AUDIT_LOG="${BRIDGE_AUDIT_LOG}" \
+          setsid "${python}" -m manyforge_assistant_bridge.bridge \
+          </dev/null >"${BRIDGE_LOG}" 2>&1 &
+        echo $! >"${BRIDGE_PID_FILE}"
+    )
+    wait_json \
+        "${BRIDGE_URL}/healthz" \
+        60 \
+        "Waiting for assistant bridge health on ${BRIDGE_URL}" \
+        "Bridge log: ${BRIDGE_LOG}"
+}
+
+load_demo_artifacts() {
+    step "Loading known-good program and assistant deployment"
+    python3 - <<'PY' | curl -fsS -X POST "${COMPOSER_URL}/api/deployment/load" \
+        -H "Content-Type: application/json" --data-binary @- >/dev/null
+import json
+print(json.dumps({"path": "/workspace/examples/assistant_modes_scene_authoring.deployment.yaml"}))
+PY
+    python3 - <<'PY' | curl -fsS -X POST "${COMPOSER_URL}/api/program/load" \
+        -H "Content-Type: application/json" --data-binary @- >/dev/null
+import json
+print(json.dumps({
+    "path": "/workspace/examples/pick_and_place.program.yaml",
+    "deploymentPath": "/workspace/examples/assistant_modes_scene_authoring.deployment.yaml",
+    "forceDiscardOverrides": True,
+}))
+PY
+}
+
+start_all() {
+    ensure_dirs
+    preflight
+    start_model
+    configure_nemoclaw
+    start_composer
+    start_bridge
+    load_demo_artifacts
+    status
+    cat <<EOF
+
+Known-good assistant demo is ready.
+Composer UI:  ${COMPOSER_URL}
+Viser HMI:     http://127.0.0.1:8081
+Bridge health: ${BRIDGE_URL}/healthz
+Model profile: ${MODEL_PROFILE}
+
+Open Composer, click the assistant button in the lower-right corner, and use:
+  Query: Is a program loaded? Read the current program and summarize it.
+  Composer Assistant: Add a small blue box named ui_demo_box at x=0.42, y=-0.12, z=0.18.
+EOF
+}
+
+smoke() {
+    stop_bridge
+    local rc=0
+    (cd "${MANYFORGE_ROOT}" && ./scripts/smoke-assistant-e2e.py \
+        --profile "${SAMPLING_PROFILE}" \
+        --require-hmi \
+        --strict \
+        --output "${LOG_DIR}/known-good-assistant-demo.json") || rc=$?
+    start_bridge || true
+    return "${rc}"
+}
+
+status() {
+    echo "Containers:"
+    docker ps --format '  {{.Names}}\t{{.Image}}\t{{.Ports}}' \
+        | grep -E "(${VLLM_CONTAINER}|${COMPOSER_CONTAINER}|openshell|nemoclaw)" || true
+    echo
+    echo "Listeners:"
+    ss -ltnp | grep -E ':(8000|8080|8081|8100|9000)\b' || true
+    echo
+    echo "Preflight:"
+    preflight || true
+    echo
+    print_json_if_available "${UPSTREAM_BASE_URL}/models"
+    print_json_if_available "${COMPOSER_URL}/api/infra/status"
+    print_json_if_available "${BRIDGE_URL}/healthz"
+}
+
+stop_bridge() {
+    if [[ -f "${BRIDGE_PID_FILE}" ]]; then
+        local pid
+        pid="$(cat "${BRIDGE_PID_FILE}")"
+        if [[ -n "${pid}" ]]; then
+            kill "${pid}" >/dev/null 2>&1 || true
+        fi
+        rm -f "${BRIDGE_PID_FILE}"
+    fi
+    pkill -f '[m]anyforge_assistant_bridge.bridge' 2>/dev/null || true
+}
+
+stop_all() {
+    stop_bridge
+    docker rm -f "${COMPOSER_CONTAINER}" >/dev/null 2>&1 || true
+    docker rm -f "${VLLM_CONTAINER}" >/dev/null 2>&1 || true
+    if [[ "${PRESERVE_OPENSHELL}" == "true" ]]; then
+        echo "Preserving openshell-cluster-nemoclaw; it owns live sandbox state."
+    else
+        echo "Removing openshell-cluster-nemoclaw; sandbox state in that gateway will be deleted."
+        docker rm -f openshell-cluster-nemoclaw >/dev/null 2>&1 || true
+    fi
+    drop_caches
+    free -h
+}
+
+case "${1:-}" in
+    start) start_all ;;
+    smoke) smoke ;;
+    preflight) preflight ;;
+    status) status ;;
+    stop) stop_all ;;
+    restart) stop_all; start_all ;;
+    -h|--help|help|"") usage ;;
+    *)
+        usage >&2
+        exit 2
+        ;;
+esac

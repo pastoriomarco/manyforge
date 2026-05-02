@@ -112,7 +112,7 @@ class Trajectory:
 
 @dataclass
 class SceneEditRequest:
-    operation: str  # "add", "remove", "update_pose", "attach", "detach"
+    operation: str  # "add", "upsert", "remove", "update_pose", "attach", "detach"
     object_id: str
     shape_type: Optional[str] = None
     box_dimensions_m: Optional[List[float]] = None
@@ -257,20 +257,20 @@ def _validate_scene_edit_request(request: SceneEditRequest) -> Optional[str]:
     if not request.object_id:
         return "object_id must not be empty"
 
-    if request.operation not in {"add", "remove", "update_pose", "attach", "detach"}:
+    if request.operation not in {"add", "upsert", "remove", "update_pose", "attach", "detach"}:
         return f"Unsupported scene edit operation: {request.operation}"
 
-    if request.operation == "add":
+    if request.operation in {"add", "upsert"}:
         if request.shape_type not in {"box", "sphere"}:
-            return "add requires shape_type to be one of: box, sphere"
+            return f"{request.operation} requires shape_type to be one of: box, sphere"
         if request.shape_type == "box":
             if not _is_vector(request.box_dimensions_m, 3):
-                return "add with shape_type=box requires box_dimensions_m=[x, y, z]"
+                return f"{request.operation} with shape_type=box requires box_dimensions_m=[x, y, z]"
             if any(v <= 0.0 for v in request.box_dimensions_m):
                 return "box_dimensions_m values must be > 0"
         if request.shape_type == "sphere":
             if request.sphere_radius_m is None or request.sphere_radius_m <= 0.0:
-                return "add with shape_type=sphere requires sphere_radius_m > 0"
+                return f"{request.operation} with shape_type=sphere requires sphere_radius_m > 0"
         if request.pose_position_m is not None and not _is_vector(request.pose_position_m, 3):
             return "pose_position_m must have exactly 3 elements"
         if request.pose_orientation_xyzw is not None and not _is_vector(request.pose_orientation_xyzw, 4):
@@ -750,6 +750,28 @@ class MockKernelClient(KernelClient):
                     success=False,
                     frame_id=request.frame_id,
                     attached=state_before.attached if state_before.exists else None,
+                    pose_in_frame=None,
+                    pose_in_universe=pose_before,
+                    error=error,
+                )
+                return SceneEditResult(success=False, error=error)
+            self._objects[request.object_id] = {
+                "shape_type": request.shape_type,
+                "box_dimensions_m": list(request.box_dimensions_m or []) or None,
+                "sphere_radius_m": request.sphere_radius_m,
+                "position_m": list(request.pose_position_m or [0.0, 0.0, 0.0]),
+                "orientation_xyzw": list(request.pose_orientation_xyzw or [0.0, 0.0, 0.0, 1.0]),
+                "frame_id": request.frame_id or "universe",
+            }
+        elif request.operation == "upsert":
+            if state_before.exists and state_before.attached:
+                error = "Cannot upsert attached object"
+                self._record_scene_trace(
+                    event=request.operation,
+                    object_id=request.object_id,
+                    success=False,
+                    frame_id=request.frame_id,
+                    attached=state_before.attached,
                     pose_in_frame=None,
                     pose_in_universe=pose_before,
                     error=error,

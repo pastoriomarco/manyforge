@@ -572,7 +572,12 @@ class AssistantConfigResponse(BaseModel):
 class AssistantToolDefinitionResponse(BaseModel):
     model_config = _ALIAS_EXTRA_CFG
     id: str
-    effect: Literal["read_only", "proposal", "runtime_mutating"]
+    effect: Literal[
+        "read_only",
+        "proposal",
+        "composer_draft_mutating",
+        "runtime_mutating",
+    ]
     description: str = ""
 
 
@@ -833,7 +838,7 @@ class SceneFrameVisibilityResponse(BaseModel):
 
 
 class SceneEditApiRequest(BaseModel):
-    operation: Literal["add", "remove", "update_pose", "attach", "detach"]
+    operation: Literal["add", "upsert", "remove", "update_pose", "attach", "detach"]
     object_id: str
     shape_type: Optional[Literal["box", "sphere"]] = None
     box_dimensions_m: Optional[List[float]] = None
@@ -847,17 +852,21 @@ class SceneEditApiRequest(BaseModel):
         if not self.object_id:
             raise ValueError("object_id must not be empty")
 
-        if self.operation == "add":
+        if self.operation in {"add", "upsert"}:
             if self.shape_type is None:
-                raise ValueError("add requires shape_type")
+                raise ValueError(f"{self.operation} requires shape_type")
             if self.shape_type == "box":
                 if self.box_dimensions_m is None or len(self.box_dimensions_m) != 3:
-                    raise ValueError("add with shape_type=box requires box_dimensions_m=[x, y, z]")
+                    raise ValueError(
+                        f"{self.operation} with shape_type=box requires box_dimensions_m=[x, y, z]"
+                    )
                 if any(v <= 0.0 for v in self.box_dimensions_m):
                     raise ValueError("box_dimensions_m values must be > 0")
             if self.shape_type == "sphere":
                 if self.sphere_radius_m is None or self.sphere_radius_m <= 0.0:
-                    raise ValueError("add with shape_type=sphere requires sphere_radius_m > 0")
+                    raise ValueError(
+                        f"{self.operation} with shape_type=sphere requires sphere_radius_m > 0"
+                    )
 
         if self.operation == "update_pose":
             if self.pose_position_m is None or len(self.pose_position_m) != 3:
@@ -1138,6 +1147,7 @@ class AssistantChatRequest(BaseModel):
     model_config = _ALIAS_CFG
     message: str = Field(min_length=1)
     mode: Literal["mock", "provider"] = "mock"
+    request_id: Optional[str] = Field(default=None, alias="requestId")
     provider_id: Optional[str] = Field(default=None, alias="providerId")
     conversation_id: Optional[str] = Field(default=None, alias="conversationId")
     assistant_mode: Optional[str] = Field(default=None, alias="assistantMode")
@@ -1173,8 +1183,15 @@ class AssistantToolCallResponse(BaseModel):
     error: Optional[str] = None
 
 
+class AssistantErrorResponse(BaseModel):
+    model_config = _ALIAS_CFG
+    code: str
+    detail: str
+
+
 class AssistantChatResponse(BaseModel):
     model_config = _ALIAS_CFG
+    request_id: str = Field(alias="requestId")
     conversation_id: str = Field(alias="conversationId")
     mode: Literal["mock", "provider"]
     provider_id: str = Field(alias="providerId")
@@ -1184,9 +1201,38 @@ class AssistantChatResponse(BaseModel):
     tool_calls: List[AssistantToolCallResponse] = Field(default_factory=list, alias="toolCalls")
     warnings: List[str] = Field(default_factory=list)
     mutated: bool = False
+    draft_mutated: bool = Field(default=False, alias="draftMutated")
     requires_review: bool = Field(default=True, alias="requiresReview")
     program_loaded: bool = Field(alias="programLoaded")
     cycle_state: str = Field(alias="cycleState")
+    timestamp_ns: int = Field(alias="timestampNs")
+    error: Optional[AssistantErrorResponse] = None
+
+
+class AssistantRequestStatusResponse(BaseModel):
+    model_config = _ALIAS_CFG
+    request_id: str = Field(alias="requestId")
+    conversation_id: str = Field(alias="conversationId")
+    provider_id: str = Field(alias="providerId")
+    assistant_mode: Optional[str] = Field(default=None, alias="assistantMode")
+    status: Literal["running", "cancel_requested", "completed", "failed", "cancelled"]
+    message: str = ""
+    error: Optional[AssistantErrorResponse] = None
+    warnings: List[str] = Field(default_factory=list)
+    draft_mutated: bool = Field(default=False, alias="draftMutated")
+    tool_call_count: int = Field(default=0, alias="toolCallCount")
+    started_at_ns: int = Field(alias="startedAtNs")
+    updated_at_ns: int = Field(alias="updatedAtNs")
+    finished_at_ns: Optional[int] = Field(default=None, alias="finishedAtNs")
+
+
+class AssistantCancelResponse(BaseModel):
+    model_config = _ALIAS_CFG
+    request_id: str = Field(alias="requestId")
+    cancelled: bool = False
+    status: Literal["running", "cancel_requested", "completed", "failed", "cancelled", "unknown"]
+    detail: str = ""
+    provider_response: Dict[str, Any] = Field(default_factory=dict, alias="providerResponse")
     timestamp_ns: int = Field(alias="timestampNs")
 
 
@@ -1220,6 +1266,7 @@ class AssistantBridgeToolResponse(BaseModel):
     result: Dict[str, Any] = Field(default_factory=dict)
     error: Optional[str] = None
     mutated: bool = False
+    draft_mutated: bool = Field(default=False, alias="draftMutated")
     timestamp_ns: int = Field(alias="timestampNs")
 
 
@@ -1298,6 +1345,7 @@ class AssistantProposeSceneObjectNodesRequest(BaseModel):
     operations: List[
         Literal[
             "add_collision_object",
+            "upsert_collision_object",
             "remove_collision_object",
             "attach_object_to_link",
             "detach_object_from_link",
