@@ -1191,12 +1191,16 @@ class TestCrossArtifactValidation:
         deploy.validate_capabilities()
 
     def test_assistant_modes_example_deployment_validates(self, catalog):
-        """The assistant-mode example validates against node and skill catalogs."""
+        """The assistant-mode example validates against Robotiq program and catalogs."""
         deploy = Deployment(ASSISTANT_MODES_EXAMPLE_DEPLOYMENT_PATH)
+        prog = Program(UR10E_ROBOTIQ_EXAMPLE_PROGRAM_PATH, catalog)
         skills = load_skill_catalog(default_skills_dir(), catalog=catalog, strict=True)
 
+        deploy.validate_against_program(prog)
         deploy.validate_capabilities()
         deploy.validate_assistant_modes(catalog, skills)
+        assert "primary" in deploy.grippers
+        assert deploy.grippers["primary"].tcp_frame == "grasp_frame"
         assert sorted(deploy.assistant_modes) == ["composer-assistant", "query"]
         resolved_catalog = deploy.resolve_assistant_mode_catalog("composer-assistant")
         assert resolved_catalog["skills"] == []
@@ -1204,6 +1208,7 @@ class TestCrossArtifactValidation:
             "catalog.read",
             "skills.read",
             "deployment.capabilities.read",
+            "scene.inspect",
             "inspect_isaac_scene",
             "propose_scene_objects",
             "propose_scene_object_nodes",
@@ -1216,6 +1221,7 @@ class TestCrossArtifactValidation:
             "tree.draft.delete_node",
             "tree.draft.move_node",
             "tree.draft.replace_subtree",
+            "tree.draft.wrap_node",
             "program.draft.upsert_parameters",
             "program.draft.remove_parameters",
             "blackboard.draft.upsert_namespaces",
@@ -1223,7 +1229,22 @@ class TestCrossArtifactValidation:
             "blackboard.draft.upsert_keys",
             "blackboard.draft.remove_keys",
         ]
-        assert resolved_catalog["nodes"] == []
+        assert sorted(resolved_catalog["nodes"]) == sorted(
+            [
+                "attach_object_to_link",
+                "detach_object_from_link",
+                "add_collision_object",
+                "remove_collision_object",
+                "upsert_collision_object",
+                "update_collision_object_pose",
+                "sequence",
+                "fallback",
+                "parallel",
+                "repeat",
+                "retry",
+                "inverter",
+            ]
+        )
 
 
 class TestAdapterCapabilityKeys:

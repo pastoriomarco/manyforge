@@ -91,7 +91,17 @@ _SCENE_RESOURCE_SCHEMA: dict[str, Any] = {
             "additionalProperties": True,
             "required": ["frame_id", "position_m"],
             "properties": {
-                "frame_id": {"type": "string", "minLength": 1},
+                "frame_id": {
+                    "type": "string",
+                    "enum": ["universe", "world", "World", "/World"],
+                    "description": (
+                        "World-scene frame for a detached Composer draft object. "
+                        "The callback normalizes common world-frame aliases to the "
+                        "active backend's canonical scene frame. Use explicit "
+                        "attach_object_to_link / detach_object_from_link tree nodes "
+                        "for attachment semantics."
+                    ),
+                },
                 "position_m": {
                     "type": "array",
                     "items": {"type": "number"},
@@ -112,10 +122,85 @@ _SCENE_RESOURCE_SCHEMA: dict[str, Any] = {
 
 _SCENE_DRAFT_SINGLE_OBJECT_SCHEMA: dict[str, Any] = {
     "type": "object",
-    "additionalProperties": False,
-    "required": ["sceneResource"],
+    "additionalProperties": True,
+    "required": ["objectId"],
+    "description": (
+        "Single detached Composer draft scene object. Prefer sending "
+        "objectId, shape, and pose directly at top level. The callback also "
+        "accepts legacy sceneResource wrappers and common aliases such as "
+        "shapeType, size, dimensions, radius, diameter, and position."
+    ),
     "properties": {
-        "sceneResource": _SCENE_RESOURCE_SCHEMA,
+        "objectId": _SCENE_RESOURCE_SCHEMA["properties"]["objectId"],
+        "shape": _SCENE_RESOURCE_SCHEMA["properties"]["shape"],
+        "pose": _SCENE_RESOURCE_SCHEMA["properties"]["pose"],
+        "shapeType": {
+            "type": "string",
+            "enum": ["box", "sphere"],
+            "description": "Convenience alias for shape.type.",
+        },
+        "shape_type": {
+            "type": "string",
+            "enum": ["box", "sphere"],
+            "description": "Convenience alias for shape.type.",
+        },
+        "size": {
+            "type": "array",
+            "items": {"type": "number"},
+            "minItems": 3,
+            "maxItems": 3,
+            "description": "Convenience alias for a box's [x, y, z] dimensions in meters.",
+        },
+        "dimensions": {
+            "type": "array",
+            "items": {"type": "number"},
+            "minItems": 3,
+            "maxItems": 3,
+            "description": "Convenience alias for a box's [x, y, z] dimensions in meters.",
+        },
+        "boxDimensionsM": {
+            "type": "array",
+            "items": {"type": "number"},
+            "minItems": 3,
+            "maxItems": 3,
+            "description": "Box dimensions [x, y, z] in meters.",
+        },
+        "box_dimensions_m": _SCENE_RESOURCE_SCHEMA["properties"]["shape"]["properties"]["box_dimensions_m"],
+        "radius": {
+            "type": "number",
+            "description": "Convenience alias for a sphere radius in meters.",
+        },
+        "diameter": {
+            "type": "number",
+            "description": "Convenience alias for a sphere diameter in meters.",
+        },
+        "sphereRadiusM": {
+            "type": "number",
+            "description": "Sphere radius in meters.",
+        },
+        "sphere_radius_m": _SCENE_RESOURCE_SCHEMA["properties"]["shape"]["properties"]["sphere_radius_m"],
+        "position": {
+            "type": "array",
+            "items": {"type": "number"},
+            "minItems": 3,
+            "maxItems": 3,
+            "description": "Convenience alias for pose.position_m.",
+        },
+        "position_m": _SCENE_RESOURCE_SCHEMA["properties"]["pose"]["properties"]["position_m"],
+        "frameId": _SCENE_RESOURCE_SCHEMA["properties"]["pose"]["properties"]["frame_id"],
+        "frame_id": _SCENE_RESOURCE_SCHEMA["properties"]["pose"]["properties"]["frame_id"],
+        "orientation_xyzw": {
+            "type": "array",
+            "items": {"type": "number"},
+            "minItems": 4,
+            "maxItems": 4,
+            "description": "Object orientation as [x, y, z, w]. Omit for identity.",
+        },
+        "orientation_rpy_deg": _SCENE_RESOURCE_SCHEMA["properties"]["pose"]["properties"]["orientation_rpy_deg"],
+        "sceneResource": {
+            **_SCENE_RESOURCE_SCHEMA,
+            "description": "Legacy wrapper form accepted for compatibility.",
+        },
         "forceDiscardOverrides": {
             "type": "boolean",
             "description": "Discard unsaved scene-resource overrides with the same objectId.",
@@ -131,7 +216,7 @@ _SCENE_DRAFT_UPSERT_OBJECTS_SCHEMA: dict[str, Any] = {
     "properties": {
         "sceneResources": {
             "type": "array",
-            "items": _SCENE_RESOURCE_SCHEMA,
+            "items": _SCENE_DRAFT_SINGLE_OBJECT_SCHEMA,
             "minItems": 1,
             "description": (
                 "Scene resources to insert or replace in the Composer draft. "
@@ -274,6 +359,75 @@ _TREE_DRAFT_REPLACE_SUBTREE_SCHEMA: dict[str, Any] = {
     "properties": {
         "nodeName": {"type": "string", "minLength": 1},
         "subtree": _TREE_NODE_SCHEMA,
+        "forceDiscardOverrides": {"type": "boolean"},
+    },
+}
+
+
+# wrap_node's wrapper deliberately does NOT accept `children` — the handler
+# inserts the target node's existing subtree as the only child. Accepting
+# children here would create ambiguity (does the model want them merged with
+# the target? replaced by the target? prepended/appended?). Reject upfront.
+_TREE_NODE_WRAPPER_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["id", "name"],
+    "properties": {
+        "id": {
+            "type": "string",
+            "minLength": 1,
+            "description": (
+                "Node catalog id (NOT a role or descriptive label). Must exactly "
+                "match an entry in the deployment's node catalog and be in this "
+                "assistant mode's catalog.nodes allowlist. Common control-flow "
+                "ids: 'sequence', 'fallback', 'parallel', 'repeat', 'retry', "
+                "'inverter'. Do NOT invent variants like 'repeat_root', "
+                "'repeat_node', 'sequence_root', etc. — those will be rejected. "
+                "Use the literal catalog id."
+            ),
+        },
+        "name": {
+            "type": "string",
+            "minLength": 1,
+            "description": (
+                "Caller-chosen instance name for this node in the program tree "
+                "(any descriptive label, e.g., 'cycle_loop' for a repeat or "
+                "'main_sequence' for a sequence). This is a label, not a "
+                "catalog id."
+            ),
+        },
+        "params": {"type": "object", "additionalProperties": True},
+        # NOTE: modificationPolicy / recoveryPolicy are intentionally omitted
+        # from the wrapper schema. Wrappers (decorators / control-flow) don't
+        # use those fields, and small models reliably emit invalid placeholder
+        # values like {"type": "string"} that fail program validation. Field
+        # absence here keeps schema-aware callers from including them.
+    },
+}
+
+
+_TREE_DRAFT_WRAP_NODE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["targetName", "wrapper"],
+    "description": (
+        "Wrap a behavior-tree node with a new parent (decorator or control-flow). "
+        "wrapper.id MUST be a literal node-catalog id like 'repeat', 'sequence', "
+        "'fallback', 'parallel', 'retry', 'inverter'. Do NOT invent variants like "
+        "'repeat_root' or 'repeat_node'. Use targetName='@root' to wrap the "
+        "current root without needing to know its name."
+    ),
+    "properties": {
+        "targetName": {
+            "type": "string",
+            "minLength": 1,
+            "description": (
+                "Name of the behavior-tree node to wrap, or '@root' to wrap the "
+                "current root without needing to know its name. Wrapping the "
+                "root produces a new root."
+            ),
+        },
+        "wrapper": _TREE_NODE_WRAPPER_SCHEMA,
         "forceDiscardOverrides": {"type": "boolean"},
     },
 }
@@ -451,6 +605,7 @@ ASSISTANT_TOOL_INPUT_SCHEMAS: dict[str, dict[str, Any]] = {
     "tree.draft.delete_node": _TREE_DRAFT_DELETE_NODE_SCHEMA,
     "tree.draft.move_node": _TREE_DRAFT_MOVE_NODE_SCHEMA,
     "tree.draft.replace_subtree": _TREE_DRAFT_REPLACE_SUBTREE_SCHEMA,
+    "tree.draft.wrap_node": _TREE_DRAFT_WRAP_NODE_SCHEMA,
     "program.draft.upsert_parameters": _PROGRAM_DRAFT_UPSERT_PARAMETERS_SCHEMA,
     "program.draft.remove_parameters": _PROGRAM_DRAFT_REMOVE_PARAMETERS_SCHEMA,
     "blackboard.draft.upsert_namespaces": _BLACKBOARD_DRAFT_UPSERT_NAMESPACES_SCHEMA,

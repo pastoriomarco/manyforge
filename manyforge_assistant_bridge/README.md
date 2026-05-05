@@ -86,7 +86,7 @@ Environment overrides:
 | `BRIDGE_AUDIT_LOG` | `manyforge_assistant_bridge/audit.log` | JSONL audit trail |
 | `BRIDGE_REQUEST_TIMEOUT_S` | `60` | per-upstream-call timeout cap |
 | `BRIDGE_CALLBACK_TIMEOUT_S` | `10` | per-callback timeout |
-| `BRIDGE_MAX_TURNS` | `4` | maximum model turns per request |
+| `BRIDGE_MAX_TURNS` | `16` | maximum model turns per request |
 | `BRIDGE_MAX_WALL_TIME_S` | `60` | maximum wall time per bridge request |
 | `BRIDGE_UPSTREAM_MAX_TOKENS` | `512` | upstream chat-completion output token cap |
 | `BRIDGE_UPSTREAM_TEMPERATURE` | `0.0` | upstream sampling temperature |
@@ -131,7 +131,7 @@ Expected:
   "manyforgeBaseUrl": "http://127.0.0.1:9000",
   "model": "<resolved-model-id>",
   "modelSource": "explicit" | "auto" | "unresolved",
-  "maxTurns": 4,
+  "maxTurns": 16,
   "maxWallTimeS": 60.0
 }
 ```

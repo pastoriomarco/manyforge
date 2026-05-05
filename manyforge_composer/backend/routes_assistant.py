@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import time
 import uuid
 from typing import Any
@@ -25,7 +26,10 @@ from .assistant_tools import (
     propose_scene_object_nodes,
     propose_scene_object_resources,
 )
-from .assistant_tool_schemas import enrich_assistant_tool_descriptors
+from .assistant_tool_schemas import (
+    assistant_tool_input_schema,
+    enrich_assistant_tool_descriptors,
+)
 from .assistant_provider import (
     AssistantProviderContext,
     AssistantProviderError,
@@ -60,13 +64,16 @@ from .models import (
     ProgramParameterResponse,
     TreeNodeResponse,
 )
-from .routes_scene import build_scene_state_payload
+from .routes_scene import build_scene_state_payload, canonical_scene_world_frame
 from .state import ComposerState
 
 
 READ_ONLY_EFFECT = "read_only"
 COMPOSER_DRAFT_MUTATING_EFFECT = "composer_draft_mutating"
 COMPOSER_ASSISTANT_MODE = "composer-assistant"
+_WORLD_FRAME_ALIASES = {"world", "/world", "/World", "World", "universe"}
+_BOX_SHAPE_ALIASES = {"box", "cube", "cuboid", "rectangular_prism", "rectangular-prism"}
+_SPHERE_SHAPE_ALIASES = {"sphere", "ball"}
 
 
 def create_assistant_router(state: ComposerState) -> APIRouter:
@@ -176,6 +183,50 @@ def create_assistant_router(state: ComposerState) -> APIRouter:
     def list_tools() -> dict[str, Any]:
         """List deterministic assistant tools available before model integration."""
         return {"tools": assistant_tool_catalog()}
+
+    @router.get("/modes/{mode}")
+    def describe_assistant_mode(mode: str) -> dict[str, Any]:
+        """Mode-scoped tool/node manifest for an external MCP wrapper.
+
+        Returns exactly the tools and node kinds the bridge accepts in this
+        mode, the catalog hash the caller must echo on each tool call, and
+        each tool's input schema. External agent runtimes (OpenClaw via
+        manyforge-mcp-bridge) consume this to expose a narrow MCP surface
+        that maps 1-to-1 onto the hardened bridge endpoint.
+        """
+        resolved_catalog, expected_hash = _resolve_bridge_tool_context(
+            state,
+            assistant_mode=mode,
+        )
+        deployment = state.deployment
+        assert deployment is not None
+        tools_payload: list[dict[str, Any]] = []
+        for entry in resolved_catalog["tools"]:
+            tool_id = entry.get("id")
+            if not isinstance(tool_id, str):
+                continue
+            descriptor = deployment.tool_catalog.get(tool_id)
+            if descriptor is None:
+                continue
+            input_schema = assistant_tool_input_schema(tool_id) or {
+                "type": "object",
+                "additionalProperties": True,
+            }
+            tools_payload.append(
+                {
+                    "id": tool_id,
+                    "description": descriptor.description or "",
+                    "effect": descriptor.effect,
+                    "inputSchema": input_schema,
+                }
+            )
+        return {
+            "mode": mode,
+            "catalogHash": expected_hash,
+            "tools": tools_payload,
+            "nodes": list(resolved_catalog["nodes"]),
+            "skills": list(resolved_catalog.get("skills") or []),
+        }
 
     @router.get(
         "/providers",
@@ -341,6 +392,8 @@ def create_assistant_router(state: ComposerState) -> APIRouter:
                 tool_id=tool_id,
                 effect=tool_definition.effect,
                 arguments=request.arguments,
+                assistant_mode=request.assistant_mode,
+                node_allowlist=set(resolved_catalog["nodes"]),
             )
             success = True
             error = None
@@ -845,6 +898,8 @@ async def _execute_bridge_tool(
     tool_id: str,
     effect: str,
     arguments: dict[str, Any],
+    assistant_mode: str | None = None,
+    node_allowlist: set[str] | None = None,
 ) -> dict[str, Any]:
     if effect == READ_ONLY_EFFECT:
         return await _execute_bridge_read_only_tool(
@@ -857,6 +912,8 @@ async def _execute_bridge_tool(
             state,
             tool_id=tool_id,
             arguments=arguments,
+            assistant_mode=assistant_mode,
+            node_allowlist=node_allowlist,
         )
     raise HTTPException(
         status_code=403,
@@ -869,6 +926,8 @@ def _execute_bridge_composer_draft_tool(
     *,
     tool_id: str,
     arguments: dict[str, Any],
+    assistant_mode: str | None = None,
+    node_allowlist: set[str] | None = None,
 ) -> dict[str, Any]:
     if tool_id == "scene.draft.add_object":
         return _apply_scene_draft_resource_single(
@@ -887,7 +946,12 @@ def _execute_bridge_composer_draft_tool(
     if tool_id == "scene.draft.remove_objects":
         return _apply_scene_draft_resources_remove(state, arguments=arguments)
     if tool_id == "tree.draft.insert_node":
-        return _apply_tree_draft_insert_node(state, arguments=arguments)
+        return _apply_tree_draft_insert_node(
+            state,
+            arguments=arguments,
+            node_allowlist=node_allowlist,
+            assistant_mode=assistant_mode,
+        )
     if tool_id == "tree.draft.update_node_params":
         return _apply_tree_draft_update_node_params(state, arguments=arguments)
     if tool_id == "tree.draft.delete_node":
@@ -895,7 +959,19 @@ def _execute_bridge_composer_draft_tool(
     if tool_id == "tree.draft.move_node":
         return _apply_tree_draft_move_node(state, arguments=arguments)
     if tool_id == "tree.draft.replace_subtree":
-        return _apply_tree_draft_replace_subtree(state, arguments=arguments)
+        return _apply_tree_draft_replace_subtree(
+            state,
+            arguments=arguments,
+            node_allowlist=node_allowlist,
+            assistant_mode=assistant_mode,
+        )
+    if tool_id == "tree.draft.wrap_node":
+        return _apply_tree_draft_wrap_node(
+            state,
+            arguments=arguments,
+            node_allowlist=node_allowlist,
+            assistant_mode=assistant_mode,
+        )
     if tool_id == "program.draft.upsert_parameters":
         return _apply_program_draft_upsert_parameters(state, arguments=arguments)
     if tool_id == "program.draft.remove_parameters":
@@ -915,30 +991,35 @@ def _execute_bridge_composer_draft_tool(
 
 
 def _scene_resource_from_draft_arguments(
+    state: ComposerState,
     arguments: dict[str, Any],
     *,
     tool_id: str,
 ) -> ProgramSceneResourceResponse:
-    raw_resource = (
-        arguments.get("sceneResource")
-        or arguments.get("scene_resource")
-        or arguments
+    raw_resource = _single_scene_resource_argument(arguments, tool_id=tool_id)
+    normalized_resource = _normalize_scene_resource_argument(
+        state,
+        raw_resource,
+        tool_id=tool_id,
+        label="sceneResource",
     )
-    if not isinstance(raw_resource, dict):
-        raise HTTPException(
-            status_code=400,
-            detail=f"{tool_id} requires a sceneResource object",
-        )
     try:
-        return ProgramSceneResourceResponse.model_validate(raw_resource)
+        resource = ProgramSceneResourceResponse.model_validate(normalized_resource)
     except ValidationError as exc:
         raise HTTPException(
             status_code=400,
             detail=f"{tool_id} sceneResource is invalid: {exc}",
         ) from exc
+    return _normalize_scene_draft_resource_frame(
+        state=state,
+        resource=resource,
+        tool_id=tool_id,
+        label="sceneResource",
+    )
 
 
 def _scene_resources_from_upsert_arguments(
+    state: ComposerState,
     arguments: dict[str, Any],
 ) -> list[ProgramSceneResourceResponse]:
     raw_resources = (
@@ -956,18 +1037,30 @@ def _scene_resources_from_upsert_arguments(
     seen: set[str] = set()
     duplicates: set[str] = set()
     for index, raw_resource in enumerate(raw_resources):
-        if not isinstance(raw_resource, dict):
-            raise HTTPException(
-                status_code=400,
-                detail=f"sceneResources[{index}] must be an object",
-            )
+        raw_resource = _single_scene_resource_argument(
+            raw_resource,
+            tool_id="scene.draft.upsert_objects",
+            label=f"sceneResources[{index}]",
+        )
+        normalized_resource = _normalize_scene_resource_argument(
+            state,
+            raw_resource,
+            tool_id="scene.draft.upsert_objects",
+            label=f"sceneResources[{index}]",
+        )
         try:
-            resource = ProgramSceneResourceResponse.model_validate(raw_resource)
+            resource = ProgramSceneResourceResponse.model_validate(normalized_resource)
         except ValidationError as exc:
             raise HTTPException(
                 status_code=400,
                 detail=f"sceneResources[{index}] is invalid: {exc}",
             ) from exc
+        resource = _normalize_scene_draft_resource_frame(
+            state=state,
+            resource=resource,
+            tool_id="scene.draft.upsert_objects",
+            label=f"sceneResources[{index}]",
+        )
         if resource.object_id in seen:
             duplicates.add(resource.object_id)
         seen.add(resource.object_id)
@@ -979,6 +1072,310 @@ def _scene_resources_from_upsert_arguments(
             detail=f"scene.draft.upsert_objects duplicate objectId values: {sorted(duplicates)}",
         )
     return resources
+
+
+def _single_scene_resource_argument(
+    value: Any,
+    *,
+    tool_id: str,
+    label: str = "sceneResource",
+) -> dict[str, Any]:
+    if isinstance(value, dict):
+        found_wrapper = False
+        for key in ("sceneResource", "scene_resource", "resource", "object"):
+            if key in value:
+                value = value[key]
+                found_wrapper = True
+                break
+        if not found_wrapper and "value" in value and len(value) == 1:
+            value = value["value"]
+    if isinstance(value, list):
+        if len(value) == 1 and isinstance(value[0], dict):
+            value = value[0]
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{tool_id} {label} must be a single scene object, not a list",
+            )
+    if not isinstance(value, dict):
+        raise HTTPException(
+            status_code=400,
+            detail=f"{tool_id} {label} must be an object",
+        )
+    return value
+
+
+def _first_mapping_value(mapping: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        if key in mapping and mapping[key] is not None:
+            return mapping[key]
+    return None
+
+
+def _float_argument(value: Any, *, label: str) -> float:
+    if isinstance(value, bool):
+        raise HTTPException(status_code=400, detail=f"{label} must be numeric")
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value.strip())
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=f"{label} must be numeric") from exc
+    raise HTTPException(status_code=400, detail=f"{label} must be numeric")
+
+
+def _numeric_vector_argument(value: Any, *, length: int, label: str) -> list[float]:
+    if isinstance(value, dict):
+        keys = ("x", "y", "z", "w")[:length]
+        if all(key in value for key in keys):
+            value = [value[key] for key in keys]
+    elif isinstance(value, str):
+        tokens = re.findall(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?", value)
+        if len(tokens) == length:
+            value = tokens
+    if not isinstance(value, list) or len(value) != length:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{label} must be a list of {length} numeric values",
+        )
+    return [
+        _float_argument(component, label=f"{label}[{index}]")
+        for index, component in enumerate(value)
+    ]
+
+
+def _normalize_scene_resource_argument(
+    state: ComposerState,
+    raw_resource: dict[str, Any],
+    *,
+    tool_id: str,
+    label: str,
+) -> dict[str, Any]:
+    object_id = _first_mapping_value(raw_resource, "objectId", "object_id", "id", "name")
+    if not isinstance(object_id, str) or not object_id.strip():
+        raise HTTPException(status_code=400, detail=f"{tool_id} {label}.objectId is required")
+
+    shape = _normalize_scene_shape_argument(raw_resource, tool_id=tool_id, label=label)
+    pose = _normalize_scene_pose_argument(state, raw_resource, tool_id=tool_id, label=label)
+    return {
+        "objectId": object_id.strip(),
+        "shape": shape,
+        "pose": pose,
+    }
+
+
+def _normalize_scene_shape_argument(
+    raw_resource: dict[str, Any],
+    *,
+    tool_id: str,
+    label: str,
+) -> dict[str, Any]:
+    raw_shape = raw_resource.get("shape") if isinstance(raw_resource.get("shape"), dict) else {}
+    assert isinstance(raw_shape, dict)
+
+    shape_type = _first_mapping_value(
+        raw_shape,
+        "type",
+        "shapeType",
+        "shape_type",
+    )
+    if shape_type is None:
+        shape_type = _first_mapping_value(raw_resource, "shapeType", "shape_type", "type")
+    shape_type_normalized = str(shape_type).strip().lower() if shape_type is not None else ""
+
+    box_dimensions = _first_mapping_value(
+        raw_shape,
+        "box_dimensions_m",
+        "boxDimensionsM",
+        "dimensions_m",
+        "dimensions",
+        "size_m",
+        "size",
+    )
+    if box_dimensions is None:
+        box_dimensions = _first_mapping_value(
+            raw_resource,
+            "box_dimensions_m",
+            "boxDimensionsM",
+            "dimensions_m",
+            "dimensions",
+            "size_m",
+            "size",
+        )
+
+    radius = _first_mapping_value(
+        raw_shape,
+        "sphere_radius_m",
+        "sphereRadiusM",
+        "radius_m",
+        "radius",
+    )
+    if radius is None:
+        radius = _first_mapping_value(
+            raw_resource,
+            "sphere_radius_m",
+            "sphereRadiusM",
+            "radius_m",
+            "radius",
+        )
+    diameter = _first_mapping_value(raw_shape, "diameter_m", "diameter")
+    if diameter is None:
+        diameter = _first_mapping_value(raw_resource, "diameter_m", "diameter")
+
+    if not shape_type_normalized:
+        if box_dimensions is not None:
+            shape_type_normalized = "box"
+        elif radius is not None or diameter is not None:
+            shape_type_normalized = "sphere"
+
+    if shape_type_normalized in _BOX_SHAPE_ALIASES:
+        if box_dimensions is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{tool_id} {label}.shape requires box dimensions",
+            )
+        return {
+            "type": "box",
+            "box_dimensions_m": _numeric_vector_argument(
+                box_dimensions,
+                length=3,
+                label=f"{label}.shape.box_dimensions_m",
+            ),
+        }
+
+    if shape_type_normalized in _SPHERE_SHAPE_ALIASES:
+        sphere_radius = radius
+        if sphere_radius is None and diameter is not None:
+            sphere_radius = _float_argument(diameter, label=f"{label}.shape.diameter") / 2.0
+        if sphere_radius is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{tool_id} {label}.shape requires sphere radius or diameter",
+            )
+        radius_value = _float_argument(sphere_radius, label=f"{label}.shape.sphere_radius_m")
+        if radius_value <= 0.0:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{tool_id} {label}.shape.sphere_radius_m must be > 0",
+            )
+        return {"type": "sphere", "sphere_radius_m": radius_value}
+
+    raise HTTPException(
+        status_code=400,
+        detail=f"{tool_id} {label}.shape.type must be one of: box, sphere",
+    )
+
+
+def _normalize_scene_pose_argument(
+    state: ComposerState,
+    raw_resource: dict[str, Any],
+    *,
+    tool_id: str,
+    label: str,
+) -> dict[str, Any]:
+    raw_pose = raw_resource.get("pose") if isinstance(raw_resource.get("pose"), dict) else {}
+    assert isinstance(raw_pose, dict)
+
+    position = _first_mapping_value(raw_pose, "position_m", "positionM", "position", "xyz")
+    if position is None:
+        position = _first_mapping_value(raw_resource, "position_m", "positionM", "position", "xyz")
+    if position is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{tool_id} {label}.pose.position_m is required",
+        )
+
+    frame_id = _first_mapping_value(raw_pose, "frame_id", "frameId")
+    if frame_id is None:
+        frame_id = _first_mapping_value(raw_resource, "frame_id", "frameId")
+    if not isinstance(frame_id, str) or not frame_id.strip():
+        frame_id = canonical_scene_world_frame(state)
+
+    pose: dict[str, Any] = {
+        "frame_id": frame_id.strip(),
+        "position_m": _numeric_vector_argument(
+            position,
+            length=3,
+            label=f"{label}.pose.position_m",
+        ),
+    }
+
+    orientation_xyzw = _first_mapping_value(raw_pose, "orientation_xyzw", "orientationXyzw")
+    if orientation_xyzw is None:
+        orientation_xyzw = _first_mapping_value(raw_resource, "orientation_xyzw", "orientationXyzw")
+    orientation_rpy = _first_mapping_value(raw_pose, "orientation_rpy_deg", "orientationRpyDeg", "rpy_deg")
+    if orientation_rpy is None:
+        orientation_rpy = _first_mapping_value(raw_resource, "orientation_rpy_deg", "orientationRpyDeg", "rpy_deg")
+    orientation = _first_mapping_value(raw_pose, "orientation")
+    if orientation is None:
+        orientation = raw_resource.get("orientation")
+
+    if orientation_xyzw is not None:
+        pose["orientation_xyzw"] = _numeric_vector_argument(
+            orientation_xyzw,
+            length=4,
+            label=f"{label}.pose.orientation_xyzw",
+        )
+    elif orientation_rpy is not None:
+        pose["orientation_rpy_deg"] = _numeric_vector_argument(
+            orientation_rpy,
+            length=3,
+            label=f"{label}.pose.orientation_rpy_deg",
+        )
+    elif orientation is not None:
+        if isinstance(orientation, dict) and all(key in orientation for key in ("x", "y", "z", "w")):
+            pose["orientation_xyzw"] = _numeric_vector_argument(
+                orientation,
+                length=4,
+                label=f"{label}.pose.orientation_xyzw",
+            )
+        else:
+            pose["orientation_rpy_deg"] = _numeric_vector_argument(
+                orientation,
+                length=3,
+                label=f"{label}.pose.orientation_rpy_deg",
+            )
+    else:
+        pose["orientation_xyzw"] = [0.0, 0.0, 0.0, 1.0]
+
+    return pose
+
+
+def _normalize_scene_draft_resource_frame(
+    state: ComposerState,
+    resource: ProgramSceneResourceResponse,
+    *,
+    tool_id: str,
+    label: str,
+) -> ProgramSceneResourceResponse:
+    """Keep Composer draft scene resources detached and world-authored.
+
+    Attachment is represented by explicit behavior-tree nodes
+    (attach_object_to_link / detach_object_from_link), not by giving an
+    authored scene resource an arbitrary robot/link frame.
+    """
+    canonical_world_frame = canonical_scene_world_frame(state)
+    data = resource.model_dump(by_alias=True)
+    pose = dict(data.get("pose") or {})
+    frame_id = pose.get("frame_id")
+    if isinstance(frame_id, str):
+        frame_id = frame_id.strip()
+        if frame_id in _WORLD_FRAME_ALIASES:
+            frame_id = canonical_world_frame
+        pose["frame_id"] = frame_id
+    if pose.get("frame_id") != canonical_world_frame:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"{tool_id} {label}.pose.frame_id must be the backend canonical "
+                f"world frame '{canonical_world_frame}' for Composer draft scene "
+                "resources; use attach_object_to_link or detach_object_from_link "
+                "tree nodes for attachment semantics"
+            ),
+        )
+    data["pose"] = pose
+    return ProgramSceneResourceResponse.model_validate(data)
 
 
 def _assert_scene_draft_edit_allowed(state: ComposerState) -> None:
@@ -1136,7 +1533,7 @@ def _apply_scene_draft_resource_single(
     _assert_scene_draft_edit_allowed(state)
     tool_id = f"scene.draft.{operation}_object"
     force_discard_overrides = _force_discard_overrides(arguments)
-    resource = _scene_resource_from_draft_arguments(arguments, tool_id=tool_id)
+    resource = _scene_resource_from_draft_arguments(state, arguments, tool_id=tool_id)
     program_data = state.program.to_dict()
     scene = list(program_data.get("scene") or [])
     scene_index = next(
@@ -1203,7 +1600,7 @@ def _apply_scene_draft_resources_upsert(
         for index, item in enumerate(scene)
         if isinstance(item.get("object_id"), str)
     }
-    resources = _scene_resources_from_upsert_arguments(arguments)
+    resources = _scene_resources_from_upsert_arguments(state, arguments)
     inserted: list[str] = []
     updated: list[str] = []
     unchanged: list[str] = []
@@ -1307,14 +1704,80 @@ def _apply_scene_draft_resources_remove(
     }
 
 
-def _tree_node_from_draft_argument(value: Any, *, field_name: str) -> dict[str, Any]:
+def _tree_node_from_draft_argument(
+    value: Any,
+    *,
+    field_name: str,
+) -> tuple[dict[str, Any], list[str]]:
+    """Validate + normalize an assistant-draft tree-node argument.
+
+    Returns the validated node dict alongside a list of human-readable
+    normalization warnings so callers can surface them in tool-result
+    responses and audit records (rather than silently rewriting the
+    caller's payload). Empty list when no normalization fired.
+    """
     if not isinstance(value, dict):
         raise HTTPException(status_code=400, detail=f"{field_name} must be an object")
+    # Pragmatic normalization for small-model emissions:
+    #   1. `name` is required by the schema but small models often omit it.
+    #      Synthesize `<id>_<short_random>` rather than reject.
+    #   2. `modificationPolicy` and `recoveryPolicy` are optional; the model
+    #      sometimes emits invalid placeholders like `{"type": "string"}` that
+    #      pass schema validation but get rejected by program validation as
+    #      "not a recognized policy field". Strip empty/invalid values
+    #      defensively. Real callers can still provide valid values; only
+    #      stubs are dropped.
+    warnings: list[str] = []
+
+    def _strip_policy_stubs(d: dict[str, Any], path: str) -> None:
+        for key in ("modificationPolicy", "recoveryPolicy"):
+            if key in d:
+                policy = d[key]
+                if not isinstance(policy, dict) or not policy:
+                    d.pop(key, None)
+                    warnings.append(
+                        f"{path}.{key} was empty/invalid and stripped"
+                    )
+                    continue
+                # Drop pydantic-default placeholders like {"type": "string"}.
+                if (
+                    set(policy.keys()) == {"type"}
+                    and isinstance(policy.get("type"), str)
+                    and policy["type"] in {"string", "object", "any", ""}
+                ):
+                    d.pop(key, None)
+                    warnings.append(
+                        f"{path}.{key} was a stub placeholder and stripped"
+                    )
+
+    def _normalize(node: Any, path: str) -> Any:
+        if not isinstance(node, dict):
+            return node
+        cleaned = dict(node)
+        if "name" not in cleaned or not str(cleaned.get("name") or "").strip():
+            node_id = str(cleaned.get("id") or "").strip()
+            if node_id:
+                synthesized = f"{node_id}_{uuid.uuid4().hex[:6]}"
+                cleaned["name"] = synthesized
+                warnings.append(
+                    f"{path}.name was missing; synthesized '{synthesized}' "
+                    f"from id '{node_id}'"
+                )
+        _strip_policy_stubs(cleaned, path)
+        children = cleaned.get("children")
+        if isinstance(children, list):
+            cleaned["children"] = [
+                _normalize(c, f"{path}.children[{i}]")
+                for i, c in enumerate(children)
+            ]
+        return cleaned
+
+    normalized = _normalize(value, field_name)
     try:
-        node = TreeNodeResponse.model_validate(value)
+        node = TreeNodeResponse.model_validate(normalized)
     except ValidationError as exc:
         raise HTTPException(status_code=400, detail=f"{field_name} is invalid: {exc}") from exc
-    return node.model_dump(by_alias=False)
+    return node.model_dump(by_alias=False), warnings
 
 
 def _find_tree_node_ref(
@@ -1337,6 +1800,110 @@ def _find_tree_node_ref(
             if found is not None:
                 return found
     return None
+
+
+def _resolve_node_name_alias(node_name: str, tree: dict[str, Any] | None) -> str:
+    """Resolve `@root` alias to the actual root node name. No-op for other names.
+
+    Lets the model target the root without needing to discover its name first —
+    e.g., `targetName: "@root"` resolves to whatever the root is called in the
+    current program tree. Only used by tools where root operations are valid;
+    tools like delete_node/move_node that always reject root pass the raw name
+    through and produce their existing "cannot delete/move the root" errors.
+    """
+    if node_name.strip() == "@root":
+        if isinstance(tree, dict) and isinstance(tree.get("name"), str):
+            return tree["name"]
+    return node_name
+
+
+def _collect_tree_node_names(node: dict[str, Any]) -> list[str]:
+    """Flat list of every node name in the tree, depth-first.
+
+    Surfaced in 404 responses so the model can recover from name typos in one
+    turn instead of looping. For trees with hundreds of nodes this is still
+    sub-kilobyte; if it ever becomes a concern we can cap at e.g. 50 and
+    indicate truncation.
+    """
+    names: list[str] = []
+    name = node.get("name")
+    if isinstance(name, str):
+        names.append(name)
+    for child in node.get("children") or []:
+        if isinstance(child, dict):
+            names.extend(_collect_tree_node_names(child))
+    return names
+
+
+def _collect_node_kinds(node_spec: dict[str, Any]) -> list[str]:
+    """Flat list of every `id` field reachable in a node spec, depth-first.
+
+    Used to walk a model-supplied subtree (insert_node, replace_subtree,
+    wrap_node) and check that every node kind it introduces is permitted by
+    the active mode's `nodes:` allowlist.
+    """
+    kinds: list[str] = []
+    node_id = node_spec.get("id")
+    if isinstance(node_id, str):
+        kinds.append(node_id)
+    for child in node_spec.get("children") or []:
+        if isinstance(child, dict):
+            kinds.extend(_collect_node_kinds(child))
+    return kinds
+
+
+def _assert_node_kinds_allowed(
+    node_spec: dict[str, Any] | list[dict[str, Any]],
+    allowlist: set[str] | None,
+    *,
+    assistant_mode: str | None,
+    field_name: str,
+) -> None:
+    """Reject a model-supplied subtree that introduces a node kind outside the
+    active mode's `nodes:` allowlist.
+
+    Bounded-autonomy guarantee: the assistant mode's `nodes:` list is the
+    runtime contract for which BT primitives the assistant may insert. Today
+    this is enforced only at this point; out-of-mode inserts that slipped
+    through previously could only be caught at promotion-time program
+    validation. Now they're caught up-front with a clear list of what IS
+    allowed so the model can recover.
+
+    `allowlist=None` means the caller didn't pass a context (e.g., direct unit
+    test); skip enforcement.
+    """
+    if allowlist is None:
+        return
+    nodes_to_walk: list[dict[str, Any]]
+    if isinstance(node_spec, list):
+        nodes_to_walk = [n for n in node_spec if isinstance(n, dict)]
+    elif isinstance(node_spec, dict):
+        nodes_to_walk = [node_spec]
+    else:
+        return
+    seen_kinds: list[str] = []
+    for node in nodes_to_walk:
+        seen_kinds.extend(_collect_node_kinds(node))
+    bad_kinds = sorted({kind for kind in seen_kinds if kind not in allowlist})
+    if not bad_kinds:
+        return
+    mode_label = assistant_mode or "active assistant mode"
+    raise HTTPException(
+        status_code=403,
+        detail={
+            "message": (
+                f"node kind(s) {bad_kinds} not allowed by {mode_label}'s catalog.nodes"
+            ),
+            "field": field_name,
+            "rejectedNodeKinds": bad_kinds,
+            "allowedNodeKinds": sorted(allowlist),
+            "hint": (
+                "Each id in the subtree must appear in the active mode's "
+                "catalog.nodes. Update the deployment's assistant_modes."
+                f"{mode_label}.catalog.nodes to expand this list."
+            ),
+        },
+    )
 
 
 def _tree_contains_name(node: dict[str, Any], node_name: str) -> bool:
@@ -1367,17 +1934,37 @@ def _apply_tree_draft_insert_node(
     state: ComposerState,
     *,
     arguments: dict[str, Any],
+    node_allowlist: set[str] | None = None,
+    assistant_mode: str | None = None,
 ) -> dict[str, Any]:
     _assert_program_draft_edit_allowed(state)
     parent_name = arguments.get("parentName") or arguments.get("parent_name")
     if not isinstance(parent_name, str) or not parent_name.strip():
         raise HTTPException(status_code=400, detail="tree.draft.insert_node requires parentName")
-    new_node = _tree_node_from_draft_argument(arguments.get("node"), field_name="node")
+    new_node, normalization_warnings = _tree_node_from_draft_argument(
+        arguments.get("node"), field_name="node"
+    )
+    _assert_node_kinds_allowed(
+        new_node,
+        node_allowlist,
+        assistant_mode=assistant_mode,
+        field_name="node",
+    )
     program_data = state.program.to_dict()
     tree = program_data.get("tree")
-    parent_ref = _find_tree_node_ref(tree, parent_name.strip()) if isinstance(tree, dict) else None
+    # Accept `@root` as parentName since inserting under the root is always valid.
+    resolved_parent_name = _resolve_node_name_alias(parent_name.strip(), tree if isinstance(tree, dict) else None)
+    parent_ref = _find_tree_node_ref(tree, resolved_parent_name) if isinstance(tree, dict) else None
     if parent_ref is None:
-        raise HTTPException(status_code=404, detail=f"Parent node not found: {parent_name}")
+        valid_names = _collect_tree_node_names(tree) if isinstance(tree, dict) else []
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "message": f"Parent node not found: {parent_name}",
+                "validParentNames": valid_names,
+                "rootAlias": "@root",
+            },
+        )
     parent_node = parent_ref[0]
     children = list(parent_node.get("children") or [])
     index = _insert_index(arguments, child_count=len(children))
@@ -1388,14 +1975,17 @@ def _apply_tree_draft_insert_node(
         program_data=program_data,
         force_discard_overrides=_force_discard_overrides(arguments),
     )
+    extra: dict[str, Any] = {
+        "nodeName": new_node["name"],
+        "parentName": parent_name.strip(),
+        "index": index,
+    }
+    if normalization_warnings:
+        extra["warnings"] = normalization_warnings
     return _program_draft_result(
         state,
         draft_mutation="tree_node_insert",
-        extra={
-            "nodeName": new_node["name"],
-            "parentName": parent_name.strip(),
-            "index": index,
-        },
+        extra=extra,
     )
 
 
@@ -1416,9 +2006,21 @@ def _apply_tree_draft_update_node_params(
         raise HTTPException(status_code=400, detail="merge must be boolean")
     program_data = state.program.to_dict()
     tree = program_data.get("tree")
-    target_ref = _find_tree_node_ref(tree, node_name.strip()) if isinstance(tree, dict) else None
+    # Accept `@root` since updating root params is valid.
+    resolved_node_name = _resolve_node_name_alias(
+        node_name.strip(), tree if isinstance(tree, dict) else None
+    )
+    target_ref = _find_tree_node_ref(tree, resolved_node_name) if isinstance(tree, dict) else None
     if target_ref is None:
-        raise HTTPException(status_code=404, detail=f"Node not found: {node_name}")
+        valid_names = _collect_tree_node_names(tree) if isinstance(tree, dict) else []
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "message": f"Node not found: {node_name}",
+                "validNodeNames": valid_names,
+                "rootAlias": "@root",
+            },
+        )
     target = target_ref[0]
     target["params"] = {**dict(target.get("params") or {}), **params} if merge else dict(params)
     _apply_program_draft_data(
@@ -1444,9 +2046,20 @@ def _apply_tree_draft_delete_node(
         raise HTTPException(status_code=400, detail="tree.draft.delete_node requires nodeName")
     program_data = state.program.to_dict()
     tree = program_data.get("tree")
+    # delete_node does NOT accept `@root` — root deletion is rejected separately
+    # below, and we want the dedicated "cannot delete the root" error rather
+    # than a name-resolution detour.
     target_ref = _find_tree_node_ref(tree, node_name.strip()) if isinstance(tree, dict) else None
     if target_ref is None:
-        raise HTTPException(status_code=404, detail=f"Node not found: {node_name}")
+        valid_names = _collect_tree_node_names(tree) if isinstance(tree, dict) else []
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "message": f"Node not found: {node_name}",
+                "validNodeNames": valid_names,
+                "note": "root cannot be deleted; use tree.draft.replace_subtree to swap the entire tree",
+            },
+        )
     target, parent, index = target_ref
     if parent is None or index is None:
         raise HTTPException(status_code=400, detail="tree.draft.delete_node cannot delete the root node")
@@ -1481,20 +2094,42 @@ def _apply_tree_draft_move_node(
     new_parent_name = new_parent_name.strip()
     program_data = state.program.to_dict()
     tree = program_data.get("tree")
+    # move_node does NOT accept `@root` for nodeName (root cannot be moved) but
+    # DOES accept `@root` for newParentName (moving something under the root is
+    # valid).
     target_ref = _find_tree_node_ref(tree, node_name) if isinstance(tree, dict) else None
     if target_ref is None:
-        raise HTTPException(status_code=404, detail=f"Node not found: {node_name}")
+        valid_names = _collect_tree_node_names(tree) if isinstance(tree, dict) else []
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "message": f"Node not found: {node_name}",
+                "validNodeNames": valid_names,
+                "note": "root cannot be moved; @root may only be used as newParentName",
+            },
+        )
     target, old_parent, old_index = target_ref
     if old_parent is None or old_index is None:
         raise HTTPException(status_code=400, detail="tree.draft.move_node cannot move the root node")
-    if _tree_contains_name(target, new_parent_name):
+    resolved_new_parent_name = _resolve_node_name_alias(
+        new_parent_name, tree if isinstance(tree, dict) else None
+    )
+    if _tree_contains_name(target, resolved_new_parent_name):
         raise HTTPException(status_code=400, detail="Cannot move a node under itself or its descendants")
     old_children = list(old_parent.get("children") or [])
     moving_node = old_children.pop(old_index)
     old_parent["children"] = old_children
-    new_parent_ref = _find_tree_node_ref(tree, new_parent_name)
+    new_parent_ref = _find_tree_node_ref(tree, resolved_new_parent_name)
     if new_parent_ref is None:
-        raise HTTPException(status_code=404, detail=f"New parent node not found: {new_parent_name}")
+        valid_names = _collect_tree_node_names(tree) if isinstance(tree, dict) else []
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "message": f"New parent node not found: {new_parent_name}",
+                "validParentNames": valid_names,
+                "rootAlias": "@root",
+            },
+        )
     new_parent = new_parent_ref[0]
     new_children = list(new_parent.get("children") or [])
     index = _insert_index(arguments, child_count=len(new_children))
@@ -1520,17 +2155,39 @@ def _apply_tree_draft_replace_subtree(
     state: ComposerState,
     *,
     arguments: dict[str, Any],
+    node_allowlist: set[str] | None = None,
+    assistant_mode: str | None = None,
 ) -> dict[str, Any]:
     _assert_program_draft_edit_allowed(state)
     node_name = arguments.get("nodeName") or arguments.get("node_name")
     if not isinstance(node_name, str) or not node_name.strip():
         raise HTTPException(status_code=400, detail="tree.draft.replace_subtree requires nodeName")
-    replacement = _tree_node_from_draft_argument(arguments.get("subtree"), field_name="subtree")
+    replacement, normalization_warnings = _tree_node_from_draft_argument(
+        arguments.get("subtree"), field_name="subtree"
+    )
+    _assert_node_kinds_allowed(
+        replacement,
+        node_allowlist,
+        assistant_mode=assistant_mode,
+        field_name="subtree",
+    )
     program_data = state.program.to_dict()
     tree = program_data.get("tree")
-    target_ref = _find_tree_node_ref(tree, node_name.strip()) if isinstance(tree, dict) else None
+    # Accept `@root` since replacing the root subtree is a valid full-tree swap.
+    resolved_node_name = _resolve_node_name_alias(
+        node_name.strip(), tree if isinstance(tree, dict) else None
+    )
+    target_ref = _find_tree_node_ref(tree, resolved_node_name) if isinstance(tree, dict) else None
     if target_ref is None:
-        raise HTTPException(status_code=404, detail=f"Node not found: {node_name}")
+        valid_names = _collect_tree_node_names(tree) if isinstance(tree, dict) else []
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "message": f"Node not found: {node_name}",
+                "validNodeNames": valid_names,
+                "rootAlias": "@root",
+            },
+        )
     _target, parent, index = target_ref
     if parent is None:
         program_data["tree"] = replacement
@@ -1544,13 +2201,167 @@ def _apply_tree_draft_replace_subtree(
         program_data=program_data,
         force_discard_overrides=_force_discard_overrides(arguments),
     )
+    extra: dict[str, Any] = {
+        "nodeName": node_name.strip(),
+        "replacementRootName": replacement["name"],
+    }
+    if normalization_warnings:
+        extra["warnings"] = normalization_warnings
     return _program_draft_result(
         state,
         draft_mutation="tree_subtree_replace",
-        extra={
-            "nodeName": node_name.strip(),
-            "replacementRootName": replacement["name"],
-        },
+        extra=extra,
+    )
+
+
+def _apply_tree_draft_wrap_node(
+    state: ComposerState,
+    *,
+    arguments: dict[str, Any],
+    node_allowlist: set[str] | None = None,
+    assistant_mode: str | None = None,
+) -> dict[str, Any]:
+    """Wrap a target node with a new parent.
+
+    Single semantic op for "give this node a new parent" — useful for inserting
+    a Repeat/Retry decorator above an existing subtree, or for adding a new
+    Sequence root that wraps the previous program. The handler inserts the
+    target's existing subtree as the wrapper's only child; the wrapper itself
+    must NOT carry `children` (rejected at schema level, double-checked here).
+    """
+    _assert_program_draft_edit_allowed(state)
+    target_name_raw = arguments.get("targetName") or arguments.get("target_name")
+    if not isinstance(target_name_raw, str) or not target_name_raw.strip():
+        raise HTTPException(status_code=400, detail="tree.draft.wrap_node requires targetName")
+    target_name = target_name_raw.strip()
+
+    wrapper_arg = arguments.get("wrapper")
+    if not isinstance(wrapper_arg, dict):
+        raise HTTPException(status_code=400, detail="tree.draft.wrap_node requires wrapper object")
+    # The contract is: the wrapper's children are filled in by the handler.
+    # Any caller-supplied children value is discarded.
+    #
+    # Non-empty children is a real intent conflict (the caller is trying to
+    # specify a different child than the wrap target) and is rejected with a
+    # 400. Empty children: [] is just structural noise — the model often emits
+    # it as a default for tree-node-shaped fields — so we strip it silently
+    # and surface a warning in the result rather than fail the call. This is
+    # a conscious empirical concession: strict key-presence rejection caused
+    # a recovery loop with this model; warn-and-strip preserves forward
+    # progress while keeping the contract visible.
+    children_warning: str | None = None
+    if "children" in wrapper_arg:
+        provided_children = wrapper_arg["children"]
+        if isinstance(provided_children, list) and len(provided_children) > 0:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "tree.draft.wrap_node wrapper must not include non-empty "
+                    "'children'. The handler inserts the target's existing "
+                    "subtree as the wrapper's only child. Resubmit without "
+                    "the children field, or with an empty list."
+                ),
+            )
+        # Empty list (or null/missing) — strip and warn.
+        children_warning = (
+            "wrapper.children was provided but ignored; the handler always "
+            "fills in the target's existing subtree as the only child. "
+            "Future calls should omit the children field."
+        )
+        wrapper_arg = {k: v for k, v in wrapper_arg.items() if k != "children"}
+    wrapper, normalization_warnings = _tree_node_from_draft_argument(
+        wrapper_arg, field_name="wrapper"
+    )
+
+    # Mode-allowlist enforcement: the wrapper's id must be in the active
+    # mode's catalog.nodes. The wrapper has no children to walk (we just
+    # rejected non-empty children above), so this is a single-id check.
+    _assert_node_kinds_allowed(
+        wrapper,
+        node_allowlist,
+        assistant_mode=assistant_mode,
+        field_name="wrapper",
+    )
+
+    # Pre-validate the wrapper's catalog id with a helpful suggestion list when
+    # the model invents a non-existent id (e.g., "repeat_node" instead of
+    # "repeat"). Without this, the model gets a generic "Unknown catalog
+    # entry: 'X'" from program validation with no recovery hint and loops.
+    wrapper_id = wrapper.get("id")
+    if isinstance(wrapper_id, str):
+        catalog_ids = sorted({entry.id for entry in state.catalog.entries})
+        if wrapper_id not in catalog_ids:
+            # Heuristic shortlist: ids that share a substring with the wrong one.
+            related = sorted(
+                cid for cid in catalog_ids
+                if wrapper_id and (wrapper_id in cid or cid in wrapper_id)
+            )
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "message": f"Unknown catalog entry: '{wrapper_id}'",
+                    "wrapperIdSuggestions": related,
+                    "validCatalogIds": catalog_ids,
+                    "hint": (
+                        "wrap_node's wrapper.id must be a node kind from the "
+                        "active node catalog. Common control-flow ids: "
+                        "sequence, fallback, parallel, repeat, retry, inverter."
+                    ),
+                },
+            )
+
+    program_data = state.program.to_dict()
+    tree = program_data.get("tree")
+    if not isinstance(tree, dict):
+        raise HTTPException(status_code=400, detail="program has no tree to wrap")
+
+    resolved_target_name = _resolve_node_name_alias(target_name, tree)
+    target_ref = _find_tree_node_ref(tree, resolved_target_name)
+    if target_ref is None:
+        valid_names = _collect_tree_node_names(tree)
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "message": f"Target node not found: {target_name}",
+                "validTargetNames": valid_names,
+                "rootAlias": "@root",
+            },
+        )
+
+    target, parent, index = target_ref
+    # Attach the target's full existing subtree as the wrapper's only child.
+    # Use the target node dict by reference — _apply_program_draft_data will
+    # validate and round-trip the structure.
+    wrapper["children"] = [target]
+
+    if parent is None:
+        # Wrapping the current root produces a new root.
+        program_data["tree"] = wrapper
+    else:
+        assert index is not None
+        children = list(parent.get("children") or [])
+        children[index] = wrapper
+        parent["children"] = children
+
+    _apply_program_draft_data(
+        state,
+        program_data=program_data,
+        force_discard_overrides=_force_discard_overrides(arguments),
+    )
+    extra: dict[str, Any] = {
+        "targetName": resolved_target_name,
+        "wrapperName": wrapper["name"],
+        "newRootName": program_data["tree"].get("name"),
+    }
+    combined_warnings: list[str] = list(normalization_warnings)
+    if children_warning is not None:
+        combined_warnings.append(children_warning)
+    if combined_warnings:
+        extra["warnings"] = combined_warnings
+    return _program_draft_result(
+        state,
+        draft_mutation="tree_node_wrap",
+        extra=extra,
     )
 
 

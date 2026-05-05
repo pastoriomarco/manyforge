@@ -13,6 +13,7 @@ Mode/catalog spec: see `manyforge_specs/docs/spec/480-assistant-modes-and-bounde
 
 from __future__ import annotations
 
+import collections
 import copy
 import hashlib
 import json
@@ -51,7 +52,18 @@ AUDIT_LOG_PATH = Path(
 )
 REQUEST_TIMEOUT_S = float(os.environ.get("BRIDGE_REQUEST_TIMEOUT_S", "60"))
 CALLBACK_TIMEOUT_S = float(os.environ.get("BRIDGE_CALLBACK_TIMEOUT_S", "10"))
-MAX_TURNS = max(1, int(os.environ.get("BRIDGE_MAX_TURNS", "4")))
+MAX_TURNS = max(1, int(os.environ.get("BRIDGE_MAX_TURNS", "16")))
+# Stuck-loop detection: the bridge tracks identical (tool_id, canonical_args,
+# error_summary) tuples per request. After STUCK_LOOP_HINT_THRESHOLD identical
+# recurrences, a synthetic system message is injected to nudge the model. After
+# STUCK_LOOP_FAIL_THRESHOLD, the request hard-fails with exit_reason="stuck_loop"
+# instead of "max_turns_exceeded" so failure attribution is clearer in the
+# audit log. Override via env var if a workload genuinely needs more retries.
+STUCK_LOOP_HINT_THRESHOLD = max(2, int(os.environ.get("BRIDGE_STUCK_LOOP_HINT_THRESHOLD", "2")))
+STUCK_LOOP_FAIL_THRESHOLD = max(
+    STUCK_LOOP_HINT_THRESHOLD + 1,
+    int(os.environ.get("BRIDGE_STUCK_LOOP_FAIL_THRESHOLD", "5")),
+)
 MAX_WALL_TIME_S = float(os.environ.get("BRIDGE_MAX_WALL_TIME_S", str(REQUEST_TIMEOUT_S)))
 UPSTREAM_MAX_TOKENS = max(1, int(os.environ.get("BRIDGE_UPSTREAM_MAX_TOKENS", "512")))
 UPSTREAM_TEMPERATURE = float(os.environ.get("BRIDGE_UPSTREAM_TEMPERATURE", "0.0"))
@@ -689,6 +701,221 @@ def _tool_result_message(
     }
 
 
+def _stuck_loop_signature(tool_id: str, arguments: dict[str, Any], error_text: str) -> str:
+    """Stable identity for a "same call, same error" recurrence detector.
+
+    - tool_id is verbatim.
+    - arguments are canonicalized (sorted keys, no whitespace) so equivalent
+      calls with different field ordering collide.
+    - error_text is trimmed to a leading window so volatile suffixes
+      (timestamps, request ids embedded in error strings) don't break matches.
+      The leading content carries the structural reason — HTTP status, the
+      `detail.message` from our handlers, or upstream error class.
+    """
+    try:
+        canonical_args = json.dumps(arguments or {}, sort_keys=True, separators=(",", ":"))
+    except (TypeError, ValueError):
+        canonical_args = repr(arguments)
+    args_digest = hashlib.sha256(canonical_args.encode("utf-8")).hexdigest()[:16]
+    err_window = (error_text or "")[:240]
+    return f"{tool_id}|{args_digest}|{err_window}"
+
+
+_RECOVERY_FIELD_NAMES = (
+    "allowedNodeKinds",
+    "validTargetNames",
+    "validParentNames",
+    "validNodeNames",
+    "wrapperIdSuggestions",
+    "validCatalogIds",
+    "rejectedNodeKinds",
+)
+
+
+def _extract_recovery_fields(last_result: dict[str, Any]) -> dict[str, Any]:
+    """Pull structured recovery fields out of the most recent failure result.
+
+    The composer's tree-edit handlers return 4xx with a `detail` object
+    carrying lists like `allowedNodeKinds`, `validTargetNames`, etc. The bridge
+    receives this as `result.error` (string with the JSON-encoded detail) or
+    `result.result.detail` depending on path. We try a couple of shapes so the
+    inlined hint is robust to where the recovery info lands.
+    """
+    found: dict[str, Any] = {}
+
+    def _harvest(obj: Any) -> None:
+        if isinstance(obj, dict):
+            for key in _RECOVERY_FIELD_NAMES:
+                if key in obj and key not in found:
+                    found[key] = obj[key]
+            for value in obj.values():
+                _harvest(value)
+        elif isinstance(obj, list):
+            for item in obj:
+                _harvest(item)
+
+    _harvest(last_result)
+
+    # The error string may itself be a JSON-encoded object (composer wraps the
+    # detail dict as JSON when bubbling 4xx through HTTPException). Best-effort
+    # parse and harvest from there too.
+    error_text = last_result.get("error") if isinstance(last_result, dict) else None
+    if isinstance(error_text, str) and "{" in error_text:
+        # Strip a leading "ManyForge callback returned HTTP NNN: " prefix if present.
+        json_start = error_text.find("{")
+        candidate = error_text[json_start:]
+        try:
+            parsed = json.loads(candidate)
+        except (ValueError, TypeError):
+            parsed = None
+        if parsed is not None:
+            _harvest(parsed)
+
+    return found
+
+
+def _build_stuck_loop_hint(
+    *,
+    tool_id: str,
+    repeat_count: int,
+    last_result: dict[str, Any],
+) -> str:
+    """Synthetic message injected after repeated identical failures.
+
+    Inlines the structured recovery fields from the prior failure so the model
+    sees suggestion lists in plain prose, not buried JSON. Empirically the
+    local model is more reliable at acting on prose than at extracting fields
+    from a tool result envelope.
+    """
+    recovery = _extract_recovery_fields(last_result)
+
+    def _fmt_list(values: Any, cap: int = 30) -> str:
+        if not isinstance(values, list):
+            return repr(values)
+        truncated = values[:cap]
+        suffix = "" if len(values) <= cap else f" (and {len(values) - cap} more)"
+        return ", ".join(repr(v) for v in truncated) + suffix
+
+    lines = [
+        f"STUCK_LOOP_HINT: you have called `{tool_id}` with identical arguments "
+        f"{repeat_count} times and received the same error each time. "
+        "Do NOT retry this exact call — the result will not change. "
+        "Pick a different value or use a different tool."
+    ]
+    if recovery.get("allowedNodeKinds"):
+        lines.append(
+            "Allowed node kinds for this assistant mode: "
+            + _fmt_list(recovery["allowedNodeKinds"])
+        )
+    if recovery.get("validCatalogIds"):
+        lines.append("Valid catalog ids: " + _fmt_list(recovery["validCatalogIds"]))
+    if recovery.get("wrapperIdSuggestions"):
+        lines.append(
+            "Closest valid alternatives to your wrapper.id: "
+            + _fmt_list(recovery["wrapperIdSuggestions"])
+        )
+    if recovery.get("validTargetNames"):
+        lines.append("Valid target node names: " + _fmt_list(recovery["validTargetNames"]))
+    if recovery.get("validParentNames"):
+        lines.append("Valid parent node names: " + _fmt_list(recovery["validParentNames"]))
+    if recovery.get("validNodeNames"):
+        lines.append("Valid node names: " + _fmt_list(recovery["validNodeNames"]))
+    if recovery.get("rejectedNodeKinds"):
+        lines.append(
+            "Rejected node kinds (must be replaced): "
+            + _fmt_list(recovery["rejectedNodeKinds"])
+        )
+    if not any(recovery.values()):
+        lines.append(
+            "No structured recovery fields found in the prior error. "
+            "Re-read the error message and try a different approach."
+        )
+    return " ".join(lines)
+
+
+def _build_clarification_message(
+    *,
+    tool_id: str,
+    repeat_count: int,
+    arguments: dict[str, Any],
+    last_result: dict[str, Any],
+) -> str:
+    """User-facing message when the assistant stops to ask for help.
+
+    Composed from the same recovery fields the stuck-loop hint uses, but
+    addressed to a human reading the chat — concrete about what was tried,
+    what failed, and what specifically would unblock the next attempt.
+    """
+    recovery = _extract_recovery_fields(last_result)
+    error_text = last_result.get("error") if isinstance(last_result, dict) else ""
+    if not isinstance(error_text, str):
+        error_text = ""
+    short_error = error_text.splitlines()[0] if error_text else "unknown error"
+    if len(short_error) > 240:
+        short_error = short_error[:240] + "…"
+
+    try:
+        args_preview = json.dumps(arguments or {}, sort_keys=True)
+    except (TypeError, ValueError):
+        args_preview = repr(arguments)
+    if len(args_preview) > 240:
+        args_preview = args_preview[:240] + "…"
+
+    lines = [
+        f"I tried `{tool_id}` {repeat_count} times with the same arguments "
+        f"and got the same error each time, so I'm stopping to check with you.",
+        f"Arguments: {args_preview}",
+        f"Error: {short_error}",
+    ]
+
+    asked = False
+    if recovery.get("validTargetNames"):
+        lines.append(
+            "Valid target node names in this program: "
+            + ", ".join(repr(v) for v in recovery["validTargetNames"][:20])
+        )
+        lines.append("Which one did you mean?")
+        asked = True
+    elif recovery.get("validNodeNames"):
+        lines.append(
+            "Valid node names in this program: "
+            + ", ".join(repr(v) for v in recovery["validNodeNames"][:20])
+        )
+        lines.append("Which one did you mean?")
+        asked = True
+    elif recovery.get("validParentNames"):
+        lines.append(
+            "Valid parent node names: "
+            + ", ".join(repr(v) for v in recovery["validParentNames"][:20])
+        )
+        lines.append("Which one did you mean?")
+        asked = True
+    elif recovery.get("wrapperIdSuggestions") or recovery.get("validCatalogIds"):
+        suggestions = recovery.get("wrapperIdSuggestions") or recovery.get("validCatalogIds") or []
+        lines.append(
+            "Closest valid catalog ids I found: "
+            + ", ".join(repr(v) for v in suggestions[:15])
+        )
+        lines.append("Which catalog id did you intend?")
+        asked = True
+    elif recovery.get("allowedNodeKinds"):
+        lines.append(
+            "This assistant mode only allows these node kinds: "
+            + ", ".join(repr(v) for v in recovery["allowedNodeKinds"][:20])
+        )
+        lines.append(
+            "Did you want one of these, or should we widen the mode allowlist?"
+        )
+        asked = True
+
+    if not asked:
+        lines.append(
+            "I don't have enough structured information to suggest a fix. "
+            "Could you rephrase the request or give me a more specific target?"
+        )
+    return "\n\n".join(lines)
+
+
 def _success_envelope(
     *,
     request_id: str,
@@ -876,6 +1103,10 @@ async def assistant(request: Request) -> JSONResponse:
     completed_callback_calls: list[dict[str, Any]] = []
     draft_mutated = False
     warnings: list[str] = []
+    # Per-request stuck-loop tracker: signature → recurrence count.
+    # Sized to ~3x the fail threshold so we don't miss a slow burn over many
+    # turns. Counts are exact, not just rolling-window.
+    stuck_failure_counts: dict[str, int] = {}
 
     try:
         for turn_index in range(1, MAX_TURNS + 1):
@@ -1136,6 +1367,109 @@ async def assistant(request: Request) -> JSONResponse:
                     )
                 )
                 messages.append(_tool_result_message(call=call, result=result))
+
+                # Stuck-loop detection: track identical failures by
+                # (tool_id, canonical_args, error_text). After
+                # STUCK_LOOP_HINT_THRESHOLD recurrences inject a synthetic
+                # system message pointing at structured recovery fields. After
+                # STUCK_LOOP_FAIL_THRESHOLD, hard-fail with exit_reason
+                # "stuck_loop" so the audit log distinguishes "couldn't make
+                # progress" from a genuine "needed more turns" outcome.
+                call_failed = result.get("success") is False
+                if call_failed:
+                    err_text = result.get("error") if isinstance(result.get("error"), str) else ""
+                    sig = _stuck_loop_signature(
+                        tool_id=call.canonical_name,
+                        arguments=call.arguments,
+                        error_text=err_text,
+                    )
+                    stuck_failure_counts[sig] = stuck_failure_counts.get(sig, 0) + 1
+                    repeat_count = stuck_failure_counts[sig]
+
+                    if repeat_count >= STUCK_LOOP_FAIL_THRESHOLD:
+                        detail = (
+                            f"bridge detected stuck loop: tool '{call.canonical_name}' "
+                            f"failed with identical arguments and identical error "
+                            f"{repeat_count} times in this request"
+                        )
+                        warnings.append("stuck_loop_converted_to_clarification")
+                        # Snapshot the offending arguments + error so the audit
+                        # record is debuggable without spelunking the bridge log.
+                        try:
+                            args_snapshot = json.dumps(
+                                call.arguments or {}, sort_keys=True
+                            )[:1024]
+                        except (TypeError, ValueError):
+                            args_snapshot = repr(call.arguments)[:1024]
+                        err_snapshot = (err_text or "")[:1024]
+                        # Convert the wedged loop into a user-facing
+                        # clarification message instead of a hard error. The
+                        # model has already shown it cannot recover from this
+                        # error class on its own; surfacing the structured
+                        # recovery fields as a chat question is more useful
+                        # than failing the request.
+                        clarification_text = _build_clarification_message(
+                            tool_id=call.canonical_name,
+                            repeat_count=repeat_count,
+                            arguments=call.arguments or {},
+                            last_result=result,
+                        )
+                        _audit_record(
+                            {
+                                "ts": time.time(),
+                                "requestId": request_id,
+                                "assistantMode": assistant_mode,
+                                "catalogHash": catalog_hash,
+                                "model": model,
+                                "turnCount": turn_index,
+                                "durationMs": round(
+                                    (time.perf_counter_ns() - started_ns) / 1_000_000, 1
+                                ),
+                                "exitReason": "needs_clarification",
+                                "stuckTool": call.canonical_name,
+                                "stuckRepeatCount": repeat_count,
+                                "stuckArguments": args_snapshot,
+                                "stuckError": err_snapshot,
+                                "detail": detail,
+                            }
+                        )
+                        clarification_envelope = _success_envelope(
+                            request_id=request_id,
+                            message_text=clarification_text,
+                            proposals=[],
+                            tool_calls=[],
+                            warnings=list(warnings),
+                            draft_mutated=draft_mutated,
+                        )
+                        clarification_envelope["needsClarification"] = True
+                        return JSONResponse(
+                            status_code=200, content=clarification_envelope
+                        )
+
+                    if repeat_count == STUCK_LOOP_HINT_THRESHOLD:
+                        # Inject the hint exactly once at the threshold so
+                        # the model sees it as a fresh signal rather than
+                        # repeated noise. Subsequent identical failures up to
+                        # FAIL_THRESHOLD count up silently.
+                        hint_text = _build_stuck_loop_hint(
+                            tool_id=call.canonical_name,
+                            repeat_count=repeat_count,
+                            last_result=result,
+                        )
+                        # User-role injection is more universally respected
+                        # by chat-completions servers than mid-conversation
+                        # system messages. The hint is plainly visible in the
+                        # transcript for human review.
+                        messages.append({"role": "user", "content": hint_text})
+                        warnings.append("stuck_loop_hint_injected")
+                        logger.info(
+                            "stuck-loop hint injected for request %s at turn %d "
+                            "after %d identical failures of %s",
+                            request_id,
+                            turn_index,
+                            repeat_count,
+                            call.canonical_name,
+                        )
 
     except BridgeCancelled as exc:
         _audit_record(

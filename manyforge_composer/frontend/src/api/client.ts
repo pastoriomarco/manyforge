@@ -31,6 +31,45 @@ import type {
 
 const BASE_URL = import.meta.env.VITE_API_URL || '';
 
+function errorMessageFromPayload(payload: unknown, fallback: string): string {
+  if (!payload || typeof payload !== 'object') {
+    return fallback;
+  }
+  const data = payload as Record<string, unknown>;
+  const detail = data.detail;
+  if (typeof detail === 'string' && detail.trim()) {
+    return detail;
+  }
+  const error = data.error;
+  if (error && typeof error === 'object') {
+    const errorDetail = (error as Record<string, unknown>).detail;
+    if (typeof errorDetail === 'string' && errorDetail.trim()) {
+      return errorDetail;
+    }
+    const errorCode = (error as Record<string, unknown>).code;
+    if (typeof errorCode === 'string' && errorCode.trim()) {
+      return errorCode;
+    }
+  }
+  const message = data.message;
+  if (typeof message === 'string' && message.trim()) {
+    return message;
+  }
+  return fallback;
+}
+
+export class ApiError extends Error {
+  readonly status: number;
+  readonly payload: unknown;
+
+  constructor(message: string, status: number, payload: unknown) {
+    super(message);
+    this.name = 'ApiError';
+    this.status = status;
+    this.payload = payload;
+  }
+}
+
 async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
   const res = await fetch(`${BASE_URL}${path}`, {
     method,
@@ -38,8 +77,12 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
     body: body ? JSON.stringify(body) : undefined,
   });
   if (!res.ok) {
-    const detail = await res.json().catch(() => ({ detail: res.statusText }));
-    throw new Error(detail.detail || res.statusText);
+    const payload = await res.json().catch(() => null);
+    throw new ApiError(
+      errorMessageFromPayload(payload, res.statusText || `HTTP ${res.status}`),
+      res.status,
+      payload,
+    );
   }
   return res.json();
 }

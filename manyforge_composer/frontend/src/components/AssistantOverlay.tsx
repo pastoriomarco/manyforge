@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { KeyboardEvent } from 'react';
-import { api } from '../api/client';
+import { ApiError, api } from '../api/client';
 import { useCycleStore } from '../store/cycleStore';
 import { useDeploymentStore } from '../store/deploymentStore';
 import { useProgramStore } from '../store/programStore';
@@ -102,8 +102,81 @@ function toolStatusClasses(status: AssistantToolCall['status']): string {
   return 'border-blue-700/70 bg-blue-950/40 text-blue-100';
 }
 
+function assistantErrorTitle(error?: { code: string; detail: string } | null, fallback = ''): string {
+  const code = error?.code ?? '';
+  const detail = error?.detail || fallback;
+  const normalized = `${code} ${detail}`.toLowerCase();
+  if (code === 'cancelled' || normalized.includes('cancelled')) {
+    return 'Request cancelled';
+  }
+  if (code === 'timeout' || normalized.includes('timeout') || normalized.includes('timed out')) {
+    return 'Model timed out';
+  }
+  if (code === 'model_unresolved' || normalized.includes('could not resolve a model')) {
+    return 'Model unavailable';
+  }
+  if (
+    code === 'upstream_http_error'
+    || code === 'upstream_call_error'
+    || normalized.includes('bad gateway')
+    || normalized.includes('bridge')
+  ) {
+    return 'Bridge or model call failed';
+  }
+  if (
+    code === 'response_rejected'
+    || normalized.includes('out-of')
+    || normalized.includes('outside the active')
+    || normalized.includes('tool rejected')
+  ) {
+    return 'Tool rejected';
+  }
+  if (
+    code === 'envelope_rejected'
+    || code === 'invalid_envelope'
+    || code === 'invalid_json'
+    || normalized.includes('malformed')
+  ) {
+    return 'Invalid assistant request';
+  }
+  if (normalized.includes('provider') && normalized.includes('configured')) {
+    return 'Provider not configured';
+  }
+  return 'Assistant request failed';
+}
+
+function assistantErrorMessage(error?: { code: string; detail: string } | null, fallback = ''): string {
+  const title = assistantErrorTitle(error, fallback);
+  const detail = error?.detail || fallback;
+  const guidance: Record<string, string> = {
+    'Bridge or model call failed': 'Check that the bridge and local model endpoint are running, then retry.',
+    'Invalid assistant request': 'Reload the deployment and retry the request.',
+    'Model timed out': 'Try a narrower request, or cancel and retry after the model is ready.',
+    'Model unavailable': 'Start the local model endpoint or set the bridge model configuration.',
+    'Provider not configured': 'Start the known-good assistant demo or configure the assistant provider.',
+    'Tool rejected': 'The model attempted an unauthorized tool call; use the correct mode or adjust the tool catalog.',
+  };
+  const suffix = guidance[title] ? ` ${guidance[title]}` : '';
+  if (!detail.trim()) {
+    return `${title}.${suffix ? ` ${suffix}` : ''}`.trim();
+  }
+  if (detail.toLowerCase().startsWith(title.toLowerCase())) {
+    return `${detail}${suffix ? ` ${suffix}` : ''}`;
+  }
+  return `${title}: ${detail}${suffix ? ` ${suffix}` : ''}`;
+}
+
 function requestStatusLabel(status: AssistantRequestStatus | null, runState: AssistantRunState): string {
   if (status?.status) {
+    if (status.status === 'completed' && status.draftMutated) {
+      return 'completed · draft changed';
+    }
+    if (status.status === 'failed' && status.error) {
+      return `failed · ${assistantErrorTitle(status.error).toLowerCase()}`;
+    }
+    if (status.status === 'cancelled') {
+      return 'cancelled';
+    }
     return status.status.replace('_', ' ');
   }
   if (runState === 'running') {
@@ -138,6 +211,166 @@ function formatJsonPreview(value: unknown): string {
   }
 }
 
+function stringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.filter((item): item is string => typeof item === 'string' && item.trim().length > 0);
+}
+
+function recordArray(value: unknown): Record<string, unknown>[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.filter((item): item is Record<string, unknown> =>
+    !!item && typeof item === 'object' && !Array.isArray(item),
+  );
+}
+
+function recordField(value: unknown): Record<string, unknown> | null {
+  return !!value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function stringField(record: Record<string, unknown>, field: string): string | null {
+  const value = record[field];
+  return typeof value === 'string' && value.trim().length > 0 ? value : null;
+}
+
+function compactList(items: string[]): string {
+  if (items.length <= 3) {
+    return items.join(', ');
+  }
+  return `${items.slice(0, 3).join(', ')} +${items.length - 3} more`;
+}
+
+function summarizeItems(action: string, itemLabel: string, ids: string[]): string {
+  if (ids.length === 0) {
+    return action;
+  }
+  const plural = ids.length === 1 ? itemLabel : `${itemLabel}s`;
+  return `${action} ${ids.length} ${plural}: ${compactList(ids)}`;
+}
+
+function sceneObjectIdsFromArguments(argumentsValue: Record<string, unknown>): string[] {
+  const directIds = [
+    stringField(argumentsValue, 'objectId'),
+    stringField(argumentsValue, 'id'),
+  ].filter((value): value is string => !!value);
+  const sceneResources = recordArray(argumentsValue.sceneResources);
+  const resourceIds = sceneResources
+    .map((resource) => stringField(resource, 'objectId'))
+    .filter((value): value is string => !!value);
+  const objectIds = stringArray(argumentsValue.objectIds);
+  return [...directIds, ...resourceIds, ...objectIds];
+}
+
+function toolCallSummary(call: AssistantToolCall): string {
+  const args = call.arguments ?? {};
+  const result = call.result ?? {};
+  const resultIds = stringArray(result.objectIds)
+    .concat(stringArray(result.ids))
+    .concat(stringArray(result.names));
+  const sceneIds = resultIds.length > 0 ? resultIds : sceneObjectIdsFromArguments(args);
+  const nodeName =
+    stringField(result, 'nodeName')
+    ?? stringField(args, 'nodeName')
+    ?? stringField(args, 'parentName')
+    ?? stringField(args, 'newParentName')
+    ?? stringField(recordField(args.node) ?? {}, 'name');
+
+  let summary: string;
+  switch (call.name) {
+    case 'program.read':
+      summary = 'Read the current program';
+      break;
+    case 'program.validate':
+      summary = 'Validated the current program';
+      break;
+    case 'catalog.read':
+      summary = 'Read the node catalog';
+      break;
+    case 'skills.read':
+      summary = 'Read the skill catalog';
+      break;
+    case 'deployment.capabilities.read':
+      summary = 'Read deployment capabilities';
+      break;
+    case 'scene.draft.add_object':
+      summary = summarizeItems('Added', 'scene object', sceneIds);
+      break;
+    case 'scene.draft.update_object':
+      summary = summarizeItems('Updated', 'scene object', sceneIds);
+      break;
+    case 'scene.draft.upsert_objects':
+      summary = summarizeItems('Created or updated', 'scene object', sceneIds);
+      break;
+    case 'scene.draft.remove_objects':
+      summary = summarizeItems('Removed', 'scene object', sceneIds);
+      break;
+    case 'tree.draft.insert_node':
+      summary = nodeName ? `Inserted tree node: ${nodeName}` : 'Inserted a tree node';
+      break;
+    case 'tree.draft.update_node_params':
+      summary = nodeName ? `Updated tree node parameters: ${nodeName}` : 'Updated tree node parameters';
+      break;
+    case 'tree.draft.delete_node':
+      summary = nodeName ? `Deleted tree node: ${nodeName}` : 'Deleted a tree node';
+      break;
+    case 'tree.draft.move_node':
+      summary = nodeName ? `Moved tree node: ${nodeName}` : 'Moved a tree node';
+      break;
+    case 'tree.draft.replace_subtree':
+      summary = nodeName ? `Replaced subtree: ${nodeName}` : 'Replaced a subtree';
+      break;
+    case 'program.draft.upsert_parameters':
+      summary = summarizeItems('Created or updated', 'program parameter', resultIds);
+      break;
+    case 'program.draft.remove_parameters':
+      summary = summarizeItems('Removed', 'program parameter', resultIds);
+      break;
+    case 'blackboard.draft.upsert_namespaces':
+      summary = summarizeItems('Created or updated', 'blackboard namespace', resultIds);
+      break;
+    case 'blackboard.draft.remove_namespaces':
+      summary = summarizeItems('Removed', 'blackboard namespace', resultIds);
+      break;
+    case 'blackboard.draft.upsert_keys':
+      summary = summarizeItems('Created or updated', 'blackboard key', resultIds);
+      break;
+    case 'blackboard.draft.remove_keys':
+      summary = summarizeItems('Removed', 'blackboard key', resultIds);
+      break;
+    default:
+      summary = call.name.split('.').join(' ');
+      break;
+  }
+
+  if (call.status === 'failed') {
+    return call.error ? `${summary} failed: ${call.error}` : `${summary} failed`;
+  }
+  if (call.status === 'skipped') {
+    return `${summary} skipped`;
+  }
+  if (call.status === 'proposed') {
+    return `${summary} proposed`;
+  }
+  return summary;
+}
+
+function responseActionDetails(response: AssistantChatResponse): { heading: string; items: string[] } | null {
+  if (response.toolCalls.length === 0) {
+    return null;
+  }
+  const draftCalls = response.toolCalls.filter((call) => call.name.includes('.draft.'));
+  const relevantCalls = response.draftMutated && draftCalls.length > 0 ? draftCalls : response.toolCalls;
+  return {
+    heading: response.draftMutated ? 'Draft changes' : 'Actions',
+    items: relevantCalls.map(toolCallSummary),
+  };
+}
+
 function responseSummary(response: AssistantChatResponse): string {
   const parts = [];
   if (response.toolCalls.length > 0) {
@@ -150,6 +383,22 @@ function responseSummary(response: AssistantChatResponse): string {
     parts.push(`${response.warnings.length} warning${response.warnings.length === 1 ? '' : 's'}`);
   }
   return parts.join(' / ');
+}
+
+function isAssistantChatResponse(value: unknown): value is AssistantChatResponse {
+  if (!value || typeof value !== 'object') {
+    return false;
+  }
+  const data = value as Partial<AssistantChatResponse>;
+  return (
+    typeof data.requestId === 'string'
+    && typeof data.conversationId === 'string'
+    && typeof data.providerId === 'string'
+    && Array.isArray(data.proposals)
+    && Array.isArray(data.toolCalls)
+    && Array.isArray(data.warnings)
+    && typeof data.draftMutated === 'boolean'
+  );
 }
 
 export function AssistantOverlay() {
@@ -373,10 +622,53 @@ export function AssistantOverlay() {
         await hydrateLoadedProgram({ retries: 0 });
       }
     } catch (error) {
+      if (error instanceof ApiError && isAssistantChatResponse(error.payload)) {
+        const response = error.payload;
+        const detail = assistantErrorMessage(response.error, error.message);
+        const finishedAtNs = Date.now() * NS_PER_MS;
+        const terminalStatus = response.error?.code === 'cancelled' ? 'cancelled' : 'failed';
+        setConversationId(response.conversationId);
+        setActiveStatus({
+          requestId: response.requestId,
+          conversationId: response.conversationId,
+          providerId: response.providerId,
+          assistantMode: response.assistantMode ?? selectedModeId,
+          status: terminalStatus,
+          message: response.message,
+          error: response.error ?? { code: 'request_failed', detail },
+          warnings: response.warnings,
+          draftMutated: response.draftMutated,
+          toolCallCount: response.toolCalls.length,
+          startedAtNs,
+          updatedAtNs: finishedAtNs,
+          finishedAtNs,
+        });
+        setLastError(detail);
+        setTranscript((items) => [
+          ...items,
+          {
+            kind: 'assistant',
+            id: `${requestId}-error`,
+            text: response.message,
+            response,
+            error: detail,
+          },
+        ]);
+        if (response.draftMutated) {
+          setAssistantEditedDraft(true);
+          await hydrateLoadedProgram({ retries: 0 });
+        }
+        return;
+      }
+
       const rawDetail = error instanceof Error ? error.message : 'Assistant request failed';
-      const detail = rawDetail.toLowerCase().includes('timeout')
-        ? `${rawDetail}. The model or bridge did not finish within the configured timeout; try a narrower request or cancel and retry.`
-        : rawDetail;
+      const detail = assistantErrorMessage(
+        {
+          code: rawDetail.toLowerCase().includes('timeout') ? 'timeout' : 'request_failed',
+          detail: rawDetail,
+        },
+        rawDetail,
+      );
       const finishedAtNs = Date.now() * NS_PER_MS;
       setActiveStatus({
         requestId,
@@ -424,7 +716,8 @@ export function AssistantOverlay() {
         setLastError(null);
       }
     } catch (error) {
-      setLastError(error instanceof Error ? error.message : 'Assistant cancellation failed');
+      const detail = error instanceof Error ? error.message : 'Assistant cancellation failed';
+      setLastError(assistantErrorMessage({ code: 'request_failed', detail }, detail));
     }
   };
 
@@ -527,6 +820,10 @@ export function AssistantOverlay() {
                   ) : (
                     transcript.map((item) => {
                       const isUser = item.kind === 'user';
+                      const actionDetails =
+                        item.kind === 'assistant' && item.response
+                          ? responseActionDetails(item.response)
+                          : null;
                       const bubbleClass = isUser
                         ? 'bg-blue-700 text-white'
                         : item.error
@@ -547,6 +844,18 @@ export function AssistantOverlay() {
                             {!isUser && item.response && (
                               <div className="mt-2 border-t border-gray-700/70 pt-2 text-[11px] text-gray-400">
                                 {responseSummary(item.response) || 'No draft changes'}
+                              </div>
+                            )}
+                            {actionDetails && (
+                              <div className="mt-2 rounded border border-gray-700/70 bg-black/20 px-2 py-2 text-left text-[11px] text-gray-300">
+                                <div className="mb-1 font-semibold uppercase tracking-wide text-gray-500">
+                                  {actionDetails.heading}
+                                </div>
+                                <ul className="space-y-1">
+                                  {actionDetails.items.map((detail, detailIndex) => (
+                                    <li key={`${item.id}-detail-${detailIndex}`}>{detail}</li>
+                                  ))}
+                                </ul>
                               </div>
                             )}
                           </div>
@@ -619,7 +928,9 @@ export function AssistantOverlay() {
                       <div className="mt-2 flex items-center justify-between gap-2">
                         <span>Request</span>
                         <span className="truncate text-gray-300">
-                          {activeDuration ? `${activeStatus.status} / ${activeDuration}` : activeStatus.status}
+                          {activeDuration
+                            ? `${requestStatusLabel(activeStatus, runState)} / ${activeDuration}`
+                            : requestStatusLabel(activeStatus, runState)}
                         </span>
                       </div>
                     )}
@@ -657,9 +968,10 @@ export function AssistantOverlay() {
                         className={`mb-2 rounded border px-2 py-2 text-xs ${toolStatusClasses(call.status)}`}
                       >
                         <summary className="flex cursor-pointer list-none items-center justify-between gap-2">
-                          <span className="truncate font-medium">{call.name}</span>
+                          <span className="truncate font-medium">{toolCallSummary(call)}</span>
                           <span className="shrink-0 text-[11px] uppercase">{call.status}</span>
                         </summary>
+                        <div className="mt-1 truncate text-[11px] opacity-70">{call.name}</div>
                         {call.error && (
                           <div className="mt-1 line-clamp-2 text-[11px] opacity-90">
                             {call.error}

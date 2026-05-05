@@ -352,6 +352,52 @@ def test_assistant_mode_rejects_requested_tools_outside_catalog(
     assert "outside assistantMode 'query'" in response.json()["detail"]
 
 
+def test_assistant_modes_endpoint_returns_mode_scoped_manifest(
+    client: TestClient,
+    state: ComposerState,
+) -> None:
+    """The /api/assistant/modes/{mode} endpoint feeds the OpenClaw MCP wrapper.
+
+    It must return only the tools the mode allows, the catalog hash the
+    bridge endpoint will check, the input schema for each tool, and the
+    node-kind allowlist. This is the single discovery point that lets a
+    sandbox-side wrapper expose a narrow MCP surface mapped 1-to-1 onto
+    /api/assistant/bridge/tools/{toolId}.
+    """
+    state.deployment = _assistant_mode_deployment()
+    expected_hash = _assistant_catalog_hash(state, "composer-assistant")
+
+    response = client.get("/api/assistant/modes/composer-assistant")
+    assert response.status_code == 200
+    body = response.json()
+
+    assert body["mode"] == "composer-assistant"
+    assert body["catalogHash"] == expected_hash
+    tool_ids = {entry["id"] for entry in body["tools"]}
+    assert "tree.draft.wrap_node" in tool_ids
+    assert "scene.draft.add_object" in tool_ids
+    # No unsafe operator tools in the assistant mode.
+    assert all(not tid.startswith("manyforge_") for tid in tool_ids)
+    # Each tool entry carries description, effect, and input schema.
+    for tool in body["tools"]:
+        assert "description" in tool
+        assert tool["effect"] in {"read_only", "composer_draft_mutating", "proposal"}
+        assert isinstance(tool["inputSchema"], dict)
+        assert tool["inputSchema"].get("type") == "object"
+    # Node allowlist surfaced for the wrapper to enforce client-side too.
+    assert isinstance(body["nodes"], list)
+    assert len(body["nodes"]) > 0
+
+
+def test_assistant_modes_endpoint_404_on_unknown_mode(
+    client: TestClient,
+    state: ComposerState,
+) -> None:
+    state.deployment = _assistant_mode_deployment()
+    response = client.get("/api/assistant/modes/no-such-mode")
+    assert response.status_code in (400, 404)
+
+
 def test_assistant_bridge_read_only_callback_returns_program_state(
     client: TestClient,
     state: ComposerState,
@@ -434,6 +480,232 @@ def test_assistant_bridge_composer_draft_callback_applies_scene_resource(
     assert state.program is not None
     assert [resource.object_id for resource in state.program.scene] == ["sim_soup_can"]
     assert state.program_session_generation == before_generation + 1
+
+
+def test_assistant_bridge_scene_resource_canonicalizes_common_world_alias(
+    client: TestClient,
+    state: ComposerState,
+    tmp_path: Path,
+) -> None:
+    program_path = _write_minimal_program(tmp_path)
+    state.load_program(str(program_path))
+    state.deployment = _assistant_mode_deployment()
+    catalog_hash = _assistant_catalog_hash(state, "composer-assistant")
+    resource = _scene_resource_proposal()["payload"]["sceneResource"]
+    resource["pose"] = {**resource["pose"], "frame_id": "world"}
+
+    response = client.post(
+        "/api/assistant/bridge/tools/scene.draft.add_object",
+        json={
+            "requestId": "req-bridge-world-alias",
+            "assistantMode": "composer-assistant",
+            "catalogHash": catalog_hash,
+            "arguments": {"sceneResource": resource},
+        },
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["result"]["scene"][0]["pose"]["frame_id"] == "universe"
+    assert state.program is not None
+    assert state.program.scene[0].pose["frame_id"] == "universe"
+
+
+def test_assistant_bridge_scene_resource_uses_deployment_world_frame_config(
+    client: TestClient,
+    state: ComposerState,
+    tmp_path: Path,
+) -> None:
+    program_path = _write_minimal_program(tmp_path)
+    state.load_program(str(program_path))
+    state.deployment = _assistant_mode_deployment(
+        context_config={"scene_world_frame": "world"}
+    )
+    catalog_hash = _assistant_catalog_hash(state, "composer-assistant")
+    resource = _scene_resource_proposal()["payload"]["sceneResource"]
+    resource["pose"] = {**resource["pose"], "frame_id": "/World"}
+
+    response = client.post(
+        "/api/assistant/bridge/tools/scene.draft.add_object",
+        json={
+            "requestId": "req-bridge-configured-world-frame",
+            "assistantMode": "composer-assistant",
+            "catalogHash": catalog_hash,
+            "arguments": {"sceneResource": resource},
+        },
+    )
+
+    assert response.status_code == 200
+    assert state.program is not None
+    assert state.program.scene[0].pose["frame_id"] == "world"
+
+
+def test_assistant_bridge_scene_resource_rejects_attachment_frame(
+    client: TestClient,
+    state: ComposerState,
+    tmp_path: Path,
+) -> None:
+    program_path = _write_minimal_program(tmp_path)
+    state.load_program(str(program_path))
+    state.deployment = _assistant_mode_deployment()
+    catalog_hash = _assistant_catalog_hash(state, "composer-assistant")
+    resource = _scene_resource_proposal()["payload"]["sceneResource"]
+    resource["pose"] = {**resource["pose"], "frame_id": "tool0"}
+
+    response = client.post(
+        "/api/assistant/bridge/tools/scene.draft.add_object",
+        json={
+            "requestId": "req-bridge-reject-attachment-frame",
+            "assistantMode": "composer-assistant",
+            "catalogHash": catalog_hash,
+            "arguments": {"sceneResource": resource},
+        },
+    )
+
+    assert response.status_code == 400
+    assert "backend canonical world frame" in response.json()["detail"]
+    assert "attach_object_to_link" in response.json()["detail"]
+
+
+def test_assistant_bridge_scene_resource_rejects_flat_attachment_frame(
+    client: TestClient,
+    state: ComposerState,
+    tmp_path: Path,
+) -> None:
+    program_path = _write_minimal_program(tmp_path)
+    state.load_program(str(program_path))
+    state.deployment = _assistant_mode_deployment()
+    catalog_hash = _assistant_catalog_hash(state, "composer-assistant")
+
+    response = client.post(
+        "/api/assistant/bridge/tools/scene.draft.add_object",
+        json={
+            "requestId": "req-bridge-reject-flat-attachment-frame",
+            "assistantMode": "composer-assistant",
+            "catalogHash": catalog_hash,
+            "arguments": {
+                "objectId": "box_001",
+                "shapeType": "box",
+                "size": [1.0, 0.02, 0.2],
+                "position": [0.0, 0.2, 0.1],
+                "frameId": "tool0",
+            },
+        },
+    )
+
+    assert response.status_code == 400
+    assert "backend canonical world frame" in response.json()["detail"]
+    assert "attach_object_to_link" in response.json()["detail"]
+
+
+def test_assistant_bridge_scene_resource_rejects_nested_attachment_frame_with_world_alias(
+    client: TestClient,
+    state: ComposerState,
+    tmp_path: Path,
+) -> None:
+    program_path = _write_minimal_program(tmp_path)
+    state.load_program(str(program_path))
+    state.deployment = _assistant_mode_deployment()
+    catalog_hash = _assistant_catalog_hash(state, "composer-assistant")
+    resource = _scene_resource_proposal()["payload"]["sceneResource"]
+    resource["pose"] = {**resource["pose"], "frame_id": "tool0"}
+
+    response = client.post(
+        "/api/assistant/bridge/tools/scene.draft.add_object",
+        json={
+            "requestId": "req-bridge-reject-nested-attachment-frame",
+            "assistantMode": "composer-assistant",
+            "catalogHash": catalog_hash,
+            "arguments": {
+                "frameId": "world",
+                "sceneResource": resource,
+            },
+        },
+    )
+
+    assert response.status_code == 400
+    assert "backend canonical world frame" in response.json()["detail"]
+    assert "attach_object_to_link" in response.json()["detail"]
+
+
+def test_assistant_bridge_scene_resource_accepts_flat_box_arguments(
+    client: TestClient,
+    state: ComposerState,
+    tmp_path: Path,
+) -> None:
+    program_path = _write_minimal_program(tmp_path)
+    state.load_program(str(program_path))
+    state.deployment = _assistant_mode_deployment()
+    catalog_hash = _assistant_catalog_hash(state, "composer-assistant")
+
+    response = client.post(
+        "/api/assistant/bridge/tools/scene.draft.add_object",
+        json={
+            "requestId": "req-bridge-flat-box",
+            "assistantMode": "composer-assistant",
+            "catalogHash": catalog_hash,
+            "arguments": {
+                "objectId": "box_001",
+                "shapeType": "box",
+                "size": [1.0, 0.02, 0.2],
+                "position": [0.0, 0.2, 0.1],
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    assert state.program is not None
+    assert state.program.scene[0].object_id == "box_001"
+    assert state.program.scene[0].shape == {
+        "type": "box",
+        "box_dimensions_m": [1.0, 0.02, 0.2],
+    }
+    assert state.program.scene[0].pose == {
+        "frame_id": "universe",
+        "position_m": [0.0, 0.2, 0.1],
+        "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+    }
+
+
+def test_assistant_bridge_scene_resource_accepts_diameter_and_list_wrapper(
+    client: TestClient,
+    state: ComposerState,
+    tmp_path: Path,
+) -> None:
+    program_path = _write_minimal_program(tmp_path)
+    state.load_program(str(program_path))
+    state.deployment = _assistant_mode_deployment()
+    catalog_hash = _assistant_catalog_hash(state, "composer-assistant")
+
+    response = client.post(
+        "/api/assistant/bridge/tools/scene.draft.add_object",
+        json={
+            "requestId": "req-bridge-wrapper-sphere",
+            "assistantMode": "composer-assistant",
+            "catalogHash": catalog_hash,
+            "arguments": {
+                "sceneResource": [
+                    {
+                        "object_id": "sphere_001",
+                        "shape_type": "sphere",
+                        "diameter": 0.1,
+                        "position_m": "0.3, 0.3, 0.3",
+                        "frame_id": "world",
+                    }
+                ],
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    assert state.program is not None
+    assert state.program.scene[0].object_id == "sphere_001"
+    assert state.program.scene[0].shape == {
+        "type": "sphere",
+        "sphere_radius_m": 0.05,
+    }
+    assert state.program.scene[0].pose["frame_id"] == "universe"
+    assert state.program.scene[0].pose["position_m"] == [0.3, 0.3, 0.3]
 
 
 def test_assistant_bridge_composer_draft_callback_updates_scene_resource(
@@ -742,6 +1014,311 @@ def test_assistant_bridge_composer_draft_tree_callbacks_mutate_validated_tree(
     )
     assert delete_response.status_code == 200
     assert [child.name for child in state.program.tree.children] == ["reset_trajectories"]
+
+
+def test_assistant_bridge_wrap_node_wraps_root_with_repeat(
+    client: TestClient,
+    state: ComposerState,
+    tmp_path: Path,
+) -> None:
+    """Regression for the original 16-turn-fail prompt.
+
+    User asked: 'add a repeat node as root, and make the current root its child.'
+    With wrap_node + @root alias, the model can express this as a single tool call.
+    Before the fix, no tool surface existed for "create a new root above the
+    existing root" — the model burned its turn budget retrying insert_node with
+    invented parent names.
+    """
+    program_path = _write_minimal_program(tmp_path)
+    state.load_program(str(program_path))
+    state.deployment = _assistant_mode_deployment()
+    catalog_hash = _assistant_catalog_hash(state, "composer-assistant")
+
+    original_root_name = state.program.tree.name  # "root" from the minimal program
+    original_root_id = state.program.tree.id  # "sequence"
+    original_child_count = len(state.program.tree.children)
+
+    response = client.post(
+        "/api/assistant/bridge/tools/tree.draft.wrap_node",
+        json={
+            "requestId": "req-wrap-root",
+            "assistantMode": "composer-assistant",
+            "catalogHash": catalog_hash,
+            "arguments": {
+                "targetName": "@root",
+                "wrapper": {
+                    "id": "repeat",
+                    "name": "loop_forever",
+                    "params": {"num_cycles": -1},
+                },
+            },
+        },
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["draftMutated"] is True
+    assert body["result"]["draftMutation"] == "tree_node_wrap"
+
+    # New root is the repeat wrapper. Old root is its only child, untouched.
+    new_root = state.program.tree
+    assert new_root.id == "repeat"
+    assert new_root.name == "loop_forever"
+    assert len(new_root.children) == 1
+
+    old_root_now_child = new_root.children[0]
+    assert old_root_now_child.name == original_root_name
+    assert old_root_now_child.id == original_root_id
+    assert len(old_root_now_child.children) == original_child_count
+
+
+def test_assistant_bridge_wrap_node_rejects_non_empty_wrapper_children(
+    client: TestClient,
+    state: ComposerState,
+    tmp_path: Path,
+) -> None:
+    """Non-empty children is a real intent conflict and must 400."""
+    program_path = _write_minimal_program(tmp_path)
+    state.load_program(str(program_path))
+    state.deployment = _assistant_mode_deployment()
+    catalog_hash = _assistant_catalog_hash(state, "composer-assistant")
+
+    response = client.post(
+        "/api/assistant/bridge/tools/tree.draft.wrap_node",
+        json={
+            "requestId": "req-wrap-with-children",
+            "assistantMode": "composer-assistant",
+            "catalogHash": catalog_hash,
+            "arguments": {
+                "targetName": "@root",
+                "wrapper": {
+                    "id": "repeat",
+                    "name": "bad_wrapper",
+                    "children": [{"id": "reset_trajectories", "name": "extra"}],
+                },
+            },
+        },
+    )
+    assert response.status_code == 400
+
+
+def test_assistant_bridge_wrap_node_strips_empty_children_with_warning(
+    client: TestClient,
+    state: ComposerState,
+    tmp_path: Path,
+) -> None:
+    """Empty `children: []` is structural noise the model emits habitually.
+
+    Reject-on-key-presence caused a 16-turn recovery loop with the local
+    model. We accept-and-warn instead: the empty list is stripped, the
+    operation succeeds, and the result carries a warning so the trail is
+    visible to humans reviewing the proposal.
+    """
+    program_path = _write_minimal_program(tmp_path)
+    state.load_program(str(program_path))
+    state.deployment = _assistant_mode_deployment()
+    catalog_hash = _assistant_catalog_hash(state, "composer-assistant")
+
+    response = client.post(
+        "/api/assistant/bridge/tools/tree.draft.wrap_node",
+        json={
+            "requestId": "req-wrap-empty-children",
+            "assistantMode": "composer-assistant",
+            "catalogHash": catalog_hash,
+            "arguments": {
+                "targetName": "@root",
+                "wrapper": {"id": "repeat", "name": "loop", "children": []},
+            },
+        },
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["draftMutated"] is True
+    warnings = body["result"].get("warnings") or []
+    assert any("children" in warning for warning in warnings), warnings
+    # Old root must still be the wrapper's only child.
+    assert state.program is not None
+    new_root = state.program.tree
+    assert new_root.id == "repeat"
+    assert len(new_root.children) == 1
+
+
+def test_assistant_bridge_wrap_node_synthesized_name_emits_warning(
+    client: TestClient,
+    state: ComposerState,
+    tmp_path: Path,
+) -> None:
+    """Synthesized node names must surface as warnings so the audit trail
+    shows what the handler rewrote, not just what the model sent."""
+    program_path = _write_minimal_program(tmp_path)
+    state.load_program(str(program_path))
+    state.deployment = _assistant_mode_deployment()
+    catalog_hash = _assistant_catalog_hash(state, "composer-assistant")
+
+    response = client.post(
+        "/api/assistant/bridge/tools/tree.draft.wrap_node",
+        json={
+            "requestId": "req-wrap-synthesized-name",
+            "assistantMode": "composer-assistant",
+            "catalogHash": catalog_hash,
+            "arguments": {
+                "targetName": "@root",
+                # No `name` field — handler must synthesize and warn.
+                "wrapper": {"id": "repeat"},
+            },
+        },
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["draftMutated"] is True
+    warnings = body["result"].get("warnings") or []
+    assert any(
+        "name" in w and "synthesized" in w for w in warnings
+    ), warnings
+
+
+def test_assistant_bridge_wrap_node_unknown_id_rejected_by_allowlist(
+    client: TestClient,
+    state: ComposerState,
+    tmp_path: Path,
+) -> None:
+    """The model invents 'repeat_node' instead of 'repeat' fairly reliably.
+
+    With Priority 5 (mode allowlist enforcement) shipped, the typo doesn't
+    reach the catalog-suggestion path because the allowlist check fires
+    first. The 403 response surfaces `allowedNodeKinds` which contains
+    'repeat' — same effective recovery hint, just delivered earlier.
+
+    The catalog-suggestion 400 path remains as a safety net for the rare
+    case where a deployment configures an allowlist entry that's somehow
+    missing from the catalog (deployment-time misconfiguration).
+    """
+    program_path = _write_minimal_program(tmp_path)
+    state.load_program(str(program_path))
+    state.deployment = _assistant_mode_deployment()
+    catalog_hash = _assistant_catalog_hash(state, "composer-assistant")
+
+    response = client.post(
+        "/api/assistant/bridge/tools/tree.draft.wrap_node",
+        json={
+            "requestId": "req-wrap-unknown-id",
+            "assistantMode": "composer-assistant",
+            "catalogHash": catalog_hash,
+            "arguments": {
+                "targetName": "@root",
+                "wrapper": {"id": "repeat_node", "name": "loop"},
+            },
+        },
+    )
+    assert response.status_code == 403
+    detail = response.json()["detail"]
+    assert isinstance(detail, dict)
+    assert "repeat_node" in detail["rejectedNodeKinds"]
+    # The recovery hint includes 'repeat' — close enough to the typo that the
+    # model can correct in one turn.
+    assert "repeat" in detail["allowedNodeKinds"]
+
+
+def test_assistant_bridge_wrap_node_enforces_mode_node_allowlist(
+    client: TestClient,
+    state: ComposerState,
+    tmp_path: Path,
+) -> None:
+    """Priority 5: wrap_node must reject node kinds outside the active mode's allowlist.
+
+    Bounded-autonomy: the assistant mode declares which BT primitives the
+    assistant may insert. The runtime must enforce this at tool-call time, not
+    just surface it to the prompt as advisory.
+    """
+    program_path = _write_minimal_program(tmp_path)
+    state.load_program(str(program_path))
+    state.deployment = _assistant_mode_deployment()
+    catalog_hash = _assistant_catalog_hash(state, "composer-assistant")
+
+    # `command_gripper` is a real catalog id (not a typo) but is NOT in the
+    # composer-assistant mode's nodes allowlist. The handler should 403, not
+    # 400, to distinguish "outside mode" from "unknown id".
+    response = client.post(
+        "/api/assistant/bridge/tools/tree.draft.wrap_node",
+        json={
+            "requestId": "req-wrap-out-of-mode",
+            "assistantMode": "composer-assistant",
+            "catalogHash": catalog_hash,
+            "arguments": {
+                "targetName": "@root",
+                "wrapper": {"id": "command_gripper", "name": "wrap"},
+            },
+        },
+    )
+    assert response.status_code == 403
+    detail = response.json()["detail"]
+    assert isinstance(detail, dict)
+    assert "command_gripper" in detail["rejectedNodeKinds"]
+    assert "repeat" in detail["allowedNodeKinds"]
+
+
+def test_assistant_bridge_insert_node_enforces_mode_node_allowlist(
+    client: TestClient,
+    state: ComposerState,
+    tmp_path: Path,
+) -> None:
+    """Same enforcement on insert_node — recursive: rejected when any subtree
+    node kind is outside the allowlist."""
+    program_path = _write_minimal_program(tmp_path)
+    state.load_program(str(program_path))
+    state.deployment = _assistant_mode_deployment()
+    catalog_hash = _assistant_catalog_hash(state, "composer-assistant")
+
+    response = client.post(
+        "/api/assistant/bridge/tools/tree.draft.insert_node",
+        json={
+            "requestId": "req-insert-out-of-mode",
+            "assistantMode": "composer-assistant",
+            "catalogHash": catalog_hash,
+            "arguments": {
+                "parentName": "root",
+                "node": {
+                    "id": "sequence",
+                    "name": "wrapper_seq",
+                    "children": [
+                        {"id": "command_gripper", "name": "bad_leaf"},
+                    ],
+                },
+            },
+        },
+    )
+    assert response.status_code == 403
+    detail = response.json()["detail"]
+    assert "command_gripper" in detail["rejectedNodeKinds"]
+
+
+def test_assistant_bridge_wrap_node_unknown_target_returns_valid_names(
+    client: TestClient,
+    state: ComposerState,
+    tmp_path: Path,
+) -> None:
+    program_path = _write_minimal_program(tmp_path)
+    state.load_program(str(program_path))
+    state.deployment = _assistant_mode_deployment()
+    catalog_hash = _assistant_catalog_hash(state, "composer-assistant")
+
+    response = client.post(
+        "/api/assistant/bridge/tools/tree.draft.wrap_node",
+        json={
+            "requestId": "req-wrap-unknown-target",
+            "assistantMode": "composer-assistant",
+            "catalogHash": catalog_hash,
+            "arguments": {
+                "targetName": "node_that_does_not_exist",
+                "wrapper": {"id": "repeat", "name": "loop"},
+            },
+        },
+    )
+    assert response.status_code == 404
+    detail = response.json()["detail"]
+    assert isinstance(detail, dict)
+    assert detail["rootAlias"] == "@root"
+    # The minimal program has root="root" and one child="reset_trajectories".
+    assert "root" in detail["validTargetNames"]
 
 
 def test_assistant_bridge_composer_draft_parameter_and_blackboard_callbacks(
@@ -1195,6 +1772,217 @@ def test_assistant_chat_records_draft_mutation_status(
     assert status["assistantMode"] == "composer-assistant"
     assert status["draftMutated"] is True
     assert status["toolCallCount"] == 1
+    assert status["error"] is None
+
+
+def test_assistant_chat_golden_program_build_matches_expected_draft(
+    client: TestClient,
+    state: ComposerState,
+    tmp_path: Path,
+) -> None:
+    program_path = _write_minimal_program(tmp_path)
+    state.load_program(str(program_path))
+    state.deployment = _assistant_mode_deployment()
+    before_generation = state.program_session_generation
+
+    expected_scene = [
+        {
+            "objectId": "golden_box_widget",
+            "shape": {"type": "box", "box_dimensions_m": [0.08, 0.04, 0.03]},
+            "pose": {
+                "frame_id": "universe",
+                "position_m": [0.45, -0.1, 0.015],
+                "orientation_rpy_deg": [0.0, 0.0, 0.0],
+            },
+        },
+        {
+            "objectId": "golden_sphere_marker",
+            "shape": {"type": "sphere", "sphere_radius_m": 0.025},
+            "pose": {
+                "frame_id": "universe",
+                "position_m": [0.55, 0.12, 0.025],
+                "orientation_rpy_deg": [0.0, 0.0, 0.0],
+            },
+        },
+    ]
+    expected_node = {
+        "id": "remove_collision_object",
+        "name": "golden_remove_widget",
+        "params": {"object_id": "golden_box_widget"},
+    }
+    expected_tree_node = {
+        **expected_node,
+        "children": [],
+        "modificationPolicy": {},
+        "recoveryPolicy": {},
+    }
+    expected_parameter = {
+        "name": "golden_target_object",
+        "type": "string",
+        "default": "golden_box_widget",
+        "constraints": {},
+        "description": "Assistant golden E2E target object.",
+    }
+    expected_namespace = {
+        "id": "golden_selection",
+        "contract": "selection_context_v1",
+        "prefix": "/golden/selection",
+        "description": "Assistant golden E2E namespace.",
+        "fields": [
+            {
+                "name": "object_id",
+                "type": "string",
+                "description": "Selected object id.",
+            }
+        ],
+    }
+    expected_key = {
+        "id": "golden_ready",
+        "type": "bool",
+        "key": "/golden/selection/ready",
+        "description": "Assistant golden E2E ready flag.",
+    }
+
+    class GoldenProgramBuilderProvider:
+        provider_id = "nemoclaw"
+
+        def run(self, request, context):
+            assert context.assistant_mode == "composer-assistant"
+            assert {
+                "scene.inspect",
+                "scene.draft.upsert_objects",
+                "tree.draft.insert_node",
+                "program.draft.upsert_parameters",
+                "blackboard.draft.upsert_namespaces",
+                "blackboard.draft.upsert_keys",
+            } <= {tool.get("id") for tool in context.tool_catalog}
+            assert {
+                "attach_object_to_link",
+                "detach_object_from_link",
+            } <= set(context.visible_nodes)
+
+            tool_calls = []
+
+            def call(tool_id: str, arguments: dict) -> dict:
+                result = routes_assistant._execute_bridge_composer_draft_tool(
+                    state,
+                    tool_id=tool_id,
+                    arguments=arguments,
+                )
+                tool_calls.append(
+                    {
+                        "name": tool_id,
+                        "status": "completed",
+                        "arguments": arguments,
+                        "result": result,
+                    }
+                )
+                return result
+
+            call("scene.draft.upsert_objects", {"sceneResources": expected_scene})
+            call(
+                "tree.draft.insert_node",
+                {"parentName": "root", "index": 0, "node": expected_node},
+            )
+            call(
+                "program.draft.upsert_parameters",
+                {"parameters": [expected_parameter]},
+            )
+            call(
+                "blackboard.draft.upsert_namespaces",
+                {"namespaces": [expected_namespace]},
+            )
+            call("blackboard.draft.upsert_keys", {"keys": [expected_key]})
+
+            return AssistantProviderResult(
+                mode="provider",
+                message=(
+                    "Built golden_box_widget, golden_sphere_marker, "
+                    "golden_remove_widget, golden_target_object, "
+                    "golden_selection, and golden_ready in the Composer draft."
+                ),
+                tool_calls=tool_calls,
+                proposals=[],
+                draft_mutated=True,
+                mutated=False,
+                requires_review=True,
+            )
+
+    state.assistant_provider = GoldenProgramBuilderProvider()
+
+    response = client.post(
+        "/api/assistant/chat",
+        json={
+            "requestId": "req-golden-program-build",
+            "message": "Build the deterministic golden Composer draft.",
+            "mode": "provider",
+            "providerId": "nemoclaw",
+            "assistantMode": "composer-assistant",
+            "requestedTools": [
+                "scene.draft.upsert_objects",
+                "tree.draft.insert_node",
+                "program.draft.upsert_parameters",
+                "blackboard.draft.upsert_namespaces",
+                "blackboard.draft.upsert_keys",
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["draftMutated"] is True
+    assert data["mutated"] is False
+    assert data["requiresReview"] is True
+    assert [
+        (call["name"], call["status"], call["arguments"])
+        for call in data["toolCalls"]
+    ] == [
+        ("scene.draft.upsert_objects", "completed", {"sceneResources": expected_scene}),
+        (
+            "tree.draft.insert_node",
+            "completed",
+            {"parentName": "root", "index": 0, "node": expected_node},
+        ),
+        (
+            "program.draft.upsert_parameters",
+            "completed",
+            {"parameters": [expected_parameter]},
+        ),
+        (
+            "blackboard.draft.upsert_namespaces",
+            "completed",
+            {"namespaces": [expected_namespace]},
+        ),
+        ("blackboard.draft.upsert_keys", "completed", {"keys": [expected_key]}),
+    ]
+    assert data["toolCalls"][0]["result"]["objectIds"] == [
+        "golden_box_widget",
+        "golden_sphere_marker",
+    ]
+    assert data["toolCalls"][1]["result"]["nodeName"] == "golden_remove_widget"
+    assert data["toolCalls"][2]["result"]["names"] == ["golden_target_object"]
+    assert data["toolCalls"][3]["result"]["ids"] == ["golden_selection"]
+    assert data["toolCalls"][4]["result"]["ids"] == ["golden_ready"]
+
+    program = client.get("/api/program").json()
+    tree = client.get("/api/program/tree").json()["tree"]
+    assert program["sceneResources"] == expected_scene
+    assert tree["children"][0] == expected_tree_node
+    assert tree["children"][1]["name"] == "reset_trajectories"
+    assert program["parameters"] == [expected_parameter]
+    assert program["blackboard"] == {
+        "namespaces": [expected_namespace],
+        "keys": [expected_key],
+    }
+    assert state.program_session_generation == before_generation + 5
+
+    status_response = client.get("/api/assistant/requests/req-golden-program-build")
+    assert status_response.status_code == 200
+    status = status_response.json()
+    assert status["status"] == "completed"
+    assert status["assistantMode"] == "composer-assistant"
+    assert status["draftMutated"] is True
+    assert status["toolCallCount"] == 5
     assert status["error"] is None
 
 
@@ -1832,7 +2620,10 @@ def _assistant_catalog_hash(state: ComposerState, assistant_mode: str) -> str:
     )
 
 
-def _assistant_mode_deployment() -> Deployment:
+def _assistant_mode_deployment(
+    *,
+    context_config: dict[str, object] | None = None,
+) -> Deployment:
     return Deployment.from_dict(
         {
             "api_version": "manyforge.deployment.v0",
@@ -1868,10 +2659,11 @@ def _assistant_mode_deployment() -> Deployment:
                         "scene.edit.add",
                         "scene.edit.remove",
                         "scene.edit.update_pose",
+                        "scene.edit.attach_detach",
                         "scene.shape.box",
                         "scene.shape.sphere",
                     ],
-                    "config": {},
+                    "config": context_config or {},
                 },
                 "execution": {
                     "adapter_id": "execution.test",
@@ -1930,6 +2722,7 @@ def _assistant_mode_deployment() -> Deployment:
                             "catalog.read",
                             "skills.read",
                             "deployment.capabilities.read",
+                            "scene.inspect",
                             "tree.insert_node",
                             "scene.draft.add_object",
                             "scene.draft.update_object",
@@ -1940,6 +2733,7 @@ def _assistant_mode_deployment() -> Deployment:
                             "tree.draft.delete_node",
                             "tree.draft.move_node",
                             "tree.draft.replace_subtree",
+                            "tree.draft.wrap_node",
                             "program.draft.upsert_parameters",
                             "program.draft.remove_parameters",
                             "blackboard.draft.upsert_namespaces",
@@ -1947,7 +2741,21 @@ def _assistant_mode_deployment() -> Deployment:
                             "blackboard.draft.upsert_keys",
                             "blackboard.draft.remove_keys",
                         ],
-                        "nodes": [],
+                        "nodes": [
+                            "attach_object_to_link",
+                            "detach_object_from_link",
+                            "add_collision_object",
+                            "remove_collision_object",
+                            "upsert_collision_object",
+                            "update_collision_object_pose",
+                            "reset_trajectories",
+                            "sequence",
+                            "fallback",
+                            "parallel",
+                            "repeat",
+                            "retry",
+                            "inverter",
+                        ],
                     },
                 },
             },
@@ -2036,6 +2844,11 @@ def _assistant_mode_deployment() -> Deployment:
                     "id": "tree.draft.replace_subtree",
                     "effect": "composer_draft_mutating",
                     "description": "Replace a subtree in the Composer draft tree.",
+                },
+                {
+                    "id": "tree.draft.wrap_node",
+                    "effect": "composer_draft_mutating",
+                    "description": "Wrap a node with a new parent node.",
                 },
                 {
                     "id": "program.draft.upsert_parameters",

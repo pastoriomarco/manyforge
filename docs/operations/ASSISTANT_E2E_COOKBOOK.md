@@ -176,7 +176,7 @@ BRIDGE_MANYFORGE_BASE_URL=http://127.0.0.1:9000 \
 BRIDGE_MODEL=nemotron3-nano-omni-30b-a3b-nvfp4 \
 BRIDGE_REQUEST_TIMEOUT_S=180 \
 BRIDGE_MAX_WALL_TIME_S=180 \
-BRIDGE_MAX_TURNS=4 \
+BRIDGE_MAX_TURNS=16 \
 BRIDGE_UPSTREAM_MAX_TOKENS=32768 \
 BRIDGE_UPSTREAM_ENABLE_THINKING=false \
 BRIDGE_UPSTREAM_TEMPERATURE=0.2 \
@@ -206,6 +206,16 @@ cd /home/tndlux/workspaces/dev_ws/src/manyforge
 ./scripts/demo-assistant-known-good.sh start
 ```
 
+The known-good launcher defaults to `ASSISTANT_MAX_TURNS=16`. This is a bridge
+agent-loop budget, not a strict tool-call count: each turn can include one or
+more callback attempts. Keep an upper bound so malformed tool schemas or model
+looping cannot run forever, but use a high enough value for the model to repair
+invalid callback arguments. Override it when testing:
+
+```bash
+ASSISTANT_MAX_TURNS=8 ./scripts/demo-assistant-known-good.sh start
+```
+
 What it does:
 
 1. stops stale `manyforge-e2e-vllm` state if needed and runs the Thor memory
@@ -216,7 +226,7 @@ What it does:
 4. starts Composer on `http://127.0.0.1:9000` with HMI/Viser on
    `http://127.0.0.1:8081`,
 5. starts the ManyForge assistant bridge on `http://127.0.0.1:8100`,
-6. loads `pick_and_place.program.yaml` with
+6. loads `pick_and_place_ur10e_robotiq.program.yaml` with
    `assistant_modes_scene_authoring.deployment.yaml`.
 
 The preflight refuses to start if ports `8000`, `8080`, `8081`, `8100`, or
@@ -239,6 +249,30 @@ qualification of the same stack:
 ```bash
 ./scripts/demo-assistant-known-good.sh smoke
 ```
+
+After Composer backend or frontend code changes, restart only Composer/HMI and
+keep the already-loaded vLLM model warm:
+
+```bash
+./scripts/demo-assistant-known-good.sh reload-composer
+```
+
+`reload-composer` rebuilds the Composer frontend bundle by default, removes and
+restarts only the `manyforge-e2e-composer` container, and reloads the known-good
+program/deployment. It does not stop vLLM, the assistant bridge, OpenShell, or
+any live NemoClaw sandbox. Use
+`REBUILD_FRONTEND_ON_COMPOSER_RELOAD=false` only when you know the frontend
+bundle is already current.
+
+After bridge code or bridge-budget changes, restart only the bridge:
+
+```bash
+./scripts/demo-assistant-known-good.sh restart-bridge
+```
+
+This keeps Composer/HMI, vLLM, OpenShell, and any live NemoClaw sandbox running.
+Use this after changing `ASSISTANT_MAX_TURNS`, bridge generation settings, or
+bridge code.
 
 Stop and free memory:
 
@@ -271,7 +305,7 @@ Use this after the base boot and manual bridge start when checking the actual
 operator workflow.
 
 1. Open `http://127.0.0.1:9000`.
-2. Load `/workspace/examples/pick_and_place.program.yaml`.
+2. Load `/workspace/examples/pick_and_place_ur10e_robotiq.program.yaml`.
 3. Load `/workspace/examples/assistant_modes_scene_authoring.deployment.yaml`.
 4. Confirm the Viser panel shows the robot/scene at `http://127.0.0.1:8081`.
 5. Open the lower-right assistant button.

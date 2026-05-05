@@ -511,10 +511,9 @@ export function DeploymentPanel() {
   const editLocked = state === 'running' || state === 'interrupt_handler' || state === 'direct_control';
   const runtimeApplied = signature(deployment) === signature(appliedDeployment);
   const diskSaved = signature(deployment) === signature(savedDeployment);
-  const deploymentModelEndpointSignature = signature(deployment?.modelEndpoints);
   const endpointAliases = useMemo(
     () => Object.keys(deployment?.modelEndpoints ?? {}).sort(),
-    [deploymentModelEndpointSignature],
+    [deployment?.modelEndpoints],
   );
   const warnings = useMemo(
     () => (deployment ? deploymentWarnings(deployment) : []),
@@ -541,7 +540,7 @@ export function DeploymentPanel() {
     return () => {
       cancelled = true;
     };
-  }, [deployment, deploymentModelEndpointSignature]);
+  }, [deployment]);
 
   useEffect(() => {
     let cancelled = false;

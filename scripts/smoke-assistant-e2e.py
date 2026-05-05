@@ -255,7 +255,10 @@ def _parse_args() -> argparse.Namespace:
         "--deployment-path",
         default="/workspace/examples/assistant_modes_scene_authoring.deployment.yaml",
     )
-    parser.add_argument("--program-path", default="/workspace/examples/pick_and_place.program.yaml")
+    parser.add_argument(
+        "--program-path",
+        default="/workspace/examples/pick_and_place_ur10e_robotiq.program.yaml",
+    )
     parser.add_argument("--bridge-host", default="127.0.0.1")
     parser.add_argument("--bridge-port", type=int, default=8100)
     parser.add_argument("--provider-id", default="nemoclaw")
@@ -270,7 +273,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--bridge-start-timeout-s", type=float, default=20.0)
     parser.add_argument("--bridge-request-timeout-s", type=float, default=180.0)
     parser.add_argument("--bridge-max-wall-time-s", type=float, default=180.0)
-    parser.add_argument("--bridge-max-turns", type=int, default=4)
+    parser.add_argument("--bridge-max-turns", type=int, default=16)
     parser.add_argument("--log-dir", default="/tmp/manyforge-assistant-e2e")
     parser.add_argument("--skip-direct-vllm", action="store_true")
     parser.add_argument("--skip-e2e", action="store_true")

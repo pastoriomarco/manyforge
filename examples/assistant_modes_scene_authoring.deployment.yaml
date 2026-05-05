@@ -1,19 +1,42 @@
 api_version: manyforge.deployment.v0
 schema_version: "0.1.0"
-name: ur5_roboplan_local_assistant_modes_scene_authoring
+name: ur10e_robotiq_assistant_modes_scene_authoring
 description: >-
-  Local deployment fixture for v0.1 assistant-mode catalog plumbing. It keeps
-  the deterministic scene-authoring provider enabled while declaring the
-  finite tools visible to query and composer-assistant requests.
+  Local deployment fixture for v0.1 assistant-mode catalog plumbing on the
+  UR10e + Robotiq 2F-140 preview stack. It keeps the deterministic
+  scene-authoring provider enabled while declaring the finite tools visible to
+  query and composer-assistant requests.
 
 program_profile: v0.1
 
 robot_config:
-  robot_id: ur5
+  robot_id: ur10e
   group_id: arm
-  urdf_path: package://roboplan_example_models/models/ur_robot_model/ur5_gripper.urdf
-  srdf_path: package://roboplan_example_models/models/ur_robot_model/ur5_gripper.srdf
+  urdf_path: package://manyforge_example_models/models/ur10e_robotiq_2f_140/ur10e_robotiq_2f_140.urdf
+  srdf_path: package://manyforge_example_models/models/ur10e_robotiq_2f_140/ur10e_robotiq_2f_140.srdf
+  package_paths:
+    - ..
   global_max_tcp_linear_speed_mps: 0.25
+
+grippers:
+  primary:
+    command_mode: simulated_joint
+    group_id: gripper
+    joint_name: finger_joint
+    open_position: 0.0
+    closed_position: 0.66
+    motion_time_s: 0.8
+    touch_links:
+      - left_inner_finger
+      - right_inner_finger
+      - left_inner_finger_pad
+      - right_inner_finger_pad
+    mount_frame: tool0
+    attach_frame: grasp_frame
+    tcp_frame: grasp_frame
+    auxiliary_frames:
+      - gripper_frame
+    description: Native simulated Robotiq 2F-140 finger actuation.
 
 adapters:
   planning:
@@ -59,6 +82,8 @@ adapters:
       - execution.pause
       - execution.resume
       - execution.reset
+      - tool.gripper.command
+      - tool.gripper.feedback
     config:
       mode: simulated
       execution_tick_hz: 100
@@ -117,6 +142,7 @@ assistant_modes:
       skills: []
       tools:
         - program.read
+        - scene.inspect
         - inspect_isaac_scene
       nodes: []
   composer-assistant:
@@ -132,6 +158,7 @@ assistant_modes:
         - catalog.read
         - skills.read
         - deployment.capabilities.read
+        - scene.inspect
         - inspect_isaac_scene
         - propose_scene_objects
         - propose_scene_object_nodes
@@ -144,13 +171,26 @@ assistant_modes:
         - tree.draft.delete_node
         - tree.draft.move_node
         - tree.draft.replace_subtree
+        - tree.draft.wrap_node
         - program.draft.upsert_parameters
         - program.draft.remove_parameters
         - blackboard.draft.upsert_namespaces
         - blackboard.draft.remove_namespaces
         - blackboard.draft.upsert_keys
         - blackboard.draft.remove_keys
-      nodes: []
+      nodes:
+        - attach_object_to_link
+        - detach_object_from_link
+        - add_collision_object
+        - remove_collision_object
+        - upsert_collision_object
+        - update_collision_object_pose
+        - sequence
+        - fallback
+        - parallel
+        - repeat
+        - retry
+        - inverter
 
 tool_catalog:
   - id: catalog.read
@@ -165,6 +205,13 @@ tool_catalog:
   - id: program.read
     effect: read_only
     description: Read the loaded Composer program/session state.
+    input_schema:
+      type: object
+      properties: {}
+      additionalProperties: false
+  - id: scene.inspect
+    effect: read_only
+    description: Read current backend scene state, including object poses and attachment status.
     input_schema:
       type: object
       properties: {}
@@ -240,78 +287,121 @@ tool_catalog:
       additionalProperties: false
   - id: scene.draft.add_object
     effect: composer_draft_mutating
-    description: Apply a validated scene-resource addition to the Composer draft.
+    description: |
+      [SCOPE: scene_resource | TIMING: compile-time]
+      Add a STATIC scene object to the program's scene resources. The added
+      object exists for the entire program run. Use this for permanent
+      collision objects (walls, fixtures, environment).
+
+      Do NOT use this to add an object DURING runtime execution at a specific
+      point in the cycle (e.g., 'at the end of the cycle, add X' or 're-add X
+      after each iteration'). For runtime scene mutation, insert an
+      `add_collision_object` BT node via `tree.draft.insert_node` instead.
+
+      Send objectId, shapeType, size/radius/diameter, and position directly;
+      legacy sceneResource wrappers are also accepted.
     input_schema:
       type: object
       required:
-        - sceneResource
+        - objectId
+      additionalProperties: true
       properties:
+        objectId:
+          type: string
+          minLength: 1
+        shapeType:
+          type: string
+          enum:
+            - box
+            - sphere
+          description: Convenience alias for shape.type.
+        shape_type:
+          type: string
+          enum:
+            - box
+            - sphere
+          description: Convenience alias for shape.type.
+        size:
+          type: array
+          items:
+            type: number
+          minItems: 3
+          maxItems: 3
+          description: Box dimensions [x, y, z] in meters.
+        dimensions:
+          type: array
+          items:
+            type: number
+          minItems: 3
+          maxItems: 3
+          description: Box dimensions [x, y, z] in meters.
+        radius:
+          type: number
+          description: Sphere radius in meters.
+        diameter:
+          type: number
+          description: Sphere diameter in meters; callback converts to radius.
+        position:
+          type: array
+          items:
+            type: number
+          minItems: 3
+          maxItems: 3
+          description: Object position [x, y, z] in the backend world frame.
+        frameId:
+          type: string
+          enum:
+            - universe
+            - world
+            - World
+            - /World
+          description: Common world-frame aliases accepted for detached Composer draft objects; the callback normalizes these to the active backend's canonical scene frame. Use attach_object_to_link or detach_object_from_link tree nodes for attachment semantics.
         sceneResource:
           type: object
-          required:
-            - objectId
-            - shape
-            - pose
-          properties:
-            objectId:
-              type: string
-              minLength: 1
-            shape:
-              type: object
-              required:
-                - type
-              properties:
-                type:
-                  type: string
-                  enum:
-                    - box
-                    - sphere
-                    - cylinder
-                    - mesh
-                box_dimensions_m:
-                  type: array
-                  items:
-                    type: number
-                  minItems: 3
-                  maxItems: 3
-              additionalProperties: true
-            pose:
-              type: object
-              required:
-                - frame_id
-                - position_m
-              properties:
-                frame_id:
-                  type: string
-                position_m:
-                  type: array
-                  items:
-                    type: number
-                  minItems: 3
-                  maxItems: 3
-                orientation_rpy_deg:
-                  type: array
-                  items:
-                    type: number
-                  minItems: 3
-                  maxItems: 3
-              additionalProperties: true
-          additionalProperties: false
+          description: Legacy wrapper form accepted for compatibility.
+          additionalProperties: true
         forceDiscardOverrides:
           type: boolean
-      additionalProperties: false
   - id: scene.draft.update_object
     effect: composer_draft_mutating
-    description: Apply a validated scene-resource replacement to the Composer draft.
+    description: |
+      [SCOPE: scene_resource | TIMING: compile-time]
+      Replace a STATIC scene object's shape/pose. For runtime mutation of
+      object pose during execution, use the `update_collision_object_pose` BT
+      node via `tree.draft.insert_node` instead.
   - id: scene.draft.upsert_objects
     effect: composer_draft_mutating
-    description: Insert or replace validated scene resources in the Composer draft.
+    description: |
+      [SCOPE: scene_resource | TIMING: compile-time]
+      Insert or replace STATIC scene objects. For runtime mutation, use the
+      `upsert_collision_object` BT node via `tree.draft.insert_node` instead.
   - id: scene.draft.remove_objects
     effect: composer_draft_mutating
-    description: Remove existing scene resources from the Composer draft.
+    description: |
+      [SCOPE: scene_resource | TIMING: compile-time]
+      Remove STATIC scene objects from the program's scene resources. The
+      objects no longer exist for any cycle iteration.
+
+      Do NOT use this to remove an object DURING runtime execution at a
+      specific point in the cycle (e.g., 'at the end of the cycle, remove X').
+      For runtime scene mutation, insert a `remove_collision_object` BT node
+      via `tree.draft.insert_node` instead.
   - id: tree.draft.insert_node
     effect: composer_draft_mutating
-    description: Insert a validated behavior-tree node into the Composer draft.
+    description: |
+      [SCOPE: behavior_tree | TIMING: runtime per cycle]
+      Insert a behavior-tree node into the program tree. Use this for any
+      action the robot/program should perform DURING execution at a specific
+      point in the cycle, including runtime scene mutations:
+      - `add_collision_object` to add an object during runtime
+      - `remove_collision_object` to remove an object during runtime
+      - `upsert_collision_object` to insert-or-replace an object during runtime
+      - `update_collision_object_pose` to move an object during runtime
+      - `attach_object_to_link` / `detach_object_from_link` for grasping
+      - control-flow: sequence, fallback, parallel, repeat, retry, inverter
+      Phrases like 'at the end of the cycle', 'after each iteration', 'when X
+      happens during execution' are clear signals to use this tool, not
+      scene.draft.*.
   - id: tree.draft.update_node_params
     effect: composer_draft_mutating
     description: Update parameters on an existing draft tree node.
@@ -324,6 +414,21 @@ tool_catalog:
   - id: tree.draft.replace_subtree
     effect: composer_draft_mutating
     description: Replace an existing draft tree subtree with a validated subtree.
+  - id: tree.draft.wrap_node
+    effect: composer_draft_mutating
+    description: |
+      Wrap an existing behavior-tree node with a new parent (decorator or
+      control-flow). The target becomes the wrapper's only child, preserving
+      the target's full subtree. Wrapping the root produces a new root. Pass
+      targetName="@root" to wrap the current root without needing to know its
+      name.
+
+      wrapper.id MUST be a literal node-catalog id like 'repeat', 'sequence',
+      'fallback', 'parallel', 'retry', 'inverter'. Do NOT invent variants like
+      'repeat_root' or 'repeat_node' — those will be rejected.
+
+      The wrapper MUST NOT include `children` — the handler inserts the
+      target's existing subtree as the wrapper's only child.
   - id: program.draft.upsert_parameters
     effect: composer_draft_mutating
     description: Insert or replace program parameter declarations in the Composer draft.

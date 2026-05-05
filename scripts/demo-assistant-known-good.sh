@@ -3,6 +3,8 @@
 #
 # Usage:
 #   ./scripts/demo-assistant-known-good.sh start
+#   ./scripts/demo-assistant-known-good.sh restart-bridge
+#   ./scripts/demo-assistant-known-good.sh reload-composer
 #   ./scripts/demo-assistant-known-good.sh smoke
 #   ./scripts/demo-assistant-known-good.sh preflight
 #   ./scripts/demo-assistant-known-good.sh status
@@ -19,6 +21,8 @@ NEMOCLAW_THOR="${NEMOCLAW_THOR:-/home/tndlux/workspaces/nemoclaw/src/NemoClaw-Th
 
 MODEL_PROFILE="${MODEL_PROFILE:-nemotron3-nano-omni-30b-a3b-nvfp4}"
 SAMPLING_PROFILE="${SAMPLING_PROFILE:-omni-instruct-no-think-32768}"
+DEMO_DEPLOYMENT_PATH="${DEMO_DEPLOYMENT_PATH:-/workspace/examples/assistant_modes_scene_authoring.deployment.yaml}"
+DEMO_PROGRAM_PATH="${DEMO_PROGRAM_PATH:-/workspace/examples/pick_and_place_ur10e_robotiq.program.yaml}"
 VLLM_CONTAINER="${VLLM_CONTAINER:-manyforge-e2e-vllm}"
 COMPOSER_CONTAINER="${COMPOSER_CONTAINER:-manyforge-e2e-composer}"
 LOG_DIR="${LOG_DIR:-/tmp/manyforge-assistant-e2e}"
@@ -29,23 +33,37 @@ COMPOSER_URL="${COMPOSER_URL:-http://127.0.0.1:9000}"
 BRIDGE_URL="${BRIDGE_URL:-http://127.0.0.1:8100}"
 UPSTREAM_BASE_URL="${UPSTREAM_BASE_URL:-http://127.0.0.1:8000/v1}"
 ASSISTANT_TIMEOUT_S="${ASSISTANT_TIMEOUT_S:-180}"
+ASSISTANT_MAX_TURNS="${ASSISTANT_MAX_TURNS:-16}"
 DROP_CACHES="${DROP_CACHES:-true}"
 PRESERVE_OPENSHELL="${PRESERVE_OPENSHELL:-true}"
+REBUILD_FRONTEND_ON_COMPOSER_RELOAD="${REBUILD_FRONTEND_ON_COMPOSER_RELOAD:-true}"
 
 usage() {
     cat <<EOF
-Usage: $0 {start|smoke|preflight|status|stop|restart}
+Usage: $0 {start|restart-bridge|reload-composer|restart-composer|smoke|preflight|status|stop|restart}
 
 Environment overrides:
   MODEL_PROFILE=${MODEL_PROFILE}
   SAMPLING_PROFILE=${SAMPLING_PROFILE}
+  DEMO_DEPLOYMENT_PATH=${DEMO_DEPLOYMENT_PATH}
+  DEMO_PROGRAM_PATH=${DEMO_PROGRAM_PATH}
   NEMOCLAW_THOR=${NEMOCLAW_THOR}
   DROP_CACHES=${DROP_CACHES}
+  ASSISTANT_TIMEOUT_S=${ASSISTANT_TIMEOUT_S}
+  ASSISTANT_MAX_TURNS=${ASSISTANT_MAX_TURNS}
   PRESERVE_OPENSHELL=${PRESERVE_OPENSHELL}
+  REBUILD_FRONTEND_ON_COMPOSER_RELOAD=${REBUILD_FRONTEND_ON_COMPOSER_RELOAD}
 
 By default, stop/restart preserves the OpenShell gateway because the gateway
 owns the live sandbox state. Set PRESERVE_OPENSHELL=false only when you
 intentionally want to delete and recreate that gateway.
+
+Use reload-composer after Composer/backend/frontend code changes. It rebuilds
+the frontend bundle, restarts only the Composer/HMI container, reloads the demo
+artifacts, and leaves vLLM, the assistant bridge, and OpenShell running.
+
+Use restart-bridge after bridge code or bridge-budget changes. It restarts only
+the assistant bridge and leaves Composer, vLLM, and OpenShell running.
 EOF
 }
 
@@ -114,6 +132,31 @@ EOF
         return 1
     fi
     echo "Preflight ok: no unmanaged listeners on ports 8000, 8080, 8081, 8100, or 9000."
+}
+
+preflight_composer_ports() {
+    local errors=0
+    local port lines
+    for port in 8081 9000; do
+        if ! port_is_listening "${port}"; then
+            continue
+        fi
+        if container_running "${COMPOSER_CONTAINER}"; then
+            continue
+        fi
+        echo "Unexpected listener on Composer port ${port}; refusing to start duplicate Composer services." >&2
+        lines="$(port_listeners "${port}")"
+        [[ -n "${lines}" ]] && echo "${lines}" >&2
+        errors=1
+    done
+    if (( errors != 0 )); then
+        cat >&2 <<EOF
+
+Stop the process that owns Composer/HMI ports 9000 or 8081, then retry:
+  ./scripts/demo-assistant-known-good.sh reload-composer
+EOF
+        return 1
+    fi
 }
 
 step() {
@@ -283,6 +326,25 @@ install_bridge_deps() {
     "${venv_python}" -m pip install -r "${MANYFORGE_ROOT}/manyforge_assistant_bridge/requirements.txt"
 }
 
+build_frontend_dist() {
+    if [[ "${REBUILD_FRONTEND_ON_COMPOSER_RELOAD}" != "true" ]]; then
+        echo "Skipping frontend rebuild because REBUILD_FRONTEND_ON_COMPOSER_RELOAD=false."
+        return
+    fi
+    step "Building Composer frontend bundle"
+    if command -v npm >/dev/null 2>&1; then
+        (cd "${MANYFORGE_ROOT}/manyforge_composer/frontend" && npm run build)
+        return
+    fi
+    echo "Host npm not found; building frontend inside manyforge-dev container."
+    docker run --rm \
+        -v "${MANYFORGE_ROOT}:/workspace" \
+        -v manyforge_build-cache:/tmp/manyforge-build \
+        -w /workspace/manyforge_composer/frontend \
+        manyforge-dev:latest \
+        npm run build
+}
+
 start_model() {
     step "Preparing vLLM model: ${MODEL_PROFILE}"
     if container_running "${VLLM_CONTAINER}"; then
@@ -350,6 +412,7 @@ start_composer() {
         echo "Reusing ${COMPOSER_CONTAINER}."
         return
     fi
+    preflight_composer_ports
     docker rm -f "${COMPOSER_CONTAINER}" >/dev/null 2>&1 || true
     docker run -d --rm \
         --name "${COMPOSER_CONTAINER}" \
@@ -363,9 +426,10 @@ start_composer() {
         manyforge-dev:latest \
         bash -lc "python -m manyforge_composer \
           --catalog-path /workspace/manyforge_behavior/resources/node_catalog.yaml \
-          --host 127.0.0.1 \
+          --host ${COMPOSER_BIND_HOST:-0.0.0.0} \
           --port 9000 \
           --hmi-port 8081 \
+          --mcp-http \
           --assistant-provider nemoclaw \
           --assistant-endpoint ${BRIDGE_URL}/v1/manyforge/assistant \
           --assistant-timeout-s ${ASSISTANT_TIMEOUT_S}" >/dev/null
@@ -401,7 +465,7 @@ start_bridge() {
           BRIDGE_MODEL="${MODEL_PROFILE}" \
           BRIDGE_REQUEST_TIMEOUT_S="${ASSISTANT_TIMEOUT_S}" \
           BRIDGE_MAX_WALL_TIME_S="${ASSISTANT_TIMEOUT_S}" \
-          BRIDGE_MAX_TURNS=4 \
+          BRIDGE_MAX_TURNS="${ASSISTANT_MAX_TURNS}" \
           BRIDGE_UPSTREAM_MAX_TOKENS=32768 \
           BRIDGE_UPSTREAM_ENABLE_THINKING=false \
           BRIDGE_UPSTREAM_TEMPERATURE=0.2 \
@@ -420,20 +484,45 @@ start_bridge() {
 
 load_demo_artifacts() {
     step "Loading known-good program and assistant deployment"
-    python3 - <<'PY' | curl -fsS -X POST "${COMPOSER_URL}/api/deployment/load" \
+    DEMO_DEPLOYMENT_PATH="${DEMO_DEPLOYMENT_PATH}" python3 - <<'PY' | curl -fsS -X POST "${COMPOSER_URL}/api/deployment/load" \
         -H "Content-Type: application/json" --data-binary @- >/dev/null
 import json
-print(json.dumps({"path": "/workspace/examples/assistant_modes_scene_authoring.deployment.yaml"}))
+import os
+print(json.dumps({"path": os.environ["DEMO_DEPLOYMENT_PATH"]}))
 PY
-    python3 - <<'PY' | curl -fsS -X POST "${COMPOSER_URL}/api/program/load" \
+    DEMO_DEPLOYMENT_PATH="${DEMO_DEPLOYMENT_PATH}" DEMO_PROGRAM_PATH="${DEMO_PROGRAM_PATH}" python3 - <<'PY' | curl -fsS -X POST "${COMPOSER_URL}/api/program/load" \
         -H "Content-Type: application/json" --data-binary @- >/dev/null
 import json
+import os
 print(json.dumps({
-    "path": "/workspace/examples/pick_and_place.program.yaml",
-    "deploymentPath": "/workspace/examples/assistant_modes_scene_authoring.deployment.yaml",
+    "path": os.environ["DEMO_PROGRAM_PATH"],
+    "deploymentPath": os.environ["DEMO_DEPLOYMENT_PATH"],
     "forceDiscardOverrides": True,
 }))
 PY
+}
+
+reload_composer() {
+    ensure_dirs
+    build_frontend_dist
+    step "Restarting Composer/HMI only"
+    docker rm -f "${COMPOSER_CONTAINER}" >/dev/null 2>&1 || true
+    start_composer
+    load_demo_artifacts
+    cat <<EOF
+
+Composer reloaded without restarting vLLM, the assistant bridge, or OpenShell.
+Composer UI: ${COMPOSER_URL}
+Viser HMI:    http://127.0.0.1:8081
+EOF
+}
+
+restart_bridge() {
+    ensure_dirs
+    step "Restarting ManyForge assistant bridge only"
+    stop_bridge
+    start_bridge
+    print_json_if_available "${BRIDGE_URL}/healthz"
 }
 
 start_all() {
@@ -452,6 +541,8 @@ Composer UI:  ${COMPOSER_URL}
 Viser HMI:     http://127.0.0.1:8081
 Bridge health: ${BRIDGE_URL}/healthz
 Model profile: ${MODEL_PROFILE}
+Program:       ${DEMO_PROGRAM_PATH}
+Deployment:    ${DEMO_DEPLOYMENT_PATH}
 
 Open Composer, click the assistant button in the lower-right corner, and use:
   Query: Is a program loaded? Read the current program and summarize it.
@@ -464,6 +555,8 @@ smoke() {
     local rc=0
     (cd "${MANYFORGE_ROOT}" && ./scripts/smoke-assistant-e2e.py \
         --profile "${SAMPLING_PROFILE}" \
+        --deployment-path "${DEMO_DEPLOYMENT_PATH}" \
+        --program-path "${DEMO_PROGRAM_PATH}" \
         --require-hmi \
         --strict \
         --output "${LOG_DIR}/known-good-assistant-demo.json") || rc=$?
@@ -515,6 +608,8 @@ stop_all() {
 
 case "${1:-}" in
     start) start_all ;;
+    restart-bridge) restart_bridge ;;
+    reload-composer|restart-composer) reload_composer ;;
     smoke) smoke ;;
     preflight) preflight ;;
     status) status ;;

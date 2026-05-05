@@ -236,6 +236,71 @@ TEST_F(NativeKernelTest, DetachObjectReparentsBackToUniverseWhilePreservingWorld
   EXPECT_NEAR(pose_after.position_m.z_m, pose_before.position_m.z_m, 1e-6);
 }
 
+// Regression for the index-cache-staleness bug: a sequence of upserts (each
+// of which is implemented as remove+add) used to corrupt the wrapper's name→
+// index map in roboplan's Scene because pinocchio shifts indices when a
+// non-LIFO geometry is removed. The next mutation (here, an attach) then
+// targeted the wrong geometry and parked an unrelated object at the wrong
+// pose, producing phantom collisions between the robot base/shoulder/ground
+// and the misplaced object. The wrapper now does LIFO replay on every
+// remove, which keeps roboplan's cache self-consistent.
+TEST_F(NativeKernelTest, UpsertCascadeFollowedByAttachDoesNotCorruptScene) {
+  // Build a 3-object scene that mirrors the production failure: a ground
+  // plane, a graspable, and a wall-shaped third object placed where the
+  // wrapper-rendered scene shows it sitting clear of the robot.
+  auto add_box = [&](const std::string& id, std::array<double, 3> dims,
+                     std::array<double, 3> pos) {
+    AddObjectRequestDTO r;
+    r.object_id = id;
+    r.frame_id = "universe";
+    r.shape = BoxShapeDTO{{dims[0], dims[1], dims[2]}};
+    r.pose.position_m = {pos[0], pos[1], pos[2]};
+    r.pose.orientation = {0.0, 0.0, 0.0, 1.0};
+    return bundle_->context->add_object(r);
+  };
+  auto remove_box = [&](const std::string& id) {
+    RemoveObjectRequestDTO r;
+    r.object_id = id;
+    return bundle_->context->remove_object(r);
+  };
+
+  ASSERT_TRUE(add_box("ground", {1.0, 1.0, 0.2}, {0.0, 0.0, -0.11}).success);
+  ASSERT_TRUE(add_box("graspable", {0.1, 0.01, 0.01}, {0.3, -0.3, 0.15}).success);
+  ASSERT_TRUE(add_box("box_1", {1.0, 0.02, 0.2}, {0.0, -0.2, 0.1}).success);
+
+  // Mimic the upsert pattern emitted by the composer at session start.
+  ASSERT_TRUE(remove_box("ground").success);
+  ASSERT_TRUE(add_box("ground", {1.0, 1.0, 0.2}, {0.0, 0.0, -0.11}).success);
+  ASSERT_TRUE(remove_box("graspable").success);
+  ASSERT_TRUE(add_box("graspable", {0.1, 0.01, 0.01}, {0.3, -0.3, 0.15}).success);
+  ASSERT_TRUE(remove_box("box_1").success);
+  ASSERT_TRUE(add_box("box_1", {1.0, 0.02, 0.2}, {0.0, -0.2, 0.1}).success);
+
+  // Attach graspable to tool0. With the bug, this used to write into box_1's
+  // slot in the geometry vector, parking box_1 near the robot base and
+  // producing phantom collisions on the next planning attempt.
+  AttachObjectRequestDTO ar;
+  ar.object_id = "graspable";
+  ar.frame_id = "tool0";
+  ASSERT_TRUE(bundle_->context->attach_object(ar).success);
+
+  // Box_1 must still report at universe (0, -0.2, 0.1) — not on the robot.
+  auto box_pose = bundle_->context->get_object_pose("box_1", "universe");
+  EXPECT_NEAR(box_pose.position_m.x_m,  0.0, 1e-6);
+  EXPECT_NEAR(box_pose.position_m.y_m, -0.2, 1e-6);
+  EXPECT_NEAR(box_pose.position_m.z_m,  0.1, 1e-6);
+
+  // And the start-state collision check must come back clean for the
+  // post-attach robot configuration.
+  auto state = bundle_->context->get_current_state();
+  CollisionCheckRequestDTO cc;
+  cc.robot_state = state;
+  auto cc_result = bundle_->context->collision_check(cc);
+  EXPECT_FALSE(cc_result.in_collision)
+      << "Phantom collision after upsert+attach indicates the index-cache "
+         "staleness regression has returned.";
+}
+
 // --- Full Execute Cycle ---
 
 TEST_F(NativeKernelTest, ExecuteJointGoalSucceeds) {

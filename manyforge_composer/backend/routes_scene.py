@@ -38,6 +38,23 @@ from .state import ComposerState
 logger = logging.getLogger(__name__)
 
 
+def canonical_scene_world_frame(state: ComposerState) -> str:
+    """Return the backend's canonical frame for authored world-scene objects."""
+    deployment = state.deployment
+    context_adapter = None
+    if deployment is not None:
+        context_adapter = deployment.adapters.get("context")
+    context_config = getattr(context_adapter, "config", {}) or {}
+    for key in ("scene_world_frame", "world_frame", "sceneRootFrame", "scene_root_frame"):
+        candidate = context_config.get(key)
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    adapter_id = str(getattr(context_adapter, "adapter_id", ""))
+    if "roboplan" in adapter_id:
+        return "universe"
+    return "universe"
+
+
 def _make_package_handler(package_dirs: list[str]):
     def handler(fname: str) -> str:
         if not fname.startswith("package://"):
@@ -102,7 +119,7 @@ def _load_model_frame_names(state: ComposerState) -> list[str]:
 
 
 def _scene_frame_roles(state: ComposerState) -> dict[str, set[str]]:
-    roles: dict[str, set[str]] = {"universe": {"world"}}
+    roles: dict[str, set[str]] = {canonical_scene_world_frame(state): {"world"}}
 
     def add_role(frame_name: str, role: str) -> None:
         name = str(frame_name).strip()
@@ -135,13 +152,14 @@ def build_scene_frames_payload(state: ComposerState) -> dict[str, Any]:
     hmi = getattr(state, "hmi_server", None)
     hmi_available = bool(hmi and hasattr(hmi, "get_frame_visibility"))
     kernel = state.kernel
+    world_frame = canonical_scene_world_frame(state)
 
     frames: list[SceneFrameResponse] = []
     for frame_name in sorted(frame_names):
-        pose_available = frame_name == "universe"
+        pose_available = frame_name == world_frame
         if not pose_available and kernel is not None:
             try:
-                pose_available = kernel.get_link_pose(frame_name, "universe") is not None
+                pose_available = kernel.get_link_pose(frame_name, world_frame) is not None
             except Exception:
                 pose_available = False
 

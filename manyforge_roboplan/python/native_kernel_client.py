@@ -444,6 +444,10 @@ class NativeKernelClient(KernelClient):
             state = self.get_object_state(request.object_id)
             if state.exists and state.attached:
                 return SceneEditResult(success=False, error="Cannot upsert attached object")
+            # Skip the no-op remove when the object doesn't exist yet.
+            # Each remove triggers an LIFO replay in the C++ context, so a
+            # redundant "Could not find object" round trip is pure noise in the
+            # scene trace and forces the planner to churn pairs unnecessarily.
             if state.exists:
                 remove_result = self.scene_edit(
                     SceneEditRequest(operation="remove", object_id=request.object_id)
