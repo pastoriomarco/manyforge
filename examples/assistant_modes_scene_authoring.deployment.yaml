@@ -155,6 +155,12 @@ assistant_modes:
     catalog:
       skills: []
       tools:
+        # A read-write mode must be a strict superset of the read-only
+        # tools in `query`, otherwise the assistant can edit the program
+        # tree but not read it — the model then loops trying to call
+        # program.read (the obvious tool name from training data) and
+        # times out the run. Keep this list aligned with `query.tools`.
+        - program.read
         - catalog.read
         - skills.read
         - deployment.capabilities.read

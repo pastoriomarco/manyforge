@@ -60,13 +60,13 @@ mux_proxy_is_running() {
 
 thor_runtime_summary_json() {
     local nemoclaw_thor="${NEMOCLAW_THOR:-$HOME/workspaces/nemoclaw/src/NemoClaw-Thor}"
-    if [[ ! -f "${nemoclaw_thor}/lib/config.sh" ]]; then
+    if [[ ! -f "${nemoclaw_thor}/serving/config.sh" ]]; then
         return 1
     fi
     # shellcheck source=/dev/null
-    source "${nemoclaw_thor}/lib/config.sh"
+    source "${nemoclaw_thor}/serving/config.sh"
     # shellcheck source=/dev/null
-    source "${nemoclaw_thor}/lib/sandbox-runtime.sh"
+    source "${nemoclaw_thor}/setup/sandbox-runtime.sh"
     load_thor_runtime_config ""
     local sandbox_name="${THOR_MANAGED_SANDBOX_NAME:-thor-v5}"
     sandbox_runtime_config_summary_json "${sandbox_name}" 2>/dev/null || true
@@ -74,11 +74,11 @@ thor_runtime_summary_json() {
 
 provider_base_url() {
     local nemoclaw_thor="${NEMOCLAW_THOR:-$HOME/workspaces/nemoclaw/src/NemoClaw-Thor}"
-    if [[ ! -f "${nemoclaw_thor}/lib/config.sh" ]]; then
+    if [[ ! -f "${nemoclaw_thor}/serving/config.sh" ]]; then
         return 1
     fi
     env -u THOR_LOCAL_VLLM_BASE_URL -u THOR_MANYFORGE_MUX_ENABLED bash -lc \
-        "source '${nemoclaw_thor}/lib/config.sh' && load_thor_runtime_config '' >/dev/null 2>&1 && printf '%s\n' \"\${THOR_LOCAL_VLLM_BASE_URL:-}\""
+        "source '${nemoclaw_thor}/serving/config.sh' && load_thor_runtime_config '' >/dev/null 2>&1 && printf '%s\n' \"\${THOR_LOCAL_VLLM_BASE_URL:-}\""
 }
 
 list_versioned_plugin_archives() {
@@ -168,12 +168,12 @@ cmd_up() {
     header ">>> [2/3] NemoClaw prerequisites"
 
     local nemoclaw_thor="${NEMOCLAW_THOR:-$HOME/workspaces/nemoclaw/src/NemoClaw-Thor}"
-    if [[ ! -f "${nemoclaw_thor}/lib/config.sh" ]]; then
+    if [[ ! -f "${nemoclaw_thor}/serving/config.sh" ]]; then
         fail "NemoClaw-Thor not found at ${nemoclaw_thor}"
         exit 1
     fi
 
-    source "${nemoclaw_thor}/lib/config.sh"
+    source "${nemoclaw_thor}/serving/config.sh"
     load_thor_runtime_config ""
     pass "Config loaded from $(thor_config_file)"
 

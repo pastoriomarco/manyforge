@@ -33,9 +33,9 @@ fi
 # --- 1. Verify Thor is healthy ---
 echo ">>> [1/4] Checking Thor system status..."
 MODEL_PROFILE="${THOR_MODEL_PROFILE:-qwen3.5-27b-claude-distilled-nvfp4}"
-if ! "$NEMOCLAW_THOR/status.sh" "$MODEL_PROFILE" 2>&1 | grep -q "All 19 checks passed"; then
+if ! "$NEMOCLAW_THOR/setup/status.sh" "$MODEL_PROFILE" 2>&1 | grep -q "All 19 checks passed"; then
     echo "    System not healthy. Run:"
-    echo "    cd $NEMOCLAW_THOR && ./configure-local-provider.sh $MODEL_PROFILE"
+    echo "    cd $NEMOCLAW_THOR && ./setup/configure-local-provider.sh $MODEL_PROFILE"
     exit 1
 fi
 echo "    OK — all 19 checks passed."

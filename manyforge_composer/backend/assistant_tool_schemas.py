@@ -130,6 +130,21 @@ _SCENE_DRAFT_SINGLE_OBJECT_SCHEMA: dict[str, Any] = {
         "accepts legacy sceneResource wrappers and common aliases such as "
         "shapeType, size, dimensions, radius, diameter, and position."
     ),
+    # 2026-05-06 v8.1 probe: a JSON-Schema `examples` array previously
+    # lived here with a worked payload using objectId "obstacle_01".
+    # The MCP wrapper's null-arg validator passes the examples through
+    # to the model on validation errors, AND the manifest exposes them
+    # via inputSchema.examples on tools/list. The Nemotron-3-Nano-Omni
+    # model in this regime (T=0.6, top_p=0.95, thinking off) takes the
+    # literal value too seriously: on the "Add a small obstacle…" task
+    # it called scene.draft.add_object 116 times in a single turn, all
+    # with objectId="obstacle_01". The bridge upserts on duplicate ID,
+    # every call returns ok, and the model has no signal it is done.
+    # Removing the examples lets the model invent its own objectId,
+    # which is what worked on the 2026-05-06 lane-parity probe (6
+    # turns / 12.7 s). The MCP wrapper null-arg validator is the
+    # load-bearing safety net; schema examples are net-negative for
+    # this model regime. Re-add only if the failure mode shifts.
     "properties": {
         "objectId": _SCENE_RESOURCE_SCHEMA["properties"]["objectId"],
         "shape": _SCENE_RESOURCE_SCHEMA["properties"]["shape"],
@@ -415,8 +430,18 @@ _TREE_DRAFT_WRAP_NODE_SCHEMA: dict[str, Any] = {
         "wrapper.id MUST be a literal node-catalog id like 'repeat', 'sequence', "
         "'fallback', 'parallel', 'retry', 'inverter'. Do NOT invent variants like "
         "'repeat_root' or 'repeat_node'. Use targetName='@root' to wrap the "
-        "current root without needing to know its name."
+        "current root without needing to know its name. "
+        "wrapper.name MUST be unique across the program tree — the bridge "
+        "rejects duplicate node-instance names with HTTP 400. If your call "
+        "fails with 'Duplicate node instance name: …', pick a different "
+        "wrapper.name (e.g. add a suffix) and retry; do not call again with "
+        "the same name."
     ),
+    # Examples removed 2026-05-06 — see _SCENE_DRAFT_SINGLE_OBJECT_SCHEMA
+    # comment for the full reason. tl;dr: model copies example payloads
+    # literally, leading to upsert loops. The MCP wrapper null-arg
+    # validator is the load-bearing safety net; schema examples are
+    # net-negative for this model regime.
     "properties": {
         "targetName": {
             "type": "string",

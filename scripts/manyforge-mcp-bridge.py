@@ -34,6 +34,21 @@ Configuration (env vars):
                                 default: 120
     MANYFORGE_CA_BUNDLE       — TLS CA bundle path.
                                 default: /etc/openshell-tls/ca-bundle.pem if present
+    MANYFORGE_ALLOWED_TOOLS   — optional comma-separated request-scoped tool ids.
+                                When set, tools/list exposes only those ids plus
+                                the helper ids below, intersected with the mode
+                                allowlist. tools/call is rejected outside the
+                                same filtered surface.
+    MANYFORGE_ALLOWED_TOOLS_FILE — optional file containing the same comma-
+                                separated list. Default:
+                                /tmp/manyforge-openclaw-allowed-tools.txt.
+                                This is used by the OpenClaw adapter because
+                                OpenClaw MCP server env is static in config.
+    MANYFORGE_HELPER_TOOLS    — comma-separated safe helper ids auto-exposed
+                                when MANYFORGE_ALLOWED_TOOLS is set.
+                                default: catalog.read,program.read,scene.inspect,
+                                         deployment.capabilities.read,skills.read,
+                                         status.read,program.validate
 
 Usage in openclaw.json mcpServers:
     {"mcpServers": {"manyforge": {"command": "python3",
@@ -59,6 +74,30 @@ COMPOSER_BASE = os.environ.get(
 ASSISTANT_MODE = os.environ.get("MANYFORGE_ASSISTANT_MODE", "composer-assistant")
 PRINCIPAL = os.environ.get("MANYFORGE_PRINCIPAL", "openclaw-sandbox")
 REQUEST_TIMEOUT = float(os.environ.get("MANYFORGE_REQUEST_TIMEOUT", "120"))
+_ALLOWED_TOOLS_FILE = os.environ.get(
+    "MANYFORGE_ALLOWED_TOOLS_FILE",
+    "/tmp/manyforge-openclaw-allowed-tools.txt",
+)
+_RAW_ALLOWED_TOOLS = os.environ.get("MANYFORGE_ALLOWED_TOOLS", "")
+if os.path.exists(_ALLOWED_TOOLS_FILE):
+    try:
+        _RAW_ALLOWED_TOOLS = open(_ALLOWED_TOOLS_FILE, encoding="utf-8").read()
+    except OSError:
+        pass
+REQUEST_ALLOWED_TOOLS = {
+    item
+    for item in (part.strip() for part in _RAW_ALLOWED_TOOLS.split(","))
+    if item
+}
+DEFAULT_HELPER_TOOLS = (
+    "catalog.read,program.read,scene.inspect,deployment.capabilities.read,"
+    "skills.read,status.read,program.validate"
+)
+REQUEST_HELPER_TOOLS = {
+    item
+    for item in (part.strip() for part in os.environ.get("MANYFORGE_HELPER_TOOLS", DEFAULT_HELPER_TOOLS).split(","))
+    if item
+}
 
 _CA_BUNDLE = os.environ.get("MANYFORGE_CA_BUNDLE", "/etc/openshell-tls/ca-bundle.pem")
 _SSL_CTX: ssl.SSLContext | None = None
@@ -142,6 +181,28 @@ def _mcp_tool_descriptor(tool: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _mode_tool_entries(manifest: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        tool
+        for tool in (manifest.get("tools") or [])
+        if isinstance(tool, dict) and isinstance(tool.get("id"), str) and tool.get("id")
+    ]
+
+
+def _visible_tool_entries(manifest: dict[str, Any]) -> list[dict[str, Any]]:
+    tools = _mode_tool_entries(manifest)
+    if not REQUEST_ALLOWED_TOOLS:
+        return tools
+
+    mode_ids = {str(tool["id"]) for tool in tools}
+    visible_ids = (REQUEST_ALLOWED_TOOLS | REQUEST_HELPER_TOOLS) & mode_ids
+    return [tool for tool in tools if str(tool.get("id")) in visible_ids]
+
+
+def _visible_tool_ids(manifest: dict[str, Any]) -> set[str]:
+    return {str(tool["id"]) for tool in _visible_tool_entries(manifest)}
+
+
 def _handle_initialize(message: dict[str, Any]) -> dict[str, Any]:
     return {
         "jsonrpc": "2.0",
@@ -153,6 +214,7 @@ def _handle_initialize(message: dict[str, Any]) -> dict[str, Any]:
                 "name": "manyforge-composer",
                 "version": "0.2.0",
                 "mode": ASSISTANT_MODE,
+                "requestScopedTools": sorted(REQUEST_ALLOWED_TOOLS),
             },
         },
     }
@@ -174,7 +236,7 @@ def _handle_tools_list(message: dict[str, Any]) -> dict[str, Any]:
                 "data": exc.payload,
             },
         }
-    tools = [_mcp_tool_descriptor(t) for t in manifest.get("tools") or []]
+    tools = [_mcp_tool_descriptor(t) for t in _visible_tool_entries(manifest)]
     return {
         "jsonrpc": "2.0",
         "id": message.get("id"),
@@ -185,7 +247,8 @@ def _handle_tools_list(message: dict[str, Any]) -> dict[str, Any]:
 def _handle_tools_call(message: dict[str, Any]) -> dict[str, Any]:
     params = message.get("params") or {}
     tool_id = params.get("name")
-    arguments = params.get("arguments") or {}
+    raw_arguments = params.get("arguments")
+    arguments = raw_arguments if isinstance(raw_arguments, dict) else {}
     if not isinstance(tool_id, str) or not tool_id:
         return {
             "jsonrpc": "2.0",
@@ -194,24 +257,63 @@ def _handle_tools_call(message: dict[str, Any]) -> dict[str, Any]:
         }
 
     manifest = _get_mode_manifest()
-    allowed_ids = {
-        t.get("id") for t in (manifest.get("tools") or []) if isinstance(t.get("id"), str)
-    }
+    allowed_ids = _visible_tool_ids(manifest)
     if tool_id not in allowed_ids:
         # Hard-stop client-side too. The bridge endpoint will reject it,
-        # but failing here gives the model a clearer, smaller error.
+        # but failing here gives the model a clearer, smaller error. When a
+        # request-scoped filter is active, this also keeps OpenClaw from
+        # wandering into unrelated mode tools.
         return {
             "jsonrpc": "2.0",
             "id": message.get("id"),
             "error": {
                 "code": -32601,
                 "message": (
-                    f"tool '{tool_id}' is not exposed by assistant mode "
-                    f"'{ASSISTANT_MODE}'"
+                    f"tool '{tool_id}' is not exposed by this request's "
+                    f"assistant tool window for mode '{ASSISTANT_MODE}'"
                 ),
                 "data": {"availableTools": sorted(allowed_ids)},
             },
         }
+
+    # 2026-05-06: pre-validate required parameters before forwarding to
+    # the bridge. Tracked down via OpenClaw transcript inspection: when
+    # the model emits `input: null` (or omits required keys) the previous
+    # behaviour was to coerce to {} and let the backend respond silently
+    # with an empty result, giving the model no error signal and causing
+    # multi-hundred-turn loops. Returning a structured isError:True
+    # result with the missing-fields list lets the model recover on the
+    # next turn the same way it does on the direct lane.
+    tool_entry = next((t for t in _visible_tool_entries(manifest) if str(t.get("id")) == tool_id), None)
+    schema = (tool_entry or {}).get("inputSchema") or {}
+    required_fields = schema.get("required") if isinstance(schema, dict) else None
+    if isinstance(required_fields, list) and required_fields:
+        missing = [k for k in required_fields if not (isinstance(arguments, dict) and k in arguments)]
+        if raw_arguments is None or missing:
+            schema_examples = schema.get("examples") if isinstance(schema, dict) else None
+            err_text = json.dumps(
+                {
+                    "success": False,
+                    "error": "missing_required_parameters",
+                    "tool": tool_id,
+                    "missing": missing or list(required_fields),
+                    "required": list(required_fields),
+                    "examples": schema_examples or [],
+                    "hint": (
+                        "Call this tool again with the missing parameters in the "
+                        "`arguments` object. Do not call it with no arguments."
+                    ),
+                },
+                sort_keys=False,
+            )
+            return {
+                "jsonrpc": "2.0",
+                "id": message.get("id"),
+                "result": {
+                    "content": [{"type": "text", "text": err_text}],
+                    "isError": True,
+                },
+            }
 
     catalog_hash = manifest.get("catalogHash")
     request_id = f"openclaw-{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"

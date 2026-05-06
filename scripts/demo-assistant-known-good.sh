@@ -30,13 +30,37 @@ BRIDGE_PID_FILE="${BRIDGE_PID_FILE:-${LOG_DIR}/known-good-bridge.pid}"
 BRIDGE_LOG="${BRIDGE_LOG:-${LOG_DIR}/known-good-bridge.log}"
 BRIDGE_AUDIT_LOG="${BRIDGE_AUDIT_LOG:-${LOG_DIR}/known-good-bridge-audit.jsonl}"
 COMPOSER_URL="${COMPOSER_URL:-http://127.0.0.1:9000}"
-BRIDGE_URL="${BRIDGE_URL:-http://127.0.0.1:8100}"
 UPSTREAM_BASE_URL="${UPSTREAM_BASE_URL:-http://127.0.0.1:8000/v1}"
-ASSISTANT_TIMEOUT_S="${ASSISTANT_TIMEOUT_S:-180}"
+# OpenClaw (sandboxed gateway) is the default assistant-provider lane:
+# openclaw_assistant_bridge on :8200, persistent OpenClaw gateway in the
+# my-assistant sandbox, mode-scoped MCP wrapper, full bounded-autonomy
+# audit chain. The direct-vLLM lane stays available as a backup (set
+# ASSISTANT_PROVIDER=nemoclaw) — useful for fast local iteration when
+# sandbox isolation is not needed.
+#
+# Default switch verified by the 2026-05-06 lane-parity probe (after
+# the trio of fixes — vLLM `T=0.6, top_p=0.95` + `enable_thinking=false`
+# server defaults, MCP wrapper validates required args, schemas ship
+# worked examples). All 5 tasks pass on both lanes within 1.3× of each
+# other; OpenClaw is *faster* on scene_inspect and scene_add. See
+# `manyforge/docs/LANE-COMPARISON-direct-vs-openclaw.md` §9 for the
+# full diagnosis and the before/after numbers.
+ASSISTANT_PROVIDER="${ASSISTANT_PROVIDER:-openclaw}"
+# Bridge URL is provider-derived: nemoclaw -> :8100 (manyforge_assistant_bridge
+# here), openclaw -> :8200 (openclaw_assistant_bridge in NemoClaw-Thor).
+case "${ASSISTANT_PROVIDER}" in
+    openclaw) BRIDGE_URL="${BRIDGE_URL:-http://127.0.0.1:8200}" ;;
+    nemoclaw|*) BRIDGE_URL="${BRIDGE_URL:-http://127.0.0.1:8100}" ;;
+esac
+# 300s composer timeout: the OpenClaw lane has legitimate runs in the
+# 100-200s range on multi-tool turns; 180s timed out one of the comparison
+# tests. Direct lane stays well under the limit; this is just headroom.
+ASSISTANT_TIMEOUT_S="${ASSISTANT_TIMEOUT_S:-300}"
 ASSISTANT_MAX_TURNS="${ASSISTANT_MAX_TURNS:-16}"
 DROP_CACHES="${DROP_CACHES:-true}"
 PRESERVE_OPENSHELL="${PRESERVE_OPENSHELL:-true}"
 REBUILD_FRONTEND_ON_COMPOSER_RELOAD="${REBUILD_FRONTEND_ON_COMPOSER_RELOAD:-true}"
+PROVISION_OPENCLAW_SANDBOX="${PROVISION_OPENCLAW_SANDBOX:-true}"
 
 usage() {
     cat <<EOF
@@ -49,10 +73,30 @@ Environment overrides:
   DEMO_PROGRAM_PATH=${DEMO_PROGRAM_PATH}
   NEMOCLAW_THOR=${NEMOCLAW_THOR}
   DROP_CACHES=${DROP_CACHES}
+  ASSISTANT_PROVIDER=${ASSISTANT_PROVIDER}        # 'openclaw' (default — sandboxed gateway) | 'nemoclaw' (direct vLLM, backup)
+  BRIDGE_URL=${BRIDGE_URL}                         # auto-derived from provider
   ASSISTANT_TIMEOUT_S=${ASSISTANT_TIMEOUT_S}
   ASSISTANT_MAX_TURNS=${ASSISTANT_MAX_TURNS}
   PRESERVE_OPENSHELL=${PRESERVE_OPENSHELL}
+  PROVISION_OPENCLAW_SANDBOX=${PROVISION_OPENCLAW_SANDBOX}   # apply manyforge-composer preset/skill/MCP at start
   REBUILD_FRONTEND_ON_COMPOSER_RELOAD=${REBUILD_FRONTEND_ON_COMPOSER_RELOAD}
+
+Provider lanes (both preserve the same bounded-autonomy contract on the
+ManyForge side — mode-scoped MCP wrapper + /api/assistant/bridge/tools/{toolId}
++ audit envelope):
+
+  openclaw  (default)    Persistent OpenClaw gateway in NemoClaw sandbox.
+                         Bridge: NemoClaw-Thor/manyforge/openclaw_assistant_bridge
+                         on :8200. Sandbox isolation + bounded-autonomy
+                         per-tool audit. Lane parity verified 2026-05-06:
+                         all tasks within 1.3x of direct lane (faster on
+                         some). 'start' provisions the sandbox automatically;
+                         set PROVISION_OPENCLAW_SANDBOX=false to skip.
+  nemoclaw  (backup)     Direct vLLM via in-tree manyforge_assistant_bridge on
+                         :8100. Sub-2s warm calls; the bridge runs the tool
+                         loop in-process. Useful when you want to iterate
+                         without the sandbox layer, or when OpenClaw gateway
+                         is offline.
 
 By default, stop/restart preserves the OpenShell gateway because the gateway
 owns the live sandbox state. Set PRESERVE_OPENSHELL=false only when you
@@ -101,7 +145,8 @@ expected_port_owner() {
         8000) container_running "${VLLM_CONTAINER}" ;;
         8080) container_running "openshell-cluster-nemoclaw" ;;
         8081) container_running "${COMPOSER_CONTAINER}" ;;
-        8100) bridge_pid_alive ;;
+        8100) bridge_pid_alive ;;        # nemoclaw provider lane (vLLM direct)
+        8200) bridge_pid_alive ;;        # openclaw provider lane (gateway HTTP)
         9000) container_running "${COMPOSER_CONTAINER}" ;;
         *) return 1 ;;
     esac
@@ -110,7 +155,7 @@ expected_port_owner() {
 preflight() {
     local errors=0
     local port lines
-    for port in 8000 8080 8081 8100 9000; do
+    for port in 8000 8080 8081 8100 8200 9000; do
         if ! port_is_listening "${port}"; then
             continue
         fi
@@ -366,7 +411,7 @@ start_model() {
             cd "${NEMOCLAW_THOR}"
             THOR_DETACH=1 \
             THOR_CONTAINER_NAME="${VLLM_CONTAINER}" \
-            ./start-model.sh "${MODEL_PROFILE}"
+            ./serving/start-model.sh "${MODEL_PROFILE}"
         )
     fi
     wait_json \
@@ -387,7 +432,7 @@ start_model() {
 configure_nemoclaw() {
     step "Configuring NemoClaw/OpenShell provider"
     local configure_log="${LOG_DIR}/configure-local-provider.log"
-    if (cd "${NEMOCLAW_THOR}" && ./configure-local-provider.sh "${MODEL_PROFILE}") \
+    if (cd "${NEMOCLAW_THOR}" && ./setup/configure-local-provider.sh "${MODEL_PROFILE}") \
         2>&1 | tee "${configure_log}"; then
         return
     fi
@@ -420,7 +465,7 @@ start_composer() {
         -v "${MANYFORGE_ROOT}:/workspace" \
         -v manyforge_build-cache:/tmp/manyforge-build \
         -w /workspace \
-        -e MANYFORGE_ASSISTANT_PROVIDER=nemoclaw \
+        -e MANYFORGE_ASSISTANT_PROVIDER="${ASSISTANT_PROVIDER}" \
         -e MANYFORGE_ASSISTANT_ENDPOINT_URL="${BRIDGE_URL}/v1/manyforge/assistant" \
         -e MANYFORGE_ASSISTANT_TIMEOUT_S="${ASSISTANT_TIMEOUT_S}" \
         manyforge-dev:latest \
@@ -430,7 +475,7 @@ start_composer() {
           --port 9000 \
           --hmi-port 8081 \
           --mcp-http \
-          --assistant-provider nemoclaw \
+          --assistant-provider ${ASSISTANT_PROVIDER} \
           --assistant-endpoint ${BRIDGE_URL}/v1/manyforge/assistant \
           --assistant-timeout-s ${ASSISTANT_TIMEOUT_S}" >/dev/null
     wait_json \
@@ -442,7 +487,14 @@ start_composer() {
 }
 
 start_bridge() {
-    step "Starting ManyForge assistant bridge"
+    case "${ASSISTANT_PROVIDER}" in
+        openclaw) start_bridge_openclaw ;;
+        nemoclaw|*) start_bridge_nemoclaw ;;
+    esac
+}
+
+start_bridge_nemoclaw() {
+    step "Starting ManyForge assistant bridge (nemoclaw / direct-vLLM lane)"
     if bridge_pid_alive; then
         echo "Reusing bridge from ${BRIDGE_PID_FILE}."
         return
@@ -466,10 +518,6 @@ start_bridge() {
           BRIDGE_REQUEST_TIMEOUT_S="${ASSISTANT_TIMEOUT_S}" \
           BRIDGE_MAX_WALL_TIME_S="${ASSISTANT_TIMEOUT_S}" \
           BRIDGE_MAX_TURNS="${ASSISTANT_MAX_TURNS}" \
-          BRIDGE_UPSTREAM_MAX_TOKENS=32768 \
-          BRIDGE_UPSTREAM_ENABLE_THINKING=false \
-          BRIDGE_UPSTREAM_TEMPERATURE=0.2 \
-          BRIDGE_UPSTREAM_TOP_K=1 \
           BRIDGE_AUDIT_LOG="${BRIDGE_AUDIT_LOG}" \
           setsid "${python}" -m manyforge_assistant_bridge.bridge \
           </dev/null >"${BRIDGE_LOG}" 2>&1 &
@@ -480,6 +528,62 @@ start_bridge() {
         60 \
         "Waiting for assistant bridge health on ${BRIDGE_URL}" \
         "Bridge log: ${BRIDGE_LOG}"
+}
+
+start_bridge_openclaw() {
+    step "Starting OpenClaw assistant bridge (openclaw / persistent-gateway lane)"
+    if bridge_pid_alive; then
+        echo "Reusing bridge from ${BRIDGE_PID_FILE}."
+        return
+    fi
+    if port_is_listening 8200; then
+        echo "Port 8200 is already in use by an unmanaged process; refusing to start another bridge." >&2
+        port_listeners 8200 >&2
+        return 1
+    fi
+    local launcher="${NEMOCLAW_THOR}/manyforge/start-openclaw-assistant-bridge.sh"
+    if [[ ! -x "${launcher}" ]]; then
+        echo "openclaw bridge launcher not found at: ${launcher}" >&2
+        echo "Set NEMOCLAW_THOR or fall back to ASSISTANT_PROVIDER=nemoclaw." >&2
+        return 1
+    fi
+    # The launcher already sets PYTHONPATH, ensures venv, and runs uvicorn.
+    # We pin USE_GATEWAY=true (the validated lane) and the slim agent profile.
+    (
+        cd "${NEMOCLAW_THOR}"
+        env \
+          OPENCLAW_ASSISTANT_USE_GATEWAY=true \
+          OPENCLAW_ASSISTANT_AGENT=manyforge-composer \
+          OPENCLAW_ASSISTANT_LOCAL=false \
+          OPENCLAW_ASSISTANT_TIMEOUT_S="${ASSISTANT_TIMEOUT_S}" \
+          OPENCLAW_ASSISTANT_BRIDGE_HOST=127.0.0.1 \
+          OPENCLAW_ASSISTANT_BRIDGE_PORT=8200 \
+          setsid "${launcher}" </dev/null >"${BRIDGE_LOG}" 2>&1 &
+        echo $! >"${BRIDGE_PID_FILE}"
+    )
+    wait_json \
+        "${BRIDGE_URL}/healthz" \
+        60 \
+        "Waiting for openclaw assistant bridge health on ${BRIDGE_URL}" \
+        "Bridge log: ${BRIDGE_LOG}"
+}
+
+provision_openclaw_sandbox() {
+    if [[ "${ASSISTANT_PROVIDER}" != "openclaw" ]]; then
+        return 0
+    fi
+    if [[ "${PROVISION_OPENCLAW_SANDBOX}" != "true" ]]; then
+        echo "PROVISION_OPENCLAW_SANDBOX=${PROVISION_OPENCLAW_SANDBOX}; skipping sandbox provisioning."
+        return 0
+    fi
+    step "Provisioning OpenClaw sandbox (manyforge-composer skill + egress preset + MCP server)"
+    local provisioner="${NEMOCLAW_THOR}/manyforge/setup-manyforge-assistant.sh"
+    if [[ ! -x "${provisioner}" ]]; then
+        echo "openclaw provisioner not found at: ${provisioner}" >&2
+        echo "Set NEMOCLAW_THOR, or set PROVISION_OPENCLAW_SANDBOX=false to skip." >&2
+        return 1
+    fi
+    "${provisioner}" "${OPENCLAW_ASSISTANT_SANDBOX:-my-assistant}"
 }
 
 load_demo_artifacts() {
@@ -530,6 +634,10 @@ start_all() {
     preflight
     start_model
     configure_nemoclaw
+    # Provision the OpenClaw sandbox (egress preset, skill bundle, MCP
+    # server registration) before composer comes up so the manyforge MCP
+    # wrapper sees the live mode manifest. No-op if provider=nemoclaw.
+    provision_openclaw_sandbox
     start_composer
     start_bridge
     load_demo_artifacts
@@ -540,6 +648,7 @@ Known-good assistant demo is ready.
 Composer UI:  ${COMPOSER_URL}
 Viser HMI:     http://127.0.0.1:8081
 Bridge health: ${BRIDGE_URL}/healthz
+Assistant provider: ${ASSISTANT_PROVIDER}
 Model profile: ${MODEL_PROFILE}
 Program:       ${DEMO_PROGRAM_PATH}
 Deployment:    ${DEMO_DEPLOYMENT_PATH}
@@ -589,7 +698,9 @@ stop_bridge() {
         fi
         rm -f "${BRIDGE_PID_FILE}"
     fi
+    # Reap whichever lane was running. Both names match unique processes.
     pkill -f '[m]anyforge_assistant_bridge.bridge' 2>/dev/null || true
+    pkill -f '[o]penclaw_assistant_bridge.service' 2>/dev/null || true
 }
 
 stop_all() {

@@ -325,6 +325,30 @@ def create_assistant_router(state: ComposerState) -> APIRouter:
             "timestampNs": time.monotonic_ns(),
         }
 
+    @router.put("/bridge/principal-binding/{principal}")
+    def bind_principal(principal: str, body: dict[str, Any]) -> dict[str, Any]:
+        """Bind a bridge `principal` to the in-flight chat assistant request.
+
+        Used by the OpenClaw bridge service so that tool calls coming
+        from the MCP bridge subprocess (which substitutes its own
+        bridge-process conversation id in the envelope) can still be
+        correlated back to the active chat for live tool-call streaming.
+        Single-tenant per sandbox: there is one chat per principal at a
+        time. Idempotent.
+        """
+        request_id = (body or {}).get("requestId") or (body or {}).get("request_id")
+        if not isinstance(request_id, str) or not request_id.strip():
+            raise HTTPException(status_code=400, detail="requestId is required")
+        state.bind_principal_to_request(
+            principal=principal, request_id=request_id.strip()
+        )
+        return {"principal": principal, "requestId": request_id.strip(), "bound": True}
+
+    @router.delete("/bridge/principal-binding/{principal}")
+    def unbind_principal(principal: str) -> dict[str, Any]:
+        state.unbind_principal(principal)
+        return {"principal": principal, "bound": False}
+
     @router.post(
         "/bridge/tools/{tool_id}",
         response_model=AssistantBridgeToolResponse,
@@ -386,6 +410,12 @@ def create_assistant_router(state: ComposerState) -> APIRouter:
                 ),
             )
 
+        # Live tool-call streaming: surface this call on the active
+        # assistant request as soon as it lands so the UI can render
+        # progress without waiting for the full agent loop to finish.
+        # We key on conversation_id from the envelope; there is at
+        # most one in-flight assistant request per conversation.
+        live_started_ns = time.monotonic_ns()
         try:
             result = await _execute_bridge_tool(
                 state,
@@ -398,11 +428,36 @@ def create_assistant_router(state: ComposerState) -> APIRouter:
             success = True
             error = None
         except HTTPException:
+            # Record the policy/validation rejection on the live feed
+            # before re-raising — the UI should show the failed call.
+            state.record_assistant_request_tool_call(
+                conversation_id=request.conversation_id or "",
+                principal=request.principal or "",
+                tool_id=tool_id,
+                status="failed",
+                args_summary=_summarize_for_live(request.arguments),
+                error="rejected by policy/validation",
+                started_at_ns=live_started_ns,
+            )
             raise
         except Exception as exc:
             result = {}
             success = False
             error = str(exc)
+
+        state.record_assistant_request_tool_call(
+            conversation_id=request.conversation_id or "",
+            principal=request.principal or "",
+            tool_id=tool_id,
+            status="completed" if success else "failed",
+            args_summary=_summarize_for_live(request.arguments),
+            result_summary=_summarize_for_live(result),
+            error=error,
+            draft_mutated=(
+                tool_definition.effect == COMPOSER_DRAFT_MUTATING_EFFECT and success
+            ),
+            started_at_ns=live_started_ns,
+        )
 
         return {
             "toolId": tool_id,
@@ -711,6 +766,40 @@ def _deployment_capabilities_payload(state: ComposerState) -> dict[str, Any]:
     }
 
 
+_LIVE_SUMMARY_MAX_CHARS = 240
+
+
+def _summarize_for_live(value: Any) -> str:
+    """Compact JSON summary suitable for the live-stream UI feed.
+
+    The summary is truncated and never includes raw tool result bodies
+    that may be large. The full audit log keeps the unredacted record;
+    this is for at-a-glance "what's happening now".
+    """
+    if value is None:
+        return ""
+    try:
+        rendered = json.dumps(value, separators=(",", ":"), default=str)
+    except Exception:
+        rendered = str(value)
+    if len(rendered) > _LIVE_SUMMARY_MAX_CHARS:
+        return rendered[: _LIVE_SUMMARY_MAX_CHARS - 1] + "…"
+    return rendered
+
+
+def _live_tool_call_payload(entry: Any) -> dict[str, Any]:
+    return {
+        "toolId": entry.tool_id,
+        "status": entry.status,
+        "startedAtNs": entry.started_at_ns,
+        "finishedAtNs": entry.finished_at_ns,
+        "argsSummary": entry.args_summary,
+        "resultSummary": entry.result_summary,
+        "error": entry.error,
+        "draftMutated": entry.draft_mutated,
+    }
+
+
 def _assistant_request_payload(record: Any) -> dict[str, Any]:
     return {
         "requestId": record.request_id,
@@ -723,6 +812,7 @@ def _assistant_request_payload(record: Any) -> dict[str, Any]:
         "warnings": list(record.warnings),
         "draftMutated": record.draft_mutated,
         "toolCallCount": record.tool_call_count,
+        "recentToolCalls": [_live_tool_call_payload(c) for c in record.tool_calls],
         "startedAtNs": record.started_at_ns,
         "updatedAtNs": record.updated_at_ns,
         "finishedAtNs": record.finished_at_ns,

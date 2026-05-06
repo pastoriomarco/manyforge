@@ -1209,6 +1209,24 @@ class AssistantChatResponse(BaseModel):
     error: Optional[AssistantErrorResponse] = None
 
 
+class LiveToolCallResponse(BaseModel):
+    """A live tool-call entry surfaced on an in-flight assistant request.
+
+    Populated by the bridge endpoint as each tool runs so the UI can
+    render activity in real time. The audit log keeps the authoritative
+    record; this is a UX feed.
+    """
+    model_config = _ALIAS_CFG
+    tool_id: str = Field(alias="toolId")
+    status: Literal["running", "completed", "failed"]
+    started_at_ns: int = Field(alias="startedAtNs")
+    finished_at_ns: Optional[int] = Field(default=None, alias="finishedAtNs")
+    args_summary: str = Field(default="", alias="argsSummary")
+    result_summary: str = Field(default="", alias="resultSummary")
+    error: Optional[str] = None
+    draft_mutated: bool = Field(default=False, alias="draftMutated")
+
+
 class AssistantRequestStatusResponse(BaseModel):
     model_config = _ALIAS_CFG
     request_id: str = Field(alias="requestId")
@@ -1221,6 +1239,9 @@ class AssistantRequestStatusResponse(BaseModel):
     warnings: List[str] = Field(default_factory=list)
     draft_mutated: bool = Field(default=False, alias="draftMutated")
     tool_call_count: int = Field(default=0, alias="toolCallCount")
+    recent_tool_calls: List[LiveToolCallResponse] = Field(
+        default_factory=list, alias="recentToolCalls"
+    )
     started_at_ns: int = Field(alias="startedAtNs")
     updated_at_ns: int = Field(alias="updatedAtNs")
     finished_at_ns: Optional[int] = Field(default=None, alias="finishedAtNs")
@@ -1256,6 +1277,12 @@ class AssistantBridgeToolRequest(BaseModel):
     conversation_id: Optional[str] = Field(default=None, alias="conversationId")
     assistant_mode: str = Field(alias="assistantMode", min_length=1)
     catalog_hash: str = Field(alias="catalogHash", min_length=1)
+    # Sent by the OpenClaw MCP wrapper (see manyforge-mcp-bridge.py
+    # `envelope = {... "principal": PRINCIPAL ...}`) so the live
+    # tool-call streaming layer in routes_assistant.py can correlate
+    # tool calls back to the in-flight chat. Optional: the in-process
+    # direct-lane bridge does not always set it.
+    principal: Optional[str] = None
     arguments: Dict[str, Any] = Field(default_factory=dict)
 
 

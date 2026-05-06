@@ -8,9 +8,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MANYFORGE_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 NEMOCLAW_THOR="${NEMOCLAW_THOR:-$HOME/workspaces/nemoclaw/src/NemoClaw-Thor}"
 
-source "${NEMOCLAW_THOR}/lib/checks.sh"
-source "${NEMOCLAW_THOR}/lib/config.sh"
-source "${NEMOCLAW_THOR}/lib/sandbox-runtime.sh"
+source "${NEMOCLAW_THOR}/setup/checks.sh"
+source "${NEMOCLAW_THOR}/serving/config.sh"
+source "${NEMOCLAW_THOR}/setup/sandbox-runtime.sh"
 
 MODE="${1:-all}"
 KEEP_FINAL_MODE="${KEEP_FINAL_MODE:-false}"
@@ -41,7 +41,7 @@ cleanup() {
     if [[ "${INITIAL_MUX_ENABLED}" == "true" ]]; then
         "${SCRIPT_DIR}/configure-manyforge-provider.sh" >/dev/null
     else
-        (cd "${NEMOCLAW_THOR}" && ./configure-local-provider.sh --without-manyforge-mux >/dev/null)
+        (cd "${NEMOCLAW_THOR}" && ./setup/configure-local-provider.sh --without-manyforge-mux >/dev/null)
     fi
 }
 trap cleanup EXIT
@@ -130,7 +130,7 @@ PY
 
 provider_base_url() {
     env -u THOR_LOCAL_VLLM_BASE_URL -u THOR_MANYFORGE_MUX_ENABLED bash -lc \
-        "source '${NEMOCLAW_THOR}/lib/config.sh' && load_thor_runtime_config '' >/dev/null 2>&1 && printf '%s\n' \"\${THOR_LOCAL_VLLM_BASE_URL:-}\""
+        "source '${NEMOCLAW_THOR}/serving/config.sh' && load_thor_runtime_config '' >/dev/null 2>&1 && printf '%s\n' \"\${THOR_LOCAL_VLLM_BASE_URL:-}\""
 }
 
 assert_sandbox_base_url() {
@@ -162,7 +162,7 @@ run_agent_json() {
 direct_smoke() {
     CURRENT_PHASE="direct"
     header "Direct Mode Smoke"
-    (cd "${NEMOCLAW_THOR}" && ./configure-local-provider.sh --without-manyforge-mux >/dev/null)
+    (cd "${NEMOCLAW_THOR}" && ./setup/configure-local-provider.sh --without-manyforge-mux >/dev/null)
     RESTORE_MODE="true"
     load_thor_runtime_config ""
 

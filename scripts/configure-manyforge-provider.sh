@@ -2,7 +2,7 @@
 # configure-manyforge-provider.sh — Wire ManyForge into a NemoClaw-Thor sandbox
 #
 # Prerequisites:
-#   - NemoClaw-Thor configured: ./configure-local-provider.sh already run
+#   - NemoClaw-Thor configured: ./setup/configure-local-provider.sh already run
 #   - ManyForge container running with Composer on port 9000 (--mcp-http)
 #
 # Usage:
@@ -40,15 +40,15 @@ MANYFORGE_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 NEMOCLAW_THOR="${NEMOCLAW_THOR:-$HOME/workspaces/nemoclaw/src/NemoClaw-Thor}"
 
-if [[ ! -f "${NEMOCLAW_THOR}/lib/checks.sh" ]]; then
+if [[ ! -f "${NEMOCLAW_THOR}/setup/checks.sh" ]]; then
     echo "ERROR: NemoClaw-Thor not found at ${NEMOCLAW_THOR}" >&2
     echo "Set NEMOCLAW_THOR to the NemoClaw-Thor directory." >&2
     exit 1
 fi
 
-source "${NEMOCLAW_THOR}/lib/checks.sh"
-source "${NEMOCLAW_THOR}/lib/config.sh"
-source "${NEMOCLAW_THOR}/lib/sandbox-runtime.sh"
+source "${NEMOCLAW_THOR}/setup/checks.sh"
+source "${NEMOCLAW_THOR}/serving/config.sh"
+source "${NEMOCLAW_THOR}/setup/sandbox-runtime.sh"
 source "${SCRIPT_DIR}/manyforge-direct-route-common.sh"
 
 push_tarball_to_sandbox() {
@@ -658,7 +658,7 @@ echo "  Tools:    ${host_tool_count}"
 echo "  Skills:   ${skill_count}"
 echo ""
 echo "  To restore direct vLLM mode only:"
-echo "    cd ${NEMOCLAW_THOR} && ./configure-local-provider.sh --without-manyforge-mux"
+echo "    cd ${NEMOCLAW_THOR} && ./setup/configure-local-provider.sh --without-manyforge-mux"
 echo ""
 echo "  To redeploy a pinned artifact without rebuilding:"
 echo "    ./scripts/configure-manyforge-provider.sh --artifact ${plugin_archive_path}"

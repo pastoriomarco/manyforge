@@ -636,9 +636,10 @@ def assistant_provider_catalog(configured_provider: AssistantProvider | None) ->
         {
             "id": "nemoclaw",
             "description": (
-                "External NemoClaw assistant provider. Calls a configured "
-                "HTTP endpoint and normalizes response proposals into Composer's "
-                "review/apply flow."
+                "Direct-vLLM assistant lane. The in-tree manyforge_assistant_bridge "
+                "runs the agent loop in-process against the configured vLLM "
+                "endpoint. Sub-2s warm latency; current known-good demo baseline "
+                "and fallback when the OpenClaw lane is unhealthy."
             ),
             "configured": configured_id == "nemoclaw",
             "requiresLiveModel": True,
@@ -647,8 +648,13 @@ def assistant_provider_catalog(configured_provider: AssistantProvider | None) ->
         {
             "id": "openclaw",
             "description": (
-                "External OpenClaw assistant provider using the same ManyForge "
-                "assistant HTTP contract as NemoClaw."
+                "Persistent-gateway assistant lane (demo default as of 2026-05-05). "
+                "The NemoClaw-Thor openclaw_assistant_bridge translates the "
+                "ManyForge assistant HTTP contract into /v1/chat/completions calls "
+                "against the OpenClaw gateway running in the NemoClaw sandbox. The "
+                "gateway runs the agent loop and the manyforge MCP server; "
+                "ManyForge still enforces every tool call via "
+                "/api/assistant/bridge/tools/{toolId}. Warm latency 5-15s."
             ),
             "configured": configured_id == "openclaw",
             "requiresLiveModel": True,

@@ -40,11 +40,35 @@ function createRequestId(): string {
   return `composer-ui-${Date.now()}-${suffix}`;
 }
 
-function modeLabel(modeId: string): string {
+// Friendly labels for known assistant modes. Pill toggle uses the short
+// form; the subtitle and the mode-card use the long form. Any modeId not
+// listed here falls back to title-cased (`error-recovery` →
+// `Error Recovery`) so adding a mode in the deployment manifest doesn't
+// require a UI change.
+const FRIENDLY_MODE_PILL: Record<string, string> = {
+  'query': 'Read',
+  'composer-assistant': 'Compose',
+  'error-recovery': 'Recover',
+};
+const FRIENDLY_MODE_LONG: Record<string, string> = {
+  'query': 'Read-only',
+  'composer-assistant': 'Read/Write',
+  'error-recovery': 'Recovery',
+};
+
+function titleCase(modeId: string): string {
   return modeId
     .split('-')
     .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
     .join(' ');
+}
+
+function modeLabel(modeId: string): string {
+  return FRIENDLY_MODE_PILL[modeId] ?? titleCase(modeId);
+}
+
+function modeLongLabel(modeId: string): string {
+  return FRIENDLY_MODE_LONG[modeId] ?? titleCase(modeId);
 }
 
 function modeEntryStatus(modeId: string, cycleState: string): { allowed: boolean; detail: string } {
@@ -100,6 +124,17 @@ function toolStatusClasses(status: AssistantToolCall['status']): string {
     return 'border-gray-700 bg-gray-900/70 text-gray-300';
   }
   return 'border-blue-700/70 bg-blue-950/40 text-blue-100';
+}
+
+function liveToolStatusClasses(status: 'running' | 'completed' | 'failed'): string {
+  if (status === 'completed') {
+    return 'border-emerald-700/70 bg-emerald-950/40 text-emerald-100';
+  }
+  if (status === 'failed') {
+    return 'border-red-700/70 bg-red-950/40 text-red-100';
+  }
+  // running — pulsing-blue look so operators see it's still in flight
+  return 'border-blue-600 bg-blue-950/60 text-blue-100 animate-pulse';
 }
 
 function assistantErrorTitle(error?: { code: string; detail: string } | null, fallback = ''): string {
@@ -498,8 +533,10 @@ export function AssistantOverlay() {
     if (selectedModeId && assistantModes[selectedModeId]?.enabled !== false) {
       return;
     }
-    const preferred = modeEntries.find(([modeId]) => modeId === 'query')
-      ?? modeEntries.find(([modeId]) => modeId === 'composer-assistant')
+    // Compose is the default — operators usually open the assistant
+    // to edit, not just to read. Read (query) is one click away.
+    const preferred = modeEntries.find(([modeId]) => modeId === 'composer-assistant')
+      ?? modeEntries.find(([modeId]) => modeId === 'query')
       ?? modeEntries[0];
     setSelectedModeId(preferred?.[0] ?? '');
   }, [assistantModes, modeEntries, selectedModeId]);
@@ -758,29 +795,60 @@ export function AssistantOverlay() {
                 </div>
                 <p className="truncate text-xs text-gray-500">
                   {assistantConfigured
-                    ? `${providerSummary} / ${selectedModeId || 'no mode'} / ${modeStatus.detail}`
+                    ? `${providerSummary} / ${modeStatus.detail}`
                     : providerCatalogReady
                       ? providerSummary
                       : 'Loading assistant provider'}
                 </p>
               </div>
 
-              <label className="flex w-52 max-w-full flex-col gap-1 text-xs text-gray-400">
-                Mode
-                <select
-                  value={selectedModeId}
-                  onChange={(event) => setSelectedModeId(event.target.value)}
-                  disabled={runState !== 'idle' || modeEntries.length === 0}
-                  className="rounded border border-gray-700 bg-gray-900 px-2 py-1 text-sm text-white disabled:cursor-not-allowed disabled:opacity-50"
-                >
-                  {modeEntries.length === 0 && <option value="">No modes</option>}
-                  {modeEntries.map(([modeId]) => (
-                    <option key={modeId} value={modeId}>
-                      {modeLabel(modeId)}
-                    </option>
-                  ))}
-                </select>
-              </label>
+              <div
+                role="radiogroup"
+                aria-label="Assistant mode"
+                className="flex max-w-full flex-col gap-1"
+              >
+                <span className="text-xs text-gray-400">
+                  Mode
+                  {selectedModeId && (
+                    <span className="text-gray-300">
+                      {': '}{modeLongLabel(selectedModeId)}
+                    </span>
+                  )}
+                </span>
+                {modeEntries.length === 0 ? (
+                  <span className="rounded border border-gray-800 bg-gray-900 px-3 py-1 text-xs text-gray-500">
+                    No modes
+                  </span>
+                ) : (
+                  <div className="inline-flex rounded border border-gray-700 bg-gray-900 p-0.5">
+                    {modeEntries.map(([modeId, modeDef]) => {
+                      const active = modeId === selectedModeId;
+                      const enabled = modeDef?.enabled !== false;
+                      const disabled = runState !== 'idle' || !enabled;
+                      return (
+                        <button
+                          key={modeId}
+                          type="button"
+                          role="radio"
+                          aria-checked={active}
+                          onClick={() => {
+                            if (!disabled) setSelectedModeId(modeId);
+                          }}
+                          disabled={disabled}
+                          title={modeDef?.description || modeLabel(modeId)}
+                          className={`rounded-sm px-3 py-1 text-xs font-medium transition-colors ${
+                            active
+                              ? 'bg-blue-600 text-white shadow-inner'
+                              : 'text-gray-300 hover:bg-gray-800 hover:text-white'
+                          } ${disabled ? 'cursor-not-allowed opacity-50 hover:bg-transparent' : ''}`}
+                        >
+                          {modeLabel(modeId)}
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
 
               <button
                 type="button"
@@ -941,7 +1009,7 @@ export function AssistantOverlay() {
                   </div>
                   <div className="rounded border border-gray-800 bg-gray-900/70 p-3">
                     <div className="text-sm font-medium text-gray-100">
-                      {selectedModeId ? modeLabel(selectedModeId) : 'No mode'}
+                      {selectedModeId ? modeLongLabel(selectedModeId) : 'No mode'}
                     </div>
                     <p className="mt-1 text-xs leading-relaxed text-gray-400">
                       {selectedMode?.description || 'No mode is available in this deployment.'}
@@ -956,6 +1024,52 @@ export function AssistantOverlay() {
                   <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-gray-500">
                     Tool Calls
                   </div>
+                  {/* Live tool calls from the in-flight assistant request.
+                      The /api/assistant/requests/{id} poll appends entries
+                      as the bridge endpoint executes each tool, so the
+                      operator sees activity while the run is still
+                      generating. Once the run completes the entries on
+                      transcript items take over. */}
+                  {runState !== 'idle' && (activeStatus?.recentToolCalls?.length ?? 0) > 0 && (
+                    <>
+                      {(activeStatus?.recentToolCalls ?? []).slice(-12).map((call, index) => (
+                        <details
+                          key={`live-${call.toolId}-${call.startedAtNs}-${index}`}
+                          className={`mb-2 rounded border px-2 py-2 text-xs ${liveToolStatusClasses(call.status)}`}
+                        >
+                          <summary className="flex cursor-pointer list-none items-center justify-between gap-2">
+                            <span className="truncate font-medium">{call.toolId}</span>
+                            <span className="shrink-0 text-[11px] uppercase">
+                              {call.status}{call.draftMutated ? ' • mutated' : ''}
+                            </span>
+                          </summary>
+                          {call.error && (
+                            <div className="mt-1 line-clamp-2 text-[11px] opacity-90">
+                              {call.error}
+                            </div>
+                          )}
+                          <div className="mt-2 space-y-2 border-t border-current/20 pt-2">
+                            {call.argsSummary && (
+                              <div>
+                                <div className="mb-1 text-[11px] uppercase opacity-70">Args</div>
+                                <pre className="max-h-32 overflow-auto whitespace-pre-wrap rounded bg-black/30 p-2 text-[11px] leading-relaxed">
+                                  {call.argsSummary}
+                                </pre>
+                              </div>
+                            )}
+                            {call.resultSummary && (
+                              <div>
+                                <div className="mb-1 text-[11px] uppercase opacity-70">Result</div>
+                                <pre className="max-h-32 overflow-auto whitespace-pre-wrap rounded bg-black/30 p-2 text-[11px] leading-relaxed">
+                                  {call.resultSummary}
+                                </pre>
+                              </div>
+                            )}
+                          </div>
+                        </details>
+                      ))}
+                    </>
+                  )}
                   {transcript
                     .filter((item): item is Extract<TranscriptItem, { kind: 'assistant' }> =>
                       item.kind === 'assistant' && !!item.response,
@@ -997,11 +1111,13 @@ export function AssistantOverlay() {
                     ))}
                   {transcript.every((item) =>
                     item.kind !== 'assistant' || !(item.response?.toolCalls.length),
-                  ) && (
-                    <div className="rounded border border-gray-800 bg-gray-900/60 p-3 text-xs text-gray-500">
-                      No tool calls yet.
-                    </div>
-                  )}
+                  )
+                    && (activeStatus?.recentToolCalls?.length ?? 0) === 0
+                    && (
+                      <div className="rounded border border-gray-800 bg-gray-900/60 p-3 text-xs text-gray-500">
+                        No tool calls yet.
+                      </div>
+                    )}
                 </section>
               </aside>
             </div>

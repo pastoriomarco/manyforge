@@ -76,7 +76,7 @@ cd /home/tndlux/workspaces/nemoclaw/src/NemoClaw-Thor
 
 THOR_DETACH=1 \
 THOR_CONTAINER_NAME=manyforge-e2e-vllm \
-./start-model.sh nemotron3-nano-omni-30b-a3b-nvfp4
+./serving/start-model.sh nemotron3-nano-omni-30b-a3b-nvfp4
 ```
 
 For Qwen3.6 or Cosmos comparison runs, replace the profile with:
@@ -101,8 +101,8 @@ route, sandbox runtime config, and warmup should still be updated.
 ```bash
 cd /home/tndlux/workspaces/nemoclaw/src/NemoClaw-Thor
 
-./configure-local-provider.sh nemotron3-nano-omni-30b-a3b-nvfp4
-./status.sh
+./setup/configure-local-provider.sh nemotron3-nano-omni-30b-a3b-nvfp4
+./setup/status.sh
 ```
 
 ### 4. Start Composer With The Live Assistant Provider And HMI
@@ -124,7 +124,7 @@ docker run -d --rm \
   -w /workspace \
   -e MANYFORGE_ASSISTANT_PROVIDER=nemoclaw \
   -e MANYFORGE_ASSISTANT_ENDPOINT_URL=http://127.0.0.1:8100/v1/manyforge/assistant \
-  -e MANYFORGE_ASSISTANT_TIMEOUT_S=180 \
+  -e MANYFORGE_ASSISTANT_TIMEOUT_S=300 \
   manyforge-dev:latest \
   bash -lc 'python -m manyforge_composer \
     --catalog-path /workspace/manyforge_behavior/resources/node_catalog.yaml \
@@ -133,7 +133,7 @@ docker run -d --rm \
     --hmi-port 8081 \
     --assistant-provider nemoclaw \
     --assistant-endpoint http://127.0.0.1:8100/v1/manyforge/assistant \
-    --assistant-timeout-s 180'
+    --assistant-timeout-s 300'
 ```
 
 Verify:
@@ -199,11 +199,29 @@ defaults to the NVIDIA Nemotron 3 Nano Omni profile because it is the current
 preferred single-model candidate for agentic workflows and leaves room for
 future text, vision, and audio input through one endpoint.
 
+The launcher has two assistant-provider lanes; **direct vLLM (`nemoclaw`) is
+the default** as of 2026-05-06:
+
+| Lane | Default? | Bridge | Latency (p50/test) | Notes |
+|---|---|---|---|---|
+| `nemoclaw` | ✅ default | in-tree `manyforge_assistant_bridge` on `:8100` | ~22 s/test | Direct vLLM. Bridge runs the tool loop in-process. Best for local development and demos. |
+| `openclaw` | sandboxed | NemoClaw-Thor `openclaw_assistant_bridge` on `:8200` | ~80 s/test | Persistent gateway in NemoClaw `my-assistant` sandbox. Adds bounded-autonomy enforcement (per-tool audit with assistantMode + catalogHash + principal). 3.6× direct latency at p50. Use for shared/multi-tenant deployments. Provisions the OpenClaw sandbox automatically (egress preset, skill, MCP server). |
+
+Both lanes preserve the same bounded-autonomy contract on the ManyForge side
+(mode-scoped MCP wrapper + `/api/assistant/bridge/tools/{toolId}` + audit envelope).
+Default switch justified by the 2026-05-06 comparison matrix — both paths
+solve 14/15 of the same task set, but direct is consistently faster. See
+`COMPARISON-2026-05-06-direct-vs-openclaw.md` in NemoClaw-Thor.
+
 ```bash
 cd /home/tndlux/workspaces/dev_ws/src/manyforge
 
+# default: direct vLLM lane
 ./scripts/demo-assistant-known-good.sh preflight
 ./scripts/demo-assistant-known-good.sh start
+
+# explicit opt-in to the OpenClaw sandboxed lane:
+ASSISTANT_PROVIDER=openclaw ./scripts/demo-assistant-known-good.sh start
 ```
 
 The known-good launcher defaults to `ASSISTANT_MAX_TURNS=16`. This is a bridge
@@ -216,24 +234,78 @@ invalid callback arguments. Override it when testing:
 ASSISTANT_MAX_TURNS=8 ./scripts/demo-assistant-known-good.sh start
 ```
 
-What it does:
+What it does (default — `nemoclaw` direct-vLLM lane):
 
 1. stops stale `manyforge-e2e-vllm` state if needed and runs the Thor memory
    protocol before model launch,
 2. starts `nemotron3-nano-omni-30b-a3b-nvfp4` through NemoClaw-Thor
-   `start-model.sh`,
-3. runs `configure-local-provider.sh` for the same profile,
-4. starts Composer on `http://127.0.0.1:9000` with HMI/Viser on
-   `http://127.0.0.1:8081`,
-5. starts the ManyForge assistant bridge on `http://127.0.0.1:8100`,
-6. loads `pick_and_place_ur10e_robotiq.program.yaml` with
+   `serving/start-model.sh`,
+3. starts Composer on `http://127.0.0.1:9000` with HMI/Viser on
+   `http://127.0.0.1:8081`, configured to use the `nemoclaw` provider at
+   `http://127.0.0.1:8100/v1/manyforge/assistant`,
+4. starts the in-tree `manyforge_assistant_bridge` on `http://127.0.0.1:8100`.
+   The bridge translates Composer's `manyforge.assistant.provider_request.v0`
+   envelope into `/v1/chat/completions` calls against vLLM directly and
+   drives the tool loop in-process,
+5. loads `pick_and_place_ur10e_robotiq.program.yaml` with
    `assistant_modes_scene_authoring.deployment.yaml`.
 
-The preflight refuses to start if ports `8000`, `8080`, `8081`, `8100`, or
-`9000` are already owned by unmanaged processes. This prevents accidental
-duplicate Composer, HMI, bridge, OpenShell, or vLLM instances. It reuses only
-the known demo-owned containers/PID file and otherwise asks you to stop the
-conflicting service explicitly.
+What changes for the OpenClaw lane (`ASSISTANT_PROVIDER=openclaw`):
+
+1. stops stale `manyforge-e2e-vllm` state if needed and runs the Thor memory
+   protocol before model launch,
+2. starts `nemotron3-nano-omni-30b-a3b-nvfp4` through NemoClaw-Thor
+   `serving/start-model.sh`,
+3. runs `setup/configure-local-provider.sh` for the same profile (which also
+   spawns the OpenClaw gateway in its SSH-session network namespace),
+4. **provisions the OpenClaw sandbox** by running
+   `manyforge/setup-manyforge-assistant.sh` — applies the
+   `manyforge-composer` egress preset (with `allowed_ips` covering the
+   Docker-bridge subnet so the SSRF guard accepts vLLM resolution),
+   removes the built-in `local-inference` preset (superseded by ours),
+   stages the `manyforge-composer` skill, and registers the `manyforge`
+   MCP server in the sandbox via `openclaw mcp set`. Skip with
+   `PROVISION_OPENCLAW_SANDBOX=false` if the sandbox is already provisioned,
+5. starts Composer on `http://127.0.0.1:9000` with HMI/Viser on
+   `http://127.0.0.1:8081`, configured to use the `openclaw` provider at
+   `http://127.0.0.1:8200/v1/manyforge/assistant`,
+6. starts the OpenClaw assistant bridge (`openclaw_assistant_bridge`) on
+   `http://127.0.0.1:8200`. The bridge translates Composer's
+   `manyforge.assistant.provider_request.v0` envelope into
+   `/v1/chat/completions` calls against the persistent gateway,
+7. loads `pick_and_place_ur10e_robotiq.program.yaml` with
+   `assistant_modes_scene_authoring.deployment.yaml`.
+
+(For the inverse — switching from the default direct lane to the OpenClaw
+lane — the launcher takes care of all the differences automatically when you
+set `ASSISTANT_PROVIDER=openclaw`.)
+
+The preflight refuses to start if ports `8000`, `8080`, `8081`, `8100`,
+`8200`, or `9000` are already owned by unmanaged processes. This prevents
+accidental duplicate Composer, HMI, bridge (either lane), OpenShell, or vLLM
+instances. It reuses only the known demo-owned containers/PID file and
+otherwise asks you to stop the conflicting service explicitly.
+
+### One-time prerequisites for the OpenClaw lane
+
+You only need to do these once per machine (or after a NemoClaw upgrade):
+
+1. **Onboard the `my-assistant` sandbox** via `nemoclaw onboard`. Pick
+   "Other OpenAI-compatible endpoint" → `http://127.0.0.1:8000/v1` →
+   served-model-name matching your profile slug; sandbox name
+   `my-assistant`; policy preset `local-inference` (`setup-manyforge-assistant.sh`
+   replaces it later with our combined `manyforge-composer` preset).
+   Detailed walk-through:
+   [`nemoclaw/src/NemoClaw-Thor/setup/NEMOCLAW-OPENCLAW-WORKFLOW.md`](../../../../../nemoclaw/src/NemoClaw-Thor/setup/NEMOCLAW-OPENCLAW-WORKFLOW.md).
+2. **Verify `nemoclaw`, `openshell`, `docker`, `kubectl` are on PATH.**
+   `manyforge/setup-manyforge-assistant.sh` checks `nemoclaw` and `docker`
+   explicitly; `kubectl` is invoked through `docker exec` against the
+   OpenShell cluster container.
+
+After that, every demo cycle is a single
+`./scripts/demo-assistant-known-good.sh start`. The integration design
+and all decisions made in landing it live at
+[`nemoclaw/src/NemoClaw-Thor/manyforge/docs/MANYFORGE-MCP-INTEGRATION.md`](../../../../../nemoclaw/src/NemoClaw-Thor/manyforge/docs/MANYFORGE-MCP-INTEGRATION.md).
 
 During startup the launcher waits on real readiness endpoints without showing a
 fake percentage or timeout-budget countdown. In an interactive terminal it
@@ -399,6 +471,51 @@ Available runner profiles:
 
 ## E2E Recipes
 
+### Composer chat HTTP contract — required fields
+
+Composer's chat endpoint (`POST /api/assistant/chat`) silently falls back
+to **mock mode** if the request body omits the right fields. Operators
+testing the live provider end-to-end must pass *both* of:
+
+```json
+{
+  "message": "<your prompt>",
+  "mode": "provider",
+  "assistantMode": "composer-assistant"
+}
+```
+
+Why each field matters:
+
+- `mode` selects the dispatch lane. Valid values are `"mock"` and
+  `"provider"`. Omitting it (or sending `"mock"`) hits the built-in
+  scaffold provider that returns a canned warning and never invokes
+  the configured external provider, regardless of
+  `configuredProviderId`. The chat response carries
+  `providerId: "mock"` in that case — a fast tell.
+- `assistantMode` selects the deployment-defined bounded-autonomy mode
+  (`composer-assistant`, `query`, etc.). Without it, the request is
+  rejected at the contract layer because the deployment exposes
+  multiple modes.
+
+Quick check that a chat request actually reached the configured provider:
+
+```bash
+curl -sS -X POST http://127.0.0.1:9000/api/assistant/chat \
+  -H 'Content-Type: application/json' \
+  -d '{"message":"reply with just OK","mode":"provider","assistantMode":"composer-assistant"}'
+```
+
+Then poll status:
+
+```bash
+curl -sS http://127.0.0.1:9000/api/assistant/requests/<requestId> | jq .providerId
+```
+
+A correct setup returns the configured provider id (e.g.
+`"openclaw"`). `"mock"` means the request was missing one of the two
+fields above.
+
 ### Read-Only Query
 
 Goal: the assistant reads current Composer state without mutating the draft.
@@ -543,8 +660,8 @@ Goal: compare candidate models under the same ManyForge workflow.
 For each profile:
 
 1. Stop vLLM and drop caches with the memory protocol.
-2. Start the model with NemoClaw-Thor `./start-model.sh <profile>`.
-3. Run `./configure-local-provider.sh <profile>`.
+2. Start the model with NemoClaw-Thor `./serving/start-model.sh <profile>`.
+3. Run `./setup/configure-local-provider.sh <profile>`.
 4. Run the primary qualification command above.
 5. Record direct tool-call, query, draft-edit, golden-scene, and repair-turn
    behavior.

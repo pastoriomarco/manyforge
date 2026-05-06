@@ -7,9 +7,11 @@ from contextlib import asynccontextmanager
 import asyncio
 from pathlib import Path
 
-from fastapi import FastAPI, Request, Response, WebSocket
+from fastapi import FastAPI, HTTPException, Request, Response, WebSocket
+from fastapi.exception_handlers import http_exception_handler
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from .security import (
     BearerAuthMiddleware,
@@ -72,11 +74,26 @@ def create_app(
         allow_headers=["Authorization", "Content-Type"],
     )
 
-    # Request logging middleware
+    # Request logging middleware.
+    #
+    # Starlette gotcha: `@app.middleware("http")` is `BaseHTTPMiddleware`,
+    # which interrupts the normal exception chain. Without the explicit
+    # HTTPException catch below, an `HTTPException(400, detail="...")`
+    # raised by a route handler escapes this middleware to
+    # ServerErrorMiddleware, which renders it as a flat HTTP 500
+    # "Internal Server Error" with no detail (verified 2026-05-06 against
+    # /api/assistant/bridge/tools/tree.draft.wrap_node returning duplicate-
+    # node errors as 500 → the LLM-side agent loops forever because the
+    # error has no actionable info). Catching HTTPException here and
+    # delegating to FastAPI's built-in handler renders the correct
+    # status + JSON body so callers (and LLM agents) see the real reason.
     @app.middleware("http")
     async def log_requests(request: Request, call_next) -> Response:
         start = time.monotonic()
-        response: Response = await call_next(request)
+        try:
+            response: Response = await call_next(request)
+        except (HTTPException, StarletteHTTPException) as exc:
+            response = await http_exception_handler(request, exc)
         duration_ms = (time.monotonic() - start) * 1000
         logger.info(
             "%s %s %d %.1fms",

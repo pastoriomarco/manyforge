@@ -339,6 +339,17 @@ export interface AssistantProviderCatalog {
   configuredProviderId?: string | null;
 }
 
+export interface LiveToolCall {
+  toolId: string;
+  status: 'running' | 'completed' | 'failed';
+  startedAtNs: number;
+  finishedAtNs?: number | null;
+  argsSummary: string;
+  resultSummary: string;
+  error?: string | null;
+  draftMutated: boolean;
+}
+
 export interface AssistantRequestStatus {
   requestId: string;
   conversationId: string;
@@ -350,6 +361,7 @@ export interface AssistantRequestStatus {
   warnings: string[];
   draftMutated: boolean;
   toolCallCount: number;
+  recentToolCalls?: LiveToolCall[];
   startedAtNs: number;
   updatedAtNs: number;
   finishedAtNs?: number | null;

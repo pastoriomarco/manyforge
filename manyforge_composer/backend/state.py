@@ -85,6 +85,26 @@ class AssistantProposalRecord:
 
 
 @dataclass
+class LiveToolCallEntry:
+    """A single tool call observed during an in-flight assistant request.
+
+    Populated as the bridge endpoint executes each tool, so the UI can
+    render tool calls in real time instead of waiting for the run to
+    complete. The audit log keeps the authoritative record; this is
+    the operator-facing view of "what's the assistant doing right now".
+    """
+
+    tool_id: str
+    status: str           # "running" | "completed" | "failed"
+    started_at_ns: int
+    finished_at_ns: Optional[int] = None
+    args_summary: str = ""        # truncated JSON, never raw secrets
+    result_summary: str = ""      # truncated JSON, never raw secrets
+    error: Optional[str] = None
+    draft_mutated: bool = False
+
+
+@dataclass
 class AssistantRequestRecord:
     request_id: str
     conversation_id: str
@@ -96,6 +116,7 @@ class AssistantRequestRecord:
     warnings: list[str] = field(default_factory=list)
     draft_mutated: bool = False
     tool_call_count: int = 0
+    tool_calls: list[LiveToolCallEntry] = field(default_factory=list)
     started_at_ns: int = field(default_factory=time.monotonic_ns)
     updated_at_ns: int = field(default_factory=time.monotonic_ns)
     finished_at_ns: Optional[int] = None
@@ -141,6 +162,14 @@ class ComposerState:
         self._assistant_proposals: dict[str, AssistantProposalRecord] = {}
         self._assistant_request_lock = threading.Lock()
         self._assistant_requests: dict[str, AssistantRequestRecord] = {}
+        # Maps an OpenClaw bridge `principal` to the chat request it is
+        # currently servicing. The bridge service registers this just
+        # before forwarding a chat to OpenClaw so the MCP bridge
+        # subprocess (which carries its own bridge-process conversation
+        # id, not the chat's) can still be correlated back to the
+        # active chat for live tool-call streaming. Single-tenant per
+        # sandbox so this is one-entry-per-principal.
+        self._assistant_principal_bindings: dict[str, str] = {}
         self.skill_catalog: SkillCatalog = load_skill_catalog(
             default_skills_dir(),
             catalog=self.catalog,
@@ -194,6 +223,106 @@ class ComposerState:
             record.updated_at_ns = now_ns
             record.finished_at_ns = now_ns
             return record
+
+    def bind_principal_to_request(
+        self,
+        *,
+        principal: str,
+        request_id: str,
+    ) -> None:
+        """Tell Composer that bridge tool calls bearing this principal
+        belong to this in-flight chat assistant request.
+
+        Used by the OpenClaw bridge service: the MCP bridge subprocess
+        substitutes its own bridge-process conversation id in tool-call
+        envelopes, so we can't correlate by conversationId alone. The
+        bridge service knows both the chat and the principal, so it
+        registers the binding here and the bridge endpoint can resolve
+        principal → request when the conversationId doesn't match.
+        Single-tenant per sandbox: one binding per principal.
+        """
+        principal = (principal or "").strip()
+        if not principal:
+            return
+        with self._assistant_request_lock:
+            self._assistant_principal_bindings[principal] = request_id
+
+    def unbind_principal(self, principal: str) -> None:
+        principal = (principal or "").strip()
+        if not principal:
+            return
+        with self._assistant_request_lock:
+            self._assistant_principal_bindings.pop(principal, None)
+
+    def record_assistant_request_tool_call(
+        self,
+        *,
+        conversation_id: str,
+        tool_id: str,
+        status: str,
+        args_summary: str = "",
+        result_summary: str = "",
+        error: Optional[str] = None,
+        draft_mutated: bool = False,
+        started_at_ns: Optional[int] = None,
+        principal: str = "",
+    ) -> Optional[LiveToolCallEntry]:
+        """Append a live tool-call entry to the in-flight assistant request
+        that owns this tool call.
+
+        Resolution order:
+
+        1. Match by ``conversation_id`` against the active request's
+           ``conversation_id``. This is the natural path on the direct
+           lane: the bridge service forwards the chat's conversationId
+           and the bridge endpoint sees it.
+
+        2. Fall back to ``principal`` binding (set by the OpenClaw
+           bridge service via ``bind_principal_to_request``). This is
+           the OpenClaw-lane path: the MCP bridge subprocess substitutes
+           its own bridge-process conversation id in the envelope, so
+           conversationId can't correlate, but principal can — there is
+           one chat per sandbox at a time.
+
+        If neither resolves to an active request, drop the entry
+        silently. Live streaming is a UX feature, not a correctness
+        gate; the audit log keeps the authoritative record.
+        """
+        now_ns = time.monotonic_ns()
+        entry = LiveToolCallEntry(
+            tool_id=tool_id,
+            status=status,
+            started_at_ns=started_at_ns if started_at_ns is not None else now_ns,
+            finished_at_ns=now_ns if status != "running" else None,
+            args_summary=args_summary,
+            result_summary=result_summary,
+            error=error,
+            draft_mutated=draft_mutated,
+        )
+        with self._assistant_request_lock:
+            # 1. conversationId match
+            if conversation_id:
+                for record in self._assistant_requests.values():
+                    if record.conversation_id != conversation_id:
+                        continue
+                    if record.status not in ("running", "cancel_requested"):
+                        continue
+                    record.tool_calls.append(entry)
+                    record.updated_at_ns = now_ns
+                    return entry
+            # 2. principal-binding fallback (OpenClaw lane)
+            if principal:
+                bound_request_id = self._assistant_principal_bindings.get(principal)
+                if bound_request_id is not None:
+                    record = self._assistant_requests.get(bound_request_id)
+                    if record is not None and record.status in (
+                        "running",
+                        "cancel_requested",
+                    ):
+                        record.tool_calls.append(entry)
+                        record.updated_at_ns = now_ns
+                        return entry
+        return None
 
     def mark_assistant_request_cancel_requested(
         self,

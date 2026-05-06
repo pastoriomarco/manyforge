@@ -1,5 +1,16 @@
 # manyforge_assistant_bridge — assistant-provider HTTP bridge (v0.1)
 
+> **Lane status**: this is the **direct-vLLM lane** (Composer's `nemoclaw`
+> provider id), available as a fallback / known-good demo baseline. As of
+> 2026-05-05, the demo launcher
+> ([`../scripts/demo-assistant-known-good.sh`](../scripts/demo-assistant-known-good.sh))
+> defaults to the **OpenClaw lane** (Composer's `openclaw` provider id;
+> persistent gateway, warm prefix-cache, slower but more agentic).
+> See [`../docs/operations/ASSISTANT_E2E_COOKBOOK.md`](../docs/operations/ASSISTANT_E2E_COOKBOOK.md)
+> "Recipe: Known-Good Assistant Demo Launcher" for the lane comparison and
+> when to use which. The OpenClaw lane lives in NemoClaw-Thor's
+> `manyforge/openclaw_assistant_bridge/`.
+
 Implements the assistant-provider HTTP contract against a local
 OpenAI-compatible LLM endpoint (typically vLLM on the deployment host).
 Receives ManyForge envelopes, validates them per the bounded-autonomy

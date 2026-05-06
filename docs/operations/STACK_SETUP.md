@@ -53,8 +53,38 @@ Use when:
 
 ### 3. ManyForge plus NemoClaw/OpenClaw
 
-Current validated agent path still uses the mux-based workaround described in
-[`../../../manyforge_specs/docs/integration/PLATFORM_REQUIREMENTS.md`](../../../manyforge_specs/docs/integration/PLATFORM_REQUIREMENTS.md).
+Two assistant-provider lanes coexist; **direct vLLM (`nemoclaw` provider) is
+the demo default** as of 2026-05-06:
+
+- **Direct vLLM lane (default — `ASSISTANT_PROVIDER=nemoclaw`)**: in-tree
+  `manyforge_assistant_bridge` on `:8100` makes chat-completions calls
+  against vLLM directly, runs the agent loop in-process. Sub-2 s warm
+  latency, ~22 s/test p50 across the comparison matrix. Use this for
+  local development, demos, and any single-tenant deployment where the
+  user trusts the model.
+
+- **OpenClaw lane (`ASSISTANT_PROVIDER=openclaw`)**: persistent OpenClaw
+  gateway in the NemoClaw `my-assistant` sandbox; Composer's `openclaw`
+  provider talks to the in-tree NemoClaw-Thor adapter at `:8200` which
+  forwards to `/v1/chat/completions` on the gateway. The gateway runs
+  the agent loop internally; ManyForge enforces every tool call via the
+  mode-scoped MCP wrapper + `/api/assistant/bridge/tools/{toolId}`.
+  Warm latency 5-15 s per turn but ~80 s/test p50 (3.6× direct).
+  Recommended for shared/multi-tenant deployments where sandbox
+  isolation + the bounded-autonomy audit envelope (assistantMode +
+  catalogHash + requestId + principal) matter. Setup recipe:
+  [`./ASSISTANT_E2E_COOKBOOK.md`](./ASSISTANT_E2E_COOKBOOK.md) →
+  "Recipe: Known-Good Assistant Demo Launcher". Integration design:
+  [`../../../../nemoclaw/src/NemoClaw-Thor/manyforge/docs/MANYFORGE-MCP-INTEGRATION.md`](../../../../nemoclaw/src/NemoClaw-Thor/manyforge/docs/MANYFORGE-MCP-INTEGRATION.md).
+
+Both lanes preserve the same bounded-autonomy contract on the ManyForge
+side. Switching between them is a single env var on
+`scripts/demo-assistant-known-good.sh` (`ASSISTANT_PROVIDER=openclaw`).
+The default switch is justified by the 2026-05-06 comparison matrix:
+both paths solve the same 14/15 task set, but direct is consistently
+3-11× faster per test. See
+[`COMPARISON-2026-05-06-direct-vs-openclaw.md`](../../../../nemoclaw/src/NemoClaw-Thor/manyforge/docs/COMPARISON-2026-05-06-direct-vs-openclaw.md)
+in NemoClaw-Thor for the per-test breakdown.
 
 Use when:
 

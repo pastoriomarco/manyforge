@@ -13,7 +13,6 @@ from __future__ import annotations
 import argparse
 import contextlib
 import dataclasses
-import hashlib
 import json
 import os
 import re
@@ -22,6 +21,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -378,10 +378,7 @@ def _run_negative_cases(args: argparse.Namespace, model: str) -> dict[str, Any]:
                 {
                     "requestId": "negative-invalid-draft",
                     "assistantMode": "composer-assistant",
-                    "catalogHash": _catalog_hash(
-                        "composer-assistant",
-                        tools=_active_mode_tools(args, "composer-assistant"),
-                    ),
+                    "catalogHash": _active_mode_catalog_hash(args, "composer-assistant"),
                     "arguments": {"sceneResource": {"objectId": "missing_shape_pose"}},
                 },
                 timeout_s=args.case_timeout_s,
@@ -971,7 +968,7 @@ def _golden_tree_insert_case(args: argparse.Namespace, profile_name: str) -> dic
                 label="toolCalls[0].result",
             )
         )
-        program = _get_json(f"{args.composer_url}/api/program", timeout_s=args.case_timeout_s)
+        tree_response = _get_json(f"{args.composer_url}/api/program/tree", timeout_s=args.case_timeout_s)
         validation_errors.extend(
             _tree_insert_result_errors(
                 {
@@ -979,7 +976,7 @@ def _golden_tree_insert_case(args: argparse.Namespace, profile_name: str) -> dic
                     "nodeName": expected_node["name"],
                     "parentName": parent_name,
                     "index": expected_arguments["index"],
-                    "tree": program.get("tree"),
+                    "tree": tree_response.get("tree"),
                 },
                 expected_arguments,
                 label="program.tree",
@@ -1297,10 +1294,7 @@ def _golden_blackboard_upsert_case(args: argparse.Namespace, profile_name: str) 
 def _draft_tool_surface_case(args: argparse.Namespace, profile_name: str) -> dict[str, Any]:
     slug = _slug(profile_name)
     started = time.perf_counter()
-    catalog_hash = _catalog_hash(
-        "composer-assistant",
-        tools=_active_mode_tools(args, "composer-assistant"),
-    )
+    catalog_hash = _active_mode_catalog_hash(args, "composer-assistant")
 
     def call(tool_id: str, arguments: dict[str, Any]) -> dict[str, Any]:
         return _post_json(
@@ -1361,12 +1355,16 @@ def _draft_tool_surface_case(args: argparse.Namespace, profile_name: str) -> dic
             "tree.draft.replace_subtree",
             {
                 "nodeName": temp_node_name,
-                "subtree": {"id": "reset_trajectories", "name": f"assistant_surface_reset_{slug}"},
+                "subtree": {
+                    "id": "remove_collision_object",
+                    "name": f"assistant_surface_replacement_{slug}",
+                    "params": {"object_id": f"{scene_object_id}_replacement"},
+                },
             },
         )
         delete_tree = call(
             "tree.draft.delete_node",
-            {"nodeName": f"assistant_surface_reset_{slug}"},
+            {"nodeName": f"assistant_surface_replacement_{slug}"},
         )
 
         param_name = f"assistant_surface_param_{slug}"
@@ -1590,8 +1588,8 @@ def _discard_draft_by_reload(args: argparse.Namespace, object_id: str) -> dict[s
 
 def _discard_tree_by_reload(args: argparse.Namespace, node_name: str) -> dict[str, Any]:
     _load_baseline(args)
-    program = _get_json(f"{args.composer_url}/api/program", timeout_s=args.case_timeout_s)
-    contains = _find_tree_node_by_name(program.get("tree"), node_name) is not None
+    tree_response = _get_json(f"{args.composer_url}/api/program/tree", timeout_s=args.case_timeout_s)
+    contains = _find_tree_node_by_name(tree_response.get("tree"), node_name) is not None
     return {"ok": not contains, "treeContainsNodeAfterReload": contains}
 
 
@@ -1764,6 +1762,17 @@ def _active_mode_tools(args: argparse.Namespace, mode_id: str) -> list[str]:
     if not isinstance(tools, list) or not all(isinstance(tool, str) for tool in tools):
         raise SmokeFailure(f"assistantModes.{mode_id}.catalog.tools is not a list of strings")
     return tools
+
+
+def _active_mode_catalog_hash(args: argparse.Namespace, mode_id: str) -> str:
+    mode = _get_json(
+        f"{args.composer_url}/api/assistant/modes/{urllib.parse.quote(mode_id)}",
+        timeout_s=args.case_timeout_s,
+    )
+    catalog_hash = mode.get("catalogHash")
+    if not isinstance(catalog_hash, str) or not catalog_hash.strip():
+        raise SmokeFailure(f"/api/assistant/modes/{mode_id} did not return catalogHash")
+    return catalog_hash.strip()
 
 
 def _check_health(composer_url: str) -> None:
@@ -1971,12 +1980,6 @@ def _scene_draft_add_tool_descriptor() -> dict[str, Any]:
             },
         },
     }
-
-
-def _catalog_hash(mode: str, *, tools: list[str]) -> str:
-    payload = {"mode": mode, "skills": [], "tools": sorted(tools), "nodes": []}
-    blob = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
-    return hashlib.sha256(blob).hexdigest()
 
 
 def _tool_call_names(tool_calls: Any) -> list[str]:
@@ -2532,6 +2535,7 @@ def _scene_resource_set_match_errors(
         if not isinstance(resource, dict):
             invalid_indices.append(index)
             continue
+        resource = _normalize_scene_resource_for_smoke(resource)
         object_id = resource.get("objectId") or resource.get("object_id")
         if not isinstance(object_id, str) or not object_id.strip():
             errors.append(f"{label}[{index}] is missing objectId")
@@ -2570,6 +2574,86 @@ def _scene_resource_set_match_errors(
             )
         )
     return errors
+
+
+def _normalize_scene_resource_for_smoke(resource: dict[str, Any]) -> dict[str, Any]:
+    """Canonicalize the LLM-facing scene-resource aliases accepted by Composer.
+
+    Smoke validation should check semantic equivalence of accepted tool input,
+    not require the model to have used only the nested canonical form.
+    """
+
+    normalized = dict(resource)
+    object_id = normalized.get("objectId") or normalized.get("object_id")
+    if isinstance(object_id, str):
+        normalized["objectId"] = object_id
+
+    shape = dict(normalized.get("shape") or {}) if isinstance(normalized.get("shape"), dict) else {}
+    shape_type = (
+        shape.get("type")
+        or normalized.get("shapeType")
+        or normalized.get("shape_type")
+        or normalized.get("type")
+    )
+    if isinstance(shape_type, str):
+        shape["type"] = shape_type
+
+    box_dimensions = (
+        shape.get("box_dimensions_m")
+        or shape.get("dimensions_m")
+        or shape.get("dimensions")
+        or normalized.get("box_dimensions_m")
+        or normalized.get("dimensions_m")
+        or normalized.get("dimensions")
+        or normalized.get("size")
+        or normalized.get("size_m")
+    )
+    if isinstance(box_dimensions, list):
+        shape["box_dimensions_m"] = box_dimensions
+
+    radius = (
+        shape.get("sphere_radius_m")
+        or shape.get("radius_m")
+        or shape.get("radius")
+        or normalized.get("sphere_radius_m")
+        or normalized.get("radius_m")
+        or normalized.get("radius")
+    )
+    diameter = shape.get("diameter_m") or shape.get("diameter") or normalized.get("diameter_m") or normalized.get("diameter")
+    if isinstance(radius, (int, float)):
+        shape["sphere_radius_m"] = radius
+    elif isinstance(diameter, (int, float)):
+        shape["sphere_radius_m"] = float(diameter) / 2.0
+    if shape:
+        normalized["shape"] = shape
+
+    pose = dict(normalized.get("pose") or {}) if isinstance(normalized.get("pose"), dict) else {}
+    frame_id = pose.get("frame_id") or pose.get("frameId") or normalized.get("frame_id") or normalized.get("frameId")
+    if isinstance(frame_id, str):
+        pose["frame_id"] = frame_id
+    position = (
+        pose.get("position_m")
+        or pose.get("position")
+        or normalized.get("position_m")
+        or normalized.get("position")
+    )
+    if isinstance(position, list):
+        pose["position_m"] = position
+    orientation_rpy = (
+        pose.get("orientation_rpy_deg")
+        or pose.get("orientation")
+        or normalized.get("orientation_rpy_deg")
+        or normalized.get("orientation")
+    )
+    if isinstance(orientation_rpy, list):
+        pose["orientation_rpy_deg"] = orientation_rpy
+    orientation_xyzw = pose.get("orientation_xyzw") or normalized.get("orientation_xyzw")
+    if isinstance(orientation_xyzw, list):
+        pose["orientation_xyzw"] = orientation_xyzw
+    if pose:
+        normalized["pose"] = pose
+
+    return normalized
 
 
 def _exact_string_set_errors(actual: list[str], expected: list[str], *, label: str) -> list[str]:
