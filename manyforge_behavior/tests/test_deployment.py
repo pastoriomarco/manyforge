@@ -788,12 +788,12 @@ class TestAssistantModeValidation:
             _minimal_deployment(
                 assistant_modes={
                     "composer-assistant": _assistant_mode_block(
-                        tools=["program.read", "tree.insert_node"],
+                        tools=["program_read", "tree.insert_node"],
                     ),
                 },
                 tool_catalog=[
                     {
-                        "id": "program.read",
+                        "id": "program_read",
                         "effect": "read_only",
                         "description": "Read the loaded program.",
                         "input_schema": no_args_schema,
@@ -809,16 +809,16 @@ class TestAssistantModeValidation:
 
         assert "composer-assistant" in deployment.assistant_modes
         assert deployment.assistant_modes["composer-assistant"].catalog.tools == [
-            "program.read",
+            "program_read",
             "tree.insert_node",
         ]
-        assert deployment.tool_catalog["program.read"].effect == "read_only"
-        assert deployment.tool_catalog["program.read"].extra["input_schema"] == no_args_schema
+        assert deployment.tool_catalog["program_read"].effect == "read_only"
+        assert deployment.tool_catalog["program_read"].extra["input_schema"] == no_args_schema
         assert deployment.resolve_assistant_mode_catalog("composer-assistant")["tools"][0][
             "input_schema"
         ] == no_args_schema
         assert deployment.to_dict()["assistant_modes"]["composer-assistant"]["catalog"]["tools"] == [
-            "program.read",
+            "program_read",
             "tree.insert_node",
         ]
         assert deployment.to_dict()["tool_catalog"][0]["input_schema"] == no_args_schema
@@ -829,7 +829,7 @@ class TestAssistantModeValidation:
                 _minimal_deployment(
                     assistant_modes={
                         "composer-assistant": _assistant_mode_block(
-                            tools=["program.read"],
+                            tools=["program_read"],
                         ),
                     },
                 )
@@ -841,12 +841,12 @@ class TestAssistantModeValidation:
                 _minimal_deployment(
                     assistant_modes={
                         "composer-assistant": _assistant_mode_block(
-                            tools=["program.read"],
+                            tools=["program_read"],
                         ),
                     },
                     tool_catalog=[
                         {
-                            "id": "program.read",
+                            "id": "program_read",
                             "effect": "read_only",
                             "input_schema": {"type": "array"},
                         },
@@ -871,7 +871,7 @@ class TestAssistantModeValidation:
                             tools=["missing.tool"],
                         ),
                     },
-                    tool_catalog=_tool_catalog("program.read"),
+                    tool_catalog=_tool_catalog("program_read"),
                 )
             )
 
@@ -891,18 +891,18 @@ class TestAssistantModeValidation:
             _minimal_deployment(
                 assistant_modes={
                     "composer-assistant": _assistant_mode_block(
-                        tools=["scene.draft.add_object"],
+                        tools=["scene_draft_add_object"],
                     ),
                 },
                 tool_catalog=_tool_catalog(
-                    "scene.draft.add_object",
+                    "scene_draft_add_object",
                     effect="composer_draft_mutating",
                 ),
             )
         )
 
         assert (
-            deployment.tool_catalog["scene.draft.add_object"].effect
+            deployment.tool_catalog["scene_draft_add_object"].effect
             == "composer_draft_mutating"
         )
 
@@ -918,11 +918,11 @@ class TestAssistantModeValidation:
                             session_kind="delegated_recovery",
                             approval_mode="policy_granted",
                             review="bounded_by_recovery_profile",
-                            tools=["scene.draft.add_object"],
+                            tools=["scene_draft_add_object"],
                         ),
                     },
                     tool_catalog=_tool_catalog(
-                        "scene.draft.add_object",
+                        "scene_draft_add_object",
                         effect="composer_draft_mutating",
                     ),
                 )
@@ -934,13 +934,13 @@ class TestAssistantModeValidation:
                 assistant_modes={
                     "composer-assistant": _assistant_mode_block(
                         skills=["assist_skill"],
-                        tools=["program.read"],
+                        tools=["program_read"],
                     ),
                 },
-                tool_catalog=_tool_catalog("program.read"),
+                tool_catalog=_tool_catalog("program_read"),
             )
         )
-        skills = _skill_catalog(tmp_path, requires_tools=["program.read"])
+        skills = _skill_catalog(tmp_path, requires_tools=["program_read"])
 
         deployment.validate_assistant_modes(catalog, skills)
 
@@ -950,10 +950,10 @@ class TestAssistantModeValidation:
                 assistant_modes={
                     "composer-assistant": _assistant_mode_block(
                         skills=["assist_skill"],
-                        tools=["program.read"],
+                        tools=["program_read"],
                     ),
                 },
-                tool_catalog=_tool_catalog("program.read", "tree.insert_node"),
+                tool_catalog=_tool_catalog("program_read", "tree.insert_node"),
             )
         )
         skills = _skill_catalog(tmp_path, requires_tools=["tree.insert_node"])
@@ -967,10 +967,10 @@ class TestAssistantModeValidation:
                 assistant_modes={
                     "composer-assistant": _assistant_mode_block(
                         skills=["missing_skill"],
-                        tools=["program.read"],
+                        tools=["program_read"],
                     ),
                 },
-                tool_catalog=_tool_catalog("program.read"),
+                tool_catalog=_tool_catalog("program_read"),
             )
         )
         skills = _skill_catalog(tmp_path, requires_tools=[])
@@ -983,11 +983,11 @@ class TestAssistantModeValidation:
             _minimal_deployment(
                 assistant_modes={
                     "composer-assistant": _assistant_mode_block(
-                        tools=["program.read"],
+                        tools=["program_read"],
                         nodes=["missing_node"],
                     ),
                 },
-                tool_catalog=_tool_catalog("program.read"),
+                tool_catalog=_tool_catalog("program_read"),
             )
         )
         skills = _skill_catalog(tmp_path, requires_tools=[])
@@ -1204,30 +1204,37 @@ class TestCrossArtifactValidation:
         assert sorted(deploy.assistant_modes) == ["composer-assistant", "query"]
         resolved_catalog = deploy.resolve_assistant_mode_catalog("composer-assistant")
         assert resolved_catalog["skills"] == []
+        # Tool order matches the deployment YAML's
+        # assistant_modes.composer-assistant.catalog.tools list order.
+        # `program_read` leads because the deployment puts the live-state
+        # read first; `tree_draft_swap_node` was added when the swap-class
+        # rules went in.
         assert [tool["id"] for tool in resolved_catalog["tools"]] == [
-            "catalog.read",
-            "skills.read",
-            "deployment.capabilities.read",
-            "scene.inspect",
+            "program_read",
+            "catalog_read",
+            "skills_read",
+            "deployment_capabilities_read",
+            "scene_inspect",
             "inspect_isaac_scene",
             "propose_scene_objects",
             "propose_scene_object_nodes",
-            "scene.draft.add_object",
-            "scene.draft.update_object",
-            "scene.draft.upsert_objects",
-            "scene.draft.remove_objects",
-            "tree.draft.insert_node",
-            "tree.draft.update_node_params",
-            "tree.draft.delete_node",
-            "tree.draft.move_node",
-            "tree.draft.replace_subtree",
-            "tree.draft.wrap_node",
-            "program.draft.upsert_parameters",
-            "program.draft.remove_parameters",
-            "blackboard.draft.upsert_namespaces",
-            "blackboard.draft.remove_namespaces",
-            "blackboard.draft.upsert_keys",
-            "blackboard.draft.remove_keys",
+            "scene_draft_add_object",
+            "scene_draft_update_object",
+            "scene_draft_upsert_objects",
+            "scene_draft_remove_objects",
+            "tree_draft_insert_node",
+            "tree_draft_update_node_params",
+            "tree_draft_delete_node",
+            "tree_draft_move_node",
+            "tree_draft_replace_subtree",
+            "tree_draft_swap_node",
+            "tree_draft_wrap_node",
+            "program_draft_upsert_parameters",
+            "program_draft_remove_parameters",
+            "blackboard_draft_upsert_namespaces",
+            "blackboard_draft_remove_namespaces",
+            "blackboard_draft_upsert_keys",
+            "blackboard_draft_remove_keys",
         ]
         assert sorted(resolved_catalog["nodes"]) == sorted(
             [

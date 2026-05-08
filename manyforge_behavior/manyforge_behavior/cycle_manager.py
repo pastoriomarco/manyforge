@@ -544,6 +544,91 @@ class CycleManager:
         bb.register_key(key="stop_requested", access=py_trees.common.Access.WRITE)
         bb.stop_requested = stop_requested
 
+    def _read_motion_paused_error(self) -> Optional[str]:
+        """Read the motion-soft-fail signal a motion node may have set on the blackboard.
+
+        Returns the human-readable cause string when a motion node has
+        captured a runtime failure and is awaiting operator decision;
+        returns None otherwise. The motion node sets two keys together:
+        ``motion_paused_due_to_error`` (bool) and ``motion_error_message``
+        (str). We require both for a positive signal so a stale message
+        from a previous run can't trigger an unwanted quiesce.
+        """
+        try:
+            bb = py_trees.blackboard.Client(name="cycle_manager_motion_error_read")
+            bb.register_key(
+                key="motion_paused_due_to_error",
+                access=py_trees.common.Access.READ,
+            )
+            bb.register_key(
+                key="motion_error_message",
+                access=py_trees.common.Access.READ,
+            )
+            paused = bool(bb.get("motion_paused_due_to_error"))
+        except (KeyError, AttributeError):
+            return None
+        if not paused:
+            return None
+        try:
+            message = bb.get("motion_error_message")
+        except (KeyError, AttributeError):
+            message = None
+        if isinstance(message, str) and message.strip():
+            return message.strip()
+        return "Motion failed without a cause string"
+
+    def _enter_motion_paused_state(self, error_message: str) -> None:
+        """Quiesce the runtime in response to a motion soft-fail.
+
+        Mirrors stop() with two differences: the error string is
+        recorded on ``self._error`` so the cycle status surfaces the
+        cause, and the tick thread is suspended (via _tick_pause_event)
+        rather than terminated, so a subsequent run() can resume the
+        same tree with the same node holding its position.
+        """
+        self._quiesce_runtime(
+            client_name="cycle_manager_motion_paused",
+            kernel_action="pause_if_executing",
+        )
+        with self._lock:
+            self._error = error_message
+            self._state = CycleState.STOPPED
+
+    def _set_resume_after_error_flag(self, value: bool) -> None:
+        """Toggle the blackboard signal that tells the motion node to retry.
+
+        Set to True before transitioning STOPPED→RUNNING when a motion
+        soft-fail is in flight. The motion node consumes the flag on its
+        next tick, clears its internal soft-fail state, and re-issues
+        the same kernel goal.
+        """
+        try:
+            bb = py_trees.blackboard.Client(name="cycle_manager_resume_after_error")
+            bb.register_key(
+                key="resume_after_error_requested",
+                access=py_trees.common.Access.WRITE,
+            )
+            bb.set("resume_after_error_requested", value)
+        except (KeyError, AttributeError):
+            pass
+
+    def _clear_motion_paused_blackboard(self) -> None:
+        """Clear the soft-fail signal so the cycle resumes cleanly on next tick."""
+        try:
+            bb = py_trees.blackboard.Client(name="cycle_manager_motion_paused_clear")
+            bb.register_key(
+                key="motion_paused_due_to_error",
+                access=py_trees.common.Access.WRITE,
+            )
+            bb.register_key(
+                key="motion_error_message",
+                access=py_trees.common.Access.WRITE,
+            )
+            bb.set("motion_paused_due_to_error", False)
+            bb.set("motion_error_message", None)
+        except (KeyError, AttributeError):
+            pass
+
     def _quiesce_runtime(
         self,
         *,
@@ -741,6 +826,15 @@ class CycleManager:
                 bb = py_trees.blackboard.Client(name="cycle_manager_resume")
                 bb.register_key(key="stop_requested", access=py_trees.common.Access.WRITE)
                 bb.stop_requested = False
+
+                # If we're resuming from a motion soft-fail (the cycle
+                # was put into STOPPED by _enter_motion_paused_state),
+                # clear the soft-fail blackboard keys and set the resume
+                # signal so the holding motion node retries its goal on
+                # the next tick rather than re-emitting the same error.
+                if self._read_motion_paused_error() is not None:
+                    self._clear_motion_paused_blackboard()
+                    self._set_resume_after_error_flag(True)
 
                 kernel_status = self._kernel.get_status()
                 if kernel_status.state == ExecutionState.PAUSED:
@@ -1466,6 +1560,19 @@ class CycleManager:
             pending = self._match_interrupt_policy(statuses, kernel_events)
             if pending is not None:
                 self._apply_interrupt_preemption(pending)
+                continue
+
+            # Motion soft-fail: a motion node has captured a runtime
+            # failure (collision, planning timeout, execution rejection,
+            # etc.) and is holding Status.RUNNING with the cause stored
+            # on the blackboard. Quiesce the runtime so the operator can
+            # see the error and decide between Run-again (retry the same
+            # motion) and Reset (clear the cycle). Without this branch
+            # the motion node would hold RUNNING forever and the
+            # operator would have no signal that anything went wrong.
+            motion_error = self._read_motion_paused_error()
+            if motion_error is not None:
+                self._enter_motion_paused_state(motion_error)
                 continue
 
             # Check if tree completed

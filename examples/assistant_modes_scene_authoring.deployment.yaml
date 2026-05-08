@@ -113,17 +113,17 @@ model_endpoint_profile_registry: model_endpoint_profiles.yaml
 
 model_endpoints:
   assistant_model:
-    profile_ref: thor_nemotron3_nano_omni
+    profile_ref: thor_cosmos_reason2_8b
     provider: nemoclaw
     base_url: http://127.0.0.1:8100/v1/manyforge/assistant
     default_timeout_s: 180.0
-    max_tokens: 32768
+    max_tokens: 8192
     capabilities:
       supports_response_tools: true
       supports_json_object: true
       supports_image_input: true
       supported_image_transports: [inline_data_url, http_url]
-      tool_call_family: qwen3_coder
+      tool_call_family: openai_chat_tools
 
 assistant:
   provider: nemoclaw
@@ -141,8 +141,8 @@ assistant_modes:
     catalog:
       skills: []
       tools:
-        - program.read
-        - scene.inspect
+        - program_read
+        - scene_inspect
         - inspect_isaac_scene
       nodes: []
   composer-assistant:
@@ -158,32 +158,33 @@ assistant_modes:
         # A read-write mode must be a strict superset of the read-only
         # tools in `query`, otherwise the assistant can edit the program
         # tree but not read it — the model then loops trying to call
-        # program.read (the obvious tool name from training data) and
+        # program_read (the obvious tool name from training data) and
         # times out the run. Keep this list aligned with `query.tools`.
-        - program.read
-        - catalog.read
-        - skills.read
-        - deployment.capabilities.read
-        - scene.inspect
+        - program_read
+        - catalog_read
+        - skills_read
+        - deployment_capabilities_read
+        - scene_inspect
         - inspect_isaac_scene
         - propose_scene_objects
         - propose_scene_object_nodes
-        - scene.draft.add_object
-        - scene.draft.update_object
-        - scene.draft.upsert_objects
-        - scene.draft.remove_objects
-        - tree.draft.insert_node
-        - tree.draft.update_node_params
-        - tree.draft.delete_node
-        - tree.draft.move_node
-        - tree.draft.replace_subtree
-        - tree.draft.wrap_node
-        - program.draft.upsert_parameters
-        - program.draft.remove_parameters
-        - blackboard.draft.upsert_namespaces
-        - blackboard.draft.remove_namespaces
-        - blackboard.draft.upsert_keys
-        - blackboard.draft.remove_keys
+        - scene_draft_add_object
+        - scene_draft_update_object
+        - scene_draft_upsert_objects
+        - scene_draft_remove_objects
+        - tree_draft_insert_node
+        - tree_draft_update_node_params
+        - tree_draft_delete_node
+        - tree_draft_move_node
+        - tree_draft_replace_subtree
+        - tree_draft_swap_node
+        - tree_draft_wrap_node
+        - program_draft_upsert_parameters
+        - program_draft_remove_parameters
+        - blackboard_draft_upsert_namespaces
+        - blackboard_draft_remove_namespaces
+        - blackboard_draft_upsert_keys
+        - blackboard_draft_remove_keys
       nodes:
         - attach_object_to_link
         - detach_object_from_link
@@ -199,25 +200,65 @@ assistant_modes:
         - inverter
 
 tool_catalog:
-  - id: catalog.read
+  - id: catalog_read
     effect: read_only
-    description: Read legal node catalog entries and parameter metadata.
-  - id: skills.read
+    description: |
+      Reads node-catalog entries that this assistant mode is permitted to
+      use. Returns the structural and parameter metadata for each entry,
+      including its catalog identifier, its kind, the child arity it
+      accepts, the full set of parameter declarations the entry expects,
+      and any deployment capabilities required to use it. Use this when
+      the per-request manifest's nodeCatalog summary needs to be expanded
+      to the full per-parameter description, or when filtering by kind or
+      category. The result is read-only metadata; it never changes the
+      program.
+  - id: skills_read
     effect: read_only
-    description: Read legal skill catalog entries and required capabilities/tools.
-  - id: deployment.capabilities.read
+    description: |
+      Reads skill-catalog entries that this assistant mode is permitted
+      to use. Skills are higher-level, deployment-defined activities that
+      expand into one or more behavior-tree nodes; each entry declares
+      the deployment capabilities it requires and the tools needed to
+      perform it. Use this when planning a request that may be
+      implementable via a skill rather than by hand-assembling individual
+      nodes. The result is read-only.
+  - id: deployment_capabilities_read
     effect: read_only
-    description: Read the active deployment capability keys by adapter family.
-  - id: program.read
+    description: |
+      Reads the active deployment's adapter-family capability keys.
+      Capabilities express what the runtime can physically do, such as
+      which motion-planning families are available, which gripper kinds
+      are supported, and which vision modes are enabled. Capabilities
+      constrain which catalog entries are usable in the current
+      configuration. Use this when a node insertion would otherwise be
+      valid by arity and parameter shape but the deployment may lack the
+      underlying capability needed to execute it. The result is
+      read-only.
+  - id: program_read
     effect: read_only
-    description: Read the loaded Composer program/session state.
+    description: |
+      Reads the loaded Composer program's current state, including the
+      in-memory behavior-tree draft, the program's scene resources, its
+      parameter declarations, its blackboard configuration, and which
+      deployment is loaded. Use this any time you need authoritative
+      information about node names, parent-child topology, the current
+      parameter values on a node, or what scene resources already exist.
+      Most assistant requests already include a snapshot of this state
+      in the request envelope; call this tool to refresh state after
+      applying a mutation in the same request rather than as a routine
+      first step.
     input_schema:
       type: object
       properties: {}
       additionalProperties: false
-  - id: scene.inspect
+  - id: scene_inspect
     effect: read_only
-    description: Read current backend scene state, including object poses and attachment status.
+    description: |
+      Reads the current backend scene state, including each object's
+      pose, shape, and attachment status. The assistant request envelope
+      already includes a snapshot of this state; call this tool to
+      refresh after applying mutations in the same request rather than
+      as a routine first step.
     input_schema:
       type: object
       properties: {}
@@ -291,21 +332,25 @@ tool_catalog:
         gripperId:
           type: string
       additionalProperties: false
-  - id: scene.draft.add_object
+  - id: scene_draft_add_object
     effect: composer_draft_mutating
     description: |
-      [SCOPE: scene_resource | TIMING: compile-time]
-      Add a STATIC scene object to the program's scene resources. The added
-      object exists for the entire program run. Use this for permanent
-      collision objects (walls, fixtures, environment).
-
-      Do NOT use this to add an object DURING runtime execution at a specific
-      point in the cycle (e.g., 'at the end of the cycle, add X' or 're-add X
-      after each iteration'). For runtime scene mutation, insert an
-      `add_collision_object` BT node via `tree.draft.insert_node` instead.
-
-      Send objectId, shapeType, size/radius/diameter, and position directly;
-      legacy sceneResource wrappers are also accepted.
+      Adds a static scene resource to the program's scene-resource list.
+      Static scene resources exist for the entire program run and are
+      part of the program's compile-time configuration; they are not
+      part of any runtime cycle. Use this tool for permanent collision
+      geometry such as walls, fixtures, or other environment objects
+      whose presence is not conditional on the program's behavior. The
+      object is added to the draft only; it is not visible in the
+      running scene until the draft is materialized. Do not use this
+      tool when a request describes adding an object at a particular
+      moment during execution, such as at the end of a cycle, after
+      each iteration, or in response to a runtime event — that
+      requirement maps to a behavior-tree node, not to a scene
+      resource, and must be satisfied by inserting the corresponding
+      runtime-mutation node into the tree via the tree-draft tools
+      instead. Failure modes are limited to validation errors on the
+      resource shape and pose declarations.
     input_schema:
       type: object
       required:
@@ -368,88 +413,258 @@ tool_catalog:
           additionalProperties: true
         forceDiscardOverrides:
           type: boolean
-  - id: scene.draft.update_object
+  - id: scene_draft_update_object
     effect: composer_draft_mutating
     description: |
-      [SCOPE: scene_resource | TIMING: compile-time]
-      Replace a STATIC scene object's shape/pose. For runtime mutation of
-      object pose during execution, use the `update_collision_object_pose` BT
-      node via `tree.draft.insert_node` instead.
-  - id: scene.draft.upsert_objects
+      Replaces a static scene resource's shape and pose in the program's
+      scene-resource list. The change is part of the program's
+      compile-time configuration, not a per-cycle event. To change an
+      object's pose only at a specific moment during execution, use a
+      behavior-tree node that performs runtime pose updates instead,
+      inserted via the tree-draft tools.
+  - id: scene_draft_upsert_objects
     effect: composer_draft_mutating
     description: |
-      [SCOPE: scene_resource | TIMING: compile-time]
-      Insert or replace STATIC scene objects. For runtime mutation, use the
-      `upsert_collision_object` BT node via `tree.draft.insert_node` instead.
-  - id: scene.draft.remove_objects
+      Inserts new static scene resources or replaces existing ones in a
+      single batched call. The semantics match the single-object add and
+      update tools: compile-time configuration, not per-cycle mutation.
+      Useful when a request introduces multiple permanent objects at
+      once. Duplicate identifiers within a single batch are rejected; the
+      caller must assign unique identifiers across the batch.
+  - id: scene_draft_remove_objects
     effect: composer_draft_mutating
     description: |
-      [SCOPE: scene_resource | TIMING: compile-time]
-      Remove STATIC scene objects from the program's scene resources. The
-      objects no longer exist for any cycle iteration.
+      Removes static scene resources from the program's scene-resource
+      list. The resources cease to exist for any subsequent cycle
+      iteration. Do not use this tool when a request describes removing
+      an object only at a specific moment during execution; that case
+      calls for the corresponding runtime-mutation behavior-tree node,
+      inserted via the tree-draft tools instead.
+  - id: tree_draft_insert_node
+    effect: composer_draft_mutating
+    description: |
+      Inserts a new node as a child of an existing parent node in the
+      program's behavior-tree draft. This is the primary tool for adding
+      any runtime activity to the program: robot motions, gripper
+      actions, scene mutations to be performed during a cycle, and the
+      control-flow constructs that govern when other activities run. The
+      parent is identified by its instance name, which must already
+      exist in the draft tree; if the model does not already know the
+      tree's node names, it must call the program-read tool first rather
+      than guess.
 
-      Do NOT use this to remove an object DURING runtime execution at a
-      specific point in the cycle (e.g., 'at the end of the cycle, remove X').
-      For runtime scene mutation, insert a `remove_collision_object` BT node
-      via `tree.draft.insert_node` instead.
-  - id: tree.draft.insert_node
+      This tool authors runtime behavior only. It is NEVER the right
+      tool for adding a static obstacle, fixture, or prop that should
+      exist for the entire program run. Those are scene resources and
+      are authored with scene_draft_add_object (or its upsert/remove
+      siblings). If the request describes adding or removing an object
+      that is not conditional on the program's behavior — phrases like
+      "add an obstacle", "place a fixture", "introduce a wall" —
+      use the scene-draft tool family instead. Inserting an
+      add_collision_object (or analogous) BT node under a sequence
+      creates a runtime mutation that fires every time that branch
+      executes, which is almost never what the operator wanted when
+      they asked for a static object.
+
+      The new node's structural identifier and its parameter values are
+      both taken from the node-catalog manifest. Every accepted
+      identifier, every accepted parameter name, every required
+      parameter, and every parameter's accepted type is declared in the
+      catalog and must be looked up there rather than guessed. Each
+      catalog entry also declares its kind, which determines whether the
+      entry accepts no children, a single child, or multiple children;
+      the parent's declared arity is the binding constraint on
+      insertion. Attempting to insert into a parent whose arity is
+      already saturated, or into a parent whose kind does not accept
+      children at all, is rejected with a structural-error response that
+      names the parent and reports its allowed arity. On receiving such
+      a response the caller should restructure the tree — typically by
+      first introducing a multi-child parent under the saturated
+      decorator — rather than re-attempting the same shape.
+
+      Pose-bearing leaves declare their reference-frame parameter as a
+      sibling of the pose object, not as a key inside the pose object;
+      the catalog entry is the source of truth on whether a parameter is
+      nested under another parameter or top-level, and must be consulted
+      whenever a parameter's name appears in more than one place in a
+      payload draft.
+
+      The model can pass the new-node payload either as a structured
+      object or as a JSON-encoded string fallback if that is what its
+      tool-call format produces; the bridge normalizes the string form
+      back to an object before validation. Successful insertion mutates
+      the draft and is reflected in subsequent reads of the program.
+      Phrases describing actions to be taken at a specific moment of
+      execution — at the end of a cycle, after each iteration, when a
+      runtime event occurs — are signals that the corresponding
+      requirement is a behavior-tree node and belongs to this tool,
+      not to the scene-draft tools.
+  - id: tree_draft_update_node_params
     effect: composer_draft_mutating
     description: |
-      [SCOPE: behavior_tree | TIMING: runtime per cycle]
-      Insert a behavior-tree node into the program tree. Use this for any
-      action the robot/program should perform DURING execution at a specific
-      point in the cycle, including runtime scene mutations:
-      - `add_collision_object` to add an object during runtime
-      - `remove_collision_object` to remove an object during runtime
-      - `upsert_collision_object` to insert-or-replace an object during runtime
-      - `update_collision_object_pose` to move an object during runtime
-      - `attach_object_to_link` / `detach_object_from_link` for grasping
-      - control-flow: sequence, fallback, parallel, repeat, retry, inverter
-      Phrases like 'at the end of the cycle', 'after each iteration', 'when X
-      happens during execution' are clear signals to use this tool, not
-      scene.draft.*.
-  - id: tree.draft.update_node_params
-    effect: composer_draft_mutating
-    description: Update parameters on an existing draft tree node.
-  - id: tree.draft.delete_node
-    effect: composer_draft_mutating
-    description: Delete an existing non-root draft tree node and its subtree.
-  - id: tree.draft.move_node
-    effect: composer_draft_mutating
-    description: Move an existing draft tree node under another parent.
-  - id: tree.draft.replace_subtree
-    effect: composer_draft_mutating
-    description: Replace an existing draft tree subtree with a validated subtree.
-  - id: tree.draft.wrap_node
+      Changes the parameter values on a node already present in the
+      draft tree, without altering the tree's structure. The node is
+      identified by its instance name. The parameter payload must
+      satisfy the catalog entry's parameter declarations; sending a
+      parameter outside that declaration, or omitting a required
+      parameter while in non-merge mode, is rejected with a
+      structural-error response that lists the parameters actually
+      sent and the parameters expected by the catalog. Use this tool
+      when a request describes modifying the behavior of an existing
+      node — its speed, its pose target, the identifier of the object
+      it operates on, and so on — rather than restructuring the tree.
+      The merge flag controls whether unspecified parameters are
+      preserved or dropped; choose merge when the request only adjusts
+      a subset of values.
+  - id: tree_draft_delete_node
     effect: composer_draft_mutating
     description: |
-      Wrap an existing behavior-tree node with a new parent (decorator or
-      control-flow). The target becomes the wrapper's only child, preserving
-      the target's full subtree. Wrapping the root produces a new root. Pass
-      targetName="@root" to wrap the current root without needing to know its
-      name.
+      Removes a non-root node and the entire subtree rooted at it from
+      the draft. The node is identified by its instance name. Use this
+      tool when a request describes removing a step or an entire branch
+      of behavior. Removing the root is not permitted; if the request
+      implies the entire program should be cleared, that is a different
+      operation outside this tool.
+  - id: tree_draft_move_node
+    effect: composer_draft_mutating
+    description: |
+      Moves an existing node and its subtree under a different parent
+      in the draft. The node and the new parent are both identified by
+      their instance names. The new parent's catalog-declared arity
+      must accept the additional child; the move is rejected with a
+      structural-error response otherwise. Use this tool when a
+      request describes reorganizing existing behavior rather than
+      introducing new behavior — for example, lifting a step out of
+      its current parent into a sibling position elsewhere, or sliding
+      a step from one branch of a multi-child parent into another.
+  - id: tree_draft_replace_subtree
+    effect: composer_draft_mutating
+    description: |
+      Atomically replaces a node and its entire subtree with a new
+      subtree in the draft. The target is identified by its instance
+      name. Use this tool for restructurings that would otherwise
+      require a long sequence of insert, wrap, move, and delete
+      operations — when the change is large enough that a
+      transaction-style replacement is more reliable than incremental
+      edits. The new subtree must be a valid program tree on its own
+      under this assistant mode's allowed catalog: the root's catalog
+      kind determines the root's arity, every nested node identifier
+      must be in the allowed-nodes set for this mode, and instance
+      names within the new subtree must not collide with names already
+      present in the rest of the tree. The same payload-form latitude
+      applies as for insertion: a structured object is preferred, and
+      a JSON-encoded string is accepted as a fallback.
+  - id: tree_draft_swap_node
+    effect: composer_draft_mutating
+    description: |
+      Changes the catalog identifier of an existing node in place
+      while preserving the node's instance name, its parent, and its
+      entire subtree. Use this tool when a request describes
+      switching one node kind for a structurally compatible one — for
+      example, replacing a decorator with a different decorator of
+      the same arity, swapping a composite for a sibling composite of
+      the same arity, or substituting one scene-create leaf for a
+      related scene-create leaf — without rewriting any of the
+      surrounding tree. The instance name is preserved
+      unconditionally, so other parts of the program that reference
+      this node by name keep working.
 
-      wrapper.id MUST be a literal node-catalog id like 'repeat', 'sequence',
-      'fallback', 'parallel', 'retry', 'inverter'. Do NOT invent variants like
-      'repeat_root' or 'repeat_node' — those will be rejected.
+      The new catalog identifier must be in the deployment catalog
+      and in this assistant mode's allowed-nodes set. The current
+      child count must satisfy the new identifier's arity range. The
+      merged parameters (the existing node's params overlaid by
+      whatever the caller supplies) must satisfy the new identifier's
+      parameter declarations; the paramsMode option controls whether
+      the supplied payload replaces the existing params, merges into
+      them, or strictly rejects when the existing params are not all
+      accepted by the new identifier.
 
-      The wrapper MUST NOT include `children` — the handler inserts the
-      target's existing subtree as the wrapper's only child.
-  - id: program.draft.upsert_parameters
+      Catalog entries may declare a swap_class field naming a
+      compatibility family. When both the current and new entries
+      declare such a family and the families differ, the call is
+      rejected unless force is set to true. Entries without a
+      declared family are validated structurally only.
+
+      Prefer this tool over replace_subtree whenever the goal is to
+      change a node's kind while keeping its position and children
+      intact — replace_subtree would force the caller to re-emit the
+      entire subtree from scratch. Prefer wrap_node when the goal is
+      to add a new parent above an existing node rather than to
+      change the existing node's kind.
+  - id: tree_draft_wrap_node
     effect: composer_draft_mutating
-    description: Insert or replace program parameter declarations in the Composer draft.
-  - id: program.draft.remove_parameters
+    description: |
+      Wraps an existing node with a new parent, making the existing
+      node the wrapper's only child while the wrapper takes the
+      existing node's former position in the tree. Use this tool when
+      a request requires changing the control-flow context around an
+      existing piece of behavior without rewriting that behavior — for
+      example, making an existing step or branch repeat, retry on
+      failure, or be inverted.
+
+      The target is identified by its instance name; passing the
+      literal protocol token for the current root targets the root
+      without requiring its name. The wrapper's catalog identifier
+      must be looked up in the manifest and must be a control-flow or
+      decorator entry; arbitrary text variants that resemble a real
+      catalog identifier are rejected. The wrapper instance name must
+      be unique across the entire program tree; collision with an
+      existing name is rejected with a structural-error response, and
+      the caller should retry with a different name rather than retry
+      with the same one.
+
+      The wrapper payload must not carry its own children, because the
+      handler inserts the target's existing subtree as the wrapper's
+      only child and supplying additional children would be ambiguous.
+      A common pattern this tool enables: when a decorator's
+      single-child arity prevents inserting multiple steps directly
+      under it, wrap the decorator's existing child with a multi-child
+      parent first, then insert the additional steps under that new
+      multi-child parent.
+  - id: program_draft_upsert_parameters
     effect: composer_draft_mutating
-    description: Remove existing program parameter declarations from the Composer draft.
-  - id: blackboard.draft.upsert_namespaces
+    description: |
+      Declares or replaces program-level parameter declarations in the
+      draft. Program parameters are typed values bound at program-load
+      time and referenced by name from inside node parameters; they
+      let the same node react to different inputs across runs without
+      rewriting the tree. Use this tool when a request describes
+      adding a new tunable knob, or changing the type or default of an
+      existing one. The replacement is keyed by parameter name.
+      Failure modes are limited to validation errors on the parameter
+      declaration.
+  - id: program_draft_remove_parameters
     effect: composer_draft_mutating
-    description: Insert or replace blackboard namespace declarations in the Composer draft.
-  - id: blackboard.draft.remove_namespaces
+    description: |
+      Removes program-level parameter declarations from the draft. If
+      a node's parameter still references the removed name, the
+      program will fail validation; the caller is responsible for
+      clearing those references first.
+  - id: blackboard_draft_upsert_namespaces
     effect: composer_draft_mutating
-    description: Remove existing blackboard namespace declarations from the Composer draft.
-  - id: blackboard.draft.upsert_keys
+    description: |
+      Declares or replaces blackboard namespace declarations in the
+      draft. Blackboard namespaces group related runtime values
+      written by one node and read by others, with a contract
+      describing the expected shape. Use this tool when a request
+      introduces a new flow of data between nodes during execution, or
+      revises an existing such flow. The replacement is keyed by
+      namespace identifier.
+  - id: blackboard_draft_remove_namespaces
     effect: composer_draft_mutating
-    description: Insert or replace blackboard key declarations in the Composer draft.
-  - id: blackboard.draft.remove_keys
+    description: |
+      Removes blackboard namespace declarations from the draft. If any
+      node still binds to the removed namespace, the program will fail
+      validation.
+  - id: blackboard_draft_upsert_keys
     effect: composer_draft_mutating
-    description: Remove existing blackboard key declarations from the Composer draft.
+    description: |
+      Declares or replaces blackboard key declarations in the draft. A
+      blackboard key names a typed slot that nodes can read or write.
+      Use this tool when a request introduces a new piece of runtime
+      state shared between nodes, or revises an existing key's type.
+  - id: blackboard_draft_remove_keys
+    effect: composer_draft_mutating
+    description: |
+      Removes blackboard key declarations from the draft. If any node
+      still binds to the removed key, the program will fail validation.

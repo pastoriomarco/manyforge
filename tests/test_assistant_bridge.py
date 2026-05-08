@@ -156,10 +156,10 @@ def test_bridge_forwards_tool_input_schema_to_upstream(
     response = TestClient(bridge.app).post(
         "/v1/manyforge/assistant",
         json=_bridge_payload(
-            catalog_tools=["scene.draft.add_object"],
+            catalog_tools=["scene_draft_add_object"],
             tools=[
                 {
-                    "id": "scene.draft.add_object",
+                    "id": "scene_draft_add_object",
                     "effect": "composer_draft_mutating",
                     "description": "Add an object to the Composer draft scene.",
                     "inputSchema": input_schema,
@@ -307,10 +307,10 @@ def test_bridge_executes_read_only_tools_in_loop(
         json=_bridge_payload(
             request_id="req-read-loop",
             assistant_mode="query",
-            catalog_tools=["program.read"],
+            catalog_tools=["program_read"],
             tools=[
                 {
-                    "id": "program.read",
+                    "id": "program_read",
                     "effect": "read_only",
                     "description": "Read the loaded program.",
                 }
@@ -323,11 +323,11 @@ def test_bridge_executes_read_only_tools_in_loop(
     assert "error" not in payload
     assert payload["message"] == "The program is loaded."
     assert payload["proposals"] == []
-    assert payload["toolCalls"][0]["name"] == "program.read"
+    assert payload["toolCalls"][0]["name"] == "program_read"
     assert payload["toolCalls"][0]["status"] == "completed"
     assert payload["toolCalls"][0]["result"] == {"programLoaded": True}
     assert len(upstream_messages) == 2
-    assert callbacks[0]["tool_id"] == "program.read"
+    assert callbacks[0]["tool_id"] == "program_read"
     assert callbacks[0]["effect"] == "read_only"
 
     audit_record = json.loads(audit_log.read_text(encoding="utf-8").splitlines()[-1])
@@ -396,10 +396,10 @@ def test_bridge_executes_composer_draft_mutating_tools_in_composer_mode(
         json=_bridge_payload(
             request_id="req-draft-loop",
             assistant_mode="composer-assistant",
-            catalog_tools=["scene.draft.add_object"],
+            catalog_tools=["scene_draft_add_object"],
             tools=[
                 {
-                    "id": "scene.draft.add_object",
+                    "id": "scene_draft_add_object",
                     "effect": "composer_draft_mutating",
                     "description": "Add an object to the Composer draft scene.",
                 }
@@ -413,7 +413,7 @@ def test_bridge_executes_composer_draft_mutating_tools_in_composer_mode(
     assert payload["message"] == "I added box_1 to the draft."
     assert payload["draftMutated"] is True
     assert payload["mutated"] is False
-    assert payload["toolCalls"][0]["name"] == "scene.draft.add_object"
+    assert payload["toolCalls"][0]["name"] == "scene_draft_add_object"
     assert payload["toolCalls"][0]["status"] == "completed"
     assert callbacks[0]["effect"] == "composer_draft_mutating"
     assert len(upstream_messages) == 2
@@ -456,10 +456,10 @@ def test_bridge_rejects_composer_draft_mutating_tool_in_query_mode(
         json=_bridge_payload(
             request_id="req-draft-query",
             assistant_mode="query",
-            catalog_tools=["scene.draft.add_object"],
+            catalog_tools=["scene_draft_add_object"],
             tools=[
                 {
-                    "id": "scene.draft.add_object",
+                    "id": "scene_draft_add_object",
                     "effect": "composer_draft_mutating",
                     "description": "Add an object to the Composer draft scene.",
                 }

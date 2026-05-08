@@ -34,7 +34,7 @@ Cold-boot and live E2E cookbook:
   validates per spec 480 §6.3 (fail-closed on missing `assistantMode`,
   malformed catalog, etc.), filters `tools[]` to the embedded catalog,
   converts ManyForge tool descriptors to OpenAI shape, maps ManyForge
-  ids such as `program.read` to model-safe function names, dispatches
+  ids such as `program_read` to model-safe function names, dispatches
   to the upstream LLM, executes in-catalog callback-safe calls via
   Composer callbacks, hard-rejects any out-of-catalog tool calls, and
   returns a ManyForge-shaped envelope with `mutated: false`,
@@ -99,7 +99,7 @@ Environment overrides:
 | `BRIDGE_CALLBACK_TIMEOUT_S` | `10` | per-callback timeout |
 | `BRIDGE_MAX_TURNS` | `16` | maximum model turns per request |
 | `BRIDGE_MAX_WALL_TIME_S` | `60` | maximum wall time per bridge request |
-| `BRIDGE_UPSTREAM_MAX_TOKENS` | `512` | upstream chat-completion output token cap |
+| `BRIDGE_UPSTREAM_MAX_TOKENS` | `2048` | upstream chat-completion output token cap. Raised from 512 (2026-05-07) so action-tool JSON args can close on inline-snapshot turns; smaller models with weak stop-token discipline may want lower values |
 | `BRIDGE_UPSTREAM_TEMPERATURE` | `0.0` | upstream sampling temperature |
 | `BRIDGE_UPSTREAM_TOP_P` | _unset_ | optional upstream nucleus-sampling cap |
 | `BRIDGE_UPSTREAM_TOP_K` | _unset_ | optional upstream top-k sampling cap |

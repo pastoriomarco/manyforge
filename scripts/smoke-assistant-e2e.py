@@ -28,14 +28,10 @@ from typing import Any
 
 
 REQUEST_VERSION = "manyforge.assistant.provider_request.v0"
-DEFAULT_MODEL = "nemotron3-nano-omni-30b-a3b-nvfp4"
+DEFAULT_MODEL = "cosmos-reason2-8b"
 DEFAULT_PROFILES = [
     "vllm-generation-config",
-    "bridge-default",
-    "omni-vendor-tool",
-    "omni-vendor-tool-no-think",
-    "omni-instruct-no-think-32768",
-    "omni-deterministic-no-think",
+    "cosmos-bridge-default",
 ]
 
 
@@ -62,6 +58,16 @@ PROFILES: dict[str, Profile] = {
         bridge_env={},
         upstream_body={"temperature": 0.0, "max_tokens": 512},
         note="Bridge defaults: deterministic, capped output, thinking unset.",
+    ),
+    "cosmos-bridge-default": Profile(
+        name="cosmos-bridge-default",
+        bridge_env={
+            "BRIDGE_UPSTREAM_MAX_TOKENS": "8192",
+            "BRIDGE_UPSTREAM_TEMPERATURE": "0.0",
+        },
+        upstream_body={"temperature": 0.0, "max_tokens": 8192},
+        expect_e2e_success=True,
+        note="Cosmos Reason2 8B bridge smoke profile; uses NemoClaw-Thor serving defaults plus a bounded output cap.",
     ),
     "omni-vendor-tool": Profile(
         name="omni-vendor-tool",
@@ -217,7 +223,7 @@ def main() -> int:
         "startedAt": time.time(),
         "profiles": {},
         "negativeCases": {},
-        "recommendedProfile": "omni-instruct-no-think-32768",
+        "recommendedProfile": "cosmos-bridge-default",
     }
 
     try:
@@ -337,7 +343,7 @@ def _run_profile(args: argparse.Namespace, profile: Profile, model: str) -> dict
 def _run_negative_cases(args: argparse.Namespace, model: str) -> dict[str, Any]:
     if args.skip_negative:
         return {"skipped": True}
-    profile = PROFILES["omni-instruct-no-think"]
+    profile = PROFILES["cosmos-bridge-default"]
     log_dir = Path(args.log_dir)
     log_dir.mkdir(parents=True, exist_ok=True)
     audit_path = log_dir / "negative-audit.jsonl"
@@ -366,7 +372,7 @@ def _run_negative_cases(args: argparse.Namespace, model: str) -> dict[str, Any]:
                     "mode": "provider",
                     "providerId": args.provider_id,
                     "assistantMode": "query",
-                    "requestedTools": ["scene.draft.add_object"],
+                    "requestedTools": ["scene_draft_add_object"],
                 },
                 timeout_s=args.case_timeout_s,
                 expected_status=400,
@@ -374,7 +380,7 @@ def _run_negative_cases(args: argparse.Namespace, model: str) -> dict[str, Any]:
             "invalidDraftCallbackArgs": _expect_http_error(
                 "Composer callback rejects invalid sceneResource",
                 _post_json,
-                f"{args.composer_url}/api/assistant/bridge/tools/scene.draft.add_object",
+                f"{args.composer_url}/api/assistant/bridge/tools/scene_draft_add_object",
                 {
                     "requestId": "negative-invalid-draft",
                     "assistantMode": "composer-assistant",
@@ -394,7 +400,7 @@ def _run_negative_cases(args: argparse.Namespace, model: str) -> dict[str, Any]:
                     "requestId": "negative-missing-mode",
                     "providerId": args.provider_id,
                     "message": "hello",
-                    "catalog": {"skills": [], "tools": [], "nodes": []},
+                    "catalog": {"skillCatalog": [], "nodeCatalog": []},
                     "tools": [],
                 },
                 timeout_s=args.case_timeout_s,
@@ -411,7 +417,7 @@ def _run_negative_cases(args: argparse.Namespace, model: str) -> dict[str, Any]:
                     "providerId": args.provider_id,
                     "assistantMode": "query",
                     "message": "hello",
-                    "catalog": {"skills": ["some.skill"], "tools": [], "nodes": []},
+                    "catalog": {"skillCatalog": [{"id": "some.skill"}], "nodeCatalog": []},
                     "tools": [],
                 },
                 timeout_s=args.case_timeout_s,
@@ -556,7 +562,7 @@ def _query_read_only_case(args: argparse.Namespace) -> dict[str, Any]:
         "mode": "provider",
         "providerId": args.provider_id,
         "assistantMode": "query",
-        "requestedTools": ["program.read"],
+        "requestedTools": ["program_read"],
     }
     started = time.perf_counter()
     try:
@@ -570,7 +576,7 @@ def _query_read_only_case(args: argparse.Namespace) -> dict[str, Any]:
             call
             for call in calls
             if isinstance(call, dict)
-            and call.get("name") == "program.read"
+            and call.get("name") == "program_read"
             and call.get("status") == "completed"
         ]
         status = _request_status(args, request_id)
@@ -600,7 +606,7 @@ def _composer_draft_add_case(args: argparse.Namespace, profile_name: str) -> dic
         "mode": "provider",
         "providerId": args.provider_id,
         "assistantMode": "composer-assistant",
-        "requestedTools": ["scene.draft.add_object"],
+        "requestedTools": ["scene_draft_add_object"],
     }
     started = time.perf_counter()
     try:
@@ -615,7 +621,7 @@ def _composer_draft_add_case(args: argparse.Namespace, profile_name: str) -> dic
             and object_id in scene_ids
             and any(
                 isinstance(call, dict)
-                and call.get("name") == "scene.draft.add_object"
+                and call.get("name") == "scene_draft_add_object"
                 and call.get("status") == "completed"
                 for call in (data.get("toolCalls") or [])
             )
@@ -668,7 +674,7 @@ def _operator_composer_flow_case(args: argparse.Namespace, profile_name: str) ->
         "mode": "provider",
         "providerId": args.provider_id,
         "assistantMode": "composer-assistant",
-        "requestedTools": ["scene.draft.upsert_objects"],
+        "requestedTools": ["scene_draft_upsert_objects"],
     }
     started = time.perf_counter()
     try:
@@ -691,7 +697,7 @@ def _operator_composer_flow_case(args: argparse.Namespace, profile_name: str) ->
         calls = data.get("toolCalls") or []
         allowed_tools = _active_mode_tools(args, "composer-assistant")
         validation_errors.extend(_out_of_mode_tool_errors(calls, allowed_tools, label="toolCalls"))
-        completed, tool_errors = _single_completed_tool_call(calls, "scene.draft.upsert_objects")
+        completed, tool_errors = _single_completed_tool_call(calls, "scene_draft_upsert_objects")
         validation_errors.extend(tool_errors)
         argument_resources = _tool_call_scene_resources(completed)
         validation_errors.extend(
@@ -776,7 +782,7 @@ def _golden_scene_upsert_case(args: argparse.Namespace, profile_name: str) -> di
         "mode": "provider",
         "providerId": args.provider_id,
         "assistantMode": "composer-assistant",
-        "requestedTools": ["scene.draft.upsert_objects"],
+        "requestedTools": ["scene_draft_upsert_objects"],
     }
     started = time.perf_counter()
     try:
@@ -790,7 +796,7 @@ def _golden_scene_upsert_case(args: argparse.Namespace, profile_name: str) -> di
         upsert_calls = [
             call
             for call in calls
-            if isinstance(call, dict) and call.get("name") == "scene.draft.upsert_objects"
+            if isinstance(call, dict) and call.get("name") == "scene_draft_upsert_objects"
         ]
         completed = [
             call
@@ -807,11 +813,11 @@ def _golden_scene_upsert_case(args: argparse.Namespace, profile_name: str) -> di
             validation_errors.append(f"expected exactly 1 tool call, got {len(calls)}")
         if len(upsert_calls) != 1:
             validation_errors.append(
-                f"expected exactly 1 scene.draft.upsert_objects call, got {len(upsert_calls)}"
+                f"expected exactly 1 scene_draft_upsert_objects call, got {len(upsert_calls)}"
             )
         if len(completed) != 1:
             validation_errors.append(
-                f"expected exactly 1 completed scene.draft.upsert_objects call, got {len(completed)}"
+                f"expected exactly 1 completed scene_draft_upsert_objects call, got {len(completed)}"
             )
         validation_errors.extend(_out_of_mode_tool_errors(calls, allowed_tools, label="toolCalls"))
 
@@ -935,7 +941,7 @@ def _golden_tree_insert_case(args: argparse.Namespace, profile_name: str) -> dic
         "mode": "provider",
         "providerId": args.provider_id,
         "assistantMode": "composer-assistant",
-        "requestedTools": ["tree.draft.insert_node"],
+        "requestedTools": ["tree_draft_insert_node"],
     }
     started = time.perf_counter()
     try:
@@ -948,7 +954,7 @@ def _golden_tree_insert_case(args: argparse.Namespace, profile_name: str) -> dic
         allowed_tools = _active_mode_tools(args, "composer-assistant")
         completed, validation_errors = _single_completed_tool_call(
             calls,
-            "tree.draft.insert_node",
+            "tree_draft_insert_node",
         )
         validation_errors.extend(_out_of_mode_tool_errors(calls, allowed_tools, label="toolCalls"))
         arguments = completed.get("arguments") if completed else {}
@@ -1039,7 +1045,7 @@ def _golden_parameter_upsert_case(args: argparse.Namespace, profile_name: str) -
         "mode": "provider",
         "providerId": args.provider_id,
         "assistantMode": "composer-assistant",
-        "requestedTools": ["program.draft.upsert_parameters"],
+        "requestedTools": ["program_draft_upsert_parameters"],
     }
     started = time.perf_counter()
     try:
@@ -1052,7 +1058,7 @@ def _golden_parameter_upsert_case(args: argparse.Namespace, profile_name: str) -
         allowed_tools = _active_mode_tools(args, "composer-assistant")
         completed, validation_errors = _single_completed_tool_call(
             calls,
-            "program.draft.upsert_parameters",
+            "program_draft_upsert_parameters",
         )
         validation_errors.extend(_out_of_mode_tool_errors(calls, allowed_tools, label="toolCalls"))
         arguments = completed.get("arguments") if completed else {}
@@ -1155,8 +1161,8 @@ def _golden_blackboard_upsert_case(args: argparse.Namespace, profile_name: str) 
         "providerId": args.provider_id,
         "assistantMode": "composer-assistant",
         "requestedTools": [
-            "blackboard.draft.upsert_namespaces",
-            "blackboard.draft.upsert_keys",
+            "blackboard_draft_upsert_namespaces",
+            "blackboard_draft_upsert_keys",
         ],
     }
     started = time.perf_counter()
@@ -1170,19 +1176,19 @@ def _golden_blackboard_upsert_case(args: argparse.Namespace, profile_name: str) 
         allowed_tools = _active_mode_tools(args, "composer-assistant")
         namespace_call, namespace_errors = _single_completed_tool_call(
             calls,
-            "blackboard.draft.upsert_namespaces",
+            "blackboard_draft_upsert_namespaces",
             exact_total=False,
         )
         key_call, key_errors = _single_completed_tool_call(
             calls,
-            "blackboard.draft.upsert_keys",
+            "blackboard_draft_upsert_keys",
             exact_total=False,
         )
         validation_errors = namespace_errors + key_errors
         validation_errors.extend(_out_of_mode_tool_errors(calls, allowed_tools, label="toolCalls"))
         validation_errors.extend(_exact_string_set_errors(_tool_call_names_from_response(calls), [
-            "blackboard.draft.upsert_namespaces",
-            "blackboard.draft.upsert_keys",
+            "blackboard_draft_upsert_namespaces",
+            "blackboard_draft_upsert_keys",
         ], label="toolCalls.names"))
         namespace_arguments = namespace_call.get("arguments") if namespace_call else {}
         key_arguments = key_call.get("arguments") if key_call else {}
@@ -1310,9 +1316,9 @@ def _draft_tool_surface_case(args: argparse.Namespace, profile_name: str) -> dic
 
     try:
         discovery = {
-            "catalog": call("catalog.read", {"entryIds": ["remove_collision_object"]}),
-            "skills": call("skills.read", {"includeBodies": False}),
-            "capabilities": call("deployment.capabilities.read", {}),
+            "catalog": call("catalog_read", {"entryIds": ["remove_collision_object"]}),
+            "skills": call("skills_read", {"includeBodies": False}),
+            "capabilities": call("deployment_capabilities_read", {}),
         }
         scene_object_id = f"assistant_surface_{slug}"
         scene_resource = {
@@ -1324,12 +1330,12 @@ def _draft_tool_surface_case(args: argparse.Namespace, profile_name: str) -> dic
                 "orientation_rpy_deg": [0.0, 0.0, 0.0],
             },
         }
-        upsert_scene = call("scene.draft.upsert_objects", {"sceneResources": [scene_resource]})
-        remove_scene = call("scene.draft.remove_objects", {"objectIds": [scene_object_id]})
+        upsert_scene = call("scene_draft_upsert_objects", {"sceneResources": [scene_resource]})
+        remove_scene = call("scene_draft_remove_objects", {"objectIds": [scene_object_id]})
 
         temp_node_name = f"assistant_surface_remove_{slug}"
         insert_tree = call(
-            "tree.draft.insert_node",
+            "tree_draft_insert_node",
             {
                 "parentName": "pick_and_place",
                 "index": 0,
@@ -1341,18 +1347,18 @@ def _draft_tool_surface_case(args: argparse.Namespace, profile_name: str) -> dic
             },
         )
         update_tree = call(
-            "tree.draft.update_node_params",
+            "tree_draft_update_node_params",
             {
                 "nodeName": temp_node_name,
                 "params": {"object_id": f"{scene_object_id}_renamed"},
             },
         )
         move_tree = call(
-            "tree.draft.move_node",
+            "tree_draft_move_node",
             {"nodeName": temp_node_name, "newParentName": "pick_and_place", "index": 1},
         )
         replace_tree = call(
-            "tree.draft.replace_subtree",
+            "tree_draft_replace_subtree",
             {
                 "nodeName": temp_node_name,
                 "subtree": {
@@ -1363,13 +1369,13 @@ def _draft_tool_surface_case(args: argparse.Namespace, profile_name: str) -> dic
             },
         )
         delete_tree = call(
-            "tree.draft.delete_node",
+            "tree_draft_delete_node",
             {"nodeName": f"assistant_surface_replacement_{slug}"},
         )
 
         param_name = f"assistant_surface_param_{slug}"
         upsert_param = call(
-            "program.draft.upsert_parameters",
+            "program_draft_upsert_parameters",
             {
                 "parameters": [
                     {
@@ -1381,12 +1387,12 @@ def _draft_tool_surface_case(args: argparse.Namespace, profile_name: str) -> dic
                 ]
             },
         )
-        remove_param = call("program.draft.remove_parameters", {"names": [param_name]})
+        remove_param = call("program_draft_remove_parameters", {"names": [param_name]})
 
         namespace_id = f"assistant_surface_ns_{slug}"
         key_id = f"assistant_surface_key_{slug}"
         upsert_namespace = call(
-            "blackboard.draft.upsert_namespaces",
+            "blackboard_draft_upsert_namespaces",
             {
                 "namespaces": [
                     {
@@ -1399,11 +1405,11 @@ def _draft_tool_surface_case(args: argparse.Namespace, profile_name: str) -> dic
             },
         )
         upsert_key = call(
-            "blackboard.draft.upsert_keys",
+            "blackboard_draft_upsert_keys",
             {"keys": [{"id": key_id, "type": "bool", "key": f"/{key_id}"}]},
         )
-        remove_key = call("blackboard.draft.remove_keys", {"ids": [key_id]})
-        remove_namespace = call("blackboard.draft.remove_namespaces", {"ids": [namespace_id]})
+        remove_key = call("blackboard_draft_remove_keys", {"ids": [key_id]})
+        remove_namespace = call("blackboard_draft_remove_namespaces", {"ids": [namespace_id]})
 
         call_results = {
             "discovery": discovery,
@@ -1434,22 +1440,22 @@ def _draft_tool_surface_case(args: argparse.Namespace, profile_name: str) -> dic
             "durationS": round(time.perf_counter() - started, 3),
             "checkedTools": sorted(
                 [
-                    "catalog.read",
-                    "skills.read",
-                    "deployment.capabilities.read",
-                    "scene.draft.upsert_objects",
-                    "scene.draft.remove_objects",
-                    "tree.draft.insert_node",
-                    "tree.draft.update_node_params",
-                    "tree.draft.move_node",
-                    "tree.draft.replace_subtree",
-                    "tree.draft.delete_node",
-                    "program.draft.upsert_parameters",
-                    "program.draft.remove_parameters",
-                    "blackboard.draft.upsert_namespaces",
-                    "blackboard.draft.upsert_keys",
-                    "blackboard.draft.remove_keys",
-                    "blackboard.draft.remove_namespaces",
+                    "catalog_read",
+                    "skills_read",
+                    "deployment_capabilities_read",
+                    "scene_draft_upsert_objects",
+                    "scene_draft_remove_objects",
+                    "tree_draft_insert_node",
+                    "tree_draft_update_node_params",
+                    "tree_draft_move_node",
+                    "tree_draft_replace_subtree",
+                    "tree_draft_delete_node",
+                    "program_draft_upsert_parameters",
+                    "program_draft_remove_parameters",
+                    "blackboard_draft_upsert_namespaces",
+                    "blackboard_draft_upsert_keys",
+                    "blackboard_draft_remove_keys",
+                    "blackboard_draft_remove_namespaces",
                 ]
             ),
             "toolResults": {
@@ -1479,7 +1485,7 @@ def _cancel_proxy_case(args: argparse.Namespace, profile_name: str) -> dict[str,
         "mode": "provider",
         "providerId": args.provider_id,
         "assistantMode": "query",
-        "requestedTools": ["program.read"],
+        "requestedTools": ["program_read"],
     }
     result: dict[str, Any] = {}
 
@@ -1550,7 +1556,7 @@ def _composer_cancelled_error_case(args: argparse.Namespace) -> dict[str, Any]:
                 "mode": "provider",
                 "providerId": args.provider_id,
                 "assistantMode": "query",
-                "requestedTools": ["program.read"],
+                "requestedTools": ["program_read"],
             },
             timeout_s=args.case_timeout_s,
         )
@@ -1737,27 +1743,27 @@ def _active_mode_tools(args: argparse.Namespace, mode_id: str) -> list[str]:
         # Compatibility fallback for already-running Composer instances that
         # predate the response-model update for composer_draft_mutating tools.
         tools = [
-            "catalog.read",
-            "skills.read",
-            "deployment.capabilities.read",
+            "catalog_read",
+            "skills_read",
+            "deployment_capabilities_read",
             "inspect_isaac_scene",
             "propose_scene_objects",
             "propose_scene_object_nodes",
-            "scene.draft.add_object",
-            "scene.draft.update_object",
-            "scene.draft.upsert_objects",
-            "scene.draft.remove_objects",
-            "tree.draft.insert_node",
-            "tree.draft.update_node_params",
-            "tree.draft.delete_node",
-            "tree.draft.move_node",
-            "tree.draft.replace_subtree",
-            "program.draft.upsert_parameters",
-            "program.draft.remove_parameters",
-            "blackboard.draft.upsert_namespaces",
-            "blackboard.draft.remove_namespaces",
-            "blackboard.draft.upsert_keys",
-            "blackboard.draft.remove_keys",
+            "scene_draft_add_object",
+            "scene_draft_update_object",
+            "scene_draft_upsert_objects",
+            "scene_draft_remove_objects",
+            "tree_draft_insert_node",
+            "tree_draft_update_node_params",
+            "tree_draft_delete_node",
+            "tree_draft_move_node",
+            "tree_draft_replace_subtree",
+            "program_draft_upsert_parameters",
+            "program_draft_remove_parameters",
+            "blackboard_draft_upsert_namespaces",
+            "blackboard_draft_remove_namespaces",
+            "blackboard_draft_upsert_keys",
+            "blackboard_draft_remove_keys",
         ]
     if not isinstance(tools, list) or not all(isinstance(tool, str) for tool in tools):
         raise SmokeFailure(f"assistantModes.{mode_id}.catalog.tools is not a list of strings")

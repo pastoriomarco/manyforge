@@ -82,7 +82,7 @@ def create_app(
     # raised by a route handler escapes this middleware to
     # ServerErrorMiddleware, which renders it as a flat HTTP 500
     # "Internal Server Error" with no detail (verified 2026-05-06 against
-    # /api/assistant/bridge/tools/tree.draft.wrap_node returning duplicate-
+    # /api/assistant/bridge/tools/tree_draft_wrap_node returning duplicate-
     # node errors as 500 → the LLM-side agent loops forever because the
     # error has no actionable info). Catching HTTPException here and
     # delegating to FastAPI's built-in handler renders the correct

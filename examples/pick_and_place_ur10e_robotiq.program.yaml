@@ -6,7 +6,7 @@ description: 'Pick-and-place demo with UR10e + Robotiq 2F-140: approach/pick/ret
   (RRT + TOPPRA), simulated Robotiq finger actuation, and scene attach/detach semantics.
   Sequence follows the existing ManyForge pattern: approach -> pick -> retreat ->
   approach drop -> drop -> retreat -> rest.'
-catalog_version: "0.1.0"
+catalog_version: 0.1.0
 robot:
   robot_id: ur10e
   group_id: arm
@@ -149,8 +149,6 @@ tree:
       velocity_scale: ${param:velocity_scale}
       planning_timeout_s: 10
       execution_timeout_s: 30
-  - id: reset_trajectories
-    name: invalidate_after_pick
   - id: move_manipulator_action
     name: move_to_drop_approach
     params:
@@ -246,8 +244,6 @@ tree:
       velocity_scale: ${param:velocity_scale}
       planning_timeout_s: 10
       execution_timeout_s: 30
-  - id: reset_trajectories
-    name: invalidate_after_drop
   - id: move_manipulator_action
     name: return_rest
     params:

@@ -68,12 +68,39 @@ class MoveManipulatorAction(py_trees.behaviour.Behaviour):
             "global_max_tcp_linear_speed_mps",
         ):
             self.blackboard.register_key(key=key, access=py_trees.common.Access.READ)
+        # Write keys: motion_error_message + motion_paused_due_to_error are
+        # how the motion node signals the cycle manager that it has entered
+        # a recoverable soft-fail state. Cycle manager reads them in its
+        # tick loop and quiesces the runtime (kernel pause + tick suspend +
+        # cycle.STOPPED) so the operator can either retry (Run again) or
+        # reset (Reset button rebuilds the tree). resume_after_error_
+        # requested is bidirectional: cycle_manager.run() sets it on
+        # STOPPED→RUNNING when a soft-fail is in flight, and the motion
+        # node consumes-and-clears it on the next tick so it doesn't
+        # re-fire stale resumes after a successful retry.
+        for key in (
+            "motion_error_message",
+            "motion_paused_due_to_error",
+            "motion_paused_node_name",
+            "resume_after_error_requested",
+        ):
+            self.blackboard.register_key(key=key, access=py_trees.common.Access.WRITE)
 
     def initialise(self) -> None:
         self._started = False
         self._execution_id = None
         self._motion_coordinator = None
         self._base_velocity_scale = float(self._params.get("velocity_scale", 1.0))
+        # Soft-fail state. When the kernel returns FAILED for our owned
+        # execution_id, we capture the cause here and hold Status.RUNNING
+        # on every subsequent tick until the operator either resumes
+        # (resume_after_error_requested clears it and we retry the same
+        # goal) or resets (the cycle manager destroys the tree externally,
+        # firing terminate() which cancels any in-flight kernel goal).
+        # This is the load-bearing change for motion recoverability:
+        # transient failures (collision, planning, execution timeout)
+        # become operator-resolvable instead of tree-terminating.
+        self._soft_fail_error = None
 
     def _read_optional_blackboard_value(self, key: str) -> Any | None:
         try:
@@ -81,10 +108,72 @@ class MoveManipulatorAction(py_trees.behaviour.Behaviour):
         except (KeyError, AttributeError):
             return None
 
+    def _set_blackboard_value(self, key: str, value: Any) -> None:
+        """Best-effort blackboard write that tolerates missing-key configurations."""
+        try:
+            self.blackboard.set(key, value)
+        except (KeyError, AttributeError):
+            pass
+
+    def _enter_soft_fail(self, error_message: str) -> py_trees.common.Status:
+        """Capture the failure cause and hold Status.RUNNING until resume/reset.
+
+        The motion node never returns Status.FAILURE on a runtime motion
+        error (planning failure, collision, execution timeout). Instead
+        it stores the cause, signals the cycle manager via blackboard,
+        and holds RUNNING. The cycle manager observes the signal in its
+        tick loop and transitions the cycle to STOPPED with the error
+        surfaced, kernel paused, tick thread suspended.
+
+        Two recovery paths:
+          - Operator clicks Run again: cycle manager clears the soft-fail
+            blackboard keys and sets resume_after_error_requested; on the
+            next tick this node retries the same goal.
+          - Operator clicks Reset: cycle manager destroys the tree
+            externally and rebuilds; this node's terminate() cancels any
+            in-flight kernel goal so we don't orphan motions.
+        """
+        self._soft_fail_error = error_message
+        self.feedback_message = error_message
+        self._set_blackboard_value("motion_error_message", error_message)
+        self._set_blackboard_value("motion_paused_due_to_error", True)
+        self._set_blackboard_value("motion_paused_node_name", self.name)
+        return py_trees.common.Status.RUNNING
+
+    def _clear_soft_fail_state(self) -> None:
+        """Reset internal + blackboard soft-fail state so the next tick re-issues the goal."""
+        self._soft_fail_error = None
+        self._started = False
+        self._execution_id = None
+        self.feedback_message = ""
+        self._set_blackboard_value("motion_error_message", None)
+        self._set_blackboard_value("motion_paused_due_to_error", False)
+        self._set_blackboard_value("motion_paused_node_name", None)
+        # Consume the resume signal so a subsequent successful tick does
+        # not re-trigger another retry from a stale flag. The cycle
+        # manager re-sets it the next time it transitions out of a
+        # motion-paused STOPPED state.
+        self._set_blackboard_value("resume_after_error_requested", False)
+
     def update(self) -> py_trees.common.Status:
         stop_requested = self._read_optional_blackboard_value("stop_requested")
         if stop_requested:
             return py_trees.common.Status.RUNNING  # block, don't start new motion
+
+        # Soft-fail handling: if a previous tick captured a kernel failure,
+        # hold RUNNING until the operator's resume signal arrives. The
+        # cycle manager sets resume_after_error_requested when the
+        # operator clicks Run after a soft-fail; the flag is consumed
+        # here and the motion is re-issued on the next pass.
+        if self._soft_fail_error is not None:
+            resume_requested = self._read_optional_blackboard_value(
+                "resume_after_error_requested"
+            )
+            if resume_requested:
+                self._clear_soft_fail_state()
+                # Fall through and re-execute with a fresh goal.
+            else:
+                return py_trees.common.Status.RUNNING
 
         effective_velocity_scale = self._base_velocity_scale
         bb_velocity_scale = self._read_optional_blackboard_value("velocity_scale")
@@ -220,20 +309,73 @@ class MoveManipulatorAction(py_trees.behaviour.Behaviour):
             result = self._motion_coordinator.execute(request)
             self._started = True
             if not result.ok:
-                self.feedback_message = result.error or "Motion execution rejected"
-                return py_trees.common.Status.FAILURE
+                # Planning rejected at submission. Soft-fail so the operator
+                # can adjust the scene/parameters and Run again to retry.
+                return self._enter_soft_fail(
+                    result.error or "Motion execution rejected"
+                )
             self._execution_id = result.execution_id
 
         if self._execution_id is None:
-            self.feedback_message = "Motion execution id was not recorded"
-            return py_trees.common.Status.FAILURE
+            # Defensive: this is an internal invariant violation, not a
+            # recoverable runtime failure. Surface it but still soft-fail
+            # so the operator isn't stuck with a terminated tree.
+            return self._enter_soft_fail("Motion execution id was not recorded")
         update = self._motion_coordinator.update(self._execution_id)
         if update.state == "succeeded":
             return py_trees.common.Status.SUCCESS
         if update.state == "failed":
-            self.feedback_message = update.error or "Motion execution failed"
-            return py_trees.common.Status.FAILURE
+            # Kernel reached FAILED or STOPPED for our owned execution_id
+            # (collision detected mid-execute, planning timeout, joint-limit,
+            # etc.). Soft-fail with the kernel's actual cause string —
+            # which now flows through motion_runtime.update() pulling from
+            # ExecutionSnapshot.error. The operator can Run again to retry
+            # the same goal or Reset to clear the cycle.
+            return self._enter_soft_fail(
+                update.error or "Motion execution failed"
+            )
         return py_trees.common.Status.RUNNING
+
+    def terminate(self, new_status: py_trees.common.Status) -> None:
+        """Cancel any in-flight kernel goal when py_trees halts this node.
+
+        Called when the parent halts the node (e.g., the tree is being
+        rebuilt after Reset, or an interrupt handler preempts the tree).
+        Without this, a kernel goal mid-execution would continue running
+        even though the BT no longer owns it — orphaned motion, the worst
+        kind of safety hazard. We issue kernel.stop() if the current
+        kernel state matches our owned execution_id and is in a stoppable
+        state. Best-effort: kernel API may not be available in all
+        configurations (e.g., during shutdown), so swallow exceptions.
+        """
+        if not self._started or self._execution_id is None:
+            return
+        try:
+            kernel = self.blackboard.kernel
+        except (KeyError, AttributeError):
+            return
+        try:
+            status = kernel.get_status()
+        except Exception:  # noqa: BLE001 — kernel may already be torn down
+            return
+        if status.execution_id != self._execution_id:
+            return
+        # Only cancel if the kernel is doing something cancellable for our
+        # goal. COMPLETED/IDLE/STOPPED/FAILED are already terminal and
+        # need no cancel call.
+        from manyforge_behavior.kernel_client import ExecutionState
+        stoppable_states = {
+            ExecutionState.PLANNING,
+            ExecutionState.VALIDATING,
+            ExecutionState.EXECUTING,
+            ExecutionState.PAUSED,
+            ExecutionState.STOPPING,
+        }
+        if status.state in stoppable_states:
+            try:
+                kernel.stop()
+            except Exception:  # noqa: BLE001 — best-effort cancel
+                pass
 
 
 class ResetTrajectories(py_trees.behaviour.Behaviour):

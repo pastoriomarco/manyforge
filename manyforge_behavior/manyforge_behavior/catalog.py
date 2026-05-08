@@ -97,6 +97,19 @@ class CatalogEntry:
     runners: dict[str, Any] = field(default_factory=dict)
     interruptible: bool = False
     default_interrupt_scope: Optional[str] = None
+    # Optional swap-compatibility family. When two entries declare the
+    # same swap_class, tree_draft_swap_node treats them as semantically
+    # interchangeable (subject to arity and param validation). When they
+    # declare different families, swap is rejected unless the caller
+    # passes force=true. Entries without a declared swap_class fall back
+    # to structural validation only. Free-form string; used as an
+    # equivalence key, not as a typed enum.
+    swap_class: Optional[str] = None
+    # Optional alias hints surfaced when params get dropped during a
+    # swap. Maps an old-id parameter name to its analogous new-id
+    # parameter name. Pure documentation; the swap handler does NOT
+    # auto-rename, only reports the alias to the caller.
+    swap_param_aliases: dict[str, str] = field(default_factory=dict)
 
 
 class CatalogValidationError(Exception):
@@ -200,6 +213,25 @@ class NodeCatalog:
             entry_id=entry_id,
         )
 
+        swap_class_raw = raw.get("swap_class")
+        if swap_class_raw is not None and not isinstance(swap_class_raw, str):
+            raise CatalogValidationError(
+                f"Entry '{entry_id}': swap_class must be a string when declared"
+            )
+        swap_class = swap_class_raw.strip() if isinstance(swap_class_raw, str) and swap_class_raw.strip() else None
+        swap_param_aliases_raw = raw.get("swap_param_aliases", {})
+        if not isinstance(swap_param_aliases_raw, dict):
+            raise CatalogValidationError(
+                f"Entry '{entry_id}': swap_param_aliases must be a mapping"
+            )
+        swap_param_aliases: dict[str, str] = {}
+        for k, v in swap_param_aliases_raw.items():
+            if not isinstance(k, str) or not isinstance(v, str):
+                raise CatalogValidationError(
+                    f"Entry '{entry_id}': swap_param_aliases keys and values must be strings"
+                )
+            swap_param_aliases[k] = v
+
         return CatalogEntry(
             id=entry_id,
             name=raw.get("name", entry_id),
@@ -217,6 +249,8 @@ class NodeCatalog:
             runners=raw.get("runners", {}),
             interruptible=bool(raw.get("interruptible", False)),
             default_interrupt_scope=raw.get("default_interrupt_scope"),
+            swap_class=swap_class,
+            swap_param_aliases=swap_param_aliases,
         )
 
     @staticmethod

@@ -317,64 +317,64 @@ function toolCallSummary(call: AssistantToolCall): string {
 
   let summary: string;
   switch (call.name) {
-    case 'program.read':
+    case 'program_read':
       summary = 'Read the current program';
       break;
-    case 'program.validate':
+    case 'program_validate':
       summary = 'Validated the current program';
       break;
-    case 'catalog.read':
+    case 'catalog_read':
       summary = 'Read the node catalog';
       break;
-    case 'skills.read':
+    case 'skills_read':
       summary = 'Read the skill catalog';
       break;
-    case 'deployment.capabilities.read':
+    case 'deployment_capabilities_read':
       summary = 'Read deployment capabilities';
       break;
-    case 'scene.draft.add_object':
+    case 'scene_draft_add_object':
       summary = summarizeItems('Added', 'scene object', sceneIds);
       break;
-    case 'scene.draft.update_object':
+    case 'scene_draft_update_object':
       summary = summarizeItems('Updated', 'scene object', sceneIds);
       break;
-    case 'scene.draft.upsert_objects':
+    case 'scene_draft_upsert_objects':
       summary = summarizeItems('Created or updated', 'scene object', sceneIds);
       break;
-    case 'scene.draft.remove_objects':
+    case 'scene_draft_remove_objects':
       summary = summarizeItems('Removed', 'scene object', sceneIds);
       break;
-    case 'tree.draft.insert_node':
+    case 'tree_draft_insert_node':
       summary = nodeName ? `Inserted tree node: ${nodeName}` : 'Inserted a tree node';
       break;
-    case 'tree.draft.update_node_params':
+    case 'tree_draft_update_node_params':
       summary = nodeName ? `Updated tree node parameters: ${nodeName}` : 'Updated tree node parameters';
       break;
-    case 'tree.draft.delete_node':
+    case 'tree_draft_delete_node':
       summary = nodeName ? `Deleted tree node: ${nodeName}` : 'Deleted a tree node';
       break;
-    case 'tree.draft.move_node':
+    case 'tree_draft_move_node':
       summary = nodeName ? `Moved tree node: ${nodeName}` : 'Moved a tree node';
       break;
-    case 'tree.draft.replace_subtree':
+    case 'tree_draft_replace_subtree':
       summary = nodeName ? `Replaced subtree: ${nodeName}` : 'Replaced a subtree';
       break;
-    case 'program.draft.upsert_parameters':
+    case 'program_draft_upsert_parameters':
       summary = summarizeItems('Created or updated', 'program parameter', resultIds);
       break;
-    case 'program.draft.remove_parameters':
+    case 'program_draft_remove_parameters':
       summary = summarizeItems('Removed', 'program parameter', resultIds);
       break;
-    case 'blackboard.draft.upsert_namespaces':
+    case 'blackboard_draft_upsert_namespaces':
       summary = summarizeItems('Created or updated', 'blackboard namespace', resultIds);
       break;
-    case 'blackboard.draft.remove_namespaces':
+    case 'blackboard_draft_remove_namespaces':
       summary = summarizeItems('Removed', 'blackboard namespace', resultIds);
       break;
-    case 'blackboard.draft.upsert_keys':
+    case 'blackboard_draft_upsert_keys':
       summary = summarizeItems('Created or updated', 'blackboard key', resultIds);
       break;
-    case 'blackboard.draft.remove_keys':
+    case 'blackboard_draft_remove_keys':
       summary = summarizeItems('Removed', 'blackboard key', resultIds);
       break;
     default:
@@ -865,7 +865,7 @@ export function AssistantOverlay() {
                 <div ref={transcriptRef} className="min-h-0 flex-1 space-y-3 overflow-y-auto px-4 py-3">
                   {assistantEditedDraft && (
                     <div className="rounded border border-amber-700/80 bg-amber-950/50 px-3 py-2 text-sm text-amber-100">
-                      Assistant edited the current Composer draft. Use the normal apply, save, or reload controls to keep or discard it.
+                      Assistant edited the program. The changes are already applied to the active draft and ready to run; use Save to persist them, or Reload to revert to the last saved version.
                     </div>
                   )}
 
@@ -1028,9 +1028,17 @@ export function AssistantOverlay() {
                       The /api/assistant/requests/{id} poll appends entries
                       as the bridge endpoint executes each tool, so the
                       operator sees activity while the run is still
-                      generating. Once the run completes the entries on
-                      transcript items take over. */}
-                  {runState !== 'idle' && (activeStatus?.recentToolCalls?.length ?? 0) > 0 && (
+                      generating.
+                      2026-05-06: removed the `runState !== 'idle'` guard so
+                      the calls remain visible *after* the run completes —
+                      until the user submits the next prompt, which resets
+                      activeStatus. Without this, OpenClaw-lane runs (whose
+                      response.toolCalls is always [] because that lane
+                      doesn't surface tool calls in the response envelope)
+                      would lose the entire tool-call list as soon as the
+                      run finished, leaving the operator unable to inspect
+                      what just happened. */}
+                  {(activeStatus?.recentToolCalls?.length ?? 0) > 0 && (
                     <>
                       {(activeStatus?.recentToolCalls ?? []).slice(-12).map((call, index) => (
                         <details

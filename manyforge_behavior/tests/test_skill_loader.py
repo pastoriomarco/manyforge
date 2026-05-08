@@ -85,20 +85,20 @@ class TestLoadSkill:
         skill_path.write_text(
             "api_version: manyforge.skill.v0\n"
             "skill_id: tool_skill\n"
-            "requires_tools: [program.read, tree.insert_node]\n"
+            "requires_tools: [program_read, tree.insert_node]\n"
             "body: {id: reset_trajectories, name: noop}\n",
         )
 
         skill = load_skill(skill_path)
 
-        assert skill.requires_tools == ["program.read", "tree.insert_node"]
+        assert skill.requires_tools == ["program_read", "tree.insert_node"]
 
     def test_rejects_requires_tools_when_not_list(self, tmp_path):
         bad = tmp_path / "bad.skill.yaml"
         bad.write_text(
             "api_version: manyforge.skill.v0\n"
             "skill_id: test\n"
-            "requires_tools: program.read\n"
+            "requires_tools: program_read\n"
             "body: {id: reset_trajectories, name: noop}\n",
         )
         with pytest.raises(ValueError, match="requires_tools must be a list"):
@@ -109,7 +109,7 @@ class TestLoadSkill:
         bad.write_text(
             "api_version: manyforge.skill.v0\n"
             "skill_id: test\n"
-            "requires_tools: [program.read, program.read]\n"
+            "requires_tools: [program_read, program_read]\n"
             "body: {id: reset_trajectories, name: noop}\n",
         )
         with pytest.raises(ValueError, match="duplicate requires_tools"):

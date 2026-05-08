@@ -191,8 +191,11 @@ def _parse_modification_policy(
     parsed: dict[str, str] = {}
     for key, value in raw_policy.items():
         if key not in _MODIFICATION_POLICY_ALLOWED_VALUES:
+            valid_keys = ", ".join(sorted(_MODIFICATION_POLICY_ALLOWED_VALUES.keys()))
             raise ProgramValidationError(
-                f"{path}.modification_policy.{key} is not a recognized policy field"
+                f"{path}.modification_policy.{key} is not a recognized policy "
+                f"field. Valid fields: {valid_keys}. Omit the field entirely "
+                f"if no policy override is needed."
             )
         if not isinstance(value, str) or value not in _MODIFICATION_POLICY_ALLOWED_VALUES[key]:
             allowed = ", ".join(sorted(_MODIFICATION_POLICY_ALLOWED_VALUES[key]))
@@ -289,8 +292,11 @@ def _parse_recovery_policy(
     }
     for key in raw_policy:
         if key not in recognized_keys:
+            valid_keys = ", ".join(sorted(recognized_keys))
             raise ProgramValidationError(
-                f"{path}.recovery_policy.{key} is not a recognized recovery policy field"
+                f"{path}.recovery_policy.{key} is not a recognized recovery "
+                f"policy field. Valid fields: {valid_keys}. Omit the field "
+                f"entirely if no recovery override is needed."
             )
 
     allow_intervention = raw_policy.get("allow_intervention")
@@ -451,6 +457,19 @@ def _contains_parameter_reference(value: Any) -> bool:
 
 def _is_blackboard_reference_string(value: Any) -> bool:
     return isinstance(value, str) and BLACKBOARD_REF_RE.match(value) is not None
+
+
+def _format_param_schema(entry: Any) -> str:
+    """Compact one-line summary of a catalog entry's expected params, for error messages."""
+    parts: list[str] = []
+    for p in entry.parameters:
+        bits = [p.name + ":" + (p.type or "any")]
+        if p.required and p.default is None:
+            bits.append("required")
+        if p.enum_values:
+            bits.append("enum=[" + "|".join(str(v) for v in p.enum_values) + "]")
+        parts.append("{" + ",".join(bits) + "}")
+    return "[" + ",".join(parts) + "]" if parts else "[]"
 
 
 def _is_numeric(value: Any) -> bool:
@@ -1083,12 +1102,19 @@ def collect_tree_validation_issues(
                 )
             )
         if entry.children_max >= 0 and n_children > entry.children_max:
+            kind_hint = (
+                "leaf nodes never accept children — pick a composite parent (sequence, fallback, "
+                "parallel) or a decorator (repeat, retry, inverter)"
+                if entry.children_max == 0
+                else f"this node kind '{entry.kind}' accepts at most {entry.children_max} child"
+                + ("" if entry.children_max == 1 else "ren")
+            )
             errors.append(
                 TreeValidationIssue(
                     path=path,
                     message=(
                         f"Node '{current.name}' ({current.id}): allows at most "
-                        f"{entry.children_max} children, got {n_children}"
+                        f"{entry.children_max} children, got {n_children}. {kind_hint}"
                     ),
                 )
             )
@@ -1125,12 +1151,14 @@ def collect_tree_validation_issues(
                 continue
 
             if param.required and param.name not in current.params and param.default is None:
+                expected = _format_param_schema(entry)
                 errors.append(
                     TreeValidationIssue(
                         path=f"{path}.params.{param.name}",
                         message=(
                             f"Node '{current.name}' ({current.id}): missing required "
-                            f"parameter '{param.name}'"
+                            f"parameter '{param.name}'. Got params={sorted(current.params.keys())}. "
+                            f"Expected schema: {expected}"
                         ),
                     )
                 )

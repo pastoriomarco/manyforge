@@ -29,6 +29,7 @@ entries:
     children:
       min: 1
       max: unbounded
+    swap_class: composite_choice
     parameters: []
     required_capabilities: []
     execution:
@@ -57,6 +58,7 @@ entries:
     children:
       min: 1
       max: unbounded
+    swap_class: composite_choice
     parameters: []
     required_capabilities: []
     execution:
@@ -136,6 +138,9 @@ entries:
     children:
       min: 1
       max: 1
+    swap_class: bounded_loop
+    swap_param_aliases:
+      num_attempts: num_cycles
     parameters:
       - name: num_cycles
         type: int
@@ -167,6 +172,9 @@ entries:
     children:
       min: 1
       max: 1
+    swap_class: bounded_loop
+    swap_param_aliases:
+      num_cycles: num_attempts
     parameters:
       - name: num_attempts
         type: int
@@ -448,6 +456,7 @@ entries:
     children:
       min: 0
       max: 0
+    swap_class: scene_object_create
     parameters:
       - name: object_id
         type: string
@@ -483,11 +492,13 @@ entries:
       - name: pose
         type: pose
         required: true
-        description: Object pose expressed in frame_id.
-      - name: frame_id
-        type: string
-        required: true
-        description: Reference frame for the object pose.
+        description: >-
+          Object PoseStamped — must contain `frame_id` (string,
+          required), `position_m` ([x, y, z] in meters), and exactly
+          one of `orientation_xyzw` ([x, y, z, w] quaternion) or
+          `orientation_rpy_deg` ([roll, pitch, yaw] in degrees). The
+          frame id lives INSIDE pose; there is no separate top-level
+          frame_id parameter.
     required_capabilities:
       - scene.shape.box
       - scene.shape.sphere
@@ -516,6 +527,7 @@ entries:
     children:
       min: 0
       max: 0
+    swap_class: scene_object_create
     parameters:
       - name: object_id
         type: string
@@ -552,11 +564,13 @@ entries:
       - name: pose
         type: pose
         required: true
-        description: Object pose expressed in frame_id.
-      - name: frame_id
-        type: string
-        required: true
-        description: Reference frame for the object pose.
+        description: >-
+          Object PoseStamped — must contain `frame_id` (string,
+          required), `position_m` ([x, y, z] in meters), and exactly
+          one of `orientation_xyzw` ([x, y, z, w] quaternion) or
+          `orientation_rpy_deg` ([roll, pitch, yaw] in degrees). The
+          frame id lives INSIDE pose; there is no separate top-level
+          frame_id parameter.
     required_capabilities:
       - scene.shape.box
       - scene.shape.sphere
@@ -632,11 +646,13 @@ entries:
       - name: pose
         type: pose
         required: true
-        description: New object pose expressed in frame_id.
-      - name: frame_id
-        type: string
-        required: true
-        description: Reference frame for the new pose.
+        description: >-
+          New object PoseStamped — must contain `frame_id` (string,
+          required), `position_m` ([x, y, z] in meters), and exactly
+          one of `orientation_xyzw` ([x, y, z, w] quaternion) or
+          `orientation_rpy_deg` ([roll, pitch, yaw] in degrees). The
+          frame id lives INSIDE pose; there is no separate top-level
+          frame_id parameter.
     required_capabilities:
       - scene.edit.update_pose
     execution:

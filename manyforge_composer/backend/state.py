@@ -170,11 +170,88 @@ class ComposerState:
         # active chat for live tool-call streaming. Single-tenant per
         # sandbox so this is one-entry-per-principal.
         self._assistant_principal_bindings: dict[str, str] = {}
+        # Per-conversation consecutive-failure counter. Incremented on
+        # every bridge tool-call rejection, reset on every success.
+        # Used by the bridge endpoint to rotate the recovery nudge it
+        # appends to error responses, so consecutive failures of the
+        # same class produce different prefixes for the model and break
+        # repetition loops on thinking-off configurations.
+        self._assistant_failure_counts: dict[str, int] = {}
         self.skill_catalog: SkillCatalog = load_skill_catalog(
             default_skills_dir(),
             catalog=self.catalog,
             strict=True,
         )
+
+    def bump_assistant_failure(self, conversation_id: str) -> int:
+        """Increment and return the consecutive-failure counter for a conversation.
+
+        Returns the value AFTER the increment. The first failure in a
+        fresh conversation returns 1, the second returns 2, and so on.
+        Conversations missing or empty count under the empty-string key.
+        """
+        key = conversation_id or ""
+        with self._assistant_request_lock:
+            current = self._assistant_failure_counts.get(key, 0) + 1
+            self._assistant_failure_counts[key] = current
+            return current
+
+    def reset_assistant_failure(self, conversation_id: str) -> None:
+        """Reset the consecutive-failure counter for a conversation."""
+        key = conversation_id or ""
+        with self._assistant_request_lock:
+            self._assistant_failure_counts.pop(key, None)
+
+    def get_assistant_tool_history(
+        self,
+        *,
+        conversation_id: str,
+        principal: str = "",
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """Return a compact summary of recent tool calls on the active request.
+
+        Resolution mirrors record_assistant_request_tool_call: try
+        conversation_id first, fall back to principal binding. Each
+        returned entry carries {tool, status, error_class} so the
+        bridge can build an impasse summary without re-classifying.
+        Order is oldest-first; most recent at the end.
+        """
+        with self._assistant_request_lock:
+            record = None
+            if conversation_id:
+                for candidate in self._assistant_requests.values():
+                    if candidate.conversation_id == conversation_id and candidate.status in (
+                        "running",
+                        "cancel_requested",
+                    ):
+                        record = candidate
+                        break
+            if record is None and principal:
+                bound = self._assistant_principal_bindings.get(principal)
+                if bound is not None:
+                    candidate = self._assistant_requests.get(bound)
+                    if candidate is not None and candidate.status in (
+                        "running",
+                        "cancel_requested",
+                    ):
+                        record = candidate
+            if record is None:
+                return []
+            entries = list(record.tool_calls)[-limit:]
+        # Don't classify here — the recovery module owns the rules.
+        # Return raw fields and let the caller classify.
+        result: list[dict[str, Any]] = []
+        for entry in entries:
+            result.append(
+                {
+                    "tool": entry.tool_id,
+                    "status": entry.status,
+                    "error": entry.error,
+                    "draft_mutated": entry.draft_mutated,
+                }
+            )
+        return result
 
     def start_assistant_request(
         self,

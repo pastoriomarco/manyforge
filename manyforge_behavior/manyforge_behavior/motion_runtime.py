@@ -74,10 +74,28 @@ class MotionExecutionCoordinator:
                         f"current={status.execution_id}, owned={execution_id}"
                     ),
                 )
+            # Pull the kernel's structured failure cause from the
+            # execution snapshot, which carries the underlying error
+            # string (planner error code, collision detail, joint-limit,
+            # time-limit, etc.). Without this we surfaced only the
+            # state enum ("failed"/"stopped") and the operator had no
+            # way to diagnose what actually went wrong.
+            cause: Optional[str] = None
+            try:
+                snapshot = self._kernel.get_execution_snapshot()
+            except Exception:  # noqa: BLE001 — kernel client may not implement snapshots in all configurations
+                snapshot = None
+            if snapshot is not None and snapshot.error:
+                cause = str(snapshot.error).strip() or None
+            error_message = (
+                cause
+                if cause
+                else f"Motion execution ended in {status.state.value}"
+            )
             return MotionTransactionUpdate(
                 state="failed",
                 status=status,
-                error=f"Motion execution ended in {status.state.value}",
+                error=error_message,
             )
 
         return MotionTransactionUpdate(state="running", status=status)

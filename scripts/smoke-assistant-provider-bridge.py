@@ -171,12 +171,15 @@ def _build_request_payload(
             "programLoaded": False,
             "cycleState": "idle",
         },
-        "skills": list(args.skill),
-        "nodes": list(args.node),
+        # Bare-id `skills`, `nodes`, and `catalog.skills` /
+        # `catalog.nodes` / `catalog.tools` were dropped from the
+        # envelope contract; consumers derive ids from the rich
+        # nodeCatalog/skillCatalog/tools payloads.
+        "nodeCatalog": [{"id": node_id} for node_id in args.node],
+        "skillCatalog": [{"id": skill_id} for skill_id in args.skill],
         "catalog": {
-            "skills": list(args.skill),
-            "tools": tool_ids,
-            "nodes": list(args.node),
+            "nodeCatalog": [{"id": node_id} for node_id in args.node],
+            "skillCatalog": [{"id": skill_id} for skill_id in args.skill],
         },
         "tools": tools,
         "constraints": {

@@ -12,6 +12,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
+from manyforge_assistant_bridge.protocol import compute_catalog_hash
 from manyforge_behavior.deployment import DeploymentValidationError
 from manyforge_behavior.program import (
     Program,
@@ -26,6 +27,8 @@ from .assistant_tools import (
     propose_scene_object_nodes,
     propose_scene_object_resources,
 )
+from . import assistant_recovery
+from . import _assistant_delta
 from .assistant_tool_schemas import (
     assistant_tool_input_schema,
     enrich_assistant_tool_descriptors,
@@ -147,12 +150,29 @@ def create_assistant_router(state: ComposerState) -> APIRouter:
                 },
             )
 
+        # Aggregate the actual draft-mutation flag from the live
+        # tool-call recorder. The OpenClaw bridge envelope hard-codes
+        # draftMutated=False because tool-call accounting happens on
+        # the ManyForge side, not in the bridge response. So we OR
+        # the provider's own claim with the recorded per-call flags
+        # — whichever is true wins. This drives the frontend hot-
+        # reload trigger; without it the canvas would silently miss
+        # successful assistant mutations on the OpenClaw lane.
+        recorded_history = state.get_assistant_tool_history(
+            conversation_id=conversation_id,
+            limit=200,
+        )
+        recorded_draft_mutated = any(
+            entry.get("draft_mutated") for entry in recorded_history
+        )
+        aggregated_draft_mutated = bool(result.draft_mutated) or recorded_draft_mutated
+
         state.finish_assistant_request(
             request_id,
             status="completed",
             message=result.message,
             warnings=result.warnings,
-            draft_mutated=result.draft_mutated,
+            draft_mutated=aggregated_draft_mutated,
             tool_call_count=len(result.tool_calls),
         )
 
@@ -167,7 +187,7 @@ def create_assistant_router(state: ComposerState) -> APIRouter:
             "toolCalls": result.tool_calls,
             "warnings": result.warnings,
             "mutated": result.mutated,
-            "draftMutated": result.draft_mutated,
+            "draftMutated": aggregated_draft_mutated,
             "requiresReview": result.requires_review,
             "programLoaded": program_loaded,
             "cycleState": cycle_state,
@@ -220,12 +240,48 @@ def create_assistant_router(state: ComposerState) -> APIRouter:
                     "inputSchema": input_schema,
                 }
             )
+        # Rich per-node descriptors keyed by id, alongside the legacy
+        # `nodes` string list. The legacy field is preserved verbatim
+        # for back-compat with the direct-lane manyforge_assistant_bridge,
+        # which validates `catalog.nodes` entries as non-empty strings.
+        #
+        # The nodeCatalog payload is the OUTPUT of catalog_read filtered
+        # to mode-allowed entries. Using the same payload-shape function
+        # the model would get from a catalog_read tool call eliminates
+        # skew: there is one source of truth for catalog metadata, and
+        # whether the model reads it from this preamble or from a
+        # tool call, the structure and fields are identical. This is
+        # the load-bearing fix for the "model invents node-kind ids"
+        # failure mode — if every parameter description, every enum
+        # option, every required capability is in the preamble, the
+        # model has no excuse to guess. Filtering by mode-allowed
+        # nodes is the only deviation from a full catalog_read.
+        node_id_set = set(resolved_catalog["nodes"])
+        node_catalog_payload: list[dict[str, Any]] = [
+            _catalog_entry_payload(entry, include_parameters=True)
+            for entry in state.catalog.entries
+            if entry.id in node_id_set
+        ]
+        # Skill payload also follows the read-function-shape rule:
+        # the same _skills_payload that powers skills_read serves the
+        # preamble. Bodies-included so the model has the full skill
+        # expansion available without burning a tool call.
+        visible_skill_ids = list(resolved_catalog.get("skills") or [])
+        try:
+            skills_full_payload = _skills_payload(
+                state, skill_ids=visible_skill_ids, include_bodies=True,
+            ) if visible_skill_ids else []
+        except HTTPException:
+            # If a visible skill id is unknown (deployment skew between
+            # mode allowlist and skill catalog), degrade gracefully to
+            # the bare-id list rather than 500 the manifest.
+            skills_full_payload = []
         return {
             "mode": mode,
             "catalogHash": expected_hash,
             "tools": tools_payload,
-            "nodes": list(resolved_catalog["nodes"]),
-            "skills": list(resolved_catalog.get("skills") or []),
+            "nodeCatalog": node_catalog_payload,
+            "skillCatalog": skills_full_payload,
         }
 
     @router.get(
@@ -427,24 +483,197 @@ def create_assistant_router(state: ComposerState) -> APIRouter:
             )
             success = True
             error = None
-        except HTTPException:
-            # Record the policy/validation rejection on the live feed
-            # before re-raising — the UI should show the failed call.
+        except HTTPException as exc:
+            # Compose a recovery envelope on top of the validator's
+            # diagnostic before surfacing to the model. Four pieces:
+            # (1) the diagnostic itself, (2) a class-specific Action
+            # clause picked by classifying the detail, (3) a rotating
+            # nudge that varies between consecutive failures so a
+            # repeat-call loop has a different prefix each turn, and
+            # (4) after several failures, a fresh program-tree
+            # snapshot so the model can replan against current state
+            # without burning a tool call on program_read. The counter
+            # is per-conversation; it resets on any successful call.
+            # When the counter crosses IMPASSE_FAILURE_THRESHOLD the
+            # endpoint emits a structural-impasse response that
+            # instructs the agent loop to halt and reply to the user.
+            conversation_id = request.conversation_id or ""
+            failure_index = state.bump_assistant_failure(conversation_id)
+            error_class = assistant_recovery.classify_detail(exc.detail)
+            # context_aware_action overrides the generic ACTION_BY_CLASS
+            # entry when the (tool_id, arguments, error_class) triple
+            # matches a known intent trap (e.g. arity_insufficient on
+            # @root with an empty decorator → wrap_node hint). Falls
+            # back to the generic action lookup.
+            action = assistant_recovery.context_aware_action(
+                error_class=error_class,
+                tool_id=tool_id,
+                arguments=request.arguments,
+            ) or assistant_recovery.action_for_class(error_class)
+            nudge = assistant_recovery.nudge_for_index(failure_index)
+            # Build a classified history slice for the layered nudges
+            # to walk. Each entry carries (tool, status, error_class)
+            # so the detectors can analyse repetition patterns without
+            # re-classifying. Append the current failure so the
+            # detectors include the call we're about to surface.
+            raw_history = state.get_assistant_tool_history(
+                conversation_id=conversation_id,
+                principal=request.principal or "",
+            )
+            classified_history: list[dict[str, Any]] = []
+            for entry in raw_history:
+                err = entry.get("error")
+                cls = (
+                    assistant_recovery.classify_detail(err) if err else None
+                )
+                classified_history.append({
+                    "tool": entry.get("tool"),
+                    "status": entry.get("status"),
+                    "error": err,
+                    "error_class": cls,
+                })
+            classified_history.append({
+                "tool": tool_id,
+                "status": "failed",
+                "error": exc.detail,
+                "error_class": error_class,
+            })
+            # Layered nudges. truncation_pattern_nudge and
+            # format_stuck_nudge are mutually exclusive — the more
+            # specific truncation nudge wins when both match.
+            # meta_nudge stacks on top once enough failures accumulate.
+            extra_lines: list[str] = []
+            truncation_line = assistant_recovery.truncation_pattern_nudge(
+                classified_history
+            )
+            if truncation_line:
+                extra_lines.append(truncation_line)
+            else:
+                stuck_line = assistant_recovery.format_stuck_nudge(classified_history)
+                if stuck_line:
+                    extra_lines.append(stuck_line)
+            meta_line = assistant_recovery.meta_nudge(
+                classified_history,
+                threshold=assistant_recovery.META_NUDGE_AFTER_FAILURES,
+            )
+            if meta_line:
+                extra_lines.append(meta_line)
+            enriched_detail = assistant_recovery.append_recovery(
+                exc.detail, action, nudge, extra_lines=extra_lines
+            )
+            # After repeated failures (>= ATTACH_SNAPSHOT_AFTER_FAILURES)
+            # attach a fresh program snapshot to the dict-shaped error
+            # so the model has current state inline without burning a
+            # tool call on program_read. Coerce a string detail into
+            # a dict envelope when needed; the dict form is safe for
+            # the bridge MCP wrapper.
+            if (
+                failure_index >= assistant_recovery.ATTACH_SNAPSHOT_AFTER_FAILURES
+                and state.program is not None
+            ):
+                snapshot_envelope: dict[str, Any]
+                if isinstance(enriched_detail, dict):
+                    snapshot_envelope = enriched_detail
+                else:
+                    snapshot_envelope = {"message": enriched_detail}
+                snapshot_envelope["programSnapshot"] = {
+                    "programLoaded": True,
+                    "programSourcePath": state.program_source_path,
+                    "programSessionGeneration": state.program_session_generation,
+                    "programTreeHash": state.program_tree_hash,
+                    "program": state.program.to_dict(),
+                }
+                snapshot_envelope["snapshotReason"] = (
+                    "Attached after repeated failures so the next call "
+                    "can plan against current state without a separate "
+                    "program_read."
+                )
+                enriched_detail = snapshot_envelope
+            # Hard cap (IMPASSE_FAILURE_THRESHOLD): tell the agent to
+            # stop and explain to the
+            # user. We compose a synthetic response shape rather than
+            # raising, so the OpenClaw lane sees a structured message
+            # in the tool-call result and the agent loop terminates
+            # cleanly instead of bouncing on the cap.
+            impasse_envelope: dict[str, Any] | None = None
+            if failure_index >= assistant_recovery.IMPASSE_FAILURE_THRESHOLD:
+                tool_history = state.get_assistant_tool_history(
+                    conversation_id=conversation_id,
+                    principal=request.principal or "",
+                )
+                # Classify each historical error to summarise patterns.
+                annotated_history: list[dict[str, Any]] = []
+                for entry in tool_history:
+                    err_class = (
+                        assistant_recovery.classify_detail(entry.get("error"))
+                        if entry.get("error")
+                        else None
+                    )
+                    annotated_history.append(
+                        {
+                            "tool": entry.get("tool"),
+                            "status": entry.get("status"),
+                            "error_class": err_class,
+                        }
+                    )
+                impasse_envelope = {
+                    "message": assistant_recovery.impasse_message(
+                        failure_count=failure_index,
+                        tool_history=annotated_history,
+                    ),
+                    "structuralImpasse": True,
+                    "failureCount": failure_index,
+                    "originalError": enriched_detail
+                    if isinstance(enriched_detail, dict)
+                    else {"message": enriched_detail},
+                }
+                # Also reset the counter so a follow-up turn starts
+                # fresh; the cap should fire once per stuck turn, not
+                # cascade into the next.
+                state.reset_assistant_failure(conversation_id)
+                enriched_detail = impasse_envelope
+            error_text = (
+                enriched_detail
+                if isinstance(enriched_detail, str)
+                else str(enriched_detail)
+            )
             state.record_assistant_request_tool_call(
-                conversation_id=request.conversation_id or "",
+                conversation_id=conversation_id,
                 principal=request.principal or "",
                 tool_id=tool_id,
                 status="failed",
                 args_summary=_summarize_for_live(request.arguments),
-                error="rejected by policy/validation",
+                error=error_text or "rejected by policy/validation",
                 started_at_ns=live_started_ns,
             )
-            raise
+            # On structural impasse return 200 with the structured body
+            # so the agent loop reads it as a tool result rather than
+            # a transport error. Otherwise re-raise the HTTPException
+            # with the enriched detail.
+            if impasse_envelope is not None:
+                return {
+                    "toolId": tool_id,
+                    "success": False,
+                    "result": impasse_envelope,
+                    "error": impasse_envelope.get("message", ""),
+                    "mutated": False,
+                    "draftMutated": False,
+                    "timestampNs": time.monotonic_ns(),
+                }
+            raise HTTPException(
+                status_code=exc.status_code, detail=enriched_detail
+            ) from exc
         except Exception as exc:
             result = {}
             success = False
             error = str(exc)
 
+        # On any successful call, clear the consecutive-failure counter
+        # so future failures start the rotation fresh. record_assistant
+        # _request_tool_call below still surfaces the call in the live
+        # feed regardless of success.
+        if success:
+            state.reset_assistant_failure(request.conversation_id or "")
         state.record_assistant_request_tool_call(
             conversation_id=request.conversation_id or "",
             principal=request.principal or "",
@@ -458,6 +687,31 @@ def create_assistant_router(state: ComposerState) -> APIRouter:
             ),
             started_at_ns=live_started_ns,
         )
+
+        # Attach a delta block so the wrapper passes fresh tree+scene
+        # state confirmation back to the model on every tool call.
+        # The delta is intentionally embedded inside `result` rather
+        # than added as a top-level field — the response model
+        # (AssistantBridgeToolResponse) is strict and would strip an
+        # unknown top-level key, but `result` is `Dict[str, Any]` and
+        # accepts arbitrary nested data. The wrapper forwards `result`
+        # verbatim into its MCP tool-result content, so the model sees
+        # `result.delta.{rootName, rootKind, sinceCallStart, …}`.
+        try:
+            current_program = (
+                state.program.to_dict() if state.program is not None else None
+            )
+            delta_block = _assistant_delta.compute_delta(
+                conversation_id=request.conversation_id or "",
+                current_program_dict=current_program,
+            )
+            if isinstance(result, dict):
+                result["delta"] = delta_block
+            else:
+                result = {"value": result, "delta": delta_block}
+        except Exception:
+            # Delta is advisory; never break a tool call on it.
+            pass
 
         return {
             "toolId": tool_id,
@@ -627,14 +881,14 @@ def create_assistant_router(state: ComposerState) -> APIRouter:
 
 
 def _compute_assistant_catalog_hash(catalog: dict[str, list[str]], mode: str) -> str:
-    payload = {
-        "mode": mode,
-        "skills": sorted(catalog.get("skills", []) or []),
-        "tools": sorted(catalog.get("tools", []) or []),
-        "nodes": sorted(catalog.get("nodes", []) or []),
-    }
-    blob = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
-    return hashlib.sha256(blob).hexdigest()
+    """Composer-side wrapper around the shared protocol helper.
+
+    Kept as a thin wrapper so the existing Composer call sites do not
+    have to reach across packages directly; the actual hashing logic
+    lives in `manyforge_assistant_bridge.protocol.compute_catalog_hash`,
+    the single source of truth for the catalog-freshness contract.
+    """
+    return compute_catalog_hash(catalog, mode)
 
 
 def _catalog_entry_payload(entry: Any, *, include_parameters: bool = True) -> dict[str, Any]:
@@ -653,6 +907,13 @@ def _catalog_entry_payload(entry: Any, *, include_parameters: bool = True) -> di
         "profilesMin": entry.profiles_min,
         "interruptible": entry.interruptible,
         "defaultInterruptScope": entry.default_interrupt_scope,
+        # swap_class and swap_param_aliases drive tree_draft_swap_node's
+        # compatibility check. Surfacing them on the catalog payload
+        # means the model can plan swaps from the same data structure
+        # it gets back from catalog_read, with no skew between the
+        # preamble snapshot and the live tool call.
+        "swapClass": entry.swap_class,
+        "swapParamAliases": dict(entry.swap_param_aliases) or None,
     }
     if include_parameters:
         payload["parameters"] = [
@@ -865,17 +1126,17 @@ async def _execute_bridge_read_only_tool(
     tool_id: str,
     arguments: dict[str, Any],
 ) -> dict[str, Any]:
-    if tool_id == "catalog.read":
+    if tool_id == "catalog_read":
         entry_ids = arguments.get("entryIds") or arguments.get("entry_ids") or []
         if entry_ids is None:
             entry_ids = []
         if not isinstance(entry_ids, list) or not all(isinstance(item, str) for item in entry_ids):
-            raise HTTPException(status_code=400, detail="catalog.read entryIds must be a list of strings")
+            raise HTTPException(status_code=400, detail="catalog_read entryIds must be a list of strings")
         category = arguments.get("category")
         kind = arguments.get("kind")
         include_parameters = arguments.get("includeParameters", arguments.get("include_parameters", True))
         if not isinstance(include_parameters, bool):
-            raise HTTPException(status_code=400, detail="catalog.read includeParameters must be boolean")
+            raise HTTPException(status_code=400, detail="catalog_read includeParameters must be boolean")
         selected = set(entry_ids)
         missing = sorted(selected - {entry.id for entry in state.catalog.entries})
         if missing:
@@ -895,15 +1156,15 @@ async def _execute_bridge_read_only_tool(
             "entries": entries,
         }
 
-    if tool_id == "skills.read":
+    if tool_id == "skills_read":
         skill_ids = arguments.get("skillIds") or arguments.get("skill_ids") or []
         if skill_ids is None:
             skill_ids = []
         if not isinstance(skill_ids, list) or not all(isinstance(item, str) for item in skill_ids):
-            raise HTTPException(status_code=400, detail="skills.read skillIds must be a list of strings")
+            raise HTTPException(status_code=400, detail="skills_read skillIds must be a list of strings")
         include_bodies = arguments.get("includeBodies", arguments.get("include_bodies", False))
         if not isinstance(include_bodies, bool):
-            raise HTTPException(status_code=400, detail="skills.read includeBodies must be boolean")
+            raise HTTPException(status_code=400, detail="skills_read includeBodies must be boolean")
         skills = _skills_payload(state, skill_ids=skill_ids, include_bodies=include_bodies)
         return {
             "skillCount": len(skills),
@@ -911,10 +1172,10 @@ async def _execute_bridge_read_only_tool(
             "timestampNs": time.monotonic_ns(),
         }
 
-    if tool_id == "deployment.capabilities.read":
+    if tool_id == "deployment_capabilities_read":
         return _deployment_capabilities_payload(state)
 
-    if tool_id == "program.read":
+    if tool_id == "program_read":
         return {
             "programLoaded": state.program is not None,
             "programSourcePath": state.program_source_path,
@@ -923,7 +1184,7 @@ async def _execute_bridge_read_only_tool(
             "program": state.program.to_dict() if state.program is not None else None,
         }
 
-    if tool_id == "program.validate":
+    if tool_id == "program_validate":
         issues: list[dict[str, str]] = []
         if state.program is None:
             issues.append({"path": "program", "message": "No program loaded"})
@@ -943,7 +1204,7 @@ async def _execute_bridge_read_only_tool(
                 issues.append({"path": "program", "message": str(exc)})
         return {"valid": not issues, "issues": issues}
 
-    if tool_id == "status.read":
+    if tool_id == "status_read":
         return {
             "programLoaded": state.program is not None,
             "cycleState": state.cycle_manager.state.value if state.cycle_manager else "idle",
@@ -959,7 +1220,7 @@ async def _execute_bridge_read_only_tool(
             },
         }
 
-    if tool_id == "scene.inspect":
+    if tool_id == "scene_inspect":
         return build_scene_state_payload(state)
 
     if tool_id == "inspect_isaac_scene":
@@ -1019,60 +1280,67 @@ def _execute_bridge_composer_draft_tool(
     assistant_mode: str | None = None,
     node_allowlist: set[str] | None = None,
 ) -> dict[str, Any]:
-    if tool_id == "scene.draft.add_object":
+    if tool_id == "scene_draft_add_object":
         return _apply_scene_draft_resource_single(
             state,
             arguments=arguments,
             operation="add",
         )
-    if tool_id == "scene.draft.update_object":
+    if tool_id == "scene_draft_update_object":
         return _apply_scene_draft_resource_single(
             state,
             arguments=arguments,
             operation="update",
         )
-    if tool_id == "scene.draft.upsert_objects":
+    if tool_id == "scene_draft_upsert_objects":
         return _apply_scene_draft_resources_upsert(state, arguments=arguments)
-    if tool_id == "scene.draft.remove_objects":
+    if tool_id == "scene_draft_remove_objects":
         return _apply_scene_draft_resources_remove(state, arguments=arguments)
-    if tool_id == "tree.draft.insert_node":
+    if tool_id == "tree_draft_insert_node":
         return _apply_tree_draft_insert_node(
             state,
             arguments=arguments,
             node_allowlist=node_allowlist,
             assistant_mode=assistant_mode,
         )
-    if tool_id == "tree.draft.update_node_params":
+    if tool_id == "tree_draft_update_node_params":
         return _apply_tree_draft_update_node_params(state, arguments=arguments)
-    if tool_id == "tree.draft.delete_node":
+    if tool_id == "tree_draft_delete_node":
         return _apply_tree_draft_delete_node(state, arguments=arguments)
-    if tool_id == "tree.draft.move_node":
+    if tool_id == "tree_draft_move_node":
         return _apply_tree_draft_move_node(state, arguments=arguments)
-    if tool_id == "tree.draft.replace_subtree":
+    if tool_id == "tree_draft_replace_subtree":
         return _apply_tree_draft_replace_subtree(
             state,
             arguments=arguments,
             node_allowlist=node_allowlist,
             assistant_mode=assistant_mode,
         )
-    if tool_id == "tree.draft.wrap_node":
+    if tool_id == "tree_draft_swap_node":
+        return _apply_tree_draft_swap_node(
+            state,
+            arguments=arguments,
+            node_allowlist=node_allowlist,
+            assistant_mode=assistant_mode,
+        )
+    if tool_id == "tree_draft_wrap_node":
         return _apply_tree_draft_wrap_node(
             state,
             arguments=arguments,
             node_allowlist=node_allowlist,
             assistant_mode=assistant_mode,
         )
-    if tool_id == "program.draft.upsert_parameters":
+    if tool_id == "program_draft_upsert_parameters":
         return _apply_program_draft_upsert_parameters(state, arguments=arguments)
-    if tool_id == "program.draft.remove_parameters":
+    if tool_id == "program_draft_remove_parameters":
         return _apply_program_draft_remove_parameters(state, arguments=arguments)
-    if tool_id == "blackboard.draft.upsert_namespaces":
+    if tool_id == "blackboard_draft_upsert_namespaces":
         return _apply_blackboard_draft_upsert_namespaces(state, arguments=arguments)
-    if tool_id == "blackboard.draft.remove_namespaces":
+    if tool_id == "blackboard_draft_remove_namespaces":
         return _apply_blackboard_draft_remove_namespaces(state, arguments=arguments)
-    if tool_id == "blackboard.draft.upsert_keys":
+    if tool_id == "blackboard_draft_upsert_keys":
         return _apply_blackboard_draft_upsert_keys(state, arguments=arguments)
-    if tool_id == "blackboard.draft.remove_keys":
+    if tool_id == "blackboard_draft_remove_keys":
         return _apply_blackboard_draft_remove_keys(state, arguments=arguments)
     raise HTTPException(
         status_code=404,
@@ -1120,7 +1388,7 @@ def _scene_resources_from_upsert_arguments(
     if not isinstance(raw_resources, list) or not raw_resources:
         raise HTTPException(
             status_code=400,
-            detail="scene.draft.upsert_objects requires a non-empty sceneResources list",
+            detail="scene_draft_upsert_objects requires a non-empty sceneResources list",
         )
 
     resources: list[ProgramSceneResourceResponse] = []
@@ -1129,13 +1397,13 @@ def _scene_resources_from_upsert_arguments(
     for index, raw_resource in enumerate(raw_resources):
         raw_resource = _single_scene_resource_argument(
             raw_resource,
-            tool_id="scene.draft.upsert_objects",
+            tool_id="scene_draft_upsert_objects",
             label=f"sceneResources[{index}]",
         )
         normalized_resource = _normalize_scene_resource_argument(
             state,
             raw_resource,
-            tool_id="scene.draft.upsert_objects",
+            tool_id="scene_draft_upsert_objects",
             label=f"sceneResources[{index}]",
         )
         try:
@@ -1148,7 +1416,7 @@ def _scene_resources_from_upsert_arguments(
         resource = _normalize_scene_draft_resource_frame(
             state=state,
             resource=resource,
-            tool_id="scene.draft.upsert_objects",
+            tool_id="scene_draft_upsert_objects",
             label=f"sceneResources[{index}]",
         )
         if resource.object_id in seen:
@@ -1159,7 +1427,7 @@ def _scene_resources_from_upsert_arguments(
     if duplicates:
         raise HTTPException(
             status_code=400,
-            detail=f"scene.draft.upsert_objects duplicate objectId values: {sorted(duplicates)}",
+            detail=f"scene_draft_upsert_objects duplicate objectId values: {sorted(duplicates)}",
         )
     return resources
 
@@ -1621,7 +1889,7 @@ def _apply_scene_draft_resource_single(
     operation: str,
 ) -> dict[str, Any]:
     _assert_scene_draft_edit_allowed(state)
-    tool_id = f"scene.draft.{operation}_object"
+    tool_id = f"scene_draft_{operation}_object"
     force_discard_overrides = _force_discard_overrides(arguments)
     resource = _scene_resource_from_draft_arguments(state, arguments, tool_id=tool_id)
     program_data = state.program.to_dict()
@@ -1761,7 +2029,7 @@ def _apply_scene_draft_resources_remove(
     object_ids = _string_list_argument(
         arguments,
         key="objectIds",
-        tool_id="scene.draft.remove_objects",
+        tool_id="scene_draft_remove_objects",
     )
     program_data = state.program.to_dict()
     scene = list(program_data.get("scene") or [])
@@ -1806,6 +2074,35 @@ def _tree_node_from_draft_argument(
     responses and audit records (rather than silently rewriting the
     caller's payload). Empty list when no normalization fired.
     """
+    # Accept stringified-JSON form for `value` and parse it back to a
+    # dict. Some small models (Nemotron-3-Nano-Omni T=0.6 top_p=0.95
+    # observed 2026-05-06) serialize the inline node object as a JSON
+    # string instead of an object. The MCP tool schema also accepts the
+    # string form (anyOf) so OpenClaw doesn't reject upfront — and we
+    # parse it here before any further processing. Same defensive
+    # precedent as _strip_policy_stubs.
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"{field_name} was a string but could not be parsed as "
+                    f"JSON: {exc}. Send {field_name} as an inline JSON "
+                    f"object instead."
+                ),
+            ) from exc
+        if not isinstance(parsed, dict):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"{field_name} string parsed to a "
+                    f"{type(parsed).__name__}, not an object. Send "
+                    f"{field_name} as an inline JSON object."
+                ),
+            )
+        value = parsed
     if not isinstance(value, dict):
         raise HTTPException(status_code=400, detail=f"{field_name} must be an object")
     # Pragmatic normalization for small-model emissions:
@@ -1829,15 +2126,28 @@ def _tree_node_from_draft_argument(
                         f"{path}.{key} was empty/invalid and stripped"
                     )
                     continue
-                # Drop pydantic-default placeholders like {"type": "string"}.
+                # Drop ANY single-key {"type": ...} payload, regardless
+                # of the value. `type` is NEVER a valid modification or
+                # recovery policy key — the real keys are
+                # {runtime_override, persistent_edit, intervention_delegate}
+                # for modificationPolicy and {action, persistence_ceiling}
+                # for recoveryPolicy. Models trained on generic JSON-Schema
+                # examples reliably emit `{"type": "string"}` (pydantic
+                # default placeholder) or `{"type": "replace"}` (general-
+                # purpose patch verb they invent). Both used to slip
+                # through with only the "string"/"object"/"any"/"" filter
+                # below; this filter catches the invented-verb variant
+                # too. Verified 2026-05-06 against
+                # `{"type": "replace"}` which loops the model 130x on
+                # the deeper program-validation error.
                 if (
                     set(policy.keys()) == {"type"}
                     and isinstance(policy.get("type"), str)
-                    and policy["type"] in {"string", "object", "any", ""}
                 ):
                     d.pop(key, None)
                     warnings.append(
-                        f"{path}.{key} was a stub placeholder and stripped"
+                        f"{path}.{key} was a stub placeholder "
+                        f"({{'type': {policy.get('type')!r}}}) and stripped"
                     )
 
     def _normalize(node: Any, path: str) -> Any:
@@ -2030,7 +2340,7 @@ def _apply_tree_draft_insert_node(
     _assert_program_draft_edit_allowed(state)
     parent_name = arguments.get("parentName") or arguments.get("parent_name")
     if not isinstance(parent_name, str) or not parent_name.strip():
-        raise HTTPException(status_code=400, detail="tree.draft.insert_node requires parentName")
+        raise HTTPException(status_code=400, detail="tree_draft_insert_node requires parentName")
     new_node, normalization_warnings = _tree_node_from_draft_argument(
         arguments.get("node"), field_name="node"
     )
@@ -2087,10 +2397,10 @@ def _apply_tree_draft_update_node_params(
     _assert_program_draft_edit_allowed(state)
     node_name = arguments.get("nodeName") or arguments.get("node_name")
     if not isinstance(node_name, str) or not node_name.strip():
-        raise HTTPException(status_code=400, detail="tree.draft.update_node_params requires nodeName")
+        raise HTTPException(status_code=400, detail="tree_draft_update_node_params requires nodeName")
     params = arguments.get("params")
     if not isinstance(params, dict):
-        raise HTTPException(status_code=400, detail="tree.draft.update_node_params requires params object")
+        raise HTTPException(status_code=400, detail="tree_draft_update_node_params requires params object")
     merge = arguments.get("merge", True)
     if not isinstance(merge, bool):
         raise HTTPException(status_code=400, detail="merge must be boolean")
@@ -2133,7 +2443,7 @@ def _apply_tree_draft_delete_node(
     _assert_program_draft_edit_allowed(state)
     node_name = arguments.get("nodeName") or arguments.get("node_name")
     if not isinstance(node_name, str) or not node_name.strip():
-        raise HTTPException(status_code=400, detail="tree.draft.delete_node requires nodeName")
+        raise HTTPException(status_code=400, detail="tree_draft_delete_node requires nodeName")
     program_data = state.program.to_dict()
     tree = program_data.get("tree")
     # delete_node does NOT accept `@root` — root deletion is rejected separately
@@ -2147,12 +2457,12 @@ def _apply_tree_draft_delete_node(
             detail={
                 "message": f"Node not found: {node_name}",
                 "validNodeNames": valid_names,
-                "note": "root cannot be deleted; use tree.draft.replace_subtree to swap the entire tree",
+                "note": "root cannot be deleted; use tree_draft_replace_subtree to swap the entire tree",
             },
         )
     target, parent, index = target_ref
     if parent is None or index is None:
-        raise HTTPException(status_code=400, detail="tree.draft.delete_node cannot delete the root node")
+        raise HTTPException(status_code=400, detail="tree_draft_delete_node cannot delete the root node")
     children = list(parent.get("children") or [])
     removed = children.pop(index)
     parent["children"] = children
@@ -2177,9 +2487,9 @@ def _apply_tree_draft_move_node(
     node_name = arguments.get("nodeName") or arguments.get("node_name")
     new_parent_name = arguments.get("newParentName") or arguments.get("new_parent_name")
     if not isinstance(node_name, str) or not node_name.strip():
-        raise HTTPException(status_code=400, detail="tree.draft.move_node requires nodeName")
+        raise HTTPException(status_code=400, detail="tree_draft_move_node requires nodeName")
     if not isinstance(new_parent_name, str) or not new_parent_name.strip():
-        raise HTTPException(status_code=400, detail="tree.draft.move_node requires newParentName")
+        raise HTTPException(status_code=400, detail="tree_draft_move_node requires newParentName")
     node_name = node_name.strip()
     new_parent_name = new_parent_name.strip()
     program_data = state.program.to_dict()
@@ -2200,7 +2510,7 @@ def _apply_tree_draft_move_node(
         )
     target, old_parent, old_index = target_ref
     if old_parent is None or old_index is None:
-        raise HTTPException(status_code=400, detail="tree.draft.move_node cannot move the root node")
+        raise HTTPException(status_code=400, detail="tree_draft_move_node cannot move the root node")
     resolved_new_parent_name = _resolve_node_name_alias(
         new_parent_name, tree if isinstance(tree, dict) else None
     )
@@ -2251,7 +2561,7 @@ def _apply_tree_draft_replace_subtree(
     _assert_program_draft_edit_allowed(state)
     node_name = arguments.get("nodeName") or arguments.get("node_name")
     if not isinstance(node_name, str) or not node_name.strip():
-        raise HTTPException(status_code=400, detail="tree.draft.replace_subtree requires nodeName")
+        raise HTTPException(status_code=400, detail="tree_draft_replace_subtree requires nodeName")
     replacement, normalization_warnings = _tree_node_from_draft_argument(
         arguments.get("subtree"), field_name="subtree"
     )
@@ -2304,6 +2614,246 @@ def _apply_tree_draft_replace_subtree(
     )
 
 
+def _apply_tree_draft_swap_node(
+    state: ComposerState,
+    *,
+    arguments: dict[str, Any],
+    node_allowlist: set[str] | None = None,
+    assistant_mode: str | None = None,
+) -> dict[str, Any]:
+    """Change a node's catalog id in place, preserving name/parent/children.
+
+    Validation pipeline:
+      1. nodeName exists in the draft tree
+      2. newId is in the catalog and (if scoped) in node_allowlist
+      3. existing child count fits newId's arity range
+      4. merged params (controlled by paramsMode) satisfy newId's
+         parameter declarations
+      5. newId's required_capabilities present in the deployment
+      6. swap_class compatibility (only when both sides declare it),
+         bypassable via force=true
+
+    All validation runs before any mutation; on success we update id +
+    params atomically and re-emit the draft.
+    """
+    _assert_program_draft_edit_allowed(state)
+    node_name_raw = arguments.get("nodeName") or arguments.get("node_name")
+    if not isinstance(node_name_raw, str) or not node_name_raw.strip():
+        raise HTTPException(
+            status_code=400, detail="tree_draft_swap_node requires nodeName"
+        )
+    node_name = node_name_raw.strip()
+    new_id = arguments.get("newId") or arguments.get("new_id")
+    if not isinstance(new_id, str) or not new_id.strip():
+        raise HTTPException(
+            status_code=400, detail="tree_draft_swap_node requires newId"
+        )
+    new_id = new_id.strip()
+    params_overlay = arguments.get("params") or {}
+    if not isinstance(params_overlay, dict):
+        raise HTTPException(
+            status_code=400, detail="tree_draft_swap_node params must be an object"
+        )
+    params_mode = arguments.get("paramsMode") or arguments.get("params_mode") or "replace"
+    if params_mode not in ("replace", "merge", "strict"):
+        raise HTTPException(
+            status_code=400,
+            detail="tree_draft_swap_node paramsMode must be one of: replace, merge, strict",
+        )
+    force = bool(arguments.get("force", False))
+
+    program_data = state.program.to_dict()
+    tree = program_data.get("tree") if isinstance(program_data, dict) else None
+    resolved_node_name = _resolve_node_name_alias(node_name, tree if isinstance(tree, dict) else None)
+    target_ref = _find_tree_node_ref(tree, resolved_node_name) if isinstance(tree, dict) else None
+    if target_ref is None:
+        valid_names = _collect_tree_node_names(tree) if isinstance(tree, dict) else []
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "message": f"Node not found: {node_name}",
+                "validNodeNames": valid_names,
+                "rootAlias": "@root",
+            },
+        )
+    target = target_ref[0]
+    old_id = target.get("id")
+
+    # Catalog lookup for the new id.
+    new_entry = state.catalog.entries_by_id().get(new_id) if hasattr(state.catalog, "entries_by_id") else None
+    if new_entry is None:
+        for candidate in state.catalog.entries:
+            if candidate.id == new_id:
+                new_entry = candidate
+                break
+    if new_entry is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "message": f"Unknown catalog id for swap: {new_id}",
+                "field": "newId",
+            },
+        )
+    # Mode allowlist gate.
+    if node_allowlist is not None and new_id not in node_allowlist:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "message": (
+                    f"Swap target id '{new_id}' not allowed by "
+                    f"{assistant_mode or 'this assistant mode'}'s catalog.nodes"
+                ),
+                "field": "newId",
+                "rejectedNodeKinds": [new_id],
+                "allowedNodeKinds": sorted(node_allowlist),
+            },
+        )
+    # Arity gate.
+    current_children = list(target.get("children") or [])
+    n_children = len(current_children)
+    cmin = new_entry.children_min
+    cmax = new_entry.children_max
+    if cmax >= 0 and n_children > cmax:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"swap arity incompatible: new id '{new_id}' allows at most "
+                f"{cmax} children, current node has {n_children}. Remove or "
+                "move excess children before retrying."
+            ),
+        )
+    if n_children < cmin:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"swap arity incompatible: new id '{new_id}' requires at least "
+                f"{cmin} children, current node has {n_children}. Insert the "
+                "missing children before retrying."
+            ),
+        )
+    # Capability gate.
+    deployment = state.deployment
+    deployment_caps: set[str] = set()
+    if deployment is not None and hasattr(deployment, "capability_keys"):
+        try:
+            deployment_caps = set(deployment.capability_keys())
+        except Exception:  # noqa: BLE001
+            deployment_caps = set()
+    elif deployment is not None and hasattr(deployment, "capabilities"):
+        deployment_caps = set(getattr(deployment, "capabilities", []))
+    required = list(getattr(new_entry, "required_capabilities", []) or [])
+    missing_caps = [cap for cap in required if cap not in deployment_caps]
+    # Treat missing capability info as a soft pass (no-deployment dev path).
+    if deployment_caps and missing_caps:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": (
+                    f"swap capability missing: new id '{new_id}' requires "
+                    f"capabilities not present in the active deployment: {missing_caps}"
+                ),
+                "missingCapabilities": missing_caps,
+            },
+        )
+    # Param merge per paramsMode.
+    old_params = dict(target.get("params") or {})
+    if params_mode == "replace":
+        merged_params = dict(params_overlay)
+    elif params_mode == "merge":
+        merged_params = {**old_params, **params_overlay}
+    else:  # strict
+        merged_params = {**old_params, **params_overlay}
+    accepted_param_names = {p.name for p in new_entry.parameters}
+    dropped_params = {
+        k: v for k, v in merged_params.items() if k not in accepted_param_names
+    }
+    if params_mode == "strict" and dropped_params:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": (
+                    f"swap params invalid: existing params {sorted(dropped_params.keys())} "
+                    f"not accepted by new id '{new_id}' under strict paramsMode"
+                ),
+                "droppedParams": sorted(dropped_params.keys()),
+                "acceptedParamNames": sorted(accepted_param_names),
+            },
+        )
+    cleaned_params = {
+        k: v for k, v in merged_params.items() if k in accepted_param_names
+    }
+    # Required-param check on the cleaned set.
+    missing_required = [
+        p.name
+        for p in new_entry.parameters
+        if p.required and p.default is None and p.name not in cleaned_params
+    ]
+    if missing_required:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": (
+                    f"swap params invalid: new id '{new_id}' requires "
+                    f"parameters not present after merge: {missing_required}"
+                ),
+                "missingRequiredParams": missing_required,
+                "droppedParams": sorted(dropped_params.keys()),
+                "providedParamNames": sorted(cleaned_params.keys()),
+            },
+        )
+    # Swap-class compatibility (advisory; only enforced when both sides
+    # carry a swap_class field and they differ).
+    old_entry = None
+    if isinstance(old_id, str):
+        for candidate in state.catalog.entries:
+            if candidate.id == old_id:
+                old_entry = candidate
+                break
+    old_class = getattr(old_entry, "swap_class", None) if old_entry is not None else None
+    new_class = getattr(new_entry, "swap_class", None)
+    swap_class_matched: bool | None = None
+    if old_class and new_class:
+        if old_class == new_class:
+            swap_class_matched = True
+        elif force:
+            swap_class_matched = False
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "message": (
+                        f"swap class mismatch: '{old_id}' is in swap_class "
+                        f"'{old_class}' but '{new_id}' is in '{new_class}'. "
+                        "Pass force=true to bypass if the cross-class swap "
+                        "is intentional."
+                    ),
+                    "oldSwapClass": old_class,
+                    "newSwapClass": new_class,
+                },
+            )
+    # All gates passed — atomic mutation.
+    target["id"] = new_id
+    target["params"] = cleaned_params
+    _apply_program_draft_data(
+        state,
+        program_data=program_data,
+        force_discard_overrides=_force_discard_overrides(arguments),
+    )
+    extra: dict[str, Any] = {
+        "nodeName": target.get("name"),
+        "oldId": old_id,
+        "newId": new_id,
+        "swapClassMatched": swap_class_matched,
+        "droppedParams": sorted(dropped_params.keys()),
+        "providedParamNames": sorted(cleaned_params.keys()),
+    }
+    return _program_draft_result(
+        state,
+        draft_mutation="tree_node_swap",
+        extra=extra,
+    )
+
+
 def _apply_tree_draft_wrap_node(
     state: ComposerState,
     *,
@@ -2322,12 +2872,12 @@ def _apply_tree_draft_wrap_node(
     _assert_program_draft_edit_allowed(state)
     target_name_raw = arguments.get("targetName") or arguments.get("target_name")
     if not isinstance(target_name_raw, str) or not target_name_raw.strip():
-        raise HTTPException(status_code=400, detail="tree.draft.wrap_node requires targetName")
+        raise HTTPException(status_code=400, detail="tree_draft_wrap_node requires targetName")
     target_name = target_name_raw.strip()
 
     wrapper_arg = arguments.get("wrapper")
     if not isinstance(wrapper_arg, dict):
-        raise HTTPException(status_code=400, detail="tree.draft.wrap_node requires wrapper object")
+        raise HTTPException(status_code=400, detail="tree_draft_wrap_node requires wrapper object")
     # The contract is: the wrapper's children are filled in by the handler.
     # Any caller-supplied children value is discarded.
     #
@@ -2346,7 +2896,7 @@ def _apply_tree_draft_wrap_node(
             raise HTTPException(
                 status_code=400,
                 detail=(
-                    "tree.draft.wrap_node wrapper must not include non-empty "
+                    "tree_draft_wrap_node wrapper must not include non-empty "
                     "'children'. The handler inserts the target's existing "
                     "subtree as the wrapper's only child. Resubmit without "
                     "the children field, or with an empty list."
@@ -2473,7 +3023,7 @@ def _apply_program_draft_upsert_parameters(
     _assert_program_draft_edit_allowed(state)
     raw_parameters = arguments.get("parameters")
     if not isinstance(raw_parameters, list) or not raw_parameters:
-        raise HTTPException(status_code=400, detail="program.draft.upsert_parameters requires parameters")
+        raise HTTPException(status_code=400, detail="program_draft_upsert_parameters requires parameters")
     parameters = [_program_parameter_dump(raw, index=index) for index, raw in enumerate(raw_parameters)]
     names = [parameter["name"] for parameter in parameters]
     if len(set(names)) != len(names):
@@ -2512,7 +3062,7 @@ def _apply_program_draft_remove_parameters(
     arguments: dict[str, Any],
 ) -> dict[str, Any]:
     _assert_program_draft_edit_allowed(state)
-    names = _string_list_argument(arguments, key="names", tool_id="program.draft.remove_parameters")
+    names = _string_list_argument(arguments, key="names", tool_id="program_draft_remove_parameters")
     program_data = state.program.to_dict()
     parameters = list(program_data.get("parameters") or [])
     existing_names = {
@@ -2578,7 +3128,7 @@ def _apply_blackboard_draft_upsert_namespaces(
     _assert_program_draft_edit_allowed(state)
     raw_namespaces = arguments.get("namespaces")
     if not isinstance(raw_namespaces, list) or not raw_namespaces:
-        raise HTTPException(status_code=400, detail="blackboard.draft.upsert_namespaces requires namespaces")
+        raise HTTPException(status_code=400, detail="blackboard_draft_upsert_namespaces requires namespaces")
     namespaces = [
         _blackboard_namespace_dump(raw, index=index)
         for index, raw in enumerate(raw_namespaces)
@@ -2622,7 +3172,7 @@ def _apply_blackboard_draft_remove_namespaces(
     arguments: dict[str, Any],
 ) -> dict[str, Any]:
     _assert_program_draft_edit_allowed(state)
-    ids = _string_list_argument(arguments, key="ids", tool_id="blackboard.draft.remove_namespaces")
+    ids = _string_list_argument(arguments, key="ids", tool_id="blackboard_draft_remove_namespaces")
     program_data = state.program.to_dict()
     blackboard = _blackboard_payload(program_data)
     existing_ids = {
@@ -2659,7 +3209,7 @@ def _apply_blackboard_draft_upsert_keys(
     _assert_program_draft_edit_allowed(state)
     raw_keys = arguments.get("keys")
     if not isinstance(raw_keys, list) or not raw_keys:
-        raise HTTPException(status_code=400, detail="blackboard.draft.upsert_keys requires keys")
+        raise HTTPException(status_code=400, detail="blackboard_draft_upsert_keys requires keys")
     keys = [_blackboard_key_dump(raw, index=index) for index, raw in enumerate(raw_keys)]
     ids = [key["id"] for key in keys]
     if len(set(ids)) != len(ids):
@@ -2700,7 +3250,7 @@ def _apply_blackboard_draft_remove_keys(
     arguments: dict[str, Any],
 ) -> dict[str, Any]:
     _assert_program_draft_edit_allowed(state)
-    ids = _string_list_argument(arguments, key="ids", tool_id="blackboard.draft.remove_keys")
+    ids = _string_list_argument(arguments, key="ids", tool_id="blackboard_draft_remove_keys")
     program_data = state.program.to_dict()
     blackboard = _blackboard_payload(program_data)
     existing_ids = {
@@ -2768,6 +3318,50 @@ def _assistant_provider_context(
                 ),
             )
 
+        # Build the rich nodeCatalog using the same _catalog_entry_payload
+        # function that powers catalog_read. Mode-filtered to nodes
+        # visible in this mode; otherwise the payload is byte-identical
+        # to what the model would receive from a catalog_read tool call.
+        # Single source of truth for catalog metadata between preamble
+        # and live tool calls.
+        _visible_node_id_set = set(resolved_catalog["nodes"])
+        _visible_node_catalog: list[dict[str, Any]] = [
+            _catalog_entry_payload(entry, include_parameters=True)
+            for entry in state.catalog.entries
+            if entry.id in _visible_node_id_set
+        ]
+        # Skill payload uses _skills_payload for the same single-source-
+        # of-truth reason as the catalog: identical shape between
+        # preamble and live skills_read.
+        _visible_skill_ids = list(resolved_catalog.get("skills") or [])
+        try:
+            _visible_skill_catalog = _skills_payload(
+                state, skill_ids=_visible_skill_ids, include_bodies=True,
+            ) if _visible_skill_ids else []
+        except HTTPException:
+            _visible_skill_catalog = []
+        # Auto-inject snapshots of the current program tree and scene
+        # state (added 2026-05-06) so the LLM can plan from real state
+        # without spending turns on `program_read` and `scene_inspect`. Same
+        # data those tools would return — payload-shape parity. The
+        # model is still expected to call those tools to *refresh*
+        # state mid-task (e.g. after applying a mutation), and the
+        # schema descriptions for those tools have been updated to
+        # spell that out.
+        _program_snapshot: dict[str, Any] | None = None
+        if state.program is not None:
+            _program_snapshot = {
+                "programLoaded": True,
+                "programSourcePath": state.program_source_path,
+                "programSessionGeneration": state.program_session_generation,
+                "programTreeHash": state.program_tree_hash,
+                "program": state.program.to_dict(),
+            }
+        _scene_snapshot: dict[str, Any] | None = None
+        try:
+            _scene_snapshot = build_scene_state_payload(state)
+        except Exception:  # noqa: BLE001 — fall back gracefully
+            _scene_snapshot = None
         return AssistantProviderContext(
             conversation_id=conversation_id,
             request_id=request_id,
@@ -2778,8 +3372,10 @@ def _assistant_provider_context(
             tool_catalog=enrich_assistant_tool_descriptors(
                 list(resolved_catalog["tools"])
             ),
-            visible_skills=list(resolved_catalog["skills"]),
-            visible_nodes=list(resolved_catalog["nodes"]),
+            visible_node_catalog=_visible_node_catalog,
+            visible_skill_catalog=_visible_skill_catalog,
+            program_snapshot=_program_snapshot,
+            scene_snapshot=_scene_snapshot,
         )
 
     if request.mode == "provider" and request.assistant_mode:

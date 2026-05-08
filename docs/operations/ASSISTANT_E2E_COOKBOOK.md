@@ -34,9 +34,9 @@ it" is better than a large demo that hides which part failed.
 
 ## Prerequisites
 
-- ManyForge repo: `/home/tndlux/workspaces/dev_ws/src/manyforge`
+- ManyForge repo: `${HOME}/workspaces/dev_ws/src/manyforge`
 - NemoClaw-Thor repo:
-  `/home/tndlux/workspaces/nemoclaw/src/NemoClaw-Thor`
+  `${HOME}/workspaces/nemoclaw/src/NemoClaw-Thor`
 - Docker image for the ManyForge dev lane is built: `manyforge-dev:latest`
 - NemoClaw-Thor vLLM image/profile support is already set up.
 - Thor memory protocol is followed before each model switch.
@@ -44,9 +44,9 @@ it" is better than a large demo that hides which part failed.
 Current primary candidate profiles:
 
 ```text
-nemotron3-nano-omni-30b-a3b-nvfp4  # current known-good single-model demo default
+cosmos-reason2-8b                  # current known-good single-model demo default
 qwen3.6-35b-a3b-nvfp4-tq-mtp-manyforge
-cosmos-reason2-8b
+nemotron3-nano-omni-30b-a3b-nvfp4
 ```
 
 ## Base Recipe: Cold Boot
@@ -72,18 +72,18 @@ misleading startup failures such as vLLM memory-profiling assertions.
 ### 2. Start The Local Model Server
 
 ```bash
-cd /home/tndlux/workspaces/nemoclaw/src/NemoClaw-Thor
+cd ${HOME}/workspaces/nemoclaw/src/NemoClaw-Thor
 
 THOR_DETACH=1 \
 THOR_CONTAINER_NAME=manyforge-e2e-vllm \
-./serving/start-model.sh nemotron3-nano-omni-30b-a3b-nvfp4
+./serving/start-model.sh cosmos-reason2-8b
 ```
 
-For Qwen3.6 or Cosmos comparison runs, replace the profile with:
+For Qwen3.6 or Nemotron Omni comparison runs, replace the profile with:
 
 ```text
 qwen3.6-35b-a3b-nvfp4-tq-mtp-manyforge
-cosmos-reason2-8b
+nemotron3-nano-omni-30b-a3b-nvfp4
 ```
 
 Verify:
@@ -99,9 +99,9 @@ The ManyForge bridge talks directly to `127.0.0.1:8000/v1`, but the provider
 route, sandbox runtime config, and warmup should still be updated.
 
 ```bash
-cd /home/tndlux/workspaces/nemoclaw/src/NemoClaw-Thor
+cd ${HOME}/workspaces/nemoclaw/src/NemoClaw-Thor
 
-./setup/configure-local-provider.sh nemotron3-nano-omni-30b-a3b-nvfp4
+./setup/configure-local-provider.sh cosmos-reason2-8b
 ./setup/status.sh
 ```
 
@@ -112,14 +112,14 @@ Start Composer with `--hmi-port 8081` for UI demos; otherwise the embedded
 Viser panel correctly reports that the HMI is unavailable.
 
 ```bash
-cd /home/tndlux/workspaces/dev_ws/src/manyforge
+cd ${HOME}/workspaces/dev_ws/src/manyforge
 
 docker rm -f manyforge-e2e-composer 2>/dev/null || true
 
 docker run -d --rm \
   --name manyforge-e2e-composer \
   --network host \
-  -v /home/tndlux/workspaces/dev_ws/src/manyforge:/workspace \
+  -v ${HOME}/workspaces/dev_ws/src/manyforge:/workspace \
   -v manyforge_build-cache:/tmp/manyforge-build \
   -w /workspace \
   -e MANYFORGE_ASSISTANT_PROVIDER=nemoclaw \
@@ -155,7 +155,7 @@ deployment.status = loaded
 ### 5. Install Bridge Dependencies
 
 ```bash
-cd /home/tndlux/workspaces/dev_ws/src/manyforge
+cd ${HOME}/workspaces/dev_ws/src/manyforge
 
 python3 -m venv manyforge_assistant_bridge/.venv
 manyforge_assistant_bridge/.venv/bin/pip install -r manyforge_assistant_bridge/requirements.txt
@@ -167,13 +167,13 @@ Use this when you want to interact with Composer manually while keeping the
 bridge process visible in a terminal.
 
 ```bash
-cd /home/tndlux/workspaces/dev_ws/src/manyforge
+cd ${HOME}/workspaces/dev_ws/src/manyforge
 
 BRIDGE_HOST=127.0.0.1 \
 BRIDGE_PORT=8100 \
 BRIDGE_UPSTREAM_BASE_URL=http://127.0.0.1:8000/v1 \
 BRIDGE_MANYFORGE_BASE_URL=http://127.0.0.1:9000 \
-BRIDGE_MODEL=nemotron3-nano-omni-30b-a3b-nvfp4 \
+BRIDGE_MODEL=cosmos-reason2-8b \
 BRIDGE_REQUEST_TIMEOUT_S=180 \
 BRIDGE_MAX_WALL_TIME_S=180 \
 BRIDGE_MAX_TURNS=16 \
@@ -195,33 +195,32 @@ curl -s http://127.0.0.1:8100/healthz | python3 -m json.tool
 
 Use this when you want the current best single-model assistant path without
 manually stitching together the model, Composer, HMI, and bridge. The launcher
-defaults to the NVIDIA Nemotron 3 Nano Omni profile because it is the current
-preferred single-model candidate for agentic workflows and leaves room for
-future text, vision, and audio input through one endpoint.
+defaults to `cosmos-reason2-8b`, the current preferred lightweight
+single-model candidate for the known-good assistant lane.
 
-The launcher has two assistant-provider lanes; **direct vLLM (`nemoclaw`) is
-the default** as of 2026-05-06:
+The launcher has two assistant-provider lanes; **OpenClaw (`openclaw`) is the
+default** for the known-good assistant workflow:
 
-| Lane | Default? | Bridge | Latency (p50/test) | Notes |
+| Lane | Default? | Bridge | Latency (median/test, cosmos-reason2-8b) | Notes |
 |---|---|---|---|---|
-| `nemoclaw` | ✅ default | in-tree `manyforge_assistant_bridge` on `:8100` | ~22 s/test | Direct vLLM. Bridge runs the tool loop in-process. Best for local development and demos. |
-| `openclaw` | sandboxed | NemoClaw-Thor `openclaw_assistant_bridge` on `:8200` | ~80 s/test | Persistent gateway in NemoClaw `my-assistant` sandbox. Adds bounded-autonomy enforcement (per-tool audit with assistantMode + catalogHash + principal). 3.6× direct latency at p50. Use for shared/multi-tenant deployments. Provisions the OpenClaw sandbox automatically (egress preset, skill, MCP server). |
+| `openclaw` | ✅ default | NemoClaw-Thor `openclaw_assistant_bridge` on `:8200` | ~25 s/test (P1 ~22 s, P2 ~25 s, P3 ~31 s; 2026-05-08) | Persistent gateway in NemoClaw `my-assistant` sandbox. Adds bounded-autonomy enforcement (per-tool audit with assistantMode + catalogHash + principal). Use for the known-good assistant lane and shared/multi-tenant deployments. Provisions the OpenClaw sandbox automatically (egress preset, skill, MCP server). |
+| `nemoclaw` | backup | in-tree `manyforge_assistant_bridge` on `:8100` | ~17 s/test (P1 ~11 s, P2 ~17 s, P3 ~19 s; 2026-05-08) | Direct vLLM. Bridge runs the tool loop in-process; for compound prompts the bridge inlines a structured `programSnapshot` / `sceneSnapshot` extract into the user message before pinning the action tool. Useful for fast local iteration when sandbox isolation is not needed. |
 
 Both lanes preserve the same bounded-autonomy contract on the ManyForge side
 (mode-scoped MCP wrapper + `/api/assistant/bridge/tools/{toolId}` + audit envelope).
-Default switch justified by the 2026-05-06 comparison matrix — both paths
-solve 14/15 of the same task set, but direct is consistently faster. See
-`COMPARISON-2026-05-06-direct-vs-openclaw.md` in NemoClaw-Thor.
+The direct lane is faster, but the known-good assistant demo defaults to
+OpenClaw because it exercises the sandbox, skill, MCP, and bounded-autonomy
+envelope used by the target runtime workflow.
 
 ```bash
-cd /home/tndlux/workspaces/dev_ws/src/manyforge
+cd ${HOME}/workspaces/dev_ws/src/manyforge
 
-# default: direct vLLM lane
+# default: OpenClaw sandboxed lane
 ./scripts/demo-assistant-known-good.sh preflight
 ./scripts/demo-assistant-known-good.sh start
 
-# explicit opt-in to the OpenClaw sandboxed lane:
-ASSISTANT_PROVIDER=openclaw ./scripts/demo-assistant-known-good.sh start
+# direct vLLM backup lane:
+ASSISTANT_PROVIDER=nemoclaw ./scripts/demo-assistant-known-good.sh start
 ```
 
 The known-good launcher defaults to `ASSISTANT_MAX_TURNS=16`. This is a bridge
@@ -234,27 +233,11 @@ invalid callback arguments. Override it when testing:
 ASSISTANT_MAX_TURNS=8 ./scripts/demo-assistant-known-good.sh start
 ```
 
-What it does (default — `nemoclaw` direct-vLLM lane):
+What it does (default — `openclaw` sandboxed lane):
 
 1. stops stale `manyforge-e2e-vllm` state if needed and runs the Thor memory
    protocol before model launch,
-2. starts `nemotron3-nano-omni-30b-a3b-nvfp4` through NemoClaw-Thor
-   `serving/start-model.sh`,
-3. starts Composer on `http://127.0.0.1:9000` with HMI/Viser on
-   `http://127.0.0.1:8081`, configured to use the `nemoclaw` provider at
-   `http://127.0.0.1:8100/v1/manyforge/assistant`,
-4. starts the in-tree `manyforge_assistant_bridge` on `http://127.0.0.1:8100`.
-   The bridge translates Composer's `manyforge.assistant.provider_request.v0`
-   envelope into `/v1/chat/completions` calls against vLLM directly and
-   drives the tool loop in-process,
-5. loads `pick_and_place_ur10e_robotiq.program.yaml` with
-   `assistant_modes_scene_authoring.deployment.yaml`.
-
-What changes for the OpenClaw lane (`ASSISTANT_PROVIDER=openclaw`):
-
-1. stops stale `manyforge-e2e-vllm` state if needed and runs the Thor memory
-   protocol before model launch,
-2. starts `nemotron3-nano-omni-30b-a3b-nvfp4` through NemoClaw-Thor
+2. starts `cosmos-reason2-8b` through NemoClaw-Thor
    `serving/start-model.sh`,
 3. runs `setup/configure-local-provider.sh` for the same profile (which also
    spawns the OpenClaw gateway in its SSH-session network namespace),
@@ -276,9 +259,10 @@ What changes for the OpenClaw lane (`ASSISTANT_PROVIDER=openclaw`):
 7. loads `pick_and_place_ur10e_robotiq.program.yaml` with
    `assistant_modes_scene_authoring.deployment.yaml`.
 
-(For the inverse — switching from the default direct lane to the OpenClaw
-lane — the launcher takes care of all the differences automatically when you
-set `ASSISTANT_PROVIDER=openclaw`.)
+The direct backup lane (`ASSISTANT_PROVIDER=nemoclaw`) uses the same model
+profile and Composer deployment but starts the in-tree
+`manyforge_assistant_bridge` on `http://127.0.0.1:8100` and drives the tool
+loop in-process against vLLM.
 
 The preflight refuses to start if ports `8000`, `8080`, `8081`, `8100`,
 `8200`, or `9000` are already owned by unmanaged processes. This prevents
@@ -367,7 +351,7 @@ surface:
 MODEL_PROFILE=qwen3.6-35b-a3b-nvfp4-tq-mtp-manyforge \
   ./scripts/demo-assistant-known-good.sh restart
 
-MODEL_PROFILE=cosmos-reason2-8b \
+MODEL_PROFILE=nemotron3-nano-omni-30b-a3b-nvfp4 \
   ./scripts/demo-assistant-known-good.sh restart
 ```
 
@@ -419,11 +403,11 @@ The reusable runner starts and stops the bridge for each sampling profile. It
 loads the assistant-mode deployment and a baseline program, then exercises:
 
 - direct vLLM tool-call probing,
-- query-mode `program.read`,
+- query-mode `program_read`,
 - operator-facing Composer assistant flow with provider discovery, HMI status,
   draft mutation, request status, diagnostics, and discard,
-- composer-assistant `scene.draft.add_object`,
-- golden-scene `scene.draft.upsert_objects` with expected object IDs, shapes,
+- composer-assistant `scene_draft_add_object`,
+- golden-scene `scene_draft_upsert_objects` with expected object IDs, shapes,
   and poses,
 - composer-assistant full draft tool surface: discovery reads, scene remove,
   tree insert/update/delete/move/replace, parameter edits, and blackboard
@@ -436,10 +420,10 @@ loads the assistant-mode deployment and a baseline program, then exercises:
 Primary qualification:
 
 ```bash
-cd /home/tndlux/workspaces/dev_ws/src/manyforge
+cd ${HOME}/workspaces/dev_ws/src/manyforge
 
 ./scripts/smoke-assistant-e2e.py \
-  --profile omni-instruct-no-think-32768 \
+  --profile cosmos-bridge-default \
   --require-hmi \
   --strict \
   --output /tmp/manyforge-assistant-e2e/assistant-primary.json
@@ -459,6 +443,7 @@ Available runner profiles:
 |---|---|
 | `vllm-generation-config` | Direct vLLM probe with no per-request generation overrides |
 | `bridge-default` | Bridge defaults: `temperature=0.0`, `max_tokens=512`, thinking unset |
+| `cosmos-bridge-default` | Current known-good Cosmos bridge profile: `temperature=0.0`, `max_tokens=8192` |
 | `omni-vendor-tool` | NVIDIA tool-call sampling: `temperature=0.6`, `top_p=0.95`, `max_tokens=512`, thinking unset |
 | `omni-vendor-tool-no-think` | Vendor sampling with `enable_thinking=false`, `max_tokens=512` |
 | `omni-vendor-tool-no-think-32768` | Vendor sampling with `enable_thinking=false`, `max_tokens=32768` |
@@ -466,7 +451,7 @@ Available runner profiles:
 | `omni-instruct-no-think-128` | Output-budget sweep with `max_tokens=128` |
 | `omni-instruct-no-think-256` | Output-budget sweep with `max_tokens=256` |
 | `omni-instruct-no-think-1024` | Output-budget sweep with `max_tokens=1024` |
-| `omni-instruct-no-think-32768` | Current realistic assistant profile: `max_tokens=32768`, `enable_thinking=false` |
+| `omni-instruct-no-think-32768` | Legacy Nemotron Omni realistic assistant profile: `max_tokens=32768`, `enable_thinking=false` |
 | `omni-deterministic-no-think` | Deterministic non-thinking comparison |
 
 ## E2E Recipes
@@ -524,12 +509,12 @@ Command:
 
 ```bash
 ./scripts/smoke-assistant-e2e.py \
-  --profile omni-instruct-no-think-32768 \
+  --profile cosmos-bridge-default \
   --skip-negative \
   --output /tmp/manyforge-assistant-e2e/query-and-draft.json
 ```
 
-Pass signal: the `queryReadOnly` result contains a completed `program.read`
+Pass signal: the `queryReadOnly` result contains a completed `program_read`
 tool call, `requestStatus.status: completed`, and `draftMutated: false` in the
 bridge audit.
 
@@ -557,7 +542,7 @@ Command:
 
 ```bash
 ./scripts/smoke-assistant-e2e.py \
-  --profile omni-instruct-no-think-32768 \
+  --profile cosmos-bridge-default \
   --require-hmi \
   --skip-negative \
   --output /tmp/manyforge-assistant-e2e/operator-flow.json
@@ -565,7 +550,7 @@ Command:
 
 Pass signal: `operatorComposerFlow.ok: true`, `providerCatalog.configuredProviderId`
 matches the configured provider, `hmi.status: healthy`, exactly one
-`scene.draft.upsert_objects` call completes, no tool call is outside
+`scene_draft_upsert_objects` call completes, no tool call is outside
 `composer-assistant`, the draft program contains the expected object before
 reload, HMI diagnostics match when available, request status is `completed`,
 and reload/discard removes the assistant-authored object.
@@ -573,12 +558,12 @@ and reload/discard removes the assistant-authored object.
 ### Golden Scene Upsert
 
 Goal: the assistant reproduces a small expected scene from text by calling
-`scene.draft.upsert_objects` once. This verifies more than transport: it checks
+`scene_draft_upsert_objects` once. This verifies more than transport: it checks
 that the resulting draft contains the expected object IDs, shape types,
 dimensions/radius, frame, and positions.
 
 Pass signal: `goldenSceneUpsert.ok: true`, exactly one completed
-`scene.draft.upsert_objects` call, no `validationErrors`, both expected objects
+`scene_draft_upsert_objects` call, no `validationErrors`, both expected objects
 appear in `matchedExpectedObjects`, `actualUpsertObjectIds` has no extras, and
 reload/discard removes the assistant-authored draft objects. The validator checks
 tool-call arguments and resulting draft state for object IDs, shape
@@ -589,10 +574,10 @@ mentions the expected object IDs.
 ### Golden Tree Insert
 
 Goal: the assistant inserts a precise behavior-tree node into the Composer draft
-from text by calling `tree.draft.insert_node` once.
+from text by calling `tree_draft_insert_node` once.
 
 Pass signal: `goldenTreeInsert.ok: true`, exactly one completed
-`tree.draft.insert_node` call, no `validationErrors`, and reload/discard removes
+`tree_draft_insert_node` call, no `validationErrors`, and reload/discard removes
 the assistant-authored node. The validator checks parent, insertion index, node
 ID/name, node parameters, resulting draft-tree placement in the tool response
 and live `/api/program`, request-status metadata, and assistant text mention of
@@ -601,10 +586,10 @@ the inserted node name.
 ### Golden Parameter Upsert
 
 Goal: the assistant inserts a precise program parameter into the Composer draft
-from text by calling `program.draft.upsert_parameters` once.
+from text by calling `program_draft_upsert_parameters` once.
 
 Pass signal: `goldenParameterUpsert.ok: true`, exactly one completed
-`program.draft.upsert_parameters` call, no `validationErrors`, and
+`program_draft_upsert_parameters` call, no `validationErrors`, and
 reload/discard removes the assistant-authored parameter. The validator checks
 tool-call arguments, resulting draft parameter metadata in the tool response
 and live `/api/program`, request-status metadata, and assistant text mention of
@@ -613,8 +598,8 @@ the parameter name.
 ### Golden Blackboard Upsert
 
 Goal: the assistant inserts a precise blackboard namespace and key into the
-Composer draft from text by calling `blackboard.draft.upsert_namespaces` and
-`blackboard.draft.upsert_keys`.
+Composer draft from text by calling `blackboard_draft_upsert_namespaces` and
+`blackboard_draft_upsert_keys`.
 
 Pass signal: `goldenBlackboardUpsert.ok: true`, exactly one completed call for
 each blackboard tool, no `validationErrors`, and reload/discard removes the
@@ -638,7 +623,7 @@ Command:
 
 ```bash
 ./scripts/smoke-assistant-e2e.py \
-  --profile omni-instruct-no-think-32768 \
+  --profile cosmos-bridge-default \
   --output /tmp/manyforge-assistant-e2e/fail-closed.json
 ```
 

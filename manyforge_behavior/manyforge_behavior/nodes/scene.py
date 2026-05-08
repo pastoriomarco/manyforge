@@ -43,7 +43,12 @@ def _resolve_collision_object_request(
     box_dimensions_m = resolve_blackboard_value(blackboard, params.get("box_dimensions_m"))
     sphere_radius_m = resolve_blackboard_value(blackboard, params.get("sphere_radius_m"))
     pose = resolve_blackboard_value(blackboard, params.get("pose", {}))
-    frame_id = resolve_blackboard_value(blackboard, params.get("frame_id"))
+    # frame_id lives INSIDE pose (PoseStamped-shaped) — same shape as
+    # scene-resource pose. The previous separate-top-level form was
+    # an asymmetry between the tree-node and scene-resource schemas
+    # that small models tripped on consistently; unified in the v0.1
+    # cleanup. See spec 410 §4 and spec 485 §2.10.
+    frame_id = pose.get("frame_id") if isinstance(pose, dict) else None
     orient = pose.get("orientation_xyzw") or (
         _rpy_deg_to_xyzw(pose["orientation_rpy_deg"])
         if "orientation_rpy_deg" in pose else None
@@ -181,12 +186,12 @@ class UpdateCollisionObjectPose(_SceneCallbackMixin, py_trees.behaviour.Behaviou
             pose = resolve_blackboard_value(
                 self.blackboard, self._params.get("pose", {})
             )
-            frame_id = resolve_blackboard_value(
-                self.blackboard, self._params.get("frame_id")
-            )
         except (AttributeError, KeyError) as exc:
             self.feedback_message = str(exc)
             return py_trees.common.Status.FAILURE
+        # frame_id is sourced from pose (PoseStamped). See the
+        # _resolve_collision_object_request comment for context.
+        frame_id = pose.get("frame_id") if isinstance(pose, dict) else None
         orient = pose.get("orientation_xyzw") or (
             _rpy_deg_to_xyzw(pose["orientation_rpy_deg"])
             if "orientation_rpy_deg" in pose else None

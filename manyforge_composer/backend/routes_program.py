@@ -426,6 +426,11 @@ def create_program_router(state: ComposerState) -> APIRouter:
                 deployment_path,
                 force_discard_overrides=request.force_discard_overrides,
             )
+            # Drop assistant delta baselines — a freshly loaded program
+            # makes any prior conversation's baseline meaningless. Next
+            # tool call re-baselines against the loaded state.
+            from ._assistant_delta import reset_all as _reset_assistant_baselines
+            _reset_assistant_baselines()
         except HTTPException:
             raise
         except RuntimeError as exc:

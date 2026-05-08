@@ -47,8 +47,31 @@ class AssistantProviderContext:
     assistant_mode: str | None = None
     schema_version: str = "0.1.0"
     tool_catalog: list[dict[str, Any]] = field(default_factory=list)
-    visible_skills: list[str] = field(default_factory=list)
-    visible_nodes: list[str] = field(default_factory=list)
+    # Rich per-node descriptors (id, kind, childrenMin, childrenMax,
+    # description, parameters, requiredCapabilities, ...) for nodes
+    # visible in this assistant mode. The same shape `catalog_read`
+    # returns. Forwarded to the assistant provider as `nodeCatalog`
+    # so the model can plan from the same data structure it gets back
+    # from a tool call — single source of truth between the preamble
+    # and live tool calls.
+    visible_node_catalog: list[dict[str, Any]] = field(default_factory=list)
+    # Full skill payloads (the same shape skills_read returns, with
+    # bodies). Forwarded to the assistant provider as `skillCatalog`.
+    # Same single-source-of-truth principle as visible_node_catalog.
+    visible_skill_catalog: list[dict[str, Any]] = field(default_factory=list)
+    # Snapshots of the current draft program tree and scene resources at
+    # request-time. Auto-injected so the LLM can plan straight from the
+    # actual state without round-tripping through `program_read` and
+    # `scene_inspect` first — saves 2 turns on every request, big win for
+    # thinking-on (~30s/turn) and noticeable for thinking-off too.
+    # Models are still expected to call program_read / scene_inspect
+    # explicitly if they need to refresh state mid-task (e.g. after a
+    # mutation in this same request); the schema descriptions are
+    # updated to make that pattern clear.
+    # Optional — None when no program/scene is loaded; consumers fall
+    # back to the existing tool-call path. Added 2026-05-06.
+    program_snapshot: dict[str, Any] | None = None
+    scene_snapshot: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -399,18 +422,40 @@ class NemoClawAssistantProvider:
             },
         }
         if context.assistant_mode:
-            tool_ids = [_tool_identifier(tool) for tool in context.tool_catalog]
+            # The wire envelope carries rich payloads only. Three
+            # parallel rich lists at the catalog level:
+            #
+            #   tools         — the top-level `tools` field above
+            #                   (full descriptors with id, description,
+            #                   effect, inputSchema). Consumers derive
+            #                   ids from `tools[*].id`.
+            #   nodeCatalog   — full catalog entries for nodes visible
+            #                   in this mode. Consumers derive ids
+            #                   from `nodeCatalog[*].id`.
+            #   skillCatalog  — full skill payloads (with bodies). Same
+            #                   convention.
+            #
+            # The legacy bare-id lists (`catalog.tools`, `catalog.nodes`,
+            # `catalog.skills`, top-level `nodes`, top-level `skills`)
+            # were dropped to remove the source-of-truth duplication.
+            # programSnapshot + sceneSnapshot carry the live program
+            # tree and scene state at request-time so the LLM can plan
+            # without round-tripping through `program_read` /
+            # `scene_inspect`.
+            # Wire envelope keeps catalog metadata at the top level
+            # only. The legacy nested `catalog` block was retained for
+            # one transitional cycle as `{nodeCatalog, skillCatalog}`,
+            # but since both fields are byte-identical to their
+            # top-level counterparts, the nested block was pure
+            # duplication. Dropped here for single-source-of-truth.
             payload.update(
                 {
                     "schemaVersion": context.schema_version,
                     "assistantMode": context.assistant_mode,
-                    "skills": list(context.visible_skills),
-                    "nodes": list(context.visible_nodes),
-                    "catalog": {
-                        "skills": list(context.visible_skills),
-                        "tools": [tool_id for tool_id in tool_ids if tool_id],
-                        "nodes": list(context.visible_nodes),
-                    },
+                    "nodeCatalog": list(context.visible_node_catalog),
+                    "skillCatalog": list(context.visible_skill_catalog),
+                    "programSnapshot": context.program_snapshot,
+                    "sceneSnapshot": context.scene_snapshot,
                 }
             )
         return payload
@@ -538,7 +583,8 @@ class NemoClawAssistantProvider:
                 "NemoClaw assistant responses must not report state mutation"
             )
 
-        message = str(data.get("message") or data.get("response") or "").strip()
+        raw_message = data.get("message") or data.get("response") or ""
+        message = _flatten_provider_message(raw_message).strip()
         if not message:
             raise AssistantProviderError("NemoClaw assistant response.message is required")
 
@@ -690,6 +736,41 @@ def _assistant_timeout_from_env() -> float:
     if timeout_s <= 0:
         raise AssistantProviderError("MANYFORGE_ASSISTANT_TIMEOUT_S must be > 0")
     return timeout_s
+
+
+def _flatten_provider_message(value: Any) -> str:
+    """Coerce a provider's ``message`` field into plain text.
+
+    Providers can send the message as a flat string, as a list of typed
+    content blocks (Anthropic-style ``[{"type": "text", "text": "..."}]``),
+    or as a single block dict. Without normalisation, ``str(value)`` on
+    a list emitted the Python ``repr`` of the list verbatim into the
+    chat surface — single quotes, embedded ``\\n`` literals, and all.
+    Mirrors the bridge-side flattener in ``openclaw_assistant_bridge``;
+    the duplication is intentional so a non-OpenClaw provider that
+    emits the same shape is also handled.
+    """
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        text = value.get("text")
+        if isinstance(text, str):
+            return text
+        return ""
+    if isinstance(value, list):
+        parts: list[str] = []
+        for block in value:
+            if isinstance(block, str):
+                parts.append(block)
+                continue
+            if not isinstance(block, dict):
+                continue
+            block_type = block.get("type")
+            text = block.get("text")
+            if isinstance(text, str) and block_type in (None, "text"):
+                parts.append(text)
+        return "".join(parts)
+    return ""
 
 
 def _tool_identifier(tool: dict[str, Any]) -> str:

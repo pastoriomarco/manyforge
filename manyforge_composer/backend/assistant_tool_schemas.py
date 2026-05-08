@@ -15,25 +15,48 @@ _NO_ARGUMENT_SCHEMA: dict[str, Any] = {
 _CATALOG_READ_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
+    "description": (
+        "Reads node-catalog entries that this assistant mode is permitted "
+        "to use. Returns each entry's catalog identifier, its kind, the "
+        "child arity it accepts, the full set of parameter declarations "
+        "the entry expects, and any deployment capabilities required to "
+        "use it. Use this when the per-request manifest's nodeCatalog "
+        "summary needs to be expanded to the full per-parameter "
+        "description, or when filtering by kind or category. The result "
+        "is read-only metadata."
+    ),
     "properties": {
         "entryIds": {
             "type": "array",
             "items": {"type": "string", "minLength": 1},
-            "description": "Optional catalog entry IDs to return. Omit for all entries.",
+            "description": (
+                "Optional list of catalog identifiers to return. Omit to "
+                "receive every entry in the allowed-nodes set."
+            ),
         },
         "category": {
             "type": "string",
             "minLength": 1,
-            "description": "Optional catalog category filter.",
+            "description": (
+                "Optional category filter. Only catalog entries declared "
+                "in the matching category are returned."
+            ),
         },
         "kind": {
             "type": "string",
             "minLength": 1,
-            "description": "Optional catalog kind filter such as action, composite, or decorator.",
+            "description": (
+                "Optional kind filter. Only catalog entries whose declared "
+                "kind matches are returned."
+            ),
         },
         "includeParameters": {
             "type": "boolean",
-            "description": "Include parameter metadata for returned entries.",
+            "description": (
+                "When true, the returned entries include the full "
+                "per-parameter declaration. When false, only the "
+                "structural fields are returned."
+            ),
         },
     },
 }
@@ -42,15 +65,31 @@ _CATALOG_READ_SCHEMA: dict[str, Any] = {
 _SKILLS_READ_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
+    "description": (
+        "Reads skill-catalog entries that this assistant mode is "
+        "permitted to use. Skills are higher-level, deployment-defined "
+        "activities that expand into one or more behavior-tree nodes; "
+        "each entry declares the deployment capabilities it requires "
+        "and the tools needed to perform it. Use this when planning a "
+        "request that may be implementable via a skill rather than by "
+        "hand-assembling individual nodes. The result is read-only."
+    ),
     "properties": {
         "skillIds": {
             "type": "array",
             "items": {"type": "string", "minLength": 1},
-            "description": "Optional skill IDs to return. Omit for all skills.",
+            "description": (
+                "Optional list of skill identifiers to return. Omit to "
+                "receive every entry in the allowed-skills set."
+            ),
         },
         "includeBodies": {
             "type": "boolean",
-            "description": "Include skill body/expansion details.",
+            "description": (
+                "When true, the returned entries include the body "
+                "describing how each skill expands into behavior-tree "
+                "nodes. When false, only the metadata is returned."
+            ),
         },
     },
 }
@@ -125,10 +164,12 @@ _SCENE_DRAFT_SINGLE_OBJECT_SCHEMA: dict[str, Any] = {
     "additionalProperties": True,
     "required": ["objectId"],
     "description": (
-        "Single detached Composer draft scene object. Prefer sending "
-        "objectId, shape, and pose directly at top level. The callback also "
-        "accepts legacy sceneResource wrappers and common aliases such as "
-        "shapeType, size, dimensions, radius, diameter, and position."
+        "Payload describing a single detached Composer scene-draft "
+        "object. The object identifier, the shape declaration, and the "
+        "pose declaration are conveyed at the top level of the payload. "
+        "The callback also accepts a number of compatibility aliases "
+        "that mirror the canonical fields under alternate names; the "
+        "canonical fields are preferred when both are available."
     ),
     # 2026-05-06 v8.1 probe: a JSON-Schema `examples` array previously
     # lived here with a worked payload using objectId "obstacle_01".
@@ -137,7 +178,7 @@ _SCENE_DRAFT_SINGLE_OBJECT_SCHEMA: dict[str, Any] = {
     # via inputSchema.examples on tools/list. The Nemotron-3-Nano-Omni
     # model in this regime (T=0.6, top_p=0.95, thinking off) takes the
     # literal value too seriously: on the "Add a small obstacle…" task
-    # it called scene.draft.add_object 116 times in a single turn, all
+    # it called scene_draft_add_object 116 times in a single turn, all
     # with objectId="obstacle_01". The bridge upserts on duplicate ID,
     # every call returns ok, and the model has no signal it is done.
     # Removing the examples lets the model invent its own objectId,
@@ -228,19 +269,33 @@ _SCENE_DRAFT_UPSERT_OBJECTS_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
     "required": ["sceneResources"],
+    "description": (
+        "Inserts new static scene resources or replaces existing ones in "
+        "a single batched call. The semantics match the single-object add "
+        "and update tools: compile-time configuration, not per-cycle "
+        "mutation. Useful when a request introduces multiple permanent "
+        "objects at once. Duplicate identifiers within a single batch "
+        "are rejected; the caller must assign unique identifiers across "
+        "the batch."
+    ),
     "properties": {
         "sceneResources": {
             "type": "array",
             "items": _SCENE_DRAFT_SINGLE_OBJECT_SCHEMA,
             "minItems": 1,
             "description": (
-                "Scene resources to insert or replace in the Composer draft. "
-                "Duplicate objectId values in one request are rejected."
+                "List of scene-resource payloads to insert or replace. "
+                "Each payload follows the single-object scene-draft "
+                "schema. Identifiers must be unique within the list."
             ),
         },
         "forceDiscardOverrides": {
             "type": "boolean",
-            "description": "Discard unsaved scene-resource overrides with matching objectIds.",
+            "description": (
+                "When true, any unsaved scene-resource overrides with "
+                "identifiers matching this batch are discarded before "
+                "the upsert is applied."
+            ),
         },
     },
 }
@@ -250,21 +305,57 @@ _SCENE_DRAFT_REMOVE_OBJECTS_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
     "required": ["objectIds"],
+    "description": (
+        "Removes a batch of static scene resources from the program's "
+        "scene-resource list. The resources cease to exist for any "
+        "subsequent cycle iteration. Do not use this tool when a request "
+        "describes removing an object only at a specific moment during "
+        "execution; that case calls for a runtime-mutation behavior-tree "
+        "node, inserted via the tree-draft tools instead."
+    ),
     "properties": {
         "objectIds": {
             "type": "array",
             "items": {"type": "string", "minLength": 1},
             "minItems": 1,
-            "description": "Scene object IDs that must already exist in the Composer draft.",
+            "description": (
+                "List of identifiers naming scene resources that must "
+                "already exist in the draft. Identifiers absent from the "
+                "draft are rejected."
+            ),
         },
         "forceDiscardOverrides": {
             "type": "boolean",
-            "description": "Discard unsaved scene-resource overrides with matching objectIds.",
+            "description": (
+                "When true, any unsaved scene-resource overrides with "
+                "identifiers matching this batch are discarded before "
+                "the removal is applied."
+            ),
         },
     },
 }
 
 
+# 2026-05-06: modificationPolicy / recoveryPolicy intentionally OMITTED
+# from these node schemas. The fields are advanced metadata
+# (governance / blackboard / runtime-override knobs) that small models
+# cannot reliably produce — they default to placeholder shapes like
+# {"type": "string"} or {"type": "replace"} that pass JSON-Schema
+# additionalProperties:True validation but get rejected deeper in
+# program-validation as "not a recognized policy field". On the
+# 2026-05-06 v8.1 probe of "remove graspable at end of cycle and
+# re-add", the model emitted {"type": "replace"} on every
+# tree-draft-insert_node call and looped 130x on the same broken
+# payload before the bridge timed out.
+#
+# Same precedent applied to _TREE_NODE_WRAPPER_SCHEMA earlier; this
+# is the matching prevention for insert_node / replace_subtree.
+# Removing the fields from the schema means the LLM no longer sees
+# them advertised on tools/list, so it stops emitting them. Real
+# callers that genuinely need the policy fields can still send them
+# via the broader assistant tool catalog (the deployment's
+# bridge/tools endpoint accepts them) — they're just not part of the
+# narrowed assistant-mode surface the LLM sees.
 _TREE_NODE_CHILD_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": True,
@@ -273,10 +364,30 @@ _TREE_NODE_CHILD_SCHEMA: dict[str, Any] = {
         "id": {"type": "string", "minLength": 1},
         "name": {"type": "string", "minLength": 1},
         "params": {"type": "object", "additionalProperties": True},
-        "modificationPolicy": {"type": "object", "additionalProperties": {"type": "string"}},
-        "recoveryPolicy": {"type": "object", "additionalProperties": True},
         "children": {"type": "array", "items": {"type": "object", "additionalProperties": True}},
     },
+}
+
+
+# 2026-05-06: nested-payload accept-both-forms schema. The model
+# (Nemotron-3-Nano-Omni T=0.6 top_p=0.95) sometimes emits `node` (or
+# `subtree`) as a JSON-encoded STRING instead of an inline object —
+# even though the schema clearly types it as object. We saw this
+# fail the user's GUI prompt with "node: must be object" and the
+# model stopped without retrying. Solution: accept either an inline
+# object (preferred) OR a stringified JSON; the MCP wrapper /
+# backend normalizes the string form back to an object before
+# forwarding. Defensive precedent: same logic as _strip_policy_stubs.
+_TREE_NODE_SCHEMA_STRING_FORM: dict[str, Any] = {
+    "type": "string",
+    "minLength": 2,
+    "description": (
+        "Stringified JSON form of the node object (DISCOURAGED — "
+        "prefer the inline object form). Accepted as a fallback "
+        "because models sometimes serialize the object as a JSON "
+        "string. The bridge parses it back to an object before "
+        "forwarding. Must be a single JSON object, not an array."
+    ),
 }
 
 
@@ -285,11 +396,51 @@ _TREE_NODE_SCHEMA: dict[str, Any] = {
     "additionalProperties": False,
     "required": ["id", "name"],
     "properties": {
-        "id": {"type": "string", "minLength": 1},
-        "name": {"type": "string", "minLength": 1},
-        "params": {"type": "object", "additionalProperties": True},
-        "modificationPolicy": {"type": "object", "additionalProperties": {"type": "string"}},
-        "recoveryPolicy": {"type": "object", "additionalProperties": True},
+        "id": {
+            "type": "string",
+            "minLength": 1,
+            "description": (
+                "Catalog identifier of the kind of node being inserted. "
+                "Must be one of the identifiers declared in the deployment's "
+                "node catalog and present in the allowed-nodes set for this "
+                "assistant mode; consult the per-request manifest's nodeCatalog "
+                "for the authoritative list and for each entry's kind, accepted "
+                "child arity, and parameter declarations. The catalog identifier "
+                "is distinct from this node's instance name and must not be a "
+                "descriptive label, a runtime role, or a textual variant of an "
+                "existing identifier — variants that merely resemble a real "
+                "catalog identifier are rejected."
+            ),
+        },
+        "name": {
+            "type": "string",
+            "minLength": 1,
+            "description": (
+                "Caller-chosen instance name for this node in the program "
+                "tree. The instance name is a free-form descriptive label "
+                "and must be unique across the entire tree. The instance "
+                "name is distinct from the catalog identifier and is not "
+                "looked up in the catalog. Collision with an existing "
+                "instance name is rejected with a structural-error response; "
+                "on retry, choose a different label."
+            ),
+        },
+        "params": {
+            "type": "object",
+            "additionalProperties": True,
+            "description": (
+                "Parameter values for this node, keyed by parameter name. "
+                "The set of accepted parameter names, the type each accepts, "
+                "and which are required, are declared on the catalog entry "
+                "for this node's identifier and must be looked up there "
+                "rather than guessed. The catalog entry is also the source "
+                "of truth on whether a parameter is nested inside another "
+                "parameter or is a sibling at the top level of params; do "
+                "not infer nesting from a parameter's name. The catalog "
+                "identifier itself is not a parameter and must not appear "
+                "as a key here."
+            ),
+        },
         "children": {
             "type": "array",
             "items": _TREE_NODE_CHILD_SCHEMA,
@@ -302,17 +453,77 @@ _TREE_DRAFT_INSERT_NODE_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
     "required": ["parentName", "node"],
+    "description": (
+        "Inserts a new node as a child of an existing parent in the "
+        "program's behavior-tree draft. This tool only authors runtime "
+        "behavior — nodes that the program will execute during a cycle. "
+        "It is NEVER the right tool for adding a static obstacle, prop, "
+        "or fixture that should exist for the entire program run: those "
+        "are scene resources and are authored with scene_draft_add_object "
+        "(or its upsert/remove siblings). If a request describes adding "
+        "or removing an object that is not conditional on the program's "
+        "behavior — `add an obstacle`, `place a fixture in the scene`, "
+        "`introduce a wall` — use the scene-draft tool family instead. "
+        "Inserting an `add_collision_object` (or analogous) BT node "
+        "under a sequence creates a runtime mutation that fires every "
+        "time that branch executes, which is almost never what the "
+        "operator wanted when they asked for a static object. "
+        "The parent is identified by its "
+        "instance name and must already exist in the draft tree; if the "
+        "tree's node names are not already known, call the program-read "
+        "tool first rather than guess. Unknown parent names are rejected "
+        "with a structural-error response that lists the legal candidates. "
+        "The new node's catalog identifier and parameters are taken from "
+        "the per-request manifest's node-catalog entries; every accepted "
+        "identifier, every accepted parameter name, every required "
+        "parameter, and every parameter's accepted type is declared in "
+        "the catalog and must be looked up there rather than guessed. "
+        "Each catalog entry's kind determines whether it accepts no "
+        "children, a single child, or multiple children, and the parent's "
+        "declared arity is the binding constraint on insertion. "
+        "Attempting to insert into a parent whose arity is already "
+        "saturated, or into a parent whose kind does not accept children, "
+        "is rejected with a structural-error response that names the "
+        "parent and reports its allowed arity; on receiving such a "
+        "response, restructure the tree (typically by introducing a "
+        "multi-child parent under the saturated decorator before "
+        "inserting the additional children) rather than re-attempting "
+        "the same shape. Pose-bearing leaves declare their reference "
+        "frame as a parameter that is a sibling of the pose object, not "
+        "as a key inside the pose object; the catalog entry is the "
+        "source of truth on whether a parameter is nested under another "
+        "parameter or top-level. The new-node payload may be passed "
+        "either as a structured object (preferred) or as a JSON-encoded "
+        "string fallback; the bridge normalizes the string form back to "
+        "an object before validation."
+    ),
     "properties": {
         "parentName": {
             "type": "string",
             "minLength": 1,
-            "description": "Existing parent node instance name.",
+            "description": (
+                "Instance name of the existing node that is to receive the "
+                "new node as a child. Must match a node already present in "
+                "the draft tree."
+            ),
         },
-        "node": _TREE_NODE_SCHEMA,
+        "node": {
+            "anyOf": [_TREE_NODE_SCHEMA, _TREE_NODE_SCHEMA_STRING_FORM],
+            "description": (
+                "Payload describing the node to insert. The structured-object "
+                "form is preferred. A JSON-encoded string is accepted as a "
+                "fallback for tool-call formats that produce stringified "
+                "objects; the bridge parses it back to an object before "
+                "validation."
+            ),
+        },
         "index": {
             "type": "integer",
             "minimum": 0,
-            "description": "Optional insertion index. Omit to append.",
+            "description": (
+                "Optional position in the parent's child list at which to "
+                "insert the new node. Omit to append at the end."
+            ),
         },
         "forceDiscardOverrides": {"type": "boolean"},
     },
@@ -323,12 +534,45 @@ _TREE_DRAFT_UPDATE_NODE_PARAMS_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
     "required": ["nodeName", "params"],
+    "description": (
+        "Changes the parameter values on a node already present in the "
+        "draft tree, without altering the tree's structure. The node is "
+        "identified by its instance name. The parameter payload must "
+        "satisfy the catalog entry's parameter declarations; sending a "
+        "parameter outside that declaration, or omitting a required "
+        "parameter while in non-merge mode, is rejected with a "
+        "structural-error response that lists the parameters actually "
+        "sent and the parameters expected by the catalog. Choose the "
+        "merge option when the request only adjusts a subset of values "
+        "and the remaining values should be preserved."
+    ),
     "properties": {
-        "nodeName": {"type": "string", "minLength": 1},
-        "params": {"type": "object", "additionalProperties": True},
+        "nodeName": {
+            "type": "string",
+            "minLength": 1,
+            "description": (
+                "Instance name of the node whose parameters are to be "
+                "modified. Must match a node already present in the draft."
+            ),
+        },
+        "params": {
+            "type": "object",
+            "additionalProperties": True,
+            "description": (
+                "Parameter values to apply, keyed by parameter name. The "
+                "set of accepted parameter names and the type each accepts "
+                "are declared on the catalog entry for the target node's "
+                "identifier and must be looked up there rather than guessed."
+            ),
+        },
         "merge": {
             "type": "boolean",
-            "description": "Merge into existing params when true; replace params when false.",
+            "description": (
+                "When true, parameters not present in this payload are "
+                "preserved at their current values. When false, the "
+                "payload fully replaces the node's parameter set, and any "
+                "required parameter not present in the payload is rejected."
+            ),
         },
         "forceDiscardOverrides": {"type": "boolean"},
     },
@@ -339,11 +583,25 @@ _TREE_DRAFT_DELETE_NODE_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
     "required": ["nodeName"],
+    "description": (
+        "Removes a non-root node and the entire subtree rooted at it from "
+        "the draft. The node is identified by its instance name. Removing "
+        "the root is not permitted; if the request implies the entire "
+        "program should be cleared, that is a different operation outside "
+        "this tool. Deletion is also rejected if it would leave the "
+        "remaining parent below its declared minimum child count; in that "
+        "case the caller must move the node's subtree somewhere else "
+        "first, or restructure the parent itself, before the deletion "
+        "becomes legal."
+    ),
     "properties": {
         "nodeName": {
             "type": "string",
             "minLength": 1,
-            "description": "Existing non-root node instance name to delete with its subtree.",
+            "description": (
+                "Instance name of the node to remove. The node and its "
+                "entire subtree are deleted in one operation."
+            ),
         },
         "forceDiscardOverrides": {"type": "boolean"},
     },
@@ -354,13 +612,39 @@ _TREE_DRAFT_MOVE_NODE_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
     "required": ["nodeName", "newParentName"],
+    "description": (
+        "Moves an existing node and its subtree under a different parent "
+        "in the draft. The node and the new parent are both identified by "
+        "their instance names. The new parent's catalog-declared arity "
+        "must accept the additional child; the move is rejected with a "
+        "structural-error response otherwise. Use this tool when a "
+        "request describes reorganizing existing behavior rather than "
+        "introducing new behavior."
+    ),
     "properties": {
-        "nodeName": {"type": "string", "minLength": 1},
-        "newParentName": {"type": "string", "minLength": 1},
+        "nodeName": {
+            "type": "string",
+            "minLength": 1,
+            "description": (
+                "Instance name of the node to move. The node's subtree "
+                "moves with it as a single unit."
+            ),
+        },
+        "newParentName": {
+            "type": "string",
+            "minLength": 1,
+            "description": (
+                "Instance name of the parent that will receive the moved "
+                "node. The parent's arity must accept the additional child."
+            ),
+        },
         "index": {
             "type": "integer",
             "minimum": 0,
-            "description": "Optional destination child index. Omit to append.",
+            "description": (
+                "Optional position in the new parent's child list at which "
+                "to insert the moved node. Omit to append at the end."
+            ),
         },
         "forceDiscardOverrides": {"type": "boolean"},
     },
@@ -371,9 +655,52 @@ _TREE_DRAFT_REPLACE_SUBTREE_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
     "required": ["nodeName", "subtree"],
+    "description": (
+        "Atomically replaces a node and its entire subtree with a new "
+        "subtree in the draft. The target is identified by its instance "
+        "name and must already exist in the draft tree; if the tree's "
+        "node names are not already known, call the program-read tool "
+        "first rather than guess. Use this tool for restructurings that "
+        "would otherwise require a long sequence of insert, wrap, move, "
+        "and delete operations — when the change is large enough that a "
+        "transaction-style replacement is more reliable than incremental "
+        "edits. The new subtree must be a valid program tree on its own "
+        "under this assistant mode's allowed catalog: the root's catalog "
+        "kind determines the root's arity, every nested node identifier "
+        "must be in the allowed-nodes set for this mode, and instance "
+        "names within the new subtree must not collide with names "
+        "already present in the rest of the tree. The subtree payload "
+        "may be passed either as a structured object (preferred) or as "
+        "a JSON-encoded string fallback. "
+        "Prefer a more surgical primitive whenever it fits: for adding "
+        "a parent above an existing node while preserving its subtree "
+        "intact, use wrap_node. For changing a node's catalog id while "
+        "keeping its name, parent, and children intact, use swap_node. "
+        "For changing only the parameter values on a node, use "
+        "update_node_params. Reach for replace_subtree only when the "
+        "new subtree's leaves and structure genuinely differ from what "
+        "is already in place; if it would re-emit any leaf already in "
+        "the draft tree, one of the surgical primitives is better."
+    ),
     "properties": {
-        "nodeName": {"type": "string", "minLength": 1},
-        "subtree": _TREE_NODE_SCHEMA,
+        "nodeName": {
+            "type": "string",
+            "minLength": 1,
+            "description": (
+                "Instance name of the node whose subtree is to be replaced "
+                "in full. The node and everything below it are removed and "
+                "the new subtree takes their position."
+            ),
+        },
+        "subtree": {
+            "anyOf": [_TREE_NODE_SCHEMA, _TREE_NODE_SCHEMA_STRING_FORM],
+            "description": (
+                "Payload describing the replacement subtree, including its "
+                "root and every descendant. The structured-object form is "
+                "preferred; a JSON-encoded string is accepted as a "
+                "fallback and normalized to an object before validation."
+            ),
+        },
         "forceDiscardOverrides": {"type": "boolean"},
     },
 }
@@ -392,23 +719,25 @@ _TREE_NODE_WRAPPER_SCHEMA: dict[str, Any] = {
             "type": "string",
             "minLength": 1,
             "description": (
-                "Node catalog id (NOT a role or descriptive label). Must exactly "
-                "match an entry in the deployment's node catalog and be in this "
-                "assistant mode's catalog.nodes allowlist. Common control-flow "
-                "ids: 'sequence', 'fallback', 'parallel', 'repeat', 'retry', "
-                "'inverter'. Do NOT invent variants like 'repeat_root', "
-                "'repeat_node', 'sequence_root', etc. — those will be rejected. "
-                "Use the literal catalog id."
+                "Catalog identifier of the wrapping node. Must be one of "
+                "the identifiers declared in the deployment's node catalog "
+                "and present in the allowed-nodes set for this assistant "
+                "mode, and its kind must be one that accepts at least one "
+                "child (a control-flow or decorator entry). Consult the "
+                "per-request manifest's nodeCatalog for the authoritative "
+                "list. The catalog identifier is distinct from this node's "
+                "instance name and must not be a descriptive label or a "
+                "textual variant that merely resembles a real catalog "
+                "identifier."
             ),
         },
         "name": {
             "type": "string",
             "minLength": 1,
             "description": (
-                "Caller-chosen instance name for this node in the program tree "
-                "(any descriptive label, e.g., 'cycle_loop' for a repeat or "
-                "'main_sequence' for a sequence). This is a label, not a "
-                "catalog id."
+                "Caller-chosen instance name for the wrapping node in the "
+                "program tree. The instance name is a free-form descriptive "
+                "label and must be unique across the entire tree."
             ),
         },
         "params": {"type": "object", "additionalProperties": True},
@@ -421,21 +750,148 @@ _TREE_NODE_WRAPPER_SCHEMA: dict[str, Any] = {
 }
 
 
+_TREE_DRAFT_SWAP_NODE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["nodeName", "newId"],
+    "description": (
+        "Changes the catalog identifier of an existing node in place "
+        "while preserving the node's instance name, its parent, and its "
+        "entire subtree. Use this tool when a request describes "
+        "switching one node kind for a structurally compatible one — "
+        "for example, replacing a decorator with a different decorator "
+        "of the same arity, swapping a composite for a sibling "
+        "composite of the same arity, or substituting one scene-create "
+        "leaf for a related scene-create leaf — without rewriting any "
+        "of the surrounding tree. The instance name is preserved "
+        "unconditionally so other parts of the program that reference "
+        "this node by name (parameter references, blackboard bindings) "
+        "keep working. "
+        "The new catalog identifier must be in the deployment catalog "
+        "and in this assistant mode's allowed-nodes set. The current "
+        "child count must satisfy the new identifier's arity range; if "
+        "it does not, the call is rejected with a structural-error "
+        "response and the caller must adjust the children before "
+        "retrying. The merged parameters (the existing node's params "
+        "overlaid by whatever the caller supplies under params) must "
+        "satisfy the new identifier's parameter declarations; the "
+        "paramsMode option controls whether the caller's payload "
+        "replaces the existing params, merges into them, or strictly "
+        "rejects when the existing params are not all accepted. "
+        "Catalog entries may declare a swap_class field naming a "
+        "compatibility family; when both the current and new entries "
+        "carry such a field and the families differ, the call is "
+        "rejected unless force is set to true. Entries without a "
+        "declared family are validated structurally only. "
+        "Prefer this tool over replace_subtree whenever the goal is to "
+        "change a node's kind while keeping its position and children "
+        "intact — replace_subtree would force the caller to re-emit "
+        "the entire subtree from scratch, including every leaf that "
+        "this assistant mode might not even be allowed to author. "
+        "Prefer wrap_node when the goal is to add a new parent above "
+        "an existing node rather than to change the existing node's "
+        "kind."
+    ),
+    "properties": {
+        "nodeName": {
+            "type": "string",
+            "minLength": 1,
+            "description": (
+                "Instance name of the node whose catalog identifier is "
+                "to be changed. Must match a node already present in "
+                "the draft tree. The instance name itself is preserved."
+            ),
+        },
+        "newId": {
+            "type": "string",
+            "minLength": 1,
+            "description": (
+                "Catalog identifier of the new kind. Must be one of the "
+                "identifiers declared in the deployment's node catalog "
+                "and present in the allowed-nodes set for this "
+                "assistant mode. Look this up in the per-request "
+                "manifest's nodeCatalog rather than guess."
+            ),
+        },
+        "params": {
+            "type": "object",
+            "additionalProperties": True,
+            "description": (
+                "Parameter overlay applied during the swap. Combined "
+                "with the existing node's params according to "
+                "paramsMode and validated against the new identifier's "
+                "parameter declarations. Old params not declared by "
+                "the new identifier are dropped and reported back in "
+                "the response under droppedParams; new required "
+                "parameters not present in either the existing params "
+                "or this overlay are rejected as a structural error."
+            ),
+        },
+        "paramsMode": {
+            "type": "string",
+            "enum": ["replace", "merge", "strict"],
+            "description": (
+                "Controls how the supplied params combine with the "
+                "existing node's params. In replace mode the supplied "
+                "params win and any existing param not present in the "
+                "supplied set is dropped. In merge mode the supplied "
+                "params overlay existing params, preserving any "
+                "existing param the new identifier still accepts. In "
+                "strict mode the call is rejected if any existing "
+                "param is not accepted by the new identifier. Defaults "
+                "to replace."
+            ),
+        },
+        "force": {
+            "type": "boolean",
+            "description": (
+                "Set to true to bypass the swap_class compatibility "
+                "check when both the current and new catalog entries "
+                "carry a swap_class field and the families differ. "
+                "Has no effect when either entry has no declared "
+                "swap_class; in that case the swap proceeds on "
+                "structural validation alone."
+            ),
+        },
+        "forceDiscardOverrides": {"type": "boolean"},
+    },
+}
+
+
 _TREE_DRAFT_WRAP_NODE_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
     "required": ["targetName", "wrapper"],
     "description": (
-        "Wrap a behavior-tree node with a new parent (decorator or control-flow). "
-        "wrapper.id MUST be a literal node-catalog id like 'repeat', 'sequence', "
-        "'fallback', 'parallel', 'retry', 'inverter'. Do NOT invent variants like "
-        "'repeat_root' or 'repeat_node'. Use targetName='@root' to wrap the "
-        "current root without needing to know its name. "
-        "wrapper.name MUST be unique across the program tree — the bridge "
-        "rejects duplicate node-instance names with HTTP 400. If your call "
-        "fails with 'Duplicate node instance name: …', pick a different "
-        "wrapper.name (e.g. add a suffix) and retry; do not call again with "
-        "the same name."
+        "Wraps an existing node with a new parent, making the existing "
+        "node the wrapper's only child while the wrapper takes the "
+        "existing node's former position in the tree. The target is "
+        "identified by its instance name; passing the literal protocol "
+        "token for the current root targets the root without requiring "
+        "its name. If the tree's node names are not already known, call "
+        "the program-read tool first rather than guess. "
+        "The wrapper's catalog identifier must be looked up in the "
+        "manifest and must be a control-flow or decorator entry; "
+        "arbitrary text variants that merely resemble a real catalog "
+        "identifier are rejected. The wrapper instance name must be "
+        "unique across the entire program tree; collision with an "
+        "existing name is rejected with a structural-error response, "
+        "and the caller should retry with a different name rather than "
+        "retry with the same one. The wrapper payload must not carry "
+        "its own children, because the handler inserts the target's "
+        "existing subtree as the wrapper's only child and supplying "
+        "additional children would be ambiguous. "
+        "A common pattern this tool enables: when a decorator's "
+        "single-child arity prevents inserting multiple steps directly "
+        "under it, wrap the decorator's existing child with a "
+        "multi-child parent first, then insert the additional steps "
+        "under that new multi-child parent. "
+        "Prefer this tool over replace_subtree whenever the goal is to "
+        "add a parent above an existing node while preserving the "
+        "existing subtree intact — replace_subtree would force the "
+        "caller to re-emit the entire subtree from scratch. To replace "
+        "an existing wrapper with a different wrapper kind in place, "
+        "use swap_node instead."
     ),
     # Examples removed 2026-05-06 — see _SCENE_DRAFT_SINGLE_OBJECT_SCHEMA
     # comment for the full reason. tl;dr: model copies example payloads
@@ -447,9 +903,9 @@ _TREE_DRAFT_WRAP_NODE_SCHEMA: dict[str, Any] = {
             "type": "string",
             "minLength": 1,
             "description": (
-                "Name of the behavior-tree node to wrap, or '@root' to wrap the "
-                "current root without needing to know its name. Wrapping the "
-                "root produces a new root."
+                "Instance name of the node to wrap, or the literal "
+                "protocol token for the current root if the root itself "
+                "is the target. Wrapping the root produces a new root."
             ),
         },
         "wrapper": _TREE_NODE_WRAPPER_SCHEMA,
@@ -479,11 +935,24 @@ _PROGRAM_DRAFT_UPSERT_PARAMETERS_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
     "required": ["parameters"],
+    "description": (
+        "Declares or replaces program-level parameter declarations in "
+        "the draft. Program parameters are typed values bound at "
+        "program-load time and referenced by name from inside node "
+        "parameters; they let the same node react to different inputs "
+        "across runs without rewriting the tree. Replacement is keyed "
+        "by parameter name."
+    ),
     "properties": {
         "parameters": {
             "type": "array",
             "items": _PROGRAM_PARAMETER_SCHEMA,
             "minItems": 1,
+            "description": (
+                "List of program-parameter declarations to insert or "
+                "replace. Each declaration carries a name, a type, and "
+                "optional default and constraint metadata."
+            ),
         },
         "forceDiscardOverrides": {"type": "boolean"},
     },
@@ -494,11 +963,21 @@ _PROGRAM_DRAFT_REMOVE_PARAMETERS_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
     "required": ["names"],
+    "description": (
+        "Removes program-level parameter declarations from the draft. "
+        "If a node's parameter still references the removed name, the "
+        "program will fail validation; the caller is responsible for "
+        "clearing those references first."
+    ),
     "properties": {
         "names": {
             "type": "array",
             "items": {"type": "string", "minLength": 1},
             "minItems": 1,
+            "description": (
+                "List of program-parameter names to remove. Each name "
+                "must currently exist in the draft."
+            ),
         },
         "forceDiscardOverrides": {"type": "boolean"},
     },
@@ -557,11 +1036,23 @@ _BLACKBOARD_DRAFT_UPSERT_NAMESPACES_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
     "required": ["namespaces"],
+    "description": (
+        "Declares or replaces blackboard namespace declarations in the "
+        "draft. Blackboard namespaces group related runtime values "
+        "written by one node and read by others, with a contract "
+        "describing the expected shape. Replacement is keyed by "
+        "namespace identifier."
+    ),
     "properties": {
         "namespaces": {
             "type": "array",
             "items": _BLACKBOARD_NAMESPACE_SCHEMA,
             "minItems": 1,
+            "description": (
+                "List of namespace declarations to insert or replace, "
+                "each carrying its identifier, contract, prefix, and "
+                "optional field declarations."
+            ),
         },
         "forceDiscardOverrides": {"type": "boolean"},
     },
@@ -572,11 +1063,21 @@ _BLACKBOARD_DRAFT_REMOVE_NAMESPACES_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
     "required": ["ids"],
+    "description": (
+        "Removes blackboard namespace declarations from the draft. If "
+        "any node still binds to the removed namespace, the program "
+        "will fail validation; the caller is responsible for clearing "
+        "those bindings first."
+    ),
     "properties": {
         "ids": {
             "type": "array",
             "items": {"type": "string", "minLength": 1},
             "minItems": 1,
+            "description": (
+                "List of namespace identifiers to remove. Each must "
+                "currently exist in the draft."
+            ),
         },
         "forceDiscardOverrides": {"type": "boolean"},
     },
@@ -587,11 +1088,20 @@ _BLACKBOARD_DRAFT_UPSERT_KEYS_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
     "required": ["keys"],
+    "description": (
+        "Declares or replaces blackboard key declarations in the draft. "
+        "A blackboard key names a typed slot that nodes can read or "
+        "write. Replacement is keyed by key identifier."
+    ),
     "properties": {
         "keys": {
             "type": "array",
             "items": _BLACKBOARD_KEY_SCHEMA,
             "minItems": 1,
+            "description": (
+                "List of key declarations to insert or replace, each "
+                "carrying its identifier, type, and key path."
+            ),
         },
         "forceDiscardOverrides": {"type": "boolean"},
     },
@@ -602,11 +1112,21 @@ _BLACKBOARD_DRAFT_REMOVE_KEYS_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
     "required": ["ids"],
+    "description": (
+        "Removes blackboard key declarations from the draft. If any "
+        "node still binds to the removed key, the program will fail "
+        "validation; the caller is responsible for clearing those "
+        "bindings first."
+    ),
     "properties": {
         "ids": {
             "type": "array",
             "items": {"type": "string", "minLength": 1},
             "minItems": 1,
+            "description": (
+                "List of key identifiers to remove. Each must currently "
+                "exist in the draft."
+            ),
         },
         "forceDiscardOverrides": {"type": "boolean"},
     },
@@ -614,29 +1134,30 @@ _BLACKBOARD_DRAFT_REMOVE_KEYS_SCHEMA: dict[str, Any] = {
 
 
 ASSISTANT_TOOL_INPUT_SCHEMAS: dict[str, dict[str, Any]] = {
-    "catalog.read": _CATALOG_READ_SCHEMA,
-    "skills.read": _SKILLS_READ_SCHEMA,
-    "deployment.capabilities.read": _NO_ARGUMENT_SCHEMA,
-    "program.read": _NO_ARGUMENT_SCHEMA,
-    "program.validate": _NO_ARGUMENT_SCHEMA,
-    "status.read": _NO_ARGUMENT_SCHEMA,
-    "scene.inspect": _NO_ARGUMENT_SCHEMA,
-    "scene.draft.add_object": _SCENE_DRAFT_SINGLE_OBJECT_SCHEMA,
-    "scene.draft.update_object": _SCENE_DRAFT_SINGLE_OBJECT_SCHEMA,
-    "scene.draft.upsert_objects": _SCENE_DRAFT_UPSERT_OBJECTS_SCHEMA,
-    "scene.draft.remove_objects": _SCENE_DRAFT_REMOVE_OBJECTS_SCHEMA,
-    "tree.draft.insert_node": _TREE_DRAFT_INSERT_NODE_SCHEMA,
-    "tree.draft.update_node_params": _TREE_DRAFT_UPDATE_NODE_PARAMS_SCHEMA,
-    "tree.draft.delete_node": _TREE_DRAFT_DELETE_NODE_SCHEMA,
-    "tree.draft.move_node": _TREE_DRAFT_MOVE_NODE_SCHEMA,
-    "tree.draft.replace_subtree": _TREE_DRAFT_REPLACE_SUBTREE_SCHEMA,
-    "tree.draft.wrap_node": _TREE_DRAFT_WRAP_NODE_SCHEMA,
-    "program.draft.upsert_parameters": _PROGRAM_DRAFT_UPSERT_PARAMETERS_SCHEMA,
-    "program.draft.remove_parameters": _PROGRAM_DRAFT_REMOVE_PARAMETERS_SCHEMA,
-    "blackboard.draft.upsert_namespaces": _BLACKBOARD_DRAFT_UPSERT_NAMESPACES_SCHEMA,
-    "blackboard.draft.remove_namespaces": _BLACKBOARD_DRAFT_REMOVE_NAMESPACES_SCHEMA,
-    "blackboard.draft.upsert_keys": _BLACKBOARD_DRAFT_UPSERT_KEYS_SCHEMA,
-    "blackboard.draft.remove_keys": _BLACKBOARD_DRAFT_REMOVE_KEYS_SCHEMA,
+    "catalog_read": _CATALOG_READ_SCHEMA,
+    "skills_read": _SKILLS_READ_SCHEMA,
+    "deployment_capabilities_read": _NO_ARGUMENT_SCHEMA,
+    "program_read": _NO_ARGUMENT_SCHEMA,
+    "program_validate": _NO_ARGUMENT_SCHEMA,
+    "status_read": _NO_ARGUMENT_SCHEMA,
+    "scene_inspect": _NO_ARGUMENT_SCHEMA,
+    "scene_draft_add_object": _SCENE_DRAFT_SINGLE_OBJECT_SCHEMA,
+    "scene_draft_update_object": _SCENE_DRAFT_SINGLE_OBJECT_SCHEMA,
+    "scene_draft_upsert_objects": _SCENE_DRAFT_UPSERT_OBJECTS_SCHEMA,
+    "scene_draft_remove_objects": _SCENE_DRAFT_REMOVE_OBJECTS_SCHEMA,
+    "tree_draft_insert_node": _TREE_DRAFT_INSERT_NODE_SCHEMA,
+    "tree_draft_update_node_params": _TREE_DRAFT_UPDATE_NODE_PARAMS_SCHEMA,
+    "tree_draft_delete_node": _TREE_DRAFT_DELETE_NODE_SCHEMA,
+    "tree_draft_move_node": _TREE_DRAFT_MOVE_NODE_SCHEMA,
+    "tree_draft_replace_subtree": _TREE_DRAFT_REPLACE_SUBTREE_SCHEMA,
+    "tree_draft_swap_node": _TREE_DRAFT_SWAP_NODE_SCHEMA,
+    "tree_draft_wrap_node": _TREE_DRAFT_WRAP_NODE_SCHEMA,
+    "program_draft_upsert_parameters": _PROGRAM_DRAFT_UPSERT_PARAMETERS_SCHEMA,
+    "program_draft_remove_parameters": _PROGRAM_DRAFT_REMOVE_PARAMETERS_SCHEMA,
+    "blackboard_draft_upsert_namespaces": _BLACKBOARD_DRAFT_UPSERT_NAMESPACES_SCHEMA,
+    "blackboard_draft_remove_namespaces": _BLACKBOARD_DRAFT_REMOVE_NAMESPACES_SCHEMA,
+    "blackboard_draft_upsert_keys": _BLACKBOARD_DRAFT_UPSERT_KEYS_SCHEMA,
+    "blackboard_draft_remove_keys": _BLACKBOARD_DRAFT_REMOVE_KEYS_SCHEMA,
 }
 
 

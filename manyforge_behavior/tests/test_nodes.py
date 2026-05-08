@@ -85,6 +85,12 @@ class TestMoveManipulatorAction:
         assert kernel.execute_count == 1
 
     def test_failure(self, kernel, bb_with_kernel):
+        # Motion soft-fail: instead of returning FAILURE and propagating
+        # up the tree, the node holds Status.RUNNING and writes the
+        # cause to the blackboard. The CycleManager observes the
+        # `motion_paused_due_to_error` signal and quiesces the runtime;
+        # the operator's STOPPED->RUNNING transition clears the soft-
+        # fail state and signals retry. See spec 410 §motion-soft-fail.
         kernel.fail_next_execute = True
         node = MoveManipulatorAction(
             name="test_move_fail",
@@ -92,10 +98,24 @@ class TestMoveManipulatorAction:
             motion_type="joint_goal",
         )
         status = _tick_node(node)
-        assert status == py_trees.common.Status.FAILURE
+        assert status == py_trees.common.Status.RUNNING
+        # The blackboard reader sees the cause + paused flag the
+        # CycleManager will pick up.
+        reader = py_trees.blackboard.Client(name="motion_state_reader")
+        reader.register_key(
+            key="motion_paused_due_to_error", access=py_trees.common.Access.READ
+        )
+        reader.register_key(
+            key="motion_error_message", access=py_trees.common.Access.READ
+        )
+        assert reader.get("motion_paused_due_to_error") is True
+        assert isinstance(reader.get("motion_error_message"), str)
 
     def test_from_non_idle_non_terminal(self, kernel, bb_with_kernel):
-        """Execute from non-terminal non-IDLE state (e.g. EXECUTING) should fail."""
+        """Execute from non-terminal non-IDLE state holds RUNNING."""
+        # Same soft-fail semantics: a busy kernel state at tick time is
+        # surfaced as a paused-due-to-error signal rather than propagating
+        # FAILURE. The cycle manager handles the recovery handshake.
         kernel._state = ExecutionState.EXECUTING
         node = MoveManipulatorAction(
             name="test_move_busy",
@@ -103,7 +123,7 @@ class TestMoveManipulatorAction:
             motion_type="joint_goal",
         )
         status = _tick_node(node)
-        assert status == py_trees.common.Status.FAILURE
+        assert status == py_trees.common.Status.RUNNING
 
     def test_request_includes_tolerances_and_tcp_cap(self, kernel, bb_with_kernel):
         cap_bb = py_trees.blackboard.Client(name="tcp_cap_writer")
@@ -377,8 +397,11 @@ class TestAddCollisionObject:
             object_id="box1",
             shape_type="box",
             box_dimensions_m=[1.0, 0.5, 0.1],
-            pose={"position_m": [0.5, 0, 0.4], "orientation_xyzw": [0, 0, 0, 1]},
-            frame_id="base_link",
+            pose={
+                "frame_id": "base_link",
+                "position_m": [0.5, 0, 0.4],
+                "orientation_xyzw": [0, 0, 0, 1],
+            },
         )
         status = _tick_node(node)
         assert status == py_trees.common.Status.SUCCESS
@@ -392,8 +415,11 @@ class TestUpsertCollisionObject:
             object_id="box1",
             shape_type="box",
             box_dimensions_m=[1.0, 0.5, 0.1],
-            pose={"position_m": [0.5, 0, 0.4], "orientation_xyzw": [0, 0, 0, 1]},
-            frame_id="base_link",
+            pose={
+                "frame_id": "base_link",
+                "position_m": [0.5, 0, 0.4],
+                "orientation_xyzw": [0, 0, 0, 1],
+            },
         )
         status = _tick_node(node)
         assert status == py_trees.common.Status.SUCCESS
@@ -415,8 +441,11 @@ class TestUpsertCollisionObject:
             object_id="box1",
             shape_type="sphere",
             sphere_radius_m=0.05,
-            pose={"position_m": [0.5, 0, 0.4], "orientation_xyzw": [0, 0, 0, 1]},
-            frame_id="base_link",
+            pose={
+                "frame_id": "base_link",
+                "position_m": [0.5, 0, 0.4],
+                "orientation_xyzw": [0, 0, 0, 1],
+            },
         )
         status = _tick_node(node)
         assert status == py_trees.common.Status.SUCCESS
@@ -509,8 +538,11 @@ class TestUpdateCollisionObjectPose:
         node = UpdateCollisionObjectPose(
             name="update_box",
             object_id="box1",
-            pose={"position_m": [1.0, 0, 0], "orientation_xyzw": [0, 0, 0, 1]},
-            frame_id="base_link",
+            pose={
+                "frame_id": "base_link",
+                "position_m": [1.0, 0, 0],
+                "orientation_xyzw": [0, 0, 0, 1],
+            },
         )
         status = _tick_node(node)
         assert status == py_trees.common.Status.SUCCESS

@@ -53,7 +53,7 @@ unsafe autonomous motion recovery.
 From the repo root:
 
 ```bash
-cd /home/tndlux/workspaces/dev_ws/src/manyforge
+cd ${HOME}/workspaces/dev_ws/src/manyforge
 ./scripts/demo-interrupt-pick-place.sh
 ```
 

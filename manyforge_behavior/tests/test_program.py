@@ -380,10 +380,10 @@ class TestProgramValidation:
                         "shape_type": "box",
                         "box_dimensions_m": [0.1, 0.1, 0.1],
                         "pose": {
+                            "frame_id": "base_link",
                             "position_m": [0.0, 0.0, 0.0],
                             "orientation_rpy_deg": [0.0, 0.0, 0.0],
                         },
-                        "frame_id": "base_link",
                     },
                 },
             ],
@@ -419,10 +419,10 @@ class TestProgramValidation:
                         "shape_type": "box",
                         "box_dimensions_m": [0.1, 0.1, 0.1],
                         "pose": {
+                            "frame_id": "base_link",
                             "position_m": [0.0, 0.0, 0.0],
                             "orientation_rpy_deg": [0.0, 0.0, 0.0],
                         },
-                        "frame_id": "base_link",
                     },
                 },
             ],

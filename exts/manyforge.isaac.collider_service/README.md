@@ -25,11 +25,11 @@ Use the repository `exts` directory as an Isaac Sim extension search path:
 For a copied install, this shape is enough:
 
 ```text
-/home/tndlux/manyforge-isaac-exts/
+${HOME}/manyforge-isaac-exts/
   manyforge.isaac.collider_service/
 ```
 
-Add `/home/tndlux/manyforge-isaac-exts` as the Isaac Sim extension search path.
+Add `${HOME}/manyforge-isaac-exts` as the Isaac Sim extension search path.
 
 Then enable:
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# demo-assistant-known-good.sh — Omni-first ManyForge assistant demo launcher.
+# demo-assistant-known-good.sh — Cosmos-first ManyForge assistant demo launcher.
 #
 # Usage:
 #   ./scripts/demo-assistant-known-good.sh start
@@ -11,16 +11,16 @@
 #   ./scripts/demo-assistant-known-good.sh stop
 #
 # Defaults target the current single-model assistant candidate:
-#   nemotron3-nano-omni-30b-a3b-nvfp4
+#   cosmos-reason2-8b
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MANYFORGE_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-NEMOCLAW_THOR="${NEMOCLAW_THOR:-/home/tndlux/workspaces/nemoclaw/src/NemoClaw-Thor}"
+NEMOCLAW_THOR="${NEMOCLAW_THOR:-${HOME}/workspaces/nemoclaw/src/NemoClaw-Thor}"
 
-MODEL_PROFILE="${MODEL_PROFILE:-nemotron3-nano-omni-30b-a3b-nvfp4}"
-SAMPLING_PROFILE="${SAMPLING_PROFILE:-omni-instruct-no-think-32768}"
+MODEL_PROFILE="${MODEL_PROFILE:-cosmos-reason2-8b}"
+SAMPLING_PROFILE="${SAMPLING_PROFILE:-cosmos-bridge-default}"
 DEMO_DEPLOYMENT_PATH="${DEMO_DEPLOYMENT_PATH:-/workspace/examples/assistant_modes_scene_authoring.deployment.yaml}"
 DEMO_PROGRAM_PATH="${DEMO_PROGRAM_PATH:-/workspace/examples/pick_and_place_ur10e_robotiq.program.yaml}"
 VLLM_CONTAINER="${VLLM_CONTAINER:-manyforge-e2e-vllm}"
@@ -634,13 +634,23 @@ start_all() {
     preflight
     start_model
     configure_nemoclaw
-    # Provision the OpenClaw sandbox (egress preset, skill bundle, MCP
-    # server registration) before composer comes up so the manyforge MCP
-    # wrapper sees the live mode manifest. No-op if provider=nemoclaw.
-    provision_openclaw_sandbox
+    # Order matters here. The OpenClaw provisioner's pre-check probes
+    # ${COMPOSER_URL}/api/assistant/modes/${ASSISTANT_MODE} for a live
+    # `catalogHash` AND it does the same probe from inside the sandbox
+    # via kubectl exec. Both probes fail unless:
+    #   (a) Composer is running (otherwise: connection refused), AND
+    #   (b) a deployment manifest with assistant_modes is loaded
+    #       (otherwise: HTTP 404 on /api/assistant/modes/<mode>).
+    # That means start_composer AND load_demo_artifacts must run
+    # before provision_openclaw_sandbox. The original order (provision
+    # before composer) only ever worked when both Composer and the
+    # deployment were already up from a prior session — a cold-start
+    # trap (verified 2026-05-08). Bridge starts last because it relies
+    # on the OpenClaw gateway provisioned in the previous step.
     start_composer
-    start_bridge
     load_demo_artifacts
+    provision_openclaw_sandbox
+    start_bridge
     status
     cat <<EOF
 
