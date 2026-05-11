@@ -448,7 +448,14 @@ entries:
     name: AddCollisionObject
     category: scene
     description: >-
-      Add a collision object to the backend-owned scene via IPlanningContext.
+      Behavior-tree leaf — runtime collision-object operation.
+      Adds a collision object to the backend planning scene during
+      program execution. Authored by inserting it as a node in the
+      behavior tree via `tree_draft_insert_node`. NOT the same as
+      `scene_draft_add_object`, which authors a static, design-time
+      scene resource that exists for the entire program run; choose
+      this leaf instead whenever the request implies the object should
+      appear at a specific moment in the cycle.
     tags: [scene, collision]
     profiles:
       min_profile: v0.0
@@ -518,8 +525,15 @@ entries:
     name: UpsertCollisionObject
     category: scene
     description: >-
-      Insert a collision object when missing or replace its shape and pose when
-      it already exists in the backend-owned scene.
+      Behavior-tree leaf — runtime collision-object operation. Inserts
+      a collision object into the backend planning scene if it doesn't
+      exist, or replaces its shape and pose if it does, during program
+      execution. Authored by inserting it as a node in the behavior
+      tree via `tree_draft_insert_node`. NOT the same as
+      `scene_draft_upsert_objects`, which authors a static, design-time
+      scene resource that exists for the entire program run; choose
+      this leaf instead whenever the request implies the object should
+      appear, change, or be re-placed at a specific moment in the cycle.
     tags: [scene, collision]
     profiles:
       min_profile: v0.1
@@ -590,7 +604,14 @@ entries:
     name: RemoveCollisionObject
     category: scene
     description: >-
-      Remove a collision object from the backend-owned scene via IPlanningContext.
+      Behavior-tree leaf — runtime collision-object operation. Removes
+      a collision object from the backend planning scene during program
+      execution. Authored by inserting it as a node in the behavior
+      tree via `tree_draft_insert_node`. NOT the same as
+      `scene_draft_remove_objects`, which removes a static, design-time
+      scene resource for the entire program run; choose this leaf
+      instead whenever the request implies the object should disappear
+      at a specific moment in the cycle.
     tags: [scene, collision]
     profiles:
       min_profile: v0.0
@@ -625,7 +646,14 @@ entries:
     name: UpdateCollisionObjectPose
     category: scene
     description: >-
-      Update the pose of an existing collision object in the backend-owned scene.
+      Behavior-tree leaf — runtime collision-object operation. Updates
+      the pose of an existing collision object in the backend planning
+      scene during program execution. Authored by inserting it as a node
+      in the behavior tree via `tree_draft_insert_node`. NOT the same as
+      `scene_draft_update_object`, which mutates a static, design-time
+      scene resource for the entire program run; choose this leaf
+      instead whenever the request implies the object's pose should
+      change at a specific moment in the cycle.
     tags: [scene, collision]
     profiles:
       min_profile: v0.0
@@ -670,9 +698,14 @@ entries:
     name: AttachObjectToLink
     category: scene
     description: >-
-      Attach a scene object to a robot link. Computes the relative transform
-      from the link's current FK pose, removes the object from world, and
-      re-adds it attached to the link frame for collision-aware planning.
+      Behavior-tree leaf — runtime collision-object operation. Attaches
+      a scene object to a robot link during program execution (computes
+      the relative transform from the link's current FK pose, removes the
+      object from world, and re-adds it attached to the link frame for
+      collision-aware planning). Authored by inserting it as a node in
+      the behavior tree via `tree_draft_insert_node`. There is no
+      design-time `scene_draft_*` equivalent — attachment is intrinsically
+      a runtime operation tied to a moment in the cycle.
     tags: [scene, collision, attach]
     profiles:
       min_profile: v0.1
@@ -724,9 +757,14 @@ entries:
     name: DetachObjectFromLink
     category: scene
     description: >-
-      Detach an object from a robot link and place it in the world frame.
-      Computes the object's world pose from the link FK and stored relative
-      transform, then removes from link and re-adds at world position.
+      Behavior-tree leaf — runtime collision-object operation. Detaches
+      an object from a robot link during program execution and places it
+      back in the world frame (computes the object's world pose from the
+      link FK and stored relative transform, then removes from link and
+      re-adds at world position). Authored by inserting it as a node in
+      the behavior tree via `tree_draft_insert_node`. There is no
+      design-time `scene_draft_*` equivalent — detachment is intrinsically
+      a runtime operation tied to a moment in the cycle.
     tags: [scene, collision, detach]
     profiles:
       min_profile: v0.1

@@ -253,8 +253,9 @@ def truncation_pattern_nudge(history: list[dict[str, Any]]) -> str | None:
         "offset on every retry, indicating a per-tool-call argument "
         "size limit. Stop trying to inline the entire subtree — switch "
         "to a tool that does not require re-emitting children "
-        "(tree_draft_wrap_node to add a parent, tree_draft_swap_node "
-        "to change a node's id), or break the operation into multiple "
+        "(tree_draft_wrap_node to add a parent, "
+        "tree_draft_change_node_kind to change a node's kind), or "
+        "break the operation into multiple "
         "smaller calls."
     )
 

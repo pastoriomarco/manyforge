@@ -39,13 +39,34 @@ UPSTREAM_BASE_URL="${UPSTREAM_BASE_URL:-http://127.0.0.1:8000/v1}"
 # sandbox isolation is not needed.
 #
 # Default switch verified by the 2026-05-06 lane-parity probe (after
-# the trio of fixes — vLLM `T=0.6, top_p=0.95` + `enable_thinking=false`
-# server defaults, MCP wrapper validates required args, schemas ship
-# worked examples). All 5 tasks pass on both lanes within 1.3× of each
-# other; OpenClaw is *faster* on scene_inspect and scene_add. See
+# the trio of fixes — vLLM sampling defaults, MCP wrapper validates
+# required args, schemas ship worked examples). All 5 tasks passed on
+# both lanes within 1.3× of each other; OpenClaw is *faster* on
+# scene_inspect and scene_add. See
 # `manyforge/docs/LANE-COMPARISON-direct-vs-openclaw.md` §9 for the
 # full diagnosis and the before/after numbers.
+#
+# Iter-32 production (2026-05-10): Cosmos-Reason2-8B with
+# enable_thinking=true at the vLLM server (cosmos profile in
+# serving/launch.sh sets `--default-chat-template-kwargs '{"enable_thinking":true}'`).
+# OpenClaw lane runs chain-session ON; bridge-fired `/compact` every
+# 2nd request neutralizes the long-history cascade. See
+# `manyforge/docs/COMPOSER-ASSISTANT-ARCHITECTURE.md` "Iter-32
+# production recipe".
 ASSISTANT_PROVIDER="${ASSISTANT_PROVIDER:-openclaw}"
+# Bridge-fired periodic /compact spacing (iter-32 production). N=2
+# means fire /compact before every 3rd, 5th, 7th, ... request per
+# session-key. Required for chain-session ON to avoid the PnP cascade.
+# Set to 0 to disable (chain-off baseline only).
+OPENCLAW_ASSISTANT_COMPACT_EVERY_N="${OPENCLAW_ASSISTANT_COMPACT_EVERY_N:-2}"
+OPENCLAW_ASSISTANT_COMPACT_TIMEOUT_S="${OPENCLAW_ASSISTANT_COMPACT_TIMEOUT_S:-120}"
+# vLLM mutator proxy (iter-32 production sits between OpenClaw gateway
+# and vLLM on :8000). Manages max_tokens injection + thinking budget.
+# When START_VLLM_PROXY=true, demo-assistant-known-good launches it as
+# part of `start`. When false, assumed to be managed externally.
+START_VLLM_PROXY="${START_VLLM_PROXY:-true}"
+OPENCLAW_PROXY_OVERRIDE_MAX_TOKENS="${OPENCLAW_PROXY_OVERRIDE_MAX_TOKENS:-2048}"
+OPENCLAW_PROXY_THINKING_TOKEN_BUDGET="${OPENCLAW_PROXY_THINKING_TOKEN_BUDGET:-512}"
 # Bridge URL is provider-derived: nemoclaw -> :8100 (manyforge_assistant_bridge
 # here), openclaw -> :8200 (openclaw_assistant_bridge in NemoClaw-Thor).
 case "${ASSISTANT_PROVIDER}" in
@@ -429,6 +450,55 @@ start_model() {
     echo "vLLM ready: ${served}"
 }
 
+# Iter-32 production layout: vLLM on :8050 (THOR_VLLM_PORT in the
+# serving profile); vllm-proxy mutator on :8000 between OpenClaw gateway
+# and vLLM. The proxy injects max_tokens=2048 and bounds the thinking
+# budget — without these, OpenClaw's tool-loop chat-completions go
+# unbounded and case wall-clocks blow up. See
+# `manyforge/docs/COMPOSER-ASSISTANT-ARCHITECTURE.md` "Iter-32
+# production recipe" §5 for the rationale.
+start_vllm_proxy() {
+    if [[ "${START_VLLM_PROXY}" != "true" ]]; then
+        echo "START_VLLM_PROXY=${START_VLLM_PROXY}; assuming vllm-proxy is managed externally."
+        return 0
+    fi
+    step "Starting vllm-proxy mutator (host:8000 -> vLLM:${VLLM_PORT:-8050})"
+    local proxy_dir="${NEMOCLAW_THOR}/manyforge/scripts/proxy"
+    local proxy_py="${proxy_dir}/vllm-proxy.py"
+    if [[ ! -f "${proxy_py}" ]]; then
+        echo "vllm-proxy.py not found at ${proxy_py}" >&2
+        echo "Set START_VLLM_PROXY=false to skip, or point NEMOCLAW_THOR at the repo containing scripts/proxy/." >&2
+        return 1
+    fi
+    if pgrep -f "vllm-proxy.py" >/dev/null 2>&1; then
+        echo "Reusing existing vllm-proxy process."
+        return 0
+    fi
+    if port_is_listening 8000 && ! pgrep -f "vllm-proxy.py" >/dev/null 2>&1; then
+        echo "Port 8000 is in use by an unmanaged process; refusing to start proxy." >&2
+        port_listeners 8000 >&2
+        return 1
+    fi
+    (
+        cd "${NEMOCLAW_THOR}"
+        env \
+          OPENCLAW_PROXY_BIND=0.0.0.0 \
+          OPENCLAW_PROXY_LISTEN_PORT=8000 \
+          OPENCLAW_PROXY_UPSTREAM="http://127.0.0.1:${VLLM_PORT:-8050}" \
+          OPENCLAW_PROXY_LOG_PATH="${LOG_DIR}/vllm-proxy.jsonl" \
+          OPENCLAW_PROXY_OVERRIDE_MAX_TOKENS="${OPENCLAW_PROXY_OVERRIDE_MAX_TOKENS}" \
+          OPENCLAW_PROXY_THINKING_TOKEN_BUDGET="${OPENCLAW_PROXY_THINKING_TOKEN_BUDGET}" \
+          setsid python3 "${proxy_py}" </dev/null >"${LOG_DIR}/vllm-proxy.log" 2>&1 &
+        echo $! >"${LOG_DIR}/vllm-proxy.pid"
+    )
+    # Wait until the proxy answers /v1/models (it proxies through to vLLM).
+    wait_json \
+        "http://127.0.0.1:8000/v1/models" \
+        30 \
+        "Waiting for vllm-proxy on :8000" \
+        "Proxy log: ${LOG_DIR}/vllm-proxy.log"
+}
+
 configure_nemoclaw() {
     step "Configuring NemoClaw/OpenShell provider"
     local configure_log="${LOG_DIR}/configure-local-provider.log"
@@ -548,7 +618,8 @@ start_bridge_openclaw() {
         return 1
     fi
     # The launcher already sets PYTHONPATH, ensures venv, and runs uvicorn.
-    # We pin USE_GATEWAY=true (the validated lane) and the slim agent profile.
+    # We pin USE_GATEWAY=true (the validated lane), the slim agent profile,
+    # and the iter-32 production env (periodic /compact spacing).
     (
         cd "${NEMOCLAW_THOR}"
         env \
@@ -558,6 +629,8 @@ start_bridge_openclaw() {
           OPENCLAW_ASSISTANT_TIMEOUT_S="${ASSISTANT_TIMEOUT_S}" \
           OPENCLAW_ASSISTANT_BRIDGE_HOST=127.0.0.1 \
           OPENCLAW_ASSISTANT_BRIDGE_PORT=8200 \
+          OPENCLAW_ASSISTANT_COMPACT_EVERY_N="${OPENCLAW_ASSISTANT_COMPACT_EVERY_N}" \
+          OPENCLAW_ASSISTANT_COMPACT_TIMEOUT_S="${OPENCLAW_ASSISTANT_COMPACT_TIMEOUT_S}" \
           setsid "${launcher}" </dev/null >"${BRIDGE_LOG}" 2>&1 &
         echo $! >"${BRIDGE_PID_FILE}"
     )
@@ -633,6 +706,7 @@ start_all() {
     ensure_dirs
     preflight
     start_model
+    start_vllm_proxy
     configure_nemoclaw
     # Order matters here. The OpenClaw provisioner's pre-check probes
     # ${COMPOSER_URL}/api/assistant/modes/${ASSISTANT_MODE} for a live

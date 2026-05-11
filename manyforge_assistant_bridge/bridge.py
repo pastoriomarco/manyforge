@@ -6,9 +6,7 @@ enforces the bounded catalog, runs a small multi-turn loop against an
 OpenAI-compatible upstream model, and executes only callback-safe tool effects
 through ManyForge callbacks.
 
-Architecture: see `manyforge_specs/docs/spec/485-assistant-bridge-architecture.md`.
-Wire contract: see `manyforge_specs/docs/reference/ASSISTANT_BACKEND_CONTRACT.md`.
-Mode/catalog spec: see `manyforge_specs/docs/spec/480-assistant-modes-and-bounded-autonomy.md`.
+Operator-facing wire contract: `docs/reference/ASSISTANT_PROVIDER_CONTRACT.md`.
 """
 
 from __future__ import annotations
@@ -221,7 +219,8 @@ async def _resolve_model() -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# Envelope validation (per manyforge_specs spec 480 §6.3)
+# Envelope validation (per the assistant-provider HTTP contract —
+# see docs/reference/ASSISTANT_PROVIDER_CONTRACT.md)
 # ---------------------------------------------------------------------------
 
 
@@ -908,7 +907,20 @@ def _infer_action_tool_id(text_lower: str) -> str | None:
                                            "place", "append", "put"))
     is_update = any(t in text_lower for t in ("update", "modify", "resize",
                                               "change", "set"))
-    is_move = any(t in text_lower for t in ("move", "reorder", "rename"))
+    # "swap the order"/"reorder" describe REPOSITIONING two siblings —
+    # that's tree_draft_move_node, not change_node_kind. The plain word
+    # "swap" elsewhere ("swap this for that kind") still maps to
+    # change_node_kind. Detect the reorder phrasings explicitly before
+    # the bare-swap fallback.
+    is_swap_order = (
+        "swap the order" in text_lower
+        or "swap order" in text_lower
+        or "reorder" in text_lower
+    )
+    is_move = (
+        any(t in text_lower for t in ("move", "reorder", "rename"))
+        or is_swap_order
+    )
     is_wrap = ("wrap" in text_lower
                or "as root" in text_lower
                or "as the root" in text_lower
@@ -918,14 +930,14 @@ def _infer_action_tool_id(text_lower: str) -> str | None:
                    and any(t in text_lower for t in ("repeat", "retry",
                                                      "fallback", "sequence",
                                                      "inverter", "parallel"))))
-    is_swap = "swap" in text_lower
+    is_change_kind = "swap" in text_lower and not is_swap_order
     is_replace = "replace" in text_lower or "subtree" in text_lower
 
     if is_tree_intent:
         if is_wrap:
             return "tree_draft_wrap_node"
-        if is_swap:
-            return "tree_draft_swap_node"
+        if is_change_kind:
+            return "tree_draft_change_node_kind"
         if is_replace:
             return "tree_draft_replace_subtree"
         if is_move:

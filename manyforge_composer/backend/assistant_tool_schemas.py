@@ -449,80 +449,144 @@ _TREE_NODE_SCHEMA: dict[str, Any] = {
 }
 
 
+# Insert-specific payload: same as _TREE_NODE_SCHEMA but `name` is moved
+# OUT of the payload and up to the tool's top-level `nodeName` argument.
+# This matches the rest of the tree_draft_* family (update_node_params,
+# delete_node, move_node, change_node_kind all take `nodeName` at
+# top-level) and removes the duplication that was confusing the model
+# (it kept setting both top-level nodeName AND node.name).
+_TREE_NODE_PAYLOAD_FOR_INSERT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["id"],
+    "properties": {
+        "id": {
+            "type": "string",
+            "minLength": 1,
+            "description": (
+                "Catalog identifier of the kind of node being inserted. "
+                "Must be one of the identifiers declared in the deployment's "
+                "node catalog and present in the allowed-nodes set for this "
+                "assistant mode; consult the per-request manifest's nodeCatalog "
+                "for the authoritative list and for each entry's kind, accepted "
+                "child arity, and parameter declarations. The catalog identifier "
+                "is distinct from this node's instance name (which is passed "
+                "as the top-level `nodeName` argument) and must not be a "
+                "descriptive label, a runtime role, or a textual variant of "
+                "an existing identifier."
+            ),
+        },
+        "params": {
+            "type": "object",
+            "additionalProperties": True,
+            "description": (
+                "Parameter values for this node, keyed by parameter name. "
+                "The set of accepted parameter names, the type each accepts, "
+                "and which are required, are declared on the catalog entry "
+                "for this node's identifier and must be looked up there "
+                "rather than guessed. The catalog entry is the source of "
+                "truth on whether a parameter is nested inside another "
+                "parameter or is a sibling at the top level of params."
+            ),
+        },
+        "children": {
+            "type": "array",
+            "items": _TREE_NODE_CHILD_SCHEMA,
+        },
+    },
+}
+
+
 _TREE_DRAFT_INSERT_NODE_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
-    "required": ["parentName", "node"],
+    "required": ["nodeName", "node"],
     "description": (
-        "Inserts a new node as a child of an existing parent in the "
-        "program's behavior-tree draft. This tool only authors runtime "
-        "behavior — nodes that the program will execute during a cycle. "
-        "It is NEVER the right tool for adding a static obstacle, prop, "
-        "or fixture that should exist for the entire program run: those "
-        "are scene resources and are authored with scene_draft_add_object "
-        "(or its upsert/remove siblings). If a request describes adding "
-        "or removing an object that is not conditional on the program's "
-        "behavior — `add an obstacle`, `place a fixture in the scene`, "
-        "`introduce a wall` — use the scene-draft tool family instead. "
+        "Inserts a new node into the program's behavior-tree draft. This "
+        "tool only authors runtime behavior — nodes that the program will "
+        "execute during a cycle. It is NEVER the right tool for adding a "
+        "static obstacle, prop, or fixture that should exist for the "
+        "entire program run: those are scene resources and are authored "
+        "with scene_draft_add_object (or its upsert/remove siblings). "
         "Inserting an `add_collision_object` (or analogous) BT node "
         "under a sequence creates a runtime mutation that fires every "
         "time that branch executes, which is almost never what the "
         "operator wanted when they asked for a static object. "
-        "The parent is identified by its "
-        "instance name and must already exist in the draft tree; if the "
-        "tree's node names are not already known, call the program-read "
-        "tool first rather than guess. Unknown parent names are rejected "
-        "with a structural-error response that lists the legal candidates. "
+        "The new node's instance name goes in `nodeName` (top-level, "
+        "matching the convention of other tree_draft_* tools). The "
+        "node's catalog kind and parameters go in `node` (which carries "
+        "`id` and `params`). The parent under which to insert is "
+        "specified by exactly ONE of: `parentName` (with optional "
+        "0-based `index`; omit `index` to append at the end), OR "
+        "`afterName`, OR `beforeName`. Use `afterName`/`beforeName` "
+        "for relative positioning (\"after X\", \"before X\") — they "
+        "resolve the parent and index from the tree automatically. "
+        "Unknown names are rejected with a structural-error response "
+        "that lists the legal candidates. "
         "The new node's catalog identifier and parameters are taken from "
         "the per-request manifest's node-catalog entries; every accepted "
         "identifier, every accepted parameter name, every required "
         "parameter, and every parameter's accepted type is declared in "
         "the catalog and must be looked up there rather than guessed. "
-        "Each catalog entry's kind determines whether it accepts no "
-        "children, a single child, or multiple children, and the parent's "
-        "declared arity is the binding constraint on insertion. "
-        "Attempting to insert into a parent whose arity is already "
-        "saturated, or into a parent whose kind does not accept children, "
-        "is rejected with a structural-error response that names the "
-        "parent and reports its allowed arity; on receiving such a "
-        "response, restructure the tree (typically by introducing a "
-        "multi-child parent under the saturated decorator before "
-        "inserting the additional children) rather than re-attempting "
-        "the same shape. Pose-bearing leaves declare their reference "
+        "The parent's declared arity is the binding constraint on "
+        "insertion; an arity-saturated parent is rejected with a "
+        "structural-error response that names the parent and reports its "
+        "allowed arity. Pose-bearing leaves declare their reference "
         "frame as a parameter that is a sibling of the pose object, not "
-        "as a key inside the pose object; the catalog entry is the "
-        "source of truth on whether a parameter is nested under another "
-        "parameter or top-level. The new-node payload may be passed "
-        "either as a structured object (preferred) or as a JSON-encoded "
-        "string fallback; the bridge normalizes the string form back to "
-        "an object before validation."
+        "as a key inside the pose object."
     ),
     "properties": {
+        "nodeName": {
+            "type": "string",
+            "minLength": 1,
+            "description": (
+                "Instance name for the new node being inserted. Free-form "
+                "descriptive label; must be unique across the entire tree."
+            ),
+        },
+        "node": {
+            "anyOf": [_TREE_NODE_PAYLOAD_FOR_INSERT_SCHEMA, _TREE_NODE_SCHEMA_STRING_FORM],
+            "description": (
+                "Payload for the new node carrying its catalog `id` and "
+                "`params` (and optional `children`). Do NOT include `name` "
+                "here — the instance name is passed as the top-level "
+                "`nodeName` argument. Structured object preferred; a "
+                "JSON-encoded string is also accepted."
+            ),
+        },
         "parentName": {
             "type": "string",
             "minLength": 1,
             "description": (
-                "Instance name of the existing node that is to receive the "
-                "new node as a child. Must match a node already present in "
-                "the draft tree."
-            ),
-        },
-        "node": {
-            "anyOf": [_TREE_NODE_SCHEMA, _TREE_NODE_SCHEMA_STRING_FORM],
-            "description": (
-                "Payload describing the node to insert. The structured-object "
-                "form is preferred. A JSON-encoded string is accepted as a "
-                "fallback for tool-call formats that produce stringified "
-                "objects; the bridge parses it back to an object before "
-                "validation."
+                "Instance name of the parent that should receive the new "
+                "node as a child. Mutually exclusive with afterName and "
+                "beforeName."
             ),
         },
         "index": {
             "type": "integer",
             "minimum": 0,
             "description": (
-                "Optional position in the parent's child list at which to "
-                "insert the new node. Omit to append at the end."
+                "0-based position within the parent's child list. "
+                "Requires parentName; omit to append at the end."
+            ),
+        },
+        "afterName": {
+            "type": "string",
+            "minLength": 1,
+            "description": (
+                "Insert immediately AFTER this named sibling. Use for "
+                "\"after X\" / \"following X\" prompts. Mutually "
+                "exclusive with parentName, index, beforeName."
+            ),
+        },
+        "beforeName": {
+            "type": "string",
+            "minLength": 1,
+            "description": (
+                "Insert immediately BEFORE this named sibling. Use for "
+                "\"before X\" prompts. Mutually exclusive with "
+                "parentName, index, afterName."
             ),
         },
         "forceDiscardOverrides": {"type": "boolean"},
@@ -613,13 +677,22 @@ _TREE_DRAFT_MOVE_NODE_SCHEMA: dict[str, Any] = {
     "additionalProperties": False,
     "required": ["nodeName", "newParentName"],
     "description": (
-        "Moves an existing node and its subtree under a different parent "
-        "in the draft. The node and the new parent are both identified by "
-        "their instance names. The new parent's catalog-declared arity "
-        "must accept the additional child; the move is rejected with a "
-        "structural-error response otherwise. Use this tool when a "
-        "request describes reorganizing existing behavior rather than "
-        "introducing new behavior."
+        "Moves an existing node and its subtree to a new position in the "
+        "tree. Both the node and the destination parent are identified "
+        "by their instance names. The node can move under a different "
+        "parent, or stay under the same parent at a different index. "
+        "The destination parent's catalog-declared arity must accept "
+        "the additional child; the move is rejected with a structural-"
+        "error response otherwise. Use this tool when a request "
+        "describes reorganizing existing behavior rather than "
+        "introducing new behavior. "
+        "This is also the right tool when the user says \"swap the "
+        "order\", \"swap A with B\", \"reorder A and B\", or any other "
+        "phrasing that implies repositioning two siblings: pass the "
+        "name of one of them and the index where it should land. "
+        "It is NOT `tree_draft_change_node_kind` (formerly named "
+        "tree_draft_swap_node) — that tool changes a node's catalog "
+        "kind in place, not its position."
     ),
     "properties": {
         "nodeName": {
@@ -750,23 +823,27 @@ _TREE_NODE_WRAPPER_SCHEMA: dict[str, Any] = {
 }
 
 
-_TREE_DRAFT_SWAP_NODE_SCHEMA: dict[str, Any] = {
+_TREE_DRAFT_CHANGE_NODE_KIND_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
     "required": ["nodeName", "newId"],
     "description": (
-        "Changes the catalog identifier of an existing node in place "
-        "while preserving the node's instance name, its parent, and its "
-        "entire subtree. Use this tool when a request describes "
-        "switching one node kind for a structurally compatible one — "
-        "for example, replacing a decorator with a different decorator "
-        "of the same arity, swapping a composite for a sibling "
-        "composite of the same arity, or substituting one scene-create "
-        "leaf for a related scene-create leaf — without rewriting any "
-        "of the surrounding tree. The instance name is preserved "
-        "unconditionally so other parts of the program that reference "
-        "this node by name (parameter references, blackboard bindings) "
-        "keep working. "
+        "Changes the catalog identifier (the kind) of an existing node "
+        "in place while preserving the node's instance name, its "
+        "parent, and its entire subtree. Use this tool when a request "
+        "describes switching one node kind for a structurally "
+        "compatible one — for example, replacing a decorator with a "
+        "different decorator of the same arity, substituting one "
+        "composite for a sibling composite of the same arity, or "
+        "substituting one scene-create leaf for a related scene-create "
+        "leaf — without rewriting any of the surrounding tree. The "
+        "instance name is preserved unconditionally so other parts of "
+        "the program that reference this node by name (parameter "
+        "references, blackboard bindings) keep working. "
+        "This tool does NOT reorder siblings. To reorder two named "
+        "nodes (e.g. \"swap the order of A and B\", \"swap A with B\", "
+        "\"reorder A and B\"), use `tree_draft_move_node` to relocate "
+        "one of them to the desired index inside the same parent. "
         "The new catalog identifier must be in the deployment catalog "
         "and in this assistant mode's allowed-nodes set. The current "
         "child count must satisfy the new identifier's arity range; if "
@@ -1150,7 +1227,7 @@ ASSISTANT_TOOL_INPUT_SCHEMAS: dict[str, dict[str, Any]] = {
     "tree_draft_delete_node": _TREE_DRAFT_DELETE_NODE_SCHEMA,
     "tree_draft_move_node": _TREE_DRAFT_MOVE_NODE_SCHEMA,
     "tree_draft_replace_subtree": _TREE_DRAFT_REPLACE_SUBTREE_SCHEMA,
-    "tree_draft_swap_node": _TREE_DRAFT_SWAP_NODE_SCHEMA,
+    "tree_draft_change_node_kind": _TREE_DRAFT_CHANGE_NODE_KIND_SCHEMA,
     "tree_draft_wrap_node": _TREE_DRAFT_WRAP_NODE_SCHEMA,
     "program_draft_upsert_parameters": _PROGRAM_DRAFT_UPSERT_PARAMETERS_SCHEMA,
     "program_draft_remove_parameters": _PROGRAM_DRAFT_REMOVE_PARAMETERS_SCHEMA,

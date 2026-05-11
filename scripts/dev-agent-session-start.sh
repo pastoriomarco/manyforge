@@ -1,11 +1,24 @@
 #!/usr/bin/env bash
-# ManyForge session startup script.
-# Run this after a reboot or when starting a new manyforge dev session.
-# It restores the sandbox to the state needed for agent tasks.
+# dev-agent-session-start.sh — DEVELOPMENT-ONLY agent-session bootstrap.
 #
-# Usage: ./scripts/manyforge-session-start.sh [sandbox-name]
+# Seeds an OpenClaw agent sandbox with the manyforge_specs repository
+# so a maintainer's dev-assist agent can answer specification /
+# architecture questions. NOT a runtime/operator script — requires
+# manyforge_specs (a private dev repo) on disk and is irrelevant for
+# deployment use.
 #
-# Prerequisites:
+# For deployment / operator workflows (install + bring-up + assistant
+# operation) use scripts/demo-assistant-known-good.sh instead, plus
+# docs/operations/STACK_SETUP.md for the runbook.
+#
+# Run this after a reboot or when starting a new manyforge dev session
+# to restore the sandbox to the state needed for spec-aware agent
+# tasks.
+#
+# Usage: ./scripts/dev-agent-session-start.sh [sandbox-name]
+#
+# Prerequisites (DEV-ONLY):
+#   - manyforge_specs cloned alongside manyforge (sibling directory)
 #   - vLLM is serving the selected local model on port 8000
 #   - Run the relevant NemoClaw-Thor local-provider/profile setup first
 #   - Then run this script

@@ -1,26 +1,254 @@
-# ManyForge Agent Entry Point
+# ManyForge — agent landing
 
-This repository contains the ManyForge implementation: code, tests, runtime
-artifacts, examples, Docker lanes, and operator launch scripts.
+> **For LLMs (Claude / ChatGPT) helping the user with this repo:** read
+> this file first. It tells you what `manyforge` is, what it ships, how
+> to operate it at runtime (with or without the LLM assistant), and
+> where to find the canonical reference docs. Read referenced docs
+> before editing code or running scripts.
 
-Authoritative development instructions live in the sibling private specs
-repository:
+---
+
+## What this repo is
+
+ManyForge is the deployment-side robot-execution framework: a behavior
+tree runtime, motion planner, scene/program/blackboard data model, a
+Composer (web UI + FastAPI backend), an HMI viewer, and an LLM
+assistant-provider HTTP bridge. **Everything required to install,
+deploy, and operate ManyForge at runtime is in this repo**, including
+when the optional Composer-assistant lane is enabled.
+
+Three sibling repositories form the full stack; the cross-repo
+authority map is:
+
+| Question | Authoritative repo | Notes |
+|---|---|---|
+| **How do I install / deploy / run ManyForge?** | this repo (`manyforge`) | self-sufficient at runtime — no other repo required for non-AI use |
+| **How do I run the LLM assistant on Jetson Thor?** | `NemoClaw-Thor` | platform glue: vLLM serving, sandbox provisioner, OpenClaw bridge launcher. Required only when using the `openclaw` lane on Thor. |
+| **What is the spec / contract / ADR — what should this code do?** | `manyforge_specs` (private) | dev-only; **not required at runtime**. Specs/ADRs/plans live there for maintainer use. |
+
+**This file covers the runtime/operator side completely.** A brief
+section at the bottom points dev maintainers at `manyforge_specs` for
+spec-level work; that's the only reason an operator/LLM should ever
+follow that link.
+
+---
+
+## Install
+
+Container-based, single command:
+
+```bash
+git clone <manyforge>            # this repo
+cd manyforge
+./scripts/setup-docker.sh        # clones RoboPlan dependency + builds manyforge-dev:latest (~10 min first time)
+docker compose run --rm dev bash # enter the dev container
+./scripts/test-all.sh            # builds C++ core + runs all tests
+```
+
+Hard requirements: Docker (with BuildKit), git, ~10 GB disk for the
+Docker image, and the host Python toolchain only if you want to run
+scripts outside the container.
+
+For a comprehensive operator runbook (deterministic-only mode,
+direct-LLM mode, full assistant mode), see
+[`docs/operations/STACK_SETUP.md`](docs/operations/STACK_SETUP.md).
+
+---
+
+## Runtime
+
+ManyForge has **three deployment modes** — pick the one that matches
+your needs. Each mode adds optional surface; the simpler ones are
+self-contained.
+
+### Mode 1 — Composer + behavior runtime (no LLM)
+
+The full ManyForge runtime, no AI. Use for validating behavior trees,
+debugging planning/execution, or any deployment that doesn't need an
+assistant.
+
+```bash
+docker compose run --rm dev bash
+python -m manyforge_composer \
+  --catalog-path manyforge_behavior/resources/node_catalog.yaml \
+  --host 0.0.0.0 --port 9000
+```
+
+Open `http://localhost:9000/` for the Composer UI. The HMI viewer is
+on `http://localhost:8081/` if launched with `--hmi-port 8081`.
+
+### Mode 2 — Composer + direct LLM endpoint
+
+Adds the **direct-lane assistant**: ManyForge's
+`manyforge_assistant_bridge` (in this repo) runs a bounded multi-turn
+loop against an OpenAI-compatible local LLM (typically vLLM). No
+sandbox, no OpenClaw — fast iteration, sandbox-bypass.
+
+```bash
+# 1. Start an OpenAI-compatible server on :8000 (vLLM, llama.cpp, ...).
+# 2. Start the bridge:
+cd manyforge_assistant_bridge
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+.venv/bin/python -m manyforge_assistant_bridge.bridge   # listens on :8100
+# 3. Start Composer with --assistant-provider nemoclaw:
+docker compose run --rm dev bash -c '
+  python -m manyforge_composer \
+    --catalog-path manyforge_behavior/resources/node_catalog.yaml \
+    --assistant-provider nemoclaw \
+    --assistant-endpoint http://127.0.0.1:8100/v1/manyforge/assistant \
+    --host 0.0.0.0 --port 9000'
+```
+
+Wire contract for the bridge service:
+[`docs/reference/ASSISTANT_PROVIDER_CONTRACT.md`](docs/reference/ASSISTANT_PROVIDER_CONTRACT.md).
+
+### Mode 3 — Composer + sandboxed assistant lane (OpenClaw)
+
+Production default on Thor. Routes the assistant through a NemoClaw
+sandbox running OpenClaw, which dispatches tool calls back to Composer
+through an MCP bridge. Adds bounded-autonomy enforcement, per-tool
+audit, and sandbox isolation. **Requires the `NemoClaw-Thor` repo**
+for the Thor platform glue (vLLM container, sandbox provisioner,
+OpenClaw launcher).
+
+One-command bring-up via the demo launcher:
+
+```bash
+./scripts/demo-assistant-known-good.sh start
+```
+
+The launcher chains: vLLM start → NemoClaw provider config → Composer
+launch → deployment load → OpenClaw provisioner → bridge launch →
+status. See the script header for env-var overrides
+(`MODEL_PROFILE`, `NEMOCLAW_THOR`, `ASSISTANT_PROVIDER`, etc.).
+
+Production model default (2026-05-08): `cosmos-reason2-8b`. Operator
+runbook for this lane lives in NemoClaw-Thor at
+`manyforge/docs/COMPOSER-ASSISTANT-RUNBOOK.md`; lane-comparison
+benchmark at `manyforge/docs/LANE-COMPARISON-direct-vs-openclaw.md`.
+
+---
+
+## Operator-facing reference docs (this repo)
+
+These three are the canonical runtime contracts. They live in this
+repo so an operator never needs to fetch private specs to operate
+ManyForge:
+
+| Topic | Doc | Source-of-truth |
+|---|---|---|
+| Composer REST API | [`docs/reference/REST_API.md`](docs/reference/REST_API.md) | FastAPI app's `/openapi.json` (live at `:9000/openapi.json` when Composer is running) |
+| MCP runtime contract | [`docs/reference/MCP_RUNTIME_CONTRACT.md`](docs/reference/MCP_RUNTIME_CONTRACT.md) | `manyforge_composer/backend/mcp_server.py` (`@mcp.tool()` decorators) |
+| Assistant-provider HTTP | [`docs/reference/ASSISTANT_PROVIDER_CONTRACT.md`](docs/reference/ASSISTANT_PROVIDER_CONTRACT.md) | `manyforge_assistant_bridge/bridge.py` + `protocol.py` |
+
+These docs are auto-generated from code (FastAPI's `openapi()` output
+plus the FastMCP tool registry). To regenerate:
+
+```bash
+docker compose run --rm dev python3 scripts/regen-public-contracts.py
+```
+
+The script must run inside the manyforge dev image — it imports
+`manyforge_composer.backend.app` / `mcp_server` which require the
+container's installed deps (FastAPI, FastMCP, kernel client). Running
+on the host without those deps produces a failure stub.
+
+A CI guard verifies the docs stay in sync with the code:
+
+```bash
+bash scripts/ci/check-public-contracts-fresh.sh
+```
+
+It runs the regenerator in `--check` mode (exit 1 on drift). Wire this
+into pre-commit / GitHub Actions to catch silent staleness — exactly
+the failure mode that left these docs frozen against `build_app` /
+`build_mcp_server` after those factories were renamed to `create_app`
+/ `create_mcp_server`, until the next manual regen.
+
+For workflow-level recipes (cold boot, profile bake-offs, lane
+comparison, smoke tests), see
+[`docs/operations/ASSISTANT_E2E_COOKBOOK.md`](docs/operations/ASSISTANT_E2E_COOKBOOK.md).
+
+For all docs in this repo:
+[`docs/INDEX.md`](docs/INDEX.md).
+
+---
+
+## Subcomponent map
+
+What lives where in this repo, and what it's for:
+
+| Path | What |
+|---|---|
+| [`manyforge_core/`](manyforge_core/) | C++20 core: planning DTOs, kernel state machine, ports |
+| [`manyforge_behavior/`](manyforge_behavior/) | Behavior-tree runtime (py_trees), node catalog, tests |
+| [`manyforge_roboplan/`](manyforge_roboplan/) | Native motion-planner backend bindings (RRT + TOPPRA) |
+| [`manyforge_composer/`](manyforge_composer/) | FastAPI backend + React frontend + MCP server |
+| [`manyforge_assistant_bridge/`](manyforge_assistant_bridge/) | Direct-lane assistant provider HTTP service (port 8100) |
+| [`manyforge_hmi/`](manyforge_hmi/) | Viser-based 3D viewer |
+| [`manyforge_ros/`](manyforge_ros/) | ROS 2 bridge (optional) |
+| [`agent-skills/manyforge-composer/`](agent-skills/manyforge-composer/) | OpenClaw skill manifest (used by Mode 3) |
+| [`examples/`](examples/) | Reference `*.program.yaml` + `*.deployment.yaml` |
+| [`scripts/`](scripts/) | Operator scripts (`demo-assistant-known-good.sh`, `setup-docker.sh`, etc.) |
+| [`docs/`](docs/) | Operator docs (`operations/`, `guides/`, `reference/`) |
+
+---
+
+## Boundary rules for LLM agents working in this repo
+
+When making changes here, check the boundary you're touching:
+
+1. **Don't reintroduce private-spec links** in any runtime path. The
+   CI guard at [`scripts/ci/check-private-spec-boundary.sh`](scripts/ci/check-private-spec-boundary.sh)
+   enforces this; run it before committing if your change touches docs
+   under `docs/operations/`, `docs/reference/`, `docs/guides/`,
+   `manyforge_assistant_bridge/`, `manyforge_composer/`, etc. The
+   guard has an explicit allowlist for docs that legitimately *describe*
+   the boundary (this file, `STACK_SETUP.md`, the dev-only session
+   script).
+2. **Operator-facing reference docs are derived from code, not specs.**
+   See `scripts/regen-public-contracts.py`. Don't hand-copy spec
+   content into `docs/reference/`; extend the generator instead.
+3. **Sibling-repo paths use env-var defaults**: `MANYFORGE_ROOT`,
+   `NEMOCLAW_THOR`, `MANYFORGE_SPECS_ROOT`. Never hard-code another
+   user's home directory.
+4. **The C++ core builds inside the dev container.** Don't try to
+   build it on the host; the entrypoint handles paths and pybind11.
+5. **Tests fall into deterministic + assistant lanes.** Run
+   `./scripts/test-all.sh` for the deterministic suite. The assistant
+   bridge has its own pytest suite under
+   `tests/test_assistant_bridge*.py`.
+6. **Schema changes are wire-breaking.** If you touch
+   `manyforge_assistant_bridge/protocol.py` (the catalog-hash function
+   or any shared envelope helper), every running deployment will
+   recompute hashes — treat as a wire-version bump.
+
+---
+
+## For maintainers / spec work
+
+If your task is to **change a contract, add an ADR, modify a spec, or
+work on a development plan**, you need the private `manyforge_specs`
+repo cloned alongside `manyforge` (sibling directory). It is **not**
+required for any runtime / install / operator task; only for
+maintainer development workflows.
+
+Authoritative dev-side instructions:
 
 - `../manyforge_specs/AGENTS.md`
 - `../manyforge_specs/docs/agent-playbook.md`
-- `../manyforge_specs/docs/implementation/manyforge-implementation-workflow.md`
 - `../manyforge_specs/docs/cross-workspace-conventions.md`
 - `../manyforge_specs/docs/spec/`
 - `../manyforge_specs/docs/adr/`
 
-Before making any change, read the relevant files in
-`../manyforge_specs`. If that repository is unavailable, stop and tell the user
-that this checkout is missing the required development-instruction repository.
+If `../manyforge_specs/` isn't present, it means this checkout is for
+*deployment* use, not maintainer development. **Don't fail the
+operator's task** — answer their runtime question from this repo's
+content (which is complete for operation), and only mention the specs
+repo if the user is asking a spec-level "what should this code do
+fundamentally?" question.
 
-ManyForge implementation docs under `docs/` are runtime/operator references
-only. They do not override `manyforge_specs`.
-
-Runtime sandbox templates under `scripts/templates/` are shipped artifacts for
-LLM-assisted ManyForge operation through OpenClaw/NemoClaw. They are not
-development instructions for this repository and must not be treated as a
-repo-level `AGENTS.md`.
+To seed an OpenClaw agent sandbox with the specs repo for development
+assistance, the dev-only script is at
+[`scripts/dev-agent-session-start.sh`](scripts/dev-agent-session-start.sh).
+It refuses to run without `manyforge_specs` on disk by design.

@@ -907,7 +907,7 @@ def _catalog_entry_payload(entry: Any, *, include_parameters: bool = True) -> di
         "profilesMin": entry.profiles_min,
         "interruptible": entry.interruptible,
         "defaultInterruptScope": entry.default_interrupt_scope,
-        # swap_class and swap_param_aliases drive tree_draft_swap_node's
+        # swap_class and swap_param_aliases drive tree_draft_change_node_kind's
         # compatibility check. Surfacing them on the catalog payload
         # means the model can plan swaps from the same data structure
         # it gets back from catalog_read, with no skew between the
@@ -1316,8 +1316,8 @@ def _execute_bridge_composer_draft_tool(
             node_allowlist=node_allowlist,
             assistant_mode=assistant_mode,
         )
-    if tool_id == "tree_draft_swap_node":
-        return _apply_tree_draft_swap_node(
+    if tool_id == "tree_draft_change_node_kind":
+        return _apply_tree_draft_change_node_kind(
             state,
             arguments=arguments,
             node_allowlist=node_allowlist,
@@ -2330,6 +2330,102 @@ def _insert_index(arguments: dict[str, Any], *, child_count: int) -> int:
     return raw_index
 
 
+def _resolve_insert_position(
+    arguments: dict[str, Any],
+    tree: Any,
+) -> tuple[str, int | None]:
+    """Resolve the three mutually-exclusive insert-position forms to a
+    (parent_name, optional_index) pair.
+
+    Forms:
+      - parentName (optional + index) — explicit parent
+      - afterName — sibling-relative; insert AFTER the named sibling
+      - beforeName — sibling-relative; insert BEFORE the named sibling
+
+    Returns the parent name to feed into the existing parent-resolution
+    path. The numeric index (when known up front) is returned too;
+    callers compute index against the resolved parent's child count if
+    None is returned.
+
+    Raises HTTPException(400) on conflicting form selection. Raises
+    HTTPException(404) when a sibling-relative form references a name
+    that doesn't exist or is the tree root (no parent).
+    """
+    parent_name = arguments.get("parentName") or arguments.get("parent_name")
+    after_name = arguments.get("afterName") or arguments.get("after_name")
+    before_name = arguments.get("beforeName") or arguments.get("before_name")
+    raw_index = arguments.get("index")
+
+    if after_name or before_name:
+        if parent_name and parent_name.strip():
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "tree_draft_insert_node: do not pass parentName "
+                    "alongside afterName/beforeName — the parent is "
+                    "resolved from the sibling automatically."
+                ),
+            )
+        if after_name and before_name:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "tree_draft_insert_node: pass at most one of "
+                    "afterName, beforeName."
+                ),
+            )
+        if raw_index is not None:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "tree_draft_insert_node: index is mutually exclusive "
+                    "with afterName/beforeName."
+                ),
+            )
+        sibling_name = (after_name or before_name).strip()
+        sibling_ref = (
+            _find_tree_node_ref(tree, sibling_name)
+            if isinstance(tree, dict)
+            else None
+        )
+        if sibling_ref is None or sibling_ref[1] is None:
+            valid_names = (
+                _collect_tree_node_names(tree)
+                if isinstance(tree, dict)
+                else []
+            )
+            label = "afterName" if after_name else "beforeName"
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "message": (
+                        f"{label} sibling not found or is the tree root: "
+                        f"{sibling_name}"
+                    ),
+                    "validNodeNames": valid_names,
+                },
+            )
+        parent_node, sibling_index = sibling_ref[1], sibling_ref[2]
+        derived_parent_name = parent_node.get("name")
+        if not isinstance(derived_parent_name, str):
+            raise HTTPException(
+                status_code=500,
+                detail="resolved sibling parent has no name",
+            )
+        derived_index = sibling_index + 1 if after_name else sibling_index
+        return derived_parent_name, derived_index
+
+    if not (isinstance(parent_name, str) and parent_name.strip()):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "tree_draft_insert_node requires one of: parentName, "
+                "afterName, beforeName."
+            ),
+        )
+    return parent_name.strip(), None  # numeric index resolved later
+
+
 def _apply_tree_draft_insert_node(
     state: ComposerState,
     *,
@@ -2338,11 +2434,36 @@ def _apply_tree_draft_insert_node(
     assistant_mode: str | None = None,
 ) -> dict[str, Any]:
     _assert_program_draft_edit_allowed(state)
-    parent_name = arguments.get("parentName") or arguments.get("parent_name")
-    if not isinstance(parent_name, str) or not parent_name.strip():
-        raise HTTPException(status_code=400, detail="tree_draft_insert_node requires parentName")
+    # 2026-05-10 schema change: the new node's instance name is now a
+    # top-level `nodeName` argument (matching the rest of the
+    # tree_draft_* family) instead of nested as `node.name`. Inject it
+    # into the node payload here so the existing helper validates the
+    # familiar shape. If the caller still nested `name` inside `node`,
+    # the top-level `nodeName` wins.
+    node_name_arg = arguments.get("nodeName") or arguments.get("node_name")
+    if not isinstance(node_name_arg, str) or not node_name_arg.strip():
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "tree_draft_insert_node requires `nodeName` (the new "
+                "node's instance name) as a top-level argument."
+            ),
+        )
+    node_name_arg = node_name_arg.strip()
+    raw_node = arguments.get("node")
+    if isinstance(raw_node, str):
+        try:
+            parsed = json.loads(raw_node)
+        except (TypeError, ValueError):
+            parsed = raw_node  # let the helper raise the right error
+        else:
+            if isinstance(parsed, dict):
+                raw_node = parsed
+    if isinstance(raw_node, dict):
+        raw_node = {**raw_node, "name": node_name_arg}
+
     new_node, normalization_warnings = _tree_node_from_draft_argument(
-        arguments.get("node"), field_name="node"
+        raw_node, field_name="node"
     )
     _assert_node_kinds_allowed(
         new_node,
@@ -2352,22 +2473,44 @@ def _apply_tree_draft_insert_node(
     )
     program_data = state.program.to_dict()
     tree = program_data.get("tree")
+    parent_name, derived_index = _resolve_insert_position(
+        arguments, tree if isinstance(tree, dict) else None
+    )
     # Accept `@root` as parentName since inserting under the root is always valid.
-    resolved_parent_name = _resolve_node_name_alias(parent_name.strip(), tree if isinstance(tree, dict) else None)
+    resolved_parent_name = _resolve_node_name_alias(parent_name, tree if isinstance(tree, dict) else None)
     parent_ref = _find_tree_node_ref(tree, resolved_parent_name) if isinstance(tree, dict) else None
     if parent_ref is None:
         valid_names = _collect_tree_node_names(tree) if isinstance(tree, dict) else []
-        raise HTTPException(
-            status_code=404,
-            detail={
-                "message": f"Parent node not found: {parent_name}",
-                "validParentNames": valid_names,
-                "rootAlias": "@root",
-            },
-        )
+        # If the bad parentName actually exists in the tree but is a
+        # leaf (not a parent), point the model at afterName/beforeName.
+        hint: str | None = None
+        if (
+            isinstance(tree, dict)
+            and parent_name in valid_names
+            and not arguments.get("afterName")
+            and not arguments.get("beforeName")
+        ):
+            hint = (
+                f"`{parent_name}` exists in the tree but is not a parent. "
+                f"To insert relative to it, use `afterName: \"{parent_name}\"` "
+                f"or `beforeName: \"{parent_name}\"` instead."
+            )
+        detail: dict[str, Any] = {
+            "message": f"Parent node not found: {parent_name}",
+            "validParentNames": valid_names,
+            "rootAlias": "@root",
+        }
+        if hint is not None:
+            detail["hint"] = hint
+        raise HTTPException(status_code=404, detail=detail)
     parent_node = parent_ref[0]
     children = list(parent_node.get("children") or [])
-    index = _insert_index(arguments, child_count=len(children))
+    if derived_index is not None:
+        # Sibling-derived index — bounded by sibling lookup, but bound-check
+        # defensively in case the tree shape changed under us.
+        index = max(0, min(derived_index, len(children)))
+    else:
+        index = _insert_index(arguments, child_count=len(children))
     children.insert(index, new_node)
     parent_node["children"] = children
     _apply_program_draft_data(
@@ -2377,7 +2520,7 @@ def _apply_tree_draft_insert_node(
     )
     extra: dict[str, Any] = {
         "nodeName": new_node["name"],
-        "parentName": parent_name.strip(),
+        "parentName": parent_name,
         "index": index,
     }
     if normalization_warnings:
@@ -2614,7 +2757,7 @@ def _apply_tree_draft_replace_subtree(
     )
 
 
-def _apply_tree_draft_swap_node(
+def _apply_tree_draft_change_node_kind(
     state: ComposerState,
     *,
     arguments: dict[str, Any],
@@ -2640,25 +2783,25 @@ def _apply_tree_draft_swap_node(
     node_name_raw = arguments.get("nodeName") or arguments.get("node_name")
     if not isinstance(node_name_raw, str) or not node_name_raw.strip():
         raise HTTPException(
-            status_code=400, detail="tree_draft_swap_node requires nodeName"
+            status_code=400, detail="tree_draft_change_node_kind requires nodeName"
         )
     node_name = node_name_raw.strip()
     new_id = arguments.get("newId") or arguments.get("new_id")
     if not isinstance(new_id, str) or not new_id.strip():
         raise HTTPException(
-            status_code=400, detail="tree_draft_swap_node requires newId"
+            status_code=400, detail="tree_draft_change_node_kind requires newId"
         )
     new_id = new_id.strip()
     params_overlay = arguments.get("params") or {}
     if not isinstance(params_overlay, dict):
         raise HTTPException(
-            status_code=400, detail="tree_draft_swap_node params must be an object"
+            status_code=400, detail="tree_draft_change_node_kind params must be an object"
         )
     params_mode = arguments.get("paramsMode") or arguments.get("params_mode") or "replace"
     if params_mode not in ("replace", "merge", "strict"):
         raise HTTPException(
             status_code=400,
-            detail="tree_draft_swap_node paramsMode must be one of: replace, merge, strict",
+            detail="tree_draft_change_node_kind paramsMode must be one of: replace, merge, strict",
         )
     force = bool(arguments.get("force", False))
 

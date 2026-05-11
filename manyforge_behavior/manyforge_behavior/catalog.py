@@ -98,12 +98,12 @@ class CatalogEntry:
     interruptible: bool = False
     default_interrupt_scope: Optional[str] = None
     # Optional swap-compatibility family. When two entries declare the
-    # same swap_class, tree_draft_swap_node treats them as semantically
-    # interchangeable (subject to arity and param validation). When they
-    # declare different families, swap is rejected unless the caller
-    # passes force=true. Entries without a declared swap_class fall back
-    # to structural validation only. Free-form string; used as an
-    # equivalence key, not as a typed enum.
+    # same swap_class, tree_draft_change_node_kind treats them as
+    # semantically interchangeable (subject to arity and param
+    # validation). When they declare different families, the kind change
+    # is rejected unless the caller passes force=true. Entries without a
+    # declared swap_class fall back to structural validation only.
+    # Free-form string; used as an equivalence key, not as a typed enum.
     swap_class: Optional[str] = None
     # Optional alias hints surfaced when params get dropped during a
     # swap. Maps an old-id parameter name to its analogous new-id

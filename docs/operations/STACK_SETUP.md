@@ -23,11 +23,16 @@ It does not cover:
 - upstream platform gaps
 - historical sprint logs
 
-See also:
+For runtime/operator-facing reference docs see:
 
-- [`../../../manyforge_specs/docs/plans/AI_ASSISTANT_INTEGRATION_PLAN.md`](../../../manyforge_specs/docs/plans/AI_ASSISTANT_INTEGRATION_PLAN.md)
-- [`../../../manyforge_specs/docs/integration/PLATFORM_REQUIREMENTS.md`](../../../manyforge_specs/docs/integration/PLATFORM_REQUIREMENTS.md)
-- [`../../../manyforge_specs/docs/plans/PRODUCT_DIRECTION_PLAN.md`](../../../manyforge_specs/docs/plans/PRODUCT_DIRECTION_PLAN.md)
+- [`../reference/REST_API.md`](../reference/REST_API.md) — Composer REST surface
+- [`../reference/MCP_RUNTIME_CONTRACT.md`](../reference/MCP_RUNTIME_CONTRACT.md) — MCP tool contract
+- [`../reference/ASSISTANT_PROVIDER_CONTRACT.md`](../reference/ASSISTANT_PROVIDER_CONTRACT.md) — assistant provider HTTP wire format
+- [`../operations/ASSISTANT_E2E_COOKBOOK.md`](./ASSISTANT_E2E_COOKBOOK.md) — end-to-end recipes
+
+(Internal architectural design rationale, platform-gap investigations, and
+sprint history are tracked in the private `manyforge_specs` repository, which
+is not required for deployment or operation of this repo.)
 
 ## Current Supported Modes
 
@@ -53,38 +58,48 @@ Use when:
 
 ### 3. ManyForge plus NemoClaw/OpenClaw
 
-Two assistant-provider lanes coexist; **direct vLLM (`nemoclaw` provider) is
-the demo default** as of 2026-05-06:
+Two assistant-provider lanes coexist; **OpenClaw + Cosmos-Reason2-8B
+(`openclaw` provider) is the demo default** as of 2026-05-07. The
+launcher [`scripts/demo-assistant-known-good.sh`](../../scripts/demo-assistant-known-good.sh)
+sets `ASSISTANT_PROVIDER=openclaw` and `MODEL_PROFILE=cosmos-reason2-8b`
+by default.
 
-- **Direct vLLM lane (default — `ASSISTANT_PROVIDER=nemoclaw`)**: in-tree
-  `manyforge_assistant_bridge` on `:8100` makes chat-completions calls
-  against vLLM directly, runs the agent loop in-process. Sub-2 s warm
-  latency, ~22 s/test p50 across the comparison matrix. Use this for
-  local development, demos, and any single-tenant deployment where the
-  user trusts the model.
-
-- **OpenClaw lane (`ASSISTANT_PROVIDER=openclaw`)**: persistent OpenClaw
-  gateway in the NemoClaw `my-assistant` sandbox; Composer's `openclaw`
-  provider talks to the in-tree NemoClaw-Thor adapter at `:8200` which
+- **OpenClaw lane (default — `ASSISTANT_PROVIDER=openclaw`)**: persistent
+  OpenClaw gateway in the NemoClaw `my-assistant` sandbox. Composer's
+  `openclaw` provider talks to an adapter at `:8200` (lives in
+  NemoClaw-Thor at `manyforge/openclaw_assistant_bridge/`) which
   forwards to `/v1/chat/completions` on the gateway. The gateway runs
   the agent loop internally; ManyForge enforces every tool call via the
   mode-scoped MCP wrapper + `/api/assistant/bridge/tools/{toolId}`.
-  Warm latency 5-15 s per turn but ~80 s/test p50 (3.6× direct).
-  Recommended for shared/multi-tenant deployments where sandbox
-  isolation + the bounded-autonomy audit envelope (assistantMode +
-  catalogHash + requestId + principal) matter. Setup recipe:
-  [`./ASSISTANT_E2E_COOKBOOK.md`](./ASSISTANT_E2E_COOKBOOK.md) →
-  "Recipe: Known-Good Assistant Demo Launcher". Integration design:
-  [`../../../../nemoclaw/src/NemoClaw-Thor/manyforge/docs/MANYFORGE-MCP-INTEGRATION.md`](../../../../nemoclaw/src/NemoClaw-Thor/manyforge/docs/MANYFORGE-MCP-INTEGRATION.md).
+  Production-validated 9/9 on the 3×3 lane-comparison smoke (P1 wrap-
+  root, P2 scene add, P3 tree insert) once envelope reductions and
+  load-bearing fields landed (2026-05-08); Cosmos-Reason2-8B at 256K
+  context with the cascading 120s chain timeout. Recommended whenever
+  sandbox isolation + the bounded-autonomy audit envelope
+  (assistantMode + catalogHash + requestId + principal) matter, which
+  for the production deployment shape is always.
+
+- **Direct vLLM lane (`ASSISTANT_PROVIDER=nemoclaw`)**: in-tree
+  `manyforge_assistant_bridge` on `:8100` makes chat-completions calls
+  against vLLM directly, runs the agent loop in-process. Sub-2 s warm
+  latency, ~22 s/test p50 — fastest end-to-end, but no sandbox
+  isolation and no per-call audit envelope. Use this for local
+  development, debugging the bridge in isolation, or single-tenant
+  setups where the model is fully trusted.
 
 Both lanes preserve the same bounded-autonomy contract on the ManyForge
 side. Switching between them is a single env var on
-`scripts/demo-assistant-known-good.sh` (`ASSISTANT_PROVIDER=openclaw`).
-The default switch is justified by the 2026-05-06 comparison matrix:
-both paths solve the same 14/15 task set, but direct is consistently
-3-11× faster per test. See
-[`COMPARISON-2026-05-06-direct-vs-openclaw.md`](../../../../nemoclaw/src/NemoClaw-Thor/manyforge/docs/COMPARISON-2026-05-06-direct-vs-openclaw.md)
-in NemoClaw-Thor for the per-test breakdown.
+`scripts/demo-assistant-known-good.sh`. The lane-comparison data that
+justified the default flip (`nemoclaw` → `openclaw` on 2026-05-07)
+and the §10 ablation that validated 9/9 reliability live in
+[`LANE-COMPARISON-direct-vs-openclaw.md`](../../../../nemoclaw/src/NemoClaw-Thor/manyforge/docs/LANE-COMPARISON-direct-vs-openclaw.md)
+in NemoClaw-Thor.
+
+Setup recipe:
+[`./ASSISTANT_E2E_COOKBOOK.md`](./ASSISTANT_E2E_COOKBOOK.md) →
+"Recipe: Known-Good Assistant Demo Launcher".
+Integration design:
+[`../../../../nemoclaw/src/NemoClaw-Thor/manyforge/docs/MANYFORGE-MCP-INTEGRATION.md`](../../../../nemoclaw/src/NemoClaw-Thor/manyforge/docs/MANYFORGE-MCP-INTEGRATION.md).
 
 Use when:
 
@@ -101,9 +116,11 @@ Use when:
 
 ### Repositories
 
-- `manyforge`
-- `manyforge_specs`
-- `NemoClaw-Thor` when using the integrated stack
+- `manyforge` (this repo) — required.
+- `NemoClaw-Thor` — required only when using the integrated OpenClaw stack
+  (Jetson Thor inference + sandboxed assistant lane).
+- `manyforge_specs` — **dev-only**, not required for runtime/operation.
+  Cloned alongside `manyforge` only by maintainers working on specs/ADRs.
 
 ## Primary Scripts
 
@@ -155,12 +172,18 @@ Purpose:
 Use this only for the current sandbox integration baseline. It is not the final
 transport design.
 
-### `scripts/manyforge-session-start.sh`
+### `scripts/dev-agent-session-start.sh` (dev-only)
 
 Purpose:
 
-- restore sandbox reference materials and contracts for a new session
+- restore sandbox reference materials and contracts for a new
+  *maintainer development* session
 - upload the engineering reference and specs into the sandbox
+
+Operators do not need this script. It requires the private
+`manyforge_specs` repo on disk and is intended for maintainer
+dev-assist agents only. For deployment / operator bring-up, use
+`scripts/demo-assistant-known-good.sh`.
 
 ## Recommended Bring-Up Sequences
 
@@ -185,8 +208,11 @@ Then use:
 
 1. Bring up the local provider/model path in `NemoClaw-Thor`.
 2. Run `scripts/configure-manyforge-provider.sh`.
-3. Use `scripts/manyforge-session-start.sh` to seed sandbox docs/contracts.
-4. Validate tool discovery and health before testing agent behavior.
+3. Validate tool discovery and health before testing agent behavior.
+
+(Maintainers working on specs/ADRs additionally run
+`scripts/dev-agent-session-start.sh` to seed sandbox dev-context;
+operators don't need it.)
 
 ## Operational Notes
 
@@ -260,10 +286,14 @@ alias; the deployment maps that alias to the actual provider/model endpoint.
 
 ### Sandbox agent cannot reach ManyForge cleanly
 
-That is expected on the current platform baseline. See:
-
-- [`../../../manyforge_specs/docs/plans/AI_ASSISTANT_INTEGRATION_PLAN.md`](../../../manyforge_specs/docs/plans/AI_ASSISTANT_INTEGRATION_PLAN.md)
-- [`../../../manyforge_specs/docs/integration/PLATFORM_REQUIREMENTS.md`](../../../manyforge_specs/docs/integration/PLATFORM_REQUIREMENTS.md)
+That is expected on the current platform baseline. The OpenClaw lane
+provisioner ([`NemoClaw-Thor/manyforge/setup-manyforge-assistant.sh`](../../../NemoClaw-Thor/manyforge/setup-manyforge-assistant.sh))
+configures the SSRF egress preset, MCP server registration, and proxy envs
+required for the in-sandbox MCP bridge to call back into Composer. Run that
+provisioner whenever the deployment sandbox is recreated. For diagnosis,
+work through [`COMPOSER-ASSISTANT-RUNBOOK.md`](../../../NemoClaw-Thor/manyforge/docs/COMPOSER-ASSISTANT-RUNBOOK.md)
+gates 4-9 (gateway in sandbox netns, vLLM reachability, bundle-mcp policy,
+proxy envs in MCP server config, SSRF L7 paths).
 
 ## Keep This File Small
 

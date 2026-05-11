@@ -177,7 +177,7 @@ assistant_modes:
         - tree_draft_delete_node
         - tree_draft_move_node
         - tree_draft_replace_subtree
-        - tree_draft_swap_node
+        - tree_draft_change_node_kind
         - tree_draft_wrap_node
         - program_draft_upsert_parameters
         - program_draft_remove_parameters
@@ -198,6 +198,17 @@ assistant_modes:
         - repeat
         - retry
         - inverter
+        # 2026-05-08: expanded the node allowlist so the assistant can
+        # author new motion + signal + key + timing nodes (not just edit
+        # existing ones). Each kind below is in the catalog at
+        # manyforge_behavior/resources/node_catalog.yaml; they were
+        # previously hidden behind `expanded_node_allowlist` in the
+        # smoke corpus future-tier markers.
+        - move_manipulator_action
+        - command_gripper
+        - timer
+        - wait_for_signal_bool
+        - set_key_bool_value
 
 tool_catalog:
   - id: catalog_read
@@ -554,20 +565,25 @@ tool_catalog:
       present in the rest of the tree. The same payload-form latitude
       applies as for insertion: a structured object is preferred, and
       a JSON-encoded string is accepted as a fallback.
-  - id: tree_draft_swap_node
+  - id: tree_draft_change_node_kind
     effect: composer_draft_mutating
     description: |
-      Changes the catalog identifier of an existing node in place
-      while preserving the node's instance name, its parent, and its
-      entire subtree. Use this tool when a request describes
+      Changes the catalog identifier (the kind) of an existing node
+      in place while preserving the node's instance name, its parent,
+      and its entire subtree. Use this tool when a request describes
       switching one node kind for a structurally compatible one — for
       example, replacing a decorator with a different decorator of
-      the same arity, swapping a composite for a sibling composite of
-      the same arity, or substituting one scene-create leaf for a
-      related scene-create leaf — without rewriting any of the
-      surrounding tree. The instance name is preserved
+      the same arity, substituting one composite for a sibling
+      composite of the same arity, or substituting one scene-create
+      leaf for a related scene-create leaf — without rewriting any of
+      the surrounding tree. The instance name is preserved
       unconditionally, so other parts of the program that reference
       this node by name keep working.
+
+      This tool does NOT reorder siblings. To reorder two named
+      nodes (e.g. "swap the order of A and B", "swap A with B",
+      "reorder A and B"), use tree_draft_move_node to relocate one
+      of them to the desired index inside the same parent.
 
       The new catalog identifier must be in the deployment catalog
       and in this assistant mode's allowed-nodes set. The current

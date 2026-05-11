@@ -43,8 +43,12 @@ import argparse
 class ThreadingHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
     daemon_threads = True
 
-VLLM_BACKEND = "http://127.0.0.1:8000"
-MANYFORGE_BACKEND = "http://127.0.0.1:9000"
+# 2026-05-09: env-var overrides allow inserting an interception proxy
+# (e.g. vllm-logging-proxy.py running with mutation enabled) between the
+# mux and the real vLLM backend. Defaults preserve the original behavior.
+import os as _os
+VLLM_BACKEND = _os.environ.get("MUX_VLLM_BACKEND", "http://127.0.0.1:8000")
+MANYFORGE_BACKEND = _os.environ.get("MUX_MANYFORGE_BACKEND", "http://127.0.0.1:9000")
 
 MANYFORGE_GET_PREFIX = "/v1/models/manyforge"
 MANYFORGE_DIRECT_PREFIX = "/manyforge"

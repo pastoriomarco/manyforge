@@ -18,15 +18,11 @@ spec, runs a bounded multi-turn loop against the upstream LLM, executes
 callback-safe tools through ManyForge callbacks, and returns ManyForge-shaped
 responses.
 
-This is the local enforcement point for the bounded-autonomy invariant
-defined in
-[`../../manyforge_specs/docs/spec/480-assistant-modes-and-bounded-autonomy.md`](../../manyforge_specs/docs/spec/480-assistant-modes-and-bounded-autonomy.md).
-Architectural design:
-[`../../manyforge_specs/docs/spec/485-assistant-bridge-architecture.md`](../../manyforge_specs/docs/spec/485-assistant-bridge-architecture.md).
-Wire contract:
-[`../../manyforge_specs/docs/reference/ASSISTANT_BACKEND_CONTRACT.md`](../../manyforge_specs/docs/reference/ASSISTANT_BACKEND_CONTRACT.md).
-Cold-boot and live E2E cookbook:
-`../docs/operations/ASSISTANT_E2E_COOKBOOK.md`.
+This is the local enforcement point for the bounded-autonomy
+invariant on the deployment side. Operator-facing references:
+
+- Wire contract: [`../docs/reference/ASSISTANT_PROVIDER_CONTRACT.md`](../docs/reference/ASSISTANT_PROVIDER_CONTRACT.md)
+- Cold-boot and live E2E cookbook: [`../docs/operations/ASSISTANT_E2E_COOKBOOK.md`](../docs/operations/ASSISTANT_E2E_COOKBOOK.md)
 
 ## What this does
 
@@ -123,7 +119,8 @@ MANYFORGE_ASSISTANT_ENDPOINT_URL=http://127.0.0.1:8100/v1/manyforge/assistant
 
 The provider in `manyforge_composer/backend/assistant_provider.py`
 reads this when the deployment artifact's `assistant.provider` is set
-to `nemoclaw` or `openclaw` (per `manyforge_specs` 430 §3.5D).
+to `nemoclaw` or `openclaw` (see provider id field in
+[`../docs/reference/ASSISTANT_PROVIDER_CONTRACT.md`](../docs/reference/ASSISTANT_PROVIDER_CONTRACT.md)).
 
 ## Health probe
 

@@ -1207,8 +1207,10 @@ class TestCrossArtifactValidation:
         # Tool order matches the deployment YAML's
         # assistant_modes.composer-assistant.catalog.tools list order.
         # `program_read` leads because the deployment puts the live-state
-        # read first; `tree_draft_swap_node` was added when the swap-class
-        # rules went in.
+        # read first; `tree_draft_change_node_kind` (formerly
+        # `tree_draft_swap_node`, renamed in 2026-05 to free the word
+        # "swap" for sibling reordering prompts) was added when the
+        # swap-class rules went in.
         assert [tool["id"] for tool in resolved_catalog["tools"]] == [
             "program_read",
             "catalog_read",
@@ -1227,7 +1229,7 @@ class TestCrossArtifactValidation:
             "tree_draft_delete_node",
             "tree_draft_move_node",
             "tree_draft_replace_subtree",
-            "tree_draft_swap_node",
+            "tree_draft_change_node_kind",
             "tree_draft_wrap_node",
             "program_draft_upsert_parameters",
             "program_draft_remove_parameters",

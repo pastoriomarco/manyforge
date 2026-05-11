@@ -118,11 +118,16 @@ The pick-and-place demo exercises the full program load, native planning, scene-
 
 ManyForge exposes a full API surface for autonomous LLM agent operation:
 
-- **REST API** — FastAPI backend at `http://localhost:9000/api/`. Development
-  guidance for LLM composition lives in
-  `../manyforge_specs/docs/guides/LLM_GUIDE.md`.
-- **MCP Server** — Model Context Protocol interface over stdio. The MCP tool
-  contract lives in `../manyforge_specs/docs/reference/MCP_SCHEMA.md`.
+- **REST API** — FastAPI backend at `http://localhost:9000/api/`. Operator-
+  facing reference: [`docs/reference/REST_API.md`](docs/reference/REST_API.md).
+  The live OpenAPI schema is also available at `http://localhost:9000/docs`
+  and `http://localhost:9000/openapi.json` once Composer is running.
+- **MCP Server** — Model Context Protocol interface over stdio. Operator-
+  facing tool contract:
+  [`docs/reference/MCP_RUNTIME_CONTRACT.md`](docs/reference/MCP_RUNTIME_CONTRACT.md).
+- **Assistant Provider Bridge** — HTTP shim that mediates between Composer
+  and an LLM endpoint. Wire-level contract:
+  [`docs/reference/ASSISTANT_PROVIDER_CONTRACT.md`](docs/reference/ASSISTANT_PROVIDER_CONTRACT.md).
 
 ```bash
 # Start the MCP server
