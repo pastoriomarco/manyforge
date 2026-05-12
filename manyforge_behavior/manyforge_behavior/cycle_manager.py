@@ -31,6 +31,7 @@ from manyforge_behavior.kernel_client import (
     KernelClient,
     ObjectState,
     SceneEditRequest,
+    SceneObjectSnapshot,
 )
 from manyforge_behavior.runner import OrchestratorRunner
 
@@ -313,6 +314,8 @@ class CycleManager:
         if self._runner.program is None:
             self._runner.load()
 
+        self._clear_motion_paused_blackboard()
+        self._set_resume_after_error_flag(False)
         self._clear_runtime_scene()
         self._tree = self._runner.build_tree()
         self._runner.apply_scene()
@@ -361,6 +364,10 @@ class CycleManager:
         """Get the current backend-authoritative object state."""
         return self._kernel.get_object_state(object_id)
 
+    def get_scene_objects(self) -> list[SceneObjectSnapshot]:
+        """Get backend-authoritative scene object snapshots."""
+        return self._kernel.get_scene_objects()
+
     def get_gripper_status(self, gripper_id: str):
         """Get the current status of an actuated gripper command channel."""
         return self._kernel.get_gripper_status(gripper_id)
@@ -371,15 +378,14 @@ class CycleManager:
         if deployment is None:
             return {}
         return {
-            gripper_id: {
-                "command_mode": config.command_mode,
-                "group_id": config.group_id,
-                "joint_name": config.joint_name,
-                "open_position": config.open_position,
-                "closed_position": config.closed_position,
-                "motion_time_s": config.motion_time_s,
-                "description": config.description,
-                "touch_links": list(config.touch_links),
+                gripper_id: {
+                    "command_mode": config.command_mode,
+                    "group_id": config.group_id,
+                    "joint_name": config.joint_name,
+                    "motion_time_s": config.motion_time_s,
+                    "srdf_presets": dict(config.srdf_presets),
+                    "description": config.description,
+                    "touch_links": list(config.touch_links),
                 "mount_frame": config.mount_frame,
                 "attach_frame": config.attach_frame,
                 "tcp_frame": config.tcp_frame,
@@ -624,8 +630,13 @@ class CycleManager:
                 key="motion_error_message",
                 access=py_trees.common.Access.WRITE,
             )
+            bb.register_key(
+                key="motion_paused_node_name",
+                access=py_trees.common.Access.WRITE,
+            )
             bb.set("motion_paused_due_to_error", False)
             bb.set("motion_error_message", None)
+            bb.set("motion_paused_node_name", None)
         except (KeyError, AttributeError):
             pass
 

@@ -36,6 +36,10 @@ guidance required for LLM-assisted development.
 - [`guides/INTERRUPT_DEMO.md`](guides/INTERRUPT_DEMO.md)
   - Operator guide for the interrupt-focused pick-and-place demo.
 
+- [`reference/ROBOPLAN_ADAPTER_NOTES.md`](reference/ROBOPLAN_ADAPTER_NOTES.md)
+  - Runtime notes for RoboPlan adapter projection rules and temporary backend
+    workarounds.
+
 ## Runtime Template Artifacts
 
 These files are copied into OpenClaw/NemoClaw runtime sandboxes. They are

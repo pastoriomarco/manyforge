@@ -42,6 +42,9 @@ def _resolve_collision_object_request(
     shape_type = resolve_blackboard_value(blackboard, params.get("shape_type"))
     box_dimensions_m = resolve_blackboard_value(blackboard, params.get("box_dimensions_m"))
     sphere_radius_m = resolve_blackboard_value(blackboard, params.get("sphere_radius_m"))
+    mesh_resource_uri = resolve_blackboard_value(blackboard, params.get("mesh_resource_uri"))
+    mesh_scale = resolve_blackboard_value(blackboard, params.get("mesh_scale"))
+    support_contacts = resolve_blackboard_value(blackboard, params.get("support_contacts"))
     pose = resolve_blackboard_value(blackboard, params.get("pose", {}))
     # frame_id lives INSIDE pose (PoseStamped-shaped) — same shape as
     # scene-resource pose. The previous separate-top-level form was
@@ -59,10 +62,24 @@ def _resolve_collision_object_request(
         shape_type=shape_type,
         box_dimensions_m=box_dimensions_m,
         sphere_radius_m=sphere_radius_m,
+        mesh_resource_uri=mesh_resource_uri,
+        mesh_scale=mesh_scale,
         pose_position_m=pose.get("position_m"),
         pose_orientation_xyzw=orient,
         frame_id=frame_id,
+        support_contacts=support_contacts,
     )
+
+
+def _shape_fields_from_registry(obj_info: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "shape_type": obj_info.get("shape_type"),
+        "box_dimensions_m": obj_info.get("box_dimensions_m"),
+        "sphere_radius_m": obj_info.get("sphere_radius_m"),
+        "mesh_resource_uri": obj_info.get("mesh_resource_uri"),
+        "mesh_scale": obj_info.get("mesh_scale"),
+        "support_contacts": obj_info.get("support_contacts"),
+    }
 
 
 class AddCollisionObject(_SceneCallbackMixin, py_trees.behaviour.Behaviour):
@@ -283,9 +300,7 @@ class AttachObjectToLink(_SceneCallbackMixin, py_trees.behaviour.Behaviour):
         request = SceneEditRequest(
             operation="attach",
             object_id=object_id,
-            shape_type=obj_info.get("shape_type"),
-            box_dimensions_m=obj_info.get("box_dimensions_m"),
-            sphere_radius_m=obj_info.get("sphere_radius_m"),
+            **_shape_fields_from_registry(obj_info),
             frame_id=link_frame,
             touch_links=touch_links,
         )
@@ -305,9 +320,7 @@ class AttachObjectToLink(_SceneCallbackMixin, py_trees.behaviour.Behaviour):
                     SceneEditRequest(
                         operation="add",
                         object_id=object_id,
-                        shape_type=obj_info.get("shape_type"),
-                        box_dimensions_m=obj_info.get("box_dimensions_m"),
-                        sphere_radius_m=obj_info.get("sphere_radius_m"),
+                        **_shape_fields_from_registry(obj_info),
                         pose_position_m=list(pose["position_m"]),
                         pose_orientation_xyzw=list(pose["orientation_xyzw"]),
                         frame_id=link_frame,
@@ -355,9 +368,7 @@ class DetachObjectFromLink(_SceneCallbackMixin, py_trees.behaviour.Behaviour):
         request = SceneEditRequest(
             operation="detach",
             object_id=object_id,
-            shape_type=obj_info.get("shape_type"),
-            box_dimensions_m=obj_info.get("box_dimensions_m"),
-            sphere_radius_m=obj_info.get("sphere_radius_m"),
+            **_shape_fields_from_registry(obj_info),
             frame_id=target_frame,
         )
         result = kernel.scene_edit(request)
@@ -376,9 +387,7 @@ class DetachObjectFromLink(_SceneCallbackMixin, py_trees.behaviour.Behaviour):
                     SceneEditRequest(
                         operation="add",
                         object_id=object_id,
-                        shape_type=obj_info.get("shape_type"),
-                        box_dimensions_m=obj_info.get("box_dimensions_m"),
-                        sphere_radius_m=obj_info.get("sphere_radius_m"),
+                        **_shape_fields_from_registry(obj_info),
                         pose_position_m=list(pose["position_m"]),
                         pose_orientation_xyzw=list(pose["orientation_xyzw"]),
                         frame_id=target_frame,

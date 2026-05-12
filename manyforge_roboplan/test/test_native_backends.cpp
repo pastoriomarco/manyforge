@@ -4,6 +4,8 @@
 
 #include <atomic>
 #include <chrono>
+#include <filesystem>
+#include <fstream>
 #include <thread>
 
 using namespace manyforge::roboplan_backend;
@@ -148,6 +150,68 @@ TEST_F(NativeKernelTest, AddSphereObject) {
   EXPECT_TRUE(result.success);
 }
 
+TEST_F(NativeKernelTest, DetachedStaticObjectOverlapDoesNotBlockRobotState) {
+  auto add_overlapping_box = [this](const std::string& object_id) {
+    AddObjectRequestDTO req;
+    req.object_id = object_id;
+    req.frame_id = "universe";
+    req.shape = BoxShapeDTO{{0.1, 0.1, 0.1}};
+    req.pose.position_m = {0.7, 0.45, 0.35};
+    req.pose.orientation = {0, 0, 0, 1};
+
+    auto result = bundle_->context->add_object(req);
+    EXPECT_TRUE(result.success)
+        << (result.error.has_value() ? result.error->message : "");
+  };
+
+  add_overlapping_box("static_overlap_a");
+  add_overlapping_box("static_overlap_b");
+
+  CollisionCheckRequestDTO check;
+  check.robot_state = bundle_->context->get_current_state();
+  EXPECT_FALSE(bundle_->context->collision_check(check).in_collision);
+
+  AddObjectRequestDTO robot_blocker;
+  robot_blocker.object_id = "robot_blocker";
+  robot_blocker.frame_id = "universe";
+  robot_blocker.shape = BoxShapeDTO{{0.3, 0.3, 0.3}};
+  robot_blocker.pose.position_m = {0.0, 0.0, 0.05};
+  robot_blocker.pose.orientation = {0, 0, 0, 1};
+  auto blocker_result = bundle_->context->add_object(robot_blocker);
+  EXPECT_TRUE(blocker_result.success)
+      << (blocker_result.error.has_value() ? blocker_result.error->message : "");
+  EXPECT_TRUE(bundle_->context->collision_check(check).in_collision);
+}
+
+TEST_F(NativeKernelTest, AddMeshObject) {
+  const auto mesh_path =
+      std::filesystem::temp_directory_path() / "manyforge_test_mesh.obj";
+  {
+    std::ofstream out(mesh_path);
+    out << "v 0 0 0\n"
+        << "v 0.05 0 0\n"
+        << "v 0 0.05 0\n"
+        << "f 1 2 3\n";
+  }
+
+  AddObjectRequestDTO req;
+  req.object_id = "test_mesh";
+  req.frame_id = "universe";
+  req.shape = MeshShapeDTO{mesh_path.string(), {1.0, 1.0, 1.0}};
+  req.pose.position_m = {0.4, 0.1, 0.5};
+  req.pose.orientation = {0, 0, 0, 1};
+
+  auto result = bundle_->context->add_object(req);
+  EXPECT_TRUE(result.success) << (result.error.has_value() ? result.error->message : "");
+
+  auto state = bundle_->context->get_object_state("test_mesh");
+  EXPECT_TRUE(state.exists);
+  auto pose = bundle_->context->get_object_pose("test_mesh", "universe");
+  EXPECT_NEAR(pose.position_m.x_m, 0.4, 1e-9);
+  EXPECT_NEAR(pose.position_m.y_m, 0.1, 1e-9);
+  EXPECT_NEAR(pose.position_m.z_m, 0.5, 1e-9);
+}
+
 TEST_F(NativeKernelTest, AttachedFrameObjectPoseResolvesFromBackendState) {
   auto link_state = bundle_->context->get_current_state();
   FkRequestDTO fk_req;
@@ -236,14 +300,12 @@ TEST_F(NativeKernelTest, DetachObjectReparentsBackToUniverseWhilePreservingWorld
   EXPECT_NEAR(pose_after.position_m.z_m, pose_before.position_m.z_m, 1e-6);
 }
 
-// Regression for the index-cache-staleness bug: a sequence of upserts (each
-// of which is implemented as remove+add) used to corrupt the wrapper's name→
-// index map in roboplan's Scene because pinocchio shifts indices when a
-// non-LIFO geometry is removed. The next mutation (here, an attach) then
-// targeted the wrong geometry and parked an unrelated object at the wrong
-// pose, producing phantom collisions between the robot base/shoulder/ground
-// and the misplaced object. The wrapper now does LIFO replay on every
-// remove, which keeps roboplan's cache self-consistent.
+// Regression for RoboPlan's historical index-cache-staleness bug: a sequence
+// of remove+add upserts used to corrupt RoboPlan Scene's name→index map. The
+// next mutation (here, an attach) then targeted the wrong geometry and parked
+// an unrelated object at the wrong pose, producing phantom collisions between
+// the robot base/shoulder/ground and the misplaced object. RoboPlan main now
+// owns that bookkeeping, so ManyForge uses direct remove/reparent operations.
 TEST_F(NativeKernelTest, UpsertCascadeFollowedByAttachDoesNotCorruptScene) {
   // Build a 3-object scene that mirrors the production failure: a ground
   // plane, a graspable, and a wall-shaped third object placed where the
@@ -362,6 +424,32 @@ TEST_F(NativeKernelTest, PlannerUsesPerRequestPlanningTimeout) {
   ASSERT_TRUE(result.error.has_value());
   EXPECT_EQ(result.error->code, kErrorPlanningFailed);
   EXPECT_NE(result.error->message.find("timed out"), std::string::npos);
+}
+
+TEST_F(NativeKernelTest, PlannerRejectsUnsatisfiedTcpSpeedLimit) {
+  PlanRequestDTO req;
+  req.robot_id = "robot1";
+  req.group_id = "arm";
+  req.move_id = "native_tcp_limit_rejected_in_planning";
+  req.base_frame = "base_link";
+  req.tcp_frame = "tool0";
+  req.start_state = bundle_->context->get_current_state();
+  req.tolerances = {0.05, 0.005, 0.05};
+  req.speed_profile = {1.0, 1.0, 1e-9};
+  req.planning_timeout_s = 10.0;
+
+  JointGoalDTO goal;
+  goal.joint_names = req.start_state.joint_names;
+  goal.positions_rad = {0.1, -0.5, 0.5, -0.5, -0.5, 0.0};
+  req.motion = goal;
+
+  auto result = bundle_->planner->plan(req);
+  ASSERT_FALSE(result.trajectory.has_value());
+  ASSERT_TRUE(result.error.has_value());
+  EXPECT_EQ(result.error->code, kErrorValidationLimitsViolation);
+  EXPECT_EQ(result.error->details.at("failure_stage"), "time_parameterization");
+  EXPECT_EQ(result.error->details.at("limit_type"), "tcp_linear_speed");
+  EXPECT_EQ(result.error->details.at("toppra_iterations"), "32");
 }
 
 TEST_F(NativeKernelTest, ExecutionBackendPublishesProgressAndInterpolatesSceneState) {
@@ -582,4 +670,39 @@ TEST_F(NativeKernelTest, TrajectoryValidationWorks) {
   ValidationOptionsDTO opts;
   auto result = bundle_->context->validate_trajectory(traj, opts);
   EXPECT_TRUE(result.valid);
+}
+
+TEST_F(NativeKernelTest, TrajectoryValidationReportsTcpSpeedBeforeCollisionSweep) {
+  auto state = bundle_->context->get_current_state();
+  ASSERT_GE(state.positions_rad.size(), 2u);
+
+  TrajectoryDTO traj;
+  traj.joint_names = state.joint_names;
+
+  TrajectoryWaypointDTO start;
+  start.time_from_start_s = 0.0;
+  start.positions_rad = state.positions_rad;
+  traj.waypoints.push_back(start);
+
+  TrajectoryWaypointDTO fast;
+  fast.time_from_start_s = 0.001;
+  fast.positions_rad = state.positions_rad;
+  fast.positions_rad[0] += 0.5;
+  traj.waypoints.push_back(fast);
+
+  ValidationOptionsDTO opts;
+  opts.max_tcp_linear_speed_mps = 0.001;
+  opts.tcp_frame = "tool0";
+  opts.base_frame = "base_link";
+
+  auto result = bundle_->context->validate_trajectory(traj, opts);
+  EXPECT_FALSE(result.valid);
+  ASSERT_TRUE(result.error.has_value());
+  EXPECT_EQ(result.error->code, kErrorValidationLimitsViolation);
+  EXPECT_EQ(result.error->details.at("limit_type"), "tcp_linear_speed");
+  EXPECT_EQ(result.error->details.at("collision_validation_duration_ns"), "0");
+  EXPECT_EQ(result.error->details.at("max_segment_index"), "0");
+  EXPECT_EQ(result.error->details.at("waypoint_count"), "2");
+  EXPECT_NE(result.error->details.find("speed_validation_duration_ns"),
+            result.error->details.end());
 }

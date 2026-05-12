@@ -30,7 +30,12 @@ BRIDGE_PID_FILE="${BRIDGE_PID_FILE:-${LOG_DIR}/known-good-bridge.pid}"
 BRIDGE_LOG="${BRIDGE_LOG:-${LOG_DIR}/known-good-bridge.log}"
 BRIDGE_AUDIT_LOG="${BRIDGE_AUDIT_LOG:-${LOG_DIR}/known-good-bridge-audit.jsonl}"
 COMPOSER_URL="${COMPOSER_URL:-http://127.0.0.1:9000}"
-UPSTREAM_BASE_URL="${UPSTREAM_BASE_URL:-http://127.0.0.1:8000/v1}"
+# When START_VLLM_PROXY=true (iter-32 production layout), vLLM moves off
+# port 8000 to make room for the proxy mutator; the proxy listens on
+# :8000 and forwards to vLLM. When false, vLLM keeps :8000 directly.
+# Resolved further down once START_VLLM_PROXY is known.
+VLLM_PORT="${VLLM_PORT:-}"
+UPSTREAM_BASE_URL_OVERRIDE="${UPSTREAM_BASE_URL:-}"
 # OpenClaw (sandboxed gateway) is the default assistant-provider lane:
 # openclaw_assistant_bridge on :8200, persistent OpenClaw gateway in the
 # my-assistant sandbox, mode-scoped MCP wrapper, full bounded-autonomy
@@ -67,6 +72,24 @@ OPENCLAW_ASSISTANT_COMPACT_TIMEOUT_S="${OPENCLAW_ASSISTANT_COMPACT_TIMEOUT_S:-12
 START_VLLM_PROXY="${START_VLLM_PROXY:-true}"
 OPENCLAW_PROXY_OVERRIDE_MAX_TOKENS="${OPENCLAW_PROXY_OVERRIDE_MAX_TOKENS:-2048}"
 OPENCLAW_PROXY_THINKING_TOKEN_BUDGET="${OPENCLAW_PROXY_THINKING_TOKEN_BUDGET:-512}"
+
+# Resolve port layout based on whether the proxy is active.
+# - proxy on:   vLLM=:8050, proxy=:8000, callers see :8000 (proxy → vLLM)
+# - proxy off:  vLLM=:8000, callers see :8000 directly
+if [[ -z "${VLLM_PORT}" ]]; then
+    if [[ "${START_VLLM_PROXY}" == "true" ]]; then
+        VLLM_PORT="8050"
+    else
+        VLLM_PORT="8000"
+    fi
+fi
+# UPSTREAM_BASE_URL is what Composer + bridge + this script's healthchecks
+# point at. With the proxy, that's the proxy on :8000; without, vLLM
+# itself on :8000.
+UPSTREAM_BASE_URL="${UPSTREAM_BASE_URL_OVERRIDE:-http://127.0.0.1:8000/v1}"
+# Direct vLLM endpoint, used by start_model's health probe (the proxy
+# isn't up at that point) and by the proxy's own upstream config.
+VLLM_DIRECT_URL="http://127.0.0.1:${VLLM_PORT}/v1"
 # Bridge URL is provider-derived: nemoclaw -> :8100 (manyforge_assistant_bridge
 # here), openclaw -> :8200 (openclaw_assistant_bridge in NemoClaw-Thor).
 case "${ASSISTANT_PROVIDER}" in
@@ -350,7 +373,10 @@ wait_json() {
 }
 
 served_model_id() {
-    curl -fsS "${UPSTREAM_BASE_URL}/models" 2>/dev/null | python3 -c '
+    # Always read the model id from vLLM directly, not via the proxy —
+    # the proxy may not be up yet during start_model, and the proxy's
+    # /v1/models passes through but adds latency we don't need.
+    curl -fsS "${VLLM_DIRECT_URL}/models" 2>/dev/null | python3 -c '
 import json
 import sys
 
@@ -432,13 +458,17 @@ start_model() {
             cd "${NEMOCLAW_THOR}"
             THOR_DETACH=1 \
             THOR_CONTAINER_NAME="${VLLM_CONTAINER}" \
+            THOR_VLLM_PORT="${VLLM_PORT}" \
             ./serving/start-model.sh "${MODEL_PROFILE}"
         )
     fi
+    # Probe vLLM directly during startup — the proxy (if any) isn't
+    # listening yet, and even when it's up the model-id check needs to
+    # see vLLM's actual served model, not the proxy passthrough.
     wait_json \
-        "${UPSTREAM_BASE_URL}/models" \
+        "${VLLM_DIRECT_URL}/models" \
         900 \
-        "Waiting for vLLM /v1/models on ${UPSTREAM_BASE_URL}" \
+        "Waiting for vLLM /v1/models on ${VLLM_DIRECT_URL}" \
         "Inspect full details in another terminal with: docker logs -f ${VLLM_CONTAINER}" \
         "${VLLM_CONTAINER}"
     local served
@@ -462,7 +492,7 @@ start_vllm_proxy() {
         echo "START_VLLM_PROXY=${START_VLLM_PROXY}; assuming vllm-proxy is managed externally."
         return 0
     fi
-    step "Starting vllm-proxy mutator (host:8000 -> vLLM:${VLLM_PORT:-8050})"
+    step "Starting vllm-proxy mutator (host:8000 -> vLLM:${VLLM_PORT})"
     local proxy_dir="${NEMOCLAW_THOR}/manyforge/scripts/proxy"
     local proxy_py="${proxy_dir}/vllm-proxy.py"
     if [[ ! -f "${proxy_py}" ]]; then
@@ -484,7 +514,7 @@ start_vllm_proxy() {
         env \
           OPENCLAW_PROXY_BIND=0.0.0.0 \
           OPENCLAW_PROXY_LISTEN_PORT=8000 \
-          OPENCLAW_PROXY_UPSTREAM="http://127.0.0.1:${VLLM_PORT:-8050}" \
+          OPENCLAW_PROXY_UPSTREAM="http://127.0.0.1:${VLLM_PORT}" \
           OPENCLAW_PROXY_LOG_PATH="${LOG_DIR}/vllm-proxy.jsonl" \
           OPENCLAW_PROXY_OVERRIDE_MAX_TOKENS="${OPENCLAW_PROXY_OVERRIDE_MAX_TOKENS}" \
           OPENCLAW_PROXY_THINKING_TOKEN_BUDGET="${OPENCLAW_PROXY_THINKING_TOKEN_BUDGET}" \

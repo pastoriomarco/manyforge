@@ -190,6 +190,9 @@ class OrchestratorRunner:
                 "shape_type": resource.shape.get("type"),
                 "box_dimensions_m": resource.shape.get("box_dimensions_m"),
                 "sphere_radius_m": resource.shape.get("sphere_radius_m"),
+                "mesh_resource_uri": resource.shape.get("mesh_resource_uri"),
+                "mesh_scale": resource.shape.get("mesh_scale"),
+                "support_contacts": resource.metadata.get("support_contacts"),
             }
         bb.scene_objects = scene_registry
 
@@ -200,9 +203,8 @@ class OrchestratorRunner:
                     "command_mode": config.command_mode,
                     "group_id": config.group_id,
                     "joint_name": config.joint_name,
-                    "open_position": config.open_position,
-                    "closed_position": config.closed_position,
                     "motion_time_s": config.motion_time_s,
+                    "srdf_presets": dict(config.srdf_presets),
                     "description": config.description,
                     "touch_links": list(config.touch_links),
                 }
@@ -245,6 +247,8 @@ class OrchestratorRunner:
         if self._program is None:
             raise RuntimeError("Call load() first")
 
+        self._kernel.set_robot_base_pose(self._program.robot.base_pose)
+
         for resource in self._program.scene:
             shape_type = resource.shape.get("type")
             request = SceneEditRequest(
@@ -253,11 +257,14 @@ class OrchestratorRunner:
                 shape_type=shape_type,
                 box_dimensions_m=resource.shape.get("box_dimensions_m"),
                 sphere_radius_m=resource.shape.get("sphere_radius_m"),
+                mesh_resource_uri=resource.shape.get("mesh_resource_uri"),
+                mesh_scale=resource.shape.get("mesh_scale"),
                 pose_position_m=resource.pose.get("position_m"),
                 pose_orientation_xyzw=resource.pose.get("orientation_xyzw")
                     or (_rpy_deg_to_xyzw(resource.pose["orientation_rpy_deg"])
                         if "orientation_rpy_deg" in resource.pose else None),
                 frame_id=resource.pose.get("frame_id"),
+                support_contacts=resource.metadata.get("support_contacts"),
             )
             result = self._kernel.scene_edit(request)
             if not result.success:

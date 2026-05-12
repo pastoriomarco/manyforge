@@ -26,8 +26,12 @@ from .models import (
     SceneEditResponse,
     SceneFrameResponse,
     SceneFramesResponse,
+    SceneFrameGizmoSizeRequest,
+    SceneFrameGizmoSizeResponse,
     SceneFrameVisibilityRequest,
     SceneFrameVisibilityResponse,
+    SceneObjectFrameVisibilityRequest,
+    SceneObjectFrameVisibilityResponse,
     SceneObjectResponse,
     SceneRobotResponse,
     SceneShapeResponse,
@@ -151,6 +155,12 @@ def build_scene_frames_payload(state: ComposerState) -> dict[str, Any]:
 
     hmi = getattr(state, "hmi_server", None)
     hmi_available = bool(hmi and hasattr(hmi, "get_frame_visibility"))
+    frame_gizmo_size_m = 0.1
+    if hmi is not None and hasattr(hmi, "get_frame_gizmo_size"):
+        try:
+            frame_gizmo_size_m = float(hmi.get_frame_gizmo_size())
+        except Exception:
+            frame_gizmo_size_m = 0.1
     kernel = state.kernel
     world_frame = canonical_scene_world_frame(state)
 
@@ -182,6 +192,7 @@ def build_scene_frames_payload(state: ComposerState) -> dict[str, Any]:
     return SceneFramesResponse(
         frames=frames,
         hmiAvailable=hmi_available,
+        frameGizmoSizeM=frame_gizmo_size_m,
         timestampNs=timestamp_ns,
     ).model_dump(by_alias=True)
 
@@ -207,6 +218,7 @@ def build_scene_state_payload(state: ComposerState) -> dict[str, Any]:
     group_id = None
     base_frame = "base_link"
     tcp_frame = "tool0"
+    base_pose: dict[str, Any] = {}
 
     if state.deployment is not None and state.deployment.robot_config is not None:
         robot_id = state.deployment.robot_config.robot_id
@@ -214,6 +226,7 @@ def build_scene_state_payload(state: ComposerState) -> dict[str, Any]:
     if state.program is not None and state.program.robot is not None:
         base_frame = state.program.robot.base_frame
         tcp_frame = state.program.robot.tcp_frame
+        base_pose = dict(state.program.robot.base_pose or {})
 
     joint_positions_by_name: dict[str, float] = {}
     joint_names: list[str] = []
@@ -246,6 +259,7 @@ def build_scene_state_payload(state: ComposerState) -> dict[str, Any]:
             group_id=group_id,
             base_frame=base_frame,
             tcp_frame=tcp_frame,
+            base_pose=base_pose,
             joint_names=joint_names,
             joint_positions=joint_positions_by_name,
             tcp_pose_in_base=tcp_pose_in_base,
@@ -256,6 +270,8 @@ def build_scene_state_payload(state: ComposerState) -> dict[str, Any]:
         resource.object_id
         for resource in (state.program.scene if state.program is not None else [])
     }
+    hmi = getattr(state, "hmi_server", None)
+    hmi_object_frames_available = bool(hmi and hasattr(hmi, "get_object_frame_visibility"))
     if state.kernel is not None:
         for scene_object in state.kernel.get_scene_objects():
             if scene_object.attached:
@@ -264,6 +280,14 @@ def build_scene_state_payload(state: ComposerState) -> dict[str, Any]:
                 source = "authored"
             else:
                 source = "runtime"
+            viewer_frame_visible = False
+            if hmi_object_frames_available:
+                try:
+                    viewer_frame_visible = bool(
+                        hmi.get_object_frame_visibility(scene_object.object_id)
+                    )
+                except Exception:
+                    viewer_frame_visible = False
             objects.append(
                 SceneObjectResponse(
                     object_id=scene_object.object_id,
@@ -273,6 +297,7 @@ def build_scene_state_payload(state: ComposerState) -> dict[str, Any]:
                     attached_to=scene_object.frame_id if scene_object.attached else None,
                     source=source,
                     persistable=source == "authored",
+                    viewer_frame_visible=viewer_frame_visible,
                 )
             )
     objects.sort(key=lambda obj: obj.object_id)
@@ -385,6 +410,43 @@ def create_scene_router(state: ComposerState) -> APIRouter:
             timestampNs=time.monotonic_ns(),
         ).model_dump(by_alias=True)
 
+    @router.post("/frames/gizmo-size")
+    def set_frame_gizmo_size(validated: SceneFrameGizmoSizeRequest) -> dict[str, Any]:
+        """Set global viewer size for named frame axes without mutating deployment."""
+        hmi = getattr(state, "hmi_server", None)
+        if hmi is None or not hasattr(hmi, "set_frame_gizmo_size"):
+            return JSONResponse(
+                status_code=503,
+                content={"detail": "HMI server not running or does not support frame gizmo size control"},
+            )
+        hmi.set_frame_gizmo_size(validated.axes_length_m)
+        return SceneFrameGizmoSizeResponse(
+            success=True,
+            axesLengthM=float(hmi.get_frame_gizmo_size()),
+            hmiAvailable=True,
+            timestampNs=time.monotonic_ns(),
+        ).model_dump(by_alias=True)
+
+    @router.post("/objects/frame-visibility")
+    def set_object_frame_visibility(
+        validated: SceneObjectFrameVisibilityRequest,
+    ) -> dict[str, Any]:
+        """Show/hide a scene object's pose axis in the HMI viewer."""
+        hmi = getattr(state, "hmi_server", None)
+        if hmi is None or not hasattr(hmi, "set_object_frame_visibility"):
+            return JSONResponse(
+                status_code=503,
+                content={"detail": "HMI server not running or does not support object frame visibility"},
+            )
+        hmi.set_object_frame_visibility(validated.object_id, validated.visible)
+        return SceneObjectFrameVisibilityResponse(
+            success=True,
+            objectId=validated.object_id,
+            visible=validated.visible,
+            hmiAvailable=True,
+            timestampNs=time.monotonic_ns(),
+        ).model_dump(by_alias=True)
+
     @router.post("/edit")
     def edit_scene(validated: SceneEditApiRequest) -> dict[str, Any]:
         """Edit the scene at runtime (add, upsert, remove, update_pose, attach, detach)."""
@@ -425,6 +487,8 @@ def create_scene_router(state: ComposerState) -> APIRouter:
                 shape_type=validated.shape_type,
                 box_dimensions_m=validated.box_dimensions_m,
                 sphere_radius_m=validated.sphere_radius_m,
+                mesh_resource_uri=validated.mesh_resource_uri,
+                mesh_scale=validated.mesh_scale,
                 pose_position_m=validated.pose_position_m,
                 pose_orientation_xyzw=validated.pose_orientation_xyzw,
                 frame_id=validated.frame_id,

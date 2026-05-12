@@ -42,5 +42,7 @@ tree:
       name: scaffold_open
       params:
         gripper_id: primary
-        command: open
-
+        position: 0.0
+        max_effort: 40.0
+        duration_s: 1.0
+        timeout_s: 0.0

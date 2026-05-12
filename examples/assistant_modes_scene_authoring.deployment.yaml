@@ -23,8 +23,6 @@ grippers:
     command_mode: simulated_joint
     group_id: gripper
     joint_name: finger_joint
-    open_position: 0.0
-    closed_position: 0.66
     motion_time_s: 0.8
     touch_links:
       - left_inner_finger
@@ -63,6 +61,7 @@ adapters:
       - context.limits.joint
       - scene.shape.box
       - scene.shape.sphere
+      - scene.shape.mesh
       - scene.edit.add
       - scene.edit.upsert
       - scene.edit.remove

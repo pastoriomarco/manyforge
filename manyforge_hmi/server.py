@@ -113,6 +113,10 @@ class ViserHmiServer:
         self._link_viser_paths: dict[str, str] = {}
         self._frame_handles: dict[str, Any] = {}
         self._frame_visibility_overrides: dict[str, bool] = {}
+        self._frame_axes_length_m = 0.1
+        self._object_frame_handles: dict[str, Any] = {}
+        self._object_frame_visibility_overrides: dict[str, bool] = {}
+        self._object_frame_render_state: dict[str, tuple[float, float, float]] = {}
         self._scene_trace: deque[dict[str, Any]] = deque(maxlen=4096)
         self._scene_snapshot_service = SceneSnapshotService(self._render_scene_sync)
         self._rebuild_link_viser_paths()
@@ -127,6 +131,10 @@ class ViserHmiServer:
 
         # Display in program panel
         self._program_panel.load_program(program)
+        if self._robot_visualizer is not None:
+            self._robot_visualizer.set_base_pose(
+                getattr(getattr(program, "robot", None), "base_pose", {})
+            )
 
         # Cache static scene metadata. Runtime pose/frame always comes from backend.
         self._scene_specs = {
@@ -135,6 +143,7 @@ class ViserHmiServer:
         }
         self._rebuild_link_viser_paths()
         self._sync_tool_frames_from_backend()
+        self._clear_object_frames()
         self._scene_renderer.clear()
         self.sync_scene_from_backend()
         self.sync_robot_from_backend(force=True)
@@ -179,6 +188,7 @@ class ViserHmiServer:
 
         if self._scene_specs:
             self.sync_scene_from_backend(snapshot_sequence=snapshot.sequence_number)
+        self._sync_visible_object_frames()
 
     def _sync_robot_from_snapshot(self, snapshot, *, force: bool = False) -> None:
         """Apply backend joint state to the robot visualizer."""
@@ -333,11 +343,12 @@ class ViserHmiServer:
         for frame_name in sorted(tracked_frames):
             handle = self._frame_handles.get(frame_name)
             if handle is None:
+                axes_length, axes_radius, origin_radius = self._frame_axes_dimensions()
                 handle = self._viser_server.scene.add_frame(
                     f"/frames/{frame_name}",
-                    axes_length=0.08,
-                    axes_radius=0.004,
-                    origin_radius=0.01,
+                    axes_length=axes_length,
+                    axes_radius=axes_radius,
+                    origin_radius=origin_radius,
                     visible=False,
                 )
                 self._frame_handles[frame_name] = handle
@@ -364,6 +375,27 @@ class ViserHmiServer:
             return self._frame_visibility_overrides.get(frame_name, True)
         return self._frame_visibility_overrides.get(frame_name, False)
 
+    def _frame_axes_dimensions(self) -> tuple[float, float, float]:
+        axes_length = float(self._frame_axes_length_m)
+        return (axes_length, axes_length * 0.05, axes_length * 0.125)
+
+    def get_frame_gizmo_size(self) -> float:
+        """Return the global viewer axis length for named frame gizmos."""
+        return float(self._frame_axes_length_m)
+
+    def set_frame_gizmo_size(self, axes_length_m: float) -> None:
+        """Set global viewer axis length for named frame gizmos."""
+        axes_length = float(axes_length_m)
+        if axes_length <= 0.0:
+            raise ValueError("axes_length_m must be positive")
+        if abs(axes_length - self._frame_axes_length_m) < 1e-12:
+            return
+        self._frame_axes_length_m = axes_length
+        for handle in list(self._frame_handles.values()):
+            handle.remove()
+        self._frame_handles.clear()
+        self._sync_tool_frames_from_backend()
+
     def set_frame_visibility(self, frame_name: str, visible: bool) -> None:
         """Set viewer visibility for a named frame without mutating deployment semantics."""
         frame_name = str(frame_name).strip()
@@ -383,6 +415,134 @@ class ViserHmiServer:
                 self._frame_visibility_overrides.pop(frame_name, None)
 
         self._sync_tool_frames_from_backend()
+
+    @staticmethod
+    def _object_frame_name(object_id: str) -> str:
+        safe_id = str(object_id).replace("/", "_")
+        return f"/object_frames/{safe_id}"
+
+    def _clear_object_frames(self) -> None:
+        """Remove all object pose axes from the viewer."""
+        for handle in list(self._object_frame_handles.values()):
+            handle.remove()
+        self._object_frame_handles.clear()
+        self._object_frame_render_state.clear()
+
+    def _remove_object_frame(self, object_id: str) -> None:
+        handle = self._object_frame_handles.pop(object_id, None)
+        if handle is not None:
+            handle.remove()
+        self._object_frame_render_state.pop(object_id, None)
+
+    @staticmethod
+    def _shape_value(shape: Any, key: str, default: Any = None) -> Any:
+        if isinstance(shape, dict):
+            return shape.get(key, default)
+        return getattr(shape, key, default)
+
+    def _object_shape_for_frame(self, object_id: str) -> Any:
+        resource = self._scene_specs.get(object_id)
+        if resource is not None:
+            return getattr(resource, "shape", None)
+        for snapshot in self._bridge.get_scene_objects():
+            if snapshot.object_id == object_id:
+                return snapshot.shape
+        return None
+
+    def _object_frame_axes_dimensions(self, object_id: str) -> tuple[float, float, float]:
+        """Return viewer frame dimensions scaled from the object's largest extent."""
+        fallback_axes_length = 0.06
+        shape = self._object_shape_for_frame(object_id)
+        shape_type = self._shape_value(shape, "type")
+        max_extent_m: Optional[float] = None
+
+        try:
+            if shape_type == "box":
+                dimensions = self._shape_value(shape, "box_dimensions_m") or []
+                max_extent_m = max(float(value) for value in dimensions)
+            elif shape_type == "sphere":
+                radius = float(self._shape_value(shape, "sphere_radius_m") or 0.0)
+                max_extent_m = 2.0 * radius
+            elif shape_type == "cylinder":
+                radius = float(self._shape_value(shape, "cylinder_radius_m") or 0.0)
+                height = float(self._shape_value(shape, "cylinder_height_m") or 0.0)
+                max_extent_m = max(2.0 * radius, height)
+            elif shape_type == "mesh":
+                resource_uri = self._shape_value(shape, "mesh_resource_uri") or ""
+                mesh_scale = tuple(float(value) for value in (
+                    self._shape_value(shape, "mesh_scale") or [1.0, 1.0, 1.0]
+                ))
+                extents = SceneRenderer.mesh_extents_m(resource_uri, mesh_scale)  # type: ignore[arg-type]
+                max_extent_m = max(extents)
+        except Exception:
+            logger.debug("Could not derive object gizmo size for %s", object_id, exc_info=True)
+
+        if max_extent_m is None or max_extent_m <= 0.0:
+            axes_length = fallback_axes_length
+        else:
+            axes_length = 0.75 * max_extent_m
+
+        axes_radius = min(max(axes_length * 0.02, 0.0015), 0.01)
+        origin_radius = min(max(axes_length * 0.05, 0.004), 0.03)
+        return (axes_length, axes_radius, origin_radius)
+
+    def _sync_object_frame_from_pose(self, object_id: str, pose: Optional[dict]) -> None:
+        """Render a standalone axis at a scene object's backend pose."""
+        visible = self._object_frame_visibility_overrides.get(object_id, False)
+        if not visible or pose is None:
+            self._remove_object_frame(object_id)
+            return
+
+        render_state = self._object_frame_axes_dimensions(object_id)
+        handle = self._object_frame_handles.get(object_id)
+        if handle is not None and self._object_frame_render_state.get(object_id) != render_state:
+            self._remove_object_frame(object_id)
+            handle = None
+
+        if handle is None:
+            axes_length, axes_radius, origin_radius = render_state
+            handle = self._viser_server.scene.add_frame(
+                self._object_frame_name(object_id),
+                axes_length=axes_length,
+                axes_radius=axes_radius,
+                origin_radius=origin_radius,
+                visible=True,
+            )
+            self._object_frame_handles[object_id] = handle
+            self._object_frame_render_state[object_id] = render_state
+
+        handle.position = tuple(float(value) for value in pose["position_m"])
+        handle.wxyz = self._xyzw_to_wxyz(tuple(float(value) for value in pose["orientation_xyzw"]))
+        handle.visible = True
+
+    def _sync_visible_object_frames(self) -> None:
+        """Refresh all requested object pose axes from backend-authoritative poses."""
+        for object_id, visible in list(self._object_frame_visibility_overrides.items()):
+            if not visible:
+                self._remove_object_frame(object_id)
+                continue
+            self._sync_object_frame_from_pose(
+                object_id,
+                self._bridge.get_object_pose(object_id, "universe"),
+            )
+
+    def get_object_frame_visibility(self, object_id: str) -> bool:
+        """Return current viewer visibility for a scene object's pose axis."""
+        return self._object_frame_visibility_overrides.get(str(object_id).strip(), False)
+
+    def set_object_frame_visibility(self, object_id: str, visible: bool) -> None:
+        """Set scene-object pose-axis visibility without mutating scene state."""
+        object_id = str(object_id).strip()
+        if not object_id:
+            raise ValueError("object_id must not be empty")
+
+        if visible:
+            self._object_frame_visibility_overrides[object_id] = True
+            pose = self._bridge.get_object_pose(object_id, "universe")
+            self._sync_object_frame_from_pose(object_id, pose)
+        else:
+            self._object_frame_visibility_overrides.pop(object_id, None)
+            self._remove_object_frame(object_id)
 
     def request_scene_sync(
         self,
@@ -429,6 +589,7 @@ class ViserHmiServer:
         for object_id in self._scene_renderer.object_ids:
             if object_id not in self._scene_specs:
                 render = self._scene_renderer.remove_object(object_id)
+                self._remove_object_frame(object_id)
                 self._record_scene_trace(
                     event="remove_orphaned_render",
                     object_id=object_id,
@@ -440,6 +601,7 @@ class ViserHmiServer:
             state = self._bridge.get_object_state(object_id)
             if not state.exists:
                 render = self._scene_renderer.remove_object(object_id)
+                self._remove_object_frame(object_id)
                 self._record_scene_trace(
                     event="reconcile_absent",
                     object_id=object_id,
@@ -462,6 +624,7 @@ class ViserHmiServer:
                 pose = self._bridge.get_object_pose(object_id, frame_id)
             world_pose = self._bridge.get_object_pose(object_id, "universe")
             if pose is None:
+                self._sync_object_frame_from_pose(object_id, world_pose)
                 self._record_scene_trace(
                     event="reconcile_pose_missing",
                     object_id=object_id,
@@ -477,6 +640,8 @@ class ViserHmiServer:
                     pose_in_universe=world_pose,
                 )
                 continue
+
+            self._sync_object_frame_from_pose(object_id, world_pose)
 
             position = tuple(pose["position_m"])
             orientation = tuple(pose["orientation_xyzw"])
@@ -496,6 +661,15 @@ class ViserHmiServer:
                     object_id,
                     radius,
                     position,
+                    frame_path=frame_path,
+                )
+            elif shape_type == "mesh":
+                render = self._scene_renderer.sync_mesh(
+                    object_id,
+                    resource.shape.get("mesh_resource_uri", ""),
+                    tuple(resource.shape.get("mesh_scale", [1.0, 1.0, 1.0])),
+                    position,
+                    orientation,
                     frame_path=frame_path,
                 )
             else:

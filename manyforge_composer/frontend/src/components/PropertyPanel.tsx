@@ -8,6 +8,7 @@ import type {
   CatalogEnumOption,
   CatalogParameter,
   FullDeployment,
+  GripperConfig,
   ModelEndpointCatalog,
   SceneFramesResponse,
   SceneStateResponse,
@@ -71,6 +72,10 @@ const SCENE_OBJECT_ID_NODE_IDS = new Set([
   'detach_object_from_link',
 ]);
 
+const GRIPPER_PRESET_MAX_EFFORT = 40.0;
+const GRIPPER_PRESET_DURATION_S = 1.0;
+const GRIPPER_PRESET_TIMEOUT_S = 0.0;
+
 function enumOptionsForProgramProfile(
   param: CatalogParameter,
   programProfile: string | null | undefined,
@@ -117,6 +122,16 @@ function normalizeSelectOptions(
   return normalized.map((value) => ({ value, label: value }));
 }
 
+function finiteNumber(value: unknown): number | null {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value === 'string' && value.trim().length > 0) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  return null;
+}
 
 function DeploymentModelEndpointAliasEditor({
   currentValue,
@@ -440,6 +455,18 @@ export function PropertyPanel({ onCollapse }: { onCollapse: () => void }) {
     () => Object.keys(deployment?.grippers ?? {}).sort((left, right) => left.localeCompare(right)),
     [deployment?.grippers],
   );
+  const selectedGripper = useMemo<{ id: string; config: GripperConfig } | null>(() => {
+    const grippers = deployment?.grippers ?? {};
+    const configuredId = typeof nodeParams.gripper_id === 'string' ? nodeParams.gripper_id : '';
+    if (configuredId && grippers[configuredId]) {
+      return { id: configuredId, config: grippers[configuredId] };
+    }
+    if (deploymentGripperOptions.length === 1) {
+      const onlyId = deploymentGripperOptions[0];
+      return { id: onlyId, config: grippers[onlyId] };
+    }
+    return null;
+  }, [deployment?.grippers, deploymentGripperOptions, nodeParams.gripper_id]);
 
   const handleDelete = useCallback(() => {
     if (!selectedNodeId) return;
@@ -480,8 +507,17 @@ export function PropertyPanel({ onCollapse }: { onCollapse: () => void }) {
       if (typeof nodeParams.shape_type !== 'string' || nodeParams.shape_type.length === 0) {
         patch.shape_type = 'box';
       }
-      if (!Array.isArray(nodeParams.box_dimensions_m) || nodeParams.box_dimensions_m.length !== 3) {
+      if (
+        (nodeParams.shape_type === undefined || nodeParams.shape_type === 'box')
+        && (!Array.isArray(nodeParams.box_dimensions_m) || nodeParams.box_dimensions_m.length !== 3)
+      ) {
         patch.box_dimensions_m = [0.1, 0.1, 0.1];
+      }
+      if (
+        nodeParams.shape_type === 'mesh'
+        && (!Array.isArray(nodeParams.mesh_scale) || nodeParams.mesh_scale.length !== 3)
+      ) {
+        patch.mesh_scale = [1, 1, 1];
       }
       if (
         nodeParams.pose === undefined
@@ -516,8 +552,28 @@ export function PropertyPanel({ onCollapse }: { onCollapse: () => void }) {
       if (Object.keys(patch).length > 0) {
         handleParamPatch(patch);
       }
+      return;
     }
-  }, [handleParamPatch, isRunMode, nodeParams.box_dimensions_m, nodeParams.frame_id, nodeParams.pose, nodeParams.shape_type, selectedCatalogId, selectedNodeId]);
+
+    if (
+      selectedCatalogId === 'command_gripper'
+      && (typeof nodeParams.gripper_id !== 'string' || nodeParams.gripper_id.trim().length === 0)
+      && deploymentGripperOptions.length === 1
+    ) {
+      handleParamPatch({ gripper_id: deploymentGripperOptions[0] });
+    }
+  }, [
+    deploymentGripperOptions,
+    handleParamPatch,
+    isRunMode,
+    nodeParams.box_dimensions_m,
+    nodeParams.frame_id,
+    nodeParams.gripper_id,
+    nodeParams.pose,
+    nodeParams.shape_type,
+    selectedCatalogId,
+    selectedNodeId,
+  ]);
 
   const isParameterVisible = useCallback((param: CatalogParameter): boolean => {
     if (!profileSatisfies(param.profilesMin, programProfile)) {
@@ -558,6 +614,78 @@ export function PropertyPanel({ onCollapse }: { onCollapse: () => void }) {
           </option>
         ))}
       </select>
+    );
+  };
+
+  const renderGripperPositionEditor = (currentValue: unknown, param: CatalogParameter) => {
+    const numericCurrent = finiteNumber(currentValue);
+    const currentMaxEffort = finiteNumber(nodeParams.max_effort);
+    const currentDuration = finiteNumber(nodeParams.duration_s);
+    const currentTimeout = finiteNumber(nodeParams.timeout_s);
+    const gripper = selectedGripper?.config;
+    const presetEntries = Object.entries(gripper?.srdfPresets ?? {})
+      .map(([name, value]) => ({ name, value: finiteNumber(value) }))
+      .filter((entry): entry is { name: string; value: number } => entry.value != null)
+      .sort((left, right) => left.name.localeCompare(right.name));
+    const matchesPresetOptions = currentMaxEffort === GRIPPER_PRESET_MAX_EFFORT
+      && currentDuration === GRIPPER_PRESET_DURATION_S
+      && currentTimeout === GRIPPER_PRESET_TIMEOUT_S;
+    const matchingPreset = numericCurrent == null || !matchesPresetOptions
+      ? null
+      : presetEntries.find((entry) => Math.abs(numericCurrent - entry.value) < 1e-9) ?? null;
+    const presetValue = matchingPreset ? matchingPreset.name : 'custom';
+
+    return (
+      <div className="space-y-2">
+        <select
+          value={presetValue}
+          onChange={(event) => {
+            const preset = presetEntries.find((entry) => entry.name === event.target.value);
+            if (preset) {
+              handleParamPatch({
+                [param.name]: preset.value,
+                max_effort: GRIPPER_PRESET_MAX_EFFORT,
+                duration_s: GRIPPER_PRESET_DURATION_S,
+                timeout_s: GRIPPER_PRESET_TIMEOUT_S,
+              });
+            }
+          }}
+          disabled={isRunMode || presetEntries.length === 0}
+          className={`w-full bg-gray-700 border border-gray-600 text-white rounded px-2 py-1 text-sm ${isRunMode || presetEntries.length === 0 ? 'opacity-50 cursor-not-allowed bg-gray-800' : ''}`}
+        >
+          <option value="custom">Custom position</option>
+          {presetEntries.map((preset) => (
+            <option key={preset.name} value={preset.name}>
+              {preset.name}
+            </option>
+          ))}
+        </select>
+        <NumericParamEditor
+          currentValue={currentValue}
+          isRunMode={isRunMode}
+          onCommit={(value) => handleParamChange(param.name, value)}
+          paramType="float"
+          constraints={param.constraints}
+        />
+        {selectedGripper && (
+          <div className="text-[11px] text-gray-500">
+            {presetEntries.length > 0 ? (
+              <>
+                Presets are parsed from SRDF group states for gripper <span className="text-gray-300">{selectedGripper.id}</span>; selecting one also sets max effort, duration, and timeout.
+              </>
+            ) : (
+              <>
+                No SRDF group states are available for gripper <span className="text-gray-300">{selectedGripper.id}</span>; use a custom position.
+              </>
+            )}
+          </div>
+        )}
+        {!selectedGripper && deploymentGripperOptions.length > 0 && (
+          <div className="text-[11px] text-gray-500">
+            Select a gripper id to check for SRDF presets.
+          </div>
+        )}
+      </div>
     );
   };
   const renderSceneObjectIdEditor = (param: CatalogParameter, currentValue: unknown) => {
@@ -928,6 +1056,14 @@ export function PropertyPanel({ onCollapse }: { onCollapse: () => void }) {
                   ? nodeParams.sphere_radius_m
                   : 0.05;
               }
+              if (nextShape === 'mesh') {
+                patch.mesh_resource_uri = typeof nodeParams.mesh_resource_uri === 'string'
+                  ? nodeParams.mesh_resource_uri
+                  : '';
+                patch.mesh_scale = Array.isArray(nodeParams.mesh_scale) && nodeParams.mesh_scale.length === 3
+                  ? nodeParams.mesh_scale
+                  : [1, 1, 1];
+              }
               handleParamPatch(patch);
             }}
             disabled={isRunMode}
@@ -935,6 +1071,7 @@ export function PropertyPanel({ onCollapse }: { onCollapse: () => void }) {
           >
             <option value="box">box</option>
             <option value="sphere">sphere</option>
+            <option value="mesh">mesh</option>
           </select>
         );
       }
@@ -999,6 +1136,19 @@ export function PropertyPanel({ onCollapse }: { onCollapse: () => void }) {
         (value) => handleParamChange(param.name, value),
         'Optional gripper id',
       );
+    }
+
+    if (selectedCatalogId === 'command_gripper' && param.name === 'gripper_id') {
+      return renderConstrainedSelect(
+        currentValue,
+        deploymentGripperOptions,
+        (value) => handleParamChange(param.name, value),
+        'Select gripper',
+      );
+    }
+
+    if (selectedCatalogId === 'command_gripper' && param.name === 'position') {
+      return renderGripperPositionEditor(currentValue, param);
     }
 
     switch (param.type) {

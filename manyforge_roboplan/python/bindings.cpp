@@ -79,6 +79,70 @@ py::dict pose_to_python(const Pose3DTO& pose) {
   return d;
 }
 
+Pose3DTO pose_from_python(const py::dict& pose_dict) {
+  Pose3DTO pose{};
+  pose.position_m = {0.0, 0.0, 0.0};
+  pose.orientation = {0.0, 0.0, 0.0, 1.0};
+  if (pose_dict.contains("position_m")) {
+    auto pos = pose_dict["position_m"].cast<std::vector<double>>();
+    if (pos.size() != 3) {
+      throw std::invalid_argument("position_m must have exactly 3 elements");
+    }
+    pose.position_m = {pos[0], pos[1], pos[2]};
+  }
+  if (pose_dict.contains("orientation_xyzw")) {
+    auto orient = pose_dict["orientation_xyzw"].cast<std::vector<double>>();
+    if (orient.size() != 4) {
+      throw std::invalid_argument("orientation_xyzw must have exactly 4 elements");
+    }
+    pose.orientation = {orient[0], orient[1], orient[2], orient[3]};
+  }
+  return pose;
+}
+
+std::vector<SupportContactDTO> support_contacts_from_python(const py::dict& request) {
+  std::vector<SupportContactDTO> contacts;
+  if (!request.contains("support_contacts") || request["support_contacts"].is_none()) {
+    return contacts;
+  }
+  if (!py::isinstance<py::list>(request["support_contacts"])) {
+    throw std::invalid_argument("support_contacts must be a list");
+  }
+  for (const auto item : request["support_contacts"].cast<py::list>()) {
+    if (!py::isinstance<py::dict>(item)) {
+      throw std::invalid_argument("support_contacts entries must be dictionaries");
+    }
+    const py::dict contact_dict = py::reinterpret_borrow<py::dict>(item);
+    if (!contact_dict.contains("support_object_id")) {
+      throw std::invalid_argument(
+          "support_contacts entries require support_object_id");
+    }
+    SupportContactDTO contact;
+    contact.support_object_id =
+        contact_dict["support_object_id"].cast<std::string>();
+    if (contact.support_object_id.empty()) {
+      throw std::invalid_argument("support_object_id must not be empty");
+    }
+    if (contact_dict.contains("max_start_penetration_m")) {
+      contact.max_start_penetration_m =
+          contact_dict["max_start_penetration_m"].cast<double>();
+      if (contact.max_start_penetration_m < 0.0) {
+        throw std::invalid_argument("max_start_penetration_m must be >= 0");
+      }
+    }
+    if (contact_dict.contains("require_separation_by_end")) {
+      contact.require_separation_by_end =
+          contact_dict["require_separation_by_end"].cast<bool>();
+      if (!contact.require_separation_by_end) {
+        throw std::invalid_argument(
+            "require_separation_by_end=false is not supported");
+      }
+    }
+    contacts.push_back(std::move(contact));
+  }
+  return contacts;
+}
+
 // Helper: convert RobotStateDTO to Python dict
 py::dict robot_state_to_python(const RobotStateDTO& state) {
   py::dict d;
@@ -633,6 +697,10 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
       .def("invalidate_trajectories", [](NativeKernelBundle& self) {
         self.cache->invalidate_all();
       })
+      .def("set_robot_base_pose", [](NativeKernelBundle& self, py::dict pose) {
+        self.context->set_robot_base_pose(pose_from_python(pose));
+        self.cache->invalidate_all();
+      }, py::arg("pose"))
       .def("scene_edit", [](NativeKernelBundle& self, py::dict request) -> py::dict {
         py::dict result;
         std::string op = request["operation"].cast<std::string>();
@@ -641,6 +709,7 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
           AddObjectRequestDTO req;
           req.object_id = request["object_id"].cast<std::string>();
           req.frame_id = request.attr("get")("frame_id", "universe").cast<std::string>();
+          req.support_contacts = support_contacts_from_python(request);
 
           // Pose
           if (request.contains("pose_position_m")) {
@@ -677,6 +746,25 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
             }
             double radius = request["sphere_radius_m"].cast<double>();
             req.shape = SphereShapeDTO{radius};
+          } else if (shape_type == "mesh") {
+            if (!request.contains("mesh_resource_uri")) {
+              result["success"] = false;
+              result["error"] = "add with shape_type=mesh requires mesh_resource_uri";
+              return result;
+            }
+            MeshShapeDTO mesh;
+            mesh.resource_uri = request["mesh_resource_uri"].cast<std::string>();
+            mesh.scale = {1.0, 1.0, 1.0};
+            if (request.contains("mesh_scale")) {
+              auto scale = request["mesh_scale"].cast<std::vector<double>>();
+              if (scale.size() != 3) {
+                result["success"] = false;
+                result["error"] = "mesh_scale must have exactly 3 elements";
+                return result;
+              }
+              mesh.scale = {scale[0], scale[1], scale[2]};
+            }
+            req.shape = mesh;
           } else {
             result["success"] = false;
             result["error"] = "Unsupported shape_type for native backend: " + shape_type;

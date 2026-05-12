@@ -123,6 +123,13 @@ _SCENE_RESOURCE_SCHEMA: dict[str, Any] = {
                 "sphere_radius_m": {"type": "number"},
                 "cylinder_radius_m": {"type": "number"},
                 "cylinder_height_m": {"type": "number"},
+                "mesh_resource_uri": {"type": "string", "minLength": 1},
+                "mesh_scale": {
+                    "type": "array",
+                    "items": {"type": "number"},
+                    "minItems": 3,
+                    "maxItems": 3,
+                },
             },
         },
         "pose": {
@@ -192,12 +199,12 @@ _SCENE_DRAFT_SINGLE_OBJECT_SCHEMA: dict[str, Any] = {
         "pose": _SCENE_RESOURCE_SCHEMA["properties"]["pose"],
         "shapeType": {
             "type": "string",
-            "enum": ["box", "sphere"],
+            "enum": ["box", "sphere", "mesh"],
             "description": "Convenience alias for shape.type.",
         },
         "shape_type": {
             "type": "string",
-            "enum": ["box", "sphere"],
+            "enum": ["box", "sphere", "mesh"],
             "description": "Convenience alias for shape.type.",
         },
         "size": {
@@ -235,6 +242,20 @@ _SCENE_DRAFT_SINGLE_OBJECT_SCHEMA: dict[str, Any] = {
             "description": "Sphere radius in meters.",
         },
         "sphere_radius_m": _SCENE_RESOURCE_SCHEMA["properties"]["shape"]["properties"]["sphere_radius_m"],
+        "meshResourceUri": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Mesh resource URI or path.",
+        },
+        "mesh_resource_uri": _SCENE_RESOURCE_SCHEMA["properties"]["shape"]["properties"]["mesh_resource_uri"],
+        "meshScale": {
+            "type": "array",
+            "items": {"type": "number"},
+            "minItems": 3,
+            "maxItems": 3,
+            "description": "Mesh scale [x, y, z].",
+        },
+        "mesh_scale": _SCENE_RESOURCE_SCHEMA["properties"]["shape"]["properties"]["mesh_scale"],
         "position": {
             "type": "array",
             "items": {"type": "number"},

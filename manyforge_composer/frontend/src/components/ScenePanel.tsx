@@ -14,6 +14,7 @@ import type {
 const SCENE_MUTATED_EVENT = 'manyforge:scene-mutated';
 const SCENE_SYNC_STATUS_EVENT = 'manyforge:scene-sync-status';
 const SCENE_SYNC_ERROR_PREFIX = 'Live scene sync failed: ';
+type SceneShapeType = 'box' | 'sphere' | 'mesh';
 
 function emitSceneMutated(): void {
   window.dispatchEvent(new CustomEvent(SCENE_MUTATED_EVENT));
@@ -219,6 +220,10 @@ function shapeSummary(shape: Record<string, unknown> | null | undefined): string
     const radius = Number(shape.sphere_radius_m ?? 0).toFixed(3);
     return `sphere (r=${radius})`;
   }
+  if (shape.type === 'mesh') {
+    const uri = typeof shape.mesh_resource_uri === 'string' ? shape.mesh_resource_uri : '?';
+    return `mesh (${uri})`;
+  }
   return String(shape.type);
 }
 
@@ -232,10 +237,11 @@ function sameShape(
 function buildAddPayload(resource: ProgramSceneResource): SceneEditRequest {
   const pose = sceneResourcePose(resource);
   const shape = resource.shape ?? {};
+  const shapeType = shape.type === 'sphere' || shape.type === 'mesh' ? shape.type : 'box';
   return {
     operation: 'add',
     object_id: resource.objectId,
-    shape_type: shape.type === 'sphere' ? 'sphere' : 'box',
+    shape_type: shapeType,
     box_dimensions_m:
       shape.type === 'box' && Array.isArray(shape.box_dimensions_m)
         ? (shape.box_dimensions_m as number[])
@@ -243,6 +249,14 @@ function buildAddPayload(resource: ProgramSceneResource): SceneEditRequest {
     sphere_radius_m:
       shape.type === 'sphere' && Number.isFinite(Number(shape.sphere_radius_m))
         ? Number(shape.sphere_radius_m)
+        : undefined,
+    mesh_resource_uri:
+      shape.type === 'mesh' && typeof shape.mesh_resource_uri === 'string'
+        ? shape.mesh_resource_uri
+        : undefined,
+    mesh_scale:
+      shape.type === 'mesh' && Array.isArray(shape.mesh_scale)
+        ? (shape.mesh_scale as number[])
         : undefined,
     pose_position_m: pose.position,
     pose_orientation_xyzw: buildPoseOrientationQuaternion(resource.pose ?? {}),
@@ -282,20 +296,28 @@ function AuthoredSceneCard({
   resource,
   frameOptions,
   disabled,
+  hmiAvailable,
+  objectFrameVisible,
   onUpdate,
   onRemove,
+  onObjectFrameVisibilityChange,
 }: {
   resource: ProgramSceneResource;
   frameOptions: string[];
   disabled: boolean;
+  hmiAvailable: boolean;
+  objectFrameVisible: boolean;
   onUpdate: (previousObjectId: string, resource: ProgramSceneResource) => void;
   onRemove: (objectId: string) => void;
+  onObjectFrameVisibilityChange: (objectId: string, visible: boolean) => void;
 }) {
   const resourceSignature = JSON.stringify(resource);
   const initialPose = sceneResourcePose(resource);
   const [objectId, setObjectId] = useState(resource.objectId);
-  const [shapeType, setShapeType] = useState<'box' | 'sphere'>(
-    resource.shape?.type === 'sphere' ? 'sphere' : 'box',
+  const [shapeType, setShapeType] = useState<SceneShapeType>(
+    resource.shape?.type === 'sphere' || resource.shape?.type === 'mesh'
+      ? resource.shape.type
+      : 'box',
   );
   const [boxDimensions, setBoxDimensions] = useState<number[]>(
     Array.isArray(resource.shape?.box_dimensions_m)
@@ -305,6 +327,14 @@ function AuthoredSceneCard({
   const [sphereRadius, setSphereRadius] = useState<number>(
     Number(resource.shape?.sphere_radius_m ?? 0.05),
   );
+  const [meshResourceUri, setMeshResourceUri] = useState<string>(
+    typeof resource.shape?.mesh_resource_uri === 'string' ? resource.shape.mesh_resource_uri : '',
+  );
+  const [meshScale, setMeshScale] = useState<number[]>(
+    Array.isArray(resource.shape?.mesh_scale)
+      ? (resource.shape.mesh_scale as number[]).map((value) => Number(value))
+      : [1, 1, 1],
+  );
   const [frameId, setFrameId] = useState(initialPose.frameId);
   const [position, setPosition] = useState(initialPose.position);
   const [rpyDegrees, setRpyDegrees] = useState(initialPose.rpyDegrees);
@@ -312,13 +342,25 @@ function AuthoredSceneCard({
   useEffect(() => {
     const pose = sceneResourcePose(resource);
     setObjectId(resource.objectId);
-    setShapeType(resource.shape?.type === 'sphere' ? 'sphere' : 'box');
+    setShapeType(
+      resource.shape?.type === 'sphere' || resource.shape?.type === 'mesh'
+        ? resource.shape.type
+        : 'box',
+    );
     setBoxDimensions(
       Array.isArray(resource.shape?.box_dimensions_m)
         ? (resource.shape.box_dimensions_m as number[]).map((value) => Number(value))
         : [0.05, 0.05, 0.1],
     );
     setSphereRadius(Number(resource.shape?.sphere_radius_m ?? 0.05));
+    setMeshResourceUri(
+      typeof resource.shape?.mesh_resource_uri === 'string' ? resource.shape.mesh_resource_uri : '',
+    );
+    setMeshScale(
+      Array.isArray(resource.shape?.mesh_scale)
+        ? (resource.shape.mesh_scale as number[]).map((value) => Number(value))
+        : [1, 1, 1],
+    );
     setFrameId(pose.frameId);
     setPosition(pose.position);
     setRpyDegrees(pose.rpyDegrees);
@@ -328,9 +370,15 @@ function AuthoredSceneCard({
     const shape =
       shapeType === 'box'
         ? { type: 'box', box_dimensions_m: boxDimensions.map((value) => Number(value)) }
-        : { type: 'sphere', sphere_radius_m: Number(sphereRadius) };
+        : shapeType === 'sphere'
+          ? { type: 'sphere', sphere_radius_m: Number(sphereRadius) }
+          : {
+              type: 'mesh',
+              mesh_resource_uri: meshResourceUri.trim(),
+              mesh_scale: meshScale.map((value) => Number(value)),
+            };
     onUpdate(resource.objectId, buildSceneResource(objectId.trim(), shape, frameId, position, rpyDegrees));
-  }, [boxDimensions, frameId, objectId, onUpdate, position, resource.objectId, rpyDegrees, shapeType, sphereRadius]);
+  }, [boxDimensions, frameId, meshResourceUri, meshScale, objectId, onUpdate, position, resource.objectId, rpyDegrees, shapeType, sphereRadius]);
 
   return (
     <div className="rounded border border-gray-700 bg-gray-900/40 p-3">
@@ -339,14 +387,26 @@ function AuthoredSceneCard({
           <div className="text-sm font-medium text-gray-100">{resource.objectId}</div>
           <div className="text-[11px] text-gray-500">{shapeSummary(resource.shape)}</div>
         </div>
-        <button
-          type="button"
-          onClick={() => onRemove(resource.objectId)}
-          disabled={disabled}
-          className="rounded border border-red-700 px-2 py-1 text-xs text-red-200 hover:bg-red-900/40 disabled:cursor-not-allowed disabled:opacity-50"
-        >
-          Remove
-        </button>
+        <div className="flex flex-col items-end gap-2">
+          <button
+            type="button"
+            onClick={() => onRemove(resource.objectId)}
+            disabled={disabled}
+            className="rounded border border-red-700 px-2 py-1 text-xs text-red-200 hover:bg-red-900/40 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            Remove
+          </button>
+          <label className="flex items-center gap-2 text-[11px] text-gray-400">
+            <input
+              type="checkbox"
+              checked={objectFrameVisible}
+              onChange={(event) => onObjectFrameVisibilityChange(resource.objectId, event.target.checked)}
+              disabled={!hmiAvailable}
+              className="h-3 w-3"
+            />
+            <span>Gizmo frame</span>
+          </label>
+        </div>
       </div>
 
       <TextInput
@@ -360,12 +420,13 @@ function AuthoredSceneCard({
         <span className="text-[11px] text-gray-400">Shape</span>
         <select
           value={shapeType}
-          onChange={(event) => setShapeType(event.target.value as 'box' | 'sphere')}
+          onChange={(event) => setShapeType(event.target.value as SceneShapeType)}
           disabled={disabled}
           className="mt-0.5 w-full rounded border border-gray-600 bg-gray-700 px-2 py-1 text-sm text-gray-200 focus:border-blue-500 focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
         >
           <option value="box">box</option>
           <option value="sphere">sphere</option>
+          <option value="mesh">mesh</option>
         </select>
       </label>
 
@@ -385,7 +446,7 @@ function AuthoredSceneCard({
             />
           ))}
         </div>
-      ) : (
+      ) : shapeType === 'sphere' ? (
         <div className="mt-2">
           <NumericInput
             label="Radius"
@@ -393,6 +454,30 @@ function AuthoredSceneCard({
             onChange={setSphereRadius}
             disabled={disabled}
           />
+        </div>
+      ) : (
+        <div className="mt-2 space-y-2">
+          <TextInput
+            label="Mesh URI"
+            value={meshResourceUri}
+            onChange={setMeshResourceUri}
+            disabled={disabled}
+          />
+          <div className="grid grid-cols-3 gap-2">
+            {meshScale.map((value, index) => (
+              <NumericInput
+                key={`mesh-scale-${resource.objectId}-${index}`}
+                label={`Scale ${['x', 'y', 'z'][index]}`}
+                value={value}
+                onChange={(next) => {
+                  const updated = [...meshScale];
+                  updated[index] = next;
+                  setMeshScale(updated);
+                }}
+                disabled={disabled}
+              />
+            ))}
+          </div>
         </div>
       )}
 
@@ -457,7 +542,15 @@ function AuthoredSceneCard({
   );
 }
 
-function LiveSceneObjectCard({ objectState }: { objectState: SceneObjectState }) {
+function LiveSceneObjectCard({
+  objectState,
+  hmiAvailable,
+  onObjectFrameVisibilityChange,
+}: {
+  objectState: SceneObjectState;
+  hmiAvailable: boolean;
+  onObjectFrameVisibilityChange: (objectId: string, visible: boolean) => void;
+}) {
   const pose = objectState.pose_in_universe as Record<string, unknown> | undefined;
   const position = readPoseVector(pose, 'position_m', 3) ?? [0, 0, 0];
   const rpyDegrees = quaternionToRpyDegrees(
@@ -472,9 +565,21 @@ function LiveSceneObjectCard({ objectState }: { objectState: SceneObjectState })
           <div className="text-sm font-medium text-gray-100">{objectState.object_id}</div>
           <div className="text-[11px] text-gray-500">{shapeSummary(objectState.shape as Record<string, unknown> | null | undefined)}</div>
         </div>
-        <span className={`rounded border px-2 py-1 text-[10px] font-semibold tracking-wide ${badge.classes}`}>
-          {badge.label}
-        </span>
+        <div className="flex flex-col items-end gap-2">
+          <span className={`rounded border px-2 py-1 text-[10px] font-semibold tracking-wide ${badge.classes}`}>
+            {badge.label}
+          </span>
+          <label className="flex items-center gap-2 text-[11px] text-gray-400">
+            <input
+              type="checkbox"
+              checked={objectState.viewer_frame_visible}
+              onChange={(event) => onObjectFrameVisibilityChange(objectState.object_id, event.target.checked)}
+              disabled={!hmiAvailable}
+              className="h-3 w-3"
+            />
+            <span>Gizmo frame</span>
+          </label>
+        </div>
       </div>
       <div className="space-y-1 text-[11px] text-gray-400">
         <div>Persistable: {objectState.persistable ? 'yes' : 'no'}</div>
@@ -595,13 +700,16 @@ export function ScenePanel() {
   const [sceneState, setSceneState] = useState<SceneStateResponse | null>(null);
   const [frames, setFrames] = useState<SceneFrameState[]>([]);
   const [hmiAvailable, setHmiAvailable] = useState(false);
+  const [frameGizmoSizeM, setFrameGizmoSizeM] = useState(0.1);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [syncError, setSyncError] = useState<string | null>(null);
   const [newObjectId, setNewObjectId] = useState('');
-  const [newShapeType, setNewShapeType] = useState<'box' | 'sphere'>('box');
+  const [newShapeType, setNewShapeType] = useState<SceneShapeType>('box');
   const [newBoxDimensions, setNewBoxDimensions] = useState<number[]>([0.05, 0.05, 0.1]);
   const [newSphereRadius, setNewSphereRadius] = useState(0.05);
+  const [newMeshResourceUri, setNewMeshResourceUri] = useState('');
+  const [newMeshScale, setNewMeshScale] = useState<number[]>([1, 1, 1]);
   const [newFrameId, setNewFrameId] = useState('base_link');
   const [newPosition, setNewPosition] = useState<number[]>([0.4, 0.0, 0.1]);
   const [newRpyDegrees, setNewRpyDegrees] = useState<number[]>([0, 0, 0]);
@@ -617,6 +725,7 @@ export function ScenePanel() {
       setSceneState(nextState);
       setFrames(frameState.frames);
       setHmiAvailable(frameState.hmiAvailable);
+      setFrameGizmoSizeM(frameState.frameGizmoSizeM ?? 0.1);
       setError(null);
     } catch (refreshError) {
       setError((refreshError as Error).message);
@@ -655,6 +764,10 @@ export function ScenePanel() {
     frames.forEach((frame) => names.add(frame.name));
     return Array.from(names).sort();
   }, [frames]);
+  const liveObjectsById = useMemo(
+    () => new Map((sceneState?.objects ?? []).map((objectState) => [objectState.object_id, objectState])),
+    [sceneState],
+  );
 
   const replaceSceneResource = useCallback(
     (previousObjectId: string, updated: ProgramSceneResource) => {
@@ -680,7 +793,13 @@ export function ScenePanel() {
     const shape =
       newShapeType === 'box'
         ? { type: 'box', box_dimensions_m: newBoxDimensions.map((value) => Number(value)) }
-        : { type: 'sphere', sphere_radius_m: Number(newSphereRadius) };
+        : newShapeType === 'sphere'
+          ? { type: 'sphere', sphere_radius_m: Number(newSphereRadius) }
+          : {
+              type: 'mesh',
+              mesh_resource_uri: newMeshResourceUri.trim(),
+              mesh_scale: newMeshScale.map((value) => Number(value)),
+            };
     const nextResource = buildSceneResource(newObjectId.trim(), shape, newFrameId, newPosition, newRpyDegrees);
     const nextScene = sceneResources.filter((resource) => resource.objectId !== nextResource.objectId);
     nextScene.push(nextResource);
@@ -691,6 +810,8 @@ export function ScenePanel() {
   }, [
     newBoxDimensions,
     newFrameId,
+    newMeshResourceUri,
+    newMeshScale,
     newObjectId,
     newPosition,
     newRpyDegrees,
@@ -705,6 +826,36 @@ export function ScenePanel() {
       setError(null);
       try {
         await api.scene.setFrameVisibility(frameName, visible);
+        await refresh();
+      } catch (toggleError) {
+        setError((toggleError as Error).message);
+      }
+    },
+    [refresh],
+  );
+
+  const updateFrameGizmoSize = useCallback(
+    async (axesLengthM: number) => {
+      if (!Number.isFinite(axesLengthM) || axesLengthM <= 0) {
+        return;
+      }
+      setFrameGizmoSizeM(axesLengthM);
+      setError(null);
+      try {
+        await api.scene.setFrameGizmoSize(axesLengthM);
+        await refresh();
+      } catch (sizeError) {
+        setError((sizeError as Error).message);
+      }
+    },
+    [refresh],
+  );
+
+  const toggleObjectFrameVisibility = useCallback(
+    async (objectId: string, visible: boolean) => {
+      setError(null);
+      try {
+        await api.scene.setObjectFrameVisibility(objectId, visible);
         await refresh();
       } catch (toggleError) {
         setError((toggleError as Error).message);
@@ -765,6 +916,15 @@ export function ScenePanel() {
             HMI frame toggles require the Viser HMI to be running.
           </div>
         )}
+        <div className="rounded border border-gray-700 bg-gray-900/40 p-3">
+          <NumericInput
+            label="Frame gizmo size (m)"
+            value={frameGizmoSizeM}
+            onChange={(next) => void updateFrameGizmoSize(next)}
+            step="0.01"
+            disabled={!hmiAvailable}
+          />
+        </div>
         <div className="space-y-2">
           {frames.length === 0 && (
             <div className="rounded border border-gray-700 bg-gray-900/40 p-3 text-xs text-gray-500">
@@ -818,12 +978,13 @@ export function ScenePanel() {
               <span className="text-[11px] text-gray-400">Shape</span>
               <select
                 value={newShapeType}
-                onChange={(event) => setNewShapeType(event.target.value as 'box' | 'sphere')}
+                onChange={(event) => setNewShapeType(event.target.value as SceneShapeType)}
                 disabled={editLocked}
                 className="mt-0.5 w-full rounded border border-gray-600 bg-gray-700 px-2 py-1 text-sm text-gray-200 focus:border-blue-500 focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
               >
                 <option value="box">box</option>
                 <option value="sphere">sphere</option>
+                <option value="mesh">mesh</option>
               </select>
             </label>
             {newShapeType === 'box' ? (
@@ -842,13 +1003,38 @@ export function ScenePanel() {
                   />
                 ))}
               </div>
-            ) : (
+            ) : newShapeType === 'sphere' ? (
               <NumericInput
                 label="Radius"
                 value={newSphereRadius}
                 onChange={setNewSphereRadius}
                 disabled={editLocked}
               />
+            ) : (
+              <div className="space-y-2">
+                <TextInput
+                  label="Mesh URI"
+                  value={newMeshResourceUri}
+                  onChange={setNewMeshResourceUri}
+                  disabled={editLocked}
+                  placeholder="file:///workspace/scene/part.obj"
+                />
+                <div className="grid grid-cols-3 gap-2">
+                  {newMeshScale.map((value, index) => (
+                    <NumericInput
+                      key={`new-mesh-scale-${index}`}
+                      label={`Scale ${['x', 'y', 'z'][index]}`}
+                      value={value}
+                      onChange={(next) => {
+                        const updated = [...newMeshScale];
+                        updated[index] = next;
+                        setNewMeshScale(updated);
+                      }}
+                      disabled={editLocked}
+                    />
+                  ))}
+                </div>
+              </div>
             )}
             <label className="block">
               <span className="text-[11px] text-gray-400">Reference Frame</span>
@@ -930,8 +1116,11 @@ export function ScenePanel() {
             resource={resource}
             frameOptions={frameOptions}
             disabled={editLocked}
+            hmiAvailable={hmiAvailable}
+            objectFrameVisible={liveObjectsById.get(resource.objectId)?.viewer_frame_visible ?? false}
             onUpdate={replaceSceneResource}
             onRemove={removeSceneResource}
+            onObjectFrameVisibilityChange={toggleObjectFrameVisibility}
           />
         ))}
       </Section>
@@ -946,6 +1135,8 @@ export function ScenePanel() {
           <LiveSceneObjectCard
             key={objectState.object_id}
             objectState={objectState}
+            hmiAvailable={hmiAvailable}
+            onObjectFrameVisibilityChange={toggleObjectFrameVisibility}
           />
         ))}
       </Section>

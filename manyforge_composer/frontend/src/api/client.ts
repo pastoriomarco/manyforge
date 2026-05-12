@@ -21,7 +21,9 @@ import type {
   SceneEditRequest,
   SceneEditResponse,
   SceneFramesResponse,
+  SceneFrameGizmoSizeResponse,
   SceneFrameVisibilityResponse,
+  SceneObjectFrameVisibilityResponse,
   AssistantChatRequest,
   AssistantChatResponse,
   AssistantProviderCatalog,
@@ -190,6 +192,10 @@ export const api = {
     frames: () => request<SceneFramesResponse>('GET', '/api/scene/frames'),
     setFrameVisibility: (frameName: string, visible: boolean) =>
       request<SceneFrameVisibilityResponse>('POST', '/api/scene/frames/visibility', { frameName, visible }),
+    setFrameGizmoSize: (axesLengthM: number) =>
+      request<SceneFrameGizmoSizeResponse>('POST', '/api/scene/frames/gizmo-size', { axesLengthM }),
+    setObjectFrameVisibility: (objectId: string, visible: boolean) =>
+      request<SceneObjectFrameVisibilityResponse>('POST', '/api/scene/objects/frame-visibility', { objectId, visible }),
   },
   assistant: {
     providers: () =>

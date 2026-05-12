@@ -4,10 +4,14 @@
 #include <cmath>
 #include <cstdlib>
 #include <fmt/format.h>
+#include <iostream>
+#include <map>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <utility>
 #include <variant>
+#include <vector>
 
 namespace {
 bool planner_debug_enabled() {
@@ -28,6 +32,124 @@ void planner_debug(fmt::format_string<Args...> format, Args&&... args) {
     return;
   }
   fmt::print(stderr, format, std::forward<Args>(args)...);
+}
+
+struct CollisionDiagnostics {
+  std::vector<std::string> pairs;
+  std::string raw_output;
+};
+
+struct TcpSpeedCheck {
+  double max_speed_mps = 0.0;
+  size_t segment_index = 0;
+  double segment_dt_s = 0.0;
+};
+
+std::string join_strings(const std::vector<std::string>& values,
+                         const std::string& separator) {
+  std::string result;
+  for (const auto& value : values) {
+    if (!result.empty()) {
+      result += separator;
+    }
+    result += value;
+  }
+  return result;
+}
+
+CollisionDiagnostics collect_collision_diagnostics(
+    const std::shared_ptr<roboplan::Scene>& scene,
+    const Eigen::VectorXd& q) {
+  CollisionDiagnostics diagnostics;
+
+  std::ostringstream capture;
+  auto* previous = std::cout.rdbuf(capture.rdbuf());
+  scene->hasCollisions(q, true);
+  std::cout.rdbuf(previous);
+
+  diagnostics.raw_output = capture.str();
+  if (!diagnostics.raw_output.empty()) {
+    std::cout << diagnostics.raw_output;
+  }
+
+  std::istringstream lines(diagnostics.raw_output);
+  std::string line;
+  const std::string prefix = "Collision detected between ";
+  while (std::getline(lines, line)) {
+    if (line.rfind(prefix, 0) != 0) {
+      continue;
+    }
+    std::string pair = line.substr(prefix.size());
+    const std::string needle = " and ";
+    const auto split = pair.find(needle);
+    if (split != std::string::npos) {
+      pair.replace(split, needle.size(), " <-> ");
+    }
+    diagnostics.pairs.push_back(pair);
+  }
+  return diagnostics;
+}
+
+std::string collision_message_with_pairs(
+    const std::string& message,
+    const CollisionDiagnostics& diagnostics) {
+  if (diagnostics.pairs.empty()) {
+    return message;
+  }
+  return message + ": " + join_strings(diagnostics.pairs, "; ");
+}
+
+std::map<std::string, std::string> collision_details(
+    std::string failure_stage,
+    bool start_in_collision,
+    bool goal_in_collision,
+    const CollisionDiagnostics& diagnostics) {
+  std::map<std::string, std::string> details;
+  details["failure_stage"] = std::move(failure_stage);
+  details["start_in_collision"] = start_in_collision ? "true" : "false";
+  details["goal_in_collision"] = goal_in_collision ? "true" : "false";
+  details["collision_pair_count"] = std::to_string(diagnostics.pairs.size());
+  if (!diagnostics.pairs.empty()) {
+    details["collision_pairs"] = join_strings(diagnostics.pairs, "; ");
+  }
+  for (size_t i = 0; i < diagnostics.pairs.size(); ++i) {
+    details["collision_pair_" + std::to_string(i + 1)] = diagnostics.pairs[i];
+  }
+  return details;
+}
+
+TcpSpeedCheck compute_tcp_speed_check(
+    const std::shared_ptr<roboplan::Scene>& scene,
+    const std::string& group_name,
+    const roboplan::JointTrajectory& trajectory,
+    const std::string& tcp_frame) {
+  TcpSpeedCheck check;
+  Eigen::Vector3d prev_pos = Eigen::Vector3d::Zero();
+  bool have_prev = false;
+
+  for (size_t i = 0; i < trajectory.times.size(); ++i) {
+    const Eigen::VectorXd q_full =
+        scene->toFullJointPositions(group_name, trajectory.positions[i]);
+    Eigen::Matrix4d tform = scene->forwardKinematics(q_full, tcp_frame);
+    Eigen::Vector3d pos = tform.block<3, 1>(0, 3);
+
+    if (have_prev && i > 0) {
+      const double dt = trajectory.times[i] - trajectory.times[i - 1];
+      if (dt > 1e-9) {
+        const double speed = (pos - prev_pos).norm() / dt;
+        if (speed > check.max_speed_mps) {
+          check.max_speed_mps = speed;
+          check.segment_index = i - 1;
+          check.segment_dt_s = dt;
+        }
+      }
+    }
+
+    prev_pos = pos;
+    have_prev = true;
+  }
+
+  return check;
 }
 
 // Rotation matrix to RPY (ZYX convention, in degrees)
@@ -103,14 +225,15 @@ core::PlanResultDTO RoboPlanPlannerBackend::plan(const core::PlanRequestDTO& req
     }
 
     if (start_collision) {
-      scene_->hasCollisions(start_positions_full, true);
+      auto diagnostics =
+          collect_collision_diagnostics(scene_, start_positions_full);
+      const std::string message = collision_message_with_pairs(
+          "Planning preview rejected: start state is already in collision",
+          diagnostics);
       result.error = core::ErrorDTO{
           core::kErrorPlanningFailed,
-          "Planning preview rejected: start state is already in collision",
-          {
-              {"failure_stage", "start_state"},
-              {"start_in_collision", "true"},
-          },
+          message,
+          collision_details("start_state", true, false, diagnostics),
       };
       return result;
     }
@@ -187,15 +310,15 @@ core::PlanResultDTO RoboPlanPlannerBackend::plan(const core::PlanRequestDTO& req
       planner_debug("[PLANNER] goal in collision: {}\n", goal_collision ? "YES" : "no");
 
       if (goal_collision) {
-        scene_->hasCollisions(goal_positions_full, true);
+        auto diagnostics =
+            collect_collision_diagnostics(scene_, goal_positions_full);
+        const std::string message = collision_message_with_pairs(
+            "Planning preview rejected: goal state is in collision",
+            diagnostics);
         result.error = core::ErrorDTO{
             core::kErrorPlanningFailed,
-            "Planning preview rejected: goal state is in collision",
-            {
-                {"failure_stage", "goal_state"},
-                {"start_in_collision", "false"},
-                {"goal_in_collision", "true"},
-            },
+            message,
+            collision_details("goal_state", false, true, diagnostics),
         };
         return result;
       }
@@ -266,12 +389,15 @@ core::PlanResultDTO RoboPlanPlannerBackend::plan(const core::PlanRequestDTO& req
     const double tcp_limit = request.speed_profile.max_tcp_linear_speed_mps.value_or(0.0);
     const std::string& tcp_frame = request.tcp_frame;
     double vel_scale = request.speed_profile.velocity_scale;
-    constexpr int kMaxTcpIterations = 5;
+    constexpr int kMaxTcpIterations = 32;
     constexpr double kTcpSpeedMargin = 0.99;  // aim slightly under the limit
 
     roboplan::JointTrajectory final_traj;
+    TcpSpeedCheck final_tcp_check;
+    int tcp_iterations_used = 0;
 
     for (int iter = 0; iter < kMaxTcpIterations; ++iter) {
+      tcp_iterations_used = iter + 1;
       auto traj_result = toppra_->generate(
           smoothed_path, 0.01,
           roboplan::SplineFittingMode::Hermite,
@@ -291,44 +417,45 @@ core::PlanResultDTO RoboPlanPlannerBackend::plan(const core::PlanRequestDTO& req
         break;
       }
 
-      // Compute max TCP linear speed across trajectory segments
-      double max_tcp_speed = 0.0;
-      Eigen::Vector3d prev_pos = Eigen::Vector3d::Zero();
-      bool have_prev = false;
-
-      for (size_t i = 0; i < final_traj.times.size(); ++i) {
-        const Eigen::VectorXd q_full =
-            scene_->toFullJointPositions(rrt_options_.group_name, final_traj.positions[i]);
-        Eigen::Matrix4d tform = scene_->forwardKinematics(q_full, tcp_frame);
-        Eigen::Vector3d pos = tform.block<3, 1>(0, 3);
-
-        if (have_prev && i > 0) {
-          double dt = final_traj.times[i] - final_traj.times[i - 1];
-          if (dt > 1e-9) {
-            double speed = (pos - prev_pos).norm() / dt;
-            if (speed > max_tcp_speed) {
-              max_tcp_speed = speed;
-            }
-          }
-        }
-
-        prev_pos = pos;
-        have_prev = true;
-      }
+      final_tcp_check = compute_tcp_speed_check(
+          scene_, rrt_options_.group_name, final_traj, tcp_frame);
 
       // If within limit, done
-      if (max_tcp_speed <= tcp_limit) {
+      if (final_tcp_check.max_speed_mps <= tcp_limit) {
         break;
       }
 
       // Scale down proportionally: new_scale = old_scale * (limit / actual)
-      double ratio = (tcp_limit * kTcpSpeedMargin) / max_tcp_speed;
+      double ratio = (tcp_limit * kTcpSpeedMargin) / final_tcp_check.max_speed_mps;
       vel_scale *= ratio;
 
       // Clamp to a reasonable minimum
       if (vel_scale < 0.001) {
         vel_scale = 0.001;
       }
+    }
+
+    if (tcp_limit > 0.0 && !tcp_frame.empty() &&
+        final_tcp_check.max_speed_mps > tcp_limit) {
+      std::map<std::string, std::string> details;
+      details["failure_stage"] = "time_parameterization";
+      details["limit_type"] = "tcp_linear_speed";
+      details["measured"] = std::to_string(final_tcp_check.max_speed_mps);
+      details["limit"] = std::to_string(tcp_limit);
+      details["units"] = "m/s";
+      details["tcp_frame"] = tcp_frame;
+      details["waypoint_count"] = std::to_string(final_traj.times.size());
+      details["trajectory_duration_s"] =
+          final_traj.times.empty() ? "0.000000" : std::to_string(final_traj.times.back());
+      details["max_segment_index"] = std::to_string(final_tcp_check.segment_index);
+      details["max_segment_dt_s"] = std::to_string(final_tcp_check.segment_dt_s);
+      details["toppra_iterations"] = std::to_string(tcp_iterations_used);
+      details["final_velocity_scale"] = std::to_string(vel_scale);
+      result.error = core::ErrorDTO{
+          core::kErrorValidationLimitsViolation,
+          "TCP linear speed exceeds limit after time-parameterization",
+          details};
+      return result;
     }
 
     // Convert to TrajectoryDTO

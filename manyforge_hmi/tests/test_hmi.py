@@ -1016,6 +1016,64 @@ class TestViserHmiServer:
         server.set_frame_visibility("base_link", True)
         assert server.get_frame_visibility("base_link") is True
         assert "base_link" in server._frame_handles
+        base_link_handle = server._frame_handles["base_link"]
+        assert server.get_frame_gizmo_size() == pytest.approx(0.1)
+        assert server._frame_axes_dimensions() == pytest.approx((0.1, 0.005, 0.0125))
+
+        server.set_frame_gizmo_size(0.12)
+        assert server.get_frame_gizmo_size() == pytest.approx(0.12)
+        assert server._frame_axes_dimensions() == pytest.approx((0.12, 0.006, 0.015))
+        assert "base_link" in server._frame_handles
+        assert server._frame_handles["base_link"] is not base_link_handle
+
+        server.stop()
+
+    def test_object_frame_visibility_toggles_backend_object_pose_axis(self, cycle_manager):
+        """Object gizmo frames are viewer-only and follow backend object poses."""
+        server = ViserHmiServer(cycle_manager, host="127.0.0.1", port=0)
+        catalog = NodeCatalog(_CATALOG_PATH)
+        program = Program(_PROGRAM_PATH, catalog)
+        first = program.scene[0]
+        cycle_manager._kernel.scene_edit(SceneEditRequest(
+            operation="add",
+            object_id=first.object_id,
+            shape_type=first.shape.get("type"),
+            box_dimensions_m=first.shape.get("box_dimensions_m"),
+            sphere_radius_m=first.shape.get("sphere_radius_m"),
+            pose_position_m=first.pose.get("position_m"),
+            pose_orientation_xyzw=first.pose.get("orientation_xyzw", [0.0, 0.0, 0.0, 1.0]),
+            frame_id=first.pose.get("frame_id", "universe"),
+        ))
+        server.load_program(program)
+        server._update_once()
+
+        assert server.get_object_frame_visibility(first.object_id) is False
+        assert first.object_id not in server._object_frame_handles
+
+        server.set_object_frame_visibility(first.object_id, True)
+        assert server.get_object_frame_visibility(first.object_id) is True
+        assert first.object_id in server._object_frame_handles
+        handle = server._object_frame_handles[first.object_id]
+        assert handle.visible is True
+        assert np.allclose(handle.position, first.pose.get("position_m"))
+        assert np.allclose(
+            server._object_frame_render_state[first.object_id],
+            (0.75, 0.01, 0.03),
+        )
+
+        cycle_manager._kernel.scene_edit(SceneEditRequest(
+            operation="update_pose",
+            object_id=first.object_id,
+            pose_position_m=[0.42, -0.13, 0.27],
+            pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
+            frame_id="universe",
+        ))
+        server._update_once()
+        assert np.allclose(handle.position, [0.42, -0.13, 0.27])
+
+        server.set_object_frame_visibility(first.object_id, False)
+        assert server.get_object_frame_visibility(first.object_id) is False
+        assert first.object_id not in server._object_frame_handles
 
         server.stop()
 

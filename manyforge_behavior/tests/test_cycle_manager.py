@@ -209,6 +209,28 @@ class TestCycleManagerRun:
         assert manager._tree is not None
         assert manager._tree is initial_tree
         assert len(slow_kernel.scene_edits) == initial_scene_edit_count
+
+    def test_reset_clears_motion_soft_fail_blackboard(self, kernel):
+        """Reset starts a fresh cycle, not a resume of a previous motion soft-fail."""
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        manager = CycleManager(runner, kernel)
+
+        bb = py_trees.blackboard.Client(name="test_motion_soft_fail_reset")
+        bb.register_key(key="motion_paused_due_to_error", access=py_trees.common.Access.WRITE)
+        bb.register_key(key="motion_error_message", access=py_trees.common.Access.WRITE)
+        bb.register_key(key="motion_paused_node_name", access=py_trees.common.Access.WRITE)
+        bb.register_key(key="resume_after_error_requested", access=py_trees.common.Access.WRITE)
+        bb.set("motion_paused_due_to_error", True)
+        bb.set("motion_error_message", "stale collision")
+        bb.set("motion_paused_node_name", "stale_motion")
+        bb.set("resume_after_error_requested", True)
+
+        manager.reset()
+
+        assert bb.get("motion_paused_due_to_error") is False
+        assert bb.get("motion_error_message") is None
+        assert bb.get("motion_paused_node_name") is None
+        assert bb.get("resume_after_error_requested") is False
     
     def test_run_from_running_is_noop(self, kernel):
         """run() from RUNNING state is a no-op."""

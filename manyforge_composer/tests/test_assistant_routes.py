@@ -548,6 +548,43 @@ def test_assistant_bridge_scene_resource_uses_deployment_world_frame_config(
     assert state.program.scene[0].pose["frame_id"] == "world"
 
 
+def test_assistant_bridge_composer_draft_callback_accepts_mesh_scene_resource(
+    client: TestClient,
+    state: ComposerState,
+    tmp_path: Path,
+) -> None:
+    program_path = _write_minimal_program(tmp_path)
+    state.load_program(str(program_path))
+    state.deployment = _assistant_mode_deployment()
+    catalog_hash = _assistant_catalog_hash(state, "composer-assistant")
+
+    response = client.post(
+        "/api/assistant/bridge/tools/scene_draft_add_object",
+        json={
+            "requestId": "req-bridge-mesh-resource",
+            "assistantMode": "composer-assistant",
+            "catalogHash": catalog_hash,
+            "arguments": {
+                "objectId": "mesh_obstacle",
+                "shapeType": "mesh",
+                "meshResourceUri": "file:///workspace/meshes/obstacle.obj",
+                "meshScale": [1.0, 1.0, 1.0],
+                "position": [0.2, 0.1, 0.0],
+                "frameId": "universe",
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["success"] is True
+    assert state.program is not None
+    resource = state.program.scene[0]
+    assert resource.shape["type"] == "mesh"
+    assert resource.shape["mesh_resource_uri"] == "file:///workspace/meshes/obstacle.obj"
+    assert resource.shape["mesh_scale"] == [1.0, 1.0, 1.0]
+
+
 def test_assistant_bridge_scene_resource_rejects_attachment_frame(
     client: TestClient,
     state: ComposerState,
@@ -953,9 +990,9 @@ def test_assistant_bridge_composer_draft_tree_callbacks_mutate_validated_tree(
             "arguments": {
                 "parentName": "root",
                 "index": 1,
+                "nodeName": "remove_temp_object",
                 "node": {
                     "id": "remove_collision_object",
-                    "name": "remove_temp_object",
                     "params": {"object_id": "temp_object"},
                 },
             },
@@ -1284,9 +1321,9 @@ def test_assistant_bridge_insert_node_enforces_mode_node_allowlist(
             "catalogHash": catalog_hash,
             "arguments": {
                 "parentName": "root",
+                "nodeName": "wrapper_seq",
                 "node": {
                     "id": "sequence",
-                    "name": "wrapper_seq",
                     "children": [
                         {"id": "command_gripper", "name": "bad_leaf"},
                     ],
@@ -1867,7 +1904,7 @@ def test_assistant_chat_golden_program_build_matches_expected_draft(
             assert {
                 "attach_object_to_link",
                 "detach_object_from_link",
-            } <= set(context.visible_nodes)
+            } <= {node.get("id") for node in context.visible_node_catalog}
 
             tool_calls = []
 
@@ -1890,7 +1927,15 @@ def test_assistant_chat_golden_program_build_matches_expected_draft(
             call("scene_draft_upsert_objects", {"sceneResources": expected_scene})
             call(
                 "tree_draft_insert_node",
-                {"parentName": "root", "index": 0, "node": expected_node},
+                {
+                    "parentName": "root",
+                    "index": 0,
+                    "nodeName": expected_node["name"],
+                    "node": {
+                        "id": expected_node["id"],
+                        "params": expected_node["params"],
+                    },
+                },
             )
             call(
                 "program_draft_upsert_parameters",
@@ -1949,7 +1994,15 @@ def test_assistant_chat_golden_program_build_matches_expected_draft(
         (
             "tree_draft_insert_node",
             "completed",
-            {"parentName": "root", "index": 0, "node": expected_node},
+            {
+                "parentName": "root",
+                "index": 0,
+                "nodeName": expected_node["name"],
+                "node": {
+                    "id": expected_node["id"],
+                    "params": expected_node["params"],
+                },
+            },
         ),
         (
             "program_draft_upsert_parameters",
@@ -2300,6 +2353,30 @@ def test_propose_scene_objects_skips_invalid_shape_lengths(client: TestClient) -
     data = response.json()
     assert data["sceneResources"] == []
     assert "box_dimensions_m must contain exactly 3 values" in data["warnings"][0]
+
+
+def test_propose_scene_objects_accepts_mesh_resource_override(client: TestClient) -> None:
+    report = _sample_isaac_report(source_roots=["/World/soup_can"])
+
+    response = client.post(
+        "/api/assistant/tools/propose-scene-objects",
+        json={
+            "inspectionReport": report,
+            "sourceRoots": ["/World/soup_can"],
+            "meshResourceOverrides": {
+                "/World/soup_can": "file:///workspace/meshes/soup_can.obj",
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    resource = data["sceneResources"][0]
+    assert resource["shape"] == {
+        "type": "mesh",
+        "mesh_resource_uri": "file:///workspace/meshes/soup_can.obj",
+        "mesh_scale": [1.0, 1.0, 1.0],
+    }
 
 
 def test_propose_scene_objects_skips_invalid_source_root(client: TestClient) -> None:
@@ -2670,6 +2747,7 @@ def _assistant_mode_deployment(
                         "scene.edit.attach_detach",
                         "scene.shape.box",
                         "scene.shape.sphere",
+                        "scene.shape.mesh",
                     ],
                     "config": context_config or {},
                 },

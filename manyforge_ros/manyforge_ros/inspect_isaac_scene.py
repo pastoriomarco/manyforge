@@ -32,6 +32,8 @@ class IsaacSceneQuery:
     max_colliders: int | None = None
     purpose: tuple[str, ...] = ()
     output_profile: str = "llm_scene_authoring"
+    mesh_export_dir: str | None = None
+    mesh_source_preference: str = "auto"
     request_id: str = field(default_factory=lambda: f"manyforge-{uuid.uuid4()}")
 
     def to_request_payload(self) -> dict[str, Any]:
@@ -49,6 +51,10 @@ class IsaacSceneQuery:
         }
         if self.max_colliders is not None:
             payload["max_colliders"] = self.max_colliders
+        if self.mesh_export_dir:
+            payload["mesh_export_dir"] = self.mesh_export_dir
+        if self.mesh_source_preference:
+            payload["mesh_source_preference"] = self.mesh_source_preference
         return payload
 
 
@@ -209,6 +215,20 @@ def main() -> int:
     parser.add_argument("--include-cooked-samples", action="store_true")
     parser.add_argument("--max-colliders", type=int, default=None)
     parser.add_argument(
+        "--mesh-export-dir",
+        default=None,
+        help="Directory where Isaac should export logical object meshes as OBJ files.",
+    )
+    parser.add_argument(
+        "--mesh-source-preference",
+        choices=["auto", "original", "collider", "primitive"],
+        default="auto",
+        help=(
+            "Mesh source to prefer in LLM scene-resource recommendations. "
+            "Use collider to ignore original visual meshes and prefer collider meshes."
+        ),
+    )
+    parser.add_argument(
         "--purpose",
         action="append",
         default=[],
@@ -239,6 +259,8 @@ def main() -> int:
             max_colliders=args.max_colliders,
             purpose=tuple(args.purpose),
             output_profile=args.output_profile,
+            mesh_export_dir=args.mesh_export_dir,
+            mesh_source_preference=args.mesh_source_preference,
         )
         client = InspectIsaacSceneClient(
             node,

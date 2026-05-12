@@ -789,26 +789,31 @@ export function DeploymentPanel() {
             disabled={editLocked}
           />
           <FieldInput
-            label="Open Position"
-            value={gripper.openPosition}
-            onChange={(value) => setNestedField(`grippers.${gripperId}.openPosition`, Number(value) || 0)}
-            type="number"
-            disabled={editLocked}
-          />
-          <FieldInput
-            label="Closed Position"
-            value={gripper.closedPosition}
-            onChange={(value) => setNestedField(`grippers.${gripperId}.closedPosition`, Number(value) || 0)}
-            type="number"
-            disabled={editLocked}
-          />
-          <FieldInput
             label="Motion Time (s)"
             value={gripper.motionTimeS}
             onChange={(value) => setNestedField(`grippers.${gripperId}.motionTimeS`, Number(value) || 0)}
             type="number"
             disabled={editLocked}
           />
+          <div>
+            <label className="block text-xs font-semibold text-gray-400 mb-1">
+              SRDF Presets
+            </label>
+            <div className="rounded border border-gray-700 bg-gray-900/60 px-2 py-1 text-xs text-gray-300">
+              {Object.entries(gripper.srdfPresets ?? {}).length > 0 ? (
+                Object.entries(gripper.srdfPresets)
+                  .sort(([left], [right]) => left.localeCompare(right))
+                  .map(([name, value]) => (
+                    <div key={name} className="flex justify-between gap-3">
+                      <span>{name}</span>
+                      <span className="font-mono">{value}</span>
+                    </div>
+                  ))
+              ) : (
+                <span className="text-gray-500">No group_state presets found for this gripper.</span>
+              )}
+            </div>
+          </div>
           <StringListInput
             label="Touch Links"
             values={gripper.touchLinks}

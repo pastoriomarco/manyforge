@@ -77,6 +77,7 @@ COMPOSER_ASSISTANT_MODE = "composer-assistant"
 _WORLD_FRAME_ALIASES = {"world", "/world", "/World", "World", "universe"}
 _BOX_SHAPE_ALIASES = {"box", "cube", "cuboid", "rectangular_prism", "rectangular-prism"}
 _SPHERE_SHAPE_ALIASES = {"sphere", "ball"}
+_MESH_SHAPE_ALIASES = {"mesh", "trimesh", "stl", "obj", "dae", "usd"}
 
 
 def create_assistant_router(state: ComposerState) -> APIRouter:
@@ -760,6 +761,7 @@ def create_assistant_router(state: ComposerState) -> APIRouter:
                 request.inspection_report,
                 source_roots=request.source_roots,
                 object_id_prefix=request.object_id_prefix,
+                mesh_resource_overrides=request.mesh_resource_overrides,
                 max_proposals=request.max_proposals,
             )
         except AssistantToolError as exc:
@@ -1581,11 +1583,41 @@ def _normalize_scene_shape_argument(
     if diameter is None:
         diameter = _first_mapping_value(raw_resource, "diameter_m", "diameter")
 
+    mesh_resource_uri = _first_mapping_value(
+        raw_shape,
+        "mesh_resource_uri",
+        "meshResourceUri",
+        "resource_uri",
+        "resourceUri",
+        "uri",
+        "path",
+        "mesh_path",
+        "meshPath",
+    )
+    if mesh_resource_uri is None:
+        mesh_resource_uri = _first_mapping_value(
+            raw_resource,
+            "mesh_resource_uri",
+            "meshResourceUri",
+            "resource_uri",
+            "resourceUri",
+            "uri",
+            "path",
+            "mesh_path",
+            "meshPath",
+        )
+
+    mesh_scale = _first_mapping_value(raw_shape, "mesh_scale", "meshScale", "scale")
+    if mesh_scale is None:
+        mesh_scale = _first_mapping_value(raw_resource, "mesh_scale", "meshScale", "scale")
+
     if not shape_type_normalized:
         if box_dimensions is not None:
             shape_type_normalized = "box"
         elif radius is not None or diameter is not None:
             shape_type_normalized = "sphere"
+        elif mesh_resource_uri is not None:
+            shape_type_normalized = "mesh"
 
     if shape_type_normalized in _BOX_SHAPE_ALIASES:
         if box_dimensions is None:
@@ -1619,9 +1651,33 @@ def _normalize_scene_shape_argument(
             )
         return {"type": "sphere", "sphere_radius_m": radius_value}
 
+    if shape_type_normalized in _MESH_SHAPE_ALIASES:
+        if not isinstance(mesh_resource_uri, str) or not mesh_resource_uri.strip():
+            raise HTTPException(
+                status_code=400,
+                detail=f"{tool_id} {label}.shape requires mesh_resource_uri",
+            )
+        scale = [1.0, 1.0, 1.0]
+        if mesh_scale is not None:
+            scale = _numeric_vector_argument(
+                mesh_scale,
+                length=3,
+                label=f"{label}.shape.mesh_scale",
+            )
+            if any(component <= 0.0 for component in scale):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{tool_id} {label}.shape.mesh_scale values must be > 0",
+                )
+        return {
+            "type": "mesh",
+            "mesh_resource_uri": mesh_resource_uri.strip(),
+            "mesh_scale": scale,
+        }
+
     raise HTTPException(
         status_code=400,
-        detail=f"{tool_id} {label}.shape.type must be one of: box, sphere",
+        detail=f"{tool_id} {label}.shape.type must be one of: box, sphere, mesh",
     )
 
 

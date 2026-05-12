@@ -249,8 +249,6 @@ class TestDeploymentLoading:
                     "command_mode": "simulated_joint",
                     "group_id": "gripper",
                     "joint_name": "finger_joint",
-                    "open_position": 0.0,
-                    "closed_position": 0.7,
                     "motion_time_s": 0.8,
                     "touch_links": ["left_inner_finger_pad", "right_inner_finger_pad"],
                     "mount_frame": "tool0",
@@ -266,7 +264,6 @@ class TestDeploymentLoading:
             assert "primary" in deploy.grippers
             assert deploy.grippers["primary"].group_id == "gripper"
             assert deploy.grippers["primary"].joint_name == "finger_joint"
-            assert deploy.grippers["primary"].closed_position == pytest.approx(0.7)
             assert deploy.grippers["primary"].touch_links == [
                 "left_inner_finger_pad",
                 "right_inner_finger_pad",
@@ -278,6 +275,68 @@ class TestDeploymentLoading:
                 "gripper_frame",
                 "insertion_frame",
             ]
+        finally:
+            os.unlink(path)
+
+    def test_gripper_srdf_presets_are_parsed(self, tmp_path):
+        srdf_path = tmp_path / "robot.srdf"
+        srdf_path.write_text(
+            '<?xml version="1.0"?>\n'
+            '<robot name="fixture">\n'
+            '  <group_state name="ready" group="gripper">\n'
+            '    <joint name="finger_joint" value="0.15"/>\n'
+            "  </group_state>\n"
+            '  <group_state name="pinch" group="gripper">\n'
+            '    <joint name="finger_joint" value="0.42"/>\n'
+            "  </group_state>\n"
+            "</robot>\n"
+        )
+        data = _minimal_deployment(
+            robot_config={
+                "robot_id": "ur5",
+                "group_id": "arm",
+                "urdf_path": "package://test.urdf",
+                "srdf_path": str(srdf_path),
+                "global_max_tcp_linear_speed_mps": 0.5,
+            },
+            grippers={
+                "primary": {
+                    "command_mode": "simulated_joint",
+                    "group_id": "gripper",
+                    "joint_name": "finger_joint",
+                    "motion_time_s": 0.8,
+                }
+            },
+        )
+        path = _write_deployment(data)
+        try:
+            deploy = Deployment(path)
+            assert deploy.grippers["primary"].srdf_presets == {
+                "ready": 0.15,
+                "pinch": 0.42,
+            }
+        finally:
+            os.unlink(path)
+
+    def test_deployment_gripper_presets_are_rejected(self):
+        data = _minimal_deployment(
+            grippers={
+                "primary": {
+                    "command_mode": "simulated_joint",
+                    "group_id": "gripper",
+                    "joint_name": "finger_joint",
+                    "closed_position": 0.7,
+                    "motion_time_s": 0.8,
+                }
+            },
+        )
+        path = _write_deployment(data)
+        try:
+            with pytest.raises(
+                DeploymentValidationError,
+                match="closed_position is no longer supported",
+            ):
+                Deployment(path)
         finally:
             os.unlink(path)
 
@@ -1187,6 +1246,10 @@ class TestCrossArtifactValidation:
         assert deploy.grippers["primary"].attach_frame == "grasp_frame"
         assert deploy.grippers["primary"].tcp_frame == "grasp_frame"
         assert deploy.grippers["primary"].auxiliary_frames == ["gripper_frame"]
+        assert deploy.grippers["primary"].srdf_presets == {
+            "open": 0.0,
+            "closed": 0.66,
+        }
         deploy.validate_against_program(prog)
         deploy.validate_capabilities()
 
@@ -1252,6 +1315,11 @@ class TestCrossArtifactValidation:
                 "repeat",
                 "retry",
                 "inverter",
+                "move_manipulator_action",
+                "command_gripper",
+                "timer",
+                "wait_for_signal_bool",
+                "set_key_bool_value",
             ]
         )
 
@@ -1441,7 +1509,7 @@ class TestValidateCapabilities:
                             "name": "close_gripper",
                             "params": {
                                 "gripper_id": "primary",
-                                "command": "close",
+                                "position": 0.7,
                             },
                         }
                     ],

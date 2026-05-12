@@ -126,6 +126,22 @@ class TestRunnerSceneApplication:
         assert kernel.scene_edits[0].operation == "add"
         assert kernel.scene_edits[0].object_id == "table"
 
+    def test_apply_scene_sets_robot_base_pose_before_objects(self, kernel):
+        catalog = NodeCatalog(CATALOG_PATH)
+        program = Program(FIXTURE_PATH, catalog)
+        program.robot.base_pose = {
+            "frame_id": "universe",
+            "position_m": [0.1, 0.2, 0.3],
+            "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+        }
+        runner = OrchestratorRunner(
+            CATALOG_PATH, FIXTURE_PATH, kernel, program=program
+        )
+        runner.load()
+        runner.apply_scene()
+        assert kernel.robot_base_pose == program.robot.base_pose
+        assert kernel.scene_edits[0].object_id == "table"
+
     def test_apply_scene_failure(self, kernel):
         kernel.fail_next_scene_edit = True
         runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
@@ -504,8 +520,6 @@ class TestRunnerDeployment:
                             "command_mode": "simulated_joint",
                             "group_id": "gripper",
                             "joint_name": "finger_joint",
-                            "open_position": 0.0,
-                            "closed_position": 0.7,
                             "motion_time_s": 0.8,
                             "touch_links": ["left_inner_finger_pad", "right_inner_finger_pad"],
                         }

@@ -71,6 +71,37 @@ class TestProgramLoading:
         assert prog.tree.id == "sequence"
         assert len(prog.tree.children) == 2
 
+    def test_robot_base_pose_round_trips(self, catalog):
+        data = yaml.safe_load(FIXTURE_PATH.read_text())
+        data["robot"]["base_pose"] = {
+            "frame_id": "universe",
+            "position_m": [0.1, -0.2, 0.3],
+            "orientation_rpy_deg": [0, 0, 90],
+        }
+        path = _write_program(data)
+
+        try:
+            prog = Program(path, catalog)
+        finally:
+            os.unlink(path)
+
+        assert prog.robot.base_pose == data["robot"]["base_pose"]
+        assert prog.to_dict()["robot"]["base_pose"] == data["robot"]["base_pose"]
+
+    def test_robot_base_pose_requires_orientation(self, catalog):
+        data = yaml.safe_load(FIXTURE_PATH.read_text())
+        data["robot"]["base_pose"] = {
+            "frame_id": "universe",
+            "position_m": [0.1, -0.2, 0.3],
+        }
+        path = _write_program(data)
+
+        try:
+            with pytest.raises(ProgramValidationError, match="base_pose requires orientation"):
+                Program(path, catalog)
+        finally:
+            os.unlink(path)
+
     def test_tree_node_names(self, catalog):
         prog = Program(FIXTURE_PATH, catalog)
         names = []
@@ -261,6 +292,135 @@ class TestProgramValidation:
         )
         program = Program.from_dict(data, catalog)
         assert program.scene[0].pose["orientation_rpy_deg"] == [0.0, 0.0, 45.0]
+
+    def test_allows_scene_resource_support_contact_metadata(self, catalog):
+        data = _minimal_program(
+            scene=[
+                {
+                    "object_id": "box1",
+                    "shape": {"type": "box", "box_dimensions_m": [0.1, 0.1, 0.1]},
+                    "pose": {
+                        "frame_id": "universe",
+                        "position_m": [0.0, 0.0, 0.05],
+                        "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+                    },
+                    "metadata": {
+                        "support_contacts": [
+                            {
+                                "support_object_id": "table",
+                                "max_start_penetration_m": 0.005,
+                                "require_separation_by_end": True,
+                            }
+                        ]
+                    },
+                },
+                {
+                    "object_id": "table",
+                    "shape": {"type": "box", "box_dimensions_m": [1.0, 1.0, 0.1]},
+                    "pose": {
+                        "frame_id": "universe",
+                        "position_m": [0.0, 0.0, -0.05],
+                        "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+                    },
+                },
+            ],
+            tree={
+                "id": "sequence",
+                "name": "root",
+                "children": [
+                    {
+                        "id": "reset_trajectories",
+                        "name": "reset",
+                    }
+                ],
+            },
+        )
+        program = Program.from_dict(data, catalog)
+        assert program.scene[0].metadata["support_contacts"][0] == {
+            "support_object_id": "table",
+            "max_start_penetration_m": 0.005,
+            "require_separation_by_end": True,
+        }
+        assert program.to_dict()["scene"][0]["metadata"]["support_contacts"][0][
+            "support_object_id"
+        ] == "table"
+
+    def test_rejects_scene_resource_support_contact_without_release_requirement(self, catalog):
+        data = _minimal_program(
+            scene=[
+                {
+                    "object_id": "box1",
+                    "shape": {"type": "box", "box_dimensions_m": [0.1, 0.1, 0.1]},
+                    "pose": {
+                        "frame_id": "universe",
+                        "position_m": [0.0, 0.0, 0.05],
+                        "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+                    },
+                    "metadata": {
+                        "support_contacts": [
+                            {
+                                "support_object_id": "table",
+                                "require_separation_by_end": False,
+                            }
+                        ]
+                    },
+                }
+            ]
+        )
+        with pytest.raises(
+            ProgramValidationError,
+            match=r"metadata\.support_contacts\[0\]\.require_separation_by_end must be true",
+        ):
+            Program.from_dict(data, catalog)
+
+    def test_rejects_scene_resource_support_contact_unknown_object(self, catalog):
+        data = _minimal_program(
+            scene=[
+                {
+                    "object_id": "box1",
+                    "shape": {"type": "box", "box_dimensions_m": [0.1, 0.1, 0.1]},
+                    "pose": {
+                        "frame_id": "universe",
+                        "position_m": [0.0, 0.0, 0.05],
+                        "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+                    },
+                    "metadata": {
+                        "support_contacts": [{"support_object_id": "missing_table"}]
+                    },
+                }
+            ]
+        )
+        with pytest.raises(
+            ProgramValidationError,
+            match=(
+                r"scene resource 'box1' support_contacts references unknown "
+                r"object_id 'missing_table'"
+            ),
+        ):
+            Program.from_dict(data, catalog)
+
+    def test_rejects_scene_resource_support_contact_self_reference(self, catalog):
+        data = _minimal_program(
+            scene=[
+                {
+                    "object_id": "box1",
+                    "shape": {"type": "box", "box_dimensions_m": [0.1, 0.1, 0.1]},
+                    "pose": {
+                        "frame_id": "universe",
+                        "position_m": [0.0, 0.0, 0.05],
+                        "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+                    },
+                    "metadata": {
+                        "support_contacts": [{"support_object_id": "box1"}]
+                    },
+                }
+            ]
+        )
+        with pytest.raises(
+            ProgramValidationError,
+            match="scene resource support_contacts cannot reference the same object",
+        ):
+            Program.from_dict(data, catalog)
 
     def test_rejects_duplicate_param_names(self, catalog):
         data = _minimal_program()
@@ -494,7 +654,7 @@ class TestProgramValidation:
                     "name": "close_gripper",
                     "params": {
                         "gripper_id": "primary",
-                        "command": "close",
+                        "position": 0.7,
                     },
                 }
             ],
@@ -556,7 +716,7 @@ class TestProgramValidation:
                     "name": "close_gripper",
                     "params": {
                         "gripper_id": "primary",
-                        "command": "close",
+                        "position": 0.7,
                     },
                 }
             ],
@@ -585,7 +745,7 @@ class TestProgramValidation:
                     "name": "close_gripper",
                     "params": {
                         "gripper_id": "primary",
-                        "command": "close",
+                        "position": 0.7,
                     },
                 }
             ],

@@ -477,8 +477,8 @@ entries:
       - name: shape_type
         type: enum
         required: true
-        enum_values: [box, sphere]
-        description: Shape type (v0.0 supports box and sphere only).
+        enum_values: [box, sphere, mesh]
+        description: Shape type.
       - name: box_dimensions_m
         type: float_list
         required: false
@@ -496,6 +496,21 @@ entries:
         constraints:
           min_exclusive: 0.0
         description: Sphere radius in meters (required when shape_type=sphere).
+      - name: mesh_resource_uri
+        type: string
+        required: false
+        visible_when:
+          param: shape_type
+          equals: mesh
+        description: Mesh resource URI or path (required when shape_type=mesh).
+      - name: mesh_scale
+        type: float_list
+        required: false
+        visible_when:
+          param: shape_type
+          equals: mesh
+        default: [1.0, 1.0, 1.0]
+        description: Mesh scale [x, y, z]; defaults to [1, 1, 1].
       - name: pose
         type: pose
         required: true
@@ -509,6 +524,7 @@ entries:
     required_capabilities:
       - scene.shape.box
       - scene.shape.sphere
+      - scene.shape.mesh
       - scene.edit.add
     execution:
       blocking: true
@@ -556,8 +572,8 @@ entries:
       - name: shape_type
         type: enum
         required: true
-        enum_values: [box, sphere]
-        description: Shape type (v0.1 supports box and sphere only).
+        enum_values: [box, sphere, mesh]
+        description: Shape type.
       - name: box_dimensions_m
         type: float_list
         required: false
@@ -575,6 +591,21 @@ entries:
         constraints:
           min_exclusive: 0.0
         description: Sphere radius in meters (required when shape_type=sphere).
+      - name: mesh_resource_uri
+        type: string
+        required: false
+        visible_when:
+          param: shape_type
+          equals: mesh
+        description: Mesh resource URI or path (required when shape_type=mesh).
+      - name: mesh_scale
+        type: float_list
+        required: false
+        visible_when:
+          param: shape_type
+          equals: mesh
+        default: [1.0, 1.0, 1.0]
+        description: Mesh scale [x, y, z]; defaults to [1, 1, 1].
       - name: pose
         type: pose
         required: true
@@ -588,6 +619,7 @@ entries:
     required_capabilities:
       - scene.shape.box
       - scene.shape.sphere
+      - scene.shape.mesh
       - scene.edit.upsert
     execution:
       blocking: true
@@ -1091,9 +1123,9 @@ entries:
     name: CommandGripper
     category: end_effector
     description: >-
-      Command an actuated gripper to open or close and block until the motion
-      completes. This is the transport-aware actuated sibling of the logical
-      set/check/wait gripper-state nodes.
+      Command an actuated gripper to a numeric command-space position and block
+      until the motion completes. This is the transport-aware actuated sibling
+      of the logical set/check/wait gripper-state nodes.
     stability: experimental
     tags: [end_effector, gripper, actuation]
     profiles:
@@ -1107,28 +1139,33 @@ entries:
         type: string
         required: true
         description: Deployment gripper identifier to command.
-      - name: command
-        type: enum
+      - name: position
+        type: float
         required: true
-        default: close
-        enum_values: [open, close]
-        description: High-level gripper command to execute.
-      - name: state_key
-        type: string
+        description: >-
+          Numeric gripper command-space target position. UI presets are parsed
+          from the deployment robot SRDF's matching gripper group_state values.
+      - name: max_effort
+        type: float
         required: false
-        ui_editor: blackboard_key_selector
-        blackboard_role: key_writer
-        blackboard_value_type: bool
-        description: Optional logical gripper-state key to write on success.
+        description: Optional maximum effort for backends that support gripper-command effort limits.
+      - name: duration_s
+        type: float
+        required: false
+        constraints:
+          min_inclusive: 0
+        description: >-
+          Optional command duration. If omitted, the runtime uses the deployment
+          gripper motion_time_s.
       - name: timeout_s
         type: float
         required: false
         constraints:
-          min_exclusive: 0
+          min_inclusive: 0
         description: >-
           Maximum time to wait for the gripper command to complete. If omitted,
-          the runtime derives a timeout from the deployment gripper motion_time_s.
-    bb_writer_params: [state_key]
+          the runtime derives a timeout from the selected command duration.
+          Use 0 to disable the timeout.
     required_capabilities:
       - tool.gripper.command
       - tool.gripper.feedback

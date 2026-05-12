@@ -44,6 +44,7 @@ class SceneResource:
     object_id: str
     shape: dict[str, Any]
     pose: dict[str, Any]
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -139,6 +140,7 @@ class RobotProfile:
     group_id: str
     base_frame: str
     tcp_frame: str
+    base_pose: dict[str, Any] = field(default_factory=dict)
 
 
 class ProgramValidationError(Exception):
@@ -496,13 +498,28 @@ def _validate_pose_value(value: Any) -> str | None:
     return None
 
 
+def _validate_robot_base_pose_value(value: Any) -> str | None:
+    pose_error = _validate_pose_value(value)
+    if pose_error is not None:
+        return f"base_pose {pose_error}"
+    frame_id = value.get("frame_id")
+    if not isinstance(frame_id, str) or not frame_id.strip():
+        return "base_pose.frame_id is required"
+    position = value.get("position_m")
+    if not _is_numeric_list(position, 3):
+        return "base_pose.position_m must be a list of 3 numeric values"
+    if "orientation_xyzw" not in value and "orientation_rpy_deg" not in value:
+        return "base_pose requires orientation_xyzw or orientation_rpy_deg"
+    return None
+
+
 def _validate_scene_shape_value(value: Any) -> str | None:
     if not isinstance(value, Mapping):
         return "shape must be a mapping"
 
     shape_type = value.get("type")
-    if shape_type not in {"box", "sphere"}:
-        return "shape.type must be one of: box, sphere"
+    if shape_type not in {"box", "sphere", "mesh"}:
+        return "shape.type must be one of: box, sphere, mesh"
 
     if shape_type == "box":
         dimensions = value.get("box_dimensions_m")
@@ -515,6 +532,17 @@ def _validate_scene_shape_value(value: Any) -> str | None:
         radius = value.get("sphere_radius_m")
         if not _is_numeric(radius) or float(radius) <= 0.0:
             return "shape.sphere_radius_m must be > 0"
+
+    if shape_type == "mesh":
+        resource_uri = value.get("mesh_resource_uri")
+        if not isinstance(resource_uri, str) or not resource_uri.strip():
+            return "shape.mesh_resource_uri is required"
+        scale = value.get("mesh_scale")
+        if scale is not None:
+            if not _is_numeric_list(scale, 3):
+                return "shape.mesh_scale must be a list of 3 numeric values"
+            if any(float(component) <= 0.0 for component in scale):
+                return "shape.mesh_scale values must be > 0"
 
     return None
 
@@ -552,6 +580,37 @@ def _validate_scene_resource_value(value: Any) -> str | None:
         return "pose.orientation_xyzw must be a list of 4 numeric values"
     if has_rpy and not _is_numeric_list(pose["orientation_rpy_deg"], 3):
         return "pose.orientation_rpy_deg must be a list of 3 numeric values"
+
+    metadata = value.get("metadata", {})
+    if metadata is None:
+        metadata = {}
+    if not isinstance(metadata, Mapping):
+        return "metadata must be a mapping"
+    support_contacts = metadata.get("support_contacts")
+    if support_contacts is not None:
+        if not isinstance(support_contacts, list):
+            return "metadata.support_contacts must be a list"
+        for contact_index, contact in enumerate(support_contacts):
+            if not isinstance(contact, Mapping):
+                return f"metadata.support_contacts[{contact_index}] must be a mapping"
+            support_object_id = contact.get("support_object_id")
+            if not isinstance(support_object_id, str) or not support_object_id.strip():
+                return (
+                    f"metadata.support_contacts[{contact_index}].support_object_id "
+                    "is required"
+                )
+            max_start_penetration_m = contact.get("max_start_penetration_m", 0.0)
+            if not _is_numeric(max_start_penetration_m) or float(max_start_penetration_m) < 0.0:
+                return (
+                    f"metadata.support_contacts[{contact_index}]."
+                    "max_start_penetration_m must be >= 0"
+                )
+            require_separation = contact.get("require_separation_by_end", True)
+            if require_separation is not True:
+                return (
+                    f"metadata.support_contacts[{contact_index}]."
+                    "require_separation_by_end must be true"
+                )
 
     return None
 
@@ -877,6 +936,31 @@ def _validate_tree_node_semantics(
                         message="sphere_radius_m must be a positive numeric value",
                     )
                 )
+        elif shape_type == "mesh":
+            resource_uri = resolved_params.get("mesh_resource_uri")
+            if not isinstance(resource_uri, str) or not resource_uri.strip():
+                issues.append(
+                    TreeValidationIssue(
+                        path=f"{path}.params.mesh_resource_uri",
+                        message="mesh_resource_uri is required when shape_type=mesh",
+                    )
+                )
+            mesh_scale = resolved_params.get("mesh_scale")
+            if mesh_scale is not None:
+                if not _is_numeric_list(mesh_scale, 3) or any(value <= 0 for value in mesh_scale):
+                    issues.append(
+                        TreeValidationIssue(
+                            path=f"{path}.params.mesh_scale",
+                            message="mesh_scale must be a list of 3 positive numeric values",
+                        )
+                    )
+        else:
+            issues.append(
+                TreeValidationIssue(
+                    path=f"{path}.params.shape_type",
+                    message="shape_type must be one of: box, sphere, mesh",
+                )
+            )
 
     if node.id == "update_collision_object_pose" and resolved_params.get("pose") is None:
         issues.append(
@@ -1710,11 +1794,19 @@ class Program:
                 raise ProgramValidationError(
                     f"robot.{field_name} is required"
                 )
+        base_pose = robot_data.get("base_pose", {})
+        if base_pose is None:
+            base_pose = {}
+        if base_pose:
+            base_pose_error = _validate_robot_base_pose_value(base_pose)
+            if base_pose_error is not None:
+                raise ProgramValidationError(f"robot.{base_pose_error}")
         self.robot = RobotProfile(
             robot_id=robot_data["robot_id"],
             group_id=robot_data["group_id"],
             base_frame=robot_data["base_frame"],
             tcp_frame=robot_data["tcp_frame"],
+            base_pose=dict(base_pose),
         )
 
         # Scene resources
@@ -1737,8 +1829,21 @@ class Program:
                     object_id=oid,
                     shape=s.get("shape", {}),
                     pose=s.get("pose", {}),
+                    metadata=dict(s.get("metadata", {}) or {}),
                 )
             )
+        for resource in self.scene:
+            for contact in resource.metadata.get("support_contacts", []) or []:
+                support_object_id = contact.get("support_object_id")
+                if support_object_id == resource.object_id:
+                    raise ProgramValidationError(
+                        "scene resource support_contacts cannot reference the same object"
+                    )
+                if support_object_id not in scene_ids:
+                    raise ProgramValidationError(
+                        f"scene resource '{resource.object_id}' support_contacts "
+                        f"references unknown object_id '{support_object_id}'"
+                    )
 
         # Parameters
         param_names: set[str] = set()
@@ -2149,14 +2254,18 @@ class Program:
             "base_frame": self.robot.base_frame,
             "tcp_frame": self.robot.tcp_frame,
         }
-        d["scene"] = [
-            {
+        if self.robot.base_pose:
+            d["robot"]["base_pose"] = self.robot.base_pose
+        d["scene"] = []
+        for s in self.scene:
+            scene_resource = {
                 "object_id": s.object_id,
                 "shape": s.shape,
                 "pose": s.pose,
             }
-            for s in self.scene
-        ]
+            if s.metadata:
+                scene_resource["metadata"] = s.metadata
+            d["scene"].append(scene_resource)
         d["parameters"] = [
             {
                 "name": p.name,

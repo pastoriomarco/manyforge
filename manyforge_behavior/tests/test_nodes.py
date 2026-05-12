@@ -814,7 +814,7 @@ class TestGripperStateNodes:
 
 
 class TestCommandGripper:
-    def test_command_gripper_closes_and_updates_logical_state(self, kernel, bb_with_kernel):
+    def test_command_gripper_moves_to_numeric_position(self, kernel, bb_with_kernel):
         writer = py_trees.blackboard.Client(name="gripper_setup")
         writer.register_key(key="gripper_configs", access=py_trees.common.Access.WRITE)
         writer.gripper_configs = {
@@ -822,17 +822,15 @@ class TestCommandGripper:
                 "command_mode": "simulated_joint",
                 "group_id": "gripper",
                 "joint_name": "finger_joint",
-                "open_position": 0.0,
-                "closed_position": 0.7,
                 "motion_time_s": 0.02,
             }
         }
 
         node = CommandGripper(
-            name="close_gripper",
+            name="move_gripper",
             gripper_id="primary",
-            command="close",
-            state_key="gripper_closed",
+            position=0.42,
+            max_effort=35.0,
             timeout_s=1.0,
         )
         node.setup()
@@ -849,11 +847,8 @@ class TestCommandGripper:
         assert status == py_trees.common.Status.SUCCESS
         assert kernel.last_gripper_command_request is not None
         assert kernel.last_gripper_command_request.gripper_id == "primary"
-        assert kernel.last_gripper_command_request.target_position == pytest.approx(0.7)
-
-        reader = py_trees.blackboard.Client(name="gripper_reader")
-        reader.register_key(key="gripper_closed", access=py_trees.common.Access.READ)
-        assert reader.get("gripper_closed") is True
+        assert kernel.last_gripper_command_request.target_position == pytest.approx(0.42)
+        assert kernel.last_gripper_command_request.max_effort == pytest.approx(35.0)
 
     def test_command_gripper_derives_default_timeout_from_motion_time(self, kernel, bb_with_kernel):
         writer = py_trees.blackboard.Client(name="gripper_setup")
@@ -863,16 +858,14 @@ class TestCommandGripper:
                 "command_mode": "simulated_joint",
                 "group_id": "gripper",
                 "joint_name": "finger_joint",
-                "open_position": 0.0,
-                "closed_position": 0.7,
                 "motion_time_s": 0.02,
             }
         }
 
         node = CommandGripper(
-            name="close_gripper",
+            name="move_gripper",
             gripper_id="primary",
-            command="close",
+            position=0.7,
         )
         node.setup()
         node.initialise()
@@ -885,15 +878,60 @@ class TestCommandGripper:
 
         assert status == py_trees.common.Status.SUCCESS
 
+    def test_command_gripper_zero_timeout_disables_timeout(self, kernel, bb_with_kernel):
+        writer = py_trees.blackboard.Client(name="gripper_setup")
+        writer.register_key(key="gripper_configs", access=py_trees.common.Access.WRITE)
+        writer.gripper_configs = {
+            "primary": {
+                "command_mode": "simulated_joint",
+                "group_id": "gripper",
+                "joint_name": "finger_joint",
+                "motion_time_s": 0.02,
+            }
+        }
+
+        node = CommandGripper(
+            name="move_gripper",
+            gripper_id="primary",
+            position=0.7,
+            duration_s=0.2,
+            timeout_s=0.0,
+        )
+        node.setup()
+        node.initialise()
+
+        assert node.update() == py_trees.common.Status.RUNNING
+        time.sleep(0.03)
+        assert node.update() == py_trees.common.Status.RUNNING
+        assert "Timed out" not in node.feedback_message
+        assert kernel.last_gripper_command_request is not None
+        assert kernel.last_gripper_command_request.duration_s == pytest.approx(0.2)
+
+    def test_command_gripper_fails_without_position(self, kernel, bb_with_kernel):
+        writer = py_trees.blackboard.Client(name="gripper_setup")
+        writer.register_key(key="gripper_configs", access=py_trees.common.Access.WRITE)
+        writer.gripper_configs = {
+            "primary": {
+                "command_mode": "simulated_joint",
+                "group_id": "gripper",
+                "joint_name": "finger_joint",
+                "motion_time_s": 0.02,
+            }
+        }
+
+        node = CommandGripper(name="move_gripper", gripper_id="primary")
+        assert _tick_node(node) == py_trees.common.Status.FAILURE
+        assert "position is required" in node.feedback_message
+
     def test_command_gripper_fails_when_gripper_is_missing(self, kernel, bb_with_kernel):
         writer = py_trees.blackboard.Client(name="gripper_setup")
         writer.register_key(key="gripper_configs", access=py_trees.common.Access.WRITE)
         writer.gripper_configs = {}
 
         node = CommandGripper(
-            name="close_gripper",
+            name="move_gripper",
             gripper_id="missing",
-            command="close",
+            position=0.7,
             timeout_s=1.0,
         )
         assert _tick_node(node) == py_trees.common.Status.FAILURE

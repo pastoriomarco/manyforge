@@ -69,6 +69,7 @@ export interface Robot {
   groupId: string;
   baseFrame: string;
   tcpFrame: string;
+  basePose?: Record<string, unknown>;
 }
 
 export interface TreeNode {
@@ -411,9 +412,8 @@ export interface GripperConfig {
   commandMode: string;
   groupId: string;
   jointName: string;
-  openPosition: number;
-  closedPosition: number;
   motionTimeS: number;
+  srdfPresets: Record<string, number>;
   description: string;
   touchLinks: string[];
   mountFrame: string;
@@ -490,6 +490,7 @@ export interface SceneRobotState {
   group_id?: string | null;
   base_frame: string;
   tcp_frame: string;
+  base_pose?: Record<string, unknown>;
   joint_names: string[];
   joint_positions: Record<string, number>;
   tcp_pose_in_base?: Record<string, unknown> | null;
@@ -503,6 +504,7 @@ export interface SceneObjectState {
   attached_to?: string | null;
   source: 'authored' | 'runtime' | 'attached' | 'sensed';
   persistable: boolean;
+  viewer_frame_visible: boolean;
 }
 
 export interface SceneStateResponse {
@@ -514,9 +516,11 @@ export interface SceneStateResponse {
 export interface SceneEditRequest {
   operation: 'add' | 'upsert' | 'remove' | 'update_pose' | 'attach' | 'detach';
   object_id: string;
-  shape_type?: 'box' | 'sphere';
+  shape_type?: 'box' | 'sphere' | 'mesh';
   box_dimensions_m?: number[];
   sphere_radius_m?: number;
+  mesh_resource_uri?: string;
+  mesh_scale?: number[];
   pose_position_m?: number[];
   pose_orientation_xyzw?: number[];
   frame_id?: string;
@@ -538,12 +542,30 @@ export interface SceneFrameState {
 export interface SceneFramesResponse {
   frames: SceneFrameState[];
   hmiAvailable: boolean;
+  frameGizmoSizeM: number;
   timestampNs: number;
 }
 
 export interface SceneFrameVisibilityResponse {
   success: boolean;
   frameName: string;
+  visible: boolean;
+  hmiAvailable: boolean;
+  timestampNs: number;
+  error?: string | null;
+}
+
+export interface SceneFrameGizmoSizeResponse {
+  success: boolean;
+  axesLengthM: number;
+  hmiAvailable: boolean;
+  timestampNs: number;
+  error?: string | null;
+}
+
+export interface SceneObjectFrameVisibilityResponse {
+  success: boolean;
+  objectId: string;
   visible: boolean;
   hmiAvailable: boolean;
   timestampNs: number;

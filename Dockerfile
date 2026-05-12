@@ -58,6 +58,7 @@ RUN pip install --no-cache-dir --upgrade pip setuptools && \
         pybind11==3.0.3 \
         pyyaml==6.0.3 \
         pillow==10.2.0 \
+        trimesh==4.11.5 \
         nanobind==2.12.0 \
         scikit-build-core==0.12.2 \
         pin==3.9.0 \

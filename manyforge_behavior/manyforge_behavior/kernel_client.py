@@ -117,10 +117,13 @@ class SceneEditRequest:
     shape_type: Optional[str] = None
     box_dimensions_m: Optional[List[float]] = None
     sphere_radius_m: Optional[float] = None
+    mesh_resource_uri: Optional[str] = None
+    mesh_scale: Optional[List[float]] = None
     pose_position_m: Optional[List[float]] = None
     pose_orientation_xyzw: Optional[List[float]] = None
     frame_id: Optional[str] = None
     touch_links: Optional[List[str]] = None
+    support_contacts: Optional[List[Dict[str, Any]]] = None
 
 
 @dataclass
@@ -174,6 +177,7 @@ class GripperCommandRequest:
     joint_name: str
     target_position: float
     duration_s: float
+    max_effort: Optional[float] = None
 
 
 @dataclass
@@ -261,8 +265,8 @@ def _validate_scene_edit_request(request: SceneEditRequest) -> Optional[str]:
         return f"Unsupported scene edit operation: {request.operation}"
 
     if request.operation in {"add", "upsert"}:
-        if request.shape_type not in {"box", "sphere"}:
-            return f"{request.operation} requires shape_type to be one of: box, sphere"
+        if request.shape_type not in {"box", "sphere", "mesh"}:
+            return f"{request.operation} requires shape_type to be one of: box, sphere, mesh"
         if request.shape_type == "box":
             if not _is_vector(request.box_dimensions_m, 3):
                 return f"{request.operation} with shape_type=box requires box_dimensions_m=[x, y, z]"
@@ -271,10 +275,35 @@ def _validate_scene_edit_request(request: SceneEditRequest) -> Optional[str]:
         if request.shape_type == "sphere":
             if request.sphere_radius_m is None or request.sphere_radius_m <= 0.0:
                 return f"{request.operation} with shape_type=sphere requires sphere_radius_m > 0"
+        if request.shape_type == "mesh":
+            if not request.mesh_resource_uri:
+                return f"{request.operation} with shape_type=mesh requires mesh_resource_uri"
+            if request.mesh_scale is not None:
+                if not _is_vector(request.mesh_scale, 3):
+                    return "mesh_scale must have exactly 3 elements"
+                if any(v <= 0.0 for v in request.mesh_scale):
+                    return "mesh_scale values must be > 0"
         if request.pose_position_m is not None and not _is_vector(request.pose_position_m, 3):
             return "pose_position_m must have exactly 3 elements"
         if request.pose_orientation_xyzw is not None and not _is_vector(request.pose_orientation_xyzw, 4):
             return "pose_orientation_xyzw must have exactly 4 elements"
+        if request.support_contacts is not None:
+            if not isinstance(request.support_contacts, list):
+                return "support_contacts must be a list"
+            for index, contact in enumerate(request.support_contacts):
+                if not isinstance(contact, dict):
+                    return f"support_contacts[{index}] must be a mapping"
+                support_object_id = contact.get("support_object_id")
+                if not isinstance(support_object_id, str) or not support_object_id:
+                    return f"support_contacts[{index}].support_object_id is required"
+                max_start_penetration_m = contact.get("max_start_penetration_m", 0.0)
+                if (
+                    not isinstance(max_start_penetration_m, (int, float))
+                    or max_start_penetration_m < 0.0
+                ):
+                    return f"support_contacts[{index}].max_start_penetration_m must be >= 0"
+                if contact.get("require_separation_by_end", True) is not True:
+                    return f"support_contacts[{index}].require_separation_by_end must be true"
 
     if request.operation == "update_pose":
         if request.pose_position_m is None:
@@ -334,6 +363,14 @@ class KernelClient(ABC):
 
     @abstractmethod
     def scene_edit(self, request: SceneEditRequest) -> SceneEditResult: ...
+
+    def set_robot_base_pose(self, pose: Optional[Dict[str, Any]]) -> None:
+        """Set the semantic robot base pose for backends that support it.
+
+        Backends that do not model a movable robot base may ignore this. Runner
+        calls it before applying program scene resources so adapter backends can
+        project world-frame objects into their internal planning frame.
+        """
 
     @abstractmethod
     def get_link_pose(
@@ -432,6 +469,7 @@ class MockKernelClient(KernelClient):
         self.fail_next_execute = False
         self.fail_next_scene_edit = False
         self._objects: Dict[str, Dict[str, Any]] = {}
+        self.robot_base_pose: Optional[Dict[str, Any]] = None
         self._scene_trace: Deque[Dict[str, Any]] = deque(maxlen=4096)
         # Metrics counters
         self._metrics = {
@@ -709,6 +747,10 @@ class MockKernelClient(KernelClient):
         self.invalidate_count += 1
         self._metrics["cache_invalidations"] += 1
 
+    def set_robot_base_pose(self, pose: Optional[Dict[str, Any]]) -> None:
+        self.robot_base_pose = None if not pose else dict(pose)
+        self.invalidate_trajectories()
+
     def scene_edit(self, request: SceneEditRequest) -> SceneEditResult:
         self.scene_edits.append(request)
         state_before = self.get_object_state(request.object_id)
@@ -759,6 +801,10 @@ class MockKernelClient(KernelClient):
                 "shape_type": request.shape_type,
                 "box_dimensions_m": list(request.box_dimensions_m or []) or None,
                 "sphere_radius_m": request.sphere_radius_m,
+                "mesh_resource_uri": request.mesh_resource_uri,
+                "mesh_scale": list(request.mesh_scale or [1.0, 1.0, 1.0])
+                if request.shape_type == "mesh"
+                else None,
                 "position_m": list(request.pose_position_m or [0.0, 0.0, 0.0]),
                 "orientation_xyzw": list(request.pose_orientation_xyzw or [0.0, 0.0, 0.0, 1.0]),
                 "frame_id": request.frame_id or "universe",
@@ -781,6 +827,10 @@ class MockKernelClient(KernelClient):
                 "shape_type": request.shape_type,
                 "box_dimensions_m": list(request.box_dimensions_m or []) or None,
                 "sphere_radius_m": request.sphere_radius_m,
+                "mesh_resource_uri": request.mesh_resource_uri,
+                "mesh_scale": list(request.mesh_scale or [1.0, 1.0, 1.0])
+                if request.shape_type == "mesh"
+                else None,
                 "position_m": list(request.pose_position_m or [0.0, 0.0, 0.0]),
                 "orientation_xyzw": list(request.pose_orientation_xyzw or [0.0, 0.0, 0.0, 1.0]),
                 "frame_id": request.frame_id or "universe",
@@ -1042,6 +1092,12 @@ class MockKernelClient(KernelClient):
                 shape = SceneShape(
                     type="sphere",
                     sphere_radius_m=tracked.get("sphere_radius_m"),
+                )
+            elif tracked.get("shape_type") == "mesh":
+                shape = SceneShape(
+                    type="mesh",
+                    mesh_resource_uri=tracked.get("mesh_resource_uri"),
+                    mesh_scale=list(tracked.get("mesh_scale") or [1.0, 1.0, 1.0]),
                 )
             objects.append(
                 SceneObjectSnapshot(

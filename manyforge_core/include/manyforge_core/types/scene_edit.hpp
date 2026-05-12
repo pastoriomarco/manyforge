@@ -35,12 +35,25 @@ struct MeshShapeDTO {
 /// Collision shape as a tagged union (spec §3.9)
 using CollisionShapeDTO = std::variant<BoxShapeDTO, SphereShapeDTO, CylinderShapeDTO, MeshShapeDTO>;
 
+/// Declared support contact for an authored scene object.
+///
+/// This is a semantic ManyForge policy, not a backend collision-matrix knob:
+/// the object may start a release motion in contact with support_object_id, but
+/// trajectory validation must prove that the pair separates by the end of the
+/// motion and does not re-contact after separation.
+struct SupportContactDTO {
+  std::string support_object_id;
+  double max_start_penetration_m = 0.0;  // reserved for backends with contact depth
+  bool require_separation_by_end = true;
+};
+
 /// Add object request (spec §3.9)
 struct AddObjectRequestDTO {
   std::string object_id;  // unique within the backend-owned scene
   CollisionShapeDTO shape;
   Pose3DTO pose;          // expressed in frame_id
   std::string frame_id;   // reference frame for the object pose
+  std::vector<SupportContactDTO> support_contacts;
 };
 
 /// Remove object request (spec §3.9)

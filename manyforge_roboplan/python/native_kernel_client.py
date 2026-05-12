@@ -439,15 +439,18 @@ class NativeKernelClient(KernelClient):
     def invalidate_trajectories(self) -> None:
         self._bundle.invalidate_trajectories()
 
+    def set_robot_base_pose(self, pose: Optional[Dict[str, Any]]) -> None:
+        normalized = _normalize_pose_dict(pose) or {}
+        self._bundle.set_robot_base_pose(normalized)
+
     def scene_edit(self, request: SceneEditRequest) -> SceneEditResult:
         if request.operation == "upsert":
             state = self.get_object_state(request.object_id)
             if state.exists and state.attached:
                 return SceneEditResult(success=False, error="Cannot upsert attached object")
             # Skip the no-op remove when the object doesn't exist yet.
-            # Each remove triggers an LIFO replay in the C++ context, so a
-            # redundant "Could not find object" round trip is pure noise in the
-            # scene trace and forces the planner to churn pairs unnecessarily.
+            # A redundant "Could not find object" round trip is pure noise in
+            # the scene trace and forces the planner to churn pairs unnecessarily.
             if state.exists:
                 remove_result = self.scene_edit(
                     SceneEditRequest(operation="remove", object_id=request.object_id)
@@ -461,10 +464,13 @@ class NativeKernelClient(KernelClient):
                     shape_type=request.shape_type,
                     box_dimensions_m=request.box_dimensions_m,
                     sphere_radius_m=request.sphere_radius_m,
+                    mesh_resource_uri=request.mesh_resource_uri,
+                    mesh_scale=request.mesh_scale,
                     pose_position_m=request.pose_position_m,
                     pose_orientation_xyzw=request.pose_orientation_xyzw,
                     frame_id=request.frame_id,
                     touch_links=request.touch_links,
+                    support_contacts=request.support_contacts,
                 )
             )
 
@@ -478,6 +484,10 @@ class NativeKernelClient(KernelClient):
             req_dict["box_dimensions_m"] = request.box_dimensions_m
         if request.sphere_radius_m is not None:
             req_dict["sphere_radius_m"] = request.sphere_radius_m
+        if request.mesh_resource_uri is not None:
+            req_dict["mesh_resource_uri"] = request.mesh_resource_uri
+        if request.mesh_scale is not None:
+            req_dict["mesh_scale"] = request.mesh_scale
         if request.pose_position_m:
             req_dict["pose_position_m"] = request.pose_position_m
         if request.pose_orientation_xyzw:
@@ -486,6 +496,8 @@ class NativeKernelClient(KernelClient):
             req_dict["frame_id"] = request.frame_id
         if request.touch_links is not None:
             req_dict["touch_links"] = list(request.touch_links)
+        if request.support_contacts is not None:
+            req_dict["support_contacts"] = list(request.support_contacts)
 
         try:
             result = self._bundle.scene_edit(req_dict)

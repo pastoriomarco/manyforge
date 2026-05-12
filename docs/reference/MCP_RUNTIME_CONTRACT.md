@@ -3,7 +3,7 @@
   Regenerate with:
     cd /workspace
     python3 scripts/regen-public-contracts.py
-  Last regenerated: 2026-05-08 11:00:09 UTC
+  Last regenerated: 2026-05-11 07:40:49 UTC
   Generator source: scripts/regen-public-contracts.py:gen_mcp_contract
 -->
 
@@ -668,6 +668,33 @@ Input schema:
       ],
       "default": null,
       "title": "Sphere Radius M"
+    },
+    "mesh_resource_uri": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Mesh Resource Uri"
+    },
+    "mesh_scale": {
+      "anyOf": [
+        {
+          "items": {
+            "type": "number"
+          },
+          "type": "array"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Mesh Scale"
     },
     "pose_position_m": {
       "anyOf": [

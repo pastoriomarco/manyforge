@@ -82,6 +82,49 @@ def test_scene_state_uses_backend_authoritative_objects_for_runtime_additions():
     assert obj["attached_to"] is None
     assert obj["source"] == "runtime"
     assert obj["persistable"] is False
+    assert obj["viewer_frame_visible"] is False
+
+
+def test_scene_object_frame_visibility_routes_to_hmi_and_state():
+    client, state, kernel = make_client()
+    result = kernel.scene_edit(
+        SceneEditRequest(
+            operation="add",
+            object_id="runtime_box",
+            shape_type="box",
+            box_dimensions_m=[0.2, 0.1, 0.3],
+            pose_position_m=[0.5, -0.2, 0.4],
+            pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
+            frame_id="universe",
+        )
+    )
+    assert result.success is True
+
+    class DummyHmi:
+        def __init__(self):
+            self.visible: dict[str, bool] = {}
+            self.frame_gizmo_size = 0.1
+
+        def get_object_frame_visibility(self, object_id: str) -> bool:
+            return self.visible.get(object_id, False)
+
+        def set_object_frame_visibility(self, object_id: str, visible: bool) -> None:
+            self.visible[object_id] = visible
+
+    state.hmi_server = DummyHmi()
+
+    toggle = client.post(
+        "/api/scene/objects/frame-visibility",
+        json={"objectId": "runtime_box", "visible": True},
+    )
+    assert toggle.status_code == 200
+    assert toggle.json()["visible"] is True
+    assert state.hmi_server.visible["runtime_box"] is True
+
+    response = client.get("/api/scene/state")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["objects"][0]["viewer_frame_visible"] is True
 
 
 def test_scene_state_includes_robot_metadata_after_program_load():
@@ -114,6 +157,12 @@ def test_scene_frames_expose_model_inventory_and_visibility_control():
         def set_frame_visibility(self, frame_name: str, visible: bool) -> None:
             self.visible[frame_name] = visible
 
+        def get_frame_gizmo_size(self) -> float:
+            return self.frame_gizmo_size
+
+        def set_frame_gizmo_size(self, axes_length_m: float) -> None:
+            self.frame_gizmo_size = axes_length_m
+
     state.hmi_server = DummyHmi()
 
     response = client.get("/api/scene/frames")
@@ -121,6 +170,7 @@ def test_scene_frames_expose_model_inventory_and_visibility_control():
     data = response.json()
 
     assert data["hmiAvailable"] is True
+    assert data["frameGizmoSizeM"] == 0.1
     frame_names = {frame["name"] for frame in data["frames"]}
     assert "universe" in frame_names
     assert "base_link" in frame_names
@@ -136,6 +186,14 @@ def test_scene_frames_expose_model_inventory_and_visibility_control():
     )
     assert toggle.status_code == 200
     assert state.hmi_server.visible["base_link"] is True
+
+    resize = client.post(
+        "/api/scene/frames/gizmo-size",
+        json={"axesLengthM": 0.12},
+    )
+    assert resize.status_code == 200
+    assert resize.json()["axesLengthM"] == 0.12
+    assert state.hmi_server.frame_gizmo_size == 0.12
 
 
 def test_scene_frames_do_not_append_default_package_paths_when_deployment_declares_package_paths(monkeypatch):

@@ -58,11 +58,7 @@ parameters:
   description: Velocity scale for all moves.
 blackboard:
   namespaces: []
-  keys:
-  - id: gripper_closed
-    type: bool
-    key: gripper_closed
-    description: Logical gripper closed/open flag written after actuation succeeds.
+  keys: []
 tree:
   id: sequence
   name: pick_and_place
@@ -71,7 +67,10 @@ tree:
     name: command_gripper
     params:
       gripper_id: primary
-      command: open
+      position: 0.0
+      max_effort: 40.0
+      duration_s: 1.0
+      timeout_s: 0.0
   - id: move_manipulator_action
     name: move_to_pick_approach
     params:
@@ -118,10 +117,10 @@ tree:
     name: close_gripper
     params:
       gripper_id: primary
-      command: close
-      state_key:
-        key_ref: gripper_closed
-      timeout_s: 5
+      position: 0.66
+      max_effort: 40.0
+      duration_s: 1.0
+      timeout_s: 0.0
   - id: attach_object_to_link
     name: attach_graspable
     params:
@@ -203,10 +202,10 @@ tree:
     name: open_gripper
     params:
       gripper_id: primary
-      command: open
-      state_key:
-        key_ref: gripper_closed
-      timeout_s: 5
+      position: 0.0
+      max_effort: 40.0
+      duration_s: 1.0
+      timeout_s: 0.0
   - id: detach_object_from_link
     name: detach_graspable
     params:

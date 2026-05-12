@@ -31,6 +31,10 @@ def main() -> int:
     repo_root = Path(__file__).resolve().parents[1]
     if str(repo_root) not in sys.path:
         sys.path.insert(0, str(repo_root))
+    for package_root in ("manyforge_behavior", "manyforge_composer", "manyforge_ros"):
+        package_path = repo_root / package_root
+        if package_path.is_dir() and str(package_path) not in sys.path:
+            sys.path.insert(0, str(package_path))
 
     try:
         result = _run_smoke(args, repo_root)

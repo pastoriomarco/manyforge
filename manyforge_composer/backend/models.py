@@ -109,6 +109,7 @@ class RobotResponse(BaseModel):
     group_id: str = Field(alias="groupId")
     base_frame: str = Field(alias="baseFrame")
     tcp_frame: str = Field(alias="tcpFrame")
+    base_pose: Dict[str, Any] = Field(default_factory=dict, alias="basePose")
 
 
 class TreeNodeResponse(BaseModel):
@@ -472,9 +473,8 @@ class GripperConfigResponse(BaseModel):
     command_mode: str = Field(alias="commandMode")
     group_id: str = Field(alias="groupId")
     joint_name: str = Field(alias="jointName")
-    open_position: float = Field(alias="openPosition")
-    closed_position: float = Field(alias="closedPosition")
     motion_time_s: float = Field(alias="motionTimeS")
+    srdf_presets: Dict[str, float] = Field(default_factory=dict, alias="srdfPresets")
     description: str = ""
     touch_links: List[str] = Field(default_factory=list, alias="touchLinks")
     mount_frame: str = Field(default="", alias="mountFrame")
@@ -788,6 +788,7 @@ class SceneObjectResponse(BaseModel):
     attached_to: Optional[str] = None
     source: str = "runtime"
     persistable: bool = False
+    viewer_frame_visible: bool = False
 
 
 class SceneRobotResponse(BaseModel):
@@ -795,6 +796,7 @@ class SceneRobotResponse(BaseModel):
     group_id: Optional[str] = None
     base_frame: str
     tcp_frame: str
+    base_pose: Dict[str, Any] = Field(default_factory=dict)
     joint_names: List[str] = Field(default_factory=list)
     joint_positions: Dict[str, float] = Field(default_factory=dict)
     tcp_pose_in_base: Optional[Dict[str, Any]] = None
@@ -818,6 +820,7 @@ class SceneFramesResponse(BaseModel):
     model_config = _ALIAS_CFG
     frames: List[SceneFrameResponse] = Field(default_factory=list)
     hmi_available: bool = Field(alias="hmiAvailable")
+    frame_gizmo_size_m: float = Field(default=0.1, alias="frameGizmoSizeM")
     timestamp_ns: int = Field(alias="timestampNs")
 
 
@@ -837,12 +840,44 @@ class SceneFrameVisibilityResponse(BaseModel):
     error: Optional[str] = None
 
 
+class SceneFrameGizmoSizeRequest(BaseModel):
+    model_config = _ALIAS_CFG
+    axes_length_m: float = Field(alias="axesLengthM", gt=0.0, le=10.0)
+
+
+class SceneFrameGizmoSizeResponse(BaseModel):
+    model_config = _ALIAS_CFG
+    success: bool
+    axes_length_m: float = Field(alias="axesLengthM")
+    hmi_available: bool = Field(alias="hmiAvailable")
+    timestamp_ns: int = Field(alias="timestampNs")
+    error: Optional[str] = None
+
+
+class SceneObjectFrameVisibilityRequest(BaseModel):
+    model_config = _ALIAS_CFG
+    object_id: str = Field(alias="objectId", min_length=1)
+    visible: bool
+
+
+class SceneObjectFrameVisibilityResponse(BaseModel):
+    model_config = _ALIAS_CFG
+    success: bool
+    object_id: str = Field(alias="objectId")
+    visible: bool
+    hmi_available: bool = Field(alias="hmiAvailable")
+    timestamp_ns: int = Field(alias="timestampNs")
+    error: Optional[str] = None
+
+
 class SceneEditApiRequest(BaseModel):
     operation: Literal["add", "upsert", "remove", "update_pose", "attach", "detach"]
     object_id: str
-    shape_type: Optional[Literal["box", "sphere"]] = None
+    shape_type: Optional[Literal["box", "sphere", "mesh"]] = None
     box_dimensions_m: Optional[List[float]] = None
     sphere_radius_m: Optional[float] = None
+    mesh_resource_uri: Optional[str] = None
+    mesh_scale: Optional[List[float]] = None
     pose_position_m: Optional[List[float]] = None
     pose_orientation_xyzw: Optional[List[float]] = None
     frame_id: Optional[str] = None
@@ -867,6 +902,16 @@ class SceneEditApiRequest(BaseModel):
                     raise ValueError(
                         f"{self.operation} with shape_type=sphere requires sphere_radius_m > 0"
                     )
+            if self.shape_type == "mesh":
+                if not self.mesh_resource_uri:
+                    raise ValueError(
+                        f"{self.operation} with shape_type=mesh requires mesh_resource_uri"
+                    )
+                if self.mesh_scale is not None:
+                    if len(self.mesh_scale) != 3:
+                        raise ValueError("mesh_scale must have exactly 3 elements")
+                    if any(v <= 0.0 for v in self.mesh_scale):
+                        raise ValueError("mesh_scale values must be > 0")
 
         if self.operation == "update_pose":
             if self.pose_position_m is None or len(self.pose_position_m) != 3:
@@ -1328,6 +1373,11 @@ class AssistantInspectIsaacSceneRequest(BaseModel):
         default="llm_scene_authoring",
         alias="outputProfile",
     )
+    mesh_export_dir: Optional[str] = Field(default=None, alias="meshExportDir")
+    mesh_source_preference: Literal["auto", "original", "collider", "primitive"] = Field(
+        default="auto",
+        alias="meshSourcePreference",
+    )
     timeout_s: float = Field(default=10.0, alias="timeoutS", gt=0.0, le=120.0)
     request_topic: Optional[str] = Field(default=None, alias="requestTopic")
     response_topic: Optional[str] = Field(default=None, alias="responseTopic")
@@ -1350,6 +1400,7 @@ class AssistantProposeSceneObjectsRequest(BaseModel):
     inspection_report: Dict[str, Any] = Field(alias="inspectionReport")
     source_roots: List[str] = Field(default_factory=list, alias="sourceRoots")
     object_id_prefix: str = Field(default="", alias="objectIdPrefix")
+    mesh_resource_overrides: Dict[str, str] = Field(default_factory=dict, alias="meshResourceOverrides")
     max_proposals: Optional[int] = Field(default=None, alias="maxProposals", ge=1)
 
 

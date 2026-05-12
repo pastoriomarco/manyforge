@@ -8,6 +8,7 @@ from manyforge_behavior.kernel_client import (
     ExecutionSnapshot,
     GripperCommandStatus,
     ObjectState,
+    SceneObjectSnapshot,
 )
 
 
@@ -61,6 +62,10 @@ class StateBridge:
     def get_object_state(self, object_id: str) -> ObjectState:
         """Get the current backend-authoritative object state."""
         return self._cm.get_object_state(object_id)
+
+    def get_scene_objects(self) -> list[SceneObjectSnapshot]:
+        """Get backend-authoritative scene object snapshots."""
+        return self._cm.get_scene_objects()
 
     def get_gripper_status(self, gripper_id: str) -> GripperCommandStatus:
         """Get the latest actuated gripper status from the kernel."""

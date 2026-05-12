@@ -179,7 +179,7 @@ export function ControlBar() {
     }
 
     if (payload.tree || payload.programParameters || payload.blackboard) {
-      const validation = await api.program_validate(
+      const validation = await api.program.validate(
         draftTree!,
         programParameters,
         {

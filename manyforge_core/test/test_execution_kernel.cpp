@@ -360,6 +360,11 @@ class ControlledExecution : public IExecutionBackend {
     cv_.wait(lock, [this]() { return execute_count > 0; });
   }
 
+  void wait_until_execute_count(int count) {
+    std::unique_lock<std::mutex> lock(mu_);
+    cv_.wait(lock, [this, count]() { return execute_count >= count; });
+  }
+
   void wait_until_paused() {
     std::unique_lock<std::mutex> lock(mu_);
     cv_.wait(lock, [this]() { return paused_; });
@@ -669,6 +674,28 @@ TEST_F(ExecutionKernelTest, Execute_CacheHit_SkipsPlanning) {
   EXPECT_EQ(planner.plan_count, 0);
   EXPECT_GE(context.validate_count, 1);
   EXPECT_EQ(execution.execute_count, 1);
+}
+
+TEST_F(ExecutionKernelTest, Execute_CacheHitValidationFailure_BlocksExecution) {
+  cache.store("move_cached_invalid", make_test_trajectory());
+  context.next_validation = ValidationResultDTO{
+      false,
+      ErrorDTO{
+          kErrorValidationCollision,
+          "Cached trajectory is no longer valid under current collision policy",
+          {{"failure_stage", "cached_validation"}}}};
+
+  execute_sync(make_test_request("move_cached_invalid"));
+
+  EXPECT_EQ(planner.plan_count, 0);
+  EXPECT_EQ(context.validate_count, 1);
+  EXPECT_EQ(execution.execute_count, 0);
+  EXPECT_EQ(kernel.get_status().state, ExecutionState::kFailed);
+  EXPECT_FALSE(cache.lookup("move_cached_invalid").has_value());
+  const auto snapshot = kernel.get_execution_snapshot();
+  ASSERT_TRUE(snapshot.error.has_value());
+  EXPECT_EQ(snapshot.error->code, kErrorValidationCollision);
+  EXPECT_EQ(snapshot.error->details.at("failure_stage"), "cached_validation");
 }
 
 TEST_F(ExecutionKernelTest, Execute_CacheDisabled_IgnoresCache) {
@@ -1939,8 +1966,9 @@ TEST_F(ExecutionKernelTest, ConcurrentStress_RapidExecuteStopResetCycles) {
     auto result = local_kernel.execute(make_test_request());
     ASSERT_TRUE(result.ok()) << "Cycle " << i << " execute failed";
 
-    // Brief pause to let the worker start
-    std::this_thread::sleep_for(std::chrono::microseconds(200));
+    // Wait until the worker actually entered the backend. Sleeping here races:
+    // complete() can otherwise run before execute_trajectory() sets running_.
+    ctrl_exec.wait_until_execute_count(i + 1);
 
     // Complete the execution immediately
     ctrl_exec.complete();
@@ -1993,8 +2021,7 @@ TEST_F(ExecutionKernelTest, ConcurrentStress_RapidExecuteStopCycles) {
     auto result = local_kernel.execute(make_test_request());
     ASSERT_TRUE(result.ok()) << "Cycle " << i << " execute failed";
 
-    // Let execution start
-    std::this_thread::sleep_for(std::chrono::microseconds(200));
+    ctrl_exec.wait_until_execute_count(i + 1);
 
     // Stop mid-execution
     auto stop_result = local_kernel.stop();

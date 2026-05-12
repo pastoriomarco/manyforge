@@ -43,6 +43,22 @@ def assistant_tool_catalog() -> list[dict[str, Any]]:
                         "type": "string",
                         "enum": ["llm_scene_authoring", "raw_inventory"],
                     },
+                    "meshExportDir": {
+                        "type": "string",
+                        "description": (
+                            "Optional Isaac-side directory where logical object "
+                            "meshes should be exported as OBJ files."
+                        ),
+                    },
+                    "meshSourcePreference": {
+                        "type": "string",
+                        "enum": ["auto", "original", "collider", "primitive"],
+                        "description": (
+                            "Select which mesh source should drive scene-object "
+                            "recommendations. Use collider when the user wants "
+                            "the collision mesh instead of the original visual mesh."
+                        ),
+                    },
                 },
                 "additionalProperties": False,
             },
@@ -65,6 +81,15 @@ def assistant_tool_catalog() -> list[dict[str, Any]]:
                         "items": {"type": "string"},
                     },
                     "objectIdPrefix": {"type": "string"},
+                    "meshResourceOverrides": {
+                        "type": "object",
+                        "additionalProperties": {"type": "string"},
+                        "description": (
+                            "Optional sourceRoot -> mesh URI/path map. Use when "
+                            "the user selected an existing mesh asset instead of "
+                            "using the probe recommendation."
+                        ),
+                    },
                 },
                 "additionalProperties": False,
             },
@@ -129,6 +154,8 @@ def inspect_isaac_scene_report(request: Any) -> dict[str, Any]:
             max_colliders=request.max_colliders,
             purpose=tuple(request.purpose),
             output_profile=request.output_profile,
+            mesh_export_dir=request.mesh_export_dir,
+            mesh_source_preference=request.mesh_source_preference,
         )
         kwargs: dict[str, Any] = {"timeout_s": request.timeout_s}
         if request.request_topic:
@@ -148,6 +175,7 @@ def propose_scene_object_resources(
     *,
     source_roots: list[str] | None = None,
     object_id_prefix: str = "",
+    mesh_resource_overrides: dict[str, str] | None = None,
     max_proposals: int | None = None,
 ) -> dict[str, Any]:
     """Build non-mutating ManyForge scene-resource proposals from an Isaac report."""
@@ -158,6 +186,7 @@ def propose_scene_object_resources(
         raise AssistantToolError("inspectionReport.objects must be a list")
 
     selected = set(source_roots or [])
+    mesh_overrides = mesh_resource_overrides or {}
     warnings: list[str] = []
     proposals: list[dict[str, Any]] = []
     scene_resources: list[dict[str, Any]] = []
@@ -179,6 +208,7 @@ def propose_scene_object_resources(
             scene_resource = _scene_resource_from_object(
                 obj,
                 object_id_prefix=object_id_prefix,
+                mesh_resource_uri_override=mesh_overrides.get(source_root),
                 used_ids=used_ids,
             )
         except AssistantToolError as exc:
@@ -289,6 +319,7 @@ def _scene_resource_from_object(
     obj: dict[str, Any],
     *,
     object_id_prefix: str,
+    mesh_resource_uri_override: str | None,
     used_ids: set[str],
 ) -> dict[str, Any]:
     source_root = _required_string(obj, "source_root")
@@ -298,6 +329,14 @@ def _scene_resource_from_object(
 
     shape = _validated_shape(recommendation.get("shape"))
     pose = _validated_pose(recommendation.get("pose"))
+    if mesh_resource_uri_override is not None:
+        if not isinstance(mesh_resource_uri_override, str) or not mesh_resource_uri_override.strip():
+            raise AssistantToolError("mesh resource override must be a non-empty string")
+        shape = {
+            "type": "mesh",
+            "mesh_resource_uri": mesh_resource_uri_override.strip(),
+            "mesh_scale": [1.0, 1.0, 1.0],
+        }
     object_id = _unique_id(
         _sanitize_object_id(f"{object_id_prefix}{obj.get('id_hint') or source_root}"),
         used_ids,
@@ -384,6 +423,9 @@ def _scene_object_tree_node(
             params["box_dimensions_m"] = shape["box_dimensions_m"]
         elif shape["type"] == "sphere":
             params["sphere_radius_m"] = shape["sphere_radius_m"]
+        elif shape["type"] == "mesh":
+            params["mesh_resource_uri"] = shape["mesh_resource_uri"]
+            params["mesh_scale"] = shape.get("mesh_scale", [1.0, 1.0, 1.0])
     elif operation in {"attach_object_to_link", "detach_object_from_link"}:
         params["link_frame"] = link_frame
         if operation == "attach_object_to_link" and gripper_id:
@@ -441,6 +483,18 @@ def _validated_shape(value: Any) -> dict[str, Any]:
         if radius <= 0.0:
             raise AssistantToolError("sphere_radius_m must be > 0")
         return {"type": "sphere", "sphere_radius_m": radius}
+    if shape_type == "mesh":
+        resource_uri = value.get("mesh_resource_uri")
+        if not isinstance(resource_uri, str) or not resource_uri.strip():
+            raise AssistantToolError("mesh_resource_uri is required")
+        scale = _finite_number_list(value.get("mesh_scale", [1.0, 1.0, 1.0]), 3, "mesh_scale")
+        if any(component <= 0.0 for component in scale):
+            raise AssistantToolError("mesh_scale values must be > 0")
+        return {
+            "type": "mesh",
+            "mesh_resource_uri": resource_uri.strip(),
+            "mesh_scale": scale,
+        }
     raise AssistantToolError(f"unsupported recommended shape type: {shape_type!r}")
 
 

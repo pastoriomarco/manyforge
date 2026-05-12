@@ -80,6 +80,8 @@ def create_mcp_server(state: ComposerState):
         shape_type: Optional[str] = None,
         box_dimensions_m: Optional[list[float]] = None,
         sphere_radius_m: Optional[float] = None,
+        mesh_resource_uri: Optional[str] = None,
+        mesh_scale: Optional[list[float]] = None,
         pose_position_m: Optional[list[float]] = None,
         pose_orientation_xyzw: Optional[list[float]] = None,
         frame_id: Optional[str] = None,
@@ -97,9 +99,11 @@ def create_mcp_server(state: ComposerState):
         Args:
             operation: One of "add", "upsert", "remove", "update_pose", "attach", "detach"
             object_id: Unique identifier for the scene object
-            shape_type: Shape type for "add"/"upsert" — "box" or "sphere"
+            shape_type: Shape type for "add"/"upsert" — "box", "sphere", or "mesh"
             box_dimensions_m: [x, y, z] dimensions for box shapes
             sphere_radius_m: Radius for sphere shapes
+            mesh_resource_uri: Mesh resource URI/path for mesh shapes
+            mesh_scale: Optional [x, y, z] scale for mesh shapes
             pose_position_m: [x, y, z] position in meters
             pose_orientation_xyzw: [x, y, z, w] quaternion orientation
             frame_id: Robot link frame for attach/detach operations
@@ -134,6 +138,8 @@ def create_mcp_server(state: ComposerState):
                 shape_type=shape_type,
                 box_dimensions_m=box_dimensions_m,
                 sphere_radius_m=sphere_radius_m,
+                mesh_resource_uri=mesh_resource_uri,
+                mesh_scale=mesh_scale,
                 pose_position_m=pose_position_m,
                 pose_orientation_xyzw=pose_orientation_xyzw,
                 frame_id=frame_id,
@@ -207,6 +213,7 @@ def create_mcp_server(state: ComposerState):
                 "group_id": robot.group_id,
                 "base_frame": robot.base_frame,
                 "tcp_frame": robot.tcp_frame,
+                "base_pose": robot.base_pose,
             },
             "scene_count": len(program.scene),
             "parameter_count": len(program.parameters),

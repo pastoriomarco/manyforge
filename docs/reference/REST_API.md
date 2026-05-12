@@ -3,7 +3,7 @@
   Regenerate with:
     cd /workspace
     python3 scripts/regen-public-contracts.py
-  Last regenerated: 2026-05-08 11:00:09 UTC
+  Last regenerated: 2026-05-11 20:29:50 UTC
   Generator source: scripts/regen-public-contracts.py:gen_rest_api
 -->
 
@@ -85,7 +85,9 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer`.
 | `GET` | `/api/scene/diagnostics` | scene | Get Scene Diagnostics |
 | `POST` | `/api/scene/edit` | scene | Edit Scene |
 | `GET` | `/api/scene/frames` | scene | Get Scene Frames |
+| `POST` | `/api/scene/frames/gizmo-size` | scene | Set Frame Gizmo Size |
 | `POST` | `/api/scene/frames/visibility` | scene | Set Frame Visibility |
+| `POST` | `/api/scene/objects/frame-visibility` | scene | Set Object Frame Visibility |
 | `GET` | `/api/scene/snapshot` | scene | Get Scene Snapshot |
 | `GET` | `/api/scene/snapshots/{snapshot_id}` | scene | Get Published Scene Snapshot |
 | `GET` | `/api/scene/state` | scene | Get Scene State |

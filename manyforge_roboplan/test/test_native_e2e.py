@@ -37,6 +37,20 @@ UR10E_ARM_JOINTS = [
     "wrist_2_joint",
     "wrist_3_joint",
 ]
+UR10E_ROBOTIQ_ATTACHED_OBJECT_REPRO_Q = [
+    0.09528976894858,
+    -1.351485248665011,
+    2.11062921572848,
+    -2.3299263952809675,
+    -1.5707963829586316,
+    0.09608604784889696,
+]
+ROBOTIQ_GRASP_TOUCH_LINKS = [
+    "left_inner_finger",
+    "right_inner_finger",
+    "left_inner_finger_pad",
+    "right_inner_finger_pad",
+]
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _UR10E_URDF = _REPO_ROOT / "manyforge_example_models" / "models" / "ur10e_robotiq_2f_140" / "ur10e_robotiq_2f_140.urdf"
 _UR10E_SRDF = _REPO_ROOT / "manyforge_example_models" / "models" / "ur10e_robotiq_2f_140" / "ur10e_robotiq_2f_140.srdf"
@@ -123,6 +137,24 @@ def make_request_for_joints(
         planning_timeout_s=10.0,
         execution_timeout_s=30.0,
         cache_mode=cache_mode,
+    )
+
+
+def make_ur10e_joint_preview_request(move_id, goal):
+    return ExecuteRequest(
+        robot_id="robot1",
+        group_id="arm",
+        move_id=move_id,
+        base_frame="base_link",
+        tcp_frame="grasp_frame",
+        motion_type="joint_goal",
+        joint_goal_names=UR10E_ARM_JOINTS,
+        joint_goal_positions_rad=goal,
+        velocity_scale=1.0,
+        acceleration_scale=1.0,
+        planning_timeout_s=5.0,
+        execution_timeout_s=10.0,
+        cache_mode="disable",
     )
 
 
@@ -821,6 +853,253 @@ class TestNativeSceneEdits:
         assert pose["position_m"][0] == pytest.approx(0.40, abs=0.03)
         assert pose["position_m"][1] == pytest.approx(-0.30, abs=0.03)
         assert pose["position_m"][2] == pytest.approx(0.25, abs=0.03)
+
+
+class TestNativeUr10eRobotiqAttachedObjectCollision:
+
+    def _set_repro_robot_state(self, native_kernel):
+        native_kernel._bundle.set_group_joint_positions(
+            "arm",
+            UR10E_ROBOTIQ_ATTACHED_OBJECT_REPRO_Q,
+        )
+        native_kernel._bundle.set_group_joint_positions("gripper", [0.33])
+
+    def _add_clear_grasped_box(
+        self,
+        native_kernel,
+        object_id="attached_clear_box",
+        support_contacts=None,
+    ):
+        self._set_repro_robot_state(native_kernel)
+        grasp_pose = native_kernel.get_link_pose("grasp_frame", "universe")
+        assert grasp_pose is not None
+
+        object_offset_in_grasp = [0.0, 0.0, 0.1109473993]
+        object_pos_world = [
+            p + d for p, d in zip(
+                grasp_pose["position_m"],
+                rotate_vector_by_quaternion(
+                    object_offset_in_grasp,
+                    grasp_pose["orientation_xyzw"],
+                ),
+            )
+        ]
+
+        add_result = native_kernel.scene_edit(SceneEditRequest(
+            operation="add",
+            object_id=object_id,
+            shape_type="box",
+            box_dimensions_m=[0.092770782, 0.184926749, 0.040091786],
+            pose_position_m=object_pos_world,
+            pose_orientation_xyzw=grasp_pose["orientation_xyzw"],
+            frame_id="universe",
+            support_contacts=support_contacts,
+        ))
+        assert add_result.success is True, add_result.error
+
+        attach_result = native_kernel.scene_edit(SceneEditRequest(
+            operation="attach",
+            object_id=object_id,
+            frame_id="grasp_frame",
+            touch_links=ROBOTIQ_GRASP_TOUCH_LINKS,
+        ))
+        assert attach_result.success is True, attach_result.error
+        return object_pos_world, grasp_pose["orientation_xyzw"]
+
+    def test_attached_object_collision_pose_uses_named_frame_not_parent_joint(
+        self,
+        native_kernel_ur10e_robotiq,
+    ):
+        self._add_clear_grasped_box(native_kernel_ur10e_robotiq)
+
+        preview = native_kernel_ur10e_robotiq.preview_motion(
+            make_ur10e_joint_preview_request(
+                "attached_object_named_frame_pose",
+                UR10E_ROBOTIQ_ATTACHED_OBJECT_REPRO_Q,
+            )
+        )
+
+        assert preview.ok is True, preview.error
+
+    def test_attached_object_still_collides_with_world_obstacles_at_carried_pose(
+        self,
+        native_kernel_ur10e_robotiq,
+    ):
+        object_pos_world, object_orientation_world = self._add_clear_grasped_box(
+            native_kernel_ur10e_robotiq,
+            object_id="attached_overlap_box",
+        )
+        obstacle_result = native_kernel_ur10e_robotiq.scene_edit(SceneEditRequest(
+            operation="add",
+            object_id="attached_pose_obstacle",
+            shape_type="box",
+            box_dimensions_m=[0.04, 0.04, 0.04],
+            pose_position_m=object_pos_world,
+            pose_orientation_xyzw=object_orientation_world,
+            frame_id="universe",
+        ))
+        assert obstacle_result.success is True, obstacle_result.error
+
+        preview = native_kernel_ur10e_robotiq.preview_motion(
+            make_ur10e_joint_preview_request(
+                "attached_object_obstacle_pose",
+                UR10E_ROBOTIQ_ATTACHED_OBJECT_REPRO_Q,
+            )
+        )
+
+        assert preview.ok is False
+        assert preview.error is not None
+        assert "attached_pose_obstacle" in (
+            preview.error + " " + str(preview.error_details)
+        )
+
+    def test_declared_support_contact_reaches_validation_and_requires_release(
+        self,
+        native_kernel_ur10e_robotiq,
+    ):
+        self._set_repro_robot_state(native_kernel_ur10e_robotiq)
+        grasp_pose = native_kernel_ur10e_robotiq.get_link_pose("grasp_frame", "universe")
+        assert grasp_pose is not None
+        object_offset_in_grasp = [0.0, 0.0, 0.1109473993]
+        support_pos_world = [
+            p + d for p, d in zip(
+                grasp_pose["position_m"],
+                rotate_vector_by_quaternion(
+                    object_offset_in_grasp,
+                    grasp_pose["orientation_xyzw"],
+                ),
+            )
+        ]
+        support_pos_world[2] -= 0.035
+
+        support_result = native_kernel_ur10e_robotiq.scene_edit(SceneEditRequest(
+            operation="add",
+            object_id="support_surface",
+            shape_type="box",
+            box_dimensions_m=[0.12, 0.20, 0.04],
+            pose_position_m=support_pos_world,
+            pose_orientation_xyzw=grasp_pose["orientation_xyzw"],
+            frame_id="universe",
+        ))
+        assert support_result.success is True, support_result.error
+
+        self._add_clear_grasped_box(
+            native_kernel_ur10e_robotiq,
+            object_id="supported_attached_box",
+            support_contacts=[
+                {
+                    "support_object_id": "support_surface",
+                    "max_start_penetration_m": 0.02,
+                    "require_separation_by_end": True,
+                }
+            ],
+        )
+
+        preview = native_kernel_ur10e_robotiq.preview_motion(
+            make_ur10e_joint_preview_request(
+                "support_contact_requires_release",
+                UR10E_ROBOTIQ_ATTACHED_OBJECT_REPRO_Q,
+            )
+        )
+
+        assert preview.ok is False
+        assert preview.error is not None
+        assert "start state is already in collision" not in preview.error
+        assert "Support-contact pair did not separate" in preview.error
+
+    def test_dynamic_attached_support_contact_requires_release(
+        self,
+        native_kernel_ur10e_robotiq,
+    ):
+        self._set_repro_robot_state(native_kernel_ur10e_robotiq)
+        grasp_pose = native_kernel_ur10e_robotiq.get_link_pose("grasp_frame", "universe")
+        assert grasp_pose is not None
+        object_offset_in_grasp = [0.0, 0.0, 0.1109473993]
+        support_pos_world = [
+            p + d for p, d in zip(
+                grasp_pose["position_m"],
+                rotate_vector_by_quaternion(
+                    object_offset_in_grasp,
+                    grasp_pose["orientation_xyzw"],
+                ),
+            )
+        ]
+        support_pos_world[2] -= 0.035
+
+        support_result = native_kernel_ur10e_robotiq.scene_edit(SceneEditRequest(
+            operation="add",
+            object_id="dynamic_support_surface",
+            shape_type="box",
+            box_dimensions_m=[0.12, 0.20, 0.04],
+            pose_position_m=support_pos_world,
+            pose_orientation_xyzw=grasp_pose["orientation_xyzw"],
+            frame_id="universe",
+        ))
+        assert support_result.success is True, support_result.error
+
+        self._add_clear_grasped_box(
+            native_kernel_ur10e_robotiq,
+            object_id="dynamic_supported_attached_box",
+        )
+
+        preview = native_kernel_ur10e_robotiq.preview_motion(
+            make_ur10e_joint_preview_request(
+                "dynamic_support_contact_requires_release",
+                UR10E_ROBOTIQ_ATTACHED_OBJECT_REPRO_Q,
+            )
+        )
+
+        assert preview.ok is False
+        assert preview.error is not None
+        assert "start state is already in collision" not in preview.error
+        assert "Support-contact pair did not separate" in preview.error
+        assert "dynamic_support_surface" in (
+            preview.error + " " + str(preview.error_details)
+        )
+
+    def test_detached_declared_support_contact_does_not_require_release(
+        self,
+        native_kernel_ur10e_robotiq,
+    ):
+        self._set_repro_robot_state(native_kernel_ur10e_robotiq)
+
+        support_result = native_kernel_ur10e_robotiq.scene_edit(SceneEditRequest(
+            operation="add",
+            object_id="detached_support_surface",
+            shape_type="box",
+            box_dimensions_m=[0.30, 0.30, 0.05],
+            pose_position_m=[0.65, 0.65, 0.025],
+            pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
+            frame_id="universe",
+        ))
+        assert support_result.success is True, support_result.error
+
+        object_result = native_kernel_ur10e_robotiq.scene_edit(SceneEditRequest(
+            operation="add",
+            object_id="detached_supported_box",
+            shape_type="box",
+            box_dimensions_m=[0.10, 0.10, 0.08],
+            pose_position_m=[0.65, 0.65, 0.04],
+            pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
+            frame_id="universe",
+            support_contacts=[
+                {
+                    "support_object_id": "detached_support_surface",
+                    "max_start_penetration_m": 0.02,
+                    "require_separation_by_end": True,
+                }
+            ],
+        ))
+        assert object_result.success is True, object_result.error
+
+        preview = native_kernel_ur10e_robotiq.preview_motion(
+            make_ur10e_joint_preview_request(
+                "detached_support_contact_ignored_for_robot_move",
+                UR10E_ROBOTIQ_ATTACHED_OBJECT_REPRO_Q,
+            )
+        )
+
+        assert preview.ok is True, preview.error
 
 
 # ============================================================================

@@ -129,6 +129,48 @@ class TestMockKernelSceneEdit:
         assert len(kernel.scene_edits) == 1
         assert kernel.scene_edits[0].object_id == "box1"
 
+    def test_scene_edit_records_support_contacts(self, kernel):
+        req = SceneEditRequest(
+            operation="add",
+            object_id="box1",
+            shape_type="box",
+            box_dimensions_m=[0.1, 0.1, 0.1],
+            support_contacts=[
+                {
+                    "support_object_id": "table",
+                    "max_start_penetration_m": 0.005,
+                    "require_separation_by_end": True,
+                }
+            ],
+        )
+        result = kernel.scene_edit(req)
+        assert result.success
+        assert kernel.scene_edits[0].support_contacts == [
+            {
+                "support_object_id": "table",
+                "max_start_penetration_m": 0.005,
+                "require_separation_by_end": True,
+            }
+        ]
+
+    def test_scene_edit_rejects_non_releasing_support_contact(self, kernel):
+        result = kernel.scene_edit(
+            SceneEditRequest(
+                operation="add",
+                object_id="box1",
+                shape_type="box",
+                box_dimensions_m=[0.1, 0.1, 0.1],
+                support_contacts=[
+                    {
+                        "support_object_id": "table",
+                        "require_separation_by_end": False,
+                    }
+                ],
+            )
+        )
+        assert result.success is False
+        assert result.error == "support_contacts[0].require_separation_by_end must be true"
+
     def test_scene_edit_failure_injection(self, kernel):
         kernel.fail_next_scene_edit = True
         req = SceneEditRequest(
@@ -172,6 +214,22 @@ class TestMockKernelSceneEdit:
         assert snapshot.shape.type == "sphere"
         assert snapshot.pose_in_universe is not None
         assert snapshot.pose_in_universe["position_m"] == pytest.approx([0.4, 0.5, 0.6])
+
+    def test_scene_edit_adds_mesh_object(self, kernel):
+        result = kernel.scene_edit(SceneEditRequest(
+            operation="add",
+            object_id="mesh1",
+            shape_type="mesh",
+            mesh_resource_uri="file:///tmp/mesh.obj",
+            mesh_scale=[1.0, 2.0, 3.0],
+            pose_position_m=[0.1, 0.2, 0.3],
+        ))
+        assert result.success is True
+        snapshot = kernel.get_scene_objects()[0]
+        assert snapshot.shape is not None
+        assert snapshot.shape.type == "mesh"
+        assert snapshot.shape.mesh_resource_uri == "file:///tmp/mesh.obj"
+        assert snapshot.shape.mesh_scale == [1.0, 2.0, 3.0]
 
     def test_scene_trace_records_scene_mutations(self, kernel):
         kernel.scene_edit(SceneEditRequest(

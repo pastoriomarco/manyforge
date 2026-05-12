@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -12,6 +13,7 @@ import yaml
 
 from manyforge_behavior.capabilities import CAPABILITY_REGISTRY, get_required_keys
 from manyforge_behavior.catalog import SEMVER_RE
+from manyforge_behavior.model_paths import normalize_package_paths, resolve_resource_path
 
 EXPECTED_API_VERSION = "manyforge.deployment.v0"
 EXPECTED_MODEL_ENDPOINT_PROFILE_REGISTRY_API_VERSION = (
@@ -34,9 +36,8 @@ class GripperConfig:
     command_mode: str
     group_id: str
     joint_name: str
-    open_position: float
-    closed_position: float
     motion_time_s: float
+    srdf_presets: dict[str, float] = field(default_factory=dict)
     description: str = ""
     touch_links: list[str] = field(default_factory=list)
     mount_frame: str = ""
@@ -496,6 +497,7 @@ class Deployment:
         if grippers_data and not isinstance(grippers_data, dict):
             raise DeploymentValidationError("grippers must be a mapping")
         parsed: dict[str, GripperConfig] = {}
+        srdf_group_states = self._load_srdf_group_state_positions()
         for gripper_id, gripper_data in (grippers_data or {}).items():
             if not isinstance(gripper_data, dict):
                 raise DeploymentValidationError(f"grippers.{gripper_id} must be a mapping")
@@ -514,18 +516,16 @@ class Deployment:
             if not joint_name:
                 raise DeploymentValidationError(f"grippers.{gripper_id}.joint_name is required")
 
-            try:
-                open_position = float(gripper_data.get("open_position"))
-            except (TypeError, ValueError) as exc:
+            if "open_position" in gripper_data:
                 raise DeploymentValidationError(
-                    f"grippers.{gripper_id}.open_position must be a number"
-                ) from exc
-            try:
-                closed_position = float(gripper_data.get("closed_position"))
-            except (TypeError, ValueError) as exc:
+                    f"grippers.{gripper_id}.open_position is no longer supported; "
+                    "define an SRDF group_state preset instead"
+                )
+            if "closed_position" in gripper_data:
                 raise DeploymentValidationError(
-                    f"grippers.{gripper_id}.closed_position must be a number"
-                ) from exc
+                    f"grippers.{gripper_id}.closed_position is no longer supported; "
+                    "define an SRDF group_state preset instead"
+                )
             try:
                 motion_time_s = float(gripper_data.get("motion_time_s", 0.0))
             except (TypeError, ValueError) as exc:
@@ -536,6 +536,7 @@ class Deployment:
                 raise DeploymentValidationError(
                     f"grippers.{gripper_id}.motion_time_s must be > 0"
                 )
+            srdf_presets = dict(srdf_group_states.get((group_id, joint_name), {}))
             touch_links_data = gripper_data.get("touch_links", [])
             if not isinstance(touch_links_data, list):
                 raise DeploymentValidationError(
@@ -571,9 +572,8 @@ class Deployment:
                 command_mode=command_mode,
                 group_id=group_id,
                 joint_name=joint_name,
-                open_position=open_position,
-                closed_position=closed_position,
                 motion_time_s=motion_time_s,
+                srdf_presets=srdf_presets,
                 description=str(gripper_data.get("description", "")),
                 touch_links=touch_links,
                 mount_frame=mount_frame,
@@ -582,6 +582,53 @@ class Deployment:
                 auxiliary_frames=auxiliary_frames,
             )
         return parsed
+
+    def _load_srdf_group_state_positions(
+        self,
+    ) -> dict[tuple[str, str], dict[str, float]]:
+        """Return SRDF group-state positions keyed by (group, joint).
+
+        Only explicit SRDF group states are treated as semantic presets. If the
+        SRDF cannot be resolved during early deployment editing, we return no
+        presets and keep the raw deployment values as ordinary metadata.
+        """
+        robot_config = self.robot_config
+        if robot_config is None or not robot_config.srdf_path:
+            return {}
+        try:
+            search_roots = normalize_package_paths(
+                robot_config.package_paths,
+                base_dir=self._path.resolve().parent,
+            )
+            srdf_path = resolve_resource_path(
+                robot_config.srdf_path,
+                base_dir=self._path.resolve().parent,
+                package_paths=search_roots,
+            )
+            root = ET.parse(srdf_path).getroot()
+        except Exception:
+            return {}
+
+        states: dict[tuple[str, str], dict[str, float]] = {}
+        for group_state in root.findall("group_state"):
+            state_name = str(group_state.get("name") or "").strip()
+            group_name = str(group_state.get("group") or "").strip()
+            if not state_name or not group_name:
+                continue
+            normalized_state = state_name.lower()
+            for joint in group_state.findall("joint"):
+                joint_name = str(joint.get("name") or "").strip()
+                raw_value = joint.get("value")
+                if not joint_name or raw_value is None:
+                    continue
+                try:
+                    value = float(raw_value)
+                except ValueError:
+                    continue
+                states.setdefault((group_name, joint_name), {})[
+                    normalized_state
+                ] = value
+        return states
 
     def _parse_optional_frame_name(
         self,
@@ -1663,8 +1710,6 @@ class Deployment:
                     "command_mode": gripper.command_mode,
                     "group_id": gripper.group_id,
                     "joint_name": gripper.joint_name,
-                    "open_position": gripper.open_position,
-                    "closed_position": gripper.closed_position,
                     "motion_time_s": gripper.motion_time_s,
                     "description": gripper.description,
                     "touch_links": list(gripper.touch_links),
@@ -1843,8 +1888,6 @@ class Deployment:
                     "command_mode": config.command_mode,
                     "group_id": config.group_id,
                     "joint_name": config.joint_name,
-                    "open_position": config.open_position,
-                    "closed_position": config.closed_position,
                     "motion_time_s": config.motion_time_s,
                     "description": config.description,
                     "touch_links": list(config.touch_links),
@@ -1864,12 +1907,6 @@ class Deployment:
                     "group_id": gripper_data.get("group_id", current.get("group_id", "")),
                     "joint_name": gripper_data.get(
                         "joint_name", current.get("joint_name", "")
-                    ),
-                    "open_position": gripper_data.get(
-                        "open_position", current.get("open_position")
-                    ),
-                    "closed_position": gripper_data.get(
-                        "closed_position", current.get("closed_position")
                     ),
                     "motion_time_s": gripper_data.get(
                         "motion_time_s", current.get("motion_time_s", 0.0)
