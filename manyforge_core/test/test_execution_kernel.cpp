@@ -5,6 +5,7 @@
 
 #include <chrono>
 #include <condition_variable>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <thread>
@@ -185,8 +186,11 @@ class MockExecution : public IExecutionBackend {
   int pause_count = 0;
   int resume_count = 0;
   int reset_count = 0;
+  int sync_count = 0;
   TrajectoryDTO last_trajectory;
   ExecutionSnapshot snapshot;
+  Result<void> next_sync_result = Result<void>::Ok();
+  std::function<void()> on_sync;
 
   ExecutionHandle execute_trajectory(const TrajectoryDTO& trajectory) override {
     ++execute_count;
@@ -199,6 +203,14 @@ class MockExecution : public IExecutionBackend {
     return ExecutionHandle{
         [](int64_t /*timeout_ns*/) { return true; },
         [this]() { return snapshot; }};
+  }
+
+  Result<void> sync_observed_state_before_planning() override {
+    ++sync_count;
+    if (on_sync) {
+      on_sync();
+    }
+    return next_sync_result;
   }
 
   StopResultDTO stop() override {
@@ -228,6 +240,10 @@ class MockExecution : public IExecutionBackend {
     ++reset_count;
     return ResetResultDTO{true, std::nullopt};
   }
+
+  ExecutionSnapshot get_execution_snapshot() const override {
+    return snapshot;
+  }
 };
 
 class ControlledExecution : public IExecutionBackend {
@@ -256,6 +272,10 @@ class ControlledExecution : public IExecutionBackend {
     }
     cv_.notify_all();
     return make_handle();
+  }
+
+  Result<void> sync_observed_state_before_planning() override {
+    return Result<void>::Ok();
   }
 
   StopResultDTO stop() override {
@@ -317,6 +337,11 @@ class ControlledExecution : public IExecutionBackend {
     }
     cv_.notify_all();
     return ResetResultDTO{true, std::nullopt};
+  }
+
+  ExecutionSnapshot get_execution_snapshot() const override {
+    std::lock_guard<std::mutex> lock(mu_);
+    return snapshot;
   }
 
   void set_progress(double progress, std::vector<double> joint_positions) {
@@ -393,7 +418,7 @@ class ControlledExecution : public IExecutionBackend {
         }};
   }
 
-  std::mutex mu_;
+  mutable std::mutex mu_;
   std::condition_variable cv_;
   bool running_ = false;
   bool paused_ = false;
@@ -435,6 +460,11 @@ class ThreadSafeManualScheduler final : public IScheduler {
     for (auto& callback : to_fire) {
       callback();
     }
+  }
+
+  size_t pending_count() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return pending_.size();
   }
 
  private:
@@ -494,6 +524,17 @@ bool wait_for_state(ExecutionKernel& kernel, ExecutionState target_state,
                     int max_attempts = 200) {
   for (int attempt = 0; attempt < max_attempts; ++attempt) {
     if (kernel.get_status().state == target_state) {
+      return true;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  return false;
+}
+
+bool wait_for_pending_scheduler_work(ThreadSafeManualScheduler& scheduler,
+                                     int max_attempts = 200) {
+  for (int attempt = 0; attempt < max_attempts; ++attempt) {
+    if (scheduler.pending_count() > 0) {
       return true;
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -713,6 +754,61 @@ TEST_F(ExecutionKernelTest, Execute_CacheDisabled_DoesNotStore) {
   EXPECT_FALSE(cache.lookup("move_no_store").has_value());
 }
 
+// --- Observed-state sync before planning ---
+
+TEST_F(ExecutionKernelTest, Execute_SyncObservedStateBeforePlanning_CalledBeforePlanner) {
+  execution.on_sync = [this]() {
+    RobotStateDTO state;
+    state.joint_names = {"j1", "j2"};
+    state.positions_rad = {0.25, -0.5};
+    context.current_state = state;
+  };
+
+  auto result = execute_sync(make_test_request("move_after_sync"));
+
+  ASSERT_TRUE(result.ok());
+  EXPECT_EQ(execution.sync_count, 1);
+  ASSERT_EQ(planner.plan_count, 1);
+  ASSERT_EQ(planner.last_request.start_state.positions_rad.size(), 2u);
+  EXPECT_DOUBLE_EQ(planner.last_request.start_state.positions_rad[0], 0.25);
+  EXPECT_DOUBLE_EQ(planner.last_request.start_state.positions_rad[1], -0.5);
+}
+
+TEST_F(ExecutionKernelTest, Execute_SyncObservedStateBeforePlanningFailure_BlocksPlanning) {
+  execution.next_sync_result = Result<void>::Err(
+      ErrorDTO{kErrorStartStateMismatch, "No fresh observed robot state", {}});
+
+  auto result = execute_sync(make_test_request("move_no_fresh_state"));
+
+  ASSERT_FALSE(result.ok());
+  EXPECT_EQ(result.error().code, kErrorStartStateMismatch);
+  EXPECT_EQ(execution.sync_count, 1);
+  EXPECT_EQ(planner.plan_count, 0);
+  EXPECT_EQ(context.validate_count, 0);
+  EXPECT_EQ(execution.execute_count, 0);
+  EXPECT_EQ(kernel.get_status().state, ExecutionState::kIdle);
+}
+
+TEST_F(ExecutionKernelTest, Execute_CacheHitWithStaleStart_InvalidatesAndReplans) {
+  auto stale_cached = make_test_trajectory();
+  ASSERT_FALSE(stale_cached.waypoints.empty());
+  stale_cached.waypoints.front().positions_rad = {0.5, 0.5};
+  cache.store("move_stale_start", stale_cached);
+
+  auto result = execute_sync(make_test_request("move_stale_start"));
+
+  ASSERT_TRUE(result.ok());
+  EXPECT_EQ(execution.sync_count, 1);
+  EXPECT_EQ(planner.plan_count, 1);
+  EXPECT_GE(context.validate_count, 1);
+  EXPECT_EQ(execution.execute_count, 1);
+  auto refreshed = cache.lookup("move_stale_start");
+  ASSERT_TRUE(refreshed.has_value());
+  ASSERT_FALSE(refreshed->waypoints.empty());
+  EXPECT_DOUBLE_EQ(refreshed->waypoints.front().positions_rad[0], 0.0);
+  EXPECT_DOUBLE_EQ(refreshed->waypoints.front().positions_rad[1], 0.0);
+}
+
 // --- Planning failure ---
 
 TEST_F(ExecutionKernelTest, Execute_PlanningFails_TransitionsToFailed) {
@@ -802,6 +898,29 @@ TEST_F(ExecutionKernelTest, AcknowledgeCompleted_FromFailed_Rejected) {
   auto ack = kernel.acknowledge_completed(result.value());
   EXPECT_FALSE(ack.accepted);
   EXPECT_EQ(kernel.get_status().state, ExecutionState::kFailed);
+}
+
+TEST_F(ExecutionKernelTest, Execute_FromFailed_ResetsStateAndRetriesWithoutBackendReset) {
+  PlanResultDTO plan_err;
+  plan_err.error = ErrorDTO{kErrorPlanningFailed, "No solution", {}};
+  planner.next_result = plan_err;
+
+  auto first = execute_sync(make_test_request("first_fails"));
+  ASSERT_TRUE(first.ok());
+  EXPECT_EQ(kernel.get_status().state, ExecutionState::kFailed);
+  EXPECT_EQ(execution.execute_count, 0);
+  EXPECT_EQ(execution.reset_count, 0);
+
+  PlanResultDTO plan_ok;
+  plan_ok.trajectory = make_test_trajectory();
+  planner.next_result = plan_ok;
+
+  auto retry = execute_sync(make_test_request("retry_after_failure"));
+  ASSERT_TRUE(retry.ok());
+  EXPECT_EQ(kernel.get_status().state, ExecutionState::kCompleted);
+  EXPECT_EQ(execution.execute_count, 1);
+  EXPECT_EQ(execution.reset_count, 0);
+  EXPECT_EQ(execution.sync_count, 2);
 }
 
 // --- Stop ---
@@ -931,9 +1050,17 @@ TEST_F(ExecutionKernelTest, Reset_FromFailed_ToIdle) {
   EXPECT_EQ(kernel.get_status().state, ExecutionState::kIdle);
 }
 
-TEST_F(ExecutionKernelTest, Reset_FromIdle_NotAccepted) {
+TEST_F(ExecutionKernelTest, Reset_FromIdle_ResetsBackendAndPublishesSnapshot) {
+  execution.snapshot.joint_positions_rad = {0.5, -0.25};
   auto result = kernel.reset();
-  EXPECT_FALSE(result.accepted);
+  EXPECT_TRUE(result.accepted);
+  EXPECT_EQ(execution.reset_count, 1);
+  EXPECT_EQ(kernel.get_status().state, ExecutionState::kIdle);
+  auto snapshot = kernel.get_execution_snapshot();
+  EXPECT_EQ(snapshot.state, ExecutionState::kIdle);
+  ASSERT_EQ(snapshot.joint_positions_rad.size(), 2u);
+  EXPECT_DOUBLE_EQ(snapshot.joint_positions_rad[0], 0.5);
+  EXPECT_DOUBLE_EQ(snapshot.joint_positions_rad[1], -0.25);
 }
 
 TEST_F(ExecutionKernelTest, Reset_ThenExecuteAgain) {
@@ -1012,6 +1139,7 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_UsesConfiguredPeriod) {
   ASSERT_TRUE(result.ok());
   controlled_execution.wait_until_execute_called();
   ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kExecuting));
+  ASSERT_TRUE(wait_for_pending_scheduler_work(local_scheduler));
   const int baseline_collision_count = context.collision_count;
 
   local_clock.advance(49'000'000);
@@ -1813,7 +1941,12 @@ TEST_F(ExecutionKernelTest, ExecutionTimeout_TransitionsToFailed) {
 
   // The timeout check happens in the polling loop — need a brief real-time wait
   // for the worker thread to process
-  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  const bool timed_out = wait_for_state(timeout_kernel, ExecutionState::kFailed, 5000);
+  if (!timed_out) {
+    controlled_execution.release();
+    (void)timeout_kernel.wait_for_completion(1'000'000'000);
+  }
+  ASSERT_TRUE(timed_out);
 
   auto status = timeout_kernel.get_status();
   EXPECT_EQ(status.state, ExecutionState::kFailed);

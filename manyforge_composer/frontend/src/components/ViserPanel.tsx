@@ -30,32 +30,41 @@ export function ViserPanel({ onCollapse, blocked, resizing = false }: ViserPanel
   useEffect(() => {
     let active = true;
 
-    void api.infra.status()
-      .then((status) => {
-        if (!active) {
-          return;
-        }
-        const hmi = status.components.hmi;
-        const port = hmi?.port;
-        if (hmi?.status === 'healthy' && typeof port === 'number' && port > 0) {
-          setHmiPort(String(port));
-          setHmiAvailable(true);
-          setHmiDetail(null);
-          return;
-        }
-        setHmiAvailable(false);
-        setHmiDetail('Start Composer with --hmi-port 8081 to enable the embedded Viser view.');
-      })
-      .catch(() => {
-        if (active) {
-          // Fall back to the default HMI port when infra status is unavailable.
-          setHmiAvailable(null);
-          setHmiDetail(null);
-        }
-      });
+    const refresh = () => {
+      void Promise.all([api.infra.status(), api.runtime.status().catch(() => null)])
+        .then(([status, runtimeStatus]) => {
+          if (!active) {
+            return;
+          }
+          const hmi = status.components.hmi;
+          const port = hmi?.port;
+          if (hmi?.status === 'healthy' && typeof port === 'number' && port > 0) {
+            setHmiPort(String(port));
+            setHmiAvailable(true);
+            setHmiDetail(null);
+            return;
+          }
+          setHmiAvailable(false);
+          setHmiDetail(
+            runtimeStatus?.userMessage
+            || 'Load a program/deployment to start the embedded Viser view.',
+          );
+        })
+        .catch(() => {
+          if (active) {
+            // Fall back to the default HMI port when infra status is unavailable.
+            setHmiAvailable(null);
+            setHmiDetail(null);
+          }
+        });
+    };
+
+    refresh();
+    const interval = window.setInterval(refresh, 2000);
 
     return () => {
       active = false;
+      window.clearInterval(interval);
     };
   }, []);
 

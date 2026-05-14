@@ -39,6 +39,16 @@ UR10E_ROBOTIQ_EXAMPLE_DEPLOYMENT_PATH = (
 UR10E_ROBOTIQ_EXAMPLE_PROGRAM_PATH = (
     Path(__file__).resolve().parents[2] / "examples" / "pick_and_place_ur10e_robotiq.program.yaml"
 )
+ISAAC_LIGHT_ROS2_CONTROL_DEPLOYMENT_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "examples"
+    / "isaac_manipulator_scene_light_ros2_control.deployment.yaml"
+)
+ISAAC_LIGHT_PROGRAM_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "examples"
+    / "isaac_manipulator_scene_light.program.yaml"
+)
 INTERRUPT_EXAMPLE_DEPLOYMENT_PATH = (
     Path(__file__).resolve().parents[2] / "examples" / "interrupt_pick_and_place.deployment.yaml"
 )
@@ -1250,6 +1260,24 @@ class TestCrossArtifactValidation:
             "open": 0.0,
             "closed": 0.66,
         }
+        deploy.validate_against_program(prog)
+        deploy.validate_capabilities()
+
+    def test_validate_against_isaac_light_ros2_control_program_success(self, catalog):
+        """The Isaac light-scene ROS execution deployment matches the saved program."""
+        deploy = Deployment(ISAAC_LIGHT_ROS2_CONTROL_DEPLOYMENT_PATH)
+        prog = Program(ISAAC_LIGHT_PROGRAM_PATH, catalog)
+        assert (
+            deploy.adapters["execution"].adapter_id
+            == "execution.ros2_control_follow_joint_trajectory"
+        )
+        assert deploy.adapters["execution"].config["arm_action"] == (
+            "/isaac_arm_controller/follow_joint_trajectory"
+        )
+        assert deploy.grippers["primary"].command_mode == "ros_gripper_command"
+        assert deploy.adapters["execution"].config["gripper"]["action_name"] == (
+            "/robotiq_gripper_controller/gripper_cmd"
+        )
         deploy.validate_against_program(prog)
         deploy.validate_capabilities()
 

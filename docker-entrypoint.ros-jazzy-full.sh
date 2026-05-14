@@ -11,6 +11,13 @@ if [ -f "/opt/ros/${ROS_DISTRO}/setup.bash" ]; then
     set -u
 fi
 
+if [ -f "/opt/manyforge/topic_based_ros2_control/install/setup.bash" ]; then
+    # shellcheck disable=SC1091
+    set +u
+    source "/opt/manyforge/topic_based_ros2_control/install/setup.bash"
+    set -u
+fi
+
 if [ -d "$MANYFORGE_VENV" ]; then
     # shellcheck disable=SC1091
     set +u

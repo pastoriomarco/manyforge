@@ -29,6 +29,11 @@ from manyforge_composer.backend.security import SecurityConfig
 
 logger = logging.getLogger(__name__)
 
+_ROS2_CONTROL_EXECUTION_ADAPTER_IDS = {
+    "execution.ros2_control_fjt",
+    "execution.ros2_control_follow_joint_trajectory",
+}
+
 
 def _configure_assistant_provider(
     state: ComposerState,
@@ -75,6 +80,23 @@ def _default_public_api_base_url(host: str, port: int) -> str:
         return override.rstrip("/")
     resolved_host = "localhost" if host in {"0.0.0.0", "::"} else host
     return f"http://{resolved_host}:{port}"
+
+
+def _optional_float_env(name: str) -> float | None:
+    value = os.environ.get(name, "").strip()
+    return float(value) if value else None
+
+
+def _optional_int_env(name: str) -> int | None:
+    value = os.environ.get(name, "").strip()
+    return int(value) if value else None
+
+
+def _bool_env(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _resolved_robot_model_from_deployment(
@@ -237,6 +259,15 @@ def _collision_monitor_period_ns_from_deployment(
     return int(period_ms * 1_000_000.0)
 
 
+def _execution_adapter_id_from_deployment(deployment: Deployment | None) -> str:
+    if deployment is None:
+        return "execution.roboplan_native"
+    execution = deployment.adapters.get("execution")
+    if execution is None:
+        return "execution.roboplan_native"
+    return execution.adapter_id
+
+
 def _native_model_and_group_from_deployment(
     deployment: Deployment | None,
 ) -> tuple[str, str]:
@@ -245,6 +276,43 @@ def _native_model_and_group_from_deployment(
     model_name = Path(deployment.robot_config.urdf_path).stem or "ur5_gripper"
     group_name = deployment.robot_config.group_id or "arm"
     return model_name, group_name
+
+
+def _make_ros2_control_kernel(
+    deployment: Deployment,
+    *,
+    collision_monitor_period_ns: int | None,
+):
+    """Create the ROS 2 controller-backed kernel.
+
+    The implementation intentionally lives outside Composer.  Composer owns
+    deployment selection and UI/server wiring; the ROS runtime package owns the
+    ROS-specific backend that satisfies the core ``IExecutionBackend`` port.
+    """
+    try:
+        from manyforge_ros.ros2_control_kernel_factory import (
+            create_ros2_control_kernel,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "Deployment selected ROS 2 controller execution "
+            f"({_execution_adapter_id_from_deployment(deployment)}), but the "
+            "ROS runtime kernel factory is not available. Start Composer in the "
+            "ROS-capable image and build/install the manyforge_ros runtime "
+            "adapter before loading this deployment."
+        ) from exc
+
+    try:
+        return create_ros2_control_kernel(
+            deployment=deployment,
+            collision_monitor_period_ns=collision_monitor_period_ns,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "ROS 2 controller execution runtime factory failed while building "
+            "the Composer kernel. Check the ROS adapter build, deployment "
+            "controller config, and ROS endpoint availability."
+        ) from exc
 
 
 def _make_kernel(
@@ -264,10 +332,26 @@ def _make_kernel(
             mock_execute_duration_s,
         )
         return MockKernelClient(execute_duration_s=mock_execute_duration_s), None
-    model_name, group_name = _native_model_and_group_from_deployment(deployment)
+    execution_adapter_id = _execution_adapter_id_from_deployment(deployment)
     collision_monitor_period_ns = _collision_monitor_period_ns_from_deployment(
         deployment
     )
+    if execution_adapter_id in _ROS2_CONTROL_EXECUTION_ADAPTER_IDS:
+        if deployment is None:
+            raise RuntimeError(
+                "ROS 2 controller execution requires a loaded deployment"
+            )
+        return _make_ros2_control_kernel(
+            deployment,
+            collision_monitor_period_ns=collision_monitor_period_ns,
+        )
+    if execution_adapter_id not in {"execution.roboplan_native", "execution.test"}:
+        raise RuntimeError(
+            f"Unsupported execution adapter '{execution_adapter_id}'. "
+            "Supported Composer runtime adapters are execution.roboplan_native "
+            "and execution.ros2_control_follow_joint_trajectory."
+        )
+    model_name, group_name = _native_model_and_group_from_deployment(deployment)
     try:
         import manyforge_roboplan_py
         from native_kernel_client import NativeKernelClient
@@ -334,6 +418,10 @@ def _run_mcp(args):
         kernel_factory=_make_kernel,
         kernel_bundle=bundle,
         trace_dir="/tmp/manyforge-traces",
+        failure_archive_dir=args.failure_archive_dir,
+        failure_archive_enabled=not args.disable_failure_archive,
+        failure_archive_max_age_s=args.failure_archive_max_age_s,
+        failure_archive_max_bytes=args.failure_archive_max_bytes,
         allowed_fs_roots=security.allowed_fs_roots,
     )
     _configure_assistant_provider(
@@ -422,6 +510,38 @@ def main():
                         help="Run as MCP server over stdio (no HTTP)")
     parser.add_argument("--mcp-http", action="store_true",
                         help="Enable HTTP/SSE MCP transport on /api/mcp (alongside REST)")
+    parser.add_argument(
+        "--failure-archive-dir",
+        default=os.environ.get("MANYFORGE_FAILURE_ARCHIVE_DIR"),
+        help=(
+            "Directory for file-backed execution failure archives. Defaults to "
+            "<trace-dir>/failure-archives."
+        ),
+    )
+    parser.add_argument(
+        "--failure-archive-max-age-s",
+        type=float,
+        default=_optional_float_env("MANYFORGE_FAILURE_ARCHIVE_MAX_AGE_S"),
+        help=(
+            "Optional archive retention age in seconds. Older archives are "
+            "deleted FIFO by directory mtime."
+        ),
+    )
+    parser.add_argument(
+        "--failure-archive-max-bytes",
+        type=int,
+        default=_optional_int_env("MANYFORGE_FAILURE_ARCHIVE_MAX_BYTES"),
+        help=(
+            "Optional archive disk budget in bytes. Oldest archives are deleted "
+            "until the budget is satisfied."
+        ),
+    )
+    parser.add_argument(
+        "--disable-failure-archive",
+        action="store_true",
+        default=_bool_env("MANYFORGE_DISABLE_FAILURE_ARCHIVE", False),
+        help="Disable file-backed failure archives.",
+    )
     args = parser.parse_args()
 
     setup_logging(args.log_level)
@@ -474,6 +594,10 @@ def main():
         ),
         kernel_bundle=bundle,
         trace_dir="/tmp/manyforge-traces",
+        failure_archive_dir=args.failure_archive_dir,
+        failure_archive_enabled=not args.disable_failure_archive,
+        failure_archive_max_age_s=args.failure_archive_max_age_s,
+        failure_archive_max_bytes=args.failure_archive_max_bytes,
         allowed_fs_roots=security.allowed_fs_roots,
     )
     _configure_assistant_provider(

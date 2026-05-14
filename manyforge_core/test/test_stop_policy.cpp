@@ -183,6 +183,20 @@ TEST_F(StopPolicyTest, ResetFromFailed_ToIdle) {
   EXPECT_EQ(sm.status().state, ExecutionState::kIdle);
 }
 
+TEST_F(StopPolicyTest, ResetFromInterventionRequired_ToIdle) {
+  sm.try_transition(ExecutionState::kPlanning);
+  sm.try_transition(ExecutionState::kInterventionRequired);
+  EXPECT_TRUE(policy.request_reset().ok());
+  EXPECT_EQ(sm.status().state, ExecutionState::kIdle);
+}
+
+TEST_F(StopPolicyTest, InterventionRequiredTransitionIsIdempotent) {
+  sm.try_transition(ExecutionState::kPlanning);
+  EXPECT_TRUE(sm.try_transition(ExecutionState::kInterventionRequired).ok());
+  EXPECT_TRUE(sm.try_transition(ExecutionState::kInterventionRequired).ok());
+  EXPECT_EQ(sm.status().state, ExecutionState::kInterventionRequired);
+}
+
 TEST_F(StopPolicyTest, ResetFromExecuting_ToIdle) {
   go_to_executing();
   EXPECT_TRUE(policy.request_reset().ok());

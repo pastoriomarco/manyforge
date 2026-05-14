@@ -26,6 +26,7 @@ class RoboPlanExecutionBackend final : public core::IExecutionBackend {
   ~RoboPlanExecutionBackend() override;
 
   core::ExecutionHandle execute_trajectory(const core::TrajectoryDTO& trajectory) override;
+  core::Result<void> sync_observed_state_before_planning() override;
   core::StopResultDTO stop() override;
   core::PauseResultDTO pause() override;
   core::ExecutionHandle resume(const core::TrajectoryDTO& trajectory) override;

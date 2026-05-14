@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <mutex>
 
 #include <roboplan/core/scene.hpp>
 #include <roboplan/core/path_utils.hpp>
@@ -20,7 +21,8 @@ class RoboPlanPlannerBackend final : public core::IPlannerBackend {
                          const roboplan::RRTOptions& rrt_options,
                          std::shared_ptr<roboplan::PathShortcutter> shortcutter,
                          std::shared_ptr<roboplan::PathParameterizerTOPPRA> toppra,
-                         std::shared_ptr<roboplan::SimpleIk> ik);
+                         std::shared_ptr<roboplan::SimpleIk> ik,
+                         std::shared_ptr<std::mutex> scene_mutex = nullptr);
 
   core::PlanResultDTO plan(const core::PlanRequestDTO& request) override;
 
@@ -32,6 +34,7 @@ class RoboPlanPlannerBackend final : public core::IPlannerBackend {
   std::shared_ptr<roboplan::PathShortcutter> shortcutter_;
   std::shared_ptr<roboplan::PathParameterizerTOPPRA> toppra_;
   std::shared_ptr<roboplan::SimpleIk> ik_;
+  std::shared_ptr<std::mutex> scene_mutex_;
 };
 
 }  // namespace manyforge::roboplan_backend

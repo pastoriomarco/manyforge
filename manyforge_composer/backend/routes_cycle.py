@@ -83,6 +83,10 @@ def create_cycle_router(state: ComposerState) -> APIRouter:
                 raise HTTPException(status_code=409, detail=str(exc))
         else:
             state.cycle_manager.reset()
+        try:
+            state.reset_backend_authoritative_sim_if_needed(reason="cycle_reset")
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
         logger.info("Cycle state: %s → %s", prev, state.cycle_manager.state.value)
         return {"state": state.cycle_manager.state.value}
 

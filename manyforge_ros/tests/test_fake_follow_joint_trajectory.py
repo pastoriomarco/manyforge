@@ -79,3 +79,81 @@ def test_fake_follow_joint_trajectory_accepts_and_completes_goal():
         server_node.destroy_node()
         client_node.destroy_node()
         rclpy.shutdown()
+
+
+def test_fake_follow_joint_trajectory_can_abort_with_error_feedback():
+    rclpy = pytest.importorskip("rclpy")
+    pytest.importorskip("control_msgs")
+    pytest.importorskip("trajectory_msgs")
+
+    from action_msgs.msg import GoalStatus
+    from control_msgs.action import FollowJointTrajectory
+    from rclpy.action import ActionClient
+    from rclpy.executors import MultiThreadedExecutor
+    from trajectory_msgs.msg import JointTrajectoryPoint
+
+    from manyforge_ros.testing.fake_follow_joint_trajectory import (
+        FakeFollowJointTrajectoryServer,
+    )
+
+    rclpy.init(args=None)
+    executor = MultiThreadedExecutor(num_threads=2)
+    server_node = rclpy.create_node("manyforge_fake_fjt_abort_server_test")
+    client_node = rclpy.create_node("manyforge_fake_fjt_abort_client_test")
+    feedback_errors: list[list[float]] = []
+
+    fake_server = FakeFollowJointTrajectoryServer(
+        server_node,
+        action_name="/fake_arm_controller/follow_joint_trajectory_abort",
+        abort_after_feedback=True,
+        feedback_error_positions=[0.0, -0.203],
+        abort_error_string="Aborted due to path tolerance violation",
+    )
+    client = ActionClient(
+        client_node,
+        FollowJointTrajectory,
+        fake_server.action_name,
+    )
+    executor.add_node(server_node)
+    executor.add_node(client_node)
+    thread = threading.Thread(target=executor.spin, daemon=True)
+    thread.start()
+
+    try:
+        assert client.wait_for_server(timeout_sec=2.0)
+
+        goal = FollowJointTrajectory.Goal()
+        goal.trajectory.joint_names = ["joint_1", "joint_2"]
+        goal.trajectory.points = [
+            _point(JointTrajectoryPoint, [0.0, 0.0], 1),
+            _point(JointTrajectoryPoint, [0.1, -0.1], 2),
+        ]
+
+        goal_handle = _wait_for_future(
+            client.send_goal_async(
+                goal,
+                feedback_callback=lambda feedback: feedback_errors.append(
+                    list(feedback.feedback.error.positions)
+                ),
+            )
+        )
+        assert goal_handle.accepted
+
+        result_response = _wait_for_future(goal_handle.get_result_async())
+        assert result_response.status == GoalStatus.STATUS_ABORTED
+        assert (
+            result_response.result.error_code
+            == FollowJointTrajectory.Result.PATH_TOLERANCE_VIOLATED
+        )
+        assert (
+            result_response.result.error_string
+            == "Aborted due to path tolerance violation"
+        )
+        assert feedback_errors == [[0.0, -0.203]]
+    finally:
+        fake_server.destroy()
+        client.destroy()
+        executor.shutdown()
+        server_node.destroy_node()
+        client_node.destroy_node()
+        rclpy.shutdown()

@@ -132,6 +132,10 @@ class ComposerState:
         kernel_factory: Optional[Callable[[Optional[Deployment]], tuple[KernelClient, Any]]] = None,
         kernel_bundle: Any = None,
         trace_dir: str | None = None,
+        failure_archive_dir: str | None = None,
+        failure_archive_enabled: bool = True,
+        failure_archive_max_age_s: float | None = None,
+        failure_archive_max_bytes: int | None = None,
         allowed_fs_roots: list[str] | None = None,
     ):
         self.catalog = NodeCatalog(catalog_path)
@@ -149,7 +153,14 @@ class ComposerState:
         self.hmi_public_port: int | None = None
         self.public_api_base_url: str | None = None
         self._on_program_loaded: Optional[Callable[["ComposerState"], None]] = None
-        self.event_recorder = EventRecorder(trace_dir=trace_dir)
+        self.started_at_ns = time.monotonic_ns()
+        self.event_recorder = EventRecorder(
+            trace_dir=trace_dir,
+            failure_archive_dir=failure_archive_dir,
+            failure_archive_enabled=failure_archive_enabled,
+            failure_archive_max_age_s=failure_archive_max_age_s,
+            failure_archive_max_bytes=failure_archive_max_bytes,
+        )
         self.scene_edit_lock = threading.Lock()
         self.allowed_fs_roots = normalize_allowed_roots(allowed_fs_roots)
         self._runtime_overrides: dict[str, RuntimeOverrideRecord] = {}
@@ -177,6 +188,8 @@ class ComposerState:
         # same class produce different prefixes for the model and break
         # repetition loops on thinking-off configurations.
         self._assistant_failure_counts: dict[str, int] = {}
+        self._external_runtime_status_lock = threading.Lock()
+        self._external_runtime_statuses: dict[str, dict[str, Any]] = {}
         self.skill_catalog: SkillCatalog = load_skill_catalog(
             default_skills_dir(),
             catalog=self.catalog,
@@ -1312,6 +1325,7 @@ class ComposerState:
         self._clear_published_scene_snapshots()
         self.cycle_manager = CycleManager(runner, self._kernel)
         self._bind_cycle_manager_callbacks()
+        self.reset_backend_authoritative_sim_if_needed(reason="program_load")
 
         if self._on_program_loaded:
             try:
@@ -1349,6 +1363,7 @@ class ComposerState:
         deployment_path: Optional[str] = None,
         *,
         force_discard_overrides: bool = False,
+        defer_initial_runtime_reset: bool = False,
     ) -> Program:
         """Load a program (and optional deployment). Creates new runner + CycleManager.
 
@@ -1408,6 +1423,8 @@ class ComposerState:
         self._clear_published_scene_snapshots()
         self.cycle_manager = CycleManager(runner, self._kernel)
         self._bind_cycle_manager_callbacks()
+        if not defer_initial_runtime_reset:
+            self.reset_backend_authoritative_sim_if_needed(reason="program_load")
 
         # Notify listeners (e.g. Viser HMI)
         if self._on_program_loaded:
@@ -1417,3 +1434,64 @@ class ComposerState:
                 logger.exception("on_program_loaded callback failed")
 
         return self.program
+
+    def update_external_runtime_status(self, provider_id: str, payload: dict[str, Any]) -> None:
+        """Record a deployment-side runtime status contribution.
+
+        Bringup supervisors and adapters can use this narrow HTTP-fed surface to
+        report external readiness without introducing ROS dependencies into
+        Composer.  The runtime status route applies freshness filtering before
+        exposing the contribution to the UI.
+        """
+        provider = provider_id.strip()
+        if not provider:
+            raise ValueError("provider_id must not be empty")
+        record = dict(payload)
+        record["providerId"] = provider
+        record["receivedAtNs"] = time.monotonic_ns()
+        with self._external_runtime_status_lock:
+            self._external_runtime_statuses[provider] = record
+
+    def external_runtime_statuses(self, *, max_age_s: float = 5.0) -> dict[str, dict[str, Any]]:
+        """Return fresh external runtime status contributions keyed by provider."""
+        now_ns = time.monotonic_ns()
+        max_age_ns = int(max_age_s * 1e9)
+        fresh: dict[str, dict[str, Any]] = {}
+        stale: list[str] = []
+        with self._external_runtime_status_lock:
+            for provider, record in self._external_runtime_statuses.items():
+                received_at_ns = int(record.get("receivedAtNs", 0) or 0)
+                if received_at_ns and now_ns - received_at_ns <= max_age_ns:
+                    fresh[provider] = dict(record)
+                else:
+                    stale.append(provider)
+            for provider in stale:
+                self._external_runtime_statuses.pop(provider, None)
+        return fresh
+
+    def reset_backend_authoritative_sim_if_needed(self, *, reason: str) -> None:
+        """Push simulator-authoritative profiles back to their configured initial state.
+
+        Real controller-backed deployments keep the physical/controller state as
+        truth and therefore must not move on software reset.  The Isaac
+        commanded-sim preview is explicitly different: ManyForge owns the
+        simulator command truth, so program load/reset should command the
+        configured initial joint vector through the execution backend.
+        """
+        deployment = self.deployment
+        if deployment is None:
+            return
+        execution = deployment.adapters.get("execution")
+        if execution is None:
+            return
+        config = dict(execution.config or {})
+        if config.get("execution_state_source_mode") != "commanded_sim":
+            return
+        if config.get("reset_to_initial_on_load", True) is False and reason == "program_load":
+            return
+        result = self._kernel.reset()
+        if not result.accepted:
+            raise RuntimeError(
+                "commanded_sim reset to initial robot state failed: "
+                f"{result.error or 'unknown error'}"
+            )

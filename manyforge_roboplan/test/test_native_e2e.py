@@ -714,6 +714,60 @@ class TestNativeSceneEdits:
         assert pose["position_m"][1] == pytest.approx(-0.3, abs=0.03)
         assert pose["position_m"][2] == pytest.approx(0.25, abs=0.03)
 
+    def test_relative_move_resolves_object_reference_for_preview_motion(self, native_kernel):
+        reset_to_demo_rest(native_kernel)
+        add_result = native_kernel.scene_edit(SceneEditRequest(
+            operation="add", object_id="preview_ref_box", shape_type="box",
+            box_dimensions_m=[0.05, 0.05, 0.05],
+            pose_position_m=[0.3, -0.3, 0.15],
+            pose_orientation_xyzw=[0.0, 0.0, -0.38268343, 0.92387953],
+            frame_id="universe",
+        ))
+        assert add_result.success is True, add_result.error
+
+        preview = native_kernel.preview_motion(
+            make_relative_request(
+                "native_relative_preview_object",
+                "preview_ref_box",
+                [0.0, 0.0, 0.10],
+                [180.0, 0.0, -90.0],
+            )
+        )
+
+        assert preview.ok is True, preview.error
+        assert preview.final_tcp_pose is not None
+        assert preview.final_tcp_pose["position_m"][0] == pytest.approx(0.3, abs=0.03)
+        assert preview.final_tcp_pose["position_m"][1] == pytest.approx(-0.3, abs=0.03)
+        assert preview.final_tcp_pose["position_m"][2] == pytest.approx(0.25, abs=0.03)
+
+    def test_relative_move_resolves_object_reference_for_plan_motion(self, native_kernel):
+        reset_to_demo_rest(native_kernel)
+        add_result = native_kernel.scene_edit(SceneEditRequest(
+            operation="add", object_id="plan_ref_box", shape_type="box",
+            box_dimensions_m=[0.05, 0.05, 0.05],
+            pose_position_m=[0.3, -0.3, 0.15],
+            pose_orientation_xyzw=[0.0, 0.0, -0.38268343, 0.92387953],
+            frame_id="universe",
+        ))
+        assert add_result.success is True, add_result.error
+
+        preview, trajectory = native_kernel.plan_motion(
+            make_relative_request(
+                "native_relative_plan_object",
+                "plan_ref_box",
+                [0.0, 0.0, 0.10],
+                [180.0, 0.0, -90.0],
+            )
+        )
+
+        assert preview.ok is True, preview.error
+        assert trajectory is not None
+        assert trajectory.waypoints
+        assert preview.final_tcp_pose is not None
+        assert preview.final_tcp_pose["position_m"][0] == pytest.approx(0.3, abs=0.03)
+        assert preview.final_tcp_pose["position_m"][1] == pytest.approx(-0.3, abs=0.03)
+        assert preview.final_tcp_pose["position_m"][2] == pytest.approx(0.25, abs=0.03)
+
     def test_relative_move_recomputes_goal_after_object_pose_changes(self, native_kernel):
         reset_to_demo_rest(native_kernel)
         native_kernel.scene_edit(SceneEditRequest(

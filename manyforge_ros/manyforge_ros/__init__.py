@@ -1,8 +1,7 @@
 """ManyForge ROS adapter package.
 
-This package intentionally keeps ROS-specific code out of ManyForge core and
-behavior packages.  The initial contents are deterministic fake ROS targets for
-adapter contract tests; production adapter nodes should live here as the ROS
-interface is frozen.
+ROS-specific helper scripts and launch-time configuration live here.  Runtime
+arm execution and observation for ros2_control deployments is implemented in
+the C++ ``manyforge_roboplan`` backend so timing-sensitive action, feedback,
+and freshness handling stays outside Python.
 """
-

@@ -1,0 +1,31 @@
+name: cpp-tsan
+
+on:
+  pull_request:
+    paths:
+      - "manyforge_core/**"
+      - "scripts/ci/run-core-tsan.sh"
+      - ".github/workflows/cpp-tsan.yml"
+  push:
+    branches: [main, dev]
+    paths:
+      - "manyforge_core/**"
+      - "scripts/ci/run-core-tsan.sh"
+      - ".github/workflows/cpp-tsan.yml"
+  workflow_dispatch:
+
+jobs:
+  manyforge-core-tsan:
+    name: manyforge_core ThreadSanitizer
+    runs-on: ubuntu-24.04
+    env:
+      TSAN_OPTIONS: halt_on_error=1 second_deadlock_stack=1 history_size=7
+      CMAKE_BUILD_PARALLEL_LEVEL: "2"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install C++ test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake g++ libgtest-dev
+      - name: Run core C++ tests under ThreadSanitizer
+        run: bash scripts/ci/run-core-tsan.sh

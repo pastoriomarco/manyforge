@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -235,6 +236,18 @@ class TestSemanticEvents:
         semantic_types = [e["type"] for e in events]
         assert "execute_failed" in semantic_types
 
+    def test_stopping_to_intervention_required(self):
+        rec = EventRecorder()
+        rec.observe(_StubState(cycle_manager=_StubCycleManager("idle")))
+        rec.observe(_StubState(cycle_manager=_StubCycleManager("running")))
+
+        events = self._observe_kernel_transition(
+            rec, ExecutionState.STOPPING, ExecutionState.INTERVENTION_REQUIRED,
+        )
+        intervention_events = [e for e in events if e["type"] == "intervention_required"]
+        assert intervention_events
+        assert intervention_events[-1]["severity"] == "ERROR"
+
     def test_executing_to_paused(self):
         rec = EventRecorder()
         rec.observe(_StubState(cycle_manager=_StubCycleManager("idle")))
@@ -340,6 +353,106 @@ class TestJSONLSink:
         assert record["timeline_id"] == run_id
         assert record["attributes"]["interrupt_id"] == "int-001"
         assert record["attributes"]["preemption_mode"] == "hold_cycle"
+
+    def test_failure_archive_written_for_execution_failure(self, tmp_path):
+        rec = EventRecorder(trace_dir=tmp_path)
+        rec.observe(_StubState(cycle_manager=_StubCycleManager("idle")))
+        rec.observe(_StubState(cycle_manager=_StubCycleManager("running")))
+        run_id = rec.current_run_id
+
+        executing = _StubStatus(
+            state=ExecutionState.EXECUTING,
+            execution_id=7,
+            active_move_id="move_pick",
+            progress=0.25,
+        )
+        rec.observe(
+            _StubState(
+                cycle_manager=_StubCycleManager(
+                    "running",
+                    kernel_status=executing,
+                    kernel_snapshot=_StubSnapshot(),
+                ),
+                kernel=_StubKernel(status=executing, snapshot=_StubSnapshot()),
+            )
+        )
+
+        failed = _StubStatus(
+            state=ExecutionState.FAILED,
+            execution_id=7,
+            active_move_id="move_pick",
+            progress=0.25,
+        )
+        failed_snapshot = _StubSnapshot(error="tracking tolerance violation")
+        rec.observe(
+            _StubState(
+                cycle_manager=_StubCycleManager(
+                    "running",
+                    kernel_status=failed,
+                    kernel_snapshot=failed_snapshot,
+                ),
+                kernel=_StubKernel(status=failed, snapshot=failed_snapshot),
+            )
+        )
+
+        archive_root = tmp_path / "failure-archives"
+        archives = sorted(path for path in archive_root.iterdir() if path.is_dir())
+        assert archives
+        manifest = json.loads((archives[0] / "manifest.json").read_text())
+        assert manifest["schema_version"] == "manyforge.failure_archive.v1"
+        assert manifest["trigger"]["type"] == "execute_failed"
+        assert manifest["trigger"]["run_id"] == run_id
+        assert manifest["trigger"]["execution_id"] == 7
+        trigger = json.loads((archives[0] / "trigger_event.json").read_text())
+        assert trigger["details"]["error"] == "tracking tolerance violation"
+        assert (archives[0] / "recent_events.jsonl").read_text().strip()
+
+        status = rec.failure_archive_status()
+        assert status["enabled"] is True
+        assert status["archive_count"] == 1
+        assert status["last_archive_id"] == archives[0].name
+
+    def test_failure_archive_cleanup_uses_age_and_fifo_budget(self, tmp_path):
+        archive_root = tmp_path / "archives"
+        archive_root.mkdir()
+        old_by_age = archive_root / "incident-old-by-age"
+        old_by_age.mkdir()
+        (old_by_age / "payload.bin").write_bytes(b"x" * 128)
+        fifo_oldest = archive_root / "incident-fifo-oldest"
+        fifo_oldest.mkdir()
+        (fifo_oldest / "payload.bin").write_bytes(b"x" * 15000)
+        fifo_newer = archive_root / "incident-fifo-newer"
+        fifo_newer.mkdir()
+        (fifo_newer / "payload.bin").write_bytes(b"x" * 4000)
+
+        now = time.time()
+        old_time = now - 3600.0
+        os.utime(old_by_age, (old_time, old_time))
+        os.utime(fifo_oldest, (now - 300.0, now - 300.0))
+        os.utime(fifo_newer, (now - 60.0, now - 60.0))
+
+        rec = EventRecorder(
+            trace_dir=tmp_path / "traces",
+            failure_archive_dir=archive_root,
+            failure_archive_max_age_s=600.0,
+            failure_archive_max_bytes=20000,
+        )
+        rec.observe(_StubState(cycle_manager=_StubCycleManager("idle")))
+        rec.observe(_StubState(cycle_manager=_StubCycleManager("running")))
+        rec._record_event(
+            event_type="cycle_error",
+            run_id=rec.current_run_id,
+            details={"error": "simulated incident"},
+        )
+
+        assert not old_by_age.exists()
+        assert not fifo_oldest.exists()
+        assert fifo_newer.exists()
+        assert any(path.name.startswith("incident-") for path in archive_root.iterdir())
+        cleanup = rec.failure_archive_status()["last_cleanup"]
+        assert cleanup["deleted_count"] >= 2
+        assert "max_age_s" in cleanup["reason"]
+        assert "max_bytes" in cleanup["reason"]
 
     def test_history_filters_by_severity_component_and_type(self):
         rec = EventRecorder()

@@ -107,8 +107,6 @@ _ALLOWED_INTERRUPT_KINDS = {"edge", "level"}
 _ALLOWED_GRIPPER_COMMAND_MODES = {
     "simulated_joint",
     "ros_gripper_command",
-    "ros_follow_joint_trajectory",
-    "ros_joint_state_publish",
 }
 _ALLOWED_AUTHORITY_DOMAINS = {
     "motion",

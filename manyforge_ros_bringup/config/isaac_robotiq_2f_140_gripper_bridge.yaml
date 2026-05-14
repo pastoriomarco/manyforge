@@ -1,0 +1,24 @@
+manyforge_isaac_gripper_action_bridge:
+  ros__parameters:
+    action_name: /robotiq_gripper_controller/gripper_cmd
+    command_topic: /isaac_gripper_state
+    state_topic: /isaac_joint_states
+    commanded_joint: finger_joint
+    joint_names:
+      - finger_joint
+      - right_outer_knuckle_joint
+      - left_outer_finger_joint
+      - right_outer_finger_joint
+      - left_inner_finger_joint
+      - right_inner_finger_joint
+      - left_inner_finger_pad_joint
+      - right_inner_finger_pad_joint
+    multipliers: [1.0, 1.0, 0.0, 0.0, -1.0, -1.0, 1.0, 1.0]
+    offsets: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    completion_tolerance_rad: 0.04
+    state_freshness_timeout_s: 1.0
+    goal_timeout_s: 5.0
+    publish_period_s: 0.05
+    hold_last_target: true
+    require_state_before_goal: true
+    require_all_state_joints: true

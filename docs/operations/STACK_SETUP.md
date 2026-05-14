@@ -13,6 +13,7 @@ User-facing product overview belongs in [`../../README.md`](../../README.md).
 This runbook covers:
 
 - ManyForge-only bring-up
+- ManyForge plus ROS 2 controller execution
 - ManyForge plus direct local model endpoint
 - ManyForge plus NemoClaw/OpenClaw integration
 - the current recommended commands
@@ -46,7 +47,43 @@ Use when:
 - debugging planning/execution
 - avoiding any model/runtime integration variables
 
-### 2. ManyForge plus direct local model endpoint
+### 2. ManyForge plus ROS 2 controller execution
+
+ManyForge plans and validates locally, then dispatches robot motion to a
+ROS 2 controller selected by deployment config. Use this for Isaac Sim
+or robot-driver previews where the program stays portable and the
+deployment provides controller topics/actions.
+
+Current activation point:
+
+```bash
+docker compose --profile ros-full up composer-ros
+```
+
+Then load:
+
+- program: `examples/isaac_manipulator_scene_light.program.yaml`
+- deployment: `examples/isaac_manipulator_scene_light_ros2_control.deployment.yaml`
+
+The `composer-ros` service uses the full ROS-capable image with host
+networking so DDS can discover Isaac/robot endpoints. The default
+Composer services remain ROS-free and continue to use native simulated
+execution unless a deployment selects another adapter.
+
+Important current status: the deployment and Composer factory dispatch
+are wired to fail closed when the ROS execution runtime factory is not
+installed. The ROS-side FollowJointTrajectory transport helpers and fake
+controller tests exist, but the in-process `IExecutionBackend` runtime
+adapter is still the next implementation slice before this mode can move
+Isaac from the Composer Run button.
+
+Use when:
+
+- validating ROS 2 controller endpoint discovery
+- testing Isaac Sim / ros2_control execution wiring
+- qualifying trajectory execution outside the native simulated backend
+
+### 3. ManyForge plus direct local model endpoint
 
 ManyForge talks directly to a local OpenAI-compatible server such as vLLM.
 
@@ -56,7 +93,7 @@ Use when:
 - validating bounded model interactions
 - running the semantic selection demo on the current text-only baseline
 
-### 3. ManyForge plus NemoClaw/OpenClaw
+### 4. ManyForge plus NemoClaw/OpenClaw
 
 Two assistant-provider lanes coexist; **OpenClaw + Cosmos-Reason2-8B
 (`openclaw` provider) is the demo default** as of 2026-05-07. The
@@ -197,6 +234,120 @@ Then use:
 
 - Composer API on port `9000`
 - HMI/Viser on port `8081`
+
+This profile does not require ROS, Isaac Sim, or a robot controller. The
+native execution adapter is in-process: reset and retry only affect ManyForge's
+software state and RoboPlan-backed scene projection. No external robot or
+simulator is commanded.
+
+### Isaac / ROS 2 controller execution
+
+1. Start the ros2_control bridge and ROS-capable Composer:
+
+   ```bash
+   ./scripts/demo-isaac-ros2-control.sh start
+   ```
+
+   Isaac Sim may be started before or after this command.  The bringup lane
+   includes an Isaac demo supervisor that loads the Composer program/deployment
+   as soon as Composer is healthy, so the backend-authored scene and Viser HMI
+   are visible even if Isaac is still off.  It keeps the arm command gate closed
+   until `/isaac_joint_states`, controller state, the arm FollowJointTrajectory
+   action, and the gripper action are all reachable. Once they are ready, it
+   requests a Composer reset so Isaac is commanded to the configured home pose
+   through the normal execution backend path.
+
+   The loaded artifacts are:
+
+   - `examples/isaac_manipulator_scene_light.program.yaml`
+   - `examples/isaac_manipulator_scene_light_ros2_control.deployment.yaml`
+
+   The lower-right Runtime button in Composer reports whether the current
+   profile can render, plan, and execute.  For this Isaac commanded-sim profile,
+   `Waiting` means rendering/planning may be available while execution is still
+   blocked on simulator/controller readiness.
+
+2. If you want to inspect the raw Isaac side manually, confirm these topics:
+
+   ```bash
+   docker compose --profile ros-full run --rm --no-deps ros-jazzy-full \
+     bash -lc 'source /opt/ros/jazzy/setup.bash; ros2 topic list | grep isaac_joint'
+   ```
+
+   Expected topics once Isaac playback and ROS publishing are active:
+
+   - `/isaac_joint_states`
+   - `/isaac_joint_commands`
+
+3. The `isaac-topic-control` service launches:
+
+   - `topic_based_ros2_control/TopicBasedSystem`
+   - `joint_state_broadcaster`
+   - `isaac_arm_controller`
+   - `/isaac_arm_controller/follow_joint_trajectory`
+   - `manyforge_isaac_topic_command_gate`
+   - `manyforge_isaac_demo_supervisor`
+
+   Keep this container running while Composer executes against Isaac. Host IPC
+   is required for reliable ROS 2 action/service behavior across containers;
+   the compose service already sets `ipc: host`. If the image has not been
+   rebuilt with `topic_based_ros2_control` yet, the script can build a temporary
+   overlay from `${ISAAC_ROS_WS}/src/topic_based_ros2_control`.
+
+4. If you want to run the services manually instead of using the one-command
+   launcher:
+
+   ```bash
+   docker compose --profile ros-full up isaac-topic-control composer-ros
+   ```
+
+   The supervisor still handles startup-order recovery and program/deployment
+   loading. Set `SUPERVISOR_AUTO_LOAD=false` to disable that behavior.
+
+5. If automatic loading is disabled, load the portable program and ROS
+   deployment variant in Composer:
+
+   - `examples/isaac_manipulator_scene_light.program.yaml`
+   - `examples/isaac_manipulator_scene_light_ros2_control.deployment.yaml`
+
+The deployment targets `/isaac_arm_controller/follow_joint_trajectory` for the
+arm. Raw `/isaac_joint_states` feeds `topic_based_ros2_control`; ManyForge
+observes the controller-owned `/joint_states` and
+`/isaac_arm_controller/controller_state` surfaces through its C++ execution
+backend. Because this profile is `commanded_sim`, ManyForge treats its
+backend/authored state as the simulator truth and disables JTC path/goal
+tolerance aborts on arm goals; controller feedback is still captured as
+tracking telemetry. Do not use that tolerance override for real robot
+deployments. The preview deployment uses `command_mode: ros_gripper_command`
+for the Robotiq gripper. The Isaac-only bridge exposes the standard
+`/robotiq_gripper_controller/gripper_cmd` `control_msgs/GripperCommand` action
+and translates it to the scene's raw `/isaac_gripper_state` JointState command
+topic.
+
+The launcher verifies the ROS image and the local
+`manyforge_ros_bringup` install before startup. If the Isaac gripper bridge
+bridge, command gate, or supervisor executable is missing from the installed
+ROS package overlay, it rebuilds the ROS image/overlay instead of starting a
+stale bridge stack. Use `./scripts/demo-isaac-ros2-control.sh status` to see
+the supervisor readiness JSON, `./scripts/demo-isaac-ros2-control.sh smoke` for
+a tiny reversible arm-action probe, and
+`./scripts/demo-isaac-ros2-control.sh stop` to stop the preview lane.
+
+### Real ROS 2 controller / robot execution
+
+Real robot deployments must use a deployment profile separate from the Isaac
+preview YAML. The source of truth is the controller/driver observed state, not
+ManyForge-authored state. In this profile:
+
+- reset clears ManyForge execution state and resyncs from the controller; it
+  must not command hardware to a home pose unless an explicit, qualified
+  motion node does so,
+- `disable_controller_path_tolerances` must remain false,
+- controller path/goal tolerances, stop completion, start-state tolerance, and
+  observed-state freshness must be qualified for the cell,
+- any external safe-state request is an integration hook to the cell's
+  independent safety/supervisor chain, not ManyForge acting as the certified
+  safety controller.
 
 ### Direct local model testing
 

@@ -18,6 +18,10 @@ enum class ExecutionState {
   kStopped,
   kCompleted,
   kFailed,
+  /// Terminal software fault: ManyForge could not prove stop/reset completion.
+  /// This is an operator/external-safety intervention request, not a claim
+  /// that ManyForge itself provides a certified safety function.
+  kInterventionRequired,
 };
 
 inline const char* to_string(ExecutionState state) {
@@ -32,6 +36,7 @@ inline const char* to_string(ExecutionState state) {
     case kStopped: return "Stopped";
     case kCompleted: return "Completed";
     case kFailed: return "Failed";
+    case kInterventionRequired: return "InterventionRequired";
   }
   return "Unknown";
 }

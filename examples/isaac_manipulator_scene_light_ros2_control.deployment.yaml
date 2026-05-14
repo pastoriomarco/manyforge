@@ -1,0 +1,162 @@
+api_version: manyforge.deployment.v0
+schema_version: "0.1.0"
+name: isaac_manipulator_scene_light_ros2_control
+description: >
+  Isaac Sim preview deployment for the saved light manipulator scene. Planning
+  and scene validation stay on RoboPlan; execution is delegated to a ROS 2
+  FollowJointTrajectory arm controller exposed by Isaac Sim through a
+  topic_based_ros2_control bridge. Robotiq commands use the standard
+  control_msgs/GripperCommand action; the Isaac-specific bridge is the only
+  component that publishes the simulator's raw gripper JointState command topic.
+
+program_profile: v0.1
+
+robot_config:
+  robot_id: ur10e
+  group_id: arm
+  urdf_path: package://manyforge_example_models/models/ur10e_robotiq_2f_140/ur10e_robotiq_2f_140.urdf
+  srdf_path: package://manyforge_example_models/models/ur10e_robotiq_2f_140/ur10e_robotiq_2f_140.srdf
+  package_paths:
+    - ..
+  global_max_tcp_linear_speed_mps: 0.25
+
+grippers:
+  primary:
+    command_mode: ros_gripper_command
+    group_id: gripper
+    joint_name: finger_joint
+    motion_time_s: 0.8
+    touch_links:
+      - left_inner_finger
+      - right_inner_finger
+      - left_inner_finger_pad
+      - right_inner_finger_pad
+    mount_frame: tool0
+    attach_frame: grasp_frame
+    tcp_frame: grasp_frame
+    auxiliary_frames:
+      - gripper_frame
+    description: Robotiq 2F-140 command through the standard ROS GripperCommand action.
+
+adapters:
+  planning:
+    adapter_id: planning.roboplan
+    adapter_version: "0.1.0"
+    supported_profiles: ["v0.1"]
+    capability_keys:
+      - planning.motion.joint_goal
+      - planning.motion.pose_goal
+      - planning.trajectory.time_parameterized
+    config:
+      rng_seed: 12345
+  context:
+    adapter_id: planning.roboplan_context
+    adapter_version: "0.1.0"
+    supported_profiles: ["v0.1"]
+    capability_keys:
+      - context.state.current
+      - context.validation.trajectory
+      - context.collision.check
+      - context.kinematics.fk
+      - context.limits.joint
+      - context.pose.resolve_reference
+      - context.scene.object_query
+      - scene.shape.box
+      - scene.shape.sphere
+      - scene.shape.mesh
+      - scene.edit.add
+      - scene.edit.remove
+      - scene.edit.update_pose
+      - scene.edit.attach_detach
+      - observability.trace.scene
+    config: {}
+  execution:
+    adapter_id: execution.ros2_control_follow_joint_trajectory
+    adapter_version: "0.1.0"
+    supported_profiles: ["v0.1"]
+    capability_keys:
+      - execution.trajectory.execute
+      - execution.feedback.phase_events
+      - execution.feedback.state_snapshots
+      - execution.stop.soft
+      - execution.pause
+      - execution.resume
+      - execution.reset
+      - tool.gripper.command
+      - tool.gripper.feedback
+    config:
+      # ``action_name`` is accepted by the C++ ROS runtime. ``arm_action`` is
+      # kept as the clearer deployment alias used by the plan and scripts.
+      action_name: /isaac_arm_controller/follow_joint_trajectory
+      arm_action: /isaac_arm_controller/follow_joint_trajectory
+      # Isaac preview is simulator-commanded: ManyForge's backend/authored
+      # state is the source of truth, and Isaac follows the streamed controller
+      # command. Observed controller state remains diagnostic/tracking feedback;
+      # it must not overwrite the idle authored state.
+      execution_state_source_mode: commanded_sim
+      require_fresh_state_before_planning: false
+      command_gate_topic: /manyforge/isaac_arm_command_enable
+      reset_to_initial_on_load: true
+      # Reset-home installs the backend-authored home command through JTC with
+      # action tolerances disabled for this simulator-only reset path.
+      sim_reset_motion_duration_s: 2.0
+      joint_state_topic: /joint_states
+      controller_state_topic: /isaac_arm_controller/controller_state
+      controller_manager: /controller_manager
+      required_joints:
+        - shoulder_pan_joint
+        - shoulder_lift_joint
+        - elbow_joint
+        - wrist_1_joint
+        - wrist_2_joint
+        - wrist_3_joint
+      initial_joint_positions_rad:
+        - 2.63422544
+        - -0.875980752
+        - 1.551074106
+        - -2.29231544
+        - -1.560498884
+        - -2.038544566
+      joint_state_max_age_ms: 250
+      wait_for_state_timeout_s: 1.0
+      wait_for_action_server_timeout_s: 2.0
+      stop_completion_timeout_s: 2.0
+      # topic_based_ros2_control + Isaac can report post-goal samples that lag
+      # the just-completed JTC goal by more than a strict real-robot start gate.
+      # This tolerance is preview-specific; real-robot deployments should use a
+      # tighter qualified value.
+      start_tolerance_rad: 0.15
+      final_tolerance_rad: 0.15
+      tracking_error_tolerance_rad: 0.05
+      # 0 disables hard tracking-lag cancellation for this Isaac preview lane.
+      # JTC owns command streaming; ManyForge still validates the full planned
+      # path before dispatch and monitors the predicted collision state during
+      # execution. Stricter real-robot deployments may set this > 0 once their
+      # controller-feedback cadence and latency envelope are qualified.
+      tracking_error_timeout_s: 0.0
+      # Isaac/topic_based_ros2_control can lag JTC's desired path under load.
+      # Disable controller-owned path/goal tolerance aborts for this simulator
+      # lane only; ManyForge still validates the trajectory before dispatch and
+      # records controller tracking telemetry during execution. Real robot
+      # deployments must keep controller tolerances qualified and enabled.
+      disable_controller_path_tolerances: true
+      controller_result_timeout_s: 30.0
+      gripper:
+        action_name: /robotiq_gripper_controller/gripper_cmd
+        wait_for_action_server_timeout_s: 2.0
+        result_timeout_s: 5.0
+
+orchestrator:
+  engine: py_trees
+  config:
+    collision_monitor_period_ms: 10.0
+
+launch:
+  ros_wrapper_nodes: []
+  runner:
+    module: manyforge_behavior.runner
+    args: []
+  ui_backend:
+    module: manyforge_composer
+    args: []
+    enabled: true

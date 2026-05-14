@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import json
+import shutil
 from pathlib import Path
 import threading
 import time
@@ -19,6 +20,7 @@ _ALLOWED_EVENT_TYPES = {
     "execute_completed",
     "execute_failed",
     "execute_started",
+    "intervention_required",
     "kernel_error",
     "kernel_state_transition",
     "node_status_transition",
@@ -37,6 +39,14 @@ _ALLOWED_EVENT_PREFIXES = (
     "runtime_override_",
 )
 _SEVERITY_ORDER = {"DEBUG": 10, "INFO": 20, "WARN": 30, "WARNING": 30, "ERROR": 40, "CRITICAL": 50}
+_FAILURE_ARCHIVE_EVENT_TYPES = {
+    "cycle_error",
+    "execute_failed",
+    "intervention_required",
+    "plan_failed",
+    "validation_failed",
+}
+_FAILURE_ARCHIVE_RECENT_EVENT_LIMIT = 1000
 
 
 def _wall_timestamp_iso() -> str:
@@ -52,7 +62,7 @@ def _validate_event_type(event_type: str) -> None:
 
 
 def _severity_for_event(event_type: str, details: Optional[dict[str, Any]]) -> str:
-    if event_type in {"cycle_error", "kernel_error"}:
+    if event_type in {"cycle_error", "kernel_error", "intervention_required"}:
         return "ERROR"
     if event_type.endswith("_failed"):
         return "ERROR"
@@ -128,6 +138,13 @@ class _StoredEvent:
     json_text: str
 
 
+@dataclass(frozen=True)
+class _ArchiveRecord:
+    path: Path
+    modified_at_s: float
+    size_bytes: int
+
+
 class EventRecorder:
     """Record execution/cycle/node events with bounded retention and JSONL sink."""
 
@@ -136,10 +153,24 @@ class EventRecorder:
         *,
         trace_dir: str | Path | None = None,
         max_events: int = 4096,
+        failure_archive_dir: str | Path | None = None,
+        failure_archive_enabled: bool = True,
+        failure_archive_max_age_s: float | None = None,
+        failure_archive_max_bytes: int | None = None,
     ) -> None:
         self._trace_dir = Path(trace_dir) if trace_dir is not None else None
         if self._trace_dir is not None:
             self._trace_dir.mkdir(parents=True, exist_ok=True)
+        self._failure_archive_dir: Path | None = None
+        if failure_archive_enabled:
+            if failure_archive_dir is not None:
+                self._failure_archive_dir = Path(failure_archive_dir)
+            elif self._trace_dir is not None:
+                self._failure_archive_dir = self._trace_dir / "failure-archives"
+        if self._failure_archive_dir is not None:
+            self._failure_archive_dir.mkdir(parents=True, exist_ok=True)
+        self._failure_archive_max_age_s = failure_archive_max_age_s
+        self._failure_archive_max_bytes = failure_archive_max_bytes
 
         self._events: deque[_StoredEvent] = deque(maxlen=max_events)
         self._event_index = 0
@@ -156,6 +187,16 @@ class EventRecorder:
         self._last_node_statuses: dict[str, str] = {}
         self._last_intervention_session_id: Optional[str] = None
         self._last_intervention_event_index: int = 0
+        self._last_failure_archive_id: Optional[str] = None
+        self._last_failure_archive_path: Optional[Path] = None
+        self._failure_archive_count = 0
+        self._last_archive_error: Optional[str] = None
+        self._last_archive_cleanup: dict[str, Any] = {
+            "deleted_count": 0,
+            "deleted_bytes": 0,
+            "reason": None,
+            "timestamp_ns": None,
+        }
 
         self._lock = threading.RLock()
 
@@ -174,6 +215,27 @@ class EventRecorder:
     def current_run_started_at_ns(self) -> Optional[int]:
         with self._lock:
             return self._current_run.started_at_ns if self._current_run is not None else None
+
+    def failure_archive_status(self) -> dict[str, Any]:
+        """Return failure-archive health and retention status for supervisors."""
+        with self._lock:
+            records = self._archive_records_locked()
+            return {
+                "enabled": self._failure_archive_dir is not None,
+                "path": str(self._failure_archive_dir) if self._failure_archive_dir is not None else None,
+                "archive_count": len(records),
+                "total_bytes": sum(record.size_bytes for record in records),
+                "max_age_s": self._failure_archive_max_age_s,
+                "max_bytes": self._failure_archive_max_bytes,
+                "last_archive_id": self._last_failure_archive_id,
+                "last_archive_path": (
+                    str(self._last_failure_archive_path)
+                    if self._last_failure_archive_path is not None
+                    else None
+                ),
+                "last_archive_error": self._last_archive_error,
+                "last_cleanup": dict(self._last_archive_cleanup),
+            }
 
     def observe(self, state) -> None:
         """Poll the current ComposerState and record semantic deltas."""
@@ -822,16 +884,23 @@ class EventRecorder:
             or current_execution_id != previous_execution_id
             or (status.active_move_id or "") != previous_move_id
         ):
+            details = {
+                "from": previous_state,
+                "to": current_state,
+                "progress": status.progress,
+                "error": snapshot.error,
+            }
+            error_code = getattr(snapshot, "error_code", None)
+            if error_code:
+                details["error_code"] = error_code
+            error_details = getattr(snapshot, "error_details", None)
+            if error_details:
+                details["error_details"] = dict(error_details)
             self._record_event(
                 event_type="kernel_state_transition",
                 execution_id=current_execution_id,
                 move_id=current_move_id,
-                details={
-                    "from": previous_state,
-                    "to": current_state,
-                    "progress": status.progress,
-                    "error": snapshot.error,
-                },
+                details=details,
             )
             self._record_semantic_execution_event(
                 previous_state=previous_state,
@@ -943,6 +1012,14 @@ class EventRecorder:
         ("executing", "failed"):  "execute_failed",
         ("planning", "failed"):   "plan_failed",
         ("validating", "failed"): "validation_failed",
+        ("planning", "intervention_required"): "intervention_required",
+        ("validating", "intervention_required"): "intervention_required",
+        ("executing", "intervention_required"): "intervention_required",
+        ("paused", "intervention_required"): "intervention_required",
+        ("stopping", "intervention_required"): "intervention_required",
+        ("stopped", "intervention_required"): "intervention_required",
+        ("completed", "intervention_required"): "intervention_required",
+        ("failed", "intervention_required"): "intervention_required",
         ("executing", "paused"):  "pause_completed",
         ("executing", "stopped"): "stop_completed",
         ("planning", "stopped"):  "stop_completed",
@@ -1085,6 +1162,7 @@ class EventRecorder:
                 )
             )
             self._append_jsonl_locked(run_id=run_id, json_text=json_text)
+            self._maybe_write_failure_archive_locked(event)
 
     def _intervention_run_id(self, session) -> str:
         """Return the correlated run_id for an intervention session."""
@@ -1170,3 +1248,154 @@ class EventRecorder:
         with file_path.open("a", encoding="utf-8") as handle:
             handle.write(json_text)
             handle.write("\n")
+
+    def _maybe_write_failure_archive_locked(self, event: dict[str, Any]) -> None:
+        if self._failure_archive_dir is None:
+            return
+        if event.get("severity") not in {"ERROR", "CRITICAL"}:
+            return
+        event_type = str(event.get("type") or "")
+        if event_type not in _FAILURE_ARCHIVE_EVENT_TYPES:
+            return
+        try:
+            self._write_failure_archive_locked(event)
+            self._prune_failure_archives_locked()
+            self._last_archive_error = None
+        except Exception as exc:  # pragma: no cover - defensive logging surface
+            self._last_archive_error = str(exc)
+
+    def _write_failure_archive_locked(self, event: dict[str, Any]) -> None:
+        assert self._failure_archive_dir is not None
+        self._failure_archive_count += 1
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        archive_id = f"incident-{stamp}-{int(event.get('event_index') or 0):06d}"
+        archive_path = self._failure_archive_dir / archive_id
+        suffix = 1
+        while archive_path.exists():
+            suffix += 1
+            archive_path = self._failure_archive_dir / f"{archive_id}-{suffix:02d}"
+        archive_path.mkdir(parents=True, exist_ok=False)
+
+        run_id = event.get("run_id")
+        trace_file = self._path_for_run(run_id if isinstance(run_id, str) else None)
+        recent_events = self._load_events_for_run(
+            run_id if isinstance(run_id, str) else None,
+            limit=_FAILURE_ARCHIVE_RECENT_EVENT_LIMIT,
+        )
+        manifest = {
+            "schema_version": "manyforge.failure_archive.v1",
+            "archive_id": archive_path.name,
+            "created_at": _wall_timestamp_iso(),
+            "created_at_ns": time.monotonic_ns(),
+            "trigger": {
+                "event_index": int(event.get("event_index") or 0),
+                "type": event.get("type"),
+                "severity": event.get("severity"),
+                "message": event.get("message"),
+                "run_id": run_id,
+                "program_run_id": event.get("program_run_id"),
+                "intervention_run_id": event.get("intervention_run_id"),
+                "execution_id": int(event.get("execution_id") or 0),
+                "move_id": event.get("move_id"),
+            },
+            "trace_file": str(trace_file) if trace_file is not None else None,
+            "retention": {
+                "max_age_s": self._failure_archive_max_age_s,
+                "max_bytes": self._failure_archive_max_bytes,
+                "policy": "fifo_oldest_archive_dirs_first",
+            },
+            "contents": {
+                "manifest": "manifest.json",
+                "trigger_event": "trigger_event.json",
+                "recent_events": "recent_events.jsonl",
+            },
+        }
+
+        (archive_path / "manifest.json").write_text(
+            json.dumps(manifest, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        (archive_path / "trigger_event.json").write_text(
+            json.dumps(event, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        with (archive_path / "recent_events.jsonl").open("w", encoding="utf-8") as handle:
+            for recent in recent_events:
+                handle.write(json.dumps(recent, sort_keys=True))
+                handle.write("\n")
+
+        self._last_failure_archive_id = archive_path.name
+        self._last_failure_archive_path = archive_path
+
+    def _prune_failure_archives_locked(self) -> None:
+        if self._failure_archive_dir is None:
+            return
+
+        deleted_count = 0
+        deleted_bytes = 0
+        reasons: set[str] = set()
+        records = self._archive_records_locked()
+        if self._failure_archive_max_age_s is not None:
+            cutoff_s = time.time() - float(self._failure_archive_max_age_s)
+            remaining: list[_ArchiveRecord] = []
+            for record in records:
+                if record.modified_at_s < cutoff_s:
+                    deleted_bytes += record.size_bytes
+                    deleted_count += 1
+                    reasons.add("max_age_s")
+                    shutil.rmtree(record.path, ignore_errors=True)
+                else:
+                    remaining.append(record)
+            records = remaining
+
+        if self._failure_archive_max_bytes is not None:
+            max_bytes = int(self._failure_archive_max_bytes)
+            total_bytes = sum(record.size_bytes for record in records)
+            remaining = sorted(records, key=lambda record: record.modified_at_s)
+            while total_bytes > max_bytes and remaining:
+                record = remaining.pop(0)
+                total_bytes -= record.size_bytes
+                deleted_bytes += record.size_bytes
+                deleted_count += 1
+                reasons.add("max_bytes")
+                shutil.rmtree(record.path, ignore_errors=True)
+
+        self._last_archive_cleanup = {
+            "deleted_count": deleted_count,
+            "deleted_bytes": deleted_bytes,
+            "reason": ",".join(sorted(reasons)) if reasons else None,
+            "timestamp_ns": time.monotonic_ns(),
+        }
+
+    def _archive_records_locked(self) -> list[_ArchiveRecord]:
+        if self._failure_archive_dir is None or not self._failure_archive_dir.exists():
+            return []
+        records: list[_ArchiveRecord] = []
+        for path in self._failure_archive_dir.iterdir():
+            if not path.is_dir():
+                continue
+            try:
+                stat = path.stat()
+                records.append(
+                    _ArchiveRecord(
+                        path=path,
+                        modified_at_s=stat.st_mtime,
+                        size_bytes=self._directory_size(path),
+                    )
+                )
+            except OSError:
+                continue
+        records.sort(key=lambda record: record.modified_at_s)
+        return records
+
+    @staticmethod
+    def _directory_size(path: Path) -> int:
+        total = 0
+        for item in path.rglob("*"):
+            if not item.is_file():
+                continue
+            try:
+                total += item.stat().st_size
+            except OSError:
+                continue
+        return total

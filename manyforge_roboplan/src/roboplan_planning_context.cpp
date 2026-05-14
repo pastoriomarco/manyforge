@@ -275,140 +275,157 @@ core::ValidationResultDTO RoboPlanPlanningContext::validate_trajectory(
     // RRT can start from a resting grasp, but validation temporarily re-enables
     // them and enforces release semantics over the generated trajectory.
     const uint64_t collision_start_ns = steady_now_ns();
+    std::set<std::pair<std::string, std::string>> start_support_pairs;
+    std::set<std::pair<std::string, std::string>> separated_support_pairs;
+    bool has_support_contact_pairs = false;
     {
       std::lock_guard<std::mutex> scene_lock(*scene_mutex_);
-      bool support_contacts_exposed = false;
-      auto restore_support_contacts = [&]() {
-        if (!support_contacts_exposed) {
-          return;
-        }
-        (void)set_support_contact_pairs_for_validation_locked(false);
-        support_contacts_exposed = false;
-      };
-      const auto support_guard =
-          std::shared_ptr<void>(nullptr, [&](void*) { restore_support_contacts(); });
-      (void)support_guard;
-      auto expose_support_contacts =
-          set_support_contact_pairs_for_validation_locked(true);
-      if (!expose_support_contacts.has_value()) {
-        result.error = core::ErrorDTO{
-            core::kErrorInternalError,
-            "Failed to expose support-contact pairs for validation: " +
-                expose_support_contacts.error(),
-            {},
+      has_support_contact_pairs = !disabled_support_contact_pairs_.empty();
+    }
+
+    for (size_t i = 0; i < waypoint_count; ++i) {
+      const auto& wp = trajectory.waypoints[i];
+      bool waypoint_in_collision = false;
+      CollisionDiagnostics diagnostics;
+      std::vector<CollisionPairDiagnostic> blocking_pairs;
+      std::set<std::pair<std::string, std::string>> colliding_support_pairs;
+
+      {
+        std::lock_guard<std::mutex> scene_lock(*scene_mutex_);
+        bool support_contacts_exposed = false;
+        auto restore_support_contacts = [&]() {
+          if (!support_contacts_exposed) {
+            return;
+          }
+          (void)set_support_contact_pairs_for_validation_locked(false);
+          support_contacts_exposed = false;
         };
-        return result;
-      }
-      support_contacts_exposed = true;
+        const auto support_guard =
+            std::shared_ptr<void>(nullptr, [&](void*) { restore_support_contacts(); });
+        (void)support_guard;
+        if (has_support_contact_pairs) {
+          auto expose_support_contacts =
+              set_support_contact_pairs_for_validation_locked(true);
+          if (!expose_support_contacts.has_value()) {
+            result.error = core::ErrorDTO{
+                core::kErrorInternalError,
+                "Failed to expose support-contact pairs for validation: " +
+                    expose_support_contacts.error(),
+                {},
+            };
+            return result;
+          }
+          support_contacts_exposed = true;
+        }
 
-      std::set<std::pair<std::string, std::string>> start_support_pairs;
-      std::set<std::pair<std::string, std::string>> separated_support_pairs;
-
-      for (size_t i = 0; i < waypoint_count; ++i) {
-        const auto& wp = trajectory.waypoints[i];
         Eigen::VectorXd q = vector_from_std(wp.positions_rad);
         if (q.size() != scene_->getCurrentJointPositions().size()) {
           q = scene_->toFullJointPositions(group_name_, q);
         }
-        if (!scene_->hasCollisions(q)) {
-          if (i > 0) {
-            for (const auto& pair : start_support_pairs) {
-              separated_support_pairs.insert(pair);
+        waypoint_in_collision = scene_->hasCollisions(q);
+        if (waypoint_in_collision) {
+          diagnostics = collect_collision_diagnostics_locked(q);
+          for (const auto& pair : diagnostics.pairs) {
+            if (has_support_contact_pairs &&
+                is_active_support_contact_pair_locked(pair.canonical_pair)) {
+              colliding_support_pairs.insert(pair.canonical_pair);
+            } else {
+              blocking_pairs.push_back(pair);
             }
-          }
-          continue;
-        }
-
-        CollisionDiagnostics diagnostics = collect_collision_diagnostics_locked(q);
-        if (diagnostics.pairs.empty()) {
-          collision_validation_duration_ns = steady_now_ns() - collision_start_ns;
-          std::map<std::string, std::string> details;
-          details["failure_stage"] = "collision_validation_unstructured";
-          details["waypoint_index"] = std::to_string(i);
-          details["waypoint_count"] = std::to_string(waypoint_count);
-          details["trajectory_duration_s"] = std::to_string(trajectory_duration_s);
-          details["speed_validation_duration_ns"] =
-              std::to_string(speed_validation_duration_ns);
-          details["collision_validation_duration_ns"] =
-              std::to_string(collision_validation_duration_ns);
-          details["collision_pair_count"] = "0";
-          details["collision_diagnostics_available"] = "false";
-          restore_support_contacts();
-          result.error = core::ErrorDTO{
-              core::kErrorValidationCollision,
-              "Trajectory passes through collision, but RoboPlan did not report collision pairs",
-              details,
-          };
-          return result;
-        }
-        std::vector<CollisionPairDiagnostic> blocking_pairs;
-        std::set<std::pair<std::string, std::string>> colliding_support_pairs;
-
-        for (const auto& pair : diagnostics.pairs) {
-          if (is_active_support_contact_pair_locked(pair.canonical_pair)) {
-            colliding_support_pairs.insert(pair.canonical_pair);
-          } else {
-            blocking_pairs.push_back(pair);
-          }
-        }
-
-        auto fail_with_diagnostics = [&](const std::string& stage,
-                                         const std::string& message) {
-          collision_validation_duration_ns = steady_now_ns() - collision_start_ns;
-          std::map<std::string, std::string> details;
-          details["failure_stage"] = stage;
-          details["waypoint_index"] = std::to_string(i);
-          details["waypoint_count"] = std::to_string(waypoint_count);
-          details["trajectory_duration_s"] = std::to_string(trajectory_duration_s);
-          details["speed_validation_duration_ns"] =
-              std::to_string(speed_validation_duration_ns);
-          details["collision_validation_duration_ns"] =
-              std::to_string(collision_validation_duration_ns);
-          add_collision_details(details, diagnostics);
-          restore_support_contacts();
-          result.error = core::ErrorDTO{
-              core::kErrorValidationCollision,
-              message,
-              details,
-          };
-        };
-
-        if (!blocking_pairs.empty()) {
-          fail_with_diagnostics(
-              "collision_validation",
-              "Trajectory passes through collision");
-          return result;
-        }
-
-        if (i == 0) {
-          start_support_pairs = colliding_support_pairs;
-          continue;
-        }
-
-        for (const auto& pair : colliding_support_pairs) {
-          if (start_support_pairs.find(pair) == start_support_pairs.end()) {
-            fail_with_diagnostics(
-                "support_contact_unexpected_path_contact",
-                "Support-contact pair collided after the start waypoint");
-            return result;
-          }
-          if (separated_support_pairs.find(pair) != separated_support_pairs.end()) {
-            fail_with_diagnostics(
-                "support_contact_recontact_after_release",
-                "Support-contact pair re-contacted after separation");
-            return result;
-          }
-        }
-
-        for (const auto& pair : start_support_pairs) {
-          if (colliding_support_pairs.find(pair) == colliding_support_pairs.end()) {
-            separated_support_pairs.insert(pair);
           }
         }
       }
 
+      if (!waypoint_in_collision) {
+        if (i > 0) {
+          for (const auto& pair : start_support_pairs) {
+            separated_support_pairs.insert(pair);
+          }
+        }
+        continue;
+      }
+
+      if (diagnostics.pairs.empty()) {
+        collision_validation_duration_ns = steady_now_ns() - collision_start_ns;
+        std::map<std::string, std::string> details;
+        details["failure_stage"] = "collision_validation_unstructured";
+        details["waypoint_index"] = std::to_string(i);
+        details["waypoint_count"] = std::to_string(waypoint_count);
+        details["trajectory_duration_s"] = std::to_string(trajectory_duration_s);
+        details["speed_validation_duration_ns"] =
+            std::to_string(speed_validation_duration_ns);
+        details["collision_validation_duration_ns"] =
+            std::to_string(collision_validation_duration_ns);
+        details["collision_pair_count"] = "0";
+        details["collision_diagnostics_available"] = "false";
+        result.error = core::ErrorDTO{
+            core::kErrorValidationCollision,
+            "Trajectory passes through collision, but RoboPlan did not report collision pairs",
+            details,
+        };
+        return result;
+      }
+
+      auto fail_with_diagnostics = [&](const std::string& stage,
+                                       const std::string& message) {
+        collision_validation_duration_ns = steady_now_ns() - collision_start_ns;
+        std::map<std::string, std::string> details;
+        details["failure_stage"] = stage;
+        details["waypoint_index"] = std::to_string(i);
+        details["waypoint_count"] = std::to_string(waypoint_count);
+        details["trajectory_duration_s"] = std::to_string(trajectory_duration_s);
+        details["speed_validation_duration_ns"] =
+            std::to_string(speed_validation_duration_ns);
+        details["collision_validation_duration_ns"] =
+            std::to_string(collision_validation_duration_ns);
+        add_collision_details(details, diagnostics);
+        result.error = core::ErrorDTO{
+            core::kErrorValidationCollision,
+            message,
+            details,
+        };
+      };
+
+      if (!blocking_pairs.empty()) {
+        fail_with_diagnostics(
+            "collision_validation",
+            "Trajectory passes through collision");
+        return result;
+      }
+
+      if (i == 0) {
+        start_support_pairs = colliding_support_pairs;
+        continue;
+      }
+
+      for (const auto& pair : colliding_support_pairs) {
+        if (start_support_pairs.find(pair) == start_support_pairs.end()) {
+          fail_with_diagnostics(
+              "support_contact_unexpected_path_contact",
+              "Support-contact pair collided after the start waypoint");
+          return result;
+        }
+        if (separated_support_pairs.find(pair) != separated_support_pairs.end()) {
+          fail_with_diagnostics(
+              "support_contact_recontact_after_release",
+              "Support-contact pair re-contacted after separation");
+          return result;
+        }
+      }
+
       for (const auto& pair : start_support_pairs) {
-        const auto policy = support_contact_policy_for_pair_locked(pair);
+        if (colliding_support_pairs.find(pair) == colliding_support_pairs.end()) {
+          separated_support_pairs.insert(pair);
+        }
+      }
+    }
+
+    for (const auto& pair : start_support_pairs) {
+      std::optional<core::SupportContactDTO> policy;
+      {
+        std::lock_guard<std::mutex> scene_lock(*scene_mutex_);
+        policy = support_contact_policy_for_pair_locked(pair);
+      }
         const bool require_separation =
             !policy.has_value() || policy->require_separation_by_end;
         if (!require_separation ||
@@ -430,7 +447,6 @@ core::ValidationResultDTO RoboPlanPlanningContext::validate_trajectory(
               std::to_string(policy->max_start_penetration_m);
           details["support_contact_depth_enforced"] = "false";
         }
-        restore_support_contacts();
         result.error = core::ErrorDTO{
             core::kErrorValidationCollision,
             "Support-contact pair did not separate by final waypoint",
@@ -438,9 +454,6 @@ core::ValidationResultDTO RoboPlanPlanningContext::validate_trajectory(
         };
         return result;
       }
-
-      restore_support_contacts();
-    }
     collision_validation_duration_ns = steady_now_ns() - collision_start_ns;
 
     result.valid = true;
@@ -1079,8 +1092,7 @@ RoboPlanPlanningContext::active_support_contact_pairs_for_validation_locked() co
 
 bool RoboPlanPlanningContext::is_active_support_contact_pair_locked(
     const std::pair<std::string, std::string>& pair) const {
-  const auto active_pairs = active_support_contact_pairs_for_validation_locked();
-  return active_pairs.find(pair) != active_pairs.end();
+  return is_support_contact_pair_locked(pair);
 }
 
 bool RoboPlanPlanningContext::is_support_contact_pair_locked(

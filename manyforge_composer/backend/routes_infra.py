@@ -50,6 +50,7 @@ def _model_endpoint_capabilities_payload(endpoint) -> dict[str, Any]:
 def build_infra_status_payload(state: ComposerState) -> dict[str, Any]:
     """Build infrastructure health status."""
     now = time.time()
+    heartbeat = build_infra_heartbeat_payload(state)
 
     components: dict[str, Any] = {}
 
@@ -109,9 +110,101 @@ def build_infra_status_payload(state: ComposerState) -> dict[str, Any]:
         components["deployment"] = {"status": "none"}
 
     return {
-        "status": "ok",
+        "status": heartbeat["status"],
         "components": components,
+        "heartbeat": heartbeat,
         "timestamp": now,
+        "timestamp_ns": heartbeat["timestamp_ns"],
+        "uptime_s": heartbeat["uptime_s"],
+    }
+
+
+def build_infra_heartbeat_payload(state: ComposerState) -> dict[str, Any]:
+    """Build a compact heartbeat/status payload for launchers and supervisors."""
+    now_ns = time.monotonic_ns()
+    started_at_ns = int(getattr(state, "started_at_ns", now_ns))
+    uptime_s = max(0.0, (now_ns - started_at_ns) / 1e9)
+    kernel_payload: dict[str, Any] = {"available": state.kernel is not None}
+    top_status = "ok"
+
+    if state.kernel is not None:
+        try:
+            status = state.kernel.get_status()
+            snapshot = state.kernel.get_execution_snapshot()
+            state_value = (
+                status.state.value
+                if hasattr(status.state, "value")
+                else str(status.state)
+            )
+            error_details = getattr(snapshot, "error_details", {}) or {}
+            requires_intervention = (
+                state_value == "intervention_required"
+                or str(error_details.get("requires_operator_intervention", "")).lower()
+                == "true"
+            )
+            resync_required = (
+                str(error_details.get("resync_required", "")).lower() == "true"
+            )
+            if requires_intervention:
+                top_status = "intervention_required"
+            elif getattr(snapshot, "error", None):
+                top_status = "degraded"
+            kernel_payload = {
+                "available": True,
+                "type": type(state.kernel).__name__,
+                "state": state_value,
+                "execution_id": int(getattr(status, "execution_id", 0) or 0),
+                "active_move_id": getattr(status, "active_move_id", "") or "",
+                "progress": float(getattr(status, "progress", 0.0) or 0.0),
+                "snapshot_timestamp_ns": int(getattr(snapshot, "timestamp_ns", 0) or 0),
+                "snapshot_age_ms": (
+                    max(0.0, (now_ns - int(getattr(snapshot, "timestamp_ns", now_ns))) / 1e6)
+                    if getattr(snapshot, "timestamp_ns", None)
+                    else None
+                ),
+                "error": getattr(snapshot, "error", None),
+                "error_code": getattr(snapshot, "error_code", None),
+                "error_details": dict(error_details),
+                "requires_operator_intervention": requires_intervention,
+                "resync_required": resync_required,
+            }
+        except Exception as exc:
+            top_status = "error"
+            kernel_payload = {
+                "available": True,
+                "status": "error",
+                "type": type(state.kernel).__name__,
+                "error": str(exc),
+            }
+
+    archive_status = {}
+    recorder = getattr(state, "event_recorder", None)
+    if recorder is not None:
+        try:
+            archive_status = recorder.failure_archive_status()
+        except Exception as exc:  # pragma: no cover - defensive status surface
+            archive_status = {"enabled": False, "error": str(exc)}
+
+    return {
+        "schema_version": "manyforge.infra_heartbeat.v1",
+        "status": top_status,
+        "timestamp": time.time(),
+        "timestamp_ns": now_ns,
+        "uptime_s": uptime_s,
+        "cycle_state": (
+            state.cycle_manager.state.value if state.cycle_manager else "none"
+        ),
+        "program_loaded": state.program is not None,
+        "program_name": state.program.name if state.program else None,
+        "deployment_source": state.deployment_source_path or None,
+        "components": {
+            "composer": {
+                "status": "healthy",
+                "catalog_version": state.catalog.version if state.catalog else None,
+            },
+            "kernel": kernel_payload,
+            "failure_archive": archive_status,
+        },
     }
 
 
@@ -123,6 +216,11 @@ def create_infra_router(state: ComposerState) -> APIRouter:
     def infra_status():
         """Get infrastructure health status for all components."""
         return build_infra_status_payload(state)
+
+    @router.get("/heartbeat")
+    def infra_heartbeat():
+        """Get a compact heartbeat/status payload for launchers and supervisors."""
+        return build_infra_heartbeat_payload(state)
 
     @router.get(
         "/model-endpoints",

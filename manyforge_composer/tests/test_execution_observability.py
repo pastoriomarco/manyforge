@@ -229,6 +229,29 @@ def test_execution_history_and_export_use_trace_sink(tmp_path):
         assert all("timelineId" in record for record in medkit["records"])
 
 
+def test_infra_heartbeat_reports_kernel_and_archive_status(tmp_path):
+    state = ComposerState(
+        catalog_path=_CATALOG_PATH,
+        kernel=MockKernelClient(),
+        trace_dir=str(tmp_path),
+    )
+    app = create_app(state)
+
+    with TestClient(app) as client:
+        response = client.get("/api/infra/heartbeat")
+        assert response.status_code == 200
+        heartbeat = response.json()
+
+        assert heartbeat["schema_version"] == "manyforge.infra_heartbeat.v1"
+        assert heartbeat["status"] == "ok"
+        assert heartbeat["uptime_s"] >= 0.0
+        assert heartbeat["components"]["kernel"]["available"] is True
+        assert heartbeat["components"]["kernel"]["state"] == "idle"
+        archive = heartbeat["components"]["failure_archive"]
+        assert archive["enabled"] is True
+        assert archive["path"].endswith("failure-archives")
+
+
 def test_execution_digest_and_history_include_pending_interrupt():
     kernel = MockKernelClient()
     program_path = _write_yaml_file(_interrupt_program(), suffix=".program.yaml")

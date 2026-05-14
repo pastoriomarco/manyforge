@@ -26,6 +26,15 @@ class IExecutionBackend {
     /// @return ExecutionHandle for tracking the execution
     virtual ExecutionHandle execute_trajectory(const TrajectoryDTO& trajectory) = 0;
 
+    /// Synchronize the backend-owned planning scene from the authoritative
+    /// observed execution state before planning.
+    ///
+    /// Native/offline execution backends may treat this as a no-op. Controller
+    /// backed adapters use it as the hard gate between live robot/simulator
+    /// state and planning: if a fresh complete observed state cannot be
+    /// obtained, planning must not proceed from stale authored state.
+    virtual Result<void> sync_observed_state_before_planning() = 0;
+
     /// Stop the current execution (spec 220 §4)
     /// 
     /// If no execution is in flight, returns accepted=false with invalid_request.
@@ -53,6 +62,14 @@ class IExecutionBackend {
     /// 
     /// @return ResetResultDTO indicating whether reset was accepted
     virtual ResetResultDTO reset() = 0;
+
+    /// Return the latest observer-safe backend snapshot.
+    ///
+    /// This is intentionally part of the execution backend contract rather
+    /// than an implementation detail: controller-backed adapters must expose
+    /// observed/predicted execution state without forcing the kernel or UI to
+    /// know which ROS topics/actions produced it.
+    virtual ExecutionSnapshot get_execution_snapshot() const = 0;
 };
 
 }  // namespace manyforge::core

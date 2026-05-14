@@ -8,6 +8,11 @@ if [ -f "/opt/ros/${ROS_DISTRO}/setup.bash" ]; then
     source "/opt/ros/${ROS_DISTRO}/setup.bash"
 fi
 
+if [ -f "/opt/manyforge/topic_based_ros2_control/install/setup.bash" ]; then
+    # shellcheck disable=SC1091
+    source "/opt/manyforge/topic_based_ros2_control/install/setup.bash"
+fi
+
 if [ -f "/workspace/install/setup.bash" ]; then
     # shellcheck disable=SC1091
     source "/workspace/install/setup.bash"

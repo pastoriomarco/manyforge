@@ -10,6 +10,7 @@ namespace manyforge::roboplan_backend {
 namespace {
 
 constexpr auto kExecutionTick = std::chrono::milliseconds(10);
+constexpr auto kResetCompletionTimeout = std::chrono::seconds(2);
 
 double clamp_progress(double progress) {
   return std::max(0.0, std::min(1.0, progress));
@@ -221,6 +222,10 @@ core::ExecutionHandle RoboPlanExecutionBackend::execute_trajectory(
       [this]() { return get_execution_snapshot(); }};
 }
 
+core::Result<void> RoboPlanExecutionBackend::sync_observed_state_before_planning() {
+  return core::Result<void>::Ok();
+}
+
 core::StopResultDTO RoboPlanExecutionBackend::stop() {
   if (!state_.running.load()) {
     return core::StopResultDTO{
@@ -271,7 +276,27 @@ core::ResetResultDTO RoboPlanExecutionBackend::reset() {
   execution_cv_.notify_all();
   {
     std::unique_lock<std::mutex> lock(execution_mutex_);
-    execution_cv_.wait(lock, [this]() { return !state_.running.load(); });
+    const bool stopped = execution_cv_.wait_for(
+        lock, kResetCompletionTimeout,
+        [this]() { return !state_.running.load(); });
+    if (!stopped) {
+      publish_snapshot(
+          core::ExecutionState::kInterventionRequired,
+          get_execution_snapshot().progress,
+          get_execution_snapshot().joint_positions_rad,
+          core::ErrorDTO{
+              core::kErrorResetFailed,
+              "Native execution reset timed out waiting for worker completion",
+              {{"requires_operator_intervention", "true"},
+               {"timeout_s", std::to_string(
+                    std::chrono::duration<double>(kResetCompletionTimeout).count())}}});
+      return core::ResetResultDTO{
+          false,
+          core::ErrorDTO{
+              core::kErrorResetFailed,
+              "Native execution reset timed out waiting for worker completion",
+              {{"requires_operator_intervention", "true"}}}};
+    }
   }
   publish_snapshot(core::ExecutionState::kIdle, 0.0, {});
   return core::ResetResultDTO{true, std::nullopt};

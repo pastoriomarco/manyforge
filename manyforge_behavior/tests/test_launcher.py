@@ -214,15 +214,12 @@ class TestLauncherKernelCreation:
         finally:
             os.unlink(deploy_path)
 
-    def test_create_kernel_with_valid_deployment(self):
-        """Create kernel with valid deployment fixture."""
+    def test_create_kernel_rejects_ros2_control_execution(self):
+        """Standalone launcher does not own ROS 2 controller runtime wiring."""
         deployment = Deployment(DEPLOYMENT_FIXTURE_PATH)
-        # Force ImportError for manyforge_roboplan_py to test fallback path
-        with patch.dict(sys.modules, {"manyforge_roboplan_py": None}):
-            kernel = create_kernel(deployment)
 
-        # Should return MockKernelClient (fallback)
-        assert isinstance(kernel, MockKernelClient)
+        with pytest.raises(RuntimeError, match="ROS 2 controller execution"):
+            create_kernel(deployment)
 
     def test_create_kernel_uses_explicit_bundle_paths_for_custom_model(self):
         data = _minimal_deployment(
@@ -419,10 +416,10 @@ class TestLauncherIntegration:
         deployment.validate_against_program(program)
         deployment.validate_capabilities()
         
-        # Create kernel (mock roboplan to test fallback path)
-        with patch.dict(sys.modules, {"manyforge_roboplan_py": None}):
-            kernel = create_kernel(deployment)
-        assert isinstance(kernel, MockKernelClient)
+        # Use an injected mock kernel here. The fixture intentionally selects
+        # ROS 2 controller execution, which is owned by Composer's ROS-capable
+        # runtime profile rather than this standalone launcher.
+        kernel = MockKernelClient()
 
         # Create runner
         runner = OrchestratorRunner(

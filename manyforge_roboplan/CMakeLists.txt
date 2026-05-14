@@ -39,6 +39,20 @@ find_package(roboplan_simple_ik REQUIRED)
 find_package(roboplan_example_models REQUIRED)
 find_package(fmt CONFIG QUIET)
 
+option(MANYFORGE_ENABLE_ROS2_CONTROL "Build ros2_control execution backend" OFF)
+set(_MANYFORGE_ROS2_CONTROL_SOURCES "")
+if(MANYFORGE_ENABLE_ROS2_CONTROL)
+  find_package(ament_cmake REQUIRED)
+  find_package(rclcpp REQUIRED)
+  find_package(rclcpp_action REQUIRED)
+  find_package(control_msgs REQUIRED)
+  find_package(sensor_msgs REQUIRED)
+  find_package(trajectory_msgs REQUIRED)
+  find_package(builtin_interfaces REQUIRED)
+  list(APPEND _MANYFORGE_ROS2_CONTROL_SOURCES
+    src/ros2_control_execution_backend.cpp)
+endif()
+
 if(NOT fmt_FOUND)
   FetchContent_Declare(
     fmt
@@ -60,6 +74,7 @@ add_library(manyforge_roboplan
   src/roboplan_planning_context.cpp
   src/roboplan_execution_backend.cpp
   src/native_kernel_factory.cpp
+  ${_MANYFORGE_ROS2_CONTROL_SOURCES}
 )
 
 target_include_directories(manyforge_roboplan PUBLIC
@@ -67,7 +82,7 @@ target_include_directories(manyforge_roboplan PUBLIC
   $<INSTALL_INTERFACE:include>
 )
 
-target_link_libraries(manyforge_roboplan PUBLIC
+target_link_libraries(manyforge_roboplan
   manyforge_core
   Eigen3::Eigen
   pinocchio::pinocchio
@@ -79,9 +94,22 @@ target_link_libraries(manyforge_roboplan PUBLIC
   fmt::fmt
 )
 
+if(MANYFORGE_ENABLE_ROS2_CONTROL)
+  target_compile_definitions(manyforge_roboplan PUBLIC MANYFORGE_ROS2_CONTROL_ENABLED)
+  ament_target_dependencies(manyforge_roboplan
+    rclcpp
+    rclcpp_action
+    control_msgs
+    sensor_msgs
+    trajectory_msgs
+    builtin_interfaces)
+endif()
+
 # pybind11 module
+set(PYBIND11_FINDPYTHON ON)
+find_package(Python3 COMPONENTS Interpreter Development.Module QUIET)
 find_package(pybind11 QUIET)
-if(pybind11_FOUND)
+if(pybind11_FOUND AND Python3_FOUND AND Python3_Development.Module_FOUND)
   pybind11_add_module(manyforge_roboplan_py python/bindings.cpp)
   target_link_libraries(manyforge_roboplan_py PRIVATE manyforge_roboplan)
 endif()

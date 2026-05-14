@@ -85,6 +85,45 @@ services:
     profiles:
       - ros-full
 
+  # Composer in the ROS-capable full image. Use this profile for deployments
+  # selecting execution.ros2_control_follow_joint_trajectory so Composer can
+  # load ROS adapter code and discover Isaac/robot ROS endpoints over DDS.
+  composer-ros:
+    build:
+      context: .
+      dockerfile: Dockerfile.ros-jazzy-full
+    network_mode: host
+    ipc: host
+    volumes:
+      - .:/workspace
+      - ros-full-build-cache:/tmp/manyforge-build
+    working_dir: /workspace
+    command: ["bash", "-lc", "./scripts/ros/start-composer-ros.sh"]
+    profiles:
+      - ros-full
+
+  # Isaac Sim ros2_control bridge. Start this alongside composer-ros when
+  # executing against Isaac's /isaac_joint_states and /isaac_joint_commands
+  # topics through the standard FollowJointTrajectory surface.
+  isaac-topic-control:
+    build:
+      context: .
+      dockerfile: Dockerfile.ros-jazzy-full
+    network_mode: host
+    ipc: host
+    volumes:
+      - .:/workspace
+      - ros-full-build-cache:/tmp/manyforge-build
+    environment:
+      COMPOSER_URL: ${COMPOSER_URL:-http://127.0.0.1:9000}
+      PROGRAM_PATH: ${PROGRAM_PATH:-/workspace/examples/isaac_manipulator_scene_light.program.yaml}
+      DEPLOYMENT_PATH: ${DEPLOYMENT_PATH:-/workspace/examples/isaac_manipulator_scene_light_ros2_control.deployment.yaml}
+      SUPERVISOR_AUTO_LOAD: ${SUPERVISOR_AUTO_LOAD:-true}
+    working_dir: /workspace
+    command: ["bash", "-lc", "./scripts/ros/launch-isaac-topic-based-control.sh"]
+    profiles:
+      - ros-full
+
 volumes:
   build-cache:
   ros-build-cache:

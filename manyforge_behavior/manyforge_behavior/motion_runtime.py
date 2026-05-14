@@ -64,7 +64,11 @@ class MotionExecutionCoordinator:
                 )
             return MotionTransactionUpdate(state="succeeded", status=status)
 
-        if status.state in {ExecutionState.FAILED, ExecutionState.STOPPED}:
+        if status.state in {
+            ExecutionState.FAILED,
+            ExecutionState.STOPPED,
+            ExecutionState.INTERVENTION_REQUIRED,
+        }:
             if status.execution_id != int(execution_id):
                 return MotionTransactionUpdate(
                     state="failed",

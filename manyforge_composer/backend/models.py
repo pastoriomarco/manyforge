@@ -101,6 +101,7 @@ class LoadProgramRequest(BaseModel):
     path: str
     deployment_path: Optional[str] = Field(None, alias="deploymentPath")
     force_discard_overrides: bool = Field(default=False, alias="forceDiscardOverrides")
+    defer_initial_runtime_reset: bool = Field(default=False, alias="deferInitialRuntimeReset")
 
 
 class RobotResponse(BaseModel):

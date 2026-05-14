@@ -20,7 +20,7 @@ robot:
     orientation_rpy_deg:
     - 0.0
     - 0.0
-    - 90.00000196119572
+    - -89.99999803880428
 scene:
 - object_id: isaac_table_low_327
   shape:
@@ -115,7 +115,7 @@ scene:
 parameters:
 - name: velocity_scale
   type: float
-  default: 0.5
+  default: 0.2
   constraints:
     min_exclusive: 0
     max_inclusive: 1
@@ -169,7 +169,7 @@ tree:
           position_m:
           - 0
           - 0
-          - 0.11
+          - 0.1
           orientation_rpy_deg:
           - 180
           - 0
@@ -323,12 +323,12 @@ tree:
       - wrist_2_joint
       - wrist_3_joint
       joint_goal_positions_rad:
-      - 0
-      - -1.57
-      - 1.57
-      - -1.57
-      - -1.57
-      - 0
+      - 2.63422544
+      - -0.875980752
+      - 1.551074106
+      - -2.29231544
+      - -1.560498884
+      - -2.038544566
       velocity_scale: ${param:velocity_scale}
       planning_timeout_s: 10
       execution_timeout_s: 30

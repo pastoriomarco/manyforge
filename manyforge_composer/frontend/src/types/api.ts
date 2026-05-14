@@ -485,6 +485,35 @@ export interface InfraStatus {
   timestamp: number;
 }
 
+export type RuntimeReadiness = 'ready' | 'waiting' | 'degraded' | 'fault' | 'offline';
+
+export interface RuntimeComponentStatus {
+  id: string;
+  label: string;
+  kind: string;
+  status: RuntimeReadiness | 'disabled' | string;
+  requiredFor: string[];
+  detail?: string;
+  [key: string]: unknown;
+}
+
+export interface RuntimeStatus {
+  schemaVersion: string;
+  profileId: string;
+  profileKind: 'composer_only' | 'commanded_sim' | 'real_robot' | string;
+  profileLabel: string;
+  authority: 'backend_authored' | 'controller_observed' | string;
+  readiness: RuntimeReadiness | string;
+  summaryLabel: string;
+  canRender: boolean;
+  canPlan: boolean;
+  canExecute: boolean;
+  userMessage: string;
+  components: RuntimeComponentStatus[];
+  externalProviders: string[];
+  timestampNs: number;
+}
+
 export interface SceneRobotState {
   robot_id?: string | null;
   group_id?: string | null;

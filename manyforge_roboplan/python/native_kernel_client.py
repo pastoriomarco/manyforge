@@ -42,6 +42,7 @@ _STATE_MAP = {
     6: ExecutionState.STOPPED,
     7: ExecutionState.COMPLETED,
     8: ExecutionState.FAILED,
+    9: ExecutionState.INTERVENTION_REQUIRED,
 }
 
 
@@ -137,8 +138,64 @@ class NativeKernelClient(KernelClient):
         return status
 
     def update_gripper_commands(self) -> None:
+        if hasattr(self._bundle, "update_ros_grippers"):
+            try:
+                self._bundle.update_ros_grippers()
+            except RuntimeError:
+                pass
         for gripper_id in list(self._active_gripper_commands):
             self._compute_gripper_command_status(gripper_id)
+
+    def _request_to_native_dict(self, request: ExecuteRequest) -> dict[str, Any]:
+        relative_move = request.relative_move
+        if relative_move is not None:
+            relative_move = dict(relative_move)
+            target_reference = relative_move.get("target_reference")
+            if target_reference is not None:
+                target_reference = dict(target_reference)
+                if target_reference.get("type") == "pose":
+                    target_reference["pose"] = _normalize_pose_dict(
+                        target_reference.get("pose")
+                    )
+                relative_move["target_reference"] = target_reference
+            offset_reference = relative_move.get("offset_reference")
+            if offset_reference is not None:
+                offset_reference = dict(offset_reference)
+                if offset_reference.get("type") == "pose":
+                    offset_reference["pose"] = _normalize_pose_dict(
+                        offset_reference.get("pose")
+                    )
+                relative_move["offset_reference"] = offset_reference
+            relative_move["offset"] = _normalize_pose_dict(relative_move.get("offset"))
+
+        req_dict = {
+            "robot_id": request.robot_id,
+            "group_id": request.group_id,
+            "move_id": request.move_id,
+            "base_frame": request.base_frame,
+            "tcp_frame": request.tcp_frame,
+            "motion_type": request.motion_type,
+            "velocity_scale": request.velocity_scale,
+            "acceleration_scale": request.acceleration_scale,
+            "planning_timeout_s": request.planning_timeout_s,
+            "execution_timeout_s": request.execution_timeout_s,
+            "joint_position_tol_rad": request.joint_position_tol_rad,
+            "translation_tol_m": request.translation_tol_m,
+            "rotation_tol_rad": request.rotation_tol_rad,
+            "cache_mode": request.cache_mode,
+        }
+
+        if request.max_tcp_linear_speed_mps is not None:
+            req_dict["max_tcp_linear_speed_mps"] = request.max_tcp_linear_speed_mps
+
+        if request.motion_type == "joint_goal":
+            req_dict["joint_goal_names"] = request.joint_goal_names
+            req_dict["joint_goal_positions_rad"] = request.joint_goal_positions_rad
+        elif request.motion_type == "pose_goal":
+            req_dict["pose_goal"] = request.pose_goal
+        elif request.motion_type == "relative_move":
+            req_dict["relative_move"] = relative_move
+        return req_dict
 
     def execute(self, request: ExecuteRequest) -> ExecuteResult:
         relative_move = request.relative_move
@@ -281,6 +338,85 @@ class NativeKernelClient(KernelClient):
             ),
         )
 
+    def plan_motion(
+        self,
+        request: ExecuteRequest,
+        start_state: Optional[RobotStateSnapshot] = None,
+    ) -> tuple[MotionPreviewResult, Optional[Trajectory]]:
+        """Plan and validate a motion, returning the trajectory for external executors.
+
+        This is intentionally narrower than ``execute``: the native RoboPlan
+        context remains the planning and validation authority, while callers
+        such as the ROS 2 execution adapter own the final transport dispatch.
+        """
+        start_state_dict = None
+        if start_state is not None:
+            start_state_dict = {
+                "joint_names": list(start_state.joint_names),
+                "positions_rad": list(start_state.positions_rad),
+                "velocities_rad_s": list(start_state.velocities_rad_s),
+            }
+
+        result = self._bundle.plan_motion(
+            self._request_to_native_dict(request),
+            start_state_dict,
+        )
+        final_state = result.get("final_state")
+        preview = MotionPreviewResult(
+            ok=result.get("ok", False),
+            error=result.get("error"),
+            error_details=(
+                None
+                if result.get("error_details") is None
+                else dict(result.get("error_details", {}))
+            ),
+            trajectory_duration_s=result.get("trajectory_duration_s"),
+            trajectory_waypoint_count=result.get("trajectory_waypoint_count"),
+            final_state=(
+                None
+                if final_state is None
+                else RobotStateSnapshot(
+                    joint_names=list(final_state.get("joint_names", [])),
+                    positions_rad=list(final_state.get("positions_rad", [])),
+                    velocities_rad_s=list(final_state.get("velocities_rad_s", [])),
+                )
+            ),
+            final_tcp_pose=(
+                None
+                if result.get("final_tcp_pose") is None
+                else {
+                    "position_m": list(result["final_tcp_pose"]["position_m"]),
+                    "orientation_xyzw": list(
+                        result["final_tcp_pose"]["orientation_xyzw"]
+                    ),
+                }
+            ),
+        )
+        if not preview.ok:
+            return preview, None
+
+        trajectory_data = result.get("trajectory")
+        if trajectory_data is None:
+            return (
+                MotionPreviewResult(
+                    ok=False,
+                    error="Native plan_motion did not return a trajectory",
+                ),
+                None,
+            )
+        waypoints = [
+            TrajectoryWaypoint(
+                time_from_start_s=float(wp["time_from_start_s"]),
+                positions_rad=list(wp["positions_rad"]),
+            )
+            for wp in trajectory_data.get("waypoints", [])
+        ]
+        trajectory = Trajectory(
+            joint_names=list(trajectory_data.get("joint_names", [])),
+            waypoints=waypoints,
+        )
+        return preview, trajectory
+
     def stop(self) -> CommandResult:
         r = self._bundle.stop()
         return CommandResult(accepted=r["accepted"], error=r.get("error"))
@@ -321,6 +457,8 @@ class NativeKernelClient(KernelClient):
             progress=s.get("progress", 0.0),
             joint_positions_rad=list(s.get("joint_positions_rad", [])),
             error=s.get("error"),
+            error_code=s.get("error_code"),
+            error_details=dict(s.get("error_details", {})),
         )
 
     def get_scene_object_ids(self) -> list[str]:
@@ -369,6 +507,22 @@ class NativeKernelClient(KernelClient):
         return dict(self._bundle.get_metrics())
 
     def command_gripper(self, request: GripperCommandRequest) -> CommandResult:
+        if hasattr(self._bundle, "command_ros_gripper"):
+            try:
+                result = self._bundle.command_ros_gripper(
+                    request.gripper_id,
+                    float(request.target_position),
+                    float(request.duration_s),
+                    0.0 if request.max_effort is None else float(request.max_effort),
+                )
+            except RuntimeError:
+                result = None
+            if result is not None:
+                return CommandResult(
+                    accepted=bool(result.get("accepted", False)),
+                    error=result.get("error"),
+                )
+
         self.update_gripper_commands()
         current = self.get_gripper_status(request.gripper_id)
         if current.state == GripperCommandState.EXECUTING:
@@ -419,6 +573,27 @@ class NativeKernelClient(KernelClient):
         return CommandResult(accepted=True)
 
     def get_gripper_status(self, gripper_id: str) -> GripperCommandStatus:
+        if hasattr(self._bundle, "get_ros_gripper_status"):
+            try:
+                status = self._bundle.get_ros_gripper_status(gripper_id)
+            except RuntimeError:
+                status = None
+            if status is not None:
+                state_name = str(status.get("state", "idle"))
+                state = {
+                    "idle": GripperCommandState.IDLE,
+                    "executing": GripperCommandState.EXECUTING,
+                    "completed": GripperCommandState.COMPLETED,
+                    "failed": GripperCommandState.FAILED,
+                }.get(state_name, GripperCommandState.IDLE)
+                return GripperCommandStatus(
+                    state=state,
+                    gripper_id=gripper_id,
+                    progress=float(status.get("progress", 0.0)),
+                    current_position=status.get("current_position"),
+                    target_position=status.get("target_position"),
+                    error=status.get("error"),
+                )
         return self._gripper_status_cache.get(
             gripper_id,
             GripperCommandStatus(
@@ -523,6 +698,10 @@ class NativeKernelClient(KernelClient):
             joint_names=list(result["joint_names"]),
             waypoints=waypoints,
         )
+
+    def collision_check_positions(self, positions_rad: list[float]) -> dict[str, Any]:
+        """Check backend collisions for active-group joint positions."""
+        return dict(self._bundle.collision_check_positions(list(positions_rad)))
 
     def get_link_pose(
         self, target_frame: str, base_frame: str

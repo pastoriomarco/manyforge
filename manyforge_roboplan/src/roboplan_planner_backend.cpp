@@ -6,6 +6,7 @@
 #include <fmt/format.h>
 #include <iostream>
 #include <map>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -166,6 +167,107 @@ void matrix_to_rpy_deg(const Eigen::Matrix4d& tform, double& roll, double& pitch
   pitch *= 180.0 / M_PI;
   yaw   *= 180.0 / M_PI;
 }
+
+double normalize_equivalent_revolute_angle_for_rrt(
+    double value,
+    double seed,
+    double lower,
+    double upper) {
+  constexpr double kTwoPi = 2.0 * M_PI;
+  constexpr double kWrapLimitTolerance = 1e-6;
+
+  if (!std::isfinite(value) || !std::isfinite(seed) ||
+      !std::isfinite(lower) || !std::isfinite(upper) || lower >= upper) {
+    return value;
+  }
+
+  const double width = upper - lower;
+  if (width < kTwoPi - kWrapLimitTolerance) {
+    return value;
+  }
+
+  const int k_min = static_cast<int>(std::ceil((lower - value) / kTwoPi));
+  const int k_max = static_cast<int>(std::floor((upper - value) / kTwoPi));
+  if (k_min > k_max) {
+    return value;
+  }
+
+  double best = value + static_cast<double>(k_min) * kTwoPi;
+  double best_distance = std::abs(best - seed);
+  for (int k = k_min + 1; k <= k_max; ++k) {
+    const double candidate = value + static_cast<double>(k) * kTwoPi;
+    const double distance = std::abs(candidate - seed);
+    if (distance < best_distance) {
+      best = candidate;
+      best_distance = distance;
+    }
+  }
+  return best;
+}
+
+void normalize_ik_goal_for_rrt_limits(
+    const std::shared_ptr<roboplan::Scene>& scene,
+    const std::string& group_name,
+    const Eigen::VectorXd& start_positions,
+    Eigen::VectorXd& goal_positions) {
+  auto pos_limits = scene->getPositionLimitVectors(group_name);
+  if (!pos_limits.has_value()) {
+    return;
+  }
+
+  const auto& [lower, upper] = pos_limits.value();
+  if (lower.size() != goal_positions.size() ||
+      upper.size() != goal_positions.size() ||
+      start_positions.size() != goal_positions.size()) {
+    return;
+  }
+
+  for (Eigen::Index i = 0; i < goal_positions.size(); ++i) {
+    const double before = goal_positions[i];
+    const double after = normalize_equivalent_revolute_angle_for_rrt(
+        before, start_positions[i], lower[i], upper[i]);
+    if (std::abs(after - before) > 1e-9) {
+      planner_debug(
+          "[PLANNER] normalized IK joint {} from {:.4f} to {:.4f} within [{:.4f}, {:.4f}]\n",
+          i, before, after, lower[i], upper[i]);
+      goal_positions[i] = after;
+    }
+  }
+}
+
+void anchor_trajectory_endpoints(
+    roboplan::JointTrajectory& trajectory,
+    const Eigen::VectorXd& start_positions,
+    const Eigen::VectorXd& goal_positions) {
+  if (trajectory.positions.empty()) {
+    return;
+  }
+
+  auto assign_if_same_size = [](Eigen::VectorXd& target, const Eigen::VectorXd& value) {
+    if (target.size() == value.size()) {
+      target = value;
+    }
+  };
+  auto zero_if_present = [](std::vector<Eigen::VectorXd>& values, size_t index) {
+    if (index < values.size()) {
+      values[index].setZero();
+    }
+  };
+
+  assign_if_same_size(trajectory.positions.front(), start_positions);
+  if (!trajectory.times.empty()) {
+    trajectory.times.front() = 0.0;
+  }
+  zero_if_present(trajectory.velocities, 0);
+  zero_if_present(trajectory.accelerations, 0);
+
+  if (trajectory.positions.size() > 1) {
+    const size_t last = trajectory.positions.size() - 1;
+    assign_if_same_size(trajectory.positions.back(), goal_positions);
+    zero_if_present(trajectory.velocities, last);
+    zero_if_present(trajectory.accelerations, last);
+  }
+}
 }  // namespace
 
 namespace manyforge::roboplan_backend {
@@ -175,15 +277,22 @@ RoboPlanPlannerBackend::RoboPlanPlannerBackend(
     const roboplan::RRTOptions& rrt_options,
     std::shared_ptr<roboplan::PathShortcutter> shortcutter,
     std::shared_ptr<roboplan::PathParameterizerTOPPRA> toppra,
-    std::shared_ptr<roboplan::SimpleIk> ik)
+    std::shared_ptr<roboplan::SimpleIk> ik,
+    std::shared_ptr<std::mutex> scene_mutex)
     : scene_(std::move(scene)),
       rrt_options_(rrt_options),
       shortcutter_(std::move(shortcutter)),
       toppra_(std::move(toppra)),
-      ik_(std::move(ik)) {}
+      ik_(std::move(ik)),
+      scene_mutex_(std::move(scene_mutex)) {
+  if (!scene_mutex_) {
+    scene_mutex_ = std::make_shared<std::mutex>();
+  }
+}
 
 core::PlanResultDTO RoboPlanPlannerBackend::plan(const core::PlanRequestDTO& request) {
   core::PlanResultDTO result;
+  std::unique_lock<std::mutex> scene_lock(*scene_mutex_);
 
   try {
     planner_debug("[PLANNER] plan() called, move_id={}, motion_type={}\n",
@@ -303,6 +412,9 @@ core::PlanResultDTO RoboPlanPlannerBackend::plan(const core::PlanRequestDTO& req
         planner_debug("{}{:.4f}", (i ? ", " : ""), goal_config.positions[i]);
       planner_debug("]\n");
 
+      normalize_ik_goal_for_rrt_limits(
+          scene_, rrt_options_.group_name, start_config.positions, goal_config.positions);
+
       // Check goal for self-collision
       const Eigen::VectorXd goal_positions_full =
           scene_->toFullJointPositions(rrt_options_.group_name, goal_config.positions);
@@ -411,6 +523,8 @@ core::PlanResultDTO RoboPlanPlannerBackend::plan(const core::PlanRequestDTO& req
       }
 
       final_traj = traj_result.value();
+      anchor_trajectory_endpoints(
+          final_traj, start_config.positions, goal_config.positions);
 
       // If no TCP speed limit, accept on first pass
       if (tcp_limit <= 0.0 || tcp_frame.empty()) {

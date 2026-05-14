@@ -20,6 +20,11 @@ from manyforge_behavior.model_paths import (
 from manyforge_behavior.program import Program
 from manyforge_behavior.runner import OrchestratorRunner
 
+_ROS2_CONTROL_EXECUTION_ADAPTER_IDS = {
+    "execution.ros2_control_fjt",
+    "execution.ros2_control_follow_joint_trajectory",
+}
+
 
 def _native_kernel_config_from_deployment(deployment: Deployment) -> dict[str, int]:
     period_ms = deployment.orchestrator.config.get("collision_monitor_period_ms")
@@ -37,6 +42,18 @@ def create_kernel(deployment: Deployment) -> KernelClient:
     Tries to import the native kernel (manyforge_roboplan) first.
     Falls back to MockKernelClient for testing.
     """
+    execution_adapter = deployment.adapters.get("execution")
+    if (
+        execution_adapter is not None
+        and execution_adapter.adapter_id in _ROS2_CONTROL_EXECUTION_ADAPTER_IDS
+    ):
+        raise RuntimeError(
+            "Deployment selected ROS 2 controller execution "
+            f"({execution_adapter.adapter_id}), but manyforge_behavior.scripts.launch "
+            "does not own ROS runtime wiring. Use Composer's ROS-capable "
+            "runtime profile or the future ROS kernel factory instead."
+        )
+
     planning_adapter = deployment.adapters.get("planning")
     if planning_adapter and planning_adapter.adapter_id == "planning.roboplan":
         try:

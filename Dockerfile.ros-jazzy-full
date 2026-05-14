@@ -27,6 +27,8 @@ ENV MANYFORGE_VENV=/opt/manyforge/venv
 ENV VIRTUAL_ENV=/opt/manyforge/venv
 ENV PATH=/opt/manyforge/venv/bin:$PATH
 ENV LD_LIBRARY_PATH=/usr/local/lib
+ARG TOPIC_BASED_ROS2_CONTROL_REPO=https://github.com/karanchahal-nv/topic_based_ros2_control.git
+ARG TOPIC_BASED_ROS2_CONTROL_REF=7ee291ab13adba52ab5889deb9e520009fe2283d
 
 SHELL ["/bin/bash", "-c"]
 
@@ -58,6 +60,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ros-${ROS_DISTRO}-sensor-msgs \
         ros-${ROS_DISTRO}-simulation-interfaces \
         ros-${ROS_DISTRO}-trajectory-msgs \
+        ros-${ROS_DISTRO}-rclpy \
         ros-${ROS_DISTRO}-controller-manager \
         ros-${ROS_DISTRO}-joint-state-broadcaster \
         ros-${ROS_DISTRO}-joint-trajectory-controller \
@@ -66,6 +69,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && cd /usr/src/googletest && cmake . && make \
     && cp lib/*.a /usr/lib/ \
     && rm -rf /var/lib/apt/lists/*
+
+RUN set -eux; \
+    mkdir -p /tmp/topic_based_ros2_control_ws/src /opt/manyforge/topic_based_ros2_control; \
+    git clone "${TOPIC_BASED_ROS2_CONTROL_REPO}" /tmp/topic_based_ros2_control_ws/src/topic_based_ros2_control; \
+    cd /tmp/topic_based_ros2_control_ws/src/topic_based_ros2_control; \
+    git checkout "${TOPIC_BASED_ROS2_CONTROL_REF}"; \
+    cd /tmp/topic_based_ros2_control_ws; \
+    set +u; \
+    source "/opt/ros/${ROS_DISTRO}/setup.bash"; \
+    set -u; \
+    colcon build --merge-install --install-base /opt/manyforge/topic_based_ros2_control/install --packages-select topic_based_ros2_control --cmake-args -DBUILD_TESTING=OFF; \
+    rm -rf /tmp/topic_based_ros2_control_ws
 
 RUN python3 -m venv --system-site-packages "${MANYFORGE_VENV}" \
     && python -m pip install --no-cache-dir --upgrade pip "setuptools<80" \

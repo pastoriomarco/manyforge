@@ -19,6 +19,9 @@ from trajectory_msgs.msg import JointTrajectoryPoint
 class FakeTrajectoryGoalRecord:
     joint_names: list[str]
     point_count: int
+    points_positions: list[list[float]] = field(default_factory=list)
+    path_tolerance_positions: list[float] = field(default_factory=list)
+    goal_tolerance_positions: list[float] = field(default_factory=list)
     canceled: bool = False
 
 
@@ -30,6 +33,12 @@ class FakeFollowJointTrajectoryServer:
     action_name: str = "/fake_arm_controller/follow_joint_trajectory"
     feedback_delay_s: float = 0.0
     reject_empty_goals: bool = True
+    abort_after_feedback: bool = False
+    feedback_error_positions: list[float] | None = None
+    actual_position_offsets: list[float] | None = None
+    hold_after_first_feedback_s: float = 0.0
+    abort_error_code: int = FollowJointTrajectory.Result.PATH_TOLERANCE_VIOLATED
+    abort_error_string: str = "fake path tolerance violation"
     goals: list[FakeTrajectoryGoalRecord] = field(default_factory=list)
 
     def __post_init__(self) -> None:
@@ -61,10 +70,19 @@ class FakeFollowJointTrajectoryServer:
         record = FakeTrajectoryGoalRecord(
             joint_names=list(trajectory.joint_names),
             point_count=len(trajectory.points),
+            points_positions=[list(point.positions) for point in trajectory.points],
+            path_tolerance_positions=[
+                float(tolerance.position)
+                for tolerance in goal_handle.request.path_tolerance
+            ],
+            goal_tolerance_positions=[
+                float(tolerance.position)
+                for tolerance in goal_handle.request.goal_tolerance
+            ],
         )
         self.goals.append(record)
 
-        for point in trajectory.points:
+        for index, point in enumerate(trajectory.points):
             if goal_handle.is_cancel_requested:
                 record.canceled = True
                 goal_handle.canceled()
@@ -73,13 +91,35 @@ class FakeFollowJointTrajectoryServer:
             feedback = FollowJointTrajectory.Feedback()
             feedback.joint_names = list(trajectory.joint_names)
             feedback.desired = point
-            feedback.actual = point
+            feedback.actual = JointTrajectoryPoint()
+            feedback.actual.positions = list(point.positions)
+            feedback.actual.velocities = list(point.velocities)
+            feedback.actual.accelerations = list(point.accelerations)
+            if self.actual_position_offsets is not None:
+                feedback.actual.positions = [
+                    value + offset
+                    for value, offset in zip(
+                        feedback.actual.positions,
+                        self.actual_position_offsets,
+                        strict=False,
+                    )
+                ]
             feedback.error = JointTrajectoryPoint()
-            feedback.error.positions = [0.0 for _ in trajectory.joint_names]
+            if self.feedback_error_positions is not None:
+                feedback.error.positions = list(self.feedback_error_positions)
+            else:
+                feedback.error.positions = [0.0 for _ in trajectory.joint_names]
             goal_handle.publish_feedback(feedback)
+
+            if index == 0 and self.hold_after_first_feedback_s > 0:
+                time.sleep(self.hold_after_first_feedback_s)
 
             if self.feedback_delay_s > 0:
                 time.sleep(self.feedback_delay_s)
+
+            if self.abort_after_feedback and index == 0:
+                goal_handle.abort()
+                return self._result(self.abort_error_code, self.abort_error_string)
 
         goal_handle.succeed()
         return self._result(

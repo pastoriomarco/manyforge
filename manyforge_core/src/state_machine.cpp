@@ -17,21 +17,32 @@ bool ExecutionStateMachine::is_valid_transition(ExecutionState from, ExecutionSt
         case ExecutionState::kPlanning:
             return to == ExecutionState::kValidating ||
                    to == ExecutionState::kFailed ||
-                   to == ExecutionState::kStopped;  // stop cancels in-flight
+                   to == ExecutionState::kStopped ||  // stop cancels in-flight
+                   to == ExecutionState::kInterventionRequired;
         case ExecutionState::kValidating:
             return to == ExecutionState::kExecuting ||
                    to == ExecutionState::kFailed ||
-                   to == ExecutionState::kStopped;  // stop cancels in-flight
+                   to == ExecutionState::kStopped ||  // stop cancels in-flight
+                   to == ExecutionState::kInterventionRequired;
         case ExecutionState::kExecuting:
             return to == ExecutionState::kStopping ||
                    to == ExecutionState::kCompleted ||
-                   to == ExecutionState::kFailed;
+                   to == ExecutionState::kFailed ||
+                   to == ExecutionState::kInterventionRequired;
         case ExecutionState::kPaused:
             return to == ExecutionState::kValidating ||  // resume re-validates
-                   to == ExecutionState::kStopping;
+                   to == ExecutionState::kStopping ||
+                   to == ExecutionState::kInterventionRequired;
         case ExecutionState::kStopping:
             return to == ExecutionState::kStopped ||
-                   to == ExecutionState::kPaused;  // deceleration complete from pause
+                   to == ExecutionState::kPaused ||  // deceleration complete from pause
+                   to == ExecutionState::kInterventionRequired;
+        case ExecutionState::kStopped:
+        case ExecutionState::kCompleted:
+        case ExecutionState::kFailed:
+            return to == ExecutionState::kInterventionRequired;
+        case ExecutionState::kInterventionRequired:
+            return to == ExecutionState::kInterventionRequired;
         default:
             return false;
     }
@@ -49,6 +60,9 @@ void ExecutionStateMachine::do_transition(ExecutionState new_state) {
 
 Result<void> ExecutionStateMachine::try_transition(ExecutionState new_state) {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (current_state_ == new_state) {
+        return Result<void>::Ok();
+    }
     if (!is_valid_transition(current_state_, new_state)) {
         return Result<void>::Err(ErrorCode::kInvalidStateTransition);
     }

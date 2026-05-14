@@ -16,6 +16,7 @@ import type {
   ApplySessionResponse,
   FileBrowserResponse,
   InfraStatus,
+  RuntimeStatus,
   ModelEndpointCatalog,
   SceneStateResponse,
   SceneEditRequest,
@@ -184,6 +185,9 @@ export const api = {
   infra: {
     status: () => request<InfraStatus>('GET', '/api/infra/status'),
     modelEndpoints: () => request<ModelEndpointCatalog>('GET', '/api/infra/model-endpoints'),
+  },
+  runtime: {
+    status: () => request<RuntimeStatus>('GET', '/api/runtime/status'),
   },
   scene: {
     state: () => request<SceneStateResponse>('GET', '/api/scene/state'),

@@ -4,11 +4,15 @@
 
 #include <cstdint>
 #include <cmath>
+#include <optional>
 #include <stdexcept>
 
 #include <Eigen/Dense>
 
 #include <manyforge_roboplan/native_kernel_factory.hpp>
+#ifdef MANYFORGE_ROS2_CONTROL_ENABLED
+#include <manyforge_roboplan/ros2_control_execution_backend.hpp>
+#endif
 
 namespace py = pybind11;
 using namespace manyforge::roboplan_backend;
@@ -62,8 +66,12 @@ py::dict snapshot_to_python(const ExecutionSnapshot& snapshot) {
   d["joint_positions_rad"] = snapshot.joint_positions_rad;
   if (snapshot.error.has_value()) {
     d["error"] = snapshot.error->message;
+    d["error_code"] = snapshot.error->code;
+    d["error_details"] = error_details_to_python(snapshot.error->details);
   } else {
     d["error"] = py::none();
+    d["error_code"] = py::none();
+    d["error_details"] = py::dict();
   }
   return d;
 }
@@ -77,6 +85,87 @@ py::dict pose_to_python(const Pose3DTO& pose) {
       pose.orientation.x, pose.orientation.y,
       pose.orientation.z, pose.orientation.w);
   return d;
+}
+
+Pose3DTO multiply_poses_for_direct_plan(const Pose3DTO& a, const Pose3DTO& b) {
+  auto pose_to_matrix = [](const Pose3DTO& pose) {
+    Eigen::Matrix4d matrix = Eigen::Matrix4d::Identity();
+    const double x = pose.orientation.x;
+    const double y = pose.orientation.y;
+    const double z = pose.orientation.z;
+    const double w = pose.orientation.w;
+    matrix(0, 0) = 1 - 2 * y * y - 2 * z * z;
+    matrix(0, 1) = 2 * x * y - 2 * z * w;
+    matrix(0, 2) = 2 * x * z + 2 * y * w;
+    matrix(1, 0) = 2 * x * y + 2 * z * w;
+    matrix(1, 1) = 1 - 2 * x * x - 2 * z * z;
+    matrix(1, 2) = 2 * y * z - 2 * x * w;
+    matrix(2, 0) = 2 * x * z - 2 * y * w;
+    matrix(2, 1) = 2 * y * z + 2 * x * w;
+    matrix(2, 2) = 1 - 2 * x * x - 2 * y * y;
+    matrix(0, 3) = pose.position_m.x_m;
+    matrix(1, 3) = pose.position_m.y_m;
+    matrix(2, 3) = pose.position_m.z_m;
+    return matrix;
+  };
+
+  auto matrix_to_pose = [](const Eigen::Matrix4d& matrix) {
+    Pose3DTO pose;
+    pose.position_m = {matrix(0, 3), matrix(1, 3), matrix(2, 3)};
+
+    const Eigen::Matrix3d rotation = matrix.block<3, 3>(0, 0);
+    Eigen::Quaterniond quaternion(rotation);
+    quaternion.normalize();
+    pose.orientation = {
+        quaternion.x(), quaternion.y(), quaternion.z(), quaternion.w()};
+    return pose;
+  };
+
+  return matrix_to_pose(pose_to_matrix(a) * pose_to_matrix(b));
+}
+
+Pose3DTO pose_with_position_and_orientation_for_direct_plan(
+    const Vector3DTO& position,
+    const QuaternionDTO& orientation) {
+  Pose3DTO pose;
+  pose.position_m = position;
+  pose.orientation = orientation;
+  return pose;
+}
+
+std::optional<ErrorDTO> resolve_motion_spec_for_direct_plan(
+    NativeKernelBundle& bundle,
+    const ExecuteRequestDTO& request,
+    MotionSpecDTO& resolved_motion) {
+  if (const auto* relative_move = std::get_if<RelativeMoveDTO>(&request.motion)) {
+    auto target_pose = bundle.context->resolve_reference_pose(
+        relative_move->target_reference, request.base_frame);
+    if (!target_pose.ok()) {
+      return target_pose.error();
+    }
+
+    Pose3DTO offset_basis_pose = target_pose.value();
+    if (relative_move->offset_reference.has_value()) {
+      auto offset_reference_pose = bundle.context->resolve_reference_pose(
+          *relative_move->offset_reference, request.base_frame);
+      if (!offset_reference_pose.ok()) {
+        return offset_reference_pose.error();
+      }
+      offset_basis_pose = offset_reference_pose.value();
+    }
+
+    PoseGoalDTO pose_goal;
+    pose_goal.goal = multiply_poses_for_direct_plan(
+        pose_with_position_and_orientation_for_direct_plan(
+            target_pose.value().position_m,
+            offset_basis_pose.orientation),
+        relative_move->offset);
+    resolved_motion = MotionSpecDTO{pose_goal};
+    return std::nullopt;
+  }
+
+  resolved_motion = request.motion;
+  return std::nullopt;
 }
 
 Pose3DTO pose_from_python(const py::dict& pose_dict) {
@@ -149,6 +238,22 @@ py::dict robot_state_to_python(const RobotStateDTO& state) {
   d["joint_names"] = state.joint_names;
   d["positions_rad"] = state.positions_rad;
   d["velocities_rad_s"] = state.velocities_rad_s;
+  return d;
+}
+
+py::dict trajectory_to_python(const TrajectoryDTO& trajectory) {
+  py::dict d;
+  d["joint_names"] = trajectory.joint_names;
+  py::list waypoints;
+  for (const auto& wp : trajectory.waypoints) {
+    py::dict wp_dict;
+    wp_dict["time_from_start_s"] = wp.time_from_start_s;
+    wp_dict["positions_rad"] = wp.positions_rad;
+    wp_dict["velocities_rad_s"] = wp.velocities_rad_s;
+    wp_dict["accelerations_rad_s2"] = wp.accelerations_rad_s2;
+    waypoints.append(wp_dict);
+  }
+  d["waypoints"] = waypoints;
   return d;
 }
 
@@ -348,6 +453,116 @@ ExecutionKernelConfig kernel_config_from_python(const py::object& config_obj) {
   return config;
 }
 
+#ifdef MANYFORGE_ROS2_CONTROL_ENABLED
+Ros2ControlExecutionBackendConfig ros2_control_config_from_python(
+    const py::object& config_obj) {
+  if (config_obj.is_none()) {
+    throw std::invalid_argument("ros2_control config must not be None");
+  }
+  py::dict config_dict = config_obj.cast<py::dict>();
+  Ros2ControlExecutionBackendConfig config;
+  if (config_dict.contains("node_name")) {
+    config.node_name = config_dict["node_name"].cast<std::string>();
+  }
+  if (config_dict.contains("action_name")) {
+    config.action_name = config_dict["action_name"].cast<std::string>();
+  }
+  if (config_dict.contains("arm_action")) {
+    config.action_name = config_dict["arm_action"].cast<std::string>();
+  }
+  if (config_dict.contains("joint_state_topic")) {
+    config.joint_state_topic = config_dict["joint_state_topic"].cast<std::string>();
+  }
+  if (config_dict.contains("controller_state_topic")) {
+    config.controller_state_topic =
+        config_dict["controller_state_topic"].cast<std::string>();
+  }
+  if (config_dict.contains("required_joints")) {
+    config.required_joints =
+        config_dict["required_joints"].cast<std::vector<std::string>>();
+  }
+  auto read_seconds = [&](const char* s_key, const char* ms_key, double current) {
+    if (config_dict.contains(s_key)) {
+      return finite_scale_from_python(config_dict[s_key], s_key);
+    }
+    if (config_dict.contains(ms_key)) {
+      return finite_scale_from_python(config_dict[ms_key], ms_key) / 1000.0;
+    }
+    return current;
+  };
+  config.joint_state_max_age_s =
+      read_seconds("joint_state_max_age_s", "joint_state_max_age_ms",
+                   config.joint_state_max_age_s);
+  config.wait_for_state_timeout_s =
+      read_seconds("wait_for_state_timeout_s", "wait_for_state_timeout_ms",
+                   config.wait_for_state_timeout_s);
+  config.wait_for_action_server_timeout_s =
+      read_seconds("wait_for_action_server_timeout_s",
+                   "wait_for_action_server_timeout_ms",
+                   config.wait_for_action_server_timeout_s);
+  config.tracking_error_timeout_s =
+      read_seconds("tracking_error_timeout_s", "tracking_error_timeout_ms",
+                   config.tracking_error_timeout_s);
+  config.monitor_period_s =
+      read_seconds("monitor_period_s", "monitor_period_ms", config.monitor_period_s);
+  config.stop_completion_timeout_s =
+      read_seconds("stop_completion_timeout_s", "stop_completion_timeout_ms",
+                   config.stop_completion_timeout_s);
+  config.sim_reset_motion_duration_s =
+      read_seconds("sim_reset_motion_duration_s",
+                   "sim_reset_motion_duration_ms",
+                   config.sim_reset_motion_duration_s);
+
+  if (config_dict.contains("start_tolerance_rad")) {
+    config.start_tolerance_rad =
+        finite_scale_from_python(config_dict["start_tolerance_rad"],
+                                 "start_tolerance_rad");
+  }
+  if (config_dict.contains("final_tolerance_rad")) {
+    config.final_tolerance_rad =
+        finite_scale_from_python(config_dict["final_tolerance_rad"],
+                                 "final_tolerance_rad");
+  }
+  if (config_dict.contains("tracking_error_tolerance_rad")) {
+    config.tracking_error_tolerance_rad =
+        finite_scale_from_python(config_dict["tracking_error_tolerance_rad"],
+                                 "tracking_error_tolerance_rad");
+  }
+  if (config_dict.contains("require_fresh_state_before_planning")) {
+    config.require_fresh_state_before_planning =
+        config_dict["require_fresh_state_before_planning"].cast<bool>();
+  }
+  if (config_dict.contains("disable_controller_path_tolerances")) {
+    config.disable_controller_path_tolerances =
+        config_dict["disable_controller_path_tolerances"].cast<bool>();
+  }
+  if (config_dict.contains("execution_state_source_mode")) {
+    config.execution_state_source_mode =
+        config_dict["execution_state_source_mode"].cast<std::string>();
+  }
+  if (config_dict.contains("initial_joint_positions_rad")) {
+    config.initial_joint_positions_rad =
+        config_dict["initial_joint_positions_rad"].cast<std::vector<double>>();
+  }
+  if (config_dict.contains("command_gate_topic")) {
+    config.command_gate_topic =
+        config_dict["command_gate_topic"].cast<std::string>();
+  }
+  return config;
+}
+
+Ros2ControlExecutionBackend& require_ros2_control_execution(
+    NativeKernelBundle& self) {
+  auto* backend =
+      dynamic_cast<Ros2ControlExecutionBackend*>(self.execution.get());
+  if (backend == nullptr) {
+    throw std::runtime_error(
+        "Native kernel execution backend is not ros2_control");
+  }
+  return *backend;
+}
+#endif
+
 }  // namespace
 
 PYBIND11_MODULE(manyforge_roboplan_py, m) {
@@ -460,7 +675,10 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
           req.motion = goal;
         }
 
-        auto result = self.kernel->execute(req);
+        auto result = [&]() {
+          py::gil_scoped_release release;
+          return self.kernel->execute(req);
+        }();
         return result_to_python(result);
       })
       .def("preview_motion", [](NativeKernelBundle& self,
@@ -566,7 +784,10 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
 
         RobotStateDTO start_state;
         if (start_state_obj.is_none()) {
-          start_state = self.context->get_current_state();
+          start_state = [&]() {
+            py::gil_scoped_release release;
+            return self.context->get_current_state();
+          }();
         } else {
           py::dict start_dict = start_state_obj.cast<py::dict>();
           start_state.joint_names =
@@ -586,12 +807,24 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
         plan_request.base_frame = req.base_frame;
         plan_request.tcp_frame = req.tcp_frame;
         plan_request.start_state = start_state;
-        plan_request.motion = req.motion;
+        MotionSpecDTO resolved_motion;
+        if (auto error = resolve_motion_spec_for_direct_plan(
+                self, req, resolved_motion)) {
+          py::dict result;
+          result["ok"] = false;
+          result["error"] = error->message;
+          result["error_details"] = error_details_to_python(error->details);
+          return result;
+        }
+        plan_request.motion = std::move(resolved_motion);
         plan_request.tolerances = req.tolerances;
         plan_request.speed_profile = req.speed_profile;
         plan_request.planning_timeout_s = req.timeouts.planning_timeout_s;
 
-        auto plan_result = self.planner->plan(plan_request);
+        auto plan_result = [&]() {
+          py::gil_scoped_release release;
+          return self.planner->plan(plan_request);
+        }();
         py::dict result;
         if (!plan_result.trajectory.has_value()) {
           result["ok"] = false;
@@ -612,8 +845,11 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
           validation_options.tcp_frame = req.tcp_frame;
           validation_options.base_frame = req.base_frame;
         }
-        auto validation_result = self.context->validate_trajectory(
-            *plan_result.trajectory, validation_options);
+        auto validation_result = [&]() {
+          py::gil_scoped_release release;
+          return self.context->validate_trajectory(
+              *plan_result.trajectory, validation_options);
+        }();
         if (!validation_result.valid) {
           result["ok"] = false;
           if (validation_result.error.has_value()) {
@@ -641,7 +877,10 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
         fk_request.robot_state = final_state;
         fk_request.target_frame = req.tcp_frame;
         fk_request.base_frame = req.base_frame;
-        auto final_tcp_pose = self.context->forward_kinematics(fk_request);
+        auto final_tcp_pose = [&]() {
+          py::gil_scoped_release release;
+          return self.context->forward_kinematics(fk_request);
+        }();
 
         result["ok"] = true;
         result["trajectory_duration_s"] =
@@ -651,20 +890,263 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
         result["final_tcp_pose"] = pose_to_python(final_tcp_pose);
         return result;
       }, py::arg("request"), py::arg("start_state") = py::none())
+      .def("plan_motion", [](NativeKernelBundle& self,
+                              py::dict request,
+                              py::object start_state_obj) -> py::dict {
+        ExecuteRequestDTO req;
+        req.robot_id = request["robot_id"].cast<std::string>();
+        req.group_id = request["group_id"].cast<std::string>();
+        req.move_id = request["move_id"].cast<std::string>();
+        req.base_frame = request["base_frame"].cast<std::string>();
+        req.tcp_frame = request["tcp_frame"].cast<std::string>();
+
+        req.tolerances.joint_position_tol_rad = request.attr("get")("joint_position_tol_rad", 0.05).cast<double>();
+        req.tolerances.translation_tol_m = request.attr("get")("translation_tol_m", 0.005).cast<double>();
+        req.tolerances.rotation_tol_rad = request.attr("get")("rotation_tol_rad", 0.05).cast<double>();
+
+        req.speed_profile.velocity_scale = finite_scale_from_python(
+            request.attr("get")("velocity_scale", 1.0),
+            "velocity_scale");
+        req.speed_profile.acceleration_scale = finite_scale_from_python(
+            request.attr("get")("acceleration_scale", 1.0),
+            "acceleration_scale");
+        if (request.contains("max_tcp_linear_speed_mps")) {
+          auto val = request["max_tcp_linear_speed_mps"];
+          if (!val.is_none()) {
+            double tcp_speed = val.cast<double>();
+            if (tcp_speed > 0.0) {
+              req.speed_profile.max_tcp_linear_speed_mps = tcp_speed;
+            }
+          }
+        }
+
+        req.timeouts.planning_timeout_s = request.attr("get")("planning_timeout_s", 5.0).cast<double>();
+        req.timeouts.execution_timeout_s = request.attr("get")("execution_timeout_s", 10.0).cast<double>();
+
+        std::string cache_mode_str = request.attr("get")("cache_mode", "default").cast<std::string>();
+        req.cache_mode = (cache_mode_str == "disable") ? CacheMode::kDisable : CacheMode::kDefault;
+
+        std::string motion_type = request["motion_type"].cast<std::string>();
+        if (motion_type == "joint_goal") {
+          JointGoalDTO goal;
+          goal.joint_names = request["joint_goal_names"].cast<std::vector<std::string>>();
+          goal.positions_rad = request["joint_goal_positions_rad"].cast<std::vector<double>>();
+          req.motion = goal;
+        } else if (motion_type == "pose_goal") {
+          PoseGoalDTO goal;
+          auto pose_dict = request["pose_goal"];
+          auto pos = pose_dict["position_m"].cast<std::vector<double>>();
+          auto orient = pose_dict["orientation_xyzw"].cast<std::vector<double>>();
+          goal.goal.position_m = {pos[0], pos[1], pos[2]};
+          goal.goal.orientation = {orient[0], orient[1], orient[2], orient[3]};
+          req.motion = goal;
+        } else if (motion_type == "relative_move") {
+          RelativeMoveDTO goal;
+          auto rel_dict = request["relative_move"];
+          auto parse_reference_dict = [](const py::dict& ref_dict,
+                                         const std::string& field_name) {
+            ReferenceDTO reference;
+            const std::string ref_type = ref_dict["type"].cast<std::string>();
+            if (ref_type == "frame") {
+              reference.type = ReferenceDTO::Type::kFrame;
+            } else if (ref_type == "object") {
+              reference.type = ReferenceDTO::Type::kObject;
+            } else if (ref_type == "robot_link") {
+              reference.type = ReferenceDTO::Type::kRobotLink;
+            } else if (ref_type == "pose") {
+              reference.type = ReferenceDTO::Type::kPose;
+            } else {
+              throw std::runtime_error("Unsupported reference type: " + ref_type);
+            }
+            if (ref_dict.contains("id")) {
+              reference.id = ref_dict["id"].cast<std::string>();
+            }
+            if (reference.type == ReferenceDTO::Type::kPose) {
+              if (!ref_dict.contains("pose")) {
+                throw std::runtime_error(
+                    "Pose reference requires " + field_name + ".pose");
+              }
+              auto pose_dict = ref_dict["pose"];
+              auto pos = pose_dict["position_m"].cast<std::vector<double>>();
+              auto orient = pose_dict["orientation_xyzw"].cast<std::vector<double>>();
+              reference.pose = Pose3DTO{};
+              reference.pose->position_m = {pos[0], pos[1], pos[2]};
+              reference.pose->orientation = {orient[0], orient[1], orient[2], orient[3]};
+            }
+            return reference;
+          };
+
+          goal.target_reference = parse_reference_dict(
+              rel_dict["target_reference"].cast<py::dict>(), "target_reference");
+          if (rel_dict.contains("offset_reference")) {
+            goal.offset_reference = parse_reference_dict(
+                rel_dict["offset_reference"].cast<py::dict>(), "offset_reference");
+          }
+
+          auto offset_dict = rel_dict["offset"];
+          auto pos = offset_dict["position_m"].cast<std::vector<double>>();
+          auto orient = offset_dict["orientation_xyzw"].cast<std::vector<double>>();
+          goal.offset.position_m = {pos[0], pos[1], pos[2]};
+          goal.offset.orientation = {orient[0], orient[1], orient[2], orient[3]};
+          req.motion = goal;
+        }
+
+        RobotStateDTO start_state;
+        if (start_state_obj.is_none()) {
+          start_state = [&]() {
+            py::gil_scoped_release release;
+            return self.context->get_current_state();
+          }();
+        } else {
+          py::dict start_dict = start_state_obj.cast<py::dict>();
+          start_state.joint_names =
+              start_dict["joint_names"].cast<std::vector<std::string>>();
+          start_state.positions_rad =
+              start_dict["positions_rad"].cast<std::vector<double>>();
+          if (start_dict.contains("velocities_rad_s")) {
+            start_state.velocities_rad_s =
+                start_dict["velocities_rad_s"].cast<std::vector<double>>();
+          }
+        }
+
+        PlanRequestDTO plan_request;
+        plan_request.robot_id = req.robot_id;
+        plan_request.group_id = req.group_id;
+        plan_request.move_id = req.move_id;
+        plan_request.base_frame = req.base_frame;
+        plan_request.tcp_frame = req.tcp_frame;
+        plan_request.start_state = start_state;
+        MotionSpecDTO resolved_motion;
+        if (auto error = resolve_motion_spec_for_direct_plan(
+                self, req, resolved_motion)) {
+          py::dict result;
+          result["ok"] = false;
+          result["error"] = error->message;
+          result["error_details"] = error_details_to_python(error->details);
+          return result;
+        }
+        plan_request.motion = std::move(resolved_motion);
+        plan_request.tolerances = req.tolerances;
+        plan_request.speed_profile = req.speed_profile;
+        plan_request.planning_timeout_s = req.timeouts.planning_timeout_s;
+
+        auto plan_result = [&]() {
+          py::gil_scoped_release release;
+          return self.planner->plan(plan_request);
+        }();
+        py::dict result;
+        if (!plan_result.trajectory.has_value()) {
+          result["ok"] = false;
+          if (plan_result.error.has_value()) {
+            result["error"] = plan_result.error->message;
+            result["error_details"] =
+                error_details_to_python(plan_result.error->details);
+          } else {
+            result["error"] = "Planning failed";
+          }
+          return result;
+        }
+
+        ValidationOptionsDTO validation_options;
+        if (req.speed_profile.max_tcp_linear_speed_mps.has_value()) {
+          validation_options.max_tcp_linear_speed_mps =
+              *req.speed_profile.max_tcp_linear_speed_mps;
+          validation_options.tcp_frame = req.tcp_frame;
+          validation_options.base_frame = req.base_frame;
+        }
+        auto validation_result = [&]() {
+          py::gil_scoped_release release;
+          return self.context->validate_trajectory(
+              *plan_result.trajectory, validation_options);
+        }();
+        if (!validation_result.valid) {
+          result["ok"] = false;
+          if (validation_result.error.has_value()) {
+            result["error"] = validation_result.error->message;
+            result["error_details"] =
+                error_details_to_python(validation_result.error->details);
+          } else {
+            result["error"] = "Trajectory validation failed";
+          }
+          return result;
+        }
+
+        const auto& trajectory = *plan_result.trajectory;
+        RobotStateDTO final_state;
+        final_state.joint_names = trajectory.joint_names;
+        if (!trajectory.waypoints.empty()) {
+          const auto& final_wp = trajectory.waypoints.back();
+          final_state.positions_rad = final_wp.positions_rad;
+          final_state.velocities_rad_s = final_wp.velocities_rad_s;
+        } else {
+          final_state = start_state;
+        }
+
+        FkRequestDTO fk_request;
+        fk_request.robot_state = final_state;
+        fk_request.target_frame = req.tcp_frame;
+        fk_request.base_frame = req.base_frame;
+        auto final_tcp_pose = [&]() {
+          py::gil_scoped_release release;
+          return self.context->forward_kinematics(fk_request);
+        }();
+
+        result["ok"] = true;
+        result["trajectory_duration_s"] =
+            trajectory.waypoints.empty() ? 0.0 : trajectory.waypoints.back().time_from_start_s;
+        result["trajectory_waypoint_count"] = trajectory.waypoints.size();
+        result["final_state"] = robot_state_to_python(final_state);
+        result["final_tcp_pose"] = pose_to_python(final_tcp_pose);
+        result["trajectory"] = trajectory_to_python(trajectory);
+        return result;
+      }, py::arg("request"), py::arg("start_state") = py::none(),
+      "Plan and validate a motion, returning the time-parameterized trajectory.")
       .def("stop", [](NativeKernelBundle& self) -> py::dict {
-        auto r = self.kernel->stop();
+        auto r = [&]() {
+          py::gil_scoped_release release;
+          return self.kernel->stop();
+        }();
         return command_result(r.accepted, r.error);
       })
       .def("pause", [](NativeKernelBundle& self) -> py::dict {
-        auto r = self.kernel->pause();
+        auto r = [&]() {
+          py::gil_scoped_release release;
+          return self.kernel->pause();
+        }();
         return command_result(r.accepted, r.error);
       })
       .def("resume", [](NativeKernelBundle& self) -> py::dict {
-        auto r = self.kernel->resume();
+        auto r = [&]() {
+          py::gil_scoped_release release;
+          return self.kernel->resume();
+        }();
         return command_result(r.accepted, r.error);
       })
       .def("reset", [](NativeKernelBundle& self) -> py::dict {
-        auto r = self.kernel->reset();
+        auto r = [&]() {
+          py::gil_scoped_release release;
+          return self.kernel->reset();
+        }();
+#ifdef MANYFORGE_ROS2_CONTROL_ENABLED
+        // The kernel rejects reset while already idle, but ROS-side auxiliary
+        // channels such as JointState gripper commands can still hold adapter
+        // state when used directly from the native bundle. Keep the low-level
+        // binding idempotent so reset reliably clears the deployment adapter.
+        if (!r.accepted) {
+          try {
+            auto backend_result = [&]() {
+              py::gil_scoped_release release;
+              return require_ros2_control_execution(self).reset();
+            }();
+            if (backend_result.accepted) {
+              return command_result(backend_result.accepted,
+                                    backend_result.error);
+            }
+          } catch (const std::runtime_error&) {
+            // Non-ROS bundles keep the kernel result below.
+          }
+        }
+#endif
         return command_result(r.accepted, r.error);
       })
       .def("acknowledge_completed", [](NativeKernelBundle& self,
@@ -681,6 +1163,72 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
       .def("get_metrics", [](NativeKernelBundle& self) -> py::dict {
         return metrics_to_python(self.kernel->get_metrics());
       })
+#ifdef MANYFORGE_ROS2_CONTROL_ENABLED
+      .def("configure_ros_gripper_action",
+          [](NativeKernelBundle& self, const std::string& gripper_id,
+             py::dict config_dict) {
+            Ros2GripperActionConfig config;
+            if (config_dict.contains("action_name")) {
+              config.action_name =
+                  config_dict["action_name"].cast<std::string>();
+            }
+            if (config_dict.contains("wait_for_action_server_timeout_s")) {
+              config.wait_for_action_server_timeout_s =
+                  finite_scale_from_python(
+                      config_dict["wait_for_action_server_timeout_s"],
+                      "wait_for_action_server_timeout_s");
+            }
+            if (config_dict.contains("result_timeout_s")) {
+              config.result_timeout_s =
+                  finite_scale_from_python(config_dict["result_timeout_s"],
+                                           "result_timeout_s");
+            }
+            require_ros2_control_execution(self).configure_gripper_action(
+                gripper_id, std::move(config));
+          },
+          py::arg("gripper_id"), py::arg("config"))
+      .def("command_ros_gripper",
+          [](NativeKernelBundle& self, const std::string& gripper_id,
+             double target_position, double duration_s,
+             double max_effort) -> py::dict {
+            const auto result = require_ros2_control_execution(self).command_gripper(
+                gripper_id, target_position, duration_s, max_effort);
+            py::dict d;
+            d["accepted"] = result.accepted;
+            if (!result.error.empty()) {
+              d["error"] = result.error;
+            }
+            return d;
+          },
+          py::arg("gripper_id"), py::arg("target_position"),
+          py::arg("duration_s"), py::arg("max_effort") = 0.0)
+      .def("update_ros_grippers", [](NativeKernelBundle& self) {
+        require_ros2_control_execution(self).update_gripper_commands();
+      })
+      .def("get_ros_gripper_status",
+          [](NativeKernelBundle& self, const std::string& gripper_id) -> py::dict {
+            const auto status =
+                require_ros2_control_execution(self).get_gripper_status(gripper_id);
+            py::dict d;
+            d["state"] = status.state;
+            d["progress"] = status.progress;
+            if (status.current_position.has_value()) {
+              d["current_position"] = *status.current_position;
+            } else {
+              d["current_position"] = py::none();
+            }
+            if (status.target_position.has_value()) {
+              d["target_position"] = *status.target_position;
+            } else {
+              d["target_position"] = py::none();
+            }
+            if (!status.error.empty()) {
+              d["error"] = status.error;
+            }
+            return d;
+          },
+          py::arg("gripper_id"))
+#endif
       .def("get_scene_object_ids", [](NativeKernelBundle& self) {
         return self.context->get_scene_object_ids();
       })
@@ -772,7 +1320,10 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
           }
 
           if (op == "upsert") {
-            auto state = self.context->get_object_state(req.object_id);
+            auto state = [&]() {
+              py::gil_scoped_release release;
+              return self.context->get_object_state(req.object_id);
+            }();
             if (state.exists && state.attached) {
               result["success"] = false;
               result["error"] = "Cannot upsert attached object";
@@ -781,7 +1332,10 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
             if (state.exists) {
               RemoveObjectRequestDTO remove_req;
               remove_req.object_id = req.object_id;
-              auto remove_result = self.context->remove_object(remove_req);
+              auto remove_result = [&]() {
+                py::gil_scoped_release release;
+                return self.context->remove_object(remove_req);
+              }();
               if (!remove_result.success) {
                 result["success"] = false;
                 if (remove_result.error.has_value()) {
@@ -794,14 +1348,20 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
             }
           }
 
-          auto r = self.context->add_object(req);
+          auto r = [&]() {
+            py::gil_scoped_release release;
+            return self.context->add_object(req);
+          }();
           result["success"] = r.success;
           if (r.error.has_value()) result["error"] = r.error->message;
 
         } else if (op == "remove") {
           RemoveObjectRequestDTO req;
           req.object_id = request["object_id"].cast<std::string>();
-          auto r = self.context->remove_object(req);
+          auto r = [&]() {
+            py::gil_scoped_release release;
+            return self.context->remove_object(req);
+          }();
           result["success"] = r.success;
           if (r.error.has_value()) result["error"] = r.error->message;
 
@@ -819,7 +1379,10 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
           } else {
             req.pose.orientation = {0, 0, 0, 1};
           }
-          auto r = self.context->update_object_pose(req);
+          auto r = [&]() {
+            py::gil_scoped_release release;
+            return self.context->update_object_pose(req);
+          }();
           result["success"] = r.success;
           if (r.error.has_value()) result["error"] = r.error->message;
         } else if (op == "attach") {
@@ -830,14 +1393,20 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
               !request["touch_links"].is_none()) {
             req.touch_links = request["touch_links"].cast<std::vector<std::string>>();
           }
-          auto r = self.context->attach_object(req);
+          auto r = [&]() {
+            py::gil_scoped_release release;
+            return self.context->attach_object(req);
+          }();
           result["success"] = r.success;
           if (r.error.has_value()) result["error"] = r.error->message;
         } else if (op == "detach") {
           DetachObjectRequestDTO req;
           req.object_id = request["object_id"].cast<std::string>();
           req.frame_id = request.attr("get")("frame_id", "universe").cast<std::string>();
-          auto r = self.context->detach_object(req);
+          auto r = [&]() {
+            py::gil_scoped_release release;
+            return self.context->detach_object(req);
+          }();
           result["success"] = r.success;
           if (r.error.has_value()) result["error"] = r.error->message;
         } else {
@@ -907,6 +1476,32 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
         }
       }, py::arg("group_name"), py::arg("positions"),
       "Set joint positions for a specific SRDF group in the planning scene.")
+      .def("collision_check_positions", [](NativeKernelBundle& self,
+                                            const std::vector<double>& positions) {
+        RobotStateDTO state;
+        state.joint_names = self.context->get_joint_names();
+        state.positions_rad = positions;
+        CollisionCheckRequestDTO request;
+        request.robot_state = state;
+        const auto result = [&]() {
+          py::gil_scoped_release release;
+          return self.context->collision_check(request);
+        }();
+        py::dict d;
+        d["in_collision"] = result.in_collision;
+        if (result.contact_body_a.has_value()) {
+          d["contact_body_a"] = *result.contact_body_a;
+        } else {
+          d["contact_body_a"] = py::none();
+        }
+        if (result.contact_body_b.has_value()) {
+          d["contact_body_b"] = *result.contact_body_b;
+        } else {
+          d["contact_body_b"] = py::none();
+        }
+        return d;
+      }, py::arg("positions"),
+      "Check collisions for active-group joint positions.")
       .def("get_cached_trajectory", [](NativeKernelBundle& self,
                                        const std::string& move_id) -> py::object {
         auto cached = self.cache->lookup(move_id);
@@ -934,9 +1529,15 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
           req.base_frame = base_frame;
 
           // Get current state for FK
-          req.robot_state = self.context->get_current_state();
+          req.robot_state = [&]() {
+            py::gil_scoped_release release;
+            return self.context->get_current_state();
+          }();
 
-          auto pose = self.context->forward_kinematics(req);
+          auto pose = [&]() {
+            py::gil_scoped_release release;
+            return self.context->forward_kinematics(req);
+          }();
 
           py::dict result;
           result["position_m"] = py::make_tuple(
@@ -953,7 +1554,11 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
                                   const std::string& object_id,
                                   const std::string& base_frame) -> py::object {
         try {
-          return pose_to_python(self.context->get_object_pose(object_id, base_frame));
+          auto pose = [&]() {
+            py::gil_scoped_release release;
+            return self.context->get_object_pose(object_id, base_frame);
+          }();
+          return pose_to_python(pose);
         } catch (...) {
           return py::none();
         }
@@ -1008,4 +1613,25 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
         py::arg("package_paths") = std::vector<std::string>{},
         py::arg("config") = py::none(),
         "Create a native C++ kernel from explicit URDF/SRDF/package bundle paths.");
+
+#ifdef MANYFORGE_ROS2_CONTROL_ENABLED
+  m.def("create_ros2_control_kernel_from_paths",
+        [](const std::string& model_name, const std::string& group_name,
+           const std::string& urdf_path, const std::string& srdf_path,
+           const std::vector<std::string>& package_paths, py::object ros_config,
+           py::object kernel_config) {
+          return create_ros2_control_kernel(
+              model_name, group_name, urdf_path, srdf_path, package_paths,
+              ros2_control_config_from_python(ros_config),
+              kernel_config_from_python(kernel_config));
+        },
+        py::arg("model_name"),
+        py::arg("group_name"),
+        py::arg("urdf_path"),
+        py::arg("srdf_path"),
+        py::arg("package_paths") = std::vector<std::string>{},
+        py::arg("ros_config") = py::none(),
+        py::arg("kernel_config") = py::none(),
+        "Create a native C++ kernel with RoboPlan planning and ros2_control execution.");
+#endif
 }

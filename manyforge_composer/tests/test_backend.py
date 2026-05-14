@@ -1329,6 +1329,50 @@ def test_infra_model_endpoints_reports_configured_and_live_models(client, monkey
     assert "Qwen3.5-9B-Claude-Distilled-NVFP4" in endpoint["availableModelIds"]
 
 
+def test_runtime_status_reports_composer_only_before_program_load(client):
+    """GET /api/runtime/status returns the generic runtime contract."""
+    response = client.get("/api/runtime/status")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["schemaVersion"] == "manyforge.runtime_status.v1"
+    assert data["profileKind"] == "composer_only"
+    assert data["authority"] == "backend_authored"
+    assert data["readiness"] == "waiting"
+    assert data["canRender"] is False
+    assert data["canPlan"] is False
+    assert data["canExecute"] is False
+    component_ids = {component["id"] for component in data["components"]}
+    assert {"composer", "program", "hmi", "planner", "execution_backend"} <= component_ids
+
+
+def test_runtime_status_merges_external_provider_components(client):
+    """External bringup supervisors can contribute modular runtime status."""
+    response = client.post(
+        "/api/runtime/external/isaac_demo_supervisor",
+        json={
+            "readiness": "waiting",
+            "canExecute": False,
+            "userMessage": "Waiting for Isaac.",
+            "components": [
+                {
+                    "id": "isaac_stream",
+                    "label": "Isaac joint stream",
+                    "kind": "simulator",
+                    "status": "waiting",
+                    "requiredFor": ["execute"],
+                    "detail": "Waiting for /isaac_joint_states",
+                }
+            ],
+        },
+    )
+    assert response.status_code == 200
+
+    data = client.get("/api/runtime/status").json()
+    assert "isaac_demo_supervisor" in data["externalProviders"]
+    assert any(component["id"] == "isaac_stream" for component in data["components"])
+
+
 def test_get_saved_full_deployment_reflects_disk_not_applied_runtime(client):
     """GET /api/deployment/saved/full returns the on-disk artifact even after an unsaved apply."""
     client.post("/api/program/load", json={"path": _PROGRAM_PATH, "deployment_path": _DEPLOYMENT_PATH})

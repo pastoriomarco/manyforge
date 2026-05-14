@@ -21,6 +21,7 @@ class ExecutionState(Enum):
     STOPPED = "stopped"
     COMPLETED = "completed"
     FAILED = "failed"
+    INTERVENTION_REQUIRED = "intervention_required"
 
 
 class GripperCommandState(Enum):
@@ -71,6 +72,8 @@ class ExecutionSnapshot:
     progress: float = 0.0
     joint_positions_rad: List[float] = field(default_factory=list)
     error: Optional[str] = None
+    error_code: Optional[str] = None
+    error_details: Dict[str, str] = field(default_factory=dict)
 
 
 @dataclass

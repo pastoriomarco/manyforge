@@ -3,13 +3,15 @@
 #include <manyforge_core/time/ischeduler.hpp>
 
 #include <map>
+#include <mutex>
 #include <utility>
 #include <vector>
 
 namespace manyforge::core {
 
 /// A manual scheduler for testing that fires callbacks when time is advanced.
-/// Not thread-safe. Intended for deterministic unit tests.
+/// Thread-safe for concurrent schedule/cancel/advance calls; callbacks run
+/// outside the scheduler lock.
 class ManualScheduler final : public IScheduler {
  public:
   /// Constructs a ManualScheduler.
@@ -17,6 +19,7 @@ class ManualScheduler final : public IScheduler {
 
   /// Schedule a callback to fire at the given deadline.
   ScheduleHandle schedule(TimePoint deadline, std::function<void()> callback) override {
+    std::lock_guard<std::mutex> lock(mutex_);
     ScheduleHandle handle = next_handle_++;
     pending_.emplace(deadline, std::make_pair(handle, std::move(callback)));
     return handle;
@@ -24,6 +27,7 @@ class ManualScheduler final : public IScheduler {
 
   /// Cancel a scheduled callback. No-op if already fired or invalid.
   void cancel(ScheduleHandle handle) override {
+    std::lock_guard<std::mutex> lock(mutex_);
     for (auto it = pending_.begin(); it != pending_.end(); ++it) {
       if (it->second.first == handle) {
         pending_.erase(it);
@@ -37,12 +41,15 @@ class ManualScheduler final : public IScheduler {
   void advance_to(TimePoint t) {
     std::vector<std::function<void()>> to_fire;
 
-    for (auto it = pending_.begin(); it != pending_.end(); ) {
-      if (it->first <= t) {
-        to_fire.push_back(std::move(it->second.second));
-        it = pending_.erase(it);
-      } else {
-        ++it;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      for (auto it = pending_.begin(); it != pending_.end(); ) {
+        if (it->first <= t) {
+          to_fire.push_back(std::move(it->second.second));
+          it = pending_.erase(it);
+        } else {
+          ++it;
+        }
       }
     }
 
@@ -52,6 +59,7 @@ class ManualScheduler final : public IScheduler {
   }
 
  private:
+  std::mutex mutex_;
   /// Multimap from deadline to (handle, callback).
   /// Allows multiple callbacks at the same deadline; sorted by deadline.
   std::multimap<TimePoint, std::pair<ScheduleHandle, std::function<void()>>> pending_;

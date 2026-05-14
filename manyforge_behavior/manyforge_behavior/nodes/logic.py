@@ -247,10 +247,13 @@ class CommandGripper(py_trees.behaviour.Behaviour):
             return py_trees.common.Status.FAILURE
 
         command_mode = str(config.get("command_mode", ""))
-        if command_mode != "simulated_joint":
+        if command_mode not in {
+            "simulated_joint",
+            "ros_gripper_command",
+        }:
             self.feedback_message = (
-                f"command_gripper currently supports command_mode=simulated_joint, "
-                f"got '{command_mode}'"
+                "command_gripper currently supports command_mode=simulated_joint "
+                f"or ros_gripper_command, got '{command_mode}'"
             )
             return py_trees.common.Status.FAILURE
 

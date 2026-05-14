@@ -221,7 +221,8 @@ std::shared_ptr<NativeKernelBundle> create_native_kernel(
   // Create native backends
   auto scene_mutex = std::make_shared<std::mutex>();
   bundle->planner = std::make_unique<RoboPlanPlannerBackend>(
-      bundle->scene, rrt_opts, bundle->shortcutter, bundle->toppra, bundle->ik);
+      bundle->scene, rrt_opts, bundle->shortcutter, bundle->toppra, bundle->ik,
+      scene_mutex);
   bundle->context = std::make_unique<RoboPlanPlanningContext>(
       bundle->scene, group_name, scene_mutex);
   bundle->clock = std::make_unique<WallClock>();

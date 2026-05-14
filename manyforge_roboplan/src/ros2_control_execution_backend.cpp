@@ -1,0 +1,1984 @@
+#include <manyforge_roboplan/ros2_control_execution_backend.hpp>
+
+#include <Eigen/Dense>
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <filesystem>
+#include <future>
+#include <iomanip>
+#include <map>
+#include <sstream>
+#include <stdexcept>
+#include <utility>
+
+#include <manyforge_core/types/error_code.hpp>
+#include <manyforge_roboplan/native_kernel_factory.hpp>
+
+namespace manyforge::roboplan_backend {
+namespace {
+
+double clamp_progress(double progress) {
+  return std::max(0.0, std::min(1.0, progress));
+}
+
+core::ErrorDTO make_error(core::ErrorCode code, std::string message) {
+  return core::ErrorDTO{std::string(core::to_string(code)), std::move(message), {}};
+}
+
+core::ErrorDTO make_error(core::ErrorCode code,
+                          std::string message,
+                          std::map<std::string, std::string> details) {
+  return core::ErrorDTO{
+      std::string(core::to_string(code)), std::move(message), std::move(details)};
+}
+
+builtin_interfaces::msg::Duration duration_from_seconds(double seconds) {
+  builtin_interfaces::msg::Duration duration;
+  const double clamped = std::max(0.0, seconds);
+  const auto whole = static_cast<int32_t>(std::floor(clamped));
+  const auto nanosec =
+      static_cast<uint32_t>(std::round((clamped - static_cast<double>(whole)) * 1e9));
+  duration.sec = whole;
+  duration.nanosec = std::min<uint32_t>(nanosec, 999999999u);
+  return duration;
+}
+
+double seconds_since(std::chrono::steady_clock::time_point t,
+                     std::chrono::steady_clock::time_point now) {
+  return std::chrono::duration<double>(now - t).count();
+}
+
+bool wait_for_fjt_action_server(
+    const rclcpp_action::Client<control_msgs::action::FollowJointTrajectory>::SharedPtr&
+        client,
+    double timeout_s) {
+  const auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::duration<double>(std::max(0.0, timeout_s));
+  do {
+    if (client->wait_for_action_server(std::chrono::milliseconds(100))) {
+      return true;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+  } while (std::chrono::steady_clock::now() < deadline);
+  return client->wait_for_action_server(std::chrono::milliseconds(0));
+}
+
+void disable_fjt_controller_tolerances(
+    control_msgs::action::FollowJointTrajectory::Goal& goal,
+    const std::vector<std::string>& joint_names) {
+  goal.path_tolerance.clear();
+  goal.goal_tolerance.clear();
+  for (const auto& joint_name : joint_names) {
+    control_msgs::msg::JointTolerance tolerance;
+    tolerance.name = joint_name;
+    tolerance.position = -1.0;
+    tolerance.velocity = -1.0;
+    tolerance.acceleration = -1.0;
+    goal.path_tolerance.push_back(tolerance);
+    goal.goal_tolerance.push_back(std::move(tolerance));
+  }
+}
+
+}  // namespace
+
+Ros2ControlExecutionBackend::Ros2ControlExecutionBackend(
+    std::shared_ptr<roboplan::Scene> scene,
+    std::string group_name,
+    core::IClock& clock,
+    Ros2ControlExecutionBackendConfig config,
+    std::shared_ptr<std::mutex> scene_mutex)
+    : scene_(std::move(scene)),
+      group_name_(std::move(group_name)),
+      clock_(clock),
+      config_(std::move(config)),
+      scene_mutex_(std::move(scene_mutex)) {
+  if (!scene_) {
+    throw std::invalid_argument("scene must not be null");
+  }
+  if (!scene_mutex_) {
+    scene_mutex_ = std::make_shared<std::mutex>();
+  }
+  validate_config();
+  snapshot_.timestamp_ns = clock_.now();
+  start_ros();
+}
+
+Ros2ControlExecutionBackend::~Ros2ControlExecutionBackend() {
+  GoalHandleFJT::SharedPtr handle_to_cancel;
+  {
+    std::lock_guard<std::mutex> lock(execution_mutex_);
+    handle_to_cancel = active_goal_handle_;
+    running_ = false;
+    terminal_ = true;
+    stop_requested_ = true;
+    pause_requested_ = false;
+    active_goal_handle_.reset();
+    active_goal_id_.reset();
+  }
+  cancel_goal_if_known(handle_to_cancel);
+  cancel_all_gripper_commands();
+  set_command_gate(false);
+  execution_cv_.notify_all();
+  if (monitor_thread_.joinable()) {
+    monitor_thread_.join();
+  }
+  stop_ros();
+}
+
+void Ros2ControlExecutionBackend::validate_config() const {
+  if (config_.action_name.empty()) {
+    throw std::invalid_argument("ros2_control action_name must not be empty");
+  }
+  if (config_.joint_state_topic.empty() && config_.controller_state_topic.empty()) {
+    throw std::invalid_argument(
+        "ros2_control execution requires joint_state_topic or controller_state_topic");
+  }
+  if (config_.required_joints.empty()) {
+    throw std::invalid_argument("ros2_control required_joints must not be empty");
+  }
+  if (config_.joint_state_max_age_s < 0.0 ||
+      config_.wait_for_state_timeout_s < 0.0 ||
+      config_.wait_for_action_server_timeout_s < 0.0 ||
+      config_.start_tolerance_rad < 0.0 ||
+      config_.final_tolerance_rad < 0.0 ||
+      config_.tracking_error_tolerance_rad < 0.0 ||
+      config_.tracking_error_timeout_s < 0.0 ||
+      config_.stop_completion_timeout_s < 0.0 ||
+      config_.sim_reset_motion_duration_s < 0.0 ||
+      config_.monitor_period_s <= 0.0) {
+    throw std::invalid_argument("ros2_control timing/tolerance config is invalid");
+  }
+  if (config_.execution_state_source_mode == "commanded_sim" &&
+      config_.initial_joint_positions_rad.size() != config_.required_joints.size()) {
+    throw std::invalid_argument(
+        "commanded_sim requires initial_joint_positions_rad with one value per required joint");
+  }
+  if (config_.disable_controller_path_tolerances &&
+      config_.execution_state_source_mode != "commanded_sim") {
+    throw std::invalid_argument(
+        "disable_controller_path_tolerances is allowed only for commanded_sim deployments");
+  }
+}
+
+void Ros2ControlExecutionBackend::start_ros() {
+  context_ = std::make_shared<rclcpp::Context>();
+  int argc = 0;
+  char** argv = nullptr;
+  context_->init(argc, argv);
+  rclcpp::NodeOptions options;
+  options.context(context_);
+  node_ = std::make_shared<rclcpp::Node>(config_.node_name, options);
+
+  action_client_ =
+      rclcpp_action::create_client<FollowJointTrajectory>(node_, config_.action_name);
+
+  if (!config_.joint_state_topic.empty()) {
+    joint_state_sub_ = node_->create_subscription<sensor_msgs::msg::JointState>(
+        config_.joint_state_topic, rclcpp::SystemDefaultsQoS(),
+        [this](const sensor_msgs::msg::JointState::SharedPtr msg) {
+          on_joint_state(msg);
+        });
+  }
+  if (!config_.controller_state_topic.empty()) {
+    controller_state_sub_ =
+        node_->create_subscription<control_msgs::msg::JointTrajectoryControllerState>(
+            config_.controller_state_topic, rclcpp::SystemDefaultsQoS(),
+            [this](
+                const control_msgs::msg::JointTrajectoryControllerState::SharedPtr msg) {
+              on_controller_state(msg);
+            });
+  }
+  if (!config_.command_gate_topic.empty()) {
+    auto qos = rclcpp::QoS(1).reliable().transient_local();
+    command_gate_pub_ = node_->create_publisher<std_msgs::msg::Bool>(
+        config_.command_gate_topic, qos);
+    set_command_gate(false);
+  }
+
+  rclcpp::ExecutorOptions executor_options;
+  executor_options.context = context_;
+  executor_ = std::make_shared<rclcpp::executors::MultiThreadedExecutor>(
+      executor_options, 2);
+  executor_->add_node(node_);
+  spin_thread_ = std::thread([this]() { executor_->spin(); });
+}
+
+void Ros2ControlExecutionBackend::stop_ros() {
+  if (executor_) {
+    executor_->cancel();
+  }
+  if (spin_thread_.joinable()) {
+    spin_thread_.join();
+  }
+  if (executor_ && node_) {
+    executor_->remove_node(node_);
+  }
+  node_.reset();
+  executor_.reset();
+  if (context_) {
+    context_->shutdown("manyforge ros2_control execution backend shutdown");
+    context_.reset();
+  }
+}
+
+void Ros2ControlExecutionBackend::on_joint_state(
+    const sensor_msgs::msg::JointState::SharedPtr msg) {
+  JointSample sample;
+  sample.joint_names = msg->name;
+  sample.positions = msg->position;
+  sample.velocities = msg->velocity;
+  sample.received_at = std::chrono::steady_clock::now();
+  sample.source = "joint_state";
+  sample.topic = config_.joint_state_topic;
+  {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    latest_joint_state_ = std::move(sample);
+  }
+  state_cv_.notify_all();
+  sync_idle_scene_from_latest_sample();
+}
+
+void Ros2ControlExecutionBackend::on_controller_state(
+    const control_msgs::msg::JointTrajectoryControllerState::SharedPtr msg) {
+  JointSample sample;
+  sample.joint_names = msg->joint_names;
+  sample.positions = msg->feedback.positions;
+  sample.velocities = msg->feedback.velocities;
+  sample.received_at = std::chrono::steady_clock::now();
+  sample.source = "controller_state";
+  sample.topic = config_.controller_state_topic;
+  {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    latest_controller_state_ = std::move(sample);
+  }
+  state_cv_.notify_all();
+  sync_idle_scene_from_latest_sample();
+}
+
+void Ros2ControlExecutionBackend::on_action_feedback(
+    GoalHandleFJT::SharedPtr goal_handle,
+    const std::shared_ptr<const FollowJointTrajectory::Feedback> feedback) {
+  const auto now = std::chrono::steady_clock::now();
+  double elapsed_s = 0.0;
+  {
+    std::lock_guard<std::mutex> lock(execution_mutex_);
+    if (terminal_ || resync_required_) {
+      return;
+    }
+    if (!goal_handle || !active_goal_id_.has_value() ||
+        goal_handle->get_goal_id() != *active_goal_id_) {
+      return;
+    }
+    if (running_ && !first_feedback_seen_) {
+      first_feedback_seen_ = true;
+      execution_started_at_ = now;
+      tracking_error_since_.reset();
+    }
+    elapsed_s = seconds_since(execution_started_at_, now);
+  }
+  JointSample sample;
+  sample.joint_names = feedback->joint_names;
+  sample.positions = feedback->actual.positions;
+  sample.velocities = feedback->actual.velocities;
+  sample.received_at = now;
+  sample.source = "action_feedback";
+  sample.topic = config_.action_name;
+  JointSample error_sample;
+  error_sample.joint_names = feedback->joint_names;
+  error_sample.positions = feedback->error.positions;
+  error_sample.velocities = feedback->error.velocities;
+  error_sample.received_at = now;
+  error_sample.source = "action_feedback_error";
+  error_sample.topic = config_.action_name;
+  const auto& observed_positions = sample.positions;
+  const auto& expected_positions = feedback->desired.positions;
+  const auto& observed_velocities = sample.velocities;
+  {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    if (!error_sample.positions.empty()) {
+      update_tracking_error_peak_locked(
+          error_sample, elapsed_s,
+          observed_positions.empty() ? nullptr : &observed_positions,
+          expected_positions.empty() ? nullptr : &expected_positions,
+          observed_velocities.empty() ? nullptr : &observed_velocities);
+      latest_action_feedback_error_ = std::move(error_sample);
+    }
+    latest_action_feedback_ = std::move(sample);
+  }
+  state_cv_.notify_all();
+}
+
+void Ros2ControlExecutionBackend::on_action_result(
+    const GoalHandleFJT::WrappedResult& result) {
+  const bool canceled = result.code == rclcpp_action::ResultCode::CANCELED;
+  bool stop_requested = false;
+  bool pause_requested = false;
+  {
+    std::lock_guard<std::mutex> lock(execution_mutex_);
+    if (terminal_ || resync_required_) {
+      return;
+    }
+    if (!active_goal_id_.has_value() || result.goal_id != *active_goal_id_) {
+      return;
+    }
+    result_received_ = true;
+    stop_requested = stop_requested_;
+    pause_requested = pause_requested_;
+  }
+
+  if (stop_requested || pause_requested || canceled) {
+    const auto snapshot = get_execution_snapshot();
+    {
+      std::lock_guard<std::mutex> lock(execution_mutex_);
+      terminal_ = true;
+      running_ = false;
+      active_goal_handle_.reset();
+      active_goal_id_.reset();
+    }
+    publish_snapshot(pause_requested ? core::ExecutionState::kPaused
+                                     : core::ExecutionState::kStopped,
+                     snapshot.progress,
+                     snapshot.joint_positions_rad);
+    execution_cv_.notify_all();
+    return;
+  }
+
+  const bool controller_success =
+      result.result &&
+      result.result->error_code == FollowJointTrajectory::Result::SUCCESSFUL;
+  if (result.code != rclcpp_action::ResultCode::SUCCEEDED || !controller_success) {
+    const std::string controller_error =
+        result.result ? result.result->error_string : "controller returned no result";
+    const std::string feedback_error = latest_feedback_error_summary();
+    std::string detail = controller_error;
+    if (!feedback_error.empty()) {
+      detail = detail.empty() ? feedback_error : detail + "; " + feedback_error;
+    }
+    fail_execution(detail.empty()
+                       ? "FollowJointTrajectory goal failed"
+                       : "FollowJointTrajectory goal failed: " + detail);
+    return;
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(execution_mutex_);
+    terminal_ = true;
+    running_ = false;
+    active_goal_handle_.reset();
+    active_goal_id_.reset();
+  }
+  complete_execution();
+}
+
+std::optional<Ros2ControlExecutionBackend::JointSample>
+Ros2ControlExecutionBackend::select_latest_sample_locked(
+    std::chrono::steady_clock::time_point now) const {
+  const auto is_fresh = [&](const std::optional<JointSample>& sample) {
+    return sample.has_value() &&
+           seconds_since(sample->received_at, now) <= config_.joint_state_max_age_s;
+  };
+  if (is_fresh(latest_action_feedback_)) {
+    return latest_action_feedback_;
+  }
+  if (is_fresh(latest_controller_state_)) {
+    return latest_controller_state_;
+  }
+  if (is_fresh(latest_joint_state_)) {
+    return latest_joint_state_;
+  }
+  return std::nullopt;
+}
+
+void Ros2ControlExecutionBackend::sync_idle_scene_from_latest_sample() {
+  if (uses_authored_backend_state()) {
+    return;
+  }
+  {
+    std::lock_guard<std::mutex> lock(execution_mutex_);
+    if (running_) {
+      return;
+    }
+  }
+
+  std::optional<JointSample> sample;
+  {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    sample = select_latest_sample_locked(std::chrono::steady_clock::now());
+  }
+  if (!sample.has_value()) {
+    return;
+  }
+
+  std::vector<double> positions;
+  try {
+    positions = positions_for_joints(*sample, config_.required_joints);
+  } catch (const std::exception&) {
+    return;
+  }
+  update_scene_positions(positions, SceneUpdateMode::kBestEffort);
+  publish_snapshot(core::ExecutionState::kIdle, 0.0, positions);
+}
+
+bool Ros2ControlExecutionBackend::is_commanded_sim_mode() const {
+  return config_.execution_state_source_mode == "commanded_sim";
+}
+
+bool Ros2ControlExecutionBackend::uses_authored_backend_state() const {
+  return config_.execution_state_source_mode == "authored_preview" ||
+         is_commanded_sim_mode();
+}
+
+void Ros2ControlExecutionBackend::set_command_gate(bool enabled) {
+  if (!command_gate_pub_) {
+    return;
+  }
+  std_msgs::msg::Bool msg;
+  msg.data = enabled;
+  command_gate_pub_->publish(msg);
+}
+
+core::Result<void> Ros2ControlExecutionBackend::command_sim_initial_state(
+    std::string phase) {
+  if (!is_commanded_sim_mode()) {
+    return core::Result<void>::Ok();
+  }
+  if (config_.initial_joint_positions_rad.size() != config_.required_joints.size()) {
+    return core::Result<void>::Err(core::ErrorDTO{
+        core::kErrorInvalidRequest,
+        "commanded_sim initial_joint_positions_rad is incomplete",
+        {{"phase", std::move(phase)},
+         {"state_source_mode", config_.execution_state_source_mode}},
+    });
+  }
+  if (!wait_for_fjt_action_server(action_client_,
+                                  config_.wait_for_action_server_timeout_s)) {
+    set_command_gate(false);
+    return core::Result<void>::Err(core::ErrorDTO{
+        core::kErrorExecutionAborted,
+        "FollowJointTrajectory action server unavailable for commanded_sim reset",
+        {{"phase", std::move(phase)},
+         {"action_name", config_.action_name},
+         {"wait_for_action_server_timeout_s",
+          std::to_string(config_.wait_for_action_server_timeout_s)}},
+    });
+  }
+
+  FollowJointTrajectory::Goal goal;
+  goal.trajectory.joint_names = config_.required_joints;
+  disable_fjt_controller_tolerances(goal, config_.required_joints);
+  trajectory_msgs::msg::JointTrajectoryPoint home_point;
+  home_point.positions = config_.initial_joint_positions_rad;
+  home_point.time_from_start =
+      duration_from_seconds(config_.sim_reset_motion_duration_s);
+  goal.trajectory.points.push_back(std::move(home_point));
+
+  // The commanded-sim profile is backend-authoritative: suppress any stale
+  // topic-based command stream until this reset/home goal has been accepted.
+  set_command_gate(false);
+  auto goal_handle_future = action_client_->async_send_goal(goal);
+  if (goal_handle_future.wait_for(
+          std::chrono::duration<double>(config_.wait_for_action_server_timeout_s)) !=
+      std::future_status::ready) {
+    set_command_gate(false);
+    return core::Result<void>::Err(core::ErrorDTO{
+        core::kErrorExecutionTimeout,
+        "Timed out waiting for commanded_sim reset goal response",
+        {{"phase", std::move(phase)}, {"action_name", config_.action_name}},
+    });
+  }
+  GoalHandleFJT::SharedPtr goal_handle;
+  try {
+    goal_handle = goal_handle_future.get();
+  } catch (const std::exception& exc) {
+    set_command_gate(false);
+    return core::Result<void>::Err(core::ErrorDTO{
+        core::kErrorExecutionAborted,
+        std::string("Failed to dispatch commanded_sim reset goal: ") + exc.what(),
+        {{"phase", std::move(phase)}, {"action_name", config_.action_name}},
+    });
+  }
+  if (!goal_handle) {
+    set_command_gate(false);
+    return core::Result<void>::Err(core::ErrorDTO{
+        core::kErrorExecutionAborted,
+        "commanded_sim reset goal was rejected",
+        {{"phase", std::move(phase)}, {"action_name", config_.action_name}},
+    });
+  }
+
+  set_command_gate(true);
+  const auto result_future = action_client_->async_get_result(goal_handle);
+  const double timeout_s = config_.sim_reset_motion_duration_s +
+                           config_.wait_for_action_server_timeout_s +
+                           config_.stop_completion_timeout_s;
+  if (result_future.wait_for(std::chrono::duration<double>(timeout_s)) !=
+      std::future_status::ready) {
+    (void)action_client_->async_cancel_goal(goal_handle);
+    set_command_gate(false);
+    return core::Result<void>::Err(core::ErrorDTO{
+        core::kErrorExecutionTimeout,
+        "Timed out waiting for commanded_sim reset goal result",
+        {{"phase", std::move(phase)},
+         {"action_name", config_.action_name},
+         {"timeout_s", std::to_string(timeout_s)}},
+    });
+  }
+  const auto result = result_future.get();
+  const bool success =
+      result.code == rclcpp_action::ResultCode::SUCCEEDED &&
+      result.result &&
+      result.result->error_code == FollowJointTrajectory::Result::SUCCESSFUL;
+  if (!success) {
+    std::string detail =
+        result.result ? result.result->error_string : "controller returned no result";
+    if (detail.empty()) {
+      detail = "controller returned non-success result";
+    }
+    set_command_gate(false);
+    return core::Result<void>::Err(core::ErrorDTO{
+        core::kErrorExecutionAborted,
+        "commanded_sim reset goal failed: " + detail,
+        {{"phase", std::move(phase)}, {"action_name", config_.action_name}},
+    });
+  }
+
+  update_scene_positions(config_.initial_joint_positions_rad);
+  publish_snapshot(core::ExecutionState::kIdle, 0.0,
+                   config_.initial_joint_positions_rad);
+  return core::Result<void>::Ok();
+}
+
+core::Result<void> Ros2ControlExecutionBackend::sync_observed_state_before_planning() {
+  auto resync_result = resync_after_intervention_if_needed("pre_plan_resync");
+  if (!resync_result.ok()) {
+    return resync_result;
+  }
+
+  if (uses_authored_backend_state()) {
+    return core::Result<void>::Ok();
+  }
+  if (!config_.require_fresh_state_before_planning) {
+    return core::Result<void>::Ok();
+  }
+
+  auto sample = wait_for_fresh_sample(config_.wait_for_state_timeout_s);
+  if (!sample.has_value()) {
+    return core::Result<void>::Err(core::ErrorDTO{
+        core::kErrorStartStateMismatch,
+        "No fresh complete observed robot state before planning",
+        {
+            {"state_source_mode", config_.execution_state_source_mode},
+            {"max_age_s", std::to_string(config_.joint_state_max_age_s)},
+            {"timeout_s", std::to_string(config_.wait_for_state_timeout_s)},
+        },
+    });
+  }
+
+  std::vector<double> positions;
+  try {
+    positions = positions_for_joints(*sample, config_.required_joints);
+  } catch (const std::exception& exc) {
+    return core::Result<void>::Err(core::ErrorDTO{
+        core::kErrorStartStateMismatch,
+        std::string("Observed robot state is incomplete before planning: ") + exc.what(),
+        {
+            {"state_source_mode", config_.execution_state_source_mode},
+            {"sample_source", sample->source},
+            {"sample_topic", sample->topic},
+        },
+    });
+  }
+
+  update_scene_positions(positions);
+  publish_snapshot(core::ExecutionState::kIdle, 0.0, positions);
+  return core::Result<void>::Ok();
+}
+
+std::optional<Ros2ControlExecutionBackend::JointSample>
+Ros2ControlExecutionBackend::wait_for_fresh_sample(double timeout_s) {
+  const auto deadline = std::chrono::steady_clock::now() +
+      std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+          std::chrono::duration<double>(timeout_s));
+  std::unique_lock<std::mutex> lock(state_mutex_);
+  while (true) {
+    const auto now = std::chrono::steady_clock::now();
+    auto sample = select_latest_sample_locked(now);
+    if (sample.has_value()) {
+      try {
+        (void)positions_for_joints(*sample, config_.required_joints);
+        return sample;
+      } catch (const std::exception&) {
+        // Keep waiting for a complete sample.
+      }
+    }
+    if (now >= deadline) {
+      return std::nullopt;
+    }
+    state_cv_.wait_until(lock, deadline);
+  }
+}
+
+std::optional<Ros2ControlExecutionBackend::JointSample>
+Ros2ControlExecutionBackend::wait_for_fresh_sample_after(
+    double timeout_s,
+    std::chrono::steady_clock::time_point not_before) {
+  const auto deadline = std::chrono::steady_clock::now() +
+      std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+          std::chrono::duration<double>(timeout_s));
+  std::unique_lock<std::mutex> lock(state_mutex_);
+  while (true) {
+    const auto now = std::chrono::steady_clock::now();
+    auto sample = select_latest_sample_locked(now);
+    if (sample.has_value() && sample->received_at >= not_before) {
+      try {
+        (void)positions_for_joints(*sample, config_.required_joints);
+        return sample;
+      } catch (const std::exception&) {
+        // Keep waiting for a complete sample.
+      }
+    }
+    if (now >= deadline) {
+      return std::nullopt;
+    }
+    state_cv_.wait_until(lock, deadline);
+  }
+}
+
+std::vector<double> Ros2ControlExecutionBackend::positions_for_joints(
+    const JointSample& sample,
+    const std::vector<std::string>& joints) const {
+  std::vector<double> result;
+  result.reserve(joints.size());
+  for (const auto& joint : joints) {
+    const auto it = std::find(sample.joint_names.begin(), sample.joint_names.end(), joint);
+    if (it == sample.joint_names.end()) {
+      throw std::runtime_error("sample missing joint " + joint);
+    }
+    const auto index = static_cast<size_t>(std::distance(sample.joint_names.begin(), it));
+    if (index >= sample.positions.size()) {
+      throw std::runtime_error("sample missing position for joint " + joint);
+    }
+    result.push_back(sample.positions[index]);
+  }
+  return result;
+}
+
+std::vector<double> Ros2ControlExecutionBackend::interpolate_joint_positions(
+    const core::TrajectoryDTO& trajectory, double time_s) const {
+  if (trajectory.waypoints.empty()) {
+    return {};
+  }
+  if (trajectory.waypoints.size() == 1 ||
+      time_s <= trajectory.waypoints.front().time_from_start_s) {
+    return trajectory.waypoints.front().positions_rad;
+  }
+  if (time_s >= trajectory.waypoints.back().time_from_start_s) {
+    return trajectory.waypoints.back().positions_rad;
+  }
+  for (size_t i = 1; i < trajectory.waypoints.size(); ++i) {
+    const auto& prev = trajectory.waypoints[i - 1];
+    const auto& next = trajectory.waypoints[i];
+    if (time_s > next.time_from_start_s) {
+      continue;
+    }
+    const double dt = next.time_from_start_s - prev.time_from_start_s;
+    if (dt <= 1e-9) {
+      return next.positions_rad;
+    }
+    const double alpha = clamp_progress((time_s - prev.time_from_start_s) / dt);
+    std::vector<double> interpolated(prev.positions_rad.size(), 0.0);
+    for (size_t joint = 0; joint < prev.positions_rad.size(); ++joint) {
+      interpolated[joint] =
+          prev.positions_rad[joint] +
+          alpha * (next.positions_rad[joint] - prev.positions_rad[joint]);
+    }
+    return interpolated;
+  }
+  return trajectory.waypoints.back().positions_rad;
+}
+
+bool Ros2ControlExecutionBackend::update_scene_positions(
+    const std::vector<double>& joint_positions,
+    SceneUpdateMode mode) {
+  if (joint_positions.empty()) {
+    return true;
+  }
+  std::unique_lock<std::mutex> scene_lock(*scene_mutex_, std::defer_lock);
+  if (mode == SceneUpdateMode::kBestEffort) {
+    if (!scene_lock.try_lock()) {
+      return false;
+    }
+  } else {
+    scene_lock.lock();
+  }
+  Eigen::VectorXd q(joint_positions.size());
+  for (size_t i = 0; i < joint_positions.size(); ++i) {
+    q[static_cast<Eigen::Index>(i)] = joint_positions[i];
+  }
+  if (q.size() != scene_->getCurrentJointPositions().size()) {
+    q = scene_->toFullJointPositions(group_name_, q);
+  }
+  scene_->setJointPositions(q);
+  return true;
+}
+
+void Ros2ControlExecutionBackend::publish_snapshot(
+    core::ExecutionState state,
+    double progress,
+    const std::vector<double>& joint_positions,
+    std::optional<core::ErrorDTO> error) {
+  std::lock_guard<std::mutex> lock(state_mutex_);
+  snapshot_.timestamp_ns = clock_.now();
+  snapshot_.sequence_number++;
+  snapshot_.state = state;
+  snapshot_.progress = clamp_progress(progress);
+  snapshot_.joint_positions_rad = joint_positions;
+  snapshot_.error = std::move(error);
+}
+
+core::ErrorDTO Ros2ControlExecutionBackend::operator_intervention_error(
+    core::ErrorCode code,
+    std::string message,
+    std::string phase,
+    core::ExecutionState backend_state) const {
+  return make_error(
+      code,
+      std::move(message),
+      {{"requires_operator_intervention", "true"},
+       {"resync_required", "true"},
+       {"phase", std::move(phase)},
+       {"backend_state", core::to_string(backend_state)},
+       {"action_name", config_.action_name},
+       {"stop_completion_timeout_s",
+        std::to_string(config_.stop_completion_timeout_s)}});
+}
+
+core::Result<void> Ros2ControlExecutionBackend::resync_after_intervention_if_needed(
+    std::string phase) {
+  {
+    std::unique_lock<std::mutex> lock(execution_mutex_);
+    if (!resync_required_) {
+      return core::Result<void>::Ok();
+    }
+    if (resync_in_progress_) {
+      const auto timeout =
+          std::chrono::duration<double>(config_.stop_completion_timeout_s +
+                                        config_.wait_for_state_timeout_s);
+      const bool finished = execution_cv_.wait_for(
+          lock, timeout, [this]() { return !resync_in_progress_; });
+      if (!finished) {
+        lock.unlock();
+        const auto snapshot = get_execution_snapshot();
+        return core::Result<void>::Err(operator_intervention_error(
+            core::ErrorCode::kResetFailed,
+            "Cannot resync ros2_control backend: another resync is still in progress",
+            phase,
+            snapshot.state));
+      }
+      if (!resync_required_) {
+        return core::Result<void>::Ok();
+      }
+    }
+    if (running_) {
+      lock.unlock();
+      const auto snapshot = get_execution_snapshot();
+      return core::Result<void>::Err(operator_intervention_error(
+          core::ErrorCode::kResetFailed,
+          "Cannot resync ros2_control backend while execution is still in flight",
+          phase,
+          snapshot.state));
+    }
+    resync_in_progress_ = true;
+  }
+  const auto resync_guard = std::shared_ptr<void>(
+      nullptr,
+      [this](void*) {
+        {
+          std::lock_guard<std::mutex> lock(execution_mutex_);
+          resync_in_progress_ = false;
+        }
+        execution_cv_.notify_all();
+      });
+  (void)resync_guard;
+
+  if (monitor_thread_.joinable() && monitor_active_.load()) {
+    std::unique_lock<std::mutex> lock(execution_mutex_);
+    const bool monitor_stopped = execution_cv_.wait_for(
+        lock,
+        std::chrono::duration<double>(config_.stop_completion_timeout_s),
+        [this]() { return !monitor_active_.load(); });
+    if (!monitor_stopped) {
+      lock.unlock();
+      const auto snapshot = get_execution_snapshot();
+      return core::Result<void>::Err(operator_intervention_error(
+          core::ErrorCode::kResetFailed,
+          "Cannot resync ros2_control backend: monitor thread is still stopping",
+          phase,
+          snapshot.state));
+    }
+  }
+  if (monitor_thread_.joinable()) {
+    monitor_thread_.join();
+  }
+
+  if (is_commanded_sim_mode()) {
+    auto reset_result = command_sim_initial_state(phase + "_commanded_sim_reset");
+    if (!reset_result.ok()) {
+      return reset_result;
+    }
+    {
+      std::lock_guard<std::mutex> lock(execution_mutex_);
+      resync_required_ = false;
+      running_ = false;
+      terminal_ = true;
+      stop_requested_ = false;
+      pause_requested_ = false;
+      goal_accepted_ = false;
+      first_feedback_seen_ = false;
+      result_received_ = false;
+      active_goal_handle_.reset();
+      active_goal_id_.reset();
+      stop_requested_at_.reset();
+      tracking_error_since_.reset();
+    }
+    execution_cv_.notify_all();
+    return core::Result<void>::Ok();
+  }
+
+  auto sample = wait_for_fresh_sample(config_.wait_for_state_timeout_s);
+  if (!sample.has_value()) {
+    const auto snapshot = get_execution_snapshot();
+    return core::Result<void>::Err(operator_intervention_error(
+        core::ErrorCode::kStartStateMismatch,
+        "Cannot resync ros2_control backend: no fresh complete controller state sample",
+        phase,
+        snapshot.state));
+  }
+
+  std::vector<double> positions;
+  try {
+    positions = positions_for_joints(*sample, config_.required_joints);
+  } catch (const std::exception& exc) {
+    const auto snapshot = get_execution_snapshot();
+    return core::Result<void>::Err(operator_intervention_error(
+        core::ErrorCode::kStartStateMismatch,
+        std::string("Cannot resync ros2_control backend: observed state is incomplete: ") +
+            exc.what(),
+        phase,
+        snapshot.state));
+  }
+
+  update_scene_positions(positions);
+  {
+    std::lock_guard<std::mutex> lock(execution_mutex_);
+    resync_required_ = false;
+    running_ = false;
+    terminal_ = true;
+    stop_requested_ = false;
+    pause_requested_ = false;
+    goal_accepted_ = false;
+    first_feedback_seen_ = false;
+    result_received_ = false;
+    active_goal_handle_.reset();
+    active_goal_id_.reset();
+    stop_requested_at_.reset();
+    tracking_error_since_.reset();
+  }
+  publish_snapshot(core::ExecutionState::kIdle, 0.0, positions);
+  execution_cv_.notify_all();
+  return core::Result<void>::Ok();
+}
+
+void Ros2ControlExecutionBackend::cancel_goal_if_known(
+    const GoalHandleFJT::SharedPtr& goal_handle) noexcept {
+  if (!goal_handle) {
+    return;
+  }
+  try {
+    (void)action_client_->async_cancel_goal(goal_handle);
+  } catch (const std::exception&) {
+    // rclcpp_action may throw if the action result already removed this goal
+    // handle from the client. Stop/reset/destruction must remain idempotent.
+  }
+}
+
+std::string Ros2ControlExecutionBackend::latest_feedback_error_summary() const {
+  std::lock_guard<std::mutex> lock(state_mutex_);
+  if (!peak_tracking_error_.has_value() || peak_tracking_error_->abs_error_rad <= 0.0) {
+    return {};
+  }
+  const auto& peak = *peak_tracking_error_;
+  std::ostringstream out;
+  out << std::fixed << std::setprecision(4)
+      << "peak controller feedback max position error: " << peak.joint_name
+      << "=" << peak.signed_error_rad << " rad"
+      << " (abs=" << peak.abs_error_rad << " rad"
+      << ", elapsed=" << peak.elapsed_s << " s)";
+  if (peak.has_expected_position && peak.has_observed_position) {
+    out << " expected=" << peak.expected_position_rad
+        << " observed=" << peak.observed_position_rad;
+  }
+  if (peak.has_observed_velocity) {
+    out << " observed_velocity=" << peak.observed_velocity_rad_s << " rad/s";
+  }
+  return out.str();
+}
+
+std::optional<Ros2ControlExecutionBackend::TrackingErrorPeak>
+Ros2ControlExecutionBackend::update_tracking_error_peak_locked(
+    const JointSample& error_sample,
+    double elapsed_s,
+    const std::vector<double>* observed_positions,
+    const std::vector<double>* expected_positions,
+    const std::vector<double>* observed_velocities) {
+  if (error_sample.positions.empty()) {
+    return peak_tracking_error_;
+  }
+  size_t max_index = 0;
+  double max_abs_error = 0.0;
+  for (size_t i = 0; i < error_sample.positions.size(); ++i) {
+    const double abs_error = std::abs(error_sample.positions[i]);
+    if (abs_error > max_abs_error) {
+      max_abs_error = abs_error;
+      max_index = i;
+    }
+  }
+  if (max_abs_error <= 0.0 ||
+      (peak_tracking_error_.has_value() &&
+       max_abs_error <= peak_tracking_error_->abs_error_rad)) {
+    return peak_tracking_error_;
+  }
+
+  TrackingErrorPeak peak;
+  peak.joint_name =
+      max_index < error_sample.joint_names.size()
+          ? error_sample.joint_names[max_index]
+          : "joint[" + std::to_string(max_index) + "]";
+  peak.signed_error_rad = error_sample.positions[max_index];
+  peak.abs_error_rad = max_abs_error;
+  peak.elapsed_s = elapsed_s;
+  if (expected_positions != nullptr && max_index < expected_positions->size()) {
+    peak.expected_position_rad = (*expected_positions)[max_index];
+    peak.has_expected_position = true;
+  }
+  if (observed_positions != nullptr && max_index < observed_positions->size()) {
+    peak.observed_position_rad = (*observed_positions)[max_index];
+    peak.has_observed_position = true;
+  }
+  if (observed_velocities != nullptr && max_index < observed_velocities->size()) {
+    peak.observed_velocity_rad_s = (*observed_velocities)[max_index];
+    peak.has_observed_velocity = true;
+  }
+  peak_tracking_error_ = peak;
+  return peak_tracking_error_;
+}
+
+void Ros2ControlExecutionBackend::fail_execution(std::string message,
+                                                 core::ErrorCode code) {
+  const auto snapshot = get_execution_snapshot();
+  {
+    std::lock_guard<std::mutex> lock(execution_mutex_);
+    if (terminal_) {
+      return;
+    }
+    running_ = false;
+    terminal_ = true;
+    resync_required_ = true;
+    active_goal_handle_.reset();
+    active_goal_id_.reset();
+  }
+  publish_snapshot(core::ExecutionState::kFailed,
+                   snapshot.progress,
+                   snapshot.joint_positions_rad,
+                   make_error(code, std::move(message)));
+  execution_cv_.notify_all();
+}
+
+void Ros2ControlExecutionBackend::require_operator_intervention(
+    std::string message,
+    core::ErrorCode code) {
+  const auto snapshot = get_execution_snapshot();
+  {
+    std::lock_guard<std::mutex> lock(execution_mutex_);
+    if (terminal_) {
+      return;
+    }
+    running_ = false;
+    terminal_ = true;
+    resync_required_ = true;
+    active_goal_handle_.reset();
+    active_goal_id_.reset();
+  }
+  publish_snapshot(
+      core::ExecutionState::kInterventionRequired,
+      snapshot.progress,
+      snapshot.joint_positions_rad,
+      operator_intervention_error(
+          code, std::move(message), "controller_cancel_timeout", snapshot.state));
+  execution_cv_.notify_all();
+}
+
+void Ros2ControlExecutionBackend::complete_execution() {
+  const auto completed_at = std::chrono::steady_clock::now();
+  std::vector<double> final_positions = get_execution_snapshot().joint_positions_rad;
+  if (!uses_authored_backend_state()) {
+    auto sample = wait_for_fresh_sample_after(
+        config_.wait_for_state_timeout_s, completed_at);
+    if (!sample.has_value()) {
+      std::lock_guard<std::mutex> state_lock(state_mutex_);
+      sample = select_latest_sample_locked(std::chrono::steady_clock::now());
+    }
+    if (sample.has_value()) {
+      try {
+        final_positions = positions_for_joints(*sample, config_.required_joints);
+      } catch (const std::exception&) {
+        // Keep the last snapshot positions.
+      }
+    }
+  }
+  if (!final_positions.empty()) {
+    update_scene_positions(final_positions);
+  }
+  publish_snapshot(core::ExecutionState::kCompleted, 1.0, final_positions);
+  execution_cv_.notify_all();
+}
+
+bool Ros2ControlExecutionBackend::start_state_matches(
+    const core::TrajectoryDTO& trajectory,
+    const JointSample& sample,
+    std::string& error) const {
+  if (trajectory.waypoints.empty()) {
+    return true;
+  }
+  std::vector<double> observed;
+  try {
+    observed = positions_for_joints(sample, trajectory.joint_names);
+  } catch (const std::exception& e) {
+    error = e.what();
+    return false;
+  }
+  const auto& start = trajectory.waypoints.front().positions_rad;
+  const double max_error = max_abs_error(observed, start);
+  if (max_error > config_.start_tolerance_rad) {
+    error = "Start state mismatch: max joint error " + std::to_string(max_error) +
+            " rad exceeds tolerance " + std::to_string(config_.start_tolerance_rad);
+    return false;
+  }
+  return true;
+}
+
+bool Ros2ControlExecutionBackend::final_state_matches(
+    const core::TrajectoryDTO& trajectory,
+    const JointSample& sample,
+    std::string& error) const {
+  if (trajectory.waypoints.empty()) {
+    return true;
+  }
+  std::vector<double> observed;
+  try {
+    observed = positions_for_joints(sample, trajectory.joint_names);
+  } catch (const std::exception& e) {
+    error = e.what();
+    return false;
+  }
+  const auto& goal = trajectory.waypoints.back().positions_rad;
+  const double max_error = max_abs_error(observed, goal);
+  if (max_error > config_.final_tolerance_rad) {
+    error = "Final state mismatch: max joint error " + std::to_string(max_error) +
+            " rad exceeds tolerance " + std::to_string(config_.final_tolerance_rad);
+    return false;
+  }
+  return true;
+}
+
+double Ros2ControlExecutionBackend::max_abs_error(
+    const std::vector<double>& lhs,
+    const std::vector<double>& rhs) const {
+  const size_t count = std::min(lhs.size(), rhs.size());
+  double max_error = 0.0;
+  for (size_t i = 0; i < count; ++i) {
+    max_error = std::max(max_error, std::abs(lhs[i] - rhs[i]));
+  }
+  return max_error;
+}
+
+core::ExecutionHandle Ros2ControlExecutionBackend::execute_trajectory(
+    const core::TrajectoryDTO& trajectory) {
+  auto resync_result = resync_after_intervention_if_needed("execute_resync");
+  if (!resync_result.ok()) {
+    const auto snapshot = get_execution_snapshot();
+    publish_snapshot(core::ExecutionState::kInterventionRequired,
+                     snapshot.progress,
+                     snapshot.joint_positions_rad,
+                     resync_result.error());
+    return core::ExecutionHandle{
+        [](int64_t) { return true; },
+        [this]() { return get_execution_snapshot(); }};
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(execution_mutex_);
+    if (running_) {
+      publish_snapshot(
+          core::ExecutionState::kFailed,
+          get_execution_snapshot().progress,
+          get_execution_snapshot().joint_positions_rad,
+          make_error(core::ErrorCode::kInvalidRequest, "Execution already in flight"));
+      return core::ExecutionHandle{
+          [](int64_t) { return true; },
+          [this]() { return get_execution_snapshot(); }};
+    } else {
+      running_ = true;
+      terminal_ = false;
+      stop_requested_ = false;
+      pause_requested_ = false;
+      goal_accepted_ = false;
+      first_feedback_seen_ = false;
+      result_received_ = false;
+      active_goal_handle_.reset();
+      active_goal_id_.reset();
+      stop_requested_at_.reset();
+      tracking_error_since_.reset();
+      peak_tracking_error_.reset();
+      execution_started_at_ = std::chrono::steady_clock::now();
+    }
+  }
+
+  std::vector<double> start_positions;
+  if (uses_authored_backend_state()) {
+    if (trajectory.waypoints.empty()) {
+      fail_execution("Trajectory has no waypoints");
+      return core::ExecutionHandle{
+          [](int64_t) { return true; },
+          [this]() { return get_execution_snapshot(); }};
+    }
+    start_positions = trajectory.waypoints.front().positions_rad;
+  } else {
+    auto start_sample = wait_for_fresh_sample(config_.wait_for_state_timeout_s);
+    if (!start_sample.has_value()) {
+      fail_execution("No fresh complete controller state sample before dispatch");
+      return core::ExecutionHandle{
+          [this](int64_t timeout_ns) {
+            std::unique_lock<std::mutex> lock(execution_mutex_);
+            if (timeout_ns > 0) {
+              return execution_cv_.wait_for(
+                  lock, std::chrono::nanoseconds(timeout_ns),
+                  [this]() { return terminal_; });
+            }
+            execution_cv_.wait(lock, [this]() { return terminal_; });
+            return true;
+          },
+          [this]() { return get_execution_snapshot(); }};
+    }
+
+    std::string start_error;
+    if (!start_state_matches(trajectory, *start_sample, start_error)) {
+      fail_execution(start_error);
+      return core::ExecutionHandle{
+          [](int64_t) { return true; },
+          [this]() { return get_execution_snapshot(); }};
+    }
+    start_positions = positions_for_joints(*start_sample, config_.required_joints);
+  }
+
+  update_scene_positions(start_positions);
+  publish_snapshot(core::ExecutionState::kExecuting, 0.0, start_positions);
+
+  if (!wait_for_fjt_action_server(action_client_,
+                                  config_.wait_for_action_server_timeout_s)) {
+    fail_execution("FollowJointTrajectory action server unavailable: " +
+                   config_.action_name);
+    return core::ExecutionHandle{
+        [](int64_t) { return true; },
+        [this]() { return get_execution_snapshot(); }};
+  }
+
+  FollowJointTrajectory::Goal goal;
+  goal.trajectory.joint_names = trajectory.joint_names;
+  if (config_.disable_controller_path_tolerances) {
+    disable_fjt_controller_tolerances(goal, trajectory.joint_names);
+  }
+  for (const auto& waypoint : trajectory.waypoints) {
+    trajectory_msgs::msg::JointTrajectoryPoint point;
+    point.positions = waypoint.positions_rad;
+    point.velocities = waypoint.velocities_rad_s;
+    point.accelerations = waypoint.accelerations_rad_s2;
+    point.time_from_start = duration_from_seconds(waypoint.time_from_start_s);
+    goal.trajectory.points.push_back(std::move(point));
+  }
+
+  rclcpp_action::Client<FollowJointTrajectory>::SendGoalOptions options;
+  options.feedback_callback =
+      [this](GoalHandleFJT::SharedPtr goal_handle,
+             const std::shared_ptr<const FollowJointTrajectory::Feedback> feedback) {
+        on_action_feedback(goal_handle, feedback);
+      };
+  options.result_callback =
+      [this](const GoalHandleFJT::WrappedResult& result) {
+        on_action_result(result);
+      };
+
+  auto goal_handle_future = action_client_->async_send_goal(goal, options);
+  if (goal_handle_future.wait_for(
+          std::chrono::duration<double>(config_.wait_for_action_server_timeout_s)) !=
+      std::future_status::ready) {
+    fail_execution("Timed out waiting for FollowJointTrajectory goal response: " +
+                   config_.action_name);
+    return core::ExecutionHandle{
+        [](int64_t) { return true; },
+        [this]() { return get_execution_snapshot(); }};
+  }
+
+  GoalHandleFJT::SharedPtr goal_handle;
+  try {
+    goal_handle = goal_handle_future.get();
+  } catch (const std::exception& exc) {
+    fail_execution(std::string("FollowJointTrajectory goal dispatch failed: ") + exc.what());
+    return core::ExecutionHandle{
+        [](int64_t) { return true; },
+        [this]() { return get_execution_snapshot(); }};
+  }
+  if (!goal_handle) {
+    fail_execution("FollowJointTrajectory goal rejected");
+    return core::ExecutionHandle{
+        [](int64_t) { return true; },
+        [this]() { return get_execution_snapshot(); }};
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(execution_mutex_);
+    active_goal_handle_ = goal_handle;
+    active_goal_id_ = goal_handle->get_goal_id();
+    goal_accepted_ = true;
+    execution_started_at_ = std::chrono::steady_clock::now();
+  }
+  if (is_commanded_sim_mode()) {
+    set_command_gate(true);
+  }
+
+  if (monitor_thread_.joinable() && monitor_active_.load()) {
+    fail_execution("Previous ros2_control monitor thread is still shutting down");
+    return core::ExecutionHandle{
+        [](int64_t) { return true; },
+        [this]() { return get_execution_snapshot(); }};
+  }
+  if (monitor_thread_.joinable()) {
+    monitor_thread_.join();
+  }
+  monitor_thread_ =
+      std::thread([this, trajectory_copy = core::TrajectoryDTO(trajectory)]() mutable {
+        monitor_worker(std::move(trajectory_copy));
+      });
+
+  return core::ExecutionHandle{
+      [this](int64_t timeout_ns) {
+        std::unique_lock<std::mutex> lock(execution_mutex_);
+        if (timeout_ns > 0) {
+          return execution_cv_.wait_for(
+              lock, std::chrono::nanoseconds(timeout_ns),
+              [this]() { return terminal_; });
+        }
+        execution_cv_.wait(lock, [this]() { return terminal_; });
+        return true;
+      },
+      [this]() { return get_execution_snapshot(); }};
+}
+
+void Ros2ControlExecutionBackend::monitor_worker(core::TrajectoryDTO trajectory) {
+  monitor_active_.store(true);
+  const auto monitor_guard =
+      std::shared_ptr<void>(nullptr, [this](void*) {
+        monitor_active_.store(false);
+        execution_cv_.notify_all();
+      });
+  (void)monitor_guard;
+
+  const double total_duration_s =
+      trajectory.waypoints.empty() ? 0.0 : trajectory.waypoints.back().time_from_start_s;
+  while (true) {
+    const auto now = std::chrono::steady_clock::now();
+    bool cancel_pending = false;
+    bool cancel_timeout = false;
+    bool waiting_for_first_feedback = false;
+    bool first_feedback_timeout = false;
+    {
+      std::lock_guard<std::mutex> lock(execution_mutex_);
+      if (terminal_ || !running_) {
+        return;
+      }
+      cancel_pending = stop_requested_ || pause_requested_;
+      cancel_timeout =
+          cancel_pending && stop_requested_at_.has_value() &&
+          seconds_since(*stop_requested_at_, now) >= config_.stop_completion_timeout_s;
+      waiting_for_first_feedback = !first_feedback_seen_;
+      first_feedback_timeout =
+          waiting_for_first_feedback &&
+          seconds_since(execution_started_at_, now) >= config_.wait_for_state_timeout_s;
+    }
+    if (cancel_timeout) {
+      require_operator_intervention(
+          "Timed out waiting for FollowJointTrajectory cancel confirmation");
+      return;
+    }
+    if (cancel_pending) {
+      const auto snapshot = get_execution_snapshot();
+      publish_snapshot(core::ExecutionState::kStopping,
+                       snapshot.progress,
+                       snapshot.joint_positions_rad);
+      std::this_thread::sleep_for(
+          std::chrono::duration<double>(config_.monitor_period_s));
+      continue;
+    }
+    if (first_feedback_timeout) {
+      fail_execution("Timed out waiting for first FollowJointTrajectory feedback");
+      return;
+    }
+    if (waiting_for_first_feedback) {
+      std::vector<double> snapshot_positions;
+      if (uses_authored_backend_state() && !trajectory.waypoints.empty()) {
+        snapshot_positions = trajectory.waypoints.front().positions_rad;
+      } else {
+        std::lock_guard<std::mutex> state_lock(state_mutex_);
+        auto sample = select_latest_sample_locked(now);
+        if (sample.has_value()) {
+          try {
+            snapshot_positions = positions_for_joints(*sample, trajectory.joint_names);
+          } catch (const std::exception&) {
+            snapshot_positions.clear();
+          }
+        }
+      }
+      if (snapshot_positions.empty() && !trajectory.waypoints.empty()) {
+        snapshot_positions = trajectory.waypoints.front().positions_rad;
+      }
+      publish_snapshot(core::ExecutionState::kExecuting, 0.0, snapshot_positions);
+      std::this_thread::sleep_for(
+          std::chrono::duration<double>(config_.monitor_period_s));
+      continue;
+    }
+    const double elapsed_s = seconds_since(execution_started_at_, now);
+    const double progress =
+        total_duration_s <= 1e-9 ? 1.0 : clamp_progress(elapsed_s / total_duration_s);
+    auto predicted_positions = interpolate_joint_positions(trajectory, elapsed_s);
+    if (!predicted_positions.empty()) {
+      update_scene_positions(predicted_positions, SceneUpdateMode::kBestEffort);
+    }
+
+    std::vector<double> snapshot_positions = predicted_positions;
+    std::optional<std::string> tracking_failure;
+    {
+      std::lock_guard<std::mutex> state_lock(state_mutex_);
+      auto sample = select_latest_sample_locked(now);
+      if (sample.has_value()) {
+        try {
+          auto observed = positions_for_joints(*sample, trajectory.joint_names);
+          if (!uses_authored_backend_state()) {
+            snapshot_positions = observed;
+          }
+          const auto expected = interpolate_joint_positions(trajectory, elapsed_s);
+          const double error = max_abs_error(observed, expected);
+          JointSample error_sample;
+          error_sample.joint_names = trajectory.joint_names;
+          error_sample.positions.reserve(observed.size());
+          for (size_t i = 0; i < std::min(observed.size(), expected.size()); ++i) {
+            error_sample.positions.push_back(observed[i] - expected[i]);
+          }
+          error_sample.velocities = sample->velocities;
+          error_sample.received_at = now;
+          error_sample.source = sample->source + "_tracking_error";
+          error_sample.topic = sample->topic;
+          update_tracking_error_peak_locked(
+              error_sample, elapsed_s, &observed, &expected, &sample->velocities);
+          if (error > config_.tracking_error_tolerance_rad &&
+              config_.tracking_error_timeout_s > 0.0) {
+            if (!tracking_error_since_.has_value()) {
+              tracking_error_since_ = now;
+            }
+            if (seconds_since(*tracking_error_since_, now) >=
+                config_.tracking_error_timeout_s) {
+              tracking_failure =
+                  "Controller tracking error exceeded tolerance: " +
+                  std::to_string(error) + " rad";
+            }
+          } else {
+            tracking_error_since_.reset();
+          }
+        } catch (const std::exception&) {
+          // A malformed/incomplete sample is ignored here; start gate already
+          // proves that at least one complete controller sample existed.
+        }
+      }
+    }
+    if (tracking_failure.has_value()) {
+      const auto feedback_error = latest_feedback_error_summary();
+      if (!feedback_error.empty()) {
+        *tracking_failure += "; " + feedback_error;
+      }
+      GoalHandleFJT::SharedPtr handle_to_cancel;
+      {
+        std::lock_guard<std::mutex> lock(execution_mutex_);
+        handle_to_cancel = active_goal_handle_;
+      }
+      cancel_goal_if_known(handle_to_cancel);
+      fail_execution(*tracking_failure);
+      return;
+    }
+    publish_snapshot(core::ExecutionState::kExecuting, progress, snapshot_positions);
+    std::this_thread::sleep_for(
+        std::chrono::duration<double>(config_.monitor_period_s));
+  }
+}
+
+core::StopResultDTO Ros2ControlExecutionBackend::stop() {
+  core::ExecutionSnapshot snapshot;
+  bool cancel_requested = false;
+  bool resync_required = false;
+  {
+    std::lock_guard<std::mutex> lock(execution_mutex_);
+    resync_required = resync_required_;
+    if (resync_required_) {
+      snapshot = get_execution_snapshot();
+    } else if (!running_ && terminal_) {
+      return core::StopResultDTO{
+          false, make_error(core::ErrorCode::kInvalidRequest, "No execution in flight")};
+    } else {
+      stop_requested_ = true;
+      pause_requested_ = false;
+      stop_requested_at_ = std::chrono::steady_clock::now();
+      cancel_requested = static_cast<bool>(active_goal_handle_);
+      if (cancel_requested) {
+        cancel_goal_if_known(active_goal_handle_);
+        snapshot = get_execution_snapshot();
+      } else {
+        running_ = false;
+        terminal_ = true;
+        snapshot = get_execution_snapshot();
+      }
+    }
+  }
+  if (resync_required) {
+    return core::StopResultDTO{
+        false,
+        operator_intervention_error(
+            core::ErrorCode::kStopFailed,
+            "ros2_control execution backend requires observed-state resync before reuse",
+            "stop_resync_required",
+            snapshot.state)};
+  }
+  publish_snapshot(cancel_requested ? core::ExecutionState::kStopping
+                                    : core::ExecutionState::kStopped,
+                   snapshot.progress,
+                   snapshot.joint_positions_rad);
+  cancel_all_gripper_commands();
+  execution_cv_.notify_all();
+  return core::StopResultDTO{true, std::nullopt};
+}
+
+core::PauseResultDTO Ros2ControlExecutionBackend::pause() {
+  core::ExecutionSnapshot snapshot;
+  bool cancel_requested = false;
+  bool resync_required = false;
+  {
+    std::lock_guard<std::mutex> lock(execution_mutex_);
+    resync_required = resync_required_;
+    if (resync_required_) {
+      snapshot = get_execution_snapshot();
+    } else if (!running_ && terminal_) {
+      return core::PauseResultDTO{
+          false, make_error(core::ErrorCode::kInvalidRequest, "No execution in flight")};
+    } else {
+      pause_requested_ = true;
+      stop_requested_ = false;
+      stop_requested_at_ = std::chrono::steady_clock::now();
+      cancel_requested = static_cast<bool>(active_goal_handle_);
+      if (cancel_requested) {
+        cancel_goal_if_known(active_goal_handle_);
+        snapshot = get_execution_snapshot();
+      } else {
+        running_ = false;
+        terminal_ = true;
+        snapshot = get_execution_snapshot();
+      }
+    }
+  }
+  if (resync_required) {
+    return core::PauseResultDTO{
+        false,
+        operator_intervention_error(
+            core::ErrorCode::kPauseFailed,
+            "ros2_control execution backend requires observed-state resync before reuse",
+            "pause_resync_required",
+            snapshot.state)};
+  }
+  publish_snapshot(cancel_requested ? core::ExecutionState::kStopping
+                                    : core::ExecutionState::kPaused,
+                   snapshot.progress,
+                   snapshot.joint_positions_rad);
+  cancel_all_gripper_commands();
+  execution_cv_.notify_all();
+  return core::PauseResultDTO{true, std::nullopt};
+}
+
+core::ExecutionHandle Ros2ControlExecutionBackend::resume(
+    const core::TrajectoryDTO& trajectory) {
+  return execute_trajectory(trajectory);
+}
+
+core::ResetResultDTO Ros2ControlExecutionBackend::reset() {
+  bool resync_required = false;
+  {
+    std::lock_guard<std::mutex> lock(execution_mutex_);
+    resync_required = resync_required_;
+    if (!resync_required && active_goal_handle_) {
+      cancel_goal_if_known(active_goal_handle_);
+    }
+    if (!resync_required) {
+      running_ = false;
+      terminal_ = true;
+      stop_requested_ = false;
+      pause_requested_ = false;
+      stop_requested_at_.reset();
+      active_goal_handle_.reset();
+      active_goal_id_.reset();
+    }
+  }
+  if (resync_required) {
+    auto resync_result = resync_after_intervention_if_needed("reset_resync");
+    if (!resync_result.ok()) {
+      const auto snapshot = get_execution_snapshot();
+      publish_snapshot(core::ExecutionState::kInterventionRequired,
+                       snapshot.progress,
+                       snapshot.joint_positions_rad,
+                       resync_result.error());
+      return core::ResetResultDTO{false, resync_result.error()};
+    }
+    return core::ResetResultDTO{true, std::nullopt};
+  }
+  cancel_all_gripper_commands();
+  execution_cv_.notify_all();
+  if (monitor_thread_.joinable() && monitor_active_.load()) {
+    std::unique_lock<std::mutex> lock(execution_mutex_);
+    const bool monitor_stopped = execution_cv_.wait_for(
+        lock,
+        std::chrono::duration<double>(config_.stop_completion_timeout_s),
+        [this]() { return !monitor_active_.load(); });
+    if (!monitor_stopped) {
+      lock.unlock();
+      const auto snapshot = get_execution_snapshot();
+      {
+        std::lock_guard<std::mutex> exec_lock(execution_mutex_);
+        resync_required_ = true;
+        running_ = false;
+        terminal_ = true;
+        active_goal_handle_.reset();
+        active_goal_id_.reset();
+      }
+      const auto error = operator_intervention_error(
+          core::ErrorCode::kResetFailed,
+          "Timed out waiting for ros2_control monitor thread to stop",
+          "reset_monitor_join_timeout",
+          snapshot.state);
+      publish_snapshot(
+          core::ExecutionState::kInterventionRequired,
+          snapshot.progress,
+          snapshot.joint_positions_rad,
+          error);
+      return core::ResetResultDTO{false, error};
+    }
+  }
+  if (monitor_thread_.joinable()) {
+    monitor_thread_.join();
+  }
+  if (is_commanded_sim_mode()) {
+    auto reset_result = command_sim_initial_state("reset_commanded_sim");
+    if (!reset_result.ok()) {
+      const auto snapshot = get_execution_snapshot();
+      auto error = reset_result.error();
+      publish_snapshot(core::ExecutionState::kInterventionRequired,
+                       snapshot.progress,
+                       snapshot.joint_positions_rad,
+                       error);
+      return core::ResetResultDTO{false, error};
+    }
+    return core::ResetResultDTO{true, std::nullopt};
+  }
+  publish_snapshot(core::ExecutionState::kIdle, 0.0, {});
+  return core::ResetResultDTO{true, std::nullopt};
+}
+
+core::ExecutionSnapshot Ros2ControlExecutionBackend::get_execution_snapshot() const {
+  std::lock_guard<std::mutex> lock(state_mutex_);
+  return snapshot_;
+}
+
+void Ros2ControlExecutionBackend::configure_gripper_action(
+    std::string gripper_id,
+    Ros2GripperActionConfig config) {
+  if (gripper_id.empty()) {
+    throw std::invalid_argument("gripper_id must not be empty");
+  }
+  if (config.action_name.empty()) {
+    throw std::invalid_argument("gripper action_name must not be empty");
+  }
+  if (config.wait_for_action_server_timeout_s < 0.0 ||
+      config.result_timeout_s < 0.0) {
+    throw std::invalid_argument("gripper action timing config is invalid");
+  }
+  auto runtime = std::make_shared<GripperRuntime>();
+  runtime->config = std::move(config);
+  runtime->action_client =
+      rclcpp_action::create_client<GripperCommand>(node_, runtime->config.action_name);
+  std::lock_guard<std::mutex> lock(gripper_map_mutex_);
+  grippers_[std::move(gripper_id)] = std::move(runtime);
+}
+
+void Ros2ControlExecutionBackend::on_gripper_feedback(
+    const std::shared_ptr<GripperRuntime>& runtime,
+    GoalHandleGripper::SharedPtr,
+    const std::shared_ptr<const GripperCommand::Feedback> feedback) {
+  if (!runtime || !feedback) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(runtime->mutex);
+  if (!runtime->executing) {
+    return;
+  }
+  runtime->current_position = feedback->position;
+  if (feedback->reached_goal) {
+    runtime->state = "completed";
+    runtime->executing = false;
+    runtime->goal_accepted = false;
+    runtime->cancel_pending = false;
+    runtime->active_goal_handle.reset();
+    runtime->error.clear();
+  }
+}
+
+void Ros2ControlExecutionBackend::on_gripper_result(
+    const std::shared_ptr<GripperRuntime>& runtime,
+    const GoalHandleGripper::WrappedResult& result) {
+  if (!runtime) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(runtime->mutex);
+  runtime->active_goal_handle.reset();
+  runtime->goal_accepted = false;
+  runtime->cancel_pending = false;
+  runtime->executing = false;
+  if (result.result) {
+    runtime->current_position = result.result->position;
+  }
+  switch (result.code) {
+    case rclcpp_action::ResultCode::SUCCEEDED:
+      if (result.result && result.result->reached_goal) {
+        runtime->state = "completed";
+        runtime->error.clear();
+      } else {
+        runtime->state = "failed";
+        runtime->error = "Gripper action succeeded without reaching the goal";
+      }
+      break;
+    case rclcpp_action::ResultCode::ABORTED:
+      runtime->state = "failed";
+      runtime->error = "Gripper action aborted";
+      break;
+    case rclcpp_action::ResultCode::CANCELED:
+      runtime->state = "idle";
+      runtime->error.clear();
+      break;
+    default:
+      runtime->state = "failed";
+      runtime->error = "Gripper action returned an unknown result code";
+      break;
+  }
+}
+
+void Ros2ControlExecutionBackend::cancel_all_gripper_commands() {
+  std::vector<std::shared_ptr<GripperRuntime>> runtimes;
+  {
+    std::lock_guard<std::mutex> lock(gripper_map_mutex_);
+    for (const auto& [_, runtime] : grippers_) {
+      runtimes.push_back(runtime);
+    }
+  }
+  for (auto& runtime : runtimes) {
+    GoalHandleGripper::SharedPtr goal_handle;
+    rclcpp_action::Client<GripperCommand>::SharedPtr action_client;
+    {
+      std::lock_guard<std::mutex> lock(runtime->mutex);
+      if (!runtime->executing && !runtime->active_goal_handle) {
+        continue;
+      }
+      goal_handle = runtime->active_goal_handle;
+      action_client = runtime->action_client;
+      runtime->executing = false;
+      runtime->goal_accepted = false;
+      runtime->cancel_pending = true;
+      runtime->active_goal_handle.reset();
+      runtime->state = "idle";
+      runtime->error.clear();
+    }
+    if (action_client && goal_handle) {
+      try {
+        (void)action_client->async_cancel_goal(goal_handle);
+      } catch (const std::exception& exc) {
+        RCLCPP_WARN(node_->get_logger(),
+                    "Failed to cancel gripper action goal: %s", exc.what());
+      }
+    }
+  }
+}
+
+Ros2GripperCommandResult Ros2ControlExecutionBackend::command_gripper(
+    const std::string& gripper_id,
+    double target_position,
+    double duration_s,
+    double max_effort) {
+  if (!std::isfinite(target_position) || !std::isfinite(duration_s) ||
+      !std::isfinite(max_effort) || duration_s < 0.0) {
+    return {false, "Invalid gripper command target, duration, or max effort"};
+  }
+  std::shared_ptr<GripperRuntime> runtime;
+  {
+    std::lock_guard<std::mutex> lock(gripper_map_mutex_);
+    const auto it = grippers_.find(gripper_id);
+    if (it == grippers_.end()) {
+      return {false, "No ROS GripperCommand action configured for " + gripper_id};
+    }
+    runtime = it->second;
+  }
+
+  const auto wait_timeout = std::chrono::duration<double>(
+      runtime->config.wait_for_action_server_timeout_s);
+  if (!runtime->action_client->wait_for_action_server(wait_timeout)) {
+    return {false,
+            "Timed out waiting for gripper action server " +
+                runtime->config.action_name};
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(runtime->mutex);
+    if (runtime->executing) {
+      return {false, "Gripper " + gripper_id + " is already executing"};
+    }
+    runtime->state = "executing";
+    runtime->executing = true;
+    runtime->goal_accepted = false;
+    runtime->cancel_pending = false;
+    runtime->target_position = target_position;
+    runtime->duration_s = duration_s;
+    runtime->max_effort = max_effort;
+    runtime->started_at = std::chrono::steady_clock::now();
+    runtime->deadline_at.reset();
+    if (runtime->config.result_timeout_s > 0.0) {
+      runtime->deadline_at =
+          runtime->started_at +
+          std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+              std::chrono::duration<double>(
+                  duration_s + runtime->config.result_timeout_s));
+    }
+    runtime->active_goal_handle.reset();
+    runtime->error.clear();
+  }
+
+  GripperCommand::Goal goal;
+  goal.command.position = target_position;
+  goal.command.max_effort = max_effort;
+
+  rclcpp_action::Client<GripperCommand>::SendGoalOptions options;
+  options.goal_response_callback =
+      [runtime](const GoalHandleGripper::SharedPtr& goal_handle) {
+        GoalHandleGripper::SharedPtr handle_to_cancel;
+        rclcpp_action::Client<GripperCommand>::SharedPtr action_client;
+        {
+          std::lock_guard<std::mutex> lock(runtime->mutex);
+          if (!goal_handle) {
+            if (runtime->executing) {
+              runtime->state = "failed";
+              runtime->executing = false;
+              runtime->goal_accepted = false;
+              runtime->cancel_pending = false;
+              runtime->error = "Gripper action goal was rejected";
+            }
+            return;
+          }
+          if (runtime->cancel_pending || !runtime->executing) {
+            handle_to_cancel = goal_handle;
+            action_client = runtime->action_client;
+            runtime->active_goal_handle.reset();
+            runtime->goal_accepted = false;
+            runtime->executing = false;
+            runtime->cancel_pending = false;
+            runtime->state = "idle";
+            runtime->error.clear();
+          } else {
+            runtime->goal_accepted = true;
+            runtime->active_goal_handle = goal_handle;
+          }
+        }
+        if (action_client && handle_to_cancel) {
+          try {
+            (void)action_client->async_cancel_goal(handle_to_cancel);
+          } catch (const std::exception&) {
+            // Reset/stop remains best-effort if the remote goal disappears during
+            // negotiation; the next status/result callback will reconcile state.
+          }
+        }
+      };
+  options.feedback_callback =
+      [this, runtime](
+          GoalHandleGripper::SharedPtr goal_handle,
+          const std::shared_ptr<const GripperCommand::Feedback> feedback) {
+        on_gripper_feedback(runtime, goal_handle, feedback);
+      };
+  options.result_callback =
+      [this, runtime](const GoalHandleGripper::WrappedResult& result) {
+        on_gripper_result(runtime, result);
+      };
+
+  try {
+    (void)runtime->action_client->async_send_goal(goal, options);
+  } catch (const std::exception& exc) {
+    {
+      std::lock_guard<std::mutex> lock(runtime->mutex);
+      runtime->state = "failed";
+      runtime->executing = false;
+      runtime->goal_accepted = false;
+      runtime->cancel_pending = false;
+      runtime->error = std::string("Failed to dispatch gripper action goal: ") +
+                       exc.what();
+    }
+    return {false, runtime->error};
+  }
+  return {true, ""};
+}
+
+void Ros2ControlExecutionBackend::update_gripper_commands() {
+  std::vector<std::shared_ptr<GripperRuntime>> runtimes;
+  {
+    std::lock_guard<std::mutex> lock(gripper_map_mutex_);
+    for (const auto& [_, runtime] : grippers_) {
+      runtimes.push_back(runtime);
+    }
+  }
+  const auto now = std::chrono::steady_clock::now();
+  for (auto& runtime : runtimes) {
+    GoalHandleGripper::SharedPtr goal_handle;
+    rclcpp_action::Client<GripperCommand>::SharedPtr action_client;
+    {
+      std::lock_guard<std::mutex> lock(runtime->mutex);
+      if (!runtime->executing) {
+        continue;
+      }
+      if (runtime->deadline_at.has_value() && now >= *runtime->deadline_at) {
+        goal_handle = runtime->active_goal_handle;
+        action_client = runtime->action_client;
+        runtime->active_goal_handle.reset();
+        runtime->state = "failed";
+        runtime->executing = false;
+        runtime->goal_accepted = false;
+        runtime->cancel_pending = false;
+        runtime->error = "Timed out waiting for gripper action result";
+      }
+    }
+    if (action_client && goal_handle) {
+      try {
+        (void)action_client->async_cancel_goal(goal_handle);
+      } catch (const std::exception& exc) {
+        RCLCPP_WARN(node_->get_logger(),
+                    "Failed to cancel timed-out gripper action goal: %s",
+                    exc.what());
+      }
+    }
+  }
+}
+
+Ros2GripperStatus Ros2ControlExecutionBackend::get_gripper_status(
+    const std::string& gripper_id) const {
+  std::shared_ptr<GripperRuntime> runtime;
+  {
+    std::lock_guard<std::mutex> lock(gripper_map_mutex_);
+    const auto it = grippers_.find(gripper_id);
+    if (it == grippers_.end()) {
+      return {};
+    }
+    runtime = it->second;
+  }
+  std::lock_guard<std::mutex> lock(runtime->mutex);
+  Ros2GripperStatus status;
+  status.state = runtime->state;
+  status.current_position = runtime->current_position;
+  status.target_position = runtime->target_position;
+  if (runtime->executing) {
+    const double duration = std::max(1e-9, runtime->duration_s);
+    status.progress =
+        clamp_progress(seconds_since(runtime->started_at,
+                                     std::chrono::steady_clock::now()) /
+                       duration);
+  } else if (runtime->state == "completed") {
+    status.progress = 1.0;
+  } else {
+    status.progress = 0.0;
+  }
+  status.error = runtime->error;
+  return status;
+}
+
+std::shared_ptr<NativeKernelBundle> create_ros2_control_kernel(
+    const std::string& model_name,
+    const std::string& group_name,
+    const std::string& urdf_path,
+    const std::string& srdf_path,
+    const std::vector<std::string>& package_paths,
+    const Ros2ControlExecutionBackendConfig& ros_config,
+    const core::ExecutionKernelConfig& kernel_config) {
+  auto bundle = std::make_shared<NativeKernelBundle>();
+  bundle->group_name = group_name;
+
+  std::vector<std::filesystem::path> pkg_paths;
+  for (const auto& path : package_paths) {
+    pkg_paths.emplace_back(path);
+  }
+
+  bundle->scene = std::make_shared<roboplan::Scene>(
+      model_name, std::filesystem::path(urdf_path),
+      std::filesystem::path(srdf_path), pkg_paths);
+
+  roboplan::RRTOptions rrt_opts;
+  rrt_opts.group_name = group_name;
+  rrt_opts.max_planning_time = 5.0;
+  rrt_opts.max_nodes = 5000;
+  bundle->rrt = std::make_shared<roboplan::RRT>(bundle->scene, rrt_opts);
+  bundle->shortcutter = std::make_shared<roboplan::PathShortcutter>(
+      bundle->scene, group_name);
+  bundle->toppra = std::make_shared<roboplan::PathParameterizerTOPPRA>(
+      bundle->scene, group_name);
+
+  roboplan::SimpleIkOptions ik_opts;
+  ik_opts.group_name = group_name;
+  ik_opts.step_size = 0.25;
+  ik_opts.max_restarts = 50;
+  ik_opts.max_time = 1.0;
+  bundle->ik = std::make_shared<roboplan::SimpleIk>(bundle->scene, ik_opts);
+
+  auto scene_mutex = std::make_shared<std::mutex>();
+  bundle->planner = std::make_unique<RoboPlanPlannerBackend>(
+      bundle->scene, rrt_opts, bundle->shortcutter, bundle->toppra, bundle->ik,
+      scene_mutex);
+  bundle->context = std::make_unique<RoboPlanPlanningContext>(
+      bundle->scene, group_name, scene_mutex);
+  bundle->clock = std::make_unique<WallClock>();
+  bundle->execution = std::make_unique<Ros2ControlExecutionBackend>(
+      bundle->scene, group_name, *bundle->clock, ros_config, scene_mutex);
+  bundle->scheduler = std::make_unique<SimpleScheduler>();
+  bundle->cache = std::make_unique<core::TrajectoryCache>();
+  bundle->kernel = std::make_unique<core::ExecutionKernel>(
+      *bundle->planner, *bundle->context, *bundle->execution,
+      *bundle->clock, *bundle->scheduler, *bundle->cache, kernel_config);
+  bundle->event_collector.subscribe(*bundle->kernel);
+  return bundle;
+}
+
+}  // namespace manyforge::roboplan_backend
