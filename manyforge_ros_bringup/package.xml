@@ -3,8 +3,8 @@
   <name>manyforge_ros_bringup</name>
   <version>0.1.0</version>
   <description>ROS 2 bringup helpers for ManyForge integration targets.</description>
-  <maintainer email="maintainers@manyforge.local">ManyForge Maintainers</maintainer>
-  <license>Proprietary</license>
+  <maintainer email="pastoriomarco@gmail.com">Marco Pastorio</maintainer>
+  <license>Apache-2.0</license>
 
   <buildtool_depend>ament_python</buildtool_depend>
 

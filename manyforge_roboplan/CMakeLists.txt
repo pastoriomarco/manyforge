@@ -121,6 +121,8 @@ if(BUILD_TESTING)
   find_package(GTest QUIET)
   if(GTest_FOUND)
     include(GoogleTest)
+    set(MANYFORGE_GTEST_TIMEOUT_SECONDS "60" CACHE STRING
+        "Per-test timeout for manyforge_roboplan gtest cases")
 
     add_executable(test_native_backends test/test_native_backends.cpp)
     target_link_libraries(test_native_backends PRIVATE
@@ -146,7 +148,9 @@ if(BUILD_TESTING)
     endforeach()
 
     gtest_discover_tests(test_native_backends
-      PROPERTIES ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
+      PROPERTIES
+        ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
+        TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS}
       DISCOVERY_EXTRA_ARGS --gtest_filter=*)
   endif()
 endif()

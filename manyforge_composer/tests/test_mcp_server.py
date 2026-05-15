@@ -48,12 +48,54 @@ def _write_program_with_runtime_policy(
     return str(target)
 
 
+def _write_program_with_failing_delegate_policy(
+    tmp_path: Path,
+    *,
+    runtime_override: str = "llm_allowed",
+    persistent_edit: str = "human_approval",
+    intervention_delegate: str = "forbidden",
+) -> str:
+    data = yaml.safe_load(Path(_PROGRAM_PATH).read_text(encoding="utf-8"))
+    data["blackboard"] = {
+        "keys": [
+            {
+                "id": "ready_flag",
+                "type": "bool",
+                "key": "ready_flag",
+                "description": "Unset flag used to force a deterministic node failure.",
+            }
+        ]
+    }
+    data["tree"] = {
+        "id": "sequence",
+        "name": "main_sequence",
+        "children": [
+            {
+                "id": "check_key_bool_value",
+                "name": "failing_delegate_check",
+                "params": {
+                    "key": {"key_ref": "ready_flag"},
+                    "expected_value": True,
+                },
+                "modification_policy": {
+                    "runtime_override": runtime_override,
+                    "persistent_edit": persistent_edit,
+                    "intervention_delegate": intervention_delegate,
+                },
+            }
+        ],
+    }
+    target = tmp_path / "failing_delegate.program.yaml"
+    target.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    return str(target)
+
+
 def _make_state(execute_duration_s: float = 0.0) -> ComposerState:
     kernel = MockKernelClient(execute_duration_s=execute_duration_s)
     return ComposerState(
         catalog_path=_CATALOG_PATH,
         kernel=kernel,
-        allowed_fs_roots=["/workspace", "/tmp"],
+        allowed_fs_roots=[str(_REPO_ROOT), "/workspace", "/tmp"],
     )
 
 
@@ -673,31 +715,29 @@ class TestIntervention:
     def test_pending_delegated_recovery_request_exposed(self, tmp_path):
         state = _make_state()
         state.load_program(
-            _write_program_with_runtime_policy(
+            _write_program_with_failing_delegate_policy(
                 tmp_path,
                 intervention_delegate="llm_allowed",
                 persistent_edit="llm_allowed",
             ),
             _DEPLOYMENT_PATH,
         )
-        state.kernel.fail_next_execute = True
         mcp = create_mcp_server(state)
 
         _call(mcp, "manyforge_cycle_control", {"command": "run"})
         time.sleep(0.2)
 
         pending = _call(mcp, "manyforge_intervention", {"action": "pending_recovery"})
-        assert pending["trigger_node_instance"] == "move_to_pick"
-        assert pending["trigger_reason"] == "execute_failed"
+        assert pending["trigger_node_instance"] == "failing_delegate_check"
+        assert pending["trigger_reason"] == "node_failure"
         assert pending["delegate_policy"] == "llm_allowed"
 
     def test_execute_delegated_recovery_from_pending_request(self, tmp_path):
         state = _make_state()
         state.load_program(
-            _write_program_with_runtime_policy(tmp_path, intervention_delegate="llm_allowed"),
+            _write_program_with_failing_delegate_policy(tmp_path, intervention_delegate="llm_allowed"),
             _DEPLOYMENT_PATH,
         )
-        state.kernel.fail_next_execute = True
         mcp = create_mcp_server(state)
 
         _call(mcp, "manyforge_cycle_control", {"command": "run"})
@@ -718,7 +758,7 @@ class TestIntervention:
             "resume_target": "stop",
         })
         assert result["session_kind"] == "delegated_recovery"
-        assert result["trigger_node_instance"] == "move_to_pick"
+        assert result["trigger_node_instance"] == "failing_delegate_check"
         assert result["principal_id"] == "agent:test-llm"
         assert result["grant_type"] == "policy_granted"
 

@@ -1,0 +1,60 @@
+name: python-tests
+
+on:
+  pull_request:
+    paths:
+      - "manyforge_behavior/**"
+      - "manyforge_composer/**"
+      - "manyforge_assistant_bridge/**"
+      - ".github/workflows/python-tests.yml"
+  push:
+    branches: [main, dev]
+    paths:
+      - "manyforge_behavior/**"
+      - "manyforge_composer/**"
+      - "manyforge_assistant_bridge/**"
+  workflow_dispatch:
+
+# Note: manyforge_hmi and manyforge_ros have tests that need heavy
+# environments (Viser + a live HMI socket for HMI; ROS Jazzy distro for
+# ros). They run in dedicated lanes — HMI tests via the Composer
+# integration tests (covered above through manyforge_composer/**), and
+# ros tests in the Docker-based scripts/test-all.sh roboplan-ros target
+# (not currently a GitHub Action). Triggering on those paths here would
+# pass while actually skipping the relevant packages — false-green CI.
+
+jobs:
+  python-tests:
+    name: Python unit tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest httpx
+          # Per-package install would require RoboPlan bindings (C++). For
+          # CI we install the pure-Python packages and run their unit tests
+          # directly; integration tests that need the C++ kernel run in the
+          # cpp-tsan / dev-container lanes.
+          pip install -e manyforge_behavior || echo "  (manyforge_behavior install soft-failed; running tests via PYTHONPATH)"
+          pip install -e manyforge_composer || echo "  (manyforge_composer install soft-failed)"
+          pip install -e manyforge_assistant_bridge || echo "  (manyforge_assistant_bridge install soft-failed)"
+          pip install py_trees pyyaml fastapi uvicorn
+      - name: Run pytest
+        env:
+          PYTHONPATH: ${{ github.workspace }}:${{ github.workspace }}/manyforge_behavior:${{ github.workspace }}/manyforge_composer:${{ github.workspace }}/manyforge_assistant_bridge
+        run: |
+          set -euo pipefail
+          # Each package runs from its own dir so it picks up its own
+          # pyproject.toml / pytest config.
+          for pkg in manyforge_behavior manyforge_composer manyforge_assistant_bridge; do
+            if [[ -d "${pkg}/tests" ]]; then
+              echo "=== pytest ${pkg} ==="
+              ( cd "${pkg}" && pytest -x --tb=short ) || exit 1
+            fi
+          done

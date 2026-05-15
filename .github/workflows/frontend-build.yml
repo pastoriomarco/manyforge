@@ -1,0 +1,39 @@
+name: frontend-build
+
+on:
+  pull_request:
+    paths:
+      - "manyforge_composer/frontend/**"
+      - ".github/workflows/frontend-build.yml"
+  push:
+    branches: [main, dev]
+    paths:
+      - "manyforge_composer/frontend/**"
+  workflow_dispatch:
+
+jobs:
+  frontend-build:
+    name: Composer frontend build
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: manyforge_composer/frontend
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: manyforge_composer/frontend/package-lock.json
+      - name: Install dependencies
+        run: |
+          if [[ -f package-lock.json ]]; then
+            npm ci
+          else
+            npm install
+          fi
+      - name: Type-check
+        run: npx tsc --noEmit -p tsconfig.app.json
+      - name: Build
+        run: npm run build

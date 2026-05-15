@@ -267,8 +267,12 @@ loop in-process against vLLM.
 The preflight refuses to start if ports `8000`, `8080`, `8081`, `8100`,
 `8200`, or `9000` are already owned by unmanaged processes. This prevents
 accidental duplicate Composer, HMI, bridge (either lane), OpenShell, or vLLM
-instances. It reuses only the known demo-owned containers/PID file and
-otherwise asks you to stop the conflicting service explicitly.
+instances. **As of `c3c492c` the preflight is strict against
+launcher-managed state too** — already-running launcher Composer / vLLM /
+bridge / supervisor containers or PID files are reported as conflicts.
+Use `scripts/launch.sh stop` or `scripts/launch.sh restart` to clear the
+state before re-running `start`. See [`scripts/MIGRATION.md`](../../scripts/MIGRATION.md)
+"Restart workflow" for the supported lifecycle.
 
 ### One-time prerequisites for the OpenClaw lane
 
@@ -306,35 +310,46 @@ qualification of the same stack:
 ./scripts/demo-assistant-known-good.sh smoke
 ```
 
-After Composer backend or frontend code changes, restart only Composer/HMI and
-keep the already-loaded vLLM model warm:
+After Composer or bridge code changes, restart the stack and reload the
+known-good program/deployment:
 
 ```bash
-./scripts/demo-assistant-known-good.sh reload-composer
+./scripts/demo-assistant-known-good.sh restart
 ```
 
-`reload-composer` rebuilds the Composer frontend bundle by default, removes and
-restarts only the `manyforge-e2e-composer` container, and reloads the known-good
-program/deployment. It does not stop vLLM, the assistant bridge, OpenShell, or
-any live NemoClaw sandbox. Use
-`REBUILD_FRONTEND_ON_COMPOSER_RELOAD=false` only when you know the frontend
-bundle is already current.
-
-After bridge code or bridge-budget changes, restart only the bridge:
-
-```bash
-./scripts/demo-assistant-known-good.sh restart-bridge
-```
-
-This keeps Composer/HMI, vLLM, OpenShell, and any live NemoClaw sandbox running.
-Use this after changing `ASSISTANT_MAX_TURNS`, bridge generation settings, or
-bridge code.
+Note: `restart-bridge` and `reload-composer` were partial-restart verbs in
+the previous version of this script. They are now deprecated and map to a
+full `restart` via `scripts/launch.sh`. **As of `c3c492c`, `start` is
+strict against partial launcher-managed state** — the previously-supported
+"`pkill` the bridge then re-`start` and let preflight reuse the still-
+running vLLM / sandbox" pattern no longer works; preflight reports the
+still-running components as conflicts and asks you to use `restart`
+instead. See `scripts/MIGRATION.md` "Restart workflow" for the supported
+lifecycle. The `REBUILD_FRONTEND_ON_COMPOSER_RELOAD` env var no longer
+applies; the dev-container startup builds the frontend from source on
+every launch (see `scripts/lib/compose.sh:start_composer_dev_container`).
 
 Stop and free memory:
 
 ```bash
 ./scripts/demo-assistant-known-good.sh stop
 ```
+
+The unified launcher's `stop` verb (which the shim now delegates to)
+runs `sync` + `echo 3 > /proc/sys/vm/drop_caches` automatically after
+the vLLM container is removed, so unified memory on Thor returns to
+the OS without a separate manual step. This requires passwordless
+sudo for the drop-caches kernel write; if sudo would prompt, the
+launcher warns once and continues without freeing — operators on
+Thor should add the following sudoers rule on first setup:
+
+```
+# /etc/sudoers.d/manyforge-drop-caches  (owner root, mode 0440)
+%docker ALL=(root) NOPASSWD: /bin/sh -c echo 3 > /proc/sys/vm/drop_caches
+```
+
+Set `DROP_CACHES=false` to disable the auto-cleanup (useful for CI
+hosts where the cache pressure isn't a concern).
 
 `stop` preserves `openshell-cluster-nemoclaw` by default because that gateway
 owns live OpenShell sandbox state, including a `my-assistant` sandbox created by

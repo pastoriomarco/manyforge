@@ -32,7 +32,7 @@ _PROGRAM_PATH = str(
 _TEST_SECURITY = SecurityConfig(
     cors_origins=["http://localhost:3000"],
     api_token=None,
-    allowed_fs_roots=["/workspace", "/tmp"],
+    allowed_fs_roots=[str(_REPO_ROOT), "/workspace", "/tmp"],
 )
 
 
@@ -42,7 +42,7 @@ def state():
     return ComposerState(
         catalog_path=_CATALOG_PATH,
         kernel=kernel,
-        allowed_fs_roots=["/workspace", "/tmp"],
+        allowed_fs_roots=[str(_REPO_ROOT), "/workspace", "/tmp"],
     )
 
 

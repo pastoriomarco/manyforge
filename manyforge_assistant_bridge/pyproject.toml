@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "manyforge_assistant_bridge"
+version = "0.1.0"
+description = "ManyForge assistant-provider bridge — multi-turn loop against an OpenAI-compatible upstream model, plus the assistant-stack supervisor that feeds Composer's runtime-status surface"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Marco Pastorio" }]
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.111",
+    "uvicorn[standard]>=0.30",
+    "httpx>=0.27",
+]
+
+[tool.setuptools]
+# Flat layout — the directory containing this pyproject.toml IS the package.
+package-dir = { "manyforge_assistant_bridge" = "." }
+packages = ["manyforge_assistant_bridge"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,114 @@
+ManyForge
+Copyright 2026 Marco Pastorio
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this software except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+This product bundles, vendors, or depends on the following third-party
+software. Each is used under the terms of its own license, which is
+listed below. See the individual LICENSE files in each dependency's
+source tree for the full text.
+
+---
+
+### RoboPlan (vendored under `.docker/roboplan/`)
+Copyright (c) 2025 Sebastian Castro
+License: MIT
+Source: bundled in the Docker build context for reproducible builds
+LICENSE file: `.docker/roboplan/LICENSE`
+
+### Pinocchio
+Copyright (c) CNRS, INRIA, LAAS-CNRS contributors
+License: BSD-2-Clause
+Source: https://github.com/stack-of-tasks/pinocchio
+Used by: RoboPlan (motion-planning kinematics + dynamics backend)
+
+### HPP-FCL (Flexible Collision Library)
+Copyright (c) CNRS, INRIA, LAAS-CNRS contributors
+License: BSD-3-Clause
+Source: https://github.com/humanoid-path-planner/hpp-fcl
+Used by: RoboPlan (collision-checking backend)
+
+### py_trees
+Copyright (c) Daniel Stonier and py_trees contributors
+License: BSD-3-Clause
+Source: https://github.com/splintered-reality/py_trees
+Used by: manyforge_behavior (behavior-tree runtime)
+
+### pybind11
+Copyright (c) Wenzel Jakob and pybind11 contributors
+License: BSD-3-Clause
+Source: https://github.com/pybind/pybind11
+Used by: manyforge_core, manyforge_roboplan (Python bindings to C++ kernel)
+
+### FastAPI
+Copyright (c) Sebastián Ramírez and FastAPI contributors
+License: MIT
+Source: https://github.com/tiangolo/fastapi
+Used by: manyforge_composer (backend HTTP API)
+
+### React + React-DOM
+Copyright (c) Meta Platforms, Inc. and React contributors
+License: MIT
+Source: https://github.com/facebook/react
+Used by: manyforge_composer/frontend
+
+### @xyflow/react (React Flow)
+Copyright (c) webkid GmbH and xyflow contributors
+License: MIT
+Source: https://github.com/xyflow/xyflow
+Used by: manyforge_composer/frontend (behavior-tree visualization)
+
+### Zustand
+Copyright (c) Paul Henschel and Zustand contributors
+License: MIT
+Source: https://github.com/pmndrs/zustand
+Used by: manyforge_composer/frontend (state management)
+
+### Viser
+Copyright (c) Brent Yi and Viser contributors
+License: MIT
+Source: https://github.com/nerfstudio-project/viser
+Used by: manyforge_hmi (3D HMI / robot visualization)
+
+### Tailwind CSS
+Copyright (c) Tailwind Labs, Inc.
+License: MIT
+Source: https://github.com/tailwindlabs/tailwindcss
+Used by: manyforge_composer/frontend (styling)
+
+### ROS 2 (Jazzy and dependent message/action packages)
+Copyright (c) Open Source Robotics Foundation, Inc. and ROS 2 contributors
+License: Apache-2.0 (most components; some Python tooling under BSD-3-Clause)
+Source: https://github.com/ros2
+Used by: manyforge_ros_bringup, manyforge_roboplan (Isaac ros2_control lane)
+
+### topic_based_ros2_control
+Copyright (c) PickNik Robotics and contributors
+License: BSD-3-Clause
+Source: https://github.com/PickNikRobotics/topic_based_ros2_control
+Used by: manyforge_ros_bringup (Isaac Sim arm-controller bridge)
+
+### control_msgs (FollowJointTrajectory, GripperCommand actions)
+Copyright (c) Open Source Robotics Foundation, Inc.
+License: Apache-2.0
+Source: https://github.com/ros-controls/control_msgs
+Used by: manyforge_roboplan (ros2_control execution backend)
+
+---
+
+The following license categories cover all third-party software listed
+above:
+
+- Apache-2.0: ROS 2 message/action packages, control_msgs
+- MIT: RoboPlan, FastAPI, React, React Flow, Zustand, Viser, Tailwind
+- BSD-2-Clause: Pinocchio
+- BSD-3-Clause: HPP-FCL, py_trees, pybind11, topic_based_ros2_control,
+  ROS 2 Python tooling
+
+When redistributing ManyForge in source or object form, You must
+retain this NOTICE file alongside the LICENSE file, as required by
+Section 4(d) of the Apache License, Version 2.0.

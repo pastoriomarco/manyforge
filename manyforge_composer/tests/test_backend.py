@@ -23,14 +23,6 @@ from manyforge_composer.backend.security import SecurityConfig
 from manyforge_composer.__main__ import build_program_loaded_callback
 from manyforge_composer.backend import routes_filesystem, routes_infra
 
-# Test security config: no auth, permissive filesystem roots for tmp_path access
-_TEST_SECURITY = SecurityConfig(
-    cors_origins=["http://localhost:3000"],
-    api_token=None,
-    allowed_fs_roots=["/workspace", "/tmp"],
-)
-
-
 # Test fixture paths (relative to repo root, same as existing tests)
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _CATALOG_PATH = str(_REPO_ROOT / "manyforge_behavior" / "resources" / "node_catalog.yaml")
@@ -39,6 +31,13 @@ _DEPLOYMENT_PATH = str(_REPO_ROOT / "manyforge_behavior" / "tests" / "fixtures" 
 _EXAMPLE_PROGRAM_PATH = str(_REPO_ROOT / "examples" / "pick_and_place.program.yaml")
 _EXAMPLE_DEPLOYMENT_PATH = str(_REPO_ROOT / "examples" / "pick_and_place.deployment.yaml")
 _SEMANTIC_DEPLOYMENT_PATH = str(_REPO_ROOT / "examples" / "semantic_shape_pick.deployment.yaml")
+
+# Test security config: no auth, permissive filesystem roots for tmp_path access
+_TEST_SECURITY = SecurityConfig(
+    cors_origins=["http://localhost:3000"],
+    api_token=None,
+    allowed_fs_roots=[str(_REPO_ROOT), "/workspace", "/tmp"],
+)
 
 
 def _write_program_with_runtime_policy(
@@ -56,6 +55,48 @@ def _write_program_with_runtime_policy(
         "intervention_delegate": intervention_delegate,
     }
     target = tmp_path / "runtime_override.program.yaml"
+    target.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    return str(target)
+
+
+def _write_program_with_failing_delegate_policy(
+    tmp_path: Path,
+    *,
+    runtime_override: str = "llm_allowed",
+    persistent_edit: str = "human_approval",
+    intervention_delegate: str = "forbidden",
+) -> str:
+    data = yaml.safe_load(Path(_PROGRAM_PATH).read_text(encoding="utf-8"))
+    data["blackboard"] = {
+        "keys": [
+            {
+                "id": "ready_flag",
+                "type": "bool",
+                "key": "ready_flag",
+                "description": "Unset flag used to force a deterministic node failure.",
+            }
+        ]
+    }
+    data["tree"] = {
+        "id": "sequence",
+        "name": "main_sequence",
+        "children": [
+            {
+                "id": "check_key_bool_value",
+                "name": "failing_delegate_check",
+                "params": {
+                    "key": {"key_ref": "ready_flag"},
+                    "expected_value": True,
+                },
+                "modification_policy": {
+                    "runtime_override": runtime_override,
+                    "persistent_edit": persistent_edit,
+                    "intervention_delegate": intervention_delegate,
+                },
+            }
+        ],
+    }
+    target = tmp_path / "failing_delegate.program.yaml"
     target.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
     return str(target)
 
@@ -1404,7 +1445,7 @@ def test_load_program_rebuilds_kernel_from_deployment_config():
         kernel=MockKernelClient(),
         kernel_factory=kernel_factory,
     )
-    app = create_app(state)
+    app = create_app(state, security=_TEST_SECURITY)
 
     with TestClient(app) as client:
         response = client.post(
@@ -2120,13 +2161,9 @@ def test_scene_snapshot_returns_image():
     kernel = MockKernelClient()
     state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
 
-    # Create a minimal valid JPEG (1x1 pixel)
-    import io
-    from PIL import Image
-    img = Image.new("RGB", (1, 1), color=(128, 128, 128))
-    buf = io.BytesIO()
-    img.save(buf, format="JPEG")
-    fake_jpeg = buf.getvalue()
+    # Minimal JPEG-like byte sequence is enough here; the route serves the
+    # renderer bytes verbatim and does not decode image content.
+    fake_jpeg = b"\xff\xd8\xff\xd9"
 
     class MockHmi:
         def render_scene(self, width=640, height=480, format="jpeg"):
@@ -2247,12 +2284,33 @@ def test_direct_pending_recovery_404_when_no_request():
     assert response.status_code == 404
 
 
+def _wait_for_pending_recovery(client, *, timeout_s: float = 2.0):
+    deadline = time.monotonic() + timeout_s
+    last_response = None
+    while time.monotonic() < deadline:
+        last_response = client.get("/api/direct/pending-recovery")
+        if last_response.status_code == 200:
+            return last_response
+        time.sleep(0.02)
+    return last_response
+
+
+def _wait_for_no_pending_recovery(client, *, timeout_s: float = 2.0):
+    deadline = time.monotonic() + timeout_s
+    last_response = None
+    while time.monotonic() < deadline:
+        last_response = client.get("/api/direct/pending-recovery")
+        if last_response.status_code == 404:
+            return last_response
+        time.sleep(0.02)
+    return last_response
+
+
 def test_delegated_recovery_request_created_on_node_failure(tmp_path):
     kernel = MockKernelClient()
-    kernel.fail_next_execute = True
     state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
     app = create_app(state, security=_TEST_SECURITY)
-    program_path = _write_program_with_runtime_policy(
+    program_path = _write_program_with_failing_delegate_policy(
         tmp_path,
         intervention_delegate="llm_allowed",
         persistent_edit="llm_allowed",
@@ -2260,13 +2318,12 @@ def test_delegated_recovery_request_created_on_node_failure(tmp_path):
     with TestClient(app) as client:
         client.post("/api/program/load", json={"path": program_path})
         client.post("/api/cycle/run")
-        time.sleep(0.2)
 
-        pending = client.get("/api/direct/pending-recovery")
+        pending = _wait_for_pending_recovery(client)
         assert pending.status_code == 200
         data = pending.json()
-        assert data["triggerNodeInstance"] == "move_to_pick"
-        assert data["triggerReason"] == "execute_failed"
+        assert data["triggerNodeInstance"] == "failing_delegate_check"
+        assert data["triggerReason"] == "node_failure"
         assert data["delegatePolicy"] == "llm_allowed"
         assert data["allowedAuthoritySources"] == ["human", "llm"]
         assert "runtime_override" in data["allowedActions"]
@@ -2274,22 +2331,22 @@ def test_delegated_recovery_request_created_on_node_failure(tmp_path):
 
         digest = client.get("/api/execution/digest").json()
         assert digest["state"] == "stopped"
-        assert digest["delegatedRecoveryRequest"]["triggerNodeInstance"] == "move_to_pick"
+        assert digest["delegatedRecoveryRequest"]["triggerNodeInstance"] == "failing_delegate_check"
 
 
 def test_direct_execute_delegated_recovery_consumes_pending_request(tmp_path):
     kernel = MockKernelClient()
-    kernel.fail_next_execute = True
     state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
     app = create_app(state, security=_TEST_SECURITY)
-    program_path = _write_program_with_runtime_policy(
+    program_path = _write_program_with_failing_delegate_policy(
         tmp_path,
         intervention_delegate="llm_allowed",
     )
     with TestClient(app) as client:
         client.post("/api/program/load", json={"path": program_path})
         client.post("/api/cycle/run")
-        time.sleep(0.2)
+        pending = _wait_for_pending_recovery(client)
+        assert pending.status_code == 200
 
         response = client.post("/api/direct/execute", json={
             "tree": {
@@ -2306,28 +2363,27 @@ def test_direct_execute_delegated_recovery_consumes_pending_request(tmp_path):
         })
         assert response.status_code == 200
         assert response.json()["sessionKind"] == "delegated_recovery"
-        assert response.json()["triggerNodeInstance"] == "move_to_pick"
+        assert response.json()["triggerNodeInstance"] == "failing_delegate_check"
         assert response.json()["principalId"] == "agent:test-llm"
         assert response.json()["grantType"] == "policy_granted"
 
-        time.sleep(0.2)
-        pending = client.get("/api/direct/pending-recovery")
+        pending = _wait_for_no_pending_recovery(client)
         assert pending.status_code == 404
 
 
 def test_direct_execute_delegated_recovery_enforces_pending_authority(tmp_path):
     kernel = MockKernelClient()
-    kernel.fail_next_execute = True
     state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
     app = create_app(state, security=_TEST_SECURITY)
-    program_path = _write_program_with_runtime_policy(
+    program_path = _write_program_with_failing_delegate_policy(
         tmp_path,
         intervention_delegate="human_only",
     )
     with TestClient(app) as client:
         client.post("/api/program/load", json={"path": program_path})
         client.post("/api/cycle/run")
-        time.sleep(0.2)
+        pending = _wait_for_pending_recovery(client)
+        assert pending.status_code == 200
 
         response = client.post("/api/direct/execute", json={
             "tree": {

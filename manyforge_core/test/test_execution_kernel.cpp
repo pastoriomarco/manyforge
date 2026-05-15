@@ -65,9 +65,15 @@ class SlowMockPlanner : public IPlannerBackend {
     return next_result;
   }
 
-  void wait_until_in_plan() {
+  // Bounded for the same reason as ControlledExecution's wait_until_*
+  // helpers: an unbounded cv_.wait can park forever under contention
+  // and hand the test up to the ctest-level 60 s ceiling with a less
+  // specific failure than an in-test ASSERT_TRUE timeout.
+  bool wait_until_in_plan(
+      std::chrono::milliseconds timeout = std::chrono::milliseconds(2000)) {
     std::unique_lock<std::mutex> lock(mu_);
-    in_plan_cv_.wait(lock, [this]() { return in_plan_; });
+    return in_plan_cv_.wait_for(lock, timeout,
+                                [this]() { return in_plan_; });
   }
 
   void release() {
@@ -380,24 +386,38 @@ class ControlledExecution : public IExecutionBackend {
     cv_.notify_all();
   }
 
-  void wait_until_execute_called() {
+  // All four helpers are bounded so the same contention class that
+  // motivated wait_until_execute_count's timeout can't slip through
+  // a sibling unbounded wait. Default 2 s is generous on a quiet
+  // host; callers ASSERT_TRUE on the return so a timeout fails the
+  // test fast with a specific diagnostic instead of hanging up to
+  // the ctest-level 60 s ceiling.
+  bool wait_until_execute_called(
+      std::chrono::milliseconds timeout = std::chrono::milliseconds(2000)) {
     std::unique_lock<std::mutex> lock(mu_);
-    cv_.wait(lock, [this]() { return execute_count > 0; });
+    return cv_.wait_for(lock, timeout,
+                        [this]() { return execute_count > 0; });
   }
 
-  void wait_until_execute_count(int count) {
+  bool wait_until_execute_count(
+      int count,
+      std::chrono::milliseconds timeout = std::chrono::milliseconds(2000)) {
     std::unique_lock<std::mutex> lock(mu_);
-    cv_.wait(lock, [this, count]() { return execute_count >= count; });
+    return cv_.wait_for(lock, timeout,
+                        [this, count]() { return execute_count >= count; });
   }
 
-  void wait_until_paused() {
+  bool wait_until_paused(
+      std::chrono::milliseconds timeout = std::chrono::milliseconds(2000)) {
     std::unique_lock<std::mutex> lock(mu_);
-    cv_.wait(lock, [this]() { return paused_; });
+    return cv_.wait_for(lock, timeout, [this]() { return paused_; });
   }
 
-  void wait_until_resume_called() {
+  bool wait_until_resume_called(
+      std::chrono::milliseconds timeout = std::chrono::milliseconds(2000)) {
     std::unique_lock<std::mutex> lock(mu_);
-    cv_.wait(lock, [this]() { return resume_count > 0; });
+    return cv_.wait_for(lock, timeout,
+                        [this]() { return resume_count > 0; });
   }
 
  private:
@@ -409,8 +429,15 @@ class ControlledExecution : public IExecutionBackend {
             return cv_.wait_for(lock, std::chrono::nanoseconds(timeout_ns),
                                 [this]() { return !running_; });
           }
-          cv_.wait(lock, [this]() { return !running_; });
-          return true;
+          // Production kernel callers always pass kExecutionPollNs (10 ms),
+          // so this branch is effectively dead in normal use. Bound it
+          // with a generous deadline (60 s, matching the ctest-level
+          // ceiling) so that a test path or future caller that passes 0
+          // can't deadlock the test runner. Return the bool from
+          // wait_for so callers see timeouts instead of getting a stale
+          // `true` after a hung wait.
+          return cv_.wait_for(lock, std::chrono::seconds(60),
+                              [this]() { return !running_; });
         },
         [this]() {
           std::lock_guard<std::mutex> lock(mu_);
@@ -960,21 +987,21 @@ TEST_F(ExecutionKernelTest, Resume_FromPaused_RevalidatesRemainingTrajectory) {
 
   auto result = controlled_kernel.execute(make_test_request());
   ASSERT_TRUE(result.ok());
-  controlled_execution.wait_until_execute_called();
+  ASSERT_TRUE(controlled_execution.wait_until_execute_called()) << "wait_until_execute_called timed out";
   ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kExecuting));
 
   controlled_execution.set_progress(0.5, {0.5, 0.5});
   auto pause_result = controlled_kernel.pause();
   ASSERT_TRUE(pause_result.accepted);
   local_scheduler.advance_to(local_clock.now());
-  controlled_execution.wait_until_paused();
+  ASSERT_TRUE(controlled_execution.wait_until_paused()) << "wait_until_paused timed out";
   ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kPaused));
 
   context.current_state.positions_rad = {0.5, 0.5};
 
   auto resume_result = controlled_kernel.resume();
   ASSERT_TRUE(resume_result.accepted);
-  controlled_execution.wait_until_resume_called();
+  ASSERT_TRUE(controlled_execution.wait_until_resume_called()) << "wait_until_resume_called timed out";
   ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kExecuting));
 
   EXPECT_GE(context.validate_count, 2);
@@ -1004,14 +1031,14 @@ TEST_F(ExecutionKernelTest, Resume_FromPaused_ValidationFailureTransitionsToFail
 
   auto result = controlled_kernel.execute(make_test_request());
   ASSERT_TRUE(result.ok());
-  controlled_execution.wait_until_execute_called();
+  ASSERT_TRUE(controlled_execution.wait_until_execute_called()) << "wait_until_execute_called timed out";
   ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kExecuting));
 
   controlled_execution.set_progress(0.5, {0.5, 0.5});
   auto pause_result = controlled_kernel.pause();
   ASSERT_TRUE(pause_result.accepted);
   local_scheduler.advance_to(local_clock.now());
-  controlled_execution.wait_until_paused();
+  ASSERT_TRUE(controlled_execution.wait_until_paused()) << "wait_until_paused timed out";
   ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kPaused));
 
   context.current_state.positions_rad = {0.5, 0.5};
@@ -1094,7 +1121,7 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_SchedulerTickChecksCollisionAndS
 
   auto result = controlled_kernel.execute(make_test_request());
   ASSERT_TRUE(result.ok());
-  controlled_execution.wait_until_execute_called();
+  ASSERT_TRUE(controlled_execution.wait_until_execute_called()) << "wait_until_execute_called timed out";
   ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kExecuting));
   std::this_thread::sleep_for(std::chrono::milliseconds(5));
 
@@ -1137,7 +1164,7 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_UsesConfiguredPeriod) {
 
   auto result = controlled_kernel.execute(make_test_request());
   ASSERT_TRUE(result.ok());
-  controlled_execution.wait_until_execute_called();
+  ASSERT_TRUE(controlled_execution.wait_until_execute_called()) << "wait_until_execute_called timed out";
   ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kExecuting));
   ASSERT_TRUE(wait_for_pending_scheduler_work(local_scheduler));
   const int baseline_collision_count = context.collision_count;
@@ -1548,7 +1575,7 @@ TEST_F(ExecutionKernelTest, Cancel_StopDuringPlanning_TransitionsToStopped) {
   ASSERT_TRUE(result.ok());
 
   // Wait until planner is in the plan call
-  slow_planner.wait_until_in_plan();
+  ASSERT_TRUE(slow_planner.wait_until_in_plan()) << "wait_until_in_plan timed out";
 
   // Call stop
   auto stop_result = kernel.stop();
@@ -1576,7 +1603,7 @@ TEST_F(ExecutionKernelTest, Cancel_ResetDuringPlanning_TransitionsToIdle) {
   ASSERT_TRUE(result.ok());
 
   // Wait until planner is in the plan call
-  slow_planner.wait_until_in_plan();
+  ASSERT_TRUE(slow_planner.wait_until_in_plan()) << "wait_until_in_plan timed out";
 
   // Call reset
   auto reset_result = kernel.reset();
@@ -1609,7 +1636,7 @@ TEST_F(ExecutionKernelTest, Cancel_StopDuringPlanning_EmitsCorrectEvents) {
   ASSERT_TRUE(result.ok());
 
   // Wait until planner is in the plan call
-  slow_planner.wait_until_in_plan();
+  ASSERT_TRUE(slow_planner.wait_until_in_plan()) << "wait_until_in_plan timed out";
 
   // Call stop
   kernel.stop();
@@ -1772,7 +1799,7 @@ TEST_F(ExecutionKernelTest, Events_CollisionDetectedEvent) {
   ASSERT_TRUE(result.ok());
 
   // Wait until planner is in the plan call
-  slow_planner.wait_until_in_plan();
+  ASSERT_TRUE(slow_planner.wait_until_in_plan()) << "wait_until_in_plan timed out";
 
   // Release the planner to let execution proceed
   slow_planner.release();
@@ -1850,7 +1877,7 @@ TEST_F(ExecutionKernelTest, MetricsAfterStop) {
   ASSERT_TRUE(result.ok());
 
   // Wait until planner is in the plan call
-  slow_planner.wait_until_in_plan();
+  ASSERT_TRUE(slow_planner.wait_until_in_plan()) << "wait_until_in_plan timed out";
 
   // Call stop
   auto stop_result = kernel.stop();
@@ -1900,7 +1927,7 @@ TEST_F(ExecutionKernelTest, Metrics_CollisionDetections) {
   ASSERT_TRUE(result.ok());
 
   // Wait until planner is in the plan call
-  slow_planner.wait_until_in_plan();
+  ASSERT_TRUE(slow_planner.wait_until_in_plan()) << "wait_until_in_plan timed out";
 
   // Release the planner to let execution proceed
   slow_planner.release();
@@ -1933,7 +1960,7 @@ TEST_F(ExecutionKernelTest, ExecutionTimeout_TransitionsToFailed) {
   ASSERT_TRUE(result.ok());
 
   // Wait until execution starts
-  controlled_execution.wait_until_execute_called();
+  ASSERT_TRUE(controlled_execution.wait_until_execute_called()) << "wait_until_execute_called timed out";
   ASSERT_TRUE(wait_for_state(timeout_kernel, ExecutionState::kExecuting));
 
   // Advance clock past the timeout
@@ -1975,13 +2002,13 @@ TEST_F(ExecutionKernelTest, ExecutionTimeout_DoesNotAdvanceWhilePaused) {
   auto result = timeout_kernel.execute(req);
   ASSERT_TRUE(result.ok());
 
-  controlled_execution.wait_until_execute_called();
+  ASSERT_TRUE(controlled_execution.wait_until_execute_called()) << "wait_until_execute_called timed out";
   ASSERT_TRUE(wait_for_state(timeout_kernel, ExecutionState::kExecuting));
 
   auto pause_result = timeout_kernel.pause();
   ASSERT_TRUE(pause_result.accepted);
   ts_scheduler.advance_to(ts_clock.now());
-  controlled_execution.wait_until_paused();
+  ASSERT_TRUE(controlled_execution.wait_until_paused()) << "wait_until_paused timed out";
   ASSERT_TRUE(wait_for_state(timeout_kernel, ExecutionState::kPaused));
 
   ts_clock.advance(1'000'000'000);  // 1s > 500ms timeout, but fully paused
@@ -2011,7 +2038,7 @@ TEST_F(ExecutionKernelTest, PlanningTimeout_TriggersStop) {
   ASSERT_TRUE(result.ok());
 
   // Wait until planning starts
-  slow_planner.wait_until_in_plan();
+  ASSERT_TRUE(slow_planner.wait_until_in_plan()) << "wait_until_in_plan timed out";
 
   // Advance scheduler past the planning timeout — fires the callback
   ts_scheduler.advance_to(ts_clock.now() + 200'000'000);  // 200ms > 100ms timeout
@@ -2043,7 +2070,7 @@ TEST_F(ExecutionKernelTest, ResetDuringPlanning_PrevStateIsPlanning) {
 
   auto result = local_kernel.execute(make_test_request());
   ASSERT_TRUE(result.ok());
-  slow_planner.wait_until_in_plan();
+  ASSERT_TRUE(slow_planner.wait_until_in_plan()) << "wait_until_in_plan timed out";
 
   // Reset during planning
   auto reset_result = local_kernel.reset();
@@ -2101,11 +2128,13 @@ TEST_F(ExecutionKernelTest, ConcurrentStress_RapidExecuteStopResetCycles) {
 
     // Wait until the worker actually entered the backend. Sleeping here races:
     // complete() can otherwise run before execute_trajectory() sets running_.
-    ctrl_exec.wait_until_execute_count(i + 1);
+    ASSERT_TRUE(ctrl_exec.wait_until_execute_count(i + 1))
+        << "Cycle " << i << " backend execute_trajectory was not entered";
 
     // Complete the execution immediately
     ctrl_exec.complete();
-    local_kernel.wait_for_completion();
+    ASSERT_TRUE(local_kernel.wait_for_completion(2'000'000'000))
+        << "Cycle " << i << " did not complete after complete()";
 
     // Reset for next cycle
     auto reset_result = local_kernel.reset();
@@ -2154,12 +2183,19 @@ TEST_F(ExecutionKernelTest, ConcurrentStress_RapidExecuteStopCycles) {
     auto result = local_kernel.execute(make_test_request());
     ASSERT_TRUE(result.ok()) << "Cycle " << i << " execute failed";
 
-    ctrl_exec.wait_until_execute_count(i + 1);
+    ASSERT_TRUE(ctrl_exec.wait_until_execute_count(i + 1))
+        << "Cycle " << i << " backend execute_trajectory was not entered";
 
-    // Stop mid-execution
+    // Stop mid-execution. ASSERT (not EXPECT) so a rejected stop fails the
+    // test with a clear "stop_result.accepted was false" diagnostic at the
+    // exact cycle instead of falling through to wait_for_completion and
+    // hanging until the 2 s timeout fires with a less-specific message.
+    // This is the diagnostic-quality fix; the hang itself is bounded by
+    // the 2 s wait_for_completion timeout below.
     auto stop_result = local_kernel.stop();
-    EXPECT_TRUE(stop_result.accepted) << "Cycle " << i << " stop failed";
-    local_kernel.wait_for_completion();
+    ASSERT_TRUE(stop_result.accepted) << "Cycle " << i << " stop failed";
+    ASSERT_TRUE(local_kernel.wait_for_completion(2'000'000'000))
+        << "Cycle " << i << " did not complete after stop()";
 
     auto reset_result = local_kernel.reset();
     EXPECT_TRUE(reset_result.accepted) << "Cycle " << i << " reset failed";

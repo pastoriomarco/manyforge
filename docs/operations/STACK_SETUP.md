@@ -129,14 +129,15 @@ side. Switching between them is a single env var on
 `scripts/demo-assistant-known-good.sh`. The lane-comparison data that
 justified the default flip (`nemoclaw` → `openclaw` on 2026-05-07)
 and the §10 ablation that validated 9/9 reliability live in
-[`LANE-COMPARISON-direct-vs-openclaw.md`](../../../../nemoclaw/src/NemoClaw-Thor/manyforge/docs/LANE-COMPARISON-direct-vs-openclaw.md)
+[`LANE-COMPARISON-direct-vs-openclaw.md`](https://github.com/pastoriomarco/NemoClaw-Thor/blob/main/manyforge/docs/LANE-COMPARISON-direct-vs-openclaw.md)
 in NemoClaw-Thor.
 
 Setup recipe:
 [`./ASSISTANT_E2E_COOKBOOK.md`](./ASSISTANT_E2E_COOKBOOK.md) →
 "Recipe: Known-Good Assistant Demo Launcher".
 Integration design:
-[`../../../../nemoclaw/src/NemoClaw-Thor/manyforge/docs/MANYFORGE-MCP-INTEGRATION.md`](../../../../nemoclaw/src/NemoClaw-Thor/manyforge/docs/MANYFORGE-MCP-INTEGRATION.md).
+[`MANYFORGE-MCP-INTEGRATION.md`](https://github.com/pastoriomarco/NemoClaw-Thor/blob/main/manyforge/docs/MANYFORGE-MCP-INTEGRATION.md)
+in NemoClaw-Thor.
 
 Use when:
 
@@ -160,6 +161,15 @@ Use when:
   Cloned alongside `manyforge` only by maintainers working on specs/ADRs.
 
 ## Primary Scripts
+
+> **Bringing up the stack from a clean checkout?** Use the unified
+> launcher `./scripts/launch.sh`. Its operator smoke-test recipe lives
+> at [`docs/operations/LAUNCHER_QUICKSTART.md`](LAUNCHER_QUICKSTART.md)
+> — covers all four lane × assistant combinations end-to-end. The
+> `demo-*.sh` scripts below are now thin shims that delegate to
+> `launch.sh`; their legacy CLI flags and `restart-bridge` /
+> `reload-composer` verbs are deprecated (see
+> [`scripts/MIGRATION.md`](../../scripts/MIGRATION.md) for replacements).
 
 ### `scripts/demo-shape-pick.sh`
 
@@ -438,11 +448,11 @@ alias; the deployment maps that alias to the actual provider/model endpoint.
 ### Sandbox agent cannot reach ManyForge cleanly
 
 That is expected on the current platform baseline. The OpenClaw lane
-provisioner ([`NemoClaw-Thor/manyforge/setup-manyforge-assistant.sh`](../../../NemoClaw-Thor/manyforge/setup-manyforge-assistant.sh))
+provisioner ([`manyforge/setup-manyforge-assistant.sh`](https://github.com/pastoriomarco/NemoClaw-Thor/blob/main/manyforge/setup-manyforge-assistant.sh))
 configures the SSRF egress preset, MCP server registration, and proxy envs
 required for the in-sandbox MCP bridge to call back into Composer. Run that
 provisioner whenever the deployment sandbox is recreated. For diagnosis,
-work through [`COMPOSER-ASSISTANT-RUNBOOK.md`](../../../NemoClaw-Thor/manyforge/docs/COMPOSER-ASSISTANT-RUNBOOK.md)
+work through [`COMPOSER-ASSISTANT-RUNBOOK.md`](https://github.com/pastoriomarco/NemoClaw-Thor/blob/main/manyforge/docs/COMPOSER-ASSISTANT-RUNBOOK.md)
 gates 4-9 (gateway in sandbox netns, vLLM reachability, bundle-mcp policy,
 proxy envs in MCP server config, SSRF L7 paths).
 

@@ -196,7 +196,7 @@ class TestPathTraversal:
         assert "outside allowed roots" in resp.json()["detail"]
 
     def test_program_save_rejects_path_outside_roots(self, tmp_path):
-        client, _ = _make_app(allowed_fs_roots=["/workspace"])
+        client, _ = _make_app(allowed_fs_roots=[str(_REPO_ROOT), "/workspace"])
         program_path = str(_REPO_ROOT / "manyforge_behavior" / "tests" / "fixtures" / "pick_and_place.program.yaml")
         deployment_path = str(_REPO_ROOT / "manyforge_behavior" / "tests" / "fixtures" / "ur5_roboplan.deployment.yaml")
         client.post("/api/program/load", json={"path": program_path, "deployment_path": deployment_path})
@@ -206,7 +206,7 @@ class TestPathTraversal:
         assert "outside allowed roots" in resp.json()["detail"]
 
     def test_deployment_save_rejects_path_outside_roots(self, tmp_path):
-        client, _ = _make_app(allowed_fs_roots=["/workspace"])
+        client, _ = _make_app(allowed_fs_roots=[str(_REPO_ROOT), "/workspace"])
         program_path = str(_REPO_ROOT / "manyforge_behavior" / "tests" / "fixtures" / "pick_and_place.program.yaml")
         deployment_path = str(_REPO_ROOT / "manyforge_behavior" / "tests" / "fixtures" / "ur5_roboplan.deployment.yaml")
         client.post("/api/program/load", json={"path": program_path, "deployment_path": deployment_path})
@@ -301,7 +301,7 @@ class TestVelocityScaleBounds:
 
     def test_velocity_accepts_valid_range(self):
         """Needs a loaded program to succeed past the 409 guard."""
-        client, state = _make_app()
+        client, state = _make_app(allowed_fs_roots=[str(_REPO_ROOT), "/workspace"])
         program_path = str(_REPO_ROOT / "manyforge_behavior" / "tests" / "fixtures" / "pick_and_place.program.yaml")
         deployment_path = str(_REPO_ROOT / "manyforge_behavior" / "tests" / "fixtures" / "ur5_roboplan.deployment.yaml")
         client.post("/api/program/load", json={"path": program_path, "deployment_path": deployment_path})

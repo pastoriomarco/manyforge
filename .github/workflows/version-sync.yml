@@ -1,0 +1,33 @@
+name: version-sync
+
+on:
+  pull_request:
+    paths:
+      - "VERSION"
+      - "**/pyproject.toml"
+      - "**/package.xml"
+      - "**/setup.py"
+      - "**/package.json"
+      - "**/CMakeLists.txt"
+      - "scripts/ci/verify-version-sync.sh"
+      - ".github/workflows/version-sync.yml"
+  push:
+    branches: [main, dev]
+    paths:
+      - "VERSION"
+      - "**/pyproject.toml"
+      - "**/package.xml"
+      - "**/setup.py"
+      - "**/package.json"
+      - "**/CMakeLists.txt"
+      - "scripts/ci/verify-version-sync.sh"
+  workflow_dispatch:
+
+jobs:
+  verify-version-sync:
+    name: Sub-package versions match repo-root VERSION
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run version-sync check
+        run: bash scripts/ci/verify-version-sync.sh

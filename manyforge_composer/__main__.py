@@ -126,7 +126,15 @@ def _resolved_hmi_robot_paths(
     default_urdf_path: str | None,
     default_package_dirs: list[str],
 ) -> tuple[str | None, list[str]]:
-    resolved_model = _resolved_robot_model_from_deployment(deployment)
+    try:
+        resolved_model = _resolved_robot_model_from_deployment(deployment)
+    except FileNotFoundError as exc:
+        logger.warning(
+            "Could not resolve deployment robot model for HMI; falling back to "
+            "launcher defaults: %s",
+            exc,
+        )
+        resolved_model = None
     if resolved_model is not None:
         return resolved_model.urdf_path, resolved_model.package_paths
     return default_urdf_path, default_package_dirs

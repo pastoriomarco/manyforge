@@ -25,6 +25,7 @@ from manyforge_composer.backend.state import ComposerState
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _CATALOG_PATH = str(_REPO_ROOT / "manyforge_behavior" / "resources" / "node_catalog.yaml")
 _PROGRAM_PATH = str(_REPO_ROOT / "manyforge_behavior" / "tests" / "fixtures" / "pick_and_place.program.yaml")
+_TEST_SECURITY = SecurityConfig(allowed_fs_roots=[str(_REPO_ROOT), "/tmp", "/workspace"])
 
 
 def _write_yaml_file(data: dict, *, suffix: str = ".yaml") -> str:
@@ -142,7 +143,7 @@ def _interrupt_deployment(
 
 def test_execution_blackboard_snapshot_after_reset():
     state = ComposerState(catalog_path=_CATALOG_PATH, kernel=MockKernelClient())
-    app = create_app(state)
+    app = create_app(state, security=_TEST_SECURITY)
 
     with TestClient(app) as client:
         response = client.post("/api/program/load", json={"path": _PROGRAM_PATH})
@@ -164,7 +165,7 @@ def test_execution_blackboard_snapshot_after_reset():
 def test_execution_digest_reports_running_state_and_object_summary():
     kernel = MockKernelClient(execute_duration_s=1.0)
     state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
-    app = create_app(state)
+    app = create_app(state, security=_TEST_SECURITY)
 
     with TestClient(app) as client:
         assert client.post("/api/program/load", json={"path": _PROGRAM_PATH}).status_code == 200
@@ -188,7 +189,7 @@ def test_execution_history_and_export_use_trace_sink(tmp_path):
         kernel=kernel,
         trace_dir=str(tmp_path),
     )
-    app = create_app(state)
+    app = create_app(state, security=_TEST_SECURITY)
 
     with TestClient(app) as client:
         assert client.post("/api/program/load", json={"path": _PROGRAM_PATH}).status_code == 200
@@ -607,7 +608,7 @@ def test_execution_digest_and_debug_export_report_signal_provider_health():
 
     kernel = MockKernelClient()
     state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
-    app = create_app(state)
+    app = create_app(state, security=_TEST_SECURITY)
 
     with TestClient(app) as client:
         assert client.post("/api/program/load", json={"path": _PROGRAM_PATH}).status_code == 200

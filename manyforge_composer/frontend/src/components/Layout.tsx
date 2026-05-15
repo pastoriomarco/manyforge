@@ -6,6 +6,7 @@ import { ControlBar } from './ControlBar';
 import { CollapsedRail } from './CollapsedRail';
 import { AssistantOverlay } from './AssistantOverlay';
 import { RuntimeStatusOverlay } from './RuntimeStatusOverlay';
+import { useDeploymentStore } from '../store/deploymentStore';
 
 const MIN_SIDEBAR_WIDTH = 220;
 const MAX_SIDEBAR_WIDTH = 420;
@@ -17,6 +18,13 @@ function clamp(value: number, min: number, max: number): number {
 export function Layout() {
   const [sidebarWidth, setSidebarWidth] = useState(340);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  // Gate the AssistantOverlay (AI button + panel) on the loaded deployment's
+  // `assistant.enabled` flag (per spec 430 §5). When no assistant block is
+  // present, the overlay is hidden — matches the MUST that Composer not
+  // route provider-mode assistant calls through an unconfigured assistant.
+  const assistantEnabled = useDeploymentStore(
+    (state) => state.deployment?.assistant?.enabled === true,
+  );
 
   const beginResize = useCallback(
     (
@@ -77,7 +85,7 @@ export function Layout() {
       </div>
       <ControlBar />
       <RuntimeStatusOverlay />
-      <AssistantOverlay />
+      {assistantEnabled ? <AssistantOverlay /> : null}
     </div>
   );
 }

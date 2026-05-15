@@ -16,10 +16,10 @@ setup(
     ],
     install_requires=["setuptools"],
     zip_safe=True,
-    maintainer="ManyForge Maintainers",
-    maintainer_email="maintainers@manyforge.local",
+    maintainer="Marco Pastorio",
+    maintainer_email="pastoriomarco@gmail.com",
     description="ROS 2 bringup helpers for ManyForge integration targets.",
-    license="Proprietary",
+    license="Apache-2.0",
     entry_points={
         "console_scripts": [
             "isaac_gripper_action_bridge = manyforge_ros_bringup.isaac_gripper_action_bridge:main",

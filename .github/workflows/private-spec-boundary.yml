@@ -1,0 +1,27 @@
+name: private-spec-boundary
+
+on:
+  pull_request:
+    paths:
+      - "**/*.md"
+      - "**/*.py"
+      - "**/*.cpp"
+      - "**/*.hpp"
+      - "**/*.h"
+      - "**/*.sh"
+      - "**/*.yaml"
+      - "**/*.yml"
+      - "scripts/ci/check-private-spec-boundary.sh"
+      - ".github/workflows/private-spec-boundary.yml"
+  push:
+    branches: [main, dev]
+  workflow_dispatch:
+
+jobs:
+  check-boundary:
+    name: No public links to private spec paths
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run boundary check
+        run: bash scripts/ci/check-private-spec-boundary.sh

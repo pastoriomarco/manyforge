@@ -12,6 +12,7 @@ set -euo pipefail
 
 WORKSPACE="${WORKSPACE:-/workspace}"
 BUILD_DIR="${MANYFORGE_BUILD_DIR:-/tmp/manyforge-build}"
+CTEST_TEST_TIMEOUT_S="${CTEST_TEST_TIMEOUT_S:-60}"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -59,9 +60,15 @@ run_cpp_tests() {
     local build="$BUILD_DIR/core"
     reset_stale_python_build_dir "$build"
     mkdir -p "$build" && cd "$build"
-    cmake "$WORKSPACE/manyforge_core" -DCMAKE_BUILD_TYPE=Release 2>&1 | tail -3
+    cmake "$WORKSPACE/manyforge_core" -DCMAKE_BUILD_TYPE=Release \
+        -DMANYFORGE_GTEST_TIMEOUT_SECONDS="$CTEST_TEST_TIMEOUT_S" 2>&1 | tail -3
     make -j"$(nproc)" 2>&1 | tail -5
-    if ctest --output-on-failure; then
+    # Both layers matter: the per-test TIMEOUT property baked by cmake
+    # above (the -D flag re-evaluates on every run, so the env var
+    # propagates correctly through the launcher path) AND the ctest
+    # CLI flag as a safety net for any ad-hoc `ctest` invocation that
+    # bypasses test-all.sh. ctest takes the min of the two.
+    if ctest --output-on-failure --timeout "$CTEST_TEST_TIMEOUT_S"; then
         PASS=$((PASS + 1))
     else
         FAIL=$((FAIL + 1))
@@ -91,9 +98,10 @@ run_roboplan_tests() {
         BOOST_INCLUDEDIR="${boost_root:+${boost_root}/include}" \
         BOOST_LIBRARYDIR="${boost_root:+${boost_root}/lib}" \
         cmake "$WORKSPACE/manyforge_roboplan" -DCMAKE_BUILD_TYPE=Release \
+        -DMANYFORGE_GTEST_TIMEOUT_SECONDS="$CTEST_TEST_TIMEOUT_S" \
         ${pybind11_dir:+-Dpybind11_DIR="$pybind11_dir"} 2>&1 | tail -3
     make -j"$(nproc)" 2>&1 | tail -5
-    if ctest --output-on-failure; then
+    if ctest --output-on-failure --timeout "$CTEST_TEST_TIMEOUT_S"; then
         PASS=$((PASS + 1))
     else
         FAIL=$((FAIL + 1))

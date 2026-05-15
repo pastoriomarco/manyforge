@@ -26,40 +26,51 @@ if(BUILD_TESTING)
   enable_testing()
   find_package(GTest REQUIRED)
   include(GoogleTest)
+  set(MANYFORGE_GTEST_TIMEOUT_SECONDS "60" CACHE STRING
+      "Per-test timeout for manyforge_core gtest cases")
 
   add_executable(test_version test/test_version.cpp)
   target_link_libraries(test_version PRIVATE manyforge_core GTest::gtest_main)
-  gtest_discover_tests(test_version)
+  gtest_discover_tests(test_version
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_contracts_compile test/test_contracts_compile.cpp)
   target_link_libraries(test_contracts_compile PRIVATE manyforge_core GTest::gtest_main)
-  gtest_discover_tests(test_contracts_compile)
+  gtest_discover_tests(test_contracts_compile
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_fake_clock test/test_fake_clock.cpp)
   target_link_libraries(test_fake_clock PRIVATE manyforge_core GTest::gtest_main)
-  gtest_discover_tests(test_fake_clock)
+  gtest_discover_tests(test_fake_clock
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_manual_scheduler test/test_manual_scheduler.cpp)
   target_link_libraries(test_manual_scheduler PRIVATE manyforge_core GTest::gtest_main)
-  gtest_discover_tests(test_manual_scheduler)
+  gtest_discover_tests(test_manual_scheduler
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_state_machine test/test_state_machine.cpp)
   target_link_libraries(test_state_machine PRIVATE manyforge_core GTest::gtest_main)
-  gtest_discover_tests(test_state_machine)
+  gtest_discover_tests(test_state_machine
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_stop_policy test/test_stop_policy.cpp)
   target_link_libraries(test_stop_policy PRIVATE manyforge_core GTest::gtest_main)
-  gtest_discover_tests(test_stop_policy)
+  gtest_discover_tests(test_stop_policy
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_cache test/test_cache.cpp)
   target_link_libraries(test_cache PRIVATE manyforge_core GTest::gtest_main)
-  gtest_discover_tests(test_cache)
+  gtest_discover_tests(test_cache
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_collision_policy test/test_collision_policy.cpp)
   target_link_libraries(test_collision_policy PRIVATE manyforge_core GTest::gtest_main)
-  gtest_discover_tests(test_collision_policy)
+  gtest_discover_tests(test_collision_policy
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_execution_kernel test/test_execution_kernel.cpp)
   target_link_libraries(test_execution_kernel PRIVATE manyforge_core GTest::gtest_main)
-  gtest_discover_tests(test_execution_kernel)
+  gtest_discover_tests(test_execution_kernel
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 endif()

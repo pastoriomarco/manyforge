@@ -31,6 +31,12 @@ section at the bottom points dev maintainers at `manyforge_specs` for
 spec-level work; that's the only reason an operator/LLM should ever
 follow that link.
 
+For development, the distinction is load-bearing: ManyForge is
+implemented according to `manyforge_specs`. If that repo is missing,
+runtime operation is still fully supported, but non-trivial behavior
+development is limited and needs maintainer audit before it should be
+treated as spec-compliant.
+
 ---
 
 ## Install
@@ -60,6 +66,19 @@ direct-LLM mode, full assistant mode), see
 ManyForge has **three deployment modes** — pick the one that matches
 your needs. Each mode adds optional surface; the simpler ones are
 self-contained.
+
+**Operator-facing launcher quickstart:**
+[`docs/operations/LAUNCHER_QUICKSTART.md`](docs/operations/LAUNCHER_QUICKSTART.md)
+is the canonical guide for the unified launcher
+(`scripts/launch.sh`). The primary use is the **interactive wizard**
+(7-step NemoClaw-onboard-style menu — just run `./scripts/launch.sh`
+with no arguments). The doc also covers scripted / non-interactive
+use for CI, the four-combination smoke-test matrix, and the seven
+`demo-*.sh` backward-compat shims. Read it before bringing up the
+stack for the first time, when verifying a launcher change, or when
+an end-to-end issue needs a known-good reference. **If you (LLM
+agent) modify the launcher scripts, update that doc in the same
+commit.**
 
 ### Mode 1 — Composer + behavior runtime (no LLM)
 
@@ -198,6 +217,12 @@ What lives where in this repo, and what it's for:
 
 When making changes here, check the boundary you're touching:
 
+0. **Spec-governed behavior requires `manyforge_specs`.** Kernel state
+   transitions, execution semantics, adapter contracts, deployment
+   schemas, assistant authority, observability surfaces, and ADR-level
+   architecture must be checked against the sibling private specs repo
+   before implementation. Without that repo, keep changes narrow,
+   document the limitation, and flag the work for maintainer audit.
 1. **Don't reintroduce private-spec links** in any runtime path. The
    CI guard at [`scripts/ci/check-private-spec-boundary.sh`](scripts/ci/check-private-spec-boundary.sh)
    enforces this; run it before committing if your change touches docs
@@ -225,13 +250,64 @@ When making changes here, check the boundary you're touching:
 
 ---
 
+## Branch & commit workflow for agents
+
+This repo uses a two-branch model (mirroring
+[manymove](https://github.com/pastoriomarco/manymove)) that applies to
+humans and LLM agents equally:
+
+- **`main`** — released. Tagged. Protected. Off-limits to direct push.
+- **`dev`** — integration. Where work lands. **Only the maintainer
+  pushes to upstream `dev`.** External contributors fork the repo and
+  open a PR from their fork to upstream `dev`.
+- **Topic branches** off `dev` — optional. Used when a change is
+  large enough to warrant pre-merge review, or when an external
+  contributor opens a PR.
+
+**Rules for LLM agents** (load-bearing, do not skip):
+
+1. **Never push to `main`.** Only the maintainer does that, via the
+   release squash-merge from `dev`. If you are running in the
+   maintainer's checkout, an authorized push goes to `origin/dev` (or
+   a topic branch if the operator explicitly asks). If you are
+   running in a contributor's fork, an authorized push goes to the
+   fork — never directly to upstream `dev` or `main`.
+2. **`git commit` requires explicit human authorization** — every time.
+   Stage the diff, present it, wait for the literal word `commit`. The
+   priority memory rule `feedback_commits_explicit_only.md` is operative:
+   multi-step instructions like "fix everything" do not transitively
+   authorize commits.
+3. **`git push` is a separate authorization** from `git commit`. Wait
+   for an explicit `push` reply.
+4. **Never open a PR autonomously.** Do not run `gh pr create` unless
+   explicitly asked. The operator opens the PR through the GitHub UI
+   when they're ready.
+5. **Before a non-trivial push, run `/codex:review`** (or equivalent
+   second-pass review) and iterate to convergence. Reference:
+   `feedback_codex_review_convergence.md`.
+6. **Releases are operator-driven.** Do not bump `VERSION`, do not
+   write `[X.Y.Z]` sections in `CHANGELOG.md`, do not tag, do not
+   squash-merge `dev → main` — those are explicit-ask operations.
+
+The per-package version-of-record is the repo-root `VERSION` file. The
+CI workflow `version-sync.yml` (driven by
+`scripts/ci/verify-version-sync.sh`) fails any PR or direct push to
+`dev`/`main` whose sub-package versions drift from `VERSION`.
+
+Full contributor reference, applicable to both humans and LLMs:
+[`CONTRIBUTING.md`](CONTRIBUTING.md).
+
+---
+
 ## For maintainers / spec work
 
 If your task is to **change a contract, add an ADR, modify a spec, or
 work on a development plan**, you need the private `manyforge_specs`
-repo cloned alongside `manyforge` (sibling directory). It is **not**
-required for any runtime / install / operator task; only for
-maintainer development workflows.
+repo cloned alongside `manyforge` (sibling directory). The same applies
+to non-trivial implementation work that changes externally observable
+behavior or the architectural contract. It is **not** required for any
+runtime / install / operator task; only for maintainer development
+workflows.
 
 Authoritative dev-side instructions:
 
@@ -242,11 +318,12 @@ Authoritative dev-side instructions:
 - `../manyforge_specs/docs/adr/`
 
 If `../manyforge_specs/` isn't present, it means this checkout is for
-*deployment* use, not maintainer development. **Don't fail the
-operator's task** — answer their runtime question from this repo's
-content (which is complete for operation), and only mention the specs
-repo if the user is asking a spec-level "what should this code do
-fundamentally?" question.
+*deployment* use or limited implementation work, not full maintainer
+development. **Don't fail the operator's runtime task** — answer their
+runtime question from this repo's content (which is complete for
+operation). For code changes, be explicit: small fixes may proceed from
+local code and tests, but spec-governed behavior changes need
+maintainer audit against `manyforge_specs` before merge.
 
 To seed an OpenClaw agent sandbox with the specs repo for development
 assistance, the dev-only script is at

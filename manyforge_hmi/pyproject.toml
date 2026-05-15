@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "manyforge_hmi"
+version = "0.1.0"
+description = "ManyForge HMI — Viser-based 3D human-machine interface for live scene + robot visualization"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Marco Pastorio" }]
+requires-python = ">=3.11"
+dependencies = [
+    "viser>=0.2",
+]
+
+[tool.setuptools]
+# Flat layout — the directory containing this pyproject.toml IS the package.
+package-dir = { "manyforge_hmi" = "." }
+packages = ["manyforge_hmi"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
