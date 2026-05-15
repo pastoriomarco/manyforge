@@ -58,14 +58,71 @@ function NumericInput({
   step?: string;
   disabled?: boolean;
 }) {
+  // Internally a draft-style input: local state during typing, commit on
+  // blur/Enter, revert on Escape. Same pattern as NumericParamEditor in
+  // ../property/PrimitiveParameterEditors.tsx — see DraftInputs.tsx for
+  // the full rationale on skipNextCommit. Step is kept for visual hints
+  // but ignored at parse time (we accept any finite number on commit).
+  const [draft, setDraft] = useState(() => (Number.isFinite(value) ? String(value) : '0'));
+  const [isFocused, setIsFocused] = useState(false);
+  const skipNextCommit = useRef(false);
+
+  useEffect(() => {
+    if (isFocused) {
+      return;
+    }
+    setDraft(Number.isFinite(value) ? String(value) : '0');
+  }, [value, isFocused]);
+
+  const commitDraft = () => {
+    const trimmed = draft.trim();
+    if (trimmed === '' || trimmed === '-' || trimmed === '+' || trimmed === '.' || trimmed === '-.' || trimmed === '+.') {
+      setDraft(Number.isFinite(value) ? String(value) : '0');
+      return;
+    }
+    const next = Number(trimmed);
+    if (!Number.isFinite(next)) {
+      setDraft(Number.isFinite(value) ? String(value) : '0');
+      return;
+    }
+    if (next !== value) {
+      onChange(next);
+    }
+    setDraft(String(next));
+  };
+
   return (
     <label className="block">
       <span className="text-[11px] text-gray-400">{label}</span>
       <input
-        type="number"
+        type="text"
+        inputMode="decimal"
         step={step}
-        value={Number.isFinite(value) ? value : 0}
-        onChange={(event) => onChange(Number(event.target.value))}
+        value={draft}
+        onFocus={() => setIsFocused(true)}
+        onChange={(event) => setDraft(event.target.value)}
+        onBlur={() => {
+          setIsFocused(false);
+          if (skipNextCommit.current) {
+            skipNextCommit.current = false;
+            setDraft(Number.isFinite(value) ? String(value) : '0');
+            return;
+          }
+          commitDraft();
+        }}
+        onKeyDown={(event) => {
+          if (event.key === 'Enter') {
+            event.preventDefault();
+            event.currentTarget.blur();
+            return;
+          }
+          if (event.key === 'Escape') {
+            event.preventDefault();
+            skipNextCommit.current = true;
+            setDraft(Number.isFinite(value) ? String(value) : '0');
+            event.currentTarget.blur();
+          }
+        }}
         disabled={disabled}
         className="mt-0.5 w-full rounded border border-gray-600 bg-gray-700 px-2 py-1 text-sm text-gray-200 focus:border-blue-500 focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
       />
@@ -86,13 +143,52 @@ function TextInput({
   disabled?: boolean;
   placeholder?: string;
 }) {
+  // Same draft-style pattern as NumericInput above. The component owns
+  // the local draft while focused so per-keystroke renders don't
+  // cascade into the program store and every other panel subscriber.
+  const [draft, setDraft] = useState(value);
+  const [isFocused, setIsFocused] = useState(false);
+  const skipNextCommit = useRef(false);
+
+  useEffect(() => {
+    if (isFocused) {
+      return;
+    }
+    setDraft(value);
+  }, [value, isFocused]);
+
   return (
     <label className="block">
       <span className="text-[11px] text-gray-400">{label}</span>
       <input
         type="text"
-        value={value}
-        onChange={(event) => onChange(event.target.value)}
+        value={draft}
+        onFocus={() => setIsFocused(true)}
+        onChange={(event) => setDraft(event.target.value)}
+        onBlur={() => {
+          setIsFocused(false);
+          if (skipNextCommit.current) {
+            skipNextCommit.current = false;
+            setDraft(value);
+            return;
+          }
+          if (draft !== value) {
+            onChange(draft);
+          }
+        }}
+        onKeyDown={(event) => {
+          if (event.key === 'Enter') {
+            event.preventDefault();
+            event.currentTarget.blur();
+            return;
+          }
+          if (event.key === 'Escape') {
+            event.preventDefault();
+            skipNextCommit.current = true;
+            setDraft(value);
+            event.currentTarget.blur();
+          }
+        }}
         disabled={disabled}
         placeholder={placeholder}
         className="mt-0.5 w-full rounded border border-gray-600 bg-gray-700 px-2 py-1 text-sm text-gray-200 focus:border-blue-500 focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"

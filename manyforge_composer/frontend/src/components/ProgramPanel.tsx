@@ -1,5 +1,6 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import type { Node } from '@xyflow/react';
+import { useShallow } from 'zustand/react/shallow';
 import { useCatalogStore } from '../store/catalogStore';
 import { useCycleStore } from '../store/cycleStore';
 import { useProgramStore } from '../store/programStore';
@@ -8,6 +9,7 @@ import type {
   CatalogParameter,
   ProgramParameter,
 } from '../types/api';
+import { DraftTextInput } from './common/DraftInputs';
 
 interface UsageRecord {
   nodeId: string;
@@ -353,11 +355,19 @@ function ParameterEditor({
 }) {
   const [draft, setDraft] = useState(() => formatDefaultValue(parameter.default));
   const [error, setError] = useState<string | null>(null);
+  const [isFocused, setIsFocused] = useState(false);
+  // See ../common/DraftInputs.tsx for the rationale: skipNextCommit gates
+  // the Escape→revert path so the synchronous blur after setDraft doesn't
+  // commit the in-progress typed value.
+  const skipNextCommit = useRef(false);
 
   useEffect(() => {
+    if (isFocused) {
+      return;
+    }
     setDraft(formatDefaultValue(parameter.default));
     setError(null);
-  }, [parameter.default, parameter.name, parameter.type]);
+  }, [parameter.default, parameter.name, parameter.type, isFocused]);
 
   const validation = useMemo(() => validateParameterDraft(parameter, draft), [draft, parameter]);
 
@@ -373,6 +383,25 @@ function ParameterEditor({
     if (signature(validation.value) !== signature(parameter.default)) {
       onCommit(validation.value);
     }
+  };
+
+  const handleBlur = () => {
+    setIsFocused(false);
+    if (skipNextCommit.current) {
+      skipNextCommit.current = false;
+      setDraft(formatDefaultValue(parameter.default));
+      setError(null);
+      return;
+    }
+    commit();
+  };
+
+  const revertOnEscape = (event: React.KeyboardEvent<HTMLInputElement | HTMLTextAreaElement>) => {
+    event.preventDefault();
+    skipNextCommit.current = true;
+    setDraft(formatDefaultValue(parameter.default));
+    setError(null);
+    event.currentTarget.blur();
   };
 
   if (parameter.type === 'bool') {
@@ -407,8 +436,21 @@ function ParameterEditor({
           rows={4}
           value={draft}
           disabled={disabled}
+          onFocus={() => setIsFocused(true)}
           onChange={(event) => setDraft(event.target.value)}
-          onBlur={commit}
+          onBlur={handleBlur}
+          onKeyDown={(event) => {
+            // Ctrl/Cmd+Enter commits; plain Enter is a newline inside
+            // a JSON/structured textarea. Esc reverts.
+            if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') {
+              event.preventDefault();
+              event.currentTarget.blur();
+              return;
+            }
+            if (event.key === 'Escape') {
+              revertOnEscape(event);
+            }
+          }}
           className={`${inputClassName} font-mono text-xs`}
         />
       ) : (
@@ -416,12 +458,17 @@ function ParameterEditor({
           type="text"
           value={draft}
           disabled={disabled}
+          onFocus={() => setIsFocused(true)}
           onChange={(event) => setDraft(event.target.value)}
-          onBlur={commit}
+          onBlur={handleBlur}
           onKeyDown={(event) => {
             if (event.key === 'Enter') {
               event.preventDefault();
-              commit();
+              event.currentTarget.blur();
+              return;
+            }
+            if (event.key === 'Escape') {
+              revertOnEscape(event);
             }
           }}
           className={`${inputClassName} ${parameter.type === 'string' ? '' : 'font-mono'}`}
@@ -516,6 +563,12 @@ function UsageList({
 }
 
 export function ProgramPanel() {
+  // useShallow narrows the subscription to just these fields/actions.
+  // Without it, `useProgramStore()` would resubscribe to the whole
+  // store and re-render the panel on every unrelated change (e.g.,
+  // the behavior-tree editor moving a node). Action references
+  // (updateX, addX, deleteX) are stable references in the zustand
+  // store, so they don't add re-render churn here.
   const {
     programInfo,
     programParameters,
@@ -532,9 +585,27 @@ export function ProgramPanel() {
     updateBlackboardKey,
     addBlackboardKey,
     deleteBlackboardKey,
-  } = useProgramStore();
-  const { entries } = useCatalogStore();
-  const { state } = useCycleStore();
+  } = useProgramStore(
+    useShallow((s) => ({
+      programInfo: s.programInfo,
+      programParameters: s.programParameters,
+      blackboardNamespaces: s.blackboardNamespaces,
+      blackboardKeys: s.blackboardKeys,
+      nodes: s.nodes,
+      selectNode: s.selectNode,
+      updateProgramParameter: s.updateProgramParameter,
+      addProgramParameter: s.addProgramParameter,
+      deleteProgramParameter: s.deleteProgramParameter,
+      updateBlackboardNamespace: s.updateBlackboardNamespace,
+      addBlackboardNamespace: s.addBlackboardNamespace,
+      deleteBlackboardNamespace: s.deleteBlackboardNamespace,
+      updateBlackboardKey: s.updateBlackboardKey,
+      addBlackboardKey: s.addBlackboardKey,
+      deleteBlackboardKey: s.deleteBlackboardKey,
+    })),
+  );
+  const entries = useCatalogStore((s) => s.entries);
+  const state = useCycleStore((s) => s.state);
   const editLocked = state === 'running' || state === 'interrupt_handler' || state === 'direct_control';
 
   const parameterUsageMap = useMemo(() => collectParameterUsages(nodes), [nodes]);
@@ -729,13 +800,11 @@ export function ProgramPanel() {
                 <div className="grid grid-cols-1 gap-3">
                   <div>
                     <label className="text-xs text-gray-300">id</label>
-                    <input
+                    <DraftTextInput
                       type="text"
                       value={namespace.id}
                       disabled={editLocked}
-                      onChange={(event) =>
-                        updateBlackboardNamespace(namespace.id, { id: event.target.value })
-                      }
+                      onCommit={(value) => updateBlackboardNamespace(namespace.id, { id: value })}
                       className="mt-1 w-full rounded border border-gray-600 bg-gray-800 px-3 py-2 text-sm text-gray-100 focus:border-blue-500 focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
                     />
                     {!namespace.id.trim() ? (
@@ -766,13 +835,11 @@ export function ProgramPanel() {
                   </div>
                   <div>
                     <label className="text-xs text-gray-300">prefix</label>
-                    <input
+                    <DraftTextInput
                       type="text"
                       value={namespace.prefix}
                       disabled={editLocked}
-                      onChange={(event) =>
-                        updateBlackboardNamespace(namespace.id, { prefix: event.target.value })
-                      }
+                      onCommit={(value) => updateBlackboardNamespace(namespace.id, { prefix: value })}
                       className="mt-1 w-full rounded border border-gray-600 bg-gray-800 px-3 py-2 text-sm text-gray-100 focus:border-blue-500 focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
                     />
                     {!namespace.prefix.trim() ? (
@@ -783,13 +850,11 @@ export function ProgramPanel() {
                   </div>
                   <div>
                     <label className="text-xs text-gray-300">description</label>
-                    <input
+                    <DraftTextInput
                       type="text"
                       value={namespace.description ?? ''}
                       disabled={editLocked}
-                      onChange={(event) =>
-                        updateBlackboardNamespace(namespace.id, { description: event.target.value })
-                      }
+                      onCommit={(value) => updateBlackboardNamespace(namespace.id, { description: value })}
                       className="mt-1 w-full rounded border border-gray-600 bg-gray-800 px-3 py-2 text-sm text-gray-100 focus:border-blue-500 focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
                     />
                   </div>
@@ -840,14 +905,14 @@ export function ProgramPanel() {
                           <div className="grid grid-cols-1 gap-3">
                             <div>
                               <label className="text-xs text-gray-300">field</label>
-                              <input
+                              <DraftTextInput
                                 type="text"
                                 value={fieldEntry.name}
                                 disabled={editLocked}
-                                onChange={(event) => {
+                                onCommit={(value) => {
                                   const nextFields = namespace.fields.map((candidate, candidateIndex) =>
                                     candidateIndex === index
-                                      ? { ...candidate, name: event.target.value }
+                                      ? { ...candidate, name: value }
                                       : candidate,
                                   );
                                   updateBlackboardNamespace(namespace.id, { fields: nextFields });
@@ -887,14 +952,14 @@ export function ProgramPanel() {
                             </div>
                             <div>
                               <label className="text-xs text-gray-300">description</label>
-                              <input
+                              <DraftTextInput
                                 type="text"
                                 value={fieldEntry.description ?? ''}
                                 disabled={editLocked}
-                                onChange={(event) => {
+                                onCommit={(value) => {
                                   const nextFields = namespace.fields.map((candidate, candidateIndex) =>
                                     candidateIndex === index
-                                      ? { ...candidate, description: event.target.value }
+                                      ? { ...candidate, description: value }
                                       : candidate,
                                   );
                                   updateBlackboardNamespace(namespace.id, { fields: nextFields });
@@ -991,11 +1056,11 @@ export function ProgramPanel() {
                 <div className="grid grid-cols-1 gap-3">
                   <div>
                     <label className="text-xs text-gray-300">id</label>
-                    <input
+                    <DraftTextInput
                       type="text"
                       value={entry.id}
                       disabled={editLocked}
-                      onChange={(event) => updateBlackboardKey(entry.id, { id: event.target.value })}
+                      onCommit={(value) => updateBlackboardKey(entry.id, { id: value })}
                       className="mt-1 w-full rounded border border-gray-600 bg-gray-800 px-3 py-2 text-sm text-gray-100 focus:border-blue-500 focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
                     />
                     {!entry.id.trim() ? (
@@ -1026,11 +1091,11 @@ export function ProgramPanel() {
                   </div>
                   <div>
                     <label className="text-xs text-gray-300">key</label>
-                    <input
+                    <DraftTextInput
                       type="text"
                       value={entry.key}
                       disabled={editLocked}
-                      onChange={(event) => updateBlackboardKey(entry.id, { key: event.target.value })}
+                      onCommit={(value) => updateBlackboardKey(entry.id, { key: value })}
                       className="mt-1 w-full rounded border border-gray-600 bg-gray-800 px-3 py-2 text-sm text-gray-100 focus:border-blue-500 focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
                     />
                     {!entry.key.trim() ? (
@@ -1041,13 +1106,11 @@ export function ProgramPanel() {
                   </div>
                   <div>
                     <label className="text-xs text-gray-300">description</label>
-                    <input
+                    <DraftTextInput
                       type="text"
                       value={entry.description ?? ''}
                       disabled={editLocked}
-                      onChange={(event) =>
-                        updateBlackboardKey(entry.id, { description: event.target.value })
-                      }
+                      onCommit={(value) => updateBlackboardKey(entry.id, { description: value })}
                       className="mt-1 w-full rounded border border-gray-600 bg-gray-800 px-3 py-2 text-sm text-gray-100 focus:border-blue-500 focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
                     />
                   </div>

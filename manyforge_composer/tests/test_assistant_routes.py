@@ -36,9 +36,6 @@ _ISAAC_SCENE_FIXTURE = (
 _DEPLOYMENT_FIXTURE = (
     _REPO_ROOT / "manyforge_behavior" / "tests" / "fixtures" / "ur5_roboplan.deployment.yaml"
 )
-_SEMANTIC_DEPLOYMENT_FIXTURE = (
-    _REPO_ROOT / "examples" / "semantic_shape_pick.deployment.yaml"
-)
 _TEST_SECURITY = SecurityConfig(
     cors_origins=["http://localhost:3000"],
     api_token=None,
@@ -221,8 +218,7 @@ def test_assistant_chat_provider_mode_uses_deployment_assistant_config(
     client: TestClient,
     state: ComposerState,
 ) -> None:
-    state.deployment = Deployment(_SEMANTIC_DEPLOYMENT_FIXTURE)
-    state.deployment_source_path = str(_SEMANTIC_DEPLOYMENT_FIXTURE)
+    state.deployment = _deterministic_assistant_deployment()
 
     response = client.post(
         "/api/assistant/chat",
@@ -1551,7 +1547,7 @@ def test_assistant_providers_catalog_marks_configured_provider(
     assert data["configuredProviderId"] == "mock"
     assert any(provider["id"] == "mock" and provider["configured"] for provider in data["providers"])
 
-    state.deployment = Deployment(_SEMANTIC_DEPLOYMENT_FIXTURE)
+    state.deployment = _deterministic_assistant_deployment()
     response = client.get("/api/assistant/providers")
     assert response.status_code == 200
     data = response.json()
@@ -2702,6 +2698,87 @@ def _assistant_catalog_hash(state: ComposerState, assistant_mode: str) -> str:
             "nodes": list(resolved["nodes"]),
         },
         assistant_mode,
+    )
+
+
+def _deterministic_assistant_deployment() -> Deployment:
+    # Minimal in-memory deployment whose assistant block points at the
+    # deterministic-scene-authoring stub provider with no assistant_modes.
+    # Used to verify the chat + providers routes pick up the deployment's
+    # declared provider as the default when no providerId is sent.
+    # Decoupled from examples/ so production-parity changes there
+    # (e.g. switching example deployments to openclaw + assistant_modes,
+    # which trigger the assistantMode-required validator path) don't
+    # silently invalidate this regression.
+    return Deployment.from_dict(
+        {
+            "api_version": "manyforge.deployment.v0",
+            "schema_version": "0.1.0",
+            "name": "deterministic-assistant-test",
+            "program_profile": "v0.0",
+            "robot_config": {
+                "robot_id": "ur5",
+                "group_id": "arm",
+                "urdf_path": "package://test.urdf",
+                "global_max_tcp_linear_speed_mps": 0.5,
+            },
+            "adapters": {
+                "planning": {
+                    "adapter_id": "planning.test",
+                    "adapter_version": "0.1.0",
+                    "capability_keys": [
+                        "planning.motion.joint_goal",
+                        "planning.motion.pose_goal",
+                        "planning.trajectory.time_parameterized",
+                    ],
+                    "config": {},
+                },
+                "context": {
+                    "adapter_id": "context.test",
+                    "adapter_version": "0.1.0",
+                    "capability_keys": [
+                        "context.collision.check",
+                        "context.kinematics.fk",
+                        "context.limits.joint",
+                        "context.state.current",
+                        "context.validation.trajectory",
+                        "scene.edit.add",
+                        "scene.edit.remove",
+                        "scene.edit.update_pose",
+                        "scene.edit.attach_detach",
+                        "scene.shape.box",
+                        "scene.shape.sphere",
+                        "scene.shape.mesh",
+                    ],
+                    "config": {},
+                },
+                "execution": {
+                    "adapter_id": "execution.test",
+                    "adapter_version": "0.1.0",
+                    "capability_keys": [
+                        "execution.feedback.phase_events",
+                        "execution.feedback.state_snapshots",
+                        "execution.pause",
+                        "execution.reset",
+                        "execution.resume",
+                        "execution.stop.soft",
+                        "execution.trajectory.execute",
+                    ],
+                    "config": {},
+                },
+            },
+            "orchestrator": {"engine": "py_trees", "config": {}},
+            "launch": {
+                "runner": {
+                    "module": "manyforge_behavior.runner",
+                    "args": [],
+                },
+            },
+            "assistant": {
+                "provider": "deterministic-scene-authoring",
+                "enabled": True,
+            },
+        }
     )
 
 

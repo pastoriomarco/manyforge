@@ -1,19 +1,46 @@
-import { useEffect, useMemo, useState } from 'react';
-import { api } from '../api/client';
+import { useMemo } from 'react';
+
+import { useStatusPolling, useStatusStore } from '../store/statusStore';
 
 const DEFAULT_HMI_PORT = '8081';
 
+// Optional Viser device-pixel-ratio cap, passed to Viser's R3F Canvas
+// via `dpr={fixedDpr}` (see DevSettingsStore.ts in the installed
+// viser client). Default is **no cap** — empty string suppresses the
+// query parameter entirely, so Viser uses its native DPR. Diagnostic
+// outcome (2026-05-15): stepping down from 1.5 → 1.0 → 0.5 produced
+// zero measurable responsiveness gain on Thor (aarch64, integrated
+// GPU, unified memory). The dominant cost there is JS-per-frame work
+// (36 useFrame callbacks in Viser's continuous 60 fps render loop),
+// not pixel shading; capping DPR only reduces fragment-shader work
+// which isn't the bottleneck. See
+// `manyforge_specs/docs/implementation/composer-native-3d-visualizer-migration.md`
+// and the open-points entry under "Composer / program artifacts /
+// orchestration" for the migration plan.
+//
+// Operators on bandwidth-constrained displays (very high DPR + weak
+// GPU + low memory) can still set `VITE_HMI_DPR=1.5` (or whatever
+// value works) at build time. The in-Viser DevSettings panel also
+// exposes this at runtime if you need to A/B compare.
+const DEFAULT_VISER_DPR =
+  (import.meta.env.VITE_HMI_DPR as string | undefined) ?? '';
+
 function getViserUrl(port: string): string {
-  if (import.meta.env.VITE_HMI_URL) {
-    return import.meta.env.VITE_HMI_URL;
+  const base = (() => {
+    if (import.meta.env.VITE_HMI_URL) {
+      return import.meta.env.VITE_HMI_URL as string;
+    }
+    if (typeof window === 'undefined') {
+      return `http://localhost:${port}`;
+    }
+    const { protocol, hostname } = window.location;
+    return `${protocol}//${hostname}:${port}`;
+  })();
+  if (!DEFAULT_VISER_DPR) {
+    return base;
   }
-
-  if (typeof window === 'undefined') {
-    return `http://localhost:${port}`;
-  }
-
-  const { protocol, hostname } = window.location;
-  return `${protocol}//${hostname}:${port}`;
+  const separator = base.includes('?') ? '&' : '?';
+  return `${base}${separator}fixedDpr=${encodeURIComponent(DEFAULT_VISER_DPR)}`;
 }
 
 interface ViserPanelProps {
@@ -23,50 +50,35 @@ interface ViserPanelProps {
 }
 
 export function ViserPanel({ onCollapse, blocked, resizing = false }: ViserPanelProps) {
-  const [hmiPort, setHmiPort] = useState(DEFAULT_HMI_PORT);
-  const [hmiAvailable, setHmiAvailable] = useState<boolean | null>(null);
-  const [hmiDetail, setHmiDetail] = useState<string | null>(null);
+  // Subscribe to the shared status poll. The first subscriber across the
+  // whole app starts the poll loop; this component just reads the latest
+  // snapshot from the zustand store via tight selectors.
+  useStatusPolling();
+  const infra = useStatusStore((state) => state.infra);
+  const runtime = useStatusStore((state) => state.runtime);
 
-  useEffect(() => {
-    let active = true;
+  const hmiPort = useMemo(() => {
+    const port = infra?.components.hmi?.port;
+    if (typeof port === 'number' && port > 0) {
+      return String(port);
+    }
+    return DEFAULT_HMI_PORT;
+  }, [infra]);
 
-    const refresh = () => {
-      void Promise.all([api.infra.status(), api.runtime.status().catch(() => null)])
-        .then(([status, runtimeStatus]) => {
-          if (!active) {
-            return;
-          }
-          const hmi = status.components.hmi;
-          const port = hmi?.port;
-          if (hmi?.status === 'healthy' && typeof port === 'number' && port > 0) {
-            setHmiPort(String(port));
-            setHmiAvailable(true);
-            setHmiDetail(null);
-            return;
-          }
-          setHmiAvailable(false);
-          setHmiDetail(
-            runtimeStatus?.userMessage
-            || 'Load a program/deployment to start the embedded Viser view.',
-          );
-        })
-        .catch(() => {
-          if (active) {
-            // Fall back to the default HMI port when infra status is unavailable.
-            setHmiAvailable(null);
-            setHmiDetail(null);
-          }
-        });
-    };
-
-    refresh();
-    const interval = window.setInterval(refresh, 2000);
-
-    return () => {
-      active = false;
-      window.clearInterval(interval);
-    };
-  }, []);
+  let hmiAvailable: boolean | null;
+  let hmiDetail: string | null = null;
+  if (infra === null) {
+    // First poll hasn't returned yet — fall through to the iframe at the
+    // default port; same behavior as before the shared store.
+    hmiAvailable = null;
+  } else if (infra.components.hmi?.status === 'healthy') {
+    hmiAvailable = true;
+  } else {
+    hmiAvailable = false;
+    hmiDetail =
+      runtime?.userMessage
+      || 'Load a program/deployment to start the embedded Viser view.';
+  }
 
   const viserUrl = useMemo(() => getViserUrl(hmiPort), [hmiPort]);
 

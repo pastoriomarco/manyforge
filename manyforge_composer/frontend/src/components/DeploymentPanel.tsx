@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { memo, useCallback, useEffect, useMemo, useState } from 'react';
+import { useShallow } from 'zustand/react/shallow';
 import { api } from '../api/client';
 import type {
   AssistantConfig,
@@ -10,6 +11,7 @@ import type {
 } from '../types/api';
 import { useDeploymentStore } from '../store/deploymentStore';
 import { useCycleStore } from '../store/cycleStore';
+import { DraftTextarea, DraftTextInput } from './common/DraftInputs';
 
 function signature(value: unknown): string {
   return JSON.stringify(value ?? null);
@@ -31,10 +33,10 @@ function FieldInput({
   return (
     <label className="block mb-2">
       <span className="text-xs text-gray-400">{label}</span>
-      <input
+      <DraftTextInput
         type={type}
         value={value}
-        onChange={(e) => onChange(e.target.value)}
+        onCommit={onChange}
         disabled={disabled}
         className="w-full mt-0.5 px-2 py-1 bg-gray-700 border border-gray-600 rounded text-sm text-gray-200 focus:border-blue-500 focus:outline-none disabled:opacity-50 disabled:cursor-not-allowed"
       />
@@ -64,22 +66,27 @@ function ConfigTextarea({
   onChange: (v: Record<string, unknown>) => void;
   disabled?: boolean;
 }) {
+  const [error, setError] = useState<string | null>(null);
+  const textValue = useMemo(() => JSON.stringify(value, null, 2), [value]);
+
   return (
     <label className="block mb-2">
       <span className="text-xs text-gray-400">{label}</span>
-      <textarea
+      <DraftTextarea
         rows={3}
-        defaultValue={JSON.stringify(value, null, 2)}
+        value={textValue}
         disabled={disabled}
-        onBlur={(e) => {
+        onCommit={(nextValue) => {
           try {
-            onChange(JSON.parse(e.target.value));
+            onChange(JSON.parse(nextValue));
+            setError(null);
           } catch {
-            // invalid JSON — keep current value
+            setError('Invalid JSON');
           }
         }}
         className="w-full mt-0.5 px-2 py-1 bg-gray-700 border border-gray-600 rounded text-xs text-gray-200 font-mono focus:border-blue-500 focus:outline-none disabled:opacity-50 disabled:cursor-not-allowed"
       />
+      {error && <span className="mt-1 block text-[11px] text-red-400">{error}</span>}
     </label>
   );
 }
@@ -144,12 +151,12 @@ function StringListInput({
   return (
     <label className="block mb-2">
       <span className="text-xs text-gray-400">{label}</span>
-      <input
+      <DraftTextInput
         type="text"
         value={values.join(', ')}
-        onChange={(e) => {
+        onCommit={(nextValue) => {
           onChange(
-            e.target.value
+            nextValue
               .split(',')
               .map((value) => value.trim())
               .filter(Boolean),
@@ -318,7 +325,14 @@ function nextEndpointAlias(existingAliases: string[]): string {
   return `model_${index}`;
 }
 
-function ModelEndpointCard({
+// Wrapped in React.memo at the bottom of the function definition so
+// editing one endpoint's fields doesn't re-render every sibling card.
+// With the draft-input pattern, the parent panel only commits on
+// blur; combined with memoized children, a single field commit
+// re-renders only the card that owns it. Callers should pass stable
+// `onUpdate` callbacks (useCallback) or accept that updates will
+// trigger card re-renders.
+function ModelEndpointCardImpl({
   alias,
   endpoint,
   availableModelIds,
@@ -494,7 +508,18 @@ function ModelEndpointCard({
   );
 }
 
+const ModelEndpointCard = memo(ModelEndpointCardImpl);
+
 export function DeploymentPanel() {
+  // Tightened selector via useShallow: previously this was
+  // `useDeploymentStore()` with no selector at all, which subscribed
+  // the panel to every field of the store and re-rendered on any
+  // unrelated change (e.g., another component editing a different
+  // slice). useShallow does a shallow comparison on the returned
+  // object's keys, so the panel now only re-renders when one of
+  // these specific seven fields changes. Action references
+  // (saveDeployment / setField / setNestedField) are stable across
+  // renders so they don't trigger pointless re-renders.
   const {
     deployment,
     appliedDeployment,
@@ -503,9 +528,18 @@ export function DeploymentPanel() {
     saveDeployment,
     setField,
     setNestedField,
-  } =
-    useDeploymentStore();
-  const { state } = useCycleStore();
+  } = useDeploymentStore(
+    useShallow((state) => ({
+      deployment: state.deployment,
+      appliedDeployment: state.appliedDeployment,
+      savedDeployment: state.savedDeployment,
+      sourcePath: state.sourcePath,
+      saveDeployment: state.saveDeployment,
+      setField: state.setField,
+      setNestedField: state.setNestedField,
+    })),
+  );
+  const state = useCycleStore((s) => s.state);
   const [modelEndpointCatalog, setModelEndpointCatalog] = useState<ModelEndpointCatalog | null>(null);
   const [sceneFrames, setSceneFrames] = useState<SceneFrameState[]>([]);
   const editLocked = state === 'running' || state === 'interrupt_handler' || state === 'direct_control';

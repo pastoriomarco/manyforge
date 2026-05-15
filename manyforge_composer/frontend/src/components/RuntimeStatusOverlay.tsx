@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { api } from '../api/client';
+import { useStatusPolling, useStatusStore } from '../store/statusStore';
 import type { RuntimeComponentStatus, RuntimeStatus } from '../types/api';
 
 function readinessClasses(readiness: string): string {
@@ -89,33 +89,13 @@ function ComponentRow({ component }: { component: RuntimeComponentStatus }) {
 
 export function RuntimeStatusOverlay() {
   const [open, setOpen] = useState(false);
-  const [status, setStatus] = useState<RuntimeStatus | null>(null);
-  const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    let cancelled = false;
-
-    const fetchStatus = async () => {
-      try {
-        const next = await api.runtime.status();
-        if (!cancelled) {
-          setStatus(next);
-          setError(null);
-        }
-      } catch (err) {
-        if (!cancelled) {
-          setError(err instanceof Error ? err.message : 'Runtime status unavailable');
-        }
-      }
-    };
-
-    void fetchStatus();
-    const interval = window.setInterval(fetchStatus, 2000);
-    return () => {
-      cancelled = true;
-      window.clearInterval(interval);
-    };
-  }, []);
+  // Single shared poll loop in ../store/statusStore.ts. This component
+  // is one of two subscribers (ViserPanel is the other); together they
+  // replace what used to be two independent setInterval timers fetching
+  // the same /api/runtime/status endpoint every 2 s.
+  useStatusPolling();
+  const status = useStatusStore((state) => state.runtime);
+  const error = useStatusStore((state) => state.runtimeError);
 
   useEffect(() => {
     if (!open) return;

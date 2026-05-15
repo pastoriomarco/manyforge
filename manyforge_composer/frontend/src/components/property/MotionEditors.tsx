@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import {
   getFieldRefTarget,
@@ -6,6 +6,7 @@ import {
   type BlackboardFieldOption,
 } from './BlackboardBindingEditors';
 import { primitiveListValuesEqual } from './utils';
+import { DraftTextInput } from '../common/DraftInputs';
 
 interface PoseEnvelopeValue {
   position_min_m: number[];
@@ -318,6 +319,12 @@ function NumberInput({
     Number.isFinite(value) ? String(value) : ''
   );
   const [isFocused, setIsFocused] = useState(false);
+  // See NumericParamEditor in ../property/PrimitiveParameterEditors.tsx
+  // and DraftTextInput in ../common/DraftInputs.tsx for the rationale:
+  // setDraft inside the Escape handler is queued asynchronously, but
+  // .blur() fires onBlur SYNCHRONOUSLY, so without this flag the typed
+  // value gets committed even when the operator pressed Escape to revert.
+  const skipNextCommit = useRef(false);
 
   useEffect(() => {
     if (isFocused) {
@@ -333,19 +340,15 @@ function NumberInput({
       value={draft}
       onFocus={() => setIsFocused(true)}
       onChange={(event) => {
-        const nextDraft = event.target.value;
-        setDraft(nextDraft);
-        const trimmed = nextDraft.trim();
-        if (trimmed === '' || trimmed === '-' || trimmed === '+' || trimmed === '.' || trimmed === '-.' || trimmed === '+.') {
-          return;
-        }
-        const nextValue = Number(trimmed);
-        if (Number.isFinite(nextValue)) {
-          onChange(nextValue);
-        }
+        setDraft(event.target.value);
       }}
       onBlur={() => {
         setIsFocused(false);
+        if (skipNextCommit.current) {
+          skipNextCommit.current = false;
+          setDraft(Number.isFinite(value) ? String(value) : '');
+          return;
+        }
         const trimmed = draft.trim();
         if (trimmed === '' || trimmed === '-' || trimmed === '+' || trimmed === '.' || trimmed === '-.' || trimmed === '+.') {
           setDraft(Number.isFinite(value) ? String(value) : '');
@@ -358,6 +361,18 @@ function NumberInput({
           return;
         }
         setDraft(Number.isFinite(value) ? String(value) : '');
+      }}
+      onKeyDown={(event) => {
+        if (event.key === 'Enter') {
+          event.preventDefault();
+          event.currentTarget.blur();
+        }
+        if (event.key === 'Escape') {
+          event.preventDefault();
+          skipNextCommit.current = true;
+          setDraft(Number.isFinite(value) ? String(value) : '');
+          event.currentTarget.blur();
+        }
       }}
       disabled={disabled}
       className={`w-full rounded border border-gray-600 bg-gray-700 px-2 py-1 text-xs text-white ${disabled ? 'opacity-50 cursor-not-allowed bg-gray-800' : ''}`}
@@ -885,15 +900,15 @@ export function JointGoalEditor({
               </label>
               <div className="space-y-1">
                 <div className="text-[11px] text-gray-500 md:hidden">Target position (rad)</div>
-                <input
+                <DraftTextInput
                   type="text"
                   inputMode="decimal"
                   value={row.positionText}
                   disabled={isRunMode || !row.selected}
-                  onChange={(event) => {
+                  onCommit={(nextPositionText) => {
                     const nextRows = rows.map((candidate) =>
                       candidate.jointName === row.jointName
-                        ? { ...candidate, positionText: event.target.value }
+                        ? { ...candidate, positionText: nextPositionText }
                         : candidate
                     );
                     commit(nextRows);

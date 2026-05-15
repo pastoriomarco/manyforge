@@ -17,6 +17,7 @@ from manyforge_behavior.kernel_client import (
     SceneEditRequest,
 )
 from manyforge_behavior.nodes.motion import MoveManipulatorAction, ResetTrajectories
+from manyforge_behavior.nodes.control_flow import RepeatDecorator
 from manyforge_behavior.nodes.scene import (
     AddCollisionObject,
     AttachObjectToLink,
@@ -380,6 +381,40 @@ class TestMoveManipulatorAction:
             [0.70710678, -0.70710678, -4.32978028e-17, 4.32978028e-17],
             abs=1e-6,
         )
+
+    def test_repeat_resubmits_relative_move_without_manual_cache_reset(self, kernel, bb_with_kernel):
+        node = MoveManipulatorAction(
+            name="dynamic_pick_move",
+            move_id="pick_dynamic_box",
+            motion_type="relative_move",
+            relative_move={
+                "target_reference": {"type": "object", "id": "dynamic_box"},
+                "offset": {
+                    "position_m": [0.0, 0.0, 0.1],
+                    "orientation_rpy_deg": [180.0, 0.0, -90.0],
+                },
+            },
+            cache_mode="default",
+        )
+        repeat = RepeatDecorator("repeat_dynamic_pick", child=node, num_cycles=2)
+        tree = py_trees.trees.BehaviourTree(root=repeat)
+
+        tree.setup()
+        tree.tick()
+        assert repeat.status == py_trees.common.Status.RUNNING
+        tree.tick()
+
+        assert repeat.status == py_trees.common.Status.SUCCESS
+        assert kernel.execute_count == 2
+        assert kernel.invalidate_count == 0
+        assert kernel.last_execute_request is not None
+        assert kernel.last_execute_request.move_id == "pick_dynamic_box"
+        assert kernel.last_execute_request.motion_type == "relative_move"
+        assert kernel.last_execute_request.relative_move is not None
+        assert kernel.last_execute_request.relative_move["target_reference"] == {
+            "type": "object",
+            "id": "dynamic_box",
+        }
 
 
 class TestResetTrajectories:

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 
 import type {
   BlackboardFieldOption,
@@ -9,6 +9,7 @@ import {
   getKeyRefId,
 } from './BlackboardBindingEditors';
 import { primitiveListValuesEqual } from './utils';
+import { DraftTextInput } from '../common/DraftInputs';
 
 type ConstraintMap = Record<string, unknown>;
 
@@ -169,6 +170,12 @@ export function NumericParamEditor({
   );
   const [error, setError] = useState<string | null>(null);
   const [isFocused, setIsFocused] = useState(false);
+  // Set to true by the Escape handler before it calls .blur(). onBlur then
+  // skips its tryCommit call so the in-progress draft is discarded instead
+  // of committed. Matches the skipNextCommit pattern in
+  // ../common/DraftInputs.tsx so behavior is consistent across all
+  // editable inputs in the property panel.
+  const skipNextCommit = useRef(false);
 
   useEffect(() => {
     if (isFocused) {
@@ -212,11 +219,40 @@ export function NumericParamEditor({
         onChange={(event) => {
           const nextDraft = event.target.value;
           setDraft(nextDraft);
-          tryCommit(nextDraft);
+          if (error) {
+            setError(null);
+          }
         }}
         onBlur={() => {
           setIsFocused(false);
-          tryCommit(draft);
+          if (skipNextCommit.current) {
+            // Escape just fired: drop the in-progress draft without
+            // committing. The next render's useEffect re-syncs `draft`
+            // to `currentValue` because isFocused is now false.
+            skipNextCommit.current = false;
+            setDraft(currentValue !== undefined && currentValue !== null ? String(currentValue) : '');
+            setError(null);
+          } else {
+            tryCommit(draft);
+          }
+        }}
+        onKeyDown={(event) => {
+          if (event.key === 'Enter') {
+            event.preventDefault();
+            event.currentTarget.blur();
+          }
+          if (event.key === 'Escape') {
+            event.preventDefault();
+            // Mark the impending blur as a revert (not a commit). The
+            // setDraft below is queued asynchronously; the
+            // synchronous blur+onBlur path uses skipNextCommit to
+            // decide whether to commit `draft` (which still holds the
+            // typed value at this point) or discard it.
+            skipNextCommit.current = true;
+            setDraft(currentValue !== undefined && currentValue !== null ? String(currentValue) : '');
+            setError(null);
+            event.currentTarget.blur();
+          }
         }}
         disabled={isRunMode}
         className={`w-full bg-gray-700 border border-gray-600 text-white rounded px-2 py-1 text-sm ${isRunMode ? 'opacity-50 cursor-not-allowed bg-gray-800' : ''}`}
@@ -304,13 +340,13 @@ export function TemplateVariableMapEditor({
       )}
       {rows.map((row) => (
         <div key={row.id} className="grid grid-cols-[1fr_1fr_auto] gap-2">
-          <input
+          <DraftTextInput
             type="text"
             value={row.name}
-            onChange={(event) => {
+            onCommit={(nextName) => {
               const nextRows = rows.map((candidate) =>
                 candidate.id === row.id
-                  ? { ...candidate, name: event.target.value }
+                  ? { ...candidate, name: nextName }
                   : candidate
               );
               validateAndCommit(nextRows);
@@ -466,14 +502,14 @@ export function ListParamEditor({
       {rows.map((row, index) => (
         <div key={row.id} className="grid grid-cols-[auto_1fr_auto] items-center gap-2">
           <div className="text-[11px] text-gray-500">{index}</div>
-          <input
+          <DraftTextInput
             type="text"
             inputMode={paramType === 'float_list' ? 'decimal' : 'text'}
             value={row.value}
-            onChange={(event) => {
+            onCommit={(nextValue) => {
               const nextRows = rows.map((candidate) =>
                 candidate.id === row.id
-                  ? { ...candidate, value: event.target.value }
+                  ? { ...candidate, value: nextValue }
                   : candidate
               );
               validateAndCommit(nextRows);
@@ -578,13 +614,13 @@ export function FixedFloatListEditor({
       {labels.map((label, index) => (
         <div key={label} className="grid grid-cols-[72px_1fr] items-center gap-2">
           <div className="text-[11px] text-gray-400">{label}</div>
-          <input
+          <DraftTextInput
             type="text"
             inputMode="decimal"
             value={drafts[index] ?? ''}
-            onChange={(event) => {
+            onCommit={(nextValue) => {
               const nextDrafts = drafts.map((value, draftIndex) =>
-                draftIndex === index ? event.target.value : value,
+                draftIndex === index ? nextValue : value,
               );
               validateAndCommit(nextDrafts);
             }}
@@ -613,11 +649,16 @@ export function StructuredParamEditor({
 }) {
   const [draft, setDraft] = useState(() => formatStructuredValue(currentValue));
   const [error, setError] = useState<string | null>(null);
+  const [isFocused, setIsFocused] = useState(false);
+  const skipNextCommit = useRef(false);
 
   useEffect(() => {
+    if (isFocused) {
+      return;
+    }
     setDraft(formatStructuredValue(currentValue));
     setError(null);
-  }, [currentValue]);
+  }, [currentValue, isFocused]);
 
   const disabledClasses = isRunMode ? 'opacity-50 cursor-not-allowed bg-gray-800' : '';
 
@@ -643,20 +684,47 @@ export function StructuredParamEditor({
     <div>
       <textarea
         value={draft}
+        onFocus={() => setIsFocused(true)}
         onChange={(event) => {
           setDraft(event.target.value);
           if (error) {
             setError(null);
           }
         }}
-        onBlur={commit}
+        onBlur={() => {
+          setIsFocused(false);
+          if (skipNextCommit.current) {
+            skipNextCommit.current = false;
+            setDraft(formatStructuredValue(currentValue));
+            setError(null);
+          } else {
+            commit();
+          }
+        }}
+        onKeyDown={(event) => {
+          // Ctrl/Cmd+Enter commits (mirrors DraftTextarea in
+          // ../common/DraftInputs.tsx). Plain Enter is a newline,
+          // which is what operators expect inside a JSON editor.
+          if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') {
+            event.preventDefault();
+            event.currentTarget.blur();
+            return;
+          }
+          if (event.key === 'Escape') {
+            event.preventDefault();
+            skipNextCommit.current = true;
+            setDraft(formatStructuredValue(currentValue));
+            setError(null);
+            event.currentTarget.blur();
+          }
+        }}
         disabled={isRunMode}
         rows={8}
         spellCheck={false}
         className={`w-full resize-y rounded border border-gray-600 bg-gray-700 px-2 py-1 font-mono text-xs text-white ${disabledClasses}`}
       />
       <div className="mt-1 flex items-center justify-between">
-        <span className="text-[11px] text-gray-500">JSON</span>
+        <span className="text-[11px] text-gray-500">JSON · Ctrl/Cmd+Enter commits · Esc reverts</span>
         {error && <span className="text-[11px] text-red-400">{error}</span>}
       </div>
     </div>

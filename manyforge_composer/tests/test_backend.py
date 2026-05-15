@@ -1338,7 +1338,8 @@ def test_get_full_deployment_includes_model_metadata(client):
     assert data["modelEndpoints"]["selection_model"]["capabilities"][
         "supportsResponseTools"
     ] is True
-    assert data["assistant"]["provider"] == "deterministic-scene-authoring"
+    assert data["assistant"]["provider"] == "openclaw"
+    assert data["assistant"]["endpointAlias"] == "assistant_model"
     assert data["promptTemplates"]["select_scene_object_v1"]["responseTool"]["name"] == "select_scene_object"
 
 

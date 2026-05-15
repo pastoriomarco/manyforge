@@ -8,6 +8,7 @@
 #include <functional>
 #include <map>
 #include <mutex>
+#include <stdexcept>
 #include <thread>
 #include <vector>
 
@@ -103,12 +104,16 @@ class MockContext : public IPlanningContext {
   ObjectStateDTO next_object_state;
   Result<Pose3DTO> next_reference_pose = Result<Pose3DTO>::Ok(Pose3DTO{});
   std::vector<Result<Pose3DTO>> reference_pose_sequence;
+  std::vector<Pose3DTO> fk_sequence;
   JointLimitsDTO next_limits;
   SceneEditResultDTO next_scene_edit;
 
   int get_state_count = 0;
   int validate_count = 0;
   int collision_count = 0;
+  int fk_count = 0;
+  FkRequestDTO last_fk_request;
+  bool throw_fk = false;
 
   RobotStateDTO get_current_state() override {
     ++get_state_count;
@@ -133,7 +138,17 @@ class MockContext : public IPlanningContext {
     return next_collision;
   }
 
-  Pose3DTO forward_kinematics(const FkRequestDTO& /*request*/) override {
+  Pose3DTO forward_kinematics(const FkRequestDTO& request) override {
+    ++fk_count;
+    last_fk_request = request;
+    if (throw_fk) {
+      throw std::runtime_error("fk failed");
+    }
+    if (!fk_sequence.empty()) {
+      auto result = fk_sequence.front();
+      fk_sequence.erase(fk_sequence.begin());
+      return result;
+    }
     return next_fk;
   }
 
@@ -532,6 +547,13 @@ TrajectoryDTO make_test_trajectory() {
   return t;
 }
 
+Pose3DTO make_pose(double x, double y, double z, QuaternionDTO orientation = {0.0, 0.0, 0.0, 1.0}) {
+  Pose3DTO pose;
+  pose.position_m = {x, y, z};
+  pose.orientation = orientation;
+  return pose;
+}
+
 ExecuteRequestDTO make_test_request(const std::string& move_id = "move_1") {
   ExecuteRequestDTO req;
   req.robot_id = "robot1";
@@ -540,6 +562,8 @@ ExecuteRequestDTO make_test_request(const std::string& move_id = "move_1") {
   req.base_frame = "world";
   req.tcp_frame = "tool0";
   req.tolerances.joint_position_tol_rad = 0.1;
+  req.tolerances.translation_tol_m = 0.01;
+  req.tolerances.rotation_tol_rad = 0.01;
   req.speed_profile.velocity_scale = 1.0;
   req.timeouts.planning_timeout_s = 10.0;
   req.cache_mode = CacheMode::kDefault;
@@ -742,6 +766,237 @@ TEST_F(ExecutionKernelTest, Execute_CacheHit_SkipsPlanning) {
   EXPECT_EQ(planner.plan_count, 0);
   EXPECT_GE(context.validate_count, 1);
   EXPECT_EQ(execution.execute_count, 1);
+}
+
+TEST_F(ExecutionKernelTest, Execute_CacheHitPoseGoalWithMatchingEndPose_SkipsPlanning) {
+  cache.store("move_pose_cached", make_test_trajectory());
+  auto req = make_test_request("move_pose_cached");
+  PoseGoalDTO pose_goal;
+  pose_goal.goal = make_pose(0.4, -0.1, 0.2);
+  req.motion = pose_goal;
+  context.next_fk = pose_goal.goal;
+
+  auto result = execute_sync(req);
+
+  ASSERT_TRUE(result.ok());
+  EXPECT_EQ(planner.plan_count, 0);
+  EXPECT_EQ(context.fk_count, 1);
+  ASSERT_EQ(context.last_fk_request.robot_state.positions_rad.size(), 2u);
+  EXPECT_DOUBLE_EQ(context.last_fk_request.robot_state.positions_rad[0], 1.0);
+  EXPECT_DOUBLE_EQ(context.last_fk_request.robot_state.positions_rad[1], 1.0);
+  EXPECT_EQ(execution.execute_count, 1);
+}
+
+TEST_F(ExecutionKernelTest, Execute_CacheHitPoseGoalWithChangedEndPose_InvalidatesAndReplans) {
+  cache.store("move_pose_changed", make_test_trajectory());
+  auto req = make_test_request("move_pose_changed");
+  PoseGoalDTO pose_goal;
+  pose_goal.goal = make_pose(0.45, -0.1, 0.2);
+  req.motion = pose_goal;
+  context.next_fk = make_pose(0.1, -0.1, 0.2);
+
+  auto result = execute_sync(req);
+
+  ASSERT_TRUE(result.ok());
+  EXPECT_EQ(planner.plan_count, 1);
+  EXPECT_EQ(context.fk_count, 1);
+  EXPECT_EQ(kernel.get_metrics().cache_invalidations, 1u);
+  auto refreshed = cache.lookup("move_pose_changed");
+  ASSERT_TRUE(refreshed.has_value());
+}
+
+TEST_F(ExecutionKernelTest, Execute_CacheHitCartesianPathWithMatchingFinalWaypoint_SkipsPlanning) {
+  cache.store("move_cartesian_cached", make_test_trajectory());
+  auto req = make_test_request("move_cartesian_cached");
+  CartesianPathDTO path;
+  path.waypoints = {make_pose(0.2, -0.1, 0.1), make_pose(0.4, -0.1, 0.2)};
+  path.max_translation_step_m = 0.01;
+  path.max_rotation_step_rad = 0.01;
+  req.motion = path;
+  context.next_fk = path.waypoints.back();
+
+  auto result = execute_sync(req);
+
+  ASSERT_TRUE(result.ok());
+  EXPECT_EQ(planner.plan_count, 0);
+  EXPECT_EQ(context.fk_count, 1);
+  EXPECT_EQ(execution.execute_count, 1);
+}
+
+TEST_F(ExecutionKernelTest, Execute_CacheHitCartesianPathWithChangedFinalWaypoint_InvalidatesAndReplans) {
+  cache.store("move_cartesian_changed", make_test_trajectory());
+  auto req = make_test_request("move_cartesian_changed");
+  CartesianPathDTO path;
+  path.waypoints = {make_pose(0.2, -0.1, 0.1), make_pose(0.45, -0.1, 0.2)};
+  path.max_translation_step_m = 0.01;
+  path.max_rotation_step_rad = 0.01;
+  req.motion = path;
+  context.next_fk = make_pose(0.1, -0.1, 0.2);
+
+  auto result = execute_sync(req);
+
+  ASSERT_TRUE(result.ok());
+  EXPECT_EQ(planner.plan_count, 1);
+  EXPECT_EQ(context.fk_count, 1);
+  EXPECT_EQ(kernel.get_metrics().cache_invalidations, 1u);
+}
+
+TEST_F(ExecutionKernelTest, Execute_CacheHitRelativeMoveWithUnchangedResolvedGoal_SkipsPlanning) {
+  cache.store("move_relative_same", make_test_trajectory());
+  auto req = make_test_request("move_relative_same");
+  RelativeMoveDTO relative_move;
+  relative_move.target_reference.type = ReferenceDTO::Type::kObject;
+  relative_move.target_reference.id = "box";
+  relative_move.offset.position_m = {0.0, 0.0, 0.1};
+  relative_move.offset.orientation = {0.0, 0.0, 0.0, 1.0};
+  req.motion = relative_move;
+
+  context.next_reference_pose = Result<Pose3DTO>::Ok(make_pose(0.3, -0.2, 0.15));
+  context.next_fk = make_pose(0.3, -0.2, 0.25);
+
+  auto result = execute_sync(req);
+
+  ASSERT_TRUE(result.ok());
+  EXPECT_EQ(planner.plan_count, 0);
+  EXPECT_EQ(context.fk_count, 1);
+  EXPECT_EQ(execution.execute_count, 1);
+}
+
+TEST_F(ExecutionKernelTest, Execute_CacheHitRelativeMoveWithMovedObject_InvalidatesAndReplans) {
+  cache.store("move_relative_changed", make_test_trajectory());
+  auto req = make_test_request("move_relative_changed");
+  RelativeMoveDTO relative_move;
+  relative_move.target_reference.type = ReferenceDTO::Type::kObject;
+  relative_move.target_reference.id = "box";
+  relative_move.offset.position_m = {0.0, 0.0, 0.1};
+  relative_move.offset.orientation = {0.0, 0.0, 0.0, 1.0};
+  req.motion = relative_move;
+
+  context.next_reference_pose = Result<Pose3DTO>::Ok(make_pose(0.5, -0.2, 0.15));
+  context.next_fk = make_pose(0.3, -0.2, 0.25);
+
+  auto result = execute_sync(req);
+
+  ASSERT_TRUE(result.ok());
+  EXPECT_EQ(planner.plan_count, 1);
+  ASSERT_TRUE(std::holds_alternative<PoseGoalDTO>(planner.last_request.motion));
+  const auto& pose_goal = std::get<PoseGoalDTO>(planner.last_request.motion);
+  EXPECT_DOUBLE_EQ(pose_goal.goal.position_m.x_m, 0.5);
+  EXPECT_DOUBLE_EQ(pose_goal.goal.position_m.y_m, -0.2);
+  EXPECT_DOUBLE_EQ(pose_goal.goal.position_m.z_m, 0.25);
+  EXPECT_EQ(kernel.get_metrics().cache_invalidations, 1u);
+}
+
+TEST_F(ExecutionKernelTest, Execute_RelativeMoveMissingReference_DoesNotUseStaleCache) {
+  cache.store("move_missing_reference", make_test_trajectory());
+  auto req = make_test_request("move_missing_reference");
+  RelativeMoveDTO relative_move;
+  relative_move.target_reference.type = ReferenceDTO::Type::kObject;
+  relative_move.target_reference.id = "missing_box";
+  relative_move.offset.position_m = {0.0, 0.0, 0.1};
+  relative_move.offset.orientation = {0.0, 0.0, 0.0, 1.0};
+  req.motion = relative_move;
+
+  context.next_reference_pose = Result<Pose3DTO>::Err(
+      ErrorDTO{kErrorMissingReference, "Object reference not found", {}});
+
+  std::vector<KernelEvent> events;
+  kernel.subscribe_events([&](const KernelEvent& e) {
+    events.push_back(e);
+  });
+
+  auto result = execute_sync(req);
+
+  ASSERT_FALSE(result.ok());
+  EXPECT_EQ(result.error().code, kErrorMissingReference);
+  EXPECT_EQ(planner.plan_count, 0);
+  EXPECT_EQ(execution.execute_count, 0);
+  EXPECT_FALSE(cache.lookup("move_missing_reference").has_value());
+  EXPECT_EQ(kernel.get_metrics().cache_invalidations, 1u);
+  EXPECT_EQ(kernel.get_status().state, ExecutionState::kIdle);
+  bool found_cache_invalidated = false;
+  for (const auto& event : events) {
+    if (event.type == KernelEventType::kCacheInvalidated) {
+      found_cache_invalidated = true;
+      EXPECT_EQ(event.execution_id, 0u);
+      EXPECT_EQ(event.details.at("move_id"), "move_missing_reference");
+      EXPECT_EQ(event.details.at("reason"), "goal_unverifiable");
+      break;
+    }
+  }
+  EXPECT_TRUE(found_cache_invalidated);
+}
+
+TEST_F(ExecutionKernelTest, Execute_CacheHitFkFailure_InvalidatesAndReplans) {
+  cache.store("move_fk_failure", make_test_trajectory());
+  auto req = make_test_request("move_fk_failure");
+  PoseGoalDTO pose_goal;
+  pose_goal.goal = make_pose(0.4, -0.1, 0.2);
+  req.motion = pose_goal;
+  context.throw_fk = true;
+
+  auto result = execute_sync(req);
+
+  ASSERT_TRUE(result.ok());
+  EXPECT_EQ(planner.plan_count, 1);
+  EXPECT_EQ(context.fk_count, 1);
+  EXPECT_EQ(kernel.get_metrics().cache_invalidations, 1u);
+}
+
+TEST_F(ExecutionKernelTest, Execute_CacheHitJointGoalComparesByJointName) {
+  auto cached = make_test_trajectory();
+  cached.joint_names = {"j2", "j1"};
+  cached.waypoints.front().positions_rad = {0.0, 0.0};
+  cached.waypoints.back().positions_rad = {2.0, 1.0};
+  cache.store("move_joint_named", cached);
+
+  auto req = make_test_request("move_joint_named");
+  req.motion = JointGoalDTO{{"j1", "j2"}, {1.0, 2.0}};
+
+  auto result = execute_sync(req);
+
+  ASSERT_TRUE(result.ok());
+  EXPECT_EQ(planner.plan_count, 0);
+  EXPECT_EQ(execution.execute_count, 1);
+}
+
+TEST_F(ExecutionKernelTest, Execute_CacheHitJointGoalNameMismatch_InvalidatesAndReplans) {
+  auto cached = make_test_trajectory();
+  cached.joint_names = {"j3", "j1"};
+  cache.store("move_joint_mismatch", cached);
+  context.current_state.joint_names = {"j3", "j1"};
+
+  auto req = make_test_request("move_joint_mismatch");
+  req.motion = JointGoalDTO{{"j1", "j2"}, {1.0, 1.0}};
+
+  auto result = execute_sync(req);
+
+  ASSERT_TRUE(result.ok());
+  EXPECT_EQ(planner.plan_count, 1);
+  EXPECT_EQ(kernel.get_metrics().cache_invalidations, 1u);
+}
+
+TEST_F(ExecutionKernelTest, Execute_CacheHitNamedTarget_InvalidatesAndReplans) {
+  cache.store("move_named_target", make_test_trajectory());
+  auto req = make_test_request("move_named_target");
+  req.motion = NamedTargetDTO{"ready"};
+
+  auto result = execute_sync(req);
+
+  ASSERT_TRUE(result.ok());
+  EXPECT_EQ(planner.plan_count, 1);
+  EXPECT_EQ(kernel.get_metrics().cache_invalidations, 1u);
+}
+
+TEST_F(ExecutionKernelTest, Execute_CacheHitEmptyTrajectory_InvalidatesAndReplans) {
+  cache.store("move_empty_cached", TrajectoryDTO{});
+  auto req = make_test_request("move_empty_cached");
+
+  auto result = execute_sync(req);
+
+  ASSERT_TRUE(result.ok());
+  EXPECT_EQ(planner.plan_count, 1);
+  EXPECT_EQ(kernel.get_metrics().cache_invalidations, 1u);
 }
 
 TEST_F(ExecutionKernelTest, Execute_CacheHitValidationFailure_BlocksExecution) {
@@ -1743,6 +1998,34 @@ TEST_F(ExecutionKernelTest, Events_CacheInvalidatedEvent) {
     if (e.type == KernelEventType::kCacheInvalidated) {
       found_cache_invalidated = true;
       EXPECT_EQ(e.details.at("move_id"), "invalidate_test");
+      EXPECT_EQ(e.details.at("reason"), "validation_failed");
+      break;
+    }
+  }
+  EXPECT_TRUE(found_cache_invalidated);
+}
+
+TEST_F(ExecutionKernelTest, Events_CacheInvalidatedEventIncludesCompatibilityReason) {
+  cache.store("goal_changed_event", make_test_trajectory());
+  auto req = make_test_request("goal_changed_event");
+  PoseGoalDTO pose_goal;
+  pose_goal.goal = make_pose(0.45, -0.1, 0.2);
+  req.motion = pose_goal;
+  context.next_fk = make_pose(0.1, -0.1, 0.2);
+
+  std::vector<KernelEvent> events;
+  kernel.subscribe_events([&](const KernelEvent& e) {
+    events.push_back(e);
+  });
+
+  execute_sync(req);
+
+  bool found_cache_invalidated = false;
+  for (const auto& e : events) {
+    if (e.type == KernelEventType::kCacheInvalidated) {
+      found_cache_invalidated = true;
+      EXPECT_EQ(e.details.at("move_id"), "goal_changed_event");
+      EXPECT_EQ(e.details.at("reason"), "goal_changed");
       break;
     }
   }

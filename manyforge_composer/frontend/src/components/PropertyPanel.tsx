@@ -43,6 +43,7 @@ import {
   SUPPORTED_PROGRAM_PARAMETER_TYPES,
 } from './property/ProgramParameterBindingEditor';
 import { profileSatisfies } from '../utils/profiles';
+import { DraftTextInput } from './common/DraftInputs';
 
 const KIND_COLORS: Record<string, string> = {
   sequence: 'border-blue-500 bg-blue-900/50',
@@ -168,10 +169,10 @@ function DeploymentModelEndpointAliasEditor({
   if (options.length === 0) {
     return (
       <div className="space-y-2">
-        <input
+        <DraftTextInput
           type="text"
           value={currentAlias}
-          onChange={(e) => onCommit(e.target.value)}
+          onCommit={onCommit}
           disabled={isRunMode}
           className={`w-full rounded border border-gray-600 bg-gray-700 px-2 py-1 text-sm text-white ${isRunMode ? 'opacity-50 cursor-not-allowed bg-gray-800' : ''}`}
         />
@@ -266,10 +267,10 @@ function DeploymentPromptTemplateEditor({
   if (options.length === 0) {
     return (
       <div className="space-y-2">
-        <input
+        <DraftTextInput
           type="text"
           value={currentTemplateId}
-          onChange={(e) => onCommit(e.target.value)}
+          onCommit={onCommit}
           disabled={isRunMode}
           className={`w-full rounded border border-gray-600 bg-gray-700 px-2 py-1 text-sm text-white ${isRunMode ? 'opacity-50 cursor-not-allowed bg-gray-800' : ''}`}
         />
@@ -473,10 +474,10 @@ export function PropertyPanel({ onCollapse }: { onCollapse: () => void }) {
     removeNode(selectedNodeId);
   }, [selectedNodeId, removeNode]);
 
-  const handleLabelChange = useCallback(
-    (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleLabelCommit = useCallback(
+    (label: string) => {
       if (isRunMode || !selectedNodeId) return;
-      updateNodeLabel(selectedNodeId, e.target.value);
+      updateNodeLabel(selectedNodeId, label);
     },
     [selectedNodeId, updateNodeLabel, isRunMode],
   );
@@ -768,14 +769,14 @@ export function PropertyPanel({ onCollapse }: { onCollapse: () => void }) {
             }
             onCreateProgramParameter={addProgramParameter}
           >
-            <input
+            <DraftTextInput
               type="text"
               value={
                 typeof currentValue === 'string' && !currentKeyRefId && !currentFieldRef
                   ? currentValue
                   : ''
               }
-              onChange={(event) => handleParamChange(param.name, event.target.value)}
+              onCommit={(value) => handleParamChange(param.name, value)}
               disabled={isRunMode}
               className={`w-full rounded border border-gray-600 bg-gray-700 px-2 py-1 text-sm text-white ${isRunMode ? 'opacity-50 cursor-not-allowed bg-gray-800' : ''}`}
               placeholder="object_id"
@@ -980,11 +981,11 @@ export function PropertyPanel({ onCollapse }: { onCollapse: () => void }) {
           fieldLabel="Declared blackboard field"
           createDefaultLiteral={() => ''}
           renderLiteralEditor={(literalValue, onCommitLiteral) => (
-            <input
+            <DraftTextInput
               type="text"
               value={typeof literalValue === 'string' ? literalValue : ''}
               disabled={isRunMode}
-              onChange={(event) => onCommitLiteral(event.target.value)}
+              onCommit={onCommitLiteral}
               className={`w-full rounded border border-gray-600 bg-gray-700 px-2 py-1 text-sm text-white ${isRunMode ? 'opacity-50 cursor-not-allowed bg-gray-800' : ''}`}
             />
           )}
@@ -1163,10 +1164,10 @@ export function PropertyPanel({ onCollapse }: { onCollapse: () => void }) {
 
       case 'string':
         return (
-          <input
+          <DraftTextInput
             type="text"
             value={String(currentValue) || ''}
-            onChange={(e) => handleParamChange(param.name, e.target.value)}
+            onCommit={(value) => handleParamChange(param.name, value)}
             disabled={isRunMode}
             className={`w-full bg-gray-700 border border-gray-600 text-white rounded px-2 py-1 text-sm ${disabledClasses}`}
             placeholder={param.description}
@@ -1275,10 +1276,10 @@ export function PropertyPanel({ onCollapse }: { onCollapse: () => void }) {
 
       default:
         return (
-          <input
+          <DraftTextInput
             type="text"
             value={String(currentValue) || ''}
-            onChange={(e) => handleParamChange(param.name, e.target.value)}
+            onCommit={(value) => handleParamChange(param.name, value)}
             disabled={isRunMode}
             className={`w-full bg-gray-700 border border-gray-600 text-white rounded px-2 py-1 text-sm ${disabledClasses}`}
             placeholder={param.description}
@@ -1323,10 +1324,10 @@ export function PropertyPanel({ onCollapse }: { onCollapse: () => void }) {
             </button>
           </div>
         </div>
-        <input
+        <DraftTextInput
           type="text"
           value={selectedNode.data.label as string}
-          onChange={handleLabelChange}
+          onCommit={handleLabelCommit}
           disabled={isRunMode}
           className={`w-full bg-gray-700 border border-gray-600 text-white rounded px-2 py-1 text-sm font-medium ${isRunMode ? 'opacity-50 cursor-not-allowed bg-gray-800' : ''}`}
         />

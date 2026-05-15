@@ -783,6 +783,7 @@ class TestNativeSceneEdits:
             "dynamic_box",
             [0.0, 0.0, 0.10],
             [180.0, 0.0, -90.0],
+            cache_mode="default",
         )
         result = native_kernel.execute(req)
         assert result.ok is True
