@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import type { Node } from '@xyflow/react';
 import { useShallow } from 'zustand/react/shallow';
 import { useCatalogStore } from '../store/catalogStore';
-import { useCycleStore } from '../store/cycleStore';
+import { useEditLocked } from '../store/cycleStore';
 import { useProgramStore } from '../store/programStore';
 import type {
   CatalogEntry,
@@ -605,8 +605,7 @@ export function ProgramPanel() {
     })),
   );
   const entries = useCatalogStore((s) => s.entries);
-  const state = useCycleStore((s) => s.state);
-  const editLocked = state === 'running' || state === 'interrupt_handler' || state === 'direct_control';
+  const editLocked = useEditLocked();
 
   const parameterUsageMap = useMemo(() => collectParameterUsages(nodes), [nodes]);
   const { namespaceUsages, keyUsages, fieldUsages } = useMemo(

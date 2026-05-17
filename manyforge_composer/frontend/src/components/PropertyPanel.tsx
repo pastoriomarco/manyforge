@@ -134,6 +134,126 @@ function finiteNumber(value: unknown): number | null {
   return null;
 }
 
+const MODIFICATION_POLICY_OPTIONS = {
+  runtime_override: ['forbidden', 'human_approval', 'llm_allowed'] as const,
+  persistent_edit: ['forbidden', 'human_approval', 'llm_allowed'] as const,
+  intervention_delegate: ['forbidden', 'human_only', 'llm_allowed', 'program_only'] as const,
+};
+
+type ModificationPolicyKey = keyof typeof MODIFICATION_POLICY_OPTIONS;
+
+// Hover-tooltip copy for the three policy keys + each of their
+// enum values. Kept short enough to read as a tooltip — the
+// authoritative semantics live in `manyforge_behavior/program.py`
+// (validators) and `cycle_manager.py` (enforcement points).
+const POLICY_KEY_HELP: Record<ModificationPolicyKey, string> = {
+  runtime_override:
+    'Who can stage param overrides for this node at runtime. '
+    + 'Overrides apply on the next cycle without rewriting the program YAML.',
+  persistent_edit:
+    'Who can change this node’s params in the program draft. '
+    + 'Persistent edits land on the YAML when the operator saves.',
+  intervention_delegate:
+    'Who can run a direct-control intervention that targets this '
+    + 'node — e.g. operator joint-jog, recovery sub-trees.',
+};
+
+const POLICY_VALUE_HELP: Record<string, string> = {
+  forbidden:
+    'Default. No one may apply this kind of change to this node. '
+    + 'API calls that try get a 409 with the "does not allow" message.',
+  human_approval:
+    'Operator may stage / edit, but activation requires explicit '
+    + 'human approval (the existing Composer review flow).',
+  llm_allowed:
+    'The assistant (LLM) may stage / edit autonomously, subject '
+    + 'to its assistant-mode catalog. Implies human_approval too.',
+  human_only:
+    'Only an operator may delegate an intervention here. '
+    + 'LLM-driven delegations are rejected.',
+  program_only:
+    'Only the program itself may trigger an intervention here '
+    + '(recovery sub-trees, error-handler branches).',
+};
+
+/**
+ * Edit a node's `modification_policy` block from the side panel.
+ *
+ * Three dropdowns mapping to the three keys defined by ManyForge's
+ * program schema. Empty/forbidden values mean the corresponding
+ * runtime-override, persistent-edit, or intervention-delegate flow
+ * is gated off — the node card's "Stage as runtime override" etc.
+ * surface their server-side rejection of those calls when the
+ * policy doesn't allow them. Operator flips to `human_approval`
+ * (or `human_only` for delegate) to enable the flow.
+ *
+ * Storing `forbidden` (= default) verbatim is harmless — the
+ * program-load path treats explicit and missing-key identically.
+ * We keep the explicit value so the operator can see what they
+ * picked when re-opening the node.
+ */
+function ModificationPolicySection({
+  selectedNode,
+  onChange,
+  isRunMode,
+}: {
+  selectedNode: { data: { modificationPolicy?: Record<string, string> } };
+  onChange: (policy: Record<string, string>) => void;
+  isRunMode: boolean;
+}) {
+  const current = (selectedNode.data.modificationPolicy ?? {}) as Record<string, string>;
+  function handleSelect(key: ModificationPolicyKey, value: string): void {
+    onChange({ ...current, [key]: value });
+  }
+  return (
+    <div className="border-t border-gray-800 p-3">
+      <h3
+        className="text-xs uppercase tracking-wide text-gray-400"
+        title="Hover any field below for what it controls. Defaults to all-forbidden when not set in the program YAML."
+      >
+        Modification policy
+      </h3>
+      <p className="mt-1 text-[10px] text-gray-500">
+        Hover a row label or option for details.
+      </p>
+      <div className="mt-2 space-y-2">
+        {(Object.entries(MODIFICATION_POLICY_OPTIONS) as Array<
+          [ModificationPolicyKey, readonly string[]]
+        >).map(([key, options]) => {
+          const value = current[key] ?? 'forbidden';
+          return (
+            <label
+              key={key}
+              className="flex items-center justify-between gap-2 text-[11px] text-gray-300"
+              title={POLICY_KEY_HELP[key]}
+            >
+              <span className="font-mono text-gray-400">{key}</span>
+              <select
+                value={value}
+                disabled={isRunMode}
+                onChange={(e) => handleSelect(key, e.target.value)}
+                title={POLICY_VALUE_HELP[value] ?? POLICY_KEY_HELP[key]}
+                className="rounded border border-gray-700 bg-gray-800 px-2 py-1 text-[11px] text-gray-200 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {options.map((opt) => (
+                  <option
+                    key={opt}
+                    value={opt}
+                    title={POLICY_VALUE_HELP[opt]}
+                  >
+                    {opt}
+                  </option>
+                ))}
+              </select>
+            </label>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+
 function DeploymentModelEndpointAliasEditor({
   currentValue,
   isRunMode,
@@ -336,6 +456,7 @@ export function PropertyPanel({ onCollapse }: { onCollapse: () => void }) {
     blackboardKeys,
     updateNodeParams,
     updateNodeLabel,
+    updateNodeModificationPolicy,
     removeNode,
     addProgramParameter,
     programInfo,
@@ -1341,9 +1462,16 @@ export function PropertyPanel({ onCollapse }: { onCollapse: () => void }) {
         </div>
       )}
 
-      {/* Parameters */}
-      {catalogEntry && catalogEntry.parameters.length > 0 && (
-        <div className="flex-1 overflow-y-auto p-3">
+      {/* Card body — single scroll area that wraps both the
+          parameters editor (rendered when the node's catalog entry
+          declares any) and the modification-policy section at the
+          very end. Putting the policy inside the same scroll
+          container ties it to the card visually (it's part of the
+          node, not a panel-wide footer) while keeping it as the
+          last thing the operator scrolls into. */}
+      <div className="flex-1 overflow-y-auto p-3">
+        {catalogEntry && catalogEntry.parameters.length > 0 && (
+          <>
           <h3 className="text-xs text-gray-400 uppercase mb-2">Parameters</h3>
           {selectedNode.data.catalogId === 'move_manipulator_action' && (
             <div className="mb-3 rounded border border-gray-700 bg-gray-900/50 px-3 py-2 text-[11px] text-gray-400">
@@ -1443,8 +1571,23 @@ export function PropertyPanel({ onCollapse }: { onCollapse: () => void }) {
               );
             })}
           </div>
-        </div>
-      )}
+          </>
+        )}
+
+        {/* Modification policy lives at the foot of the card body,
+            inside the same scroll container so it's part of the node
+            and not a panel-wide always-visible footer. Defaults to
+            all-forbidden when not set; flipping a value here surfaces
+            via the editor's Apply / Save flow the same as a parameter
+            edit. */}
+        <ModificationPolicySection
+          selectedNode={selectedNode}
+          onChange={(policy) =>
+            updateNodeModificationPolicy(selectedNode.id, policy)
+          }
+          isRunMode={isRunMode}
+        />
+      </div>
     </div>
   );
 }

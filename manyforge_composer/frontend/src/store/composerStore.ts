@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 import { useCycleStore } from './cycleStore';
 import { useProgramStore } from './programStore';
+import { useViewerSelectionStore } from './viewerSelectionStore';
 
 type NodeStatus = 'idle' | 'running' | 'success' | 'failure';
 export type EdgeStyle = 'smoothstep' | 'default' | 'simplebezier' | 'straight' | 'step';
@@ -45,16 +46,31 @@ export const useComposerStore = create<ComposerStore>((set) => ({
   },
 }));
 
-// Subscribe to cycleStore changes to auto-update mode and nodeStatuses
+// Subscribe to cycleStore changes to auto-update mode and nodeStatuses.
+// We also treat an active TCP-jog gizmo drag as "run" so the UI doesn't
+// flicker back to compose between successive jog commands while the
+// operator is still dragging (the backend ping-pongs idle↔direct_control
+// in the gaps between motion segments).
+function computeMode(): 'compose' | 'run' {
+  const cycleState = useCycleStore.getState().state;
+  const dragging = useViewerSelectionStore.getState().isDraggingGizmo;
+  if (dragging) return 'run';
+  return cycleState === 'idle' ? 'compose' : 'run';
+}
+
+function syncMode(): void {
+  const newMode = computeMode();
+  if (useComposerStore.getState().mode !== newMode) {
+    useComposerStore.setState({ mode: newMode });
+  }
+}
+
 export function initComposerStore() {
+  const unsubscribeDrag = useViewerSelectionStore.subscribe(syncMode);
   const unsubscribe = useCycleStore.subscribe((state) => {
     const cycleState = state.state;
-    const newMode: 'compose' | 'run' = cycleState === 'idle' ? 'compose' : 'run';
-    
-    if (useComposerStore.getState().mode !== newMode) {
-      useComposerStore.setState({ mode: newMode });
-    }
-    
+    syncMode();
+
     const wsStatuses = state.nodeStatuses || {};
     if (Object.keys(wsStatuses).length > 0) {
       // Build label→flowId lookup from current program nodes
@@ -78,6 +94,9 @@ export function initComposerStore() {
       useComposerStore.getState().clearNodeStatuses();
     }
   });
-  
-  return unsubscribe;
+
+  return () => {
+    unsubscribe();
+    unsubscribeDrag();
+  };
 }

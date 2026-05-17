@@ -771,7 +771,7 @@ export function AssistantOverlay() {
         <button
           type="button"
           onClick={() => setOpen(true)}
-          className="fixed bottom-20 right-6 z-40 flex h-12 w-12 items-center justify-center rounded-full border border-blue-400/70 bg-blue-600 text-sm font-semibold text-white shadow-xl shadow-black/40 transition hover:bg-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-300"
+          className="fixed bottom-20 right-20 z-40 flex h-12 w-12 items-center justify-center rounded-full border border-blue-400/70 bg-blue-600 text-sm font-semibold text-white shadow-xl shadow-black/40 transition hover:bg-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-300"
           title="Open assistant"
         >
           AI

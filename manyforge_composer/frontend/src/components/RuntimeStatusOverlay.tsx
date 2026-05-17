@@ -117,7 +117,7 @@ export function RuntimeStatusOverlay() {
         <button
           type="button"
           onClick={() => setOpen(true)}
-          className={`fixed bottom-3 right-6 z-40 flex h-12 w-12 items-center justify-center rounded-md border text-[11px] font-semibold shadow-xl shadow-black/40 transition focus:outline-none focus:ring-2 ${readinessClasses(readiness)}`}
+          className={`fixed bottom-20 right-6 z-40 flex h-12 w-12 items-center justify-center rounded-md border text-[11px] font-semibold shadow-xl shadow-black/40 transition focus:outline-none focus:ring-2 ${readinessClasses(readiness)}`}
           title={status?.userMessage || error || 'Runtime status'}
         >
           {buttonLabel}

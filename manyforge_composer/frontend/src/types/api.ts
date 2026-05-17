@@ -539,7 +539,55 @@ export interface SceneObjectState {
 export interface SceneStateResponse {
   robot?: SceneRobotState | null;
   objects: SceneObjectState[];
+  link_poses?: Record<string, { position_m: number[]; orientation_xyzw: number[] }>;
   timestamp_ns: number;
+}
+
+export type SceneUrdfPrimitive =
+  | { type: 'box'; size_m: number[] }
+  | { type: 'cylinder'; radius_m: number; length_m: number }
+  | { type: 'sphere'; radius_m: number };
+
+export interface SceneUrdfVisual {
+  index: number;
+  mesh_url: string | null;
+  primitive: SceneUrdfPrimitive | null;
+  visual_origin: {
+    position_m: number[];
+    orientation_rpy_rad: number[];
+  };
+}
+
+export interface SceneUrdfLink {
+  name: string;
+  visuals: SceneUrdfVisual[];
+}
+
+export type SceneUrdfJointType =
+  | 'revolute'
+  | 'prismatic'
+  | 'continuous'
+  | 'fixed'
+  | 'floating'
+  | 'planar';
+
+export interface SceneUrdfJoint {
+  name: string;
+  type: SceneUrdfJointType | string;
+  axis: number[];
+  parent_link: string;
+  child_link: string;
+  limit_lower: number | null;
+  limit_upper: number | null;
+  effort_limit: number | null;
+  velocity_limit: number | null;
+}
+
+export interface SceneUrdfManifest {
+  robot_id: string | null;
+  root_link: string;
+  links: SceneUrdfLink[];
+  joints?: SceneUrdfJoint[];
 }
 
 export interface SceneEditRequest {
@@ -566,6 +614,7 @@ export interface SceneFrameState {
   roles: string[];
   viewerVisible: boolean;
   poseAvailable: boolean;
+  poseInWorld?: { position_m: number[]; orientation_xyzw: number[] } | null;
 }
 
 export interface SceneFramesResponse {

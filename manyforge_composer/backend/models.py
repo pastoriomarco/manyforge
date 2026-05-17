@@ -403,6 +403,50 @@ class InterventionExecuteRequest(BaseModel):
     )
 
 
+class JointJogRequest(BaseModel):
+    """Operator-driven single-joint jog from the robot-control overlay.
+
+    Day 5b of the native-viewer migration: the panel's slider commits
+    POST one of these. The backend reads the current full joint state
+    from the kernel, applies the requested partial update, and submits
+    a one-leaf intervention tree (single `move_manipulator_action` with
+    `motion_type=joint_goal`) through the existing intervention
+    machinery. No new kernel API is needed because the kernel already
+    drives joints exclusively through behavior-tree execution.
+    """
+
+    model_config = _ALIAS_CFG
+    joint_names: List[str] = Field(alias="jointNames", min_length=1)
+    joint_positions_rad: List[float] = Field(alias="jointPositionsRad", min_length=1)
+    # Optional lease + auth fields. Defaults are sensible for an
+    # operator dragging a slider with no preset principal.
+    lease_timeout_ms: int = Field(default=10_000, alias="leaseTimeoutMs", gt=0)
+    principal_id: str = Field(default="composer-viewer", alias="principalId", min_length=1)
+
+
+class CartesianJogRequest(BaseModel):
+    """Operator-driven Cartesian end-effector jog from the robot-control
+    overlay's Cartesian tab (Day 5c.2).
+
+    The viewer side sends a target TCP pose expressed in the robot's
+    base frame (the same frame the catalog's `pose_goal` parameter
+    speaks). For now, the frontend converts world-frame gizmo poses
+    to base frame using the kernel's known base pose before POSTing
+    — keeps the backend small. The backend builds a one-leaf
+    intervention tree with `move_manipulator_action(motion_type=
+    pose_goal, pose_goal=<pose>)` and submits via the existing
+    cycle_manager.execute_intervention machinery.
+    """
+
+    model_config = _ALIAS_CFG
+    position_m: List[float] = Field(alias="positionM", min_length=3, max_length=3)
+    orientation_xyzw: List[float] = Field(
+        alias="orientationXyzw", min_length=4, max_length=4
+    )
+    lease_timeout_ms: int = Field(default=10_000, alias="leaseTimeoutMs", gt=0)
+    principal_id: str = Field(default="composer-viewer", alias="principalId", min_length=1)
+
+
 class InterventionPromoteRequest(BaseModel):
     model_config = _ALIAS_CFG
     session_id: Optional[str] = Field(default=None, alias="sessionId")
@@ -806,6 +850,7 @@ class SceneRobotResponse(BaseModel):
 class SceneStateResponse(BaseModel):
     robot: Optional[SceneRobotResponse] = None
     objects: List[SceneObjectResponse] = Field(default_factory=list)
+    link_poses: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
     timestamp_ns: int
 
 
@@ -815,6 +860,11 @@ class SceneFrameResponse(BaseModel):
     roles: List[str] = Field(default_factory=list)
     viewer_visible: bool = Field(alias="viewerVisible")
     pose_available: bool = Field(alias="poseAvailable")
+    # Day-4: native viewer reads frame poses from here to render axes
+    # helpers per frame. None for frames the kernel can't FK-resolve
+    # (e.g. before a deployment is loaded). Keyed by `position_m` +
+    # `orientation_xyzw` to match the scene-state pose convention.
+    pose_in_world: Optional[Dict[str, Any]] = Field(default=None, alias="poseInWorld")
 
 
 class SceneFramesResponse(BaseModel):

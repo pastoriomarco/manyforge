@@ -258,3 +258,6 @@ tree:
       velocity_scale: ${param:velocity_scale}
       planning_timeout_s: 10
       execution_timeout_s: 30
+    modification_policy:
+      runtime_override: human_approval
+      persistent_edit: human_approval

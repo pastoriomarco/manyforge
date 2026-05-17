@@ -1,6 +1,6 @@
 import { useCallback, useState } from 'react';
 import { api } from '../api/client';
-import { useCycleStore } from '../store/cycleStore';
+import { useCycleStore, useEditLocked } from '../store/cycleStore';
 import { useComposerStore } from '../store/composerStore';
 import { useProgramStore } from '../store/programStore';
 import { useDeploymentStore } from '../store/deploymentStore';
@@ -23,7 +23,7 @@ interface BrowserSession {
 }
 
 export function ControlBar() {
-  const { state, error } = useCycleStore();
+  const { error } = useCycleStore();
   const { edgeStyle, setEdgeStyle } = useComposerStore();
   const {
     nodes,
@@ -521,7 +521,8 @@ export function ControlBar() {
     savedTree,
   ]);
 
-  const editLocked = state === 'running' || state === 'interrupt_handler' || state === 'direct_control' || busy;
+  const cycleEditLocked = useEditLocked();
+  const editLocked = cycleEditLocked || busy;
   const canSaveAs = (!editLocked && !!programInfo) || (!editLocked && !!deployment);
 
   return (
@@ -611,8 +612,16 @@ export function ControlBar() {
         </span>
 
         {programLoading && (
-          <span className="text-gray-400 text-sm ml-auto">Loading program...</span>
+          <span className="text-gray-400 text-sm">Loading program...</span>
         )}
+
+        {/* Cycle controls — pushed right so they sit next to the
+            floating "Ready" overlay. Run/Stop/Reset + velocity-scale
+            slider were missing from the Composer UI (only existed as
+            backend routes + cycleStore actions); landing them here
+            gives the operator parity with the legacy Viser GUI's
+            control panel without a separate overlay. */}
+        <CycleControls />
 
         {browserSession && (
           <FileBrowserDialog
@@ -646,5 +655,77 @@ export function ControlBar() {
         )}
         </div>
       </div>
+  );
+}
+
+/**
+ * Cycle-control surface: Run / Stop / Reset + velocity-scale slider.
+ *
+ * Sits in the bottom bar, pushed right with `ml-auto` so it lands
+ * next to the floating <RuntimeStatusOverlay /> "Ready" indicator
+ * at bottom-right of the screen. Button enabled-state mirrors the
+ * cycle-state machine: Run only fires from idle/stopped, Stop from
+ * running / interrupt_handler / direct_control, Reset from any
+ * state except where the kernel forbids it (the backend returns
+ * 409 in that case; we let it surface via the cycle store's error).
+ */
+function CycleControls() {
+  const { state, velocityScale, run, stop, reset, setVelocityScale, error } = useCycleStore();
+  const canRun = state === 'idle' || state === 'stopped';
+  const canStop = state === 'running' || state === 'interrupt_handler' || state === 'direct_control';
+
+  return (
+    <div className="ml-auto flex items-center gap-2">
+      <button
+        type="button"
+        onClick={() => void run()}
+        disabled={!canRun}
+        title={canRun ? 'Start the loaded program' : `Cycle is ${state}`}
+        className="rounded bg-emerald-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-emerald-500 disabled:cursor-not-allowed disabled:bg-gray-600"
+      >
+        Run
+      </button>
+      <button
+        type="button"
+        onClick={() => void stop()}
+        disabled={!canStop}
+        title={canStop ? 'Stop the active cycle' : `Cycle is ${state}`}
+        className="rounded bg-orange-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-orange-500 disabled:cursor-not-allowed disabled:bg-gray-600"
+      >
+        Stop
+      </button>
+      <button
+        type="button"
+        onClick={() => void reset()}
+        title="Reset the cycle to its initial state"
+        className="rounded bg-rose-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-rose-500"
+      >
+        Reset
+      </button>
+      <label className="ml-2 flex items-center gap-1.5 text-xs text-gray-300" title="Velocity scale (0.1 - 1.0)">
+        <span className="font-mono text-[11px] text-gray-400">vel</span>
+        <input
+          type="range"
+          min={0.1}
+          max={1.0}
+          step={0.05}
+          value={velocityScale}
+          onChange={(e) => void setVelocityScale(Number(e.target.value))}
+          className="w-24 accent-emerald-500"
+        />
+        <span className="w-8 text-right font-mono text-[11px]">
+          {velocityScale.toFixed(2)}
+        </span>
+      </label>
+      {error && (
+        <span
+          className="ml-2 truncate text-[11px] text-red-300"
+          title={error}
+          style={{ maxWidth: '20ch' }}
+        >
+          ⚠ {error.slice(0, 24)}
+        </span>
+      )}
+    </div>
   );
 }

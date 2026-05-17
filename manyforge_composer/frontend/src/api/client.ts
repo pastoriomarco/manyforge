@@ -22,6 +22,7 @@ import type {
   SceneEditRequest,
   SceneEditResponse,
   SceneFramesResponse,
+  SceneUrdfManifest,
   SceneFrameGizmoSizeResponse,
   SceneFrameVisibilityResponse,
   SceneObjectFrameVisibilityResponse,
@@ -124,10 +125,31 @@ export const api = {
       request<unknown>('PUT', '/api/program/tree', { tree }),
     runtimeOverrides: () =>
       request<RuntimeOverrideStatus>('GET', '/api/program/runtime-overrides'),
+    // Day-5c.3: Pose Edit overlay stages node param overrides via this
+    // existing route. authoritySource + approvalMode default to
+    // operator-driven values that don't require additional auth.
+    applyRuntimeOverride: (
+      nodeName: string,
+      params: Record<string, unknown>,
+      reason: string,
+    ) =>
+      request<RuntimeOverrideStatus>('POST', '/api/program/runtime-overrides', {
+        nodeName,
+        params,
+        authoritySource: 'human',
+        approvalMode: 'human_approved',
+        reason,
+      }),
     activateRuntimeOverrides: () =>
       request<RuntimeOverrideStatus>('POST', '/api/program/runtime-overrides/activate'),
     clearRuntimeOverrides: () =>
       request<RuntimeOverrideStatus>('POST', '/api/program/runtime-overrides/clear'),
+    // Promote staged runtime overrides into the loaded program
+    // (in-memory), so a subsequent /api/program/save persists them.
+    promoteRuntimeOverridesToLoaded: () =>
+      request<unknown>('POST', '/api/program/runtime-overrides/promote', {
+        target: 'loaded_program',
+      }),
     save: (path: string, parameters?: ProgramInfo['parameters'], blackboard?: ProgramBlackboard) =>
       request<unknown>('POST', '/api/program/save', {
         path,
@@ -189,8 +211,38 @@ export const api = {
   runtime: {
     status: () => request<RuntimeStatus>('GET', '/api/runtime/status'),
   },
+  urdf: {
+    manifest: () => request<SceneUrdfManifest>('GET', '/api/scene/urdf/manifest'),
+    meshUrl: (linkName: string) =>
+      `${BASE_URL}/api/scene/urdf/meshes/${encodeURIComponent(linkName)}`,
+  },
+  direct: {
+    // Day 5b: operator-driven single-joint jog from the
+    // robot-control overlay. Wraps the existing intervention
+    // machinery so the cycle manager + planner + kernel handle
+    // the jog through their normal lifecycle.
+    jointJog: (jointNames: string[], jointPositionsRad: number[]) =>
+      request<unknown>('POST', '/api/direct/joint-jog', {
+        jointNames,
+        jointPositionsRad,
+      }),
+    // Day 5c.2: Cartesian end-effector jog via the panel's
+    // Cartesian tab + 3D gizmo. positionM and orientationXyzw
+    // express the target TCP pose in the robot's base frame.
+    cartesianJog: (positionM: number[], orientationXyzw: number[]) =>
+      request<unknown>('POST', '/api/direct/cartesian-jog', {
+        positionM,
+        orientationXyzw,
+      }),
+  },
   scene: {
     state: () => request<SceneStateResponse>('GET', '/api/scene/state'),
+    // Day-5c followup: persist an authored scene object's
+    // pose/shape into the program draft. Wraps the assistant
+    // tool's scene_draft_update_object helper; operator commits
+    // to YAML via ProgramPanel Save afterwards.
+    updateProgramSceneResource: (payload: Record<string, unknown>) =>
+      request<unknown>('POST', '/api/scene/program-resource/update', payload),
     edit: (payload: SceneEditRequest) =>
       request<SceneEditResponse>('POST', '/api/scene/edit', payload),
     frames: () => request<SceneFramesResponse>('GET', '/api/scene/frames'),

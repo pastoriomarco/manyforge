@@ -2,6 +2,7 @@ import { create } from 'zustand';
 import { api } from '../api/client';
 import { StateWebSocket } from '../api/websocket';
 import { useProgramStore } from './programStore';
+import { useViewerSelectionStore } from './viewerSelectionStore';
 import type { CycleStatus } from '../types/api';
 
 interface CycleStore {
@@ -115,3 +116,23 @@ export const useCycleStore = create<CycleStore>((set, get) => ({
     set({ _ws: null });
   },
 }));
+
+/**
+ * Whether interactive editing of the program/scene should be locked.
+ * True when the cycle is in any active backend state
+ * (running / interrupt_handler / direct_control) OR when the user
+ * is actively dragging the TCP jog gizmo — even if the backend
+ * hasn't yet transitioned to direct_control. Keeps the UI feel
+ * consistent: any interaction that actively commands the robot
+ * gates the rest of the surface the same way.
+ */
+export function useEditLocked(): boolean {
+  const cycleState = useCycleStore((s) => s.state);
+  const dragging = useViewerSelectionStore((s) => s.isDraggingGizmo);
+  return (
+    cycleState === 'running' ||
+    cycleState === 'interrupt_handler' ||
+    cycleState === 'direct_control' ||
+    dragging
+  );
+}

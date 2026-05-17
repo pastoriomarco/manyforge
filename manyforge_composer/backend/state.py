@@ -162,6 +162,25 @@ class ComposerState:
             failure_archive_max_bytes=failure_archive_max_bytes,
         )
         self.scene_edit_lock = threading.Lock()
+        # Viewer-side visibility state. Previously owned by the Viser HMI
+        # server; the Day-4 parity work makes ComposerState the source of
+        # truth so the native viewer works without HMI. Frames + object
+        # frames default visible; the sets store the *hidden* ids so a
+        # missing entry maps to "visible" without bookkeeping work on
+        # newly-discovered frames.
+        self._scene_viewer_lock = threading.Lock()
+        self._hidden_frames: set[str] = set()
+        self._hidden_object_frames: set[str] = set()
+        self._frame_gizmo_size_m: float = 0.1
+        # Last-known joint vector, refreshed whenever the kernel reports
+        # one. The kernel's execution snapshot returns
+        # `joint_positions_rad=None` outside an active execution, so
+        # reading "live" joint state via routes_scene would otherwise
+        # see zeros and the robot-control panel slider would mirror
+        # nothing. Day-5c.1 fix: cache the vector so reads after IDLE
+        # return the most-recent value; falls back to the deployment's
+        # execution.config.initial_joint_positions_rad on first read.
+        self._last_known_joint_positions_rad: list[float] | None = None
         self.allowed_fs_roots = normalize_allowed_roots(allowed_fs_roots)
         self._runtime_overrides: dict[str, RuntimeOverrideRecord] = {}
         self._program_tree_hash: str = ""
@@ -1285,6 +1304,152 @@ class ComposerState:
             raise RuntimeError("Runtime overrides may only be changed in IDLE or DIRECT_CONTROL")
         return cycle_state
 
+    def get_current_joint_positions(self) -> Optional[list[float]]:
+        """Return the best-known full joint vector, or None if unknown.
+
+        Day-5c.1 lifted this resolution chain into routes_scene for the
+        /api/scene/state payload; routes_direct's joint-jog handler
+        needed the same answer when assembling the full overlay before
+        submitting an intervention. The chain:
+
+        1. Live execution snapshot if it carries non-empty positions.
+        2. The state-cached `_last_known_joint_positions_rad`, refreshed
+           on every read with valid live positions or on the
+           optimistic write that follows a successful jog.
+        3. Deployment's `adapters.execution.config.initial_joint_positions_rad`
+           — the same vector the kernel uses as its initial config on
+           deployment load.
+
+        Without this, joint-jog called outside an active execution
+        would pad the snapshot's `None` to zeros and the planner would
+        receive a goal where every untouched joint should be 0 —
+        the operator's "slider drives the robot to all-zero" report.
+        """
+        if self.kernel is None:
+            return None
+        joint_names = self.kernel.get_joint_names()
+        if not joint_names:
+            return None
+        snapshot = (
+            self.cycle_manager.get_execution_snapshot()
+            if self.cycle_manager is not None
+            else self.kernel.get_execution_snapshot()
+        )
+        snapshot_positions = getattr(snapshot, "joint_positions_rad", None)
+        if snapshot_positions and len(snapshot_positions) == len(joint_names):
+            live = list(snapshot_positions)
+            self._last_known_joint_positions_rad = live
+            return live
+        if (
+            self._last_known_joint_positions_rad is not None
+            and len(self._last_known_joint_positions_rad) == len(joint_names)
+        ):
+            return list(self._last_known_joint_positions_rad)
+        if self.deployment is not None:
+            try:
+                execution_adapter = self.deployment.adapters.get("execution")
+            except Exception:
+                execution_adapter = None
+            if execution_adapter is not None:
+                initial = execution_adapter.config.get("initial_joint_positions_rad")
+                if isinstance(initial, list) and len(initial) == len(joint_names):
+                    seeded = [float(v) for v in initial]
+                    self._last_known_joint_positions_rad = seeded
+                    return seeded
+        return None
+
+    # Viewer-state accessors: frame + object-frame visibility + gizmo
+    # size. Day-4 makes these state-owned so the native viewer is
+    # functional without the Viser HMI server attached. The accessors
+    # accept both the new state-local path and the legacy HMI-server
+    # path, so an in-process HMI (if present) sees consistent state.
+
+    def get_frame_visibility(self, frame_name: str) -> bool:
+        with self._scene_viewer_lock:
+            return frame_name not in self._hidden_frames
+
+    def set_frame_visibility(self, frame_name: str, visible: bool) -> None:
+        with self._scene_viewer_lock:
+            if visible:
+                self._hidden_frames.discard(frame_name)
+            else:
+                self._hidden_frames.add(frame_name)
+        hmi = self.hmi_server
+        if hmi is not None and hasattr(hmi, "set_frame_visibility"):
+            try:
+                hmi.set_frame_visibility(frame_name, visible)
+            except Exception:
+                logger.debug("HMI frame visibility mirror failed", exc_info=True)
+
+    def get_object_frame_visibility(self, object_id: str) -> bool:
+        with self._scene_viewer_lock:
+            return object_id not in self._hidden_object_frames
+
+    def set_object_frame_visibility(self, object_id: str, visible: bool) -> None:
+        with self._scene_viewer_lock:
+            if visible:
+                self._hidden_object_frames.discard(object_id)
+            else:
+                self._hidden_object_frames.add(object_id)
+        hmi = self.hmi_server
+        if hmi is not None and hasattr(hmi, "set_object_frame_visibility"):
+            try:
+                hmi.set_object_frame_visibility(object_id, visible)
+            except Exception:
+                logger.debug("HMI object frame visibility mirror failed", exc_info=True)
+
+    def get_frame_gizmo_size(self) -> float:
+        with self._scene_viewer_lock:
+            return self._frame_gizmo_size_m
+
+    def set_frame_gizmo_size(self, axes_length_m: float) -> None:
+        size = float(axes_length_m)
+        if size <= 0:
+            raise ValueError("frame gizmo size must be positive")
+        with self._scene_viewer_lock:
+            self._frame_gizmo_size_m = size
+        hmi = self.hmi_server
+        if hmi is not None and hasattr(hmi, "set_frame_gizmo_size"):
+            try:
+                hmi.set_frame_gizmo_size(size)
+            except Exception:
+                logger.debug("HMI gizmo size mirror failed", exc_info=True)
+
+    def _resolve_scene_snapshot_provider(
+        self,
+    ) -> Optional[Callable[[int, int, str], Optional[bytes]]]:
+        """Pick the active snapshot source for the runner.
+
+        Priority order:
+        1. The native-viewer broker if a browser is currently connected
+           (Day-3 of the native-viewer migration).
+        2. The legacy Viser HMI's cached snapshot / render path.
+
+        We do NOT mix the two within a single capture: if a native
+        client is connected and the round-trip fails (timeout, client
+        disconnects mid-render), the provider returns ``None`` rather
+        than silently falling back to Viser. The legacy path remains
+        the active source only when no native viewer is currently
+        attached, which keeps capture semantics consistent within a
+        single operator session.
+        """
+        broker = getattr(self, "snapshot_broker", None)
+        hmi_provider = (
+            getattr(self.hmi_server, "get_cached_scene_snapshot", None)
+            or getattr(self.hmi_server, "render_scene", None)
+        )
+        if broker is None:
+            return hmi_provider
+
+        def provider(width: int, height: int, format: str) -> Optional[bytes]:
+            if broker.has_clients():
+                return broker.render_sync(width, height, format)
+            if hmi_provider is not None:
+                return hmi_provider(width, height, format)
+            return None
+
+        return provider
+
     def _rebuild_runtime(
         self,
         program: Program,
@@ -1293,10 +1458,7 @@ class ComposerState:
         effective_program: Optional[Program] = None,
     ) -> None:
         """Rebuild runner + cycle manager from already-validated in-memory models."""
-        scene_snapshot_provider = (
-            getattr(self.hmi_server, "get_cached_scene_snapshot", None)
-            or getattr(self.hmi_server, "render_scene", None)
-        )
+        scene_snapshot_provider = self._resolve_scene_snapshot_provider()
         if self.cycle_manager is not None:
             self.cycle_manager.reset()
 
@@ -1385,10 +1547,7 @@ class ComposerState:
             self.cycle_manager.reset()
 
         # Load deployment first (if provided)
-        scene_snapshot_provider = (
-            getattr(self.hmi_server, "get_cached_scene_snapshot", None)
-            or getattr(self.hmi_server, "render_scene", None)
-        )
+        scene_snapshot_provider = self._resolve_scene_snapshot_provider()
         deployment = self.deployment
         if deployment_path:
             deployment = Deployment(deployment_path)

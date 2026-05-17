@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api } from '../api/client';
-import { useCycleStore } from '../store/cycleStore';
+import { useCycleStore, useEditLocked } from '../store/cycleStore';
 import { useProgramStore } from '../store/programStore';
 import type {
   ProgramSceneResource,
@@ -788,11 +788,9 @@ export function SceneDraftMirror() {
 }
 
 export function ScenePanel() {
-  const cycleState = useCycleStore((state) => state.state);
   const sceneResources = useProgramStore((state) => state.sceneResources);
   const setSceneResources = useProgramStore((state) => state.setSceneResources);
-  const editLocked =
-    cycleState === 'running' || cycleState === 'interrupt_handler' || cycleState === 'direct_control';
+  const editLocked = useEditLocked();
   const [sceneState, setSceneState] = useState<SceneStateResponse | null>(null);
   const [frames, setFrames] = useState<SceneFrameState[]>([]);
   const [hmiAvailable, setHmiAvailable] = useState(false);

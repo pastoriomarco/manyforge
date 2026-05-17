@@ -1,11 +1,92 @@
-import { useCallback, useState } from 'react';
-import type { PointerEvent as ReactPointerEvent } from 'react';
+import { Component, useCallback, useMemo, useState } from 'react';
+import type { ErrorInfo, PointerEvent as ReactPointerEvent, ReactNode } from 'react';
 import { TreeCanvas } from './TreeCanvas';
 import { PropertyPanel } from './PropertyPanel';
 import { ViserPanel } from './ViserPanel';
+import { SceneViewerPanel } from './SceneViewer';
 import { CollapsedRail } from './CollapsedRail';
 import { useProgramStore } from '../store/programStore';
 import { useDeploymentStore } from '../store/deploymentStore';
+
+interface ViewerErrorBoundaryProps {
+  fallback: ReactNode;
+  children: ReactNode;
+}
+
+interface ViewerErrorBoundaryState {
+  hasError: boolean;
+}
+
+// Isolated error boundary around whichever viewer is mounted. The native
+// R3F viewer is a panel — if it crashes (WebGL context loss, a drei
+// version mismatch, a malformed URDF, etc.) Composer's editor must
+// remain usable. Without this, an exception inside the viewer
+// propagates up and React 19 unmounts the whole tree (operator sees a
+// blank page).
+class ViewerErrorBoundary extends Component<
+  ViewerErrorBoundaryProps,
+  ViewerErrorBoundaryState
+> {
+  state: ViewerErrorBoundaryState = { hasError: false };
+
+  static getDerivedStateFromError(): ViewerErrorBoundaryState {
+    return { hasError: true };
+  }
+
+  componentDidCatch(error: Error, info: ErrorInfo): void {
+    console.error('Viewer panel crashed:', error, info.componentStack);
+  }
+
+  render(): ReactNode {
+    if (this.state.hasError) {
+      return this.props.fallback;
+    }
+    return this.props.children;
+  }
+}
+
+function ViewerCrashFallback({ viewerKind }: { viewerKind: 'viser' | 'native' }) {
+  return (
+    <div className="flex h-full w-full flex-col overflow-hidden bg-gray-900">
+      <div className="flex h-10 items-center border-b border-gray-700 bg-gray-800 px-3">
+        <div className="text-xs font-semibold uppercase tracking-wide text-orange-300">
+          Viewer error
+        </div>
+      </div>
+      <div className="flex flex-1 items-center justify-center p-6 text-center">
+        <div className="max-w-sm rounded-lg border border-orange-700 bg-gray-900/95 p-4 shadow-xl">
+          <div className="mb-2 text-sm font-semibold text-orange-300">
+            {viewerKind === 'native' ? 'Native viewer crashed' : 'Viser viewer crashed'}
+          </div>
+          <p className="text-sm text-gray-300">
+            The 3D viewer panel hit a runtime error and was isolated.
+            Composer is still usable; the underlying program and runtime are unaffected.
+            {viewerKind === 'native'
+              ? ' Try reloading without ?viewer=native to fall back to the legacy Viser iframe.'
+              : ' Try reloading or use ?viewer=native to switch viewers.'}
+          </p>
+          <p className="mt-2 text-xs text-gray-500">
+            See browser devtools console for the full stack trace.
+          </p>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Feature flag: `?viewer=native` opts into the in-React-tree R3F scene
+// viewer. Default keeps the legacy Viser iframe so incremental dev work
+// (during Days 1–4 of the migration plan) doesn't disturb operators who
+// need the running viewer. Day 5 cutover flips the default and removes
+// the flag. See
+// `manyforge_specs/docs/implementation/composer-native-3d-visualizer-migration.md`.
+function readViewerFlag(): 'viser' | 'native' {
+  if (typeof window === 'undefined') {
+    return 'viser';
+  }
+  const params = new URLSearchParams(window.location.search);
+  return params.get('viewer') === 'native' ? 'native' : 'viser';
+}
 
 const MIN_VISER_WIDTH = 480;
 const MAX_VISER_WIDTH = 960;
@@ -26,6 +107,7 @@ export function Viewport() {
   const [viserCollapsed, setViserCollapsed] = useState(false);
   const [propertyCollapsed, setPropertyCollapsed] = useState(false);
   const [activeResize, setActiveResize] = useState<'properties' | 'viser' | null>(null);
+  const viewerKind = useMemo(() => readViewerFlag(), []);
 
   const flowToTree = useProgramStore((state) => state.flowToTree);
   const appliedTree = useProgramStore((state) => state.appliedTree);
@@ -103,7 +185,11 @@ export function Viewport() {
       )}
 
       {viserCollapsed ? (
-        <CollapsedRail label="Viser" side="right" onExpand={() => setViserCollapsed(false)} />
+        <CollapsedRail
+          label={viewerKind === 'native' ? 'Viewer' : 'Viser'}
+          side="right"
+          onExpand={() => setViserCollapsed(false)}
+        />
       ) : (
         <>
           <div
@@ -113,17 +199,27 @@ export function Viewport() {
               )
             }
             className="w-3 shrink-0 touch-none cursor-col-resize bg-gray-800/40 transition-colors hover:bg-blue-500/60"
-            title="Resize Viser panel"
+            title={viewerKind === 'native' ? 'Resize viewer panel' : 'Resize Viser panel'}
           />
           <div
             className="relative shrink-0 overflow-hidden border-l border-gray-700"
             style={{ width: viserWidth }}
           >
-            <ViserPanel
-              onCollapse={() => setViserCollapsed(true)}
-              blocked={hasUnappliedChanges}
-              resizing={activeResize === 'viser'}
-            />
+            <ViewerErrorBoundary fallback={<ViewerCrashFallback viewerKind={viewerKind} />}>
+              {viewerKind === 'native' ? (
+                <SceneViewerPanel
+                  onCollapse={() => setViserCollapsed(true)}
+                  blocked={hasUnappliedChanges}
+                  resizing={activeResize === 'viser'}
+                />
+              ) : (
+                <ViserPanel
+                  onCollapse={() => setViserCollapsed(true)}
+                  blocked={hasUnappliedChanges}
+                  resizing={activeResize === 'viser'}
+                />
+              )}
+            </ViewerErrorBoundary>
           </div>
         </>
       )}

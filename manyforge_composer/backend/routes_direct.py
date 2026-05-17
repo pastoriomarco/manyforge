@@ -10,10 +10,12 @@ from manyforge_behavior.program import collect_tree_validation_issues, tree_node
 
 from .intervention_validation import merged_intervention_blackboard_keys
 from .models import (
+    CartesianJogRequest,
     DelegatedRecoveryRequestResponse,
     InterventionExecuteRequest,
     InterventionPromoteRequest,
     InterventionSessionResponse,
+    JointJogRequest,
 )
 from .state import ComposerState
 
@@ -187,6 +189,342 @@ def create_direct_router(state: ComposerState) -> APIRouter:
                 trigger_node_instance=request.trigger_node_instance,
                 approval_mode=request.approval_mode,
                 artifact_origin=request.artifact_origin,
+            )
+        except RuntimeError as exc:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": str(exc),
+                    "timestamp_ns": time.monotonic_ns(),
+                },
+            )
+
+        return _session_response(session)
+
+    @router.post("/joint-jog")
+    def joint_jog(request: JointJogRequest, http_request: Request):
+        """Drive one or more joints to a target position from the viewer's
+        robot-control overlay panel (Day 5b).
+
+        The operator's slider commit posts a partial joint update (just
+        the joints they touched); the backend reads the current full
+        joint vector from the kernel and overlays the requested
+        positions before submitting a single-leaf intervention tree
+        with `move_manipulator_action` set to `motion_type=joint_goal`.
+        This reuses the existing intervention machinery so the cycle
+        manager transitions to DIRECT_CONTROL, the planner produces a
+        bounded trajectory, the kernel executes it, and the cycle
+        returns to IDLE — same lifecycle as `/api/direct/execute` with
+        no new kernel-side API.
+
+        The 409 / 400 / 200 branches mirror /api/direct/execute so
+        operators see consistent error semantics across the direct-
+        control surface.
+        """
+        if state.cycle_manager is None:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": "No program loaded",
+                    "timestamp_ns": time.monotonic_ns(),
+                },
+            )
+        if state.kernel is None:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": "No kernel available",
+                    "timestamp_ns": time.monotonic_ns(),
+                },
+            )
+        if len(request.joint_names) != len(request.joint_positions_rad):
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": "jointNames and jointPositionsRad must have the same length",
+                    "timestamp_ns": time.monotonic_ns(),
+                },
+            )
+
+        # Read current joint vector. We need a full goal across every
+        # joint the kernel exposes, not just the ones the operator
+        # touched, otherwise the planner produces a trajectory that
+        # tries to zero out the unspecified joints. The kernel's
+        # execution-snapshot `joint_positions_rad` is None outside an
+        # active execution, so we route through ComposerState's
+        # full fallback chain (cached last-known → deployment's
+        # initial config) instead of consuming None directly.
+        kernel_joint_names = list(state.kernel.get_joint_names())
+        if not kernel_joint_names:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": "Kernel reports no joints; cannot jog",
+                    "timestamp_ns": time.monotonic_ns(),
+                },
+            )
+
+        current_positions = state.get_current_joint_positions()
+        if current_positions is None:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": (
+                        "Kernel has no joint state yet — load a deployment so the "
+                        "initial joint configuration is available"
+                    ),
+                    "timestamp_ns": time.monotonic_ns(),
+                },
+            )
+
+        # Apply the partial update from the request onto the full
+        # current-positions vector.
+        target_positions = list(current_positions)
+        for name, pos in zip(request.joint_names, request.joint_positions_rad):
+            try:
+                idx = kernel_joint_names.index(name)
+            except ValueError:
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": f"Unknown joint '{name}'",
+                        "timestamp_ns": time.monotonic_ns(),
+                    },
+                )
+            target_positions[idx] = float(pos)
+
+        auth_principal = getattr(http_request.state, "principal_id", None)
+        effective_principal = auth_principal or request.principal_id
+
+        # One-leaf intervention tree. move_manipulator_action is a
+        # `leaf` in the catalog so it can be the root of the
+        # intervention tree directly. In ManyForge's BT tree
+        # convention, `id` is the catalog-entry id (kind) the
+        # validator looks up via `catalog.get(node.id)`, and `name`
+        # is the per-instance identifier used for trajectory
+        # caching and event traces.
+        instance_name = f"joint_jog_{time.monotonic_ns()}"
+        tree_dict = {
+            "id": "move_manipulator_action",
+            "name": instance_name,
+            "params": {
+                "move_id": instance_name,
+                "motion_type": "joint_goal",
+                "joint_goal_names": kernel_joint_names,
+                "joint_goal_positions_rad": target_positions,
+            },
+            "children": [],
+        }
+
+        try:
+            tree = tree_node_from_dict(tree_dict)
+        except Exception as exc:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": f"Failed to build joint-jog intervention: {exc}",
+                    "timestamp_ns": time.monotonic_ns(),
+                },
+            )
+        errors, _warnings = collect_tree_validation_issues(
+            tree,
+            state.catalog,
+            parameter_defaults=(
+                state.program.get_parameter_defaults()
+                if state.program is not None
+                else None
+            ),
+            blackboard_namespaces=(
+                state.program.blackboard_namespaces
+                if state.program is not None
+                else None
+            ),
+            blackboard_keys=merged_intervention_blackboard_keys(
+                tree,
+                state.catalog,
+                base_keys=(
+                    state.program.blackboard_keys
+                    if state.program is not None
+                    else None
+                ),
+            ),
+            skill_catalog=state.skill_catalog,
+            program_profile=(
+                state.program.program_profile
+                if state.program is not None
+                else None
+            ),
+            deployment_capability_keys=_deployment_capability_keys(state),
+        )
+        if errors:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": errors[0].message,
+                    "details": [
+                        {"path": issue.path, "message": issue.message}
+                        for issue in errors
+                    ],
+                    "timestamp_ns": time.monotonic_ns(),
+                },
+            )
+
+        try:
+            session = state.cycle_manager.execute_intervention(
+                tree_dict,
+                parent_run_id=_parent_run_id_for_intervention(state),
+                lease_timeout_ms=request.lease_timeout_ms,
+                # Day 5c.1 fix: explicit "idle" resume target so the
+                # cycle returns to IDLE after the intervention. With
+                # the prior `None` value the cycle ended up in STOPPED
+                # and the next slider commit couldn't fire until the
+                # operator manually reset.
+                resume_target="idle",
+                session_kind="manual_intervention",
+                authority_source="human",
+                principal_id=effective_principal,
+                grant_type="human_approved",
+                trigger_reason="composer_viewer_joint_jog",
+                trigger_node_instance=None,
+                approval_mode="human_approved",
+                artifact_origin="runtime_override",
+            )
+        except RuntimeError as exc:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": str(exc),
+                    "timestamp_ns": time.monotonic_ns(),
+                },
+            )
+
+        # Day 5c.1: optimistic cache update. The kernel's snapshot
+        # returns joint_positions_rad=None when not executing, so
+        # absent this update the panel slider snaps back to the
+        # last *during-execution* value once the trajectory
+        # completes. Setting the cache to the commanded target
+        # right after the intervention is submitted keeps the
+        # slider at the operator's requested position; any
+        # divergence (planner caps, collision halts) overrides this
+        # on the next scene-state poll during execution.
+        state._last_known_joint_positions_rad = list(target_positions)
+
+        return _session_response(session)
+
+    @router.post("/cartesian-jog")
+    def cartesian_jog(request: CartesianJogRequest, http_request: Request):
+        """Drive the TCP to a target pose from the viewer's Cartesian
+        jog gizmo (Day 5c.2).
+
+        Same intervention-machinery wrapping as /api/direct/joint-jog
+        but with motion_type=pose_goal. The frontend sends the
+        target TCP pose already expressed in the robot's base frame
+        (the same convention the catalog's `pose_goal` parameter
+        speaks). The cycle returns to IDLE on success, enabling
+        rapid sequential gizmo commits.
+        """
+        if state.cycle_manager is None:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": "No program loaded",
+                    "timestamp_ns": time.monotonic_ns(),
+                },
+            )
+        if state.kernel is None:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": "No kernel available",
+                    "timestamp_ns": time.monotonic_ns(),
+                },
+            )
+
+        auth_principal = getattr(http_request.state, "principal_id", None)
+        effective_principal = auth_principal or request.principal_id
+
+        instance_name = f"cartesian_jog_{time.monotonic_ns()}"
+        tree_dict = {
+            "id": "move_manipulator_action",
+            "name": instance_name,
+            "params": {
+                "move_id": instance_name,
+                "motion_type": "pose_goal",
+                "pose_goal": {
+                    "position_m": [float(v) for v in request.position_m],
+                    "orientation_xyzw": [float(v) for v in request.orientation_xyzw],
+                },
+            },
+            "children": [],
+        }
+
+        try:
+            tree = tree_node_from_dict(tree_dict)
+        except Exception as exc:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": f"Failed to build cartesian-jog intervention: {exc}",
+                    "timestamp_ns": time.monotonic_ns(),
+                },
+            )
+        errors, _warnings = collect_tree_validation_issues(
+            tree,
+            state.catalog,
+            parameter_defaults=(
+                state.program.get_parameter_defaults()
+                if state.program is not None
+                else None
+            ),
+            blackboard_namespaces=(
+                state.program.blackboard_namespaces
+                if state.program is not None
+                else None
+            ),
+            blackboard_keys=merged_intervention_blackboard_keys(
+                tree,
+                state.catalog,
+                base_keys=(
+                    state.program.blackboard_keys
+                    if state.program is not None
+                    else None
+                ),
+            ),
+            skill_catalog=state.skill_catalog,
+            program_profile=(
+                state.program.program_profile
+                if state.program is not None
+                else None
+            ),
+            deployment_capability_keys=_deployment_capability_keys(state),
+        )
+        if errors:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": errors[0].message,
+                    "details": [
+                        {"path": issue.path, "message": issue.message}
+                        for issue in errors
+                    ],
+                    "timestamp_ns": time.monotonic_ns(),
+                },
+            )
+
+        try:
+            session = state.cycle_manager.execute_intervention(
+                tree_dict,
+                parent_run_id=_parent_run_id_for_intervention(state),
+                lease_timeout_ms=request.lease_timeout_ms,
+                resume_target="idle",
+                session_kind="manual_intervention",
+                authority_source="human",
+                principal_id=effective_principal,
+                grant_type="human_approved",
+                trigger_reason="composer_viewer_cartesian_jog",
+                trigger_node_instance=None,
+                approval_mode="human_approved",
+                artifact_origin="runtime_override",
             )
         except RuntimeError as exc:
             return JSONResponse(

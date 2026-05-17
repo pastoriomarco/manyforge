@@ -10,7 +10,7 @@ import type {
   SceneFrameState,
 } from '../types/api';
 import { useDeploymentStore } from '../store/deploymentStore';
-import { useCycleStore } from '../store/cycleStore';
+import { useEditLocked } from '../store/cycleStore';
 import { DraftTextarea, DraftTextInput } from './common/DraftInputs';
 
 function signature(value: unknown): string {
@@ -539,10 +539,9 @@ export function DeploymentPanel() {
       setNestedField: state.setNestedField,
     })),
   );
-  const state = useCycleStore((s) => s.state);
+  const editLocked = useEditLocked();
   const [modelEndpointCatalog, setModelEndpointCatalog] = useState<ModelEndpointCatalog | null>(null);
   const [sceneFrames, setSceneFrames] = useState<SceneFrameState[]>([]);
-  const editLocked = state === 'running' || state === 'interrupt_handler' || state === 'direct_control';
   const runtimeApplied = signature(deployment) === signature(appliedDeployment);
   const diskSaved = signature(deployment) === signature(savedDeployment);
   const endpointAliases = useMemo(

@@ -3,9 +3,9 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any
+from typing import Any, Optional
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import JSONResponse, Response
 
 from manyforge_behavior.cycle_manager import CycleState
@@ -147,38 +147,49 @@ def _scene_frame_roles(state: ComposerState) -> dict[str, set[str]]:
 
 
 def build_scene_frames_payload(state: ComposerState) -> dict[str, Any]:
-    """Build known frame inventory plus current viewer visibility."""
+    """Build known frame inventory plus current viewer visibility.
+
+    Day-4 of the native-viewer migration: visibility state is owned by
+    ComposerState (see `set_frame_visibility` / `get_frame_visibility`
+    on the state object), so this works without the Viser HMI server
+    attached. ``hmi_available`` in the response now reflects whether
+    *any* viewer is wired up (always true now that state owns it) —
+    the field is preserved for backward compatibility with clients
+    that still gate on it; legacy Viser callers see the same value
+    they did before.
+    """
     timestamp_ns = time.monotonic_ns()
     frame_roles = _scene_frame_roles(state)
     frame_names = set(frame_roles.keys())
     frame_names.update(_load_model_frame_names(state))
 
-    hmi = getattr(state, "hmi_server", None)
-    hmi_available = bool(hmi and hasattr(hmi, "get_frame_visibility"))
-    frame_gizmo_size_m = 0.1
-    if hmi is not None and hasattr(hmi, "get_frame_gizmo_size"):
-        try:
-            frame_gizmo_size_m = float(hmi.get_frame_gizmo_size())
-        except Exception:
-            frame_gizmo_size_m = 0.1
     kernel = state.kernel
     world_frame = canonical_scene_world_frame(state)
 
     frames: list[SceneFrameResponse] = []
     for frame_name in sorted(frame_names):
         pose_available = frame_name == world_frame
-        if not pose_available and kernel is not None:
+        pose_in_world: Optional[dict[str, Any]] = None
+        if frame_name == world_frame:
+            pose_in_world = {
+                "position_m": [0.0, 0.0, 0.0],
+                "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+            }
+        elif kernel is not None:
             try:
-                pose_available = kernel.get_link_pose(frame_name, world_frame) is not None
+                pose = kernel.get_link_pose(frame_name, world_frame)
             except Exception:
+                pose = None
+            if pose is not None:
+                pose_in_world = {
+                    "position_m": list(pose["position_m"]),
+                    "orientation_xyzw": list(pose["orientation_xyzw"]),
+                }
+                pose_available = True
+            else:
                 pose_available = False
 
-        viewer_visible = False
-        if hmi_available:
-            try:
-                viewer_visible = bool(hmi.get_frame_visibility(frame_name))
-            except Exception:
-                viewer_visible = False
+        viewer_visible = state.get_frame_visibility(frame_name)
 
         frames.append(
             SceneFrameResponse(
@@ -186,13 +197,14 @@ def build_scene_frames_payload(state: ComposerState) -> dict[str, Any]:
                 roles=sorted(frame_roles.get(frame_name, set())),
                 viewerVisible=viewer_visible,
                 poseAvailable=pose_available,
+                poseInWorld=pose_in_world,
             )
         )
 
     return SceneFramesResponse(
         frames=frames,
-        hmiAvailable=hmi_available,
-        frameGizmoSizeM=frame_gizmo_size_m,
+        hmiAvailable=True,
+        frameGizmoSizeM=state.get_frame_gizmo_size(),
         timestampNs=timestamp_ns,
     ).model_dump(by_alias=True)
 
@@ -237,10 +249,32 @@ def build_scene_state_payload(state: ComposerState) -> dict[str, Any]:
             if state.cycle_manager is not None
             else state.kernel.get_execution_snapshot()
         )
+        # Joint-state readback fallback chain (Day 5c.1):
+        # 1. Active execution snapshot (preferred — freshest).
+        # 2. The state-cached last-known vector from a prior execution.
+        # 3. Deployment's `execution.config.initial_joint_positions_rad`
+        #    (set on deployment load; what the kernel uses as its
+        #    initial configuration).
+        # 4. Zeros (last-resort default; matches pre-5c.1 behaviour).
+        live_positions: list[float] | None = None
         if snapshot.joint_positions_rad:
+            live_positions = list(snapshot.joint_positions_rad)
+            state._last_known_joint_positions_rad = live_positions
+        elif state._last_known_joint_positions_rad is not None:
+            live_positions = state._last_known_joint_positions_rad
+        elif state.deployment is not None:
+            try:
+                execution_adapter = state.deployment.adapters.get("execution")
+            except Exception:
+                execution_adapter = None
+            if execution_adapter is not None:
+                initial = execution_adapter.config.get("initial_joint_positions_rad")
+                if isinstance(initial, list) and len(initial) == len(joint_names):
+                    live_positions = [float(v) for v in initial]
+                    state._last_known_joint_positions_rad = live_positions
+        if live_positions is not None and len(live_positions) == len(joint_names):
             joint_positions_by_name = {
-                name: pos
-                for name, pos in zip(joint_names, snapshot.joint_positions_rad)
+                name: pos for name, pos in zip(joint_names, live_positions)
             }
 
     tcp_pose_in_base = None
@@ -270,8 +304,6 @@ def build_scene_state_payload(state: ComposerState) -> dict[str, Any]:
         resource.object_id
         for resource in (state.program.scene if state.program is not None else [])
     }
-    hmi = getattr(state, "hmi_server", None)
-    hmi_object_frames_available = bool(hmi and hasattr(hmi, "get_object_frame_visibility"))
     if state.kernel is not None:
         for scene_object in state.kernel.get_scene_objects():
             if scene_object.attached:
@@ -280,14 +312,7 @@ def build_scene_state_payload(state: ComposerState) -> dict[str, Any]:
                 source = "authored"
             else:
                 source = "runtime"
-            viewer_frame_visible = False
-            if hmi_object_frames_available:
-                try:
-                    viewer_frame_visible = bool(
-                        hmi.get_object_frame_visibility(scene_object.object_id)
-                    )
-                except Exception:
-                    viewer_frame_visible = False
+            viewer_frame_visible = state.get_object_frame_visibility(scene_object.object_id)
             objects.append(
                 SceneObjectResponse(
                     object_id=scene_object.object_id,
@@ -302,9 +327,30 @@ def build_scene_state_payload(state: ComposerState) -> dict[str, Any]:
             )
     objects.sort(key=lambda obj: obj.object_id)
 
+    link_poses: dict[str, dict[str, Any]] = {}
+    if state.kernel is not None:
+        try:
+            from .routes_urdf import visual_link_names_for_fk
+        except Exception:
+            visual_link_names_for_fk = None  # type: ignore[assignment]
+        if visual_link_names_for_fk is not None:
+            world_frame = canonical_scene_world_frame(state)
+            for link_name in visual_link_names_for_fk(state):
+                try:
+                    pose = state.kernel.get_link_pose(link_name, world_frame)
+                except Exception:
+                    pose = None
+                if pose is None:
+                    continue
+                link_poses[link_name] = {
+                    "position_m": list(pose["position_m"]),
+                    "orientation_xyzw": list(pose["orientation_xyzw"]),
+                }
+
     return SceneStateResponse(
         robot=robot_info,
         objects=objects,
+        link_poses=link_poses,
         timestamp_ns=timestamp_ns,
     ).model_dump()
 
@@ -394,14 +440,8 @@ def create_scene_router(state: ComposerState) -> APIRouter:
 
     @router.post("/frames/visibility")
     def set_frame_visibility(validated: SceneFrameVisibilityRequest) -> dict[str, Any]:
-        """Show/hide a named frame axis in the HMI viewer without mutating deployment."""
-        hmi = getattr(state, "hmi_server", None)
-        if hmi is None or not hasattr(hmi, "set_frame_visibility"):
-            return JSONResponse(
-                status_code=503,
-                content={"detail": "HMI server not running or does not support frame visibility control"},
-            )
-        hmi.set_frame_visibility(validated.frame_name, validated.visible)
+        """Show/hide a named frame axis in the active viewer."""
+        state.set_frame_visibility(validated.frame_name, validated.visible)
         return SceneFrameVisibilityResponse(
             success=True,
             frameName=validated.frame_name,
@@ -412,17 +452,17 @@ def create_scene_router(state: ComposerState) -> APIRouter:
 
     @router.post("/frames/gizmo-size")
     def set_frame_gizmo_size(validated: SceneFrameGizmoSizeRequest) -> dict[str, Any]:
-        """Set global viewer size for named frame axes without mutating deployment."""
-        hmi = getattr(state, "hmi_server", None)
-        if hmi is None or not hasattr(hmi, "set_frame_gizmo_size"):
+        """Set global viewer size for named frame axes."""
+        try:
+            state.set_frame_gizmo_size(validated.axes_length_m)
+        except ValueError as exc:
             return JSONResponse(
-                status_code=503,
-                content={"detail": "HMI server not running or does not support frame gizmo size control"},
+                status_code=400,
+                content={"detail": str(exc)},
             )
-        hmi.set_frame_gizmo_size(validated.axes_length_m)
         return SceneFrameGizmoSizeResponse(
             success=True,
-            axesLengthM=float(hmi.get_frame_gizmo_size()),
+            axesLengthM=state.get_frame_gizmo_size(),
             hmiAvailable=True,
             timestampNs=time.monotonic_ns(),
         ).model_dump(by_alias=True)
@@ -431,14 +471,8 @@ def create_scene_router(state: ComposerState) -> APIRouter:
     def set_object_frame_visibility(
         validated: SceneObjectFrameVisibilityRequest,
     ) -> dict[str, Any]:
-        """Show/hide a scene object's pose axis in the HMI viewer."""
-        hmi = getattr(state, "hmi_server", None)
-        if hmi is None or not hasattr(hmi, "set_object_frame_visibility"):
-            return JSONResponse(
-                status_code=503,
-                content={"detail": "HMI server not running or does not support object frame visibility"},
-            )
-        hmi.set_object_frame_visibility(validated.object_id, validated.visible)
+        """Show/hide a scene object's pose axis in the active viewer."""
+        state.set_object_frame_visibility(validated.object_id, validated.visible)
         return SceneObjectFrameVisibilityResponse(
             success=True,
             objectId=validated.object_id,
@@ -446,6 +480,41 @@ def create_scene_router(state: ComposerState) -> APIRouter:
             hmiAvailable=True,
             timestampNs=time.monotonic_ns(),
         ).model_dump(by_alias=True)
+
+    @router.post("/program-resource/update")
+    def update_program_scene_resource(payload: dict[str, Any]) -> dict[str, Any]:
+        """Operator-facing wrapper around the assistant tool's
+        scene_draft_update_object helper (Day-5c followup, issue #2).
+
+        The native-viewer's Object Edit overlay POSTs here to persist
+        an authored scene object's pose/shape changes into the
+        program draft. The operator can then Save via ProgramPanel
+        to commit to the YAML. Runtime / sensed / attached objects
+        aren't represented in the program's scene resource list and
+        can't be persisted this way — they should be edited via
+        their source behavior-tree node (runtime override).
+        """
+        # Lazy import to avoid pulling the assistant-routes module
+        # into the import chain at app construction time; the
+        # underscore-prefixed helper is module-private but the route
+        # is the documented operator-facing surface for the same
+        # operation the assistant tool exposes to LLMs.
+        from .routes_assistant import _apply_scene_draft_resource_single
+
+        try:
+            return _apply_scene_draft_resource_single(
+                state,
+                arguments=payload,
+                operation="update",
+            )
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.warning("program scene resource update failed", exc_info=True)
+            return JSONResponse(
+                status_code=400,
+                content={"detail": str(exc)},
+            )
 
     @router.post("/edit")
     def edit_scene(validated: SceneEditApiRequest) -> dict[str, Any]:
@@ -506,23 +575,32 @@ def create_scene_router(state: ComposerState) -> APIRouter:
         height: int = Query(default=480, ge=64, le=1080),
         format: str = Query(default="jpeg", pattern="^(jpeg|png)$"),
     ) -> Response:
-        """Render the Viser 3D viewport as an image.
+        """Render the active 3D viewport as an image.
 
-        Requires the HMI server to be running (--hmi-port) and at least one
-        connected Viser client.
+        Day-4 of the native-viewer migration routes this through
+        ``ComposerState._resolve_scene_snapshot_provider()`` so the same
+        broker → HMI fallback chain used by the BT-node provider path
+        (Day 3) also serves this HTTP route. Callers (assistant tools,
+        external debug) get bytes from whichever viewer is currently
+        attached; the legacy Viser HMI is fallback when no native
+        viewer is connected.
         """
-        hmi = state.hmi_server
-        if hmi is None:
+        provider = state._resolve_scene_snapshot_provider()
+        if provider is None:
             return JSONResponse(
                 status_code=503,
-                content={"detail": "HMI server not running (start with --hmi-port)"},
+                content={
+                    "detail": (
+                        "No scene snapshot source available "
+                        "(open Composer with the viewer panel visible, or start --hmi-port)"
+                    ),
+                },
             )
-
-        image_bytes = hmi.render_scene(width=width, height=height, format=format)
+        image_bytes = provider(width, height, format)
         if image_bytes is None:
             return JSONResponse(
                 status_code=503,
-                content={"detail": "No Viser client connected for rendering"},
+                content={"detail": "Scene snapshot source did not return an image in time"},
             )
 
         media_type = "image/jpeg" if format == "jpeg" else "image/png"

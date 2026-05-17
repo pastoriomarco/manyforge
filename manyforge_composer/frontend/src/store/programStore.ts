@@ -80,6 +80,7 @@ interface ProgramStore {
   selectNode: (id: string | null) => void;
   updateNodeParams: (nodeId: string, params: Record<string, unknown>) => void;
   updateNodeLabel: (nodeId: string, label: string) => void;
+  updateNodeModificationPolicy: (nodeId: string, policy: Record<string, string>) => void;
   updateProgramParameter: (name: string, patch: Partial<ProgramParameter>) => void;
   addProgramParameter: (parameter: ProgramParameter) => void;
   deleteProgramParameter: (name: string) => void;
@@ -785,6 +786,31 @@ export const useProgramStore = create<ProgramStore>((set, get) => ({
           ? { ...node, data: { ...node.data, params } }
           : node
       ),
+      error: null,
+      isDirty: true,
+    });
+  },
+
+  // Mirrors `updateNodeParams` for the modification_policy block.
+  // The flow node already carries `data.modificationPolicy` (parsed
+  // from the backend on program load and serialized back via
+  // `flowToTree`); this action mutates it locally and flips
+  // `isDirty` so the editor bar's Apply / Save light up the same
+  // way they do for a param edit. Empty-string values mean "drop
+  // the key" so the operator can return to the default-forbidden
+  // behaviour without an explicit `forbidden` entry on disk.
+  updateNodeModificationPolicy: (nodeId, policy) => {
+    set({
+      nodes: get().nodes.map(node => {
+        if (node.id !== nodeId) return node;
+        const trimmed: Record<string, string> = {};
+        for (const [key, value] of Object.entries(policy)) {
+          if (typeof value === 'string' && value.length > 0) {
+            trimmed[key] = value;
+          }
+        }
+        return { ...node, data: { ...node.data, modificationPolicy: trimmed } };
+      }),
       error: null,
       isDirty: true,
     });
