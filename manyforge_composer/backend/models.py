@@ -503,6 +503,16 @@ class LoadDeploymentRequest(BaseModel):
     path: str
 
 
+class StreamingJointLimitResponse(BaseModel):
+    """Per-joint streaming caps (ADR-0016, spec/430 §3.2)."""
+
+    model_config = _ALIAS_CFG
+    max_velocity_rad_s: Optional[float] = Field(default=None, alias="maxVelocityRadS")
+    max_acceleration_rad_s2: Optional[float] = Field(
+        default=None, alias="maxAccelerationRadS2"
+    )
+
+
 class RobotConfigResponse(BaseModel):
     model_config = _ALIAS_CFG
     robot_id: str = Field(alias="robotId")
@@ -511,6 +521,11 @@ class RobotConfigResponse(BaseModel):
     srdf_path: str = Field(default="", alias="srdfPath")
     package_paths: List[str] = Field(default_factory=list, alias="packagePaths")
     global_max_tcp_linear_speed_mps: float = Field(alias="globalMaxTcpLinearSpeedMps")
+    # Per-joint streaming caps keyed by joint name. Empty mapping = all
+    # joints use engine defaults (0.5 rad/s, 2.0 rad/s²).
+    streaming_joint_limits: Dict[str, StreamingJointLimitResponse] = Field(
+        default_factory=dict, alias="streamingJointLimits"
+    )
 
 
 class GripperConfigResponse(BaseModel):
@@ -839,6 +854,7 @@ class SceneObjectResponse(BaseModel):
 class SceneRobotResponse(BaseModel):
     robot_id: Optional[str] = None
     group_id: Optional[str] = None
+    urdf_model_key: Optional[str] = None
     base_frame: str
     tcp_frame: str
     base_pose: Dict[str, Any] = Field(default_factory=dict)
@@ -847,10 +863,25 @@ class SceneRobotResponse(BaseModel):
     tcp_pose_in_base: Optional[Dict[str, Any]] = None
 
 
+class SceneGripperStateResponse(BaseModel):
+    gripper_id: str
+    joint_name: str
+    state: str
+    current_position: Optional[float] = None
+    target_position: Optional[float] = None
+    limit_lower: Optional[float] = None
+    limit_upper: Optional[float] = None
+    motion_time_s: float = 0.0
+    srdf_presets: Dict[str, float] = Field(default_factory=dict)
+    error: Optional[str] = None
+
+
 class SceneStateResponse(BaseModel):
     robot: Optional[SceneRobotResponse] = None
     objects: List[SceneObjectResponse] = Field(default_factory=list)
     link_poses: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
+    grippers: List[SceneGripperStateResponse] = Field(default_factory=list)
+    object_axes_gizmo_size_m: float = 0.1
     timestamp_ns: int
 
 
@@ -901,6 +932,36 @@ class SceneFrameGizmoSizeResponse(BaseModel):
     success: bool
     axes_length_m: float = Field(alias="axesLengthM")
     hmi_available: bool = Field(alias="hmiAvailable")
+    timestamp_ns: int = Field(alias="timestampNs")
+    error: Optional[str] = None
+
+
+class SceneGripperCommandApiRequest(BaseModel):
+    model_config = _ALIAS_CFG
+    gripper_id: str = Field(alias="gripperId", min_length=1)
+    target_position: float = Field(alias="targetPosition")
+    max_effort: Optional[float] = Field(default=None, alias="maxEffort")
+    duration_s: Optional[float] = Field(default=None, alias="durationS", ge=0.0)
+
+
+class SceneGripperCommandApiResponse(BaseModel):
+    model_config = _ALIAS_CFG
+    accepted: bool
+    gripper_id: str = Field(alias="gripperId")
+    target_position: float = Field(alias="targetPosition")
+    error: Optional[str] = None
+    timestamp_ns: int = Field(alias="timestampNs")
+
+
+class SceneObjectAxesGizmoSizeRequest(BaseModel):
+    model_config = _ALIAS_CFG
+    axes_length_m: float = Field(alias="axesLengthM", gt=0.0, le=10.0)
+
+
+class SceneObjectAxesGizmoSizeResponse(BaseModel):
+    model_config = _ALIAS_CFG
+    success: bool
+    axes_length_m: float = Field(alias="axesLengthM")
     timestamp_ns: int = Field(alias="timestampNs")
     error: Optional[str] = None
 

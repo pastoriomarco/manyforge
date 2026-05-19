@@ -23,6 +23,9 @@ interface SceneControlsProps {
 export function SceneControls({ onClose }: SceneControlsProps) {
   const frames = useSceneStateStore((s) => s.frames);
   const objects = useSceneStateStore((s) => s.scene?.objects ?? EMPTY_OBJECTS);
+  const objectAxesGizmoSize = useSceneStateStore(
+    (s) => s.scene?.object_axes_gizmo_size_m ?? 0.1,
+  );
   const robot = useSceneStateStore((s) => s.scene?.robot ?? null);
   const selectedId = useViewerSelectionStore((s) => s.selectedId);
   const setSelected = useViewerSelectionStore((s) => s.setSelected);
@@ -62,7 +65,9 @@ export function SceneControls({ onClose }: SceneControlsProps) {
             gizmoSize={frames?.frameGizmoSizeM ?? 0.1}
           />
         )}
-        {openSection === 'objects' && <ObjectsSection objects={objects} />}
+        {openSection === 'objects' && (
+          <ObjectsSection objects={objects} gizmoSize={objectAxesGizmoSize} />
+        )}
         {openSection === 'tree' && (
           <RuntimeTree
             robot={robot}
@@ -181,15 +186,51 @@ function FrameRow({ frame }: { frame: SceneFrameState }) {
   );
 }
 
-function ObjectsSection({ objects }: { objects: SceneObjectState[] }) {
-  if (objects.length === 0) {
-    return <div className="text-[11px] italic text-gray-500">No scene objects.</div>;
+function ObjectsSection({
+  objects,
+  gizmoSize,
+}: {
+  objects: SceneObjectState[];
+  gizmoSize: number;
+}) {
+  // Local state on the slider so dragging feels responsive even
+  // while the server-side state hasn't returned the new value yet.
+  const [localSize, setLocalSize] = useState<number | null>(null);
+  const displaySize = localSize ?? gizmoSize;
+
+  function commitSize(value: number): void {
+    setLocalSize(null);
+    void api.scene.setObjectAxesGizmoSize(value).catch((err) => {
+      console.warn('object axes gizmo size update failed', err);
+    });
   }
+
   return (
-    <div className="space-y-0.5">
-      {objects.map((obj) => (
-        <ObjectFrameRow key={obj.object_id} object={obj} />
-      ))}
+    <div className="space-y-2">
+      <label className="flex items-center justify-between gap-2 text-[11px]">
+        <span className="text-gray-400">Gizmo size</span>
+        <span className="font-mono text-gray-300">{displaySize.toFixed(3)} m</span>
+      </label>
+      <input
+        type="range"
+        min="0.02"
+        max="1.0"
+        step="0.01"
+        value={displaySize}
+        onChange={(e) => setLocalSize(Number(e.target.value))}
+        onMouseUp={(e) => commitSize(Number((e.target as HTMLInputElement).value))}
+        onTouchEnd={(e) => commitSize(Number((e.target as HTMLInputElement).value))}
+        className="w-full"
+      />
+      {objects.length === 0 ? (
+        <div className="text-[11px] italic text-gray-500">No scene objects.</div>
+      ) : (
+        <div className="space-y-0.5">
+          {objects.map((obj) => (
+            <ObjectFrameRow key={obj.object_id} object={obj} />
+          ))}
+        </div>
+      )}
     </div>
   );
 }

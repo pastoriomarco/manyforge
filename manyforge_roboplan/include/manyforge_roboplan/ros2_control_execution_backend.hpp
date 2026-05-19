@@ -103,6 +103,40 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
   core::ResetResultDTO reset() override;
   core::ExecutionSnapshot get_execution_snapshot() const override;
 
+  // Streaming-session mode (ADR-0016).
+  //
+  // v0.1 ros2_control semantics:
+  //   - Joint-mode targets are first-class: each push builds an anchored
+  //     two-point FollowJointTrajectory (anchor at observed state with
+  //     negative time_from_start, target at the requested joint vector
+  //     with positive time_from_start computed from joint-velocity
+  //     limits). Latest-wins coalescing happens at the streaming worker.
+  //     The negative-time anchor gives JTC's spline a continuous starting
+  //     condition, so successive preempts produce smooth motion (no
+  //     velocity discontinuity at the goal-replacement seam).
+  //   - Cartesian-mode targets are NOT supported in this revision; the
+  //     IK pre-resolution path is deferred. Cartesian pushes return
+  //     unsupported_capability. Operators get Cartesian via the existing
+  //     one-shot /api/direct/cartesian-jog path until IK pre-resolution
+  //     lands; joint sliders are first-class today.
+  //   - Soft stop strategies:
+  //       spring_back  -> final goal: anchor at observed state with
+  //                       negative time_from_start; future point at
+  //                       observed *position* with zero velocity and
+  //                       time_from_start = config.soft_stop_deceleration_time_s.
+  //       velocity_scaling -> NOT YET implemented; falls back to spring_back
+  //                       with a structured warning event. Promoting it to
+  //                       the default requires the qualification matrix in
+  //                       docs/open-points.md.
+  core::StreamingSessionBeginResultDTO begin_streaming_session(
+      const core::StreamingSessionConfigDTO& config) override;
+  core::StreamingPushResultDTO push_streaming_target(
+      uint64_t session_id,
+      const core::StreamingTargetDTO& target) override;
+  core::StreamingSessionEndResultDTO end_streaming_session(
+      uint64_t session_id,
+      core::SoftStopStrategy strategy) override;
+
   void configure_gripper_action(std::string gripper_id,
                                 Ros2GripperActionConfig config);
   Ros2GripperCommandResult command_gripper(const std::string& gripper_id,
@@ -281,6 +315,27 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
 
   mutable std::mutex gripper_map_mutex_;
   std::unordered_map<std::string, std::shared_ptr<GripperRuntime>> grippers_;
+
+  // Streaming-session bookkeeping (ADR-0016).
+  void streaming_dispatch_worker(std::stop_token st);
+  bool streaming_send_anchored_goal(
+      const std::vector<std::string>& joint_names,
+      const std::vector<double>& target_positions,
+      double target_time_from_start_s);
+  bool streaming_send_spring_back_stop();
+
+  mutable std::mutex streaming_mutex_;
+  std::condition_variable streaming_cv_;
+  std::jthread streaming_thread_;
+  std::atomic<bool> streaming_active_{false};
+  uint64_t streaming_session_id_ = 0;
+  uint64_t next_streaming_backend_seq_ = 1;
+  core::StreamingSessionConfigDTO streaming_config_;
+  std::optional<core::StreamingTargetDTO> streaming_target_;
+  // The most-recent goal handle issued by the streaming dispatcher.
+  // Subsequent dispatches preempt it via async_send_goal; the existing
+  // on_action_result callback handles its terminal state.
+  GoalHandleFJT::SharedPtr streaming_active_goal_;
 };
 
 std::shared_ptr<NativeKernelBundle> create_ros2_control_kernel(

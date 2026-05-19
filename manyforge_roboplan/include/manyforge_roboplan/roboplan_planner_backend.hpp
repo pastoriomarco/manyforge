@@ -26,6 +26,8 @@ class RoboPlanPlannerBackend final : public core::IPlannerBackend {
 
   core::PlanResultDTO plan(const core::PlanRequestDTO& request) override;
 
+  core::IkResultDTO solve_ik(const core::IkRequestDTO& request) override;
+
  private:
   core::TrajectoryDTO convert_trajectory(const roboplan::JointTrajectory& traj);
 

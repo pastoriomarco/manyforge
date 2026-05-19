@@ -73,6 +73,7 @@ class StateHub:
                     self._last_broadcast_event_index = kernel_events[-1]["event_index"]
             native_kernel_events = []
             if self._state and self._state.cycle_manager is not None:
+                self._state.cycle_manager.drain_kernel_events_now()
                 native_kernel_events = self._state.cycle_manager.get_kernel_events_since(
                     self._last_kernel_event_index
                 )

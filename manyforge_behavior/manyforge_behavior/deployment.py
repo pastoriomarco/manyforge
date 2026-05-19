@@ -22,6 +22,14 @@ EXPECTED_MODEL_ENDPOINT_PROFILE_REGISTRY_API_VERSION = (
 
 
 @dataclass
+class StreamingJointLimit:
+    """Per-joint streaming caps (ADR-0016, spec/430 §3.2)."""
+
+    max_velocity_rad_s: Optional[float] = None
+    max_acceleration_rad_s2: Optional[float] = None
+
+
+@dataclass
 class RobotConfig:
     robot_id: str
     group_id: str
@@ -29,6 +37,13 @@ class RobotConfig:
     srdf_path: str = ""
     package_paths: list[str] = field(default_factory=list)
     global_max_tcp_linear_speed_mps: float = 0.0
+    # Per-joint streaming caps keyed by joint name. Absent joints fall back
+    # to backend engine defaults (0.5 rad/s velocity, 2.0 rad/s²
+    # acceleration). Validation: joint names must be in the program's
+    # drivable joint set; loaders enforce strictly-positive values.
+    streaming_joint_limits: dict[str, "StreamingJointLimit"] = field(
+        default_factory=dict
+    )
 
 
 @dataclass
@@ -411,6 +426,10 @@ class Deployment:
             "global_max_tcp_linear_speed_mps": (
                 current.global_max_tcp_linear_speed_mps if current is not None else 0.0
             ),
+            "streaming_joint_limits": (
+                {k: v for k, v in current.streaming_joint_limits.items()}
+                if current is not None else {}
+            ),
         }
         merged.update(robot_data)
 
@@ -442,6 +461,54 @@ class Deployment:
                 "robot_config.package_paths must be a list of non-empty strings"
             )
 
+        streaming_limits_raw = merged.get("streaming_joint_limits", {})
+        if streaming_limits_raw is None:
+            streaming_limits_raw = {}
+        if not isinstance(streaming_limits_raw, dict):
+            raise DeploymentValidationError(
+                "robot_config.streaming_joint_limits must be a mapping of "
+                "joint_name -> {max_velocity_rad_s, max_acceleration_rad_s2}"
+            )
+        streaming_limits: dict[str, StreamingJointLimit] = {}
+        for joint_name, limit_raw in streaming_limits_raw.items():
+            if isinstance(limit_raw, StreamingJointLimit):
+                streaming_limits[str(joint_name)] = limit_raw
+                continue
+            if not isinstance(limit_raw, dict):
+                raise DeploymentValidationError(
+                    f"robot_config.streaming_joint_limits['{joint_name}'] must be a mapping"
+                )
+            v = limit_raw.get("max_velocity_rad_s")
+            a = limit_raw.get("max_acceleration_rad_s2")
+            v_val: Optional[float] = None
+            a_val: Optional[float] = None
+            if v is not None:
+                try:
+                    v_val = float(v)
+                except (TypeError, ValueError) as exc:
+                    raise DeploymentValidationError(
+                        f"streaming_joint_limits['{joint_name}'].max_velocity_rad_s must be a number"
+                    ) from exc
+                if v_val <= 0:
+                    raise DeploymentValidationError(
+                        f"streaming_joint_limits['{joint_name}'].max_velocity_rad_s must be > 0"
+                    )
+            if a is not None:
+                try:
+                    a_val = float(a)
+                except (TypeError, ValueError) as exc:
+                    raise DeploymentValidationError(
+                        f"streaming_joint_limits['{joint_name}'].max_acceleration_rad_s2 must be a number"
+                    ) from exc
+                if a_val <= 0:
+                    raise DeploymentValidationError(
+                        f"streaming_joint_limits['{joint_name}'].max_acceleration_rad_s2 must be > 0"
+                    )
+            streaming_limits[str(joint_name)] = StreamingJointLimit(
+                max_velocity_rad_s=v_val,
+                max_acceleration_rad_s2=a_val,
+            )
+
         return RobotConfig(
             robot_id=str(merged["robot_id"]),
             group_id=str(merged["group_id"]),
@@ -449,6 +516,7 @@ class Deployment:
             srdf_path=str(merged.get("srdf_path", "")),
             package_paths=[value.strip() for value in package_paths],
             global_max_tcp_linear_speed_mps=tcp_speed,
+            streaming_joint_limits=streaming_limits,
         )
 
     def _parse_authority_matrix(
@@ -1535,6 +1603,32 @@ class Deployment:
                     f"'{policy.source}'"
                 )
 
+    def validate_streaming_joint_limits_against(
+        self, drivable_joint_names: list[str]
+    ) -> None:
+        """Spec/430 §3.2 cross-validation: every key in
+        `robot_config.streaming_joint_limits` MUST name a drivable joint
+        from the bound URDF's group. Caller is responsible for supplying
+        the joint list (typically `kernel.get_joint_names()` once the
+        kernel/URDF is loaded). Raises `DeploymentValidationError` with
+        the offending name(s) on mismatch so typo'd limits surface
+        rather than silently no-op.
+        """
+        if not self.robot_config or not self.robot_config.streaming_joint_limits:
+            return
+        allowed = set(drivable_joint_names)
+        unknown = [
+            name for name in self.robot_config.streaming_joint_limits.keys()
+            if name not in allowed
+        ]
+        if unknown:
+            allowed_sorted = sorted(allowed)
+            raise DeploymentValidationError(
+                "robot_config.streaming_joint_limits references unknown "
+                f"joint(s): {unknown}. Drivable joints for this robot are: "
+                f"{allowed_sorted}"
+            )
+
     def validate_capabilities(self, program: Any | None = None) -> None:
         """Verify adapter capabilities cover the program profile requirements.
 
@@ -1702,6 +1796,22 @@ class Deployment:
                 "package_paths": self.robot_config.package_paths,
                 "global_max_tcp_linear_speed_mps": self.robot_config.global_max_tcp_linear_speed_mps,
             }
+            # Spec/430 §3.2 streaming-joint-limits round-trip.
+            # Joints where BOTH fields are unset are dropped from the
+            # serialized form so the YAML stays minimal when the
+            # operator hasn't customized anything; loaders treat the
+            # absence as "engine defaults".
+            limits_out: dict[str, dict[str, float]] = {}
+            for joint_name, limit in self.robot_config.streaming_joint_limits.items():
+                entry: dict[str, float] = {}
+                if limit.max_velocity_rad_s is not None:
+                    entry["max_velocity_rad_s"] = float(limit.max_velocity_rad_s)
+                if limit.max_acceleration_rad_s2 is not None:
+                    entry["max_acceleration_rad_s2"] = float(limit.max_acceleration_rad_s2)
+                if entry:
+                    limits_out[joint_name] = entry
+            if limits_out:
+                d["robot_config"]["streaming_joint_limits"] = limits_out
         if self.grippers:
             d["grippers"] = {
                 gripper_id: {

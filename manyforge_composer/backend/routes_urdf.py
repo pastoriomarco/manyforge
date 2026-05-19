@@ -20,12 +20,14 @@ Caching:
 """
 from __future__ import annotations
 
+import hashlib
 import io
 import logging
 import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse, Response
@@ -39,6 +41,12 @@ from manyforge_behavior.model_paths import (
 from .state import ComposerState
 
 logger = logging.getLogger(__name__)
+
+# Public visual-asset protocol revision. Bump this whenever the
+# server-side URDF-to-GLB conversion semantics change. The value is
+# deliberately folded into the model key so browsers and drei cannot
+# reuse immutable GLBs produced by an older converter.
+_VISUAL_ASSET_SCHEMA_VERSION = "r3f-urdf-glb-v3-xyzw"
 
 
 @dataclass(frozen=True)
@@ -68,6 +76,12 @@ class _LinkVisual:
     primitive: dict[str, Any] | None
     visual_origin_xyz: tuple[float, float, float]
     visual_origin_rpy: tuple[float, float, float]
+    # Quaternion (x, y, z, w) derived directly from yourdfpy's rotation
+    # matrix. The frontend MUST prefer this over rpy, because Three.js's
+    # default Euler order is intrinsic XYZ while URDF RPY is fixed-axis
+    # ZYX — these disagree for any compound rotation (e.g. UR10E's
+    # upperarm origin rpy="π/2 0 -π/2").
+    visual_origin_xyzw: tuple[float, float, float, float]
 
 
 @dataclass(frozen=True)
@@ -95,6 +109,16 @@ class _JointEntry:
     limit_upper: Optional[float]
     effort_limit: Optional[float]
     velocity_limit: Optional[float]
+    # Non-None when this joint's value is computed from another joint via
+    # a URDF `<mimic>` declaration. Such joints cannot be commanded
+    # independently and the jog UI must hide them — they follow the
+    # master through FK.
+    mimic: Optional[tuple[str, float, float]] = None  # (master, multiplier, offset)
+    # True when at least one other joint mimics this one. The jog UI
+    # also hides masters until a dedicated gripper widget exists, because
+    # the current MoveIt-planning-group streaming session has no command
+    # path to them.
+    is_mimic_master: bool = False
 
 
 @dataclass
@@ -106,7 +130,7 @@ class _UrdfCacheEntry:
     links: tuple[_LinkEntry, ...]
     joints: tuple[_JointEntry, ...]
     link_names_for_fk: tuple[str, ...]
-    mesh_glb_cache: dict[tuple[str, int], bytes]
+    mesh_glb_cache: dict[tuple[str, int, str, str], bytes]
 
 
 _cache_lock = threading.Lock()
@@ -190,21 +214,43 @@ def _load_urdf_entry(urdf_path: str, package_paths: tuple[str, ...]) -> _UrdfCac
 
     import math
 
-    def _origin_to_xyz_rpy(
+    def _origin_decompose(
         origin: Any,
-    ) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
+    ) -> tuple[
+        tuple[float, float, float],
+        tuple[float, float, float],
+        tuple[float, float, float, float],
+    ]:
+        """Return (xyz, rpy, quat_xyzw) from a 4x4 origin matrix.
+
+        The quaternion is derived directly from the rotation matrix
+        (Shepperd's method), bypassing Euler conventions entirely. The
+        frontend MUST consume the quaternion: Three.js's default Euler
+        order is intrinsic XYZ while URDF RPY is fixed-axis ZYX, and the
+        two disagree for any compound rotation (e.g. UR10E's
+        ``upperarm`` visual origin ``rpy="π/2 0 -π/2"`` ends up 90° off
+        if rpy is fed to ``<group rotation={...}>`` directly).
+        """
+        zero_xyz = (0.0, 0.0, 0.0)
+        zero_rpy = (0.0, 0.0, 0.0)
+        identity_quat = (0.0, 0.0, 0.0, 1.0)
         if origin is None:
-            return (0.0, 0.0, 0.0), (0.0, 0.0, 0.0)
+            return zero_xyz, zero_rpy, identity_quat
         try:
             xyz = (
                 float(origin[0, 3]),
                 float(origin[1, 3]),
                 float(origin[2, 3]),
             )
-            r00, r10 = float(origin[0, 0]), float(origin[1, 0])
-            r20, r21, r22 = float(origin[2, 0]), float(origin[2, 1]), float(origin[2, 2])
-            r12 = float(origin[1, 2])
+            r00 = float(origin[0, 0])
+            r01 = float(origin[0, 1])
+            r02 = float(origin[0, 2])
+            r10 = float(origin[1, 0])
             r11 = float(origin[1, 1])
+            r12 = float(origin[1, 2])
+            r20 = float(origin[2, 0])
+            r21 = float(origin[2, 1])
+            r22 = float(origin[2, 2])
             sy = math.sqrt(r00 * r00 + r10 * r10)
             if sy < 1e-6:
                 roll = math.atan2(-r12, r11)
@@ -214,9 +260,43 @@ def _load_urdf_entry(urdf_path: str, package_paths: tuple[str, ...]) -> _UrdfCac
                 roll = math.atan2(r21, r22)
                 pitch = math.atan2(-r20, sy)
                 yaw = math.atan2(r10, r00)
-            return xyz, (roll, pitch, yaw)
+            # Shepperd's method: numerically robust quaternion extraction.
+            trace = r00 + r11 + r22
+            if trace > 0.0:
+                s = math.sqrt(trace + 1.0) * 2.0
+                qw = 0.25 * s
+                qx = (r21 - r12) / s
+                qy = (r02 - r20) / s
+                qz = (r10 - r01) / s
+            elif r00 > r11 and r00 > r22:
+                s = math.sqrt(1.0 + r00 - r11 - r22) * 2.0
+                qw = (r21 - r12) / s
+                qx = 0.25 * s
+                qy = (r01 + r10) / s
+                qz = (r02 + r20) / s
+            elif r11 > r22:
+                s = math.sqrt(1.0 + r11 - r00 - r22) * 2.0
+                qw = (r02 - r20) / s
+                qx = (r01 + r10) / s
+                qy = 0.25 * s
+                qz = (r12 + r21) / s
+            else:
+                s = math.sqrt(1.0 + r22 - r00 - r11) * 2.0
+                qw = (r10 - r01) / s
+                qx = (r02 + r20) / s
+                qy = (r12 + r21) / s
+                qz = 0.25 * s
+            norm = math.sqrt(qx * qx + qy * qy + qz * qz + qw * qw)
+            if norm > 1e-12:
+                qx /= norm
+                qy /= norm
+                qz /= norm
+                qw /= norm
+            else:
+                qx, qy, qz, qw = 0.0, 0.0, 0.0, 1.0
+            return xyz, (roll, pitch, yaw), (qx, qy, qz, qw)
         except Exception:
-            return (0.0, 0.0, 0.0), (0.0, 0.0, 0.0)
+            return zero_xyz, zero_rpy, identity_quat
 
     def _resolve_mesh_path(mesh_uri: str) -> str | None:
         if mesh_uri.startswith("package://"):
@@ -234,7 +314,7 @@ def _load_urdf_entry(urdf_path: str, package_paths: tuple[str, ...]) -> _UrdfCac
         if geometry is None:
             return None
         origin = getattr(visual, "origin", None)
-        origin_xyz, origin_rpy = _origin_to_xyz_rpy(origin)
+        origin_xyz, origin_rpy, origin_xyzw = _origin_decompose(origin)
 
         mesh = getattr(geometry, "mesh", None)
         if mesh is not None:
@@ -255,6 +335,7 @@ def _load_urdf_entry(urdf_path: str, package_paths: tuple[str, ...]) -> _UrdfCac
                 primitive=None,
                 visual_origin_xyz=origin_xyz,
                 visual_origin_rpy=origin_rpy,
+                visual_origin_xyzw=origin_xyzw,
             )
 
         box = getattr(geometry, "box", None)
@@ -274,6 +355,7 @@ def _load_urdf_entry(urdf_path: str, package_paths: tuple[str, ...]) -> _UrdfCac
                 },
                 visual_origin_xyz=origin_xyz,
                 visual_origin_rpy=origin_rpy,
+                visual_origin_xyzw=origin_xyzw,
             )
 
         cylinder = getattr(geometry, "cylinder", None)
@@ -295,6 +377,7 @@ def _load_urdf_entry(urdf_path: str, package_paths: tuple[str, ...]) -> _UrdfCac
                 },
                 visual_origin_xyz=origin_xyz,
                 visual_origin_rpy=origin_rpy,
+                visual_origin_xyzw=origin_xyzw,
             )
 
         sphere = getattr(geometry, "sphere", None)
@@ -311,6 +394,7 @@ def _load_urdf_entry(urdf_path: str, package_paths: tuple[str, ...]) -> _UrdfCac
                 primitive={"type": "sphere", "radius_m": float(radius)},
                 visual_origin_xyz=origin_xyz,
                 visual_origin_rpy=origin_rpy,
+                visual_origin_xyzw=origin_xyzw,
             )
         return None
 
@@ -330,9 +414,45 @@ def _load_urdf_entry(urdf_path: str, package_paths: tuple[str, ...]) -> _UrdfCac
     # Joint metadata for the Day-5 robot-control overlay. We capture
     # everything we need from `yourdfpy.Joint` here so the manifest
     # response doesn't have to re-parse the URDF on every request.
-    joints: list[_JointEntry] = []
+    #
+    # URDF `<mimic>` joints are pinned to a master joint by a linear
+    # relation (multiplier·q_master + offset). They cannot be commanded
+    # independently — the jog UI must filter them out, and the master
+    # is also filtered until a dedicated gripper widget owns the chain
+    # (the current MoveIt planning-group streaming session has no path
+    # to gripper joints anyway). We collect mimic data in a first pass
+    # and then back-fill `is_mimic_master` on the corresponding entries.
     joint_map = getattr(urdf_model, "joint_map", {}) or {}
+
+    def _extract_mimic(joint: Any) -> Optional[tuple[str, float, float]]:
+        m = getattr(joint, "mimic", None)
+        if m is None:
+            return None
+        master = getattr(m, "joint", None)
+        if not isinstance(master, str) or not master:
+            return None
+        multiplier_raw = getattr(m, "multiplier", 1.0)
+        offset_raw = getattr(m, "offset", 0.0)
+        try:
+            multiplier = float(multiplier_raw) if multiplier_raw is not None else 1.0
+        except (TypeError, ValueError):
+            multiplier = 1.0
+        try:
+            offset = float(offset_raw) if offset_raw is not None else 0.0
+        except (TypeError, ValueError):
+            offset = 0.0
+        return (master, multiplier, offset)
+
+    mimic_by_name: dict[str, tuple[str, float, float]] = {}
     for joint_name, joint in joint_map.items():
+        mimic = _extract_mimic(joint)
+        if mimic is not None:
+            mimic_by_name[str(joint_name)] = mimic
+    masters: set[str] = {master for (master, _, _) in mimic_by_name.values()}
+
+    joints: list[_JointEntry] = []
+    for joint_name, joint in joint_map.items():
+        name = str(joint_name)
         joint_type = str(getattr(joint, "type", "fixed") or "fixed")
         axis_value = getattr(joint, "axis", None)
         if axis_value is not None and len(axis_value) == 3:
@@ -348,7 +468,7 @@ def _load_urdf_entry(urdf_path: str, package_paths: tuple[str, ...]) -> _UrdfCac
         velocity_limit = getattr(limit, "velocity", None) if limit is not None else None
         joints.append(
             _JointEntry(
-                name=str(joint_name),
+                name=name,
                 type=joint_type,
                 axis=axis,
                 parent_link=parent_link,
@@ -357,6 +477,8 @@ def _load_urdf_entry(urdf_path: str, package_paths: tuple[str, ...]) -> _UrdfCac
                 limit_upper=None if limit_upper is None else float(limit_upper),
                 effort_limit=None if effort_limit is None else float(effort_limit),
                 velocity_limit=None if velocity_limit is None else float(velocity_limit),
+                mimic=mimic_by_name.get(name),
+                is_mimic_master=name in masters,
             )
         )
 
@@ -391,6 +513,56 @@ def visual_link_names_for_fk(state: ComposerState) -> tuple[str, ...]:
     return tuple(link.name for link in entry.links)
 
 
+def _mesh_stat_key(mesh_path: str | None) -> str:
+    if mesh_path is None:
+        return "primitive"
+    path = Path(mesh_path)
+    try:
+        stat = path.stat()
+    except OSError:
+        return f"{path.resolve()}|missing"
+    return f"{path.resolve()}|{stat.st_mtime_ns}|{stat.st_size}"
+
+
+def _entry_model_key(entry: _UrdfCacheEntry, robot_id: str | None) -> str:
+    """Stable public key for the active robot visual model content."""
+    digest = hashlib.sha256()
+    digest.update(_VISUAL_ASSET_SCHEMA_VERSION.encode("utf-8"))
+    digest.update(b"\0")
+    digest.update((robot_id or "").encode("utf-8"))
+    digest.update(b"\0")
+    digest.update(str(Path(entry.urdf_path).resolve()).encode("utf-8", errors="replace"))
+    digest.update(b"\0")
+    digest.update(str(entry.mtime_ns).encode("ascii"))
+    digest.update(b"\0")
+    for package_path in entry.package_paths:
+        digest.update(str(Path(package_path).resolve()).encode("utf-8", errors="replace"))
+        digest.update(b"\0")
+    for link in entry.links:
+        digest.update(link.name.encode("utf-8", errors="replace"))
+        digest.update(b"\0")
+        for visual in link.visuals:
+            digest.update(str(visual.visual_index).encode("ascii"))
+            digest.update(b"\0")
+            digest.update((visual.mesh_resource_uri or "").encode("utf-8", errors="replace"))
+            digest.update(b"\0")
+            digest.update(_mesh_stat_key(visual.mesh_path).encode("utf-8", errors="replace"))
+            digest.update(b"\0")
+    return digest.hexdigest()[:24]
+
+
+def active_urdf_model_key(state: ComposerState) -> str | None:
+    """Return the active URDF visual model key for scene-state clients."""
+    entry = get_urdf_entry(state)
+    if entry is None:
+        return None
+    deployment = state.deployment
+    robot_id = None
+    if deployment is not None and deployment.robot_config is not None:
+        robot_id = deployment.robot_config.robot_id
+    return _entry_model_key(entry, robot_id)
+
+
 def _find_visual(
     entry: _UrdfCacheEntry,
     link_name: str,
@@ -410,10 +582,6 @@ def _render_visual_glb(
     entry: _UrdfCacheEntry,
     visual: _LinkVisual,
 ) -> bytes | None:
-    cache_key = (visual.link_name, visual.visual_index)
-    cached = entry.mesh_glb_cache.get(cache_key)
-    if cached is not None:
-        return cached
     # Primitive-only visuals are rendered client-side via Three.js native
     # geometries — no glTF needed. The mesh route returns 404 for these
     # and the frontend uses the manifest's `primitive` block instead.
@@ -428,6 +596,15 @@ def _render_visual_glb(
             mesh_file,
         )
         return None
+    cache_key = (
+        visual.link_name,
+        visual.visual_index,
+        _VISUAL_ASSET_SCHEMA_VERSION,
+        _mesh_stat_key(visual.mesh_path),
+    )
+    cached = entry.mesh_glb_cache.get(cache_key)
+    if cached is not None:
+        return cached
     try:
         import trimesh
     except ImportError:
@@ -483,8 +660,15 @@ def create_urdf_router(state: ComposerState) -> APIRouter:
         robot_id = None
         if deployment is not None and deployment.robot_config is not None:
             robot_id = deployment.robot_config.robot_id
+        # Drei's GLB cache is keyed by URL string, while industrial robot
+        # models often reuse link names across arms. Key mesh URLs by the
+        # resolved URDF content identity, not just robot_id, so switching
+        # UR5 <-> UR10e or editing a same-id deployment cannot reuse stale
+        # link geometry at new FK poses.
+        model_key = _entry_model_key(entry, robot_id)
         return {
             "robot_id": robot_id,
+            "model_key": model_key,
             "root_link": entry.root_link,
             "links": [
                 {
@@ -493,7 +677,8 @@ def create_urdf_router(state: ComposerState) -> APIRouter:
                         {
                             "index": visual.visual_index,
                             "mesh_url": (
-                                f"/api/scene/urdf/meshes/{link.name}/{visual.visual_index}"
+                                f"/api/scene/urdf/models/{model_key}/meshes/"
+                                f"{quote(link.name, safe='')}/{visual.visual_index}"
                                 if visual.mesh_path is not None
                                 else None
                             ),
@@ -501,6 +686,7 @@ def create_urdf_router(state: ComposerState) -> APIRouter:
                             "visual_origin": {
                                 "position_m": list(visual.visual_origin_xyz),
                                 "orientation_rpy_rad": list(visual.visual_origin_rpy),
+                                "orientation_xyzw": list(visual.visual_origin_xyzw),
                             },
                         }
                         for visual in link.visuals
@@ -519,18 +705,44 @@ def create_urdf_router(state: ComposerState) -> APIRouter:
                     "limit_upper": joint.limit_upper,
                     "effort_limit": joint.effort_limit,
                     "velocity_limit": joint.velocity_limit,
+                    "mimic": (
+                        {
+                            "master": joint.mimic[0],
+                            "multiplier": joint.mimic[1],
+                            "offset": joint.mimic[2],
+                        }
+                        if joint.mimic is not None
+                        else None
+                    ),
+                    "is_mimic_master": joint.is_mimic_master,
                 }
                 for joint in entry.joints
             ],
         }
 
-    @router.get("/meshes/{link_name}/{visual_index}")
-    def get_mesh(link_name: str, visual_index: int) -> Response:
+    def _get_mesh_for_model(
+        link_name: str,
+        visual_index: int,
+        requested_model_key: str | None,
+    ) -> Response:
         entry = get_urdf_entry(state)
         if entry is None:
             return JSONResponse(
                 status_code=404,
                 content={"detail": "No URDF available for the active deployment"},
+            )
+        deployment = state.deployment
+        robot_id = None
+        if deployment is not None and deployment.robot_config is not None:
+            robot_id = deployment.robot_config.robot_id
+        active_model_key = _entry_model_key(entry, robot_id)
+        if requested_model_key is not None and requested_model_key != active_model_key:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "detail": "Stale URDF mesh URL for inactive robot model",
+                    "active_model_key": active_model_key,
+                },
             )
         visual = _find_visual(entry, link_name, visual_index)
         if visual is None:
@@ -554,9 +766,31 @@ def create_urdf_router(state: ComposerState) -> APIRouter:
             content=glb_bytes,
             media_type="model/gltf-binary",
             headers={
-                "Cache-Control": "public, max-age=300",
-                "ETag": f'"{entry.mtime_ns}-{link_name}-{visual_index}"',
+                "Cache-Control": (
+                    "public, max-age=31536000, immutable"
+                    if requested_model_key is not None
+                    else "no-store"
+                ),
+                "ETag": f'"{active_model_key}-{link_name}-{visual_index}"',
             },
+        )
+
+    @router.get("/models/{model_key}/meshes/{link_name}/{visual_index}")
+    def get_model_mesh(model_key: str, link_name: str, visual_index: int) -> Response:
+        return _get_mesh_for_model(
+            link_name=link_name,
+            visual_index=visual_index,
+            requested_model_key=model_key,
+        )
+
+    @router.get("/meshes/{link_name}/{visual_index}")
+    def get_mesh(link_name: str, visual_index: int, model: str | None = None) -> Response:
+        # Legacy route kept for older bundles during a rolling local reload.
+        # New manifests always use the model-addressed route above.
+        return _get_mesh_for_model(
+            link_name=link_name,
+            visual_index=visual_index,
+            requested_model_key=model,
         )
 
     return router

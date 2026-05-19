@@ -16,6 +16,7 @@ class ExecutionState(Enum):
     PLANNING = "planning"
     VALIDATING = "validating"
     EXECUTING = "executing"
+    STREAMING = "streaming"  # ADR-0016: streaming-session execution mode
     PAUSED = "paused"
     STOPPING = "stopping"
     STOPPED = "stopped"
@@ -88,6 +89,73 @@ class ObjectState:
 class CommandResult:
     accepted: bool = False
     error: Optional[str] = None
+
+
+@dataclass
+class StreamingSessionConfig:
+    """Configuration for a streaming-session begin call (ADR-0016)."""
+
+    group_id: str = ""
+    joint_names: List[str] = field(default_factory=list)
+    input_mode: str = "cartesian"  # "cartesian" | "joint"
+    cartesian_reference_frame: str = "base"
+    tcp_frame: str = ""  # required for cartesian sessions (ADR-0016 IK pre-resolution)
+    soft_stop_strategy: str = "spring_back"  # "spring_back" | "velocity_scaling"
+    soft_stop_deceleration_time_s: float = 0.4
+    anchor_negative_time_s: float = -0.010
+    target_time_from_start_min_s: float = 0.030
+    max_dispatch_rate_hz: float = 30.0
+    target_max_age_s: float = 0.200
+    velocity_scale: float = 1.0
+    # Absolute Cartesian (TCP) linear speed cap, m/s (ADR-0015 / ADR-0016).
+    # 0.0 = unlimited; deployments should populate from
+    # `robot_config.global_max_tcp_linear_speed_mps`.
+    max_tcp_linear_speed_mps: float = 0.0
+    # Per-joint streaming caps (parallel to joint_names), spec/430 §3.2
+    # streaming-joint-limits + ADR-0016. Sourced at session begin from
+    # `deployment.robot_config.streaming_joint_limits` and laid out in
+    # session-joint-order; zero entries fall back to backend engine
+    # defaults (0.5 rad/s velocity, 2.0 rad/s² acceleration).
+    per_joint_velocity_caps_rad_s: List[float] = field(default_factory=list)
+    per_joint_acceleration_caps_rad_s2: List[float] = field(default_factory=list)
+    principal_id: str = ""
+    authority_source: str = "human"
+    trigger_reason: str = "operator_direct_control"
+
+
+@dataclass
+class StreamingTarget:
+    """A single push_streaming_target payload (ADR-0016)."""
+
+    kind: str = "cartesian"  # "cartesian" | "joint"
+    position_m: List[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])
+    orientation_xyzw: List[float] = field(
+        default_factory=lambda: [0.0, 0.0, 0.0, 1.0]
+    )
+    joint_names: List[str] = field(default_factory=list)
+    joint_positions_rad: List[float] = field(default_factory=list)
+    source_timestamp_ns: int = 0
+    source_sequence: int = 0
+    # Floor on the backend's anchored-FJT time_from_start (s). Populated
+    # by the kernel when enforcing the Cartesian speed cap (ADR-0015 on
+    # streaming sessions); callers typically leave at 0.0.
+    min_time_from_start_s: float = 0.0
+
+
+@dataclass
+class StreamingBeginResult:
+    accepted: bool = False
+    session_id: int = 0
+    error: Optional[str] = None
+    error_code: Optional[str] = None
+
+
+@dataclass
+class StreamingPushResult:
+    accepted: bool = False
+    backend_sequence: int = 0
+    error: Optional[str] = None
+    error_code: Optional[str] = None
 
 
 @dataclass
@@ -345,6 +413,34 @@ class KernelClient(ABC):
 
     @abstractmethod
     def acknowledge_completed(self, execution_id: int) -> CommandResult: ...
+
+    # Streaming-session API (ADR-0016). Default implementations make the new
+    # surface optional for backends that don't support it; the kernel-bound
+    # clients (NativeKernelClient) override with the real implementations.
+    def begin_streaming_session(
+        self, config: StreamingSessionConfig
+    ) -> StreamingBeginResult:
+        return StreamingBeginResult(
+            accepted=False,
+            error="streaming-session mode not supported by this kernel client",
+            error_code="unsupported_capability",
+        )
+
+    def push_streaming_target(
+        self, session_id: int, target: StreamingTarget
+    ) -> StreamingPushResult:
+        return StreamingPushResult(
+            accepted=False,
+            error="streaming-session mode not supported by this kernel client",
+        )
+
+    def end_streaming_session(
+        self, session_id: int, soft_stop_strategy: str = "spring_back"
+    ) -> CommandResult:
+        return CommandResult(
+            accepted=False,
+            error="streaming-session mode not supported by this kernel client",
+        )
 
     @abstractmethod
     def get_status(self) -> ExecutionStatus: ...

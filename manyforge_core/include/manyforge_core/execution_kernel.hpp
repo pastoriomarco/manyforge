@@ -13,6 +13,7 @@
 #include <manyforge_core/types/execution_result.hpp>
 #include <manyforge_core/types/kernel_event.hpp>
 #include <manyforge_core/types/metrics.hpp>
+#include <manyforge_core/types/streaming_session.hpp>
 
 #include <atomic>
 #include <condition_variable>
@@ -72,6 +73,33 @@ class ExecutionKernel {
   /// Valid only when the kernel is currently Completed for exactly the supplied
   /// execution_id. Failed and Stopped executions require Reset/recovery instead.
   AcknowledgeCompletedResultDTO acknowledge_completed(uint64_t execution_id);
+
+  // ---------------------------------------------------------------
+  // Streaming-session mode (ADR-0016).
+  //
+  // begin/push/end form the kernel-side surface for continuous direct-
+  // control inputs. Push targets are not motion-blocking; they are
+  // coalesced by the bound execution backend. stop() / reset() from
+  // kStreaming map to the soft-stop and hard-cancel paths respectively.
+  // Only one streaming session per kernel instance in v0.1.
+  // ---------------------------------------------------------------
+
+  /// Open a streaming session on the bound execution backend. Valid from
+  /// kIdle. Transitions the kernel to kStreaming on accept.
+  StreamingSessionBeginResultDTO begin_streaming_session(
+      const StreamingSessionConfigDTO& config);
+
+  /// Update the active streaming session's current target. Latest-wins
+  /// coalescing applies at the backend; this call MUST NOT block on motion.
+  StreamingPushResultDTO push_streaming_target(
+      uint64_t session_id,
+      const StreamingTargetDTO& target);
+
+  /// End the active streaming session. The backend runs the soft-stop
+  /// trajectory; the kernel transitions kStreaming -> kStopping -> kStopped.
+  StreamingSessionEndResultDTO end_streaming_session(
+      uint64_t session_id,
+      SoftStopStrategy strategy);
 
   /// Get current kernel status.
   ExecutionStatus get_status() const;
@@ -170,6 +198,37 @@ class ExecutionKernel {
   ScheduleHandle collision_monitor_handle_{0};
   uint64_t collision_monitor_generation_ = 0;
   bool collision_monitor_active_ = false;
+
+  // Streaming-session bookkeeping. Only one active session at a time in
+  // v0.1; `active_streaming_session_id_` is 0 when none is active.
+  // `active_backend_session_id_` is the id the backend assigned in its
+  // begin_streaming_session response; the kernel passes THIS id back to
+  // push/end calls so kernel↔backend id mapping stays correct even if
+  // the two counters diverge.
+  mutable std::mutex streaming_session_mutex_;
+  uint64_t next_streaming_session_id_ = 1;
+  uint64_t active_streaming_session_id_ = 0;
+  uint64_t active_backend_session_id_ = 0;
+  StreamingSessionConfigDTO active_streaming_config_;
+  SoftStopStrategy active_soft_stop_strategy_ = SoftStopStrategy::kSpringBack;
+  // Last accepted Cartesian target position (only meaningful when the
+  // active session is cartesian-mode). Used to compute the implied
+  // Cartesian speed between successive frames so the kernel can reject
+  // frames that would exceed `max_tcp_linear_speed_mps`.
+  std::array<double, 3> last_accepted_cartesian_pos_{0.0, 0.0, 0.0};
+  bool last_accepted_cartesian_pos_valid_ = false;
+  int64_t last_accepted_cartesian_ts_ns_ = 0;
+  // Last successfully commanded full joint vector (session-order, per
+  // `active_streaming_config_.joint_names`). Used to overlay partial
+  // joint-mode targets onto the full vector before backend dispatch
+  // — per spec/200 §2 partial-joint-map normalization rules. Seeded
+  // from `context_.get_current_state()` on the first push of a
+  // session; cleared at session begin/end. Updated on backend ACCEPT
+  // for both cartesian (from IK result) and joint (from overlaid
+  // vector) targets, so cartesian-then-joint or joint-then-joint
+  // sequences within a session compose correctly.
+  std::vector<double> last_commanded_joints_;
+  bool last_commanded_joints_valid_ = false;
 
   // Metrics (atomic counters for thread safety)
   mutable std::mutex metrics_mutex_;

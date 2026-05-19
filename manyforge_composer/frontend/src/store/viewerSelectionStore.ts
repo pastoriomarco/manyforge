@@ -5,18 +5,54 @@ interface ViewerCamera {
   target: [number, number, number];
 }
 
-type RobotMode = 'joint' | 'cartesian' | 'pose-edit';
+type RobotMode = 'joint' | 'cartesian' | 'move-to' | 'pose-edit';
+type MoveToSource = 'object' | 'frame' | 'pose';
+type MoveToOrientationMode = 'keep-current' | 'face-down' | 'use-entity';
+
+interface MoveToState {
+  source: MoveToSource;
+  objectId: string | null;
+  frameName: string | null;
+  poseNodeName: string | null;
+  orientationMode: MoveToOrientationMode;
+  offsetXyzM: [number, number, number];
+  offsetRpyDeg: [number, number, number];
+}
+
+const MOVE_TO_DEFAULT_STATE: MoveToState = {
+  source: 'object',
+  objectId: null,
+  frameName: null,
+  poseNodeName: null,
+  orientationMode: 'keep-current',
+  offsetXyzM: [0, 0, 0],
+  offsetRpyDeg: [0, 0, 0],
+};
 type CartesianFrame = 'world' | 'base' | 'tcp';
+type ActivePanel = 'tools' | 'robot' | 'object' | null;
 
 interface ViewerSelectionStore {
   selectedId: string | null;
   lockedIds: Set<string>;
   pendingCamera: ViewerCamera | null;
+  // Which overlay panel is open above the 3D canvas. Lifted out of
+  // SceneViewer local state so Canvas descendants (TcpJogGizmo,
+  // SceneObjectMesh's TransformControls) can gate themselves on
+  // panel focus without prop-drilling through the Canvas boundary.
+  // Switching the active panel implicitly stops the relevant
+  // gizmos — the gizmo components unmount and their cleanup
+  // effects abort any open streaming session.
+  activePanel: ActivePanel;
   // Day-5c: robot-panel mode. The Cartesian mode renders a TCP
   // gizmo inside the 3D Canvas (managed by SceneViewer reading from
   // this store). Joint mode hides the gizmo. Pose-Edit mode is
   // non-destructive — sliders edit stored values, no commanding.
   robotMode: RobotMode;
+  // Move-To tab state. Lives in the store so the 3D ghost preview
+  // (rendered inside the Canvas) can read the same selection the
+  // panel UI is editing. Reset on panel close so each session starts
+  // from a clean default.
+  moveTo: MoveToState;
   cartesianFrame: CartesianFrame;
   cartesianGizmoMode: 'translate' | 'rotate';
   // True while the TCP jog gizmo is actively being dragged. Flips
@@ -26,18 +62,50 @@ interface ViewerSelectionStore {
   // jog request only races there on mouseUp / the first
   // follow-throttle tick).
   isDraggingGizmo: boolean;
+  // ADR-0016 streaming-session UX: short label shown when the most-
+  // recent streamed Cartesian target was rejected by the kernel/backend
+  // (e.g. IK failure when the gizmo is dragged out of reach). Held in
+  // the store rather than TcpJogGizmo's local state because frequent
+  // state changes on the gizmo component caused TransformControls to
+  // mount/remount and fire spurious onMouseDown events. The indicator
+  // is rendered by a separate sibling component that subscribes here.
+  cartesianRejectionLabel: string | null;
+  /// Live anchor pose used by the magenta indicator to track the gizmo
+  /// position. Vec3 + xyzw quat; null when no streaming session is active.
+  cartesianRejectionAnchor: {
+    position: [number, number, number];
+    quaternion: [number, number, number, number];
+  } | null;
   setSelected: (id: string | null) => void;
   toggleLocked: (id: string) => void;
   isLocked: (id: string) => boolean;
   setPendingCamera: (cam: ViewerCamera | null) => void;
   consumePendingCamera: () => ViewerCamera | null;
+  setActivePanel: (panel: ActivePanel) => void;
+  toggleActivePanel: (panel: NonNullable<ActivePanel>) => void;
   setRobotMode: (mode: RobotMode) => void;
+  patchMoveTo: (patch: Partial<MoveToState>) => void;
+  resetMoveTo: () => void;
   setCartesianFrame: (frame: CartesianFrame) => void;
   setCartesianGizmoMode: (mode: 'translate' | 'rotate') => void;
   setDraggingGizmo: (next: boolean) => void;
+  setCartesianRejection: (
+    label: string | null,
+    anchor?: {
+      position: [number, number, number];
+      quaternion: [number, number, number, number];
+    } | null,
+  ) => void;
 }
 
-export type { RobotMode, CartesianFrame };
+export type {
+  RobotMode,
+  CartesianFrame,
+  ActivePanel,
+  MoveToSource,
+  MoveToOrientationMode,
+  MoveToState,
+};
 
 /**
  * Shared viewer-side selection state.
@@ -63,10 +131,14 @@ export const useViewerSelectionStore = create<ViewerSelectionStore>((set, get) =
   selectedId: null,
   lockedIds: new Set<string>(),
   pendingCamera: null,
+  activePanel: null,
   robotMode: 'joint',
+  moveTo: MOVE_TO_DEFAULT_STATE,
   cartesianFrame: 'world',
   cartesianGizmoMode: 'translate',
   isDraggingGizmo: false,
+  cartesianRejectionLabel: null,
+  cartesianRejectionAnchor: null,
   setSelected: (id) => set({ selectedId: id }),
   toggleLocked: (id) =>
     set((state) => {
@@ -82,10 +154,21 @@ export const useViewerSelectionStore = create<ViewerSelectionStore>((set, get) =
     if (current !== null) set({ pendingCamera: null });
     return current;
   },
+  setActivePanel: (panel) => set({ activePanel: panel }),
+  toggleActivePanel: (panel) =>
+    set((state) => ({ activePanel: state.activePanel === panel ? null : panel })),
   setRobotMode: (mode) => set({ robotMode: mode }),
+  patchMoveTo: (patch) => set((state) => ({ moveTo: { ...state.moveTo, ...patch } })),
+  resetMoveTo: () => set({ moveTo: MOVE_TO_DEFAULT_STATE }),
   setCartesianFrame: (frame) => set({ cartesianFrame: frame }),
   setCartesianGizmoMode: (mode) => set({ cartesianGizmoMode: mode }),
   setDraggingGizmo: (next) => set({ isDraggingGizmo: next }),
+  setCartesianRejection: (label, anchor) =>
+    set((state) => ({
+      cartesianRejectionLabel: label,
+      cartesianRejectionAnchor:
+        anchor !== undefined ? anchor : state.cartesianRejectionAnchor,
+    })),
 }));
 
 /**

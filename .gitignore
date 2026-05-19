@@ -1,4 +1,7 @@
 build/
+build_*/
+cmake-build-*/
+_build/
 install/
 log/
 __pycache__/
@@ -8,3 +11,8 @@ __pycache__/
 .docker/
 node_modules/
 dist/
+dist.*-old/
+*.tmp
+.tsbuildinfo/
+.vite-temp/
+.vite/

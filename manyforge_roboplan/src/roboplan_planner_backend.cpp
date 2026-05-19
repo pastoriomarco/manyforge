@@ -616,4 +616,98 @@ core::TrajectoryDTO RoboPlanPlannerBackend::convert_trajectory(
   return dto;
 }
 
+// =================================================================
+// Single-shot IK for streaming-session execution mode (ADR-0016).
+//
+// Reuses the SimpleIk solver already configured for this backend.
+// Distinct from plan(): no trajectory shaping, no collision check, no
+// RRT — just a pose-to-joint resolve with the previous-frame joints as
+// seed for continuity across streamed frames.
+// =================================================================
+core::IkResultDTO RoboPlanPlannerBackend::solve_ik(
+    const core::IkRequestDTO& request) {
+  core::IkResultDTO result;
+
+  if (!ik_) {
+    result.ok = false;
+    result.error = core::ErrorDTO{
+        std::string(core::to_string(core::ErrorCode::kUnsupportedCapability)),
+        "no IK solver configured on this planner backend",
+        {}};
+    return result;
+  }
+
+  // Build the 4x4 target transform from the requested pose. Same conversion
+  // used in plan() above; factored inline to avoid lifting a helper.
+  Eigen::Matrix4d tform = Eigen::Matrix4d::Identity();
+  tform(0, 3) = request.goal_pose.position_m.x_m;
+  tform(1, 3) = request.goal_pose.position_m.y_m;
+  tform(2, 3) = request.goal_pose.position_m.z_m;
+  const double x = request.goal_pose.orientation.x;
+  const double y = request.goal_pose.orientation.y;
+  const double z = request.goal_pose.orientation.z;
+  const double w = request.goal_pose.orientation.w;
+  tform(0, 0) = 1 - 2 * y * y - 2 * z * z;
+  tform(0, 1) = 2 * x * y - 2 * z * w;
+  tform(0, 2) = 2 * x * z + 2 * y * w;
+  tform(1, 0) = 2 * x * y + 2 * z * w;
+  tform(1, 1) = 1 - 2 * x * x - 2 * z * z;
+  tform(1, 2) = 2 * y * z - 2 * x * w;
+  tform(2, 0) = 2 * x * z - 2 * y * w;
+  tform(2, 1) = 2 * y * z + 2 * x * w;
+  tform(2, 2) = 1 - 2 * x * x - 2 * y * y;
+
+  roboplan::CartesianConfiguration cart_config;
+  cart_config.base_frame = request.base_frame;
+  cart_config.tip_frame = request.tcp_frame;
+  cart_config.tform = tform;
+
+  // Seed must come from the caller. The kernel populates request.seed_state
+  // from the live planning context before invoking solve_ik. Empty seeds
+  // fail fast — the IK solver needs a starting configuration for continuity.
+  if (request.seed_state.joint_names.empty() ||
+      request.seed_state.joint_names.size() !=
+          request.seed_state.positions_rad.size()) {
+    result.ok = false;
+    result.error = core::ErrorDTO{
+        std::string(core::to_string(core::ErrorCode::kInvalidRequest)),
+        "solve_ik requires a non-empty seed_state with matching joint names "
+        "and positions; kernel populates from planning-context current state",
+        {}};
+    return result;
+  }
+
+  roboplan::JointConfiguration start_config;
+  roboplan::JointConfiguration goal_config;
+  Eigen::VectorXd seed_positions(request.seed_state.positions_rad.size());
+  for (size_t i = 0; i < request.seed_state.positions_rad.size(); ++i) {
+    seed_positions[i] = request.seed_state.positions_rad[i];
+  }
+  start_config.joint_names = request.seed_state.joint_names;
+  start_config.positions = seed_positions;
+  goal_config.joint_names = start_config.joint_names;
+  goal_config.positions = start_config.positions;  // seed with start
+
+  {
+    std::lock_guard<std::mutex> lock(*scene_mutex_);
+    if (!ik_->solveIk(cart_config, start_config, goal_config)) {
+      result.ok = false;
+      result.error = core::ErrorDTO{
+          std::string(core::to_string(core::ErrorCode::kIkFailed)),
+          "IK failed for streaming target",
+          {{"base_frame", request.base_frame},
+           {"tcp_frame", request.tcp_frame}}};
+      return result;
+    }
+  }
+
+  result.ok = true;
+  result.joint_names = goal_config.joint_names;
+  result.positions_rad.resize(goal_config.positions.size());
+  for (Eigen::Index i = 0; i < goal_config.positions.size(); ++i) {
+    result.positions_rad[i] = goal_config.positions[i];
+  }
+  return result;
+}
+
 }  // namespace manyforge::roboplan_backend

@@ -31,7 +31,20 @@ class RoboPlanExecutionBackend final : public core::IExecutionBackend {
   core::PauseResultDTO pause() override;
   core::ExecutionHandle resume(const core::TrajectoryDTO& trajectory) override;
   core::ResetResultDTO reset() override;
-  core::ExecutionSnapshot get_execution_snapshot() const;
+  core::ExecutionSnapshot get_execution_snapshot() const override;
+
+  // Streaming-session mode (ADR-0016). v0.1 of the simulated path supports
+  // joint-mode targets only; cartesian targets are rejected with
+  // unsupported_capability and the caller is expected to pre-resolve IK
+  // (the ros2_control adapter handles cartesian IK internally via roboplan).
+  core::StreamingSessionBeginResultDTO begin_streaming_session(
+      const core::StreamingSessionConfigDTO& config) override;
+  core::StreamingPushResultDTO push_streaming_target(
+      uint64_t session_id,
+      const core::StreamingTargetDTO& target) override;
+  core::StreamingSessionEndResultDTO end_streaming_session(
+      uint64_t session_id,
+      core::SoftStopStrategy strategy) override;
 
  private:
   struct ExecutionStateData {
@@ -48,6 +61,12 @@ class RoboPlanExecutionBackend final : public core::IExecutionBackend {
       const core::TrajectoryDTO& trajectory, double time_s) const;
   void execution_worker(std::stop_token st, core::TrajectoryDTO trajectory);
 
+  // Streaming-session worker. Drives the scene toward the latest joint
+  // target at a tick cadence governed by the session's max_dispatch_rate_hz.
+  // Cartesian targets are rejected at push time; the simulated path expects
+  // pre-resolved joint targets.
+  void streaming_worker(std::stop_token st);
+
   std::shared_ptr<roboplan::Scene> scene_;
   std::string group_name_;
   core::IClock& clock_;
@@ -58,6 +77,35 @@ class RoboPlanExecutionBackend final : public core::IExecutionBackend {
   std::condition_variable execution_cv_;
   std::jthread worker_thread_;
   ExecutionStateData state_;
+
+  // Streaming-session state (ADR-0016).
+  mutable std::mutex streaming_mutex_;
+  std::condition_variable streaming_cv_;
+  std::jthread streaming_thread_;
+  std::atomic<bool> streaming_active_{false};
+  uint64_t streaming_session_id_ = 0;
+  uint64_t next_streaming_backend_seq_ = 1;
+  core::StreamingSessionConfigDTO streaming_config_;
+  std::optional<core::StreamingTargetDTO> streaming_target_;  // latest-wins
+  // Last-commanded joint vector for the streaming session. The worker
+  // interpolates toward the latest target one tick at a time, respecting
+  // both the joint-velocity cap and `min_time_from_start_s` (which the
+  // kernel populates from the deployment's
+  // `global_max_tcp_linear_speed_mps`, ADR-0015). Cleared on begin/end.
+  std::optional<std::vector<double>> streaming_commanded_joints_;
+  // Last-tick velocity per joint for the streaming session, parallel to
+  // `streaming_commanded_joints_`. Used by the acceleration limiter:
+  // velocity change per tick is bounded by `a_cap[i] * tick_s` so the
+  // arm doesn't snap to its velocity cap in one step. Cleared on
+  // begin/end alongside the position vector.
+  std::optional<std::vector<double>> streaming_commanded_velocities_;
+  // One-shot diagnostic flag: set true when the streaming worker
+  // first enters the hold branch (because the published snapshot's
+  // joint vector doesn't cover every session joint, so it can't be
+  // used as a seed). Used to emit a stderr line once per session
+  // entry so docker logs catches the failure without spamming a
+  // log line every tick. Reset on each begin_streaming_session.
+  bool streaming_hold_emitted_ = false;
 };
 
 }  // namespace manyforge::roboplan_backend

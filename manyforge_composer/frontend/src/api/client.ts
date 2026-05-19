@@ -26,6 +26,10 @@ import type {
   SceneFrameGizmoSizeResponse,
   SceneFrameVisibilityResponse,
   SceneObjectFrameVisibilityResponse,
+  SceneObjectAxesGizmoSizeResponse,
+  SceneGripperCommandResponse,
+  PreviewLinkPosesRequest,
+  PreviewLinkPosesResponse,
   AssistantChatRequest,
   AssistantChatResponse,
   AssistantProviderCatalog,
@@ -213,8 +217,8 @@ export const api = {
   },
   urdf: {
     manifest: () => request<SceneUrdfManifest>('GET', '/api/scene/urdf/manifest'),
-    meshUrl: (linkName: string) =>
-      `${BASE_URL}/api/scene/urdf/meshes/${encodeURIComponent(linkName)}`,
+    meshUrl: (modelKey: string, linkName: string, visualIndex = 0) =>
+      `${BASE_URL}/api/scene/urdf/models/${encodeURIComponent(modelKey)}/meshes/${encodeURIComponent(linkName)}/${visualIndex}`,
   },
   direct: {
     // Day 5b: operator-driven single-joint jog from the
@@ -252,6 +256,23 @@ export const api = {
       request<SceneFrameGizmoSizeResponse>('POST', '/api/scene/frames/gizmo-size', { axesLengthM }),
     setObjectFrameVisibility: (objectId: string, visible: boolean) =>
       request<SceneObjectFrameVisibilityResponse>('POST', '/api/scene/objects/frame-visibility', { objectId, visible }),
+    setObjectAxesGizmoSize: (axesLengthM: number) =>
+      request<SceneObjectAxesGizmoSizeResponse>('POST', '/api/scene/objects/gizmo-size', { axesLengthM }),
+    commandGripper: (payload: {
+      gripperId: string;
+      targetPosition: number;
+      maxEffort?: number;
+      durationS?: number;
+    }) =>
+      request<SceneGripperCommandResponse>('POST', '/api/scene/gripper/command', payload),
+    // Ghost-robot preview: given a target joint config OR a cartesian
+    // TCP pose, returns link_poses at that config (running IK then
+    // per-link FK on the kernel's planning context, no scene state
+    // mutation). On IK failure returns {reachable: false} + the TCP
+    // pose so the frontend can render a red TCP-only ghost as the
+    // "won't reach" indicator.
+    previewLinkPoses: (payload: PreviewLinkPosesRequest) =>
+      request<PreviewLinkPosesResponse>('POST', '/api/scene/preview-link-poses', payload),
   },
   assistant: {
     providers: () =>

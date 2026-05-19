@@ -1,7 +1,9 @@
 #pragma once
 
-#include <manyforge_core/types/trajectory_dto.hpp>
+#include <manyforge_core/types/error_code.hpp>
 #include <manyforge_core/types/execution_result.hpp>
+#include <manyforge_core/types/streaming_session.hpp>
+#include <manyforge_core/types/trajectory_dto.hpp>
 
 namespace manyforge::core {
 
@@ -70,6 +72,72 @@ class IExecutionBackend {
     /// observed/predicted execution state without forcing the kernel or UI to
     /// know which ROS topics/actions produced it.
     virtual ExecutionSnapshot get_execution_snapshot() const = 0;
+
+    // ---------------------------------------------------------------
+    // Streaming-session mode (ADR-0016).
+    //
+    // These operations are additive on top of the discrete-trajectory
+    // contract above. They are mutually exclusive with execute_trajectory:
+    // the backend MUST NOT host an active trajectory execution and an
+    // active streaming session simultaneously.
+    //
+    // Default implementations return invalid_request so backends that have
+    // not opted into the streaming-session mode keep building. Backends
+    // that DO support streaming override all three.
+    // ---------------------------------------------------------------
+
+    /// Open a streaming session (ADR-0016 §"Surface").
+    ///
+    /// On accept, the backend prepares its target register and any
+    /// controller-side state required to dispatch rolling-horizon goals,
+    /// and returns a backend-assigned session_id. The kernel transitions
+    /// kIdle -> kStreaming on accept.
+    virtual StreamingSessionBeginResultDTO begin_streaming_session(
+        const StreamingSessionConfigDTO& /*config*/) {
+      StreamingSessionBeginResultDTO result;
+      result.accepted = false;
+      result.error = ErrorDTO{
+          std::string(to_string(ErrorCode::kInvalidRequest)),
+          "streaming-session mode not supported by this execution backend",
+          {}};
+      return result;
+    }
+
+    /// Update the active streaming session's current target.
+    ///
+    /// Latest-writes-win; targets that arrive faster than the backend can
+    /// dispatch are coalesced. MUST NOT block on motion completion. Returns
+    /// a backend-assigned sequence number that downstream
+    /// streaming_target_dispatched events correlate with.
+    virtual StreamingPushResultDTO push_streaming_target(
+        uint64_t /*session_id*/,
+        const StreamingTargetDTO& /*target*/) {
+      StreamingPushResultDTO result;
+      result.accepted = false;
+      result.error = ErrorDTO{
+          std::string(to_string(ErrorCode::kInvalidRequest)),
+          "streaming-session mode not supported by this execution backend",
+          {}};
+      return result;
+    }
+
+    /// End the streaming session using the supplied soft-stop strategy.
+    ///
+    /// The backend runs the soft-stop trajectory (or velocity-scaling ramp)
+    /// per the strategy. The session reaches terminal state once the
+    /// soft-stop completes; the kernel transitions kStreaming -> kStopping
+    /// -> kStopped via the standard state-machine path.
+    virtual StreamingSessionEndResultDTO end_streaming_session(
+        uint64_t /*session_id*/,
+        SoftStopStrategy /*strategy*/) {
+      StreamingSessionEndResultDTO result;
+      result.accepted = false;
+      result.error = ErrorDTO{
+          std::string(to_string(ErrorCode::kInvalidRequest)),
+          "streaming-session mode not supported by this execution backend",
+          {}};
+      return result;
+    }
 };
 
 }  // namespace manyforge::core

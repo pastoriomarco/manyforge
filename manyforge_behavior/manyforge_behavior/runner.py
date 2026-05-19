@@ -26,6 +26,7 @@ from manyforge_behavior.nodes.logic import (
     WaitForGripperState,
 )
 from manyforge_behavior.nodes.motion import MoveManipulatorAction, ResetTrajectories, _rpy_deg_to_xyzw
+from manyforge_behavior.nodes.streaming import TrackTargetAction
 from manyforge_behavior.nodes.scene import (
     AddCollisionObject,
     AttachObjectToLink,
@@ -55,6 +56,7 @@ from manyforge_behavior.skill_loader import (
 # Composites/decorators are handled separately since they need children.
 PLUGIN_FACTORY: dict[str, type] = {
     "move_manipulator_action": MoveManipulatorAction,
+    "track_target_action": TrackTargetAction,  # ADR-0016 streaming session
     "reset_trajectories": ResetTrajectories,
     "add_collision_object": AddCollisionObject,
     "upsert_collision_object": UpsertCollisionObject,

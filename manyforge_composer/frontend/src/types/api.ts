@@ -399,6 +399,11 @@ export interface AuthorityDomainConfig {
   description: string;
 }
 
+export interface StreamingJointLimit {
+  maxVelocityRadS?: number | null;
+  maxAccelerationRadS2?: number | null;
+}
+
 export interface RobotConfig {
   robotId: string;
   groupId: string;
@@ -406,6 +411,8 @@ export interface RobotConfig {
   srdfPath: string;
   packagePaths: string[];
   globalMaxTcpLinearSpeedMps: number;
+  /** Per-joint streaming caps (ADR-0016). Empty = all joints use engine defaults. */
+  streamingJointLimits?: Record<string, StreamingJointLimit>;
 }
 
 export interface GripperConfig {
@@ -517,6 +524,7 @@ export interface RuntimeStatus {
 export interface SceneRobotState {
   robot_id?: string | null;
   group_id?: string | null;
+  urdf_model_key?: string | null;
   base_frame: string;
   tcp_frame: string;
   base_pose?: Record<string, unknown>;
@@ -536,10 +544,25 @@ export interface SceneObjectState {
   viewer_frame_visible: boolean;
 }
 
+export interface SceneGripperState {
+  gripper_id: string;
+  joint_name: string;
+  state: string;
+  current_position: number | null;
+  target_position: number | null;
+  limit_lower: number | null;
+  limit_upper: number | null;
+  motion_time_s: number;
+  srdf_presets: Record<string, number>;
+  error: string | null;
+}
+
 export interface SceneStateResponse {
   robot?: SceneRobotState | null;
   objects: SceneObjectState[];
   link_poses?: Record<string, { position_m: number[]; orientation_xyzw: number[] }>;
+  grippers?: SceneGripperState[];
+  object_axes_gizmo_size_m?: number;
   timestamp_ns: number;
 }
 
@@ -555,6 +578,7 @@ export interface SceneUrdfVisual {
   visual_origin: {
     position_m: number[];
     orientation_rpy_rad: number[];
+    orientation_xyzw?: number[];
   };
 }
 
@@ -581,10 +605,13 @@ export interface SceneUrdfJoint {
   limit_upper: number | null;
   effort_limit: number | null;
   velocity_limit: number | null;
+  mimic?: { master: string; multiplier: number; offset: number } | null;
+  is_mimic_master?: boolean;
 }
 
 export interface SceneUrdfManifest {
   robot_id: string | null;
+  model_key?: string | null;
   root_link: string;
   links: SceneUrdfLink[];
   joints?: SceneUrdfJoint[];
@@ -608,6 +635,37 @@ export interface SceneEditResponse {
   error?: string | null;
   timestamp_ns: number;
 }
+
+/**
+ * Ghost-robot preview request — see /api/scene/preview-link-poses.
+ * `kind: 'joint'` uses joint_names + joint_positions_rad directly;
+ * `kind: 'cartesian'` runs IK against tcp_pose first (the seed
+ * joint_names + joint_positions_rad are optional; if absent the
+ * kernel uses the current robot state as seed).
+ */
+export interface PreviewLinkPosesRequest {
+  kind: 'cartesian' | 'joint';
+  base_frame?: string;
+  link_names?: string[];
+  joint_names?: string[];
+  joint_positions_rad?: number[];
+  tcp_frame?: string;
+  tcp_position_m?: [number, number, number];
+  tcp_orientation_xyzw?: [number, number, number, number];
+}
+
+export type PreviewLinkPosesResponse =
+  | {
+      reachable: true;
+      joint_names: string[];
+      joint_positions_rad: number[];
+      link_poses: Record<string, { position_m: number[]; orientation_xyzw: number[] }>;
+    }
+  | {
+      reachable: false;
+      reason: string;
+      tcp_pose?: { position_m: number[]; orientation_xyzw: number[] };
+    };
 
 export interface SceneFrameState {
   name: string;
@@ -648,6 +706,21 @@ export interface SceneObjectFrameVisibilityResponse {
   hmiAvailable: boolean;
   timestampNs: number;
   error?: string | null;
+}
+
+export interface SceneObjectAxesGizmoSizeResponse {
+  success: boolean;
+  axesLengthM: number;
+  timestampNs: number;
+  error?: string | null;
+}
+
+export interface SceneGripperCommandResponse {
+  accepted: boolean;
+  gripperId: string;
+  targetPosition: number;
+  error?: string | null;
+  timestampNs: number;
 }
 
 export interface ModelEndpointProbe {

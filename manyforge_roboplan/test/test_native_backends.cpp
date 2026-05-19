@@ -4,6 +4,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <thread>
@@ -531,6 +532,80 @@ TEST_F(NativeKernelTest, ExecutionBackendResetPublishesAuthoritativeIdleSnapshot
   EXPECT_EQ(later_snapshot.state, ExecutionState::kIdle);
   EXPECT_DOUBLE_EQ(later_snapshot.progress, 0.0);
   EXPECT_TRUE(later_snapshot.joint_positions_rad.empty());
+}
+
+TEST_F(NativeKernelTest, KernelStreamingSnapshotFollowsBackendLiveState) {
+  auto start_state = bundle_->context->get_current_state();
+  ASSERT_FALSE(start_state.joint_names.empty());
+  ASSERT_EQ(start_state.joint_names.size(), start_state.positions_rad.size());
+
+  StreamingSessionConfigDTO config;
+  config.group_id = "arm";
+  config.joint_names = start_state.joint_names;
+  config.default_input_mode = StreamingInputMode::kJoint;
+  config.max_dispatch_rate_hz = 30.0;
+
+  auto begin = bundle_->kernel->begin_streaming_session(config);
+  ASSERT_TRUE(begin.accepted) << (begin.error ? begin.error->message : "");
+
+  const double target = start_state.positions_rad[0] + 0.25;
+  StreamingTargetDTO command;
+  command.kind = StreamingInputMode::kJoint;
+  command.joint_names = {start_state.joint_names[0]};
+  command.joint_positions_rad = {target};
+  command.source_sequence = 1;
+
+  auto push = bundle_->kernel->push_streaming_target(begin.session_id, command);
+  ASSERT_TRUE(push.accepted) << (push.error ? push.error->message : "");
+
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(3);
+  ExecutionSnapshot live_snapshot;
+  bool saw_live_progress = false;
+  bool reached_target = false;
+  do {
+    live_snapshot = bundle_->kernel->get_execution_snapshot();
+    if (live_snapshot.joint_positions_rad.size() ==
+        start_state.positions_rad.size()) {
+      if (std::abs(live_snapshot.joint_positions_rad[0] -
+                   start_state.positions_rad[0]) > 0.01) {
+        saw_live_progress = true;
+      }
+      if (std::abs(live_snapshot.joint_positions_rad[0] - target) < 1e-3) {
+        reached_target = true;
+      }
+    }
+    if (saw_live_progress && reached_target) {
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  } while (std::chrono::steady_clock::now() < deadline);
+
+  EXPECT_EQ(live_snapshot.state, ExecutionState::kStreaming);
+  ASSERT_EQ(live_snapshot.joint_positions_rad.size(),
+            start_state.positions_rad.size());
+  EXPECT_TRUE(saw_live_progress)
+      << "kernel observers must see backend streaming progress; otherwise "
+         "Composer joint controls cannot close deterministically";
+  ASSERT_TRUE(reached_target)
+      << "test must keep the streaming session open until arrival; "
+         "end_streaming_session is a soft-stop primitive, not a finish-to-target "
+         "primitive";
+
+  auto end =
+      bundle_->kernel->end_streaming_session(begin.session_id,
+                                             SoftStopStrategy::kSpringBack);
+  EXPECT_TRUE(end.accepted) << (end.error ? end.error->message : "");
+  EXPECT_EQ(bundle_->kernel->get_status().state, ExecutionState::kIdle);
+
+  const auto final_snapshot = bundle_->kernel->get_execution_snapshot();
+  EXPECT_EQ(final_snapshot.state, ExecutionState::kIdle);
+  ASSERT_EQ(final_snapshot.joint_positions_rad.size(),
+            start_state.positions_rad.size());
+  EXPECT_NEAR(final_snapshot.joint_positions_rad[0], target, 1e-3)
+      << "clean streaming end must retain the final backend joint state in "
+         "the observer snapshot; otherwise Composer controls jump back to "
+         "a stale pre-streaming value";
 }
 
 TEST_F(NativeKernelTest, KernelExecuteWaitsForTimedBackendCompletion) {

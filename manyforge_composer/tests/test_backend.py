@@ -2555,6 +2555,34 @@ def test_kernel_events_no_program(client):
     assert data["last_event_index"] == 0
 
 
+def test_kernel_events_drains_direct_kernel_events():
+    """GET /api/kernel/events drains events produced outside the cycle tick loop."""
+    from manyforge_behavior.kernel_client import ExecuteRequest
+
+    kernel = MockKernelClient()
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    app = create_app(state, security=_TEST_SECURITY)
+    with TestClient(app) as client:
+        client.post("/api/program/load", json={"path": _PROGRAM_PATH})
+        kernel.execute(
+            ExecuteRequest(
+                robot_id="r",
+                group_id="g",
+                move_id="direct",
+                base_frame="base_link",
+                tcp_frame="tool0",
+                motion_type="joint_goal",
+            )
+        )
+
+        response = client.get("/api/kernel/events?since=0")
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data["events"]) > 0
+        assert data["last_event_index"] > 0
+        assert all("event_index" in event for event in data["events"])
+
+
 def test_kernel_events_after_execution():
     """GET /api/kernel/events returns events after program execution."""
     import time

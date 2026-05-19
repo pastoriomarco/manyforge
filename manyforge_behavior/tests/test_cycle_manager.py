@@ -1882,3 +1882,27 @@ class TestKernelEventBridge:
         assert len(new_events) == 0
 
         manager.reset()
+
+    def test_cycle_manager_drains_direct_kernel_events_on_demand(self, kernel):
+        """Direct kernel calls can be surfaced without waiting for a tree tick."""
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        manager = CycleManager(runner, kernel)
+
+        from manyforge_behavior.kernel_client import ExecuteRequest
+        req = ExecuteRequest(
+            robot_id="r",
+            group_id="g",
+            move_id="direct",
+            base_frame="base_link",
+            tcp_frame="tool0",
+            motion_type="joint_goal",
+        )
+        kernel.execute(req)
+
+        assert manager.get_kernel_events_since(0) == []
+        drained = manager.drain_kernel_events_now()
+        assert len(drained) > 0
+        events = manager.get_kernel_events_since(0)
+        assert len(events) == len(drained)
+        assert all("event_index" in event for event in events)
+        assert manager.drain_kernel_events_now() == []

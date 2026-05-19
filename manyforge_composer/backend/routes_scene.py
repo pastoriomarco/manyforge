@@ -9,7 +9,10 @@ from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import JSONResponse, Response
 
 from manyforge_behavior.cycle_manager import CycleState
-from manyforge_behavior.kernel_client import SceneEditRequest
+from manyforge_behavior.kernel_client import (
+    GripperCommandRequest,
+    SceneEditRequest,
+)
 from manyforge_behavior.model_paths import (
     default_package_paths,
     resolve_package_uri,
@@ -30,6 +33,11 @@ from .models import (
     SceneFrameGizmoSizeResponse,
     SceneFrameVisibilityRequest,
     SceneFrameVisibilityResponse,
+    SceneGripperCommandApiRequest,
+    SceneGripperCommandApiResponse,
+    SceneGripperStateResponse,
+    SceneObjectAxesGizmoSizeRequest,
+    SceneObjectAxesGizmoSizeResponse,
     SceneObjectFrameVisibilityRequest,
     SceneObjectFrameVisibilityResponse,
     SceneObjectResponse,
@@ -189,7 +197,15 @@ def build_scene_frames_payload(state: ComposerState) -> dict[str, Any]:
             else:
                 pose_available = False
 
-        viewer_visible = state.get_frame_visibility(frame_name)
+        # Only frames carrying a semantic role (world / program TCP /
+        # gripper mount-attach-tcp-auxiliary) are visible by default;
+        # structural URDF link frames stay off until the operator
+        # explicitly toggles them on. Operator overrides (via
+        # set_frame_visibility) take precedence over this default.
+        default_visible = bool(frame_roles.get(frame_name))
+        viewer_visible = state.get_frame_visibility(
+            frame_name, default=default_visible
+        )
 
         frames.append(
             SceneFrameResponse(
@@ -288,9 +304,17 @@ def build_scene_state_payload(state: ComposerState) -> dict[str, Any]:
 
     robot_info = None
     if state.deployment is not None or state.kernel is not None:
+        urdf_model_key = None
+        try:
+            from .routes_urdf import active_urdf_model_key
+
+            urdf_model_key = active_urdf_model_key(state)
+        except Exception:
+            urdf_model_key = None
         robot_info = SceneRobotResponse(
             robot_id=robot_id,
             group_id=group_id,
+            urdf_model_key=urdf_model_key,
             base_frame=base_frame,
             tcp_frame=tcp_frame,
             base_pose=base_pose,
@@ -351,8 +375,71 @@ def build_scene_state_payload(state: ComposerState) -> dict[str, Any]:
         robot=robot_info,
         objects=objects,
         link_poses=link_poses,
+        grippers=_collect_gripper_states(state),
+        object_axes_gizmo_size_m=state.get_object_axes_gizmo_size(),
         timestamp_ns=timestamp_ns,
     ).model_dump()
+
+
+def _gripper_joint_limits(
+    state: ComposerState, joint_name: str
+) -> tuple[Optional[float], Optional[float]]:
+    """Look up a joint's URDF limit pair without re-importing the URDF
+    parser at the top of this module (avoids a circular import)."""
+    try:
+        from .routes_urdf import get_urdf_entry
+    except Exception:
+        return (None, None)
+    entry = get_urdf_entry(state)
+    if entry is None:
+        return (None, None)
+    for joint in entry.joints:
+        if joint.name == joint_name:
+            return (joint.limit_lower, joint.limit_upper)
+    return (None, None)
+
+
+def _collect_gripper_states(state: ComposerState) -> list[SceneGripperStateResponse]:
+    """One entry per gripper declared in the active deployment. Surfaces
+    enough metadata for the Robot panel's gripper widget to render a
+    slider with correct URDF limits and any SRDF-named presets, plus the
+    live command/status from the kernel."""
+    deployment = state.deployment
+    kernel = state.kernel
+    if deployment is None or kernel is None:
+        return []
+    # Advance any simulated_joint command in flight. The BT
+    # `command_gripper` node ticks this on every BT tick; the operator's
+    # widget is the only client outside the BT cycle, so without this
+    # call the simulated finger position never progresses from its
+    # "executing" snapshot toward the target.
+    try:
+        kernel.update_gripper_commands()
+    except Exception:
+        logger.debug("update_gripper_commands failed", exc_info=True)
+    out: list[SceneGripperStateResponse] = []
+    for gripper_id, config in deployment.grippers.items():
+        try:
+            status = kernel.get_gripper_status(gripper_id)
+        except Exception:
+            logger.debug("get_gripper_status failed for %s", gripper_id, exc_info=True)
+            continue
+        limit_lower, limit_upper = _gripper_joint_limits(state, config.joint_name)
+        out.append(
+            SceneGripperStateResponse(
+                gripper_id=gripper_id,
+                joint_name=config.joint_name,
+                state=str(getattr(status.state, "value", status.state)),
+                current_position=status.current_position,
+                target_position=status.target_position,
+                limit_lower=limit_lower,
+                limit_upper=limit_upper,
+                motion_time_s=config.motion_time_s,
+                srdf_presets=dict(config.srdf_presets or {}),
+                error=status.error,
+            )
+        )
+    return out
 
 
 def build_scene_diagnostics_payload(state: ComposerState) -> dict[str, Any]:
@@ -428,6 +515,58 @@ def create_scene_router(state: ComposerState) -> APIRouter:
         """Get full scene state including robot and objects."""
         return build_scene_state_payload(state)
 
+    @router.post("/preview-link-poses")
+    def preview_link_poses(payload: dict[str, Any]) -> dict[str, Any]:
+        """Compute link poses for a hypothetical robot configuration.
+
+        Backs the Composer Move-To "ghost robot" preview. Stateless
+        w.r.t. the live scene — runs IK (for cartesian targets) and
+        per-link FK against the kernel's planning context without
+        mutating scene joint state.
+
+        Request:
+            { "kind": "cartesian" | "joint",
+              "base_frame": "base"|"universe"|...,
+              # joint mode:
+              "joint_names": [...], "joint_positions_rad": [...],
+              # cartesian mode:
+              "tcp_frame": "tool0",
+              "tcp_position_m": [x, y, z],
+              "tcp_orientation_xyzw": [x, y, z, w],
+              # seed (cartesian, optional):
+              "joint_names": [...], "joint_positions_rad": [...],
+            }
+        Response:
+            { "reachable": true, "joint_names": [...],
+              "joint_positions_rad": [...],
+              "link_poses": {link: {position_m, orientation_xyzw}} }
+            or:
+            { "reachable": false, "reason": "ik_failed"|...,
+              "tcp_pose": {position_m, orientation_xyzw} }
+        """
+        if state.kernel is None:
+            return {"reachable": False, "reason": "no_kernel"}
+        compute = getattr(state.kernel, "compute_target_link_poses", None)
+        if compute is None:
+            # Older kernel client without the FK preview binding.
+            return {"reachable": False, "reason": "unsupported_capability"}
+        # Default link_names to all visual links if caller didn't
+        # supply (frontend usually has the URDF manifest and passes
+        # the link list explicitly, but a missing list is non-fatal).
+        payload = dict(payload)
+        if not payload.get("link_names"):
+            try:
+                from .routes_urdf import visual_link_names_for_fk
+                payload["link_names"] = list(visual_link_names_for_fk(state))
+            except Exception:
+                payload["link_names"] = []
+        if not payload.get("base_frame"):
+            payload["base_frame"] = canonical_scene_world_frame(state)
+        try:
+            return compute(payload)
+        except Exception as exc:  # pragma: no cover — defensive
+            return {"reachable": False, "reason": f"internal_error: {exc}"}
+
     @router.get("/diagnostics")
     def get_scene_diagnostics() -> dict[str, Any]:
         """Compare backend-authoritative scene truth with HMI render state."""
@@ -478,6 +617,85 @@ def create_scene_router(state: ComposerState) -> APIRouter:
             objectId=validated.object_id,
             visible=validated.visible,
             hmiAvailable=True,
+            timestampNs=time.monotonic_ns(),
+        ).model_dump(by_alias=True)
+
+    @router.post("/gripper/command")
+    def command_gripper(
+        validated: SceneGripperCommandApiRequest,
+    ) -> dict[str, Any]:
+        """Send a position command to a deployment-declared gripper.
+
+        Mirrors the ``command_gripper`` behaviour-tree node so the
+        operator's interactive widget and the BT-driven sequencer share
+        the exact same kernel API. The deployment YAML owns
+        gripper-specific fields (``group_id``, ``joint_name``,
+        ``motion_time_s``); the operator only specifies the target
+        position and optional overrides.
+        """
+        deployment = state.deployment
+        if deployment is None:
+            return JSONResponse(
+                status_code=400,
+                content={"detail": "No deployment loaded"},
+            )
+        config = deployment.grippers.get(validated.gripper_id)
+        if config is None:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "detail": (
+                        f"Gripper '{validated.gripper_id}' is not declared in "
+                        "the active deployment"
+                    )
+                },
+            )
+        if state.kernel is None:
+            return JSONResponse(
+                status_code=503,
+                content={"detail": "Kernel is not attached"},
+            )
+        duration_s = (
+            float(config.motion_time_s)
+            if validated.duration_s is None
+            else float(validated.duration_s)
+        )
+        request = GripperCommandRequest(
+            gripper_id=validated.gripper_id,
+            group_id=str(config.group_id),
+            joint_name=str(config.joint_name),
+            target_position=float(validated.target_position),
+            duration_s=duration_s,
+            max_effort=(
+                None if validated.max_effort is None else float(validated.max_effort)
+            ),
+        )
+        result = state.kernel.command_gripper(request)
+        return SceneGripperCommandApiResponse(
+            accepted=bool(result.accepted),
+            gripperId=validated.gripper_id,
+            targetPosition=float(validated.target_position),
+            error=(None if result.accepted else (result.error or "rejected")),
+            timestampNs=time.monotonic_ns(),
+        ).model_dump(by_alias=True)
+
+    @router.post("/objects/gizmo-size")
+    def set_object_axes_gizmo_size(
+        validated: SceneObjectAxesGizmoSizeRequest,
+    ) -> dict[str, Any]:
+        """Set global viewer size for scene-object axes (parallels the
+        named-frame gizmo size, but tracked independently so operators
+        can size each gizmo type to taste)."""
+        try:
+            state.set_object_axes_gizmo_size(validated.axes_length_m)
+        except ValueError as exc:
+            return JSONResponse(
+                status_code=400,
+                content={"detail": str(exc)},
+            )
+        return SceneObjectAxesGizmoSizeResponse(
+            success=True,
+            axesLengthM=state.get_object_axes_gizmo_size(),
             timestampNs=time.monotonic_ns(),
         ).model_dump(by_alias=True)
 
@@ -577,30 +795,43 @@ def create_scene_router(state: ComposerState) -> APIRouter:
     ) -> Response:
         """Render the active 3D viewport as an image.
 
-        Day-4 of the native-viewer migration routes this through
-        ``ComposerState._resolve_scene_snapshot_provider()`` so the same
-        broker → HMI fallback chain used by the BT-node provider path
-        (Day 3) also serves this HTTP route. Callers (assistant tools,
-        external debug) get bytes from whichever viewer is currently
-        attached; the legacy Viser HMI is fallback when no native
-        viewer is connected.
+        Day-4 of the native-viewer migration serves this through the same
+        native-viewer broker → legacy HMI fallback chain used by the BT-node
+        provider path. Keep the failure modes distinct so operators and tests
+        can tell "no snapshot source exists" from "a connected source timed
+        out".
         """
-        provider = state._resolve_scene_snapshot_provider()
-        if provider is None:
+        broker = getattr(state, "snapshot_broker", None)
+        hmi_provider = (
+            getattr(state.hmi_server, "get_cached_scene_snapshot", None)
+            or getattr(state.hmi_server, "render_scene", None)
+        )
+
+        if broker is not None and broker.has_clients():
+            image_bytes = broker.render_sync(width, height, format)
+            if image_bytes is None:
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "detail": "Scene snapshot source did not return an image in time"
+                    },
+                )
+        elif hmi_provider is not None:
+            image_bytes = hmi_provider(width, height, format)
+            if image_bytes is None:
+                return JSONResponse(
+                    status_code=503,
+                    content={"detail": "No Viser client connected"},
+                )
+        else:
             return JSONResponse(
                 status_code=503,
                 content={
                     "detail": (
-                        "No scene snapshot source available "
-                        "(open Composer with the viewer panel visible, or start --hmi-port)"
+                        "HMI server not running and no native scene snapshot "
+                        "viewer connected"
                     ),
                 },
-            )
-        image_bytes = provider(width, height, format)
-        if image_bytes is None:
-            return JSONResponse(
-                status_code=503,
-                content={"detail": "Scene snapshot source did not return an image in time"},
             )
 
         media_type = "image/jpeg" if format == "jpeg" else "image/png"

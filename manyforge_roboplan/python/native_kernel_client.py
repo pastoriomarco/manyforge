@@ -27,22 +27,28 @@ from manyforge_behavior.kernel_client import (
     SceneShape,
     SceneEditRequest,
     SceneEditResult,
+    StreamingBeginResult,
+    StreamingPushResult,
+    StreamingSessionConfig,
+    StreamingTarget,
     Trajectory,
     TrajectoryWaypoint,
 )
 
-# State int → ExecutionState mapping (matches C++ ExecutionState enum order)
+# State int → ExecutionState mapping (matches C++ ExecutionState enum order
+# in include/manyforge_core/types/execution_status.hpp).
 _STATE_MAP = {
     0: ExecutionState.IDLE,
     1: ExecutionState.PLANNING,
     2: ExecutionState.VALIDATING,
     3: ExecutionState.EXECUTING,
-    4: ExecutionState.PAUSED,
-    5: ExecutionState.STOPPING,
-    6: ExecutionState.STOPPED,
-    7: ExecutionState.COMPLETED,
-    8: ExecutionState.FAILED,
-    9: ExecutionState.INTERVENTION_REQUIRED,
+    4: ExecutionState.STREAMING,
+    5: ExecutionState.PAUSED,
+    6: ExecutionState.STOPPING,
+    7: ExecutionState.STOPPED,
+    8: ExecutionState.COMPLETED,
+    9: ExecutionState.FAILED,
+    10: ExecutionState.INTERVENTION_REQUIRED,
 }
 
 
@@ -437,6 +443,78 @@ class NativeKernelClient(KernelClient):
         r = self._bundle.acknowledge_completed(int(execution_id))
         return CommandResult(accepted=r["accepted"], error=r.get("error"))
 
+    # ---- Streaming-session API (ADR-0016) ----
+    def begin_streaming_session(
+        self, config: StreamingSessionConfig
+    ) -> StreamingBeginResult:
+        cfg_dict = {
+            "group_id": config.group_id,
+            "joint_names": list(config.joint_names),
+            "input_mode": config.input_mode,
+            "cartesian_reference_frame": config.cartesian_reference_frame,
+            "tcp_frame": config.tcp_frame,
+            "soft_stop_strategy": config.soft_stop_strategy,
+            "soft_stop_deceleration_time_s": float(
+                config.soft_stop_deceleration_time_s
+            ),
+            "anchor_negative_time_s": float(config.anchor_negative_time_s),
+            "target_time_from_start_min_s": float(
+                config.target_time_from_start_min_s
+            ),
+            "max_dispatch_rate_hz": float(config.max_dispatch_rate_hz),
+            "target_max_age_s": float(config.target_max_age_s),
+            "velocity_scale": float(config.velocity_scale),
+            "max_tcp_linear_speed_mps": float(config.max_tcp_linear_speed_mps),
+            "per_joint_velocity_caps_rad_s": [
+                float(v) for v in config.per_joint_velocity_caps_rad_s
+            ],
+            "per_joint_acceleration_caps_rad_s2": [
+                float(v) for v in config.per_joint_acceleration_caps_rad_s2
+            ],
+            "principal_id": config.principal_id,
+            "authority_source": config.authority_source,
+            "trigger_reason": config.trigger_reason,
+        }
+        r = self._bundle.begin_streaming_session(cfg_dict)
+        return StreamingBeginResult(
+            accepted=bool(r.get("accepted", False)),
+            session_id=int(r.get("session_id", 0)),
+            error=r.get("error"),
+            error_code=r.get("error_code"),
+        )
+
+    def push_streaming_target(
+        self, session_id: int, target: StreamingTarget
+    ) -> StreamingPushResult:
+        tgt_dict = {
+            "kind": target.kind,
+            "position_m": list(target.position_m),
+            "orientation_xyzw": list(target.orientation_xyzw),
+            "joint_names": list(target.joint_names),
+            "joint_positions_rad": list(target.joint_positions_rad),
+            "source_timestamp_ns": int(target.source_timestamp_ns),
+            "source_sequence": int(target.source_sequence),
+            "min_time_from_start_s": float(target.min_time_from_start_s),
+        }
+        r = self._bundle.push_streaming_target(int(session_id), tgt_dict)
+        return StreamingPushResult(
+            accepted=bool(r.get("accepted", False)),
+            backend_sequence=int(r.get("backend_sequence", 0)),
+            error=r.get("error"),
+            error_code=r.get("error_code"),
+        )
+
+    def end_streaming_session(
+        self, session_id: int, soft_stop_strategy: str = "spring_back"
+    ) -> CommandResult:
+        r = self._bundle.end_streaming_session(
+            int(session_id), soft_stop_strategy
+        )
+        return CommandResult(
+            accepted=bool(r.get("accepted", False)),
+            error=r.get("error"),
+        )
+
     def get_status(self) -> ExecutionStatus:
         s = self._bundle.get_status()
         return ExecutionStatus(
@@ -713,6 +791,55 @@ class NativeKernelClient(KernelClient):
             "position_m": list(result["position_m"]),
             "orientation_xyzw": list(result["orientation_xyzw"]),
         }
+
+    def compute_target_link_poses(
+        self, request: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Compute link poses at a hypothetical robot configuration.
+
+        Used by the Composer Move-To "ghost robot" preview (ADR-0016).
+        Request shape:
+            {
+              "kind": "cartesian" | "joint",
+              "base_frame": str,
+              "link_names": [link_name, ...],
+              # for joint:
+              "joint_names": [...], "joint_positions_rad": [...],
+              # for cartesian:
+              "tcp_frame": str,
+              "tcp_position_m": [x, y, z],
+              "tcp_orientation_xyzw": [x, y, z, w],
+              # for cartesian, optional seed:
+              "joint_names": [...], "joint_positions_rad": [...],
+            }
+        Returns:
+            {"reachable": True, "joint_names": [...],
+             "joint_positions_rad": [...], "link_poses": {link: pose}}
+          or:
+            {"reachable": False, "reason": "ik_failed",
+             "tcp_pose": {position_m, orientation_xyzw}}
+        """
+        raw = self._bundle.compute_target_link_poses(request)
+        out: Dict[str, Any] = {"reachable": bool(raw.get("reachable", False))}
+        if not out["reachable"]:
+            out["reason"] = str(raw.get("reason", "ik_failed"))
+            tcp = raw.get("tcp_pose")
+            if tcp is not None:
+                out["tcp_pose"] = {
+                    "position_m": list(tcp["position_m"]),
+                    "orientation_xyzw": list(tcp["orientation_xyzw"]),
+                }
+            return out
+        out["joint_names"] = list(raw.get("joint_names", []))
+        out["joint_positions_rad"] = [float(v) for v in raw.get("joint_positions_rad", [])]
+        link_poses: Dict[str, Dict[str, Any]] = {}
+        for link_name, pose in (raw.get("link_poses") or {}).items():
+            link_poses[str(link_name)] = {
+                "position_m": list(pose["position_m"]),
+                "orientation_xyzw": list(pose["orientation_xyzw"]),
+            }
+        out["link_poses"] = link_poses
+        return out
 
     def get_object_pose(
         self, object_id: str, base_frame: str

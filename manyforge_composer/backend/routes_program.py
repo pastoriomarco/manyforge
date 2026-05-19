@@ -210,6 +210,13 @@ def _deployment_to_full_response(deployment: Deployment, source_path: str) -> di
             srdfPath=deployment.robot_config.srdf_path,
             packagePaths=deployment.robot_config.package_paths,
             globalMaxTcpLinearSpeedMps=deployment.robot_config.global_max_tcp_linear_speed_mps,
+            streamingJointLimits={
+                name: {
+                    "maxVelocityRadS": limit.max_velocity_rad_s,
+                    "maxAccelerationRadS2": limit.max_acceleration_rad_s2,
+                }
+                for name, limit in deployment.robot_config.streaming_joint_limits.items()
+            },
         ),
         grippers={
             gripper_id: {
@@ -822,6 +829,13 @@ def create_program_router(state: ComposerState) -> APIRouter:
                 srdfPath=robot_config.srdf_path,
                 packagePaths=robot_config.package_paths,
                 globalMaxTcpLinearSpeedMps=robot_config.global_max_tcp_linear_speed_mps,
+                streamingJointLimits={
+                    name: {
+                        "maxVelocityRadS": limit.max_velocity_rad_s,
+                        "maxAccelerationRadS2": limit.max_acceleration_rad_s2,
+                    }
+                    for name, limit in robot_config.streaming_joint_limits.items()
+                },
             ),
             grippers={
                 gripper_id: {
@@ -860,6 +874,13 @@ def create_program_router(state: ComposerState) -> APIRouter:
                 srdfPath=robot_config.srdf_path,
                 packagePaths=robot_config.package_paths,
                 globalMaxTcpLinearSpeedMps=robot_config.global_max_tcp_linear_speed_mps,
+                streamingJointLimits={
+                    name: {
+                        "maxVelocityRadS": limit.max_velocity_rad_s,
+                        "maxAccelerationRadS2": limit.max_acceleration_rad_s2,
+                    }
+                    for name, limit in robot_config.streaming_joint_limits.items()
+                },
             ),
             grippers={
                 gripper_id: {
@@ -1096,6 +1117,21 @@ def create_program_router(state: ComposerState) -> APIRouter:
                 deployment,
                 force_discard_overrides=request.force_discard_overrides,
             )
+
+            # Spec/430 §3.2 cross-validation that requires the URDF to
+            # be loaded — runs AFTER apply_models so we have a kernel
+            # with a populated joint set. If validation fails we let
+            # the DeploymentValidationError propagate to the 400
+            # handler below. The state has already accepted the
+            # deployment at this point; the operator's next load
+            # attempt with a corrected deployment supersedes.
+            if deployment is not None and state.kernel is not None:
+                try:
+                    drivable_joints = state.kernel.get_joint_names()
+                except Exception:
+                    drivable_joints = []
+                if drivable_joints:
+                    deployment.validate_streaming_joint_limits_against(drivable_joints)
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc))
         except (ProgramValidationError, DeploymentValidationError) as exc:

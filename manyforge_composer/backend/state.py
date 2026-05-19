@@ -164,14 +164,19 @@ class ComposerState:
         self.scene_edit_lock = threading.Lock()
         # Viewer-side visibility state. Previously owned by the Viser HMI
         # server; the Day-4 parity work makes ComposerState the source of
-        # truth so the native viewer works without HMI. Frames + object
-        # frames default visible; the sets store the *hidden* ids so a
-        # missing entry maps to "visible" without bookkeeping work on
-        # newly-discovered frames.
+        # truth so the native viewer works without HMI. Robot/tool frames
+        # default visible. Object frames default hidden and are opt-in so
+        # runtime scene additions do not clutter the operator view.
         self._scene_viewer_lock = threading.Lock()
+        # Explicit operator overrides. A frame in `_hidden_frames` is
+        # forced off; a frame in `_explicit_visible_frames` is forced
+        # on; otherwise the caller-supplied default (computed from
+        # whether the frame carries a semantic role) decides.
         self._hidden_frames: set[str] = set()
-        self._hidden_object_frames: set[str] = set()
+        self._explicit_visible_frames: set[str] = set()
+        self._visible_object_frames: set[str] = set()
         self._frame_gizmo_size_m: float = 0.1
+        self._object_axes_gizmo_size_m: float = 0.1
         # Last-known joint vector, refreshed whenever the kernel reports
         # one. The kernel's execution snapshot returns
         # `joint_positions_rad=None` outside an active execution, so
@@ -1364,15 +1369,21 @@ class ComposerState:
     # accept both the new state-local path and the legacy HMI-server
     # path, so an in-process HMI (if present) sees consistent state.
 
-    def get_frame_visibility(self, frame_name: str) -> bool:
+    def get_frame_visibility(self, frame_name: str, default: bool = True) -> bool:
         with self._scene_viewer_lock:
-            return frame_name not in self._hidden_frames
+            if frame_name in self._hidden_frames:
+                return False
+            if frame_name in self._explicit_visible_frames:
+                return True
+            return default
 
     def set_frame_visibility(self, frame_name: str, visible: bool) -> None:
         with self._scene_viewer_lock:
             if visible:
                 self._hidden_frames.discard(frame_name)
+                self._explicit_visible_frames.add(frame_name)
             else:
+                self._explicit_visible_frames.discard(frame_name)
                 self._hidden_frames.add(frame_name)
         hmi = self.hmi_server
         if hmi is not None and hasattr(hmi, "set_frame_visibility"):
@@ -1383,14 +1394,14 @@ class ComposerState:
 
     def get_object_frame_visibility(self, object_id: str) -> bool:
         with self._scene_viewer_lock:
-            return object_id not in self._hidden_object_frames
+            return object_id in self._visible_object_frames
 
     def set_object_frame_visibility(self, object_id: str, visible: bool) -> None:
         with self._scene_viewer_lock:
             if visible:
-                self._hidden_object_frames.discard(object_id)
+                self._visible_object_frames.add(object_id)
             else:
-                self._hidden_object_frames.add(object_id)
+                self._visible_object_frames.discard(object_id)
         hmi = self.hmi_server
         if hmi is not None and hasattr(hmi, "set_object_frame_visibility"):
             try:
@@ -1414,6 +1425,17 @@ class ComposerState:
                 hmi.set_frame_gizmo_size(size)
             except Exception:
                 logger.debug("HMI gizmo size mirror failed", exc_info=True)
+
+    def get_object_axes_gizmo_size(self) -> float:
+        with self._scene_viewer_lock:
+            return self._object_axes_gizmo_size_m
+
+    def set_object_axes_gizmo_size(self, axes_length_m: float) -> None:
+        size = float(axes_length_m)
+        if size <= 0:
+            raise ValueError("object axes gizmo size must be positive")
+        with self._scene_viewer_lock:
+            self._object_axes_gizmo_size_m = size
 
     def _resolve_scene_snapshot_provider(
         self,
@@ -1517,6 +1539,14 @@ class ComposerState:
                     "materialize (promote) or clear them before changing the program, "
                     "or pass force_discard_overrides=True to discard"
                 )
+        # Frame visibility overrides are scoped to a (program, deployment)
+        # pair: switching to a different robot can reuse link names with
+        # entirely different semantics, so stale toggles must not carry
+        # over.
+        with self._scene_viewer_lock:
+            self._hidden_frames.clear()
+            self._explicit_visible_frames.clear()
+            self._visible_object_frames.clear()
         self._rebuild_runtime(program, deployment, effective_program=program)
 
     def load_program(

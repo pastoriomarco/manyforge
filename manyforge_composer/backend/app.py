@@ -180,6 +180,21 @@ def create_app(
         except Exception:
             hub.disconnect(ws)
 
+    # Streaming-session WebSocket (ADR-0016).
+    # Consumes gizmo / joint-slider follow frames and forwards them to the
+    # kernel's streaming-session API. The first frame opens an intervention
+    # carrying a `track_target_action` BT leaf (which begins the kernel
+    # session); subsequent frames push targets directly; socket close ends
+    # the session with the configured soft-stop strategy.
+    from .follow_target_ws import handle_follow_target_ws  # noqa: PLC0415
+
+    @app.websocket("/ws/follow-target")
+    async def ws_follow_target(ws: WebSocket):
+        if security.api_token and not check_ws_bearer_token(ws, security.api_token):
+            await ws.close(code=4401, reason="Unauthorized")
+            return
+        await handle_follow_target_ws(ws, state)
+
     # Serve built frontend in production mode (must be last — catches all routes)
     resolved_static = _find_static_dir(static_dir)
     if resolved_static:

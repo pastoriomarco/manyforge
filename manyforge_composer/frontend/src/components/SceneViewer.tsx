@@ -3,6 +3,7 @@ import type { MutableRefObject } from 'react';
 import { Canvas } from '@react-three/fiber';
 import {
   Grid,
+  Html,
   OrbitControls,
   PerspectiveCamera,
   Stats,
@@ -13,16 +14,25 @@ import * as THREE from 'three';
 import type { Mesh } from 'three';
 
 import { api } from '../api/client';
-import { useCycleStore } from '../store/cycleStore';
+import {
+  followTargetController,
+  type FollowTargetDragToken,
+} from '../streaming/followTargetController';
 import { usePointCloudStore, usePointCloudSubscription } from '../store/pointCloudStore';
+import { useProgramStore } from '../store/programStore';
 import { useSceneStateStore, useScenePolling } from '../store/sceneStateStore';
 import { useStatusPolling, useStatusStore } from '../store/statusStore';
 import { useViewerSelectionStore } from '../store/viewerSelectionStore';
 import type {
+  PreviewLinkPosesRequest,
+  PreviewLinkPosesResponse,
+  SceneFrameState,
   SceneObjectState,
   SceneUrdfManifest,
   SceneUrdfVisual,
+  TreeNode,
 } from '../types/api';
+import { computeMoveToTarget } from '../utils/moveTo';
 import { ObjectEditPanel } from './ObjectEditPanel';
 import { RobotControlPanel } from './RobotControlPanel';
 import { SceneControls } from './SceneControls';
@@ -35,23 +45,6 @@ import { SnapshotResponder } from './SnapshotResponder';
 // same identity across renders keeps zustand's bailout path working.
 const EMPTY_OBJECTS: SceneObjectState[] = [];
 
-// Pose equality with a small floating-point tolerance — used by the
-// TCP jog follow chain to decide whether a fresh jog request is
-// needed. Position threshold ~0.1 mm; quaternion threshold matches.
-function posesClose(
-  a: { pos: readonly number[]; quat: readonly number[] },
-  b: { pos: readonly number[]; quat: readonly number[] },
-): boolean {
-  const POS_EPS = 1e-4;
-  const ROT_EPS = 1e-4;
-  for (let i = 0; i < 3; i += 1) {
-    if (Math.abs(a.pos[i] - b.pos[i]) > POS_EPS) return false;
-  }
-  for (let i = 0; i < 4; i += 1) {
-    if (Math.abs(a.quat[i] - b.quat[i]) > ROT_EPS) return false;
-  }
-  return true;
-}
 const EMPTY_LINK_POSES: Record<
   string,
   { position_m: number[]; orientation_xyzw: number[] }
@@ -125,11 +118,14 @@ export function SceneViewerPanel({
   // Header panels are mutually exclusive — clicking one closes any
   // other. Modelled as a single `activePanel` discriminator rather
   // than three independent booleans so the radio-group invariant is
-  // unambiguous to read.
-  const [activePanel, setActivePanel] = useState<'tools' | 'robot' | 'object' | null>(null);
-  const togglePanel = (kind: 'tools' | 'robot' | 'object'): void => {
-    setActivePanel((current) => (current === kind ? null : kind));
-  };
+  // unambiguous to read. The state lives in viewerSelectionStore so
+  // Canvas descendants (TcpJogGizmo, SceneObjectMesh's
+  // TransformControls) can gate themselves on panel focus and unmount
+  // — cleanly aborting any open streaming session — when the operator
+  // switches panels mid-interaction.
+  const activePanel = useViewerSelectionStore((s) => s.activePanel);
+  const setActivePanel = useViewerSelectionStore((s) => s.setActivePanel);
+  const toggleActivePanel = useViewerSelectionStore((s) => s.toggleActivePanel);
 
   let backendAvailable: boolean | null;
   let unavailableDetail: string | null = null;
@@ -173,19 +169,19 @@ export function SceneViewerPanel({
           <HeaderToggle
             label="Tools"
             on={activePanel === 'tools'}
-            onClick={() => togglePanel('tools')}
+            onClick={() => toggleActivePanel('tools')}
             title="Frames / object axes / scene tree"
           />
           <HeaderToggle
             label="Robot"
             on={activePanel === 'robot'}
-            onClick={() => togglePanel('robot')}
+            onClick={() => toggleActivePanel('robot')}
             title="Robot control panel (joint sliders)"
           />
           <HeaderToggle
             label="Object"
             on={activePanel === 'object'}
-            onClick={() => togglePanel('object')}
+            onClick={() => toggleActivePanel('object')}
             title="Object edit panel (pose, shape)"
           />
           <button
@@ -522,6 +518,9 @@ function SceneCanvas({
       <ObjectFrameAxes />
       <PointCloud />
       <TcpJogGizmo />
+      <MoveToTargetGhost />
+      <MoveToGhostRobot />
+      <CartesianRejectionIndicator />
       <SnapshotResponder />
       {statsVisible && <Stats className="!left-2 !top-2" />}
     </Canvas>
@@ -589,6 +588,12 @@ function SceneObjectMesh({
   // <TransformControls> is a normal reactive value. The TS-typed mesh
   // is also handed back to the pose-emit helper unchanged.
   const [meshNode, setMeshNode] = useState<Mesh | null>(null);
+  // Object-tab focus gate: the TransformControls only mount when the
+  // operator has the Object panel open. Selecting an object from a
+  // different panel keeps the selection visible (highlight, right-click
+  // menu) but does NOT surface the drag gizmo, matching the principle
+  // that the gizmo is the Object-panel affordance.
+  const objectPanelActive = useViewerSelectionStore((s) => s.activePanel === 'object');
   const pose = useMemo(() => extractPose(object.pose_in_universe), [object.pose_in_universe]);
   const shape = object.shape ?? null;
   const color = selected ? '#f5d24a' : colorForSource(object.source);
@@ -637,7 +642,7 @@ function SceneObjectMesh({
           wireframe={shapeType !== 'box' && shapeType !== 'sphere'}
         />
       </mesh>
-      {selected && editable && !locked && meshNode !== null && (
+      {objectPanelActive && selected && editable && !locked && meshNode !== null && (
         <TransformControls
           object={meshNode}
           mode={gizmoMode}
@@ -680,9 +685,14 @@ function RobotModel() {
   const [manifest, setManifest] = useState<SceneUrdfManifest | null>(null);
   const [manifestError, setManifestError] = useState<string | null>(null);
   const linkPoses = useSceneStateStore((state) => state.scene?.link_poses ?? EMPTY_LINK_POSES);
+  const robotModelKey = useSceneStateStore(
+    (state) => state.scene?.robot?.urdf_model_key ?? state.scene?.robot?.robot_id ?? null,
+  );
 
   useEffect(() => {
     let cancelled = false;
+    setManifest(null);
+    setManifestError(null);
     api.urdf
       .manifest()
       .then((data) => {
@@ -696,7 +706,7 @@ function RobotModel() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [robotModelKey]);
 
   if (manifest === null) {
     // 404 here is the normal state when the deployment has no URDF;
@@ -704,23 +714,31 @@ function RobotModel() {
     void manifestError;
     return null;
   }
+  if (
+    robotModelKey !== null &&
+    manifest.model_key !== undefined &&
+    manifest.model_key !== robotModelKey
+  ) {
+    return null;
+  }
 
   return (
-    <group name="manyforge-urdf">
+    <group name="manyforge-urdf" key={manifest.model_key ?? manifest.robot_id ?? 'unknown'}>
       {manifest.links.map((link) => {
         const pose = linkPoses[link.name];
         if (pose === undefined) {
           return null;
         }
+        const modelKey = manifest.model_key ?? manifest.robot_id ?? 'unknown';
         return (
           <group
-            key={link.name}
+            key={`${modelKey}:${link.name}`}
             position={pose.position_m as [number, number, number]}
             quaternion={pose.orientation_xyzw as [number, number, number, number]}
           >
             {link.visuals.map((visual) => (
               <RobotLinkVisual
-                key={`${link.name}-${visual.index}`}
+                key={`${modelKey}:${link.name}:${visual.index}:${visual.mesh_url ?? 'primitive'}`}
                 visual={visual}
               />
             ))}
@@ -733,11 +751,11 @@ function RobotModel() {
 
 function RobotLinkVisual({ visual }: { visual: SceneUrdfVisual }) {
   const offsetPos = visual.visual_origin.position_m as [number, number, number];
-  const offsetRpy = visual.visual_origin.orientation_rpy_rad as [number, number, number];
+  const offsetQuat = visualOriginQuaternion(visual);
   // Mesh-backed visual — let drei's useGLTF stream the per-visual GLB.
   if (visual.mesh_url !== null) {
     return (
-      <group position={offsetPos} rotation={offsetRpy}>
+      <group position={offsetPos} quaternion={offsetQuat}>
         <RobotLinkGltf url={visual.mesh_url} />
       </group>
     );
@@ -746,7 +764,7 @@ function RobotLinkVisual({ visual }: { visual: SceneUrdfVisual }) {
   // shapes like UR5's tool0 boxes that make up the rudimentary gripper.
   if (visual.primitive !== null) {
     return (
-      <group position={offsetPos} rotation={offsetRpy}>
+      <group position={offsetPos} quaternion={offsetQuat}>
         <PrimitiveMesh primitive={visual.primitive} />
       </group>
     );
@@ -757,7 +775,7 @@ function RobotLinkVisual({ visual }: { visual: SceneUrdfVisual }) {
 function RobotLinkGltf({ url }: { url: string }) {
   const gltf = useGLTF(url);
   const cloned = useMemo(() => gltf.scene.clone(true), [gltf.scene]);
-  return <primitive object={cloned} />;
+  return <primitive key={url} object={cloned} />;
 }
 
 function PrimitiveMesh({
@@ -838,6 +856,44 @@ function numberQuad(
   return fallback;
 }
 
+// URDF RPY is fixed-axis ZYX; Three.js's default Euler order is intrinsic
+// XYZ. Feeding RPY straight into <group rotation={...}> silently produces
+// the wrong matrix for any compound rotation (UR10E upperarm/forearm have
+// rpy="π/2 0 -π/2", which is where the disconnected-pieces bug came from).
+// The backend now ships an explicit quaternion; we use that when present
+// and fall back to a fixed-axis ZYX construction only for old payloads.
+function visualOriginQuaternion(
+  visual: SceneUrdfVisual,
+): [number, number, number, number] {
+  const xyzw = visual.visual_origin.orientation_xyzw;
+  if (Array.isArray(xyzw) && xyzw.length === 4) {
+    return [
+      Number(xyzw[0]) || 0,
+      Number(xyzw[1]) || 0,
+      Number(xyzw[2]) || 0,
+      Number(xyzw[3]) || 1,
+    ];
+  }
+  const rpy = visual.visual_origin.orientation_rpy_rad;
+  const roll = Number(rpy?.[0]) || 0;
+  const pitch = Number(rpy?.[1]) || 0;
+  const yaw = Number(rpy?.[2]) || 0;
+  // Quaternion for fixed-axis (extrinsic) X then Y then Z rotation —
+  // equivalently URDF "roll-pitch-yaw" convention.
+  const cr = Math.cos(roll / 2);
+  const sr = Math.sin(roll / 2);
+  const cp = Math.cos(pitch / 2);
+  const sp = Math.sin(pitch / 2);
+  const cy = Math.cos(yaw / 2);
+  const sy = Math.sin(yaw / 2);
+  return [
+    sr * cp * cy - cr * sp * sy,
+    cr * sp * cy + sr * cp * sy,
+    cr * cp * sy - sr * sp * cy,
+    cr * cp * cy + sr * sp * sy,
+  ];
+}
+
 function FrameAxes() {
   // Render an axes triad at every frame the operator has flagged
   // visible. Pose + size come from /api/scene/frames (Day-4 parity
@@ -865,46 +921,56 @@ function FrameAxes() {
 }
 
 function TcpJogGizmo() {
-  // Day-5c.2: end-effector jog gizmo. Mounted when the robot panel
-  // is in Cartesian mode. The gizmo is anchored to a small invisible
-  // mesh placed at the current TCP pose (read from scene state's
-  // tcp_pose_in_base; the demo's base_link is at world origin so
-  // base ≈ world). On the gizmo's mouseUp we read the target
-  // transform and POST to /api/direct/cartesian-jog.
+  // End-effector jog gizmo, ADR-0016 streaming-session edition.
   //
-  // V1 simplification: target pose is sent verbatim under the
-  // assumption that base_frame ≈ world. A future tweak will convert
-  // through the robot's base_pose for non-fixed-base setups.
+  // The gizmo is anchored to an invisible mesh at the current TCP pose
+  // (read from scene state). On mouseDown we open a WebSocket streaming
+  // session via /ws/follow-target; while dragging we push the gizmo's
+  // live pose to the session as fast as drei fires onObjectChange (the
+  // backend coalesces — latest-wins — so there's no need to rate-limit
+  // here); on mouseUp we close the session and the backend runs the
+  // configured soft-stop trajectory.
+  //
+  // Why this replaces the old one-shot /api/direct/cartesian-jog path:
+  // each one-shot per frame produced fresh plan+execute cycles, which
+  // (a) carried plan latency, (b) made the robot's motion chunky from
+  // back-to-back acceleration ramps, and (c) raced cycleState transitions
+  // such that the chain could deadlock if a WS state edge beat the HTTP
+  // response. The streaming session is one long-lived intervention with
+  // a mutable target register the C++ backend coalesces against — cycle
+  // stays in direct_control for the entire drag, no idle/direct_control
+  // flapping, smooth preempt via anchored FJT.
+  // Robot-tab focus + cartesian-mode gate. The gizmo only mounts when
+  // BOTH conditions hold: the operator has the Robot panel open AND
+  // the robot panel's mode is set to Cartesian. Switching the active
+  // panel away (Object, Tools, or closed) — or switching robot mode
+  // to Joint — unmounts the gizmo, which triggers the cleanup effect
+  // below to abort any open streaming session.
+  const robotPanelActive = useViewerSelectionStore((s) => s.activePanel === 'robot');
   const robotMode = useViewerSelectionStore((s) => s.robotMode);
   const cartesianFrame = useViewerSelectionStore((s) => s.cartesianFrame);
   const gizmoMode = useViewerSelectionStore((s) => s.cartesianGizmoMode);
   const tcpPose = useSceneStateStore((s) => s.scene?.robot?.tcp_pose_in_base ?? null);
+  const tcpFrame = useSceneStateStore((s) => s.scene?.robot?.tcp_frame ?? null);
+  const baseFrame = useSceneStateStore((s) => s.scene?.robot?.base_frame ?? null);
+  // Joint list for the cartesian streaming session. Sourced from the
+  // live scene's robot state (`scene.robot.joint_names`) rather than the
+  // URDF manifest because the backend's IK uses scene-state ordering;
+  // a URDF/scene mismatch would make the kernel reject every frame with
+  // `unknown_joint_name`. Falls back to an empty list when the scene is
+  // still loading — the kernel's begin_streaming_session fallback (it
+  // populates joint_names from `context_.get_current_state()` when the
+  // session list is empty) covers that gap.
+  const sceneJointNames = useSceneStateStore(
+    (s) => s.scene?.robot?.joint_names ?? null,
+  );
+  const drivableJointNamesRef = useRef<string[]>([]);
+  useEffect(() => {
+    drivableJointNamesRef.current = sceneJointNames ?? [];
+  }, [sceneJointNames]);
   const [anchor, setAnchor] = useState<Mesh | null>(null);
-  // Track whether the operator is actively dragging so we don't
-  // re-seed the anchor from scene state mid-drag.
   const draggingRef = useRef(false);
-  // State-aware coalesce. The backend's `execute_intervention`
-  // returns immediately after starting the tick thread (it does
-  // NOT block until motion completes), so a Promise.finally chain
-  // fires follow-up jogs while the robot is still moving — all of
-  // which get 409'd because the state machine is still in
-  // DIRECT_CONTROL. The fix: gate firing on cycleState === 'idle'
-  // and drive retries off the WS-pushed state edge from
-  // DIRECT_CONTROL → IDLE. `lastFiredPoseRef` is only updated on
-  // a successful 200 response, so a rejected/retried jog can't
-  // poison the "already-sent" check and make us drop later
-  // gizmo positions.
-  // `shouldFollowRef`: true from mouseDown until the robot has
-  // caught up to the latest target post-release. Prevents the
-  // gizmo from issuing jogs in response to background state
-  // transitions (e.g. an autonomous program toggling idle/run)
-  // when the operator isn't actually interacting.
-  const inFlightRef = useRef(false);
-  const lastFiredPoseRef = useRef<{
-    pos: [number, number, number];
-    quat: [number, number, number, number];
-  } | null>(null);
-  const shouldFollowRef = useRef(false);
+  const dragTokenRef = useRef<FollowTargetDragToken | null>(null);
 
   const initialPose = useMemo(() => {
     if (tcpPose === null) return null;
@@ -918,14 +984,6 @@ function TcpJogGizmo() {
     };
   }, [tcpPose]);
 
-  // When entering Cartesian mode (or when tcpPose updates outside of
-  // a drag), re-seed the anchor mesh to the current TCP pose.
-  // Critical: we do NOT pass `position`/`quaternion` as JSX props on
-  // the anchor mesh, because React would re-apply them every render
-  // (each tcpPose poll) — yanking the gizmo back to the robot's
-  // current pose mid-drag and causing a visible flicker between
-  // mouse position and robot position. All seeding is imperative
-  // and guarded by `draggingRef`.
   useEffect(() => {
     if (anchor === null || initialPose === null) return;
     if (draggingRef.current) return;
@@ -933,65 +991,88 @@ function TcpJogGizmo() {
     anchor.quaternion.set(...initialPose.quaternion);
   }, [anchor, initialPose, robotMode]);
 
-  // Fire a jog toward the gizmo's live pose. Gated by:
-  //   - `shouldFollowRef`: operator is interacting (or robot still
-  //     catching up to the release pose)
-  //   - `inFlightRef`: at most one HTTP request outstanding
-  //   - `cycleState === 'idle'`: the backend will accept a new
-  //     intervention (avoids 409 storms during in-flight motion)
-  // `lastFiredPoseRef` is only updated on success. The chain is
-  // re-armed by the cycleStore subscription (below) on each
-  // transition into IDLE, not by Promise.finally.
-  function tryFire(): void {
-    if (!shouldFollowRef.current) return;
-    if (inFlightRef.current) return;
-    if (anchor === null) return;
-    if (useCycleStore.getState().state !== 'idle') return;
-    const p = anchor.position;
-    const q = anchor.quaternion;
-    const target = {
-      pos: [p.x, p.y, p.z] as [number, number, number],
-      quat: [q.x, q.y, q.z, q.w] as [number, number, number, number],
-    };
-    const last = lastFiredPoseRef.current;
-    if (last !== null && posesClose(target, last)) {
-      // Robot already at (or commanded to) the gizmo's live pose.
-      // If the operator has released, the follow window closes.
-      if (!draggingRef.current) shouldFollowRef.current = false;
-      return;
-    }
-    inFlightRef.current = true;
-    void api.direct
-      .cartesianJog(target.pos, target.quat)
-      .then(() => {
-        lastFiredPoseRef.current = target;
-      })
-      .catch((err: unknown) => {
-        // 409 / validation errors leave `lastFiredPoseRef`
-        // untouched so the next tryFire (from the cycleState
-        // listener or onObjectChange) can retry the same pose.
-        console.warn('cartesian follow-jog failed', err);
-      })
-      .finally(() => {
-        inFlightRef.current = false;
-      });
-  }
-
-  // Drive the chain off WS-pushed cycleState transitions to IDLE.
-  // The `execute_intervention` HTTP response resolves before the
-  // motion finishes, so we use the state transition as the only
-  // reliable "the previous segment really completed" signal.
+  // Abort any active session on unmount (mode switch away from Cartesian,
+  // panel close, viewer remount). The controller owns the WebSocket
+  // lifecycle independent of this component; abort() ensures the socket
+  // is closed and the kernel session is released regardless of what
+  // caused the unmount.
   useEffect(() => {
-    const unsub = useCycleStore.subscribe((s, prev) => {
-      if (s.state === 'idle' && prev.state !== 'idle') {
-        tryFire();
+    return () => {
+      if (followTargetController.phase() !== 'idle') {
+        followTargetController.abort('TcpJogGizmo unmount');
       }
-    });
-    return unsub;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    };
+  }, []);
+
+  // Retry watchdog: while dragging, fire a push at a steady rate
+  // independent of drei's onObjectChange cadence. Two failure modes
+  // this catches:
+  //   1. Operator holds the gizmo still in an unreachable region;
+  //      drei stops firing onObjectChange so no pushes go out, so IK
+  //      is never re-attempted. With the watchdog, the kernel keeps
+  //      retrying every 200 ms — if scene interpolation eventually
+  //      brings the kernel's IK seed into a config from which the
+  //      target is reachable, the next push lands and the indicator
+  //      clears without operator intervention.
+  //   2. drei's onObjectChange under fast re-renders firing slower
+  //      than the operator's actual hand motion (we observed 1 Hz
+  //      cadence in logs); the watchdog backs it up at 5 Hz.
+  // No-op when not dragging or when controller phase is not
+  // 'streaming' (the controller's push() drops the call cheaply).
+  useEffect(() => {
+    // 4 Hz watchdog — operator-visible motion stays smooth, kernel +
+    // controller see at most one in-flight frame, and the released
+    // pose is always covered by an explicit final push on onMouseUp.
+    const interval = setInterval(() => {
+      if (!draggingRef.current) return;
+      if (anchor === null) return;
+      const token = dragTokenRef.current;
+      if (token === null) return;
+      const p = anchor.position;
+      const q = anchor.quaternion;
+      followTargetController.push(token, {
+        kind: 'cartesian',
+        positionM: [p.x, p.y, p.z],
+        orientationXyzw: [q.x, q.y, q.z, q.w],
+      });
+    }, 250);
+    return () => clearInterval(interval);
   }, [anchor]);
 
-  if (robotMode !== 'cartesian' || initialPose === null) {
+  // Global pointerup safety net: if drei TransformControls drops the
+  // mouseUp event (which we've observed under certain raycast / event-
+  // capture conditions), the window-level pointerup still fires. When
+  // it does and we're still in dragging state, force the release path
+  // so the gizmo snaps back, the controller ends the session, and the
+  // kernel doesn't stay locked in kStreaming. Without this, releasing
+  // in an unreachable region used to hang the chain for ~30 seconds
+  // until other timeouts eventually unstuck it.
+  useEffect(() => {
+    const onPointerUp = () => {
+      if (!draggingRef.current) return;
+      draggingRef.current = false;
+      const token = dragTokenRef.current;
+      dragTokenRef.current = null;
+      const vs = useViewerSelectionStore.getState();
+      vs.setDraggingGizmo(false);
+      vs.setCartesianRejection(null, null);
+      followTargetController.cancelPendingBegin(token);
+      followTargetController.end(token, 'spring_back');
+      // Always snap back — same invariant as the drei onMouseUp path.
+      if (anchor !== null && initialPose !== null) {
+        anchor.position.set(...initialPose.position);
+        anchor.quaternion.set(...initialPose.quaternion);
+      }
+    };
+    window.addEventListener('pointerup', onPointerUp);
+    window.addEventListener('pointercancel', onPointerUp);
+    return () => {
+      window.removeEventListener('pointerup', onPointerUp);
+      window.removeEventListener('pointercancel', onPointerUp);
+    };
+  }, [anchor, initialPose]);
+
+  if (!robotPanelActive || robotMode !== 'cartesian' || initialPose === null) {
     return null;
   }
 
@@ -1001,53 +1082,578 @@ function TcpJogGizmo() {
     <>
       <mesh
         ref={(m) => {
-          // Seed pose synchronously on mount so the gizmo doesn't
-          // flash at the origin before the useEffect fires.
           if (m !== null && initialPose !== null && !draggingRef.current) {
             m.position.set(...initialPose.position);
             m.quaternion.set(...initialPose.quaternion);
           }
           setAnchor(m);
         }}
-        // Make the anchor invisible but not hidden (drei TransformControls
-        // needs the underlying Object3D to compute its handles).
         visible={false}
       >
         <sphereGeometry args={[0.005, 8, 6]} />
       </mesh>
+      {/*
+        Unreachable/rejected indicator lives in a sibling component
+        (CartesianRejectionIndicator) subscribed to the viewer-selection
+        store. Pulled out of TcpJogGizmo's own render tree to avoid
+        re-rendering the TransformControls subtree on every per-frame
+        rejection — that triggered spurious onMouseDown events under
+        rapid rejection streams.
+      */}
       {anchor !== null && (
         <TransformControls
           object={anchor}
           mode={gizmoMode}
           space={gizmoSpace}
           onMouseDown={() => {
+            // Guard against drei firing onMouseDown twice before
+            // mouseUp. Local UI state (draggingRef + draggingGizmo
+            // store flag) is set unconditionally — independent of
+            // whether the controller can open a fresh session right
+            // now. If the previous session is still ending, the
+            // controller QUEUES the begin and auto-fires it once it
+            // reaches idle. Pushes during the queue window are
+            // dropped at the controller and harmless (backend
+            // coalesces). Decoupling the UI lifecycle from the
+            // session lifecycle is what fixes the "second drag
+            // doesn't snap back on release" bug.
+            if (draggingRef.current) return;
+            const token = followTargetController.begin({
+              inputMode: 'cartesian',
+              jointNames: drivableJointNamesRef.current,
+              cartesianReferenceFrame:
+                cartesianFrame === 'tcp' ? 'tcp' : 'base',
+              tcpFrame: tcpFrame ?? '',
+              softStopStrategy: 'spring_back',
+              maxDispatchRateHz: 30,
+              principalId: 'composer_operator',
+              authoritySource: 'human',
+              triggerReason: 'composer_gizmo_drag',
+            });
+            if (token === null) return;
+            dragTokenRef.current = token;
             draggingRef.current = true;
-            shouldFollowRef.current = true;
-            // Reset the last-fired marker so a re-grab from the
-            // same pose can still issue a jog if needed.
-            lastFiredPoseRef.current = null;
             useViewerSelectionStore.getState().setDraggingGizmo(true);
-            tryFire();
+            // Push the initial pose. If the controller is still in
+            // ending/aborted phase this is dropped; the watchdog will
+            // re-attempt once the queued begin fires.
+            const p = anchor.position;
+            const q = anchor.quaternion;
+            followTargetController.push(token, {
+              kind: 'cartesian',
+              positionM: [p.x, p.y, p.z],
+              orientationXyzw: [q.x, q.y, q.z, q.w],
+            });
           }}
           onObjectChange={() => {
             if (!draggingRef.current) return;
-            // Will fire only if state is idle. Otherwise the
-            // cycleStore subscriber will catch the next IDLE
-            // transition and fire with the live pose then.
-            tryFire();
+            // Server pushes are driven by the 4 Hz watchdog above —
+            // pushing on every drei frame here is redundant and
+            // floods the wire (drei fires at ~60 Hz). The watchdog
+            // reads the live anchor pose, so no per-frame motion is
+            // lost. We do still update the magenta indicator anchor
+            // here in-process (no server hit) so the rejection label
+            // tracks the gizmo smoothly through the unreachable
+            // region.
+            const p = anchor.position;
+            const q = anchor.quaternion;
+            const vsState = useViewerSelectionStore.getState();
+            if (vsState.cartesianRejectionLabel !== null) {
+              vsState.setCartesianRejection(vsState.cartesianRejectionLabel, {
+                position: [p.x, p.y, p.z],
+                quaternion: [q.x, q.y, q.z, q.w],
+              });
+            }
           }}
           onMouseUp={() => {
+            // Unconditional cleanup. Local UI state always resets on
+            // release, regardless of whether the session opened or
+            // queued, regardless of whether the controller phase is
+            // streaming / opening / ending. This guarantees the gizmo
+            // snaps back on every release.
+            const wasDragging = draggingRef.current;
             draggingRef.current = false;
-            useViewerSelectionStore.getState().setDraggingGizmo(false);
-            // `shouldFollowRef` stays true; tryFire keeps firing
-            // until the robot reaches the release pose, at which
-            // point posesClose() trips the early-return that
-            // clears the follow flag.
-            tryFire();
+            const vs = useViewerSelectionStore.getState();
+            vs.setDraggingGizmo(false);
+            vs.setCartesianRejection(null, null);
+            // Cancel any queued begin so a release-then-grab-then-
+            // release doesn't leave a phantom session pending.
+            const token = dragTokenRef.current;
+            dragTokenRef.current = null;
+            followTargetController.cancelPendingBegin(token);
+            if (wasDragging && token !== null) {
+              // Push the release pose and end the active session.
+              // push() drops if controller isn't streaming (queued or
+              // already ended). end() drops if not streaming/opening.
+              // Both safe.
+              const p = anchor.position;
+              const q = anchor.quaternion;
+              followTargetController.push(token, {
+                kind: 'cartesian',
+                positionM: [p.x, p.y, p.z],
+                orientationXyzw: [q.x, q.y, q.z, q.w],
+              });
+              followTargetController.end(token, 'spring_back');
+            }
+            // ALWAYS snap the gizmo back to the live TCP. The decisive
+            // user-visible bit: never leave the gizmo floating in the
+            // unreachable region after a release.
+            if (anchor !== null && initialPose !== null) {
+              anchor.position.set(...initialPose.position);
+              anchor.quaternion.set(...initialPose.quaternion);
+            }
+            void baseFrame; // reserved for multi-base future work
           }}
         />
       )}
     </>
+  );
+}
+
+/**
+ * 3D ghost preview for the Robot panel's Move To tab.
+ *
+ * Reads the same store state as MoveToBody (source, entity selection,
+ * orientation mode, offset) and computes the resulting target pose
+ * through the shared `utils/moveTo.ts` helper — so the operator sees
+ * exactly the pose that will be commanded on Go.
+ *
+ * Renders an axesHelper at the target (red/green/blue = x/y/z of the
+ * TCP frame) plus a label tag for orientation context. Joint-goal
+ * targets are skipped (no cartesian pose to anchor an axes preview
+ * to; the operator gets a less-detailed text preview in the panel).
+ */
+function MoveToTargetGhost() {
+  const robotPanelActive = useViewerSelectionStore((s) => s.activePanel === 'robot');
+  const robotMode = useViewerSelectionStore((s) => s.robotMode);
+  const moveTo = useViewerSelectionStore((s) => s.moveTo);
+  const objects = useSceneStateStore((s) => s.scene?.objects ?? EMPTY_OBJECTS);
+  const tcpPose = useSceneStateStore((s) => s.scene?.robot?.tcp_pose_in_base ?? null);
+  const appliedTree = useProgramStore((s) => s.appliedTree);
+  const [frames, setFrames] = useState<SceneFrameState[]>([]);
+
+  // Independent frames fetch so the ghost works even if MoveToBody
+  // isn't mounted (e.g. operator toggles the panel chrome but keeps
+  // the Move-To selection live). Same cleanup-on-unmount pattern.
+  useEffect(() => {
+    if (!robotPanelActive || robotMode !== 'move-to') return;
+    let cancelled = false;
+    void api.scene
+      .frames()
+      .then((data) => {
+        if (!cancelled) setFrames(data.frames.filter((f) => f.poseAvailable));
+      })
+      .catch(() => {
+        if (!cancelled) setFrames([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [robotPanelActive, robotMode]);
+
+  const storedPoses = useMemo(() => {
+    const out: { nodeName: string; motionType: 'pose_goal' | 'joint_goal'; params: Record<string, unknown> }[] = [];
+    function visit(node: TreeNode | null): void {
+      if (node === null) return;
+      if (node.id === 'move_manipulator_action') {
+        const mt = node.params['motion_type'];
+        if (mt === 'pose_goal' || mt === 'joint_goal') {
+          out.push({ nodeName: node.name, motionType: mt, params: node.params });
+        }
+      }
+      for (const child of node.children ?? []) visit(child);
+    }
+    visit(appliedTree);
+    return out;
+  }, [appliedTree]);
+
+  const target = useMemo(() => {
+    if (!robotPanelActive || robotMode !== 'move-to') return null;
+    return computeMoveToTarget({
+      moveTo,
+      objects: objects.filter((o) => !o.attached),
+      frames,
+      storedPoses,
+      tcpPose,
+    });
+  }, [robotPanelActive, robotMode, moveTo, objects, frames, storedPoses, tcpPose]);
+
+  if (target === null || target.kind !== 'cartesian') return null;
+
+  return (
+    <group position={target.position} quaternion={target.quaternion}>
+      <axesHelper args={[0.12]} />
+    </group>
+  );
+}
+
+/**
+ * Transparent ghost-robot preview for the Move-To tab.
+ *
+ * Posts the current Move-To target to /api/scene/preview-link-poses
+ * on a 250 ms debounce; on success renders the full URDF at the
+ * returned link_poses with 50 % alpha; on IK failure (unreachable
+ * cartesian target) renders ONLY the TCP link at the supplied
+ * tcp_pose in red 50 % alpha — the visual cue that the rest of
+ * the kinematic chain can't reach this pose.
+ *
+ * Lives as a sibling of MoveToTargetGhost (the axes preview) so
+ * the two compose: axes always show the precise TCP point; the
+ * ghost robot adds the "will the elbow fight me" reachability
+ * answer.
+ */
+function MoveToGhostRobot() {
+  const robotPanelActive = useViewerSelectionStore((s) => s.activePanel === 'robot');
+  const robotMode = useViewerSelectionStore((s) => s.robotMode);
+  const moveTo = useViewerSelectionStore((s) => s.moveTo);
+  const objects = useSceneStateStore((s) => s.scene?.objects ?? EMPTY_OBJECTS);
+  const tcpPose = useSceneStateStore((s) => s.scene?.robot?.tcp_pose_in_base ?? null);
+  const tcpFrame = useSceneStateStore((s) => s.scene?.robot?.tcp_frame ?? null);
+  const robotModelKey = useSceneStateStore(
+    (s) => s.scene?.robot?.urdf_model_key ?? s.scene?.robot?.robot_id ?? null,
+  );
+  const liveJointNames = useSceneStateStore((s) => s.scene?.robot?.joint_names ?? null);
+  const liveJointPositions = useSceneStateStore(
+    (s) => s.scene?.robot?.joint_positions ?? null,
+  );
+  const appliedTree = useProgramStore((s) => s.appliedTree);
+  const [frames, setFrames] = useState<SceneFrameState[]>([]);
+  const [manifest, setManifest] = useState<SceneUrdfManifest | null>(null);
+  const [preview, setPreview] = useState<PreviewLinkPosesResponse | null>(null);
+
+  // Fetch frames + URDF manifest once when Move-To becomes active. Both
+  // are needed to compute the target (frames feed the Frame source)
+  // and to render the ghost (manifest carries the link/visual tree).
+  useEffect(() => {
+    if (!robotPanelActive || robotMode !== 'move-to') return;
+    let cancelled = false;
+    void Promise.all([api.scene.frames(), api.urdf.manifest()])
+      .then(([f, m]) => {
+        if (cancelled) return;
+        setFrames(f.frames.filter((fr) => fr.poseAvailable));
+        setManifest(m);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setFrames([]);
+        setManifest(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [robotPanelActive, robotMode, robotModelKey]);
+
+  const storedPoses = useMemo(() => {
+    const out: { nodeName: string; motionType: 'pose_goal' | 'joint_goal'; params: Record<string, unknown> }[] = [];
+    function visit(node: TreeNode | null): void {
+      if (node === null) return;
+      if (node.id === 'move_manipulator_action') {
+        const mt = node.params['motion_type'];
+        if (mt === 'pose_goal' || mt === 'joint_goal') {
+          out.push({ nodeName: node.name, motionType: mt, params: node.params });
+        }
+      }
+      for (const child of node.children ?? []) visit(child);
+    }
+    visit(appliedTree);
+    return out;
+  }, [appliedTree]);
+
+  const target = useMemo(() => {
+    if (!robotPanelActive || robotMode !== 'move-to') return null;
+    return computeMoveToTarget({
+      moveTo,
+      objects: objects.filter((o) => !o.attached),
+      frames,
+      storedPoses,
+      tcpPose,
+    });
+  }, [robotPanelActive, robotMode, moveTo, objects, frames, storedPoses, tcpPose]);
+
+  // Debounced preview-link-poses request. Re-fires whenever the
+  // computed target changes (slider drag, offset edit, source switch)
+  // but always waits the 250 ms quiescence so we don't hammer the
+  // kernel during slider drags. IK is ~5-50 ms per call; per-link FK
+  // is sub-millisecond — comfortable budget at this rate.
+  useEffect(() => {
+    if (target === null || manifest === null) {
+      setPreview(null);
+      return;
+    }
+    const linkNames = manifest.links.map((l) => l.name);
+    const handle = window.setTimeout(() => {
+      let req: PreviewLinkPosesRequest;
+      if (target.kind === 'cartesian') {
+        // Pass the live joint configuration as the IK seed so the
+        // solver picks the branch nearest the current arm pose. Without
+        // a seed the kernel falls back to context.get_current_state(),
+        // which works but produces non-deterministic branch flips as
+        // the operator drags an offset slider — adjacent targets can
+        // land on opposite elbow-up/elbow-down solutions and visibly
+        // pop the ghost robot.
+        const seedJointNames: string[] = liveJointNames ?? [];
+        const seedJointPositions: number[] =
+          liveJointNames && liveJointPositions
+            ? liveJointNames.map((n) => Number(liveJointPositions[n] ?? 0))
+            : [];
+        req = {
+          kind: 'cartesian',
+          tcp_frame: tcpFrame ?? '',
+          tcp_position_m: target.position,
+          tcp_orientation_xyzw: target.quaternion,
+          link_names: linkNames,
+          joint_names: seedJointNames,
+          joint_positions_rad: seedJointPositions,
+        };
+      } else {
+        req = {
+          kind: 'joint',
+          joint_names: target.jointNames,
+          joint_positions_rad: target.jointPositionsRad,
+          link_names: linkNames,
+        };
+      }
+      void api.scene
+        .previewLinkPoses(req)
+        .then((r) => setPreview(r))
+        .catch(() => setPreview(null));
+    }, 250);
+    return () => window.clearTimeout(handle);
+  }, [target, manifest, tcpFrame, liveJointNames, liveJointPositions]);
+
+  if (!robotPanelActive || robotMode !== 'move-to') return null;
+  if (manifest === null || preview === null) return null;
+  if (
+    robotModelKey !== null &&
+    manifest.model_key !== undefined &&
+    manifest.model_key !== robotModelKey
+  ) {
+    return null;
+  }
+
+  if (preview.reachable) {
+    return (
+      <group name="manyforge-ghost-robot" key={manifest.model_key ?? manifest.robot_id ?? 'unknown'}>
+        {manifest.links.map((link) => {
+          const pose = preview.link_poses[link.name];
+          if (!pose) return null;
+          const modelKey = manifest.model_key ?? manifest.robot_id ?? 'unknown';
+          return (
+            <group
+              key={`${modelKey}:ghost:${link.name}`}
+              position={pose.position_m as [number, number, number]}
+              quaternion={pose.orientation_xyzw as [number, number, number, number]}
+            >
+              {link.visuals.map((visual) => (
+                <GhostVisual
+                  key={`${modelKey}:ghost:${link.name}:${visual.index}:${visual.mesh_url ?? 'primitive'}`}
+                  visual={visual}
+                  opacity={0.5}
+                />
+              ))}
+            </group>
+          );
+        })}
+      </group>
+    );
+  }
+
+  // Unreachable: render only the TCP link (the "gripper") at the
+  // supplied target pose, in red. Operator gets a clear "you asked
+  // for this TCP pose, the rest of the arm can't reach it" cue
+  // without an axes-only ambiguity.
+  if (preview.tcp_pose === undefined || tcpFrame === null) return null;
+  const tcpLink = manifest.links.find((l) => l.name === tcpFrame);
+  if (tcpLink === undefined) return null;
+  const modelKey = manifest.model_key ?? manifest.robot_id ?? 'unknown';
+  return (
+    <group
+      name="manyforge-ghost-tcp-unreachable"
+      key={`${modelKey}:ghost-unreachable:${tcpFrame}`}
+      position={preview.tcp_pose.position_m as [number, number, number]}
+      quaternion={preview.tcp_pose.orientation_xyzw as [number, number, number, number]}
+    >
+      {tcpLink.visuals.map((visual) => (
+        <GhostVisual
+          key={`${modelKey}:ghost-unreachable:${tcpFrame}:${visual.index}:${visual.mesh_url ?? 'primitive'}`}
+          visual={visual}
+          opacity={0.5}
+          color="#ff3333"
+        />
+      ))}
+    </group>
+  );
+}
+
+function GhostVisual({
+  visual,
+  opacity,
+  color,
+}: {
+  visual: SceneUrdfVisual;
+  opacity: number;
+  color?: string;
+}) {
+  const offsetPos = visual.visual_origin.position_m as [number, number, number];
+  const offsetQuat = visualOriginQuaternion(visual);
+  if (visual.mesh_url !== null) {
+    return (
+      <group position={offsetPos} quaternion={offsetQuat}>
+        <GhostMeshGltf url={visual.mesh_url} opacity={opacity} color={color} />
+      </group>
+    );
+  }
+  if (visual.primitive !== null) {
+    return (
+      <group position={offsetPos} quaternion={offsetQuat}>
+        <GhostPrimitiveMesh primitive={visual.primitive} opacity={opacity} color={color} />
+      </group>
+    );
+  }
+  return null;
+}
+
+function GhostMeshGltf({
+  url,
+  opacity,
+  color,
+}: {
+  url: string;
+  opacity: number;
+  color?: string;
+}) {
+  const gltf = useGLTF(url);
+  const cloned = useMemo(() => {
+    const c = gltf.scene.clone(true);
+    c.traverse((obj) => {
+      const m = obj as THREE.Mesh;
+      if (!m.isMesh) return;
+      const sourceMaterials = Array.isArray(m.material) ? m.material : [m.material];
+      const tinted = sourceMaterials.map((src) => {
+        const mat = src.clone() as THREE.MeshStandardMaterial;
+        mat.transparent = true;
+        mat.opacity = opacity;
+        // depthWrite=false avoids the ghost writing its own depth
+        // and causing nested-mesh transparency ordering artefacts
+        // (a UR5 link has multiple visual submeshes that would
+        // otherwise self-occlude when both transparent).
+        mat.depthWrite = false;
+        if (color !== undefined && (mat as THREE.MeshStandardMaterial).color) {
+          (mat as THREE.MeshStandardMaterial).color.set(color);
+        }
+        return mat;
+      });
+      m.material = Array.isArray(m.material) ? tinted : tinted[0];
+    });
+    return c;
+  }, [gltf.scene, opacity, color]);
+  return <primitive key={url} object={cloned} />;
+}
+
+function GhostPrimitiveMesh({
+  primitive,
+  opacity,
+  color,
+}: {
+  primitive: NonNullable<SceneUrdfVisual['primitive']>;
+  opacity: number;
+  color?: string;
+}) {
+  const matColor = color ?? '#a8aab0';
+  if (primitive.type === 'box') {
+    const dims = primitive.size_m as [number, number, number];
+    return (
+      <mesh>
+        <boxGeometry args={dims} />
+        <meshStandardMaterial
+          color={matColor}
+          metalness={0.1}
+          roughness={0.7}
+          transparent
+          opacity={opacity}
+          depthWrite={false}
+        />
+      </mesh>
+    );
+  }
+  if (primitive.type === 'cylinder') {
+    return (
+      <mesh rotation={[Math.PI / 2, 0, 0]}>
+        <cylinderGeometry
+          args={[primitive.radius_m, primitive.radius_m, primitive.length_m, 24]}
+        />
+        <meshStandardMaterial
+          color={matColor}
+          metalness={0.1}
+          roughness={0.7}
+          transparent
+          opacity={opacity}
+          depthWrite={false}
+        />
+      </mesh>
+    );
+  }
+  if (primitive.type === 'sphere') {
+    return (
+      <mesh>
+        <sphereGeometry args={[primitive.radius_m, 24, 16]} />
+        <meshStandardMaterial
+          color={matColor}
+          metalness={0.1}
+          roughness={0.7}
+          transparent
+          opacity={opacity}
+          depthWrite={false}
+        />
+      </mesh>
+    );
+  }
+  return null;
+}
+
+/**
+ * Sibling-component rendering for the streaming-session magenta
+ * indicator. Subscribed to the viewer-selection store so it re-renders
+ * independently of TcpJogGizmo — store updates from per-frame rejections
+ * don't touch the gizmo's render tree (which under fast rejection
+ * streams produced spurious onMouseDown events and burst WS opens).
+ */
+function CartesianRejectionIndicator() {
+  const label = useViewerSelectionStore((s) => s.cartesianRejectionLabel);
+  const anchor = useViewerSelectionStore((s) => s.cartesianRejectionAnchor);
+  if (label === null || anchor === null) return null;
+  // Label only — no in-scene mesh. The HTML overlay carries all the
+  // information the operator needs; rendering a 3D mesh at the gizmo
+  // position is decorative and a raycast-intercept risk for drei's
+  // TransformControls. `pointerEvents="none"` keeps the label transparent
+  // to the gizmo's mouse handling.
+  return (
+    <group position={anchor.position} quaternion={anchor.quaternion}>
+      <Html
+        position={[0, 0.07, 0]}
+        center
+        distanceFactor={1.5}
+        pointerEvents="none"
+        prepend
+        zIndexRange={[0, 0]}
+        style={{
+          userSelect: 'none',
+          pointerEvents: 'none',
+          fontFamily: 'monospace',
+          fontWeight: 700,
+          fontSize: '10px',
+          letterSpacing: '0.1em',
+          color: '#ffffff',
+          background: '#ff00ff',
+          padding: '2px 6px',
+          borderRadius: '2px',
+          whiteSpace: 'nowrap',
+          boxShadow: '0 0 4px rgba(0,0,0,0.4)',
+        }}
+      >
+        {label}
+      </Html>
+    </group>
   );
 }
 
@@ -1103,9 +1709,13 @@ function PointCloud() {
 function ObjectFrameAxes() {
   // Sibling of FrameAxes for per-scene-object frame helpers. Pose
   // comes from /api/scene/state.objects[].pose_in_universe;
-  // visibility from .viewer_frame_visible (now state-owned).
+  // visibility from .viewer_frame_visible (now state-owned). Size
+  // is tracked independently of the named-frame gizmo size so the
+  // operator can dial each axis style separately.
   const objects = useSceneStateStore((s) => s.scene?.objects ?? EMPTY_OBJECTS);
-  const gizmoSize = useSceneStateStore((s) => s.frames?.frameGizmoSizeM ?? 0.1);
+  const gizmoSize = useSceneStateStore(
+    (s) => s.scene?.object_axes_gizmo_size_m ?? 0.1,
+  );
   return (
     <group name="manyforge-object-frame-axes">
       {objects.map((obj) => {

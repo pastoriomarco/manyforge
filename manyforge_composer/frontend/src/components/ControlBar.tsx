@@ -1,6 +1,9 @@
-import { useCallback, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { api } from '../api/client';
 import { useCycleStore, useEditLocked } from '../store/cycleStore';
+import { useSceneStateStore } from '../store/sceneStateStore';
+import { followTargetController } from '../streaming/followTargetController';
+import type { FollowTargetPhase } from '../streaming/followTargetController';
 import { useComposerStore } from '../store/composerStore';
 import { useProgramStore } from '../store/programStore';
 import { useDeploymentStore } from '../store/deploymentStore';
@@ -669,17 +672,58 @@ export function ControlBar() {
  * state except where the kernel forbids it (the backend returns
  * 409 in that case; we let it surface via the cycle store's error).
  */
+function useFollowTargetPhase(): FollowTargetPhase {
+  const [phase, setPhase] = useState<FollowTargetPhase>(() => followTargetController.phase());
+  useEffect(() => followTargetController.subscribe(setPhase), []);
+  return phase;
+}
+
 function CycleControls() {
   const { state, velocityScale, run, stop, reset, setVelocityScale, error } = useCycleStore();
+  const streamingPhase = useFollowTargetPhase();
+  // `ending` is the post-end-op window where the kernel session is
+  // closing — the worker is already winding down and Stop wouldn't
+  // accomplish anything useful. Treat the session as active only for
+  // phases where the operator can still cancel commanded motion.
+  const streamingActive = streamingPhase === 'opening' || streamingPhase === 'streaming';
+  const [cycleBusy, setCycleBusy] = useState(false);
   const canRun = state === 'idle' || state === 'stopped';
-  const canStop = state === 'running' || state === 'interrupt_handler' || state === 'direct_control';
+  // Stop applies to any in-flight motion the operator can see — BT
+  // execution (state==='running'), an intervention session
+  // (direct_control), an interrupt handler, OR a follow-target
+  // streaming session driven by a slider/gizmo. The latter doesn't
+  // transition the cycle state today (follow_target_ws calls the
+  // kernel directly), so without surfacing the controller phase here
+  // the Stop button would stay disabled while a slider-commanded
+  // motion was still travelling toward its goal.
+  const cycleStoppable =
+    state === 'running' || state === 'interrupt_handler' || state === 'direct_control';
+  const canStop = cycleStoppable || streamingActive;
+
+  const runAfterStreamingSettles = useCallback(
+    (reason: string, command: () => Promise<void>) => {
+      void (async () => {
+        setCycleBusy(true);
+        try {
+          const settled = await followTargetController.abortAndWaitForIdle(reason, 3000);
+          if (!settled) {
+            console.warn('Streaming session did not settle before cycle command:', reason);
+          }
+          await command();
+        } finally {
+          setCycleBusy(false);
+        }
+      })();
+    },
+    [],
+  );
 
   return (
     <div className="ml-auto flex items-center gap-2">
       <button
         type="button"
         onClick={() => void run()}
-        disabled={!canRun}
+        disabled={cycleBusy || !canRun}
         title={canRun ? 'Start the loaded program' : `Cycle is ${state}`}
         className="rounded bg-emerald-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-emerald-500 disabled:cursor-not-allowed disabled:bg-gray-600"
       >
@@ -687,18 +731,54 @@ function CycleControls() {
       </button>
       <button
         type="button"
-        onClick={() => void stop()}
-        disabled={!canStop}
-        title={canStop ? 'Stop the active cycle' : `Cycle is ${state}`}
+        onClick={() => {
+          // ADR-0016: any user-initiated stop must abort an active
+          // streaming session FIRST so the frontend doesn't keep
+          // pushing frames into a dead kernel session. If the cycle
+          // is also in a stoppable state (BT execution / intervention
+          // / interrupt handler) call stop() once streaming settles;
+          // otherwise the abort alone is the stop.
+          //
+          // After the abort lands the kernel publishes a kStopped
+          // snapshot with the final joint positions, but the
+          // composer's scene-state poll cadence is 100–250 ms; without
+          // a forced refresh the operator sees the slider hold at its
+          // last-pushed target for up to one poll interval before
+          // snapping to the actual stopped pose. The explicit refresh
+          // closes that visual gap.
+          runAfterStreamingSettles('user stop', async () => {
+            if (cycleStoppable) {
+              await stop();
+            }
+            try {
+              await useSceneStateStore.getState().refresh();
+            } catch (err) {
+              console.warn('post-stop scene refresh failed', err);
+            }
+          });
+        }}
+        disabled={cycleBusy || !canStop}
+        title={
+          canStop
+            ? streamingActive && !cycleStoppable
+              ? 'Stop the active slider motion'
+              : 'Stop the active cycle'
+            : `Cycle is ${state}`
+        }
         className="rounded bg-orange-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-orange-500 disabled:cursor-not-allowed disabled:bg-gray-600"
       >
         Stop
       </button>
       <button
         type="button"
-        onClick={() => void reset()}
+        onClick={() => {
+          // Same precondition as Stop: abort the streaming session
+          // before resetting the kernel state.
+          runAfterStreamingSettles('user reset', reset);
+        }}
+        disabled={cycleBusy}
         title="Reset the cycle to its initial state"
-        className="rounded bg-rose-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-rose-500"
+        className="rounded bg-rose-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-rose-500 disabled:cursor-not-allowed disabled:bg-gray-600"
       >
         Reset
       </button>

@@ -258,6 +258,7 @@ _INTERRUPT_NODE_RESOURCE_CLAIMS: dict[str, tuple[str, ...]] = {
     "detach_object_from_link": ("scene", "gripper"),
     "get_link_pose": ("scene",),
     "move_manipulator_action": ("motion",),
+    "track_target_action": ("motion",),
     "plan_pick_sequence": ("planner", "scene"),
     "query_model": ("model",),
     "remove_collision_object": ("scene",),

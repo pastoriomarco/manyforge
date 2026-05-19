@@ -1,9 +1,10 @@
 import { useMemo, useState } from 'react';
 
 import { api } from '../api/client';
+import { useProgramStore } from '../store/programStore';
 import { useSceneStateStore } from '../store/sceneStateStore';
 import { useViewerSelectionStore } from '../store/viewerSelectionStore';
-import type { SceneObjectState } from '../types/api';
+import type { ProgramSceneResource, SceneObjectState } from '../types/api';
 
 /**
  * Day-5 object-edit overlay panel. Renders metadata for whichever
@@ -99,9 +100,203 @@ function ObjectEditor({ object }: { object: SceneObjectState }) {
         commit={(next) => emitPoseEdit(object.object_id, position, next)}
       />
 
-      <SaveToProgramRow object={object} />
+      <SaveOrDiscardRow object={object} />
     </div>
   );
+}
+
+/**
+ * Combined "Save to program" + "Discard pending move" controls.
+ *
+ * Live edits (gizmo drag, numeric pose fields) POST to /api/scene/edit
+ * which mutates only the live scene. The program YAML's
+ * scene-resource definition still holds the authored pose until
+ * Save-to-program is clicked. Until then the operator had no way to
+ * undo a pending move without reloading the program.
+ *
+ * "Discard" re-reads the program's scene resource for this object and
+ * POSTs update_pose with the authored pose/orientation, snapping the
+ * live scene back. Only applies to authored objects (the same scope
+ * as Save-to-program); runtime/sensed/attached objects don't have a
+ * program-side pose to revert to.
+ */
+function SaveOrDiscardRow({ object }: { object: SceneObjectState }) {
+  const sceneResources = useProgramStore((s) => s.sceneResources);
+  const programResource = useMemo<ProgramSceneResource | null>(
+    () => sceneResources.find((r) => r.objectId === object.object_id) ?? null,
+    [sceneResources, object.object_id],
+  );
+  const authored = object.source === 'authored' && !object.attached;
+  const livePose = (object.pose_in_universe ?? {}) as Record<string, unknown>;
+  const programPose = useMemo(
+    () => normalizeProgramPose(programResource?.pose ?? null),
+    [programResource],
+  );
+  const hasPendingMove = authored && programPose !== null && posesDiffer(livePose, programPose);
+
+  return (
+    <div className="mt-2 border-t border-gray-800 pt-2">
+      <SaveToProgramRow object={object} />
+      <DiscardPendingMoveRow
+        object={object}
+        authored={authored}
+        programPose={programPose}
+        hasPendingMove={hasPendingMove}
+      />
+    </div>
+  );
+}
+
+function DiscardPendingMoveRow({
+  object,
+  authored,
+  programPose,
+  hasPendingMove,
+}: {
+  object: SceneObjectState;
+  authored: boolean;
+  programPose: NormalizedPose | null;
+  hasPendingMove: boolean;
+}) {
+  const [status, setStatus] = useState<'idle' | 'sending' | 'error'>('idle');
+  const [errorDetail, setErrorDetail] = useState<string | null>(null);
+
+  function discard(): void {
+    if (programPose === null) {
+      setStatus('error');
+      setErrorDetail('program pose missing or malformed');
+      return;
+    }
+    setStatus('sending');
+    setErrorDetail(null);
+    void api.scene
+      .edit({
+        operation: 'update_pose',
+        object_id: object.object_id,
+        pose_position_m: programPose.position,
+        pose_orientation_xyzw: programPose.quaternion,
+      })
+      .then(() => {
+        setStatus('idle');
+      })
+      .catch((err: unknown) => {
+        setStatus('error');
+        setErrorDetail(err instanceof Error ? err.message : 'discard failed');
+      });
+  }
+
+  const disabled = !authored || !hasPendingMove || status === 'sending';
+  const title = !authored
+    ? object.attached
+      ? 'Attached objects follow their parent link; not revertible here'
+      : object.source === 'runtime'
+        ? 'Runtime objects have no program-side pose to revert to'
+        : 'Object is not persistable'
+    : !hasPendingMove
+      ? 'No pending move to discard'
+      : 'Revert this object to the program-defined pose';
+
+  return (
+    <div className="mt-1.5">
+      <button
+        type="button"
+        onClick={discard}
+        disabled={disabled}
+        title={title}
+        className="w-full rounded bg-gray-700 px-2 py-1 text-[11px] text-gray-200 hover:bg-gray-600 disabled:cursor-not-allowed disabled:opacity-40"
+      >
+        Discard pending move
+      </button>
+      {status === 'error' && errorDetail !== null && (
+        <div className="mt-1 text-[10px] text-red-300" title={errorDetail}>
+          ✗ {errorDetail.slice(0, 60)}
+        </div>
+      )}
+    </div>
+  );
+}
+
+interface NormalizedPose {
+  position: [number, number, number];
+  quaternion: [number, number, number, number];
+}
+
+/**
+ * Normalize a program scene-resource pose dict into world-canonical
+ * position + xyzw quaternion. Program YAML allows either
+ * `orientation_xyzw` (quaternion, direct) or `orientation_rpy_deg`
+ * (Euler in degrees) per the schema in spec/420; we convert the
+ * latter so the discard path doesn't have to ship two shapes to the
+ * backend. Returns null when the pose is missing/malformed.
+ */
+function normalizeProgramPose(pose: Record<string, unknown> | null): NormalizedPose | null {
+  if (pose === null) return null;
+  const position = readTriple(pose.position_m);
+  if (position === null) return null;
+  const quatDirect = readQuad(pose.orientation_xyzw);
+  if (quatDirect !== null) return { position, quaternion: quatDirect };
+  const rpyDeg = readTriple(pose.orientation_rpy_deg);
+  if (rpyDeg !== null) {
+    const rpyRad: [number, number, number] = [
+      (rpyDeg[0] * Math.PI) / 180,
+      (rpyDeg[1] * Math.PI) / 180,
+      (rpyDeg[2] * Math.PI) / 180,
+    ];
+    return { position, quaternion: rpyRadToQuat(rpyRad) };
+  }
+  // Identity quaternion when orientation is omitted entirely — the
+  // program schema treats missing orientation as identity, matching
+  // the backend Program loader.
+  return { position, quaternion: [0, 0, 0, 1] };
+}
+
+function rpyRadToQuat(rpy: [number, number, number]): [number, number, number, number] {
+  const [r, p, y] = rpy;
+  const cr = Math.cos(r / 2);
+  const sr = Math.sin(r / 2);
+  const cp = Math.cos(p / 2);
+  const sp = Math.sin(p / 2);
+  const cy = Math.cos(y / 2);
+  const sy = Math.sin(y / 2);
+  const w = cr * cp * cy + sr * sp * sy;
+  const qx = sr * cp * cy - cr * sp * sy;
+  const qy = cr * sp * cy + sr * cp * sy;
+  const qz = cr * cp * sy - sr * sp * cy;
+  return [qx, qy, qz, w];
+}
+
+function posesDiffer(
+  live: Record<string, unknown>,
+  program: NormalizedPose,
+): boolean {
+  const livePos = readTriple(live.position_m);
+  if (livePos === null) return true;
+  for (let i = 0; i < 3; i++) {
+    if (Math.abs(livePos[i] - program.position[i]) > 1e-6) return true;
+  }
+  const liveQuat = readQuad(live.orientation_xyzw);
+  if (liveQuat === null) return true;
+  // Quaternion equivalence: q and -q represent the same rotation.
+  let dot = 0;
+  for (let i = 0; i < 4; i++) dot += liveQuat[i] * program.quaternion[i];
+  return Math.abs(Math.abs(dot) - 1) > 1e-6;
+}
+
+function readTriple(value: unknown): [number, number, number] | null {
+  if (!Array.isArray(value) || value.length !== 3) return null;
+  const out: [number, number, number] = [Number(value[0]), Number(value[1]), Number(value[2])];
+  return out.every(Number.isFinite) ? out : null;
+}
+
+function readQuad(value: unknown): [number, number, number, number] | null {
+  if (!Array.isArray(value) || value.length !== 4) return null;
+  const out: [number, number, number, number] = [
+    Number(value[0]),
+    Number(value[1]),
+    Number(value[2]),
+    Number(value[3]),
+  ];
+  return out.every(Number.isFinite) ? out : null;
 }
 
 /**
@@ -170,7 +365,7 @@ function SaveToProgramRow({ object }: { object: SceneObjectState }) {
   }
 
   return (
-    <div className="mt-2 border-t border-gray-800 pt-2">
+    <>
       <button
         type="button"
         onClick={saveToProgram}
@@ -189,7 +384,7 @@ function SaveToProgramRow({ object }: { object: SceneObjectState }) {
         Save to program (scene resource)
       </button>
       <SaveStatus status={status} runtime={runtime} />
-    </div>
+    </>
   );
 }
 

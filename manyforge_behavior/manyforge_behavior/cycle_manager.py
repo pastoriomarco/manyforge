@@ -424,6 +424,16 @@ class CycleManager:
                 self._kernel_events.append(event)
         return events
 
+    def drain_kernel_events_now(self) -> list[dict[str, Any]]:
+        """Pull pending native kernel events into the indexed event buffer.
+
+        Normal behavior-tree execution drains native events from the tick loop.
+        Direct surfaces such as the streaming-target WebSocket bypass that loop,
+        so API routes and websocket status broadcasts call this explicit drain
+        before reading the buffered event stream.
+        """
+        return self._drain_kernel_events()
+
     def get_kernel_events_since(self, event_index: int) -> list[dict[str, Any]]:
         """Return kernel events with event_index greater than the given value."""
         with self._lock:

@@ -29,6 +29,13 @@ enum class KernelEventType {
   kPauseRequested,     // pause requested
   kResumeRequested,    // resume requested
   kCompletedAcknowledged,  // completed terminal outcome acknowledged
+  // Streaming-session events (ADR-0016). `session_id` lives in `details`
+  // under the key "session_id" for correlation.
+  kStreamingSessionStarted,    // streaming session opened on backend
+  kStreamingTargetReceived,    // push_streaming_target accepted by kernel
+  kStreamingTargetDispatched,  // backend dispatched a goal for a coalesced target
+  kStreamingTargetRejected,    // target rejected (IK fail, validation, etc.)
+  kStreamingSessionEnded,      // streaming session terminal (soft-stop or hard cancel)
   kErrorRaised,        // error occurred
   kCollisionDetected,  // collision detected during execution
 };

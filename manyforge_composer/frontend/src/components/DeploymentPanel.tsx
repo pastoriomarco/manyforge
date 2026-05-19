@@ -8,6 +8,8 @@ import type {
   ModelEndpointCatalog,
   ModelEndpointConfig,
   SceneFrameState,
+  SceneUrdfManifest,
+  StreamingJointLimit,
 } from '../types/api';
 import { useDeploymentStore } from '../store/deploymentStore';
 import { useEditLocked } from '../store/cycleStore';
@@ -23,21 +25,39 @@ function FieldInput({
   onChange,
   type = 'text',
   disabled = false,
+  help,
+  min,
+  step,
 }: {
   label: string;
   value: string | number;
   onChange: (v: string) => void;
   type?: string;
   disabled?: boolean;
+  help?: string;
+  min?: number;
+  step?: number;
 }) {
   return (
-    <label className="block mb-2">
-      <span className="text-xs text-gray-400">{label}</span>
+    <label className="block mb-2" title={help}>
+      <span className="text-xs text-gray-400">
+        {label}
+        {help !== undefined && (
+          <span
+            className="ml-1 cursor-help text-gray-500"
+            aria-label={help}
+          >
+            ⓘ
+          </span>
+        )}
+      </span>
       <DraftTextInput
         type={type}
         value={value}
         onCommit={onChange}
         disabled={disabled}
+        min={min}
+        step={step}
         className="w-full mt-0.5 px-2 py-1 bg-gray-700 border border-gray-600 rounded text-sm text-gray-200 focus:border-blue-500 focus:outline-none disabled:opacity-50 disabled:cursor-not-allowed"
       />
     </label>
@@ -317,6 +337,100 @@ function FrameMultiSelect({
   );
 }
 
+/**
+ * Per-joint streaming velocity/acceleration limits editor
+ * (spec/430 §3.2 streaming-joint-limits + ADR-0016).
+ *
+ * Renders one row per drivable joint with two number inputs
+ * (max velocity rad/s, max acceleration rad/s²). Empty input =
+ * "use engine default" (0.5 rad/s velocity, 2.0 rad/s² acceleration);
+ * the placeholder reminds the operator what the default is.
+ *
+ * Persistence: the editor writes to
+ * `deployment.robotConfig.streamingJointLimits` (Record<joint, limit>);
+ * joints with both fields empty are omitted from the saved YAML so a
+ * "no overrides" deployment stays minimal.
+ */
+function StreamingJointLimitsEditor({
+  drivableJointNames,
+  limits,
+  onChange,
+  disabled,
+}: {
+  drivableJointNames: string[];
+  limits: Record<string, StreamingJointLimit>;
+  onChange: (next: Record<string, StreamingJointLimit>) => void;
+  disabled: boolean;
+}) {
+  if (drivableJointNames.length === 0) {
+    return (
+      <div className="text-xs italic text-gray-500">
+        URDF manifest not loaded yet (or no drivable joints found). Load a
+        program with a robot to edit per-joint streaming limits.
+      </div>
+    );
+  }
+
+  function commit(joint: string, field: 'maxVelocityRadS' | 'maxAccelerationRadS2', raw: string): void {
+    const trimmed = raw.trim();
+    const next: Record<string, StreamingJointLimit> = { ...limits };
+    const current: StreamingJointLimit = { ...(next[joint] ?? {}) };
+    if (trimmed === '') {
+      current[field] = null;
+    } else {
+      const v = Number(trimmed);
+      if (!Number.isFinite(v) || v <= 0) return;
+      current[field] = v;
+    }
+    if (current.maxVelocityRadS == null && current.maxAccelerationRadS2 == null) {
+      delete next[joint];
+    } else {
+      next[joint] = current;
+    }
+    onChange(next);
+  }
+
+  return (
+    <div className="space-y-1">
+      <div className="text-[10px] text-gray-500">
+        Per-joint caps applied during streaming sessions (gizmo drag, joint
+        slider). Leave blank to use engine defaults (0.5 rad/s, 2.0 rad/s²).
+        Velocity is scaled by the operator's velocity slider; acceleration is
+        an absolute physical limit.
+      </div>
+      <div className="grid grid-cols-[1fr_5rem_5rem] items-center gap-2 border-b border-gray-700/40 pb-1 text-[10px] uppercase tracking-wide text-gray-500">
+        <span>Joint</span>
+        <span className="text-right">vel (rad/s)</span>
+        <span className="text-right">accel (rad/s²)</span>
+      </div>
+      {drivableJointNames.map((name) => {
+        const limit = limits[name] ?? {};
+        return (
+          <div key={name} className="grid grid-cols-[1fr_5rem_5rem] items-center gap-2">
+            <span className="truncate font-mono text-[11px] text-gray-200">{name}</span>
+            <DraftTextInput
+              value={limit.maxVelocityRadS == null ? '' : String(limit.maxVelocityRadS)}
+              onCommit={(v) => commit(name, 'maxVelocityRadS', v)}
+              placeholder="0.5"
+              disabled={disabled}
+              className="w-full rounded bg-gray-800 px-1 py-0.5 text-right font-mono text-[10px] text-gray-200"
+              inputMode="decimal"
+            />
+            <DraftTextInput
+              value={limit.maxAccelerationRadS2 == null ? '' : String(limit.maxAccelerationRadS2)}
+              onCommit={(v) => commit(name, 'maxAccelerationRadS2', v)}
+              placeholder="2.0"
+              disabled={disabled}
+              className="w-full rounded bg-gray-800 px-1 py-0.5 text-right font-mono text-[10px] text-gray-200"
+              inputMode="decimal"
+            />
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 function nextEndpointAlias(existingAliases: string[]): string {
   let index = existingAliases.length + 1;
   while (existingAliases.includes(`model_${index}`)) {
@@ -542,6 +656,25 @@ export function DeploymentPanel() {
   const editLocked = useEditLocked();
   const [modelEndpointCatalog, setModelEndpointCatalog] = useState<ModelEndpointCatalog | null>(null);
   const [sceneFrames, setSceneFrames] = useState<SceneFrameState[]>([]);
+  const [urdfManifest, setUrdfManifest] = useState<SceneUrdfManifest | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    void api.urdf.manifest()
+      .then((m) => {
+        if (!cancelled) setUrdfManifest(m);
+      })
+      .catch(() => {
+        if (!cancelled) setUrdfManifest(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [deployment?.sourcePath]);
+  const drivableJointNames = useMemo<string[]>(() => {
+    if (!urdfManifest?.joints) return [];
+    const DRIVABLE = new Set(['revolute', 'prismatic', 'continuous']);
+    return urdfManifest.joints.filter((j) => DRIVABLE.has(j.type)).map((j) => j.name);
+  }, [urdfManifest]);
   const runtimeApplied = signature(deployment) === signature(appliedDeployment);
   const diskSaved = signature(deployment) === signature(savedDeployment);
   const endpointAliases = useMemo(
@@ -785,12 +918,33 @@ export function DeploymentPanel() {
           disabled={editLocked}
         />
         <FieldInput
-          label="Max TCP Speed (m/s)"
+          label="Global Max TCP Linear Speed (m/s)"
           value={deployment.robotConfig.globalMaxTcpLinearSpeedMps}
           onChange={(v) =>
             setNestedField('robotConfig.globalMaxTcpLinearSpeedMps', parseFloat(v) || 0)
           }
           type="number"
+          min={0}
+          step={0.05}
+          disabled={editLocked}
+          help={
+            'Deployment-wide cap on TCP (end-effector) Cartesian speed in m/s. ' +
+            'Enforced for ALL moves: planned trajectories clamp ' +
+            'max_tcp_linear_speed_mps against this (min wins); streaming ' +
+            'sessions (gizmo drag, joint-slider follow) use it to compute ' +
+            'each frame’s minimum time-from-start so the robot tracks at ' +
+            '≤ this speed regardless of operator input rate. ' +
+            '0 means “unlimited” (not recommended for hardware). ' +
+            'See ADR-0015 / ADR-0016.'
+          }
+        />
+      </Section>
+
+      <Section title="Streaming Joint Limits">
+        <StreamingJointLimitsEditor
+          drivableJointNames={drivableJointNames}
+          limits={deployment.robotConfig.streamingJointLimits ?? {}}
+          onChange={(next) => setNestedField('robotConfig.streamingJointLimits', next)}
           disabled={editLocked}
         />
       </Section>

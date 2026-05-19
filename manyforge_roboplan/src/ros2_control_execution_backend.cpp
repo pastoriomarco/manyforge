@@ -1981,4 +1981,497 @@ std::shared_ptr<NativeKernelBundle> create_ros2_control_kernel(
   return bundle;
 }
 
+// =================================================================
+// Streaming-session mode (ADR-0016).
+//
+// Joint-only in v0.1. Cartesian targets are rejected; the IK pre-
+// resolution path is deferred. Anchored two-point FJT goals preserve
+// JTC spline continuity across preempts.
+// =================================================================
+
+bool Ros2ControlExecutionBackend::streaming_send_anchored_goal(
+    const std::vector<std::string>& joint_names,
+    const std::vector<double>& target_positions,
+    double target_time_from_start_s) {
+  if (joint_names.empty() || target_positions.empty()) {
+    return false;
+  }
+  if (target_positions.size() != joint_names.size()) {
+    return false;
+  }
+
+  // Anchor at the latest controller-source sample if available; otherwise
+  // anchor at the requested target (degenerate but safe for the first goal
+  // of a session).
+  std::vector<double> anchor_positions;
+  std::vector<double> anchor_velocities;
+  {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    if (latest_action_feedback_.has_value()) {
+      anchor_positions = positions_for_joints(
+          *latest_action_feedback_, joint_names);
+      anchor_velocities.resize(joint_names.size(), 0.0);
+      const auto& sample = *latest_action_feedback_;
+      for (size_t i = 0; i < joint_names.size(); ++i) {
+        const auto it = std::find(
+            sample.joint_names.begin(), sample.joint_names.end(),
+            joint_names[i]);
+        if (it != sample.joint_names.end() &&
+            static_cast<size_t>(it - sample.joint_names.begin()) <
+                sample.velocities.size()) {
+          anchor_velocities[i] =
+              sample.velocities[it - sample.joint_names.begin()];
+        }
+      }
+    } else if (latest_controller_state_.has_value()) {
+      anchor_positions = positions_for_joints(
+          *latest_controller_state_, joint_names);
+      anchor_velocities.assign(joint_names.size(), 0.0);
+    } else if (latest_joint_state_.has_value()) {
+      anchor_positions = positions_for_joints(
+          *latest_joint_state_, joint_names);
+      anchor_velocities.assign(joint_names.size(), 0.0);
+    }
+  }
+  if (anchor_positions.empty() || anchor_positions.size() != joint_names.size()) {
+    // No fresh state to anchor on — fall back to the target as anchor.
+    // This degrades smoothness on the first frame but the second frame
+    // and on will recover. The kernel's freshness gates should normally
+    // ensure observed state is present before begin_streaming_session.
+    anchor_positions = target_positions;
+    anchor_velocities.assign(joint_names.size(), 0.0);
+  }
+
+  if (!wait_for_fjt_action_server(action_client_,
+                                  config_.wait_for_action_server_timeout_s)) {
+    return false;
+  }
+
+  FollowJointTrajectory::Goal goal;
+  goal.trajectory.joint_names = joint_names;
+  if (config_.disable_controller_path_tolerances) {
+    disable_fjt_controller_tolerances(goal, joint_names);
+  }
+
+  // Anchor point: observed state with negative time_from_start. JTC's
+  // spline uses this to compute continuous starting conditions for the
+  // new trajectory, so the preempt does not introduce a velocity
+  // discontinuity at the goal-replacement seam.
+  trajectory_msgs::msg::JointTrajectoryPoint anchor_point;
+  anchor_point.positions = anchor_positions;
+  anchor_point.velocities = anchor_velocities;
+  anchor_point.accelerations.assign(joint_names.size(), 0.0);
+  anchor_point.time_from_start = duration_from_seconds(
+      streaming_config_.anchor_negative_time_s);
+  goal.trajectory.points.push_back(std::move(anchor_point));
+
+  // Target point: requested final position, zero velocity (the next
+  // streamed target will reset velocity at the next preempt anyway).
+  trajectory_msgs::msg::JointTrajectoryPoint target_point;
+  target_point.positions = target_positions;
+  target_point.velocities.assign(joint_names.size(), 0.0);
+  target_point.accelerations.assign(joint_names.size(), 0.0);
+  target_point.time_from_start = duration_from_seconds(
+      std::max(target_time_from_start_s,
+               streaming_config_.target_time_from_start_min_s));
+  goal.trajectory.points.push_back(std::move(target_point));
+
+  rclcpp_action::Client<FollowJointTrajectory>::SendGoalOptions options;
+  options.feedback_callback =
+      [this](GoalHandleFJT::SharedPtr goal_handle,
+             const std::shared_ptr<const FollowJointTrajectory::Feedback> feedback) {
+        on_action_feedback(goal_handle, feedback);
+      };
+  options.result_callback =
+      [this](const GoalHandleFJT::WrappedResult& result) {
+        // The streaming dispatcher does not block on per-goal results;
+        // it preempts via async_send_goal. Route the result through the
+        // existing callback so feedback freshness gates and tracking
+        // peak telemetry continue to work uniformly.
+        on_action_result(result);
+      };
+
+  auto goal_handle_future = action_client_->async_send_goal(goal, options);
+  if (goal_handle_future.wait_for(
+          std::chrono::duration<double>(
+              config_.wait_for_action_server_timeout_s)) !=
+      std::future_status::ready) {
+    return false;
+  }
+  GoalHandleFJT::SharedPtr goal_handle;
+  try {
+    goal_handle = goal_handle_future.get();
+  } catch (const std::exception&) {
+    return false;
+  }
+  if (!goal_handle) {
+    return false;
+  }
+  streaming_active_goal_ = goal_handle;
+  return true;
+}
+
+bool Ros2ControlExecutionBackend::streaming_send_spring_back_stop() {
+  // Final-goal soft-stop: anchor at observed state (neg time) + target at
+  // observed *position* with zero velocity at +soft_stop_deceleration_time_s.
+  std::vector<double> observed_positions;
+  {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    if (latest_action_feedback_.has_value()) {
+      observed_positions = positions_for_joints(
+          *latest_action_feedback_, config_.required_joints);
+    } else if (latest_controller_state_.has_value()) {
+      observed_positions = positions_for_joints(
+          *latest_controller_state_, config_.required_joints);
+    } else if (latest_joint_state_.has_value()) {
+      observed_positions = positions_for_joints(
+          *latest_joint_state_, config_.required_joints);
+    }
+  }
+  if (observed_positions.empty()) {
+    return false;
+  }
+  return streaming_send_anchored_goal(
+      config_.required_joints,
+      observed_positions,
+      streaming_config_.soft_stop_deceleration_time_s);
+}
+
+void Ros2ControlExecutionBackend::streaming_dispatch_worker(std::stop_token st) {
+  const double tick_s = [&]() {
+    std::lock_guard<std::mutex> lock(streaming_mutex_);
+    const double rate = streaming_config_.max_dispatch_rate_hz;
+    return rate > 0.0 ? (1.0 / rate) : 0.033;
+  }();
+  const auto tick = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::duration<double>(tick_s));
+
+  std::vector<double> last_dispatched_positions;
+  std::chrono::steady_clock::time_point last_dispatch_at =
+      std::chrono::steady_clock::time_point::min();
+
+  while (!st.stop_requested()) {
+    std::optional<core::StreamingTargetDTO> target;
+    {
+      std::lock_guard<std::mutex> lock(streaming_mutex_);
+      target = streaming_target_;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    const auto since_dispatch =
+        std::chrono::duration_cast<std::chrono::duration<double>>(
+            now - last_dispatch_at).count();
+
+    if (target.has_value() &&
+        target->kind == core::StreamingInputMode::kJoint &&
+        !target->joint_positions_rad.empty()) {
+      const auto& new_pos = target->joint_positions_rad;
+      bool changed = (new_pos != last_dispatched_positions);
+      // Honor target_max_age_s by re-dispatching the last target as a
+      // hold if no new target arrives within the window. JTC will treat
+      // it as the same anchored goal; this keeps the controller from
+      // timing out the action.
+      const bool stale_hold =
+          !changed &&
+          since_dispatch > streaming_config_.target_max_age_s;
+
+      if (changed || stale_hold) {
+        const auto names = streaming_config_.joint_names.empty()
+                               ? config_.required_joints
+                               : streaming_config_.joint_names;
+        // Compute target_time_from_start from joint deltas (velocity-cap
+        // bound) when we have a previous dispatch; otherwise fall back
+        // to the configured minimum.
+        double target_dt = streaming_config_.target_time_from_start_min_s;
+        if (!last_dispatched_positions.empty() &&
+            last_dispatched_positions.size() == new_pos.size()) {
+          // Per-joint velocity + acceleration caps from
+          // deployment.robot_config.streaming_joint_limits
+          // (ADR-0016 / spec/430 §3.2).
+          //
+          // For each joint we compute two lower bounds on dt:
+          //   dt_v_i = |Δq_i| / v_cap_i     (velocity constraint)
+          //   dt_a_i = sqrt(2 * |Δq_i| / a_cap_i)
+          //                                  (triangular accel-decel
+          //                                   profile starting and
+          //                                   ending at rest — the
+          //                                   shape JTC interpolates
+          //                                   for a 1-anchor + 1-goal
+          //                                   FJT trajectory)
+          // The dispatched `time_from_start` must be >= each lower
+          // bound for every joint, so we take the max across both
+          // constraints AND across joints. Falls back to engine
+          // defaults (0.5 rad/s, 2.0 rad/s²) for joints without
+          // explicit caps.
+          constexpr double kDefaultVelRadS = 0.5;
+          constexpr double kDefaultAccelRadS2 = 2.0;
+          const bool have_per_joint_v =
+              streaming_config_.per_joint_velocity_caps_rad_s.size()
+              == new_pos.size();
+          const bool have_per_joint_a =
+              streaming_config_.per_joint_acceleration_caps_rad_s2.size()
+              == new_pos.size();
+          const double v_scale = std::max(streaming_config_.velocity_scale, 1e-6);
+          double required_dt = 0.0;
+          for (size_t i = 0; i < new_pos.size(); ++i) {
+            double v_cap_i = kDefaultVelRadS;
+            if (have_per_joint_v
+                && streaming_config_.per_joint_velocity_caps_rad_s[i] > 0.0) {
+              v_cap_i = streaming_config_.per_joint_velocity_caps_rad_s[i];
+            }
+            v_cap_i *= v_scale;
+            double a_cap_i = kDefaultAccelRadS2;
+            if (have_per_joint_a
+                && streaming_config_.per_joint_acceleration_caps_rad_s2[i] > 0.0) {
+              a_cap_i = streaming_config_.per_joint_acceleration_caps_rad_s2[i];
+            }
+            const double delta_i = std::abs(new_pos[i] -
+                                            last_dispatched_positions[i]);
+            if (v_cap_i > 1e-6) {
+              const double dt_v_i = delta_i / v_cap_i;
+              if (dt_v_i > required_dt) required_dt = dt_v_i;
+            }
+            if (a_cap_i > 1e-6 && delta_i > 0.0) {
+              const double dt_a_i = std::sqrt(2.0 * delta_i / a_cap_i);
+              if (dt_a_i > required_dt) required_dt = dt_a_i;
+            }
+          }
+          if (required_dt > 0.0) {
+            // 20 ms margin so the controller's interpolator has headroom.
+            target_dt = std::max(target_dt, required_dt + 0.020);
+          }
+        }
+        // ADR-0015 enforcement: honor the kernel-supplied Cartesian
+        // speed floor (target.min_time_from_start_s). The kernel
+        // populates this when a max_tcp_linear_speed_mps cap is in
+        // effect, derived from |Δpos_cartesian| / max_speed. Taking
+        // the max with joint-velocity-derived dt means BOTH joint and
+        // Cartesian caps are respected on every dispatched goal.
+        if (target->min_time_from_start_s > target_dt) {
+          target_dt = target->min_time_from_start_s;
+        }
+        if (streaming_send_anchored_goal(names, new_pos, target_dt)) {
+          last_dispatched_positions = new_pos;
+          last_dispatch_at = now;
+        } else {
+          // Surface dispatch failures via the existing snapshot/error
+          // channel so the kernel + WS path can correlate operator
+          // frames with controller-side failures. Without this, a
+          // failing JTC action server or stale joint state would
+          // silently break the chain.
+          publish_snapshot(
+              core::ExecutionState::kStreaming,
+              0.0,
+              {},
+              core::ErrorDTO{
+                  std::string(
+                      core::to_string(core::ErrorCode::kExecutionRejected)),
+                  "streaming dispatch failed: action server unavailable, "
+                  "stale joint state, or empty target",
+                  {}});
+        }
+      }
+    }
+
+    std::unique_lock<std::mutex> lock(streaming_mutex_);
+    streaming_cv_.wait_for(lock, tick, [&st]() {
+      return st.stop_requested();
+    });
+  }
+
+  streaming_active_.store(false);
+  streaming_cv_.notify_all();
+}
+
+core::StreamingSessionBeginResultDTO
+Ros2ControlExecutionBackend::begin_streaming_session(
+    const core::StreamingSessionConfigDTO& config) {
+  core::StreamingSessionBeginResultDTO result;
+
+  {
+    std::lock_guard<std::mutex> lock(execution_mutex_);
+    if (running_) {
+      result.accepted = false;
+      result.error = core::ErrorDTO{
+          std::string(
+              core::to_string(core::ErrorCode::kInvalidStateTransition)),
+          "backend is currently executing a discrete trajectory",
+          {}};
+      return result;
+    }
+  }
+  if (streaming_active_.load()) {
+    result.accepted = false;
+    result.error = core::ErrorDTO{
+        std::string(
+            core::to_string(core::ErrorCode::kInvalidStateTransition)),
+        "streaming session already active on backend",
+        {}};
+    return result;
+  }
+  if (!action_client_) {
+    result.accepted = false;
+    result.error = core::ErrorDTO{
+        std::string(core::to_string(core::ErrorCode::kInternalError)),
+        "FollowJointTrajectory action client not initialized",
+        {}};
+    return result;
+  }
+  if (!wait_for_fjt_action_server(action_client_,
+                                  config_.wait_for_action_server_timeout_s)) {
+    result.accepted = false;
+    result.error = core::ErrorDTO{
+        std::string(core::to_string(core::ErrorCode::kExecutionRejected)),
+        "FollowJointTrajectory action server unavailable",
+        {{"action_name", config_.action_name}}};
+    return result;
+  }
+
+  uint64_t session_id = 0;
+  {
+    std::lock_guard<std::mutex> lock(streaming_mutex_);
+    session_id = ++streaming_session_id_;
+    streaming_config_ = config;
+    streaming_target_.reset();
+    streaming_active_goal_.reset();
+    next_streaming_backend_seq_ = 1;
+  }
+  streaming_active_.store(true);
+
+  streaming_thread_ = std::jthread(
+      [this](std::stop_token st) { this->streaming_dispatch_worker(st); });
+
+  publish_snapshot(core::ExecutionState::kStreaming, 0.0, {});
+
+  result.accepted = true;
+  result.session_id = session_id;
+  return result;
+}
+
+core::StreamingPushResultDTO
+Ros2ControlExecutionBackend::push_streaming_target(
+    uint64_t session_id,
+    const core::StreamingTargetDTO& target) {
+  core::StreamingPushResultDTO result;
+
+  {
+    std::lock_guard<std::mutex> lock(streaming_mutex_);
+    if (!streaming_active_.load() || streaming_session_id_ != session_id) {
+      result.accepted = false;
+      result.error = core::ErrorDTO{
+          std::string(core::to_string(core::ErrorCode::kInvalidRequest)),
+          "session_id does not match active streaming session",
+          {}};
+      return result;
+    }
+    if (target.kind == core::StreamingInputMode::kCartesian) {
+      // The kernel resolves cartesian targets to joint targets via
+      // planner.solve_ik before forwarding (ADR-0016 IK pre-resolution).
+      // Reaching this branch means a caller bypassed the kernel — defense-
+      // in-depth reject. Backends are joint-only by design (ADR-0007
+      // scene-ownership boundary).
+      result.accepted = false;
+      result.error = core::ErrorDTO{
+          std::string(
+              core::to_string(core::ErrorCode::kUnsupportedCapability)),
+          "execution backends accept joint streaming targets only; "
+          "cartesian targets must be resolved by the kernel's IK "
+          "pre-resolution path before reaching the backend",
+          {}};
+      return result;
+    }
+    if (target.joint_positions_rad.empty()) {
+      result.accepted = false;
+      result.error = core::ErrorDTO{
+          std::string(core::to_string(core::ErrorCode::kInvalidRequest)),
+          "joint streaming target carries no joint_positions_rad",
+          {}};
+      return result;
+    }
+    streaming_target_ = target;
+    result.backend_sequence = next_streaming_backend_seq_++;
+  }
+  streaming_cv_.notify_all();
+
+  result.accepted = true;
+  return result;
+}
+
+core::StreamingSessionEndResultDTO
+Ros2ControlExecutionBackend::end_streaming_session(
+    uint64_t session_id,
+    core::SoftStopStrategy strategy) {
+  core::StreamingSessionEndResultDTO result;
+
+  {
+    std::lock_guard<std::mutex> lock(streaming_mutex_);
+    if (!streaming_active_.load() || streaming_session_id_ != session_id) {
+      result.accepted = false;
+      result.error = core::ErrorDTO{
+          std::string(core::to_string(core::ErrorCode::kInvalidRequest)),
+          "session_id does not match active streaming session",
+          {}};
+      return result;
+    }
+  }
+
+  // Stop the dispatch worker first so it doesn't race the soft-stop
+  // goal with a freshly arrived target.
+  streaming_thread_.request_stop();
+  streaming_cv_.notify_all();
+
+  // velocity_scaling is documented as opt-in / qualification-gated and
+  // is not implemented in v0.1; fall back to spring_back with a clear
+  // note in the result for the caller's audit log.
+  bool ok = false;
+  if (strategy == core::SoftStopStrategy::kVelocityScaling) {
+    ok = streaming_send_spring_back_stop();
+    if (ok) {
+      result.error = core::ErrorDTO{
+          std::string(core::to_string(core::ErrorCode::kInvalidRequest)),
+          "velocity_scaling soft-stop not yet implemented; fell back to "
+          "spring_back. See docs/open-points.md qualification matrix.",
+          {{"requested_strategy", to_string(strategy)},
+           {"executed_strategy",
+            to_string(core::SoftStopStrategy::kSpringBack)}}};
+    }
+  } else {
+    ok = streaming_send_spring_back_stop();
+  }
+
+  if (!ok) {
+    result.accepted = false;
+    if (!result.error.has_value()) {
+      result.error = core::ErrorDTO{
+          std::string(core::to_string(core::ErrorCode::kStopFailed)),
+          "soft-stop trajectory dispatch failed; check action server and "
+          "observed-state freshness",
+          {}};
+    }
+    return result;
+  }
+
+  // Bounded wait for the spring-back trajectory to complete. We use the
+  // existing stop_completion_timeout_s budget for parity with stop().
+  const auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::duration<double>(
+                            config_.stop_completion_timeout_s);
+  while (streaming_active_.load() &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+
+  if (streaming_active_.load()) {
+    result.accepted = false;
+    result.error = core::ErrorDTO{
+        std::string(core::to_string(core::ErrorCode::kStopFailed)),
+        "soft-stop did not complete within configured timeout",
+        {{"timeout_s", std::to_string(config_.stop_completion_timeout_s)}}};
+    return result;
+  }
+
+  result.accepted = true;
+  return result;
+}
+
 }  // namespace manyforge::roboplan_backend

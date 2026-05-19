@@ -322,6 +322,11 @@ const char* kernel_event_type_to_string(KernelEventType type) {
     case KernelEventType::kPauseRequested: return "pause_requested";
     case KernelEventType::kResumeRequested: return "resume_requested";
     case KernelEventType::kCompletedAcknowledged: return "acknowledge_completed";
+    case KernelEventType::kStreamingSessionStarted: return "streaming_session_started";
+    case KernelEventType::kStreamingTargetReceived: return "streaming_target_received";
+    case KernelEventType::kStreamingTargetDispatched: return "streaming_target_dispatched";
+    case KernelEventType::kStreamingTargetRejected: return "streaming_target_rejected";
+    case KernelEventType::kStreamingSessionEnded: return "streaming_session_ended";
     case KernelEventType::kErrorRaised: return "error_raised";
     case KernelEventType::kCollisionDetected: return "collision_detected";
     default: return "unknown";
@@ -1154,6 +1159,179 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
         auto r = self.kernel->acknowledge_completed(execution_id);
         return command_result(r.accepted, r.error);
       })
+      // ---- Streaming-session API (ADR-0016) ----
+      .def("begin_streaming_session",
+           [](NativeKernelBundle& self, py::dict config_dict) -> py::dict {
+             StreamingSessionConfigDTO config;
+             auto get_str = [&](const char* key, std::string& dst) {
+               if (config_dict.contains(key) &&
+                   !config_dict[key].is_none()) {
+                 dst = config_dict[key].cast<std::string>();
+               }
+             };
+             auto get_double = [&](const char* key, double& dst) {
+               if (config_dict.contains(key) &&
+                   !config_dict[key].is_none()) {
+                 dst = config_dict[key].cast<double>();
+               }
+             };
+             get_str("group_id", config.group_id);
+             if (config_dict.contains("joint_names") &&
+                 !config_dict["joint_names"].is_none()) {
+               for (const auto& name :
+                    config_dict["joint_names"].cast<py::list>()) {
+                 config.joint_names.push_back(name.cast<std::string>());
+               }
+             }
+             if (config_dict.contains("input_mode") &&
+                 !config_dict["input_mode"].is_none()) {
+               const auto mode_str =
+                   config_dict["input_mode"].cast<std::string>();
+               config.default_input_mode =
+                   (mode_str == "cartesian")
+                       ? StreamingInputMode::kCartesian
+                       : StreamingInputMode::kJoint;
+             }
+             get_str("cartesian_reference_frame",
+                     config.cartesian_reference_frame);
+             get_str("tcp_frame", config.tcp_frame);
+             if (config_dict.contains("soft_stop_strategy") &&
+                 !config_dict["soft_stop_strategy"].is_none()) {
+               const auto strat_str =
+                   config_dict["soft_stop_strategy"].cast<std::string>();
+               config.default_soft_stop_strategy =
+                   (strat_str == "velocity_scaling")
+                       ? SoftStopStrategy::kVelocityScaling
+                       : SoftStopStrategy::kSpringBack;
+             }
+             get_double("soft_stop_deceleration_time_s",
+                        config.soft_stop_deceleration_time_s);
+             get_double("anchor_negative_time_s",
+                        config.anchor_negative_time_s);
+             get_double("target_time_from_start_min_s",
+                        config.target_time_from_start_min_s);
+             get_double("max_dispatch_rate_hz", config.max_dispatch_rate_hz);
+             get_double("target_max_age_s", config.target_max_age_s);
+             get_double("velocity_scale", config.velocity_scale);
+             get_double("max_tcp_linear_speed_mps",
+                        config.max_tcp_linear_speed_mps);
+             // Per-joint streaming caps (parallel to joint_names),
+             // spec/430 §3.2 streaming-joint-limits + ADR-0016.
+             // Sized to match joint_names; zero entries fall back to
+             // engine defaults at the backend (0.5 rad/s, 2.0 rad/s²).
+             if (config_dict.contains("per_joint_velocity_caps_rad_s")
+                 && !config_dict["per_joint_velocity_caps_rad_s"].is_none()) {
+               for (const auto& v : config_dict["per_joint_velocity_caps_rad_s"]
+                                        .cast<py::list>()) {
+                 config.per_joint_velocity_caps_rad_s.push_back(v.cast<double>());
+               }
+             }
+             if (config_dict.contains("per_joint_acceleration_caps_rad_s2")
+                 && !config_dict["per_joint_acceleration_caps_rad_s2"].is_none()) {
+               for (const auto& v :
+                    config_dict["per_joint_acceleration_caps_rad_s2"]
+                        .cast<py::list>()) {
+                 config.per_joint_acceleration_caps_rad_s2.push_back(
+                     v.cast<double>());
+               }
+             }
+             get_str("principal_id", config.principal_id);
+             get_str("authority_source", config.authority_source);
+             get_str("trigger_reason", config.trigger_reason);
+
+             auto r = self.kernel->begin_streaming_session(config);
+             py::dict d;
+             d["accepted"] = r.accepted;
+             d["session_id"] = r.session_id;
+             if (r.error.has_value()) {
+               d["error"] = r.error->message;
+               d["error_code"] = r.error->code;
+             }
+             return d;
+           })
+      .def("push_streaming_target",
+           [](NativeKernelBundle& self,
+              uint64_t session_id,
+              py::dict target_dict) -> py::dict {
+             StreamingTargetDTO target;
+             if (target_dict.contains("kind") &&
+                 !target_dict["kind"].is_none()) {
+               const auto kind_str = target_dict["kind"].cast<std::string>();
+               target.kind = (kind_str == "cartesian")
+                                 ? StreamingInputMode::kCartesian
+                                 : StreamingInputMode::kJoint;
+             }
+             if (target_dict.contains("position_m") &&
+                 !target_dict["position_m"].is_none()) {
+               const auto pos = target_dict["position_m"].cast<py::list>();
+               if (pos.size() == 3) {
+                 for (size_t i = 0; i < 3; ++i) {
+                   target.position_m[i] = pos[i].cast<double>();
+                 }
+               }
+             }
+             if (target_dict.contains("orientation_xyzw") &&
+                 !target_dict["orientation_xyzw"].is_none()) {
+               const auto q = target_dict["orientation_xyzw"]
+                                  .cast<py::list>();
+               if (q.size() == 4) {
+                 for (size_t i = 0; i < 4; ++i) {
+                   target.orientation_xyzw[i] = q[i].cast<double>();
+                 }
+               }
+             }
+             if (target_dict.contains("joint_names") &&
+                 !target_dict["joint_names"].is_none()) {
+               for (const auto& name :
+                    target_dict["joint_names"].cast<py::list>()) {
+                 target.joint_names.push_back(name.cast<std::string>());
+               }
+             }
+             if (target_dict.contains("joint_positions_rad") &&
+                 !target_dict["joint_positions_rad"].is_none()) {
+               for (const auto& v :
+                    target_dict["joint_positions_rad"].cast<py::list>()) {
+                 target.joint_positions_rad.push_back(v.cast<double>());
+               }
+             }
+             if (target_dict.contains("source_timestamp_ns") &&
+                 !target_dict["source_timestamp_ns"].is_none()) {
+               target.source_timestamp_ns =
+                   target_dict["source_timestamp_ns"].cast<int64_t>();
+             }
+             if (target_dict.contains("source_sequence") &&
+                 !target_dict["source_sequence"].is_none()) {
+               target.source_sequence =
+                   target_dict["source_sequence"].cast<uint64_t>();
+             }
+             if (target_dict.contains("min_time_from_start_s") &&
+                 !target_dict["min_time_from_start_s"].is_none()) {
+               target.min_time_from_start_s =
+                   target_dict["min_time_from_start_s"].cast<double>();
+             }
+
+             auto r =
+                 self.kernel->push_streaming_target(session_id, target);
+             py::dict d;
+             d["accepted"] = r.accepted;
+             d["backend_sequence"] = r.backend_sequence;
+             if (r.error.has_value()) {
+               d["error"] = r.error->message;
+             }
+             return d;
+           })
+      .def("end_streaming_session",
+           [](NativeKernelBundle& self,
+              uint64_t session_id,
+              const std::string& strategy_str) -> py::dict {
+             const SoftStopStrategy strategy =
+                 (strategy_str == "velocity_scaling")
+                     ? SoftStopStrategy::kVelocityScaling
+                     : SoftStopStrategy::kSpringBack;
+             auto r =
+                 self.kernel->end_streaming_session(session_id, strategy);
+             return command_result(r.accepted, r.error);
+           })
       .def("get_status", [](NativeKernelBundle& self) -> py::dict {
         return status_to_python(self.kernel->get_status());
       })
@@ -1584,7 +1762,116 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
           result.append(kernel_event_to_python(event));
         }
         return result;
-      });
+      })
+      // Compute all link poses at a hypothetical robot configuration,
+      // for the Composer Move-To "ghost robot" preview (ADR-0016 §UX).
+      // Stateless w.r.t. the live scene: builds a RobotStateDTO from the
+      // caller's joint vector (or IK result), then calls FK per link.
+      // For kind=="cartesian": runs IK first using the supplied tcp_pose
+      // and seed_joint_positions_rad; if IK fails, returns
+      // {reachable: False, reason, tcp_pose} so the frontend can render
+      // the TCP link only (red gripper-shaped ghost) without the rest
+      // of the robot.
+      // For kind=="joint": uses joint_positions_rad directly.
+      .def("compute_target_link_poses",
+           [](NativeKernelBundle& self, py::dict req) -> py::dict {
+             py::dict out;
+             const std::string kind = req.contains("kind")
+                 ? req["kind"].cast<std::string>() : std::string("joint");
+             const std::string base_frame = req.contains("base_frame")
+                 ? req["base_frame"].cast<std::string>() : std::string("base");
+             std::vector<std::string> link_names;
+             if (req.contains("link_names") && !req["link_names"].is_none()) {
+               for (const auto& n : req["link_names"].cast<py::list>()) {
+                 link_names.push_back(n.cast<std::string>());
+               }
+             }
+             RobotStateDTO state;
+             if (req.contains("joint_names") && !req["joint_names"].is_none()) {
+               for (const auto& n : req["joint_names"].cast<py::list>()) {
+                 state.joint_names.push_back(n.cast<std::string>());
+               }
+             }
+             if (req.contains("joint_positions_rad")
+                 && !req["joint_positions_rad"].is_none()) {
+               for (const auto& v : req["joint_positions_rad"].cast<py::list>()) {
+                 state.positions_rad.push_back(v.cast<double>());
+               }
+             }
+
+             if (kind == "cartesian") {
+               IkRequestDTO ik_req;
+               const auto pos = req["tcp_position_m"].cast<py::list>();
+               const auto quat = req["tcp_orientation_xyzw"].cast<py::list>();
+               ik_req.goal_pose.position_m.x_m = pos[0].cast<double>();
+               ik_req.goal_pose.position_m.y_m = pos[1].cast<double>();
+               ik_req.goal_pose.position_m.z_m = pos[2].cast<double>();
+               ik_req.goal_pose.orientation.x = quat[0].cast<double>();
+               ik_req.goal_pose.orientation.y = quat[1].cast<double>();
+               ik_req.goal_pose.orientation.z = quat[2].cast<double>();
+               ik_req.goal_pose.orientation.w = quat[3].cast<double>();
+               ik_req.base_frame = base_frame;
+               ik_req.tcp_frame = req["tcp_frame"].cast<std::string>();
+               if (!state.joint_names.empty()
+                   && state.positions_rad.size() == state.joint_names.size()) {
+                 ik_req.seed_state = state;
+               } else {
+                 ik_req.seed_state = self.context->get_current_state();
+               }
+               auto ik_result = [&]() {
+                 py::gil_scoped_release release;
+                 return self.planner->solve_ik(ik_req);
+               }();
+               if (!ik_result.ok) {
+                 out["reachable"] = false;
+                 out["reason"] = ik_result.error
+                     ? ik_result.error->code : std::string("ik_failed");
+                 out["tcp_pose"] = py::dict(
+                     py::arg("position_m") = py::make_tuple(
+                         ik_req.goal_pose.position_m.x_m,
+                         ik_req.goal_pose.position_m.y_m,
+                         ik_req.goal_pose.position_m.z_m),
+                     py::arg("orientation_xyzw") = py::make_tuple(
+                         ik_req.goal_pose.orientation.x,
+                         ik_req.goal_pose.orientation.y,
+                         ik_req.goal_pose.orientation.z,
+                         ik_req.goal_pose.orientation.w));
+                 return out;
+               }
+               state.joint_names = ik_result.joint_names;
+               state.positions_rad = ik_result.positions_rad;
+             }
+
+             // FK for each requested link at the resolved joint state.
+             py::dict link_poses;
+             for (const auto& link_name : link_names) {
+               FkRequestDTO fk_req;
+               fk_req.robot_state = state;
+               fk_req.target_frame = link_name;
+               fk_req.base_frame = base_frame;
+               try {
+                 auto pose = [&]() {
+                   py::gil_scoped_release release;
+                   return self.context->forward_kinematics(fk_req);
+                 }();
+                 py::dict d;
+                 d["position_m"] = py::make_tuple(
+                     pose.position_m.x_m, pose.position_m.y_m, pose.position_m.z_m);
+                 d["orientation_xyzw"] = py::make_tuple(
+                     pose.orientation.x, pose.orientation.y,
+                     pose.orientation.z, pose.orientation.w);
+                 link_poses[py::str(link_name)] = d;
+               } catch (...) {
+                 // Skip links FK can't resolve — frontend just won't
+                 // render them at the target pose.
+               }
+             }
+             out["reachable"] = true;
+             out["joint_names"] = py::cast(state.joint_names);
+             out["joint_positions_rad"] = py::cast(state.positions_rad);
+             out["link_poses"] = link_poses;
+             return out;
+           });
 
   // Factory function
   m.def("create_native_kernel",

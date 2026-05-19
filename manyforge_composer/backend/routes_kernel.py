@@ -90,6 +90,7 @@ def create_kernel_router(state: ComposerState) -> APIRouter:
                 "last_event_index": 0,
                 "timestamp_ns": time.monotonic_ns(),
             }
+        state.cycle_manager.drain_kernel_events_now()
         events = state.cycle_manager.get_kernel_events_since(since)
         last_index = events[-1]["event_index"] if events else since
         return {

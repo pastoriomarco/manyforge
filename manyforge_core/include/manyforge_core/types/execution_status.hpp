@@ -13,6 +13,10 @@ enum class ExecutionState {
   kPlanning,
   kValidating,  // pre-execution validation phase
   kExecuting,
+  /// Streaming-session execution mode (ADR-0016). The backend is dispatching
+  /// rolling-horizon goals from a mutable target register; per-target updates
+  /// do not transition the kernel out of kStreaming. Entry is only from kIdle.
+  kStreaming,
   kPaused,
   kStopping,
   kStopped,
@@ -31,6 +35,7 @@ inline const char* to_string(ExecutionState state) {
     case kPlanning: return "Planning";
     case kValidating: return "Validating";
     case kExecuting: return "Executing";
+    case kStreaming: return "Streaming";
     case kPaused: return "Paused";
     case kStopping: return "Stopping";
     case kStopped: return "Stopped";

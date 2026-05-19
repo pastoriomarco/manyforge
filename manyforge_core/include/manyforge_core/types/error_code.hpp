@@ -42,7 +42,8 @@ enum class ErrorCode {
     kInvariantViolation,
     kInvalidStateTransition,
     kCacheMiss,
-    kCollisionDetected
+    kCollisionDetected,
+    kUnknownJointName
 };
 
 inline const char* to_string(ErrorCode code) {
@@ -74,6 +75,7 @@ inline const char* to_string(ErrorCode code) {
         case kInvalidStateTransition: return "invalid_state_transition";
         case kCacheMiss: return "cache_miss";
         case kCollisionDetected: return "collision_detected";
+        case kUnknownJointName: return "unknown_joint_name";
         default: return "unknown";
     }
 }
