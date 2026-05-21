@@ -136,7 +136,7 @@ def test_scene_state_soak_uses_one_batch_fk_per_poll(
     link_names = tuple(f"link_{idx:03d}" for idx in range(80))
     monkeypatch.setattr(routes_urdf, "visual_link_names_for_fk", lambda _state: link_names)
     monkeypatch.setattr(routes_urdf, "active_urdf_model_key", lambda _state: "soak-model")
-    monkeypatch.setattr(routes_scene, "_collect_gripper_states", lambda _state: [])
+    monkeypatch.setattr(routes_scene, "_collect_gripper_states", lambda *_args, **_kwargs: [])
     kernel = _SoakKernel()
     state = _SoakState(kernel)
 

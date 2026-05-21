@@ -55,6 +55,10 @@ class RoboPlanPlanningContext final : public core::IPlanningContext {
       const core::CollisionCheckRequestDTO& request) override;
 
   core::Pose3DTO forward_kinematics(const core::FkRequestDTO& request) override;
+  std::map<std::string, core::Pose3DTO> forward_kinematics_batch(
+      const core::RobotStateDTO& robot_state,
+      const std::vector<std::string>& target_frames,
+      const std::string& base_frame);
   core::Pose3DTO get_object_pose(const std::string& object_id,
                                  const std::string& base_frame) override;
   core::ObjectStateDTO get_object_state(const std::string& object_id) override;

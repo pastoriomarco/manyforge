@@ -241,6 +241,18 @@ py::dict robot_state_to_python(const RobotStateDTO& state) {
   return d;
 }
 
+RobotStateDTO observer_robot_state(NativeKernelBundle& self) {
+  if (self.kernel) {
+    const auto snapshot = self.kernel->get_execution_snapshot();
+    if (!snapshot.joint_positions_rad.empty()) {
+      RobotStateDTO state;
+      state.positions_rad = snapshot.joint_positions_rad;
+      return state;
+    }
+  }
+  return self.context->get_current_state();
+}
+
 py::dict trajectory_to_python(const TrajectoryDTO& trajectory) {
   py::dict d;
   d["joint_names"] = trajectory.joint_names;
@@ -1408,13 +1420,25 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
              self.kernel->set_streaming_velocity_scale(scale);
            })
       .def("get_status", [](NativeKernelBundle& self) -> py::dict {
-        return status_to_python(self.kernel->get_status());
+        const auto status = [&]() {
+          py::gil_scoped_release release;
+          return self.kernel->get_status();
+        }();
+        return status_to_python(status);
       })
       .def("get_execution_snapshot", [](NativeKernelBundle& self) -> py::dict {
-        return snapshot_to_python(self.kernel->get_execution_snapshot());
+        const auto snapshot = [&]() {
+          py::gil_scoped_release release;
+          return self.kernel->get_execution_snapshot();
+        }();
+        return snapshot_to_python(snapshot);
       })
       .def("get_metrics", [](NativeKernelBundle& self) -> py::dict {
-        return metrics_to_python(self.kernel->get_metrics());
+        const auto metrics = [&]() {
+          py::gil_scoped_release release;
+          return self.kernel->get_metrics();
+        }();
+        return metrics_to_python(metrics);
       })
 #ifdef MANYFORGE_ROS2_CONTROL_ENABLED
       .def("configure_ros_gripper_action",
@@ -1450,8 +1474,12 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
           [](NativeKernelBundle& self, const std::string& gripper_id,
              double target_position, double duration_s,
              double max_effort) -> py::dict {
-            const auto result = require_ros2_control_execution(self).command_gripper(
-                gripper_id, target_position, duration_s, max_effort);
+            auto& backend = require_ros2_control_execution(self);
+            const auto result = [&]() {
+              py::gil_scoped_release release;
+              return backend.command_gripper(
+                  gripper_id, target_position, duration_s, max_effort);
+            }();
             py::dict d;
             d["accepted"] = result.accepted;
             if (!result.error.empty()) {
@@ -1462,12 +1490,17 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
           py::arg("gripper_id"), py::arg("target_position"),
           py::arg("duration_s"), py::arg("max_effort") = 0.0)
       .def("update_ros_grippers", [](NativeKernelBundle& self) {
-        require_ros2_control_execution(self).update_gripper_commands();
+        auto& backend = require_ros2_control_execution(self);
+        py::gil_scoped_release release;
+        backend.update_gripper_commands();
       })
       .def("get_ros_gripper_status",
           [](NativeKernelBundle& self, const std::string& gripper_id) -> py::dict {
-            const auto status =
-                require_ros2_control_execution(self).get_gripper_status(gripper_id);
+            auto& backend = require_ros2_control_execution(self);
+            const auto status = [&]() {
+              py::gil_scoped_release release;
+              return backend.get_gripper_status(gripper_id);
+            }();
             py::dict d;
             d["state"] = status.state;
             d["progress"] = status.progress;
@@ -1489,14 +1522,20 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
           py::arg("gripper_id"))
 #endif
       .def("get_scene_object_ids", [](NativeKernelBundle& self) {
+        py::gil_scoped_release release;
         return self.context->get_scene_object_ids();
       })
       .def("get_joint_names", [](NativeKernelBundle& self) {
+        py::gil_scoped_release release;
         return self.context->get_joint_names();
       })
       .def("get_scene_objects", [](NativeKernelBundle& self) -> py::list {
+        const auto objects = [&]() {
+          py::gil_scoped_release release;
+          return self.context->get_scene_objects();
+        }();
         py::list result;
-        for (const auto& object : self.context->get_scene_objects()) {
+        for (const auto& object : objects) {
           result.append(scene_object_snapshot_to_python(object));
         }
         return result;
@@ -1797,28 +1836,17 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
                                 const std::string& target_frame,
                                 const std::string& base_frame) -> py::object {
         try {
-          FkRequestDTO req;
-          req.target_frame = target_frame;
-          req.base_frame = base_frame;
-
-          // Get current state for FK
-          req.robot_state = [&]() {
+          const auto poses = [&]() {
             py::gil_scoped_release release;
-            return self.context->get_current_state();
+            const auto state = observer_robot_state(self);
+            return self.context->forward_kinematics_batch(
+                state, std::vector<std::string>{target_frame}, base_frame);
           }();
-
-          auto pose = [&]() {
-            py::gil_scoped_release release;
-            return self.context->forward_kinematics(req);
-          }();
-
-          py::dict result;
-          result["position_m"] = py::make_tuple(
-              pose.position_m.x_m, pose.position_m.y_m, pose.position_m.z_m);
-          result["orientation_xyzw"] = py::make_tuple(
-              pose.orientation.x, pose.orientation.y,
-              pose.orientation.z, pose.orientation.w);
-          return result;
+          const auto it = poses.find(target_frame);
+          if (it == poses.end()) {
+            return py::none();
+          }
+          return py::object(pose_to_python(it->second));
         } catch (...) {
           return py::none();
         }
@@ -1826,33 +1854,15 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
       .def("get_link_poses", [](NativeKernelBundle& self,
                                  const std::vector<std::string>& target_frames,
                                  const std::string& base_frame) -> py::dict {
-        RobotStateDTO state = [&]() {
+        const auto poses = [&]() {
           py::gil_scoped_release release;
-          return self.context->get_current_state();
+          const auto state = observer_robot_state(self);
+          return self.context->forward_kinematics_batch(
+              state, target_frames, base_frame);
         }();
         py::dict result;
-        for (const auto& target_frame : target_frames) {
-          FkRequestDTO req;
-          req.robot_state = state;
-          req.target_frame = target_frame;
-          req.base_frame = base_frame;
-          try {
-            auto pose = [&]() {
-              py::gil_scoped_release release;
-              return self.context->forward_kinematics(req);
-            }();
-            py::dict item;
-            item["position_m"] = py::make_tuple(
-                pose.position_m.x_m, pose.position_m.y_m, pose.position_m.z_m);
-            item["orientation_xyzw"] = py::make_tuple(
-                pose.orientation.x, pose.orientation.y,
-                pose.orientation.z, pose.orientation.w);
-            result[py::str(target_frame)] = item;
-          } catch (...) {
-            // Skip unresolved links. The scene-state route treats absence
-            // as "do not render this link pose" rather than failing the
-            // whole viewer update.
-          }
+        for (const auto& [target_frame, pose] : poses) {
+          result[py::str(target_frame)] = pose_to_python(pose);
         }
         return result;
       })
@@ -1871,12 +1881,20 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
       })
       .def("get_object_state", [](NativeKernelBundle& self,
                                    const std::string& object_id) -> py::dict {
-        return object_state_to_python(self.context->get_object_state(object_id));
+        const auto state = [&]() {
+          py::gil_scoped_release release;
+          return self.context->get_object_state(object_id);
+        }();
+        return object_state_to_python(state);
       })
       .def("get_scene_trace", [](NativeKernelBundle& self, int limit) -> py::list {
+        const auto events = [&]() {
+          py::gil_scoped_release release;
+          return self.context->get_scene_trace(
+              limit < 0 ? 0 : static_cast<size_t>(limit));
+        }();
         py::list result;
-        size_t bounded_limit = limit < 0 ? 0 : static_cast<size_t>(limit);
-        for (const auto& event : self.context->get_scene_trace(bounded_limit)) {
+        for (const auto& event : events) {
           result.append(scene_trace_event_to_python(event));
         }
         return result;

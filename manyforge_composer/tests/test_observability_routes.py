@@ -143,10 +143,16 @@ def test_scene_state_includes_robot_metadata_after_program_load():
     assert isinstance(data["robot"]["joint_positions"], dict)
 
 
-def test_scene_state_advances_gripper_before_link_pose_fk(monkeypatch: pytest.MonkeyPatch):
-    """A moving gripper must enter the authoritative FK state before the
-    native viewer reads link poses. Otherwise the robot arm updates through
-    FK while the gripper visuals lag by one scene poll or stay at defaults."""
+def test_scene_state_does_not_advance_gripper_commands_on_read_path(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Scene-state polling is an observer path.
+
+    Gripper command progression belongs to execution/tick paths. The native
+    viewer must not mutate kernel state while reading FK because that couples
+    rendering cadence to command state and can stall every observer route
+    behind gripper or scene locks.
+    """
 
     class OrderedKernel(MockKernelClient):
         def __init__(self) -> None:
@@ -157,14 +163,14 @@ def test_scene_state_advances_gripper_before_link_pose_fk(monkeypatch: pytest.Mo
             return SimpleNamespace(joint_positions_rad=[0.0])
 
         def get_link_pose(self, link_name: str, reference_frame: str):
-            assert self.gripper_update_count == 1
+            assert self.gripper_update_count == 0
             return {
                 "position_m": [0.0, 0.0, 0.0],
                 "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
             }
 
         def get_link_poses(self, link_names: list[str], reference_frame: str):
-            assert self.gripper_update_count == 1
+            assert self.gripper_update_count == 0
             return {
                 name: {
                     "position_m": [0.0, 0.0, 0.0],
@@ -193,7 +199,7 @@ def test_scene_state_advances_gripper_before_link_pose_fk(monkeypatch: pytest.Mo
     payload = routes_scene.build_scene_state_payload(state)
 
     assert payload["link_poses"]["finger"]["position_m"] == [0.0, 0.0, 0.0]
-    assert kernel.gripper_update_count == 1
+    assert kernel.gripper_update_count == 0
 
 
 def test_scene_frames_expose_model_inventory_and_visibility_control():
@@ -247,6 +253,53 @@ def test_scene_frames_expose_model_inventory_and_visibility_control():
     assert resize.status_code == 200
     assert resize.json()["axesLengthM"] == 0.12
     assert state.hmi_server.frame_gizmo_size == 0.12
+
+
+def test_scene_frames_batch_fk_once_for_observer_route(monkeypatch):
+    class BatchKernel(MockKernelClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.batch_calls: list[tuple[list[str], str]] = []
+
+        def get_link_poses(self, link_names: list[str], reference_frame: str):
+            self.batch_calls.append((list(link_names), reference_frame))
+            return {
+                name: {
+                    "position_m": [float(index), 0.0, 0.0],
+                    "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+                }
+                for index, name in enumerate(link_names)
+            }
+
+        def get_link_pose(self, link_name: str, reference_frame: str):
+            raise AssertionError("scene frames must use batch FK")
+
+    monkeypatch.setattr(
+        routes_scene,
+        "_load_model_frame_names",
+        lambda _state: {"link_a", "link_b"},
+    )
+    kernel = BatchKernel()
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state.program = SimpleNamespace(
+        robot=SimpleNamespace(base_frame="base_link", tcp_frame="tool0", base_pose={}),
+        scene=[],
+    )
+    state.deployment = SimpleNamespace(
+        robot_config=SimpleNamespace(robot_id="testbot", group_id="arm"),
+        adapters={},
+        grippers={},
+    )
+
+    payload = routes_scene.build_scene_frames_payload(state)
+
+    assert len(kernel.batch_calls) == 1
+    requested_frames, reference_frame = kernel.batch_calls[0]
+    assert reference_frame == "universe"
+    assert set(requested_frames) == {"base_link", "link_a", "link_b", "tool0"}
+    poses_by_name = {frame["name"]: frame for frame in payload["frames"]}
+    assert poses_by_name["link_a"]["poseAvailable"] is True
+    assert poses_by_name["link_a"]["poseInWorld"] is not None
 
 
 def test_scene_frames_do_not_append_default_package_paths_when_deployment_declares_package_paths(monkeypatch, tmp_path):

@@ -240,7 +240,57 @@ class PlanPickSequenceNode(BlackboardOutputMixin, py_trees.behaviour.Behaviour):
             access=py_trees.common.Access.WRITE,
         )
         self._bb.register_key(key="kernel", access=py_trees.common.Access.READ)
+        self._bb.register_key(
+            key="pose_source_apply_callback",
+            access=py_trees.common.Access.READ,
+        )
+        self._bb.register_key(
+            key="pose_source_between_nodes_callback",
+            access=py_trees.common.Access.READ,
+        )
         self._output_keys_registered = True
+
+    def _apply_pose_source_latches(
+        self,
+        *,
+        selected_object_id: str,
+    ) -> py_trees.common.Status | None:
+        callbacks = (
+            ("pose_source_apply_callback", "before-planning"),
+            ("pose_source_between_nodes_callback", "between-nodes"),
+        )
+        for blackboard_key, label in callbacks:
+            try:
+                callback = self._bb.get(blackboard_key)
+            except (AttributeError, KeyError):
+                callback = None
+            if not callable(callback):
+                continue
+            try:
+                result = callback(
+                    object_ids=[selected_object_id],
+                    reason=f"pick_sequence:{self.name}",
+                )
+            except Exception as exc:  # noqa: BLE001 - callback boundary
+                self.feedback_message = f"{label} pose-source apply raised: {exc}"
+                self._write_failure_response(
+                    selected_object_id=selected_object_id,
+                    attempted_candidates=0,
+                    outcome="pose_source_apply_failed",
+                    failure_detail=f"{label}: {exc}",
+                )
+                return py_trees.common.Status.FAILURE
+            if not result.get("success", False):
+                error = str(result.get("error") or f"{label} pose-source apply failed")
+                self.feedback_message = error
+                self._write_failure_response(
+                    selected_object_id=selected_object_id,
+                    attempted_candidates=0,
+                    outcome="pose_source_apply_failed",
+                    failure_detail=f"{label}: {error}",
+                )
+                return py_trees.common.Status.FAILURE
+        return None
 
     def initialise(self) -> None:
         self._ensure_output_keys()
@@ -290,6 +340,12 @@ class PlanPickSequenceNode(BlackboardOutputMixin, py_trees.behaviour.Behaviour):
                 outcome="unsupported_search_strategy",
             )
             return py_trees.common.Status.FAILURE
+
+        pose_source_status = self._apply_pose_source_latches(
+            selected_object_id=selected_object_id
+        )
+        if pose_source_status is not None:
+            return pose_source_status
 
         if self._image_source == "hmi_snapshot":
             provider = self._scene_snapshot_provider

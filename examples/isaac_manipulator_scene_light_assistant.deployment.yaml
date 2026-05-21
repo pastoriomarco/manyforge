@@ -49,6 +49,20 @@ grippers:
       - gripper_frame
     description: Robotiq 2F-140 command through the standard ROS GripperCommand action.
 
+pose_sources:
+  - id: isaac_scene_objects
+    kind: simulation_interfaces
+    enabled: true
+    service_prefix: auto
+    max_update_hz: 4.0
+    stale_after_s: 1.0
+    frame_id: universe
+    description: Isaac Sim entity poses for scene objects that can move between plans.
+    objects:
+      isaac_cheese_box:
+        entity: /mac_n_cheese_centered
+        apply_policy: before_planning
+
 adapters:
   planning:
     adapter_id: planning.roboplan

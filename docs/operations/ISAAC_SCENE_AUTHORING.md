@@ -173,6 +173,45 @@ through the UI). Confirm three things:
    context is reading the same OBJ files, so a successful plan
    confirms the geometry is reaching RoboPlan as well as the viewer.
 
+## 7. Optional: stream object poses from Isaac
+
+Static OBJ files define object shape. Object pose can also be observed
+from Isaac at runtime through deployment `pose_sources`. In Composer,
+open **Deployment > Object Pose Sources** to edit the source, entity
+binding, and apply policy. The Isaac demo source uses
+`kind: simulation_interfaces`, `service_prefix: auto`, `frame_id:
+universe`, and a bounded `max_update_hz` such as `4.0`.
+
+Pick the apply policy per object:
+
+- `observe_only` shows freshness and observed pose without changing
+  ManyForge's planning scene.
+- `when_idle` updates only while no cycle or direct-control session is
+  active.
+- `before_planning` latches the latest fresh pose just before planning
+  an object-relative motion.
+- `between_nodes` applies only at behavior-tree safe points.
+- `continuous` applies fresh observations immediately at the configured
+  source rate. If the object is attached, Composer updates the object's
+  offset in the attachment frame instead of detaching it with a
+  world-frame overwrite.
+- `continuous_unattached` applies fresh observations at the configured
+  source rate only while the object is detached. Once attached, the
+  planning-scene object stays at the canonical attachment offset while
+  the external observation remains available for ghost/drift diagnostics.
+
+For industrial cells, keep `observe_only` as the default while
+commissioning a source, then move individual objects to `before_planning`,
+`between_nodes`, `continuous`, or `continuous_unattached` only when that
+source is part of the cell authority model and its stale-data behavior is
+understood.
+
+For diagnostics, open **Tools > Sources** in the native viewer and enable
+**Measured-state ghost**. It renders fresh external object observations as
+a cyan translucent overlay so you can compare Isaac/perception state with
+Composer's backend-authoritative planning scene. The overlay is viewer-only;
+it does not modify object poses.
+
 ## Troubleshooting
 
 | Symptom | Likely cause | Fix |

@@ -42,6 +42,23 @@ def _normalize_pose_dict(pose: dict[str, Any] | None) -> dict[str, Any] | None:
     return pose
 
 
+def _relative_move_object_ids(relative_move: dict[str, Any] | None) -> list[str]:
+    """Return scene object IDs referenced by a relative move request."""
+    if not isinstance(relative_move, dict):
+        return []
+    object_ids: list[str] = []
+    for key in ("target_reference", "offset_reference"):
+        reference = relative_move.get(key)
+        if not isinstance(reference, dict):
+            continue
+        if reference.get("type") != "object":
+            continue
+        object_id = reference.get("id")
+        if isinstance(object_id, str) and object_id and object_id not in object_ids:
+            object_ids.append(object_id)
+    return object_ids
+
+
 class MoveManipulatorAction(py_trees.behaviour.Behaviour):
     """Execute a motion request through the kernel (plan + validate + execute)."""
 
@@ -66,6 +83,8 @@ class MoveManipulatorAction(py_trees.behaviour.Behaviour):
             "stop_requested",
             "velocity_scale",
             "global_max_tcp_linear_speed_mps",
+            "pose_source_apply_callback",
+            "pose_source_between_nodes_callback",
         ):
             self.blackboard.register_key(key=key, access=py_trees.common.Access.READ)
         # Write keys: motion_error_message + motion_paused_due_to_error are
@@ -255,6 +274,39 @@ class MoveManipulatorAction(py_trees.behaviour.Behaviour):
                 relative_move["offset"] = _normalize_pose_dict(
                     relative_move.get("offset")
                 )
+
+            referenced_object_ids = _relative_move_object_ids(relative_move)
+            if referenced_object_ids:
+                callbacks = (
+                    (
+                        "pose_source_apply_callback",
+                        "before-planning",
+                    ),
+                    (
+                        "pose_source_between_nodes_callback",
+                        "between-nodes",
+                    ),
+                )
+                for blackboard_key, label in callbacks:
+                    apply_callback = self._read_optional_blackboard_value(
+                        blackboard_key
+                    )
+                    if not callable(apply_callback):
+                        continue
+                    try:
+                        apply_result = apply_callback(
+                            object_ids=referenced_object_ids,
+                            reason=f"motion_node:{self.name}",
+                        )
+                    except Exception as exc:  # noqa: BLE001 - callback boundary
+                        return self._enter_soft_fail(
+                            f"{label} pose-source apply raised: {exc}"
+                        )
+                    if not apply_result.get("success", False):
+                        error = apply_result.get("error") or (
+                            f"{label} pose-source apply failed"
+                        )
+                        return self._enter_soft_fail(str(error))
 
             request = ExecuteRequest(
                 robot_id=self._params.get("robot_id", ""),

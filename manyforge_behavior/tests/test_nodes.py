@@ -227,6 +227,104 @@ class TestMoveManipulatorAction:
             abs=1e-6,
         )
 
+    def test_relative_move_applies_pose_source_before_planning(self, kernel, bb_with_kernel):
+        calls = []
+
+        def apply_pose_source(**kwargs):
+            calls.append(kwargs)
+            return {"success": True}
+
+        client = py_trees.blackboard.Client(name="pose_source_setup")
+        client.register_key(
+            key="pose_source_apply_callback",
+            access=py_trees.common.Access.WRITE,
+        )
+        client.pose_source_apply_callback = apply_pose_source
+
+        node = MoveManipulatorAction(
+            name="test_relative_move_apply_source",
+            move_id="m_rel_source",
+            motion_type="relative_move",
+            relative_move={
+                "target_reference": {"type": "object", "id": "graspable"},
+                "offset": {"position_m": [0.0, 0.0, 0.1]},
+            },
+        )
+
+        status = _tick_node(node)
+
+        assert status == py_trees.common.Status.SUCCESS
+        assert calls == [
+            {
+                "object_ids": ["graspable"],
+                "reason": "motion_node:test_relative_move_apply_source",
+            }
+        ]
+
+    def test_relative_move_holds_when_before_planning_pose_source_fails(
+        self,
+        kernel,
+        bb_with_kernel,
+    ):
+        def apply_pose_source(**kwargs):
+            return {"success": False, "error": "no fresh pose-source update for: graspable"}
+
+        client = py_trees.blackboard.Client(name="pose_source_setup_fail")
+        client.register_key(
+            key="pose_source_apply_callback",
+            access=py_trees.common.Access.WRITE,
+        )
+        client.pose_source_apply_callback = apply_pose_source
+
+        node = MoveManipulatorAction(
+            name="test_relative_move_apply_source_fail",
+            move_id="m_rel_source_fail",
+            motion_type="relative_move",
+            relative_move={
+                "target_reference": {"type": "object", "id": "graspable"},
+                "offset": {"position_m": [0.0, 0.0, 0.1]},
+            },
+        )
+
+        status = _tick_node(node)
+
+        assert status == py_trees.common.Status.RUNNING
+        assert node.feedback_message == "no fresh pose-source update for: graspable"
+
+    def test_relative_move_applies_between_nodes_pose_source(self, kernel, bb_with_kernel):
+        calls = []
+
+        def apply_between_nodes(**kwargs):
+            calls.append(kwargs)
+            return {"success": True}
+
+        client = py_trees.blackboard.Client(name="pose_source_between_nodes_setup")
+        client.register_key(
+            key="pose_source_between_nodes_callback",
+            access=py_trees.common.Access.WRITE,
+        )
+        client.pose_source_between_nodes_callback = apply_between_nodes
+
+        node = MoveManipulatorAction(
+            name="test_relative_move_between_nodes_source",
+            move_id="m_rel_between_nodes",
+            motion_type="relative_move",
+            relative_move={
+                "target_reference": {"type": "object", "id": "graspable"},
+                "offset": {"position_m": [0.0, 0.0, 0.1]},
+            },
+        )
+
+        status = _tick_node(node)
+
+        assert status == py_trees.common.Status.SUCCESS
+        assert calls == [
+            {
+                "object_ids": ["graspable"],
+                "reason": "motion_node:test_relative_move_between_nodes_source",
+            }
+        ]
+
     def test_relative_move_pose_reference_normalizes_inline_pose_orientation(self, kernel, bb_with_kernel):
         node = MoveManipulatorAction(
             name="test_relative_move_pose_ref",

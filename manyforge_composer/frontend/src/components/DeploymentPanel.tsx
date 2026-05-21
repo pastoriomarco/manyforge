@@ -7,6 +7,10 @@ import type {
   ModelEndpointCapabilities,
   ModelEndpointCatalog,
   ModelEndpointConfig,
+  PoseSourceApplyPolicy,
+  PoseSourceConfig,
+  PoseSourceKind,
+  PoseSourceObjectBindingConfig,
   SceneFrameState,
   SceneUrdfManifest,
   StreamingJointLimit,
@@ -222,6 +226,23 @@ const DEFAULT_MODEL_ENDPOINT_CAPABILITIES: ModelEndpointCapabilities = {
   latencyBudgetMs: null,
 };
 
+const POSE_SOURCE_KINDS: PoseSourceKind[] = [
+  'simulation_interfaces',
+  'pose_stamped_topic',
+  'pose_array_topic',
+  'detection3d_array_topic',
+  'tf',
+];
+
+const POSE_SOURCE_APPLY_POLICIES: PoseSourceApplyPolicy[] = [
+  'observe_only',
+  'when_idle',
+  'continuous',
+  'continuous_unattached',
+  'before_planning',
+  'between_nodes',
+];
+
 function modelEndpointCapabilities(
   endpoint: ModelEndpointConfig,
 ): ModelEndpointCapabilities {
@@ -281,6 +302,40 @@ function deploymentWarnings(deployment: FullDeployment): string[] {
   }
 
   return warnings;
+}
+
+function nextPoseSourceId(sources: PoseSourceConfig[]): string {
+  const existing = new Set(sources.map((source) => source.id));
+  let index = 1;
+  while (existing.has(`pose_source_${index}`)) {
+    index += 1;
+  }
+  return `pose_source_${index}`;
+}
+
+function defaultPoseSource(id: string): PoseSourceConfig {
+  return {
+    id,
+    kind: 'simulation_interfaces',
+    enabled: true,
+    maxUpdateHz: 4,
+    staleAfterS: 1,
+    frameId: 'universe',
+    servicePrefix: 'auto',
+    topic: '',
+    description: '',
+    objects: {},
+  };
+}
+
+function defaultPoseSourceObject(): PoseSourceObjectBindingConfig {
+  return {
+    entity: '',
+    frameId: '',
+    applyPolicy: 'observe_only',
+    confidenceMin: null,
+    metadata: {},
+  };
 }
 
 function FrameMultiSelect({
@@ -427,6 +482,282 @@ function StreamingJointLimitsEditor({
           </div>
         );
       })}
+    </div>
+  );
+}
+
+function PoseSourcesEditor({
+  sources,
+  onChange,
+  disabled,
+}: {
+  sources: PoseSourceConfig[];
+  onChange: (next: PoseSourceConfig[]) => void;
+  disabled: boolean;
+}) {
+  const updateSource = useCallback((index: number, patch: Partial<PoseSourceConfig>) => {
+    onChange(sources.map((source, i) => (i === index ? { ...source, ...patch } : source)));
+  }, [onChange, sources]);
+
+  const removeSource = useCallback((index: number) => {
+    onChange(sources.filter((_, i) => i !== index));
+  }, [onChange, sources]);
+
+  const addSource = useCallback(() => {
+    onChange([...sources, defaultPoseSource(nextPoseSourceId(sources))]);
+  }, [onChange, sources]);
+
+  const updateObject = useCallback((
+    sourceIndex: number,
+    objectId: string,
+    patch: Partial<PoseSourceObjectBindingConfig>,
+  ) => {
+    const source = sources[sourceIndex];
+    if (!source) return;
+    updateSource(sourceIndex, {
+      objects: {
+        ...(source.objects ?? {}),
+        [objectId]: {
+          ...defaultPoseSourceObject(),
+          ...(source.objects?.[objectId] ?? {}),
+          ...patch,
+        },
+      },
+    });
+  }, [sources, updateSource]);
+
+  const renameObject = useCallback((sourceIndex: number, currentId: string, nextIdRaw: string) => {
+    const nextId = nextIdRaw.trim();
+    const source = sources[sourceIndex];
+    if (!source || !nextId || nextId === currentId || source.objects?.[nextId]) return;
+    const nextObjects: Record<string, PoseSourceObjectBindingConfig> = {};
+    for (const [objectId, binding] of Object.entries(source.objects ?? {})) {
+      nextObjects[objectId === currentId ? nextId : objectId] = binding;
+    }
+    updateSource(sourceIndex, { objects: nextObjects });
+  }, [sources, updateSource]);
+
+  const addObject = useCallback((sourceIndex: number) => {
+    const source = sources[sourceIndex];
+    if (!source) return;
+    const existing = new Set(Object.keys(source.objects ?? {}));
+    let index = 1;
+    while (existing.has(`scene_object_${index}`)) {
+      index += 1;
+    }
+    updateSource(sourceIndex, {
+      objects: {
+        ...(source.objects ?? {}),
+        [`scene_object_${index}`]: defaultPoseSourceObject(),
+      },
+    });
+  }, [sources, updateSource]);
+
+  const removeObject = useCallback((sourceIndex: number, objectId: string) => {
+    const source = sources[sourceIndex];
+    if (!source) return;
+    const nextObjects = { ...(source.objects ?? {}) };
+    delete nextObjects[objectId];
+    updateSource(sourceIndex, { objects: nextObjects });
+  }, [sources, updateSource]);
+
+  return (
+    <div className="space-y-2">
+      <div className="rounded border border-blue-900/50 bg-blue-950/20 p-2 text-[11px] leading-relaxed text-blue-100/90">
+        Pose sources continuously observe external object poses up to the configured
+        max update rate. Apply policy controls when those observations may mutate
+        ManyForge's planning scene: never during an active trajectory.
+      </div>
+      {sources.length === 0 && (
+        <div className="rounded border border-gray-700 bg-gray-900/40 p-3 text-xs text-gray-500">
+          No pose sources configured.
+        </div>
+      )}
+      {sources.map((source, sourceIndex) => {
+        const objects = source.objects ?? {};
+        return (
+          <div key={`${source.id}:${sourceIndex}`} className="rounded border border-gray-700 bg-gray-900/40 p-3">
+            <div className="mb-2 flex items-center justify-between gap-2">
+              <div className="min-w-0">
+                <div className="truncate text-xs font-semibold uppercase tracking-wide text-gray-300">
+                  {source.id || `pose source ${sourceIndex + 1}`}
+                </div>
+                <div className="text-[10px] text-gray-500">
+                  Continuous observation at max {source.maxUpdateHz || 4} Hz; stale after {source.staleAfterS || 1}s.
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => removeSource(sourceIndex)}
+                disabled={disabled}
+                className="rounded border border-red-900 px-2 py-1 text-[11px] text-red-200 hover:bg-red-950 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                Remove
+              </button>
+            </div>
+            <div className="grid gap-2 md:grid-cols-2">
+              <FieldInput
+                label="Source ID"
+                value={source.id}
+                onChange={(value) => updateSource(sourceIndex, { id: value.trim() || source.id })}
+                disabled={disabled}
+              />
+              <label className="block mb-2">
+                <span className="text-xs text-gray-400">Kind</span>
+                <select
+                  value={source.kind}
+                  onChange={(event) => updateSource(sourceIndex, { kind: event.target.value as PoseSourceKind })}
+                  disabled={disabled}
+                  className="w-full mt-0.5 px-2 py-1 bg-gray-700 border border-gray-600 rounded text-sm text-gray-200 focus:border-blue-500 focus:outline-none disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  {POSE_SOURCE_KINDS.map((kind) => (
+                    <option key={kind} value={kind}>{kind}</option>
+                  ))}
+                </select>
+              </label>
+              <FieldInput
+                label="Max Update Hz"
+                value={source.maxUpdateHz}
+                type="number"
+                min={0.1}
+                step={0.5}
+                onChange={(value) => updateSource(sourceIndex, { maxUpdateHz: Math.max(0.1, Number(value) || 4) })}
+                disabled={disabled}
+              />
+              <FieldInput
+                label="Stale After (s)"
+                value={source.staleAfterS}
+                type="number"
+                min={0.1}
+                step={0.1}
+                onChange={(value) => updateSource(sourceIndex, { staleAfterS: Math.max(0.1, Number(value) || 1) })}
+                disabled={disabled}
+              />
+              <FieldInput
+                label="Frame ID"
+                value={source.frameId ?? ''}
+                onChange={(value) => updateSource(sourceIndex, { frameId: value })}
+                disabled={disabled}
+              />
+              <FieldInput
+                label="Service Prefix"
+                value={source.servicePrefix ?? 'auto'}
+                onChange={(value) => updateSource(sourceIndex, { servicePrefix: value || 'auto' })}
+                disabled={disabled}
+                help="simulation_interfaces service namespace. Use auto for discovery."
+              />
+              <FieldInput
+                label="Topic"
+                value={source.topic ?? ''}
+                onChange={(value) => updateSource(sourceIndex, { topic: value })}
+                disabled={disabled}
+                help="Required for topic-based or TF source adapters."
+              />
+              <CheckboxInput
+                label="Enabled"
+                checked={source.enabled}
+                onChange={(value) => updateSource(sourceIndex, { enabled: value })}
+                disabled={disabled}
+              />
+            </div>
+            <FieldInput
+              label="Description"
+              value={source.description ?? ''}
+              onChange={(value) => updateSource(sourceIndex, { description: value })}
+              disabled={disabled}
+            />
+            <div className="mt-2 space-y-2">
+              <div className="flex items-center justify-between">
+                <div className="text-[10px] font-semibold uppercase tracking-wide text-gray-500">Object bindings</div>
+                <button
+                  type="button"
+                  onClick={() => addObject(sourceIndex)}
+                  disabled={disabled}
+                  className="rounded border border-gray-600 px-2 py-1 text-[11px] text-gray-200 hover:bg-gray-700 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  Add Object
+                </button>
+              </div>
+              {Object.keys(objects).length === 0 && (
+                <div className="rounded border border-gray-700 bg-gray-950/50 px-2 py-1 text-[11px] text-gray-500">
+                  Add one binding per ManyForge scene object that this source observes.
+                </div>
+              )}
+              {Object.entries(objects).map(([objectId, binding]) => (
+                <div key={objectId} className="rounded border border-gray-800 bg-gray-950/50 p-2">
+                  <div className="grid gap-2 md:grid-cols-2">
+                    <FieldInput
+                      label="ManyForge Object ID"
+                      value={objectId}
+                      onChange={(value) => renameObject(sourceIndex, objectId, value)}
+                      disabled={disabled}
+                    />
+                    <FieldInput
+                      label="Source Entity"
+                      value={binding.entity ?? ''}
+                      onChange={(value) => updateObject(sourceIndex, objectId, { entity: value })}
+                      disabled={disabled}
+                      help="For Isaac simulation_interfaces, this is the USD/entity path."
+                    />
+                    <label className="block mb-2">
+                      <span className="text-xs text-gray-400">Apply Policy</span>
+                      <select
+                        value={binding.applyPolicy ?? 'observe_only'}
+                        onChange={(event) => updateObject(sourceIndex, objectId, { applyPolicy: event.target.value as PoseSourceApplyPolicy })}
+                        disabled={disabled}
+                        className="w-full mt-0.5 px-2 py-1 bg-gray-700 border border-gray-600 rounded text-sm text-gray-200 focus:border-blue-500 focus:outline-none disabled:opacity-50 disabled:cursor-not-allowed"
+                      >
+                        {POSE_SOURCE_APPLY_POLICIES.map((policy) => (
+                          <option key={policy} value={policy}>{policy}</option>
+                        ))}
+                      </select>
+                    </label>
+                    <FieldInput
+                      label="Object Frame ID"
+                      value={binding.frameId ?? ''}
+                      onChange={(value) => updateObject(sourceIndex, objectId, { frameId: value })}
+                      disabled={disabled}
+                    />
+                    <FieldInput
+                      label="Min Confidence"
+                      value={binding.confidenceMin ?? ''}
+                      type="number"
+                      min={0}
+                      step={0.05}
+                      onChange={(value) => {
+                        const trimmed = value.trim();
+                        updateObject(sourceIndex, objectId, {
+                          confidenceMin: trimmed === '' ? null : Math.min(1, Math.max(0, Number(trimmed) || 0)),
+                        });
+                      }}
+                      disabled={disabled}
+                      help="Optional threshold for perception-driven sources."
+                    />
+                    <div className="flex items-end">
+                      <button
+                        type="button"
+                        onClick={() => removeObject(sourceIndex, objectId)}
+                        disabled={disabled}
+                        className="w-full rounded border border-red-900 px-2 py-1 text-[11px] text-red-200 hover:bg-red-950 disabled:cursor-not-allowed disabled:opacity-50"
+                      >
+                        Remove Binding
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        );
+      })}
+      <button
+        type="button"
+        onClick={addSource}
+        disabled={disabled}
+        className="w-full rounded border border-gray-600 px-3 py-2 text-sm text-gray-200 hover:bg-gray-700 disabled:cursor-not-allowed disabled:opacity-50"
+      >
+        Add Pose Source
+      </button>
     </div>
   );
 }
@@ -945,6 +1276,14 @@ export function DeploymentPanel() {
           drivableJointNames={drivableJointNames}
           limits={deployment.robotConfig.streamingJointLimits ?? {}}
           onChange={(next) => setNestedField('robotConfig.streamingJointLimits', next)}
+          disabled={editLocked}
+        />
+      </Section>
+
+      <Section title="Object Pose Sources">
+        <PoseSourcesEditor
+          sources={deployment.poseSources ?? []}
+          onChange={(next) => setField('poseSources', next)}
           disabled={editLocked}
         />
       </Section>

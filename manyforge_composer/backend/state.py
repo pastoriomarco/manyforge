@@ -1,8 +1,10 @@
 """ComposerState - Holds the runtime state shared across all API routes."""
 from __future__ import annotations
 
+import copy
 import hashlib
 import logging
+import math
 import threading
 import time
 import uuid
@@ -21,7 +23,7 @@ from manyforge_behavior.program import (
 from manyforge_behavior.deployment import Deployment
 from manyforge_behavior.cycle_manager import CycleManager
 from manyforge_behavior.runner import OrchestratorRunner
-from manyforge_behavior.kernel_client import KernelClient
+from manyforge_behavior.kernel_client import KernelClient, SceneEditRequest
 from manyforge_behavior.skill_loader import SkillCatalog, load_skill_catalog, default_skills_dir
 from .event_recorder import EventRecorder
 from .security import normalize_allowed_roots
@@ -46,6 +48,74 @@ def _normalize_scene_snapshot_base_url(value: str, *, field_name: str) -> str:
             f"{field_name} must not include embedded credentials"
         )
     return candidate
+
+
+def _pose_to_matrix(pos: list[float], orient_xyzw: list[float]) -> list[list[float]]:
+    """Build a rigid 4x4 transform from a position and xyzw quaternion."""
+    x, y, z, w = orient_xyzw
+    norm = math.sqrt(x * x + y * y + z * z + w * w)
+    if norm <= 0.0 or not math.isfinite(norm):
+        raise ValueError("orientation quaternion is not finite")
+    x, y, z, w = x / norm, y / norm, z / norm, w / norm
+    return [
+        [1 - 2 * y * y - 2 * z * z, 2 * x * y - 2 * z * w, 2 * x * z + 2 * y * w, pos[0]],
+        [2 * x * y + 2 * z * w, 1 - 2 * x * x - 2 * z * z, 2 * y * z - 2 * x * w, pos[1]],
+        [2 * x * z - 2 * y * w, 2 * y * z + 2 * x * w, 1 - 2 * x * x - 2 * y * y, pos[2]],
+        [0.0, 0.0, 0.0, 1.0],
+    ]
+
+
+def _matrix_to_pose(matrix: list[list[float]]) -> tuple[list[float], list[float]]:
+    """Extract position and xyzw quaternion from a rigid 4x4 transform."""
+    pos = [matrix[0][3], matrix[1][3], matrix[2][3]]
+    trace = matrix[0][0] + matrix[1][1] + matrix[2][2]
+    if trace > 0.0:
+        s = math.sqrt(trace + 1.0) * 2.0
+        w = 0.25 * s
+        x = (matrix[2][1] - matrix[1][2]) / s
+        y = (matrix[0][2] - matrix[2][0]) / s
+        z = (matrix[1][0] - matrix[0][1]) / s
+    elif matrix[0][0] > matrix[1][1] and matrix[0][0] > matrix[2][2]:
+        s = math.sqrt(1.0 + matrix[0][0] - matrix[1][1] - matrix[2][2]) * 2.0
+        w = (matrix[2][1] - matrix[1][2]) / s
+        x = 0.25 * s
+        y = (matrix[0][1] + matrix[1][0]) / s
+        z = (matrix[0][2] + matrix[2][0]) / s
+    elif matrix[1][1] > matrix[2][2]:
+        s = math.sqrt(1.0 + matrix[1][1] - matrix[0][0] - matrix[2][2]) * 2.0
+        w = (matrix[0][2] - matrix[2][0]) / s
+        x = (matrix[0][1] + matrix[1][0]) / s
+        y = 0.25 * s
+        z = (matrix[1][2] + matrix[2][1]) / s
+    else:
+        s = math.sqrt(1.0 + matrix[2][2] - matrix[0][0] - matrix[1][1]) * 2.0
+        w = (matrix[1][0] - matrix[0][1]) / s
+        x = (matrix[0][2] + matrix[2][0]) / s
+        y = (matrix[1][2] + matrix[2][1]) / s
+        z = 0.25 * s
+    norm = math.sqrt(x * x + y * y + z * z + w * w)
+    if norm <= 0.0 or not math.isfinite(norm):
+        raise ValueError("computed quaternion is not finite")
+    return pos, [x / norm, y / norm, z / norm, w / norm]
+
+
+def _multiply_matrices(a: list[list[float]], b: list[list[float]]) -> list[list[float]]:
+    return [
+        [sum(a[i][k] * b[k][j] for k in range(4)) for j in range(4)]
+        for i in range(4)
+    ]
+
+
+def _invert_matrix(matrix: list[list[float]]) -> list[list[float]]:
+    rt = [[matrix[j][i] for j in range(3)] for i in range(3)]
+    t = [matrix[0][3], matrix[1][3], matrix[2][3]]
+    nt = [-(rt[i][0] * t[0] + rt[i][1] * t[1] + rt[i][2] * t[2]) for i in range(3)]
+    return [
+        [rt[0][0], rt[0][1], rt[0][2], nt[0]],
+        [rt[1][0], rt[1][1], rt[1][2], nt[1]],
+        [rt[2][0], rt[2][1], rt[2][2], nt[2]],
+        [0.0, 0.0, 0.0, 1.0],
+    ]
 
 
 @dataclass
@@ -216,6 +286,12 @@ class ComposerState:
         self._assistant_failure_counts: dict[str, int] = {}
         self._external_runtime_status_lock = threading.Lock()
         self._external_runtime_statuses: dict[str, dict[str, Any]] = {}
+        self._pose_source_lock = threading.Lock()
+        self._pose_source_snapshots: dict[str, dict[str, Any]] = {}
+        self._pose_source_apply_lock = threading.Lock()
+        self._pose_source_apply_pending: dict[str, dict[str, Any]] = {}
+        self._pose_source_apply_running = False
+        self._pose_source_apply_last_result: dict[str, Any] | None = None
         self.skill_catalog: SkillCatalog = load_skill_catalog(
             default_skills_dir(),
             catalog=self.catalog,
@@ -1559,6 +1635,8 @@ class ComposerState:
             event_recorder=self.event_recorder,
             scene_snapshot_provider=scene_snapshot_provider,
             scene_snapshot_url_publisher=self.publish_scene_snapshot,
+            pose_source_apply_callback=self.apply_pose_sources_before_planning,
+            pose_source_between_nodes_callback=self.apply_pose_sources_between_nodes,
         )
         runner.load()
 
@@ -1568,6 +1646,7 @@ class ComposerState:
         self._update_program_tree_hash()
         self._program_session_generation += 1
         self._clear_published_scene_snapshots()
+        self.clear_pose_source_snapshots()
         self.cycle_manager = CycleManager(runner, self._kernel)
         self._bind_cycle_manager_callbacks()
         self.reset_backend_authoritative_sim_if_needed(reason="program_load")
@@ -1677,6 +1756,8 @@ class ComposerState:
             event_recorder=self.event_recorder,
             scene_snapshot_provider=scene_snapshot_provider,
             scene_snapshot_url_publisher=self.publish_scene_snapshot,
+            pose_source_apply_callback=self.apply_pose_sources_before_planning,
+            pose_source_between_nodes_callback=self.apply_pose_sources_between_nodes,
         )
         runner.load()
 
@@ -1694,6 +1775,7 @@ class ComposerState:
             self._hidden_frames.clear()
             self._explicit_visible_frames.clear()
             self._visible_object_frames.clear()
+        self.clear_pose_source_snapshots()
         self.cycle_manager = CycleManager(runner, self._kernel)
         self._bind_cycle_manager_callbacks()
         if not defer_initial_runtime_reset:
@@ -1724,6 +1806,493 @@ class ComposerState:
         record["receivedAtNs"] = time.monotonic_ns()
         with self._external_runtime_status_lock:
             self._external_runtime_statuses[provider] = record
+
+    def update_pose_source_snapshot(
+        self,
+        pose_source_id: str,
+        payload: dict[str, Any],
+    ) -> None:
+        """Record the latest snapshot from one pose-source sidecar.
+
+        Composer stores sidecar snapshots separately from the planning scene.
+        Mutating policies are handled by the explicit apply layer, including the
+        `continuous` policy that the snapshot route invokes after this latest
+        value is recorded. This keeps the provider endpoint latest-wins and
+        avoids accumulating a pose-update backlog.
+        """
+        source = pose_source_id.strip()
+        if not source:
+            raise ValueError("pose_source_id must not be empty")
+        record = copy.deepcopy(payload)
+        record["pose_source_id"] = source
+        record["received_at_ns"] = time.monotonic_ns()
+        with self._pose_source_lock:
+            self._pose_source_snapshots[source] = record
+
+    def _pose_source_scene_edit_pose(
+        self,
+        *,
+        object_id: str,
+        position: list[float],
+        orientation: list[float],
+        frame_id: str,
+        detail: dict[str, Any],
+    ) -> tuple[list[float] | None, list[float] | None, str | None]:
+        """Return the pose/frame to send to scene_edit for a source update.
+
+        Detached objects are updated in their configured source frame. Attached
+        objects are different: applying a world-frame pose directly would change
+        the object's frame to `universe` and silently detach it. For attached
+        objects, convert the observed pose through the current attachment chain
+        and update the object as an offset in the attachment frame.
+        """
+        object_state = self.kernel.get_object_state(object_id)
+        apply_frame = str(frame_id or "universe")
+        if not object_state.attached:
+            detail["attached"] = False
+            return position, orientation, apply_frame
+
+        attached_frame = str(object_state.frame_id or "")
+        detail["attached"] = True
+        detail["attached_frame_id"] = attached_frame
+        if not attached_frame:
+            detail["status"] = "rejected"
+            detail["reject_reason"] = "missing_attachment_frame"
+            return None, None, None
+
+        if apply_frame == attached_frame:
+            detail["attached_update_mode"] = "attachment_frame"
+            return position, orientation, attached_frame
+
+        try:
+            observed_transform = _pose_to_matrix(position, orientation)
+            if apply_frame in {"", "universe"}:
+                world_transform = observed_transform
+            else:
+                source_pose = self.kernel.get_link_pose(apply_frame, "universe")
+                if source_pose is None:
+                    detail["status"] = "rejected"
+                    detail["reject_reason"] = "source_frame_unresolved"
+                    detail["frame_id"] = apply_frame
+                    return None, None, None
+                source_transform = _pose_to_matrix(
+                    list(source_pose["position_m"]),
+                    list(source_pose["orientation_xyzw"]),
+                )
+                world_transform = _multiply_matrices(source_transform, observed_transform)
+
+            attached_pose = self.kernel.get_link_pose(attached_frame, "universe")
+            if attached_pose is None:
+                detail["status"] = "rejected"
+                detail["reject_reason"] = "attached_frame_unresolved"
+                detail["attached_frame_id"] = attached_frame
+                return None, None, None
+            attached_transform = _pose_to_matrix(
+                list(attached_pose["position_m"]),
+                list(attached_pose["orientation_xyzw"]),
+            )
+            local_position, local_orientation = _matrix_to_pose(
+                _multiply_matrices(_invert_matrix(attached_transform), world_transform)
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            detail["status"] = "rejected"
+            detail["reject_reason"] = "attached_pose_transform_failed"
+            detail["error"] = str(exc)
+            return None, None, None
+
+        detail["attached_update_mode"] = "attachment_offset_from_observation"
+        detail["observed_apply_frame_id"] = apply_frame
+        return local_position, local_orientation, attached_frame
+
+    def pose_source_snapshots(self) -> dict[str, dict[str, Any]]:
+        """Return a defensive copy of latest pose-source snapshots."""
+        with self._pose_source_lock:
+            return copy.deepcopy(self._pose_source_snapshots)
+
+    def clear_pose_source_snapshots(self) -> None:
+        """Drop observed source state when the runtime scene changes."""
+        with self._pose_source_lock:
+            self._pose_source_snapshots.clear()
+
+    def apply_pose_source_updates(
+        self,
+        *,
+        policy: str,
+        object_ids: list[str] | None = None,
+        require_idle: bool = False,
+        reason: str = "",
+    ) -> dict[str, Any]:
+        """Apply fresh observed poses to the backend planning scene.
+
+        This is the only Composer-owned bridge from pose-source observations to
+        kernel scene edits. It is deliberately policy-gated and latest-wins:
+        sidecars can provide observations, but the deployment selects which
+        object policies may mutate the planning scene.
+        """
+        if policy not in {
+            "when_idle",
+            "continuous",
+            "continuous_unattached",
+            "before_planning",
+            "between_nodes",
+        }:
+            raise ValueError(f"unsupported pose-source apply policy: {policy}")
+        if self.kernel is None:
+            return {
+                "success": False,
+                "policy": policy,
+                "error": "kernel unavailable",
+                "applied_count": 0,
+                "skipped_count": 0,
+                "rejected_count": 1,
+                "details": [],
+            }
+        cycle_state = self.cycle_manager.state if self.cycle_manager is not None else None
+        if require_idle and cycle_state is not None and cycle_state.value != "idle":
+            return {
+                "success": False,
+                "policy": policy,
+                "error": f"pose-source apply requires idle cycle state, got {cycle_state.value}",
+                "cycle_state": cycle_state.value,
+                "applied_count": 0,
+                "skipped_count": 0,
+                "rejected_count": 1,
+                "details": [],
+            }
+        deployment = self.deployment
+        if deployment is None or not getattr(deployment, "pose_sources", {}):
+            return {
+                "success": True,
+                "policy": policy,
+                "applied_count": 0,
+                "skipped_count": 0,
+                "rejected_count": 0,
+                "details": [],
+            }
+
+        requested_ids = {str(object_id) for object_id in object_ids or [] if str(object_id)}
+        snapshots = self.pose_source_snapshots()
+        details: list[dict[str, Any]] = []
+        applied_count = 0
+        skipped_count = 0
+        rejected_count = 0
+
+        with self.scene_edit_lock:
+            for source_id, source in sorted(deployment.pose_sources.items()):
+                if not source.enabled:
+                    continue
+                snapshot = snapshots.get(source_id, {})
+                snapshot_objects = {
+                    str(item.get("object_id") or ""): item
+                    for item in snapshot.get("objects", [])
+                    if isinstance(item, dict)
+                }
+                for object_id, binding in sorted(source.objects.items()):
+                    if binding.apply_policy != policy:
+                        continue
+                    if requested_ids and object_id not in requested_ids:
+                        continue
+                    observed = snapshot_objects.get(object_id)
+                    detail = {
+                        "source_id": source_id,
+                        "object_id": object_id,
+                        "policy": policy,
+                        "reason": reason,
+                    }
+                    if not observed:
+                        detail["status"] = "skipped"
+                        detail["skip_reason"] = "missing_observation"
+                        skipped_count += 1
+                        details.append(detail)
+                        continue
+                    if policy == "continuous_unattached":
+                        object_state = self.kernel.get_object_state(object_id)
+                        if object_state.attached:
+                            detail["status"] = "skipped"
+                            detail["skip_reason"] = "attached_object"
+                            detail["attached"] = True
+                            detail["attached_frame_id"] = str(object_state.frame_id or "")
+                            skipped_count += 1
+                            details.append(detail)
+                            continue
+                    if observed.get("status") != "fresh":
+                        detail["status"] = "rejected"
+                        detail["reject_reason"] = "not_fresh"
+                        detail["observed_status"] = observed.get("status")
+                        rejected_count += 1
+                        details.append(detail)
+                        continue
+                    age_s = observed.get("age_s")
+                    if age_s is not None and float(age_s) > float(source.stale_after_s):
+                        detail["status"] = "rejected"
+                        detail["reject_reason"] = "stale"
+                        detail["age_s"] = float(age_s)
+                        detail["stale_after_s"] = float(source.stale_after_s)
+                        rejected_count += 1
+                        details.append(detail)
+                        continue
+                    update = observed.get("update")
+                    pose = update.get("pose") if isinstance(update, dict) else None
+                    if not isinstance(pose, dict):
+                        detail["status"] = "rejected"
+                        detail["reject_reason"] = "missing_pose"
+                        rejected_count += 1
+                        details.append(detail)
+                        continue
+                    position = pose.get("position_xyz") or pose.get("positionXYZ")
+                    orientation = pose.get("orientation_xyzw") or pose.get("orientationXYZW")
+                    observed_frame_id = pose.get("frame_id") or pose.get("frameId")
+                    # The deployment binding owns ManyForge planning-frame semantics.
+                    # External providers often report an entity-local/source-native
+                    # frame in their payload; using that frame for scene_edit would
+                    # make an otherwise fresh observation fail to resolve in the
+                    # planning scene. Keep the provider frame as trace metadata and
+                    # apply in the configured object/source frame.
+                    frame_id = binding.frame_id or source.frame_id or observed_frame_id
+                    if (
+                        not isinstance(position, list)
+                        or len(position) != 3
+                        or not isinstance(orientation, list)
+                        or len(orientation) != 4
+                    ):
+                        detail["status"] = "rejected"
+                        detail["reject_reason"] = "malformed_pose"
+                        rejected_count += 1
+                        details.append(detail)
+                        continue
+                    edit_position, edit_orientation, edit_frame_id = (
+                        self._pose_source_scene_edit_pose(
+                            object_id=object_id,
+                            position=[float(value) for value in position],
+                            orientation=[float(value) for value in orientation],
+                            frame_id=str(frame_id or "universe"),
+                            detail=detail,
+                        )
+                    )
+                    if edit_position is None or edit_orientation is None or edit_frame_id is None:
+                        rejected_count += 1
+                        details.append(detail)
+                        continue
+                    result = self.kernel.scene_edit(
+                        SceneEditRequest(
+                            operation="update_pose",
+                            object_id=object_id,
+                            pose_position_m=edit_position,
+                            pose_orientation_xyzw=edit_orientation,
+                            frame_id=edit_frame_id,
+                        )
+                    )
+                    if not result.success:
+                        detail["status"] = "rejected"
+                        detail["reject_reason"] = "scene_edit_failed"
+                        detail["error"] = result.error
+                        detail["frame_id"] = edit_frame_id
+                        if observed_frame_id:
+                            detail["observed_frame_id"] = str(observed_frame_id)
+                        rejected_count += 1
+                        details.append(detail)
+                        continue
+                    detail["status"] = "applied"
+                    detail["frame_id"] = edit_frame_id
+                    if observed_frame_id:
+                        detail["observed_frame_id"] = str(observed_frame_id)
+                    applied_count += 1
+                    details.append(detail)
+
+        required_missing = [
+            object_id
+            for object_id in requested_ids
+            if not any(
+                detail["object_id"] == object_id
+                and (
+                    detail["status"] == "applied"
+                    or (
+                        policy == "continuous_unattached"
+                        and detail["status"] == "skipped"
+                        and detail.get("skip_reason") == "attached_object"
+                    )
+                )
+                for detail in details
+            )
+            and any(
+                binding.object_id == object_id and binding.apply_policy == policy
+                for source in deployment.pose_sources.values()
+                for binding in source.objects.values()
+            )
+        ]
+        success = rejected_count == 0 and not required_missing
+        error = None
+        if required_missing:
+            error = f"no fresh pose-source update for: {', '.join(sorted(required_missing))}"
+        elif rejected_count:
+            error = "one or more pose-source updates were rejected"
+
+        event_details = {
+            "policy": policy,
+            "reason": reason,
+            "object_ids": sorted(requested_ids),
+            "applied_count": applied_count,
+            "skipped_count": skipped_count,
+            "rejected_count": rejected_count,
+            "required_missing": sorted(required_missing),
+            "success": success,
+            "details": copy.deepcopy(details),
+        }
+        try:
+            self.event_recorder.record_pose_source_event(
+                "applied" if success else "apply_failed",
+                details=event_details,
+            )
+        except Exception:
+            logger.debug("pose-source event recording failed", exc_info=True)
+
+        return {
+            "success": success,
+            "policy": policy,
+            "error": error,
+            "applied_count": applied_count,
+            "skipped_count": skipped_count,
+            "rejected_count": rejected_count,
+            "details": details,
+        }
+
+    def enqueue_pose_source_apply(
+        self,
+        *,
+        policy: str,
+        object_ids: list[str] | None = None,
+        require_idle: bool = False,
+        reason: str = "",
+    ) -> dict[str, Any]:
+        """Queue a latest-wins continuous pose-source scene apply.
+
+        Continuous pose-source snapshots can arrive while trajectory validation
+        owns the planner scene. Applying inside the HTTP request path makes
+        provider requests pile up behind the same native scene lock and can
+        starve viewer polling. This worker keeps only the newest apply request
+        and runs the existing audited apply path on one background thread.
+        """
+        if policy not in {"continuous", "continuous_unattached"}:
+            raise ValueError(
+                "enqueue_pose_source_apply is only for continuous pose-source policies"
+            )
+        request = {
+            "policy": policy,
+            "object_ids": list(object_ids or []),
+            "require_idle": bool(require_idle),
+            "reason": reason,
+        }
+        with self._pose_source_apply_lock:
+            coalesced = policy in self._pose_source_apply_pending
+            if coalesced:
+                existing = self._pose_source_apply_pending[policy]
+                existing_ids = {
+                    str(object_id)
+                    for object_id in existing.get("object_ids", [])
+                    if object_id
+                }
+                new_ids = {
+                    str(object_id)
+                    for object_id in request.get("object_ids", [])
+                    if object_id
+                }
+                existing["object_ids"] = sorted(existing_ids | new_ids)
+                existing["require_idle"] = bool(
+                    existing.get("require_idle") or request["require_idle"]
+                )
+                existing["reason"] = request["reason"] or existing.get("reason", "")
+            else:
+                self._pose_source_apply_pending[policy] = request
+            started_worker = False
+            if not self._pose_source_apply_running:
+                self._pose_source_apply_running = True
+                threading.Thread(
+                    target=self._pose_source_apply_worker,
+                    name="manyforge_pose_source_apply",
+                    daemon=True,
+                ).start()
+                started_worker = True
+            last_result = copy.deepcopy(self._pose_source_apply_last_result)
+        return {
+            "success": True,
+            "policy": policy,
+            "queued": True,
+            "started_worker": started_worker,
+            "coalesced_pending": coalesced,
+            "object_ids": list(object_ids or []),
+            "last_result": last_result,
+        }
+
+    def _pose_source_apply_worker(self) -> None:
+        while True:
+            with self._pose_source_apply_lock:
+                if not self._pose_source_apply_pending:
+                    self._pose_source_apply_running = False
+                    return
+                policy = sorted(self._pose_source_apply_pending)[0]
+                request = self._pose_source_apply_pending.pop(policy)
+            started = time.monotonic()
+            try:
+                result = self.apply_pose_source_updates(**request)
+            except Exception as exc:  # pragma: no cover - defensive worker guard
+                result = {
+                    "success": False,
+                    "policy": request.get("policy"),
+                    "error": str(exc),
+                    "applied_count": 0,
+                    "skipped_count": 0,
+                    "rejected_count": 1,
+                    "details": [],
+                }
+            duration_ms = (time.monotonic() - started) * 1000.0
+            result["duration_ms"] = round(duration_ms, 1)
+            result["queued_worker"] = True
+            with self._pose_source_apply_lock:
+                self._pose_source_apply_last_result = copy.deepcopy(result)
+            if duration_ms >= 100.0:
+                logger.warning(
+                    "pose-source apply worker slow: policy=%s objects=%s "
+                    "duration_ms=%.1f success=%s",
+                    request.get("policy"),
+                    request.get("object_ids"),
+                    duration_ms,
+                    result.get("success", False),
+                )
+            if not result.get("success", False):
+                logger.warning(
+                    "pose-source apply worker failed: policy=%s objects=%s error=%s",
+                    request.get("policy"),
+                    request.get("object_ids"),
+                    result.get("error"),
+                )
+
+    def apply_pose_sources_before_planning(
+        self,
+        *,
+        object_ids: list[str] | None = None,
+        reason: str = "",
+    ) -> dict[str, Any]:
+        """Apply `before_planning` source updates at the BT latch point."""
+        return self.apply_pose_source_updates(
+            policy="before_planning",
+            object_ids=object_ids,
+            require_idle=False,
+            reason=reason or "before_planning",
+        )
+
+    def apply_pose_sources_between_nodes(
+        self,
+        *,
+        object_ids: list[str] | None = None,
+        reason: str = "",
+    ) -> dict[str, Any]:
+        """Apply `between_nodes` source updates at a BT safe point."""
+        return self.apply_pose_source_updates(
+            policy="between_nodes",
+            object_ids=object_ids,
+            require_idle=False,
+            reason=reason or "between_nodes",
+        )
 
     def external_runtime_statuses(self, *, max_age_s: float = 5.0) -> dict[str, dict[str, Any]]:
         """Return fresh external runtime status contributions keyed by provider."""

@@ -10,6 +10,7 @@
 #include <iostream>
 #include <map>
 #include <sstream>
+#include <thread>
 
 #include <roboplan/core/scene_utils.hpp>
 #include <stdexcept>
@@ -347,6 +348,11 @@ core::ValidationResultDTO RoboPlanPlanningContext::validate_trajectory(
           }
         }
       }
+      // Collision validation can run across many waypoints and each waypoint
+      // needs the non-reentrant RoboPlan/Pinocchio scene. Yield between
+      // waypoint checks so observer FK and scene-state reads are not starved
+      // behind a tight validation loop for the full validation duration.
+      std::this_thread::yield();
 
       if (!waypoint_in_collision) {
         if (i > 0) {
@@ -516,6 +522,47 @@ core::Pose3DTO RoboPlanPlanningContext::forward_kinematics(
   const Eigen::Matrix4d t_robot_base_requested_base =
       scene_->forwardKinematics(q, request.base_frame);
   return matrix_to_pose(t_robot_base_requested_base.inverse() * t_robot_base_target);
+}
+
+std::map<std::string, core::Pose3DTO>
+RoboPlanPlanningContext::forward_kinematics_batch(
+    const core::RobotStateDTO& robot_state,
+    const std::vector<std::string>& target_frames,
+    const std::string& base_frame) {
+  std::map<std::string, core::Pose3DTO> result;
+  if (target_frames.empty()) {
+    return result;
+  }
+
+  std::lock_guard<std::mutex> scene_lock(*scene_mutex_);
+  Eigen::VectorXd q = vector_from_std(robot_state.positions_rad);
+  if (q.size() != scene_->getCurrentJointPositions().size()) {
+    q = scene_->toFullJointPositions(group_name_, q);
+  }
+
+  Eigen::Matrix4d t_requested_base_robot_base = Eigen::Matrix4d::Identity();
+  if (is_world_frame(base_frame)) {
+    t_requested_base_robot_base = world_from_robot_base_;
+  } else {
+    const Eigen::Matrix4d t_robot_base_requested_base =
+        scene_->forwardKinematics(q, base_frame);
+    t_requested_base_robot_base = t_robot_base_requested_base.inverse();
+  }
+
+  for (const auto& target_frame : target_frames) {
+    try {
+      const Eigen::Matrix4d t_robot_base_target =
+          is_world_frame(target_frame)
+              ? Eigen::Matrix4d::Identity()
+              : scene_->forwardKinematics(q, target_frame);
+      result[target_frame] =
+          matrix_to_pose(t_requested_base_robot_base * t_robot_base_target);
+    } catch (...) {
+      // Keep observer reads best-effort: one unresolved visual link must not
+      // fail the entire native viewer update.
+    }
+  }
+  return result;
 }
 
 core::Pose3DTO RoboPlanPlanningContext::get_object_pose(

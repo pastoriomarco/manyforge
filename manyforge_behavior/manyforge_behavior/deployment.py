@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import math
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -99,6 +100,40 @@ class InterruptSource:
     description: str = ""
 
 
+@dataclass(frozen=True)
+class PoseSourceObjectBinding:
+    """Deployment binding from an external pose source to a scene object."""
+
+    object_id: str
+    apply_policy: str = "observe_only"
+    entity: str = ""
+    frame_id: str = ""
+    confidence_min: Optional[float] = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class PoseSourceConfig:
+    """Contract-only pose source declaration.
+
+    Runtime sidecars consume these declarations in later slices. The
+    deployment loader validates authority and shape now so malformed
+    deployments fail closed before any source can mutate or observe scene
+    state.
+    """
+
+    source_id: str
+    kind: str
+    enabled: bool = True
+    max_update_hz: float = 4.0
+    stale_after_s: float = 1.0
+    frame_id: str = ""
+    service_prefix: str = "auto"
+    topic: str = ""
+    description: str = ""
+    objects: dict[str, PoseSourceObjectBinding] = field(default_factory=dict)
+
+
 @dataclass
 class AuthorityDomain:
     owner: str
@@ -119,6 +154,21 @@ class DeploymentValidationError(Exception):
 
 _ALLOWED_HASH_ALGORITHMS = {"sha256", "sha384", "sha512"}
 _ALLOWED_INTERRUPT_KINDS = {"edge", "level"}
+_ALLOWED_POSE_SOURCE_KINDS = {
+    "simulation_interfaces",
+    "pose_stamped_topic",
+    "pose_array_topic",
+    "detection3d_array_topic",
+    "tf",
+}
+_ALLOWED_POSE_SOURCE_APPLY_POLICIES = {
+    "observe_only",
+    "when_idle",
+    "continuous",
+    "continuous_unattached",
+    "before_planning",
+    "between_nodes",
+}
 _ALLOWED_GRIPPER_COMMAND_MODES = {
     "simulated_joint",
     "ros_gripper_command",
@@ -309,6 +359,7 @@ class Deployment:
         self.orchestrator: Optional[OrchestratorConfig] = None
         self.launch: Optional[LaunchConfig] = None
         self.interrupt_sources: dict[str, InterruptSource] = {}
+        self.pose_sources: dict[str, PoseSourceConfig] = {}
         self.authority_matrix: dict[str, AuthorityDomain] = {}
         self.model_audit_policy: Optional[ModelAuditPolicy] = None
         self.model_endpoint_profile_registry: Optional[str] = None
@@ -343,6 +394,7 @@ class Deployment:
         self.orchestrator = None
         self.launch = None
         self.interrupt_sources = {}
+        self.pose_sources = {}
         self.authority_matrix = {}
         self.model_audit_policy = None
         self.model_endpoint_profile_registry = None
@@ -556,6 +608,178 @@ class Deployment:
             )
         return parsed
 
+    def _parse_pose_sources(
+        self,
+        pose_sources_data: list[dict[str, Any]] | None,
+    ) -> dict[str, PoseSourceConfig]:
+        if pose_sources_data is None:
+            return {}
+        if not isinstance(pose_sources_data, list):
+            raise DeploymentValidationError("pose_sources must be a list")
+
+        def get_alias(data: dict[str, Any], snake: str, camel: str, default: Any) -> Any:
+            if snake in data:
+                return data[snake]
+            if camel in data:
+                return data[camel]
+            return default
+
+        parsed: dict[str, PoseSourceConfig] = {}
+        object_writers: dict[str, str] = {}
+        for index, source_data in enumerate(pose_sources_data):
+            field_path = f"pose_sources[{index}]"
+            if not isinstance(source_data, dict):
+                raise DeploymentValidationError(f"{field_path} must be a mapping")
+
+            source_id_raw = source_data.get("id")
+            if not isinstance(source_id_raw, str) or not source_id_raw.strip():
+                raise DeploymentValidationError(f"{field_path}.id is required")
+            source_id = source_id_raw.strip()
+            if source_id in parsed:
+                raise DeploymentValidationError(
+                    f"pose_sources id '{source_id}' is declared more than once"
+                )
+
+            kind_raw = source_data.get("kind")
+            if not isinstance(kind_raw, str):
+                raise DeploymentValidationError(
+                    f"{field_path}.kind must be a string"
+                )
+            kind = kind_raw.strip()
+            if kind not in _ALLOWED_POSE_SOURCE_KINDS:
+                allowed = ", ".join(sorted(_ALLOWED_POSE_SOURCE_KINDS))
+                raise DeploymentValidationError(
+                    f"{field_path}.kind must be one of: {allowed}"
+                )
+
+            enabled = source_data.get("enabled", True)
+            if not isinstance(enabled, bool):
+                raise DeploymentValidationError(
+                    f"{field_path}.enabled must be a boolean"
+                )
+
+            max_update_hz = self._parse_positive_float(
+                get_alias(source_data, "max_update_hz", "maxUpdateHz", 4.0),
+                f"{field_path}.max_update_hz",
+            )
+            stale_after_s = self._parse_positive_float(
+                get_alias(source_data, "stale_after_s", "staleAfterS", 1.0),
+                f"{field_path}.stale_after_s",
+            )
+
+            frame_id = self._parse_optional_text(
+                get_alias(source_data, "frame_id", "frameId", ""),
+                f"{field_path}.frame_id",
+            )
+            service_prefix = self._parse_optional_text(
+                get_alias(source_data, "service_prefix", "servicePrefix", "auto"),
+                f"{field_path}.service_prefix",
+            )
+            topic = self._parse_optional_text(
+                source_data.get("topic", ""),
+                f"{field_path}.topic",
+            )
+            description = str(source_data.get("description", ""))
+
+            objects_data = source_data.get("objects", {})
+            if not isinstance(objects_data, dict) or not objects_data:
+                raise DeploymentValidationError(
+                    f"{field_path}.objects must be a non-empty mapping"
+                )
+            objects: dict[str, PoseSourceObjectBinding] = {}
+            for object_id_raw, object_data in objects_data.items():
+                if not isinstance(object_id_raw, str) or not object_id_raw.strip():
+                    raise DeploymentValidationError(
+                        f"{field_path}.objects keys must be non-empty strings"
+                    )
+                object_id = object_id_raw.strip()
+                object_path = f"{field_path}.objects.{object_id}"
+                if not isinstance(object_data, dict):
+                    raise DeploymentValidationError(f"{object_path} must be a mapping")
+
+                apply_policy = self._parse_optional_text(
+                    get_alias(object_data, "apply_policy", "applyPolicy", "observe_only"),
+                    f"{object_path}.apply_policy",
+                )
+                if apply_policy not in _ALLOWED_POSE_SOURCE_APPLY_POLICIES:
+                    allowed = ", ".join(sorted(_ALLOWED_POSE_SOURCE_APPLY_POLICIES))
+                    raise DeploymentValidationError(
+                        f"{object_path}.apply_policy must be one of: {allowed}"
+                    )
+
+                previous_writer = object_writers.get(object_id)
+                if previous_writer is not None:
+                    raise DeploymentValidationError(
+                        "pose_sources declare multiple write authorities for "
+                        f"object '{object_id}': '{previous_writer}' and '{source_id}'"
+                    )
+                object_writers[object_id] = source_id
+
+                confidence_raw = get_alias(object_data, "confidence_min", "confidenceMin", None)
+                confidence_min: Optional[float] = None
+                if confidence_raw is not None:
+                    confidence_min = self._parse_bounded_float(
+                        confidence_raw,
+                        f"{object_path}.confidence_min",
+                        minimum=0.0,
+                        maximum=1.0,
+                    )
+
+                metadata = object_data.get("metadata", {})
+                if metadata is None:
+                    metadata = {}
+                if not isinstance(metadata, dict):
+                    raise DeploymentValidationError(
+                        f"{object_path}.metadata must be a mapping"
+                    )
+
+                entity = self._parse_optional_text(
+                    object_data.get("entity", ""),
+                    f"{object_path}.entity",
+                )
+                if kind == "simulation_interfaces" and not entity:
+                    raise DeploymentValidationError(
+                        f"{object_path}.entity is required for simulation_interfaces"
+                    )
+                binding_frame_id = self._parse_optional_text(
+                    get_alias(object_data, "frame_id", "frameId", ""),
+                    f"{object_path}.frame_id",
+                )
+
+                objects[object_id] = PoseSourceObjectBinding(
+                    object_id=object_id,
+                    apply_policy=apply_policy,
+                    entity=entity,
+                    frame_id=binding_frame_id,
+                    confidence_min=confidence_min,
+                    metadata=dict(metadata),
+                )
+
+            if kind == "simulation_interfaces" and not service_prefix:
+                raise DeploymentValidationError(
+                    f"{field_path}.service_prefix must be non-empty"
+                )
+            if kind in {
+                "pose_stamped_topic",
+                "pose_array_topic",
+                "detection3d_array_topic",
+            } and not topic:
+                raise DeploymentValidationError(f"{field_path}.topic is required")
+
+            parsed[source_id] = PoseSourceConfig(
+                source_id=source_id,
+                kind=kind,
+                enabled=enabled,
+                max_update_hz=max_update_hz,
+                stale_after_s=stale_after_s,
+                frame_id=frame_id,
+                service_prefix=service_prefix or "auto",
+                topic=topic,
+                description=description,
+                objects=objects,
+            )
+        return parsed
+
     def _parse_grippers(
         self,
         grippers_data: dict[str, Any] | None,
@@ -760,6 +984,13 @@ class Deployment:
             raise DeploymentValidationError(f"{field_path} must be a string")
         return value.strip()
 
+    def _parse_optional_text(self, value: Any, field_path: str) -> str:
+        if value is None:
+            return ""
+        if not isinstance(value, str):
+            raise DeploymentValidationError(f"{field_path} must be a string")
+        return value.strip()
+
     def _parse_positive_float(self, value: Any, field_path: str) -> float:
         if isinstance(value, bool):
             raise DeploymentValidationError(f"{field_path} must be a number > 0")
@@ -767,8 +998,32 @@ class Deployment:
             parsed = float(value)
         except (TypeError, ValueError) as exc:
             raise DeploymentValidationError(f"{field_path} must be a number > 0") from exc
-        if parsed <= 0.0:
+        if not math.isfinite(parsed) or parsed <= 0.0:
             raise DeploymentValidationError(f"{field_path} must be a number > 0")
+        return parsed
+
+    def _parse_bounded_float(
+        self,
+        value: Any,
+        field_path: str,
+        *,
+        minimum: float,
+        maximum: float,
+    ) -> float:
+        if isinstance(value, bool):
+            raise DeploymentValidationError(
+                f"{field_path} must be a number between {minimum} and {maximum}"
+            )
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError) as exc:
+            raise DeploymentValidationError(
+                f"{field_path} must be a number between {minimum} and {maximum}"
+            ) from exc
+        if not math.isfinite(parsed) or parsed < minimum or parsed > maximum:
+            raise DeploymentValidationError(
+                f"{field_path} must be a number between {minimum} and {maximum}"
+            )
         return parsed
 
     def _parse_positive_int(self, value: Any, field_path: str) -> int:
@@ -1376,6 +1631,7 @@ class Deployment:
         self.orchestrator = None
         self.launch = None
         self.interrupt_sources = {}
+        self.pose_sources = {}
         self.authority_matrix = {}
         self.model_audit_policy = None
         self.model_endpoint_profile_registry = None
@@ -1499,6 +1755,9 @@ class Deployment:
         # Interrupt sources (optional)
         interrupt_sources_data = data.get("interrupt_sources", {})
         self.interrupt_sources = self._parse_interrupt_sources(interrupt_sources_data)
+
+        # Object pose sources (optional, contract-only in this slice)
+        self.pose_sources = self._parse_pose_sources(data.get("pose_sources"))
 
         # Authority matrix (optional)
         authority_matrix_data = data.get("authority_matrix", {})
@@ -1961,6 +2220,39 @@ class Deployment:
                 }
                 for source_id, source in self.interrupt_sources.items()
             }
+        if self.pose_sources:
+            d["pose_sources"] = []
+            for source in self.pose_sources.values():
+                source_d: dict[str, Any] = {
+                    "id": source.source_id,
+                    "kind": source.kind,
+                    "enabled": source.enabled,
+                    "max_update_hz": source.max_update_hz,
+                    "stale_after_s": source.stale_after_s,
+                    "objects": {},
+                }
+                if source.frame_id:
+                    source_d["frame_id"] = source.frame_id
+                if source.service_prefix != "auto":
+                    source_d["service_prefix"] = source.service_prefix
+                if source.topic:
+                    source_d["topic"] = source.topic
+                if source.description:
+                    source_d["description"] = source.description
+                for object_id, binding in source.objects.items():
+                    binding_d: dict[str, Any] = {
+                        "apply_policy": binding.apply_policy,
+                    }
+                    if binding.entity:
+                        binding_d["entity"] = binding.entity
+                    if binding.frame_id:
+                        binding_d["frame_id"] = binding.frame_id
+                    if binding.confidence_min is not None:
+                        binding_d["confidence_min"] = binding.confidence_min
+                    if binding.metadata:
+                        binding_d["metadata"] = dict(binding.metadata)
+                    source_d["objects"][object_id] = binding_d
+                d["pose_sources"].append(source_d)
         if self.authority_matrix:
             d["authority_matrix"] = {
                 domain: {
@@ -2153,6 +2445,8 @@ class Deployment:
                     ),
                 }
             self.interrupt_sources = self._parse_interrupt_sources(merged_sources)
+        if "pose_sources" in data:
+            self.pose_sources = self._parse_pose_sources(data["pose_sources"])
         if "authority_matrix" in data:
             merged_matrix = {
                 domain: {

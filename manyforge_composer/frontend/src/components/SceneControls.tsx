@@ -3,7 +3,11 @@ import { useMemo, useState } from 'react';
 import { api } from '../api/client';
 import { useSceneStateStore } from '../store/sceneStateStore';
 import { useViewerSelectionStore } from '../store/viewerSelectionStore';
-import type { SceneFrameState, SceneObjectState } from '../types/api';
+import type {
+  PoseSourceStatusState,
+  SceneFrameState,
+  SceneObjectState,
+} from '../types/api';
 
 /**
  * Viser-parity controls for the native viewer (Day 4): frame axis
@@ -23,6 +27,9 @@ interface SceneControlsProps {
 export function SceneControls({ onClose }: SceneControlsProps) {
   const frames = useSceneStateStore((s) => s.frames);
   const objects = useSceneStateStore((s) => s.scene?.objects ?? EMPTY_OBJECTS);
+  const poseSources = useSceneStateStore(
+    (s) => s.scene?.pose_sources ?? EMPTY_POSE_SOURCES,
+  );
   const objectAxesGizmoSize = useSceneStateStore(
     (s) => s.scene?.object_axes_gizmo_size_m ?? 0.1,
   );
@@ -57,6 +64,9 @@ export function SceneControls({ onClose }: SceneControlsProps) {
         <SectionTab id="tree" current={openSection} onClick={setOpenSection}>
           Tree
         </SectionTab>
+        <SectionTab id="sources" current={openSection} onClick={setOpenSection}>
+          Sources
+        </SectionTab>
       </div>
       <div className="flex-1 overflow-y-auto bg-gray-950/50 p-2">
         {openSection === 'frames' && (
@@ -77,15 +87,17 @@ export function SceneControls({ onClose }: SceneControlsProps) {
             lockedIds={lockedIds}
           />
         )}
+        {openSection === 'sources' && <PoseSourcesSection sources={poseSources} />}
       </div>
     </div>
   );
 }
 
-type Section = 'frames' | 'objects' | 'tree';
+type Section = 'frames' | 'objects' | 'tree' | 'sources';
 
 const EMPTY_FRAMES: SceneFrameState[] = [];
 const EMPTY_OBJECTS: SceneObjectState[] = [];
+const EMPTY_POSE_SOURCES: PoseSourceStatusState[] = [];
 
 function SectionTab({
   id,
@@ -353,5 +365,131 @@ function TreeObjectRow({
         {locked && <span className="ml-1 text-[10px] text-orange-400">🔒</span>}
       </button>
     </li>
+  );
+}
+
+function PoseSourcesSection({ sources }: { sources: PoseSourceStatusState[] }) {
+  const [applyState, setApplyState] = useState<
+    { status: 'idle' | 'applying' | 'ok' | 'error'; message: string }
+  >({ status: 'idle', message: '' });
+  const measuredStateGhostVisible = useViewerSelectionStore(
+    (s) => s.measuredStateGhostVisible,
+  );
+  const setMeasuredStateGhostVisible = useViewerSelectionStore(
+    (s) => s.setMeasuredStateGhostVisible,
+  );
+
+  if (sources.length === 0) {
+    return (
+      <div className="text-[11px] italic text-gray-500">
+        No pose sources declared in deployment.
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-3">
+      <div className="rounded border border-cyan-800/60 bg-cyan-950/20 p-2">
+        <label className="flex items-center gap-2 text-[11px] text-gray-200">
+          <input
+            type="checkbox"
+            checked={measuredStateGhostVisible}
+            onChange={(event) => setMeasuredStateGhostVisible(event.target.checked)}
+          />
+          <span>Measured-state ghost</span>
+        </label>
+        <div className="mt-1 text-[10px] leading-snug text-gray-500">
+          Shows fresh external object observations as a cyan translucent overlay.
+          Composer's planning scene remains the authoritative state.
+        </div>
+      </div>
+      <div className="rounded border border-gray-800 bg-gray-950/50 p-2">
+        <button
+          type="button"
+          disabled={applyState.status === 'applying'}
+          onClick={async () => {
+            setApplyState({ status: 'applying', message: 'Applying idle-safe updates...' });
+            try {
+              const result = await api.scene.applyPoseSources('when_idle');
+              await useSceneStateStore.getState().refresh();
+              setApplyState({
+                status: 'ok',
+                message: `Applied ${result.applied_count}, skipped ${result.skipped_count}.`,
+              });
+            } catch (error) {
+              setApplyState({
+                status: 'error',
+                message: error instanceof Error ? error.message : 'Pose-source apply failed',
+              });
+            }
+          }}
+          className="w-full rounded border border-gray-600 px-2 py-1 text-[11px] text-gray-200 hover:bg-gray-800 disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          Apply when-idle updates
+        </button>
+        {applyState.message && (
+          <div
+            className={`mt-1 text-[10px] ${
+              applyState.status === 'error' ? 'text-red-300' : 'text-gray-400'
+            }`}
+          >
+            {applyState.message}
+          </div>
+        )}
+      </div>
+      {sources.map((source) => (
+        <div key={source.pose_source_id} className="space-y-1">
+          <div className="flex items-center justify-between gap-2">
+            <div className="min-w-0 truncate font-mono text-[11px] text-gray-200">
+              {source.pose_source_id}
+            </div>
+            <StatusPill status={source.status} />
+          </div>
+          <div className="truncate text-[10px] text-gray-500">
+            {source.kind} · max {source.max_update_hz.toFixed(1)} Hz · stale{' '}
+            {source.stale_after_s.toFixed(2)} s
+          </div>
+          <ul className="ml-2 space-y-0.5">
+            {source.objects.map((objectState) => (
+              <li key={objectState.object_id} className="flex items-center gap-2 text-[11px]">
+                <span className="min-w-0 flex-1 truncate font-mono text-gray-300">
+                  {objectState.object_id}
+                </span>
+                <span className="truncate text-[10px] text-gray-500">
+                  {objectState.apply_policy}
+                </span>
+                <StatusPill status={objectState.status} compact />
+              </li>
+            ))}
+          </ul>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function StatusPill({
+  status,
+  compact = false,
+}: {
+  status: string;
+  compact?: boolean;
+}) {
+  const color =
+    status === 'fresh'
+      ? 'border-emerald-500/50 bg-emerald-950/80 text-emerald-300'
+      : status === 'stale'
+        ? 'border-amber-500/50 bg-amber-950/80 text-amber-300'
+        : status === 'rejected'
+          ? 'border-red-500/50 bg-red-950/80 text-red-300'
+          : 'border-gray-600 bg-gray-900 text-gray-400';
+  return (
+    <span
+      className={`shrink-0 rounded border px-1.5 py-0.5 uppercase tracking-wide ${color} ${
+        compact ? 'text-[9px]' : 'text-[10px]'
+      }`}
+    >
+      {status}
+    </span>
   );
 }

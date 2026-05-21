@@ -732,6 +732,31 @@ class AuthorityDomainResponse(BaseModel):
     description: str = ""
 
 
+class PoseSourceObjectBindingConfigResponse(BaseModel):
+    model_config = _ALIAS_CFG
+    entity: str = ""
+    frame_id: str = Field(default="", alias="frameId")
+    apply_policy: str = Field(default="observe_only", alias="applyPolicy")
+    confidence_min: Optional[float] = Field(default=None, alias="confidenceMin")
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class PoseSourceConfigResponse(BaseModel):
+    model_config = _ALIAS_CFG
+    id: str
+    kind: str
+    enabled: bool = True
+    max_update_hz: float = Field(default=4.0, alias="maxUpdateHz")
+    stale_after_s: float = Field(default=1.0, alias="staleAfterS")
+    frame_id: str = Field(default="", alias="frameId")
+    service_prefix: str = Field(default="auto", alias="servicePrefix")
+    topic: str = ""
+    description: str = ""
+    objects: Dict[str, PoseSourceObjectBindingConfigResponse] = Field(
+        default_factory=dict
+    )
+
+
 class FullDeploymentResponse(BaseModel):
     model_config = _ALIAS_CFG
     api_version: str = Field(alias="apiVersion")
@@ -776,6 +801,10 @@ class FullDeploymentResponse(BaseModel):
     authority_matrix: Dict[str, AuthorityDomainResponse] = Field(
         default_factory=dict,
         alias="authorityMatrix",
+    )
+    pose_sources: List[PoseSourceConfigResponse] = Field(
+        default_factory=list,
+        alias="poseSources",
     )
     source_path: str = Field(alias="sourcePath", default="")
 
@@ -826,6 +855,10 @@ class UpdateDeploymentRequest(BaseModel):
     authority_matrix: Optional[Dict[str, Dict[str, Any]]] = Field(
         None,
         alias="authorityMatrix",
+    )
+    pose_sources: Optional[List[Dict[str, Any]]] = Field(
+        None,
+        alias="poseSources",
     )
 
 
@@ -934,11 +967,96 @@ class SceneGripperStateResponse(BaseModel):
     error: Optional[str] = None
 
 
+class PoseSourcePoseResponse(BaseModel):
+    model_config = _ALIAS_CFG
+    frame_id: str = Field(alias="frameId")
+    stamp_sec: Optional[float] = Field(default=None, alias="stampSec")
+    position_xyz: List[float] = Field(alias="positionXYZ")
+    orientation_xyzw: List[float] = Field(alias="orientationXYZW")
+
+
+class PoseSourceUpdateResponse(BaseModel):
+    model_config = _ALIAS_CFG
+    pose_source_id: str = Field(alias="poseSourceId")
+    object_id: str = Field(alias="objectId")
+    entity: str = ""
+    monotonic_s: float = Field(alias="monotonicS")
+    apply_policy: str = Field(default="observe_only", alias="applyPolicy")
+    pose: PoseSourcePoseResponse
+
+
+class PoseSourceRejectionResponse(BaseModel):
+    model_config = _ALIAS_CFG
+    pose_source_id: str = Field(alias="poseSourceId")
+    object_id: str = Field(alias="objectId")
+    entity: str = ""
+    reason: str
+    detail: str = ""
+    monotonic_s: float = Field(alias="monotonicS")
+
+
+class PoseSourceObjectStateResponse(BaseModel):
+    model_config = _ALIAS_CFG
+    object_id: str = Field(alias="objectId")
+    entity: str = ""
+    frame_id: str = Field(default="", alias="frameId")
+    apply_policy: str = Field(default="observe_only", alias="applyPolicy")
+    status: str
+    age_s: Optional[float] = Field(default=None, alias="ageS")
+    update: Optional[PoseSourceUpdateResponse] = None
+    rejection: Optional[PoseSourceRejectionResponse] = None
+
+
+class PoseSourceStatusResponse(BaseModel):
+    model_config = _ALIAS_CFG
+    pose_source_id: str = Field(alias="poseSourceId")
+    kind: str
+    enabled: bool = True
+    status: str
+    max_update_hz: float = Field(alias="maxUpdateHz")
+    stale_after_s: float = Field(alias="staleAfterS")
+    frame_id: str = Field(default="", alias="frameId")
+    description: str = ""
+    received_at_ns: Optional[int] = Field(default=None, alias="receivedAtNs")
+    objects: List[PoseSourceObjectStateResponse] = Field(default_factory=list)
+
+
+class PoseSourceSnapshotRequest(BaseModel):
+    model_config = _ALIAS_CFG
+    pose_source_id: str = Field(alias="poseSourceId")
+    status: str
+    monotonic_s: float = Field(alias="monotonicS")
+    objects: List[PoseSourceObjectStateResponse] = Field(default_factory=list)
+
+
+class PoseSourceApplyRequest(BaseModel):
+    model_config = _ALIAS_CFG
+    policy: Literal[
+        "when_idle",
+        "continuous",
+        "continuous_unattached",
+        "before_planning",
+        "between_nodes",
+    ] = "when_idle"
+    object_ids: List[str] = Field(default_factory=list, alias="objectIds")
+
+
+class PoseSourceApplyResponse(BaseModel):
+    policy: str
+    success: bool
+    error: Optional[str] = None
+    applied_count: int
+    skipped_count: int
+    rejected_count: int
+    details: List[Dict[str, Any]] = Field(default_factory=list)
+
+
 class SceneStateResponse(BaseModel):
     robot: Optional[SceneRobotResponse] = None
     objects: List[SceneObjectResponse] = Field(default_factory=list)
     link_poses: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
     grippers: List[SceneGripperStateResponse] = Field(default_factory=list)
+    pose_sources: List[PoseSourceStatusResponse] = Field(default_factory=list)
     object_axes_gizmo_size_m: float = 0.1
     timestamp_ns: int
 

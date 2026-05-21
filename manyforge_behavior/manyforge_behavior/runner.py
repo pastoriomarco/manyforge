@@ -98,6 +98,12 @@ class OrchestratorRunner:
         scene_snapshot_url_publisher: Optional[
             Callable[..., Optional[dict[str, Any]]]
         ] = None,
+        pose_source_apply_callback: Optional[
+            Callable[..., dict[str, Any]]
+        ] = None,
+        pose_source_between_nodes_callback: Optional[
+            Callable[..., dict[str, Any]]
+        ] = None,
     ):
         self._catalog_path = catalog_path
         self._program_path = program_path
@@ -116,6 +122,8 @@ class OrchestratorRunner:
         self._event_recorder = event_recorder
         self._scene_snapshot_provider = scene_snapshot_provider
         self._scene_snapshot_url_publisher = scene_snapshot_url_publisher
+        self._pose_source_apply_callback = pose_source_apply_callback
+        self._pose_source_between_nodes_callback = pose_source_between_nodes_callback
         self._motion_coordinator = MotionExecutionCoordinator(kernel)
         # Intervention context — set by cycle_manager before building
         # intervention subtrees so nodes like QueryModelNode can attribute
@@ -225,6 +233,16 @@ class OrchestratorRunner:
         bb.stop_requested = False
         bb.register_key(key="velocity_scale", access=py_trees.common.Access.WRITE)
         bb.velocity_scale = 1.0
+        bb.register_key(
+            key="pose_source_apply_callback",
+            access=py_trees.common.Access.WRITE,
+        )
+        bb.pose_source_apply_callback = self._pose_source_apply_callback
+        bb.register_key(
+            key="pose_source_between_nodes_callback",
+            access=py_trees.common.Access.WRITE,
+        )
+        bb.pose_source_between_nodes_callback = self._pose_source_between_nodes_callback
 
         self._tree = tree
         return tree

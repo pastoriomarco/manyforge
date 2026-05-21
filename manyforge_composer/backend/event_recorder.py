@@ -42,6 +42,7 @@ _ALLOWED_EVENT_PREFIXES = (
     "intervention_",
     "interrupt_",
     "model_call_",
+    "pose_source_",
     "runtime_override_",
 )
 _SEVERITY_ORDER = {"DEBUG": 10, "INFO": 20, "WARN": 30, "WARNING": 30, "ERROR": 40, "CRITICAL": 50}
@@ -102,6 +103,8 @@ def _severity_for_event(event_type: str, details: Optional[dict[str, Any]]) -> s
 def _component_for_event(event_type: str) -> str:
     if event_type.startswith("model_call_"):
         return "manyforge.model"
+    if event_type.startswith("pose_source_"):
+        return "manyforge.scene"
     if event_type.startswith("runtime_override_"):
         return "manyforge.runtime_override"
     if event_type.startswith("intervention_"):
@@ -778,6 +781,23 @@ class EventRecorder:
             grant_type=grant_type,
             trigger_node_instance=trigger_node_instance,
             execution_mode="intervention" if session_id is not None else "program",
+        )
+
+    def record_pose_source_event(
+        self,
+        action: str,
+        *,
+        details: Optional[dict[str, Any]] = None,
+    ) -> None:
+        """Record scene pose-source apply/status events.
+
+        Pose-source events are low-rate operational diagnostics used to explain
+        why externally observed object poses did or did not enter the planning
+        scene. High-rate raw observations stay out of the durable recorder.
+        """
+        self._record_event(
+            event_type=f"pose_source_{action}",
+            details=details,
         )
 
     def record_delegated_recovery_requested(self, request) -> None:

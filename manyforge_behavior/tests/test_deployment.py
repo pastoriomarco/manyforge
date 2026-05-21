@@ -504,6 +504,185 @@ class TestDeploymentLoading:
         finally:
             os.unlink(path)
 
+    def test_pose_sources_parse_and_roundtrip(self):
+        data = _minimal_deployment(
+            pose_sources=[
+                {
+                    "id": "isaac_scene_objects",
+                    "kind": "simulation_interfaces",
+                    "service_prefix": "auto",
+                    "max_update_hz": 4,
+                    "stale_after_s": 1.25,
+                    "frame_id": "universe",
+                    "description": "Isaac entity poses for known scene objects.",
+                    "objects": {
+                        "isaac_cheese_box": {
+                            "entity": "/mac_n_cheese_centered",
+                            "apply_policy": "before_planning",
+                            "confidence_min": 0.8,
+                            "metadata": {"source": "fixture"},
+                        },
+                        "isaac_soup_can": {
+                            "entity": "/World/soup_can",
+                            "apply_policy": "observe_only",
+                        },
+                    },
+                }
+            ],
+        )
+        deploy = Deployment.from_dict(data)
+
+        source = deploy.pose_sources["isaac_scene_objects"]
+        assert source.kind == "simulation_interfaces"
+        assert source.max_update_hz == 4.0
+        assert source.stale_after_s == 1.25
+        assert source.frame_id == "universe"
+        assert set(source.objects) == {"isaac_cheese_box", "isaac_soup_can"}
+        assert source.objects["isaac_cheese_box"].entity == "/mac_n_cheese_centered"
+        assert source.objects["isaac_cheese_box"].apply_policy == "before_planning"
+        assert source.objects["isaac_cheese_box"].confidence_min == 0.8
+        assert source.objects["isaac_cheese_box"].metadata == {"source": "fixture"}
+
+        serialized = deploy.to_dict()
+        reloaded = Deployment.from_dict(serialized)
+        assert reloaded.pose_sources["isaac_scene_objects"].objects[
+            "isaac_soup_can"
+        ].apply_policy == "observe_only"
+
+    def test_pose_source_rejects_duplicate_object_authority(self):
+        data = _minimal_deployment(
+            pose_sources=[
+                {
+                    "id": "source_a",
+                    "kind": "simulation_interfaces",
+                    "objects": {
+                        "box": {
+                            "entity": "/World/box_a",
+                            "apply_policy": "observe_only",
+                        }
+                    },
+                },
+                {
+                    "id": "source_b",
+                    "kind": "simulation_interfaces",
+                    "objects": {
+                        "box": {
+                            "entity": "/World/box_b",
+                            "apply_policy": "observe_only",
+                        }
+                    },
+                },
+            ],
+        )
+        with pytest.raises(
+            DeploymentValidationError,
+            match="multiple write authorities for object 'box'",
+        ):
+            Deployment.from_dict(data)
+
+    @pytest.mark.parametrize(
+        ("pose_sources", "match"),
+        [
+            (
+                [
+                    {
+                        "id": "bad_kind",
+                        "kind": "raw_magic",
+                        "objects": {
+                            "box": {
+                                "entity": "/World/box",
+                                "apply_policy": "observe_only",
+                            }
+                        },
+                    }
+                ],
+                "kind must be one of",
+            ),
+            (
+                [
+                    {
+                        "id": "bad_policy",
+                        "kind": "simulation_interfaces",
+                        "objects": {
+                            "box": {
+                                "entity": "/World/box",
+                                "apply_policy": "during_motion",
+                            }
+                        },
+                    }
+                ],
+                "apply_policy must be one of",
+            ),
+            (
+                [
+                    {
+                        "id": "bad_rate",
+                        "kind": "simulation_interfaces",
+                        "max_update_hz": 0,
+                        "objects": {
+                            "box": {
+                                "entity": "/World/box",
+                                "apply_policy": "observe_only",
+                            }
+                        },
+                    }
+                ],
+                "max_update_hz must be a number > 0",
+            ),
+            (
+                [
+                    {
+                        "id": "bad_confidence",
+                        "kind": "simulation_interfaces",
+                        "objects": {
+                            "box": {
+                                "entity": "/World/box",
+                                "apply_policy": "observe_only",
+                                "confidence_min": 1.5,
+                            }
+                        },
+                    }
+                ],
+                "confidence_min must be a number between 0.0 and 1.0",
+            ),
+            (
+                [
+                    {
+                        "id": "missing_entity",
+                        "kind": "simulation_interfaces",
+                        "objects": {
+                            "box": {
+                                "apply_policy": "observe_only",
+                            }
+                        },
+                    }
+                ],
+                "entity is required for simulation_interfaces",
+            ),
+            (
+                [
+                    {
+                        "id": "topic_source",
+                        "kind": "pose_stamped_topic",
+                        "objects": {
+                            "box": {
+                                "apply_policy": "observe_only",
+                            }
+                        },
+                    }
+                ],
+                "topic is required",
+            ),
+        ],
+    )
+    def test_pose_source_validation_rejects_invalid_contract(
+        self,
+        pose_sources,
+        match,
+    ):
+        with pytest.raises(DeploymentValidationError, match=match):
+            Deployment.from_dict(_minimal_deployment(pose_sources=pose_sources))
+
     def test_authority_matrix_parsed(self):
         data = _minimal_deployment(
             authority_matrix={

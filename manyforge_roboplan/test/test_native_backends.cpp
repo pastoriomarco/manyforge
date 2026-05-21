@@ -545,7 +545,11 @@ TEST_F(NativeKernelTest, ExecutionBackendPublishesProgressAndInterpolatesSceneSt
   auto handle = bundle_->execution->execute_trajectory(traj);
   auto initial = bundle_->execution->get_execution_snapshot();
   EXPECT_EQ(initial.state, ExecutionState::kExecuting);
-  EXPECT_DOUBLE_EQ(initial.progress, 0.0);
+  // The dispatch worker may publish the first interpolation tick before this
+  // immediate observer read returns. Assert the stable contract instead of
+  // requiring an exact zero-progress race against the worker thread.
+  EXPECT_GE(initial.progress, 0.0);
+  EXPECT_LT(initial.progress, 0.05);
 
   std::this_thread::sleep_for(std::chrono::milliseconds(120));
 

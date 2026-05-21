@@ -404,6 +404,42 @@ export interface StreamingJointLimit {
   maxAccelerationRadS2?: number | null;
 }
 
+export type PoseSourceKind =
+  | 'simulation_interfaces'
+  | 'pose_stamped_topic'
+  | 'pose_array_topic'
+  | 'detection3d_array_topic'
+  | 'tf';
+
+export type PoseSourceApplyPolicy =
+  | 'observe_only'
+  | 'when_idle'
+  | 'continuous'
+  | 'continuous_unattached'
+  | 'before_planning'
+  | 'between_nodes';
+
+export interface PoseSourceObjectBindingConfig {
+  entity?: string;
+  frameId?: string;
+  applyPolicy?: PoseSourceApplyPolicy;
+  confidenceMin?: number | null;
+  metadata?: Record<string, unknown>;
+}
+
+export interface PoseSourceConfig {
+  id: string;
+  kind: PoseSourceKind;
+  enabled: boolean;
+  maxUpdateHz: number;
+  staleAfterS: number;
+  frameId?: string;
+  servicePrefix?: string;
+  topic?: string;
+  description?: string;
+  objects: Record<string, PoseSourceObjectBindingConfig>;
+}
+
 export interface RobotConfig {
   robotId: string;
   groupId: string;
@@ -484,6 +520,7 @@ export interface FullDeployment {
   promptTemplates: Record<string, PromptTemplateConfig>;
   interruptSources: Record<string, InterruptSourceConfig>;
   authorityMatrix: Record<string, AuthorityDomainConfig>;
+  poseSources: PoseSourceConfig[];
   sourcePath: string;
 }
 
@@ -623,11 +660,71 @@ export interface SceneGripperState {
   error: string | null;
 }
 
+export interface PoseSourcePoseState {
+  frame_id: string;
+  stamp_sec?: number | null;
+  position_xyz: number[];
+  orientation_xyzw: number[];
+}
+
+export interface PoseSourceUpdateState {
+  pose_source_id: string;
+  object_id: string;
+  entity: string;
+  monotonic_s: number;
+  apply_policy: string;
+  pose: PoseSourcePoseState;
+}
+
+export interface PoseSourceRejectionState {
+  pose_source_id: string;
+  object_id: string;
+  entity: string;
+  reason: string;
+  detail: string;
+  monotonic_s: number;
+}
+
+export interface PoseSourceObjectState {
+  object_id: string;
+  entity: string;
+  frame_id: string;
+  apply_policy: string;
+  status: 'disabled' | 'fresh' | 'stale' | 'rejected' | string;
+  age_s?: number | null;
+  update?: PoseSourceUpdateState | null;
+  rejection?: PoseSourceRejectionState | null;
+}
+
+export interface PoseSourceStatusState {
+  pose_source_id: string;
+  kind: string;
+  enabled: boolean;
+  status: 'disabled' | 'fresh' | 'stale' | 'rejected' | string;
+  max_update_hz: number;
+  stale_after_s: number;
+  frame_id: string;
+  description: string;
+  received_at_ns?: number | null;
+  objects: PoseSourceObjectState[];
+}
+
+export interface PoseSourceApplyResponse {
+  policy: string;
+  success: boolean;
+  error?: string | null;
+  applied_count: number;
+  skipped_count: number;
+  rejected_count: number;
+  details: Record<string, unknown>[];
+}
+
 export interface SceneStateResponse {
   robot?: SceneRobotState | null;
   objects: SceneObjectState[];
   link_poses?: Record<string, { position_m: number[]; orientation_xyzw: number[] }>;
   grippers?: SceneGripperState[];
+  pose_sources?: PoseSourceStatusState[];
   object_axes_gizmo_size_m?: number;
   timestamp_ns: number;
 }

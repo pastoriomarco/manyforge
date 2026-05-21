@@ -26,6 +26,7 @@ import { useStatusPolling, useStatusStore } from '../store/statusStore';
 import { useViewerSelectionStore } from '../store/viewerSelectionStore';
 import type {
   MeshAssetStatus,
+  PoseSourceStatusState,
   PreviewLinkPosesRequest,
   PreviewLinkPosesResponse,
   SceneFrameState,
@@ -47,6 +48,8 @@ import { SnapshotResponder } from './SnapshotResponder';
 // update loop when combined with downstream useMemo deps. Sharing the
 // same identity across renders keeps zustand's bailout path working.
 const EMPTY_OBJECTS: SceneObjectState[] = [];
+
+const EMPTY_POSE_SOURCES: PoseSourceStatusState[] = [];
 
 const EMPTY_GRIPPERS: import('../types/api').SceneGripperState[] = [];
 
@@ -523,6 +526,7 @@ function SceneCanvas({
         isDraggingRef={isDraggingRef}
         onContextMenu={onContextMenu}
       />
+      <MeasuredPoseSourceGhosts />
       <FrameAxes />
       <ObjectFrameAxes />
       <PointCloud />
@@ -569,6 +573,133 @@ function SceneObjects({
         />
       ))}
     </group>
+  );
+}
+
+interface MeasuredGhost {
+  key: string;
+  objectId: string;
+  sourceId: string;
+  position: [number, number, number];
+  quaternion: [number, number, number, number];
+  shape: SceneShapeState | null;
+  shapeType: string | null;
+}
+
+function MeasuredPoseSourceGhosts() {
+  const visible = useViewerSelectionStore((s) => s.measuredStateGhostVisible);
+  const poseSources = useSceneStateStore(
+    (state) => state.scene?.pose_sources ?? EMPTY_POSE_SOURCES,
+  );
+  const objects = useSceneStateStore((state) => state.scene?.objects ?? EMPTY_OBJECTS);
+
+  const objectById = useMemo(() => {
+    const map = new Map<string, SceneObjectState>();
+    for (const object of objects) {
+      map.set(object.object_id, object);
+    }
+    return map;
+  }, [objects]);
+
+  const ghosts = useMemo<MeasuredGhost[]>(() => {
+    if (!visible) return [];
+    const next: MeasuredGhost[] = [];
+    for (const source of poseSources) {
+      for (const observed of source.objects) {
+        if (observed.status !== 'fresh' || observed.update === null || observed.update === undefined) {
+          continue;
+        }
+        const pose = observed.update.pose;
+        // `observed.frame_id` is the configured coordinate frame for the
+        // binding. `pose.frame_id` is provider metadata and may carry the
+        // source entity frame/name (Isaac reports e.g. "mac_n_cheese_centered")
+        // even though the numeric pose is expressed in the source frame.
+        if (!isRenderableWorldPoseFrame(observed.frame_id, source.frame_id)) {
+          continue;
+        }
+        const position = tuple3(pose.position_xyz);
+        const quaternion = tuple4(pose.orientation_xyzw);
+        if (position === null || quaternion === null) {
+          continue;
+        }
+        const object = objectById.get(observed.object_id) ?? null;
+        const shape = object?.shape ?? null;
+        const shapeType = typeof shape?.type === 'string' ? shape.type : null;
+        next.push({
+          key: `${source.pose_source_id}:${observed.object_id}`,
+          objectId: observed.object_id,
+          sourceId: source.pose_source_id,
+          position,
+          quaternion,
+          shape,
+          shapeType,
+        });
+      }
+    }
+    return next;
+  }, [objectById, poseSources, visible]);
+
+  if (!visible || ghosts.length === 0) {
+    return null;
+  }
+
+  return (
+    <group name="manyforge-measured-state-ghosts" renderOrder={20}>
+      {ghosts.map((ghost) => (
+        <group
+          key={ghost.key}
+          name={`measured-ghost:${ghost.objectId}`}
+          position={ghost.position}
+          quaternion={ghost.quaternion}
+        >
+          <MeasuredGhostBody shape={ghost.shape} shapeType={ghost.shapeType} />
+        </group>
+      ))}
+    </group>
+  );
+}
+
+function MeasuredGhostBody({
+  shape,
+  shapeType,
+}: {
+  shape: SceneShapeState | null;
+  shapeType: string | null;
+}) {
+  const ghostColor = '#22d3ee';
+  const ghostOpacity = 0.45;
+  if (shapeType === 'mesh') {
+    return (
+      <SceneObjectMeshAsset
+        shape={shape}
+        color={ghostColor}
+        opacity={0.4}
+        overlay
+      />
+    );
+  }
+  if (shape !== null) {
+    return (
+      <SceneObjectPrimitive
+        shape={shape}
+        color={ghostColor}
+        opacity={ghostOpacity}
+        shapeType={shapeType}
+        overlay
+      />
+    );
+  }
+  return (
+    <mesh renderOrder={20}>
+      <boxGeometry args={[0.06, 0.06, 0.06]} />
+      <meshStandardMaterial
+        color={ghostColor}
+        wireframe
+        transparent
+        opacity={0.7}
+        depthWrite={false}
+      />
+    </mesh>
   );
 }
 
@@ -664,11 +795,13 @@ function SceneObjectPrimitive({
   color,
   opacity,
   shapeType,
+  overlay = false,
 }: {
   shape: SceneShapeState | null;
   color: string;
   opacity: number;
   shapeType: string | null;
+  overlay?: boolean;
 }) {
   const cylinderRadius = typeof shape?.cylinder_radius_m === 'number' ? shape.cylinder_radius_m : 0.05;
   const cylinderHeight = typeof shape?.cylinder_height_m === 'number' ? shape.cylinder_height_m : 0.1;
@@ -706,13 +839,15 @@ function SceneObjectPrimitive({
   }, [cylinderGeometry, shape, shapeType]);
 
   return (
-    <mesh>
+    <mesh renderOrder={overlay ? 20 : 0}>
       {geometry}
       <meshStandardMaterial
         color={color}
         transparent={opacity < 1}
         opacity={opacity}
-        wireframe={shapeType !== 'box' && shapeType !== 'sphere' && shapeType !== 'cylinder'}
+        depthTest={!overlay}
+        depthWrite={opacity >= 1 && !overlay}
+        wireframe={overlay || (shapeType !== 'box' && shapeType !== 'sphere' && shapeType !== 'cylinder')}
       />
     </mesh>
   );
@@ -722,10 +857,12 @@ function SceneObjectMeshAsset({
   shape,
   color,
   opacity,
+  overlay = false,
 }: {
   shape: SceneShapeState | null;
   color: string;
   opacity: number;
+  overlay?: boolean;
 }) {
   const status = (shape?.mesh_asset_status ?? 'missing') as MeshAssetStatus | string;
   const url = typeof shape?.mesh_asset_url === 'string' ? shape.mesh_asset_url : null;
@@ -737,7 +874,12 @@ function SceneObjectMeshAsset({
         fallback={<SceneMeshStatusMarker status="parse_failed" color={color} />}
       >
         <Suspense fallback={<SceneMeshStatusMarker status="pending" color={color} />}>
-          <SceneObjectMeshGltf url={url} color={color} opacity={opacity} />
+          <SceneObjectMeshGltf
+            url={url}
+            color={color}
+            opacity={opacity}
+            overlay={overlay}
+          />
         </Suspense>
       </SceneMeshErrorBoundary>
     );
@@ -760,17 +902,31 @@ function SceneObjectMeshGltf({
   url,
   color,
   opacity,
+  overlay = false,
 }: {
   url: string;
   color: string;
   opacity: number;
+  overlay?: boolean;
 }) {
   const gltf = useGLTF(url);
   const cloned = useMemo(() => {
     const root = gltf.scene.clone(true);
     root.traverse((obj) => {
+      obj.renderOrder = overlay ? 20 : obj.renderOrder;
       const mesh = obj as THREE.Mesh;
       if (!mesh.isMesh) return;
+      if (overlay) {
+        mesh.material = new THREE.MeshBasicMaterial({
+          color,
+          transparent: true,
+          opacity,
+          depthTest: false,
+          depthWrite: false,
+          side: THREE.DoubleSide,
+        });
+        return;
+      }
       const sourceMaterials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
       const tinted = sourceMaterials.map((source) => {
         const material = source.clone() as THREE.MeshStandardMaterial;
@@ -785,7 +941,7 @@ function SceneObjectMeshGltf({
       mesh.material = Array.isArray(mesh.material) ? tinted : tinted[0];
     });
     return root;
-  }, [gltf.scene, color, opacity]);
+  }, [gltf.scene, color, opacity, overlay]);
   return <primitive key={url} object={cloned} />;
 }
 
@@ -1045,6 +1201,25 @@ function numberQuad(
     ];
   }
   return fallback;
+}
+
+function tuple3(value: unknown): [number, number, number] | null {
+  if (!Array.isArray(value) || value.length !== 3) return null;
+  const next = value.map(Number);
+  if (next.some((entry) => !Number.isFinite(entry))) return null;
+  return [next[0], next[1], next[2]];
+}
+
+function tuple4(value: unknown): [number, number, number, number] | null {
+  if (!Array.isArray(value) || value.length !== 4) return null;
+  const next = value.map(Number);
+  if (next.some((entry) => !Number.isFinite(entry))) return null;
+  return [next[0], next[1], next[2], next[3]];
+}
+
+function isRenderableWorldPoseFrame(poseFrameId: string, sourceFrameId: string): boolean {
+  const frame = poseFrameId || sourceFrameId;
+  return frame === '' || frame === 'universe' || frame === 'world' || frame === '/World';
 }
 
 // URDF RPY is fixed-axis ZYX; Three.js's default Euler order is intrinsic

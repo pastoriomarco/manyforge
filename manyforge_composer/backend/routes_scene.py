@@ -37,6 +37,11 @@ from .models import (
     SceneObjectFrameVisibilityRequest,
     SceneObjectFrameVisibilityResponse,
     SceneObjectResponse,
+    PoseSourceApplyRequest,
+    PoseSourceApplyResponse,
+    PoseSourceObjectStateResponse,
+    PoseSourceSnapshotRequest,
+    PoseSourceStatusResponse,
     SceneRobotResponse,
     SceneShapeResponse,
     SceneStateResponse,
@@ -44,6 +49,13 @@ from .models import (
 from .state import ComposerState
 
 logger = logging.getLogger(__name__)
+_POSE_SOURCE_STATUSES = {"disabled", "fresh", "stale", "rejected"}
+_SCENE_STATE_WARN_MS = 250.0
+_SCENE_STATE_SUBSTEP_WARN_MS = 100.0
+
+
+def _elapsed_ms(start: float) -> float:
+    return (time.monotonic() - start) * 1000.0
 
 
 def canonical_scene_world_frame(state: ComposerState) -> str:
@@ -112,16 +124,62 @@ def build_scene_frames_payload(state: ComposerState) -> dict[str, Any]:
     that still gate on it; legacy Viser callers see the same value
     they did before.
     """
+    build_started = time.monotonic()
+    timings_ms: dict[str, float] = {}
+
+    def mark_step(name: str, step_started: float) -> None:
+        timings_ms[name] = _elapsed_ms(step_started)
+
     timestamp_ns = time.monotonic_ns()
     frame_roles = _scene_frame_roles(state)
     frame_names = set(frame_roles.keys())
+    step_started = time.monotonic()
     frame_names.update(_load_model_frame_names(state))
+    mark_step("frame_inventory", step_started)
 
     kernel = state.kernel
     world_frame = canonical_scene_world_frame(state)
 
+    sorted_frame_names = sorted(frame_names)
+    pose_lookup: dict[str, Any] = {}
+    unresolved_frame_names = [
+        frame_name for frame_name in sorted_frame_names if frame_name != world_frame
+    ]
+    if kernel is not None and unresolved_frame_names:
+        batch_start = time.monotonic()
+        try:
+            pose_lookup = dict(
+                kernel.get_link_poses(unresolved_frame_names, world_frame)
+            )
+        except Exception as exc:
+            timings_ms["batch_fk"] = _elapsed_ms(batch_start)
+            logger.warning(
+                "scene frames batch FK failed",
+                extra={
+                    "event": "scene_frames_batch_fk_failed",
+                    "frame_count": len(unresolved_frame_names),
+                    "error": str(exc),
+                    "duration_ms": round(_elapsed_ms(batch_start), 1),
+                },
+            )
+            pose_lookup = {}
+        else:
+            duration_ms = _elapsed_ms(batch_start)
+            timings_ms["batch_fk"] = duration_ms
+            if duration_ms >= _SCENE_STATE_SUBSTEP_WARN_MS:
+                logger.warning(
+                    "scene frames batch FK slow",
+                    extra={
+                        "event": "scene_frames_batch_fk_slow",
+                        "frame_count": len(unresolved_frame_names),
+                        "duration_ms": round(duration_ms, 1),
+                    },
+                )
+    elif unresolved_frame_names:
+        timings_ms["batch_fk"] = 0.0
+
     frames: list[SceneFrameResponse] = []
-    for frame_name in sorted(frame_names):
+    for frame_name in sorted_frame_names:
         pose_available = frame_name == world_frame
         pose_in_world: Optional[dict[str, Any]] = None
         if frame_name == world_frame:
@@ -129,11 +187,8 @@ def build_scene_frames_payload(state: ComposerState) -> dict[str, Any]:
                 "position_m": [0.0, 0.0, 0.0],
                 "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
             }
-        elif kernel is not None:
-            try:
-                pose = kernel.get_link_pose(frame_name, world_frame)
-            except Exception:
-                pose = None
+        else:
+            pose = pose_lookup.get(frame_name)
             if pose is not None:
                 pose_in_world = {
                     "position_m": list(pose["position_m"]),
@@ -163,12 +218,28 @@ def build_scene_frames_payload(state: ComposerState) -> dict[str, Any]:
             )
         )
 
-    return SceneFramesResponse(
+    payload = SceneFramesResponse(
         frames=frames,
         hmiAvailable=True,
         frameGizmoSizeM=state.get_frame_gizmo_size(),
         timestampNs=timestamp_ns,
     ).model_dump(by_alias=True)
+    total_ms = _elapsed_ms(build_started)
+    slow_steps = {
+        name: round(duration, 1)
+        for name, duration in timings_ms.items()
+        if duration >= _SCENE_STATE_SUBSTEP_WARN_MS
+    }
+    if total_ms >= _SCENE_STATE_WARN_MS or slow_steps:
+        logger.warning(
+            "scene frames build slow: total_ms=%.1f slow_steps=%s timings_ms=%s "
+            "frames=%d",
+            total_ms,
+            slow_steps,
+            {name: round(duration, 1) for name, duration in timings_ms.items()},
+            len(frames),
+        )
+    return payload
 
 
 def _scene_shape_response(state: ComposerState, scene_object) -> SceneShapeResponse | None:
@@ -209,8 +280,81 @@ def _scene_shape_response(state: ComposerState, scene_object) -> SceneShapeRespo
     return SceneShapeResponse(**payload)
 
 
+def _pose_sources_payload(state: ComposerState) -> list[PoseSourceStatusResponse]:
+    """Merge deployment pose-source declarations with latest sidecar snapshots.
+
+    This is intentionally observe-only. Runtime sidecars can report freshness
+    and object poses, but this payload does not alter `objects[].pose_in_universe`
+    or any kernel planning-scene state.
+    """
+    deployment = state.deployment
+    pose_sources = (
+        getattr(deployment, "pose_sources", {}) if deployment is not None else {}
+    )
+    if not pose_sources:
+        return []
+    snapshots = state.pose_source_snapshots()
+    responses: list[PoseSourceStatusResponse] = []
+
+    for source_id, source in sorted(pose_sources.items()):
+        snapshot = snapshots.get(source_id, {})
+        status = str(
+            snapshot.get("status") or ("stale" if source.enabled else "disabled")
+        )
+        if status not in _POSE_SOURCE_STATUSES:
+            status = "rejected"
+        if not source.enabled:
+            status = "disabled"
+        snapshot_objects = {
+            str(item.get("object_id") or item.get("objectId") or ""): item
+            for item in snapshot.get("objects", [])
+            if isinstance(item, dict)
+        }
+        object_states: list[PoseSourceObjectStateResponse] = []
+        for object_id, binding in sorted(source.objects.items()):
+            observed = snapshot_objects.get(object_id, {})
+            object_status = str(observed.get("status") or status)
+            if object_status not in _POSE_SOURCE_STATUSES:
+                object_status = "rejected"
+            if not source.enabled:
+                object_status = "disabled"
+            object_states.append(
+                PoseSourceObjectStateResponse(
+                    object_id=object_id,
+                    entity=binding.entity,
+                    frame_id=binding.frame_id or source.frame_id,
+                    apply_policy=binding.apply_policy,
+                    status=object_status,
+                    age_s=observed.get("age_s"),
+                    update=observed.get("update"),
+                    rejection=observed.get("rejection"),
+                )
+            )
+        responses.append(
+            PoseSourceStatusResponse(
+                pose_source_id=source_id,
+                kind=source.kind,
+                enabled=source.enabled,
+                status=status,
+                max_update_hz=source.max_update_hz,
+                stale_after_s=source.stale_after_s,
+                frame_id=source.frame_id,
+                description=source.description,
+                received_at_ns=snapshot.get("received_at_ns"),
+                objects=object_states,
+            )
+        )
+    return responses
+
+
 def build_scene_state_payload(state: ComposerState) -> dict[str, Any]:
     """Build backend-authoritative scene state."""
+    build_started = time.monotonic()
+    timings_ms: dict[str, float] = {}
+
+    def mark_step(name: str, step_started: float) -> None:
+        timings_ms[name] = _elapsed_ms(step_started)
+
     timestamp_ns = time.monotonic_ns()
     robot_id = None
     group_id = None
@@ -226,8 +370,7 @@ def build_scene_state_payload(state: ComposerState) -> dict[str, Any]:
         tcp_frame = state.program.robot.tcp_frame
         base_pose = dict(state.program.robot.base_pose or {})
 
-    _advance_gripper_commands(state)
-
+    step_started = time.monotonic()
     joint_positions_by_name: dict[str, float] = {}
     joint_names: list[str] = []
     if state.kernel is not None:
@@ -264,7 +407,9 @@ def build_scene_state_payload(state: ComposerState) -> dict[str, Any]:
             joint_positions_by_name = {
                 name: pos for name, pos in zip(joint_names, live_positions)
             }
+    mark_step("robot_snapshot", step_started)
 
+    step_started = time.monotonic()
     tcp_pose_in_base = None
     if state.kernel is not None:
         tcp_pose = state.kernel.get_link_pose(tcp_frame, base_frame)
@@ -273,7 +418,9 @@ def build_scene_state_payload(state: ComposerState) -> dict[str, Any]:
                 "position_m": list(tcp_pose["position_m"]),
                 "orientation_xyzw": list(tcp_pose["orientation_xyzw"]),
             }
+    mark_step("tcp_pose", step_started)
 
+    step_started = time.monotonic()
     robot_info = None
     if state.deployment is not None or state.kernel is not None:
         urdf_model_key = None
@@ -294,7 +441,9 @@ def build_scene_state_payload(state: ComposerState) -> dict[str, Any]:
             joint_positions=joint_positions_by_name,
             tcp_pose_in_base=tcp_pose_in_base,
         )
+    mark_step("robot_payload", step_started)
 
+    step_started = time.monotonic()
     objects: list[SceneObjectResponse] = []
     authored_object_ids = {
         resource.object_id
@@ -322,7 +471,9 @@ def build_scene_state_payload(state: ComposerState) -> dict[str, Any]:
                 )
             )
     objects.sort(key=lambda obj: obj.object_id)
+    mark_step("scene_objects", step_started)
 
+    step_started = time.monotonic()
     link_poses: dict[str, dict[str, Any]] = {}
     if state.kernel is not None:
         try:
@@ -355,15 +506,44 @@ def build_scene_state_payload(state: ComposerState) -> dict[str, Any]:
                         "position_m": list(pose["position_m"]),
                         "orientation_xyzw": list(pose["orientation_xyzw"]),
                     }
+    mark_step("link_poses", step_started)
 
-    return SceneStateResponse(
+    step_started = time.monotonic()
+    grippers = _collect_gripper_states(state, advance_commands=False)
+    mark_step("grippers", step_started)
+
+    step_started = time.monotonic()
+    pose_sources = _pose_sources_payload(state)
+    mark_step("pose_sources", step_started)
+
+    payload = SceneStateResponse(
         robot=robot_info,
         objects=objects,
         link_poses=link_poses,
-        grippers=_collect_gripper_states(state, advance_commands=False),
+        grippers=grippers,
+        pose_sources=pose_sources,
         object_axes_gizmo_size_m=state.get_object_axes_gizmo_size(),
         timestamp_ns=timestamp_ns,
     ).model_dump()
+    total_ms = _elapsed_ms(build_started)
+    slow_steps = {
+        name: round(duration, 1)
+        for name, duration in timings_ms.items()
+        if duration >= _SCENE_STATE_SUBSTEP_WARN_MS
+    }
+    if total_ms >= _SCENE_STATE_WARN_MS or slow_steps:
+        logger.warning(
+            "scene state build slow: total_ms=%.1f slow_steps=%s timings_ms=%s "
+            "objects=%d links=%d grippers=%d pose_sources=%d",
+            total_ms,
+            slow_steps,
+            {name: round(duration, 1) for name, duration in timings_ms.items()},
+            len(objects),
+            len(link_poses),
+            len(grippers),
+            len(pose_sources),
+        )
+    return payload
 
 
 def _gripper_joint_limits(
@@ -601,6 +781,143 @@ def create_scene_router(state: ComposerState) -> APIRouter:
     def get_scene_state() -> dict[str, Any]:
         """Get full scene state including robot and objects."""
         return build_scene_state_payload(state)
+
+    @router.post("/pose-sources/{pose_source_id}/snapshot")
+    def update_pose_source_snapshot(
+        pose_source_id: str,
+        request: PoseSourceSnapshotRequest,
+    ) -> dict[str, Any]:
+        """Record one latest-wins pose-source snapshot.
+
+        Deployment configuration remains authoritative for source IDs, object
+        bindings, and apply policies. Most policies are explicit safe-point
+        latches; `continuous` is intentionally paced by this endpoint after the
+        latest snapshot has been accepted, so provider cadence remains the only
+        update loop and stale observations cannot backlog.
+        """
+        deployment = state.deployment
+        source = None
+        if deployment is not None:
+            source = deployment.pose_sources.get(pose_source_id)
+        if source is None:
+            raise HTTPException(status_code=404, detail="pose source is not declared")
+        if not source.enabled:
+            raise HTTPException(status_code=409, detail="pose source is disabled")
+        if request.pose_source_id != pose_source_id:
+            raise HTTPException(
+                status_code=400,
+                detail="pose_source_id does not match path",
+            )
+        if request.status not in _POSE_SOURCE_STATUSES - {"disabled"}:
+            raise HTTPException(status_code=400, detail="invalid pose-source status")
+
+        payload = request.model_dump()
+        sanitized_objects: list[dict[str, Any]] = []
+        for object_state in payload.get("objects", []):
+            object_id = str(object_state.get("object_id") or "")
+            binding = source.objects.get(object_id)
+            if binding is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"pose source '{pose_source_id}' reported unknown "
+                        f"object '{object_id}'"
+                    ),
+                )
+            # The deployment, not the sidecar payload, owns policy and entity
+            # binding. Normalize here so a stale or compromised sidecar cannot
+            # alter scene-apply semantics.
+            object_state["entity"] = binding.entity
+            object_state["frame_id"] = binding.frame_id or source.frame_id
+            object_state["apply_policy"] = binding.apply_policy
+            update = object_state.get("update")
+            if isinstance(update, dict):
+                update["entity"] = binding.entity
+                update["apply_policy"] = binding.apply_policy
+            rejection = object_state.get("rejection")
+            if isinstance(rejection, dict):
+                rejection["entity"] = binding.entity
+            sanitized_objects.append(object_state)
+        payload["objects"] = sanitized_objects
+        state.update_pose_source_snapshot(pose_source_id, payload)
+        continuous_apply_results: list[dict[str, Any]] = []
+        for continuous_policy in ("continuous", "continuous_unattached"):
+            continuous_object_ids = [
+                str(object_state.get("object_id") or "")
+                for object_state in sanitized_objects
+                if object_state.get("apply_policy") == continuous_policy
+            ]
+            if not continuous_object_ids:
+                continue
+            apply_result = state.enqueue_pose_source_apply(
+                policy=continuous_policy,
+                object_ids=continuous_object_ids,
+                require_idle=False,
+                reason=f"snapshot_{continuous_policy}",
+            )
+            continuous_apply_results.append(apply_result)
+            if not apply_result.get("success", False):
+                logger.warning(
+                    "%s pose-source apply queue failed: source=%s objects=%s error=%s",
+                    continuous_policy,
+                    pose_source_id,
+                    continuous_object_ids,
+                    apply_result.get("error"),
+                )
+        logger.info(
+            "pose source snapshot accepted: source=%s status=%s objects=%d",
+            pose_source_id,
+            request.status,
+            len(sanitized_objects),
+        )
+        response = {"success": True, "pose_source_id": pose_source_id}
+        if len(continuous_apply_results) == 1:
+            response["continuous_apply"] = continuous_apply_results[0]
+        elif continuous_apply_results:
+            response["continuous_apply_results"] = continuous_apply_results
+        return response
+
+    @router.post("/pose-sources/apply", response_model=None)
+    def apply_pose_source_updates(
+        request: PoseSourceApplyRequest,
+    ) -> Any:
+        """Apply eligible pose-source updates to the planning scene.
+
+        API callers may only use this as a bounded safe-point operation. The
+        usual operator-facing path is `when_idle`; the behavior-tree
+        before-planning latch calls the same ComposerState method directly.
+        """
+        if request.policy in {
+            "continuous",
+            "continuous_unattached",
+            "before_planning",
+            "between_nodes",
+        }:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "success": False,
+                    "policy": request.policy,
+                    "error": (
+                        f"{request.policy} pose-source applies are only allowed "
+                        "from their configured runtime latch"
+                    ),
+                    "applied_count": 0,
+                    "skipped_count": 0,
+                    "rejected_count": 1,
+                    "details": [],
+                },
+            )
+        result = state.apply_pose_source_updates(
+            policy=request.policy,
+            object_ids=request.object_ids,
+            require_idle=True,
+            reason="api",
+        )
+        response = PoseSourceApplyResponse(**result).model_dump()
+        if response["success"]:
+            return response
+        return JSONResponse(status_code=409, content=response)
 
     @router.post("/preview-link-poses")
     def preview_link_poses(payload: dict[str, Any]) -> dict[str, Any]:

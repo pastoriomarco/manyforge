@@ -28,6 +28,7 @@ import type {
   SceneObjectFrameVisibilityResponse,
   SceneObjectAxesGizmoSizeResponse,
   SceneGripperCommandResponse,
+  PoseSourceApplyResponse,
   PreviewLinkPosesRequest,
   PreviewLinkPosesResponse,
   AssistantChatRequest,
@@ -258,6 +259,11 @@ export const api = {
       request<SceneObjectFrameVisibilityResponse>('POST', '/api/scene/objects/frame-visibility', { objectId, visible }),
     setObjectAxesGizmoSize: (axesLengthM: number) =>
       request<SceneObjectAxesGizmoSizeResponse>('POST', '/api/scene/objects/gizmo-size', { axesLengthM }),
+    applyPoseSources: (policy = 'when_idle', objectIds: string[] = []) =>
+      request<PoseSourceApplyResponse>('POST', '/api/scene/pose-sources/apply', {
+        policy,
+        objectIds,
+      }),
     commandGripper: (payload: {
       gripperId: string;
       targetPosition: number;

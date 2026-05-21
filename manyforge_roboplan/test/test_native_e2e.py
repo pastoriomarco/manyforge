@@ -549,6 +549,21 @@ class TestNativeSceneEdits:
         assert len(pose["position_m"]) == 3
         assert len(pose["orientation_xyzw"]) == 4
 
+    def test_get_link_poses_matches_single_fk(self, native_kernel):
+        target_frames = ["base_link", "tool0"]
+        batch = native_kernel.get_link_poses(target_frames, "universe")
+
+        assert set(batch.keys()) == set(target_frames)
+        for frame_name in target_frames:
+            single = native_kernel.get_link_pose(frame_name, "universe")
+            assert single is not None
+            assert batch[frame_name]["position_m"] == pytest.approx(
+                single["position_m"], abs=1e-9
+            )
+            assert batch[frame_name]["orientation_xyzw"] == pytest.approx(
+                single["orientation_xyzw"], abs=1e-9
+            )
+
     def test_get_object_pose_and_state(self, native_kernel):
         result = native_kernel.scene_edit(SceneEditRequest(
             operation="add", object_id="query_box", shape_type="box",

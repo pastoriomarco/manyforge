@@ -76,6 +76,10 @@ interface ViewerSelectionStore {
     position: [number, number, number];
     quaternion: [number, number, number, number];
   } | null;
+  // Optional diagnostics overlay for external pose-source observations
+  // (Isaac/perception measured state). Kept viewer-local and off by
+  // default because it is an operator aid, not planning-scene truth.
+  measuredStateGhostVisible: boolean;
   setSelected: (id: string | null) => void;
   toggleLocked: (id: string) => void;
   isLocked: (id: string) => boolean;
@@ -96,6 +100,7 @@ interface ViewerSelectionStore {
       quaternion: [number, number, number, number];
     } | null,
   ) => void;
+  setMeasuredStateGhostVisible: (visible: boolean) => void;
 }
 
 export type {
@@ -139,6 +144,7 @@ export const useViewerSelectionStore = create<ViewerSelectionStore>((set, get) =
   isDraggingGizmo: false,
   cartesianRejectionLabel: null,
   cartesianRejectionAnchor: null,
+  measuredStateGhostVisible: false,
   setSelected: (id) => set({ selectedId: id }),
   toggleLocked: (id) =>
     set((state) => {
@@ -169,6 +175,7 @@ export const useViewerSelectionStore = create<ViewerSelectionStore>((set, get) =
       cartesianRejectionAnchor:
         anchor !== undefined ? anchor : state.cartesianRejectionAnchor,
     })),
+  setMeasuredStateGhostVisible: (visible) => set({ measuredStateGhostVisible: visible }),
 }));
 
 /**

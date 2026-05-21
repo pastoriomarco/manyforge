@@ -142,6 +142,24 @@ def generate_launch_description() -> LaunchDescription:
                 default_value="/workspace/examples/isaac_manipulator_scene_light_ros2_control.deployment.yaml",
                 description="Deployment artifact loaded by the Isaac demo supervisor.",
             ),
+            DeclareLaunchArgument(
+                "pose_source_sidecar",
+                default_value="true",
+                description=(
+                    "When true, poll configured simulation_interfaces pose sources "
+                    "and publish observe-only snapshots to Composer."
+                ),
+            ),
+            DeclareLaunchArgument(
+                "pose_source_service_timeout_s",
+                default_value="2.0",
+                description="Timeout for simulation_interfaces pose-source service calls.",
+            ),
+            DeclareLaunchArgument(
+                "pose_source_publish_timeout_s",
+                default_value="1.0",
+                description="Timeout for publishing pose-source snapshots to Composer.",
+            ),
             OpaqueFunction(function=_launch_setup),
         ]
     )
@@ -297,11 +315,35 @@ def _launch_setup(context, *_, **__) -> list[object]:
             }
         ],
     )
+    pose_source_snapshot_publisher = Node(
+        package="manyforge_ros_bringup",
+        executable="pose_source_snapshot_publisher",
+        name="manyforge_pose_source_snapshot_publisher",
+        output="screen",
+        parameters=[
+            {
+                "composer_url": LaunchConfiguration("composer_url").perform(context),
+                "deployment_path": LaunchConfiguration("deployment_path").perform(
+                    context
+                ),
+                "service_timeout_s": float(
+                    LaunchConfiguration("pose_source_service_timeout_s").perform(
+                        context
+                    )
+                ),
+                "publish_timeout_s": float(
+                    LaunchConfiguration("pose_source_publish_timeout_s").perform(
+                        context
+                    )
+                ),
+            }
+        ],
+    )
 
     # Give controller_manager a short deterministic startup window before
     # spawners call its services. This keeps the launch file simple and robust
     # in containers where DDS discovery can be a little slow.
-    return [
+    actions = [
         topic_command_gate,
         demo_supervisor,
         robot_state_publisher,
@@ -310,3 +352,9 @@ def _launch_setup(context, *_, **__) -> list[object]:
         TimerAction(period=2.0, actions=[joint_state_broadcaster]),
         TimerAction(period=3.0, actions=[arm_controller]),
     ]
+    if (
+        LaunchConfiguration("pose_source_sidecar").perform(context).strip().lower()
+        == "true"
+    ):
+        actions.insert(2, pose_source_snapshot_publisher)
+    return actions

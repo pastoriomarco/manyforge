@@ -390,6 +390,30 @@ def _deployment_to_full_response(
             }
             for domain, config in deployment.authority_matrix.items()
         },
+        poseSources=[
+            {
+                "id": source.source_id,
+                "kind": source.kind,
+                "enabled": source.enabled,
+                "maxUpdateHz": source.max_update_hz,
+                "staleAfterS": source.stale_after_s,
+                "frameId": source.frame_id,
+                "servicePrefix": source.service_prefix,
+                "topic": source.topic,
+                "description": source.description,
+                "objects": {
+                    object_id: {
+                        "entity": binding.entity,
+                        "frameId": binding.frame_id,
+                        "applyPolicy": binding.apply_policy,
+                        "confidenceMin": binding.confidence_min,
+                        "metadata": dict(binding.metadata),
+                    }
+                    for object_id, binding in source.objects.items()
+                },
+            }
+            for source in deployment.pose_sources.values()
+        ],
         sourcePath=source_path,
     ).model_dump(by_alias=True)
 

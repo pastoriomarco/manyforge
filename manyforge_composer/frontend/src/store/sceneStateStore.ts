@@ -37,36 +37,36 @@ export const useSceneStateStore = create<SceneStateStore>((set) => ({
       return;
     }
     set({ refreshInFlight: true });
-    // Fetch /api/scene/state + /api/scene/frames in parallel. Both
-    // are cheap reads from in-memory state and the viewer needs them
-    // at the same cadence (frame axes + visibility checklists track
-    // the live kernel poses). If one fails we keep the previous
-    // value and surface the most recent error.
-    const sceneP = api.scene.state();
-    const framesP = api.scene.frames();
-    let scene: SceneStateResponse | null = null;
-    let frames: SceneFramesResponse | null = null;
-    let error: string | null = null;
+    // Fetch /api/scene/state + /api/scene/frames in parallel, but apply each
+    // response as soon as it arrives. Robot/object animation must not wait for
+    // auxiliary frame inventory if frame FK is slow during validation.
+    let firstError: string | null = null;
+    const rememberError = (fallback: string, err: unknown): void => {
+      if (firstError === null) {
+        firstError = err instanceof Error ? err.message : fallback;
+      }
+    };
     try {
-      try {
-        scene = await sceneP;
-      } catch (err: unknown) {
-        error = err instanceof Error ? err.message : 'Scene state unavailable';
+      const sceneUpdate = api.scene.state().then(
+        (scene: SceneStateResponse) => {
+          set({ scene, error: null, lastUpdatedAtMs: Date.now() });
+        },
+        (err: unknown) => {
+          rememberError('Scene state unavailable', err);
+        },
+      );
+      const framesUpdate = api.scene.frames().then(
+        (frames: SceneFramesResponse) => {
+          set({ frames, lastUpdatedAtMs: Date.now() });
+        },
+        (err: unknown) => {
+          rememberError('Frames inventory unavailable', err);
+        },
+      );
+      await Promise.allSettled([sceneUpdate, framesUpdate]);
+      if (firstError !== null) {
+        set({ error: firstError });
       }
-      try {
-        frames = await framesP;
-      } catch (err: unknown) {
-        if (error === null) {
-          error = err instanceof Error ? err.message : 'Frames inventory unavailable';
-        }
-      }
-      const refreshed = scene !== null || frames !== null;
-      set((state) => ({
-        scene: scene ?? state.scene,
-        frames: frames ?? state.frames,
-        error,
-        lastUpdatedAtMs: refreshed ? Date.now() : state.lastUpdatedAtMs,
-      }));
     } finally {
       set({ refreshInFlight: false });
     }

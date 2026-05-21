@@ -513,6 +513,23 @@ class KernelClient(ABC):
         self, target_frame: str, base_frame: str
     ) -> Optional[Dict[str, Any]]: ...
 
+    def get_link_poses(
+        self, target_frames: List[str], base_frame: str
+    ) -> Dict[str, Dict[str, Any]]:
+        """Return poses for multiple frames.
+
+        Backends with native batch FK should override this method. The default
+        loop preserves compatibility for simple mocks and non-native clients,
+        but observer routes should still call this surface so native backends
+        can avoid one scene-lock acquisition per visual frame.
+        """
+        poses: Dict[str, Dict[str, Any]] = {}
+        for target_frame in target_frames:
+            pose = self.get_link_pose(target_frame, base_frame)
+            if pose is not None:
+                poses[target_frame] = pose
+        return poses
+
     @abstractmethod
     def get_object_pose(
         self, object_id: str, base_frame: str
