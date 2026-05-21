@@ -27,6 +27,7 @@ from .routes_program import create_program_router
 from .routes_filesystem import create_filesystem_router
 from .routes_kernel import create_kernel_router
 from .routes_scene import create_scene_router
+from .routes_scene_meshes import create_scene_meshes_router
 from .routes_pointcloud import create_pointcloud_router
 from .routes_snapshot import create_snapshot_router
 from .routes_urdf import create_urdf_router
@@ -139,6 +140,11 @@ def create_app(
     )
     app.include_router(create_kernel_router(state), prefix="/api/kernel", tags=["kernel"])
     app.include_router(create_scene_router(state), prefix="/api/scene", tags=["scene"])
+    app.include_router(
+        create_scene_meshes_router(state),
+        prefix="/api/scene/object-meshes",
+        tags=["scene-object-meshes"],
+    )
     app.include_router(create_urdf_router(state), prefix="/api/scene/urdf", tags=["scene-urdf"])
     # Snapshot router carries the /ws/scene/snapshot WS + the upload
     # POST under /api/scene/snapshot/upload/{request_id}; both paths

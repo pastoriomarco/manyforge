@@ -4,7 +4,7 @@ import { api } from '../api/client';
 import { useProgramStore } from '../store/programStore';
 import { useSceneStateStore } from '../store/sceneStateStore';
 import { useViewerSelectionStore } from '../store/viewerSelectionStore';
-import type { ProgramSceneResource, SceneObjectState } from '../types/api';
+import type { ProgramSceneResource, SceneObjectState, SceneShapeState } from '../types/api';
 
 /**
  * Day-5 object-edit overlay panel. Renders metadata for whichever
@@ -429,7 +429,7 @@ function SaveStatus({
   );
 }
 
-function ShapeReadout({ shape }: { shape: Record<string, unknown> | null }) {
+function ShapeReadout({ shape }: { shape: SceneShapeState | null }) {
   if (shape === null) return null;
   const type = String(shape.type ?? '?');
   let detail = '';
@@ -442,11 +442,20 @@ function ShapeReadout({ shape }: { shape: Record<string, unknown> | null }) {
   } else if (typeof shape.mesh_resource_uri === 'string') {
     detail = String(shape.mesh_resource_uri);
   }
+  const meshStatus =
+    typeof shape.mesh_asset_status === 'string' && shape.mesh_asset_status
+      ? String(shape.mesh_asset_status)
+      : null;
   return (
     <div>
       <div className="text-[10px] uppercase tracking-wide text-gray-500">Shape</div>
       <div className="font-mono text-[11px]">{type}</div>
       {detail && <div className="font-mono text-[10px] text-gray-400">{detail}</div>}
+      {meshStatus && (
+        <div className="font-mono text-[10px] text-orange-300">
+          mesh asset: {meshStatus}
+        </div>
+      )}
     </div>
   );
 }

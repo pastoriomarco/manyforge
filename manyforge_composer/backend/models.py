@@ -864,6 +864,7 @@ class KernelSnapshotResponse(BaseModel):
 
 
 class SceneShapeResponse(BaseModel):
+    model_config = _ALIAS_EXTRA_CFG
     type: str
     box_dimensions_m: Optional[List[float]] = None
     sphere_radius_m: Optional[float] = None

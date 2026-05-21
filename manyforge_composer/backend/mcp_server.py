@@ -142,6 +142,14 @@ def create_mcp_server(state: ComposerState):
             return json.dumps({"success": False, "error": "Kernel not available"})
 
         with state.scene_edit_lock:
+            if operation in {"add", "upsert"} and shape_type == "mesh":
+                from .routes_scene_meshes import validate_scene_mesh_resource_or_409
+
+                validate_scene_mesh_resource_or_409(
+                    state,
+                    mesh_resource_uri,
+                    mesh_scale,
+                )
             request = SceneEditRequest(
                 operation=operation,
                 object_id=object_id,

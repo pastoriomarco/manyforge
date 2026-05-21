@@ -560,9 +560,31 @@ export interface SceneRobotState {
   tcp_pose_in_base?: Record<string, unknown> | null;
 }
 
+export type MeshAssetStatus =
+  | 'ok'
+  | 'pending'
+  | 'missing'
+  | 'unsupported_format'
+  | 'parse_failed'
+  | 'conversion_timeout'
+  | 'too_large'
+  | 'outside_allowed_roots';
+
+export interface SceneShapeState {
+  type?: string;
+  box_dimensions_m?: number[];
+  sphere_radius_m?: number;
+  cylinder_radius_m?: number;
+  cylinder_height_m?: number;
+  mesh_resource_uri?: string;
+  mesh_scale?: number[];
+  mesh_asset_url?: string | null;
+  mesh_asset_status?: MeshAssetStatus | string | null;
+}
+
 export interface SceneObjectState {
   object_id: string;
-  shape?: Record<string, unknown> | null;
+  shape?: SceneShapeState | null;
   pose_in_universe?: Record<string, unknown> | null;
   attached: boolean;
   attached_to?: string | null;

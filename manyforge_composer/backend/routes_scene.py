@@ -171,18 +171,42 @@ def build_scene_frames_payload(state: ComposerState) -> dict[str, Any]:
     ).model_dump(by_alias=True)
 
 
-def _scene_shape_response(scene_object) -> SceneShapeResponse | None:
+def _scene_shape_response(state: ComposerState, scene_object) -> SceneShapeResponse | None:
     if scene_object.shape is None:
         return None
-    return SceneShapeResponse(
-        type=scene_object.shape.type,
-        box_dimensions_m=scene_object.shape.box_dimensions_m,
-        sphere_radius_m=scene_object.shape.sphere_radius_m,
-        cylinder_radius_m=scene_object.shape.cylinder_radius_m,
-        cylinder_height_m=scene_object.shape.cylinder_height_m,
-        mesh_resource_uri=scene_object.shape.mesh_resource_uri,
-        mesh_scale=scene_object.shape.mesh_scale,
-    )
+    mesh_asset_url = None
+    mesh_asset_status = None
+    if scene_object.shape.type == "mesh":
+        try:
+            from .routes_scene_meshes import scene_mesh_shape_metadata
+
+            metadata = scene_mesh_shape_metadata(
+                state,
+                scene_object.shape.mesh_resource_uri,
+                scene_object.shape.mesh_scale,
+            )
+            mesh_asset_url = metadata.get("mesh_asset_url")
+            mesh_asset_status = metadata.get("mesh_asset_status")
+        except Exception:
+            logger.debug(
+                "Could not resolve scene mesh visualization metadata for %s",
+                getattr(scene_object, "object_id", "<unknown>"),
+                exc_info=True,
+            )
+            mesh_asset_status = "parse_failed"
+    payload: dict[str, Any] = {
+        "type": scene_object.shape.type,
+        "box_dimensions_m": scene_object.shape.box_dimensions_m,
+        "sphere_radius_m": scene_object.shape.sphere_radius_m,
+        "cylinder_radius_m": scene_object.shape.cylinder_radius_m,
+        "cylinder_height_m": scene_object.shape.cylinder_height_m,
+        "mesh_resource_uri": scene_object.shape.mesh_resource_uri,
+        "mesh_scale": scene_object.shape.mesh_scale,
+    }
+    if scene_object.shape.type == "mesh":
+        payload["mesh_asset_url"] = mesh_asset_url
+        payload["mesh_asset_status"] = mesh_asset_status
+    return SceneShapeResponse(**payload)
 
 
 def build_scene_state_payload(state: ComposerState) -> dict[str, Any]:
@@ -288,7 +312,7 @@ def build_scene_state_payload(state: ComposerState) -> dict[str, Any]:
             objects.append(
                 SceneObjectResponse(
                     object_id=scene_object.object_id,
-                    shape=_scene_shape_response(scene_object),
+                    shape=_scene_shape_response(state, scene_object),
                     pose_in_universe=scene_object.pose_in_universe,
                     attached=scene_object.attached,
                     attached_to=scene_object.frame_id if scene_object.attached else None,
@@ -871,6 +895,18 @@ def create_scene_router(state: ComposerState) -> APIRouter:
                         "error": "Kernel not available",
                         "timestamp_ns": time.monotonic_ns(),
                     },
+                )
+
+            if (
+                validated.operation in {"add", "upsert"}
+                and validated.shape_type == "mesh"
+            ):
+                from .routes_scene_meshes import validate_scene_mesh_resource_or_409
+
+                validate_scene_mesh_resource_or_409(
+                    state,
+                    validated.mesh_resource_uri,
+                    validated.mesh_scale,
                 )
 
             scene_request = SceneEditRequest(

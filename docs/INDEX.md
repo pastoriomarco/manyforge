@@ -33,6 +33,10 @@ guidance required for LLM-assisted development.
   - Practical E2E assistant recipes, known-good demo launch, and model/profile
     smoke checks.
 
+- [`operations/ISAAC_SCENE_AUTHORING.md`](operations/ISAAC_SCENE_AUTHORING.md)
+  - Operator runbook for exporting Isaac Sim scene meshes and loading them
+    through Composer.
+
 - [`guides/INTERRUPT_DEMO.md`](guides/INTERRUPT_DEMO.md)
   - Operator guide for the interrupt-focused pick-and-place demo.
 

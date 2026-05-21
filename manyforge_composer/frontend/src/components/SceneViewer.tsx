@@ -1,5 +1,5 @@
-import { Suspense, useEffect, useMemo, useRef, useState } from 'react';
-import type { MutableRefObject } from 'react';
+import { Component, Suspense, useEffect, useMemo, useRef, useState } from 'react';
+import type { ErrorInfo, MutableRefObject, ReactNode } from 'react';
 import { Canvas } from '@react-three/fiber';
 import {
   Grid,
@@ -11,7 +11,7 @@ import {
   useGLTF,
 } from '@react-three/drei';
 import * as THREE from 'three';
-import type { Mesh } from 'three';
+import type { Group, Mesh } from 'three';
 
 import { api } from '../api/client';
 import {
@@ -25,10 +25,12 @@ import { useSceneStateStore, useScenePolling } from '../store/sceneStateStore';
 import { useStatusPolling, useStatusStore } from '../store/statusStore';
 import { useViewerSelectionStore } from '../store/viewerSelectionStore';
 import type {
+  MeshAssetStatus,
   PreviewLinkPosesRequest,
   PreviewLinkPosesResponse,
   SceneFrameState,
   SceneObjectState,
+  SceneShapeState,
   SceneUrdfManifest,
   SceneUrdfVisual,
   TreeNode,
@@ -589,12 +591,11 @@ function SceneObjectMesh({
   gizmoSpace: GizmoSpace;
   isDraggingRef: MutableRefObject<boolean>;
 }) {
-  // State-as-ref: the lint rule `react-hooks/refs` (correctly) forbids
-  // reading `someRef.current` during render. We instead store the live
-  // Mesh node directly in component state so the `object` prop on
-  // <TransformControls> is a normal reactive value. The TS-typed mesh
-  // is also handed back to the pose-emit helper unchanged.
-  const [meshNode, setMeshNode] = useState<Mesh | null>(null);
+  // State-as-ref: TransformControls needs a stable Object3D. Mesh-backed
+  // scene objects can swap their child renderer while GLB assets load or
+  // fail, so the controls attach to this stable wrapper group rather than
+  // to a primitive mesh or a GLB primitive.
+  const [objectNode, setObjectNode] = useState<Group | null>(null);
   // Object-tab focus gate: the TransformControls only mount when the
   // operator has the Object panel open. Selecting an object from a
   // different panel keeps the selection visible (highlight, right-click
@@ -607,6 +608,68 @@ function SceneObjectMesh({
   const opacity = object.attached ? 0.85 : 1.0;
   const shapeType = typeof shape?.type === 'string' ? (shape.type as string) : null;
   const editable = object.persistable && !object.attached;
+
+  return (
+    <>
+      <group
+        ref={setObjectNode}
+        position={pose.position}
+        quaternion={pose.quaternion}
+        onClick={(event) => {
+          event.stopPropagation();
+          onSelect();
+        }}
+        onContextMenu={(event) => {
+          event.stopPropagation();
+          // Block the browser's native menu so ours can take over.
+          // `nativeEvent` is the synthetic R3F event's underlying
+          // DOM event; preventDefault here propagates to the
+          // canvas-level handler too.
+          event.nativeEvent.preventDefault();
+          onSelect();
+          onContextMenu(object.object_id, event.nativeEvent.clientX, event.nativeEvent.clientY);
+        }}
+      >
+        {shapeType === 'mesh' ? (
+          <SceneObjectMeshAsset shape={shape} color={color} opacity={opacity} />
+        ) : (
+          <SceneObjectPrimitive shape={shape} color={color} opacity={opacity} shapeType={shapeType} />
+        )}
+      </group>
+      {objectPanelActive && selected && editable && !locked && objectNode !== null && (
+        <TransformControls
+          object={objectNode}
+          mode={gizmoMode}
+          space={gizmoSpace}
+          // drei TransformControls emits `dragging-changed`. Reflect
+          // it into the parent ref so the Canvas's onPointerMissed
+          // skips the deselect during the drag — that was the cause
+          // of the "drag releases after a fraction of a second" bug
+          // reported in the first pass.
+          onMouseDown={() => {
+            isDraggingRef.current = true;
+          }}
+          onMouseUp={() => {
+            isDraggingRef.current = false;
+            emitObjectPoseEdit(object.object_id, objectNode);
+          }}
+        />
+      )}
+    </>
+  );
+}
+
+function SceneObjectPrimitive({
+  shape,
+  color,
+  opacity,
+  shapeType,
+}: {
+  shape: SceneShapeState | null;
+  color: string;
+  opacity: number;
+  shapeType: string | null;
+}) {
   const cylinderRadius = typeof shape?.cylinder_radius_m === 'number' ? shape.cylinder_radius_m : 0.05;
   const cylinderHeight = typeof shape?.cylinder_height_m === 'number' ? shape.cylinder_height_m : 0.1;
   const cylinderGeometry = useMemo(() => {
@@ -643,61 +706,160 @@ function SceneObjectMesh({
   }, [cylinderGeometry, shape, shapeType]);
 
   return (
-    <>
-      <mesh
-        ref={setMeshNode}
-        position={pose.position}
-        quaternion={pose.quaternion}
-        onClick={(event) => {
-          event.stopPropagation();
-          onSelect();
-        }}
-        onContextMenu={(event) => {
-          event.stopPropagation();
-          // Block the browser's native menu so ours can take over.
-          // `nativeEvent` is the synthetic R3F event's underlying
-          // DOM event; preventDefault here propagates to the
-          // canvas-level handler too.
-          event.nativeEvent.preventDefault();
-          onSelect();
-          onContextMenu(object.object_id, event.nativeEvent.clientX, event.nativeEvent.clientY);
-        }}
-      >
-        {geometry}
-        <meshStandardMaterial
-          color={color}
-          transparent={opacity < 1}
-          opacity={opacity}
-          wireframe={shapeType !== 'box' && shapeType !== 'sphere' && shapeType !== 'cylinder'}
-        />
-      </mesh>
-      {objectPanelActive && selected && editable && !locked && meshNode !== null && (
-        <TransformControls
-          object={meshNode}
-          mode={gizmoMode}
-          space={gizmoSpace}
-          // drei TransformControls emits `dragging-changed`. Reflect
-          // it into the parent ref so the Canvas's onPointerMissed
-          // skips the deselect during the drag — that was the cause
-          // of the "drag releases after a fraction of a second" bug
-          // reported in the first pass.
-          onMouseDown={() => {
-            isDraggingRef.current = true;
-          }}
-          onMouseUp={() => {
-            isDraggingRef.current = false;
-            emitObjectPoseEdit(object.object_id, meshNode);
-          }}
-        />
-      )}
-    </>
+    <mesh>
+      {geometry}
+      <meshStandardMaterial
+        color={color}
+        transparent={opacity < 1}
+        opacity={opacity}
+        wireframe={shapeType !== 'box' && shapeType !== 'sphere' && shapeType !== 'cylinder'}
+      />
+    </mesh>
   );
 }
 
-function emitObjectPoseEdit(objectId: string, mesh: Mesh | null): void {
-  if (!mesh) return;
-  const position = mesh.position.toArray() as [number, number, number];
-  const q = mesh.quaternion;
+function SceneObjectMeshAsset({
+  shape,
+  color,
+  opacity,
+}: {
+  shape: SceneShapeState | null;
+  color: string;
+  opacity: number;
+}) {
+  const status = (shape?.mesh_asset_status ?? 'missing') as MeshAssetStatus | string;
+  const url = typeof shape?.mesh_asset_url === 'string' ? shape.mesh_asset_url : null;
+  useClearPreviousSceneMeshUrl(url);
+  if (status === 'ok' && url) {
+    return (
+      <SceneMeshErrorBoundary
+        resetKey={url}
+        fallback={<SceneMeshStatusMarker status="parse_failed" color={color} />}
+      >
+        <Suspense fallback={<SceneMeshStatusMarker status="pending" color={color} />}>
+          <SceneObjectMeshGltf url={url} color={color} opacity={opacity} />
+        </Suspense>
+      </SceneMeshErrorBoundary>
+    );
+  }
+  return <SceneMeshStatusMarker status={status} color={color} />;
+}
+
+function useClearPreviousSceneMeshUrl(url: string | null): void {
+  const previousUrlRef = useRef<string | null>(null);
+  useEffect(() => {
+    const previous = previousUrlRef.current;
+    if (previous !== null && previous !== url) {
+      (useGLTF as unknown as { clear?: (target: string) => void }).clear?.(previous);
+    }
+    previousUrlRef.current = url;
+  }, [url]);
+}
+
+function SceneObjectMeshGltf({
+  url,
+  color,
+  opacity,
+}: {
+  url: string;
+  color: string;
+  opacity: number;
+}) {
+  const gltf = useGLTF(url);
+  const cloned = useMemo(() => {
+    const root = gltf.scene.clone(true);
+    root.traverse((obj) => {
+      const mesh = obj as THREE.Mesh;
+      if (!mesh.isMesh) return;
+      const sourceMaterials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+      const tinted = sourceMaterials.map((source) => {
+        const material = source.clone() as THREE.MeshStandardMaterial;
+        material.color?.set(color);
+        if (opacity < 1) {
+          material.transparent = true;
+          material.opacity = opacity;
+          material.depthWrite = false;
+        }
+        return material;
+      });
+      mesh.material = Array.isArray(mesh.material) ? tinted : tinted[0];
+    });
+    return root;
+  }, [gltf.scene, color, opacity]);
+  return <primitive key={url} object={cloned} />;
+}
+
+function SceneMeshStatusMarker({ status, color }: { status: string; color: string }) {
+  const label = meshStatusLabel(status);
+  const markerColor = status === 'pending' ? color : '#f97316';
+  return (
+    <group>
+      <mesh>
+        <boxGeometry args={[0.05, 0.05, 0.05]} />
+        <meshStandardMaterial color={markerColor} wireframe opacity={0.95} transparent />
+      </mesh>
+      <Html position={[0, 0, 0.075]} center distanceFactor={8} style={{ pointerEvents: 'none' }}>
+        <div className="rounded border border-orange-500 bg-gray-950/90 px-2 py-1 text-[10px] font-semibold uppercase tracking-wide text-orange-200 shadow">
+          {label}
+        </div>
+      </Html>
+    </group>
+  );
+}
+
+function meshStatusLabel(status: string): string {
+  switch (status) {
+    case 'pending':
+      return 'mesh loading';
+    case 'missing':
+      return 'mesh missing';
+    case 'unsupported_format':
+      return 'unsupported mesh';
+    case 'parse_failed':
+      return 'mesh parse failed';
+    case 'conversion_timeout':
+      return 'mesh timeout';
+    case 'too_large':
+      return 'mesh too large';
+    case 'outside_allowed_roots':
+      return 'mesh path blocked';
+    default:
+      return 'mesh unavailable';
+  }
+}
+
+class SceneMeshErrorBoundary extends Component<
+  { resetKey: string; fallback: ReactNode; children: ReactNode },
+  { failed: boolean }
+> {
+  state = { failed: false };
+
+  static getDerivedStateFromError(): { failed: boolean } {
+    return { failed: true };
+  }
+
+  componentDidCatch(error: Error, info: ErrorInfo): void {
+    console.warn('scene mesh asset failed to load', error, info.componentStack);
+  }
+
+  componentDidUpdate(prevProps: { resetKey: string }): void {
+    if (prevProps.resetKey !== this.props.resetKey && this.state.failed) {
+      this.setState({ failed: false });
+    }
+  }
+
+  render(): ReactNode {
+    if (this.state.failed) {
+      return this.props.fallback;
+    }
+    return this.props.children;
+  }
+}
+
+function emitObjectPoseEdit(objectId: string, group: Group | null): void {
+  if (!group) return;
+  const position = group.position.toArray() as [number, number, number];
+  const q = group.quaternion;
   void api.scene
     .edit({
       operation: 'update_pose',

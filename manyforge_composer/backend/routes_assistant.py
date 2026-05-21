@@ -2030,6 +2030,7 @@ def _apply_scene_draft_resource_single(
     tool_id = f"scene_draft_{operation}_object"
     force_discard_overrides = _force_discard_overrides(arguments)
     resource = _scene_resource_from_draft_arguments(state, arguments, tool_id=tool_id)
+    _validate_scene_resource_mesh_boundary(state, resource)
     program_data = state.program.to_dict()
     scene = list(program_data.get("scene") or [])
     scene_index = next(
@@ -2079,6 +2080,19 @@ def _apply_scene_draft_resource_single(
     }
 
 
+def _validate_scene_resource_mesh_boundary(state: ComposerState, resource) -> None:
+    shape = getattr(resource, "shape", {}) or {}
+    if shape.get("type") != "mesh":
+        return
+    from .routes_scene_meshes import validate_scene_mesh_resource_or_409
+
+    validate_scene_mesh_resource_or_409(
+        state,
+        shape.get("mesh_resource_uri"),
+        shape.get("mesh_scale"),
+    )
+
+
 def _apply_scene_draft_resources_upsert(
     state: ComposerState,
     *,
@@ -2097,6 +2111,8 @@ def _apply_scene_draft_resources_upsert(
         if isinstance(item.get("object_id"), str)
     }
     resources = _scene_resources_from_upsert_arguments(state, arguments)
+    for resource in resources:
+        _validate_scene_resource_mesh_boundary(state, resource)
     inserted: list[str] = []
     updated: list[str] = []
     unchanged: list[str] = []

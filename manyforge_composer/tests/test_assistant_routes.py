@@ -550,6 +550,11 @@ def test_assistant_bridge_composer_draft_callback_accepts_mesh_scene_resource(
     tmp_path: Path,
 ) -> None:
     program_path = _write_minimal_program(tmp_path)
+    mesh_path = tmp_path / "obstacle.obj"
+    mesh_path.write_text(
+        "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n",
+        encoding="utf-8",
+    )
     state.load_program(str(program_path))
     state.deployment = _assistant_mode_deployment()
     catalog_hash = _assistant_catalog_hash(state, "composer-assistant")
@@ -563,7 +568,7 @@ def test_assistant_bridge_composer_draft_callback_accepts_mesh_scene_resource(
             "arguments": {
                 "objectId": "mesh_obstacle",
                 "shapeType": "mesh",
-                "meshResourceUri": "file:///workspace/meshes/obstacle.obj",
+                "meshResourceUri": str(mesh_path),
                 "meshScale": [1.0, 1.0, 1.0],
                 "position": [0.2, 0.1, 0.0],
                 "frameId": "universe",
@@ -577,7 +582,7 @@ def test_assistant_bridge_composer_draft_callback_accepts_mesh_scene_resource(
     assert state.program is not None
     resource = state.program.scene[0]
     assert resource.shape["type"] == "mesh"
-    assert resource.shape["mesh_resource_uri"] == "file:///workspace/meshes/obstacle.obj"
+    assert resource.shape["mesh_resource_uri"] == str(mesh_path)
     assert resource.shape["mesh_scale"] == [1.0, 1.0, 1.0]
 
 
