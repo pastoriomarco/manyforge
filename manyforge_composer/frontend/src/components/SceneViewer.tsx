@@ -20,6 +20,7 @@ import {
 } from '../streaming/followTargetController';
 import { usePointCloudStore, usePointCloudSubscription } from '../store/pointCloudStore';
 import { useProgramStore } from '../store/programStore';
+import { useRobotCommandAuthority } from '../store/commandAuthority';
 import { useSceneStateStore, useScenePolling } from '../store/sceneStateStore';
 import { useStatusPolling, useStatusStore } from '../store/statusStore';
 import { useViewerSelectionStore } from '../store/viewerSelectionStore';
@@ -44,6 +45,8 @@ import { SnapshotResponder } from './SnapshotResponder';
 // update loop when combined with downstream useMemo deps. Sharing the
 // same identity across renders keeps zustand's bailout path working.
 const EMPTY_OBJECTS: SceneObjectState[] = [];
+
+const EMPTY_GRIPPERS: import('../types/api').SceneGripperState[] = [];
 
 const EMPTY_LINK_POSES: Record<
   string,
@@ -299,7 +302,7 @@ function SceneObjectContextMenu({
       ? (pose!.orientation_xyzw as number[]).map(Number)
       : [0, 0, 0, 1];
     const shape = object.shape as Record<string, unknown> | null;
-    const shapeType = shape?.type as 'box' | 'sphere' | 'mesh' | undefined;
+    const shapeType = shape?.type as 'box' | 'sphere' | 'cylinder' | 'mesh' | undefined;
     void api.scene
       .edit({
         operation: 'add',
@@ -310,6 +313,10 @@ function SceneObjectContextMenu({
           : undefined,
         sphere_radius_m:
           typeof shape?.sphere_radius_m === 'number' ? (shape.sphere_radius_m as number) : undefined,
+        cylinder_radius_m:
+          typeof shape?.cylinder_radius_m === 'number' ? (shape.cylinder_radius_m as number) : undefined,
+        cylinder_height_m:
+          typeof shape?.cylinder_height_m === 'number' ? (shape.cylinder_height_m as number) : undefined,
         pose_position_m: position as [number, number, number],
         pose_orientation_xyzw: orientation as [number, number, number, number],
       })
@@ -600,6 +607,25 @@ function SceneObjectMesh({
   const opacity = object.attached ? 0.85 : 1.0;
   const shapeType = typeof shape?.type === 'string' ? (shape.type as string) : null;
   const editable = object.persistable && !object.attached;
+  const cylinderRadius = typeof shape?.cylinder_radius_m === 'number' ? shape.cylinder_radius_m : 0.05;
+  const cylinderHeight = typeof shape?.cylinder_height_m === 'number' ? shape.cylinder_height_m : 0.1;
+  const cylinderGeometry = useMemo(() => {
+    if (shapeType !== 'cylinder') {
+      return null;
+    }
+    const geometry = new THREE.CylinderGeometry(cylinderRadius, cylinderRadius, cylinderHeight, 32);
+    // RoboPlan/Coal cylinders are Z-axis primitives. Three.js cylinders are
+    // Y-axis primitives, so rotate the geometry instead of the scene object;
+    // this keeps pose edits and TransformControls in the backend frame.
+    geometry.rotateX(Math.PI / 2);
+    return geometry;
+  }, [cylinderHeight, cylinderRadius, shapeType]);
+
+  useEffect(() => {
+    return () => {
+      cylinderGeometry?.dispose();
+    };
+  }, [cylinderGeometry]);
 
   const geometry = useMemo(() => {
     if (shapeType === 'box') {
@@ -610,8 +636,11 @@ function SceneObjectMesh({
       const radius = typeof shape?.sphere_radius_m === 'number' ? shape.sphere_radius_m : 0.05;
       return <sphereGeometry args={[radius, 24, 16]} />;
     }
+    if (shapeType === 'cylinder') {
+      return cylinderGeometry ? <primitive object={cylinderGeometry} attach="geometry" /> : null;
+    }
     return <boxGeometry args={[0.05, 0.05, 0.05]} />;
-  }, [shape, shapeType]);
+  }, [cylinderGeometry, shape, shapeType]);
 
   return (
     <>
@@ -639,7 +668,7 @@ function SceneObjectMesh({
           color={color}
           transparent={opacity < 1}
           opacity={opacity}
-          wireframe={shapeType !== 'box' && shapeType !== 'sphere'}
+          wireframe={shapeType !== 'box' && shapeType !== 'sphere' && shapeType !== 'cylinder'}
         />
       </mesh>
       {objectPanelActive && selected && editable && !locked && meshNode !== null && (
@@ -950,6 +979,7 @@ function TcpJogGizmo() {
   const robotMode = useViewerSelectionStore((s) => s.robotMode);
   const cartesianFrame = useViewerSelectionStore((s) => s.cartesianFrame);
   const gizmoMode = useViewerSelectionStore((s) => s.cartesianGizmoMode);
+  const commandGate = useRobotCommandAuthority({ allowFollowTargetActive: true });
   const tcpPose = useSceneStateStore((s) => s.scene?.robot?.tcp_pose_in_base ?? null);
   const tcpFrame = useSceneStateStore((s) => s.scene?.robot?.tcp_frame ?? null);
   const baseFrame = useSceneStateStore((s) => s.scene?.robot?.base_frame ?? null);
@@ -1072,7 +1102,7 @@ function TcpJogGizmo() {
     };
   }, [anchor, initialPose]);
 
-  if (!robotPanelActive || robotMode !== 'cartesian' || initialPose === null) {
+  if (!robotPanelActive || robotMode !== 'cartesian' || initialPose === null || !commandGate.canCommand) {
     return null;
   }
 
@@ -1106,6 +1136,7 @@ function TcpJogGizmo() {
           mode={gizmoMode}
           space={gizmoSpace}
           onMouseDown={() => {
+            if (!commandGate.canCommand) return;
             // Guard against drei firing onMouseDown twice before
             // mouseUp. Local UI state (draggingRef + draggingGizmo
             // store flag) is set unconditionally — independent of
@@ -1316,10 +1347,16 @@ function MoveToGhostRobot() {
   const liveJointPositions = useSceneStateStore(
     (s) => s.scene?.robot?.joint_positions ?? null,
   );
+  // Backend auto-discovered gripper visualization metadata (ADR-0018
+  // unreachable-ghost fallback). Empty for deployments with no
+  // grippers; the unreachable path then falls through to the floor
+  // marker via Tier C in the render block below.
+  const grippers = useSceneStateStore((s) => s.scene?.grippers ?? EMPTY_GRIPPERS);
   const appliedTree = useProgramStore((s) => s.appliedTree);
   const [frames, setFrames] = useState<SceneFrameState[]>([]);
   const [manifest, setManifest] = useState<SceneUrdfManifest | null>(null);
   const [preview, setPreview] = useState<PreviewLinkPosesResponse | null>(null);
+  const previewRequestSeqRef = useRef(0);
 
   // Fetch frames + URDF manifest once when Move-To becomes active. Both
   // are needed to compute the target (frames feed the Frame source)
@@ -1377,11 +1414,13 @@ function MoveToGhostRobot() {
   // is sub-millisecond — comfortable budget at this rate.
   useEffect(() => {
     if (target === null || manifest === null) {
+      previewRequestSeqRef.current += 1;
       setPreview(null);
       return;
     }
     const linkNames = manifest.links.map((l) => l.name);
     const handle = window.setTimeout(() => {
+      const requestSeq = ++previewRequestSeqRef.current;
       let req: PreviewLinkPosesRequest;
       if (target.kind === 'cartesian') {
         // Pass the live joint configuration as the IK seed so the
@@ -1415,8 +1454,16 @@ function MoveToGhostRobot() {
       }
       void api.scene
         .previewLinkPoses(req)
-        .then((r) => setPreview(r))
-        .catch(() => setPreview(null));
+        .then((r) => {
+          if (requestSeq === previewRequestSeqRef.current) {
+            setPreview(r);
+          }
+        })
+        .catch(() => {
+          if (requestSeq === previewRequestSeqRef.current) {
+            setPreview(null);
+          }
+        });
     }, 250);
     return () => window.clearTimeout(handle);
   }, [target, manifest, tcpFrame, liveJointNames, liveJointPositions]);
@@ -1458,29 +1505,111 @@ function MoveToGhostRobot() {
     );
   }
 
-  // Unreachable: render only the TCP link (the "gripper") at the
-  // supplied target pose, in red. Operator gets a clear "you asked
-  // for this TCP pose, the rest of the arm can't reach it" cue
-  // without an axes-only ambiguity.
-  if (preview.tcp_pose === undefined || tcpFrame === null) return null;
-  const tcpLink = manifest.links.find((l) => l.name === tcpFrame);
-  if (tcpLink === undefined) return null;
+  // Unreachable target. Render a red silhouette at the commanded TCP
+  // pose so the operator gets visual feedback. Render order, by
+  // preference:
+  //
+  //   1. tcp_frame is itself a link with visuals (e.g. UR5+simple
+  //      tool with primitive boxes on tool0). Render those.
+  //   2. Otherwise — and for most industrial grippers tcp_frame is a
+  //      virtual grasp/tcp frame with no mesh — render the
+  //      auto-discovered gripper subtree (root + all descendants)
+  //      that the backend resolves from `mount_frame`. See ADR-0018
+  //      and routes_urdf.resolve_gripper_visualization.
+  //   3. Floor marker: a small red wireframe sphere at the TCP pose.
+  //      Always renders so the operator never gets a silent "ghost
+  //      missing" state.
+  if (preview.tcp_pose === undefined) return null;
   const modelKey = manifest.model_key ?? manifest.robot_id ?? 'unknown';
+  const ghostKey = `${modelKey}:ghost-unreachable:${tcpFrame ?? 'tcp'}`;
+  const tcpPos = preview.tcp_pose.position_m as [number, number, number];
+  const tcpQuat = preview.tcp_pose.orientation_xyzw as [number, number, number, number];
+
+  const tcpLink = tcpFrame
+    ? manifest.links.find((l) => l.name === tcpFrame)
+    : undefined;
+  const tcpLinkHasVisuals =
+    tcpLink !== undefined && tcpLink.visuals.length > 0;
+
+  // First gripper with an auto-discovered visualization wins: the
+  // common single-gripper deployment has exactly one, and a
+  // multi-gripper deployment should disambiguate by tcp_frame
+  // upstream (tracked as a separate refinement).
+  const gripperViz = (() => {
+    for (const g of grippers) {
+      if (g.visualization) return g.visualization;
+    }
+    return null;
+  })();
+
+  // The subtree path renders root + all descendants posed relative
+  // to root, at the URDF default joint configuration. Rendering only
+  // the root link is unintelligible — Robotiq's robotiq_base_link
+  // is a featureless block; the fingers and knuckles are what make
+  // the silhouette recognizable as a gripper.
+  const gripperSubtreeRenderables: Array<{
+    pose: { position: [number, number, number]; quaternion: [number, number, number, number] };
+    visuals: typeof manifest.links[number]['visuals'];
+    linkName: string;
+  }> = [];
+  if (gripperViz) {
+    for (const subtreeLink of gripperViz.subtree_links ?? []) {
+      const link = manifest.links.find((l) => l.name === subtreeLink.name);
+      if (link === undefined || link.visuals.length === 0) continue;
+      gripperSubtreeRenderables.push({
+        pose: {
+          position: subtreeLink.position_m as [number, number, number],
+          quaternion: subtreeLink.orientation_xyzw as [number, number, number, number],
+        },
+        visuals: link.visuals,
+        linkName: subtreeLink.name,
+      });
+    }
+  }
+  const gripperSubtreeHasVisuals = gripperSubtreeRenderables.length > 0;
+
   return (
-    <group
-      name="manyforge-ghost-tcp-unreachable"
-      key={`${modelKey}:ghost-unreachable:${tcpFrame}`}
-      position={preview.tcp_pose.position_m as [number, number, number]}
-      quaternion={preview.tcp_pose.orientation_xyzw as [number, number, number, number]}
-    >
-      {tcpLink.visuals.map((visual) => (
-        <GhostVisual
-          key={`${modelKey}:ghost-unreachable:${tcpFrame}:${visual.index}:${visual.mesh_url ?? 'primitive'}`}
-          visual={visual}
-          opacity={0.5}
-          color="#ff3333"
-        />
-      ))}
+    <group name="manyforge-ghost-tcp-unreachable" key={ghostKey} position={tcpPos} quaternion={tcpQuat}>
+      {tcpLinkHasVisuals && (
+        tcpLink!.visuals.map((visual) => (
+          <GhostVisual
+            key={`${modelKey}:ghost-unreachable:tcp:${tcpFrame}:${visual.index}:${visual.mesh_url ?? 'primitive'}`}
+            visual={visual}
+            opacity={0.5}
+            color="#ff3333"
+          />
+        ))
+      )}
+      {!tcpLinkHasVisuals && gripperSubtreeHasVisuals && gripperViz && (
+        <group
+          position={gripperViz.tcp_to_root_position_m as [number, number, number]}
+          quaternion={gripperViz.tcp_to_root_orientation_xyzw as [number, number, number, number]}
+        >
+          {gripperSubtreeRenderables.map(({ pose, visuals, linkName }) => (
+            <group
+              key={`${modelKey}:ghost-unreachable:subtree:${linkName}`}
+              position={pose.position}
+              quaternion={pose.quaternion}
+            >
+              {visuals.map((visual) => (
+                <GhostVisual
+                  key={`${modelKey}:ghost-unreachable:subtree:${linkName}:${visual.index}:${visual.mesh_url ?? 'primitive'}`}
+                  visual={visual}
+                  opacity={0.5}
+                  color="#ff3333"
+                />
+              ))}
+            </group>
+          ))}
+        </group>
+      )}
+      {/* Always-on floor marker — a small red wireframe sphere at
+          the commanded TCP pose. Small enough that it doesn't
+          obscure the mesh silhouettes above when they render. */}
+      <mesh>
+        <sphereGeometry args={[0.02, 16, 12]} />
+        <meshBasicMaterial color="#ff3333" wireframe />
+      </mesh>
     </group>
   );
 }

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import time
 from typing import Any, Optional
 
@@ -12,11 +13,6 @@ from manyforge_behavior.cycle_manager import CycleState
 from manyforge_behavior.kernel_client import (
     GripperCommandRequest,
     SceneEditRequest,
-)
-from manyforge_behavior.model_paths import (
-    default_package_paths,
-    resolve_package_uri,
-    resolve_robot_model,
 )
 
 from .models import (
@@ -67,67 +63,17 @@ def canonical_scene_world_frame(state: ComposerState) -> str:
     return "universe"
 
 
-def _make_package_handler(package_dirs: list[str]):
-    def handler(fname: str) -> str:
-        if not fname.startswith("package://"):
-            return fname
-        resolved = resolve_package_uri(fname, package_dirs)
-        if resolved is not None:
-            return resolved
-        return fname
-
-    return handler
-
-
 def _load_model_frame_names(state: ComposerState) -> list[str]:
-    deployment = state.deployment
-    if deployment is None:
-        return []
-    if not state.deployment_source_path:
-        return []
-
-    robot_config = deployment.robot_config
-    if not robot_config.urdf_path:
-        return []
-
-    extra_package_paths = (
-        []
-        if robot_config.package_paths
-        else default_package_paths()
-    )
     try:
-        resolved_model = resolve_robot_model(
-            urdf_path=robot_config.urdf_path,
-            srdf_path=robot_config.srdf_path,
-            package_paths=robot_config.package_paths,
-            deployment_path=state.deployment_source_path,
-            extra_package_paths=extra_package_paths,
-        )
+        from .routes_urdf import get_urdf_entry
+
+        entry = get_urdf_entry(state)
     except Exception:
-        logger.debug("Could not resolve robot model while building frame inventory", exc_info=True)
+        logger.debug("Could not resolve URDF cache while building frame inventory", exc_info=True)
         return []
-
-    try:
-        import yourdfpy
-
-        if resolved_model.package_paths:
-            model = yourdfpy.URDF.load(
-                resolved_model.urdf_path,
-                filename_handler=_make_package_handler(resolved_model.package_paths),
-                load_meshes=False,
-            )
-        else:
-            model = yourdfpy.URDF.load(
-                resolved_model.urdf_path,
-                load_meshes=False,
-            )
-    except Exception:
-        logger.debug("Could not load URDF while building frame inventory", exc_info=True)
+    if entry is None:
         return []
-
-    link_map = getattr(model, "link_map", {}) or {}
-    frame_names = sorted(str(name) for name in link_map.keys())
-    return frame_names
+    return sorted(link.name for link in entry.links)
 
 
 def _scene_frame_roles(state: ComposerState) -> dict[str, set[str]]:
@@ -359,17 +305,30 @@ def build_scene_state_payload(state: ComposerState) -> dict[str, Any]:
             visual_link_names_for_fk = None  # type: ignore[assignment]
         if visual_link_names_for_fk is not None:
             world_frame = canonical_scene_world_frame(state)
-            for link_name in visual_link_names_for_fk(state):
+            link_names = list(visual_link_names_for_fk(state))
+            batch_getter = getattr(state.kernel, "get_link_poses", None)
+            if callable(batch_getter):
                 try:
-                    pose = state.kernel.get_link_pose(link_name, world_frame)
+                    raw_link_poses = batch_getter(link_names, world_frame)
                 except Exception:
-                    pose = None
-                if pose is None:
-                    continue
-                link_poses[link_name] = {
-                    "position_m": list(pose["position_m"]),
-                    "orientation_xyzw": list(pose["orientation_xyzw"]),
-                }
+                    raw_link_poses = {}
+                for link_name, pose in raw_link_poses.items():
+                    link_poses[str(link_name)] = {
+                        "position_m": list(pose["position_m"]),
+                        "orientation_xyzw": list(pose["orientation_xyzw"]),
+                    }
+            else:
+                for link_name in link_names:
+                    try:
+                        pose = state.kernel.get_link_pose(link_name, world_frame)
+                    except Exception:
+                        pose = None
+                    if pose is None:
+                        continue
+                    link_poses[link_name] = {
+                        "position_m": list(pose["position_m"]),
+                        "orientation_xyzw": list(pose["orientation_xyzw"]),
+                    }
 
     return SceneStateResponse(
         robot=robot_info,
@@ -399,6 +358,29 @@ def _gripper_joint_limits(
     return (None, None)
 
 
+def _direct_gripper_cycle_blocker(state: ComposerState) -> JSONResponse | None:
+    """Reject ad hoc gripper commands while another authority owns execution."""
+    cycle_manager = state.cycle_manager
+    if cycle_manager is None:
+        return None
+    cycle_state = cycle_manager.state
+    if cycle_state in {
+        CycleState.RUNNING,
+        CycleState.INTERRUPT_HANDLER,
+        CycleState.DIRECT_CONTROL,
+    }:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "detail": (
+                    "Gripper direct commands are allowed only while the cycle is "
+                    f"idle or stopped; current cycle state is {cycle_state.value}"
+                )
+            },
+        )
+    return None
+
+
 def _collect_gripper_states(state: ComposerState) -> list[SceneGripperStateResponse]:
     """One entry per gripper declared in the active deployment. Surfaces
     enough metadata for the Robot panel's gripper widget to render a
@@ -417,6 +399,31 @@ def _collect_gripper_states(state: ComposerState) -> list[SceneGripperStateRespo
         kernel.update_gripper_commands()
     except Exception:
         logger.debug("update_gripper_commands failed", exc_info=True)
+    joint_limits: dict[str, tuple[Optional[float], Optional[float]]] = {}
+    try:
+        from .routes_urdf import get_urdf_entry
+
+        entry = get_urdf_entry(state)
+        if entry is not None:
+            joint_limits = {
+                joint.name: (joint.limit_lower, joint.limit_upper)
+                for joint in entry.joints
+            }
+    except Exception:
+        logger.debug("gripper limit cache build failed", exc_info=True)
+    # Resolve auto-discovered visualization root + tcp→root SE(3)
+    # once per scene-state call. Pure read against the URDF cache, so
+    # the cost is one helper call per gripper per poll. ADR-0018 +
+    # ADR-0016 audit-second-pass R-tier note: this powers the
+    # Move-To unreachable-ghost frontend fallback so the operator
+    # always sees a recognizable gripper silhouette at the unreachable
+    # target, regardless of whether tcp_frame is itself a visual link.
+    try:
+        from .routes_urdf import resolve_gripper_visualization
+    except Exception:
+        resolve_gripper_visualization = None  # type: ignore[assignment]
+        logger.debug("routes_urdf not importable; scene gripper viz disabled", exc_info=True)
+
     out: list[SceneGripperStateResponse] = []
     for gripper_id, config in deployment.grippers.items():
         try:
@@ -424,7 +431,48 @@ def _collect_gripper_states(state: ComposerState) -> list[SceneGripperStateRespo
         except Exception:
             logger.debug("get_gripper_status failed for %s", gripper_id, exc_info=True)
             continue
-        limit_lower, limit_upper = _gripper_joint_limits(state, config.joint_name)
+        limit_lower, limit_upper = joint_limits.get(
+            config.joint_name,
+            (None, None),
+        )
+        visualization = None
+        if resolve_gripper_visualization is not None:
+            srdf_gripper_joints: tuple[str, ...] = ()
+            joint_name = (config.joint_name or "").strip()
+            if joint_name:
+                srdf_gripper_joints = (joint_name,)
+            try:
+                resolution = resolve_gripper_visualization(
+                    state,
+                    mount_frame=config.mount_frame,
+                    tcp_frame=config.tcp_frame,
+                    srdf_gripper_joint_names=srdf_gripper_joints,
+                )
+            except Exception:
+                logger.debug(
+                    "Gripper visualization resolution failed for %s",
+                    gripper_id,
+                    exc_info=True,
+                )
+                resolution = None
+            if resolution is not None:
+                visualization = {
+                    "gripper_root_link": resolution.gripper_root_link,
+                    "tcp_to_root_position_m": list(
+                        resolution.tcp_to_root_position_m
+                    ),
+                    "tcp_to_root_orientation_xyzw": list(
+                        resolution.tcp_to_root_orientation_xyzw
+                    ),
+                    "subtree_links": [
+                        {
+                            "name": link.name,
+                            "position_m": list(link.position_m),
+                            "orientation_xyzw": list(link.orientation_xyzw),
+                        }
+                        for link in resolution.subtree_links
+                    ],
+                }
         out.append(
             SceneGripperStateResponse(
                 gripper_id=gripper_id,
@@ -436,6 +484,7 @@ def _collect_gripper_states(state: ComposerState) -> list[SceneGripperStateRespo
                 limit_upper=limit_upper,
                 motion_time_s=config.motion_time_s,
                 srdf_presets=dict(config.srdf_presets or {}),
+                visualization=visualization,
                 error=status.error,
             )
         )
@@ -655,26 +704,68 @@ def create_scene_router(state: ComposerState) -> APIRouter:
                 status_code=503,
                 content={"detail": "Kernel is not attached"},
             )
+        blocked = _direct_gripper_cycle_blocker(state)
+        if blocked is not None:
+            return blocked
+        target_position = float(validated.target_position)
+        if not math.isfinite(target_position):
+            return JSONResponse(
+                status_code=400,
+                content={"detail": "targetPosition must be finite"},
+            )
+        max_effort = (
+            None if validated.max_effort is None else float(validated.max_effort)
+        )
+        if max_effort is not None and (not math.isfinite(max_effort) or max_effort < 0.0):
+            return JSONResponse(
+                status_code=400,
+                content={"detail": "maxEffort must be finite and >= 0"},
+            )
         duration_s = (
             float(config.motion_time_s)
             if validated.duration_s is None
             else float(validated.duration_s)
         )
+        if not math.isfinite(duration_s) or duration_s < 0.0:
+            return JSONResponse(
+                status_code=400,
+                content={"detail": "durationS must be finite and >= 0"},
+            )
+        limit_lower, limit_upper = _gripper_joint_limits(state, config.joint_name)
+        if limit_lower is None or limit_upper is None:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "detail": (
+                        f"Cannot command gripper '{validated.gripper_id}' because "
+                        f"joint '{config.joint_name}' has no finite URDF limits"
+                    )
+                },
+            )
+        if target_position < float(limit_lower) or target_position > float(limit_upper):
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "detail": (
+                        f"targetPosition {target_position} is outside limits "
+                        f"[{float(limit_lower)}, {float(limit_upper)}] for "
+                        f"gripper joint '{config.joint_name}'"
+                    )
+                },
+            )
         request = GripperCommandRequest(
             gripper_id=validated.gripper_id,
             group_id=str(config.group_id),
             joint_name=str(config.joint_name),
-            target_position=float(validated.target_position),
+            target_position=target_position,
             duration_s=duration_s,
-            max_effort=(
-                None if validated.max_effort is None else float(validated.max_effort)
-            ),
+            max_effort=max_effort,
         )
         result = state.kernel.command_gripper(request)
         return SceneGripperCommandApiResponse(
             accepted=bool(result.accepted),
             gripperId=validated.gripper_id,
-            targetPosition=float(validated.target_position),
+            targetPosition=target_position,
             error=(None if result.accepted else (result.error or "rejected")),
             timestampNs=time.monotonic_ns(),
         ).model_dump(by_alias=True)
@@ -774,6 +865,8 @@ def create_scene_router(state: ComposerState) -> APIRouter:
                 shape_type=validated.shape_type,
                 box_dimensions_m=validated.box_dimensions_m,
                 sphere_radius_m=validated.sphere_radius_m,
+                cylinder_radius_m=validated.cylinder_radius_m,
+                cylinder_height_m=validated.cylinder_height_m,
                 mesh_resource_uri=validated.mesh_resource_uri,
                 mesh_scale=validated.mesh_scale,
                 pose_position_m=validated.pose_position_m,

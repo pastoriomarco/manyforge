@@ -212,11 +212,17 @@ class MockExecution : public IExecutionBackend {
   ExecutionSnapshot snapshot;
   Result<void> next_sync_result = Result<void>::Ok();
   std::function<void()> on_sync;
+  /// Optional override for the terminal state reported back to the kernel
+  /// at the end of `execute_trajectory`. When unset, behave as before
+  /// (`kCompleted`). Used by tests that need to drive the kernel into a
+  /// non-default terminal state (e.g. `kInterventionRequired`) to exercise
+  /// the explicit acknowledgement paths.
+  std::optional<ExecutionState> next_terminal_state;
 
   ExecutionHandle execute_trajectory(const TrajectoryDTO& trajectory) override {
     ++execute_count;
     last_trajectory = trajectory;
-    snapshot.state = ExecutionState::kCompleted;
+    snapshot.state = next_terminal_state.value_or(ExecutionState::kCompleted);
     snapshot.progress = 1.0;
     if (!trajectory.waypoints.empty()) {
       snapshot.joint_positions_rad = trajectory.waypoints.back().positions_rad;
@@ -468,7 +474,9 @@ class ControlledExecution : public IExecutionBackend {
 
 class ThreadSafeManualScheduler final : public IScheduler {
  public:
-  ScheduleHandle schedule(TimePoint deadline, std::function<void()> callback) override {
+  ScheduleHandle schedule(
+      TimePoint deadline, std::function<void()> callback,
+      SchedulerPriority /*priority*/ = SchedulerPriority::Safety) override {
     std::lock_guard<std::mutex> lock(mu_);
     ScheduleHandle handle = next_handle_++;
     pending_.emplace(deadline, std::make_pair(handle, std::move(callback)));
@@ -1135,6 +1143,28 @@ TEST_F(ExecutionKernelTest, Execute_StartStateMismatch_Fails) {
   EXPECT_EQ(kernel.get_status().state, ExecutionState::kFailed);
 }
 
+TEST_F(ExecutionKernelTest, Execute_StartStateValidationComparesByJointName) {
+  RobotStateDTO reordered_state;
+  reordered_state.joint_names = {"j2", "j1"};
+  reordered_state.positions_rad = {0.0, 0.0};
+  context.current_state = reordered_state;
+
+  execute_sync(make_test_request("move_start_named"));
+  EXPECT_EQ(kernel.get_status().state, ExecutionState::kCompleted);
+  EXPECT_EQ(execution.execute_count, 1);
+}
+
+TEST_F(ExecutionKernelTest, Execute_StartStateMissingJointName_FailsClosed) {
+  RobotStateDTO ambiguous_state;
+  ambiguous_state.joint_names = {"j1"};
+  ambiguous_state.positions_rad = {0.0};
+  context.current_state = ambiguous_state;
+
+  execute_sync(make_test_request("move_start_missing_joint"));
+  EXPECT_EQ(kernel.get_status().state, ExecutionState::kFailed);
+  EXPECT_EQ(execution.execute_count, 0);
+}
+
 // --- Pre-execution collision ---
 
 TEST_F(ExecutionKernelTest, Execute_PreCollisionCheck_Blocks) {
@@ -1180,6 +1210,85 @@ TEST_F(ExecutionKernelTest, AcknowledgeCompleted_FromFailed_Rejected) {
   auto ack = kernel.acknowledge_completed(result.value());
   EXPECT_FALSE(ack.accepted);
   EXPECT_EQ(kernel.get_status().state, ExecutionState::kFailed);
+}
+
+// --- Explicit acknowledge_intervention API ---
+//
+// `execute()` rejects with `kErrorInvalidRequest` while in
+// `kInterventionRequired`. The only legitimate exit is an explicit
+// `acknowledge_intervention(principal_id, reason)` call, which clears
+// the state and emits a `kInterventionAcknowledged` event whose details
+// carry the principal and reason for traceability.
+
+TEST_F(ExecutionKernelTest, Execute_FromInterventionRequired_Rejected) {
+  execution.next_terminal_state = ExecutionState::kInterventionRequired;
+  auto first = execute_sync(make_test_request());
+  ASSERT_TRUE(first.ok());
+  EXPECT_EQ(kernel.get_status().state, ExecutionState::kInterventionRequired);
+
+  auto rejected = kernel.execute(make_test_request());
+  EXPECT_FALSE(rejected.ok());
+  EXPECT_EQ(kernel.get_status().state, ExecutionState::kInterventionRequired);
+  ASSERT_TRUE(rejected.error().details.contains("reason_code"));
+  EXPECT_EQ(rejected.error().details.at("reason_code"), "intervention_required");
+}
+
+TEST_F(ExecutionKernelTest, AcknowledgeIntervention_FromIntervention_TransitionsToIdle) {
+  execution.next_terminal_state = ExecutionState::kInterventionRequired;
+  auto first = execute_sync(make_test_request());
+  ASSERT_TRUE(first.ok());
+  EXPECT_EQ(kernel.get_status().state, ExecutionState::kInterventionRequired);
+
+  std::vector<KernelEvent> events;
+  kernel.subscribe_events(
+      [&](const KernelEvent& e) { events.push_back(e); });
+
+  auto ack = kernel.acknowledge_intervention("operator_alice", "ui_run_resume");
+  ASSERT_TRUE(ack.accepted);
+  EXPECT_EQ(kernel.get_status().state, ExecutionState::kIdle);
+
+  // Subsequent execute() must succeed: clear next_terminal_state so the
+  // backend reports a normal Completed result for the resume run.
+  execution.next_terminal_state.reset();
+  auto resumed = execute_sync(make_test_request());
+  EXPECT_TRUE(resumed.ok());
+
+  bool saw_ack_event = false;
+  for (const auto& e : events) {
+    if (e.type == KernelEventType::kInterventionAcknowledged) {
+      saw_ack_event = true;
+      ASSERT_TRUE(e.details.contains("principal_id"));
+      EXPECT_EQ(e.details.at("principal_id"), "operator_alice");
+      ASSERT_TRUE(e.details.contains("reason"));
+      EXPECT_EQ(e.details.at("reason"), "ui_run_resume");
+      ASSERT_TRUE(e.details.contains("prev_state"));
+      EXPECT_EQ(e.details.at("prev_state"),
+                to_string(ExecutionState::kInterventionRequired));
+      break;
+    }
+  }
+  EXPECT_TRUE(saw_ack_event)
+      << "kInterventionAcknowledged event was not emitted";
+}
+
+TEST_F(ExecutionKernelTest, AcknowledgeIntervention_FromIdle_Rejected) {
+  EXPECT_EQ(kernel.get_status().state, ExecutionState::kIdle);
+
+  auto ack = kernel.acknowledge_intervention("operator_bob", "spurious");
+  EXPECT_FALSE(ack.accepted);
+  ASSERT_TRUE(ack.error.has_value());
+  EXPECT_EQ(ack.error->code, kErrorInvalidRequest);
+}
+
+TEST_F(ExecutionKernelTest, AcknowledgeIntervention_FromCompleted_Rejected) {
+  auto first = execute_sync(make_test_request());
+  ASSERT_TRUE(first.ok());
+  EXPECT_EQ(kernel.get_status().state, ExecutionState::kCompleted);
+
+  auto ack = kernel.acknowledge_intervention("operator_carol", "wrong_state");
+  EXPECT_FALSE(ack.accepted);
+  EXPECT_EQ(kernel.get_status().state, ExecutionState::kCompleted)
+      << "Wrong-state ack must not transition out of Completed";
 }
 
 TEST_F(ExecutionKernelTest, Execute_FromFailed_ResetsStateAndRetriesWithoutBackendReset) {

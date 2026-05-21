@@ -12,6 +12,7 @@ from typing import Any, Optional
 import pytest
 
 from manyforge_behavior.kernel_client import ExecutionState, ExecutionSnapshot, ExecutionStatus
+from manyforge_composer.backend import event_recorder as event_recorder_module
 from manyforge_composer.backend.event_recorder import EventRecorder
 
 
@@ -394,6 +395,7 @@ class TestJSONLSink:
                 kernel=_StubKernel(status=failed, snapshot=failed_snapshot),
             )
         )
+        assert rec.wait_for_failure_archives_idle()
 
         archive_root = tmp_path / "failure-archives"
         archives = sorted(path for path in archive_root.iterdir() if path.is_dir())
@@ -444,6 +446,7 @@ class TestJSONLSink:
             run_id=rec.current_run_id,
             details={"error": "simulated incident"},
         )
+        assert rec.wait_for_failure_archives_idle()
 
         assert not old_by_age.exists()
         assert not fifo_oldest.exists()
@@ -453,6 +456,75 @@ class TestJSONLSink:
         assert cleanup["deleted_count"] >= 2
         assert "max_age_s" in cleanup["reason"]
         assert "max_bytes" in cleanup["reason"]
+
+    def test_failure_archive_queue_pressure_is_reported(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(event_recorder_module, "_FAILURE_ARCHIVE_QUEUE_SIZE", 1)
+
+        def slow_archive(self, job):
+            time.sleep(0.2)
+            archive_path = self._failure_archive_dir / f"incident-test-{job.event['event_index']}"
+            archive_path.mkdir(parents=True, exist_ok=True)
+            return archive_path
+
+        monkeypatch.setattr(EventRecorder, "_write_failure_archive", slow_archive)
+        rec = EventRecorder(trace_dir=tmp_path)
+        rec.observe(_StubState(cycle_manager=_StubCycleManager("idle")))
+        rec.observe(_StubState(cycle_manager=_StubCycleManager("running")))
+        run_id = rec.current_run_id
+
+        for i in range(8):
+            rec._record_event(
+                event_type="cycle_error",
+                run_id=run_id,
+                details={"error": f"simulated incident {i}"},
+            )
+
+        status = rec.failure_archive_status()
+        assert status["queue_capacity"] == 1
+        assert status["dropped_archives"] > 0
+        assert status["last_archive_error"] == "failure archive queue full"
+        assert rec.wait_for_failure_archives_idle(timeout_s=2.0)
+
+    def test_native_streaming_events_project_into_history_once(self):
+        rec = EventRecorder()
+        native_events = [
+            {
+                "event_index": 1,
+                "type": "streaming_session_started",
+                "timestamp_ns": 101,
+                "execution_id": 42,
+                "details": {"session_id": 7, "input_mode": "cartesian"},
+            },
+            {
+                "event_index": 2,
+                "type": "streaming_target_dispatched",
+                "timestamp_ns": 102,
+                "execution_id": 42,
+                "details": {"session_id": 7},
+            },
+            {
+                "event_index": 3,
+                "type": "streaming_target_rejected",
+                "timestamp_ns": 103,
+                "execution_id": 42,
+                "error": {"code": "ik_failed", "message": "IK failed"},
+                "details": {"session_id": 7, "source_sequence": 12},
+            },
+        ]
+
+        rec.record_native_kernel_events(native_events)
+        rec.record_native_kernel_events(native_events)
+
+        events = _memory_events(rec)
+        event_types = [event["type"] for event in events]
+        assert event_types == ["streaming_session_started", "streaming_target_rejected"]
+        assert events[0]["execution_mode"] == "direct_control"
+        assert events[0]["component"] == "manyforge.direct_control"
+        assert events[0]["details"]["native_kernel_event_index"] == 1
+        assert events[1]["severity"] == "WARN"
+        assert events[1]["details"]["error_code"] == "ik_failed"
+        assert events[1]["details"]["error"] == "IK failed"
+        assert events[1]["details"]["native_kernel_event_index"] == 3
 
     def test_history_filters_by_severity_component_and_type(self):
         rec = EventRecorder()

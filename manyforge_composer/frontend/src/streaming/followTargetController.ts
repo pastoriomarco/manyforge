@@ -109,6 +109,8 @@ class FollowTargetController {
   // instead of a multi-second dead window.
   private pendingBeginOpts: BeginOptions | null = null;
   private pendingBeginToken: FollowTargetDragToken | null = null;
+  private pendingFramesByToken: Map<FollowTargetDragToken, StreamingFrame> =
+    new Map();
   private activeDragToken: FollowTargetDragToken | null = null;
   private nextDragToken = 1;
 
@@ -167,9 +169,10 @@ class FollowTargetController {
    *
    * The caller (gizmo drag handler) should always proceed with the
    * local drag state when this returns a token, regardless of whether
-   * the session opens immediately or queues. push() is a no-op until
-   * the session reaches 'streaming' phase, so deferred pushes are
-   * harmless; the backend coalesces inbound targets anyway.
+   * the session opens immediately or queues. Pushes for a queued token
+   * are retained latest-wins and replayed once the deferred session
+   * opens, so a spinner click cannot lose its only target while the
+   * previous session is still ending.
    */
   begin(opts: BeginOptions): FollowTargetDragToken | null {
     const token = this.nextDragToken++;
@@ -203,6 +206,11 @@ class FollowTargetController {
     ) {
       return;
     }
+    if (token !== undefined && token !== null) {
+      this.pendingFramesByToken.delete(token);
+    } else {
+      this.pendingFramesByToken.clear();
+    }
     this.pendingBeginOpts = null;
     this.pendingBeginToken = null;
   }
@@ -218,6 +226,12 @@ class FollowTargetController {
     this.setPhase('opening');
     const session = openFollowTargetSession(opts);
     this.session = session;
+    const queuedFrame = this.pendingFramesByToken.get(token);
+    if (queuedFrame !== undefined) {
+      this.pendingFramesByToken.delete(token);
+      this.rememberFramePose(queuedFrame);
+      session.pushTarget(queuedFrame);
+    }
 
     session.onError((code, message) => {
       this.abort(`server error: ${code} ${message}`);
@@ -268,7 +282,14 @@ class FollowTargetController {
   }
 
   push(token: FollowTargetDragToken | null, frame: StreamingFrame): void {
-    if (token === null || token !== this.activeDragToken) return;
+    if (token === null) return;
+    if (token !== this.activeDragToken) {
+      if (token === this.pendingBeginToken) {
+        this.pendingFramesByToken.set(token, frame);
+        this.rememberFramePose(frame);
+      }
+      return;
+    }
     // Accept pushes during 'opening' as well as 'streaming'. The WS
     // client buffers the latest frame in `pendingFrame` and flushes
     // it as soon as the server's `began` message arrives, so the
@@ -278,17 +299,7 @@ class FollowTargetController {
     // session yet or one being torn down.
     if (this._phase !== 'streaming' && this._phase !== 'opening') return;
     if (this.session === null) return;
-    if (frame.kind === 'cartesian') {
-      // Joint streaming intentionally does not maintain lastTargetPose:
-      // the magenta out-of-reach indicator is a Cartesian-only concept
-      // (operator-controlled pose disagreeing with what IK can reach).
-      // Joint sliders bypass IK and are bounded by joint limits at the
-      // backend, so there is no equivalent indicator anchor to track.
-      this.lastTargetPose = {
-        position: [...frame.positionM],
-        quaternion: [...frame.orientationXyzw],
-      };
-    }
+    this.rememberFramePose(frame);
     try {
       this.session.pushTarget(frame);
     } catch (err) {
@@ -332,6 +343,7 @@ class FollowTargetController {
     this.setPhase('aborted');
     this.pendingBeginOpts = null;
     this.pendingBeginToken = null;
+    this.pendingFramesByToken.clear();
     this.activeDragToken = null;
     const session = this.session;
     if (session !== null) {
@@ -381,6 +393,21 @@ class FollowTargetController {
       this.pendingBeginToken = null;
       this._begin_now(opts, token);
     }
+  }
+
+  private rememberFramePose(frame: StreamingFrame): void {
+    if (frame.kind !== 'cartesian') {
+      // Joint streaming intentionally does not maintain lastTargetPose:
+      // the magenta out-of-reach indicator is a Cartesian-only concept
+      // (operator-controlled pose disagreeing with what IK can reach).
+      // Joint sliders bypass IK and are bounded by joint limits at the
+      // backend, so there is no equivalent indicator anchor to track.
+      return;
+    }
+    this.lastTargetPose = {
+      position: [...frame.positionM],
+      quaternion: [...frame.orientationXyzw],
+    };
   }
 }
 

@@ -12,7 +12,13 @@ import yaml
 from manyforge_behavior.capabilities import V0_0_REQUIRED_KEYS
 from manyforge_behavior.kernel_client import ExecutionState, MockKernelClient
 from manyforge_behavior.runner import OrchestratorRunner
-from manyforge_behavior.cycle_manager import CycleManager, CycleState, InterventionSession
+from manyforge_behavior.cycle_manager import (
+    CycleManager,
+    CycleState,
+    InterventionSession,
+    PendingInterrupt,
+    RecoveryTrigger,
+)
 
 CATALOG_PATH = str(Path(__file__).parent.parent / "resources" / "node_catalog.yaml")
 FIXTURE_PATH = str(
@@ -1119,8 +1125,8 @@ class TestCycleManagerVelocityScale:
         with pytest.raises(ValueError):
             manager.set_velocity_scale(float("inf"))
     
-    def test_velocity_scale_applied_to_motion(self, kernel):
-        """velocity_scale is written to blackboard and accessible."""
+    def test_velocity_scale_forwarded_to_runtime_kernel(self, kernel):
+        """velocity_scale is written to blackboard and forwarded as live control."""
         runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
         manager = CycleManager(runner, kernel)
         
@@ -1130,6 +1136,8 @@ class TestCycleManagerVelocityScale:
         bb = py_trees.blackboard.Client(name="test_vs")
         bb.register_key(key="velocity_scale", access=py_trees.common.Access.READ)
         assert bb.velocity_scale == 0.75
+        assert kernel.runtime_velocity_scale == pytest.approx(0.75)
+        assert kernel.runtime_velocity_scale_updates[-1] == pytest.approx(0.75)
     
     def test_stop_flag_blocks_new_motion(self, kernel):
         """stop_requested flag is written to blackboard."""
@@ -1906,3 +1914,175 @@ class TestKernelEventBridge:
         assert len(events) == len(drained)
         assert all("event_index" in event for event in events)
         assert manager.drain_kernel_events_now() == []
+
+
+# --- Recovery trigger taxonomy ---
+
+
+class TestRecoveryTriggerTaxonomy:
+    """spec/460 §6.2.2 canonical taxonomy; legacy aliases for migration."""
+
+    CANONICAL = {
+        "planning_failed",
+        "validation_failed",
+        "execute_failed",
+        "execute_timeout",
+        "scene_mismatch",
+        "precondition_failed",
+        "postcondition_failed",
+    }
+
+    def test_all_canonical_values_are_loadable(self):
+        for value in self.CANONICAL:
+            assert RecoveryTrigger(value).value == value
+
+    def test_canonical_set_is_subset_of_enum(self):
+        present = {member.value for member in RecoveryTrigger}
+        assert self.CANONICAL.issubset(present)
+
+    def test_legacy_aliases_still_parse(self):
+        # These are kept for serialised-trace round-trip during the
+        # migration window. Removal target lives in open-points.md.
+        assert RecoveryTrigger("timeout") is RecoveryTrigger.TIMEOUT
+        assert RecoveryTrigger("node_failure") is RecoveryTrigger.NODE_FAILURE
+
+    def test_unknown_string_is_rejected(self):
+        with pytest.raises(ValueError):
+            RecoveryTrigger("made_up_reason")
+
+
+# --- Cycle-state machine + Run-side auto-ack ---
+
+
+class TestCycleStateMachine:
+    """spec/400 §6.6.2 — five-state machine."""
+
+    def test_all_documented_states_exist(self):
+        names = {state.name for state in CycleState}
+        # The three baseline operator states plus the two
+        # runtime-interruption / intervention states.
+        assert names >= {
+            "IDLE",
+            "RUNNING",
+            "STOPPED",
+            "INTERRUPT_HANDLER",
+            "DIRECT_CONTROL",
+        }
+
+
+class TestCycleManagerRunSideAutoAck:
+    """Run on STOPPED + kernel INTERVENTION_REQUIRED (spec/400 §6.6.2)."""
+
+    def _make_manager(self) -> tuple[CycleManager, MockKernelClient]:
+        kernel = MockKernelClient(execute_duration_s=0.5)
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        manager = CycleManager(runner, kernel)
+        return manager, kernel
+
+    def test_run_from_stopped_with_kernel_intervention_auto_acks(self):
+        manager, kernel = self._make_manager()
+        manager.run()
+        time.sleep(0.1)
+        manager.stop()
+        assert manager.state == CycleState.STOPPED
+
+        # Drive the kernel into INTERVENTION_REQUIRED via direct mutation
+        # of the in-memory mock. Production kernels reach this via backend
+        # snapshots or reset failure; both paths converge on
+        # `acknowledge_intervention` as the only legitimate exit.
+        kernel._state = ExecutionState.INTERVENTION_REQUIRED
+
+        # Run should auto-ack and transition back to RUNNING.
+        manager.run()
+        assert manager.state == CycleState.RUNNING
+        assert kernel.get_status().state != ExecutionState.INTERVENTION_REQUIRED
+
+    def test_run_from_stopped_with_kernel_intervention_fails_closed_if_intervention_session_running(
+        self,
+    ):
+        # An intervention session that the cycle manager still considers
+        # running is a direct-control lease per spec/400 §6.6.2 — auto-ack
+        # MUST refuse until the operator ends/promotes/aborts that session.
+        manager, kernel = self._make_manager()
+        manager.run()
+        time.sleep(0.1)
+        manager.stop()
+        assert manager.state == CycleState.STOPPED
+
+        kernel._state = ExecutionState.INTERVENTION_REQUIRED
+        manager._intervention = InterventionSession(
+            session_id="sess-1",
+            parent_run_id=None,
+            entry_state="STOPPED",
+            lease_timeout_ms=60_000,
+            lease_expires_at_ns=10**18,
+            resume_target="resume",
+            principal_id="human:test",
+        )
+        manager._intervention.status = "running"
+
+        with pytest.raises(RuntimeError, match="Cannot auto-acknowledge"):
+            manager.run()
+        assert manager.state == CycleState.STOPPED
+
+    def test_run_from_stopped_normal_path_unchanged(self):
+        # The auto-ack code path only fires when the kernel is in
+        # INTERVENTION_REQUIRED. Normal STOPPED resume must not call
+        # acknowledge_intervention, so no new event is emitted.
+        manager, kernel = self._make_manager()
+        manager.run()
+        time.sleep(0.1)
+        manager.stop()
+        assert manager.state == CycleState.STOPPED
+
+        events_before = list(manager.drain_kernel_events_now())
+        manager.run()
+        assert manager.state == CycleState.RUNNING
+        events_after = list(manager.drain_kernel_events_now())
+        ack_events = [
+            e for e in events_before + events_after
+            if e.get("type") == "acknowledge_intervention"
+        ]
+        assert ack_events == []
+
+    def test_helper_refuses_when_pending_interrupt_blocks(self):
+        # A latched pending interrupt that has NOT cleanly completed must
+        # block auto-ack. The cycle manager's existing run() STOPPED
+        # branch already refuses to resume in this state; the helper
+        # should report the same finding so the K4 path doesn't end-run
+        # around the interrupt gating.
+        manager, _kernel = self._make_manager()
+        manager._pending_interrupt = PendingInterrupt(
+            interrupt_id="int-1",
+            source_id="src",
+            source_adapter="test",
+            signal="latched",
+            kind="blackboard",
+            priority=10,
+            maskable=False,
+            policy_id=None,
+            handler_id=None,
+            preemption_mode="immediate",
+            after_handler="reset_required",   # not resumable_hold
+            active_node_name=None,
+            active_node_id=None,
+            active_move_id=None,
+            details={"handler_state": "latched"},
+        )
+        ok, reason = manager._can_auto_acknowledge_leftover_state()
+        assert ok is False
+        assert reason == "pending_interrupt_blocks_auto_ack"
+
+    def test_helper_refuses_when_kernel_status_unreadable(self):
+        # If the kernel's get_status() raises, the helper MUST fail
+        # closed with a structured reason — never silently swallow.
+        manager, kernel = self._make_manager()
+
+        def boom():
+            raise RuntimeError("kernel went away")
+
+        kernel.get_status = boom  # type: ignore[assignment]
+        ok, reason = manager._can_auto_acknowledge_leftover_state()
+        assert ok is False
+        assert reason.startswith("kernel_status_unreadable:")
+        assert "RuntimeError" in reason

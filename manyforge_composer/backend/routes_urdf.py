@@ -131,10 +131,18 @@ class _UrdfCacheEntry:
     joints: tuple[_JointEntry, ...]
     link_names_for_fk: tuple[str, ...]
     mesh_glb_cache: dict[tuple[str, int, str, str], bytes]
+    # yourdfpy.URDF model retained for on-demand FK queries
+    # (e.g. gripper-root resolution + tcp→root transform for the
+    # Move-To unreachable ghost). Loaded with `load_meshes=False` so
+    # the per-entry memory cost is the parsed XML + a few numpy
+    # arrays. None when the URDF could not be parsed.
+    urdf_model: Any = None
 
 
 _cache_lock = threading.Lock()
 _urdf_cache: dict[tuple[str, tuple[str, ...]], _UrdfCacheEntry] = {}
+_MAX_URDF_CACHE_ENTRIES = 8
+_MAX_GLB_CACHE_ENTRIES_PER_MODEL = 256
 
 
 def _make_package_handler(package_dirs: list[str]):
@@ -491,8 +499,11 @@ def _load_urdf_entry(urdf_path: str, package_paths: tuple[str, ...]) -> _UrdfCac
         joints=tuple(joints),
         link_names_for_fk=tuple(fk_link_names),
         mesh_glb_cache={},
+        urdf_model=urdf_model,
     )
     _urdf_cache[cache_key] = entry
+    while len(_urdf_cache) > _MAX_URDF_CACHE_ENTRIES:
+        _urdf_cache.pop(next(iter(_urdf_cache)))
     return entry
 
 
@@ -563,6 +574,320 @@ def active_urdf_model_key(state: ComposerState) -> str | None:
     return _entry_model_key(entry, robot_id)
 
 
+@dataclass(frozen=True)
+class GripperSubtreeLink:
+    """One link in the gripper subtree, posed relative to
+    `gripper_root_link` at the URDF default joint configuration
+    (open pose for SRDF group_state defaults; articulated mimic
+    chains follow their master at the default joint value)."""
+
+    name: str
+    position_m: tuple[float, float, float]
+    orientation_xyzw: tuple[float, float, float, float]
+
+
+@dataclass(frozen=True)
+class GripperVisualizationResolution:
+    """Resolved root link + tcp→root SE(3) + full subtree for the
+    Move-To unreachable ghost.
+
+    `gripper_root_link` is the first link reachable downstream of the
+    deployment's `mount_frame` (in the URDF joint tree) that has at
+    least one visual block. The frontend renders the FULL gripper
+    subtree in red at the operator's commanded TCP pose, offset by
+    `tcp_to_root_*` and then each link's `position_m`/
+    `orientation_xyzw` (relative to root). Showing only the root link
+    isn't legible to operators — Robotiq's base is just a cube; the
+    fingers and knuckles are what make the gripper recognizable as
+    such.
+
+    `tcp_to_root_position_m` and `tcp_to_root_orientation_xyzw`
+    describe the SE(3) transform from `tcp_frame` to
+    `gripper_root_link` at zero-joint-state. For typical gripper
+    attachments (fixed-joint chain from `tool0` to
+    `robotiq_base_link`) the transform is configuration-invariant.
+
+    `subtree_links` is the gripper_root_link + all its descendants
+    reachable via the URDF joint graph, each carrying its pose
+    relative to gripper_root_link. The root itself appears in the
+    list with identity transform so the frontend can render uniformly.
+    """
+
+    gripper_root_link: str
+    tcp_to_root_position_m: tuple[float, float, float]
+    tcp_to_root_orientation_xyzw: tuple[float, float, float, float]
+    subtree_links: tuple[GripperSubtreeLink, ...]
+
+
+def _has_visuals(entry: _UrdfCacheEntry, link_name: str) -> bool:
+    for link in entry.links:
+        if link.name == link_name:
+            return len(link.visuals) > 0
+    return False
+
+
+def _walk_gripper_root(
+    entry: _UrdfCacheEntry,
+    mount_frame: str,
+    srdf_gripper_joint_names: tuple[str, ...] = (),
+) -> str | None:
+    """Walk the URDF joint tree forward from `mount_frame` to the
+    first descendant link that has at least one visual.
+
+    Tiebreak when `mount_frame` has multiple downstream children: if
+    `srdf_gripper_joint_names` is non-empty, prefer the child whose
+    subtree contains the most joints from that list (typically the
+    gripper's SRDF group joints — `finger_joint` for Robotiq).
+    Otherwise fall back to the first child link reached in BFS order.
+    Returns None if no descendant has visuals (the floor-fallback
+    case where the unreachable ghost shows a red marker only).
+    """
+    if not mount_frame:
+        return None
+    # Adjacency: parent_link -> list of (child_link, joint_name)
+    children_of: dict[str, list[tuple[str, str]]] = {}
+    for joint in entry.joints:
+        children_of.setdefault(joint.parent_link, []).append(
+            (joint.child_link, joint.name)
+        )
+    if mount_frame not in children_of:
+        return None
+    srdf_set = set(srdf_gripper_joint_names)
+
+    def subtree_score(link: str) -> tuple[int, int]:
+        # (number of SRDF gripper joints in subtree, total descendants).
+        # First element drives the tiebreak; second breaks ties by size.
+        n_srdf, n_total = 0, 0
+        seen = {link}
+        stack = [link]
+        while stack:
+            node = stack.pop()
+            for child, joint_name in children_of.get(node, ()):
+                if child in seen:
+                    continue
+                seen.add(child)
+                n_total += 1
+                if joint_name in srdf_set:
+                    n_srdf += 1
+                stack.append(child)
+        return (n_srdf, n_total)
+
+    # Pick the best child of mount_frame, then BFS down to first
+    # link with visuals.
+    candidates = children_of[mount_frame]
+    if len(candidates) > 1:
+        candidates = sorted(candidates, key=lambda c: subtree_score(c[0]), reverse=True)
+    for child_link, _joint_name in candidates:
+        # BFS the subtree of this candidate to find first link with
+        # visuals.
+        from collections import deque
+
+        queue: deque[str] = deque([child_link])
+        seen: set[str] = {child_link}
+        while queue:
+            node = queue.popleft()
+            if _has_visuals(entry, node):
+                return node
+            for grandchild, _jn in children_of.get(node, ()):
+                if grandchild not in seen:
+                    seen.add(grandchild)
+                    queue.append(grandchild)
+    return None
+
+
+def _se3_transform_via_urdf(
+    entry: _UrdfCacheEntry, source_frame: str, target_frame: str
+) -> tuple[tuple[float, float, float], tuple[float, float, float, float]] | None:
+    """Return SE(3) (xyz, xyzw) from `source_frame` to `target_frame`
+    at the URDF's default joint configuration, or None if either
+    frame is not in the URDF or the transform is undefined.
+    """
+    model = entry.urdf_model
+    if model is None:
+        return None
+    link_map = getattr(model, "link_map", {}) or {}
+    if source_frame not in link_map or target_frame not in link_map:
+        return None
+    try:
+        # yourdfpy.URDF.get_transform(target, source) returns the 4x4
+        # homogeneous transform from source frame to target frame at
+        # the model's default configuration (zero joints unless the
+        # SRDF/URDF provides a non-default cfg). For fixed-joint
+        # chains (typical gripper attachments) this is
+        # configuration-invariant.
+        T = model.get_transform(frame_to=target_frame, frame_from=source_frame)
+    except Exception:
+        logger.debug(
+            "yourdfpy get_transform(%s -> %s) failed",
+            source_frame,
+            target_frame,
+            exc_info=True,
+        )
+        return None
+    if T is None:
+        return None
+    try:
+        import math
+
+        xyz = (float(T[0, 3]), float(T[1, 3]), float(T[2, 3]))
+        # Shepperd's quaternion extraction — same routine used by
+        # _origin_decompose for visual_origin. Kept inline to avoid
+        # depending on numpy here.
+        r00 = float(T[0, 0]); r01 = float(T[0, 1]); r02 = float(T[0, 2])
+        r10 = float(T[1, 0]); r11 = float(T[1, 1]); r12 = float(T[1, 2])
+        r20 = float(T[2, 0]); r21 = float(T[2, 1]); r22 = float(T[2, 2])
+        trace = r00 + r11 + r22
+        if trace > 0.0:
+            s = math.sqrt(trace + 1.0) * 2.0
+            qw = 0.25 * s
+            qx = (r21 - r12) / s
+            qy = (r02 - r20) / s
+            qz = (r10 - r01) / s
+        elif r00 > r11 and r00 > r22:
+            s = math.sqrt(1.0 + r00 - r11 - r22) * 2.0
+            qw = (r21 - r12) / s
+            qx = 0.25 * s
+            qy = (r01 + r10) / s
+            qz = (r02 + r20) / s
+        elif r11 > r22:
+            s = math.sqrt(1.0 + r11 - r00 - r22) * 2.0
+            qw = (r02 - r20) / s
+            qx = (r01 + r10) / s
+            qy = 0.25 * s
+            qz = (r12 + r21) / s
+        else:
+            s = math.sqrt(1.0 + r22 - r00 - r11) * 2.0
+            qw = (r10 - r01) / s
+            qx = (r02 + r20) / s
+            qy = (r12 + r21) / s
+            qz = 0.25 * s
+        norm = math.sqrt(qx * qx + qy * qy + qz * qz + qw * qw)
+        if norm > 1e-12:
+            qx /= norm; qy /= norm; qz /= norm; qw /= norm
+        else:
+            qx, qy, qz, qw = 0.0, 0.0, 0.0, 1.0
+        return xyz, (qx, qy, qz, qw)
+    except Exception:
+        logger.debug(
+            "tcp→root quaternion extraction failed for %s -> %s",
+            source_frame,
+            target_frame,
+            exc_info=True,
+        )
+        return None
+
+
+def _enumerate_gripper_subtree(
+    entry: _UrdfCacheEntry, gripper_root: str
+) -> tuple[str, ...]:
+    """Return gripper_root + all descendants reachable via the URDF
+    joint graph, in BFS order. Includes structural links (no visuals)
+    so the caller can decide whether to render or skip — the
+    backend's job is to enumerate, the frontend's job is to look up
+    visuals from the manifest."""
+    children_of: dict[str, list[str]] = {}
+    for joint in entry.joints:
+        children_of.setdefault(joint.parent_link, []).append(joint.child_link)
+    from collections import deque
+
+    out: list[str] = [gripper_root]
+    seen: set[str] = {gripper_root}
+    queue: deque[str] = deque([gripper_root])
+    while queue:
+        node = queue.popleft()
+        for child in children_of.get(node, ()):
+            if child in seen:
+                continue
+            seen.add(child)
+            out.append(child)
+            queue.append(child)
+    return tuple(out)
+
+
+def _collect_subtree_relative_poses(
+    entry: _UrdfCacheEntry, gripper_root: str, subtree: tuple[str, ...]
+) -> tuple[GripperSubtreeLink, ...]:
+    """For each link in `subtree`, compute its pose relative to
+    `gripper_root` at the URDF default configuration. Links whose
+    transform can't be computed are dropped (industrial fail-closed —
+    one bad link doesn't take down the whole ghost)."""
+    result: list[GripperSubtreeLink] = []
+    for link_name in subtree:
+        if link_name == gripper_root:
+            # Identity — root relative to itself.
+            result.append(
+                GripperSubtreeLink(
+                    name=link_name,
+                    position_m=(0.0, 0.0, 0.0),
+                    orientation_xyzw=(0.0, 0.0, 0.0, 1.0),
+                )
+            )
+            continue
+        transform = _se3_transform_via_urdf(entry, gripper_root, link_name)
+        if transform is None:
+            logger.debug(
+                "subtree FK miss for %s relative to %s",
+                link_name,
+                gripper_root,
+            )
+            continue
+        position, orientation = transform
+        result.append(
+            GripperSubtreeLink(
+                name=link_name,
+                position_m=position,
+                orientation_xyzw=orientation,
+            )
+        )
+    return tuple(result)
+
+
+def resolve_gripper_visualization(
+    state: ComposerState,
+    mount_frame: str,
+    tcp_frame: str,
+    *,
+    srdf_gripper_joint_names: tuple[str, ...] = (),
+) -> GripperVisualizationResolution | None:
+    """Resolve the gripper visualization root + subtree for the
+    Move-To unreachable ghost.
+
+    Industrial-safety properties:
+    - Side-effect-free (read-only URDF + FK).
+    - Always returns None on uncertainty (caller falls back to a
+      red-axes marker that ALWAYS renders).
+    - Deterministic tiebreak when `mount_frame` has multiple
+      downstream children: prefer the subtree containing the most
+      SRDF gripper-group joints (when provided), else BFS-first.
+    - Configuration-invariant for the typical fixed-joint
+      attachment chain.
+    - Subtree enumeration is BFS deterministic; one bad descendant
+      FK does not invalidate the whole resolution (drop-on-error).
+    """
+    entry = get_urdf_entry(state)
+    if entry is None:
+        return None
+    mount = (mount_frame or "").strip()
+    tcp = (tcp_frame or "").strip()
+    if not mount or not tcp:
+        return None
+    gripper_root = _walk_gripper_root(entry, mount, srdf_gripper_joint_names)
+    if gripper_root is None:
+        return None
+    transform = _se3_transform_via_urdf(entry, tcp, gripper_root)
+    if transform is None:
+        return None
+    position, orientation = transform
+    subtree_names = _enumerate_gripper_subtree(entry, gripper_root)
+    subtree_links = _collect_subtree_relative_poses(entry, gripper_root, subtree_names)
+    return GripperVisualizationResolution(
+        gripper_root_link=gripper_root,
+        tcp_to_root_position_m=position,
+        tcp_to_root_orientation_xyzw=orientation,
+        subtree_links=subtree_links,
+    )
+
+
 def _find_visual(
     entry: _UrdfCacheEntry,
     link_name: str,
@@ -602,7 +927,8 @@ def _render_visual_glb(
         _VISUAL_ASSET_SCHEMA_VERSION,
         _mesh_stat_key(visual.mesh_path),
     )
-    cached = entry.mesh_glb_cache.get(cache_key)
+    with _cache_lock:
+        cached = entry.mesh_glb_cache.get(cache_key)
     if cached is not None:
         return cached
     try:
@@ -640,7 +966,10 @@ def _render_visual_glb(
         logger.warning("mesh.export to glb failed for %s", mesh_file, exc_info=True)
         return None
     glb_bytes = buffer.getvalue()
-    entry.mesh_glb_cache[cache_key] = glb_bytes
+    with _cache_lock:
+        entry.mesh_glb_cache[cache_key] = glb_bytes
+        while len(entry.mesh_glb_cache) > _MAX_GLB_CACHE_ENTRIES_PER_MODEL:
+            entry.mesh_glb_cache.pop(next(iter(entry.mesh_glb_cache)))
     return glb_bytes
 
 

@@ -26,11 +26,17 @@ logger = logging.getLogger(__name__)
 
 
 def _valid_trigger_reasons() -> set[str]:
+    """Allowlist of trigger reason strings accepted by intervention APIs.
+
+    `manual_request` is intentionally NOT in this set: it is a
+    *session_kind* concept (`manual_intervention` carries
+    `trigger_reason="manual_request"` by default — see spec/460 §6.3),
+    not a recovery trigger. The MCP allowlist mirrors the canonical
+    `RecoveryTrigger` taxonomy from spec/460 §6.2.2 exactly.
+    """
     from manyforge_behavior.cycle_manager import RecoveryTrigger
 
-    reasons = {member.value for member in RecoveryTrigger}
-    reasons.add("manual_request")
-    return reasons
+    return {member.value for member in RecoveryTrigger}
 
 
 def create_mcp_server(state: ComposerState):
@@ -80,6 +86,8 @@ def create_mcp_server(state: ComposerState):
         shape_type: Optional[str] = None,
         box_dimensions_m: Optional[list[float]] = None,
         sphere_radius_m: Optional[float] = None,
+        cylinder_radius_m: Optional[float] = None,
+        cylinder_height_m: Optional[float] = None,
         mesh_resource_uri: Optional[str] = None,
         mesh_scale: Optional[list[float]] = None,
         pose_position_m: Optional[list[float]] = None,
@@ -99,9 +107,11 @@ def create_mcp_server(state: ComposerState):
         Args:
             operation: One of "add", "upsert", "remove", "update_pose", "attach", "detach"
             object_id: Unique identifier for the scene object
-            shape_type: Shape type for "add"/"upsert" — "box", "sphere", or "mesh"
+            shape_type: Shape type for "add"/"upsert" — "box", "sphere", "cylinder", or "mesh"
             box_dimensions_m: [x, y, z] dimensions for box shapes
             sphere_radius_m: Radius for sphere shapes
+            cylinder_radius_m: Radius for cylinder shapes
+            cylinder_height_m: Height for cylinder shapes along local Z
             mesh_resource_uri: Mesh resource URI/path for mesh shapes
             mesh_scale: Optional [x, y, z] scale for mesh shapes
             pose_position_m: [x, y, z] position in meters
@@ -138,6 +148,8 @@ def create_mcp_server(state: ComposerState):
                 shape_type=shape_type,
                 box_dimensions_m=box_dimensions_m,
                 sphere_radius_m=sphere_radius_m,
+                cylinder_radius_m=cylinder_radius_m,
+                cylinder_height_m=cylinder_height_m,
                 mesh_resource_uri=mesh_resource_uri,
                 mesh_scale=mesh_scale,
                 pose_position_m=pose_position_m,
@@ -389,7 +401,16 @@ def create_mcp_server(state: ComposerState):
                     state.activate_staged_runtime_overrides()
                 except RuntimeError as exc:
                     return json.dumps({"error": str(exc)})
-            state.cycle_manager.run()
+            try:
+                state.cycle_manager.run()
+            except RuntimeError as exc:
+                # Cycle-manager auto-ack refusals (e.g. running
+                # intervention session, blocking pending interrupt,
+                # unreadable kernel status) and other resume-path
+                # refusals surface as RuntimeError. Return them as
+                # structured errors so MCP clients see a consistent
+                # shape rather than an internal exception.
+                return json.dumps({"error": str(exc)})
             return json.dumps({"state": state.cycle_manager.state.value})
         elif command == "stop":
             state.cycle_manager.stop()

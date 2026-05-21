@@ -9,6 +9,8 @@ interface SceneStateStore {
   scene: SceneStateResponse | null;
   frames: SceneFramesResponse | null;
   error: string | null;
+  lastUpdatedAtMs: number | null;
+  refreshInFlight: boolean;
   refresh: () => Promise<void>;
 }
 
@@ -28,7 +30,13 @@ export const useSceneStateStore = create<SceneStateStore>((set) => ({
   scene: null,
   frames: null,
   error: null,
+  lastUpdatedAtMs: null,
+  refreshInFlight: false,
   refresh: async () => {
+    if (useSceneStateStore.getState().refreshInFlight) {
+      return;
+    }
+    set({ refreshInFlight: true });
     // Fetch /api/scene/state + /api/scene/frames in parallel. Both
     // are cheap reads from in-memory state and the viewer needs them
     // at the same cadence (frame axes + visibility checklists track
@@ -40,22 +48,28 @@ export const useSceneStateStore = create<SceneStateStore>((set) => ({
     let frames: SceneFramesResponse | null = null;
     let error: string | null = null;
     try {
-      scene = await sceneP;
-    } catch (err: unknown) {
-      error = err instanceof Error ? err.message : 'Scene state unavailable';
-    }
-    try {
-      frames = await framesP;
-    } catch (err: unknown) {
-      if (error === null) {
-        error = err instanceof Error ? err.message : 'Frames inventory unavailable';
+      try {
+        scene = await sceneP;
+      } catch (err: unknown) {
+        error = err instanceof Error ? err.message : 'Scene state unavailable';
       }
+      try {
+        frames = await framesP;
+      } catch (err: unknown) {
+        if (error === null) {
+          error = err instanceof Error ? err.message : 'Frames inventory unavailable';
+        }
+      }
+      const refreshed = scene !== null || frames !== null;
+      set((state) => ({
+        scene: scene ?? state.scene,
+        frames: frames ?? state.frames,
+        error,
+        lastUpdatedAtMs: refreshed ? Date.now() : state.lastUpdatedAtMs,
+      }));
+    } finally {
+      set({ refreshInFlight: false });
     }
-    set((state) => ({
-      scene: scene ?? state.scene,
-      frames: frames ?? state.frames,
-      error,
-    }));
   },
 }));
 
@@ -95,8 +109,8 @@ function scheduleNextTick(): void {
     pollTimer = null;
     return;
   }
-  pollTimer = window.setTimeout(() => {
-    void useSceneStateStore.getState().refresh();
+  pollTimer = window.setTimeout(async () => {
+    await useSceneStateStore.getState().refresh();
     scheduleNextTick();
   }, nextInterval());
 }

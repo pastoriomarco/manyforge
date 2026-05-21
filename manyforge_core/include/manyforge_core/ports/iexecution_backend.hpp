@@ -138,6 +138,23 @@ class IExecutionBackend {
           {}};
       return result;
     }
+
+    /// Update the runtime velocity scale used by active execution.
+    ///
+    /// ADR-0018: this is a live control surface, not a trajectory planning
+    /// parameter. Implementations SHOULD use an atomic / lock-free store so
+    /// discrete trajectory workers and streaming workers can read it cheaply on
+    /// every tick. A scale of 0.0 means "hold trajectory time" rather than Stop.
+    /// Inputs MUST be finite and clamped to [0, 1]; the kernel validates before
+    /// forwarding and implementations should still defend in depth.
+    virtual void set_runtime_velocity_scale(double /*scale*/) {
+      // Default: no-op. Backends that support runtime velocity scaling override.
+    }
+
+    /// Compatibility alias for older callers.
+    virtual void set_streaming_velocity_scale(double scale) {
+      set_runtime_velocity_scale(scale);
+    }
 };
 
 }  // namespace manyforge::core

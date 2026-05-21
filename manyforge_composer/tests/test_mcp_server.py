@@ -196,6 +196,21 @@ class TestSceneEdit:
         })
         assert result["success"] is True
 
+    def test_add_cylinder_object(self):
+        state = _make_state()
+        state.load_program(_PROGRAM_PATH, _DEPLOYMENT_PATH)
+        mcp = create_mcp_server(state)
+        result = _call(mcp, "manyforge_scene_edit", {
+            "operation": "add",
+            "object_id": "test_cylinder",
+            "shape_type": "cylinder",
+            "cylinder_radius_m": 0.04,
+            "cylinder_height_m": 0.2,
+            "pose_position_m": [0.3, 0.0, 0.15],
+            "pose_orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+        })
+        assert result["success"] is True
+
     def test_upsert_object(self):
         state = _make_state()
         state.load_program(_PROGRAM_PATH, _DEPLOYMENT_PATH)
@@ -729,7 +744,10 @@ class TestIntervention:
 
         pending = _call(mcp, "manyforge_intervention", {"action": "pending_recovery"})
         assert pending["trigger_node_instance"] == "failing_delegate_check"
-        assert pending["trigger_reason"] == "node_failure"
+        # Fallback trigger reason is the canonical `execute_failed`
+        # (spec/460 §6.2.2); the legacy `node_failure` alias is kept only
+        # for serialised-trace round-trip.
+        assert pending["trigger_reason"] == "execute_failed"
         assert pending["delegate_policy"] == "llm_allowed"
 
     def test_execute_delegated_recovery_from_pending_request(self, tmp_path):

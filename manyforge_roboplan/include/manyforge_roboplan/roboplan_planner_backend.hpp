@@ -22,7 +22,8 @@ class RoboPlanPlannerBackend final : public core::IPlannerBackend {
                          std::shared_ptr<roboplan::PathShortcutter> shortcutter,
                          std::shared_ptr<roboplan::PathParameterizerTOPPRA> toppra,
                          std::shared_ptr<roboplan::SimpleIk> ik,
-                         std::shared_ptr<std::mutex> scene_mutex = nullptr);
+                         std::shared_ptr<std::mutex> scene_mutex = nullptr,
+                         std::shared_ptr<roboplan::SimpleIk> streaming_ik = nullptr);
 
   core::PlanResultDTO plan(const core::PlanRequestDTO& request) override;
 
@@ -36,6 +37,7 @@ class RoboPlanPlannerBackend final : public core::IPlannerBackend {
   std::shared_ptr<roboplan::PathShortcutter> shortcutter_;
   std::shared_ptr<roboplan::PathParameterizerTOPPRA> toppra_;
   std::shared_ptr<roboplan::SimpleIk> ik_;
+  std::shared_ptr<roboplan::SimpleIk> streaming_ik_;
   std::shared_ptr<std::mutex> scene_mutex_;
 };
 

@@ -26,6 +26,18 @@ FAIL=0
 section() { echo -e "\n${GREEN}=== $1 ===${NC}"; }
 skip()    { echo -e "${YELLOW}  SKIP: $1${NC}"; }
 
+require_ctest_tests() {
+    local suite="$1"
+    local listing
+    listing="$(ctest -N)"
+    echo "$listing" | tail -3
+    if echo "$listing" | grep -q "Total Tests: 0"; then
+        echo -e "${RED}  FAIL: ${suite} configured zero CTest tests${NC}"
+        return 1
+    fi
+    return 0
+}
+
 setup_pythonpath() {
     export PYTHONPATH="$WORKSPACE:$WORKSPACE/manyforge_behavior:${PYTHONPATH:-}"
 }
@@ -61,6 +73,7 @@ run_cpp_tests() {
     reset_stale_python_build_dir "$build"
     mkdir -p "$build" && cd "$build"
     cmake "$WORKSPACE/manyforge_core" -DCMAKE_BUILD_TYPE=Release \
+        -DBUILD_TESTING=ON \
         -DMANYFORGE_GTEST_TIMEOUT_SECONDS="$CTEST_TEST_TIMEOUT_S" 2>&1 | tail -3
     make -j"$(nproc)" 2>&1 | tail -5
     # Both layers matter: the per-test TIMEOUT property baked by cmake
@@ -68,7 +81,9 @@ run_cpp_tests() {
     # propagates correctly through the launcher path) AND the ctest
     # CLI flag as a safety net for any ad-hoc `ctest` invocation that
     # bypasses test-all.sh. ctest takes the min of the two.
-    if ctest --output-on-failure --timeout "$CTEST_TEST_TIMEOUT_S"; then
+    if ! require_ctest_tests "manyforge_core"; then
+        FAIL=$((FAIL + 1))
+    elif ctest --output-on-failure --timeout "$CTEST_TEST_TIMEOUT_S"; then
         PASS=$((PASS + 1))
     else
         FAIL=$((FAIL + 1))
@@ -81,7 +96,24 @@ run_roboplan_tests() {
     reset_stale_python_build_dir "$build"
     mkdir -p "$build" && cd "$build"
 
-    PINOCCHIO_CMAKE_DIR=$(find /usr -name "pinocchioConfig.cmake" -printf '%h\n' 2>/dev/null | head -1)
+    PINOCCHIO_CMAKE_DIR=$(
+        python3 - <<'PY'
+import pathlib
+import site
+
+roots = [pathlib.Path("/usr"), pathlib.Path("/usr/local")]
+roots.extend(pathlib.Path(p) for p in site.getsitepackages())
+seen = set()
+for root in roots:
+    if root in seen or not root.exists():
+        continue
+    seen.add(root)
+    for candidate in root.glob("**/pinocchioConfig.cmake"):
+        print(candidate.parent)
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+    ) || true
     if [ -z "$PINOCCHIO_CMAKE_DIR" ]; then
         skip "Pinocchio CMake package not found; run roboplan tests in manyforge-dev or install pinocchio locally"
         return
@@ -98,10 +130,13 @@ run_roboplan_tests() {
         BOOST_INCLUDEDIR="${boost_root:+${boost_root}/include}" \
         BOOST_LIBRARYDIR="${boost_root:+${boost_root}/lib}" \
         cmake "$WORKSPACE/manyforge_roboplan" -DCMAKE_BUILD_TYPE=Release \
+        -DBUILD_TESTING=ON \
         -DMANYFORGE_GTEST_TIMEOUT_SECONDS="$CTEST_TEST_TIMEOUT_S" \
         ${pybind11_dir:+-Dpybind11_DIR="$pybind11_dir"} 2>&1 | tail -3
     make -j"$(nproc)" 2>&1 | tail -5
-    if ctest --output-on-failure --timeout "$CTEST_TEST_TIMEOUT_S"; then
+    if ! require_ctest_tests "manyforge_roboplan"; then
+        FAIL=$((FAIL + 1))
+    elif ctest --output-on-failure --timeout "$CTEST_TEST_TIMEOUT_S"; then
         PASS=$((PASS + 1))
     else
         FAIL=$((FAIL + 1))

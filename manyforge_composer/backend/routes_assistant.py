@@ -77,6 +77,7 @@ COMPOSER_ASSISTANT_MODE = "composer-assistant"
 _WORLD_FRAME_ALIASES = {"world", "/world", "/World", "World", "universe"}
 _BOX_SHAPE_ALIASES = {"box", "cube", "cuboid", "rectangular_prism", "rectangular-prism"}
 _SPHERE_SHAPE_ALIASES = {"sphere", "ball"}
+_CYLINDER_SHAPE_ALIASES = {"cylinder", "tube", "can"}
 _MESH_SHAPE_ALIASES = {"mesh", "trimesh", "stl", "obj", "dae", "usd"}
 
 
@@ -1583,6 +1584,48 @@ def _normalize_scene_shape_argument(
     if diameter is None:
         diameter = _first_mapping_value(raw_resource, "diameter_m", "diameter")
 
+    cylinder_radius = _first_mapping_value(
+        raw_shape,
+        "cylinder_radius_m",
+        "cylinderRadiusM",
+        "radius_m",
+        "radius",
+    )
+    if cylinder_radius is None:
+        cylinder_radius = _first_mapping_value(
+            raw_resource,
+            "cylinder_radius_m",
+            "cylinderRadiusM",
+            "radius_m",
+            "radius",
+        )
+    cylinder_diameter = _first_mapping_value(
+        raw_shape,
+        "cylinder_diameter_m",
+        "cylinderDiameterM",
+    )
+    if cylinder_diameter is None:
+        cylinder_diameter = _first_mapping_value(
+            raw_resource,
+            "cylinder_diameter_m",
+            "cylinderDiameterM",
+        )
+    cylinder_height = _first_mapping_value(
+        raw_shape,
+        "cylinder_height_m",
+        "cylinderHeightM",
+        "height_m",
+        "height",
+    )
+    if cylinder_height is None:
+        cylinder_height = _first_mapping_value(
+            raw_resource,
+            "cylinder_height_m",
+            "cylinderHeightM",
+            "height_m",
+            "height",
+        )
+
     mesh_resource_uri = _first_mapping_value(
         raw_shape,
         "mesh_resource_uri",
@@ -1614,6 +1657,10 @@ def _normalize_scene_shape_argument(
     if not shape_type_normalized:
         if box_dimensions is not None:
             shape_type_normalized = "box"
+        elif cylinder_height is not None and (
+            cylinder_radius is not None or cylinder_diameter is not None
+        ):
+            shape_type_normalized = "cylinder"
         elif radius is not None or diameter is not None:
             shape_type_normalized = "sphere"
         elif mesh_resource_uri is not None:
@@ -1651,6 +1698,41 @@ def _normalize_scene_shape_argument(
             )
         return {"type": "sphere", "sphere_radius_m": radius_value}
 
+    if shape_type_normalized in _CYLINDER_SHAPE_ALIASES:
+        radius_value = cylinder_radius
+        if radius_value is None and cylinder_diameter is not None:
+            radius_value = (
+                _float_argument(cylinder_diameter, label=f"{label}.shape.cylinder_diameter_m")
+                / 2.0
+            )
+        if radius_value is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{tool_id} {label}.shape requires cylinder radius or diameter",
+            )
+        if cylinder_height is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{tool_id} {label}.shape requires cylinder height",
+            )
+        radius_float = _float_argument(radius_value, label=f"{label}.shape.cylinder_radius_m")
+        height_float = _float_argument(cylinder_height, label=f"{label}.shape.cylinder_height_m")
+        if radius_float <= 0.0:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{tool_id} {label}.shape.cylinder_radius_m must be > 0",
+            )
+        if height_float <= 0.0:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{tool_id} {label}.shape.cylinder_height_m must be > 0",
+            )
+        return {
+            "type": "cylinder",
+            "cylinder_radius_m": radius_float,
+            "cylinder_height_m": height_float,
+        }
+
     if shape_type_normalized in _MESH_SHAPE_ALIASES:
         if not isinstance(mesh_resource_uri, str) or not mesh_resource_uri.strip():
             raise HTTPException(
@@ -1677,7 +1759,7 @@ def _normalize_scene_shape_argument(
 
     raise HTTPException(
         status_code=400,
-        detail=f"{tool_id} {label}.shape.type must be one of: box, sphere, mesh",
+        detail=f"{tool_id} {label}.shape.type must be one of: box, sphere, cylinder, mesh",
     )
 
 

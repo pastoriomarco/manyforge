@@ -63,17 +63,38 @@ class GrantType:
 
 
 class RecoveryTrigger(Enum):
-    """Closed enum of recovery trigger reasons (OP-6).
+    """Closed enum of recovery trigger reasons.
 
-    Replaces ad-hoc string trigger reasons with a typed, bounded taxonomy.
+    Canonical names are spec'd at `spec/460` §6.2.2:
+
+    - ``planning_failed``
+    - ``validation_failed``
+    - ``execute_failed``
+    - ``execute_timeout``
+    - ``scene_mismatch``
+    - ``precondition_failed``
+    - ``postcondition_failed``
+
+    Two legacy values (``timeout``, ``node_failure``) are kept as
+    deprecated aliases for migration. They MUST NOT be used by new
+    code and will be removed once all in-tree call sites and traces
+    have been migrated. See ``open-points.md`` for the removal target.
     """
     PLANNING_FAILED = "planning_failed"
     VALIDATION_FAILED = "validation_failed"
     EXECUTE_FAILED = "execute_failed"
-    TIMEOUT = "timeout"
+    EXECUTE_TIMEOUT = "execute_timeout"
     SCENE_MISMATCH = "scene_mismatch"
-    NODE_FAILURE = "node_failure"
     PRECONDITION_FAILED = "precondition_failed"
+    POSTCONDITION_FAILED = "postcondition_failed"
+
+    # --- Deprecated legacy aliases ---
+    # Kept as distinct enum members rather than aliasing canonical
+    # values so existing serialised traces (which carry the legacy
+    # string) continue to round-trip. Code SHOULD prefer the canonical
+    # values above.
+    TIMEOUT = "timeout"
+    NODE_FAILURE = "node_failure"
 
 
 @dataclass
@@ -239,11 +260,24 @@ def _find_failure_feedback(node) -> Optional[str]:
 
 class CycleManager:
     """Runtime lifecycle controller for continuous robot programs.
-    
-    State transitions:
+
+    Five-state machine (spec/400 §6.6.2):
+
         IDLE ──(run)──► RUNNING ──(stop)──► STOPPED ──(run)──► RUNNING
+        RUNNING ──(interrupt)──► INTERRUPT_HANDLER ──(resume)──► RUNNING
+        STOPPED ──(intervention.enter)──► DIRECT_CONTROL ──(end)──► STOPPED
         Any state ──(reset)──► IDLE
-    
+
+    See `spec/400` §6.6.2 for the canonical states and `spec/460` §6.2
+    for the intervention/direct-control transitions.
+
+    Run-side auto-ack (spec/400 §6.6.2): if the kernel is in
+    `INTERVENTION_REQUIRED` and the leftover state is provably
+    execution-local (no active streaming, scene/program/deployment
+    edits applied, next motion can pass kernel validation), the cycle
+    manager MAY call `kernel.acknowledge_intervention(...)` on Run.
+    Otherwise Run fails closed with a structured reason.
+
     The CycleManager owns:
     - The OrchestratorRunner (tree builder)
     - The KernelClient (execution engine)
@@ -787,6 +821,55 @@ class CycleManager:
         """Install a callback invoked when runtime interrupt lifecycle events occur."""
         self._on_interrupt_event = callback
 
+    def _can_auto_acknowledge_leftover_state(self) -> tuple[bool, str]:
+        """Check whether kernel-side leftover state is safe to clear on Run.
+
+        Per `spec/400` §6.6.2, Run-side auto-ack of `INTERVENTION_REQUIRED`
+        is permitted only when the leftover state is execution-local and
+        the next command can pass ManyForge-owned checks. External plant
+        safety (PLC, scanners, robot safety controllers) is intentionally
+        out of scope; this method only validates ManyForge-owned state.
+
+        Returns (ok, reason). When ok is False, reason is a stable
+        identifier suitable for surfacing to the operator.
+        """
+        try:
+            kernel_status = self._kernel.get_status()
+        except Exception as exc:  # noqa: BLE001 — propagate as structured reason
+            return False, f"kernel_status_unreadable:{type(exc).__name__}"
+
+        # Refuse if a streaming/direct-control session is still active. The
+        # kernel surface for these states cannot be safely overridden by a
+        # supervisory Run; the operator must end/stop them first.
+        active_session_states = (
+            ExecutionState.STREAMING,
+            ExecutionState.STOPPING,
+        )
+        if kernel_status.state in active_session_states:
+            return False, "active_streaming_or_stopping"
+
+        # Refuse if the cycle-manager-tracked intervention session is still
+        # marked running: that means a direct-control lease still owns
+        # blackboard scope. The operator must end the intervention session
+        # via the explicit end/promote path before Run can auto-ack.
+        if self._intervention is not None and self._intervention.status == "running":
+            return False, "intervention_session_running"
+
+        # A pending interrupt that has not reached a clean terminal state
+        # blocks auto-ack too — see also the existing pending_interrupt
+        # checks in the STOPPED branch of run().
+        if self._pending_interrupt is not None:
+            handler_state = str(
+                self._pending_interrupt.details.get("handler_state", "latched")
+            )
+            if (
+                self._pending_interrupt.after_handler != "resumable_hold"
+                or handler_state != "completed"
+            ):
+                return False, "pending_interrupt_blocks_auto_ack"
+
+        return True, "ok"
+
     def run(self) -> None:
         """
         Start or resume program execution.
@@ -858,6 +941,34 @@ class CycleManager:
                     self._set_resume_after_error_flag(True)
 
                 kernel_status = self._kernel.get_status()
+
+                # Run-side auto-ack of `INTERVENTION_REQUIRED`.
+                # The kernel rejects `execute()` while intervention is
+                # required, so a stopped cycle whose underlying kernel
+                # ended in intervention cannot resume without an explicit
+                # ack. spec/400 §6.6.2 permits an automatic ack only when
+                # the leftover state is execution-local and the next
+                # command can pass ManyForge-owned checks; otherwise Run
+                # MUST fail closed.
+                if kernel_status.state == ExecutionState.INTERVENTION_REQUIRED:
+                    ok, reason = self._can_auto_acknowledge_leftover_state()
+                    if not ok:
+                        raise RuntimeError(
+                            "Cannot auto-acknowledge kernel "
+                            f"INTERVENTION_REQUIRED on Run: {reason}. "
+                            "Explicit operator recovery required."
+                        )
+                    ack = self._kernel.acknowledge_intervention(
+                        principal_id="cycle_manager_run",
+                        reason="run_auto_ack_local_leftover",
+                    )
+                    if not ack.accepted:
+                        raise RuntimeError(
+                            "kernel.acknowledge_intervention rejected: "
+                            f"{ack.error}"
+                        )
+                    kernel_status = self._kernel.get_status()
+
                 if kernel_status.state == ExecutionState.PAUSED:
                     self._kernel.resume()
 
@@ -1010,16 +1121,44 @@ class CycleManager:
         """Set velocity_scale on blackboard. Clamped to [0.0, 1.0].
 
         Rejects NaN and infinity — these would propagate to the robot.
+
+        ADR-0018: also forward the new scale to the kernel/backend runtime
+        register. Discrete trajectories and streaming sessions read that
+        register while they are in flight, so the operator slider retimes the
+        current motion without stopping or re-dispatching behavior-tree nodes.
         """
         import math
+
         if not isinstance(scale, (int, float)) or math.isnan(scale) or math.isinf(scale):
             raise ValueError(f"velocity_scale must be a finite number, got {scale!r}")
         scale = max(0.0, min(1.0, float(scale)))
+        previous_scale = self._velocity_scale
         self._velocity_scale = scale
-        
+
         bb = py_trees.blackboard.Client(name="cycle_manager_vs")
         bb.register_key(key="velocity_scale", access=py_trees.common.Access.WRITE)
         bb.velocity_scale = scale
+
+        try:
+            forward = getattr(self._kernel, "set_runtime_velocity_scale", None)
+            if forward is not None:
+                forward(scale)
+        except Exception:
+            logger.debug(
+                "kernel.set_runtime_velocity_scale failed; HMI runtime "
+                "velocity slider will retain the backend's previous scale",
+                exc_info=True,
+            )
+        if previous_scale != scale:
+            logger.info(
+                "runtime_velocity_scale_changed",
+                extra={
+                    "event": "runtime_velocity_scale_changed",
+                    "previous_scale": previous_scale,
+                    "new_scale": scale,
+                    "backend_status": "forwarded",
+                },
+            )
 
     def _try_activate_interrupt_handler(
         self,
@@ -2183,11 +2322,14 @@ class CycleManager:
         return visit(program.tree)
 
     def _derive_delegated_trigger_reason(self) -> RecoveryTrigger:
+        # Maps kernel event types to canonical recovery triggers
+        # (spec/460 §6.2.2). The legacy "timeout" / NODE_FAILURE
+        # surfaces are deprecated and intentionally not used here.
         _EVENT_TO_TRIGGER = {
             "planning_failed": RecoveryTrigger.PLANNING_FAILED,
             "validation_failed": RecoveryTrigger.VALIDATION_FAILED,
             "execute_failed": RecoveryTrigger.EXECUTE_FAILED,
-            "timeout": RecoveryTrigger.TIMEOUT,
+            "timeout": RecoveryTrigger.EXECUTE_TIMEOUT,
             "scene_mismatch": RecoveryTrigger.SCENE_MISMATCH,
         }
         with self._lock:
@@ -2203,7 +2345,9 @@ class CycleManager:
                     and event.get("to_state") == "failed"
                 ):
                     return RecoveryTrigger.EXECUTE_FAILED
-        return RecoveryTrigger.NODE_FAILURE
+        # No identifying event in the window; fall back to a generic
+        # execute-failure rather than the deprecated NODE_FAILURE alias.
+        return RecoveryTrigger.EXECUTE_FAILED
 
     def _build_delegated_recovery_request(
         self,

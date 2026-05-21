@@ -443,6 +443,12 @@ class NativeKernelClient(KernelClient):
         r = self._bundle.acknowledge_completed(int(execution_id))
         return CommandResult(accepted=r["accepted"], error=r.get("error"))
 
+    def acknowledge_intervention(
+        self, principal_id: str, reason: str
+    ) -> CommandResult:
+        r = self._bundle.acknowledge_intervention(str(principal_id), str(reason))
+        return CommandResult(accepted=r["accepted"], error=r.get("error"))
+
     # ---- Streaming-session API (ADR-0016) ----
     def begin_streaming_session(
         self, config: StreamingSessionConfig
@@ -514,6 +520,18 @@ class NativeKernelClient(KernelClient):
             accepted=bool(r.get("accepted", False)),
             error=r.get("error"),
         )
+
+    def set_runtime_velocity_scale(self, scale: float) -> None:
+        # ADR-0018: forward runtime HMI velocity-scale changes to the C++
+        # kernel/backend. The kernel validates finiteness and clamps to [0, 1].
+        import math
+
+        if not isinstance(scale, (int, float)) or math.isnan(scale) or math.isinf(scale):
+            return
+        self._bundle.set_runtime_velocity_scale(float(scale))
+
+    def set_streaming_velocity_scale(self, scale: float) -> None:
+        self.set_runtime_velocity_scale(scale)
 
     def get_status(self) -> ExecutionStatus:
         s = self._bundle.get_status()
@@ -717,6 +735,8 @@ class NativeKernelClient(KernelClient):
                     shape_type=request.shape_type,
                     box_dimensions_m=request.box_dimensions_m,
                     sphere_radius_m=request.sphere_radius_m,
+                    cylinder_radius_m=request.cylinder_radius_m,
+                    cylinder_height_m=request.cylinder_height_m,
                     mesh_resource_uri=request.mesh_resource_uri,
                     mesh_scale=request.mesh_scale,
                     pose_position_m=request.pose_position_m,
@@ -737,6 +757,10 @@ class NativeKernelClient(KernelClient):
             req_dict["box_dimensions_m"] = request.box_dimensions_m
         if request.sphere_radius_m is not None:
             req_dict["sphere_radius_m"] = request.sphere_radius_m
+        if request.cylinder_radius_m is not None:
+            req_dict["cylinder_radius_m"] = request.cylinder_radius_m
+        if request.cylinder_height_m is not None:
+            req_dict["cylinder_height_m"] = request.cylinder_height_m
         if request.mesh_resource_uri is not None:
             req_dict["mesh_resource_uri"] = request.mesh_resource_uri
         if request.mesh_scale is not None:
@@ -791,6 +815,18 @@ class NativeKernelClient(KernelClient):
             "position_m": list(result["position_m"]),
             "orientation_xyzw": list(result["orientation_xyzw"]),
         }
+
+    def get_link_poses(
+        self, target_frames: list[str], base_frame: str
+    ) -> Dict[str, Dict[str, Any]]:
+        raw = self._bundle.get_link_poses(list(target_frames), base_frame)
+        poses: Dict[str, Dict[str, Any]] = {}
+        for link_name, pose in dict(raw).items():
+            poses[str(link_name)] = {
+                "position_m": list(pose["position_m"]),
+                "orientation_xyzw": list(pose["orientation_xyzw"]),
+            }
+        return poses
 
     def compute_target_link_poses(
         self, request: Dict[str, Any]

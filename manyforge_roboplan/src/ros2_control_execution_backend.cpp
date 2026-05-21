@@ -19,6 +19,8 @@
 namespace manyforge::roboplan_backend {
 namespace {
 
+constexpr double kRuntimeScaleSlewPerSecond = 4.0;  // 0→1 in 250 ms.
+
 double clamp_progress(double progress) {
   return std::max(0.0, std::min(1.0, progress));
 }
@@ -107,6 +109,7 @@ Ros2ControlExecutionBackend::Ros2ControlExecutionBackend(
 
 Ros2ControlExecutionBackend::~Ros2ControlExecutionBackend() {
   GoalHandleFJT::SharedPtr handle_to_cancel;
+  GoalHandleFJT::SharedPtr streaming_handle_to_cancel;
   {
     std::lock_guard<std::mutex> lock(execution_mutex_);
     handle_to_cancel = active_goal_handle_;
@@ -117,10 +120,27 @@ Ros2ControlExecutionBackend::~Ros2ControlExecutionBackend() {
     active_goal_handle_.reset();
     active_goal_id_.reset();
   }
+  {
+    std::lock_guard<std::mutex> lock(streaming_mutex_);
+    streaming_handle_to_cancel = streaming_active_goal_;
+    streaming_active_goal_.reset();
+    streaming_terminal_goal_id_.reset();
+    streaming_terminal_result_received_ = true;
+    streaming_terminal_result_success_ = true;
+    streaming_terminal_error_.reset();
+  }
+  if (streaming_thread_.joinable()) {
+    streaming_thread_.request_stop();
+    streaming_cv_.notify_all();
+  }
   cancel_goal_if_known(handle_to_cancel);
+  cancel_goal_if_known(streaming_handle_to_cancel);
   cancel_all_gripper_commands();
   set_command_gate(false);
   execution_cv_.notify_all();
+  if (streaming_thread_.joinable()) {
+    streaming_thread_.join();
+  }
   if (monitor_thread_.joinable()) {
     monitor_thread_.join();
   }
@@ -196,6 +216,32 @@ void Ros2ControlExecutionBackend::start_ros() {
         config_.command_gate_topic, qos);
     set_command_gate(false);
   }
+#ifdef MANYFORGE_HAS_SPEED_SCALING_FACTOR_MSG
+  {
+    std::string speed_scaling_topic = config_.speed_scaling_topic;
+    if (speed_scaling_topic.empty()) {
+      constexpr char suffix[] = "/follow_joint_trajectory";
+      if (config_.action_name.size() >= std::char_traits<char>::length(suffix) &&
+          config_.action_name.compare(
+              config_.action_name.size() - std::char_traits<char>::length(suffix),
+              std::char_traits<char>::length(suffix),
+              suffix) == 0) {
+        speed_scaling_topic =
+            config_.action_name.substr(
+                0, config_.action_name.size() - std::char_traits<char>::length(suffix)) +
+            "/speed_scaling_input";
+      } else {
+        speed_scaling_topic = config_.action_name + "/speed_scaling_input";
+      }
+    }
+    auto qos = rclcpp::QoS(1).reliable().transient_local();
+    speed_scaling_pub_ =
+        node_->create_publisher<control_msgs::msg::SpeedScalingFactor>(
+            speed_scaling_topic, qos);
+    publish_runtime_velocity_scale(
+        runtime_velocity_scale_.load(std::memory_order_acquire));
+  }
+#endif
 
   rclcpp::ExecutorOptions executor_options;
   executor_options.context = context_;
@@ -437,6 +483,19 @@ void Ros2ControlExecutionBackend::set_command_gate(bool enabled) {
   std_msgs::msg::Bool msg;
   msg.data = enabled;
   command_gate_pub_->publish(msg);
+}
+
+void Ros2ControlExecutionBackend::publish_runtime_velocity_scale(double scale) {
+#ifdef MANYFORGE_HAS_SPEED_SCALING_FACTOR_MSG
+  if (!speed_scaling_pub_) {
+    return;
+  }
+  control_msgs::msg::SpeedScalingFactor msg;
+  msg.factor = std::max(0.0, std::min(1.0, scale));
+  speed_scaling_pub_->publish(msg);
+#else
+  (void)scale;
+#endif
 }
 
 core::Result<void> Ros2ControlExecutionBackend::command_sim_initial_state(
@@ -1143,6 +1202,9 @@ core::ExecutionHandle Ros2ControlExecutionBackend::execute_trajectory(
       tracking_error_since_.reset();
       peak_tracking_error_.reset();
       execution_started_at_ = std::chrono::steady_clock::now();
+      applied_runtime_velocity_scale_.store(
+          runtime_velocity_scale_.load(std::memory_order_acquire),
+          std::memory_order_release);
     }
   }
 
@@ -1200,6 +1262,8 @@ core::ExecutionHandle Ros2ControlExecutionBackend::execute_trajectory(
   if (config_.disable_controller_path_tolerances) {
     disable_fjt_controller_tolerances(goal, trajectory.joint_names);
   }
+  publish_runtime_velocity_scale(
+      runtime_velocity_scale_.load(std::memory_order_acquire));
   for (const auto& waypoint : trajectory.waypoints) {
     trajectory_msgs::msg::JointTrajectoryPoint point;
     point.positions = waypoint.positions_rad;
@@ -1297,6 +1361,10 @@ void Ros2ControlExecutionBackend::monitor_worker(core::TrajectoryDTO trajectory)
 
   const double total_duration_s =
       trajectory.waypoints.empty() ? 0.0 : trajectory.waypoints.back().time_from_start_s;
+  auto last_monitor_tick = std::chrono::steady_clock::now();
+  double trajectory_time_s = 0.0;
+  double applied_runtime_scale =
+      applied_runtime_velocity_scale_.load(std::memory_order_acquire);
   while (true) {
     const auto now = std::chrono::steady_clock::now();
     bool cancel_pending = false;
@@ -1336,6 +1404,7 @@ void Ros2ControlExecutionBackend::monitor_worker(core::TrajectoryDTO trajectory)
       return;
     }
     if (waiting_for_first_feedback) {
+      last_monitor_tick = now;
       std::vector<double> snapshot_positions;
       if (uses_authored_backend_state() && !trajectory.waypoints.empty()) {
         snapshot_positions = trajectory.waypoints.front().positions_rad;
@@ -1358,10 +1427,25 @@ void Ros2ControlExecutionBackend::monitor_worker(core::TrajectoryDTO trajectory)
           std::chrono::duration<double>(config_.monitor_period_s));
       continue;
     }
-    const double elapsed_s = seconds_since(execution_started_at_, now);
+    const double dt_s =
+        std::max(0.0, std::chrono::duration<double>(now - last_monitor_tick).count());
+    last_monitor_tick = now;
+    const double target_scale = clamp_progress(
+        runtime_velocity_scale_.load(std::memory_order_acquire));
+    const double max_delta = kRuntimeScaleSlewPerSecond * dt_s;
+    if (target_scale > applied_runtime_scale + max_delta) {
+      applied_runtime_scale += max_delta;
+    } else if (target_scale < applied_runtime_scale - max_delta) {
+      applied_runtime_scale -= max_delta;
+    } else {
+      applied_runtime_scale = target_scale;
+    }
+    applied_runtime_velocity_scale_.store(
+        applied_runtime_scale, std::memory_order_release);
+    trajectory_time_s += dt_s * applied_runtime_scale;
     const double progress =
-        total_duration_s <= 1e-9 ? 1.0 : clamp_progress(elapsed_s / total_duration_s);
-    auto predicted_positions = interpolate_joint_positions(trajectory, elapsed_s);
+        total_duration_s <= 1e-9 ? 1.0 : clamp_progress(trajectory_time_s / total_duration_s);
+    auto predicted_positions = interpolate_joint_positions(trajectory, trajectory_time_s);
     if (!predicted_positions.empty()) {
       update_scene_positions(predicted_positions, SceneUpdateMode::kBestEffort);
     }
@@ -1377,7 +1461,7 @@ void Ros2ControlExecutionBackend::monitor_worker(core::TrajectoryDTO trajectory)
           if (!uses_authored_backend_state()) {
             snapshot_positions = observed;
           }
-          const auto expected = interpolate_joint_positions(trajectory, elapsed_s);
+          const auto expected = interpolate_joint_positions(trajectory, trajectory_time_s);
           const double error = max_abs_error(observed, expected);
           JointSample error_sample;
           error_sample.joint_names = trajectory.joint_names;
@@ -1390,7 +1474,7 @@ void Ros2ControlExecutionBackend::monitor_worker(core::TrajectoryDTO trajectory)
           error_sample.source = sample->source + "_tracking_error";
           error_sample.topic = sample->topic;
           update_tracking_error_peak_locked(
-              error_sample, elapsed_s, &observed, &expected, &sample->velocities);
+              error_sample, trajectory_time_s, &observed, &expected, &sample->velocities);
           if (error > config_.tracking_error_tolerance_rad &&
               config_.tracking_error_timeout_s > 0.0) {
             if (!tracking_error_since_.has_value()) {
@@ -1527,6 +1611,55 @@ core::ExecutionHandle Ros2ControlExecutionBackend::resume(
 }
 
 core::ResetResultDTO Ros2ControlExecutionBackend::reset() {
+  GoalHandleFJT::SharedPtr streaming_goal_to_cancel;
+  {
+    std::lock_guard<std::mutex> lock(streaming_mutex_);
+    streaming_goal_to_cancel = streaming_active_goal_;
+    streaming_active_goal_.reset();
+    streaming_terminal_goal_id_.reset();
+    streaming_terminal_result_received_ = true;
+    streaming_terminal_result_success_ = true;
+    streaming_terminal_error_.reset();
+  }
+  if (streaming_thread_.joinable()) {
+    streaming_thread_.request_stop();
+    streaming_cv_.notify_all();
+    cancel_goal_if_known(streaming_goal_to_cancel);
+    {
+      std::unique_lock<std::mutex> lock(streaming_mutex_);
+      const bool streaming_stopped = streaming_cv_.wait_for(
+          lock,
+          std::chrono::duration<double>(config_.stop_completion_timeout_s),
+          [this]() { return !streaming_active_.load(); });
+      if (!streaming_stopped) {
+        const auto snapshot = get_execution_snapshot();
+        const auto error = operator_intervention_error(
+            core::ErrorCode::kResetFailed,
+            "Timed out waiting for ros2_control streaming worker to stop",
+            "reset_streaming_join_timeout",
+            snapshot.state);
+        publish_snapshot(core::ExecutionState::kInterventionRequired,
+                         snapshot.progress,
+                         snapshot.joint_positions_rad,
+                         error);
+        return core::ResetResultDTO{false, error};
+      }
+    }
+    streaming_thread_.join();
+  } else {
+    cancel_goal_if_known(streaming_goal_to_cancel);
+  }
+  {
+    std::lock_guard<std::mutex> lock(streaming_mutex_);
+    streaming_target_.reset();
+    streaming_active_goal_.reset();
+    streaming_terminal_goal_id_.reset();
+    streaming_terminal_result_received_ = true;
+    streaming_terminal_result_success_ = true;
+    streaming_terminal_error_.reset();
+    streaming_config_ = core::StreamingSessionConfigDTO{};
+  }
+
   bool resync_required = false;
   {
     std::lock_guard<std::mutex> lock(execution_mutex_);
@@ -1962,11 +2095,15 @@ std::shared_ptr<NativeKernelBundle> create_ros2_control_kernel(
   ik_opts.max_restarts = 50;
   ik_opts.max_time = 1.0;
   bundle->ik = std::make_shared<roboplan::SimpleIk>(bundle->scene, ik_opts);
+  auto streaming_ik_opts = ik_opts;
+  streaming_ik_opts.max_time = kernel_config.streaming_ik_timeout_s;
+  bundle->streaming_ik =
+      std::make_shared<roboplan::SimpleIk>(bundle->scene, streaming_ik_opts);
 
   auto scene_mutex = std::make_shared<std::mutex>();
   bundle->planner = std::make_unique<RoboPlanPlannerBackend>(
       bundle->scene, rrt_opts, bundle->shortcutter, bundle->toppra, bundle->ik,
-      scene_mutex);
+      scene_mutex, bundle->streaming_ik);
   bundle->context = std::make_unique<RoboPlanPlanningContext>(
       bundle->scene, group_name, scene_mutex);
   bundle->clock = std::make_unique<WallClock>();
@@ -1992,11 +2129,36 @@ std::shared_ptr<NativeKernelBundle> create_ros2_control_kernel(
 bool Ros2ControlExecutionBackend::streaming_send_anchored_goal(
     const std::vector<std::string>& joint_names,
     const std::vector<double>& target_positions,
-    double target_time_from_start_s) {
+    double target_time_from_start_s,
+    bool track_terminal_goal) {
   if (joint_names.empty() || target_positions.empty()) {
+    if (track_terminal_goal) {
+      std::lock_guard<std::mutex> lock(streaming_mutex_);
+      streaming_terminal_result_received_ = true;
+      streaming_terminal_result_success_ = false;
+      streaming_terminal_error_ = make_error(
+          core::ErrorCode::kStopFailed,
+          "streaming terminal soft-stop target is empty",
+          {{"reason_code", "soft_stop_dispatch_failed"},
+           {"failure_stage", "empty_terminal_target"}});
+      streaming_cv_.notify_all();
+    }
     return false;
   }
   if (target_positions.size() != joint_names.size()) {
+    if (track_terminal_goal) {
+      std::lock_guard<std::mutex> lock(streaming_mutex_);
+      streaming_terminal_result_received_ = true;
+      streaming_terminal_result_success_ = false;
+      streaming_terminal_error_ = make_error(
+          core::ErrorCode::kStopFailed,
+          "streaming terminal soft-stop target size does not match joint names",
+          {{"reason_code", "soft_stop_dispatch_failed"},
+           {"failure_stage", "terminal_target_size_mismatch"},
+           {"joint_count", std::to_string(joint_names.size())},
+           {"position_count", std::to_string(target_positions.size())}});
+      streaming_cv_.notify_all();
+    }
     return false;
   }
 
@@ -2044,8 +2206,40 @@ bool Ros2ControlExecutionBackend::streaming_send_anchored_goal(
 
   if (!wait_for_fjt_action_server(action_client_,
                                   config_.wait_for_action_server_timeout_s)) {
+    if (track_terminal_goal) {
+      std::lock_guard<std::mutex> lock(streaming_mutex_);
+      streaming_terminal_result_received_ = true;
+      streaming_terminal_result_success_ = false;
+      streaming_terminal_error_ = make_error(
+          core::ErrorCode::kStopFailed,
+          "FollowJointTrajectory action server unavailable for streaming "
+          "terminal soft-stop",
+          {{"reason_code", "soft_stop_dispatch_failed"},
+           {"failure_stage", "action_server_unavailable"},
+           {"action_name", config_.action_name}});
+      streaming_cv_.notify_all();
+    }
     return false;
   }
+
+  if (track_terminal_goal) {
+    std::lock_guard<std::mutex> lock(streaming_mutex_);
+    streaming_terminal_goal_id_.reset();
+    streaming_terminal_result_received_ = false;
+    streaming_terminal_result_success_ = false;
+    streaming_terminal_error_.reset();
+  }
+  const auto mark_terminal_dispatch_failed = [&](std::string message) {
+    if (!track_terminal_goal) {
+      return;
+    }
+    std::lock_guard<std::mutex> lock(streaming_mutex_);
+    streaming_terminal_result_received_ = true;
+    streaming_terminal_result_success_ = false;
+    streaming_terminal_error_ = make_error(
+        core::ErrorCode::kStopFailed, std::move(message));
+    streaming_cv_.notify_all();
+  };
 
   FollowJointTrajectory::Goal goal;
   goal.trajectory.joint_names = joint_names;
@@ -2083,12 +2277,16 @@ bool Ros2ControlExecutionBackend::streaming_send_anchored_goal(
         on_action_feedback(goal_handle, feedback);
       };
   options.result_callback =
-      [this](const GoalHandleFJT::WrappedResult& result) {
+      [this, track_terminal_goal](const GoalHandleFJT::WrappedResult& result) {
         // The streaming dispatcher does not block on per-goal results;
         // it preempts via async_send_goal. Route the result through the
         // existing callback so feedback freshness gates and tracking
         // peak telemetry continue to work uniformly.
-        on_action_result(result);
+        if (track_terminal_goal) {
+          on_streaming_terminal_result(result);
+        } else {
+          on_action_result(result);
+        }
       };
 
   auto goal_handle_future = action_client_->async_send_goal(goal, options);
@@ -2096,19 +2294,63 @@ bool Ros2ControlExecutionBackend::streaming_send_anchored_goal(
           std::chrono::duration<double>(
               config_.wait_for_action_server_timeout_s)) !=
       std::future_status::ready) {
+    mark_terminal_dispatch_failed(
+        "timed out waiting for streaming terminal soft-stop goal acceptance");
     return false;
   }
   GoalHandleFJT::SharedPtr goal_handle;
   try {
     goal_handle = goal_handle_future.get();
   } catch (const std::exception&) {
+    mark_terminal_dispatch_failed(
+        "streaming terminal soft-stop goal acceptance threw an exception");
     return false;
   }
   if (!goal_handle) {
+    mark_terminal_dispatch_failed(
+        "streaming terminal soft-stop goal was rejected by the controller");
     return false;
   }
-  streaming_active_goal_ = goal_handle;
+  {
+    std::lock_guard<std::mutex> lock(streaming_mutex_);
+    streaming_active_goal_ = goal_handle;
+    if (track_terminal_goal) {
+      streaming_terminal_goal_id_ = goal_handle->get_goal_id();
+    }
+  }
   return true;
+}
+
+void Ros2ControlExecutionBackend::on_streaming_terminal_result(
+    const GoalHandleFJT::WrappedResult& result) {
+  const bool controller_success =
+      result.result &&
+      result.result->error_code == FollowJointTrajectory::Result::SUCCESSFUL;
+  const bool terminal_success =
+      result.code == rclcpp_action::ResultCode::SUCCEEDED && controller_success;
+
+  std::lock_guard<std::mutex> lock(streaming_mutex_);
+  if (streaming_terminal_goal_id_.has_value() &&
+      result.goal_id != *streaming_terminal_goal_id_) {
+    return;
+  }
+  streaming_terminal_result_received_ = true;
+  streaming_terminal_result_success_ = terminal_success;
+  streaming_active_goal_.reset();
+  streaming_terminal_goal_id_.reset();
+  if (!terminal_success) {
+    const std::string controller_error =
+        result.result ? result.result->error_string : "controller returned no result";
+    streaming_terminal_error_ = make_error(
+        core::ErrorCode::kStopFailed,
+        controller_error.empty()
+            ? "streaming terminal soft-stop goal failed"
+            : "streaming terminal soft-stop goal failed: " + controller_error,
+        {{"result_code", std::to_string(static_cast<int>(result.code))}});
+  } else {
+    streaming_terminal_error_.reset();
+  }
+  streaming_cv_.notify_all();
 }
 
 bool Ros2ControlExecutionBackend::streaming_send_spring_back_stop() {
@@ -2128,13 +2370,40 @@ bool Ros2ControlExecutionBackend::streaming_send_spring_back_stop() {
           *latest_joint_state_, config_.required_joints);
     }
   }
+  if (observed_positions.empty() && is_commanded_sim_mode()) {
+    // Simulator-commanded profiles may not have emitted controller feedback
+    // yet when the operator releases immediately after a target push. In that
+    // topology the backend-authored command is the execution source of truth,
+    // so a terminal hold may safely anchor to the last normalized streaming
+    // target. Real hardware profiles intentionally do not take this fallback.
+    std::lock_guard<std::mutex> lock(streaming_mutex_);
+    if (streaming_target_.has_value() &&
+        streaming_target_->joint_positions_rad.size() ==
+            config_.required_joints.size()) {
+      observed_positions = streaming_target_->joint_positions_rad;
+    } else if (config_.initial_joint_positions_rad.size() ==
+               config_.required_joints.size()) {
+      observed_positions = config_.initial_joint_positions_rad;
+    }
+  }
   if (observed_positions.empty()) {
+    std::lock_guard<std::mutex> lock(streaming_mutex_);
+    streaming_terminal_result_received_ = true;
+    streaming_terminal_result_success_ = false;
+    streaming_terminal_error_ = make_error(
+        core::ErrorCode::kStopFailed,
+        "no state available to anchor streaming terminal soft-stop",
+        {{"reason_code", "soft_stop_dispatch_failed"},
+         {"failure_stage", "missing_terminal_anchor_state"},
+         {"state_source_mode", config_.execution_state_source_mode}});
+    streaming_cv_.notify_all();
     return false;
   }
   return streaming_send_anchored_goal(
       config_.required_joints,
       observed_positions,
-      streaming_config_.soft_stop_deceleration_time_s);
+      streaming_config_.soft_stop_deceleration_time_s,
+      true);
 }
 
 void Ros2ControlExecutionBackend::streaming_dispatch_worker(std::stop_token st) {
@@ -2211,7 +2480,11 @@ void Ros2ControlExecutionBackend::streaming_dispatch_worker(std::stop_token st) 
           const bool have_per_joint_a =
               streaming_config_.per_joint_acceleration_caps_rad_s2.size()
               == new_pos.size();
-          const double v_scale = std::max(streaming_config_.velocity_scale, 1e-6);
+          // ADR-0018: per-tick runtime read so HMI slider updates take effect
+          // on this in-flight session without tearing it down.
+          const double v_scale = std::max(
+              runtime_velocity_scale_.load(std::memory_order_acquire),
+              0.0);
           double required_dt = 0.0;
           for (size_t i = 0; i < new_pos.size(); ++i) {
             double v_cap_i = kDefaultVelRadS;
@@ -2300,15 +2573,6 @@ Ros2ControlExecutionBackend::begin_streaming_session(
       return result;
     }
   }
-  if (streaming_active_.load()) {
-    result.accepted = false;
-    result.error = core::ErrorDTO{
-        std::string(
-            core::to_string(core::ErrorCode::kInvalidStateTransition)),
-        "streaming session already active on backend",
-        {}};
-    return result;
-  }
   if (!action_client_) {
     result.accepted = false;
     result.error = core::ErrorDTO{
@@ -2330,13 +2594,34 @@ Ros2ControlExecutionBackend::begin_streaming_session(
   uint64_t session_id = 0;
   {
     std::lock_guard<std::mutex> lock(streaming_mutex_);
+    if (streaming_active_.load()) {
+      result.accepted = false;
+      result.error = core::ErrorDTO{
+          std::string(
+              core::to_string(core::ErrorCode::kInvalidStateTransition)),
+          "streaming session already active on backend",
+          {}};
+      return result;
+    }
     session_id = ++streaming_session_id_;
     streaming_config_ = config;
     streaming_target_.reset();
     streaming_active_goal_.reset();
     next_streaming_backend_seq_ = 1;
+    // Seed the runtime atomic from the session config so the first dispatch
+    // tick reads the same value as the begin payload. Subsequent operator
+    // slider changes update this atomic through set_runtime_velocity_scale.
+    {
+      double initial = config.velocity_scale;
+      if (!std::isfinite(initial) || initial < 0.0) initial = 0.0;
+      if (initial > 1.0) initial = 1.0;
+      runtime_velocity_scale_.store(
+          initial, std::memory_order_release);
+      applied_runtime_velocity_scale_.store(initial, std::memory_order_release);
+      publish_runtime_velocity_scale(initial);
+    }
+    streaming_active_.store(true);
   }
-  streaming_active_.store(true);
 
   streaming_thread_ = std::jthread(
       [this](std::stop_token st) { this->streaming_dispatch_worker(st); });
@@ -2441,7 +2726,9 @@ Ros2ControlExecutionBackend::end_streaming_session(
 
   if (!ok) {
     result.accepted = false;
-    if (!result.error.has_value()) {
+    if (streaming_terminal_error_.has_value()) {
+      result.error = streaming_terminal_error_;
+    } else if (!result.error.has_value()) {
       result.error = core::ErrorDTO{
           std::string(core::to_string(core::ErrorCode::kStopFailed)),
           "soft-stop trajectory dispatch failed; check action server and "
@@ -2451,27 +2738,52 @@ Ros2ControlExecutionBackend::end_streaming_session(
     return result;
   }
 
-  // Bounded wait for the spring-back trajectory to complete. We use the
-  // existing stop_completion_timeout_s budget for parity with stop().
+  // Bounded wait for both the dispatcher shutdown and the controller's
+  // terminal soft-stop result. Reporting Idle before the controller accepts
+  // and completes the terminal goal would let a new command overlap a
+  // soft-stop that is still in flight.
   const auto deadline = std::chrono::steady_clock::now() +
                         std::chrono::duration<double>(
                             config_.stop_completion_timeout_s);
-  while (streaming_active_.load() &&
-         std::chrono::steady_clock::now() < deadline) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-  }
+  std::unique_lock<std::mutex> lock(streaming_mutex_);
+  const bool completed = streaming_cv_.wait_until(lock, deadline, [this]() {
+    return !streaming_active_.load() && streaming_terminal_result_received_;
+  });
 
-  if (streaming_active_.load()) {
+  if (!completed) {
     result.accepted = false;
     result.error = core::ErrorDTO{
         std::string(core::to_string(core::ErrorCode::kStopFailed)),
-        "soft-stop did not complete within configured timeout",
-        {{"timeout_s", std::to_string(config_.stop_completion_timeout_s)}}};
+        "soft-stop terminal result was not observed within configured timeout",
+        {{"reason_code", "soft_stop_timeout"},
+         {"timeout_s", std::to_string(config_.stop_completion_timeout_s)}}};
+    return result;
+  }
+
+  if (!streaming_terminal_result_success_) {
+    result.accepted = false;
+    result.error = streaming_terminal_error_.value_or(core::ErrorDTO{
+        std::string(core::to_string(core::ErrorCode::kStopFailed)),
+        "soft-stop terminal goal failed",
+        {}});
     return result;
   }
 
   result.accepted = true;
   return result;
+}
+
+void Ros2ControlExecutionBackend::set_runtime_velocity_scale(double scale) {
+  // ADR-0018: clamp + atomic store. Caller (kernel) already validated
+  // finiteness, but defense-in-depth keeps monitor/dispatcher workers from
+  // ever reading NaN/Inf via this path.
+  if (!std::isfinite(scale)) return;
+  if (scale < 0.0) scale = 0.0;
+  if (scale > 1.0) scale = 1.0;
+  runtime_velocity_scale_.store(scale, std::memory_order_release);
+  publish_runtime_velocity_scale(scale);
+  execution_cv_.notify_all();
+  streaming_cv_.notify_all();
 }
 
 }  // namespace manyforge::roboplan_backend

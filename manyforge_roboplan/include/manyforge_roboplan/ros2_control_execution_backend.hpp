@@ -13,6 +13,10 @@
 #include <control_msgs/action/follow_joint_trajectory.hpp>
 #include <control_msgs/action/gripper_command.hpp>
 #include <control_msgs/msg/joint_trajectory_controller_state.hpp>
+#if __has_include(<control_msgs/msg/speed_scaling_factor.hpp>)
+#include <control_msgs/msg/speed_scaling_factor.hpp>
+#define MANYFORGE_HAS_SPEED_SCALING_FACTOR_MSG 1
+#endif
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_action/rclcpp_action.hpp>
 #include <roboplan/core/scene.hpp>
@@ -50,6 +54,10 @@ struct Ros2ControlExecutionBackendConfig {
   std::string execution_state_source_mode = "observed_robot";
   std::vector<double> initial_joint_positions_rad;
   std::string command_gate_topic;
+  // JTC Jazzy+ on-controller speed-scaling input. If empty, derived from
+  // action_name by replacing `/follow_joint_trajectory` with
+  // `/speed_scaling_input`.
+  std::string speed_scaling_topic;
 };
 
 struct Ros2GripperActionConfig {
@@ -136,6 +144,9 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
   core::StreamingSessionEndResultDTO end_streaming_session(
       uint64_t session_id,
       core::SoftStopStrategy strategy) override;
+  // ADR-0018: per-tick runtime velocity scale for discrete trajectory
+  // monitoring and streaming dispatch.
+  void set_runtime_velocity_scale(double scale) override;
 
   void configure_gripper_action(std::string gripper_id,
                                 Ros2GripperActionConfig config);
@@ -221,6 +232,7 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
   bool is_commanded_sim_mode() const;
   bool uses_authored_backend_state() const;
   void set_command_gate(bool enabled);
+  void publish_runtime_velocity_scale(double scale);
   core::Result<void> command_sim_initial_state(std::string phase);
   std::vector<double> interpolate_joint_positions(
       const core::TrajectoryDTO& trajectory, double time_s) const;
@@ -284,6 +296,10 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
   rclcpp::Subscription<control_msgs::msg::JointTrajectoryControllerState>::SharedPtr
       controller_state_sub_;
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr command_gate_pub_;
+#ifdef MANYFORGE_HAS_SPEED_SCALING_FACTOR_MSG
+  rclcpp::Publisher<control_msgs::msg::SpeedScalingFactor>::SharedPtr
+      speed_scaling_pub_;
+#endif
 
   mutable std::mutex state_mutex_;
   std::condition_variable state_cv_;
@@ -321,8 +337,11 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
   bool streaming_send_anchored_goal(
       const std::vector<std::string>& joint_names,
       const std::vector<double>& target_positions,
-      double target_time_from_start_s);
+      double target_time_from_start_s,
+      bool track_terminal_goal = false);
   bool streaming_send_spring_back_stop();
+  void on_streaming_terminal_result(
+      const GoalHandleFJT::WrappedResult& result);
 
   mutable std::mutex streaming_mutex_;
   std::condition_variable streaming_cv_;
@@ -331,11 +350,18 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
   uint64_t streaming_session_id_ = 0;
   uint64_t next_streaming_backend_seq_ = 1;
   core::StreamingSessionConfigDTO streaming_config_;
+  // ADR-0018: runtime velocity scale read by monitor/dispatcher loops.
+  std::atomic<double> runtime_velocity_scale_{1.0};
+  std::atomic<double> applied_runtime_velocity_scale_{1.0};
   std::optional<core::StreamingTargetDTO> streaming_target_;
   // The most-recent goal handle issued by the streaming dispatcher.
   // Subsequent dispatches preempt it via async_send_goal; the existing
   // on_action_result callback handles its terminal state.
   GoalHandleFJT::SharedPtr streaming_active_goal_;
+  std::optional<rclcpp_action::GoalUUID> streaming_terminal_goal_id_;
+  bool streaming_terminal_result_received_ = true;
+  bool streaming_terminal_result_success_ = true;
+  std::optional<core::ErrorDTO> streaming_terminal_error_;
 };
 
 std::shared_ptr<NativeKernelBundle> create_ros2_control_kernel(

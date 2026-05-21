@@ -25,6 +25,10 @@ struct IkRequestDTO {
     /// Seed state (previous-frame joint positions for continuity).
     /// Empty seed falls back to the planner backend's current state.
     RobotStateDTO seed_state;
+    /// Optional caller budget for this IK request. A value <= 0 means the
+    /// backend default applies. Streaming callers set this to the direct
+    /// control budget so a slow IK attempt cannot stall the operator loop.
+    double timeout_s = 0.0;
 };
 
 /// Result of a single-shot IK solve.

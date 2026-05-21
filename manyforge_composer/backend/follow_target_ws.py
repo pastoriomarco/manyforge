@@ -48,6 +48,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import time
 from typing import Any, Optional
 
@@ -122,7 +123,7 @@ async def handle_follow_target_ws(ws: WebSocket, state: ComposerState) -> None:
                     if err is not None:
                         await _close_error(ws, err_code or "begin_failed", err)
                         return
-                source_sequence = int(msg.get("source_sequence", 0))
+                source_sequence = _safe_int(msg.get("source_sequence", 0))
                 target = _frame_to_target(msg)
                 if target is None:
                     await ws.send_text(json.dumps({
@@ -264,7 +265,10 @@ async def _open_session(
     # allowed to exceed the deployment global — same precedence rule as
     # planned moves in motion.py: min(global, per-call) if both set.
     deployment_cap_mps = _deployment_tcp_speed_cap(state)
-    requested_cap_mps = float(msg.get("max_tcp_linear_speed_mps", 0.0) or 0.0)
+    requested_cap_mps = _finite_float_or_default(
+        msg.get("max_tcp_linear_speed_mps", 0.0),
+        0.0,
+    )
     if deployment_cap_mps > 0.0 and requested_cap_mps > 0.0:
         effective_cap_mps = min(deployment_cap_mps, requested_cap_mps)
     elif deployment_cap_mps > 0.0:
@@ -317,18 +321,18 @@ async def _open_session(
         ),
         tcp_frame=str(msg.get("tcp_frame", "") or ""),
         soft_stop_strategy=str(msg.get("soft_stop_strategy", "spring_back")),
-        soft_stop_deceleration_time_s=float(
-            msg.get("soft_stop_deceleration_time_s", 0.4)
-        ),
-        anchor_negative_time_s=float(
-            msg.get("anchor_negative_time_s", -0.010)
-        ),
-        target_time_from_start_min_s=float(
-            msg.get("target_time_from_start_min_s", 0.030)
-        ),
-        max_dispatch_rate_hz=float(msg.get("max_dispatch_rate_hz", 30.0)),
-        target_max_age_s=float(msg.get("target_max_age_s", 0.200)),
-        velocity_scale=float(msg.get("velocity_scale", 1.0)),
+        soft_stop_deceleration_time_s=_finite_float_or_default(
+            msg.get("soft_stop_deceleration_time_s", 0.4), 0.4),
+        anchor_negative_time_s=_finite_float_or_default(
+            msg.get("anchor_negative_time_s", -0.010), -0.010),
+        target_time_from_start_min_s=_finite_float_or_default(
+            msg.get("target_time_from_start_min_s", 0.030), 0.030),
+        max_dispatch_rate_hz=_finite_float_or_default(
+            msg.get("max_dispatch_rate_hz", 30.0), 30.0),
+        target_max_age_s=_finite_float_or_default(
+            msg.get("target_max_age_s", 0.200), 0.200),
+        velocity_scale=_finite_float_or_default(
+            msg.get("velocity_scale", 1.0), 1.0),
         max_tcp_linear_speed_mps=effective_cap_mps,
         per_joint_velocity_caps_rad_s=per_joint_v,
         per_joint_acceleration_caps_rad_s2=per_joint_a,
@@ -378,18 +382,45 @@ def _frame_to_target(msg: dict[str, Any]) -> Optional[StreamingTarget]:
             return None
         if not (isinstance(quat, list) and len(quat) == 4):
             return None
-        target.position_m = [float(v) for v in pos]
-        target.orientation_xyzw = [float(v) for v in quat]
+        try:
+            target.position_m = [_finite_float(v) for v in pos]
+            target.orientation_xyzw = [_finite_float(v) for v in quat]
+        except (TypeError, ValueError):
+            return None
     elif kind == "joint":
         names = msg.get("joint_names") or []
         values = msg.get("joint_positions_rad")
         if not (isinstance(values, list) and values):
             return None
         target.joint_names = [str(n) for n in names]
-        target.joint_positions_rad = [float(v) for v in values]
+        try:
+            target.joint_positions_rad = [_finite_float(v) for v in values]
+        except (TypeError, ValueError):
+            return None
     else:
         return None
     return target
+
+
+def _finite_float(value: Any) -> float:
+    out = float(value)
+    if not math.isfinite(out):
+        raise ValueError("non-finite numeric value")
+    return out
+
+
+def _finite_float_or_default(value: Any, default: float) -> float:
+    try:
+        return _finite_float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_int(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _deployment_streaming_joint_limits(

@@ -415,6 +415,32 @@ export interface RobotConfig {
   streamingJointLimits?: Record<string, StreamingJointLimit>;
 }
 
+// One link in the gripper subtree, posed relative to the gripper
+// root at the URDF default joint configuration. The unreachable
+// ghost renders the full subtree so the operator sees a recognizable
+// gripper silhouette, not just the root cube.
+export interface GripperSubtreeLink {
+  name: string;
+  positionM: number[];
+  orientationXyzw: number[];
+}
+
+// Auto-discovered Move-To unreachable-ghost visualization metadata
+// (see ADR-0018 / `routes_urdf.resolve_gripper_visualization`).
+// `gripperRootLink` is the first link reachable downstream of
+// `mountFrame` that has visuals; the tcp→root SE(3) places the
+// gripper mesh at the right offset from an unreachable TCP target;
+// `subtreeLinks` enumerates the full gripper chain so the renderer
+// can draw the whole shape, not just the root link.
+// Null when the URDF graph walk does not reach a visual link — the
+// frontend renders a red-axes marker instead.
+export interface GripperVisualization {
+  gripperRootLink: string;
+  tcpToRootPositionM: number[];
+  tcpToRootOrientationXyzw: number[];
+  subtreeLinks: GripperSubtreeLink[];
+}
+
 export interface GripperConfig {
   commandMode: string;
   groupId: string;
@@ -427,6 +453,7 @@ export interface GripperConfig {
   attachFrame: string;
   tcpFrame: string;
   auxiliaryFrames: string[];
+  visualization?: GripperVisualization | null;
 }
 
 export interface DeploymentInfo {
@@ -544,6 +571,22 @@ export interface SceneObjectState {
   viewer_frame_visible: boolean;
 }
 
+export interface SceneGripperSubtreeLink {
+  name: string;
+  position_m: number[];
+  orientation_xyzw: number[];
+}
+
+// Snake_case mirror of GripperVisualization, surfaced on the
+// scene-state gripper block so the Move-To ghost renderer can
+// consume it without an extra deployment fetch.
+export interface SceneGripperVisualization {
+  gripper_root_link: string;
+  tcp_to_root_position_m: number[];
+  tcp_to_root_orientation_xyzw: number[];
+  subtree_links: SceneGripperSubtreeLink[];
+}
+
 export interface SceneGripperState {
   gripper_id: string;
   joint_name: string;
@@ -554,6 +597,7 @@ export interface SceneGripperState {
   limit_upper: number | null;
   motion_time_s: number;
   srdf_presets: Record<string, number>;
+  visualization?: SceneGripperVisualization | null;
   error: string | null;
 }
 
@@ -620,9 +664,11 @@ export interface SceneUrdfManifest {
 export interface SceneEditRequest {
   operation: 'add' | 'upsert' | 'remove' | 'update_pose' | 'attach' | 'detach';
   object_id: string;
-  shape_type?: 'box' | 'sphere' | 'mesh';
+  shape_type?: 'box' | 'sphere' | 'cylinder' | 'mesh';
   box_dimensions_m?: number[];
   sphere_radius_m?: number;
+  cylinder_radius_m?: number;
+  cylinder_height_m?: number;
   mesh_resource_uri?: string;
   mesh_scale?: number[];
   pose_position_m?: number[];

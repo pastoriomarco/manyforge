@@ -7,9 +7,11 @@ set -euo pipefail
 
 BUILD_DIR="${MANYFORGE_ROBOPLAN_BUILD_DIR:-${MANYFORGE_BUILD_DIR:-/tmp/manyforge-build}/roboplan}"
 export PYTHONPATH="${BUILD_DIR}:/workspace/manyforge_roboplan/python:${PYTHONPATH:-}"
+COMPOSER_PORT="${MANYFORGE_COMPOSER_PORT:-${COMPOSER_PORT:-9000}}"
+HMI_PORT="${MANYFORGE_HMI_PORT:-${HMI_PORT:-8081}}"
 
 exec python -m manyforge_composer \
     --catalog-path /workspace/manyforge_behavior/resources/node_catalog.yaml \
     --host 0.0.0.0 \
-    --port 9000 \
-    --hmi-port 8081
+    --port "${COMPOSER_PORT}" \
+    --hmi-port "${HMI_PORT}"

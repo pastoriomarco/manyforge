@@ -199,12 +199,12 @@ _SCENE_DRAFT_SINGLE_OBJECT_SCHEMA: dict[str, Any] = {
         "pose": _SCENE_RESOURCE_SCHEMA["properties"]["pose"],
         "shapeType": {
             "type": "string",
-            "enum": ["box", "sphere", "mesh"],
+            "enum": ["box", "sphere", "cylinder", "mesh"],
             "description": "Convenience alias for shape.type.",
         },
         "shape_type": {
             "type": "string",
-            "enum": ["box", "sphere", "mesh"],
+            "enum": ["box", "sphere", "cylinder", "mesh"],
             "description": "Convenience alias for shape.type.",
         },
         "size": {
@@ -231,17 +231,27 @@ _SCENE_DRAFT_SINGLE_OBJECT_SCHEMA: dict[str, Any] = {
         "box_dimensions_m": _SCENE_RESOURCE_SCHEMA["properties"]["shape"]["properties"]["box_dimensions_m"],
         "radius": {
             "type": "number",
-            "description": "Convenience alias for a sphere radius in meters.",
+            "description": "Convenience alias for sphere radius, or cylinder radius when shapeType is cylinder.",
         },
         "diameter": {
             "type": "number",
-            "description": "Convenience alias for a sphere diameter in meters.",
+            "description": "Convenience alias for sphere diameter, or cylinder diameter when shapeType is cylinder.",
         },
         "sphereRadiusM": {
             "type": "number",
             "description": "Sphere radius in meters.",
         },
         "sphere_radius_m": _SCENE_RESOURCE_SCHEMA["properties"]["shape"]["properties"]["sphere_radius_m"],
+        "cylinderRadiusM": {
+            "type": "number",
+            "description": "Cylinder radius in meters.",
+        },
+        "cylinder_radius_m": _SCENE_RESOURCE_SCHEMA["properties"]["shape"]["properties"]["cylinder_radius_m"],
+        "cylinderHeightM": {
+            "type": "number",
+            "description": "Cylinder height in meters along its local Z axis.",
+        },
+        "cylinder_height_m": _SCENE_RESOURCE_SCHEMA["properties"]["shape"]["properties"]["cylinder_height_m"],
         "meshResourceUri": {
             "type": "string",
             "minLength": 1,

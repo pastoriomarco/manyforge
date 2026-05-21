@@ -242,9 +242,17 @@ export function openFollowTargetSession(
   };
 
   ws.onclose = (ev) => {
+    const wasConnecting = state === 'connecting';
     state = 'closed';
     pendingFrame = null;
     inFlightSequence = null;
+    if (wasConnecting) {
+      rejectReady(
+        new Error(
+          `socket closed before session begin${ev.reason ? `: ${ev.reason}` : ''}`,
+        ),
+      );
+    }
     finishEnd();
     if (onCloseCb) {
       try {

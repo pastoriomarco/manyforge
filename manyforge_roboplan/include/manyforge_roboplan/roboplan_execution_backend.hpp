@@ -15,6 +15,11 @@
 
 namespace manyforge::roboplan_backend {
 
+struct RoboPlanExecutionBackendConfig {
+  double reset_completion_timeout_s = 5.0;
+  double streaming_stop_completion_timeout_s = 5.0;
+};
+
 /// Simulated execution backend that updates the planning scene
 /// over time and publishes observer-safe execution snapshots.
 class RoboPlanExecutionBackend final : public core::IExecutionBackend {
@@ -22,7 +27,8 @@ class RoboPlanExecutionBackend final : public core::IExecutionBackend {
   RoboPlanExecutionBackend(std::shared_ptr<roboplan::Scene> scene,
                            std::string group_name,
                            core::IClock& clock,
-                           std::shared_ptr<std::mutex> scene_mutex = nullptr);
+                           std::shared_ptr<std::mutex> scene_mutex = nullptr,
+                           RoboPlanExecutionBackendConfig config = {});
   ~RoboPlanExecutionBackend() override;
 
   core::ExecutionHandle execute_trajectory(const core::TrajectoryDTO& trajectory) override;
@@ -45,6 +51,9 @@ class RoboPlanExecutionBackend final : public core::IExecutionBackend {
   core::StreamingSessionEndResultDTO end_streaming_session(
       uint64_t session_id,
       core::SoftStopStrategy strategy) override;
+  // ADR-0018: atomic per-tick read of the runtime velocity scale so the HMI
+  // slider retimes in-flight discrete and streaming motion without stopping.
+  void set_runtime_velocity_scale(double scale) override;
 
  private:
   struct ExecutionStateData {
@@ -71,6 +80,7 @@ class RoboPlanExecutionBackend final : public core::IExecutionBackend {
   std::string group_name_;
   core::IClock& clock_;
   std::shared_ptr<std::mutex> scene_mutex_;
+  RoboPlanExecutionBackendConfig config_;
 
   mutable std::mutex execution_mutex_;
   mutable std::mutex state_mutex_;
@@ -99,6 +109,10 @@ class RoboPlanExecutionBackend final : public core::IExecutionBackend {
   // arm doesn't snap to its velocity cap in one step. Cleared on
   // begin/end alongside the position vector.
   std::optional<std::vector<double>> streaming_commanded_velocities_;
+  // Runtime velocity scale read on every worker tick. std::atomic<double> is
+  // lock-free on all supported targets; memory_order_release on the setter pairs
+  // with memory_order_acquire on the worker's per-tick read.
+  std::atomic<double> runtime_velocity_scale_{1.0};
   // One-shot diagnostic flag: set true when the streaming worker
   // first enters the hold branch (because the published snapshot's
   // joint vector doesn't cover every session joint, so it can't be

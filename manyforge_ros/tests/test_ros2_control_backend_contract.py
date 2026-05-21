@@ -222,6 +222,91 @@ def test_ros2_control_commanded_sim_uses_backend_initial_state_without_observed_
         rclpy.shutdown()
 
 
+def test_ros2_control_streaming_end_waits_for_terminal_soft_stop_result():
+    rclpy = pytest.importorskip("rclpy")
+    pytest.importorskip("control_msgs")
+
+    from rclpy.executors import MultiThreadedExecutor
+
+    from manyforge_ros.testing.fake_follow_joint_trajectory import (
+        FakeFollowJointTrajectoryServer,
+    )
+
+    suffix = uuid.uuid4().hex
+    action_name = (
+        f"/manyforge_contract_streaming_terminal_{suffix}/follow_joint_trajectory"
+    )
+    joint_state_topic = f"/manyforge_contract_streaming_terminal_{suffix}/joint_states"
+    controller_state_topic = (
+        f"/manyforge_contract_streaming_terminal_{suffix}/controller_state"
+    )
+
+    rclpy.init(args=None)
+    executor = MultiThreadedExecutor(num_threads=3)
+    node = rclpy.create_node(f"manyforge_contract_streaming_terminal_{suffix}")
+    fake_server = None
+    bundle = None
+
+    try:
+        fake_server = FakeFollowJointTrajectoryServer(
+            node,
+            action_name=action_name,
+            hold_after_first_feedback_s=0.25,
+        )
+        executor.add_node(node)
+        spin_thread = threading.Thread(target=executor.spin, daemon=True)
+        spin_thread.start()
+        time.sleep(0.2)
+
+        bundle = _create_bundle(
+            action_name=action_name,
+            joint_state_topic=joint_state_topic,
+            controller_state_topic=controller_state_topic,
+            wait_s=0.05,
+            config_overrides={
+                "execution_state_source_mode": "commanded_sim",
+                "require_fresh_state_before_planning": False,
+                "initial_joint_positions_rad": START_POSITIONS,
+                "wait_for_action_server_timeout_s": 3.0,
+                "stop_completion_timeout_s": 1.0,
+                "disable_controller_path_tolerances": True,
+            },
+        )
+        reset = bundle.reset()
+        assert reset["accepted"] is True, reset
+        initial_goal_count = len(fake_server.goals)
+
+        begin = bundle.begin_streaming_session(
+            {
+                "group_id": "arm",
+                "joint_names": JOINTS,
+                "input_mode": "joint",
+                "target_time_from_start_min_s": 0.03,
+                "soft_stop_deceleration_time_s": 0.05,
+            }
+        )
+        assert begin["accepted"] is True, begin
+
+        started = time.monotonic()
+        ended = bundle.end_streaming_session(begin["session_id"], "spring_back")
+        elapsed_s = time.monotonic() - started
+
+        assert ended["accepted"] is True, ended
+        assert elapsed_s >= 0.20
+        assert len(fake_server.goals) >= initial_goal_count + 1
+    finally:
+        if bundle is not None:
+            try:
+                bundle.reset()
+            except RuntimeError:
+                pass
+        if fake_server is not None:
+            fake_server.destroy()
+        executor.shutdown()
+        node.destroy_node()
+        rclpy.shutdown()
+
+
 def test_ros2_control_backend_preserves_fjt_abort_diagnostics():
     rclpy = pytest.importorskip("rclpy")
     pytest.importorskip("control_msgs")

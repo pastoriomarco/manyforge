@@ -1,14 +1,14 @@
 # ManyForge roadmap
 
 This is the public direction document. It is not a commitment to delivery
-dates — items can move, get reordered, or be deferred as integration
-work surfaces new constraints. See CHANGELOG.md for what's actually
-shipped.
+dates or versions - items can move, get reordered, or be deferred as
+integration work surfaces new constraints. See CHANGELOG.md for what is
+actually planned for the next tag and what has shipped after tags exist.
 
-The roadmap is structured by **what** before **when**: the milestones
-below describe outcomes the project is working toward, in rough priority
-order. Each milestone names the work it depends on and the criteria for
-"done."
+The roadmap is structured by **what** before **when**: the workstreams below
+describe outcomes the project is working toward, in rough priority order. Each
+workstream names the work it depends on and the criteria for "done"; none of
+them is pinned to a specific future version.
 
 ## Companion roadmap
 
@@ -16,10 +16,10 @@ NemoClaw-Thor publishes its own roadmap focused on serving + sandboxing:
 the model server (vLLM container generations), the OpenClaw bridge lane,
 and the Thor-hardware specifics. See
 [NemoClaw-Thor ROADMAP](https://github.com/pastoriomarco/NemoClaw-Thor/blob/main/ROADMAP.md).
-The two roadmaps coordinate version pins; check both before planning a
-release that crosses the boundary.
+The two roadmaps coordinate compatibility constraints; check both before
+planning a release that crosses the boundary.
 
-## 0.2.x — real-robot execution lane
+## Real-Robot Execution Lane
 
 **Goal.** Ship the third execution lane (`real-robot`) alongside the
 existing `manyforge-only` and `isaac-sim` lanes. The `commanded_sim` /
@@ -41,7 +41,7 @@ launcher scenario.
 - Operator runbook for first power-on, e-stop integration, and
   measured stop-completion characterization.
 
-## 0.2.x — fake-controller chaos tests
+## Fake-Controller Chaos Tests
 
 **Goal.** Cover the stop/reset race cases listed in spec 220 + the open
 points: stop before goal acceptance, stop before first feedback, stale
@@ -58,7 +58,7 @@ convergence, gripper action server hang.
 - ThreadSanitizer coverage extended from `manyforge_core` to the
   RoboPlan/ROS-backed runtime tests.
 
-## 0.2.x — assistant graduations
+## Assistant Graduations
 
 **Goal.** Move two assistant modes from preview to qualified:
 
@@ -77,7 +77,7 @@ convergence, gripper action server hang.
 - Bridge-fired `/compact` cadence tunable per deployment (currently
   pinned at N=2 for OpenClaw).
 
-## 0.3.x — observability + supervisability
+## Observability And Supervisability
 
 **Goal.** Promote the existing tracing/heartbeat surfaces from
 "present" to "production-supervisable."
@@ -97,7 +97,7 @@ convergence, gripper action server hang.
 - Operational logging spec (spec 520) lands in production deployments
   including assistant-mode audit envelopes.
 
-## 0.4.x — fine-tuning + agentic loop
+## Fine-Tuning And Agentic Loop
 
 **Goal.** Use NemoClaw-Thor's JP7.2 (Q2 2026) SBSA transition to enable
 SDFT/QAT-based fine-tuning of the assistant lane on operator-edited
@@ -106,9 +106,9 @@ program corpora.
 **Acceptance criteria depend on Thor's SBSA milestone. Tracking link**:
 NemoClaw-Thor ROADMAP §"Thor SBSA + fine-tuning".
 
-## 1.0.0 — production readiness
+## Production Readiness Bar
 
-The bar for 1.0:
+The bar for calling ManyForge production-ready:
 
 1. All three execution lanes (manyforge-only, isaac-sim, real-robot)
    ship with qualified tolerances and an external-watchdog example.
@@ -116,9 +116,9 @@ The bar for 1.0:
 3. The assistant `composer-assistant` mode hits ≥85% on the smoke
    corpus with the production recipe (currently 77.3%).
 4. Public-facing APIs (kernel state surfaces, deployment YAML schema,
-   assistant-provider contract) are versioned per spec 430 §schema and
-   stable enough that breaking changes are 1.x → 2.x transitions, not
-   1.x patch bumps.
+   assistant-provider contract) are versioned per spec 430 §schema and stable
+   enough that breaking changes are explicit major-release decisions, not
+   silent patch-level behavior shifts.
 5. Spec ↔ implementation drift is automated-checked (the existing
    `check-private-spec-boundary.sh` is the boundary check; an
    additional CI lane verifying the assistant-bridge wire fields
@@ -127,16 +127,16 @@ The bar for 1.0:
 
 ## Out of scope / explicitly deferred
 
-These came up during the launcher pass but are not on the 0.x roadmap:
+These came up during the launcher pass but are not currently on the roadmap:
 
 - **Per-package independent SemVer.** We chose unified-repo SemVer
-  for the 0.x line. If sub-packages start releasing on independent
-  cadences (e.g. `manyforge_core` ships a patch faster than the rest),
-  the model can split in a later major version.
+  for the initial public line. If sub-packages start releasing on independent
+  cadences (e.g. `manyforge_core` ships a patch faster than the rest), the
+  model can split in a later major release decision.
 - **Single-service hot-restart verbs** (`restart-bridge`,
   `reload-composer`). Deprecated in favor of the unified
   `scripts/launch.sh restart`. If iteration velocity loss is
-  meaningful, can be added back as per-service verbs in 0.2.
+  meaningful, they can be added back as per-service verbs later.
 - **`Code of Conduct`**. Deferred until the project has external
   contributors. Adding it later is a single-PR change.
 

@@ -360,6 +360,10 @@ step_preflight() {
     if [[ "${STOP_KNOWN_CONFLICTS}" == "true" ]]; then
         info "Removing any stale manyforge-e2e-* containers"
         stop_known_conflicts
+        if [[ "${ASSISTANT}" == "on" ]]; then
+            info "Stopping stale launcher-managed assistant processes"
+            stop_assistant_stack
+        fi
     else
         preflight_managed_components
     fi
@@ -374,6 +378,9 @@ step_preflight() {
     fi
     if [[ "${ASSISTANT}" == "on" ]]; then
         ports+=(8000)
+        if [[ "${START_VLLM_PROXY:-true}" == "true" ]]; then
+            ports+=("${VLLM_PORT:-8050}")
+        fi
         case "${ASSISTANT_PROVIDER}" in
             openclaw) ports+=(8200) ;;
             nemoclaw|*) ports+=(8100) ;;
@@ -549,8 +556,16 @@ verb_status() {
     docker ps --format '    {{.Names}}\t{{.Image}}\t{{.Ports}}' \
         | grep -E "(manyforge-e2e-|composer-ros|isaac-topic-control|openshell)" >&2 || true
     echo >&2
-    echo "  Listeners (8000 8081 8100 8200 9000):" >&2
-    ss -ltnp 2>/dev/null | grep -E ':(8000|8081|8100|8200|9000)\b' >&2 || true
+    local status_ports=("${COMPOSER_PORT:-9000}" "${HMI_PORT:-8081}" 8000)
+    if [[ "${START_VLLM_PROXY:-true}" == "true" ]]; then
+        status_ports+=("${VLLM_PORT:-8050}")
+    fi
+    status_ports+=(8100 8200)
+    local port_re
+    port_re="$(printf '|%s' "${status_ports[@]}")"
+    port_re="${port_re:1}"
+    echo "  Listeners (${status_ports[*]}):" >&2
+    ss -ltnp 2>/dev/null | grep -E ":(${port_re})\\b" >&2 || true
     echo >&2
     echo "  Runtime status:" >&2
     runtime_status_summary

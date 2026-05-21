@@ -749,6 +749,44 @@ def test_assistant_bridge_scene_resource_accepts_diameter_and_list_wrapper(
     assert state.program.scene[0].pose["position_m"] == [0.3, 0.3, 0.3]
 
 
+def test_assistant_bridge_scene_resource_accepts_cylinder_arguments(
+    client: TestClient,
+    state: ComposerState,
+    tmp_path: Path,
+) -> None:
+    program_path = _write_minimal_program(tmp_path)
+    state.load_program(str(program_path))
+    state.deployment = _assistant_mode_deployment()
+    catalog_hash = _assistant_catalog_hash(state, "composer-assistant")
+
+    response = client.post(
+        "/api/assistant/bridge/tools/scene_draft_add_object",
+        json={
+            "requestId": "req-bridge-cylinder",
+            "assistantMode": "composer-assistant",
+            "catalogHash": catalog_hash,
+            "arguments": {
+                "objectId": "cylinder_001",
+                "shapeType": "cylinder",
+                "radius": 0.04,
+                "height": 0.2,
+                "position": [0.3, 0.3, 0.1],
+                "frameId": "world",
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    assert state.program is not None
+    assert state.program.scene[0].object_id == "cylinder_001"
+    assert state.program.scene[0].shape == {
+        "type": "cylinder",
+        "cylinder_radius_m": 0.04,
+        "cylinder_height_m": 0.2,
+    }
+    assert state.program.scene[0].pose["frame_id"] == "universe"
+
+
 def test_assistant_bridge_composer_draft_callback_updates_scene_resource(
     client: TestClient,
     state: ComposerState,

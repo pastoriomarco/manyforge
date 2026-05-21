@@ -74,6 +74,7 @@ adapters:
       - context.scene.object_query
       - scene.shape.box
       - scene.shape.sphere
+      - scene.shape.cylinder
       - scene.shape.mesh
       - scene.edit.add
       - scene.edit.remove
@@ -422,12 +423,14 @@ tool_catalog:
           enum:
             - box
             - sphere
+            - cylinder
           description: Convenience alias for shape.type.
         shape_type:
           type: string
           enum:
             - box
             - sphere
+            - cylinder
           description: Convenience alias for shape.type.
         size:
           type: array
@@ -445,10 +448,22 @@ tool_catalog:
           description: Box dimensions [x, y, z] in meters.
         radius:
           type: number
-          description: Sphere radius in meters.
+          description: Sphere radius, or cylinder radius when shapeType is cylinder.
         diameter:
           type: number
-          description: Sphere diameter in meters; callback converts to radius.
+          description: Sphere diameter, or cylinder diameter when shapeType is cylinder; callback converts to radius.
+        cylinderRadiusM:
+          type: number
+          description: Cylinder radius in meters.
+        cylinder_radius_m:
+          type: number
+          description: Cylinder radius in meters.
+        cylinderHeightM:
+          type: number
+          description: Cylinder height in meters along local Z.
+        cylinder_height_m:
+          type: number
+          description: Cylinder height in meters along local Z.
         position:
           type: array
           items:

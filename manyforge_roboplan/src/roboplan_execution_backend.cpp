@@ -4,17 +4,24 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <iostream>
+#include <stdexcept>
 #include <utility>
 
 namespace manyforge::roboplan_backend {
 namespace {
 
 constexpr auto kExecutionTick = std::chrono::milliseconds(10);
-constexpr auto kResetCompletionTimeout = std::chrono::seconds(2);
+constexpr double kRuntimeScaleSlewPerSecond = 4.0;  // 0→1 in 250 ms.
 
 double clamp_progress(double progress) {
   return std::max(0.0, std::min(1.0, progress));
+}
+
+template <typename Rep, typename Period>
+std::string seconds_string(std::chrono::duration<Rep, Period> duration) {
+  return std::to_string(std::chrono::duration<double>(duration).count());
 }
 
 }  // namespace
@@ -22,11 +29,23 @@ double clamp_progress(double progress) {
 RoboPlanExecutionBackend::RoboPlanExecutionBackend(
     std::shared_ptr<roboplan::Scene> scene, std::string group_name,
     core::IClock& clock,
-    std::shared_ptr<std::mutex> scene_mutex)
+    std::shared_ptr<std::mutex> scene_mutex,
+    RoboPlanExecutionBackendConfig config)
     : scene_(std::move(scene)),
       group_name_(std::move(group_name)),
       clock_(clock),
-      scene_mutex_(std::move(scene_mutex)) {
+      scene_mutex_(std::move(scene_mutex)),
+      config_(config) {
+  if (config_.reset_completion_timeout_s <= 0.0 ||
+      !std::isfinite(config_.reset_completion_timeout_s)) {
+    throw std::invalid_argument(
+        "reset_completion_timeout_s must be finite and > 0");
+  }
+  if (config_.streaming_stop_completion_timeout_s <= 0.0 ||
+      !std::isfinite(config_.streaming_stop_completion_timeout_s)) {
+    throw std::invalid_argument(
+        "streaming_stop_completion_timeout_s must be finite and > 0");
+  }
   if (!scene_mutex_) {
     scene_mutex_ = std::make_shared<std::mutex>();
   }
@@ -127,8 +146,10 @@ void RoboPlanExecutionBackend::execution_worker(std::stop_token st, core::Trajec
   update_scene_positions(latest_positions);
   publish_snapshot(core::ExecutionState::kExecuting, 0.0, latest_positions);
 
-  const int64_t start_time_ns = clock_.now();
-  int64_t accumulated_pause_ns = 0;
+  int64_t last_tick_ns = clock_.now();
+  double trajectory_time_s = 0.0;
+  double applied_runtime_scale = std::max(
+      0.0, std::min(1.0, runtime_velocity_scale_.load(std::memory_order_acquire)));
 
   while (true) {
     const bool pause_requested = state_.pause_requested.load();
@@ -142,12 +163,11 @@ void RoboPlanExecutionBackend::execution_worker(std::stop_token st, core::Trajec
     if (pause_requested) {
       publish_snapshot(core::ExecutionState::kPaused,
                        get_execution_snapshot().progress, latest_positions);
-      const int64_t pause_started_ns = clock_.now();
       std::unique_lock<std::mutex> lock(execution_mutex_);
       execution_cv_.wait(lock, [this, &st]() {
         return st.stop_requested() || !state_.pause_requested.load();
       });
-      accumulated_pause_ns += clock_.now() - pause_started_ns;
+      last_tick_ns = clock_.now();
       if (st.stop_requested()) {
         continue;
       }
@@ -156,15 +176,25 @@ void RoboPlanExecutionBackend::execution_worker(std::stop_token st, core::Trajec
       continue;
     }
 
-    double elapsed_s = 0.0;
-    if (total_duration_s > 0.0) {
-      const int64_t elapsed_ns = clock_.now() - start_time_ns - accumulated_pause_ns;
-      elapsed_s = static_cast<double>(elapsed_ns) / 1e9;
+    const int64_t now_ns = clock_.now();
+    const double dt_s =
+        std::max(0.0, static_cast<double>(now_ns - last_tick_ns) / 1e9);
+    last_tick_ns = now_ns;
+    const double target_scale = std::max(
+        0.0, std::min(1.0, runtime_velocity_scale_.load(std::memory_order_acquire)));
+    const double max_delta = kRuntimeScaleSlewPerSecond * dt_s;
+    if (target_scale > applied_runtime_scale + max_delta) {
+      applied_runtime_scale += max_delta;
+    } else if (target_scale < applied_runtime_scale - max_delta) {
+      applied_runtime_scale -= max_delta;
+    } else {
+      applied_runtime_scale = target_scale;
     }
+    trajectory_time_s += dt_s * applied_runtime_scale;
 
     const double progress =
-        total_duration_s <= 1e-9 ? 1.0 : clamp_progress(elapsed_s / total_duration_s);
-    latest_positions = interpolate_joint_positions(trajectory, elapsed_s);
+        total_duration_s <= 1e-9 ? 1.0 : clamp_progress(trajectory_time_s / total_duration_s);
+    latest_positions = interpolate_joint_positions(trajectory, trajectory_time_s);
     update_scene_positions(latest_positions);
     publish_snapshot(core::ExecutionState::kExecuting, progress, latest_positions);
 
@@ -270,6 +300,51 @@ core::ExecutionHandle RoboPlanExecutionBackend::resume(
 }
 
 core::ResetResultDTO RoboPlanExecutionBackend::reset() {
+  const auto reset_timeout =
+      std::chrono::duration<double>(config_.reset_completion_timeout_s);
+  if (streaming_thread_.joinable()) {
+    streaming_thread_.request_stop();
+    streaming_cv_.notify_all();
+    {
+      std::unique_lock<std::mutex> lock(streaming_mutex_);
+      const bool stopped = streaming_cv_.wait_for(
+          lock, reset_timeout,
+          [this]() { return !streaming_active_.load(); });
+      if (!stopped) {
+        publish_snapshot(
+            core::ExecutionState::kInterventionRequired,
+            get_execution_snapshot().progress,
+            get_execution_snapshot().joint_positions_rad,
+            core::ErrorDTO{
+                core::kErrorResetFailed,
+                "Native execution reset timed out waiting for streaming "
+                "worker completion",
+                {{"requires_operator_intervention", "true"},
+                 {"reason_code", "reset_timeout"},
+                 {"phase", "streaming_worker_reset"},
+                 {"timeout_s", seconds_string(reset_timeout)}}});
+        return core::ResetResultDTO{
+            false,
+            core::ErrorDTO{
+                core::kErrorResetFailed,
+                "Native execution reset timed out waiting for streaming "
+                "worker completion",
+                {{"requires_operator_intervention", "true"},
+                 {"reason_code", "reset_timeout"},
+                 {"phase", "streaming_worker_reset"},
+                 {"timeout_s", seconds_string(reset_timeout)}}}};
+      }
+    }
+    streaming_thread_.join();
+  }
+  {
+    std::lock_guard<std::mutex> lock(streaming_mutex_);
+    streaming_target_.reset();
+    streaming_commanded_joints_.reset();
+    streaming_commanded_velocities_.reset();
+    streaming_hold_emitted_ = false;
+  }
+
   state_.pause_requested.store(false);
   if (worker_thread_.joinable()) {
     worker_thread_.request_stop();
@@ -278,7 +353,7 @@ core::ResetResultDTO RoboPlanExecutionBackend::reset() {
   {
     std::unique_lock<std::mutex> lock(execution_mutex_);
     const bool stopped = execution_cv_.wait_for(
-        lock, kResetCompletionTimeout,
+        lock, reset_timeout,
         [this]() { return !state_.running.load(); });
     if (!stopped) {
       publish_snapshot(
@@ -289,14 +364,18 @@ core::ResetResultDTO RoboPlanExecutionBackend::reset() {
               core::kErrorResetFailed,
               "Native execution reset timed out waiting for worker completion",
               {{"requires_operator_intervention", "true"},
-               {"timeout_s", std::to_string(
-                    std::chrono::duration<double>(kResetCompletionTimeout).count())}}});
+               {"reason_code", "reset_timeout"},
+               {"phase", "execution_worker_reset"},
+               {"timeout_s", seconds_string(reset_timeout)}}});
       return core::ResetResultDTO{
           false,
           core::ErrorDTO{
               core::kErrorResetFailed,
               "Native execution reset timed out waiting for worker completion",
-              {{"requires_operator_intervention", "true"}}}};
+              {{"requires_operator_intervention", "true"},
+               {"reason_code", "reset_timeout"},
+               {"phase", "execution_worker_reset"},
+               {"timeout_s", seconds_string(reset_timeout)}}}};
     }
   }
   publish_snapshot(core::ExecutionState::kIdle, 0.0, {});
@@ -456,7 +535,10 @@ void RoboPlanExecutionBackend::streaming_worker(std::stop_token st) {
           config.per_joint_velocity_caps_rad_s.size() == goal.size();
       const bool have_per_joint_a =
           config.per_joint_acceleration_caps_rad_s2.size() == goal.size();
-      const double v_scale = std::max(config.velocity_scale, 1e-6);
+      // ADR-0018: read the runtime velocity scale fresh on every tick.
+      const double v_scale = std::max(
+          runtime_velocity_scale_.load(std::memory_order_acquire),
+          0.0);
 
       // Cartesian-cap-derived fraction. The kernel pre-computed
       // min_time_from_start_s from |Δpos| / max_tcp_linear_speed_mps.
@@ -517,11 +599,14 @@ void RoboPlanExecutionBackend::streaming_worker(std::stop_token st) {
         // a direction reversal naturally decelerates through the
         // accel-limited path on subsequent ticks.
         const double next_pos = current[i] + v_new * tick_s;
+        const bool settled =
+            std::abs(goal[i] - current[i]) < 1e-9 &&
+            std::abs(prev_v[i]) < 1e-6;
         const bool crosses_from_below =
             current[i] < goal[i] && next_pos >= goal[i];
         const bool crosses_from_above =
             current[i] > goal[i] && next_pos <= goal[i];
-        if (crosses_from_below || crosses_from_above) {
+        if (settled || crosses_from_below || crosses_from_above) {
           current[i] = goal[i];
           prev_v[i] = 0.0;
         } else {
@@ -556,18 +641,17 @@ RoboPlanExecutionBackend::begin_streaming_session(
     const core::StreamingSessionConfigDTO& config) {
   core::StreamingSessionBeginResultDTO result;
 
-  if (streaming_active_.load() || state_.running.load()) {
-    result.accepted = false;
-    result.error = core::ErrorDTO{
-        std::string(core::to_string(core::ErrorCode::kInvalidStateTransition)),
-        "backend is already executing or streaming",
-        {}};
-    return result;
-  }
-
   uint64_t session_id = 0;
   {
     std::lock_guard<std::mutex> lock(streaming_mutex_);
+    if (streaming_active_.load() || state_.running.load()) {
+      result.accepted = false;
+      result.error = core::ErrorDTO{
+          std::string(core::to_string(core::ErrorCode::kInvalidStateTransition)),
+          "backend is already executing or streaming",
+          {}};
+      return result;
+    }
     session_id = ++streaming_session_id_;
     streaming_config_ = config;
     streaming_target_.reset();
@@ -575,8 +659,18 @@ RoboPlanExecutionBackend::begin_streaming_session(
     streaming_commanded_velocities_.reset();
     streaming_hold_emitted_ = false;
     next_streaming_backend_seq_ = 1;
+    // Seed the runtime atomic from the session config so the first tick reads
+    // the same value as the begin payload. Subsequent operator slider changes
+    // update this atomic through set_runtime_velocity_scale.
+    {
+      double initial = config.velocity_scale;
+      if (!std::isfinite(initial) || initial < 0.0) initial = 0.0;
+      if (initial > 1.0) initial = 1.0;
+      runtime_velocity_scale_.store(
+          initial, std::memory_order_release);
+    }
+    streaming_active_.store(true);
   }
-  streaming_active_.store(true);
 
   // Start worker. jthread auto-joins on destruction; this also tears down
   // any previous lingering thread cleanly.
@@ -704,10 +798,13 @@ RoboPlanExecutionBackend::end_streaming_session(
   streaming_thread_.request_stop();
   streaming_cv_.notify_all();
 
-  // Bounded wait for the worker to settle. Matches the existing
-  // kResetCompletionTimeout convention used by reset().
-  const auto deadline =
-      std::chrono::steady_clock::now() + kResetCompletionTimeout;
+  // Bounded wait for the worker to settle. This is independently tunable
+  // from full reset because an operator release should fail quickly with a
+  // clear soft-stop timeout while reset can allow a longer drain.
+  const auto stop_timeout =
+      std::chrono::duration<double>(
+          config_.streaming_stop_completion_timeout_s);
+  const auto deadline = std::chrono::steady_clock::now() + stop_timeout;
   while (streaming_active_.load() &&
          std::chrono::steady_clock::now() < deadline) {
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -721,12 +818,26 @@ RoboPlanExecutionBackend::end_streaming_session(
     result.error = core::ErrorDTO{
         std::string(core::to_string(core::ErrorCode::kStopFailed)),
         "streaming worker did not exit within bounded soft-stop window",
-        {}};
+        {{"reason_code", "soft_stop_timeout"},
+         {"timeout_s", seconds_string(stop_timeout)}}};
     return result;
   }
 
   result.accepted = true;
   return result;
+}
+
+void RoboPlanExecutionBackend::set_runtime_velocity_scale(double scale) {
+  // ADR-0018: clamp + atomic store. Caller (kernel) already validated
+  // finiteness, but defense-in-depth keeps the workers from ever reading
+  // NaN/Inf via this path.
+  if (!std::isfinite(scale)) return;
+  if (scale < 0.0) scale = 0.0;
+  if (scale > 1.0) scale = 1.0;
+  runtime_velocity_scale_.store(scale, std::memory_order_release);
+  // Wake both workers so a scale=0 hold or resume takes effect promptly.
+  execution_cv_.notify_all();
+  streaming_cv_.notify_all();
 }
 
 }  // namespace manyforge::roboplan_backend

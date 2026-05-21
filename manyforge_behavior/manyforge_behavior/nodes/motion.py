@@ -175,10 +175,11 @@ class MoveManipulatorAction(py_trees.behaviour.Behaviour):
             else:
                 return py_trees.common.Status.RUNNING
 
+        # This is the authored per-move planning/execution scale. The HMI runtime
+        # velocity slider is a separate live control surface: CycleManager forwards
+        # it to the kernel/backend, which retimes in-flight execution without
+        # stopping or re-dispatching this behavior node.
         effective_velocity_scale = self._base_velocity_scale
-        bb_velocity_scale = self._read_optional_blackboard_value("velocity_scale")
-        if bb_velocity_scale is not None and 0.0 < bb_velocity_scale <= 1.0:
-            effective_velocity_scale *= float(bb_velocity_scale)
 
         kernel: KernelClient = self.blackboard.kernel
         if self._motion_coordinator is None:

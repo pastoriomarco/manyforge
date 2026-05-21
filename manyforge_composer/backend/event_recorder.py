@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import json
+import queue
 import shutil
 from pathlib import Path
 import threading
@@ -17,6 +18,8 @@ _ALLOWED_EVENT_TYPES = {
     "cycle_error",
     "cycle_state_changed",
     "delegated_recovery_requested",
+    "collision_detected",
+    "error_raised",
     "execute_completed",
     "execute_failed",
     "execute_started",
@@ -29,6 +32,9 @@ _ALLOWED_EVENT_TYPES = {
     "plan_failed",
     "plan_started",
     "stop_completed",
+    "streaming_session_ended",
+    "streaming_session_started",
+    "streaming_target_rejected",
     "validation_failed",
     "validation_started",
 }
@@ -47,6 +53,20 @@ _FAILURE_ARCHIVE_EVENT_TYPES = {
     "validation_failed",
 }
 _FAILURE_ARCHIVE_RECENT_EVENT_LIMIT = 1000
+_FAILURE_ARCHIVE_QUEUE_SIZE = 16
+_DEFAULT_FAILURE_ARCHIVE_MAX_AGE_S = 30 * 24 * 60 * 60
+_DEFAULT_FAILURE_ARCHIVE_MAX_BYTES = 1024 * 1024 * 1024
+_DEFAULT_HISTORY_LIMIT = 1000
+_MAX_HISTORY_LIMIT = 10000
+_NATIVE_KERNEL_EVENT_TYPES_TO_RECORD = {
+    # Keep high-rate accepted target events out of the durable recorder. The
+    # native kernel event buffer still carries them for short-term diagnostics.
+    "streaming_session_started",
+    "streaming_session_ended",
+    "streaming_target_rejected",
+    "error_raised",
+    "collision_detected",
+}
 
 
 def _wall_timestamp_iso() -> str:
@@ -62,10 +82,18 @@ def _validate_event_type(event_type: str) -> None:
 
 
 def _severity_for_event(event_type: str, details: Optional[dict[str, Any]]) -> str:
-    if event_type in {"cycle_error", "kernel_error", "intervention_required"}:
+    if event_type in {
+        "cycle_error",
+        "kernel_error",
+        "intervention_required",
+        "error_raised",
+        "collision_detected",
+    }:
         return "ERROR"
     if event_type.endswith("_failed"):
         return "ERROR"
+    if event_type == "streaming_target_rejected":
+        return "WARN"
     if details and details.get("error"):
         return "ERROR"
     return "INFO"
@@ -80,6 +108,8 @@ def _component_for_event(event_type: str) -> str:
         return "manyforge.intervention"
     if event_type.startswith("interrupt_"):
         return "manyforge.interrupt"
+    if event_type.startswith("streaming_"):
+        return "manyforge.direct_control"
     if event_type.startswith("cycle_"):
         return "manyforge.cycle"
     if event_type.startswith("kernel_") or event_type in {
@@ -94,6 +124,8 @@ def _component_for_event(event_type: str) -> str:
         "pause_completed",
         "stop_completed",
         "cache_hit",
+        "error_raised",
+        "collision_detected",
     }:
         return "manyforge.execution"
     if event_type == "node_status_transition":
@@ -145,6 +177,13 @@ class _ArchiveRecord:
     size_bytes: int
 
 
+@dataclass(frozen=True)
+class _FailureArchiveJob:
+    event: dict[str, Any]
+    run_id: Optional[str]
+    trace_file: Optional[Path]
+
+
 class EventRecorder:
     """Record execution/cycle/node events with bounded retention and JSONL sink."""
 
@@ -169,8 +208,24 @@ class EventRecorder:
                 self._failure_archive_dir = self._trace_dir / "failure-archives"
         if self._failure_archive_dir is not None:
             self._failure_archive_dir.mkdir(parents=True, exist_ok=True)
-        self._failure_archive_max_age_s = failure_archive_max_age_s
-        self._failure_archive_max_bytes = failure_archive_max_bytes
+        self._failure_archive_max_age_s = (
+            failure_archive_max_age_s
+            if failure_archive_max_age_s is not None
+            else (
+                float(_DEFAULT_FAILURE_ARCHIVE_MAX_AGE_S)
+                if self._failure_archive_dir is not None
+                else None
+            )
+        )
+        self._failure_archive_max_bytes = (
+            failure_archive_max_bytes
+            if failure_archive_max_bytes is not None
+            else (
+                _DEFAULT_FAILURE_ARCHIVE_MAX_BYTES
+                if self._failure_archive_dir is not None
+                else None
+            )
+        )
 
         self._events: deque[_StoredEvent] = deque(maxlen=max_events)
         self._event_index = 0
@@ -187,9 +242,11 @@ class EventRecorder:
         self._last_node_statuses: dict[str, str] = {}
         self._last_intervention_session_id: Optional[str] = None
         self._last_intervention_event_index: int = 0
+        self._last_recorded_native_kernel_event_index: int = 0
         self._last_failure_archive_id: Optional[str] = None
         self._last_failure_archive_path: Optional[Path] = None
         self._failure_archive_count = 0
+        self._failure_archive_dropped = 0
         self._last_archive_error: Optional[str] = None
         self._last_archive_cleanup: dict[str, Any] = {
             "deleted_count": 0,
@@ -199,6 +256,16 @@ class EventRecorder:
         }
 
         self._lock = threading.RLock()
+        self._failure_archive_queue: queue.Queue[_FailureArchiveJob] | None = None
+        self._failure_archive_worker: threading.Thread | None = None
+        if self._failure_archive_dir is not None:
+            self._failure_archive_queue = queue.Queue(maxsize=_FAILURE_ARCHIVE_QUEUE_SIZE)
+            self._failure_archive_worker = threading.Thread(
+                target=self._failure_archive_worker_loop,
+                name="manyforge-failure-archive",
+                daemon=True,
+            )
+            self._failure_archive_worker.start()
 
     @property
     def current_run_id(self) -> Optional[str]:
@@ -235,6 +302,22 @@ class EventRecorder:
                 ),
                 "last_archive_error": self._last_archive_error,
                 "last_cleanup": dict(self._last_archive_cleanup),
+                "queue_depth": (
+                    self._failure_archive_queue.qsize()
+                    if self._failure_archive_queue is not None
+                    else 0
+                ),
+                "queue_capacity": (
+                    _FAILURE_ARCHIVE_QUEUE_SIZE
+                    if self._failure_archive_queue is not None
+                    else 0
+                ),
+                "dropped_archives": self._failure_archive_dropped,
+                "worker_alive": (
+                    self._failure_archive_worker.is_alive()
+                    if self._failure_archive_worker is not None
+                    else False
+                ),
             }
 
     def observe(self, state) -> None:
@@ -350,6 +433,47 @@ class EventRecorder:
             ]
         return result
 
+    def record_native_kernel_events(self, events: list[dict[str, Any]]) -> None:
+        """Project selected native kernel events into durable history.
+
+        The native kernel event buffer is intentionally fine-grained and may
+        include high-rate target-received/dispatched events. The recorder keeps
+        durable trace volume bounded by recording session lifecycle, rejects,
+        and explicit hazard/error events only. `event_index` dedupes events
+        drained through both `/api/kernel/events` and the websocket hub.
+        """
+        for native_event in events:
+            native_type = str(native_event.get("type") or "")
+            native_index = int(native_event.get("event_index") or 0)
+            if native_type not in _NATIVE_KERNEL_EVENT_TYPES_TO_RECORD:
+                continue
+
+            with self._lock:
+                if (
+                    native_index > 0
+                    and native_index <= self._last_recorded_native_kernel_event_index
+                ):
+                    continue
+                if native_index > 0:
+                    self._last_recorded_native_kernel_event_index = native_index
+
+            details = self._native_event_details(native_event)
+            error_message = details.pop("_error_message", None)
+            if error_message:
+                details["error"] = error_message
+
+            self._record_event(
+                event_type=native_type,
+                execution_id=int(native_event.get("execution_id") or 0),
+                details=details or None,
+                execution_mode=(
+                    "direct_control"
+                    if native_type.startswith("streaming_")
+                    else None
+                ),
+                timestamp_ns=int(native_event.get("timestamp_ns") or time.monotonic_ns()),
+            )
+
     def history(
         self,
         *,
@@ -365,7 +489,11 @@ class EventRecorder:
         intervention_run_id: Optional[str] = None,
     ) -> dict[str, Any]:
         selected_run_id = run_id or self.last_run_id
-        events = self._load_events_for_run(selected_run_id)
+        if limit is None:
+            effective_limit = _DEFAULT_HISTORY_LIMIT
+        else:
+            effective_limit = max(0, min(int(limit), _MAX_HISTORY_LIMIT))
+        events = self._load_events_for_run(selected_run_id, limit=effective_limit)
         events = self._filter_events(
             events,
             start_ns=start_ns,
@@ -377,8 +505,10 @@ class EventRecorder:
             program_run_id=program_run_id,
             intervention_run_id=intervention_run_id,
         )
-        if limit is not None and limit >= 0:
-            events = events[-limit:]
+        if effective_limit == 0:
+            events = []
+        else:
+            events = events[-effective_limit:]
 
         regular_events = [event for event in events if event["type"] != "node_status_transition"]
         node_transitions = [
@@ -582,6 +712,36 @@ class EventRecorder:
                 continue
             filtered.append(event)
         return filtered
+
+    @staticmethod
+    def _native_event_details(native_event: dict[str, Any]) -> dict[str, Any]:
+        details: dict[str, Any] = {}
+        native_details = native_event.get("details")
+        if isinstance(native_details, dict):
+            details.update(native_details)
+
+        native_index = native_event.get("event_index")
+        if native_index is not None:
+            details["native_kernel_event_index"] = int(native_index)
+        native_type = native_event.get("type")
+        if native_type is not None:
+            details["native_kernel_event_type"] = native_type
+        for key in ("from_state", "to_state"):
+            value = native_event.get(key)
+            if value is not None:
+                details[key] = value
+
+        error = native_event.get("error")
+        if isinstance(error, dict):
+            code = error.get("code")
+            message = error.get("message")
+            if code:
+                details["error_code"] = code
+            if message:
+                details["_error_message"] = message
+        elif isinstance(error, str) and error:
+            details["_error_message"] = error
+        return details
 
     def record_runtime_override_event(
         self,
@@ -816,7 +976,7 @@ class EventRecorder:
             if run_id is None:
                 events = [self._decode_stored_event(event) for event in self._events]
                 if limit is not None and limit >= 0:
-                    return events[-limit:]
+                    return [] if limit == 0 else events[-limit:]
                 return events
             path = self._path_for_run(run_id)
             if path is not None and path.exists():
@@ -834,7 +994,7 @@ class EventRecorder:
                 if event.run_id == run_id
             ]
             if limit is not None and limit >= 0:
-                return events[-limit:]
+                return [] if limit == 0 else events[-limit:]
             return events
 
     @staticmethod
@@ -1257,18 +1417,70 @@ class EventRecorder:
         event_type = str(event.get("type") or "")
         if event_type not in _FAILURE_ARCHIVE_EVENT_TYPES:
             return
+        queue_ = self._failure_archive_queue
+        if queue_ is None:
+            return
+        run_id = event.get("run_id") if isinstance(event.get("run_id"), str) else None
+        trace_file = self._path_for_run(run_id)
+        job = _FailureArchiveJob(
+            event=dict(event),
+            run_id=run_id,
+            trace_file=trace_file,
+        )
         try:
-            self._write_failure_archive_locked(event)
-            self._prune_failure_archives_locked()
-            self._last_archive_error = None
-        except Exception as exc:  # pragma: no cover - defensive logging surface
-            self._last_archive_error = str(exc)
+            queue_.put_nowait(job)
+        except queue.Full:
+            self._failure_archive_dropped += 1
+            self._last_archive_error = "failure archive queue full"
 
-    def _write_failure_archive_locked(self, event: dict[str, Any]) -> None:
+    def wait_for_failure_archives_idle(self, timeout_s: float = 5.0) -> bool:
+        """Wait until queued failure-archive jobs have finished.
+
+        Intended for tests and controlled shutdown paths. Runtime request paths
+        should not call this; archive IO is intentionally asynchronous.
+        """
+        queue_ = self._failure_archive_queue
+        if queue_ is None:
+            return True
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if queue_.unfinished_tasks == 0:
+                return True
+            time.sleep(0.01)
+        return queue_.unfinished_tasks == 0
+
+    def _failure_archive_worker_loop(self) -> None:
+        queue_ = self._failure_archive_queue
+        if queue_ is None:  # pragma: no cover - defensive
+            return
+        while True:
+            job = queue_.get()
+            try:
+                try:
+                    archive_path = self._write_failure_archive(job)
+                    cleanup = self._prune_failure_archives()
+                    with self._lock:
+                        self._last_failure_archive_id = archive_path.name
+                        self._last_failure_archive_path = archive_path
+                        self._last_archive_cleanup = cleanup
+                        self._last_archive_error = None
+                except Exception as exc:  # pragma: no cover - defensive logging surface
+                    with self._lock:
+                        self._last_archive_error = str(exc)
+            finally:
+                queue_.task_done()
+
+    def _write_failure_archive(self, job: _FailureArchiveJob) -> Path:
         assert self._failure_archive_dir is not None
-        self._failure_archive_count += 1
+        event = job.event
+        with self._lock:
+            self._failure_archive_count += 1
+            archive_count = self._failure_archive_count
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        archive_id = f"incident-{stamp}-{int(event.get('event_index') or 0):06d}"
+        archive_id = (
+            f"incident-{stamp}-{int(event.get('event_index') or 0):06d}"
+            f"-{archive_count:06d}"
+        )
         archive_path = self._failure_archive_dir / archive_id
         suffix = 1
         while archive_path.exists():
@@ -1276,12 +1488,6 @@ class EventRecorder:
             archive_path = self._failure_archive_dir / f"{archive_id}-{suffix:02d}"
         archive_path.mkdir(parents=True, exist_ok=False)
 
-        run_id = event.get("run_id")
-        trace_file = self._path_for_run(run_id if isinstance(run_id, str) else None)
-        recent_events = self._load_events_for_run(
-            run_id if isinstance(run_id, str) else None,
-            limit=_FAILURE_ARCHIVE_RECENT_EVENT_LIMIT,
-        )
         manifest = {
             "schema_version": "manyforge.failure_archive.v1",
             "archive_id": archive_path.name,
@@ -1292,13 +1498,13 @@ class EventRecorder:
                 "type": event.get("type"),
                 "severity": event.get("severity"),
                 "message": event.get("message"),
-                "run_id": run_id,
+                "run_id": job.run_id,
                 "program_run_id": event.get("program_run_id"),
                 "intervention_run_id": event.get("intervention_run_id"),
                 "execution_id": int(event.get("execution_id") or 0),
                 "move_id": event.get("move_id"),
             },
-            "trace_file": str(trace_file) if trace_file is not None else None,
+            "trace_file": str(job.trace_file) if job.trace_file is not None else None,
             "retention": {
                 "max_age_s": self._failure_archive_max_age_s,
                 "max_bytes": self._failure_archive_max_bytes,
@@ -1320,21 +1526,28 @@ class EventRecorder:
             encoding="utf-8",
         )
         with (archive_path / "recent_events.jsonl").open("w", encoding="utf-8") as handle:
-            for recent in recent_events:
+            for recent in self._load_events_for_run(
+                job.run_id,
+                limit=_FAILURE_ARCHIVE_RECENT_EVENT_LIMIT,
+            ):
                 handle.write(json.dumps(recent, sort_keys=True))
                 handle.write("\n")
 
-        self._last_failure_archive_id = archive_path.name
-        self._last_failure_archive_path = archive_path
+        return archive_path
 
-    def _prune_failure_archives_locked(self) -> None:
+    def _prune_failure_archives(self) -> dict[str, Any]:
         if self._failure_archive_dir is None:
-            return
+            return {
+                "deleted_count": 0,
+                "deleted_bytes": 0,
+                "reason": None,
+                "timestamp_ns": time.monotonic_ns(),
+            }
 
         deleted_count = 0
         deleted_bytes = 0
         reasons: set[str] = set()
-        records = self._archive_records_locked()
+        records = self._archive_records()
         if self._failure_archive_max_age_s is not None:
             cutoff_s = time.time() - float(self._failure_archive_max_age_s)
             remaining: list[_ArchiveRecord] = []
@@ -1360,7 +1573,7 @@ class EventRecorder:
                 reasons.add("max_bytes")
                 shutil.rmtree(record.path, ignore_errors=True)
 
-        self._last_archive_cleanup = {
+        return {
             "deleted_count": deleted_count,
             "deleted_bytes": deleted_bytes,
             "reason": ",".join(sorted(reasons)) if reasons else None,
@@ -1368,6 +1581,9 @@ class EventRecorder:
         }
 
     def _archive_records_locked(self) -> list[_ArchiveRecord]:
+        return self._archive_records()
+
+    def _archive_records(self) -> list[_ArchiveRecord]:
         if self._failure_archive_dir is None or not self._failure_archive_dir.exists():
             return []
         records: list[_ArchiveRecord] = []

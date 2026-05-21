@@ -31,6 +31,18 @@ namespace manyforge::core {
 
 struct ExecutionKernelConfig {
   Duration collision_monitor_period_ns = 10'000'000;  // 10 ms
+
+  // Direct-control Cartesian pushes must not inherit full planning IK
+  // budgets. The kernel passes this value to the planner backend and rejects
+  // any target whose IK resolution exceeds the budget. 50 ms is conservative
+  // enough for operator feedback while allowing one missed 30 Hz frame.
+  double streaming_ik_timeout_s = 0.050;
+
+  // Native execution-backend lifecycle drains. ROS adapters expose their own
+  // `stop_completion_timeout_s`; these fields provide equivalent knobs for
+  // the non-ROS RoboPlan backend used by Composer/native simulation.
+  double native_reset_completion_timeout_s = 5.0;
+  double native_streaming_stop_completion_timeout_s = 5.0;
 };
 
 /// Execution Kernel — single authority for motion execution governance.
@@ -74,6 +86,18 @@ class ExecutionKernel {
   /// execution_id. Failed and Stopped executions require Reset/recovery instead.
   AcknowledgeCompletedResultDTO acknowledge_completed(uint64_t execution_id);
 
+  /// Acknowledge an `kInterventionRequired` state and return to Idle.
+  ///
+  /// Valid only from `kInterventionRequired`. Emits a traceable
+  /// `kInterventionAcknowledged` event with the supplied `principal_id` and
+  /// `reason`. The caller (cycle manager Run-side auto-ack, MCP, operator UI)
+  /// holds the policy decision about whether the leftover state is safe to
+  /// clear; the kernel only enforces fail-closed semantics: `execute()`
+  /// rejects with `kErrorInvalidRequest` while `kInterventionRequired`,
+  /// requiring an explicit ack first. See `spec/200` and ADR-0005.
+  AcknowledgeInterventionResultDTO acknowledge_intervention(
+      std::string principal_id, std::string reason);
+
   // ---------------------------------------------------------------
   // Streaming-session mode (ADR-0016).
   //
@@ -100,6 +124,19 @@ class ExecutionKernel {
   StreamingSessionEndResultDTO end_streaming_session(
       uint64_t session_id,
       SoftStopStrategy strategy);
+
+  /// ADR-0018: update the runtime velocity scale for active execution.
+  ///
+  /// The HMI velocity slider drives this through cycle_manager → kernel →
+  /// backend. Backends retime discrete trajectory execution and streaming
+  /// sessions continuously; changing the scale never stops an action by itself.
+  /// `scale` is validated finite and clamped to [0, 1]. NOT serialized through
+  /// lifecycle_mutex_: this is a high-rate operator surface and the backend's
+  /// atomic store handles concurrency.
+  void set_runtime_velocity_scale(double scale);
+
+  /// Compatibility alias for older callers.
+  void set_streaming_velocity_scale(double scale);
 
   /// Get current kernel status.
   ExecutionStatus get_status() const;
@@ -135,6 +172,9 @@ class ExecutionKernel {
 
  private:
   Result<MotionSpecDTO> resolve_motion_spec(const ExecuteRequestDTO& request);
+  StreamingSessionEndResultDTO end_streaming_session_unlocked(
+      uint64_t session_id,
+      SoftStopStrategy strategy);
   Result<TrajectoryDTO> plan_trajectory(const ExecuteRequestDTO& request);
   Result<void> validate_trajectory(const TrajectoryDTO& trajectory,
                                    const ExecuteRequestDTO& request);
@@ -172,8 +212,13 @@ class ExecutionKernel {
   StopPolicy stop_policy_;
   CollisionPolicy collision_policy_;
 
-  std::mutex execute_mutex_;
+  // Serializes low-rate lifecycle authority transitions across execute,
+  // streaming begin/end, stop, pause, resume, reset, and acknowledge. High-rate
+  // streaming target pushes intentionally do not take this lock; they are
+  // protected by streaming_session_mutex_ and session generation checks.
+  std::mutex lifecycle_mutex_;
   std::atomic<uint64_t> next_execution_id_{1};
+  std::atomic<double> runtime_velocity_scale_{1.0};
   mutable std::mutex active_move_id_mutex_;
   std::string active_move_id_;
 
@@ -209,6 +254,7 @@ class ExecutionKernel {
   uint64_t next_streaming_session_id_ = 1;
   uint64_t active_streaming_session_id_ = 0;
   uint64_t active_backend_session_id_ = 0;
+  uint64_t active_streaming_generation_ = 0;
   StreamingSessionConfigDTO active_streaming_config_;
   SoftStopStrategy active_soft_stop_strategy_ = SoftStopStrategy::kSpringBack;
   // Last accepted Cartesian target position (only meaningful when the

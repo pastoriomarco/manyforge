@@ -43,6 +43,7 @@ if TYPE_CHECKING:
     from .state import ComposerState
 
 logger = logging.getLogger(__name__)
+_POINTCLOUD_SEND_TIMEOUT_S = 0.25
 
 
 class PointCloudPublisher:
@@ -134,12 +135,15 @@ class PointCloudPublisher:
         for ws in clients:
             asyncio.run_coroutine_threadsafe(self._send_safe(ws, message), loop)
 
-    @staticmethod
-    async def _send_safe(ws: WebSocket, frame: dict) -> None:
+    async def _send_safe(self, ws: WebSocket, frame: dict) -> None:
         try:
-            await ws.send_json(frame)
+            await asyncio.wait_for(
+                ws.send_json(frame),
+                timeout=_POINTCLOUD_SEND_TIMEOUT_S,
+            )
         except Exception:
             logger.debug("PointCloud send failed (client likely disconnected)", exc_info=True)
+            await self.detach(ws)
 
 
 def create_pointcloud_router(

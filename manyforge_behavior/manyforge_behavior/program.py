@@ -519,8 +519,8 @@ def _validate_scene_shape_value(value: Any) -> str | None:
         return "shape must be a mapping"
 
     shape_type = value.get("type")
-    if shape_type not in {"box", "sphere", "mesh"}:
-        return "shape.type must be one of: box, sphere, mesh"
+    if shape_type not in {"box", "sphere", "cylinder", "mesh"}:
+        return "shape.type must be one of: box, sphere, cylinder, mesh"
 
     if shape_type == "box":
         dimensions = value.get("box_dimensions_m")
@@ -533,6 +533,14 @@ def _validate_scene_shape_value(value: Any) -> str | None:
         radius = value.get("sphere_radius_m")
         if not _is_numeric(radius) or float(radius) <= 0.0:
             return "shape.sphere_radius_m must be > 0"
+
+    if shape_type == "cylinder":
+        radius = value.get("cylinder_radius_m")
+        height = value.get("cylinder_height_m")
+        if not _is_numeric(radius) or float(radius) <= 0.0:
+            return "shape.cylinder_radius_m must be > 0"
+        if not _is_numeric(height) or float(height) <= 0.0:
+            return "shape.cylinder_height_m must be > 0"
 
     if shape_type == "mesh":
         resource_uri = value.get("mesh_resource_uri")
@@ -937,6 +945,23 @@ def _validate_tree_node_semantics(
                         message="sphere_radius_m must be a positive numeric value",
                     )
                 )
+        elif shape_type == "cylinder":
+            radius = resolved_params.get("cylinder_radius_m")
+            height = resolved_params.get("cylinder_height_m")
+            if not _is_numeric(radius) or radius <= 0:
+                issues.append(
+                    TreeValidationIssue(
+                        path=f"{path}.params.cylinder_radius_m",
+                        message="cylinder_radius_m must be a positive numeric value",
+                    )
+                )
+            if not _is_numeric(height) or height <= 0:
+                issues.append(
+                    TreeValidationIssue(
+                        path=f"{path}.params.cylinder_height_m",
+                        message="cylinder_height_m must be a positive numeric value",
+                    )
+                )
         elif shape_type == "mesh":
             resource_uri = resolved_params.get("mesh_resource_uri")
             if not isinstance(resource_uri, str) or not resource_uri.strip():
@@ -959,7 +984,7 @@ def _validate_tree_node_semantics(
             issues.append(
                 TreeValidationIssue(
                     path=f"{path}.params.shape_type",
-                    message="shape_type must be one of: box, sphere, mesh",
+                    message="shape_type must be one of: box, sphere, cylinder, mesh",
                 )
             )
 

@@ -182,8 +182,20 @@ def build_infra_heartbeat_payload(state: ComposerState) -> dict[str, Any]:
     if recorder is not None:
         try:
             archive_status = recorder.failure_archive_status()
+            archive_degraded = (
+                bool(archive_status.get("enabled"))
+                and (
+                    int(archive_status.get("dropped_archives") or 0) > 0
+                    or not bool(archive_status.get("worker_alive", True))
+                )
+            )
+            archive_status["status"] = "degraded" if archive_degraded else "healthy"
+            if archive_degraded and top_status == "ok":
+                top_status = "degraded"
         except Exception as exc:  # pragma: no cover - defensive status surface
-            archive_status = {"enabled": False, "error": str(exc)}
+            archive_status = {"enabled": False, "status": "error", "error": str(exc)}
+            if top_status == "ok":
+                top_status = "degraded"
 
     return {
         "schema_version": "manyforge.infra_heartbeat.v1",

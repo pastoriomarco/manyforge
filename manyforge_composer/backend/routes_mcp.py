@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 
 # Session eviction: disconnected sessions are purged after this grace period
 _SESSION_EVICTION_GRACE_NS = 5 * 60 * 1_000_000_000  # 5 minutes
+_SESSION_IDLE_EVICTION_NS = 30 * 60 * 1_000_000_000  # 30 minutes
 _SESSION_MAX_COUNT = 1000
 
 
@@ -51,7 +52,7 @@ def create_mcp_router(state) -> APIRouter:
         return _mcp_server
 
     def _evict_stale_sessions() -> None:
-        """Remove disconnected sessions older than the grace period.
+        """Remove idle/disconnected sessions and enforce the hard cap.
 
         Called on each new session creation to bound memory growth.
         """
@@ -59,22 +60,54 @@ def create_mcp_router(state) -> APIRouter:
         stale = [
             sid
             for sid, s in _sessions.items()
-            if not s._connected
-            and (now - s.disconnected_at_ns) > _SESSION_EVICTION_GRACE_NS
+            if (
+                now - s.last_seen_ns > _SESSION_IDLE_EVICTION_NS
+                or (
+                    not s._connected
+                    and (now - s.disconnected_at_ns) > _SESSION_EVICTION_GRACE_NS
+                )
+            )
         ]
         for sid in stale:
             del _sessions[sid]
         if stale:
             logger.debug("Evicted %d stale MCP session(s)", len(stale))
-        # Hard cap: if still over limit, drop oldest disconnected first
+        # Hard cap: if still over limit, drop oldest disconnected first,
+        # then oldest idle sessions. POST-only clients may never open SSE,
+        # so "connected only" eviction is insufficient.
         if len(_sessions) > _SESSION_MAX_COUNT:
-            disconnected = sorted(
-                ((sid, s) for sid, s in _sessions.items() if not s._connected),
-                key=lambda pair: pair[1].disconnected_at_ns,
+            victims = sorted(
+                _sessions.items(),
+                key=lambda pair: (
+                    0 if not pair[1]._connected else 1,
+                    pair[1].last_seen_ns,
+                ),
             )
-            while len(_sessions) > _SESSION_MAX_COUNT and disconnected:
-                sid, _ = disconnected.pop(0)
+            while len(_sessions) > _SESSION_MAX_COUNT and victims:
+                sid, _ = victims.pop(0)
                 del _sessions[sid]
+
+    def _get_or_create_session(
+        session_id: str,
+        principal_id: Optional[str],
+    ) -> _McpSession:
+        """Create/touch a session and enforce retention consistently.
+
+        Both POST-only clients and SSE clients allocate session records. Keep
+        the cap logic in one path so either transport cannot exceed the hard
+        bound by one after a non-stale insertion.
+        """
+        created_session = False
+        if session_id not in _sessions:
+            _evict_stale_sessions()
+            _sessions[session_id] = _McpSession(session_id, principal_id)
+            created_session = True
+
+        session = _sessions[session_id]
+        session.touch(principal_id)
+        if created_session:
+            _evict_stale_sessions()
+        return session
 
     @router.post("")
     async def mcp_message(request: Request) -> JSONResponse:
@@ -90,11 +123,7 @@ def create_mcp_router(state) -> APIRouter:
         if not session_id:
             session_id = uuid.uuid4().hex[:12]
 
-        if session_id not in _sessions:
-            _evict_stale_sessions()
-            _sessions[session_id] = _McpSession(session_id, principal_id)
-
-        session = _sessions[session_id]
+        session = _get_or_create_session(session_id, principal_id)
 
         # Route JSON-RPC to MCP server tools
         try:
@@ -127,11 +156,7 @@ def create_mcp_router(state) -> APIRouter:
 
         principal_id = getattr(request.state, "principal_id", None) if hasattr(request, "state") else None
 
-        if session_id not in _sessions:
-            _evict_stale_sessions()
-            _sessions[session_id] = _McpSession(session_id, principal_id)
-
-        session = _sessions[session_id]
+        session = _get_or_create_session(session_id, principal_id)
 
         async def event_stream():
             # Send initial connection event
@@ -139,6 +164,7 @@ def create_mcp_router(state) -> APIRouter:
 
             try:
                 while True:
+                    session.touch()
                     # Check for pending notifications
                     notification = await session.wait_notification(timeout=30.0)
                     if notification is not None:
@@ -177,6 +203,7 @@ class _McpSession:
         self.session_id = session_id
         self.principal_id = principal_id
         self.created_at_ns = time.monotonic_ns()
+        self.last_seen_ns = self.created_at_ns
         self.disconnected_at_ns: int = 0
         self._notification_queue: asyncio.Queue[dict] = asyncio.Queue(maxsize=256)
         self._connected = True
@@ -200,6 +227,12 @@ class _McpSession:
     def mark_disconnected(self) -> None:
         self._connected = False
         self.disconnected_at_ns = time.monotonic_ns()
+        self.last_seen_ns = self.disconnected_at_ns
+
+    def touch(self, principal_id: Optional[str] = None) -> None:
+        self.last_seen_ns = time.monotonic_ns()
+        if principal_id is not None:
+            self.principal_id = principal_id
 
 
 async def _handle_jsonrpc(mcp_server, body: dict, session: _McpSession) -> dict:

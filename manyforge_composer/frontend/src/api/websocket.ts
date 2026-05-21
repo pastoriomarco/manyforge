@@ -21,7 +21,8 @@ export class StateWebSocket {
       window.clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
-    const wsUrl = url || `ws://${window.location.host}/ws/state`;
+    const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const wsUrl = url || `${proto}//${window.location.host}/ws/state`;
     this.ws = new WebSocket(wsUrl);
     this.ws.onmessage = (event) => {
       const text = event.data as string;
@@ -30,7 +31,15 @@ export class StateWebSocket {
         this._stale = false;
         return;
       }
-      const data = JSON.parse(text) as StateUpdate;
+      let data: StateUpdate;
+      try {
+        data = JSON.parse(text) as StateUpdate;
+      } catch {
+        return;
+      }
+      if (!data || typeof data !== 'object') {
+        return;
+      }
       this.callbacks.forEach(cb => cb(data));
     };
     this.ws.onopen = () => {

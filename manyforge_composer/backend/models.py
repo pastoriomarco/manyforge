@@ -528,6 +528,36 @@ class RobotConfigResponse(BaseModel):
     )
 
 
+class GripperSubtreeLinkResponse(BaseModel):
+    """One link in the gripper subtree, posed relative to
+    `gripperRootLink` at the URDF default configuration. Operator
+    sees the WHOLE gripper at the unreachable target, not just the
+    root cube — the fingers and knuckles are what make the shape
+    recognizable as a gripper."""
+
+    model_config = _ALIAS_CFG
+    name: str
+    position_m: List[float] = Field(alias="positionM")
+    orientation_xyzw: List[float] = Field(alias="orientationXyzw")
+
+
+class GripperVisualizationResponse(BaseModel):
+    """Auto-discovered visualization metadata for the Move-To
+    unreachable-ghost fallback. None means the URDF graph walk from
+    `mount_frame` did not reach a link with visuals; the frontend
+    renders the floor-fallback red-axes marker instead. See
+    `docs/operations/ADDING_A_ROBOT.md` and `routes_urdf.py
+    resolve_gripper_visualization`."""
+
+    model_config = _ALIAS_CFG
+    gripper_root_link: str = Field(alias="gripperRootLink")
+    tcp_to_root_position_m: List[float] = Field(alias="tcpToRootPositionM")
+    tcp_to_root_orientation_xyzw: List[float] = Field(alias="tcpToRootOrientationXyzw")
+    subtree_links: List[GripperSubtreeLinkResponse] = Field(
+        default_factory=list, alias="subtreeLinks"
+    )
+
+
 class GripperConfigResponse(BaseModel):
     model_config = _ALIAS_CFG
     command_mode: str = Field(alias="commandMode")
@@ -541,6 +571,9 @@ class GripperConfigResponse(BaseModel):
     attach_frame: str = Field(default="", alias="attachFrame")
     tcp_frame: str = Field(default="", alias="tcpFrame")
     auxiliary_frames: List[str] = Field(default_factory=list, alias="auxiliaryFrames")
+    visualization: Optional[GripperVisualizationResponse] = Field(
+        default=None, alias="visualization"
+    )
 
 
 class DeploymentResponse(BaseModel):
@@ -863,6 +896,29 @@ class SceneRobotResponse(BaseModel):
     tcp_pose_in_base: Optional[Dict[str, Any]] = None
 
 
+class SceneGripperSubtreeLink(BaseModel):
+    """Snake_case mirror of GripperSubtreeLinkResponse for the
+    scene-state surface."""
+
+    name: str
+    position_m: List[float]
+    orientation_xyzw: List[float]
+
+
+class SceneGripperVisualizationResponse(BaseModel):
+    """Auto-discovered visualization root + tcp→root SE(3) + full
+    gripper subtree for the Move-To unreachable-ghost. Surfaced on
+    the scene-state gripper block so the frontend ghost renderer has
+    it without an extra deployment fetch. None means the URDF walk
+    did not reach a link with visuals; the frontend renders a
+    red-axes marker instead."""
+
+    gripper_root_link: str
+    tcp_to_root_position_m: List[float]
+    tcp_to_root_orientation_xyzw: List[float]
+    subtree_links: List[SceneGripperSubtreeLink] = Field(default_factory=list)
+
+
 class SceneGripperStateResponse(BaseModel):
     gripper_id: str
     joint_name: str
@@ -873,6 +929,7 @@ class SceneGripperStateResponse(BaseModel):
     limit_upper: Optional[float] = None
     motion_time_s: float = 0.0
     srdf_presets: Dict[str, float] = Field(default_factory=dict)
+    visualization: Optional[SceneGripperVisualizationResponse] = None
     error: Optional[str] = None
 
 
@@ -985,9 +1042,11 @@ class SceneObjectFrameVisibilityResponse(BaseModel):
 class SceneEditApiRequest(BaseModel):
     operation: Literal["add", "upsert", "remove", "update_pose", "attach", "detach"]
     object_id: str
-    shape_type: Optional[Literal["box", "sphere", "mesh"]] = None
+    shape_type: Optional[Literal["box", "sphere", "cylinder", "mesh"]] = None
     box_dimensions_m: Optional[List[float]] = None
     sphere_radius_m: Optional[float] = None
+    cylinder_radius_m: Optional[float] = None
+    cylinder_height_m: Optional[float] = None
     mesh_resource_uri: Optional[str] = None
     mesh_scale: Optional[List[float]] = None
     pose_position_m: Optional[List[float]] = None
@@ -1013,6 +1072,15 @@ class SceneEditApiRequest(BaseModel):
                 if self.sphere_radius_m is None or self.sphere_radius_m <= 0.0:
                     raise ValueError(
                         f"{self.operation} with shape_type=sphere requires sphere_radius_m > 0"
+                    )
+            if self.shape_type == "cylinder":
+                if self.cylinder_radius_m is None or self.cylinder_radius_m <= 0.0:
+                    raise ValueError(
+                        f"{self.operation} with shape_type=cylinder requires cylinder_radius_m > 0"
+                    )
+                if self.cylinder_height_m is None or self.cylinder_height_m <= 0.0:
+                    raise ValueError(
+                        f"{self.operation} with shape_type=cylinder requires cylinder_height_m > 0"
                     )
             if self.shape_type == "mesh":
                 if not self.mesh_resource_uri:

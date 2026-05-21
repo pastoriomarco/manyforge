@@ -322,6 +322,7 @@ const char* kernel_event_type_to_string(KernelEventType type) {
     case KernelEventType::kPauseRequested: return "pause_requested";
     case KernelEventType::kResumeRequested: return "resume_requested";
     case KernelEventType::kCompletedAcknowledged: return "acknowledge_completed";
+    case KernelEventType::kInterventionAcknowledged: return "acknowledge_intervention";
     case KernelEventType::kStreamingSessionStarted: return "streaming_session_started";
     case KernelEventType::kStreamingTargetReceived: return "streaming_target_received";
     case KernelEventType::kStreamingTargetDispatched: return "streaming_target_dispatched";
@@ -365,6 +366,11 @@ py::dict command_result(bool accepted, const std::optional<ErrorDTO>& error) {
   d["accepted"] = accepted;
   if (error.has_value()) {
     d["error"] = error->message;
+    d["error_code"] = error->code;
+    d["error_details"] = error_details_to_python(error->details);
+  } else {
+    d["error_code"] = py::none();
+    d["error_details"] = py::dict();
   }
   return d;
 }
@@ -444,6 +450,16 @@ ExecutionKernelConfig kernel_config_from_python(const py::object& config_obj) {
   }
 
   py::dict config_dict = config_obj.cast<py::dict>();
+  auto read_seconds = [&](const char* s_key, const char* ms_key,
+                          double current) {
+    if (config_dict.contains(s_key)) {
+      return finite_scale_from_python(config_dict[s_key], s_key);
+    }
+    if (config_dict.contains(ms_key)) {
+      return finite_scale_from_python(config_dict[ms_key], ms_key) / 1000.0;
+    }
+    return current;
+  };
   if (config_dict.contains("collision_monitor_period_ns")) {
     const double period_ns =
         finite_scale_from_python(config_dict["collision_monitor_period_ns"],
@@ -454,6 +470,28 @@ ExecutionKernelConfig kernel_config_from_python(const py::object& config_obj) {
     }
     config.collision_monitor_period_ns =
         static_cast<int64_t>(period_ns);
+  }
+  config.streaming_ik_timeout_s =
+      read_seconds("streaming_ik_timeout_s", "streaming_ik_timeout_ms",
+                   config.streaming_ik_timeout_s);
+  config.native_reset_completion_timeout_s =
+      read_seconds("native_reset_completion_timeout_s",
+                   "native_reset_completion_timeout_ms",
+                   config.native_reset_completion_timeout_s);
+  config.native_streaming_stop_completion_timeout_s =
+      read_seconds("native_streaming_stop_completion_timeout_s",
+                   "native_streaming_stop_completion_timeout_ms",
+                   config.native_streaming_stop_completion_timeout_s);
+  if (config.streaming_ik_timeout_s <= 0.0) {
+    throw std::invalid_argument("streaming_ik_timeout_s must be > 0");
+  }
+  if (config.native_reset_completion_timeout_s <= 0.0) {
+    throw std::invalid_argument(
+        "native_reset_completion_timeout_s must be > 0");
+  }
+  if (config.native_streaming_stop_completion_timeout_s <= 0.0) {
+    throw std::invalid_argument(
+        "native_streaming_stop_completion_timeout_s must be > 0");
   }
   return config;
 }
@@ -1159,6 +1197,15 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
         auto r = self.kernel->acknowledge_completed(execution_id);
         return command_result(r.accepted, r.error);
       })
+      .def("acknowledge_intervention",
+           [](NativeKernelBundle& self, std::string principal_id,
+              std::string reason) -> py::dict {
+             auto r = self.kernel->acknowledge_intervention(
+                 std::move(principal_id), std::move(reason));
+             return command_result(r.accepted, r.error);
+           },
+           py::arg("principal_id"),
+           py::arg("reason"))
       // ---- Streaming-session API (ADR-0016) ----
       .def("begin_streaming_session",
            [](NativeKernelBundle& self, py::dict config_dict) -> py::dict {
@@ -1239,13 +1286,21 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
              get_str("authority_source", config.authority_source);
              get_str("trigger_reason", config.trigger_reason);
 
-             auto r = self.kernel->begin_streaming_session(config);
+             auto r = [&]() {
+               py::gil_scoped_release release;
+               return self.kernel->begin_streaming_session(config);
+             }();
              py::dict d;
              d["accepted"] = r.accepted;
              d["session_id"] = r.session_id;
              if (r.error.has_value()) {
                d["error"] = r.error->message;
                d["error_code"] = r.error->code;
+               d["error_details"] =
+                   error_details_to_python(r.error->details);
+             } else {
+               d["error_code"] = py::none();
+               d["error_details"] = py::dict();
              }
              return d;
            })
@@ -1310,13 +1365,21 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
                    target_dict["min_time_from_start_s"].cast<double>();
              }
 
-             auto r =
-                 self.kernel->push_streaming_target(session_id, target);
+             auto r = [&]() {
+               py::gil_scoped_release release;
+               return self.kernel->push_streaming_target(session_id, target);
+             }();
              py::dict d;
              d["accepted"] = r.accepted;
              d["backend_sequence"] = r.backend_sequence;
              if (r.error.has_value()) {
                d["error"] = r.error->message;
+               d["error_code"] = r.error->code;
+               d["error_details"] =
+                   error_details_to_python(r.error->details);
+             } else {
+               d["error_code"] = py::none();
+               d["error_details"] = py::dict();
              }
              return d;
            })
@@ -1328,9 +1391,21 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
                  (strategy_str == "velocity_scaling")
                      ? SoftStopStrategy::kVelocityScaling
                      : SoftStopStrategy::kSpringBack;
-             auto r =
-                 self.kernel->end_streaming_session(session_id, strategy);
+             auto r = [&]() {
+               py::gil_scoped_release release;
+               return self.kernel->end_streaming_session(session_id, strategy);
+             }();
              return command_result(r.accepted, r.error);
+           })
+      .def("set_runtime_velocity_scale",
+           [](NativeKernelBundle& self, double scale) {
+             py::gil_scoped_release release;
+             self.kernel->set_runtime_velocity_scale(scale);
+           })
+      .def("set_streaming_velocity_scale",
+           [](NativeKernelBundle& self, double scale) {
+             py::gil_scoped_release release;
+             self.kernel->set_streaming_velocity_scale(scale);
            })
       .def("get_status", [](NativeKernelBundle& self) -> py::dict {
         return status_to_python(self.kernel->get_status());
@@ -1472,6 +1547,20 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
             }
             double radius = request["sphere_radius_m"].cast<double>();
             req.shape = SphereShapeDTO{radius};
+          } else if (shape_type == "cylinder") {
+            if (!request.contains("cylinder_radius_m")) {
+              result["success"] = false;
+              result["error"] = "add with shape_type=cylinder requires cylinder_radius_m";
+              return result;
+            }
+            if (!request.contains("cylinder_height_m")) {
+              result["success"] = false;
+              result["error"] = "add with shape_type=cylinder requires cylinder_height_m";
+              return result;
+            }
+            double radius = request["cylinder_radius_m"].cast<double>();
+            double height = request["cylinder_height_m"].cast<double>();
+            req.shape = CylinderShapeDTO{radius, height};
           } else if (shape_type == "mesh") {
             if (!request.contains("mesh_resource_uri")) {
               result["success"] = false;
@@ -1727,6 +1816,39 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
         } catch (...) {
           return py::none();
         }
+      })
+      .def("get_link_poses", [](NativeKernelBundle& self,
+                                 const std::vector<std::string>& target_frames,
+                                 const std::string& base_frame) -> py::dict {
+        RobotStateDTO state = [&]() {
+          py::gil_scoped_release release;
+          return self.context->get_current_state();
+        }();
+        py::dict result;
+        for (const auto& target_frame : target_frames) {
+          FkRequestDTO req;
+          req.robot_state = state;
+          req.target_frame = target_frame;
+          req.base_frame = base_frame;
+          try {
+            auto pose = [&]() {
+              py::gil_scoped_release release;
+              return self.context->forward_kinematics(req);
+            }();
+            py::dict item;
+            item["position_m"] = py::make_tuple(
+                pose.position_m.x_m, pose.position_m.y_m, pose.position_m.z_m);
+            item["orientation_xyzw"] = py::make_tuple(
+                pose.orientation.x, pose.orientation.y,
+                pose.orientation.z, pose.orientation.w);
+            result[py::str(target_frame)] = item;
+          } catch (...) {
+            // Skip unresolved links. The scene-state route treats absence
+            // as "do not render this link pose" rather than failing the
+            // whole viewer update.
+          }
+        }
+        return result;
       })
       .def("get_object_pose", [](NativeKernelBundle& self,
                                   const std::string& object_id,

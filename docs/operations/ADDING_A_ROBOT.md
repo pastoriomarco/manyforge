@@ -10,11 +10,10 @@ LLM agents can follow it without re-discovering the conventions.
 > cover authoring a behavior tree, gripper-controller adapter
 > development, or planner tuning — those have their own references.
 
-> **Spec authority.** When this document and `manyforge_specs/` disagree,
-> the spec wins. The two spec docs you will touch most often are:
-> [`420-program-yaml-schema.md`](../../manyforge_specs/docs/spec/420-program-yaml-schema.md)
-> and
-> [`430-deployment-artifact-schema.md`](../../manyforge_specs/docs/spec/430-deployment-artifact-schema.md).
+> **Schema authority.** This public runtime guide mirrors the current
+> program/deployment schema used by ManyForge. Maintainers changing
+> schema-governed behavior must update the canonical private development
+> specs first, then keep this operator guide and the implementation in sync.
 
 > **Maintenance rule** — keep this file in sync with the deployment
 > spec and `manyforge_behavior/manyforge_behavior/deployment.py`. If

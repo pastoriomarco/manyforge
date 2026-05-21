@@ -14,7 +14,7 @@ import type {
 const SCENE_MUTATED_EVENT = 'manyforge:scene-mutated';
 const SCENE_SYNC_STATUS_EVENT = 'manyforge:scene-sync-status';
 const SCENE_SYNC_ERROR_PREFIX = 'Live scene sync failed: ';
-type SceneShapeType = 'box' | 'sphere' | 'mesh';
+type SceneShapeType = 'box' | 'sphere' | 'cylinder' | 'mesh';
 
 function emitSceneMutated(): void {
   window.dispatchEvent(new CustomEvent(SCENE_MUTATED_EVENT));
@@ -316,6 +316,11 @@ function shapeSummary(shape: Record<string, unknown> | null | undefined): string
     const radius = Number(shape.sphere_radius_m ?? 0).toFixed(3);
     return `sphere (r=${radius})`;
   }
+  if (shape.type === 'cylinder') {
+    const radius = Number(shape.cylinder_radius_m ?? 0).toFixed(3);
+    const height = Number(shape.cylinder_height_m ?? 0).toFixed(3);
+    return `cylinder (r=${radius}, h=${height})`;
+  }
   if (shape.type === 'mesh') {
     const uri = typeof shape.mesh_resource_uri === 'string' ? shape.mesh_resource_uri : '?';
     return `mesh (${uri})`;
@@ -333,7 +338,10 @@ function sameShape(
 function buildAddPayload(resource: ProgramSceneResource): SceneEditRequest {
   const pose = sceneResourcePose(resource);
   const shape = resource.shape ?? {};
-  const shapeType = shape.type === 'sphere' || shape.type === 'mesh' ? shape.type : 'box';
+  const shapeType =
+    shape.type === 'sphere' || shape.type === 'cylinder' || shape.type === 'mesh'
+      ? shape.type
+      : 'box';
   return {
     operation: 'add',
     object_id: resource.objectId,
@@ -345,6 +353,14 @@ function buildAddPayload(resource: ProgramSceneResource): SceneEditRequest {
     sphere_radius_m:
       shape.type === 'sphere' && Number.isFinite(Number(shape.sphere_radius_m))
         ? Number(shape.sphere_radius_m)
+        : undefined,
+    cylinder_radius_m:
+      shape.type === 'cylinder' && Number.isFinite(Number(shape.cylinder_radius_m))
+        ? Number(shape.cylinder_radius_m)
+        : undefined,
+    cylinder_height_m:
+      shape.type === 'cylinder' && Number.isFinite(Number(shape.cylinder_height_m))
+        ? Number(shape.cylinder_height_m)
         : undefined,
     mesh_resource_uri:
       shape.type === 'mesh' && typeof shape.mesh_resource_uri === 'string'
@@ -411,7 +427,7 @@ function AuthoredSceneCard({
   const initialPose = sceneResourcePose(resource);
   const [objectId, setObjectId] = useState(resource.objectId);
   const [shapeType, setShapeType] = useState<SceneShapeType>(
-    resource.shape?.type === 'sphere' || resource.shape?.type === 'mesh'
+    resource.shape?.type === 'sphere' || resource.shape?.type === 'cylinder' || resource.shape?.type === 'mesh'
       ? resource.shape.type
       : 'box',
   );
@@ -422,6 +438,12 @@ function AuthoredSceneCard({
   );
   const [sphereRadius, setSphereRadius] = useState<number>(
     Number(resource.shape?.sphere_radius_m ?? 0.05),
+  );
+  const [cylinderRadius, setCylinderRadius] = useState<number>(
+    Number(resource.shape?.cylinder_radius_m ?? 0.05),
+  );
+  const [cylinderHeight, setCylinderHeight] = useState<number>(
+    Number(resource.shape?.cylinder_height_m ?? 0.1),
   );
   const [meshResourceUri, setMeshResourceUri] = useState<string>(
     typeof resource.shape?.mesh_resource_uri === 'string' ? resource.shape.mesh_resource_uri : '',
@@ -439,7 +461,7 @@ function AuthoredSceneCard({
     const pose = sceneResourcePose(resource);
     setObjectId(resource.objectId);
     setShapeType(
-      resource.shape?.type === 'sphere' || resource.shape?.type === 'mesh'
+      resource.shape?.type === 'sphere' || resource.shape?.type === 'cylinder' || resource.shape?.type === 'mesh'
         ? resource.shape.type
         : 'box',
     );
@@ -449,6 +471,8 @@ function AuthoredSceneCard({
         : [0.05, 0.05, 0.1],
     );
     setSphereRadius(Number(resource.shape?.sphere_radius_m ?? 0.05));
+    setCylinderRadius(Number(resource.shape?.cylinder_radius_m ?? 0.05));
+    setCylinderHeight(Number(resource.shape?.cylinder_height_m ?? 0.1));
     setMeshResourceUri(
       typeof resource.shape?.mesh_resource_uri === 'string' ? resource.shape.mesh_resource_uri : '',
     );
@@ -468,13 +492,19 @@ function AuthoredSceneCard({
         ? { type: 'box', box_dimensions_m: boxDimensions.map((value) => Number(value)) }
         : shapeType === 'sphere'
           ? { type: 'sphere', sphere_radius_m: Number(sphereRadius) }
+          : shapeType === 'cylinder'
+            ? {
+                type: 'cylinder',
+                cylinder_radius_m: Number(cylinderRadius),
+                cylinder_height_m: Number(cylinderHeight),
+              }
           : {
               type: 'mesh',
               mesh_resource_uri: meshResourceUri.trim(),
               mesh_scale: meshScale.map((value) => Number(value)),
             };
     onUpdate(resource.objectId, buildSceneResource(objectId.trim(), shape, frameId, position, rpyDegrees));
-  }, [boxDimensions, frameId, meshResourceUri, meshScale, objectId, onUpdate, position, resource.objectId, rpyDegrees, shapeType, sphereRadius]);
+  }, [boxDimensions, cylinderHeight, cylinderRadius, frameId, meshResourceUri, meshScale, objectId, onUpdate, position, resource.objectId, rpyDegrees, shapeType, sphereRadius]);
 
   return (
     <div className="rounded border border-gray-700 bg-gray-900/40 p-3">
@@ -522,6 +552,7 @@ function AuthoredSceneCard({
         >
           <option value="box">box</option>
           <option value="sphere">sphere</option>
+          <option value="cylinder">cylinder</option>
           <option value="mesh">mesh</option>
         </select>
       </label>
@@ -548,6 +579,21 @@ function AuthoredSceneCard({
             label="Radius"
             value={sphereRadius}
             onChange={setSphereRadius}
+            disabled={disabled}
+          />
+        </div>
+      ) : shapeType === 'cylinder' ? (
+        <div className="mt-2 grid grid-cols-2 gap-2">
+          <NumericInput
+            label="Radius"
+            value={cylinderRadius}
+            onChange={setCylinderRadius}
+            disabled={disabled}
+          />
+          <NumericInput
+            label="Height"
+            value={cylinderHeight}
+            onChange={setCylinderHeight}
             disabled={disabled}
           />
         </div>
@@ -802,6 +848,8 @@ export function ScenePanel() {
   const [newShapeType, setNewShapeType] = useState<SceneShapeType>('box');
   const [newBoxDimensions, setNewBoxDimensions] = useState<number[]>([0.05, 0.05, 0.1]);
   const [newSphereRadius, setNewSphereRadius] = useState(0.05);
+  const [newCylinderRadius, setNewCylinderRadius] = useState(0.05);
+  const [newCylinderHeight, setNewCylinderHeight] = useState(0.1);
   const [newMeshResourceUri, setNewMeshResourceUri] = useState('');
   const [newMeshScale, setNewMeshScale] = useState<number[]>([1, 1, 1]);
   const [newFrameId, setNewFrameId] = useState('base_link');
@@ -889,6 +937,12 @@ export function ScenePanel() {
         ? { type: 'box', box_dimensions_m: newBoxDimensions.map((value) => Number(value)) }
         : newShapeType === 'sphere'
           ? { type: 'sphere', sphere_radius_m: Number(newSphereRadius) }
+          : newShapeType === 'cylinder'
+            ? {
+                type: 'cylinder',
+                cylinder_radius_m: Number(newCylinderRadius),
+                cylinder_height_m: Number(newCylinderHeight),
+              }
           : {
               type: 'mesh',
               mesh_resource_uri: newMeshResourceUri.trim(),
@@ -903,6 +957,8 @@ export function ScenePanel() {
     setError(null);
   }, [
     newBoxDimensions,
+    newCylinderHeight,
+    newCylinderRadius,
     newFrameId,
     newMeshResourceUri,
     newMeshScale,
@@ -1078,6 +1134,7 @@ export function ScenePanel() {
               >
                 <option value="box">box</option>
                 <option value="sphere">sphere</option>
+                <option value="cylinder">cylinder</option>
                 <option value="mesh">mesh</option>
               </select>
             </label>
@@ -1104,6 +1161,21 @@ export function ScenePanel() {
                 onChange={setNewSphereRadius}
                 disabled={editLocked}
               />
+            ) : newShapeType === 'cylinder' ? (
+              <div className="grid grid-cols-2 gap-2">
+                <NumericInput
+                  label="Radius"
+                  value={newCylinderRadius}
+                  onChange={setNewCylinderRadius}
+                  disabled={editLocked}
+                />
+                <NumericInput
+                  label="Height"
+                  value={newCylinderHeight}
+                  onChange={setNewCylinderHeight}
+                  disabled={editLocked}
+                />
+              </div>
             ) : (
               <div className="space-y-2">
                 <TextInput

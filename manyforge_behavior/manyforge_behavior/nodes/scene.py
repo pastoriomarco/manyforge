@@ -42,6 +42,8 @@ def _resolve_collision_object_request(
     shape_type = resolve_blackboard_value(blackboard, params.get("shape_type"))
     box_dimensions_m = resolve_blackboard_value(blackboard, params.get("box_dimensions_m"))
     sphere_radius_m = resolve_blackboard_value(blackboard, params.get("sphere_radius_m"))
+    cylinder_radius_m = resolve_blackboard_value(blackboard, params.get("cylinder_radius_m"))
+    cylinder_height_m = resolve_blackboard_value(blackboard, params.get("cylinder_height_m"))
     mesh_resource_uri = resolve_blackboard_value(blackboard, params.get("mesh_resource_uri"))
     mesh_scale = resolve_blackboard_value(blackboard, params.get("mesh_scale"))
     support_contacts = resolve_blackboard_value(blackboard, params.get("support_contacts"))
@@ -62,6 +64,8 @@ def _resolve_collision_object_request(
         shape_type=shape_type,
         box_dimensions_m=box_dimensions_m,
         sphere_radius_m=sphere_radius_m,
+        cylinder_radius_m=cylinder_radius_m,
+        cylinder_height_m=cylinder_height_m,
         mesh_resource_uri=mesh_resource_uri,
         mesh_scale=mesh_scale,
         pose_position_m=pose.get("position_m"),
@@ -76,6 +80,8 @@ def _shape_fields_from_registry(obj_info: dict[str, Any]) -> dict[str, Any]:
         "shape_type": obj_info.get("shape_type"),
         "box_dimensions_m": obj_info.get("box_dimensions_m"),
         "sphere_radius_m": obj_info.get("sphere_radius_m"),
+        "cylinder_radius_m": obj_info.get("cylinder_radius_m"),
+        "cylinder_height_m": obj_info.get("cylinder_height_m"),
         "mesh_resource_uri": obj_info.get("mesh_resource_uri"),
         "mesh_scale": obj_info.get("mesh_scale"),
         "support_contacts": obj_info.get("support_contacts"),

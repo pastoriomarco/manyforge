@@ -1,9 +1,9 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { api } from '../api/client';
 import { useCycleStore, useEditLocked } from '../store/cycleStore';
+import { useFollowTargetPhase, useRobotCommandAuthority } from '../store/commandAuthority';
 import { useSceneStateStore } from '../store/sceneStateStore';
 import { followTargetController } from '../streaming/followTargetController';
-import type { FollowTargetPhase } from '../streaming/followTargetController';
 import { useComposerStore } from '../store/composerStore';
 import { useProgramStore } from '../store/programStore';
 import { useDeploymentStore } from '../store/deploymentStore';
@@ -672,22 +672,27 @@ export function ControlBar() {
  * state except where the kernel forbids it (the backend returns
  * 409 in that case; we let it surface via the cycle store's error).
  */
-function useFollowTargetPhase(): FollowTargetPhase {
-  const [phase, setPhase] = useState<FollowTargetPhase>(() => followTargetController.phase());
-  useEffect(() => followTargetController.subscribe(setPhase), []);
-  return phase;
-}
-
 function CycleControls() {
   const { state, velocityScale, run, stop, reset, setVelocityScale, error } = useCycleStore();
   const streamingPhase = useFollowTargetPhase();
+  const runAuthority = useRobotCommandAuthority({
+    requireFreshScene: true,
+  });
   // `ending` is the post-end-op window where the kernel session is
   // closing — the worker is already winding down and Stop wouldn't
   // accomplish anything useful. Treat the session as active only for
   // phases where the operator can still cancel commanded motion.
   const streamingActive = streamingPhase === 'opening' || streamingPhase === 'streaming';
   const [cycleBusy, setCycleBusy] = useState(false);
-  const canRun = state === 'idle' || state === 'stopped';
+  const [velocityDraft, setVelocityDraft] = useState(velocityScale);
+  const pendingVelocityScaleRef = useRef<number | null>(null);
+  const velocityScaleInFlightRef = useRef(false);
+  const velocityScaleTimerRef = useRef<number | null>(null);
+  const lastVelocityScaleSentAtRef = useRef(0);
+  const canRun =
+    (state === 'idle' || state === 'stopped') &&
+    runAuthority.canCommand &&
+    (streamingPhase === 'idle' || streamingPhase === 'aborted');
   // Stop applies to any in-flight motion the operator can see — BT
   // execution (state==='running'), an intervention session
   // (direct_control), an interrupt handler, OR a follow-target
@@ -718,13 +723,72 @@ function CycleControls() {
     [],
   );
 
+  const flushVelocityScale = useCallback(() => {
+    if (velocityScaleTimerRef.current !== null) {
+      window.clearTimeout(velocityScaleTimerRef.current);
+      velocityScaleTimerRef.current = null;
+    }
+    if (velocityScaleInFlightRef.current || pendingVelocityScaleRef.current === null) {
+      return;
+    }
+    const nextScale = pendingVelocityScaleRef.current;
+    pendingVelocityScaleRef.current = null;
+    velocityScaleInFlightRef.current = true;
+    lastVelocityScaleSentAtRef.current = performance.now();
+    void setVelocityScale(nextScale).finally(() => {
+      velocityScaleInFlightRef.current = false;
+      if (pendingVelocityScaleRef.current !== null) {
+        const elapsed = performance.now() - lastVelocityScaleSentAtRef.current;
+        const delay = Math.max(0, 250 - elapsed);
+        velocityScaleTimerRef.current = window.setTimeout(flushVelocityScale, delay);
+      }
+    });
+  }, [setVelocityScale]);
+
+  const queueVelocityScale = useCallback((value: number) => {
+    const clamped = Math.max(0, Math.min(1, value));
+    setVelocityDraft(clamped);
+    pendingVelocityScaleRef.current = clamped;
+    if (velocityScaleInFlightRef.current) {
+      return;
+    }
+    const elapsed = performance.now() - lastVelocityScaleSentAtRef.current;
+    const delay = Math.max(0, 250 - elapsed);
+    if (delay === 0) {
+      flushVelocityScale();
+    } else if (velocityScaleTimerRef.current === null) {
+      velocityScaleTimerRef.current = window.setTimeout(flushVelocityScale, delay);
+    }
+  }, [flushVelocityScale]);
+
+  useEffect(() => {
+    if (pendingVelocityScaleRef.current === null && !velocityScaleInFlightRef.current) {
+      setVelocityDraft(velocityScale);
+    }
+  }, [velocityScale]);
+
+  useEffect(() => () => {
+    if (velocityScaleTimerRef.current !== null) {
+      window.clearTimeout(velocityScaleTimerRef.current);
+      velocityScaleTimerRef.current = null;
+    }
+  }, []);
+
   return (
     <div className="ml-auto flex items-center gap-2">
       <button
         type="button"
         onClick={() => void run()}
         disabled={cycleBusy || !canRun}
-        title={canRun ? 'Start the loaded program' : `Cycle is ${state}`}
+        title={
+          canRun
+            ? 'Start the loaded program'
+            : runAuthority.reason !== null
+              ? runAuthority.reason
+            : streamingPhase !== 'idle' && streamingPhase !== 'aborted'
+              ? `Streaming session is ${streamingPhase}`
+              : `Cycle is ${state}`
+        }
         className="rounded bg-emerald-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-emerald-500 disabled:cursor-not-allowed disabled:bg-gray-600"
       >
         Run
@@ -782,19 +846,19 @@ function CycleControls() {
       >
         Reset
       </button>
-      <label className="ml-2 flex items-center gap-1.5 text-xs text-gray-300" title="Velocity scale (0.1 - 1.0)">
+      <label className="ml-2 flex items-center gap-1.5 text-xs text-gray-300" title="Runtime velocity scale (0.0 - 1.0; 0 holds motion)">
         <span className="font-mono text-[11px] text-gray-400">vel</span>
         <input
           type="range"
-          min={0.1}
+          min={0.0}
           max={1.0}
-          step={0.05}
-          value={velocityScale}
-          onChange={(e) => void setVelocityScale(Number(e.target.value))}
+          step={0.01}
+          value={velocityDraft}
+          onChange={(e) => queueVelocityScale(Number(e.target.value))}
           className="w-24 accent-emerald-500"
         />
         <span className="w-8 text-right font-mono text-[11px]">
-          {velocityScale.toFixed(2)}
+          {velocityDraft.toFixed(2)}
         </span>
       </label>
       {error && (

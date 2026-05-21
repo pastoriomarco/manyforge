@@ -349,6 +349,14 @@ function SaveToProgramRow({ object }: { object: SceneObjectState }) {
     } else if (shapeType === 'sphere') {
       payload.shapeType = 'sphere';
       payload.radius = shape.sphere_radius_m;
+    } else if (shapeType === 'cylinder') {
+      payload.shapeType = 'cylinder';
+      payload.cylinder_radius_m = shape.cylinder_radius_m;
+      payload.cylinder_height_m = shape.cylinder_height_m;
+    } else if (shapeType === 'mesh') {
+      payload.shapeType = 'mesh';
+      payload.mesh_resource_uri = shape.mesh_resource_uri;
+      payload.mesh_scale = shape.mesh_scale;
     }
     try {
       await api.scene.updateProgramSceneResource(payload);

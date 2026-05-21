@@ -155,14 +155,14 @@ class TestMoveManipulatorAction:
         status = _tick_node(node)
         assert status == py_trees.common.Status.SUCCESS
         assert kernel.last_execute_request is not None
-        assert kernel.last_execute_request.velocity_scale == pytest.approx(0.4)
+        assert kernel.last_execute_request.velocity_scale == pytest.approx(0.5)
         assert kernel.last_execute_request.acceleration_scale == pytest.approx(0.6)
         assert kernel.last_execute_request.max_tcp_linear_speed_mps == pytest.approx(0.25)
         assert kernel.last_execute_request.joint_position_tol_rad == pytest.approx(0.02)
         assert kernel.last_execute_request.translation_tol_m == pytest.approx(0.003)
         assert kernel.last_execute_request.rotation_tol_rad == pytest.approx(0.04)
 
-    def test_velocity_scale_does_not_compound_across_async_ticks(self, bb_with_kernel):
+    def test_runtime_velocity_scale_does_not_modify_dispatched_request(self, bb_with_kernel):
         kernel = MockKernelClient(execute_duration_s=0.05)
         bb_with_kernel.kernel = kernel
 
@@ -186,7 +186,7 @@ class TestMoveManipulatorAction:
             node.update()
 
         assert kernel.last_execute_request is not None
-        assert kernel.last_execute_request.velocity_scale == pytest.approx(0.4)
+        assert kernel.last_execute_request.velocity_scale == pytest.approx(0.5)
         assert node._params["velocity_scale"] == pytest.approx(0.5)
 
         while node.update() == py_trees.common.Status.RUNNING:
@@ -195,7 +195,7 @@ class TestMoveManipulatorAction:
         node.initialise()
         assert node.update() == py_trees.common.Status.RUNNING
         assert kernel.last_execute_request is not None
-        assert kernel.last_execute_request.velocity_scale == pytest.approx(0.4)
+        assert kernel.last_execute_request.velocity_scale == pytest.approx(0.5)
 
     def test_relative_move_request_normalizes_offset_orientation(self, kernel, bb_with_kernel):
         node = MoveManipulatorAction(

@@ -188,6 +188,8 @@ class SceneEditRequest:
     shape_type: Optional[str] = None
     box_dimensions_m: Optional[List[float]] = None
     sphere_radius_m: Optional[float] = None
+    cylinder_radius_m: Optional[float] = None
+    cylinder_height_m: Optional[float] = None
     mesh_resource_uri: Optional[str] = None
     mesh_scale: Optional[List[float]] = None
     pose_position_m: Optional[List[float]] = None
@@ -336,8 +338,8 @@ def _validate_scene_edit_request(request: SceneEditRequest) -> Optional[str]:
         return f"Unsupported scene edit operation: {request.operation}"
 
     if request.operation in {"add", "upsert"}:
-        if request.shape_type not in {"box", "sphere", "mesh"}:
-            return f"{request.operation} requires shape_type to be one of: box, sphere, mesh"
+        if request.shape_type not in {"box", "sphere", "cylinder", "mesh"}:
+            return f"{request.operation} requires shape_type to be one of: box, sphere, cylinder, mesh"
         if request.shape_type == "box":
             if not _is_vector(request.box_dimensions_m, 3):
                 return f"{request.operation} with shape_type=box requires box_dimensions_m=[x, y, z]"
@@ -346,6 +348,11 @@ def _validate_scene_edit_request(request: SceneEditRequest) -> Optional[str]:
         if request.shape_type == "sphere":
             if request.sphere_radius_m is None or request.sphere_radius_m <= 0.0:
                 return f"{request.operation} with shape_type=sphere requires sphere_radius_m > 0"
+        if request.shape_type == "cylinder":
+            if request.cylinder_radius_m is None or request.cylinder_radius_m <= 0.0:
+                return f"{request.operation} with shape_type=cylinder requires cylinder_radius_m > 0"
+            if request.cylinder_height_m is None or request.cylinder_height_m <= 0.0:
+                return f"{request.operation} with shape_type=cylinder requires cylinder_height_m > 0"
         if request.shape_type == "mesh":
             if not request.mesh_resource_uri:
                 return f"{request.operation} with shape_type=mesh requires mesh_resource_uri"
@@ -414,6 +421,20 @@ class KernelClient(ABC):
     @abstractmethod
     def acknowledge_completed(self, execution_id: int) -> CommandResult: ...
 
+    @abstractmethod
+    def acknowledge_intervention(
+        self, principal_id: str, reason: str
+    ) -> CommandResult:
+        """Explicitly clear `kInterventionRequired`.
+
+        Mirrors the C++ kernel API. Callers (cycle manager Run-side
+        auto-ack, MCP, operator UI) hold the policy decision about
+        whether the leftover state is safe to clear; the kernel only
+        enforces fail-closed semantics. `execute()` rejects while the
+        kernel is in `INTERVENTION_REQUIRED` until this is called.
+        """
+        ...
+
     # Streaming-session API (ADR-0016). Default implementations make the new
     # surface optional for backends that don't support it; the kernel-bound
     # clients (NativeKernelClient) override with the real implementations.
@@ -441,6 +462,22 @@ class KernelClient(ABC):
             accepted=False,
             error="streaming-session mode not supported by this kernel client",
         )
+
+    def set_runtime_velocity_scale(self, scale: float) -> None:
+        """Forward the HMI runtime velocity-scale control to the kernel.
+
+        ADR-0018: this is a live execution control, not a behavior-tree
+        parameter override. Implementations clamp finite values to [0, 1] and
+        apply them to discrete and streaming execution without stopping the
+        active action.
+        """
+        # Default implementation: no-op. Native/mocked clients that support
+        # runtime scaling override.
+        return None
+
+    def set_streaming_velocity_scale(self, scale: float) -> None:
+        """Compatibility alias for older callers."""
+        self.set_runtime_velocity_scale(scale)
 
     @abstractmethod
     def get_status(self) -> ExecutionStatus: ...
@@ -562,6 +599,8 @@ class MockKernelClient(KernelClient):
         self.resume_count = 0
         self.reset_count = 0
         self.invalidate_count = 0
+        self.runtime_velocity_scale = 1.0
+        self.runtime_velocity_scale_updates: List[float] = []
         self.scene_edits: List[SceneEditRequest] = []
         self.link_pose_calls: List[tuple[str, str]] = []
         # Allow tests to inject failures
@@ -795,6 +834,33 @@ class MockKernelClient(KernelClient):
         self._emit_kernel_event("state_transition", from_state=prev, to_state="idle")
         return CommandResult(accepted=True)
 
+    def acknowledge_intervention(
+        self, principal_id: str, reason: str
+    ) -> CommandResult:
+        if self._state != ExecutionState.INTERVENTION_REQUIRED:
+            return CommandResult(
+                accepted=False,
+                error=(
+                    "acknowledge_intervention is valid only from "
+                    f"INTERVENTION_REQUIRED; current state={self._state.value}"
+                ),
+            )
+        prev = self._state.value
+        self._state = ExecutionState.IDLE
+        self._active_move_id = ""
+        self._emit_kernel_event(
+            "acknowledge_intervention",
+            details={
+                "principal_id": principal_id,
+                "reason": reason,
+                "prev_state": prev,
+            },
+        )
+        self._emit_kernel_event(
+            "state_transition", from_state=prev, to_state="idle"
+        )
+        return CommandResult(accepted=True)
+
     def get_status(self) -> ExecutionStatus:
         import time
         # Transition EXECUTING → COMPLETED when duration elapses
@@ -845,6 +911,13 @@ class MockKernelClient(KernelClient):
     def invalidate_trajectories(self) -> None:
         self.invalidate_count += 1
         self._metrics["cache_invalidations"] += 1
+
+    def set_runtime_velocity_scale(self, scale: float) -> None:
+        if not isinstance(scale, (int, float)) or math.isnan(scale) or math.isinf(scale):
+            return
+        clamped = max(0.0, min(1.0, float(scale)))
+        self.runtime_velocity_scale = clamped
+        self.runtime_velocity_scale_updates.append(clamped)
 
     def set_robot_base_pose(self, pose: Optional[Dict[str, Any]]) -> None:
         self.robot_base_pose = None if not pose else dict(pose)
@@ -900,6 +973,8 @@ class MockKernelClient(KernelClient):
                 "shape_type": request.shape_type,
                 "box_dimensions_m": list(request.box_dimensions_m or []) or None,
                 "sphere_radius_m": request.sphere_radius_m,
+                "cylinder_radius_m": request.cylinder_radius_m,
+                "cylinder_height_m": request.cylinder_height_m,
                 "mesh_resource_uri": request.mesh_resource_uri,
                 "mesh_scale": list(request.mesh_scale or [1.0, 1.0, 1.0])
                 if request.shape_type == "mesh"
@@ -926,6 +1001,8 @@ class MockKernelClient(KernelClient):
                 "shape_type": request.shape_type,
                 "box_dimensions_m": list(request.box_dimensions_m or []) or None,
                 "sphere_radius_m": request.sphere_radius_m,
+                "cylinder_radius_m": request.cylinder_radius_m,
+                "cylinder_height_m": request.cylinder_height_m,
                 "mesh_resource_uri": request.mesh_resource_uri,
                 "mesh_scale": list(request.mesh_scale or [1.0, 1.0, 1.0])
                 if request.shape_type == "mesh"
@@ -1191,6 +1268,12 @@ class MockKernelClient(KernelClient):
                 shape = SceneShape(
                     type="sphere",
                     sphere_radius_m=tracked.get("sphere_radius_m"),
+                )
+            elif tracked.get("shape_type") == "cylinder":
+                shape = SceneShape(
+                    type="cylinder",
+                    cylinder_radius_m=tracked.get("cylinder_radius_m"),
+                    cylinder_height_m=tracked.get("cylinder_height_m"),
                 )
             elif tracked.get("shape_type") == "mesh":
                 shape = SceneShape(

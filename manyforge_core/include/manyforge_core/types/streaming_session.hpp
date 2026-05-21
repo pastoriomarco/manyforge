@@ -139,6 +139,13 @@ struct StreamingSessionConfigDTO {
   /// at session begin.
   std::vector<double> per_joint_acceleration_caps_rad_s2;
 
+  /// Per-joint position limits (rad or m, parallel to joint_names), populated
+  /// by the kernel from IPlanningContext::get_joint_limits() at session begin.
+  /// Non-finite entries mean "unbounded/unknown"; finite entries are enforced
+  /// by ExecutionKernel::push_streaming_target before backend dispatch.
+  std::vector<double> per_joint_position_lower;
+  std::vector<double> per_joint_position_upper;
+
   /// Absolute Cartesian (TCP) linear speed cap in m/s. The backend's
   /// dispatch worker MUST clamp target_time_from_start so that the
   /// implied Cartesian linear speed never exceeds this value. This is

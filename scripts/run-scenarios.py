@@ -105,19 +105,25 @@ class ManagedComposerProcess:
             stderr=stderr,
             text=True,
         )
-        deadline = time.monotonic() + self._wait_timeout_s
-        with httpx.Client(base_url=self.base_url, timeout=2.0) as client:
-            while time.monotonic() < deadline:
-                if self._process.poll() is not None:
-                    raise RuntimeError(f"Composer exited early with code {self._process.returncode}")
-                try:
-                    response = client.get("/api/health")
-                    if response.status_code == 200:
-                        return
-                except Exception:
-                    pass
-                time.sleep(0.1)
-        raise RuntimeError("Timed out waiting for Composer health endpoint")
+        try:
+            deadline = time.monotonic() + self._wait_timeout_s
+            with httpx.Client(base_url=self.base_url, timeout=2.0) as client:
+                while time.monotonic() < deadline:
+                    if self._process.poll() is not None:
+                        raise RuntimeError(
+                            f"Composer exited early with code {self._process.returncode}"
+                        )
+                    try:
+                        response = client.get("/api/health")
+                        if response.status_code == 200:
+                            return
+                    except Exception:
+                        pass
+                    time.sleep(0.1)
+            raise RuntimeError("Timed out waiting for Composer health endpoint")
+        except Exception:
+            self.stop()
+            raise
 
     def stop(self) -> None:
         if self._process is not None and self._process.poll() is None:

@@ -2,9 +2,11 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <exception>
 #include <limits>
+#include <stdexcept>
 #include <string>
 
 namespace manyforge::core {
@@ -424,11 +426,29 @@ ExecutionKernel::ExecutionKernel(IPlannerBackend& planner,
       stop_policy_(sm_, scheduler, clock, [this]() { cache_.invalidate_all(); }),
       collision_policy_(stop_policy_,
                         [this]() { cache_.invalidate_all(); }) {
+  if (config_.streaming_ik_timeout_s <= 0.0 ||
+      !std::isfinite(config_.streaming_ik_timeout_s)) {
+    throw std::invalid_argument("streaming_ik_timeout_s must be finite and > 0");
+  }
+  if (config_.native_reset_completion_timeout_s <= 0.0 ||
+      !std::isfinite(config_.native_reset_completion_timeout_s)) {
+    throw std::invalid_argument(
+        "native_reset_completion_timeout_s must be finite and > 0");
+  }
+  if (config_.native_streaming_stop_completion_timeout_s <= 0.0 ||
+      !std::isfinite(config_.native_streaming_stop_completion_timeout_s)) {
+    throw std::invalid_argument(
+        "native_streaming_stop_completion_timeout_s must be finite and > 0");
+  }
   stop_policy_.set_stop_callback([this]() { (void)execution_backend_.stop(); });
   sync_snapshot_from_context();
 }
 
 ExecutionKernel::~ExecutionKernel() {
+  // Scheduled collision callbacks capture `this`; cancel them before any
+  // member teardown so destruction cannot race a monitor tick.
+  stop_collision_monitoring();
+
   // Join before member destruction so worker callbacks cannot notify the
   // condition variable after it has been destroyed. This is intentionally
   // explicit instead of relying on std::jthread member teardown order.
@@ -440,8 +460,17 @@ ExecutionKernel::~ExecutionKernel() {
 }
 
 void ExecutionKernel::emit_event(const KernelEvent& event) {
-  std::lock_guard<std::mutex> lock(subscribers_mutex_);
-  for (const auto& [id, callback] : subscribers_) {
+  std::vector<EventCallback> callbacks;
+  {
+    std::lock_guard<std::mutex> lock(subscribers_mutex_);
+    callbacks.reserve(subscribers_.size());
+    for (const auto& [id, callback] : subscribers_) {
+      (void)id;
+      callbacks.push_back(callback);
+    }
+  }
+
+  for (const auto& callback : callbacks) {
     try {
       callback(event);
     } catch (...) {
@@ -646,9 +675,13 @@ void ExecutionKernel::async_execute_worker(
               : 0;
       if (planning_timeout_ns > 0) {
         const int64_t deadline = planning_start_ns + planning_timeout_ns;
-        planning_timeout_handle = scheduler_.schedule(deadline, [this]() {
-          stop_policy_.request_hard_stop();
-        });
+        // Monitoring lane: the watchdog must fire even when the planner
+        // and collision-monitor are blocked behind the scene lock. See
+        // spec/220 threading invariants and ADR-0019.
+        planning_timeout_handle = scheduler_.schedule(
+            deadline,
+            [this]() { stop_policy_.request_hard_stop(); },
+            SchedulerPriority::Monitoring);
       }
 
       auto plan_result = plan_trajectory(request);
@@ -782,7 +815,8 @@ void ExecutionKernel::async_execute_worker(
       publish_execution_snapshot(std::move(snapshot));
       emit_event({KernelEventType::kStateTransition, exec_id, clock_.now(),
                    ExecutionState::kValidating, ExecutionState::kFailed, std::nullopt, {}});
-      if (request.cache_mode != CacheMode::kDisable) {
+      if (request.cache_mode != CacheMode::kDisable &&
+          cache_.lookup(request.move_id).has_value()) {
         cache_.invalidate(request.move_id);
         // Emit cache invalidated event
         emit_event({KernelEventType::kCacheInvalidated, exec_id, clock_.now(),
@@ -886,9 +920,9 @@ void ExecutionKernel::async_execute_worker(
     core::ExecutionSnapshot latest_backend_snapshot;
     start_collision_monitoring();
 
-    int64_t paused_accumulated_ns = 0;
     bool pause_in_progress = false;
-    int64_t pause_started_ns = 0;
+    int64_t last_runtime_scale_sample_ns = exec_start_ns;
+    double runtime_scaled_execution_ns = 0.0;
 
     while (true) {
       bool completed = true;
@@ -911,20 +945,21 @@ void ExecutionKernel::async_execute_worker(
       if (paused) {
         if (!pause_in_progress) {
           pause_in_progress = true;
-          pause_started_ns = now_ns;
         }
       } else if (pause_in_progress) {
-        paused_accumulated_ns += now_ns - pause_started_ns;
         pause_in_progress = false;
       }
 
-      const int64_t current_pause_ns =
-          pause_in_progress ? now_ns - pause_started_ns : 0;
-      const int64_t effective_elapsed_ns =
-          now_ns - exec_start_ns - paused_accumulated_ns - current_pause_ns;
+      if (!paused) {
+        const int64_t dt_ns = std::max<int64_t>(0, now_ns - last_runtime_scale_sample_ns);
+        const double scale = clamp_unit_interval(
+            runtime_velocity_scale_.load(std::memory_order_acquire));
+        runtime_scaled_execution_ns += static_cast<double>(dt_ns) * scale;
+      }
+      last_runtime_scale_sample_ns = now_ns;
 
       // Check execution timeout (W-1)
-      if (exec_timeout_ns > 0 && effective_elapsed_ns >= exec_timeout_ns) {
+      if (exec_timeout_ns > 0 && runtime_scaled_execution_ns >= static_cast<double>(exec_timeout_ns)) {
         stop_collision_monitoring();
         (void)execution_backend_.stop();
         const bool stop_completed = drain_execution_handle_bounded(execution_handle);
@@ -964,6 +999,15 @@ void ExecutionKernel::async_execute_worker(
         execution_complete_.store(true);
         completion_cv_.notify_all();
         return;
+      }
+
+      const auto loop_state = sm_.status().state;
+      if (completed ||
+          loop_state == ExecutionState::kStopped ||
+          loop_state == ExecutionState::kIdle ||
+          loop_state == ExecutionState::kFailed ||
+          loop_state == ExecutionState::kInterventionRequired) {
+        break;
       }
 
       if (latest_backend_snapshot.state == ExecutionState::kPaused ||
@@ -1071,10 +1115,6 @@ void ExecutionKernel::async_execute_worker(
         }
 
         continue;
-      }
-
-      if (completed) {
-        break;
       }
     }
 
@@ -1202,33 +1242,22 @@ void ExecutionKernel::async_execute_worker(
 }
 
 Result<uint64_t> ExecutionKernel::execute(const ExecuteRequestDTO& request) {
-  std::lock_guard<std::mutex> lock(execute_mutex_);
+  std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
 
+  // `kInterventionRequired` MUST be cleared by an explicit
+  // `acknowledge_intervention(principal_id, reason)` call, not silently by
+  // `execute()`. An implicit clear here would erase the operator
+  // intervention boundary — any caller (including LLMs) could re-issue
+  // `execute` to bypass the intervention gate with no audit event. The
+  // policy decision about whether the leftover state is safe to clear
+  // lives in the caller (cycle manager Run-side auto-ack, MCP, operator UI).
   if (sm_.status().state == ExecutionState::kInterventionRequired) {
-    const auto prev_state = sm_.status().state;
-    auto backend_reset = execution_backend_.reset();
-    if (!backend_reset.accepted) {
-      return Result<uint64_t>::Err(backend_reset.error.value_or(
-          ErrorDTO{kErrorResetFailed,
-                   "Execution backend could not resync from intervention_required",
-                   {{"requires_operator_intervention", "true"},
-                    {"resync_required", "true"},
-                    {"phase", "execute_resync"}}}));
-    }
-    auto reset_result = stop_policy_.request_reset();
-    if (!reset_result.ok()) {
-      return Result<uint64_t>::Err(reset_result.error());
-    }
-    auto snapshot = execution_backend_.get_execution_snapshot();
-    snapshot.timestamp_ns = clock_.now();
-    snapshot.execution_id = 0;
-    snapshot.move_id.clear();
-    snapshot.state = ExecutionState::kIdle;
-    snapshot.progress = 0.0;
-    snapshot.error.reset();
-    publish_execution_snapshot(std::move(snapshot));
-    emit_event({KernelEventType::kStateTransition, sm_.status().execution_id,
-                clock_.now(), prev_state, ExecutionState::kIdle, std::nullopt, {}});
+    return Result<uint64_t>::Err(ErrorDTO{
+        kErrorInvalidRequest,
+        "Execution is in InterventionRequired; explicit acknowledge_intervention required",
+        {{"requires_operator_intervention", "true"},
+         {"reason_code", "intervention_required"},
+         {"state", to_string(sm_.status().state)}}});
   }
 
   if (sm_.status().state == ExecutionState::kFailed ||
@@ -1397,6 +1426,8 @@ Result<uint64_t> ExecutionKernel::execute(const ExecuteRequestDTO& request) {
 }
 
 StopResultDTO ExecutionKernel::stop() {
+  std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
+
   // ADR-0016: stop() from kStreaming maps to a soft-end of the active
   // streaming session using the session's configured soft-stop strategy
   // (spring_back by default; velocity_scaling when qualification permits).
@@ -1412,8 +1443,8 @@ StopResultDTO ExecutionKernel::stop() {
     }
   }
   if (streaming_session_to_end != 0) {
-    auto end_result = end_streaming_session(streaming_session_to_end,
-                                              streaming_strategy);
+    auto end_result = end_streaming_session_unlocked(streaming_session_to_end,
+                                                     streaming_strategy);
     if (end_result.accepted) {
       std::lock_guard<std::mutex> lock(metrics_mutex_);
       metrics_.stops_issued++;
@@ -1444,6 +1475,8 @@ StopResultDTO ExecutionKernel::stop() {
 }
 
 PauseResultDTO ExecutionKernel::pause() {
+  std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
+
   auto result = stop_policy_.request_pause();
   if (result.ok()) {
     stop_collision_monitoring();
@@ -1461,6 +1494,8 @@ PauseResultDTO ExecutionKernel::pause() {
 }
 
 ResumeResultDTO ExecutionKernel::resume() {
+  std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
+
   auto prev_state = sm_.status().state;
   auto result = stop_policy_.request_resume();
   if (result.ok()) {
@@ -1482,6 +1517,8 @@ ResumeResultDTO ExecutionKernel::resume() {
 }
 
 ResetResultDTO ExecutionKernel::reset() {
+  std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
+
   auto prev_state = sm_.status().state;
 
   // ADR-0016: reset() is the HARD-cancel path (max-decel cancel via
@@ -1499,6 +1536,7 @@ ResetResultDTO ExecutionKernel::reset() {
       closed_streaming_id = active_streaming_session_id_;
       active_streaming_session_id_ = 0;
       active_backend_session_id_ = 0;
+      ++active_streaming_generation_;
       active_streaming_config_ = StreamingSessionConfigDTO{};
       active_soft_stop_strategy_ = SoftStopStrategy::kSpringBack;
       last_accepted_cartesian_pos_valid_ = false;
@@ -1596,7 +1634,7 @@ ResetResultDTO ExecutionKernel::reset() {
 
 AcknowledgeCompletedResultDTO ExecutionKernel::acknowledge_completed(
     uint64_t execution_id) {
-  std::lock_guard<std::mutex> lock(execute_mutex_);
+  std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
 
   const auto status = sm_.status();
   if (status.state != ExecutionState::kCompleted) {
@@ -1648,6 +1686,84 @@ AcknowledgeCompletedResultDTO ExecutionKernel::acknowledge_completed(
               {}});
 
   return AcknowledgeCompletedResultDTO{true, std::nullopt};
+}
+
+AcknowledgeInterventionResultDTO ExecutionKernel::acknowledge_intervention(
+    std::string principal_id, std::string reason) {
+  std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
+
+  const auto status = sm_.status();
+  if (status.state != ExecutionState::kInterventionRequired) {
+    return AcknowledgeInterventionResultDTO{
+        false,
+        ErrorDTO{kErrorInvalidRequest,
+                 "acknowledge_intervention is valid only from InterventionRequired",
+                 {{"state", to_string(status.state)}}}};
+  }
+
+  // Resync the backend before clearing the intervention flag. Without this,
+  // a downstream `execute()` call would race against backend state that
+  // still reflects the pre-intervention error. Mirrors the previous implicit
+  // path in execute() but with explicit operator authority.
+  auto backend_reset = execution_backend_.reset();
+  if (!backend_reset.accepted) {
+    return AcknowledgeInterventionResultDTO{
+        false,
+        backend_reset.error.value_or(
+            ErrorDTO{kErrorResetFailed,
+                     "Execution backend could not resync from intervention_required",
+                     {{"requires_operator_intervention", "true"},
+                      {"resync_required", "true"},
+                      {"phase", "acknowledge_intervention_resync"}}})};
+  }
+
+  // Use `stop_policy_.request_reset()` rather than `sm_.reset()` directly
+  // (which is what `acknowledge_completed` does) because intervention can
+  // be entered with a pending scheduled soft-stop or a sticky `stop_requested_`
+  // flag in StopPolicy. `request_reset()` cancels the scheduled callback
+  // and clears the flag in addition to driving `sm_.reset()`; from
+  // `kCompleted` there is no such pending work to cancel, hence the
+  // sibling acknowledge_completed uses the narrower `sm_.reset()` directly.
+  auto reset_result = stop_policy_.request_reset();
+  if (!reset_result.ok()) {
+    return AcknowledgeInterventionResultDTO{false, reset_result.error()};
+  }
+
+  const auto prev_state = status.state;
+  const auto prev_execution_id = status.execution_id;
+  sm_.set_execution_id(0);
+  {
+    std::lock_guard<std::mutex> move_lock(active_move_id_mutex_);
+    active_move_id_.clear();
+  }
+
+  ExecutionSnapshot snapshot = execution_backend_.get_execution_snapshot();
+  snapshot.timestamp_ns = clock_.now();
+  snapshot.execution_id = 0;
+  snapshot.move_id.clear();
+  snapshot.state = ExecutionState::kIdle;
+  snapshot.progress = 0.0;
+  snapshot.error.reset();
+  publish_execution_snapshot(std::move(snapshot));
+
+  emit_event({KernelEventType::kInterventionAcknowledged,
+              prev_execution_id,
+              clock_.now(),
+              {},
+              {},
+              std::nullopt,
+              {{"principal_id", principal_id},
+               {"reason", reason},
+               {"prev_state", to_string(prev_state)}}});
+  emit_event({KernelEventType::kStateTransition,
+              prev_execution_id,
+              clock_.now(),
+              prev_state,
+              ExecutionState::kIdle,
+              std::nullopt,
+              {}});
+
+  return AcknowledgeInterventionResultDTO{true, std::nullopt};
 }
 
 ExecutionStatus ExecutionKernel::get_status() const {
@@ -1839,16 +1955,13 @@ Result<void> ExecutionKernel::validate_trajectory(
   // Start-state gate
   auto current_state = context_.get_current_state();
   if (!trajectory.waypoints.empty()) {
-    const auto& start_wp = trajectory.waypoints.front();
-    if (current_state.positions_rad.size() == start_wp.positions_rad.size()) {
-      for (size_t i = 0; i < current_state.positions_rad.size(); ++i) {
-        double diff = current_state.positions_rad[i] - start_wp.positions_rad[i];
-        if (diff < 0) diff = -diff;
-        if (diff > request.tolerances.joint_position_tol_rad) {
-          return Result<void>::Err(
-              ErrorDTO{kErrorStartStateMismatch, "Start state mismatch", {}});
-        }
-      }
+    const auto start_match = cached_trajectory_matches_current_start(
+        trajectory, current_state, request.tolerances.joint_position_tol_rad);
+    if (!start_match.compatible) {
+      return Result<void>::Err(
+          ErrorDTO{kErrorStartStateMismatch,
+                   "Start state mismatch",
+                   {{"reason", start_match.reason}}});
     }
   }
 
@@ -1885,11 +1998,13 @@ Result<void> ExecutionKernel::validate_trajectory(
 // Concurrency: streaming_session_mutex_ protects the active session
 // metadata. We do NOT hold it across the backend call (the backend has
 // its own internal locks; we mustn't invert lock order with
-// execute_mutex_).
+// lifecycle_mutex_).
 // -----------------------------------------------------------------
 
 StreamingSessionBeginResultDTO ExecutionKernel::begin_streaming_session(
     const StreamingSessionConfigDTO& config) {
+  std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
+
   StreamingSessionBeginResultDTO result;
 
   {
@@ -1929,6 +2044,41 @@ StreamingSessionBeginResultDTO ExecutionKernel::begin_streaming_session(
       populated_config.joint_names = current_state.joint_names;
     }
   }
+  if (!populated_config.joint_names.empty()) {
+    const double unbounded_lower = -std::numeric_limits<double>::infinity();
+    const double unbounded_upper = std::numeric_limits<double>::infinity();
+    populated_config.per_joint_position_lower.assign(
+        populated_config.joint_names.size(), unbounded_lower);
+    populated_config.per_joint_position_upper.assign(
+        populated_config.joint_names.size(), unbounded_upper);
+
+    try {
+      auto limits = context_.get_joint_limits("", populated_config.group_id);
+      const bool have_position_limits =
+          limits.joint_names.size() == limits.position_lower_rad.size() &&
+          limits.joint_names.size() == limits.position_upper_rad.size();
+      if (have_position_limits) {
+        for (size_t si = 0; si < populated_config.joint_names.size(); ++si) {
+          const auto& joint_name = populated_config.joint_names[si];
+          auto lit = std::find(limits.joint_names.begin(),
+                               limits.joint_names.end(), joint_name);
+          if (lit == limits.joint_names.end()) {
+            continue;
+          }
+          const auto li = static_cast<size_t>(
+              std::distance(limits.joint_names.begin(), lit));
+          populated_config.per_joint_position_lower[si] =
+              limits.position_lower_rad[li];
+          populated_config.per_joint_position_upper[si] =
+              limits.position_upper_rad[li];
+        }
+      }
+    } catch (...) {
+      // Some lightweight test contexts/backends cannot expose limits. Keep
+      // entries unbounded rather than rejecting begin; push-time enforcement
+      // still applies for every finite limit the context can provide.
+    }
+  }
 
   auto backend_result =
       execution_backend_.begin_streaming_session(populated_config);
@@ -1953,6 +2103,7 @@ StreamingSessionBeginResultDTO ExecutionKernel::begin_streaming_session(
     kernel_session_id = next_streaming_session_id_++;
     active_streaming_session_id_ = kernel_session_id;
     active_backend_session_id_ = backend_result.session_id;
+    ++active_streaming_generation_;
     active_streaming_config_ = populated_config;
     active_soft_stop_strategy_ = populated_config.default_soft_stop_strategy;
     last_accepted_cartesian_pos_valid_ = false;
@@ -1986,6 +2137,26 @@ StreamingSessionBeginResultDTO ExecutionKernel::begin_streaming_session(
   return result;
 }
 
+void ExecutionKernel::set_runtime_velocity_scale(double scale) {
+  // ADR-0018: HMI runtime velocity scale → backend runtime register.
+  // Validate finiteness here; clamp to [0, 1]; forward to the backend's
+  // atomic store. No lifecycle_mutex_: this is a high-rate operator surface,
+  // peer to push_streaming_target. The backend's atomic handles concurrency.
+  if (!std::isfinite(scale)) {
+    // K2-style defense in depth: refuse NaN/Inf rather than
+    // propagating into the worker.
+    return;
+  }
+  if (scale < 0.0) scale = 0.0;
+  if (scale > 1.0) scale = 1.0;
+  runtime_velocity_scale_.store(scale, std::memory_order_release);
+  execution_backend_.set_runtime_velocity_scale(scale);
+}
+
+void ExecutionKernel::set_streaming_velocity_scale(double scale) {
+  set_runtime_velocity_scale(scale);
+}
+
 StreamingPushResultDTO ExecutionKernel::push_streaming_target(
     uint64_t session_id,
     const StreamingTargetDTO& target) {
@@ -2002,6 +2173,7 @@ StreamingPushResultDTO ExecutionKernel::push_streaming_target(
 
   StreamingSessionConfigDTO active_config;
   uint64_t backend_session_id = 0;
+  uint64_t session_generation = 0;
   {
     std::lock_guard<std::mutex> lock(streaming_session_mutex_);
     if (active_streaming_session_id_ == 0 ||
@@ -2017,6 +2189,75 @@ StreamingPushResultDTO ExecutionKernel::push_streaming_target(
     }
     active_config = active_streaming_config_;
     backend_session_id = active_backend_session_id_;
+    session_generation = active_streaming_generation_;
+  }
+
+  auto reject_malformed_frame =
+      [&](const std::string& message,
+          std::map<std::string, std::string> details = {}) {
+        details.emplace("reason_code", "malformed_frame");
+        result.accepted = false;
+        result.backend_sequence = 0;
+        result.error = ErrorDTO{
+            std::string(to_string(ErrorCode::kInvalidRequest)),
+            message,
+            details};
+        emit_event({KernelEventType::kStreamingTargetRejected,
+                    0,
+                    clock_.now(),
+                    {},
+                    {},
+                    result.error,
+                    {{"session_id", std::to_string(session_id)},
+                     {"source_sequence",
+                      std::to_string(target.source_sequence)},
+                     {"kind", "malformed_frame"}}});
+        return result;
+      };
+
+  if (!std::isfinite(target.min_time_from_start_s)
+      || target.min_time_from_start_s < 0.0) {
+    return reject_malformed_frame(
+        "streaming target min_time_from_start_s must be finite and >= 0",
+        {{"field", "min_time_from_start_s"}});
+  }
+
+  StreamingTargetDTO resolved_target = target;
+  if (target.kind == StreamingInputMode::kCartesian) {
+    for (size_t i = 0; i < target.position_m.size(); ++i) {
+      if (!std::isfinite(target.position_m[i])) {
+        return reject_malformed_frame(
+            "Cartesian streaming target contains non-finite position",
+            {{"field", "position_m"}, {"index", std::to_string(i)}});
+      }
+    }
+    double quat_norm_sq = 0.0;
+    for (size_t i = 0; i < target.orientation_xyzw.size(); ++i) {
+      const double value = target.orientation_xyzw[i];
+      if (!std::isfinite(value)) {
+        return reject_malformed_frame(
+            "Cartesian streaming target contains non-finite orientation",
+            {{"field", "orientation_xyzw"}, {"index", std::to_string(i)}});
+      }
+      quat_norm_sq += value * value;
+    }
+    if (quat_norm_sq < 1e-12) {
+      return reject_malformed_frame(
+          "Cartesian streaming target quaternion norm is too small",
+          {{"field", "orientation_xyzw"}});
+    }
+    const double quat_norm = std::sqrt(quat_norm_sq);
+    for (double& value : resolved_target.orientation_xyzw) {
+      value /= quat_norm;
+    }
+  } else if (target.kind == StreamingInputMode::kJoint) {
+    for (size_t i = 0; i < target.joint_positions_rad.size(); ++i) {
+      if (!std::isfinite(target.joint_positions_rad[i])) {
+        return reject_malformed_frame(
+            "Joint streaming target contains non-finite position",
+            {{"field", "joint_positions_rad"}, {"index", std::to_string(i)}});
+      }
+    }
   }
 
   // ADR-0015 / ADR-0016: enforce the deployment's Cartesian speed cap
@@ -2030,7 +2271,6 @@ StreamingPushResultDTO ExecutionKernel::push_streaming_target(
   // and the backend's dispatch worker max'es this with its own joint-
   // velocity-cap-derived floor. The result is that the FJT goal is
   // always scheduled to take long enough for the cap to hold.
-  StreamingTargetDTO resolved_target = target;
   if (target.kind == StreamingInputMode::kCartesian &&
       active_config.max_tcp_linear_speed_mps > 0.0) {
     std::array<double, 3> last_pos{0.0, 0.0, 0.0};
@@ -2065,10 +2305,10 @@ StreamingPushResultDTO ExecutionKernel::push_streaming_target(
     pose.position_m.x_m = target.position_m[0];
     pose.position_m.y_m = target.position_m[1];
     pose.position_m.z_m = target.position_m[2];
-    pose.orientation.x = target.orientation_xyzw[0];
-    pose.orientation.y = target.orientation_xyzw[1];
-    pose.orientation.z = target.orientation_xyzw[2];
-    pose.orientation.w = target.orientation_xyzw[3];
+    pose.orientation.x = resolved_target.orientation_xyzw[0];
+    pose.orientation.y = resolved_target.orientation_xyzw[1];
+    pose.orientation.z = resolved_target.orientation_xyzw[2];
+    pose.orientation.w = resolved_target.orientation_xyzw[3];
     ik_req.goal_pose = pose;
     ik_req.base_frame = active_config.cartesian_reference_frame.empty()
                              ? std::string("base")
@@ -2096,8 +2336,38 @@ StreamingPushResultDTO ExecutionKernel::push_streaming_target(
       return result;
     }
     ik_req.seed_state = current_state;
+    ik_req.timeout_s = config_.streaming_ik_timeout_s;
 
+    const auto ik_started = std::chrono::steady_clock::now();
     auto ik_result = planner_.solve_ik(ik_req);
+    const double ik_elapsed_s =
+        std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - ik_started)
+            .count();
+    if (ik_elapsed_s > config_.streaming_ik_timeout_s) {
+      result.accepted = false;
+      result.backend_sequence = 0;
+      result.error = ErrorDTO{
+          std::string(to_string(ErrorCode::kIkFailed)),
+          "streaming IK exceeded configured timeout",
+          {{"reason_code", "ik_timeout"},
+           {"timeout_s", std::to_string(config_.streaming_ik_timeout_s)},
+           {"elapsed_s", std::to_string(ik_elapsed_s)},
+           {"base_frame", ik_req.base_frame},
+           {"tcp_frame", ik_req.tcp_frame}}};
+      emit_event({KernelEventType::kStreamingTargetRejected,
+                  0,
+                  clock_.now(),
+                  {},
+                  {},
+                  result.error,
+                  {{"session_id", std::to_string(session_id)},
+                   {"source_sequence",
+                    std::to_string(target.source_sequence)},
+                   {"kind", "cartesian_ik_timeout"},
+                   {"elapsed_s", std::to_string(ik_elapsed_s)}}});
+      return result;
+    }
     if (!ik_result.ok) {
       result.accepted = false;
       result.backend_sequence = 0;
@@ -2299,6 +2569,45 @@ StreamingPushResultDTO ExecutionKernel::push_streaming_target(
     resolved_target.joint_positions_rad = commanded_full;
   }
 
+  if (resolved_target.kind == StreamingInputMode::kJoint &&
+      resolved_target.joint_positions_rad.size()
+          == active_config.joint_names.size() &&
+      active_config.per_joint_position_lower.size()
+          == active_config.joint_names.size() &&
+      active_config.per_joint_position_upper.size()
+          == active_config.joint_names.size()) {
+    constexpr double kLimitTolerance = 1e-9;
+    for (size_t i = 0; i < resolved_target.joint_positions_rad.size(); ++i) {
+      const double value = resolved_target.joint_positions_rad[i];
+      const double lower = active_config.per_joint_position_lower[i];
+      const double upper = active_config.per_joint_position_upper[i];
+      if ((std::isfinite(lower) && value < lower - kLimitTolerance) ||
+          (std::isfinite(upper) && value > upper + kLimitTolerance)) {
+        result.accepted = false;
+        result.backend_sequence = 0;
+        result.error = ErrorDTO{
+            std::string(to_string(ErrorCode::kValidationLimitsViolation)),
+            "streaming target joint position exceeds configured limits",
+            {{"reason_code", "joint_position_limit"},
+             {"joint_name", active_config.joint_names[i]},
+             {"position_rad", std::to_string(value)},
+             {"limit_lower", std::to_string(lower)},
+             {"limit_upper", std::to_string(upper)}}};
+        emit_event({KernelEventType::kStreamingTargetRejected,
+                    0,
+                    clock_.now(),
+                    {},
+                    {},
+                    result.error,
+                    {{"session_id", std::to_string(session_id)},
+                     {"source_sequence",
+                      std::to_string(target.source_sequence)},
+                     {"kind", "joint_position_limit"}}});
+        return result;
+      }
+    }
+  }
+
   // Forward to backend using the BACKEND's session_id (assigned at begin
   // time), not the kernel's. Kernel and backend counters are independent;
   // mapping must use the backend's view.
@@ -2306,6 +2615,32 @@ StreamingPushResultDTO ExecutionKernel::push_streaming_target(
       execution_backend_.push_streaming_target(backend_session_id,
                                                 resolved_target);
   result = backend_result;
+
+  if (result.accepted) {
+    std::lock_guard<std::mutex> lock(streaming_session_mutex_);
+    if (active_streaming_session_id_ != session_id ||
+        active_backend_session_id_ != backend_session_id ||
+        active_streaming_generation_ != session_generation) {
+      result.accepted = false;
+      result.backend_sequence = 0;
+      result.error = ErrorDTO{
+          std::string(to_string(ErrorCode::kInvalidRequest)),
+          "streaming session changed while target was being processed",
+          {{"reason_code", "session_lost"},
+           {"requested_session_id", std::to_string(session_id)}}};
+      emit_event({KernelEventType::kStreamingTargetRejected,
+                  0,
+                  clock_.now(),
+                  {},
+                  {},
+                  result.error,
+                  {{"session_id", std::to_string(session_id)},
+                   {"source_sequence",
+                    std::to_string(target.source_sequence)},
+                   {"kind", "session_lost"}}});
+      return result;
+    }
+  }
 
   // On accept: record the cartesian position as the new
   // last-accepted-frame anchor for speed-limit enforcement on the next
@@ -2388,6 +2723,13 @@ StreamingPushResultDTO ExecutionKernel::push_streaming_target(
 StreamingSessionEndResultDTO ExecutionKernel::end_streaming_session(
     uint64_t session_id,
     SoftStopStrategy strategy) {
+  std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
+  return end_streaming_session_unlocked(session_id, strategy);
+}
+
+StreamingSessionEndResultDTO ExecutionKernel::end_streaming_session_unlocked(
+    uint64_t session_id,
+    SoftStopStrategy strategy) {
   StreamingSessionEndResultDTO result;
 
   const auto prev_state = sm_.status().state;
@@ -2455,6 +2797,7 @@ StreamingSessionEndResultDTO ExecutionKernel::end_streaming_session(
       std::lock_guard<std::mutex> lock(streaming_session_mutex_);
       active_streaming_session_id_ = 0;
       active_backend_session_id_ = 0;
+      ++active_streaming_generation_;
       active_streaming_config_ = StreamingSessionConfigDTO{};
       active_soft_stop_strategy_ = SoftStopStrategy::kSpringBack;
       last_accepted_cartesian_pos_valid_ = false;
@@ -2478,6 +2821,7 @@ StreamingSessionEndResultDTO ExecutionKernel::end_streaming_session(
       std::lock_guard<std::mutex> lock(streaming_session_mutex_);
       active_streaming_session_id_ = 0;
       active_backend_session_id_ = 0;
+      ++active_streaming_generation_;
       active_streaming_config_ = StreamingSessionConfigDTO{};
       active_soft_stop_strategy_ = SoftStopStrategy::kSpringBack;
       last_accepted_cartesian_pos_valid_ = false;
@@ -2494,6 +2838,7 @@ StreamingSessionEndResultDTO ExecutionKernel::end_streaming_session(
     closed_kernel_id = active_streaming_session_id_;
     active_streaming_session_id_ = 0;
     active_backend_session_id_ = 0;
+    ++active_streaming_generation_;
     active_streaming_config_ = StreamingSessionConfigDTO{};
     active_soft_stop_strategy_ = SoftStopStrategy::kSpringBack;
     last_accepted_cartesian_pos_valid_ = false;

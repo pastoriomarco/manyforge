@@ -7,6 +7,7 @@
 #include <cmath>
 #include <filesystem>
 #include <fstream>
+#include <stdexcept>
 #include <thread>
 
 using namespace manyforge::roboplan_backend;
@@ -45,6 +46,22 @@ TEST_F(NativeKernelTest, InitialStateIsIdle) {
   EXPECT_EQ(status.state, ExecutionState::kIdle);
 }
 
+TEST_F(NativeKernelTest, NativeExecutionBackendRejectsInvalidLifecycleTimeouts) {
+  RoboPlanExecutionBackendConfig config;
+  config.reset_completion_timeout_s = 0.0;
+  EXPECT_THROW(
+      RoboPlanExecutionBackend(
+          bundle_->scene, "arm", *bundle_->clock, nullptr, config),
+      std::invalid_argument);
+
+  config.reset_completion_timeout_s = 5.0;
+  config.streaming_stop_completion_timeout_s = 0.0;
+  EXPECT_THROW(
+      RoboPlanExecutionBackend(
+          bundle_->scene, "arm", *bundle_->clock, nullptr, config),
+      std::invalid_argument);
+}
+
 TEST(NativeSchedulerTest, SimpleSchedulerHonorsFutureDeadline) {
   SimpleScheduler scheduler;
   std::atomic<bool> fired{false};
@@ -67,6 +84,62 @@ TEST(NativeSchedulerTest, SimpleSchedulerHonorsFutureDeadline) {
   }
 
   EXPECT_TRUE(fired.load());
+}
+
+TEST(NativeSchedulerTest, MonitoringLaneFiresWhileSafetyLaneIsBlocked) {
+  // Audit K3 regression: with the previous single-worker scheduler a
+  // long-blocking Safety callback (e.g. collision_check_tick stuck
+  // waiting on the scene mutex) would prevent the Monitoring watchdog
+  // from firing — including the watchdog whose job is to abort that
+  // stall. With the split scheduler the lanes are independent.
+  SimpleScheduler scheduler;
+  std::atomic<bool> safety_can_exit{false};
+  std::atomic<bool> safety_running{false};
+  std::atomic<bool> monitoring_fired{false};
+
+  const auto schedule_at = [&](int64_t offset_ns) {
+    const auto now_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+    return now_ns + offset_ns;
+  };
+
+  // Safety callback parks itself until the test releases it; mirrors
+  // a collision_check_tick stalled on `scene_mutex_` during a long RRT.
+  scheduler.schedule(
+      schedule_at(10'000'000LL),
+      [&]() {
+        safety_running.store(true);
+        while (!safety_can_exit.load()) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+      },
+      SchedulerPriority::Safety);
+
+  // Monitoring callback must fire even while Safety is parked.
+  scheduler.schedule(
+      schedule_at(20'000'000LL),
+      [&]() { monitoring_fired.store(true); },
+      SchedulerPriority::Monitoring);
+
+  // Wait up to 500 ms for the watchdog to fire under contention.
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+  while (!monitoring_fired.load() &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+
+  EXPECT_TRUE(safety_running.load())
+      << "Safety callback did not reach its parking loop";
+  EXPECT_TRUE(monitoring_fired.load())
+      << "Monitoring watchdog did not fire while Safety lane was blocked";
+
+  // Release the parked Safety callback so the scheduler destructor
+  // does not race with a still-running task.
+  safety_can_exit.store(true);
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
 }
 
 // --- Planning Context ---
@@ -606,6 +679,183 @@ TEST_F(NativeKernelTest, KernelStreamingSnapshotFollowsBackendLiveState) {
       << "clean streaming end must retain the final backend joint state in "
          "the observer snapshot; otherwise Composer controls jump back to "
          "a stale pre-streaming value";
+}
+
+TEST_F(NativeKernelTest, StreamingRuntimeVelocityScaleAppliesPerTick) {
+  // ADR-0018: changing the velocity scale on an in-flight streaming session
+  // MUST take effect on worker ticks without tearing the session down.
+  //
+  // Strategy: open a session at scale=1.0, push a far-away joint
+  // target, sample worker progress for a fixed window. Then call
+  // set_runtime_velocity_scale(0.05), sample for the same window
+  // size. The second window's commanded-joint delta must be much
+  // smaller — the worker honored the runtime read. Tolerances are
+  // sized for the simulated backend (tick = 10 ms, v_cap = 0.5 rad/s
+  // default in the engine).
+  auto start_state = bundle_->context->get_current_state();
+  ASSERT_FALSE(start_state.joint_names.empty());
+
+  StreamingSessionConfigDTO config;
+  config.group_id = "arm";
+  config.joint_names = start_state.joint_names;
+  config.default_input_mode = StreamingInputMode::kJoint;
+  config.max_dispatch_rate_hz = 100.0;
+  config.velocity_scale = 1.0;
+
+  auto begin = bundle_->kernel->begin_streaming_session(config);
+  ASSERT_TRUE(begin.accepted) << (begin.error ? begin.error->message : "");
+
+  // Push a target far enough that the joint will travel for the
+  // entire ~600 ms sampling window even at full scale.
+  const double target = start_state.positions_rad[0] + 1.5;
+  StreamingTargetDTO command;
+  command.kind = StreamingInputMode::kJoint;
+  command.joint_names = {start_state.joint_names[0]};
+  command.joint_positions_rad = {target};
+  command.source_sequence = 1;
+
+  auto push = bundle_->kernel->push_streaming_target(begin.session_id, command);
+  ASSERT_TRUE(push.accepted) << (push.error ? push.error->message : "");
+
+  // Let the worker accelerate up to steady-state at scale=1.0
+  // (engine default a_cap = 2.0 rad/s², tick = 10 ms, so ramp from 0
+  // to 0.5 rad/s takes ~250 ms).
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+  // Window 1: scale=1.0 (steady-state). Sample for 200 ms.
+  constexpr auto kSampleWindow = std::chrono::milliseconds(200);
+  const auto p_before_full = bundle_->kernel->get_execution_snapshot()
+                                 .joint_positions_rad;
+  ASSERT_EQ(p_before_full.size(), start_state.positions_rad.size());
+  std::this_thread::sleep_for(kSampleWindow);
+  const auto p_after_full = bundle_->kernel->get_execution_snapshot()
+                                .joint_positions_rad;
+  ASSERT_EQ(p_after_full.size(), start_state.positions_rad.size());
+  const double delta_full = p_after_full[0] - p_before_full[0];
+
+  // Drop the runtime scale. Phase 1 expects this to take effect on
+  // the next tick — no preempt, no replan, just a per-tick atomic
+  // read by the worker.
+  bundle_->kernel->set_runtime_velocity_scale(0.05);
+
+  // The accel limiter (engine default 2 rad/s², 10 ms tick → 0.02
+  // rad/s velocity change per tick) takes ~250 ms to decelerate
+  // from 0.5 rad/s steady-state down to 0.025 rad/s (the new cap at
+  // scale=0.05 × 0.5 rad/s v_cap). Wait it out before sampling so
+  // the test characterizes the *new steady-state* velocity, not the
+  // mid-ramp transient.
+  std::this_thread::sleep_for(std::chrono::milliseconds(350));
+
+  // Window 2: scale=0.05 (steady-state). Sample for the same 200 ms.
+  const auto p_before_slow = bundle_->kernel->get_execution_snapshot()
+                                 .joint_positions_rad;
+  std::this_thread::sleep_for(kSampleWindow);
+  const auto p_after_slow = bundle_->kernel->get_execution_snapshot()
+                                .joint_positions_rad;
+  const double delta_slow = p_after_slow[0] - p_before_slow[0];
+
+  // At scale=0.05 with v_cap=0.5, steady-state velocity is
+  // 0.025 rad/s → 5 mrad over 200 ms. At scale=1.0, ~100 mrad over
+  // 200 ms. Asserting slow < full / 4 leaves headroom for any
+  // residual ramp time without papering over the runtime read.
+  EXPECT_GT(delta_full, 0.05)
+      << "session must make material progress at scale=1.0";
+  EXPECT_LT(delta_slow, delta_full / 4.0)
+      << "runtime scale change to 0.05 must throttle commanded "
+         "velocity; delta_full=" << delta_full
+      << " delta_slow=" << delta_slow;
+
+  auto end = bundle_->kernel->end_streaming_session(
+      begin.session_id, SoftStopStrategy::kSpringBack);
+  EXPECT_TRUE(end.accepted) << (end.error ? end.error->message : "");
+}
+
+TEST_F(NativeKernelTest, StreamingRuntimeVelocityScaleRejectsNonFinite) {
+  // ADR-0018 / K2-aligned: non-finite inputs must NOT
+  // propagate into the worker's atomic read. The kernel itself
+  // filters before forwarding to the backend; the backend's setter
+  // re-checks. Test confirms the in-flight session is unperturbed.
+  auto start_state = bundle_->context->get_current_state();
+  StreamingSessionConfigDTO config;
+  config.group_id = "arm";
+  config.joint_names = start_state.joint_names;
+  config.default_input_mode = StreamingInputMode::kJoint;
+  config.max_dispatch_rate_hz = 100.0;
+  config.velocity_scale = 0.5;
+
+  auto begin = bundle_->kernel->begin_streaming_session(config);
+  ASSERT_TRUE(begin.accepted) << (begin.error ? begin.error->message : "");
+
+  // NaN, +Inf, -Inf: each must be ignored. The kernel returns void,
+  // so we verify by sampling the session is still alive afterward.
+  bundle_->kernel->set_runtime_velocity_scale(
+      std::numeric_limits<double>::quiet_NaN());
+  bundle_->kernel->set_runtime_velocity_scale(
+      std::numeric_limits<double>::infinity());
+  bundle_->kernel->set_runtime_velocity_scale(
+      -std::numeric_limits<double>::infinity());
+
+  // Session is still in kStreaming and accepting pushes — the
+  // failing setter calls did not corrupt state.
+  EXPECT_EQ(bundle_->kernel->get_status().state, ExecutionState::kStreaming);
+  StreamingTargetDTO command;
+  command.kind = StreamingInputMode::kJoint;
+  command.joint_names = {start_state.joint_names[0]};
+  command.joint_positions_rad = {start_state.positions_rad[0] + 0.1};
+  command.source_sequence = 1;
+  auto push = bundle_->kernel->push_streaming_target(begin.session_id, command);
+  EXPECT_TRUE(push.accepted)
+      << "non-finite scale write must not poison subsequent pushes";
+
+  auto end = bundle_->kernel->end_streaming_session(
+      begin.session_id, SoftStopStrategy::kSpringBack);
+  EXPECT_TRUE(end.accepted) << (end.error ? end.error->message : "");
+}
+
+TEST_F(NativeKernelTest, RuntimeVelocityScaleZeroHoldsDiscreteTrajectoryTime) {
+  // ADR-0018: runtime scale 0 is a hold/freeze of trajectory progress, not a
+  // Stop. The native backend slews the applied scale smoothly, so this test
+  // waits for the deceleration ramp before asserting the hold is stable.
+  const auto start_state = bundle_->context->get_current_state();
+  ASSERT_FALSE(start_state.joint_names.empty());
+  ASSERT_EQ(start_state.joint_names.size(), start_state.positions_rad.size());
+
+  TrajectoryDTO trajectory;
+  trajectory.joint_names = start_state.joint_names;
+  TrajectoryWaypointDTO start_wp;
+  start_wp.time_from_start_s = 0.0;
+  start_wp.positions_rad = start_state.positions_rad;
+  trajectory.waypoints.push_back(start_wp);
+
+  auto target = start_state.positions_rad;
+  target[0] += 0.8;
+  TrajectoryWaypointDTO end_wp;
+  end_wp.time_from_start_s = 1.0;
+  end_wp.positions_rad = target;
+  trajectory.waypoints.push_back(end_wp);
+
+  bundle_->execution->set_runtime_velocity_scale(1.0);
+  auto handle = bundle_->execution->execute_trajectory(trajectory);
+  std::this_thread::sleep_for(std::chrono::milliseconds(250));
+  const auto moving = handle.get_snapshot().joint_positions_rad;
+  ASSERT_EQ(moving.size(), target.size());
+
+  bundle_->execution->set_runtime_velocity_scale(0.0);
+  std::this_thread::sleep_for(std::chrono::milliseconds(350));
+  const auto held_a = handle.get_snapshot().joint_positions_rad;
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  const auto held_b = handle.get_snapshot().joint_positions_rad;
+  ASSERT_EQ(held_a.size(), target.size());
+  ASSERT_EQ(held_b.size(), target.size());
+  EXPECT_NEAR(held_b[0], held_a[0], 0.02)
+      << "scale=0 must hold after the smooth deceleration ramp";
+
+  bundle_->execution->set_runtime_velocity_scale(1.0);
+  ASSERT_TRUE(handle.wait_for_completion(3'000'000'000LL));
+  const auto final = handle.get_snapshot();
+  EXPECT_EQ(final.state, ExecutionState::kCompleted);
+  ASSERT_EQ(final.joint_positions_rad.size(), target.size());
+  EXPECT_NEAR(final.joint_positions_rad[0], target[0], 1e-3);
 }
 
 TEST_F(NativeKernelTest, KernelExecuteWaitsForTimedBackendCompletion) {

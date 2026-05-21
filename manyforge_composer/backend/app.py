@@ -181,11 +181,10 @@ def create_app(
             hub.disconnect(ws)
 
     # Streaming-session WebSocket (ADR-0016).
-    # Consumes gizmo / joint-slider follow frames and forwards them to the
-    # kernel's streaming-session API. The first frame opens an intervention
-    # carrying a `track_target_action` BT leaf (which begins the kernel
-    # session); subsequent frames push targets directly; socket close ends
-    # the session with the configured soft-stop strategy.
+    # Consumes gizmo / joint-slider follow frames and forwards them directly
+    # to the kernel's streaming-session API. The first frame opens one kernel
+    # session; subsequent frames push ack-gated latest-wins targets; socket
+    # close ends the session with the configured soft-stop strategy.
     from .follow_target_ws import handle_follow_target_ws  # noqa: PLC0415
 
     @app.websocket("/ws/follow-target")

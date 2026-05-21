@@ -18,11 +18,28 @@ class ManualScheduler final : public IScheduler {
   ManualScheduler() : next_handle_(1) {}
 
   /// Schedule a callback to fire at the given deadline.
-  ScheduleHandle schedule(TimePoint deadline, std::function<void()> callback) override {
+  ///
+  /// `priority` is accepted for IScheduler conformance and stored for
+  /// inspection in tests but does not affect deadline ordering: the
+  /// manual scheduler is single-threaded by design and reports
+  /// callbacks via `advance_to`. Production schedulers split priority
+  /// across worker pools; see `SchedulerPriority`.
+  ScheduleHandle schedule(
+      TimePoint deadline, std::function<void()> callback,
+      SchedulerPriority priority = SchedulerPriority::Safety) override {
     std::lock_guard<std::mutex> lock(mutex_);
     ScheduleHandle handle = next_handle_++;
+    last_priority_ = priority;
     pending_.emplace(deadline, std::make_pair(handle, std::move(callback)));
     return handle;
+  }
+
+  /// Test-only: returns the priority passed to the most recent schedule()
+  /// call. Useful for asserting that production callers tag their
+  /// callbacks correctly.
+  SchedulerPriority last_priority() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return last_priority_;
   }
 
   /// Cancel a scheduled callback. No-op if already fired or invalid.
@@ -59,11 +76,12 @@ class ManualScheduler final : public IScheduler {
   }
 
  private:
-  std::mutex mutex_;
+  mutable std::mutex mutex_;
   /// Multimap from deadline to (handle, callback).
   /// Allows multiple callbacks at the same deadline; sorted by deadline.
   std::multimap<TimePoint, std::pair<ScheduleHandle, std::function<void()>>> pending_;
   uint64_t next_handle_;
+  SchedulerPriority last_priority_ = SchedulerPriority::Safety;
 };
 
 }  // namespace manyforge::core

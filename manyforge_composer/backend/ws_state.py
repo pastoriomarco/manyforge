@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     from .state import ComposerState
 
 logger = logging.getLogger(__name__)
+_WS_SEND_TIMEOUT_S = 0.25
 
 
 class StateHub:
@@ -38,10 +39,21 @@ class StateHub:
     
     async def broadcast(self, data: dict):
         dead = []
-        for ws in self._connections:
+        connections = list(self._connections)
+
+        async def _send(ws: WebSocket) -> WebSocket | None:
             try:
-                await ws.send_json(data)
+                await asyncio.wait_for(ws.send_json(data), timeout=_WS_SEND_TIMEOUT_S)
+                return None
             except Exception:
+                return ws
+
+        results = await asyncio.gather(
+            *(_send(ws) for ws in connections),
+            return_exceptions=False,
+        )
+        for ws in results:
+            if ws is not None:
                 dead.append(ws)
         for ws in dead:
             self.disconnect(ws)
@@ -78,6 +90,10 @@ class StateHub:
                     self._last_kernel_event_index
                 )
                 if native_kernel_events:
+                    if hasattr(self._state, "event_recorder"):
+                        self._state.event_recorder.record_native_kernel_events(
+                            native_kernel_events
+                        )
                     self._last_kernel_event_index = native_kernel_events[-1].get(
                         "event_index", self._last_kernel_event_index
                     )

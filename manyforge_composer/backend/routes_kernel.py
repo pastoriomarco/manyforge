@@ -92,6 +92,8 @@ def create_kernel_router(state: ComposerState) -> APIRouter:
             }
         state.cycle_manager.drain_kernel_events_now()
         events = state.cycle_manager.get_kernel_events_since(since)
+        if events and hasattr(state, "event_recorder"):
+            state.event_recorder.record_native_kernel_events(events)
         last_index = events[-1]["event_index"] if events else since
         return {
             "events": events,

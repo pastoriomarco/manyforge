@@ -25,7 +25,7 @@ for the commit(s) on this branch. See AGENTS.md and CONTRIBUTING.md.
 
 - [ ] PR targets `dev` (not `main`); topic branch name `feature/<x>`, `fix/<x>`, or `docs/<x>` if using one
 - [ ] Tests added or updated for the behavior change
-- [ ] `CHANGELOG.md` updated under `[Unreleased]` if user-visible
+- [ ] `CHANGELOG.md` updated under the upcoming release section if user-visible
 - [ ] `./scripts/ci/verify-version-sync.sh` passes locally
 - [ ] Bash files I touched pass `bash -n`
 - [ ] Frontend changes pass `cd manyforge_composer/frontend && npm run build`

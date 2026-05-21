@@ -17,6 +17,7 @@ import yaml
 
 from manyforge_behavior.kernel_client import MockKernelClient, SceneEditRequest
 from manyforge_behavior.cycle_manager import CycleState
+from manyforge_behavior.deployment import Deployment
 from manyforge_composer.backend.state import ComposerState
 from manyforge_composer.backend.app import create_app
 from manyforge_composer.backend.security import SecurityConfig
@@ -30,6 +31,7 @@ _PROGRAM_PATH = str(_REPO_ROOT / "manyforge_behavior" / "tests" / "fixtures" / "
 _DEPLOYMENT_PATH = str(_REPO_ROOT / "manyforge_behavior" / "tests" / "fixtures" / "ur5_roboplan.deployment.yaml")
 _EXAMPLE_PROGRAM_PATH = str(_REPO_ROOT / "examples" / "pick_and_place.program.yaml")
 _EXAMPLE_DEPLOYMENT_PATH = str(_REPO_ROOT / "examples" / "pick_and_place.deployment.yaml")
+_UR10E_ROBOTIQ_DEPLOYMENT_PATH = str(_REPO_ROOT / "examples" / "pick_and_place_ur10e_robotiq.deployment.yaml")
 _SEMANTIC_DEPLOYMENT_PATH = str(_REPO_ROOT / "examples" / "semantic_shape_pick.deployment.yaml")
 
 # Test security config: no auth, permissive filesystem roots for tmp_path access
@@ -539,6 +541,55 @@ def test_get_program_tree_preserves_modification_policy(client, tmp_path):
     assert move_node["modificationPolicy"]["runtime_override"] == "llm_allowed"
 
 
+def test_gripper_command_rejects_out_of_bounds_target(client, state):
+    state.deployment = Deployment(_UR10E_ROBOTIQ_DEPLOYMENT_PATH)
+    state.deployment_source_path = _UR10E_ROBOTIQ_DEPLOYMENT_PATH
+
+    response = client.post(
+        "/api/scene/gripper/command",
+        json={"gripperId": "primary", "targetPosition": 999.0},
+    )
+
+    assert response.status_code == 400
+    assert "outside limits" in response.json()["detail"]
+    assert state.kernel.gripper_command_count == 0
+
+
+def test_gripper_command_rejects_while_cycle_owns_execution(client, state):
+    state.deployment = Deployment(_UR10E_ROBOTIQ_DEPLOYMENT_PATH)
+    state.deployment_source_path = _UR10E_ROBOTIQ_DEPLOYMENT_PATH
+    state.cycle_manager = type(
+        "CycleManagerStub",
+        (),
+        {"state": CycleState.RUNNING},
+    )()
+
+    response = client.post(
+        "/api/scene/gripper/command",
+        json={"gripperId": "primary", "targetPosition": 0.1},
+    )
+
+    assert response.status_code == 409
+    assert "current cycle state is running" in response.json()["detail"]
+    assert state.kernel.gripper_command_count == 0
+
+
+def test_gripper_command_accepts_bounded_idle_target(client, state):
+    state.deployment = Deployment(_UR10E_ROBOTIQ_DEPLOYMENT_PATH)
+    state.deployment_source_path = _UR10E_ROBOTIQ_DEPLOYMENT_PATH
+
+    response = client.post(
+        "/api/scene/gripper/command",
+        json={"gripperId": "primary", "targetPosition": 0.1, "durationS": 0.0},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["accepted"] is True
+    assert state.kernel.gripper_command_count == 1
+    assert state.kernel.last_gripper_command_request is not None
+    assert state.kernel.last_gripper_command_request.target_position == pytest.approx(0.1)
+
+
 def test_runtime_override_apply_updates_effective_tree_but_not_saved_artifact(client, tmp_path):
     program_path = _write_program_with_runtime_policy(tmp_path)
     client.post("/api/program/load", json={"path": program_path})
@@ -863,6 +914,38 @@ def test_load_program_with_force_discard_overrides(client, tmp_path):
 
     status = client.get("/api/program/runtime-overrides").json()
     assert status["activeCount"] == 0
+
+
+def test_load_program_validates_streaming_joint_limits(client, tmp_path):
+    deployment_data = yaml.safe_load(Path(_DEPLOYMENT_PATH).read_text(encoding="utf-8"))
+    deployment_data["robot_config"]["streaming_joint_limits"] = {
+        "typo_not_a_joint": {"max_velocity_rad_s": 0.2}
+    }
+    deployment_path = tmp_path / "invalid_streaming_limits.deployment.yaml"
+    deployment_path.write_text(yaml.safe_dump(deployment_data), encoding="utf-8")
+
+    response = client.post(
+        "/api/program/load",
+        json={"path": _PROGRAM_PATH, "deploymentPath": str(deployment_path)},
+    )
+
+    assert response.status_code == 400
+    assert "streaming_joint_limits references unknown" in response.json()["detail"]
+    assert "typo_not_a_joint" in response.json()["detail"]
+
+
+def test_load_program_clears_viewer_frame_overrides(client, state):
+    state.set_frame_visibility("tool0", False)
+    state.set_object_frame_visibility("box", True)
+
+    assert state.get_frame_visibility("tool0", default=True) is False
+    assert state.get_object_frame_visibility("box") is True
+
+    response = client.post("/api/program/load", json={"path": _PROGRAM_PATH})
+
+    assert response.status_code == 200
+    assert state.get_frame_visibility("tool0", default=True) is True
+    assert state.get_object_frame_visibility("box") is False
 
 
 def test_update_tree_rejects_when_overrides_exist(client, tmp_path):
@@ -2324,7 +2407,11 @@ def test_delegated_recovery_request_created_on_node_failure(tmp_path):
         assert pending.status_code == 200
         data = pending.json()
         assert data["triggerNodeInstance"] == "failing_delegate_check"
-        assert data["triggerReason"] == "node_failure"
+        # When no identifying kernel event is in the window, the
+        # delegated-recovery fallback emits the canonical `execute_failed`
+        # per spec/460 §6.2.2; the legacy `node_failure` alias is kept
+        # only for serialised-trace round-trip.
+        assert data["triggerReason"] == "execute_failed"
         assert data["delegatePolicy"] == "llm_allowed"
         assert data["allowedAuthoritySources"] == ["human", "llm"]
         assert "runtime_override" in data["allowedActions"]

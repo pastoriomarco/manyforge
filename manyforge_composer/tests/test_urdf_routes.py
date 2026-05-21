@@ -132,3 +132,215 @@ def test_urdf_manifest_uses_content_model_key_for_mesh_cache(
     assert legacy_current.status_code in (200, 404)
     if legacy_current.status_code == 200:
         assert legacy_current.headers["cache-control"] == "no-store"
+
+
+# ----------------------------------------------------------------------
+# Gripper visualization resolution (ADR-0018 unreachable-ghost fallback).
+# The Move-To unreachable branch needs the first downstream link with
+# visuals reachable from `mount_frame`, plus the static SE(3) from
+# `tcp_frame` to that link. This is the canonical UR10e+Robotiq case:
+# tcp_frame is a virtual grasp_frame (no visuals); mount_frame is
+# tool0 (also no visuals); the gripper root is robotiq_base_link.
+# ----------------------------------------------------------------------
+
+
+def _make_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_urdf_cls) -> ComposerState:
+    urdf_path = tmp_path / "robot.urdf"
+    urdf_path.write_text("fixture")
+    monkeypatch.setattr(routes_urdf, "default_package_paths", lambda: [])
+    monkeypatch.setattr(
+        routes_urdf,
+        "resolve_robot_model",
+        lambda **kwargs: SimpleNamespace(urdf_path=str(kwargs["urdf_path"]), package_paths=[]),
+    )
+    monkeypatch.setitem(sys.modules, "yourdfpy", SimpleNamespace(URDF=fake_urdf_cls))
+    routes_urdf._urdf_cache.clear()  # type: ignore[attr-defined]
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=MockKernelClient())
+    state.deployment_source_path = str(tmp_path / "deployment.yaml")
+    state.deployment = SimpleNamespace(
+        robot_config=SimpleNamespace(
+            robot_id="ur10e",
+            group_id="arm",
+            urdf_path=str(urdf_path),
+            srdf_path=None,
+            package_paths=[],
+        )
+    )
+    return state
+
+
+class _FakeJoint:
+    def __init__(self, name: str, parent: str, child: str, joint_type: str = "fixed") -> None:
+        self.name = name
+        self.parent = parent
+        self.child = child
+        self.type = joint_type
+        self.axis = [1.0, 0.0, 0.0]
+        self.origin = None
+        self.limit = None
+        self.mimic = None
+
+
+def test_resolve_gripper_visualization_for_virtual_tcp_chain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """UR10e+Robotiq canonical case: mount=tool0 (no visuals),
+    tcp=grasp_frame (no visuals), gripper-root=robotiq_base_link (has visuals)."""
+    import numpy as np  # local — pytest will skip the test if missing
+
+    class FakeUrdf:
+        base_link = "base_link"
+
+        def __init__(self) -> None:
+            self.link_map = {
+                "base_link": _FakeLink(),
+                "tool0": _FakeLink(),  # mount, no visuals
+                "robotiq_base_link": _FakeLink([_FakeVisual("dummy_mesh")]),
+                "grasp_frame": _FakeLink(),  # tcp, no visuals
+                "left_outer_knuckle": _FakeLink([_FakeVisual("knuckle_mesh")]),
+            }
+            self.joint_map = {
+                "tool0_to_robotiq": _FakeJoint("tool0_to_robotiq", "tool0", "robotiq_base_link"),
+                "robotiq_to_grasp": _FakeJoint("robotiq_to_grasp", "robotiq_base_link", "grasp_frame"),
+                "finger_joint": _FakeJoint(
+                    "finger_joint", "robotiq_base_link", "left_outer_knuckle", "revolute"
+                ),
+            }
+
+        @staticmethod
+        def load(urdf_path: str, **_: object) -> "FakeUrdf":
+            return FakeUrdf()
+
+        def get_transform(self, frame_to: str, frame_from: str):
+            # grasp_frame is a fixed child of robotiq_base_link with
+            # identity origin in this fixture; transforms between
+            # the two are identity.
+            return np.eye(4)
+
+    state = _make_state(tmp_path, monkeypatch, FakeUrdf)
+    result = routes_urdf.resolve_gripper_visualization(
+        state, mount_frame="tool0", tcp_frame="grasp_frame",
+        srdf_gripper_joint_names=("finger_joint",),
+    )
+    assert result is not None
+    assert result.gripper_root_link == "robotiq_base_link"
+    # Identity transform within tolerance — Shepperd's-method extraction
+    # of an identity rotation returns (0, 0, 0, 1).
+    assert result.tcp_to_root_position_m == (0.0, 0.0, 0.0)
+    qx, qy, qz, qw = result.tcp_to_root_orientation_xyzw
+    assert abs(qx) < 1e-9 and abs(qy) < 1e-9 and abs(qz) < 1e-9
+    assert abs(qw - 1.0) < 1e-9
+    # The full subtree must include the root + descendants reachable
+    # via the URDF joint graph (grasp_frame, left_outer_knuckle here).
+    subtree_names = {link.name for link in result.subtree_links}
+    assert "robotiq_base_link" in subtree_names
+    assert "left_outer_knuckle" in subtree_names
+    # The root itself appears with identity transform.
+    root_entry = next(
+        link for link in result.subtree_links if link.name == "robotiq_base_link"
+    )
+    assert root_entry.position_m == (0.0, 0.0, 0.0)
+    assert root_entry.orientation_xyzw == (0.0, 0.0, 0.0, 1.0)
+
+
+def test_resolve_gripper_visualization_returns_none_when_no_visual_descendant(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No downstream link from mount_frame has visuals — should
+    return None so the frontend falls through to the floor marker."""
+
+    class FakeUrdf:
+        base_link = "base_link"
+
+        def __init__(self) -> None:
+            self.link_map = {
+                "base_link": _FakeLink(),
+                "tool0": _FakeLink(),
+                "phantom_a": _FakeLink(),  # no visuals
+                "phantom_b": _FakeLink(),  # no visuals
+            }
+            self.joint_map = {
+                "tool0_to_phantom_a": _FakeJoint("tool0_to_phantom_a", "tool0", "phantom_a"),
+                "phantom_a_to_phantom_b": _FakeJoint("phantom_a_to_phantom_b", "phantom_a", "phantom_b"),
+            }
+
+        @staticmethod
+        def load(urdf_path: str, **_: object) -> "FakeUrdf":
+            return FakeUrdf()
+
+        def get_transform(self, *args, **kwargs):  # pragma: no cover - never reached
+            return None
+
+    state = _make_state(tmp_path, monkeypatch, FakeUrdf)
+    result = routes_urdf.resolve_gripper_visualization(
+        state, mount_frame="tool0", tcp_frame="phantom_b",
+    )
+    assert result is None
+
+
+def test_resolve_gripper_visualization_returns_none_when_mount_frame_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Mount frame is not in the URDF — fail-closed."""
+
+    class FakeUrdf:
+        base_link = "base_link"
+
+        def __init__(self) -> None:
+            self.link_map = {"base_link": _FakeLink()}
+            self.joint_map = {}
+
+        @staticmethod
+        def load(urdf_path: str, **_: object) -> "FakeUrdf":
+            return FakeUrdf()
+
+        def get_transform(self, *args, **kwargs):  # pragma: no cover - never reached
+            return None
+
+    state = _make_state(tmp_path, monkeypatch, FakeUrdf)
+    result = routes_urdf.resolve_gripper_visualization(
+        state, mount_frame="not_a_link", tcp_frame="base_link",
+    )
+    assert result is None
+
+
+def test_resolve_gripper_visualization_srdf_tiebreak_prefers_gripper_subtree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """mount_frame has two children A and B; only B's subtree contains
+    the SRDF gripper joint. Resolver MUST prefer B's subtree even if
+    A's first-child happens to have visuals."""
+    import numpy as np
+
+    class FakeUrdf:
+        base_link = "base_link"
+
+        def __init__(self) -> None:
+            self.link_map = {
+                "tool0": _FakeLink(),
+                "decoy_with_visuals": _FakeLink([_FakeVisual("decoy")]),
+                "gripper_root": _FakeLink([_FakeVisual("gripper_mesh")]),
+                "gripper_finger": _FakeLink([_FakeVisual("finger_mesh")]),
+            }
+            self.joint_map = {
+                "tool0_to_decoy": _FakeJoint("tool0_to_decoy", "tool0", "decoy_with_visuals"),
+                "tool0_to_gripper": _FakeJoint("tool0_to_gripper", "tool0", "gripper_root"),
+                "finger_joint": _FakeJoint(
+                    "finger_joint", "gripper_root", "gripper_finger", "revolute"
+                ),
+            }
+
+        @staticmethod
+        def load(urdf_path: str, **_: object) -> "FakeUrdf":
+            return FakeUrdf()
+
+        def get_transform(self, frame_to: str, frame_from: str):
+            return np.eye(4)
+
+    state = _make_state(tmp_path, monkeypatch, FakeUrdf)
+    result = routes_urdf.resolve_gripper_visualization(
+        state, mount_frame="tool0", tcp_frame="gripper_root",
+        srdf_gripper_joint_names=("finger_joint",),
+    )
+    assert result is not None
+    assert result.gripper_root_link == "gripper_root"

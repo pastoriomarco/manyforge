@@ -78,6 +78,8 @@ whether you're the maintainer or a forked contributor:
 - C++ RoboPlan: `./scripts/test-all.sh roboplan`
 - Python: `./scripts/test-all.sh python`
 - Frontend: `cd manyforge_composer/frontend && npm run build`
+- ROS adapter contracts: `docker compose --profile ros run --rm ros-jazzy ./scripts/test-ros.sh`
+- Full ros2_control contracts: `docker compose --profile ros-full run --rm ros-jazzy-full ./scripts/test-ros-full.sh`
 - All bash: `bash -n scripts/*.sh scripts/lib/*.sh`
 - Version sync: `./scripts/ci/verify-version-sync.sh`
 
@@ -123,12 +125,14 @@ Only the maintainer has push access to upstream `dev`. The flow is:
 Releases happen when `dev` has accumulated enough work to warrant a
 version bump. Maintainer flow:
 
-1. Bump `VERSION` (semver) and add a section to `CHANGELOG.md` on
-   `dev`.
+1. For the first public release, finalize the existing `0.1.0 - Upcoming`
+   section in `CHANGELOG.md`. For later releases, bump `VERSION` (SemVer) and
+   add a new changelog section on `dev`.
 2. Confirm CI is green on `dev`.
 3. **Squash-merge `dev → main`** — one commit per release, as
    manymove does. The squash message is the release notes.
-4. Tag the merge commit: `git tag v0.1.1 && git push --tags`.
+4. Tag the merge commit, for example `git tag v0.1.0 && git push --tags`
+   for the first public tag.
 5. (Optional) Draft a GitHub release from the tag.
 
 If you spot something that should go in the next release, mention it
@@ -228,7 +232,8 @@ Stop and ask the operator. Specifically:
 - `bash -n` clean on any bash files touched.
 - `npx tsc --noEmit -p tsconfig.app.json` clean for frontend changes.
 - Relevant pytest / ctest target passes for code changes.
-- CHANGELOG.md updated under `[Unreleased]` for user-visible changes.
+- CHANGELOG.md updated under the upcoming release section for user-visible
+  changes.
 - AGENTS.md / CONTRIBUTING.md / README updated only when the durable
   workflow changes — never for transient incident notes.
 - **Launcher behavior changed?** If your change touches

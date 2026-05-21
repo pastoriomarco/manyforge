@@ -196,7 +196,90 @@ def _validate_deployment_against_catalogs(
     deployment.validate_assistant_modes(state.catalog, state.skill_catalog)
 
 
-def _deployment_to_full_response(deployment: Deployment, source_path: str) -> dict:
+def _gripper_to_serialized_dict(
+    state: ComposerState | None,
+    gripper_id: str,
+    gripper,
+) -> dict:
+    """Serialize one gripper config for the API.
+
+    When ``state`` is provided AND a URDF is loaded, also resolve the
+    auto-discovered visualization root + tcp→root transform (used by
+    the Move-To unreachable-ghost ADR-0018 path — see
+    `routes_urdf.resolve_gripper_visualization`). Pure read-only; on
+    any failure the visualization field is simply omitted (None),
+    which the frontend handles via its floor-fallback marker.
+    """
+    payload: dict = {
+        "commandMode": gripper.command_mode,
+        "groupId": gripper.group_id,
+        "jointName": gripper.joint_name,
+        "motionTimeS": gripper.motion_time_s,
+        "srdfPresets": dict(gripper.srdf_presets),
+        "description": gripper.description,
+        "touchLinks": list(gripper.touch_links),
+        "mountFrame": gripper.mount_frame,
+        "attachFrame": gripper.attach_frame,
+        "tcpFrame": gripper.tcp_frame,
+        "auxiliaryFrames": list(gripper.auxiliary_frames),
+    }
+    if state is None:
+        return payload
+    # Defer the import to avoid a circular dep at module load.
+    try:
+        from .routes_urdf import resolve_gripper_visualization
+    except Exception:
+        logger.debug(
+            "routes_urdf not importable; gripper visualization disabled",
+            exc_info=True,
+        )
+        return payload
+    # SRDF gripper joint names tiebreak: prefer the subtree that
+    # contains the gripper's SRDF group joints when mount_frame has
+    # multiple children. For Robotiq with one declared finger joint
+    # this gives exactly the expected attachment; for arms with no
+    # SRDF gripper group it falls back to BFS-first.
+    srdf_gripper_joints: tuple[str, ...] = ()
+    joint_name = (gripper.joint_name or "").strip()
+    if joint_name:
+        srdf_gripper_joints = (joint_name,)
+    try:
+        resolution = resolve_gripper_visualization(
+            state,
+            mount_frame=gripper.mount_frame,
+            tcp_frame=gripper.tcp_frame,
+            srdf_gripper_joint_names=srdf_gripper_joints,
+        )
+    except Exception:
+        logger.debug(
+            "Gripper visualization resolution failed for %s", gripper_id,
+            exc_info=True,
+        )
+        resolution = None
+    if resolution is not None:
+        payload["visualization"] = {
+            "gripperRootLink": resolution.gripper_root_link,
+            "tcpToRootPositionM": list(resolution.tcp_to_root_position_m),
+            "tcpToRootOrientationXyzw": list(
+                resolution.tcp_to_root_orientation_xyzw
+            ),
+            "subtreeLinks": [
+                {
+                    "name": link.name,
+                    "positionM": list(link.position_m),
+                    "orientationXyzw": list(link.orientation_xyzw),
+                }
+                for link in resolution.subtree_links
+            ],
+        }
+    return payload
+
+
+def _deployment_to_full_response(
+    deployment: Deployment,
+    source_path: str,
+    state: ComposerState | None = None,
+) -> dict:
     return FullDeploymentResponse(
         apiVersion=deployment.api_version,
         schemaVersion=deployment.schema_version,
@@ -219,19 +302,7 @@ def _deployment_to_full_response(deployment: Deployment, source_path: str) -> di
             },
         ),
         grippers={
-            gripper_id: {
-                "commandMode": gripper.command_mode,
-                "groupId": gripper.group_id,
-                "jointName": gripper.joint_name,
-                "motionTimeS": gripper.motion_time_s,
-                "srdfPresets": dict(gripper.srdf_presets),
-                "description": gripper.description,
-                "touchLinks": list(gripper.touch_links),
-                "mountFrame": gripper.mount_frame,
-                "attachFrame": gripper.attach_frame,
-                "tcpFrame": gripper.tcp_frame,
-                "auxiliaryFrames": list(gripper.auxiliary_frames),
-            }
+            gripper_id: _gripper_to_serialized_dict(state, gripper_id, gripper)
             for gripper_id, gripper in deployment.grippers.items()
         },
         adapters={
@@ -838,23 +909,11 @@ def create_program_router(state: ComposerState) -> APIRouter:
                 },
             ),
             grippers={
-                gripper_id: {
-                    "commandMode": gripper.command_mode,
-                    "groupId": gripper.group_id,
-                    "jointName": gripper.joint_name,
-                    "motionTimeS": gripper.motion_time_s,
-                    "srdfPresets": dict(gripper.srdf_presets),
-                    "description": gripper.description,
-                    "touchLinks": list(gripper.touch_links),
-                    "mountFrame": gripper.mount_frame,
-                    "attachFrame": gripper.attach_frame,
-                    "tcpFrame": gripper.tcp_frame,
-                    "auxiliaryFrames": list(gripper.auxiliary_frames),
-                }
+                gripper_id: _gripper_to_serialized_dict(state, gripper_id, gripper)
                 for gripper_id, gripper in deployment.grippers.items()
             },
         ).model_dump(by_alias=True)
-    
+
     @router.get("/deployment", response_model=DeploymentResponse, response_model_by_alias=True)
     def get_deployment() -> dict:
         """Get the currently loaded deployment."""
@@ -883,19 +942,7 @@ def create_program_router(state: ComposerState) -> APIRouter:
                 },
             ),
             grippers={
-                gripper_id: {
-                    "commandMode": gripper.command_mode,
-                    "groupId": gripper.group_id,
-                    "jointName": gripper.joint_name,
-                    "motionTimeS": gripper.motion_time_s,
-                    "srdfPresets": dict(gripper.srdf_presets),
-                    "description": gripper.description,
-                    "touchLinks": list(gripper.touch_links),
-                    "mountFrame": gripper.mount_frame,
-                    "attachFrame": gripper.attach_frame,
-                    "tcpFrame": gripper.tcp_frame,
-                    "auxiliaryFrames": list(gripper.auxiliary_frames),
-                }
+                gripper_id: _gripper_to_serialized_dict(state, gripper_id, gripper)
                 for gripper_id, gripper in deployment.grippers.items()
             },
         ).model_dump(by_alias=True)
@@ -905,7 +952,9 @@ def create_program_router(state: ComposerState) -> APIRouter:
         """Get the currently loaded full deployment artifact."""
         if state.deployment is None:
             raise HTTPException(status_code=404, detail="No deployment loaded")
-        return _deployment_to_full_response(state.deployment, state.deployment_source_path)
+        return _deployment_to_full_response(
+            state.deployment, state.deployment_source_path, state=state,
+        )
 
     @router.get("/deployment/saved/full", response_model=FullDeploymentResponse, response_model_by_alias=True)
     def get_saved_full_deployment() -> dict:
@@ -917,7 +966,12 @@ def create_program_router(state: ComposerState) -> APIRouter:
         except Exception as e:
             logger.error("Failed to read saved deployment: %s", e)
             raise HTTPException(status_code=500, detail="Failed to read saved deployment")
-        return _deployment_to_full_response(saved_deployment, state.deployment_source_path)
+        # Resolve visualization against the LOADED URDF (state-side),
+        # not from the saved-on-disk deployment: the URDF cache key is
+        # the runtime URDF path, and the saved deployment shares it.
+        return _deployment_to_full_response(
+            saved_deployment, state.deployment_source_path, state=state,
+        )
 
     @router.put("/program/tree")
     def update_program_tree(request: UpdateTreeRequest) -> dict:

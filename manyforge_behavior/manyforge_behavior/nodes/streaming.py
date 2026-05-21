@@ -78,6 +78,7 @@ class TrackTargetAction(py_trees.behaviour.Behaviour):
         self._kernel: Optional[KernelClient] = None
         self._session_id: int = 0
         self._begin_error: Optional[str] = None
+        self._end_error: Optional[str] = None
         self._started_at: Optional[float] = None
         self._terminated_externally: bool = False
 
@@ -141,6 +142,7 @@ class TrackTargetAction(py_trees.behaviour.Behaviour):
 
     def initialise(self) -> None:
         self._begin_error = None
+        self._end_error = None
         self._terminated_externally = False
         kernel = self._resolve_kernel()
         if kernel is None:
@@ -189,8 +191,12 @@ class TrackTargetAction(py_trees.behaviour.Behaviour):
             and self._started_at is not None
             and (time.monotonic() - self._started_at) > max_duration
         ):
-            self._end_session(reason="max_session_duration exceeded")
-            return py_trees.common.Status.SUCCESS
+            if self._end_session(reason="max_session_duration exceeded"):
+                return py_trees.common.Status.SUCCESS
+            self.feedback_message = self._end_error or (
+                "failed to end streaming session"
+            )
+            return py_trees.common.Status.FAILURE
 
         # Reflect the kernel's actual state. If the kernel has left
         # kStreaming (operator hit Stop / Reset, or the backend faulted),
@@ -234,16 +240,28 @@ class TrackTargetAction(py_trees.behaviour.Behaviour):
         except (AttributeError, KeyError):
             pass
 
-    def _end_session(self, reason: str) -> None:
+    def _end_session(self, reason: str) -> bool:
         kernel = self._resolve_kernel()
         if kernel is None or self._session_id == 0:
-            return
+            return True
         strategy = str(
             self._params.get("soft_stop_strategy", "spring_back")
         )
         try:
-            kernel.end_streaming_session(self._session_id, strategy)
-        except Exception:  # pragma: no cover — defensive
-            pass
+            result = kernel.end_streaming_session(self._session_id, strategy)
+        except Exception as exc:  # pragma: no cover — defensive
+            self._end_error = (
+                f"end_streaming_session raised during {reason}: {exc}"
+            )
+            self.feedback_message = self._end_error
+            return False
+        if not result.accepted:
+            self._end_error = result.error or (
+                f"kernel rejected end_streaming_session during {reason}"
+            )
+            self.feedback_message = self._end_error
+            return False
         self._session_id = 0
         self._started_at = None
+        self._end_error = None
+        return True

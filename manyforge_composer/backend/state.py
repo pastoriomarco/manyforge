@@ -27,6 +27,8 @@ from .event_recorder import EventRecorder
 from .security import normalize_allowed_roots
 
 logger = logging.getLogger(__name__)
+_MAX_ASSISTANT_REQUEST_RECORDS = 200
+_MAX_ASSISTANT_PROPOSAL_RECORDS = 500
 
 
 def _normalize_scene_snapshot_base_url(value: str, *, field_name: str) -> str:
@@ -220,6 +222,62 @@ class ComposerState:
             strict=True,
         )
 
+    def _prune_assistant_requests_locked(self) -> None:
+        if len(self._assistant_requests) <= _MAX_ASSISTANT_REQUEST_RECORDS:
+            return
+        removable = sorted(
+            (
+                record
+                for record in self._assistant_requests.values()
+                if record.status not in {"running", "cancel_requested"}
+            ),
+            key=lambda record: (record.updated_at_ns, record.request_id),
+        )
+        for record in removable:
+            if len(self._assistant_requests) <= _MAX_ASSISTANT_REQUEST_RECORDS:
+                break
+            self._assistant_requests.pop(record.request_id, None)
+            for principal, request_id in list(self._assistant_principal_bindings.items()):
+                if request_id == record.request_id:
+                    self._assistant_principal_bindings.pop(principal, None)
+        if len(self._assistant_failure_counts) > _MAX_ASSISTANT_REQUEST_RECORDS:
+            active_conversations = {
+                record.conversation_id
+                for record in self._assistant_requests.values()
+                if record.status in {"running", "cancel_requested"}
+            }
+            for conversation_id in list(self._assistant_failure_counts.keys()):
+                if conversation_id not in active_conversations:
+                    self._assistant_failure_counts.pop(conversation_id, None)
+                if len(self._assistant_failure_counts) <= _MAX_ASSISTANT_REQUEST_RECORDS:
+                    break
+
+    def _prune_assistant_proposals_locked(self) -> None:
+        if len(self._assistant_proposals) <= _MAX_ASSISTANT_PROPOSAL_RECORDS:
+            return
+        removable = sorted(
+            (
+                record
+                for record in self._assistant_proposals.values()
+                if record.lifecycle_status != "staged"
+            ),
+            key=lambda record: (record.updated_at_ns, record.proposal_id),
+        )
+        for record in removable:
+            if len(self._assistant_proposals) <= _MAX_ASSISTANT_PROPOSAL_RECORDS:
+                break
+            self._assistant_proposals.pop(record.proposal_id, None)
+        if len(self._assistant_proposals) <= _MAX_ASSISTANT_PROPOSAL_RECORDS:
+            return
+        staged = sorted(
+            self._assistant_proposals.values(),
+            key=lambda record: (record.created_at_ns, record.proposal_id),
+        )
+        for record in staged:
+            if len(self._assistant_proposals) <= _MAX_ASSISTANT_PROPOSAL_RECORDS:
+                break
+            self._assistant_proposals.pop(record.proposal_id, None)
+
     def bump_assistant_failure(self, conversation_id: str) -> int:
         """Increment and return the consecutive-failure counter for a conversation.
 
@@ -310,6 +368,7 @@ class ComposerState:
         )
         with self._assistant_request_lock:
             self._assistant_requests[request_id] = record
+            self._prune_assistant_requests_locked()
         return record
 
     def finish_assistant_request(
@@ -336,6 +395,7 @@ class ComposerState:
             record.tool_call_count = tool_call_count
             record.updated_at_ns = now_ns
             record.finished_at_ns = now_ns
+            self._prune_assistant_requests_locked()
             return record
 
     def bind_principal_to_request(
@@ -484,6 +544,7 @@ class ComposerState:
                 )
                 self._assistant_proposals[proposal_id] = record
                 staged.append(record)
+            self._prune_assistant_proposals_locked()
         return staged
 
     def list_assistant_proposals(
@@ -1576,25 +1637,40 @@ class ComposerState:
         if self.cycle_manager is not None:
             self.cycle_manager.reset()
 
-        # Load deployment first (if provided)
+        # Load deployment first (if provided), but do not publish the new
+        # deployment/kernel into session state until every cross-check below
+        # has passed. A failed load must leave the previous runtime intact.
         scene_snapshot_provider = self._resolve_scene_snapshot_provider()
         deployment = self.deployment
+        deployment_source_path = self.deployment_source_path
         if deployment_path:
             deployment = Deployment(deployment_path)
             deployment.validate_assistant_modes(self.catalog, self.skill_catalog)
-            self.deployment = deployment
-            self.deployment_source_path = deployment_path
+            deployment_source_path = deployment_path
         elif deployment is not None:
             deployment.validate_assistant_modes(self.catalog, self.skill_catalog)
 
+        kernel = self._kernel
+        kernel_bundle = self.kernel_bundle
         if deployment is not None and self._kernel_factory is not None:
-            self._kernel, self.kernel_bundle = self._kernel_factory(deployment)
+            kernel, kernel_bundle = self._kernel_factory(deployment)
+
+        # Spec/430 §3.2 cross-validation requires the bound robot's drivable
+        # joint list. Run it for both /api/session/apply and /api/program/load
+        # so typo'd per-joint streaming caps fail at load time, not on first jog.
+        if deployment is not None and kernel is not None:
+            try:
+                drivable_joints = kernel.get_joint_names()
+            except Exception:
+                drivable_joints = []
+            if drivable_joints:
+                deployment.validate_streaming_joint_limits_against(drivable_joints)
 
         # Create runner
         runner = OrchestratorRunner(
             catalog_path=self._catalog_path,
             program_path=program_path,
-            kernel=self._kernel,
+            kernel=kernel,
             deployment_path=deployment_path,
             deployment=deployment,
             skill_catalog=self.skill_catalog,
@@ -1607,9 +1683,17 @@ class ComposerState:
         self.program = runner.program
         self._effective_program = runner.program
         self.program_source_path = program_path
+        self.deployment = deployment
+        self.deployment_source_path = deployment_source_path
+        self._kernel = kernel
+        self.kernel_bundle = kernel_bundle
         self._update_program_tree_hash()
         self._program_session_generation += 1
         self._clear_published_scene_snapshots()
+        with self._scene_viewer_lock:
+            self._hidden_frames.clear()
+            self._explicit_visible_frames.clear()
+            self._visible_object_frames.clear()
         self.cycle_manager = CycleManager(runner, self._kernel)
         self._bind_cycle_manager_callbacks()
         if not defer_initial_runtime_reset:

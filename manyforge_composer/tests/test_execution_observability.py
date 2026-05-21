@@ -250,7 +250,28 @@ def test_infra_heartbeat_reports_kernel_and_archive_status(tmp_path):
         assert heartbeat["components"]["kernel"]["state"] == "idle"
         archive = heartbeat["components"]["failure_archive"]
         assert archive["enabled"] is True
+        assert archive["status"] == "healthy"
         assert archive["path"].endswith("failure-archives")
+
+
+def test_infra_heartbeat_degrades_when_failure_archives_drop(tmp_path):
+    state = ComposerState(
+        catalog_path=_CATALOG_PATH,
+        kernel=MockKernelClient(),
+        trace_dir=str(tmp_path),
+    )
+    state.event_recorder._failure_archive_dropped = 1
+    app = create_app(state)
+
+    with TestClient(app) as client:
+        response = client.get("/api/infra/heartbeat")
+        assert response.status_code == 200
+        heartbeat = response.json()
+
+        assert heartbeat["status"] == "degraded"
+        archive = heartbeat["components"]["failure_archive"]
+        assert archive["status"] == "degraded"
+        assert archive["dropped_archives"] == 1
 
 
 def test_execution_digest_and_history_include_pending_interrupt():

@@ -55,7 +55,15 @@ def create_cycle_router(state: ComposerState) -> APIRouter:
             except RuntimeError as exc:
                 raise HTTPException(status_code=409, detail=str(exc))
         prev = state.cycle_manager.state.value
-        state.cycle_manager.run()
+        try:
+            state.cycle_manager.run()
+        except RuntimeError as exc:
+            # Cycle-manager Run-side auto-ack refusals (e.g. "Cannot
+            # auto-acknowledge kernel INTERVENTION_REQUIRED on Run:
+            # intervention_session_running.") surface as RuntimeError.
+            # Translate to a structured 409 so clients see a clean
+            # conflict rather than a generic 500.
+            raise HTTPException(status_code=409, detail=str(exc))
         logger.info("Cycle state: %s → %s", prev, state.cycle_manager.state.value)
         return {"state": state.cycle_manager.state.value}
 

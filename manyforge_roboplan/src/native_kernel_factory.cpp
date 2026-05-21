@@ -28,10 +28,14 @@ void KernelEventCollector::subscribe(core::ExecutionKernel& kernel) {
 }
 
 void KernelEventCollector::unsubscribe(core::ExecutionKernel& kernel) {
-  std::lock_guard<std::mutex> lock(mutex_);
-  if (!subscribed_) return;
-  kernel.unsubscribe_events(subscription_);
-  subscribed_ = false;
+  core::SubscriptionHandle subscription{0};
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!subscribed_) return;
+    subscription = subscription_;
+    subscribed_ = false;
+  }
+  kernel.unsubscribe_events(subscription);
 }
 
 std::vector<core::KernelEvent> KernelEventCollector::drain() {
@@ -72,67 +76,107 @@ core::TimePoint steady_now_ns() {
 
 }  // namespace
 
-SimpleScheduler::SimpleScheduler() = default;
+SimpleScheduler::SimpleScheduler() {
+  safety_worker_.owner = this;
+  monitoring_worker_.owner = this;
+}
 
 SimpleScheduler::~SimpleScheduler() {
-  if (worker_thread_.joinable()) {
-    worker_thread_.request_stop();
-    cv_.notify_all();
+  for (Worker* w : {&safety_worker_, &monitoring_worker_}) {
+    if (w->thread.joinable()) {
+      w->thread.request_stop();
+      w->cv.notify_all();
+    }
   }
 }
 
-void SimpleScheduler::ensure_worker_started_locked() {
-  if (worker_thread_.joinable()) {
+void SimpleScheduler::Worker::ensure_started_locked(Worker* self) {
+  if (thread.joinable()) {
     return;
   }
-  worker_thread_ = std::jthread([this](std::stop_token st) { worker_loop(st); });
+  thread = std::jthread([self](std::stop_token st) { self->worker_loop(st); });
+}
+
+SimpleScheduler::Worker& SimpleScheduler::worker_for(
+    core::SchedulerPriority priority) {
+  switch (priority) {
+    case core::SchedulerPriority::Monitoring:
+      return monitoring_worker_;
+    case core::SchedulerPriority::Safety:
+    default:
+      return safety_worker_;
+  }
 }
 
 core::ScheduleHandle SimpleScheduler::schedule(
-    core::TimePoint deadline, std::function<void()> callback) {
+    core::TimePoint deadline, std::function<void()> callback,
+    core::SchedulerPriority priority) {
   auto handle = next_handle_.fetch_add(1);
+  Worker& w = worker_for(priority);
   {
-    std::lock_guard<std::mutex> lock(mutex_);
-    ensure_worker_started_locked();
-    tasks_.emplace(handle, ScheduledTask{deadline, std::move(callback)});
+    std::lock_guard<std::mutex> registry_lock(registry_mutex_);
+    handle_to_priority_[handle] = priority;
   }
-  cv_.notify_all();
+  {
+    std::lock_guard<std::mutex> lock(w.mutex);
+    w.ensure_started_locked(&w);
+    w.tasks.emplace(handle, ScheduledTask{deadline, std::move(callback)});
+  }
+  w.cv.notify_all();
   return handle;
 }
 
 void SimpleScheduler::cancel(core::ScheduleHandle handle) {
+  core::SchedulerPriority priority;
   {
-    std::lock_guard<std::mutex> lock(mutex_);
-    tasks_.erase(handle);
+    std::lock_guard<std::mutex> registry_lock(registry_mutex_);
+    auto it = handle_to_priority_.find(handle);
+    if (it == handle_to_priority_.end()) {
+      return;  // already fired or never scheduled
+    }
+    priority = it->second;
+    handle_to_priority_.erase(it);
   }
-  cv_.notify_all();
+  Worker& w = worker_for(priority);
+  {
+    std::lock_guard<std::mutex> lock(w.mutex);
+    w.tasks.erase(handle);
+  }
+  w.cv.notify_all();
 }
 
-void SimpleScheduler::worker_loop(std::stop_token st) {
+void SimpleScheduler::Worker::worker_loop(std::stop_token st) {
   while (!st.stop_requested()) {
+    core::ScheduleHandle fired_handle = 0;
     std::function<void()> callback;
 
     {
-      std::unique_lock<std::mutex> lock(mutex_);
-      cv_.wait(lock, [this, &st]() { return st.stop_requested() || !tasks_.empty(); });
+      std::unique_lock<std::mutex> lock(mutex);
+      cv.wait(lock, [this, &st]() { return st.stop_requested() || !tasks.empty(); });
       if (st.stop_requested()) {
         return;
       }
 
       const auto next_it = std::min_element(
-          tasks_.begin(), tasks_.end(),
+          tasks.begin(), tasks.end(),
           [](const auto& lhs, const auto& rhs) {
             return lhs.second.deadline < rhs.second.deadline;
           });
 
       const auto now = steady_now_ns();
       if (next_it->second.deadline > now) {
-        cv_.wait_for(lock, std::chrono::nanoseconds(next_it->second.deadline - now));
+        cv.wait_for(lock, std::chrono::nanoseconds(next_it->second.deadline - now));
         continue;
       }
 
       callback = std::move(next_it->second.callback);
-      tasks_.erase(next_it);
+      fired_handle = next_it->first;
+      tasks.erase(next_it);
+    }
+
+    if (owner != nullptr && fired_handle != 0) {
+      std::lock_guard<std::mutex> registry_lock(owner->registry_mutex_);
+      owner->handle_to_priority_.erase(fired_handle);
     }
 
     if (callback) {
@@ -217,17 +261,26 @@ std::shared_ptr<NativeKernelBundle> create_native_kernel(
   ik_opts.max_restarts = 50;
   ik_opts.max_time = 1.0;
   bundle->ik = std::make_shared<roboplan::SimpleIk>(bundle->scene, ik_opts);
+  auto streaming_ik_opts = ik_opts;
+  streaming_ik_opts.max_time = kernel_config.streaming_ik_timeout_s;
+  bundle->streaming_ik =
+      std::make_shared<roboplan::SimpleIk>(bundle->scene, streaming_ik_opts);
 
   // Create native backends
   auto scene_mutex = std::make_shared<std::mutex>();
   bundle->planner = std::make_unique<RoboPlanPlannerBackend>(
       bundle->scene, rrt_opts, bundle->shortcutter, bundle->toppra, bundle->ik,
-      scene_mutex);
+      scene_mutex, bundle->streaming_ik);
   bundle->context = std::make_unique<RoboPlanPlanningContext>(
       bundle->scene, group_name, scene_mutex);
   bundle->clock = std::make_unique<WallClock>();
+  RoboPlanExecutionBackendConfig execution_config;
+  execution_config.reset_completion_timeout_s =
+      kernel_config.native_reset_completion_timeout_s;
+  execution_config.streaming_stop_completion_timeout_s =
+      kernel_config.native_streaming_stop_completion_timeout_s;
   bundle->execution = std::make_unique<RoboPlanExecutionBackend>(
-      bundle->scene, group_name, *bundle->clock, scene_mutex);
+      bundle->scene, group_name, *bundle->clock, scene_mutex, execution_config);
   bundle->scheduler = std::make_unique<SimpleScheduler>();
   bundle->cache = std::make_unique<core::TrajectoryCache>();
 

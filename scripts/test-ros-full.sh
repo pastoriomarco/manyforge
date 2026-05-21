@@ -34,6 +34,11 @@ export PYTHONPATH="${WORKSPACE}/manyforge_ros:${WORKSPACE}/manyforge_behavior:${
 
 cd "$WORKSPACE"
 
+./scripts/ros/build-ros2-control-runtime.sh
+
+ROBOPLAN_BUILD="${MANYFORGE_ROBOPLAN_BUILD_DIR:-${MANYFORGE_BUILD_DIR:-/tmp/manyforge-build}/roboplan}"
+export PYTHONPATH="${ROBOPLAN_BUILD}:${WORKSPACE}/manyforge_roboplan/python:${PYTHONPATH}"
+
 python3 - <<'PY'
 import importlib
 

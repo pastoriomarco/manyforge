@@ -78,7 +78,9 @@ docker compose --profile ros-full run --rm ros-jazzy-full ./scripts/test-ros-ful
 The full image also starts from `ros:jazzy-ros-base-noble`, but adds a pinned
 ManyForge application venv with `--system-site-packages` so ROS Python remains
 apt-managed while Composer/FastAPI/Pydantic/RoboPlan app dependencies are
-reproducible.
+reproducible. `test-ros-full.sh` rebuilds and exports the ROS-enabled native
+RoboPlan module before running tests, so it is the canonical local command for
+ros2_control contract coverage.
 
 To build C++ manually:
 

@@ -267,6 +267,31 @@ def _collision_monitor_period_ns_from_deployment(
     return int(period_ms * 1_000_000.0)
 
 
+def _kernel_config_from_deployment(
+    deployment: Deployment | None,
+    *,
+    collision_monitor_period_ns: int | None,
+) -> dict[str, float | int] | None:
+    config: dict[str, float | int] = {}
+    if collision_monitor_period_ns is not None:
+        config["collision_monitor_period_ns"] = collision_monitor_period_ns
+
+    execution = deployment.adapters.get("execution") if deployment is not None else None
+    execution_config = dict(execution.config or {}) if execution is not None else {}
+    for key in (
+        "streaming_ik_timeout_s",
+        "streaming_ik_timeout_ms",
+        "native_reset_completion_timeout_s",
+        "native_reset_completion_timeout_ms",
+        "native_streaming_stop_completion_timeout_s",
+        "native_streaming_stop_completion_timeout_ms",
+    ):
+        if key in execution_config:
+            config[key] = execution_config[key]
+
+    return config or None
+
+
 def _execution_adapter_id_from_deployment(deployment: Deployment | None) -> str:
     if deployment is None:
         return "execution.roboplan_native"
@@ -364,11 +389,10 @@ def _make_kernel(
         import manyforge_roboplan_py
         from native_kernel_client import NativeKernelClient
 
-        kernel_config = None
-        if collision_monitor_period_ns is not None:
-            kernel_config = {
-                "collision_monitor_period_ns": collision_monitor_period_ns,
-            }
+        kernel_config = _kernel_config_from_deployment(
+            deployment,
+            collision_monitor_period_ns=collision_monitor_period_ns,
+        )
         resolved_model = _resolved_robot_model_from_deployment(deployment)
         if resolved_model is not None:
             bundle = manyforge_roboplan_py.create_native_kernel_from_paths(
@@ -531,8 +555,9 @@ def main():
         type=float,
         default=_optional_float_env("MANYFORGE_FAILURE_ARCHIVE_MAX_AGE_S"),
         help=(
-            "Optional archive retention age in seconds. Older archives are "
-            "deleted FIFO by directory mtime."
+            "Archive retention age in seconds. Defaults to "
+            "MANYFORGE_FAILURE_ARCHIVE_MAX_AGE_S or 2592000 (30 days). "
+            "Older archives are deleted FIFO by directory mtime."
         ),
     )
     parser.add_argument(
@@ -540,8 +565,9 @@ def main():
         type=int,
         default=_optional_int_env("MANYFORGE_FAILURE_ARCHIVE_MAX_BYTES"),
         help=(
-            "Optional archive disk budget in bytes. Oldest archives are deleted "
-            "until the budget is satisfied."
+            "Archive disk budget in bytes. Defaults to "
+            "MANYFORGE_FAILURE_ARCHIVE_MAX_BYTES or 1073741824 (1 GiB). "
+            "Oldest archives are deleted until the budget is satisfied."
         ),
     )
     parser.add_argument(

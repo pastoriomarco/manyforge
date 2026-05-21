@@ -278,15 +278,20 @@ RoboPlanPlannerBackend::RoboPlanPlannerBackend(
     std::shared_ptr<roboplan::PathShortcutter> shortcutter,
     std::shared_ptr<roboplan::PathParameterizerTOPPRA> toppra,
     std::shared_ptr<roboplan::SimpleIk> ik,
-    std::shared_ptr<std::mutex> scene_mutex)
+    std::shared_ptr<std::mutex> scene_mutex,
+    std::shared_ptr<roboplan::SimpleIk> streaming_ik)
     : scene_(std::move(scene)),
       rrt_options_(rrt_options),
       shortcutter_(std::move(shortcutter)),
       toppra_(std::move(toppra)),
       ik_(std::move(ik)),
+      streaming_ik_(std::move(streaming_ik)),
       scene_mutex_(std::move(scene_mutex)) {
   if (!scene_mutex_) {
     scene_mutex_ = std::make_shared<std::mutex>();
+  }
+  if (!streaming_ik_) {
+    streaming_ik_ = ik_;
   }
 }
 
@@ -619,7 +624,9 @@ core::TrajectoryDTO RoboPlanPlannerBackend::convert_trajectory(
 // =================================================================
 // Single-shot IK for streaming-session execution mode (ADR-0016).
 //
-// Reuses the SimpleIk solver already configured for this backend.
+// Uses a separate low-budget SimpleIk solver when configured. Full plan()
+// keeps the planning IK budget; streaming solve_ik() is bounded for direct
+// control responsiveness.
 // Distinct from plan(): no trajectory shaping, no collision check, no
 // RRT — just a pose-to-joint resolve with the previous-frame joints as
 // seed for continuity across streamed frames.
@@ -628,7 +635,7 @@ core::IkResultDTO RoboPlanPlannerBackend::solve_ik(
     const core::IkRequestDTO& request) {
   core::IkResultDTO result;
 
-  if (!ik_) {
+  if (!streaming_ik_) {
     result.ok = false;
     result.error = core::ErrorDTO{
         std::string(core::to_string(core::ErrorCode::kUnsupportedCapability)),
@@ -690,7 +697,7 @@ core::IkResultDTO RoboPlanPlannerBackend::solve_ik(
 
   {
     std::lock_guard<std::mutex> lock(*scene_mutex_);
-    if (!ik_->solveIk(cart_config, start_config, goal_config)) {
+    if (!streaming_ik_->solveIk(cart_config, start_config, goal_config)) {
       result.ok = false;
       result.error = core::ErrorDTO{
           std::string(core::to_string(core::ErrorCode::kIkFailed)),

@@ -209,6 +209,16 @@ core::ValidationResultDTO RoboPlanPlanningContext::validate_trajectory(
 
     // TCP speed validation is intentionally first. It is cheap FK-only work and
     // can reject infeasible trajectories before expensive mesh collision sweeps.
+    //
+    // Lock scope: held once across the whole speed-validation loop rather
+    // than per waypoint. The previous per-iteration acquire/release was the
+    // worst-of-both-worlds: it imposed lock-thrash overhead while still
+    // holding the scene mutex cumulatively for the same duration (FK can
+    // only run while we hold the mutex because Pinocchio's `Data` inside
+    // `roboplan::Scene` is non-reentrant — see ADR-0019). With FK at
+    // microsecond scale per waypoint, a single acquire is both faster and
+    // gives concurrent get_status() callers a single contiguous wait
+    // window instead of N short ones.
     if (options.max_tcp_linear_speed_mps > 0.0 &&
         !options.tcp_frame.empty() && waypoint_count >= 2) {
       const uint64_t speed_start_ns = steady_now_ns();
@@ -218,32 +228,34 @@ core::ValidationResultDTO RoboPlanPlanningContext::validate_trajectory(
       size_t max_segment_index = 0;
       double max_segment_dt_s = 0.0;
 
-      for (size_t i = 0; i < waypoint_count; ++i) {
-        const auto& wp = trajectory.waypoints[i];
+      {
         std::lock_guard<std::mutex> scene_lock(*scene_mutex_);
-        Eigen::VectorXd q = vector_from_std(wp.positions_rad);
-        if (q.size() != scene_->getCurrentJointPositions().size()) {
-          q = scene_->toFullJointPositions(group_name_, q);
-        }
+        for (size_t i = 0; i < waypoint_count; ++i) {
+          const auto& wp = trajectory.waypoints[i];
+          Eigen::VectorXd q = vector_from_std(wp.positions_rad);
+          if (q.size() != scene_->getCurrentJointPositions().size()) {
+            q = scene_->toFullJointPositions(group_name_, q);
+          }
 
-        Eigen::Matrix4d tform = scene_->forwardKinematics(q, options.tcp_frame);
-        Eigen::Vector3d pos = tform.block<3, 1>(0, 3);
+          Eigen::Matrix4d tform = scene_->forwardKinematics(q, options.tcp_frame);
+          Eigen::Vector3d pos = tform.block<3, 1>(0, 3);
 
-        if (have_prev && i > 0) {
-          const double dt =
-              wp.time_from_start_s - trajectory.waypoints[i - 1].time_from_start_s;
-          if (dt > 1e-9) {
-            const double speed = (pos - prev_pos).norm() / dt;
-            if (speed > max_speed) {
-              max_speed = speed;
-              max_segment_index = i - 1;
-              max_segment_dt_s = dt;
+          if (have_prev && i > 0) {
+            const double dt =
+                wp.time_from_start_s - trajectory.waypoints[i - 1].time_from_start_s;
+            if (dt > 1e-9) {
+              const double speed = (pos - prev_pos).norm() / dt;
+              if (speed > max_speed) {
+                max_speed = speed;
+                max_segment_index = i - 1;
+                max_segment_dt_s = dt;
+              }
             }
           }
-        }
 
-        prev_pos = pos;
-        have_prev = true;
+          prev_pos = pos;
+          have_prev = true;
+        }
       }
       speed_validation_duration_ns = steady_now_ns() - speed_start_ns;
 
@@ -1144,6 +1156,12 @@ tl::expected<void, std::string> RoboPlanPlanningContext::add_geometry_locked(
   } else if (auto* sphere = std::get_if<core::SphereShapeDTO>(&state.shape)) {
     roboplan::Sphere s(sphere->radius_m);
     auto r = scene_->addSphereGeometry(object_id, target_frame, s, t_target_object, color);
+    if (!r.has_value()) {
+      return tl::make_unexpected(r.error());
+    }
+  } else if (auto* cylinder = std::get_if<core::CylinderShapeDTO>(&state.shape)) {
+    roboplan::Cylinder c(cylinder->radius_m, cylinder->height_m);
+    auto r = scene_->addCylinderGeometry(object_id, target_frame, c, t_target_object, color);
     if (!r.has_value()) {
       return tl::make_unexpected(r.error());
     }

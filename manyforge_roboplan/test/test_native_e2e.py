@@ -484,6 +484,17 @@ class TestNativeSceneEdits:
         ))
         assert result.success is True
 
+    def test_add_cylinder(self, native_kernel):
+        result = native_kernel.scene_edit(SceneEditRequest(
+            operation="add", object_id="cylinder1", shape_type="cylinder",
+            cylinder_radius_m=0.05,
+            cylinder_height_m=0.2,
+            pose_position_m=[0.3, -0.2, 0.6],
+            pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
+            frame_id="universe",
+        ))
+        assert result.success is True
+
     def test_upsert_replaces_existing_object(self, native_kernel):
         insert = native_kernel.scene_edit(SceneEditRequest(
             operation="upsert", object_id="upsert_box", shape_type="box",

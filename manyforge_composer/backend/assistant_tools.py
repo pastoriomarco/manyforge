@@ -483,6 +483,18 @@ def _validated_shape(value: Any) -> dict[str, Any]:
         if radius <= 0.0:
             raise AssistantToolError("sphere_radius_m must be > 0")
         return {"type": "sphere", "sphere_radius_m": radius}
+    if shape_type == "cylinder":
+        radius = _finite_number(value.get("cylinder_radius_m"), "cylinder_radius_m")
+        height = _finite_number(value.get("cylinder_height_m"), "cylinder_height_m")
+        if radius <= 0.0:
+            raise AssistantToolError("cylinder_radius_m must be > 0")
+        if height <= 0.0:
+            raise AssistantToolError("cylinder_height_m must be > 0")
+        return {
+            "type": "cylinder",
+            "cylinder_radius_m": radius,
+            "cylinder_height_m": height,
+        }
     if shape_type == "mesh":
         resource_uri = value.get("mesh_resource_uri")
         if not isinstance(resource_uri, str) or not resource_uri.strip():

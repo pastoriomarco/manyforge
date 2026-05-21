@@ -28,7 +28,7 @@ const MOVE_TO_DEFAULT_STATE: MoveToState = {
   offsetXyzM: [0, 0, 0],
   offsetRpyDeg: [0, 0, 0],
 };
-type CartesianFrame = 'world' | 'base' | 'tcp';
+type CartesianFrame = 'base' | 'tcp';
 type ActivePanel = 'tools' | 'robot' | 'object' | null;
 
 interface ViewerSelectionStore {
@@ -134,7 +134,7 @@ export const useViewerSelectionStore = create<ViewerSelectionStore>((set, get) =
   activePanel: null,
   robotMode: 'joint',
   moveTo: MOVE_TO_DEFAULT_STATE,
-  cartesianFrame: 'world',
+  cartesianFrame: 'base',
   cartesianGizmoMode: 'translate',
   isDraggingGizmo: false,
   cartesianRejectionLabel: null,

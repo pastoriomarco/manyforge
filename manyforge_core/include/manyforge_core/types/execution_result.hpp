@@ -63,4 +63,17 @@ struct AcknowledgeCompletedResultDTO {
   std::optional<ErrorDTO> error;
 };
 
+/// Explicit intervention acknowledgement result.
+///
+/// Valid only from `kInterventionRequired`. Clears the intervention flag
+/// and transitions to `kIdle`, emitting a `kInterventionAcknowledged`
+/// event with `principal_id` and `reason` for traceability. Callers (cycle
+/// manager Run-side auto-ack, MCP, operator UI) hold the policy decision
+/// about whether an ack is appropriate; the kernel only enforces
+/// "explicit, traceable, fail-closed on other states".
+struct AcknowledgeInterventionResultDTO {
+  bool accepted = false;
+  std::optional<ErrorDTO> error;
+};
+
 }  // namespace manyforge::core

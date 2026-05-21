@@ -12,8 +12,11 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <functional>
+#include <limits>
 #include <mutex>
 #include <optional>
+#include <thread>
 #include <vector>
 
 #include <manyforge_core/execution_kernel.hpp>
@@ -37,8 +40,9 @@ class FakeClock : public IClock {
 
 class ManualScheduler : public IScheduler {
  public:
-  ScheduleHandle schedule(TimePoint /*deadline*/,
-                          std::function<void()> /*callback*/) override {
+  ScheduleHandle schedule(
+      TimePoint /*deadline*/, std::function<void()> /*callback*/,
+      SchedulerPriority /*priority*/ = SchedulerPriority::Safety) override {
     return ScheduleHandle{0};
   }
   void cancel(ScheduleHandle /*handle*/) override {}
@@ -48,6 +52,13 @@ class StubPlanner : public IPlannerBackend {
  public:
   PlanResultDTO plan(const PlanRequestDTO& /*request*/) override {
     PlanResultDTO out;
+    TrajectoryDTO trajectory;
+    trajectory.joint_names = {"j1", "j2"};
+    trajectory.waypoints.push_back(
+        TrajectoryWaypointDTO{0.0, {0.0, 0.0}, {}, {}});
+    trajectory.waypoints.push_back(
+        TrajectoryWaypointDTO{1.0, {1.0, 1.0}, {}, {}});
+    out.trajectory = trajectory;
     return out;
   }
 
@@ -57,11 +68,15 @@ class StubPlanner : public IPlannerBackend {
   IkRequestDTO last_ik_request;
   std::vector<double> next_ik_positions = {0.1, 0.2};
   std::vector<std::string> next_ik_joint_names = {"j1", "j2"};
+  std::chrono::milliseconds solve_ik_delay{0};
   bool reject_ik = false;
 
   IkResultDTO solve_ik(const IkRequestDTO& request) override {
     ++solve_ik_calls;
     last_ik_request = request;
+    if (solve_ik_delay.count() > 0) {
+      std::this_thread::sleep_for(solve_ik_delay);
+    }
     IkResultDTO result;
     if (reject_ik) {
       result.ok = false;
@@ -86,6 +101,7 @@ class StubContext : public IPlanningContext {
  public:
   std::vector<std::string> current_joint_names = {"j1", "j2"};
   std::vector<double> current_positions_rad = {0.0, 0.0};
+  JointLimitsDTO joint_limits;
 
   RobotStateDTO get_current_state() override {
     RobotStateDTO state;
@@ -119,7 +135,7 @@ class StubContext : public IPlanningContext {
   }
   JointLimitsDTO get_joint_limits(const std::string& /*robot_id*/,
                                    const std::string& /*group_id*/) override {
-    return JointLimitsDTO{};
+    return joint_limits;
   }
   SceneEditResultDTO add_object(
       const AddObjectRequestDTO& /*request*/) override {
@@ -162,6 +178,7 @@ class StreamingMock : public IExecutionBackend {
   bool reject_begin = false;
   bool reject_push = false;
   bool reject_end = false;
+  std::function<void()> before_accept_push;
 
   ExecutionHandle execute_trajectory(
       const TrajectoryDTO& /*trajectory*/) override {
@@ -208,6 +225,9 @@ class StreamingMock : public IExecutionBackend {
     if (session_id != active_session_id) {
       return {false, 0,
               ErrorDTO{kErrorInvalidRequest, "wrong session_id", {}}};
+    }
+    if (before_accept_push) {
+      before_accept_push();
     }
     received_targets.push_back(target);
     return {true, static_cast<uint64_t>(received_targets.size()),
@@ -305,6 +325,21 @@ class StreamingSessionTest : public ::testing::Test {
     cfg.cartesian_reference_frame = "base";
     return cfg;
   }
+
+  ExecuteRequestDTO execute_request(const std::string& move_id = "move_1") {
+    ExecuteRequestDTO req;
+    req.robot_id = "robot";
+    req.group_id = "arm";
+    req.move_id = move_id;
+    req.base_frame = "base";
+    req.tcp_frame = "tcp";
+    req.tolerances.joint_position_tol_rad = 0.1;
+    req.tolerances.translation_tol_m = 0.01;
+    req.tolerances.rotation_tol_rad = 0.01;
+    req.cache_mode = CacheMode::kDefault;
+    req.motion = JointGoalDTO{{"j1", "j2"}, {1.0, 1.0}};
+    return req;
+  }
 };
 
 // ---- begin_streaming_session ----
@@ -326,6 +361,19 @@ TEST_F(StreamingSessionTest, Begin_EmitsSessionStartedAndStateTransitionEvents) 
   EXPECT_GE(count_events_of(KernelEventType::kStateTransition), 1u);
 }
 
+TEST_F(StreamingSessionTest, EventCallbackMayUnsubscribeItself) {
+  SubscriptionHandle self_handle{0};
+  int callback_count = 0;
+  self_handle = kernel.subscribe_events([&](const KernelEvent& /*event*/) {
+    ++callback_count;
+    kernel.unsubscribe_events(self_handle);
+  });
+
+  auto r = kernel.begin_streaming_session(default_config());
+  ASSERT_TRUE(r.accepted);
+  EXPECT_EQ(callback_count, 1);
+}
+
 TEST_F(StreamingSessionTest, Begin_SecondCallFromStreaming_Rejected) {
   ASSERT_TRUE(kernel.begin_streaming_session(default_config()).accepted);
   auto r2 = kernel.begin_streaming_session(default_config());
@@ -337,6 +385,48 @@ TEST_F(StreamingSessionTest, Begin_BackendRejection_LeavesKernelInIdle) {
   backend.reject_begin = true;
   auto r = kernel.begin_streaming_session(default_config());
   EXPECT_FALSE(r.accepted);
+  EXPECT_EQ(kernel.get_status().state, ExecutionState::kIdle);
+}
+
+TEST_F(StreamingSessionTest,
+       ConcurrentBeginStreamingAndExecute_OnlyOneAuthorityWins) {
+  std::atomic<bool> start{false};
+  std::optional<Result<uint64_t>> execute_result;
+  StreamingSessionBeginResultDTO begin_result;
+
+  std::thread execute_thread([&]() {
+    while (!start.load(std::memory_order_acquire)) {
+      std::this_thread::yield();
+    }
+    execute_result = kernel.execute(execute_request("concurrent_execute"));
+  });
+  std::thread begin_thread([&]() {
+    while (!start.load(std::memory_order_acquire)) {
+      std::this_thread::yield();
+    }
+    begin_result = kernel.begin_streaming_session(default_config());
+  });
+
+  start.store(true, std::memory_order_release);
+  execute_thread.join();
+  begin_thread.join();
+
+  ASSERT_TRUE(execute_result.has_value());
+  const bool execute_accepted = execute_result->ok();
+  const bool begin_accepted = begin_result.accepted;
+  EXPECT_NE(execute_accepted, begin_accepted)
+      << "execute() and begin_streaming_session() are mutually exclusive "
+         "lifecycle authorities; exactly one may reserve Idle";
+
+  if (execute_accepted) {
+    ASSERT_TRUE(kernel.wait_for_completion(2'000'000'000))
+        << "accepted execute did not complete";
+    ASSERT_TRUE(kernel.reset().accepted);
+  } else if (begin_accepted) {
+    ASSERT_TRUE(kernel.end_streaming_session(begin_result.session_id,
+                                             SoftStopStrategy::kSpringBack)
+                    .accepted);
+  }
   EXPECT_EQ(kernel.get_status().state, ExecutionState::kIdle);
 }
 
@@ -383,6 +473,68 @@ TEST_F(StreamingSessionTest, Push_BackendRejection_EmitsRejectionEvent) {
       begin_result.session_id, joint_target({0.1, 0.2}));
   EXPECT_FALSE(push_result.accepted);
   EXPECT_GE(count_events_of(KernelEventType::kStreamingTargetRejected), 1u);
+}
+
+TEST_F(StreamingSessionTest,
+       Push_SessionChangesDuringBackendCall_DoesNotMutateCommandBookkeeping) {
+  auto begin_result = kernel.begin_streaming_session(default_config());
+  ASSERT_TRUE(begin_result.accepted);
+  backend.before_accept_push = [this]() {
+    auto reset = kernel.reset();
+    ASSERT_TRUE(reset.accepted);
+  };
+
+  auto push_result = kernel.push_streaming_target(
+      begin_result.session_id, joint_target({0.1, 0.2}));
+
+  EXPECT_FALSE(push_result.accepted);
+  ASSERT_TRUE(push_result.error.has_value());
+  EXPECT_EQ(push_result.error->details.at("reason_code"), "session_lost");
+  EXPECT_EQ(kernel.get_status().state, ExecutionState::kIdle);
+}
+
+TEST_F(StreamingSessionTest,
+       Push_RacingResetAndNewBegin_DoesNotPoisonNextSessionSeed) {
+  context.current_positions_rad = {1.0, 2.0};
+  auto first_begin = kernel.begin_streaming_session(default_config());
+  ASSERT_TRUE(first_begin.accepted);
+
+  StreamingSessionBeginResultDTO second_begin;
+  backend.before_accept_push = [&]() {
+    ASSERT_TRUE(kernel.reset().accepted);
+    context.current_positions_rad = {10.0, 20.0};
+    second_begin = kernel.begin_streaming_session(default_config());
+    ASSERT_TRUE(second_begin.accepted);
+  };
+
+  auto stale_push = kernel.push_streaming_target(
+      first_begin.session_id, joint_target({0.4, 0.6}));
+
+  EXPECT_FALSE(stale_push.accepted);
+  ASSERT_TRUE(stale_push.error.has_value());
+  EXPECT_EQ(stale_push.error->details.at("reason_code"), "session_lost");
+  ASSERT_TRUE(second_begin.accepted);
+
+  backend.before_accept_push = nullptr;
+  StreamingTargetDTO partial;
+  partial.kind = StreamingInputMode::kJoint;
+  partial.joint_names = {"j2"};
+  partial.joint_positions_rad = {30.0};
+
+  auto fresh_push =
+      kernel.push_streaming_target(second_begin.session_id, partial);
+  ASSERT_TRUE(fresh_push.accepted);
+  ASSERT_GE(backend.received_targets.size(), 2u);
+  const auto& latest = backend.received_targets.back();
+  ASSERT_EQ(latest.joint_positions_rad.size(), 2u);
+  EXPECT_DOUBLE_EQ(latest.joint_positions_rad[0], 10.0)
+      << "new session must seed from the live state, not the stale push";
+  EXPECT_DOUBLE_EQ(latest.joint_positions_rad[1], 30.0);
+
+  ASSERT_TRUE(kernel.end_streaming_session(second_begin.session_id,
+                                           SoftStopStrategy::kSpringBack)
+                  .accepted);
+  EXPECT_EQ(kernel.get_status().state, ExecutionState::kIdle);
 }
 
 // ---- end_streaming_session ----
@@ -495,6 +647,35 @@ TEST_F(StreamingSessionTest,
             (std::vector<double>{0.5, -0.3}));
 }
 
+TEST_F(StreamingSessionTest, CartesianTarget_PassesStreamingIkBudgetToPlanner) {
+  ASSERT_TRUE(kernel.begin_streaming_session(cartesian_config()).accepted);
+
+  auto push_result =
+      kernel.push_streaming_target(1, cartesian_target({0.4, 0.1, 0.6}));
+
+  EXPECT_TRUE(push_result.accepted);
+  EXPECT_EQ(planner.solve_ik_calls, 1);
+  EXPECT_DOUBLE_EQ(planner.last_ik_request.timeout_s, 0.050);
+}
+
+TEST_F(StreamingSessionTest,
+       CartesianTarget_IkExceedsBudget_RejectedWithStructuredTimeout) {
+  ASSERT_TRUE(kernel.begin_streaming_session(cartesian_config()).accepted);
+  planner.solve_ik_delay = std::chrono::milliseconds(65);
+
+  auto push_result =
+      kernel.push_streaming_target(1, cartesian_target({0.4, 0.1, 0.6}));
+
+  EXPECT_FALSE(push_result.accepted);
+  ASSERT_TRUE(push_result.error.has_value());
+  EXPECT_EQ(push_result.error->code, std::string("ik_failed"));
+  EXPECT_EQ(push_result.error->details.at("reason_code"), "ik_timeout");
+  EXPECT_EQ(push_result.error->details.at("timeout_s"), "0.050000");
+  EXPECT_EQ(backend.push_calls, 0)
+      << "IK timeout must not dispatch a stale target";
+  EXPECT_GE(count_events_of(KernelEventType::kStreamingTargetRejected), 1u);
+}
+
 TEST_F(StreamingSessionTest, CartesianTarget_IkRejection_EmitsRejectionEvent) {
   ASSERT_TRUE(kernel.begin_streaming_session(cartesian_config()).accepted);
   planner.reject_ik = true;
@@ -518,6 +699,57 @@ TEST_F(StreamingSessionTest, CartesianTarget_MissingTcpFrame_Rejected) {
   EXPECT_FALSE(push_result.accepted);
   EXPECT_EQ(planner.solve_ik_calls, 0)
       << "missing tcp_frame must reject before planner call";
+}
+
+TEST_F(StreamingSessionTest, CartesianTarget_NonFinitePosition_RejectedBeforeIk) {
+  ASSERT_TRUE(kernel.begin_streaming_session(cartesian_config()).accepted);
+
+  auto bad = cartesian_target(
+      {std::numeric_limits<double>::infinity(), 0.1, 0.6});
+  auto push_result = kernel.push_streaming_target(1, bad);
+
+  EXPECT_FALSE(push_result.accepted);
+  ASSERT_TRUE(push_result.error.has_value());
+  EXPECT_EQ(push_result.error->code, std::string("invalid_request"));
+  EXPECT_NE(
+      push_result.error->message.find("non-finite position"),
+      std::string::npos);
+  EXPECT_EQ(planner.solve_ik_calls, 0)
+      << "malformed cartesian frames must reject before IK";
+  EXPECT_EQ(backend.push_calls, 0);
+  EXPECT_GE(count_events_of(KernelEventType::kStreamingTargetRejected), 1u);
+}
+
+TEST_F(StreamingSessionTest, CartesianTarget_ZeroNormQuaternion_RejectedBeforeIk) {
+  ASSERT_TRUE(kernel.begin_streaming_session(cartesian_config()).accepted);
+
+  auto bad = cartesian_target({0.4, 0.1, 0.6}, {0.0, 0.0, 0.0, 0.0});
+  auto push_result = kernel.push_streaming_target(1, bad);
+
+  EXPECT_FALSE(push_result.accepted);
+  ASSERT_TRUE(push_result.error.has_value());
+  EXPECT_EQ(push_result.error->code, std::string("invalid_request"));
+  EXPECT_NE(
+      push_result.error->message.find("quaternion norm"),
+      std::string::npos);
+  EXPECT_EQ(planner.solve_ik_calls, 0)
+      << "malformed cartesian frames must reject before IK";
+  EXPECT_EQ(backend.push_calls, 0);
+}
+
+TEST_F(StreamingSessionTest, CartesianTarget_QuaternionIsNormalizedBeforeIk) {
+  ASSERT_TRUE(kernel.begin_streaming_session(cartesian_config()).accepted);
+
+  auto push_result =
+      kernel.push_streaming_target(1, cartesian_target({0.4, 0.1, 0.6},
+                                                       {0.0, 0.0, 0.0, 2.0}));
+
+  EXPECT_TRUE(push_result.accepted);
+  EXPECT_EQ(planner.solve_ik_calls, 1);
+  EXPECT_DOUBLE_EQ(planner.last_ik_request.goal_pose.orientation.x, 0.0);
+  EXPECT_DOUBLE_EQ(planner.last_ik_request.goal_pose.orientation.y, 0.0);
+  EXPECT_DOUBLE_EQ(planner.last_ik_request.goal_pose.orientation.z, 0.0);
+  EXPECT_DOUBLE_EQ(planner.last_ik_request.goal_pose.orientation.w, 1.0);
 }
 
 TEST_F(StreamingSessionTest, JointTarget_DoesNotInvokeIk) {
@@ -583,6 +815,61 @@ TEST_F(StreamingSessionTest,
   EXPECT_TRUE(rebegin.accepted)
       << "begin_streaming_session must succeed after reset cleared "
          "the previous session — review-fix regression check";
+}
+
+TEST_F(StreamingSessionTest,
+       ConcurrentStopResetAndEndFromStreaming_LeavesKernelReusable) {
+  auto begin = kernel.begin_streaming_session(default_config());
+  ASSERT_TRUE(begin.accepted);
+
+  std::atomic<bool> start{false};
+  std::atomic<bool> stop_accepted{false};
+  std::atomic<bool> reset_accepted{false};
+  std::atomic<bool> end_accepted{false};
+
+  std::thread stop_thread([&]() {
+    while (!start.load(std::memory_order_acquire)) {
+      std::this_thread::yield();
+    }
+    stop_accepted.store(kernel.stop().accepted, std::memory_order_release);
+  });
+  std::thread reset_thread([&]() {
+    while (!start.load(std::memory_order_acquire)) {
+      std::this_thread::yield();
+    }
+    reset_accepted.store(kernel.reset().accepted, std::memory_order_release);
+  });
+  std::thread end_thread([&]() {
+    while (!start.load(std::memory_order_acquire)) {
+      std::this_thread::yield();
+    }
+    end_accepted.store(
+        kernel
+            .end_streaming_session(begin.session_id,
+                                   SoftStopStrategy::kSpringBack)
+            .accepted,
+        std::memory_order_release);
+  });
+
+  start.store(true, std::memory_order_release);
+  stop_thread.join();
+  reset_thread.join();
+  end_thread.join();
+
+  EXPECT_TRUE(stop_accepted.load(std::memory_order_acquire) ||
+              reset_accepted.load(std::memory_order_acquire) ||
+              end_accepted.load(std::memory_order_acquire))
+      << "one terminal lifecycle action must win the streaming session";
+
+  if (kernel.get_status().state != ExecutionState::kIdle) {
+    ASSERT_TRUE(kernel.reset().accepted);
+  }
+  EXPECT_EQ(kernel.get_status().state, ExecutionState::kIdle);
+
+  auto rebegin = kernel.begin_streaming_session(default_config());
+  EXPECT_TRUE(rebegin.accepted)
+      << "kernel must admit a fresh streaming session after racing "
+         "stop/reset/end calls are serialized";
 }
 
 TEST_F(StreamingSessionTest,
@@ -794,6 +1081,84 @@ TEST_F(StreamingSessionTest, DuplicateJointName_RejectsAsMalformed) {
   ASSERT_TRUE(r.error.has_value());
   EXPECT_EQ(r.error->code, std::string("invalid_request"));
   EXPECT_NE(r.error->message.find("duplicate joint name"), std::string::npos);
+  EXPECT_EQ(backend.received_targets.size(), 0u);
+}
+
+TEST_F(StreamingSessionTest, JointTarget_NonFinitePosition_RejectsAsMalformed) {
+  auto begin = kernel.begin_streaming_session(default_config());
+  ASSERT_TRUE(begin.accepted);
+
+  StreamingTargetDTO bad;
+  bad.kind = StreamingInputMode::kJoint;
+  bad.joint_names = {"j1", "j2"};
+  bad.joint_positions_rad = {
+      0.5,
+      std::numeric_limits<double>::quiet_NaN(),
+  };
+  auto r = kernel.push_streaming_target(begin.session_id, bad);
+
+  EXPECT_FALSE(r.accepted);
+  ASSERT_TRUE(r.error.has_value());
+  EXPECT_EQ(r.error->code, std::string("invalid_request"));
+  EXPECT_NE(r.error->message.find("non-finite position"), std::string::npos);
+  EXPECT_EQ(backend.received_targets.size(), 0u);
+}
+
+TEST_F(StreamingSessionTest, JointTarget_AbovePositionLimit_RejectsBeforeBackend) {
+  context.joint_limits.joint_names = {"j1", "j2"};
+  context.joint_limits.position_lower_rad = {-1.0, -0.5};
+  context.joint_limits.position_upper_rad = {1.0, 0.5};
+  auto begin = kernel.begin_streaming_session(default_config());
+  ASSERT_TRUE(begin.accepted);
+
+  auto r = kernel.push_streaming_target(begin.session_id,
+                                        joint_target({0.0, 0.75}));
+
+  EXPECT_FALSE(r.accepted);
+  ASSERT_TRUE(r.error.has_value());
+  EXPECT_EQ(r.error->code, std::string("validation_limits_violation"));
+  EXPECT_EQ(r.error->details.at("reason_code"), "joint_position_limit");
+  EXPECT_EQ(r.error->details.at("joint_name"), "j2");
+  EXPECT_EQ(backend.received_targets.size(), 0u);
+}
+
+TEST_F(StreamingSessionTest,
+       PartialJointTarget_OutOfLimitAfterOverlay_RejectsBeforeBackend) {
+  context.current_positions_rad = {0.0, 0.0};
+  context.joint_limits.joint_names = {"j1", "j2"};
+  context.joint_limits.position_lower_rad = {-1.0, -0.5};
+  context.joint_limits.position_upper_rad = {1.0, 0.5};
+  auto begin = kernel.begin_streaming_session(default_config());
+  ASSERT_TRUE(begin.accepted);
+
+  StreamingTargetDTO partial;
+  partial.kind = StreamingInputMode::kJoint;
+  partial.joint_names = {"j2"};
+  partial.joint_positions_rad = {-0.75};
+  auto r = kernel.push_streaming_target(begin.session_id, partial);
+
+  EXPECT_FALSE(r.accepted);
+  ASSERT_TRUE(r.error.has_value());
+  EXPECT_EQ(r.error->code, std::string("validation_limits_violation"));
+  EXPECT_EQ(r.error->details.at("joint_name"), "j2");
+  EXPECT_EQ(backend.received_targets.size(), 0u);
+}
+
+TEST_F(StreamingSessionTest, CartesianIkResult_OutOfPositionLimit_RejectsBeforeBackend) {
+  context.joint_limits.joint_names = {"j1", "j2"};
+  context.joint_limits.position_lower_rad = {-1.0, -0.5};
+  context.joint_limits.position_upper_rad = {1.0, 0.5};
+  planner.next_ik_positions = {0.0, 0.75};
+  auto begin = kernel.begin_streaming_session(cartesian_config());
+  ASSERT_TRUE(begin.accepted);
+
+  auto r = kernel.push_streaming_target(
+      begin.session_id, cartesian_target({0.4, 0.1, 0.6}));
+
+  EXPECT_FALSE(r.accepted);
+  ASSERT_TRUE(r.error.has_value());
+  EXPECT_EQ(r.error->code, std::string("validation_limits_violation"));
+  EXPECT_EQ(r.error->details.at("joint_name"), "j2");
   EXPECT_EQ(backend.received_targets.size(), 0u);
 }
 

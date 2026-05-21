@@ -29,6 +29,11 @@ enum class KernelEventType {
   kPauseRequested,     // pause requested
   kResumeRequested,    // resume requested
   kCompletedAcknowledged,  // completed terminal outcome acknowledged
+  // Intervention acknowledgement. Emitted when an explicit operator/runtime
+  // call clears `kInterventionRequired`. `details` carries `principal_id`
+  // and `reason`. `execute()` MUST NOT clear the state implicitly — the
+  // boundary is load-bearing for the operator-intervention audit trail.
+  kInterventionAcknowledged,
   // Streaming-session events (ADR-0016). `session_id` lives in `details`
   // under the key "session_id" for correlation.
   kStreamingSessionStarted,    // streaming session opened on backend

@@ -64,9 +64,13 @@ def create_ros2_control_kernel(
         deployment_path=deployment.source_path,
         extra_package_paths=default_package_paths(),
     )
-    kernel_config = None
+    kernel_config: dict[str, float | int] = {}
     if collision_monitor_period_ns is not None:
-        kernel_config = {"collision_monitor_period_ns": collision_monitor_period_ns}
+        kernel_config["collision_monitor_period_ns"] = collision_monitor_period_ns
+    for key in ("streaming_ik_timeout_s", "streaming_ik_timeout_ms"):
+        if key in config:
+            kernel_config[key] = config[key]
+    kernel_config_arg = kernel_config or None
 
     required_joints = tuple(str(joint) for joint in config.get("required_joints", []))
     if not required_joints:
@@ -88,7 +92,7 @@ def create_ros2_control_kernel(
         resolved_model.srdf_path,
         resolved_model.package_paths,
         ros_config,
-        kernel_config,
+        kernel_config_arg,
     )
 
     _configure_ros_grippers(native_bundle, deployment, config)

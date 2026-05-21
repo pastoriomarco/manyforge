@@ -16,7 +16,7 @@ from fastapi.testclient import TestClient
 from manyforge_behavior.cycle_manager import CycleState
 from manyforge_behavior.kernel_client import MockKernelClient, SceneEditRequest
 from manyforge_composer.backend.app import create_app
-from manyforge_composer.backend import routes_scene
+from manyforge_composer.backend import routes_scene, routes_urdf
 from manyforge_composer.backend.state import ComposerState
 
 
@@ -196,10 +196,12 @@ def test_scene_frames_expose_model_inventory_and_visibility_control():
     assert state.hmi_server.frame_gizmo_size == 0.12
 
 
-def test_scene_frames_do_not_append_default_package_paths_when_deployment_declares_package_paths(monkeypatch):
+def test_scene_frames_do_not_append_default_package_paths_when_deployment_declares_package_paths(monkeypatch, tmp_path):
     client, state, kernel = make_client()
     state.load_program(_PROGRAM_PATH, deployment_path=_DEPLOYMENT_PATH)
     state.deployment.robot_config.package_paths = ["/declared/share"]
+    urdf_path = tmp_path / "test.urdf"
+    urdf_path.write_text("<robot name='test'/>", encoding="utf-8")
 
     calls: dict[str, object] = {}
 
@@ -210,7 +212,7 @@ def test_scene_frames_do_not_append_default_package_paths_when_deployment_declar
         calls["extra_package_paths"] = kwargs["extra_package_paths"]
         calls["package_paths"] = kwargs["package_paths"]
         return SimpleNamespace(
-            urdf_path="/declared/share/test.urdf",
+            urdf_path=str(urdf_path),
             package_paths=list(kwargs["package_paths"]),
         )
 
@@ -220,8 +222,8 @@ def test_scene_frames_do_not_append_default_package_paths_when_deployment_declar
             calls["filename_handler_present"] = "filename_handler" in kwargs
             return SimpleNamespace(link_map={"base_link": object(), "tool0": object()})
 
-    monkeypatch.setattr(routes_scene, "default_package_paths", fail_default_package_paths)
-    monkeypatch.setattr(routes_scene, "resolve_robot_model", fake_resolve_robot_model)
+    monkeypatch.setattr(routes_urdf, "default_package_paths", fail_default_package_paths)
+    monkeypatch.setattr(routes_urdf, "resolve_robot_model", fake_resolve_robot_model)
     monkeypatch.setitem(sys.modules, "yourdfpy", SimpleNamespace(URDF=FakeUrdf))
 
     response = client.get("/api/scene/frames")
@@ -275,6 +277,26 @@ def test_scene_edit_accepts_upsert_operation():
             "object_id": "box1",
             "shape_type": "box",
             "box_dimensions_m": [0.05, 0.05, 0.05],
+            "pose_position_m": [0.3, 0.0, 0.15],
+            "pose_orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["success"] is True
+
+
+def test_scene_edit_accepts_cylinder_add():
+    client, state, kernel = make_client()
+
+    response = client.post(
+        "/api/scene/edit",
+        json={
+            "operation": "add",
+            "object_id": "cylinder1",
+            "shape_type": "cylinder",
+            "cylinder_radius_m": 0.04,
+            "cylinder_height_m": 0.2,
             "pose_position_m": [0.3, 0.0, 0.15],
             "pose_orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
         },

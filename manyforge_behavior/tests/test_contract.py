@@ -329,6 +329,24 @@ class TestSceneEditInvariants:
         result = kernel.scene_edit(request)
         assert result.success is True
 
+    def test_scene_add_cylinder(self, kernel: KernelClient) -> None:
+        """
+        INVARIANT: Add cylinder must return success=True.
+
+        Scene edit with operation="add" and shape_type="cylinder" must succeed.
+        """
+        request = SceneEditRequest(
+            operation="add",
+            object_id="test_cylinder",
+            shape_type="cylinder",
+            cylinder_radius_m=0.05,
+            cylinder_height_m=0.2,
+            pose_position_m=[0.5, 0.0, 0.5],
+            pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
+        )
+        result = kernel.scene_edit(request)
+        assert result.success is True
+
     def test_scene_remove_existing(self, kernel: KernelClient) -> None:
         """
         INVARIANT: Remove existing object must return success=True.

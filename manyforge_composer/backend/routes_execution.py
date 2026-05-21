@@ -362,7 +362,7 @@ def create_execution_router(state: ComposerState) -> APIRouter:
     @router.get("/history")
     def get_execution_history(
         run_id: str | None = None,
-        limit: int | None = None,
+        limit: int | None = Query(default=None, ge=0, le=10000),
         start_ns: int | None = Query(default=None, alias="startNs"),
         end_ns: int | None = Query(default=None, alias="endNs"),
         min_severity: str | None = Query(default=None, alias="minSeverity"),

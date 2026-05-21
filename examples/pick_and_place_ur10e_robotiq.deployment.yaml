@@ -57,6 +57,7 @@ adapters:
       - context.scene.object_query
       - scene.shape.box
       - scene.shape.sphere
+      - scene.shape.cylinder
       - scene.shape.mesh
       - scene.edit.add
       - scene.edit.remove
