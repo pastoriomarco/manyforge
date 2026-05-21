@@ -143,6 +143,59 @@ def test_scene_state_includes_robot_metadata_after_program_load():
     assert isinstance(data["robot"]["joint_positions"], dict)
 
 
+def test_scene_state_advances_gripper_before_link_pose_fk(monkeypatch: pytest.MonkeyPatch):
+    """A moving gripper must enter the authoritative FK state before the
+    native viewer reads link poses. Otherwise the robot arm updates through
+    FK while the gripper visuals lag by one scene poll or stay at defaults."""
+
+    class OrderedKernel(MockKernelClient):
+        def __init__(self) -> None:
+            super().__init__(joint_names=["joint_a"])
+            self.gripper_update_count = 0
+
+        def get_execution_snapshot(self):
+            return SimpleNamespace(joint_positions_rad=[0.0])
+
+        def get_link_pose(self, link_name: str, reference_frame: str):
+            assert self.gripper_update_count == 1
+            return {
+                "position_m": [0.0, 0.0, 0.0],
+                "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+            }
+
+        def get_link_poses(self, link_names: list[str], reference_frame: str):
+            assert self.gripper_update_count == 1
+            return {
+                name: {
+                    "position_m": [0.0, 0.0, 0.0],
+                    "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+                }
+                for name in link_names
+            }
+
+        def update_gripper_commands(self) -> None:
+            self.gripper_update_count += 1
+
+    monkeypatch.setattr(routes_urdf, "visual_link_names_for_fk", lambda _state: ("finger",))
+    monkeypatch.setattr(routes_urdf, "active_urdf_model_key", lambda _state: "ordered")
+    kernel = OrderedKernel()
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state.program = SimpleNamespace(
+        robot=SimpleNamespace(base_frame="base", tcp_frame="tcp", base_pose={}),
+        scene=[],
+    )
+    state.deployment = SimpleNamespace(
+        robot_config=SimpleNamespace(robot_id="testbot", group_id="arm"),
+        adapters={},
+        grippers={},
+    )
+
+    payload = routes_scene.build_scene_state_payload(state)
+
+    assert payload["link_poses"]["finger"]["position_m"] == [0.0, 0.0, 0.0]
+    assert kernel.gripper_update_count == 1
+
+
 def test_scene_frames_expose_model_inventory_and_visibility_control():
     client, state, kernel = make_client()
     state.load_program(_PROGRAM_PATH, deployment_path=_DEPLOYMENT_PATH)

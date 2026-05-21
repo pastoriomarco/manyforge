@@ -21,6 +21,12 @@ START_POSITIONS = [0.0, -1.0, 1.2, -1.5, -1.57, 0.0]
 GOAL_POSITIONS = [0.01, -1.0, 1.2, -1.5, -1.57, 0.0]
 URDF_PATH = Path("/usr/local/share/roboplan_example_models/models/ur_robot_model/ur5_gripper.urdf")
 SRDF_PATH = Path("/usr/local/share/roboplan_example_models/models/ur_robot_model/ur5_gripper.srdf")
+UR10E_ROBOTIQ_URDF_PATH = Path(
+    "/workspace/manyforge_example_models/models/ur10e_robotiq_2f_140/ur10e_robotiq_2f_140.urdf"
+)
+UR10E_ROBOTIQ_SRDF_PATH = Path(
+    "/workspace/manyforge_example_models/models/ur10e_robotiq_2f_140/ur10e_robotiq_2f_140.srdf"
+)
 
 
 def _native_module():
@@ -42,6 +48,10 @@ def _create_bundle(
     controller_state_topic: str,
     wait_s: float,
     config_overrides: dict | None = None,
+    model_name: str = "ur5_test",
+    urdf_path: Path = URDF_PATH,
+    srdf_path: Path = SRDF_PATH,
+    package_paths: list[str] | None = None,
 ):
     module = _native_module()
     config = {
@@ -59,12 +69,13 @@ def _create_bundle(
     }
     if config_overrides:
         config.update(config_overrides)
+    package_paths = package_paths or ["/usr/local/share"]
     return module.create_ros2_control_kernel_from_paths(
-        "ur5_test",
+        model_name,
         "arm",
-        str(URDF_PATH),
-        str(SRDF_PATH),
-        ["/usr/local/share"],
+        str(urdf_path),
+        str(srdf_path),
+        package_paths,
         config,
         None,
     )
@@ -698,6 +709,119 @@ def test_ros2_control_backend_reset_clears_inflight_gripper_command():
 
         second = bundle.command_ros_gripper("primary", 0.0, 10.0, 5.0)
         assert second["accepted"] is True
+    finally:
+        stop_event.set()
+        try:
+            bundle.reset()
+        except RuntimeError:
+            pass
+        action_server.destroy()
+        executor.shutdown()
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+def test_ros2_control_gripper_updates_roboplan_scene_group_state():
+    rclpy = pytest.importorskip("rclpy")
+    pytest.importorskip("control_msgs")
+
+    from control_msgs.action import GripperCommand
+    from rclpy.action import ActionServer
+    from rclpy.executors import MultiThreadedExecutor
+
+    suffix = uuid.uuid4().hex
+    gripper_action = f"/manyforge_contract_gripper_scene_{suffix}/gripper_cmd"
+    rclpy.init(args=None)
+    executor = MultiThreadedExecutor(num_threads=2)
+    node = rclpy.create_node(f"manyforge_contract_gripper_scene_{suffix}")
+    stop_event = threading.Event()
+
+    def execute_gripper_goal(goal_handle):
+        target = float(goal_handle.request.command.position)
+        result = GripperCommand.Result()
+        start = time.monotonic()
+        while not stop_event.is_set():
+            progress = min(max((time.monotonic() - start) / 0.2, 0.0), 1.0)
+            feedback = GripperCommand.Feedback()
+            feedback.position = target * progress
+            feedback.effort = 0.0
+            feedback.stalled = False
+            feedback.reached_goal = progress >= 1.0
+            goal_handle.publish_feedback(feedback)
+            if progress >= 1.0:
+                goal_handle.succeed()
+                result.position = target
+                result.effort = 0.0
+                result.stalled = False
+                result.reached_goal = True
+                return result
+            time.sleep(0.02)
+        goal_handle.abort()
+        result.position = 0.0
+        result.effort = 0.0
+        result.stalled = True
+        result.reached_goal = False
+        return result
+
+    action_server = ActionServer(
+        node,
+        GripperCommand,
+        gripper_action,
+        execute_callback=execute_gripper_goal,
+    )
+    executor.add_node(node)
+    spin_thread = threading.Thread(target=executor.spin, daemon=True)
+    spin_thread.start()
+    bundle = _create_bundle(
+        action_name=f"/manyforge_contract_gripper_scene_{suffix}/follow_joint_trajectory",
+        joint_state_topic=f"/manyforge_contract_gripper_scene_{suffix}/joint_states",
+        controller_state_topic=f"/manyforge_contract_gripper_scene_{suffix}/controller_state",
+        wait_s=0.05,
+        model_name="ur10e_robotiq_contract",
+        urdf_path=UR10E_ROBOTIQ_URDF_PATH,
+        srdf_path=UR10E_ROBOTIQ_SRDF_PATH,
+        package_paths=["/workspace"],
+        config_overrides={
+            "execution_state_source_mode": "commanded_sim",
+            "require_fresh_state_before_planning": False,
+            "initial_joint_positions_rad": START_POSITIONS,
+            "disable_controller_path_tolerances": True,
+        },
+    )
+    try:
+        if not hasattr(bundle, "configure_ros_gripper_action"):
+            pytest.skip("manyforge_roboplan_py was built without ROS gripper support")
+
+        assert bundle.get_group_joint_positions("gripper") == pytest.approx([0.0])
+        bundle.configure_ros_gripper_action(
+            "primary",
+            {
+                "action_name": gripper_action,
+                "group_id": "gripper",
+                "joint_name": "finger_joint",
+                "wait_for_action_server_timeout_s": 2.0,
+                "result_timeout_s": 2.0,
+            },
+        )
+        time.sleep(0.2)
+
+        result = bundle.command_ros_gripper("primary", 0.7, 0.2, 5.0)
+        assert result["accepted"] is True, result
+
+        deadline = time.monotonic() + 1.5
+        observed_motion = False
+        final_position = 0.0
+        while time.monotonic() < deadline:
+            bundle.update_ros_grippers()
+            final_position = bundle.get_group_joint_positions("gripper")[0]
+            if 0.05 < final_position < 0.69:
+                observed_motion = True
+            if abs(final_position - 0.7) <= 2e-2:
+                break
+            time.sleep(0.02)
+
+        assert observed_motion
+        assert final_position == pytest.approx(0.7, abs=2e-2)
     finally:
         stop_event.set()
         try:

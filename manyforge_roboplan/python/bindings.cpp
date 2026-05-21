@@ -1425,6 +1425,12 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
               config.action_name =
                   config_dict["action_name"].cast<std::string>();
             }
+            if (config_dict.contains("group_id")) {
+              config.group_id = config_dict["group_id"].cast<std::string>();
+            }
+            if (config_dict.contains("joint_name")) {
+              config.joint_name = config_dict["joint_name"].cast<std::string>();
+            }
             if (config_dict.contains("wait_for_action_server_timeout_s")) {
               config.wait_for_action_server_timeout_s =
                   finite_scale_from_python(

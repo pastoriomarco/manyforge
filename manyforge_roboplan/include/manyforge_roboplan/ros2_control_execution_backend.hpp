@@ -62,6 +62,12 @@ struct Ros2ControlExecutionBackendConfig {
 
 struct Ros2GripperActionConfig {
   std::string action_name = "/robotiq_gripper_controller/gripper_cmd";
+  // Optional RoboPlan scene projection metadata. When set, the ROS gripper
+  // command/status path also updates the declared gripper group so Composer's
+  // FK/link-pose scene state renders the gripper through the same robot-state
+  // path as the arm.
+  std::string group_id;
+  std::string joint_name;
   double wait_for_action_server_timeout_s = 2.0;
   double result_timeout_s = 5.0;
 };
@@ -199,6 +205,7 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
     bool executing = false;
     bool goal_accepted = false;
     bool cancel_pending = false;
+    std::optional<double> start_position;
     std::optional<double> current_position;
     std::optional<double> max_effort;
     double target_position = 0.0;
@@ -238,6 +245,18 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
       const core::TrajectoryDTO& trajectory, double time_s) const;
   bool update_scene_positions(const std::vector<double>& joint_positions,
                               SceneUpdateMode mode = SceneUpdateMode::kBlocking);
+  std::optional<double> scene_group_joint_position(
+      const std::string& group_id,
+      const std::string& joint_name) const;
+  bool update_scene_group_joint_position(
+      const std::string& group_id,
+      const std::string& joint_name,
+      double position,
+      SceneUpdateMode mode = SceneUpdateMode::kBlocking);
+  void project_gripper_position_to_scene(
+      const Ros2GripperActionConfig& config,
+      double position,
+      SceneUpdateMode mode = SceneUpdateMode::kBlocking);
   void publish_snapshot(core::ExecutionState state,
                         double progress,
                         const std::vector<double>& joint_positions,

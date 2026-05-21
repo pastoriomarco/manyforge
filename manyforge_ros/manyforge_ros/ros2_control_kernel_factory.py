@@ -125,6 +125,8 @@ def _configure_ros_grippers(native_bundle: Any, deployment: Deployment, config: 
             gripper_id,
             {
                 "action_name": action_name,
+                "group_id": str(gripper.group_id),
+                "joint_name": str(gripper.joint_name),
                 "wait_for_action_server_timeout_s": float(
                     gripper_config.get("wait_for_action_server_timeout_s", 2.0)
                 ),

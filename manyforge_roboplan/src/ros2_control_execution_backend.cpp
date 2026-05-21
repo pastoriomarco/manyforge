@@ -783,6 +783,99 @@ bool Ros2ControlExecutionBackend::update_scene_positions(
   return true;
 }
 
+std::optional<double> Ros2ControlExecutionBackend::scene_group_joint_position(
+    const std::string& group_id,
+    const std::string& joint_name) const {
+  if (group_id.empty() || joint_name.empty() || !scene_) {
+    return std::nullopt;
+  }
+  std::lock_guard<std::mutex> scene_lock(*scene_mutex_);
+  const auto maybe_group_info = scene_->getJointGroupInfo(group_id);
+  if (!maybe_group_info) {
+    return std::nullopt;
+  }
+  const auto& group_info = *maybe_group_info;
+  const auto joint_it =
+      std::find(group_info.joint_names.begin(), group_info.joint_names.end(),
+                joint_name);
+  if (joint_it == group_info.joint_names.end()) {
+    return std::nullopt;
+  }
+  const auto index =
+      static_cast<size_t>(std::distance(group_info.joint_names.begin(), joint_it));
+  if (index >= static_cast<size_t>(group_info.q_indices.size())) {
+    return std::nullopt;
+  }
+  const auto q = scene_->getCurrentJointPositions();
+  const auto q_index = group_info.q_indices[static_cast<Eigen::Index>(index)];
+  if (q_index < 0 || q_index >= q.size()) {
+    return std::nullopt;
+  }
+  return q[q_index];
+}
+
+bool Ros2ControlExecutionBackend::update_scene_group_joint_position(
+    const std::string& group_id,
+    const std::string& joint_name,
+    double position,
+    SceneUpdateMode mode) {
+  if (group_id.empty() || joint_name.empty() || !std::isfinite(position) || !scene_) {
+    return false;
+  }
+  std::unique_lock<std::mutex> scene_lock(*scene_mutex_, std::defer_lock);
+  if (mode == SceneUpdateMode::kBestEffort) {
+    if (!scene_lock.try_lock()) {
+      return false;
+    }
+  } else {
+    scene_lock.lock();
+  }
+  const auto maybe_group_info = scene_->getJointGroupInfo(group_id);
+  if (!maybe_group_info) {
+    return false;
+  }
+  const auto& group_info = *maybe_group_info;
+  const auto joint_it =
+      std::find(group_info.joint_names.begin(), group_info.joint_names.end(),
+                joint_name);
+  if (joint_it == group_info.joint_names.end()) {
+    return false;
+  }
+  if (group_info.joint_names.size() !=
+      static_cast<size_t>(group_info.q_indices.size())) {
+    return false;
+  }
+  const auto q_current = scene_->getCurrentJointPositions();
+  Eigen::VectorXd group_q(group_info.q_indices.size());
+  for (Eigen::Index i = 0; i < group_info.q_indices.size(); ++i) {
+    const auto q_index = group_info.q_indices[i];
+    if (q_index < 0 || q_index >= q_current.size()) {
+      return false;
+    }
+    group_q[i] = q_current[q_index];
+  }
+  const auto group_index =
+      static_cast<Eigen::Index>(std::distance(group_info.joint_names.begin(), joint_it));
+  group_q[group_index] = position;
+  auto q_full = group_q;
+  if (q_full.size() != q_current.size()) {
+    q_full = scene_->toFullJointPositions(group_id, group_q);
+  }
+  scene_->setJointPositions(q_full);
+  return true;
+}
+
+void Ros2ControlExecutionBackend::project_gripper_position_to_scene(
+    const Ros2GripperActionConfig& config,
+    double position,
+    SceneUpdateMode mode) {
+  if (config.group_id.empty() || config.joint_name.empty()) {
+    return;
+  }
+  (void)update_scene_group_joint_position(config.group_id, config.joint_name,
+                                          position, mode);
+}
+
 void Ros2ControlExecutionBackend::publish_snapshot(
     core::ExecutionState state,
     double progress,
@@ -1759,6 +1852,10 @@ void Ros2ControlExecutionBackend::configure_gripper_action(
       config.result_timeout_s < 0.0) {
     throw std::invalid_argument("gripper action timing config is invalid");
   }
+  if (config.group_id.empty() != config.joint_name.empty()) {
+    throw std::invalid_argument(
+        "gripper group_id and joint_name must be configured together");
+  }
   auto runtime = std::make_shared<GripperRuntime>();
   runtime->config = std::move(config);
   runtime->action_client =
@@ -1774,18 +1871,30 @@ void Ros2ControlExecutionBackend::on_gripper_feedback(
   if (!runtime || !feedback) {
     return;
   }
-  std::lock_guard<std::mutex> lock(runtime->mutex);
-  if (!runtime->executing) {
-    return;
+  Ros2GripperActionConfig runtime_config;
+  std::optional<double> feedback_position;
+  bool reached_goal = false;
+  {
+    std::lock_guard<std::mutex> lock(runtime->mutex);
+    if (!runtime->executing) {
+      return;
+    }
+    runtime_config = runtime->config;
+    runtime->current_position = feedback->position;
+    feedback_position = feedback->position;
+    reached_goal = feedback->reached_goal;
+    if (reached_goal) {
+      runtime->state = "completed";
+      runtime->executing = false;
+      runtime->goal_accepted = false;
+      runtime->cancel_pending = false;
+      runtime->active_goal_handle.reset();
+      runtime->error.clear();
+    }
   }
-  runtime->current_position = feedback->position;
-  if (feedback->reached_goal) {
-    runtime->state = "completed";
-    runtime->executing = false;
-    runtime->goal_accepted = false;
-    runtime->cancel_pending = false;
-    runtime->active_goal_handle.reset();
-    runtime->error.clear();
+  if (feedback_position.has_value() && (!is_commanded_sim_mode() || reached_goal)) {
+    project_gripper_position_to_scene(runtime_config, *feedback_position,
+                                      SceneUpdateMode::kBestEffort);
   }
 }
 
@@ -1795,36 +1904,49 @@ void Ros2ControlExecutionBackend::on_gripper_result(
   if (!runtime) {
     return;
   }
-  std::lock_guard<std::mutex> lock(runtime->mutex);
-  runtime->active_goal_handle.reset();
-  runtime->goal_accepted = false;
-  runtime->cancel_pending = false;
-  runtime->executing = false;
-  if (result.result) {
-    runtime->current_position = result.result->position;
-  }
-  switch (result.code) {
-    case rclcpp_action::ResultCode::SUCCEEDED:
-      if (result.result && result.result->reached_goal) {
-        runtime->state = "completed";
-        runtime->error.clear();
-      } else {
+  Ros2GripperActionConfig runtime_config;
+  std::optional<double> result_position;
+  {
+    std::lock_guard<std::mutex> lock(runtime->mutex);
+    runtime_config = runtime->config;
+    runtime->active_goal_handle.reset();
+    runtime->goal_accepted = false;
+    runtime->cancel_pending = false;
+    runtime->executing = false;
+    if (result.result) {
+      runtime->current_position = result.result->position;
+      result_position = result.result->position;
+    }
+    switch (result.code) {
+      case rclcpp_action::ResultCode::SUCCEEDED:
+        if (result.result && result.result->reached_goal) {
+          runtime->state = "completed";
+          runtime->error.clear();
+          if (!result_position.has_value()) {
+            result_position = runtime->target_position;
+          }
+        } else {
+          runtime->state = "failed";
+          runtime->error = "Gripper action succeeded without reaching the goal";
+        }
+        break;
+      case rclcpp_action::ResultCode::ABORTED:
         runtime->state = "failed";
-        runtime->error = "Gripper action succeeded without reaching the goal";
-      }
-      break;
-    case rclcpp_action::ResultCode::ABORTED:
-      runtime->state = "failed";
-      runtime->error = "Gripper action aborted";
-      break;
-    case rclcpp_action::ResultCode::CANCELED:
-      runtime->state = "idle";
-      runtime->error.clear();
-      break;
-    default:
-      runtime->state = "failed";
-      runtime->error = "Gripper action returned an unknown result code";
-      break;
+        runtime->error = "Gripper action aborted";
+        break;
+      case rclcpp_action::ResultCode::CANCELED:
+        runtime->state = "idle";
+        runtime->error.clear();
+        break;
+      default:
+        runtime->state = "failed";
+        runtime->error = "Gripper action returned an unknown result code";
+        break;
+    }
+  }
+  if (result_position.has_value()) {
+    project_gripper_position_to_scene(runtime_config, *result_position,
+                                      SceneUpdateMode::kBestEffort);
   }
 }
 
@@ -1882,6 +2004,18 @@ Ros2GripperCommandResult Ros2ControlExecutionBackend::command_gripper(
     }
     runtime = it->second;
   }
+  const Ros2GripperActionConfig runtime_config = runtime->config;
+  std::optional<double> start_position;
+  if (!runtime_config.group_id.empty() || !runtime_config.joint_name.empty()) {
+    start_position = scene_group_joint_position(runtime_config.group_id,
+                                                runtime_config.joint_name);
+    if (!start_position.has_value()) {
+      return {false,
+              "Cannot project gripper '" + gripper_id +
+                  "' into RoboPlan scene group '" + runtime_config.group_id +
+                  "' joint '" + runtime_config.joint_name + "'"};
+    }
+  }
 
   const auto wait_timeout = std::chrono::duration<double>(
       runtime->config.wait_for_action_server_timeout_s);
@@ -1900,6 +2034,8 @@ Ros2GripperCommandResult Ros2ControlExecutionBackend::command_gripper(
     runtime->executing = true;
     runtime->goal_accepted = false;
     runtime->cancel_pending = false;
+    runtime->start_position = start_position;
+    runtime->current_position = start_position;
     runtime->target_position = target_position;
     runtime->duration_s = duration_s;
     runtime->max_effort = max_effort;
@@ -1985,6 +2121,9 @@ Ros2GripperCommandResult Ros2ControlExecutionBackend::command_gripper(
     }
     return {false, runtime->error};
   }
+  if (duration_s <= 0.0 && start_position.has_value()) {
+    project_gripper_position_to_scene(runtime_config, target_position);
+  }
   return {true, ""};
 }
 
@@ -2000,11 +2139,14 @@ void Ros2ControlExecutionBackend::update_gripper_commands() {
   for (auto& runtime : runtimes) {
     GoalHandleGripper::SharedPtr goal_handle;
     rclcpp_action::Client<GripperCommand>::SharedPtr action_client;
+    Ros2GripperActionConfig runtime_config;
+    std::optional<double> scene_position;
     {
       std::lock_guard<std::mutex> lock(runtime->mutex);
       if (!runtime->executing) {
         continue;
       }
+      runtime_config = runtime->config;
       if (runtime->deadline_at.has_value() && now >= *runtime->deadline_at) {
         goal_handle = runtime->active_goal_handle;
         action_client = runtime->action_client;
@@ -2014,7 +2156,26 @@ void Ros2ControlExecutionBackend::update_gripper_commands() {
         runtime->goal_accepted = false;
         runtime->cancel_pending = false;
         runtime->error = "Timed out waiting for gripper action result";
+      } else if (!runtime_config.group_id.empty() &&
+                 !runtime_config.joint_name.empty()) {
+        if (is_commanded_sim_mode() && runtime->start_position.has_value()) {
+          const double duration = std::max(1e-9, runtime->duration_s);
+          const double progress =
+              clamp_progress(seconds_since(runtime->started_at, now) / duration);
+          scene_position =
+              *runtime->start_position +
+              (runtime->target_position - *runtime->start_position) * progress;
+          runtime->current_position = scene_position;
+        } else if (runtime->current_position.has_value()) {
+          scene_position = *runtime->current_position;
+        } else if (runtime->start_position.has_value()) {
+          scene_position = *runtime->start_position;
+        }
       }
+    }
+    if (scene_position.has_value()) {
+      project_gripper_position_to_scene(runtime_config, *scene_position,
+                                        SceneUpdateMode::kBestEffort);
     }
     if (action_client && goal_handle) {
       try {

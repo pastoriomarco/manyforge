@@ -202,6 +202,8 @@ def build_scene_state_payload(state: ComposerState) -> dict[str, Any]:
         tcp_frame = state.program.robot.tcp_frame
         base_pose = dict(state.program.robot.base_pose or {})
 
+    _advance_gripper_commands(state)
+
     joint_positions_by_name: dict[str, float] = {}
     joint_names: list[str] = []
     if state.kernel is not None:
@@ -334,7 +336,7 @@ def build_scene_state_payload(state: ComposerState) -> dict[str, Any]:
         robot=robot_info,
         objects=objects,
         link_poses=link_poses,
-        grippers=_collect_gripper_states(state),
+        grippers=_collect_gripper_states(state, advance_commands=False),
         object_axes_gizmo_size_m=state.get_object_axes_gizmo_size(),
         timestamp_ns=timestamp_ns,
     ).model_dump()
@@ -381,7 +383,21 @@ def _direct_gripper_cycle_blocker(state: ComposerState) -> JSONResponse | None:
     return None
 
 
-def _collect_gripper_states(state: ComposerState) -> list[SceneGripperStateResponse]:
+def _advance_gripper_commands(state: ComposerState) -> None:
+    kernel = state.kernel
+    if kernel is None:
+        return
+    try:
+        kernel.update_gripper_commands()
+    except Exception:
+        logger.debug("update_gripper_commands failed", exc_info=True)
+
+
+def _collect_gripper_states(
+    state: ComposerState,
+    *,
+    advance_commands: bool = True,
+) -> list[SceneGripperStateResponse]:
     """One entry per gripper declared in the active deployment. Surfaces
     enough metadata for the Robot panel's gripper widget to render a
     slider with correct URDF limits and any SRDF-named presets, plus the
@@ -395,10 +411,8 @@ def _collect_gripper_states(state: ComposerState) -> list[SceneGripperStateRespo
     # widget is the only client outside the BT cycle, so without this
     # call the simulated finger position never progresses from its
     # "executing" snapshot toward the target.
-    try:
-        kernel.update_gripper_commands()
-    except Exception:
-        logger.debug("update_gripper_commands failed", exc_info=True)
+    if advance_commands:
+        _advance_gripper_commands(state)
     joint_limits: dict[str, tuple[Optional[float], Optional[float]]] = {}
     try:
         from .routes_urdf import get_urdf_entry
