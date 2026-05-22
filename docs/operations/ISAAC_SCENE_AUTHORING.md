@@ -212,6 +212,44 @@ a cyan translucent overlay so you can compare Isaac/perception state with
 Composer's backend-authoritative planning scene. The overlay is viewer-only;
 it does not modify object poses.
 
+## 8. Qualify visual-state responsiveness during a live cycle
+
+The native viewer should read Composer's published visual-state snapshot, not
+the mutable planning scene. While Isaac and Composer are running, use the live
+probe to record whether `/api/scene/state` stays on the snapshot path during
+the pick/place cycle:
+
+```bash
+cd ${MANYFORGE_REPO_ROOT}
+
+docker compose run --rm --network host dev bash -lc '
+  python scripts/qualify-visual-state-live.py \
+    --base-url http://127.0.0.1:9000 \
+    --duration-s 90 \
+    --hz 10 \
+    --max-p95-ms 100 \
+    --samples-jsonl /tmp/manyforge-visual-state-samples.jsonl \
+    --summary-json /tmp/manyforge-visual-state-summary.json'
+```
+
+Run the probe while the browser or a scenario harness drives the program. It is
+read-only; it does not start, stop, reset, or otherwise mutate the cell state.
+
+Acceptance for the current migration:
+
+1. `mode` is `visual_snapshot` for steady-state samples. A short
+   `visual_snapshot_pending` window is acceptable immediately after reload or
+   reset. `legacy_live` is no longer an accepted scene-state route mode.
+2. p95 `/api/scene/state` latency remains under the configured budget while
+   planning, validation, gripper motion, and pose-source polling are active.
+3. `snapshot_publisher_error` remains empty and the stale ratio stays within
+   the configured budget.
+4. Object and gripper counts remain plausible for the loaded scene, so a fast
+   route is not hiding missing observer data.
+
+If the probe fails, keep the JSONL samples and Composer logs. The samples show
+exactly when the viewer fell back, went stale, or exceeded the latency budget.
+
 ## Troubleshooting
 
 | Symptom | Likely cause | Fix |

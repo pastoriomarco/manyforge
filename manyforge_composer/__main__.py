@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 import logging
 import os
 from pathlib import Path
@@ -211,12 +212,34 @@ def build_program_loaded_callback(
         _hmi_server.load_program(st.effective_program or st.program)
 
         def on_scene_edit(operation: str, request):
+            visual_request = request
+            if getattr(request, "operation", operation) != operation:
+                try:
+                    visual_request = replace(request, operation=operation)
+                except Exception:
+                    visual_request = request
+            visual_update = st.apply_visual_scene_edit_success(visual_request)
+            if visual_update.get("needs_refresh"):
+                st.request_visual_scene_objects_refresh(
+                    reason=f"scene_edit_callback_{operation}"
+                )
             _hmi_server.request_scene_sync(
                 reason="scene_edit_callback",
                 operation=operation,
                 object_id=request.object_id,
             )
-            logger.debug("Scene invalidation requested after %s '%s'", operation, request.object_id)
+            logger.debug(
+                "Scene invalidation requested after %s '%s'",
+                operation,
+                request.object_id,
+                extra={
+                    "event": "manyforge.visual.scene_edit_callback",
+                    "operation": operation,
+                    "object_id": request.object_id,
+                    "visual_cache_updated": bool(visual_update.get("updated")),
+                    "visual_refresh_requested": bool(visual_update.get("needs_refresh")),
+                },
+            )
 
         bb = py_trees.blackboard.Client(name="composer_scene_sync")
         bb.register_key(key="scene_edit_callback", access=py_trees.common.Access.WRITE)

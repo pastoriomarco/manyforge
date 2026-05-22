@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import threading
 import time
 from types import SimpleNamespace
 from typing import Any
@@ -288,6 +289,15 @@ def test_continuous_snapshot_applies_planning_scene_without_operator_apply(tmp_p
         pose_sources=_pose_sources(box_policy="continuous")
     )
     _add_box(client)
+    refresh_reasons: list[str] = []
+    publish_reasons: list[str] = []
+    state.request_visual_scene_objects_refresh = (
+        lambda *, reason="": refresh_reasons.append(reason)
+        or {"success": True, "queued": True}
+    )
+    state.request_visual_state_publish = (
+        lambda *, reason="": publish_reasons.append(reason)
+    )
 
     response = _post_fresh_box_snapshot(client)
 
@@ -302,6 +312,51 @@ def test_continuous_snapshot_applies_planning_scene_without_operator_apply(tmp_p
     assert object_pose["position_m"] == [1.0, 2.0, 3.0]
     assert state.kernel.scene_edits[-1].operation == "update_pose"
     assert state.kernel.scene_edits[-1].frame_id == "universe"
+    visual_objects, _meta = state.visual_scene_objects_snapshot()
+    assert visual_objects[0].pose_in_universe["position_m"] == [1.0, 2.0, 3.0]
+    assert refresh_reasons == []
+    assert publish_reasons == [
+        "scene_edit_update_pose",
+        "pose_source_continuous",
+        "scene_state_cache_empty",
+    ]
+
+
+def test_scene_state_does_not_wait_for_blocked_pose_source_apply(tmp_path: Path) -> None:
+    client, state = _client(tmp_path)
+    state.deployment = _minimal_deployment(
+        pose_sources=_pose_sources(box_policy="continuous")
+    )
+    _add_box(client)
+    original_scene_edit = state.kernel.scene_edit
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocking_scene_edit(request: SceneEditRequest):
+        if request.operation == "update_pose":
+            entered.set()
+            assert release.wait(timeout=5.0)
+        return original_scene_edit(request)
+
+    state.kernel.scene_edit = blocking_scene_edit  # type: ignore[method-assign]
+
+    try:
+        response = _post_fresh_box_snapshot(client)
+        assert response.json()["continuous_apply"]["queued"] is True
+        assert entered.wait(timeout=2.0)
+
+        started = time.monotonic()
+        scene = client.get("/api/scene/state").json()
+        elapsed_ms = (time.monotonic() - started) * 1000.0
+    finally:
+        release.set()
+        apply_result = _wait_for_pose_source_apply(state)
+
+    assert elapsed_ms < 50.0
+    assert scene["objects"][0]["pose_in_universe"]["position_m"] == [0.0, 0.0, 0.0]
+    assert scene["pose_sources"][0]["objects"][0]["status"] == "fresh"
+    assert apply_result["success"] is True
+    assert apply_result["applied_count"] == 1
 
 
 def test_continuous_snapshot_preserves_attached_object_chain(tmp_path: Path) -> None:

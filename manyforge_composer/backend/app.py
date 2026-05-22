@@ -63,6 +63,7 @@ def create_app(
         hub._task = asyncio.create_task(hub._broadcast_loop())
         yield
         logger.info("ManyForge Composer shutting down")
+        state.stop_visual_state_publisher()
         hub.stop()
 
     app = FastAPI(title="ManyForge Composer", lifespan=lifespan)

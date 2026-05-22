@@ -407,7 +407,7 @@ def create_direct_router(state: ComposerState) -> APIRouter:
         # slider at the operator's requested position; any
         # divergence (planner caps, collision halts) overrides this
         # on the next scene-state poll during execution.
-        state._last_known_joint_positions_rad = list(target_positions)
+        state.record_current_joint_positions(list(target_positions))
 
         return _session_response(session)
 

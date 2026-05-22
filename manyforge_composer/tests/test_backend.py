@@ -2109,6 +2109,24 @@ def test_program_load_callback_registers_scene_edit_callback(caplog):
     bb.register_key(key="scene_edit_callback", access=py_trees.common.Access.READ)
     assert callable(bb.scene_edit_callback)
 
+    bb.scene_edit_callback(
+        "add",
+        SceneEditRequest(
+            operation="add",
+            object_id="visual_box",
+            shape_type="box",
+            box_dimensions_m=[0.1, 0.2, 0.3],
+            pose_position_m=[0.4, 0.5, 0.6],
+            pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
+            frame_id="universe",
+        ),
+    )
+    visual_objects, visual_meta = state.visual_scene_objects_snapshot()
+    assert visual_meta["timestamp_ns"] > 0
+    assert [obj.object_id for obj in visual_objects] == ["visual_box"]
+    assert visual_objects[0].attached is False
+    assert visual_objects[0].pose_in_universe["position_m"] == [0.4, 0.5, 0.6]
+
     state.cycle_manager._on_run_from_idle()
     assert server.scene_renderer.cleared
     assert server.scene_sync_requested > 0

@@ -34,6 +34,16 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Install native visual-FK dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          # The Pinocchio wheel used by the observer-safe visual snapshot
+          # path dynamically links against Ubuntu's URDFDOM runtime
+          # libraries, including liburdfdom_sensor.so.4.0.  The dev package
+          # depends on the complete runtime set and keeps the FK test lane
+          # close to the production/dev-container native dependency shape.
+          sudo apt-get install -y --no-install-recommends liburdfdom-dev
       - name: Install test dependencies
         run: |
           set -euo pipefail
@@ -44,10 +54,18 @@ jobs:
           # directly; integration tests that need the C++ kernel run in the
           # cpp-tsan / dev-container lanes.
           pip install -e manyforge_behavior
-          pip install -e manyforge_composer
+          # Exercise the production visual-state FK path. Lightweight
+          # deployments may omit this extra and receive structured
+          # pinocchio_unavailable diagnostics, but CI must keep the native
+          # snapshot path covered.
+          pip install -e "manyforge_composer[visual]"
           pip install -e manyforge_assistant_bridge
           pip install py_trees pyyaml fastapi uvicorn
           pip check
+          python - <<'PY'
+          import pinocchio
+          print(f"pinocchio {pinocchio.__version__} import ok")
+          PY
       - name: Run pytest
         env:
           PYTHONPATH: ${{ github.workspace }}:${{ github.workspace }}/manyforge_behavior:${{ github.workspace }}/manyforge_composer:${{ github.workspace }}/manyforge_assistant_bridge

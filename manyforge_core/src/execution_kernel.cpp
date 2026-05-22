@@ -8,6 +8,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <thread>
 
 namespace manyforge::core {
 namespace {
@@ -1002,8 +1003,7 @@ void ExecutionKernel::async_execute_worker(
       }
 
       const auto loop_state = sm_.status().state;
-      if (completed ||
-          loop_state == ExecutionState::kStopped ||
+      if (loop_state == ExecutionState::kStopped ||
           loop_state == ExecutionState::kIdle ||
           loop_state == ExecutionState::kFailed ||
           loop_state == ExecutionState::kInterventionRequired) {
@@ -1011,7 +1011,7 @@ void ExecutionKernel::async_execute_worker(
       }
 
       if (latest_backend_snapshot.state == ExecutionState::kPaused ||
-          sm_.status().state == ExecutionState::kPaused) {
+          loop_state == ExecutionState::kPaused) {
         stop_collision_monitoring();
 
         if (resume_requested_.exchange(false)) {
@@ -1114,7 +1114,20 @@ void ExecutionKernel::async_execute_worker(
           start_collision_monitoring();
         }
 
+        if (completed) {
+          // Some real backends implement pause by cancelling the active
+          // controller goal. Their execution handle is then terminal even
+          // though the kernel state is intentionally kPaused. Keep the kernel
+          // worker alive so a later resume() can revalidate and dispatch the
+          // remaining trajectory; otherwise the state machine can advance to
+          // kValidating with no worker left to consume resume_requested_.
+          std::this_thread::sleep_for(std::chrono::nanoseconds(kExecutionPollNs));
+        }
         continue;
+      }
+
+      if (completed) {
+        break;
       }
     }
 

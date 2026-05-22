@@ -1051,12 +1051,59 @@ class PoseSourceApplyResponse(BaseModel):
     details: List[Dict[str, Any]] = Field(default_factory=list)
 
 
+class VisualStateRouteDiagnosticsResponse(BaseModel):
+    """Diagnostics for bounded visual-snapshot route assembly."""
+
+    mode: str = "visual_snapshot_pending"
+    served_from_visual_snapshot: bool = False
+    fallback_reason: Optional[str] = None
+    total_ms: float = 0.0
+    timings_ms: Dict[str, float] = Field(default_factory=dict)
+    slow_steps: Dict[str, float] = Field(default_factory=dict)
+    objects_source: str = "visual_snapshot_pending"
+    objects_age_ms: Optional[float] = None
+    objects_refresh_running: bool = False
+    objects_refresh_error: Optional[str] = None
+    snapshot_age_ms: Optional[float] = None
+    snapshot_sequence_number: Optional[int] = None
+    snapshot_build_ms: Optional[float] = None
+    snapshot_publisher_running: bool = False
+    snapshot_publisher_error: Optional[str] = None
+    snapshot_publisher_error_detail: Optional[str] = None
+    snapshot_stale: bool = False
+
+
+class VisualSceneSnapshotResponse(BaseModel):
+    """Immutable viewer snapshot published outside scene-state request paths.
+
+    Observer routes serve the latest snapshot by cheap copy/serialization.
+    Potentially blocking reads such as execution snapshots, visual FK,
+    scene-object reads, and gripper feedback collection belong in the publisher
+    path, not in HTTP request handling.
+    """
+
+    schema_version: str = "visual_scene_snapshot.v0"
+    sequence_number: int = 0
+    timestamp_ns: int = 0
+    source: str = "visual_snapshot"
+    world_frame: str = "universe"
+    model_key: Optional[str] = None
+    stale: bool = False
+    robot: Optional[SceneRobotResponse] = None
+    objects: List[SceneObjectResponse] = Field(default_factory=list)
+    link_poses: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
+    grippers: List[SceneGripperStateResponse] = Field(default_factory=list)
+    pose_sources: List[PoseSourceStatusResponse] = Field(default_factory=list)
+
+
 class SceneStateResponse(BaseModel):
     robot: Optional[SceneRobotResponse] = None
     objects: List[SceneObjectResponse] = Field(default_factory=list)
     link_poses: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
     grippers: List[SceneGripperStateResponse] = Field(default_factory=list)
     pose_sources: List[PoseSourceStatusResponse] = Field(default_factory=list)
+    visual_state: Optional[VisualSceneSnapshotResponse] = None
+    visual_state_diagnostics: Optional[VisualStateRouteDiagnosticsResponse] = None
     object_axes_gizmo_size_m: float = 0.1
     timestamp_ns: int
 
@@ -1079,6 +1126,10 @@ class SceneFramesResponse(BaseModel):
     frames: List[SceneFrameResponse] = Field(default_factory=list)
     hmi_available: bool = Field(alias="hmiAvailable")
     frame_gizmo_size_m: float = Field(default=0.1, alias="frameGizmoSizeM")
+    visual_state_diagnostics: Optional[VisualStateRouteDiagnosticsResponse] = Field(
+        default=None,
+        alias="visualStateDiagnostics",
+    )
     timestamp_ns: int = Field(alias="timestampNs")
 
 

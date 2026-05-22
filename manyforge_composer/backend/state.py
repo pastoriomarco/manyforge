@@ -1,6 +1,7 @@
 """ComposerState - Holds the runtime state shared across all API routes."""
 from __future__ import annotations
 
+import atexit
 import copy
 import hashlib
 import logging
@@ -8,6 +9,7 @@ import math
 import threading
 import time
 import uuid
+import weakref
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -23,7 +25,12 @@ from manyforge_behavior.program import (
 from manyforge_behavior.deployment import Deployment
 from manyforge_behavior.cycle_manager import CycleManager
 from manyforge_behavior.runner import OrchestratorRunner
-from manyforge_behavior.kernel_client import KernelClient, SceneEditRequest
+from manyforge_behavior.kernel_client import (
+    KernelClient,
+    SceneEditRequest,
+    SceneObjectSnapshot,
+    SceneShape,
+)
 from manyforge_behavior.skill_loader import SkillCatalog, load_skill_catalog, default_skills_dir
 from .event_recorder import EventRecorder
 from .security import normalize_allowed_roots
@@ -31,6 +38,18 @@ from .security import normalize_allowed_roots
 logger = logging.getLogger(__name__)
 _MAX_ASSISTANT_REQUEST_RECORDS = 200
 _MAX_ASSISTANT_PROPOSAL_RECORDS = 500
+_COMPOSER_STATE_INSTANCES: weakref.WeakSet[Any] = weakref.WeakSet()
+
+
+def stop_all_visual_state_publishers(*, timeout_s: float = 0.5) -> None:
+    for state in list(_COMPOSER_STATE_INSTANCES):
+        try:
+            state.stop_visual_state_publisher(timeout_s=timeout_s)
+        except Exception:
+            pass
+
+
+atexit.register(stop_all_visual_state_publishers)
 
 
 def _normalize_scene_snapshot_base_url(value: str, *, field_name: str) -> str:
@@ -249,15 +268,18 @@ class ComposerState:
         self._visible_object_frames: set[str] = set()
         self._frame_gizmo_size_m: float = 0.1
         self._object_axes_gizmo_size_m: float = 0.1
-        # Last-known joint vector, refreshed whenever the kernel reports
-        # one. The kernel's execution snapshot returns
-        # `joint_positions_rad=None` outside an active execution, so
-        # reading "live" joint state via routes_scene would otherwise
-        # see zeros and the robot-control panel slider would mirror
-        # nothing. Day-5c.1 fix: cache the vector so reads after IDLE
-        # return the most-recent value; falls back to the deployment's
-        # execution.config.initial_joint_positions_rad on first read.
+        # Drivable joint metadata + last-known joint vector. The visual
+        # publisher runs concurrently with planning/validation and must not
+        # poll RoboPlan's mutable scene for stable group metadata on every
+        # frame: native get_joint_names() is protected by the planner scene
+        # mutex and can queue behind collision validation. Cache the ordered
+        # joint list at runtime setup, then use execution snapshots for live
+        # positions.
+        self._joint_state_lock = threading.Lock()
+        self._drivable_joint_names: list[str] = []
         self._last_known_joint_positions_rad: list[float] | None = None
+        if kernel is not None:
+            self.refresh_drivable_joint_names(kernel=kernel)
         self.allowed_fs_roots = normalize_allowed_roots(allowed_fs_roots)
         self._runtime_overrides: dict[str, RuntimeOverrideRecord] = {}
         self._program_tree_hash: str = ""
@@ -292,11 +314,33 @@ class ComposerState:
         self._pose_source_apply_pending: dict[str, dict[str, Any]] = {}
         self._pose_source_apply_running = False
         self._pose_source_apply_last_result: dict[str, Any] | None = None
+        self._visual_scene_objects_lock = threading.Lock()
+        self._visual_scene_objects: list[SceneObjectSnapshot] = []
+        self._visual_scene_object_attachment_offsets: dict[str, dict[str, Any]] = {}
+        self._visual_scene_objects_timestamp_ns = 0
+        self._visual_scene_objects_refresh_attempt_ns = 0
+        self._visual_scene_objects_refresh_running = False
+        self._visual_scene_objects_refresh_error: str | None = None
+        self._visual_state_lock = threading.Lock()
+        self._visual_state_snapshot: Any | None = None
+        self._visual_state_timestamp_ns = 0
+        self._visual_state_last_duration_ms: float | None = None
+        self._visual_state_last_error: str | None = None
+        self._visual_state_last_error_detail: str | None = None
+        self._visual_state_last_reason: str = ""
+        self._visual_state_next_reason: str = ""
+        self._visual_state_publisher_running = False
+        self._visual_state_publisher_thread: threading.Thread | None = None
+        self._visual_state_publisher_wake = threading.Event()
+        self._visual_state_publisher_stop = threading.Event()
+        self._visual_state_publisher_builder: Callable[[], Any] | None = None
+        self._visual_state_publisher_period_s = 1.0 / 15.0
         self.skill_catalog: SkillCatalog = load_skill_catalog(
             default_skills_dir(),
             catalog=self.catalog,
             strict=True,
         )
+        _COMPOSER_STATE_INSTANCES.add(self)
 
     def _prune_assistant_requests_locked(self) -> None:
         if len(self._assistant_requests) <= _MAX_ASSISTANT_REQUEST_RECORDS:
@@ -1446,7 +1490,56 @@ class ComposerState:
             raise RuntimeError("Runtime overrides may only be changed in IDLE or DIRECT_CONTROL")
         return cycle_state
 
-    def get_current_joint_positions(self) -> Optional[list[float]]:
+    def refresh_drivable_joint_names(self, *, kernel: Any | None = None) -> list[str]:
+        """Refresh and return the ordered drivable joint-name cache.
+
+        This may cross into the native backend. Call it during runtime setup or
+        explicit validation, not from observer/publisher hot paths.
+        """
+
+        source = kernel if kernel is not None else self.kernel
+        names: list[str] = []
+        if source is not None:
+            try:
+                names = [str(name) for name in source.get_joint_names()]
+            except Exception:
+                logger.debug(
+                    "drivable joint-name refresh failed",
+                    exc_info=True,
+                    extra={"event": "manyforge.visual.drivable_joint_names_refresh_failed"},
+                )
+        with self._joint_state_lock:
+            self._drivable_joint_names = list(names)
+            return list(self._drivable_joint_names)
+
+    def get_drivable_joint_names(
+        self,
+        *,
+        allow_backend_refresh: bool = False,
+    ) -> list[str]:
+        """Return cached ordered drivable joint names.
+
+        Observer paths should leave `allow_backend_refresh` false so rendering
+        cannot block behind planner scene locks. Non-hot validation/setup code
+        may opt into a backend refresh when the cache is empty or stale.
+        """
+
+        with self._joint_state_lock:
+            names = list(self._drivable_joint_names)
+        if names or not allow_backend_refresh:
+            return names
+        return self.refresh_drivable_joint_names()
+
+    def record_current_joint_positions(self, positions: list[float]) -> None:
+        with self._joint_state_lock:
+            self._last_known_joint_positions_rad = list(positions)
+
+    def get_current_joint_positions(
+        self,
+        *,
+        joint_names: list[str] | None = None,
+        allow_backend_joint_names: bool = True,
+    ) -> Optional[list[float]]:
         """Return the best-known full joint vector, or None if unknown.
 
         Day-5c.1 lifted this resolution chain into routes_scene for the
@@ -1469,7 +1562,13 @@ class ComposerState:
         """
         if self.kernel is None:
             return None
-        joint_names = self.kernel.get_joint_names()
+        joint_names = list(
+            joint_names
+            if joint_names is not None
+            else self.get_drivable_joint_names(
+                allow_backend_refresh=allow_backend_joint_names
+            )
+        )
         if not joint_names:
             return None
         snapshot = (
@@ -1480,13 +1579,16 @@ class ComposerState:
         snapshot_positions = getattr(snapshot, "joint_positions_rad", None)
         if snapshot_positions and len(snapshot_positions) == len(joint_names):
             live = list(snapshot_positions)
-            self._last_known_joint_positions_rad = live
+            self.record_current_joint_positions(live)
             return live
-        if (
-            self._last_known_joint_positions_rad is not None
-            and len(self._last_known_joint_positions_rad) == len(joint_names)
-        ):
-            return list(self._last_known_joint_positions_rad)
+        with self._joint_state_lock:
+            last_known = (
+                list(self._last_known_joint_positions_rad)
+                if self._last_known_joint_positions_rad is not None
+                else None
+            )
+        if last_known is not None and len(last_known) == len(joint_names):
+            return last_known
         if self.deployment is not None:
             try:
                 execution_adapter = self.deployment.adapters.get("execution")
@@ -1496,9 +1598,723 @@ class ComposerState:
                 initial = execution_adapter.config.get("initial_joint_positions_rad")
                 if isinstance(initial, list) and len(initial) == len(joint_names):
                     seeded = [float(v) for v in initial]
-                    self._last_known_joint_positions_rad = seeded
+                    self.record_current_joint_positions(seeded)
                     return seeded
         return None
+
+    def update_visual_scene_objects_snapshot(
+        self,
+        objects: list[SceneObjectSnapshot],
+        *,
+        error: str | None = None,
+    ) -> None:
+        """Replace the observer-side object snapshot with immutable copies."""
+        visual_snapshot, _meta = self.visual_state_snapshot()
+        link_poses = (
+            copy.deepcopy(getattr(visual_snapshot, "link_poses", {}) or {})
+            if visual_snapshot is not None
+            else {}
+        )
+        with self._visual_scene_objects_lock:
+            copied = copy.deepcopy(list(objects))
+            incoming_ids = {obj.object_id for obj in copied}
+            self._visual_scene_object_attachment_offsets = {
+                object_id: offset
+                for object_id, offset in self._visual_scene_object_attachment_offsets.items()
+                if object_id in incoming_ids
+            }
+            for obj in copied:
+                if not obj.attached:
+                    self._visual_scene_object_attachment_offsets.pop(obj.object_id, None)
+                    continue
+                if obj.frame_id and obj.pose_in_universe:
+                    frame_pose = link_poses.get(obj.frame_id)
+                    if frame_pose is not None:
+                        try:
+                            self._visual_scene_object_attachment_offsets[obj.object_id] = (
+                                self._visual_scene_relative_pose(
+                                    parent_pose=frame_pose,
+                                    child_pose=obj.pose_in_universe,
+                                )
+                            )
+                        except Exception:
+                            logger.debug(
+                                "failed to derive visual attachment offset from backend snapshot",
+                                exc_info=True,
+                                extra={
+                                    "event": "manyforge.visual.attachment_offset_derive_failed",
+                                    "object_id": obj.object_id,
+                                    "frame_id": obj.frame_id,
+                                },
+                            )
+            self._visual_scene_objects = copied
+            self._visual_scene_objects_timestamp_ns = time.monotonic_ns()
+            self._visual_scene_objects_refresh_error = error
+
+    def clear_visual_scene_objects_snapshot(self) -> None:
+        with self._visual_scene_objects_lock:
+            self._visual_scene_objects.clear()
+            self._visual_scene_object_attachment_offsets.clear()
+            self._visual_scene_objects_timestamp_ns = 0
+            self._visual_scene_objects_refresh_attempt_ns = 0
+            self._visual_scene_objects_refresh_error = None
+
+    def visual_scene_objects_snapshot(
+        self,
+    ) -> tuple[list[SceneObjectSnapshot], dict[str, Any]]:
+        """Return cached scene objects and freshness metadata.
+
+        This cache is the object half of the visual-snapshot migration. Routes
+        can read it without touching the mutable planner scene. A background
+        refresh may still block on the backend, but observer HTTP requests do
+        not.
+        """
+        with self._visual_scene_objects_lock:
+            objects = copy.deepcopy(self._visual_scene_objects)
+            timestamp_ns = self._visual_scene_objects_timestamp_ns
+            attempt_ns = self._visual_scene_objects_refresh_attempt_ns
+            running = self._visual_scene_objects_refresh_running
+            error = self._visual_scene_objects_refresh_error
+        age_ms = None
+        if timestamp_ns > 0:
+            age_ms = (time.monotonic_ns() - timestamp_ns) / 1_000_000.0
+        refresh_attempt_age_ms = None
+        if attempt_ns > 0:
+            refresh_attempt_age_ms = (time.monotonic_ns() - attempt_ns) / 1_000_000.0
+        return objects, {
+            "timestamp_ns": timestamp_ns,
+            "age_ms": age_ms,
+            "refresh_attempt_ns": attempt_ns,
+            "refresh_attempt_age_ms": refresh_attempt_age_ms,
+            "refresh_running": running,
+            "refresh_error": error,
+        }
+
+    def visual_scene_objects_for_link_poses(
+        self,
+        link_poses: dict[str, dict[str, Any]] | None,
+    ) -> tuple[list[SceneObjectSnapshot], dict[str, Any]]:
+        """Return cached visual objects, composing attached poses from link poses.
+
+        Attached-object canonical visuals should follow the visual robot model
+        without polling the mutable planner scene. Attachment offsets are
+        recorded when Composer-owned scene-edit paths attach or update an
+        attached object.
+        """
+
+        objects, meta = self.visual_scene_objects_snapshot()
+        if not link_poses:
+            return objects, meta
+        with self._visual_scene_objects_lock:
+            offsets = copy.deepcopy(self._visual_scene_object_attachment_offsets)
+            for obj in objects:
+                if (
+                    not obj.attached
+                    or not obj.frame_id
+                    or obj.pose_in_universe is None
+                    or obj.object_id in offsets
+                ):
+                    continue
+                frame_pose = link_poses.get(obj.frame_id)
+                if frame_pose is None:
+                    continue
+                try:
+                    offset = self._visual_scene_relative_pose(
+                        parent_pose=frame_pose,
+                        child_pose=obj.pose_in_universe,
+                    )
+                except Exception:
+                    logger.debug(
+                        "failed to lazily derive visual attachment offset",
+                        exc_info=True,
+                        extra={
+                            "event": "manyforge.visual.attachment_offset_lazy_derive_failed",
+                            "object_id": obj.object_id,
+                            "frame_id": obj.frame_id,
+                        },
+                    )
+                    continue
+                self._visual_scene_object_attachment_offsets[obj.object_id] = offset
+                offsets[obj.object_id] = offset
+        composed: list[SceneObjectSnapshot] = []
+        for obj in objects:
+            next_obj = copy.deepcopy(obj)
+            if obj.attached and obj.frame_id:
+                offset = offsets.get(obj.object_id)
+                frame_pose = link_poses.get(obj.frame_id)
+                if offset is not None and frame_pose is not None:
+                    try:
+                        frame_matrix = _pose_to_matrix(
+                            list(frame_pose["position_m"]),
+                            list(frame_pose["orientation_xyzw"]),
+                        )
+                        local_matrix = _pose_to_matrix(
+                            list(offset["position_m"]),
+                            list(offset["orientation_xyzw"]),
+                        )
+                        position, orientation = _matrix_to_pose(
+                            _multiply_matrices(frame_matrix, local_matrix)
+                        )
+                        next_obj.pose_in_universe = {
+                            "position_m": position,
+                            "orientation_xyzw": orientation,
+                        }
+                    except Exception:
+                        logger.debug(
+                            "failed to compose visual attached-object pose",
+                            exc_info=True,
+                            extra={
+                                "event": "manyforge.visual.attached_object_compose_failed",
+                                "object_id": obj.object_id,
+                                "frame_id": obj.frame_id,
+                            },
+                        )
+            composed.append(next_obj)
+        return composed, meta
+
+    def _visual_scene_world_frame(self) -> str:
+        deployment = self.deployment
+        context_adapter = None
+        if deployment is not None:
+            context_adapter = deployment.adapters.get("context")
+        context_config = getattr(context_adapter, "config", {}) or {}
+        for key in ("scene_world_frame", "world_frame", "sceneRootFrame", "scene_root_frame"):
+            candidate = context_config.get(key)
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate.strip()
+        return "universe"
+
+    def _visual_scene_is_world_frame(self, frame_id: str | None) -> bool:
+        frame = str(frame_id or "").strip()
+        return frame in {"", "universe", self._visual_scene_world_frame()}
+
+    def _visual_scene_shape_from_edit_request(
+        self,
+        request: SceneEditRequest,
+    ) -> SceneShape | None:
+        if not request.shape_type:
+            return None
+        return SceneShape(
+            type=request.shape_type,
+            box_dimensions_m=(
+                list(request.box_dimensions_m)
+                if request.box_dimensions_m is not None
+                else None
+            ),
+            sphere_radius_m=request.sphere_radius_m,
+            cylinder_radius_m=request.cylinder_radius_m,
+            cylinder_height_m=request.cylinder_height_m,
+            mesh_resource_uri=request.mesh_resource_uri,
+            mesh_scale=(
+                list(request.mesh_scale)
+                if request.mesh_scale is not None
+                else None
+            ),
+        )
+
+    def _visual_scene_pose_dict(
+        self,
+        position_m: list[float] | None,
+        orientation_xyzw: list[float] | None,
+    ) -> dict[str, Any]:
+        return {
+            "position_m": [float(v) for v in (position_m or [0.0, 0.0, 0.0])],
+            "orientation_xyzw": [
+                float(v) for v in (orientation_xyzw or [0.0, 0.0, 0.0, 1.0])
+            ],
+        }
+
+    def _visual_scene_compose_world_pose(
+        self,
+        *,
+        frame_id: str | None,
+        local_pose: dict[str, Any],
+        link_poses: dict[str, dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        if self._visual_scene_is_world_frame(frame_id):
+            return copy.deepcopy(local_pose)
+        frame_pose = link_poses.get(str(frame_id or ""))
+        if frame_pose is None:
+            return None
+        frame_matrix = _pose_to_matrix(
+            list(frame_pose["position_m"]),
+            list(frame_pose["orientation_xyzw"]),
+        )
+        local_matrix = _pose_to_matrix(
+            list(local_pose["position_m"]),
+            list(local_pose["orientation_xyzw"]),
+        )
+        position, orientation = _matrix_to_pose(
+            _multiply_matrices(frame_matrix, local_matrix)
+        )
+        return {"position_m": position, "orientation_xyzw": orientation}
+
+    def _visual_scene_relative_pose(
+        self,
+        *,
+        parent_pose: dict[str, Any],
+        child_pose: dict[str, Any],
+    ) -> dict[str, Any]:
+        parent_matrix = _pose_to_matrix(
+            list(parent_pose["position_m"]),
+            list(parent_pose["orientation_xyzw"]),
+        )
+        child_matrix = _pose_to_matrix(
+            list(child_pose["position_m"]),
+            list(child_pose["orientation_xyzw"]),
+        )
+        position, orientation = _matrix_to_pose(
+            _multiply_matrices(_invert_matrix(parent_matrix), child_matrix)
+        )
+        return {"position_m": position, "orientation_xyzw": orientation}
+
+    def apply_visual_scene_edit_success(
+        self,
+        request: SceneEditRequest,
+    ) -> dict[str, Any]:
+        """Reflect a successful Composer-owned scene edit into visual state.
+
+        Returns whether the observer cache was updated directly and whether a
+        backend refresh is still needed. This enforces the visual snapshot
+        single-writer discipline for HTTP scene edits and pose-source applies:
+        route/read paths should not rediscover successful mutations later by
+        polling the mutable planning scene.
+        """
+
+        visual_snapshot, _meta = self.visual_state_snapshot()
+        link_poses = (
+            copy.deepcopy(getattr(visual_snapshot, "link_poses", {}) or {})
+            if visual_snapshot is not None
+            else {}
+        )
+        now_ns = time.monotonic_ns()
+        updated = False
+        needs_refresh = False
+        with self._visual_scene_objects_lock:
+            objects = copy.deepcopy(self._visual_scene_objects)
+            index_by_id = {obj.object_id: index for index, obj in enumerate(objects)}
+            object_index = index_by_id.get(request.object_id)
+
+            try:
+                if request.operation == "remove":
+                    if object_index is not None:
+                        objects.pop(object_index)
+                    self._visual_scene_object_attachment_offsets.pop(request.object_id, None)
+                    updated = True
+                elif request.operation in {"add", "upsert"}:
+                    shape = self._visual_scene_shape_from_edit_request(request)
+                    if shape is None:
+                        needs_refresh = True
+                    else:
+                        frame_id = request.frame_id or self._visual_scene_world_frame()
+                        local_pose = self._visual_scene_pose_dict(
+                            request.pose_position_m,
+                            request.pose_orientation_xyzw,
+                        )
+                        world_pose = self._visual_scene_compose_world_pose(
+                            frame_id=frame_id,
+                            local_pose=local_pose,
+                            link_poses=link_poses,
+                        )
+                        if world_pose is None:
+                            needs_refresh = True
+                        else:
+                            attached = not self._visual_scene_is_world_frame(frame_id)
+                            snapshot = SceneObjectSnapshot(
+                                object_id=request.object_id,
+                                shape=shape,
+                                pose_in_universe=world_pose,
+                                attached=attached,
+                                frame_id=frame_id,
+                            )
+                            if object_index is None:
+                                objects.append(snapshot)
+                            else:
+                                objects[object_index] = snapshot
+                            if attached:
+                                self._visual_scene_object_attachment_offsets[
+                                    request.object_id
+                                ] = local_pose
+                            else:
+                                self._visual_scene_object_attachment_offsets.pop(
+                                    request.object_id, None
+                                )
+                            updated = True
+                elif request.operation == "update_pose":
+                    if object_index is None:
+                        needs_refresh = True
+                    else:
+                        existing = objects[object_index]
+                        frame_id = request.frame_id or existing.frame_id or self._visual_scene_world_frame()
+                        local_pose = self._visual_scene_pose_dict(
+                            request.pose_position_m,
+                            request.pose_orientation_xyzw,
+                        )
+                        world_pose = self._visual_scene_compose_world_pose(
+                            frame_id=frame_id,
+                            local_pose=local_pose,
+                            link_poses=link_poses,
+                        )
+                        if world_pose is None:
+                            needs_refresh = True
+                        else:
+                            existing.pose_in_universe = world_pose
+                            existing.frame_id = frame_id
+                            existing.attached = not self._visual_scene_is_world_frame(frame_id)
+                            objects[object_index] = existing
+                            if existing.attached:
+                                self._visual_scene_object_attachment_offsets[
+                                    request.object_id
+                                ] = local_pose
+                            else:
+                                self._visual_scene_object_attachment_offsets.pop(
+                                    request.object_id, None
+                                )
+                            updated = True
+                elif request.operation == "attach":
+                    if object_index is None or not request.frame_id:
+                        needs_refresh = True
+                    else:
+                        existing = objects[object_index]
+                        frame_pose = link_poses.get(request.frame_id)
+                        if frame_pose is None or existing.pose_in_universe is None:
+                            needs_refresh = True
+                        else:
+                            local_pose = self._visual_scene_relative_pose(
+                                parent_pose=frame_pose,
+                                child_pose=existing.pose_in_universe,
+                            )
+                            existing.attached = True
+                            existing.frame_id = request.frame_id
+                            objects[object_index] = existing
+                            self._visual_scene_object_attachment_offsets[
+                                request.object_id
+                            ] = local_pose
+                            updated = True
+                elif request.operation == "detach":
+                    if object_index is None:
+                        needs_refresh = True
+                    else:
+                        existing = objects[object_index]
+                        offset = self._visual_scene_object_attachment_offsets.get(
+                            request.object_id
+                        )
+                        if existing.attached and existing.frame_id and offset is not None:
+                            world_pose = self._visual_scene_compose_world_pose(
+                                frame_id=existing.frame_id,
+                                local_pose=offset,
+                                link_poses=link_poses,
+                            )
+                            if world_pose is not None:
+                                existing.pose_in_universe = world_pose
+                        existing.attached = False
+                        existing.frame_id = request.frame_id or self._visual_scene_world_frame()
+                        self._visual_scene_object_attachment_offsets.pop(
+                            request.object_id, None
+                        )
+                        objects[object_index] = existing
+                        updated = True
+                else:
+                    needs_refresh = True
+            except Exception as exc:
+                logger.debug(
+                    "visual scene edit cache update failed",
+                    exc_info=True,
+                    extra={
+                        "event": "manyforge.visual.scene_edit_cache_update_failed",
+                        "operation": request.operation,
+                        "object_id": request.object_id,
+                        "error": str(exc),
+                    },
+                )
+                needs_refresh = True
+                updated = False
+
+            if updated:
+                self._visual_scene_objects = objects
+                self._visual_scene_objects_timestamp_ns = now_ns
+                self._visual_scene_objects_refresh_error = None
+
+        if updated:
+            self.request_visual_state_publish(reason=f"scene_edit_{request.operation}")
+        return {"updated": updated, "needs_refresh": needs_refresh}
+
+    def refresh_visual_scene_objects_sync(self, *, reason: str = "") -> dict[str, Any]:
+        """Refresh cached visual objects from the backend on a non-observer path."""
+        if self.kernel is None:
+            self.update_visual_scene_objects_snapshot([], error="kernel unavailable")
+            return {"success": False, "error": "kernel unavailable", "reason": reason}
+        started = time.monotonic()
+        with self._visual_scene_objects_lock:
+            self._visual_scene_objects_refresh_attempt_ns = time.monotonic_ns()
+        try:
+            objects = list(self.kernel.get_scene_objects())
+        except Exception as exc:
+            with self._visual_scene_objects_lock:
+                self._visual_scene_objects_refresh_error = str(exc)
+            return {"success": False, "error": str(exc), "reason": reason}
+        self.update_visual_scene_objects_snapshot(objects)
+        return {
+            "success": True,
+            "count": len(objects),
+            "reason": reason,
+            "duration_ms": round((time.monotonic() - started) * 1000.0, 1),
+        }
+
+    def request_visual_scene_objects_refresh(self, *, reason: str = "") -> dict[str, Any]:
+        """Start a latest-wins background refresh for observer-side objects."""
+        with self._visual_scene_objects_lock:
+            if self._visual_scene_objects_refresh_running:
+                return {
+                    "success": True,
+                    "queued": False,
+                    "running": True,
+                    "reason": reason,
+                }
+            self._visual_scene_objects_refresh_running = True
+            self._visual_scene_objects_refresh_attempt_ns = time.monotonic_ns()
+
+        def worker() -> None:
+            try:
+                result = self.refresh_visual_scene_objects_sync(reason=reason)
+                if not result.get("success", False):
+                    logger.debug(
+                        "visual scene object refresh failed: %s",
+                        result.get("error"),
+                    )
+            finally:
+                with self._visual_scene_objects_lock:
+                    self._visual_scene_objects_refresh_running = False
+
+        threading.Thread(
+            target=worker,
+            name="manyforge_visual_scene_objects_refresh",
+            daemon=True,
+        ).start()
+        return {"success": True, "queued": True, "running": False, "reason": reason}
+
+    def update_visual_state_snapshot(
+        self,
+        snapshot: Any | None,
+        *,
+        duration_ms: float | None = None,
+        error: str | None = None,
+        error_detail: str | None = None,
+        reason: str = "",
+    ) -> None:
+        """Publish the latest immutable visual-state snapshot.
+
+        Observer routes read this cache by cheap copy. Potentially blocking
+        operations such as execution-snapshot reads, gripper observer calls, FK,
+        and scene-object snapshots belong in the visual publisher, never in
+        request handling.
+        """
+        with self._visual_state_lock:
+            self._visual_state_snapshot = copy.deepcopy(snapshot)
+            self._visual_state_timestamp_ns = time.monotonic_ns() if snapshot is not None else 0
+            self._visual_state_last_duration_ms = duration_ms
+            self._visual_state_last_error = error
+            self._visual_state_last_error_detail = error_detail
+            self._visual_state_last_reason = reason
+
+    def clear_visual_state_snapshot(self) -> None:
+        self.update_visual_state_snapshot(
+            None,
+            duration_ms=None,
+            error=None,
+            reason="cleared",
+        )
+
+    def record_visual_state_publish_error(
+        self,
+        *,
+        duration_ms: float,
+        error: str,
+        error_detail: str | None = None,
+        reason: str,
+    ) -> None:
+        """Record publisher failure without discarding the last good snapshot."""
+        with self._visual_state_lock:
+            self._visual_state_last_duration_ms = duration_ms
+            self._visual_state_last_error = error
+            self._visual_state_last_error_detail = error_detail
+            self._visual_state_last_reason = reason
+
+    def visual_state_snapshot(self) -> tuple[Any | None, dict[str, Any]]:
+        """Return the latest published visual snapshot and freshness metadata."""
+        with self._visual_state_lock:
+            snapshot = copy.deepcopy(self._visual_state_snapshot)
+            timestamp_ns = self._visual_state_timestamp_ns
+            duration_ms = self._visual_state_last_duration_ms
+            error = self._visual_state_last_error
+            error_detail = self._visual_state_last_error_detail
+            reason = self._visual_state_last_reason
+            running = self._visual_state_publisher_running
+            period_s = self._visual_state_publisher_period_s
+        age_ms = None
+        if timestamp_ns > 0:
+            age_ms = (time.monotonic_ns() - timestamp_ns) / 1_000_000.0
+        sequence_number = None
+        if snapshot is not None:
+            sequence_number = getattr(snapshot, "sequence_number", None)
+        return snapshot, {
+            "timestamp_ns": timestamp_ns,
+            "age_ms": age_ms,
+            "last_duration_ms": duration_ms,
+            "last_error": error,
+            "last_error_detail": error_detail,
+            "last_reason": reason,
+            "publisher_running": running,
+            "publisher_period_s": period_s,
+            "sequence_number": sequence_number,
+        }
+
+    def publish_visual_state_snapshot_sync(
+        self,
+        builder: Callable[[], Any],
+        *,
+        reason: str = "manual",
+    ) -> dict[str, Any]:
+        """Build and publish a visual snapshot outside route request handling."""
+        started = time.monotonic()
+        try:
+            snapshot = builder()
+        except Exception as exc:
+            duration_ms = (time.monotonic() - started) * 1000.0
+            error_code = str(getattr(exc, "reason", "") or "").strip()
+            error_detail = str(getattr(exc, "detail", "") or str(exc)).strip()
+            if not error_code:
+                error_code = error_detail or exc.__class__.__name__
+            if not error_detail:
+                error_detail = error_code
+            self.record_visual_state_publish_error(
+                duration_ms=duration_ms,
+                error=error_code,
+                error_detail=error_detail,
+                reason=reason,
+            )
+            return {
+                "success": False,
+                "error": error_code,
+                "error_detail": error_detail,
+                "reason": reason,
+                "duration_ms": round(duration_ms, 1),
+            }
+        duration_ms = (time.monotonic() - started) * 1000.0
+        self.update_visual_state_snapshot(
+            snapshot,
+            duration_ms=duration_ms,
+            error=None,
+            reason=reason,
+        )
+        return {
+            "success": True,
+            "reason": reason,
+            "duration_ms": round(duration_ms, 1),
+            "sequence_number": getattr(snapshot, "sequence_number", None),
+        }
+
+    def ensure_visual_state_publisher(
+        self,
+        builder: Callable[[], Any],
+        *,
+        period_s: float,
+    ) -> None:
+        """Start or update the background visual-state publisher."""
+        period = max(0.02, min(float(period_s), 5.0))
+        with self._visual_state_lock:
+            self._visual_state_publisher_builder = builder
+            self._visual_state_publisher_period_s = period
+            thread = self._visual_state_publisher_thread
+            if thread is not None and thread.is_alive():
+                return
+            self._visual_state_publisher_stop.clear()
+            self._visual_state_publisher_running = True
+            thread = threading.Thread(
+                target=self._visual_state_publisher_loop,
+                name="manyforge_visual_state_publisher",
+                daemon=True,
+            )
+            self._visual_state_publisher_thread = thread
+            thread.start()
+
+    def request_visual_state_publish(self, *, reason: str = "") -> None:
+        with self._visual_state_lock:
+            if reason:
+                self._visual_state_next_reason = reason
+        self._visual_state_publisher_wake.set()
+
+    def stop_visual_state_publisher(self, *, timeout_s: float = 1.0) -> None:
+        self._visual_state_publisher_stop.set()
+        self._visual_state_publisher_wake.set()
+        with self._visual_state_lock:
+            thread = self._visual_state_publisher_thread
+        if (
+            thread is not None
+            and thread.is_alive()
+            and thread is not threading.current_thread()
+        ):
+            thread.join(timeout=max(0.0, timeout_s))
+        with self._visual_state_lock:
+            if (
+                self._visual_state_publisher_thread is thread
+                and (thread is None or not thread.is_alive())
+            ):
+                self._visual_state_publisher_thread = None
+                self._visual_state_publisher_running = False
+
+    def _visual_state_publisher_loop(self) -> None:
+        while not self._visual_state_publisher_stop.is_set():
+            with self._visual_state_lock:
+                builder = self._visual_state_publisher_builder
+                period_s = self._visual_state_publisher_period_s
+                reason = self._visual_state_next_reason or "periodic"
+                self._visual_state_next_reason = ""
+            if builder is not None:
+                result = self.publish_visual_state_snapshot_sync(
+                    builder,
+                    reason=reason,
+                )
+                if not result.get("success", False):
+                    logger.debug(
+                        "visual-state publisher failed: %s",
+                        result.get("error"),
+                        extra={
+                            "event": "manyforge.visual.snapshot_publish_failed",
+                            "reason": reason,
+                            "duration_ms": result.get("duration_ms"),
+                        },
+                    )
+                else:
+                    duration_ms = float(result.get("duration_ms") or 0.0)
+                    logger.debug(
+                        "visual-state snapshot published: reason=%s sequence=%s duration_ms=%.1f",
+                        reason,
+                        result.get("sequence_number"),
+                        duration_ms,
+                        extra={
+                            "event": "manyforge.visual.snapshot_published",
+                            "reason": reason,
+                            "duration_ms": duration_ms,
+                            "sequence_number": result.get("sequence_number"),
+                        },
+                    )
+                    if duration_ms >= 100.0:
+                        logger.warning(
+                            "visual-state publisher slow: reason=%s duration_ms=%.1f",
+                            reason,
+                            duration_ms,
+                            extra={
+                                "event": "manyforge.visual.snapshot_build_slow",
+                                "reason": reason,
+                                "duration_ms": duration_ms,
+                                "sequence_number": result.get("sequence_number"),
+                            },
+                        )
+            self._visual_state_publisher_wake.wait(period_s)
+            self._visual_state_publisher_wake.clear()
+        with self._visual_state_lock:
+            self._visual_state_publisher_running = False
 
     # Viewer-state accessors: frame + object-frame visibility + gizmo
     # size. Day-4 makes these state-owned so the native viewer is
@@ -1623,6 +2439,9 @@ class ComposerState:
 
         if deployment is not None and self._kernel_factory is not None:
             self._kernel, self.kernel_bundle = self._kernel_factory(deployment)
+        drivable_joints = self.refresh_drivable_joint_names(kernel=self._kernel)
+        if deployment is not None and drivable_joints:
+            deployment.validate_streaming_joint_limits_against(drivable_joints)
 
         runner = OrchestratorRunner(
             catalog_path=self._catalog_path,
@@ -1647,6 +2466,7 @@ class ComposerState:
         self._program_session_generation += 1
         self._clear_published_scene_snapshots()
         self.clear_pose_source_snapshots()
+        self.clear_visual_state_snapshot()
         self.cycle_manager = CycleManager(runner, self._kernel)
         self._bind_cycle_manager_callbacks()
         self.reset_backend_authoritative_sim_if_needed(reason="program_load")
@@ -1687,6 +2507,8 @@ class ComposerState:
             self._hidden_frames.clear()
             self._explicit_visible_frames.clear()
             self._visible_object_frames.clear()
+        self.clear_visual_scene_objects_snapshot()
+        self.clear_visual_state_snapshot()
         self._rebuild_runtime(program, deployment, effective_program=program)
 
     def load_program(
@@ -1737,9 +2559,10 @@ class ComposerState:
         # Spec/430 §3.2 cross-validation requires the bound robot's drivable
         # joint list. Run it for both /api/session/apply and /api/program/load
         # so typo'd per-joint streaming caps fail at load time, not on first jog.
+        drivable_joints: list[str] = []
         if deployment is not None and kernel is not None:
             try:
-                drivable_joints = kernel.get_joint_names()
+                drivable_joints = [str(name) for name in kernel.get_joint_names()]
             except Exception:
                 drivable_joints = []
             if drivable_joints:
@@ -1768,6 +2591,13 @@ class ComposerState:
         self.deployment_source_path = deployment_source_path
         self._kernel = kernel
         self.kernel_bundle = kernel_bundle
+        joint_names_to_cache = (
+            drivable_joints
+            if drivable_joints or deployment is not None
+            else self.get_drivable_joint_names()
+        )
+        with self._joint_state_lock:
+            self._drivable_joint_names = list(joint_names_to_cache)
         self._update_program_tree_hash()
         self._program_session_generation += 1
         self._clear_published_scene_snapshots()
@@ -1776,6 +2606,8 @@ class ComposerState:
             self._explicit_visible_frames.clear()
             self._visible_object_frames.clear()
         self.clear_pose_source_snapshots()
+        self.clear_visual_scene_objects_snapshot()
+        self.clear_visual_state_snapshot()
         self.cycle_manager = CycleManager(runner, self._kernel)
         self._bind_cycle_manager_callbacks()
         if not defer_initial_runtime_reset:
@@ -2073,15 +2905,14 @@ class ComposerState:
                         rejected_count += 1
                         details.append(detail)
                         continue
-                    result = self.kernel.scene_edit(
-                        SceneEditRequest(
-                            operation="update_pose",
-                            object_id=object_id,
-                            pose_position_m=edit_position,
-                            pose_orientation_xyzw=edit_orientation,
-                            frame_id=edit_frame_id,
-                        )
+                    scene_request = SceneEditRequest(
+                        operation="update_pose",
+                        object_id=object_id,
+                        pose_position_m=edit_position,
+                        pose_orientation_xyzw=edit_orientation,
+                        frame_id=edit_frame_id,
                     )
+                    result = self.kernel.scene_edit(scene_request)
                     if not result.success:
                         detail["status"] = "rejected"
                         detail["reject_reason"] = "scene_edit_failed"
@@ -2096,8 +2927,17 @@ class ComposerState:
                     detail["frame_id"] = edit_frame_id
                     if observed_frame_id:
                         detail["observed_frame_id"] = str(observed_frame_id)
+                    visual_update = self.apply_visual_scene_edit_success(scene_request)
+                    if visual_update.get("needs_refresh"):
+                        detail["visual_refresh_requested"] = True
+                        self.request_visual_scene_objects_refresh(
+                            reason=f"pose_source_{policy}"
+                        )
                     applied_count += 1
                     details.append(detail)
+
+        if applied_count > 0:
+            self.request_visual_state_publish(reason=f"pose_source_{policy}")
 
         required_missing = [
             object_id

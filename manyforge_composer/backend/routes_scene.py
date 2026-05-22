@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import time
 from typing import Any, Optional
 
@@ -45,8 +46,14 @@ from .models import (
     SceneRobotResponse,
     SceneShapeResponse,
     SceneStateResponse,
+    VisualStateRouteDiagnosticsResponse,
 )
 from .state import ComposerState
+from .visual_state import (
+    VisualSnapshotUnavailable,
+    build_robot_visual_snapshot,
+    relative_pose_from_world,
+)
 
 logger = logging.getLogger(__name__)
 _POSE_SOURCE_STATUSES = {"disabled", "fresh", "stale", "rejected"}
@@ -56,6 +63,155 @@ _SCENE_STATE_SUBSTEP_WARN_MS = 100.0
 
 def _elapsed_ms(start: float) -> float:
     return (time.monotonic() - start) * 1000.0
+
+
+def _visual_publish_period_s() -> float:
+    raw_value = os.environ.get("MANYFORGE_VISUAL_STATE_PUBLISH_HZ")
+    if raw_value is None:
+        return 1.0 / 15.0
+    try:
+        hz = float(raw_value)
+    except ValueError:
+        logger.warning(
+            "invalid MANYFORGE_VISUAL_STATE_PUBLISH_HZ=%r; using 15 Hz",
+            raw_value,
+            extra={"event": "visual_state_invalid_publish_hz"},
+        )
+        return 1.0 / 15.0
+    hz = max(1.0, min(hz, 60.0))
+    return 1.0 / hz
+
+
+def _visual_snapshot_stale_after_ms() -> float:
+    raw_value = os.environ.get("MANYFORGE_VISUAL_STATE_STALE_AFTER_MS")
+    if raw_value is not None:
+        try:
+            configured_ms = float(raw_value)
+        except ValueError:
+            logger.warning(
+                "invalid MANYFORGE_VISUAL_STATE_STALE_AFTER_MS=%r; using cadence-derived threshold",
+                raw_value,
+                extra={"event": "manyforge.visual.invalid_stale_threshold"},
+            )
+        else:
+            if math.isfinite(configured_ms) and configured_ms > 0.0:
+                return max(50.0, configured_ms)
+            logger.warning(
+                "invalid MANYFORGE_VISUAL_STATE_STALE_AFTER_MS=%r; using cadence-derived threshold",
+                raw_value,
+                extra={"event": "manyforge.visual.invalid_stale_threshold"},
+            )
+    return max(250.0, _visual_publish_period_s() * 3000.0)
+
+
+def _visual_snapshot_is_stale(snapshot_meta: dict[str, Any] | None) -> bool:
+    if not snapshot_meta:
+        return False
+    if snapshot_meta.get("last_error"):
+        return True
+    age_ms = snapshot_meta.get("age_ms")
+    if age_ms is None:
+        return False
+    try:
+        return float(age_ms) > _visual_snapshot_stale_after_ms()
+    except (TypeError, ValueError):
+        return False
+
+
+def _visual_route_diagnostics(
+    *,
+    timings_ms: dict[str, float],
+    total_ms: float,
+    slow_steps: dict[str, float],
+    mode: str = "visual_snapshot_pending",
+    served_from_visual_snapshot: bool = False,
+    fallback_reason: str | None = None,
+    objects_source: str = "visual_snapshot_pending",
+    objects_age_ms: float | None = None,
+    objects_refresh_running: bool = False,
+    objects_refresh_error: str | None = None,
+    snapshot_meta: dict[str, Any] | None = None,
+) -> VisualStateRouteDiagnosticsResponse:
+    if fallback_reason is None and not served_from_visual_snapshot:
+        fallback_reason = "visual_snapshot_publisher_unavailable"
+    return VisualStateRouteDiagnosticsResponse(
+        mode=mode,
+        served_from_visual_snapshot=served_from_visual_snapshot,
+        fallback_reason=fallback_reason,
+        total_ms=round(total_ms, 1),
+        timings_ms={name: round(duration, 1) for name, duration in timings_ms.items()},
+        slow_steps=slow_steps,
+        objects_source=objects_source,
+        objects_age_ms=None if objects_age_ms is None else round(objects_age_ms, 1),
+        objects_refresh_running=objects_refresh_running,
+        objects_refresh_error=objects_refresh_error,
+        snapshot_age_ms=(
+            None
+            if snapshot_meta is None or snapshot_meta.get("age_ms") is None
+            else round(float(snapshot_meta["age_ms"]), 1)
+        ),
+        snapshot_sequence_number=(
+            None if snapshot_meta is None else snapshot_meta.get("sequence_number")
+        ),
+        snapshot_build_ms=(
+            None
+            if snapshot_meta is None or snapshot_meta.get("last_duration_ms") is None
+            else round(float(snapshot_meta["last_duration_ms"]), 1)
+        ),
+        snapshot_publisher_running=bool(
+            snapshot_meta.get("publisher_running", False) if snapshot_meta else False
+        ),
+        snapshot_publisher_error=(
+            None if snapshot_meta is None else snapshot_meta.get("last_error")
+        ),
+        snapshot_publisher_error_detail=(
+            None if snapshot_meta is None else snapshot_meta.get("last_error_detail")
+        ),
+        snapshot_stale=_visual_snapshot_is_stale(snapshot_meta),
+    )
+
+
+def _visual_fk_joint_inputs(
+    *,
+    joint_names: list[str],
+    joint_positions_rad: list[float] | None,
+    grippers: list[SceneGripperStateResponse],
+) -> tuple[list[str], list[float] | None]:
+    """Merge execution joints and visual-only gripper feedback for FK.
+
+    The scene-state robot block remains the execution group reported by the
+    kernel. The visual FK surface also needs actuated gripper joints so links
+    below the gripper mount move coherently in the viewer. Treat those values
+    as observer inputs only; they are not execution authority for the arm.
+    """
+
+    if joint_positions_rad is None or len(joint_names) != len(joint_positions_rad):
+        return list(joint_names), None
+
+    # This function intentionally accepts a list of gripper state objects
+    # rather than reading global deployment state. Today Composer has one
+    # active robot model per scene-state response; future multi-robot support
+    # can call this per visual robot with only that robot's grippers.
+    visual_names = list(joint_names)
+    visual_positions_by_name = {
+        str(name): float(position)
+        for name, position in zip(joint_names, joint_positions_rad)
+    }
+    for gripper in grippers:
+        joint_name = (gripper.joint_name or "").strip()
+        if not joint_name or gripper.current_position is None:
+            continue
+        try:
+            position = float(gripper.current_position)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(position):
+            continue
+        if joint_name not in visual_positions_by_name:
+            visual_names.append(joint_name)
+        visual_positions_by_name[joint_name] = position
+
+    return visual_names, [visual_positions_by_name[name] for name in visual_names]
 
 
 def canonical_scene_world_frame(state: ComposerState) -> str:
@@ -137,7 +293,6 @@ def build_scene_frames_payload(state: ComposerState) -> dict[str, Any]:
     frame_names.update(_load_model_frame_names(state))
     mark_step("frame_inventory", step_started)
 
-    kernel = state.kernel
     world_frame = canonical_scene_world_frame(state)
 
     sorted_frame_names = sorted(frame_names)
@@ -145,38 +300,36 @@ def build_scene_frames_payload(state: ComposerState) -> dict[str, Any]:
     unresolved_frame_names = [
         frame_name for frame_name in sorted_frame_names if frame_name != world_frame
     ]
-    if kernel is not None and unresolved_frame_names:
-        batch_start = time.monotonic()
-        try:
-            pose_lookup = dict(
-                kernel.get_link_poses(unresolved_frame_names, world_frame)
-            )
-        except Exception as exc:
-            timings_ms["batch_fk"] = _elapsed_ms(batch_start)
-            logger.warning(
-                "scene frames batch FK failed",
-                extra={
-                    "event": "scene_frames_batch_fk_failed",
-                    "frame_count": len(unresolved_frame_names),
-                    "error": str(exc),
-                    "duration_ms": round(_elapsed_ms(batch_start), 1),
-                },
-            )
-            pose_lookup = {}
-        else:
-            duration_ms = _elapsed_ms(batch_start)
-            timings_ms["batch_fk"] = duration_ms
-            if duration_ms >= _SCENE_STATE_SUBSTEP_WARN_MS:
-                logger.warning(
-                    "scene frames batch FK slow",
-                    extra={
-                        "event": "scene_frames_batch_fk_slow",
-                        "frame_count": len(unresolved_frame_names),
-                        "duration_ms": round(duration_ms, 1),
-                    },
+    visual_route_mode = "visual_snapshot"
+    visual_route_served = not bool(unresolved_frame_names)
+    visual_route_fallback: str | None = None
+    snapshot_meta: dict[str, Any] = {}
+    if unresolved_frame_names:
+        step_started = time.monotonic()
+        _ensure_visual_state_publisher(state, reason="scene_frames_route")
+        visual_snapshot, snapshot_meta = state.visual_state_snapshot()
+        mark_step("snapshot_read", step_started)
+        if visual_snapshot is not None:
+            if _visual_snapshot_is_stale(snapshot_meta):
+                visual_snapshot.stale = True
+                visual_route_fallback = (
+                    snapshot_meta.get("last_error") or "visual_snapshot_stale"
                 )
-    elif unresolved_frame_names:
-        timings_ms["batch_fk"] = 0.0
+            pose_lookup = dict(visual_snapshot.link_poses)
+            world_frame = visual_snapshot.world_frame or world_frame
+            visual_route_mode = "visual_snapshot"
+            visual_route_served = True
+        else:
+            state.request_visual_state_publish(reason="scene_frames_cache_empty")
+            visual_route_mode = "visual_snapshot_pending"
+            visual_route_fallback = (
+                snapshot_meta.get("last_error") or "visual_snapshot_pending"
+            )
+    if unresolved_frame_names and not visual_route_served:
+        # The frames endpoint is an observer path. It never falls back to
+        # route-time FK; the background publisher will fill the cache and
+        # callers get poseAvailable=false until then.
+        timings_ms.setdefault("visual_frame_snapshot", 0.0)
 
     frames: list[SceneFrameResponse] = []
     for frame_name in sorted_frame_names:
@@ -218,26 +371,55 @@ def build_scene_frames_payload(state: ComposerState) -> dict[str, Any]:
             )
         )
 
-    payload = SceneFramesResponse(
-        frames=frames,
-        hmiAvailable=True,
-        frameGizmoSizeM=state.get_frame_gizmo_size(),
-        timestampNs=timestamp_ns,
-    ).model_dump(by_alias=True)
     total_ms = _elapsed_ms(build_started)
     slow_steps = {
         name: round(duration, 1)
         for name, duration in timings_ms.items()
         if duration >= _SCENE_STATE_SUBSTEP_WARN_MS
     }
+    diagnostics = _visual_route_diagnostics(
+        timings_ms=timings_ms,
+        total_ms=total_ms,
+        slow_steps=slow_steps,
+        mode=visual_route_mode,
+        served_from_visual_snapshot=visual_route_served,
+        fallback_reason=visual_route_fallback,
+        snapshot_meta=snapshot_meta,
+    )
+    payload = SceneFramesResponse(
+        frames=frames,
+        hmiAvailable=True,
+        frameGizmoSizeM=state.get_frame_gizmo_size(),
+        visualStateDiagnostics=diagnostics,
+        timestampNs=timestamp_ns,
+    ).model_dump(by_alias=True)
+    logger.debug(
+        "scene frames build: mode=%s total_ms=%.1f frames=%d",
+        diagnostics.mode,
+        total_ms,
+        len(frames),
+        extra={
+            "event": "scene_frames_build",
+            "route_mode": diagnostics.mode,
+            "served_from_visual_snapshot": diagnostics.served_from_visual_snapshot,
+            "duration_ms": round(total_ms, 1),
+            "slow_steps": slow_steps,
+        },
+    )
     if total_ms >= _SCENE_STATE_WARN_MS or slow_steps:
         logger.warning(
-            "scene frames build slow: total_ms=%.1f slow_steps=%s timings_ms=%s "
-            "frames=%d",
+            "scene frames build slow: mode=%s total_ms=%.1f slow_steps=%s "
+            "timings_ms=%s frames=%d",
+            diagnostics.mode,
             total_ms,
             slow_steps,
             {name: round(duration, 1) for name, duration in timings_ms.items()},
             len(frames),
+            extra={
+                "event": "scene_frames_build_slow",
+                "route_mode": diagnostics.mode,
+                "served_from_visual_snapshot": diagnostics.served_from_visual_snapshot,
+            },
         )
     return payload
 
@@ -278,6 +460,38 @@ def _scene_shape_response(state: ComposerState, scene_object) -> SceneShapeRespo
         payload["mesh_asset_url"] = mesh_asset_url
         payload["mesh_asset_status"] = mesh_asset_status
     return SceneShapeResponse(**payload)
+
+
+def _scene_object_responses(
+    state: ComposerState,
+    scene_objects: list[Any],
+) -> list[SceneObjectResponse]:
+    authored_object_ids = {
+        resource.object_id
+        for resource in (state.program.scene if state.program is not None else [])
+    }
+    objects: list[SceneObjectResponse] = []
+    for scene_object in scene_objects:
+        if scene_object.attached:
+            source = "attached"
+        elif scene_object.object_id in authored_object_ids:
+            source = "authored"
+        else:
+            source = "runtime"
+        viewer_frame_visible = state.get_object_frame_visibility(scene_object.object_id)
+        objects.append(
+            SceneObjectResponse(
+                object_id=scene_object.object_id,
+                shape=_scene_shape_response(state, scene_object),
+                pose_in_universe=scene_object.pose_in_universe,
+                attached=scene_object.attached,
+                attached_to=scene_object.frame_id if scene_object.attached else None,
+                source=source,
+                persistable=source == "authored",
+                viewer_frame_visible=viewer_frame_visible,
+            )
+        )
+    return sorted(objects, key=lambda obj: obj.object_id)
 
 
 def _pose_sources_payload(state: ComposerState) -> list[PoseSourceStatusResponse]:
@@ -347,203 +561,274 @@ def _pose_sources_payload(state: ComposerState) -> list[PoseSourceStatusResponse
     return responses
 
 
-def build_scene_state_payload(state: ComposerState) -> dict[str, Any]:
-    """Build backend-authoritative scene state."""
-    build_started = time.monotonic()
-    timings_ms: dict[str, float] = {}
-
-    def mark_step(name: str, step_started: float) -> None:
-        timings_ms[name] = _elapsed_ms(step_started)
-
-    timestamp_ns = time.monotonic_ns()
+def _base_robot_route_metadata(
+    state: ComposerState,
+) -> tuple[str | None, str | None, str, str, dict[str, Any]]:
     robot_id = None
     group_id = None
     base_frame = "base_link"
     tcp_frame = "tool0"
     base_pose: dict[str, Any] = {}
-
     if state.deployment is not None and state.deployment.robot_config is not None:
         robot_id = state.deployment.robot_config.robot_id
         group_id = state.deployment.robot_config.group_id
-    if state.program is not None and state.program.robot is not None:
-        base_frame = state.program.robot.base_frame
-        tcp_frame = state.program.robot.tcp_frame
-        base_pose = dict(state.program.robot.base_pose or {})
+    program_robot = getattr(state.program, "robot", None) if state.program is not None else None
+    if program_robot is not None:
+        base_frame = program_robot.base_frame
+        tcp_frame = program_robot.tcp_frame
+        base_pose = dict(program_robot.base_pose or {})
+    return robot_id, group_id, base_frame, tcp_frame, base_pose
 
-    step_started = time.monotonic()
+
+def _build_visual_state_snapshot_for_publisher(state: ComposerState):
+    """Build the complete visual scene snapshot on the publisher thread.
+
+    This is the only visual-snapshot path that may call backend observer APIs.
+    HTTP routes must read the latest published snapshot instead of calling this
+    function directly.
+    """
+    if state.kernel is None:
+        raise VisualSnapshotUnavailable("kernel_unavailable")
+
+    robot_id, group_id, base_frame, tcp_frame, base_pose = _base_robot_route_metadata(state)
+    joint_names = state.get_drivable_joint_names()
+    live_positions = state.get_current_joint_positions(
+        joint_names=joint_names,
+        allow_backend_joint_names=False,
+    )
     joint_positions_by_name: dict[str, float] = {}
-    joint_names: list[str] = []
-    if state.kernel is not None:
-        joint_names = state.kernel.get_joint_names()
-        snapshot = (
-            state.cycle_manager.get_execution_snapshot()
-            if state.cycle_manager is not None
-            else state.kernel.get_execution_snapshot()
-        )
-        # Joint-state readback fallback chain (Day 5c.1):
-        # 1. Active execution snapshot (preferred — freshest).
-        # 2. The state-cached last-known vector from a prior execution.
-        # 3. Deployment's `execution.config.initial_joint_positions_rad`
-        #    (set on deployment load; what the kernel uses as its
-        #    initial configuration).
-        # 4. Zeros (last-resort default; matches pre-5c.1 behaviour).
-        live_positions: list[float] | None = None
-        if snapshot.joint_positions_rad:
-            live_positions = list(snapshot.joint_positions_rad)
-            state._last_known_joint_positions_rad = live_positions
-        elif state._last_known_joint_positions_rad is not None:
-            live_positions = state._last_known_joint_positions_rad
-        elif state.deployment is not None:
-            try:
-                execution_adapter = state.deployment.adapters.get("execution")
-            except Exception:
-                execution_adapter = None
-            if execution_adapter is not None:
-                initial = execution_adapter.config.get("initial_joint_positions_rad")
-                if isinstance(initial, list) and len(initial) == len(joint_names):
-                    live_positions = [float(v) for v in initial]
-                    state._last_known_joint_positions_rad = live_positions
-        if live_positions is not None and len(live_positions) == len(joint_names):
-            joint_positions_by_name = {
-                name: pos for name, pos in zip(joint_names, live_positions)
-            }
-    mark_step("robot_snapshot", step_started)
+    if live_positions is not None and len(live_positions) == len(joint_names):
+        joint_positions_by_name = {
+            name: position for name, position in zip(joint_names, live_positions)
+        }
+    urdf_model_key = None
+    try:
+        from .routes_urdf import active_urdf_model_key
 
-    step_started = time.monotonic()
-    tcp_pose_in_base = None
-    if state.kernel is not None:
-        tcp_pose = state.kernel.get_link_pose(tcp_frame, base_frame)
-        if tcp_pose is not None:
-            tcp_pose_in_base = {
-                "position_m": list(tcp_pose["position_m"]),
-                "orientation_xyzw": list(tcp_pose["orientation_xyzw"]),
-            }
-    mark_step("tcp_pose", step_started)
-
-    step_started = time.monotonic()
-    robot_info = None
-    if state.deployment is not None or state.kernel is not None:
+        urdf_model_key = active_urdf_model_key(state)
+    except Exception:
         urdf_model_key = None
-        try:
-            from .routes_urdf import active_urdf_model_key
 
-            urdf_model_key = active_urdf_model_key(state)
-        except Exception:
-            urdf_model_key = None
-        robot_info = SceneRobotResponse(
-            robot_id=robot_id,
-            group_id=group_id,
-            urdf_model_key=urdf_model_key,
-            base_frame=base_frame,
-            tcp_frame=tcp_frame,
-            base_pose=base_pose,
-            joint_names=joint_names,
-            joint_positions=joint_positions_by_name,
-            tcp_pose_in_base=tcp_pose_in_base,
-        )
-    mark_step("robot_payload", step_started)
+    robot_info = SceneRobotResponse(
+        robot_id=robot_id,
+        group_id=group_id,
+        urdf_model_key=urdf_model_key,
+        base_frame=base_frame,
+        tcp_frame=tcp_frame,
+        base_pose=base_pose,
+        joint_names=joint_names,
+        joint_positions=joint_positions_by_name,
+    )
 
-    step_started = time.monotonic()
-    objects: list[SceneObjectResponse] = []
-    authored_object_ids = {
-        resource.object_id
-        for resource in (state.program.scene if state.program is not None else [])
-    }
-    if state.kernel is not None:
-        for scene_object in state.kernel.get_scene_objects():
-            if scene_object.attached:
-                source = "attached"
-            elif scene_object.object_id in authored_object_ids:
-                source = "authored"
-            else:
-                source = "runtime"
-            viewer_frame_visible = state.get_object_frame_visibility(scene_object.object_id)
-            objects.append(
-                SceneObjectResponse(
-                    object_id=scene_object.object_id,
-                    shape=_scene_shape_response(state, scene_object),
-                    pose_in_universe=scene_object.pose_in_universe,
-                    attached=scene_object.attached,
-                    attached_to=scene_object.frame_id if scene_object.attached else None,
-                    source=source,
-                    persistable=source == "authored",
-                    viewer_frame_visible=viewer_frame_visible,
-                )
-            )
-    objects.sort(key=lambda obj: obj.object_id)
-    mark_step("scene_objects", step_started)
-
-    step_started = time.monotonic()
-    link_poses: dict[str, dict[str, Any]] = {}
-    if state.kernel is not None:
-        try:
-            from .routes_urdf import visual_link_names_for_fk
-        except Exception:
-            visual_link_names_for_fk = None  # type: ignore[assignment]
-        if visual_link_names_for_fk is not None:
-            world_frame = canonical_scene_world_frame(state)
-            link_names = list(visual_link_names_for_fk(state))
-            batch_getter = getattr(state.kernel, "get_link_poses", None)
-            if callable(batch_getter):
-                try:
-                    raw_link_poses = batch_getter(link_names, world_frame)
-                except Exception:
-                    raw_link_poses = {}
-                for link_name, pose in raw_link_poses.items():
-                    link_poses[str(link_name)] = {
-                        "position_m": list(pose["position_m"]),
-                        "orientation_xyzw": list(pose["orientation_xyzw"]),
-                    }
-            else:
-                for link_name in link_names:
-                    try:
-                        pose = state.kernel.get_link_pose(link_name, world_frame)
-                    except Exception:
-                        pose = None
-                    if pose is None:
-                        continue
-                    link_poses[link_name] = {
-                        "position_m": list(pose["position_m"]),
-                        "orientation_xyzw": list(pose["orientation_xyzw"]),
-                    }
-    mark_step("link_poses", step_started)
-
-    step_started = time.monotonic()
     grippers = _collect_gripper_states(state, advance_commands=False)
-    mark_step("grippers", step_started)
-
-    step_started = time.monotonic()
     pose_sources = _pose_sources_payload(state)
-    mark_step("pose_sources", step_started)
 
-    payload = SceneStateResponse(
+    try:
+        from .routes_urdf import visual_link_names_for_fk
+    except Exception as exc:
+        raise VisualSnapshotUnavailable("visual_links_unavailable", str(exc)) from exc
+
+    world_frame = canonical_scene_world_frame(state)
+    link_names = sorted({*visual_link_names_for_fk(state), base_frame, tcp_frame})
+    visual_joint_names, visual_joint_positions = _visual_fk_joint_inputs(
+        joint_names=joint_names,
+        joint_positions_rad=live_positions,
+        grippers=grippers,
+    )
+    visual_state = build_robot_visual_snapshot(
+        state,
         robot=robot_info,
-        objects=objects,
-        link_poses=link_poses,
+        joint_names=visual_joint_names,
+        joint_positions_rad=visual_joint_positions,
+        link_names=link_names,
+        reference_frame=world_frame,
+        base_frame=base_frame,
+        base_pose=base_pose,
         grippers=grippers,
         pose_sources=pose_sources,
-        object_axes_gizmo_size_m=state.get_object_axes_gizmo_size(),
-        timestamp_ns=timestamp_ns,
-    ).model_dump()
+    )
+    link_poses = dict(visual_state.link_poses)
+    if base_frame in link_poses and tcp_frame in link_poses:
+        try:
+            robot_info.tcp_pose_in_base = relative_pose_from_world(
+                child_pose=link_poses[tcp_frame],
+                parent_pose=link_poses[base_frame],
+            )
+        except VisualSnapshotUnavailable:
+            logger.debug(
+                "visual-state publisher could not derive tcp_pose_in_base",
+                exc_info=True,
+                extra={"event": "visual_snapshot_tcp_pose_unavailable"},
+            )
+    scene_objects, objects_meta = state.visual_scene_objects_for_link_poses(link_poses)
+    object_refresh_attempt_age_ms = objects_meta.get("refresh_attempt_age_ms")
+    object_refresh_retry_due = (
+        object_refresh_attempt_age_ms is None
+        or float(object_refresh_attempt_age_ms) >= 1000.0
+    )
+    if (
+        not scene_objects
+        and objects_meta.get("timestamp_ns", 0) == 0
+        and not objects_meta.get("refresh_running", False)
+        and object_refresh_retry_due
+    ):
+        state.request_visual_scene_objects_refresh(reason="visual_state_cache_empty")
+    objects = _scene_object_responses(state, scene_objects)
+    visual_state.robot = robot_info
+    visual_state.objects = objects
+    visual_state.grippers = grippers
+    visual_state.pose_sources = pose_sources
+    return visual_state
+
+
+def _ensure_visual_state_publisher(state: ComposerState, *, reason: str) -> None:
+    state.ensure_visual_state_publisher(
+        lambda: _build_visual_state_snapshot_for_publisher(state),
+        period_s=_visual_publish_period_s(),
+    )
+
+
+def _scene_state_payload_from_visual_cache(
+    state: ComposerState,
+    *,
+    build_started: float,
+    timestamp_ns: int,
+) -> dict[str, Any]:
+    timings_ms: dict[str, float] = {}
+    step_started = time.monotonic()
+    _ensure_visual_state_publisher(state, reason="scene_state_route")
+    visual_state, snapshot_meta = state.visual_state_snapshot()
+    timings_ms["snapshot_read"] = _elapsed_ms(step_started)
     total_ms = _elapsed_ms(build_started)
     slow_steps = {
         name: round(duration, 1)
         for name, duration in timings_ms.items()
         if duration >= _SCENE_STATE_SUBSTEP_WARN_MS
     }
+    if visual_state is None:
+        state.request_visual_state_publish(reason="scene_state_cache_empty")
+        cached_objects, objects_meta = state.visual_scene_objects_snapshot()
+        objects = _scene_object_responses(state, cached_objects)
+        pose_sources = _pose_sources_payload(state)
+        robot_id, group_id, base_frame, tcp_frame, base_pose = _base_robot_route_metadata(state)
+        joint_names = state.get_drivable_joint_names(allow_backend_refresh=False)
+        joint_positions: dict[str, float] = {}
+        live_positions = state.get_current_joint_positions(
+            joint_names=joint_names,
+            allow_backend_joint_names=False,
+        )
+        if live_positions is not None and len(live_positions) == len(joint_names):
+            joint_positions = {
+                name: position for name, position in zip(joint_names, live_positions)
+            }
+        robot_info = SceneRobotResponse(
+            robot_id=robot_id,
+            group_id=group_id,
+            base_frame=base_frame,
+            tcp_frame=tcp_frame,
+            base_pose=base_pose,
+            joint_names=joint_names,
+            joint_positions=joint_positions,
+        )
+        diagnostics = _visual_route_diagnostics(
+            timings_ms=timings_ms,
+            total_ms=total_ms,
+            slow_steps=slow_steps,
+            mode="visual_snapshot_pending",
+            served_from_visual_snapshot=False,
+            fallback_reason=snapshot_meta.get("last_error") or "visual_snapshot_pending",
+            objects_source=(
+                "visual_cache_pending"
+                if objects_meta.get("timestamp_ns", 0)
+                else "visual_snapshot_pending"
+            ),
+            objects_age_ms=objects_meta.get("age_ms"),
+            objects_refresh_running=bool(objects_meta.get("refresh_running", False)),
+            objects_refresh_error=objects_meta.get("refresh_error"),
+            snapshot_meta=snapshot_meta,
+        )
+        return SceneStateResponse(
+            robot=robot_info,
+            objects=objects,
+            link_poses={},
+            grippers=[],
+            pose_sources=pose_sources,
+            visual_state=None,
+            visual_state_diagnostics=diagnostics,
+            object_axes_gizmo_size_m=state.get_object_axes_gizmo_size(),
+            timestamp_ns=timestamp_ns,
+        ).model_dump()
+
+    stale = _visual_snapshot_is_stale(snapshot_meta)
+    if stale:
+        visual_state.stale = True
+    diagnostics = _visual_route_diagnostics(
+        timings_ms=timings_ms,
+        total_ms=total_ms,
+        slow_steps=slow_steps,
+        mode="visual_snapshot",
+        served_from_visual_snapshot=True,
+        fallback_reason=(
+            snapshot_meta.get("last_error")
+            or ("visual_snapshot_stale" if stale else None)
+        ),
+        objects_source="visual_snapshot",
+        objects_age_ms=snapshot_meta.get("age_ms"),
+        snapshot_meta=snapshot_meta,
+    )
+    payload = SceneStateResponse(
+        robot=visual_state.robot,
+        objects=list(visual_state.objects),
+        link_poses=dict(visual_state.link_poses),
+        grippers=list(visual_state.grippers),
+        pose_sources=list(visual_state.pose_sources),
+        visual_state=visual_state,
+        visual_state_diagnostics=diagnostics,
+        object_axes_gizmo_size_m=state.get_object_axes_gizmo_size(),
+        timestamp_ns=timestamp_ns,
+    ).model_dump()
+    logger.debug(
+        "scene state cache read: total_ms=%.1f sequence=%s age_ms=%s",
+        total_ms,
+        snapshot_meta.get("sequence_number"),
+        snapshot_meta.get("age_ms"),
+        extra={
+            "event": "manyforge.visual.route_served_snapshot",
+            "route_mode": diagnostics.mode,
+            "served_from_visual_snapshot": diagnostics.served_from_visual_snapshot,
+            "duration_ms": round(total_ms, 1),
+            "snapshot_age_ms": snapshot_meta.get("age_ms"),
+            "snapshot_stale": stale,
+        },
+    )
     if total_ms >= _SCENE_STATE_WARN_MS or slow_steps:
         logger.warning(
-            "scene state build slow: total_ms=%.1f slow_steps=%s timings_ms=%s "
-            "objects=%d links=%d grippers=%d pose_sources=%d",
+            "scene state cache read slow: total_ms=%.1f slow_steps=%s",
             total_ms,
             slow_steps,
-            {name: round(duration, 1) for name, duration in timings_ms.items()},
-            len(objects),
-            len(link_poses),
-            len(grippers),
-            len(pose_sources),
+            extra={
+                "event": "manyforge.visual.route_latency_slow",
+                "route_mode": diagnostics.mode,
+                "served_from_visual_snapshot": diagnostics.served_from_visual_snapshot,
+            },
         )
     return payload
+
+
+def build_scene_state_payload(state: ComposerState) -> dict[str, Any]:
+    """Build backend-authoritative scene state from the visual snapshot cache.
+
+    Scene-state reads are observer paths. They must not fall back to route-time
+    FK, live scene-object reads, or other mutable planner-scene APIs. The
+    background visual-state publisher owns those reads and exposes bounded
+    snapshot diagnostics when a snapshot is not available yet.
+    """
+
+    return _scene_state_payload_from_visual_cache(
+        state,
+        build_started=time.monotonic(),
+        timestamp_ns=time.monotonic_ns(),
+    )
 
 
 def _gripper_joint_limits(
@@ -1241,6 +1526,10 @@ def create_scene_router(state: ComposerState) -> APIRouter:
                 frame_id=validated.frame_id,
             )
             result = kernel.scene_edit(scene_request)
+            if result.success:
+                visual_update = state.apply_visual_scene_edit_success(scene_request)
+                if visual_update.get("needs_refresh"):
+                    state.request_visual_scene_objects_refresh(reason="scene_edit")
         return SceneEditResponse(
             success=result.success,
             error=result.error,

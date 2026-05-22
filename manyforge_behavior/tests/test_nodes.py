@@ -681,6 +681,38 @@ class TestUpdateCollisionObjectPose:
         assert status == py_trees.common.Status.SUCCESS
         assert kernel.scene_edits[-1].operation == "update_pose"
 
+    def test_success_emits_scene_callback(self, kernel, bb_with_kernel):
+        callbacks = []
+        bb_with_kernel.register_key(
+            key="scene_edit_callback", access=py_trees.common.Access.WRITE
+        )
+        bb_with_kernel.scene_edit_callback = (
+            lambda operation, request: callbacks.append((operation, request))
+        )
+        kernel.scene_edit(
+            SceneEditRequest(
+                operation="add",
+                object_id="box1",
+                shape_type="box",
+                box_dimensions_m=[0.1, 0.1, 0.1],
+            )
+        )
+        node = UpdateCollisionObjectPose(
+            name="update_box",
+            object_id="box1",
+            pose={
+                "frame_id": "base_link",
+                "position_m": [1.0, 0, 0],
+                "orientation_xyzw": [0, 0, 0, 1],
+            },
+        )
+
+        status = _tick_node(node)
+
+        assert status == py_trees.common.Status.SUCCESS
+        assert callbacks[-1][0] == "update_pose"
+        assert callbacks[-1][1].operation == "update_pose"
+
 
 class TestAttachDetachObjectNodes:
     def test_attach_delegates_to_backend_and_preserves_current_pose(self, kernel, bb_with_kernel):
@@ -738,6 +770,39 @@ class TestAttachDetachObjectNodes:
         assert pose["position_m"] == pytest.approx([0.1, 0.0, 0.0])
         assert pose["orientation_xyzw"] == pytest.approx([0.0, 0.0, 0.0, 1.0])
 
+    def test_attach_emits_direct_attach_callback(self, kernel, bb_with_kernel):
+        callbacks = []
+        bb_with_kernel.register_key(key="scene_objects", access=py_trees.common.Access.WRITE)
+        bb_with_kernel.register_key(
+            key="scene_edit_callback", access=py_trees.common.Access.WRITE
+        )
+        bb_with_kernel.scene_objects = {}
+        bb_with_kernel.scene_edit_callback = (
+            lambda operation, request: callbacks.append((operation, request))
+        )
+        kernel.scene_edit(
+            SceneEditRequest(
+                operation="add",
+                object_id="box1",
+                shape_type="box",
+                box_dimensions_m=[0.1, 0.1, 0.1],
+                pose_position_m=[0.6, 0.0, 0.6],
+                pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
+                frame_id="base_link",
+            )
+        )
+        node = AttachObjectToLink(
+            name="attach_box",
+            object_id="box1",
+            link_frame="tool0",
+        )
+
+        status = _tick_node(node)
+
+        assert status == py_trees.common.Status.SUCCESS
+        assert callbacks == [("attach", kernel.scene_edits[-1])]
+        assert callbacks[0][1].operation == "attach"
+
     def test_detach_delegates_to_backend_and_preserves_current_pose(
         self, kernel, bb_with_kernel
     ):
@@ -776,6 +841,35 @@ class TestAttachDetachObjectNodes:
         assert pose is not None
         assert pose["position_m"] == pytest.approx([0.6, 0.0, 0.6])
         assert pose["orientation_xyzw"] == pytest.approx([0.0, 0.0, 0.0, 1.0])
+
+    def test_detach_emits_direct_detach_callback(self, kernel, bb_with_kernel):
+        callbacks = []
+        bb_with_kernel.register_key(key="scene_objects", access=py_trees.common.Access.WRITE)
+        bb_with_kernel.register_key(
+            key="scene_edit_callback", access=py_trees.common.Access.WRITE
+        )
+        bb_with_kernel.scene_objects = {}
+        bb_with_kernel.scene_edit_callback = (
+            lambda operation, request: callbacks.append((operation, request))
+        )
+        kernel.scene_edit(
+            SceneEditRequest(
+                operation="add",
+                object_id="box1",
+                shape_type="box",
+                box_dimensions_m=[0.1, 0.1, 0.1],
+                pose_position_m=[0.1, 0.0, 0.0],
+                pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
+                frame_id="tool0",
+            )
+        )
+        node = DetachObjectFromLink(name="detach_box", object_id="box1", link_frame="tool0")
+
+        status = _tick_node(node)
+
+        assert status == py_trees.common.Status.SUCCESS
+        assert callbacks == [("detach", kernel.scene_edits[-1])]
+        assert callbacks[0][1].operation == "detach"
 
 
 class TestCheckKeyBoolValue:

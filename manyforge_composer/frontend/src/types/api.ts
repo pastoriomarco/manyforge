@@ -719,12 +719,49 @@ export interface PoseSourceApplyResponse {
   details: Record<string, unknown>[];
 }
 
+export interface VisualStateRouteDiagnostics {
+  mode: 'visual_snapshot' | 'visual_snapshot_pending' | string;
+  served_from_visual_snapshot: boolean;
+  fallback_reason?: string | null;
+  total_ms: number;
+  timings_ms: Record<string, number>;
+  slow_steps: Record<string, number>;
+  objects_source?: 'visual_snapshot' | 'visual_snapshot_pending' | 'visual_cache_pending' | string;
+  objects_age_ms?: number | null;
+  objects_refresh_running?: boolean;
+  objects_refresh_error?: string | null;
+  snapshot_age_ms?: number | null;
+  snapshot_sequence_number?: number | null;
+  snapshot_build_ms?: number | null;
+  snapshot_publisher_running?: boolean;
+  snapshot_publisher_error?: string | null;
+  snapshot_publisher_error_detail?: string | null;
+  snapshot_stale?: boolean;
+}
+
+export interface VisualSceneSnapshot {
+  schema_version: string;
+  sequence_number: number;
+  timestamp_ns: number;
+  source: string;
+  world_frame: string;
+  model_key?: string | null;
+  stale: boolean;
+  robot?: SceneRobotState | null;
+  objects: SceneObjectState[];
+  link_poses: Record<string, { position_m: number[]; orientation_xyzw: number[] }>;
+  grippers: SceneGripperState[];
+  pose_sources: PoseSourceStatusState[];
+}
+
 export interface SceneStateResponse {
   robot?: SceneRobotState | null;
   objects: SceneObjectState[];
   link_poses?: Record<string, { position_m: number[]; orientation_xyzw: number[] }>;
   grippers?: SceneGripperState[];
   pose_sources?: PoseSourceStatusState[];
+  visual_state?: VisualSceneSnapshot | null;
+  visual_state_diagnostics?: VisualStateRouteDiagnostics | null;
   object_axes_gizmo_size_m?: number;
   timestamp_ns: number;
 }
@@ -844,6 +881,7 @@ export interface SceneFramesResponse {
   frames: SceneFrameState[];
   hmiAvailable: boolean;
   frameGizmoSizeM: number;
+  visualStateDiagnostics?: VisualStateRouteDiagnostics | null;
   timestampNs: number;
 }
 

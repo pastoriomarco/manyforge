@@ -228,6 +228,7 @@ class UpdateCollisionObjectPose(_SceneCallbackMixin, py_trees.behaviour.Behaviou
         )
         result = kernel.scene_edit(request)
         if result.success:
+            self._emit_scene_callback("update_pose", request)
             return py_trees.common.Status.SUCCESS
         return py_trees.common.Status.FAILURE
 
@@ -315,6 +316,8 @@ class AttachObjectToLink(_SceneCallbackMixin, py_trees.behaviour.Behaviour):
             self.logger.error(f"Failed to attach '{object_id}': {result.error}")
             return py_trees.common.Status.FAILURE
 
+        self._emit_scene_callback("attach", request)
+
         if obj_info:
             pose = kernel.get_object_pose(object_id, link_frame)
             if pose is not None:
@@ -381,6 +384,8 @@ class DetachObjectFromLink(_SceneCallbackMixin, py_trees.behaviour.Behaviour):
         if not result.success:
             self.logger.error(f"Failed to detach '{object_id}': {result.error}")
             return py_trees.common.Status.FAILURE
+
+        self._emit_scene_callback("detach", request)
 
         if obj_info:
             pose = kernel.get_object_pose(object_id, target_frame)

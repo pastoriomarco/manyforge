@@ -19,6 +19,15 @@ dependencies = [
     "yourdfpy>=0.0.60",
 ]
 
+[project.optional-dependencies]
+# The observer-safe visual snapshot publisher uses Pinocchio FK when the
+# runtime supports native robot visualization. Lightweight Composer installs
+# may omit this extra and will expose a structured pinocchio_unavailable
+# diagnostic instead of calling the legacy planning-scene FK path.
+visual = [
+    "pin==3.9.0",
+]
+
 [tool.setuptools]
 # Flat layout — the directory containing this pyproject.toml IS the package.
 # `backend` is a sub-package; `frontend`, `tests`, `verification` are excluded.

@@ -3,6 +3,7 @@
 #include <manyforge_core/time/fake_clock.hpp>
 #include <manyforge_core/time/manual_scheduler.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <functional>
@@ -283,6 +284,7 @@ class ControlledExecution : public IExecutionBackend {
   TrajectoryDTO last_execute_trajectory;
   TrajectoryDTO last_resume_trajectory;
   ExecutionSnapshot snapshot;
+  bool terminal_handle_on_pause = false;
 
   ExecutionHandle execute_trajectory(const TrajectoryDTO& trajectory) override {
     {
@@ -331,6 +333,9 @@ class ControlledExecution : public IExecutionBackend {
             ErrorDTO{kErrorInvalidRequest, "No execution in flight", {}}};
       }
       ++pause_count;
+      if (terminal_handle_on_pause) {
+        running_ = false;
+      }
       paused_ = true;
       snapshot.state = ExecutionState::kPaused;
     }
@@ -343,6 +348,9 @@ class ControlledExecution : public IExecutionBackend {
       std::lock_guard<std::mutex> lock(mu_);
       ++resume_count;
       last_resume_trajectory = trajectory;
+      if (terminal_handle_on_pause) {
+        running_ = true;
+      }
       paused_ = false;
       if (running_) {
         snapshot.state = ExecutionState::kExecuting;
@@ -1383,6 +1391,91 @@ TEST_F(ExecutionKernelTest, Resume_FromPaused_RevalidatesRemainingTrajectory) {
   controlled_execution.complete();
   controlled_kernel.wait_for_completion();
   EXPECT_EQ(controlled_kernel.get_status().state, ExecutionState::kCompleted);
+}
+
+TEST_F(ExecutionKernelTest, Resume_FromPaused_WhenBackendPauseTerminatesHandle_KeepsWorkerAlive) {
+  ControlledExecution controlled_execution;
+  controlled_execution.terminal_handle_on_pause = true;
+  FakeClock local_clock;
+  ManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  ExecutionKernel controlled_kernel{
+      planner, context, controlled_execution, local_clock, local_scheduler, local_cache};
+
+  std::mutex events_mutex;
+  std::vector<KernelEventType> events;
+  controlled_kernel.subscribe_events([&](const KernelEvent& e) {
+    std::lock_guard<std::mutex> lock(events_mutex);
+    events.push_back(e.type);
+  });
+
+  auto result = controlled_kernel.execute(make_test_request());
+  ASSERT_TRUE(result.ok());
+  ASSERT_TRUE(controlled_execution.wait_until_execute_called())
+      << "wait_until_execute_called timed out";
+  ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kExecuting));
+
+  controlled_execution.set_progress(0.5, {0.5, 0.5});
+  auto pause_result = controlled_kernel.pause();
+  ASSERT_TRUE(pause_result.accepted);
+  local_scheduler.advance_to(local_clock.now());
+  ASSERT_TRUE(controlled_execution.wait_until_paused())
+      << "wait_until_paused timed out";
+  ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kPaused));
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  {
+    std::lock_guard<std::mutex> lock(events_mutex);
+    EXPECT_EQ(
+        std::count(events.begin(), events.end(), KernelEventType::kExecuteCompleted),
+        0);
+  }
+  EXPECT_EQ(controlled_kernel.get_status().state, ExecutionState::kPaused);
+
+  context.current_state.positions_rad = {0.5, 0.5};
+  auto resume_result = controlled_kernel.resume();
+  ASSERT_TRUE(resume_result.accepted);
+  ASSERT_TRUE(controlled_execution.wait_until_resume_called())
+      << "wait_until_resume_called timed out";
+  ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kExecuting));
+
+  EXPECT_GE(context.validate_count, 2);
+  ASSERT_FALSE(controlled_execution.last_resume_trajectory.waypoints.empty());
+
+  controlled_execution.complete();
+  controlled_kernel.wait_for_completion();
+  EXPECT_EQ(controlled_kernel.get_status().state, ExecutionState::kCompleted);
+}
+
+TEST_F(ExecutionKernelTest, Reset_FromPaused_WhenBackendPauseTerminatesHandle_ReturnsIdle) {
+  ControlledExecution controlled_execution;
+  controlled_execution.terminal_handle_on_pause = true;
+  FakeClock local_clock;
+  ManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  ExecutionKernel controlled_kernel{
+      planner, context, controlled_execution, local_clock, local_scheduler, local_cache};
+
+  auto result = controlled_kernel.execute(make_test_request());
+  ASSERT_TRUE(result.ok());
+  ASSERT_TRUE(controlled_execution.wait_until_execute_called())
+      << "wait_until_execute_called timed out";
+  ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kExecuting));
+
+  auto pause_result = controlled_kernel.pause();
+  ASSERT_TRUE(pause_result.accepted);
+  local_scheduler.advance_to(local_clock.now());
+  ASSERT_TRUE(controlled_execution.wait_until_paused())
+      << "wait_until_paused timed out";
+  ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kPaused));
+
+  auto reset_result = controlled_kernel.reset();
+  ASSERT_TRUE(reset_result.accepted);
+  EXPECT_EQ(controlled_execution.reset_count, 1);
+  EXPECT_EQ(controlled_kernel.get_status().state, ExecutionState::kIdle);
+  EXPECT_TRUE(controlled_kernel.wait_for_completion(1'000'000'000))
+      << "worker did not quiesce after reset from backend-terminal pause";
+  EXPECT_EQ(controlled_kernel.get_status().state, ExecutionState::kIdle);
 }
 
 TEST_F(ExecutionKernelTest, Resume_FromPaused_ValidationFailureTransitionsToFailed) {

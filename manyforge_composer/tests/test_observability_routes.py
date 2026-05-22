@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import builtins
+import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
+import math
 import sys
+import threading
+import time
 
 import pytest
 
@@ -14,9 +19,18 @@ pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient
 
 from manyforge_behavior.cycle_manager import CycleState
-from manyforge_behavior.kernel_client import MockKernelClient, SceneEditRequest
+from manyforge_behavior.kernel_client import (
+    ExecutionSnapshot,
+    GripperCommandState,
+    GripperCommandStatus,
+    MockKernelClient,
+    SceneEditRequest,
+    SceneObjectSnapshot,
+    SceneShape,
+)
 from manyforge_composer.backend.app import create_app
 from manyforge_composer.backend import routes_scene, routes_urdf
+from manyforge_composer.backend.models import VisualSceneSnapshotResponse
 from manyforge_composer.backend.state import ComposerState
 
 
@@ -24,6 +38,11 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 _CATALOG_PATH = str(_REPO_ROOT / "manyforge_behavior" / "resources" / "node_catalog.yaml")
 _PROGRAM_PATH = str(_REPO_ROOT / "manyforge_behavior" / "tests" / "fixtures" / "pick_and_place.program.yaml")
 _DEPLOYMENT_PATH = str(_REPO_ROOT / "manyforge_behavior" / "tests" / "fixtures" / "ur5_roboplan.deployment.yaml")
+_PINOCCHIO_AVAILABLE = importlib.util.find_spec("pinocchio") is not None
+_REQUIRES_PINOCCHIO_VISUAL_FK = pytest.mark.skipif(
+    not _PINOCCHIO_AVAILABLE,
+    reason="independent visual-snapshot FK requires manyforge_composer[visual]",
+)
 
 
 def make_client(*, joint_names: list[str] | None = None) -> tuple[TestClient, ComposerState, MockKernelClient]:
@@ -31,6 +50,48 @@ def make_client(*, joint_names: list[str] | None = None) -> tuple[TestClient, Co
     state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
     app = create_app(state)
     return TestClient(app), state, kernel
+
+
+def _publish_visual_snapshot(state: ComposerState) -> dict:
+    return state.publish_visual_state_snapshot_sync(
+        lambda: routes_scene._build_visual_state_snapshot_for_publisher(state),
+        reason="test",
+    )
+
+
+def _write_toy_visual_urdf(tmp_path: Path) -> Path:
+    urdf_path = tmp_path / "toy.urdf"
+    urdf_path.write_text(
+        """<?xml version="1.0"?>
+<robot name="toy">
+  <link name="base_link">
+    <visual><geometry><box size="0.1 0.1 0.1"/></geometry></visual>
+  </link>
+  <joint name="joint_a" type="revolute">
+    <parent link="base_link"/>
+    <child link="link_1"/>
+    <origin xyz="1 0 0" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-3.14" upper="3.14" effort="1" velocity="1"/>
+  </joint>
+  <link name="link_1">
+    <visual><geometry><box size="0.1 0.1 0.1"/></geometry></visual>
+  </link>
+  <joint name="finger_joint" type="prismatic">
+    <parent link="link_1"/>
+    <child link="finger_link"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+    <axis xyz="1 0 0"/>
+    <limit lower="0" upper="1" effort="1" velocity="1"/>
+  </joint>
+  <link name="finger_link">
+    <visual><geometry><box size="0.05 0.05 0.05"/></geometry></visual>
+  </link>
+</robot>
+""",
+        encoding="utf-8",
+    )
+    return urdf_path
 
 
 def test_scene_state_no_program_returns_empty_world():
@@ -47,6 +108,976 @@ def test_scene_state_no_program_returns_empty_world():
     assert data["timestamp_ns"] > 0
 
 
+def test_scene_state_reports_visual_snapshot_pending_without_live_fallback():
+    client, _state, _kernel = make_client()
+
+    response = client.get("/api/scene/state")
+    assert response.status_code == 200
+    data = response.json()
+
+    assert data["visual_state"] is None
+    diagnostics = data["visual_state_diagnostics"]
+    assert diagnostics["mode"] == "visual_snapshot_pending"
+    assert diagnostics["served_from_visual_snapshot"] is False
+    assert diagnostics["fallback_reason"] in {
+        "visual_snapshot_publisher_unavailable",
+        "visual_snapshot_pending",
+    }
+    assert "snapshot_read" in diagnostics["timings_ms"]
+
+
+@_REQUIRES_PINOCCHIO_VISUAL_FK
+def test_scene_state_visual_snapshot_fk_uses_independent_model_when_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    """Snapshot FK must not call the kernel's legacy planning-scene FK path."""
+
+    urdf_path = _write_toy_visual_urdf(tmp_path)
+
+    class VisualKernel(MockKernelClient):
+        def __init__(self) -> None:
+            super().__init__(joint_names=["joint_a"])
+
+        def get_execution_snapshot(self):
+            return ExecutionSnapshot(joint_positions_rad=[math.pi / 2.0])
+
+        def get_link_poses(self, link_names: list[str], reference_frame: str):
+            raise AssertionError("visual snapshot must not use legacy kernel FK")
+
+        def get_link_pose(self, link_name: str, reference_frame: str):
+            raise AssertionError("visual snapshot must not use single-link FK")
+
+    entry = SimpleNamespace(urdf_path=str(urdf_path))
+    monkeypatch.setattr(routes_urdf, "get_urdf_entry", lambda _state: entry)
+    monkeypatch.setattr(routes_urdf, "active_urdf_model_key", lambda _state: "toy-key")
+    monkeypatch.setattr(
+        routes_urdf,
+        "visual_link_names_for_fk",
+        lambda _state: ("base_link", "link_1"),
+    )
+    kernel = VisualKernel()
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state.program = SimpleNamespace(
+        robot=SimpleNamespace(base_frame="base_link", tcp_frame="link_1", base_pose={}),
+        scene=[],
+    )
+    state.deployment = SimpleNamespace(
+        robot_config=SimpleNamespace(robot_id="toy", group_id="arm"),
+        adapters={},
+        grippers={},
+    )
+    result = _publish_visual_snapshot(state)
+    assert result["success"] is True, result
+
+    payload = routes_scene.build_scene_state_payload(state)
+
+    diagnostics = payload["visual_state_diagnostics"]
+    assert diagnostics["mode"] == "visual_snapshot"
+    assert diagnostics["served_from_visual_snapshot"] is True
+    assert diagnostics["fallback_reason"] is None
+    assert payload["visual_state"] is not None
+    assert payload["visual_state"]["sequence_number"] > 0
+    assert payload["visual_state"]["model_key"] == "toy-key"
+    assert payload["robot"]["tcp_pose_in_base"]["position_m"] == pytest.approx(
+        [1.0, 0.0, 0.0],
+        abs=1e-6,
+    )
+    link_pose = payload["link_poses"]["link_1"]
+    assert link_pose["position_m"] == pytest.approx([1.0, 0.0, 0.0])
+    assert link_pose["orientation_xyzw"][2] == pytest.approx(math.sqrt(0.5), abs=1e-6)
+    assert link_pose["orientation_xyzw"][3] == pytest.approx(math.sqrt(0.5), abs=1e-6)
+
+
+def test_scene_state_visual_snapshot_reports_missing_pinocchio(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    """Missing visual FK dependencies must fail closed with stable diagnostics."""
+
+    urdf_path = _write_toy_visual_urdf(tmp_path)
+
+    class VisualKernel(MockKernelClient):
+        def __init__(self) -> None:
+            super().__init__(joint_names=["joint_a"])
+
+        def get_execution_snapshot(self):
+            return ExecutionSnapshot(joint_positions_rad=[0.0])
+
+        def get_link_poses(self, link_names: list[str], reference_frame: str):
+            raise AssertionError("visual snapshot must not fall back to legacy FK")
+
+        def get_link_pose(self, link_name: str, reference_frame: str):
+            raise AssertionError("visual snapshot must not fall back to single-link FK")
+
+    entry = SimpleNamespace(urdf_path=str(urdf_path))
+    monkeypatch.setattr(routes_urdf, "get_urdf_entry", lambda _state: entry)
+    monkeypatch.setattr(
+        routes_urdf,
+        "active_urdf_model_key",
+        lambda _state: "toy-missing-pinocchio-key",
+    )
+    monkeypatch.setattr(
+        routes_urdf,
+        "visual_link_names_for_fk",
+        lambda _state: ("base_link", "link_1"),
+    )
+    kernel = VisualKernel()
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state.program = SimpleNamespace(
+        robot=SimpleNamespace(base_frame="base_link", tcp_frame="link_1", base_pose={}),
+        scene=[],
+    )
+    state.deployment = SimpleNamespace(
+        robot_config=SimpleNamespace(robot_id="toy", group_id="arm"),
+        adapters={},
+        grippers={},
+    )
+
+    real_import = builtins.__import__
+
+    def blocked_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "pinocchio" or name.startswith("pinocchio."):
+            raise ModuleNotFoundError("No module named 'pinocchio'")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", blocked_import)
+
+    result = _publish_visual_snapshot(state)
+    assert result["success"] is False
+    assert result["error"] == "pinocchio_unavailable"
+    assert "pinocchio" in result["error_detail"]
+
+    state.ensure_visual_state_publisher = lambda builder, period_s: None
+    state.request_visual_state_publish = lambda *, reason="": None
+    payload = routes_scene.build_scene_state_payload(state)
+
+    diagnostics = payload["visual_state_diagnostics"]
+    assert diagnostics["mode"] == "visual_snapshot_pending"
+    assert diagnostics["served_from_visual_snapshot"] is False
+    assert diagnostics["fallback_reason"] == "pinocchio_unavailable"
+    assert diagnostics["snapshot_publisher_error"] == "pinocchio_unavailable"
+    assert "pinocchio" in diagnostics["snapshot_publisher_error_detail"]
+    assert payload["visual_state"] is None
+    assert payload["link_poses"] == {}
+
+
+@_REQUIRES_PINOCCHIO_VISUAL_FK
+def test_visual_state_publisher_uses_cached_scene_objects_without_backend_scene_read(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    urdf_path = _write_toy_visual_urdf(tmp_path)
+
+    class VisualObjectKernel(MockKernelClient):
+        def __init__(self) -> None:
+            super().__init__(joint_names=["joint_a"])
+
+        def get_execution_snapshot(self):
+            return ExecutionSnapshot(joint_positions_rad=[0.0])
+
+        def get_scene_objects(self):
+            raise AssertionError("visual publisher must not poll mutable scene objects")
+
+    entry = SimpleNamespace(urdf_path=str(urdf_path))
+    monkeypatch.setattr(routes_urdf, "get_urdf_entry", lambda _state: entry)
+    monkeypatch.setattr(routes_urdf, "active_urdf_model_key", lambda _state: "toy-objects-key")
+    monkeypatch.setattr(
+        routes_urdf,
+        "visual_link_names_for_fk",
+        lambda _state: ("base_link", "link_1"),
+    )
+    kernel = VisualObjectKernel()
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state.program = SimpleNamespace(
+        robot=SimpleNamespace(base_frame="base_link", tcp_frame="link_1", base_pose={}),
+        scene=[],
+    )
+    state.deployment = SimpleNamespace(
+        robot_config=SimpleNamespace(robot_id="toy", group_id="arm"),
+        adapters={},
+        grippers={},
+    )
+    state.update_visual_scene_objects_snapshot(
+        [
+            SceneObjectSnapshot(
+                object_id="cached_box",
+                shape=SceneShape(type="box", box_dimensions_m=[0.1, 0.2, 0.3]),
+                pose_in_universe={
+                    "position_m": [0.4, 0.5, 0.6],
+                    "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+                },
+                attached=False,
+                frame_id="universe",
+            )
+        ]
+    )
+
+    result = _publish_visual_snapshot(state)
+
+    assert result["success"] is True, result
+    snapshot, _meta = state.visual_state_snapshot()
+    assert snapshot is not None
+    assert [obj.object_id for obj in snapshot.objects] == ["cached_box"]
+
+
+@_REQUIRES_PINOCCHIO_VISUAL_FK
+def test_visual_state_publisher_uses_cached_joint_names(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    """Visual publishing must not poll RoboPlan group metadata every frame.
+
+    The native get_joint_names() path reads the planner scene and can queue
+    behind trajectory collision validation. Runtime setup caches the stable
+    drivable joint order; the background visual publisher should consume that
+    cache plus execution snapshots.
+    """
+
+    urdf_path = _write_toy_visual_urdf(tmp_path)
+
+    class VisualKernel(MockKernelClient):
+        def __init__(self) -> None:
+            super().__init__(joint_names=["joint_a"])
+
+        def get_execution_snapshot(self):
+            return ExecutionSnapshot(joint_positions_rad=[0.0])
+
+    entry = SimpleNamespace(urdf_path=str(urdf_path))
+    monkeypatch.setattr(routes_urdf, "get_urdf_entry", lambda _state: entry)
+    monkeypatch.setattr(routes_urdf, "active_urdf_model_key", lambda _state: "toy-joints-key")
+    monkeypatch.setattr(
+        routes_urdf,
+        "visual_link_names_for_fk",
+        lambda _state: ("base_link", "link_1"),
+    )
+    kernel = VisualKernel()
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state.program = SimpleNamespace(
+        robot=SimpleNamespace(base_frame="base_link", tcp_frame="link_1", base_pose={}),
+        scene=[],
+    )
+    state.deployment = SimpleNamespace(
+        robot_config=SimpleNamespace(robot_id="toy", group_id="arm"),
+        adapters={},
+        grippers={},
+    )
+
+    def blocked_get_joint_names():
+        raise AssertionError("visual publisher must use cached joint names")
+
+    monkeypatch.setattr(kernel, "get_joint_names", blocked_get_joint_names)
+
+    result = _publish_visual_snapshot(state)
+
+    assert result["success"] is True, result
+    snapshot, _meta = state.visual_state_snapshot()
+    assert snapshot is not None
+    assert snapshot.robot is not None
+    assert snapshot.robot.joint_names == ["joint_a"]
+
+
+@_REQUIRES_PINOCCHIO_VISUAL_FK
+def test_scene_state_visual_snapshot_includes_gripper_feedback_in_fk(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    """Actuated gripper joints are observer FK inputs, not arm execution joints."""
+
+    urdf_path = _write_toy_visual_urdf(tmp_path)
+
+    class VisualGripperKernel(MockKernelClient):
+        def __init__(self) -> None:
+            super().__init__(joint_names=["joint_a"])
+
+        def get_execution_snapshot(self):
+            return ExecutionSnapshot(joint_positions_rad=[0.0])
+
+        def get_gripper_status(self, gripper_id: str):
+            assert gripper_id == "primary"
+            return GripperCommandStatus(
+                state=GripperCommandState.COMPLETED,
+                gripper_id=gripper_id,
+                current_position=0.25,
+                target_position=0.25,
+            )
+
+        def get_link_poses(self, link_names: list[str], reference_frame: str):
+            raise AssertionError("visual snapshot must not use legacy kernel FK")
+
+        def get_link_pose(self, link_name: str, reference_frame: str):
+            raise AssertionError("visual snapshot must not use single-link FK")
+
+    entry = SimpleNamespace(urdf_path=str(urdf_path))
+    monkeypatch.setattr(routes_urdf, "get_urdf_entry", lambda _state: entry)
+    monkeypatch.setattr(routes_urdf, "active_urdf_model_key", lambda _state: "toy-gripper-key")
+    monkeypatch.setattr(
+        routes_urdf,
+        "visual_link_names_for_fk",
+        lambda _state: ("base_link", "link_1", "finger_link"),
+    )
+    kernel = VisualGripperKernel()
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state.program = SimpleNamespace(
+        robot=SimpleNamespace(base_frame="base_link", tcp_frame="finger_link", base_pose={}),
+        scene=[],
+    )
+    state.deployment = SimpleNamespace(
+        robot_config=SimpleNamespace(robot_id="toy", group_id="arm"),
+        adapters={},
+        grippers={
+            "primary": SimpleNamespace(
+                joint_name="finger_joint",
+                mount_frame="link_1",
+                tcp_frame="finger_link",
+                motion_time_s=0.8,
+                srdf_presets={},
+            )
+        },
+    )
+    result = _publish_visual_snapshot(state)
+    assert result["success"] is True, result
+
+    payload = routes_scene.build_scene_state_payload(state)
+
+    diagnostics = payload["visual_state_diagnostics"]
+    assert diagnostics["mode"] == "visual_snapshot"
+    assert diagnostics["served_from_visual_snapshot"] is True
+    assert payload["robot"]["joint_names"] == ["joint_a"]
+    assert payload["robot"]["joint_positions"] == {"joint_a": 0.0}
+    assert payload["grippers"][0]["joint_name"] == "finger_joint"
+    assert payload["grippers"][0]["current_position"] == pytest.approx(0.25)
+    assert payload["link_poses"]["finger_link"]["position_m"] == pytest.approx(
+        [1.25, 0.0, 0.0],
+        abs=1e-6,
+    )
+    assert payload["robot"]["tcp_pose_in_base"]["position_m"] == pytest.approx(
+        [1.25, 0.0, 0.0],
+        abs=1e-6,
+    )
+
+
+def test_scene_routes_read_cached_visual_snapshot_without_backend_calls(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class BlockingKernel(MockKernelClient):
+        def get_execution_snapshot(self):
+            raise AssertionError("scene routes must not read execution snapshots")
+
+        def get_link_poses(self, link_names: list[str], reference_frame: str):
+            raise AssertionError("scene routes must not call FK")
+
+        def get_link_pose(self, link_name: str, reference_frame: str):
+            raise AssertionError("scene routes must not call FK")
+
+        def get_scene_objects(self):
+            raise AssertionError("scene routes must not read mutable scene objects")
+
+    monkeypatch.setattr(routes_scene, "_load_model_frame_names", lambda _state: {"base_link"})
+    kernel = BlockingKernel(joint_names=["joint_a"])
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state.program = SimpleNamespace(
+        robot=SimpleNamespace(base_frame="base_link", tcp_frame="tool0", base_pose={}),
+        scene=[],
+    )
+    state.deployment = SimpleNamespace(
+        robot_config=SimpleNamespace(robot_id="toy", group_id="arm"),
+        adapters={},
+        grippers={},
+    )
+    state.update_visual_state_snapshot(
+        VisualSceneSnapshotResponse(
+            sequence_number=42,
+            timestamp_ns=1,
+            robot=routes_scene.SceneRobotResponse(
+                robot_id="toy",
+                group_id="arm",
+                base_frame="base_link",
+                tcp_frame="tool0",
+                joint_names=["joint_a"],
+                joint_positions={"joint_a": 0.0},
+            ),
+            link_poses={
+                "base_link": {
+                    "position_m": [0.0, 0.0, 0.0],
+                    "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+                }
+            },
+        ),
+        reason="test",
+    )
+    publish_reasons: list[str] = []
+    state.ensure_visual_state_publisher = lambda builder, period_s: None
+    state.request_visual_state_publish = lambda *, reason="": publish_reasons.append(reason)
+
+    state_payload = routes_scene.build_scene_state_payload(state)
+    frames_payload = routes_scene.build_scene_frames_payload(state)
+
+    assert state_payload["visual_state_diagnostics"]["served_from_visual_snapshot"] is True
+    assert state_payload["visual_state_diagnostics"]["snapshot_sequence_number"] == 42
+    assert state_payload["robot"]["robot_id"] == "toy"
+    frames = {frame["name"]: frame for frame in frames_payload["frames"]}
+    assert frames["base_link"]["poseAvailable"] is True
+    assert (
+        frames_payload["visualStateDiagnostics"]["served_from_visual_snapshot"] is True
+    )
+    assert publish_reasons == []
+
+
+def test_scene_state_deployment_only_uses_cached_visual_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class BlockingKernel(MockKernelClient):
+        def get_execution_snapshot(self):
+            raise AssertionError("loaded deployment route must not read execution snapshots")
+
+        def get_link_pose(self, link_name: str, reference_frame: str):
+            raise AssertionError("loaded deployment route must not call FK")
+
+        def get_scene_objects(self):
+            raise AssertionError("loaded deployment route must not read mutable scene objects")
+
+    kernel = BlockingKernel(joint_names=["joint_a"])
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state.deployment = SimpleNamespace(
+        robot_config=SimpleNamespace(robot_id="toy", group_id="arm"),
+        adapters={},
+        grippers={},
+    )
+    state.update_visual_state_snapshot(
+        VisualSceneSnapshotResponse(
+            sequence_number=8,
+            timestamp_ns=1,
+            robot=routes_scene.SceneRobotResponse(
+                robot_id="toy",
+                group_id="arm",
+                base_frame="base_link",
+                tcp_frame="tool0",
+                joint_names=["joint_a"],
+                joint_positions={"joint_a": 0.0},
+            ),
+        ),
+        reason="test",
+    )
+    state.ensure_visual_state_publisher = lambda builder, period_s: None
+
+    payload = routes_scene.build_scene_state_payload(state)
+
+    diagnostics = payload["visual_state_diagnostics"]
+    assert diagnostics["served_from_visual_snapshot"] is True
+    assert diagnostics["snapshot_sequence_number"] == 8
+    assert payload["robot"]["robot_id"] == "toy"
+
+
+def test_scene_state_marks_stale_visual_snapshot_without_blocking(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("MANYFORGE_VISUAL_STATE_STALE_AFTER_MS", "50")
+    kernel = MockKernelClient(joint_names=["joint_a"])
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state.program = SimpleNamespace(
+        robot=SimpleNamespace(base_frame="base_link", tcp_frame="tool0", base_pose={}),
+        scene=[],
+    )
+    state.deployment = SimpleNamespace(
+        robot_config=SimpleNamespace(robot_id="toy", group_id="arm"),
+        adapters={},
+        grippers={},
+    )
+    state.update_visual_state_snapshot(
+        VisualSceneSnapshotResponse(
+            sequence_number=7,
+            timestamp_ns=1,
+            robot=routes_scene.SceneRobotResponse(
+                robot_id="toy",
+                group_id="arm",
+                base_frame="base_link",
+                tcp_frame="tool0",
+                joint_names=["joint_a"],
+                joint_positions={"joint_a": 0.0},
+            ),
+        ),
+        reason="test",
+    )
+    with state._visual_state_lock:
+        state._visual_state_timestamp_ns = time.monotonic_ns() - 200_000_000
+    state.ensure_visual_state_publisher = lambda builder, period_s: None
+
+    payload = routes_scene.build_scene_state_payload(state)
+
+    diagnostics = payload["visual_state_diagnostics"]
+    assert diagnostics["served_from_visual_snapshot"] is True
+    assert diagnostics["snapshot_stale"] is True
+    assert diagnostics["fallback_reason"] == "visual_snapshot_stale"
+    assert payload["visual_state"]["stale"] is True
+
+
+def test_scene_state_does_not_wait_for_blocked_visual_publisher(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=MockKernelClient())
+    state.program = SimpleNamespace(
+        robot=SimpleNamespace(base_frame="base_link", tcp_frame="tool0", base_pose={}),
+        scene=[],
+    )
+    state.deployment = SimpleNamespace(
+        robot_config=SimpleNamespace(robot_id="toy", group_id="arm"),
+        adapters={},
+        grippers={},
+    )
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocked_builder(_state):
+        entered.set()
+        assert release.wait(timeout=5.0)
+        raise RuntimeError("synthetic publisher block")
+
+    monkeypatch.setattr(routes_scene, "_build_visual_state_snapshot_for_publisher", blocked_builder)
+
+    try:
+        first_payload = routes_scene.build_scene_state_payload(state)
+        assert first_payload["visual_state_diagnostics"]["mode"] == "visual_snapshot_pending"
+        assert entered.wait(timeout=2.0)
+
+        started = time.monotonic()
+        second_payload = routes_scene.build_scene_state_payload(state)
+        elapsed_ms = (time.monotonic() - started) * 1000.0
+    finally:
+        release.set()
+        state.stop_visual_state_publisher(timeout_s=2.0)
+
+    assert elapsed_ms < 50.0
+    diagnostics = second_payload["visual_state_diagnostics"]
+    assert diagnostics["mode"] == "visual_snapshot_pending"
+    assert diagnostics["served_from_visual_snapshot"] is False
+    assert second_payload["robot"]["robot_id"] == "toy"
+
+
+def test_scene_state_visual_snapshot_uses_cached_objects_without_scene_read(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class ObjectCacheKernel(MockKernelClient):
+        def get_scene_objects(self):
+            raise AssertionError("scene-state observer must use cached visual objects")
+
+    monkeypatch.setattr(routes_urdf, "visual_link_names_for_fk", lambda _state: ())
+    kernel = ObjectCacheKernel()
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state.program = SimpleNamespace(scene=[])
+    scene_object = SceneObjectSnapshot(
+        object_id="cached_box",
+        shape=SceneShape(type="box", box_dimensions_m=[0.1, 0.2, 0.3]),
+        pose_in_universe={
+            "position_m": [0.4, 0.5, 0.6],
+            "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+        },
+        attached=False,
+        frame_id="universe",
+    )
+    state.update_visual_state_snapshot(
+        VisualSceneSnapshotResponse(
+            sequence_number=1,
+            timestamp_ns=1,
+            objects=routes_scene._scene_object_responses(state, [scene_object]),
+        ),
+        reason="test",
+    )
+
+    payload = routes_scene.build_scene_state_payload(state)
+
+    assert payload["objects"][0]["object_id"] == "cached_box"
+    assert payload["objects"][0]["shape"]["type"] == "box"
+    diagnostics = payload["visual_state_diagnostics"]
+    assert diagnostics["objects_source"] == "visual_snapshot"
+    assert diagnostics["objects_age_ms"] is not None
+
+
+def test_scene_state_empty_visual_object_cache_queues_refresh_without_scene_read(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class ObjectCacheKernel(MockKernelClient):
+        def get_scene_objects(self):
+            raise AssertionError("scene-state route must not read mutable scene objects")
+
+    monkeypatch.setattr(routes_urdf, "visual_link_names_for_fk", lambda _state: ())
+    kernel = ObjectCacheKernel()
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state.program = SimpleNamespace(scene=[])
+    publish_reasons: list[str] = []
+    state.ensure_visual_state_publisher = lambda builder, period_s: None
+    state.request_visual_state_publish = lambda *, reason="": publish_reasons.append(reason)
+
+    payload = routes_scene.build_scene_state_payload(state)
+
+    assert payload["objects"] == []
+    diagnostics = payload["visual_state_diagnostics"]
+    assert diagnostics["mode"] == "visual_snapshot_pending"
+    assert diagnostics["objects_source"] == "visual_snapshot_pending"
+    assert publish_reasons == ["scene_state_cache_empty"]
+
+
+def test_scene_state_does_not_wait_for_blocked_object_refresh(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class BlockingRefreshKernel(MockKernelClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.entered = threading.Event()
+            self.release = threading.Event()
+
+        def get_scene_objects(self):
+            self.entered.set()
+            assert self.release.wait(timeout=5.0)
+            return []
+
+    kernel = BlockingRefreshKernel()
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state.program = SimpleNamespace(scene=[])
+    publish_reasons: list[str] = []
+    state.ensure_visual_state_publisher = lambda builder, period_s: None
+    state.request_visual_state_publish = lambda *, reason="": publish_reasons.append(reason)
+
+    try:
+        refresh_result = state.request_visual_scene_objects_refresh(reason="test_blocked")
+        assert refresh_result["queued"] is True
+        assert kernel.entered.wait(timeout=2.0)
+
+        started = time.monotonic()
+        payload = routes_scene.build_scene_state_payload(state)
+        elapsed_ms = (time.monotonic() - started) * 1000.0
+    finally:
+        kernel.release.set()
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            _objects, meta = state.visual_scene_objects_snapshot()
+            if not meta["refresh_running"]:
+                break
+            time.sleep(0.005)
+
+    assert elapsed_ms < 50.0
+    diagnostics = payload["visual_state_diagnostics"]
+    assert diagnostics["mode"] == "visual_snapshot_pending"
+    assert diagnostics["objects_refresh_running"] is True
+    assert publish_reasons == ["scene_state_cache_empty"]
+
+
+def test_scene_edit_updates_visual_cache_without_backend_refresh(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    client, state, _kernel = make_client()
+    refresh_reasons: list[str] = []
+    publish_reasons: list[str] = []
+    state.request_visual_scene_objects_refresh = (
+        lambda *, reason="": refresh_reasons.append(reason)
+        or {"success": True, "queued": True}
+    )
+    state.request_visual_state_publish = (
+        lambda *, reason="": publish_reasons.append(reason)
+    )
+
+    response = client.post(
+        "/api/scene/edit",
+        json={
+            "operation": "add",
+            "object_id": "operator_box",
+            "shape_type": "box",
+            "box_dimensions_m": [0.1, 0.2, 0.3],
+            "pose_position_m": [0.4, 0.5, 0.6],
+            "pose_orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["success"] is True
+    objects, meta = state.visual_scene_objects_snapshot()
+    assert meta["timestamp_ns"] > 0
+    assert [obj.object_id for obj in objects] == ["operator_box"]
+    assert objects[0].pose_in_universe["position_m"] == [0.4, 0.5, 0.6]
+    assert objects[0].shape.type == "box"
+    assert refresh_reasons == []
+    assert publish_reasons == ["scene_edit_add"]
+
+
+def test_attached_visual_object_pose_is_composed_from_link_pose(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=MockKernelClient())
+    state.update_visual_state_snapshot(
+        VisualSceneSnapshotResponse(
+            sequence_number=1,
+            timestamp_ns=1,
+            link_poses={
+                "tool0": {
+                    "position_m": [1.0, 0.0, 0.0],
+                    "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+                }
+            },
+        ),
+        reason="test",
+    )
+    state.update_visual_scene_objects_snapshot(
+        [
+            SceneObjectSnapshot(
+                object_id="part",
+                shape=SceneShape(type="box", box_dimensions_m=[0.1, 0.1, 0.1]),
+                pose_in_universe={
+                    "position_m": [1.2, 0.0, 0.0],
+                    "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+                },
+                attached=False,
+                frame_id="universe",
+            )
+        ]
+    )
+
+    visual_update = state.apply_visual_scene_edit_success(
+        SceneEditRequest(operation="attach", object_id="part", frame_id="tool0")
+    )
+    objects_at_attach, _meta = state.visual_scene_objects_for_link_poses(
+        {
+            "tool0": {
+                "position_m": [1.0, 0.0, 0.0],
+                "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+            }
+        }
+    )
+    objects_after_motion, _meta = state.visual_scene_objects_for_link_poses(
+        {
+            "tool0": {
+                "position_m": [2.0, 0.0, 0.0],
+                "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+            }
+        }
+    )
+
+    assert visual_update == {"updated": True, "needs_refresh": False}
+    assert objects_at_attach[0].attached is True
+    assert objects_at_attach[0].frame_id == "tool0"
+    assert objects_at_attach[0].pose_in_universe["position_m"] == pytest.approx(
+        [1.2, 0.0, 0.0]
+    )
+    assert objects_after_motion[0].pose_in_universe["position_m"] == pytest.approx(
+        [2.2, 0.0, 0.0]
+    )
+
+
+def test_visual_object_refresh_derives_attachment_offset_from_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=MockKernelClient())
+    state.update_visual_state_snapshot(
+        VisualSceneSnapshotResponse(
+            sequence_number=1,
+            timestamp_ns=1,
+            link_poses={
+                "tool0": {
+                    "position_m": [1.0, 0.0, 0.0],
+                    "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+                }
+            },
+        ),
+        reason="test",
+    )
+
+    state.update_visual_scene_objects_snapshot(
+        [
+            SceneObjectSnapshot(
+                object_id="part",
+                shape=SceneShape(type="box", box_dimensions_m=[0.1, 0.1, 0.1]),
+                pose_in_universe={
+                    "position_m": [1.2, 0.0, 0.0],
+                    "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+                },
+                attached=True,
+                frame_id="tool0",
+            )
+        ]
+    )
+    objects_after_motion, _meta = state.visual_scene_objects_for_link_poses(
+        {
+            "tool0": {
+                "position_m": [2.0, 0.0, 0.0],
+                "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+            }
+        }
+    )
+
+    assert objects_after_motion[0].attached is True
+    assert objects_after_motion[0].pose_in_universe["position_m"] == pytest.approx(
+        [2.2, 0.0, 0.0]
+    )
+
+
+def test_visual_object_reader_lazily_derives_missing_attachment_offset(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=MockKernelClient())
+    state.update_visual_scene_objects_snapshot(
+        [
+            SceneObjectSnapshot(
+                object_id="part",
+                shape=SceneShape(type="box", box_dimensions_m=[0.1, 0.1, 0.1]),
+                pose_in_universe={
+                    "position_m": [1.2, 0.0, 0.0],
+                    "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+                },
+                attached=True,
+                frame_id="tool0",
+            )
+        ]
+    )
+
+    objects_at_first_fk, _meta = state.visual_scene_objects_for_link_poses(
+        {
+            "tool0": {
+                "position_m": [1.0, 0.0, 0.0],
+                "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+            }
+        }
+    )
+    objects_after_motion, _meta = state.visual_scene_objects_for_link_poses(
+        {
+            "tool0": {
+                "position_m": [2.0, 0.0, 0.0],
+                "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+            }
+        }
+    )
+
+    assert objects_at_first_fk[0].pose_in_universe["position_m"] == pytest.approx(
+        [1.2, 0.0, 0.0]
+    )
+    assert objects_after_motion[0].pose_in_universe["position_m"] == pytest.approx(
+        [2.2, 0.0, 0.0]
+    )
+
+
+def test_scene_frames_visual_snapshot_pending_flags_are_deterministic():
+    client, state, _kernel = make_client()
+    state.load_program(_PROGRAM_PATH, deployment_path=_DEPLOYMENT_PATH)
+
+    response = client.get("/api/scene/frames")
+    assert response.status_code == 200
+    data = response.json()
+
+    diagnostics = data["visualStateDiagnostics"]
+    assert diagnostics["mode"] == "visual_snapshot_pending"
+    assert diagnostics["served_from_visual_snapshot"] is False
+    assert diagnostics["fallback_reason"] in {
+        "visual_snapshot_pending",
+        "visual_snapshot_publisher_unavailable",
+    }
+    assert "frame_inventory" in diagnostics["timings_ms"]
+
+
+@_REQUIRES_PINOCCHIO_VISUAL_FK
+def test_scene_frames_visual_snapshot_avoids_legacy_batch_fk(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    urdf_path = _write_toy_visual_urdf(tmp_path)
+
+    class VisualFrameKernel(MockKernelClient):
+        def __init__(self) -> None:
+            super().__init__(joint_names=["joint_a"])
+
+        def get_execution_snapshot(self):
+            return ExecutionSnapshot(joint_positions_rad=[math.pi / 2.0])
+
+        def get_link_poses(self, link_names: list[str], reference_frame: str):
+            raise AssertionError("frames route must not compute FK")
+
+    entry = SimpleNamespace(urdf_path=str(urdf_path))
+    monkeypatch.setattr(routes_urdf, "get_urdf_entry", lambda _state: entry)
+    monkeypatch.setattr(routes_urdf, "active_urdf_model_key", lambda _state: "toy-frame-key")
+    monkeypatch.setattr(
+        routes_scene,
+        "_load_model_frame_names",
+        lambda _state: {"base_link", "link_1"},
+    )
+    monkeypatch.setattr(
+        routes_urdf,
+        "visual_link_names_for_fk",
+        lambda _state: ("base_link", "link_1"),
+    )
+    kernel = VisualFrameKernel()
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state.program = SimpleNamespace(
+        robot=SimpleNamespace(base_frame="base_link", tcp_frame="tool0", base_pose={}),
+        scene=[],
+    )
+    state.deployment = SimpleNamespace(
+        robot_config=SimpleNamespace(robot_id="toy", group_id="arm"),
+        adapters={},
+        grippers={},
+    )
+    result = _publish_visual_snapshot(state)
+    assert result["success"] is True, result
+
+    payload = routes_scene.build_scene_frames_payload(state)
+
+    diagnostics = payload["visualStateDiagnostics"]
+    assert diagnostics["mode"] == "visual_snapshot"
+    assert diagnostics["served_from_visual_snapshot"] is True
+    frames = {frame["name"]: frame for frame in payload["frames"]}
+    assert frames["link_1"]["poseAvailable"] is True
+    assert frames["link_1"]["poseInWorld"]["orientation_xyzw"][2] == pytest.approx(
+        math.sqrt(0.5),
+        abs=1e-6,
+    )
+
+
+def test_scene_frames_does_not_wait_for_blocked_visual_publisher(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(
+        routes_scene,
+        "_load_model_frame_names",
+        lambda _state: {"base_link", "tool0"},
+    )
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=MockKernelClient())
+    state.program = SimpleNamespace(
+        robot=SimpleNamespace(base_frame="base_link", tcp_frame="tool0", base_pose={}),
+        scene=[],
+    )
+    state.deployment = SimpleNamespace(
+        robot_config=SimpleNamespace(robot_id="toy", group_id="arm"),
+        adapters={},
+        grippers={},
+    )
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocked_builder(_state):
+        entered.set()
+        assert release.wait(timeout=5.0)
+        raise RuntimeError("synthetic publisher block")
+
+    monkeypatch.setattr(routes_scene, "_build_visual_state_snapshot_for_publisher", blocked_builder)
+
+    try:
+        first_payload = routes_scene.build_scene_frames_payload(state)
+        assert (
+            first_payload["visualStateDiagnostics"]["mode"]
+            == "visual_snapshot_pending"
+        )
+        assert entered.wait(timeout=2.0)
+
+        started = time.monotonic()
+        second_payload = routes_scene.build_scene_frames_payload(state)
+        elapsed_ms = (time.monotonic() - started) * 1000.0
+    finally:
+        release.set()
+        state.stop_visual_state_publisher(timeout_s=2.0)
+
+    assert elapsed_ms < 50.0
+    diagnostics = second_payload["visualStateDiagnostics"]
+    assert diagnostics["mode"] == "visual_snapshot_pending"
+    frames = {frame["name"]: frame for frame in second_payload["frames"]}
+    assert frames["base_link"]["poseAvailable"] is False
+
+
 def test_scene_state_uses_backend_authoritative_objects_for_runtime_additions():
     client, state, kernel = make_client()
     result = kernel.scene_edit(
@@ -61,6 +1092,8 @@ def test_scene_state_uses_backend_authoritative_objects_for_runtime_additions():
         )
     )
     assert result.success is True
+    refresh = state.refresh_visual_scene_objects_sync(reason="test_runtime_addition")
+    assert refresh["success"] is True
 
     response = client.get("/api/scene/state")
     assert response.status_code == 200
@@ -99,6 +1132,8 @@ def test_scene_object_frame_visibility_routes_to_hmi_and_state():
         )
     )
     assert result.success is True
+    refresh = state.refresh_visual_scene_objects_sync(reason="test_object_frame_visibility")
+    assert refresh["success"] is True
 
     class DummyHmi:
         def __init__(self):
@@ -127,7 +1162,9 @@ def test_scene_object_frame_visibility_routes_to_hmi_and_state():
     assert data["objects"][0]["viewer_frame_visible"] is True
 
 
-def test_scene_state_includes_robot_metadata_after_program_load():
+def test_scene_state_includes_robot_metadata_after_program_load(
+    monkeypatch: pytest.MonkeyPatch,
+):
     client, state, kernel = make_client(joint_names=["joint_a", "joint_b", "joint_c"])
     state.load_program(_PROGRAM_PATH, deployment_path=_DEPLOYMENT_PATH)
 
@@ -195,6 +1232,19 @@ def test_scene_state_does_not_advance_gripper_commands_on_read_path(
         adapters={},
         grippers={},
     )
+    state.update_visual_state_snapshot(
+        VisualSceneSnapshotResponse(
+            sequence_number=1,
+            timestamp_ns=1,
+            link_poses={
+                "finger": {
+                    "position_m": [0.0, 0.0, 0.0],
+                    "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+                }
+            },
+        ),
+        reason="test",
+    )
 
     payload = routes_scene.build_scene_state_payload(state)
 
@@ -202,7 +1252,9 @@ def test_scene_state_does_not_advance_gripper_commands_on_read_path(
     assert kernel.gripper_update_count == 0
 
 
-def test_scene_frames_expose_model_inventory_and_visibility_control():
+def test_scene_frames_expose_model_inventory_and_visibility_control(
+    monkeypatch: pytest.MonkeyPatch,
+):
     client, state, kernel = make_client()
     state.load_program(_PROGRAM_PATH, deployment_path=_DEPLOYMENT_PATH)
 
@@ -223,7 +1275,6 @@ def test_scene_frames_expose_model_inventory_and_visibility_control():
             self.frame_gizmo_size = axes_length_m
 
     state.hmi_server = DummyHmi()
-
     response = client.get("/api/scene/frames")
     assert response.status_code == 200
     data = response.json()
@@ -237,7 +1288,7 @@ def test_scene_frames_expose_model_inventory_and_visibility_control():
     tool0 = next(frame for frame in data["frames"] if frame["name"] == "tool0")
     assert "program_tcp" in tool0["roles"]
     assert tool0["viewerVisible"] is True
-    assert tool0["poseAvailable"] is True
+    assert tool0["poseAvailable"] is False
 
     toggle = client.post(
         "/api/scene/frames/visibility",
@@ -255,7 +1306,7 @@ def test_scene_frames_expose_model_inventory_and_visibility_control():
     assert state.hmi_server.frame_gizmo_size == 0.12
 
 
-def test_scene_frames_batch_fk_once_for_observer_route(monkeypatch):
+def test_scene_frames_never_call_batch_fk_on_observer_route(monkeypatch):
     class BatchKernel(MockKernelClient):
         def __init__(self) -> None:
             super().__init__()
@@ -272,7 +1323,7 @@ def test_scene_frames_batch_fk_once_for_observer_route(monkeypatch):
             }
 
         def get_link_pose(self, link_name: str, reference_frame: str):
-            raise AssertionError("scene frames must use batch FK")
+            raise AssertionError("scene frames route must not compute FK")
 
     monkeypatch.setattr(
         routes_scene,
@@ -293,13 +1344,10 @@ def test_scene_frames_batch_fk_once_for_observer_route(monkeypatch):
 
     payload = routes_scene.build_scene_frames_payload(state)
 
-    assert len(kernel.batch_calls) == 1
-    requested_frames, reference_frame = kernel.batch_calls[0]
-    assert reference_frame == "universe"
-    assert set(requested_frames) == {"base_link", "link_a", "link_b", "tool0"}
+    assert kernel.batch_calls == []
     poses_by_name = {frame["name"]: frame for frame in payload["frames"]}
-    assert poses_by_name["link_a"]["poseAvailable"] is True
-    assert poses_by_name["link_a"]["poseInWorld"] is not None
+    assert poses_by_name["link_a"]["poseAvailable"] is False
+    assert poses_by_name["link_a"]["poseInWorld"] is None
 
 
 def test_scene_frames_do_not_append_default_package_paths_when_deployment_declares_package_paths(monkeypatch, tmp_path):
