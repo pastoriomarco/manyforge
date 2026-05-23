@@ -17,6 +17,7 @@
 #include <manyforge_core/types/validation.hpp>
 #include <manyforge_core/types/scene_edit.hpp>
 #include <manyforge_core/types/collision_event.hpp>
+#include <manyforge_core/types/collision.hpp>
 
 namespace py = pybind11;
 
@@ -440,15 +441,17 @@ PYBIND11_MODULE(manyforge_core_py, m) {
 
     py::class_<manyforge::core::ValidationOptionsDTO>(m, "ValidationOptionsDTO")
         .def(py::init<>())
-        .def(py::init<double, const std::string&, const std::string&>(),
+        .def(py::init<double, const std::string&, const std::string&, bool>(),
              py::arg("max_tcp_linear_speed_mps") = 0.0,
-             py::arg("tcp_frame"), py::arg("base_frame"))
+             py::arg("tcp_frame"), py::arg("base_frame"),
+             py::arg("run_collision_checks") = true)
         .def_readwrite("max_tcp_linear_speed_mps", &manyforge::core::ValidationOptionsDTO::max_tcp_linear_speed_mps)
         .def_readwrite("tcp_frame", &manyforge::core::ValidationOptionsDTO::tcp_frame)
         .def_readwrite("base_frame", &manyforge::core::ValidationOptionsDTO::base_frame)
+        .def_readwrite("run_collision_checks", &manyforge::core::ValidationOptionsDTO::run_collision_checks)
         .def("__repr__", [](const manyforge::core::ValidationOptionsDTO& v) {
-            return py::str("ValidationOptionsDTO(max_tcp_linear_speed_mps={}, tcp_frame='{}', base_frame='{}')")
-                .format(v.max_tcp_linear_speed_mps, v.tcp_frame, v.base_frame);
+            return py::str("ValidationOptionsDTO(max_tcp_linear_speed_mps={}, tcp_frame='{}', base_frame='{}', run_collision_checks={})")
+                .format(v.max_tcp_linear_speed_mps, v.tcp_frame, v.base_frame, v.run_collision_checks);
         });
 
     py::class_<manyforge::core::ValidationResultDTO>(m, "ValidationResultDTO")
@@ -472,6 +475,8 @@ PYBIND11_MODULE(manyforge_core_py, m) {
         .def_readwrite("in_collision", &manyforge::core::CollisionCheckResultDTO::in_collision)
         .def_readwrite("contact_body_a", &manyforge::core::CollisionCheckResultDTO::contact_body_a)
         .def_readwrite("contact_body_b", &manyforge::core::CollisionCheckResultDTO::contact_body_b)
+        .def_readwrite("penetration_depth_m", &manyforge::core::CollisionCheckResultDTO::penetration_depth_m)
+        .def_readwrite("estimated_force_n", &manyforge::core::CollisionCheckResultDTO::estimated_force_n)
         .def("__repr__", [](const manyforge::core::CollisionCheckResultDTO& c) {
             return py::str("CollisionCheckResultDTO(in_collision={})").format(c.in_collision);
         });
@@ -601,6 +606,334 @@ PYBIND11_MODULE(manyforge_core_py, m) {
         .def_readwrite("error", &manyforge::core::SceneEditResultDTO::error)
         .def("__repr__", [](const manyforge::core::SceneEditResultDTO& s) {
             return py::str("SceneEditResultDTO(success={})").format(s.success);
+        });
+
+    // ========================================================================
+    // Normalized Collision DTOs (spec §3.8.1)
+    //
+    // See docs/plans/COLLISION_CHECKING_OWNERSHIP_PLAN.md. These DTOs ride
+    // alongside the existing CollisionCheckRequestDTO / CollisionCheckResultDTO
+    // through Chunks 1-4 and become the kernel's source of truth in Chunk 5.
+    // ========================================================================
+
+    py::enum_<manyforge::core::CollisionOwnerKind>(m, "CollisionOwnerKind")
+        .value("kRobotLink", manyforge::core::CollisionOwnerKind::kRobotLink)
+        .value("kAttachedObject", manyforge::core::CollisionOwnerKind::kAttachedObject)
+        .value("kDetachedObject", manyforge::core::CollisionOwnerKind::kDetachedObject)
+        .value("kFixture", manyforge::core::CollisionOwnerKind::kFixture);
+
+    py::enum_<manyforge::core::CollisionGeometryKind>(m, "CollisionGeometryKind")
+        .value("kBox", manyforge::core::CollisionGeometryKind::kBox)
+        .value("kSphere", manyforge::core::CollisionGeometryKind::kSphere)
+        .value("kCylinder", manyforge::core::CollisionGeometryKind::kCylinder)
+        .value("kCapsule", manyforge::core::CollisionGeometryKind::kCapsule)
+        .value("kConvexMesh", manyforge::core::CollisionGeometryKind::kConvexMesh)
+        .value("kTriangleMesh", manyforge::core::CollisionGeometryKind::kTriangleMesh)
+        .value("kCompound", manyforge::core::CollisionGeometryKind::kCompound);
+
+    py::enum_<manyforge::core::CollisionSurface>(m, "CollisionSurface")
+        .value("kPreExecutionValidation",
+               manyforge::core::CollisionSurface::kPreExecutionValidation)
+        .value("kPredictedRuntimeMonitor",
+               manyforge::core::CollisionSurface::kPredictedRuntimeMonitor)
+        .value("kObservedRuntimeMonitor",
+               manyforge::core::CollisionSurface::kObservedRuntimeMonitor)
+        .value("kDiagnosticCompare",
+               manyforge::core::CollisionSurface::kDiagnosticCompare)
+        .value("kPlannerHint", manyforge::core::CollisionSurface::kPlannerHint)
+        .value("kStreamingTargetValidation",
+               manyforge::core::CollisionSurface::kStreamingTargetValidation)
+        .value("kStreamingPredictedMonitor",
+               manyforge::core::CollisionSurface::kStreamingPredictedMonitor)
+        .value("kStreamingObservedMonitor",
+               manyforge::core::CollisionSurface::kStreamingObservedMonitor);
+
+    py::enum_<manyforge::core::CollisionSamplingMode>(m, "CollisionSamplingMode")
+        .value("kWaypointOnly", manyforge::core::CollisionSamplingMode::kWaypointOnly)
+        .value("kInterpolatedDiscrete",
+               manyforge::core::CollisionSamplingMode::kInterpolatedDiscrete)
+        .value("kCcd", manyforge::core::CollisionSamplingMode::kCcd)
+        .value("kEngineDefault", manyforge::core::CollisionSamplingMode::kEngineDefault);
+
+    py::enum_<manyforge::core::CollisionEngineStatus>(m, "CollisionEngineStatus")
+        .value("kOk", manyforge::core::CollisionEngineStatus::kOk)
+        .value("kTimeout", manyforge::core::CollisionEngineStatus::kTimeout)
+        .value("kUnsupportedGeometry",
+               manyforge::core::CollisionEngineStatus::kUnsupportedGeometry)
+        .value("kDiagnosticIncomplete",
+               manyforge::core::CollisionEngineStatus::kDiagnosticIncomplete)
+        .value("kEngineError", manyforge::core::CollisionEngineStatus::kEngineError);
+
+    py::enum_<manyforge::core::CollisionDecisionResult>(m, "CollisionDecisionResult")
+        .value("kPass", manyforge::core::CollisionDecisionResult::kPass)
+        .value("kFail", manyforge::core::CollisionDecisionResult::kFail)
+        .value("kWarn", manyforge::core::CollisionDecisionResult::kWarn)
+        .value("kStopRequested",
+               manyforge::core::CollisionDecisionResult::kStopRequested)
+        .value("kInconclusiveFail",
+               manyforge::core::CollisionDecisionResult::kInconclusiveFail);
+
+    py::enum_<manyforge::core::CollisionDecisionSeverity>(m, "CollisionDecisionSeverity")
+        .value("kNone", manyforge::core::CollisionDecisionSeverity::kNone)
+        .value("kWarn", manyforge::core::CollisionDecisionSeverity::kWarn)
+        .value("kBlock", manyforge::core::CollisionDecisionSeverity::kBlock);
+
+    py::enum_<manyforge::core::CollisionDecisionAction>(m, "CollisionDecisionAction")
+        .value("kDispatch", manyforge::core::CollisionDecisionAction::kDispatch)
+        .value("kReject", manyforge::core::CollisionDecisionAction::kReject)
+        .value("kWarnOnly", manyforge::core::CollisionDecisionAction::kWarnOnly)
+        .value("kInconclusive",
+               manyforge::core::CollisionDecisionAction::kInconclusive);
+
+    py::class_<manyforge::core::CollisionWorldRevision>(m, "CollisionWorldRevision")
+        .def(py::init<>())
+        .def(py::init<std::uint64_t, const std::string&>(),
+             py::arg("revision_id"), py::arg("content_hash"))
+        .def_readwrite("revision_id",
+                       &manyforge::core::CollisionWorldRevision::revision_id)
+        .def_readwrite("content_hash",
+                       &manyforge::core::CollisionWorldRevision::content_hash)
+        .def("__repr__", [](const manyforge::core::CollisionWorldRevision& r) {
+            return py::str("CollisionWorldRevision(revision_id={}, content_hash='{}')")
+                .format(r.revision_id, r.content_hash);
+        });
+
+    py::enum_<manyforge::core::CollisionWorldMutationSource>(m, "CollisionWorldMutationSource")
+        .value("kProgramLoad",
+               manyforge::core::CollisionWorldMutationSource::kProgramLoad)
+        .value("kSceneEdit",
+               manyforge::core::CollisionWorldMutationSource::kSceneEdit)
+        .value("kAttach", manyforge::core::CollisionWorldMutationSource::kAttach)
+        .value("kDetach", manyforge::core::CollisionWorldMutationSource::kDetach)
+        .value("kPoseSourceApply",
+               manyforge::core::CollisionWorldMutationSource::kPoseSourceApply)
+        .value("kDeploymentLoad",
+               manyforge::core::CollisionWorldMutationSource::kDeploymentLoad)
+        .value("kPolicyUpdate",
+               manyforge::core::CollisionWorldMutationSource::kPolicyUpdate);
+
+    py::class_<manyforge::core::CollisionWorldLedgerEntry>(m, "CollisionWorldLedgerEntry")
+        .def(py::init<>())
+        .def_readwrite("revision",
+                       &manyforge::core::CollisionWorldLedgerEntry::revision)
+        .def_readwrite("previous_revision_id",
+                       &manyforge::core::CollisionWorldLedgerEntry::previous_revision_id)
+        .def_readwrite("mutation_source",
+                       &manyforge::core::CollisionWorldLedgerEntry::mutation_source)
+        .def_readwrite("affected_body_ids",
+                       &manyforge::core::CollisionWorldLedgerEntry::affected_body_ids)
+        .def_readwrite("timestamp_ns",
+                       &manyforge::core::CollisionWorldLedgerEntry::timestamp_ns)
+        .def_readwrite("authority_source",
+                       &manyforge::core::CollisionWorldLedgerEntry::authority_source)
+        .def_readwrite("session_id",
+                       &manyforge::core::CollisionWorldLedgerEntry::session_id)
+        .def("__repr__", [](const manyforge::core::CollisionWorldLedgerEntry& e) {
+            return py::str(
+                       "CollisionWorldLedgerEntry(revision_id={}, source='{}')")
+                .format(e.revision.revision_id, e.authority_source);
+        });
+
+    py::class_<manyforge::core::CollisionPairId>(m, "CollisionPairId")
+        .def(py::init<>())
+        .def(py::init<const std::string&, const std::string&>(),
+             py::arg("body_a"), py::arg("body_b"))
+        .def_readwrite("body_a", &manyforge::core::CollisionPairId::body_a)
+        .def_readwrite("body_b", &manyforge::core::CollisionPairId::body_b)
+        .def("__repr__", [](const manyforge::core::CollisionPairId& p) {
+            return py::str("CollisionPairId(body_a='{}', body_b='{}')")
+                .format(p.body_a, p.body_b);
+        });
+
+    py::enum_<manyforge::core::CollisionPairClassification>(m,
+                                                            "CollisionPairClassification")
+        .value("kBlockingCollision",
+               manyforge::core::CollisionPairClassification::kBlockingCollision)
+        .value("kAllowedStaticStatic",
+               manyforge::core::CollisionPairClassification::kAllowedStaticStatic)
+        .value("kSupportContactStart",
+               manyforge::core::CollisionPairClassification::kSupportContactStart)
+        .value("kSupportContactContinued",
+               manyforge::core::CollisionPairClassification::kSupportContactContinued)
+        .value("kSupportContactSeparated",
+               manyforge::core::CollisionPairClassification::kSupportContactSeparated)
+        .value("kSupportContactRecontactViolation",
+               manyforge::core::CollisionPairClassification::
+                   kSupportContactRecontactViolation)
+        .value("kAllowedTouchLink",
+               manyforge::core::CollisionPairClassification::kAllowedTouchLink)
+        .value("kDiagnosticIncomplete",
+               manyforge::core::CollisionPairClassification::kDiagnosticIncomplete);
+
+    py::class_<manyforge::core::CollisionPairResult>(m, "CollisionPairResult")
+        .def(py::init<>())
+        .def_readwrite("pair", &manyforge::core::CollisionPairResult::pair)
+        .def_readwrite("classification",
+                       &manyforge::core::CollisionPairResult::classification)
+        .def_readwrite("is_first_failure",
+                       &manyforge::core::CollisionPairResult::is_first_failure)
+        .def("__repr__", [](const manyforge::core::CollisionPairResult& r) {
+            return py::str("CollisionPairResult(is_first_failure={})")
+                .format(r.is_first_failure);
+        });
+
+    py::class_<manyforge::core::SupportContactPolicyEntry>(m,
+                                                           "SupportContactPolicyEntry")
+        .def(py::init<>())
+        .def_readwrite("pair",
+                       &manyforge::core::SupportContactPolicyEntry::pair)
+        .def_readwrite(
+            "max_start_penetration_m",
+            &manyforge::core::SupportContactPolicyEntry::max_start_penetration_m)
+        .def_readwrite(
+            "require_separation_by_end",
+            &manyforge::core::SupportContactPolicyEntry::require_separation_by_end)
+        .def_readwrite("allow_recontact",
+                       &manyforge::core::SupportContactPolicyEntry::allow_recontact);
+
+    py::class_<manyforge::core::CollisionPolicyRevision>(m,
+                                                         "CollisionPolicyRevision")
+        .def(py::init<>())
+        .def(py::init<std::uint64_t, const std::string&>(),
+             py::arg("revision_id"), py::arg("content_hash"))
+        .def_readwrite("revision_id",
+                       &manyforge::core::CollisionPolicyRevision::revision_id)
+        .def_readwrite("content_hash",
+                       &manyforge::core::CollisionPolicyRevision::content_hash);
+
+    py::class_<manyforge::core::CollisionPolicySnapshot>(m,
+                                                         "CollisionPolicySnapshot")
+        .def(py::init<>())
+        .def_readwrite("policy_id",
+                       &manyforge::core::CollisionPolicySnapshot::policy_id)
+        .def_readwrite("revision",
+                       &manyforge::core::CollisionPolicySnapshot::revision)
+        .def_readwrite(
+            "allowed_static_static_pairs",
+            &manyforge::core::CollisionPolicySnapshot::allowed_static_static_pairs)
+        .def_readwrite(
+            "allowed_touch_link_pairs",
+            &manyforge::core::CollisionPolicySnapshot::allowed_touch_link_pairs)
+        .def_readwrite(
+            "support_contacts",
+            &manyforge::core::CollisionPolicySnapshot::support_contacts)
+        .def_readwrite(
+            "require_full_diagnostics",
+            &manyforge::core::CollisionPolicySnapshot::require_full_diagnostics);
+
+    py::class_<manyforge::core::CollisionGeometryDescriptor>(m, "CollisionGeometryDescriptor")
+        .def(py::init<>())
+        .def_readwrite("body_id",
+                       &manyforge::core::CollisionGeometryDescriptor::body_id)
+        .def_readwrite("owner_kind",
+                       &manyforge::core::CollisionGeometryDescriptor::owner_kind)
+        .def_readwrite("geometry_kind",
+                       &manyforge::core::CollisionGeometryDescriptor::geometry_kind)
+        .def_readwrite("local_pose",
+                       &manyforge::core::CollisionGeometryDescriptor::local_pose)
+        .def_readwrite("source_uri",
+                       &manyforge::core::CollisionGeometryDescriptor::source_uri)
+        .def_readwrite("source_hash",
+                       &manyforge::core::CollisionGeometryDescriptor::source_hash)
+        .def_readwrite("quality_labels",
+                       &manyforge::core::CollisionGeometryDescriptor::quality_labels)
+        .def_readwrite("triangle_count",
+                       &manyforge::core::CollisionGeometryDescriptor::triangle_count)
+        .def_readwrite("convex_part_count",
+                       &manyforge::core::CollisionGeometryDescriptor::convex_part_count)
+        .def_readwrite("memory_estimate_bytes",
+                       &manyforge::core::CollisionGeometryDescriptor::memory_estimate_bytes)
+        .def("__repr__", [](const manyforge::core::CollisionGeometryDescriptor& g) {
+            return py::str("CollisionGeometryDescriptor(body_id='{}')")
+                .format(g.body_id);
+        });
+
+    py::class_<manyforge::core::CollisionQuery>(m, "CollisionQuery")
+        .def(py::init<>())
+        .def_readwrite("query_id", &manyforge::core::CollisionQuery::query_id)
+        .def_readwrite("validation_id",
+                       &manyforge::core::CollisionQuery::validation_id)
+        .def_readwrite("surface", &manyforge::core::CollisionQuery::surface)
+        .def_readwrite("collision_world_revision",
+                       &manyforge::core::CollisionQuery::collision_world_revision)
+        .def_readwrite("policy_revision",
+                       &manyforge::core::CollisionQuery::policy_revision)
+        .def_readwrite("robot_state",
+                       &manyforge::core::CollisionQuery::robot_state)
+        .def_readwrite("waypoint_index",
+                       &manyforge::core::CollisionQuery::waypoint_index)
+        .def_readwrite("state_time_ns",
+                       &manyforge::core::CollisionQuery::state_time_ns)
+        .def_readwrite("sampling_mode",
+                       &manyforge::core::CollisionQuery::sampling_mode)
+        .def_readwrite("timeout_budget_ns",
+                       &manyforge::core::CollisionQuery::timeout_budget_ns)
+        .def_readwrite("required_capabilities",
+                       &manyforge::core::CollisionQuery::required_capabilities)
+        .def_readwrite("max_contacts",
+                       &manyforge::core::CollisionQuery::max_contacts)
+        .def("__repr__", [](const manyforge::core::CollisionQuery& q) {
+            return py::str("CollisionQuery(query_id='{}')").format(q.query_id);
+        });
+
+    py::class_<manyforge::core::CollisionResult>(m, "CollisionResult")
+        .def(py::init<>())
+        .def_readwrite("in_collision",
+                       &manyforge::core::CollisionResult::in_collision)
+        .def_readwrite("contact_body_a",
+                       &manyforge::core::CollisionResult::contact_body_a)
+        .def_readwrite("contact_body_b",
+                       &manyforge::core::CollisionResult::contact_body_b)
+        .def_readwrite("normalized_pairs",
+                       &manyforge::core::CollisionResult::normalized_pairs)
+        .def_readwrite("query_id", &manyforge::core::CollisionResult::query_id)
+        .def_readwrite("collision_world_revision",
+                       &manyforge::core::CollisionResult::collision_world_revision)
+        .def_readwrite("policy_revision",
+                       &manyforge::core::CollisionResult::policy_revision)
+        .def_readwrite("surface", &manyforge::core::CollisionResult::surface)
+        .def_readwrite("state_time_ns",
+                       &manyforge::core::CollisionResult::state_time_ns)
+        .def_readwrite("engine_status",
+                       &manyforge::core::CollisionResult::engine_status)
+        .def_readwrite("decision", &manyforge::core::CollisionResult::decision)
+        .def_readwrite("engine_id", &manyforge::core::CollisionResult::engine_id)
+        .def_readwrite("engine_version",
+                       &manyforge::core::CollisionResult::engine_version)
+        .def_readwrite("query_duration_ns",
+                       &manyforge::core::CollisionResult::query_duration_ns)
+        .def_readwrite("sampling_mode",
+                       &manyforge::core::CollisionResult::sampling_mode)
+        .def_readwrite("min_clearance_m",
+                       &manyforge::core::CollisionResult::min_clearance_m)
+        .def_readwrite("min_clearance_pair",
+                       &manyforge::core::CollisionResult::min_clearance_pair)
+        .def_readwrite(
+            "normalized_pairs_classified",
+            &manyforge::core::CollisionResult::normalized_pairs_classified)
+        .def_readwrite("policy_revision_used",
+                       &manyforge::core::CollisionResult::policy_revision_used)
+        .def("__repr__", [](const manyforge::core::CollisionResult& r) {
+            return py::str("CollisionResult(in_collision={}, pairs={})")
+                .format(r.in_collision, r.normalized_pairs.size());
+        });
+
+    py::class_<manyforge::core::CollisionDecision>(m, "CollisionDecision")
+        .def(py::init<>())
+        .def_readwrite("accepted", &manyforge::core::CollisionDecision::accepted)
+        .def_readwrite("first_failing_waypoint",
+                       &manyforge::core::CollisionDecision::first_failing_waypoint)
+        .def_readwrite("first_failing_time_ns",
+                       &manyforge::core::CollisionDecision::first_failing_time_ns)
+        .def_readwrite("severity",
+                       &manyforge::core::CollisionDecision::severity)
+        .def_readwrite("action", &manyforge::core::CollisionDecision::action)
+        .def_readwrite("collision_world_revision",
+                       &manyforge::core::CollisionDecision::collision_world_revision)
+        .def_readwrite("failure_archive_id",
+                       &manyforge::core::CollisionDecision::failure_archive_id)
+        .def("__repr__", [](const manyforge::core::CollisionDecision& d) {
+            return py::str("CollisionDecision(accepted={})").format(d.accepted);
         });
 
     // ========================================================================

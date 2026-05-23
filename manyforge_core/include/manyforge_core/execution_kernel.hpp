@@ -2,6 +2,7 @@
 
 #include <manyforge_core/cache/trajectory_cache.hpp>
 #include <manyforge_core/collision/collision_policy.hpp>
+#include <manyforge_core/collision/collision_validation_coordinator.hpp>
 #include <manyforge_core/ports/iexecution_backend.hpp>
 #include <manyforge_core/ports/iplanner_backend.hpp>
 #include <manyforge_core/ports/iplanning_context.hpp>
@@ -153,6 +154,35 @@ class ExecutionKernel {
   /// Called externally (e.g., by a scheduler) during Executing.
   Result<void> collision_check_tick();
 
+  /// Install (or replace) the collision policy snapshot used by the
+  /// CollisionValidationCoordinator path (Chunk 5 of the collision-ownership
+  /// plan). When set, pre-execute validation routes through the coordinator
+  /// instead of the legacy collision_check + pre_execute_check path. Passing
+  /// nullopt restores the legacy path.
+  ///
+  /// The kernel takes ownership of the snapshot via copy; per-pass support-
+  /// contact state lives in a coordinator instance constructed inside
+  /// validate_trajectory().
+  void set_collision_validation_policy_snapshot(
+      std::optional<CollisionPolicySnapshot> snapshot);
+
+  /// Optional pose-source / per-state retry configuration for the
+  /// CollisionValidationCoordinator. Has no effect until a policy snapshot is
+  /// installed via set_collision_validation_policy_snapshot.
+  void set_collision_validation_retry_config(
+      PoseSourceRetryConfig retry, std::int64_t per_state_timeout_ns = 0);
+
+  /// Run the validation coordinator predicted-path monitor (Chunk 6
+  /// diagnostic mode) against the current planning context. Returns the
+  /// decision bundle; emits a `kCollisionDetected` diagnostic event when
+  /// the decision is not kPass. The kernel does not stop or fault on this
+  /// path: production runtime-fault behavior remains gated on the future
+  /// interrupt model. Pass nullopt for `predicted_state` to use the kernel's
+  /// current state.
+  CollisionValidationDecisionBundle
+  run_predicted_path_monitor_diagnostic(
+      const std::optional<RobotStateDTO>& predicted_state = std::nullopt);
+
   /// Subscribe to kernel events.
   /// @param callback Called for each event. Must be thread-safe.
   /// @return Handle for unsubscribing.
@@ -211,6 +241,16 @@ class ExecutionKernel {
   ExecutionStateMachine sm_;
   StopPolicy stop_policy_;
   CollisionPolicy collision_policy_;
+
+  // Optional collision validation coordinator state (Chunk 5). When
+  // coordinator_policy_snapshot_ holds a value, validate_trajectory()
+  // routes through the coordinator path; otherwise it stays on the legacy
+  // collision_policy_.pre_execute_check() path so kernels constructed
+  // before the migration retain prior behavior.
+  mutable std::mutex coordinator_mutex_;
+  std::optional<CollisionPolicySnapshot> coordinator_policy_snapshot_;
+  PoseSourceRetryConfig coordinator_retry_config_{};
+  std::int64_t coordinator_per_state_timeout_ns_ = 0;
 
   // Serializes low-rate lifecycle authority transitions across execute,
   // streaming begin/end, stop, pause, resume, reset, and acknowledge. High-rate

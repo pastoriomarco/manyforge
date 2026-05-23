@@ -43,7 +43,8 @@ enum class ErrorCode {
     kInvalidStateTransition,
     kCacheMiss,
     kCollisionDetected,
-    kUnknownJointName
+    kUnknownJointName,
+    kSceneChangedDuringValidation
 };
 
 inline const char* to_string(ErrorCode code) {
@@ -76,6 +77,7 @@ inline const char* to_string(ErrorCode code) {
         case kCacheMiss: return "cache_miss";
         case kCollisionDetected: return "collision_detected";
         case kUnknownJointName: return "unknown_joint_name";
+        case kSceneChangedDuringValidation: return "scene_changed_during_validation";
         default: return "unknown";
     }
 }
@@ -242,6 +244,8 @@ inline const char* kErrorCartesianIncomplete = "cartesian_incomplete";
 inline const char* kErrorStartStateMismatch = "start_state_mismatch";
 inline const char* kErrorValidationCollision = "validation_collision";
 inline const char* kErrorValidationLimitsViolation = "validation_limits_violation";
+inline const char* kErrorSceneChangedDuringValidation =
+    "scene_changed_during_validation";
 
 // Scene editing
 inline const char* kErrorObjectAlreadyExists = "object_already_exists";

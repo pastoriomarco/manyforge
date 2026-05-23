@@ -130,6 +130,100 @@ TEST_F(TrajectoryCacheTest, OverwriteDoesNotEvict) {
 }
 
 // --- Empty trajectory ---
+// --- Chunk 2: revision-aware cache ---
+TEST_F(TrajectoryCacheTest, RevisionAware_StoreAndLookupSucceedsOnExactMatch) {
+  CollisionWorldRevision rev{7, "abc"};
+  cache.store("move_1", make_trajectory("t1"), rev);
+  auto result = cache.lookup_with_revision("move_1", rev);
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(result->joint_names[0], "t1");
+}
+
+TEST_F(TrajectoryCacheTest, RevisionAware_MismatchRevisionMissesAndEvicts) {
+  CollisionWorldRevision rev_old{7, "abc"};
+  CollisionWorldRevision rev_new{8, "def"};
+  cache.store("move_1", make_trajectory("t1"), rev_old);
+
+  auto miss = cache.lookup_with_revision("move_1", rev_new);
+  EXPECT_FALSE(miss.has_value());
+
+  // Subsequent lookup-by-key sees the entry was evicted.
+  EXPECT_FALSE(cache.lookup("move_1").has_value());
+  EXPECT_EQ(cache.size(), 0u);
+}
+
+TEST_F(TrajectoryCacheTest, RevisionAware_DifferentHashSameIdIsMiss) {
+  CollisionWorldRevision rev_a{7, "abc"};
+  CollisionWorldRevision rev_b{7, "xyz"};
+  cache.store("move_1", make_trajectory("t1"), rev_a);
+
+  EXPECT_FALSE(cache.lookup_with_revision("move_1", rev_b).has_value());
+  // Stale entry was evicted.
+  EXPECT_EQ(cache.size(), 0u);
+}
+
+TEST_F(TrajectoryCacheTest, RevisionAware_ExpectedUnsetMissesEvenWhenStoredUnset) {
+  // Revision-aware lookup fails closed when the caller cannot identify the
+  // authoritative collision-world revision. Legacy callers can still use
+  // lookup() explicitly.
+  cache.store("move_1", make_trajectory("t1"));
+  auto miss =
+      cache.lookup_with_revision("move_1", CollisionWorldRevision{});
+  EXPECT_FALSE(miss.has_value());
+  EXPECT_TRUE(cache.lookup("move_1").has_value());
+}
+
+TEST_F(TrajectoryCacheTest, RevisionAware_ExpectedUnsetButStoredTaggedMisses) {
+  CollisionWorldRevision rev{7, "abc"};
+  cache.store("move_1", make_trajectory("t1"), rev);
+
+  // Caller without an authoritative revision MUST NOT see the tagged hit.
+  EXPECT_FALSE(
+      cache.lookup_with_revision("move_1", CollisionWorldRevision{})
+          .has_value());
+
+  // Entry NOT evicted: it remains valid for a future caller that does
+  // supply the correct revision.
+  EXPECT_EQ(cache.size(), 1u);
+  auto subsequent = cache.lookup_with_revision("move_1", rev);
+  ASSERT_TRUE(subsequent.has_value());
+}
+
+TEST_F(TrajectoryCacheTest, RevisionAware_ExpectedTaggedButStoredUnsetEvicts) {
+  // Adapter promoted to publishing revisions after this entry was stored
+  // without a tag. The pre-promotion entry can no longer be trusted.
+  cache.store("move_1", make_trajectory("t1"));
+  CollisionWorldRevision rev{7, "abc"};
+  EXPECT_FALSE(cache.lookup_with_revision("move_1", rev).has_value());
+  EXPECT_EQ(cache.size(), 0u);
+}
+
+TEST_F(TrajectoryCacheTest, RevisionAware_RevisionOfReturnsTaggedValue) {
+  CollisionWorldRevision rev{7, "abc"};
+  cache.store("move_1", make_trajectory("t1"), rev);
+  auto stored = cache.revision_of("move_1");
+  ASSERT_TRUE(stored.has_value());
+  EXPECT_EQ(stored->revision_id, 7u);
+  EXPECT_EQ(stored->content_hash, "abc");
+}
+
+TEST_F(TrajectoryCacheTest, RevisionAware_RevisionOfReturnsNulloptForUntagged) {
+  cache.store("move_1", make_trajectory("t1"));
+  EXPECT_FALSE(cache.revision_of("move_1").has_value());
+}
+
+TEST_F(TrajectoryCacheTest, RevisionAware_OverwriteUpdatesRevision) {
+  CollisionWorldRevision rev_a{7, "abc"};
+  CollisionWorldRevision rev_b{8, "def"};
+  cache.store("move_1", make_trajectory("t1"), rev_a);
+  cache.store("move_1", make_trajectory("t1_updated"), rev_b);
+
+  // Old revision no longer matches.
+  EXPECT_FALSE(cache.lookup_with_revision("move_1", rev_a).has_value());
+  // After the failed lookup the entry was evicted.
+  EXPECT_EQ(cache.size(), 0u);
+}
+
 TEST_F(TrajectoryCacheTest, StoreEmptyTrajectory) {
   TrajectoryDTO empty;
   EXPECT_TRUE(empty.empty());

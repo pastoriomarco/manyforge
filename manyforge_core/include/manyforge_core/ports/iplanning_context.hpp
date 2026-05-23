@@ -2,6 +2,7 @@
 
 #include <string>
 
+#include <manyforge_core/types/collision.hpp>
 #include <manyforge_core/types/error_code.hpp>
 #include <manyforge_core/types/geometry.hpp>
 #include <manyforge_core/types/motion_spec.hpp>
@@ -127,6 +128,59 @@ class IPlanningContext {
     /// @param request The detach request with target frame
     /// @return SceneEditResultDTO indicating success/failure
     virtual SceneEditResultDTO detach_object(const DetachObjectRequestDTO& request) = 0;
+
+    /// Current authoritative collision-world revision (spec/210 §3.8.1,
+    /// COLLISION_CHECKING_OWNERSHIP_PLAN Chunk 2).
+    ///
+    /// Returns the revision a subsequent collision query / validation /
+    /// dispatch would be measured against. The kernel uses this to tag
+    /// cache entries at store time and to gate cache hits at lookup time
+    /// (a cached trajectory validated under revision N MUST NOT be served
+    /// at active revision N+1).
+    ///
+    /// Threading: implementations MUST be safe to call concurrently with
+    /// validate_trajectory / collision_check. Implementations that do not
+    /// yet own a revision publisher MAY return the default-constructed
+    /// CollisionWorldRevision (`revision_id == 0`, empty `content_hash`);
+    /// consumers MUST treat that as "no authoritative revision available
+    /// — do not cache".
+    virtual CollisionWorldRevision current_collision_world_revision() {
+        return CollisionWorldRevision{};
+    }
+
+    /// Normalized collision check (spec/210 §3.8.1, COLLISION_CHECKING_OWNERSHIP_PLAN
+    /// Chunk 1+). Returns a CollisionResult carrying normalized_pairs, the
+    /// active world revision, engine status, and (when a policy snapshot is
+    /// installed by the adapter) classified pairs + a CollisionDecision.
+    ///
+    /// Chunk 5 of the collision-ownership plan elevates this to the port so
+    /// the CollisionValidationCoordinator can call it across waypoints
+    /// without depending on a specific adapter type. Implementations that
+    /// have not yet migrated MUST provide the degraded default that wraps
+    /// the legacy collision_check() result; consumers must treat the absence
+    /// of normalized_pairs / classified_pairs as kDiagnosticIncomplete.
+    virtual CollisionResult collision_check_normalized(
+        const CollisionQuery& query) {
+        CollisionCheckRequestDTO legacy_req;
+        legacy_req.robot_state = query.robot_state;
+        auto legacy = collision_check(legacy_req);
+        CollisionResult result;
+        result.query_id = query.query_id;
+        result.surface = query.surface;
+        result.policy_revision = query.policy_revision;
+        result.state_time_ns = query.state_time_ns;
+        result.sampling_mode = query.sampling_mode;
+        result.in_collision = legacy.in_collision;
+        result.contact_body_a = legacy.contact_body_a;
+        result.contact_body_b = legacy.contact_body_b;
+        result.engine_status = CollisionEngineStatus::kDiagnosticIncomplete;
+        result.decision = legacy.in_collision
+                              ? CollisionDecisionResult::kInconclusiveFail
+                              : CollisionDecisionResult::kPass;
+        result.engine_id = "iplanning_context_legacy_fallback";
+        result.engine_version = "0.x";
+        return result;
+    }
 };
 
 }  // namespace manyforge::core

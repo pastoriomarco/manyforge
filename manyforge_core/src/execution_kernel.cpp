@@ -140,7 +140,34 @@ ErrorCode error_code_from_dto(const ErrorDTO& error) {
   if (error.code == kErrorInvalidRequest) {
     return ErrorCode::kInvalidRequest;
   }
+  if (error.code == kErrorInvariantViolation) {
+    return ErrorCode::kInvariantViolation;
+  }
   return ErrorCode::kInternalError;
+}
+
+bool collision_world_revision_is_set(const CollisionWorldRevision& revision) {
+  return revision.revision_id != 0 || !revision.content_hash.empty();
+}
+
+bool same_collision_world_revision(const CollisionWorldRevision& a,
+                                   const CollisionWorldRevision& b) {
+  return a.revision_id == b.revision_id &&
+         a.content_hash == b.content_hash;
+}
+
+ErrorDTO collision_world_changed_error(const CollisionWorldRevision& before,
+                                       const CollisionWorldRevision& after,
+                                       const std::string& phase) {
+  return ErrorDTO{
+      kErrorInvariantViolation,
+      "Collision world changed during trajectory validation",
+      {{"reason", "scene_changed_during_validation"},
+       {"phase", phase},
+       {"before_revision_id", std::to_string(before.revision_id)},
+       {"before_content_hash", before.content_hash},
+       {"after_revision_id", std::to_string(after.revision_id)},
+       {"after_content_hash", after.content_hash}}};
 }
 
 bool drain_execution_handle_bounded(ExecutionHandle& handle) {
@@ -794,7 +821,18 @@ void ExecutionKernel::async_execute_worker(
 
     emit_event({KernelEventType::kValidationStarted, exec_id, clock_.now(), {}, {}, std::nullopt, {}});
 
+    const auto validation_revision_before =
+        context_.current_collision_world_revision();
     auto val_result = validate_trajectory(trajectory, request);
+    const auto validation_revision_after =
+        context_.current_collision_world_revision();
+    if (val_result.ok() &&
+        !same_collision_world_revision(validation_revision_before,
+                                       validation_revision_after)) {
+      val_result = Result<void>::Err(collision_world_changed_error(
+          validation_revision_before, validation_revision_after,
+          "pre_execution_validation"));
+    }
     if (!val_result.ok()) {
       // Emit validation failed event BEFORE error raised
       emit_event({KernelEventType::kValidationFailed, exec_id, clock_.now(),
@@ -805,7 +843,7 @@ void ExecutionKernel::async_execute_worker(
         std::lock_guard<std::mutex> lock(metrics_mutex_);
         metrics_.validations_failed++;
       }
-      sm_.set_last_error(ErrorCode::kValidationCollision);
+      sm_.set_last_error(error_code_from_dto(val_result.error()));
       sm_.try_transition(ExecutionState::kFailed);
       auto snapshot = get_execution_snapshot();
       snapshot.timestamp_ns = clock_.now();
@@ -883,8 +921,12 @@ void ExecutionKernel::async_execute_worker(
     }
 
     // Store in cache
-    if (request.cache_mode != CacheMode::kDisable && !cache_hit) {
-      cache_.store(request.move_id, trajectory);
+    if (request.cache_mode != CacheMode::kDisable && !cache_hit &&
+        collision_world_revision_is_set(validation_revision_before)) {
+      // Chunk 2: tag every cache entry with the collision-world revision
+      // that validation actually used. The before/after equality check above
+      // ensures a trajectory validated at revision N is never stored as N+1.
+      cache_.store(request.move_id, trajectory, validation_revision_before);
     }
 
     // Validating -> Executing
@@ -1020,7 +1062,18 @@ void ExecutionKernel::async_execute_worker(
 
           auto resumed_trajectory =
               build_remaining_trajectory(active_trajectory, latest_backend_snapshot);
+          const auto resume_revision_before =
+              context_.current_collision_world_revision();
           auto resume_validation = validate_trajectory(resumed_trajectory, request);
+          const auto resume_revision_after =
+              context_.current_collision_world_revision();
+          if (resume_validation.ok() &&
+              !same_collision_world_revision(resume_revision_before,
+                                             resume_revision_after)) {
+            resume_validation = Result<void>::Err(collision_world_changed_error(
+                resume_revision_before, resume_revision_after,
+                "resume_validation"));
+          }
           if (!resume_validation.ok()) {
             emit_event({KernelEventType::kValidationFailed, exec_id, clock_.now(),
                         {}, {}, std::nullopt,
@@ -1335,7 +1388,17 @@ Result<uint64_t> ExecutionKernel::execute(const ExecuteRequestDTO& request) {
 
   PreparedExecutionStart prepared;
   if (request.cache_mode != CacheMode::kDisable) {
-    auto cached = cache_.lookup(request.move_id);
+    // Chunk 2: gate cache hits on the active collision-world revision.
+    // A cached trajectory validated under revision N MUST NOT be served
+    // when the scene is at revision N+1. lookup_with_revision removes the
+    // stale entry on mismatch so the next lookup is unambiguous.
+    // Adapters that do not yet implement current_collision_world_revision
+    // return the default-constructed revision; lookup_with_revision then
+    // declines to serve a hit at all, which is the documented sentinel
+    // for "no authoritative revision available".
+    const auto active_revision = context_.current_collision_world_revision();
+    auto cached =
+        cache_.lookup_with_revision(request.move_id, active_revision);
     if (cached.has_value()) {
       const auto goal_match =
           cached_trajectory_matches_request_goal(context_, *cached, resolved_request);
@@ -1978,12 +2041,26 @@ Result<void> ExecutionKernel::validate_trajectory(
     }
   }
 
-  // Full trajectory validation (including TCP speed limit per spec 230 §3.3)
+  std::optional<CollisionPolicySnapshot> snapshot;
+  PoseSourceRetryConfig retry;
+  std::int64_t per_state_timeout_ns = 0;
+  {
+    std::scoped_lock lock(coordinator_mutex_);
+    snapshot = coordinator_policy_snapshot_;
+    retry = coordinator_retry_config_;
+    per_state_timeout_ns = coordinator_per_state_timeout_ns_;
+  }
+
+  // Full non-collision trajectory validation (including TCP speed limit per
+  // spec 230 §3.3). When the normalized collision coordinator is installed it
+  // owns collision authority, so the backend validator must not run its legacy
+  // collision sweep first and reject contacts the active policy would allow.
   ValidationOptionsDTO opts;
   opts.tcp_frame = request.tcp_frame;
   opts.base_frame = request.base_frame;
   opts.max_tcp_linear_speed_mps =
       request.speed_profile.max_tcp_linear_speed_mps.value_or(0.0);
+  opts.run_collision_checks = !snapshot.has_value();
   auto val_result = context_.validate_trajectory(trajectory, opts);
   if (!val_result.valid) {
     if (val_result.error.has_value()) {
@@ -1992,11 +2069,144 @@ Result<void> ExecutionKernel::validate_trajectory(
     return Result<void>::Err(ErrorCode::kValidationCollision);
   }
 
-  // Pre-execution collision check
+  // Pre-execution collision check.
+  //
+  // Chunk 5 of the collision-ownership plan: when a CollisionPolicySnapshot
+  // is installed, route through the CollisionValidationCoordinator. The
+  // coordinator validates every waypoint (not just the start state), owns
+  // trajectory-scoped support-contact state, and produces a normalized
+  // CollisionDecision. Without an installed snapshot the kernel keeps the
+  // legacy single-state path for backward compatibility.
+  if (snapshot) {
+    CollisionValidationPassConfig cfg;
+    cfg.policy_snapshot = *snapshot;
+    cfg.pose_source_retry = retry;
+    cfg.per_state_timeout_ns = per_state_timeout_ns;
+    CollisionValidationCoordinator coord(std::move(cfg));
+    auto bundle = coord.validate_trajectory(context_, trajectory);
+    if (bundle.decision.accepted) {
+      return Result<void>::Ok();
+    }
+    if (bundle.scene_changed_during_validation) {
+      return Result<void>::Err(
+          ErrorDTO{kErrorSceneChangedDuringValidation,
+                   "Collision-world revision changed during validation",
+                   {{"borrowed_revision_id",
+                     std::to_string(bundle.borrowed_world_revision.revision_id)}}});
+    }
+    std::map<std::string, std::string> details;
+    if (bundle.decision.first_failing_waypoint) {
+      details["first_failing_waypoint"] =
+          std::to_string(*bundle.decision.first_failing_waypoint);
+    }
+    if (bundle.decision.first_failing_time_ns) {
+      details["first_failing_time_ns"] =
+          std::to_string(*bundle.decision.first_failing_time_ns);
+    }
+    if (bundle.decision.action ==
+        CollisionDecisionAction::kInconclusive) {
+      return Result<void>::Err(
+          ErrorDTO{kErrorValidationCollision,
+                   "Collision validation inconclusive",
+                   std::move(details)});
+    }
+    return Result<void>::Err(
+        ErrorDTO{kErrorValidationCollision,
+                 "Collision validation rejected trajectory",
+                 std::move(details)});
+  }
+
   CollisionCheckRequestDTO collision_req;
   collision_req.robot_state = current_state;
   auto collision_result = context_.collision_check(collision_req);
   return collision_policy_.pre_execute_check(collision_result);
+}
+
+void ExecutionKernel::set_collision_validation_policy_snapshot(
+    std::optional<CollisionPolicySnapshot> snapshot) {
+  std::scoped_lock lock(coordinator_mutex_);
+  coordinator_policy_snapshot_ = std::move(snapshot);
+}
+
+void ExecutionKernel::set_collision_validation_retry_config(
+    PoseSourceRetryConfig retry, std::int64_t per_state_timeout_ns) {
+  std::scoped_lock lock(coordinator_mutex_);
+  coordinator_retry_config_ = retry;
+  coordinator_per_state_timeout_ns_ = per_state_timeout_ns;
+}
+
+CollisionValidationDecisionBundle
+ExecutionKernel::run_predicted_path_monitor_diagnostic(
+    const std::optional<RobotStateDTO>& predicted_state) {
+  std::optional<CollisionPolicySnapshot> snapshot;
+  PoseSourceRetryConfig retry;
+  std::int64_t per_state_timeout_ns = 0;
+  {
+    std::scoped_lock lock(coordinator_mutex_);
+    snapshot = coordinator_policy_snapshot_;
+    retry = coordinator_retry_config_;
+    per_state_timeout_ns = coordinator_per_state_timeout_ns_;
+  }
+  CollisionValidationDecisionBundle bundle;
+  if (!snapshot) {
+    bundle.decision.accepted = true;
+    bundle.decision.action = CollisionDecisionAction::kDispatch;
+    return bundle;
+  }
+  CollisionValidationPassConfig cfg;
+  cfg.policy_snapshot = *snapshot;
+  cfg.pose_source_retry = retry;
+  cfg.per_state_timeout_ns = per_state_timeout_ns;
+  cfg.require_pose_source_borrow = false;
+  cfg.surface = CollisionSurface::kPredictedRuntimeMonitor;
+  CollisionValidationCoordinator coord(std::move(cfg));
+
+  try {
+    RobotStateDTO state = predicted_state.value_or(context_.get_current_state());
+    bundle = coord.validate_state(context_, state);
+  } catch (const std::exception& e) {
+    bundle.decision.accepted = false;
+    bundle.decision.severity = CollisionDecisionSeverity::kBlock;
+    bundle.decision.action = CollisionDecisionAction::kInconclusive;
+    KernelEvent ev;
+    ev.type = KernelEventType::kCollisionDetected;
+    ev.execution_id = sm_.status().execution_id;
+    ev.timestamp_ns = clock_.now();
+    ev.details["surface"] = "runtime_predicted_diagnostic";
+    ev.details["diagnostic_error"] = e.what();
+    emit_event(ev);
+    return bundle;
+  } catch (...) {
+    bundle.decision.accepted = false;
+    bundle.decision.severity = CollisionDecisionSeverity::kBlock;
+    bundle.decision.action = CollisionDecisionAction::kInconclusive;
+    KernelEvent ev;
+    ev.type = KernelEventType::kCollisionDetected;
+    ev.execution_id = sm_.status().execution_id;
+    ev.timestamp_ns = clock_.now();
+    ev.details["surface"] = "runtime_predicted_diagnostic";
+    ev.details["diagnostic_error"] = "unknown";
+    emit_event(ev);
+    return bundle;
+  }
+
+  if (!bundle.decision.accepted) {
+    KernelEvent ev;
+    ev.type = KernelEventType::kCollisionDetected;
+    ev.execution_id = sm_.status().execution_id;
+    ev.timestamp_ns = clock_.now();
+    ev.details["surface"] = "runtime_predicted_diagnostic";
+    if (bundle.decision.first_failing_waypoint) {
+      ev.details["first_failing_waypoint"] =
+          std::to_string(*bundle.decision.first_failing_waypoint);
+    }
+    if (bundle.borrowed_world_revision.revision_id != 0) {
+      ev.details["collision_world_revision_id"] =
+          std::to_string(bundle.borrowed_world_revision.revision_id);
+    }
+    emit_event(ev);
+  }
+  return bundle;
 }
 
 // -----------------------------------------------------------------

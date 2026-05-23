@@ -2,6 +2,7 @@
 
 #include <manyforge_roboplan/native_kernel_factory.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -172,6 +173,66 @@ TEST_F(NativeKernelTest, CollisionCheckAtHomeNotInCollision) {
   req.robot_state = state;
   auto result = bundle_->context->collision_check(req);
   EXPECT_FALSE(result.in_collision);
+}
+
+TEST_F(NativeKernelTest, NormalizedCollisionCheckAtHomePreservesWorldRevision) {
+  CollisionQuery query;
+  query.query_id = "normalized-home";
+  query.robot_state = bundle_->context->get_current_state();
+  query.collision_world_revision = CollisionWorldRevision{42, "world-rev-42"};
+
+  auto result = bundle_->context->collision_check_normalized(query);
+  EXPECT_FALSE(result.in_collision);
+  EXPECT_EQ(result.engine_status, CollisionEngineStatus::kOk);
+  EXPECT_EQ(result.decision, CollisionDecisionResult::kPass);
+  EXPECT_EQ(result.engine_id, "roboplan_scene");
+  EXPECT_EQ(result.engine_version, "unknown");
+  ASSERT_TRUE(result.collision_world_revision.has_value());
+  EXPECT_EQ(result.collision_world_revision->revision_id, 42u);
+  EXPECT_EQ(result.collision_world_revision->content_hash, "world-rev-42");
+}
+
+TEST_F(NativeKernelTest, NormalizedCollisionCheckMapsRobotObjectPair) {
+  bundle_->context->set_collision_mapping_robot_id("ur5_gripper");
+
+  AddObjectRequestDTO robot_blocker;
+  robot_blocker.object_id = "robot_blocker";
+  robot_blocker.frame_id = "universe";
+  robot_blocker.shape = BoxShapeDTO{{0.3, 0.3, 0.3}};
+  robot_blocker.pose.position_m = {0.0, 0.0, 0.05};
+  robot_blocker.pose.orientation = {0, 0, 0, 1};
+  auto blocker_result = bundle_->context->add_object(robot_blocker);
+  ASSERT_TRUE(blocker_result.success)
+      << (blocker_result.error.has_value() ? blocker_result.error->message : "");
+
+  CollisionQuery query;
+  query.query_id = "normalized-robot-blocker";
+  query.robot_state = bundle_->context->get_current_state();
+  auto result = bundle_->context->collision_check_normalized(query);
+
+  ASSERT_TRUE(result.in_collision);
+  ASSERT_TRUE(result.contact_body_a.has_value());
+  ASSERT_TRUE(result.contact_body_b.has_value());
+  EXPECT_EQ(result.engine_status, CollisionEngineStatus::kOk)
+      << "raw pair: " << *result.contact_body_a << " <-> "
+      << *result.contact_body_b;
+  EXPECT_EQ(result.decision, CollisionDecisionResult::kFail);
+  ASSERT_FALSE(result.normalized_pairs.empty());
+
+  const auto has_robot_object_pair =
+      std::any_of(result.normalized_pairs.begin(), result.normalized_pairs.end(),
+                  [](const CollisionPairId& pair) {
+                    const bool a_object =
+                        pair.body_a == "object/robot_blocker/shape/0";
+                    const bool b_object =
+                        pair.body_b == "object/robot_blocker/shape/0";
+                    const bool a_robot =
+                        pair.body_a.rfind("robot/ur5_gripper/link/", 0) == 0;
+                    const bool b_robot =
+                        pair.body_b.rfind("robot/ur5_gripper/link/", 0) == 0;
+                    return (a_object && b_robot) || (b_object && a_robot);
+                  });
+  EXPECT_TRUE(has_robot_object_pair);
 }
 
 TEST_F(NativeKernelTest, GetJointLimitsReturnsValidData) {
@@ -999,6 +1060,46 @@ TEST_F(NativeKernelTest, TrajectoryValidationWorks) {
   ValidationOptionsDTO opts;
   auto result = bundle_->context->validate_trajectory(traj, opts);
   EXPECT_TRUE(result.valid);
+}
+
+TEST_F(NativeKernelTest, TrajectoryValidationCanSkipLegacyCollisionSweep) {
+  auto state = bundle_->context->get_current_state();
+
+  AddObjectRequestDTO add;
+  add.object_id = "validation_overlap_box";
+  BoxShapeDTO box;
+  box.dimensions_m = {2.0, 2.0, 2.0};
+  add.shape = box;
+  add.frame_id = "base_link";
+  add.pose.position_m = {0.0, 0.0, 0.0};
+  add.pose.orientation = {0.0, 0.0, 0.0, 1.0};
+  auto edit = bundle_->context->add_object(add);
+  ASSERT_TRUE(edit.success) << (edit.error ? edit.error->message : "");
+
+  TrajectoryDTO traj;
+  traj.joint_names = state.joint_names;
+  TrajectoryWaypointDTO wp;
+  wp.time_from_start_s = 0.0;
+  wp.positions_rad = state.positions_rad;
+  traj.waypoints.push_back(wp);
+
+  ValidationOptionsDTO opts;
+  opts.run_collision_checks = false;
+  auto result = bundle_->context->validate_trajectory(traj, opts);
+  EXPECT_TRUE(result.valid);
+}
+
+TEST_F(NativeKernelTest,
+       NormalizedCollisionCheckUnsupportedRequiredCapabilityFailsClosed) {
+  auto state = bundle_->context->get_current_state();
+
+  CollisionQuery query;
+  query.robot_state = state;
+  query.required_capabilities = {"penetration_depth"};
+
+  auto result = bundle_->context->collision_check_normalized(query);
+  EXPECT_EQ(result.engine_status, CollisionEngineStatus::kDiagnosticIncomplete);
+  EXPECT_EQ(result.decision, CollisionDecisionResult::kInconclusiveFail);
 }
 
 TEST_F(NativeKernelTest, TrajectoryValidationReportsTcpSpeedBeforeCollisionSweep) {

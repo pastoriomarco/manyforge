@@ -13,6 +13,9 @@ add_library(manyforge_core
   src/stop_policy.cpp
   src/trajectory_cache.cpp
   src/collision_policy.cpp
+  src/collision_policy_evaluator.cpp
+  src/collision_validation_coordinator.cpp
+  src/parallel_collision_validation_worker_pool.cpp
   src/execution_kernel.cpp
 )
 target_include_directories(manyforge_core PUBLIC
@@ -67,6 +70,34 @@ if(BUILD_TESTING)
   add_executable(test_collision_policy test/test_collision_policy.cpp)
   target_link_libraries(test_collision_policy PRIVATE manyforge_core GTest::gtest_main)
   gtest_discover_tests(test_collision_policy
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_collision_policy_evaluator
+    test/test_collision_policy_evaluator.cpp)
+  target_link_libraries(test_collision_policy_evaluator PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_collision_policy_evaluator
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_collision_validation_coordinator
+    test/test_collision_validation_coordinator.cpp)
+  target_link_libraries(test_collision_validation_coordinator PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_collision_validation_coordinator
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_parallel_collision_validation_worker_pool
+    test/test_parallel_collision_validation_worker_pool.cpp)
+  target_link_libraries(test_parallel_collision_validation_worker_pool PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_parallel_collision_validation_worker_pool
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_collision_engine_mismatch_ledger
+    test/test_collision_engine_mismatch_ledger.cpp)
+  target_link_libraries(test_collision_engine_mismatch_ledger PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_collision_engine_mismatch_ledger
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_execution_kernel test/test_execution_kernel.cpp)

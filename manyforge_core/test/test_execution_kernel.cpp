@@ -108,23 +108,34 @@ class MockContext : public IPlanningContext {
   std::vector<Pose3DTO> fk_sequence;
   JointLimitsDTO next_limits;
   SceneEditResultDTO next_scene_edit;
+  CollisionWorldRevision current_revision{1, "mock-collision-world"};
 
   int get_state_count = 0;
   int validate_count = 0;
   int collision_count = 0;
   int fk_count = 0;
   FkRequestDTO last_fk_request;
+  ValidationOptionsDTO last_validation_options;
+  bool throw_get_state = false;
   bool throw_fk = false;
+  std::function<void()> on_validate;
 
   RobotStateDTO get_current_state() override {
     ++get_state_count;
+    if (throw_get_state) {
+      throw std::runtime_error("state unavailable");
+    }
     return current_state;
   }
 
   ValidationResultDTO validate_trajectory(
       const TrajectoryDTO& /*trajectory*/,
-      const ValidationOptionsDTO& /*options*/) override {
+      const ValidationOptionsDTO& options) override {
     ++validate_count;
+    last_validation_options = options;
+    if (on_validate) {
+      on_validate();
+    }
     return next_validation;
   }
 
@@ -198,6 +209,10 @@ class MockContext : public IPlanningContext {
   SceneEditResultDTO detach_object(
       const DetachObjectRequestDTO& /*request*/) override {
     return next_scene_edit;
+  }
+
+  CollisionWorldRevision current_collision_world_revision() override {
+    return current_revision;
   }
 };
 
@@ -643,6 +658,10 @@ class ExecutionKernelTest : public ::testing::Test {
     }
     return result;
   }
+
+  void store_cache(const std::string& move_id, TrajectoryDTO trajectory) {
+    cache.store(move_id, std::move(trajectory), context.current_revision);
+  }
 };
 
 // --- Happy path ---
@@ -766,6 +785,22 @@ TEST_F(ExecutionKernelTest, Execute_HappyPath_CachesTrajectory) {
   EXPECT_EQ(cached->waypoints.size(), 2u);
 }
 
+TEST_F(ExecutionKernelTest, Execute_SceneRevisionChangeDuringValidationFailsClosed) {
+  context.on_validate = [this]() {
+    context.current_revision = CollisionWorldRevision{2, "mutated-world"};
+  };
+
+  auto result = execute_sync(make_test_request("move_scene_changed"));
+
+  ASSERT_TRUE(result.ok());
+  EXPECT_EQ(kernel.get_status().state, ExecutionState::kFailed);
+  auto snapshot = kernel.get_execution_snapshot();
+  ASSERT_TRUE(snapshot.error.has_value());
+  EXPECT_EQ(snapshot.error->code, kErrorInvariantViolation);
+  EXPECT_EQ(snapshot.error->details.at("reason"), "scene_changed_during_validation");
+  EXPECT_FALSE(cache.lookup("move_scene_changed").has_value());
+}
+
 TEST_F(ExecutionKernelTest, Execute_IncrementingIds) {
   auto r1 = execute_sync(make_test_request());
   EXPECT_EQ(r1.value(), 1u);
@@ -777,7 +812,7 @@ TEST_F(ExecutionKernelTest, Execute_IncrementingIds) {
 // --- Cache hit path ---
 
 TEST_F(ExecutionKernelTest, Execute_CacheHit_SkipsPlanning) {
-  cache.store("move_cached", make_test_trajectory());
+  store_cache("move_cached", make_test_trajectory());
   execute_sync(make_test_request("move_cached"));
   EXPECT_EQ(planner.plan_count, 0);
   EXPECT_GE(context.validate_count, 1);
@@ -785,7 +820,7 @@ TEST_F(ExecutionKernelTest, Execute_CacheHit_SkipsPlanning) {
 }
 
 TEST_F(ExecutionKernelTest, Execute_CacheHitPoseGoalWithMatchingEndPose_SkipsPlanning) {
-  cache.store("move_pose_cached", make_test_trajectory());
+  store_cache("move_pose_cached", make_test_trajectory());
   auto req = make_test_request("move_pose_cached");
   PoseGoalDTO pose_goal;
   pose_goal.goal = make_pose(0.4, -0.1, 0.2);
@@ -804,7 +839,7 @@ TEST_F(ExecutionKernelTest, Execute_CacheHitPoseGoalWithMatchingEndPose_SkipsPla
 }
 
 TEST_F(ExecutionKernelTest, Execute_CacheHitPoseGoalWithChangedEndPose_InvalidatesAndReplans) {
-  cache.store("move_pose_changed", make_test_trajectory());
+  store_cache("move_pose_changed", make_test_trajectory());
   auto req = make_test_request("move_pose_changed");
   PoseGoalDTO pose_goal;
   pose_goal.goal = make_pose(0.45, -0.1, 0.2);
@@ -822,7 +857,7 @@ TEST_F(ExecutionKernelTest, Execute_CacheHitPoseGoalWithChangedEndPose_Invalidat
 }
 
 TEST_F(ExecutionKernelTest, Execute_CacheHitCartesianPathWithMatchingFinalWaypoint_SkipsPlanning) {
-  cache.store("move_cartesian_cached", make_test_trajectory());
+  store_cache("move_cartesian_cached", make_test_trajectory());
   auto req = make_test_request("move_cartesian_cached");
   CartesianPathDTO path;
   path.waypoints = {make_pose(0.2, -0.1, 0.1), make_pose(0.4, -0.1, 0.2)};
@@ -840,7 +875,7 @@ TEST_F(ExecutionKernelTest, Execute_CacheHitCartesianPathWithMatchingFinalWaypoi
 }
 
 TEST_F(ExecutionKernelTest, Execute_CacheHitCartesianPathWithChangedFinalWaypoint_InvalidatesAndReplans) {
-  cache.store("move_cartesian_changed", make_test_trajectory());
+  store_cache("move_cartesian_changed", make_test_trajectory());
   auto req = make_test_request("move_cartesian_changed");
   CartesianPathDTO path;
   path.waypoints = {make_pose(0.2, -0.1, 0.1), make_pose(0.45, -0.1, 0.2)};
@@ -858,7 +893,7 @@ TEST_F(ExecutionKernelTest, Execute_CacheHitCartesianPathWithChangedFinalWaypoin
 }
 
 TEST_F(ExecutionKernelTest, Execute_CacheHitRelativeMoveWithUnchangedResolvedGoal_SkipsPlanning) {
-  cache.store("move_relative_same", make_test_trajectory());
+  store_cache("move_relative_same", make_test_trajectory());
   auto req = make_test_request("move_relative_same");
   RelativeMoveDTO relative_move;
   relative_move.target_reference.type = ReferenceDTO::Type::kObject;
@@ -879,7 +914,7 @@ TEST_F(ExecutionKernelTest, Execute_CacheHitRelativeMoveWithUnchangedResolvedGoa
 }
 
 TEST_F(ExecutionKernelTest, Execute_CacheHitRelativeMoveWithMovedObject_InvalidatesAndReplans) {
-  cache.store("move_relative_changed", make_test_trajectory());
+  store_cache("move_relative_changed", make_test_trajectory());
   auto req = make_test_request("move_relative_changed");
   RelativeMoveDTO relative_move;
   relative_move.target_reference.type = ReferenceDTO::Type::kObject;
@@ -904,7 +939,7 @@ TEST_F(ExecutionKernelTest, Execute_CacheHitRelativeMoveWithMovedObject_Invalida
 }
 
 TEST_F(ExecutionKernelTest, Execute_RelativeMoveMissingReference_DoesNotUseStaleCache) {
-  cache.store("move_missing_reference", make_test_trajectory());
+  store_cache("move_missing_reference", make_test_trajectory());
   auto req = make_test_request("move_missing_reference");
   RelativeMoveDTO relative_move;
   relative_move.target_reference.type = ReferenceDTO::Type::kObject;
@@ -944,7 +979,7 @@ TEST_F(ExecutionKernelTest, Execute_RelativeMoveMissingReference_DoesNotUseStale
 }
 
 TEST_F(ExecutionKernelTest, Execute_CacheHitFkFailure_InvalidatesAndReplans) {
-  cache.store("move_fk_failure", make_test_trajectory());
+  store_cache("move_fk_failure", make_test_trajectory());
   auto req = make_test_request("move_fk_failure");
   PoseGoalDTO pose_goal;
   pose_goal.goal = make_pose(0.4, -0.1, 0.2);
@@ -964,7 +999,7 @@ TEST_F(ExecutionKernelTest, Execute_CacheHitJointGoalComparesByJointName) {
   cached.joint_names = {"j2", "j1"};
   cached.waypoints.front().positions_rad = {0.0, 0.0};
   cached.waypoints.back().positions_rad = {2.0, 1.0};
-  cache.store("move_joint_named", cached);
+  store_cache("move_joint_named", cached);
 
   auto req = make_test_request("move_joint_named");
   req.motion = JointGoalDTO{{"j1", "j2"}, {1.0, 2.0}};
@@ -979,7 +1014,7 @@ TEST_F(ExecutionKernelTest, Execute_CacheHitJointGoalComparesByJointName) {
 TEST_F(ExecutionKernelTest, Execute_CacheHitJointGoalNameMismatch_InvalidatesAndReplans) {
   auto cached = make_test_trajectory();
   cached.joint_names = {"j3", "j1"};
-  cache.store("move_joint_mismatch", cached);
+  store_cache("move_joint_mismatch", cached);
   context.current_state.joint_names = {"j3", "j1"};
 
   auto req = make_test_request("move_joint_mismatch");
@@ -993,7 +1028,7 @@ TEST_F(ExecutionKernelTest, Execute_CacheHitJointGoalNameMismatch_InvalidatesAnd
 }
 
 TEST_F(ExecutionKernelTest, Execute_CacheHitNamedTarget_InvalidatesAndReplans) {
-  cache.store("move_named_target", make_test_trajectory());
+  store_cache("move_named_target", make_test_trajectory());
   auto req = make_test_request("move_named_target");
   req.motion = NamedTargetDTO{"ready"};
 
@@ -1005,7 +1040,7 @@ TEST_F(ExecutionKernelTest, Execute_CacheHitNamedTarget_InvalidatesAndReplans) {
 }
 
 TEST_F(ExecutionKernelTest, Execute_CacheHitEmptyTrajectory_InvalidatesAndReplans) {
-  cache.store("move_empty_cached", TrajectoryDTO{});
+  store_cache("move_empty_cached", TrajectoryDTO{});
   auto req = make_test_request("move_empty_cached");
 
   auto result = execute_sync(req);
@@ -1016,7 +1051,7 @@ TEST_F(ExecutionKernelTest, Execute_CacheHitEmptyTrajectory_InvalidatesAndReplan
 }
 
 TEST_F(ExecutionKernelTest, Execute_CacheHitValidationFailure_BlocksExecution) {
-  cache.store("move_cached_invalid", make_test_trajectory());
+  store_cache("move_cached_invalid", make_test_trajectory());
   context.next_validation = ValidationResultDTO{
       false,
       ErrorDTO{
@@ -1038,7 +1073,7 @@ TEST_F(ExecutionKernelTest, Execute_CacheHitValidationFailure_BlocksExecution) {
 }
 
 TEST_F(ExecutionKernelTest, Execute_CacheDisabled_IgnoresCache) {
-  cache.store("move_no_cache", make_test_trajectory());
+  store_cache("move_no_cache", make_test_trajectory());
   auto req = make_test_request("move_no_cache");
   req.cache_mode = CacheMode::kDisable;
   execute_sync(req);
@@ -1091,7 +1126,7 @@ TEST_F(ExecutionKernelTest, Execute_CacheHitWithStaleStart_InvalidatesAndReplans
   auto stale_cached = make_test_trajectory();
   ASSERT_FALSE(stale_cached.waypoints.empty());
   stale_cached.waypoints.front().positions_rad = {0.5, 0.5};
-  cache.store("move_stale_start", stale_cached);
+  store_cache("move_stale_start", stale_cached);
 
   auto result = execute_sync(make_test_request("move_stale_start"));
 
@@ -1128,10 +1163,11 @@ TEST_F(ExecutionKernelTest, Execute_ValidationFails_TransitionsToFailed) {
   execute_sync(make_test_request());
   EXPECT_EQ(kernel.get_status().state, ExecutionState::kFailed);
   EXPECT_EQ(execution.execute_count, 0);
+  EXPECT_TRUE(context.last_validation_options.run_collision_checks);
 }
 
 TEST_F(ExecutionKernelTest, Execute_ValidationFails_InvalidatesCache) {
-  cache.store("move_val_fail", make_test_trajectory());
+  store_cache("move_val_fail", make_test_trajectory());
   context.next_validation = ValidationResultDTO{
       false, ErrorDTO{kErrorValidationCollision, "Collision", {}}};
 
@@ -1181,6 +1217,94 @@ TEST_F(ExecutionKernelTest, Execute_PreCollisionCheck_Blocks) {
   execute_sync(make_test_request());
   EXPECT_EQ(kernel.get_status().state, ExecutionState::kFailed);
   EXPECT_EQ(execution.execute_count, 0);
+  EXPECT_TRUE(context.last_validation_options.run_collision_checks);
+}
+
+// --- Pre-execution collision via the CollisionValidationCoordinator (Chunk 5)
+
+TEST_F(ExecutionKernelTest,
+       Execute_CoordinatorPath_BlocksOnLegacyAdapterInCollision) {
+  CollisionPolicySnapshot snapshot;
+  snapshot.policy_id = "free_space";
+  snapshot.revision.revision_id = 17;
+  snapshot.require_full_diagnostics = false;
+  kernel.set_collision_validation_policy_snapshot(snapshot);
+
+  // Legacy CollisionCheckResultDTO.in_collision=true → default
+  // collision_check_normalized maps it to engine_status=kDiagnosticIncomplete
+  // and decision=kInconclusiveFail. The coordinator must not downgrade this
+  // to dispatch, and the kernel must reject the request.
+  context.next_collision = CollisionCheckResultDTO{true, "link1", "box"};
+
+  execute_sync(make_test_request());
+  EXPECT_EQ(kernel.get_status().state, ExecutionState::kFailed);
+  EXPECT_EQ(execution.execute_count, 0);
+}
+
+TEST_F(ExecutionKernelTest,
+       Execute_CoordinatorPath_DispatchesWhenLegacyAdapterReportsClean) {
+  CollisionPolicySnapshot snapshot;
+  snapshot.policy_id = "free_space";
+  snapshot.revision.revision_id = 17;
+  snapshot.require_full_diagnostics = false;
+  kernel.set_collision_validation_policy_snapshot(snapshot);
+
+  context.next_collision = CollisionCheckResultDTO{false, "", ""};
+
+  auto result = execute_sync(make_test_request());
+  ASSERT_TRUE(result.ok());
+  EXPECT_EQ(execution.execute_count, 1);
+  EXPECT_FALSE(context.last_validation_options.run_collision_checks);
+}
+
+TEST_F(ExecutionKernelTest,
+       PredictedPathDiagnostic_EmitsEventWhenPolicyBlocks) {
+  CollisionPolicySnapshot snapshot;
+  snapshot.policy_id = "free_space";
+  snapshot.revision.revision_id = 17;
+  snapshot.require_full_diagnostics = false;
+  kernel.set_collision_validation_policy_snapshot(snapshot);
+
+  context.next_collision = CollisionCheckResultDTO{true, "link1", "box"};
+
+  std::atomic<int> events_seen{0};
+  auto sub = kernel.subscribe_events([&events_seen](const KernelEvent& e) {
+    if (e.type == KernelEventType::kCollisionDetected &&
+        e.details.count("surface") &&
+        e.details.at("surface") == "runtime_predicted_diagnostic") {
+      events_seen.fetch_add(1);
+    }
+  });
+
+  RobotStateDTO state;
+  auto bundle = kernel.run_predicted_path_monitor_diagnostic(state);
+  EXPECT_FALSE(bundle.decision.accepted);
+  EXPECT_EQ(events_seen.load(), 1);
+  kernel.unsubscribe_events(sub);
+}
+
+TEST_F(ExecutionKernelTest,
+       PredictedPathDiagnostic_CatchesContextExceptions) {
+  CollisionPolicySnapshot snapshot;
+  snapshot.policy_id = "free_space";
+  snapshot.revision.revision_id = 17;
+  snapshot.require_full_diagnostics = false;
+  kernel.set_collision_validation_policy_snapshot(snapshot);
+  context.throw_get_state = true;
+
+  std::atomic<int> events_seen{0};
+  auto sub = kernel.subscribe_events([&events_seen](const KernelEvent& e) {
+    if (e.type == KernelEventType::kCollisionDetected &&
+        e.details.count("diagnostic_error")) {
+      events_seen.fetch_add(1);
+    }
+  });
+
+  auto bundle = kernel.run_predicted_path_monitor_diagnostic(std::nullopt);
+  EXPECT_FALSE(bundle.decision.accepted);
+  EXPECT_EQ(bundle.decision.action, CollisionDecisionAction::kInconclusive);
+  EXPECT_EQ(events_seen.load(), 1);
+  kernel.unsubscribe_events(sub);
 }
 
 // --- Execute requires bound acknowledgement from terminal success ---
@@ -1700,7 +1824,7 @@ TEST_F(ExecutionKernelTest, Execute_ImmediatelyTransitionsToPlanningOnCacheMiss)
 }
 
 TEST_F(ExecutionKernelTest, Execute_ImmediatelyTransitionsToValidatingOnCacheHit) {
-  cache.store("cached_move", make_test_trajectory());
+  store_cache("cached_move", make_test_trajectory());
 
   auto result = kernel.execute(make_test_request("cached_move"));
   ASSERT_TRUE(result.ok());
@@ -1777,7 +1901,7 @@ TEST_F(ExecutionKernelTest, Events_HappyPath_PlanAndExecute) {
 }
 
 TEST_F(ExecutionKernelTest, Events_CacheHit) {
-  cache.store("cached_move", make_test_trajectory());
+  store_cache("cached_move", make_test_trajectory());
 
   std::vector<KernelEventType> events;
   kernel.subscribe_events([&](const KernelEvent& e) {
@@ -1929,7 +2053,7 @@ TEST_F(ExecutionKernelTest, Events_StateTransition_HappyPath) {
 }
 
 TEST_F(ExecutionKernelTest, Events_StateTransition_CacheHit) {
-  cache.store("cached_move", make_test_trajectory());
+  store_cache("cached_move", make_test_trajectory());
 
   std::vector<KernelEvent> events;
   kernel.subscribe_events([&](const KernelEvent& e) {
@@ -2166,7 +2290,7 @@ TEST_F(ExecutionKernelTest, Events_CacheMissEvent) {
 
 TEST_F(ExecutionKernelTest, Events_CacheHitDoesNotEmitMiss) {
   // Execute after cache store -> verify kCacheMiss NOT emitted
-  cache.store("cached_for_test", make_test_trajectory());
+  store_cache("cached_for_test", make_test_trajectory());
 
   std::vector<KernelEvent> events;
   kernel.subscribe_events([&](const KernelEvent& e) {
@@ -2183,7 +2307,7 @@ TEST_F(ExecutionKernelTest, Events_CacheHitDoesNotEmitMiss) {
 
 TEST_F(ExecutionKernelTest, Events_CacheInvalidatedEvent) {
   // Trigger validation failure -> verify kCacheInvalidated emitted
-  cache.store("invalidate_test", make_test_trajectory());
+  store_cache("invalidate_test", make_test_trajectory());
   context.next_validation = ValidationResultDTO{
       false, ErrorDTO{kErrorValidationCollision, "Collision", {}}};
 
@@ -2208,7 +2332,7 @@ TEST_F(ExecutionKernelTest, Events_CacheInvalidatedEvent) {
 }
 
 TEST_F(ExecutionKernelTest, Events_CacheInvalidatedEventIncludesCompatibilityReason) {
-  cache.store("goal_changed_event", make_test_trajectory());
+  store_cache("goal_changed_event", make_test_trajectory());
   auto req = make_test_request("goal_changed_event");
   PoseGoalDTO pose_goal;
   pose_goal.goal = make_pose(0.45, -0.1, 0.2);
@@ -2504,7 +2628,8 @@ TEST_F(ExecutionKernelTest, ExecutionTimeout_DoesNotAdvanceWhilePaused) {
 
   auto stop_result = timeout_kernel.stop();
   ASSERT_TRUE(stop_result.accepted);
-  timeout_kernel.wait_for_completion();
+  ASSERT_TRUE(timeout_kernel.wait_for_completion(2'000'000'000))
+      << "kernel did not complete after stopping from paused state";
   EXPECT_EQ(timeout_kernel.get_status().state, ExecutionState::kStopped);
 }
 

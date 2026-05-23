@@ -1,5 +1,8 @@
 #include <manyforge_roboplan/roboplan_planning_context.hpp>
 
+#include <manyforge_roboplan/collision_body_id_mapper.hpp>
+#include <manyforge_roboplan/direct_collision_query_engine.hpp>
+
 #include <Eigen/Dense>
 #include <algorithm>
 #include <chrono>
@@ -7,10 +10,16 @@
 #include <cstdlib>
 #include <deque>
 #include <filesystem>
+#include <iomanip>
 #include <iostream>
 #include <map>
+#include <optional>
+#include <set>
 #include <sstream>
 #include <thread>
+#include <type_traits>
+
+#include <manyforge_core/collision/collision_policy_evaluator.hpp>
 
 #include <roboplan/core/scene_utils.hpp>
 #include <stdexcept>
@@ -142,10 +151,562 @@ RoboPlanPlanningContext::RoboPlanPlanningContext(
     std::shared_ptr<std::mutex> scene_mutex)
     : scene_(std::move(scene)),
       group_name_(std::move(group_name)),
-      scene_mutex_(std::move(scene_mutex)) {
+      scene_mutex_(std::move(scene_mutex)),
+      mapper_(std::make_unique<RoboPlanCollisionBodyIdMapper>()) {
   if (!scene_mutex_) {
     scene_mutex_ = std::make_shared<std::mutex>();
   }
+  std::lock_guard<std::mutex> scene_lock(*scene_mutex_);
+  publish_collision_world_revision_locked(
+      core::CollisionWorldMutationSource::kProgramLoad,
+      {},
+      "roboplan_context.constructor");
+}
+
+RoboPlanPlanningContext::~RoboPlanPlanningContext() = default;
+
+namespace {
+
+void fnv1a_mix(std::uint64_t& h, const std::string& s) {
+  for (const unsigned char c : s) {
+    h ^= static_cast<std::uint64_t>(c);
+    h *= 1099511628211ULL;
+  }
+  h ^= 0xffU;
+  h *= 1099511628211ULL;
+}
+
+std::string stable_double(double value) {
+  std::ostringstream oss;
+  oss << std::setprecision(17) << value;
+  return oss.str();
+}
+
+void append_pose_entries(std::vector<std::string>& entries,
+                         const std::string& prefix,
+                         const core::Pose3DTO& pose) {
+  entries.push_back(prefix + ".px=" + stable_double(pose.position_m.x_m));
+  entries.push_back(prefix + ".py=" + stable_double(pose.position_m.y_m));
+  entries.push_back(prefix + ".pz=" + stable_double(pose.position_m.z_m));
+  entries.push_back(prefix + ".qx=" + stable_double(pose.orientation.x));
+  entries.push_back(prefix + ".qy=" + stable_double(pose.orientation.y));
+  entries.push_back(prefix + ".qz=" + stable_double(pose.orientation.z));
+  entries.push_back(prefix + ".qw=" + stable_double(pose.orientation.w));
+}
+
+void append_shape_entries(std::vector<std::string>& entries,
+                          const std::string& prefix,
+                          const core::CollisionShapeDTO& shape) {
+  std::visit(
+      [&](const auto& concrete) {
+        using ShapeT = std::decay_t<decltype(concrete)>;
+        if constexpr (std::is_same_v<ShapeT, core::BoxShapeDTO>) {
+          entries.push_back(prefix + ".shape=box");
+          entries.push_back(prefix + ".x=" +
+                            stable_double(concrete.dimensions_m.x_m));
+          entries.push_back(prefix + ".y=" +
+                            stable_double(concrete.dimensions_m.y_m));
+          entries.push_back(prefix + ".z=" +
+                            stable_double(concrete.dimensions_m.z_m));
+        } else if constexpr (std::is_same_v<ShapeT, core::SphereShapeDTO>) {
+          entries.push_back(prefix + ".shape=sphere");
+          entries.push_back(prefix + ".r=" + stable_double(concrete.radius_m));
+        } else if constexpr (std::is_same_v<ShapeT, core::CylinderShapeDTO>) {
+          entries.push_back(prefix + ".shape=cylinder");
+          entries.push_back(prefix + ".r=" + stable_double(concrete.radius_m));
+          entries.push_back(prefix + ".h=" + stable_double(concrete.height_m));
+        } else if constexpr (std::is_same_v<ShapeT, core::MeshShapeDTO>) {
+          entries.push_back(prefix + ".shape=mesh");
+          entries.push_back(prefix + ".uri=" + concrete.resource_uri);
+          entries.push_back(prefix + ".sx=" + stable_double(concrete.scale.x_m));
+          entries.push_back(prefix + ".sy=" + stable_double(concrete.scale.y_m));
+          entries.push_back(prefix + ".sz=" + stable_double(concrete.scale.z_m));
+        }
+      },
+      shape);
+}
+
+/// Deterministic fingerprint over the body inventory that affects body-id
+/// assignment. Two scenes with identical (object_id, attached) sets in any
+/// order produce identical fingerprints. Includes raw robot collision-body
+/// mappings, so a robot model/deployment change triggers a rebuild. The
+/// fingerprint changes whenever a rebuild is needed (object
+/// added/removed/attached/detached, robot mapping changed); it does NOT change
+/// for pose-only updates that leave the body inventory intact.
+std::string compute_body_identity_fingerprint(
+    const std::string& robot_id,
+    const std::vector<RoboPlanPlanningContext::SceneObjectSnapshot>& objects,
+    const std::vector<std::pair<std::string, core::CollisionBodyId>>&
+        robot_body_mappings) {
+  std::vector<std::string> entries;
+  entries.reserve(objects.size() + robot_body_mappings.size());
+  for (const auto& obj : objects) {
+    entries.push_back("object:" + obj.object_id + ":" +
+                      (obj.attached ? "A" : "D"));
+  }
+  for (const auto& [raw_name, body_id] : robot_body_mappings) {
+    entries.push_back("robot:" + raw_name + ":" + body_id);
+  }
+  std::sort(entries.begin(), entries.end());
+
+  std::uint64_t h = 1469598103934665603ULL;
+  fnv1a_mix(h, robot_id);
+  for (const auto& e : entries) {
+    fnv1a_mix(h, e);
+  }
+
+  std::ostringstream oss;
+  oss << std::hex << h;
+  return oss.str();
+}
+
+core::CollisionDecisionResult merge_policy_collision_decision(
+    core::CollisionDecisionResult engine_decision,
+    core::CollisionDecisionResult policy_decision) {
+  // Complete policy classification may allow raw engine collisions
+  // (static-static, touch links, support contacts). Incomplete diagnostics are
+  // not a policy classification, so they remain fail-closed and cannot be
+  // downgraded by an empty/dispatch policy result.
+  if (engine_decision == core::CollisionDecisionResult::kInconclusiveFail ||
+      engine_decision == core::CollisionDecisionResult::kStopRequested) {
+    return engine_decision;
+  }
+  return policy_decision;
+}
+
+std::string collision_engine_status_text(core::CollisionEngineStatus status) {
+  switch (status) {
+    case core::CollisionEngineStatus::kOk:
+      return "ok";
+    case core::CollisionEngineStatus::kTimeout:
+      return "timeout";
+    case core::CollisionEngineStatus::kUnsupportedGeometry:
+      return "unsupported_geometry";
+    case core::CollisionEngineStatus::kDiagnosticIncomplete:
+      return "diagnostic_incomplete";
+    case core::CollisionEngineStatus::kEngineError:
+      return "engine_error";
+  }
+  return "unknown";
+}
+
+std::string collision_decision_text(core::CollisionDecisionResult decision) {
+  switch (decision) {
+    case core::CollisionDecisionResult::kPass:
+      return "pass";
+    case core::CollisionDecisionResult::kFail:
+      return "fail";
+    case core::CollisionDecisionResult::kWarn:
+      return "warn";
+    case core::CollisionDecisionResult::kStopRequested:
+      return "stop_requested";
+    case core::CollisionDecisionResult::kInconclusiveFail:
+      return "inconclusive_fail";
+  }
+  return "unknown";
+}
+
+bool collision_pairs_equal(const std::vector<core::CollisionPairId>& lhs,
+                           const std::vector<core::CollisionPairId>& rhs) {
+  return lhs == rhs;
+}
+
+bool roboplan_normalized_supports_required_capability(
+    const std::string& capability) {
+  return capability == "binary_collision" || capability == "body_pair_only";
+}
+
+}  // namespace
+
+void RoboPlanPlanningContext::set_collision_mapping_robot_id(
+    const std::string& robot_id) {
+  bool changed = false;
+  {
+    std::scoped_lock lock(mapper_mutex_);
+    if (robot_id != mapper_robot_id_) {
+      mapper_robot_id_ = robot_id;
+      // Force a rebuild on next collision_check_normalized call.
+      mapper_scene_fingerprint_.clear();
+      changed = true;
+    }
+  }
+  if (changed) {
+    std::lock_guard<std::mutex> scene_lock(*scene_mutex_);
+    publish_collision_world_revision_locked(
+        core::CollisionWorldMutationSource::kDeploymentLoad,
+        {},
+        "roboplan_context.set_collision_mapping_robot_id");
+  }
+}
+
+void RoboPlanPlanningContext::set_collision_policy_snapshot(
+    core::CollisionPolicySnapshot snapshot) {
+  std::scoped_lock lock(evaluator_mutex_);
+  policy_snapshot_ = std::move(snapshot);
+}
+
+void RoboPlanPlanningContext::reset_collision_policy_state() {
+  // Chunks 3-4 create a query-local evaluator for every normalized check.
+  // There is no planning-context-global policy state to reset. The method
+  // remains as a stable API for Chunk 5, where the validation coordinator owns
+  // trajectory-scoped evaluator state.
+}
+
+void RoboPlanPlanningContext::set_direct_engine_for_compare(
+    std::shared_ptr<DirectCollisionQueryEngine> engine) {
+  std::scoped_lock lock(direct_engine_mutex_);
+  direct_engine_ = std::move(engine);
+}
+
+void RoboPlanPlanningContext::set_engine_mismatch_emitter(
+    MismatchEmitter emitter) {
+  std::scoped_lock lock(direct_engine_mutex_);
+  mismatch_emitter_ = std::move(emitter);
+}
+
+void RoboPlanPlanningContext::set_engine_mismatch_record_emitter(
+    MismatchRecordEmitter emitter) {
+  std::scoped_lock lock(direct_engine_mutex_);
+  mismatch_record_emitter_ = std::move(emitter);
+}
+
+core::CollisionWorldRevision
+RoboPlanPlanningContext::current_collision_world_revision() {
+  // Chunk 2: returns the authoritative revision tracked by the in-context
+  // publisher. The mapper's local revision is derived from this on the
+  // collision_check_normalized path; this method is the single source of
+  // truth for the world revision exposed via the IPlanningContext port.
+  std::lock_guard<std::mutex> scene_lock(*scene_mutex_);
+  return core::CollisionWorldRevision{world_revision_id_, world_content_hash_};
+}
+
+std::vector<core::CollisionWorldLedgerEntry>
+RoboPlanPlanningContext::recent_collision_world_ledger(std::size_t limit) const {
+  std::lock_guard<std::mutex> scene_lock(*scene_mutex_);
+  std::vector<core::CollisionWorldLedgerEntry> out;
+  if (world_ledger_.empty()) {
+    return out;
+  }
+  const std::size_t take =
+      (limit == 0 || limit >= world_ledger_.size()) ? world_ledger_.size() : limit;
+  out.reserve(take);
+  // Newest-first: walk from the back of the deque.
+  auto it = world_ledger_.crbegin();
+  for (std::size_t i = 0; i < take && it != world_ledger_.crend(); ++i, ++it) {
+    out.push_back(*it);
+  }
+  return out;
+}
+
+void RoboPlanPlanningContext::publish_collision_world_revision_locked(
+    core::CollisionWorldMutationSource mutation_source,
+    const std::vector<std::string>& affected_body_ids,
+    std::string authority_source,
+    std::optional<std::string> session_id) {
+  // Caller MUST hold scene_mutex_. Build the new revision id + content hash
+  // and append a ledger entry. content_hash is a pure digest of the collision
+  // world content; revision_id and the ledger fields provide sequence
+  // identity for repeated mutations that leave content unchanged.
+  const std::uint64_t previous_revision_id = world_revision_id_;
+  world_revision_id_ += 1;
+
+  std::string robot_id;
+  {
+    std::scoped_lock map_lock(mapper_mutex_);
+    robot_id = mapper_robot_id_;
+  }
+  world_content_hash_ = compute_collision_world_content_hash_locked(robot_id);
+
+  core::CollisionWorldLedgerEntry entry;
+  entry.revision.revision_id = world_revision_id_;
+  entry.revision.content_hash = world_content_hash_;
+  entry.previous_revision_id = previous_revision_id;
+  entry.mutation_source = mutation_source;
+  entry.affected_body_ids = affected_body_ids;
+  entry.timestamp_ns =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count();
+  entry.authority_source = std::move(authority_source);
+  entry.session_id = std::move(session_id);
+
+  world_ledger_.push_back(std::move(entry));
+  while (world_ledger_.size() > kCollisionWorldLedgerCapacity) {
+    world_ledger_.pop_front();
+  }
+}
+
+core::CollisionResult RoboPlanPlanningContext::collision_check_normalized(
+    const core::CollisionQuery& query) {
+  const auto t_start = std::chrono::steady_clock::now();
+  std::string robot_id;
+  {
+    std::scoped_lock lock(mapper_mutex_);
+    robot_id = mapper_robot_id_;
+  }
+
+  for (const auto& capability : query.required_capabilities) {
+    if (!roboplan_normalized_supports_required_capability(capability)) {
+      core::CollisionResult result;
+      result.query_id = query.query_id;
+      result.policy_revision = query.policy_revision;
+      result.surface = query.surface;
+      result.state_time_ns = query.state_time_ns;
+      result.sampling_mode = query.sampling_mode;
+      result.engine_id = "roboplan_scene";
+      result.engine_version = "unknown";
+      if (query.collision_world_revision.revision_id != 0 ||
+          !query.collision_world_revision.content_hash.empty()) {
+        result.collision_world_revision = query.collision_world_revision;
+      } else {
+        result.collision_world_revision = current_collision_world_revision();
+      }
+      result.engine_status = core::CollisionEngineStatus::kDiagnosticIncomplete;
+      result.decision = core::CollisionDecisionResult::kInconclusiveFail;
+      result.query_duration_ns =
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() - t_start)
+              .count();
+      return result;
+    }
+  }
+
+  std::vector<SceneObjectSnapshot> scene_objects;
+  std::vector<std::pair<std::string, core::CollisionBodyId>> robot_mappings;
+  core::CollisionCheckResultDTO legacy_result;
+  CollisionDiagnostics diagnostics;
+  core::CollisionWorldRevision checked_revision;
+
+  {
+    // Snapshot the body inventory and run the legacy collision query while
+    // holding the same scene lock. This keeps the normalized diagnostic mapping
+    // consistent with the scene that was actually checked. We do not hold the
+    // mapper mutex while touching RoboPlan/Pinocchio state.
+    std::lock_guard<std::mutex> scene_lock(*scene_mutex_);
+    scene_objects = scene_objects_locked();
+    robot_mappings = robot_body_mappings_locked(robot_id);
+    checked_revision =
+        core::CollisionWorldRevision{world_revision_id_, world_content_hash_};
+
+    Eigen::VectorXd q = vector_from_std(query.robot_state.positions_rad);
+    if (q.size() != scene_->getCurrentJointPositions().size()) {
+      q = scene_->toFullJointPositions(group_name_, q);
+    }
+    legacy_result.in_collision = scene_->hasCollisions(q);
+    if (legacy_result.in_collision) {
+      diagnostics = collect_collision_diagnostics_locked(q);
+      if (!diagnostics.pairs.empty()) {
+        legacy_result.contact_body_a = diagnostics.pairs.front().canonical_pair.first;
+        legacy_result.contact_body_b = diagnostics.pairs.front().canonical_pair.second;
+      }
+    }
+  }
+  const auto t_end = std::chrono::steady_clock::now();
+
+  RoboPlanCollisionBodyIdMapper result_mapper;
+  result_mapper.rebuild(robot_id, scene_objects, robot_mappings);
+  {
+    std::scoped_lock lock(mapper_mutex_);
+    std::string fingerprint = compute_body_identity_fingerprint(
+        robot_id, scene_objects, robot_mappings);
+    if (fingerprint != mapper_scene_fingerprint_) {
+      mapper_->rebuild(robot_id, scene_objects, robot_mappings);
+      mapper_scene_fingerprint_ = std::move(fingerprint);
+    }
+  }
+
+  // Build the normalized CollisionResult next to the legacy result.
+  core::CollisionResult result;
+  result.in_collision = legacy_result.in_collision;
+  result.contact_body_a = legacy_result.contact_body_a;
+  result.contact_body_b = legacy_result.contact_body_b;
+  result.query_id = query.query_id;
+  result.policy_revision = query.policy_revision;
+  result.surface = query.surface;
+  result.state_time_ns = query.state_time_ns;
+  result.sampling_mode = query.sampling_mode;
+  result.engine_id = "roboplan_scene";
+  result.engine_version = "unknown";
+  result.query_duration_ns =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(t_end - t_start)
+          .count();
+  if (query.collision_world_revision.revision_id != 0 ||
+      !query.collision_world_revision.content_hash.empty()) {
+    // Caller supplied an authoritative revision (e.g. Chunk 5's validation
+    // coordinator). Echo it back so failure archives can correlate.
+    result.collision_world_revision = query.collision_world_revision;
+  } else {
+    // Chunk 2: capture the in-context publisher revision inside the same
+    // scene critical section that executed hasCollisions(). Do not re-read
+    // it here; a concurrent mutation after the check would otherwise tag
+    // this result with a revision it did not actually validate.
+    if (checked_revision.revision_id != 0 ||
+        !checked_revision.content_hash.empty()) {
+      result.collision_world_revision = checked_revision;
+    }
+  }
+  // Chunk 1: distance queries are not supported; min_clearance fields remain
+  // null (per spec/210 §3.8.1).
+
+  bool any_unknown = legacy_result.in_collision && diagnostics.pairs.empty();
+  {
+    for (const auto& raw_pair : diagnostics.pairs) {
+      auto a = result_mapper.lookup(raw_pair.canonical_pair.first);
+      auto b = result_mapper.lookup(raw_pair.canonical_pair.second);
+      if (a && b) {
+        core::CollisionPairId pair{*a, *b};
+        if (pair.body_b < pair.body_a) {
+          std::swap(pair.body_a, pair.body_b);
+        }
+        result.normalized_pairs.push_back(pair);
+      } else {
+        any_unknown = true;
+      }
+    }
+  }
+
+  std::sort(result.normalized_pairs.begin(), result.normalized_pairs.end(),
+            [](const auto& lhs, const auto& rhs) {
+              if (lhs.body_a != rhs.body_a) {
+                return lhs.body_a < rhs.body_a;
+              }
+              return lhs.body_b < rhs.body_b;
+            });
+  result.normalized_pairs.erase(
+      std::unique(result.normalized_pairs.begin(), result.normalized_pairs.end(),
+                  [](const auto& lhs, const auto& rhs) {
+                    return lhs.body_a == rhs.body_a && lhs.body_b == rhs.body_b;
+                  }),
+      result.normalized_pairs.end());
+
+  result.engine_status = any_unknown
+                             ? core::CollisionEngineStatus::kDiagnosticIncomplete
+                             : core::CollisionEngineStatus::kOk;
+  result.decision = legacy_result.in_collision
+                        ? (any_unknown ? core::CollisionDecisionResult::kInconclusiveFail
+                                       : core::CollisionDecisionResult::kFail)
+                        : core::CollisionDecisionResult::kPass;
+
+  // Chunk 3: if a policy snapshot is installed, classify the normalized pairs
+  // through a query-local evaluator. This integration is deliberately stateless
+  // at planning-context scope; cross-waypoint support-contact state belongs to
+  // Chunk 5's validation coordinator.
+  std::optional<core::CollisionPolicySnapshot> policy_snapshot;
+  {
+    std::scoped_lock lock(evaluator_mutex_);
+    policy_snapshot = policy_snapshot_;
+  }
+  if (policy_snapshot) {
+    core::CollisionPolicyEvaluator evaluator(*policy_snapshot);
+    const auto active_world_revision =
+        result.collision_world_revision.value_or(core::CollisionWorldRevision{});
+    const bool diagnostics_complete = !any_unknown;
+    auto evaluated = evaluator.classify(result.normalized_pairs,
+                                        active_world_revision,
+                                        diagnostics_complete);
+    result.normalized_pairs_classified = std::move(evaluated.pairs);
+    result.policy_revision_used =
+        std::to_string(evaluator.snapshot().revision.revision_id);
+
+    // Mirror the evaluator outcome into CollisionResult::decision. Complete
+    // policy classification may allow raw engine collisions; diagnostic-
+    // incomplete from the mapper remains inconclusive even when the policy
+    // evaluator sees no classified pairs.
+    switch (evaluated.decision.action) {
+      case core::CollisionDecisionAction::kReject:
+        result.decision = merge_policy_collision_decision(
+            result.decision, core::CollisionDecisionResult::kFail);
+        break;
+      case core::CollisionDecisionAction::kInconclusive:
+        result.decision = merge_policy_collision_decision(
+            result.decision, core::CollisionDecisionResult::kInconclusiveFail);
+        break;
+      case core::CollisionDecisionAction::kWarnOnly:
+        result.decision = merge_policy_collision_decision(
+            result.decision, core::CollisionDecisionResult::kWarn);
+        break;
+      case core::CollisionDecisionAction::kDispatch:
+        result.decision = merge_policy_collision_decision(
+            result.decision, core::CollisionDecisionResult::kPass);
+        break;
+    }
+  }
+
+  // Chunk 4: diagnostic compare mode. If a direct engine is installed,
+  // run it on the same query and record any mismatch with the legacy
+  // path. The direct engine is never authoritative — its result is
+  // observed only.
+  std::shared_ptr<DirectCollisionQueryEngine> direct_engine;
+  MismatchEmitter mismatch_emitter;
+  MismatchRecordEmitter mismatch_record_emitter;
+  {
+    std::scoped_lock lock(direct_engine_mutex_);
+    direct_engine = direct_engine_;
+    mismatch_emitter = mismatch_emitter_;
+    mismatch_record_emitter = mismatch_record_emitter_;
+  }
+  if (direct_engine) {
+    auto direct_result = direct_engine->check(query);
+    const bool mismatch =
+        direct_result.in_collision != result.in_collision ||
+        direct_result.engine_status != result.engine_status ||
+        direct_result.decision != result.decision ||
+        !collision_pairs_equal(direct_result.normalized_pairs,
+                               result.normalized_pairs);
+    if (mismatch) {
+      std::map<std::string, std::string> details;
+      details["legacy_engine_id"] = result.engine_id;
+      details["legacy_in_collision"] = result.in_collision ? "true" : "false";
+      details["legacy_engine_status"] =
+          collision_engine_status_text(result.engine_status);
+      details["legacy_decision"] = collision_decision_text(result.decision);
+      details["legacy_normalized_pair_count"] =
+          std::to_string(result.normalized_pairs.size());
+      details["direct_engine_id"] = direct_result.engine_id;
+      details["direct_in_collision"] =
+          direct_result.in_collision ? "true" : "false";
+      details["direct_engine_status"] =
+          collision_engine_status_text(direct_result.engine_status);
+      details["direct_decision"] = collision_decision_text(direct_result.decision);
+      details["direct_normalized_pair_count"] =
+          std::to_string(direct_result.normalized_pairs.size());
+      if (result.collision_world_revision) {
+        details["collision_world_revision_id"] =
+            std::to_string(result.collision_world_revision->revision_id);
+      }
+      details["query_id"] = query.query_id;
+      if (mismatch_emitter) {
+        mismatch_emitter(details);
+      }
+      if (mismatch_record_emitter) {
+        core::CollisionEngineMismatchRecord record;
+        record.mismatch_id = result.engine_id + "_vs_" +
+                              direct_result.engine_id + "@" + query.query_id;
+        record.emitted_at_ns = steady_now_ns();
+        record.authoritative_engine_id = result.engine_id;
+        record.authoritative_engine_version = result.engine_version;
+        record.secondary_engine_id = direct_result.engine_id;
+        record.secondary_engine_version = direct_result.engine_version;
+        record.collision_world_revision = result.collision_world_revision;
+        record.policy_revision = result.policy_revision_used;
+        record.authoritative_normalized_pairs = result.normalized_pairs;
+        record.secondary_normalized_pairs = direct_result.normalized_pairs;
+        if (!query.query_id.empty()) {
+          record.query_id = query.query_id;
+        }
+        record.state_time_ns = query.state_time_ns;
+        record.waypoint_index = query.waypoint_index;
+        record.raw_diagnostics = std::move(details);
+        // Default disposition is kTolerated (shadow_compare mode). Production
+        // wiring overrides via a wrapping emitter; see CompareMode enum.
+        record.disposition =
+            core::CollisionEngineMismatchDisposition::kTolerated;
+        mismatch_record_emitter(std::move(record));
+      }
+    }
+  }
+
+  return result;
 }
 
 void RoboPlanPlanningContext::set_robot_base_pose(const core::Pose3DTO& pose) {
@@ -279,6 +840,11 @@ core::ValidationResultDTO RoboPlanPlanningContext::validate_trajectory(
             "TCP linear speed exceeds limit", details};
         return result;
       }
+    }
+
+    if (!options.run_collision_checks) {
+      result.valid = true;
+      return result;
     }
 
     // Collision check at each waypoint.
@@ -730,6 +1296,11 @@ std::vector<std::string> RoboPlanPlanningContext::get_joint_names() {
 std::vector<RoboPlanPlanningContext::SceneObjectSnapshot>
 RoboPlanPlanningContext::get_scene_objects() {
   std::lock_guard<std::mutex> scene_lock(*scene_mutex_);
+  return scene_objects_locked();
+}
+
+std::vector<RoboPlanPlanningContext::SceneObjectSnapshot>
+RoboPlanPlanningContext::scene_objects_locked() {
   std::vector<SceneObjectSnapshot> objects;
   objects.reserve(object_states_.size());
   for (const auto& [object_id, tracked] : object_states_) {
@@ -743,6 +1314,151 @@ RoboPlanPlanningContext::get_scene_objects() {
     });
   }
   return objects;
+}
+
+std::vector<std::pair<std::string, core::CollisionBodyId>>
+RoboPlanPlanningContext::robot_body_mappings_locked(
+    const std::string& robot_id) {
+  std::vector<std::pair<std::string, core::CollisionBodyId>> mappings;
+  if (!scene_) {
+    return mappings;
+  }
+
+  const auto& model = scene_->getModel();
+  const auto& collision_model = scene_->getCollisionModel();
+  std::map<std::string, int> next_collision_index_by_link;
+  std::set<std::string> emitted_raw_names;
+  std::set<std::string> scene_object_ids;
+  for (const auto& [object_id, tracked] : object_states_) {
+    static_cast<void>(tracked);
+    scene_object_ids.insert(object_id);
+  }
+
+  for (const auto& geometry_object : collision_model.geometryObjects) {
+    if (scene_object_ids.find(geometry_object.name) != scene_object_ids.end()) {
+      continue;
+    }
+    if (geometry_object.parentFrame >= model.frames.size()) {
+      continue;
+    }
+    const std::string link_name = model.frames[geometry_object.parentFrame].name;
+    if (link_name.empty() || is_world_frame(link_name) ||
+        scene_object_ids.find(link_name) != scene_object_ids.end()) {
+      continue;
+    }
+
+    const int collision_index = next_collision_index_by_link[link_name]++;
+    const auto body_id = RoboPlanCollisionBodyIdMapper::make_robot_link_id(
+        robot_id, link_name, collision_index);
+
+    if (emitted_raw_names.insert(geometry_object.name).second) {
+      mappings.emplace_back(geometry_object.name, body_id);
+    }
+    // RoboPlan diagnostics have historically used either geometry-object names
+    // or frame/link names depending on the underlying version and query path.
+    // Map the frame name to the first collision body on that link so common
+    // diagnostics still normalize. Geometry names above retain per-shape
+    // precision when available.
+    if (collision_index == 0 && emitted_raw_names.insert(link_name).second) {
+      mappings.emplace_back(link_name, body_id);
+    }
+  }
+
+  std::sort(mappings.begin(), mappings.end(), [](const auto& a, const auto& b) {
+    if (a.first != b.first) {
+      return a.first < b.first;
+    }
+    return a.second < b.second;
+  });
+  return mappings;
+}
+
+std::vector<std::string> RoboPlanPlanningContext::object_body_ids_for_state_locked(
+    const std::string& object_id,
+    const TrackedObjectState& state) const {
+  std::string robot_id;
+  {
+    std::scoped_lock map_lock(mapper_mutex_);
+    robot_id = mapper_robot_id_;
+  }
+  constexpr int kShapeIndex = 0;
+  if (state.attached) {
+    return {RoboPlanCollisionBodyIdMapper::make_attached_object_id(
+        robot_id, object_id, kShapeIndex)};
+  }
+  return {RoboPlanCollisionBodyIdMapper::make_detached_object_id(
+      object_id, kShapeIndex)};
+}
+
+std::vector<std::string>
+RoboPlanPlanningContext::object_body_ids_for_transition_locked(
+    const std::string& object_id,
+    const TrackedObjectState& before,
+    const TrackedObjectState& after) const {
+  auto affected = object_body_ids_for_state_locked(object_id, before);
+  auto after_ids = object_body_ids_for_state_locked(object_id, after);
+  affected.insert(affected.end(), after_ids.begin(), after_ids.end());
+  std::sort(affected.begin(), affected.end());
+  affected.erase(std::unique(affected.begin(), affected.end()), affected.end());
+  return affected;
+}
+
+std::string RoboPlanPlanningContext::compute_collision_world_content_hash_locked(
+    const std::string& robot_id) {
+  std::vector<std::string> entries;
+
+  auto robot_mappings = robot_body_mappings_locked(robot_id);
+  for (const auto& [raw_name, body_id] : robot_mappings) {
+    entries.push_back("robot.raw=" + raw_name + ".body=" + body_id);
+  }
+
+  for (const auto& [object_id, tracked] : object_states_) {
+    const std::string prefix = "object." + object_id;
+    entries.push_back(prefix + ".frame=" + tracked.frame_id);
+    entries.push_back(prefix + ".attached=" + (tracked.attached ? "1" : "0"));
+    for (const auto& body_id :
+         object_body_ids_for_state_locked(object_id, tracked)) {
+      entries.push_back(prefix + ".body=" + body_id);
+    }
+    append_pose_entries(entries, prefix + ".pose", tracked.pose);
+    append_shape_entries(entries, prefix, tracked.shape);
+
+    std::vector<std::string> touch_links = tracked.touch_links;
+    std::sort(touch_links.begin(), touch_links.end());
+    for (const auto& link : touch_links) {
+      entries.push_back(prefix + ".touch_link=" + link);
+    }
+
+    std::vector<std::string> support_contacts;
+    support_contacts.reserve(tracked.support_contacts.size());
+    for (const auto& contact : tracked.support_contacts) {
+      support_contacts.push_back(
+          contact.support_object_id + ":" +
+          stable_double(contact.max_start_penetration_m) + ":" +
+          (contact.require_separation_by_end ? "1" : "0"));
+    }
+    std::sort(support_contacts.begin(), support_contacts.end());
+    for (const auto& contact : support_contacts) {
+      entries.push_back(prefix + ".support_contact=" + contact);
+    }
+  }
+
+  for (const auto& pair : disabled_static_collision_pairs_) {
+    entries.push_back("policy.disabled_static=" + pair.first + "|" + pair.second);
+  }
+  for (const auto& pair : disabled_support_contact_pairs_) {
+    entries.push_back("policy.disabled_support=" + pair.first + "|" + pair.second);
+  }
+
+  std::sort(entries.begin(), entries.end());
+  std::uint64_t h = 1469598103934665603ULL;
+  fnv1a_mix(h, robot_id);
+  for (const auto& entry : entries) {
+    fnv1a_mix(h, entry);
+  }
+  std::ostringstream oss;
+  oss << std::hex << h;
+  return oss.str();
 }
 
 Eigen::Matrix4d RoboPlanPlanningContext::pose_to_matrix(const core::Pose3DTO& pose) {
@@ -882,11 +1598,31 @@ tl::expected<void, std::string> RoboPlanPlanningContext::set_touch_links_locked(
     const std::string& object_id,
     const std::vector<std::string>& touch_links,
     bool enable) {
+  std::vector<std::string> applied;
   for (const auto& link_name : touch_links) {
     auto result = scene_->setCollisions(object_id, link_name, enable);
     if (!result.has_value()) {
+      // Best-effort rollback keeps touch-link updates transactional for the
+      // ManyForge collision-world revision contract. If rollback itself fails,
+      // report both failures; callers can then publish a policy revision
+      // rather than leaving cached validation decisions ambiguous.
+      std::string rollback_error;
+      for (auto it = applied.rbegin(); it != applied.rend(); ++it) {
+        auto rollback = scene_->setCollisions(object_id, *it, !enable);
+        if (!rollback.has_value()) {
+          if (!rollback_error.empty()) {
+            rollback_error += "; ";
+          }
+          rollback_error += rollback.error();
+        }
+      }
+      if (!rollback_error.empty()) {
+        return tl::make_unexpected(
+            result.error() + " (rollback failed: " + rollback_error + ")");
+      }
       return tl::make_unexpected(result.error());
     }
+    applied.push_back(link_name);
   }
   return {};
 }
@@ -1395,8 +2131,12 @@ core::SceneEditResultDTO RoboPlanPlanningContext::add_object(
       return result;
     }
 
-    result.success = true;
     const auto& tracked = object_states_.at(request.object_id);
+    result.success = true;
+    publish_collision_world_revision_locked(
+        core::CollisionWorldMutationSource::kSceneEdit,
+        object_body_ids_for_state_locked(request.object_id, tracked),
+        "scene_edit.add_object");
     SceneTraceEvent event;
     event.event = "add";
     event.object_id = request.object_id;
@@ -1483,6 +2223,10 @@ core::SceneEditResultDTO RoboPlanPlanningContext::remove_object(
     event.pose_in_universe =
         pose_in_base_from_tracked_locked(tracked_before, "universe");
     result.success = true;
+    publish_collision_world_revision_locked(
+        core::CollisionWorldMutationSource::kSceneEdit,
+        object_body_ids_for_state_locked(request.object_id, tracked_before),
+        "scene_edit.remove_object");
     record_scene_event_locked(std::move(event));
   } catch (const std::exception& e) {
     result.error = core::ErrorDTO{core::kErrorInternalError, e.what(), {}};
@@ -1513,6 +2257,7 @@ core::SceneEditResultDTO RoboPlanPlanningContext::update_object_pose(
       return result;
     }
 
+    const TrackedObjectState previous_state = it->second;
     TrackedObjectState new_state = it->second;
     new_state.pose = request.pose;
     new_state.frame_id = is_world_frame(request.frame_id) ? "universe" : request.frame_id;
@@ -1550,6 +2295,11 @@ core::SceneEditResultDTO RoboPlanPlanningContext::update_object_pose(
 
     const auto& tracked = object_states_.at(request.object_id);
     result.success = true;
+    publish_collision_world_revision_locked(
+        core::CollisionWorldMutationSource::kSceneEdit,
+        object_body_ids_for_transition_locked(
+            request.object_id, previous_state, tracked),
+        "scene_edit.update_object_pose");
     SceneTraceEvent event;
     event.event = "update_pose";
     event.object_id = request.object_id;
@@ -1607,8 +2357,15 @@ core::SceneEditResultDTO RoboPlanPlanningContext::attach_object(
       return result;
     }
     auto& tracked = it->second;
+    const TrackedObjectState state_before = tracked;
     auto clear_result = clear_touch_links_locked(request.object_id, tracked);
     if (!clear_result.has_value()) {
+      if (!state_before.touch_links.empty()) {
+        publish_collision_world_revision_locked(
+            core::CollisionWorldMutationSource::kPolicyUpdate,
+            object_body_ids_for_state_locked(request.object_id, tracked),
+            "scene_edit.attach_object.partial_failure");
+      }
       return core::SceneEditResultDTO{
           false,
           core::ErrorDTO{
@@ -1620,12 +2377,23 @@ core::SceneEditResultDTO RoboPlanPlanningContext::attach_object(
     }
     auto result = reparent_object_locked(request.object_id, request.frame_id);
     if (!result.success) {
+      if (state_before.touch_links != tracked.touch_links) {
+        publish_collision_world_revision_locked(
+            core::CollisionWorldMutationSource::kPolicyUpdate,
+            object_body_ids_for_state_locked(request.object_id, tracked),
+            "scene_edit.attach_object.partial_failure");
+      }
       return result;
     }
     if (!request.touch_links.empty()) {
       auto collision_result =
           set_touch_links_locked(request.object_id, request.touch_links, false);
       if (!collision_result.has_value()) {
+        publish_collision_world_revision_locked(
+            core::CollisionWorldMutationSource::kAttach,
+            object_body_ids_for_transition_locked(
+                request.object_id, state_before, object_states_.at(request.object_id)),
+            "scene_edit.attach_object.partial_failure");
         return core::SceneEditResultDTO{
             false,
             core::ErrorDTO{
@@ -1637,6 +2405,11 @@ core::SceneEditResultDTO RoboPlanPlanningContext::attach_object(
       }
       tracked.touch_links = request.touch_links;
     }
+    publish_collision_world_revision_locked(
+        core::CollisionWorldMutationSource::kAttach,
+        object_body_ids_for_transition_locked(
+            request.object_id, state_before, object_states_.at(request.object_id)),
+        "scene_edit.attach_object");
     return result;
   } catch (const std::exception& e) {
     std::lock_guard<std::mutex> scene_lock(*scene_mutex_);
@@ -1666,8 +2439,15 @@ core::SceneEditResultDTO RoboPlanPlanningContext::detach_object(
       };
     }
     auto& tracked = it->second;
+    const TrackedObjectState state_before = tracked;
     auto clear_result = clear_touch_links_locked(request.object_id, tracked);
     if (!clear_result.has_value()) {
+      if (!state_before.touch_links.empty()) {
+        publish_collision_world_revision_locked(
+            core::CollisionWorldMutationSource::kPolicyUpdate,
+            object_body_ids_for_state_locked(request.object_id, tracked),
+            "scene_edit.detach_object.partial_failure");
+      }
       return core::SceneEditResultDTO{
           false,
           core::ErrorDTO{
@@ -1677,7 +2457,20 @@ core::SceneEditResultDTO RoboPlanPlanningContext::detach_object(
           },
       };
     }
-    return reparent_object_locked(request.object_id, target_frame);
+    auto result = reparent_object_locked(request.object_id, target_frame);
+    if (result.success) {
+      publish_collision_world_revision_locked(
+          core::CollisionWorldMutationSource::kDetach,
+          object_body_ids_for_transition_locked(
+              request.object_id, state_before, object_states_.at(request.object_id)),
+          "scene_edit.detach_object");
+    } else if (state_before.touch_links != tracked.touch_links) {
+      publish_collision_world_revision_locked(
+          core::CollisionWorldMutationSource::kPolicyUpdate,
+          object_body_ids_for_state_locked(request.object_id, tracked),
+          "scene_edit.detach_object.partial_failure");
+    }
+    return result;
   } catch (const std::exception& e) {
     std::lock_guard<std::mutex> scene_lock(*scene_mutex_);
     SceneTraceEvent event;

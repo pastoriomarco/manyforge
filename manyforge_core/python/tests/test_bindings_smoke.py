@@ -252,6 +252,21 @@ def test_collision_check_result_dto():
     
     r = manyforge_core_py.CollisionCheckResultDTO()
     assert r.in_collision is False
+    assert r.contact_body_a is None
+    assert r.contact_body_b is None
+    assert r.penetration_depth_m is None
+    assert r.estimated_force_n is None
+
+    r.in_collision = True
+    r.contact_body_a = "tool0"
+    r.contact_body_b = "box"
+    r.penetration_depth_m = 0.001
+    r.estimated_force_n = 3.5
+    assert r.in_collision is True
+    assert r.contact_body_a == "tool0"
+    assert r.contact_body_b == "box"
+    assert r.penetration_depth_m == 0.001
+    assert r.estimated_force_n == 3.5
 
 
 def test_scene_edit_result_dto():
@@ -407,6 +422,10 @@ def test_validation_options_dto():
     assert v.max_tcp_linear_speed_mps == 1.0
     assert v.tcp_frame == "tcp"
     assert v.base_frame == "base_link"
+    assert v.run_collision_checks is True
+
+    v.run_collision_checks = False
+    assert v.run_collision_checks is False
 
 
 def test_fk_request_dto():
