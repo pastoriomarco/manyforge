@@ -16,11 +16,17 @@ def test_execution_state_enum():
     assert manyforge_core_py.ExecutionState.kPlanning == manyforge_core_py.kPlanning
     assert manyforge_core_py.ExecutionState.kValidating == manyforge_core_py.kValidating
     assert manyforge_core_py.ExecutionState.kExecuting == manyforge_core_py.kExecuting
+    assert manyforge_core_py.ExecutionState.kStreaming == manyforge_core_py.kStreaming
+    assert manyforge_core_py.ExecutionState.kInterrupted == manyforge_core_py.kInterrupted
     assert manyforge_core_py.ExecutionState.kPaused == manyforge_core_py.kPaused
     assert manyforge_core_py.ExecutionState.kStopping == manyforge_core_py.kStopping
     assert manyforge_core_py.ExecutionState.kStopped == manyforge_core_py.kStopped
     assert manyforge_core_py.ExecutionState.kCompleted == manyforge_core_py.kCompleted
     assert manyforge_core_py.ExecutionState.kFailed == manyforge_core_py.kFailed
+    assert (
+        manyforge_core_py.ExecutionState.kInterventionRequired
+        == manyforge_core_py.kInterventionRequired
+    )
 
 
 def test_cache_mode_enum():

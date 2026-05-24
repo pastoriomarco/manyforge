@@ -153,12 +153,12 @@ class IPlanningContext {
     /// active world revision, engine status, and (when a policy snapshot is
     /// installed by the adapter) classified pairs + a CollisionDecision.
     ///
-    /// Chunk 5 of the collision-ownership plan elevates this to the port so
-    /// the CollisionValidationCoordinator can call it across waypoints
-    /// without depending on a specific adapter type. Implementations that
-    /// have not yet migrated MUST provide the degraded default that wraps
-    /// the legacy collision_check() result; consumers must treat the absence
-    /// of normalized_pairs / classified_pairs as kDiagnosticIncomplete.
+    /// This remains as a compatibility and diagnostic surface for adapters
+    /// that have not yet implemented the snapshot-consuming
+    /// ICollisionQueryEngine port. The production pre-execution validation
+    /// path does not use this degraded default. Consumers that intentionally
+    /// call it must treat the absence of normalized_pairs / classified_pairs
+    /// as kDiagnosticIncomplete.
     virtual CollisionResult collision_check_normalized(
         const CollisionQuery& query) {
         CollisionCheckRequestDTO legacy_req;

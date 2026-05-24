@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <memory>
+#include <map>
 #include <queue>
 #include <vector>
 
@@ -90,6 +91,68 @@ class MockPlanningContext : public IPlanningContext {
   }
 };
 
+class MockCollisionQueryEngine : public ICollisionQueryEngine {
+ public:
+  CollisionResult default_result;
+  std::map<std::int64_t, CollisionResult> result_by_waypoint;
+  int check_count = 0;
+
+  MockCollisionQueryEngine() {
+    default_result.in_collision = false;
+    default_result.engine_status = CollisionEngineStatus::kOk;
+    default_result.decision = CollisionDecisionResult::kPass;
+    default_result.engine_id = "mock_engine";
+    default_result.engine_version = "test";
+    capability_.engine_id = "mock_engine";
+    capability_.engine_version = "test";
+    capability_.library_lineage = "unit_test";
+    capability_.supported_geometry_kinds = {"box"};
+    capability_.thread_safety =
+        CollisionEngineThreadSafetyClass::kSingleContextExclusive;
+    capability_.deterministic_ordering = true;
+  }
+
+  const CollisionEngineCapabilityDescriptor& capability() const override {
+    return capability_;
+  }
+
+  CollisionResult check(const CollisionWorldSnapshot& snapshot,
+                        const CollisionQuery& query,
+                        const CollisionPolicySnapshot&,
+                        const CollisionCancellationToken& cancel) override {
+    ++check_count;
+    CollisionResult result = default_result;
+    if (query.waypoint_index) {
+      auto it = result_by_waypoint.find(*query.waypoint_index);
+      if (it != result_by_waypoint.end()) {
+        result = it->second;
+      }
+    }
+    result.query_id = query.query_id;
+    result.surface = query.surface;
+    result.state_time_ns = query.state_time_ns;
+    result.collision_world_revision = snapshot.revision;
+    result.engine_id = capability_.engine_id;
+    result.engine_version = capability_.engine_version;
+    if (cancel.is_cancel_requested()) {
+      result.in_collision = false;
+      result.normalized_pairs.clear();
+      result.engine_status = CollisionEngineStatus::kCancelled;
+      result.decision = CollisionDecisionResult::kInconclusiveFail;
+      result.raw_diagnostics["cancel_reason"] = cancel.reason();
+    }
+    return result;
+  }
+
+  std::string engine_id() const override { return capability_.engine_id; }
+  std::string engine_version() const override {
+    return capability_.engine_version;
+  }
+
+ private:
+  CollisionEngineCapabilityDescriptor capability_;
+};
+
 CollisionResult make_clean_result() {
   CollisionResult r;
   r.in_collision = false;
@@ -121,6 +184,17 @@ CollisionResult make_inconclusive_result() {
   return r;
 }
 
+CollisionResult make_cancelled_result(std::string reason) {
+  CollisionResult r;
+  r.in_collision = false;
+  r.engine_status = CollisionEngineStatus::kCancelled;
+  r.decision = CollisionDecisionResult::kInconclusiveFail;
+  r.engine_id = "mock_engine";
+  r.engine_version = "0.x";
+  r.raw_diagnostics["cancel_reason"] = std::move(reason);
+  return r;
+}
+
 CollisionPolicySnapshot make_freespace_snapshot() {
   CollisionPolicySnapshot s;
   s.policy_id = "free_space";
@@ -147,11 +221,22 @@ TrajectoryDTO make_trivial_trajectory(int waypoint_count) {
   t.joint_names = {"j0"};
   for (int i = 0; i < waypoint_count; ++i) {
     TrajectoryWaypointDTO wp;
-    wp.positions_rad = {0.1 * i};
+    wp.positions_rad.push_back(0.1 * i);
     wp.time_from_start_s = 0.1 * i;
     t.waypoints.push_back(wp);
   }
   return t;
+}
+
+CollisionWorldSnapshot make_snapshot() {
+  CollisionWorldSnapshot snapshot;
+  snapshot.publisher_id = "unit_test";
+  snapshot.revision = CollisionWorldRevision{11, "snapshot-11"};
+  snapshot.snapshot_format_version = 1;
+  snapshot.body_count = 1;
+  snapshot.geometry_count = 1;
+  snapshot.all_bodies_have_geometry = true;
+  return snapshot;
 }
 
 // --- Trajectory-wide validation passing -----------------------------------
@@ -354,6 +439,88 @@ TEST(CollisionValidationCoordinatorTest,
   EXPECT_FALSE(bundle.scene_changed_during_validation);
   EXPECT_TRUE(bundle.decision.accepted);
   EXPECT_EQ(bundle.pose_source_retries_used, 0);
+}
+
+// --- Engine-backed cancellation is fail-closed and traceable --------------
+
+TEST(CollisionValidationCoordinatorTest,
+     EngineBackedValidationCancelsBeforeFirstWaypoint) {
+  MockCollisionQueryEngine engine;
+  CollisionCancellationToken cancel;
+  cancel.request_cancel("operator_stop");
+
+  CollisionValidationPassConfig cfg;
+  cfg.policy_snapshot = make_freespace_snapshot();
+  CollisionValidationCoordinator coord(cfg);
+
+  auto bundle = coord.validate_trajectory(
+      make_snapshot(), engine, make_trivial_trajectory(3), cancel);
+
+  EXPECT_TRUE(bundle.cancelled);
+  ASSERT_TRUE(bundle.cancellation_reason.has_value());
+  EXPECT_EQ(*bundle.cancellation_reason, "operator_stop");
+  ASSERT_TRUE(bundle.cancelled_at_waypoint_index.has_value());
+  EXPECT_EQ(*bundle.cancelled_at_waypoint_index, 0);
+  EXPECT_FALSE(bundle.decision.accepted);
+  EXPECT_EQ(bundle.decision.action, CollisionDecisionAction::kInconclusive);
+  EXPECT_EQ(bundle.decision.severity, CollisionDecisionSeverity::kBlock);
+  ASSERT_TRUE(bundle.final_world_revision.has_value());
+  EXPECT_EQ(bundle.final_world_revision->revision_id, 11u);
+  EXPECT_EQ(bundle.waypoint_records.size(), 0u);
+  EXPECT_EQ(engine.check_count, 0);
+}
+
+TEST(CollisionValidationCoordinatorTest,
+     EngineBackedValidationCarriesEngineCancellationRecord) {
+  MockCollisionQueryEngine engine;
+  engine.result_by_waypoint[1] = make_cancelled_result("engine_cancelled");
+  CollisionCancellationToken cancel;
+
+  CollisionValidationPassConfig cfg;
+  cfg.policy_snapshot = make_freespace_snapshot();
+  CollisionValidationCoordinator coord(cfg);
+
+  auto bundle = coord.validate_trajectory(
+      make_snapshot(), engine, make_trivial_trajectory(4), cancel);
+
+  EXPECT_TRUE(bundle.cancelled);
+  ASSERT_TRUE(bundle.cancellation_reason.has_value());
+  EXPECT_EQ(*bundle.cancellation_reason, "engine_cancelled");
+  ASSERT_TRUE(bundle.cancelled_at_waypoint_index.has_value());
+  EXPECT_EQ(*bundle.cancelled_at_waypoint_index, 1);
+  EXPECT_FALSE(bundle.decision.accepted);
+  EXPECT_EQ(bundle.decision.action, CollisionDecisionAction::kInconclusive);
+  ASSERT_TRUE(bundle.decision.first_failing_waypoint.has_value());
+  EXPECT_EQ(*bundle.decision.first_failing_waypoint, 1);
+  ASSERT_EQ(bundle.waypoint_records.size(), 2u);
+  EXPECT_EQ(bundle.waypoint_records.back().result.engine_status,
+            CollisionEngineStatus::kCancelled);
+  EXPECT_EQ(engine.check_count, 2);
+}
+
+TEST(CollisionValidationCoordinatorTest,
+     EngineBackedCollisionBeforeCancellationPreservesRejectDecision) {
+  MockCollisionQueryEngine engine;
+  engine.result_by_waypoint[0] =
+      make_colliding_result(CollisionPairId{"robot/link", "object/part"});
+  engine.result_by_waypoint[2] = make_cancelled_result("operator_stop");
+  CollisionCancellationToken cancel;
+
+  CollisionValidationPassConfig cfg;
+  cfg.policy_snapshot = make_freespace_snapshot();
+  CollisionValidationCoordinator coord(cfg);
+
+  auto bundle = coord.validate_trajectory(
+      make_snapshot(), engine, make_trivial_trajectory(4), cancel);
+
+  EXPECT_TRUE(bundle.cancelled);
+  ASSERT_TRUE(bundle.cancelled_at_waypoint_index.has_value());
+  EXPECT_EQ(*bundle.cancelled_at_waypoint_index, 2);
+  EXPECT_FALSE(bundle.decision.accepted);
+  EXPECT_EQ(bundle.decision.action, CollisionDecisionAction::kReject);
+  ASSERT_TRUE(bundle.decision.first_failing_waypoint.has_value());
+  EXPECT_EQ(*bundle.decision.first_failing_waypoint, 0);
+  ASSERT_EQ(bundle.waypoint_records.size(), 3u);
 }
 
 // --- Single-state validation convenience hits the same code path ----------

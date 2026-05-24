@@ -14,12 +14,23 @@
 #include <utility>
 
 #include <manyforge_core/types/error_code.hpp>
+#include <manyforge_core/collision/parallel_collision_validation_worker_pool.hpp>
+#include <manyforge_collision/manyforge_collision_engine.hpp>
 #include <manyforge_roboplan/native_kernel_factory.hpp>
 
 namespace manyforge::roboplan_backend {
 namespace {
 
 constexpr double kRuntimeScaleSlewPerSecond = 4.0;  // 0→1 in 250 ms.
+
+core::CollisionPolicySnapshot default_collision_policy_snapshot() {
+  core::CollisionPolicySnapshot policy;
+  policy.policy_id = "default_free_space";
+  policy.revision.revision_id = 1;
+  policy.revision.content_hash = "default_free_space_v1";
+  policy.require_full_diagnostics = false;
+  return policy;
+}
 
 double clamp_progress(double progress) {
   return std::max(0.0, std::min(1.0, progress));
@@ -2272,9 +2283,33 @@ std::shared_ptr<NativeKernelBundle> create_ros2_control_kernel(
       bundle->scene, group_name, *bundle->clock, ros_config, scene_mutex);
   bundle->scheduler = std::make_unique<SimpleScheduler>();
   bundle->cache = std::make_unique<core::TrajectoryCache>();
+
+  const auto policy = default_collision_policy_snapshot();
+  bundle->context->set_collision_policy_snapshot(policy);
+  const int collision_worker_count =
+      core::env_validation_collision_workers(
+          std::max(1, kernel_config.validation_collision_workers));
+  bundle->collision_validation_engines.reserve(collision_worker_count);
+  for (int i = 0; i < collision_worker_count; ++i) {
+    bundle->collision_validation_engines.push_back(
+        std::make_shared<manyforge::collision::ManyForgeCollisionEngine>(
+            model_name,
+            std::filesystem::path(urdf_path),
+            std::filesystem::path(srdf_path),
+            pkg_paths,
+            group_name));
+  }
+
+  core::ExecutionKernelConfig resolved_kernel_config = kernel_config;
+  resolved_kernel_config.validation_collision_workers = collision_worker_count;
   bundle->kernel = std::make_unique<core::ExecutionKernel>(
       *bundle->planner, *bundle->context, *bundle->execution,
-      *bundle->clock, *bundle->scheduler, *bundle->cache, kernel_config);
+      *bundle->clock, *bundle->scheduler, *bundle->cache,
+      resolved_kernel_config);
+  bundle->kernel->set_collision_validation_policy_snapshot(policy);
+  bundle->kernel->set_collision_validation_pipeline(
+      *bundle->context,
+      bundle->collision_validation_engines);
   bundle->event_collector.subscribe(*bundle->kernel);
   return bundle;
 }

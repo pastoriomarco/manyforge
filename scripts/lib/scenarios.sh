@@ -16,7 +16,6 @@ source "$(dirname "${BASH_SOURCE[0]}")/runner.sh"
 _SCENARIO_TABLE=(
     "ur5-pick-place|manyforge-only|off|/workspace/examples/pick_and_place.program.yaml|/workspace/examples/pick_and_place.deployment.yaml|UR5 pick-and-place baseline (12-step)"
     "ur5-simple-pick-place|manyforge-only|off|/workspace/manyforge_behavior/tests/fixtures/pick_and_place.program.yaml|/workspace/examples/pick_and_place.deployment.yaml|UR5 3-step minimal test fixture (was demo.sh --simple)"
-    "ur5-interrupt-pick-place|manyforge-only|off|/workspace/examples/interrupt_pick_and_place.program.yaml|/workspace/examples/interrupt_pick_and_place.deployment.yaml|UR5 pick-and-place with interrupt + resume (pause/resume demo)"
     "ur10e-pick-place|manyforge-only|off|/workspace/examples/pick_and_place_ur10e_robotiq.program.yaml|/workspace/examples/pick_and_place_ur10e_robotiq.deployment.yaml|UR10e + Robotiq 2F-140 self-contained preview"
     "ur5-semantic-shape-pick|manyforge-only|on|/workspace/examples/semantic_shape_pick.program.yaml|/workspace/examples/semantic_shape_pick.deployment.yaml|UR5 semantic shape pick (vision LLM)"
     "ur5-vision-pose-pick|manyforge-only|on|/workspace/examples/vision_guided_pose_pick.program.yaml|/workspace/examples/vision_guided_pose_pick.deployment.yaml|UR5 vision-guided pose pick (vision LLM)"
@@ -33,7 +32,6 @@ _SCENARIO_TABLE=(
 # Format: old_name|canonical_name
 _SCENARIO_ALIASES=(
     "pick-place|ur5-pick-place"
-    "interrupt|ur5-interrupt-pick-place"
     "ur10e|ur10e-pick-place"
     "shape-pick|ur5-semantic-shape-pick"
     "vision-pose|ur5-vision-pose-pick"

@@ -42,11 +42,4 @@ Result<void> CollisionPolicy::handle_collision(const CollisionCheckResultDTO& ch
   return Result<void>::Ok();
 }
 
-Result<void> CollisionPolicy::pre_execute_check(const CollisionCheckResultDTO& check) {
-  if (!check.in_collision) {
-    return Result<void>::Ok();
-  }
-  return Result<void>::Err(ErrorCode::kValidationCollision);
-}
-
 }  // namespace manyforge::core

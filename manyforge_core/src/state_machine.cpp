@@ -17,16 +17,19 @@ bool ExecutionStateMachine::is_valid_transition(ExecutionState from, ExecutionSt
                    to == ExecutionState::kStreaming;     // begin_streaming_session (ADR-0016)
         case ExecutionState::kPlanning:
             return to == ExecutionState::kValidating ||
+                   to == ExecutionState::kInterrupted ||
                    to == ExecutionState::kFailed ||
                    to == ExecutionState::kStopped ||  // stop cancels in-flight
                    to == ExecutionState::kInterventionRequired;
         case ExecutionState::kValidating:
             return to == ExecutionState::kExecuting ||
+                   to == ExecutionState::kInterrupted ||
                    to == ExecutionState::kFailed ||
                    to == ExecutionState::kStopped ||  // stop cancels in-flight
                    to == ExecutionState::kInterventionRequired;
         case ExecutionState::kExecuting:
             return to == ExecutionState::kStopping ||
+                   to == ExecutionState::kInterrupted ||
                    to == ExecutionState::kCompleted ||
                    to == ExecutionState::kFailed ||
                    to == ExecutionState::kInterventionRequired;
@@ -36,11 +39,13 @@ bool ExecutionStateMachine::is_valid_transition(ExecutionState from, ExecutionSt
             // via fault -> Failed/InterventionRequired. Per-target updates do
             // not transition out of kStreaming.
             return to == ExecutionState::kStopping ||
+                   to == ExecutionState::kInterrupted ||
                    to == ExecutionState::kStopped ||
                    to == ExecutionState::kFailed ||
                    to == ExecutionState::kInterventionRequired;
         case ExecutionState::kPaused:
             return to == ExecutionState::kValidating ||  // resume re-validates
+                   to == ExecutionState::kInterrupted ||
                    to == ExecutionState::kStopping ||
                    to == ExecutionState::kInterventionRequired;
         case ExecutionState::kStopping:
@@ -59,7 +64,14 @@ bool ExecutionStateMachine::is_valid_transition(ExecutionState from, ExecutionSt
         case ExecutionState::kCompleted:
         case ExecutionState::kFailed:
             return to == ExecutionState::kInterventionRequired;
+        case ExecutionState::kInterrupted:
+            return to == ExecutionState::kInterventionRequired ||
+                   to == ExecutionState::kFailed ||
+                   to == ExecutionState::kIdle;
         case ExecutionState::kInterventionRequired:
+            // Idempotent safety sinks are allowed: repeated fault reports from
+            // independent monitors must not turn an already-held kernel into a
+            // transition error.
             return to == ExecutionState::kInterventionRequired;
         default:
             return false;

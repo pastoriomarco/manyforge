@@ -37,11 +37,6 @@ class CollisionPolicy {
   /// If not in_collision: no-op, returns Ok.
   Result<void> handle_collision(const CollisionCheckResultDTO& check);
 
-  /// Pre-execution collision gate.
-  /// If in_collision: returns Err(kValidationCollision).
-  /// If not: returns Ok.
-  Result<void> pre_execute_check(const CollisionCheckResultDTO& check);
-
  private:
   StopPolicy& stop_policy_;
   CacheInvalidationCallback invalidate_cache_;

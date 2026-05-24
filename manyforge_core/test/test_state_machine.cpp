@@ -124,6 +124,30 @@ TEST_F(StateMachineTest, StoppingToPaused) {
   EXPECT_TRUE(sm.try_transition(ExecutionState::kPaused).ok());
 }
 
+TEST_F(StateMachineTest, PlanningToInterrupted) {
+  sm.try_transition(ExecutionState::kPlanning);
+  EXPECT_TRUE(sm.try_transition(ExecutionState::kInterrupted).ok());
+}
+
+TEST_F(StateMachineTest, ValidatingToInterrupted) {
+  sm.try_transition(ExecutionState::kPlanning);
+  sm.try_transition(ExecutionState::kValidating);
+  EXPECT_TRUE(sm.try_transition(ExecutionState::kInterrupted).ok());
+}
+
+TEST_F(StateMachineTest, ExecutingToInterrupted) {
+  sm.try_transition(ExecutionState::kPlanning);
+  sm.try_transition(ExecutionState::kValidating);
+  sm.try_transition(ExecutionState::kExecuting);
+  EXPECT_TRUE(sm.try_transition(ExecutionState::kInterrupted).ok());
+}
+
+TEST_F(StateMachineTest, InterruptedToInterventionRequired) {
+  sm.try_transition(ExecutionState::kPlanning);
+  sm.try_transition(ExecutionState::kInterrupted);
+  EXPECT_TRUE(sm.try_transition(ExecutionState::kInterventionRequired).ok());
+}
+
 // --- Invalid transitions (at least one per state) ---
 TEST_F(StateMachineTest, IdleToExecutingInvalid) {
   EXPECT_FALSE(sm.try_transition(ExecutionState::kExecuting).ok());
@@ -203,6 +227,16 @@ TEST_F(StateMachineTest, FailedToAnyInvalid) {
   EXPECT_FALSE(sm.try_transition(ExecutionState::kPlanning).ok());
 }
 
+TEST_F(StateMachineTest, IdleToInterruptedInvalid) {
+  EXPECT_FALSE(sm.try_transition(ExecutionState::kInterrupted).ok());
+}
+
+TEST_F(StateMachineTest, InterruptedToExecutingInvalid) {
+  sm.try_transition(ExecutionState::kPlanning);
+  sm.try_transition(ExecutionState::kInterrupted);
+  EXPECT_FALSE(sm.try_transition(ExecutionState::kExecuting).ok());
+}
+
 // --- Reset ---
 TEST_F(StateMachineTest, ResetFromIdle_Fails) {
   EXPECT_FALSE(sm.reset().ok());
@@ -266,6 +300,13 @@ TEST_F(StateMachineTest, ResetFromCompleted) {
 TEST_F(StateMachineTest, ResetFromFailed) {
   sm.try_transition(ExecutionState::kPlanning);
   sm.try_transition(ExecutionState::kFailed);
+  EXPECT_TRUE(sm.reset().ok());
+  EXPECT_EQ(sm.status().state, ExecutionState::kIdle);
+}
+
+TEST_F(StateMachineTest, ResetFromInterrupted) {
+  sm.try_transition(ExecutionState::kPlanning);
+  sm.try_transition(ExecutionState::kInterrupted);
   EXPECT_TRUE(sm.reset().ok());
   EXPECT_EQ(sm.status().state, ExecutionState::kIdle);
 }

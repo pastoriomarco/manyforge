@@ -102,36 +102,6 @@ def _write_program_with_failing_delegate_policy(
     target.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
     return str(target)
 
-
-def _write_program_with_interrupt_policy(tmp_path: Path) -> str:
-    data = yaml.safe_load(Path(_PROGRAM_PATH).read_text(encoding="utf-8"))
-    data["interrupt_handlers"] = {
-        "pause_announce": {
-            "description": "Minimal handler for pause hold.",
-            "root": {
-                "id": "sequence",
-                "name": "pause_announce",
-                "children": [
-                    {"id": "reset_trajectories", "name": "noop_interrupt"},
-                ],
-            },
-        },
-    }
-    data["interrupt_policies"] = [
-        {
-            "id": "operator_pause_hold",
-            "source": "operator_pause",
-            "applies_to": {"subtree_root": "main_sequence", "interruptible_only": True},
-            "preemption_mode": "hold_cycle",
-            "handler": "pause_announce",
-            "after_handler": "resumable_hold",
-        },
-    ]
-    target = tmp_path / "interrupts.program.yaml"
-    target.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
-    return str(target)
-
-
 @pytest.fixture
 def state():
     """Create a fresh ComposerState for each test."""
@@ -362,18 +332,6 @@ def test_catalog_entry_includes_stability_metadata(client):
     data = response.json()
     assert data["stability"] == "experimental"
     assert data["profilesMin"] == "v0.1"
-
-
-def test_program_response_includes_interrupt_metadata(client, tmp_path):
-    """Program load surfaces declared interrupt handlers and policies."""
-    program_path = _write_program_with_interrupt_policy(tmp_path)
-    response = client.post("/api/program/load", json={"path": program_path})
-    assert response.status_code == 200
-    data = response.json()
-    assert data["interruptHandlers"][0]["id"] == "pause_announce"
-    assert data["interruptPolicies"][0]["id"] == "operator_pause_hold"
-    assert data["interruptPolicies"][0]["preemptionMode"] == "hold_cycle"
-
 
 def test_catalog_entry_not_found(client):
     """GET /api/catalog/nonexistent returns 404."""

@@ -156,6 +156,84 @@ bool same_collision_world_revision(const CollisionWorldRevision& a,
          a.content_hash == b.content_hash;
 }
 
+constexpr const char* kRuntimeCollisionFaultSourceId =
+    "manyforge.kernel.runtime_collision_fault";
+constexpr const char* kRuntimeCollisionFaultPolicyId =
+    "manyforge.kernel.runtime_collision_fault.preempt_trajectory";
+
+bool validation_cancelled_by_interrupt(const ErrorDTO& error) {
+  if (error.code != kErrorValidationCollision) {
+    return false;
+  }
+  const auto it = error.details.find("reason");
+  return it != error.details.end() &&
+         it->second == "collision_validation_cancelled";
+}
+
+const char* streaming_collision_reason_code(
+    const CollisionValidationDecisionBundle& bundle) {
+  if (!bundle.cancelled) {
+    return "streaming_collision_rejected";
+  }
+  if (bundle.decision.first_failing_waypoint &&
+      bundle.cancelled_at_waypoint_index &&
+      *bundle.decision.first_failing_waypoint <
+          *bundle.cancelled_at_waypoint_index) {
+    return "streaming_collision_rejected";
+  }
+  return "streaming_collision_cancelled";
+}
+
+std::optional<KernelEventType> interrupt_event_type_from_name(
+    const std::string& name) {
+  static const std::map<std::string, KernelEventType> kMap{
+      {"interrupt_signal_ingested", KernelEventType::kInterruptSignalIngested},
+      {"interrupt_signal_rejected_stale",
+       KernelEventType::kInterruptSignalRejectedStale},
+      {"interrupt_signal_rejected_class_violation",
+       KernelEventType::kInterruptSignalRejectedClassViolation},
+      {"interrupt_signal_rejected", KernelEventType::kInterruptSignalRejected},
+      {"interrupt_latched", KernelEventType::kInterruptLatched},
+      {"interrupt_suppressed_by_active_mask",
+       KernelEventType::kInterruptSuppressedByActiveMask},
+      {"interrupt_queued", KernelEventType::kInterruptQueued},
+      {"interrupt_dropped_queue_overflow",
+       KernelEventType::kInterruptDroppedQueueOverflow},
+      {"interrupt_preempt_applied", KernelEventType::kInterruptPreemptApplied},
+      {"interrupt_disposition_applied",
+       KernelEventType::kInterruptDispositionApplied},
+      {"interrupt_cleared", KernelEventType::kInterruptCleared},
+      {"interrupt_ingest_overflow", KernelEventType::kInterruptIngestOverflow},
+      {"interrupt_source_class_violation",
+       KernelEventType::kInterruptSourceClassViolation},
+      {"interrupt_recovery_handler_started",
+       KernelEventType::kInterruptRecoveryHandlerStarted},
+      {"interrupt_recovery_handler_completed",
+       KernelEventType::kInterruptRecoveryHandlerCompleted},
+  };
+  const auto it = kMap.find(name);
+  if (it == kMap.end()) {
+    return std::nullopt;
+  }
+  return it->second;
+}
+
+InterruptIngestResult reject_interrupts_without_active_phase(
+    const std::vector<InterruptSignalUpdate>& updates) {
+  InterruptIngestResult result;
+  result.rejected = true;
+  result.reason = "no_active_execution_phase";
+  for (const auto& update : updates) {
+    result.events.push_back(
+        {"interrupt_signal_rejected",
+         {{"source_id", update.source_id},
+          {"sequence_id", std::to_string(update.sequence_id)},
+          {"reason", result.reason}},
+         std::nullopt});
+  }
+  return result;
+}
+
 ErrorDTO collision_world_changed_error(const CollisionWorldRevision& before,
                                        const CollisionWorldRevision& after,
                                        const std::string& phase) {
@@ -168,6 +246,48 @@ ErrorDTO collision_world_changed_error(const CollisionWorldRevision& before,
        {"before_content_hash", before.content_hash},
        {"after_revision_id", std::to_string(after.revision_id)},
        {"after_content_hash", after.content_hash}}};
+}
+
+ErrorDTO authoritative_collision_validation_config_error(
+    std::string reason,
+    std::map<std::string, std::string> details = {},
+    std::string phase = "pre_execution_validation") {
+  details.emplace("reason", std::move(reason));
+  details.emplace("phase", std::move(phase));
+  return ErrorDTO{
+      kErrorInvariantViolation,
+      "Authoritative collision validation pipeline is not configured",
+      std::move(details)};
+}
+
+InterruptSourceDefinition runtime_collision_fault_source_definition() {
+  InterruptSourceDefinition source;
+  source.source_id = kRuntimeCollisionFaultSourceId;
+  source.adapter = InterruptAdapter::kKernel;
+  source.signal = "runtime_collision_fault";
+  source.source_class = InterruptSourceClass::kFastExecutionRelevant;
+  source.kind = InterruptSourceKind::kEdge;
+  source.priority = 1000;
+  source.maskable = false;
+  source.freshness_budget_ns = 1'000'000;
+  source.description =
+      "Kernel-owned runtime collision monitor fault source";
+  return source;
+}
+
+InterruptPolicyDefinition runtime_collision_fault_policy_definition() {
+  InterruptPolicyDefinition policy;
+  policy.policy_id = kRuntimeCollisionFaultPolicyId;
+  policy.source_id = kRuntimeCollisionFaultSourceId;
+  policy.priority = 1000;
+  policy.maskable = false;
+  policy.affected_phases = {InterruptExecutionPhase::kTrajectoryExecution};
+  policy.preemption_action = InterruptPreemptionAction::kPreemptTrajectory;
+  policy.post_latch_disposition =
+      InterruptPostLatchDisposition::kAwaitOperatorAck;
+  policy.description =
+      "Preempt trajectory execution when runtime collision monitoring detects a collision";
+  return policy;
 }
 
 bool drain_execution_handle_bounded(ExecutionHandle& handle) {
@@ -458,6 +578,11 @@ ExecutionKernel::ExecutionKernel(IPlannerBackend& planner,
       !std::isfinite(config_.streaming_ik_timeout_s)) {
     throw std::invalid_argument("streaming_ik_timeout_s must be finite and > 0");
   }
+  if (config_.streaming_collision_timeout_s <= 0.0 ||
+      !std::isfinite(config_.streaming_collision_timeout_s)) {
+    throw std::invalid_argument(
+        "streaming_collision_timeout_s must be finite and > 0");
+  }
   if (config_.native_reset_completion_timeout_s <= 0.0 ||
       !std::isfinite(config_.native_reset_completion_timeout_s)) {
     throw std::invalid_argument(
@@ -468,7 +593,14 @@ ExecutionKernel::ExecutionKernel(IPlannerBackend& planner,
     throw std::invalid_argument(
         "native_streaming_stop_completion_timeout_s must be finite and > 0");
   }
+  if (config_.validation_collision_workers < 1) {
+    config_.validation_collision_workers = 1;
+  }
+  if (config_.validation_collision_min_waypoints_for_parallel < 1) {
+    config_.validation_collision_min_waypoints_for_parallel = 1;
+  }
   stop_policy_.set_stop_callback([this]() { (void)execution_backend_.stop(); });
+  install_builtin_interrupt_sources();
   sync_snapshot_from_context();
 }
 
@@ -517,6 +649,429 @@ SubscriptionHandle ExecutionKernel::subscribe_events(EventCallback callback) {
 void ExecutionKernel::unsubscribe_events(SubscriptionHandle handle) {
   std::lock_guard<std::mutex> lock(subscribers_mutex_);
   subscribers_.erase(handle.id);
+}
+
+Result<void> ExecutionKernel::register_interrupt_source(
+    const InterruptSourceDefinition& source) {
+  return interrupt_manager_.register_source(source);
+}
+
+Result<void> ExecutionKernel::register_interrupt_policy(
+    const InterruptPolicyDefinition& policy) {
+  return interrupt_manager_.register_policy(policy);
+}
+
+CollisionWorldRevision
+ExecutionKernel::current_authoritative_collision_world_revision() const {
+  ICollisionWorldSnapshotPublisher* publisher = nullptr;
+  {
+    std::scoped_lock lock(coordinator_mutex_);
+    publisher = collision_snapshot_publisher_;
+  }
+  if (publisher == nullptr) {
+    return {};
+  }
+  try {
+    auto snapshot = publisher->snapshot();
+    if (snapshot) {
+      return snapshot->revision;
+    }
+  } catch (...) {
+    // Callers use the default revision as "no authoritative revision
+    // available"; validation itself reports the concrete publisher error.
+  }
+  return {};
+}
+
+std::shared_ptr<CollisionCancellationToken>
+ExecutionKernel::install_validation_cancel_token() {
+  auto token = std::make_shared<CollisionCancellationToken>();
+  {
+    std::scoped_lock lock(validation_cancel_mutex_);
+    active_validation_cancel_token_ = token;
+  }
+  if (auto latch = interrupt_manager_.active_latch();
+      latch &&
+      latch->preemption_action_requested ==
+          InterruptPreemptionAction::kCancelValidation) {
+    token->request_cancel("interrupt:" + latch->latch_id);
+  }
+  return token;
+}
+
+void ExecutionKernel::clear_validation_cancel_token(
+    const std::shared_ptr<CollisionCancellationToken>& token) {
+  std::scoped_lock lock(validation_cancel_mutex_);
+  auto active = active_validation_cancel_token_.lock();
+  if (active && active == token) {
+    active_validation_cancel_token_.reset();
+  }
+}
+
+std::shared_ptr<CollisionCancellationToken>
+ExecutionKernel::install_streaming_target_cancel_token(
+    std::uint64_t validation_sequence) {
+  auto token = std::make_shared<CollisionCancellationToken>();
+  std::scoped_lock lock(streaming_cancel_mutex_);
+  if (auto previous = active_streaming_target_cancel_token_.lock()) {
+    previous->request_cancel("superseded_by_newer_streaming_target");
+  }
+  if (validation_sequence != streaming_target_validation_sequence_.load(
+                                 std::memory_order_acquire)) {
+    token->request_cancel("superseded_by_newer_streaming_target");
+  }
+  active_streaming_target_cancel_token_ = token;
+  return token;
+}
+
+void ExecutionKernel::clear_streaming_target_cancel_token(
+    const std::shared_ptr<CollisionCancellationToken>& token) {
+  std::scoped_lock lock(streaming_cancel_mutex_);
+  auto active = active_streaming_target_cancel_token_.lock();
+  if (active && active == token) {
+    active_streaming_target_cancel_token_.reset();
+  }
+}
+
+void ExecutionKernel::cancel_active_streaming_target_validation(
+    std::string reason) {
+  streaming_target_validation_sequence_.fetch_add(
+      1, std::memory_order_acq_rel);
+  std::scoped_lock lock(streaming_cancel_mutex_);
+  if (auto active = active_streaming_target_cancel_token_.lock()) {
+    active->request_cancel(std::move(reason));
+  }
+}
+
+void ExecutionKernel::request_validation_cancel_from_interrupt(
+    const InterruptIngestResult& result) {
+  if (!result.latched || !result.active_latch ||
+      result.active_latch->preemption_action_requested !=
+          InterruptPreemptionAction::kCancelValidation) {
+    return;
+  }
+  std::shared_ptr<CollisionCancellationToken> token;
+  {
+    std::scoped_lock lock(validation_cancel_mutex_);
+    token = active_validation_cancel_token_.lock();
+  }
+  if (token) {
+    token->request_cancel("interrupt:" + result.active_latch->latch_id);
+  }
+}
+
+void ExecutionKernel::mark_active_interrupt_preemption_result(
+    InterruptPreemptionResult result) {
+  auto latch = interrupt_manager_.active_latch();
+  if (!latch) {
+    return;
+  }
+  const auto now = clock_.now();
+  auto marked = interrupt_manager_.mark_active_preemption_result(
+      result, now - latch->latched_at_ns, now);
+  if (marked.ok()) {
+    emit_interrupt_events(marked.value());
+  }
+}
+
+void ExecutionKernel::install_builtin_interrupt_sources() {
+  auto source = interrupt_manager_.register_source(
+      runtime_collision_fault_source_definition());
+  if (!source.ok()) {
+    throw std::logic_error(
+        "failed to register kernel runtime collision interrupt source: " +
+        source.error().message);
+  }
+  auto policy = interrupt_manager_.register_policy(
+      runtime_collision_fault_policy_definition());
+  if (!policy.ok()) {
+    throw std::logic_error(
+        "failed to register kernel runtime collision interrupt policy: " +
+        policy.error().message);
+  }
+}
+
+InterruptIngestResult
+ExecutionKernel::publish_runtime_collision_fault_interrupt(
+    const CollisionCheckResultDTO& check) {
+  InterruptSignalUpdate signal;
+  signal.source_id = kRuntimeCollisionFaultSourceId;
+  signal.sequence_id =
+      runtime_collision_fault_sequence_.fetch_add(1, std::memory_order_relaxed) +
+      1;
+  signal.timestamp_ns = clock_.now();
+  signal.freshness_ns = 0;
+  signal.value = true;
+  signal.metadata["surface"] = "observed_runtime_monitor";
+  signal.metadata["in_collision"] = check.in_collision ? "true" : "false";
+  if (check.contact_body_a) {
+    signal.metadata["contact_a"] = *check.contact_body_a;
+  }
+  if (check.contact_body_b) {
+    signal.metadata["contact_b"] = *check.contact_body_b;
+  }
+  return publish_fast_interrupt_signal(signal);
+}
+
+void ExecutionKernel::apply_latched_interrupt_preemption(
+    const InterruptIngestResult& result) {
+  if (!result.latched || !result.active_latch) {
+    return;
+  }
+  const auto& latch = *result.active_latch;
+  if (latch.preemption_action_requested ==
+      InterruptPreemptionAction::kPreemptStreaming) {
+    cancel_active_streaming_target_validation("interrupt:" + latch.latch_id);
+    std::uint64_t kernel_session_id = 0;
+    std::uint64_t backend_session_id = 0;
+    SoftStopStrategy strategy = SoftStopStrategy::kSpringBack;
+    {
+      std::lock_guard<std::mutex> lock(streaming_session_mutex_);
+      kernel_session_id = active_streaming_session_id_;
+      backend_session_id = active_backend_session_id_;
+      strategy = active_soft_stop_strategy_;
+    }
+
+    if (kernel_session_id == 0 || backend_session_id == 0) {
+      mark_active_interrupt_preemption_result(
+          InterruptPreemptionResult::kSucceeded);
+      return;
+    }
+
+    auto end_result =
+        execution_backend_.end_streaming_session(backend_session_id, strategy);
+    if (end_result.accepted) {
+      {
+        std::lock_guard<std::mutex> lock(streaming_session_mutex_);
+        if (active_streaming_session_id_ == kernel_session_id) {
+          active_streaming_session_id_ = 0;
+          active_backend_session_id_ = 0;
+          ++active_streaming_generation_;
+          active_streaming_config_ = StreamingSessionConfigDTO{};
+          active_soft_stop_strategy_ = SoftStopStrategy::kSpringBack;
+          last_accepted_cartesian_pos_valid_ = false;
+          last_accepted_cartesian_ts_ns_ = 0;
+          last_commanded_joints_valid_ = false;
+          last_commanded_joints_.clear();
+        }
+      }
+      emit_event({KernelEventType::kStreamingSessionEnded,
+                  0,
+                  clock_.now(),
+                  {},
+                  {},
+                  std::nullopt,
+                  {{"session_id", std::to_string(kernel_session_id)},
+                   {"backend_session_id", std::to_string(backend_session_id)},
+                   {"end_reason", "interrupt_preempt_streaming"},
+                   {"soft_stop_strategy", to_string(strategy)}}});
+      mark_active_interrupt_preemption_result(
+          InterruptPreemptionResult::kSucceeded);
+    } else {
+      mark_active_interrupt_preemption_result(
+          InterruptPreemptionResult::kBackendPreemptFailed);
+      if (end_result.error) {
+        sm_.set_last_error(error_code_from_dto(*end_result.error));
+        auto snapshot = get_execution_snapshot();
+        snapshot.timestamp_ns = clock_.now();
+        snapshot.state = ExecutionState::kInterrupted;
+        snapshot.error = end_result.error;
+        publish_execution_snapshot(std::move(snapshot));
+        emit_event({KernelEventType::kErrorRaised,
+                    sm_.status().execution_id,
+                    clock_.now(),
+                    {},
+                    {},
+                    end_result.error,
+                    {{"phase", "preempt_streaming"},
+                     {"session_id", std::to_string(kernel_session_id)}}});
+      }
+    }
+    return;
+  }
+  if (latch.preemption_action_requested !=
+      InterruptPreemptionAction::kPreemptTrajectory) {
+    return;
+  }
+  stop_collision_monitoring();
+  cache_.invalidate_all();
+  auto stop = execution_backend_.stop();
+  mark_active_interrupt_preemption_result(
+      stop.accepted ? InterruptPreemptionResult::kSucceeded
+                    : InterruptPreemptionResult::kBackendPreemptFailed);
+  if (!stop.accepted && stop.error) {
+    sm_.set_last_error(error_code_from_dto(*stop.error));
+    auto snapshot = get_execution_snapshot();
+    snapshot.timestamp_ns = clock_.now();
+    snapshot.state = ExecutionState::kInterrupted;
+    snapshot.error = stop.error;
+    publish_execution_snapshot(std::move(snapshot));
+    emit_event({KernelEventType::kErrorRaised,
+                sm_.status().execution_id,
+                clock_.now(),
+                {},
+                {},
+                stop.error,
+                {{"phase", "preempt_trajectory"}}});
+  }
+}
+
+InterruptRuntimeContext ExecutionKernel::current_interrupt_context() const {
+  InterruptRuntimeContext context;
+  const auto status = sm_.status();
+  const auto phase = interrupt_phase_from_state(status.state);
+  context.phase = phase.value_or(InterruptExecutionPhase::kHeld);
+  if (status.execution_id != 0) {
+    context.execution_id = status.execution_id;
+  }
+  {
+    std::lock_guard<std::mutex> move_lock(active_move_id_mutex_);
+    if (!active_move_id_.empty()) {
+      context.move_id = active_move_id_;
+    }
+  }
+  {
+    std::lock_guard<std::mutex> streaming_lock(streaming_session_mutex_);
+    if (active_streaming_session_id_ != 0) {
+      context.streaming_session_id = active_streaming_session_id_;
+    }
+  }
+  // Interrupt latches record the publisher's live revision at signal time.
+  // A validation bundle that is cancelled by this latch may carry an older
+  // borrowed revision because validation intentionally runs against one
+  // immutable snapshot per pass.
+  const auto revision = current_authoritative_collision_world_revision();
+  if (collision_world_revision_is_set(revision)) {
+    context.borrowed_collision_world_revision = revision;
+  }
+  return context;
+}
+
+void ExecutionKernel::emit_interrupt_events(const InterruptIngestResult& result) {
+  for (const auto& event : result.events) {
+    auto event_type = interrupt_event_type_from_name(event.type);
+    if (!event_type) {
+      continue;
+    }
+    emit_event({*event_type,
+                sm_.status().execution_id,
+                clock_.now(),
+                {},
+                {},
+                std::nullopt,
+                event.details});
+  }
+}
+
+InterruptIngestResult ExecutionKernel::publish_fast_interrupt_signal(
+    const InterruptSignalUpdate& update) {
+  return publish_fast_interrupt_signals({update});
+}
+
+InterruptIngestResult ExecutionKernel::publish_supervisory_interrupt_signal(
+    const InterruptSignalUpdate& update) {
+  if (!interrupt_phase_from_state(sm_.status().state)) {
+    auto result = reject_interrupts_without_active_phase({update});
+    emit_interrupt_events(result);
+    return result;
+  }
+  auto result = interrupt_manager_.ingest(
+      update,
+      InterruptSourceClass::kLowRateSupervisory,
+      current_interrupt_context(),
+      clock_.now());
+  request_validation_cancel_from_interrupt(result);
+  if (result.latched) {
+    const auto prev_state = sm_.status().state;
+    if (prev_state != ExecutionState::kInterrupted) {
+      auto transition = sm_.try_transition(ExecutionState::kInterrupted);
+      if (transition.ok()) {
+        auto snapshot = get_execution_snapshot();
+        snapshot.timestamp_ns = clock_.now();
+        snapshot.state = ExecutionState::kInterrupted;
+        publish_execution_snapshot(std::move(snapshot));
+        emit_event({KernelEventType::kStateTransition,
+                    sm_.status().execution_id,
+                    clock_.now(),
+                    prev_state,
+                    ExecutionState::kInterrupted,
+                    std::nullopt,
+                    {{"reason", "interrupt_latched"}}});
+      }
+    }
+  }
+  emit_interrupt_events(result);
+  apply_latched_interrupt_preemption(result);
+  return result;
+}
+
+InterruptIngestResult ExecutionKernel::publish_fast_interrupt_signals(
+    const std::vector<InterruptSignalUpdate>& updates) {
+  if (!interrupt_phase_from_state(sm_.status().state)) {
+    auto result = reject_interrupts_without_active_phase(updates);
+    emit_interrupt_events(result);
+    return result;
+  }
+  auto result = interrupt_manager_.ingest_batch(
+      updates,
+      InterruptSourceClass::kFastExecutionRelevant,
+      current_interrupt_context(),
+      clock_.now());
+  request_validation_cancel_from_interrupt(result);
+  if (result.latched) {
+    const auto prev_state = sm_.status().state;
+    if (prev_state != ExecutionState::kInterrupted) {
+      auto transition = sm_.try_transition(ExecutionState::kInterrupted);
+      if (transition.ok()) {
+        auto snapshot = get_execution_snapshot();
+        snapshot.timestamp_ns = clock_.now();
+        snapshot.state = ExecutionState::kInterrupted;
+        publish_execution_snapshot(std::move(snapshot));
+        emit_event({KernelEventType::kStateTransition,
+                    sm_.status().execution_id,
+                    clock_.now(),
+                    prev_state,
+                    ExecutionState::kInterrupted,
+                    std::nullopt,
+                    {{"reason", "interrupt_latched"}}});
+      }
+    }
+  }
+  emit_interrupt_events(result);
+  apply_latched_interrupt_preemption(result);
+  return result;
+}
+
+std::optional<InterruptLatch> ExecutionKernel::get_active_interrupt_latch() const {
+  return interrupt_manager_.active_latch();
+}
+
+Result<InterruptIngestResult> ExecutionKernel::apply_interrupt_disposition(
+    const InterruptDisposition& disposition) {
+  auto result = interrupt_manager_.apply_disposition(disposition, clock_.now());
+  if (!result.ok()) {
+    return result;
+  }
+  emit_interrupt_events(result.value());
+  if (!interrupt_manager_.active_latch() &&
+      sm_.status().state == ExecutionState::kInterrupted) {
+    const auto prev_state = sm_.status().state;
+    auto transition = sm_.try_transition(ExecutionState::kInterventionRequired);
+    if (transition.ok()) {
+      auto snapshot = get_execution_snapshot();
+      snapshot.timestamp_ns = clock_.now();
+      snapshot.state = ExecutionState::kInterventionRequired;
+      publish_execution_snapshot(std::move(snapshot));
+      emit_event({KernelEventType::kStateTransition,
+                  sm_.status().execution_id,
+                  clock_.now(),
+                  prev_state,
+                  ExecutionState::kInterventionRequired,
+                  std::nullopt,
+                  {{"reason", "interrupt_disposition"}}});
+    }
+  }
+  return result;
 }
 
 void ExecutionKernel::publish_execution_snapshot(ExecutionSnapshot snapshot) {
@@ -821,19 +1376,38 @@ void ExecutionKernel::async_execute_worker(
 
     emit_event({KernelEventType::kValidationStarted, exec_id, clock_.now(), {}, {}, std::nullopt, {}});
 
-    const auto validation_revision_before =
-        context_.current_collision_world_revision();
     auto val_result = validate_trajectory(trajectory, request);
     const auto validation_revision_after =
-        context_.current_collision_world_revision();
+        current_authoritative_collision_world_revision();
     if (val_result.ok() &&
-        !same_collision_world_revision(validation_revision_before,
+        collision_world_revision_is_set(validation_revision_after) &&
+        !same_collision_world_revision(val_result.value(),
                                        validation_revision_after)) {
-      val_result = Result<void>::Err(collision_world_changed_error(
-          validation_revision_before, validation_revision_after,
+      val_result = Result<CollisionWorldRevision>::Err(collision_world_changed_error(
+          val_result.value(), validation_revision_after,
           "pre_execution_validation"));
     }
     if (!val_result.ok()) {
+      if (validation_cancelled_by_interrupt(val_result.error()) &&
+          sm_.status().state == ExecutionState::kInterrupted) {
+        emit_event({KernelEventType::kValidationFailed, exec_id, clock_.now(),
+                     {}, {}, std::nullopt,
+                     {{"reason", "validation cancelled by interrupt"}}});
+        emit_event({KernelEventType::kErrorRaised, exec_id, clock_.now(),
+                     {}, {}, val_result.error(), {}});
+        mark_active_interrupt_preemption_result(
+            InterruptPreemptionResult::kSucceeded);
+        auto interrupted_snapshot = get_execution_snapshot();
+        interrupted_snapshot.timestamp_ns = clock_.now();
+        interrupted_snapshot.execution_id = exec_id;
+        interrupted_snapshot.move_id = request.move_id;
+        interrupted_snapshot.state = ExecutionState::kInterrupted;
+        interrupted_snapshot.error = val_result.error();
+        publish_execution_snapshot(std::move(interrupted_snapshot));
+        execution_complete_.store(true);
+        completion_cv_.notify_all();
+        return;
+      }
       // Emit validation failed event BEFORE error raised
       emit_event({KernelEventType::kValidationFailed, exec_id, clock_.now(),
                    {}, {}, std::nullopt, {{"reason", "validation failed"}}});
@@ -922,11 +1496,12 @@ void ExecutionKernel::async_execute_worker(
 
     // Store in cache
     if (request.cache_mode != CacheMode::kDisable && !cache_hit &&
-        collision_world_revision_is_set(validation_revision_before)) {
+        val_result.ok() &&
+        collision_world_revision_is_set(val_result.value())) {
       // Chunk 2: tag every cache entry with the collision-world revision
-      // that validation actually used. The before/after equality check above
+      // that validation actually used. The post-validation equality check above
       // ensures a trajectory validated at revision N is never stored as N+1.
-      cache_.store(request.move_id, trajectory, validation_revision_before);
+      cache_.store(request.move_id, trajectory, val_result.value());
     }
 
     // Validating -> Executing
@@ -1051,6 +1626,17 @@ void ExecutionKernel::async_execute_worker(
           loop_state == ExecutionState::kInterventionRequired) {
         break;
       }
+      if (loop_state == ExecutionState::kInterrupted) {
+        if (auto latch = interrupt_manager_.active_latch();
+            latch &&
+            latch->preemption_action_requested ==
+                InterruptPreemptionAction::kPreemptTrajectory) {
+          stop_collision_monitoring();
+          execution_complete_.store(true);
+          completion_cv_.notify_all();
+          return;
+        }
+      }
 
       if (latest_backend_snapshot.state == ExecutionState::kPaused ||
           loop_state == ExecutionState::kPaused) {
@@ -1062,19 +1648,39 @@ void ExecutionKernel::async_execute_worker(
 
           auto resumed_trajectory =
               build_remaining_trajectory(active_trajectory, latest_backend_snapshot);
-          const auto resume_revision_before =
-              context_.current_collision_world_revision();
           auto resume_validation = validate_trajectory(resumed_trajectory, request);
           const auto resume_revision_after =
-              context_.current_collision_world_revision();
+              current_authoritative_collision_world_revision();
           if (resume_validation.ok() &&
-              !same_collision_world_revision(resume_revision_before,
+              collision_world_revision_is_set(resume_revision_after) &&
+              !same_collision_world_revision(resume_validation.value(),
                                              resume_revision_after)) {
-            resume_validation = Result<void>::Err(collision_world_changed_error(
-                resume_revision_before, resume_revision_after,
-                "resume_validation"));
+            resume_validation = Result<CollisionWorldRevision>::Err(
+                collision_world_changed_error(
+                    resume_validation.value(), resume_revision_after,
+                    "resume_validation"));
           }
           if (!resume_validation.ok()) {
+            if (validation_cancelled_by_interrupt(resume_validation.error()) &&
+                sm_.status().state == ExecutionState::kInterrupted) {
+              emit_event({KernelEventType::kValidationFailed, exec_id, clock_.now(),
+                          {}, {}, std::nullopt,
+                          {{"reason", "resume validation cancelled by interrupt"}}});
+              emit_event({KernelEventType::kErrorRaised, exec_id, clock_.now(),
+                          {}, {}, resume_validation.error(), {}});
+              mark_active_interrupt_preemption_result(
+                  InterruptPreemptionResult::kSucceeded);
+              auto interrupted_snapshot = latest_backend_snapshot;
+              interrupted_snapshot.timestamp_ns = clock_.now();
+              interrupted_snapshot.execution_id = exec_id;
+              interrupted_snapshot.move_id = request.move_id;
+              interrupted_snapshot.state = ExecutionState::kInterrupted;
+              interrupted_snapshot.error = resume_validation.error();
+              publish_execution_snapshot(std::move(interrupted_snapshot));
+              execution_complete_.store(true);
+              completion_cv_.notify_all();
+              return;
+            }
             emit_event({KernelEventType::kValidationFailed, exec_id, clock_.now(),
                         {}, {}, std::nullopt,
                         {{"reason", "resume validation failed"}}});
@@ -1388,15 +1994,13 @@ Result<uint64_t> ExecutionKernel::execute(const ExecuteRequestDTO& request) {
 
   PreparedExecutionStart prepared;
   if (request.cache_mode != CacheMode::kDisable) {
-    // Chunk 2: gate cache hits on the active collision-world revision.
-    // A cached trajectory validated under revision N MUST NOT be served
-    // when the scene is at revision N+1. lookup_with_revision removes the
-    // stale entry on mismatch so the next lookup is unambiguous.
-    // Adapters that do not yet implement current_collision_world_revision
-    // return the default-constructed revision; lookup_with_revision then
-    // declines to serve a hit at all, which is the documented sentinel
-    // for "no authoritative revision available".
-    const auto active_revision = context_.current_collision_world_revision();
+    // Gate cache hits on the authoritative snapshot revision, not on the
+    // planner context. A cached trajectory validated under revision N MUST NOT
+    // be served when the collision-world snapshot is at revision N+1.
+    // A default revision means the authoritative publisher is unavailable; the
+    // cache then declines to serve a hit and validation fails closed later.
+    const auto active_revision =
+        current_authoritative_collision_world_revision();
     auto cached =
         cache_.lookup_with_revision(request.move_id, active_revision);
     if (cached.has_value()) {
@@ -1596,6 +2200,13 @@ ResetResultDTO ExecutionKernel::reset() {
   std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
 
   auto prev_state = sm_.status().state;
+  cancel_active_streaming_target_validation("streaming_session_reset");
+  if (get_active_interrupt_latch()) {
+    auto clear = interrupt_manager_.clear_active_latch("reset", clock_.now());
+    if (clear.ok()) {
+      emit_interrupt_events(clear.value());
+    }
+  }
 
   // ADR-0016: reset() is the HARD-cancel path (max-decel cancel via
   // backend.reset(), no soft-stop trajectory). Clear streaming session
@@ -1927,11 +2538,11 @@ Result<void> ExecutionKernel::collision_check_tick() {
     auto check = context_.collision_check(req);
 
     if (check.in_collision) {
-      // Emit collision detected event
       KernelEvent collision_event;
       collision_event.type = KernelEventType::kCollisionDetected;
       collision_event.execution_id = sm_.status().execution_id;
       collision_event.timestamp_ns = clock_.now();
+      collision_event.details["surface"] = "observed_runtime_monitor";
       collision_event.details["contact_a"] = check.contact_body_a.value_or("");
       collision_event.details["contact_b"] = check.contact_body_b.value_or("");
       emit_event(collision_event);
@@ -1939,22 +2550,16 @@ Result<void> ExecutionKernel::collision_check_tick() {
         std::lock_guard<std::mutex> collision_metrics_lock(metrics_mutex_);
         metrics_.collision_detections++;
       }
-    }
-
-    auto result = collision_policy_.handle_collision(check);
-    auto new_state = sm_.status().state;
-    if (new_state != prev_state) {
-      auto snapshot = get_execution_snapshot();
-      snapshot.timestamp_ns = clock_.now();
-      snapshot.state = new_state;
-      publish_execution_snapshot(std::move(snapshot));
-      emit_event({KernelEventType::kStateTransition, sm_.status().execution_id, clock_.now(),
-                  prev_state, new_state, std::nullopt, {}});
-      if (new_state == ExecutionState::kStopped) {
-        stop_collision_monitoring();
+      cache_.invalidate_all();
+      auto interrupt = publish_runtime_collision_fault_interrupt(check);
+      if (interrupt.rejected) {
+        return Result<void>::Err(
+            ErrorDTO{kErrorInvalidRequest,
+                     "Runtime collision interrupt signal rejected",
+                     {{"reason", interrupt.reason}}});
       }
     }
-    return result;
+    return Result<void>::Ok();
   } catch (const std::exception& e) {
     return Result<void>::Err(
         ErrorDTO{kErrorInternalError,
@@ -2026,7 +2631,7 @@ Result<MotionSpecDTO> ExecutionKernel::resolve_motion_spec(
   return Result<MotionSpecDTO>::Ok(request.motion);
 }
 
-Result<void> ExecutionKernel::validate_trajectory(
+Result<CollisionWorldRevision> ExecutionKernel::validate_trajectory(
     const TrajectoryDTO& trajectory, const ExecuteRequestDTO& request) {
   // Start-state gate
   auto current_state = context_.get_current_state();
@@ -2034,7 +2639,7 @@ Result<void> ExecutionKernel::validate_trajectory(
     const auto start_match = cached_trajectory_matches_current_start(
         trajectory, current_state, request.tolerances.joint_position_tol_rad);
     if (!start_match.compatible) {
-      return Result<void>::Err(
+      return Result<CollisionWorldRevision>::Err(
           ErrorDTO{kErrorStartStateMismatch,
                    "Start state mismatch",
                    {{"reason", start_match.reason}}});
@@ -2044,88 +2649,447 @@ Result<void> ExecutionKernel::validate_trajectory(
   std::optional<CollisionPolicySnapshot> snapshot;
   PoseSourceRetryConfig retry;
   std::int64_t per_state_timeout_ns = 0;
+  ICollisionWorldSnapshotPublisher* snapshot_publisher = nullptr;
+  std::vector<std::shared_ptr<ICollisionQueryEngine>> validation_engines;
   {
     std::scoped_lock lock(coordinator_mutex_);
     snapshot = coordinator_policy_snapshot_;
     retry = coordinator_retry_config_;
     per_state_timeout_ns = coordinator_per_state_timeout_ns_;
+    snapshot_publisher = collision_snapshot_publisher_;
+    validation_engines = collision_validation_engines_;
   }
 
   // Full non-collision trajectory validation (including TCP speed limit per
-  // spec 230 §3.3). When the normalized collision coordinator is installed it
-  // owns collision authority, so the backend validator must not run its legacy
+  // spec 230 §3.3). Phase 3A makes the manyforge_collision pipeline the only
+  // collision authority, so the backend validator must not run its legacy
   // collision sweep first and reject contacts the active policy would allow.
   ValidationOptionsDTO opts;
   opts.tcp_frame = request.tcp_frame;
   opts.base_frame = request.base_frame;
   opts.max_tcp_linear_speed_mps =
       request.speed_profile.max_tcp_linear_speed_mps.value_or(0.0);
-  opts.run_collision_checks = !snapshot.has_value();
+  opts.run_collision_checks = false;
   auto val_result = context_.validate_trajectory(trajectory, opts);
   if (!val_result.valid) {
     if (val_result.error.has_value()) {
-      return Result<void>::Err(std::move(*val_result.error));
+      return Result<CollisionWorldRevision>::Err(std::move(*val_result.error));
     }
-    return Result<void>::Err(ErrorCode::kValidationCollision);
+    return Result<CollisionWorldRevision>::Err(ErrorCode::kValidationCollision);
   }
 
-  // Pre-execution collision check.
-  //
-  // Chunk 5 of the collision-ownership plan: when a CollisionPolicySnapshot
-  // is installed, route through the CollisionValidationCoordinator. The
-  // coordinator validates every waypoint (not just the start state), owns
-  // trajectory-scoped support-contact state, and produces a normalized
-  // CollisionDecision. Without an installed snapshot the kernel keeps the
-  // legacy single-state path for backward compatibility.
-  if (snapshot) {
-    CollisionValidationPassConfig cfg;
-    cfg.policy_snapshot = *snapshot;
-    cfg.pose_source_retry = retry;
-    cfg.per_state_timeout_ns = per_state_timeout_ns;
-    CollisionValidationCoordinator coord(std::move(cfg));
-    auto bundle = coord.validate_trajectory(context_, trajectory);
-    if (bundle.decision.accepted) {
-      return Result<void>::Ok();
+  if (snapshot_publisher == nullptr) {
+    return Result<CollisionWorldRevision>::Err(authoritative_collision_validation_config_error(
+        "missing_collision_world_snapshot_publisher"));
+  }
+  if (validation_engines.empty()) {
+    return Result<CollisionWorldRevision>::Err(authoritative_collision_validation_config_error(
+        "missing_collision_query_engines"));
+  }
+
+  CollisionWorldSnapshotPtr world_snapshot;
+  try {
+    world_snapshot = snapshot_publisher->snapshot();
+  } catch (const std::exception& e) {
+    return Result<CollisionWorldRevision>::Err(authoritative_collision_validation_config_error(
+        "snapshot_publisher_exception",
+        {{"exception", e.what()}}));
+  } catch (...) {
+    return Result<CollisionWorldRevision>::Err(authoritative_collision_validation_config_error(
+        "snapshot_publisher_exception",
+        {{"exception", "unknown"}}));
+  }
+  if (!world_snapshot) {
+    return Result<CollisionWorldRevision>::Err(authoritative_collision_validation_config_error(
+        "snapshot_unavailable"));
+  }
+
+  try {
+    if (auto publisher_policy =
+            snapshot_publisher->collision_policy_snapshot()) {
+      snapshot = std::move(publisher_policy);
     }
-    if (bundle.scene_changed_during_validation) {
-      return Result<void>::Err(
-          ErrorDTO{kErrorSceneChangedDuringValidation,
-                   "Collision-world revision changed during validation",
-                   {{"borrowed_revision_id",
-                     std::to_string(bundle.borrowed_world_revision.revision_id)}}});
+  } catch (const std::exception& e) {
+    return Result<CollisionWorldRevision>::Err(authoritative_collision_validation_config_error(
+        "policy_publisher_exception",
+        {{"exception", e.what()}}));
+  } catch (...) {
+    return Result<CollisionWorldRevision>::Err(authoritative_collision_validation_config_error(
+        "policy_publisher_exception",
+        {{"exception", "unknown"}}));
+  }
+  if (!snapshot) {
+    return Result<CollisionWorldRevision>::Err(authoritative_collision_validation_config_error(
+        "missing_collision_policy_snapshot"));
+  }
+
+  std::vector<ICollisionQueryEngine*> engine_ptrs;
+  engine_ptrs.reserve(validation_engines.size());
+  for (const auto& engine : validation_engines) {
+    if (engine) {
+      engine_ptrs.push_back(engine.get());
     }
-    std::map<std::string, std::string> details;
-    if (bundle.decision.first_failing_waypoint) {
-      details["first_failing_waypoint"] =
-          std::to_string(*bundle.decision.first_failing_waypoint);
+  }
+  if (engine_ptrs.empty()) {
+    return Result<CollisionWorldRevision>::Err(authoritative_collision_validation_config_error(
+        "missing_collision_query_engines"));
+  }
+
+  CollisionValidationPassConfig cfg;
+  cfg.policy_snapshot = *snapshot;
+  cfg.pose_source_retry = retry;
+  cfg.per_state_timeout_ns = per_state_timeout_ns;
+  cfg.surface = CollisionSurface::kPreExecutionValidation;
+
+  ParallelCollisionValidationWorkerPool::Config pool_cfg;
+  pool_cfg.pass_config = std::move(cfg);
+  pool_cfg.worker_count = config_.validation_collision_workers;
+  pool_cfg.min_waypoints_for_parallel =
+      config_.validation_collision_min_waypoints_for_parallel;
+  auto cancel = install_validation_cancel_token();
+  struct ValidationCancelTokenGuard {
+    ExecutionKernel* kernel = nullptr;
+    std::shared_ptr<CollisionCancellationToken> token;
+    ~ValidationCancelTokenGuard() {
+      if (kernel) {
+        kernel->clear_validation_cancel_token(token);
+      }
     }
-    if (bundle.decision.first_failing_time_ns) {
-      details["first_failing_time_ns"] =
-          std::to_string(*bundle.decision.first_failing_time_ns);
-    }
-    if (bundle.decision.action ==
-        CollisionDecisionAction::kInconclusive) {
-      return Result<void>::Err(
-          ErrorDTO{kErrorValidationCollision,
-                   "Collision validation inconclusive",
-                   std::move(details)});
-    }
-    return Result<void>::Err(
-        ErrorDTO{kErrorValidationCollision,
-                 "Collision validation rejected trajectory",
+  } cancel_guard{this, cancel};
+  ParallelCollisionValidationWorkerPool pool(std::move(pool_cfg));
+  auto bundle =
+      pool.validate_trajectory(*world_snapshot, engine_ptrs, trajectory, *cancel);
+  if (bundle.decision.accepted) {
+    return Result<CollisionWorldRevision>::Ok(bundle.borrowed_world_revision);
+  }
+  std::map<std::string, std::string> details;
+  if (bundle.decision.first_failing_waypoint) {
+    details["first_failing_waypoint"] =
+        std::to_string(*bundle.decision.first_failing_waypoint);
+  }
+  if (bundle.decision.first_failing_time_ns) {
+    details["first_failing_time_ns"] =
+        std::to_string(*bundle.decision.first_failing_time_ns);
+  }
+  details["collision_world_revision_id"] =
+      std::to_string(bundle.borrowed_world_revision.revision_id);
+  details["collision_world_content_hash"] =
+      bundle.borrowed_world_revision.content_hash;
+  details["workers_used"] =
+      std::to_string(pool.last_telemetry().workers_actually_used);
+  if (!pool.last_telemetry().fallback_reason.empty()) {
+    details["parallel_fallback_reason"] = pool.last_telemetry().fallback_reason;
+  }
+  if (bundle.scene_changed_during_validation) {
+    return Result<CollisionWorldRevision>::Err(
+        ErrorDTO{kErrorSceneChangedDuringValidation,
+                 "Collision-world revision changed during validation",
                  std::move(details)});
   }
+  if (bundle.cancelled) {
+    if (bundle.cancelled_at_waypoint_index) {
+      details["cancelled_at_waypoint_index"] =
+          std::to_string(*bundle.cancelled_at_waypoint_index);
+    }
+    if (bundle.cancellation_reason) {
+      details["cancellation_reason"] = *bundle.cancellation_reason;
+    }
+    details["reason"] = "collision_validation_cancelled";
+    return Result<CollisionWorldRevision>::Err(
+        ErrorDTO{kErrorValidationCollision,
+                 "Collision validation cancelled by interrupt",
+                 std::move(details)});
+  }
+  if (bundle.decision.action == CollisionDecisionAction::kInconclusive) {
+    return Result<CollisionWorldRevision>::Err(
+        ErrorDTO{kErrorValidationCollision,
+                 "Collision validation inconclusive",
+                 std::move(details)});
+  }
+  return Result<CollisionWorldRevision>::Err(
+      ErrorDTO{kErrorValidationCollision,
+               "Collision validation rejected trajectory",
+               std::move(details)});
+}
 
-  CollisionCheckRequestDTO collision_req;
-  collision_req.robot_state = current_state;
-  auto collision_result = context_.collision_check(collision_req);
-  return collision_policy_.pre_execute_check(collision_result);
+Result<CollisionWorldRevision>
+ExecutionKernel::validate_streaming_target_collision(
+    const StreamingSessionConfigDTO& active_config,
+    const StreamingTargetDTO& resolved_target,
+    std::uint64_t validation_sequence,
+    std::uint64_t session_id,
+    std::uint64_t source_sequence) {
+  const auto still_latest = [this, validation_sequence]() {
+    return validation_sequence == streaming_target_validation_sequence_.load(
+                                      std::memory_order_acquire);
+  };
+
+  if (!still_latest()) {
+    return Result<CollisionWorldRevision>::Err(
+        ErrorDTO{kErrorInvalidRequest,
+                 "streaming target superseded by a newer target",
+                 {{"reason_code", "superseded_by_newer_streaming_target"},
+                  {"phase", "streaming_target_validation"},
+                  {"validation_sequence", std::to_string(validation_sequence)},
+                  {"current_validation_sequence",
+                   std::to_string(streaming_target_validation_sequence_.load(
+                       std::memory_order_acquire))}}});
+  }
+
+  if (resolved_target.kind != StreamingInputMode::kJoint ||
+      resolved_target.joint_positions_rad.size() !=
+          active_config.joint_names.size()) {
+    return Result<CollisionWorldRevision>::Err(
+        ErrorDTO{kErrorInvalidRequest,
+                 "streaming target collision validation requires a full "
+                 "session-order joint target",
+                 {{"reason_code", "malformed_frame"},
+                  {"phase", "streaming_target_validation"},
+                  {"session_id", std::to_string(session_id)}}});
+  }
+
+  std::optional<CollisionPolicySnapshot> policy_snapshot;
+  ICollisionWorldSnapshotPublisher* snapshot_publisher = nullptr;
+  std::vector<std::shared_ptr<ICollisionQueryEngine>> validation_engines;
+  {
+    std::scoped_lock lock(coordinator_mutex_);
+    policy_snapshot = coordinator_policy_snapshot_;
+    snapshot_publisher = collision_snapshot_publisher_;
+    validation_engines = collision_validation_engines_;
+  }
+
+  if (snapshot_publisher == nullptr) {
+    return Result<CollisionWorldRevision>::Err(
+        authoritative_collision_validation_config_error(
+            "missing_collision_world_snapshot_publisher",
+            {{"reason_code", "collision_pipeline_not_configured"}},
+            "streaming_target_validation"));
+  }
+  if (validation_engines.empty()) {
+    return Result<CollisionWorldRevision>::Err(
+        authoritative_collision_validation_config_error(
+            "missing_collision_query_engines",
+            {{"reason_code", "collision_pipeline_not_configured"}},
+            "streaming_target_validation"));
+  }
+
+  CollisionWorldSnapshotPtr world_snapshot;
+  try {
+    world_snapshot = snapshot_publisher->snapshot();
+  } catch (const std::exception& e) {
+    return Result<CollisionWorldRevision>::Err(
+        authoritative_collision_validation_config_error(
+            "snapshot_publisher_exception",
+            {{"reason_code", "collision_pipeline_not_configured"},
+             {"exception", e.what()}},
+            "streaming_target_validation"));
+  } catch (...) {
+    return Result<CollisionWorldRevision>::Err(
+        authoritative_collision_validation_config_error(
+            "snapshot_publisher_exception",
+            {{"reason_code", "collision_pipeline_not_configured"},
+             {"exception", "unknown"}},
+            "streaming_target_validation"));
+  }
+  if (!world_snapshot) {
+    return Result<CollisionWorldRevision>::Err(
+        authoritative_collision_validation_config_error(
+            "snapshot_unavailable",
+            {{"reason_code", "collision_pipeline_not_configured"}},
+            "streaming_target_validation"));
+  }
+
+  try {
+    if (auto publisher_policy =
+            snapshot_publisher->collision_policy_snapshot()) {
+      policy_snapshot = std::move(publisher_policy);
+    }
+  } catch (const std::exception& e) {
+    return Result<CollisionWorldRevision>::Err(
+        authoritative_collision_validation_config_error(
+            "policy_publisher_exception",
+            {{"reason_code", "collision_pipeline_not_configured"},
+             {"exception", e.what()}},
+            "streaming_target_validation"));
+  } catch (...) {
+    return Result<CollisionWorldRevision>::Err(
+        authoritative_collision_validation_config_error(
+            "policy_publisher_exception",
+            {{"reason_code", "collision_pipeline_not_configured"},
+             {"exception", "unknown"}},
+            "streaming_target_validation"));
+  }
+  if (!policy_snapshot) {
+    return Result<CollisionWorldRevision>::Err(
+        authoritative_collision_validation_config_error(
+            "missing_collision_policy_snapshot",
+            {{"reason_code", "collision_pipeline_not_configured"}},
+            "streaming_target_validation"));
+  }
+
+  ICollisionQueryEngine* engine = nullptr;
+  for (const auto& candidate : validation_engines) {
+    if (candidate) {
+      engine = candidate.get();
+      break;
+    }
+  }
+  if (engine == nullptr) {
+    return Result<CollisionWorldRevision>::Err(
+        authoritative_collision_validation_config_error(
+            "missing_collision_query_engines",
+            {{"reason_code", "collision_pipeline_not_configured"}},
+            "streaming_target_validation"));
+  }
+
+  TrajectoryDTO one_state;
+  one_state.joint_names = active_config.joint_names;
+  one_state.waypoints.push_back(TrajectoryWaypointDTO{
+      resolved_target.min_time_from_start_s,
+      resolved_target.joint_positions_rad,
+      {},
+      {}});
+
+  CollisionValidationPassConfig cfg;
+  cfg.policy_snapshot = *policy_snapshot;
+  cfg.require_pose_source_borrow = false;
+  cfg.surface = CollisionSurface::kStreamingTargetValidation;
+  cfg.per_state_timeout_ns = static_cast<std::int64_t>(
+      config_.streaming_collision_timeout_s * 1'000'000'000.0);
+
+  auto cancel = install_streaming_target_cancel_token(validation_sequence);
+  struct StreamingCancelTokenGuard {
+    ExecutionKernel* kernel = nullptr;
+    std::shared_ptr<CollisionCancellationToken> token;
+    ~StreamingCancelTokenGuard() {
+      if (kernel) {
+        kernel->clear_streaming_target_cancel_token(token);
+      }
+    }
+  } cancel_guard{this, cancel};
+
+  CollisionValidationDecisionBundle bundle;
+  std::chrono::steady_clock::time_point started;
+  {
+    std::unique_lock<std::mutex> validation_lock(
+        streaming_collision_validation_mutex_);
+    if (!still_latest()) {
+      cancel->request_cancel("superseded_by_newer_streaming_target");
+    }
+    if (cancel->is_cancel_requested()) {
+      return Result<CollisionWorldRevision>::Err(
+          ErrorDTO{kErrorInvalidRequest,
+                   "streaming target superseded by a newer target",
+                   {{"reason_code", "superseded_by_newer_streaming_target"},
+                    {"phase", "streaming_target_validation"},
+                    {"session_id", std::to_string(session_id)},
+                    {"source_sequence", std::to_string(source_sequence)}}});
+    }
+    CollisionValidationCoordinator coord(std::move(cfg));
+    started = std::chrono::steady_clock::now();
+    try {
+      bundle = coord.validate_trajectory(*world_snapshot, *engine, one_state,
+                                         *cancel);
+    } catch (const std::exception& e) {
+      return Result<CollisionWorldRevision>::Err(
+          ErrorDTO{kErrorValidationCollision,
+                   "streaming collision validation engine threw",
+                   {{"reason_code", "streaming_collision_engine_exception"},
+                    {"phase", "streaming_target_validation"},
+                    {"exception", e.what()},
+                    {"session_id", std::to_string(session_id)},
+                    {"source_sequence", std::to_string(source_sequence)},
+                    {"collision_world_revision_id",
+                     std::to_string(world_snapshot->revision.revision_id)}}});
+    } catch (...) {
+      return Result<CollisionWorldRevision>::Err(
+          ErrorDTO{kErrorValidationCollision,
+                   "streaming collision validation engine threw",
+                   {{"reason_code", "streaming_collision_engine_exception"},
+                    {"phase", "streaming_target_validation"},
+                    {"exception", "unknown"},
+                    {"session_id", std::to_string(session_id)},
+                    {"source_sequence", std::to_string(source_sequence)},
+                    {"collision_world_revision_id",
+                     std::to_string(world_snapshot->revision.revision_id)}}});
+    }
+  }
+  const auto elapsed_ns =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now() - started)
+          .count();
+
+  if (!still_latest()) {
+    cancel->request_cancel("superseded_by_newer_streaming_target");
+    return Result<CollisionWorldRevision>::Err(
+        ErrorDTO{kErrorInvalidRequest,
+                 "streaming target superseded by a newer target",
+                 {{"reason_code", "superseded_by_newer_streaming_target"},
+                  {"phase", "streaming_target_validation"},
+                  {"session_id", std::to_string(session_id)},
+                  {"source_sequence", std::to_string(source_sequence)}}});
+  }
+
+  const auto budget_ns = static_cast<std::int64_t>(
+      config_.streaming_collision_timeout_s * 1'000'000'000.0);
+  if (elapsed_ns > budget_ns) {
+    return Result<CollisionWorldRevision>::Err(
+        ErrorDTO{kErrorValidationCollision,
+                 "streaming collision validation exceeded per-frame budget",
+                 {{"reason_code", "streaming_collision_timeout"},
+                  {"phase", "streaming_target_validation"},
+                  {"timeout_ns", std::to_string(budget_ns)},
+                  {"elapsed_ns", std::to_string(elapsed_ns)},
+                  {"session_id", std::to_string(session_id)},
+                  {"source_sequence", std::to_string(source_sequence)},
+                  {"collision_world_revision_id",
+                   std::to_string(world_snapshot->revision.revision_id)}}});
+  }
+
+  if (bundle.decision.accepted) {
+    return Result<CollisionWorldRevision>::Ok(bundle.borrowed_world_revision);
+  }
+
+  std::map<std::string, std::string> details{
+      {"reason_code", streaming_collision_reason_code(bundle)},
+      {"phase", "streaming_target_validation"},
+      {"session_id", std::to_string(session_id)},
+      {"source_sequence", std::to_string(source_sequence)},
+      {"collision_world_revision_id",
+       std::to_string(bundle.borrowed_world_revision.revision_id)},
+      {"collision_world_content_hash",
+       bundle.borrowed_world_revision.content_hash}};
+  if (bundle.decision.first_failing_waypoint) {
+    details["first_failing_waypoint"] =
+        std::to_string(*bundle.decision.first_failing_waypoint);
+  }
+  if (bundle.cancelled_at_waypoint_index) {
+    details["cancelled_at_waypoint_index"] =
+        std::to_string(*bundle.cancelled_at_waypoint_index);
+  }
+  if (bundle.cancellation_reason) {
+    details["cancellation_reason"] = *bundle.cancellation_reason;
+  }
+  return Result<CollisionWorldRevision>::Err(
+      ErrorDTO{kErrorValidationCollision,
+               bundle.cancelled
+                   ? "streaming collision validation cancelled"
+                   : "streaming target rejected by collision validation",
+               std::move(details)});
 }
 
 void ExecutionKernel::set_collision_validation_policy_snapshot(
     std::optional<CollisionPolicySnapshot> snapshot) {
   std::scoped_lock lock(coordinator_mutex_);
   coordinator_policy_snapshot_ = std::move(snapshot);
+}
+
+void ExecutionKernel::set_collision_validation_pipeline(
+    ICollisionWorldSnapshotPublisher& publisher,
+    std::vector<std::shared_ptr<ICollisionQueryEngine>> engines) {
+  std::scoped_lock lock(coordinator_mutex_);
+  collision_snapshot_publisher_ = &publisher;
+  collision_validation_engines_ = std::move(engines);
 }
 
 void ExecutionKernel::set_collision_validation_retry_config(
@@ -2414,6 +3378,14 @@ StreamingPushResultDTO ExecutionKernel::push_streaming_target(
     backend_session_id = active_backend_session_id_;
     session_generation = active_streaming_generation_;
   }
+  const auto validation_sequence =
+      streaming_target_validation_sequence_.fetch_add(
+          1, std::memory_order_acq_rel) +
+      1;
+  const auto streaming_target_is_latest = [this, validation_sequence]() {
+    return validation_sequence == streaming_target_validation_sequence_.load(
+                                      std::memory_order_acquire);
+  };
 
   auto reject_malformed_frame =
       [&](const std::string& message,
@@ -2435,6 +3407,30 @@ StreamingPushResultDTO ExecutionKernel::push_streaming_target(
                      {"source_sequence",
                       std::to_string(target.source_sequence)},
                      {"kind", "malformed_frame"}}});
+        return result;
+      };
+
+  auto reject_streaming_collision =
+      [&](ErrorDTO error,
+          std::map<std::string, std::string> event_details = {}) {
+        event_details.emplace("session_id", std::to_string(session_id));
+        event_details.emplace("source_sequence",
+                              std::to_string(target.source_sequence));
+        event_details.emplace("kind", "streaming_collision_validation");
+        if (auto it = error.details.find("reason_code");
+            it != error.details.end()) {
+          event_details.emplace("reason_code", it->second);
+        }
+        result.accepted = false;
+        result.backend_sequence = 0;
+        result.error = std::move(error);
+        emit_event({KernelEventType::kStreamingTargetRejected,
+                    0,
+                    clock_.now(),
+                    {},
+                    {},
+                    result.error,
+                    std::move(event_details)});
         return result;
       };
 
@@ -2831,6 +3827,21 @@ StreamingPushResultDTO ExecutionKernel::push_streaming_target(
     }
   }
 
+  if (!streaming_target_is_latest()) {
+    return reject_streaming_collision(
+        ErrorDTO{kErrorInvalidRequest,
+                 "streaming target superseded by a newer target",
+                 {{"reason_code", "superseded_by_newer_streaming_target"},
+                  {"phase", "streaming_target_validation"}}});
+  }
+
+  auto collision_validation = validate_streaming_target_collision(
+      active_config, resolved_target, validation_sequence, session_id,
+      target.source_sequence);
+  if (!collision_validation.ok()) {
+    return reject_streaming_collision(collision_validation.error());
+  }
+
   // Forward to backend using the BACKEND's session_id (assigned at begin
   // time), not the kernel's. Kernel and backend counters are independent;
   // mapping must use the backend's view.
@@ -2981,6 +3992,7 @@ StreamingSessionEndResultDTO ExecutionKernel::end_streaming_session_unlocked(
     }
     backend_session_id = active_backend_session_id_;
   }
+  cancel_active_streaming_target_validation("streaming_session_ending");
 
   // Move through Stopping during the backend soft-stop. The backend's
   // soft-stop trajectory still has to play out; we report Stopping until

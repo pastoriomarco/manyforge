@@ -65,6 +65,7 @@ def test_collision_engine_status_enum():
         "kTimeout",
         "kUnsupportedGeometry",
         "kDiagnosticIncomplete",
+        "kCancelled",
         "kEngineError",
     ):
         assert getattr(e, name) is not None
@@ -85,6 +86,19 @@ def test_collision_decision_severity_enum():
 def test_collision_decision_action_enum():
     e = manyforge_core_py.CollisionDecisionAction
     for name in ("kDispatch", "kReject", "kWarnOnly", "kInconclusive"):
+        assert getattr(e, name) is not None
+
+
+def test_collision_failure_kind_enum():
+    e = manyforge_core_py.CollisionFailureKind
+    for name in (
+        "kBlockingCollision",
+        "kSupportContactViolation",
+        "kDiagnosticIncomplete",
+        "kEngineError",
+        "kCancelled",
+        "kSceneChangedDuringValidation",
+    ):
         assert getattr(e, name) is not None
 
 
@@ -296,6 +310,12 @@ def test_collision_geometry_descriptor_default_and_writable():
     assert d.body_id == ""
     assert d.owner_kind == manyforge_core_py.CollisionOwnerKind.kFixture
     assert d.geometry_kind == manyforge_core_py.CollisionGeometryKind.kBox
+    assert d.box_dimensions_m is None
+    assert d.sphere_radius_m is None
+    assert d.cylinder_radius_m is None
+    assert d.cylinder_height_m is None
+    assert d.capsule_radius_m is None
+    assert d.capsule_height_m is None
     assert d.source_uri is None
     assert d.source_hash is None
     assert d.triangle_count is None
@@ -306,6 +326,12 @@ def test_collision_geometry_descriptor_default_and_writable():
     d.body_id = "object/cheese_box/shape/0"
     d.owner_kind = manyforge_core_py.CollisionOwnerKind.kDetachedObject
     d.geometry_kind = manyforge_core_py.CollisionGeometryKind.kConvexMesh
+    d.box_dimensions_m = manyforge_core_py.Vector3DTO(x_m=0.1, y_m=0.2, z_m=0.3)
+    d.sphere_radius_m = 0.05
+    d.cylinder_radius_m = 0.04
+    d.cylinder_height_m = 0.2
+    d.capsule_radius_m = 0.03
+    d.capsule_height_m = 0.4
     d.source_uri = "file:///tmp/cheese.obj"
     d.source_hash = "sha256:0123"
     d.quality_labels = ["convex", "watertight"]
@@ -316,6 +342,12 @@ def test_collision_geometry_descriptor_default_and_writable():
     assert d.body_id == "object/cheese_box/shape/0"
     assert d.owner_kind == manyforge_core_py.CollisionOwnerKind.kDetachedObject
     assert d.geometry_kind == manyforge_core_py.CollisionGeometryKind.kConvexMesh
+    assert d.box_dimensions_m.x_m == 0.1
+    assert d.sphere_radius_m == 0.05
+    assert d.cylinder_radius_m == 0.04
+    assert d.cylinder_height_m == 0.2
+    assert d.capsule_radius_m == 0.03
+    assert d.capsule_height_m == 0.4
     assert d.source_uri == "file:///tmp/cheese.obj"
     assert d.source_hash == "sha256:0123"
     assert d.quality_labels == ["convex", "watertight"]
@@ -410,6 +442,7 @@ def test_collision_result_default():
     assert r.min_clearance_pair is None
     assert r.normalized_pairs_classified == []
     assert r.policy_revision_used is None
+    assert r.raw_diagnostics == {}
 
 
 def test_collision_result_round_trip():
@@ -442,6 +475,7 @@ def test_collision_result_round_trip():
     classified.is_first_failure = True
     r.normalized_pairs_classified = [classified]
     r.policy_revision_used = "12"
+    r.raw_diagnostics = {"snapshot_sync_error": "unsupported mesh"}
     # Chunk 1: distance fields stay null even on a populated result.
     assert r.min_clearance_m is None
     assert r.min_clearance_pair is None
@@ -455,6 +489,7 @@ def test_collision_result_round_trip():
     assert r.query_duration_ns == 1_234_567
     assert r.normalized_pairs_classified[0].is_first_failure is True
     assert r.policy_revision_used == "12"
+    assert r.raw_diagnostics == {"snapshot_sync_error": "unsupported mesh"}
 
 
 # ---------------------------------------------------------------------------
@@ -492,3 +527,222 @@ def test_collision_decision_round_trip():
     assert d.action == manyforge_core_py.CollisionDecisionAction.kReject
     assert d.collision_world_revision.revision_id == 9
     assert d.failure_archive_id == "archive-001"
+
+
+# ---------------------------------------------------------------------------
+# CollisionFailureArchiveEntry
+# ---------------------------------------------------------------------------
+
+
+def test_collision_failure_archive_entry_default():
+    e = manyforge_core_py.CollisionFailureArchiveEntry()
+    assert e.entry_id == ""
+    assert e.emitted_at_ns == 0
+    assert e.engine_id == ""
+    assert e.engine_version == ""
+    assert e.collision_world_revision.revision_id == 0
+    assert e.policy_revision is None
+    assert e.failure_kind == manyforge_core_py.CollisionFailureKind.kBlockingCollision
+    assert e.decision_action == manyforge_core_py.CollisionDecisionAction.kInconclusive
+    assert e.decision_severity == manyforge_core_py.CollisionDecisionSeverity.kBlock
+    assert e.normalized_pairs == []
+    assert e.first_failing_waypoint is None
+    assert e.first_failing_time_ns is None
+    assert e.trajectory_waypoint_count == 0
+    assert e.query_duration_ns is None
+    assert e.worker_count_actually_used == 1
+    assert e.fallback_reason == ""
+    assert e.raw_diagnostics == {}
+    assert e.correlation_id is None
+
+
+def test_collision_failure_archive_entry_round_trip():
+    e = manyforge_core_py.CollisionFailureArchiveEntry()
+    e.entry_id = "failure-001"
+    e.emitted_at_ns = 1_700_000_000_000_000_002
+    e.engine_id = "manyforge_collision/ur5_gripper"
+    e.engine_version = "v1"
+    e.collision_world_revision = manyforge_core_py.CollisionWorldRevision(
+        revision_id=12, content_hash="world-hash"
+    )
+    e.policy_revision = "policy-7"
+    e.failure_kind = manyforge_core_py.CollisionFailureKind.kCancelled
+    e.decision_action = manyforge_core_py.CollisionDecisionAction.kInconclusive
+    e.decision_severity = manyforge_core_py.CollisionDecisionSeverity.kBlock
+    pair = manyforge_core_py.CollisionPairId(
+        body_a="object/a/shape/0", body_b="robot/r0/link/tool/collision/0"
+    )
+    e.normalized_pairs = [pair]
+    e.first_failing_waypoint = 4
+    e.first_failing_time_ns = 123_000_000
+    e.trajectory_waypoint_count = 10
+    e.query_duration_ns = 55_000
+    e.worker_count_actually_used = 4
+    e.fallback_reason = ""
+    e.raw_diagnostics = {"cancel_reason": "operator"}
+    e.correlation_id = "move-42"
+
+    assert e.entry_id == "failure-001"
+    assert e.engine_id == "manyforge_collision/ur5_gripper"
+    assert e.collision_world_revision.revision_id == 12
+    assert e.policy_revision == "policy-7"
+    assert e.failure_kind == manyforge_core_py.CollisionFailureKind.kCancelled
+    assert e.normalized_pairs[0].body_b.endswith("/collision/0")
+    assert e.first_failing_waypoint == 4
+    assert e.raw_diagnostics == {"cancel_reason": "operator"}
+    assert e.correlation_id == "move-42"
+
+
+# ---------------------------------------------------------------------------
+# CollisionWorldSnapshot + builder
+# ---------------------------------------------------------------------------
+
+
+def _identity_pose():
+    p = manyforge_core_py.Pose3DTO()
+    p.position_m = manyforge_core_py.Vector3DTO(x_m=0.0, y_m=0.0, z_m=0.0)
+    p.orientation = manyforge_core_py.QuaternionDTO(x=0.0, y=0.0, z=0.0, w=1.0)
+    return p
+
+
+def _box_geom(body_id, owner_kind):
+    g = manyforge_core_py.CollisionGeometryDescriptor()
+    g.body_id = body_id
+    g.owner_kind = owner_kind
+    g.geometry_kind = manyforge_core_py.CollisionGeometryKind.kBox
+    g.local_pose = _identity_pose()
+    g.box_dimensions_m = manyforge_core_py.Vector3DTO(x_m=0.1, y_m=0.1, z_m=0.1)
+    return g
+
+
+def _robot_link_body(link_name):
+    body_id = f"robot/r1/link/{link_name}/collision/0"
+    b = manyforge_core_py.CollisionWorldBody()
+    b.body_id = body_id
+    b.owner_kind = manyforge_core_py.CollisionOwnerKind.kRobotLink
+    b.frame_id = "world"
+    b.pose = _identity_pose()
+    b.geometries = [_box_geom(body_id, manyforge_core_py.CollisionOwnerKind.kRobotLink)]
+    return b
+
+
+def test_collision_world_snapshot_default():
+    s = manyforge_core_py.CollisionWorldSnapshot()
+    assert s.snapshot_format_version == 1
+    assert s.publisher_id == ""
+    assert s.revision.revision_id == 0
+    assert s.bodies == []
+    assert s.body_count == 0
+    assert s.geometry_count == 0
+    assert not s.contains_mesh_geometry
+    assert s.all_bodies_have_geometry
+
+
+def test_collision_world_body_round_trip():
+    b = _robot_link_body("link1")
+    assert b.body_id == "robot/r1/link/link1/collision/0"
+    assert b.owner_kind == manyforge_core_py.CollisionOwnerKind.kRobotLink
+    assert b.parent_link is None
+    assert b.frame_id == "world"
+    assert len(b.geometries) == 1
+
+
+def test_collision_world_snapshot_builder_happy_path():
+    builder = manyforge_core_py.CollisionWorldSnapshotBuilder()
+    (
+        builder.set_publisher_id("py_test")
+        .set_revision_id(7)
+        .set_emitted_at_ns(1234)
+        .add_body(_robot_link_body("link1"))
+        .add_body(_robot_link_body("link2"))
+    )
+    snap = builder.build()
+    assert snap.publisher_id == "py_test"
+    assert snap.revision.revision_id == 7
+    assert snap.revision.content_hash  # non-empty
+    assert snap.emitted_at_ns == 1234
+    assert snap.body_count == 2
+    assert snap.geometry_count == 2
+    assert snap.robot_link_count == 2
+    assert snap.attached_object_count == 0
+    assert not snap.contains_mesh_geometry
+    assert snap.all_bodies_have_geometry
+    # Bodies sorted lexicographically.
+    assert snap.bodies[0].body_id < snap.bodies[1].body_id
+
+
+def test_collision_world_snapshot_builder_raises_on_empty_publisher():
+    builder = (
+        manyforge_core_py.CollisionWorldSnapshotBuilder()
+        .set_revision_id(1)
+        .add_body(_robot_link_body("link1"))
+    )
+    with pytest.raises(ValueError) as exc:
+        builder.build()
+    assert "publisher_id" in str(exc.value)
+
+
+def test_collision_world_snapshot_builder_raises_on_zero_revision():
+    builder = (
+        manyforge_core_py.CollisionWorldSnapshotBuilder()
+        .set_publisher_id("py_test")
+        .add_body(_robot_link_body("link1"))
+    )
+    with pytest.raises(ValueError):
+        builder.build()
+
+
+def test_collision_world_snapshot_builder_raises_on_zero_format_version():
+    builder = (
+        manyforge_core_py.CollisionWorldSnapshotBuilder()
+        .set_publisher_id("py_test")
+        .set_snapshot_format_version(0)
+        .set_revision_id(1)
+        .add_body(_robot_link_body("link1"))
+    )
+    with pytest.raises(ValueError):
+        builder.build()
+
+
+def test_collision_world_snapshot_builder_raises_on_duplicate_body_ids():
+    builder = (
+        manyforge_core_py.CollisionWorldSnapshotBuilder()
+        .set_publisher_id("py_test")
+        .set_revision_id(1)
+        .add_body(_robot_link_body("link1"))
+        .add_body(_robot_link_body("link1"))
+    )
+    with pytest.raises(ValueError) as exc:
+        builder.build()
+    assert "duplicate" in str(exc.value).lower()
+
+
+def test_collision_world_snapshot_builder_raises_on_owner_kind_id_mismatch():
+    body = _robot_link_body("link1")
+    body.body_id = "object/link1/shape/0"
+    body.geometries = [
+        _box_geom(body.body_id, manyforge_core_py.CollisionOwnerKind.kRobotLink)
+    ]
+    builder = (
+        manyforge_core_py.CollisionWorldSnapshotBuilder()
+        .set_publisher_id("py_test")
+        .set_revision_id(1)
+        .add_body(body)
+    )
+    with pytest.raises(ValueError):
+        builder.build()
+
+
+def test_collision_world_snapshot_builder_determinism():
+    def build():
+        return (
+            manyforge_core_py.CollisionWorldSnapshotBuilder()
+            .set_publisher_id("py_test")
+            .set_revision_id(3)
+            .add_body(_robot_link_body("link1"))
+            .add_body(_robot_link_body("link2"))
+            .build()
+        )
+
+    a, b = build(), build()
+    assert a.revision.content_hash == b.revision.content_hash

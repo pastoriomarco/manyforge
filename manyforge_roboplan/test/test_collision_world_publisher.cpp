@@ -9,6 +9,8 @@
 
 #include <gtest/gtest.h>
 
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <string>
 
@@ -17,9 +19,13 @@ namespace {
 using manyforge::core::AddObjectRequestDTO;
 using manyforge::core::AttachObjectRequestDTO;
 using manyforge::core::BoxShapeDTO;
+using manyforge::core::CollisionGeometryKind;
+using manyforge::core::CollisionOwnerKind;
 using manyforge::core::CollisionShapeDTO;
+using manyforge::core::CollisionWorldBody;
 using manyforge::core::CollisionWorldMutationSource;
 using manyforge::core::DetachObjectRequestDTO;
+using manyforge::core::MeshShapeDTO;
 using manyforge::core::Pose3DTO;
 using manyforge::core::RemoveObjectRequestDTO;
 using manyforge::core::UpdateObjectPoseRequestDTO;
@@ -27,6 +33,11 @@ using manyforge::core::Vector3DTO;
 using manyforge::roboplan_backend::create_native_kernel;
 using manyforge::roboplan_backend::NativeKernelBundle;
 using manyforge::roboplan_backend::RoboPlanPlanningContext;
+
+bool has_label(const std::vector<std::string>& labels,
+               const std::string& label) {
+  return std::find(labels.begin(), labels.end(), label) != labels.end();
+}
 
 class CollisionWorldPublisherTest : public ::testing::Test {
  protected:
@@ -48,8 +59,48 @@ class CollisionWorldPublisherTest : public ::testing::Test {
     return req;
   }
 
+  AddObjectRequestDTO make_mesh_at_origin(const std::string& object_id) {
+    const auto mesh_path =
+        std::filesystem::temp_directory_path() /
+        ("manyforge_collision_snapshot_" + object_id + ".obj");
+    std::ofstream mesh_file(mesh_path);
+    mesh_file << "v 0 0 0\n";
+    mesh_file << "v 0.01 0 0\n";
+    mesh_file << "v 0 0.01 0\n";
+    mesh_file << "f 1 2 3\n";
+    mesh_file.close();
+    last_mesh_uri_ = mesh_path.string();
+
+    AddObjectRequestDTO req;
+    req.object_id = object_id;
+    MeshShapeDTO mesh;
+    mesh.resource_uri = last_mesh_uri_;
+    mesh.scale = Vector3DTO{1.0, 1.0, 1.0};
+    req.shape = CollisionShapeDTO{mesh};
+    req.pose.position_m = Vector3DTO{0.0, 0.0, 0.5};
+    req.pose.orientation.w = 1.0;
+    req.frame_id = "universe";
+    return req;
+  }
+
+  const CollisionWorldBody* find_body(const std::string& body_id) {
+    auto snapshot = context_->snapshot();
+    if (!snapshot) {
+      return nullptr;
+    }
+    auto it = std::find_if(snapshot->bodies.begin(), snapshot->bodies.end(),
+                           [&](const CollisionWorldBody& body) {
+                             return body.body_id == body_id;
+                           });
+    if (it == snapshot->bodies.end()) {
+      return nullptr;
+    }
+    return &*it;
+  }
+
   std::shared_ptr<NativeKernelBundle> bundle_;
   RoboPlanPlanningContext* context_ = nullptr;
+  std::string last_mesh_uri_;
 };
 
 // --- Initial state -------------------------------------------------------
@@ -66,6 +117,38 @@ TEST_F(CollisionWorldPublisherTest, InitialRevisionIsProgramLoadRevision) {
   EXPECT_EQ(ledger[0].previous_revision_id, 0u);
 }
 
+TEST_F(CollisionWorldPublisherTest, InitialSnapshotPublishesRobotBodies) {
+  auto snapshot = context_->snapshot();
+  ASSERT_NE(snapshot, nullptr);
+  const auto current_revision = context_->current_collision_world_revision();
+  EXPECT_EQ(snapshot->revision.revision_id, current_revision.revision_id);
+  EXPECT_EQ(snapshot->revision.content_hash, current_revision.content_hash);
+  EXPECT_GT(snapshot->robot_link_count, 0);
+  EXPECT_GT(snapshot->geometry_count, 0);
+  EXPECT_EQ(snapshot->attached_object_count, 0);
+  EXPECT_EQ(snapshot->detached_object_count, 0);
+  EXPECT_TRUE(snapshot->all_bodies_have_geometry);
+
+  bool found_robot_body = false;
+  bool found_robot_proxy = false;
+  for (const auto& body : snapshot->bodies) {
+    if (body.owner_kind == CollisionOwnerKind::kRobotLink) {
+      found_robot_body = true;
+      EXPECT_EQ(body.frame_id, "universe");
+      ASSERT_FALSE(body.geometries.empty());
+      EXPECT_EQ(body.geometries.front().body_id, body.body_id);
+      EXPECT_EQ(body.geometries.front().owner_kind, CollisionOwnerKind::kRobotLink);
+      if (body.geometries.front().geometry_kind == CollisionGeometryKind::kBox &&
+          has_label(body.geometries.front().quality_labels,
+                    "conservative_proxy")) {
+        found_robot_proxy = true;
+      }
+    }
+  }
+  EXPECT_TRUE(found_robot_body);
+  EXPECT_TRUE(found_robot_proxy);
+}
+
 // --- Successful mutations bump the revision ------------------------------
 
 TEST_F(CollisionWorldPublisherTest, AddSucceeds_BumpsRevisionOnce) {
@@ -78,6 +161,65 @@ TEST_F(CollisionWorldPublisherTest, AddSucceeds_BumpsRevisionOnce) {
   EXPECT_EQ(after.revision_id, before.revision_id + 1);
   EXPECT_FALSE(after.content_hash.empty());
   EXPECT_NE(after.content_hash, before.content_hash);
+}
+
+TEST_F(CollisionWorldPublisherTest,
+       SnapshotIncludesDetachedPrimitiveObjectWithDimensions) {
+  ASSERT_TRUE(context_->add_object(make_box_at_origin("box_a")).success);
+
+  const auto* body = find_body("object/box_a/shape/0");
+  ASSERT_NE(body, nullptr);
+  EXPECT_EQ(body->owner_kind, CollisionOwnerKind::kDetachedObject);
+  EXPECT_FALSE(body->parent_link.has_value());
+  EXPECT_EQ(body->frame_id, "universe");
+  ASSERT_EQ(body->geometries.size(), 1u);
+  const auto& geom = body->geometries.front();
+  EXPECT_EQ(geom.geometry_kind, CollisionGeometryKind::kBox);
+  ASSERT_TRUE(geom.box_dimensions_m.has_value());
+  EXPECT_DOUBLE_EQ(geom.box_dimensions_m->x_m, 0.1);
+  EXPECT_DOUBLE_EQ(geom.box_dimensions_m->y_m, 0.1);
+  EXPECT_DOUBLE_EQ(geom.box_dimensions_m->z_m, 0.1);
+}
+
+TEST_F(CollisionWorldPublisherTest,
+       SnapshotRepresentsAttachedObjectInParentLinkFrame) {
+  ASSERT_TRUE(context_->add_object(make_box_at_origin("box_a")).success);
+
+  AttachObjectRequestDTO attach;
+  attach.object_id = "box_a";
+  attach.frame_id = "tool0";
+  ASSERT_TRUE(context_->attach_object(attach).success);
+
+  const auto* detached = find_body("object/box_a/shape/0");
+  EXPECT_EQ(detached, nullptr);
+  const auto* attached =
+      find_body("robot/robot0/attached/box_a/shape/0");
+  ASSERT_NE(attached, nullptr);
+  EXPECT_EQ(attached->owner_kind, CollisionOwnerKind::kAttachedObject);
+  ASSERT_TRUE(attached->parent_link.has_value());
+  EXPECT_EQ(*attached->parent_link, "robot/robot0/link/tool0");
+  EXPECT_EQ(attached->frame_id, "robot/robot0/link/tool0");
+  ASSERT_EQ(attached->geometries.size(), 1u);
+  EXPECT_EQ(attached->geometries.front().owner_kind,
+            CollisionOwnerKind::kAttachedObject);
+}
+
+TEST_F(CollisionWorldPublisherTest,
+       SnapshotCarriesMeshSourceIdentityAndMeshFlag) {
+  ASSERT_TRUE(context_->add_object(make_mesh_at_origin("mesh_a")).success);
+
+  auto snapshot = context_->snapshot();
+  ASSERT_NE(snapshot, nullptr);
+  EXPECT_TRUE(snapshot->contains_mesh_geometry);
+  const auto* body = find_body("object/mesh_a/shape/0");
+  ASSERT_NE(body, nullptr);
+  ASSERT_EQ(body->geometries.size(), 1u);
+  const auto& geom = body->geometries.front();
+  EXPECT_EQ(geom.geometry_kind, CollisionGeometryKind::kTriangleMesh);
+  ASSERT_TRUE(geom.source_uri.has_value());
+  EXPECT_EQ(*geom.source_uri, last_mesh_uri_);
+  ASSERT_TRUE(geom.source_hash.has_value());
+  EXPECT_FALSE(geom.source_hash->empty());
 }
 
 TEST_F(CollisionWorldPublisherTest, RemoveSucceeds_BumpsRevisionOnce) {

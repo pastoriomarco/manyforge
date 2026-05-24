@@ -12,6 +12,8 @@
 
 #include <roboplan/core/scene.hpp>
 
+#include <manyforge_core/collision/i_collision_query_engine.hpp>
+#include <manyforge_core/collision/i_collision_world_snapshot_publisher.hpp>
 #include <functional>
 #include <manyforge_core/ports/iplanning_context.hpp>
 #include <manyforge_core/types/collision.hpp>
@@ -19,12 +21,13 @@
 namespace manyforge::roboplan_backend {
 
 class RoboPlanCollisionBodyIdMapper;
-class DirectCollisionQueryEngine;
 
 
 /// Native C++ planning context wrapping RoboPlan Scene.
 /// Provides state queries, FK, collision checks, validation, and scene edits.
-class RoboPlanPlanningContext final : public core::IPlanningContext {
+class RoboPlanPlanningContext final
+    : public core::IPlanningContext,
+      public core::ICollisionWorldSnapshotPublisher {
  public:
   struct SceneObjectSnapshot {
     std::string object_id;
@@ -123,17 +126,14 @@ class RoboPlanPlanningContext final : public core::IPlanningContext {
   /// coordinator will own trajectory-scoped evaluator state.
   void set_collision_policy_snapshot(core::CollisionPolicySnapshot snapshot);
 
-  /// Install a direct collision query engine to run in **diagnostic
-  /// compare mode** alongside the legacy RoboPlan path (Chunk 4 of the
-  /// collision-ownership plan). When set, collision_check_normalized
-  /// runs both engines, records a mismatch event when their decisions
-  /// disagree, and reports the mismatch through `mismatch_emitter` if
-  /// one is registered. The direct engine is never authoritative;
-  /// kernel-facing results still come from the RoboPlan legacy path.
+  /// Install a secondary collision query engine to run in diagnostic
+  /// compare mode alongside the legacy RoboPlan path. The engine is accepted
+  /// through the backend-agnostic ICollisionQueryEngine port; RoboPlan does
+  /// not depend on the concrete ManyForge collision engine class.
   ///
   /// Passing `nullptr` disables compare mode.
-  void set_direct_engine_for_compare(
-      std::shared_ptr<DirectCollisionQueryEngine> engine);
+  void set_collision_engine_for_compare(
+      std::shared_ptr<core::ICollisionQueryEngine> engine);
 
   /// Register a callback that receives engine-mismatch records when
   /// compare mode is active. Pass an empty function to clear.
@@ -177,6 +177,22 @@ class RoboPlanPlanningContext final : public core::IPlanningContext {
   std::vector<core::CollisionWorldLedgerEntry>
   recent_collision_world_ledger(std::size_t limit = 0) const;
 
+  /// Current immutable collision-world snapshot (kernel-architecture sprint
+  /// Chunk 2A). Built from the authoritative planning-context scene state and
+  /// cached by collision-world revision. Returns nullptr only when the
+  /// snapshot builder rejects the current world, which callers must treat as a
+  /// fail-closed diagnostic condition.
+  core::CollisionWorldSnapshotPtr snapshot() const override;
+
+  /// Current policy overlay paired with the collision-world snapshot.
+  ///
+  /// The snapshot is rebuilt from current scene-object state on every call so
+  /// attach/detach, static object filtering, touch-link allowances, and
+  /// support-contact discovery are borrowed atomically with the active world
+  /// revision used by the kernel validation pass.
+  std::optional<core::CollisionPolicySnapshot>
+  collision_policy_snapshot() const override;
+
  private:
   struct TrackedObjectState {
     core::Pose3DTO pose;
@@ -199,14 +215,16 @@ class RoboPlanPlanningContext final : public core::IPlanningContext {
     std::string raw_output;
   };
 
-  Eigen::Matrix4d pose_to_matrix(const core::Pose3DTO& pose);
-  core::Pose3DTO matrix_to_pose(const Eigen::Matrix4d& matrix);
+  Eigen::Matrix4d pose_to_matrix(const core::Pose3DTO& pose) const;
+  core::Pose3DTO matrix_to_pose(const Eigen::Matrix4d& matrix) const;
   bool is_world_frame(const std::string& frame_id) const;
-  Eigen::Matrix4d scene_placement_from_tracked_locked(const TrackedObjectState& state);
-  Eigen::Matrix4d parent_joint_from_frame_matrix_locked(const std::string& frame_id);
-  Eigen::Matrix4d frame_to_world_matrix_locked(const std::string& frame_id);
+  Eigen::Matrix4d scene_placement_from_tracked_locked(
+      const TrackedObjectState& state) const;
+  Eigen::Matrix4d parent_joint_from_frame_matrix_locked(
+      const std::string& frame_id) const;
+  Eigen::Matrix4d frame_to_world_matrix_locked(const std::string& frame_id) const;
   core::Pose3DTO pose_in_base_from_tracked_locked(const TrackedObjectState& state,
-                                                  const std::string& base_frame);
+                                                  const std::string& base_frame) const;
   bool infer_attached_from_frame(const std::string& frame_id) const;
   tl::expected<void, std::string> set_touch_links_locked(
       const std::string& object_id,
@@ -248,6 +266,15 @@ class RoboPlanPlanningContext final : public core::IPlanningContext {
   std::vector<SceneObjectSnapshot> scene_objects_locked();
   std::vector<std::pair<std::string, core::CollisionBodyId>>
   robot_body_mappings_locked(const std::string& robot_id);
+  std::vector<core::CollisionWorldBody>
+  robot_snapshot_bodies_locked(const std::string& robot_id) const;
+  std::vector<core::CollisionWorldBody>
+  object_snapshot_bodies_locked(const std::string& robot_id) const;
+  core::CollisionGeometryDescriptor geometry_descriptor_for_shape_locked(
+      const core::CollisionBodyId& body_id,
+      core::CollisionOwnerKind owner_kind,
+      const core::CollisionShapeDTO& shape) const;
+  core::CollisionWorldSnapshotPtr build_collision_world_snapshot_locked() const;
   std::vector<std::string> object_body_ids_for_state_locked(
       const std::string& object_id,
       const TrackedObjectState& state) const;
@@ -257,6 +284,8 @@ class RoboPlanPlanningContext final : public core::IPlanningContext {
       const TrackedObjectState& after) const;
   std::string compute_collision_world_content_hash_locked(
       const std::string& robot_id);
+  core::CollisionPolicySnapshot build_collision_policy_snapshot_locked(
+      const std::string& robot_id) const;
 
   tl::expected<void, std::string> add_geometry_locked(
       const std::string& object_id, const TrackedObjectState& state);
@@ -287,11 +316,11 @@ class RoboPlanPlanningContext final : public core::IPlanningContext {
   mutable std::mutex evaluator_mutex_;
   std::optional<core::CollisionPolicySnapshot> policy_snapshot_;
 
-  // Direct collision engine compare mode (Chunk 4). Shared pointer so the
-  // engine lifetime can outlive a single planning context; nullptr disables
-  // compare mode. Emitter receives mismatch records when both engines run.
-  mutable std::mutex direct_engine_mutex_;
-  std::shared_ptr<DirectCollisionQueryEngine> direct_engine_;
+  // Secondary collision engine compare mode. Shared pointer so the comparator
+  // lifetime can outlive a single planning context; nullptr disables compare
+  // mode. Emitter receives mismatch records when both engines run.
+  mutable std::mutex compare_engine_mutex_;
+  std::shared_ptr<core::ICollisionQueryEngine> compare_engine_;
   MismatchEmitter mismatch_emitter_;
   MismatchRecordEmitter mismatch_record_emitter_;
 
@@ -303,6 +332,10 @@ class RoboPlanPlanningContext final : public core::IPlanningContext {
   std::string world_content_hash_;
   std::deque<core::CollisionWorldLedgerEntry> world_ledger_;
   static constexpr std::size_t kCollisionWorldLedgerCapacity = 32;
+
+  mutable core::CollisionWorldSnapshotPtr snapshot_cache_;
+  mutable std::uint64_t snapshot_cache_revision_id_ = 0;
+  mutable std::string snapshot_cache_content_hash_;
 
   /// Bump the authoritative collision-world revision after a successful
   /// scene mutation. Must be called under scene_mutex_.

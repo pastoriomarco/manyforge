@@ -97,7 +97,6 @@ function nextInterval(): number {
   if (
     cycleState === 'running'
     || cycleState === 'direct_control'
-    || cycleState === 'interrupt_handler'
   ) {
     return POLL_INTERVAL_MS_ACTIVE;
   }

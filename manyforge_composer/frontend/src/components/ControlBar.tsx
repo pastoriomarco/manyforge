@@ -668,7 +668,7 @@ export function ControlBar() {
  * next to the floating <RuntimeStatusOverlay /> "Ready" indicator
  * at bottom-right of the screen. Button enabled-state mirrors the
  * cycle-state machine: Run only fires from idle/stopped, Stop from
- * running / interrupt_handler / direct_control, Reset from any
+ * running / direct_control, Reset from any
  * state except where the kernel forbids it (the backend returns
  * 409 in that case; we let it surface via the cycle store's error).
  */
@@ -695,14 +695,14 @@ function CycleControls() {
     (streamingPhase === 'idle' || streamingPhase === 'aborted');
   // Stop applies to any in-flight motion the operator can see — BT
   // execution (state==='running'), an intervention session
-  // (direct_control), an interrupt handler, OR a follow-target
+  // (direct_control), OR a follow-target
   // streaming session driven by a slider/gizmo. The latter doesn't
   // transition the cycle state today (follow_target_ws calls the
   // kernel directly), so without surfacing the controller phase here
   // the Stop button would stay disabled while a slider-commanded
   // motion was still travelling toward its goal.
   const cycleStoppable =
-    state === 'running' || state === 'interrupt_handler' || state === 'direct_control';
+    state === 'running' || state === 'direct_control';
   const canStop = cycleStoppable || streamingActive;
 
   const runAfterStreamingSettles = useCallback(
@@ -799,8 +799,8 @@ function CycleControls() {
           // ADR-0016: any user-initiated stop must abort an active
           // streaming session FIRST so the frontend doesn't keep
           // pushing frames into a dead kernel session. If the cycle
-          // is also in a stoppable state (BT execution / intervention
-          // / interrupt handler) call stop() once streaming settles;
+          // is also in a stoppable state (BT execution / intervention)
+          // call stop() once streaming settles;
           // otherwise the abort alone is the stop.
           //
           // After the abort lands the kernel publishes a kStopped

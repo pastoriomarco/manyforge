@@ -41,7 +41,6 @@ class CycleState(Enum):
     IDLE = "idle"
     RUNNING = "running"
     STOPPED = "stopped"
-    INTERRUPT_HANDLER = "interrupt_handler"
     DIRECT_CONTROL = "direct_control"
 
 
@@ -175,59 +174,6 @@ class _InterventionContext:
     velocity_scale: float
 
 
-@dataclass
-class PendingInterrupt:
-    """Latched interrupt request awaiting explicit operator/runtime handling."""
-
-    interrupt_id: str
-    source_id: str
-    source_adapter: str
-    signal: str
-    kind: str
-    priority: int
-    maskable: bool
-    policy_id: Optional[str]
-    handler_id: Optional[str]
-    preemption_mode: str
-    after_handler: str
-    active_node_name: Optional[str]
-    active_node_id: Optional[str]
-    active_move_id: Optional[str]
-    latched_at_ns: int = field(default_factory=time.monotonic_ns)
-    details: dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass
-class ActiveInterruptHandler:
-    """Runtime execution state for a compiled interrupt handler subtree."""
-
-    interrupt_id: str
-    policy_id: Optional[str]
-    handler_id: str
-    tree: py_trees.trees.BehaviourTree
-    resource_claims: tuple[str, ...]
-    timeout_s: Optional[float] = None
-    started_at_ns: int = field(default_factory=time.monotonic_ns)
-    deadline_at_ns: Optional[int] = None
-    tick_count: int = 0
-    last_status: str = py_trees.common.Status.INVALID.value
-    completed_at_ns: Optional[int] = None
-    last_error: Optional[str] = None
-
-
-_INTERRUPT_CONTEXT_PREFIX = "_interrupt/current"
-_SUPPORTED_AUTO_INTERRUPT_RESOURCE_CLAIMS = {
-    "blackboard",
-    "gripper",
-    "model",
-    "motion",
-    "planner",
-    "scene",
-    "signals",
-    "timers",
-}
-
-
 def _collect_statuses(node, result):
     """Recursively collect node statuses from a py_trees node and its children."""
     result[node.name] = node.status.value if node.status else "INVALID"
@@ -261,10 +207,9 @@ def _find_failure_feedback(node) -> Optional[str]:
 class CycleManager:
     """Runtime lifecycle controller for continuous robot programs.
 
-    Five-state machine (spec/400 §6.6.2):
+    Four-state machine (spec/400 §6.6.2):
 
         IDLE ──(run)──► RUNNING ──(stop)──► STOPPED ──(run)──► RUNNING
-        RUNNING ──(interrupt)──► INTERRUPT_HANDLER ──(resume)──► RUNNING
         STOPPED ──(intervention.enter)──► DIRECT_CONTROL ──(end)──► STOPPED
         Any state ──(reset)──► IDLE
 
@@ -303,20 +248,15 @@ class CycleManager:
         self._intervention: Optional[InterventionSession] = None
         self._intervention_context: Optional[_InterventionContext] = None
         self._pending_delegated_recovery: Optional[DelegatedRecoveryRequest] = None
-        self._pending_interrupt: Optional[PendingInterrupt] = None
-        self._active_interrupt_handler: Optional[ActiveInterruptHandler] = None
-        self._deferred_interrupts: deque[PendingInterrupt] = deque()
         self._on_delegated_recovery_requested: Optional[
             Callable[[DelegatedRecoveryRequest], None]
         ] = None
         self._on_recovery_exhausted: Optional[
             Callable[[str, str, str], None]
         ] = None
-        self._on_interrupt_event: Optional[Callable[..., None]] = None
         self._parent_run_id_provider: Optional[Callable[[], Optional[str]]] = None
         self._kernel_events: deque[dict[str, Any]] = deque(maxlen=4096)
         self._kernel_event_index: int = 0
-        self._interrupt_source_levels: dict[str, bool] = {}
         self._signal_registry = RuntimeSignalRegistry()
         self._signal_managed_keys: set[str] = set()
 
@@ -357,12 +297,7 @@ class CycleManager:
         with self._lock:
             self._node_statuses = {}
             self._pending_delegated_recovery = None
-            self._pending_interrupt = None
-            self._active_interrupt_handler = None
-            self._deferred_interrupts.clear()
-            self._interrupt_source_levels = {}
-        self._clear_interrupt_context()
-    
+
     @property
     def state(self) -> CycleState:
         """Current lifecycle state."""
@@ -690,7 +625,7 @@ class CycleManager:
         client_name: str,
         kernel_action: str,
     ) -> None:
-        """Enter a quiesced runtime mode shared by stop and interrupt preemption."""
+        """Enter a quiesced runtime mode shared by stop and reset paths."""
         self._set_stop_requested_flag(True, client_name=client_name)
 
         kernel_status = self._kernel.get_status()
@@ -723,57 +658,6 @@ class CycleManager:
         bb.register_key(key="velocity_scale", access=py_trees.common.Access.WRITE)
         bb.stop_requested = stop_requested
         bb.velocity_scale = velocity_scale
-
-    def _publish_interrupt_context(self, pending: PendingInterrupt) -> None:
-        """Publish the current interrupt context as a bundle on the blackboard."""
-        bb = py_trees.blackboard.Client(name="cycle_manager_interrupt_context")
-        bb.register_key(key=_INTERRUPT_CONTEXT_PREFIX, access=py_trees.common.Access.WRITE)
-        write_namespace_bundle(
-            bb,
-            _INTERRUPT_CONTEXT_PREFIX,
-            value={
-                "interrupt_id": pending.interrupt_id,
-                "source_id": pending.source_id,
-                "source_adapter": pending.source_adapter,
-                "signal": pending.signal,
-                "kind": pending.kind,
-                "priority": pending.priority,
-                "maskable": pending.maskable,
-                "policy_id": pending.policy_id,
-                "handler_id": pending.handler_id,
-                "preemption_mode": pending.preemption_mode,
-                "after_handler": pending.after_handler,
-                "active_node_name": pending.active_node_name,
-                "active_node_id": pending.active_node_id,
-                "active_move_id": pending.active_move_id,
-                "latched_at_ns": pending.latched_at_ns,
-                "details": dict(pending.details),
-            },
-            status=str(pending.details.get("handler_state", "latched")),
-            interrupt_id=pending.interrupt_id,
-            source_id=pending.source_id,
-            policy_id=pending.policy_id,
-            handler_id=pending.handler_id,
-            preemption_mode=pending.preemption_mode,
-            disposition=pending.after_handler,
-        )
-
-    def _clear_interrupt_context(self) -> None:
-        """Remove the active interrupt context bundle from the blackboard."""
-        py_trees.blackboard.Blackboard.unset(_INTERRUPT_CONTEXT_PREFIX)
-
-    def _cleanup_interrupt_handler_tree(
-        self,
-        active: Optional[ActiveInterruptHandler],
-    ) -> None:
-        """Best-effort invalidation of an active handler tree on forced exit."""
-        if active is None:
-            return
-        try:
-            if active.tree.root.status == py_trees.common.Status.RUNNING:
-                active.tree.root.stop(py_trees.common.Status.INVALID)
-        except Exception:
-            logger.exception("Failed to stop active interrupt handler tree cleanly")
 
     def _iter_runtime_tree_nodes(self, node):
         yield node
@@ -814,13 +698,6 @@ class CycleManager:
         """
         self._on_recovery_exhausted = callback
 
-    def set_on_interrupt_event(
-        self,
-        callback: Optional[Callable[..., None]],
-    ) -> None:
-        """Install a callback invoked when runtime interrupt lifecycle events occur."""
-        self._on_interrupt_event = callback
-
     def _can_auto_acknowledge_leftover_state(self) -> tuple[bool, str]:
         """Check whether kernel-side leftover state is safe to clear on Run.
 
@@ -855,19 +732,6 @@ class CycleManager:
         if self._intervention is not None and self._intervention.status == "running":
             return False, "intervention_session_running"
 
-        # A pending interrupt that has not reached a clean terminal state
-        # blocks auto-ack too — see also the existing pending_interrupt
-        # checks in the STOPPED branch of run().
-        if self._pending_interrupt is not None:
-            handler_state = str(
-                self._pending_interrupt.details.get("handler_state", "latched")
-            )
-            if (
-                self._pending_interrupt.after_handler != "resumable_hold"
-                or handler_state != "completed"
-            ):
-                return False, "pending_interrupt_blocks_auto_ack"
-
         return True, "ok"
 
     def run(self) -> None:
@@ -883,14 +747,11 @@ class CycleManager:
                  must be prepared explicitly via Reset before another run.
         If STOPPED: clear stop_requested on BB, resume tick thread. State → RUNNING.
                     If kernel is PAUSED, call kernel.resume().
-        If INTERRUPT_HANDLER: reject resume while a handler is still executing.
         If RUNNING: no-op.
         """
         prepare_fresh = False
         start_from_idle = False
         on_run_from_idle: Optional[Callable[[], None]] = None
-        clear_resumable_interrupt = False
-        resumed_from_stopped = False
 
         with self._lock:
             if self._state == CycleState.RUNNING:
@@ -910,21 +771,6 @@ class CycleManager:
                 on_run_from_idle = self._on_run_from_idle
 
             elif self._state == CycleState.STOPPED:
-                pending_interrupt = self._pending_interrupt
-                if pending_interrupt is not None:
-                    handler_state = str(
-                        pending_interrupt.details.get("handler_state", "latched")
-                    )
-                    if (
-                        pending_interrupt.after_handler != "resumable_hold"
-                        or handler_state != "completed"
-                    ):
-                        raise RuntimeError(
-                            "Cannot resume cycle while interrupt "
-                            f"'{pending_interrupt.policy_id or pending_interrupt.source_id}' "
-                            "requires reset or explicit handler execution"
-                        )
-                    clear_resumable_interrupt = True
                 # Resuming from stopped state
                 self._pending_delegated_recovery = None
                 bb = py_trees.blackboard.Client(name="cycle_manager_resume")
@@ -978,9 +824,6 @@ class CycleManager:
                         raise RuntimeError("Cannot resume stopped cycle without a tree")
                     self._start_tick_thread(self._tick_loop)
                 self._state = CycleState.RUNNING
-                resumed_from_stopped = True
-            elif self._state == CycleState.INTERRUPT_HANDLER:
-                raise RuntimeError("Cannot resume cycle while an interrupt handler is executing")
 
         if start_from_idle:
             if prepare_fresh:
@@ -994,12 +837,7 @@ class CycleManager:
             with self._lock:
                 self._start_tick_thread(self._tick_loop)
                 self._state = CycleState.RUNNING
-        elif resumed_from_stopped and clear_resumable_interrupt:
-            self._clear_pending_interrupt(
-                action="cleared",
-                reason="operator_resume",
-            )
-    
+
     def stop(self) -> None:
         """
         Stop program execution.
@@ -1007,7 +845,7 @@ class CycleManager:
         If RUNNING: set stop_requested=True on BB, suspend tick thread.
                     If kernel state is EXECUTING, call kernel.pause().
                     State → STOPPED.
-        If INTERRUPT_HANDLER, STOPPED or IDLE: no-op.
+        If STOPPED or IDLE: no-op.
         """
         with self._lock:
             if self._state != CycleState.RUNNING:
@@ -1071,9 +909,6 @@ class CycleManager:
                     self._error = "tick thread did not terminate"
                     self._state = CycleState.IDLE
                     self._pending_delegated_recovery = None
-                    self._pending_interrupt = None
-                    self._active_interrupt_handler = None
-                    self._deferred_interrupts.clear()
                     cleanup_alive = (
                         self._tick_cleanup_thread is not None
                         and self._tick_cleanup_thread.is_alive()
@@ -1086,7 +921,6 @@ class CycleManager:
                             daemon=True,
                         )
                         self._tick_cleanup_thread.start()
-                self._clear_interrupt_context()
                 return
             with self._lock:
                 if self._tick_thread is thread_to_join:
@@ -1098,25 +932,13 @@ class CycleManager:
 
         self._prepare_fresh_cycle()
 
-        clear_pending_interrupt = False
-        active_interrupt_handler = None
         with self._lock:
             self._tick_stop_event.clear()
             self._tick_pause_event.set()
             self._error = None
             self._state = CycleState.IDLE
             self._pending_delegated_recovery = None
-            clear_pending_interrupt = self._pending_interrupt is not None
-            active_interrupt_handler = self._active_interrupt_handler
-            self._active_interrupt_handler = None
-            self._deferred_interrupts.clear()
-            self._interrupt_source_levels = {}
-        self._cleanup_interrupt_handler_tree(active_interrupt_handler)
-        if clear_pending_interrupt:
-            self._clear_pending_interrupt(action="cleared", reason="cycle_reset")
-        else:
-            self._clear_interrupt_context()
-    
+
     def set_velocity_scale(self, scale: float) -> None:
         """Set velocity_scale on blackboard. Clamped to [0.0, 1.0].
 
@@ -1160,479 +982,6 @@ class CycleManager:
                 },
             )
 
-    def _try_activate_interrupt_handler(
-        self,
-        pending: PendingInterrupt,
-    ) -> bool:
-        """Compile and activate a named interrupt handler when safe to do so."""
-        program = self._runner.program
-        if program is None or pending.handler_id is None:
-            return False
-        handler = program.interrupt_handlers.get(pending.handler_id)
-        if handler is None:
-            pending.details["handler_state"] = "blocked"
-            pending.details["handler_blocked_reason"] = "missing_handler_definition"
-            self._publish_interrupt_context(pending)
-            self._notify_interrupt_event(
-                action="handler_auto_execution_blocked",
-                interrupt_id=pending.interrupt_id,
-                source=pending.source_id,
-                policy_id=pending.policy_id,
-                preemption_mode=pending.preemption_mode,
-                disposition=pending.after_handler,
-                active_node_id=pending.active_node_id,
-                active_move_id=pending.active_move_id,
-                details=dict(pending.details),
-            )
-            return False
-
-        resource_claims = tuple(sorted(handler.resource_claims))
-        pending.details["handler_resource_claims"] = list(resource_claims)
-        if handler.timeout_s is not None:
-            pending.details["handler_timeout_s"] = handler.timeout_s
-        unsupported_claims = sorted(
-            set(resource_claims) - _SUPPORTED_AUTO_INTERRUPT_RESOURCE_CLAIMS
-        )
-        if unsupported_claims:
-            pending.details["handler_state"] = "blocked"
-            pending.details["handler_blocked_reason"] = (
-                "unsupported_auto_execution_resource_claims"
-            )
-            pending.details["unsupported_resource_claims"] = unsupported_claims
-            self._publish_interrupt_context(pending)
-            self._notify_interrupt_event(
-                action="handler_auto_execution_blocked",
-                interrupt_id=pending.interrupt_id,
-                source=pending.source_id,
-                policy_id=pending.policy_id,
-                preemption_mode=pending.preemption_mode,
-                disposition=pending.after_handler,
-                active_node_id=pending.active_node_id,
-                active_move_id=pending.active_move_id,
-                details=dict(pending.details),
-            )
-            return False
-
-        preparation_error = self._prepare_interrupt_handler_runtime(
-            pending=pending,
-            resource_claims=resource_claims,
-        )
-        if preparation_error is not None:
-            pending.details["handler_state"] = "blocked"
-            pending.details["handler_blocked_reason"] = preparation_error
-            self._set_stop_requested_flag(
-                True,
-                client_name="cycle_manager_interrupt_handler_restore_stop_flag",
-            )
-            self._publish_interrupt_context(pending)
-            self._notify_interrupt_event(
-                action="handler_auto_execution_blocked",
-                interrupt_id=pending.interrupt_id,
-                source=pending.source_id,
-                policy_id=pending.policy_id,
-                preemption_mode=pending.preemption_mode,
-                disposition=pending.after_handler,
-                active_node_id=pending.active_node_id,
-                active_move_id=pending.active_move_id,
-                details=dict(pending.details),
-            )
-            return False
-
-        try:
-            handler_tree = self._runner.build_interrupt_handler_tree(pending.handler_id)
-        except Exception as exc:
-            pending.details["handler_state"] = "blocked"
-            pending.details["handler_blocked_reason"] = "handler_build_failed"
-            pending.details["handler_last_error"] = str(exc)
-            self._set_stop_requested_flag(
-                True,
-                client_name="cycle_manager_interrupt_handler_restore_stop_flag",
-            )
-            self._publish_interrupt_context(pending)
-            self._notify_interrupt_event(
-                action="handler_auto_execution_blocked",
-                interrupt_id=pending.interrupt_id,
-                source=pending.source_id,
-                policy_id=pending.policy_id,
-                preemption_mode=pending.preemption_mode,
-                disposition=pending.after_handler,
-                active_node_id=pending.active_node_id,
-                active_move_id=pending.active_move_id,
-                details=dict(pending.details),
-            )
-            return False
-
-        active = ActiveInterruptHandler(
-            interrupt_id=pending.interrupt_id,
-            policy_id=pending.policy_id,
-            handler_id=pending.handler_id,
-            tree=handler_tree,
-            resource_claims=resource_claims,
-            timeout_s=handler.timeout_s,
-        )
-        if active.timeout_s is not None:
-            active.deadline_at_ns = active.started_at_ns + int(active.timeout_s * 1_000_000_000)
-        pending.details["handler_state"] = "running"
-        pending.details["handler_started_at_ns"] = active.started_at_ns
-        pending.details["handler_start_latency_ns"] = max(
-            0,
-            active.started_at_ns - pending.latched_at_ns,
-        )
-        quiesced_at_ns = pending.details.get("quiesce_completed_at_ns")
-        if isinstance(quiesced_at_ns, int):
-            pending.details["handler_post_quiesce_latency_ns"] = max(
-                0,
-                active.started_at_ns - quiesced_at_ns,
-            )
-        if active.deadline_at_ns is not None:
-            pending.details["handler_deadline_at_ns"] = active.deadline_at_ns
-        self._publish_interrupt_context(pending)
-        with self._lock:
-            self._active_interrupt_handler = active
-            self._state = CycleState.INTERRUPT_HANDLER
-        self._tick_pause_event.set()
-        self._notify_interrupt_event(
-            action="handler_started",
-            interrupt_id=pending.interrupt_id,
-            source=pending.source_id,
-            policy_id=pending.policy_id,
-            preemption_mode=pending.preemption_mode,
-            disposition=pending.after_handler,
-            active_node_id=pending.active_node_id,
-            active_move_id=pending.active_move_id,
-            details=dict(pending.details),
-        )
-        return True
-
-    def _prepare_interrupt_handler_runtime(
-        self,
-        *,
-        pending: PendingInterrupt,
-        resource_claims: tuple[str, ...],
-    ) -> Optional[str]:
-        self._set_stop_requested_flag(
-            False,
-            client_name="cycle_manager_interrupt_handler_enable_execution",
-        )
-        pending.details["handler_stop_requested_cleared"] = True
-
-        if "motion" not in resource_claims:
-            return None
-
-        pending.details["handler_kernel_preparation"] = "stop_and_reset_to_idle"
-        status = self._kernel.get_status().state
-        if status in {
-            ExecutionState.EXECUTING,
-            ExecutionState.PLANNING,
-            ExecutionState.VALIDATING,
-            ExecutionState.PAUSED,
-            ExecutionState.STOPPING,
-        }:
-            stop_result = self._kernel.stop()
-            if not stop_result.accepted:
-                return f"kernel_stop_failed: {stop_result.error or 'rejected'}"
-            status = self._kernel.get_status().state
-
-        if status != ExecutionState.IDLE:
-            reset_result = self._kernel.reset()
-            if not reset_result.accepted and self._kernel.get_status().state != ExecutionState.IDLE:
-                return f"kernel_reset_failed: {reset_result.error or 'rejected'}"
-
-        pending.details["handler_kernel_ready_state"] = self._kernel.get_status().state.value
-        return None
-
-    def _restart_interrupted_subtree(self, pending: PendingInterrupt) -> Optional[str]:
-        if self._tree is None or self._tree.root is None:
-            return "missing_runtime_tree"
-
-        target_name = None
-        program = self._runner.program
-        if program is not None and pending.policy_id is not None:
-            policy = program.interrupt_policies.get(pending.policy_id)
-            if policy is not None:
-                target_name = str(policy.applies_to.get("subtree_root") or "").strip() or None
-        if target_name is None:
-            target_name = pending.active_node_name
-        if not target_name:
-            return "missing_restart_target"
-
-        target_node = next(
-            (node for node in self._iter_runtime_tree_nodes(self._tree.root) if node.name == target_name),
-            None,
-        )
-        if target_node is None:
-            return f"restart_target_not_found:{target_name}"
-
-        status = self._kernel.get_status().state
-        if status in {
-            ExecutionState.EXECUTING,
-            ExecutionState.PLANNING,
-            ExecutionState.VALIDATING,
-            ExecutionState.PAUSED,
-            ExecutionState.STOPPING,
-        }:
-            stop_result = self._kernel.stop()
-            if not stop_result.accepted:
-                return f"kernel_stop_failed: {stop_result.error or 'rejected'}"
-            status = self._kernel.get_status().state
-        if status != ExecutionState.IDLE:
-            reset_result = self._kernel.reset()
-            if not reset_result.accepted and self._kernel.get_status().state != ExecutionState.IDLE:
-                return f"kernel_reset_failed: {reset_result.error or 'rejected'}"
-
-        target_node.stop(py_trees.common.Status.INVALID)
-        self._set_stop_requested_flag(
-            False,
-            client_name="cycle_manager_interrupt_restart_subtree_resume",
-        )
-        with self._lock:
-            self._state = CycleState.RUNNING
-            self._active_interrupt_handler = None
-        self._tick_pause_event.set()
-        pending.details["restart_target_name"] = target_name
-        pending.details["restart_completed_at_ns"] = time.monotonic_ns()
-        pending.details["restart_completion_latency_ns"] = max(
-            0,
-            pending.details["restart_completed_at_ns"] - pending.latched_at_ns,
-        )
-        return None
-
-    def _queue_deferred_interrupt(self, pending: PendingInterrupt) -> None:
-        signature = (
-            pending.source_id,
-            pending.policy_id,
-            pending.active_node_name,
-            pending.signal,
-        )
-        existing = {
-            (queued.source_id, queued.policy_id, queued.active_node_name, queued.signal)
-            for queued in self._deferred_interrupts
-        }
-        if signature in existing:
-            return
-        pending.details["deferred"] = True
-        pending.details["deferred_at_ns"] = time.monotonic_ns()
-        self._deferred_interrupts.append(pending)
-        self._notify_interrupt_event(
-            action="deferred",
-            interrupt_id=pending.interrupt_id,
-            source=pending.source_id,
-            policy_id=pending.policy_id,
-            preemption_mode=pending.preemption_mode,
-            disposition=pending.after_handler,
-            active_node_id=pending.active_node_id,
-            active_move_id=pending.active_move_id,
-            details=dict(pending.details),
-        )
-
-    def _pop_deferred_interrupt(self) -> Optional[PendingInterrupt]:
-        if not self._deferred_interrupts:
-            return None
-        best_index = 0
-        best_pending = self._deferred_interrupts[0]
-        for index, candidate in enumerate(self._deferred_interrupts):
-            if (
-                candidate.priority > best_pending.priority
-                or (
-                    candidate.priority == best_pending.priority
-                    and candidate.latched_at_ns < best_pending.latched_at_ns
-                )
-            ):
-                best_index = index
-                best_pending = candidate
-        self._deferred_interrupts.rotate(-best_index)
-        selected = self._deferred_interrupts.popleft()
-        self._deferred_interrupts.rotate(best_index)
-        selected.details.pop("deferred", None)
-        selected.details["deferred_consumed_at_ns"] = time.monotonic_ns()
-        selected.details["deferred_wait_ns"] = max(
-            0,
-            selected.details["deferred_consumed_at_ns"] - selected.latched_at_ns,
-        )
-        return selected
-
-    def _apply_interrupt_disposition(
-        self,
-        pending: PendingInterrupt,
-        *,
-        handler_failed: bool = False,
-        error: Optional[str] = None,
-    ) -> None:
-        """Apply post-handler disposition conservatively and audibly."""
-        disposition = pending.after_handler
-        if handler_failed:
-            disposition = "failed"
-        pending.details["handler_state"] = "failed" if handler_failed else "completed"
-        if error is not None:
-            pending.details["handler_last_error"] = error
-        pending.details["handler_completed_at_ns"] = time.monotonic_ns()
-        handler_started_at_ns = pending.details.get("handler_started_at_ns")
-        if isinstance(handler_started_at_ns, int):
-            pending.details["handler_duration_ns"] = max(
-                0,
-                pending.details["handler_completed_at_ns"] - handler_started_at_ns,
-            )
-        pending.details["handler_completion_latency_ns"] = max(
-            0,
-            pending.details["handler_completed_at_ns"] - pending.latched_at_ns,
-        )
-        self._publish_interrupt_context(pending)
-
-        auto_resume = (
-            not handler_failed
-            and disposition in {"resume_node", "resume_subtree"}
-            and pending.preemption_mode == "hold_cycle"
-        )
-        if auto_resume:
-            bb = py_trees.blackboard.Client(name="cycle_manager_interrupt_resume")
-            bb.register_key(key="stop_requested", access=py_trees.common.Access.WRITE)
-            bb.stop_requested = False
-            kernel_status = self._kernel.get_status()
-            if kernel_status.state == ExecutionState.PAUSED:
-                self._kernel.resume()
-            with self._lock:
-                self._state = CycleState.RUNNING
-                self._active_interrupt_handler = None
-            self._notify_interrupt_event(
-                action="handler_completed",
-                interrupt_id=pending.interrupt_id,
-                source=pending.source_id,
-                policy_id=pending.policy_id,
-                preemption_mode=pending.preemption_mode,
-                disposition=disposition,
-                active_node_id=pending.active_node_id,
-                active_move_id=pending.active_move_id,
-                details=dict(pending.details),
-            )
-            self._clear_pending_interrupt(action="cleared", reason="handler_auto_resume")
-            return
-
-        if not handler_failed and disposition == "restart_subtree":
-            restart_error = self._restart_interrupted_subtree(pending)
-            if restart_error is None:
-                self._notify_interrupt_event(
-                    action="handler_completed",
-                    interrupt_id=pending.interrupt_id,
-                    source=pending.source_id,
-                    policy_id=pending.policy_id,
-                    preemption_mode=pending.preemption_mode,
-                    disposition=disposition,
-                    active_node_id=pending.active_node_id,
-                    active_move_id=pending.active_move_id,
-                    details=dict(pending.details),
-                )
-                self._clear_pending_interrupt(
-                    action="cleared",
-                    reason="handler_restart_subtree",
-                )
-                return
-            handler_failed = True
-            disposition = "failed"
-            pending.details["handler_failure_reason"] = "restart_subtree_failed"
-            pending.details["handler_last_error"] = restart_error
-            error = restart_error
-
-        if not handler_failed and disposition == "resumable_hold":
-            next_state = CycleState.STOPPED
-            reason = "handler_completed_resumable_hold"
-        else:
-            next_state = CycleState.STOPPED
-            reason = (
-                "handler_failed"
-                if handler_failed
-                else f"handler_completed_{disposition}"
-            )
-
-        if handler_failed or disposition in {"failed", "escalate"}:
-            self._error = error or f"Interrupt handler '{pending.handler_id}' failed"
-
-        self._set_stop_requested_flag(
-            True,
-            client_name="cycle_manager_interrupt_handler_restore_stop_flag",
-        )
-        with self._lock:
-            self._state = next_state
-            active = self._active_interrupt_handler
-            self._active_interrupt_handler = None
-        self._cleanup_interrupt_handler_tree(active)
-        self._tick_pause_event.clear()
-        self._notify_interrupt_event(
-            action="handler_completed" if not handler_failed else "handler_failed",
-            interrupt_id=pending.interrupt_id,
-            source=pending.source_id,
-            policy_id=pending.policy_id,
-            preemption_mode=pending.preemption_mode,
-            disposition=disposition,
-            active_node_id=pending.active_node_id,
-            active_move_id=pending.active_move_id,
-            details={"reason": reason} | dict(pending.details),
-        )
-
-    def _tick_interrupt_handler(self) -> None:
-        """Tick the active interrupt handler subtree once."""
-        with self._lock:
-            active = self._active_interrupt_handler
-            pending = self._pending_interrupt
-        if active is None or pending is None:
-            with self._lock:
-                active = self._active_interrupt_handler
-                self._active_interrupt_handler = None
-                self._state = CycleState.STOPPED
-            self._cleanup_interrupt_handler_tree(active)
-            self._tick_pause_event.clear()
-            return
-
-        try:
-            active.tree.tick()
-        except Exception:
-            error_msg = traceback.format_exc()
-            active.last_error = error_msg
-            active.completed_at_ns = time.monotonic_ns()
-            pending.details["handler_last_error"] = error_msg
-            self._apply_interrupt_disposition(
-                pending,
-                handler_failed=True,
-                error=error_msg,
-            )
-            return
-
-        active.tick_count += 1
-        active.last_status = (
-            active.tree.root.status.value
-            if active.tree.root.status is not None
-            else py_trees.common.Status.INVALID.value
-        )
-        pending.details["handler_tick_count"] = active.tick_count
-        pending.details["handler_root_status"] = active.last_status
-        pending.details["handler_elapsed_ns"] = time.monotonic_ns() - active.started_at_ns
-        self._publish_interrupt_context(pending)
-
-        status = active.tree.root.status
-        if status == py_trees.common.Status.RUNNING:
-            if (
-                active.deadline_at_ns is not None
-                and time.monotonic_ns() >= active.deadline_at_ns
-            ):
-                active.completed_at_ns = time.monotonic_ns()
-                pending.details["handler_failure_reason"] = "timeout"
-                pending.details["handler_timed_out_at_ns"] = active.completed_at_ns
-                error_msg = (
-                    f"Interrupt handler '{active.handler_id}' timed out after "
-                    f"{active.timeout_s:.3f}s"
-                )
-                active.last_error = error_msg
-                pending.details["handler_last_error"] = error_msg
-                self._apply_interrupt_disposition(
-                    pending,
-                    handler_failed=True,
-                    error=error_msg,
-                )
-                return
-            return
-
-        active.completed_at_ns = time.monotonic_ns()
-        self._apply_interrupt_disposition(pending)
-
     def _refresh_signal_registry(self) -> None:
         """Poll external signal providers and mirror fresh values to blackboard."""
         now_ns = time.monotonic_ns()
@@ -1673,27 +1022,7 @@ class CycleManager:
                 continue  # Paused, loop again
 
             self._refresh_signal_registry()
-            with self._lock:
-                current_state = self._state
-            if current_state == CycleState.INTERRUPT_HANDLER:
-                kernel_events = self._drain_kernel_events()
-                deferred = self._match_interrupt_policy(self._node_statuses, kernel_events)
-                if deferred is not None:
-                    self._queue_deferred_interrupt(deferred)
-                start_time = time.monotonic()
-                self._tick_interrupt_handler()
-                elapsed = time.monotonic() - start_time
-                sleep_time = period_s - elapsed
-                if sleep_time > 0:
-                    time.sleep(sleep_time)
-                continue
 
-            kernel_events = self._drain_kernel_events()
-            pending = self._match_interrupt_policy(self._node_statuses, kernel_events)
-            if pending is not None:
-                self._apply_interrupt_preemption(pending)
-                continue
-            
             # Tick the tree
             start_time = time.monotonic()
             try:
@@ -1716,11 +1045,6 @@ class CycleManager:
             _collect_statuses(self._tree.root, statuses)
             with self._lock:
                 self._node_statuses = statuses
-
-            pending = self._match_interrupt_policy(statuses, kernel_events)
-            if pending is not None:
-                self._apply_interrupt_preemption(pending)
-                continue
 
             # Motion soft-fail: a motion node has captured a runtime
             # failure (collision, planning timeout, execution rejection,
@@ -1814,11 +1138,6 @@ class CycleManager:
     def pending_delegated_recovery(self) -> Optional[DelegatedRecoveryRequest]:
         """Current delegated recovery request waiting to be serviced, if any."""
         return self._pending_delegated_recovery
-
-    @property
-    def pending_interrupt(self) -> Optional[PendingInterrupt]:
-        """Current latched interrupt waiting for reset/resume/handler execution."""
-        return self._pending_interrupt
 
     @staticmethod
     def _normalize_blackboard_key(key: str) -> str:
@@ -2019,286 +1338,6 @@ class CycleManager:
             self._on_recovery_exhausted(node.name, node.id, trigger.value)
         except Exception:
             logger.exception("recovery exhausted callback failed")
-
-    def _notify_interrupt_event(self, **payload: Any) -> None:
-        """Best-effort callback for interrupt lifecycle events."""
-        if self._on_interrupt_event is None:
-            return
-        try:
-            self._on_interrupt_event(**payload)
-        except Exception:
-            logger.exception("interrupt callback failed")
-
-    def _read_interrupt_source_active(
-        self,
-        source,
-        kernel_events: list[dict[str, Any]],
-    ) -> tuple[bool, dict[str, Any]]:
-        """Resolve an interrupt source into an active/inactive signal."""
-        if source.adapter == "kernel":
-            for event in kernel_events:
-                if event.get("type") == source.signal:
-                    return True, {"kernel_event": dict(event)}
-            return False, {}
-
-        registry_record = self._signal_registry.get_signal(
-            source.adapter,
-            source.signal,
-            now_ns=time.monotonic_ns(),
-        )
-        if registry_record is not None:
-            details = {
-                "registry_signal": registry_record.signal,
-                "registry_adapter": registry_record.adapter,
-                "registry_provider": registry_record.provider_id,
-                "registry_freshness": registry_record.freshness,
-                "mirror_key": registry_record.mirror_key,
-                "observed_at_ns": registry_record.observed_at_ns,
-            }
-            if registry_record.metadata:
-                details["metadata"] = dict(registry_record.metadata)
-            if registry_record.freshness != "fresh":
-                return False, details
-            return bool(registry_record.value), details
-
-        runtime_key = self._normalize_blackboard_key(source.signal)
-        try:
-            value = py_trees.blackboard.Blackboard.get(runtime_key)
-        except KeyError:
-            return False, {"runtime_key": runtime_key, "present": False}
-        return bool(value), {"runtime_key": runtime_key, "present": True}
-
-    def _active_program_nodes(self, statuses: dict[str, str]) -> list[Any]:
-        """Return currently running program tree nodes in deterministic order."""
-        program = self._runner.program
-        if program is None or program.tree is None:
-            return []
-        return [
-            node
-            for node in _iter_tree_nodes(program.tree)
-            if statuses.get(node.name) == py_trees.common.Status.RUNNING.value
-        ]
-
-    def _policy_matches_node(self, policy, node) -> bool:
-        applies_to = policy.applies_to or {}
-        if not applies_to:
-            return True
-
-        if "subtree_root" in applies_to:
-            root_name = applies_to["subtree_root"]
-            program = self._runner.program
-            if program is None or program.tree is None:
-                return False
-            matching_root = next(
-                (candidate for candidate in _iter_tree_nodes(program.tree) if candidate.name == root_name),
-                None,
-            )
-            if matching_root is None:
-                return False
-            subtree_names = {candidate.name for candidate in _iter_tree_nodes(matching_root)}
-            if node.name not in subtree_names:
-                return False
-
-        node_ids = set(applies_to.get("node_ids", []))
-        if node_ids and node.id not in node_ids:
-            return False
-
-        node_kinds = set(applies_to.get("node_kinds", []))
-        if node_kinds and node.id not in node_kinds:
-            return False
-
-        node_names = set(applies_to.get("node_names", []))
-        if node_names and node.name not in node_names:
-            return False
-
-        if applies_to.get("interruptible_only"):
-            catalog = self._runner.catalog
-            if catalog is None:
-                return False
-            try:
-                entry = catalog.get(node.id)
-            except KeyError:
-                return False
-            if not entry.interruptible:
-                return False
-
-        return True
-
-    def _match_interrupt_policy(
-        self,
-        statuses: dict[str, str],
-        kernel_events: list[dict[str, Any]],
-    ) -> Optional[PendingInterrupt]:
-        """Return the highest-priority interrupt that should be latched now."""
-        deployment = self._runner.deployment
-        program = self._runner.program
-        if (
-            deployment is None
-            or program is None
-            or not deployment.interrupt_sources
-        ):
-            return None
-        if self._pending_interrupt is None:
-            deferred = self._pop_deferred_interrupt()
-            if deferred is not None:
-                return deferred
-
-        active_nodes = self._active_program_nodes(statuses)
-        source_candidates: list[tuple[int, str, Any, dict[str, Any]]] = []
-        for source_id, source in deployment.interrupt_sources.items():
-            active, details = self._read_interrupt_source_active(source, kernel_events)
-            previous = self._interrupt_source_levels.get(source_id, False)
-            self._interrupt_source_levels[source_id] = active
-            if not active:
-                continue
-            if source.kind == "edge" and previous:
-                continue
-            source_candidates.append((source.priority, source_id, source, details))
-
-        source_candidates.sort(key=lambda item: (-item[0], item[1]))
-        kernel_status = self._kernel.get_status()
-        for _, source_id, source, source_details in source_candidates:
-            matched_policy = None
-            matched_node = None
-            for policy in program.interrupt_policies.values():
-                if policy.source != source_id:
-                    continue
-                matched_node = next(
-                    (node for node in active_nodes if self._policy_matches_node(policy, node)),
-                    None,
-                )
-                if matched_node is None:
-                    continue
-                matched_policy = policy
-                break
-            if matched_policy is not None and matched_node is not None:
-                return PendingInterrupt(
-                    interrupt_id=uuid.uuid4().hex[:12],
-                    source_id=source_id,
-                    source_adapter=source.adapter,
-                    signal=source.signal,
-                    kind=source.kind,
-                    priority=source.priority,
-                    maskable=source.maskable,
-                    policy_id=matched_policy.id,
-                    handler_id=matched_policy.handler,
-                    preemption_mode=matched_policy.preemption_mode,
-                    after_handler=matched_policy.after_handler,
-                    active_node_name=matched_node.name,
-                    active_node_id=matched_node.id,
-                    active_move_id=kernel_status.active_move_id or None,
-                    details=source_details,
-                )
-            if not source.maskable:
-                fallback_node = active_nodes[0] if active_nodes else None
-                return PendingInterrupt(
-                    interrupt_id=uuid.uuid4().hex[:12],
-                    source_id=source_id,
-                    source_adapter=source.adapter,
-                    signal=source.signal,
-                    kind=source.kind,
-                    priority=source.priority,
-                    maskable=source.maskable,
-                    policy_id=None,
-                    handler_id=None,
-                    preemption_mode="latched_fault",
-                    after_handler="halted",
-                    active_node_name=fallback_node.name if fallback_node is not None else None,
-                    active_node_id=fallback_node.id if fallback_node is not None else None,
-                    active_move_id=kernel_status.active_move_id or None,
-                    details={"reason": "unhandled_non_maskable_source"} | dict(source_details),
-                )
-        return None
-
-    def _apply_interrupt_preemption(self, pending: PendingInterrupt) -> None:
-        """Latch the interrupt into a deterministic stopped/held runtime state."""
-        self._quiesce_runtime(
-            client_name="cycle_manager_interrupt_stop",
-            kernel_action=(
-                "pause_if_executing"
-                if pending.preemption_mode == "hold_cycle"
-                else "stop_if_active"
-            ),
-        )
-
-        with self._lock:
-            self._pending_interrupt = pending
-            self._active_interrupt_handler = None
-            self._state = CycleState.STOPPED
-
-        pending.details["quiesce_completed_at_ns"] = time.monotonic_ns()
-        pending.details["quiesce_latency_ns"] = max(
-            0,
-            pending.details["quiesce_completed_at_ns"] - pending.latched_at_ns,
-        )
-        self._publish_interrupt_context(pending)
-
-        self._notify_interrupt_event(
-            action="latched",
-            interrupt_id=pending.interrupt_id,
-            source=pending.source_id,
-            policy_id=pending.policy_id,
-            preemption_mode=pending.preemption_mode,
-            disposition=pending.after_handler,
-            active_node_id=pending.active_node_id,
-            active_move_id=pending.active_move_id,
-            details={
-                "source_adapter": pending.source_adapter,
-                "signal": pending.signal,
-                "priority": pending.priority,
-                "maskable": pending.maskable,
-                "active_node_name": pending.active_node_name,
-                "handler_id": pending.handler_id,
-            }
-            | dict(pending.details),
-        )
-
-        if self._try_activate_interrupt_handler(pending):
-            return
-
-    def _clear_pending_interrupt(self, *, action: str, reason: str) -> None:
-        with self._lock:
-            pending = self._pending_interrupt
-            active = self._active_interrupt_handler
-            if pending is None:
-                return
-            self._pending_interrupt = None
-            self._active_interrupt_handler = None
-        self._cleanup_interrupt_handler_tree(active)
-        self._clear_interrupt_context()
-        cleared_at_ns = time.monotonic_ns()
-        clear_details = {
-            "reason": reason,
-            "cleared_at_ns": cleared_at_ns,
-            "clear_latency_ns": max(0, cleared_at_ns - pending.latched_at_ns),
-        }
-        if reason == "operator_resume":
-            clear_details["operator_resume_latency_ns"] = max(
-                0,
-                cleared_at_ns - pending.latched_at_ns,
-            )
-        elif reason == "handler_auto_resume":
-            clear_details["auto_resume_latency_ns"] = max(
-                0,
-                cleared_at_ns - pending.latched_at_ns,
-            )
-        elif reason == "handler_restart_subtree":
-            clear_details["restart_clear_latency_ns"] = max(
-                0,
-                cleared_at_ns - pending.latched_at_ns,
-            )
-
-        self._notify_interrupt_event(
-            action=action,
-            interrupt_id=pending.interrupt_id,
-            source=pending.source_id,
-            policy_id=pending.policy_id,
-            preemption_mode=pending.preemption_mode,
-            disposition=pending.after_handler,
-            active_node_id=pending.active_node_id,
-            active_move_id=pending.active_move_id,
-            details=clear_details,
-        )
 
     def _find_delegated_recovery_candidate(
         self,

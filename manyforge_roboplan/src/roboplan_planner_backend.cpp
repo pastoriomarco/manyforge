@@ -1,5 +1,7 @@
 #include <manyforge_roboplan/roboplan_planner_backend.hpp>
 
+#include <manyforge_roboplan/collision_diagnostics_capture.hpp>
+
 #include <Eigen/Dense>
 #include <cmath>
 #include <cstdlib>
@@ -63,13 +65,13 @@ CollisionDiagnostics collect_collision_diagnostics(
     const Eigen::VectorXd& q) {
   CollisionDiagnostics diagnostics;
 
-  std::ostringstream capture;
-  auto* previous = std::cout.rdbuf(capture.rdbuf());
-  scene->hasCollisions(q, true);
-  std::cout.rdbuf(previous);
-
-  diagnostics.raw_output = capture.str();
+  diagnostics.raw_output =
+      manyforge::roboplan_backend::capture_collision_diagnostics_stdout([&]() {
+        scene->hasCollisions(q, true);
+      });
   if (!diagnostics.raw_output.empty()) {
+    std::lock_guard<std::mutex> lock(
+        manyforge::roboplan_backend::collision_diagnostics_stdout_mutex());
     std::cout << diagnostics.raw_output;
   }
 

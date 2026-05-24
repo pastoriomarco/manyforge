@@ -165,6 +165,18 @@ struct CollisionGeometryDescriptor {
   CollisionOwnerKind owner_kind = CollisionOwnerKind::kFixture;
   CollisionGeometryKind geometry_kind = CollisionGeometryKind::kBox;
   Pose3DTO local_pose;
+  /// Full box dimensions in meters. Required when `geometry_kind == kBox`.
+  std::optional<Vector3DTO> box_dimensions_m;
+  /// Sphere radius in meters. Required when `geometry_kind == kSphere`.
+  std::optional<double> sphere_radius_m;
+  /// Cylinder radius / height in meters. Required when
+  /// `geometry_kind == kCylinder`.
+  std::optional<double> cylinder_radius_m;
+  std::optional<double> cylinder_height_m;
+  /// Capsule radius / height in meters. Required when
+  /// `geometry_kind == kCapsule`.
+  std::optional<double> capsule_radius_m;
+  std::optional<double> capsule_height_m;
   std::optional<std::string> source_uri;
   std::optional<std::string> source_hash;
   /// Capability labels such as "convex", "watertight", "visual_mesh",
@@ -226,6 +238,7 @@ enum class CollisionEngineStatus {
   kTimeout,
   kUnsupportedGeometry,
   kDiagnosticIncomplete,
+  kCancelled,
   kEngineError,
 };
 
@@ -290,6 +303,13 @@ struct CollisionResult {
   /// normalized_pairs_classified. When the evaluator runs, this MUST
   /// equal the snapshot's revision.revision_id rendered as a string.
   std::optional<std::string> policy_revision_used;
+
+  /// Free-form per-engine diagnostic payload. Required for fail-closed
+  /// statuses where operators need the concrete reason, for example
+  /// unsupported snapshot geometry, stale revisions, cancellation, unknown
+  /// backend contact names, or an unsupported snapshot_format_version.
+  /// Stable consumers SHOULD treat unknown keys as opaque.
+  std::map<std::string, std::string> raw_diagnostics;
 };
 
 /// One entry in CollisionPolicySnapshot::support_contacts (spec §3.8.1,
@@ -398,7 +418,7 @@ enum class CollisionEngineThreadSafetyClass {
 /// Engine capability descriptor (spec COLLISION_CHECKING_OWNERSHIP_PLAN
 /// §"Engine Capability And Mismatch Policy", added in Chunk 8 groundwork).
 ///
-/// Every adapter (RoboPlan / DirectCollisionQueryEngine / future MoveIt2 /
+/// Every adapter (RoboPlan / manyforge_collision / future MoveIt2 /
 /// future direct-Pinocchio) publishes one of these so callers can decide
 /// whether to ask for `distance`, `contact_points`, etc., before issuing
 /// the query, and so qualification can record what an engine claimed it
@@ -465,6 +485,105 @@ struct CollisionEngineMismatchRecord {
   std::optional<std::string> query_id;
   CollisionEngineMismatchDisposition disposition =
       CollisionEngineMismatchDisposition::kTolerated;
+};
+
+/// Categorical reason a collision validation failed (spec
+/// COLLISION_CHECKING_OWNERSHIP_PLAN §"Failure archive groundwork",
+/// added by the kernel-architecture sprint C-arch chunk). Distinct from
+/// `CollisionDecisionResult` because archive consumers want to slice by
+/// *why* the kernel rejected dispatch, not just the resulting action.
+enum class CollisionFailureKind {
+  /// Authoritative engine reported an in-collision pair that the policy
+  /// classified as `kBlockingCollision`.
+  kBlockingCollision,
+  /// A configured `support_contact` constraint was violated (initial
+  /// penetration, separation, or recontact).
+  kSupportContactViolation,
+  /// Engine returned `kDiagnosticIncomplete` for a query that required
+  /// full diagnostics.
+  kDiagnosticIncomplete,
+  /// Engine returned `kEngineError` (raised exception, internal
+  /// inconsistency, backend unavailability).
+  kEngineError,
+  /// Cancellation observed via `CollisionCancellationToken` (spec/260
+  /// §8 handshake).
+  kCancelled,
+  /// Workers borrowed different `CollisionWorldRevision`s, or the
+  /// revision drifted across the validation pass.
+  kSceneChangedDuringValidation,
+};
+
+/// One archived collision-validation failure (spec
+/// COLLISION_CHECKING_OWNERSHIP_PLAN §"Failure archive groundwork",
+/// added by the kernel-architecture sprint C-arch chunk).
+///
+/// Pushed by the `CollisionValidationCoordinator` (or by callers wrapping
+/// it) only when a validation pass produces a non-`kDispatch` decision.
+/// The archive does NOT record passing trajectories — that would make it
+/// useless as a triage surface and would silently inflate ingest cost.
+///
+/// Persistence shape is intentionally deferred for now: the v0 archive
+/// is an in-process ring buffer (`CollisionFailureArchive`) with an
+/// optional sink callback that external integrations (JSONL writer,
+/// telemetry bus, qualification harness) can wire up. The on-disk /
+/// long-retention persistence format will be decided once we have data
+/// on retention duration, blob sizes, and query patterns (per the
+/// defer-design-until-data rule).
+struct CollisionFailureArchiveEntry {
+  /// Stable identifier for cross-system correlation (UUID-ish). The
+  /// archive does NOT generate this; the caller (coordinator) supplies it.
+  std::string entry_id;
+  std::int64_t emitted_at_ns = 0;
+
+  /// Authoritative engine that produced the failing result.
+  std::string engine_id;
+  std::string engine_version;
+
+  /// World + policy revisions active when the failure was emitted.
+  CollisionWorldRevision collision_world_revision;
+  std::optional<std::string> policy_revision;
+
+  /// Categorical failure kind. See `CollisionFailureKind`.
+  CollisionFailureKind failure_kind = CollisionFailureKind::kBlockingCollision;
+
+  /// Kernel-facing decision recorded alongside the failure.
+  CollisionDecisionAction decision_action =
+      CollisionDecisionAction::kInconclusive;
+  CollisionDecisionSeverity decision_severity =
+      CollisionDecisionSeverity::kBlock;
+
+  /// Normalized colliding pairs at the point of failure (may be empty
+  /// for `kEngineError`, `kCancelled`, `kDiagnosticIncomplete`).
+  std::vector<CollisionPairId> normalized_pairs;
+
+  /// Trajectory-level coordinates of the failure. Optional because
+  /// some failures (e.g. cancellation) are not tied to a specific
+  /// waypoint.
+  std::optional<std::int64_t> first_failing_waypoint;
+  std::optional<std::int64_t> first_failing_time_ns;
+
+  /// Total waypoints in the trajectory the failure was found in.
+  /// Useful for "failure at 3/20" vs "failure at 19/20" triage.
+  std::int64_t trajectory_waypoint_count = 0;
+
+  /// Engine query duration that produced the failure, ns.
+  std::optional<std::int64_t> query_duration_ns;
+
+  /// Parallel pool snapshot: how many workers ran (1 means serial
+  /// fallback) and the fallback reason if any. Empty `fallback_reason`
+  /// with `worker_count_actually_used == 1` is also possible when the
+  /// coordinator was invoked directly without the pool.
+  int worker_count_actually_used = 1;
+  std::string fallback_reason;
+
+  /// Free-form per-engine diagnostic payload (engine_status text, raw
+  /// contact names, internal counters). Keys are engine-specific;
+  /// stable archive consumers SHOULD treat unknown keys as opaque.
+  std::map<std::string, std::string> raw_diagnostics;
+
+  /// Optional correlation identifier for downstream systems (program
+  /// id, move id, cycle id). Free-form.
+  std::optional<std::string> correlation_id;
 };
 
 }  // namespace manyforge::core

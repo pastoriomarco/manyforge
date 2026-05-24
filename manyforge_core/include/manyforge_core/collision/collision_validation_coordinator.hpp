@@ -9,6 +9,7 @@
 #include <vector>
 
 #include <manyforge_core/collision/collision_policy_evaluator.hpp>
+#include <manyforge_core/collision/i_collision_query_engine.hpp>
 #include <manyforge_core/ports/iplanning_context.hpp>
 #include <manyforge_core/time/iclock.hpp>
 #include <manyforge_core/types/collision.hpp>
@@ -92,6 +93,9 @@ struct CollisionValidationDecisionBundle {
   int pose_source_retries_used = 0;
   bool scene_changed_during_validation = false;
   bool churn_window_exceeded = false;
+  bool cancelled = false;
+  std::optional<std::string> cancellation_reason;
+  std::optional<std::int64_t> cancelled_at_waypoint_index;
   std::vector<CollisionValidationWaypointRecord> waypoint_records;
 };
 
@@ -142,6 +146,20 @@ class CollisionValidationCoordinator {
   CollisionValidationDecisionBundle validate_trajectory(
       IPlanningContext& context, const TrajectoryDTO& trajectory);
 
+  /// Validate a full trajectory in waypoint order against a scene-aware
+  /// collision-query engine and immutable collision-world snapshot.
+  ///
+  /// This is the production worker primitive for the manyforge_collision path: it
+  /// does not depend on `IPlanningContext`, planner-scene mutexes, or
+  /// planner-owned mutable state. The snapshot revision is borrowed once and
+  /// remains both the initial and final revision for the pass because the
+  /// snapshot is immutable.
+  CollisionValidationDecisionBundle validate_trajectory(
+      const CollisionWorldSnapshot& snapshot,
+      ICollisionQueryEngine& engine,
+      const TrajectoryDTO& trajectory,
+      const CollisionCancellationToken& cancel);
+
   /// Snapshot view of the active policy.
   const CollisionPolicySnapshot& policy_snapshot() const {
     return config_.policy_snapshot;
@@ -151,9 +169,36 @@ class CollisionValidationCoordinator {
   CollisionValidationDecisionBundle run_pass_once(
       IPlanningContext& context, const TrajectoryDTO& trajectory);
 
+  CollisionValidationDecisionBundle run_pass_once(
+      const CollisionWorldSnapshot& snapshot,
+      ICollisionQueryEngine& engine,
+      const TrajectoryDTO& trajectory,
+      const CollisionCancellationToken& cancel);
+
   /// Classify a single waypoint and update support-contact state.
   CollisionValidationWaypointRecord classify_one(
       IPlanningContext& context, const RobotStateDTO& state,
+      std::int64_t waypoint_index,
+      std::optional<std::int64_t> time_from_start_ns,
+      const CollisionWorldRevision& borrowed_revision);
+
+  CollisionValidationWaypointRecord classify_one(
+      const CollisionWorldSnapshot& snapshot,
+      ICollisionQueryEngine& engine,
+      const RobotStateDTO& state,
+      std::int64_t waypoint_index,
+      std::optional<std::int64_t> time_from_start_ns,
+      const CollisionWorldRevision& borrowed_revision,
+      const CollisionCancellationToken& cancel);
+
+  CollisionQuery make_query(
+      const RobotStateDTO& state,
+      std::int64_t waypoint_index,
+      std::optional<std::int64_t> time_from_start_ns,
+      const CollisionWorldRevision& borrowed_revision) const;
+
+  CollisionValidationWaypointRecord classify_result(
+      CollisionResult result,
       std::int64_t waypoint_index,
       std::optional<std::int64_t> time_from_start_ns,
       const CollisionWorldRevision& borrowed_revision);

@@ -61,47 +61,10 @@ def _split_csv_query(value: str | None) -> list[str] | None:
     return items or None
 
 
-def _interrupt_timing_payload(details: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "quiesceCompletedAtNs": details.get("quiesce_completed_at_ns"),
-        "quiesceLatencyNs": details.get("quiesce_latency_ns"),
-        "handlerStartedAtNs": details.get("handler_started_at_ns"),
-        "handlerStartLatencyNs": details.get("handler_start_latency_ns"),
-        "handlerPostQuiesceLatencyNs": details.get("handler_post_quiesce_latency_ns"),
-        "handlerCompletedAtNs": details.get("handler_completed_at_ns"),
-        "handlerDurationNs": details.get("handler_duration_ns"),
-        "handlerCompletionLatencyNs": details.get("handler_completion_latency_ns"),
-        "deferredWaitNs": details.get("deferred_wait_ns"),
-        "restartCompletedAtNs": details.get("restart_completed_at_ns"),
-        "restartCompletionLatencyNs": details.get("restart_completion_latency_ns"),
-        "clearedAtNs": details.get("cleared_at_ns"),
-        "clearLatencyNs": details.get("clear_latency_ns"),
-        "operatorResumeLatencyNs": details.get("operator_resume_latency_ns"),
-        "autoResumeLatencyNs": details.get("auto_resume_latency_ns"),
-        "restartClearLatencyNs": details.get("restart_clear_latency_ns"),
-    }
-
-
 def _operator_action_state(
     *,
     cycle_state: str,
-    pending_interrupt: dict[str, Any] | None,
 ) -> tuple[str, bool, bool, bool]:
-    if cycle_state == "interrupt_handler":
-        return ("wait", False, False, False)
-    if pending_interrupt is not None:
-        details = pending_interrupt.get("details") or {}
-        if bool(details.get("ack_required")):
-            return ("acknowledge", False, False, True)
-        handler_state = str(details.get("handler_state", "latched"))
-        after_handler = str(pending_interrupt.get("afterHandler") or "")
-        if cycle_state == "stopped" and after_handler == "resumable_hold" and handler_state == "completed":
-            return ("resume", True, False, False)
-        if after_handler in {"halted", "failed", "escalate"}:
-            return ("reset", False, True, False)
-        if handler_state in {"running", "latched"}:
-            return ("wait", False, False, False)
-        return ("reset", False, True, False)
     if cycle_state == "stopped":
         return ("resume", True, False, False)
     return ("none", False, False, False)
@@ -222,7 +185,6 @@ def build_execution_digest_payload(state: ComposerState) -> dict[str, Any]:
                 f"'{signal_data.get('adapter')}' is stale"
             )
     delegated_recovery_request = None
-    pending_interrupt = None
     if state.cycle_manager is not None and state.cycle_manager.pending_delegated_recovery is not None:
         request = state.cycle_manager.pending_delegated_recovery
         delegated_recovery_request = {
@@ -245,46 +207,6 @@ def build_execution_digest_payload(state: ComposerState) -> dict[str, Any]:
         warnings.append(
             f"Delegated recovery requested by '{request.trigger_node_instance}' ({request.trigger_reason.value if hasattr(request.trigger_reason, 'value') else request.trigger_reason})"
         )
-    if state.cycle_manager is not None and state.cycle_manager.pending_interrupt is not None:
-        pending = state.cycle_manager.pending_interrupt
-        interrupt_details = dict(pending.details)
-        pending_interrupt = {
-            "interruptId": pending.interrupt_id,
-            "sourceId": pending.source_id,
-            "sourceAdapter": pending.source_adapter,
-            "signal": pending.signal,
-            "kind": pending.kind,
-            "priority": pending.priority,
-            "maskable": pending.maskable,
-            "policyId": pending.policy_id,
-            "handlerId": pending.handler_id,
-            "preemptionMode": pending.preemption_mode,
-            "afterHandler": pending.after_handler,
-            "activeNodeName": pending.active_node_name,
-            "activeNodeId": pending.active_node_id,
-            "activeMoveId": pending.active_move_id,
-            "latchedAtNs": pending.latched_at_ns,
-            "requiredAction": "none",
-            "resumeAllowed": False,
-            "resetRequired": False,
-            "ackRequired": False,
-            "timing": _interrupt_timing_payload(interrupt_details),
-            "details": interrupt_details,
-        }
-        handler_state = interrupt_details.get("handler_state")
-        if cycle_state == "interrupt_handler":
-            warnings.append(
-                f"Interrupt handler '{pending.handler_id or pending.source_id}' is executing "
-                f"for source '{pending.source_id}'"
-            )
-        else:
-            warnings.append(
-                f"Interrupt latched from '{pending.source_id}' ({pending.preemption_mode} -> {pending.after_handler})"
-            )
-        if isinstance(handler_state, str) and handler_state not in {"latched", "running"}:
-            warnings.append(
-                f"Interrupt handler state: {handler_state}"
-            )
     if runtime_override_state.get("has_active"):
         warnings.append(
             f"{runtime_override_state['active_count']} active runtime override(s) applied"
@@ -312,16 +234,8 @@ def build_execution_digest_payload(state: ComposerState) -> dict[str, Any]:
         elapsed_s = max(0.0, (time.monotonic_ns() - started_at_ns) / 1_000_000_000.0)
 
     required_operator_action, resume_allowed, reset_required, ack_required = (
-        _operator_action_state(
-            cycle_state=cycle_state,
-            pending_interrupt=pending_interrupt,
-        )
+        _operator_action_state(cycle_state=cycle_state)
     )
-    if pending_interrupt is not None:
-        pending_interrupt["requiredAction"] = required_operator_action
-        pending_interrupt["resumeAllowed"] = resume_allowed
-        pending_interrupt["resetRequired"] = reset_required
-        pending_interrupt["ackRequired"] = ack_required
     if required_operator_action != "none":
         warnings.append(f"Operator action required: {required_operator_action}")
 
@@ -346,7 +260,6 @@ def build_execution_digest_payload(state: ComposerState) -> dict[str, Any]:
         warnings=warnings,
         runtimeOverrideState=runtime_override_state,
         delegatedRecoveryRequest=delegated_recovery_request,
-        pendingInterrupt=pending_interrupt,
         requiredOperatorAction=required_operator_action,
         resumeAllowed=resume_allowed,
         resetRequired=reset_required,

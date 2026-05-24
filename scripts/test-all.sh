@@ -261,22 +261,6 @@ run_qualification_tests() {
     fi
 }
 
-run_qualification_interrupt_tests() {
-    section "Advanced interrupt qualification matrix"
-    cd "$WORKSPACE"
-    setup_pythonpath
-    if ! python_has_modules fastapi py_trees httpx uvicorn yaml; then
-        skip "Missing Python deps for interrupt qualification runner"
-        return
-    fi
-    chmod +x ./scripts/qualify-interrupt-scenarios.sh ./scripts/run-scenarios.py
-    if ./scripts/qualify-interrupt-scenarios.sh; then
-        PASS=$((PASS + 1))
-    else
-        FAIL=$((FAIL + 1))
-    fi
-}
-
 run_qualification_native_tests() {
     section "Native live-evaluation qualification matrix"
     cd "$WORKSPACE"
@@ -347,9 +331,6 @@ case "$FILTER" in
     qualification)
         run_qualification_tests
         ;;
-    qualification-interrupt)
-        run_qualification_interrupt_tests
-        ;;
     qualification-native)
         run_qualification_native_tests
         ;;
@@ -361,7 +342,6 @@ case "$FILTER" in
         ;;
     qualification-all)
         run_qualification_tests
-        run_qualification_interrupt_tests
         run_qualification_native_tests
         run_qualification_soak_tests
         ;;
@@ -378,11 +358,10 @@ case "$FILTER" in
         run_composer_backend_tests
         run_composer_frontend_build
         run_qualification_tests
-        run_qualification_interrupt_tests
         run_qualification_native_tests
         ;;
     *)
-        echo "Usage: $0 [all|cpp|roboplan|bindings|python|composer|qualification|qualification-interrupt|qualification-native|qualification-soak|qualification-all|integration|ros]"
+        echo "Usage: $0 [all|cpp|roboplan|bindings|python|composer|qualification|qualification-native|qualification-soak|qualification-all|integration|ros]"
         exit 1
         ;;
 esac

@@ -37,8 +37,8 @@ hardening done before the first tag was granted.
 - **Cycle-manager Run-side auto-ack**: when the kernel reports
   `InterventionRequired` on Run from `STOPPED` and the leftover state is
   provably execution-local (no active streaming/direct-control lease, no
-  running intervention session, no blocking pending interrupt), the cycle
-  manager automatically acknowledges it through the new kernel API. Otherwise
+  running intervention session), the cycle manager automatically
+  acknowledges it through the new kernel API. Otherwise
   Run fails closed with a structured reason. See `spec/400` §6.6.2 and the
   audit-K4 decision.
 - **Direct-control and streaming observability**: direct-control WebSocket
@@ -101,7 +101,7 @@ hardening done before the first tag was granted.
     readiness rows.
 - **Behavior + HMI** (`manyforge_behavior`, `manyforge_hmi`)
   - py_trees-based behavior-tree runner with `CycleManager`
-    (run/pause/stop/reset, interrupt handling, intervention sessions).
+    (run/pause/stop/reset, intervention sessions).
   - 3D HMI/scene visualization and control-panel surfaces.
 - **ROS bringup** (`manyforge_ros`, `manyforge_ros_bringup`)
   - Order-tolerant `isaac_demo_supervisor` ROS node that loads the Composer
@@ -118,7 +118,7 @@ hardening done before the first tag was granted.
   - Nine named scenarios including Isaac+AI
     (`isaac-ur10e-light-scene-assistant`) and the
     `ur5-simple-pick-place` 3-step test fixture. Old short names
-    (`pick-place`, `interrupt`, `ur10e`, `shape-pick`, `vision-pose`,
+    (`pick-place`, `ur10e`, `shape-pick`, `vision-pose`,
     `assistant-authoring`, `isaac-light`, `isaac-assistant`) still resolve via
     an alias table with a one-time deprecation warning per launch.
   - Concern-organised lib modules under `scripts/lib/`.

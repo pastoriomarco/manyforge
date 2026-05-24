@@ -16,12 +16,20 @@ add_library(manyforge_core
   src/collision_policy_evaluator.cpp
   src/collision_validation_coordinator.cpp
   src/parallel_collision_validation_worker_pool.cpp
+  src/collision_world_snapshot_builder.cpp
+  src/interrupt_manager.cpp
   src/execution_kernel.cpp
 )
 target_include_directories(manyforge_core PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>
 )
+
+# The static library is linked into both standalone test executables AND
+# the pybind11 shared module (manyforge_core_py). Shared modules require
+# position-independent code from every object they consume; build the
+# static lib with PIC so a single .a serves both link paths.
+set_target_properties(manyforge_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 # Testing
 option(BUILD_TESTING "Build unit tests" ON)
@@ -98,6 +106,33 @@ if(BUILD_TESTING)
   target_link_libraries(test_collision_engine_mismatch_ledger PRIVATE
     manyforge_core GTest::gtest_main)
   gtest_discover_tests(test_collision_engine_mismatch_ledger
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_collision_failure_archive
+    test/test_collision_failure_archive.cpp)
+  target_link_libraries(test_collision_failure_archive PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_collision_failure_archive
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_content_hash test/test_content_hash.cpp)
+  target_link_libraries(test_content_hash PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_content_hash
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_collision_world_snapshot
+    test/test_collision_world_snapshot.cpp)
+  target_link_libraries(test_collision_world_snapshot PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_collision_world_snapshot
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_interrupt_manager
+    test/test_interrupt_manager.cpp)
+  target_link_libraries(test_interrupt_manager PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_interrupt_manager
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_execution_kernel test/test_execution_kernel.cpp)

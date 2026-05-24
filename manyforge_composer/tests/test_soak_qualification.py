@@ -32,6 +32,10 @@ from manyforge_behavior.kernel_client import (  # noqa: E402
 )
 from manyforge_composer.backend import routes_scene, routes_urdf  # noqa: E402
 from manyforge_composer.backend.event_recorder import EventRecorder  # noqa: E402
+from manyforge_composer.backend.models import (  # noqa: E402
+    SceneRobotResponse,
+    VisualSceneSnapshotResponse,
+)
 
 
 _POSE = {
@@ -92,6 +96,8 @@ class _SoakState:
         self._kernel = kernel
         self.cycle_manager = None
         self._last_known_joint_positions_rad: list[float] | None = None
+        self._visual_state_builder: Any | None = None
+        self._visual_state_sequence = 0
         self.program = SimpleNamespace(
             robot=SimpleNamespace(
                 base_frame="base",
@@ -128,6 +134,110 @@ class _SoakState:
 
     def get_object_frame_visibility(self, _object_id: str) -> bool:
         return True
+
+    def ensure_visual_state_publisher(self, builder: Any, *, period_s: float) -> None:
+        assert period_s > 0.0
+        self._visual_state_builder = builder
+
+    def visual_state_snapshot(self) -> tuple[Any | None, dict[str, Any]]:
+        if self._visual_state_builder is None:
+            return None, {
+                "timestamp_ns": 0,
+                "age_ms": None,
+                "last_duration_ms": None,
+                "last_error": None,
+                "last_error_detail": None,
+                "last_reason": "",
+                "publisher_running": False,
+                "publisher_period_s": 0.0,
+                "sequence_number": None,
+            }
+        # Keep this soak fixture synchronous and deterministic while still
+        # exercising the route's visual-snapshot read path. The production
+        # builder may use a separate Pinocchio FK model; this qualification
+        # fixture preserves the original contract under test: one batched
+        # backend FK call per scene-state poll, plus one TCP FK.
+        joint_names = self.kernel.get_joint_names()
+        joint_positions = {
+            name: position
+            for name, position in zip(
+                joint_names,
+                self.kernel.get_execution_snapshot().joint_positions_rad,
+            )
+        }
+        link_names = list(routes_urdf.visual_link_names_for_fk(self))
+        link_poses = self.kernel.get_link_poses(link_names, "world")
+        tcp_pose = self.kernel.get_link_pose("tcp", "base")
+        robot = SceneRobotResponse(
+            robot_id="soak_bot",
+            group_id="arm",
+            urdf_model_key=routes_urdf.active_urdf_model_key(self),
+            base_frame="base",
+            tcp_frame="tcp",
+            base_pose={},
+            joint_names=joint_names,
+            joint_positions=joint_positions,
+            tcp_pose_in_base=tcp_pose,
+        )
+        self._visual_state_sequence += 1
+        snapshot = VisualSceneSnapshotResponse(
+            sequence_number=self._visual_state_sequence,
+            timestamp_ns=time.monotonic_ns(),
+            world_frame="world",
+            model_key="soak-model",
+            robot=robot,
+            objects=[],
+            link_poses=link_poses,
+            grippers=[],
+            pose_sources=[],
+        )
+        return snapshot, {
+            "timestamp_ns": time.monotonic_ns(),
+            "age_ms": 0.0,
+            "last_duration_ms": 0.0,
+            "last_error": None,
+            "last_error_detail": None,
+            "last_reason": "soak_test",
+            "publisher_running": True,
+            "publisher_period_s": 0.05,
+            "sequence_number": self._visual_state_sequence,
+        }
+
+    def request_visual_state_publish(self, *, reason: str = "") -> None:
+        assert isinstance(reason, str)
+
+    def visual_scene_objects_snapshot(self) -> tuple[list[Any], dict[str, Any]]:
+        return [], {
+            "timestamp_ns": time.monotonic_ns(),
+            "age_ms": 0.0,
+            "refresh_attempt_ns": 0,
+            "refresh_attempt_age_ms": None,
+            "refresh_running": False,
+            "refresh_error": None,
+        }
+
+    def visual_scene_objects_for_link_poses(
+        self,
+        _link_poses: dict[str, dict[str, Any]] | None,
+    ) -> tuple[list[Any], dict[str, Any]]:
+        return self.visual_scene_objects_snapshot()
+
+    def request_visual_scene_objects_refresh(self, *, reason: str = "") -> None:
+        assert isinstance(reason, str)
+
+    def get_drivable_joint_names(self, *, allow_backend_refresh: bool = True) -> list[str]:
+        assert allow_backend_refresh in {True, False}
+        return self.kernel.get_joint_names()
+
+    def get_current_joint_positions(
+        self,
+        *,
+        joint_names: list[str],
+        allow_backend_joint_names: bool = True,
+    ) -> list[float] | None:
+        assert allow_backend_joint_names in {True, False}
+        snapshot = self.kernel.get_execution_snapshot()
+        return list(snapshot.joint_positions_rad[: len(joint_names)])
 
 
 def test_scene_state_soak_uses_one_batch_fk_per_poll(

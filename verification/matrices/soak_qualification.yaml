@@ -4,6 +4,3 @@ scenarios:
   - path: verification/scenarios/basic_pick_and_place_complete.scenario.yaml
     repeat: 3
     tags: [soak, deterministic]
-  - path: verification/scenarios/interrupt_pick_and_place_pause_resume.scenario.yaml
-    repeat: 3
-    tags: [soak, deterministic]

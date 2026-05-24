@@ -16,6 +16,7 @@ from typing import Any, Optional
 _ALLOWED_EVENT_TYPES = {
     "cache_hit",
     "cycle_error",
+    "cycle_started",
     "cycle_state_changed",
     "delegated_recovery_requested",
     "collision_detected",
@@ -40,7 +41,6 @@ _ALLOWED_EVENT_TYPES = {
 }
 _ALLOWED_EVENT_PREFIXES = (
     "intervention_",
-    "interrupt_",
     "model_call_",
     "pose_source_",
     "runtime_override_",
@@ -109,8 +109,6 @@ def _component_for_event(event_type: str) -> str:
         return "manyforge.runtime_override"
     if event_type.startswith("intervention_"):
         return "manyforge.intervention"
-    if event_type.startswith("interrupt_"):
-        return "manyforge.interrupt"
     if event_type.startswith("streaming_"):
         return "manyforge.direct_control"
     if event_type.startswith("cycle_"):
@@ -822,45 +820,6 @@ class EventRecorder:
                 "persistent_edit_policy": request.persistent_edit_policy,
                 "requested_from_state": request.requested_from_state,
             },
-        )
-
-    def record_interrupt_event(
-        self,
-        *,
-        action: str,
-        interrupt_id: str,
-        source: str,
-        policy_id: Optional[str] = None,
-        preemption_mode: Optional[str] = None,
-        disposition: Optional[str] = None,
-        active_node_id: Optional[str] = None,
-        active_move_id: Optional[str] = None,
-        run_id: Optional[str] = None,
-        parent_run_id: Optional[str] = None,
-        execution_mode: Optional[str] = None,
-        details: Optional[dict[str, Any]] = None,
-    ) -> None:
-        """Record an interrupt lifecycle event with a stable envelope."""
-        payload = dict(details or {})
-        payload["interrupt_id"] = interrupt_id
-        payload["source"] = source
-        if policy_id is not None:
-            payload["policy_id"] = policy_id
-        if preemption_mode is not None:
-            payload["preemption_mode"] = preemption_mode
-        if disposition is not None:
-            payload["disposition"] = disposition
-        if active_node_id is not None:
-            payload["active_node_id"] = active_node_id
-        if active_move_id is not None:
-            payload["active_move_id"] = active_move_id
-        self._record_event(
-            event_type=f"interrupt_{action}",
-            details=payload,
-            move_id=active_move_id,
-            run_id=run_id,
-            parent_run_id=parent_run_id,
-            execution_mode=execution_mode,
         )
 
     def record_model_event(

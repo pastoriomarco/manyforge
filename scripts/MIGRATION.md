@@ -77,7 +77,6 @@ alias forward.
 | Deprecated alias | Canonical name |
 |---|---|
 | `pick-place` | `ur5-pick-place` |
-| `interrupt` | `ur5-interrupt-pick-place` |
 | `ur10e` | `ur10e-pick-place` |
 | `shape-pick` | `ur5-semantic-shape-pick` |
 | `vision-pose` | `ur5-vision-pose-pick` |

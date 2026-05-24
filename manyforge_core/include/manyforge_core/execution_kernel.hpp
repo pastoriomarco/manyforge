@@ -2,7 +2,11 @@
 
 #include <manyforge_core/cache/trajectory_cache.hpp>
 #include <manyforge_core/collision/collision_policy.hpp>
+#include <manyforge_core/collision/i_collision_world_snapshot_publisher.hpp>
 #include <manyforge_core/collision/collision_validation_coordinator.hpp>
+#include <manyforge_core/collision/i_collision_query_engine.hpp>
+#include <manyforge_core/collision/parallel_collision_validation_worker_pool.hpp>
+#include <manyforge_core/interrupt/interrupt_manager.hpp>
 #include <manyforge_core/ports/iexecution_backend.hpp>
 #include <manyforge_core/ports/iplanner_backend.hpp>
 #include <manyforge_core/ports/iplanning_context.hpp>
@@ -21,6 +25,7 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <stop_token>
@@ -39,11 +44,23 @@ struct ExecutionKernelConfig {
   // enough for operator feedback while allowing one missed 30 Hz frame.
   double streaming_ik_timeout_s = 0.050;
 
+  // Direct-control collision validation has a tighter frame budget than
+  // batch trajectory validation. A target that cannot be validated inside
+  // this budget is rejected fail-closed instead of being dispatched late.
+  double streaming_collision_timeout_s = 0.010;
+
   // Native execution-backend lifecycle drains. ROS adapters expose their own
   // `stop_completion_timeout_s`; these fields provide equivalent knobs for
   // the non-ROS RoboPlan backend used by Composer/native simulation.
   double native_reset_completion_timeout_s = 5.0;
   double native_streaming_stop_completion_timeout_s = 5.0;
+
+  // Authoritative collision validation worker-pool sizing. The concrete
+  // engines are injected through core-owned ports; this knob only selects how
+  // many injected workers the kernel asks the pool to use. Values < 1 are
+  // normalized to 1 by the kernel.
+  int validation_collision_workers = 1;
+  int validation_collision_min_waypoints_for_parallel = 8;
 };
 
 /// Execution Kernel — single authority for motion execution governance.
@@ -155,16 +172,28 @@ class ExecutionKernel {
   Result<void> collision_check_tick();
 
   /// Install (or replace) the collision policy snapshot used by the
-  /// CollisionValidationCoordinator path (Chunk 5 of the collision-ownership
-  /// plan). When set, pre-execute validation routes through the coordinator
-  /// instead of the legacy collision_check + pre_execute_check path. Passing
-  /// nullopt restores the legacy path.
+  /// authoritative CollisionValidationCoordinator path.
   ///
   /// The kernel takes ownership of the snapshot via copy; per-pass support-
   /// contact state lives in a coordinator instance constructed inside
-  /// validate_trajectory().
+  /// validate_trajectory(). Passing nullopt is allowed only for tests or
+  /// bootstrap error paths; execution validation then fails closed because
+  /// there is no authoritative collision policy.
   void set_collision_validation_policy_snapshot(
       std::optional<CollisionPolicySnapshot> snapshot);
+
+  /// Install the authoritative collision validation world publisher and
+  /// query-engine workers. The publisher and engines are backend-agnostic
+  /// ManyForge-owned ports; RoboPlan / MoveIt / Isaac may publish snapshots or
+  /// implement the port, but the kernel never falls back to planner-internal
+  /// collision checks once Phase 3A is active.
+  ///
+  /// `publisher` must outlive the kernel. Engines are retained by shared_ptr
+  /// so the composition root can hand them to the kernel without additional
+  /// lifetime coupling.
+  void set_collision_validation_pipeline(
+      ICollisionWorldSnapshotPublisher& publisher,
+      std::vector<std::shared_ptr<ICollisionQueryEngine>> engines);
 
   /// Optional pose-source / per-state retry configuration for the
   /// CollisionValidationCoordinator. Has no effect until a policy snapshot is
@@ -182,6 +211,28 @@ class ExecutionKernel {
   CollisionValidationDecisionBundle
   run_predicted_path_monitor_diagnostic(
       const std::optional<RobotStateDTO>& predicted_state = std::nullopt);
+
+  // ---------------------------------------------------------------
+  // Kernel-native interrupt registration and latch surface (spec/260,
+  // sprint Chunk I-2). This chunk owns source/policy registration, signal
+  // ingestion, priority arbitration, latch visibility, disposition validation,
+  // and event emission. Phase-specific cancellation / execution preemption is
+  // wired in later Phase 3 chunks.
+  // ---------------------------------------------------------------
+
+  Result<void> register_interrupt_source(
+      const InterruptSourceDefinition& source);
+  Result<void> register_interrupt_policy(
+      const InterruptPolicyDefinition& policy);
+  InterruptIngestResult publish_fast_interrupt_signal(
+      const InterruptSignalUpdate& update);
+  InterruptIngestResult publish_supervisory_interrupt_signal(
+      const InterruptSignalUpdate& update);
+  InterruptIngestResult publish_fast_interrupt_signals(
+      const std::vector<InterruptSignalUpdate>& updates);
+  std::optional<InterruptLatch> get_active_interrupt_latch() const;
+  Result<InterruptIngestResult> apply_interrupt_disposition(
+      const InterruptDisposition& disposition);
 
   /// Subscribe to kernel events.
   /// @param callback Called for each event. Must be thread-safe.
@@ -206,8 +257,15 @@ class ExecutionKernel {
       uint64_t session_id,
       SoftStopStrategy strategy);
   Result<TrajectoryDTO> plan_trajectory(const ExecuteRequestDTO& request);
-  Result<void> validate_trajectory(const TrajectoryDTO& trajectory,
-                                   const ExecuteRequestDTO& request);
+  Result<CollisionWorldRevision> validate_trajectory(
+      const TrajectoryDTO& trajectory,
+      const ExecuteRequestDTO& request);
+  Result<CollisionWorldRevision> validate_streaming_target_collision(
+      const StreamingSessionConfigDTO& active_config,
+      const StreamingTargetDTO& resolved_target,
+      std::uint64_t validation_sequence,
+      std::uint64_t session_id,
+      std::uint64_t source_sequence);
   TrajectoryDTO build_remaining_trajectory(
       const TrajectoryDTO& trajectory,
       const ExecutionSnapshot& snapshot) const;
@@ -229,6 +287,26 @@ class ExecutionKernel {
   void start_collision_monitoring();
   void stop_collision_monitoring();
   void schedule_next_collision_monitor_tick(uint64_t generation);
+  CollisionWorldRevision current_authoritative_collision_world_revision() const;
+  std::shared_ptr<CollisionCancellationToken> install_validation_cancel_token();
+  void clear_validation_cancel_token(
+      const std::shared_ptr<CollisionCancellationToken>& token);
+  void request_validation_cancel_from_interrupt(
+      const InterruptIngestResult& result);
+  void mark_active_interrupt_preemption_result(
+      InterruptPreemptionResult result);
+  std::shared_ptr<CollisionCancellationToken>
+  install_streaming_target_cancel_token(std::uint64_t validation_sequence);
+  void clear_streaming_target_cancel_token(
+      const std::shared_ptr<CollisionCancellationToken>& token);
+  void cancel_active_streaming_target_validation(std::string reason);
+  void install_builtin_interrupt_sources();
+  InterruptIngestResult publish_runtime_collision_fault_interrupt(
+      const CollisionCheckResultDTO& check);
+  void apply_latched_interrupt_preemption(
+      const InterruptIngestResult& result);
+  InterruptRuntimeContext current_interrupt_context() const;
+  void emit_interrupt_events(const InterruptIngestResult& result);
 
   IPlannerBackend& planner_;
   IPlanningContext& context_;
@@ -241,16 +319,25 @@ class ExecutionKernel {
   ExecutionStateMachine sm_;
   StopPolicy stop_policy_;
   CollisionPolicy collision_policy_;
+  InterruptManager interrupt_manager_;
+  std::atomic<std::int64_t> runtime_collision_fault_sequence_{0};
 
-  // Optional collision validation coordinator state (Chunk 5). When
-  // coordinator_policy_snapshot_ holds a value, validate_trajectory()
-  // routes through the coordinator path; otherwise it stays on the legacy
-  // collision_policy_.pre_execute_check() path so kernels constructed
-  // before the migration retain prior behavior.
+  // Authoritative collision validation pipeline (Phase 3A). Missing policy,
+  // publisher, snapshot, or engines are configuration errors and fail closed;
+  // the previous planner-context collision_check fallback is not a supported
+  // execution path.
   mutable std::mutex coordinator_mutex_;
   std::optional<CollisionPolicySnapshot> coordinator_policy_snapshot_;
   PoseSourceRetryConfig coordinator_retry_config_{};
   std::int64_t coordinator_per_state_timeout_ns_ = 0;
+  ICollisionWorldSnapshotPublisher* collision_snapshot_publisher_ = nullptr;
+  std::vector<std::shared_ptr<ICollisionQueryEngine>> collision_validation_engines_;
+  mutable std::mutex validation_cancel_mutex_;
+  std::weak_ptr<CollisionCancellationToken> active_validation_cancel_token_;
+  mutable std::mutex streaming_collision_validation_mutex_;
+  mutable std::mutex streaming_cancel_mutex_;
+  std::weak_ptr<CollisionCancellationToken> active_streaming_target_cancel_token_;
+  std::atomic<std::uint64_t> streaming_target_validation_sequence_{0};
 
   // Serializes low-rate lifecycle authority transitions across execute,
   // streaming begin/end, stop, pause, resume, reset, and acknowledge. High-rate

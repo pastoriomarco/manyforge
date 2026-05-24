@@ -1883,7 +1883,6 @@ def _assert_program_draft_edit_allowed(state: ComposerState) -> None:
         raise HTTPException(status_code=404, detail="No program loaded")
     if state.cycle_manager is not None and state.cycle_manager.state.value in {
         "running",
-        "interrupt_handler",
         "direct_control",
     }:
         raise HTTPException(

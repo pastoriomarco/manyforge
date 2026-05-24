@@ -167,7 +167,7 @@ export function evaluateRobotCommandAuthority({
     }
   }
 
-  if (cycleState === 'running' || cycleState === 'interrupt_handler') {
+  if (cycleState === 'running') {
     return blocked(ROBOT_COMMAND_AUTHORITY_REASONS.cycleOwnsRobot);
   }
   if (

@@ -132,9 +132,9 @@ class ViserHmiServer:
         # Display in program panel
         self._program_panel.load_program(program)
         if self._robot_visualizer is not None:
-            self._robot_visualizer.set_base_pose(
-                getattr(getattr(program, "robot", None), "base_pose", {})
-            )
+            set_base_pose = getattr(self._robot_visualizer, "set_base_pose", None)
+            if callable(set_base_pose):
+                set_base_pose(getattr(getattr(program, "robot", None), "base_pose", {}))
 
         # Cache static scene metadata. Runtime pose/frame always comes from backend.
         self._scene_specs = {

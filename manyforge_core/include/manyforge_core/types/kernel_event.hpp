@@ -43,6 +43,23 @@ enum class KernelEventType {
   kStreamingSessionEnded,      // streaming session terminal (soft-stop or hard cancel)
   kErrorRaised,        // error occurred
   kCollisionDetected,  // collision detected during execution
+  // Kernel-native interrupt events (spec/260 §7). Details carry the required
+  // event payload in string-normalized form.
+  kInterruptSignalIngested,
+  kInterruptSignalRejectedStale,
+  kInterruptSignalRejectedClassViolation,
+  kInterruptSignalRejected,
+  kInterruptLatched,
+  kInterruptSuppressedByActiveMask,
+  kInterruptQueued,
+  kInterruptDroppedQueueOverflow,
+  kInterruptPreemptApplied,
+  kInterruptDispositionApplied,
+  kInterruptCleared,
+  kInterruptIngestOverflow,
+  kInterruptSourceClassViolation,
+  kInterruptRecoveryHandlerStarted,
+  kInterruptRecoveryHandlerCompleted,
 };
 
 /// Kernel event structure (spec §6.1)

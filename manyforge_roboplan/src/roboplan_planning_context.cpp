@@ -1,7 +1,7 @@
 #include <manyforge_roboplan/roboplan_planning_context.hpp>
 
 #include <manyforge_roboplan/collision_body_id_mapper.hpp>
-#include <manyforge_roboplan/direct_collision_query_engine.hpp>
+#include <manyforge_roboplan/collision_diagnostics_capture.hpp>
 
 #include <Eigen/Dense>
 #include <algorithm>
@@ -19,7 +19,13 @@
 #include <thread>
 #include <type_traits>
 
+#include <coal/collision_object.h>
+#include <coal/BVH/BVH_model.h>
+#include <coal/shape/convex.h>
+#include <coal/shape/geometric_shapes.h>
 #include <manyforge_core/collision/collision_policy_evaluator.hpp>
+#include <manyforge_core/collision/collision_world_snapshot_builder.hpp>
+#include <manyforge_core/types/content_hash.hpp>
 
 #include <roboplan/core/scene_utils.hpp>
 #include <stdexcept>
@@ -167,15 +173,6 @@ RoboPlanPlanningContext::~RoboPlanPlanningContext() = default;
 
 namespace {
 
-void fnv1a_mix(std::uint64_t& h, const std::string& s) {
-  for (const unsigned char c : s) {
-    h ^= static_cast<std::uint64_t>(c);
-    h *= 1099511628211ULL;
-  }
-  h ^= 0xffU;
-  h *= 1099511628211ULL;
-}
-
 std::string stable_double(double value) {
   std::ostringstream oss;
   oss << std::setprecision(17) << value;
@@ -226,6 +223,229 @@ void append_shape_entries(std::vector<std::string>& entries,
       shape);
 }
 
+std::string robot_link_parent_body_id(const std::string& robot_id,
+                                      const std::string& link_name) {
+  return "robot/" + robot_id + "/link/" + link_name;
+}
+
+bool robot_collision_body_id_matches_link(const core::CollisionBodyId& body_id,
+                                          const std::string& robot_id,
+                                          const std::string& link_name) {
+  const std::string prefix =
+      robot_link_parent_body_id(robot_id, link_name) + "/collision/";
+  return body_id.rfind(prefix, 0) == 0;
+}
+
+core::Vector3DTO vector3_from_eigen(const Eigen::Vector3d& value) {
+  core::Vector3DTO out;
+  out.x_m = value.x();
+  out.y_m = value.y();
+  out.z_m = value.z();
+  return out;
+}
+
+std::string effective_mesh_source_hash(const core::MeshShapeDTO& mesh) {
+  core::ContentHasher h;
+  h.mix("mesh_shape")
+      .mix(mesh.resource_uri)
+      .mix(mesh.scale.x_m)
+      .mix(mesh.scale.y_m)
+      .mix(mesh.scale.z_m);
+  return h.finalize();
+}
+
+void add_common_quality_label(core::CollisionGeometryDescriptor& descriptor,
+                              std::string label) {
+  descriptor.quality_labels.push_back(std::move(label));
+  std::sort(descriptor.quality_labels.begin(),
+            descriptor.quality_labels.end());
+  descriptor.quality_labels.erase(
+      std::unique(descriptor.quality_labels.begin(),
+                  descriptor.quality_labels.end()),
+      descriptor.quality_labels.end());
+}
+
+core::CollisionGeometryDescriptor descriptor_from_coal_geometry(
+    const core::CollisionBodyId& body_id,
+    const pinocchio::GeometryObject& geometry_object,
+    const core::Pose3DTO& local_pose) {
+  core::CollisionGeometryDescriptor descriptor;
+  descriptor.body_id = body_id;
+  descriptor.owner_kind = core::CollisionOwnerKind::kRobotLink;
+  descriptor.local_pose = local_pose;
+  descriptor.source_hash = geometry_object.name;
+  descriptor.quality_labels = {"robot_collision"};
+
+  const auto& geometry = geometry_object.geometry;
+  if (!geometry) {
+    descriptor.geometry_kind = core::CollisionGeometryKind::kCompound;
+    add_common_quality_label(descriptor, "missing_backend_geometry");
+    return descriptor;
+  }
+
+  auto apply_box_proxy = [&](const Eigen::Vector3d& min,
+                             const Eigen::Vector3d& max,
+                             const std::string& source_label) -> bool {
+    const Eigen::Vector3d size = max - min;
+    const Eigen::Vector3d center = 0.5 * (max + min);
+    if (!(size.array().isFinite()).all() ||
+        !(center.array().isFinite()).all() ||
+        !(size.array() > 0.0).all()) {
+      return false;
+    }
+
+    Eigen::Quaterniond q(local_pose.orientation.w, local_pose.orientation.x,
+                         local_pose.orientation.y, local_pose.orientation.z);
+    if (!std::isfinite(q.x()) || !std::isfinite(q.y()) ||
+        !std::isfinite(q.z()) || !std::isfinite(q.w()) ||
+        q.norm() <= 0.0) {
+      return false;
+    }
+    q.normalize();
+
+    descriptor.local_pose = local_pose;
+    const Eigen::Vector3d translated =
+        q.toRotationMatrix() * center +
+        Eigen::Vector3d(local_pose.position_m.x_m,
+                        local_pose.position_m.y_m,
+                        local_pose.position_m.z_m);
+    descriptor.local_pose.position_m = vector3_from_eigen(translated);
+    descriptor.geometry_kind = core::CollisionGeometryKind::kBox;
+    descriptor.box_dimensions_m = vector3_from_eigen(size);
+    add_common_quality_label(descriptor, "primitive");
+    add_common_quality_label(descriptor, "conservative_proxy");
+    add_common_quality_label(descriptor, source_label);
+    return true;
+  };
+
+  auto apply_points_proxy = [&](const auto& points,
+                                std::size_t count,
+                                const std::string& source_label) -> bool {
+    if (count == 0 || points == nullptr || points->size() < count) {
+      return false;
+    }
+    Eigen::Vector3d min = points->at(0);
+    Eigen::Vector3d max = points->at(0);
+    for (std::size_t i = 1; i < count; ++i) {
+      min = min.cwiseMin(points->at(i));
+      max = max.cwiseMax(points->at(i));
+    }
+    return apply_box_proxy(min, max, source_label);
+  };
+
+  auto apply_backend_aabb_proxy = [&]() -> bool {
+    if (geometry->aabb_radius < 0.0) {
+      return false;
+    }
+    return apply_box_proxy(geometry->aabb_local.min_,
+                           geometry->aabb_local.max_,
+                           "backend_aabb_proxy");
+  };
+
+  auto apply_mesh_points_proxy = [&]() -> bool {
+    const auto* bvh =
+        dynamic_cast<const coal::BVHModelBase*>(geometry.get());
+    if (bvh == nullptr) {
+      return false;
+    }
+    return apply_points_proxy(bvh->vertices,
+                              static_cast<std::size_t>(bvh->num_vertices),
+                              "backend_vertex_aabb_proxy");
+  };
+
+  auto apply_convex_points_proxy = [&]() -> bool {
+    const auto* convex =
+        dynamic_cast<const coal::ConvexBase*>(geometry.get());
+    if (convex == nullptr) {
+      return false;
+    }
+    return apply_points_proxy(convex->points,
+                              static_cast<std::size_t>(convex->num_points),
+                              "backend_vertex_aabb_proxy");
+  };
+
+  switch (geometry->getNodeType()) {
+    case coal::GEOM_BOX: {
+      const auto* box = dynamic_cast<const coal::Box*>(geometry.get());
+      if (box != nullptr) {
+        descriptor.geometry_kind = core::CollisionGeometryKind::kBox;
+        descriptor.box_dimensions_m = vector3_from_eigen(2.0 * box->halfSide);
+        add_common_quality_label(descriptor, "primitive");
+        return descriptor;
+      }
+      break;
+    }
+    case coal::GEOM_SPHERE: {
+      const auto* sphere = dynamic_cast<const coal::Sphere*>(geometry.get());
+      if (sphere != nullptr) {
+        descriptor.geometry_kind = core::CollisionGeometryKind::kSphere;
+        descriptor.sphere_radius_m = sphere->radius;
+        add_common_quality_label(descriptor, "primitive");
+        return descriptor;
+      }
+      break;
+    }
+    case coal::GEOM_CYLINDER: {
+      const auto* cylinder =
+          dynamic_cast<const coal::Cylinder*>(geometry.get());
+      if (cylinder != nullptr) {
+        descriptor.geometry_kind = core::CollisionGeometryKind::kCylinder;
+        descriptor.cylinder_radius_m = cylinder->radius;
+        descriptor.cylinder_height_m = 2.0 * cylinder->halfLength;
+        add_common_quality_label(descriptor, "primitive");
+        return descriptor;
+      }
+      break;
+    }
+    case coal::GEOM_CAPSULE: {
+      const auto* capsule = dynamic_cast<const coal::Capsule*>(geometry.get());
+      if (capsule != nullptr) {
+        const double radius = capsule->radius;
+        const double half_length = capsule->halfLength;
+        if (std::isfinite(radius) && std::isfinite(half_length) &&
+            radius > 0.0 && half_length > 0.0) {
+          // The Phase-2 manyforge_collision engine is intentionally primitive-box/sphere/
+          // cylinder only. Represent backend robot capsules as explicit
+          // conservative boxes so the snapshot stays consumable without
+          // silently dropping robot collision volume.
+          const Eigen::Vector3d min(-radius, -radius,
+                                    -(half_length + radius));
+          const Eigen::Vector3d max(radius, radius,
+                                    half_length + radius);
+          if (apply_box_proxy(min, max, "backend_capsule_aabb_proxy")) {
+            return descriptor;
+          }
+        }
+      }
+      break;
+    }
+    case coal::GEOM_CONVEX:
+      if (apply_convex_points_proxy() || apply_backend_aabb_proxy()) {
+        return descriptor;
+      }
+      descriptor.geometry_kind = core::CollisionGeometryKind::kConvexMesh;
+      add_common_quality_label(descriptor, "convex");
+      return descriptor;
+    default:
+      break;
+  }
+
+  // Industrial manyforge_collision workers must not rely on backend mesh BVH
+  // behavior that emits unstructured Coal numerical warnings. For robot-link
+  // mesh or compound collision geometry, publish a deterministic conservative
+  // AABB proxy in the geometry frame. This keeps the snapshot consumable by the
+  // primitive ManyForge-owned engine and makes the approximation explicit through
+  // quality labels.
+  if (apply_mesh_points_proxy() || apply_convex_points_proxy() ||
+      apply_backend_aabb_proxy()) {
+    return descriptor;
+  }
+
+  descriptor.geometry_kind = core::CollisionGeometryKind::kCompound;
+  add_common_quality_label(descriptor, "unsupported_backend_geometry");
+  return descriptor;
+}
+
 /// Deterministic fingerprint over the body inventory that affects body-id
 /// assignment. Two scenes with identical (object_id, attached) sets in any
 /// order produce identical fingerprints. Includes raw robot collision-body
@@ -249,15 +469,13 @@ std::string compute_body_identity_fingerprint(
   }
   std::sort(entries.begin(), entries.end());
 
-  std::uint64_t h = 1469598103934665603ULL;
-  fnv1a_mix(h, robot_id);
+  core::ContentHasher h;
+  h.mix("manyforge_roboplan/body_identity_fingerprint");
+  h.mix(robot_id);
   for (const auto& e : entries) {
-    fnv1a_mix(h, e);
+    h.mix(e);
   }
-
-  std::ostringstream oss;
-  oss << std::hex << h;
-  return oss.str();
+  return h.finalize();
 }
 
 core::CollisionDecisionResult merge_policy_collision_decision(
@@ -284,6 +502,8 @@ std::string collision_engine_status_text(core::CollisionEngineStatus status) {
       return "unsupported_geometry";
     case core::CollisionEngineStatus::kDiagnosticIncomplete:
       return "diagnostic_incomplete";
+    case core::CollisionEngineStatus::kCancelled:
+      return "cancelled";
     case core::CollisionEngineStatus::kEngineError:
       return "engine_error";
   }
@@ -352,21 +572,21 @@ void RoboPlanPlanningContext::reset_collision_policy_state() {
   // trajectory-scoped evaluator state.
 }
 
-void RoboPlanPlanningContext::set_direct_engine_for_compare(
-    std::shared_ptr<DirectCollisionQueryEngine> engine) {
-  std::scoped_lock lock(direct_engine_mutex_);
-  direct_engine_ = std::move(engine);
+void RoboPlanPlanningContext::set_collision_engine_for_compare(
+    std::shared_ptr<core::ICollisionQueryEngine> engine) {
+  std::scoped_lock lock(compare_engine_mutex_);
+  compare_engine_ = std::move(engine);
 }
 
 void RoboPlanPlanningContext::set_engine_mismatch_emitter(
     MismatchEmitter emitter) {
-  std::scoped_lock lock(direct_engine_mutex_);
+  std::scoped_lock lock(compare_engine_mutex_);
   mismatch_emitter_ = std::move(emitter);
 }
 
 void RoboPlanPlanningContext::set_engine_mismatch_record_emitter(
     MismatchRecordEmitter emitter) {
-  std::scoped_lock lock(direct_engine_mutex_);
+  std::scoped_lock lock(compare_engine_mutex_);
   mismatch_record_emitter_ = std::move(emitter);
 }
 
@@ -378,6 +598,28 @@ RoboPlanPlanningContext::current_collision_world_revision() {
   // truth for the world revision exposed via the IPlanningContext port.
   std::lock_guard<std::mutex> scene_lock(*scene_mutex_);
   return core::CollisionWorldRevision{world_revision_id_, world_content_hash_};
+}
+
+core::CollisionWorldSnapshotPtr RoboPlanPlanningContext::snapshot() const {
+  std::lock_guard<std::mutex> scene_lock(*scene_mutex_);
+  if (snapshot_cache_ &&
+      snapshot_cache_revision_id_ == world_revision_id_ &&
+      snapshot_cache_content_hash_ == world_content_hash_) {
+    return snapshot_cache_;
+  }
+
+  auto next = build_collision_world_snapshot_locked();
+  if (!next) {
+    snapshot_cache_.reset();
+    snapshot_cache_revision_id_ = 0;
+    snapshot_cache_content_hash_.clear();
+    return nullptr;
+  }
+
+  snapshot_cache_revision_id_ = world_revision_id_;
+  snapshot_cache_content_hash_ = world_content_hash_;
+  snapshot_cache_ = std::move(next);
+  return snapshot_cache_;
 }
 
 std::vector<core::CollisionWorldLedgerEntry>
@@ -415,7 +657,18 @@ void RoboPlanPlanningContext::publish_collision_world_revision_locked(
     std::scoped_lock map_lock(mapper_mutex_);
     robot_id = mapper_robot_id_;
   }
-  world_content_hash_ = compute_collision_world_content_hash_locked(robot_id);
+  auto next_snapshot = build_collision_world_snapshot_locked();
+  if (next_snapshot) {
+    world_content_hash_ = next_snapshot->revision.content_hash;
+    snapshot_cache_revision_id_ = world_revision_id_;
+    snapshot_cache_content_hash_ = world_content_hash_;
+    snapshot_cache_ = std::move(next_snapshot);
+  } else {
+    world_content_hash_ = compute_collision_world_content_hash_locked(robot_id);
+    snapshot_cache_.reset();
+    snapshot_cache_revision_id_ = 0;
+    snapshot_cache_content_hash_.clear();
+  }
 
   core::CollisionWorldLedgerEntry entry;
   entry.revision.revision_id = world_revision_id_;
@@ -632,26 +885,51 @@ core::CollisionResult RoboPlanPlanningContext::collision_check_normalized(
     }
   }
 
-  // Chunk 4: diagnostic compare mode. If a direct engine is installed,
-  // run it on the same query and record any mismatch with the legacy
-  // path. The direct engine is never authoritative — its result is
-  // observed only.
-  std::shared_ptr<DirectCollisionQueryEngine> direct_engine;
+  // Diagnostic compare mode. If a secondary ICollisionQueryEngine is installed,
+  // run it against the current CollisionWorldSnapshot and record any mismatch
+  // with the legacy RoboPlan path. The secondary engine is never authoritative
+  // on this adapter path.
+  std::shared_ptr<core::ICollisionQueryEngine> compare_engine;
   MismatchEmitter mismatch_emitter;
   MismatchRecordEmitter mismatch_record_emitter;
   {
-    std::scoped_lock lock(direct_engine_mutex_);
-    direct_engine = direct_engine_;
+    std::scoped_lock lock(compare_engine_mutex_);
+    compare_engine = compare_engine_;
     mismatch_emitter = mismatch_emitter_;
     mismatch_record_emitter = mismatch_record_emitter_;
   }
-  if (direct_engine) {
-    auto direct_result = direct_engine->check(query);
+  if (compare_engine) {
+    auto current_snapshot = snapshot();
+    core::CollisionResult secondary_result;
+    if (current_snapshot) {
+      core::CollisionQuery compare_query = query;
+      if (compare_query.collision_world_revision.revision_id == 0) {
+        compare_query.collision_world_revision = current_snapshot->revision;
+      }
+      core::CollisionPolicySnapshot compare_policy =
+          policy_snapshot.value_or(core::CollisionPolicySnapshot{});
+      core::CollisionCancellationToken compare_cancel;
+      secondary_result = compare_engine->check(*current_snapshot,
+                                               compare_query,
+                                               compare_policy,
+                                               compare_cancel);
+    } else {
+      secondary_result.query_id = query.query_id;
+      secondary_result.surface = query.surface;
+      secondary_result.engine_id = compare_engine->engine_id();
+      secondary_result.engine_version = compare_engine->engine_version();
+      secondary_result.engine_status =
+          core::CollisionEngineStatus::kDiagnosticIncomplete;
+      secondary_result.decision =
+          core::CollisionDecisionResult::kInconclusiveFail;
+      secondary_result.raw_diagnostics["snapshot_error"] =
+          "RoboPlanPlanningContext::snapshot() returned null";
+    }
     const bool mismatch =
-        direct_result.in_collision != result.in_collision ||
-        direct_result.engine_status != result.engine_status ||
-        direct_result.decision != result.decision ||
-        !collision_pairs_equal(direct_result.normalized_pairs,
+        secondary_result.in_collision != result.in_collision ||
+        secondary_result.engine_status != result.engine_status ||
+        secondary_result.decision != result.decision ||
+        !collision_pairs_equal(secondary_result.normalized_pairs,
                                result.normalized_pairs);
     if (mismatch) {
       std::map<std::string, std::string> details;
@@ -662,14 +940,15 @@ core::CollisionResult RoboPlanPlanningContext::collision_check_normalized(
       details["legacy_decision"] = collision_decision_text(result.decision);
       details["legacy_normalized_pair_count"] =
           std::to_string(result.normalized_pairs.size());
-      details["direct_engine_id"] = direct_result.engine_id;
-      details["direct_in_collision"] =
-          direct_result.in_collision ? "true" : "false";
-      details["direct_engine_status"] =
-          collision_engine_status_text(direct_result.engine_status);
-      details["direct_decision"] = collision_decision_text(direct_result.decision);
-      details["direct_normalized_pair_count"] =
-          std::to_string(direct_result.normalized_pairs.size());
+      details["secondary_engine_id"] = secondary_result.engine_id;
+      details["secondary_in_collision"] =
+          secondary_result.in_collision ? "true" : "false";
+      details["secondary_engine_status"] =
+          collision_engine_status_text(secondary_result.engine_status);
+      details["secondary_decision"] =
+          collision_decision_text(secondary_result.decision);
+      details["secondary_normalized_pair_count"] =
+          std::to_string(secondary_result.normalized_pairs.size());
       if (result.collision_world_revision) {
         details["collision_world_revision_id"] =
             std::to_string(result.collision_world_revision->revision_id);
@@ -681,16 +960,16 @@ core::CollisionResult RoboPlanPlanningContext::collision_check_normalized(
       if (mismatch_record_emitter) {
         core::CollisionEngineMismatchRecord record;
         record.mismatch_id = result.engine_id + "_vs_" +
-                              direct_result.engine_id + "@" + query.query_id;
+                              secondary_result.engine_id + "@" + query.query_id;
         record.emitted_at_ns = steady_now_ns();
         record.authoritative_engine_id = result.engine_id;
         record.authoritative_engine_version = result.engine_version;
-        record.secondary_engine_id = direct_result.engine_id;
-        record.secondary_engine_version = direct_result.engine_version;
+        record.secondary_engine_id = secondary_result.engine_id;
+        record.secondary_engine_version = secondary_result.engine_version;
         record.collision_world_revision = result.collision_world_revision;
         record.policy_revision = result.policy_revision_used;
         record.authoritative_normalized_pairs = result.normalized_pairs;
-        record.secondary_normalized_pairs = direct_result.normalized_pairs;
+        record.secondary_normalized_pairs = secondary_result.normalized_pairs;
         if (!query.query_id.empty()) {
           record.query_id = query.query_id;
         }
@@ -724,6 +1003,10 @@ void RoboPlanPlanningContext::set_robot_base_pose(const core::Pose3DTO& pose) {
           r.error());
     }
   }
+  publish_collision_world_revision_locked(
+      core::CollisionWorldMutationSource::kDeploymentLoad,
+      {},
+      "roboplan_context.set_robot_base_pose");
 }
 
 core::RobotStateDTO RoboPlanPlanningContext::get_current_state() {
@@ -1403,6 +1686,345 @@ RoboPlanPlanningContext::object_body_ids_for_transition_locked(
   return affected;
 }
 
+std::vector<core::CollisionWorldBody>
+RoboPlanPlanningContext::robot_snapshot_bodies_locked(
+    const std::string& robot_id) const {
+  std::vector<core::CollisionWorldBody> bodies;
+  if (!scene_) {
+    return bodies;
+  }
+
+  const auto& model = scene_->getModel();
+  const auto& collision_model = scene_->getCollisionModel();
+  std::set<std::string> scene_object_ids;
+  for (const auto& [object_id, tracked] : object_states_) {
+    static_cast<void>(tracked);
+    scene_object_ids.insert(object_id);
+  }
+
+  std::map<std::string, int> next_collision_index_by_link;
+  const auto& positions = scene_->getCurrentJointPositions();
+  Eigen::VectorXd q(positions.size());
+  for (Eigen::Index i = 0; i < positions.size(); ++i) {
+    q[i] = positions[i];
+  }
+
+  for (const auto& geometry_object : collision_model.geometryObjects) {
+    if (scene_object_ids.find(geometry_object.name) != scene_object_ids.end()) {
+      continue;
+    }
+    if (geometry_object.parentFrame >= model.frames.size()) {
+      continue;
+    }
+    const auto& frame = model.frames[geometry_object.parentFrame];
+    const std::string link_name = frame.name;
+    if (link_name.empty() || is_world_frame(link_name) ||
+        scene_object_ids.find(link_name) != scene_object_ids.end()) {
+      continue;
+    }
+
+    const int collision_index = next_collision_index_by_link[link_name]++;
+    const auto body_id = RoboPlanCollisionBodyIdMapper::make_robot_link_id(
+        robot_id, link_name, collision_index);
+
+    Eigen::Matrix4d t_world_link = Eigen::Matrix4d::Identity();
+    try {
+      t_world_link = world_from_robot_base_ * scene_->forwardKinematics(q, link_name);
+    } catch (const std::exception&) {
+      // Fail closed later through the snapshot builder by publishing a
+      // deterministic, unsupported compound descriptor instead of silently
+      // omitting the robot body.
+      t_world_link = world_from_robot_base_;
+    }
+
+    const Eigen::Matrix4d t_joint_link =
+        frame.placement.toHomogeneousMatrix();
+    const Eigen::Matrix4d t_link_geometry =
+        t_joint_link.inverse() * geometry_object.placement.toHomogeneousMatrix();
+
+    core::CollisionWorldBody body;
+    body.body_id = body_id;
+    body.owner_kind = core::CollisionOwnerKind::kRobotLink;
+    body.frame_id = "universe";
+    body.pose = matrix_to_pose(t_world_link);
+    body.geometries.push_back(descriptor_from_coal_geometry(
+        body_id, geometry_object, matrix_to_pose(t_link_geometry)));
+    bodies.push_back(std::move(body));
+  }
+
+  return bodies;
+}
+
+core::CollisionGeometryDescriptor
+RoboPlanPlanningContext::geometry_descriptor_for_shape_locked(
+    const core::CollisionBodyId& body_id,
+    core::CollisionOwnerKind owner_kind,
+    const core::CollisionShapeDTO& shape) const {
+  core::CollisionGeometryDescriptor descriptor;
+  descriptor.body_id = body_id;
+  descriptor.owner_kind = owner_kind;
+  descriptor.local_pose.orientation.w = 1.0;
+  descriptor.quality_labels = {"scene_object"};
+
+  std::visit(
+      [&](const auto& concrete) {
+        using ShapeT = std::decay_t<decltype(concrete)>;
+        if constexpr (std::is_same_v<ShapeT, core::BoxShapeDTO>) {
+          descriptor.geometry_kind = core::CollisionGeometryKind::kBox;
+          descriptor.box_dimensions_m = concrete.dimensions_m;
+          add_common_quality_label(descriptor, "primitive");
+        } else if constexpr (std::is_same_v<ShapeT, core::SphereShapeDTO>) {
+          descriptor.geometry_kind = core::CollisionGeometryKind::kSphere;
+          descriptor.sphere_radius_m = concrete.radius_m;
+          add_common_quality_label(descriptor, "primitive");
+        } else if constexpr (std::is_same_v<ShapeT, core::CylinderShapeDTO>) {
+          descriptor.geometry_kind = core::CollisionGeometryKind::kCylinder;
+          descriptor.cylinder_radius_m = concrete.radius_m;
+          descriptor.cylinder_height_m = concrete.height_m;
+          add_common_quality_label(descriptor, "primitive");
+        } else if constexpr (std::is_same_v<ShapeT, core::MeshShapeDTO>) {
+          descriptor.geometry_kind = core::CollisionGeometryKind::kTriangleMesh;
+          descriptor.source_uri = concrete.resource_uri;
+          descriptor.source_hash = effective_mesh_source_hash(concrete);
+          add_common_quality_label(descriptor, "mesh");
+          add_common_quality_label(descriptor, "collision_mesh");
+        }
+      },
+      shape);
+
+  return descriptor;
+}
+
+std::vector<core::CollisionWorldBody>
+RoboPlanPlanningContext::object_snapshot_bodies_locked(
+    const std::string& robot_id) const {
+  std::vector<core::CollisionWorldBody> bodies;
+  bodies.reserve(object_states_.size());
+
+  for (const auto& [object_id, tracked] : object_states_) {
+    const auto body_ids = object_body_ids_for_state_locked(object_id, tracked);
+    if (body_ids.empty()) {
+      continue;
+    }
+    core::CollisionWorldBody body;
+    body.body_id = body_ids.front();
+    body.owner_kind = tracked.attached
+                          ? core::CollisionOwnerKind::kAttachedObject
+                          : core::CollisionOwnerKind::kDetachedObject;
+    if (tracked.attached) {
+      const auto parent_link = robot_link_parent_body_id(robot_id, tracked.frame_id);
+      body.parent_link = parent_link;
+      body.frame_id = parent_link;
+      body.pose = tracked.pose;
+    } else {
+      body.frame_id = "universe";
+      body.pose = pose_in_base_from_tracked_locked(tracked, "universe");
+    }
+    body.geometries.push_back(geometry_descriptor_for_shape_locked(
+        body.body_id, body.owner_kind, tracked.shape));
+    bodies.push_back(std::move(body));
+  }
+
+  return bodies;
+}
+
+core::CollisionWorldSnapshotPtr
+RoboPlanPlanningContext::build_collision_world_snapshot_locked() const {
+  std::string robot_id;
+  {
+    std::scoped_lock map_lock(mapper_mutex_);
+    robot_id = mapper_robot_id_;
+  }
+
+  core::CollisionWorldSnapshotBuilder builder;
+  builder.set_publisher_id("roboplan_context")
+      .set_revision_id(world_revision_id_)
+      .set_emitted_at_ns(static_cast<std::int64_t>(steady_now_ns()));
+
+  for (auto& body : robot_snapshot_bodies_locked(robot_id)) {
+    builder.add_body(std::move(body));
+  }
+  for (auto& body : object_snapshot_bodies_locked(robot_id)) {
+    builder.add_body(std::move(body));
+  }
+
+  auto result = builder.build_shared();
+  if (!result.ok()) {
+    return nullptr;
+  }
+  return std::move(result.value());
+}
+
+std::optional<core::CollisionPolicySnapshot>
+RoboPlanPlanningContext::collision_policy_snapshot() const {
+  std::string robot_id;
+  {
+    std::scoped_lock map_lock(mapper_mutex_);
+    robot_id = mapper_robot_id_;
+  }
+
+  std::lock_guard<std::mutex> scene_lock(*scene_mutex_);
+  return build_collision_policy_snapshot_locked(robot_id);
+}
+
+core::CollisionPolicySnapshot
+RoboPlanPlanningContext::build_collision_policy_snapshot_locked(
+    const std::string& robot_id) const {
+  core::CollisionPolicySnapshot policy;
+  {
+    std::scoped_lock eval_lock(evaluator_mutex_);
+    if (policy_snapshot_) {
+      policy = *policy_snapshot_;
+    }
+  }
+
+  auto add_pair = [](std::vector<core::CollisionPairId>& pairs,
+                     std::string a,
+                     std::string b) {
+    if (a.empty() || b.empty() || a == b) {
+      return;
+    }
+    if (b < a) {
+      std::swap(a, b);
+    }
+    pairs.push_back(core::CollisionPairId{std::move(a), std::move(b)});
+  };
+  auto sort_unique_pairs = [](std::vector<core::CollisionPairId>& pairs) {
+    std::sort(pairs.begin(), pairs.end());
+    pairs.erase(std::unique(pairs.begin(), pairs.end()), pairs.end());
+  };
+
+  for (const auto& pair : disabled_static_collision_pairs_) {
+    const auto a = object_states_.find(pair.first);
+    const auto b = object_states_.find(pair.second);
+    if (a == object_states_.end() || b == object_states_.end()) {
+      continue;
+    }
+    if (a->second.attached || b->second.attached) {
+      continue;
+    }
+    for (const auto& body_a :
+         object_body_ids_for_state_locked(a->first, a->second)) {
+      for (const auto& body_b :
+           object_body_ids_for_state_locked(b->first, b->second)) {
+        add_pair(policy.allowed_static_static_pairs, body_a, body_b);
+      }
+    }
+  }
+
+  const auto robot_bodies = robot_snapshot_bodies_locked(robot_id);
+  for (const auto& [object_id, tracked] : object_states_) {
+    if (!tracked.attached || tracked.touch_links.empty()) {
+      continue;
+    }
+    const auto object_body_ids =
+        object_body_ids_for_state_locked(object_id, tracked);
+    for (const auto& touch_link : tracked.touch_links) {
+      for (const auto& robot_body : robot_bodies) {
+        if (!robot_collision_body_id_matches_link(robot_body.body_id,
+                                                  robot_id,
+                                                  touch_link)) {
+          continue;
+        }
+        for (const auto& object_body_id : object_body_ids) {
+          add_pair(policy.allowed_touch_link_pairs,
+                   object_body_id,
+                   robot_body.body_id);
+        }
+      }
+    }
+  }
+
+  for (const auto& pair : disabled_support_contact_pairs_) {
+    const auto a = object_states_.find(pair.first);
+    const auto b = object_states_.find(pair.second);
+    if (a == object_states_.end() || b == object_states_.end()) {
+      continue;
+    }
+    std::optional<core::SupportContactDTO> configured =
+        support_contact_policy_for_pair_locked(pair);
+    for (const auto& body_a :
+         object_body_ids_for_state_locked(a->first, a->second)) {
+      for (const auto& body_b :
+           object_body_ids_for_state_locked(b->first, b->second)) {
+        core::SupportContactPolicyEntry entry;
+        if (body_b < body_a) {
+          entry.pair = core::CollisionPairId{body_b, body_a};
+        } else {
+          entry.pair = core::CollisionPairId{body_a, body_b};
+        }
+        if (configured) {
+          entry.max_start_penetration_m =
+              configured->max_start_penetration_m;
+          entry.require_separation_by_end =
+              configured->require_separation_by_end;
+        }
+        policy.support_contacts.push_back(std::move(entry));
+      }
+    }
+  }
+
+  sort_unique_pairs(policy.allowed_static_static_pairs);
+  sort_unique_pairs(policy.allowed_touch_link_pairs);
+  std::sort(policy.support_contacts.begin(),
+            policy.support_contacts.end(),
+            [](const auto& lhs, const auto& rhs) {
+              if (lhs.pair != rhs.pair) {
+                return lhs.pair < rhs.pair;
+              }
+              if (lhs.max_start_penetration_m !=
+                  rhs.max_start_penetration_m) {
+                return lhs.max_start_penetration_m <
+                       rhs.max_start_penetration_m;
+              }
+              if (lhs.require_separation_by_end !=
+                  rhs.require_separation_by_end) {
+                return lhs.require_separation_by_end <
+                       rhs.require_separation_by_end;
+              }
+              return lhs.allow_recontact < rhs.allow_recontact;
+            });
+  policy.support_contacts.erase(
+      std::unique(policy.support_contacts.begin(),
+                  policy.support_contacts.end(),
+                  [](const auto& lhs, const auto& rhs) {
+                    return lhs.pair == rhs.pair &&
+                           lhs.max_start_penetration_m ==
+                               rhs.max_start_penetration_m &&
+                           lhs.require_separation_by_end ==
+                               rhs.require_separation_by_end &&
+                           lhs.allow_recontact == rhs.allow_recontact;
+                  }),
+      policy.support_contacts.end());
+
+  core::ContentHasher h;
+  h.mix("manyforge_roboplan/collision_policy_snapshot")
+      .mix(robot_id)
+      .mix(world_revision_id_)
+      .mix(world_content_hash_)
+      .mix(policy.policy_id)
+      .mix(static_cast<std::int64_t>(
+          policy.require_full_diagnostics ? 1 : 0));
+  for (const auto& pair : policy.allowed_static_static_pairs) {
+    h.mix("static").mix(pair.body_a).mix(pair.body_b);
+  }
+  for (const auto& pair : policy.allowed_touch_link_pairs) {
+    h.mix("touch").mix(pair.body_a).mix(pair.body_b);
+  }
+  for (const auto& entry : policy.support_contacts) {
+    h.mix("support")
+        .mix(entry.pair.body_a)
+        .mix(entry.pair.body_b)
+        .mix(entry.max_start_penetration_m)
+        .mix(static_cast<std::int64_t>(
+            entry.require_separation_by_end ? 1 : 0))
+        .mix(static_cast<std::int64_t>(entry.allow_recontact ? 1 : 0));
+  }
+  policy.revision.revision_id = world_revision_id_;
+  policy.revision.content_hash = h.finalize();
+  return policy;
+}
+
 std::string RoboPlanPlanningContext::compute_collision_world_content_hash_locked(
     const std::string& robot_id) {
   std::vector<std::string> entries;
@@ -1451,17 +2073,17 @@ std::string RoboPlanPlanningContext::compute_collision_world_content_hash_locked
   }
 
   std::sort(entries.begin(), entries.end());
-  std::uint64_t h = 1469598103934665603ULL;
-  fnv1a_mix(h, robot_id);
+  core::ContentHasher h;
+  h.mix("manyforge_roboplan/collision_world_revision_fallback");
+  h.mix(robot_id);
   for (const auto& entry : entries) {
-    fnv1a_mix(h, entry);
+    h.mix(entry);
   }
-  std::ostringstream oss;
-  oss << std::hex << h;
-  return oss.str();
+  return h.finalize();
 }
 
-Eigen::Matrix4d RoboPlanPlanningContext::pose_to_matrix(const core::Pose3DTO& pose) {
+Eigen::Matrix4d RoboPlanPlanningContext::pose_to_matrix(
+    const core::Pose3DTO& pose) const {
   Eigen::Matrix4d tform = Eigen::Matrix4d::Identity();
   tform(0, 3) = pose.position_m.x_m;
   tform(1, 3) = pose.position_m.y_m;
@@ -1484,7 +2106,8 @@ Eigen::Matrix4d RoboPlanPlanningContext::pose_to_matrix(const core::Pose3DTO& po
   return tform;
 }
 
-core::Pose3DTO RoboPlanPlanningContext::matrix_to_pose(const Eigen::Matrix4d& tform) {
+core::Pose3DTO RoboPlanPlanningContext::matrix_to_pose(
+    const Eigen::Matrix4d& tform) const {
   core::Pose3DTO pose;
   pose.position_m.x_m = tform(0, 3);
   pose.position_m.y_m = tform(1, 3);
@@ -1533,7 +2156,7 @@ bool RoboPlanPlanningContext::is_world_frame(const std::string& frame_id) const 
 }
 
 Eigen::Matrix4d RoboPlanPlanningContext::scene_placement_from_tracked_locked(
-    const TrackedObjectState& state) {
+    const TrackedObjectState& state) const {
   const Eigen::Matrix4d t_frame_object = pose_to_matrix(state.pose);
   if (is_world_frame(state.frame_id)) {
     return world_from_robot_base_.inverse() * t_frame_object;
@@ -1542,7 +2165,7 @@ Eigen::Matrix4d RoboPlanPlanningContext::scene_placement_from_tracked_locked(
 }
 
 Eigen::Matrix4d RoboPlanPlanningContext::parent_joint_from_frame_matrix_locked(
-    const std::string& frame_id) {
+    const std::string& frame_id) const {
   if (is_world_frame(frame_id)) {
     return Eigen::Matrix4d::Identity();
   }
@@ -1567,7 +2190,7 @@ Eigen::Matrix4d RoboPlanPlanningContext::parent_joint_from_frame_matrix_locked(
 }
 
 Eigen::Matrix4d RoboPlanPlanningContext::frame_to_world_matrix_locked(
-    const std::string& frame_id) {
+    const std::string& frame_id) const {
   if (is_world_frame(frame_id)) {
     return Eigen::Matrix4d::Identity();
   }
@@ -1581,7 +2204,7 @@ Eigen::Matrix4d RoboPlanPlanningContext::frame_to_world_matrix_locked(
 }
 
 core::Pose3DTO RoboPlanPlanningContext::pose_in_base_from_tracked_locked(
-    const TrackedObjectState& state, const std::string& base_frame) {
+    const TrackedObjectState& state, const std::string& base_frame) const {
   const Eigen::Matrix4d t_frame_object = pose_to_matrix(state.pose);
   const Eigen::Matrix4d t_world_frame = frame_to_world_matrix_locked(state.frame_id);
   const Eigen::Matrix4d t_world_object = t_world_frame * t_frame_object;
@@ -1668,12 +2291,9 @@ RoboPlanPlanningContext::collect_collision_diagnostics_locked(
     const Eigen::VectorXd& q) {
   CollisionDiagnostics diagnostics;
 
-  std::ostringstream capture;
-  auto* previous = std::cout.rdbuf(capture.rdbuf());
-  scene_->hasCollisions(q, true);
-  std::cout.rdbuf(previous);
-
-  diagnostics.raw_output = capture.str();
+  diagnostics.raw_output = capture_collision_diagnostics_stdout([&]() {
+    scene_->hasCollisions(q, true);
+  });
 
   std::istringstream lines(diagnostics.raw_output);
   std::string line;

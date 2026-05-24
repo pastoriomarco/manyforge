@@ -16,6 +16,7 @@
 #include <limits>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <thread>
 #include <vector>
 
@@ -159,6 +160,93 @@ class StubContext : public IPlanningContext {
   }
 };
 
+class StubCollisionWorldPublisher final
+    : public ICollisionWorldSnapshotPublisher {
+ public:
+  StubCollisionWorldPublisher() {
+    CollisionWorldSnapshot snapshot;
+    snapshot.snapshot_format_version = 1;
+    snapshot.publisher_id = "streaming-test";
+    snapshot.revision = CollisionWorldRevision{1, "streaming-test-world"};
+    snapshot.emitted_at_ns = 1;
+    current_snapshot = std::make_shared<const CollisionWorldSnapshot>(
+        std::move(snapshot));
+    current_policy = CollisionPolicySnapshot{};
+    current_policy->revision = CollisionPolicyRevision{1, "streaming-policy"};
+  }
+
+  CollisionWorldSnapshotPtr snapshot() const override {
+    return current_snapshot;
+  }
+
+  std::optional<CollisionPolicySnapshot> collision_policy_snapshot()
+      const override {
+    return current_policy;
+  }
+
+  CollisionWorldSnapshotPtr current_snapshot;
+  std::optional<CollisionPolicySnapshot> current_policy;
+};
+
+class StreamingCollisionEngine final : public ICollisionQueryEngine {
+ public:
+  StreamingCollisionEngine() {
+    default_result.engine_status = CollisionEngineStatus::kOk;
+    default_result.decision = CollisionDecisionResult::kPass;
+    default_result.in_collision = false;
+    capability_.engine_id = "streaming_test_engine";
+    capability_.engine_version = "test";
+    capability_.library_lineage = "unit_test";
+    capability_.supported_geometry_kinds = {"box"};
+    capability_.thread_safety =
+        CollisionEngineThreadSafetyClass::kSingleContextExclusive;
+    capability_.deterministic_ordering = true;
+  }
+
+  const CollisionEngineCapabilityDescriptor& capability() const override {
+    return capability_;
+  }
+
+  CollisionResult check(const CollisionWorldSnapshot& snapshot,
+                        const CollisionQuery& query,
+                        const CollisionPolicySnapshot& /*policy*/,
+                        const CollisionCancellationToken& cancel) override {
+    ++check_count;
+    last_query = query;
+    if (on_check) {
+      on_check(query);
+    }
+    CollisionResult result = default_result;
+    result.query_id = query.query_id;
+    result.surface = query.surface;
+    result.state_time_ns = query.state_time_ns;
+    result.collision_world_revision = snapshot.revision;
+    result.engine_id = capability_.engine_id;
+    result.engine_version = capability_.engine_version;
+    if (cancel.is_cancel_requested()) {
+      result.in_collision = false;
+      result.normalized_pairs.clear();
+      result.engine_status = CollisionEngineStatus::kCancelled;
+      result.decision = CollisionDecisionResult::kInconclusiveFail;
+      result.raw_diagnostics["cancel_reason"] = cancel.reason();
+    }
+    return result;
+  }
+
+  std::string engine_id() const override { return capability_.engine_id; }
+  std::string engine_version() const override {
+    return capability_.engine_version;
+  }
+
+  CollisionResult default_result;
+  std::atomic<int> check_count{0};
+  CollisionQuery last_query;
+  std::function<void(const CollisionQuery&)> on_check;
+
+ private:
+  CollisionEngineCapabilityDescriptor capability_;
+};
+
 // Streaming-capable mock backend. Records begin/push/end calls and exposes
 // the recorded targets for assertion. Discrete-trajectory ops are stubbed
 // as no-ops (this fixture is streaming-focused).
@@ -262,6 +350,9 @@ class StreamingSessionTest : public ::testing::Test {
   StubContext context;
   StreamingMock backend;
   TrajectoryCache cache{CacheConfig{4}};
+  StubCollisionWorldPublisher collision_publisher;
+  std::shared_ptr<StreamingCollisionEngine> collision_engine{
+      std::make_shared<StreamingCollisionEngine>()};
   ExecutionKernel kernel{planner, context, backend, clock, scheduler, cache};
 
   std::vector<KernelEvent> events;
@@ -269,6 +360,10 @@ class StreamingSessionTest : public ::testing::Test {
   SubscriptionHandle subscription{0};
 
   void SetUp() override {
+    kernel.set_collision_validation_pipeline(
+        collision_publisher, {collision_engine});
+    kernel.set_collision_validation_policy_snapshot(
+        collision_publisher.current_policy);
     subscription = kernel.subscribe_events([this](const KernelEvent& ev) {
       std::lock_guard<std::mutex> lock(events_mutex);
       events.push_back(ev);
@@ -324,6 +419,43 @@ class StreamingSessionTest : public ::testing::Test {
     cfg.tcp_frame = "tcp";
     cfg.cartesian_reference_frame = "base";
     return cfg;
+  }
+
+  InterruptSourceDefinition interrupt_source(const std::string& source_id) {
+    InterruptSourceDefinition source;
+    source.source_id = source_id;
+    source.adapter = InterruptAdapter::kInternalTest;
+    source.signal = source_id + "_signal";
+    source.source_class = InterruptSourceClass::kFastExecutionRelevant;
+    source.kind = InterruptSourceKind::kEdge;
+    source.priority = 800;
+    source.freshness_budget_ns = 1'000'000;
+    return source;
+  }
+
+  InterruptPolicyDefinition preempt_streaming_policy(
+      const std::string& policy_id,
+      const std::string& source_id) {
+    InterruptPolicyDefinition policy;
+    policy.policy_id = policy_id;
+    policy.source_id = source_id;
+    policy.priority = 800;
+    policy.affected_phases = {InterruptExecutionPhase::kStreaming};
+    policy.preemption_action = InterruptPreemptionAction::kPreemptStreaming;
+    policy.post_latch_disposition =
+        InterruptPostLatchDisposition::kAwaitOperatorAck;
+    return policy;
+  }
+
+  InterruptSignalUpdate interrupt_signal(const std::string& source_id,
+                                         std::int64_t sequence_id = 1) {
+    InterruptSignalUpdate signal;
+    signal.source_id = source_id;
+    signal.sequence_id = sequence_id;
+    signal.timestamp_ns = clock.now();
+    signal.freshness_ns = 0;
+    signal.value = true;
+    return signal;
   }
 
   ExecuteRequestDTO execute_request(const std::string& move_id = "move_1") {
@@ -444,6 +576,157 @@ TEST_F(StreamingSessionTest, Push_HappyPath_AcceptsTargetAndEmitsEvent) {
   ASSERT_EQ(backend.received_targets.size(), 1u);
   EXPECT_EQ(backend.received_targets[0].joint_positions_rad,
             (std::vector<double>{0.1, 0.2}));
+}
+
+TEST_F(StreamingSessionTest,
+       Push_ValidatesCollisionOnStreamingSurfaceBeforeBackendDispatch) {
+  auto begin_result = kernel.begin_streaming_session(default_config());
+  ASSERT_TRUE(begin_result.accepted);
+
+  auto push_result = kernel.push_streaming_target(
+      begin_result.session_id, joint_target({0.3, 0.4}));
+
+  ASSERT_TRUE(push_result.accepted);
+  EXPECT_EQ(collision_engine->check_count.load(), 1);
+  EXPECT_EQ(collision_engine->last_query.surface,
+            CollisionSurface::kStreamingTargetValidation);
+  EXPECT_EQ(collision_engine->last_query.robot_state.joint_names,
+            (std::vector<std::string>{"j1", "j2"}));
+  EXPECT_EQ(collision_engine->last_query.robot_state.positions_rad,
+            (std::vector<double>{0.3, 0.4}));
+  EXPECT_EQ(backend.push_calls, 1);
+}
+
+TEST_F(StreamingSessionTest,
+       Push_CollisionRejected_DoesNotDispatchToBackend) {
+  CollisionResult collision;
+  collision.in_collision = true;
+  collision.engine_status = CollisionEngineStatus::kOk;
+  collision.decision = CollisionDecisionResult::kFail;
+  collision.normalized_pairs.push_back(
+      CollisionPairId{"robot/test/link/wrist/collision/0",
+                      "object/box/shape/0"});
+  collision_engine->default_result = collision;
+
+  auto begin_result = kernel.begin_streaming_session(default_config());
+  ASSERT_TRUE(begin_result.accepted);
+
+  auto push_result = kernel.push_streaming_target(
+      begin_result.session_id, joint_target({0.1, 0.2}));
+
+  ASSERT_FALSE(push_result.accepted);
+  ASSERT_TRUE(push_result.error.has_value());
+  EXPECT_EQ(push_result.error->code, kErrorValidationCollision);
+  EXPECT_EQ(push_result.error->details.at("phase"),
+            "streaming_target_validation");
+  EXPECT_EQ(push_result.error->details.at("reason_code"),
+            "streaming_collision_rejected");
+  EXPECT_EQ(backend.push_calls, 0);
+  EXPECT_GE(count_events_of(KernelEventType::kStreamingTargetRejected), 1u);
+}
+
+TEST_F(StreamingSessionTest,
+       Push_CollisionValidationTimeout_DoesNotDispatchToBackend) {
+  collision_engine->on_check = [](const CollisionQuery& /*query*/) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  };
+
+  auto begin_result = kernel.begin_streaming_session(default_config());
+  ASSERT_TRUE(begin_result.accepted);
+
+  auto push_result = kernel.push_streaming_target(
+      begin_result.session_id, joint_target({0.1, 0.2}));
+
+  ASSERT_FALSE(push_result.accepted);
+  ASSERT_TRUE(push_result.error.has_value());
+  EXPECT_EQ(push_result.error->details.at("reason_code"),
+            "streaming_collision_timeout");
+  EXPECT_EQ(push_result.error->details.at("phase"),
+            "streaming_target_validation");
+  EXPECT_EQ(backend.push_calls, 0);
+}
+
+TEST_F(StreamingSessionTest,
+       Push_CollisionEngineException_DoesNotDispatchToBackend) {
+  collision_engine->on_check = [](const CollisionQuery& /*query*/) {
+    throw std::runtime_error("streaming engine failure");
+  };
+
+  auto begin_result = kernel.begin_streaming_session(default_config());
+  ASSERT_TRUE(begin_result.accepted);
+
+  auto push_result = kernel.push_streaming_target(
+      begin_result.session_id, joint_target({0.1, 0.2}));
+
+  ASSERT_FALSE(push_result.accepted);
+  ASSERT_TRUE(push_result.error.has_value());
+  EXPECT_EQ(push_result.error->code, kErrorValidationCollision);
+  EXPECT_EQ(push_result.error->details.at("reason_code"),
+            "streaming_collision_engine_exception");
+  EXPECT_EQ(push_result.error->details.at("phase"),
+            "streaming_target_validation");
+  EXPECT_EQ(push_result.error->details.at("exception"),
+            "streaming engine failure");
+  EXPECT_EQ(backend.push_calls, 0);
+}
+
+TEST_F(StreamingSessionTest,
+       Push_NewerTargetSupersedesOlderCollisionValidation) {
+  auto begin_result = kernel.begin_streaming_session(default_config());
+  ASSERT_TRUE(begin_result.accepted);
+
+  std::mutex mu;
+  std::condition_variable cv;
+  bool first_query_entered = false;
+  bool second_push_started = false;
+  collision_engine->on_check = [&](const CollisionQuery& query) {
+    if (query.robot_state.positions_rad ==
+        std::vector<double>{0.1, 0.2}) {
+      {
+        std::lock_guard<std::mutex> lock(mu);
+        first_query_entered = true;
+      }
+      cv.notify_all();
+      std::unique_lock<std::mutex> lock(mu);
+      cv.wait_for(lock, std::chrono::seconds(2),
+                  [&]() { return second_push_started; });
+      lock.unlock();
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+  };
+
+  StreamingPushResultDTO first_result;
+  std::thread first_thread([&]() {
+    first_result = kernel.push_streaming_target(
+        begin_result.session_id, joint_target({0.1, 0.2}));
+  });
+
+  StreamingPushResultDTO second_result;
+  {
+    std::unique_lock<std::mutex> lock(mu);
+    ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds(2),
+                            [&]() { return first_query_entered; }));
+  }
+  std::thread second_thread([&]() {
+    {
+      std::lock_guard<std::mutex> lock(mu);
+      second_push_started = true;
+    }
+    cv.notify_all();
+    second_result = kernel.push_streaming_target(
+        begin_result.session_id, joint_target({0.5, 0.6}));
+  });
+  first_thread.join();
+  second_thread.join();
+
+  ASSERT_FALSE(first_result.accepted);
+  ASSERT_TRUE(first_result.error.has_value());
+  EXPECT_EQ(first_result.error->details.at("reason_code"),
+            "superseded_by_newer_streaming_target");
+  ASSERT_TRUE(second_result.accepted);
+  ASSERT_EQ(backend.received_targets.size(), 1u);
+  EXPECT_EQ(backend.received_targets[0].joint_positions_rad,
+            (std::vector<double>{0.5, 0.6}));
 }
 
 TEST_F(StreamingSessionTest, Push_WithMismatchedSessionId_Rejected) {
@@ -799,6 +1082,66 @@ TEST_F(StreamingSessionTest, Stop_FromStreaming_DrivesSoftEndAndAutoAcksToIdle) 
   EXPECT_EQ(backend.end_calls, 1)
       << "stop() must drive backend.end_streaming_session";
   EXPECT_EQ(backend.last_end_strategy, SoftStopStrategy::kSpringBack);
+}
+
+TEST_F(StreamingSessionTest,
+       InterruptPreemptStreaming_EndsBackendSessionAndHoldsInterruptedState) {
+  auto begin = kernel.begin_streaming_session(default_config());
+  ASSERT_TRUE(begin.accepted);
+  ASSERT_TRUE(kernel.register_interrupt_source(
+                        interrupt_source("test.streaming_guard"))
+                  .ok());
+  ASSERT_TRUE(kernel.register_interrupt_policy(
+                        preempt_streaming_policy("test.streaming_guard.policy",
+                                                 "test.streaming_guard"))
+                  .ok());
+
+  auto ingest =
+      kernel.publish_fast_interrupt_signal(interrupt_signal("test.streaming_guard"));
+
+  EXPECT_TRUE(ingest.latched);
+  EXPECT_EQ(backend.end_calls, 1);
+  EXPECT_EQ(kernel.get_status().state, ExecutionState::kInterrupted);
+  auto latch = kernel.get_active_interrupt_latch();
+  ASSERT_TRUE(latch.has_value());
+  EXPECT_EQ(latch->active_streaming_session_id, begin.session_id);
+  EXPECT_EQ(latch->preemption_action_requested,
+            InterruptPreemptionAction::kPreemptStreaming);
+  EXPECT_EQ(latch->preemption_result, InterruptPreemptionResult::kSucceeded);
+  EXPECT_GE(count_events_of(KernelEventType::kStreamingSessionEnded), 1u);
+  EXPECT_GE(count_events_of(KernelEventType::kInterruptPreemptApplied), 1u);
+
+  auto stale_push =
+      kernel.push_streaming_target(begin.session_id, joint_target({0.1, 0.2}));
+  EXPECT_FALSE(stale_push.accepted);
+  ASSERT_TRUE(stale_push.error.has_value());
+  EXPECT_EQ(stale_push.error->details.at("state"), "Interrupted");
+}
+
+TEST_F(StreamingSessionTest,
+       InterruptPreemptStreaming_BackendFailureIsFailClosed) {
+  auto begin = kernel.begin_streaming_session(default_config());
+  ASSERT_TRUE(begin.accepted);
+  backend.reject_end = true;
+  ASSERT_TRUE(kernel.register_interrupt_source(
+                        interrupt_source("test.streaming_fault"))
+                  .ok());
+  ASSERT_TRUE(kernel.register_interrupt_policy(
+                        preempt_streaming_policy("test.streaming_fault.policy",
+                                                 "test.streaming_fault"))
+                  .ok());
+
+  auto ingest =
+      kernel.publish_fast_interrupt_signal(interrupt_signal("test.streaming_fault"));
+
+  EXPECT_TRUE(ingest.latched);
+  EXPECT_EQ(backend.end_calls, 1);
+  EXPECT_EQ(kernel.get_status().state, ExecutionState::kInterrupted);
+  auto latch = kernel.get_active_interrupt_latch();
+  ASSERT_TRUE(latch.has_value());
+  EXPECT_EQ(latch->preemption_result,
+            InterruptPreemptionResult::kBackendPreemptFailed);
+  EXPECT_GE(count_events_of(KernelEventType::kErrorRaised), 1u);
 }
 
 TEST_F(StreamingSessionTest,

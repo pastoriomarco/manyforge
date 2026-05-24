@@ -92,21 +92,6 @@ TEST_F(CollisionPolicyTest, HandleCollision_FromIdle_StopFails) {
   EXPECT_FALSE(result.ok());
 }
 
-// --- pre_execute_check ---
-TEST_F(CollisionPolicyTest, PreExecuteCheck_NoCollision_Ok) {
-  CollisionCheckResultDTO check;
-  check.in_collision = false;
-  EXPECT_TRUE(policy.pre_execute_check(check).ok());
-}
-
-TEST_F(CollisionPolicyTest, PreExecuteCheck_Collision_Error) {
-  CollisionCheckResultDTO check;
-  check.in_collision = true;
-  auto result = policy.pre_execute_check(check);
-  EXPECT_FALSE(result.ok());
-  EXPECT_EQ(result.error().code, "validation_collision");
-}
-
 // --- Custom response configuration ---
 TEST_F(CollisionPolicyTest, SetAndGetResponse) {
   CollisionResponse r;

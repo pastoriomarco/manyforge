@@ -3,6 +3,11 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+    security_opt:
+      # ThreadSanitizer needs personality(ADDR_NO_RANDOMIZE), which Docker's
+      # default seccomp profile blocks on this platform. Phase-4 release
+      # qualification runs the TSan collision-engine lane in this dev service.
+      - seccomp=unconfined
     volumes:
       - .:/workspace
       - build-cache:/tmp/manyforge-build

@@ -24,7 +24,7 @@ Program (.program.yaml)
 Deployment (.deployment.yaml)
   └─ Robot adapter, capabilities, model endpoints
 CycleManager
-  └─ Runtime states: idle, running, stopped, interrupt_handler, direct_control
+  └─ Runtime states: idle, running, stopped, direct_control
 Kernel
   └─ Execution state, validation, cache, collision monitoring, motion backend
 ```
@@ -102,9 +102,9 @@ Save the loaded program to YAML. Defaults to original source path.
 
 **`manyforge_cycle_control(command, velocity_scale=None)`**
 Control execution: "run", "stop", "reset", "status", "velocity".
-Returned cycle states include `idle`, `running`, `stopped`,
-`interrupt_handler`, and `direct_control`. Kernel terminal acknowledgement is
-runtime-owned and is not a behavior-tree authoring action.
+Returned cycle states include `idle`, `running`, `stopped`, and
+`direct_control`. Kernel terminal acknowledgement is runtime-owned and is
+not a behavior-tree authoring action.
 
 **`manyforge_execution_status(include="digest")`**
 Get execution information.
@@ -173,7 +173,7 @@ Get kernel execution state and metrics.
 Manage the composer session.
 - `"status"`: current session info (loaded program, deployment, overrides, events)
 - `"reset"`: reset cycle state and clear runtime overrides while keeping the
-  loaded program; not allowed while execution or an interrupt handler is active
+  loaded program; not allowed while execution is active
 
 ### Filesystem
 

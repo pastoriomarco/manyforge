@@ -123,7 +123,7 @@ def create_mcp_server(state: ComposerState):
 
         if state.cycle_manager is not None and state.cycle_manager.state in {
             CycleState.RUNNING,
-            CycleState.INTERRUPT_HANDLER,
+            CycleState.DIRECT_CONTROL,
         }:
             cycle_state = state.cycle_manager.state
             return json.dumps(
@@ -271,7 +271,7 @@ def create_mcp_server(state: ComposerState):
         if action == "write":
             if tree is None:
                 return json.dumps({"error": "tree is required for write action"})
-            if state.cycle_manager is not None and state.cycle_manager.state.value in {"running", "interrupt_handler"}:
+            if state.cycle_manager is not None and state.cycle_manager.state.value == "running":
                 return json.dumps({"error": "Cannot modify tree while execution is active"})
             try:
                 from manyforge_behavior.program import Program
@@ -374,9 +374,9 @@ def create_mcp_server(state: ComposerState):
             velocity_scale: Required when command is "velocity" (0.0 to 1.0).
                            0.0 will stall the robot — use "stop" to pause instead.
 
-        Cycle states include idle, running, stopped, interrupt_handler, and
-        direct_control. Kernel terminal acknowledgement is runtime-owned and is
-        not a behavior-tree authoring action.
+        Cycle states include idle, running, stopped, and direct_control.
+        Kernel terminal acknowledgement is runtime-owned and is not a
+        behavior-tree authoring action.
         """
         if command == "status":
             if state.cycle_manager is None:
@@ -413,9 +413,9 @@ def create_mcp_server(state: ComposerState):
                 state.cycle_manager.run()
             except RuntimeError as exc:
                 # Cycle-manager auto-ack refusals (e.g. running
-                # intervention session, blocking pending interrupt,
-                # unreadable kernel status) and other resume-path
-                # refusals surface as RuntimeError. Return them as
+                # intervention session, unreadable kernel status) and
+                # other resume-path refusals surface as RuntimeError.
+                # Return them as
                 # structured errors so MCP clients see a consistent
                 # shape rather than an internal exception.
                 return json.dumps({"error": str(exc)})
@@ -1106,8 +1106,7 @@ def create_mcp_server(state: ComposerState):
         - status: Return current session info (loaded program, deployment,
           cycle state, override count, event count)
         - reset: Reset cycle state and clear runtime overrides while keeping
-          the loaded program. Not allowed while execution or an interrupt
-          handler is active.
+          the loaded program. Not allowed while execution is active.
         """
         if action == "status":
             override_status = (
@@ -1137,10 +1136,10 @@ def create_mcp_server(state: ComposerState):
         if action == "reset":
             if (
                 state.cycle_manager is not None
-                and state.cycle_manager.state.value in {"running", "interrupt_handler"}
+                and state.cycle_manager.state.value == "running"
             ):
                 return json.dumps(
-                    {"error": "Cannot reset session while execution is active — stop or wait for the handler first"}
+                    {"error": "Cannot reset session while execution is active — stop it first"}
                 )
             # Reset cycle and overrides; program stays loaded
             if state.cycle_manager is not None:

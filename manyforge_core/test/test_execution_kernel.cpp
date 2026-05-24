@@ -4,6 +4,7 @@
 #include <manyforge_core/time/manual_scheduler.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <functional>
@@ -216,6 +217,95 @@ class MockContext : public IPlanningContext {
   }
 };
 
+class MockCollisionWorldPublisher final : public ICollisionWorldSnapshotPublisher {
+ public:
+  CollisionWorldSnapshotPtr current_snapshot =
+      std::make_shared<const CollisionWorldSnapshot>();
+  std::optional<CollisionPolicySnapshot> current_policy;
+  bool throw_on_snapshot = false;
+
+  CollisionWorldSnapshotPtr snapshot() const override {
+    if (throw_on_snapshot) {
+      throw std::runtime_error("snapshot unavailable");
+    }
+    return current_snapshot;
+  }
+
+  std::optional<CollisionPolicySnapshot> collision_policy_snapshot()
+      const override {
+    return current_policy;
+  }
+};
+
+class MockCollisionEngine final : public ICollisionQueryEngine {
+ public:
+  CollisionResult default_result;
+  std::map<std::int64_t, CollisionResult> result_by_waypoint;
+  std::function<void(const CollisionQuery&)> on_check;
+  std::atomic<int> check_count{0};
+
+  MockCollisionEngine() {
+    default_result.in_collision = false;
+    default_result.engine_status = CollisionEngineStatus::kOk;
+    default_result.decision = CollisionDecisionResult::kPass;
+    capability_.engine_id = "mock_authoritative_engine";
+    capability_.engine_version = "test";
+    capability_.library_lineage = "unit_test";
+    capability_.supported_geometry_kinds = {"box"};
+    capability_.thread_safety =
+        CollisionEngineThreadSafetyClass::kSingleContextExclusive;
+    capability_.deterministic_ordering = true;
+  }
+
+  const CollisionEngineCapabilityDescriptor& capability() const override {
+    return capability_;
+  }
+
+  CollisionResult check(const CollisionWorldSnapshot& snapshot,
+                        const CollisionQuery& query,
+                        const CollisionPolicySnapshot& policy,
+                        const CollisionCancellationToken& cancel) override {
+    check_count.fetch_add(1);
+    last_policy_id = policy.policy_id;
+    last_policy_revision_id = policy.revision.revision_id;
+    if (on_check) {
+      on_check(query);
+    }
+    CollisionResult result = default_result;
+    if (query.waypoint_index) {
+      auto it = result_by_waypoint.find(*query.waypoint_index);
+      if (it != result_by_waypoint.end()) {
+        result = it->second;
+      }
+    }
+    result.query_id = query.query_id;
+    result.surface = query.surface;
+    result.state_time_ns = query.state_time_ns;
+    result.collision_world_revision = snapshot.revision;
+    result.engine_id = capability_.engine_id;
+    result.engine_version = capability_.engine_version;
+    if (cancel.is_cancel_requested()) {
+      result.in_collision = false;
+      result.normalized_pairs.clear();
+      result.engine_status = CollisionEngineStatus::kCancelled;
+      result.decision = CollisionDecisionResult::kInconclusiveFail;
+      result.raw_diagnostics["cancel_reason"] = cancel.reason();
+    }
+    return result;
+  }
+
+  std::string engine_id() const override { return capability_.engine_id; }
+  std::string engine_version() const override {
+    return capability_.engine_version;
+  }
+
+  std::string last_policy_id;
+  std::uint64_t last_policy_revision_id = 0;
+
+ private:
+  CollisionEngineCapabilityDescriptor capability_;
+};
+
 class MockExecution : public IExecutionBackend {
  public:
   int execute_count = 0;
@@ -224,8 +314,11 @@ class MockExecution : public IExecutionBackend {
   int resume_count = 0;
   int reset_count = 0;
   int sync_count = 0;
+  int begin_streaming_count = 0;
   TrajectoryDTO last_trajectory;
   ExecutionSnapshot snapshot;
+  uint64_t next_streaming_session_id = 1;
+  uint64_t active_streaming_session_id = 0;
   Result<void> next_sync_result = Result<void>::Ok();
   std::function<void()> on_sync;
   /// Optional override for the terminal state reported back to the kernel
@@ -286,6 +379,15 @@ class MockExecution : public IExecutionBackend {
 
   ExecutionSnapshot get_execution_snapshot() const override {
     return snapshot;
+  }
+
+  StreamingSessionBeginResultDTO begin_streaming_session(
+      const StreamingSessionConfigDTO& /*config*/) override {
+    ++begin_streaming_count;
+    active_streaming_session_id = next_streaming_session_id++;
+    snapshot.state = ExecutionState::kStreaming;
+    return StreamingSessionBeginResultDTO{
+        true, active_streaming_session_id, std::nullopt};
   }
 };
 
@@ -602,6 +704,82 @@ ExecuteRequestDTO make_test_request(const std::string& move_id = "move_1") {
   return req;
 }
 
+StreamingSessionConfigDTO make_streaming_config() {
+  StreamingSessionConfigDTO cfg;
+  cfg.group_id = "arm";
+  cfg.joint_names = {"j1", "j2"};
+  cfg.principal_id = "test_operator";
+  cfg.default_input_mode = StreamingInputMode::kJoint;
+  return cfg;
+}
+
+CollisionWorldSnapshot make_test_collision_world_snapshot() {
+  CollisionWorldSnapshot snapshot;
+  snapshot.publisher_id = "mock_kernel_collision_world";
+  snapshot.revision = CollisionWorldRevision{1, "mock-collision-world"};
+  snapshot.snapshot_format_version = 1;
+  snapshot.body_count = 0;
+  snapshot.geometry_count = 0;
+  snapshot.all_bodies_have_geometry = true;
+  return snapshot;
+}
+
+CollisionPolicySnapshot make_test_collision_policy_snapshot() {
+  CollisionPolicySnapshot snapshot;
+  snapshot.policy_id = "free_space";
+  snapshot.revision.revision_id = 1;
+  snapshot.revision.content_hash = "mock-policy";
+  snapshot.require_full_diagnostics = false;
+  return snapshot;
+}
+
+CollisionResult make_authoritative_collision_result() {
+  CollisionResult result;
+  result.in_collision = true;
+  result.normalized_pairs = {CollisionPairId{
+      "robot/robot1/link/link1/collision/0",
+      "object/box/shape/0"}};
+  result.engine_status = CollisionEngineStatus::kOk;
+  result.decision = CollisionDecisionResult::kFail;
+  return result;
+}
+
+InterruptSourceDefinition make_interrupt_source(std::string source_id) {
+  InterruptSourceDefinition source;
+  source.source_id = std::move(source_id);
+  source.adapter = InterruptAdapter::kInternalTest;
+  source.signal = source.source_id + "_signal";
+  source.source_class = InterruptSourceClass::kFastExecutionRelevant;
+  source.kind = InterruptSourceKind::kEdge;
+  source.priority = 500;
+  source.freshness_budget_ns = 1'000'000;
+  return source;
+}
+
+InterruptPolicyDefinition make_interrupt_policy(std::string policy_id,
+                                                std::string source_id) {
+  InterruptPolicyDefinition policy;
+  policy.policy_id = std::move(policy_id);
+  policy.source_id = std::move(source_id);
+  policy.priority = 500;
+  policy.affected_phases = {InterruptExecutionPhase::kStreaming};
+  policy.preemption_action = InterruptPreemptionAction::kLatchHeld;
+  policy.post_latch_disposition =
+      InterruptPostLatchDisposition::kAwaitOperatorAck;
+  return policy;
+}
+
+InterruptSignalUpdate make_interrupt_signal(std::string source_id,
+                                            std::int64_t sequence_id = 1) {
+  InterruptSignalUpdate signal;
+  signal.source_id = std::move(source_id);
+  signal.sequence_id = sequence_id;
+  signal.timestamp_ns = 1'000;
+  signal.freshness_ns = 0;
+  signal.value = true;
+  return signal;
+}
+
 bool wait_for_state(ExecutionKernel& kernel, ExecutionState target_state,
                     int max_attempts = 200) {
   for (int attempt = 0; attempt < max_attempts; ++attempt) {
@@ -634,6 +812,9 @@ class ExecutionKernelTest : public ::testing::Test {
   MockContext context;
   MockExecution execution;
   TrajectoryCache cache{CacheConfig{10}};
+  MockCollisionWorldPublisher collision_world_publisher;
+  std::shared_ptr<MockCollisionEngine> collision_engine =
+      std::make_shared<MockCollisionEngine>();
   ExecutionKernel kernel{planner, context, execution, clock, scheduler, cache};
 
   void SetUp() override {
@@ -648,6 +829,16 @@ class ExecutionKernelTest : public ::testing::Test {
     state.joint_names = {"j1", "j2"};
     state.positions_rad = {0.0, 0.0};
     context.current_state = state;
+    collision_world_publisher.current_snapshot =
+        std::make_shared<const CollisionWorldSnapshot>(
+            make_test_collision_world_snapshot());
+    collision_world_publisher.current_policy =
+        make_test_collision_policy_snapshot();
+    collision_engine = std::make_shared<MockCollisionEngine>();
+    kernel.set_collision_validation_policy_snapshot(
+        make_test_collision_policy_snapshot());
+    kernel.set_collision_validation_pipeline(collision_world_publisher,
+                                             {collision_engine});
   }
 
   /// Helper: execute and wait for async completion.
@@ -661,6 +852,19 @@ class ExecutionKernelTest : public ::testing::Test {
 
   void store_cache(const std::string& move_id, TrajectoryDTO trajectory) {
     cache.store(move_id, std::move(trajectory), context.current_revision);
+  }
+
+  void configure_authoritative_collision_validation(
+      ExecutionKernel& target_kernel,
+      MockCollisionWorldPublisher& publisher,
+      const std::shared_ptr<MockCollisionEngine>& engine) {
+    publisher.current_snapshot =
+        std::make_shared<const CollisionWorldSnapshot>(
+            make_test_collision_world_snapshot());
+    publisher.current_policy = make_test_collision_policy_snapshot();
+    target_kernel.set_collision_validation_policy_snapshot(
+        make_test_collision_policy_snapshot());
+    target_kernel.set_collision_validation_pipeline(publisher, {engine});
   }
 };
 
@@ -786,8 +990,11 @@ TEST_F(ExecutionKernelTest, Execute_HappyPath_CachesTrajectory) {
 }
 
 TEST_F(ExecutionKernelTest, Execute_SceneRevisionChangeDuringValidationFailsClosed) {
-  context.on_validate = [this]() {
-    context.current_revision = CollisionWorldRevision{2, "mutated-world"};
+  collision_engine->on_check = [this](const CollisionQuery&) {
+    auto mutated = make_test_collision_world_snapshot();
+    mutated.revision = CollisionWorldRevision{2, "mutated-world"};
+    collision_world_publisher.current_snapshot =
+        std::make_shared<const CollisionWorldSnapshot>(std::move(mutated));
   };
 
   auto result = execute_sync(make_test_request("move_scene_changed"));
@@ -1163,7 +1370,7 @@ TEST_F(ExecutionKernelTest, Execute_ValidationFails_TransitionsToFailed) {
   execute_sync(make_test_request());
   EXPECT_EQ(kernel.get_status().state, ExecutionState::kFailed);
   EXPECT_EQ(execution.execute_count, 0);
-  EXPECT_TRUE(context.last_validation_options.run_collision_checks);
+  EXPECT_FALSE(context.last_validation_options.run_collision_checks);
 }
 
 TEST_F(ExecutionKernelTest, Execute_ValidationFails_InvalidatesCache) {
@@ -1212,49 +1419,133 @@ TEST_F(ExecutionKernelTest, Execute_StartStateMissingJointName_FailsClosed) {
 // --- Pre-execution collision ---
 
 TEST_F(ExecutionKernelTest, Execute_PreCollisionCheck_Blocks) {
-  context.next_collision = CollisionCheckResultDTO{true, "link1", "box"};
+  collision_engine->default_result = make_authoritative_collision_result();
 
   execute_sync(make_test_request());
   EXPECT_EQ(kernel.get_status().state, ExecutionState::kFailed);
   EXPECT_EQ(execution.execute_count, 0);
-  EXPECT_TRUE(context.last_validation_options.run_collision_checks);
+  EXPECT_FALSE(context.last_validation_options.run_collision_checks);
 }
 
-// --- Pre-execution collision via the CollisionValidationCoordinator (Chunk 5)
+// --- Authoritative pre-execution collision via the manyforge_collision port
 
 TEST_F(ExecutionKernelTest,
-       Execute_CoordinatorPath_BlocksOnLegacyAdapterInCollision) {
-  CollisionPolicySnapshot snapshot;
-  snapshot.policy_id = "free_space";
-  snapshot.revision.revision_id = 17;
-  snapshot.require_full_diagnostics = false;
-  kernel.set_collision_validation_policy_snapshot(snapshot);
-
-  // Legacy CollisionCheckResultDTO.in_collision=true → default
-  // collision_check_normalized maps it to engine_status=kDiagnosticIncomplete
-  // and decision=kInconclusiveFail. The coordinator must not downgrade this
-  // to dispatch, and the kernel must reject the request.
-  context.next_collision = CollisionCheckResultDTO{true, "link1", "box"};
+       Execute_AuthoritativeCollisionPipelineRejectsCollision) {
+  collision_engine->default_result = make_authoritative_collision_result();
 
   execute_sync(make_test_request());
   EXPECT_EQ(kernel.get_status().state, ExecutionState::kFailed);
   EXPECT_EQ(execution.execute_count, 0);
+  EXPECT_GE(collision_engine->check_count.load(), 1);
 }
 
 TEST_F(ExecutionKernelTest,
-       Execute_CoordinatorPath_DispatchesWhenLegacyAdapterReportsClean) {
-  CollisionPolicySnapshot snapshot;
-  snapshot.policy_id = "free_space";
-  snapshot.revision.revision_id = 17;
-  snapshot.require_full_diagnostics = false;
-  kernel.set_collision_validation_policy_snapshot(snapshot);
-
-  context.next_collision = CollisionCheckResultDTO{false, "", ""};
-
+       Execute_AuthoritativeCollisionPipelineDispatchesWhenEngineReportsClean) {
   auto result = execute_sync(make_test_request());
   ASSERT_TRUE(result.ok());
   EXPECT_EQ(execution.execute_count, 1);
   EXPECT_FALSE(context.last_validation_options.run_collision_checks);
+  EXPECT_GE(collision_engine->check_count.load(), 1);
+}
+
+TEST_F(ExecutionKernelTest,
+       Execute_AuthoritativeCollisionUsesPublisherPolicySnapshot) {
+  auto installed_policy = make_test_collision_policy_snapshot();
+  installed_policy.policy_id = "stale_installed_policy";
+  installed_policy.revision.revision_id = 9;
+  kernel.set_collision_validation_policy_snapshot(installed_policy);
+
+  auto publisher_policy = make_test_collision_policy_snapshot();
+  publisher_policy.policy_id = "publisher_dynamic_policy";
+  publisher_policy.revision.revision_id = 42;
+  collision_world_publisher.current_policy = publisher_policy;
+
+  auto result = execute_sync(make_test_request());
+  ASSERT_TRUE(result.ok());
+  EXPECT_GE(collision_engine->check_count.load(), 1);
+  EXPECT_EQ(collision_engine->last_policy_id, "publisher_dynamic_policy");
+  EXPECT_EQ(collision_engine->last_policy_revision_id, 42u);
+}
+
+TEST_F(ExecutionKernelTest,
+       Execute_MissingAuthoritativeCollisionPipelineFailsClosed) {
+  ExecutionKernel unconfigured_kernel{
+      planner, context, execution, clock, scheduler, cache};
+
+  auto result = unconfigured_kernel.execute(make_test_request("missing_pipeline"));
+  ASSERT_TRUE(result.ok());
+  unconfigured_kernel.wait_for_completion();
+  EXPECT_EQ(unconfigured_kernel.get_status().state, ExecutionState::kFailed);
+  EXPECT_EQ(execution.execute_count, 0);
+}
+
+TEST_F(ExecutionKernelTest,
+       Execute_ValidationInterruptCancelsCollisionPassWithoutDispatch) {
+  auto source = make_interrupt_source("validation_stop");
+  ASSERT_TRUE(kernel.register_interrupt_source(source).ok());
+  auto policy =
+      make_interrupt_policy("validation_stop_policy", "validation_stop");
+  policy.affected_phases = {InterruptExecutionPhase::kValidation};
+  policy.preemption_action = InterruptPreemptionAction::kCancelValidation;
+  ASSERT_TRUE(kernel.register_interrupt_policy(policy).ok());
+
+  std::vector<KernelEvent> events;
+  kernel.subscribe_events([&](const KernelEvent& e) { events.push_back(e); });
+
+  bool interrupt_sent = false;
+  collision_engine->on_check = [&](const CollisionQuery&) {
+    if (interrupt_sent) {
+      return;
+    }
+    interrupt_sent = true;
+    auto ingest =
+        kernel.publish_fast_interrupt_signal(make_interrupt_signal(
+            "validation_stop"));
+    EXPECT_TRUE(ingest.latched);
+  };
+
+  auto result = execute_sync(make_test_request("validation_cancel"));
+
+  ASSERT_TRUE(result.ok());
+  EXPECT_TRUE(interrupt_sent);
+  EXPECT_EQ(kernel.get_status().state, ExecutionState::kInterrupted);
+  EXPECT_EQ(execution.execute_count, 0);
+  auto latch = kernel.get_active_interrupt_latch();
+  ASSERT_TRUE(latch.has_value());
+  EXPECT_EQ(latch->source_id, "validation_stop");
+  EXPECT_EQ(latch->execution_phase_at_latch,
+            InterruptExecutionPhase::kValidation);
+  EXPECT_EQ(latch->preemption_action_requested,
+            InterruptPreemptionAction::kCancelValidation);
+  EXPECT_EQ(latch->preemption_result, InterruptPreemptionResult::kSucceeded);
+  auto snapshot = kernel.get_execution_snapshot();
+  ASSERT_TRUE(snapshot.error.has_value());
+  EXPECT_EQ(snapshot.error->details.at("reason"),
+            "collision_validation_cancelled");
+
+  bool saw_latched = false;
+  bool saw_preempt_succeeded = false;
+  bool saw_interrupted_transition = false;
+  bool saw_validation_failed = false;
+  for (const auto& event : events) {
+    saw_latched = saw_latched ||
+                  event.type == KernelEventType::kInterruptLatched;
+    if (event.type == KernelEventType::kInterruptPreemptApplied &&
+        event.details.at("preemption_result") == "succeeded") {
+      saw_preempt_succeeded = true;
+    }
+    if (event.type == KernelEventType::kStateTransition &&
+        event.to_state == ExecutionState::kInterrupted) {
+      saw_interrupted_transition = true;
+    }
+    saw_validation_failed =
+        saw_validation_failed ||
+        event.type == KernelEventType::kValidationFailed;
+  }
+  EXPECT_TRUE(saw_latched);
+  EXPECT_TRUE(saw_preempt_succeeded);
+  EXPECT_TRUE(saw_interrupted_transition);
+  EXPECT_TRUE(saw_validation_failed);
 }
 
 TEST_F(ExecutionKernelTest,
@@ -1478,8 +1769,12 @@ TEST_F(ExecutionKernelTest, Resume_FromPaused_RevalidatesRemainingTrajectory) {
   FakeClock local_clock;
   ManualScheduler local_scheduler;
   TrajectoryCache local_cache{CacheConfig{10}};
+  MockCollisionWorldPublisher local_collision_world;
+  auto local_collision_engine = std::make_shared<MockCollisionEngine>();
   ExecutionKernel controlled_kernel{
       planner, context, controlled_execution, local_clock, local_scheduler, local_cache};
+  configure_authoritative_collision_validation(
+      controlled_kernel, local_collision_world, local_collision_engine);
 
   auto result = controlled_kernel.execute(make_test_request());
   ASSERT_TRUE(result.ok());
@@ -1523,8 +1818,12 @@ TEST_F(ExecutionKernelTest, Resume_FromPaused_WhenBackendPauseTerminatesHandle_K
   FakeClock local_clock;
   ManualScheduler local_scheduler;
   TrajectoryCache local_cache{CacheConfig{10}};
+  MockCollisionWorldPublisher local_collision_world;
+  auto local_collision_engine = std::make_shared<MockCollisionEngine>();
   ExecutionKernel controlled_kernel{
       planner, context, controlled_execution, local_clock, local_scheduler, local_cache};
+  configure_authoritative_collision_validation(
+      controlled_kernel, local_collision_world, local_collision_engine);
 
   std::mutex events_mutex;
   std::vector<KernelEventType> events;
@@ -1577,8 +1876,12 @@ TEST_F(ExecutionKernelTest, Reset_FromPaused_WhenBackendPauseTerminatesHandle_Re
   FakeClock local_clock;
   ManualScheduler local_scheduler;
   TrajectoryCache local_cache{CacheConfig{10}};
+  MockCollisionWorldPublisher local_collision_world;
+  auto local_collision_engine = std::make_shared<MockCollisionEngine>();
   ExecutionKernel controlled_kernel{
       planner, context, controlled_execution, local_clock, local_scheduler, local_cache};
+  configure_authoritative_collision_validation(
+      controlled_kernel, local_collision_world, local_collision_engine);
 
   auto result = controlled_kernel.execute(make_test_request());
   ASSERT_TRUE(result.ok());
@@ -1607,8 +1910,12 @@ TEST_F(ExecutionKernelTest, Resume_FromPaused_ValidationFailureTransitionsToFail
   FakeClock local_clock;
   ManualScheduler local_scheduler;
   TrajectoryCache local_cache{CacheConfig{10}};
+  MockCollisionWorldPublisher local_collision_world;
+  auto local_collision_engine = std::make_shared<MockCollisionEngine>();
   ExecutionKernel controlled_kernel{
       planner, context, controlled_execution, local_clock, local_scheduler, local_cache};
+  configure_authoritative_collision_validation(
+      controlled_kernel, local_collision_world, local_collision_engine);
 
   auto result = controlled_kernel.execute(make_test_request());
   ASSERT_TRUE(result.ok());
@@ -1687,16 +1994,23 @@ TEST_F(ExecutionKernelTest, CollisionCheckTick_NotExecuting_NoOp) {
   EXPECT_EQ(context.collision_count, 0);
 }
 
-TEST_F(ExecutionKernelTest, CollisionMonitoring_SchedulerTickChecksCollisionAndStopsExecution) {
+TEST_F(ExecutionKernelTest,
+       CollisionMonitoring_SchedulerTickLatchesRuntimeCollisionInterrupt) {
   ControlledExecution controlled_execution;
   ThreadSafeFakeClock local_clock;
   ThreadSafeManualScheduler local_scheduler;
   TrajectoryCache local_cache{CacheConfig{10}};
+  MockCollisionWorldPublisher local_collision_world;
+  auto local_collision_engine = std::make_shared<MockCollisionEngine>();
   ExecutionKernel controlled_kernel{
       planner, context, controlled_execution, local_clock, local_scheduler, local_cache};
+  configure_authoritative_collision_validation(
+      controlled_kernel, local_collision_world, local_collision_engine);
+  std::vector<KernelEvent> events;
+  controlled_kernel.subscribe_events(
+      [&](const KernelEvent& e) { events.push_back(e); });
 
   context.collision_sequence = {
-      CollisionCheckResultDTO{false, std::nullopt, std::nullopt},
       CollisionCheckResultDTO{true, "link1", "box"},
   };
 
@@ -1725,7 +2039,28 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_SchedulerTickChecksCollisionAndS
 
   EXPECT_GE(context.collision_count, 1);
   EXPECT_EQ(controlled_execution.stop_count, 1);
-  EXPECT_EQ(controlled_kernel.get_status().state, ExecutionState::kStopped);
+  EXPECT_EQ(controlled_kernel.get_status().state, ExecutionState::kInterrupted);
+  auto latch = controlled_kernel.get_active_interrupt_latch();
+  ASSERT_TRUE(latch.has_value());
+  EXPECT_EQ(latch->source_id, "manyforge.kernel.runtime_collision_fault");
+  EXPECT_EQ(latch->execution_phase_at_latch,
+            InterruptExecutionPhase::kTrajectoryExecution);
+  EXPECT_EQ(latch->preemption_action_requested,
+            InterruptPreemptionAction::kPreemptTrajectory);
+  EXPECT_EQ(latch->preemption_result, InterruptPreemptionResult::kSucceeded);
+  EXPECT_TRUE(std::any_of(events.begin(), events.end(), [](const KernelEvent& e) {
+    return e.type == KernelEventType::kInterruptLatched;
+  }));
+  EXPECT_TRUE(std::any_of(events.begin(), events.end(), [](const KernelEvent& e) {
+    return e.type == KernelEventType::kInterruptPreemptApplied &&
+           e.details.at("preemption_result") == "succeeded";
+  }));
+  EXPECT_TRUE(std::any_of(events.begin(), events.end(), [](const KernelEvent& e) {
+    return e.type == KernelEventType::kCollisionDetected &&
+           e.details.at("surface") == "observed_runtime_monitor" &&
+           e.details.at("contact_a") == "link1" &&
+           e.details.at("contact_b") == "box";
+  }));
 }
 
 TEST_F(ExecutionKernelTest, CollisionMonitoring_UsesConfiguredPeriod) {
@@ -1735,6 +2070,8 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_UsesConfiguredPeriod) {
   TrajectoryCache local_cache{CacheConfig{10}};
   ExecutionKernelConfig config;
   config.collision_monitor_period_ns = 50'000'000;  // 50 ms
+  MockCollisionWorldPublisher local_collision_world;
+  auto local_collision_engine = std::make_shared<MockCollisionEngine>();
   ExecutionKernel controlled_kernel{planner,
                                     context,
                                     controlled_execution,
@@ -1742,6 +2079,8 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_UsesConfiguredPeriod) {
                                     local_scheduler,
                                     local_cache,
                                     config};
+  configure_authoritative_collision_validation(
+      controlled_kernel, local_collision_world, local_collision_engine);
 
   auto result = controlled_kernel.execute(make_test_request());
   ASSERT_TRUE(result.ok());
@@ -2005,6 +2344,98 @@ TEST_F(ExecutionKernelTest, Events_MultipleSubscribers) {
   EXPECT_EQ(events_a.size(), events_b.size());
 }
 
+TEST_F(ExecutionKernelTest, InterruptSignalLatchesAndEmitsKernelEvents) {
+  ASSERT_TRUE(kernel.register_interrupt_source(
+                        make_interrupt_source("controller_fault"))
+                  .ok());
+  ASSERT_TRUE(kernel.register_interrupt_policy(
+                        make_interrupt_policy("controller_fault_policy",
+                                              "controller_fault"))
+                  .ok());
+  std::vector<KernelEvent> events;
+  kernel.subscribe_events([&](const KernelEvent& e) { events.push_back(e); });
+
+  ASSERT_TRUE(kernel.begin_streaming_session(make_streaming_config()).accepted);
+  auto result =
+      kernel.publish_fast_interrupt_signal(make_interrupt_signal("controller_fault"));
+
+  EXPECT_TRUE(result.latched);
+  EXPECT_EQ(kernel.get_status().state, ExecutionState::kInterrupted);
+  auto latch = kernel.get_active_interrupt_latch();
+  ASSERT_TRUE(latch.has_value());
+  EXPECT_EQ(latch->source_id, "controller_fault");
+  EXPECT_EQ(latch->policy_id, "controller_fault_policy");
+  EXPECT_EQ(latch->execution_phase_at_latch, InterruptExecutionPhase::kStreaming);
+  EXPECT_EQ(latch->active_streaming_session_id, 1u);
+
+  bool saw_latched = false;
+  bool saw_preempt_applied = false;
+  bool saw_interrupted_transition = false;
+  for (const auto& event : events) {
+    saw_latched = saw_latched || event.type == KernelEventType::kInterruptLatched;
+    saw_preempt_applied =
+        saw_preempt_applied || event.type == KernelEventType::kInterruptPreemptApplied;
+    if (event.type == KernelEventType::kStateTransition &&
+        event.to_state == ExecutionState::kInterrupted) {
+      saw_interrupted_transition = true;
+      EXPECT_EQ(event.details.at("reason"), "interrupt_latched");
+    }
+  }
+  EXPECT_TRUE(saw_latched);
+  EXPECT_TRUE(saw_preempt_applied);
+  EXPECT_TRUE(saw_interrupted_transition);
+}
+
+TEST_F(ExecutionKernelTest, ResetClearsActiveInterruptLatch) {
+  ASSERT_TRUE(kernel.register_interrupt_source(
+                        make_interrupt_source("controller_fault"))
+                  .ok());
+  ASSERT_TRUE(kernel.register_interrupt_policy(
+                        make_interrupt_policy("controller_fault_policy",
+                                              "controller_fault"))
+                  .ok());
+  std::vector<KernelEvent> events;
+  kernel.subscribe_events([&](const KernelEvent& e) { events.push_back(e); });
+  ASSERT_TRUE(kernel.begin_streaming_session(make_streaming_config()).accepted);
+  ASSERT_TRUE(kernel.publish_fast_interrupt_signal(
+                        make_interrupt_signal("controller_fault"))
+                  .latched);
+  ASSERT_TRUE(kernel.get_active_interrupt_latch().has_value());
+
+  auto reset = kernel.reset();
+
+  EXPECT_TRUE(reset.accepted);
+  EXPECT_FALSE(kernel.get_active_interrupt_latch().has_value());
+  EXPECT_EQ(kernel.get_status().state, ExecutionState::kIdle);
+  bool saw_reset_clear = false;
+  for (const auto& event : events) {
+    if (event.type == KernelEventType::kInterruptCleared &&
+        event.details.at("clear_reason") == "reset") {
+      saw_reset_clear = true;
+    }
+  }
+  EXPECT_TRUE(saw_reset_clear);
+}
+
+TEST_F(ExecutionKernelTest, InterruptSignalFromIdleCannotCreateHeldLatch) {
+  ASSERT_TRUE(kernel.register_interrupt_source(
+                        make_interrupt_source("controller_fault"))
+                  .ok());
+  auto policy =
+      make_interrupt_policy("controller_fault_policy", "controller_fault");
+  policy.affected_phases = {InterruptExecutionPhase::kHeld};
+  ASSERT_TRUE(kernel.register_interrupt_policy(policy).ok());
+
+  auto result =
+      kernel.publish_fast_interrupt_signal(make_interrupt_signal("controller_fault"));
+
+  EXPECT_TRUE(result.rejected);
+  EXPECT_EQ(result.reason, "no_active_execution_phase");
+  EXPECT_FALSE(result.latched);
+  EXPECT_FALSE(kernel.get_active_interrupt_latch().has_value());
+  EXPECT_EQ(kernel.get_status().state, ExecutionState::kIdle);
+}
+
 TEST_F(ExecutionKernelTest, Events_ExecutionId_Matches) {
   std::vector<uint64_t> event_ids;
   kernel.subscribe_events([&](const KernelEvent& e) {
@@ -2150,6 +2581,8 @@ TEST_F(ExecutionKernelTest, Cancel_StopDuringPlanning_TransitionsToStopped) {
   ManualScheduler scheduler;
   TrajectoryCache cache{CacheConfig{10}};
   ExecutionKernel kernel{slow_planner, context, execution, clock, scheduler, cache};
+  configure_authoritative_collision_validation(
+      kernel, collision_world_publisher, collision_engine);
 
   // Start execution
   auto result = kernel.execute(make_test_request());
@@ -2178,6 +2611,8 @@ TEST_F(ExecutionKernelTest, Cancel_ResetDuringPlanning_TransitionsToIdle) {
   ManualScheduler scheduler;
   TrajectoryCache cache{CacheConfig{10}};
   ExecutionKernel kernel{slow_planner, context, execution, clock, scheduler, cache};
+  configure_authoritative_collision_validation(
+      kernel, collision_world_publisher, collision_engine);
 
   // Start execution
   auto result = kernel.execute(make_test_request());
@@ -2206,6 +2641,8 @@ TEST_F(ExecutionKernelTest, Cancel_StopDuringPlanning_EmitsCorrectEvents) {
   ManualScheduler scheduler;
   TrajectoryCache cache{CacheConfig{10}};
   ExecutionKernel kernel{slow_planner, context, execution, clock, scheduler, cache};
+  configure_authoritative_collision_validation(
+      kernel, collision_world_publisher, collision_engine);
 
   std::vector<KernelEvent> events;
   kernel.subscribe_events([&](const KernelEvent& e) {
@@ -2397,6 +2834,8 @@ TEST_F(ExecutionKernelTest, Events_CollisionDetectedEvent) {
   ManualScheduler scheduler;
   TrajectoryCache cache{CacheConfig{10}};
   ExecutionKernel kernel{slow_planner, context, execution, clock, scheduler, cache};
+  configure_authoritative_collision_validation(
+      kernel, collision_world_publisher, collision_engine);
 
   std::vector<KernelEvent> events;
   kernel.subscribe_events([&](const KernelEvent& e) {
@@ -2480,6 +2919,8 @@ TEST_F(ExecutionKernelTest, MetricsAfterStop) {
   ManualScheduler scheduler;
   TrajectoryCache cache{CacheConfig{10}};
   ExecutionKernel kernel{slow_planner, context, execution, clock, scheduler, cache};
+  configure_authoritative_collision_validation(
+      kernel, collision_world_publisher, collision_engine);
 
   // Start execution
   auto result = kernel.execute(make_test_request());
@@ -2527,6 +2968,8 @@ TEST_F(ExecutionKernelTest, Metrics_CollisionDetections) {
   ManualScheduler scheduler;
   TrajectoryCache cache{CacheConfig{10}};
   ExecutionKernel kernel{slow_planner, context, execution, clock, scheduler, cache};
+  configure_authoritative_collision_validation(
+      kernel, collision_world_publisher, collision_engine);
 
   // Set up collision detection
   context.next_collision = CollisionCheckResultDTO{true, "link1", "box"};
@@ -2561,6 +3004,8 @@ TEST_F(ExecutionKernelTest, ExecutionTimeout_TransitionsToFailed) {
   TrajectoryCache local_cache{CacheConfig{10}};
   ExecutionKernel timeout_kernel{
       planner, context, controlled_execution, ts_clock, ts_scheduler, local_cache};
+  configure_authoritative_collision_validation(
+      timeout_kernel, collision_world_publisher, collision_engine);
 
   auto req = make_test_request();
   req.timeouts.execution_timeout_s = 0.5;
@@ -2604,6 +3049,8 @@ TEST_F(ExecutionKernelTest, ExecutionTimeout_DoesNotAdvanceWhilePaused) {
   TrajectoryCache local_cache{CacheConfig{10}};
   ExecutionKernel timeout_kernel{
       planner, context, controlled_execution, ts_clock, ts_scheduler, local_cache};
+  configure_authoritative_collision_validation(
+      timeout_kernel, collision_world_publisher, collision_engine);
 
   auto req = make_test_request();
   req.timeouts.execution_timeout_s = 0.5;
@@ -2640,6 +3087,8 @@ TEST_F(ExecutionKernelTest, PlanningTimeout_TriggersStop) {
   TrajectoryCache local_cache{CacheConfig{10}};
   ExecutionKernel timeout_kernel{
       slow_planner, context, execution, ts_clock, ts_scheduler, local_cache};
+  configure_authoritative_collision_validation(
+      timeout_kernel, collision_world_publisher, collision_engine);
 
   auto req = make_test_request();
   req.timeouts.planning_timeout_s = 0.1;
@@ -2674,6 +3123,8 @@ TEST_F(ExecutionKernelTest, ResetDuringPlanning_PrevStateIsPlanning) {
   TrajectoryCache local_cache{CacheConfig{10}};
   ExecutionKernel local_kernel{
       slow_planner, context, execution, ts_clock, ts_scheduler, local_cache};
+  configure_authoritative_collision_validation(
+      local_kernel, collision_world_publisher, collision_engine);
 
   std::vector<KernelEvent> events;
   local_kernel.subscribe_events([&](const KernelEvent& e) { events.push_back(e); });
@@ -2712,6 +3163,8 @@ TEST_F(ExecutionKernelTest, ConcurrentStress_RapidExecuteStopResetCycles) {
   TrajectoryCache local_cache{CacheConfig{10}};
   ExecutionKernel local_kernel{
       planner, context, ctrl_exec, ts_clock, ts_scheduler, local_cache};
+  configure_authoritative_collision_validation(
+      local_kernel, collision_world_publisher, collision_engine);
 
   std::atomic<bool> reader_stop{false};
   std::atomic<int> reads_completed{0};
@@ -2787,6 +3240,8 @@ TEST_F(ExecutionKernelTest, ConcurrentStress_RapidExecuteStopCycles) {
   TrajectoryCache local_cache{CacheConfig{10}};
   ExecutionKernel local_kernel{
       planner, context, ctrl_exec, ts_clock, ts_scheduler, local_cache};
+  configure_authoritative_collision_validation(
+      local_kernel, collision_world_publisher, collision_engine);
 
   constexpr int kCycles = 30;
   for (int i = 0; i < kCycles; ++i) {

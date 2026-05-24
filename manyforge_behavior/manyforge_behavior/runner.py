@@ -247,21 +247,6 @@ class OrchestratorRunner:
         self._tree = tree
         return tree
 
-    def build_interrupt_handler_tree(
-        self,
-        handler_id: str,
-    ) -> py_trees.trees.BehaviourTree:
-        """Build a dedicated behaviour tree for a named interrupt handler."""
-        if self._program is None or self._resolver is None:
-            raise RuntimeError("Call load() first")
-        handler = self._program.interrupt_handlers.get(handler_id)
-        if handler is None:
-            raise KeyError(f"Unknown interrupt handler: {handler_id}")
-        root = self._build_node(handler.root)
-        tree = py_trees.trees.BehaviourTree(root=root)
-        tree.setup()
-        return tree
-
     def apply_scene(self) -> None:
         """Apply program scene resources via kernel.scene_edit() before execution."""
         if self._program is None:

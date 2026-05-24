@@ -18,6 +18,8 @@
 #include <manyforge_core/types/scene_edit.hpp>
 #include <manyforge_core/types/collision_event.hpp>
 #include <manyforge_core/types/collision.hpp>
+#include <manyforge_core/types/collision_world_snapshot.hpp>
+#include <manyforge_core/collision/collision_world_snapshot_builder.hpp>
 
 namespace py = pybind11;
 
@@ -37,11 +39,15 @@ PYBIND11_MODULE(manyforge_core_py, m) {
         .value("kPlanning", manyforge::core::ExecutionState::kPlanning)
         .value("kValidating", manyforge::core::ExecutionState::kValidating)
         .value("kExecuting", manyforge::core::ExecutionState::kExecuting)
+        .value("kStreaming", manyforge::core::ExecutionState::kStreaming)
+        .value("kInterrupted", manyforge::core::ExecutionState::kInterrupted)
         .value("kPaused", manyforge::core::ExecutionState::kPaused)
         .value("kStopping", manyforge::core::ExecutionState::kStopping)
         .value("kStopped", manyforge::core::ExecutionState::kStopped)
         .value("kCompleted", manyforge::core::ExecutionState::kCompleted)
         .value("kFailed", manyforge::core::ExecutionState::kFailed)
+        .value("kInterventionRequired",
+               manyforge::core::ExecutionState::kInterventionRequired)
         .export_values();
 
     py::enum_<manyforge::core::CacheMode>(m, "CacheMode")
@@ -662,6 +668,7 @@ PYBIND11_MODULE(manyforge_core_py, m) {
                manyforge::core::CollisionEngineStatus::kUnsupportedGeometry)
         .value("kDiagnosticIncomplete",
                manyforge::core::CollisionEngineStatus::kDiagnosticIncomplete)
+        .value("kCancelled", manyforge::core::CollisionEngineStatus::kCancelled)
         .value("kEngineError", manyforge::core::CollisionEngineStatus::kEngineError);
 
     py::enum_<manyforge::core::CollisionDecisionResult>(m, "CollisionDecisionResult")
@@ -831,6 +838,24 @@ PYBIND11_MODULE(manyforge_core_py, m) {
                        &manyforge::core::CollisionGeometryDescriptor::geometry_kind)
         .def_readwrite("local_pose",
                        &manyforge::core::CollisionGeometryDescriptor::local_pose)
+        .def_readwrite(
+            "box_dimensions_m",
+            &manyforge::core::CollisionGeometryDescriptor::box_dimensions_m)
+        .def_readwrite(
+            "sphere_radius_m",
+            &manyforge::core::CollisionGeometryDescriptor::sphere_radius_m)
+        .def_readwrite(
+            "cylinder_radius_m",
+            &manyforge::core::CollisionGeometryDescriptor::cylinder_radius_m)
+        .def_readwrite(
+            "cylinder_height_m",
+            &manyforge::core::CollisionGeometryDescriptor::cylinder_height_m)
+        .def_readwrite(
+            "capsule_radius_m",
+            &manyforge::core::CollisionGeometryDescriptor::capsule_radius_m)
+        .def_readwrite(
+            "capsule_height_m",
+            &manyforge::core::CollisionGeometryDescriptor::capsule_height_m)
         .def_readwrite("source_uri",
                        &manyforge::core::CollisionGeometryDescriptor::source_uri)
         .def_readwrite("source_hash",
@@ -847,6 +872,104 @@ PYBIND11_MODULE(manyforge_core_py, m) {
             return py::str("CollisionGeometryDescriptor(body_id='{}')")
                 .format(g.body_id);
         });
+
+    py::class_<manyforge::core::CollisionWorldBody>(m, "CollisionWorldBody")
+        .def(py::init<>())
+        .def_readwrite("body_id",
+                       &manyforge::core::CollisionWorldBody::body_id)
+        .def_readwrite("owner_kind",
+                       &manyforge::core::CollisionWorldBody::owner_kind)
+        .def_readwrite("parent_link",
+                       &manyforge::core::CollisionWorldBody::parent_link)
+        .def_readwrite("frame_id",
+                       &manyforge::core::CollisionWorldBody::frame_id)
+        .def_readwrite("pose", &manyforge::core::CollisionWorldBody::pose)
+        .def_readwrite("geometries",
+                       &manyforge::core::CollisionWorldBody::geometries)
+        .def_readwrite("body_content_hash",
+                       &manyforge::core::CollisionWorldBody::body_content_hash)
+        .def("__repr__", [](const manyforge::core::CollisionWorldBody& b) {
+            return py::str("CollisionWorldBody(body_id='{}')")
+                .format(b.body_id);
+        });
+
+    py::class_<manyforge::core::CollisionWorldSnapshot,
+               std::shared_ptr<manyforge::core::CollisionWorldSnapshot>>(
+        m, "CollisionWorldSnapshot")
+        .def(py::init<>())
+        .def_readwrite(
+            "snapshot_format_version",
+            &manyforge::core::CollisionWorldSnapshot::snapshot_format_version)
+        .def_readwrite("publisher_id",
+                       &manyforge::core::CollisionWorldSnapshot::publisher_id)
+        .def_readwrite("revision",
+                       &manyforge::core::CollisionWorldSnapshot::revision)
+        .def_readwrite("emitted_at_ns",
+                       &manyforge::core::CollisionWorldSnapshot::emitted_at_ns)
+        .def_readwrite("bodies",
+                       &manyforge::core::CollisionWorldSnapshot::bodies)
+        .def_readwrite("body_count",
+                       &manyforge::core::CollisionWorldSnapshot::body_count)
+        .def_readwrite(
+            "geometry_count",
+            &manyforge::core::CollisionWorldSnapshot::geometry_count)
+        .def_readwrite(
+            "robot_link_count",
+            &manyforge::core::CollisionWorldSnapshot::robot_link_count)
+        .def_readwrite(
+            "attached_object_count",
+            &manyforge::core::CollisionWorldSnapshot::attached_object_count)
+        .def_readwrite(
+            "detached_object_count",
+            &manyforge::core::CollisionWorldSnapshot::detached_object_count)
+        .def_readwrite("fixture_count",
+                       &manyforge::core::CollisionWorldSnapshot::fixture_count)
+        .def_readwrite(
+            "contains_mesh_geometry",
+            &manyforge::core::CollisionWorldSnapshot::contains_mesh_geometry)
+        .def_readwrite(
+            "all_bodies_have_geometry",
+            &manyforge::core::CollisionWorldSnapshot::all_bodies_have_geometry)
+        .def("__repr__", [](const manyforge::core::CollisionWorldSnapshot& s) {
+            return py::str(
+                       "CollisionWorldSnapshot(publisher_id='{}', "
+                       "revision_id={}, body_count={}, geometry_count={})")
+                .format(s.publisher_id, s.revision.revision_id,
+                        s.body_count, s.geometry_count);
+        });
+
+    // Builder. `build()` raises ValueError on invariant violation; that is
+    // the idiomatic Python surface for a fail-closed assembler. The
+    // setters return self so callers can chain the same way they do in C++.
+    py::class_<manyforge::core::CollisionWorldSnapshotBuilder>(
+        m, "CollisionWorldSnapshotBuilder")
+        .def(py::init<>())
+        .def("set_publisher_id",
+             &manyforge::core::CollisionWorldSnapshotBuilder::set_publisher_id,
+             py::return_value_policy::reference_internal)
+        .def(
+            "set_snapshot_format_version",
+            &manyforge::core::CollisionWorldSnapshotBuilder::
+                set_snapshot_format_version,
+            py::return_value_policy::reference_internal)
+        .def("set_revision_id",
+             &manyforge::core::CollisionWorldSnapshotBuilder::set_revision_id,
+             py::return_value_policy::reference_internal)
+        .def(
+            "set_emitted_at_ns",
+            &manyforge::core::CollisionWorldSnapshotBuilder::set_emitted_at_ns,
+            py::return_value_policy::reference_internal)
+        .def("add_body",
+             &manyforge::core::CollisionWorldSnapshotBuilder::add_body,
+             py::return_value_policy::reference_internal)
+        .def("build",
+             [](manyforge::core::CollisionWorldSnapshotBuilder& self) {
+                 auto result = self.build();
+                 if (!result.ok()) {
+                     throw py::value_error(result.error().message);
+                 }
+                 return result.value();
+             });
 
     py::class_<manyforge::core::CollisionQuery>(m, "CollisionQuery")
         .def(py::init<>())
@@ -913,6 +1036,8 @@ PYBIND11_MODULE(manyforge_core_py, m) {
             &manyforge::core::CollisionResult::normalized_pairs_classified)
         .def_readwrite("policy_revision_used",
                        &manyforge::core::CollisionResult::policy_revision_used)
+        .def_readwrite("raw_diagnostics",
+                       &manyforge::core::CollisionResult::raw_diagnostics)
         .def("__repr__", [](const manyforge::core::CollisionResult& r) {
             return py::str("CollisionResult(in_collision={}, pairs={})")
                 .format(r.in_collision, r.normalized_pairs.size());
@@ -934,6 +1059,81 @@ PYBIND11_MODULE(manyforge_core_py, m) {
                        &manyforge::core::CollisionDecision::failure_archive_id)
         .def("__repr__", [](const manyforge::core::CollisionDecision& d) {
             return py::str("CollisionDecision(accepted={})").format(d.accepted);
+        });
+
+    py::enum_<manyforge::core::CollisionFailureKind>(m, "CollisionFailureKind")
+        .value("kBlockingCollision",
+               manyforge::core::CollisionFailureKind::kBlockingCollision)
+        .value("kSupportContactViolation",
+               manyforge::core::CollisionFailureKind::kSupportContactViolation)
+        .value("kDiagnosticIncomplete",
+               manyforge::core::CollisionFailureKind::kDiagnosticIncomplete)
+        .value("kEngineError",
+               manyforge::core::CollisionFailureKind::kEngineError)
+        .value("kCancelled",
+               manyforge::core::CollisionFailureKind::kCancelled)
+        .value("kSceneChangedDuringValidation",
+               manyforge::core::CollisionFailureKind::
+                   kSceneChangedDuringValidation);
+
+    py::class_<manyforge::core::CollisionFailureArchiveEntry>(
+        m, "CollisionFailureArchiveEntry")
+        .def(py::init<>())
+        .def_readwrite("entry_id",
+                       &manyforge::core::CollisionFailureArchiveEntry::entry_id)
+        .def_readwrite("emitted_at_ns",
+                       &manyforge::core::CollisionFailureArchiveEntry::
+                           emitted_at_ns)
+        .def_readwrite("engine_id",
+                       &manyforge::core::CollisionFailureArchiveEntry::engine_id)
+        .def_readwrite(
+            "engine_version",
+            &manyforge::core::CollisionFailureArchiveEntry::engine_version)
+        .def_readwrite("collision_world_revision",
+                       &manyforge::core::CollisionFailureArchiveEntry::
+                           collision_world_revision)
+        .def_readwrite("policy_revision",
+                       &manyforge::core::CollisionFailureArchiveEntry::
+                           policy_revision)
+        .def_readwrite("failure_kind",
+                       &manyforge::core::CollisionFailureArchiveEntry::
+                           failure_kind)
+        .def_readwrite("decision_action",
+                       &manyforge::core::CollisionFailureArchiveEntry::
+                           decision_action)
+        .def_readwrite("decision_severity",
+                       &manyforge::core::CollisionFailureArchiveEntry::
+                           decision_severity)
+        .def_readwrite("normalized_pairs",
+                       &manyforge::core::CollisionFailureArchiveEntry::
+                           normalized_pairs)
+        .def_readwrite("first_failing_waypoint",
+                       &manyforge::core::CollisionFailureArchiveEntry::
+                           first_failing_waypoint)
+        .def_readwrite("first_failing_time_ns",
+                       &manyforge::core::CollisionFailureArchiveEntry::
+                           first_failing_time_ns)
+        .def_readwrite("trajectory_waypoint_count",
+                       &manyforge::core::CollisionFailureArchiveEntry::
+                           trajectory_waypoint_count)
+        .def_readwrite("query_duration_ns",
+                       &manyforge::core::CollisionFailureArchiveEntry::
+                           query_duration_ns)
+        .def_readwrite("worker_count_actually_used",
+                       &manyforge::core::CollisionFailureArchiveEntry::
+                           worker_count_actually_used)
+        .def_readwrite("fallback_reason",
+                       &manyforge::core::CollisionFailureArchiveEntry::
+                           fallback_reason)
+        .def_readwrite("raw_diagnostics",
+                       &manyforge::core::CollisionFailureArchiveEntry::
+                           raw_diagnostics)
+        .def_readwrite("correlation_id",
+                       &manyforge::core::CollisionFailureArchiveEntry::
+                           correlation_id)
+        .def("__repr__", [](const manyforge::core::CollisionFailureArchiveEntry& e) {
+            return py::str("CollisionFailureArchiveEntry(entry_id='{}')")
+                .format(e.entry_id);
         });
 
     // ========================================================================

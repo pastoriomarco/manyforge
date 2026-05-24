@@ -1583,8 +1583,8 @@ function GripperRow({
   // operator sees both "where the finger actually is" and "where we
   // asked it to go".
   const [pending, setPending] = useState<number | null>(null);
-  // Anything that releases the BT runner (Run, an interrupt handler,
-  // a direct-control session opened from a sibling panel) clears the
+  // Anything that releases the BT runner (Run or a direct-control session
+  // opened from a sibling panel) clears the
   // operator's stale drag value. Without this, a drag that didn't
   // close cleanly (mouseup outside the slider, a torn touch event)
   // leaves pending set forever and the slider stops following live
@@ -1593,7 +1593,6 @@ function GripperRow({
   useEffect(() => {
     if (
       cycleState === 'running'
-      || cycleState === 'interrupt_handler'
       || cycleState === 'direct_control'
     ) {
       setPending(null);
@@ -2045,7 +2044,6 @@ function JointRow({
   useEffect(() => {
     if (
       cycleState === 'running'
-      || cycleState === 'interrupt_handler'
       || cycleState === 'direct_control'
     ) {
       setDraft(null);

@@ -286,7 +286,7 @@ TEST(ContractsCompile, CacheModeEnum) {
   EXPECT_NE(static_cast<int>(mode1), static_cast<int>(mode2));
 }
 
-// Test all 9 ExecutionState enum values and to_string
+// Test all ExecutionState enum values and to_string
 TEST(ContractsCompile, AllExecutionStates) {
   using namespace manyforge::core;
 
@@ -294,11 +294,14 @@ TEST(ContractsCompile, AllExecutionStates) {
   EXPECT_STREQ(to_string(ExecutionState::kPlanning), "Planning");
   EXPECT_STREQ(to_string(ExecutionState::kValidating), "Validating");
   EXPECT_STREQ(to_string(ExecutionState::kExecuting), "Executing");
+  EXPECT_STREQ(to_string(ExecutionState::kInterrupted), "Interrupted");
   EXPECT_STREQ(to_string(ExecutionState::kPaused), "Paused");
   EXPECT_STREQ(to_string(ExecutionState::kStopping), "Stopping");
   EXPECT_STREQ(to_string(ExecutionState::kStopped), "Stopped");
   EXPECT_STREQ(to_string(ExecutionState::kCompleted), "Completed");
   EXPECT_STREQ(to_string(ExecutionState::kFailed), "Failed");
+  EXPECT_STREQ(to_string(ExecutionState::kInterventionRequired),
+               "InterventionRequired");
 }
 
 // Test PlanResultDTO XOR invariant: exactly one of trajectory or error

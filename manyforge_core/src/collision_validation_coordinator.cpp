@@ -49,6 +49,24 @@ bool revisions_equal(const CollisionWorldRevision& a,
   return a.revision_id == b.revision_id && a.content_hash == b.content_hash;
 }
 
+void mark_cancelled(CollisionValidationDecisionBundle& bundle,
+                    std::int64_t waypoint_index,
+                    std::string reason) {
+  bundle.cancelled = true;
+  bundle.cancellation_reason = std::move(reason);
+  bundle.decision.accepted = false;
+  bundle.cancelled_at_waypoint_index = waypoint_index;
+  const bool earlier_reject =
+      bundle.decision.action == CollisionDecisionAction::kReject &&
+      bundle.decision.first_failing_waypoint &&
+      *bundle.decision.first_failing_waypoint < waypoint_index;
+  if (!earlier_reject) {
+    bundle.decision.severity = CollisionDecisionSeverity::kBlock;
+    bundle.decision.action = CollisionDecisionAction::kInconclusive;
+    bundle.decision.first_failing_waypoint = waypoint_index;
+  }
+}
+
 CollisionPairId canonicalize(CollisionPairId pair) {
   if (pair.body_b < pair.body_a) {
     std::swap(pair.body_a, pair.body_b);
@@ -103,30 +121,14 @@ CollisionValidationCoordinator::merge_engine_and_policy_decision(
 }
 
 CollisionValidationWaypointRecord
-CollisionValidationCoordinator::classify_one(
-    IPlanningContext& context, const RobotStateDTO& state,
-    std::int64_t waypoint_index, std::optional<std::int64_t> time_from_start_ns,
+CollisionValidationCoordinator::classify_result(
+    CollisionResult result, std::int64_t waypoint_index,
+    std::optional<std::int64_t> time_from_start_ns,
     const CollisionWorldRevision& borrowed_revision) {
   CollisionValidationWaypointRecord record;
   record.waypoint_index = waypoint_index;
   record.time_from_start_ns = time_from_start_ns;
-
-  CollisionQuery query;
-  query.robot_state = state;
-  query.surface = config_.surface;
-  query.collision_world_revision = borrowed_revision;
-  query.policy_revision =
-      std::to_string(config_.policy_snapshot.revision.revision_id);
-  query.state_time_ns = time_from_start_ns;
-  query.waypoint_index = waypoint_index;
-  query.query_id = "validation_coordinator_w" + std::to_string(waypoint_index);
-  query.required_capabilities =
-      required_capabilities_for(config_.policy_snapshot);
-  if (config_.per_state_timeout_ns > 0) {
-    query.timeout_budget_ns = config_.per_state_timeout_ns;
-  }
-
-  record.result = context.collision_check_normalized(query);
+  record.result = std::move(result);
 
   const bool diagnostics_complete =
       record.result.engine_status == CollisionEngineStatus::kOk;
@@ -159,6 +161,54 @@ CollisionValidationCoordinator::classify_one(
   record.produced_decision_change = (merged != CollisionDecisionResult::kPass);
   record.result.decision = merged;
   return record;
+}
+
+CollisionQuery CollisionValidationCoordinator::make_query(
+    const RobotStateDTO& state, std::int64_t waypoint_index,
+    std::optional<std::int64_t> time_from_start_ns,
+    const CollisionWorldRevision& borrowed_revision) const {
+  CollisionQuery query;
+  query.robot_state = state;
+  query.surface = config_.surface;
+  query.collision_world_revision = borrowed_revision;
+  query.policy_revision =
+      std::to_string(config_.policy_snapshot.revision.revision_id);
+  query.state_time_ns = time_from_start_ns;
+  query.waypoint_index = waypoint_index;
+  query.query_id = "validation_coordinator_w" + std::to_string(waypoint_index);
+  query.required_capabilities =
+      required_capabilities_for(config_.policy_snapshot);
+  if (config_.per_state_timeout_ns > 0) {
+    query.timeout_budget_ns = config_.per_state_timeout_ns;
+  }
+  return query;
+}
+
+CollisionValidationWaypointRecord
+CollisionValidationCoordinator::classify_one(
+    IPlanningContext& context, const RobotStateDTO& state,
+    std::int64_t waypoint_index, std::optional<std::int64_t> time_from_start_ns,
+    const CollisionWorldRevision& borrowed_revision) {
+  auto query =
+      make_query(state, waypoint_index, time_from_start_ns, borrowed_revision);
+  return classify_result(context.collision_check_normalized(query),
+                         waypoint_index, time_from_start_ns,
+                         borrowed_revision);
+}
+
+CollisionValidationWaypointRecord
+CollisionValidationCoordinator::classify_one(
+    const CollisionWorldSnapshot& snapshot, ICollisionQueryEngine& engine,
+    const RobotStateDTO& state, std::int64_t waypoint_index,
+    std::optional<std::int64_t> time_from_start_ns,
+    const CollisionWorldRevision& borrowed_revision,
+    const CollisionCancellationToken& cancel) {
+  auto query =
+      make_query(state, waypoint_index, time_from_start_ns, borrowed_revision);
+  return classify_result(engine.check(snapshot, query, config_.policy_snapshot,
+                                      cancel),
+                         waypoint_index, time_from_start_ns,
+                         borrowed_revision);
 }
 
 CollisionValidationDecisionBundle
@@ -255,6 +305,127 @@ CollisionValidationCoordinator::run_pass_once(
 }
 
 CollisionValidationDecisionBundle
+CollisionValidationCoordinator::run_pass_once(
+    const CollisionWorldSnapshot& snapshot, ICollisionQueryEngine& engine,
+    const TrajectoryDTO& trajectory,
+    const CollisionCancellationToken& cancel) {
+  CollisionValidationDecisionBundle bundle;
+  bundle.borrowed_world_revision = snapshot.revision;
+
+  evaluator_.reset();
+
+  CollisionDecisionResult worst_decision = CollisionDecisionResult::kPass;
+  CollisionDecisionSeverity worst_severity = CollisionDecisionSeverity::kNone;
+  std::optional<std::int64_t> first_failing_waypoint;
+  std::optional<std::int64_t> first_failing_time_ns;
+
+  for (std::size_t i = 0; i < trajectory.waypoints.size(); ++i) {
+    if (cancel.is_cancel_requested()) {
+      mark_cancelled(bundle, static_cast<std::int64_t>(i), cancel.reason());
+      bundle.final_world_revision = snapshot.revision;
+      return bundle;
+    }
+    const auto& wp = trajectory.waypoints[i];
+    RobotStateDTO state;
+    state.joint_names = trajectory.joint_names;
+    state.positions_rad = wp.positions_rad;
+
+    std::optional<std::int64_t> time_from_start_ns =
+        static_cast<std::int64_t>(wp.time_from_start_s * 1e9);
+    auto record = classify_one(snapshot, engine, state,
+                               static_cast<std::int64_t>(i),
+                               time_from_start_ns,
+                               bundle.borrowed_world_revision, cancel);
+    const auto wp_decision = record.result.decision;
+    const auto wp_severity = severity_for(wp_decision);
+    const bool had_prior_failure = first_failing_waypoint.has_value();
+
+    if (wp_severity > worst_severity ||
+        (wp_severity == worst_severity &&
+         wp_decision != CollisionDecisionResult::kPass &&
+         worst_decision == CollisionDecisionResult::kPass)) {
+      worst_decision = wp_decision;
+      worst_severity = wp_severity;
+    }
+    if (wp_decision != CollisionDecisionResult::kPass &&
+        !first_failing_waypoint.has_value()) {
+      first_failing_waypoint = record.waypoint_index;
+      first_failing_time_ns = record.time_from_start_ns;
+    }
+    const bool record_cancelled =
+        record.result.engine_status == CollisionEngineStatus::kCancelled;
+    const auto cancelled_index = record.waypoint_index;
+    const auto cancelled_reason =
+        record.result.raw_diagnostics.contains("cancel_reason")
+            ? record.result.raw_diagnostics.at("cancel_reason")
+            : cancel.reason();
+    bundle.waypoint_records.push_back(std::move(record));
+    if (record_cancelled) {
+      if (had_prior_failure) {
+        bundle.decision.accepted = false;
+        bundle.decision.severity = worst_severity;
+        bundle.decision.action = action_for(worst_decision);
+        bundle.decision.first_failing_waypoint = first_failing_waypoint;
+        bundle.decision.first_failing_time_ns = first_failing_time_ns;
+        bundle.decision.collision_world_revision = snapshot.revision;
+      }
+      mark_cancelled(bundle, cancelled_index, cancelled_reason);
+      bundle.final_world_revision = snapshot.revision;
+      return bundle;
+    }
+  }
+
+  for (const auto& support_entry : config_.policy_snapshot.support_contacts) {
+    if (!support_entry.require_separation_by_end) {
+      continue;
+    }
+    const auto required_pair = canonicalize(support_entry.pair);
+    bool contact_started = false;
+    bool separated = false;
+    for (const auto& record : bundle.waypoint_records) {
+      for (const auto& classified :
+           record.result.normalized_pairs_classified) {
+        if (canonicalize(classified.pair) != required_pair) {
+          continue;
+        }
+        switch (classified.classification) {
+          case CollisionPairClassification::kSupportContactStart:
+          case CollisionPairClassification::kSupportContactContinued:
+          case CollisionPairClassification::kSupportContactRecontactViolation:
+            contact_started = true;
+            break;
+          case CollisionPairClassification::kSupportContactSeparated:
+            separated = true;
+            break;
+          default:
+            break;
+        }
+      }
+    }
+    if (contact_started && !separated) {
+      worst_decision = CollisionDecisionResult::kFail;
+      worst_severity = CollisionDecisionSeverity::kBlock;
+      if (!first_failing_waypoint.has_value() && !trajectory.waypoints.empty()) {
+        first_failing_waypoint =
+            static_cast<std::int64_t>(trajectory.waypoints.size() - 1);
+        const auto& final_wp = trajectory.waypoints.back();
+        first_failing_time_ns =
+            static_cast<std::int64_t>(final_wp.time_from_start_s * 1e9);
+      }
+    }
+  }
+
+  bundle.decision.accepted = (worst_decision == CollisionDecisionResult::kPass);
+  bundle.decision.severity = worst_severity;
+  bundle.decision.action = action_for(worst_decision);
+  bundle.decision.first_failing_waypoint = first_failing_waypoint;
+  bundle.decision.first_failing_time_ns = first_failing_time_ns;
+  bundle.decision.collision_world_revision = bundle.borrowed_world_revision;
+  bundle.final_world_revision = snapshot.revision;
+  return bundle;
+}
+
+CollisionValidationDecisionBundle
 CollisionValidationCoordinator::validate_state(IPlanningContext& context,
                                                 const RobotStateDTO& state) {
   TrajectoryDTO single;
@@ -264,6 +435,14 @@ CollisionValidationCoordinator::validate_state(IPlanningContext& context,
   wp.time_from_start_s = 0.0;
   single.waypoints.push_back(std::move(wp));
   return validate_trajectory(context, single);
+}
+
+CollisionValidationDecisionBundle
+CollisionValidationCoordinator::validate_trajectory(
+    const CollisionWorldSnapshot& snapshot, ICollisionQueryEngine& engine,
+    const TrajectoryDTO& trajectory,
+    const CollisionCancellationToken& cancel) {
+  return run_pass_once(snapshot, engine, trajectory, cancel);
 }
 
 CollisionValidationDecisionBundle

@@ -68,6 +68,16 @@ if(NOT TARGET manyforge_core)
                    ${CMAKE_CURRENT_BINARY_DIR}/manyforge_core)
 endif()
 
+# manyforge_collision is a neutral ManyForge-owned module. This package links
+# it only at the composition boundary (NativeKernelFactory) so kernels created
+# through the RoboPlan adapter can receive the authoritative ManyForge
+# collision-validation pipeline. RoboPlan remains the planner/snapshot
+# publisher; validation semantics stay behind core-owned ports.
+if(NOT TARGET manyforge_collision)
+  add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_collision
+                   ${CMAKE_CURRENT_BINARY_DIR}/manyforge_collision)
+endif()
+
 # Native backend library
 add_library(manyforge_roboplan
   src/roboplan_planner_backend.cpp
@@ -75,7 +85,6 @@ add_library(manyforge_roboplan
   src/roboplan_execution_backend.cpp
   src/native_kernel_factory.cpp
   src/collision_body_id_mapper.cpp
-  src/direct_collision_query_engine.cpp
   ${_MANYFORGE_ROS2_CONTROL_SOURCES}
 )
 
@@ -93,6 +102,7 @@ target_link_libraries(manyforge_roboplan
   roboplan_toppra::roboplan_toppra
   roboplan_simple_ik::roboplan_simple_ik
   roboplan_example_models::roboplan_example_models
+  manyforge_collision
   fmt::fmt
 )
 
@@ -143,13 +153,6 @@ if(BUILD_TESTING)
     target_link_libraries(test_collision_world_publisher PRIVATE
       manyforge_roboplan GTest::gtest_main)
 
-    # Chunk 4: DirectCollisionQueryEngine concurrency + parity tests
-    # against an independent scene instance.
-    add_executable(test_direct_collision_query_engine
-      test/test_direct_collision_query_engine.cpp)
-    target_link_libraries(test_direct_collision_query_engine PRIVATE
-      manyforge_roboplan GTest::gtest_main)
-
     # Informational perf measurement for the collision-ownership Chunk 1
     # mapper. Not a ctest case: invoked by scripts/run-collision-mapper-perf.sh
     # and reports JSON to stdout / MANYFORGE_PERF_JSON_OUT. Phase 1 is
@@ -194,10 +197,8 @@ if(BUILD_TESTING)
         TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS}
       DISCOVERY_EXTRA_ARGS --gtest_filter=*)
 
-    gtest_discover_tests(test_direct_collision_query_engine
-      PROPERTIES
-        ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
-        TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS}
-      DISCOVERY_EXTRA_ARGS --gtest_filter=*)
+    set(MANYFORGE_INTEGRATION_TEST_LIB_PATHS "${_LIB_PATHS}")
+    add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../tests/cpp
+                     ${CMAKE_CURRENT_BINARY_DIR}/manyforge_integration_tests)
   endif()
 endif()

@@ -17,6 +17,10 @@ enum class ExecutionState {
   /// rolling-horizon goals from a mutable target register; per-target updates
   /// do not transition the kernel out of kStreaming. Entry is only from kIdle.
   kStreaming,
+  /// Kernel-native interrupt latch is active. The prior execution phase is
+  /// recorded on the InterruptLatch; the state itself is the observable
+  /// interrupted annotation from spec/260.
+  kInterrupted,
   kPaused,
   kStopping,
   kStopped,
@@ -36,6 +40,7 @@ inline const char* to_string(ExecutionState state) {
     case kValidating: return "Validating";
     case kExecuting: return "Executing";
     case kStreaming: return "Streaming";
+    case kInterrupted: return "Interrupted";
     case kPaused: return "Paused";
     case kStopping: return "Stopping";
     case kStopped: return "Stopped";

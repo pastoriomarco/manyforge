@@ -393,7 +393,7 @@ class MoveManipulatorAction(py_trees.behaviour.Behaviour):
         """Cancel any in-flight kernel goal when py_trees halts this node.
 
         Called when the parent halts the node (e.g., the tree is being
-        rebuilt after Reset, or an interrupt handler preempts the tree).
+        rebuilt after Reset, Stop, or an owned execution transition).
         Without this, a kernel goal mid-execution would continue running
         even though the BT no longer owns it — orphaned motion, the worst
         kind of safety hazard. We issue kernel.stop() if the current

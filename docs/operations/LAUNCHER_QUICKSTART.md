@@ -122,8 +122,7 @@ through a 7-step wizard (same shape as
   Scenario
     1) ur5-pick-place
     2) ur5-simple-pick-place
-    3) ur5-interrupt-pick-place
-    4) ur10e-pick-place
+    3) ur10e-pick-place
 
   Choose [1]: _
 
@@ -194,7 +193,7 @@ matching flag.
 |---|---|
 | `--lane manyforge-only` / `--lane isaac-sim` | `[1/7]` |
 | `--assistant on` / `--assistant off` | `[2/7]` |
-| `--scenario NAME` | `[3/7]` (use `--list-scenarios` to see all nine; deprecated aliases — `pick-place`, `interrupt`, `ur10e`, `shape-pick`, `vision-pose`, `assistant-authoring`, `isaac-light`, `isaac-assistant` — also resolve with a one-time deprecation warning per launch) |
+| `--scenario NAME` | `[3/7]` (use `--list-scenarios` to see all nine; deprecated aliases — `pick-place`, `ur10e`, `shape-pick`, `vision-pose`, `assistant-authoring`, `isaac-light`, `isaac-assistant` — also resolve with a one-time deprecation warning per launch) |
 | `--program PATH --deployment PATH` | Free-form alternative to `--scenario` |
 | `--non-interactive` (env: `MANYFORGE_NON_INTERACTIVE=1`) | Skip all prompts; any unset selection takes its default value |
 | `--yes` / `-y` (env: `MANYFORGE_ASSUME_YES=1`) | Skip the review gate confirmation |
@@ -301,15 +300,12 @@ first so port conflicts don't cause confusing errors:
 
 ### Step 4 — Shim parity check
 
-Verify all seven backward-compatibility shims still route correctly:
+Verify the backward-compatibility shims still route correctly:
 
 ```bash
 ./scripts/demo.sh start                              # ≡ manyforge-only + ur5-pick-place
 ./scripts/demo.sh --simple start                     # ≡ manyforge-only + ur5-simple-pick-place
 ./scripts/demo.sh stop
-
-./scripts/demo-interrupt-pick-place.sh start         # ≡ manyforge-only + ur5-interrupt-pick-place
-./scripts/demo-interrupt-pick-place.sh stop
 
 ./scripts/demo-ur10e-robotiq-pick-place.sh start     # ≡ manyforge-only + ur10e-pick-place
 ./scripts/demo-ur10e-robotiq-pick-place.sh stop

@@ -52,29 +52,6 @@ def test_basic_pick_and_place_scenario_runs_to_completion():
         for assertion in result["assertions"]
     )
 
-
-def test_interrupt_pick_and_place_scenario_runs_pause_resume():
-    state = ComposerState(
-        catalog_path=_CATALOG_PATH,
-        kernel=MockKernelClient(execute_duration_s=0.2),
-        allowed_fs_roots=[str(_REPO_ROOT), "/tmp", "/workspace"],
-    )
-    app = create_app(state, security=_TEST_SECURITY)
-
-    with TestClient(app) as client:
-        runner = ScenarioRunner(client, workspace_root=_REPO_ROOT)
-        result = runner.run_from_path(
-            _SCENARIO_ROOT / "interrupt_pick_and_place_pause_resume.scenario.yaml"
-        )
-
-    assert result["success"] is True
-    assert result["finalArtifacts"]["digest"]["state"] == "idle"
-    assert any(
-        assertion["condition"].get("event_type") == "interrupt_latched"
-        for assertion in result["assertions"]
-    )
-
-
 def test_runner_can_assert_visual_scene_consistency_without_manual_inspection():
     kernel = MockKernelClient()
     kernel.scene_edit(

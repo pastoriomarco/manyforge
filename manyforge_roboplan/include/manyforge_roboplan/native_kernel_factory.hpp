@@ -17,6 +17,7 @@
 #include <roboplan_simple_ik/simple_ik.hpp>
 
 #include <manyforge_core/execution_kernel.hpp>
+#include <manyforge_core/collision/i_collision_query_engine.hpp>
 #include <manyforge_core/ports/iexecution_backend.hpp>
 #include <manyforge_roboplan/roboplan_planner_backend.hpp>
 #include <manyforge_roboplan/roboplan_planning_context.hpp>
@@ -133,6 +134,8 @@ struct NativeKernelBundle {
   std::unique_ptr<SimpleScheduler> scheduler;
   std::unique_ptr<core::TrajectoryCache> cache;
   std::unique_ptr<core::IExecutionBackend> execution;
+  std::vector<std::shared_ptr<core::ICollisionQueryEngine>>
+      collision_validation_engines;
 
   // Event collector — subscribes to kernel, must be destroyed before kernel
   KernelEventCollector event_collector;

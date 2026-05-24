@@ -37,9 +37,6 @@ guidance required for LLM-assisted development.
   - Operator runbook for exporting Isaac Sim scene meshes and loading them
     through Composer.
 
-- [`guides/INTERRUPT_DEMO.md`](guides/INTERRUPT_DEMO.md)
-  - Operator guide for the interrupt-focused pick-and-place demo.
-
 - [`reference/ROBOPLAN_ADAPTER_NOTES.md`](reference/ROBOPLAN_ADAPTER_NOTES.md)
   - Runtime notes for RoboPlan adapter projection rules and temporary backend
     workarounds.

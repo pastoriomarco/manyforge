@@ -143,14 +143,6 @@ class ProgramResponse(BaseModel):
     parameter_count: int = Field(alias="parameterCount")
     parameters: List["ProgramParameterResponse"] = Field(default_factory=list)
     blackboard: "ProgramBlackboardResponse" = Field(default_factory=lambda: ProgramBlackboardResponse())
-    interrupt_handlers: List["ProgramInterruptHandlerResponse"] = Field(
-        default_factory=list,
-        alias="interruptHandlers",
-    )
-    interrupt_policies: List["ProgramInterruptPolicyResponse"] = Field(
-        default_factory=list,
-        alias="interruptPolicies",
-    )
     source_path: str = Field(alias="sourcePath", default="")
 
 
@@ -198,25 +190,6 @@ class ProgramBlackboardResponse(BaseModel):
     model_config = _ALIAS_CFG
     namespaces: List[BlackboardNamespaceResponse] = Field(default_factory=list)
     keys: List[BlackboardKeyResponse] = Field(default_factory=list)
-
-
-class ProgramInterruptHandlerResponse(BaseModel):
-    model_config = _ALIAS_CFG
-    id: str
-    description: str = ""
-    root: TreeNodeResponse
-
-
-class ProgramInterruptPolicyResponse(BaseModel):
-    model_config = _ALIAS_CFG
-    id: str
-    source: str
-    applies_to: Dict[str, Any] = Field(default_factory=dict, alias="appliesTo")
-    preemption_mode: str = Field(alias="preemptionMode")
-    handler: str
-    after_handler: str = Field(alias="afterHandler")
-    condition: Dict[str, Any] = Field(default_factory=dict)
-    description: str = ""
 
 
 class ProgramTreeResponse(BaseModel):
@@ -715,16 +688,6 @@ class PromptTemplateResponse(BaseModel):
     response_tool: Optional[Dict[str, Any]] = Field(default=None, alias="responseTool")
 
 
-class InterruptSourceResponse(BaseModel):
-    model_config = _ALIAS_CFG
-    adapter: str
-    signal: str
-    kind: Literal["edge", "level"]
-    priority: int
-    maskable: bool
-    description: str = ""
-
-
 class AuthorityDomainResponse(BaseModel):
     model_config = _ALIAS_CFG
     owner: str
@@ -793,10 +756,6 @@ class FullDeploymentResponse(BaseModel):
     prompt_templates: Dict[str, PromptTemplateResponse] = Field(
         default_factory=dict,
         alias="promptTemplates",
-    )
-    interrupt_sources: Dict[str, InterruptSourceResponse] = Field(
-        default_factory=dict,
-        alias="interruptSources",
     )
     authority_matrix: Dict[str, AuthorityDomainResponse] = Field(
         default_factory=dict,
@@ -1386,31 +1345,6 @@ class ExecutionDigestObjectResponse(BaseModel):
     position_m: Optional[List[float]] = None
 
 
-class PendingInterruptResponse(BaseModel):
-    model_config = _ALIAS_CFG
-    interrupt_id: str = Field(alias="interruptId")
-    source_id: str = Field(alias="sourceId")
-    source_adapter: str = Field(alias="sourceAdapter")
-    signal: str
-    kind: str
-    priority: int
-    maskable: bool
-    policy_id: Optional[str] = Field(default=None, alias="policyId")
-    handler_id: Optional[str] = Field(default=None, alias="handlerId")
-    preemption_mode: str = Field(alias="preemptionMode")
-    after_handler: str = Field(alias="afterHandler")
-    active_node_name: Optional[str] = Field(default=None, alias="activeNodeName")
-    active_node_id: Optional[str] = Field(default=None, alias="activeNodeId")
-    active_move_id: Optional[str] = Field(default=None, alias="activeMoveId")
-    latched_at_ns: int = Field(alias="latchedAtNs")
-    required_action: str = Field(alias="requiredAction")
-    resume_allowed: bool = Field(alias="resumeAllowed")
-    reset_required: bool = Field(alias="resetRequired")
-    ack_required: bool = Field(alias="ackRequired")
-    timing: Dict[str, Any] = Field(default_factory=dict)
-    details: Dict[str, Any] = Field(default_factory=dict)
-
-
 class ExecutionDigestResponse(BaseModel):
     model_config = _ALIAS_CFG
     state: str
@@ -1431,10 +1365,6 @@ class ExecutionDigestResponse(BaseModel):
     delegated_recovery_request: Optional[Dict[str, Any]] = Field(
         default=None,
         alias="delegatedRecoveryRequest",
-    )
-    pending_interrupt: Optional[PendingInterruptResponse] = Field(
-        default=None,
-        alias="pendingInterrupt",
     )
     required_operator_action: str = Field(alias="requiredOperatorAction")
     resume_allowed: bool = Field(alias="resumeAllowed")

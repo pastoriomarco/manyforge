@@ -837,7 +837,6 @@ class ComposerState:
         self.cycle_manager.set_on_delegated_recovery_requested(
             self._record_delegated_recovery_requested,
         )
-        self.cycle_manager.set_on_interrupt_event(self._record_interrupt_event)
 
     def _current_or_last_run_id_for_recovery(self) -> Optional[str]:
         self.event_recorder.observe(self)
@@ -845,14 +844,6 @@ class ComposerState:
 
     def _record_delegated_recovery_requested(self, request) -> None:
         self.event_recorder.record_delegated_recovery_requested(request)
-
-    def _record_interrupt_event(self, **payload: Any) -> None:
-        self.event_recorder.observe(self)
-        self.event_recorder.record_interrupt_event(
-            run_id=self.event_recorder.current_run_id or self.event_recorder.last_run_id,
-            execution_mode="program",
-            **payload,
-        )
 
     @property
     def kernel(self) -> Optional[KernelClient]:
@@ -1151,7 +1142,7 @@ class ComposerState:
     ) -> Program:
         """Save a materialized program view produced from runtime overrides."""
         cycle_state = self._current_cycle_state()
-        if cycle_state in {"running", "interrupt_handler"}:
+        if cycle_state == "running":
             raise RuntimeError(
                 "Materialized runtime override saves are not allowed while execution is active"
             )

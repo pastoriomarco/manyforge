@@ -120,7 +120,7 @@ export const useCycleStore = create<CycleStore>((set, get) => ({
 /**
  * Whether interactive editing of the program/scene should be locked.
  * True when the cycle is in any active backend state
- * (running / interrupt_handler / direct_control) OR when the user
+ * (running / direct_control) OR when the user
  * is actively dragging the TCP jog gizmo — even if the backend
  * hasn't yet transitioned to direct_control. Keeps the UI feel
  * consistent: any interaction that actively commands the robot
@@ -131,7 +131,6 @@ export function useEditLocked(): boolean {
   const dragging = useViewerSelectionStore((s) => s.isDraggingGizmo);
   return (
     cycleState === 'running' ||
-    cycleState === 'interrupt_handler' ||
     cycleState === 'direct_control' ||
     dragging
   );

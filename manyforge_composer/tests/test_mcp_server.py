@@ -236,27 +236,6 @@ class TestSceneEdit:
         # Mock kernel returns success=False with an error for missing objects
         assert "success" in result
 
-    def test_scene_edit_rejected_while_interrupt_handler_active(self):
-        state = _make_state()
-        state.cycle_manager = type("CycleManagerStub", (), {"state": CycleState.INTERRUPT_HANDLER})()
-        mcp = create_mcp_server(state)
-        result = _call(
-            mcp,
-            "manyforge_scene_edit",
-            {
-                "operation": "remove",
-                "object_id": "nonexistent",
-            },
-        )
-        assert result["success"] is False
-        assert result["cycle_state"] == "interrupt_handler"
-        assert "INTERRUPT_HANDLER" in result["error"]
-
-
-# =============================================================================
-# Program Load
-# =============================================================================
-
 class TestProgramLoad:
 
     def test_load_program(self):
