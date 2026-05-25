@@ -128,6 +128,11 @@ TEST_F(CollisionWorldPublisherTest, InitialSnapshotPublishesRobotBodies) {
   EXPECT_EQ(snapshot->attached_object_count, 0);
   EXPECT_EQ(snapshot->detached_object_count, 0);
   EXPECT_TRUE(snapshot->all_bodies_have_geometry);
+  ASSERT_EQ(snapshot->robot_model_frames.size(), 1u);
+  EXPECT_EQ(snapshot->robot_model_frames.front().robot_id, "robot0");
+  EXPECT_EQ(snapshot->robot_model_frames.front().model_frame_id, "base_link");
+  EXPECT_DOUBLE_EQ(snapshot->robot_model_frames.front().world_pose.orientation.w,
+                   1.0);
 
   bool found_robot_body = false;
   bool found_robot_proxy = false;
@@ -220,6 +225,10 @@ TEST_F(CollisionWorldPublisherTest,
   EXPECT_EQ(*geom.source_uri, last_mesh_uri_);
   ASSERT_TRUE(geom.source_hash.has_value());
   EXPECT_FALSE(geom.source_hash->empty());
+  ASSERT_TRUE(geom.mesh_scale.has_value());
+  EXPECT_DOUBLE_EQ(geom.mesh_scale->x_m, 1.0);
+  EXPECT_DOUBLE_EQ(geom.mesh_scale->y_m, 1.0);
+  EXPECT_DOUBLE_EQ(geom.mesh_scale->z_m, 1.0);
 }
 
 TEST_F(CollisionWorldPublisherTest, RemoveSucceeds_BumpsRevisionOnce) {

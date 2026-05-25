@@ -120,6 +120,12 @@ Common overrides (read by lib modules):
   Progress display:
     MANYFORGE_PROGRESS_MODE={auto|plain}  (plain = no ANSI redraw; for CI)
 
+  Collision validation:
+    MANYFORGE_VALIDATION_COLLISION_WORKERS=N
+      Override the default authoritative trajectory-validation worker count
+      (default 4; use 1-2 on constrained deployments if controller / observer
+      latency qualification requires it).
+
   Assistant:  MODEL_PROFILE  ASSISTANT_PROVIDER  START_VLLM_PROXY
               OPENCLAW_ASSISTANT_COMPACT_EVERY_N  VLLM_PORT
   Isaac:      ARM_ACTION  GRIPPER_ACTION

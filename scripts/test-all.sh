@@ -92,6 +92,15 @@ run_cpp_tests() {
 
 run_roboplan_tests() {
     section "C++ manyforge_roboplan tests"
+    if [ -f /opt/ros/jazzy/setup.bash ]; then
+        # RoboPlan's ROS-enabled targets may pull in ament_cmake. Source the
+        # ROS environment so ament's Python helpers are importable during CMake
+        # configure; this keeps the standard suite aligned with launch.sh.
+        # shellcheck disable=SC1091
+        set +u
+        source /opt/ros/jazzy/setup.bash
+        set -u
+    fi
     local build="$BUILD_DIR/roboplan"
     reset_stale_python_build_dir "$build"
     mkdir -p "$build" && cd "$build"

@@ -24,9 +24,9 @@ namespace manyforge::collision {
 /// GeometryModel, GeometryData, and contact buffers; no query touches
 /// RoboPlan planner-context APIs, RoboPlan scene locks, or adapter state.
 ///
-/// Primitive robot proxies and scene objects are supported in the current
-/// production profile. Meshes / compounds fail closed unless the snapshot
-/// provides an approved primitive proxy.
+/// Primitive robot proxies plus authored scene triangle meshes are supported
+/// in the current production profile. Compounds and convex meshes still fail
+/// closed until the snapshot contract carries a qualified decomposition.
 class ManyForgeCollisionEngine final : public core::ICollisionQueryEngine {
  public:
   /// Construct an independent collision query engine from a ManyForge-owned
@@ -65,6 +65,7 @@ class ManyForgeCollisionEngine final : public core::ICollisionQueryEngine {
  private:
   pinocchio::Model model_;
   pinocchio::GeometryModel base_collision_model_;
+  std::vector<std::filesystem::path> package_paths_;
   std::vector<std::string> group_joint_names_;
   std::string group_name_;
   std::string engine_id_;

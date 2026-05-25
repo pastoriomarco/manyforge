@@ -63,6 +63,24 @@ struct CollisionWorldBody {
   std::string body_content_hash;
 };
 
+/// Pose of one robot model frame in the collision-world frame.
+///
+/// `CollisionWorldSnapshot` bodies are published in the scene/world frame, but
+/// most robot collision engines evaluate Pinocchio-style robot geometry in the
+/// robot model's root frame. This descriptor is the explicit bridge between
+/// those frames: engines use it to transform detached objects and fixtures into
+/// the model frame before running per-waypoint FK.
+struct CollisionRobotModelFrame {
+  /// Stable robot namespace used in `CollisionBodyId`, e.g. `robot0`.
+  std::string robot_id;
+
+  /// Frame name in the robot model, e.g. `base_link`.
+  std::string model_frame_id;
+
+  /// Pose of `model_frame_id` in the collision-world frame.
+  Pose3DTO world_pose;
+};
+
 /// Immutable snapshot of the active collision world (spec §3.8.1,
 /// defined by the kernel-architecture sprint P-2-impl-snapshot
 /// chunk).
@@ -115,6 +133,13 @@ struct CollisionWorldSnapshot {
   /// Steady-clock wall time the snapshot was assembled, ns. Used by
   /// telemetry only; engines MUST NOT use it for cache decisions.
   std::int64_t emitted_at_ns = 0;
+
+  /// Robot model frames published with the snapshot. Current production
+  /// profiles contain one robot; the vector shape is intentionally used so
+  /// multi-robot snapshots can add one descriptor per robot without changing
+  /// the schema. Engines that support only one robot MUST fail closed if more
+  /// than one descriptor is present.
+  std::vector<CollisionRobotModelFrame> robot_model_frames;
 
   /// All collision bodies, sorted lexicographically by `body_id`.
   /// Sorting is performed by the builder; publishers MUST NOT rely

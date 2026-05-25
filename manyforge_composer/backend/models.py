@@ -144,6 +144,8 @@ class ProgramResponse(BaseModel):
     parameters: List["ProgramParameterResponse"] = Field(default_factory=list)
     blackboard: "ProgramBlackboardResponse" = Field(default_factory=lambda: ProgramBlackboardResponse())
     source_path: str = Field(alias="sourcePath", default="")
+    program_session_generation: int = Field(default=0, alias="programSessionGeneration")
+    program_tree_hash: str = Field(default="", alias="programTreeHash")
 
 
 class ProgramParameterResponse(BaseModel):
@@ -1242,6 +1244,36 @@ class SceneEditResponse(BaseModel):
     success: bool
     error: Optional[str] = None
     timestamp_ns: int
+
+
+class SceneAuthoredSyncRequest(BaseModel):
+    model_config = _ALIAS_CFG
+    program_session_generation: int = Field(alias="programSessionGeneration", ge=0)
+    program_tree_hash: Optional[str] = Field(default=None, alias="programTreeHash")
+    scene_signature: str = Field(alias="sceneSignature", min_length=1)
+    scene_resources: List[ProgramSceneResourceResponse] = Field(
+        default_factory=list,
+        alias="sceneResources",
+    )
+
+
+class SceneAuthoredSyncResponse(BaseModel):
+    model_config = _ALIAS_CFG
+    success: bool
+    sync_id: str = Field(alias="syncId")
+    program_session_generation: int = Field(alias="programSessionGeneration")
+    program_tree_hash: str = Field(alias="programTreeHash")
+    scene_signature: str = Field(alias="sceneSignature")
+    added: List[str] = Field(default_factory=list)
+    updated: List[str] = Field(default_factory=list)
+    removed: List[str] = Field(default_factory=list)
+    unchanged: List[str] = Field(default_factory=list)
+    failed_object_id: Optional[str] = Field(default=None, alias="failedObjectId")
+    error: Optional[str] = None
+    visual_refresh_requested: bool = Field(default=False, alias="visualRefreshRequested")
+    visual_publish_requested: bool = Field(default=False, alias="visualPublishRequested")
+    started_ns: int = Field(alias="startedNs")
+    completed_ns: int = Field(alias="completedNs")
 
 
 class SceneDiagnosticBackendResponse(BaseModel):

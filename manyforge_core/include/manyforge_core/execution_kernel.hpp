@@ -57,9 +57,12 @@ struct ExecutionKernelConfig {
 
   // Authoritative collision validation worker-pool sizing. The concrete
   // engines are injected through core-owned ports; this knob only selects how
-  // many injected workers the kernel asks the pool to use. Values < 1 are
-  // normalized to 1 by the kernel.
-  int validation_collision_workers = 1;
+  // many injected workers the kernel asks the pool to use. Four workers is the
+  // production default: it gives useful trajectory-validation speedup on Jetson
+  // Orin Nano-class systems while leaving CPU headroom for ROS/controller,
+  // observer, and Composer lanes. Values < 1 are normalized to 1 by the kernel;
+  // deployments can override with MANYFORGE_VALIDATION_COLLISION_WORKERS.
+  int validation_collision_workers = 4;
   int validation_collision_min_waypoints_for_parallel = 8;
 };
 
@@ -302,7 +305,8 @@ class ExecutionKernel {
   void cancel_active_streaming_target_validation(std::string reason);
   void install_builtin_interrupt_sources();
   InterruptIngestResult publish_runtime_collision_fault_interrupt(
-      const CollisionCheckResultDTO& check);
+      const CollisionCheckResultDTO& check,
+      const std::map<std::string, std::string>& metadata = {});
   void apply_latched_interrupt_preemption(
       const InterruptIngestResult& result);
   InterruptRuntimeContext current_interrupt_context() const;

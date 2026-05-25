@@ -65,6 +65,7 @@ class MotionExecutionCoordinator:
             return MotionTransactionUpdate(state="succeeded", status=status)
 
         if status.state in {
+            ExecutionState.INTERRUPTED,
             ExecutionState.FAILED,
             ExecutionState.STOPPED,
             ExecutionState.INTERVENTION_REQUIRED,

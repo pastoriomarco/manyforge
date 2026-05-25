@@ -35,21 +35,53 @@ from manyforge_behavior.kernel_client import (
     TrajectoryWaypoint,
 )
 
-# State int → ExecutionState mapping (matches C++ ExecutionState enum order
-# in include/manyforge_core/types/execution_status.hpp).
-_STATE_MAP = {
-    0: ExecutionState.IDLE,
-    1: ExecutionState.PLANNING,
-    2: ExecutionState.VALIDATING,
-    3: ExecutionState.EXECUTING,
-    4: ExecutionState.STREAMING,
-    5: ExecutionState.PAUSED,
-    6: ExecutionState.STOPPING,
-    7: ExecutionState.STOPPED,
-    8: ExecutionState.COMPLETED,
-    9: ExecutionState.FAILED,
-    10: ExecutionState.INTERVENTION_REQUIRED,
+# Native bindings expose a stable state_name. Do not decode by numeric enum
+# value: inserting a C++ enum member must not silently remap terminal states in
+# Composer again.
+_STATE_NAME_MAP = {
+    "Idle": ExecutionState.IDLE,
+    "Planning": ExecutionState.PLANNING,
+    "Validating": ExecutionState.VALIDATING,
+    "Executing": ExecutionState.EXECUTING,
+    "Streaming": ExecutionState.STREAMING,
+    "Interrupted": ExecutionState.INTERRUPTED,
+    "Paused": ExecutionState.PAUSED,
+    "Stopping": ExecutionState.STOPPING,
+    "Stopped": ExecutionState.STOPPED,
+    "Completed": ExecutionState.COMPLETED,
+    "Failed": ExecutionState.FAILED,
+    "InterventionRequired": ExecutionState.INTERVENTION_REQUIRED,
 }
+
+
+def _state_from_native(payload) -> ExecutionState:
+    state_name = payload.get("state_name")
+    if state_name is None:
+        raise ValueError(
+            "native kernel payload is missing required stable state_name"
+        )
+    mapped = _STATE_NAME_MAP.get(str(state_name))
+    if mapped is None:
+        raise ValueError(f"unknown native kernel state_name: {state_name!r}")
+    return mapped
+
+
+_GRIPPER_STATE_NAME_MAP = {
+    "idle": GripperCommandState.IDLE,
+    "executing": GripperCommandState.EXECUTING,
+    "completed": GripperCommandState.COMPLETED,
+    "failed": GripperCommandState.FAILED,
+}
+
+
+def _gripper_state_from_native(payload) -> GripperCommandState:
+    state_name = payload.get("state")
+    if state_name is None:
+        raise ValueError("native gripper payload is missing required state")
+    mapped = _GRIPPER_STATE_NAME_MAP.get(str(state_name))
+    if mapped is None:
+        raise ValueError(f"unknown native gripper state: {state_name!r}")
+    return mapped
 
 
 def _rpy_deg_to_xyzw(rpy_deg):
@@ -536,7 +568,7 @@ class NativeKernelClient(KernelClient):
     def get_status(self) -> ExecutionStatus:
         s = self._bundle.get_status()
         return ExecutionStatus(
-            state=_STATE_MAP.get(s["state"], ExecutionState.IDLE),
+            state=_state_from_native(s),
             execution_id=s.get("execution_id", 0),
             progress=s.get("progress", 0.0),
             active_move_id=s.get("active_move_id", ""),
@@ -549,7 +581,7 @@ class NativeKernelClient(KernelClient):
             sequence_number=s.get("sequence_number", 0),
             execution_id=s.get("execution_id", 0),
             move_id=s.get("move_id", ""),
-            state=_STATE_MAP.get(s.get("state", 0), ExecutionState.IDLE),
+            state=_state_from_native(s),
             progress=s.get("progress", 0.0),
             joint_positions_rad=list(s.get("joint_positions_rad", [])),
             error=s.get("error"),
@@ -675,15 +707,8 @@ class NativeKernelClient(KernelClient):
             except RuntimeError:
                 status = None
             if status is not None:
-                state_name = str(status.get("state", "idle"))
-                state = {
-                    "idle": GripperCommandState.IDLE,
-                    "executing": GripperCommandState.EXECUTING,
-                    "completed": GripperCommandState.COMPLETED,
-                    "failed": GripperCommandState.FAILED,
-                }.get(state_name, GripperCommandState.IDLE)
                 return GripperCommandStatus(
-                    state=state,
+                    state=_gripper_state_from_native(status),
                     gripper_id=gripper_id,
                     progress=float(status.get("progress", 0.0)),
                     current_position=status.get("current_position"),

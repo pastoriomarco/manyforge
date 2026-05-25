@@ -177,6 +177,10 @@ struct CollisionGeometryDescriptor {
   /// `geometry_kind == kCapsule`.
   std::optional<double> capsule_radius_m;
   std::optional<double> capsule_height_m;
+  /// Mesh scale applied by the scene publisher before collision evaluation.
+  /// Optional for mesh-like geometry; absent means unit scale. Publishers
+  /// SHOULD normalize authored "zero means default" scale values to 1.0 here.
+  std::optional<Vector3DTO> mesh_scale;
   std::optional<std::string> source_uri;
   std::optional<std::string> source_hash;
   /// Capability labels such as "convex", "watertight", "visual_mesh",

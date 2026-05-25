@@ -16,6 +16,9 @@ from fastapi import APIRouter, Body, HTTPException
 from .routes_infra import build_infra_heartbeat_payload
 from .state import ComposerState
 
+_KERNEL_HEALTHY_STATUSES = {"ok", "degraded"}
+_KERNEL_FAULT_STATUSES = {"error", "intervention_required"}
+
 
 def _component(
     component_id: str,
@@ -86,7 +89,11 @@ def build_runtime_status_payload(state: ComposerState) -> dict[str, Any]:
     hmi_ready = state.hmi_server is not None
     kernel_payload = heartbeat.get("components", {}).get("kernel", {})
     kernel_available = bool(kernel_payload.get("available"))
-    kernel_status = str(heartbeat.get("status", "ok"))
+    kernel_status = str(heartbeat.get("status", "__missing__"))
+    kernel_status_known = kernel_status in (
+        _KERNEL_HEALTHY_STATUSES | _KERNEL_FAULT_STATUSES
+    )
+    kernel_fault = kernel_status in _KERNEL_FAULT_STATUSES or not kernel_status_known
 
     components: list[dict[str, Any]] = [
         _component(
@@ -135,7 +142,7 @@ def build_runtime_status_payload(state: ComposerState) -> dict[str, Any]:
             "execution",
             (
                 "fault"
-                if kernel_status in {"error", "intervention_required"}
+                if kernel_fault
                 else "ready"
                 if kernel_available and program_loaded
                 else "waiting"
@@ -197,17 +204,21 @@ def build_runtime_status_payload(state: ComposerState) -> dict[str, Any]:
     can_execute = bool(program_loaded and kernel_available)
     if profile_kind == "commanded_sim":
         can_execute = can_execute and external_ready
-    if kernel_status in {"error", "intervention_required"}:
+    if kernel_fault:
         can_execute = False
 
     if kernel_status == "intervention_required":
         readiness = "fault"
         summary_label = "Fault"
         user_message = "Operator intervention is required before execution can continue."
-    elif kernel_status == "error" or external_fault:
+    elif kernel_fault or external_fault:
         readiness = "fault"
         summary_label = "Fault"
-        user_message = external_user_message or "A runtime component reported a fault."
+        user_message = (
+            f"Kernel reported unknown status '{kernel_status}'."
+            if not kernel_status_known
+            else external_user_message or "A runtime component reported a fault."
+        )
     elif external_waiting or (profile_kind == "commanded_sim" and not can_execute):
         readiness = "waiting"
         summary_label = "Waiting"

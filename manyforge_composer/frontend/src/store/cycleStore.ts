@@ -3,6 +3,7 @@ import { api } from '../api/client';
 import { StateWebSocket } from '../api/websocket';
 import { useProgramStore } from './programStore';
 import { useViewerSelectionStore } from './viewerSelectionStore';
+import { coerceCycleStateFailClosed } from './cycleState';
 import type { CycleStatus } from '../types/api';
 
 interface CycleStore {
@@ -37,7 +38,8 @@ export const useCycleStore = create<CycleStore>((set, get) => ({
   run: async () => {
     try {
       const result = await api.cycle.run();
-      set({ state: result.state as CycleStatus['state'], error: null });
+      const parsed = coerceCycleStateFailClosed(result.state);
+      set({ state: parsed.state, error: parsed.error });
     } catch (e) {
       set({ error: (e as Error).message });
     }
@@ -46,7 +48,8 @@ export const useCycleStore = create<CycleStore>((set, get) => ({
   stop: async () => {
     try {
       const result = await api.cycle.stop();
-      set({ state: result.state as CycleStatus['state'], error: null });
+      const parsed = coerceCycleStateFailClosed(result.state);
+      set({ state: parsed.state, error: parsed.error });
     } catch (e) {
       set({ error: (e as Error).message });
     }
@@ -55,7 +58,8 @@ export const useCycleStore = create<CycleStore>((set, get) => ({
   reset: async () => {
     try {
       const result = await api.cycle.reset();
-      set({ state: result.state as CycleStatus['state'], error: null });
+      const parsed = coerceCycleStateFailClosed(result.state);
+      set({ state: parsed.state, error: parsed.error });
       const programStore = useProgramStore.getState();
       if (get().programLoaded || programStore.programInfo !== null) {
         await Promise.all([
@@ -83,13 +87,14 @@ export const useCycleStore = create<CycleStore>((set, get) => ({
     ws.subscribe((update) => {
       const prev = get();
       const nextProgramSessionGeneration = update.programSessionGeneration ?? 0;
+      const parsed = coerceCycleStateFailClosed(update.state);
       set({
-        state: update.state,
+        state: parsed.state,
         velocityScale: update.velocityScale,
         nodeStatuses: update.nodeStatuses || {},
         programLoaded: update.programLoaded ?? false,
         programSessionGeneration: nextProgramSessionGeneration,
-        error: update.error ?? null,
+        error: parsed.error ?? update.error ?? null,
       });
       // Keep the canvas hydrated even if startup ordering or reconnect timing
       // causes the initial load edge to be missed.

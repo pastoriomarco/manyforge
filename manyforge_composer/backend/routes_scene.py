@@ -5,6 +5,7 @@ import logging
 import math
 import os
 import time
+import uuid
 from typing import Any, Optional
 
 from fastapi import APIRouter, HTTPException, Query
@@ -22,6 +23,8 @@ from .models import (
     SceneDiagnosticObjectResponse,
     SceneDiagnosticsResponse,
     SceneDiagnosticsSummaryResponse,
+    SceneAuthoredSyncRequest,
+    SceneAuthoredSyncResponse,
     SceneEditApiRequest,
     SceneEditResponse,
     SceneFrameResponse,
@@ -48,6 +51,7 @@ from .models import (
     SceneStateResponse,
     VisualStateRouteDiagnosticsResponse,
 )
+from manyforge_behavior.nodes.motion import _rpy_deg_to_xyzw
 from .state import ComposerState
 from .visual_state import (
     VisualSnapshotUnavailable,
@@ -1057,6 +1061,101 @@ def build_scene_diagnostics_payload(state: ComposerState) -> dict[str, Any]:
     ).model_dump(by_alias=True)
 
 
+def _scene_sync_shape_key_from_request(request: SceneEditRequest) -> tuple[Any, ...]:
+    if request.shape_type == "box":
+        return ("box", tuple(float(v) for v in (request.box_dimensions_m or [])))
+    if request.shape_type == "sphere":
+        return ("sphere", float(request.sphere_radius_m or 0.0))
+    if request.shape_type == "cylinder":
+        return (
+            "cylinder",
+            float(request.cylinder_radius_m or 0.0),
+            float(request.cylinder_height_m or 0.0),
+        )
+    if request.shape_type == "mesh":
+        return (
+            "mesh",
+            request.mesh_resource_uri or "",
+            tuple(float(v) for v in (request.mesh_scale or [1.0, 1.0, 1.0])),
+        )
+    return (request.shape_type,)
+
+
+def _scene_sync_shape_key_from_object(scene_object: Any) -> tuple[Any, ...]:
+    shape = getattr(scene_object, "shape", None)
+    shape_type = getattr(shape, "type", None)
+    if shape_type == "box":
+        return ("box", tuple(float(v) for v in (shape.box_dimensions_m or [])))
+    if shape_type == "sphere":
+        return ("sphere", float(shape.sphere_radius_m or 0.0))
+    if shape_type == "cylinder":
+        return (
+            "cylinder",
+            float(shape.cylinder_radius_m or 0.0),
+            float(shape.cylinder_height_m or 0.0),
+        )
+    if shape_type == "mesh":
+        return (
+            "mesh",
+            shape.mesh_resource_uri or "",
+            tuple(float(v) for v in (shape.mesh_scale or [1.0, 1.0, 1.0])),
+        )
+    return (shape_type,)
+
+
+def _scene_sync_pose_key_from_request(request: SceneEditRequest) -> tuple[Any, ...]:
+    return (
+        request.frame_id or "universe",
+        tuple(float(v) for v in (request.pose_position_m or [0.0, 0.0, 0.0])),
+        tuple(float(v) for v in (request.pose_orientation_xyzw or [0.0, 0.0, 0.0, 1.0])),
+    )
+
+
+def _scene_sync_pose_key_from_object(scene_object: Any) -> tuple[Any, ...] | None:
+    pose = getattr(scene_object, "pose_in_universe", None)
+    if not isinstance(pose, dict):
+        return None
+    position = pose.get("position_m")
+    orientation = pose.get("orientation_xyzw")
+    if (
+        not isinstance(position, list)
+        or not isinstance(orientation, list)
+        or len(position) != 3
+        or len(orientation) != 4
+    ):
+        return None
+    return (
+        getattr(scene_object, "frame_id", None) or "universe",
+        tuple(float(v) for v in position),
+        tuple(float(v) for v in orientation),
+    )
+
+
+def _scene_sync_resource_request(resource: Any) -> SceneEditRequest:
+    shape = dict(resource.shape or {})
+    pose = dict(resource.pose or {})
+    shape_type = shape.get("type")
+    if shape_type not in {"box", "sphere", "cylinder", "mesh"}:
+        shape_type = "box"
+    orientation = pose.get("orientation_xyzw")
+    if orientation is None and "orientation_rpy_deg" in pose:
+        orientation = _rpy_deg_to_xyzw(pose["orientation_rpy_deg"])
+    return SceneEditRequest(
+        operation="add",
+        object_id=resource.object_id,
+        shape_type=shape_type,
+        box_dimensions_m=shape.get("box_dimensions_m"),
+        sphere_radius_m=shape.get("sphere_radius_m"),
+        cylinder_radius_m=shape.get("cylinder_radius_m"),
+        cylinder_height_m=shape.get("cylinder_height_m"),
+        mesh_resource_uri=shape.get("mesh_resource_uri"),
+        mesh_scale=shape.get("mesh_scale"),
+        pose_position_m=pose.get("position_m") or [0.0, 0.0, 0.0],
+        pose_orientation_xyzw=orientation or [0.0, 0.0, 0.0, 1.0],
+        frame_id=pose.get("frame_id") or "base_link",
+    )
+
+
 def create_scene_router(state: ComposerState) -> APIRouter:
     """Create the scene router with the given state."""
     router = APIRouter()
@@ -1463,6 +1562,370 @@ def create_scene_router(state: ComposerState) -> APIRouter:
                 status_code=400,
                 content={"detail": str(exc)},
             )
+
+    @router.post(
+        "/sync-authored",
+        response_model=SceneAuthoredSyncResponse,
+        response_model_by_alias=True,
+    )
+    def sync_authored_scene(validated: SceneAuthoredSyncRequest) -> dict[str, Any]:
+        """Atomically reconcile the authored scene draft into the live scene."""
+        sync_id = uuid.uuid4().hex
+        started_ns = time.monotonic_ns()
+
+        def response(
+            *,
+            success: bool,
+            added: list[str] | None = None,
+            updated: list[str] | None = None,
+            removed: list[str] | None = None,
+            unchanged: list[str] | None = None,
+            failed_object_id: str | None = None,
+            error: str | None = None,
+            visual_refresh_requested: bool = False,
+            visual_publish_requested: bool = False,
+        ) -> dict[str, Any]:
+            return SceneAuthoredSyncResponse(
+                success=success,
+                syncId=sync_id,
+                programSessionGeneration=state.program_session_generation,
+                programTreeHash=state.program_tree_hash,
+                sceneSignature=validated.scene_signature,
+                added=added or [],
+                updated=updated or [],
+                removed=removed or [],
+                unchanged=unchanged or [],
+                failedObjectId=failed_object_id,
+                error=error,
+                visualRefreshRequested=visual_refresh_requested,
+                visualPublishRequested=visual_publish_requested,
+                startedNs=started_ns,
+                completedNs=time.monotonic_ns(),
+            ).model_dump(by_alias=True)
+
+        with state.scene_edit_lock:
+            if state.cycle_manager is not None and state.cycle_manager.state in {
+                CycleState.RUNNING,
+                CycleState.DIRECT_CONTROL,
+            }:
+                return JSONResponse(
+                    status_code=409,
+                    content=response(
+                        success=False,
+                        error=(
+                            "Authored scene sync is not allowed while execution "
+                            f"is active (state={state.cycle_manager.state.name})"
+                        ),
+                    ),
+                )
+
+            if state.program is None:
+                return JSONResponse(
+                    status_code=409,
+                    content=response(success=False, error="No program loaded"),
+                )
+            if state.kernel is None:
+                return JSONResponse(
+                    status_code=500,
+                    content=response(success=False, error="Kernel not available"),
+                )
+            if validated.program_session_generation != state.program_session_generation:
+                return JSONResponse(
+                    status_code=409,
+                    content=response(
+                        success=False,
+                        error=(
+                            "Program session generation changed; reload the "
+                            "program draft before syncing the live scene"
+                        ),
+                    ),
+                )
+            if (
+                validated.program_tree_hash is not None
+                and validated.program_tree_hash
+                and validated.program_tree_hash != state.program_tree_hash
+            ):
+                return JSONResponse(
+                    status_code=409,
+                    content=response(
+                        success=False,
+                        error=(
+                            "Program tree hash changed; reload the program "
+                            "draft before syncing the live scene"
+                        ),
+                    ),
+                )
+
+            desired_requests: dict[str, SceneEditRequest] = {}
+            for resource in validated.scene_resources:
+                if resource.object_id in desired_requests:
+                    return JSONResponse(
+                        status_code=400,
+                        content=response(
+                            success=False,
+                            failed_object_id=resource.object_id,
+                            error=(
+                                f"Duplicate authored scene object id "
+                                f"'{resource.object_id}'"
+                            ),
+                        ),
+                    )
+                request = _scene_sync_resource_request(resource)
+                if request.shape_type == "mesh":
+                    try:
+                        from .routes_scene_meshes import validate_scene_mesh_resource_or_409
+
+                        validate_scene_mesh_resource_or_409(
+                            state,
+                            request.mesh_resource_uri,
+                            request.mesh_scale,
+                        )
+                    except HTTPException as exc:
+                        return JSONResponse(
+                            status_code=exc.status_code,
+                            content=response(
+                                success=False,
+                                failed_object_id=request.object_id,
+                                error=str(exc.detail),
+                            ),
+                        )
+                desired_requests[request.object_id] = request
+
+            live_objects = {
+                scene_object.object_id: scene_object
+                for scene_object in state.kernel.get_scene_objects()
+            }
+            managed_ids = state.authored_scene_sync_managed_ids()
+            desired_ids = set(desired_requests)
+            added: list[str] = []
+            updated: list[str] = []
+            removed: list[str] = []
+            unchanged: list[str] = []
+            visual_refresh_requested = False
+            visual_publish_requested = False
+
+            def apply_request(request: SceneEditRequest):
+                nonlocal visual_refresh_requested, visual_publish_requested
+                result = state.kernel.scene_edit(request)
+                if not result.success:
+                    return result
+                visual_update = state.apply_visual_scene_edit_success(
+                    request,
+                    publish=False,
+                )
+                visual_refresh_requested = (
+                    visual_refresh_requested
+                    or bool(visual_update.get("needs_refresh"))
+                )
+                visual_publish_requested = (
+                    visual_publish_requested
+                    or bool(visual_update.get("updated"))
+                )
+                return result
+
+            for object_id in sorted(managed_ids - desired_ids):
+                if object_id not in live_objects:
+                    continue
+                request = SceneEditRequest(operation="remove", object_id=object_id)
+                result = state.kernel.scene_edit(request)
+                if not result.success:
+                    return JSONResponse(
+                        status_code=409,
+                        content=response(
+                            success=False,
+                            added=added,
+                            updated=updated,
+                            removed=removed,
+                            unchanged=unchanged,
+                            failed_object_id=object_id,
+                            error=result.error or "Scene remove failed",
+                            visual_refresh_requested=visual_refresh_requested,
+                            visual_publish_requested=visual_publish_requested,
+                        ),
+                    )
+                visual_update = state.apply_visual_scene_edit_success(
+                    request,
+                    publish=False,
+                )
+                visual_refresh_requested = (
+                    visual_refresh_requested
+                    or bool(visual_update.get("needs_refresh"))
+                )
+                visual_publish_requested = (
+                    visual_publish_requested
+                    or bool(visual_update.get("updated"))
+                )
+                removed.append(object_id)
+
+            for object_id in sorted(desired_requests):
+                request = desired_requests[object_id]
+                live_object = live_objects.get(object_id)
+                if live_object is None:
+                    result = apply_request(request)
+                    if not result.success:
+                        return JSONResponse(
+                            status_code=409,
+                            content=response(
+                                success=False,
+                                added=added,
+                                updated=updated,
+                                removed=removed,
+                                unchanged=unchanged,
+                                failed_object_id=object_id,
+                                error=result.error or "Scene add failed",
+                                visual_refresh_requested=visual_refresh_requested,
+                                visual_publish_requested=visual_publish_requested,
+                            ),
+                        )
+                    added.append(object_id)
+                    continue
+
+                if object_id not in managed_ids:
+                    return JSONResponse(
+                        status_code=409,
+                        content=response(
+                            success=False,
+                            added=added,
+                            updated=updated,
+                            removed=removed,
+                            unchanged=unchanged,
+                            failed_object_id=object_id,
+                            error=(
+                                "Live scene object exists but is not managed by "
+                                "authored-scene sync"
+                            ),
+                            visual_refresh_requested=visual_refresh_requested,
+                            visual_publish_requested=visual_publish_requested,
+                        ),
+                    )
+
+                same_shape = (
+                    _scene_sync_shape_key_from_object(live_object)
+                    == _scene_sync_shape_key_from_request(request)
+                )
+                same_pose = (
+                    _scene_sync_pose_key_from_object(live_object)
+                    == _scene_sync_pose_key_from_request(request)
+                )
+                if getattr(live_object, "attached", False) or not same_shape:
+                    remove_request = SceneEditRequest(
+                        operation="remove",
+                        object_id=object_id,
+                    )
+                    result = state.kernel.scene_edit(remove_request)
+                    if not result.success:
+                        return JSONResponse(
+                            status_code=409,
+                            content=response(
+                                success=False,
+                                added=added,
+                                updated=updated,
+                                removed=removed,
+                                unchanged=unchanged,
+                                failed_object_id=object_id,
+                                error=result.error or "Scene remove failed",
+                                visual_refresh_requested=visual_refresh_requested,
+                                visual_publish_requested=visual_publish_requested,
+                            ),
+                        )
+                    visual_update = state.apply_visual_scene_edit_success(
+                        remove_request,
+                        publish=False,
+                    )
+                    visual_refresh_requested = (
+                        visual_refresh_requested
+                        or bool(visual_update.get("needs_refresh"))
+                    )
+                    visual_publish_requested = (
+                        visual_publish_requested
+                        or bool(visual_update.get("updated"))
+                    )
+                    result = apply_request(request)
+                    if not result.success:
+                        return JSONResponse(
+                            status_code=409,
+                            content=response(
+                                success=False,
+                                added=added,
+                                updated=updated,
+                                removed=removed,
+                                unchanged=unchanged,
+                                failed_object_id=object_id,
+                                error=result.error or "Scene recreate failed",
+                                visual_refresh_requested=visual_refresh_requested,
+                                visual_publish_requested=visual_publish_requested,
+                            ),
+                        )
+                    updated.append(object_id)
+                    continue
+
+                if same_pose:
+                    unchanged.append(object_id)
+                    continue
+
+                update_request = SceneEditRequest(
+                    operation="update_pose",
+                    object_id=object_id,
+                    pose_position_m=request.pose_position_m,
+                    pose_orientation_xyzw=request.pose_orientation_xyzw,
+                    frame_id=request.frame_id,
+                )
+                result = apply_request(update_request)
+                if not result.success:
+                    return JSONResponse(
+                        status_code=409,
+                        content=response(
+                            success=False,
+                            added=added,
+                            updated=updated,
+                            removed=removed,
+                            unchanged=unchanged,
+                            failed_object_id=object_id,
+                            error=result.error or "Scene pose update failed",
+                            visual_refresh_requested=visual_refresh_requested,
+                            visual_publish_requested=visual_publish_requested,
+                        ),
+                    )
+                updated.append(object_id)
+
+            state.set_authored_scene_sync_managed_ids(desired_ids)
+            # Authored sync is also the reconciliation authority for the visual
+            # object cache. Even an idempotent no-op must repair a stale empty
+            # visual cache after process restart or browser remount.
+            refresh_result = state.refresh_visual_scene_objects_sync(
+                reason="authored_scene_sync"
+            )
+            visual_refresh_requested = True
+            if not refresh_result.get("success", False):
+                logger.warning(
+                    "authored scene sync visual refresh failed: %s",
+                    refresh_result.get("error"),
+                )
+            visual_publish_requested = True
+            state.request_visual_state_publish(reason="authored_scene_sync")
+
+        logger.info(
+            "authored scene sync completed",
+            extra={
+                "event": "manyforge.scene.authored_sync",
+                "sync_id": sync_id,
+                "program_session_generation": state.program_session_generation,
+                "scene_signature": validated.scene_signature,
+                "added": added,
+                "updated": updated,
+                "removed": removed,
+                "unchanged": unchanged,
+            },
+        )
+        return response(
+            success=True,
+            added=added,
+            updated=updated,
+            removed=removed,
+            unchanged=unchanged,
+            visual_refresh_requested=visual_refresh_requested,
+            visual_publish_requested=visual_publish_requested,
+        )
 
     @router.post("/edit")
     def edit_scene(validated: SceneEditApiRequest) -> dict[str, Any]:

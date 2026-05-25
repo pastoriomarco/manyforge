@@ -4,6 +4,7 @@
 // no-scene-lock-contention against the planning context.
 
 #include <manyforge_collision/manyforge_collision_engine.hpp>
+#include <manyforge_core/collision/collision_validation_coordinator.hpp>
 #include <roboplan_example_models/resources.hpp>
 #include <manyforge_roboplan/native_kernel_factory.hpp>
 #include <manyforge_roboplan/roboplan_planning_context.hpp>
@@ -19,10 +20,12 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace {
 
 using manyforge::core::AddObjectRequestDTO;
+using manyforge::core::AttachObjectRequestDTO;
 using manyforge::core::BoxShapeDTO;
 using manyforge::core::CollisionCancellationToken;
 using manyforge::core::CollisionDecisionResult;
@@ -31,9 +34,15 @@ using manyforge::core::CollisionPolicySnapshot;
 using manyforge::core::CollisionQuery;
 using manyforge::core::CollisionResult;
 using manyforge::core::CollisionShapeDTO;
+using manyforge::core::CollisionSurface;
+using manyforge::core::CollisionValidationCoordinator;
+using manyforge::core::CollisionValidationPassConfig;
 using manyforge::core::CollisionWorldSnapshot;
 using manyforge::core::ICollisionQueryEngine;
 using manyforge::core::MeshShapeDTO;
+using manyforge::core::Pose3DTO;
+using manyforge::core::TrajectoryDTO;
+using manyforge::core::TrajectoryWaypointDTO;
 using manyforge::core::Vector3DTO;
 using manyforge::collision::ManyForgeCollisionEngine;
 using manyforge::roboplan_backend::NativeKernelBundle;
@@ -76,6 +85,36 @@ std::shared_ptr<ManyForgeCollisionEngine> make_engine(
       models_dir / it->second.srdf_rel,
       std::vector<std::filesystem::path>{pkg_share},
       actual_group);
+}
+
+std::filesystem::path repo_root() {
+  return std::filesystem::path(__FILE__).parent_path().parent_path().parent_path();
+}
+
+std::shared_ptr<NativeKernelBundle> make_ur10e_bundle() {
+  const auto root = repo_root();
+  const auto model_dir = root / "manyforge_example_models" / "models" /
+                         "ur10e_robotiq_2f_140";
+  manyforge::core::ExecutionKernelConfig config;
+  return manyforge::roboplan_backend::create_native_kernel(
+      "ur10e_robotiq_2f_140",
+      "arm",
+      (model_dir / "ur10e_robotiq_2f_140.urdf").string(),
+      (model_dir / "ur10e_robotiq_2f_140.srdf").string(),
+      {root.string()},
+      config);
+}
+
+std::shared_ptr<ManyForgeCollisionEngine> make_ur10e_engine() {
+  const auto root = repo_root();
+  const auto model_dir = root / "manyforge_example_models" / "models" /
+                         "ur10e_robotiq_2f_140";
+  return std::make_shared<ManyForgeCollisionEngine>(
+      "ur10e_robotiq_2f_140",
+      model_dir / "ur10e_robotiq_2f_140.urdf",
+      model_dir / "ur10e_robotiq_2f_140.srdf",
+      std::vector<std::filesystem::path>{root},
+      "arm");
 }
 
 CollisionQuery make_query(const std::vector<double>& positions) {
@@ -171,6 +210,33 @@ AddObjectRequestDTO make_mesh_object(const std::string& object_id) {
   return req;
 }
 
+AddObjectRequestDTO make_isaac_mesh_object(const std::string& object_id,
+                                           const std::string& rel_mesh_path,
+                                           Vector3DTO scale,
+                                           Vector3DTO position,
+                                           manyforge::core::QuaternionDTO orientation =
+                                               {0.0, 0.0, 0.0, 1.0}) {
+  MeshShapeDTO mesh;
+  mesh.resource_uri = (repo_root() / rel_mesh_path).string();
+  mesh.scale = scale;
+
+  AddObjectRequestDTO req;
+  req.object_id = object_id;
+  req.shape = CollisionShapeDTO{mesh};
+  req.pose.position_m = position;
+  req.pose.orientation = orientation;
+  req.frame_id = "universe";
+  return req;
+}
+
+Pose3DTO make_pose(Vector3DTO position,
+                   manyforge::core::QuaternionDTO orientation) {
+  Pose3DTO pose;
+  pose.position_m = position;
+  pose.orientation = orientation;
+  return pose;
+}
+
 std::string diagnostics_text(
     const std::map<std::string, std::string>& diagnostics) {
   std::string out;
@@ -179,6 +245,29 @@ std::string diagnostics_text(
       out += "; ";
     }
     out += key + "=" + value;
+  }
+  return out;
+}
+
+std::int64_t diagnostic_int64(
+    const std::map<std::string, std::string>& diagnostics,
+    const std::string& key) {
+  auto it = diagnostics.find(key);
+  if (it == diagnostics.end()) {
+    throw std::runtime_error("missing diagnostic key: " + key);
+  }
+  return std::stoll(it->second);
+}
+
+std::string classified_pairs_text(const CollisionResult& result) {
+  std::string out;
+  for (const auto& classified : result.normalized_pairs_classified) {
+    if (!out.empty()) {
+      out += "; ";
+    }
+    out += classified.pair.body_a + " <-> " + classified.pair.body_b +
+           " class=" +
+           std::to_string(static_cast<int>(classified.classification));
   }
   return out;
 }
@@ -377,7 +466,40 @@ TEST(ManyForgeCollisionEngineTest,
 }
 
 TEST(ManyForgeCollisionEngineTest,
-     SnapshotPortFailsClosedOnUnsupportedMeshSceneObject) {
+     ObservedRuntimeMonitorReportsSnapshotSyncSeparately) {
+  auto bundle = create_native_kernel("ur5_gripper", "arm");
+  ASSERT_TRUE(bundle);
+  auto* context = dynamic_cast<RoboPlanPlanningContext*>(bundle->context.get());
+  ASSERT_NE(context, nullptr);
+  ASSERT_TRUE(context->add_object(make_mesh_object("mesh_a")).success);
+  auto snapshot = context->snapshot();
+  ASSERT_NE(snapshot, nullptr);
+  ASSERT_TRUE(snapshot->contains_mesh_geometry);
+
+  auto engine = make_engine("ur5_gripper", "arm");
+  CollisionQuery q;
+  q.query_id = "observed-runtime-sync-separate";
+  q.surface = CollisionSurface::kObservedRuntimeMonitor;
+  q.robot_state = context->get_current_state();
+  q.collision_world_revision = snapshot->revision;
+  CollisionPolicySnapshot policy;
+  CollisionCancellationToken cancel;
+
+  auto result = engine->check(*snapshot, q, policy, cancel);
+  EXPECT_EQ(result.engine_status, CollisionEngineStatus::kOk)
+      << diagnostics_text(result.raw_diagnostics);
+  ASSERT_TRUE(result.query_duration_ns.has_value());
+  const auto sync_duration_ns =
+      diagnostic_int64(result.raw_diagnostics, "snapshot_sync_duration_ns");
+  const auto total_duration_ns =
+      diagnostic_int64(result.raw_diagnostics, "total_call_duration_ns");
+  EXPECT_GE(sync_duration_ns, 0);
+  EXPECT_GE(total_duration_ns, sync_duration_ns);
+  EXPECT_GE(total_duration_ns, *result.query_duration_ns);
+}
+
+TEST(ManyForgeCollisionEngineTest,
+     SnapshotPortLoadsTriangleMeshSceneObject) {
   auto bundle = create_native_kernel("ur5_gripper", "arm");
   ASSERT_TRUE(bundle);
   auto* context = dynamic_cast<RoboPlanPlanningContext*>(bundle->context.get());
@@ -396,12 +518,211 @@ TEST(ManyForgeCollisionEngineTest,
   CollisionCancellationToken cancel;
 
   auto result = engine->check(*snapshot, q, policy, cancel);
-  EXPECT_EQ(result.engine_status, CollisionEngineStatus::kUnsupportedGeometry);
-  EXPECT_EQ(result.decision, CollisionDecisionResult::kInconclusiveFail);
-  ASSERT_TRUE(result.raw_diagnostics.count("snapshot_sync_error"));
-  EXPECT_NE(result.raw_diagnostics["snapshot_sync_error"].find("mesh_a"),
-            std::string::npos)
-      << result.raw_diagnostics["snapshot_sync_error"];
+  EXPECT_EQ(result.engine_status, CollisionEngineStatus::kOk)
+      << diagnostics_text(result.raw_diagnostics);
+  EXPECT_EQ(result.decision, result.in_collision
+                                 ? CollisionDecisionResult::kFail
+                                 : CollisionDecisionResult::kPass);
+  EXPECT_EQ(result.raw_diagnostics.count("snapshot_sync_error"), 0u)
+      << diagnostics_text(result.raw_diagnostics);
+}
+
+TEST(ManyForgeCollisionEngineTest,
+     PassiveMeshSceneContactDoesNotEnterMotionEnginePairGraph) {
+  auto bundle = create_native_kernel("ur5_gripper", "arm");
+  ASSERT_TRUE(bundle);
+  auto* context = dynamic_cast<RoboPlanPlanningContext*>(bundle->context.get());
+  ASSERT_NE(context, nullptr);
+  ASSERT_TRUE(context->add_object(make_mesh_object("mesh_a")).success);
+  ASSERT_TRUE(context->add_object(make_box_object("box_a", 0.7)).success);
+  auto snapshot = context->snapshot();
+  ASSERT_NE(snapshot, nullptr);
+  ASSERT_TRUE(snapshot->contains_mesh_geometry);
+  auto policy = context->collision_policy_snapshot();
+  ASSERT_TRUE(policy.has_value());
+  ASSERT_FALSE(policy->allowed_static_static_pairs.empty());
+
+  auto engine = make_engine("ur5_gripper", "arm");
+  CollisionQuery q;
+  q.query_id = "snapshot-mesh-static-contact";
+  q.robot_state = context->get_current_state();
+  q.collision_world_revision = snapshot->revision;
+  CollisionCancellationToken cancel;
+
+  auto direct = engine->check(*snapshot, q, *policy, cancel);
+  ASSERT_EQ(direct.engine_status, CollisionEngineStatus::kOk)
+      << diagnostics_text(direct.raw_diagnostics);
+  ASSERT_FALSE(direct.in_collision)
+      << "Passive world-object contacts must remain scene-health data, not "
+         "motion-validation contacts.";
+
+  TrajectoryDTO trajectory;
+  trajectory.joint_names = q.robot_state.joint_names;
+  TrajectoryWaypointDTO waypoint;
+  waypoint.positions_rad = q.robot_state.positions_rad;
+  waypoint.time_from_start_s = 0.0;
+  trajectory.waypoints.push_back(std::move(waypoint));
+
+  CollisionValidationPassConfig cfg;
+  cfg.policy_snapshot = *policy;
+  CollisionValidationCoordinator coordinator(std::move(cfg));
+  const auto bundle_result =
+      coordinator.validate_trajectory(*snapshot, *engine, trajectory, cancel);
+  EXPECT_TRUE(bundle_result.decision.accepted);
+  ASSERT_FALSE(bundle_result.waypoint_records.empty());
+  EXPECT_EQ(bundle_result.waypoint_records.front().result.engine_status,
+            CollisionEngineStatus::kOk);
+}
+
+TEST(ManyForgeCollisionEngineTest,
+     IsaacMeshTableCheeseStartContactDoesNotEnterMotionEnginePairGraph) {
+  auto bundle = make_ur10e_bundle();
+  ASSERT_TRUE(bundle);
+  auto* context = dynamic_cast<RoboPlanPlanningContext*>(bundle->context.get());
+  ASSERT_NE(context, nullptr);
+  context->set_robot_base_pose(make_pose(
+      Vector3DTO{-0.21814000606536865, -0.571590006351471,
+                 0.12999999523162842},
+      manyforge::core::QuaternionDTO{0.0, 0.0, -0.7071067690849304,
+                                     0.7071067932881648}));
+
+  ASSERT_TRUE(context->add_object(make_isaac_mesh_object(
+                  "isaac_table_low_327",
+                  "examples/isaac_manipulator_scene_light/meshes/"
+                  "background__table_low_327_collider_cooked.obj",
+                  Vector3DTO{1.0, 1.5, 1.149999976},
+                  Vector3DTO{0.0, 0.0, -0.7695999827980996}))
+                  .success);
+  ASSERT_TRUE(context->add_object(make_isaac_mesh_object(
+                  "isaac_cheese_box",
+                  "examples/isaac_manipulator_scene_light/meshes/"
+                  "mac_n_cheese_centered_collider_cooked.obj",
+                  Vector3DTO{1.0, 1.0, 1.0},
+                  Vector3DTO{-0.4550379514694214, 0.0765950009226799,
+                             0.087826669216156},
+                  manyforge::core::QuaternionDTO{
+                      0.5020703673362732, -0.518012523651123,
+                      -0.4821583032608032, 0.49710360169410706}))
+                  .success);
+  ASSERT_TRUE(context->add_object(make_isaac_mesh_object(
+                  "isaac_soup_can",
+                  "examples/isaac_manipulator_scene_light/meshes/"
+                  "World__soup_can_collider_cooked.obj",
+                  Vector3DTO{1.0, 1.0, 1.0},
+                  Vector3DTO{0.085370734333992, -0.004780956543982029,
+                             0.05248536914587021},
+                  manyforge::core::QuaternionDTO{
+                      0.03936762849031647, 0.705935907260489,
+                      0.706009404317132, 0.04068667697327009}))
+                  .success);
+  ASSERT_TRUE(context->add_object(make_isaac_mesh_object(
+                  "isaac_small_KLT",
+                  "examples/isaac_manipulator_scene_light/meshes/"
+                  "World__small_KLT_collider_primitives.obj",
+                  Vector3DTO{1.0, 1.0, 1.0},
+                  Vector3DTO{-0.561839, -0.367252, 0.073459},
+                  manyforge::core::QuaternionDTO{
+                      -7.463636797056011e-07, 0.0014223730063974037,
+                      5.845196084198735e-05, 0.9999989867184076}))
+                  .success);
+  ASSERT_TRUE(context->add_object(make_isaac_mesh_object(
+                  "isaac_small_KLT_01",
+                  "examples/isaac_manipulator_scene_light/meshes/"
+                  "World__small_KLT_01_collider_primitives.obj",
+                  Vector3DTO{1.0, 1.0, 1.0},
+                  Vector3DTO{0.27161648869514465, -0.35853588581085205,
+                             0.07468909025192261},
+                  manyforge::core::QuaternionDTO{
+                      -1.835783623763347e-07, -0.0009134877500924122,
+                      -3.4923311013172767e-07, 0.9999995827699003}))
+                  .success);
+
+  auto snapshot = context->snapshot();
+  ASSERT_NE(snapshot, nullptr);
+  auto policy = context->collision_policy_snapshot();
+  ASSERT_TRUE(policy.has_value());
+  ASSERT_FALSE(policy->allowed_static_static_pairs.empty());
+
+  CollisionQuery q;
+  q.query_id = "isaac-mesh-contact-start";
+  q.robot_state.positions_rad = {2.63422544, -0.875980752, 1.551074106,
+                                 -2.29231544, -1.560498884, -2.038544566};
+  q.collision_world_revision = snapshot->revision;
+  CollisionCancellationToken cancel;
+  auto engine = make_ur10e_engine();
+
+  auto direct = engine->check(*snapshot, q, *policy, cancel);
+  ASSERT_EQ(direct.engine_status, CollisionEngineStatus::kOk)
+      << diagnostics_text(direct.raw_diagnostics);
+  ASSERT_FALSE(direct.in_collision)
+      << "The cheese box resting on the Isaac table is passive scene state; "
+         "it must not consume the robot motion engine's runtime-monitor budget.";
+
+  TrajectoryDTO trajectory;
+  trajectory.joint_names = {};
+  TrajectoryWaypointDTO waypoint;
+  waypoint.positions_rad = q.robot_state.positions_rad;
+  waypoint.time_from_start_s = 0.0;
+  trajectory.waypoints.push_back(std::move(waypoint));
+
+  CollisionValidationPassConfig cfg;
+  cfg.policy_snapshot = *policy;
+  CollisionValidationCoordinator coordinator(std::move(cfg));
+  const auto bundle_result =
+      coordinator.validate_trajectory(*snapshot, *engine, trajectory, cancel);
+  ASSERT_FALSE(bundle_result.waypoint_records.empty());
+  EXPECT_TRUE(bundle_result.decision.accepted)
+      << classified_pairs_text(bundle_result.waypoint_records.front().result);
+}
+
+TEST(ManyForgeCollisionEngineTest,
+     AttachedObjectTouchLinksHonorExplicitGripperCollisionEnvelope) {
+  auto bundle = make_ur10e_bundle();
+  ASSERT_TRUE(bundle);
+  auto* context = dynamic_cast<RoboPlanPlanningContext*>(bundle->context.get());
+  ASSERT_NE(context, nullptr);
+
+  ASSERT_TRUE(context->add_object(make_box_object("grasped_box")).success);
+  AttachObjectRequestDTO attach;
+  attach.object_id = "grasped_box";
+  attach.frame_id = "grasp_frame";
+  attach.touch_links = {"robotiq_base_link",
+                        "left_outer_knuckle",
+                        "left_outer_finger",
+                        "left_inner_knuckle",
+                        "left_inner_finger",
+                        "right_inner_finger",
+                        "left_inner_finger_pad",
+                        "right_outer_knuckle",
+                        "right_outer_finger",
+                        "right_inner_knuckle",
+                        "right_inner_finger_pad"};
+  const auto attach_result = context->attach_object(attach);
+  ASSERT_TRUE(attach_result.success)
+      << (attach_result.error ? attach_result.error->message : "");
+
+  auto policy = context->collision_policy_snapshot();
+  ASSERT_TRUE(policy.has_value());
+  const std::string object_body =
+      "robot/robot0/attached/grasped_box/shape/0";
+  const std::string left_knuckle_body =
+      "robot/robot0/link/left_inner_knuckle/collision/0";
+  const std::string right_knuckle_body =
+      "robot/robot0/link/right_inner_knuckle/collision/0";
+  const std::string gripper_base_body =
+      "robot/robot0/link/robotiq_base_link/collision/0";
+  const auto has_pair = [&](const std::string& a, const std::string& b) {
+    manyforge::core::CollisionPairId expected{a, b};
+    if (expected.body_b < expected.body_a) {
+      std::swap(expected.body_a, expected.body_b);
+    }
+    return std::find(policy->allowed_touch_link_pairs.begin(),
+                     policy->allowed_touch_link_pairs.end(),
+                     expected) != policy->allowed_touch_link_pairs.end();
+  };
+  EXPECT_TRUE(has_pair(object_body, left_knuckle_body));
+  EXPECT_TRUE(has_pair(object_body, right_knuckle_body));
+  EXPECT_TRUE(has_pair(object_body, gripper_base_body));
 }
 
 TEST(ManyForgeCollisionEngineTest, SnapshotPortRejectsStaleRevision) {

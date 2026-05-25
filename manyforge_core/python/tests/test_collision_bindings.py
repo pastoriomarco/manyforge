@@ -316,6 +316,7 @@ def test_collision_geometry_descriptor_default_and_writable():
     assert d.cylinder_height_m is None
     assert d.capsule_radius_m is None
     assert d.capsule_height_m is None
+    assert d.mesh_scale is None
     assert d.source_uri is None
     assert d.source_hash is None
     assert d.triangle_count is None
@@ -327,6 +328,7 @@ def test_collision_geometry_descriptor_default_and_writable():
     d.owner_kind = manyforge_core_py.CollisionOwnerKind.kDetachedObject
     d.geometry_kind = manyforge_core_py.CollisionGeometryKind.kConvexMesh
     d.box_dimensions_m = manyforge_core_py.Vector3DTO(x_m=0.1, y_m=0.2, z_m=0.3)
+    d.mesh_scale = manyforge_core_py.Vector3DTO(x_m=1.0, y_m=1.5, z_m=1.15)
     d.sphere_radius_m = 0.05
     d.cylinder_radius_m = 0.04
     d.cylinder_height_m = 0.2
@@ -348,6 +350,9 @@ def test_collision_geometry_descriptor_default_and_writable():
     assert d.cylinder_height_m == 0.2
     assert d.capsule_radius_m == 0.03
     assert d.capsule_height_m == 0.4
+    assert d.mesh_scale.x_m == 1.0
+    assert d.mesh_scale.y_m == 1.5
+    assert d.mesh_scale.z_m == 1.15
     assert d.source_uri == "file:///tmp/cheese.obj"
     assert d.source_hash == "sha256:0123"
     assert d.quality_labels == ["convex", "watertight"]
@@ -631,6 +636,7 @@ def test_collision_world_snapshot_default():
     assert s.snapshot_format_version == 1
     assert s.publisher_id == ""
     assert s.revision.revision_id == 0
+    assert s.robot_model_frames == []
     assert s.bodies == []
     assert s.body_count == 0
     assert s.geometry_count == 0
@@ -647,12 +653,28 @@ def test_collision_world_body_round_trip():
     assert len(b.geometries) == 1
 
 
+def test_collision_robot_model_frame_round_trip():
+    frame = manyforge_core_py.CollisionRobotModelFrame()
+    frame.robot_id = "robot0"
+    frame.model_frame_id = "base_link"
+    frame.world_pose = _identity_pose()
+
+    assert frame.robot_id == "robot0"
+    assert frame.model_frame_id == "base_link"
+    assert frame.world_pose.orientation.w == 1.0
+
+
 def test_collision_world_snapshot_builder_happy_path():
+    frame = manyforge_core_py.CollisionRobotModelFrame()
+    frame.robot_id = "r1"
+    frame.model_frame_id = "base_link"
+    frame.world_pose = _identity_pose()
     builder = manyforge_core_py.CollisionWorldSnapshotBuilder()
     (
         builder.set_publisher_id("py_test")
         .set_revision_id(7)
         .set_emitted_at_ns(1234)
+        .add_robot_model_frame(frame)
         .add_body(_robot_link_body("link1"))
         .add_body(_robot_link_body("link2"))
     )
@@ -661,6 +683,8 @@ def test_collision_world_snapshot_builder_happy_path():
     assert snap.revision.revision_id == 7
     assert snap.revision.content_hash  # non-empty
     assert snap.emitted_at_ns == 1234
+    assert len(snap.robot_model_frames) == 1
+    assert snap.robot_model_frames[0].model_frame_id == "base_link"
     assert snap.body_count == 2
     assert snap.geometry_count == 2
     assert snap.robot_link_count == 2

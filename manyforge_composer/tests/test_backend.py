@@ -22,7 +22,7 @@ from manyforge_composer.backend.state import ComposerState
 from manyforge_composer.backend.app import create_app
 from manyforge_composer.backend.security import SecurityConfig
 from manyforge_composer.__main__ import build_program_loaded_callback
-from manyforge_composer.backend import routes_filesystem, routes_infra
+from manyforge_composer.backend import routes_filesystem, routes_infra, routes_runtime
 
 # Test fixture paths (relative to repo root, same as existing tests)
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -1427,6 +1427,63 @@ def test_runtime_status_reports_composer_only_before_program_load(client):
     assert data["canExecute"] is False
     component_ids = {component["id"] for component in data["components"]}
     assert {"composer", "program", "hmi", "planner", "execution_backend"} <= component_ids
+
+
+def test_runtime_status_classifies_unknown_kernel_status_as_fault(client, monkeypatch):
+    """Unknown cross-boundary kernel statuses fail closed in readiness telemetry."""
+
+    def fake_heartbeat(_state):
+        return {
+            "status": "backend_unavailable",
+            "uptime_s": 1.0,
+            "components": {
+                "kernel": {
+                    "available": True,
+                    "type": "MockKernelClient",
+                    "state": "backend_unavailable",
+                }
+            },
+        }
+
+    monkeypatch.setattr(routes_runtime, "build_infra_heartbeat_payload", fake_heartbeat)
+
+    response = client.get("/api/runtime/status")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["readiness"] == "fault"
+    assert data["canExecute"] is False
+    assert "backend_unavailable" in data["userMessage"]
+    execution_backend = next(
+        component for component in data["components"] if component["id"] == "execution_backend"
+    )
+    assert execution_backend["status"] == "fault"
+
+
+def test_runtime_status_classifies_missing_kernel_status_as_fault(client, monkeypatch):
+    """The heartbeat contract requires a status; missing values fail closed."""
+
+    def fake_heartbeat(_state):
+        return {
+            "uptime_s": 1.0,
+            "components": {
+                "kernel": {
+                    "available": True,
+                    "type": "MockKernelClient",
+                    "state": "executing",
+                }
+            },
+        }
+
+    monkeypatch.setattr(routes_runtime, "build_infra_heartbeat_payload", fake_heartbeat)
+
+    response = client.get("/api/runtime/status")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["readiness"] == "fault"
+    assert data["canExecute"] is False
+    assert "__missing__" in data["userMessage"]
 
 
 def test_runtime_status_merges_external_provider_components(client):

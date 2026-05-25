@@ -25,9 +25,16 @@ grippers:
     joint_name: finger_joint
     motion_time_s: 0.8
     touch_links:
+      - robotiq_base_link
+      - left_outer_knuckle
+      - left_outer_finger
+      - left_inner_knuckle
       - left_inner_finger
-      - right_inner_finger
       - left_inner_finger_pad
+      - right_outer_knuckle
+      - right_outer_finger
+      - right_inner_knuckle
+      - right_inner_finger
       - right_inner_finger_pad
     mount_frame: tool0
     attach_frame: grasp_frame

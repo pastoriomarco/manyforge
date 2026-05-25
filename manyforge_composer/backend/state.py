@@ -284,6 +284,7 @@ class ComposerState:
         self._runtime_overrides: dict[str, RuntimeOverrideRecord] = {}
         self._program_tree_hash: str = ""
         self._program_session_generation: int = 0
+        self._authored_scene_sync_object_ids: set[str] = set()
         self._scene_snapshot_lock = threading.Lock()
         self._published_scene_snapshots: dict[str, PublishedSceneSnapshot] = {}
         self.assistant_provider: Any = None
@@ -864,6 +865,29 @@ class ComposerState:
     def program_session_generation(self) -> int:
         """Monotonic generation for the loaded/applied program snapshot."""
         return self._program_session_generation
+
+    def authored_scene_sync_managed_ids(self) -> set[str]:
+        """Object ids managed by backend-authored scene reconciliation.
+
+        The loaded program's static scene resources are always managed.
+        Draft-only resources become managed after the first successful
+        authored-scene sync, so a later draft removal can delete them from the
+        live scene even before the draft is saved to disk.
+        """
+        base_ids = {
+            resource.object_id
+            for resource in (self.program.scene if self.program is not None else [])
+        }
+        return base_ids | set(self._authored_scene_sync_object_ids)
+
+    def set_authored_scene_sync_managed_ids(self, object_ids: set[str]) -> None:
+        self._authored_scene_sync_object_ids = set(object_ids)
+
+    def reset_authored_scene_sync_managed_ids(self) -> None:
+        self._authored_scene_sync_object_ids = {
+            resource.object_id
+            for resource in (self.program.scene if self.program is not None else [])
+        }
 
     @property
     def runtime_overrides(self) -> dict[str, RuntimeOverrideRecord]:
@@ -1862,6 +1886,8 @@ class ComposerState:
     def apply_visual_scene_edit_success(
         self,
         request: SceneEditRequest,
+        *,
+        publish: bool = True,
     ) -> dict[str, Any]:
         """Reflect a successful Composer-owned scene edit into visual state.
 
@@ -2026,7 +2052,7 @@ class ComposerState:
                 self._visual_scene_objects_timestamp_ns = now_ns
                 self._visual_scene_objects_refresh_error = None
 
-        if updated:
+        if updated and publish:
             self.request_visual_state_publish(reason=f"scene_edit_{request.operation}")
         return {"updated": updated, "needs_refresh": needs_refresh}
 
@@ -2455,6 +2481,7 @@ class ComposerState:
         self.deployment = deployment
         self._update_program_tree_hash()
         self._program_session_generation += 1
+        self.reset_authored_scene_sync_managed_ids()
         self._clear_published_scene_snapshots()
         self.clear_pose_source_snapshots()
         self.clear_visual_state_snapshot()
@@ -2591,6 +2618,7 @@ class ComposerState:
             self._drivable_joint_names = list(joint_names_to_cache)
         self._update_program_tree_hash()
         self._program_session_generation += 1
+        self.reset_authored_scene_sync_managed_ids()
         self._clear_published_scene_snapshots()
         with self._scene_viewer_lock:
             self._hidden_frames.clear()
@@ -2936,13 +2964,13 @@ class ComposerState:
             if not any(
                 detail["object_id"] == object_id
                 and (
-                    detail["status"] == "applied"
-                    or (
-                        policy == "continuous_unattached"
-                        and detail["status"] == "skipped"
-                        and detail.get("skip_reason") == "attached_object"
+                        detail["status"] == "applied"
+                        or (
+                            policy == "continuous_unattached"
+                            and detail["status"] == "skipped"
+                            and detail.get("skip_reason") == "attached_object"
+                        )
                     )
-                )
                 for detail in details
             )
             and any(

@@ -989,10 +989,56 @@ TEST_F(ExecutionKernelTest, Execute_HappyPath_CachesTrajectory) {
   EXPECT_EQ(cached->waypoints.size(), 2u);
 }
 
-TEST_F(ExecutionKernelTest, Execute_SceneRevisionChangeDuringValidationFailsClosed) {
-  collision_engine->on_check = [this](const CollisionQuery&) {
+TEST_F(ExecutionKernelTest,
+       Execute_LiveSceneRevisionChangeAfterBorrowedSnapshotDoesNotBlockDispatch) {
+  bool mutated_once = false;
+  collision_engine->on_check = [this, &mutated_once](const CollisionQuery&) {
+    if (!mutated_once) {
+      mutated_once = true;
+      auto mutated = make_test_collision_world_snapshot();
+      mutated.revision = CollisionWorldRevision{2, "mutated-world"};
+      collision_world_publisher.current_snapshot =
+          std::make_shared<const CollisionWorldSnapshot>(std::move(mutated));
+    }
+  };
+
+  auto result = execute_sync(make_test_request("move_scene_changed"));
+
+  ASSERT_TRUE(result.ok());
+  EXPECT_EQ(kernel.get_status().state, ExecutionState::kCompleted);
+  EXPECT_EQ(execution.execute_count, 1);
+  EXPECT_TRUE(cache.lookup("move_scene_changed").has_value());
+  EXPECT_EQ(collision_engine->check_count.load(), 2);
+}
+
+TEST_F(ExecutionKernelTest, Execute_SameContentRevisionChangeDuringValidationDispatches) {
+  bool mutated_once = false;
+  collision_engine->on_check = [this, &mutated_once](const CollisionQuery&) {
+    if (!mutated_once) {
+      mutated_once = true;
+      auto mutated = make_test_collision_world_snapshot();
+      mutated.revision = CollisionWorldRevision{2, "mock-collision-world"};
+      collision_world_publisher.current_snapshot =
+          std::make_shared<const CollisionWorldSnapshot>(std::move(mutated));
+    }
+  };
+
+  auto result = execute_sync(make_test_request("move_same_content_revision"));
+
+  ASSERT_TRUE(result.ok());
+  EXPECT_EQ(kernel.get_status().state, ExecutionState::kCompleted);
+  EXPECT_EQ(execution.execute_count, 1);
+  EXPECT_TRUE(cache.lookup("move_same_content_revision").has_value());
+}
+
+TEST_F(ExecutionKernelTest,
+       Execute_RepeatedLiveSceneRevisionChangesDuringValidationDoNotFreezeDispatch) {
+  std::uint64_t next_revision = 2;
+  collision_engine->on_check = [this, &next_revision](const CollisionQuery&) {
     auto mutated = make_test_collision_world_snapshot();
-    mutated.revision = CollisionWorldRevision{2, "mutated-world"};
+    mutated.revision = CollisionWorldRevision{
+        next_revision, "mutated-world-" + std::to_string(next_revision)};
+    ++next_revision;
     collision_world_publisher.current_snapshot =
         std::make_shared<const CollisionWorldSnapshot>(std::move(mutated));
   };
@@ -1000,12 +1046,11 @@ TEST_F(ExecutionKernelTest, Execute_SceneRevisionChangeDuringValidationFailsClos
   auto result = execute_sync(make_test_request("move_scene_changed"));
 
   ASSERT_TRUE(result.ok());
-  EXPECT_EQ(kernel.get_status().state, ExecutionState::kFailed);
-  auto snapshot = kernel.get_execution_snapshot();
-  ASSERT_TRUE(snapshot.error.has_value());
-  EXPECT_EQ(snapshot.error->code, kErrorInvariantViolation);
-  EXPECT_EQ(snapshot.error->details.at("reason"), "scene_changed_during_validation");
-  EXPECT_FALSE(cache.lookup("move_scene_changed").has_value());
+  EXPECT_EQ(kernel.get_status().state, ExecutionState::kCompleted);
+  EXPECT_EQ(execution.execute_count, 1);
+  auto cached = cache.lookup("move_scene_changed");
+  ASSERT_TRUE(cached.has_value());
+  EXPECT_EQ(cache.revision_of("move_scene_changed")->revision_id, 1u);
 }
 
 TEST_F(ExecutionKernelTest, Execute_IncrementingIds) {
@@ -1437,6 +1482,39 @@ TEST_F(ExecutionKernelTest,
   EXPECT_EQ(kernel.get_status().state, ExecutionState::kFailed);
   EXPECT_EQ(execution.execute_count, 0);
   EXPECT_GE(collision_engine->check_count.load(), 1);
+}
+
+TEST_F(ExecutionKernelTest,
+       Execute_AuthoritativeCollisionDiagnosticsReportClassifiedFailurePair) {
+  CollisionPairId allowed_pair{
+      "object/box_a/shape/0",
+      "object/box_b/shape/0"};
+  CollisionPairId blocking_pair{
+      "object/box_a/shape/0",
+      "robot/robot1/link/link1/collision/0"};
+  CollisionResult result;
+  result.in_collision = true;
+  result.normalized_pairs = {allowed_pair, blocking_pair};
+  result.engine_status = CollisionEngineStatus::kOk;
+  result.decision = CollisionDecisionResult::kFail;
+  collision_engine->default_result = result;
+
+  auto policy = make_test_collision_policy_snapshot();
+  policy.allowed_static_static_pairs.push_back(allowed_pair);
+  collision_world_publisher.current_policy = policy;
+
+  execute_sync(make_test_request("classified_failure_diagnostics"));
+
+  const auto snapshot = kernel.get_execution_snapshot();
+  ASSERT_TRUE(snapshot.error.has_value());
+  const auto& details = snapshot.error->details;
+  EXPECT_EQ(details.at("collision_result_first_pair"),
+            "object/box_a/shape/0 <-> object/box_b/shape/0");
+  EXPECT_EQ(details.at("collision_result_first_failure_pair"),
+            "object/box_a/shape/0 <-> robot/robot1/link/link1/collision/0");
+  EXPECT_EQ(details.at("collision_result_first_failure_classification"),
+            "blocking_collision");
+  EXPECT_EQ(execution.execute_count, 0);
 }
 
 TEST_F(ExecutionKernelTest,
@@ -2010,14 +2088,15 @@ TEST_F(ExecutionKernelTest,
   controlled_kernel.subscribe_events(
       [&](const KernelEvent& e) { events.push_back(e); });
 
-  context.collision_sequence = {
-      CollisionCheckResultDTO{true, "link1", "box"},
-  };
-
   auto result = controlled_kernel.execute(make_test_request());
   ASSERT_TRUE(result.ok());
   ASSERT_TRUE(controlled_execution.wait_until_execute_called()) << "wait_until_execute_called timed out";
   ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kExecuting));
+  auto live_snapshot = make_test_collision_world_snapshot();
+  live_snapshot.revision = CollisionWorldRevision{99, "live-scene-after-dispatch"};
+  local_collision_world.current_snapshot =
+      std::make_shared<const CollisionWorldSnapshot>(std::move(live_snapshot));
+  local_collision_engine->default_result = make_authoritative_collision_result();
   std::this_thread::sleep_for(std::chrono::milliseconds(5));
 
   local_clock.advance(10'000'000);
@@ -2037,7 +2116,8 @@ TEST_F(ExecutionKernelTest,
   }
   EXPECT_TRUE(completed);
 
-  EXPECT_GE(context.collision_count, 1);
+  EXPECT_EQ(context.collision_count, 0);
+  EXPECT_GE(local_collision_engine->check_count.load(), 3);
   EXPECT_EQ(controlled_execution.stop_count, 1);
   EXPECT_EQ(controlled_kernel.get_status().state, ExecutionState::kInterrupted);
   auto latch = controlled_kernel.get_active_interrupt_latch();
@@ -2058,8 +2138,9 @@ TEST_F(ExecutionKernelTest,
   EXPECT_TRUE(std::any_of(events.begin(), events.end(), [](const KernelEvent& e) {
     return e.type == KernelEventType::kCollisionDetected &&
            e.details.at("surface") == "observed_runtime_monitor" &&
-           e.details.at("contact_a") == "link1" &&
-           e.details.at("contact_b") == "box";
+           e.details.at("collision_world_revision_id") == "99" &&
+           e.details.at("contact_a") == "object/box/shape/0" &&
+           e.details.at("contact_b") == "robot/robot1/link/link1/collision/0";
   }));
 }
 
@@ -2088,14 +2169,17 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_UsesConfiguredPeriod) {
   ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kExecuting));
   ASSERT_TRUE(wait_for_pending_scheduler_work(local_scheduler));
   const int baseline_collision_count = context.collision_count;
+  const int baseline_engine_count = local_collision_engine->check_count.load();
 
   local_clock.advance(49'000'000);
   local_scheduler.advance_to(local_clock.now());
   EXPECT_EQ(context.collision_count, baseline_collision_count);
+  EXPECT_EQ(local_collision_engine->check_count.load(), baseline_engine_count);
 
   local_clock.advance(1'000'000);
   local_scheduler.advance_to(local_clock.now());
-  EXPECT_EQ(context.collision_count, baseline_collision_count + 1);
+  EXPECT_EQ(context.collision_count, baseline_collision_count);
+  EXPECT_EQ(local_collision_engine->check_count.load(), baseline_engine_count + 1);
 
   controlled_execution.complete();
   controlled_kernel.wait_for_completion();

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import builtins
 import importlib.util
 from pathlib import Path
@@ -57,6 +58,35 @@ def _publish_visual_snapshot(state: ComposerState) -> dict:
         lambda: routes_scene._build_visual_state_snapshot_for_publisher(state),
         reason="test",
     )
+
+
+def _load_program_for_scene_sync() -> tuple[TestClient, ComposerState, MockKernelClient]:
+    client, state, kernel = make_client()
+    state.load_program(_PROGRAM_PATH)
+    return client, state, kernel
+
+
+def _authored_sync_payload(
+    state: ComposerState,
+    scene: list[dict] | None = None,
+    *,
+    signature: str = "test-scene-signature",
+) -> dict:
+    if scene is None:
+        scene = [
+            {
+                "objectId": resource.object_id,
+                "shape": dict(resource.shape),
+                "pose": dict(resource.pose),
+            }
+            for resource in (state.program.scene if state.program is not None else [])
+        ]
+    return {
+        "programSessionGeneration": state.program_session_generation,
+        "programTreeHash": state.program_tree_hash,
+        "sceneSignature": signature,
+        "sceneResources": scene,
+    }
 
 
 def _write_toy_visual_urdf(tmp_path: Path) -> Path:
@@ -797,6 +827,186 @@ def test_scene_edit_updates_visual_cache_without_backend_refresh(
     assert objects[0].shape.type == "box"
     assert refresh_reasons == []
     assert publish_reasons == ["scene_edit_add"]
+
+
+def test_authored_scene_sync_adds_then_noops_existing_authored_object():
+    client, state, kernel = _load_program_for_scene_sync()
+
+    first = client.post("/api/scene/sync-authored", json=_authored_sync_payload(state))
+    assert first.status_code == 200
+    first_body = first.json()
+    assert first_body["success"] is True
+    assert first_body["added"] == ["table"]
+    assert first_body["unchanged"] == []
+
+    state.clear_visual_scene_objects_snapshot()
+    second = client.post("/api/scene/sync-authored", json=_authored_sync_payload(state))
+    assert second.status_code == 200
+    second_body = second.json()
+    assert second_body["success"] is True
+    assert second_body["added"] == []
+    assert second_body["updated"] == []
+    assert second_body["removed"] == []
+    assert second_body["unchanged"] == ["table"]
+    assert kernel.get_object_state("table").exists is True
+    visual_objects, visual_meta = state.visual_scene_objects_snapshot()
+    assert visual_meta["timestamp_ns"] > 0
+    assert [obj.object_id for obj in visual_objects] == ["table"]
+
+
+def test_authored_scene_sync_removes_previous_draft_only_object():
+    client, state, kernel = _load_program_for_scene_sync()
+    extra_scene = _authored_sync_payload(state)["sceneResources"] + [
+        {
+            "objectId": "draft_box",
+            "shape": {"type": "box", "box_dimensions_m": [0.1, 0.1, 0.1]},
+            "pose": {
+                "frame_id": "base_link",
+                "position_m": [0.1, 0.2, 0.3],
+                "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+            },
+        }
+    ]
+    first = client.post(
+        "/api/scene/sync-authored",
+        json=_authored_sync_payload(state, extra_scene, signature="with-draft"),
+    )
+    assert first.status_code == 200
+    assert first.json()["success"] is True
+    assert kernel.get_object_state("draft_box").exists is True
+
+    second = client.post(
+        "/api/scene/sync-authored",
+        json=_authored_sync_payload(state, [], signature="empty-draft"),
+    )
+    assert second.status_code == 200
+    body = second.json()
+    assert body["success"] is True
+    assert body["removed"] == ["draft_box", "table"]
+    assert kernel.get_object_state("draft_box").exists is False
+    assert kernel.get_object_state("table").exists is False
+
+
+def test_authored_scene_sync_recreates_shape_changes_and_keeps_add_strict():
+    client, state, kernel = _load_program_for_scene_sync()
+    assert client.post(
+        "/api/scene/sync-authored",
+        json=_authored_sync_payload(state),
+    ).json()["success"] is True
+
+    changed_scene = [
+        {
+            "objectId": "table",
+            "shape": {"type": "sphere", "sphere_radius_m": 0.2},
+            "pose": {
+                "frame_id": "base_link",
+                "position_m": [0.5, 0.0, 0.4],
+                "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+            },
+        }
+    ]
+    response = client.post(
+        "/api/scene/sync-authored",
+        json=_authored_sync_payload(state, changed_scene, signature="shape-change"),
+    )
+    assert response.status_code == 200
+    assert response.json()["updated"] == ["table"]
+    assert kernel.get_object_state("table").exists is True
+    assert kernel.get_scene_objects()[0].shape.type == "sphere"
+
+    duplicate = client.post(
+        "/api/scene/edit",
+        json={
+            "operation": "add",
+            "object_id": "table",
+            "shape_type": "box",
+            "box_dimensions_m": [0.1, 0.1, 0.1],
+        },
+    )
+    assert duplicate.status_code == 200
+    assert duplicate.json()["success"] is False
+    assert "already exists" in (duplicate.json()["error"] or "")
+
+
+def test_authored_scene_sync_updates_pose_without_recreating_shape():
+    client, state, kernel = _load_program_for_scene_sync()
+    assert client.post(
+        "/api/scene/sync-authored",
+        json=_authored_sync_payload(state),
+    ).json()["success"] is True
+
+    moved_scene = [
+        {
+            "objectId": "table",
+            "shape": {"type": "box", "box_dimensions_m": [0.7, 0.3, 0.2]},
+            "pose": {
+                "frame_id": "base_link",
+                "position_m": [0.6, 0.1, 0.2],
+                "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+            },
+        }
+    ]
+    response = client.post(
+        "/api/scene/sync-authored",
+        json=_authored_sync_payload(state, moved_scene, signature="pose-change"),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["success"] is True
+    assert body["added"] == []
+    assert body["updated"] == ["table"]
+    assert body["removed"] == []
+    assert body["unchanged"] == []
+    scene_object = kernel.get_scene_objects()[0]
+    assert scene_object.shape.type == "box"
+    assert scene_object.pose_in_universe["position_m"] == [0.6, 0.1, 0.2]
+
+
+def test_authored_scene_sync_rejects_stale_generation():
+    client, state, _kernel = _load_program_for_scene_sync()
+    payload = _authored_sync_payload(state)
+    payload["programSessionGeneration"] = state.program_session_generation + 1
+
+    response = client.post("/api/scene/sync-authored", json=payload)
+
+    assert response.status_code == 409
+    body = response.json()
+    assert body["success"] is False
+    assert "generation changed" in (body["error"] or "")
+
+
+def test_authored_scene_sync_rejects_while_running():
+    client, state, _kernel = _load_program_for_scene_sync()
+    assert state.cycle_manager is not None
+    state.cycle_manager._state = CycleState.RUNNING
+
+    response = client.post("/api/scene/sync-authored", json=_authored_sync_payload(state))
+
+    assert response.status_code == 409
+    body = response.json()
+    assert body["success"] is False
+    assert "not allowed while execution is active" in (body["error"] or "")
+
+
+def test_authored_scene_sync_concurrent_identical_requests_are_idempotent():
+    client, state, kernel = _load_program_for_scene_sync()
+    payload = _authored_sync_payload(state)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        responses = list(
+            pool.map(
+                lambda _index: client.post("/api/scene/sync-authored", json=payload),
+                range(2),
+            )
+        )
+
+    assert [response.status_code for response in responses] == [200, 200]
+    bodies = [response.json() for response in responses]
+    assert all(body["success"] for body in bodies)
+    assert sorted(body["added"] for body in bodies) == [[], ["table"]]
+    assert sorted(body["unchanged"] for body in bodies) == [[], ["table"]]
+    assert kernel.get_object_state("table").exists is True
 
 
 def test_attached_visual_object_pose_is_composed_from_link_pose(

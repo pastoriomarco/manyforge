@@ -226,6 +226,8 @@ class RoboPlanPlanningContext final
   core::Pose3DTO pose_in_base_from_tracked_locked(const TrackedObjectState& state,
                                                   const std::string& base_frame) const;
   bool infer_attached_from_frame(const std::string& frame_id) const;
+  std::vector<std::string> normalize_touch_links_locked(
+      const std::vector<std::string>& touch_links) const;
   tl::expected<void, std::string> set_touch_links_locked(
       const std::string& object_id,
       const std::vector<std::string>& touch_links,

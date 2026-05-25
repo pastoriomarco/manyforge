@@ -14,11 +14,25 @@ from manyforge_behavior.kernel_client import (
 )
 
 try:
+    from native_kernel_client import (
+        NativeKernelClient,
+        _gripper_state_from_native,
+        _state_from_native,
+    )
+except ImportError:
+    NativeKernelClient = None
+    _gripper_state_from_native = None
+    _state_from_native = None
+    HAS_NATIVE_CLIENT = False
+else:
+    HAS_NATIVE_CLIENT = True
+
+try:
     import manyforge_roboplan_py
-    from native_kernel_client import NativeKernelClient
-    HAS_NATIVE = True
 except ImportError:
     HAS_NATIVE = False
+else:
+    HAS_NATIVE = HAS_NATIVE_CLIENT
 
 
 UR5_JOINTS = [
@@ -95,6 +109,45 @@ def test_create_native_kernel_accepts_collision_monitor_config():
     status = kernel.get_status()
 
     assert status.state == ExecutionState.IDLE
+
+
+def test_native_state_mapping_uses_stable_state_name_only():
+    if not HAS_NATIVE_CLIENT:
+        pytest.skip("native_kernel_client not available")
+
+    assert _state_from_native({"state": 12345, "state_name": "Completed"}) == (
+        ExecutionState.COMPLETED
+    )
+    assert _state_from_native({"state": 12345, "state_name": "Failed"}) == (
+        ExecutionState.FAILED
+    )
+    assert _state_from_native({"state": 12345, "state_name": "Interrupted"}) == (
+        ExecutionState.INTERRUPTED
+    )
+    with pytest.raises(ValueError, match="missing required stable state_name"):
+        _state_from_native({"state": 9})
+    with pytest.raises(ValueError, match="unknown native kernel state_name"):
+        _state_from_native({"state": 9, "state_name": "Complete-ish"})
+
+
+def test_native_gripper_state_mapping_rejects_unknown_or_missing_state():
+    if not HAS_NATIVE_CLIENT:
+        pytest.skip("native_kernel_client not available")
+
+    assert _gripper_state_from_native({"state": "idle"}) == GripperCommandState.IDLE
+    assert (
+        _gripper_state_from_native({"state": "executing"})
+        == GripperCommandState.EXECUTING
+    )
+    assert (
+        _gripper_state_from_native({"state": "completed"})
+        == GripperCommandState.COMPLETED
+    )
+    assert _gripper_state_from_native({"state": "failed"}) == GripperCommandState.FAILED
+    with pytest.raises(ValueError, match="missing required state"):
+        _gripper_state_from_native({})
+    with pytest.raises(ValueError, match="unknown native gripper state"):
+        _gripper_state_from_native({"state": "interrupted"})
 
 
 def make_request(move_id, goal, cache_mode="default"):

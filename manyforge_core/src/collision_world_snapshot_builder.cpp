@@ -77,6 +77,16 @@ void mix_vector3(ContentHasher& hasher, const Vector3DTO& vector) {
   hasher.mix(vector.z_m);
 }
 
+bool finite_pose(const Pose3DTO& pose) {
+  return std::isfinite(pose.position_m.x_m) &&
+         std::isfinite(pose.position_m.y_m) &&
+         std::isfinite(pose.position_m.z_m) &&
+         std::isfinite(pose.orientation.x) &&
+         std::isfinite(pose.orientation.y) &&
+         std::isfinite(pose.orientation.z) &&
+         std::isfinite(pose.orientation.w);
+}
+
 bool positive_finite(double value) {
   return std::isfinite(value) && value > 0.0;
 }
@@ -84,6 +94,11 @@ bool positive_finite(double value) {
 bool valid_positive_dimensions(const Vector3DTO& dimensions) {
   return positive_finite(dimensions.x_m) && positive_finite(dimensions.y_m) &&
          positive_finite(dimensions.z_m);
+}
+
+bool valid_mesh_scale(const Vector3DTO& scale) {
+  return positive_finite(scale.x_m) && positive_finite(scale.y_m) &&
+         positive_finite(scale.z_m);
 }
 
 bool has_unrelated_dimensions(const CollisionGeometryDescriptor& geom,
@@ -111,6 +126,13 @@ bool has_unrelated_dimensions(const CollisionGeometryDescriptor& geom,
 
 std::optional<std::string> validate_geometry_shape_fields(
     const CollisionGeometryDescriptor& geom) {
+  const bool mesh_like =
+      geom.geometry_kind == CollisionGeometryKind::kConvexMesh ||
+      geom.geometry_kind == CollisionGeometryKind::kTriangleMesh ||
+      geom.geometry_kind == CollisionGeometryKind::kCompound;
+  if (!mesh_like && geom.mesh_scale.has_value()) {
+    return "primitive geometry carries mesh_scale";
+  }
   switch (geom.geometry_kind) {
     case CollisionGeometryKind::kBox:
       if (has_unrelated_dimensions(geom, true, false, false, false)) {
@@ -158,6 +180,9 @@ std::optional<std::string> validate_geometry_shape_fields(
       if (has_unrelated_dimensions(geom, false, false, false, false)) {
         return "mesh/compound geometry carries primitive dimensions";
       }
+      if (geom.mesh_scale.has_value() && !valid_mesh_scale(*geom.mesh_scale)) {
+        return "mesh/compound geometry requires positive finite mesh_scale";
+      }
       if ((!geom.source_uri.has_value() || geom.source_uri->empty()) &&
           (!geom.source_hash.has_value() || geom.source_hash->empty())) {
         return "mesh/compound geometry requires source_uri or source_hash";
@@ -182,6 +207,10 @@ void mix_geometry(ContentHasher& hasher,
   hasher.mix(geom.cylinder_height_m.value_or(-1.0));
   hasher.mix(geom.capsule_radius_m.value_or(-1.0));
   hasher.mix(geom.capsule_height_m.value_or(-1.0));
+  hasher.mix(static_cast<std::int64_t>(geom.mesh_scale.has_value() ? 1 : 0));
+  if (geom.mesh_scale) {
+    mix_vector3(hasher, *geom.mesh_scale);
+  }
   hasher.mix(geom.source_uri.value_or(""));
   hasher.mix(geom.source_hash.value_or(""));
   // Quality labels are sorted so a publisher emitting {"convex","watertight"}
@@ -245,6 +274,13 @@ CollisionWorldSnapshotBuilder& CollisionWorldSnapshotBuilder::set_emitted_at_ns(
   return *this;
 }
 
+CollisionWorldSnapshotBuilder&
+CollisionWorldSnapshotBuilder::add_robot_model_frame(
+    CollisionRobotModelFrame frame) {
+  robot_model_frames_.push_back(std::move(frame));
+  return *this;
+}
+
 CollisionWorldSnapshotBuilder& CollisionWorldSnapshotBuilder::add_body(
     CollisionWorldBody body) {
   bodies_.push_back(std::move(body));
@@ -270,8 +306,38 @@ Result<CollisionWorldSnapshot> CollisionWorldSnapshotBuilder::build() {
   snapshot.publisher_id = publisher_id_;
   snapshot.revision.revision_id = revision_id_;
   snapshot.emitted_at_ns = emitted_at_ns_;
+  snapshot.robot_model_frames = std::move(robot_model_frames_);
+  robot_model_frames_.clear();
   snapshot.bodies = std::move(bodies_);
   bodies_.clear();
+
+  std::set<std::pair<std::string, std::string>> seen_robot_frames;
+  for (const auto& frame : snapshot.robot_model_frames) {
+    if (frame.robot_id.empty()) {
+      return err("robot_model_frame robot_id must be non-empty");
+    }
+    if (frame.model_frame_id.empty()) {
+      return err("robot_model_frame model_frame_id must be non-empty");
+    }
+    if (!finite_pose(frame.world_pose)) {
+      return err("robot_model_frame world_pose must be finite");
+    }
+    const auto key = std::make_pair(frame.robot_id, frame.model_frame_id);
+    if (!seen_robot_frames.insert(key).second) {
+      return err("duplicate robot_model_frame: " + frame.robot_id + "/" +
+                 frame.model_frame_id);
+    }
+  }
+
+  std::sort(snapshot.robot_model_frames.begin(),
+            snapshot.robot_model_frames.end(),
+            [](const CollisionRobotModelFrame& a,
+               const CollisionRobotModelFrame& b) {
+              if (a.robot_id != b.robot_id) {
+                return a.robot_id < b.robot_id;
+              }
+              return a.model_frame_id < b.model_frame_id;
+            });
 
   std::set<CollisionBodyId> seen_ids;
   for (const auto& body : snapshot.bodies) {
@@ -388,6 +454,12 @@ Result<CollisionWorldSnapshot> CollisionWorldSnapshotBuilder::build() {
   world.mix("manyforge_core/CollisionWorldSnapshot");
   world.mix(static_cast<std::int64_t>(snapshot.snapshot_format_version));
   world.mix(snapshot.publisher_id);
+  world.mix(static_cast<std::int64_t>(snapshot.robot_model_frames.size()));
+  for (const auto& frame : snapshot.robot_model_frames) {
+    world.mix(frame.robot_id);
+    world.mix(frame.model_frame_id);
+    mix_pose(world, frame.world_pose);
+  }
   world.mix(static_cast<std::int64_t>(snapshot.bodies.size()));
   for (const auto& body : snapshot.bodies) {
     world.mix(body.body_content_hash);

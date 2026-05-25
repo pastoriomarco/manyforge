@@ -24,6 +24,9 @@ namespace manyforge::core {
 ///   - `snapshot_format_version` is non-zero.
 ///   - `revision_id` is non-zero (zero is reserved for "unset").
 ///   - `emitted_at_ns` is non-negative.
+///   - Each robot model frame has non-empty `robot_id` and
+///     `model_frame_id`, finite `world_pose`, and no duplicate
+///     `(robot_id, model_frame_id)` key.
 ///   - Each body's `body_id` is non-empty.
 ///   - Each body's `body_id` matches its `owner_kind` namespace.
 ///   - Each body's `frame_id` is non-empty.
@@ -73,6 +76,8 @@ class CollisionWorldSnapshotBuilder {
       std::uint32_t version);
   CollisionWorldSnapshotBuilder& set_revision_id(std::uint64_t revision_id);
   CollisionWorldSnapshotBuilder& set_emitted_at_ns(std::int64_t emitted_at_ns);
+  CollisionWorldSnapshotBuilder& add_robot_model_frame(
+      CollisionRobotModelFrame frame);
 
   /// Append a body. Bodies are validated and sorted at `build()`
   /// time, not at `add_body()` time, so callers may add bodies in
@@ -100,6 +105,7 @@ class CollisionWorldSnapshotBuilder {
   std::uint32_t snapshot_format_version_ = 1;
   std::uint64_t revision_id_ = 0;
   std::int64_t emitted_at_ns_ = 0;
+  std::vector<CollisionRobotModelFrame> robot_model_frames_;
   std::vector<CollisionWorldBody> bodies_;
 };
 

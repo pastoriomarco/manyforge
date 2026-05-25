@@ -19,6 +19,8 @@ import type {
   RuntimeStatus,
   ModelEndpointCatalog,
   SceneStateResponse,
+  SceneAuthoredSyncRequest,
+  SceneAuthoredSyncResponse,
   SceneEditRequest,
   SceneEditResponse,
   SceneFramesResponse,
@@ -250,6 +252,8 @@ export const api = {
       request<unknown>('POST', '/api/scene/program-resource/update', payload),
     edit: (payload: SceneEditRequest) =>
       request<SceneEditResponse>('POST', '/api/scene/edit', payload),
+    syncAuthored: (payload: SceneAuthoredSyncRequest) =>
+      request<SceneAuthoredSyncResponse>('POST', '/api/scene/sync-authored', payload),
     frames: () => request<SceneFramesResponse>('GET', '/api/scene/frames'),
     setFrameVisibility: (frameName: string, visible: boolean) =>
       request<SceneFrameVisibilityResponse>('POST', '/api/scene/frames/visibility', { frameName, visible }),

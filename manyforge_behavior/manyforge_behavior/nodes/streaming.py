@@ -217,6 +217,7 @@ class TrackTargetAction(py_trees.behaviour.Behaviour):
             self._terminated_externally = True
             return py_trees.common.Status.SUCCESS
         if status.state in (
+            ExecutionState.INTERRUPTED,
             ExecutionState.FAILED,
             ExecutionState.INTERVENTION_REQUIRED,
         ):

@@ -637,6 +637,7 @@ class CycleManager:
                 ExecutionState.EXECUTING,
                 ExecutionState.PLANNING,
                 ExecutionState.VALIDATING,
+                ExecutionState.INTERRUPTED,
                 ExecutionState.PAUSED,
                 ExecutionState.STOPPING,
             }
@@ -720,6 +721,7 @@ class CycleManager:
         # supervisory Run; the operator must end/stop them first.
         active_session_states = (
             ExecutionState.STREAMING,
+            ExecutionState.INTERRUPTED,
             ExecutionState.STOPPING,
         )
         if kernel_status.state in active_session_states:

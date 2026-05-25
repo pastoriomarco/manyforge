@@ -236,6 +236,40 @@ bool robot_collision_body_id_matches_link(const core::CollisionBodyId& body_id,
   return body_id.rfind(prefix, 0) == 0;
 }
 
+std::optional<std::string> robot_link_from_collision_body_id(
+    const core::CollisionBodyId& body_id,
+    const std::string& robot_id) {
+  const std::string prefix = "robot/" + robot_id + "/link/";
+  if (body_id.rfind(prefix, 0) != 0) {
+    return std::nullopt;
+  }
+  const auto begin = prefix.size();
+  const auto collision_pos = body_id.find("/collision/", begin);
+  if (collision_pos == std::string::npos || collision_pos == begin) {
+    return std::nullopt;
+  }
+  return body_id.substr(begin, collision_pos - begin);
+}
+
+bool link_is_static_wrt_group(const pinocchio::Model& model,
+                              const std::string& link_name,
+                              const std::set<std::string>& group_joint_names) {
+  if (group_joint_names.empty() || !model.existFrame(link_name)) {
+    return false;
+  }
+  auto joint_id = model.frames[model.getFrameId(link_name)].parentJoint;
+  while (joint_id > 0 && static_cast<std::size_t>(joint_id) < model.parents.size()) {
+    if (static_cast<std::size_t>(joint_id) < model.names.size() &&
+        static_cast<std::size_t>(joint_id) < model.nqs.size() &&
+        model.nqs[joint_id] > 0 &&
+        group_joint_names.find(model.names[joint_id]) != group_joint_names.end()) {
+      return false;
+    }
+    joint_id = model.parents[joint_id];
+  }
+  return true;
+}
+
 core::Vector3DTO vector3_from_eigen(const Eigen::Vector3d& value) {
   core::Vector3DTO out;
   out.x_m = value.x();
@@ -1786,6 +1820,10 @@ RoboPlanPlanningContext::geometry_descriptor_for_shape_locked(
           descriptor.geometry_kind = core::CollisionGeometryKind::kTriangleMesh;
           descriptor.source_uri = concrete.resource_uri;
           descriptor.source_hash = effective_mesh_source_hash(concrete);
+          descriptor.mesh_scale = core::Vector3DTO{
+              concrete.scale.x_m == 0.0 ? 1.0 : concrete.scale.x_m,
+              concrete.scale.y_m == 0.0 ? 1.0 : concrete.scale.y_m,
+              concrete.scale.z_m == 0.0 ? 1.0 : concrete.scale.z_m};
           add_common_quality_label(descriptor, "mesh");
           add_common_quality_label(descriptor, "collision_mesh");
         }
@@ -1840,6 +1878,12 @@ RoboPlanPlanningContext::build_collision_world_snapshot_locked() const {
   builder.set_publisher_id("roboplan_context")
       .set_revision_id(world_revision_id_)
       .set_emitted_at_ns(static_cast<std::int64_t>(steady_now_ns()));
+
+  core::CollisionRobotModelFrame robot_frame;
+  robot_frame.robot_id = robot_id;
+  robot_frame.model_frame_id = "base_link";
+  robot_frame.world_pose = matrix_to_pose(world_from_robot_base_);
+  builder.add_robot_model_frame(std::move(robot_frame));
 
   for (auto& body : robot_snapshot_bodies_locked(robot_id)) {
     builder.add_body(std::move(body));
@@ -1913,6 +1957,41 @@ RoboPlanPlanningContext::build_collision_policy_snapshot_locked(
   }
 
   const auto robot_bodies = robot_snapshot_bodies_locked(robot_id);
+  std::set<std::string> group_joint_names;
+  if (const auto maybe_group_info = scene_->getJointGroupInfo(group_name_);
+      maybe_group_info.has_value()) {
+    group_joint_names.insert(maybe_group_info->joint_names.begin(),
+                             maybe_group_info->joint_names.end());
+  }
+  std::vector<core::CollisionBodyId> static_robot_bodies;
+  const auto& model = scene_->getModel();
+  for (const auto& robot_body : robot_bodies) {
+    auto link = robot_link_from_collision_body_id(robot_body.body_id, robot_id);
+    if (!link) {
+      continue;
+    }
+    if (link_is_static_wrt_group(model, *link, group_joint_names)) {
+      static_robot_bodies.push_back(robot_body.body_id);
+    }
+  }
+
+  // Fixed robot-base geometry is world-static for this trajectory. Contacts
+  // between that geometry and detached scene objects are scene-health data, not
+  // motion validation blockers. Moving robot links remain fully checked.
+  for (const auto& robot_body_id : static_robot_bodies) {
+    for (const auto& [object_id, tracked] : object_states_) {
+      if (tracked.attached) {
+        continue;
+      }
+      for (const auto& object_body_id :
+           object_body_ids_for_state_locked(object_id, tracked)) {
+        add_pair(policy.allowed_static_static_pairs,
+                 robot_body_id,
+                 object_body_id);
+      }
+    }
+  }
+
   for (const auto& [object_id, tracked] : object_states_) {
     if (!tracked.attached || tracked.touch_links.empty()) {
       continue;
@@ -2217,12 +2296,26 @@ bool RoboPlanPlanningContext::infer_attached_from_frame(
   return !is_world_frame(frame_id) && frame_id != "base_link";
 }
 
+std::vector<std::string> RoboPlanPlanningContext::normalize_touch_links_locked(
+    const std::vector<std::string>& touch_links) const {
+  std::set<std::string> normalized;
+  for (const auto& link_name : touch_links) {
+    if (link_name.empty()) {
+      continue;
+    }
+    normalized.insert(link_name);
+  }
+
+  return {normalized.begin(), normalized.end()};
+}
+
 tl::expected<void, std::string> RoboPlanPlanningContext::set_touch_links_locked(
     const std::string& object_id,
     const std::vector<std::string>& touch_links,
     bool enable) {
+  const auto effective_touch_links = normalize_touch_links_locked(touch_links);
   std::vector<std::string> applied;
-  for (const auto& link_name : touch_links) {
+  for (const auto& link_name : effective_touch_links) {
     auto result = scene_->setCollisions(object_id, link_name, enable);
     if (!result.has_value()) {
       // Best-effort rollback keeps touch-link updates transactional for the
@@ -3006,8 +3099,10 @@ core::SceneEditResultDTO RoboPlanPlanningContext::attach_object(
       return result;
     }
     if (!request.touch_links.empty()) {
+      const auto effective_touch_links =
+          normalize_touch_links_locked(request.touch_links);
       auto collision_result =
-          set_touch_links_locked(request.object_id, request.touch_links, false);
+          set_touch_links_locked(request.object_id, effective_touch_links, false);
       if (!collision_result.has_value()) {
         publish_collision_world_revision_locked(
             core::CollisionWorldMutationSource::kAttach,
@@ -3023,7 +3118,7 @@ core::SceneEditResultDTO RoboPlanPlanningContext::attach_object(
             },
         };
       }
-      tracked.touch_links = request.touch_links;
+      tracked.touch_links = effective_touch_links;
     }
     publish_collision_world_revision_locked(
         core::CollisionWorldMutationSource::kAttach,

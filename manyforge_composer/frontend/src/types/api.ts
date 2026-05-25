@@ -92,6 +92,8 @@ export interface ProgramInfo {
   parameters: ProgramParameter[];
   blackboard: ProgramBlackboard;
   sourcePath: string;
+  programSessionGeneration: number;
+  programTreeHash: string;
 }
 
 export interface ProgramSceneResource {
@@ -826,6 +828,31 @@ export interface SceneEditResponse {
   success: boolean;
   error?: string | null;
   timestamp_ns: number;
+}
+
+export interface SceneAuthoredSyncRequest {
+  programSessionGeneration: number;
+  programTreeHash?: string | null;
+  sceneSignature: string;
+  sceneResources: ProgramSceneResource[];
+}
+
+export interface SceneAuthoredSyncResponse {
+  success: boolean;
+  syncId: string;
+  programSessionGeneration: number;
+  programTreeHash: string;
+  sceneSignature: string;
+  added: string[];
+  updated: string[];
+  removed: string[];
+  unchanged: string[];
+  failedObjectId?: string | null;
+  error?: string | null;
+  visualRefreshRequested: boolean;
+  visualPublishRequested: boolean;
+  startedNs: number;
+  completedNs: number;
 }
 
 /**

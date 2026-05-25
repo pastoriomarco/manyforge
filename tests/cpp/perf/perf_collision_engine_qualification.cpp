@@ -371,7 +371,7 @@ bool setup_fixture(RoboPlanPlanningContext& context, FixtureEvidence& evidence) 
     }
     return true;
   }
-  if (name == "unsupported_mesh_fail_closed") {
+  if (name == "mesh_scene_object") {
     return add_object_checked(context, mesh_object("phase4_mesh"), evidence);
   }
   if (name == "isaac_like_primitive_cell") {
@@ -702,12 +702,10 @@ int main() {
                     .profile = "attached_primitive",
                     .expect_manyforge_vs_roboplan_match = true,
                     .expect_attached_object = true},
-      FixtureConfig{.name = "unsupported_mesh_fail_closed",
-                    .profile = "unsupported_mesh",
-                    .expect_manyforge_vs_roboplan_match = false,
-                    .expect_unsupported_fail_closed = true,
-                    .validate_trajectory = false,
-                    .query_iterations = 10},
+      FixtureConfig{.name = "mesh_scene_object",
+                    .profile = "mesh_scene_object",
+                    .expect_manyforge_vs_roboplan_match = true,
+                    .query_iterations = 30},
       FixtureConfig{.name = "isaac_like_primitive_cell",
                     .profile = "isaac_like_primitive",
                     .expect_manyforge_vs_roboplan_match = true,

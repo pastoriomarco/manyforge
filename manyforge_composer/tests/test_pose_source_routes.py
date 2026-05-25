@@ -425,6 +425,33 @@ def test_continuous_unattached_snapshot_applies_only_while_detached(tmp_path: Pa
     assert state.kernel.scene_edits[-1].operation == "attach"
 
 
+def test_continuous_unattached_snapshot_updates_canonical_scene_while_cycle_running(
+    tmp_path: Path,
+) -> None:
+    client, state = _client(tmp_path)
+    state.deployment = _minimal_deployment(
+        pose_sources=_pose_sources(box_policy="continuous_unattached")
+    )
+    _add_box(client)
+    state.cycle_manager = SimpleNamespace(state=CycleState.RUNNING)
+
+    response = _post_fresh_box_snapshot(client)
+
+    apply_request = response.json()["continuous_apply"]
+    assert apply_request["success"] is True
+    assert apply_request["queued"] is True
+    apply_result = _wait_for_pose_source_apply(state)
+    assert apply_result["success"] is True
+    assert apply_result["applied_count"] == 1
+    assert apply_result["skipped_count"] == 0
+    detail = apply_result["details"][0]
+    assert detail["status"] == "applied"
+    assert detail["frame_id"] == "universe"
+    visual_objects, _meta = state.visual_scene_objects_snapshot()
+    assert visual_objects[0].pose_in_universe["position_m"] == [1.0, 2.0, 3.0]
+    assert state.kernel.scene_edits[-1].operation == "update_pose"
+
+
 def test_continuous_policy_is_not_operator_apply_route(tmp_path: Path) -> None:
     client, state = _client(tmp_path)
     state.deployment = _minimal_deployment(

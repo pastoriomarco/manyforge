@@ -82,6 +82,14 @@ CollisionWorldSnapshotBuilder fresh_builder() {
   return b;
 }
 
+CollisionRobotModelFrame make_robot_model_frame(double x = 0.0) {
+  CollisionRobotModelFrame frame;
+  frame.robot_id = "r1";
+  frame.model_frame_id = "base_link";
+  frame.world_pose = Pose3DTO{{x, 0.0, 0.0}, {0.0, 0.0, 0.0, 1.0}};
+  return frame;
+}
+
 // --- Happy path ---
 
 TEST(CollisionWorldSnapshotBuilder, BuildsMinimalSnapshot) {
@@ -93,11 +101,33 @@ TEST(CollisionWorldSnapshotBuilder, BuildsMinimalSnapshot) {
   EXPECT_EQ(snap.revision.revision_id, 1u);
   EXPECT_FALSE(snap.revision.content_hash.empty());
   EXPECT_EQ(snap.body_count, 1);
+  EXPECT_TRUE(snap.robot_model_frames.empty());
   EXPECT_EQ(snap.geometry_count, 1);
   EXPECT_EQ(snap.robot_link_count, 1);
   EXPECT_FALSE(snap.contains_mesh_geometry);
   EXPECT_TRUE(snap.all_bodies_have_geometry);
   EXPECT_FALSE(snap.bodies.front().body_content_hash.empty());
+}
+
+TEST(CollisionWorldSnapshotBuilder, CarriesSortedRobotModelFrames) {
+  CollisionRobotModelFrame b;
+  b.robot_id = "robot_b";
+  b.model_frame_id = "base_link";
+  b.world_pose = Pose3DTO{{0.2, 0.0, 0.0}, {0.0, 0.0, 0.0, 1.0}};
+  CollisionRobotModelFrame a;
+  a.robot_id = "robot_a";
+  a.model_frame_id = "base_link";
+  a.world_pose = Pose3DTO{{0.1, 0.0, 0.0}, {0.0, 0.0, 0.0, 1.0}};
+
+  auto result = fresh_builder()
+                    .add_robot_model_frame(std::move(b))
+                    .add_robot_model_frame(std::move(a))
+                    .add_body(make_robot_link("link1"))
+                    .build();
+  ASSERT_TRUE(result.ok()) << result.error().message;
+  ASSERT_EQ(result.value().robot_model_frames.size(), 2u);
+  EXPECT_EQ(result.value().robot_model_frames[0].robot_id, "robot_a");
+  EXPECT_EQ(result.value().robot_model_frames[1].robot_id, "robot_b");
 }
 
 TEST(CollisionWorldSnapshotBuilder, CountsByOwnerKind) {
@@ -173,10 +203,43 @@ TEST(CollisionWorldSnapshotBuilder, ContentHashChangesWhenPoseChanges) {
   EXPECT_NE(r1.value().revision.content_hash, r2.value().revision.content_hash);
 }
 
+TEST(CollisionWorldSnapshotBuilder,
+     ContentHashChangesWhenRobotModelFramePoseChanges) {
+  auto r1 = fresh_builder()
+                .add_robot_model_frame(make_robot_model_frame(0.0))
+                .add_body(make_robot_link("link1"))
+                .build();
+  auto r2 = fresh_builder()
+                .add_robot_model_frame(make_robot_model_frame(0.1))
+                .add_body(make_robot_link("link1"))
+                .build();
+  ASSERT_TRUE(r1.ok());
+  ASSERT_TRUE(r2.ok());
+  EXPECT_NE(r1.value().revision.content_hash,
+            r2.value().revision.content_hash);
+}
+
 TEST(CollisionWorldSnapshotBuilder, ContentHashChangesWhenBoxDimensionsChange) {
   CollisionWorldBody a = make_robot_link("link1");
   CollisionWorldBody b = make_robot_link("link1");
   b.geometries.front().box_dimensions_m = Vector3DTO{0.2, 0.1, 0.1};
+
+  auto r1 = fresh_builder().add_body(std::move(a)).build();
+  auto r2 = fresh_builder().add_body(std::move(b)).build();
+  ASSERT_TRUE(r1.ok());
+  ASSERT_TRUE(r2.ok());
+  EXPECT_NE(r1.value().revision.content_hash, r2.value().revision.content_hash);
+}
+
+TEST(CollisionWorldSnapshotBuilder, ContentHashChangesWhenMeshScaleChanges) {
+  CollisionWorldBody a = make_robot_link("mesh_link");
+  a.geometries.front().geometry_kind = CollisionGeometryKind::kTriangleMesh;
+  a.geometries.front().box_dimensions_m.reset();
+  a.geometries.front().source_hash = "mesh-hash";
+  a.geometries.front().mesh_scale = Vector3DTO{1.0, 1.0, 1.0};
+
+  CollisionWorldBody b = a;
+  b.geometries.front().mesh_scale = Vector3DTO{1.0, 1.5, 1.15};
 
   auto r1 = fresh_builder().add_body(std::move(a)).build();
   auto r2 = fresh_builder().add_body(std::move(b)).build();
@@ -285,6 +348,27 @@ TEST(CollisionWorldSnapshotBuilder, RejectsNegativeEmissionTime) {
   ASSERT_FALSE(result.ok());
 }
 
+TEST(CollisionWorldSnapshotBuilder, RejectsInvalidRobotModelFrame) {
+  CollisionRobotModelFrame invalid = make_robot_model_frame();
+  invalid.model_frame_id.clear();
+  auto result = fresh_builder()
+                    .add_robot_model_frame(std::move(invalid))
+                    .add_body(make_robot_link("link1"))
+                    .build();
+  ASSERT_FALSE(result.ok());
+  EXPECT_EQ(result.error().code, "invariant_violation");
+}
+
+TEST(CollisionWorldSnapshotBuilder, RejectsDuplicateRobotModelFrame) {
+  auto result = fresh_builder()
+                    .add_robot_model_frame(make_robot_model_frame())
+                    .add_robot_model_frame(make_robot_model_frame())
+                    .add_body(make_robot_link("link1"))
+                    .build();
+  ASSERT_FALSE(result.ok());
+  EXPECT_EQ(result.error().code, "invariant_violation");
+}
+
 TEST(CollisionWorldSnapshotBuilder, RejectsDuplicateBodyIds) {
   auto result = fresh_builder()
                     .add_body(make_robot_link("link1"))
@@ -364,6 +448,13 @@ TEST(CollisionWorldSnapshotBuilder, RejectsUnrelatedPrimitiveDimensions) {
   ASSERT_FALSE(result.ok());
 }
 
+TEST(CollisionWorldSnapshotBuilder, RejectsPrimitiveWithMeshScale) {
+  CollisionWorldBody body = make_robot_link("link1");
+  body.geometries.front().mesh_scale = Vector3DTO{1.0, 1.0, 1.0};
+  auto result = fresh_builder().add_body(std::move(body)).build();
+  ASSERT_FALSE(result.ok());
+}
+
 TEST(CollisionWorldSnapshotBuilder, RejectsMeshWithoutSourceIdentity) {
   CollisionWorldBody body = make_robot_link("mesh_link");
   body.geometries.front().geometry_kind = CollisionGeometryKind::kTriangleMesh;
@@ -380,6 +471,16 @@ TEST(CollisionWorldSnapshotBuilder, AcceptsMeshWithSourceHash) {
   auto result = fresh_builder().add_body(std::move(body)).build();
   ASSERT_TRUE(result.ok()) << result.error().message;
   EXPECT_TRUE(result.value().contains_mesh_geometry);
+}
+
+TEST(CollisionWorldSnapshotBuilder, RejectsMeshWithInvalidScale) {
+  CollisionWorldBody body = make_robot_link("mesh_link");
+  body.geometries.front().geometry_kind = CollisionGeometryKind::kTriangleMesh;
+  body.geometries.front().box_dimensions_m.reset();
+  body.geometries.front().source_hash = "mesh-hash";
+  body.geometries.front().mesh_scale = Vector3DTO{1.0, 0.0, 1.0};
+  auto result = fresh_builder().add_body(std::move(body)).build();
+  ASSERT_FALSE(result.ok());
 }
 
 TEST(CollisionWorldSnapshotBuilder, RejectsAttachedWithoutParentLink) {

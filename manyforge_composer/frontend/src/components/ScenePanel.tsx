@@ -4,8 +4,6 @@ import { useCycleStore, useEditLocked } from '../store/cycleStore';
 import { useProgramStore } from '../store/programStore';
 import type {
   ProgramSceneResource,
-  SceneEditRequest,
-  SceneEditResponse,
   SceneFrameState,
   SceneObjectState,
   SceneStateResponse,
@@ -26,12 +24,6 @@ function emitSceneSyncStatus(error: string | null): void {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
-}
-
-function assertSceneEditSuccess(response: SceneEditResponse): void {
-  if (!response.success) {
-    throw new Error(response.error ?? 'Scene edit failed');
-  }
 }
 
 function Section({ title, children }: { title: string; children: React.ReactNode }) {
@@ -326,65 +318,6 @@ function shapeSummary(shape: Record<string, unknown> | null | undefined): string
     return `mesh (${uri})`;
   }
   return String(shape.type);
-}
-
-function sameShape(
-  liveShape: Record<string, unknown> | null | undefined,
-  desiredShape: Record<string, unknown> | null | undefined,
-): boolean {
-  return JSON.stringify(liveShape ?? null) === JSON.stringify(desiredShape ?? null);
-}
-
-function buildAddPayload(resource: ProgramSceneResource): SceneEditRequest {
-  const pose = sceneResourcePose(resource);
-  const shape = resource.shape ?? {};
-  const shapeType =
-    shape.type === 'sphere' || shape.type === 'cylinder' || shape.type === 'mesh'
-      ? shape.type
-      : 'box';
-  return {
-    operation: 'add',
-    object_id: resource.objectId,
-    shape_type: shapeType,
-    box_dimensions_m:
-      shape.type === 'box' && Array.isArray(shape.box_dimensions_m)
-        ? (shape.box_dimensions_m as number[])
-        : undefined,
-    sphere_radius_m:
-      shape.type === 'sphere' && Number.isFinite(Number(shape.sphere_radius_m))
-        ? Number(shape.sphere_radius_m)
-        : undefined,
-    cylinder_radius_m:
-      shape.type === 'cylinder' && Number.isFinite(Number(shape.cylinder_radius_m))
-        ? Number(shape.cylinder_radius_m)
-        : undefined,
-    cylinder_height_m:
-      shape.type === 'cylinder' && Number.isFinite(Number(shape.cylinder_height_m))
-        ? Number(shape.cylinder_height_m)
-        : undefined,
-    mesh_resource_uri:
-      shape.type === 'mesh' && typeof shape.mesh_resource_uri === 'string'
-        ? shape.mesh_resource_uri
-        : undefined,
-    mesh_scale:
-      shape.type === 'mesh' && Array.isArray(shape.mesh_scale)
-        ? (shape.mesh_scale as number[])
-        : undefined,
-    pose_position_m: pose.position,
-    pose_orientation_xyzw: buildPoseOrientationQuaternion(resource.pose ?? {}),
-    frame_id: pose.frameId,
-  };
-}
-
-function buildUpdatePosePayload(resource: ProgramSceneResource): SceneEditRequest {
-  const pose = sceneResourcePose(resource);
-  return {
-    operation: 'update_pose',
-    object_id: resource.objectId,
-    pose_position_m: pose.position,
-    pose_orientation_xyzw: buildPoseOrientationQuaternion(resource.pose ?? {}),
-    frame_id: pose.frameId,
-  };
 }
 
 function authoredSceneSignature(sceneResources: ProgramSceneResource[]): string {
@@ -769,43 +702,17 @@ export function SceneDraftMirror() {
     const sync = async () => {
       inFlightRef.current = true;
       try {
-        const liveState = await api.scene.state();
+        const result = await api.scene.syncAuthored({
+          programSessionGeneration: programInfo.programSessionGeneration,
+          programTreeHash: programInfo.programTreeHash,
+          sceneSignature,
+          sceneResources,
+        });
         if (cancelled) {
           return;
         }
-
-        const desiredById = new Map(sceneResources.map((resource) => [resource.objectId, resource]));
-        const liveById = new Map(liveState.objects.map((objectState) => [objectState.object_id, objectState]));
-
-        for (const objectState of liveState.objects) {
-          if (objectState.source === 'authored' && !desiredById.has(objectState.object_id)) {
-            assertSceneEditSuccess(
-              await api.scene.edit({ operation: 'remove', object_id: objectState.object_id }),
-            );
-          }
-        }
-
-        for (const resource of sceneResources) {
-          const liveObject = liveById.get(resource.objectId);
-          if (liveObject == null) {
-            assertSceneEditSuccess(await api.scene.edit(buildAddPayload(resource)));
-            continue;
-          }
-
-          const requiresRecreate =
-            liveObject.attached
-            || liveObject.source !== 'authored'
-            || !sameShape(liveObject.shape as Record<string, unknown> | null | undefined, resource.shape);
-
-          if (requiresRecreate) {
-            assertSceneEditSuccess(
-              await api.scene.edit({ operation: 'remove', object_id: resource.objectId }),
-            );
-            assertSceneEditSuccess(await api.scene.edit(buildAddPayload(resource)));
-            continue;
-          }
-
-          assertSceneEditSuccess(await api.scene.edit(buildUpdatePosePayload(resource)));
+        if (!result.success) {
+          throw new Error(result.error ?? 'Authored scene sync failed');
         }
 
         emitSceneMutated();

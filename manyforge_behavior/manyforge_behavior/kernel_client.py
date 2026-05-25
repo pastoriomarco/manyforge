@@ -17,6 +17,7 @@ class ExecutionState(Enum):
     VALIDATING = "validating"
     EXECUTING = "executing"
     STREAMING = "streaming"  # ADR-0016: streaming-session execution mode
+    INTERRUPTED = "interrupted"
     PAUSED = "paused"
     STOPPING = "stopping"
     STOPPED = "stopped"
@@ -780,6 +781,7 @@ class MockKernelClient(KernelClient):
             ExecutionState.EXECUTING,
             ExecutionState.PLANNING,
             ExecutionState.VALIDATING,
+            ExecutionState.INTERRUPTED,
             ExecutionState.PAUSED,
             ExecutionState.STOPPING,
         }

@@ -421,6 +421,7 @@ class MoveManipulatorAction(py_trees.behaviour.Behaviour):
             ExecutionState.PLANNING,
             ExecutionState.VALIDATING,
             ExecutionState.EXECUTING,
+            ExecutionState.INTERRUPTED,
             ExecutionState.PAUSED,
             ExecutionState.STOPPING,
         }

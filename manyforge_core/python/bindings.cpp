@@ -856,6 +856,8 @@ PYBIND11_MODULE(manyforge_core_py, m) {
         .def_readwrite(
             "capsule_height_m",
             &manyforge::core::CollisionGeometryDescriptor::capsule_height_m)
+        .def_readwrite("mesh_scale",
+                       &manyforge::core::CollisionGeometryDescriptor::mesh_scale)
         .def_readwrite("source_uri",
                        &manyforge::core::CollisionGeometryDescriptor::source_uri)
         .def_readwrite("source_hash",
@@ -893,6 +895,23 @@ PYBIND11_MODULE(manyforge_core_py, m) {
                 .format(b.body_id);
         });
 
+    py::class_<manyforge::core::CollisionRobotModelFrame>(
+        m, "CollisionRobotModelFrame")
+        .def(py::init<>())
+        .def_readwrite("robot_id",
+                       &manyforge::core::CollisionRobotModelFrame::robot_id)
+        .def_readwrite(
+            "model_frame_id",
+            &manyforge::core::CollisionRobotModelFrame::model_frame_id)
+        .def_readwrite("world_pose",
+                       &manyforge::core::CollisionRobotModelFrame::world_pose)
+        .def("__repr__", [](const manyforge::core::CollisionRobotModelFrame& f) {
+            return py::str(
+                       "CollisionRobotModelFrame(robot_id='{}', "
+                       "model_frame_id='{}')")
+                .format(f.robot_id, f.model_frame_id);
+        });
+
     py::class_<manyforge::core::CollisionWorldSnapshot,
                std::shared_ptr<manyforge::core::CollisionWorldSnapshot>>(
         m, "CollisionWorldSnapshot")
@@ -906,6 +925,9 @@ PYBIND11_MODULE(manyforge_core_py, m) {
                        &manyforge::core::CollisionWorldSnapshot::revision)
         .def_readwrite("emitted_at_ns",
                        &manyforge::core::CollisionWorldSnapshot::emitted_at_ns)
+        .def_readwrite(
+            "robot_model_frames",
+            &manyforge::core::CollisionWorldSnapshot::robot_model_frames)
         .def_readwrite("bodies",
                        &manyforge::core::CollisionWorldSnapshot::bodies)
         .def_readwrite("body_count",
@@ -958,6 +980,11 @@ PYBIND11_MODULE(manyforge_core_py, m) {
         .def(
             "set_emitted_at_ns",
             &manyforge::core::CollisionWorldSnapshotBuilder::set_emitted_at_ns,
+            py::return_value_policy::reference_internal)
+        .def(
+            "add_robot_model_frame",
+            &manyforge::core::CollisionWorldSnapshotBuilder::
+                add_robot_model_frame,
             py::return_value_policy::reference_internal)
         .def("add_body",
              &manyforge::core::CollisionWorldSnapshotBuilder::add_body,

@@ -372,6 +372,12 @@ ss -ltnp | grep -E ':(9000|8081|8000|8050|8100|8200)'
   ANSI cursor-up. For CI logs, set `MANYFORGE_PROGRESS_MODE=plain`;
   the helper reprints the full status block every 30 s instead of
   redrawing.
+- **Collision validation worker sizing** → authoritative trajectory
+  validation defaults to `MANYFORGE_VALIDATION_COLLISION_WORKERS=4`.
+  This is the baseline for Jetson Orin Nano-class and larger systems.
+  Use `MANYFORGE_VALIDATION_COLLISION_WORKERS=1` or `2` only when a
+  deployment's controller / observer latency qualification shows that
+  CPU headroom is too tight.
 - **`HEALTH_TIMEOUT_S` from old runbooks** → deprecated alias for
   `COMPOSER_READY_TIMEOUT_S`. Both work for one release; you'll see a
   one-time warning per launch. Switch your runbooks to the per-service

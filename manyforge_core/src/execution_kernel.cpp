@@ -146,14 +146,213 @@ ErrorCode error_code_from_dto(const ErrorDTO& error) {
   return ErrorCode::kInternalError;
 }
 
-bool collision_world_revision_is_set(const CollisionWorldRevision& revision) {
-  return revision.revision_id != 0 || !revision.content_hash.empty();
+std::string collision_engine_status_name(CollisionEngineStatus status) {
+  switch (status) {
+    case CollisionEngineStatus::kOk:
+      return "ok";
+    case CollisionEngineStatus::kTimeout:
+      return "timeout";
+    case CollisionEngineStatus::kUnsupportedGeometry:
+      return "unsupported_geometry";
+    case CollisionEngineStatus::kDiagnosticIncomplete:
+      return "diagnostic_incomplete";
+    case CollisionEngineStatus::kCancelled:
+      return "cancelled";
+    case CollisionEngineStatus::kEngineError:
+      return "engine_error";
+  }
+  return "unknown";
 }
 
-bool same_collision_world_revision(const CollisionWorldRevision& a,
-                                   const CollisionWorldRevision& b) {
-  return a.revision_id == b.revision_id &&
-         a.content_hash == b.content_hash;
+std::string collision_decision_result_name(CollisionDecisionResult decision) {
+  switch (decision) {
+    case CollisionDecisionResult::kPass:
+      return "pass";
+    case CollisionDecisionResult::kFail:
+      return "fail";
+    case CollisionDecisionResult::kWarn:
+      return "warn";
+    case CollisionDecisionResult::kStopRequested:
+      return "stop_requested";
+    case CollisionDecisionResult::kInconclusiveFail:
+      return "inconclusive_fail";
+  }
+  return "unknown";
+}
+
+std::string collision_pair_classification_name(
+    CollisionPairClassification classification) {
+  switch (classification) {
+    case CollisionPairClassification::kBlockingCollision:
+      return "blocking_collision";
+    case CollisionPairClassification::kAllowedStaticStatic:
+      return "allowed_static_static";
+    case CollisionPairClassification::kSupportContactStart:
+      return "support_contact_start";
+    case CollisionPairClassification::kSupportContactContinued:
+      return "support_contact_continued";
+    case CollisionPairClassification::kSupportContactSeparated:
+      return "support_contact_separated";
+    case CollisionPairClassification::kSupportContactRecontactViolation:
+      return "support_contact_recontact_violation";
+    case CollisionPairClassification::kAllowedTouchLink:
+      return "allowed_touch_link";
+    case CollisionPairClassification::kDiagnosticIncomplete:
+      return "diagnostic_incomplete";
+  }
+  return "unknown";
+}
+
+bool collision_pair_classification_blocks_dispatch(
+    CollisionPairClassification classification) {
+  switch (classification) {
+    case CollisionPairClassification::kBlockingCollision:
+    case CollisionPairClassification::kSupportContactRecontactViolation:
+    case CollisionPairClassification::kDiagnosticIncomplete:
+      return true;
+    case CollisionPairClassification::kAllowedStaticStatic:
+    case CollisionPairClassification::kSupportContactStart:
+    case CollisionPairClassification::kSupportContactContinued:
+    case CollisionPairClassification::kSupportContactSeparated:
+    case CollisionPairClassification::kAllowedTouchLink:
+      return false;
+  }
+  return true;
+}
+
+std::string collision_pair_name(const CollisionPairId& pair) {
+  return pair.body_a + " <-> " + pair.body_b;
+}
+
+void append_collision_failure_diagnostics(
+    std::map<std::string, std::string>& details,
+    const CollisionValidationDecisionBundle& bundle) {
+  const CollisionValidationWaypointRecord* selected = nullptr;
+  if (bundle.decision.first_failing_waypoint) {
+    for (const auto& record : bundle.waypoint_records) {
+      if (record.waypoint_index == *bundle.decision.first_failing_waypoint) {
+        selected = &record;
+        break;
+      }
+    }
+  }
+  if (selected == nullptr) {
+    for (const auto& record : bundle.waypoint_records) {
+      if (record.result.decision != CollisionDecisionResult::kPass ||
+          record.result.engine_status != CollisionEngineStatus::kOk) {
+        selected = &record;
+        break;
+      }
+    }
+  }
+  if (selected == nullptr) {
+    return;
+  }
+
+  const auto& result = selected->result;
+  details["collision_result_waypoint_index"] =
+      std::to_string(selected->waypoint_index);
+  if (result.query_id) {
+    details["collision_result_query_id"] = *result.query_id;
+  }
+  details["collision_result_engine_id"] = result.engine_id;
+  details["collision_result_engine_version"] = result.engine_version;
+  details["collision_result_engine_status"] =
+      collision_engine_status_name(result.engine_status);
+  details["collision_result_decision"] =
+      collision_decision_result_name(result.decision);
+  details["collision_result_in_collision"] =
+      result.in_collision ? "true" : "false";
+  details["collision_result_normalized_pair_count"] =
+      std::to_string(result.normalized_pairs.size());
+  if (!result.normalized_pairs.empty()) {
+    details["collision_result_first_pair"] =
+        collision_pair_name(result.normalized_pairs.front());
+  }
+  details["collision_result_classified_pair_count"] =
+      std::to_string(result.normalized_pairs_classified.size());
+  const CollisionPairResult* first_failure_pair = nullptr;
+  for (const auto& classified : result.normalized_pairs_classified) {
+    if (classified.is_first_failure) {
+      first_failure_pair = &classified;
+      break;
+    }
+  }
+  if (first_failure_pair == nullptr) {
+    for (const auto& classified : result.normalized_pairs_classified) {
+      if (collision_pair_classification_blocks_dispatch(
+              classified.classification)) {
+        first_failure_pair = &classified;
+        break;
+      }
+    }
+  }
+  if (first_failure_pair != nullptr) {
+    details["collision_result_first_failure_pair"] =
+        collision_pair_name(first_failure_pair->pair);
+    details["collision_result_first_failure_classification"] =
+        collision_pair_classification_name(first_failure_pair->classification);
+  }
+  std::size_t emitted = 0;
+  for (const auto& [key, value] : result.raw_diagnostics) {
+    if (emitted >= 8) {
+      details["collision_result_raw_diagnostics_truncated"] = "true";
+      break;
+    }
+    details["collision_result_raw_" + key] = value;
+    ++emitted;
+  }
+}
+
+const CollisionValidationWaypointRecord* select_collision_failure_record(
+    const CollisionValidationDecisionBundle& bundle) {
+  if (bundle.decision.first_failing_waypoint) {
+    for (const auto& record : bundle.waypoint_records) {
+      if (record.waypoint_index == *bundle.decision.first_failing_waypoint) {
+        return &record;
+      }
+    }
+  }
+  for (const auto& record : bundle.waypoint_records) {
+    if (record.result.decision != CollisionDecisionResult::kPass ||
+        record.result.engine_status != CollisionEngineStatus::kOk) {
+      return &record;
+    }
+  }
+  return nullptr;
+}
+
+CollisionCheckResultDTO collision_check_result_from_bundle(
+    const CollisionValidationDecisionBundle& bundle) {
+  CollisionCheckResultDTO check;
+  const auto* record = select_collision_failure_record(bundle);
+  if (record == nullptr) {
+    return check;
+  }
+
+  check.in_collision = record->result.in_collision;
+  if (!record->result.normalized_pairs.empty()) {
+    check.contact_body_a = record->result.normalized_pairs.front().body_a;
+    check.contact_body_b = record->result.normalized_pairs.front().body_b;
+  }
+  for (const auto& classified : record->result.normalized_pairs_classified) {
+    if (!collision_pair_classification_blocks_dispatch(
+            classified.classification)) {
+      continue;
+    }
+    check.contact_body_a = classified.pair.body_a;
+    check.contact_body_b = classified.pair.body_b;
+    break;
+  }
+  if (record->result.min_clearance_m &&
+      *record->result.min_clearance_m < 0.0) {
+    check.penetration_depth_m = -*record->result.min_clearance_m;
+  }
+  return check;
+}
+
+bool collision_world_revision_is_set(const CollisionWorldRevision& revision) {
+  return revision.revision_id != 0 || !revision.content_hash.empty();
 }
 
 constexpr const char* kRuntimeCollisionFaultSourceId =
@@ -232,20 +431,6 @@ InterruptIngestResult reject_interrupts_without_active_phase(
          std::nullopt});
   }
   return result;
-}
-
-ErrorDTO collision_world_changed_error(const CollisionWorldRevision& before,
-                                       const CollisionWorldRevision& after,
-                                       const std::string& phase) {
-  return ErrorDTO{
-      kErrorInvariantViolation,
-      "Collision world changed during trajectory validation",
-      {{"reason", "scene_changed_during_validation"},
-       {"phase", phase},
-       {"before_revision_id", std::to_string(before.revision_id)},
-       {"before_content_hash", before.content_hash},
-       {"after_revision_id", std::to_string(after.revision_id)},
-       {"after_content_hash", after.content_hash}}};
 }
 
 ErrorDTO authoritative_collision_validation_config_error(
@@ -793,7 +978,8 @@ void ExecutionKernel::install_builtin_interrupt_sources() {
 
 InterruptIngestResult
 ExecutionKernel::publish_runtime_collision_fault_interrupt(
-    const CollisionCheckResultDTO& check) {
+    const CollisionCheckResultDTO& check,
+    const std::map<std::string, std::string>& metadata) {
   InterruptSignalUpdate signal;
   signal.source_id = kRuntimeCollisionFaultSourceId;
   signal.sequence_id =
@@ -809,6 +995,9 @@ ExecutionKernel::publish_runtime_collision_fault_interrupt(
   }
   if (check.contact_body_b) {
     signal.metadata["contact_b"] = *check.contact_body_b;
+  }
+  for (const auto& [key, value] : metadata) {
+    signal.metadata[key] = value;
   }
   return publish_fast_interrupt_signal(signal);
 }
@@ -1374,19 +1563,9 @@ void ExecutionKernel::async_execute_worker(
       publish_execution_snapshot(std::move(validating_snapshot));
     }
 
-    emit_event({KernelEventType::kValidationStarted, exec_id, clock_.now(), {}, {}, std::nullopt, {}});
+  emit_event({KernelEventType::kValidationStarted, exec_id, clock_.now(), {}, {}, std::nullopt, {}});
 
     auto val_result = validate_trajectory(trajectory, request);
-    const auto validation_revision_after =
-        current_authoritative_collision_world_revision();
-    if (val_result.ok() &&
-        collision_world_revision_is_set(validation_revision_after) &&
-        !same_collision_world_revision(val_result.value(),
-                                       validation_revision_after)) {
-      val_result = Result<CollisionWorldRevision>::Err(collision_world_changed_error(
-          val_result.value(), validation_revision_after,
-          "pre_execution_validation"));
-    }
     if (!val_result.ok()) {
       if (validation_cancelled_by_interrupt(val_result.error()) &&
           sm_.status().state == ExecutionState::kInterrupted) {
@@ -1498,9 +1677,9 @@ void ExecutionKernel::async_execute_worker(
     if (request.cache_mode != CacheMode::kDisable && !cache_hit &&
         val_result.ok() &&
         collision_world_revision_is_set(val_result.value())) {
-      // Chunk 2: tag every cache entry with the collision-world revision
-      // that validation actually used. The post-validation equality check above
-      // ensures a trajectory validated at revision N is never stored as N+1.
+      // Tag every cache entry with the immutable snapshot revision that
+      // validation actually used. If live pose-source updates publish newer
+      // revisions before the next lookup, lookup_with_revision declines the hit.
       cache_.store(request.move_id, trajectory, val_result.value());
     }
 
@@ -1649,17 +1828,6 @@ void ExecutionKernel::async_execute_worker(
           auto resumed_trajectory =
               build_remaining_trajectory(active_trajectory, latest_backend_snapshot);
           auto resume_validation = validate_trajectory(resumed_trajectory, request);
-          const auto resume_revision_after =
-              current_authoritative_collision_world_revision();
-          if (resume_validation.ok() &&
-              collision_world_revision_is_set(resume_revision_after) &&
-              !same_collision_world_revision(resume_validation.value(),
-                                             resume_revision_after)) {
-            resume_validation = Result<CollisionWorldRevision>::Err(
-                collision_world_changed_error(
-                    resume_validation.value(), resume_revision_after,
-                    "resume_validation"));
-          }
           if (!resume_validation.ok()) {
             if (validation_cancelled_by_interrupt(resume_validation.error()) &&
                 sm_.status().state == ExecutionState::kInterrupted) {
@@ -2531,40 +2699,168 @@ Result<void> ExecutionKernel::collision_check_tick() {
     return Result<void>::Ok();
   }
 
-  try {
-    auto state = context_.get_current_state();
-    CollisionCheckRequestDTO req;
-    req.robot_state = state;
-    auto check = context_.collision_check(req);
-
-    if (check.in_collision) {
-      KernelEvent collision_event;
-      collision_event.type = KernelEventType::kCollisionDetected;
-      collision_event.execution_id = sm_.status().execution_id;
-      collision_event.timestamp_ns = clock_.now();
-      collision_event.details["surface"] = "observed_runtime_monitor";
-      collision_event.details["contact_a"] = check.contact_body_a.value_or("");
-      collision_event.details["contact_b"] = check.contact_body_b.value_or("");
-      emit_event(collision_event);
-      {
-        std::lock_guard<std::mutex> collision_metrics_lock(metrics_mutex_);
-        metrics_.collision_detections++;
-      }
-      cache_.invalidate_all();
-      auto interrupt = publish_runtime_collision_fault_interrupt(check);
-      if (interrupt.rejected) {
-        return Result<void>::Err(
-            ErrorDTO{kErrorInvalidRequest,
-                     "Runtime collision interrupt signal rejected",
-                     {{"reason", interrupt.reason}}});
-      }
+  auto publish_runtime_monitor_fault =
+      [this](CollisionCheckResultDTO check,
+             std::map<std::string, std::string> details) -> Result<void> {
+    details["surface"] = "observed_runtime_monitor";
+    KernelEvent collision_event;
+    collision_event.type = KernelEventType::kCollisionDetected;
+    collision_event.execution_id = sm_.status().execution_id;
+    collision_event.timestamp_ns = clock_.now();
+    collision_event.details = details;
+    if (check.contact_body_a) {
+      collision_event.details["contact_a"] = *check.contact_body_a;
+    }
+    if (check.contact_body_b) {
+      collision_event.details["contact_b"] = *check.contact_body_b;
+    }
+    emit_event(collision_event);
+    {
+      std::lock_guard<std::mutex> collision_metrics_lock(metrics_mutex_);
+      metrics_.collision_detections++;
+    }
+    cache_.invalidate_all();
+    auto interrupt = publish_runtime_collision_fault_interrupt(
+        check, collision_event.details);
+    if (interrupt.rejected) {
+      return Result<void>::Err(
+          ErrorDTO{kErrorInvalidRequest,
+                   "Runtime collision interrupt signal rejected",
+                   {{"reason", interrupt.reason}}});
     }
     return Result<void>::Ok();
-  } catch (const std::exception& e) {
-    return Result<void>::Err(
-        ErrorDTO{kErrorInternalError,
-                 std::string("Collision check exception: ") + e.what(), {}});
+  };
+
+  std::optional<CollisionPolicySnapshot> policy_snapshot;
+  ICollisionWorldSnapshotPublisher* snapshot_publisher = nullptr;
+  std::vector<std::shared_ptr<ICollisionQueryEngine>> validation_engines;
+  {
+    std::scoped_lock lock(coordinator_mutex_);
+    policy_snapshot = coordinator_policy_snapshot_;
+    snapshot_publisher = collision_snapshot_publisher_;
+    validation_engines = collision_validation_engines_;
   }
+
+  std::map<std::string, std::string> monitor_details;
+  monitor_details["reason_code"] = "runtime_collision_monitor";
+  if (snapshot_publisher == nullptr) {
+    monitor_details["reason"] = "missing_collision_world_snapshot_publisher";
+    return publish_runtime_monitor_fault(CollisionCheckResultDTO{}, monitor_details);
+  }
+  if (validation_engines.empty()) {
+    monitor_details["reason"] = "missing_collision_query_engines";
+    return publish_runtime_monitor_fault(CollisionCheckResultDTO{}, monitor_details);
+  }
+
+  CollisionWorldSnapshotPtr world_snapshot;
+  try {
+    world_snapshot = snapshot_publisher->snapshot();
+  } catch (const std::exception& e) {
+    monitor_details["reason"] = "snapshot_publisher_exception";
+    monitor_details["exception"] = e.what();
+    return publish_runtime_monitor_fault(CollisionCheckResultDTO{}, monitor_details);
+  } catch (...) {
+    monitor_details["reason"] = "snapshot_publisher_exception";
+    monitor_details["exception"] = "unknown";
+    return publish_runtime_monitor_fault(CollisionCheckResultDTO{}, monitor_details);
+  }
+  if (!world_snapshot) {
+    monitor_details["reason"] = "snapshot_unavailable";
+    return publish_runtime_monitor_fault(CollisionCheckResultDTO{}, monitor_details);
+  }
+
+  try {
+    if (auto publisher_policy =
+            snapshot_publisher->collision_policy_snapshot()) {
+      policy_snapshot = std::move(publisher_policy);
+    }
+  } catch (const std::exception& e) {
+    monitor_details["reason"] = "policy_publisher_exception";
+    monitor_details["exception"] = e.what();
+    return publish_runtime_monitor_fault(CollisionCheckResultDTO{}, monitor_details);
+  } catch (...) {
+    monitor_details["reason"] = "policy_publisher_exception";
+    monitor_details["exception"] = "unknown";
+    return publish_runtime_monitor_fault(CollisionCheckResultDTO{}, monitor_details);
+  }
+  if (!policy_snapshot) {
+    monitor_details["reason"] = "missing_collision_policy_snapshot";
+    return publish_runtime_monitor_fault(CollisionCheckResultDTO{}, monitor_details);
+  }
+
+  ICollisionQueryEngine* engine = nullptr;
+  for (const auto& candidate : validation_engines) {
+    if (candidate) {
+      engine = candidate.get();
+      break;
+    }
+  }
+  if (engine == nullptr) {
+    monitor_details["reason"] = "missing_collision_query_engines";
+    return publish_runtime_monitor_fault(CollisionCheckResultDTO{}, monitor_details);
+  }
+
+  RobotStateDTO state;
+  try {
+    state = context_.get_current_state();
+  } catch (const std::exception& e) {
+    monitor_details["reason"] = "state_unavailable";
+    monitor_details["exception"] = e.what();
+    return publish_runtime_monitor_fault(CollisionCheckResultDTO{}, monitor_details);
+  } catch (...) {
+    monitor_details["reason"] = "state_unavailable";
+    monitor_details["exception"] = "unknown";
+    return publish_runtime_monitor_fault(CollisionCheckResultDTO{}, monitor_details);
+  }
+
+  TrajectoryDTO one_state;
+  one_state.joint_names = state.joint_names;
+  one_state.waypoints.push_back(TrajectoryWaypointDTO{
+      0.0,
+      state.positions_rad,
+      state.velocities_rad_s,
+      {}});
+
+  CollisionValidationPassConfig cfg;
+  cfg.policy_snapshot = *policy_snapshot;
+  cfg.require_pose_source_borrow = false;
+  cfg.surface = CollisionSurface::kObservedRuntimeMonitor;
+  cfg.per_state_timeout_ns =
+      static_cast<std::int64_t>(config_.collision_monitor_period_ns / 2);
+  CollisionValidationCoordinator coord(std::move(cfg));
+  CollisionCancellationToken cancel;
+  CollisionValidationDecisionBundle bundle;
+  try {
+    bundle = coord.validate_trajectory(*world_snapshot, *engine, one_state, cancel);
+  } catch (const std::exception& e) {
+    monitor_details["reason"] = "runtime_collision_engine_exception";
+    monitor_details["exception"] = e.what();
+    monitor_details["collision_world_revision_id"] =
+        std::to_string(world_snapshot->revision.revision_id);
+    return publish_runtime_monitor_fault(CollisionCheckResultDTO{}, monitor_details);
+  } catch (...) {
+    monitor_details["reason"] = "runtime_collision_engine_exception";
+    monitor_details["exception"] = "unknown";
+    monitor_details["collision_world_revision_id"] =
+        std::to_string(world_snapshot->revision.revision_id);
+    return publish_runtime_monitor_fault(CollisionCheckResultDTO{}, monitor_details);
+  }
+
+  if (bundle.decision.accepted) {
+    return Result<void>::Ok();
+  }
+
+  monitor_details["reason"] =
+      bundle.decision.action == CollisionDecisionAction::kInconclusive
+          ? "runtime_collision_monitor_inconclusive"
+          : "runtime_collision_detected";
+  monitor_details["collision_world_revision_id"] =
+      std::to_string(bundle.borrowed_world_revision.revision_id);
+  monitor_details["collision_world_content_hash"] =
+      bundle.borrowed_world_revision.content_hash;
+  append_collision_failure_diagnostics(monitor_details, bundle);
+  return publish_runtime_monitor_fault(collision_check_result_from_bundle(bundle),
+                                       std::move(monitor_details));
 }
 
 Result<TrajectoryDTO> ExecutionKernel::plan_trajectory(
@@ -2687,42 +2983,6 @@ Result<CollisionWorldRevision> ExecutionKernel::validate_trajectory(
         "missing_collision_query_engines"));
   }
 
-  CollisionWorldSnapshotPtr world_snapshot;
-  try {
-    world_snapshot = snapshot_publisher->snapshot();
-  } catch (const std::exception& e) {
-    return Result<CollisionWorldRevision>::Err(authoritative_collision_validation_config_error(
-        "snapshot_publisher_exception",
-        {{"exception", e.what()}}));
-  } catch (...) {
-    return Result<CollisionWorldRevision>::Err(authoritative_collision_validation_config_error(
-        "snapshot_publisher_exception",
-        {{"exception", "unknown"}}));
-  }
-  if (!world_snapshot) {
-    return Result<CollisionWorldRevision>::Err(authoritative_collision_validation_config_error(
-        "snapshot_unavailable"));
-  }
-
-  try {
-    if (auto publisher_policy =
-            snapshot_publisher->collision_policy_snapshot()) {
-      snapshot = std::move(publisher_policy);
-    }
-  } catch (const std::exception& e) {
-    return Result<CollisionWorldRevision>::Err(authoritative_collision_validation_config_error(
-        "policy_publisher_exception",
-        {{"exception", e.what()}}));
-  } catch (...) {
-    return Result<CollisionWorldRevision>::Err(authoritative_collision_validation_config_error(
-        "policy_publisher_exception",
-        {{"exception", "unknown"}}));
-  }
-  if (!snapshot) {
-    return Result<CollisionWorldRevision>::Err(authoritative_collision_validation_config_error(
-        "missing_collision_policy_snapshot"));
-  }
-
   std::vector<ICollisionQueryEngine*> engine_ptrs;
   engine_ptrs.reserve(validation_engines.size());
   for (const auto& engine : validation_engines) {
@@ -2735,17 +2995,6 @@ Result<CollisionWorldRevision> ExecutionKernel::validate_trajectory(
         "missing_collision_query_engines"));
   }
 
-  CollisionValidationPassConfig cfg;
-  cfg.policy_snapshot = *snapshot;
-  cfg.pose_source_retry = retry;
-  cfg.per_state_timeout_ns = per_state_timeout_ns;
-  cfg.surface = CollisionSurface::kPreExecutionValidation;
-
-  ParallelCollisionValidationWorkerPool::Config pool_cfg;
-  pool_cfg.pass_config = std::move(cfg);
-  pool_cfg.worker_count = config_.validation_collision_workers;
-  pool_cfg.min_waypoints_for_parallel =
-      config_.validation_collision_min_waypoints_for_parallel;
   auto cancel = install_validation_cancel_token();
   struct ValidationCancelTokenGuard {
     ExecutionKernel* kernel = nullptr;
@@ -2756,9 +3005,86 @@ Result<CollisionWorldRevision> ExecutionKernel::validate_trajectory(
       }
     }
   } cancel_guard{this, cancel};
-  ParallelCollisionValidationWorkerPool pool(std::move(pool_cfg));
-  auto bundle =
-      pool.validate_trajectory(*world_snapshot, engine_ptrs, trajectory, *cancel);
+
+  struct AuthoritativeValidationAttempt {
+    CollisionValidationDecisionBundle bundle;
+    ParallelValidationTelemetry telemetry;
+  };
+
+  auto run_authoritative_validation_once =
+      [&]() -> Result<AuthoritativeValidationAttempt> {
+    CollisionWorldSnapshotPtr world_snapshot;
+    try {
+      world_snapshot = snapshot_publisher->snapshot();
+    } catch (const std::exception& e) {
+      return Result<AuthoritativeValidationAttempt>::Err(
+          authoritative_collision_validation_config_error(
+              "snapshot_publisher_exception",
+              {{"exception", e.what()}}));
+    } catch (...) {
+      return Result<AuthoritativeValidationAttempt>::Err(
+          authoritative_collision_validation_config_error(
+              "snapshot_publisher_exception",
+              {{"exception", "unknown"}}));
+    }
+    if (!world_snapshot) {
+      return Result<AuthoritativeValidationAttempt>::Err(
+          authoritative_collision_validation_config_error(
+              "snapshot_unavailable"));
+    }
+
+    auto active_policy = snapshot;
+    try {
+      if (auto publisher_policy =
+              snapshot_publisher->collision_policy_snapshot()) {
+        active_policy = std::move(publisher_policy);
+      }
+    } catch (const std::exception& e) {
+      return Result<AuthoritativeValidationAttempt>::Err(
+          authoritative_collision_validation_config_error(
+              "policy_publisher_exception",
+              {{"exception", e.what()}}));
+    } catch (...) {
+      return Result<AuthoritativeValidationAttempt>::Err(
+          authoritative_collision_validation_config_error(
+              "policy_publisher_exception",
+              {{"exception", "unknown"}}));
+    }
+    if (!active_policy) {
+      return Result<AuthoritativeValidationAttempt>::Err(
+          authoritative_collision_validation_config_error(
+              "missing_collision_policy_snapshot"));
+    }
+
+    CollisionValidationPassConfig cfg;
+    cfg.policy_snapshot = *active_policy;
+    cfg.pose_source_retry = retry;
+    cfg.per_state_timeout_ns = per_state_timeout_ns;
+    cfg.surface = CollisionSurface::kPreExecutionValidation;
+
+    ParallelCollisionValidationWorkerPool::Config pool_cfg;
+    pool_cfg.pass_config = std::move(cfg);
+    pool_cfg.worker_count = config_.validation_collision_workers;
+    pool_cfg.min_waypoints_for_parallel =
+        config_.validation_collision_min_waypoints_for_parallel;
+    ParallelCollisionValidationWorkerPool pool(std::move(pool_cfg));
+
+    AuthoritativeValidationAttempt attempt;
+    attempt.bundle =
+        pool.validate_trajectory(*world_snapshot, engine_ptrs, trajectory, *cancel);
+    attempt.telemetry = pool.last_telemetry();
+    return Result<AuthoritativeValidationAttempt>::Ok(std::move(attempt));
+  };
+
+  auto attempt_result = run_authoritative_validation_once();
+  if (!attempt_result.ok()) {
+    return Result<CollisionWorldRevision>::Err(attempt_result.error());
+  }
+
+  auto attempt = std::move(attempt_result.value());
+  auto bundle = std::move(attempt.bundle);
+  auto telemetry = attempt.telemetry;
+
   if (bundle.decision.accepted) {
     return Result<CollisionWorldRevision>::Ok(bundle.borrowed_world_revision);
   }
@@ -2776,16 +3102,11 @@ Result<CollisionWorldRevision> ExecutionKernel::validate_trajectory(
   details["collision_world_content_hash"] =
       bundle.borrowed_world_revision.content_hash;
   details["workers_used"] =
-      std::to_string(pool.last_telemetry().workers_actually_used);
-  if (!pool.last_telemetry().fallback_reason.empty()) {
-    details["parallel_fallback_reason"] = pool.last_telemetry().fallback_reason;
+      std::to_string(telemetry.workers_actually_used);
+  if (!telemetry.fallback_reason.empty()) {
+    details["parallel_fallback_reason"] = telemetry.fallback_reason;
   }
-  if (bundle.scene_changed_during_validation) {
-    return Result<CollisionWorldRevision>::Err(
-        ErrorDTO{kErrorSceneChangedDuringValidation,
-                 "Collision-world revision changed during validation",
-                 std::move(details)});
-  }
+  append_collision_failure_diagnostics(details, bundle);
   if (bundle.cancelled) {
     if (bundle.cancelled_at_waypoint_index) {
       details["cancelled_at_waypoint_index"] =

@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <cstdlib>
 #include <fstream>
 #include <map>
 #include <optional>
@@ -14,11 +15,15 @@
 #include <utility>
 
 #include <pinocchio/algorithm/geometry.hpp>
+#include <pinocchio/algorithm/frames.hpp>
 #include <pinocchio/algorithm/joint-configuration.hpp>
+#include <pinocchio/algorithm/kinematics.hpp>
 #include <pinocchio/collision/collision.hpp>
 #include <pinocchio/parsers/srdf.hpp>
 #include <pinocchio/parsers/urdf.hpp>
 
+#include <hpp/fcl/BVH/BVH_model.h>
+#include <hpp/fcl/mesh_loader/loader.h>
 #include <hpp/fcl/shape/geometric_shapes.h>
 
 #ifndef MANYFORGE_COLLISION_ENGINE_VERSION
@@ -185,6 +190,16 @@ bool supported_required_capability(const std::string& capability,
   return snapshot_mode && capability == "body_pair_only";
 }
 
+bool timeout_budget_covers_snapshot_sync(core::CollisionSurface surface) {
+  switch (surface) {
+    case core::CollisionSurface::kObservedRuntimeMonitor:
+    case core::CollisionSurface::kStreamingObservedMonitor:
+      return false;
+    default:
+      return true;
+  }
+}
+
 Eigen::Matrix4d pose_to_matrix(const core::Pose3DTO& pose) {
   Eigen::Matrix4d tform = Eigen::Matrix4d::Identity();
   tform(0, 3) = pose.position_m.x_m;
@@ -276,6 +291,170 @@ std::optional<std::string> robot_link_from_collision_body_id(
   return body_id.substr(begin, collision_pos - begin);
 }
 
+bool is_robot_owned_body_id(const std::string& body_id) {
+  return body_id.rfind("robot/", 0) == 0;
+}
+
+bool is_attached_body_id(const std::string& body_id) {
+  return body_id.rfind("robot/", 0) == 0 &&
+         body_id.find("/attached/") != std::string::npos;
+}
+
+bool is_robot_link_body_id(const std::string& body_id) {
+  return robot_link_from_collision_body_id(body_id).has_value();
+}
+
+bool link_is_static_wrt_group(const pinocchio::Model& model,
+                              const std::string& link_name,
+                              const std::vector<std::string>& group_joint_names) {
+  if (group_joint_names.empty() || !model.existFrame(link_name)) {
+    // Fail operationally conservative for engines constructed without a
+    // resolved group: treat robot links as motion-relevant instead of silently
+    // pruning them from the collision graph.
+    return false;
+  }
+  auto joint_id = model.frames[model.getFrameId(link_name)].parentJoint;
+  while (joint_id > 0 &&
+         static_cast<std::size_t>(joint_id) < model.parents.size()) {
+    if (static_cast<std::size_t>(joint_id) < model.names.size() &&
+        static_cast<std::size_t>(joint_id) < model.nqs.size() &&
+        model.nqs[joint_id] > 0 &&
+        std::find(group_joint_names.begin(),
+                  group_joint_names.end(),
+                  model.names[joint_id]) != group_joint_names.end()) {
+      return false;
+    }
+    joint_id = model.parents[joint_id];
+  }
+  return true;
+}
+
+bool body_is_motion_relevant(const std::string& body_id,
+                             const pinocchio::Model& model,
+                             const std::vector<std::string>& group_joint_names) {
+  if (!is_robot_owned_body_id(body_id)) {
+    return false;
+  }
+  if (is_attached_body_id(body_id)) {
+    return true;
+  }
+  auto link = robot_link_from_collision_body_id(body_id);
+  if (!link) {
+    // Unknown robot-owned body namespace. Keep it in the active graph rather
+    // than creating a false negative.
+    return true;
+  }
+  return !link_is_static_wrt_group(model, *link, group_joint_names);
+}
+
+std::vector<std::filesystem::path> split_env_paths(const char* value) {
+  std::vector<std::filesystem::path> paths;
+  if (value == nullptr || *value == '\0') {
+    return paths;
+  }
+  std::stringstream stream(value);
+  std::string item;
+  while (std::getline(stream, item, ':')) {
+    if (!item.empty()) {
+      paths.emplace_back(item);
+    }
+  }
+  return paths;
+}
+
+std::optional<std::filesystem::path> first_existing_path(
+    const std::vector<std::filesystem::path>& candidates) {
+  for (const auto& candidate : candidates) {
+    std::error_code ec;
+    if (!candidate.empty() && std::filesystem::exists(candidate, ec)) {
+      auto canonical = std::filesystem::canonical(candidate, ec);
+      return ec ? candidate : canonical;
+    }
+  }
+  return std::nullopt;
+}
+
+std::optional<std::filesystem::path> resolve_mesh_resource_uri(
+    const std::string& source_uri,
+    const std::vector<std::filesystem::path>& package_paths,
+    std::string& error) {
+  if (source_uri.empty()) {
+    error = "mesh source_uri must not be empty";
+    return std::nullopt;
+  }
+
+  constexpr const char* kFilePrefix = "file://";
+  constexpr const char* kPackagePrefix = "package://";
+  std::string path_text = source_uri;
+  if (path_text.rfind(kFilePrefix, 0) == 0) {
+    path_text = path_text.substr(std::char_traits<char>::length(kFilePrefix));
+  } else if (path_text.rfind(kPackagePrefix, 0) == 0) {
+    const std::string rest =
+        path_text.substr(std::char_traits<char>::length(kPackagePrefix));
+    const auto slash = rest.find('/');
+    if (slash == std::string::npos || slash == 0 || slash + 1 >= rest.size()) {
+      error = "invalid package:// mesh URI: " + source_uri;
+      return std::nullopt;
+    }
+    const std::string package_name = rest.substr(0, slash);
+    const std::filesystem::path package_rel_path = rest.substr(slash + 1);
+
+    std::vector<std::filesystem::path> candidates;
+    for (const auto& prefix : package_paths) {
+      candidates.push_back(prefix / package_rel_path);
+      candidates.push_back(prefix / package_name / package_rel_path);
+      candidates.push_back(prefix / "share" / package_name / package_rel_path);
+      if (prefix.filename() == package_name) {
+        candidates.push_back(prefix / package_rel_path);
+      }
+    }
+    for (const auto& prefix : split_env_paths(std::getenv("AMENT_PREFIX_PATH"))) {
+      candidates.push_back(prefix / "share" / package_name / package_rel_path);
+    }
+    for (const auto& prefix : split_env_paths(std::getenv("COLCON_PREFIX_PATH"))) {
+      candidates.push_back(prefix / "share" / package_name / package_rel_path);
+    }
+    for (const auto& root : split_env_paths(std::getenv("ROS_PACKAGE_PATH"))) {
+      candidates.push_back(root / package_name / package_rel_path);
+      if (root.filename() == package_name) {
+        candidates.push_back(root / package_rel_path);
+      }
+    }
+    candidates.push_back(std::filesystem::path("/opt/ros/jazzy/share") /
+                         package_name / package_rel_path);
+    candidates.push_back(std::filesystem::path("/usr/local/share") /
+                         package_name / package_rel_path);
+    candidates.push_back(std::filesystem::path("/workspace") / package_name /
+                         package_rel_path);
+    if (auto resolved = first_existing_path(candidates)) {
+      return resolved;
+    }
+    error = "could not resolve package mesh URI: " + source_uri;
+    return std::nullopt;
+  }
+
+  const std::filesystem::path candidate(path_text);
+  std::vector<std::filesystem::path> candidates;
+  candidates.push_back(candidate);
+  if (candidate.is_relative()) {
+    candidates.push_back(std::filesystem::current_path() / candidate);
+    candidates.push_back(std::filesystem::path("/workspace") / candidate);
+  }
+  if (auto resolved = first_existing_path(candidates)) {
+    return resolved;
+  }
+  error = "mesh resource does not exist: " + source_uri;
+  return std::nullopt;
+}
+
+Eigen::Vector3d effective_mesh_scale(
+    const std::optional<core::Vector3DTO>& scale) {
+  if (!scale) {
+    return Eigen::Vector3d::Ones();
+  }
+  return Eigen::Vector3d(scale->x_m, scale->y_m, scale->z_m);
+}
+
 std::pair<std::string, std::string> canonical_pair(std::string a,
                                                    std::string b) {
   if (b < a) {
@@ -321,6 +500,7 @@ ManyForgeCollisionEngine::ManyForgeCollisionEngine(
     : group_name_(std::move(group_name)),
       engine_id_("manyforge_collision/" + model_name),
       engine_version_(MANYFORGE_COLLISION_ENGINE_VERSION) {
+  package_paths_ = package_paths;
   pinocchio::urdf::buildModel(urdf_path.string(), model_, false, false);
   std::vector<std::string> package_path_strings;
   package_path_strings.reserve(package_paths.size());
@@ -344,7 +524,8 @@ ManyForgeCollisionEngine::ManyForgeCollisionEngine(
   capability_.engine_id = engine_id_;
   capability_.engine_version = engine_version_;
   capability_.library_lineage = "manyforge_collision_pinocchio_coal";
-  capability_.supported_geometry_kinds = {"box", "sphere", "cylinder"};
+  capability_.supported_geometry_kinds = {
+      "box", "sphere", "cylinder", "triangle_mesh"};
   capability_.supports_distance_query = false;
   capability_.supports_contact_points = false;
   capability_.supports_penetration_depth = false;
@@ -353,7 +534,7 @@ ManyForgeCollisionEngine::ManyForgeCollisionEngine(
       core::CollisionEngineThreadSafetyClass::kSingleContextExclusive;
   capability_.deterministic_ordering = true;
   capability_.known_unsupported_cases = {
-      "scene_object_mesh_without_approved_proxy",
+      "convex_mesh_without_qualified_decomposition",
       "scene_object_compound_geometry",
       "distance_query",
       "continuous_collision"};
@@ -376,11 +557,15 @@ core::CollisionResult ManyForgeCollisionEngine::check(
   result.collision_world_revision = snapshot.revision;
 
   const auto t_start = std::chrono::steady_clock::now();
-  auto finish_with_duration = [&]() {
-    const auto t_end = std::chrono::steady_clock::now();
-    result.query_duration_ns =
-        std::chrono::duration_cast<std::chrono::nanoseconds>(t_end - t_start)
+  auto elapsed_ns_since =
+      [](const std::chrono::steady_clock::time_point& start) {
+        const auto t_end = std::chrono::steady_clock::now();
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(t_end -
+                                                                    start)
             .count();
+      };
+  auto finish_with_duration = [&]() {
+    result.query_duration_ns = elapsed_ns_since(t_start);
   };
 
   if (cancel.is_cancel_requested()) {
@@ -427,27 +612,43 @@ core::CollisionResult ManyForgeCollisionEngine::check(
 
   try {
     std::lock_guard<std::mutex> scene_lock(scene_mutex_);
+    const auto sync_start = std::chrono::steady_clock::now();
     if (auto sync_error = sync_snapshot_locked(snapshot);
         sync_error.has_value()) {
       finish_with_duration();
       result.engine_status = core::CollisionEngineStatus::kUnsupportedGeometry;
       result.decision = core::CollisionDecisionResult::kInconclusiveFail;
       result.raw_diagnostics["snapshot_sync_error"] = *sync_error;
+      result.raw_diagnostics["snapshot_sync_duration_ns"] =
+          std::to_string(elapsed_ns_since(sync_start));
       return result;
     }
+    const auto snapshot_sync_duration_ns = elapsed_ns_since(sync_start);
     if (cancel.is_cancel_requested()) {
       finish_with_duration();
       result.engine_status = core::CollisionEngineStatus::kCancelled;
       result.decision = core::CollisionDecisionResult::kInconclusiveFail;
       result.raw_diagnostics["cancel_reason"] = cancel.reason();
+      result.raw_diagnostics["snapshot_sync_duration_ns"] =
+          std::to_string(snapshot_sync_duration_ns);
       return result;
     }
     result = check_locked(query, &snapshot, &cancel);
-    // The snapshot overload may need to synchronize a new immutable world into
-    // the engine-local collision model before the query can run. The timeout
-    // budget and telemetry must cover that full blocking call, not only the
-    // inner collision check.
-    finish_with_duration();
+    const auto total_call_duration_ns = elapsed_ns_since(t_start);
+    result.raw_diagnostics["snapshot_sync_duration_ns"] =
+        std::to_string(snapshot_sync_duration_ns);
+    result.raw_diagnostics["total_call_duration_ns"] =
+        std::to_string(total_call_duration_ns);
+    // Offline validation treats snapshot ingestion as part of the blocking
+    // validation call. Observed runtime monitors have a different contract:
+    // the per-tick query budget measures the already-synchronized collision
+    // query, while scene freshness is monitored separately by the publisher /
+    // monitor cadence. Counting cold snapshot ingestion as a collision-query
+    // timeout causes false runtime interrupts when a live object publishes a
+    // new revision with no robot collision.
+    if (timeout_budget_covers_snapshot_sync(query.surface)) {
+      result.query_duration_ns = total_call_duration_ns;
+    }
     if (result.engine_status == core::CollisionEngineStatus::kOk &&
         query.timeout_budget_ns &&
         result.query_duration_ns &&
@@ -835,6 +1036,31 @@ std::optional<std::string> ManyForgeCollisionEngine::sync_snapshot_locked(
   }
 
   active_collision_model_.emplace();
+  pinocchio::SE3 model_from_world = pinocchio::SE3::Identity();
+  if (snapshot.robot_model_frames.size() > 1) {
+    return "manyforge_collision currently supports one robot_model_frame per snapshot";
+  }
+  if (!snapshot.robot_model_frames.empty()) {
+    const auto& frame = snapshot.robot_model_frames.front();
+    if (!model_.existFrame(frame.model_frame_id)) {
+      return "robot_model_frame model_frame_id not present in engine model: " +
+             frame.model_frame_id;
+    }
+    pinocchio::Data neutral_data(model_);
+    const Eigen::VectorXd q_neutral = pinocchio::neutral(model_);
+    pinocchio::framesForwardKinematics(model_, neutral_data, q_neutral);
+    const auto frame_id = model_.getFrameId(frame.model_frame_id);
+    if (frame_id >= neutral_data.oMf.size()) {
+      return "robot_model_frame frame index out of range: " +
+             frame.model_frame_id;
+    }
+    const pinocchio::SE3 model_from_frame = neutral_data.oMf[frame_id];
+    const pinocchio::SE3 world_from_frame = pose_to_se3(frame.world_pose);
+    const pinocchio::SE3 world_from_model =
+        world_from_frame * model_from_frame.inverse();
+    model_from_world = world_from_model.inverse();
+  }
+
   std::size_t index = 0;
   for (const auto& body : snapshot.bodies) {
     if (body.geometries.size() != 1) {
@@ -884,11 +1110,37 @@ std::optional<std::string> ManyForgeCollisionEngine::sync_snapshot_locked(
                                                      *geom.cylinder_height_m);
         break;
       }
+      case core::CollisionGeometryKind::kTriangleMesh: {
+        if (!geom.source_uri || geom.source_uri->empty()) {
+          return "triangle mesh geometry missing source_uri: " + body.body_id;
+        }
+        const Eigen::Vector3d scale = effective_mesh_scale(geom.mesh_scale);
+        if (!(scale.array().isFinite()).all() ||
+            !(scale.array() > 0.0).all()) {
+          return "triangle mesh geometry has invalid mesh_scale: " +
+                 body.body_id;
+        }
+        std::string mesh_error;
+        auto mesh_path =
+            resolve_mesh_resource_uri(*geom.source_uri, package_paths_,
+                                      mesh_error);
+        if (!mesh_path) {
+          return "triangle mesh geometry could not resolve source_uri for " +
+                 body.body_id + ": " + mesh_error;
+        }
+        hpp::fcl::MeshLoader loader;
+        auto mesh = loader.load(mesh_path->string(), scale);
+        if (!mesh) {
+          return "triangle mesh loader returned null for " + body.body_id +
+                 ": " + mesh_path->string();
+        }
+        shape = mesh;
+        break;
+      }
       case core::CollisionGeometryKind::kCapsule:
       case core::CollisionGeometryKind::kConvexMesh:
-      case core::CollisionGeometryKind::kTriangleMesh:
       case core::CollisionGeometryKind::kCompound:
-        return "unsupported scene geometry kind for direct primitive engine: " +
+        return "unsupported scene geometry kind for manyforge_collision: " +
                body.body_id;
     }
 
@@ -910,10 +1162,12 @@ std::optional<std::string> ManyForgeCollisionEngine::sync_snapshot_locked(
                      placement,
                      shape);
     } else {
+      const pinocchio::SE3 body_geometry_in_model =
+          model_from_world * compose_pose_to_se3(body.pose, geom.local_pose);
       object.emplace(raw_name,
                      pinocchio::JointIndex(0),
                      pinocchio::FrameIndex(0),
-                     compose_pose_to_se3(body.pose, geom.local_pose),
+                     body_geometry_in_model,
                      shape);
     }
     active_collision_model_->addGeometryObject(*object, model_);
@@ -948,9 +1202,17 @@ std::optional<std::string> ManyForgeCollisionEngine::sync_snapshot_locked(
       if (body_b == synced_raw_name_to_body_id_.end()) {
         continue;
       }
-      const bool a_robot = body_a->second.rfind("robot/", 0) == 0;
-      const bool b_robot = body_b->second.rfind("robot/", 0) == 0;
-      if (a_robot && b_robot &&
+      const bool a_motion_relevant =
+          body_is_motion_relevant(body_a->second, model_, group_joint_names_);
+      const bool b_motion_relevant =
+          body_is_motion_relevant(body_b->second, model_, group_joint_names_);
+      if (!a_motion_relevant && !b_motion_relevant) {
+        continue;
+      }
+
+      const bool a_robot_link = is_robot_link_body_id(body_a->second);
+      const bool b_robot_link = is_robot_link_body_id(body_b->second);
+      if (a_robot_link && b_robot_link &&
           active_robot_body_pairs.count(
               canonical_pair(body_a->second, body_b->second)) == 0) {
         continue;

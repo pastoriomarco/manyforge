@@ -523,6 +523,8 @@ def create_program_router(state: ComposerState) -> APIRouter:
             parameters=_program_parameters_to_response(program),
             blackboard=_program_blackboard_to_response(program),
             sourcePath=state.program_source_path,
+            programSessionGeneration=state.program_session_generation,
+            programTreeHash=state.program_tree_hash,
         ).model_dump(by_alias=True)
 
     @router.get("/program", response_model=ProgramResponse, response_model_by_alias=True)
@@ -550,6 +552,8 @@ def create_program_router(state: ComposerState) -> APIRouter:
             parameters=_program_parameters_to_response(program),
             blackboard=_program_blackboard_to_response(program),
             sourcePath=state.program_source_path,
+            programSessionGeneration=state.program_session_generation,
+            programTreeHash=state.program_tree_hash,
         ).model_dump(by_alias=True)
 
     @router.get("/program/saved", response_model=ProgramResponse, response_model_by_alias=True)
@@ -585,6 +589,8 @@ def create_program_router(state: ComposerState) -> APIRouter:
             parameters=_program_parameters_to_response(saved_program),
             blackboard=_program_blackboard_to_response(saved_program),
             sourcePath=state.program_source_path,
+            programSessionGeneration=0,
+            programTreeHash="",
         ).model_dump(by_alias=True)
     
     @router.get("/program/tree", response_model=ProgramTreeResponse, response_model_by_alias=True)
