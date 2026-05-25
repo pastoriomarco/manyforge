@@ -231,6 +231,34 @@ TEST(CollisionWorldSnapshotBuilder, ContentHashChangesWhenBoxDimensionsChange) {
   EXPECT_NE(r1.value().revision.content_hash, r2.value().revision.content_hash);
 }
 
+TEST(CollisionWorldSnapshotBuilder, SourceTimestampDoesNotChangeContentHash) {
+  CollisionWorldBody a = make_robot_link("link1");
+  a.source_timestamp_ns = 100;
+  a.source_freshness_budget_ns = 50'000'000;
+  CollisionWorldBody b = a;
+  b.source_timestamp_ns = 200;
+
+  auto r1 = fresh_builder().add_body(std::move(a)).build();
+  auto r2 = fresh_builder().add_body(std::move(b)).build();
+  ASSERT_TRUE(r1.ok());
+  ASSERT_TRUE(r2.ok());
+  EXPECT_EQ(r1.value().revision.content_hash, r2.value().revision.content_hash);
+}
+
+TEST(CollisionWorldSnapshotBuilder, ContentHashChangesWhenFreshnessBudgetChanges) {
+  CollisionWorldBody a = make_robot_link("link1");
+  a.source_timestamp_ns = 100;
+  a.source_freshness_budget_ns = 50'000'000;
+  CollisionWorldBody b = a;
+  b.source_freshness_budget_ns = 100'000'000;
+
+  auto r1 = fresh_builder().add_body(std::move(a)).build();
+  auto r2 = fresh_builder().add_body(std::move(b)).build();
+  ASSERT_TRUE(r1.ok());
+  ASSERT_TRUE(r2.ok());
+  EXPECT_NE(r1.value().revision.content_hash, r2.value().revision.content_hash);
+}
+
 TEST(CollisionWorldSnapshotBuilder, ContentHashChangesWhenMeshScaleChanges) {
   CollisionWorldBody a = make_robot_link("mesh_link");
   a.geometries.front().geometry_kind = CollisionGeometryKind::kTriangleMesh;
@@ -346,6 +374,31 @@ TEST(CollisionWorldSnapshotBuilder, RejectsNegativeEmissionTime) {
                     .add_body(make_robot_link("link1"))
                     .build();
   ASSERT_FALSE(result.ok());
+}
+
+TEST(CollisionWorldSnapshotBuilder, RejectsBodyFreshnessBudgetWithoutTimestamp) {
+  CollisionWorldBody body = make_robot_link("link1");
+  body.source_freshness_budget_ns = 50'000'000;
+  auto result = fresh_builder().add_body(std::move(body)).build();
+  ASSERT_FALSE(result.ok());
+  EXPECT_EQ(result.error().code, "invariant_violation");
+}
+
+TEST(CollisionWorldSnapshotBuilder, RejectsNegativeBodySourceTimestamp) {
+  CollisionWorldBody body = make_robot_link("link1");
+  body.source_timestamp_ns = -1;
+  auto result = fresh_builder().add_body(std::move(body)).build();
+  ASSERT_FALSE(result.ok());
+  EXPECT_EQ(result.error().code, "invariant_violation");
+}
+
+TEST(CollisionWorldSnapshotBuilder, RejectsNonPositiveBodyFreshnessBudget) {
+  CollisionWorldBody body = make_robot_link("link1");
+  body.source_timestamp_ns = 100;
+  body.source_freshness_budget_ns = 0;
+  auto result = fresh_builder().add_body(std::move(body)).build();
+  ASSERT_FALSE(result.ok());
+  EXPECT_EQ(result.error().code, "invariant_violation");
 }
 
 TEST(CollisionWorldSnapshotBuilder, RejectsInvalidRobotModelFrame) {

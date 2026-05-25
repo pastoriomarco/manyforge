@@ -585,6 +585,11 @@ PYBIND11_MODULE(manyforge_core_py, m) {
         .def_readwrite("object_id", &manyforge::core::UpdateObjectPoseRequestDTO::object_id)
         .def_readwrite("pose", &manyforge::core::UpdateObjectPoseRequestDTO::pose)
         .def_readwrite("frame_id", &manyforge::core::UpdateObjectPoseRequestDTO::frame_id)
+        .def_readwrite("source_timestamp_ns",
+                       &manyforge::core::UpdateObjectPoseRequestDTO::source_timestamp_ns)
+        .def_readwrite(
+            "source_freshness_budget_ns",
+            &manyforge::core::UpdateObjectPoseRequestDTO::source_freshness_budget_ns)
         .def("__repr__", [](const manyforge::core::UpdateObjectPoseRequestDTO& u) {
             return py::str("UpdateObjectPoseRequestDTO(object_id='{}')").format(u.object_id);
         });
@@ -784,17 +789,52 @@ PYBIND11_MODULE(manyforge_core_py, m) {
                 .format(r.is_first_failure);
         });
 
+    py::class_<manyforge::core::CollisionPairClearance>(m,
+                                                        "CollisionPairClearance")
+        .def(py::init<>())
+        .def_readwrite("pair",
+                       &manyforge::core::CollisionPairClearance::pair)
+        .def_readwrite(
+            "signed_clearance_m",
+            &manyforge::core::CollisionPairClearance::signed_clearance_m)
+        .def("__repr__", [](const manyforge::core::CollisionPairClearance& r) {
+            return py::str("CollisionPairClearance(signed_clearance_m={})")
+                .format(r.signed_clearance_m);
+        });
+
+    py::enum_<manyforge::core::CollisionContactPolicyMode>(
+        m, "CollisionContactPolicyMode")
+        .value("kContactRelease",
+               manyforge::core::CollisionContactPolicyMode::kContactRelease)
+        .value("kContactProcess",
+               manyforge::core::CollisionContactPolicyMode::kContactProcess);
+
     py::class_<manyforge::core::SupportContactPolicyEntry>(m,
                                                            "SupportContactPolicyEntry")
         .def(py::init<>())
         .def_readwrite("pair",
                        &manyforge::core::SupportContactPolicyEntry::pair)
+        .def_readwrite("mode",
+                       &manyforge::core::SupportContactPolicyEntry::mode)
         .def_readwrite(
             "max_start_penetration_m",
             &manyforge::core::SupportContactPolicyEntry::max_start_penetration_m)
         .def_readwrite(
+            "release_tolerance_m",
+            &manyforge::core::SupportContactPolicyEntry::release_tolerance_m)
+        .def_readwrite(
+            "min_release_progress_m",
+            &manyforge::core::SupportContactPolicyEntry::min_release_progress_m)
+        .def_readwrite(
+            "min_separation_clearance_m",
+            &manyforge::core::SupportContactPolicyEntry::min_separation_clearance_m)
+        .def_readwrite(
             "require_separation_by_end",
             &manyforge::core::SupportContactPolicyEntry::require_separation_by_end)
+        .def_readwrite(
+            "require_strictly_decreasing_penetration",
+            &manyforge::core::SupportContactPolicyEntry::
+                require_strictly_decreasing_penetration)
         .def_readwrite("allow_recontact",
                        &manyforge::core::SupportContactPolicyEntry::allow_recontact);
 
@@ -886,6 +926,12 @@ PYBIND11_MODULE(manyforge_core_py, m) {
         .def_readwrite("frame_id",
                        &manyforge::core::CollisionWorldBody::frame_id)
         .def_readwrite("pose", &manyforge::core::CollisionWorldBody::pose)
+        .def_readwrite(
+            "source_timestamp_ns",
+            &manyforge::core::CollisionWorldBody::source_timestamp_ns)
+        .def_readwrite(
+            "source_freshness_budget_ns",
+            &manyforge::core::CollisionWorldBody::source_freshness_budget_ns)
         .def_readwrite("geometries",
                        &manyforge::core::CollisionWorldBody::geometries)
         .def_readwrite("body_content_hash",
@@ -1058,6 +1104,8 @@ PYBIND11_MODULE(manyforge_core_py, m) {
                        &manyforge::core::CollisionResult::min_clearance_m)
         .def_readwrite("min_clearance_pair",
                        &manyforge::core::CollisionResult::min_clearance_pair)
+        .def_readwrite("pair_clearances",
+                       &manyforge::core::CollisionResult::pair_clearances)
         .def_readwrite(
             "normalized_pairs_classified",
             &manyforge::core::CollisionResult::normalized_pairs_classified)

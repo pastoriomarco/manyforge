@@ -233,6 +233,11 @@ std::string compute_body_content_hash(const CollisionWorldBody& body) {
   h.mix(body.parent_link.value_or(""));
   h.mix(body.frame_id);
   mix_pose(h, body.pose);
+  h.mix(static_cast<std::int64_t>(
+      body.source_freshness_budget_ns.has_value() ? 1 : 0));
+  if (body.source_freshness_budget_ns) {
+    h.mix(*body.source_freshness_budget_ns);
+  }
   h.mix(static_cast<std::int64_t>(body.geometries.size()));
   for (const auto& geom : body.geometries) {
     mix_geometry(h, geom);
@@ -353,6 +358,27 @@ Result<CollisionWorldSnapshot> CollisionWorldSnapshotBuilder::build() {
       std::ostringstream oss;
       oss << "frame_id must be non-empty for body: " << body.body_id;
       return err(oss.str());
+    }
+    if (body.source_timestamp_ns.has_value() &&
+        *body.source_timestamp_ns < 0) {
+      std::ostringstream oss;
+      oss << "source_timestamp_ns must be non-negative for body: "
+          << body.body_id;
+      return err(oss.str());
+    }
+    if (body.source_freshness_budget_ns.has_value()) {
+      if (!body.source_timestamp_ns.has_value()) {
+        std::ostringstream oss;
+        oss << "source_freshness_budget_ns requires source_timestamp_ns for body: "
+            << body.body_id;
+        return err(oss.str());
+      }
+      if (*body.source_freshness_budget_ns <= 0) {
+        std::ostringstream oss;
+        oss << "source_freshness_budget_ns must be positive for body: "
+            << body.body_id;
+        return err(oss.str());
+      }
     }
     if (!seen_ids.insert(body.body_id).second) {
       std::ostringstream oss;

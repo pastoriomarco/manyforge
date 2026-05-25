@@ -30,6 +30,8 @@ namespace manyforge::core {
 ///   - Each body's `body_id` is non-empty.
 ///   - Each body's `body_id` matches its `owner_kind` namespace.
 ///   - Each body's `frame_id` is non-empty.
+///   - If a body declares `source_freshness_budget_ns`, it also declares a
+///     non-negative `source_timestamp_ns` and the budget is positive.
 ///   - Body ids are unique within the snapshot.
 ///   - Each body has at least one geometry.
 ///   - Each body's geometries reference the same `body_id` as the
@@ -49,7 +51,9 @@ namespace manyforge::core {
 ///     validation.
 ///   - Each body's `body_content_hash` is computed by the builder
 ///     using `ContentHasher` over (body_id, owner_kind, parent_link,
-///     frame_id, pose, geometries' source-defining fields).
+///     frame_id, pose, freshness budget, geometries' source-defining fields).
+///     `source_timestamp_ns` is intentionally excluded so freshness-only
+///     updates do not change collision-world content identity.
 ///   - The snapshot's `revision.content_hash` is the digest over
 ///     `publisher_id`, `snapshot_format_version`, `revision_id`,
 ///     and the sorted bodies' `body_content_hash` values.

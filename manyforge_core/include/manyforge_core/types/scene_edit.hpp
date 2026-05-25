@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <variant>
@@ -7,6 +8,7 @@
 
 #include <manyforge_core/types/error_code.hpp>
 #include <manyforge_core/types/geometry.hpp>
+#include <manyforge_core/types/collision.hpp>
 
 namespace manyforge::core {
 
@@ -43,8 +45,15 @@ using CollisionShapeDTO = std::variant<BoxShapeDTO, SphereShapeDTO, CylinderShap
 /// motion and does not re-contact after separation.
 struct SupportContactDTO {
   std::string support_object_id;
-  double max_start_penetration_m = 0.0;  // reserved for backends with contact depth
+  CollisionContactPolicyMode mode =
+      CollisionContactPolicyMode::kContactRelease;
+  double max_start_penetration_m = 0.0;
+  double release_tolerance_m = 1e-5;
+  double min_release_progress_m = 0.0;
+  double min_separation_clearance_m = 0.0;
   bool require_separation_by_end = true;
+  bool require_strictly_decreasing_penetration = true;
+  bool allow_recontact = false;
 };
 
 /// Add object request (spec §3.9)
@@ -66,6 +75,14 @@ struct UpdateObjectPoseRequestDTO {
   std::string object_id;
   Pose3DTO pose;          // expressed in frame_id
   std::string frame_id;
+  /// Optional observation timestamp in the kernel steady-clock domain.
+  ///
+  /// Pose-source updates set this together with `source_freshness_budget_ns` so
+  /// runtime collision monitoring can fail closed when dynamic object poses go
+  /// stale. Authored/manual scene edits leave both fields unset, which clears
+  /// any previous source authority for the object.
+  std::optional<std::int64_t> source_timestamp_ns;
+  std::optional<std::int64_t> source_freshness_budget_ns;
 };
 
 /// Attach an existing object to a frame while preserving its current world pose.

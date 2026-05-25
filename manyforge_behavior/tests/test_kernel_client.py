@@ -153,7 +153,7 @@ class TestMockKernelSceneEdit:
             }
         ]
 
-    def test_scene_edit_rejects_non_releasing_support_contact(self, kernel):
+    def test_scene_edit_rejects_invalid_support_contact_policy_field(self, kernel):
         result = kernel.scene_edit(
             SceneEditRequest(
                 operation="add",
@@ -163,13 +163,29 @@ class TestMockKernelSceneEdit:
                 support_contacts=[
                     {
                         "support_object_id": "table",
-                        "require_separation_by_end": False,
+                        "allow_recontact": "no",
                     }
                 ],
             )
         )
         assert result.success is False
-        assert result.error == "support_contacts[0].require_separation_by_end must be true"
+        assert result.error == "support_contacts[0].allow_recontact must be boolean"
+
+    def test_scene_edit_rejects_partial_pose_source_freshness_metadata(self, kernel):
+        result = kernel.scene_edit(
+            SceneEditRequest(
+                operation="update_pose",
+                object_id="box1",
+                pose_position_m=[0.0, 0.0, 0.0],
+                source_timestamp_ns=123,
+            )
+        )
+
+        assert result.success is False
+        assert result.error == (
+            "update_pose source_timestamp_ns and source_freshness_budget_ns "
+            "must be provided together"
+        )
 
     def test_scene_edit_failure_injection(self, kernel):
         kernel.fail_next_scene_edit = True

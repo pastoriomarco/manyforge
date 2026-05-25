@@ -496,12 +496,17 @@ class ControlledExecution : public IExecutionBackend {
     return snapshot;
   }
 
-  void set_progress(double progress, std::vector<double> joint_positions) {
+  void set_progress(double progress,
+                    std::vector<double> joint_positions,
+                    std::optional<std::int64_t> timestamp_ns = std::nullopt) {
     {
       std::lock_guard<std::mutex> lock(mu_);
       snapshot.progress = progress;
       snapshot.joint_positions_rad = std::move(joint_positions);
       snapshot.state = paused_ ? ExecutionState::kPaused : ExecutionState::kExecuting;
+      if (timestamp_ns) {
+        snapshot.timestamp_ns = *timestamp_ns;
+      }
     }
     cv_.notify_all();
   }
@@ -724,6 +729,24 @@ CollisionWorldSnapshot make_test_collision_world_snapshot() {
   return snapshot;
 }
 
+CollisionWorldBody make_dynamic_test_body(std::int64_t source_timestamp_ns,
+                                          std::int64_t freshness_budget_ns) {
+  CollisionWorldBody body;
+  body.body_id = "object/dynamic_box/shape/0";
+  body.owner_kind = CollisionOwnerKind::kDetachedObject;
+  body.frame_id = "universe";
+  body.pose.orientation.w = 1.0;
+  body.source_timestamp_ns = source_timestamp_ns;
+  body.source_freshness_budget_ns = freshness_budget_ns;
+  CollisionGeometryDescriptor geom;
+  geom.body_id = body.body_id;
+  geom.owner_kind = body.owner_kind;
+  geom.geometry_kind = CollisionGeometryKind::kBox;
+  geom.box_dimensions_m = Vector3DTO{0.1, 0.1, 0.1};
+  body.geometries.push_back(std::move(geom));
+  return body;
+}
+
 CollisionPolicySnapshot make_test_collision_policy_snapshot() {
   CollisionPolicySnapshot snapshot;
   snapshot.policy_id = "free_space";
@@ -741,6 +764,22 @@ CollisionResult make_authoritative_collision_result() {
       "object/box/shape/0"}};
   result.engine_status = CollisionEngineStatus::kOk;
   result.decision = CollisionDecisionResult::kFail;
+  return result;
+}
+
+CollisionResult make_support_contact_collision_result(
+    const CollisionPairId& pair,
+    double signed_clearance_m) {
+  CollisionResult result;
+  result.in_collision = signed_clearance_m < 0.0;
+  if (result.in_collision) {
+    result.normalized_pairs = {pair};
+    result.decision = CollisionDecisionResult::kFail;
+  } else {
+    result.decision = CollisionDecisionResult::kPass;
+  }
+  result.engine_status = CollisionEngineStatus::kOk;
+  result.pair_clearances = {CollisionPairClearance{pair, signed_clearance_m}};
   return result;
 }
 
@@ -1626,56 +1665,6 @@ TEST_F(ExecutionKernelTest,
   EXPECT_TRUE(saw_validation_failed);
 }
 
-TEST_F(ExecutionKernelTest,
-       PredictedPathDiagnostic_EmitsEventWhenPolicyBlocks) {
-  CollisionPolicySnapshot snapshot;
-  snapshot.policy_id = "free_space";
-  snapshot.revision.revision_id = 17;
-  snapshot.require_full_diagnostics = false;
-  kernel.set_collision_validation_policy_snapshot(snapshot);
-
-  context.next_collision = CollisionCheckResultDTO{true, "link1", "box"};
-
-  std::atomic<int> events_seen{0};
-  auto sub = kernel.subscribe_events([&events_seen](const KernelEvent& e) {
-    if (e.type == KernelEventType::kCollisionDetected &&
-        e.details.count("surface") &&
-        e.details.at("surface") == "runtime_predicted_diagnostic") {
-      events_seen.fetch_add(1);
-    }
-  });
-
-  RobotStateDTO state;
-  auto bundle = kernel.run_predicted_path_monitor_diagnostic(state);
-  EXPECT_FALSE(bundle.decision.accepted);
-  EXPECT_EQ(events_seen.load(), 1);
-  kernel.unsubscribe_events(sub);
-}
-
-TEST_F(ExecutionKernelTest,
-       PredictedPathDiagnostic_CatchesContextExceptions) {
-  CollisionPolicySnapshot snapshot;
-  snapshot.policy_id = "free_space";
-  snapshot.revision.revision_id = 17;
-  snapshot.require_full_diagnostics = false;
-  kernel.set_collision_validation_policy_snapshot(snapshot);
-  context.throw_get_state = true;
-
-  std::atomic<int> events_seen{0};
-  auto sub = kernel.subscribe_events([&events_seen](const KernelEvent& e) {
-    if (e.type == KernelEventType::kCollisionDetected &&
-        e.details.count("diagnostic_error")) {
-      events_seen.fetch_add(1);
-    }
-  });
-
-  auto bundle = kernel.run_predicted_path_monitor_diagnostic(std::nullopt);
-  EXPECT_FALSE(bundle.decision.accepted);
-  EXPECT_EQ(bundle.decision.action, CollisionDecisionAction::kInconclusive);
-  EXPECT_EQ(events_seen.load(), 1);
-  kernel.unsubscribe_events(sub);
-}
-
 // --- Execute requires bound acknowledgement from terminal success ---
 
 TEST_F(ExecutionKernelTest, Execute_FromCompleted_RequiresAcknowledgement) {
@@ -2078,10 +2067,18 @@ TEST_F(ExecutionKernelTest,
   ThreadSafeFakeClock local_clock;
   ThreadSafeManualScheduler local_scheduler;
   TrajectoryCache local_cache{CacheConfig{10}};
+  ExecutionKernelConfig config;
+  config.collision_monitor_period_ns = 10'000'000;  // Keep this scheduler test fast.
+  config.runtime_collision_query_timeout_ns = 10'000'000;
   MockCollisionWorldPublisher local_collision_world;
   auto local_collision_engine = std::make_shared<MockCollisionEngine>();
-  ExecutionKernel controlled_kernel{
-      planner, context, controlled_execution, local_clock, local_scheduler, local_cache};
+  ExecutionKernel controlled_kernel{planner,
+                                    context,
+                                    controlled_execution,
+                                    local_clock,
+                                    local_scheduler,
+                                    local_cache,
+                                    config};
   configure_authoritative_collision_validation(
       controlled_kernel, local_collision_world, local_collision_engine);
   std::vector<KernelEvent> events;
@@ -2144,6 +2141,242 @@ TEST_F(ExecutionKernelTest,
   }));
 }
 
+TEST_F(ExecutionKernelTest,
+       CollisionMonitoring_UsesBackendObservedStateForRuntimeQuery) {
+  ControlledExecution controlled_execution;
+  ThreadSafeFakeClock local_clock;
+  ThreadSafeManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  MockCollisionWorldPublisher local_collision_world;
+  auto local_collision_engine = std::make_shared<MockCollisionEngine>();
+  ExecutionKernel controlled_kernel{
+      planner, context, controlled_execution, local_clock, local_scheduler, local_cache};
+  configure_authoritative_collision_validation(
+      controlled_kernel, local_collision_world, local_collision_engine);
+
+  std::vector<double> queried_positions;
+  local_collision_engine->on_check = [&](const CollisionQuery& query) {
+    queried_positions = query.robot_state.positions_rad;
+  };
+
+  auto result = controlled_kernel.execute(make_test_request());
+  ASSERT_TRUE(result.ok());
+  ASSERT_TRUE(controlled_execution.wait_until_execute_called())
+      << "wait_until_execute_called timed out";
+  ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kExecuting));
+  controlled_execution.set_progress(0.25, {0.25, 0.75}, local_clock.now());
+  context.current_state.positions_rad = {99.0, 99.0};
+
+  auto tick = controlled_kernel.collision_check_tick();
+  ASSERT_TRUE(tick.ok());
+  ASSERT_EQ(queried_positions.size(), 2u);
+  EXPECT_DOUBLE_EQ(queried_positions[0], 0.25);
+  EXPECT_DOUBLE_EQ(queried_positions[1], 0.75);
+
+  controlled_execution.complete();
+  controlled_kernel.wait_for_completion();
+}
+
+TEST_F(ExecutionKernelTest,
+       CollisionMonitoring_StaleObservedStateFailsClosedBeforeEngineQuery) {
+  ControlledExecution controlled_execution;
+  ThreadSafeFakeClock local_clock;
+  ThreadSafeManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  ExecutionKernelConfig config;
+  config.runtime_observed_state_max_age_ns = 10'000'000;  // 10 ms
+  MockCollisionWorldPublisher local_collision_world;
+  auto local_collision_engine = std::make_shared<MockCollisionEngine>();
+  ExecutionKernel controlled_kernel{planner,
+                                    context,
+                                    controlled_execution,
+                                    local_clock,
+                                    local_scheduler,
+                                    local_cache,
+                                    config};
+  configure_authoritative_collision_validation(
+      controlled_kernel, local_collision_world, local_collision_engine);
+
+  auto result = controlled_kernel.execute(make_test_request());
+  ASSERT_TRUE(result.ok());
+  ASSERT_TRUE(controlled_execution.wait_until_execute_called())
+      << "wait_until_execute_called timed out";
+  ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kExecuting));
+  controlled_execution.set_progress(0.25, {0.25, 0.75}, 0);
+  local_clock.advance(20'000'000);
+  const int baseline_engine_checks = local_collision_engine->check_count.load();
+
+  auto tick = controlled_kernel.collision_check_tick();
+  ASSERT_TRUE(tick.ok());
+  EXPECT_EQ(local_collision_engine->check_count.load(), baseline_engine_checks);
+  EXPECT_EQ(controlled_execution.stop_count, 1);
+  EXPECT_EQ(controlled_kernel.get_status().state, ExecutionState::kInterrupted);
+  auto latch = controlled_kernel.get_active_interrupt_latch();
+  ASSERT_TRUE(latch.has_value());
+  EXPECT_EQ(latch->signal_snapshot.metadata.at("reason"),
+            "stale_observed_robot_state");
+  EXPECT_EQ(latch->signal_snapshot.metadata.at("observed_state_age_ns"),
+            "20000000");
+}
+
+TEST_F(ExecutionKernelTest,
+       CollisionMonitoring_StaleDynamicBodyFailsClosedBeforeEngineQuery) {
+  ControlledExecution controlled_execution;
+  ThreadSafeFakeClock local_clock;
+  ThreadSafeManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  ExecutionKernelConfig config;
+  config.runtime_dynamic_body_max_age_cap_ns = 100'000'000;  // 100 ms
+  MockCollisionWorldPublisher local_collision_world;
+  auto local_collision_engine = std::make_shared<MockCollisionEngine>();
+  ExecutionKernel controlled_kernel{planner,
+                                    context,
+                                    controlled_execution,
+                                    local_clock,
+                                    local_scheduler,
+                                    local_cache,
+                                    config};
+  configure_authoritative_collision_validation(
+      controlled_kernel, local_collision_world, local_collision_engine);
+  auto live_snapshot = make_test_collision_world_snapshot();
+  live_snapshot.revision = CollisionWorldRevision{42, "dynamic-world"};
+  live_snapshot.bodies.push_back(make_dynamic_test_body(0, 10'000'000));
+  local_collision_world.current_snapshot =
+      std::make_shared<const CollisionWorldSnapshot>(std::move(live_snapshot));
+
+  auto result = controlled_kernel.execute(make_test_request());
+  ASSERT_TRUE(result.ok());
+  ASSERT_TRUE(controlled_execution.wait_until_execute_called())
+      << "wait_until_execute_called timed out";
+  ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kExecuting));
+  controlled_execution.set_progress(0.25, {0.25, 0.75}, 20'000'000);
+  local_clock.advance(20'000'000);
+  const int baseline_engine_checks = local_collision_engine->check_count.load();
+
+  auto tick = controlled_kernel.collision_check_tick();
+  ASSERT_TRUE(tick.ok());
+  EXPECT_EQ(local_collision_engine->check_count.load(), baseline_engine_checks);
+  EXPECT_EQ(controlled_execution.stop_count, 1);
+  EXPECT_EQ(controlled_kernel.get_status().state, ExecutionState::kInterrupted);
+  auto latch = controlled_kernel.get_active_interrupt_latch();
+  ASSERT_TRUE(latch.has_value());
+  EXPECT_EQ(latch->signal_snapshot.metadata.at("reason"),
+            "stale_dynamic_collision_body");
+  EXPECT_EQ(latch->signal_snapshot.metadata.at("dynamic_body_id"),
+            "object/dynamic_box/shape/0");
+  EXPECT_EQ(latch->signal_snapshot.metadata.at("dynamic_body_age_ns"),
+            "20000000");
+}
+
+TEST_F(ExecutionKernelTest,
+       CollisionMonitoring_ContactReleaseAllowsBoundedOngoingReleaseContact) {
+  ControlledExecution controlled_execution;
+  ThreadSafeFakeClock local_clock;
+  ThreadSafeManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  MockCollisionWorldPublisher local_collision_world;
+  auto local_collision_engine = std::make_shared<MockCollisionEngine>();
+  ExecutionKernel controlled_kernel{
+      planner, context, controlled_execution, local_clock, local_scheduler, local_cache};
+  configure_authoritative_collision_validation(
+      controlled_kernel, local_collision_world, local_collision_engine);
+
+  const CollisionPairId pair{"robot/robot1/attached/part/shape/0",
+                             "object/support/shape/0"};
+  auto policy = make_test_collision_policy_snapshot();
+  policy.require_full_diagnostics = true;
+  SupportContactPolicyEntry entry;
+  entry.pair = pair;
+  entry.max_start_penetration_m = 0.010;
+  entry.require_separation_by_end = true;
+  entry.require_strictly_decreasing_penetration = true;
+  policy.support_contacts.push_back(entry);
+  local_collision_world.current_policy = policy;
+  controlled_kernel.set_collision_validation_policy_snapshot(policy);
+  local_collision_engine->result_by_waypoint[0] =
+      make_support_contact_collision_result(pair, -0.004);
+  local_collision_engine->result_by_waypoint[1] =
+      make_support_contact_collision_result(pair, 0.002);
+
+  auto result = controlled_kernel.execute(make_test_request());
+  ASSERT_TRUE(result.ok());
+  ASSERT_TRUE(controlled_execution.wait_until_execute_called())
+      << "wait_until_execute_called timed out";
+  ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kExecuting));
+  local_collision_engine->result_by_waypoint.clear();
+  local_collision_engine->default_result =
+      make_support_contact_collision_result(pair, -0.004);
+  controlled_execution.set_progress(0.25, {0.25, 0.75}, local_clock.now());
+  const int baseline_stop_count = controlled_execution.stop_count;
+
+  auto tick = controlled_kernel.collision_check_tick();
+  ASSERT_TRUE(tick.ok());
+  EXPECT_EQ(controlled_execution.stop_count, baseline_stop_count);
+  EXPECT_EQ(controlled_kernel.get_status().state, ExecutionState::kExecuting);
+
+  controlled_execution.complete();
+  controlled_kernel.wait_for_completion();
+}
+
+TEST_F(ExecutionKernelTest,
+       CollisionMonitoring_ContactReleasePenetrationIncreaseFailsClosed) {
+  ControlledExecution controlled_execution;
+  ThreadSafeFakeClock local_clock;
+  ThreadSafeManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  MockCollisionWorldPublisher local_collision_world;
+  auto local_collision_engine = std::make_shared<MockCollisionEngine>();
+  ExecutionKernel controlled_kernel{
+      planner, context, controlled_execution, local_clock, local_scheduler, local_cache};
+  configure_authoritative_collision_validation(
+      controlled_kernel, local_collision_world, local_collision_engine);
+
+  const CollisionPairId pair{"robot/robot1/attached/part/shape/0",
+                             "object/support/shape/0"};
+  auto policy = make_test_collision_policy_snapshot();
+  policy.require_full_diagnostics = true;
+  SupportContactPolicyEntry entry;
+  entry.pair = pair;
+  entry.max_start_penetration_m = 0.010;
+  entry.release_tolerance_m = 1e-5;
+  entry.require_separation_by_end = true;
+  entry.require_strictly_decreasing_penetration = true;
+  policy.support_contacts.push_back(entry);
+  local_collision_world.current_policy = policy;
+  controlled_kernel.set_collision_validation_policy_snapshot(policy);
+
+  local_collision_engine->result_by_waypoint[0] =
+      make_support_contact_collision_result(pair, -0.004);
+  local_collision_engine->result_by_waypoint[1] =
+      make_support_contact_collision_result(pair, 0.002);
+  auto result = controlled_kernel.execute(make_test_request());
+  ASSERT_TRUE(result.ok());
+  ASSERT_TRUE(controlled_execution.wait_until_execute_called())
+      << "wait_until_execute_called timed out";
+  ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kExecuting));
+  local_collision_engine->result_by_waypoint.clear();
+  local_collision_engine->default_result =
+      make_support_contact_collision_result(pair, -0.004);
+  controlled_execution.set_progress(0.25, {0.25, 0.75}, local_clock.now());
+  ASSERT_TRUE(controlled_kernel.collision_check_tick().ok());
+  ASSERT_EQ(controlled_execution.stop_count, 0);
+
+  local_collision_engine->default_result =
+      make_support_contact_collision_result(pair, -0.006);
+  local_clock.advance(10'000'000);
+  controlled_execution.set_progress(0.50, {0.50, 0.90}, local_clock.now());
+  auto tick = controlled_kernel.collision_check_tick();
+  ASSERT_TRUE(tick.ok());
+  EXPECT_EQ(controlled_execution.stop_count, 1);
+  EXPECT_EQ(controlled_kernel.get_status().state, ExecutionState::kInterrupted);
+  auto latch = controlled_kernel.get_active_interrupt_latch();
+  ASSERT_TRUE(latch.has_value());
+  EXPECT_EQ(latch->signal_snapshot.metadata.at("reason"),
+            "runtime_contact_release_penetration_increased");
+  EXPECT_EQ(latch->signal_snapshot.metadata.at("contact_a"), pair.body_a);
+  EXPECT_EQ(latch->signal_snapshot.metadata.at("contact_b"), pair.body_b);
+}
+
 TEST_F(ExecutionKernelTest, CollisionMonitoring_UsesConfiguredPeriod) {
   ControlledExecution controlled_execution;
   ThreadSafeFakeClock local_clock;
@@ -2151,8 +2384,13 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_UsesConfiguredPeriod) {
   TrajectoryCache local_cache{CacheConfig{10}};
   ExecutionKernelConfig config;
   config.collision_monitor_period_ns = 50'000'000;  // 50 ms
+  config.runtime_collision_query_timeout_ns = 25'000'000;  // 25 ms
   MockCollisionWorldPublisher local_collision_world;
   auto local_collision_engine = std::make_shared<MockCollisionEngine>();
+  std::optional<std::int64_t> observed_timeout_budget_ns;
+  local_collision_engine->on_check = [&](const CollisionQuery& query) {
+    observed_timeout_budget_ns = query.timeout_budget_ns;
+  };
   ExecutionKernel controlled_kernel{planner,
                                     context,
                                     controlled_execution,
@@ -2180,6 +2418,8 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_UsesConfiguredPeriod) {
   local_scheduler.advance_to(local_clock.now());
   EXPECT_EQ(context.collision_count, baseline_collision_count);
   EXPECT_EQ(local_collision_engine->check_count.load(), baseline_engine_count + 1);
+  ASSERT_TRUE(observed_timeout_budget_ns.has_value());
+  EXPECT_EQ(*observed_timeout_budget_ns, 25'000'000);
 
   controlled_execution.complete();
   controlled_kernel.wait_for_completion();

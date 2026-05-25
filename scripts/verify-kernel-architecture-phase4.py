@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -33,11 +34,41 @@ REQUIRED_EXTERNAL_EVIDENCE = {
     "live_isaac": "live Isaac scene qualification evidence",
 }
 
-FORBIDDEN_PRODUCTION_TOKENS = {
-    "legacy_collision_validation": "legacy collision validation compatibility flag",
-    "collision_engine=direct_scene": "prototype collision engine selector",
-    "direct_scene_roboplan": "adapter-hosted prototype engine id",
-}
+# Each entry is a regex pattern (Python `re` syntax) plus a human-readable
+# description. Patterns are matched with `re.MULTILINE | re.DOTALL`, so `\s+`
+# correctly matches whitespace including newlines — important for catching
+# multi-line C++ signatures where the legacy surfaces were declared.
+#
+# Patterns are checked as substrings (re.search). Use `\b` for word-boundary
+# anchoring where an identifier could embed in a longer name (e.g. plain
+# `CollisionPolicy` vs. `CollisionPolicySnapshot`).
+FORBIDDEN_PRODUCTION_PATTERNS: list[tuple[str, str]] = [
+    (r"legacy_collision_validation", "legacy collision validation compatibility flag"),
+    (r"collision_engine=direct_scene", "prototype collision engine selector"),
+    (r"direct_scene_roboplan", "adapter-hosted prototype engine id"),
+    # Phase 4-P2 cleanup: legacy collision-validation surfaces that lost
+    # production callers. Reintroducing any of these tokens in a production
+    # scan-dir is a regression.
+    (r"\bCollisionPolicy\b(?!Snapshot)",
+     "deleted CollisionPolicy class (use CollisionPolicySnapshot)"),
+    (r"\bcollision_policy_\b",
+     "deleted ExecutionKernel collision_policy_ member"),
+    (r"CollisionPolicy::handle_collision",
+     "deleted binary-collision stop-policy method"),
+    (r"\bset_engine_mismatch_emitter\b",
+     "deleted string-only engine-mismatch callback (use set_engine_mismatch_record_emitter)"),
+    (r"\brun_predicted_path_monitor_diagnostic\b",
+     "deleted IPlanningContext-based diagnostic (use snapshot/engine path)"),
+    (r"\brun_serial_fallback\b",
+     "deleted IPlanningContext-based worker-pool helper"),
+    # Multi-line signature catchers — \s+ matches newlines under DOTALL.
+    (r"validate_trajectory\s*\(\s*IPlanningContext",
+     "deleted IPlanningContext coordinator/worker-pool validate_trajectory overload (use snapshot/engine overload)"),
+    (r"validate_state\s*\(\s*IPlanningContext",
+     "deleted IPlanningContext coordinator validate_state overload"),
+    (r"std::vector\s*<\s*IPlanningContext\s*\*\s*>",
+     "deleted std::vector<IPlanningContext*> worker-pool argument type"),
+]
 
 SCAN_DIRS = [
     "manyforge_core",
@@ -94,6 +125,48 @@ def load_optional_json(
         failures.append(f"{label} summary artifact unreadable: {exc}")
         return None
     return data
+
+
+def _is_structural_visual_load_evidence(payload: dict[str, Any] | None) -> bool:
+    """Return True if `payload` looks like a real qualify-visual-state-live
+    run rather than a synthetic status-only assertion.
+
+    Strict release rejects `{"success": true}`-only blobs because the
+    harness produces them when an operator sets the legacy
+    `MANYFORGE_PHASE4_VISUAL_LOAD_EVIDENCE=passed` env var without a
+    real artifact path. Real artifacts carry sample counts, latency
+    percentiles, and an empty failure list.
+    """
+    if not isinstance(payload, dict):
+        return False
+    if not bool(payload.get("success")):
+        return False
+    failures = payload.get("failures")
+    if not isinstance(failures, list) or failures:
+        return False
+    try:
+        duration_s = float(payload.get("duration_s", 0.0))
+        hz = float(payload.get("hz", 0.0))
+    except (TypeError, ValueError):
+        return False
+    if duration_s <= 0.0 or hz <= 0.0:
+        return False
+    summary = payload.get("summary")
+    if not isinstance(summary, dict):
+        return False
+    try:
+        sample_count = int(summary.get("sample_count", 0))
+        error_count = int(summary.get("error_count", -1))
+    except (TypeError, ValueError):
+        return False
+    if sample_count <= 0 or error_count != 0:
+        return False
+    latency = summary.get("latency_ms")
+    if not isinstance(latency, dict):
+        return False
+    if "p95" not in latency:
+        return False
+    return True
 
 
 def validate_collision_matrix(
@@ -187,6 +260,19 @@ def validate_external_evidence(args: argparse.Namespace, failures: list[str],
                 "visual validation-load evidence reports success",
                 failures,
             ))
+            # Strict mode also requires the structural fields a real
+            # qualify-visual-state-live.py run emits — a status-only
+            # {"success": true} blob (e.g. the synthetic file the harness
+            # writes when MANYFORGE_PHASE4_VISUAL_LOAD_EVIDENCE=passed is
+            # set without a real artifact path) must not satisfy the gate.
+            # `--allow-incomplete` skips this stricter check so offline
+            # development runs keep their existing semantics.
+            if not args.allow_incomplete:
+                checks.append(check(
+                    _is_structural_visual_load_evidence(load_evidence),
+                    "visual validation-load evidence carries structural probe fields",
+                    failures,
+                ))
         if key == "live_isaac":
             live = load_optional_json(args.live_isaac_summary_json, failures, label)
             checks.append(check(
@@ -211,19 +297,23 @@ def iter_text_files(root: Path):
 
 
 def validate_release_cleanup(repo_root: Path, failures: list[str]) -> list[dict[str, Any]]:
-    hits: dict[str, list[str]] = {token: [] for token in FORBIDDEN_PRODUCTION_TOKENS}
+    compiled = [
+        (re.compile(pattern, re.MULTILINE | re.DOTALL), description)
+        for pattern, description in FORBIDDEN_PRODUCTION_PATTERNS
+    ]
+    hits: list[list[str]] = [[] for _ in compiled]
     for path in iter_text_files(repo_root):
         try:
             text = path.read_text(encoding="utf-8")
         except UnicodeDecodeError:
             continue
-        for token in FORBIDDEN_PRODUCTION_TOKENS:
-            if token in text:
-                hits[token].append(str(path.relative_to(repo_root)))
+        for index, (pattern, _) in enumerate(compiled):
+            if pattern.search(text):
+                hits[index].append(str(path.relative_to(repo_root)))
 
     checks = []
-    for token, description in FORBIDDEN_PRODUCTION_TOKENS.items():
-        ok = not hits[token]
+    for index, (_, description) in enumerate(compiled):
+        ok = not hits[index]
         checks.append(check(ok, f"no production {description}", failures))
     return checks
 

@@ -612,12 +612,6 @@ void RoboPlanPlanningContext::set_collision_engine_for_compare(
   compare_engine_ = std::move(engine);
 }
 
-void RoboPlanPlanningContext::set_engine_mismatch_emitter(
-    MismatchEmitter emitter) {
-  std::scoped_lock lock(compare_engine_mutex_);
-  mismatch_emitter_ = std::move(emitter);
-}
-
 void RoboPlanPlanningContext::set_engine_mismatch_record_emitter(
     MismatchRecordEmitter emitter) {
   std::scoped_lock lock(compare_engine_mutex_);
@@ -924,12 +918,10 @@ core::CollisionResult RoboPlanPlanningContext::collision_check_normalized(
   // with the legacy RoboPlan path. The secondary engine is never authoritative
   // on this adapter path.
   std::shared_ptr<core::ICollisionQueryEngine> compare_engine;
-  MismatchEmitter mismatch_emitter;
   MismatchRecordEmitter mismatch_record_emitter;
   {
     std::scoped_lock lock(compare_engine_mutex_);
     compare_engine = compare_engine_;
-    mismatch_emitter = mismatch_emitter_;
     mismatch_record_emitter = mismatch_record_emitter_;
   }
   if (compare_engine) {
@@ -988,9 +980,6 @@ core::CollisionResult RoboPlanPlanningContext::collision_check_normalized(
             std::to_string(result.collision_world_revision->revision_id);
       }
       details["query_id"] = query.query_id;
-      if (mismatch_emitter) {
-        mismatch_emitter(details);
-      }
       if (mismatch_record_emitter) {
         core::CollisionEngineMismatchRecord record;
         record.mismatch_id = result.engine_id + "_vs_" +
@@ -1858,6 +1847,8 @@ RoboPlanPlanningContext::object_snapshot_bodies_locked(
       body.frame_id = "universe";
       body.pose = pose_in_base_from_tracked_locked(tracked, "universe");
     }
+    body.source_timestamp_ns = tracked.source_timestamp_ns;
+    body.source_freshness_budget_ns = tracked.source_freshness_budget_ns;
     body.geometries.push_back(geometry_descriptor_for_shape_locked(
         body.body_id, body.owner_kind, tracked.shape));
     bodies.push_back(std::move(body));
@@ -2033,14 +2024,29 @@ RoboPlanPlanningContext::build_collision_policy_snapshot_locked(
           entry.pair = core::CollisionPairId{body_a, body_b};
         }
         if (configured) {
+          entry.mode = configured->mode;
           entry.max_start_penetration_m =
               configured->max_start_penetration_m;
+          entry.release_tolerance_m = configured->release_tolerance_m;
+          entry.min_release_progress_m =
+              configured->min_release_progress_m;
+          entry.min_separation_clearance_m =
+              configured->min_separation_clearance_m;
           entry.require_separation_by_end =
               configured->require_separation_by_end;
+          entry.require_strictly_decreasing_penetration =
+              configured->require_strictly_decreasing_penetration;
+          entry.allow_recontact = configured->allow_recontact;
         }
         policy.support_contacts.push_back(std::move(entry));
       }
     }
+  }
+  if (!policy.support_contacts.empty()) {
+    // Contact-release is a numeric safety contract. It is never valid to
+    // evaluate support contacts through a degraded body-pair-only policy: the
+    // ManyForge engine must provide signed clearance / penetration diagnostics.
+    policy.require_full_diagnostics = true;
   }
 
   sort_unique_pairs(policy.allowed_static_static_pairs);
@@ -2051,15 +2057,36 @@ RoboPlanPlanningContext::build_collision_policy_snapshot_locked(
               if (lhs.pair != rhs.pair) {
                 return lhs.pair < rhs.pair;
               }
+              if (lhs.mode != rhs.mode) {
+                return static_cast<int>(lhs.mode) < static_cast<int>(rhs.mode);
+              }
               if (lhs.max_start_penetration_m !=
                   rhs.max_start_penetration_m) {
                 return lhs.max_start_penetration_m <
                        rhs.max_start_penetration_m;
               }
+              if (lhs.release_tolerance_m != rhs.release_tolerance_m) {
+                return lhs.release_tolerance_m < rhs.release_tolerance_m;
+              }
+              if (lhs.min_release_progress_m !=
+                  rhs.min_release_progress_m) {
+                return lhs.min_release_progress_m <
+                       rhs.min_release_progress_m;
+              }
+              if (lhs.min_separation_clearance_m !=
+                  rhs.min_separation_clearance_m) {
+                return lhs.min_separation_clearance_m <
+                       rhs.min_separation_clearance_m;
+              }
               if (lhs.require_separation_by_end !=
                   rhs.require_separation_by_end) {
                 return lhs.require_separation_by_end <
                        rhs.require_separation_by_end;
+              }
+              if (lhs.require_strictly_decreasing_penetration !=
+                  rhs.require_strictly_decreasing_penetration) {
+                return lhs.require_strictly_decreasing_penetration <
+                       rhs.require_strictly_decreasing_penetration;
               }
               return lhs.allow_recontact < rhs.allow_recontact;
             });
@@ -2068,10 +2095,19 @@ RoboPlanPlanningContext::build_collision_policy_snapshot_locked(
                   policy.support_contacts.end(),
                   [](const auto& lhs, const auto& rhs) {
                     return lhs.pair == rhs.pair &&
+                           lhs.mode == rhs.mode &&
                            lhs.max_start_penetration_m ==
                                rhs.max_start_penetration_m &&
+                           lhs.release_tolerance_m ==
+                               rhs.release_tolerance_m &&
+                           lhs.min_release_progress_m ==
+                               rhs.min_release_progress_m &&
+                           lhs.min_separation_clearance_m ==
+                               rhs.min_separation_clearance_m &&
                            lhs.require_separation_by_end ==
                                rhs.require_separation_by_end &&
+                           lhs.require_strictly_decreasing_penetration ==
+                               rhs.require_strictly_decreasing_penetration &&
                            lhs.allow_recontact == rhs.allow_recontact;
                   }),
       policy.support_contacts.end());
@@ -2094,9 +2130,15 @@ RoboPlanPlanningContext::build_collision_policy_snapshot_locked(
     h.mix("support")
         .mix(entry.pair.body_a)
         .mix(entry.pair.body_b)
+        .mix(static_cast<std::int64_t>(entry.mode))
         .mix(entry.max_start_penetration_m)
+        .mix(entry.release_tolerance_m)
+        .mix(entry.min_release_progress_m)
+        .mix(entry.min_separation_clearance_m)
         .mix(static_cast<std::int64_t>(
             entry.require_separation_by_end ? 1 : 0))
+        .mix(static_cast<std::int64_t>(
+            entry.require_strictly_decreasing_penetration ? 1 : 0))
         .mix(static_cast<std::int64_t>(entry.allow_recontact ? 1 : 0));
   }
   policy.revision.revision_id = world_revision_id_;
@@ -2135,8 +2177,14 @@ std::string RoboPlanPlanningContext::compute_collision_world_content_hash_locked
     for (const auto& contact : tracked.support_contacts) {
       support_contacts.push_back(
           contact.support_object_id + ":" +
+          std::to_string(static_cast<int>(contact.mode)) + ":" +
           stable_double(contact.max_start_penetration_m) + ":" +
-          (contact.require_separation_by_end ? "1" : "0"));
+          stable_double(contact.release_tolerance_m) + ":" +
+          stable_double(contact.min_release_progress_m) + ":" +
+          stable_double(contact.min_separation_clearance_m) + ":" +
+          (contact.require_separation_by_end ? "1" : "0") + ":" +
+          (contact.require_strictly_decreasing_penetration ? "1" : "0") +
+          ":" + (contact.allow_recontact ? "1" : "0"));
     }
     std::sort(support_contacts.begin(), support_contacts.end());
     for (const auto& contact : support_contacts) {
@@ -2715,6 +2763,11 @@ core::SceneEditResultDTO RoboPlanPlanningContext::reparent_object_locked(
   new_state.pose = matrix_to_pose(t_target_object);
   new_state.frame_id = canonical_target_frame;
   new_state.attached = infer_attached_from_frame(canonical_target_frame);
+  // Reparenting changes pose authority: the object is now owned by the robot
+  // attachment chain or by an authored world-frame detach until a fresh
+  // pose-source update explicitly reclaims authority.
+  new_state.source_timestamp_ns.reset();
+  new_state.source_freshness_budget_ns.reset();
 
   Eigen::Matrix4d t_scene_object = scene_placement_from_tracked_locked(new_state);
   const std::string scene_target_frame =
@@ -2815,6 +2868,8 @@ core::SceneEditResultDTO RoboPlanPlanningContext::add_object(
         attached,
         {},
         request.support_contacts,
+        {},
+        {},
     };
 
     auto add_r = add_geometry_locked(request.object_id, new_state);
@@ -2975,6 +3030,33 @@ core::SceneEditResultDTO RoboPlanPlanningContext::update_object_pose(
     new_state.pose = request.pose;
     new_state.frame_id = is_world_frame(request.frame_id) ? "universe" : request.frame_id;
     new_state.attached = infer_attached_from_frame(new_state.frame_id);
+    if (request.source_timestamp_ns.has_value() !=
+        request.source_freshness_budget_ns.has_value()) {
+      result.error = core::ErrorDTO{
+          core::kErrorInvalidRequest,
+          "source_timestamp_ns and source_freshness_budget_ns must be provided "
+          "together for source-driven pose updates",
+          {},
+      };
+      return result;
+    }
+    if (request.source_timestamp_ns && *request.source_timestamp_ns < 0) {
+      result.error = core::ErrorDTO{core::kErrorInvalidRequest,
+                                    "source_timestamp_ns must be non-negative",
+                                    {}};
+      return result;
+    }
+    if (request.source_freshness_budget_ns &&
+        *request.source_freshness_budget_ns <= 0) {
+      result.error = core::ErrorDTO{
+          core::kErrorInvalidRequest,
+          "source_freshness_budget_ns must be positive",
+          {},
+      };
+      return result;
+    }
+    new_state.source_timestamp_ns = request.source_timestamp_ns;
+    new_state.source_freshness_budget_ns = request.source_freshness_budget_ns;
 
     Eigen::Matrix4d tform = scene_placement_from_tracked_locked(new_state);
     const std::string scene_target_frame =

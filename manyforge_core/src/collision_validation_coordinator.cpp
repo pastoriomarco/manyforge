@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <limits>
 #include <set>
 #include <utility>
 
@@ -44,11 +46,6 @@ CollisionDecisionAction action_for(CollisionDecisionResult decision) {
   return CollisionDecisionAction::kReject;
 }
 
-bool revisions_equal(const CollisionWorldRevision& a,
-                     const CollisionWorldRevision& b) {
-  return a.revision_id == b.revision_id && a.content_hash == b.content_hash;
-}
-
 void mark_cancelled(CollisionValidationDecisionBundle& bundle,
                     std::int64_t waypoint_index,
                     std::string reason) {
@@ -77,25 +74,85 @@ CollisionPairId canonicalize(CollisionPairId pair) {
 std::vector<std::string> required_capabilities_for(
     const CollisionPolicySnapshot& snapshot) {
   std::vector<std::string> capabilities;
-  if (!snapshot.require_full_diagnostics) {
+  const bool has_support_contacts = !snapshot.support_contacts.empty();
+  if (!snapshot.require_full_diagnostics && !has_support_contacts) {
     return capabilities;
   }
   if (!snapshot.allowed_static_static_pairs.empty() ||
       !snapshot.allowed_touch_link_pairs.empty() ||
-      !snapshot.support_contacts.empty()) {
+      has_support_contacts) {
     capabilities.push_back("body_pair_only");
   }
-  if (!snapshot.support_contacts.empty()) {
-    // Support-contact envelopes include max_start_penetration_m. Until a
-    // coordinator receives per-pair penetration diagnostics, a full-diagnostic
-    // support-contact policy must fail closed on engines that cannot provide
-    // this capability.
+  if (has_support_contacts) {
+    capabilities.push_back("distance");
     capabilities.push_back("penetration_depth");
+    for (const auto& entry : snapshot.support_contacts) {
+      if (entry.mode == CollisionContactPolicyMode::kContactProcess) {
+        capabilities.push_back("contact_process");
+      }
+    }
   }
   std::sort(capabilities.begin(), capabilities.end());
   capabilities.erase(std::unique(capabilities.begin(), capabilities.end()),
                      capabilities.end());
   return capabilities;
+}
+
+std::optional<double> clearance_for_pair(const CollisionResult& result,
+                                         const CollisionPairId& pair) {
+  const auto canonical = canonicalize(pair);
+  for (const auto& clearance : result.pair_clearances) {
+    if (canonicalize(clearance.pair) == canonical) {
+      return clearance.signed_clearance_m;
+    }
+  }
+  if (result.min_clearance_pair &&
+      canonicalize(*result.min_clearance_pair) == canonical &&
+      result.min_clearance_m) {
+    return *result.min_clearance_m;
+  }
+  return std::nullopt;
+}
+
+std::string pair_text(const CollisionPairId& pair) {
+  const auto canonical = canonicalize(pair);
+  return canonical.body_a + " <-> " + canonical.body_b;
+}
+
+void set_contact_release_diagnostic(CollisionValidationWaypointRecord& record,
+                                    const SupportContactPolicyEntry& entry,
+                                    std::string reason,
+                                    std::optional<double> initial_depth,
+                                    std::optional<double> current_depth) {
+  record.result.raw_diagnostics["contact_release_violation"] =
+      std::move(reason);
+  record.result.raw_diagnostics["contact_release_pair"] = pair_text(entry.pair);
+  record.result.raw_diagnostics["contact_release_mode"] =
+      entry.mode == CollisionContactPolicyMode::kContactProcess
+          ? "contact_process"
+          : "contact_release";
+  record.result.raw_diagnostics["contact_release_tolerance_m"] =
+      std::to_string(entry.release_tolerance_m);
+  record.result.raw_diagnostics["contact_release_max_start_penetration_m"] =
+      std::to_string(entry.max_start_penetration_m);
+  record.result.raw_diagnostics["contact_release_min_progress_m"] =
+      std::to_string(entry.min_release_progress_m);
+  record.result.raw_diagnostics["contact_release_min_separation_clearance_m"] =
+      std::to_string(entry.min_separation_clearance_m);
+  if (initial_depth) {
+    record.result.raw_diagnostics["contact_release_initial_penetration_m"] =
+        std::to_string(*initial_depth);
+  }
+  if (current_depth) {
+    record.result.raw_diagnostics["contact_release_current_penetration_m"] =
+        std::to_string(*current_depth);
+  }
+  for (auto& classified : record.result.normalized_pairs_classified) {
+    if (canonicalize(classified.pair) == canonicalize(entry.pair)) {
+      classified.is_first_failure = true;
+      break;
+    }
+  }
 }
 
 }  // namespace
@@ -163,6 +220,198 @@ CollisionValidationCoordinator::classify_result(
   return record;
 }
 
+void CollisionValidationCoordinator::apply_contact_release_constraints(
+    const TrajectoryDTO& trajectory,
+    CollisionValidationDecisionBundle& bundle,
+    CollisionDecisionResult& worst_decision,
+    CollisionDecisionSeverity& worst_severity,
+    std::optional<std::int64_t>& first_failing_waypoint,
+    std::optional<std::int64_t>& first_failing_time_ns) const {
+  auto record_violation = [&](CollisionValidationWaypointRecord& record,
+                              const SupportContactPolicyEntry& entry,
+                              CollisionDecisionResult decision,
+                              std::string reason,
+                              std::optional<double> initial_depth,
+                              std::optional<double> current_depth) {
+    if (decision == CollisionDecisionResult::kInconclusiveFail &&
+        worst_decision != CollisionDecisionResult::kStopRequested) {
+      worst_decision = CollisionDecisionResult::kInconclusiveFail;
+    } else if (worst_decision == CollisionDecisionResult::kPass ||
+               worst_decision == CollisionDecisionResult::kWarn) {
+      worst_decision = decision;
+    }
+    worst_severity = CollisionDecisionSeverity::kBlock;
+    record.result.decision = decision;
+    record.produced_decision_change = true;
+    set_contact_release_diagnostic(record,
+                                   entry,
+                                   std::move(reason),
+                                   initial_depth,
+                                   current_depth);
+    if (!first_failing_waypoint.has_value()) {
+      first_failing_waypoint = record.waypoint_index;
+      first_failing_time_ns = record.time_from_start_ns;
+    }
+  };
+
+  if (bundle.waypoint_records.empty()) {
+    return;
+  }
+
+  for (const auto& support_entry : config_.policy_snapshot.support_contacts) {
+    if (support_entry.mode == CollisionContactPolicyMode::kContactProcess) {
+      record_violation(bundle.waypoint_records.front(),
+                       support_entry,
+                       CollisionDecisionResult::kInconclusiveFail,
+                       "contact_process_policy_not_implemented",
+                       std::nullopt,
+                       std::nullopt);
+      continue;
+    }
+
+    const double tolerance = std::max(0.0, support_entry.release_tolerance_m);
+    const double max_start =
+        std::max(0.0, support_entry.max_start_penetration_m);
+    const double min_progress =
+        std::max(0.0, support_entry.min_release_progress_m);
+
+    bool started_in_contact = false;
+    bool separated = false;
+    std::optional<double> initial_depth;
+    double previous_depth = 0.0;
+    double best_depth = std::numeric_limits<double>::infinity();
+
+    for (std::size_t i = 0; i < bundle.waypoint_records.size(); ++i) {
+      auto& record = bundle.waypoint_records[i];
+      const auto clearance = clearance_for_pair(record.result,
+                                                support_entry.pair);
+      if (!clearance || !std::isfinite(*clearance)) {
+        record_violation(record,
+                         support_entry,
+                         CollisionDecisionResult::kInconclusiveFail,
+                         "missing_contact_release_clearance",
+                         initial_depth,
+                         std::nullopt);
+        break;
+      }
+
+      const double depth = std::max(0.0, -*clearance);
+      const bool separated_now =
+          *clearance >= support_entry.min_separation_clearance_m;
+
+      if (i == 0) {
+        if (depth <= tolerance || separated_now) {
+          previous_depth = 0.0;
+          best_depth = 0.0;
+          continue;
+        }
+        started_in_contact = true;
+        initial_depth = depth;
+        previous_depth = depth;
+        best_depth = depth;
+        if (depth > max_start + tolerance) {
+          record_violation(record,
+                           support_entry,
+                           CollisionDecisionResult::kFail,
+                           "initial_penetration_exceeds_policy",
+                           initial_depth,
+                           depth);
+          break;
+        }
+        continue;
+      }
+
+      if (!started_in_contact) {
+        if (depth > tolerance && !separated_now) {
+          record_violation(record,
+                           support_entry,
+                           CollisionDecisionResult::kFail,
+                           "new_active_contact_after_clear_start",
+                           initial_depth,
+                           depth);
+          break;
+        }
+        continue;
+      }
+
+      if (separated) {
+        if (depth > tolerance && !separated_now) {
+          if (!support_entry.allow_recontact) {
+            record_violation(record,
+                             support_entry,
+                             CollisionDecisionResult::kFail,
+                             "recontact_after_release",
+                             initial_depth,
+                             depth);
+            break;
+          }
+          if (depth > max_start + tolerance) {
+            record_violation(record,
+                             support_entry,
+                             CollisionDecisionResult::kFail,
+                             "recontact_penetration_exceeds_policy",
+                             initial_depth,
+                             depth);
+            break;
+          }
+        }
+      }
+
+      if (separated_now) {
+        separated = true;
+        previous_depth = 0.0;
+        best_depth = std::min(best_depth, 0.0);
+        continue;
+      }
+
+      if (depth > previous_depth + tolerance) {
+        record_violation(record,
+                         support_entry,
+                         CollisionDecisionResult::kFail,
+                         "penetration_increased",
+                         initial_depth,
+                         depth);
+        break;
+      }
+      previous_depth = depth;
+      best_depth = std::min(best_depth, depth);
+    }
+
+    if (!started_in_contact || first_failing_waypoint.has_value()) {
+      continue;
+    }
+
+    auto& final_record = bundle.waypoint_records.back();
+    const auto final_clearance =
+        clearance_for_pair(final_record.result, support_entry.pair);
+    const double final_depth =
+        final_clearance ? std::max(0.0, -*final_clearance) : previous_depth;
+    if (support_entry.require_separation_by_end && !separated) {
+      record_violation(final_record,
+                       support_entry,
+                       CollisionDecisionResult::kFail,
+                       "final_sample_not_separated",
+                       initial_depth,
+                       final_depth);
+      continue;
+    }
+    if (support_entry.require_strictly_decreasing_penetration && !separated) {
+      const double required_progress = std::max(min_progress, tolerance);
+      const double progress = *initial_depth - best_depth;
+      if (progress + tolerance < required_progress) {
+        record_violation(final_record,
+                         support_entry,
+                         CollisionDecisionResult::kFail,
+                         "insufficient_release_progress",
+                         initial_depth,
+                         final_depth);
+      }
+    }
+  }
+
+  (void)trajectory;
+}
+
 CollisionQuery CollisionValidationCoordinator::make_query(
     const RobotStateDTO& state, std::int64_t waypoint_index,
     std::optional<std::int64_t> time_from_start_ns,
@@ -186,18 +435,6 @@ CollisionQuery CollisionValidationCoordinator::make_query(
 
 CollisionValidationWaypointRecord
 CollisionValidationCoordinator::classify_one(
-    IPlanningContext& context, const RobotStateDTO& state,
-    std::int64_t waypoint_index, std::optional<std::int64_t> time_from_start_ns,
-    const CollisionWorldRevision& borrowed_revision) {
-  auto query =
-      make_query(state, waypoint_index, time_from_start_ns, borrowed_revision);
-  return classify_result(context.collision_check_normalized(query),
-                         waypoint_index, time_from_start_ns,
-                         borrowed_revision);
-}
-
-CollisionValidationWaypointRecord
-CollisionValidationCoordinator::classify_one(
     const CollisionWorldSnapshot& snapshot, ICollisionQueryEngine& engine,
     const RobotStateDTO& state, std::int64_t waypoint_index,
     std::optional<std::int64_t> time_from_start_ns,
@@ -209,99 +446,6 @@ CollisionValidationCoordinator::classify_one(
                                       cancel),
                          waypoint_index, time_from_start_ns,
                          borrowed_revision);
-}
-
-CollisionValidationDecisionBundle
-CollisionValidationCoordinator::run_pass_once(
-    IPlanningContext& context, const TrajectoryDTO& trajectory) {
-  CollisionValidationDecisionBundle bundle;
-  bundle.borrowed_world_revision = context.current_collision_world_revision();
-
-  evaluator_.reset();
-
-  CollisionDecisionResult worst_decision = CollisionDecisionResult::kPass;
-  CollisionDecisionSeverity worst_severity = CollisionDecisionSeverity::kNone;
-  std::optional<std::int64_t> first_failing_waypoint;
-  std::optional<std::int64_t> first_failing_time_ns;
-
-  for (std::size_t i = 0; i < trajectory.waypoints.size(); ++i) {
-    const auto& wp = trajectory.waypoints[i];
-    RobotStateDTO state;
-    state.joint_names = trajectory.joint_names;
-    state.positions_rad = wp.positions_rad;
-
-    std::optional<std::int64_t> time_from_start_ns =
-        static_cast<std::int64_t>(wp.time_from_start_s * 1e9);
-    auto record = classify_one(context, state, static_cast<std::int64_t>(i),
-                               time_from_start_ns,
-                               bundle.borrowed_world_revision);
-    const auto wp_decision = record.result.decision;
-    const auto wp_severity = severity_for(wp_decision);
-
-    if (wp_severity > worst_severity ||
-        (wp_severity == worst_severity &&
-         wp_decision != CollisionDecisionResult::kPass &&
-         worst_decision == CollisionDecisionResult::kPass)) {
-      worst_decision = wp_decision;
-      worst_severity = wp_severity;
-    }
-    if (wp_decision != CollisionDecisionResult::kPass &&
-        !first_failing_waypoint.has_value()) {
-      first_failing_waypoint = record.waypoint_index;
-      first_failing_time_ns = record.time_from_start_ns;
-    }
-    bundle.waypoint_records.push_back(std::move(record));
-  }
-
-  for (const auto& support_entry : config_.policy_snapshot.support_contacts) {
-    if (!support_entry.require_separation_by_end) {
-      continue;
-    }
-    const auto required_pair = canonicalize(support_entry.pair);
-    bool contact_started = false;
-    bool separated = false;
-    for (const auto& record : bundle.waypoint_records) {
-      for (const auto& classified :
-           record.result.normalized_pairs_classified) {
-        if (canonicalize(classified.pair) != required_pair) {
-          continue;
-        }
-        switch (classified.classification) {
-          case CollisionPairClassification::kSupportContactStart:
-          case CollisionPairClassification::kSupportContactContinued:
-          case CollisionPairClassification::kSupportContactRecontactViolation:
-            contact_started = true;
-            break;
-          case CollisionPairClassification::kSupportContactSeparated:
-            separated = true;
-            break;
-          default:
-            break;
-        }
-      }
-    }
-    if (contact_started && !separated) {
-      worst_decision = CollisionDecisionResult::kFail;
-      worst_severity = CollisionDecisionSeverity::kBlock;
-      if (!first_failing_waypoint.has_value() && !trajectory.waypoints.empty()) {
-        first_failing_waypoint =
-            static_cast<std::int64_t>(trajectory.waypoints.size() - 1);
-        const auto& final_wp = trajectory.waypoints.back();
-        first_failing_time_ns =
-            static_cast<std::int64_t>(final_wp.time_from_start_s * 1e9);
-      }
-    }
-  }
-
-  bundle.decision.accepted = (worst_decision == CollisionDecisionResult::kPass);
-  bundle.decision.severity = worst_severity;
-  bundle.decision.action = action_for(worst_decision);
-  bundle.decision.first_failing_waypoint = first_failing_waypoint;
-  bundle.decision.first_failing_time_ns = first_failing_time_ns;
-  bundle.decision.collision_world_revision = bundle.borrowed_world_revision;
-
-  bundle.final_world_revision = context.current_collision_world_revision();
-  return bundle;
 }
 
 CollisionValidationDecisionBundle
@@ -375,45 +519,12 @@ CollisionValidationCoordinator::run_pass_once(
     }
   }
 
-  for (const auto& support_entry : config_.policy_snapshot.support_contacts) {
-    if (!support_entry.require_separation_by_end) {
-      continue;
-    }
-    const auto required_pair = canonicalize(support_entry.pair);
-    bool contact_started = false;
-    bool separated = false;
-    for (const auto& record : bundle.waypoint_records) {
-      for (const auto& classified :
-           record.result.normalized_pairs_classified) {
-        if (canonicalize(classified.pair) != required_pair) {
-          continue;
-        }
-        switch (classified.classification) {
-          case CollisionPairClassification::kSupportContactStart:
-          case CollisionPairClassification::kSupportContactContinued:
-          case CollisionPairClassification::kSupportContactRecontactViolation:
-            contact_started = true;
-            break;
-          case CollisionPairClassification::kSupportContactSeparated:
-            separated = true;
-            break;
-          default:
-            break;
-        }
-      }
-    }
-    if (contact_started && !separated) {
-      worst_decision = CollisionDecisionResult::kFail;
-      worst_severity = CollisionDecisionSeverity::kBlock;
-      if (!first_failing_waypoint.has_value() && !trajectory.waypoints.empty()) {
-        first_failing_waypoint =
-            static_cast<std::int64_t>(trajectory.waypoints.size() - 1);
-        const auto& final_wp = trajectory.waypoints.back();
-        first_failing_time_ns =
-            static_cast<std::int64_t>(final_wp.time_from_start_s * 1e9);
-      }
-    }
-  }
+  apply_contact_release_constraints(trajectory,
+                                    bundle,
+                                    worst_decision,
+                                    worst_severity,
+                                    first_failing_waypoint,
+                                    first_failing_time_ns);
 
   bundle.decision.accepted = (worst_decision == CollisionDecisionResult::kPass);
   bundle.decision.severity = worst_severity;
@@ -426,93 +537,11 @@ CollisionValidationCoordinator::run_pass_once(
 }
 
 CollisionValidationDecisionBundle
-CollisionValidationCoordinator::validate_state(IPlanningContext& context,
-                                                const RobotStateDTO& state) {
-  TrajectoryDTO single;
-  single.joint_names = state.joint_names;
-  TrajectoryWaypointDTO wp;
-  wp.positions_rad = state.positions_rad;
-  wp.time_from_start_s = 0.0;
-  single.waypoints.push_back(std::move(wp));
-  return validate_trajectory(context, single);
-}
-
-CollisionValidationDecisionBundle
 CollisionValidationCoordinator::validate_trajectory(
     const CollisionWorldSnapshot& snapshot, ICollisionQueryEngine& engine,
     const TrajectoryDTO& trajectory,
     const CollisionCancellationToken& cancel) {
   return run_pass_once(snapshot, engine, trajectory, cancel);
-}
-
-CollisionValidationDecisionBundle
-CollisionValidationCoordinator::validate_trajectory(
-    IPlanningContext& context, const TrajectoryDTO& trajectory) {
-  auto bundle = run_pass_once(context, trajectory);
-
-  if (!config_.require_pose_source_borrow) {
-    return bundle;
-  }
-
-  const auto final_rev =
-      bundle.final_world_revision.value_or(CollisionWorldRevision{});
-  if (revisions_equal(bundle.borrowed_world_revision, final_rev)) {
-    return bundle;
-  }
-
-  // Revision changed mid-pass. Retry up to max_count times within
-  // retry_wall_time_ns wall budget. Surface scene_changed_during_validation
-  // and downgrade the decision to inconclusive if all retries are exhausted.
-  const auto retry_start_ns = clock_now_();
-  std::set<std::pair<std::uint64_t, std::string>> observed_revisions;
-  auto record_revisions = [&observed_revisions](
-                              const CollisionValidationDecisionBundle& b) {
-    observed_revisions.insert({b.borrowed_world_revision.revision_id,
-                               b.borrowed_world_revision.content_hash});
-    if (b.final_world_revision) {
-      observed_revisions.insert({b.final_world_revision->revision_id,
-                                 b.final_world_revision->content_hash});
-    }
-  };
-  record_revisions(bundle);
-  bool churn_window_exceeded = false;
-  for (int retry_idx = 0;
-       retry_idx < config_.pose_source_retry.max_count; ++retry_idx) {
-    const auto elapsed_ns = clock_now_() - retry_start_ns;
-    if (elapsed_ns > config_.pose_source_retry.retry_wall_time_ns) {
-      break;
-    }
-    if (config_.pose_source_retry.churn_max_revisions > 0 &&
-        elapsed_ns <= config_.pose_source_retry.churn_window_ns &&
-        static_cast<int>(observed_revisions.size()) >
-            config_.pose_source_retry.churn_max_revisions) {
-      churn_window_exceeded = true;
-      break;
-    }
-    bundle = run_pass_once(context, trajectory);
-    bundle.pose_source_retries_used = retry_idx + 1;
-    record_revisions(bundle);
-    const auto post_retry_elapsed_ns = clock_now_() - retry_start_ns;
-    if (config_.pose_source_retry.churn_max_revisions > 0 &&
-        post_retry_elapsed_ns <= config_.pose_source_retry.churn_window_ns &&
-        static_cast<int>(observed_revisions.size()) >
-            config_.pose_source_retry.churn_max_revisions) {
-      churn_window_exceeded = true;
-      break;
-    }
-    const auto rev_after =
-        bundle.final_world_revision.value_or(CollisionWorldRevision{});
-    if (revisions_equal(bundle.borrowed_world_revision, rev_after)) {
-      return bundle;
-    }
-  }
-
-  bundle.scene_changed_during_validation = true;
-  bundle.churn_window_exceeded = churn_window_exceeded;
-  bundle.decision.accepted = false;
-  bundle.decision.severity = CollisionDecisionSeverity::kBlock;
-  bundle.decision.action = CollisionDecisionAction::kInconclusive;
-  return bundle;
 }
 
 }  // namespace manyforge::core

@@ -198,6 +198,8 @@ class SceneEditRequest:
     frame_id: Optional[str] = None
     touch_links: Optional[List[str]] = None
     support_contacts: Optional[List[Dict[str, Any]]] = None
+    source_timestamp_ns: Optional[int] = None
+    source_freshness_budget_ns: Optional[int] = None
 
 
 @dataclass
@@ -381,8 +383,27 @@ def _validate_scene_edit_request(request: SceneEditRequest) -> Optional[str]:
                     or max_start_penetration_m < 0.0
                 ):
                     return f"support_contacts[{index}].max_start_penetration_m must be >= 0"
-                if contact.get("require_separation_by_end", True) is not True:
-                    return f"support_contacts[{index}].require_separation_by_end must be true"
+                mode = contact.get("mode", "contact_release")
+                if mode not in {"contact_release", "contact_process"}:
+                    return (
+                        f"support_contacts[{index}].mode must be contact_release "
+                        "or contact_process"
+                    )
+                for field_name in (
+                    "release_tolerance_m",
+                    "min_release_progress_m",
+                    "min_separation_clearance_m",
+                ):
+                    value = contact.get(field_name, 0.0)
+                    if not isinstance(value, (int, float)) or value < 0.0:
+                        return f"support_contacts[{index}].{field_name} must be >= 0"
+                for field_name in (
+                    "require_separation_by_end",
+                    "require_strictly_decreasing_penetration",
+                    "allow_recontact",
+                ):
+                    if field_name in contact and not isinstance(contact[field_name], bool):
+                        return f"support_contacts[{index}].{field_name} must be boolean"
 
     if request.operation == "update_pose":
         if request.pose_position_m is None:
@@ -391,6 +412,18 @@ def _validate_scene_edit_request(request: SceneEditRequest) -> Optional[str]:
             return "pose_position_m must have exactly 3 elements"
         if request.pose_orientation_xyzw is not None and not _is_vector(request.pose_orientation_xyzw, 4):
             return "pose_orientation_xyzw must have exactly 4 elements"
+        source_timestamp = request.source_timestamp_ns
+        source_budget = request.source_freshness_budget_ns
+        if (source_timestamp is None) != (source_budget is None):
+            return (
+                "update_pose source_timestamp_ns and "
+                "source_freshness_budget_ns must be provided together"
+            )
+        if source_timestamp is not None:
+            if not isinstance(source_timestamp, int) or source_timestamp < 0:
+                return "source_timestamp_ns must be a non-negative integer"
+            if not isinstance(source_budget, int) or source_budget <= 0:
+                return "source_freshness_budget_ns must be a positive integer"
 
     if request.operation == "attach" and not request.frame_id:
         return "attach requires frame_id"

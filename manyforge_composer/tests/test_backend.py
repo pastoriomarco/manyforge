@@ -1559,7 +1559,7 @@ def test_load_program_rebuilds_kernel_from_deployment_config():
     assert len(calls) == 1
     assert calls[0] is state.deployment
     assert state.deployment is not None
-    assert state.deployment.orchestrator.config["collision_monitor_period_ms"] == 10.0
+    assert state.deployment.orchestrator.config["collision_monitor_period_ms"] == 50.0
     assert isinstance(state._kernel, RebuiltKernel)
     assert state.kernel_bundle == {"bundle": 1}
 

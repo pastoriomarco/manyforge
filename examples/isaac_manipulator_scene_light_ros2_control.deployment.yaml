@@ -134,7 +134,7 @@ adapters:
 orchestrator:
   engine: py_trees
   config:
-    collision_monitor_period_ms: 10
+    collision_monitor_period_ms: 50.0
 launch:
   runner:
     module: manyforge_behavior.runner

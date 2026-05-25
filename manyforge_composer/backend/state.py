@@ -2873,12 +2873,53 @@ class ComposerState:
                         rejected_count += 1
                         details.append(detail)
                         continue
-                    age_s = observed.get("age_s")
-                    if age_s is not None and float(age_s) > float(source.stale_after_s):
+                    age_s_raw = observed.get("age_s")
+                    if age_s_raw is None:
+                        detail["status"] = "rejected"
+                        detail["reject_reason"] = "missing_age"
+                        rejected_count += 1
+                        details.append(detail)
+                        continue
+                    try:
+                        age_s = float(age_s_raw)
+                    except (TypeError, ValueError):
+                        detail["status"] = "rejected"
+                        detail["reject_reason"] = "malformed_age"
+                        detail["age_s"] = str(age_s_raw)
+                        rejected_count += 1
+                        details.append(detail)
+                        continue
+                    if age_s < 0.0:
+                        detail["status"] = "rejected"
+                        detail["reject_reason"] = "negative_age"
+                        detail["age_s"] = age_s
+                        rejected_count += 1
+                        details.append(detail)
+                        continue
+                    if age_s > float(source.stale_after_s):
                         detail["status"] = "rejected"
                         detail["reject_reason"] = "stale"
-                        detail["age_s"] = float(age_s)
+                        detail["age_s"] = age_s
                         detail["stale_after_s"] = float(source.stale_after_s)
+                        rejected_count += 1
+                        details.append(detail)
+                        continue
+                    received_at_ns = int(snapshot.get("received_at_ns", 0) or 0)
+                    source_freshness_budget_ns = int(float(source.stale_after_s) * 1_000_000_000)
+                    if received_at_ns <= 0 or source_freshness_budget_ns <= 0:
+                        detail["status"] = "rejected"
+                        detail["reject_reason"] = "invalid_freshness_budget"
+                        detail["received_at_ns"] = received_at_ns
+                        detail["source_freshness_budget_ns"] = source_freshness_budget_ns
+                        rejected_count += 1
+                        details.append(detail)
+                        continue
+                    source_timestamp_ns = received_at_ns - int(age_s * 1_000_000_000)
+                    if source_timestamp_ns < 0:
+                        detail["status"] = "rejected"
+                        detail["reject_reason"] = "invalid_source_timestamp"
+                        detail["received_at_ns"] = received_at_ns
+                        detail["age_s"] = age_s
                         rejected_count += 1
                         details.append(detail)
                         continue
@@ -2930,6 +2971,8 @@ class ComposerState:
                         pose_position_m=edit_position,
                         pose_orientation_xyzw=edit_orientation,
                         frame_id=edit_frame_id,
+                        source_timestamp_ns=source_timestamp_ns,
+                        source_freshness_budget_ns=source_freshness_budget_ns,
                     )
                     result = self.kernel.scene_edit(scene_request)
                     if not result.success:

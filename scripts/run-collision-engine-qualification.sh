@@ -22,7 +22,26 @@ if [[ "${1:-}" == "--in-container" ]]; then
   IN_CONTAINER=true
 fi
 
+source_ros_setup_if_available() {
+  if [[ -f /opt/ros/jazzy/setup.bash ]]; then
+    # The in-container CMake path may need ament_package from the ROS Python
+    # tree even when the active Python executable comes from the ManyForge venv.
+    # Source ROS explicitly so qualification does not depend on caller state.
+    # shellcheck disable=SC1091
+    set +u
+    source /opt/ros/jazzy/setup.bash
+    set -u
+  fi
+  local cmeel_prefix="${MANYFORGE_CMEEL_PREFIX:-/opt/manyforge/venv/lib/python3.12/site-packages/cmeel.prefix}"
+  if [[ -d "${cmeel_prefix}" ]]; then
+    export CMAKE_PREFIX_PATH="${cmeel_prefix}:${CMAKE_PREFIX_PATH:-}"
+    export LD_LIBRARY_PATH="${cmeel_prefix}/lib:${LD_LIBRARY_PATH:-}"
+    export PKG_CONFIG_PATH="${cmeel_prefix}/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+  fi
+}
+
 run_inside_container() {
+  source_ros_setup_if_available
   local build_dir="${MANYFORGE_BUILD_DIR:-/tmp/manyforge-build}/roboplan"
   local source_file="${WORKSPACE:-/workspace}/tests/cpp/perf/perf_collision_engine_qualification.cpp"
   local binary="${build_dir}/manyforge_integration_tests/perf_collision_engine_qualification"

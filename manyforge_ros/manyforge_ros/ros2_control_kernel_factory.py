@@ -38,6 +38,8 @@ def create_ros2_control_kernel(
     *,
     deployment: Deployment,
     collision_monitor_period_ns: int | None = None,
+    runtime_collision_query_timeout_ns: int | None = None,
+    runtime_dynamic_body_max_age_cap_ns: int | None = None,
 ):
     """Create a KernelClient that plans with RoboPlan and executes via C++ ROS."""
     robot_config = deployment.robot_config
@@ -67,6 +69,14 @@ def create_ros2_control_kernel(
     kernel_config: dict[str, float | int] = {}
     if collision_monitor_period_ns is not None:
         kernel_config["collision_monitor_period_ns"] = collision_monitor_period_ns
+    if runtime_collision_query_timeout_ns is not None:
+        kernel_config["runtime_collision_query_timeout_ns"] = (
+            runtime_collision_query_timeout_ns
+        )
+    if runtime_dynamic_body_max_age_cap_ns is not None:
+        kernel_config["runtime_dynamic_body_max_age_cap_ns"] = (
+            runtime_dynamic_body_max_age_cap_ns
+        )
     for key in ("streaming_ik_timeout_s", "streaming_ik_timeout_ms"):
         if key in config:
             kernel_config[key] = config[key]

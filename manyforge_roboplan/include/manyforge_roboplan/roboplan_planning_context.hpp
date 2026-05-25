@@ -135,16 +135,6 @@ class RoboPlanPlanningContext final
   void set_collision_engine_for_compare(
       std::shared_ptr<core::ICollisionQueryEngine> engine);
 
-  /// Register a callback that receives engine-mismatch records when
-  /// compare mode is active. Pass an empty function to clear.
-  ///
-  /// Signature: `void(const std::map<std::string, std::string>& details)`.
-  /// The details payload mirrors the eventual
-  /// `KernelEventType::kCollisionEngineMismatch` event details.
-  using MismatchEmitter =
-      std::function<void(const std::map<std::string, std::string>&)>;
-  void set_engine_mismatch_emitter(MismatchEmitter emitter);
-
   /// Register a structured-record emitter that receives canonical
   /// `CollisionEngineMismatchRecord` values (Chunk 8 groundwork of the
   /// collision-ownership plan). Deployment / kernel wiring typically points
@@ -201,6 +191,8 @@ class RoboPlanPlanningContext final
     bool attached = false;
     std::vector<std::string> touch_links;
     std::vector<core::SupportContactDTO> support_contacts;
+    std::optional<std::int64_t> source_timestamp_ns;
+    std::optional<std::int64_t> source_freshness_budget_ns;
   };
 
   struct CollisionPairDiagnostic {
@@ -323,7 +315,6 @@ class RoboPlanPlanningContext final
   // mode. Emitter receives mismatch records when both engines run.
   mutable std::mutex compare_engine_mutex_;
   std::shared_ptr<core::ICollisionQueryEngine> compare_engine_;
-  MismatchEmitter mismatch_emitter_;
   MismatchRecordEmitter mismatch_record_emitter_;
 
   // Collision-world revision publisher (Chunk 2). Bumped on every successful

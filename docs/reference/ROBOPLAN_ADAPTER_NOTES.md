@@ -132,9 +132,9 @@ it cannot independently detect a runtime deviation that re-enters only that
 support pair after validation. This is one of the reasons the workaround must be
 removed once RoboPlan exposes request-scoped collision policy/contact queries.
 
-The execution monitor is not a 10 ms "grace period" for support contacts. The
+The execution monitor is not a 50 ms "grace period" for support contacts. The
 kernel starts monitoring after a trajectory has passed validation and execution
-has begun; the default monitor tick period is 10 ms. Support-contact pairs are
+has begun; the default monitor tick period is 50 ms / 20 Hz. Support-contact pairs are
 already disabled in the RoboPlan planner projection at that point, so the live
 monitor does not require the initial attached-object/support contact to separate
 before the first tick. The planned trajectory must have proven release during

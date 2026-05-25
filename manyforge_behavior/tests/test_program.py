@@ -354,7 +354,7 @@ class TestProgramValidation:
             "support_object_id"
         ] == "table"
 
-    def test_rejects_scene_resource_support_contact_without_release_requirement(self, catalog):
+    def test_rejects_scene_resource_support_contact_invalid_boolean_policy_field(self, catalog):
         data = _minimal_program(
             scene=[
                 {
@@ -369,7 +369,7 @@ class TestProgramValidation:
                         "support_contacts": [
                             {
                                 "support_object_id": "table",
-                                "require_separation_by_end": False,
+                                "require_separation_by_end": "no",
                             }
                         ]
                     },
@@ -378,7 +378,7 @@ class TestProgramValidation:
         )
         with pytest.raises(
             ProgramValidationError,
-            match=r"metadata\.support_contacts\[0\]\.require_separation_by_end must be true",
+            match=r"metadata\.support_contacts\[0\]\.require_separation_by_end must be boolean",
         ):
             Program.from_dict(data, catalog)
 

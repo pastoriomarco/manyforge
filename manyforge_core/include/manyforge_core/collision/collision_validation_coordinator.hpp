@@ -105,20 +105,24 @@ struct CollisionValidationDecisionBundle {
 /// The coordinator is the authoritative pre-execution validation surface
 /// for collision. It:
 ///
-///   - borrows the active collision-world revision at start so concurrent
-///     pose-source applies cannot mutate the snapshot under it;
+///   - takes an immutable `CollisionWorldSnapshot` reference for the whole
+///     pass so concurrent pose-source applies cannot mutate the world
+///     under it; the snapshot's revision is the borrowed revision;
 ///   - owns one CollisionPolicyEvaluator instance with trajectory-scoped
 ///     support-contact state that evolves across waypoints in trajectory
 ///     order;
-///   - calls `IPlanningContext::collision_check_normalized` per waypoint,
-///     so backend choice and engine compare mode remain adapter concerns;
+///   - calls `ICollisionQueryEngine::check(snapshot, query, policy, cancel)`
+///     per waypoint, so backend choice and engine compare mode remain
+///     adapter concerns and the coordinator never reads planner-owned
+///     mutable scene state;
 ///   - merges engine status with the evaluator's classification deterministi-
 ///     cally, never downgrading kInconclusiveFail / kStopRequested.
 ///
 /// The coordinator is single-threaded by design. Parallelism is added by the
 /// ParallelCollisionValidationWorkerPool (Chunk 7), which runs multiple
-/// coordinator instances against independent query contexts and merges by
-/// lowest failing waypoint index.
+/// coordinator instances against independent `ICollisionQueryEngine`
+/// instances sharing the same snapshot, and merges by lowest failing
+/// waypoint index.
 class CollisionValidationCoordinator {
  public:
   using ClockNow = std::function<TimePoint()>;
@@ -128,23 +132,6 @@ class CollisionValidationCoordinator {
   ///   timestamp. Defaults to steady_clock. Used only for retry timing.
   explicit CollisionValidationCoordinator(CollisionValidationPassConfig config,
                                           ClockNow clock_now = nullptr);
-
-  /// Validate a single robot state at a fixed instant. Used both for
-  /// pre-execute start-state gates and for unit-test fixtures.
-  CollisionValidationDecisionBundle validate_state(IPlanningContext& context,
-                                                    const RobotStateDTO& state);
-
-  /// Validate a full trajectory in waypoint order. The evaluator sees
-  /// waypoints in their authoritative order so the support-contact state
-  /// machine evolves correctly.
-  ///
-  /// If the planning context's `current_collision_world_revision()` differs
-  /// between the start and the end of the pass, and
-  /// `require_pose_source_borrow` is true, this method retries up to
-  /// `pose_source_retry.max_count` times before returning a bundle with
-  /// `scene_changed_during_validation = true` and a kInconclusive decision.
-  CollisionValidationDecisionBundle validate_trajectory(
-      IPlanningContext& context, const TrajectoryDTO& trajectory);
 
   /// Validate a full trajectory in waypoint order against a scene-aware
   /// collision-query engine and immutable collision-world snapshot.
@@ -167,21 +154,12 @@ class CollisionValidationCoordinator {
 
  private:
   CollisionValidationDecisionBundle run_pass_once(
-      IPlanningContext& context, const TrajectoryDTO& trajectory);
-
-  CollisionValidationDecisionBundle run_pass_once(
       const CollisionWorldSnapshot& snapshot,
       ICollisionQueryEngine& engine,
       const TrajectoryDTO& trajectory,
       const CollisionCancellationToken& cancel);
 
   /// Classify a single waypoint and update support-contact state.
-  CollisionValidationWaypointRecord classify_one(
-      IPlanningContext& context, const RobotStateDTO& state,
-      std::int64_t waypoint_index,
-      std::optional<std::int64_t> time_from_start_ns,
-      const CollisionWorldRevision& borrowed_revision);
-
   CollisionValidationWaypointRecord classify_one(
       const CollisionWorldSnapshot& snapshot,
       ICollisionQueryEngine& engine,
@@ -202,6 +180,14 @@ class CollisionValidationCoordinator {
       std::int64_t waypoint_index,
       std::optional<std::int64_t> time_from_start_ns,
       const CollisionWorldRevision& borrowed_revision);
+
+  void apply_contact_release_constraints(
+      const TrajectoryDTO& trajectory,
+      CollisionValidationDecisionBundle& bundle,
+      CollisionDecisionResult& worst_decision,
+      CollisionDecisionSeverity& worst_severity,
+      std::optional<std::int64_t>& first_failing_waypoint,
+      std::optional<std::int64_t>& first_failing_time_ns) const;
 
   /// Merge an engine-level CollisionDecisionResult with a policy-level one.
   /// kInconclusiveFail / kStopRequested cannot be downgraded.

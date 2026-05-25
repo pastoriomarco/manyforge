@@ -212,20 +212,56 @@ std::vector<SupportContactDTO> support_contacts_from_python(const py::dict& requ
     if (contact.support_object_id.empty()) {
       throw std::invalid_argument("support_object_id must not be empty");
     }
+    auto nonnegative_finite = [](double value, const char* field) {
+      if (!std::isfinite(value) || value < 0.0) {
+        throw std::invalid_argument(std::string(field) + " must be finite and >= 0");
+      }
+    };
+    if (contact_dict.contains("mode")) {
+      const auto mode = contact_dict["mode"].cast<std::string>();
+      if (mode == "contact_release") {
+        contact.mode = CollisionContactPolicyMode::kContactRelease;
+      } else if (mode == "contact_process") {
+        contact.mode = CollisionContactPolicyMode::kContactProcess;
+      } else {
+        throw std::invalid_argument(
+            "support_contacts mode must be contact_release or contact_process");
+      }
+    }
     if (contact_dict.contains("max_start_penetration_m")) {
       contact.max_start_penetration_m =
           contact_dict["max_start_penetration_m"].cast<double>();
-      if (contact.max_start_penetration_m < 0.0) {
-        throw std::invalid_argument("max_start_penetration_m must be >= 0");
-      }
+      nonnegative_finite(contact.max_start_penetration_m,
+                         "max_start_penetration_m");
+    }
+    if (contact_dict.contains("release_tolerance_m")) {
+      contact.release_tolerance_m =
+          contact_dict["release_tolerance_m"].cast<double>();
+      nonnegative_finite(contact.release_tolerance_m, "release_tolerance_m");
+    }
+    if (contact_dict.contains("min_release_progress_m")) {
+      contact.min_release_progress_m =
+          contact_dict["min_release_progress_m"].cast<double>();
+      nonnegative_finite(contact.min_release_progress_m,
+                         "min_release_progress_m");
+    }
+    if (contact_dict.contains("min_separation_clearance_m")) {
+      contact.min_separation_clearance_m =
+          contact_dict["min_separation_clearance_m"].cast<double>();
+      nonnegative_finite(contact.min_separation_clearance_m,
+                         "min_separation_clearance_m");
     }
     if (contact_dict.contains("require_separation_by_end")) {
       contact.require_separation_by_end =
           contact_dict["require_separation_by_end"].cast<bool>();
-      if (!contact.require_separation_by_end) {
-        throw std::invalid_argument(
-            "require_separation_by_end=false is not supported");
-      }
+    }
+    if (contact_dict.contains("require_strictly_decreasing_penetration")) {
+      contact.require_strictly_decreasing_penetration =
+          contact_dict["require_strictly_decreasing_penetration"].cast<bool>();
+    }
+    if (contact_dict.contains("allow_recontact")) {
+      contact.allow_recontact =
+          contact_dict["allow_recontact"].cast<bool>();
     }
     contacts.push_back(std::move(contact));
   }
@@ -482,6 +518,30 @@ ExecutionKernelConfig kernel_config_from_python(const py::object& config_obj) {
     }
     config.collision_monitor_period_ns =
         static_cast<int64_t>(period_ns);
+  }
+  if (config_dict.contains("runtime_collision_query_timeout_ns")) {
+    const double timeout_ns =
+        finite_scale_from_python(config_dict["runtime_collision_query_timeout_ns"],
+                                 "runtime_collision_query_timeout_ns");
+    if (timeout_ns <= 0.0) {
+      throw std::invalid_argument(
+          "runtime_collision_query_timeout_ns must be > 0");
+    }
+    config.runtime_collision_query_timeout_ns =
+        static_cast<int64_t>(timeout_ns);
+  }
+  if (config_dict.contains("runtime_dynamic_body_max_age_cap_ns")) {
+    const double cap_ns = finite_scale_from_python(
+        config_dict["runtime_dynamic_body_max_age_cap_ns"],
+        "runtime_dynamic_body_max_age_cap_ns");
+    // Zero is a sentinel: disable the kernel-side cap while keeping
+    // body-local freshness checks active. Negative values are invalid.
+    if (cap_ns < 0.0) {
+      throw std::invalid_argument(
+          "runtime_dynamic_body_max_age_cap_ns must be >= 0");
+    }
+    config.runtime_dynamic_body_max_age_cap_ns =
+        static_cast<int64_t>(cap_ns);
   }
   config.streaming_ik_timeout_s =
       read_seconds("streaming_ik_timeout_s", "streaming_ik_timeout_ms",
@@ -1690,6 +1750,16 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
             req.pose.orientation = {orient[0], orient[1], orient[2], orient[3]};
           } else {
             req.pose.orientation = {0, 0, 0, 1};
+          }
+          if (request.contains("source_timestamp_ns") &&
+              !request["source_timestamp_ns"].is_none()) {
+            req.source_timestamp_ns =
+                request["source_timestamp_ns"].cast<int64_t>();
+          }
+          if (request.contains("source_freshness_budget_ns") &&
+              !request["source_freshness_budget_ns"].is_none()) {
+            req.source_freshness_budget_ns =
+                request["source_freshness_budget_ns"].cast<int64_t>();
           }
           auto r = [&]() {
             py::gil_scoped_release release;

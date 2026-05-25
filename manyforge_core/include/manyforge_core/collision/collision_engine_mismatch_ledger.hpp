@@ -14,7 +14,7 @@ namespace manyforge::core {
 /// Policy", added in Chunk 8 groundwork).
 ///
 /// The ledger lets compare-mode emitters (e.g. RoboPlanPlanningContext's
-/// `set_engine_mismatch_emitter`) deposit canonical mismatch records that
+/// `set_engine_mismatch_record_emitter`) deposit canonical mismatch records that
 /// can later be inspected by failure-archive integrations, qualification
 /// harnesses, or operator-facing diagnostics. The ledger is thread-safe so
 /// that compare-mode emission paths that run outside the planning context's

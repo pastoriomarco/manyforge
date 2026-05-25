@@ -169,7 +169,7 @@ tree:
           position_m:
           - 0
           - 0
-          - 0.1
+          - 0.08
           orientation_rpy_deg:
           - 180
           - 0
@@ -207,7 +207,7 @@ tree:
           position_m:
           - 0
           - 0
-          - -0.15
+          - -0.2
           orientation_rpy_deg:
           - 0
           - 0
@@ -299,7 +299,7 @@ tree:
           position_m:
           - 0
           - 0
-          - 0.3
+          - 0.4
           orientation_rpy_deg:
           - 180
           - 0

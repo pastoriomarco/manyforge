@@ -27,13 +27,38 @@ _ROS2_CONTROL_EXECUTION_ADAPTER_IDS = {
 
 
 def _native_kernel_config_from_deployment(deployment: Deployment) -> dict[str, int]:
+    config: dict[str, int] = {}
     period_ms = deployment.orchestrator.config.get("collision_monitor_period_ms")
-    if period_ms is None:
-        return {}
-    period_ms = float(period_ms)
-    if period_ms <= 0.0:
-        raise ValueError("orchestrator.config.collision_monitor_period_ms must be > 0")
-    return {"collision_monitor_period_ns": int(period_ms * 1_000_000.0)}
+    if period_ms is not None:
+        period_ms = float(period_ms)
+        if period_ms <= 0.0:
+            raise ValueError(
+                "orchestrator.config.collision_monitor_period_ms must be > 0"
+            )
+        config["collision_monitor_period_ns"] = int(period_ms * 1_000_000.0)
+    timeout_ms = deployment.orchestrator.config.get(
+        "runtime_collision_query_timeout_ms"
+    )
+    if timeout_ms is not None:
+        timeout_ms = float(timeout_ms)
+        if timeout_ms <= 0.0:
+            raise ValueError(
+                "orchestrator.config.runtime_collision_query_timeout_ms must be > 0"
+            )
+        config["runtime_collision_query_timeout_ns"] = int(timeout_ms * 1_000_000.0)
+    cap_ms = deployment.orchestrator.config.get(
+        "runtime_dynamic_body_max_age_cap_ms"
+    )
+    if cap_ms is not None:
+        cap_ms = float(cap_ms)
+        # Zero is a sentinel: disable the kernel-side cap while keeping
+        # body-local freshness checks active. Negative values are invalid.
+        if cap_ms < 0.0:
+            raise ValueError(
+                "orchestrator.config.runtime_dynamic_body_max_age_cap_ms must be >= 0"
+            )
+        config["runtime_dynamic_body_max_age_cap_ns"] = int(cap_ms * 1_000_000.0)
+    return config
 
 
 def create_kernel(deployment: Deployment) -> KernelClient:

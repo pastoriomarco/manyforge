@@ -259,14 +259,41 @@ def test_support_contact_policy_entry_round_trip():
         body_a="object/part/shape/0",
         body_b="fixture/table/shape/0",
     )
+    e.mode = manyforge_core_py.CollisionContactPolicyMode.kContactRelease
     e.max_start_penetration_m = 0.001
+    e.release_tolerance_m = 0.00001
+    e.min_release_progress_m = 0.0005
+    e.min_separation_clearance_m = 0.0002
     e.require_separation_by_end = False
+    e.require_strictly_decreasing_penetration = True
     e.allow_recontact = True
 
     assert e.pair.body_b == "fixture/table/shape/0"
+    assert e.mode == manyforge_core_py.CollisionContactPolicyMode.kContactRelease
     assert e.max_start_penetration_m == 0.001
+    assert e.release_tolerance_m == 0.00001
+    assert e.min_release_progress_m == 0.0005
+    assert e.min_separation_clearance_m == 0.0002
     assert e.require_separation_by_end is False
+    assert e.require_strictly_decreasing_penetration is True
     assert e.allow_recontact is True
+
+
+def test_collision_pair_clearance_round_trip():
+    clearance = manyforge_core_py.CollisionPairClearance()
+    clearance.pair = manyforge_core_py.CollisionPairId(
+        body_a="robot/r/link/tool/collision/0",
+        body_b="object/part/shape/0",
+    )
+    clearance.signed_clearance_m = -0.001
+
+    result = manyforge_core_py.CollisionResult()
+    result.pair_clearances = [clearance]
+    result.min_clearance_m = -0.001
+    result.min_clearance_pair = clearance.pair
+
+    assert result.pair_clearances[0].signed_clearance_m == -0.001
+    assert result.min_clearance_pair.body_b == "object/part/shape/0"
 
 
 def test_collision_policy_revision_and_snapshot_round_trip():
@@ -646,11 +673,27 @@ def test_collision_world_snapshot_default():
 
 def test_collision_world_body_round_trip():
     b = _robot_link_body("link1")
+    b.source_timestamp_ns = 123
+    b.source_freshness_budget_ns = 50_000_000
     assert b.body_id == "robot/r1/link/link1/collision/0"
     assert b.owner_kind == manyforge_core_py.CollisionOwnerKind.kRobotLink
     assert b.parent_link is None
     assert b.frame_id == "world"
+    assert b.source_timestamp_ns == 123
+    assert b.source_freshness_budget_ns == 50_000_000
     assert len(b.geometries) == 1
+
+
+def test_update_object_pose_request_source_freshness_round_trip():
+    req = manyforge_core_py.UpdateObjectPoseRequestDTO()
+    req.object_id = "box"
+    req.frame_id = "universe"
+    req.pose = _identity_pose()
+    req.source_timestamp_ns = 123
+    req.source_freshness_budget_ns = 50_000_000
+
+    assert req.source_timestamp_ns == 123
+    assert req.source_freshness_budget_ns == 50_000_000
 
 
 def test_collision_robot_model_frame_round_trip():

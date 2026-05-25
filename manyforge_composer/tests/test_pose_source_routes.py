@@ -127,33 +127,34 @@ def _post_fresh_box_snapshot(
     client: TestClient,
     *,
     observed_frame_id: str = "universe",
+    age_s: float | None = 0.05,
 ) -> Any:
+    observed: dict[str, Any] = {
+        "objectId": "box",
+        "status": "fresh",
+        "update": {
+            "poseSourceId": "isaac_scene_objects",
+            "objectId": "box",
+            "entity": "/wrong",
+            "monotonicS": 10.0,
+            "applyPolicy": "observe_only",
+            "pose": {
+                "frameId": observed_frame_id,
+                "stampSec": 100.0,
+                "positionXYZ": [1.0, 2.0, 3.0],
+                "orientationXYZW": [0.0, 0.0, 0.0, 1.0],
+            },
+        },
+    }
+    if age_s is not None:
+        observed["ageS"] = age_s
     response = client.post(
         "/api/scene/pose-sources/isaac_scene_objects/snapshot",
         json={
             "poseSourceId": "isaac_scene_objects",
             "status": "fresh",
             "monotonicS": 10.0,
-            "objects": [
-                {
-                    "objectId": "box",
-                    "status": "fresh",
-                    "ageS": 0.05,
-                    "update": {
-                        "poseSourceId": "isaac_scene_objects",
-                        "objectId": "box",
-                        "entity": "/wrong",
-                        "monotonicS": 10.0,
-                        "applyPolicy": "observe_only",
-                        "pose": {
-                            "frameId": observed_frame_id,
-                            "stampSec": 100.0,
-                            "positionXYZ": [1.0, 2.0, 3.0],
-                            "orientationXYZW": [0.0, 0.0, 0.0, 1.0],
-                        },
-                    },
-                }
-            ],
+            "objects": [observed],
         },
     )
     assert response.status_code == 200
@@ -280,7 +281,32 @@ def test_when_idle_apply_updates_planning_scene_from_fresh_snapshot(tmp_path: Pa
     scene = client.get("/api/scene/state").json()
     object_pose = scene["objects"][0]["pose_in_universe"]
     assert object_pose["position_m"] == [1.0, 2.0, 3.0]
-    assert state.kernel.scene_edits[-1].operation == "update_pose"
+    edit = state.kernel.scene_edits[-1]
+    assert edit.operation == "update_pose"
+    snapshot = state.pose_source_snapshots()["isaac_scene_objects"]
+    assert edit.source_freshness_budget_ns == 1_000_000_000
+    assert edit.source_timestamp_ns == snapshot["received_at_ns"] - 50_000_000
+
+
+def test_pose_source_apply_rejects_fresh_pose_without_age(tmp_path: Path) -> None:
+    client, state = _client(tmp_path)
+    state.deployment = _minimal_deployment(
+        pose_sources=_pose_sources(box_policy="when_idle")
+    )
+    _add_box(client)
+    _post_fresh_box_snapshot(client, age_s=None)
+
+    response = client.post(
+        "/api/scene/pose-sources/apply",
+        json={"policy": "when_idle", "objectIds": ["box"]},
+    )
+
+    assert response.status_code == 409
+    payload = response.json()
+    assert payload["success"] is False
+    assert payload["rejected_count"] == 1
+    assert payload["details"][0]["reject_reason"] == "missing_age"
+    assert state.kernel.scene_edits[-1].operation == "add"
 
 
 def test_continuous_snapshot_applies_planning_scene_without_operator_apply(tmp_path: Path) -> None:

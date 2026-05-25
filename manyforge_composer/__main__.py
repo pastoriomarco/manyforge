@@ -290,14 +290,62 @@ def _collision_monitor_period_ns_from_deployment(
     return int(period_ms * 1_000_000.0)
 
 
+def _runtime_collision_query_timeout_ns_from_deployment(
+    deployment: Deployment | None,
+) -> int | None:
+    if deployment is None or deployment.orchestrator is None:
+        return None
+    raw_value = deployment.orchestrator.config.get(
+        "runtime_collision_query_timeout_ms"
+    )
+    if raw_value is None:
+        return None
+    timeout_ms = float(raw_value)
+    if timeout_ms <= 0.0:
+        raise ValueError(
+            "orchestrator.config.runtime_collision_query_timeout_ms must be > 0"
+        )
+    return int(timeout_ms * 1_000_000.0)
+
+
+def _runtime_dynamic_body_max_age_cap_ns_from_deployment(
+    deployment: Deployment | None,
+) -> int | None:
+    if deployment is None or deployment.orchestrator is None:
+        return None
+    raw_value = deployment.orchestrator.config.get(
+        "runtime_dynamic_body_max_age_cap_ms"
+    )
+    if raw_value is None:
+        return None
+    cap_ms = float(raw_value)
+    # Zero is a sentinel: disable the kernel-side cap while keeping body-local
+    # freshness checks active. Negative values are invalid.
+    if cap_ms < 0.0:
+        raise ValueError(
+            "orchestrator.config.runtime_dynamic_body_max_age_cap_ms must be >= 0"
+        )
+    return int(cap_ms * 1_000_000.0)
+
+
 def _kernel_config_from_deployment(
     deployment: Deployment | None,
     *,
     collision_monitor_period_ns: int | None,
+    runtime_collision_query_timeout_ns: int | None,
+    runtime_dynamic_body_max_age_cap_ns: int | None,
 ) -> dict[str, float | int] | None:
     config: dict[str, float | int] = {}
     if collision_monitor_period_ns is not None:
         config["collision_monitor_period_ns"] = collision_monitor_period_ns
+    if runtime_collision_query_timeout_ns is not None:
+        config["runtime_collision_query_timeout_ns"] = (
+            runtime_collision_query_timeout_ns
+        )
+    if runtime_dynamic_body_max_age_cap_ns is not None:
+        config["runtime_dynamic_body_max_age_cap_ns"] = (
+            runtime_dynamic_body_max_age_cap_ns
+        )
 
     execution = deployment.adapters.get("execution") if deployment is not None else None
     execution_config = dict(execution.config or {}) if execution is not None else {}
@@ -338,6 +386,8 @@ def _make_ros2_control_kernel(
     deployment: Deployment,
     *,
     collision_monitor_period_ns: int | None,
+    runtime_collision_query_timeout_ns: int | None,
+    runtime_dynamic_body_max_age_cap_ns: int | None,
 ):
     """Create the ROS 2 controller-backed kernel.
 
@@ -362,6 +412,8 @@ def _make_ros2_control_kernel(
         return create_ros2_control_kernel(
             deployment=deployment,
             collision_monitor_period_ns=collision_monitor_period_ns,
+            runtime_collision_query_timeout_ns=runtime_collision_query_timeout_ns,
+            runtime_dynamic_body_max_age_cap_ns=runtime_dynamic_body_max_age_cap_ns,
         )
     except Exception as exc:
         raise RuntimeError(
@@ -392,6 +444,12 @@ def _make_kernel(
     collision_monitor_period_ns = _collision_monitor_period_ns_from_deployment(
         deployment
     )
+    runtime_collision_query_timeout_ns = (
+        _runtime_collision_query_timeout_ns_from_deployment(deployment)
+    )
+    runtime_dynamic_body_max_age_cap_ns = (
+        _runtime_dynamic_body_max_age_cap_ns_from_deployment(deployment)
+    )
     if execution_adapter_id in _ROS2_CONTROL_EXECUTION_ADAPTER_IDS:
         if deployment is None:
             raise RuntimeError(
@@ -400,6 +458,8 @@ def _make_kernel(
         return _make_ros2_control_kernel(
             deployment,
             collision_monitor_period_ns=collision_monitor_period_ns,
+            runtime_collision_query_timeout_ns=runtime_collision_query_timeout_ns,
+            runtime_dynamic_body_max_age_cap_ns=runtime_dynamic_body_max_age_cap_ns,
         )
     if execution_adapter_id not in {"execution.roboplan_native", "execution.test"}:
         raise RuntimeError(
@@ -415,6 +475,8 @@ def _make_kernel(
         kernel_config = _kernel_config_from_deployment(
             deployment,
             collision_monitor_period_ns=collision_monitor_period_ns,
+            runtime_collision_query_timeout_ns=runtime_collision_query_timeout_ns,
+            runtime_dynamic_body_max_age_cap_ns=runtime_dynamic_body_max_age_cap_ns,
         )
         resolved_model = _resolved_robot_model_from_deployment(deployment)
         if resolved_model is not None:

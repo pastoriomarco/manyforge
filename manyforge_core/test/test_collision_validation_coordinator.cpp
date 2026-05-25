@@ -15,81 +15,6 @@
 namespace manyforge::core {
 namespace {
 
-class MockPlanningContext : public IPlanningContext {
- public:
-  // Queue of normalized results consumed FIFO per collision_check_normalized
-  // call. If empty, returns the default `next_normalized`.
-  std::queue<CollisionResult> normalized_sequence;
-  CollisionResult next_normalized;
-  CollisionWorldRevision world_revision{1, "mock-world"};
-
-  // Counter used to flip the revision mid-pass for pose-source tests.
-  int revision_bumps_remaining = 0;
-  bool revision_bump_on_each_call = false;
-  CollisionQuery last_query;
-
-  // Plain unused implementations.
-  RobotStateDTO get_current_state() override { return {}; }
-  ValidationResultDTO validate_trajectory(const TrajectoryDTO&,
-                                          const ValidationOptionsDTO&) override {
-    ValidationResultDTO r;
-    r.valid = true;
-    return r;
-  }
-  CollisionCheckResultDTO collision_check(
-      const CollisionCheckRequestDTO&) override {
-    return {};
-  }
-  Pose3DTO forward_kinematics(const FkRequestDTO&) override { return {}; }
-  Pose3DTO get_object_pose(const std::string&, const std::string&) override {
-    return {};
-  }
-  ObjectStateDTO get_object_state(const std::string&) override { return {}; }
-  Result<Pose3DTO> resolve_reference_pose(const ReferenceDTO&,
-                                          const std::string&) override {
-    return Result<Pose3DTO>::Ok(Pose3DTO{});
-  }
-  JointLimitsDTO get_joint_limits(const std::string&,
-                                  const std::string&) override {
-    return {};
-  }
-  SceneEditResultDTO add_object(const AddObjectRequestDTO&) override {
-    return {};
-  }
-  SceneEditResultDTO remove_object(const RemoveObjectRequestDTO&) override {
-    return {};
-  }
-  SceneEditResultDTO update_object_pose(
-      const UpdateObjectPoseRequestDTO&) override {
-    return {};
-  }
-  SceneEditResultDTO attach_object(const AttachObjectRequestDTO&) override {
-    return {};
-  }
-  SceneEditResultDTO detach_object(const DetachObjectRequestDTO&) override {
-    return {};
-  }
-
-  CollisionWorldRevision current_collision_world_revision() override {
-    if (revision_bump_on_each_call && revision_bumps_remaining > 0) {
-      world_revision.revision_id++;
-      world_revision.content_hash =
-          "mock-world-r" + std::to_string(world_revision.revision_id);
-      revision_bumps_remaining--;
-    }
-    return world_revision;
-  }
-
-  CollisionResult collision_check_normalized(const CollisionQuery& query) override {
-    last_query = query;
-    if (!normalized_sequence.empty()) {
-      auto r = std::move(normalized_sequence.front());
-      normalized_sequence.pop();
-      return r;
-    }
-    return next_normalized;
-  }
-};
 
 class MockCollisionQueryEngine : public ICollisionQueryEngine {
  public:
@@ -153,32 +78,12 @@ class MockCollisionQueryEngine : public ICollisionQueryEngine {
   CollisionEngineCapabilityDescriptor capability_;
 };
 
-CollisionResult make_clean_result() {
-  CollisionResult r;
-  r.in_collision = false;
-  r.engine_status = CollisionEngineStatus::kOk;
-  r.decision = CollisionDecisionResult::kPass;
-  r.engine_id = "mock_engine";
-  r.engine_version = "0.x";
-  return r;
-}
-
 CollisionResult make_colliding_result(const CollisionPairId& pair) {
   CollisionResult r;
   r.in_collision = true;
   r.normalized_pairs = {pair};
   r.engine_status = CollisionEngineStatus::kOk;
   r.decision = CollisionDecisionResult::kFail;
-  r.engine_id = "mock_engine";
-  r.engine_version = "0.x";
-  return r;
-}
-
-CollisionResult make_inconclusive_result() {
-  CollisionResult r;
-  r.in_collision = false;
-  r.engine_status = CollisionEngineStatus::kDiagnosticIncomplete;
-  r.decision = CollisionDecisionResult::kInconclusiveFail;
   r.engine_id = "mock_engine";
   r.engine_version = "0.x";
   return r;
@@ -204,14 +109,61 @@ CollisionPolicySnapshot make_freespace_snapshot() {
   return s;
 }
 
-CollisionPolicySnapshot make_degraded_support_snapshot(
-    const CollisionPairId& pair) {
+CollisionResult make_pass_result_with_clearance(const CollisionPairId& pair,
+                                                 double signed_clearance_m) {
+  CollisionResult r;
+  r.in_collision = signed_clearance_m < 0.0;
+  if (r.in_collision) {
+    r.normalized_pairs = {pair};
+  }
+  r.pair_clearances = {CollisionPairClearance{pair, signed_clearance_m}};
+  r.min_clearance_m = signed_clearance_m;
+  r.min_clearance_pair = pair;
+  r.engine_status = CollisionEngineStatus::kOk;
+  r.decision = r.in_collision ? CollisionDecisionResult::kFail
+                              : CollisionDecisionResult::kPass;
+  r.engine_id = "mock_engine";
+  r.engine_version = "test";
+  return r;
+}
+
+CollisionResult make_pass_result_without_clearance() {
+  CollisionResult r;
+  r.in_collision = false;
+  r.engine_status = CollisionEngineStatus::kOk;
+  r.decision = CollisionDecisionResult::kPass;
+  r.engine_id = "mock_engine";
+  r.engine_version = "test";
+  return r;
+}
+
+CollisionPolicySnapshot make_contact_release_snapshot(
+    const CollisionPairId& pair,
+    double max_start_penetration_m,
+    bool require_separation_by_end,
+    bool require_strictly_decreasing_penetration) {
   CollisionPolicySnapshot s = make_freespace_snapshot();
-  s.require_full_diagnostics = false;
   SupportContactPolicyEntry entry;
   entry.pair = pair;
-  entry.require_separation_by_end = true;
+  entry.mode = CollisionContactPolicyMode::kContactRelease;
+  entry.max_start_penetration_m = max_start_penetration_m;
+  entry.release_tolerance_m = 1e-5;
+  entry.min_release_progress_m = 0.0;
+  entry.min_separation_clearance_m = 0.0;
+  entry.require_separation_by_end = require_separation_by_end;
+  entry.require_strictly_decreasing_penetration =
+      require_strictly_decreasing_penetration;
   entry.allow_recontact = false;
+  s.support_contacts.push_back(entry);
+  return s;
+}
+
+CollisionPolicySnapshot make_contact_process_snapshot(
+    const CollisionPairId& pair) {
+  CollisionPolicySnapshot s = make_freespace_snapshot();
+  SupportContactPolicyEntry entry;
+  entry.pair = pair;
+  entry.mode = CollisionContactPolicyMode::kContactProcess;
   s.support_contacts.push_back(entry);
   return s;
 }
@@ -238,210 +190,6 @@ CollisionWorldSnapshot make_snapshot() {
   snapshot.all_bodies_have_geometry = true;
   return snapshot;
 }
-
-// --- Trajectory-wide validation passing -----------------------------------
-
-TEST(CollisionValidationCoordinatorTest, PassesCleanTrajectory) {
-  MockPlanningContext ctx;
-  ctx.next_normalized = make_clean_result();
-
-  CollisionValidationPassConfig cfg;
-  cfg.policy_snapshot = make_freespace_snapshot();
-  CollisionValidationCoordinator coord(cfg);
-
-  auto bundle = coord.validate_trajectory(ctx, make_trivial_trajectory(5));
-  EXPECT_TRUE(bundle.decision.accepted);
-  EXPECT_EQ(bundle.decision.action, CollisionDecisionAction::kDispatch);
-  EXPECT_FALSE(bundle.decision.first_failing_waypoint.has_value());
-  EXPECT_EQ(bundle.waypoint_records.size(), 5u);
-  EXPECT_EQ(bundle.borrowed_world_revision.revision_id, 1u);
-}
-
-// --- Trajectory-wide validation rejecting at first blocking waypoint ------
-
-TEST(CollisionValidationCoordinatorTest,
-     RejectsAtLowestFailingWaypointIndex) {
-  MockPlanningContext ctx;
-  // 5 waypoints: clean, clean, collide, collide, clean.
-  ctx.normalized_sequence.push(make_clean_result());
-  ctx.normalized_sequence.push(make_clean_result());
-  ctx.normalized_sequence.push(
-      make_colliding_result(CollisionPairId{"a", "b"}));
-  ctx.normalized_sequence.push(
-      make_colliding_result(CollisionPairId{"c", "d"}));
-  ctx.normalized_sequence.push(make_clean_result());
-
-  CollisionValidationPassConfig cfg;
-  cfg.policy_snapshot = make_freespace_snapshot();
-  CollisionValidationCoordinator coord(cfg);
-
-  auto bundle = coord.validate_trajectory(ctx, make_trivial_trajectory(5));
-  EXPECT_FALSE(bundle.decision.accepted);
-  EXPECT_EQ(bundle.decision.action, CollisionDecisionAction::kReject);
-  ASSERT_TRUE(bundle.decision.first_failing_waypoint.has_value());
-  EXPECT_EQ(*bundle.decision.first_failing_waypoint, 2);
-}
-
-// --- Diagnostic-incomplete cannot be downgraded to pass --------------------
-
-TEST(CollisionValidationCoordinatorTest,
-     DiagnosticIncompleteRemainsBlockingThroughEvaluator) {
-  MockPlanningContext ctx;
-  ctx.next_normalized = make_inconclusive_result();
-
-  CollisionValidationPassConfig cfg;
-  cfg.policy_snapshot = make_freespace_snapshot();
-  CollisionValidationCoordinator coord(cfg);
-
-  auto bundle = coord.validate_trajectory(ctx, make_trivial_trajectory(1));
-  EXPECT_FALSE(bundle.decision.accepted);
-  EXPECT_EQ(bundle.decision.action, CollisionDecisionAction::kInconclusive);
-}
-
-TEST(CollisionValidationCoordinatorTest,
-     FullDiagnosticSupportContactRequestsPenetrationDepth) {
-  MockPlanningContext ctx;
-  ctx.next_normalized = make_clean_result();
-
-  CollisionPolicySnapshot snapshot = make_freespace_snapshot();
-  snapshot.require_full_diagnostics = true;
-  SupportContactPolicyEntry entry;
-  entry.pair = CollisionPairId{"gripper", "part"};
-  snapshot.support_contacts.push_back(entry);
-
-  CollisionValidationPassConfig cfg;
-  cfg.policy_snapshot = snapshot;
-  CollisionValidationCoordinator coord(cfg);
-
-  auto bundle = coord.validate_trajectory(ctx, make_trivial_trajectory(1));
-  EXPECT_TRUE(bundle.decision.accepted);
-  EXPECT_NE(std::find(ctx.last_query.required_capabilities.begin(),
-                      ctx.last_query.required_capabilities.end(),
-                      "body_pair_only"),
-            ctx.last_query.required_capabilities.end());
-  EXPECT_NE(std::find(ctx.last_query.required_capabilities.begin(),
-                      ctx.last_query.required_capabilities.end(),
-                      "penetration_depth"),
-            ctx.last_query.required_capabilities.end());
-  ASSERT_TRUE(ctx.last_query.waypoint_index.has_value());
-  EXPECT_EQ(*ctx.last_query.waypoint_index, 0);
-}
-
-TEST(CollisionValidationCoordinatorTest,
-     SupportContactMustSeparateByFinalWaypoint) {
-  const CollisionPairId pair{"gripper", "part"};
-  MockPlanningContext ctx;
-  ctx.normalized_sequence.push(make_colliding_result(pair));
-  ctx.normalized_sequence.push(make_colliding_result(pair));
-  ctx.normalized_sequence.push(make_colliding_result(pair));
-
-  CollisionValidationPassConfig cfg;
-  cfg.policy_snapshot = make_degraded_support_snapshot(pair);
-  CollisionValidationCoordinator coord(cfg);
-
-  auto bundle = coord.validate_trajectory(ctx, make_trivial_trajectory(3));
-  EXPECT_FALSE(bundle.decision.accepted);
-  EXPECT_EQ(bundle.decision.action, CollisionDecisionAction::kReject);
-  ASSERT_TRUE(bundle.decision.first_failing_waypoint.has_value());
-  EXPECT_EQ(*bundle.decision.first_failing_waypoint, 2);
-}
-
-TEST(CollisionValidationCoordinatorTest,
-     SupportContactSeparationByFinalWaypointPassesWhenDegradedAllowed) {
-  const CollisionPairId pair{"gripper", "part"};
-  MockPlanningContext ctx;
-  ctx.normalized_sequence.push(make_colliding_result(pair));
-  ctx.normalized_sequence.push(make_clean_result());
-  ctx.normalized_sequence.push(make_clean_result());
-
-  CollisionValidationPassConfig cfg;
-  cfg.policy_snapshot = make_degraded_support_snapshot(pair);
-  CollisionValidationCoordinator coord(cfg);
-
-  auto bundle = coord.validate_trajectory(ctx, make_trivial_trajectory(3));
-  EXPECT_TRUE(bundle.decision.accepted);
-}
-
-// --- Pose-source borrow records final revision in bundle -------------------
-
-TEST(CollisionValidationCoordinatorTest,
-     BorrowsRevisionAtStartAndExposesItOnBundle) {
-  MockPlanningContext ctx;
-  ctx.next_normalized = make_clean_result();
-  ctx.world_revision = {42, "mock-r42"};
-
-  CollisionValidationPassConfig cfg;
-  cfg.policy_snapshot = make_freespace_snapshot();
-  CollisionValidationCoordinator coord(cfg);
-
-  auto bundle = coord.validate_trajectory(ctx, make_trivial_trajectory(2));
-  EXPECT_EQ(bundle.borrowed_world_revision.revision_id, 42u);
-  ASSERT_TRUE(bundle.final_world_revision.has_value());
-  EXPECT_EQ(bundle.final_world_revision->revision_id, 42u);
-}
-
-// --- Pose-source apply mid-pass triggers retry and eventual fail-closed ----
-
-TEST(CollisionValidationCoordinatorTest,
-     SceneChangedDuringValidationFailsClosedAfterRetriesExhausted) {
-  MockPlanningContext ctx;
-  ctx.next_normalized = make_clean_result();
-  // Every revision-query bumps the revision so retries can never settle.
-  ctx.revision_bump_on_each_call = true;
-  ctx.revision_bumps_remaining = 1000;
-
-  CollisionValidationPassConfig cfg;
-  cfg.policy_snapshot = make_freespace_snapshot();
-  cfg.pose_source_retry.max_count = 1;
-  CollisionValidationCoordinator coord(cfg);
-
-  auto bundle = coord.validate_trajectory(ctx, make_trivial_trajectory(2));
-  EXPECT_TRUE(bundle.scene_changed_during_validation);
-  EXPECT_FALSE(bundle.decision.accepted);
-  EXPECT_EQ(bundle.decision.action, CollisionDecisionAction::kInconclusive);
-  EXPECT_GE(bundle.pose_source_retries_used, 1);
-}
-
-TEST(CollisionValidationCoordinatorTest,
-     ChurnWindowExceededIsReported) {
-  MockPlanningContext ctx;
-  ctx.next_normalized = make_clean_result();
-  ctx.revision_bump_on_each_call = true;
-  ctx.revision_bumps_remaining = 1000;
-
-  CollisionValidationPassConfig cfg;
-  cfg.policy_snapshot = make_freespace_snapshot();
-  cfg.pose_source_retry.max_count = 2;
-  cfg.pose_source_retry.churn_max_revisions = 1;
-  CollisionValidationCoordinator coord(cfg);
-
-  auto bundle = coord.validate_trajectory(ctx, make_trivial_trajectory(2));
-  EXPECT_TRUE(bundle.scene_changed_during_validation);
-  EXPECT_TRUE(bundle.churn_window_exceeded);
-  EXPECT_FALSE(bundle.decision.accepted);
-}
-
-// --- Disabling borrow skips retry; final decision passes despite churn -----
-
-TEST(CollisionValidationCoordinatorTest,
-     DisableBorrowSkipsRetryAndAcceptsChurnedScene) {
-  MockPlanningContext ctx;
-  ctx.next_normalized = make_clean_result();
-  ctx.revision_bump_on_each_call = true;
-  ctx.revision_bumps_remaining = 1000;
-
-  CollisionValidationPassConfig cfg;
-  cfg.policy_snapshot = make_freespace_snapshot();
-  cfg.require_pose_source_borrow = false;
-  CollisionValidationCoordinator coord(cfg);
-
-  auto bundle = coord.validate_trajectory(ctx, make_trivial_trajectory(2));
-  EXPECT_FALSE(bundle.scene_changed_during_validation);
-  EXPECT_TRUE(bundle.decision.accepted);
-  EXPECT_EQ(bundle.pose_source_retries_used, 0);
-}
-
-// --- Engine-backed cancellation is fail-closed and traceable --------------
 
 TEST(CollisionValidationCoordinatorTest,
      EngineBackedValidationCancelsBeforeFirstWaypoint) {
@@ -523,41 +271,185 @@ TEST(CollisionValidationCoordinatorTest,
   ASSERT_EQ(bundle.waypoint_records.size(), 3u);
 }
 
-// --- Single-state validation convenience hits the same code path ----------
+// --- Contact-release (Phase 4-P1) on the engine-backed mock -----------------
 
-TEST(CollisionValidationCoordinatorTest, ValidateStateWrapsTrajectoryPath) {
-  MockPlanningContext ctx;
-  ctx.next_normalized = make_clean_result();
+TEST(CollisionValidationCoordinatorTest,
+     ContactReleaseFailsClosedWhenNumericClearanceMissing) {
+  // Engine returns a pass with no pair_clearances. The contact-release gate
+  // requires numeric clearance for the configured pair; absence must produce
+  // a kInconclusiveFail with reason "missing_contact_release_clearance".
+  CollisionPairId pair{"robot/grasp", "object/box"};
+  MockCollisionQueryEngine engine;
+  engine.default_result = make_pass_result_without_clearance();
+  CollisionCancellationToken cancel;
 
   CollisionValidationPassConfig cfg;
-  cfg.policy_snapshot = make_freespace_snapshot();
+  cfg.policy_snapshot = make_contact_release_snapshot(
+      pair, /*max_start=*/0.005,
+      /*require_separation_by_end=*/false,
+      /*require_strictly_decreasing_penetration=*/false);
   CollisionValidationCoordinator coord(cfg);
 
-  RobotStateDTO state;
-  state.joint_names = {"j0"};
-  state.positions_rad = {0.0};
-  auto bundle = coord.validate_state(ctx, state);
+  auto bundle = coord.validate_trajectory(
+      make_snapshot(), engine, make_trivial_trajectory(3), cancel);
+
+  EXPECT_FALSE(bundle.decision.accepted);
+  EXPECT_EQ(bundle.decision.action, CollisionDecisionAction::kInconclusive);
+  ASSERT_TRUE(bundle.decision.first_failing_waypoint.has_value());
+  EXPECT_EQ(*bundle.decision.first_failing_waypoint, 0);
+  ASSERT_FALSE(bundle.waypoint_records.empty());
+  EXPECT_EQ(bundle.waypoint_records.front()
+                .result.raw_diagnostics.at("contact_release_violation"),
+            "missing_contact_release_clearance");
+}
+
+TEST(CollisionValidationCoordinatorTest,
+     ContactReleaseStrictlyDecreasingPenetrationPasses) {
+  // Initial contact with penetration <= max_start, depth monotonically
+  // decreases to 0 (clearance crosses positive at the end). Must pass.
+  CollisionPairId pair{"robot/grasp", "object/box"};
+  MockCollisionQueryEngine engine;
+  engine.result_by_waypoint[0] = make_pass_result_with_clearance(pair, -0.003);
+  engine.result_by_waypoint[1] = make_pass_result_with_clearance(pair, -0.001);
+  engine.result_by_waypoint[2] = make_pass_result_with_clearance(pair, 0.002);
+  CollisionCancellationToken cancel;
+
+  CollisionValidationPassConfig cfg;
+  cfg.policy_snapshot = make_contact_release_snapshot(
+      pair, /*max_start=*/0.005,
+      /*require_separation_by_end=*/true,
+      /*require_strictly_decreasing_penetration=*/true);
+  CollisionValidationCoordinator coord(cfg);
+
+  auto bundle = coord.validate_trajectory(
+      make_snapshot(), engine, make_trivial_trajectory(3), cancel);
+
   EXPECT_TRUE(bundle.decision.accepted);
-  EXPECT_EQ(bundle.waypoint_records.size(), 1u);
+  EXPECT_EQ(bundle.decision.action, CollisionDecisionAction::kDispatch);
+  EXPECT_FALSE(bundle.decision.first_failing_waypoint.has_value());
 }
 
-// --- Policy revision is echoed onto every classified result ---------------
-
-TEST(CollisionValidationCoordinatorTest, PolicyRevisionAppearsOnWaypoints) {
-  MockPlanningContext ctx;
-  ctx.next_normalized = make_clean_result();
+TEST(CollisionValidationCoordinatorTest,
+     ContactReleaseInitialPenetrationExceedsEnvelopeFailsClosed) {
+  // Initial depth > max_start_penetration_m + tolerance must reject at
+  // waypoint 0 with reason "initial_penetration_exceeds_policy".
+  CollisionPairId pair{"robot/grasp", "object/box"};
+  MockCollisionQueryEngine engine;
+  engine.result_by_waypoint[0] = make_pass_result_with_clearance(pair, -0.020);
+  engine.result_by_waypoint[1] = make_pass_result_with_clearance(pair, -0.010);
+  engine.result_by_waypoint[2] = make_pass_result_with_clearance(pair, 0.001);
+  CollisionCancellationToken cancel;
 
   CollisionValidationPassConfig cfg;
-  cfg.policy_snapshot = make_freespace_snapshot();
+  cfg.policy_snapshot = make_contact_release_snapshot(
+      pair, /*max_start=*/0.005,
+      /*require_separation_by_end=*/true,
+      /*require_strictly_decreasing_penetration=*/true);
   CollisionValidationCoordinator coord(cfg);
 
-  auto bundle = coord.validate_trajectory(ctx, make_trivial_trajectory(3));
-  ASSERT_EQ(bundle.waypoint_records.size(), 3u);
-  for (const auto& rec : bundle.waypoint_records) {
-    ASSERT_TRUE(rec.result.policy_revision_used.has_value());
-    EXPECT_EQ(*rec.result.policy_revision_used, "7");
-  }
+  auto bundle = coord.validate_trajectory(
+      make_snapshot(), engine, make_trivial_trajectory(3), cancel);
+
+  EXPECT_FALSE(bundle.decision.accepted);
+  EXPECT_EQ(bundle.decision.action, CollisionDecisionAction::kReject);
+  ASSERT_TRUE(bundle.decision.first_failing_waypoint.has_value());
+  EXPECT_EQ(*bundle.decision.first_failing_waypoint, 0);
+  EXPECT_EQ(bundle.waypoint_records.front()
+                .result.raw_diagnostics.at("contact_release_violation"),
+            "initial_penetration_exceeds_policy");
 }
+
+TEST(CollisionValidationCoordinatorTest,
+     ContactReleasePenetrationIncreaseFailsAtFirstViolation) {
+  // Penetration monotonicity: a later waypoint deeper than previous beyond
+  // tolerance must fail with reason "penetration_increased" at the first
+  // violating index.
+  CollisionPairId pair{"robot/grasp", "object/box"};
+  MockCollisionQueryEngine engine;
+  engine.result_by_waypoint[0] = make_pass_result_with_clearance(pair, -0.004);
+  engine.result_by_waypoint[1] = make_pass_result_with_clearance(pair, -0.003);
+  engine.result_by_waypoint[2] = make_pass_result_with_clearance(pair, -0.020);
+  engine.result_by_waypoint[3] = make_pass_result_with_clearance(pair, 0.001);
+  CollisionCancellationToken cancel;
+
+  CollisionValidationPassConfig cfg;
+  cfg.policy_snapshot = make_contact_release_snapshot(
+      pair, /*max_start=*/0.005,
+      /*require_separation_by_end=*/true,
+      /*require_strictly_decreasing_penetration=*/true);
+  CollisionValidationCoordinator coord(cfg);
+
+  auto bundle = coord.validate_trajectory(
+      make_snapshot(), engine, make_trivial_trajectory(4), cancel);
+
+  EXPECT_FALSE(bundle.decision.accepted);
+  EXPECT_EQ(bundle.decision.action, CollisionDecisionAction::kReject);
+  ASSERT_TRUE(bundle.decision.first_failing_waypoint.has_value());
+  EXPECT_EQ(*bundle.decision.first_failing_waypoint, 2);
+  EXPECT_EQ(bundle.waypoint_records[2]
+                .result.raw_diagnostics.at("contact_release_violation"),
+            "penetration_increased");
+}
+
+TEST(CollisionValidationCoordinatorTest,
+     ContactReleaseFinalSeparationRequiredFailsWhenStillPenetrating) {
+  // Strictly decreasing penetration but no separation by end, with
+  // require_separation_by_end=true, must fail at the final waypoint
+  // with reason "final_sample_not_separated".
+  CollisionPairId pair{"robot/grasp", "object/box"};
+  MockCollisionQueryEngine engine;
+  engine.result_by_waypoint[0] = make_pass_result_with_clearance(pair, -0.004);
+  engine.result_by_waypoint[1] = make_pass_result_with_clearance(pair, -0.002);
+  engine.result_by_waypoint[2] = make_pass_result_with_clearance(pair, -0.001);
+  CollisionCancellationToken cancel;
+
+  CollisionValidationPassConfig cfg;
+  cfg.policy_snapshot = make_contact_release_snapshot(
+      pair, /*max_start=*/0.005,
+      /*require_separation_by_end=*/true,
+      /*require_strictly_decreasing_penetration=*/false);
+  CollisionValidationCoordinator coord(cfg);
+
+  auto bundle = coord.validate_trajectory(
+      make_snapshot(), engine, make_trivial_trajectory(3), cancel);
+
+  EXPECT_FALSE(bundle.decision.accepted);
+  EXPECT_EQ(bundle.decision.action, CollisionDecisionAction::kReject);
+  ASSERT_TRUE(bundle.decision.first_failing_waypoint.has_value());
+  EXPECT_EQ(*bundle.decision.first_failing_waypoint, 2);
+  EXPECT_EQ(bundle.waypoint_records.back()
+                .result.raw_diagnostics.at("contact_release_violation"),
+            "final_sample_not_separated");
+}
+
+TEST(CollisionValidationCoordinatorTest,
+     ContactProcessModeFailsClosed) {
+  // kContactProcess is reserved fail-closed until force/controller sensing
+  // contracts qualify. Validation must reject with
+  // "contact_process_policy_not_implemented".
+  CollisionPairId pair{"robot/tcp", "object/part"};
+  MockCollisionQueryEngine engine;
+  engine.default_result = make_pass_result_with_clearance(pair, -0.001);
+  CollisionCancellationToken cancel;
+
+  CollisionValidationPassConfig cfg;
+  cfg.policy_snapshot = make_contact_process_snapshot(pair);
+  CollisionValidationCoordinator coord(cfg);
+
+  auto bundle = coord.validate_trajectory(
+      make_snapshot(), engine, make_trivial_trajectory(3), cancel);
+
+  EXPECT_FALSE(bundle.decision.accepted);
+  EXPECT_EQ(bundle.decision.action, CollisionDecisionAction::kInconclusive);
+  ASSERT_FALSE(bundle.waypoint_records.empty());
+  EXPECT_EQ(bundle.waypoint_records.front()
+                .result.raw_diagnostics.at("contact_release_violation"),
+            "contact_process_policy_not_implemented");
+  EXPECT_EQ(bundle.waypoint_records.front()
+                .result.raw_diagnostics.at("contact_release_mode"),
+            "contact_process");
+}
+
 
 }  // namespace
 }  // namespace manyforge::core

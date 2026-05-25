@@ -8,7 +8,6 @@
 #include <algorithm>
 #include <chrono>
 #include <filesystem>
-#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <map>
@@ -30,15 +29,19 @@ using manyforge::core::CollisionCancellationToken;
 using manyforge::core::CollisionDecisionAction;
 using manyforge::core::CollisionDecisionSeverity;
 using manyforge::core::CollisionEngineStatus;
+using manyforge::core::CollisionGeometryDescriptor;
+using manyforge::core::CollisionGeometryKind;
+using manyforge::core::CollisionOwnerKind;
 using manyforge::core::CollisionPairId;
 using manyforge::core::CollisionPolicySnapshot;
 using manyforge::core::CollisionQuery;
 using manyforge::core::CollisionResult;
 using manyforge::core::CollisionShapeDTO;
 using manyforge::core::CollisionSurface;
+using manyforge::core::CollisionWorldBody;
+using manyforge::core::CollisionWorldSnapshot;
 using manyforge::core::CylinderShapeDTO;
 using manyforge::core::ICollisionQueryEngine;
-using manyforge::core::MeshShapeDTO;
 using manyforge::core::ParallelCollisionValidationWorkerPool;
 using manyforge::core::Pose3DTO;
 using manyforge::core::SupportContactPolicyEntry;
@@ -155,27 +158,27 @@ AddObjectRequestDTO cylinder_object(std::string id, double radius_m,
   return req;
 }
 
-AddObjectRequestDTO mesh_object(const std::string& object_id) {
-  const auto mesh_path =
-      std::filesystem::temp_directory_path() /
-      ("manyforge_phase4_collision_" + object_id + ".obj");
-  std::ofstream mesh_file(mesh_path);
-  mesh_file << "v 0 0 0\n";
-  mesh_file << "v 0.01 0 0\n";
-  mesh_file << "v 0 0.01 0\n";
-  mesh_file << "f 1 2 3\n";
-  mesh_file.close();
+void append_unloadable_mesh_body(CollisionWorldSnapshot& snapshot) {
+  CollisionWorldBody body;
+  body.body_id = "object/phase4_unloadable_mesh/shape/0";
+  body.owner_kind = CollisionOwnerKind::kDetachedObject;
+  body.frame_id = "universe";
+  body.pose = pose(0.7, 0.0, 0.25);
 
-  MeshShapeDTO mesh;
-  mesh.resource_uri = mesh_path.string();
-  mesh.scale = Vector3DTO{1.0, 1.0, 1.0};
+  CollisionGeometryDescriptor geom;
+  geom.body_id = body.body_id;
+  geom.owner_kind = body.owner_kind;
+  geom.geometry_kind = CollisionGeometryKind::kTriangleMesh;
+  geom.local_pose.orientation.w = 1.0;
+  geom.source_hash = "phase4_unloadable_mesh_without_source_uri";
+  geom.quality_labels = {"mesh", "collision_mesh", "unloadable_fixture"};
+  body.geometries.push_back(std::move(geom));
 
-  AddObjectRequestDTO req;
-  req.object_id = object_id;
-  req.shape = CollisionShapeDTO{mesh};
-  req.pose = pose(0.7, 0.0, 0.25);
-  req.frame_id = "universe";
-  return req;
+  snapshot.bodies.push_back(std::move(body));
+  snapshot.body_count += 1;
+  snapshot.detached_object_count += 1;
+  snapshot.geometry_count += 1;
+  snapshot.contains_mesh_geometry = true;
 }
 
 TrajectoryDTO repeated_trajectory(const manyforge::core::RobotStateDTO& state,
@@ -371,8 +374,8 @@ bool setup_fixture(RoboPlanPlanningContext& context, FixtureEvidence& evidence) 
     }
     return true;
   }
-  if (name == "mesh_scene_object") {
-    return add_object_checked(context, mesh_object("phase4_mesh"), evidence);
+  if (name == "unsupported_mesh_fail_closed") {
+    return true;
   }
   if (name == "isaac_like_primitive_cell") {
     return add_object_checked(context,
@@ -583,22 +586,26 @@ FixtureEvidence run_fixture(const FixtureConfig& config) {
     add_error(evidence, "snapshot publisher returned null");
     return evidence;
   }
-  evidence.revision_id = snapshot->revision.revision_id;
-  evidence.body_count = snapshot->body_count;
-  evidence.geometry_count = snapshot->geometry_count;
-  evidence.robot_link_count = snapshot->robot_link_count;
-  evidence.detached_object_count = snapshot->detached_object_count;
-  evidence.attached_object_count = snapshot->attached_object_count;
-  evidence.contains_mesh_geometry = snapshot->contains_mesh_geometry;
+  CollisionWorldSnapshot probe_snapshot = *snapshot;
+  if (config.expect_unsupported_fail_closed) {
+    append_unloadable_mesh_body(probe_snapshot);
+  }
+  evidence.revision_id = probe_snapshot.revision.revision_id;
+  evidence.body_count = probe_snapshot.body_count;
+  evidence.geometry_count = probe_snapshot.geometry_count;
+  evidence.robot_link_count = probe_snapshot.robot_link_count;
+  evidence.detached_object_count = probe_snapshot.detached_object_count;
+  evidence.attached_object_count = probe_snapshot.attached_object_count;
+  evidence.contains_mesh_geometry = probe_snapshot.contains_mesh_geometry;
 
   auto engine = make_engine("ur5_gripper", "arm");
   evidence.engine_id = engine->engine_id();
   evidence.engine_version = engine->engine_version();
 
   const auto policy = policy_for_fixture(config);
-  run_query_probe(*context, *snapshot, *engine, policy, evidence);
+  run_query_probe(*context, probe_snapshot, *engine, policy, evidence);
   if (!config.expect_unsupported_fail_closed) {
-    run_validation_probe(*context, *snapshot, policy, evidence);
+    run_validation_probe(*context, probe_snapshot, policy, evidence);
   }
 
   if (config.expect_manyforge_vs_roboplan_match &&
@@ -702,9 +709,11 @@ int main() {
                     .profile = "attached_primitive",
                     .expect_manyforge_vs_roboplan_match = true,
                     .expect_attached_object = true},
-      FixtureConfig{.name = "mesh_scene_object",
-                    .profile = "mesh_scene_object",
-                    .expect_manyforge_vs_roboplan_match = true,
+      FixtureConfig{.name = "unsupported_mesh_fail_closed",
+                    .profile = "unsupported_mesh",
+                    .expect_manyforge_vs_roboplan_match = false,
+                    .expect_unsupported_fail_closed = true,
+                    .validate_trajectory = false,
                     .query_iterations = 30},
       FixtureConfig{.name = "isaac_like_primitive_cell",
                     .profile = "isaac_like_primitive",

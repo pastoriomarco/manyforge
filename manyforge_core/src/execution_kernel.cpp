@@ -224,6 +224,143 @@ std::string collision_pair_name(const CollisionPairId& pair) {
   return pair.body_a + " <-> " + pair.body_b;
 }
 
+CollisionPairId canonical_collision_pair(CollisionPairId pair) {
+  if (pair.body_b < pair.body_a) {
+    std::swap(pair.body_a, pair.body_b);
+  }
+  return pair;
+}
+
+std::string collision_pair_key(const CollisionPairId& pair) {
+  const auto canonical = canonical_collision_pair(pair);
+  return canonical.body_a + "\n" + canonical.body_b;
+}
+
+std::optional<double> pair_clearance_for_result(
+    const CollisionResult& result,
+    const CollisionPairId& pair) {
+  const auto canonical = canonical_collision_pair(pair);
+  for (const auto& clearance : result.pair_clearances) {
+    if (canonical_collision_pair(clearance.pair) == canonical) {
+      return clearance.signed_clearance_m;
+    }
+  }
+  if (result.min_clearance_pair &&
+      canonical_collision_pair(*result.min_clearance_pair) == canonical &&
+      result.min_clearance_m) {
+    return *result.min_clearance_m;
+  }
+  return std::nullopt;
+}
+
+void append_collision_result_observation(
+    std::map<std::string, std::string>& details,
+    const CollisionResult& result) {
+  details["collision_result_engine_id"] = result.engine_id;
+  details["collision_result_engine_version"] = result.engine_version;
+  details["collision_result_engine_status"] =
+      collision_engine_status_name(result.engine_status);
+  details["collision_result_decision"] =
+      collision_decision_result_name(result.decision);
+  details["collision_result_in_collision"] =
+      result.in_collision ? "true" : "false";
+  details["collision_result_pair_clearance_count"] =
+      std::to_string(result.pair_clearances.size());
+  details["collision_result_normalized_pair_count"] =
+      std::to_string(result.normalized_pairs.size());
+  if (result.min_clearance_m) {
+    details["collision_result_min_clearance_m"] =
+        std::to_string(*result.min_clearance_m);
+  }
+  if (result.min_clearance_pair) {
+    details["collision_result_min_clearance_pair"] =
+        collision_pair_name(*result.min_clearance_pair);
+  }
+  if (!result.pair_clearances.empty()) {
+    details["collision_result_first_clearance_pair"] =
+        collision_pair_name(result.pair_clearances.front().pair);
+    details["collision_result_first_clearance_m"] =
+        std::to_string(result.pair_clearances.front().signed_clearance_m);
+  }
+  std::size_t emitted = 0;
+  for (const auto& [key, value] : result.raw_diagnostics) {
+    if (emitted >= 8) {
+      details["collision_result_raw_diagnostics_truncated"] = "true";
+      break;
+    }
+    details["collision_result_raw_" + key] = value;
+    ++emitted;
+  }
+}
+
+bool snapshot_too_old(std::int64_t now_ns,
+                      std::int64_t timestamp_ns,
+                      std::int64_t max_age_ns,
+                      std::map<std::string, std::string>& details,
+                      const std::string& timestamp_key,
+                      const std::string& age_key,
+                      const std::string& budget_key) {
+  if (max_age_ns <= 0) {
+    return false;
+  }
+  details[timestamp_key] = std::to_string(timestamp_ns);
+  details[budget_key] = std::to_string(max_age_ns);
+  if (timestamp_ns < 0) {
+    details[age_key] = "invalid_negative_timestamp";
+    return true;
+  }
+  if (timestamp_ns > now_ns) {
+    details[age_key] = "timestamp_in_future";
+    details["clock_skew_ns"] = std::to_string(timestamp_ns - now_ns);
+    return true;
+  }
+  const auto age_ns = now_ns - timestamp_ns;
+  details[age_key] = std::to_string(age_ns);
+  return age_ns > max_age_ns;
+}
+
+std::optional<std::string> validate_dynamic_body_freshness(
+    const CollisionWorldSnapshot& snapshot,
+    std::int64_t now_ns,
+    std::int64_t runtime_cap_ns,
+    std::map<std::string, std::string>& details) {
+  for (const auto& body : snapshot.bodies) {
+    if (!body.source_freshness_budget_ns.has_value()) {
+      continue;
+    }
+    details["dynamic_body_id"] = body.body_id;
+    details["dynamic_body_declared_freshness_budget_ns"] =
+        std::to_string(*body.source_freshness_budget_ns);
+    const auto effective_budget_ns =
+        runtime_cap_ns > 0
+            ? std::min(*body.source_freshness_budget_ns, runtime_cap_ns)
+            : *body.source_freshness_budget_ns;
+    details["dynamic_body_effective_freshness_budget_ns"] =
+        std::to_string(effective_budget_ns);
+    if (!body.source_timestamp_ns.has_value()) {
+      return "dynamic_body_missing_source_timestamp";
+    }
+    details["dynamic_body_source_timestamp_ns"] =
+        std::to_string(*body.source_timestamp_ns);
+    if (*body.source_timestamp_ns < 0) {
+      details["dynamic_body_age_ns"] = "invalid_negative_timestamp";
+      return "stale_dynamic_collision_body";
+    }
+    if (*body.source_timestamp_ns > now_ns) {
+      details["dynamic_body_age_ns"] = "timestamp_in_future";
+      details["dynamic_body_clock_skew_ns"] =
+          std::to_string(*body.source_timestamp_ns - now_ns);
+      return "stale_dynamic_collision_body";
+    }
+    const auto age_ns = now_ns - *body.source_timestamp_ns;
+    details["dynamic_body_age_ns"] = std::to_string(age_ns);
+    if (effective_budget_ns <= 0 || age_ns > effective_budget_ns) {
+      return "stale_dynamic_collision_body";
+    }
+  }
+  return std::nullopt;
+}
+
 void append_collision_failure_diagnostics(
     std::map<std::string, std::string>& details,
     const CollisionValidationDecisionBundle& bundle) {
@@ -756,9 +893,14 @@ ExecutionKernel::ExecutionKernel(IPlannerBackend& planner,
       cache_(cache),
       config_(std::move(config)),
       sm_(clock),
-      stop_policy_(sm_, scheduler, clock, [this]() { cache_.invalidate_all(); }),
-      collision_policy_(stop_policy_,
-                        [this]() { cache_.invalidate_all(); }) {
+      stop_policy_(sm_, scheduler, clock, [this]() { cache_.invalidate_all(); }) {
+  if (config_.collision_monitor_period_ns <= 0) {
+    throw std::invalid_argument("collision_monitor_period_ns must be > 0");
+  }
+  if (config_.runtime_collision_query_timeout_ns <= 0) {
+    throw std::invalid_argument(
+        "runtime_collision_query_timeout_ns must be > 0");
+  }
   if (config_.streaming_ik_timeout_s <= 0.0 ||
       !std::isfinite(config_.streaming_ik_timeout_s)) {
     throw std::invalid_argument("streaming_ik_timeout_s must be finite and > 0");
@@ -1289,6 +1431,7 @@ bool ExecutionKernel::wait_for_completion(int64_t timeout_ns) {
 }
 
 void ExecutionKernel::start_collision_monitoring() {
+  reset_runtime_contact_release_state();
   std::lock_guard<std::mutex> lock(collision_monitor_mutex_);
   collision_monitor_active_ = true;
   ++collision_monitor_generation_;
@@ -1307,6 +1450,89 @@ void ExecutionKernel::stop_collision_monitoring() {
     scheduler_.cancel(collision_monitor_handle_);
     collision_monitor_handle_ = 0;
   }
+  reset_runtime_contact_release_state();
+}
+
+void ExecutionKernel::reset_runtime_contact_release_state() {
+  std::lock_guard<std::mutex> lock(runtime_contact_release_mutex_);
+  runtime_contact_release_state_.clear();
+}
+
+std::optional<std::map<std::string, std::string>>
+ExecutionKernel::update_runtime_contact_release_state(
+    const CollisionPolicySnapshot& policy_snapshot,
+    const CollisionValidationDecisionBundle& bundle) {
+  if (policy_snapshot.support_contacts.empty() ||
+      bundle.waypoint_records.empty()) {
+    return std::nullopt;
+  }
+  const auto& result = bundle.waypoint_records.front().result;
+  std::lock_guard<std::mutex> lock(runtime_contact_release_mutex_);
+  for (const auto& entry : policy_snapshot.support_contacts) {
+    std::map<std::string, std::string> details;
+    details["reason_code"] = "runtime_contact_release_monitor";
+    details["contact_release_pair"] = collision_pair_name(entry.pair);
+    details["contact_a"] = entry.pair.body_a;
+    details["contact_b"] = entry.pair.body_b;
+    details["contact_release_tolerance_m"] =
+        std::to_string(entry.release_tolerance_m);
+    details["contact_release_max_start_penetration_m"] =
+        std::to_string(entry.max_start_penetration_m);
+    details["contact_release_min_separation_clearance_m"] =
+        std::to_string(entry.min_separation_clearance_m);
+
+    if (entry.mode == CollisionContactPolicyMode::kContactProcess) {
+      details["reason"] = "runtime_contact_process_policy_not_implemented";
+      return details;
+    }
+
+    auto clearance = pair_clearance_for_result(result, entry.pair);
+    if (!clearance.has_value() || !std::isfinite(*clearance)) {
+      details["reason"] = "runtime_contact_release_missing_clearance";
+      append_collision_result_observation(details, result);
+      return details;
+    }
+    const double tolerance = std::max(0.0, entry.release_tolerance_m);
+    const double depth = *clearance < 0.0 ? -*clearance : 0.0;
+    const bool separated =
+        *clearance >= std::max(0.0, entry.min_separation_clearance_m);
+    details["contact_release_signed_clearance_m"] =
+        std::to_string(*clearance);
+    details["contact_release_current_penetration_m"] = std::to_string(depth);
+
+    const auto key = collision_pair_key(entry.pair);
+    auto it = runtime_contact_release_state_.find(key);
+    if (it == runtime_contact_release_state_.end()) {
+      if (depth > std::max(0.0, entry.max_start_penetration_m) + tolerance) {
+        details["reason"] = "runtime_contact_release_initial_penetration_exceeds_policy";
+        return details;
+      }
+      RuntimeContactReleasePairState state;
+      state.initial_penetration_m = depth;
+      state.last_penetration_m = depth;
+      state.separated = separated;
+      runtime_contact_release_state_.emplace(key, state);
+      continue;
+    }
+
+    auto& state = it->second;
+    details["contact_release_initial_penetration_m"] =
+        std::to_string(state.initial_penetration_m);
+    details["contact_release_previous_penetration_m"] =
+        std::to_string(state.last_penetration_m);
+
+    if (state.separated && depth > tolerance && !entry.allow_recontact) {
+      details["reason"] = "runtime_contact_release_recontact";
+      return details;
+    }
+    if (depth > state.last_penetration_m + tolerance) {
+      details["reason"] = "runtime_contact_release_penetration_increased";
+      return details;
+    }
+    state.last_penetration_m = depth;
+    state.separated = state.separated || separated;
+  }
+  return std::nullopt;
 }
 
 void ExecutionKernel::schedule_next_collision_monitor_tick(uint64_t generation) {
@@ -2800,33 +3026,95 @@ Result<void> ExecutionKernel::collision_check_tick() {
     return publish_runtime_monitor_fault(CollisionCheckResultDTO{}, monitor_details);
   }
 
-  RobotStateDTO state;
+  const auto now_ns = clock_.now();
+  if (auto freshness_reason = validate_dynamic_body_freshness(
+          *world_snapshot,
+          now_ns,
+          config_.runtime_dynamic_body_max_age_cap_ns,
+          monitor_details)) {
+    monitor_details["reason"] = *freshness_reason;
+    monitor_details["collision_world_revision_id"] =
+        std::to_string(world_snapshot->revision.revision_id);
+    monitor_details["collision_world_content_hash"] =
+        world_snapshot->revision.content_hash;
+    return publish_runtime_monitor_fault(CollisionCheckResultDTO{},
+                                         monitor_details);
+  }
+
+  ExecutionSnapshot observed_snapshot;
   try {
-    state = context_.get_current_state();
+    observed_snapshot = execution_backend_.get_execution_snapshot();
   } catch (const std::exception& e) {
-    monitor_details["reason"] = "state_unavailable";
+    monitor_details["reason"] = "observed_state_unavailable";
     monitor_details["exception"] = e.what();
     return publish_runtime_monitor_fault(CollisionCheckResultDTO{}, monitor_details);
   } catch (...) {
-    monitor_details["reason"] = "state_unavailable";
+    monitor_details["reason"] = "observed_state_unavailable";
     monitor_details["exception"] = "unknown";
+    return publish_runtime_monitor_fault(CollisionCheckResultDTO{}, monitor_details);
+  }
+  if (snapshot_too_old(now_ns,
+                       observed_snapshot.timestamp_ns,
+                       config_.runtime_observed_state_max_age_ns,
+                       monitor_details,
+                       "observed_state_timestamp_ns",
+                       "observed_state_age_ns",
+                       "observed_state_freshness_budget_ns")) {
+    monitor_details["reason"] = "stale_observed_robot_state";
+    return publish_runtime_monitor_fault(CollisionCheckResultDTO{}, monitor_details);
+  }
+  if (observed_snapshot.joint_positions_rad.empty()) {
+    monitor_details["reason"] = "observed_state_missing_joint_positions";
+    return publish_runtime_monitor_fault(CollisionCheckResultDTO{}, monitor_details);
+  }
+
+  RobotStateDTO context_state;
+  try {
+    context_state = context_.get_current_state();
+  } catch (const std::exception& e) {
+    monitor_details["reason"] = "joint_name_state_unavailable";
+    monitor_details["exception"] = e.what();
+    return publish_runtime_monitor_fault(CollisionCheckResultDTO{}, monitor_details);
+  } catch (...) {
+    monitor_details["reason"] = "joint_name_state_unavailable";
+    monitor_details["exception"] = "unknown";
+    return publish_runtime_monitor_fault(CollisionCheckResultDTO{}, monitor_details);
+  }
+  if (context_state.joint_names.size() !=
+      observed_snapshot.joint_positions_rad.size()) {
+    monitor_details["reason"] = "observed_state_joint_count_mismatch";
+    monitor_details["joint_name_count"] =
+        std::to_string(context_state.joint_names.size());
+    monitor_details["observed_joint_position_count"] =
+        std::to_string(observed_snapshot.joint_positions_rad.size());
     return publish_runtime_monitor_fault(CollisionCheckResultDTO{}, monitor_details);
   }
 
   TrajectoryDTO one_state;
-  one_state.joint_names = state.joint_names;
+  one_state.joint_names = context_state.joint_names;
   one_state.waypoints.push_back(TrajectoryWaypointDTO{
       0.0,
-      state.positions_rad,
-      state.velocities_rad_s,
+      observed_snapshot.joint_positions_rad,
+      {},
       {}});
 
+  auto runtime_policy_snapshot = *policy_snapshot;
+  for (auto& entry : runtime_policy_snapshot.support_contacts) {
+    if (entry.mode == CollisionContactPolicyMode::kContactRelease) {
+      // Runtime ticks are single observed states, not complete trajectories.
+      // The per-move validation proves final separation; the runtime monitor
+      // enforces bounded/non-increasing penetration across ticks below.
+      entry.require_separation_by_end = false;
+      entry.require_strictly_decreasing_penetration = false;
+    }
+  }
+
   CollisionValidationPassConfig cfg;
-  cfg.policy_snapshot = *policy_snapshot;
+  cfg.policy_snapshot = runtime_policy_snapshot;
   cfg.require_pose_source_borrow = false;
   cfg.surface = CollisionSurface::kObservedRuntimeMonitor;
   cfg.per_state_timeout_ns =
-      static_cast<std::int64_t>(config_.collision_monitor_period_ns / 2);
+      static_cast<std::int64_t>(config_.runtime_collision_query_timeout_ns);
   CollisionValidationCoordinator coord(std::move(cfg));
   CollisionCancellationToken cancel;
   CollisionValidationDecisionBundle bundle;
@@ -2847,6 +3135,28 @@ Result<void> ExecutionKernel::collision_check_tick() {
   }
 
   if (bundle.decision.accepted) {
+    if (auto release_fault =
+            update_runtime_contact_release_state(*policy_snapshot, bundle)) {
+      if (release_fault->find("reason") == release_fault->end()) {
+        (*release_fault)["reason"] = "runtime_contact_release_monitor";
+      }
+      (*release_fault)["collision_world_revision_id"] =
+          std::to_string(bundle.borrowed_world_revision.revision_id);
+      (*release_fault)["collision_world_content_hash"] =
+          bundle.borrowed_world_revision.content_hash;
+      append_collision_failure_diagnostics(*release_fault, bundle);
+      CollisionCheckResultDTO check;
+      check.in_collision = true;
+      auto contact_a = release_fault->find("contact_a");
+      if (contact_a != release_fault->end()) {
+        check.contact_body_a = contact_a->second;
+      }
+      auto contact_b = release_fault->find("contact_b");
+      if (contact_b != release_fault->end()) {
+        check.contact_body_b = contact_b->second;
+      }
+      return publish_runtime_monitor_fault(check, std::move(*release_fault));
+    }
     return Result<void>::Ok();
   }
 
@@ -3418,80 +3728,6 @@ void ExecutionKernel::set_collision_validation_retry_config(
   std::scoped_lock lock(coordinator_mutex_);
   coordinator_retry_config_ = retry;
   coordinator_per_state_timeout_ns_ = per_state_timeout_ns;
-}
-
-CollisionValidationDecisionBundle
-ExecutionKernel::run_predicted_path_monitor_diagnostic(
-    const std::optional<RobotStateDTO>& predicted_state) {
-  std::optional<CollisionPolicySnapshot> snapshot;
-  PoseSourceRetryConfig retry;
-  std::int64_t per_state_timeout_ns = 0;
-  {
-    std::scoped_lock lock(coordinator_mutex_);
-    snapshot = coordinator_policy_snapshot_;
-    retry = coordinator_retry_config_;
-    per_state_timeout_ns = coordinator_per_state_timeout_ns_;
-  }
-  CollisionValidationDecisionBundle bundle;
-  if (!snapshot) {
-    bundle.decision.accepted = true;
-    bundle.decision.action = CollisionDecisionAction::kDispatch;
-    return bundle;
-  }
-  CollisionValidationPassConfig cfg;
-  cfg.policy_snapshot = *snapshot;
-  cfg.pose_source_retry = retry;
-  cfg.per_state_timeout_ns = per_state_timeout_ns;
-  cfg.require_pose_source_borrow = false;
-  cfg.surface = CollisionSurface::kPredictedRuntimeMonitor;
-  CollisionValidationCoordinator coord(std::move(cfg));
-
-  try {
-    RobotStateDTO state = predicted_state.value_or(context_.get_current_state());
-    bundle = coord.validate_state(context_, state);
-  } catch (const std::exception& e) {
-    bundle.decision.accepted = false;
-    bundle.decision.severity = CollisionDecisionSeverity::kBlock;
-    bundle.decision.action = CollisionDecisionAction::kInconclusive;
-    KernelEvent ev;
-    ev.type = KernelEventType::kCollisionDetected;
-    ev.execution_id = sm_.status().execution_id;
-    ev.timestamp_ns = clock_.now();
-    ev.details["surface"] = "runtime_predicted_diagnostic";
-    ev.details["diagnostic_error"] = e.what();
-    emit_event(ev);
-    return bundle;
-  } catch (...) {
-    bundle.decision.accepted = false;
-    bundle.decision.severity = CollisionDecisionSeverity::kBlock;
-    bundle.decision.action = CollisionDecisionAction::kInconclusive;
-    KernelEvent ev;
-    ev.type = KernelEventType::kCollisionDetected;
-    ev.execution_id = sm_.status().execution_id;
-    ev.timestamp_ns = clock_.now();
-    ev.details["surface"] = "runtime_predicted_diagnostic";
-    ev.details["diagnostic_error"] = "unknown";
-    emit_event(ev);
-    return bundle;
-  }
-
-  if (!bundle.decision.accepted) {
-    KernelEvent ev;
-    ev.type = KernelEventType::kCollisionDetected;
-    ev.execution_id = sm_.status().execution_id;
-    ev.timestamp_ns = clock_.now();
-    ev.details["surface"] = "runtime_predicted_diagnostic";
-    if (bundle.decision.first_failing_waypoint) {
-      ev.details["first_failing_waypoint"] =
-          std::to_string(*bundle.decision.first_failing_waypoint);
-    }
-    if (bundle.borrowed_world_revision.revision_id != 0) {
-      ev.details["collision_world_revision_id"] =
-          std::to_string(bundle.borrowed_world_revision.revision_id);
-    }
-    emit_event(ev);
-  }
-  return bundle;
 }
 
 // -----------------------------------------------------------------

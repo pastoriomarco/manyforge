@@ -800,6 +800,12 @@ class NativeKernelClient(KernelClient):
             req_dict["touch_links"] = list(request.touch_links)
         if request.support_contacts is not None:
             req_dict["support_contacts"] = list(request.support_contacts)
+        if request.source_timestamp_ns is not None:
+            req_dict["source_timestamp_ns"] = int(request.source_timestamp_ns)
+        if request.source_freshness_budget_ns is not None:
+            req_dict["source_freshness_budget_ns"] = int(
+                request.source_freshness_budget_ns
+            )
 
         try:
             result = self._bundle.scene_edit(req_dict)

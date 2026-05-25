@@ -527,12 +527,33 @@ def _validate_scene_resource_value(value: Any) -> str | None:
                     f"metadata.support_contacts[{contact_index}]."
                     "max_start_penetration_m must be >= 0"
                 )
-            require_separation = contact.get("require_separation_by_end", True)
-            if require_separation is not True:
+            mode = contact.get("mode", "contact_release")
+            if mode not in {"contact_release", "contact_process"}:
                 return (
-                    f"metadata.support_contacts[{contact_index}]."
-                    "require_separation_by_end must be true"
+                    f"metadata.support_contacts[{contact_index}].mode must be "
+                    "contact_release or contact_process"
                 )
+            for field_name in (
+                "release_tolerance_m",
+                "min_release_progress_m",
+                "min_separation_clearance_m",
+            ):
+                value = contact.get(field_name, 0.0)
+                if not _is_numeric(value) or float(value) < 0.0:
+                    return (
+                        f"metadata.support_contacts[{contact_index}]."
+                        f"{field_name} must be >= 0"
+                    )
+            for field_name in (
+                "require_separation_by_end",
+                "require_strictly_decreasing_penetration",
+                "allow_recontact",
+            ):
+                if field_name in contact and not isinstance(contact[field_name], bool):
+                    return (
+                        f"metadata.support_contacts[{contact_index}]."
+                        f"{field_name} must be boolean"
+                    )
 
     return None
 

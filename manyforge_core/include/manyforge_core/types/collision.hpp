@@ -140,6 +140,19 @@ struct CollisionPairResult {
   bool is_first_failure = false;
 };
 
+/// Signed clearance / penetration diagnostic for one canonical collision pair.
+///
+/// Positive values mean separation clearance. Zero means touching within
+/// engine tolerance. Negative values mean penetration depth. Engines populate
+/// this vector only when the query requested `distance` /
+/// `penetration_depth`, or when doing so is already part of their normal query
+/// path. Consumers MUST NOT infer contact-release safety from
+/// `normalized_pairs` alone when a policy requires numeric release proof.
+struct CollisionPairClearance {
+  CollisionPairId pair;
+  double signed_clearance_m = 0.0;
+};
+
 /// Logical owner of a collision body (spec §3.8.1).
 enum class CollisionOwnerKind {
   kRobotLink,
@@ -296,6 +309,12 @@ struct CollisionResult {
   /// null.
   std::optional<CollisionPairId> min_clearance_pair;
 
+  /// Per-pair signed clearance / penetration diagnostics. Sorted by pair.
+  /// This may include non-colliding pairs when a query requires distance
+  /// proof. Contact-release policies depend on this field for tracked pairs;
+  /// missing entries under such a policy are fail-closed.
+  std::vector<CollisionPairClearance> pair_clearances;
+
   /// Per-pair classification produced by the Chunk 3 policy evaluator.
   /// Includes observed-pair classifications and may include policy-state
   /// transition entries (for example kSupportContactSeparated) for pairs absent
@@ -316,17 +335,44 @@ struct CollisionResult {
   std::map<std::string, std::string> raw_diagnostics;
 };
 
+/// Contact-policy mode for entries in CollisionPolicySnapshot::support_contacts.
+///
+/// kContactRelease is the Phase 4-P1 production mode for moves that start in
+/// bounded contact and must prove decreasing penetration / release.
+/// kContactProcess is reserved for future force/controller-backed contact-rich
+/// applications and intentionally fails closed until sensing envelopes and
+/// adapter freshness gates are implemented.
+enum class CollisionContactPolicyMode {
+  kContactRelease,
+  kContactProcess,
+};
+
 /// One entry in CollisionPolicySnapshot::support_contacts (spec §3.8.1,
 /// added in Chunk 3).
 struct SupportContactPolicyEntry {
   CollisionPairId pair;
+  CollisionContactPolicyMode mode =
+      CollisionContactPolicyMode::kContactRelease;
   /// Initial penetration envelope. Enforced only by evaluators/coordinators
   /// that receive penetration-depth diagnostics; otherwise full-diagnostic
   /// policies must fail closed.
   double max_start_penetration_m = 0.0;
+  /// Numeric tolerance for monotonic release checks. A later sample may be
+  /// deeper than the previous accepted sample by at most this amount.
+  double release_tolerance_m = 1e-5;
+  /// Minimum total reduction required when
+  /// require_strictly_decreasing_penetration is true and the pair has not
+  /// reached separation. Zero means any reduction beyond tolerance.
+  double min_release_progress_m = 0.0;
+  /// Signed clearance required to count as separated for
+  /// require_separation_by_end and re-contact checks.
+  double min_separation_clearance_m = 0.0;
   /// Requires a trajectory-scoped coordinator to evaluate the final sample.
   /// Stateless single-sample evaluators must not claim this was proven.
   bool require_separation_by_end = true;
+  /// Require the trajectory to show a net penetration decrease or separation,
+  /// not merely "no worse than start" within tolerance.
+  bool require_strictly_decreasing_penetration = true;
   bool allow_recontact = false;
 };
 

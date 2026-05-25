@@ -12,6 +12,7 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <optional>
 #include <string>
 
 namespace {
@@ -25,6 +26,7 @@ using manyforge::core::CollisionShapeDTO;
 using manyforge::core::CollisionWorldBody;
 using manyforge::core::CollisionWorldMutationSource;
 using manyforge::core::DetachObjectRequestDTO;
+using manyforge::core::kErrorInvalidRequest;
 using manyforge::core::MeshShapeDTO;
 using manyforge::core::Pose3DTO;
 using manyforge::core::RemoveObjectRequestDTO;
@@ -83,19 +85,19 @@ class CollisionWorldPublisherTest : public ::testing::Test {
     return req;
   }
 
-  const CollisionWorldBody* find_body(const std::string& body_id) {
+  std::optional<CollisionWorldBody> find_body(const std::string& body_id) {
     auto snapshot = context_->snapshot();
     if (!snapshot) {
-      return nullptr;
+      return std::nullopt;
     }
     auto it = std::find_if(snapshot->bodies.begin(), snapshot->bodies.end(),
                            [&](const CollisionWorldBody& body) {
                              return body.body_id == body_id;
                            });
     if (it == snapshot->bodies.end()) {
-      return nullptr;
+      return std::nullopt;
     }
-    return &*it;
+    return *it;
   }
 
   std::shared_ptr<NativeKernelBundle> bundle_;
@@ -172,8 +174,8 @@ TEST_F(CollisionWorldPublisherTest,
        SnapshotIncludesDetachedPrimitiveObjectWithDimensions) {
   ASSERT_TRUE(context_->add_object(make_box_at_origin("box_a")).success);
 
-  const auto* body = find_body("object/box_a/shape/0");
-  ASSERT_NE(body, nullptr);
+  const auto body = find_body("object/box_a/shape/0");
+  ASSERT_TRUE(body.has_value());
   EXPECT_EQ(body->owner_kind, CollisionOwnerKind::kDetachedObject);
   EXPECT_FALSE(body->parent_link.has_value());
   EXPECT_EQ(body->frame_id, "universe");
@@ -195,11 +197,11 @@ TEST_F(CollisionWorldPublisherTest,
   attach.frame_id = "tool0";
   ASSERT_TRUE(context_->attach_object(attach).success);
 
-  const auto* detached = find_body("object/box_a/shape/0");
-  EXPECT_EQ(detached, nullptr);
-  const auto* attached =
+  const auto detached = find_body("object/box_a/shape/0");
+  EXPECT_FALSE(detached.has_value());
+  const auto attached =
       find_body("robot/robot0/attached/box_a/shape/0");
-  ASSERT_NE(attached, nullptr);
+  ASSERT_TRUE(attached.has_value());
   EXPECT_EQ(attached->owner_kind, CollisionOwnerKind::kAttachedObject);
   ASSERT_TRUE(attached->parent_link.has_value());
   EXPECT_EQ(*attached->parent_link, "robot/robot0/link/tool0");
@@ -216,8 +218,8 @@ TEST_F(CollisionWorldPublisherTest,
   auto snapshot = context_->snapshot();
   ASSERT_NE(snapshot, nullptr);
   EXPECT_TRUE(snapshot->contains_mesh_geometry);
-  const auto* body = find_body("object/mesh_a/shape/0");
-  ASSERT_NE(body, nullptr);
+  const auto body = find_body("object/mesh_a/shape/0");
+  ASSERT_TRUE(body.has_value());
   ASSERT_EQ(body->geometries.size(), 1u);
   const auto& geom = body->geometries.front();
   EXPECT_EQ(geom.geometry_kind, CollisionGeometryKind::kTriangleMesh);
@@ -258,6 +260,48 @@ TEST_F(CollisionWorldPublisherTest, UpdatePoseSucceeds_BumpsRevisionOnce) {
 
   EXPECT_EQ(context_->current_collision_world_revision().revision_id,
             before.revision_id + 1);
+}
+
+TEST_F(CollisionWorldPublisherTest,
+       UpdatePoseWithSourceFreshnessReachesCollisionSnapshot) {
+  ASSERT_TRUE(context_->add_object(make_box_at_origin("box_a")).success);
+
+  UpdateObjectPoseRequestDTO req;
+  req.object_id = "box_a";
+  req.pose.position_m = Vector3DTO{0.5, 0.0, 0.5};
+  req.pose.orientation.w = 1.0;
+  req.frame_id = "universe";
+  req.source_timestamp_ns = 123'000'000;
+  req.source_freshness_budget_ns = 50'000'000;
+  auto result = context_->update_object_pose(req);
+  ASSERT_TRUE(result.success);
+
+  const auto body = find_body("object/box_a/shape/0");
+  ASSERT_TRUE(body.has_value());
+  ASSERT_TRUE(body->source_timestamp_ns.has_value());
+  EXPECT_EQ(*body->source_timestamp_ns, 123'000'000);
+  ASSERT_TRUE(body->source_freshness_budget_ns.has_value());
+  EXPECT_EQ(*body->source_freshness_budget_ns, 50'000'000);
+}
+
+TEST_F(CollisionWorldPublisherTest,
+       UpdatePoseRejectsPartialSourceFreshnessMetadataWithoutRevisionBump) {
+  ASSERT_TRUE(context_->add_object(make_box_at_origin("box_a")).success);
+  const auto before = context_->current_collision_world_revision();
+
+  UpdateObjectPoseRequestDTO req;
+  req.object_id = "box_a";
+  req.pose.position_m = Vector3DTO{0.5, 0.0, 0.5};
+  req.pose.orientation.w = 1.0;
+  req.frame_id = "universe";
+  req.source_timestamp_ns = 123'000'000;
+  auto result = context_->update_object_pose(req);
+  ASSERT_FALSE(result.success);
+  ASSERT_TRUE(result.error.has_value());
+  EXPECT_EQ(result.error->code, kErrorInvalidRequest);
+
+  EXPECT_EQ(context_->current_collision_world_revision().revision_id,
+            before.revision_id);
 }
 
 TEST_F(CollisionWorldPublisherTest, AttachDetachEachBumpRevisionOnce) {

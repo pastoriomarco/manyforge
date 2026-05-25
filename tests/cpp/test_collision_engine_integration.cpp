@@ -13,6 +13,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -813,13 +814,37 @@ TEST(ManyForgeCollisionEngineTest,
 
   CollisionQuery q;
   q.robot_state = context->get_current_state();
-  q.required_capabilities = {"distance"};
+  q.required_capabilities = {"contact_points"};
   auto result = check_snapshot(*engine, *snapshot, q);
 
   EXPECT_EQ(result.engine_status,
             manyforge::core::CollisionEngineStatus::kDiagnosticIncomplete);
   EXPECT_EQ(result.decision,
             manyforge::core::CollisionDecisionResult::kInconclusiveFail);
+}
+
+TEST(ManyForgeCollisionEngineTest,
+     RequiredDistanceCapabilityPopulatesSignedClearance) {
+  auto bundle = create_native_kernel("ur5_gripper", "arm");
+  ASSERT_TRUE(bundle);
+  auto* context = dynamic_cast<RoboPlanPlanningContext*>(bundle->context.get());
+  ASSERT_NE(context, nullptr);
+  ASSERT_TRUE(context->add_object(make_box_object("distance_box")).success);
+  auto snapshot = context->snapshot();
+  ASSERT_NE(snapshot, nullptr);
+  auto engine = make_engine("ur5_gripper", "arm");
+
+  CollisionQuery q;
+  q.robot_state = context->get_current_state();
+  q.required_capabilities = {"distance", "penetration_depth"};
+  auto result = check_snapshot(*engine, *snapshot, q);
+
+  EXPECT_EQ(result.engine_status,
+            manyforge::core::CollisionEngineStatus::kOk);
+  ASSERT_TRUE(result.min_clearance_m.has_value());
+  ASSERT_TRUE(result.min_clearance_pair.has_value());
+  EXPECT_FALSE(result.pair_clearances.empty());
+  EXPECT_TRUE(std::isfinite(*result.min_clearance_m));
 }
 
 TEST(ManyForgeCollisionEngineTest, ZeroTimeoutFailsClosedWithoutQueryPass) {
@@ -923,21 +948,18 @@ TEST(ManyForgeCollisionEngineTest,
   std::atomic<int> mismatch_count{0};
   std::atomic<bool> saw_secondary_incomplete{false};
   std::atomic<bool> saw_timestamp{false};
-  context->set_engine_mismatch_emitter(
-      [&mismatch_count, &saw_secondary_incomplete](
-          const std::map<std::string, std::string>& details) {
-        auto status_it = details.find("secondary_engine_status");
-        if (status_it != details.end() &&
+  context->set_engine_mismatch_record_emitter(
+      [&mismatch_count, &saw_secondary_incomplete, &saw_timestamp](
+          manyforge::core::CollisionEngineMismatchRecord record) {
+        auto status_it = record.raw_diagnostics.find("secondary_engine_status");
+        if (status_it != record.raw_diagnostics.end() &&
             status_it->second == "diagnostic_incomplete") {
           saw_secondary_incomplete.store(true);
         }
-        mismatch_count.fetch_add(1);
-      });
-  context->set_engine_mismatch_record_emitter(
-      [&saw_timestamp](manyforge::core::CollisionEngineMismatchRecord record) {
         if (record.emitted_at_ns > 0) {
           saw_timestamp.store(true);
         }
+        mismatch_count.fetch_add(1);
       });
 
   CollisionQuery q;

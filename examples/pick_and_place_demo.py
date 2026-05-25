@@ -98,34 +98,41 @@ def _load_simulator_initial_joint_positions() -> list[float] | None:
     return [float(v) for v in positions]
 
 
-def _load_collision_monitor_period_ns() -> int | None:
-    """Read collision monitor cadence from the example deployment."""
+def _load_kernel_config_from_deployment() -> dict[str, int]:
+    """Read kernel runtime-monitor settings from the example deployment."""
     try:
         with open(DEPLOYMENT_PATH) as f:
             data = yaml.safe_load(f)
     except Exception:
-        return None
+        return {}
 
-    raw_value = (data or {}).get("orchestrator", {}).get("config", {}).get(
-        "collision_monitor_period_ms"
-    )
-    if raw_value is None:
-        return None
-    period_ms = float(raw_value)
-    if period_ms <= 0.0:
-        raise ValueError("orchestrator.config.collision_monitor_period_ms must be > 0")
-    return int(period_ms * 1_000_000.0)
+    config = (data or {}).get("orchestrator", {}).get("config", {})
+    kernel_config: dict[str, int] = {}
+    raw_period = config.get("collision_monitor_period_ms")
+    if raw_period is not None:
+        period_ms = float(raw_period)
+        if period_ms <= 0.0:
+            raise ValueError(
+                "orchestrator.config.collision_monitor_period_ms must be > 0"
+            )
+        kernel_config["collision_monitor_period_ns"] = int(period_ms * 1_000_000.0)
+    raw_timeout = config.get("runtime_collision_query_timeout_ms")
+    if raw_timeout is not None:
+        timeout_ms = float(raw_timeout)
+        if timeout_ms <= 0.0:
+            raise ValueError(
+                "orchestrator.config.runtime_collision_query_timeout_ms must be > 0"
+            )
+        kernel_config["runtime_collision_query_timeout_ns"] = int(
+            timeout_ms * 1_000_000.0
+        )
+    return kernel_config
 
 
 def main():
     # --- 1. Create the native kernel (real RoboPlan planning) ---
     print("Creating UR5 robot with RoboPlan backends...")
-    kernel_config = None
-    collision_monitor_period_ns = _load_collision_monitor_period_ns()
-    if collision_monitor_period_ns is not None:
-        kernel_config = {
-            "collision_monitor_period_ns": collision_monitor_period_ns,
-        }
+    kernel_config = _load_kernel_config_from_deployment() or None
     bundle = manyforge_roboplan_py.create_native_kernel(
         "ur5_gripper", "arm", kernel_config
     )

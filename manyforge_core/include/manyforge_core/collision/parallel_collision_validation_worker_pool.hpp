@@ -93,8 +93,9 @@ struct FallbackLogEvent {
 /// Chunk 7, TRAJECTORY_VALIDATION_PARALLELISM_PLAN Chunks 1-3).
 ///
 /// Splits a trajectory into contiguous waypoint chunks, runs each chunk on a
-/// dedicated worker with its own IPlanningContext, and merges the per-chunk
-/// results deterministically by lowest failing waypoint index.
+/// dedicated worker with its own `ICollisionQueryEngine` against a shared
+/// immutable `CollisionWorldSnapshot`, and merges the per-chunk results
+/// deterministically by lowest failing waypoint index.
 ///
 /// Workers always see waypoints in their original trajectory order within
 /// each chunk; the merge is order-invariant w.r.t. worker completion time. This
@@ -106,7 +107,7 @@ struct FallbackLogEvent {
 ///     plan);
 ///   - worker_count <= 1;
 ///   - the trajectory is shorter than `min_waypoints_for_parallel`;
-///   - the caller did not provide enough worker_contexts to back the requested
+///   - the caller did not provide enough worker_engines to back the requested
 ///     worker count.
 ///
 /// The pool is stateless across calls EXCEPT for the fallback-log rate
@@ -169,17 +170,6 @@ class ParallelCollisionValidationWorkerPool {
 
   explicit ParallelCollisionValidationWorkerPool(Config config);
 
-  /// Run validation. `worker_contexts` is the caller-provided pool of
-  /// independent planning contexts. Null entries are ignored; if no
-  /// non-null context remains the pool fails closed with
-  /// `fallback_reason = "no_worker_contexts"`. The first non-null context
-  /// is also used for the serial fallback. The pool MUST NOT mutate the
-  /// contexts; threading discipline is the caller's responsibility (each
-  /// worker uses exactly one context for the duration of the call).
-  CollisionValidationDecisionBundle validate_trajectory(
-      const std::vector<IPlanningContext*>& worker_contexts,
-      const TrajectoryDTO& trajectory);
-
   /// Production engine-backed validation path. `worker_engines` must contain
   /// one independent engine per worker for engines that report
   /// kSingleContextExclusive. Null entries are ignored. The pool routes every
@@ -202,13 +192,6 @@ class ParallelCollisionValidationWorkerPool {
   }
 
  private:
-  CollisionValidationDecisionBundle run_serial_fallback(
-      IPlanningContext& context, const TrajectoryDTO& trajectory,
-      std::string fallback_reason,
-      int worker_count_requested,
-      int worker_count_available,
-      bool support_contact_active);
-
   /// Emit a fallback-log event through the sink, rate-limited.
   void maybe_emit_fallback_log(const FallbackLogEvent& event);
 

@@ -32,6 +32,24 @@ done
 
 mkdir -p "${OUT_DIR}"
 
+source_ros_setup_if_available() {
+  if [[ -f /opt/ros/jazzy/setup.bash ]]; then
+    # The Phase 4 harness is often invoked through docker exec, where shell
+    # startup files are not sourced. Source ROS explicitly before CMake lanes
+    # that may load ament package templates.
+    # shellcheck disable=SC1091
+    set +u
+    source /opt/ros/jazzy/setup.bash
+    set -u
+  fi
+  local cmeel_prefix="${MANYFORGE_CMEEL_PREFIX:-/opt/manyforge/venv/lib/python3.12/site-packages/cmeel.prefix}"
+  if [[ -d "${cmeel_prefix}" ]]; then
+    export CMAKE_PREFIX_PATH="${cmeel_prefix}:${CMAKE_PREFIX_PATH:-}"
+    export LD_LIBRARY_PATH="${cmeel_prefix}/lib:${LD_LIBRARY_PATH:-}"
+    export PKG_CONFIG_PATH="${cmeel_prefix}/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+  fi
+}
+
 status_to_arg() {
   local status="$1"
   case "${status}" in
@@ -60,6 +78,15 @@ except Exception:
     raise SystemExit(0)
 print("passed" if bool(payload.get("success")) else "failed")
 PY
+}
+
+copy_evidence_json() {
+  local src="$1"
+  local dst="$2"
+  if [[ "$(realpath -m "${src}")" == "$(realpath -m "${dst}")" ]]; then
+    return 0
+  fi
+  cp "${src}" "${dst}"
 }
 
 run_collision_matrix() {
@@ -93,6 +120,10 @@ run_optional_step() {
 
 collision_json="$(run_collision_matrix)"
 
+if [[ "${IN_CONTAINER}" == "true" ]]; then
+  source_ros_setup_if_available
+fi
+
 if [[ "${MANYFORGE_PHASE4_RUN_TSAN:-0}" == "1" ]]; then
   if [[ "${IN_CONTAINER}" == "true" ]]; then
     race_status="$(run_optional_step "1" "tsan-collision-engine" \
@@ -108,7 +139,8 @@ fi
 
 if [[ "${MANYFORGE_PHASE4_RUN_SOAK:-0}" == "1" ]]; then
   if [[ "${IN_CONTAINER}" == "true" ]]; then
-    if MANYFORGE_RUN_SOAK_TESTS=1 pytest -q \
+    if PYTHONPATH="${REPO_ROOT}:${REPO_ROOT}/manyforge_behavior:${PYTHONPATH:-}" \
+      MANYFORGE_RUN_SOAK_TESTS=1 pytest -q \
       "${REPO_ROOT}/manyforge_composer/tests/test_soak_qualification.py" \
       >"${OUT_DIR}/soak.log" 2>&1; then
       soak_status="passed"
@@ -134,7 +166,7 @@ if [[ "${MANYFORGE_PHASE4_RUN_INTERRUPT:-0}" == "1" ]]; then
     ctest --output-on-failure -R "ExecutionKernel|InterruptManager|StateMachine"
   '
   if [[ "${IN_CONTAINER}" == "true" ]]; then
-    if bash -lc "${interrupt_cmd}" >"${OUT_DIR}/interrupt.log" 2>&1; then
+    if bash -lc "if [[ -f /opt/ros/jazzy/setup.bash ]]; then set +u; source /opt/ros/jazzy/setup.bash; set -u; fi; ${interrupt_cmd}" >"${OUT_DIR}/interrupt.log" 2>&1; then
       interrupt_status="passed"
     else
       interrupt_status="failed"
@@ -160,16 +192,32 @@ if [[ "${MANYFORGE_PHASE4_RUN_VISUAL:-0}" == "1" ]]; then
         --summary-json "${visual_summary}" \
         >"${OUT_DIR}/visual.log" 2>&1; then
     if [[ -n "${MANYFORGE_PHASE4_VISUAL_LOAD_EVIDENCE_JSON:-}" ]]; then
-      cp "${MANYFORGE_PHASE4_VISUAL_LOAD_EVIDENCE_JSON}" \
+      copy_evidence_json "${MANYFORGE_PHASE4_VISUAL_LOAD_EVIDENCE_JSON}" \
         "${OUT_DIR}/visual-load-evidence.json"
       visual_load_status="$(json_success_status "${OUT_DIR}/visual-load-evidence.json")"
-    else
+    elif [[ "${ALLOW_INCOMPLETE}" == "true" ]]; then
+      # Offline development path: an operator-attested status assertion is
+      # acceptable when the strict gate has been opted out via
+      # --allow-incomplete. The synthetic artifact records the source so
+      # the verifier (and any downstream reader) can tell it apart from a
+      # real qualify-visual-state-live.py capture.
       visual_load_status="${MANYFORGE_PHASE4_VISUAL_LOAD_EVIDENCE:-not_run}"
       if [[ "${visual_load_status}" == "passed" ]]; then
         cat >"${OUT_DIR}/visual-load-evidence.json" <<'JSON'
 {"success": true, "source": "operator_attested_validation_load"}
 JSON
       fi
+    else
+      # Strict release path: status-only assertions are not sufficient.
+      # The verifier also enforces this via structural field checks, but
+      # we fail closed at the harness level so the operator gets an
+      # actionable error and no synthetic artifact is written.
+      visual_load_status="failed"
+      {
+        echo "strict release rejects MANYFORGE_PHASE4_VISUAL_LOAD_EVIDENCE status-only assertions"
+        echo "set MANYFORGE_PHASE4_VISUAL_LOAD_EVIDENCE_JSON to a real qualify-visual-state-live.py artifact"
+        echo "or pass --allow-incomplete for offline development runs"
+      } >"${OUT_DIR}/visual-load.log"
     fi
     if [[ "${visual_load_status}" == "passed" ]]; then
       visual_status="passed"
@@ -188,7 +236,7 @@ else
 fi
 
 if [[ -n "${MANYFORGE_PHASE4_LIVE_ISAAC_EVIDENCE_JSON:-}" ]]; then
-  cp "${MANYFORGE_PHASE4_LIVE_ISAAC_EVIDENCE_JSON}" \
+  copy_evidence_json "${MANYFORGE_PHASE4_LIVE_ISAAC_EVIDENCE_JSON}" \
     "${OUT_DIR}/live-isaac-summary.json"
   live_isaac_status="$(json_success_status "${OUT_DIR}/live-isaac-summary.json")"
 else

@@ -1,7 +1,6 @@
 #pragma once
 
 #include <manyforge_core/cache/trajectory_cache.hpp>
-#include <manyforge_core/collision/collision_policy.hpp>
 #include <manyforge_core/collision/i_collision_world_snapshot_publisher.hpp>
 #include <manyforge_core/collision/collision_validation_coordinator.hpp>
 #include <manyforge_core/collision/i_collision_query_engine.hpp>
@@ -36,7 +35,15 @@
 namespace manyforge::core {
 
 struct ExecutionKernelConfig {
-  Duration collision_monitor_period_ns = 10'000'000;  // 10 ms
+  Duration collision_monitor_period_ns = 50'000'000;  // 50 ms / 20 Hz
+
+  // Hard per-tick budget for the observed runtime collision query after the
+  // live collision-world snapshot has been acquired. This is intentionally
+  // separate from the monitor cadence: the industrial performance target is
+  // p95 <= 50% of `collision_monitor_period_ns`, but the fail-closed timeout
+  // must allow contact-rich distance queries to complete within the full
+  // configured monitor period before preempting execution.
+  Duration runtime_collision_query_timeout_ns = 50'000'000;  // 50 ms
 
   // Direct-control Cartesian pushes must not inherit full planning IK
   // budgets. The kernel passes this value to the planner backend and rejects
@@ -64,6 +71,20 @@ struct ExecutionKernelConfig {
   // deployments can override with MANYFORGE_VALIDATION_COLLISION_WORKERS.
   int validation_collision_workers = 4;
   int validation_collision_min_waypoints_for_parallel = 8;
+
+  // Runtime collision monitoring must run against live observed robot state,
+  // not authored/planning-context state. A backend snapshot older than this
+  // budget causes a runtime collision fault with a freshness reason before
+  // the collision engine is queried. Zero disables the age check for
+  // deterministic tests only; production deployments must keep this positive.
+  Duration runtime_observed_state_max_age_ns = 100'000'000;  // 100 ms
+
+  // Dynamic bodies in CollisionWorldSnapshot may carry their own freshness
+  // budget. Static authored/fixture bodies leave that metadata unset and do
+  // not expire. This kernel-level cap prevents a dynamic source from declaring
+  // an unbounded budget silently; zero disables only the cap, not body-local
+  // freshness checks.
+  Duration runtime_dynamic_body_max_age_cap_ns = 500'000'000;  // 500 ms
 };
 
 /// Execution Kernel — single authority for motion execution governance.
@@ -204,17 +225,6 @@ class ExecutionKernel {
   void set_collision_validation_retry_config(
       PoseSourceRetryConfig retry, std::int64_t per_state_timeout_ns = 0);
 
-  /// Run the validation coordinator predicted-path monitor (Chunk 6
-  /// diagnostic mode) against the current planning context. Returns the
-  /// decision bundle; emits a `kCollisionDetected` diagnostic event when
-  /// the decision is not kPass. The kernel does not stop or fault on this
-  /// path: production runtime-fault behavior remains gated on the future
-  /// interrupt model. Pass nullopt for `predicted_state` to use the kernel's
-  /// current state.
-  CollisionValidationDecisionBundle
-  run_predicted_path_monitor_diagnostic(
-      const std::optional<RobotStateDTO>& predicted_state = std::nullopt);
-
   // ---------------------------------------------------------------
   // Kernel-native interrupt registration and latch surface (spec/260,
   // sprint Chunk I-2). This chunk owns source/policy registration, signal
@@ -290,6 +300,11 @@ class ExecutionKernel {
   void start_collision_monitoring();
   void stop_collision_monitoring();
   void schedule_next_collision_monitor_tick(uint64_t generation);
+  void reset_runtime_contact_release_state();
+  std::optional<std::map<std::string, std::string>>
+  update_runtime_contact_release_state(
+      const CollisionPolicySnapshot& policy_snapshot,
+      const CollisionValidationDecisionBundle& bundle);
   CollisionWorldRevision current_authoritative_collision_world_revision() const;
   std::shared_ptr<CollisionCancellationToken> install_validation_cancel_token();
   void clear_validation_cancel_token(
@@ -322,7 +337,6 @@ class ExecutionKernel {
 
   ExecutionStateMachine sm_;
   StopPolicy stop_policy_;
-  CollisionPolicy collision_policy_;
   InterruptManager interrupt_manager_;
   std::atomic<std::int64_t> runtime_collision_fault_sequence_{0};
 
@@ -374,6 +388,14 @@ class ExecutionKernel {
   ScheduleHandle collision_monitor_handle_{0};
   uint64_t collision_monitor_generation_ = 0;
   bool collision_monitor_active_ = false;
+  struct RuntimeContactReleasePairState {
+    double initial_penetration_m = 0.0;
+    double last_penetration_m = 0.0;
+    bool separated = false;
+  };
+  mutable std::mutex runtime_contact_release_mutex_;
+  std::map<std::string, RuntimeContactReleasePairState>
+      runtime_contact_release_state_;
 
   // Streaming-session bookkeeping. Only one active session at a time in
   // v0.1; `active_streaming_session_id_` is 0 when none is active.
