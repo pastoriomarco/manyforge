@@ -42,6 +42,12 @@ for the full guide — interactive wizard first, then scripted /
 non-interactive use for CI, plus the four-combination smoke-test
 matrix.
 
+**Adding a new robot?** See
+[`docs/operations/ADDING_A_ROBOT.md`](docs/operations/ADDING_A_ROBOT.md) —
+URDF/SRDF requirements, deployment-YAML schema, capability adapter
+selection, and smoke-test curls. All operator docs are catalogued at
+[`docs/INDEX.md`](docs/INDEX.md).
+
 ## Running Tests
 
 All commands run inside the container (`docker compose run --rm dev bash`).
@@ -130,7 +136,7 @@ Program YAML --> Behavior Runner --> ExecutionKernel (C++) --> Planner/Execution
 Run the validated end-to-end demo with RoboPlan motion planning, Composer, and Viser 3D visualization:
 
 ```bash
-./scripts/demo.sh
+./scripts/launch.sh --lane manyforge-only --assistant off --scenario ur5-pick-place --non-interactive --yes
 ```
 
 Then open:
@@ -138,6 +144,12 @@ Then open:
 - `http://localhost:8081` for the Viser 3D view
 
 The pick-and-place demo exercises the full program load, native planning, scene-edit, run, reset, and rerun flow through the supported container path.
+
+`./scripts/demo.sh` is a backwards-compat shim that forwards to the
+command above (with `--simple` switching to the `ur5-simple-pick-place`
+scenario). New automation should call `launch.sh` directly; see
+[`docs/operations/LAUNCHER_QUICKSTART.md`](docs/operations/LAUNCHER_QUICKSTART.md)
+for all scenarios and the `--list-scenarios` verb.
 
 ## LLM Operability
 

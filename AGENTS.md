@@ -80,6 +80,11 @@ an end-to-end issue needs a known-good reference. **If you (LLM
 agent) modify the launcher scripts, update that doc in the same
 commit.**
 
+**Adding a new robot deployment:** see
+[`docs/operations/ADDING_A_ROBOT.md`](docs/operations/ADDING_A_ROBOT.md)
+for URDF/SRDF requirements, deployment-YAML schema (arm + gripper),
+capability adapter selection, and smoke-test curls.
+
 ### Mode 1 — Composer + behavior runtime (no LLM)
 
 The full ManyForge runtime, no AI. Use for validating behavior trees,

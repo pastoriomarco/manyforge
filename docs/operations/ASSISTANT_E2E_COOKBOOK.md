@@ -473,6 +473,11 @@ Available runner profiles:
 
 ### Composer chat HTTP contract — required fields
 
+> If you arrived here because chat returned a mock voice, see the
+> short version in [`TROUBLESHOOTING.md` §"Assistant fell back to
+> mock"](TROUBLESHOOTING.md#assistant-fell-back-to-mock); this section
+> is the full contract reference.
+
 Composer's chat endpoint (`POST /api/assistant/chat`) silently falls back
 to **mock mode** if the request body omits the right fields. Operators
 testing the live provider end-to-end must pass *both* of:

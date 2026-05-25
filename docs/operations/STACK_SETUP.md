@@ -148,9 +148,36 @@ Use when:
 
 ### Host
 
-- Docker / Docker Compose
-- local model server if testing LLM paths
-- NemoClaw-Thor checkout if testing OpenClaw integration
+ManyForge runs inside Docker containers, so the host requirement is
+primarily "a machine that runs Docker." Specifics:
+
+- **OS**: Linux (Ubuntu 24.04 LTS is the reference). Docker Desktop on
+  macOS / Windows works for Mode 1 development but is unsupported for
+  the assistant and Isaac lanes — Isaac Sim and NVIDIA-runtime workloads
+  require a Linux host with NVIDIA drivers.
+- **Architecture**: amd64 (x86_64) is the reference. arm64 is supported
+  for the dev image and the ROS Jazzy image (`ros:jazzy-ros-base-noble`
+  has both architectures); the Jetson Thor deployment target is
+  arm64+CUDA via NemoClaw-Thor. Isaac Sim itself is x86_64-only.
+- **Docker**: Docker Engine with BuildKit, plus the Compose v2 plugin
+  (`docker compose ...`, not the legacy `docker-compose`).
+- **GPU / driver**: not required for Mode 1 (deterministic). Required
+  for Mode 2 (direct LLM) and Mode 3 (sandboxed assistant) — both
+  expect an OpenAI-compatible model server reachable from the host;
+  on Thor that is the NemoClaw-Thor-managed vLLM container, which
+  needs the NVIDIA Container Toolkit (`nvidia-ctk`) configured.
+  Required for the Isaac lane (NVIDIA driver + RTX-class GPU).
+- **RAM**: 16 GB minimum for Mode 1 with a comfortable C++ build.
+  32 GB recommended for Mode 2/3 (vLLM warm-up) and for the Isaac lane.
+  Jetson Thor 64 GB unified memory is the supported assistant-lane
+  deployment target.
+- **Disk**: ~10 GB for the Docker image plus build cache. The vLLM
+  model cache (Mode 2/3) can grow to 30-60 GB depending on which models
+  are pulled — that cache lives outside the manyforge tree, under
+  NemoClaw-Thor's volume.
+- **Local model server (Mode 2/3 only)**: an OpenAI-compatible HTTP
+  endpoint such as vLLM, llama.cpp, or any other server that implements
+  `/v1/chat/completions`. Default port 8000.
 
 ### Repositories
 
@@ -159,6 +186,61 @@ Use when:
   (Jetson Thor inference + sandboxed assistant lane).
 - `manyforge_specs` — **dev-only**, not required for runtime/operation.
   Cloned alongside `manyforge` only by maintainers working on specs/ADRs.
+
+### External dependencies (pinned versions and source)
+
+These are baked into the Docker images by `scripts/setup-docker.sh`
+and the Dockerfiles. Operators do not need to install or manage them
+manually; they are documented here for traceability.
+
+| Dependency | Version / pin | Source | Notes |
+| --- | --- | --- | --- |
+| Base dev image | `python:3.12-slim-bookworm` | Docker Hub | Dockerfile L31; ROS-free dev environment |
+| Frontend builder | `node:22-slim` | Docker Hub | Dockerfile L23; React/Vite build stage |
+| ROS image | `ros:jazzy-ros-base-noble` | Docker Hub | Dockerfile.ros-jazzy L11; Ubuntu Noble + ROS Jazzy |
+| RoboPlan | SHA `1c1edec04913a655db808f940a9dad8ef7f2c87e` (PR 197 `cylinder-and-mesh` head) | `https://github.com/open-planning/roboplan.git` | Pinned in `scripts/setup-docker.sh` as `ROBOPLAN_PINNED_REF`. The adapter code in `manyforge_roboplan/` requires `Scene::addMeshGeometry`, which is not yet in a tagged release. When mesh-geometry support lands upstream, the default will switch back to a release tag — see [`../reference/ROBOPLAN_ADAPTER_NOTES.md`](../reference/ROBOPLAN_ADAPTER_NOTES.md) "Removal Criteria". |
+| Pinocchio (kinematics / dynamics) | `pin==3.9.0` | PyPI | Dockerfile L65; brings `hpp-fcl` / `coal` and Eigen helpers transitively |
+| `pybind11` | `3.0.3` | PyPI | Dockerfile L58 |
+| `nanobind` | `2.12.0` | PyPI | Dockerfile L63 |
+| `topic_based_ros2_control` | commit `7ee291ab13adba52ab5889deb9e520009fe2283d` | `https://github.com/karanchahal-nv/topic_based_ros2_control.git` | Dockerfile.ros-jazzy L17; built into the ROS image; the bridge used by the Isaac lane |
+| Eigen 3 | apt `libeigen3-dev` | Debian Bookworm | Dockerfile L45 |
+| `urdfdom` | apt `liburdfdom-dev` | Debian Bookworm | Dockerfile L45 |
+| `octomap` | apt `liboctomap-dev` | Debian Bookworm | Dockerfile L46 |
+| `boost` (filesystem / serialization / system / python / chrono / thread / date_time) | apt | Debian Bookworm | Dockerfile L43-44 |
+| `trimesh` | `4.11.5` | PyPI | Dockerfile L61; OBJ/mesh parsing |
+| `yourdfpy` | `0.0.60` | PyPI | Dockerfile L62; URDF Python loader |
+| FastAPI | `0.135.3` | PyPI | Dockerfile L67; Composer backend |
+| Viser | `1.0.26` | PyPI | Dockerfile L66; HMI viewer |
+| MCP (Model Context Protocol) | `1.27.0` | PyPI | Dockerfile L71; assistant-lane MCP server |
+
+The model endpoints used by Mode 2/3 are configured in
+[`examples/model_endpoint_profiles.yaml`](../../examples/model_endpoint_profiles.yaml).
+The runtime model server (vLLM) is provisioned by NemoClaw-Thor — see
+its repo for model pinning.
+
+**Confirming the RoboPlan ref baked into your image.** The
+`package.xml` `<version>` field can lag the actual code (PR branches
+carry the same string as the tag they forked from), so
+`pip show roboplan` inside the container is not authoritative. After
+`setup-docker.sh` runs, the actual ref and resolved SHA are recorded
+on the host:
+
+```bash
+cat .docker/roboplan/.manyforge-roboplan-ref   # the ref passed to git fetch
+cat .docker/roboplan/.manyforge-roboplan-sha   # the resolved commit SHA
+```
+
+**Force a refresh** (e.g. when the PR moves, or to test a release
+tag once mesh-geometry support is upstream):
+
+```bash
+rm -rf .docker/roboplan/
+ROBOPLAN_REF=<branch|tag|sha> ./scripts/setup-docker.sh
+```
+
+With no `ROBOPLAN_REF`, the script uses the SHA pinned at
+`scripts/setup-docker.sh` (`ROBOPLAN_PINNED_REF`). Maintainers move that
+pin forward as upstream PR 197 advances.
 
 ## Primary Scripts
 
@@ -195,29 +277,35 @@ Notes:
 
 ### `scripts/manyforge-stack.sh`
 
+**Not a replacement for `scripts/launch.sh`.** This script is the
+NemoClaw/OpenClaw integration lifecycle helper. Use `launch.sh` for
+ManyForge bring-up; use `manyforge-stack.sh` only when you need to
+wire the running stack into NemoClaw mux/plugin workflows.
+
 Purpose:
 
-- start/stop the local ManyForge stack
-- optionally wire it into NemoClaw/OpenClaw workflows
+- start/stop the ManyForge stack with NemoClaw mux integration
+- manage the NemoClaw plugin lifecycle (`plugin deploy`,
+  `plugin rollback`, `plugin status`, `plugin list`)
+- drive sandbox smoke tests (`smoke direct|mux|all`)
 
 Typical usage:
 
 ```bash
-./scripts/manyforge-stack.sh up
-./scripts/manyforge-stack.sh up --with-nemoclaw
+./scripts/manyforge-stack.sh up                  # ManyForge + mux proxy
+./scripts/manyforge-stack.sh up --with-nemoclaw  # + NemoClaw integration
 ./scripts/manyforge-stack.sh status
+./scripts/manyforge-stack.sh smoke all
+./scripts/manyforge-stack.sh plugin status
 ./scripts/manyforge-stack.sh down
 ```
 
 ### `scripts/configure-manyforge-provider.sh`
 
-Purpose:
-
-- configure the current mux/plugin-based ManyForge provider path for
-  NemoClaw/OpenClaw
-
-Use this only for the current sandbox integration baseline. It is not the final
-transport design.
+NemoClaw/OpenClaw configuration helper, not a ManyForge entrypoint.
+Configures the current mux/plugin-based ManyForge provider path on the
+NemoClaw side. Use only when wiring a sandbox to ManyForge through the
+current mux baseline; the transport design is not final.
 
 ### `scripts/dev-agent-session-start.sh` (dev-only)
 
@@ -426,6 +514,11 @@ Current status:
 Do not treat browser-backed image capture as a production path.
 
 ## Troubleshooting
+
+For the cross-cutting symptom → cause → diagnostic-step matrix that
+spans collision, interrupt, assistant, and Isaac/ros2_control failures,
+see [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md). The rest of this section
+covers stack-bring-up-specific cases.
 
 ### Tree does not progress after `Run`
 

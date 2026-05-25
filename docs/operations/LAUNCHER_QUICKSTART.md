@@ -343,6 +343,12 @@ ss -ltnp | grep -E ':(9000|8081|8000|8050|8100|8200)'
 
 ## Likely first-run gotchas
 
+Bring-up-specific cases below. For cross-cutting runtime failures
+(collision rejection, motion interrupted, assistant fallback to mock,
+ros2_control discovery) see [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md).
+For where logs and observability endpoints live, see
+[`OBSERVABILITY.md`](OBSERVABILITY.md).
+
 - **`manyforge-dev:latest` not built** → preflight fails with a clear
   error. Run `./scripts/setup-docker.sh` first.
 - **Composer takes minutes on first launch** → the dev container does a

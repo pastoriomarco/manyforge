@@ -130,9 +130,12 @@ robot_config:
   srdf_path: package://manyforge_example_models/models/my_robot/my_robot.srdf
   package_paths:
     - ..                                # relative to this YAML's directory
-  global_max_tcp_linear_speed_mps: 0.25 # ADR-0015 global TCP cap
+  global_max_tcp_linear_speed_mps: 0.25 # required; deployment-wide
+                                        # ceiling on TCP linear speed
+                                        # for Cartesian/streaming moves
 
-  # Optional: per-joint streaming caps (ADR-0016 partial-joint streaming).
+  # Optional: per-joint streaming caps applied during direct-control /
+  # streaming sessions (independent of planned-trajectory limits).
   # Joint names MUST be in the SRDF planning group above. Unknown names
   # are rejected with a DeploymentValidationError at load time.
   # streaming_joint_limits:
@@ -310,6 +313,9 @@ curl -s http://localhost:9000/api/scene/frames \
 ```
 
 ## Troubleshooting
+
+Robot-import-specific cases below. For cross-cutting runtime failures
+see [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md).
 
 ### Mesh and transform issues
 

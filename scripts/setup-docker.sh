@@ -9,11 +9,10 @@
 # Usage:
 #   ./scripts/setup-docker.sh
 #
-#   # Optional: clone a RoboPlan branch, tag, or commit instead of the
-#   # default pinned release.
+#   # Optional: clone a different RoboPlan ref instead of the pinned SHA.
 #   ROBOPLAN_REF=main ./scripts/setup-docker.sh
 #   ROBOPLAN_REF=cylinder-and-mesh ./scripts/setup-docker.sh
-#   ROBOPLAN_REF=69dd5f9f91870af8937b029ca1f4890e65ce98c5 ./scripts/setup-docker.sh
+#   ROBOPLAN_REF=0.3.0 ./scripts/setup-docker.sh
 #
 # After setup:
 #   docker compose run --rm dev bash
@@ -23,8 +22,13 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 ROBOPLAN_DIR="$REPO_DIR/.docker/roboplan"
-ROBOPLAN_VERSION="0.3.0"
-ROBOPLAN_REF="${ROBOPLAN_REF:-$ROBOPLAN_VERSION}"
+# Pinned to PR 197 head (`cylinder-and-mesh` branch).
+# The manyforge_roboplan adapter requires Scene::addMeshGeometry, which is
+# not yet in any upstream RoboPlan release tag. Switch this back to a release
+# tag (e.g. "0.4.0") when mesh-geometry support lands upstream.
+# See docs/reference/ROBOPLAN_ADAPTER_NOTES.md for the source-level dependency.
+ROBOPLAN_PINNED_REF="1c1edec04913a655db808f940a9dad8ef7f2c87e"
+ROBOPLAN_REF="${ROBOPLAN_REF:-$ROBOPLAN_PINNED_REF}"
 ROBOPLAN_REF_MARKER="$ROBOPLAN_DIR/.manyforge-roboplan-ref"
 ROBOPLAN_SHA_MARKER="$ROBOPLAN_DIR/.manyforge-roboplan-sha"
 
@@ -33,10 +37,6 @@ warn() { echo -e "\033[1;33m>>>\033[0m $1"; }
 fail() { echo -e "\033[0;31m>>>\033[0m $1"; exit 1; }
 
 # 1. Pre-clone RoboPlan
-current_roboplan_version=""
-if [ -f "$ROBOPLAN_DIR/roboplan/package.xml" ]; then
-    current_roboplan_version=$(sed -n 's:.*<version>\(.*\)</version>.*:\1:p' "$ROBOPLAN_DIR/roboplan/package.xml" | head -n 1 || true)
-fi
 current_roboplan_ref=""
 if [ -f "$ROBOPLAN_REF_MARKER" ]; then
     current_roboplan_ref=$(cat "$ROBOPLAN_REF_MARKER" || true)
@@ -47,13 +47,6 @@ if [ -d "$ROBOPLAN_DIR/scripts" ] && [ "$current_roboplan_ref" = "$ROBOPLAN_REF"
     if [ -f "$ROBOPLAN_SHA_MARKER" ]; then
         info "Resolved SHA: $(cat "$ROBOPLAN_SHA_MARKER")"
     fi
-    info "To force a refresh, delete .docker/roboplan/ and re-run."
-elif [ -d "$ROBOPLAN_DIR/scripts" ] \
-    && [ -z "$current_roboplan_ref" ] \
-    && [ "$ROBOPLAN_REF" = "$ROBOPLAN_VERSION" ] \
-    && [ "$current_roboplan_version" = "$ROBOPLAN_VERSION" ]; then
-    info "RoboPlan $ROBOPLAN_VERSION already present at .docker/roboplan/ — skipping clone."
-    printf '%s\n' "$ROBOPLAN_REF" > "$ROBOPLAN_REF_MARKER"
     info "To force a refresh, delete .docker/roboplan/ and re-run."
 else
     info "Cloning RoboPlan ref '$ROBOPLAN_REF' (this takes a minute)..."

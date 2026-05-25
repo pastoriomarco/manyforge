@@ -252,6 +252,10 @@ exactly when the viewer fell back, went stale, or exceeded the latency budget.
 
 ## Troubleshooting
 
+Scene-authoring-specific cases below. For cross-cutting failures
+(collision rejection, kernel interrupts, ros2_control discovery)
+see [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md).
+
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | Inventory response missing an object | Object has no collider, or it's hidden and you didn't pass `include_hidden`. | Author a collider in Isaac, or re-run with the right include flags. |

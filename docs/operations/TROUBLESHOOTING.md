@@ -1,0 +1,249 @@
+# Troubleshooting — Symptom → Cause → Diagnostic Step
+
+Cross-cutting symptom-to-diagnostic-step matrix for ManyForge runtime
+issues. Use this as the entry point when something is wrong; from each
+row jump to the right detailed runbook.
+
+For where to look (log paths, REST endpoints, container names), see
+[`OBSERVABILITY.md`](OBSERVABILITY.md). For per-workflow runbooks see
+the existing operations docs cross-linked below.
+
+## Quick symptom matrix
+
+| Symptom | Most likely cause class | First diagnostic step |
+| --- | --- | --- |
+| `./scripts/launch.sh start` fails immediately | Image not built, port busy, docker daemon down | `./scripts/launch.sh preflight` |
+| `start` returns green but cycle won't run | External dependency (Isaac, vLLM, ros2_control) still warming up | `./scripts/launch.sh smoke` (blocks on external readiness); see [`LAUNCHER_QUICKSTART.md`](LAUNCHER_QUICKSTART.md) §"first-run gotchas" |
+| Composer never reaches `/api/health = ok` | Composer cold C++/RoboPlan build (~10 min first launch); container died | `docker logs manyforge-e2e-composer`; raise `COMPOSER_READY_TIMEOUT_S` |
+| Cycle runs but tree does not progress | Image-mode demo on experimental path; wrong model selection | See [`STACK_SETUP.md`](STACK_SETUP.md) §Troubleshooting items 1-2 |
+| "Collision validation rejected trajectory" | Stale pose source, scene drift, or genuine collision | See [§Collision rejection](#collision-rejection) below |
+| "Motion execution ended in interrupted" | Kernel-native interrupt latched (collision fault, signal source) | See [§Motion ended interrupted](#motion-ended-interrupted) below |
+| Assistant chat answers in canned/mock voice | Required fields missing on `POST /api/assistant/chat` | See [§Assistant fell back to mock](#assistant-fell-back-to-mock) below |
+| Isaac lane: never out of "waiting for FJT action / `/joint_states`" | Isaac not running, controller config not spawned, DDS isolation | See [§ros2_control discovery failing](#ros2_control-discovery-failing) below |
+| Floating / disconnected URDF mesh pieces | Compound `<origin rpy=…>` on `<visual>` block | See [`ADDING_A_ROBOT.md`](ADDING_A_ROBOT.md) §Troubleshooting "Floating / disconnected mesh pieces" |
+| Mesh 404 in browser network tab | OBJ missing or `trimesh.load` failed | See [`ADDING_A_ROBOT.md`](ADDING_A_ROBOT.md) §"404 on a mesh URL" |
+| Composer scene mesh shows `missing` / `parse_failed` / `outside_allowed_roots` | Path resolution mismatch / malformed OBJ / allowlist | See [`ISAAC_SCENE_AUTHORING.md`](ISAAC_SCENE_AUTHORING.md) §Troubleshooting table |
+| Sandbox agent can't reach ManyForge | OpenClaw provider not configured on host | See [`STACK_SETUP.md`](STACK_SETUP.md) §"Sandbox agent cannot reach ManyForge cleanly" |
+| Unified memory not freed after `stop` on Thor | `drop_caches` needs sudo | See [`LAUNCHER_QUICKSTART.md`](LAUNCHER_QUICKSTART.md) §"Unified memory not freed" |
+
+## Detailed flows for session-known failures
+
+### Collision rejection
+
+**Symptom**: an `ErrorDTO` with code `kErrorValidationCollision` and
+message `"Collision validation rejected trajectory"` surfaces through
+the cycle digest / execution history. The kernel emits this from
+`manyforge_core/src/execution_kernel.cpp:3130-3133`. The same error
+code is also used for `"Collision validation cancelled by interrupt"`
+(line 3120) and `"Collision validation inconclusive"` (line 3127) —
+the `message` field distinguishes them, and the `details` map
+includes the canonical pair, body ids, and
+`collision_world_revision`.
+
+**Where to look**:
+
+1. `GET /api/execution/history?eventTypes=kernel_error&limit=20` — get
+   the `details` map for the rejection (canonical pair, body ids,
+   `collision_world_revision`).
+2. `GET /api/kernel/snapshot` — confirm the active world revision and
+   read the structured error.
+3. `GET /api/scene/diagnostics` — compare backend-authoritative scene
+   state with HMI render state. **First place to look on the Isaac
+   lane**: a stale Isaac pose can drive a rejection even when the
+   viewer looks correct (this was the live regression fixed in commit
+   `35684b0 Fix collision snapshot validation for Isaac pose sources`).
+4. `GET /api/kernel/events?since=N` — scan for interrupt-family events
+   that may have cancelled validation under load.
+
+**Common causes**:
+
+- Stale pose source after a scene edit (Isaac lane especially).
+  Confirm `pose_sources.<id>.apply_policy` in the deployment — Isaac
+  scenes typically use `continuous_unattached` or `before_planning`
+  (see [`EXAMPLES_CATALOG.md`](EXAMPLES_CATALOG.md)).
+- Genuine collision the operator did not anticipate. Use
+  `GET /api/scene/snapshot` to visualize the world at the rejection
+  revision.
+- Validation cancelled by an interrupt latch (message will read
+  `"cancelled by interrupt"`, not `"rejected"`). Follow up with
+  [§Motion ended interrupted](#motion-ended-interrupted).
+
+**Adjacent reference**: the collision contract and the engine's
+projection rules are documented in
+[`../reference/ROBOPLAN_ADAPTER_NOTES.md`](../reference/ROBOPLAN_ADAPTER_NOTES.md).
+
+### Motion ended interrupted
+
+**Symptom**: the literal string `Motion execution ended in interrupted`
+in the cycle status / chat overlay / behavior tree result. Emitted by
+`manyforge_behavior/manyforge_behavior/motion_runtime.py:98` when the
+kernel snapshot reports `ExecutionState::kInterrupted` without a
+structured `error` for `motion_runtime` to surface as a cause string.
+The kernel transitions to `kInterrupted` at
+`manyforge_core/src/execution_kernel.cpp:1066`, `1095`, `1175-1186`,
+`1212-1223`.
+
+**Where to look**:
+
+1. `GET /api/kernel/snapshot` — `snapshot.error` (the structured cause
+   `motion_runtime.py:93-94` prefers) is the authoritative diagnosis.
+   If absent, the f-string fallback was used and the underlying cause
+   is in the events.
+2. `GET /api/kernel/events?since=N` — filter for the interrupt-family
+   event types (`interrupt_signal_ingested`, `interrupt_latched`,
+   `interrupt_suppressed_by_active_mask`,
+   `interrupt_recovery_handler_started`,
+   `interrupt_recovery_handler_completed`,
+   `interrupt_ingest_overflow`, `interrupt_source_class_violation`).
+   The latched source identifies the cause class.
+3. If the latched source is `runtime_collision_fault_source_definition`,
+   the immediate cause is a runtime collision fault. Follow up with
+   [§Collision rejection](#collision-rejection) — the kernel emits a
+   collision rejection through the interrupt path.
+
+**Common causes**:
+
+- Runtime collision fault during execution (commit `361260f Harden
+  phase 3 collision interrupt edge cases` reworked this path).
+- Cooperative-interrupt removal artifacts: a node still issuing
+  cooperative-style cancellation that the new latch model rejects as
+  a class violation. Check `interrupt_source_class_violation` events.
+- Stop / pause issued from another surface (Composer UI, MCP tool,
+  bringup script) — the launcher's `status` verb shows which surface
+  is connected.
+
+**Adjacent reference**: kernel-event types are defined at
+`manyforge_core/src/execution_kernel.cpp:389-411`.
+
+### Assistant fell back to mock
+
+**Symptom**: `POST /api/assistant/chat` returns a request that, when
+polled via `GET /api/assistant/requests/{requestId}`, has
+`providerId: "mock"` instead of the configured provider (e.g.
+`"openclaw"`). The chat response carries a canned warning. Composer
+logs do **not** flag this as an error — the fallback is silent.
+
+**Cause**: the request body omitted `mode: "provider"` and/or
+`assistantMode: "composer-assistant"`. Without `mode`, dispatch routes
+to the built-in scaffold provider regardless of
+`configuredProviderId`. Without `assistantMode`, the contract layer
+rejects because deployments expose multiple bounded-autonomy modes.
+
+**Diagnostic**:
+
+```bash
+# Correct invocation
+curl -s http://127.0.0.1:9000/api/assistant/chat \
+  -H 'content-type: application/json' \
+  -d '{"message":"reply with just OK","mode":"provider","assistantMode":"composer-assistant"}' \
+  | jq -r .requestId
+
+# Verify provider id (replace <id>)
+curl -s http://127.0.0.1:9000/api/assistant/requests/<id> | jq .providerId
+# Expected: "openclaw" (or the configured provider). "mock" means a missing field.
+```
+
+**Independent verification of the provider wiring**:
+
+- `GET /api/infra/model-endpoints` — shows configured endpoints + a
+  live `/v1/models` probe.
+- `GET /api/assistant/providers` — lists registered providers.
+- `GET /api/runtime/status` — merged provider state.
+
+**Adjacent reference**: full wire-contract details in
+[`ASSISTANT_E2E_COOKBOOK.md`](ASSISTANT_E2E_COOKBOOK.md) §"Composer
+chat HTTP contract — required fields".
+
+### ros2_control discovery failing
+
+**Symptom**: on the `isaac-sim` lane (`isaac-ur10e-light-scene` or
+`isaac-ur10e-light-scene-assistant` scenarios), Composer never
+transitions out of "waiting for FJT action server" or "waiting for
+`/joint_states`". The deployment declares the FJT action at
+`/isaac_arm_controller/follow_joint_trajectory` and
+`controller_manager: /controller_manager` with
+`wait_for_action_server_timeout_s: 2.0` and
+`joint_state_max_age_ms: 250` — once exhausted, Composer flags the
+supervisor as `waiting` instead of `ready`.
+
+**Where to look**:
+
+1. `./scripts/demo-isaac-ros2-control.sh status` — supervisor
+   readiness JSON (referenced from
+   [`STACK_SETUP.md`](STACK_SETUP.md) §"Isaac ros2_control execution").
+2. `GET /api/runtime/status` — confirms what the Composer side sees.
+3. `GET /api/infra/heartbeat` — what the launcher's `status` verb
+   polls.
+4. `docker compose logs --tail 200 composer-ros` — Composer's
+   stderr will show `"wait_for_action_server timeout"` or `"joint
+   state stale (age >250 ms)"`.
+
+**On the ROS host (outside the container, with `network_mode: host`)**:
+
+```bash
+ros2 action list | grep follow_joint_trajectory
+ros2 topic hz /joint_states                       # confirm > 4 Hz
+ros2 control list_controllers                     # confirm isaac_arm_controller is active
+```
+
+**Common causes**:
+
+- Isaac Sim not running, or `topic_based_ros2_control` bridge not
+  loaded. `/isaac_joint_states` never publishes.
+- Controller config file
+  `manyforge_ros_bringup/config/isaac_ur10e_topic_based_controllers.yaml`
+  not spawned by the launch file — `controller_manager` name mismatch
+  with the deployment's `controller_manager: /controller_manager`.
+- DDS discovery isolation. The compose services declare
+  `network_mode: host` and `ipc: host`
+  (`docker-compose.yaml:104-105,135-136`) — but a non-default
+  `ROS_DOMAIN_ID` or DDS profile on the host can break Isaac↔Composer
+  visibility. Confirm with `ros2 doctor` and `echo $ROS_DOMAIN_ID`.
+
+**Note on tolerances**: the Isaac preview deployment intentionally
+sets `disable_controller_path_tolerances: true`
+(`isaac_manipulator_scene_light_ros2_control.deployment.yaml:128`).
+Real-robot deployments **must** keep this `false`. If a
+controller-state tolerance abort appears on Isaac, that's a deployment
+misconfig, not a controller bug. See [`STACK_SETUP.md`](STACK_SETUP.md)
+§"Real ROS 2 controller / robot execution".
+
+## Where else troubleshooting lives
+
+Per-workflow troubleshooting blocks already exist in the operations
+docs. This matrix is the cross-cutting entry point; the detailed
+remediations stay in the workflow docs:
+
+- [`LAUNCHER_QUICKSTART.md`](LAUNCHER_QUICKSTART.md) §"Likely
+  first-run gotchas" (lines 344-393) — startup failures, port
+  conflicts, timeouts, drop_caches/sudo.
+- [`STACK_SETUP.md`](STACK_SETUP.md) §"Troubleshooting"
+  (lines 434+) — cycle stuck, model selection ignored, sandbox
+  reachability.
+- [`ISAAC_SCENE_AUTHORING.md`](ISAAC_SCENE_AUTHORING.md)
+  §"Troubleshooting" (lines 253-263) — Isaac mesh inventory, transfer,
+  parse, allowlist issues.
+- [`ADDING_A_ROBOT.md`](ADDING_A_ROBOT.md) §"Troubleshooting"
+  (lines 312-381) — URDF/mesh rendering, mimic chains,
+  streaming-session errors, frame visibility.
+- [`ASSISTANT_E2E_COOKBOOK.md`](ASSISTANT_E2E_COOKBOOK.md) §"Composer
+  chat HTTP contract — required fields" (lines 474-517) — the canonical
+  source for the mock-fallback gotcha.
+
+## Capturing a failure for later analysis
+
+See [`OBSERVABILITY.md`](OBSERVABILITY.md) §"Capturing a bug report"
+for the full capture recipe. The minimum bundle for a
+collision/interrupt failure:
+
+```bash
+RUN_ID=<from cycle status>
+curl -s "http://127.0.0.1:9000/api/debug/export?run_id=${RUN_ID}" > debug-export.json
+curl -s "http://127.0.0.1:9000/api/execution/history?run_id=${RUN_ID}&limit=1000" > history.json
+curl -s "http://127.0.0.1:9000/api/kernel/snapshot" > kernel-snapshot.json
+docker logs --tail 2000 manyforge-e2e-composer > composer.log
+```
+
+Attach also the launcher invocation
+(`./scripts/launch.sh --lane … --assistant … --scenario …`) and the
+value of `MANYFORGE_VALIDATION_COLLISION_WORKERS` if set.
