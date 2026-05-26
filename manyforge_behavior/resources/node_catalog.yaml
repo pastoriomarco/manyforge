@@ -415,6 +415,490 @@ entries:
       consumes_events:
         - stop_requested
 
+  - id: move_until_signal
+    name: MoveUntilSignal
+    category: motion
+    description: >-
+      Phase 4.5E motion-scoped trip node (spec/260 §2.6). Submits a
+      scoped execute request that arms a `complete_move_on_signal`
+      policy for exactly this move; the kernel owns signal
+      arbitration, controlled-stop dispatch, and stop-snapshot
+      capture. The node maps the kernel's terminal
+      `MotionExecutionOutcome` to py_trees Status: signal_trip →
+      SUCCESS; no_signal_trip → SUCCESS by default, or FAILURE when
+      `not_found_is_failure=true`; every other terminal cause →
+      FAILURE with the cause surfaced via `motion_error_message`.
+      Motion-field parity with `move_manipulator_action`: same
+      tolerances / scales / timeouts / cache mode / blackboard pose
+      resolution / pose-source callbacks / global TCP cap /
+      `stop_requested` gate.
+    tags: [motion, planning, execution, motion_scoped_trip]
+    profiles:
+      min_profile: v0.2
+    kind: leaf
+    children:
+      min: 0
+      max: 0
+    parameters:
+      - name: move_id
+        type: string
+        required: true
+        description: Stable move identifier for trajectory caching.
+      - name: motion_type
+        type: enum
+        required: true
+        enum_values: [joint_goal, pose_goal, relative_move]
+        enum_options:
+          - value: joint_goal
+          - value: pose_goal
+          - value: relative_move
+            profiles:
+              min_profile: v0.2
+            required_capabilities:
+              - context.pose.resolve_reference
+        description: The type of motion to plan.
+      - name: joint_goal_names
+        type: string_list
+        required: false
+        visible_when:
+          param: motion_type
+          equals: joint_goal
+        description: >-
+          Joint names for joint_goal motion type. Required when motion_type=joint_goal.
+      - name: joint_goal_positions_rad
+        type: float_list
+        required: false
+        visible_when:
+          param: motion_type
+          equals: joint_goal
+        description: >-
+          Joint positions in radians for joint_goal. Required when motion_type=joint_goal.
+      - name: pose_goal
+        type: pose
+        required: false
+        visible_when:
+          param: motion_type
+          equals: pose_goal
+        ui_editor: pose_or_blackboard_field_selector
+        blackboard_role: field_reader
+        blackboard_value_type: pose
+        description: >-
+          Target end-effector pose in base_frame for pose_goal motion type.
+          May be an inline pose or a declared blackboard field_ref.
+      - name: relative_move
+        type: dict
+        required: false
+        visible_when:
+          param: motion_type
+          equals: relative_move
+        ui_editor: relative_move
+        description: >-
+          Relative move goal (see move_manipulator_action for structure).
+      - name: policy_id
+        type: string
+        required: true
+        description: >-
+          The registered move-scoped `complete_move_on_signal` policy
+          this scope binds to.
+      - name: scope_id
+        type: string
+        required: false
+        description: >-
+          Per-move binding identifier (default `{move_id}_scope`).
+      - name: stop_mode
+        type: enum
+        required: true
+        enum_values: [spring_back_hold, soft_on_path, hard_deceleration]
+        description: >-
+          Controlled-stop mode requested at trip time. The backend's
+          capability profile MUST advertise the mode or the kernel
+          rejects the execute request before dispatch.
+      - name: activation_mode
+        type: enum
+        required: false
+        enum_values:
+          - require_inactive_at_arm
+          - fresh_edge_after_arm
+          - trip_if_already_active
+          - maintain_level_with_hysteresis
+        description: >-
+          Spec/260 §2.6 activation mode for the binding. Default
+          `require_inactive_at_arm`.
+      - name: not_found_is_failure
+        type: bool
+        required: false
+        description: >-
+          When true, `no_signal_trip` terminal cause maps to FAILURE
+          instead of SUCCESS. Use for "must contact" semantics.
+      - name: allowed_fallback_modes
+        type: string_list
+        required: false
+        description: >-
+          Stop modes the backend may execute as a fallback at trip
+          time (spec/210 §3.11 conjunctive rule). Every entry MUST
+          be in the backend capability profile AND the kernel
+          policy's `allowed_stop_modes`.
+      - name: stop_max_time_s
+        type: float
+        required: false
+        description: Upper bound on backend stop confirmation.
+      - name: stop_deceleration_time_s
+        type: float
+        required: false
+        description: Ramp duration for spring_back_hold / soft_on_path.
+      - name: per_joint_max_deceleration_rad_s2
+        type: dict
+        required: false
+        description: >-
+          Per-joint deceleration limits for soft_on_path feasibility
+          and replacement-trajectory generation. Required when
+          stop_mode is `soft_on_path`.
+      - name: allow_natural_completion_on_short_path
+        type: bool
+        required: false
+        default: true
+        visible_when:
+          param: stop_mode
+          equals: soft_on_path
+        description: >-
+          For generic MoveUntilSignal soft_on_path only: when a signal
+          arrives too close to the accepted trajectory endpoint for a
+          useful wall-time stop ramp, allow the original motion to
+          complete and map the terminal outcome to no_signal_trip
+          semantics. Disable when a controlled stop is mandatory.
+      - name: scope_outcome_key
+        type: string
+        required: false
+        description: >-
+          Blackboard key for the terminal MotionExecutionOutcome
+          (default `motion_scope_outcome`).
+      - name: result_binding_key
+        type: string
+        required: false
+        description: >-
+          Optional spec/260 §2.6 result-binding key recorded on the
+          trip outcome for downstream BT consumers.
+      - name: velocity_scale
+        type: float
+        required: false
+        default: 1.0
+        constraints:
+          min_exclusive: 0.0
+          max_inclusive: 1.0
+        parameterizable: true
+        description: Velocity scaling factor.
+      - name: acceleration_scale
+        type: float
+        required: false
+        default: 1.0
+        constraints:
+          min_exclusive: 0.0
+          max_inclusive: 1.0
+        parameterizable: true
+        description: Acceleration scaling factor.
+      - name: max_tcp_linear_speed_mps
+        type: float
+        required: false
+        constraints:
+          min_exclusive: 0.0
+        parameterizable: true
+        description: >-
+          Per-move TCP linear speed cap (m/s). Effective limit is
+          min(global_max, this value). Omit to use global limit only.
+      - name: joint_position_tol_rad
+        type: float
+        required: false
+        default: 0.05
+        constraints:
+          min_inclusive: 0.0
+        parameterizable: true
+        description: Joint position tolerance in radians.
+      - name: translation_tol_m
+        type: float
+        required: false
+        default: 0.005
+        constraints:
+          min_inclusive: 0.0
+        parameterizable: true
+        description: Cartesian translation tolerance in meters.
+      - name: rotation_tol_rad
+        type: float
+        required: false
+        default: 0.05
+        constraints:
+          min_inclusive: 0.0
+        parameterizable: true
+        description: Cartesian rotation tolerance in radians.
+      - name: planning_timeout_s
+        type: float
+        required: false
+        default: 2.0
+        constraints:
+          min_exclusive: 0.0
+        parameterizable: true
+        description: Planning timeout in seconds.
+      - name: execution_timeout_s
+        type: float
+        required: false
+        default: 10.0
+        constraints:
+          min_exclusive: 0.0
+        parameterizable: true
+        description: Execution timeout in seconds.
+      - name: cache_mode
+        type: enum
+        required: false
+        default: default
+        enum_values: [default, disable]
+        description: Trajectory cache mode.
+    required_capabilities:
+      - kernel.motion_interrupt_scope
+      - planning.motion.joint_goal
+      - planning.motion.pose_goal
+      - planning.trajectory.time_parameterized
+      - context.state.current
+      - context.validation.trajectory
+      - context.collision.check
+      - execution.trajectory.execute
+      - execution.feedback.phase_events
+      - execution.stop.soft
+    execution:
+      blocking: true
+      cancellable: true
+      timeout_param: execution_timeout_s
+    interruptible: true
+    default_interrupt_scope: kernel_motion
+    runners:
+      py_trees:
+        implementation_kind: plugin
+    observability:
+      emits_events:
+        - plan_started
+        - plan_completed
+        - validation_started
+        - validation_passed
+        - execute_started
+        - execute_completed
+      consumes_events:
+        - stop_requested
+
+  - id: probe_search_move
+    name: ProbeSearchMove
+    category: motion
+    description: >-
+      Phase 4.5E precision-contact motion-scoped trip node. Same
+      shape as MoveUntilSignal but with stricter defaults:
+      `node_category=precision_contact`, `not_found_is_failure=true`
+      (the probe MUST have contacted), `activation_mode=require_inactive_at_arm`,
+      and `allowed_fallback_modes` rejected at construction (spec/210
+      §3.11 conjunctive rule disallows fallback for precision-contact
+      categories). Motion-field parity with `move_manipulator_action`.
+    tags: [motion, planning, execution, motion_scoped_trip, precision_contact]
+    profiles:
+      min_profile: v0.2
+    kind: leaf
+    children:
+      min: 0
+      max: 0
+    parameters:
+      - name: move_id
+        type: string
+        required: true
+        description: Stable move identifier for trajectory caching.
+      - name: motion_type
+        type: enum
+        required: true
+        enum_values: [joint_goal, pose_goal, relative_move]
+        enum_options:
+          - value: joint_goal
+          - value: pose_goal
+          - value: relative_move
+            profiles:
+              min_profile: v0.2
+            required_capabilities:
+              - context.pose.resolve_reference
+        description: The type of motion to plan (default pose_goal for contact moves).
+      - name: joint_goal_names
+        type: string_list
+        required: false
+        visible_when:
+          param: motion_type
+          equals: joint_goal
+        description: Joint names when motion_type=joint_goal.
+      - name: joint_goal_positions_rad
+        type: float_list
+        required: false
+        visible_when:
+          param: motion_type
+          equals: joint_goal
+        description: Joint positions in radians when motion_type=joint_goal.
+      - name: pose_goal
+        type: pose
+        required: false
+        visible_when:
+          param: motion_type
+          equals: pose_goal
+        ui_editor: pose_or_blackboard_field_selector
+        blackboard_role: field_reader
+        blackboard_value_type: pose
+        description: Target probe-search end pose for motion_type=pose_goal.
+      - name: relative_move
+        type: dict
+        required: false
+        visible_when:
+          param: motion_type
+          equals: relative_move
+        ui_editor: relative_move
+        description: Relative move goal (see move_manipulator_action).
+      - name: policy_id
+        type: string
+        required: true
+        description: >-
+          The registered move-scoped `complete_move_on_signal` policy
+          this scope binds to.
+      - name: stop_mode
+        type: enum
+        required: true
+        enum_values: [spring_back_hold, soft_on_path, hard_deceleration]
+        description: >-
+          Controlled-stop mode requested at trip time. Backend
+          capability MUST advertise the mode.
+      - name: scope_id
+        type: string
+        required: false
+        description: Per-move binding identifier.
+      - name: stop_max_time_s
+        type: float
+        required: false
+        description: Upper bound on backend stop confirmation.
+      - name: stop_deceleration_time_s
+        type: float
+        required: false
+        description: Ramp duration for spring_back_hold / soft_on_path.
+      - name: per_joint_max_deceleration_rad_s2
+        type: dict
+        required: false
+        description: >-
+          Per-joint deceleration limits for soft_on_path feasibility
+          and replacement-trajectory generation. Required when
+          stop_mode is `soft_on_path`.
+      - name: scope_outcome_key
+        type: string
+        required: false
+        description: >-
+          Blackboard key for the terminal MotionExecutionOutcome
+          (default `motion_scope_outcome`).
+      - name: result_binding_key
+        type: string
+        required: false
+        description: >-
+          Optional spec/260 §2.6 result-binding key recorded on the
+          trip outcome.
+      - name: velocity_scale
+        type: float
+        required: false
+        default: 1.0
+        constraints:
+          min_exclusive: 0.0
+          max_inclusive: 1.0
+        parameterizable: true
+        description: Velocity scaling factor.
+      - name: acceleration_scale
+        type: float
+        required: false
+        default: 1.0
+        constraints:
+          min_exclusive: 0.0
+          max_inclusive: 1.0
+        parameterizable: true
+        description: Acceleration scaling factor.
+      - name: max_tcp_linear_speed_mps
+        type: float
+        required: false
+        constraints:
+          min_exclusive: 0.0
+        parameterizable: true
+        description: >-
+          Per-move TCP linear speed cap (m/s). Effective limit is
+          min(global_max, this value).
+      - name: joint_position_tol_rad
+        type: float
+        required: false
+        default: 0.05
+        constraints:
+          min_inclusive: 0.0
+        parameterizable: true
+        description: Joint position tolerance in radians.
+      - name: translation_tol_m
+        type: float
+        required: false
+        default: 0.005
+        constraints:
+          min_inclusive: 0.0
+        parameterizable: true
+        description: Cartesian translation tolerance in meters.
+      - name: rotation_tol_rad
+        type: float
+        required: false
+        default: 0.05
+        constraints:
+          min_inclusive: 0.0
+        parameterizable: true
+        description: Cartesian rotation tolerance in radians.
+      - name: planning_timeout_s
+        type: float
+        required: false
+        default: 2.0
+        constraints:
+          min_exclusive: 0.0
+        parameterizable: true
+        description: Planning timeout in seconds.
+      - name: execution_timeout_s
+        type: float
+        required: false
+        default: 10.0
+        constraints:
+          min_exclusive: 0.0
+        parameterizable: true
+        description: Execution timeout in seconds.
+      - name: cache_mode
+        type: enum
+        required: false
+        default: default
+        enum_values: [default, disable]
+        description: Trajectory cache mode.
+    required_capabilities:
+      - kernel.motion_interrupt_scope
+      - kernel.motion_interrupt_precision_contact
+      - planning.motion.joint_goal
+      - planning.motion.pose_goal
+      - planning.trajectory.time_parameterized
+      - context.state.current
+      - context.validation.trajectory
+      - context.collision.check
+      - execution.trajectory.execute
+      - execution.feedback.phase_events
+      - execution.stop.soft
+    execution:
+      blocking: true
+      cancellable: true
+      timeout_param: execution_timeout_s
+    interruptible: true
+    default_interrupt_scope: kernel_motion
+    runners:
+      py_trees:
+        implementation_kind: plugin
+    observability:
+      emits_events:
+        - plan_started
+        - plan_completed
+        - validation_started
+        - validation_passed
+        - execute_started
+        - execute_completed
+      consumes_events:
+        - stop_requested
+
   - id: reset_trajectories
     name: ResetTrajectories
     category: motion

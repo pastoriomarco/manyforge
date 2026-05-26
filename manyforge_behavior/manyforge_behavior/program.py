@@ -789,7 +789,20 @@ def _validate_tree_node_semantics(
 ) -> list[TreeValidationIssue]:
     issues: list[TreeValidationIssue] = []
 
-    if node.id == "move_manipulator_action":
+    # Phase 4.5E follow-up: scoped motion trip nodes share the same
+    # motion-goal shape as `move_manipulator_action` (they declare the
+    # full parameter set in the catalog for motion-field parity). The
+    # original validator only covered `move_manipulator_action`, so
+    # `move_until_signal` / `probe_search_move` would load with
+    # missing joint targets / mismatched arrays / missing pose_goal /
+    # malformed relative_move, and the error would surface at runtime
+    # in the kernel. For industrial contact/search motion, fail-fast
+    # at program load. Treat all three IDs uniformly here.
+    if node.id in {
+        "move_manipulator_action",
+        "move_until_signal",
+        "probe_search_move",
+    }:
         motion_type = resolved_params.get("motion_type")
         if motion_type == "joint_goal":
             joint_names = resolved_params.get("joint_goal_names")

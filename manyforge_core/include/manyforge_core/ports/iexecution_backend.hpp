@@ -2,6 +2,7 @@
 
 #include <manyforge_core/types/error_code.hpp>
 #include <manyforge_core/types/execution_result.hpp>
+#include <manyforge_core/types/motion_interrupt.hpp>
 #include <manyforge_core/types/streaming_session.hpp>
 #include <manyforge_core/types/trajectory_dto.hpp>
 
@@ -154,6 +155,55 @@ class IExecutionBackend {
     /// Compatibility alias for older callers.
     virtual void set_streaming_velocity_scale(double scale) {
       set_runtime_velocity_scale(scale);
+    }
+
+    // ---------------------------------------------------------------
+    // Phase 4.5D-1: controlled-stop capability surface (spec/240).
+    //
+    // The kernel reads this once at arm time to enforce pre-dispatch
+    // capability gating on `complete_move_on_signal` scopes. Default
+    // returns an empty capability set so backends that have not
+    // implemented the controlled-stop contract fail closed: any
+    // execute request carrying a move-scoped trip policy is rejected
+    // with `motion_interrupt_arm_failed` and reason
+    // `stop_mode_not_supported_by_backend`. Backends override once
+    // they declare at least one production-qualified stop mode in
+    // their capability profile.
+    // ---------------------------------------------------------------
+    virtual MotionInterruptStopCapabilityDTO
+    get_motion_interrupt_stop_capability() const {
+      return MotionInterruptStopCapabilityDTO{};
+    }
+
+    // ---------------------------------------------------------------
+    // Phase 4.5D-2: controlled-stop result surface (spec/260 §5.6).
+    //
+    // Called by the kernel at trip time when a `complete_move_on_signal`
+    // latch fires. The backend MUST execute the requested stop mode (or
+    // a mode listed in `allowed_fallback_modes`), wait for the
+    // controller to acknowledge within `max_stop_time_s`, and return a
+    // `ControlledStopResultDTO` describing what actually happened. The
+    // kernel applies the conjunctive fallback rule on top of this
+    // result and downgrades the outcome to `failed` on any deviation.
+    //
+    // The default implementation returns `accepted=false` with a
+    // `motion_interrupt_backend_stop_failed` error so backends that
+    // have not yet implemented the controlled-stop contract fail
+    // closed. Phase 4.5D-1's capability gate also rejects these
+    // backends at arm time when the supported_stop_modes set is empty;
+    // this default exists for backends that mistakenly declare a
+    // non-empty capability set without overriding this method.
+    // ---------------------------------------------------------------
+    virtual ControlledStopResultDTO execute_controlled_stop(
+        const MotionInterruptStopProfileDTO& /*profile*/) {
+      ControlledStopResultDTO result;
+      result.accepted = false;
+      result.backend_stop_confirmed = false;
+      result.error = ErrorDTO{
+          std::string(kErrorMotionInterruptBackendStopFailed),
+          "execute_controlled_stop is not implemented by this backend",
+          {{"reason", "controlled_stop_port_not_implemented"}}};
+      return result;
     }
 };
 

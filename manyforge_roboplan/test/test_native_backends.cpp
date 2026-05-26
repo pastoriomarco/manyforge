@@ -1136,3 +1136,442 @@ TEST_F(NativeKernelTest, TrajectoryValidationReportsTcpSpeedBeforeCollisionSweep
   EXPECT_NE(result.error->details.find("speed_validation_duration_ns"),
             result.error->details.end());
 }
+
+// =========================================================================
+// Phase 4.5D-3: native backend `spring_back_hold` controlled-stop tests
+// =========================================================================
+
+TEST_F(NativeKernelTest,
+       NativeBackend_StopCapability_DeclaresSpringBackHoldAndSoftOnPath) {
+  // Spec/240 backend capability profile + spec/260 §5.6: the native
+  // simulator now has concrete support for spring_back_hold and Phase
+  // 4.5G soft_on_path. hard_deceleration remains ros2_control/JTC-only.
+  auto cap = bundle_->execution->get_motion_interrupt_stop_capability();
+  EXPECT_EQ(cap.supported_stop_modes.size(), 2u);
+  EXPECT_TRUE(cap.supported_stop_modes.contains(
+      MotionInterruptStopMode::kSpringBackHold));
+  EXPECT_TRUE(cap.supported_stop_modes.contains(
+      MotionInterruptStopMode::kSoftOnPath));
+  EXPECT_FALSE(cap.supported_stop_modes.contains(
+      MotionInterruptStopMode::kHardDeceleration));
+  ASSERT_TRUE(cap.capability_profile_id.has_value());
+  EXPECT_EQ(*cap.capability_profile_id, "roboplan_native_v2_soft_on_path");
+  ASSERT_TRUE(cap.soft_on_path_planner_config.has_value());
+  EXPECT_DOUBLE_EQ(cap.soft_on_path_planner_config->stop_traj_delta_s, 0.02);
+  EXPECT_DOUBLE_EQ(cap.soft_on_path_planner_config->sample_period_s, 0.01);
+  EXPECT_TRUE(cap.soft_on_path_planner_config->allow_model_velocity_fallback);
+}
+
+TEST_F(NativeKernelTest,
+       NativeBackend_ControlledStop_RejectsUnsupportedMode) {
+  // Defense in depth: the kernel's arm-time gate already rejects
+  // unsupported modes, but a backend that has been mis-wired must
+  // also fail closed at trip time rather than silently producing a
+  // hold for a different requested mode.
+  MotionInterruptStopProfileDTO profile;
+  profile.profile_id = "test_hard_deceleration";
+  profile.stop_mode = MotionInterruptStopMode::kHardDeceleration;
+  auto result = bundle_->execution->execute_controlled_stop(profile);
+  EXPECT_FALSE(result.accepted);
+  EXPECT_FALSE(result.backend_stop_confirmed);
+  ASSERT_TRUE(result.error.has_value());
+  EXPECT_EQ(result.error->details.at("reason"),
+            "stop_mode_not_supported_by_backend");
+}
+
+TEST_F(NativeKernelTest,
+       NativeBackend_ControlledStop_RejectsWithNoExecutionInFlight) {
+  // No execution + no recorded observed state → fail closed.
+  MotionInterruptStopProfileDTO profile;
+  profile.profile_id = "test_no_inflight";
+  profile.stop_mode = MotionInterruptStopMode::kSpringBackHold;
+  auto result = bundle_->execution->execute_controlled_stop(profile);
+  EXPECT_FALSE(result.accepted);
+  EXPECT_FALSE(result.backend_stop_confirmed);
+  ASSERT_TRUE(result.error.has_value());
+  EXPECT_EQ(result.error->details.at("reason"),
+            "controlled_stop_no_observed_state");
+}
+
+TEST_F(NativeKernelTest,
+       NativeBackend_ControlledStop_SpringBackHoldPreemptsActiveExecution) {
+  // Spec/260 §5.6 spring_back_hold semantics: preempt the active
+  // trajectory, leave the worker at its observed joint position,
+  // confirm the stop. The post-stop snapshot's joint vector MUST
+  // anchor to a point along the trajectory (not at the endpoint,
+  // since the worker was preempted mid-flight) and MUST be reported
+  // with kStopped state and kNativeSimulatedStop command source.
+  auto start_state = bundle_->context->get_current_state();
+  ASSERT_FALSE(start_state.positions_rad.empty());
+
+  std::vector<double> goal = start_state.positions_rad;
+  goal[0] += 0.5;
+  if (goal.size() > 1) {
+    goal[1] -= 0.4;
+  }
+
+  // Long trajectory so the worker is mid-flight when we preempt.
+  TrajectoryDTO traj;
+  traj.joint_names = start_state.joint_names;
+  traj.waypoints.push_back(
+      TrajectoryWaypointDTO{0.0, start_state.positions_rad, {}, {}});
+  traj.waypoints.push_back(TrajectoryWaypointDTO{2.0, goal, {}, {}});
+
+  auto handle = bundle_->execution->execute_trajectory(traj);
+  // Wait a touch so the worker has time to advance past the anchor.
+  std::this_thread::sleep_for(std::chrono::milliseconds(150));
+
+  MotionInterruptStopProfileDTO profile;
+  profile.profile_id = "test_spring_back";
+  profile.stop_mode = MotionInterruptStopMode::kSpringBackHold;
+  profile.max_stop_time_s = 1.0;  // generous; well above the worker tick
+
+  const auto call_start = bundle_->clock->now();
+  auto result = bundle_->execution->execute_controlled_stop(profile);
+  const auto call_end = bundle_->clock->now();
+  EXPECT_TRUE(result.accepted);
+  EXPECT_TRUE(result.backend_stop_confirmed);
+  EXPECT_EQ(result.executed_stop_mode,
+            MotionInterruptStopMode::kSpringBackHold);
+  EXPECT_EQ(result.stop_command_source,
+            MotionInterruptStopCommandSource::kNativeSimulatedStop);
+  EXPECT_GE(result.confirmation_latency_ns, 0);
+  EXPECT_LE(result.confirmation_latency_ns,
+            std::int64_t{call_end - call_start});
+
+  // The wait_for_completion handle is now satisfied (the worker
+  // exited under stop_token).
+  ASSERT_TRUE(handle.wait_for_completion(2'000'000'000LL));
+
+  // Post-stop snapshot reflects the anchored (preempted) position.
+  auto stopped = bundle_->execution->get_execution_snapshot();
+  EXPECT_EQ(stopped.state, ExecutionState::kStopped);
+  ASSERT_EQ(stopped.joint_positions_rad.size(),
+            start_state.positions_rad.size());
+  // Anchor MUST be different from the planned endpoint (worker was
+  // preempted) and SHOULD be advanced past the start position
+  // (worker had ~150 ms of forward motion).
+  EXPECT_NE(stopped.joint_positions_rad[0], goal[0])
+      << "spring_back_hold MUST NOT silently complete the trajectory";
+  EXPECT_NE(stopped.joint_positions_rad[0], start_state.positions_rad[0])
+      << "spring_back_hold MUST anchor at observed (mid-flight) state";
+}
+
+TEST_F(NativeKernelTest,
+       NativeBackend_ControlledStop_SoftOnPathRunsWallTimePathRamp) {
+  auto start_state = bundle_->context->get_current_state();
+  ASSERT_FALSE(start_state.positions_rad.empty());
+
+  std::vector<double> goal = start_state.positions_rad;
+  goal[0] += 0.6;
+  if (goal.size() > 1) {
+    goal[1] += 0.2;
+  }
+
+  TrajectoryDTO traj;
+  traj.joint_names = start_state.joint_names;
+  traj.waypoints.push_back(
+      TrajectoryWaypointDTO{0.0, start_state.positions_rad, {}, {}});
+  traj.waypoints.push_back(TrajectoryWaypointDTO{2.0, goal, {}, {}});
+
+  auto handle = bundle_->execution->execute_trajectory(traj);
+  std::this_thread::sleep_for(std::chrono::milliseconds(120));
+
+  MotionInterruptStopProfileDTO profile;
+  profile.profile_id = "native_soft_on_path";
+  profile.stop_mode = MotionInterruptStopMode::kSoftOnPath;
+  profile.deceleration_time_s = 0.15;
+  profile.max_stop_time_s = 1.0;
+  profile.allowed_fallback_modes = {MotionInterruptStopMode::kSpringBackHold};
+  for (const auto& joint_name : start_state.joint_names) {
+    profile.per_joint_max_deceleration_rad_s2[joint_name] = 100.0;
+  }
+
+  auto result = bundle_->execution->execute_controlled_stop(profile);
+
+  EXPECT_TRUE(result.accepted);
+  EXPECT_TRUE(result.backend_stop_confirmed);
+  EXPECT_EQ(result.executed_stop_mode, MotionInterruptStopMode::kSoftOnPath);
+  EXPECT_EQ(result.stop_command_source,
+            MotionInterruptStopCommandSource::kNativeSimulatedPathRamp);
+  ASSERT_TRUE(result.path_deviation_max_rad.has_value());
+  EXPECT_GE(*result.path_deviation_max_rad, 0.0);
+  ASSERT_TRUE(result.stop_distance_rad.has_value());
+  EXPECT_GT(*result.stop_distance_rad, 0.0);
+  EXPECT_EQ(result.diagnostics.at("runtime_scale_isolated"), "true");
+  EXPECT_EQ(result.diagnostics.at("velocity_source"), "model_derived");
+
+  ASSERT_TRUE(handle.wait_for_completion(2'000'000'000LL));
+  auto stopped = bundle_->execution->get_execution_snapshot();
+  EXPECT_EQ(stopped.state, ExecutionState::kStopped);
+  ASSERT_EQ(stopped.joint_positions_rad.size(), start_state.positions_rad.size());
+  EXPECT_NE(stopped.joint_positions_rad[0], goal[0])
+      << "soft_on_path stop MUST NOT silently finish the original trajectory";
+}
+
+TEST_F(NativeKernelTest,
+       NativeBackend_ControlledStop_SoftOnPathIgnoresSliderChangesDuringStop) {
+  auto start_state = bundle_->context->get_current_state();
+  ASSERT_FALSE(start_state.positions_rad.empty());
+
+  std::vector<double> goal = start_state.positions_rad;
+  goal[0] += 0.7;
+  if (goal.size() > 1) {
+    goal[1] += 0.2;
+  }
+
+  TrajectoryDTO traj;
+  traj.joint_names = start_state.joint_names;
+  traj.waypoints.push_back(
+      TrajectoryWaypointDTO{0.0, start_state.positions_rad, {}, {}});
+  traj.waypoints.push_back(TrajectoryWaypointDTO{3.0, goal, {}, {}});
+
+  bundle_->execution->set_runtime_velocity_scale(0.25);
+  auto handle = bundle_->execution->execute_trajectory(traj);
+  std::this_thread::sleep_for(std::chrono::milliseconds(180));
+
+  MotionInterruptStopProfileDTO profile;
+  profile.profile_id = "native_soft_on_path_scale_isolation";
+  profile.stop_mode = MotionInterruptStopMode::kSoftOnPath;
+  profile.deceleration_time_s = 0.25;
+  profile.max_stop_time_s = 1.0;
+  profile.allowed_fallback_modes = {MotionInterruptStopMode::kSpringBackHold};
+  for (const auto& joint_name : start_state.joint_names) {
+    profile.per_joint_max_deceleration_rad_s2[joint_name] = 100.0;
+  }
+
+  auto* execution = bundle_->execution.get();
+  std::thread slider_thread([execution]() {
+    std::this_thread::sleep_for(std::chrono::milliseconds(40));
+    execution->set_runtime_velocity_scale(0.0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(80));
+    execution->set_runtime_velocity_scale(1.0);
+  });
+
+  const auto call_start = std::chrono::steady_clock::now();
+  auto result = bundle_->execution->execute_controlled_stop(profile);
+  const auto call_elapsed =
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - call_start);
+  slider_thread.join();
+
+  EXPECT_TRUE(result.accepted);
+  EXPECT_TRUE(result.backend_stop_confirmed);
+  EXPECT_EQ(result.executed_stop_mode, MotionInterruptStopMode::kSoftOnPath);
+  EXPECT_EQ(result.stop_command_source,
+            MotionInterruptStopCommandSource::kNativeSimulatedPathRamp);
+  EXPECT_EQ(result.diagnostics.at("runtime_scale_isolated"), "true");
+  EXPECT_EQ(result.diagnostics.at("runtime_velocity_scale_at_trip"), "0.25");
+  EXPECT_LT(call_elapsed, std::chrono::milliseconds(700))
+      << "soft_on_path replacement trajectory must run in wall time; "
+      << "operator slider changes during the controlled stop must not "
+      << "stretch or freeze the stop";
+  EXPECT_LT(result.confirmation_latency_ns, std::int64_t{700'000'000});
+
+  ASSERT_TRUE(handle.wait_for_completion(2'000'000'000LL));
+  auto stopped = bundle_->execution->get_execution_snapshot();
+  EXPECT_EQ(stopped.state, ExecutionState::kStopped);
+}
+
+TEST_F(NativeKernelTest,
+       NativeBackend_ControlledStop_SoftOnPathAllowsShortPathNaturalCompletion) {
+  auto start_state = bundle_->context->get_current_state();
+  ASSERT_FALSE(start_state.positions_rad.empty());
+
+  std::vector<double> goal = start_state.positions_rad;
+  goal[0] += 0.1;
+
+  TrajectoryDTO traj;
+  traj.joint_names = start_state.joint_names;
+  traj.waypoints.push_back(
+      TrajectoryWaypointDTO{0.0, start_state.positions_rad, {}, {}});
+  traj.waypoints.push_back(TrajectoryWaypointDTO{0.3, goal, {}, {}});
+
+  auto handle = bundle_->execution->execute_trajectory(traj);
+  std::this_thread::sleep_for(std::chrono::milliseconds(220));
+
+  MotionInterruptStopProfileDTO profile;
+  profile.profile_id = "native_soft_on_path_natural_completion";
+  profile.stop_mode = MotionInterruptStopMode::kSoftOnPath;
+  profile.deceleration_time_s = 1.0;
+  profile.max_stop_time_s = 1.0;
+  profile.allow_natural_completion_on_short_path = true;
+  for (const auto& joint_name : start_state.joint_names) {
+    profile.per_joint_max_deceleration_rad_s2[joint_name] = 100.0;
+  }
+
+  auto result = bundle_->execution->execute_controlled_stop(profile);
+
+  EXPECT_TRUE(result.accepted);
+  EXPECT_TRUE(result.backend_stop_confirmed);
+  EXPECT_TRUE(result.completed_by_natural_completion);
+  EXPECT_EQ(result.executed_stop_mode, MotionInterruptStopMode::kSoftOnPath);
+  EXPECT_EQ(result.stop_command_source,
+            MotionInterruptStopCommandSource::kDiagnosticOther);
+  EXPECT_EQ(result.diagnostics.at("recommended_disposition"),
+            "natural_completion");
+  ASSERT_TRUE(handle.wait_for_completion(2'000'000'000LL));
+  auto completed = bundle_->execution->get_execution_snapshot();
+  EXPECT_EQ(completed.state, ExecutionState::kCompleted);
+}
+
+TEST_F(NativeKernelTest,
+       NativeBackend_EndToEnd_ScopedTripProducesSignalTripOutcome) {
+  // End-to-end Phase 4.5D-3 integration: kernel + RoboPlanExecutionBackend +
+  // InterruptManager produce a real signal_trip outcome with a populated
+  // MotionTripOutcomeDTO. This exercises the controlled-stop port at the
+  // kernel layer (handle_motion_trip_latch -> execute_controlled_stop ->
+  // ExecutionStopSnapshotDTO capture), not via MockExecution.
+  auto start_state = bundle_->context->get_current_state();
+  ASSERT_FALSE(start_state.positions_rad.empty());
+
+  // Register a fast-execution-relevant source and a move-scoped
+  // complete_move_on_signal policy that permits spring_back_hold.
+  InterruptSourceDefinition src;
+  src.source_id = "probe";
+  src.adapter = InterruptAdapter::kInternalTest;
+  src.signal = "probe_signal";
+  src.source_class = InterruptSourceClass::kFastExecutionRelevant;
+  src.kind = InterruptSourceKind::kEdge;
+  src.priority = 700;
+  ASSERT_TRUE(bundle_->kernel->register_interrupt_source(src).ok());
+
+  InterruptPolicyDefinition policy;
+  policy.policy_id = "probe_trip";
+  policy.source_id = "probe";
+  policy.priority = 700;
+  policy.affected_phases = {InterruptExecutionPhase::kTrajectoryExecution};
+  policy.preemption_action = InterruptPreemptionAction::kCompleteMoveOnSignal;
+  policy.post_latch_disposition =
+      InterruptPostLatchDisposition::kAutoClearAfterMotionOutcome;
+  policy.scope_kind = InterruptPolicyScopeKind::kMove;
+  policy.allowed_activation_modes = {
+      MotionInterruptActivationMode::kTripIfAlreadyActive};
+  policy.allowed_stop_modes = {MotionInterruptStopMode::kSpringBackHold};
+  ASSERT_TRUE(bundle_->kernel->register_interrupt_policy(policy).ok());
+
+  // Build the request: a long(ish) joint goal so the worker is
+  // mid-flight when we publish the trip.
+  std::vector<double> goal = start_state.positions_rad;
+  goal[0] += 0.4;
+  if (goal.size() > 1) {
+    goal[1] -= 0.3;
+  }
+
+  MotionInterruptScopeDTO scope;
+  scope.scope_id = "probe_scope_a";
+  scope.policy_id = "probe_trip";
+  scope.activation_mode = MotionInterruptActivationMode::kTripIfAlreadyActive;
+  MotionInterruptStopProfileDTO profile;
+  profile.profile_id = "spring_back_v1";
+  profile.stop_mode = MotionInterruptStopMode::kSpringBackHold;
+  profile.max_stop_time_s = 1.0;
+  scope.stop_profile = profile;
+
+  ExecuteRequestDTO req;
+  req.robot_id = "robot1";
+  req.group_id = "arm";
+  req.move_id = "scoped_trip_e2e";
+  req.base_frame = "base_link";
+  req.tcp_frame = "tool0";
+  req.tolerances = {0.05, 0.005, 0.05};
+  req.speed_profile = {1.0, 1.0, std::nullopt};
+  req.timeouts = {10.0, 30.0};
+  req.cache_mode = CacheMode::kDefault;
+  JointGoalDTO jg;
+  jg.joint_names = start_state.joint_names;
+  jg.positions_rad = goal;
+  req.motion = jg;
+  req.motion_interrupt_scopes = {scope};
+
+  auto exec_result = bundle_->kernel->execute(req);
+  ASSERT_TRUE(exec_result.ok())
+      << "execute failed: " << exec_result.error().message;
+
+  // Wait for the worker to reach kExecuting before publishing the trip.
+  for (int attempt = 0; attempt < 200; ++attempt) {
+    if (bundle_->kernel->get_status().state == ExecutionState::kExecuting) {
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  ASSERT_EQ(bundle_->kernel->get_status().state, ExecutionState::kExecuting);
+
+  // Let the worker advance so the anchored stop point is not at the
+  // trajectory's start position.
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+  // Publish the trip.
+  InterruptSignalUpdate trip;
+  trip.source_id = "probe";
+  trip.sequence_id = 2;
+  trip.timestamp_ns = bundle_->clock->now();
+  trip.value = true;
+  auto ingest = bundle_->kernel->publish_fast_interrupt_signal(trip);
+  ASSERT_TRUE(ingest.latched) << "expected move-scoped trip to latch; reason="
+                                << ingest.reason;
+
+  ASSERT_TRUE(bundle_->kernel->wait_for_completion(3'000'000'000LL));
+  EXPECT_EQ(bundle_->kernel->get_status().state, ExecutionState::kCompleted);
+
+  auto outcome = bundle_->kernel->get_execution_outcome(exec_result.value());
+  ASSERT_TRUE(outcome.has_value());
+  EXPECT_EQ(outcome->terminal_cause,
+            MotionExecutionTerminalCause::kSignalTrip);
+  ASSERT_TRUE(outcome->trip.has_value());
+  EXPECT_EQ(outcome->trip->executed_stop_mode,
+            MotionInterruptStopMode::kSpringBackHold);
+  EXPECT_EQ(outcome->trip->stop_command_source,
+            MotionInterruptStopCommandSource::kNativeSimulatedStop);
+  EXPECT_TRUE(outcome->trip->stop_snapshot.backend_stop_confirmed);
+  EXPECT_EQ(outcome->trip->stop_snapshot.source,
+            ExecutionStopSnapshotSource::kExecutionBackendFeedback);
+  // Stop snapshot satisfies spec/210 §3.7 size/ordering.
+  EXPECT_FALSE(outcome->trip->stop_snapshot.robot_state.joint_names.empty());
+  EXPECT_EQ(outcome->trip->stop_snapshot.robot_state.joint_names.size(),
+            outcome->trip->stop_snapshot.robot_state.positions_rad.size());
+  // Latch auto-cleared via auto_clear_after_motion_outcome on success.
+  EXPECT_FALSE(bundle_->kernel->get_active_interrupt_latch().has_value());
+}
+
+TEST_F(NativeKernelTest,
+       NativeBackend_ControlledStop_RespectsMaxStopTimeBudget) {
+  // The backend's own internal wait honors profile.max_stop_time_s.
+  // A short profile budget MUST be observed by the controlled-stop
+  // path. (The kernel still enforces its own deadline on top of
+  // this; this test isolates the backend wait.)
+  auto start_state = bundle_->context->get_current_state();
+  ASSERT_FALSE(start_state.positions_rad.empty());
+
+  std::vector<double> goal = start_state.positions_rad;
+  goal[0] += 0.3;
+
+  TrajectoryDTO traj;
+  traj.joint_names = start_state.joint_names;
+  traj.waypoints.push_back(
+      TrajectoryWaypointDTO{0.0, start_state.positions_rad, {}, {}});
+  traj.waypoints.push_back(TrajectoryWaypointDTO{1.5, goal, {}, {}});
+
+  auto handle = bundle_->execution->execute_trajectory(traj);
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+  MotionInterruptStopProfileDTO profile;
+  profile.profile_id = "test_budget";
+  profile.stop_mode = MotionInterruptStopMode::kSpringBackHold;
+  profile.max_stop_time_s = 0.5;  // 500 ms budget
+
+  const auto call_start = bundle_->clock->now();
+  auto result = bundle_->execution->execute_controlled_stop(profile);
+  const auto call_end = bundle_->clock->now();
+  const auto elapsed_ns = call_end - call_start;
+  EXPECT_TRUE(result.accepted);
+  EXPECT_TRUE(result.backend_stop_confirmed);
+  // The worker should exit promptly (the tick is 10 ms). Latency
+  // recorded by the backend must not exceed the elapsed time.
+  EXPECT_LE(result.confirmation_latency_ns, elapsed_ns);
+  EXPECT_LT(elapsed_ns, std::int64_t{500'000'000})
+      << "spring_back_hold MUST exit well before max_stop_time_s under "
+      << "nominal conditions";
+
+  ASSERT_TRUE(handle.wait_for_completion(2'000'000'000LL));
+}

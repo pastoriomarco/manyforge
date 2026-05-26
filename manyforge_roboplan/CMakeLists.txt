@@ -83,6 +83,7 @@ add_library(manyforge_roboplan
   src/roboplan_planner_backend.cpp
   src/roboplan_planning_context.cpp
   src/roboplan_execution_backend.cpp
+  src/ros2_control_capability.cpp
   src/native_kernel_factory.cpp
   src/collision_body_id_mapper.cpp
   ${_MANYFORGE_ROS2_CONTROL_SOURCES}
@@ -140,6 +141,14 @@ if(BUILD_TESTING)
     target_link_libraries(test_native_backends PRIVATE
       manyforge_roboplan GTest::gtest_main)
 
+    # Phase 4.5D-4: pure capability-helper tests for the ros2_control
+    # adapter. The helper is a static function on
+    # Ros2ControlExecutionBackend that inspects a config and returns
+    # the capability set; no ROS runtime required.
+    add_executable(test_ros2_capability test/test_ros2_capability.cpp)
+    target_link_libraries(test_ros2_capability PRIVATE
+      manyforge_roboplan GTest::gtest_main)
+
     add_executable(test_collision_body_id_mapper
       test/test_collision_body_id_mapper.cpp)
     target_link_libraries(test_collision_body_id_mapper PRIVATE
@@ -180,6 +189,12 @@ if(BUILD_TESTING)
     endforeach()
 
     gtest_discover_tests(test_native_backends
+      PROPERTIES
+        ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
+        TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS}
+      DISCOVERY_EXTRA_ARGS --gtest_filter=*)
+
+    gtest_discover_tests(test_ros2_capability
       PROPERTIES
         ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
         TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS}

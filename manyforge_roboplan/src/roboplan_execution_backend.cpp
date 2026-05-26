@@ -2,6 +2,8 @@
 
 #include <Eigen/Dense>
 
+#include <manyforge_core/motion_interrupt/soft_on_path_stop_planner.hpp>
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -45,6 +47,34 @@ RoboPlanExecutionBackend::RoboPlanExecutionBackend(
       !std::isfinite(config_.streaming_stop_completion_timeout_s)) {
     throw std::invalid_argument(
         "streaming_stop_completion_timeout_s must be finite and > 0");
+  }
+  if (config_.soft_on_path_stop_traj_delta_s < 0.0 ||
+      !std::isfinite(config_.soft_on_path_stop_traj_delta_s)) {
+    throw std::invalid_argument(
+        "soft_on_path_stop_traj_delta_s must be finite and >= 0");
+  }
+  if (config_.soft_on_path_sample_period_s <= 0.0 ||
+      !std::isfinite(config_.soft_on_path_sample_period_s)) {
+    throw std::invalid_argument(
+        "soft_on_path_sample_period_s must be finite and > 0");
+  }
+  if (config_.soft_on_path_max_initial_velocity_deviation_rad_s.has_value() &&
+      (!std::isfinite(*config_.soft_on_path_max_initial_velocity_deviation_rad_s) ||
+       *config_.soft_on_path_max_initial_velocity_deviation_rad_s < 0.0)) {
+    throw std::invalid_argument(
+        "soft_on_path_max_initial_velocity_deviation_rad_s must be finite and >= 0");
+  }
+  if (config_.soft_on_path_max_initial_path_deviation_rad.has_value() &&
+      (!std::isfinite(*config_.soft_on_path_max_initial_path_deviation_rad) ||
+       *config_.soft_on_path_max_initial_path_deviation_rad < 0.0)) {
+    throw std::invalid_argument(
+        "soft_on_path_max_initial_path_deviation_rad must be finite and >= 0");
+  }
+  for (const auto& [joint, jerk] : config_.soft_on_path_max_jerk_rad_s3) {
+    if (joint.empty() || !std::isfinite(jerk) || jerk <= 0.0) {
+      throw std::invalid_argument(
+          "soft_on_path_max_jerk_rad_s3 entries must have non-empty joint names and finite positive values");
+    }
   }
   if (!scene_mutex_) {
     scene_mutex_ = std::make_shared<std::mutex>();
@@ -150,6 +180,12 @@ void RoboPlanExecutionBackend::execution_worker(std::stop_token st, core::Trajec
   double trajectory_time_s = 0.0;
   double applied_runtime_scale = std::max(
       0.0, std::min(1.0, runtime_velocity_scale_.load(std::memory_order_acquire)));
+  {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    state_.active_trajectory = trajectory;
+    state_.active_trajectory_time_s = trajectory_time_s;
+    state_.active_runtime_velocity_scale = applied_runtime_scale;
+  }
 
   while (true) {
     const bool pause_requested = state_.pause_requested.load();
@@ -191,6 +227,11 @@ void RoboPlanExecutionBackend::execution_worker(std::stop_token st, core::Trajec
       applied_runtime_scale = target_scale;
     }
     trajectory_time_s += dt_s * applied_runtime_scale;
+    {
+      std::lock_guard<std::mutex> lock(state_mutex_);
+      state_.active_trajectory_time_s = trajectory_time_s;
+      state_.active_runtime_velocity_scale = applied_runtime_scale;
+    }
 
     const double progress =
         total_duration_s <= 1e-9 ? 1.0 : clamp_progress(trajectory_time_s / total_duration_s);
@@ -230,6 +271,13 @@ core::ExecutionHandle RoboPlanExecutionBackend::execute_trajectory(
 
   state_.running.store(true);
   state_.pause_requested.store(false);
+  {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    state_.active_trajectory = trajectory;
+    state_.active_trajectory_time_s = 0.0;
+    state_.active_runtime_velocity_scale = std::max(
+        0.0, std::min(1.0, runtime_velocity_scale_.load(std::memory_order_acquire)));
+  }
   publish_snapshot(core::ExecutionState::kExecuting, 0.0, initial_positions);
   update_scene_positions(initial_positions);
 
@@ -266,6 +314,342 @@ core::StopResultDTO RoboPlanExecutionBackend::stop() {
   worker_thread_.request_stop();
   execution_cv_.notify_all();
   return core::StopResultDTO{true, std::nullopt};
+}
+
+// Phase 4.5D-3: controlled-stop capability + result surface.
+//
+// The native simulator supports `kSpringBackHold` and Phase 4.5G
+// `kSoftOnPath`. `kHardDeceleration` is a ros2_control/JTC-only mode in
+// the current scope. Declaring only supported modes keeps the kernel's
+// arm-time gate honest: scopes requesting unsupported modes fail closed
+// before dispatch.
+
+core::MotionInterruptStopCapabilityDTO
+RoboPlanExecutionBackend::get_motion_interrupt_stop_capability() const {
+  core::MotionInterruptStopCapabilityDTO cap;
+  cap.supported_stop_modes = {core::MotionInterruptStopMode::kSpringBackHold,
+                              core::MotionInterruptStopMode::kSoftOnPath};
+  cap.capability_profile_id = "roboplan_native_v2_soft_on_path";
+  core::MotionInterruptSoftOnPathPlannerConfigDTO soft_config;
+  soft_config.stop_traj_delta_s = config_.soft_on_path_stop_traj_delta_s;
+  soft_config.sample_period_s = config_.soft_on_path_sample_period_s;
+  soft_config.max_initial_path_deviation_rad =
+      config_.soft_on_path_max_initial_path_deviation_rad;
+  soft_config.max_initial_velocity_deviation_rad_s =
+      config_.soft_on_path_max_initial_velocity_deviation_rad_s;
+  soft_config.per_joint_max_jerk_rad_s3 =
+      config_.soft_on_path_max_jerk_rad_s3;
+  soft_config.allow_model_velocity_fallback = true;
+  cap.soft_on_path_planner_config = std::move(soft_config);
+  return cap;
+}
+
+core::ControlledStopResultDTO
+RoboPlanExecutionBackend::execute_controlled_stop(
+    const core::MotionInterruptStopProfileDTO& profile) {
+  // Defense in depth: the kernel's arm-time gate already rejects
+  // unsupported modes, but a backend that has been mis-wired into
+  // running the wrong mode at trip time MUST fail closed rather than
+  // silently producing a hold for a path-preserving request.
+  core::ControlledStopResultDTO result;
+  result.executed_stop_mode = profile.stop_mode;
+
+  if (profile.stop_mode == core::MotionInterruptStopMode::kSoftOnPath) {
+    core::TrajectoryDTO active_trajectory;
+    core::ExecutionSnapshot active_snapshot;
+    double active_time_s = 0.0;
+    double active_runtime_scale = 1.0;
+    {
+      std::lock_guard<std::mutex> lock(state_mutex_);
+      active_snapshot = state_.snapshot;
+      if (state_.active_trajectory.has_value()) {
+        active_trajectory = *state_.active_trajectory;
+      }
+      active_time_s = state_.active_trajectory_time_s;
+      active_runtime_scale = state_.active_runtime_velocity_scale;
+    }
+
+    if (active_trajectory.waypoints.empty() ||
+        active_snapshot.joint_positions_rad.empty()) {
+      result.accepted = false;
+      result.backend_stop_confirmed = false;
+      result.error = core::ErrorDTO{
+          std::string(core::kErrorMotionInterruptBackendStopFailed),
+          "native soft_on_path requires an active trajectory and observed state",
+          {{"reason", "soft_on_path_missing_active_trajectory_or_state"},
+           {"backend_capability_profile_id", "roboplan_native_v2_soft_on_path"}}};
+      return result;
+    }
+
+    core::SoftOnPathInitialStateDTO initial;
+    initial.state.joint_names = active_trajectory.joint_names;
+    initial.state.positions_rad = active_snapshot.joint_positions_rad;
+    initial.trajectory_time_from_start_s = active_time_s;
+    initial.position_source = core::SoftOnPathStateSource::kMeasuredFeedback;
+    initial.velocity_source = core::SoftOnPathStateSource::kModelDerived;
+    initial.runtime_velocity_scale_at_trip = active_runtime_scale;
+    initial.sample_age_ns = std::max<std::int64_t>(
+        0, clock_.now() - active_snapshot.timestamp_ns);
+
+    core::SoftOnPathPlannerConfig planner_config;
+    planner_config.stop_traj_delta_s = config_.soft_on_path_stop_traj_delta_s;
+    planner_config.sample_period_s = config_.soft_on_path_sample_period_s;
+    planner_config.allow_model_velocity_fallback = true;
+    planner_config.max_initial_path_deviation_rad =
+        config_.soft_on_path_max_initial_path_deviation_rad;
+    planner_config.max_initial_velocity_deviation_rad_s =
+        config_.soft_on_path_max_initial_velocity_deviation_rad_s;
+    planner_config.per_joint_max_jerk_rad_s3 =
+        config_.soft_on_path_max_jerk_rad_s3;
+
+    auto planned = core::plan_soft_on_path_stop(
+        active_trajectory, profile, initial, planner_config);
+    if (!planned.ok()) {
+      if (profile.allow_natural_completion_on_short_path &&
+          core::soft_on_path_error_recommends_natural_completion(
+              planned.error())) {
+        const auto call_start_ns = clock_.now();
+        const auto wait_deadline_s = profile.max_stop_time_s.value_or(1.0);
+        std::unique_lock<std::mutex> lock(execution_mutex_);
+        const bool completed = execution_cv_.wait_for(
+            lock,
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::duration<double>(wait_deadline_s)),
+            [this]() { return !state_.running.load(); });
+        lock.unlock();
+        const auto call_end_ns = clock_.now();
+        result.confirmation_latency_ns =
+            std::max<std::int64_t>(0, call_end_ns - call_start_ns);
+        result.diagnostics = planned.error().details;
+        result.diagnostics["command_source"] =
+            "native_simulated_natural_completion";
+        result.diagnostics["soft_on_path_phase"] =
+            "4.5G_natural_completion";
+        result.diagnostics["requested_stop_mode"] = "soft_on_path";
+        result.stop_command_source =
+            core::MotionInterruptStopCommandSource::kDiagnosticOther;
+        if (!completed ||
+            get_execution_snapshot().state !=
+                core::ExecutionState::kCompleted) {
+          result.accepted = true;
+          result.backend_stop_confirmed = false;
+          result.error = core::ErrorDTO{
+              std::string(core::kErrorMotionInterruptBackendStopFailed),
+              "native soft_on_path natural completion did not reach the "
+              "trajectory endpoint within max_stop_time_s",
+              {{"reason", "soft_on_path_natural_completion_timeout"},
+               {"deadline_s", std::to_string(wait_deadline_s)}}};
+          return result;
+        }
+        result.accepted = true;
+        result.backend_stop_confirmed = true;
+        result.completed_by_natural_completion = true;
+        return result;
+      }
+      const bool may_fallback = std::find(
+          profile.allowed_fallback_modes.begin(),
+          profile.allowed_fallback_modes.end(),
+          core::MotionInterruptStopMode::kSpringBackHold) !=
+          profile.allowed_fallback_modes.end();
+      if (may_fallback) {
+        core::MotionInterruptStopProfileDTO fallback_profile = profile;
+        fallback_profile.stop_mode = core::MotionInterruptStopMode::kSpringBackHold;
+        auto fallback = execute_controlled_stop(fallback_profile);
+        fallback.executed_stop_mode = core::MotionInterruptStopMode::kSpringBackHold;
+        fallback.fallback_reason = planned.error().details.count("reason") > 0
+                                       ? planned.error().details.at("reason")
+                                       : "soft_on_path_planner_rejected";
+        fallback.diagnostics["requested_stop_mode"] = "soft_on_path";
+        fallback.diagnostics["fallback_reason"] = *fallback.fallback_reason;
+        fallback.diagnostics["soft_on_path_planner_error"] =
+            planned.error().message;
+        return fallback;
+      }
+      result.accepted = false;
+      result.backend_stop_confirmed = false;
+      result.error = planned.error();
+      return result;
+    }
+
+    const auto call_start_ns = clock_.now();
+    state_.pause_requested.store(false);
+    worker_thread_.request_stop();
+    execution_cv_.notify_all();
+    {
+      std::unique_lock<std::mutex> lock(execution_mutex_);
+      const bool stopped = execution_cv_.wait_for(
+          lock,
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::duration<double>(profile.max_stop_time_s.value_or(1.0))),
+          [this]() { return !state_.running.load(); });
+      if (!stopped) {
+        result.accepted = true;
+        result.backend_stop_confirmed = false;
+        result.error = core::ErrorDTO{
+            std::string(core::kErrorMotionInterruptBackendStopFailed),
+            "worker did not yield to native soft_on_path before deadline",
+            {{"reason", "soft_on_path_worker_stop_timeout"}}};
+        return result;
+      }
+    }
+
+    const auto& replacement = planned.value().replacement_trajectory;
+    state_.running.store(true);
+    const auto steady_start = std::chrono::steady_clock::now();
+    const double total_time_s =
+        replacement.waypoints.empty()
+            ? 0.0
+            : replacement.waypoints.back().time_from_start_s;
+    for (const auto& waypoint : replacement.waypoints) {
+      const auto wake_time =
+          steady_start + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                             std::chrono::duration<double>(waypoint.time_from_start_s));
+      std::this_thread::sleep_until(wake_time);
+      const double progress =
+          total_time_s <= 1e-9
+              ? 1.0
+              : clamp_progress(waypoint.time_from_start_s / total_time_s);
+      update_scene_positions(waypoint.positions_rad);
+      publish_snapshot(core::ExecutionState::kStopping,
+                       progress,
+                       waypoint.positions_rad);
+    }
+
+    const auto call_end_ns = clock_.now();
+    const auto& final_wp = replacement.waypoints.back();
+    publish_snapshot(core::ExecutionState::kStopped, 1.0, final_wp.positions_rad);
+    update_scene_positions(final_wp.positions_rad);
+    state_.running.store(false);
+    execution_cv_.notify_all();
+
+    result.accepted = true;
+    result.backend_stop_confirmed = true;
+    result.executed_stop_mode = core::MotionInterruptStopMode::kSoftOnPath;
+    result.stop_command_source =
+        core::MotionInterruptStopCommandSource::kNativeSimulatedPathRamp;
+    result.confirmation_latency_ns =
+        std::max<std::int64_t>(0, call_end_ns - call_start_ns);
+    result.path_deviation_max_rad = planned.value().path_deviation_max_rad;
+    result.initial_path_deviation_rad =
+        planned.value().initial_path_deviation_rad;
+    result.stop_distance_rad = 0.0;
+    if (!active_snapshot.joint_positions_rad.empty() &&
+        final_wp.positions_rad.size() == active_snapshot.joint_positions_rad.size()) {
+      double sum = 0.0;
+      for (size_t i = 0; i < final_wp.positions_rad.size(); ++i) {
+        const double d = final_wp.positions_rad[i] -
+                         active_snapshot.joint_positions_rad[i];
+        sum += d * d;
+      }
+      result.stop_distance_rad = std::sqrt(sum);
+    }
+    result.diagnostics = planned.value().diagnostics;
+    result.diagnostics["command_source"] = "native_simulated_path_ramp";
+    result.diagnostics["runtime_scale_isolated"] = "true";
+    result.diagnostics["soft_on_path_phase"] = "4.5G_native";
+    return result;
+  }
+
+  if (profile.stop_mode != core::MotionInterruptStopMode::kSpringBackHold) {
+    result.accepted = false;
+    result.backend_stop_confirmed = false;
+    result.error = core::ErrorDTO{
+        std::string(core::kErrorMotionInterruptBackendStopFailed),
+        "RoboPlanExecutionBackend supports only kSpringBackHold and kSoftOnPath in v2",
+        {{"reason", "stop_mode_not_supported_by_backend"},
+         {"backend_capability_profile_id", "roboplan_native_v2_soft_on_path"}}};
+    return result;
+  }
+
+  // Capture observed joint positions BEFORE requesting the worker to
+  // stop so the recorded anchor reflects the kernel's pre-stop trip
+  // sample, not whatever the worker happens to publish after the
+  // stop_requested flag fires. `latest_positions` inside the worker
+  // is updated on every tick; reading the published snapshot here is
+  // the closest the native simulator has to "controller terminal
+  // result confirmation."
+  std::vector<double> observed_anchor;
+  {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    observed_anchor = state_.snapshot.joint_positions_rad;
+  }
+
+  // If no execution is in flight, there's nothing to preempt. The
+  // kernel never calls this without an active trip, but defense in
+  // depth handles the case anyway.
+  if (!state_.running.load()) {
+    if (observed_anchor.empty()) {
+      result.accepted = false;
+      result.backend_stop_confirmed = false;
+      result.error = core::ErrorDTO{
+          std::string(core::kErrorMotionInterruptBackendStopFailed),
+          "execute_controlled_stop invoked with no execution in flight "
+          "and no recorded observed state",
+          {{"reason", "controlled_stop_no_observed_state"}}};
+      return result;
+    }
+    // Already stopped with a recorded anchor: report immediate
+    // confirmation. This collapses to the "spring-back to here" path
+    // when the trip latch arrives right as the worker is winding down.
+    result.accepted = true;
+    result.backend_stop_confirmed = true;
+    result.stop_command_source =
+        core::MotionInterruptStopCommandSource::kNativeSimulatedStop;
+    result.confirmation_latency_ns = 0;
+    return result;
+  }
+
+  const auto call_start_ns = clock_.now();
+  // Request the worker to stop. The worker's stop_token wakes it,
+  // it publishes a kStopped snapshot at its current observed
+  // position, then clears `state_.running`.
+  state_.pause_requested.store(false);
+  worker_thread_.request_stop();
+  execution_cv_.notify_all();
+
+  // Wait bounded by the profile's max_stop_time_s when set; the
+  // ExecutionKernelConfig default fallback is applied by the kernel
+  // before this method is called (the kernel enforces deadline
+  // overflow on top of whatever value the backend reports). Default
+  // backend wait is 1 s which exceeds the 500 ms kernel default so
+  // the kernel's enforcement always wins; we still bound here to
+  // avoid pinning the kernel's worker forever on a misbehaving
+  // simulator stop.
+  const auto wait_deadline_s =
+      profile.max_stop_time_s.value_or(1.0);
+  std::unique_lock<std::mutex> lock(execution_mutex_);
+  const bool stopped = execution_cv_.wait_for(
+      lock,
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::duration<double>(wait_deadline_s)),
+      [this]() { return !state_.running.load(); });
+  lock.unlock();
+
+  const auto call_end_ns = clock_.now();
+  result.confirmation_latency_ns = std::max<std::int64_t>(0, call_end_ns -
+                                                                 call_start_ns);
+
+  if (!stopped) {
+    result.accepted = true;  // command was accepted (worker was notified)
+    result.backend_stop_confirmed = false;
+    result.error = core::ErrorDTO{
+        std::string(core::kErrorMotionInterruptBackendStopFailed),
+        "worker did not exit within the controlled-stop deadline",
+        {{"reason", "backend_stop_not_confirmed"},
+         {"deadline_s", std::to_string(wait_deadline_s)}}};
+    return result;
+  }
+
+  // Worker stopped. The post-stop snapshot already carries the
+  // observed joint positions at the moment the worker exited the
+  // execution loop (publish_snapshot was called with state=kStopped
+  // and the latest interpolated positions). The kernel's snapshot
+  // capture pulls that via get_execution_snapshot().
+  result.accepted = true;
+  result.backend_stop_confirmed = true;
+  result.stop_command_source =
+      core::MotionInterruptStopCommandSource::kNativeSimulatedStop;
+  return result;
 }
 
 core::PauseResultDTO RoboPlanExecutionBackend::pause() {
@@ -377,6 +761,12 @@ core::ResetResultDTO RoboPlanExecutionBackend::reset() {
                {"phase", "execution_worker_reset"},
                {"timeout_s", seconds_string(reset_timeout)}}}};
     }
+  }
+  {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    state_.active_trajectory.reset();
+    state_.active_trajectory_time_s = 0.0;
+    state_.active_runtime_velocity_scale = 1.0;
   }
   publish_snapshot(core::ExecutionState::kIdle, 0.0, {});
   return core::ResetResultDTO{true, std::nullopt};

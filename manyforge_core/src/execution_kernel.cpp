@@ -1,5 +1,7 @@
 #include <manyforge_core/execution_kernel.hpp>
 
+#include <manyforge_core/motion_interrupt/soft_on_path_stop_planner.hpp>
+
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -142,6 +144,24 @@ ErrorCode error_code_from_dto(const ErrorDTO& error) {
   }
   if (error.code == kErrorInvariantViolation) {
     return ErrorCode::kInvariantViolation;
+  }
+  // Phase 4.5C motion-scoped outcomes (spec/210 §5.2): each
+  // motion-interrupt error has its own ErrorCode so the state-machine
+  // `last_error` surface distinguishes them rather than collapsing all
+  // motion-interrupt failures to `internal_error`. Audit / release
+  // evidence relies on the state-machine code, not just the outcome
+  // DTO, to classify a terminal execution.
+  if (error.code == kErrorMotionInterruptArmFailed) {
+    return ErrorCode::kMotionInterruptArmFailed;
+  }
+  if (error.code == kErrorMotionInterruptSourceActiveAtArm) {
+    return ErrorCode::kMotionInterruptSourceActiveAtArm;
+  }
+  if (error.code == kErrorMotionInterruptBackendStopFailed) {
+    return ErrorCode::kMotionInterruptBackendStopFailed;
+  }
+  if (error.code == kErrorMotionInterruptStopStateInvalid) {
+    return ErrorCode::kMotionInterruptStopStateInvalid;
   }
   return ErrorCode::kInternalError;
 }
@@ -546,6 +566,19 @@ std::optional<KernelEventType> interrupt_event_type_from_name(
        KernelEventType::kInterruptRecoveryHandlerStarted},
       {"interrupt_recovery_handler_completed",
        KernelEventType::kInterruptRecoveryHandlerCompleted},
+      // Phase 4.5C/4.5B: motion-scoped interrupt event surface
+      // (spec/260 §7). Manager emits the names; the kernel maps them
+      // to typed events for subscribers (Composer, BT runtime, audit).
+      {"motion_interrupt_scope_armed",
+       KernelEventType::kMotionInterruptScopeArmed},
+      {"motion_interrupt_scope_reaped",
+       KernelEventType::kMotionInterruptScopeReaped},
+      {"motion_interrupt_queued_update_dropped",
+       KernelEventType::kMotionInterruptQueuedUpdateDropped},
+      {"motion_trip_secondary_signal",
+       KernelEventType::kMotionTripSecondarySignal},
+      {"motion_trip_failed", KernelEventType::kMotionTripFailed},
+      {"motion_trip_completed", KernelEventType::kMotionTripCompleted},
   };
   const auto it = kMap.find(name);
   if (it == kMap.end()) {
@@ -1294,6 +1327,806 @@ void ExecutionKernel::emit_interrupt_events(const InterruptIngestResult& result)
   }
 }
 
+void ExecutionKernel::emit_interrupt_manager_events(
+    const std::vector<InterruptManagerEvent>& events,
+    std::uint64_t execution_id) {
+  for (const auto& event : events) {
+    auto event_type = interrupt_event_type_from_name(event.type);
+    if (!event_type) {
+      continue;
+    }
+    emit_event({*event_type, execution_id, clock_.now(), {}, {},
+                std::nullopt, event.details});
+  }
+}
+
+namespace {
+
+const char* terminal_cause_string(MotionExecutionTerminalCause cause) {
+  switch (cause) {
+    using enum MotionExecutionTerminalCause;
+    case kCompletedNormally: return "completed_normally";
+    case kSignalTrip: return "signal_trip";
+    case kNoSignalTrip: return "no_signal_trip";
+    case kStopped: return "stopped";
+    case kFailed: return "failed";
+    case kInterruptedFault: return "interrupted_fault";
+  }
+  return "unknown";
+}
+
+SoftOnPathPlannerConfig soft_on_path_planner_config_from_capability(
+    const MotionInterruptStopCapabilityDTO& capability) {
+  SoftOnPathPlannerConfig config;
+  if (!capability.soft_on_path_planner_config.has_value()) {
+    return config;
+  }
+  const auto& declared = *capability.soft_on_path_planner_config;
+  config.stop_traj_delta_s = declared.stop_traj_delta_s;
+  config.sample_period_s = declared.sample_period_s;
+  config.allow_model_velocity_fallback =
+      declared.allow_model_velocity_fallback;
+  config.max_initial_path_deviation_rad =
+      declared.max_initial_path_deviation_rad;
+  config.max_initial_velocity_deviation_rad_s =
+      declared.max_initial_velocity_deviation_rad_s;
+  config.per_joint_max_jerk_rad_s3 =
+      declared.per_joint_max_jerk_rad_s3;
+  return config;
+}
+
+}  // namespace
+
+Result<void> ExecutionKernel::arm_motion_scopes_for_dispatch(
+    const ExecuteRequestDTO& request,
+    const TrajectoryDTO& trajectory,
+    std::uint64_t execution_id,
+    ActiveMotionExecution& motion_state) {
+  motion_state.execution_id = execution_id;
+  motion_state.move_id = request.move_id;
+  motion_state.had_scopes = !request.motion_interrupt_scopes.empty();
+  motion_state.arm_succeeded = false;
+  motion_state.motion_trip_latch.reset();
+  motion_state.outcome_emitted = false;
+  if (!motion_state.had_scopes) {
+    return Result<void>::Ok();
+  }
+  // Phase 4.5D-1 (spec/260 §5.6 dual-boundary capability validation):
+  // pre-dispatch backend-capability check. The InterruptManager
+  // validates policy-level constraints (allowed_stop_modes,
+  // node-category fallback rules, stop_profile presence). The
+  // backend's controlled-stop capability is the second independent
+  // gate: every requested stop_mode and every element of
+  // allowed_fallback_modes MUST also be in the backend's
+  // supported_stop_modes set. Trip-time validation in 4.5D-2+ will
+  // catch live-controller divergence; this gate stops the request
+  // before arming if the backend has not declared support.
+  const auto capability =
+      execution_backend_.get_motion_interrupt_stop_capability();
+  for (const auto& scope : request.motion_interrupt_scopes) {
+    if (!scope.stop_profile) {
+      // Manager will reject this with stop_profile_required if the
+      // bound policy is complete_move_on_signal; otherwise the
+      // backend gate has nothing to check.
+      continue;
+    }
+    const auto& profile = *scope.stop_profile;
+    if (!capability.supported_stop_modes.contains(profile.stop_mode)) {
+      return Result<void>::Err(ErrorDTO{
+          kErrorMotionInterruptArmFailed,
+          "requested stop_mode is not in backend supported_stop_modes",
+          {{"reason", "stop_mode_not_supported_by_backend"},
+           {"scope_id", scope.scope_id},
+           {"policy_id", scope.policy_id}}});
+    }
+    for (const auto& fallback : profile.allowed_fallback_modes) {
+      if (!capability.supported_stop_modes.contains(fallback)) {
+        return Result<void>::Err(ErrorDTO{
+            kErrorMotionInterruptArmFailed,
+            "allowed_fallback_modes entry is not in backend supported_stop_modes",
+            {{"reason", "fallback_mode_not_supported_by_backend"},
+             {"scope_id", scope.scope_id},
+             {"policy_id", scope.policy_id}}});
+      }
+    }
+    if (profile.stop_mode == MotionInterruptStopMode::kSoftOnPath) {
+      const auto planner_config =
+          soft_on_path_planner_config_from_capability(capability);
+      const auto envelope = validate_soft_on_path_feasibility_envelope(
+          trajectory, profile, planner_config);
+      if (!envelope.ok()) {
+        ErrorDTO error = envelope.error();
+        error.code = kErrorMotionInterruptArmFailed;
+        error.details["scope_id"] = scope.scope_id;
+        error.details["policy_id"] = scope.policy_id;
+        const bool recommends_spring_back =
+            error.details.contains("recommended_fallback") &&
+            error.details.at("recommended_fallback") == "spring_back_hold";
+        const bool allows_spring_back =
+            std::find(profile.allowed_fallback_modes.begin(),
+                      profile.allowed_fallback_modes.end(),
+                      MotionInterruptStopMode::kSpringBackHold) !=
+            profile.allowed_fallback_modes.end();
+        if (!recommends_spring_back || !allows_spring_back) {
+          return Result<void>::Err(std::move(error));
+        }
+      }
+    }
+  }
+  auto arm = interrupt_manager_.arm_motion_interrupt_scopes(
+      execution_id, request.move_id,
+      request.motion_interrupt_scopes, clock_.now());
+  if (!arm.ok()) {
+    // Promote the manager's `details["reason"]` (e.g.
+    // `motion_interrupt_arm_failed`, `motion_interrupt_source_active_at_arm`)
+    // to the canonical ErrorDTO.code. The manager wraps every error as
+    // `invalid_request` for legacy callers, but spec/210 §5.2 treats the
+    // motion-interrupt identifiers as first-class error codes. Without
+    // this promotion, `error_code_from_dto` collapses every arm failure
+    // to `kInvalidRequest` and the state-machine surface loses fidelity.
+    ErrorDTO err = arm.error();
+    if (err.details.contains("reason")) {
+      const auto& reason = err.details.at("reason");
+      if (reason.rfind("motion_interrupt_", 0) == 0) {
+        err.code = reason;
+      }
+    }
+    emit_event({KernelEventType::kMotionInterruptArmFailed,
+                execution_id, clock_.now(), {}, {}, err,
+                {{"move_id", request.move_id},
+                 {"reason",
+                  err.details.contains("reason")
+                      ? err.details.at("reason")
+                      : err.code}}});
+    return Result<void>::Err(std::move(err));
+  }
+  // Surface scope_armed events; the manager has already validated each
+  // binding atomically, so we just relay.
+  emit_interrupt_manager_events(arm.value().events, execution_id);
+  motion_state.arm_succeeded = true;
+  return Result<void>::Ok();
+}
+
+void ExecutionKernel::finalize_motion_execution_outcome(
+    ActiveMotionExecution& motion_state,
+    MotionExecutionTerminalCause terminal_cause,
+    std::optional<ErrorDTO> error,
+    std::optional<MotionTripOutcomeDTO> trip,
+    std::string reap_reason) {
+  if (motion_state.outcome_emitted || motion_state.execution_id == 0) {
+    return;
+  }
+  motion_state.outcome_emitted = true;
+
+  // Reap any armed bindings for this execution before publishing the
+  // outcome. Reaping always runs even if no scopes were carried —
+  // cheap when the binding map is empty and keeps the invariant that
+  // every execution_id terminates with a clean binding table.
+  if (motion_state.arm_succeeded) {
+    auto reap = interrupt_manager_.reap_motion_interrupt_scopes(
+        motion_state.execution_id, reap_reason, clock_.now());
+    emit_interrupt_manager_events(reap.events, motion_state.execution_id);
+  }
+
+  // Invariant enforcement (spec/210 §3.11). The kernel publishes one
+  // immutable outcome per terminal execution; mis-shaped requests are
+  // coerced to the closest valid taxonomy AND logged via a kErrorRaised
+  // event so the operator surface sees the coercion in audit.
+  MotionExecutionOutcomeDTO outcome;
+  outcome.execution_id = motion_state.execution_id;
+  outcome.move_id = motion_state.move_id;
+  outcome.terminal_cause = terminal_cause;
+
+  const auto coerce = [&](MotionExecutionTerminalCause to,
+                           const char* reason) {
+    emit_event({KernelEventType::kErrorRaised,
+                motion_state.execution_id, clock_.now(), {}, {},
+                ErrorDTO{kErrorInvariantViolation,
+                         "motion outcome coerced", {{"reason", reason}}},
+                {{"from", terminal_cause_string(outcome.terminal_cause)},
+                 {"to", terminal_cause_string(to)}}});
+    outcome.terminal_cause = to;
+  };
+
+  switch (outcome.terminal_cause) {
+    using enum MotionExecutionTerminalCause;
+    case kSignalTrip:
+      if (!trip || error) {
+        coerce(kFailed, "signal_trip_requires_trip_and_forbids_error");
+      }
+      break;
+    case kNoSignalTrip:
+      if (!motion_state.had_scopes) {
+        coerce(kCompletedNormally, "no_signal_trip_requires_scopes");
+      }
+      if (trip || error) {
+        coerce(kFailed, "no_signal_trip_forbids_trip_and_error");
+      }
+      break;
+    case kCompletedNormally:
+      if (motion_state.had_scopes) {
+        // Reached endpoint with scopes but no trip → no_signal_trip.
+        outcome.terminal_cause = kNoSignalTrip;
+      }
+      if (trip || error) {
+        coerce(kFailed, "completed_normally_forbids_trip_and_error");
+      }
+      break;
+    case kStopped:
+    case kInterruptedFault:
+      if (trip || error) {
+        coerce(kFailed, "terminal_cause_forbids_trip_and_error");
+      }
+      break;
+    case kFailed:
+      if (!error) {
+        error = ErrorDTO{kErrorInternalError,
+                         "Motion execution failed without a captured error",
+                         {{"reason", "missing_error_on_failed_outcome"}}};
+      }
+      break;
+  }
+
+  if (outcome.terminal_cause == MotionExecutionTerminalCause::kSignalTrip) {
+    outcome.trip = std::move(trip);
+  } else if (outcome.terminal_cause == MotionExecutionTerminalCause::kFailed) {
+    outcome.error = std::move(error);
+  }
+
+  // Store and evict FIFO when over the retention bound.
+  {
+    std::lock_guard<std::mutex> lock(motion_outcomes_mutex_);
+    motion_execution_outcomes_.insert_or_assign(
+        outcome.execution_id, outcome);
+    motion_outcome_order_.push_back(outcome.execution_id);
+    while (motion_outcome_order_.size() >
+           config_.motion_execution_outcome_retention) {
+      const auto evict_id = motion_outcome_order_.front();
+      motion_outcome_order_.erase(motion_outcome_order_.begin());
+      motion_execution_outcomes_.erase(evict_id);
+    }
+  }
+
+  std::map<std::string, std::string> details{
+      {"execution_id", std::to_string(outcome.execution_id)},
+      {"move_id", outcome.move_id},
+      {"terminal_cause", terminal_cause_string(outcome.terminal_cause)},
+      {"had_scopes", motion_state.had_scopes ? "true" : "false"},
+      {"arm_succeeded", motion_state.arm_succeeded ? "true" : "false"},
+  };
+  if (outcome.trip) {
+    details.emplace("latch_id", outcome.trip->latch_id);
+    details.emplace("source_id", outcome.trip->source_id);
+    details.emplace("policy_id", outcome.trip->policy_id);
+    details.emplace("scope_id", outcome.trip->scope_id);
+  }
+  if (outcome.error) {
+    details.emplace("error_code", outcome.error->code);
+    if (outcome.error->details.contains("reason")) {
+      details.emplace("error_reason", outcome.error->details.at("reason"));
+    }
+  }
+  emit_event({KernelEventType::kMotionExecutionOutcomeRecorded,
+              outcome.execution_id, clock_.now(), {}, {}, outcome.error,
+              std::move(details)});
+}
+
+namespace {
+
+const char* stop_mode_string(MotionInterruptStopMode mode) {
+  switch (mode) {
+    using enum MotionInterruptStopMode;
+    case kSpringBackHold: return "spring_back_hold";
+    case kSoftOnPath: return "soft_on_path";
+    case kHardDeceleration: return "hard_deceleration";
+  }
+  return "unknown";
+}
+
+const char* stop_command_source_string(MotionInterruptStopCommandSource s) {
+  switch (s) {
+    using enum MotionInterruptStopCommandSource;
+    case kFjtPreemptHold: return "fjt_preempt_hold";
+    case kFjtPreemptPathRamp: return "fjt_preempt_path_ramp";
+    case kJtcSpeedScalingRamp: return "jtc_speed_scaling_ramp";
+    case kJtcCancelDecelerateOnCancel: return "jtc_cancel_decelerate_on_cancel";
+    case kNativeSimulatedStop: return "native_simulated_stop";
+    case kNativeSimulatedPathRamp: return "native_simulated_path_ramp";
+    case kRobotNativeStop: return "robot_native_stop";
+    case kDiagnosticOther: return "diagnostic_other";
+  }
+  return "unknown";
+}
+
+struct StopFallbackQualificationRow {
+  MotionInterruptStopMode requested;
+  MotionInterruptStopMode executed;
+  MotionInterruptNodeCategory node_category;
+  std::array<MotionInterruptStopCommandSource, 3> allowed_command_sources;
+  std::size_t allowed_command_source_count;
+  const char* qualification_id;
+  const char* rationale;
+  const char* telemetry;
+  const char* evidence_status;
+};
+
+constexpr std::array<StopFallbackQualificationRow, 1>
+    kStopFallbackQualificationMatrix{{
+        {MotionInterruptStopMode::kSoftOnPath,
+         MotionInterruptStopMode::kSpringBackHold,
+         MotionInterruptNodeCategory::kGeneric,
+         {MotionInterruptStopCommandSource::kDiagnosticOther,
+          MotionInterruptStopCommandSource::kFjtPreemptHold,
+          MotionInterruptStopCommandSource::kNativeSimulatedStop},
+         3,
+         "4.5G-soft_on_path-to-spring_back_hold-generic-v1",
+         "path-preserving ramp unavailable; generic node accepts observed-state halt",
+         "fallback_reason, requested/executed modes, command source, stop snapshot, stop timing",
+         "in_tree_qualified; live_adapter_evidence_required_for_release"},
+    }};
+
+const StopFallbackQualificationRow* qualified_stop_fallback_pair(
+    MotionInterruptStopMode requested,
+    MotionInterruptStopMode executed,
+    MotionInterruptNodeCategory node_category) {
+  for (const auto& row : kStopFallbackQualificationMatrix) {
+    if (row.requested == requested && row.executed == executed &&
+        row.node_category == node_category) {
+      return &row;
+    }
+  }
+  return nullptr;
+}
+
+bool fallback_row_allows_command_source(
+    const StopFallbackQualificationRow& row,
+    MotionInterruptStopCommandSource source) {
+  for (std::size_t i = 0; i < row.allowed_command_source_count; ++i) {
+    if (row.allowed_command_sources[i] == source) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/// Spec/210 §3.7 RobotStateDTO size/ordering invariant: joint_names and
+/// positions_rad MUST have the same non-zero length and no empty
+/// joint names. Used as the spec/210 §3.11 ExecutionStopSnapshotDTO
+/// validation gate.
+bool robot_state_size_ordering_ok(const RobotStateDTO& state) {
+  if (state.joint_names.empty()) {
+    return false;
+  }
+  if (state.joint_names.size() != state.positions_rad.size()) {
+    return false;
+  }
+  for (const auto& name : state.joint_names) {
+    if (name.empty()) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/// Spec/210 §3.11 ExecutionStopSnapshotDTO source-priority capture.
+/// Phase 4.5D-2 (codex review follow-up): the post-stop snapshot is
+/// fetched FRESH after the backend confirms the controlled stop and
+/// `joint_names` are recovered from the planning context so spec/210
+/// §3.7 size/ordering validation can actually run.
+///
+/// Returns the snapshot if validation succeeds; populates
+/// `failure_reason` when the snapshot is invalid for the node category
+/// (e.g. `planning_context_state` source for a precision-contact node,
+/// or invalid `robot_state`).
+std::optional<ExecutionStopSnapshotDTO> capture_stop_snapshot(
+    const ExecutionSnapshot& post_stop_backend_snapshot,
+    const std::optional<RobotStateDTO>& planning_context_state,
+    bool backend_stop_confirmed,
+    MotionInterruptNodeCategory node_category,
+    std::int64_t captured_at_ns,
+    std::string& failure_reason) {
+  ExecutionStopSnapshotDTO snap;
+  snap.captured_at_ns = captured_at_ns;
+  snap.backend_stop_confirmed = backend_stop_confirmed;
+
+  // Priority 1: execution-backend feedback (preferred). Joint names
+  // come from the planning context (the IExecutionBackend's snapshot
+  // DTO does not carry them); we MUST be able to align name-by-name
+  // for spec/210 §3.7 validation.
+  if (!post_stop_backend_snapshot.joint_positions_rad.empty() &&
+      planning_context_state &&
+      planning_context_state->joint_names.size() ==
+          post_stop_backend_snapshot.joint_positions_rad.size()) {
+    snap.source = ExecutionStopSnapshotSource::kExecutionBackendFeedback;
+    snap.robot_state.joint_names = planning_context_state->joint_names;
+    snap.robot_state.positions_rad =
+        post_stop_backend_snapshot.joint_positions_rad;
+    if (post_stop_backend_snapshot.progress > 0.0 &&
+        post_stop_backend_snapshot.progress <= 1.0) {
+      snap.trajectory_progress = post_stop_backend_snapshot.progress;
+    }
+    if (!robot_state_size_ordering_ok(snap.robot_state)) {
+      failure_reason = "stop_snapshot_robot_state_size_ordering_invalid";
+      return std::nullopt;
+    }
+    return snap;
+  }
+
+  // Priority 2: kernel execution snapshot. Same source path as
+  // Priority 1 — the worker's `get_execution_snapshot()` proxies the
+  // backend's snapshot — but if the backend snapshot was unusable we
+  // fall through to the planning-context fallback rather than
+  // synthesizing a partial RobotStateDTO.
+
+  // Priority 3: planning-context state is rejected for precision-
+  // contact node categories (spec/210 §3.11 ExecutionStopSnapshotDTO
+  // semantic rules). Generic nodes may accept it as a last resort
+  // when the backend snapshot is unusable.
+  if (node_category == MotionInterruptNodeCategory::kPrecisionContact) {
+    failure_reason = "stop_snapshot_planning_context_rejected_for_precision_contact";
+    return std::nullopt;
+  }
+  if (planning_context_state) {
+    snap.source = ExecutionStopSnapshotSource::kPlanningContextState;
+    snap.robot_state = *planning_context_state;
+    if (!robot_state_size_ordering_ok(snap.robot_state)) {
+      failure_reason = "stop_snapshot_robot_state_size_ordering_invalid";
+      return std::nullopt;
+    }
+    return snap;
+  }
+  failure_reason = "stop_snapshot_no_usable_state_available";
+  return std::nullopt;
+}
+
+}  // namespace
+
+void ExecutionKernel::handle_motion_trip_latch(
+    const ExecuteRequestDTO& request,
+    const InterruptLatch& latch,
+    std::uint64_t exec_id,
+    const ExecutionSnapshot& /*latest_backend_snapshot*/,
+    ActiveMotionExecution& motion_state) {
+  // Locate the originating scope so we can recover the
+  // MotionInterruptStopProfileDTO and node_category. The latch carries
+  // the scope id; the request carries the scope vector. A trip latch
+  // without a matching scope is a manager invariant violation and is
+  // treated as a backend stop failure (intervention path: the robot
+  // state is uncertain).
+  motion_state.motion_trip_latch = latch;
+  stop_collision_monitoring();
+  const MotionInterruptScopeDTO* matching_scope = nullptr;
+  if (latch.motion_interrupt_scope_id) {
+    for (const auto& s : request.motion_interrupt_scopes) {
+      if (s.scope_id == *latch.motion_interrupt_scope_id) {
+        matching_scope = &s;
+        break;
+      }
+    }
+  }
+  if (!matching_scope || !matching_scope->stop_profile) {
+    const auto prev_state_trip = sm_.status().state;
+    sm_.set_last_error(ErrorCode::kMotionInterruptBackendStopFailed);
+    if (prev_state_trip == ExecutionState::kInterrupted) {
+      sm_.try_transition(ExecutionState::kStopping);
+    }
+    sm_.try_transition(ExecutionState::kInterventionRequired);
+    ErrorDTO err{
+        kErrorMotionInterruptBackendStopFailed,
+        "complete_move_on_signal latch missing matching scope/stop_profile",
+        {{"reason", "motion_interrupt_scope_lookup_failed"},
+         {"latch_id", latch.latch_id}}};
+    emit_event({KernelEventType::kErrorRaised, exec_id, clock_.now(),
+                 {}, {}, err, {}});
+    emit_event({KernelEventType::kStateTransition, exec_id, clock_.now(),
+                 prev_state_trip, ExecutionState::kInterventionRequired,
+                 std::nullopt, {}});
+    finalize_motion_execution_outcome(
+        motion_state, MotionExecutionTerminalCause::kFailed,
+        std::move(err), std::nullopt, "motion_trip_scope_lookup_failed");
+    // Latch persists for operator intervention-acknowledge; do NOT
+    // auto-clear on this failure path.
+    return;
+  }
+  const auto& profile = *matching_scope->stop_profile;
+  const auto node_category = matching_scope->node_category;
+
+  // Move kernel to Stopping while the controlled stop is in flight.
+  // The latch remains visible; spec/230 §3.4 forbids parking in
+  // Interrupted during the controlled-stop window.
+  const auto prev_state_trip = sm_.status().state;
+  if (prev_state_trip == ExecutionState::kInterrupted) {
+    auto t = sm_.try_transition(ExecutionState::kStopping);
+    if (t.ok()) {
+      emit_event({KernelEventType::kStateTransition, exec_id, clock_.now(),
+                   prev_state_trip, ExecutionState::kStopping,
+                   std::nullopt,
+                   {{"reason", "motion_interrupt_trip_controlled_stop"}}});
+    }
+  }
+
+  // Issue the controlled stop. The backend performs the stop and
+  // reports what it actually did. Timing is captured around the call
+  // so the kernel can validate against `max_stop_time_s` (with the
+  // deployment default `complete_move_on_signal_timeout_ns` as the
+  // fallback when the scope leaves the field unset) and embed
+  // latch->call and call->confirm latencies in the trip outcome.
+  const auto call_start_ns = clock_.now();
+  auto stop_result = execution_backend_.execute_controlled_stop(profile);
+  const auto call_end_ns = clock_.now();
+
+  // Common failure-path downgrader. Industrial behavior (spec/230
+  // §3.4 lines 563-564): backend-stop and stop-snapshot failures
+  // transition to `InterventionRequired`, not `Failed`. The latch
+  // persists for operator/runtime intervention-acknowledge; it is
+  // NOT auto-cleared on the failure paths. The outcome record's
+  // `terminal_cause` is still `failed` per spec/210 §3.11.
+  const auto downgrade_to_intervention =
+      [&](std::string reason, std::string message,
+          std::string error_code = std::string(
+              kErrorMotionInterruptBackendStopFailed)) {
+        sm_.set_last_error(
+            error_code == kErrorMotionInterruptStopStateInvalid
+                ? ErrorCode::kMotionInterruptStopStateInvalid
+                : ErrorCode::kMotionInterruptBackendStopFailed);
+        const auto prev = sm_.status().state;
+        sm_.try_transition(ExecutionState::kInterventionRequired);
+        ErrorDTO err{
+            std::move(error_code), std::move(message),
+            {{"reason", std::move(reason)},
+             {"latch_id", latch.latch_id},
+             {"source_id", latch.source_id},
+             {"policy_id", latch.policy_id},
+             {"requested_stop_mode", stop_mode_string(profile.stop_mode)},
+             {"executed_stop_mode",
+              stop_mode_string(stop_result.executed_stop_mode)}}};
+        emit_event({KernelEventType::kMotionTripFailed, exec_id,
+                     clock_.now(), {}, {}, err, err.details});
+        emit_event({KernelEventType::kStateTransition, exec_id, clock_.now(),
+                     prev, ExecutionState::kInterventionRequired,
+                     std::nullopt, {}});
+        finalize_motion_execution_outcome(
+            motion_state, MotionExecutionTerminalCause::kFailed,
+            std::move(err), std::nullopt, "motion_trip_failed");
+        // Latch persists. Do NOT auto-clear.
+      };
+
+  const std::int64_t effective_deadline_ns =
+      profile.max_stop_time_s
+          ? static_cast<std::int64_t>(*profile.max_stop_time_s * 1e9)
+          : config_.complete_move_on_signal_timeout_ns;
+
+  // Phase 4.5G short-path policy: a generic soft_on_path scope may
+  // explicitly allow the original trajectory to complete naturally
+  // when a useful wall-time replacement ramp would overshoot the
+  // accepted endpoint. This is NOT a successful controlled stop; the
+  // terminal outcome remains no_signal_trip semantics after the
+  // backend proves the original motion is terminal. Precision-contact
+  // nodes and profiles without the explicit policy fail closed.
+  if (stop_result.completed_by_natural_completion) {
+    if (profile.stop_mode != MotionInterruptStopMode::kSoftOnPath ||
+        !profile.allow_natural_completion_on_short_path ||
+        node_category == MotionInterruptNodeCategory::kPrecisionContact ||
+        !stop_result.accepted || stop_result.error.has_value()) {
+      downgrade_to_intervention(
+          "natural_completion_not_allowed_for_scope",
+          "backend reported natural completion for a scope that cannot "
+          "accept short-path natural completion");
+      return;
+    }
+    if (effective_deadline_ns > 0 &&
+        stop_result.confirmation_latency_ns > effective_deadline_ns) {
+      downgrade_to_intervention(
+          "natural_completion_exceeded_max_stop_time_s",
+          "soft_on_path natural completion exceeded max_stop_time_s");
+      return;
+    }
+
+    sm_.try_transition(ExecutionState::kCompleted);
+    emit_event({KernelEventType::kStateTransition, exec_id, clock_.now(),
+                ExecutionState::kStopping, ExecutionState::kCompleted,
+                std::nullopt,
+                {{"reason", "motion_trip_short_path_natural_completion"},
+                 {"latch_id", latch.latch_id},
+                 {"scope_id", latch.motion_interrupt_scope_id.value_or("")},
+                 {"requested_stop_mode", stop_mode_string(profile.stop_mode)}}});
+    finalize_motion_execution_outcome(
+        motion_state, MotionExecutionTerminalCause::kNoSignalTrip,
+        std::nullopt, std::nullopt, "motion_trip_natural_completion");
+    (void)interrupt_manager_.clear_active_latch(
+        "auto_clear_after_motion_outcome", clock_.now());
+    return;
+  }
+
+  // (1) Backend accepted the call.
+  if (!stop_result.accepted) {
+    auto reason = stop_result.error && stop_result.error->details.contains(
+                                            "reason")
+                      ? stop_result.error->details.at("reason")
+                      : std::string("controlled_stop_not_accepted");
+    auto msg = stop_result.error ? stop_result.error->message
+                                  : "execute_controlled_stop returned accepted=false";
+    downgrade_to_intervention(std::move(reason), std::move(msg));
+    return;
+  }
+  // (2) Backend confirmed the stop within max_stop_time_s (or the
+  //     deployment default `complete_move_on_signal_timeout_ns` when
+  //     the profile leaves `max_stop_time_s` unset).
+  if (!stop_result.backend_stop_confirmed) {
+    downgrade_to_intervention(
+        "backend_stop_not_confirmed",
+        "backend did not confirm controlled stop within deadline");
+    return;
+  }
+  if (effective_deadline_ns > 0 &&
+      stop_result.confirmation_latency_ns > effective_deadline_ns) {
+    downgrade_to_intervention(
+        "backend_stop_confirmation_exceeded_max_stop_time_s",
+        "controlled-stop confirmation exceeded max_stop_time_s");
+    return;
+  }
+  // (3) Executed mode matches requested OR is an allowed fallback.
+  const StopFallbackQualificationRow* fallback_qualification_row = nullptr;
+  if (stop_result.executed_stop_mode != profile.stop_mode) {
+    const auto& allowed = profile.allowed_fallback_modes;
+    const bool fallback_allowed =
+        std::find(allowed.begin(), allowed.end(),
+                  stop_result.executed_stop_mode) != allowed.end();
+    if (!fallback_allowed) {
+      downgrade_to_intervention(
+          "executed_mode_not_in_allowed_fallback_modes",
+          "backend executed a stop_mode not in "
+          "stop_profile.allowed_fallback_modes");
+      return;
+    }
+    if (node_category == MotionInterruptNodeCategory::kPrecisionContact) {
+      downgrade_to_intervention(
+          "fallback_not_allowed_for_node_category",
+          "precision-contact node category cannot accept a stop-mode fallback");
+      return;
+    }
+    fallback_qualification_row = qualified_stop_fallback_pair(
+        profile.stop_mode, stop_result.executed_stop_mode, node_category);
+    if (fallback_qualification_row == nullptr) {
+      downgrade_to_intervention(
+          "fallback_pair_not_qualified",
+          "requested/executed stop-mode fallback pair is not in the "
+          "Phase 4.5G qualification matrix");
+      return;
+    }
+    if (!fallback_row_allows_command_source(
+            *fallback_qualification_row, stop_result.stop_command_source)) {
+      downgrade_to_intervention(
+          "fallback_command_source_not_qualified",
+          "controlled-stop fallback command source is not in the "
+          "Phase 4.5G qualification matrix row");
+      return;
+    }
+    if (!stop_result.fallback_reason) {
+      downgrade_to_intervention(
+          "fallback_reason_required",
+          "controlled-stop fallback executed without fallback_reason");
+      return;
+    }
+  }
+  // (4) Capture a FRESH post-stop snapshot. Using the worker's last
+  // pre-trip poll would record a stale state. Pull the snapshot
+  // directly from the backend now that it has confirmed the stop, and
+  // recover joint names from the planning context so spec/210 §3.7
+  // size/ordering validation can actually run.
+  const auto post_stop_backend_snapshot =
+      execution_backend_.get_execution_snapshot();
+  std::optional<RobotStateDTO> planning_state;
+  try {
+    planning_state = context_.get_current_state();
+  } catch (...) {
+    planning_state.reset();
+  }
+  std::string snap_failure_reason;
+  auto snap_opt = capture_stop_snapshot(
+      post_stop_backend_snapshot, planning_state,
+      stop_result.backend_stop_confirmed, node_category, clock_.now(),
+      snap_failure_reason);
+  if (!snap_opt) {
+    downgrade_to_intervention(
+        std::move(snap_failure_reason),
+        "controlled-stop snapshot capture or validation failed",
+        std::string(kErrorMotionInterruptStopStateInvalid));
+    return;
+  }
+  // (5) Build and publish the signal_trip outcome.
+  MotionTripOutcomeDTO trip;
+  trip.latch_id = latch.latch_id;
+  trip.source_id = latch.source_id;
+  trip.policy_id = latch.policy_id;
+  trip.scope_id = latch.motion_interrupt_scope_id.value_or("");
+  trip.signal_snapshot = latch.signal_snapshot;
+  trip.stop_snapshot = std::move(*snap_opt);
+  trip.requested_stop_profile = profile;
+  trip.executed_stop_mode = stop_result.executed_stop_mode;
+  trip.stop_command_source = stop_result.stop_command_source;
+  // signal_to_latch_ns measures time from when the source published
+  // the signal (latch.signal_snapshot.timestamp_ns) to when the
+  // manager accepted the latch (latch.latched_at_ns). Using the
+  // handler's `clock_.now()` here would always be negative because
+  // the latch already exists by the time we get called.
+  trip.signal_to_latch_ns = std::max<std::int64_t>(
+      0, latch.latched_at_ns - latch.signal_snapshot.timestamp_ns);
+  trip.latch_to_backend_stop_call_ns =
+      std::max<std::int64_t>(0, call_start_ns - latch.latched_at_ns);
+  trip.latch_to_stop_confirmed_ns =
+      std::max<std::int64_t>(0, call_end_ns - latch.latched_at_ns);
+  trip.collision_world_revision = latch.borrowed_collision_world_revision;
+  trip.stop_distance_rad = stop_result.stop_distance_rad;
+  trip.path_deviation_max_rad = stop_result.path_deviation_max_rad;
+  trip.initial_path_deviation_rad = stop_result.initial_path_deviation_rad;
+  trip.fallback_reason = stop_result.fallback_reason;
+  trip.diagnostics = stop_result.diagnostics;
+  if (fallback_qualification_row != nullptr) {
+    trip.diagnostics["fallback_qualification_id"] =
+        fallback_qualification_row->qualification_id;
+    trip.diagnostics["fallback_qualification_rationale"] =
+        fallback_qualification_row->rationale;
+    trip.diagnostics["fallback_qualification_required_telemetry"] =
+        fallback_qualification_row->telemetry;
+    trip.diagnostics["fallback_qualification_evidence_status"] =
+        fallback_qualification_row->evidence_status;
+    trip.diagnostics["fallback_pair"] =
+        std::string(stop_mode_string(profile.stop_mode)) + "->" +
+        stop_mode_string(stop_result.executed_stop_mode);
+  }
+  // Phase 4.5E (codex review follow-up): copy the scope's
+  // result_binding_key onto the trip outcome so BT/runtime consumers
+  // can correlate the outcome with the blackboard slot the motion
+  // node owns. The key is the only stable identifier the BT layer
+  // can use to dispatch the result downstream.
+  if (matching_scope && matching_scope->result_binding_key) {
+    trip.result_binding_key = *matching_scope->result_binding_key;
+  }
+
+  // Transition Stopping -> Completed BEFORE finalize so the outcome
+  // record reflects the terminal state. The latch is cleared after
+  // the outcome is durable via the auto_clear_after_motion_outcome
+  // disposition path.
+  sm_.try_transition(ExecutionState::kCompleted);
+  emit_event({KernelEventType::kMotionTripCompleted, exec_id, clock_.now(),
+               {}, {}, std::nullopt,
+               {{"latch_id", latch.latch_id},
+                {"scope_id", trip.scope_id},
+                {"executed_stop_mode",
+                 stop_mode_string(trip.executed_stop_mode)},
+                {"stop_command_source",
+                 stop_command_source_string(trip.stop_command_source)}}});
+  emit_event({KernelEventType::kStateTransition, exec_id, clock_.now(),
+               ExecutionState::kStopping, ExecutionState::kCompleted,
+               std::nullopt, {}});
+
+  finalize_motion_execution_outcome(
+      motion_state, MotionExecutionTerminalCause::kSignalTrip,
+      std::nullopt, std::move(trip), "motion_trip_completed");
+
+  // Auto-clear only on the success path. Failure paths leave the
+  // latch in place for operator intervention-acknowledge per
+  // spec/230 §3.4 / spec/260 §5.6.
+  (void)interrupt_manager_.clear_active_latch(
+      "auto_clear_after_motion_outcome", clock_.now());
+}
+
+std::optional<MotionExecutionOutcomeDTO>
+ExecutionKernel::get_execution_outcome(std::uint64_t execution_id) const {
+  std::lock_guard<std::mutex> lock(motion_outcomes_mutex_);
+  const auto it = motion_execution_outcomes_.find(execution_id);
+  if (it == motion_execution_outcomes_.end()) {
+    return std::nullopt;
+  }
+  return it->second;
+}
+
+std::vector<MotionInterruptScopeStatusDTO>
+ExecutionKernel::active_motion_interrupt_scopes() const {
+  return interrupt_manager_.active_motion_interrupt_scopes();
+}
+
 InterruptIngestResult ExecutionKernel::publish_fast_interrupt_signal(
     const InterruptSignalUpdate& update) {
   return publish_fast_interrupt_signals({update});
@@ -1648,12 +2481,44 @@ TrajectoryDTO ExecutionKernel::build_remaining_trajectory(
 void ExecutionKernel::async_execute_worker(
     std::stop_token st, ExecuteRequestDTO request, uint64_t exec_id,
     std::optional<TrajectoryDTO> cached_trajectory) {
+  // Phase 4.5C: worker-local motion-execution state. Lives on this
+  // stack frame so two overlapping workers (should never happen under
+  // the lifecycle mutex, but defense in depth) cannot share state.
+  // The RAII guard guarantees exactly one outcome is emitted per
+  // terminal execution even if a new terminal path is added later and
+  // forgets to call `finalize_motion_execution_outcome` explicitly.
+  ActiveMotionExecution motion_state;
+  motion_state.execution_id = exec_id;
+  motion_state.move_id = request.move_id;
+  struct MotionOutcomeGuard {
+    ExecutionKernel* self;
+    ActiveMotionExecution& state;
+    ~MotionOutcomeGuard() {
+      if (state.outcome_emitted) {
+        return;
+      }
+      // Defensive: an unexpected return path missed the explicit
+      // finalize call. Emit `failed` with a diagnostic reason so we
+      // never silently drop the outcome record.
+      self->finalize_motion_execution_outcome(
+          state, MotionExecutionTerminalCause::kFailed,
+          ErrorDTO{kErrorInternalError,
+                   "Worker exited without explicit motion outcome",
+                   {{"reason", "worker_exit_without_outcome"}}},
+          std::nullopt, "worker_exit_without_outcome");
+    }
+  };
+  MotionOutcomeGuard outcome_guard{this, motion_state};
+
   try {
     // Capture initial state for correct prev_state in events (B-2)
     const auto worker_entry_state = sm_.status().state;
 
     // Check for early cancellation
     if (st.stop_requested()) {
+      finalize_motion_execution_outcome(
+          motion_state, MotionExecutionTerminalCause::kStopped,
+          std::nullopt, std::nullopt, "early_stop_requested");
       execution_complete_.store(true);
       completion_cv_.notify_all();
       return;
@@ -1711,6 +2576,9 @@ void ExecutionKernel::async_execute_worker(
         publish_execution_snapshot(std::move(stopped_snapshot));
         emit_event({KernelEventType::kStateTransition, exec_id, clock_.now(),
                      prev, ExecutionState::kStopped, std::nullopt, {}});
+        finalize_motion_execution_outcome(
+            motion_state, MotionExecutionTerminalCause::kStopped,
+            std::nullopt, std::nullopt, "planning_stop");
         execution_complete_.store(true);
         completion_cv_.notify_all();
         return;
@@ -1731,6 +2599,9 @@ void ExecutionKernel::async_execute_worker(
         publish_execution_snapshot(std::move(idle_snapshot));
         emit_event({KernelEventType::kStateTransition, exec_id, clock_.now(),
                      prev, ExecutionState::kIdle, std::nullopt, {}});
+        finalize_motion_execution_outcome(
+            motion_state, MotionExecutionTerminalCause::kStopped,
+            std::nullopt, std::nullopt, "planning_reset");
         execution_complete_.store(true);
         completion_cv_.notify_all();
         return;
@@ -1754,6 +2625,9 @@ void ExecutionKernel::async_execute_worker(
         publish_execution_snapshot(std::move(failed_snapshot));
         emit_event({KernelEventType::kStateTransition, exec_id, clock_.now(),
                      ExecutionState::kPlanning, ExecutionState::kFailed, std::nullopt, {}});
+        finalize_motion_execution_outcome(
+            motion_state, MotionExecutionTerminalCause::kFailed,
+            plan_result.error(), std::nullopt, "planning_failed");
         execution_complete_.store(true);
         completion_cv_.notify_all();
         return;
@@ -1774,6 +2648,11 @@ void ExecutionKernel::async_execute_worker(
         sm_.try_transition(ExecutionState::kFailed);
         emit_event({KernelEventType::kStateTransition, exec_id, clock_.now(),
                      prev_state2, ExecutionState::kFailed, std::nullopt, {}});
+        finalize_motion_execution_outcome(
+            motion_state, MotionExecutionTerminalCause::kFailed,
+            ErrorDTO{kErrorInternalError,
+                     "Failed to transition to Validating", {}},
+            std::nullopt, "validating_transition_failed");
         execution_complete_.store(true);
         completion_cv_.notify_all();
         return;
@@ -1809,6 +2688,11 @@ void ExecutionKernel::async_execute_worker(
         interrupted_snapshot.state = ExecutionState::kInterrupted;
         interrupted_snapshot.error = val_result.error();
         publish_execution_snapshot(std::move(interrupted_snapshot));
+        // Validation cancelled by a fault session policy interrupting
+        // the move (spec/260 §B.4). Cause is interrupted_fault.
+        finalize_motion_execution_outcome(
+            motion_state, MotionExecutionTerminalCause::kInterruptedFault,
+            std::nullopt, std::nullopt, "validation_cancelled_by_interrupt");
         execution_complete_.store(true);
         completion_cv_.notify_all();
         return;
@@ -1846,6 +2730,9 @@ void ExecutionKernel::async_execute_worker(
           metrics_.cache_invalidations++;
         }
       }
+      finalize_motion_execution_outcome(
+          motion_state, MotionExecutionTerminalCause::kFailed,
+          val_result.error(), std::nullopt, "validation_failed");
       execution_complete_.store(true);
       completion_cv_.notify_all();
       return;
@@ -1874,6 +2761,9 @@ void ExecutionKernel::async_execute_worker(
       publish_execution_snapshot(std::move(snapshot));
       emit_event({KernelEventType::kStateTransition, exec_id, clock_.now(),
                    prev, ExecutionState::kStopped, std::nullopt, {}});
+      finalize_motion_execution_outcome(
+          motion_state, MotionExecutionTerminalCause::kStopped,
+          std::nullopt, std::nullopt, "validation_stop");
       execution_complete_.store(true);
       completion_cv_.notify_all();
       return;
@@ -1894,6 +2784,9 @@ void ExecutionKernel::async_execute_worker(
       publish_execution_snapshot(std::move(snapshot));
       emit_event({KernelEventType::kStateTransition, exec_id, clock_.now(),
                    prev, ExecutionState::kIdle, std::nullopt, {}});
+      finalize_motion_execution_outcome(
+          motion_state, MotionExecutionTerminalCause::kStopped,
+          std::nullopt, std::nullopt, "validation_reset");
       execution_complete_.store(true);
       completion_cv_.notify_all();
       return;
@@ -1909,6 +2802,43 @@ void ExecutionKernel::async_execute_worker(
       cache_.store(request.move_id, trajectory, val_result.value());
     }
 
+    // Phase 4.5C: arm move-scoped interrupt bindings atomically with
+    // dispatch (spec/230 §3.4). Runs AFTER validation passes and
+    // BEFORE the Validating->Executing transition. On failure we fail
+    // closed: emit a `failed` outcome and never enter Executing or
+    // call the backend. Empty `motion_interrupt_scopes` preserves the
+    // legacy free-move dispatch path.
+    {
+      auto arm_result = arm_motion_scopes_for_dispatch(
+          request, trajectory, exec_id, motion_state);
+      if (!arm_result.ok()) {
+        auto prev = sm_.status().state;
+        // Stamp the state machine with the specific arm-failure code
+        // so audit/release evidence sees `motion_interrupt_arm_failed`
+        // (or `motion_interrupt_source_active_at_arm`) rather than a
+        // generic `internal_error`.
+        sm_.set_last_error(error_code_from_dto(arm_result.error()));
+        sm_.try_transition(ExecutionState::kFailed);
+        emit_event({KernelEventType::kErrorRaised, exec_id, clock_.now(),
+                     {}, {}, arm_result.error(), {}});
+        auto arm_fail_snapshot = get_execution_snapshot();
+        arm_fail_snapshot.timestamp_ns = clock_.now();
+        arm_fail_snapshot.execution_id = exec_id;
+        arm_fail_snapshot.move_id = request.move_id;
+        arm_fail_snapshot.state = ExecutionState::kFailed;
+        arm_fail_snapshot.error = arm_result.error();
+        publish_execution_snapshot(std::move(arm_fail_snapshot));
+        emit_event({KernelEventType::kStateTransition, exec_id, clock_.now(),
+                     prev, ExecutionState::kFailed, std::nullopt, {}});
+        finalize_motion_execution_outcome(
+            motion_state, MotionExecutionTerminalCause::kFailed,
+            arm_result.error(), std::nullopt, "arm_failed");
+        execution_complete_.store(true);
+        completion_cv_.notify_all();
+        return;
+      }
+    }
+
     // Validating -> Executing
     auto prev_state3 = sm_.status().state;
     auto r3 = sm_.try_transition(ExecutionState::kExecuting);
@@ -1917,6 +2847,11 @@ void ExecutionKernel::async_execute_worker(
       sm_.try_transition(ExecutionState::kFailed);
       emit_event({KernelEventType::kStateTransition, exec_id, clock_.now(),
                    prev_state3, ExecutionState::kFailed, std::nullopt, {}});
+      finalize_motion_execution_outcome(
+          motion_state, MotionExecutionTerminalCause::kFailed,
+          ErrorDTO{kErrorInternalError,
+                   "Failed to transition to Executing", {}},
+          std::nullopt, "state_transition_failed");
       execution_complete_.store(true);
       completion_cv_.notify_all();
       return;
@@ -2019,6 +2954,9 @@ void ExecutionKernel::async_execute_worker(
           std::lock_guard<std::mutex> lock(metrics_mutex_);
           metrics_.executions_failed++;
         }
+        finalize_motion_execution_outcome(
+            motion_state, MotionExecutionTerminalCause::kFailed,
+            terminal_error, std::nullopt, "execution_timeout");
         execution_complete_.store(true);
         completion_cv_.notify_all();
         return;
@@ -2032,11 +2970,36 @@ void ExecutionKernel::async_execute_worker(
         break;
       }
       if (loop_state == ExecutionState::kInterrupted) {
-        if (auto latch = interrupt_manager_.active_latch();
-            latch &&
+        auto latch = interrupt_manager_.active_latch();
+        if (latch &&
             latch->preemption_action_requested ==
                 InterruptPreemptionAction::kPreemptTrajectory) {
+          // Fault session policy preempted the move. The scope (if
+          // any) is reaped as part of finalize; terminal_cause is
+          // `interrupted_fault` (spec/260 §B.4). The fault's own
+          // latch surface is the authoritative record; this outcome
+          // exists for symmetric BT consumption.
           stop_collision_monitoring();
+          finalize_motion_execution_outcome(
+              motion_state, MotionExecutionTerminalCause::kInterruptedFault,
+              std::nullopt, std::nullopt, "interrupted_fault");
+          execution_complete_.store(true);
+          completion_cv_.notify_all();
+          return;
+        }
+        if (latch &&
+            latch->preemption_action_requested ==
+                InterruptPreemptionAction::kCompleteMoveOnSignal) {
+          // Phase 4.5D-2: move-scoped trip handling. The helper
+          // resolves the matching scope/stop_profile, transitions
+          // Interrupted -> Stopping, invokes the controlled-stop
+          // backend port, captures the validated stop snapshot,
+          // enforces the conjunctive fallback rule, and transitions
+          // Stopping -> Completed (signal_trip) or Stopping -> Failed.
+          // Replaces the 4.5C `motion_interrupt_phase_4_5d_required`
+          // bridge.
+          handle_motion_trip_latch(request, *latch, exec_id,
+                                     latest_backend_snapshot, motion_state);
           execution_complete_.store(true);
           completion_cv_.notify_all();
           return;
@@ -2071,6 +3034,11 @@ void ExecutionKernel::async_execute_worker(
               interrupted_snapshot.state = ExecutionState::kInterrupted;
               interrupted_snapshot.error = resume_validation.error();
               publish_execution_snapshot(std::move(interrupted_snapshot));
+              finalize_motion_execution_outcome(
+                  motion_state,
+                  MotionExecutionTerminalCause::kInterruptedFault,
+                  std::nullopt, std::nullopt,
+                  "resume_validation_cancelled_by_interrupt");
               execution_complete_.store(true);
               completion_cv_.notify_all();
               return;
@@ -2112,6 +3080,15 @@ void ExecutionKernel::async_execute_worker(
             publish_execution_snapshot(std::move(failed_snapshot));
             emit_event({KernelEventType::kStateTransition, exec_id, clock_.now(),
                         prev_state, terminal_state, std::nullopt, {}});
+            finalize_motion_execution_outcome(
+                motion_state, MotionExecutionTerminalCause::kFailed,
+                stop_completed
+                    ? resume_validation.error()
+                    : ErrorDTO{kErrorStopFailed,
+                               "Resume validation failed and stop drain "
+                               "did not complete",
+                               {{"reason", "resume_validation_stop_drain"}}},
+                std::nullopt, "resume_validation_failed");
             execution_complete_.store(true);
             completion_cv_.notify_all();
             return;
@@ -2144,6 +3121,11 @@ void ExecutionKernel::async_execute_worker(
             publish_execution_snapshot(std::move(failed_snapshot));
             emit_event({KernelEventType::kStateTransition, exec_id, clock_.now(),
                         prev_state, ExecutionState::kFailed, std::nullopt, {}});
+            finalize_motion_execution_outcome(
+                motion_state, MotionExecutionTerminalCause::kFailed,
+                ErrorDTO{kErrorResumeFailed,
+                         "Resume transition to Executing failed", {}},
+                std::nullopt, "resume_transition_failed");
             execution_complete_.store(true);
             completion_cv_.notify_all();
             return;
@@ -2204,6 +3186,9 @@ void ExecutionKernel::async_execute_worker(
     if (final_snapshot.state == ExecutionState::kStopped ||
         sm_.status().state == ExecutionState::kStopped ||
         sm_.status().state == ExecutionState::kIdle) {
+      finalize_motion_execution_outcome(
+          motion_state, MotionExecutionTerminalCause::kStopped,
+          std::nullopt, std::nullopt, "execution_stop_terminal");
       execution_complete_.store(true);
       completion_cv_.notify_all();
       return;
@@ -2231,6 +3216,13 @@ void ExecutionKernel::async_execute_worker(
         std::lock_guard<std::mutex> metrics_lock(metrics_mutex_);
         metrics_.executions_failed++;
       }
+      finalize_motion_execution_outcome(
+          motion_state, MotionExecutionTerminalCause::kFailed,
+          final_snapshot.error.value_or(
+              ErrorDTO{kErrorInternalError,
+                       "Execution failed without captured error",
+                       {{"reason", "missing_error_on_failed"}}}),
+          std::nullopt, "execution_failed");
       execution_complete_.store(true);
       completion_cv_.notify_all();
       return;
@@ -2259,6 +3251,14 @@ void ExecutionKernel::async_execute_worker(
         std::lock_guard<std::mutex> metrics_lock(metrics_mutex_);
         metrics_.executions_failed++;
       }
+      finalize_motion_execution_outcome(
+          motion_state, MotionExecutionTerminalCause::kFailed,
+          final_snapshot.error.value_or(
+              ErrorDTO{kErrorStopFailed,
+                       "Execution required intervention without captured "
+                       "error",
+                       {{"reason", "missing_error_on_intervention"}}}),
+          std::nullopt, "execution_intervention_required");
       execution_complete_.store(true);
       completion_cv_.notify_all();
       return;
@@ -2282,6 +3282,13 @@ void ExecutionKernel::async_execute_worker(
       std::lock_guard<std::mutex> metrics_lock(metrics_mutex_);
       metrics_.executions_completed++;
     }
+    // Phase 4.5C: trajectory reached its planned endpoint. Cause is
+    // `completed_normally` for free moves; the finalize helper rewrites
+    // to `no_signal_trip` when the request carried scopes (spec/210
+    // §3.11 invariants).
+    finalize_motion_execution_outcome(
+        motion_state, MotionExecutionTerminalCause::kCompletedNormally,
+        std::nullopt, std::nullopt, "execution_completed");
 
   } catch (const std::exception& e) {
     stop_collision_monitoring();
@@ -2301,6 +3308,11 @@ void ExecutionKernel::async_execute_worker(
       std::lock_guard<std::mutex> metrics_lock(metrics_mutex_);
       metrics_.executions_failed++;
     }
+    finalize_motion_execution_outcome(
+        motion_state, MotionExecutionTerminalCause::kFailed,
+        ErrorDTO{kErrorInternalError, e.what(),
+                 {{"reason", "worker_exception"}}},
+        std::nullopt, "worker_exception");
   }
 
   execution_complete_.store(true);

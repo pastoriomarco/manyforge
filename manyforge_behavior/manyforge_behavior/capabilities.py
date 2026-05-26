@@ -1,4 +1,4 @@
-"""Capability key registry and profile definitions for ManyForge v0.0/v0.1."""
+"""Capability key registry and profile definitions for ManyForge v0.0/v0.1/v0.2."""
 
 CAPABILITY_REGISTRY: frozenset[str] = frozenset({
     # Planning
@@ -38,6 +38,15 @@ CAPABILITY_REGISTRY: frozenset[str] = frozenset({
     "execution.contact.force_torque",
     "execution.contact.controller_reported",
     "execution.control.admittance",
+    # Phase 4.5: motion-scoped interrupt outcomes
+    # `kernel.motion_interrupt_scope` is required for any node that
+    # submits a `MotionInterruptScopeDTO` (MoveUntilSignal,
+    # ProbeSearchMove). `kernel.motion_interrupt_precision_contact`
+    # narrows that to deployments whose backend capability profile
+    # supports the precision-contact node category fallback rules
+    # (spec/210 §3.11).
+    "kernel.motion_interrupt_scope",
+    "kernel.motion_interrupt_precision_contact",
     # IO / GPIO
     "io.gpio.set_output",
     "io.gpio.get_input",
@@ -102,6 +111,20 @@ V0_1_REQUIRED_KEYS: frozenset[str] = frozenset(
 )
 
 PROFILE_REQUIRED_KEYS["v0.1"] = V0_1_REQUIRED_KEYS
+
+# v0.2 adds the Phase 4.5 motion-scoped interrupt surface. Programs
+# that author MoveUntilSignal / ProbeSearchMove (catalog `min_profile:
+# v0.2`) must declare `program_profile: v0.2` so deployments without
+# the kernel.motion_interrupt_scope capability can be rejected at load
+# time rather than at trip time.
+V0_2_REQUIRED_KEYS: frozenset[str] = frozenset(
+    set(V0_1_REQUIRED_KEYS)
+    | {
+        "kernel.motion_interrupt_scope",
+    }
+)
+
+PROFILE_REQUIRED_KEYS["v0.2"] = V0_2_REQUIRED_KEYS
 
 
 def get_required_keys(profile: str) -> frozenset[str]:

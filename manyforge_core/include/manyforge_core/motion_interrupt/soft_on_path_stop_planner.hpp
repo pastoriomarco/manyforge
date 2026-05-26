@@ -1,0 +1,127 @@
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+#include <map>
+#include <optional>
+#include <string>
+
+#include <manyforge_core/types/error_code.hpp>
+#include <manyforge_core/types/motion_interrupt.hpp>
+#include <manyforge_core/types/robot_state.hpp>
+#include <manyforge_core/types/trajectory_dto.hpp>
+
+namespace manyforge::core {
+
+/// Source used for the soft-on-path stop initial condition.
+enum class SoftOnPathStateSource {
+  /// Fresh backend/controller feedback such as FJT feedback,
+  /// controller state, or `/joint_states`.
+  kMeasuredFeedback,
+  /// Accepted trajectory model plus the applied runtime velocity scale.
+  kModelDerived,
+};
+
+/// Trip-time state estimate for a Phase 4.5G soft-on-path stop.
+struct SoftOnPathInitialStateDTO {
+  RobotStateDTO state;
+  /// Optional active trajectory model time. Required when model-derived
+  /// velocity is used; otherwise only a hint for projection.
+  std::optional<double> trajectory_time_from_start_s;
+  SoftOnPathStateSource position_source =
+      SoftOnPathStateSource::kMeasuredFeedback;
+  SoftOnPathStateSource velocity_source =
+      SoftOnPathStateSource::kMeasuredFeedback;
+  /// Runtime velocity scale already applied to the original trajectory at
+  /// trip time. Used only for model-derived velocity and diagnostics.
+  double runtime_velocity_scale_at_trip = 1.0;
+  std::int64_t sample_age_ns = 0;
+};
+
+/// Planner options that are deployment/runtime facts rather than node policy.
+struct SoftOnPathPlannerConfig {
+  /// Handoff budget from kernel trip/latch time to the first useful
+  /// controller waypoint.
+  double stop_traj_delta_s = 0.05;
+  /// Sampling period for the generated derivative-complete ramp.
+  double sample_period_s = 0.01;
+  /// Explicitly authorize model-derived velocity when measured velocity is
+  /// missing or marked as model-derived.
+  bool allow_model_velocity_fallback = false;
+  /// Optional best-effort drift limit. When absent, drift is measured and
+  /// reported but not a planner failure.
+  std::optional<double> max_initial_path_deviation_rad;
+  /// Optional measured-velocity coherence limit. When absent, off-path
+  /// velocity is preserved in the anchor waypoint and measured in diagnostics
+  /// but does not reject the plan.
+  std::optional<double> max_initial_velocity_deviation_rad_s;
+  /// Optional deployment jerk limits. Missing joints default from
+  /// acceleration limit and effective ramp time.
+  std::map<std::string, double> per_joint_max_jerk_rad_s3;
+};
+
+struct SoftOnPathStopPlanDTO {
+  TrajectoryDTO replacement_trajectory;
+  double projected_time_from_start_s = 0.0;
+  double effective_ramp_s = 0.0;
+  double stop_traj_delta_s = 0.0;
+  double initial_path_deviation_rad = 0.0;
+  double initial_velocity_deviation_rad_s = 0.0;
+  double path_deviation_max_rad = 0.0;
+  double runtime_velocity_scale_at_trip = 1.0;
+  bool used_model_velocity = false;
+  std::string position_source;
+  std::string velocity_source;
+  /// `deployment`, `default`, or `mixed`.
+  std::string jerk_limit_source;
+  InterruptStructuredValue diagnostics;
+};
+
+struct SoftOnPathFeasibilityEnvelopeDTO {
+  std::size_t checked_samples = 0;
+  std::size_t natural_completion_samples = 0;
+  double first_sample_time_from_start_s = 0.0;
+  double last_sample_time_from_start_s = 0.0;
+  double max_path_deviation_rad = 0.0;
+  double max_initial_velocity_deviation_rad_s = 0.0;
+  std::string jerk_limit_source;
+  InterruptStructuredValue diagnostics;
+};
+
+/// Build a wall-time, best-effort path-preserving replacement trajectory for
+/// `MotionInterruptStopMode::kSoftOnPath`.
+///
+/// The planner is intentionally side-effect free. Backends use the returned
+/// trajectory as the command shape; kernel/backend code remains responsible for
+/// runtime-scale isolation, dispatch, controller acknowledgement, and outcome
+/// persistence.
+Result<SoftOnPathStopPlanDTO> plan_soft_on_path_stop(
+    const TrajectoryDTO& accepted_trajectory,
+    const MotionInterruptStopProfileDTO& stop_profile,
+    const SoftOnPathInitialStateDTO& initial_state,
+    const SoftOnPathPlannerConfig& config = {});
+
+/// Validate, before backend dispatch, that model-derived trip samples along the
+/// accepted trajectory can produce a `soft_on_path` ramp under the same planner
+/// limits. This is the Phase 4.5G plan-time feasibility envelope; it is
+/// conservative because it assumes runtime scale 1.0 for the original motion.
+Result<SoftOnPathFeasibilityEnvelopeDTO>
+validate_soft_on_path_feasibility_envelope(
+    const TrajectoryDTO& accepted_trajectory,
+    const MotionInterruptStopProfileDTO& stop_profile,
+    const SoftOnPathPlannerConfig& config = {});
+
+/// True when a planner rejection means the accepted trajectory is already too
+/// close to its natural endpoint for a useful wall-time `soft_on_path` ramp and
+/// the caller may apply `allow_natural_completion_on_short_path` policy.
+bool soft_on_path_error_recommends_natural_completion(
+    const ErrorDTO& error);
+
+/// Measure joint-space projection residual from an observed state to the
+/// accepted trajectory path. Used by backends to turn controller feedback into
+/// runtime path-deviation evidence for `soft_on_path`.
+Result<double> measure_soft_on_path_path_deviation(
+    const TrajectoryDTO& accepted_trajectory,
+    const RobotStateDTO& observed_state);
+
+}  // namespace manyforge::core

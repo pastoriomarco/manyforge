@@ -41,13 +41,103 @@ enum class InterruptPreemptionAction {
   kPreemptStreaming,
   kLatchHeld,
   kLatchFaulted,
+  /// Move-scoped non-fault completion (spec/260 §5.6). Reserved for
+  /// `InterruptPolicyDefinition::scope_kind == kMove` policies. Stops
+  /// trajectory execution on a desired signal trip and produces a
+  /// `MotionExecutionOutcomeDTO` with `terminal_cause = signal_trip`
+  /// when (and only when) the backend confirms stop and a valid
+  /// `ExecutionStopSnapshotDTO` is captured.
+  kCompleteMoveOnSignal,
 };
 
 enum class InterruptPostLatchDisposition {
   kAwaitOperatorAck,
   kAwaitRecoveryHandler,
   kAutoClearOnSignalRelease,
+  /// Latch is cleared only after the matching `MotionExecutionOutcomeDTO`
+  /// has been durably emitted to the operational event stream and
+  /// stored in the kernel's terminal-outcome surface. Only valid for
+  /// `scope_kind=move` policies whose `preemption_action ==
+  /// kCompleteMoveOnSignal`.
+  kAutoClearAfterMotionOutcome,
   kFaultTerminal,
+};
+
+/// Activation modes for move-scoped policy bindings (spec/260 §2.6).
+enum class MotionInterruptActivationMode {
+  /// Default for touch probes: kernel samples the source at arm time;
+  /// if active or unknown, the move is rejected before dispatch.
+  kRequireInactiveAtArm,
+  /// Records baseline at arm time; only a post-arm transition latches.
+  kFreshEdgeAfterArm,
+  /// Latches immediately when already active; must be explicitly allowed
+  /// in the policy's `allowed_activation_modes`.
+  kTripIfAlreadyActive,
+  /// Reserved for surface following and compliant maintenance; v1
+  /// adapters return `diagnostic_incomplete` if they cannot support it.
+  kMaintainLevelWithHysteresis,
+};
+
+/// Controlled-stop mode requested by a move-scoped interrupt scope
+/// (spec/260 §5.6 Stop-profile semantics; spec/210 §3.11
+/// `MotionInterruptStopProfileDTO`). Phase 4.5D-1.
+///
+/// `kSpringBackHold` is the simplest controlled halt: observed-state
+/// anchor + zero-velocity hold target. `kSoftOnPath` is a
+/// path-preserving ramp along the accepted trajectory.
+/// `kHardDeceleration` is an acceleration-limited stop that may leave
+/// the path. None of these is a safety e-stop; e-stop / protective
+/// stops remain higher-priority session/fault policies and produce
+/// `interrupted_fault` or `failed`, never `signal_trip`.
+enum class MotionInterruptStopMode {
+  kSpringBackHold,
+  kSoftOnPath,
+  kHardDeceleration,
+};
+
+/// Which backend/controller surface actually issued the controlled
+/// stop (spec/210 §3.11 `MotionTripOutcomeDTO.stop_command_source`).
+/// `kDiagnosticOther` is reserved for backends whose stop path does
+/// not match a named taxonomy and MUST carry a stable reason in the
+/// outcome's `diagnostics`. Phase 4.5D-1.
+enum class MotionInterruptStopCommandSource {
+  kFjtPreemptHold,
+  kFjtPreemptPathRamp,
+  kJtcSpeedScalingRamp,
+  kJtcCancelDecelerateOnCancel,
+  kNativeSimulatedStop,
+  kNativeSimulatedPathRamp,
+  kRobotNativeStop,
+  kDiagnosticOther,
+};
+
+/// Motion-node category metadata carried on a `MotionInterruptScopeDTO`.
+/// The kernel uses the category to enforce default fallback rules at
+/// arm time (spec/210 §3.11 conjunctive fallback rule; motion-scoped
+/// design doc §B.4 node-category defaults). Phase 4.5D-1.
+enum class MotionInterruptNodeCategory {
+  /// `MoveUntilSignal` and other generic search nodes. May accept any
+  /// fallback the backend capability profile and policy allow.
+  kGeneric,
+  /// `ProbeSearchMove` and other precision-contact node families.
+  /// Defaults to no fallback — the precision contract cannot tolerate
+  /// silent substitution of a different stop mode at trip time.
+  kPrecisionContact,
+};
+
+/// Whether a policy is always active (`kSession`) or only when armed by
+/// a `MotionInterruptScopeDTO` on the active `ExecuteRequestDTO`
+/// (`kMove`). Spec/260 §2.2.
+enum class InterruptPolicyScopeKind {
+  kSession,
+  kMove,
+};
+
+/// When the kernel auto-reaps a move-scoped policy binding.
+/// Spec/260 §2.2.
+enum class InterruptPolicyScopeExpiry {
+  kExecutionTerminal,
+  kStreamingSessionTerminal,
 };
 
 enum class InterruptExecutionPhase {
@@ -120,6 +210,27 @@ struct InterruptPolicyDefinition {
   std::vector<std::string> maskable_by;
   InterruptPostLatchDisposition post_latch_disposition =
       InterruptPostLatchDisposition::kAwaitOperatorAck;
+  /// Spec/260 §2.2. `kSession` (default) keeps legacy behavior.
+  /// `kMove` policies are inactive until armed by a
+  /// `MotionInterruptScopeDTO` on the active `ExecuteRequestDTO`.
+  InterruptPolicyScopeKind scope_kind = InterruptPolicyScopeKind::kSession;
+  /// Applies only when `scope_kind == kMove`. Default
+  /// `kExecutionTerminal` reaps the binding on terminal execution
+  /// state.
+  InterruptPolicyScopeExpiry scope_expiry =
+      InterruptPolicyScopeExpiry::kExecutionTerminal;
+  /// Applies only when `scope_kind == kMove`. Empty set means the
+  /// kernel default (only `kRequireInactiveAtArm` accepted).
+  std::set<MotionInterruptActivationMode> allowed_activation_modes;
+  /// Spec/260 §2.2 Phase 4.5D-1: deployment policy gate listing the
+  /// stop modes a move-scoped scope MAY request via its
+  /// `MotionInterruptStopProfileDTO.stop_mode`. REQUIRED (non-empty)
+  /// when `preemption_action == kCompleteMoveOnSignal`; rejected at
+  /// registration otherwise. Distinct from the backend's
+  /// `MotionInterruptStopCapabilityDTO.supported_stop_modes`:
+  /// arm-time validation enforces both (the requested mode and every
+  /// element of `allowed_fallback_modes` MUST be in BOTH sets).
+  std::set<MotionInterruptStopMode> allowed_stop_modes;
   std::optional<std::string> description;
 };
 
@@ -164,6 +275,16 @@ struct InterruptLatch {
   std::optional<InterruptDisposition> disposition;
   std::optional<std::int64_t> cleared_at_ns;
   std::optional<std::string> clear_reason;
+  /// Populated when this latch matched a `kMove`-scoped policy binding
+  /// (spec/260 §2.4 / §2.6). Carries the `scope_id` from the active
+  /// `ExecuteRequestDTO.motion_interrupt_scopes` entry that armed the
+  /// binding.
+  std::optional<std::string> motion_interrupt_scope_id;
+  /// Populated after the kernel has captured a valid stop snapshot and
+  /// emitted the matching `MotionExecutionOutcomeDTO`. The latch never
+  /// carries `RobotStateDTO` in v1; this id links the latch to the
+  /// outcome record stored in the kernel terminal-outcome surface.
+  std::optional<std::string> terminal_outcome_id;
 };
 
 inline const char* to_string(InterruptExecutionPhase phase) {

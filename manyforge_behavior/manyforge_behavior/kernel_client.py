@@ -34,6 +34,84 @@ class GripperCommandState(Enum):
 
 
 @dataclass
+class MotionInterruptStopProfile:
+    """Phase 4.5D-1: controlled-stop profile carried by a motion-scoped
+    interrupt scope (mirrors `MotionInterruptStopProfileDTO` in
+    spec/210 §3.11). `stop_mode` is one of "spring_back_hold",
+    "soft_on_path", or "hard_deceleration"."""
+
+    profile_id: str
+    stop_mode: str
+    deceleration_time_s: Optional[float] = None
+    max_stop_time_s: Optional[float] = None
+    joint_deceleration_profile_id: Optional[str] = None
+    per_joint_max_deceleration_rad_s2: Dict[str, float] = field(default_factory=dict)
+    allowed_fallback_modes: List[str] = field(default_factory=list)
+    allow_natural_completion_on_short_path: bool = False
+    require_backend_confirmation: bool = True
+
+
+@dataclass
+class MotionInterruptScope:
+    """Phase 4.5B/D: per-move binding that arms a `kMove`-scoped
+    interrupt policy for exactly one execute request (spec/260 §2.6).
+    `node_category` is one of "generic" (default; MoveUntilSignal) or
+    "precision_contact" (ProbeSearchMove). `activation_mode` is one of
+    "require_inactive_at_arm", "fresh_edge_after_arm",
+    "trip_if_already_active", or "maintain_level_with_hysteresis".
+    `complete_move_on_signal` scopes MUST carry a `stop_profile`."""
+
+    scope_id: str
+    policy_id: str
+    activation_mode: str = "require_inactive_at_arm"
+    arm_timeout_ns: Optional[int] = None
+    result_binding_key: Optional[str] = None
+    required: bool = True
+    stop_profile: Optional[MotionInterruptStopProfile] = None
+    node_category: str = "generic"
+
+
+@dataclass
+class MotionTripOutcome:
+    """Phase 4.5A/D: successful signal_trip outcome carried inside a
+    `MotionExecutionOutcome`. Mirrors `MotionTripOutcomeDTO`."""
+
+    latch_id: str = ""
+    source_id: str = ""
+    policy_id: str = ""
+    scope_id: str = ""
+    executed_stop_mode: str = ""
+    stop_command_source: str = ""
+    backend_stop_confirmed: bool = False
+    stop_distance_rad: Optional[float] = None
+    initial_path_deviation_rad: Optional[float] = None
+    path_deviation_max_rad: Optional[float] = None
+    fallback_reason: Optional[str] = None
+    signal_to_latch_ns: int = 0
+    latch_to_backend_stop_call_ns: int = 0
+    latch_to_stop_confirmed_ns: int = 0
+    result_binding_key: Optional[str] = None
+
+
+@dataclass
+class MotionExecutionOutcome:
+    """Phase 4.5A: immutable terminal outcome for one motion execution
+    (mirrors `MotionExecutionOutcomeDTO`, spec/210 §3.11). The kernel
+    emits one per terminal execution; behavior-tree nodes consume it
+    via `KernelClient.get_execution_outcome(execution_id)`."""
+
+    execution_id: int = 0
+    move_id: str = ""
+    # One of "completed_normally" | "signal_trip" | "no_signal_trip" |
+    # "stopped" | "failed" | "interrupted_fault".
+    terminal_cause: str = "completed_normally"
+    trip: Optional[MotionTripOutcome] = None
+    error_code: Optional[str] = None
+    error_message: Optional[str] = None
+    error_reason: Optional[str] = None
+
+
+@dataclass
 class ExecuteRequest:
     robot_id: str
     group_id: str
@@ -54,6 +132,11 @@ class ExecuteRequest:
     planning_timeout_s: float = 2.0
     execution_timeout_s: float = 10.0
     cache_mode: str = "default"
+    # Phase 4.5: per-move bindings that arm move-scoped interrupt
+    # policies (spec/210 §3.10 + spec/260 §2.6). Empty list preserves
+    # free-move semantics; non-empty arms each scope atomically with
+    # dispatch and reaps on every terminal execution state.
+    motion_interrupt_scopes: List[MotionInterruptScope] = field(default_factory=list)
 
 
 @dataclass
@@ -519,6 +602,18 @@ class KernelClient(ABC):
     @abstractmethod
     def get_execution_snapshot(self) -> ExecutionSnapshot: ...
 
+    def get_execution_outcome(
+        self, execution_id: int
+    ) -> Optional[MotionExecutionOutcome]:
+        """Phase 4.5: return the immutable terminal MotionExecutionOutcome
+        for `execution_id`, or None when no outcome has been recorded.
+
+        Default returns None so kernel clients that do not yet implement
+        the outcome surface (legacy mocks) keep building. Production
+        kernel clients (NativeKernelClient, ROS bridges) MUST override.
+        """
+        return None
+
     @abstractmethod
     def invalidate_trajectories(self) -> None: ...
 
@@ -654,6 +749,13 @@ class MockKernelClient(KernelClient):
         self.runtime_velocity_scale_updates: List[float] = []
         self.scene_edits: List[SceneEditRequest] = []
         self.link_pose_calls: List[tuple[str, str]] = []
+        # Phase 4.5E: outcome store keyed by execution_id, populated
+        # automatically when execute() returns. Tests can override the
+        # default outcome shape via `next_outcome_factory`; if unset,
+        # the mock emits `completed_normally` for free moves and
+        # `no_signal_trip` for moves carrying motion_interrupt_scopes.
+        self._outcomes: Dict[int, MotionExecutionOutcome] = {}
+        self.next_outcome_factory = None  # type: ignore[assignment]
         # Allow tests to inject failures
         self.fail_next_execute = False
         self.fail_next_scene_edit = False
@@ -769,7 +871,39 @@ class MockKernelClient(KernelClient):
             self._metrics["executions_completed"] += 1
             self._emit_kernel_event("state_transition", from_state="idle", to_state="completed")
             self._emit_kernel_event("execute_completed")
+            # Phase 4.5E: stamp an outcome for the completed execution.
+            # Tests can override via `next_outcome_factory`; default
+            # picks `no_signal_trip` for scoped moves and
+            # `completed_normally` for free moves so the natural
+            # MoveUntilSignal/ProbeSearchMove test path produces the
+            # spec-required outcome shape.
+            outcome = self._stamp_outcome(eid, request)
+            self._outcomes[eid] = outcome
         return ExecuteResult(ok=True, execution_id=eid)
+
+    def _stamp_outcome(
+        self, execution_id: int, request: ExecuteRequest
+    ) -> MotionExecutionOutcome:
+        if callable(self.next_outcome_factory):
+            outcome = self.next_outcome_factory(execution_id, request)
+            self.next_outcome_factory = None
+            return outcome
+        if request.motion_interrupt_scopes:
+            return MotionExecutionOutcome(
+                execution_id=execution_id,
+                move_id=request.move_id,
+                terminal_cause="no_signal_trip",
+            )
+        return MotionExecutionOutcome(
+            execution_id=execution_id,
+            move_id=request.move_id,
+            terminal_cause="completed_normally",
+        )
+
+    def get_execution_outcome(
+        self, execution_id: int
+    ) -> Optional[MotionExecutionOutcome]:
+        return self._outcomes.get(execution_id)
 
     def preview_motion(
         self,

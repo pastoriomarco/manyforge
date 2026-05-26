@@ -91,11 +91,15 @@ class TestCatalogLoading:
         v0_entries = catalog.filter_by_profile("v0.0")
         assert all(entry.profiles_min == "v0.0" for entry in v0_entries)
         v0_ids = {entry.id for entry in v0_entries}
+        # v0.1 entries (post-v0.0)
         assert "command_gripper" not in v0_ids
         assert "upsert_collision_object" not in v0_ids
         assert "attach_object_to_link" not in v0_ids
         assert "detach_object_from_link" not in v0_ids
-        assert len(v0_entries) == len(catalog.entries) - 4
+        # v0.2 entries: Phase 4.5E motion-scoped trip nodes
+        assert "move_until_signal" not in v0_ids
+        assert "probe_search_move" not in v0_ids
+        assert len(v0_entries) == len(catalog.entries) - 6
 
     def test_command_gripper_is_marked_experimental(self):
         catalog = NodeCatalog(CATALOG_PATH)

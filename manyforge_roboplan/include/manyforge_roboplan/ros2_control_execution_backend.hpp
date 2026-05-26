@@ -2,9 +2,9 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <cstddef>
 #include <memory>
 #include <mutex>
-#include <optional>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -27,38 +27,11 @@
 #include <manyforge_core/execution_kernel.hpp>
 #include <manyforge_core/ports/iexecution_backend.hpp>
 #include <manyforge_core/time/iclock.hpp>
+#include <manyforge_roboplan/ros2_control_capability.hpp>
 
 namespace manyforge::roboplan_backend {
 
 struct NativeKernelBundle;
-
-struct Ros2ControlExecutionBackendConfig {
-  std::string node_name = "manyforge_ros2_control_execution_backend";
-  std::string action_name;
-  std::string joint_state_topic = "/joint_states";
-  std::string controller_state_topic;
-  std::vector<std::string> required_joints;
-
-  double joint_state_max_age_s = 0.25;
-  double wait_for_state_timeout_s = 1.0;
-  double wait_for_action_server_timeout_s = 2.0;
-  double start_tolerance_rad = 0.02;
-  double final_tolerance_rad = 0.02;
-  double tracking_error_tolerance_rad = 0.05;
-  double tracking_error_timeout_s = 0.1;
-  double monitor_period_s = 0.01;
-  double stop_completion_timeout_s = 2.0;
-  double sim_reset_motion_duration_s = 2.0;
-  bool require_fresh_state_before_planning = true;
-  bool disable_controller_path_tolerances = false;
-  std::string execution_state_source_mode = "observed_robot";
-  std::vector<double> initial_joint_positions_rad;
-  std::string command_gate_topic;
-  // JTC Jazzy+ on-controller speed-scaling input. If empty, derived from
-  // action_name by replacing `/follow_joint_trajectory` with
-  // `/speed_scaling_input`.
-  std::string speed_scaling_topic;
-};
 
 struct Ros2GripperActionConfig {
   std::string action_name = "/robotiq_gripper_controller/gripper_cmd";
@@ -116,6 +89,41 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
   core::ExecutionHandle resume(const core::TrajectoryDTO& trajectory) override;
   core::ResetResultDTO reset() override;
   core::ExecutionSnapshot get_execution_snapshot() const override;
+
+  // Phase 4.5D-3..4.5G: controlled-stop capability + result surface
+  // for motion-scoped interrupt outcomes (spec/260 §5.6). The
+  // ros2_control adapter supports these stop modes:
+  // - `kSpringBackHold`: JTC preempt + anchored-hold (4.5D-3). Always
+  //   available; cancel the active FollowJointTrajectory goal,
+  //   dispatch a new goal anchored at the observed joint state with
+  //   a future zero-velocity hold point, await the controller's
+  //   terminal result, surface as `kFjtPreemptHold`.
+  // - `kHardDeceleration`: native JTC `decelerate_on_cancel` (4.5D-4).
+  //   Advertised only when controller-config evidence is complete
+  //   (see `Ros2ControlExecutionBackendConfig` capability fields);
+  //   cancel the active goal and let the controller decelerate
+  //   in-place using its configured per-joint limits, surface as
+  //   `kJtcCancelDecelerateOnCancel` with `stop_distance_rad`
+  //   telemetry.
+  // - `kSoftOnPath`: Phase 4.5G path-ramp replacement trajectory,
+  //   advertised only when explicitly enabled and JTC speed-scaling
+  //   input is disabled. The older D-5 scaffold remains available behind
+  //   `enable_soft_on_path_experimental` and executes through explicit
+  //   spring-back fallback gating.
+  core::MotionInterruptStopCapabilityDTO
+  get_motion_interrupt_stop_capability() const override;
+  core::ControlledStopResultDTO execute_controlled_stop(
+      const core::MotionInterruptStopProfileDTO& profile) override;
+
+  // Phase 4.5D-4: pure capability evaluation, exposed as a static so
+  // tests and deployment audit tools can verify which stop modes a
+  // deployment's `Ros2ControlExecutionBackendConfig` will advertise
+  // without instantiating ROS. The runtime
+  // `get_motion_interrupt_stop_capability()` is just a thin wrapper
+  // around this helper.
+  static core::MotionInterruptStopCapabilityDTO
+  compute_motion_interrupt_stop_capability(
+      const Ros2ControlExecutionBackendConfig& config);
 
   // Streaming-session mode (ADR-0016).
   //
@@ -343,6 +351,14 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
   bool resync_in_progress_ = false;
   GoalHandleFJT::SharedPtr active_goal_handle_;
   std::optional<rclcpp_action::GoalUUID> active_goal_id_;
+  // Phase 4.5D-4: the raw rclcpp_action result code from the last
+  // discrete-trajectory goal terminal callback. Persisted so the
+  // hard_deceleration controlled-stop path can distinguish a true
+  // `CANCELED` (controller honored decelerate_on_cancel) from a
+  // `SUCCEEDED` race where the trajectory completed normally just
+  // as the stop was requested. Reset to `std::nullopt` at each new
+  // dispatch.
+  std::optional<rclcpp_action::ResultCode> last_action_result_code_;
   std::chrono::steady_clock::time_point execution_started_at_;
   std::optional<std::chrono::steady_clock::time_point> stop_requested_at_;
   std::optional<std::chrono::steady_clock::time_point> tracking_error_since_;
@@ -358,7 +374,17 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
       const std::vector<double>& target_positions,
       double target_time_from_start_s,
       bool track_terminal_goal = false);
+  bool streaming_send_replacement_trajectory(
+      const core::TrajectoryDTO& trajectory,
+      bool track_terminal_goal = false);
   bool streaming_send_spring_back_stop();
+  void begin_streaming_path_deviation_tracking(
+      const core::TrajectoryDTO& accepted_trajectory,
+      double initial_path_deviation_rad);
+  void record_streaming_path_deviation_feedback(
+      const std::vector<std::string>& joint_names,
+      const std::vector<double>& positions);
+  void clear_streaming_path_deviation_tracking();
   void on_streaming_terminal_result(
       const GoalHandleFJT::WrappedResult& result);
 
@@ -372,6 +398,9 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
   // ADR-0018: runtime velocity scale read by monitor/dispatcher loops.
   std::atomic<double> runtime_velocity_scale_{1.0};
   std::atomic<double> applied_runtime_velocity_scale_{1.0};
+  std::optional<core::TrajectoryDTO> active_trajectory_;
+  double active_trajectory_time_s_ = 0.0;
+  double active_runtime_velocity_scale_ = 1.0;
   std::optional<core::StreamingTargetDTO> streaming_target_;
   // The most-recent goal handle issued by the streaming dispatcher.
   // Subsequent dispatches preempt it via async_send_goal; the existing
@@ -381,6 +410,10 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
   bool streaming_terminal_result_received_ = true;
   bool streaming_terminal_result_success_ = true;
   std::optional<core::ErrorDTO> streaming_terminal_error_;
+  std::optional<core::TrajectoryDTO> streaming_path_deviation_reference_;
+  std::optional<double> streaming_path_deviation_max_rad_;
+  std::size_t streaming_path_deviation_feedback_samples_ = 0;
+  std::optional<core::ErrorDTO> streaming_path_deviation_error_;
 };
 
 std::shared_ptr<NativeKernelBundle> create_ros2_control_kernel(

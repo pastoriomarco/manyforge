@@ -8,6 +8,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <functional>
+#include <iostream>
 #include <map>
 #include <mutex>
 #include <stdexcept>
@@ -389,6 +390,45 @@ class MockExecution : public IExecutionBackend {
     return StreamingSessionBeginResultDTO{
         true, active_streaming_session_id, std::nullopt};
   }
+
+  /// Phase 4.5D-1: test backend declares spring_back_hold + hard_deceleration
+  /// as supported. Individual tests may further customize via the
+  /// `motion_interrupt_stop_capability` field.
+  MotionInterruptStopCapabilityDTO motion_interrupt_stop_capability{
+      {MotionInterruptStopMode::kSpringBackHold,
+       MotionInterruptStopMode::kHardDeceleration},
+      std::string{"mock_backend_capability"},
+      std::nullopt};
+
+  MotionInterruptStopCapabilityDTO
+  get_motion_interrupt_stop_capability() const override {
+    return motion_interrupt_stop_capability;
+  }
+
+  // Phase 4.5D-2: controlled-stop result surface. Default returns a
+  // successful native-simulated stop so trip tests using MockExecution
+  // produce signal_trip outcomes; individual tests can override
+  // `next_controlled_stop_result` to exercise failure / fallback paths.
+  std::optional<ControlledStopResultDTO> next_controlled_stop_result;
+  int controlled_stop_count = 0;
+  MotionInterruptStopProfileDTO last_controlled_stop_profile;
+
+  ControlledStopResultDTO execute_controlled_stop(
+      const MotionInterruptStopProfileDTO& profile) override {
+    ++controlled_stop_count;
+    last_controlled_stop_profile = profile;
+    if (next_controlled_stop_result) {
+      return *next_controlled_stop_result;
+    }
+    ControlledStopResultDTO r;
+    r.accepted = true;
+    r.executed_stop_mode = profile.stop_mode;
+    r.stop_command_source =
+        MotionInterruptStopCommandSource::kNativeSimulatedStop;
+    r.backend_stop_confirmed = true;
+    r.confirmation_latency_ns = 1'000'000;  // 1 ms
+    return r;
+  }
 };
 
 class ControlledExecution : public IExecutionBackend {
@@ -494,6 +534,58 @@ class ControlledExecution : public IExecutionBackend {
   ExecutionSnapshot get_execution_snapshot() const override {
     std::lock_guard<std::mutex> lock(mu_);
     return snapshot;
+  }
+
+  /// Phase 4.5D-1: controlled-stop capability for trip tests using
+  /// ControlledExecution. Mirrors MockExecution; individual tests
+  /// may shrink the set to exercise capability-gate rejection.
+  MotionInterruptStopCapabilityDTO motion_interrupt_stop_capability{
+      {MotionInterruptStopMode::kSpringBackHold,
+       MotionInterruptStopMode::kHardDeceleration},
+      std::string{"controlled_backend_capability"},
+      std::nullopt};
+
+  MotionInterruptStopCapabilityDTO
+  get_motion_interrupt_stop_capability() const override {
+    return motion_interrupt_stop_capability;
+  }
+
+  // Phase 4.5D-2: controlled-stop result surface. Default returns a
+  // successful native-simulated stop; trip tests override
+  // `next_controlled_stop_result` for failure / fallback variants.
+  std::optional<ControlledStopResultDTO> next_controlled_stop_result;
+  // Tests targeting the post-stop snapshot capture path can override
+  // the joint vector the backend reports after controlled stop. When
+  // unset, the controlled-stop path leaves the snapshot's joint
+  // vector unchanged (the trajectory waypoints from execute_trajectory).
+  std::optional<std::vector<double>> next_post_stop_joint_positions_rad;
+  int controlled_stop_count = 0;
+  MotionInterruptStopProfileDTO last_controlled_stop_profile;
+
+  ControlledStopResultDTO execute_controlled_stop(
+      const MotionInterruptStopProfileDTO& profile) override {
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      ++controlled_stop_count;
+      last_controlled_stop_profile = profile;
+      running_ = false;
+      snapshot.state = ExecutionState::kStopped;
+      if (next_post_stop_joint_positions_rad) {
+        snapshot.joint_positions_rad = *next_post_stop_joint_positions_rad;
+      }
+    }
+    cv_.notify_all();
+    if (next_controlled_stop_result) {
+      return *next_controlled_stop_result;
+    }
+    ControlledStopResultDTO r;
+    r.accepted = true;
+    r.executed_stop_mode = profile.stop_mode;
+    r.stop_command_source =
+        MotionInterruptStopCommandSource::kNativeSimulatedStop;
+    r.backend_stop_confirmed = true;
+    r.confirmation_latency_ns = 1'000'000;
+    return r;
   }
 
   void set_progress(double progress,
@@ -3591,6 +3683,1694 @@ TEST_F(ExecutionKernelTest, ConcurrentStress_RapidExecuteStopCycles) {
   }
 
   EXPECT_EQ(local_kernel.get_status().state, ExecutionState::kIdle);
+}
+
+// =========================================================================
+// Phase 4.5C: motion-scoped interrupt arming/reaping/outcome store
+// =========================================================================
+
+namespace motion_45c {
+
+InterruptSourceDefinition make_fast_probe_source(std::string id) {
+  InterruptSourceDefinition src;
+  src.source_id = std::move(id);
+  src.adapter = InterruptAdapter::kInternalTest;
+  src.signal = src.source_id + "_signal";
+  src.source_class = InterruptSourceClass::kFastExecutionRelevant;
+  src.kind = InterruptSourceKind::kEdge;
+  src.priority = 700;
+  return src;
+}
+
+InterruptPolicyDefinition make_move_trip_policy(std::string policy_id,
+                                                  std::string source_id,
+                                                  int priority = 700) {
+  InterruptPolicyDefinition p;
+  p.policy_id = std::move(policy_id);
+  p.source_id = std::move(source_id);
+  p.priority = priority;
+  p.affected_phases = {InterruptExecutionPhase::kTrajectoryExecution};
+  p.preemption_action = InterruptPreemptionAction::kCompleteMoveOnSignal;
+  p.post_latch_disposition =
+      InterruptPostLatchDisposition::kAutoClearAfterMotionOutcome;
+  p.scope_kind = InterruptPolicyScopeKind::kMove;
+  // Allow both modes; the test selects which mode the scope uses.
+  // kTripIfAlreadyActive lets unit tests arm without first
+  // establishing a baseline sample (the kernel-level rejection of
+  // fast-interrupt signals from kIdle would prevent that anyway).
+  p.allowed_activation_modes = {
+      MotionInterruptActivationMode::kRequireInactiveAtArm,
+      MotionInterruptActivationMode::kTripIfAlreadyActive};
+  // Phase 4.5D-1: complete_move_on_signal policies MUST declare a
+  // non-empty allowed_stop_modes set. Defaults span the modes the
+  // kernel tests exercise (the kernel-level capability gate
+  // additionally enforces the backend's supported_stop_modes).
+  p.allowed_stop_modes = {MotionInterruptStopMode::kSpringBackHold,
+                            MotionInterruptStopMode::kSoftOnPath,
+                            MotionInterruptStopMode::kHardDeceleration};
+  return p;
+}
+
+/// Phase 4.5D-1: minimal stop profile so scopes can satisfy the
+/// stop_profile_required gate. Tests can override the mode.
+MotionInterruptStopProfileDTO make_stop_profile(
+    MotionInterruptStopMode mode = MotionInterruptStopMode::kSpringBackHold) {
+  MotionInterruptStopProfileDTO p;
+  p.profile_id = "test_stop_profile";
+  p.stop_mode = mode;
+  return p;
+}
+
+MotionInterruptStopProfileDTO make_soft_on_path_profile(
+    bool allow_spring_back_fallback,
+    bool allow_natural_completion_on_short_path = false) {
+  auto p = make_stop_profile(MotionInterruptStopMode::kSoftOnPath);
+  p.deceleration_time_s = 0.5;
+  p.max_stop_time_s = 1.0;
+  p.allow_natural_completion_on_short_path =
+      allow_natural_completion_on_short_path;
+  p.per_joint_max_deceleration_rad_s2 = {
+      {"j1", 100.0},
+      {"j2", 100.0},
+  };
+  if (allow_spring_back_fallback) {
+    p.allowed_fallback_modes = {MotionInterruptStopMode::kSpringBackHold};
+  }
+  return p;
+}
+
+InterruptSignalUpdate make_probe_sample(std::string source_id,
+                                          std::int64_t seq,
+                                          std::int64_t ts_ns,
+                                          bool active = false) {
+  InterruptSignalUpdate u;
+  u.source_id = std::move(source_id);
+  u.sequence_id = seq;
+  u.timestamp_ns = ts_ns;
+  u.value = active;
+  return u;
+}
+
+MotionInterruptScopeDTO make_scope(
+    std::string scope_id, std::string policy_id,
+    MotionInterruptActivationMode mode =
+        MotionInterruptActivationMode::kTripIfAlreadyActive,
+    MotionInterruptStopMode stop_mode =
+        MotionInterruptStopMode::kSpringBackHold) {
+  MotionInterruptScopeDTO scope;
+  scope.scope_id = std::move(scope_id);
+  scope.policy_id = std::move(policy_id);
+  scope.activation_mode = mode;
+  scope.stop_profile = make_stop_profile(stop_mode);
+  return scope;
+}
+
+}  // namespace motion_45c
+
+TEST_F(ExecutionKernelTest,
+       Execute_FreeMove_EmitsCompletedNormallyOutcome) {
+  auto result = execute_sync(make_test_request());
+  ASSERT_TRUE(result.ok());
+  EXPECT_EQ(kernel.get_status().state, ExecutionState::kCompleted);
+
+  auto outcome = kernel.get_execution_outcome(result.value());
+  ASSERT_TRUE(outcome.has_value());
+  EXPECT_EQ(outcome->execution_id, result.value());
+  EXPECT_EQ(outcome->move_id, "move_1");
+  EXPECT_EQ(outcome->terminal_cause,
+            MotionExecutionTerminalCause::kCompletedNormally);
+  EXPECT_FALSE(outcome->trip.has_value());
+  EXPECT_FALSE(outcome->error.has_value());
+}
+
+TEST_F(ExecutionKernelTest,
+       GetExecutionOutcome_UnknownIdReturnsNullopt) {
+  EXPECT_FALSE(kernel.get_execution_outcome(9999u).has_value());
+}
+
+TEST_F(ExecutionKernelTest,
+       Execute_ScopedMoveHappyPath_EmitsNoSignalTripOutcome) {
+  using namespace motion_45c;
+  ASSERT_TRUE(kernel.register_interrupt_source(
+                  make_fast_probe_source("probe")).ok());
+  ASSERT_TRUE(kernel.register_interrupt_policy(
+                  make_move_trip_policy("probe_trip", "probe")).ok());
+
+  auto req = make_test_request("probe_move");
+  // kTripIfAlreadyActive arms without a prior baseline; no signal is
+  // published, so the move completes normally and the outcome is
+  // coerced from completed_normally to no_signal_trip.
+  req.motion_interrupt_scopes = {make_scope("scope_a", "probe_trip")};
+  auto result = execute_sync(req);
+  ASSERT_TRUE(result.ok());
+  EXPECT_EQ(kernel.get_status().state, ExecutionState::kCompleted);
+
+  auto outcome = kernel.get_execution_outcome(result.value());
+  ASSERT_TRUE(outcome.has_value());
+  EXPECT_EQ(outcome->terminal_cause,
+            MotionExecutionTerminalCause::kNoSignalTrip);
+  EXPECT_FALSE(outcome->trip.has_value());
+  EXPECT_FALSE(outcome->error.has_value());
+
+  // Reap MUST run: no armed bindings remain.
+  EXPECT_TRUE(kernel.active_motion_interrupt_scopes().empty());
+}
+
+TEST_F(ExecutionKernelTest,
+       Execute_ScopedMoveArmFails_NeverDispatches) {
+  using namespace motion_45c;
+  ASSERT_TRUE(kernel.register_interrupt_source(
+                  make_fast_probe_source("probe")).ok());
+  ASSERT_TRUE(kernel.register_interrupt_policy(
+                  make_move_trip_policy("probe_trip", "probe")).ok());
+
+  // kRequireInactiveAtArm with no recorded baseline fails arming
+  // (spec/260 §B.1: arming must have a fresh sample).
+  auto req = make_test_request("probe_move");
+  req.motion_interrupt_scopes = {make_scope(
+      "scope_a", "probe_trip",
+      MotionInterruptActivationMode::kRequireInactiveAtArm)};
+  const int planner_calls_before = planner.plan_count;
+  const int execute_calls_before = execution.execute_count;
+
+  auto result = execute_sync(req);
+  ASSERT_TRUE(result.ok());  // execute() returns id, worker fails
+  EXPECT_EQ(kernel.get_status().state, ExecutionState::kFailed);
+
+  // The backend MUST NOT have been dispatched.
+  EXPECT_EQ(execution.execute_count, execute_calls_before);
+  // Planning still ran (arming is post-validation).
+  EXPECT_GT(planner.plan_count, planner_calls_before);
+
+  auto outcome = kernel.get_execution_outcome(result.value());
+  ASSERT_TRUE(outcome.has_value());
+  EXPECT_EQ(outcome->terminal_cause,
+            MotionExecutionTerminalCause::kFailed);
+  ASSERT_TRUE(outcome->error.has_value());
+  // Spec/210 §5.2: motion_interrupt_arm_failed is a first-class error
+  // code. The kernel promotes the manager's `details["reason"]` to the
+  // canonical code so callers don't have to read the nested detail.
+  EXPECT_EQ(outcome->error->code, kErrorMotionInterruptArmFailed);
+  EXPECT_EQ(outcome->error->details.at("reason"),
+            "motion_interrupt_arm_failed");
+  EXPECT_TRUE(kernel.active_motion_interrupt_scopes().empty());
+}
+
+TEST_F(ExecutionKernelTest,
+       Execute_ScopedMoveArmFails_LastErrorClassifiedAsArmFailed) {
+  // Regression for codex review finding: `error_code_from_dto` must map
+  // the motion_interrupt_* string codes back to their ErrorCode enum
+  // entries so the state-machine `last_error` surface — which Composer
+  // and release evidence consume — distinguishes arm failures from
+  // generic internal errors.
+  using namespace motion_45c;
+  ASSERT_TRUE(kernel.register_interrupt_source(
+                  make_fast_probe_source("probe")).ok());
+  ASSERT_TRUE(kernel.register_interrupt_policy(
+                  make_move_trip_policy("probe_trip", "probe")).ok());
+
+  auto req = make_test_request("probe_move_lasterr");
+  req.motion_interrupt_scopes = {make_scope(
+      "scope_a", "probe_trip",
+      MotionInterruptActivationMode::kRequireInactiveAtArm)};
+  auto result = execute_sync(req);
+  ASSERT_TRUE(result.ok());
+  EXPECT_EQ(kernel.get_status().state, ExecutionState::kFailed);
+  EXPECT_EQ(kernel.get_status().last_error,
+            ErrorCode::kMotionInterruptArmFailed);
+}
+
+// Phase 4.5D-2 superseded the 4.5C bridge: legacy
+// `Execute_ScopedTripDuringExecution_LastErrorClassifiedAsBackendStopFailed`
+// was removed because the kCompleteMoveOnSignal latch now produces a
+// signal_trip success via execute_controlled_stop. The equivalent
+// last_error fidelity coverage for trip-time stop failures lives in
+// `Execute_ScopedTrip_BackendStopFailureDowngradesToFailed` below.
+
+TEST_F(ExecutionKernelTest,
+       Execute_ScopedMoveArmFails_OutcomeQueryableByExecutionId) {
+  using namespace motion_45c;
+  // Unknown policy_id at arm time: a different failure mode than the
+  // missing-baseline test above; verifies the outcome is still
+  // queryable by execution_id and carries the manager's reason.
+  auto req = make_test_request("probe_move");
+  MotionInterruptScopeDTO bad;
+  bad.scope_id = "scope_a";
+  bad.policy_id = "policy_does_not_exist";
+  req.motion_interrupt_scopes = {bad};
+  auto result = execute_sync(req);
+  ASSERT_TRUE(result.ok());
+  auto outcome = kernel.get_execution_outcome(result.value());
+  ASSERT_TRUE(outcome.has_value());
+  EXPECT_EQ(outcome->terminal_cause,
+            MotionExecutionTerminalCause::kFailed);
+  ASSERT_TRUE(outcome->error.has_value());
+  EXPECT_EQ(outcome->error->details.at("reason"),
+            "motion_interrupt_policy_not_found");
+}
+
+TEST_F(ExecutionKernelTest,
+       Execute_PlanningFailure_EmitsFailedOutcome) {
+  PlanResultDTO bad;
+  bad.error = ErrorDTO{kErrorPlanningFailed, "no plan", {}};
+  planner.next_result = bad;
+
+  auto result = execute_sync(make_test_request("plan_fail_move"));
+  ASSERT_TRUE(result.ok());
+  EXPECT_EQ(kernel.get_status().state, ExecutionState::kFailed);
+
+  auto outcome = kernel.get_execution_outcome(result.value());
+  ASSERT_TRUE(outcome.has_value());
+  EXPECT_EQ(outcome->terminal_cause,
+            MotionExecutionTerminalCause::kFailed);
+  ASSERT_TRUE(outcome->error.has_value());
+  EXPECT_EQ(outcome->error->code, kErrorPlanningFailed);
+}
+
+TEST_F(ExecutionKernelTest,
+       Execute_ScopedTripDuringExecution_EmitsSignalTripOutcome) {
+  using namespace motion_45c;
+  // Phase 4.5D-2 success path: backend's default
+  // execute_controlled_stop returns accepted + confirmed +
+  // native_simulated_stop. The kernel must transition
+  // Executing -> Stopping -> Completed and emit a
+  // MotionExecutionOutcomeDTO with terminal_cause = signal_trip and a
+  // populated MotionTripOutcomeDTO.
+  ControlledExecution controlled_execution;
+  FakeClock local_clock;
+  ManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  MockCollisionWorldPublisher local_publisher;
+  auto local_engine = std::make_shared<MockCollisionEngine>();
+  ExecutionKernel local_kernel{planner, context, controlled_execution,
+                                local_clock, local_scheduler, local_cache};
+  configure_authoritative_collision_validation(local_kernel, local_publisher,
+                                                local_engine);
+  ASSERT_TRUE(local_kernel.register_interrupt_source(
+                  make_fast_probe_source("probe")).ok());
+  ASSERT_TRUE(local_kernel.register_interrupt_policy(
+                  make_move_trip_policy("probe_trip", "probe")).ok());
+
+  auto req = make_test_request("trip_success");
+  req.motion_interrupt_scopes = {make_scope(
+      "scope_a", "probe_trip",
+      MotionInterruptActivationMode::kTripIfAlreadyActive)};
+  auto result = local_kernel.execute(req);
+  ASSERT_TRUE(result.ok());
+  ASSERT_TRUE(controlled_execution.wait_until_execute_called());
+  ASSERT_TRUE(wait_for_state(local_kernel, ExecutionState::kExecuting));
+
+  auto trip = make_probe_sample("probe", 2, local_clock.now(),
+                                   /*active=*/true);
+  ASSERT_TRUE(local_kernel.publish_fast_interrupt_signal(trip).latched);
+
+  ASSERT_TRUE(local_kernel.wait_for_completion(2'000'000'000));
+  EXPECT_EQ(local_kernel.get_status().state, ExecutionState::kCompleted);
+
+  auto outcome = local_kernel.get_execution_outcome(result.value());
+  ASSERT_TRUE(outcome.has_value());
+  EXPECT_EQ(outcome->terminal_cause,
+            MotionExecutionTerminalCause::kSignalTrip);
+  ASSERT_TRUE(outcome->trip.has_value());
+  EXPECT_EQ(outcome->trip->executed_stop_mode,
+            MotionInterruptStopMode::kSpringBackHold);
+  EXPECT_EQ(outcome->trip->stop_command_source,
+            MotionInterruptStopCommandSource::kNativeSimulatedStop);
+  EXPECT_TRUE(outcome->trip->stop_snapshot.backend_stop_confirmed);
+  EXPECT_FALSE(outcome->error.has_value());
+  EXPECT_TRUE(local_kernel.active_motion_interrupt_scopes().empty());
+  EXPECT_FALSE(local_kernel.get_active_interrupt_latch().has_value())
+      << "latch must be cleared via auto_clear_after_motion_outcome";
+  EXPECT_EQ(controlled_execution.controlled_stop_count, 1);
+  EXPECT_EQ(controlled_execution.last_controlled_stop_profile.stop_mode,
+            MotionInterruptStopMode::kSpringBackHold);
+}
+
+TEST_F(ExecutionKernelTest,
+       Execute_ScopedTrip_BackendStopFailureDowngradesToFailed) {
+  using namespace motion_45c;
+  // Phase 4.5D-2 failure path: backend returns accepted=false.
+  // Kernel transitions Stopping -> Failed and emits terminal_cause =
+  // failed with motion_interrupt_backend_stop_failed.
+  ControlledExecution controlled_execution;
+  ControlledStopResultDTO failure;
+  failure.accepted = false;
+  failure.executed_stop_mode = MotionInterruptStopMode::kSpringBackHold;
+  failure.stop_command_source =
+      MotionInterruptStopCommandSource::kDiagnosticOther;
+  failure.error = ErrorDTO{kErrorMotionInterruptBackendStopFailed,
+                            "simulated backend refusal",
+                            {{"reason", "controller_rejected_goal"}}};
+  controlled_execution.next_controlled_stop_result = failure;
+
+  FakeClock local_clock;
+  ManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  MockCollisionWorldPublisher local_publisher;
+  auto local_engine = std::make_shared<MockCollisionEngine>();
+  ExecutionKernel local_kernel{planner, context, controlled_execution,
+                                local_clock, local_scheduler, local_cache};
+  configure_authoritative_collision_validation(local_kernel, local_publisher,
+                                                local_engine);
+  ASSERT_TRUE(local_kernel.register_interrupt_source(
+                  make_fast_probe_source("probe")).ok());
+  ASSERT_TRUE(local_kernel.register_interrupt_policy(
+                  make_move_trip_policy("probe_trip", "probe")).ok());
+
+  auto req = make_test_request("trip_backend_refuse");
+  req.motion_interrupt_scopes = {make_scope(
+      "scope_a", "probe_trip",
+      MotionInterruptActivationMode::kTripIfAlreadyActive)};
+  auto result = local_kernel.execute(req);
+  ASSERT_TRUE(result.ok());
+  ASSERT_TRUE(controlled_execution.wait_until_execute_called());
+  ASSERT_TRUE(wait_for_state(local_kernel, ExecutionState::kExecuting));
+  auto trip = make_probe_sample("probe", 2, local_clock.now(), true);
+  ASSERT_TRUE(local_kernel.publish_fast_interrupt_signal(trip).latched);
+
+  ASSERT_TRUE(local_kernel.wait_for_completion(2'000'000'000));
+  // Spec/230 §3.4: backend-stop failure on a complete_move_on_signal
+  // trip transitions to InterventionRequired (uncertain robot state).
+  // Outcome cause is `failed` per spec/210 §3.11.
+  EXPECT_EQ(local_kernel.get_status().state,
+            ExecutionState::kInterventionRequired);
+  EXPECT_EQ(local_kernel.get_status().last_error,
+            ErrorCode::kMotionInterruptBackendStopFailed);
+
+  auto outcome = local_kernel.get_execution_outcome(result.value());
+  ASSERT_TRUE(outcome.has_value());
+  EXPECT_EQ(outcome->terminal_cause,
+            MotionExecutionTerminalCause::kFailed);
+  ASSERT_TRUE(outcome->error.has_value());
+  EXPECT_EQ(outcome->error->code, kErrorMotionInterruptBackendStopFailed);
+  EXPECT_EQ(outcome->error->details.at("reason"),
+            "controller_rejected_goal");
+  EXPECT_FALSE(outcome->trip.has_value());
+  // Latch persists for operator intervention-acknowledge.
+  EXPECT_TRUE(local_kernel.get_active_interrupt_latch().has_value());
+}
+
+TEST_F(ExecutionKernelTest,
+       Execute_ScopedTrip_BackendNotConfirmedDowngradesToFailed) {
+  using namespace motion_45c;
+  // Phase 4.5D-2 conjunctive rule #3: backend_stop_confirmed=false
+  // downgrades to failed even when accepted=true.
+  ControlledExecution controlled_execution;
+  ControlledStopResultDTO unconfirmed;
+  unconfirmed.accepted = true;
+  unconfirmed.backend_stop_confirmed = false;
+  unconfirmed.executed_stop_mode = MotionInterruptStopMode::kSpringBackHold;
+  unconfirmed.stop_command_source =
+      MotionInterruptStopCommandSource::kFjtPreemptHold;
+  controlled_execution.next_controlled_stop_result = unconfirmed;
+
+  FakeClock local_clock;
+  ManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  MockCollisionWorldPublisher local_publisher;
+  auto local_engine = std::make_shared<MockCollisionEngine>();
+  ExecutionKernel local_kernel{planner, context, controlled_execution,
+                                local_clock, local_scheduler, local_cache};
+  configure_authoritative_collision_validation(local_kernel, local_publisher,
+                                                local_engine);
+  ASSERT_TRUE(local_kernel.register_interrupt_source(
+                  make_fast_probe_source("probe")).ok());
+  ASSERT_TRUE(local_kernel.register_interrupt_policy(
+                  make_move_trip_policy("probe_trip", "probe")).ok());
+
+  auto req = make_test_request("trip_no_confirm");
+  req.motion_interrupt_scopes = {make_scope(
+      "scope_a", "probe_trip",
+      MotionInterruptActivationMode::kTripIfAlreadyActive)};
+  auto result = local_kernel.execute(req);
+  ASSERT_TRUE(result.ok());
+  ASSERT_TRUE(controlled_execution.wait_until_execute_called());
+  ASSERT_TRUE(wait_for_state(local_kernel, ExecutionState::kExecuting));
+  auto trip = make_probe_sample("probe", 2, local_clock.now(), true);
+  ASSERT_TRUE(local_kernel.publish_fast_interrupt_signal(trip).latched);
+  ASSERT_TRUE(local_kernel.wait_for_completion(2'000'000'000));
+  EXPECT_EQ(local_kernel.get_status().state,
+            ExecutionState::kInterventionRequired);
+
+  auto outcome = local_kernel.get_execution_outcome(result.value());
+  ASSERT_TRUE(outcome.has_value());
+  ASSERT_TRUE(outcome->error.has_value());
+  EXPECT_EQ(outcome->error->details.at("reason"),
+            "backend_stop_not_confirmed");
+  EXPECT_TRUE(local_kernel.get_active_interrupt_latch().has_value());
+}
+
+TEST_F(ExecutionKernelTest,
+       Execute_ScopedTrip_ExecutedModeNotInAllowedFallbackDowngradesToFailed) {
+  using namespace motion_45c;
+  // Phase 4.5D-2 conjunctive rule #1: backend executed kHardDeceleration
+  // but the scope's allowed_fallback_modes does not include it.
+  ControlledExecution controlled_execution;
+  ControlledStopResultDTO unauthorized_fallback;
+  unauthorized_fallback.accepted = true;
+  unauthorized_fallback.backend_stop_confirmed = true;
+  unauthorized_fallback.executed_stop_mode =
+      MotionInterruptStopMode::kHardDeceleration;
+  unauthorized_fallback.stop_command_source =
+      MotionInterruptStopCommandSource::kJtcCancelDecelerateOnCancel;
+  unauthorized_fallback.fallback_reason = "controller_rejected_spring_back";
+  controlled_execution.next_controlled_stop_result = unauthorized_fallback;
+
+  FakeClock local_clock;
+  ManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  MockCollisionWorldPublisher local_publisher;
+  auto local_engine = std::make_shared<MockCollisionEngine>();
+  ExecutionKernel local_kernel{planner, context, controlled_execution,
+                                local_clock, local_scheduler, local_cache};
+  configure_authoritative_collision_validation(local_kernel, local_publisher,
+                                                local_engine);
+  ASSERT_TRUE(local_kernel.register_interrupt_source(
+                  make_fast_probe_source("probe")).ok());
+  ASSERT_TRUE(local_kernel.register_interrupt_policy(
+                  make_move_trip_policy("probe_trip", "probe")).ok());
+
+  auto req = make_test_request("trip_unauthorized_fallback");
+  // Scope requests spring_back_hold; no fallbacks listed.
+  req.motion_interrupt_scopes = {make_scope(
+      "scope_a", "probe_trip",
+      MotionInterruptActivationMode::kTripIfAlreadyActive,
+      MotionInterruptStopMode::kSpringBackHold)};
+  auto result = local_kernel.execute(req);
+  ASSERT_TRUE(result.ok());
+  ASSERT_TRUE(controlled_execution.wait_until_execute_called());
+  ASSERT_TRUE(wait_for_state(local_kernel, ExecutionState::kExecuting));
+  auto trip = make_probe_sample("probe", 2, local_clock.now(), true);
+  ASSERT_TRUE(local_kernel.publish_fast_interrupt_signal(trip).latched);
+  ASSERT_TRUE(local_kernel.wait_for_completion(2'000'000'000));
+  EXPECT_EQ(local_kernel.get_status().state,
+            ExecutionState::kInterventionRequired);
+
+  auto outcome = local_kernel.get_execution_outcome(result.value());
+  ASSERT_TRUE(outcome.has_value());
+  ASSERT_TRUE(outcome->error.has_value());
+  EXPECT_EQ(outcome->error->details.at("reason"),
+            "executed_mode_not_in_allowed_fallback_modes");
+  EXPECT_FALSE(outcome->trip.has_value());
+  EXPECT_TRUE(local_kernel.get_active_interrupt_latch().has_value());
+}
+
+TEST_F(ExecutionKernelTest,
+       Execute_ScopedTrip_FallbackHonoredWhenAllowed) {
+  using namespace motion_45c;
+  // Phase 4.5G fallback matrix v1: the only qualified generic
+  // requested/executed mismatch is soft_on_path -> spring_back_hold.
+  // The scope listed the fallback, the backend reported a stable
+  // fallback_reason, and the node category is kGeneric.
+  ControlledExecution controlled_execution;
+  controlled_execution.motion_interrupt_stop_capability.supported_stop_modes =
+      {MotionInterruptStopMode::kSoftOnPath,
+       MotionInterruptStopMode::kSpringBackHold};
+  ControlledStopResultDTO fallback_ok;
+  fallback_ok.accepted = true;
+  fallback_ok.backend_stop_confirmed = true;
+  fallback_ok.executed_stop_mode =
+      MotionInterruptStopMode::kSpringBackHold;
+  fallback_ok.stop_command_source =
+      MotionInterruptStopCommandSource::kDiagnosticOther;
+  fallback_ok.fallback_reason = "soft_on_path_scaffold_anchored_hold_fallback";
+  controlled_execution.next_controlled_stop_result = fallback_ok;
+
+  FakeClock local_clock;
+  ManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  MockCollisionWorldPublisher local_publisher;
+  auto local_engine = std::make_shared<MockCollisionEngine>();
+  ExecutionKernel local_kernel{planner, context, controlled_execution,
+                                local_clock, local_scheduler, local_cache};
+  configure_authoritative_collision_validation(local_kernel, local_publisher,
+                                                local_engine);
+  ASSERT_TRUE(local_kernel.register_interrupt_source(
+                  make_fast_probe_source("probe")).ok());
+  ASSERT_TRUE(local_kernel.register_interrupt_policy(
+                  make_move_trip_policy("probe_trip", "probe")).ok());
+
+  auto req = make_test_request("trip_fallback_ok");
+  auto scope = make_scope("scope_a", "probe_trip",
+                            MotionInterruptActivationMode::kTripIfAlreadyActive,
+                            MotionInterruptStopMode::kSoftOnPath);
+  scope.stop_profile->deceleration_time_s = 0.2;
+  scope.stop_profile->per_joint_max_deceleration_rad_s2 = {
+      {"j1", 10.0}, {"j2", 10.0}};
+  scope.stop_profile->allowed_fallback_modes = {
+      MotionInterruptStopMode::kSpringBackHold};
+  scope.node_category = MotionInterruptNodeCategory::kGeneric;
+  req.motion_interrupt_scopes = {scope};
+
+  auto result = local_kernel.execute(req);
+  ASSERT_TRUE(result.ok());
+  ASSERT_TRUE(controlled_execution.wait_until_execute_called());
+  ASSERT_TRUE(wait_for_state(local_kernel, ExecutionState::kExecuting));
+  auto trip = make_probe_sample("probe", 2, local_clock.now(), true);
+  ASSERT_TRUE(local_kernel.publish_fast_interrupt_signal(trip).latched);
+  ASSERT_TRUE(local_kernel.wait_for_completion(2'000'000'000));
+  EXPECT_EQ(local_kernel.get_status().state, ExecutionState::kCompleted);
+
+  auto outcome = local_kernel.get_execution_outcome(result.value());
+  ASSERT_TRUE(outcome.has_value());
+  EXPECT_EQ(outcome->terminal_cause,
+            MotionExecutionTerminalCause::kSignalTrip);
+  ASSERT_TRUE(outcome->trip.has_value());
+  EXPECT_EQ(outcome->trip->executed_stop_mode,
+            MotionInterruptStopMode::kSpringBackHold);
+  ASSERT_TRUE(outcome->trip->fallback_reason.has_value());
+  EXPECT_EQ(*outcome->trip->fallback_reason,
+            "soft_on_path_scaffold_anchored_hold_fallback");
+  EXPECT_EQ(outcome->trip->diagnostics.at("fallback_qualification_id"),
+            "4.5G-soft_on_path-to-spring_back_hold-generic-v1");
+  EXPECT_EQ(outcome->trip->diagnostics.at("fallback_pair"),
+            "soft_on_path->spring_back_hold");
+  EXPECT_EQ(outcome->trip->diagnostics.at(
+                "fallback_qualification_evidence_status"),
+            "in_tree_qualified; live_adapter_evidence_required_for_release");
+}
+
+TEST_F(ExecutionKernelTest,
+       Execute_ScopedTrip_SoftOnPathNaturalCompletionMapsToNoSignalTrip) {
+  using namespace motion_45c;
+  ControlledExecution controlled_execution;
+  controlled_execution.motion_interrupt_stop_capability.supported_stop_modes =
+      {MotionInterruptStopMode::kSoftOnPath};
+  MotionInterruptSoftOnPathPlannerConfigDTO soft_planner_config;
+  soft_planner_config.per_joint_max_jerk_rad_s3 = {
+      {"j1", 1'000'000.0}, {"j2", 1'000'000.0}};
+  controlled_execution.motion_interrupt_stop_capability
+      .soft_on_path_planner_config = soft_planner_config;
+  ControlledStopResultDTO natural_completion;
+  natural_completion.accepted = true;
+  natural_completion.backend_stop_confirmed = true;
+  natural_completion.completed_by_natural_completion = true;
+  natural_completion.executed_stop_mode = MotionInterruptStopMode::kSoftOnPath;
+  natural_completion.stop_command_source =
+      MotionInterruptStopCommandSource::kDiagnosticOther;
+  natural_completion.diagnostics["reason"] =
+      "soft_on_path_remaining_time_short";
+  natural_completion.diagnostics["recommended_disposition"] =
+      "natural_completion";
+  controlled_execution.next_controlled_stop_result = natural_completion;
+
+  FakeClock local_clock;
+  ManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  MockCollisionWorldPublisher local_publisher;
+  auto local_engine = std::make_shared<MockCollisionEngine>();
+  ExecutionKernel local_kernel{planner, context, controlled_execution,
+                                local_clock, local_scheduler, local_cache};
+  configure_authoritative_collision_validation(local_kernel, local_publisher,
+                                                local_engine);
+  ASSERT_TRUE(local_kernel.register_interrupt_source(
+                  make_fast_probe_source("probe")).ok());
+  ASSERT_TRUE(local_kernel.register_interrupt_policy(
+                  make_move_trip_policy("probe_trip", "probe")).ok());
+
+  auto req = make_test_request("trip_natural_completion_ok");
+  auto scope = make_scope("scope_a", "probe_trip",
+                            MotionInterruptActivationMode::kTripIfAlreadyActive,
+                            MotionInterruptStopMode::kSoftOnPath);
+  scope.stop_profile = make_soft_on_path_profile(
+      /*allow_spring_back_fallback=*/false,
+      /*allow_natural_completion_on_short_path=*/true);
+  scope.stop_profile->allow_natural_completion_on_short_path = true;
+  scope.node_category = MotionInterruptNodeCategory::kGeneric;
+  req.motion_interrupt_scopes = {scope};
+
+  auto result = local_kernel.execute(req);
+  ASSERT_TRUE(result.ok());
+  ASSERT_TRUE(controlled_execution.wait_until_execute_called());
+  ASSERT_TRUE(wait_for_state(local_kernel, ExecutionState::kExecuting));
+  auto trip = make_probe_sample("probe", 2, local_clock.now(), true);
+  ASSERT_TRUE(local_kernel.publish_fast_interrupt_signal(trip).latched);
+  ASSERT_TRUE(local_kernel.wait_for_completion(2'000'000'000));
+  EXPECT_EQ(local_kernel.get_status().state, ExecutionState::kCompleted);
+
+  auto outcome = local_kernel.get_execution_outcome(result.value());
+  ASSERT_TRUE(outcome.has_value());
+  EXPECT_EQ(outcome->terminal_cause,
+            MotionExecutionTerminalCause::kNoSignalTrip);
+  EXPECT_FALSE(outcome->trip.has_value());
+  EXPECT_FALSE(outcome->error.has_value());
+  EXPECT_FALSE(local_kernel.get_active_interrupt_latch().has_value());
+  EXPECT_TRUE(local_kernel.active_motion_interrupt_scopes().empty());
+}
+
+TEST_F(ExecutionKernelTest,
+       Execute_ScopedTrip_UnqualifiedFallbackPairDowngradesToFailed) {
+  using namespace motion_45c;
+  // allowed_fallback_modes is a fail-closed guardrail, not production
+  // approval for arbitrary substitutions. spring_back_hold -> hard_deceleration
+  // is not in the Phase 4.5G fallback matrix, so the outcome must fail even
+  // though the profile listed the fallback and the backend confirmed it.
+  ControlledExecution controlled_execution;
+  ControlledStopResultDTO fallback_unqualified;
+  fallback_unqualified.accepted = true;
+  fallback_unqualified.backend_stop_confirmed = true;
+  fallback_unqualified.executed_stop_mode =
+      MotionInterruptStopMode::kHardDeceleration;
+  fallback_unqualified.stop_command_source =
+      MotionInterruptStopCommandSource::kJtcCancelDecelerateOnCancel;
+  fallback_unqualified.fallback_reason = "controller_no_spring_back_capability";
+  controlled_execution.next_controlled_stop_result = fallback_unqualified;
+
+  FakeClock local_clock;
+  ManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  MockCollisionWorldPublisher local_publisher;
+  auto local_engine = std::make_shared<MockCollisionEngine>();
+  ExecutionKernel local_kernel{planner, context, controlled_execution,
+                                local_clock, local_scheduler, local_cache};
+  configure_authoritative_collision_validation(local_kernel, local_publisher,
+                                                local_engine);
+  ASSERT_TRUE(local_kernel.register_interrupt_source(
+                  make_fast_probe_source("probe")).ok());
+  ASSERT_TRUE(local_kernel.register_interrupt_policy(
+                  make_move_trip_policy("probe_trip", "probe")).ok());
+
+  auto req = make_test_request("trip_unqualified_fallback");
+  auto scope = make_scope("scope_a", "probe_trip",
+                            MotionInterruptActivationMode::kTripIfAlreadyActive,
+                            MotionInterruptStopMode::kSpringBackHold);
+  scope.stop_profile->allowed_fallback_modes = {
+      MotionInterruptStopMode::kHardDeceleration};
+  scope.node_category = MotionInterruptNodeCategory::kGeneric;
+  req.motion_interrupt_scopes = {scope};
+
+  auto result = local_kernel.execute(req);
+  ASSERT_TRUE(result.ok());
+  ASSERT_TRUE(controlled_execution.wait_until_execute_called());
+  ASSERT_TRUE(wait_for_state(local_kernel, ExecutionState::kExecuting));
+  auto trip = make_probe_sample("probe", 2, local_clock.now(), true);
+  ASSERT_TRUE(local_kernel.publish_fast_interrupt_signal(trip).latched);
+  ASSERT_TRUE(local_kernel.wait_for_completion(2'000'000'000));
+  EXPECT_EQ(local_kernel.get_status().state,
+            ExecutionState::kInterventionRequired);
+
+  auto outcome = local_kernel.get_execution_outcome(result.value());
+  ASSERT_TRUE(outcome.has_value());
+  EXPECT_EQ(outcome->terminal_cause,
+            MotionExecutionTerminalCause::kFailed);
+  ASSERT_TRUE(outcome->error.has_value());
+  EXPECT_EQ(outcome->error->details.at("reason"),
+            "fallback_pair_not_qualified");
+  EXPECT_FALSE(outcome->trip.has_value());
+  EXPECT_TRUE(local_kernel.get_active_interrupt_latch().has_value());
+}
+
+TEST_F(ExecutionKernelTest,
+       Execute_ScopedTrip_FallbackCommandSourceNotQualifiedDowngradesToFailed) {
+  using namespace motion_45c;
+  // The fallback matrix qualifies a requested/executed mode pair only for
+  // specific command sources. A backend cannot report the right stop modes
+  // while using an unqualified controller path and still claim a trip success.
+  ControlledExecution controlled_execution;
+  controlled_execution.motion_interrupt_stop_capability.supported_stop_modes =
+      {MotionInterruptStopMode::kSoftOnPath,
+       MotionInterruptStopMode::kSpringBackHold};
+  ControlledStopResultDTO wrong_source;
+  wrong_source.accepted = true;
+  wrong_source.backend_stop_confirmed = true;
+  wrong_source.executed_stop_mode =
+      MotionInterruptStopMode::kSpringBackHold;
+  wrong_source.stop_command_source =
+      MotionInterruptStopCommandSource::kJtcCancelDecelerateOnCancel;
+  wrong_source.fallback_reason = "controller_used_cancel_deceleration";
+  controlled_execution.next_controlled_stop_result = wrong_source;
+
+  FakeClock local_clock;
+  ManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  MockCollisionWorldPublisher local_publisher;
+  auto local_engine = std::make_shared<MockCollisionEngine>();
+  ExecutionKernel local_kernel{planner, context, controlled_execution,
+                                local_clock, local_scheduler, local_cache};
+  configure_authoritative_collision_validation(local_kernel, local_publisher,
+                                                local_engine);
+  ASSERT_TRUE(local_kernel.register_interrupt_source(
+                  make_fast_probe_source("probe")).ok());
+  ASSERT_TRUE(local_kernel.register_interrupt_policy(
+                  make_move_trip_policy("probe_trip", "probe")).ok());
+
+  auto req = make_test_request("trip_unqualified_fallback_source");
+  auto scope = make_scope("scope_a", "probe_trip",
+                            MotionInterruptActivationMode::kTripIfAlreadyActive,
+                            MotionInterruptStopMode::kSoftOnPath);
+  scope.stop_profile->deceleration_time_s = 0.2;
+  scope.stop_profile->per_joint_max_deceleration_rad_s2 = {
+      {"j1", 10.0}, {"j2", 10.0}};
+  scope.stop_profile->allowed_fallback_modes = {
+      MotionInterruptStopMode::kSpringBackHold};
+  scope.node_category = MotionInterruptNodeCategory::kGeneric;
+  req.motion_interrupt_scopes = {scope};
+
+  auto result = local_kernel.execute(req);
+  ASSERT_TRUE(result.ok());
+  ASSERT_TRUE(controlled_execution.wait_until_execute_called());
+  ASSERT_TRUE(wait_for_state(local_kernel, ExecutionState::kExecuting));
+  auto trip = make_probe_sample("probe", 2, local_clock.now(), true);
+  ASSERT_TRUE(local_kernel.publish_fast_interrupt_signal(trip).latched);
+  ASSERT_TRUE(local_kernel.wait_for_completion(2'000'000'000));
+  EXPECT_EQ(local_kernel.get_status().state,
+            ExecutionState::kInterventionRequired);
+
+  auto outcome = local_kernel.get_execution_outcome(result.value());
+  ASSERT_TRUE(outcome.has_value());
+  EXPECT_EQ(outcome->terminal_cause,
+            MotionExecutionTerminalCause::kFailed);
+  ASSERT_TRUE(outcome->error.has_value());
+  EXPECT_EQ(outcome->error->details.at("reason"),
+            "fallback_command_source_not_qualified");
+  EXPECT_FALSE(outcome->trip.has_value());
+  EXPECT_TRUE(local_kernel.get_active_interrupt_latch().has_value());
+}
+
+TEST_F(ExecutionKernelTest,
+       Execute_ScopedTrip_FallbackReasonRequiredWhenModeDiffers) {
+  // Phase 4.5D-2/4.5G conjunctive rule: even for a qualified fallback
+  // pair, an unset fallback_reason produces a failed outcome.
+  using namespace motion_45c;
+  ControlledExecution controlled_execution;
+  controlled_execution.motion_interrupt_stop_capability.supported_stop_modes =
+      {MotionInterruptStopMode::kSoftOnPath,
+       MotionInterruptStopMode::kSpringBackHold};
+  ControlledStopResultDTO no_reason;
+  no_reason.accepted = true;
+  no_reason.backend_stop_confirmed = true;
+  no_reason.executed_stop_mode =
+      MotionInterruptStopMode::kSpringBackHold;
+  no_reason.stop_command_source =
+      MotionInterruptStopCommandSource::kDiagnosticOther;
+  // fallback_reason intentionally unset
+  controlled_execution.next_controlled_stop_result = no_reason;
+
+  FakeClock local_clock;
+  ManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  MockCollisionWorldPublisher local_publisher;
+  auto local_engine = std::make_shared<MockCollisionEngine>();
+  ExecutionKernel local_kernel{planner, context, controlled_execution,
+                                local_clock, local_scheduler, local_cache};
+  configure_authoritative_collision_validation(local_kernel, local_publisher,
+                                                local_engine);
+  ASSERT_TRUE(local_kernel.register_interrupt_source(
+                  make_fast_probe_source("probe")).ok());
+  ASSERT_TRUE(local_kernel.register_interrupt_policy(
+                  make_move_trip_policy("probe_trip", "probe")).ok());
+
+  auto req = make_test_request("trip_missing_reason");
+  auto scope = make_scope("scope_a", "probe_trip",
+                            MotionInterruptActivationMode::kTripIfAlreadyActive,
+                            MotionInterruptStopMode::kSoftOnPath);
+  scope.stop_profile->deceleration_time_s = 0.2;
+  scope.stop_profile->per_joint_max_deceleration_rad_s2 = {
+      {"j1", 10.0}, {"j2", 10.0}};
+  scope.stop_profile->allowed_fallback_modes = {
+      MotionInterruptStopMode::kSpringBackHold};
+  req.motion_interrupt_scopes = {scope};
+
+  auto result = local_kernel.execute(req);
+  ASSERT_TRUE(result.ok());
+  ASSERT_TRUE(controlled_execution.wait_until_execute_called());
+  ASSERT_TRUE(wait_for_state(local_kernel, ExecutionState::kExecuting));
+  auto trip = make_probe_sample("probe", 2, local_clock.now(), true);
+  ASSERT_TRUE(local_kernel.publish_fast_interrupt_signal(trip).latched);
+  ASSERT_TRUE(local_kernel.wait_for_completion(2'000'000'000));
+
+  auto outcome = local_kernel.get_execution_outcome(result.value());
+  ASSERT_TRUE(outcome.has_value());
+  ASSERT_TRUE(outcome->error.has_value());
+  EXPECT_EQ(outcome->error->details.at("reason"), "fallback_reason_required");
+  EXPECT_EQ(local_kernel.get_status().state,
+            ExecutionState::kInterventionRequired);
+  EXPECT_TRUE(local_kernel.get_active_interrupt_latch().has_value());
+}
+
+TEST_F(ExecutionKernelTest,
+       Execute_ScopedTrip_PrecisionContactRejectsFallbackEvenIfBackendReturnsIt) {
+  // Defense in depth: precision-contact node category MUST NOT accept
+  // a stop-mode fallback at trip time even if the arm-time gate was
+  // bypassed (e.g. backend returned a different mode than requested).
+  // The arm-time gate already forbids non-empty allowed_fallback_modes
+  // for precision-contact, but the trip-time check here covers a
+  // backend that returns a fallback the arm gate didn't see.
+  using namespace motion_45c;
+  ControlledExecution controlled_execution;
+  ControlledStopResultDTO surprise_fallback;
+  surprise_fallback.accepted = true;
+  surprise_fallback.backend_stop_confirmed = true;
+  surprise_fallback.executed_stop_mode =
+      MotionInterruptStopMode::kHardDeceleration;
+  surprise_fallback.stop_command_source =
+      MotionInterruptStopCommandSource::kJtcCancelDecelerateOnCancel;
+  surprise_fallback.fallback_reason = "controller_fallback";
+  controlled_execution.next_controlled_stop_result = surprise_fallback;
+
+  FakeClock local_clock;
+  ManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  MockCollisionWorldPublisher local_publisher;
+  auto local_engine = std::make_shared<MockCollisionEngine>();
+  ExecutionKernel local_kernel{planner, context, controlled_execution,
+                                local_clock, local_scheduler, local_cache};
+  configure_authoritative_collision_validation(local_kernel, local_publisher,
+                                                local_engine);
+  ASSERT_TRUE(local_kernel.register_interrupt_source(
+                  make_fast_probe_source("probe")).ok());
+  ASSERT_TRUE(local_kernel.register_interrupt_policy(
+                  make_move_trip_policy("probe_trip", "probe")).ok());
+
+  auto req = make_test_request("precision_trip_fallback");
+  auto scope = make_scope("scope_a", "probe_trip",
+                            MotionInterruptActivationMode::kTripIfAlreadyActive,
+                            MotionInterruptStopMode::kSpringBackHold);
+  // Precision contact, no fallback listed (arm gate accepts).
+  scope.node_category = MotionInterruptNodeCategory::kPrecisionContact;
+  req.motion_interrupt_scopes = {scope};
+
+  auto result = local_kernel.execute(req);
+  ASSERT_TRUE(result.ok());
+  ASSERT_TRUE(controlled_execution.wait_until_execute_called());
+  ASSERT_TRUE(wait_for_state(local_kernel, ExecutionState::kExecuting));
+  auto trip = make_probe_sample("probe", 2, local_clock.now(), true);
+  ASSERT_TRUE(local_kernel.publish_fast_interrupt_signal(trip).latched);
+  ASSERT_TRUE(local_kernel.wait_for_completion(2'000'000'000));
+  EXPECT_EQ(local_kernel.get_status().state,
+            ExecutionState::kInterventionRequired);
+  auto outcome = local_kernel.get_execution_outcome(result.value());
+  ASSERT_TRUE(outcome.has_value());
+  ASSERT_TRUE(outcome->error.has_value());
+  EXPECT_EQ(outcome->error->details.at("reason"),
+            "executed_mode_not_in_allowed_fallback_modes");
+  EXPECT_TRUE(local_kernel.get_active_interrupt_latch().has_value());
+}
+
+TEST_F(ExecutionKernelTest,
+       Execute_ScopedTrip_ConfirmationLatencyExceedingMaxStopTimeFailsClosed) {
+  // Phase 4.5D-2 conjunctive rule: confirmation_latency_ns must not
+  // exceed max_stop_time_s (or complete_move_on_signal_timeout_ns).
+  using namespace motion_45c;
+  ControlledExecution controlled_execution;
+  ControlledStopResultDTO slow;
+  slow.accepted = true;
+  slow.backend_stop_confirmed = true;
+  slow.executed_stop_mode = MotionInterruptStopMode::kSpringBackHold;
+  slow.stop_command_source =
+      MotionInterruptStopCommandSource::kFjtPreemptHold;
+  slow.confirmation_latency_ns = 600'000'000;  // 600 ms
+  controlled_execution.next_controlled_stop_result = slow;
+
+  FakeClock local_clock;
+  ManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  MockCollisionWorldPublisher local_publisher;
+  auto local_engine = std::make_shared<MockCollisionEngine>();
+  ExecutionKernel local_kernel{planner, context, controlled_execution,
+                                local_clock, local_scheduler, local_cache};
+  configure_authoritative_collision_validation(local_kernel, local_publisher,
+                                                local_engine);
+  ASSERT_TRUE(local_kernel.register_interrupt_source(
+                  make_fast_probe_source("probe")).ok());
+  ASSERT_TRUE(local_kernel.register_interrupt_policy(
+                  make_move_trip_policy("probe_trip", "probe")).ok());
+
+  auto req = make_test_request("trip_slow_confirm");
+  auto scope = make_scope("scope_a", "probe_trip",
+                            MotionInterruptActivationMode::kTripIfAlreadyActive,
+                            MotionInterruptStopMode::kSpringBackHold);
+  scope.stop_profile->max_stop_time_s = 0.5;  // 500 ms
+  req.motion_interrupt_scopes = {scope};
+
+  auto result = local_kernel.execute(req);
+  ASSERT_TRUE(result.ok());
+  ASSERT_TRUE(controlled_execution.wait_until_execute_called());
+  ASSERT_TRUE(wait_for_state(local_kernel, ExecutionState::kExecuting));
+  auto trip = make_probe_sample("probe", 2, local_clock.now(), true);
+  ASSERT_TRUE(local_kernel.publish_fast_interrupt_signal(trip).latched);
+  ASSERT_TRUE(local_kernel.wait_for_completion(2'000'000'000));
+  EXPECT_EQ(local_kernel.get_status().state,
+            ExecutionState::kInterventionRequired);
+
+  auto outcome = local_kernel.get_execution_outcome(result.value());
+  ASSERT_TRUE(outcome.has_value());
+  ASSERT_TRUE(outcome->error.has_value());
+  EXPECT_EQ(outcome->error->details.at("reason"),
+            "backend_stop_confirmation_exceeded_max_stop_time_s");
+  EXPECT_TRUE(local_kernel.get_active_interrupt_latch().has_value());
+}
+
+// -------- Phase 4.5D-2 codex-review-follow-up coverage --------
+
+TEST_F(ExecutionKernelTest,
+       Execute_ScopedTrip_DefaultTimeoutEnforcedWhenMaxStopTimeUnset) {
+  // Finding 3: when stop_profile.max_stop_time_s is absent, the kernel
+  // MUST fall back to the deployment default
+  // (complete_move_on_signal_timeout_ns). A backend reporting a
+  // confirmation latency that exceeds the default still fails closed
+  // even with no explicit max_stop_time_s on the profile.
+  using namespace motion_45c;
+  ExecutionKernelConfig cfg;
+  cfg.complete_move_on_signal_timeout_ns = 100'000'000;  // 100 ms
+  ControlledExecution controlled_execution;
+  ControlledStopResultDTO slow;
+  slow.accepted = true;
+  slow.backend_stop_confirmed = true;
+  slow.executed_stop_mode = MotionInterruptStopMode::kSpringBackHold;
+  slow.stop_command_source =
+      MotionInterruptStopCommandSource::kFjtPreemptHold;
+  slow.confirmation_latency_ns = 200'000'000;  // 200 ms > 100 ms
+  controlled_execution.next_controlled_stop_result = slow;
+
+  FakeClock local_clock;
+  ManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  MockCollisionWorldPublisher local_publisher;
+  auto local_engine = std::make_shared<MockCollisionEngine>();
+  ExecutionKernel local_kernel{planner, context, controlled_execution,
+                                local_clock, local_scheduler, local_cache,
+                                cfg};
+  configure_authoritative_collision_validation(local_kernel, local_publisher,
+                                                local_engine);
+  ASSERT_TRUE(local_kernel.register_interrupt_source(
+                  make_fast_probe_source("probe")).ok());
+  ASSERT_TRUE(local_kernel.register_interrupt_policy(
+                  make_move_trip_policy("probe_trip", "probe")).ok());
+
+  auto req = make_test_request("trip_default_timeout");
+  auto scope = make_scope("scope_a", "probe_trip",
+                            MotionInterruptActivationMode::kTripIfAlreadyActive,
+                            MotionInterruptStopMode::kSpringBackHold);
+  // Intentionally leave scope.stop_profile->max_stop_time_s unset.
+  ASSERT_FALSE(scope.stop_profile->max_stop_time_s.has_value());
+  req.motion_interrupt_scopes = {scope};
+
+  auto result = local_kernel.execute(req);
+  ASSERT_TRUE(result.ok());
+  ASSERT_TRUE(controlled_execution.wait_until_execute_called());
+  ASSERT_TRUE(wait_for_state(local_kernel, ExecutionState::kExecuting));
+  auto trip = make_probe_sample("probe", 2, local_clock.now(), true);
+  ASSERT_TRUE(local_kernel.publish_fast_interrupt_signal(trip).latched);
+  ASSERT_TRUE(local_kernel.wait_for_completion(2'000'000'000));
+  EXPECT_EQ(local_kernel.get_status().state,
+            ExecutionState::kInterventionRequired);
+
+  auto outcome = local_kernel.get_execution_outcome(result.value());
+  ASSERT_TRUE(outcome.has_value());
+  ASSERT_TRUE(outcome->error.has_value());
+  EXPECT_EQ(outcome->error->details.at("reason"),
+            "backend_stop_confirmation_exceeded_max_stop_time_s");
+}
+
+TEST_F(ExecutionKernelTest,
+       Execute_ScopedTrip_SignalToLatchTimingPositive) {
+  // Finding 4: signal_to_latch_ns MUST be derived from the signal
+  // timestamp on the latch, not from any handler-local clock read.
+  using namespace motion_45c;
+  ControlledExecution controlled_execution;
+
+  FakeClock local_clock;
+  ManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  MockCollisionWorldPublisher local_publisher;
+  auto local_engine = std::make_shared<MockCollisionEngine>();
+  ExecutionKernel local_kernel{planner, context, controlled_execution,
+                                local_clock, local_scheduler, local_cache};
+  configure_authoritative_collision_validation(local_kernel, local_publisher,
+                                                local_engine);
+  ASSERT_TRUE(local_kernel.register_interrupt_source(
+                  make_fast_probe_source("probe")).ok());
+  ASSERT_TRUE(local_kernel.register_interrupt_policy(
+                  make_move_trip_policy("probe_trip", "probe")).ok());
+
+  auto req = make_test_request("trip_timing");
+  req.motion_interrupt_scopes = {make_scope(
+      "scope_a", "probe_trip",
+      MotionInterruptActivationMode::kTripIfAlreadyActive)};
+  auto result = local_kernel.execute(req);
+  ASSERT_TRUE(result.ok());
+  ASSERT_TRUE(controlled_execution.wait_until_execute_called());
+  ASSERT_TRUE(wait_for_state(local_kernel, ExecutionState::kExecuting));
+  // Send a signal whose timestamp is in the past (clock advances
+  // between the signal source observing the value and the manager
+  // accepting the latch). With FakeClock the manager's latched_at_ns
+  // will equal local_clock.now() at ingest; the signal carries an
+  // older timestamp, so latched_at_ns - timestamp_ns is strictly
+  // positive.
+  InterruptSignalUpdate signal;
+  signal.source_id = "probe";
+  signal.sequence_id = 2;
+  signal.timestamp_ns = local_clock.now() - 5'000'000;  // 5 ms older
+  signal.value = true;
+  ASSERT_TRUE(local_kernel.publish_fast_interrupt_signal(signal).latched);
+  ASSERT_TRUE(local_kernel.wait_for_completion(2'000'000'000));
+  EXPECT_EQ(local_kernel.get_status().state, ExecutionState::kCompleted);
+
+  auto outcome = local_kernel.get_execution_outcome(result.value());
+  ASSERT_TRUE(outcome.has_value());
+  ASSERT_TRUE(outcome->trip.has_value());
+  EXPECT_GT(outcome->trip->signal_to_latch_ns, 0)
+      << "signal_to_latch_ns must be derived from signal_snapshot.timestamp_ns";
+  EXPECT_GE(outcome->trip->latch_to_stop_confirmed_ns, 0);
+}
+
+TEST_F(ExecutionKernelTest,
+       Execute_ScopedTrip_StopSnapshotCarriesJointNamesFromPlanningContext) {
+  // Finding 2b: the captured ExecutionStopSnapshotDTO MUST satisfy
+  // spec/210 §3.7 size/ordering rules — joint_names non-empty and
+  // matching positions_rad length. The capture path pulls
+  // joint_names from the planning context's current_state so the
+  // RobotStateDTO is well-formed.
+  using namespace motion_45c;
+  ControlledExecution controlled_execution;
+  // Set ControlledExecution snapshot to a fresh post-stop state with
+  // two joint positions matching the test fixture's two joint names.
+  controlled_execution.snapshot.joint_positions_rad = {0.4, 0.4};
+
+  FakeClock local_clock;
+  ManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  MockCollisionWorldPublisher local_publisher;
+  auto local_engine = std::make_shared<MockCollisionEngine>();
+  ExecutionKernel local_kernel{planner, context, controlled_execution,
+                                local_clock, local_scheduler, local_cache};
+  configure_authoritative_collision_validation(local_kernel, local_publisher,
+                                                local_engine);
+  ASSERT_TRUE(local_kernel.register_interrupt_source(
+                  make_fast_probe_source("probe")).ok());
+  ASSERT_TRUE(local_kernel.register_interrupt_policy(
+                  make_move_trip_policy("probe_trip", "probe")).ok());
+
+  auto req = make_test_request("trip_snap_joints");
+  req.motion_interrupt_scopes = {make_scope(
+      "scope_a", "probe_trip",
+      MotionInterruptActivationMode::kTripIfAlreadyActive)};
+  auto result = local_kernel.execute(req);
+  ASSERT_TRUE(result.ok());
+  ASSERT_TRUE(controlled_execution.wait_until_execute_called());
+  ASSERT_TRUE(wait_for_state(local_kernel, ExecutionState::kExecuting));
+  auto trip = make_probe_sample("probe", 2, local_clock.now(), true);
+  ASSERT_TRUE(local_kernel.publish_fast_interrupt_signal(trip).latched);
+  ASSERT_TRUE(local_kernel.wait_for_completion(2'000'000'000));
+  EXPECT_EQ(local_kernel.get_status().state, ExecutionState::kCompleted);
+
+  auto outcome = local_kernel.get_execution_outcome(result.value());
+  ASSERT_TRUE(outcome.has_value());
+  ASSERT_TRUE(outcome->trip.has_value());
+  const auto& robot_state = outcome->trip->stop_snapshot.robot_state;
+  EXPECT_FALSE(robot_state.joint_names.empty());
+  EXPECT_EQ(robot_state.joint_names.size(),
+            robot_state.positions_rad.size());
+  EXPECT_EQ(outcome->trip->stop_snapshot.source,
+            ExecutionStopSnapshotSource::kExecutionBackendFeedback);
+}
+
+TEST_F(ExecutionKernelTest,
+       Execute_ScopedTrip_StopSnapshotInvalidDowngradesToInterventionRequired) {
+  // Finding 2b: when the backend's post-stop joint vector does not
+  // match the planning context's joint_names (size mismatch), the
+  // RobotStateDTO size/ordering validation MUST fail and the outcome
+  // MUST downgrade to failed with motion_interrupt_stop_state_invalid.
+  using namespace motion_45c;
+  ControlledExecution controlled_execution;
+  // Override the post-stop joint vector to a 3-element vector that
+  // cannot align with the fixture context's 2-element joint_names.
+  controlled_execution.next_post_stop_joint_positions_rad =
+      std::vector<double>{0.1, 0.2, 0.3};
+
+  FakeClock local_clock;
+  ManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  MockCollisionWorldPublisher local_publisher;
+  auto local_engine = std::make_shared<MockCollisionEngine>();
+
+  ExecutionKernel local_kernel{planner, context, controlled_execution,
+                                local_clock, local_scheduler, local_cache};
+  configure_authoritative_collision_validation(local_kernel, local_publisher,
+                                                local_engine);
+  ASSERT_TRUE(local_kernel.register_interrupt_source(
+                  make_fast_probe_source("probe")).ok());
+  ASSERT_TRUE(local_kernel.register_interrupt_policy(
+                  make_move_trip_policy("probe_trip", "probe")).ok());
+
+  // Precision-contact scope so the planning-context fallback is
+  // rejected too — failing both Priority 1 (size mismatch) and
+  // Priority 3 (precision-contact rejects planning_context_state).
+  auto req = make_test_request("trip_snap_invalid");
+  auto scope = make_scope("scope_a", "probe_trip",
+                            MotionInterruptActivationMode::kTripIfAlreadyActive,
+                            MotionInterruptStopMode::kSpringBackHold);
+  scope.node_category = MotionInterruptNodeCategory::kPrecisionContact;
+  req.motion_interrupt_scopes = {scope};
+  auto result = local_kernel.execute(req);
+  ASSERT_TRUE(result.ok());
+  ASSERT_TRUE(controlled_execution.wait_until_execute_called());
+  ASSERT_TRUE(wait_for_state(local_kernel, ExecutionState::kExecuting));
+  auto trip = make_probe_sample("probe", 2, local_clock.now(), true);
+  ASSERT_TRUE(local_kernel.publish_fast_interrupt_signal(trip).latched);
+  ASSERT_TRUE(local_kernel.wait_for_completion(2'000'000'000));
+  EXPECT_EQ(local_kernel.get_status().state,
+            ExecutionState::kInterventionRequired);
+  EXPECT_EQ(local_kernel.get_status().last_error,
+            ErrorCode::kMotionInterruptStopStateInvalid);
+
+  auto outcome = local_kernel.get_execution_outcome(result.value());
+  ASSERT_TRUE(outcome.has_value());
+  ASSERT_TRUE(outcome->error.has_value());
+  EXPECT_EQ(outcome->error->code,
+            kErrorMotionInterruptStopStateInvalid);
+  EXPECT_TRUE(local_kernel.get_active_interrupt_latch().has_value());
+}
+
+// Phase 4.5D-2 superseded the 4.5C bridge. Legacy
+// `Execute_ScopedTripDuringExecution_EmitsFailedOutcomePending45D`
+// was removed because the kCompleteMoveOnSignal latch now produces a
+// real signal_trip outcome via `handle_motion_trip_latch`. The
+// equivalent coverage lives in the
+// `Execute_ScopedTripDuringExecution_EmitsSignalTripOutcome` happy-path
+// test and the failure-path tests above.
+
+// =========================================================================
+// Phase 4.5D-1: backend controlled-stop capability gate at arm time
+// =========================================================================
+
+TEST_F(ExecutionKernelTest,
+       Execute_ScopedMove_RejectsStopModeNotInBackendCapability) {
+  // Spec/260 §5.6 (Phase 4.5D-1 pre-dispatch capability validation):
+  // every requested stop_mode MUST be in the backend's
+  // supported_stop_modes. Shrinking the backend capability to drop
+  // kHardDeceleration but requesting it in the scope produces a
+  // pre-dispatch rejection with reason
+  // `stop_mode_not_supported_by_backend`. The backend MUST NOT be
+  // dispatched and no scope binding remains armed.
+  using namespace motion_45c;
+  execution.motion_interrupt_stop_capability.supported_stop_modes = {
+      MotionInterruptStopMode::kSpringBackHold};
+  ASSERT_TRUE(kernel.register_interrupt_source(
+                  make_fast_probe_source("probe")).ok());
+  ASSERT_TRUE(kernel.register_interrupt_policy(
+                  make_move_trip_policy("probe_trip", "probe")).ok());
+
+  auto req = make_test_request("backend_cap_drop");
+  req.motion_interrupt_scopes = {make_scope(
+      "scope_a", "probe_trip",
+      MotionInterruptActivationMode::kTripIfAlreadyActive,
+      MotionInterruptStopMode::kHardDeceleration)};
+  const int execute_calls_before = execution.execute_count;
+
+  auto result = execute_sync(req);
+  ASSERT_TRUE(result.ok());
+  EXPECT_EQ(kernel.get_status().state, ExecutionState::kFailed);
+  EXPECT_EQ(execution.execute_count, execute_calls_before);
+
+  auto outcome = kernel.get_execution_outcome(result.value());
+  ASSERT_TRUE(outcome.has_value());
+  EXPECT_EQ(outcome->terminal_cause,
+            MotionExecutionTerminalCause::kFailed);
+  ASSERT_TRUE(outcome->error.has_value());
+  EXPECT_EQ(outcome->error->code, kErrorMotionInterruptArmFailed);
+  EXPECT_EQ(outcome->error->details.at("reason"),
+            "stop_mode_not_supported_by_backend");
+  EXPECT_TRUE(kernel.active_motion_interrupt_scopes().empty());
+}
+
+TEST_F(ExecutionKernelTest,
+       Execute_ScopedMove_RejectsFallbackModeNotInBackendCapability) {
+  // Phase 4.5D-1: every element of allowed_fallback_modes must also
+  // be in the backend's supported_stop_modes. Backend supports
+  // kSpringBackHold only; scope requests kSpringBackHold with
+  // kHardDeceleration as a fallback. Pre-dispatch rejects with
+  // `fallback_mode_not_supported_by_backend`.
+  using namespace motion_45c;
+  execution.motion_interrupt_stop_capability.supported_stop_modes = {
+      MotionInterruptStopMode::kSpringBackHold};
+  ASSERT_TRUE(kernel.register_interrupt_source(
+                  make_fast_probe_source("probe")).ok());
+  ASSERT_TRUE(kernel.register_interrupt_policy(
+                  make_move_trip_policy("probe_trip", "probe")).ok());
+
+  auto req = make_test_request("fallback_cap_drop");
+  auto scope = make_scope("scope_a", "probe_trip",
+                            MotionInterruptActivationMode::kTripIfAlreadyActive,
+                            MotionInterruptStopMode::kSpringBackHold);
+  scope.stop_profile->allowed_fallback_modes = {
+      MotionInterruptStopMode::kHardDeceleration};
+  req.motion_interrupt_scopes = {scope};
+
+  auto result = execute_sync(req);
+  ASSERT_TRUE(result.ok());
+  EXPECT_EQ(kernel.get_status().state, ExecutionState::kFailed);
+
+  auto outcome = kernel.get_execution_outcome(result.value());
+  ASSERT_TRUE(outcome.has_value());
+  ASSERT_TRUE(outcome->error.has_value());
+  EXPECT_EQ(outcome->error->code, kErrorMotionInterruptArmFailed);
+  EXPECT_EQ(outcome->error->details.at("reason"),
+            "fallback_mode_not_supported_by_backend");
+}
+
+TEST_F(ExecutionKernelTest,
+       Execute_ScopedMove_BackendDefaultEmptyCapabilityFailsClosed) {
+  // Industrial safety property: the IExecutionBackend default
+  // capability is an empty supported_stop_modes set. Any
+  // complete_move_on_signal scope therefore fails closed at arm
+  // time on a backend that has not declared support. This is the
+  // 4.5D-1 fail-closed default the spec requires.
+  using namespace motion_45c;
+  execution.motion_interrupt_stop_capability.supported_stop_modes.clear();
+  ASSERT_TRUE(kernel.register_interrupt_source(
+                  make_fast_probe_source("probe")).ok());
+  ASSERT_TRUE(kernel.register_interrupt_policy(
+                  make_move_trip_policy("probe_trip", "probe")).ok());
+
+  auto req = make_test_request("backend_default_empty");
+  req.motion_interrupt_scopes = {make_scope("scope_a", "probe_trip")};
+  auto result = execute_sync(req);
+  ASSERT_TRUE(result.ok());
+  EXPECT_EQ(kernel.get_status().state, ExecutionState::kFailed);
+
+  auto outcome = kernel.get_execution_outcome(result.value());
+  ASSERT_TRUE(outcome.has_value());
+  ASSERT_TRUE(outcome->error.has_value());
+  EXPECT_EQ(outcome->error->details.at("reason"),
+            "stop_mode_not_supported_by_backend");
+}
+
+TEST_F(ExecutionKernelTest,
+       Execute_ScopedMove_PrecisionContactWithEmptyFallbackArms) {
+  // Phase 4.5D-1 happy path for precision-contact node category:
+  // empty fallback list + supported mode + valid policy arms
+  // cleanly, dispatches, and produces no_signal_trip on completion.
+  using namespace motion_45c;
+  ASSERT_TRUE(kernel.register_interrupt_source(
+                  make_fast_probe_source("probe")).ok());
+  ASSERT_TRUE(kernel.register_interrupt_policy(
+                  make_move_trip_policy("probe_trip", "probe")).ok());
+
+  auto req = make_test_request("precision_contact_move");
+  auto scope = make_scope("scope_a", "probe_trip");
+  scope.node_category = MotionInterruptNodeCategory::kPrecisionContact;
+  req.motion_interrupt_scopes = {scope};
+
+  auto result = execute_sync(req);
+  ASSERT_TRUE(result.ok());
+  EXPECT_EQ(kernel.get_status().state, ExecutionState::kCompleted);
+
+  auto outcome = kernel.get_execution_outcome(result.value());
+  ASSERT_TRUE(outcome.has_value());
+  EXPECT_EQ(outcome->terminal_cause,
+            MotionExecutionTerminalCause::kNoSignalTrip);
+}
+
+TEST_F(ExecutionKernelTest,
+       Execute_SoftOnPathWithoutFallbackRejectsInfeasibleEnvelope) {
+  // Phase 4.5G: exact soft_on_path must prove the plan-time feasibility
+  // envelope before arming. The default fixture trajectory has no explicit
+  // natural-completion policy, so late trip points cannot satisfy the requested
+  // wall-time ramp and the scoped move fails closed before backend dispatch.
+  using namespace motion_45c;
+  execution.motion_interrupt_stop_capability.supported_stop_modes = {
+      MotionInterruptStopMode::kSoftOnPath};
+  MotionInterruptSoftOnPathPlannerConfigDTO soft_planner_config;
+  soft_planner_config.per_joint_max_jerk_rad_s3 = {
+      {"j1", 1'000'000.0}, {"j2", 1'000'000.0}};
+  execution.motion_interrupt_stop_capability.soft_on_path_planner_config =
+      soft_planner_config;
+  ASSERT_TRUE(kernel.register_interrupt_source(
+                  make_fast_probe_source("probe")).ok());
+  ASSERT_TRUE(kernel.register_interrupt_policy(
+                  make_move_trip_policy("probe_trip", "probe")).ok());
+
+  auto req = make_test_request("soft_exact_envelope_reject");
+  auto scope = make_scope("scope_a", "probe_trip",
+                            MotionInterruptActivationMode::kTripIfAlreadyActive,
+                            MotionInterruptStopMode::kSoftOnPath);
+  scope.stop_profile = make_soft_on_path_profile(
+      /*allow_spring_back_fallback=*/false);
+  req.motion_interrupt_scopes = {scope};
+  const int execute_calls_before = execution.execute_count;
+
+  auto result = execute_sync(req);
+  ASSERT_TRUE(result.ok());
+  EXPECT_EQ(kernel.get_status().state, ExecutionState::kFailed);
+  EXPECT_EQ(execution.execute_count, execute_calls_before);
+
+  auto outcome = kernel.get_execution_outcome(result.value());
+  ASSERT_TRUE(outcome.has_value());
+  ASSERT_TRUE(outcome->error.has_value());
+  EXPECT_EQ(outcome->error->code, kErrorMotionInterruptArmFailed);
+  EXPECT_EQ(outcome->error->details.at("reason"),
+            "soft_on_path_feasibility_envelope_infeasible");
+  EXPECT_TRUE(outcome->error->details.contains("planner_reason"));
+  EXPECT_EQ(outcome->error->details.at("recommended_fallback"),
+            "spring_back_hold");
+  EXPECT_TRUE(kernel.active_motion_interrupt_scopes().empty());
+}
+
+TEST_F(ExecutionKernelTest,
+       Execute_SoftOnPathNaturalCompletionPolicyAllowsEnvelopeGap) {
+  // Phase 4.5G: generic search moves may explicitly say that a signal
+  // arriving too close to the natural endpoint should complete as ordinary
+  // no-trip/natural completion rather than depending on spring_back fallback.
+  using namespace motion_45c;
+  execution.motion_interrupt_stop_capability.supported_stop_modes = {
+      MotionInterruptStopMode::kSoftOnPath};
+  MotionInterruptSoftOnPathPlannerConfigDTO soft_planner_config;
+  soft_planner_config.per_joint_max_jerk_rad_s3 = {
+      {"j1", 1'000'000.0}, {"j2", 1'000'000.0}};
+  execution.motion_interrupt_stop_capability.soft_on_path_planner_config =
+      soft_planner_config;
+  ASSERT_TRUE(kernel.register_interrupt_source(
+                  make_fast_probe_source("probe")).ok());
+  ASSERT_TRUE(kernel.register_interrupt_policy(
+                  make_move_trip_policy("probe_trip", "probe")).ok());
+
+  auto req = make_test_request("soft_exact_natural_completion");
+  auto scope = make_scope("scope_a", "probe_trip",
+                            MotionInterruptActivationMode::kTripIfAlreadyActive,
+                            MotionInterruptStopMode::kSoftOnPath);
+  scope.stop_profile = make_soft_on_path_profile(
+      /*allow_spring_back_fallback=*/false,
+      /*allow_natural_completion_on_short_path=*/true);
+  req.motion_interrupt_scopes = {scope};
+
+  auto result = execute_sync(req);
+  ASSERT_TRUE(result.ok());
+  auto outcome = kernel.get_execution_outcome(result.value());
+  ASSERT_TRUE(outcome.has_value());
+  EXPECT_EQ(kernel.get_status().state, ExecutionState::kCompleted)
+      << (outcome->error ? outcome->error->message : "")
+      << " reason="
+      << (outcome->error && outcome->error->details.contains("reason")
+              ? outcome->error->details.at("reason")
+              : "")
+      << " planner_reason="
+      << (outcome->error && outcome->error->details.contains("planner_reason")
+              ? outcome->error->details.at("planner_reason")
+              : "");
+  EXPECT_EQ(execution.execute_count, 1);
+
+  EXPECT_EQ(outcome->terminal_cause,
+            MotionExecutionTerminalCause::kNoSignalTrip);
+  EXPECT_TRUE(kernel.active_motion_interrupt_scopes().empty());
+}
+
+TEST_F(ExecutionKernelTest,
+       Execute_SoftOnPathWithSpringBackFallbackAllowsEnvelopeGap) {
+  // The same plan-time gap is acceptable only when the motion profile
+  // explicitly names the first qualified production fallback pair. A future
+  // trip must then record requested=soft_on_path / executed=spring_back_hold;
+  // no-trip completion remains no_signal_trip.
+  using namespace motion_45c;
+  execution.motion_interrupt_stop_capability.supported_stop_modes = {
+      MotionInterruptStopMode::kSoftOnPath,
+      MotionInterruptStopMode::kSpringBackHold};
+  ASSERT_TRUE(kernel.register_interrupt_source(
+                  make_fast_probe_source("probe")).ok());
+  ASSERT_TRUE(kernel.register_interrupt_policy(
+                  make_move_trip_policy("probe_trip", "probe")).ok());
+
+  auto req = make_test_request("soft_envelope_fallback_allowed");
+  auto scope = make_scope("scope_a", "probe_trip",
+                            MotionInterruptActivationMode::kTripIfAlreadyActive,
+                            MotionInterruptStopMode::kSoftOnPath);
+  scope.stop_profile = make_soft_on_path_profile(
+      /*allow_spring_back_fallback=*/true);
+  req.motion_interrupt_scopes = {scope};
+
+  auto result = execute_sync(req);
+  ASSERT_TRUE(result.ok());
+  EXPECT_EQ(kernel.get_status().state, ExecutionState::kCompleted);
+  EXPECT_EQ(execution.execute_count, 1);
+
+  auto outcome = kernel.get_execution_outcome(result.value());
+  ASSERT_TRUE(outcome.has_value());
+  EXPECT_EQ(outcome->terminal_cause,
+            MotionExecutionTerminalCause::kNoSignalTrip);
+  EXPECT_TRUE(kernel.active_motion_interrupt_scopes().empty());
+}
+
+TEST_F(ExecutionKernelTest,
+       OutcomeStore_FifoEvictionRespectsRetentionCap) {
+  // Tiny retention so we can observe eviction without running many
+  // executions. The fixture kernel already runs one execute()
+  // implicitly via SetUp's plan / validation defaults; we reset
+  // between executes via the kernel's Failed/Stopped-to-Idle path
+  // by configuring a local kernel with retention=2.
+  ExecutionKernelConfig cfg;
+  cfg.motion_execution_outcome_retention = 2;
+  ExecutionKernel local_kernel{planner, context, execution, clock,
+                                scheduler, cache, cfg};
+  configure_authoritative_collision_validation(local_kernel,
+                                                 collision_world_publisher,
+                                                 collision_engine);
+
+  std::vector<std::uint64_t> ids;
+  for (int i = 0; i < 3; ++i) {
+    auto r = local_kernel.execute(
+        make_test_request("evict_move_" + std::to_string(i)));
+    ASSERT_TRUE(r.ok())
+        << "execute " << i << " failed: code=" << r.error().code
+        << " msg=" << r.error().message;
+    local_kernel.wait_for_completion();
+    ids.push_back(r.value());
+    // Return to kIdle for the next execute() call.
+    auto ack = local_kernel.acknowledge_completed(r.value());
+    ASSERT_TRUE(ack.accepted);
+  }
+  // Oldest evicted; latest two retained.
+  EXPECT_FALSE(local_kernel.get_execution_outcome(ids[0]).has_value());
+  EXPECT_TRUE(local_kernel.get_execution_outcome(ids[1]).has_value());
+  EXPECT_TRUE(local_kernel.get_execution_outcome(ids[2]).has_value());
+}
+
+// =========================================================================
+// Phase 4.5F: motion-scoped interrupt qualification. These tests live
+// alongside the rest of the kernel suite so they reuse the proven
+// ControlledExecution + freshness-aware mock infrastructure. Each
+// scenario emits a structured JSON evidence line on stdout that
+// deployment qualification runs can grep for and archive as audit
+// input. The line format is stable:
+//   MANYFORGE_QUALIFICATION_EVIDENCE {...json...}
+// Existing per-scenario coverage (signal_trip happy path, backend
+// refusal, fallback honored, etc.) is the unit-test surface; the
+// dedicated qualification tests below extend it with measured
+// latencies + the JSON shape qualification archives need.
+// =========================================================================
+
+namespace {
+
+void emit_qualification_evidence(
+    const std::string& scenario,
+    const std::optional<MotionExecutionOutcomeDTO>& outcome) {
+  std::cout << "MANYFORGE_QUALIFICATION_EVIDENCE {\"scenario\":\""
+            << scenario << "\"";
+  if (!outcome) {
+    std::cout << ",\"outcome\":null}" << std::endl;
+    return;
+  }
+  std::cout << ",\"execution_id\":" << outcome->execution_id;
+  std::cout << ",\"terminal_cause\":\"";
+  using enum MotionExecutionTerminalCause;
+  switch (outcome->terminal_cause) {
+    case kCompletedNormally: std::cout << "completed_normally"; break;
+    case kSignalTrip:        std::cout << "signal_trip"; break;
+    case kNoSignalTrip:      std::cout << "no_signal_trip"; break;
+    case kStopped:           std::cout << "stopped"; break;
+    case kFailed:            std::cout << "failed"; break;
+    case kInterruptedFault:  std::cout << "interrupted_fault"; break;
+  }
+  std::cout << "\"";
+  if (outcome->trip) {
+    std::cout << ",\"signal_to_latch_ns\":"
+              << outcome->trip->signal_to_latch_ns;
+    std::cout << ",\"latch_to_backend_stop_call_ns\":"
+              << outcome->trip->latch_to_backend_stop_call_ns;
+    std::cout << ",\"latch_to_stop_confirmed_ns\":"
+              << outcome->trip->latch_to_stop_confirmed_ns;
+    std::cout << ",\"backend_stop_confirmed\":"
+              << (outcome->trip->stop_snapshot.backend_stop_confirmed
+                      ? "true" : "false");
+  } else if (outcome->error) {
+    std::cout << ",\"error_code\":\"" << outcome->error->code << "\"";
+    if (outcome->error->details.contains("reason")) {
+      std::cout << ",\"error_reason\":\""
+                << outcome->error->details.at("reason") << "\"";
+    }
+  }
+  std::cout << "}" << std::endl;
+}
+
+}  // namespace
+
+TEST_F(ExecutionKernelTest,
+       Qualification_SignalTripWithMeasuredLatencyEmitsEvidence) {
+  using namespace motion_45c;
+  // Phase 4.5F: signal_trip happy path with measured signal_to_latch_ns,
+  // latch_to_backend_stop_call_ns, latch_to_stop_confirmed_ns. The
+  // emitted JSON gives deployment qualification reproducible
+  // measurement points without needing the kernel to expose new APIs.
+  ControlledExecution controlled_execution;
+  FakeClock local_clock;
+  ManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  MockCollisionWorldPublisher local_publisher;
+  auto local_engine = std::make_shared<MockCollisionEngine>();
+  ExecutionKernel local_kernel{planner, context, controlled_execution,
+                                local_clock, local_scheduler, local_cache};
+  configure_authoritative_collision_validation(local_kernel, local_publisher,
+                                                local_engine);
+  ASSERT_TRUE(local_kernel.register_interrupt_source(
+                  make_fast_probe_source("probe")).ok());
+  ASSERT_TRUE(local_kernel.register_interrupt_policy(
+                  make_move_trip_policy("probe_trip", "probe")).ok());
+  auto req = make_test_request("qual_signal_trip");
+  req.motion_interrupt_scopes = {make_scope(
+      "scope_a", "probe_trip",
+      MotionInterruptActivationMode::kTripIfAlreadyActive)};
+  auto result = local_kernel.execute(req);
+  ASSERT_TRUE(result.ok());
+  ASSERT_TRUE(controlled_execution.wait_until_execute_called());
+  ASSERT_TRUE(wait_for_state(local_kernel, ExecutionState::kExecuting));
+  auto trip = make_probe_sample("probe", 2,
+                                   local_clock.now() - 50'000, true);
+  ASSERT_TRUE(local_kernel.publish_fast_interrupt_signal(trip).latched);
+  ASSERT_TRUE(local_kernel.wait_for_completion(2'000'000'000));
+  auto outcome = local_kernel.get_execution_outcome(result.value());
+  ASSERT_TRUE(outcome.has_value());
+  EXPECT_EQ(outcome->terminal_cause,
+            MotionExecutionTerminalCause::kSignalTrip);
+  ASSERT_TRUE(outcome->trip.has_value());
+  EXPECT_GT(outcome->trip->signal_to_latch_ns, 0);
+  emit_qualification_evidence("signal_trip_happy_path", outcome);
+}
+
+TEST_F(ExecutionKernelTest,
+       Qualification_BackendStopRefusalEmitsInterventionEvidence) {
+  using namespace motion_45c;
+  ControlledExecution controlled_execution;
+  ControlledStopResultDTO refusal;
+  refusal.accepted = false;
+  refusal.executed_stop_mode = MotionInterruptStopMode::kSpringBackHold;
+  refusal.stop_command_source =
+      MotionInterruptStopCommandSource::kDiagnosticOther;
+  refusal.error = ErrorDTO{kErrorMotionInterruptBackendStopFailed,
+                            "qualification: simulated controller refusal",
+                            {{"reason", "qual_controller_rejected"}}};
+  controlled_execution.next_controlled_stop_result = refusal;
+  FakeClock local_clock;
+  ManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  MockCollisionWorldPublisher local_publisher;
+  auto local_engine = std::make_shared<MockCollisionEngine>();
+  ExecutionKernel local_kernel{planner, context, controlled_execution,
+                                local_clock, local_scheduler, local_cache};
+  configure_authoritative_collision_validation(local_kernel, local_publisher,
+                                                local_engine);
+  ASSERT_TRUE(local_kernel.register_interrupt_source(
+                  make_fast_probe_source("probe")).ok());
+  ASSERT_TRUE(local_kernel.register_interrupt_policy(
+                  make_move_trip_policy("probe_trip", "probe")).ok());
+  auto req = make_test_request("qual_refusal");
+  req.motion_interrupt_scopes = {make_scope(
+      "scope_a", "probe_trip",
+      MotionInterruptActivationMode::kTripIfAlreadyActive)};
+  auto result = local_kernel.execute(req);
+  ASSERT_TRUE(result.ok());
+  ASSERT_TRUE(controlled_execution.wait_until_execute_called());
+  ASSERT_TRUE(wait_for_state(local_kernel, ExecutionState::kExecuting));
+  auto trip = make_probe_sample("probe", 2, local_clock.now(), true);
+  ASSERT_TRUE(local_kernel.publish_fast_interrupt_signal(trip).latched);
+  ASSERT_TRUE(local_kernel.wait_for_completion(2'000'000'000));
+  EXPECT_EQ(local_kernel.get_status().state,
+            ExecutionState::kInterventionRequired);
+  auto outcome = local_kernel.get_execution_outcome(result.value());
+  ASSERT_TRUE(outcome.has_value());
+  EXPECT_EQ(outcome->terminal_cause,
+            MotionExecutionTerminalCause::kFailed);
+  emit_qualification_evidence("backend_stop_refusal", outcome);
+}
+
+TEST_F(ExecutionKernelTest,
+       Qualification_StaleSourceRejectedDoesNotLatch) {
+  // Phase 4.5F: stale-source qualification. With a 1us freshness
+  // budget, a signal whose timestamp is 100us in the past MUST be
+  // rejected at ingest with reason=stale and MUST NOT latch. Emit a
+  // null-outcome evidence line so the qualification archive records
+  // the rejection.
+  InterruptSourceDefinition tight =
+      motion_45c::make_fast_probe_source("probe_qual_stale");
+  tight.freshness_budget_ns = 1'000;  // 1us
+  ASSERT_TRUE(kernel.register_interrupt_source(tight).ok());
+
+  InterruptSignalUpdate u;
+  u.source_id = "probe_qual_stale";
+  u.sequence_id = 1;
+  u.timestamp_ns = 0;  // kernel-time is well past zero
+  u.value = true;
+  auto result = kernel.publish_fast_interrupt_signal(u);
+  EXPECT_TRUE(result.rejected);
+  emit_qualification_evidence("stale_source_rejected", std::nullopt);
+}
+
+TEST_F(ExecutionKernelTest,
+       Qualification_FallbackHonoredWhenAllowedEmitsFallbackReason) {
+  using namespace motion_45c;
+  ControlledExecution controlled_execution;
+  controlled_execution.motion_interrupt_stop_capability.supported_stop_modes =
+      {MotionInterruptStopMode::kSoftOnPath,
+       MotionInterruptStopMode::kSpringBackHold};
+  ControlledStopResultDTO fallback_ok;
+  fallback_ok.accepted = true;
+  fallback_ok.backend_stop_confirmed = true;
+  fallback_ok.executed_stop_mode =
+      MotionInterruptStopMode::kSpringBackHold;
+  fallback_ok.stop_command_source =
+      MotionInterruptStopCommandSource::kDiagnosticOther;
+  fallback_ok.fallback_reason =
+      "qualification: soft_on_path_scaffold_anchored_hold_fallback";
+  controlled_execution.next_controlled_stop_result = fallback_ok;
+  FakeClock local_clock;
+  ManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  MockCollisionWorldPublisher local_publisher;
+  auto local_engine = std::make_shared<MockCollisionEngine>();
+  ExecutionKernel local_kernel{planner, context, controlled_execution,
+                                local_clock, local_scheduler, local_cache};
+  configure_authoritative_collision_validation(local_kernel, local_publisher,
+                                                local_engine);
+  ASSERT_TRUE(local_kernel.register_interrupt_source(
+                  make_fast_probe_source("probe")).ok());
+  ASSERT_TRUE(local_kernel.register_interrupt_policy(
+                  make_move_trip_policy("probe_trip", "probe")).ok());
+  auto req = make_test_request("qual_fallback");
+  auto scope = make_scope("scope_a", "probe_trip",
+                            MotionInterruptActivationMode::kTripIfAlreadyActive,
+                            MotionInterruptStopMode::kSoftOnPath);
+  scope.stop_profile->deceleration_time_s = 0.2;
+  scope.stop_profile->per_joint_max_deceleration_rad_s2 = {
+      {"j1", 10.0}, {"j2", 10.0}};
+  scope.stop_profile->allowed_fallback_modes = {
+      MotionInterruptStopMode::kSpringBackHold};
+  req.motion_interrupt_scopes = {scope};
+  auto result = local_kernel.execute(req);
+  ASSERT_TRUE(result.ok());
+  ASSERT_TRUE(controlled_execution.wait_until_execute_called());
+  ASSERT_TRUE(wait_for_state(local_kernel, ExecutionState::kExecuting));
+  auto trip = make_probe_sample("probe", 2, local_clock.now(), true);
+  ASSERT_TRUE(local_kernel.publish_fast_interrupt_signal(trip).latched);
+  ASSERT_TRUE(local_kernel.wait_for_completion(2'000'000'000));
+  EXPECT_EQ(local_kernel.get_status().state, ExecutionState::kCompleted);
+  auto outcome = local_kernel.get_execution_outcome(result.value());
+  ASSERT_TRUE(outcome.has_value());
+  EXPECT_EQ(outcome->terminal_cause,
+            MotionExecutionTerminalCause::kSignalTrip);
+  ASSERT_TRUE(outcome->trip.has_value());
+  EXPECT_EQ(outcome->trip->executed_stop_mode,
+            MotionInterruptStopMode::kSpringBackHold);
+  ASSERT_TRUE(outcome->trip->fallback_reason.has_value());
+  emit_qualification_evidence("fallback_honored", outcome);
 }
 
 }  // namespace

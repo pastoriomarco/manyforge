@@ -17,6 +17,7 @@
 #include <manyforge_core/types/execution_result.hpp>
 #include <manyforge_core/types/kernel_event.hpp>
 #include <manyforge_core/types/metrics.hpp>
+#include <manyforge_core/types/motion_interrupt.hpp>
 #include <manyforge_core/types/streaming_session.hpp>
 
 #include <atomic>
@@ -85,6 +86,21 @@ struct ExecutionKernelConfig {
   // an unbounded budget silently; zero disables only the cap, not body-local
   // freshness checks.
   Duration runtime_dynamic_body_max_age_cap_ns = 500'000'000;  // 500 ms
+
+  // Phase 4.5C: terminal motion-outcome retention. Outcomes are queryable
+  // via `get_execution_outcome(execution_id)` until the store reaches
+  // this depth; oldest entries are evicted FIFO. Audit-grade deployments
+  // should raise this and pair with a streaming archive subscriber.
+  std::size_t motion_execution_outcome_retention = 256;
+
+  // Phase 4.5D-2: deployment default for the backend-stop confirmation
+  // deadline used by `complete_move_on_signal` trip handling when the
+  // scope's `MotionInterruptStopProfileDTO.max_stop_time_s` is unset
+  // (spec/260 §5.6, motion-scoped design §B.4). 500 ms matches the
+  // canonical default; deployments whose controllers cannot confirm
+  // stop within that window MUST raise this knob explicitly so the
+  // longer deadline is audit-visible.
+  Duration complete_move_on_signal_timeout_ns = 500'000'000;  // 500 ms
 };
 
 /// Execution Kernel — single authority for motion execution governance.
@@ -247,6 +263,24 @@ class ExecutionKernel {
   Result<InterruptIngestResult> apply_interrupt_disposition(
       const InterruptDisposition& disposition);
 
+  // ---------------------------------------------------------------
+  // Phase 4.5C: motion-scoped terminal outcome surface (spec/210 §3.11,
+  // spec/230 §3.4). Read-only observer; Composer and the behavior
+  // runtime consume outcomes here instead of polling signal state.
+  // ---------------------------------------------------------------
+
+  /// Return the immutable terminal outcome record for `execution_id`, if
+  /// the kernel has emitted one. Outcomes survive subsequent executions
+  /// so callers (BT, MCP, audit) can correlate by id; the bound is the
+  /// `motion_execution_outcome_retention` config knob.
+  std::optional<MotionExecutionOutcomeDTO> get_execution_outcome(
+      std::uint64_t execution_id) const;
+
+  /// Diagnostics-only observer for armed move-scoped bindings
+  /// (spec/260 §B.3). BT/policy code MUST NOT poll this for control flow.
+  std::vector<MotionInterruptScopeStatusDTO> active_motion_interrupt_scopes()
+      const;
+
   /// Subscribe to kernel events.
   /// @param callback Called for each event. Must be thread-safe.
   /// @return Handle for unsubscribing.
@@ -326,6 +360,67 @@ class ExecutionKernel {
       const InterruptIngestResult& result);
   InterruptRuntimeContext current_interrupt_context() const;
   void emit_interrupt_events(const InterruptIngestResult& result);
+
+  // Phase 4.5C: motion-scope lifecycle plumbing on the worker thread.
+  // `active_motion_execution_` is reset at execute() entry and populated
+  // by `arm_motion_scopes_for_dispatch_locked` after validation passes.
+  // The worker MUST call `finalize_motion_execution_outcome` exactly
+  // once on every terminal exit so the outcome store has a 1:1
+  // correspondence with terminal executions.
+  struct ActiveMotionExecution {
+    std::uint64_t execution_id = 0;
+    std::string move_id;
+    bool had_scopes = false;
+    bool arm_succeeded = false;
+    bool outcome_emitted = false;
+    std::optional<InterruptLatch> motion_trip_latch;
+  };
+
+  /// Arm scopes carried by `request.motion_interrupt_scopes` atomically
+  /// with dispatch (spec/230 §3.4): all scopes succeed or none do. On
+  /// success, populates `motion_state.had_scopes` /
+  /// `motion_state.arm_succeeded` and emits
+  /// `motion_interrupt_scope_armed` kernel events. Returns Err with the
+  /// manager's failure reason; the caller fails the execution closed.
+  Result<void> arm_motion_scopes_for_dispatch(
+      const ExecuteRequestDTO& request,
+      const TrajectoryDTO& trajectory,
+      std::uint64_t execution_id,
+      ActiveMotionExecution& motion_state);
+
+  /// Build, validate, store, and emit the immutable
+  /// `MotionExecutionOutcomeDTO` for `execution_id`. Always reaps any
+  /// remaining armed bindings tied to `execution_id`. Safe to call from
+  /// every terminal exit; subsequent calls for the same execution are
+  /// no-ops so worker code can be defensive without producing duplicate
+  /// records.
+  void finalize_motion_execution_outcome(
+      ActiveMotionExecution& motion_state,
+      MotionExecutionTerminalCause terminal_cause,
+      std::optional<ErrorDTO> error,
+      std::optional<MotionTripOutcomeDTO> trip,
+      std::string reap_reason);
+
+  /// Phase 4.5D-2 (spec/260 §5.6): handle a `complete_move_on_signal`
+  /// latch by running the controlled-stop flow end to end. The
+  /// function takes the worker's `motion_state`, the originating
+  /// `request` (so the matching `MotionInterruptScopeDTO.stop_profile`
+  /// can be resolved from `latch.motion_interrupt_scope_id`), the
+  /// latch itself, and the worker's `exec_id` / `latest_backend_snapshot`.
+  /// It performs the controlled-stop call, captures the stop snapshot,
+  /// enforces the conjunctive fallback rule, transitions the state
+  /// machine Stopping->Completed (signal_trip success) or
+  /// Stopping->Failed (failure path), and finalizes the outcome.
+  void handle_motion_trip_latch(
+      const ExecuteRequestDTO& request,
+      const InterruptLatch& latch,
+      std::uint64_t exec_id,
+      const ExecutionSnapshot& latest_backend_snapshot,
+      ActiveMotionExecution& motion_state);
+
+  void emit_interrupt_manager_events(
+      const std::vector<InterruptManagerEvent>& events,
+      std::uint64_t execution_id);
 
   IPlannerBackend& planner_;
   IPlanningContext& context_;
@@ -432,6 +527,18 @@ class ExecutionKernel {
   // Metrics (atomic counters for thread safety)
   mutable std::mutex metrics_mutex_;
   mutable MetricsSnapshot metrics_;
+
+  // Phase 4.5C: bounded outcome store keyed by execution_id. FIFO
+  // eviction beyond `motion_execution_outcome_retention`. The eviction
+  // order is captured in `motion_outcome_order_` because std::map keeps
+  // execution_ids sorted ascending, not insertion-ordered; eviction
+  // tracks the original publication order so retention behaves
+  // intuitively under id reuse-prevention. The per-execution motion
+  // state lives on the worker stack and is NOT a kernel field — two
+  // worker threads must not share it across overlapping executions.
+  mutable std::mutex motion_outcomes_mutex_;
+  std::map<std::uint64_t, MotionExecutionOutcomeDTO> motion_execution_outcomes_;
+  std::vector<std::uint64_t> motion_outcome_order_;
 };
 
 }  // namespace manyforge::core

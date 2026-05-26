@@ -20,7 +20,11 @@ from manyforge_behavior.kernel_client import (
     CommandResult,
     ExecutionStatus,
     ExecutionSnapshot,
+    MotionExecutionOutcome,
+    MotionInterruptScope,
+    MotionInterruptStopProfile,
     MotionPreviewResult,
+    MotionTripOutcome,
     ObjectState,
     RobotStateSnapshot,
     SceneObjectSnapshot,
@@ -95,6 +99,119 @@ def _rpy_deg_to_xyzw(rpy_deg):
         cr * cp * sy - sr * sp * cy,
         cr * cp * cy + sr * sp * sy,
     ]
+
+
+def _serialize_motion_interrupt_scope(
+    scope: MotionInterruptScope,
+) -> Dict[str, Any]:
+    """Phase 4.5E: serialize a Python MotionInterruptScope DTO into the
+    dict shape the pybind `execute` parser consumes. Field names mirror
+    the C++ MotionInterruptScopeDTO members so downstream parsing is
+    straightforward."""
+    out: Dict[str, Any] = {
+        "scope_id": scope.scope_id,
+        "policy_id": scope.policy_id,
+        "activation_mode": scope.activation_mode,
+        "required": bool(scope.required),
+        "node_category": scope.node_category,
+    }
+    if scope.arm_timeout_ns is not None:
+        out["arm_timeout_ns"] = int(scope.arm_timeout_ns)
+    if scope.result_binding_key is not None:
+        out["result_binding_key"] = scope.result_binding_key
+    if scope.stop_profile is not None:
+        profile = scope.stop_profile
+        sp: Dict[str, Any] = {
+            "profile_id": profile.profile_id,
+            "stop_mode": profile.stop_mode,
+            "allow_natural_completion_on_short_path": bool(
+                profile.allow_natural_completion_on_short_path
+            ),
+            "require_backend_confirmation": bool(
+                profile.require_backend_confirmation
+            ),
+        }
+        if profile.deceleration_time_s is not None:
+            sp["deceleration_time_s"] = float(profile.deceleration_time_s)
+        if profile.max_stop_time_s is not None:
+            sp["max_stop_time_s"] = float(profile.max_stop_time_s)
+        if profile.joint_deceleration_profile_id is not None:
+            sp["joint_deceleration_profile_id"] = (
+                profile.joint_deceleration_profile_id
+            )
+        if profile.per_joint_max_deceleration_rad_s2:
+            sp["per_joint_max_deceleration_rad_s2"] = dict(
+                profile.per_joint_max_deceleration_rad_s2
+            )
+        if profile.allowed_fallback_modes:
+            sp["allowed_fallback_modes"] = list(profile.allowed_fallback_modes)
+        out["stop_profile"] = sp
+    return out
+
+
+def _deserialize_motion_execution_outcome(
+    raw: Optional[Dict[str, Any]],
+) -> Optional[MotionExecutionOutcome]:
+    """Phase 4.5E: deserialize the dict returned by the native bundle's
+    get_execution_outcome into the Python DTO. Returns None when the
+    native surface returns a falsy value (no outcome recorded yet)."""
+    if not raw:
+        return None
+    outcome = MotionExecutionOutcome(
+        execution_id=int(raw.get("execution_id", 0)),
+        move_id=str(raw.get("move_id", "")),
+        terminal_cause=str(raw.get("terminal_cause", "completed_normally")),
+    )
+    trip = raw.get("trip")
+    if trip:
+        outcome.trip = MotionTripOutcome(
+            latch_id=str(trip.get("latch_id", "")),
+            source_id=str(trip.get("source_id", "")),
+            policy_id=str(trip.get("policy_id", "")),
+            scope_id=str(trip.get("scope_id", "")),
+            executed_stop_mode=str(trip.get("executed_stop_mode", "")),
+            stop_command_source=str(trip.get("stop_command_source", "")),
+            backend_stop_confirmed=bool(trip.get("backend_stop_confirmed", False)),
+            stop_distance_rad=trip.get("stop_distance_rad"),
+            initial_path_deviation_rad=trip.get("initial_path_deviation_rad"),
+            path_deviation_max_rad=trip.get("path_deviation_max_rad"),
+            fallback_reason=trip.get("fallback_reason"),
+            signal_to_latch_ns=int(trip.get("signal_to_latch_ns", 0)),
+            latch_to_backend_stop_call_ns=int(
+                trip.get("latch_to_backend_stop_call_ns", 0)
+            ),
+            latch_to_stop_confirmed_ns=int(
+                trip.get("latch_to_stop_confirmed_ns", 0)
+            ),
+            result_binding_key=trip.get("result_binding_key"),
+        )
+        # Phase 4.5E (codex review follow-up): full outcome fidelity.
+        # Snapshot source/state/captured_at_ns + requested-mode +
+        # diagnostics + profile_id surface back through the Python DTO
+        # so BT consumers can audit the trip without re-querying the
+        # kernel. Extra fields land on `MotionTripOutcome` as attribute
+        # writes; the dataclass has the named fields above, and the
+        # rest live on a dynamic attribute bag so we don't churn the
+        # Python DTO schema with every backend addition.
+        outcome.trip.stop_snapshot_source = trip.get("stop_snapshot_source")
+        outcome.trip.stop_snapshot_captured_at_ns = int(
+            trip.get("stop_snapshot_captured_at_ns", 0)
+        )
+        outcome.trip.stop_snapshot_robot_state = trip.get(
+            "stop_snapshot_robot_state"
+        )
+        outcome.trip.requested_stop_mode = trip.get("requested_stop_mode")
+        outcome.trip.requested_stop_profile_id = trip.get(
+            "requested_stop_profile_id"
+        )
+        outcome.trip.diagnostics = trip.get("diagnostics") or {}
+    err = raw.get("error")
+    if err:
+        outcome.error_code = err.get("code")
+        outcome.error_message = err.get("message")
+        details = err.get("details") or {}
+        outcome.error_reason = details.get("reason")
+    return outcome
 
 
 def _normalize_pose_dict(pose: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -279,6 +396,20 @@ class NativeKernelClient(KernelClient):
         elif request.motion_type == "relative_move":
             req_dict["relative_move"] = relative_move
 
+        # Phase 4.5E: motion-scoped interrupt scopes (spec/210 §3.10 +
+        # spec/260 §2.6). Each scope arms a move-scoped policy for
+        # exactly this execute request; the kernel arms them
+        # atomically after validation and reaps on every terminal
+        # state. Without this serialization, the scope DTOs carried
+        # by `MoveUntilSignal`/`ProbeSearchMove` would silently
+        # disappear at the Python/native boundary and the move would
+        # run unscoped.
+        if request.motion_interrupt_scopes:
+            req_dict["motion_interrupt_scopes"] = [
+                _serialize_motion_interrupt_scope(scope)
+                for scope in request.motion_interrupt_scopes
+            ]
+
         result = self._bundle.execute(req_dict)
 
         return ExecuteResult(
@@ -286,6 +417,17 @@ class NativeKernelClient(KernelClient):
             execution_id=result.get("execution_id", 0),
             error=result.get("error"),
         )
+
+    def get_execution_outcome(self, execution_id):
+        """Phase 4.5E: fetch the terminal MotionExecutionOutcome for a
+        completed scoped execution from the native kernel."""
+        try:
+            raw = self._bundle.get_execution_outcome(int(execution_id))
+        except (AttributeError, RuntimeError):
+            # Native bundle predates 4.5C outcome store. Return None
+            # so callers (BT nodes) fail closed per spec/210 §3.11.
+            return None
+        return _deserialize_motion_execution_outcome(raw)
 
     def preview_motion(
         self,

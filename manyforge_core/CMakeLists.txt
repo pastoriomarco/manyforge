@@ -17,6 +17,7 @@ add_library(manyforge_core
   src/parallel_collision_validation_worker_pool.cpp
   src/collision_world_snapshot_builder.cpp
   src/interrupt_manager.cpp
+  src/soft_on_path_stop_planner.cpp
   src/execution_kernel.cpp
 )
 target_include_directories(manyforge_core PUBLIC
@@ -129,6 +130,21 @@ if(BUILD_TESTING)
   gtest_discover_tests(test_interrupt_manager
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
+  add_executable(test_soft_on_path_stop_planner
+    test/test_soft_on_path_stop_planner.cpp)
+  target_link_libraries(test_soft_on_path_stop_planner PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_soft_on_path_stop_planner
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  # Phase 4.5G qualification probe. This executable is intentionally not a
+  # ctest case: unit tests prove correctness invariants, while
+  # scripts/run-soft-on-path-planner-qualification.sh runs this probe in a
+  # release build and emits archival JSON latency evidence.
+  add_executable(perf_soft_on_path_planner
+    test/perf/perf_soft_on_path_planner.cpp)
+  target_link_libraries(perf_soft_on_path_planner PRIVATE manyforge_core)
+
   add_executable(test_execution_kernel test/test_execution_kernel.cpp)
   target_link_libraries(test_execution_kernel PRIVATE manyforge_core GTest::gtest_main)
   gtest_discover_tests(test_execution_kernel
@@ -140,4 +156,5 @@ if(BUILD_TESTING)
   target_link_libraries(test_streaming_session PRIVATE manyforge_core GTest::gtest_main)
   gtest_discover_tests(test_streaming_session
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
 endif()

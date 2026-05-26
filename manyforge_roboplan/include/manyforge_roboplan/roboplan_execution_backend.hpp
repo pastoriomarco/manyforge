@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -18,6 +19,14 @@ namespace manyforge::roboplan_backend {
 struct RoboPlanExecutionBackendConfig {
   double reset_completion_timeout_s = 5.0;
   double streaming_stop_completion_timeout_s = 5.0;
+  /// Native-sim handoff budget for Phase 4.5G soft_on_path. This is
+  /// deliberately small but non-zero so tests exercise the same wall-time
+  /// contract as controller deployments.
+  double soft_on_path_stop_traj_delta_s = 0.02;
+  double soft_on_path_sample_period_s = 0.01;
+  std::optional<double> soft_on_path_max_initial_path_deviation_rad;
+  std::optional<double> soft_on_path_max_initial_velocity_deviation_rad_s;
+  std::map<std::string, double> soft_on_path_max_jerk_rad_s3;
 };
 
 /// Simulated execution backend that updates the planning scene
@@ -55,11 +64,24 @@ class RoboPlanExecutionBackend final : public core::IExecutionBackend {
   // slider retimes in-flight discrete and streaming motion without stopping.
   void set_runtime_velocity_scale(double scale) override;
 
+  // Phase 4.5D-3: controlled-stop capability + result surface for
+  // motion-scoped interrupt outcomes (spec/260 §5.6). The native
+  // simulator supports `kSpringBackHold` and Phase 4.5G native
+  // `kSoftOnPath`. `kHardDeceleration` remains a ros2_control/JTC-only
+  // mode in the current scope.
+  core::MotionInterruptStopCapabilityDTO
+  get_motion_interrupt_stop_capability() const override;
+  core::ControlledStopResultDTO execute_controlled_stop(
+      const core::MotionInterruptStopProfileDTO& profile) override;
+
  private:
   struct ExecutionStateData {
     core::ExecutionSnapshot snapshot;
     std::atomic<bool> running{false};
     std::atomic<bool> pause_requested{false};
+    std::optional<core::TrajectoryDTO> active_trajectory;
+    double active_trajectory_time_s = 0.0;
+    double active_runtime_velocity_scale = 1.0;
   };
 
   void publish_snapshot(core::ExecutionState state, double progress,

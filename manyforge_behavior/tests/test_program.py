@@ -1259,6 +1259,179 @@ class TestProgramValidation:
             Program(path, catalog)
         os.unlink(path)
 
+    # ----- Phase 4.5E follow-up: scoped motion node validation parity -----
+
+    @staticmethod
+    def _scoped_program(*, node_id: str, params: dict, profile: str = "v0.2") -> dict:
+        """Minimal program containing a single motion-scoped node."""
+        prog = _minimal_program(program_profile=profile)
+        prog["tree"] = {
+            "id": "sequence",
+            "name": "root",
+            "children": [
+                {
+                    "id": node_id,
+                    "name": f"{node_id}_under_test",
+                    "params": params,
+                },
+            ],
+        }
+        return prog
+
+    @pytest.mark.parametrize(
+        "node_id", ["move_until_signal", "probe_search_move"]
+    )
+    def test_scoped_node_rejects_joint_goal_without_joint_targets(
+        self, catalog, node_id
+    ):
+        data = self._scoped_program(
+            node_id=node_id,
+            params={
+                "move_id": "probe_a",
+                "motion_type": "joint_goal",
+                "policy_id": "trip",
+                "stop_mode": "spring_back_hold",
+            },
+        )
+        path = _write_program(data)
+        try:
+            with pytest.raises(
+                ProgramValidationError, match="joint_goal_names is required"
+            ):
+                Program(path, catalog)
+        finally:
+            os.unlink(path)
+
+    @pytest.mark.parametrize(
+        "node_id", ["move_until_signal", "probe_search_move"]
+    )
+    def test_scoped_node_rejects_joint_goal_mismatched_array_lengths(
+        self, catalog, node_id
+    ):
+        data = self._scoped_program(
+            node_id=node_id,
+            params={
+                "move_id": "probe_a",
+                "motion_type": "joint_goal",
+                "joint_goal_names": ["j1", "j2"],
+                "joint_goal_positions_rad": [0.1],
+                "policy_id": "trip",
+                "stop_mode": "spring_back_hold",
+            },
+        )
+        path = _write_program(data)
+        try:
+            with pytest.raises(
+                ProgramValidationError,
+                match="joint_goal_names and joint_goal_positions_rad must have the same length",
+            ):
+                Program(path, catalog)
+        finally:
+            os.unlink(path)
+
+    @pytest.mark.parametrize(
+        "node_id", ["move_until_signal", "probe_search_move"]
+    )
+    def test_scoped_node_rejects_pose_goal_without_pose(self, catalog, node_id):
+        data = self._scoped_program(
+            node_id=node_id,
+            params={
+                "move_id": "probe_a",
+                "motion_type": "pose_goal",
+                "policy_id": "trip",
+                "stop_mode": "spring_back_hold",
+            },
+        )
+        path = _write_program(data)
+        try:
+            with pytest.raises(
+                ProgramValidationError,
+                match="pose_goal is required when motion_type=pose_goal",
+            ):
+                Program(path, catalog)
+        finally:
+            os.unlink(path)
+
+    @pytest.mark.parametrize(
+        "node_id", ["move_until_signal", "probe_search_move"]
+    )
+    def test_scoped_node_rejects_relative_move_without_request(
+        self, catalog, node_id
+    ):
+        data = self._scoped_program(
+            node_id=node_id,
+            params={
+                "move_id": "probe_a",
+                "motion_type": "relative_move",
+                "policy_id": "trip",
+                "stop_mode": "spring_back_hold",
+            },
+        )
+        path = _write_program(data)
+        try:
+            with pytest.raises(
+                ProgramValidationError,
+                match="relative_move is required when motion_type=relative_move",
+            ):
+                Program(path, catalog)
+        finally:
+            os.unlink(path)
+
+    @pytest.mark.parametrize(
+        "node_id", ["move_until_signal", "probe_search_move"]
+    )
+    def test_scoped_node_rejects_malformed_relative_move(
+        self, catalog, node_id
+    ):
+        data = self._scoped_program(
+            node_id=node_id,
+            params={
+                "move_id": "probe_a",
+                "motion_type": "relative_move",
+                # Missing target_reference is a structural defect that
+                # would surface at runtime in the kernel without
+                # validation parity.
+                "relative_move": {
+                    "offset": {"position_m": [0.0, 0.0, 0.01]},
+                },
+                "policy_id": "trip",
+                "stop_mode": "spring_back_hold",
+            },
+        )
+        path = _write_program(data)
+        try:
+            with pytest.raises(
+                ProgramValidationError, match="target_reference is required"
+            ):
+                Program(path, catalog)
+        finally:
+            os.unlink(path)
+
+    @pytest.mark.parametrize(
+        "node_id", ["move_until_signal", "probe_search_move"]
+    )
+    def test_scoped_node_loads_when_joint_goal_is_well_formed(
+        self, catalog, node_id
+    ):
+        data = self._scoped_program(
+            node_id=node_id,
+            params={
+                "move_id": "probe_a",
+                "motion_type": "joint_goal",
+                "joint_goal_names": ["j1", "j2"],
+                "joint_goal_positions_rad": [0.1, -0.2],
+                "policy_id": "trip",
+                "stop_mode": "spring_back_hold",
+            },
+        )
+        path = _write_program(data)
+        try:
+            program = Program(path, catalog)
+            assert program.tree.children[0].id == node_id
+        finally:
+            os.unlink(path)
+
+
 class TestComputeProgramTreeHash:
     def test_deterministic(self):
         tree = TreeNode(id="move_to_waypoint", name="move_to_pick", params={"speed": 1.0})

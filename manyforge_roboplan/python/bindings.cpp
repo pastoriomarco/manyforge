@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cmath>
 #include <optional>
+#include <set>
 #include <stdexcept>
 
 #include <Eigen/Dense>
@@ -663,6 +664,78 @@ Ros2ControlExecutionBackendConfig ros2_control_config_from_python(
     config.command_gate_topic =
         config_dict["command_gate_topic"].cast<std::string>();
   }
+  if (config_dict.contains("speed_scaling_topic")) {
+    config.speed_scaling_topic =
+        config_dict["speed_scaling_topic"].cast<std::string>();
+  }
+  if (config_dict.contains("enable_jtc_speed_scaling_input")) {
+    config.enable_jtc_speed_scaling_input =
+        config_dict["enable_jtc_speed_scaling_input"].cast<bool>();
+  }
+  if (config_dict.contains("decelerate_on_cancel")) {
+    config.decelerate_on_cancel =
+        config_dict["decelerate_on_cancel"].cast<bool>();
+  }
+  if (config_dict.contains("velocity_state_interface_joints")) {
+    const auto joints =
+        config_dict["velocity_state_interface_joints"].cast<std::vector<std::string>>();
+    config.velocity_state_interface_joints =
+        std::set<std::string>(joints.begin(), joints.end());
+  }
+  if (config_dict.contains("max_deceleration_on_cancel_rad_s2")) {
+    config.max_deceleration_on_cancel_rad_s2 =
+        config_dict["max_deceleration_on_cancel_rad_s2"]
+            .cast<std::map<std::string, double>>();
+  }
+  if (config_dict.contains("enable_soft_on_path_path_ramp")) {
+    config.enable_soft_on_path_path_ramp =
+        config_dict["enable_soft_on_path_path_ramp"].cast<bool>();
+  }
+  config.soft_on_path_stop_traj_delta_s =
+      read_seconds("soft_on_path_stop_traj_delta_s",
+                   "soft_on_path_stop_traj_delta_ms",
+                   config.soft_on_path_stop_traj_delta_s);
+  config.soft_on_path_sample_period_s =
+      read_seconds("soft_on_path_sample_period_s",
+                   "soft_on_path_sample_period_ms",
+                   config.soft_on_path_sample_period_s);
+  if (config_dict.contains("soft_on_path_max_initial_path_deviation_rad")) {
+    auto val = config_dict["soft_on_path_max_initial_path_deviation_rad"];
+    if (!val.is_none()) {
+      config.soft_on_path_max_initial_path_deviation_rad =
+          finite_scale_from_python(val,
+                                   "soft_on_path_max_initial_path_deviation_rad");
+    }
+  }
+  if (config_dict.contains(
+          "soft_on_path_max_initial_velocity_deviation_rad_s")) {
+    auto val =
+        config_dict["soft_on_path_max_initial_velocity_deviation_rad_s"];
+    if (!val.is_none()) {
+      config.soft_on_path_max_initial_velocity_deviation_rad_s =
+          finite_scale_from_python(
+              val,
+              "soft_on_path_max_initial_velocity_deviation_rad_s");
+    }
+  }
+  if (config_dict.contains("soft_on_path_max_jerk_rad_s3")) {
+    config.soft_on_path_max_jerk_rad_s3 =
+        config_dict["soft_on_path_max_jerk_rad_s3"]
+            .cast<std::map<std::string, double>>();
+  }
+  if (config_dict.contains("soft_on_path_per_joint_max_jerk_rad_s3")) {
+    config.soft_on_path_max_jerk_rad_s3 =
+        config_dict["soft_on_path_per_joint_max_jerk_rad_s3"]
+            .cast<std::map<std::string, double>>();
+  }
+  if (config_dict.contains("allow_soft_on_path_model_velocity_fallback")) {
+    config.allow_soft_on_path_model_velocity_fallback =
+        config_dict["allow_soft_on_path_model_velocity_fallback"].cast<bool>();
+  }
+  if (config_dict.contains("enable_soft_on_path_experimental")) {
+    config.enable_soft_on_path_experimental =
+        config_dict["enable_soft_on_path_experimental"].cast<bool>();
+  }
   return config;
 }
 
@@ -790,12 +863,306 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
           req.motion = goal;
         }
 
+        // Phase 4.5E: motion-scoped interrupt scopes
+        // (spec/210 §3.10 + spec/260 §2.6). Parse each scope's
+        // stop_profile + node_category so MoveUntilSignal /
+        // ProbeSearchMove can drive the kernel arm path. Without
+        // this parsing the scopes would be silently dropped at the
+        // Python/native boundary and the move would run unscoped.
+        if (request.contains("motion_interrupt_scopes")) {
+          auto scopes_obj = request["motion_interrupt_scopes"];
+          if (!scopes_obj.is_none()) {
+            auto scopes_list = scopes_obj.cast<py::list>();
+            for (auto handle : scopes_list) {
+              auto sd = handle.cast<py::dict>();
+              MotionInterruptScopeDTO scope;
+              scope.scope_id = sd["scope_id"].cast<std::string>();
+              scope.policy_id = sd["policy_id"].cast<std::string>();
+              const std::string activation =
+                  sd.attr("get")("activation_mode",
+                                  std::string("require_inactive_at_arm"))
+                      .cast<std::string>();
+              // Phase 4.5E (codex review follow-up): a typoed or
+              // stale client value MUST fail before dispatch. Silently
+              // coercing "trip_if_already_inactive" → require_inactive
+              // would dispatch a different scope than the operator
+              // configured.
+              if (activation == "require_inactive_at_arm") {
+                scope.activation_mode =
+                    MotionInterruptActivationMode::kRequireInactiveAtArm;
+              } else if (activation == "fresh_edge_after_arm") {
+                scope.activation_mode =
+                    MotionInterruptActivationMode::kFreshEdgeAfterArm;
+              } else if (activation == "trip_if_already_active") {
+                scope.activation_mode =
+                    MotionInterruptActivationMode::kTripIfAlreadyActive;
+              } else if (activation == "maintain_level_with_hysteresis") {
+                scope.activation_mode =
+                    MotionInterruptActivationMode::kMaintainLevelWithHysteresis;
+              } else {
+                throw std::invalid_argument(
+                    std::string("motion_interrupt_scopes[].activation_mode: "
+                                "unknown value '") +
+                    activation +
+                    "' (expected one of require_inactive_at_arm, "
+                    "fresh_edge_after_arm, trip_if_already_active, "
+                    "maintain_level_with_hysteresis)");
+              }
+              if (sd.contains("arm_timeout_ns") &&
+                  !sd["arm_timeout_ns"].is_none()) {
+                scope.arm_timeout_ns =
+                    sd["arm_timeout_ns"].cast<std::int64_t>();
+              }
+              if (sd.contains("result_binding_key") &&
+                  !sd["result_binding_key"].is_none()) {
+                scope.result_binding_key =
+                    sd["result_binding_key"].cast<std::string>();
+              }
+              scope.required = sd.attr("get")("required", true).cast<bool>();
+              const std::string node_category =
+                  sd.attr("get")("node_category", std::string("generic"))
+                      .cast<std::string>();
+              if (node_category == "generic") {
+                scope.node_category = MotionInterruptNodeCategory::kGeneric;
+              } else if (node_category == "precision_contact") {
+                scope.node_category =
+                    MotionInterruptNodeCategory::kPrecisionContact;
+              } else {
+                throw std::invalid_argument(
+                    std::string("motion_interrupt_scopes[].node_category: "
+                                "unknown value '") +
+                    node_category +
+                    "' (expected 'generic' or 'precision_contact')");
+              }
+              if (sd.contains("stop_profile") &&
+                  !sd["stop_profile"].is_none()) {
+                auto sp = sd["stop_profile"].cast<py::dict>();
+                MotionInterruptStopProfileDTO profile;
+                profile.profile_id = sp["profile_id"].cast<std::string>();
+                const std::string sm = sp["stop_mode"].cast<std::string>();
+                if (sm == "spring_back_hold") {
+                  profile.stop_mode = MotionInterruptStopMode::kSpringBackHold;
+                } else if (sm == "soft_on_path") {
+                  profile.stop_mode = MotionInterruptStopMode::kSoftOnPath;
+                } else if (sm == "hard_deceleration") {
+                  profile.stop_mode = MotionInterruptStopMode::kHardDeceleration;
+                } else {
+                  throw std::invalid_argument(
+                      std::string("motion_interrupt_scopes[].stop_profile."
+                                  "stop_mode: unknown value '") +
+                      sm +
+                      "' (expected 'spring_back_hold', 'soft_on_path', or "
+                      "'hard_deceleration')");
+                }
+                if (sp.contains("deceleration_time_s") &&
+                    !sp["deceleration_time_s"].is_none()) {
+                  profile.deceleration_time_s =
+                      sp["deceleration_time_s"].cast<double>();
+                }
+                if (sp.contains("max_stop_time_s") &&
+                    !sp["max_stop_time_s"].is_none()) {
+                  profile.max_stop_time_s =
+                      sp["max_stop_time_s"].cast<double>();
+                }
+                if (sp.contains("joint_deceleration_profile_id") &&
+                    !sp["joint_deceleration_profile_id"].is_none()) {
+                  profile.joint_deceleration_profile_id =
+                      sp["joint_deceleration_profile_id"].cast<std::string>();
+                }
+                if (sp.contains("per_joint_max_deceleration_rad_s2") &&
+                    !sp["per_joint_max_deceleration_rad_s2"].is_none()) {
+                  profile.per_joint_max_deceleration_rad_s2 =
+                      sp["per_joint_max_deceleration_rad_s2"]
+                          .cast<std::map<std::string, double>>();
+                }
+                if (sp.contains("allowed_fallback_modes") &&
+                    !sp["allowed_fallback_modes"].is_none()) {
+                  for (auto m :
+                       sp["allowed_fallback_modes"].cast<py::list>()) {
+                    const std::string ms = m.cast<std::string>();
+                    if (ms == "spring_back_hold") {
+                      profile.allowed_fallback_modes.push_back(
+                          MotionInterruptStopMode::kSpringBackHold);
+                    } else if (ms == "soft_on_path") {
+                      profile.allowed_fallback_modes.push_back(
+                          MotionInterruptStopMode::kSoftOnPath);
+                    } else if (ms == "hard_deceleration") {
+                      profile.allowed_fallback_modes.push_back(
+                          MotionInterruptStopMode::kHardDeceleration);
+                    } else {
+                      throw std::invalid_argument(
+                          std::string("motion_interrupt_scopes[].stop_profile."
+                                      "allowed_fallback_modes: unknown value '") +
+                          ms +
+                          "' (expected 'spring_back_hold', 'soft_on_path', "
+                          "or 'hard_deceleration')");
+                    }
+                  }
+                }
+                profile.allow_natural_completion_on_short_path =
+                    sp.attr("get")(
+                          "allow_natural_completion_on_short_path", false)
+                        .cast<bool>();
+                profile.require_backend_confirmation =
+                    sp.attr("get")("require_backend_confirmation", true)
+                        .cast<bool>();
+                scope.stop_profile = profile;
+              }
+              req.motion_interrupt_scopes.push_back(std::move(scope));
+            }
+          }
+        }
+
         auto result = [&]() {
           py::gil_scoped_release release;
           return self.kernel->execute(req);
         }();
         return result_to_python(result);
       })
+      .def("get_execution_outcome",
+           [](NativeKernelBundle& self, std::uint64_t execution_id)
+               -> py::object {
+             // Phase 4.5E: expose the kernel's terminal motion outcome
+             // store so the Python BT nodes can map terminal_cause to
+             // py_trees Status. Returns None when no outcome is
+             // recorded (e.g., the execution id was never seen or
+             // FIFO-evicted).
+             auto outcome_opt = [&]() {
+               py::gil_scoped_release release;
+               return self.kernel->get_execution_outcome(execution_id);
+             }();
+             if (!outcome_opt) {
+               return py::none();
+             }
+             const auto& outcome = *outcome_opt;
+             py::dict d;
+             d["execution_id"] = outcome.execution_id;
+             d["move_id"] = outcome.move_id;
+             const char* cause = "completed_normally";
+             switch (outcome.terminal_cause) {
+               using enum MotionExecutionTerminalCause;
+               case kCompletedNormally: cause = "completed_normally"; break;
+               case kSignalTrip:        cause = "signal_trip"; break;
+               case kNoSignalTrip:      cause = "no_signal_trip"; break;
+               case kStopped:           cause = "stopped"; break;
+               case kFailed:            cause = "failed"; break;
+               case kInterruptedFault:  cause = "interrupted_fault"; break;
+             }
+             d["terminal_cause"] = std::string(cause);
+             if (outcome.trip) {
+               const auto& trip = *outcome.trip;
+               py::dict td;
+               td["latch_id"] = trip.latch_id;
+               td["source_id"] = trip.source_id;
+               td["policy_id"] = trip.policy_id;
+               td["scope_id"] = trip.scope_id;
+               const char* esm = "spring_back_hold";
+               switch (trip.executed_stop_mode) {
+                 using enum MotionInterruptStopMode;
+                 case kSpringBackHold:    esm = "spring_back_hold"; break;
+                 case kSoftOnPath:        esm = "soft_on_path"; break;
+                 case kHardDeceleration:  esm = "hard_deceleration"; break;
+               }
+               td["executed_stop_mode"] = std::string(esm);
+               const char* scs = "diagnostic_other";
+               switch (trip.stop_command_source) {
+                 using enum MotionInterruptStopCommandSource;
+                 case kFjtPreemptHold:           scs = "fjt_preempt_hold"; break;
+                 case kFjtPreemptPathRamp:       scs = "fjt_preempt_path_ramp"; break;
+                 case kJtcSpeedScalingRamp:      scs = "jtc_speed_scaling_ramp"; break;
+                 case kJtcCancelDecelerateOnCancel:
+                   scs = "jtc_cancel_decelerate_on_cancel"; break;
+                 case kNativeSimulatedStop:      scs = "native_simulated_stop"; break;
+                 case kNativeSimulatedPathRamp:
+                   scs = "native_simulated_path_ramp"; break;
+                 case kRobotNativeStop:          scs = "robot_native_stop"; break;
+                 case kDiagnosticOther:          scs = "diagnostic_other"; break;
+               }
+               td["stop_command_source"] = std::string(scs);
+               td["backend_stop_confirmed"] =
+                   trip.stop_snapshot.backend_stop_confirmed;
+               // Phase 4.5E (codex review follow-up): full stop
+               // snapshot fidelity. Downstream consumers need source +
+               // state + captured_at_ns so they can decide whether
+               // the certified rest position is acceptable for the
+               // node's precision contract.
+               const char* sss = "execution_backend_feedback";
+               switch (trip.stop_snapshot.source) {
+                 using enum ExecutionStopSnapshotSource;
+                 case kExecutionBackendFeedback:
+                   sss = "execution_backend_feedback"; break;
+                 case kKernelExecutionSnapshot:
+                   sss = "kernel_execution_snapshot"; break;
+                 case kPlanningContextState:
+                   sss = "planning_context_state"; break;
+               }
+               td["stop_snapshot_source"] = std::string(sss);
+               td["stop_snapshot_captured_at_ns"] =
+                   trip.stop_snapshot.captured_at_ns;
+               py::dict rs;
+               rs["joint_names"] = trip.stop_snapshot.robot_state.joint_names;
+               rs["positions_rad"] =
+                   trip.stop_snapshot.robot_state.positions_rad;
+               td["stop_snapshot_robot_state"] = rs;
+               if (trip.stop_distance_rad) {
+                 td["stop_distance_rad"] = *trip.stop_distance_rad;
+               }
+               if (trip.path_deviation_max_rad) {
+                 td["path_deviation_max_rad"] = *trip.path_deviation_max_rad;
+               }
+               if (trip.initial_path_deviation_rad) {
+                 td["initial_path_deviation_rad"] =
+                     *trip.initial_path_deviation_rad;
+               }
+               if (trip.fallback_reason) {
+                 td["fallback_reason"] = *trip.fallback_reason;
+               }
+               if (trip.result_binding_key) {
+                 td["result_binding_key"] = *trip.result_binding_key;
+               }
+               td["signal_to_latch_ns"] = trip.signal_to_latch_ns;
+               td["latch_to_backend_stop_call_ns"] =
+                   trip.latch_to_backend_stop_call_ns;
+               td["latch_to_stop_confirmed_ns"] =
+                   trip.latch_to_stop_confirmed_ns;
+               // Trip diagnostics: bounded JSON-safe string map; surface
+               // every entry so the BT/runtime can read scaffold flags
+               // (e.g. soft_on_path_scaffold_phase) without re-querying
+               // the backend.
+               py::dict trip_diag;
+               for (const auto& [k, v] : trip.diagnostics) {
+                 trip_diag[py::str(k)] = v;
+               }
+               td["diagnostics"] = trip_diag;
+               // Requested vs executed: the executed_stop_mode above
+               // describes physical behavior; expose the original
+               // requested mode separately so audit can verify the
+               // scope's profile matches what the operator authored.
+               const char* req_mode = "spring_back_hold";
+               switch (trip.requested_stop_profile.stop_mode) {
+                 using enum MotionInterruptStopMode;
+                 case kSpringBackHold:    req_mode = "spring_back_hold"; break;
+                 case kSoftOnPath:        req_mode = "soft_on_path"; break;
+                 case kHardDeceleration:  req_mode = "hard_deceleration"; break;
+               }
+               td["requested_stop_mode"] = std::string(req_mode);
+               td["requested_stop_profile_id"] =
+                   trip.requested_stop_profile.profile_id;
+               d["trip"] = td;
+             }
+             if (outcome.error) {
+               py::dict ed;
+               ed["code"] = outcome.error->code;
+               ed["message"] = outcome.error->message;
+               py::dict details;
+               for (const auto& [k, v] : outcome.error->details) {
+                 details[py::str(k)] = v;
+               }
+               ed["details"] = details;
+               d["error"] = ed;
+             }
+             return d;
+           })
       .def("preview_motion", [](NativeKernelBundle& self,
                                  py::dict request,
                                  py::object start_state_obj) -> py::dict {

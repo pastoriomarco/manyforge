@@ -51,6 +51,15 @@ bool ExecutionStateMachine::is_valid_transition(ExecutionState from, ExecutionSt
         case ExecutionState::kStopping:
             return to == ExecutionState::kStopped ||
                    to == ExecutionState::kPaused ||  // deceleration complete from pause
+                   // Phase 4.5D-2 (spec/230 §3.4): a successful
+                   // complete_move_on_signal trip transitions
+                   // Stopping -> Completed once the controlled stop
+                   // is confirmed and the validated stop snapshot
+                   // is captured. The corresponding failure paths
+                   // (backend stop failed, stop snapshot invalid)
+                   // transition Stopping -> Failed.
+                   to == ExecutionState::kCompleted ||
+                   to == ExecutionState::kFailed ||
                    to == ExecutionState::kInterventionRequired;
         case ExecutionState::kStopped:
             // ADR-0016: streaming sessions auto-return to kIdle after a
@@ -67,6 +76,13 @@ bool ExecutionStateMachine::is_valid_transition(ExecutionState from, ExecutionSt
         case ExecutionState::kInterrupted:
             return to == ExecutionState::kInterventionRequired ||
                    to == ExecutionState::kFailed ||
+                   // Phase 4.5D-2: when a move-scoped
+                   // complete_move_on_signal latch fires, the kernel
+                   // transitions Interrupted -> Stopping while the
+                   // controlled stop is in flight (spec/230 §3.4).
+                   // This is the non-fault terminal path; the latch
+                   // visible during Stopping is the trip itself.
+                   to == ExecutionState::kStopping ||
                    to == ExecutionState::kIdle;
         case ExecutionState::kInterventionRequired:
             // Idempotent safety sinks are allowed: repeated fault reports from

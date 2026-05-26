@@ -60,6 +60,24 @@ enum class KernelEventType {
   kInterruptSourceClassViolation,
   kInterruptRecoveryHandlerStarted,
   kInterruptRecoveryHandlerCompleted,
+  // Phase 4.5C: motion-scoped interrupt outcomes (spec/260 §7).
+  // `motion_interrupt_scope_armed` / `motion_interrupt_scope_reaped`
+  // surface the binding lifecycle. `motion_interrupt_queued_update_dropped`
+  // and `motion_trip_secondary_signal` come from the manager. Arm-time
+  // failures emit `kMotionInterruptArmFailed` (kernel-owned, not
+  // surfaced by the manager because the kernel decides not to dispatch).
+  // `kMotionExecutionOutcomeRecorded` is the terminal record event
+  // referenced by spec/210 §3.11; details carry the outcome's
+  // `terminal_cause`, plus `execution_id`, `move_id`, and any
+  // trip-specific identifiers when present.
+  kMotionInterruptScopeArmed,
+  kMotionInterruptScopeReaped,
+  kMotionInterruptArmFailed,
+  kMotionInterruptQueuedUpdateDropped,
+  kMotionTripSecondarySignal,
+  kMotionTripFailed,
+  kMotionTripCompleted,
+  kMotionExecutionOutcomeRecorded,
 };
 
 /// Kernel event structure (spec §6.1)

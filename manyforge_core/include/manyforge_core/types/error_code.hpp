@@ -44,7 +44,12 @@ enum class ErrorCode {
     kCacheMiss,
     kCollisionDetected,
     kUnknownJointName,
-    kSceneChangedDuringValidation
+    kSceneChangedDuringValidation,
+    // Phase 4.5C motion-scoped interrupt outcomes (spec/210 §5.2).
+    kMotionInterruptArmFailed,
+    kMotionInterruptSourceActiveAtArm,
+    kMotionInterruptBackendStopFailed,
+    kMotionInterruptStopStateInvalid
 };
 
 inline const char* to_string(ErrorCode code) {
@@ -78,6 +83,13 @@ inline const char* to_string(ErrorCode code) {
         case kCollisionDetected: return "collision_detected";
         case kUnknownJointName: return "unknown_joint_name";
         case kSceneChangedDuringValidation: return "scene_changed_during_validation";
+        case kMotionInterruptArmFailed: return "motion_interrupt_arm_failed";
+        case kMotionInterruptSourceActiveAtArm:
+            return "motion_interrupt_source_active_at_arm";
+        case kMotionInterruptBackendStopFailed:
+            return "motion_interrupt_backend_stop_failed";
+        case kMotionInterruptStopStateInvalid:
+            return "motion_interrupt_stop_state_invalid";
         default: return "unknown";
     }
 }
@@ -263,5 +275,24 @@ inline const char* kErrorResetFailed = "reset_failed";
 // Internal
 inline const char* kErrorInternalError = "internal_error";
 inline const char* kErrorInvariantViolation = "invariant_violation";
+
+// Phase 4.5C motion-scoped interrupt outcomes (spec/210 §5.2).
+// `motion_interrupt_arm_failed` — atomic arm-before-dispatch rejected
+// at least one `MotionInterruptScopeDTO`; the execution never reached
+// `Executing`. `motion_interrupt_source_active_at_arm` is the specific
+// arm-failure reason for `require_inactive_at_arm`. The two
+// backend/stop-state failures are reserved for Phase 4.5D and emitted
+// when a `complete_move_on_signal` trip cannot produce a validated
+// `ExecutionStopSnapshotDTO`. Until 4.5D lands, the kernel treats any
+// in-flight move-scoped latch as `motion_interrupt_backend_stop_failed`
+// so callers see the same code path post-4.5D.
+inline const char* kErrorMotionInterruptArmFailed =
+    "motion_interrupt_arm_failed";
+inline const char* kErrorMotionInterruptSourceActiveAtArm =
+    "motion_interrupt_source_active_at_arm";
+inline const char* kErrorMotionInterruptBackendStopFailed =
+    "motion_interrupt_backend_stop_failed";
+inline const char* kErrorMotionInterruptStopStateInvalid =
+    "motion_interrupt_stop_state_invalid";
 
 }  // namespace manyforge::core

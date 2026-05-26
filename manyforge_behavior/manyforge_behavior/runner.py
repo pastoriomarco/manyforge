@@ -26,6 +26,7 @@ from manyforge_behavior.nodes.logic import (
     WaitForGripperState,
 )
 from manyforge_behavior.nodes.motion import MoveManipulatorAction, ResetTrajectories, _rpy_deg_to_xyzw
+from manyforge_behavior.nodes.motion_scoped import MoveUntilSignal, ProbeSearchMove
 from manyforge_behavior.nodes.streaming import TrackTargetAction
 from manyforge_behavior.nodes.scene import (
     AddCollisionObject,
@@ -56,6 +57,13 @@ from manyforge_behavior.skill_loader import (
 # Composites/decorators are handled separately since they need children.
 PLUGIN_FACTORY: dict[str, type] = {
     "move_manipulator_action": MoveManipulatorAction,
+    # Phase 4.5E motion-scoped trip nodes (spec/260 §2.6). Authored
+    # programs reference these by catalog id; constructor kwargs map
+    # to the node's __init__ parameters (move_id, policy_id, stop_mode,
+    # etc.). The kernel owns signal arbitration; these nodes only
+    # submit the request and consume the terminal MotionExecutionOutcome.
+    "move_until_signal": MoveUntilSignal,
+    "probe_search_move": ProbeSearchMove,
     "track_target_action": TrackTargetAction,  # ADR-0016 streaming session
     "reset_trajectories": ResetTrajectories,
     "add_collision_object": AddCollisionObject,
@@ -382,7 +390,15 @@ class OrchestratorRunner:
         children = [self._build_node(c) for c in tree_node.children]
 
         # Inject robot profile defaults for motion nodes
-        if tree_node.id == "move_manipulator_action":
+        if tree_node.id in (
+            "move_manipulator_action",
+            # Phase 4.5E: motion-scoped trip nodes are full motion
+            # nodes — they need the same robot/frame defaults injected
+            # so authored programs don't have to repeat them on every
+            # MoveUntilSignal / ProbeSearchMove invocation.
+            "move_until_signal",
+            "probe_search_move",
+        ):
             if "robot_id" not in resolved_params:
                 resolved_params["robot_id"] = self._program.robot.robot_id
             if "group_id" not in resolved_params:
