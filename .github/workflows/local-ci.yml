@@ -1,0 +1,128 @@
+name: local-ci
+
+on:
+  pull_request:
+  push:
+    branches: [main, dev]
+  workflow_dispatch:
+
+concurrency:
+  group: local-ci-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  docker-local:
+    name: ${{ matrix.name }}
+    runs-on: [self-hosted, manyforge-local]
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: hygiene
+            suite: hygiene
+            command: |
+              errors=0
+              while IFS= read -r script; do
+                if ! bash -n "${script}" 2>&1; then
+                  echo "syntax error in ${script}" >&2
+                  errors=$((errors + 1))
+                fi
+              done < <(find scripts -type f -name '*.sh')
+              if (( errors > 0 )); then
+                echo "Found ${errors} script(s) with syntax errors" >&2
+                exit 1
+              fi
+              echo "All shell scripts pass bash -n"
+              ./scripts/ci/verify-version-sync.sh
+              ./scripts/ci/check-private-spec-boundary.sh
+          - name: core-cpp
+            suite: core-cpp
+            command: ./scripts/test-all.sh cpp
+          - name: roboplan
+            suite: roboplan
+            command: ./scripts/test-all.sh roboplan
+          - name: bindings
+            suite: bindings
+            command: |
+              ./scripts/test-all.sh cpp
+              ./scripts/test-all.sh bindings
+          - name: python-composer
+            suite: python-composer
+            command: |
+              ./scripts/test-all.sh python
+              (cd manyforge_composer/frontend && npm ci && npx tsc --noEmit -p tsconfig.app.json)
+              ./scripts/test-all.sh composer
+          - name: qualification
+            suite: qualification
+            command: |
+              ./scripts/test-all.sh qualification
+              ./scripts/run-soft-on-path-planner-qualification.sh --in-container
+          - name: core-tsan
+            suite: core-tsan
+            command: bash scripts/ci/run-core-tsan.sh
+    steps:
+      - name: Prepare local clone
+        id: checkout
+        shell: bash
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number || '' }}
+        run: |
+          set -euo pipefail
+
+          source_repo="${MANYFORGE_SOURCE_REPO:-/home/tndlux/workspaces/dev_ws/src/manyforge}"
+          worktree="${RUNNER_TEMP}/manyforge-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${{ matrix.suite }}"
+
+          if [[ ! -d "${source_repo}/.git" ]]; then
+            echo "Missing source repo at ${source_repo}" >&2
+            echo "Set MANYFORGE_SOURCE_REPO on the self-hosted runner if your clone lives elsewhere." >&2
+            exit 1
+          fi
+
+          echo "worktree=${worktree}" >> "${GITHUB_OUTPUT}"
+          rm -rf "${worktree}"
+          git clone --local --no-hardlinks "${source_repo}" "${worktree}"
+
+          if [[ -n "${PR_NUMBER}" ]]; then
+            git -C "${worktree}" fetch --no-tags origin "pull/${PR_NUMBER}/merge"
+          else
+            git -C "${worktree}" fetch --no-tags origin "${GITHUB_SHA}"
+          fi
+          git -C "${worktree}" checkout --detach FETCH_HEAD
+          git -C "${worktree}" status --short --branch
+
+      - name: Run ${{ matrix.name }} in Docker
+        shell: bash
+        env:
+          LOCAL_CI_COMMAND: ${{ matrix.command }}
+          TSAN_OPTIONS: halt_on_error=1 second_deadlock_stack=1 history_size=7
+          CMAKE_BUILD_PARALLEL_LEVEL: "2"
+        run: |
+          set -euo pipefail
+          worktree="${{ steps.checkout.outputs.worktree }}"
+          image="${MANYFORGE_LOCAL_CI_IMAGE:-manyforge-dev:latest}"
+          cache_volume="manyforge-local-ci-build-${{ matrix.suite }}"
+
+          docker image inspect "${image}" >/dev/null
+          docker run --rm \
+            --security-opt seccomp=unconfined \
+            -e WORKSPACE=/workspace \
+            -e MANYFORGE_BUILD_DIR=/tmp/manyforge-build \
+            -e CMAKE_BUILD_PARALLEL_LEVEL="${CMAKE_BUILD_PARALLEL_LEVEL}" \
+            -e TSAN_OPTIONS="${TSAN_OPTIONS}" \
+            -v "${worktree}:/workspace" \
+            -v "${cache_volume}:/tmp/manyforge-build" \
+            -w /workspace \
+            "${image}" \
+            bash -lc "set -euo pipefail; ${LOCAL_CI_COMMAND}"
+
+      - name: Remove local clone
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          worktree="${{ steps.checkout.outputs.worktree }}"
+          if [[ -n "${worktree}" ]]; then
+            docker run --rm -v "${worktree}:/target" python:3.12-slim \
+              bash -lc 'rm -rf /target' 2>/dev/null || rm -rf "${worktree}"
+          fi

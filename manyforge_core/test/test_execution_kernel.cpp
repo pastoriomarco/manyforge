@@ -2173,9 +2173,12 @@ TEST_F(ExecutionKernelTest,
                                     config};
   configure_authoritative_collision_validation(
       controlled_kernel, local_collision_world, local_collision_engine);
+  std::mutex events_mu;
   std::vector<KernelEvent> events;
-  controlled_kernel.subscribe_events(
-      [&](const KernelEvent& e) { events.push_back(e); });
+  controlled_kernel.subscribe_events([&](const KernelEvent& e) {
+    std::lock_guard<std::mutex> lock(events_mu);
+    events.push_back(e);
+  });
 
   auto result = controlled_kernel.execute(make_test_request());
   ASSERT_TRUE(result.ok());
@@ -2217,20 +2220,36 @@ TEST_F(ExecutionKernelTest,
   EXPECT_EQ(latch->preemption_action_requested,
             InterruptPreemptionAction::kPreemptTrajectory);
   EXPECT_EQ(latch->preemption_result, InterruptPreemptionResult::kSucceeded);
-  EXPECT_TRUE(std::any_of(events.begin(), events.end(), [](const KernelEvent& e) {
-    return e.type == KernelEventType::kInterruptLatched;
-  }));
-  EXPECT_TRUE(std::any_of(events.begin(), events.end(), [](const KernelEvent& e) {
-    return e.type == KernelEventType::kInterruptPreemptApplied &&
-           e.details.at("preemption_result") == "succeeded";
-  }));
-  EXPECT_TRUE(std::any_of(events.begin(), events.end(), [](const KernelEvent& e) {
-    return e.type == KernelEventType::kCollisionDetected &&
-           e.details.at("surface") == "observed_runtime_monitor" &&
-           e.details.at("collision_world_revision_id") == "99" &&
-           e.details.at("contact_a") == "object/box/shape/0" &&
-           e.details.at("contact_b") == "robot/robot1/link/link1/collision/0";
-  }));
+  std::vector<KernelEvent> captured_events;
+  {
+    std::lock_guard<std::mutex> lock(events_mu);
+    captured_events = events;
+  }
+  EXPECT_TRUE(
+      std::any_of(captured_events.begin(), captured_events.end(),
+                  [](const KernelEvent& e) {
+                    return e.type == KernelEventType::kInterruptLatched;
+                  }));
+  EXPECT_TRUE(
+      std::any_of(captured_events.begin(), captured_events.end(),
+                  [](const KernelEvent& e) {
+                    return e.type ==
+                               KernelEventType::kInterruptPreemptApplied &&
+                           e.details.at("preemption_result") == "succeeded";
+                  }));
+  EXPECT_TRUE(
+      std::any_of(captured_events.begin(), captured_events.end(),
+                  [](const KernelEvent& e) {
+                    return e.type == KernelEventType::kCollisionDetected &&
+                           e.details.at("surface") ==
+                               "observed_runtime_monitor" &&
+                           e.details.at("collision_world_revision_id") ==
+                               "99" &&
+                           e.details.at("contact_a") ==
+                               "object/box/shape/0" &&
+                           e.details.at("contact_b") ==
+                               "robot/robot1/link/link1/collision/0";
+                  }));
 }
 
 TEST_F(ExecutionKernelTest,
