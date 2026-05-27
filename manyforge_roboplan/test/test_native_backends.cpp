@@ -1138,14 +1138,14 @@ TEST_F(NativeKernelTest, TrajectoryValidationReportsTcpSpeedBeforeCollisionSweep
 }
 
 // =========================================================================
-// Phase 4.5D-3: native backend `spring_back_hold` controlled-stop tests
+// Native backend `spring_back_hold` controlled-stop tests
 // =========================================================================
 
 TEST_F(NativeKernelTest,
        NativeBackend_StopCapability_DeclaresSpringBackHoldAndSoftOnPath) {
   // Spec/240 backend capability profile + spec/260 §5.6: the native
-  // simulator now has concrete support for spring_back_hold and Phase
-  // 4.5G soft_on_path. hard_deceleration remains ros2_control/JTC-only.
+  // simulator now has concrete support for spring_back_hold and
+  // soft_on_path. hard_deceleration remains ros2_control/JTC-only.
   auto cap = bundle_->execution->get_motion_interrupt_stop_capability();
   EXPECT_EQ(cap.supported_stop_modes.size(), 2u);
   EXPECT_TRUE(cap.supported_stop_modes.contains(
@@ -1417,7 +1417,7 @@ TEST_F(NativeKernelTest,
 
 TEST_F(NativeKernelTest,
        NativeBackend_EndToEnd_ScopedTripProducesSignalTripOutcome) {
-  // End-to-end Phase 4.5D-3 integration: kernel + RoboPlanExecutionBackend +
+  // End-to-end integration: kernel + RoboPlanExecutionBackend +
   // InterruptManager produce a real signal_trip outcome with a populated
   // MotionTripOutcomeDTO. This exercises the controlled-stop port at the
   // kernel layer (handle_motion_trip_latch -> execute_controlled_stop ->

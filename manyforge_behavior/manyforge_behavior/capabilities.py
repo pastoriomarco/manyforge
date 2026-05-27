@@ -38,7 +38,7 @@ CAPABILITY_REGISTRY: frozenset[str] = frozenset({
     "execution.contact.force_torque",
     "execution.contact.controller_reported",
     "execution.control.admittance",
-    # Phase 4.5: motion-scoped interrupt outcomes
+    # Motion-scoped interrupt outcomes.
     # `kernel.motion_interrupt_scope` is required for any node that
     # submits a `MotionInterruptScopeDTO` (MoveUntilSignal,
     # ProbeSearchMove). `kernel.motion_interrupt_precision_contact`
@@ -112,7 +112,7 @@ V0_1_REQUIRED_KEYS: frozenset[str] = frozenset(
 
 PROFILE_REQUIRED_KEYS["v0.1"] = V0_1_REQUIRED_KEYS
 
-# v0.2 adds the Phase 4.5 motion-scoped interrupt surface. Programs
+# v0.2 adds the motion-scoped interrupt surface. Programs
 # that author MoveUntilSignal / ProbeSearchMove (catalog `min_profile:
 # v0.2`) must declare `program_profile: v0.2` so deployments without
 # the kernel.motion_interrupt_scope capability can be rejected at load

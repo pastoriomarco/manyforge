@@ -60,7 +60,7 @@ struct MotionInterruptStopCapabilityDTO {
 /// any element of `allowed_fallback_modes` is outside the policy's
 /// `allowed_stop_modes` or the backend's
 /// `MotionInterruptStopCapabilityDTO`. At trip time the backend
-/// fails closed when live controller behavior diverges (Phase 4.5D-2+).
+/// fails closed when live controller behavior diverges.
 struct MotionInterruptStopProfileDTO {
   /// Stable profile identifier for trace/audit. May reference a
   /// deployment-defined profile or an inline motion-node profile.
@@ -85,9 +85,9 @@ struct MotionInterruptStopProfileDTO {
   /// MUST be recorded in the terminal outcome. The conjunctive rule
   /// (spec/210 §3.11) gates trip-time acceptance.
   std::vector<MotionInterruptStopMode> allowed_fallback_modes;
-  /// Phase 4.5G: when `kSoftOnPath` is requested and the remaining
-  /// accepted trajectory would finish before a useful wall-time stop
-  /// ramp can be accepted, allow the motion to complete naturally
+  /// When `kSoftOnPath` is requested and the remaining accepted
+  /// trajectory would finish before a useful wall-time stop ramp
+  /// can be accepted, allow the motion to complete naturally
   /// instead of requiring a stop-mode fallback. Default false preserves
   /// precision-contact semantics.
   bool allow_natural_completion_on_short_path = false;
@@ -101,7 +101,7 @@ struct MotionInterruptStopProfileDTO {
 };
 
 /// Result of a controlled-stop request issued to the execution backend
-/// at trip time (spec/260 §5.6, Phase 4.5D-2). The backend MUST set
+/// at trip time (spec/260 §5.6). The backend MUST set
 /// `accepted=false` and a populated `error` when it cannot execute any
 /// controlled stop (including the trivial native-simulated path);
 /// otherwise it reports the mode it actually executed, which surface
@@ -120,7 +120,7 @@ struct ControlledStopResultDTO {
   /// request. `false` plus a populated `error` MUST be used when the
   /// backend cannot execute the requested or any fallback mode.
   bool accepted = false;
-  /// Phase 4.5G: `true` only for the explicit short-path policy where
+  /// `true` only for the explicit short-path policy where
   /// `kSoftOnPath` was requested, no useful wall-time replacement ramp
   /// can be accepted before the original trajectory endpoint, and the
   /// stop profile allows natural completion. No controlled stop is
@@ -151,7 +151,7 @@ struct ControlledStopResultDTO {
   /// stop. REQUIRED for `kSoftOnPath` production qualification.
   std::optional<double> path_deviation_max_rad;
   /// Optional deviation at the trip/handoff anchor before the
-  /// path-ramp projection. Phase 4.5G records this separately so
+  /// path-ramp projection. Recorded separately so
   /// best-effort path preservation does not hide initial tracking
   /// error.
   std::optional<double> initial_path_deviation_rad;
@@ -198,14 +198,14 @@ struct MotionInterruptScopeDTO {
   /// v1 MUST be `true`; present so later advisory scopes can downgrade
   /// without a schema break.
   bool required = true;
-  /// Phase 4.5D-1 (spec/260 §5.6 + spec/210 §3.11): controlled-stop
-  /// profile selected by the motion node. REQUIRED when the bound
+  /// Controlled-stop profile (spec/260 §5.6 + spec/210 §3.11)
+  /// selected by the motion node. REQUIRED when the bound
   /// policy's `preemption_action == kCompleteMoveOnSignal`; missing
   /// here is an arm-time rejection. Free-move / non-trip scopes (none
   /// in v1) MAY omit.
   std::optional<MotionInterruptStopProfileDTO> stop_profile;
-  /// Phase 4.5D-1: motion-node category metadata. Drives default
-  /// fallback rules at arm time (spec/210 §3.11). Default
+  /// Motion-node category metadata. Drives default fallback rules
+  /// at arm time (spec/210 §3.11). Default
   /// `kGeneric` matches `MoveUntilSignal`-class nodes;
   /// `kPrecisionContact` matches `ProbeSearchMove`-class nodes and
   /// rejects any non-empty `allowed_fallback_modes` at arm time.
@@ -255,24 +255,22 @@ struct MotionTripOutcomeDTO {
   std::string scope_id;
   InterruptSignalUpdate signal_snapshot;
   ExecutionStopSnapshotDTO stop_snapshot;
-  /// Phase 4.5D-1: exact profile carried by the winning scope. The
-  /// backend MUST report both requested and executed stop modes; a
+  /// Exact profile carried by the winning scope. The backend MUST
+  /// report both requested and executed stop modes; a
   /// successful `signal_trip` outcome is invalid if the executed mode
   /// is unknown (spec/210 §3.11).
   MotionInterruptStopProfileDTO requested_stop_profile;
-  /// Phase 4.5D-1: mode the backend actually executed. MUST match
+  /// Mode the backend actually executed. MUST match
   /// `requested_stop_profile.stop_mode` unless the profile explicitly
   /// listed this mode in `allowed_fallback_modes` AND every other
   /// condition of the conjunctive fallback rule (spec/210 §3.11) is
-  /// satisfied. Default `kSpringBackHold` is a placeholder used by
-  /// 4.5D-1 schema; subsequent sub-chunks populate the real value.
+  /// satisfied. Default `kSpringBackHold` is a schema placeholder;
+  /// real values are populated by the trip-handling path.
   MotionInterruptStopMode executed_stop_mode =
       MotionInterruptStopMode::kSpringBackHold;
-  /// Phase 4.5D-1: which backend/controller surface issued the stop.
+  /// Which backend/controller surface issued the stop.
   /// `kDiagnosticOther` MUST include a stable backend reason in
-  /// `diagnostics`. 4.5D-1 leaves this as `kDiagnosticOther`
-  /// placeholder pending the controlled-stop result surface in
-  /// 4.5D-2.
+  /// `diagnostics`.
   MotionInterruptStopCommandSource stop_command_source =
       MotionInterruptStopCommandSource::kDiagnosticOther;
   std::int64_t signal_to_latch_ns = 0;
@@ -280,24 +278,24 @@ struct MotionTripOutcomeDTO {
   std::int64_t latch_to_stop_confirmed_ns = 0;
   std::optional<CollisionWorldRevision> collision_world_revision;
   std::optional<std::string> collision_policy_revision;
-  /// Phase 4.5D-1: joint-space stop distance from trip sample to
-  /// confirmed stop state. REQUIRED for `kHardDeceleration` runtime
-  /// evidence; OPTIONAL for `kSpringBackHold` / `kSoftOnPath`.
+  /// Joint-space stop distance from trip sample to confirmed stop
+  /// state. REQUIRED for `kHardDeceleration` runtime evidence;
+  /// OPTIONAL for `kSpringBackHold` / `kSoftOnPath`.
   std::optional<double> stop_distance_rad;
-  /// Phase 4.5D-1: maximum deviation from the accepted path during
-  /// the stop. REQUIRED for `kSoftOnPath` production qualification;
+  /// Maximum deviation from the accepted path during the stop.
+  /// REQUIRED for `kSoftOnPath` production qualification;
   /// MAY be absent at runtime only when the backend records an
   /// explicit diagnostic reason.
   std::optional<double> path_deviation_max_rad;
-  /// Phase 4.5G: deviation at the stop-ramp anchor before projection
-  /// onto the accepted path. Required for release-ready `kSoftOnPath`
+  /// Deviation at the stop-ramp anchor before projection onto the
+  /// accepted path. Required for release-ready `kSoftOnPath`
   /// evidence and optional for other modes.
   std::optional<double> initial_path_deviation_rad;
-  /// Phase 4.5D-1: stable reason explaining why the executed mode
-  /// differs from the requested mode. REQUIRED when
+  /// Stable reason explaining why the executed mode differs from
+  /// the requested mode. REQUIRED when
   /// `executed_stop_mode != requested_stop_profile.stop_mode`.
   std::optional<std::string> fallback_reason;
-  /// Phase 4.5E (codex review follow-up): the originating scope's
+  /// The originating scope's
   /// `MotionInterruptScopeDTO.result_binding_key` (spec/260 §2.6),
   /// echoed into the trip outcome so BT/runtime consumers can
   /// correlate the outcome with the blackboard slot that owns its
@@ -333,7 +331,7 @@ enum class MotionExecutionTerminalCause {
 
 /// Immutable terminal record of one motion execution (spec/210 §3.11).
 /// Stored in the kernel's terminal-outcome surface; queryable via
-/// `get_execution_outcome(execution_id)` (Phase 4.5C). Emitted exactly
+/// `get_execution_outcome(execution_id)`. Emitted exactly
 /// once per terminal execution; never mutated after publication.
 struct MotionExecutionOutcomeDTO {
   std::uint64_t execution_id = 0;

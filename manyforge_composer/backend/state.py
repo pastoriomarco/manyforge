@@ -3229,7 +3229,11 @@ class ComposerState:
         if execution is None:
             return
         config = dict(execution.config or {})
-        if config.get("execution_state_source_mode") != "commanded_sim":
+        authority_profile = (
+            config.get("execution_state_authority_profile")
+            or config.get("execution_state_source_mode")
+        )
+        if authority_profile != "commanded_sim":
             return
         if config.get("reset_to_initial_on_load", True) is False and reason == "program_load":
             return

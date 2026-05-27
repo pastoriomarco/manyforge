@@ -13,6 +13,34 @@ class CycleStatusResponse(BaseModel):
     model_config = _ALIAS_CFG
     state: str
     velocity_scale: float = Field(alias="velocityScale")
+    # Structured error surface so the HMI can render the actual cause of a
+    # runtime fault / restart-blocked condition instead of a generic banner.
+    # `error` is the human-readable message; `error_code` is a stable machine
+    # token for HMI mapping (e.g. "validation_collision",
+    # "motion_interrupt_backend_stop_failed"); `error_details` is the kernel
+    # diagnostics map (colliding pair, classification, waypoint index, etc.).
+    error: Optional[str] = None
+    error_code: Optional[str] = Field(default=None, alias="errorCode")
+    error_details: Optional[Dict[str, Any]] = Field(
+        default=None, alias="errorDetails"
+    )
+
+
+class CycleCommandErrorResponse(BaseModel):
+    """Structured error payload returned by cycle command routes (run/stop/
+    reset/velocity) when the kernel or cycle manager rejects the operation.
+
+    FastAPI's `HTTPException` carries an arbitrary `detail` value, and the
+    routes pass an instance of this model as that detail so the HMI can
+    surface the kernel's actual cause instead of a single string.
+    """
+
+    model_config = _ALIAS_CFG
+    message: str
+    error_code: Optional[str] = Field(default=None, alias="errorCode")
+    error_details: Optional[Dict[str, Any]] = Field(
+        default=None, alias="errorDetails"
+    )
 
 
 class VelocityScaleRequest(BaseModel):
@@ -852,7 +880,18 @@ class KernelSnapshotResponse(BaseModel):
     active_move_id: Optional[str] = None
     progress: float
     joint_positions_rad: Optional[List[float]] = None
+    state_source: Optional[str] = None
+    source_timestamp_ns: Optional[int] = None
+    source_age_ns: Optional[int] = None
     error: Optional[str] = None
+    # Reset/error UX: kernel errors carry structured diagnostics
+    # (collision pair, classification, waypoint index, snapshot revision,
+    # fault reason code, etc.). The kernel already produces these via the
+    # ErrorDTO; pybind already serializes them into the Python snapshot.
+    # The HMI needs both fields to render a structured cause panel instead
+    # of a generic banner.
+    error_code: Optional[str] = None
+    error_details: Optional[Dict[str, Any]] = None
     last_transition_ns: Optional[int] = None
     timestamp_ns: int
 
@@ -889,6 +928,9 @@ class SceneRobotResponse(BaseModel):
     joint_names: List[str] = Field(default_factory=list)
     joint_positions: Dict[str, float] = Field(default_factory=dict)
     tcp_pose_in_base: Optional[Dict[str, Any]] = None
+    state_source: Optional[str] = None
+    source_timestamp_ns: Optional[int] = None
+    source_age_ns: Optional[int] = None
 
 
 class SceneGripperSubtreeLink(BaseModel):
@@ -1835,4 +1877,12 @@ class StateUpdate(BaseModel):
         default=None, alias="runtimeOverrideStatus"
     )
     error: Optional[str] = None
+    # Phase 2 of issue #1/#3 rich-error rendering: WebSocket carries the
+    # cycle manager's structured (errorCode, errorDetails) tuple so the
+    # HMI can render the KernelErrorPanel from a single push instead of
+    # falling back to polling /api/cycle/status.
+    error_code: Optional[str] = Field(default=None, alias="errorCode")
+    error_details: Optional[Dict[str, Any]] = Field(
+        default=None, alias="errorDetails"
+    )
     timestamp: float

@@ -180,20 +180,27 @@ tree:
       velocity_scale: ${param:velocity_scale}
       planning_timeout_s: 10
       execution_timeout_s: 30
-  - id: command_gripper
-    name: close_gripper
-    params:
-      gripper_id: primary
-      position: 0.55
-      max_effort: 40
-      duration_s: 1
-      timeout_s: 0
-  - id: attach_object_to_link
-    name: attach_cheese_box
-    params:
-      object_id: isaac_cheese_box
-      link_frame: grasp_frame
-      gripper_id: primary
+  - id: sequence
+    name: gripper_close_sequence
+    children:
+    - id: command_gripper
+      name: close_gripper
+      params:
+        gripper_id: primary
+        position: 0.55
+        max_effort: 40
+        duration_s: 1
+        timeout_s: 0
+    - id: timer
+      name: attach_timer
+      params:
+        duration_s: 0.5
+    - id: attach_object_to_link
+      name: attach_cheese_box
+      params:
+        object_id: isaac_cheese_box
+        link_frame: grasp_frame
+        gripper_id: primary
   - id: move_manipulator_action
     name: pick_retreat
     params:
@@ -273,19 +280,26 @@ tree:
         offset_reference:
           type: frame
           id: base_link
-  - id: command_gripper
-    name: open_gripper
-    params:
-      gripper_id: primary
-      position: 0
-      max_effort: 40
-      duration_s: 1
-      timeout_s: 0
-  - id: detach_object_from_link
-    name: detach_cheese_box
-    params:
-      object_id: isaac_cheese_box
-      link_frame: grasp_frame
+  - id: sequence
+    name: gripper_open_sequence
+    children:
+    - id: detach_object_from_link
+      name: detach_cheese_box
+      params:
+        object_id: isaac_cheese_box
+        link_frame: grasp_frame
+    - id: timer
+      name: detach_timer
+      params:
+        duration_s: 1
+    - id: command_gripper
+      name: open_gripper
+      params:
+        gripper_id: primary
+        position: 0
+        max_effort: 40
+        duration_s: 1
+        timeout_s: 0
   - id: move_manipulator_action
     name: drop_retreat
     params:

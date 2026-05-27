@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { api } from '../api/client';
+import { api, ApiError } from '../api/client';
 import { useCycleStore, useEditLocked } from '../store/cycleStore';
+import { KernelErrorPanel } from './KernelErrorPanel';
 import { useFollowTargetPhase, useRobotCommandAuthority } from '../store/commandAuthority';
 import { useSceneStateStore } from '../store/sceneStateStore';
 import { followTargetController } from '../streaming/followTargetController';
@@ -26,7 +27,11 @@ interface BrowserSession {
 }
 
 export function ControlBar() {
-  const { error } = useCycleStore();
+  const {
+    error,
+    errorCode: cycleErrorCode,
+    errorDetails: cycleErrorDetails,
+  } = useCycleStore();
   const { edgeStyle, setEdgeStyle } = useComposerStore();
   const {
     nodes,
@@ -72,7 +77,50 @@ export function ControlBar() {
     error: deploymentError,
   } = useDeploymentStore();
 
-  const [actionError, setActionError] = useState<string | null>(null);
+  // Structured error capture for the KernelErrorPanel: when a cycle command
+  // (run/stop/reset) is rejected, the backend returns a 409 with a
+  // `detail.{message, errorCode, errorDetails}` payload that the API client
+  // surfaces via ApiError. We hold both the message and the structured
+  // fields so the panel can render a cause headline plus the diagnostics
+  // map. Frontend-only errors (validation, transport) still set message-
+  // only and the panel falls back to a generic banner.
+  interface ActionErrorState {
+    message: string;
+    errorCode: string | null;
+    errorDetails: Record<string, unknown> | null;
+  }
+  const [actionError, setActionErrorState] = useState<ActionErrorState | null>(null);
+  const setActionError = useCallback((value: string | null | unknown) => {
+    if (value === null || value === undefined) {
+      setActionErrorState(null);
+      return;
+    }
+    if (value instanceof ApiError) {
+      setActionErrorState({
+        message: value.message,
+        errorCode: value.errorCode,
+        errorDetails: value.errorDetails,
+      });
+      return;
+    }
+    if (value instanceof Error) {
+      setActionErrorState({
+        message: value.message,
+        errorCode: null,
+        errorDetails: null,
+      });
+      return;
+    }
+    if (typeof value === 'string') {
+      setActionErrorState({ message: value, errorCode: null, errorDetails: null });
+      return;
+    }
+    setActionErrorState({
+      message: String(value),
+      errorCode: null,
+      errorDetails: null,
+    });
+  }, []);
   const [busy, setBusy] = useState(false);
   const [browserSession, setBrowserSession] = useState<BrowserSession | null>(null);
 
@@ -117,7 +165,32 @@ export function ControlBar() {
     || !blackboardKeysSaved
     || !deploymentSaved;
   const hasAppliedUnsavedChanges = !programAppliedMatchesSaved || !deploymentAppliedMatchesSaved;
-  const activeError = actionError || error || programError || deploymentError;
+  // Resolve the active error to a uniform { message, errorCode, errorDetails }
+  // shape. Precedence:
+  //   1. actionError — a fresh cycle-command 409 (highest priority because
+  //      it represents the operator's most recent action).
+  //   2. cycle store error — pushed via WebSocket from the cycle manager,
+  //      carries the runtime-fault structured cause (collision_detected /
+  //      interrupt_latched harvest, motion-soft-fail diagnostics, etc.).
+  //   3. programError / deploymentError — frontend validation/transport
+  //      errors that don't carry kernel diagnostics. Rendered with the
+  //      panel's generic-banner fallback (no errorCode mapping).
+  let activeError: ActionErrorState | null = null;
+  if (actionError) {
+    activeError = actionError;
+  } else if (error) {
+    activeError = {
+      message: error,
+      errorCode: cycleErrorCode ?? null,
+      errorDetails: cycleErrorDetails ?? null,
+    };
+  } else if (programError || deploymentError) {
+    activeError = {
+      message: programError || deploymentError!,
+      errorCode: null,
+      errorDetails: null,
+    };
+  }
   const hasRuntimeOverrides = !!runtimeOverrideStatus && (runtimeOverrideStatus.hasActive || runtimeOverrideStatus.hasStaged);
 
   const summarizeValidationErrors = (errors: Array<{ path: string; message: string }>): string => {
@@ -270,11 +343,11 @@ export function ControlBar() {
       setActionError(null);
       await applyDrafts(hasRuntimeOverrides);
     } catch (e) {
-      setActionError((e as Error).message);
+      setActionError(e);
     } finally {
       setBusy(false);
     }
-  }, [applyDrafts, hasRuntimeOverrides]);
+  }, [applyDrafts, hasRuntimeOverrides, setActionError]);
 
   const handleSaveAll = useCallback(async () => {
     try {
@@ -282,11 +355,11 @@ export function ControlBar() {
       setActionError(null);
       await saveDrafts();
     } catch (e) {
-      setActionError((e as Error).message);
+      setActionError(e);
     } finally {
       setBusy(false);
     }
-  }, [saveDrafts]);
+  }, [saveDrafts, setActionError]);
 
   const handleSaveAs = useCallback(async () => {
     if (!programInfo && !deployment) {
@@ -299,7 +372,7 @@ export function ControlBar() {
       programPath: programInfo?.sourcePath ?? '',
       deploymentPath: deploymentSourcePath || deployment?.sourcePath || '',
     });
-  }, [deployment, deploymentSourcePath, programInfo]);
+  }, [deployment, deploymentSourcePath, programInfo, setActionError]);
 
   const handleLoad = useCallback(async () => {
     const hasDraftChanges = hasUnappliedChanges || hasUnsavedChanges;
@@ -330,6 +403,7 @@ export function ControlBar() {
     hasUnsavedChanges,
     programInfo?.sourcePath,
     hasRuntimeOverrides,
+    setActionError,
   ]);
 
   const finalizeBrowserSession = useCallback(
@@ -356,7 +430,7 @@ export function ControlBar() {
           await Promise.all(operations);
         }
       } catch (e) {
-        setActionError((e as Error).message);
+        setActionError(e);
       } finally {
         setBusy(false);
         setBrowserSession(null);
@@ -372,6 +446,7 @@ export function ControlBar() {
       hasRuntimeOverrides,
       saveDeployment,
       saveProgram,
+      setActionError,
     ],
   );
 
@@ -425,7 +500,7 @@ export function ControlBar() {
     discardProgramToApplied();
     discardDeploymentToApplied();
     setActionError(null);
-  }, [discardDeploymentToApplied, discardProgramToApplied]);
+  }, [discardDeploymentToApplied, discardProgramToApplied, setActionError]);
 
   const handleDiscard = useCallback(() => {
     discardDrafts();
@@ -500,7 +575,7 @@ export function ControlBar() {
           : Promise.resolve(true),
       ]);
     } catch (e) {
-      setActionError((e as Error).message);
+      setActionError(e);
     } finally {
       setBusy(false);
     }
@@ -522,6 +597,7 @@ export function ControlBar() {
     savedBlackboardNamespaces,
     savedProgramParameters,
     savedTree,
+    setActionError,
   ]);
 
   const cycleEditLocked = useEditLocked();
@@ -531,10 +607,11 @@ export function ControlBar() {
   return (
       <div className="border-t border-gray-700 bg-gray-800 px-4 py-2">
         {activeError && (
-          <div className="mb-2 rounded border border-red-700 bg-red-950/60 px-3 py-2 text-sm text-red-200">
-            <div className="font-semibold text-red-100">Session change failed</div>
-            <div className="break-words">{activeError}</div>
-          </div>
+          <KernelErrorPanel
+            message={activeError.message}
+            errorCode={activeError.errorCode}
+            errorDetails={activeError.errorDetails}
+          />
         )}
         <div className="flex min-h-12 items-center gap-4">
         <button
@@ -673,7 +750,7 @@ export function ControlBar() {
  * 409 in that case; we let it surface via the cycle store's error).
  */
 function CycleControls() {
-  const { state, velocityScale, run, stop, reset, setVelocityScale, error } = useCycleStore();
+  const { state, velocityScale, run, stop, reset, setVelocityScale } = useCycleStore();
   const streamingPhase = useFollowTargetPhase();
   const runAuthority = useRobotCommandAuthority({
     requireFreshScene: true,
@@ -861,15 +938,6 @@ function CycleControls() {
           {velocityDraft.toFixed(2)}
         </span>
       </label>
-      {error && (
-        <span
-          className="ml-2 truncate text-[11px] text-red-300"
-          title={error}
-          style={{ maxWidth: '20ch' }}
-        >
-          ⚠ {error.slice(0, 24)}
-        </span>
-      )}
     </div>
   );
 }

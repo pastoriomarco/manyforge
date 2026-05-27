@@ -19,9 +19,9 @@ namespace manyforge::roboplan_backend {
 struct RoboPlanExecutionBackendConfig {
   double reset_completion_timeout_s = 5.0;
   double streaming_stop_completion_timeout_s = 5.0;
-  /// Native-sim handoff budget for Phase 4.5G soft_on_path. This is
-  /// deliberately small but non-zero so tests exercise the same wall-time
-  /// contract as controller deployments.
+  /// Native-sim handoff budget for soft_on_path. This is deliberately
+  /// small but non-zero so tests exercise the same wall-time contract
+  /// as controller deployments.
   double soft_on_path_stop_traj_delta_s = 0.02;
   double soft_on_path_sample_period_s = 0.01;
   std::optional<double> soft_on_path_max_initial_path_deviation_rad;
@@ -64,11 +64,10 @@ class RoboPlanExecutionBackend final : public core::IExecutionBackend {
   // slider retimes in-flight discrete and streaming motion without stopping.
   void set_runtime_velocity_scale(double scale) override;
 
-  // Phase 4.5D-3: controlled-stop capability + result surface for
-  // motion-scoped interrupt outcomes (spec/260 §5.6). The native
-  // simulator supports `kSpringBackHold` and Phase 4.5G native
-  // `kSoftOnPath`. `kHardDeceleration` remains a ros2_control/JTC-only
-  // mode in the current scope.
+  // Controlled-stop capability + result surface for motion-scoped
+  // interrupt outcomes (spec/260 §5.6). The native simulator supports
+  // `kSpringBackHold` and native `kSoftOnPath`. `kHardDeceleration`
+  // remains a ros2_control/JTC-only mode in the current scope.
   core::MotionInterruptStopCapabilityDTO
   get_motion_interrupt_stop_capability() const override;
   core::ControlledStopResultDTO execute_controlled_stop(

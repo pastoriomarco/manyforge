@@ -1242,10 +1242,11 @@ std::optional<std::string> ManyForgeCollisionEngine::sync_snapshot_locked(
       }
       const auto frame_id = model_.getFrameId(target_frame);
       const auto& frame = model_.frames[frame_id];
-      const auto placement =
+      const auto frame_relative_placement =
           body.owner_kind == core::CollisionOwnerKind::kRobotLink
               ? pose_to_se3(geom.local_pose)
               : compose_pose_to_se3(body.pose, geom.local_pose);
+      const auto placement = frame.placement * frame_relative_placement;
       object.emplace(raw_name,
                      frame.parentJoint,
                      frame_id,

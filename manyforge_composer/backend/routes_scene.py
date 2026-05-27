@@ -584,6 +584,45 @@ def _base_robot_route_metadata(
     return robot_id, group_id, base_frame, tcp_frame, base_pose
 
 
+def _execution_authority_metadata(state: ComposerState) -> dict[str, Any]:
+    """Return state-authority metadata for scene robot snapshots.
+
+    Phase 4-P3 requires `/api/scene/state` consumers (native viewer and
+    Cartesian gizmo included) to be auditable against the same state authority
+    as `/api/kernel/snapshot`. This helper is only called by the visual-state
+    publisher or its cold-cache fallback, never while serving a cached
+    scene-state snapshot.
+    """
+
+    if state.kernel is None:
+        return {}
+    try:
+        snapshot = (
+            state.cycle_manager.get_execution_snapshot()
+            if state.cycle_manager is not None
+            else state.kernel.get_execution_snapshot()
+        )
+    except Exception:
+        logger.debug(
+            "execution authority metadata unavailable for scene robot state",
+            exc_info=True,
+            extra={"event": "manyforge.visual.authority_metadata_unavailable"},
+        )
+        return {}
+
+    metadata: dict[str, Any] = {}
+    state_source = getattr(snapshot, "state_source", "") or None
+    if state_source is not None:
+        metadata["state_source"] = state_source
+    source_timestamp_ns = getattr(snapshot, "source_timestamp_ns", None)
+    if source_timestamp_ns is not None:
+        metadata["source_timestamp_ns"] = source_timestamp_ns
+    source_age_ns = getattr(snapshot, "source_age_ns", None)
+    if source_age_ns is not None:
+        metadata["source_age_ns"] = source_age_ns
+    return metadata
+
+
 def _build_visual_state_snapshot_for_publisher(state: ComposerState):
     """Build the complete visual scene snapshot on the publisher thread.
 
@@ -622,6 +661,7 @@ def _build_visual_state_snapshot_for_publisher(state: ComposerState):
         base_pose=base_pose,
         joint_names=joint_names,
         joint_positions=joint_positions_by_name,
+        **_execution_authority_metadata(state),
     )
 
     grippers = _collect_gripper_states(state, advance_commands=False)
@@ -733,6 +773,7 @@ def _scene_state_payload_from_visual_cache(
             base_pose=base_pose,
             joint_names=joint_names,
             joint_positions=joint_positions,
+            **_execution_authority_metadata(state),
         )
         diagnostics = _visual_route_diagnostics(
             timings_ms=timings_ms,

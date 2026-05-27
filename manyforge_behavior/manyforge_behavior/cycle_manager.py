@@ -244,6 +244,17 @@ class CycleManager:
         self._lock = threading.Lock()
         self._on_run_from_idle: Optional[Callable[[], None]] = None
         self._error: Optional[str] = None
+        # Structured cause for the HMI: when the cycle's `_error` is set from
+        # a kernel-side fault (collision, intervention, etc.), the kernel's
+        # ErrorDTO carries a stable `error_code` plus a `details` map (e.g.
+        # `collision_result_first_failure_pair`, `reason_code`,
+        # `collision_result_waypoint_index`). Preserving them on the cycle
+        # status lets the operator see what actually happened instead of a
+        # generic banner. Both are best-effort: motion-soft-fail paths that
+        # only produce a string set only `_error` and leave the structured
+        # fields None.
+        self._error_code: Optional[str] = None
+        self._error_details: Optional[dict[str, Any]] = None
         self._node_statuses: dict[str, str] = {}
         self._intervention: Optional[InterventionSession] = None
         self._intervention_context: Optional[_InterventionContext] = None
@@ -274,14 +285,91 @@ class CycleManager:
         )
 
     def _clear_runtime_scene(self) -> None:
-        """Best-effort removal of program-scoped scene objects from the backend."""
+        """Return the planning scene to its authored baseline.
+
+        Reset is an industrial "back to known state" operation: the operator
+        clicks Reset and expects the next Run to start from the program's
+        authored scene, not from whatever runtime state the previous cycle
+        accumulated. This method enforces that contract by:
+
+        1. Detaching every currently-attached object. After reset the robot
+           is not physically holding anything, so any attachment state from
+           the prior execution must be cleared. This applies to authored
+           objects too: if `attach_cheese_box` succeeded before the cycle
+           was stopped, the cheese box is still attached in the backend —
+           leaving it attached would (a) misrepresent physical reality after
+           reset and (b) cause the subsequent `apply_scene()` to fail with
+           "Object already exists" when it tries to re-add the authored
+           cheese box.
+        2. Removing every now-unattached object. This wipes both the just-
+           detached objects and anything runtime-added (`AddCollisionObject`
+           BT node, assistant runtime override, REST scene edit). The kernel
+           snapshot used by the next plan is now empty of objects.
+        3. `apply_scene()` (called by the caller right after this method)
+           re-adds the authored set with the canonical pose and shape.
+
+        Every scene edit's result is checked. A failure to detach or remove
+        is a reset-failed condition and propagates as a RuntimeError so the
+        operator sees that reset did not return to a known state.
+        """
         program = self._runner.program
         if program is None:
             return
-        for resource in program.scene:
-            self._kernel.scene_edit(
-                SceneEditRequest(operation="remove", object_id=resource.object_id)
+        try:
+            current_objects = self._kernel.get_scene_objects()
+        except (AttributeError, NotImplementedError):
+            # Legacy kernel clients that predate `get_scene_objects()` cannot
+            # enumerate runtime-added objects. Fall back to the historical
+            # behavior — purge authored objects so `apply_scene()` re-adds
+            # them cleanly — and accept that runtime-added objects will
+            # persist on those clients. Production backends
+            # (RoboPlanExecutionBackend, Ros2ControlExecutionBackend) all
+            # implement get_scene_objects, so this fallback only affects
+            # legacy test mocks.
+            for resource in program.scene:
+                result = self._kernel.scene_edit(
+                    SceneEditRequest(
+                        operation="remove", object_id=resource.object_id
+                    )
+                )
+                if not result.success:
+                    raise RuntimeError(
+                        f"reset failed to remove authored scene object "
+                        f"'{resource.object_id}': {result.error}"
+                    )
+            return
+        # Phase 1: detach everything currently attached. Reset means "robot
+        # is no longer holding anything" — both authored and runtime-added
+        # attachments are cleared.
+        for snapshot in current_objects:
+            if not snapshot.attached:
+                continue
+            result = self._kernel.scene_edit(
+                SceneEditRequest(
+                    operation="detach", object_id=snapshot.object_id
+                )
             )
+            if not result.success:
+                raise RuntimeError(
+                    f"reset failed to detach scene object "
+                    f"'{snapshot.object_id}': {result.error}"
+                )
+        # Phase 2: remove every object so apply_scene() can re-add the
+        # authored set from a clean slate. We iterate the snapshot taken
+        # before phase 1; since detach does not change the set of objects
+        # in the scene (only their attach state), the ID list is still
+        # valid.
+        for snapshot in current_objects:
+            result = self._kernel.scene_edit(
+                SceneEditRequest(
+                    operation="remove", object_id=snapshot.object_id
+                )
+            )
+            if not result.success:
+                raise RuntimeError(
+                    f"reset failed to remove scene object "
+                    f"'{snapshot.object_id}': {result.error}"
+                )
 
     def _prepare_fresh_cycle(self) -> None:
         """Rebuild tree and reapply the program scene without touching robot state."""
@@ -312,6 +400,21 @@ class CycleManager:
     def error(self) -> Optional[str]:
         """Last tick-loop exception or surfaced terminal node failure, or None."""
         return self._error
+
+    @property
+    def error_code(self) -> Optional[str]:
+        """Stable machine-readable code matching the kernel ErrorDTO, when
+        the latest error came from a kernel/backend fault. Motion-soft-fail
+        errors that only produced a human message leave this None."""
+        return self._error_code
+
+    @property
+    def error_details(self) -> Optional[dict[str, Any]]:
+        """Structured diagnostics map matching the kernel ErrorDTO. Carries
+        collision-pair / classification / waypoint-index / reason-code style
+        details when the cause is a kernel fault. None when the cause did
+        not produce a structured payload."""
+        return self._error_details
 
     def get_execution_snapshot(self) -> ExecutionSnapshot:
         """Get the latest observer-safe execution snapshot from the kernel."""
@@ -570,14 +673,131 @@ class CycleManager:
         cause, and the tick thread is suspended (via _tick_pause_event)
         rather than terminated, so a subsequent run() can resume the
         same tree with the same node holding its position.
+
+        Also captures the kernel's structured error_code / error_details
+        from the latest execution snapshot when available, so the HMI can
+        render the actual cause (collision pair, classification, waypoint
+        index, fault reason code) instead of only the blackboard string.
         """
         self._quiesce_runtime(
             client_name="cycle_manager_motion_paused",
             kernel_action="pause_if_executing",
         )
+        structured_code, structured_details = self._capture_kernel_error_diagnostics()
         with self._lock:
             self._error = error_message
+            self._error_code = structured_code
+            self._error_details = structured_details
             self._state = CycleState.STOPPED
+
+    def _capture_kernel_error_diagnostics(
+        self,
+    ) -> tuple[Optional[str], Optional[dict[str, Any]]]:
+        """Best-effort read of the kernel's structured error diagnostics.
+
+        Two complementary sources are consulted:
+
+        1. **ExecutionSnapshot error_code/error_details.** The kernel
+           populates these when a kernel-side ErrorDTO is the cause (plan
+           rejection, validation failure, dispatch refusal). Older kernel
+           clients without the structured fields return (None, None).
+
+        2. **Recent kernel events.** For runtime fault interrupts (a
+           dynamic body appearing on the trajectory during execution),
+           the kernel transitions to `Interrupted` but DOES NOT populate
+           snapshot.error — the rich diagnostics live on the event stream
+           (`collision_detected`, `interrupt_latched`). Without harvesting
+           events the operator only sees a fallback "Motion execution
+           ended in interrupted" string. We scan the most recent buffered
+           events for the latest interrupt-causing record and synthesize
+           the structured fields from its details payload.
+
+        Source #1 wins when both are present (kernel-side errors carry the
+        canonical ErrorDTO). Source #2 backfills the runtime-interrupt
+        case. Returns (None, None) when neither source has anything useful.
+        """
+        try:
+            snapshot = self._kernel.get_execution_snapshot()
+        except Exception:  # noqa: BLE001 — diagnostics best-effort
+            snapshot = None
+        snapshot_code = (
+            getattr(snapshot, "error_code", None) or None if snapshot else None
+        )
+        snapshot_details = (
+            getattr(snapshot, "error_details", None) if snapshot else None
+        )
+        if not snapshot_details:
+            snapshot_details = None
+        if snapshot_code or snapshot_details:
+            return snapshot_code, snapshot_details
+        # Snapshot has nothing — try the event stream. Walk recent events
+        # newest-first looking for a record that carries diagnostics worth
+        # surfacing. `collision_detected` is the strongest signal (full
+        # collision-result map); `interrupt_latched` is next (policy +
+        # latch identity). Other event types are not currently mapped.
+        return self._harvest_kernel_event_diagnostics()
+
+    def _harvest_kernel_event_diagnostics(
+        self,
+    ) -> tuple[Optional[str], Optional[dict[str, Any]]]:
+        """Scan recent buffered kernel events for a structured cause when
+        the snapshot's error field is empty.
+
+        Event priority (not chronology):
+          1. `collision_detected` — carries the colliding pair, the
+             classification, the failing waypoint, the dynamic-body id,
+             and the snapshot revision. This is the strongest operator-
+             facing diagnostic for a runtime collision, so it wins over
+             any other recent event regardless of order. The runtime
+             monitor publishes collision_detected BEFORE interrupt_latched
+             during a fault sequence, so a naive newest-first walk would
+             pick the latch event and discard the richer collision data.
+          2. `interrupt_latched` — fallback when no collision_detected is
+             present in the window (e.g. drift-fault interrupts, operator-
+             initiated preempts, etc.). Carries the policy id + latch
+             identity but no causal diagnostics.
+
+        Other event types are not currently mapped. The lookup window is
+        bounded to the last 64 events to keep the cost predictable for
+        long-running cycles. Within each priority tier we still prefer
+        the most recent event (newest-first), so a fresh collision wins
+        over a stale one from earlier in the cycle.
+        """
+        try:
+            self._drain_kernel_events()
+        except Exception:  # noqa: BLE001 — drain is best-effort here
+            pass
+        events: list[dict[str, Any]]
+        with self._lock:
+            events = list(self._kernel_events)[-64:]
+
+        latest_collision: Optional[dict[str, Any]] = None
+        latest_latch: Optional[dict[str, Any]] = None
+        for event in reversed(events):
+            event_type = event.get("type") or event.get("event_type") or ""
+            details = event.get("details")
+            if not isinstance(details, dict) or not details:
+                continue
+            if event_type == "collision_detected" and latest_collision is None:
+                latest_collision = dict(details)
+                # We have the highest-priority signal; no need to keep
+                # scanning for older latches.
+                break
+            if event_type == "interrupt_latched" and latest_latch is None:
+                latest_latch = dict(details)
+                # Don't break — keep scanning in case an older
+                # collision_detected is still in the window.
+
+        if latest_collision is not None:
+            # Runtime collision monitor is operationally distinct from a
+            # pre-execute validation rejection: the trajectory PASSED
+            # validation, then a dynamic body appeared during execution
+            # and the runtime monitor latched. Use a separate code so
+            # the HMI can route to the right operator-facing copy.
+            return "runtime_collision", latest_collision
+        if latest_latch is not None:
+            return "motion_interrupt_latched", latest_latch
+        return None, None
 
     def _set_resume_after_error_flag(self, value: bool) -> None:
         """Toggle the blackboard signal that tells the motion node to retry.
@@ -760,6 +980,8 @@ class CycleManager:
                 return  # Already running, no-op
 
             self._error = None
+            self._error_code = None
+            self._error_details = None
 
             if self._state == CycleState.IDLE:
                 # Guard: refuse to start if a zombie tick thread is still alive
@@ -779,16 +1001,41 @@ class CycleManager:
                 bb.register_key(key="stop_requested", access=py_trees.common.Access.WRITE)
                 bb.stop_requested = False
 
+                motion_paused_error = self._read_motion_paused_error()
+                kernel_status = self._kernel.get_status()
+
                 # If we're resuming from a motion soft-fail (the cycle
                 # was put into STOPPED by _enter_motion_paused_state),
-                # clear the soft-fail blackboard keys and set the resume
-                # signal so the holding motion node retries its goal on
-                # the next tick rather than re-emitting the same error.
-                if self._read_motion_paused_error() is not None:
+                # Run is an explicit operator retry. A runtime collision
+                # fault leaves the kernel in INTERRUPTED with a latched
+                # ManyForge-owned interrupt; clearing the scene object alone
+                # does not clear that latch. Acknowledge only the interrupted
+                # execution boundary before re-ticking the held motion node;
+                # do not call kernel.reset(), because ROS/Isaac reset may
+                # command the backend back to its initial/home pose. If the
+                # obstacle is still present, the fresh execute/monitor pass
+                # will latch a new collision immediately.
+                if (
+                    motion_paused_error is not None
+                    and kernel_status.state == ExecutionState.INTERRUPTED
+                ):
+                    ack_interrupted = self._kernel.acknowledge_interrupted_for_retry(
+                        principal_id="cycle_manager_run",
+                        reason="run_retry_after_motion_fault",
+                    )
+                    if not ack_interrupted.accepted:
+                        raise RuntimeError(
+                            "kernel.acknowledge_interrupted_for_retry rejected: "
+                            f"{ack_interrupted.error}"
+                        )
+                    kernel_status = self._kernel.get_status()
+
+                # Clear the soft-fail blackboard keys and set the resume
+                # signal so the holding motion node retries its goal on the
+                # next tick rather than re-emitting the same error.
+                if motion_paused_error is not None:
                     self._clear_motion_paused_blackboard()
                     self._set_resume_after_error_flag(True)
-
-                kernel_status = self._kernel.get_status()
 
                 # Run-side auto-ack of `INTERVENTION_REQUIRED`.
                 # The kernel rejects `execute()` while intervention is
@@ -909,6 +1156,8 @@ class CycleManager:
                     )
                 with self._lock:
                     self._error = "tick thread did not terminate"
+                    self._error_code = "tick_thread_zombie"
+                    self._error_details = None
                     self._state = CycleState.IDLE
                     self._pending_delegated_recovery = None
                     cleanup_alive = (
@@ -938,6 +1187,8 @@ class CycleManager:
             self._tick_stop_event.clear()
             self._tick_pause_event.set()
             self._error = None
+            self._error_code = None
+            self._error_details = None
             self._state = CycleState.IDLE
             self._pending_delegated_recovery = None
 
@@ -1035,6 +1286,8 @@ class CycleManager:
                 self._tick_stop_event.set()
                 with self._lock:
                     self._error = error_msg
+                    self._error_code = "tick_loop_exception"
+                    self._error_details = None
                     self._state = CycleState.IDLE
                     self._tick_thread = None
                 break
@@ -1089,8 +1342,15 @@ class CycleManager:
                                 access=py_trees.common.Access.WRITE,
                             )
                             bb.stop_requested = True
+                            tick_code, tick_details = (
+                                self._capture_kernel_error_diagnostics()
+                            )
                             with self._lock:
                                 self._error = failure_feedback
+                                self._error_code = (
+                                    tick_code or "recovery_exhausted"
+                                )
+                                self._error_details = tick_details
                                 self._state = CycleState.STOPPED
                                 self._tick_thread = None
                             self._notify_recovery_exhausted(
@@ -1107,15 +1367,36 @@ class CycleManager:
                             access=py_trees.common.Access.WRITE,
                         )
                         bb.stop_requested = True
+                        delegated_code, delegated_details = (
+                            self._capture_kernel_error_diagnostics()
+                        )
                         with self._lock:
                             self._error = failure_feedback
+                            self._error_code = (
+                                delegated_code or "delegated_recovery_requested"
+                            )
+                            self._error_details = delegated_details
                             self._pending_delegated_recovery = request
                             self._state = CycleState.STOPPED
                             self._tick_thread = None
                         self._notify_delegated_recovery_requested(request)
                         break
+                terminal_code, terminal_details = (
+                    (None, None)
+                    if status != py_trees.common.Status.FAILURE
+                    else self._capture_kernel_error_diagnostics()
+                )
                 with self._lock:
-                    self._error = failure_feedback if status == py_trees.common.Status.FAILURE else None
+                    if status == py_trees.common.Status.FAILURE:
+                        self._error = failure_feedback
+                        self._error_code = (
+                            terminal_code or "tree_failed"
+                        )
+                        self._error_details = terminal_details
+                    else:
+                        self._error = None
+                        self._error_code = None
+                        self._error_details = None
                     self._state = CycleState.IDLE
                     self._tick_thread = None
                 break

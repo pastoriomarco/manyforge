@@ -34,6 +34,20 @@ REQUIRED_EXTERNAL_EVIDENCE = {
     "live_isaac": "live Isaac scene qualification evidence",
 }
 
+REQUIRED_LIVE_ISAAC_PHASE4_P3_CHECKS = {
+    "runtime_profile_commanded_sim",
+    "kernel_snapshot_authority_metadata",
+    "scene_state_robot_authority_metadata",
+    "streaming_collision_budget_configured",
+    "joint_slider_accepted",
+    "joint_spinner_input_accepted",
+    "cartesian_gizmo_accepted",
+    "cartesian_input_accepted",
+    "gripper_open_close_commanded",
+    "rejected_frame_recovery",
+    "reset_home_command_stream_refresh",
+}
+
 # Each entry is a regex pattern (Python `re` syntax) plus a human-readable
 # description. Patterns are matched with `re.MULTILINE | re.DOTALL`, so `\s+`
 # correctly matches whitespace including newlines — important for catching
@@ -46,7 +60,7 @@ FORBIDDEN_PRODUCTION_PATTERNS: list[tuple[str, str]] = [
     (r"legacy_collision_validation", "legacy collision validation compatibility flag"),
     (r"collision_engine=direct_scene", "prototype collision engine selector"),
     (r"direct_scene_roboplan", "adapter-hosted prototype engine id"),
-    # Phase 4-P2 cleanup: legacy collision-validation surfaces that lost
+    # Cleanup: legacy collision-validation surfaces that lost
     # production callers. Reintroducing any of these tokens in a production
     # scan-dir is a regression.
     (r"\bCollisionPolicy\b(?!Snapshot)",
@@ -169,6 +183,48 @@ def _is_structural_visual_load_evidence(payload: dict[str, Any] | None) -> bool:
     return True
 
 
+def _phase4_p3_live_isaac_check_map(payload: dict[str, Any]) -> dict[str, bool]:
+    checks = payload.get("checks")
+    if not isinstance(checks, list):
+        return {}
+    out: dict[str, bool] = {}
+    for item in checks:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        out[name] = bool(item.get("passed"))
+    return out
+
+
+def _is_structural_live_isaac_p3_evidence(payload: dict[str, Any] | None) -> bool:
+    """Return True only for a real Phase 4-P3 commanded-sim evidence blob.
+
+    Strict Phase 4 used to accept any live Isaac JSON with ``success: true``.
+    Phase 4-P3 tightened the live-Isaac gate: the evidence must prove the
+    commanded-sim state-authority contract, direct-control recovery, gripper
+    visual authority, and reset/home command-stream refresh. A status-only blob
+    is no longer enough.
+    """
+
+    if not isinstance(payload, dict):
+        return False
+    if not bool(payload.get("success")):
+        return False
+    schema = str(payload.get("schema_version") or payload.get("schemaVersion") or "")
+    if schema != "manyforge.phase4_p3_commanded_sim.v1":
+        return False
+    if str(payload.get("profile_kind") or payload.get("profileKind") or "") != "commanded_sim":
+        return False
+    if str(payload.get("authority") or "") != "backend_authored":
+        return False
+    check_map = _phase4_p3_live_isaac_check_map(payload)
+    if not REQUIRED_LIVE_ISAAC_PHASE4_P3_CHECKS.issubset(check_map):
+        return False
+    return all(check_map[name] for name in REQUIRED_LIVE_ISAAC_PHASE4_P3_CHECKS)
+
+
 def validate_collision_matrix(
     data: dict[str, Any],
     failures: list[str],
@@ -280,6 +336,12 @@ def validate_external_evidence(args: argparse.Namespace, failures: list[str],
                 "live Isaac summary reports success",
                 failures,
             ))
+            if not args.allow_incomplete:
+                checks.append(check(
+                    _is_structural_live_isaac_p3_evidence(live),
+                    "live Isaac summary carries Phase 4-P3 commanded_sim evidence",
+                    failures,
+                ))
     return checks
 
 

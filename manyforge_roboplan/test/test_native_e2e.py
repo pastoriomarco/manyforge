@@ -1046,6 +1046,15 @@ class TestNativeUr10eRobotiqAttachedObjectCollision:
     ):
         self._add_clear_grasped_box(native_kernel_ur10e_robotiq)
 
+        comparison = native_kernel_ur10e_robotiq.collision_compare_positions(
+            UR10E_ROBOTIQ_ATTACHED_OBJECT_REPRO_Q,
+            waypoint_index=0,
+        )
+        assert comparison["ok"] is True
+        assert comparison["manyforge_collision"]["decision"] == "pass", comparison
+        assert comparison["manyforge_collision"]["in_collision"] is False, comparison
+        assert comparison["decision_match"] is True, comparison
+
         preview = native_kernel_ur10e_robotiq.preview_motion(
             make_ur10e_joint_preview_request(
                 "attached_object_named_frame_pose",

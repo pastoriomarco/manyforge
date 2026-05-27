@@ -316,13 +316,13 @@ core::StopResultDTO RoboPlanExecutionBackend::stop() {
   return core::StopResultDTO{true, std::nullopt};
 }
 
-// Phase 4.5D-3: controlled-stop capability + result surface.
+// Controlled-stop capability + result surface.
 //
-// The native simulator supports `kSpringBackHold` and Phase 4.5G
-// `kSoftOnPath`. `kHardDeceleration` is a ros2_control/JTC-only mode in
-// the current scope. Declaring only supported modes keeps the kernel's
-// arm-time gate honest: scopes requesting unsupported modes fail closed
-// before dispatch.
+// The native simulator supports `kSpringBackHold` and `kSoftOnPath`.
+// `kHardDeceleration` is a ros2_control/JTC-only mode in the current
+// scope. Declaring only supported modes keeps the kernel's arm-time
+// gate honest: scopes requesting unsupported modes fail closed before
+// dispatch.
 
 core::MotionInterruptStopCapabilityDTO
 RoboPlanExecutionBackend::get_motion_interrupt_stop_capability() const {

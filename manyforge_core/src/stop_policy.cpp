@@ -117,7 +117,10 @@ Result<void> StopPolicy::request_pause() {
 
     auto deadline = clock_.now();
     scheduler_.schedule(deadline, [this]() {
-        sm_.try_transition(ExecutionState::kPaused);
+        auto transition_result = sm_.try_transition(ExecutionState::kPaused);
+        if (transition_result.ok() && pause_completed_callback_) {
+            pause_completed_callback_();
+        }
     });
 
     return Result<void>::Ok();
@@ -154,6 +157,11 @@ Result<void> StopPolicy::request_reset() {
 void StopPolicy::set_stop_callback(StopCallback callback) {
     std::lock_guard<std::mutex> lock(mutex_);
     stop_callback_ = std::move(callback);
+}
+
+void StopPolicy::set_pause_completed_callback(PauseCompletedCallback callback) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    pause_completed_callback_ = std::move(callback);
 }
 
 bool StopPolicy::stop_requested() const {

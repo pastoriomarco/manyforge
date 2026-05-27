@@ -21,6 +21,7 @@ _SCENARIO_TABLE=(
     "ur5-vision-pose-pick|manyforge-only|on|/workspace/examples/vision_guided_pose_pick.program.yaml|/workspace/examples/vision_guided_pose_pick.deployment.yaml|UR5 vision-guided pose pick (vision LLM)"
     "ur10e-scene-authoring|manyforge-only|on|/workspace/examples/pick_and_place_ur10e_robotiq.program.yaml|/workspace/examples/assistant_modes_scene_authoring.deployment.yaml|UR10e + Robotiq with full Cosmos assistant + scene authoring"
     "isaac-ur10e-light-scene|isaac-sim|off|/workspace/examples/isaac_manipulator_scene_light.program.yaml|/workspace/examples/isaac_manipulator_scene_light_ros2_control.deployment.yaml|Isaac commanded sim with UR10e light manipulator scene"
+    "isaac-ur10e-light-scene-collision|isaac-sim|off|/workspace/examples/isaac_manipulator_scene_light_collision.program.yaml|/workspace/examples/isaac_manipulator_scene_light_ros2_control_collision.deployment.yaml|Isaac commanded sim with UR10e light scene + popup collision object for runtime-fault testing"
     "isaac-ur10e-light-scene-assistant|isaac-sim|on|/workspace/examples/isaac_manipulator_scene_light.program.yaml|/workspace/examples/isaac_manipulator_scene_light_assistant.deployment.yaml|Isaac commanded sim with UR10e light manipulator scene + full Cosmos assistant overlay"
 )
 

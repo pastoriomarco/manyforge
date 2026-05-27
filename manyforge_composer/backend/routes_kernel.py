@@ -14,7 +14,14 @@ logger = logging.getLogger(__name__)
 
 
 def build_kernel_snapshot_payload(state: ComposerState) -> dict[str, Any]:
-    """Build the current kernel execution snapshot payload."""
+    """Build the current kernel execution snapshot payload.
+
+    The error surface exposes both the human-readable `error` message and
+    the structured `error_code` / `error_details` map the kernel produces
+    via its ErrorDTO. The HMI uses the structured fields to render a
+    cause-specific panel (colliding pair, classification, waypoint index,
+    fault reason code, etc.) instead of a generic banner.
+    """
     now_ns = time.monotonic_ns()
     if state.kernel is None:
         return {
@@ -23,7 +30,12 @@ def build_kernel_snapshot_payload(state: ComposerState) -> dict[str, Any]:
             "active_move_id": None,
             "progress": 0.0,
             "joint_positions_rad": None,
+            "state_source": None,
+            "source_timestamp_ns": None,
+            "source_age_ns": None,
             "error": None,
+            "error_code": None,
+            "error_details": None,
             "last_transition_ns": None,
             "timestamp_ns": now_ns,
         }
@@ -40,6 +52,12 @@ def build_kernel_snapshot_payload(state: ComposerState) -> dict[str, Any]:
     )
 
     joint_positions = snapshot.joint_positions_rad if snapshot.joint_positions_rad else None
+    snapshot_error_details = getattr(snapshot, "error_details", None)
+    # The kernel client populates `error_details` as a dict[str, str]; an
+    # empty dict has no diagnostic value to the HMI, so collapse it to None
+    # so the frontend can fall back to the headline message cleanly.
+    if not snapshot_error_details:
+        snapshot_error_details = None
 
     return KernelSnapshotResponse(
         state=status.state.value,
@@ -47,7 +65,12 @@ def build_kernel_snapshot_payload(state: ComposerState) -> dict[str, Any]:
         active_move_id=status.active_move_id if status.active_move_id else None,
         progress=status.progress,
         joint_positions_rad=joint_positions,
+        state_source=getattr(snapshot, "state_source", "") or None,
+        source_timestamp_ns=getattr(snapshot, "source_timestamp_ns", None),
+        source_age_ns=getattr(snapshot, "source_age_ns", None),
         error=snapshot.error,
+        error_code=getattr(snapshot, "error_code", None),
+        error_details=snapshot_error_details,
         last_transition_ns=None,
         timestamp_ns=snapshot.timestamp_ns,
     ).model_dump()

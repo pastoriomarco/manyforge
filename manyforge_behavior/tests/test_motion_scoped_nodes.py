@@ -1,4 +1,4 @@
-"""Phase 4.5E: tests for MoveUntilSignal + ProbeSearchMove BT nodes.
+"""Tests for MoveUntilSignal + ProbeSearchMove BT nodes.
 
 The tests run against MockKernelClient so they exercise the full
 node lifecycle (execute → wait → outcome → tree status mapping)
@@ -403,7 +403,7 @@ def test_move_until_signal_terminate_no_op_when_kernel_id_mismatches():
     assert kernel.stop_count == 0
 
 
-# ----- Motion-field parity (codex review follow-up #2) -----
+# ----- Motion-field parity -----
 
 
 def _wire_with_optional_keys(node, kernel, extra_keys=()):
@@ -609,7 +609,7 @@ def test_pose_goal_rpy_normalized_to_xyzw_quaternion():
     assert "orientation_rpy_deg" not in sent_pose
 
 
-# ----- Failure observability (codex round 3 finding M1) -----
+# ----- Failure observability -----
 #
 # Every FAILURE terminal cause must set motion_error_message so the
 # cycle manager / operator surface gets a concrete reason. Without

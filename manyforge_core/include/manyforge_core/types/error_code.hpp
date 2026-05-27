@@ -45,7 +45,7 @@ enum class ErrorCode {
     kCollisionDetected,
     kUnknownJointName,
     kSceneChangedDuringValidation,
-    // Phase 4.5C motion-scoped interrupt outcomes (spec/210 §5.2).
+    // Motion-scoped interrupt outcomes (spec/210 §5.2).
     kMotionInterruptArmFailed,
     kMotionInterruptSourceActiveAtArm,
     kMotionInterruptBackendStopFailed,
@@ -276,16 +276,14 @@ inline const char* kErrorResetFailed = "reset_failed";
 inline const char* kErrorInternalError = "internal_error";
 inline const char* kErrorInvariantViolation = "invariant_violation";
 
-// Phase 4.5C motion-scoped interrupt outcomes (spec/210 §5.2).
+// Motion-scoped interrupt outcomes (spec/210 §5.2).
 // `motion_interrupt_arm_failed` — atomic arm-before-dispatch rejected
 // at least one `MotionInterruptScopeDTO`; the execution never reached
 // `Executing`. `motion_interrupt_source_active_at_arm` is the specific
 // arm-failure reason for `require_inactive_at_arm`. The two
-// backend/stop-state failures are reserved for Phase 4.5D and emitted
-// when a `complete_move_on_signal` trip cannot produce a validated
-// `ExecutionStopSnapshotDTO`. Until 4.5D lands, the kernel treats any
-// in-flight move-scoped latch as `motion_interrupt_backend_stop_failed`
-// so callers see the same code path post-4.5D.
+// backend/stop-state failures are emitted when a
+// `complete_move_on_signal` trip cannot produce a validated
+// `ExecutionStopSnapshotDTO`.
 inline const char* kErrorMotionInterruptArmFailed =
     "motion_interrupt_arm_failed";
 inline const char* kErrorMotionInterruptSourceActiveAtArm =

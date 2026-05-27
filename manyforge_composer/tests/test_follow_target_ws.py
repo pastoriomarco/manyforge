@@ -61,6 +61,7 @@ class _StreamingKernel(MockKernelClient):
         self.push_targets: list[tuple[int, StreamingTarget]] = []
         self.ended_sessions: list[tuple[int, str]] = []
         self.reject_sequences: set[int] = set()
+        self.reject_details_by_sequence: dict[int, dict[str, str]] = {}
         self.begin_error_code: Optional[str] = None
         self.begin_error: Optional[str] = None
 
@@ -118,6 +119,26 @@ class _StreamingKernel(MockKernelClient):
                 accepted=False,
                 error_code="invalid_request",
                 error="active streaming session does not match session_id",
+                error_details={"reason_code": "session_lost"},
+            )
+        if target.source_sequence in self.reject_details_by_sequence:
+            details = self.reject_details_by_sequence[target.source_sequence]
+            self._emit_kernel_event(
+                "streaming_target_rejected",
+                error="streaming target rejected",
+                details={
+                    "session_id": session_id,
+                    "source_sequence": target.source_sequence,
+                    "kind": target.kind,
+                    **details,
+                },
+            )
+            return StreamingPushResult(
+                accepted=False,
+                backend_sequence=0,
+                error_code="validation_collision",
+                error="streaming target rejected by collision validation",
+                error_details=details,
             )
         if target.source_sequence in self.reject_sequences:
             self._emit_kernel_event(
@@ -135,6 +156,7 @@ class _StreamingKernel(MockKernelClient):
                 backend_sequence=0,
                 error_code="ik_failed",
                 error="IK failed",
+                error_details={"reason_code": "ik_failed"},
             )
         backend_sequence = len(self.push_targets)
         self._emit_kernel_event(
@@ -250,6 +272,14 @@ class TestReasonCodes:
         assert _streaming_reason_code("ik_failed", "anything") == "ik_failed"
         assert _streaming_reason_code("unknown_joint_name", "anything") == "unknown_joint_name"
         assert _streaming_reason_code("invalid_state_transition", "anything") == "invalid_state"
+        assert (
+            _streaming_reason_code(
+                "validation_collision",
+                "streaming target rejected by collision validation",
+                {"reason_code": "streaming_collision_timeout"},
+            )
+            == "streaming_collision_timeout"
+        )
 
     def test_push_reason_code_keeps_stable_message_fallbacks(self):
         assert (
@@ -426,6 +456,38 @@ class TestFollowTargetWebSocket:
                 assert ws.receive_json()["op"] == "ended"
 
             assert [target.source_sequence for _, target in kernel.push_targets] == [11]
+
+    def test_collision_rejection_ack_carries_budget_and_collision_details(self):
+        kernel = _StreamingKernel()
+        kernel.reject_details_by_sequence[2] = {
+            "reason_code": "streaming_collision_rejected",
+            "elapsed_ns": "4200000",
+            "timeout_ns": "10000000",
+            "collision_result_first_failure_pair": "robot/link <-> object/wall",
+            "collision_result_first_failure_classification": "blocking_collision",
+        }
+        client = _app_with_kernel(kernel)
+
+        with client:
+            with client.websocket_connect("/ws/follow-target") as ws:
+                ws.send_json({"op": "begin", "input_mode": "cartesian"})
+                assert ws.receive_json()["op"] == "began"
+
+                ws.send_json(_cartesian_frame(2))
+                rejected = ws.receive_json()
+                assert rejected["op"] == "pushed"
+                assert rejected["accepted"] is False
+                assert rejected["reason_code"] == "streaming_collision_rejected"
+                assert rejected["details"]["elapsed_ns"] == "4200000"
+                assert rejected["details"]["timeout_ns"] == "10000000"
+                assert (
+                    rejected["details"]["collision_result_first_failure_pair"]
+                    == "robot/link <-> object/wall"
+                )
+                assert rejected["duration_ms"] >= 0.0
+
+                ws.send_json({"op": "end"})
+                assert ws.receive_json()["op"] == "ended"
 
     def test_socket_disconnect_ends_session_and_next_session_can_begin(self):
         kernel = _StreamingKernel()

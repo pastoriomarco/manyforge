@@ -136,6 +136,8 @@ async def handle_follow_target_ws(ws: WebSocket, state: ComposerState) -> None:
                         "reason": "frame missing required fields (kind, "
                                   "position_m/orientation_xyzw for cartesian, "
                                   "or joint_positions_rad for joint)",
+                        "details": {"reason_code": "malformed_frame"},
+                        "duration_ms": 0.0,
                         "kind": str(msg.get("kind", "unknown")),
                     }))
                     continue
@@ -146,9 +148,11 @@ async def handle_follow_target_ws(ws: WebSocket, state: ComposerState) -> None:
                     target,
                 )
                 elapsed_ms = (time.monotonic_ns() - start_ns) / 1_000_000.0
+                error_details = dict(getattr(push, "error_details", {}) or {})
                 reason_code = _streaming_reason_code(
                     getattr(push, "error_code", None),
                     push.error,
+                    error_details,
                 )
                 # Server-side log on rejection so `docker logs` shows the
                 # reason. Per-frame rejections are recoverable (next
@@ -176,6 +180,8 @@ async def handle_follow_target_ws(ws: WebSocket, state: ComposerState) -> None:
                     "backend_sequence": int(push.backend_sequence),
                     "reason_code": reason_code if not push.accepted else "",
                     "reason": (push.error or "") if not push.accepted else "",
+                    "details": error_details if not push.accepted else {},
+                    "duration_ms": elapsed_ms,
                     "kind": target.kind,
                 }))
                 continue
@@ -473,13 +479,25 @@ def _deployment_tcp_speed_cap(state: ComposerState) -> float:
     return cap_f if cap_f > 0.0 else 0.0
 
 
-def _streaming_reason_code(error_code: Optional[str], message: Optional[str]) -> str:
+def _streaming_reason_code(
+    error_code: Optional[str],
+    message: Optional[str],
+    details: Optional[dict[str, object]] = None,
+) -> str:
     """Map kernel/backend errors to stable UI-facing streaming reason codes.
 
     Prefer the C++ ErrorDTO code when available. The message fallback exists
     only for mock/default clients that predate the explicit code field; the
     frontend never depends on these English strings.
     """
+    detail_reason = ""
+    if isinstance(details, dict):
+        raw = details.get("reason_code")
+        if raw is not None:
+            detail_reason = str(raw).strip().lower()
+    if detail_reason:
+        return detail_reason
+
     code = (error_code or "").strip().lower()
     if code == "ik_failed":
         return "ik_failed"

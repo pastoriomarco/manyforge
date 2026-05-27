@@ -59,6 +59,11 @@ function isFatalRejectionReason(reasonCode: string): boolean {
     || r === 'session_already_active'
     || r === 'no_controller'
     || r === 'unsupported_capability'
+    || r === 'validation_collision'
+    || r === 'streaming_collision_rejected'
+    || r === 'streaming_collision_timeout'
+    || r === 'streaming_collision_engine_exception'
+    || r === 'collision_pipeline_not_configured'
   );
 }
 
@@ -84,6 +89,15 @@ function rejectionReasonToShortLabel(reasonCode: string): string {
       return 'UNSUPPORTED';
     case 'unknown_joint_name':
       return 'BAD JOINT NAME';
+    case 'validation_collision':
+    case 'streaming_collision_rejected':
+      return 'COLLISION';
+    case 'streaming_collision_timeout':
+      return 'COLLISION TIMEOUT';
+    case 'streaming_collision_engine_exception':
+      return 'COLLISION ERROR';
+    case 'collision_pipeline_not_configured':
+      return 'COLLISION CONFIG';
     default:
       return 'REJECTED';
   }

@@ -603,9 +603,12 @@ TEST_F(StreamingSessionTest,
   collision.in_collision = true;
   collision.engine_status = CollisionEngineStatus::kOk;
   collision.decision = CollisionDecisionResult::kFail;
-  collision.normalized_pairs.push_back(
-      CollisionPairId{"robot/test/link/wrist/collision/0",
-                      "object/box/shape/0"});
+  const CollisionPairId failing_pair{"robot/test/link/wrist/collision/0",
+                                     "object/box/shape/0"};
+  collision.normalized_pairs.push_back(failing_pair);
+  collision.normalized_pairs_classified.push_back(CollisionPairResult{
+      failing_pair, CollisionPairClassification::kBlockingCollision, true});
+  collision.raw_diagnostics["signed_clearance_m"] = "-0.004";
   collision_engine->default_result = collision;
 
   auto begin_result = kernel.begin_streaming_session(default_config());
@@ -621,6 +624,23 @@ TEST_F(StreamingSessionTest,
             "streaming_target_validation");
   EXPECT_EQ(push_result.error->details.at("reason_code"),
             "streaming_collision_rejected");
+  EXPECT_TRUE(push_result.error->details.contains("elapsed_ns"));
+  EXPECT_EQ(push_result.error->details.at("timeout_ns"), "10000000");
+  EXPECT_EQ(push_result.error->details.at("collision_result_waypoint_index"),
+            "0");
+  const auto& first_failure_pair =
+      push_result.error->details.at("collision_result_first_failure_pair");
+  EXPECT_TRUE(first_failure_pair.find("robot/test/link/wrist/collision/0") !=
+              std::string::npos);
+  EXPECT_TRUE(first_failure_pair.find("object/box/shape/0") !=
+              std::string::npos);
+  EXPECT_EQ(
+      push_result.error->details.at(
+          "collision_result_first_failure_classification"),
+      "blocking_collision");
+  EXPECT_EQ(push_result.error->details.at(
+                "collision_result_raw_signed_clearance_m"),
+            "-0.004");
   EXPECT_EQ(backend.push_calls, 0);
   EXPECT_GE(count_events_of(KernelEventType::kStreamingTargetRejected), 1u);
 }
@@ -665,6 +685,8 @@ TEST_F(StreamingSessionTest,
             "streaming_collision_engine_exception");
   EXPECT_EQ(push_result.error->details.at("phase"),
             "streaming_target_validation");
+  EXPECT_TRUE(push_result.error->details.contains("elapsed_ns"));
+  EXPECT_EQ(push_result.error->details.at("timeout_ns"), "10000000");
   EXPECT_EQ(push_result.error->details.at("exception"),
             "streaming engine failure");
   EXPECT_EQ(backend.push_calls, 0);

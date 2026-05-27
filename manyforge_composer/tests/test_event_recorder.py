@@ -506,6 +506,50 @@ class TestJSONLSink:
         assert events[1]["details"]["error"] == "IK failed"
         assert events[1]["details"]["native_kernel_event_index"] == 3
 
+    def test_native_error_event_preserves_structured_error_details(self):
+        rec = EventRecorder()
+        native_events = [
+            {
+                "event_index": 4,
+                "type": "error_raised",
+                "timestamp_ns": 104,
+                "execution_id": 43,
+                "error": {
+                    "code": "validation_collision",
+                    "message": "Collision validation rejected trajectory",
+                    "details": {
+                        "collision_result_first_failure_pair": (
+                            "object/box_a/shape/0 <-> "
+                            "robot/robot1/link/link1/collision/0"
+                        ),
+                        "collision_result_first_failure_classification": (
+                            "blocking_collision"
+                        ),
+                    },
+                },
+            },
+        ]
+
+        rec.record_native_kernel_events(native_events)
+
+        events = _memory_events(rec)
+        assert len(events) == 1
+        details = events[0]["details"]
+        assert events[0]["type"] == "error_raised"
+        assert details["error_code"] == "validation_collision"
+        assert details["error"] == "Collision validation rejected trajectory"
+        assert (
+            details["collision_result_first_failure_pair"]
+            == "object/box_a/shape/0 <-> robot/robot1/link/link1/collision/0"
+        )
+        assert (
+            details["collision_result_first_failure_classification"]
+            == "blocking_collision"
+        )
+        assert details["error_details"][
+            "collision_result_first_failure_pair"
+        ] == details["collision_result_first_failure_pair"]
+
     def test_history_filters_by_severity_component_and_type(self):
         rec = EventRecorder()
         rec.observe(_StubState(cycle_manager=_StubCycleManager("idle")))

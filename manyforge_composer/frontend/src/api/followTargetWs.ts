@@ -56,6 +56,8 @@ export interface FollowTargetPushAck {
   backendSequence: number;
   reasonCode: string;
   reason: string;
+  details: Record<string, unknown>;
+  durationMs: number;
   kind: 'cartesian' | 'joint';
 }
 
@@ -198,6 +200,11 @@ export function openFollowTargetSession(
         backendSequence: Number(msg.backend_sequence) || 0,
         reasonCode: String(msg.reason_code ?? ''),
         reason: String(msg.reason ?? ''),
+        details:
+          msg.details !== null && typeof msg.details === 'object'
+            ? (msg.details as Record<string, unknown>)
+            : {},
+        durationMs: Number(msg.duration_ms) || 0,
         kind:
           msg.kind === 'joint' || msg.kind === 'cartesian'
             ? (msg.kind as 'joint' | 'cartesian')

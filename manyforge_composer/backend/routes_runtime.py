@@ -58,7 +58,11 @@ def _execution_profile(state: ComposerState) -> tuple[str, str, str, dict[str, A
         )
     config = dict(execution.config or {})
     adapter_id = execution.adapter_id
-    source_mode = str(config.get("execution_state_source_mode", "") or "")
+    source_mode = str(
+        config.get("execution_state_authority_profile")
+        or config.get("execution_state_source_mode")
+        or ""
+    )
     if source_mode == "commanded_sim":
         return (
             "commanded_sim",
@@ -67,6 +71,13 @@ def _execution_profile(state: ComposerState) -> tuple[str, str, str, dict[str, A
             config,
         )
     if adapter_id.startswith("execution.ros2_control"):
+        if source_mode == "observed_ros2":
+            return (
+                "observed_ros2",
+                "ROS controller observed authority",
+                "controller_observed",
+                config,
+            )
         return (
             "real_robot",
             "ROS controller / real robot",

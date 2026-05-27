@@ -73,67 +73,77 @@ class StateHub:
     async def _broadcast_loop(self):
         """Poll state at ~10Hz and broadcast to all connected clients."""
         while self._running:
-            has_program = self._state and self._state.program is not None
-            kernel_events = []
-            if self._state is not None and hasattr(self._state, "event_recorder"):
-                self._state.event_recorder.observe(self._state)
-                kernel_events = self._state.event_recorder.get_events_since(
-                    self._last_broadcast_event_index,
-                    include_node_transitions=False,
-                )
-                if kernel_events:
-                    self._last_broadcast_event_index = kernel_events[-1]["event_index"]
-            native_kernel_events = []
-            if self._state and self._state.cycle_manager is not None:
-                self._state.cycle_manager.drain_kernel_events_now()
-                native_kernel_events = self._state.cycle_manager.get_kernel_events_since(
-                    self._last_kernel_event_index
-                )
-                if native_kernel_events:
-                    if hasattr(self._state, "event_recorder"):
-                        self._state.event_recorder.record_native_kernel_events(
-                            native_kernel_events
-                        )
-                    self._last_kernel_event_index = native_kernel_events[-1].get(
-                        "event_index", self._last_kernel_event_index
+            try:
+                has_program = self._state and self._state.program is not None
+                kernel_events = []
+                if self._state is not None and hasattr(self._state, "event_recorder"):
+                    self._state.event_recorder.observe(self._state)
+                    kernel_events = self._state.event_recorder.get_events_since(
+                        self._last_broadcast_event_index,
+                        include_node_transitions=False,
                     )
+                    if kernel_events:
+                        self._last_broadcast_event_index = kernel_events[-1]["event_index"]
+                native_kernel_events = []
+                if self._state and self._state.cycle_manager is not None:
+                    self._state.cycle_manager.drain_kernel_events_now()
+                    native_kernel_events = self._state.cycle_manager.get_kernel_events_since(
+                        self._last_kernel_event_index
+                    )
+                    if native_kernel_events:
+                        if hasattr(self._state, "event_recorder"):
+                            self._state.event_recorder.record_native_kernel_events(
+                                native_kernel_events
+                            )
+                        self._last_kernel_event_index = native_kernel_events[-1].get(
+                            "event_index", self._last_kernel_event_index
+                        )
 
-            if self._state and self._state.cycle_manager is not None:
-                runtime_override_status = None
-                if self._state.program is not None:
-                    runtime_override_status = RuntimeOverrideStatusResponse(
-                        **self._state.runtime_override_status()
+                if self._state and self._state.cycle_manager is not None:
+                    runtime_override_status = None
+                    if self._state.program is not None:
+                        runtime_override_status = RuntimeOverrideStatusResponse(
+                            **self._state.runtime_override_status()
+                        ).model_dump(by_alias=True)
+                    data = StateUpdate(
+                        state=self._state.cycle_manager.state.value,
+                        velocityScale=self._state.cycle_manager.velocity_scale,
+                        nodeStatuses=self._state.cycle_manager.get_node_statuses(),
+                        kernelEvents=kernel_events,
+                        nativeKernelEvents=native_kernel_events,
+                        error=self._state.cycle_manager.error,
+                        errorCode=self._state.cycle_manager.error_code,
+                        errorDetails=self._state.cycle_manager.error_details,
+                        programLoaded=bool(has_program),
+                        programSessionGeneration=self._state.program_session_generation,
+                        runtimeOverrideStatus=runtime_override_status,
+                        timestamp=time.time(),
                     ).model_dump(by_alias=True)
-                data = StateUpdate(
-                    state=self._state.cycle_manager.state.value,
-                    velocityScale=self._state.cycle_manager.velocity_scale,
-                    nodeStatuses=self._state.cycle_manager.get_node_statuses(),
-                    kernelEvents=kernel_events,
-                    nativeKernelEvents=native_kernel_events,
-                    error=self._state.cycle_manager.error,
-                    programLoaded=bool(has_program),
-                    programSessionGeneration=self._state.program_session_generation,
-                    runtimeOverrideStatus=runtime_override_status,
-                    timestamp=time.time(),
-                ).model_dump(by_alias=True)
-            else:
-                runtime_override_status = None
-                if self._state is not None and self._state.program is not None:
-                    runtime_override_status = RuntimeOverrideStatusResponse(
-                        **self._state.runtime_override_status()
+                else:
+                    runtime_override_status = None
+                    if self._state is not None and self._state.program is not None:
+                        runtime_override_status = RuntimeOverrideStatusResponse(
+                            **self._state.runtime_override_status()
+                        ).model_dump(by_alias=True)
+                    data = StateUpdate(
+                        state="idle",
+                        velocityScale=1.0,
+                        nodeStatuses={},
+                        kernelEvents=kernel_events,
+                        nativeKernelEvents=[],
+                        programLoaded=bool(has_program),
+                        programSessionGeneration=(
+                            self._state.program_session_generation
+                            if self._state is not None
+                            else 0
+                        ),
+                        runtimeOverrideStatus=runtime_override_status,
+                        timestamp=time.time(),
                     ).model_dump(by_alias=True)
-                data = StateUpdate(
-                    state="idle",
-                    velocityScale=1.0,
-                    nodeStatuses={},
-                    kernelEvents=kernel_events,
-                    nativeKernelEvents=[],
-                    programLoaded=bool(has_program),
-                    programSessionGeneration=(
-                        self._state.program_session_generation if self._state is not None else 0
-                    ),
-                    runtimeOverrideStatus=runtime_override_status,
-                    timestamp=time.time(),
-                ).model_dump(by_alias=True)
-            await self.broadcast(data)
-            await asyncio.sleep(0.1)  # 10 Hz
+                await self.broadcast(data)
+                await asyncio.sleep(0.1)  # 10 Hz
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("WebSocket state broadcast iteration failed")
+                await asyncio.sleep(0.5)

@@ -95,11 +95,14 @@ adapters:
     config:
       action_name: /isaac_arm_controller/follow_joint_trajectory
       arm_action: /isaac_arm_controller/follow_joint_trajectory
+      execution_state_authority_profile: commanded_sim
       execution_state_source_mode: commanded_sim
+      streaming_ik_timeout_s: 0.10
+      streaming_collision_timeout_s: 0.025
       require_fresh_state_before_planning: false
       command_gate_topic: /manyforge/isaac_arm_command_enable
       reset_to_initial_on_load: true
-      sim_reset_motion_duration_s: 2
+      sim_reset_motion_duration_s: 0.0
       joint_state_topic: /joint_states
       controller_state_topic: /isaac_arm_controller/controller_state
       controller_manager: /controller_manager

@@ -193,7 +193,7 @@ matching flag.
 |---|---|
 | `--lane manyforge-only` / `--lane isaac-sim` | `[1/7]` |
 | `--assistant on` / `--assistant off` | `[2/7]` |
-| `--scenario NAME` | `[3/7]` (use `--list-scenarios` to see all nine; deprecated aliases — `pick-place`, `ur10e`, `shape-pick`, `vision-pose`, `assistant-authoring`, `isaac-light`, `isaac-assistant` — also resolve with a one-time deprecation warning per launch) |
+| `--scenario NAME` | `[3/7]` (use `--list-scenarios` to see all nine; deprecated aliases — `pick-place`, `ur10e`, `shape-pick`, `vision-pose`, `assistant-authoring`, `isaac-light`, `isaac-assistant` — also resolve with a one-time deprecation warning per launch. Includes `isaac-ur10e-light-scene-collision` for testing runtime collision-fault detection with a popup object.) |
 | `--program PATH --deployment PATH` | Free-form alternative to `--scenario` |
 | `--non-interactive` (env: `MANYFORGE_NON_INTERACTIVE=1`) | Skip all prompts; any unset selection takes its default value |
 | `--yes` / `-y` (env: `MANYFORGE_ASSUME_YES=1`) | Skip the review gate confirmation |

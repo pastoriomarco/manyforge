@@ -30,6 +30,135 @@ py::dict error_details_to_python(
   return d;
 }
 
+const char* collision_engine_status_to_string(CollisionEngineStatus status) {
+  switch (status) {
+    case CollisionEngineStatus::kOk:
+      return "ok";
+    case CollisionEngineStatus::kTimeout:
+      return "timeout";
+    case CollisionEngineStatus::kUnsupportedGeometry:
+      return "unsupported_geometry";
+    case CollisionEngineStatus::kDiagnosticIncomplete:
+      return "diagnostic_incomplete";
+    case CollisionEngineStatus::kCancelled:
+      return "cancelled";
+    case CollisionEngineStatus::kEngineError:
+      return "engine_error";
+  }
+  return "unknown";
+}
+
+const char* collision_decision_to_string(CollisionDecisionResult decision) {
+  switch (decision) {
+    case CollisionDecisionResult::kPass:
+      return "pass";
+    case CollisionDecisionResult::kFail:
+      return "fail";
+    case CollisionDecisionResult::kWarn:
+      return "warn";
+    case CollisionDecisionResult::kStopRequested:
+      return "stop_requested";
+    case CollisionDecisionResult::kInconclusiveFail:
+      return "inconclusive_fail";
+  }
+  return "unknown";
+}
+
+const char* collision_pair_classification_to_string(
+    CollisionPairClassification classification) {
+  switch (classification) {
+    case CollisionPairClassification::kBlockingCollision:
+      return "blocking_collision";
+    case CollisionPairClassification::kAllowedStaticStatic:
+      return "allowed_static_static";
+    case CollisionPairClassification::kSupportContactStart:
+      return "support_contact_start";
+    case CollisionPairClassification::kSupportContactContinued:
+      return "support_contact_continued";
+    case CollisionPairClassification::kSupportContactSeparated:
+      return "support_contact_separated";
+    case CollisionPairClassification::kSupportContactRecontactViolation:
+      return "support_contact_recontact_violation";
+    case CollisionPairClassification::kAllowedTouchLink:
+      return "allowed_touch_link";
+    case CollisionPairClassification::kDiagnosticIncomplete:
+      return "diagnostic_incomplete";
+  }
+  return "unknown";
+}
+
+py::dict collision_pair_to_python(const CollisionPairId& pair) {
+  py::dict d;
+  d["body_a"] = pair.body_a;
+  d["body_b"] = pair.body_b;
+  return d;
+}
+
+py::dict collision_result_to_python(const CollisionResult& result) {
+  py::dict d;
+  d["in_collision"] = result.in_collision;
+  d["engine_id"] = result.engine_id;
+  d["engine_version"] = result.engine_version;
+  d["engine_status"] =
+      collision_engine_status_to_string(result.engine_status);
+  d["decision"] = collision_decision_to_string(result.decision);
+  d["query_duration_ns"] =
+      result.query_duration_ns.has_value()
+          ? py::cast(*result.query_duration_ns)
+          : py::none();
+  d["contact_body_a"] = result.contact_body_a.has_value()
+                            ? py::cast(*result.contact_body_a)
+                            : py::none();
+  d["contact_body_b"] = result.contact_body_b.has_value()
+                            ? py::cast(*result.contact_body_b)
+                            : py::none();
+  if (result.collision_world_revision.has_value()) {
+    py::dict revision;
+    revision["revision_id"] = result.collision_world_revision->revision_id;
+    revision["content_hash"] = result.collision_world_revision->content_hash;
+    d["collision_world_revision"] = revision;
+  } else {
+    d["collision_world_revision"] = py::none();
+  }
+
+  py::list pairs;
+  for (const auto& pair : result.normalized_pairs) {
+    pairs.append(collision_pair_to_python(pair));
+  }
+  d["normalized_pairs"] = pairs;
+
+  py::list classified;
+  for (const auto& pair_result : result.normalized_pairs_classified) {
+    py::dict item;
+    item["pair"] = collision_pair_to_python(pair_result.pair);
+    item["classification"] =
+        collision_pair_classification_to_string(pair_result.classification);
+    item["is_first_failure"] = pair_result.is_first_failure;
+    classified.append(item);
+  }
+  d["normalized_pairs_classified"] = classified;
+
+  py::list clearances;
+  for (const auto& clearance : result.pair_clearances) {
+    py::dict item;
+    item["pair"] = collision_pair_to_python(clearance.pair);
+    item["signed_clearance_m"] = clearance.signed_clearance_m;
+    clearances.append(item);
+  }
+  d["pair_clearances"] = clearances;
+  d["min_clearance_m"] = result.min_clearance_m.has_value()
+                             ? py::cast(*result.min_clearance_m)
+                             : py::none();
+  if (result.min_clearance_pair.has_value()) {
+    d["min_clearance_pair"] =
+        collision_pair_to_python(*result.min_clearance_pair);
+  } else {
+    d["min_clearance_pair"] = py::none();
+  }
+  d["raw_diagnostics"] = error_details_to_python(result.raw_diagnostics);
+  return d;
+}
+
 // Helper: convert Result<uint64_t> to Python dict
 py::dict result_to_python(const Result<uint64_t>& result) {
   py::dict d;
@@ -65,6 +194,9 @@ py::dict snapshot_to_python(const ExecutionSnapshot& snapshot) {
   d["state_name"] = to_string(snapshot.state);
   d["progress"] = snapshot.progress;
   d["joint_positions_rad"] = snapshot.joint_positions_rad;
+  d["state_source"] = snapshot.state_source;
+  d["source_timestamp_ns"] = snapshot.source_timestamp_ns;
+  d["source_age_ns"] = snapshot.source_age_ns;
   if (snapshot.error.has_value()) {
     d["error"] = snapshot.error->message;
     d["error_code"] = snapshot.error->code;
@@ -379,6 +511,42 @@ const char* kernel_event_type_to_string(KernelEventType type) {
     case KernelEventType::kStreamingSessionEnded: return "streaming_session_ended";
     case KernelEventType::kErrorRaised: return "error_raised";
     case KernelEventType::kCollisionDetected: return "collision_detected";
+    case KernelEventType::kInterruptSignalIngested: return "interrupt_signal_ingested";
+    case KernelEventType::kInterruptSignalRejectedStale: return "interrupt_signal_rejected_stale";
+    case KernelEventType::kInterruptSignalRejectedClassViolation:
+      return "interrupt_signal_rejected_class_violation";
+    case KernelEventType::kInterruptSignalRejected: return "interrupt_signal_rejected";
+    case KernelEventType::kInterruptLatched: return "interrupt_latched";
+    case KernelEventType::kInterruptSuppressedByActiveMask:
+      return "interrupt_suppressed_by_active_mask";
+    case KernelEventType::kInterruptQueued: return "interrupt_queued";
+    case KernelEventType::kInterruptDroppedQueueOverflow:
+      return "interrupt_dropped_queue_overflow";
+    case KernelEventType::kInterruptPreemptApplied: return "interrupt_preempt_applied";
+    case KernelEventType::kInterruptDispositionApplied:
+      return "interrupt_disposition_applied";
+    case KernelEventType::kInterruptCleared: return "interrupt_cleared";
+    case KernelEventType::kInterruptIngestOverflow: return "interrupt_ingest_overflow";
+    case KernelEventType::kInterruptSourceClassViolation:
+      return "interrupt_source_class_violation";
+    case KernelEventType::kInterruptRecoveryHandlerStarted:
+      return "interrupt_recovery_handler_started";
+    case KernelEventType::kInterruptRecoveryHandlerCompleted:
+      return "interrupt_recovery_handler_completed";
+    case KernelEventType::kMotionInterruptScopeArmed:
+      return "motion_interrupt_scope_armed";
+    case KernelEventType::kMotionInterruptScopeReaped:
+      return "motion_interrupt_scope_reaped";
+    case KernelEventType::kMotionInterruptArmFailed:
+      return "motion_interrupt_arm_failed";
+    case KernelEventType::kMotionInterruptQueuedUpdateDropped:
+      return "motion_interrupt_queued_update_dropped";
+    case KernelEventType::kMotionTripSecondarySignal:
+      return "motion_trip_secondary_signal";
+    case KernelEventType::kMotionTripFailed: return "motion_trip_failed";
+    case KernelEventType::kMotionTripCompleted: return "motion_trip_completed";
+    case KernelEventType::kMotionExecutionOutcomeRecorded:
+      return "motion_execution_outcome_recorded";
     default: return "unknown";
   }
 }
@@ -397,6 +565,7 @@ py::dict kernel_event_to_python(const KernelEvent& event) {
     py::dict err;
     err["code"] = event.error->code;
     err["message"] = event.error->message;
+    err["details"] = error_details_to_python(event.error->details);
     d["error"] = err;
   }
   if (!event.details.empty()) {
@@ -492,6 +661,76 @@ double finite_scale_from_python(const py::handle& value, const char* field_name)
   return result;
 }
 
+// Helper used by both the motion-scoped scope parser (above) and the
+// kernel-config parser (default_fault_stop_profile /
+// operator_stop_profile). The body mirrors the inline parser in the
+// scope path so behavior stays identical; the `context` parameter names
+// the source for error messages.
+MotionInterruptStopProfileDTO stop_profile_from_python(
+    const py::dict& sp, const char* context) {
+  MotionInterruptStopProfileDTO profile;
+  profile.profile_id = sp["profile_id"].cast<std::string>();
+  const std::string sm = sp["stop_mode"].cast<std::string>();
+  if (sm == "spring_back_hold") {
+    profile.stop_mode = MotionInterruptStopMode::kSpringBackHold;
+  } else if (sm == "soft_on_path") {
+    profile.stop_mode = MotionInterruptStopMode::kSoftOnPath;
+  } else if (sm == "hard_deceleration") {
+    profile.stop_mode = MotionInterruptStopMode::kHardDeceleration;
+  } else {
+    throw std::invalid_argument(
+        std::string(context) + ".stop_mode: unknown value '" + sm +
+        "' (expected 'spring_back_hold', 'soft_on_path', or "
+        "'hard_deceleration')");
+  }
+  if (sp.contains("deceleration_time_s") &&
+      !sp["deceleration_time_s"].is_none()) {
+    profile.deceleration_time_s = sp["deceleration_time_s"].cast<double>();
+  }
+  if (sp.contains("max_stop_time_s") && !sp["max_stop_time_s"].is_none()) {
+    profile.max_stop_time_s = sp["max_stop_time_s"].cast<double>();
+  }
+  if (sp.contains("joint_deceleration_profile_id") &&
+      !sp["joint_deceleration_profile_id"].is_none()) {
+    profile.joint_deceleration_profile_id =
+        sp["joint_deceleration_profile_id"].cast<std::string>();
+  }
+  if (sp.contains("per_joint_max_deceleration_rad_s2") &&
+      !sp["per_joint_max_deceleration_rad_s2"].is_none()) {
+    profile.per_joint_max_deceleration_rad_s2 =
+        sp["per_joint_max_deceleration_rad_s2"]
+            .cast<std::map<std::string, double>>();
+  }
+  if (sp.contains("allowed_fallback_modes") &&
+      !sp["allowed_fallback_modes"].is_none()) {
+    for (auto m : sp["allowed_fallback_modes"].cast<py::list>()) {
+      const std::string ms = m.cast<std::string>();
+      if (ms == "spring_back_hold") {
+        profile.allowed_fallback_modes.push_back(
+            MotionInterruptStopMode::kSpringBackHold);
+      } else if (ms == "soft_on_path") {
+        profile.allowed_fallback_modes.push_back(
+            MotionInterruptStopMode::kSoftOnPath);
+      } else if (ms == "hard_deceleration") {
+        profile.allowed_fallback_modes.push_back(
+            MotionInterruptStopMode::kHardDeceleration);
+      } else {
+        throw std::invalid_argument(
+            std::string(context) + ".allowed_fallback_modes: unknown value '" +
+            ms +
+            "' (expected 'spring_back_hold', 'soft_on_path', "
+            "or 'hard_deceleration')");
+      }
+    }
+  }
+  profile.allow_natural_completion_on_short_path =
+      sp.attr("get")("allow_natural_completion_on_short_path", false)
+          .cast<bool>();
+  profile.require_backend_confirmation =
+      sp.attr("get")("require_backend_confirmation", true).cast<bool>();
+  return profile;
+}
+
 ExecutionKernelConfig kernel_config_from_python(const py::object& config_obj) {
   ExecutionKernelConfig config;
   if (config_obj.is_none()) {
@@ -547,6 +786,10 @@ ExecutionKernelConfig kernel_config_from_python(const py::object& config_obj) {
   config.streaming_ik_timeout_s =
       read_seconds("streaming_ik_timeout_s", "streaming_ik_timeout_ms",
                    config.streaming_ik_timeout_s);
+  config.streaming_collision_timeout_s =
+      read_seconds("streaming_collision_timeout_s",
+                   "streaming_collision_timeout_ms",
+                   config.streaming_collision_timeout_s);
   config.native_reset_completion_timeout_s =
       read_seconds("native_reset_completion_timeout_s",
                    "native_reset_completion_timeout_ms",
@@ -558,6 +801,9 @@ ExecutionKernelConfig kernel_config_from_python(const py::object& config_obj) {
   if (config.streaming_ik_timeout_s <= 0.0) {
     throw std::invalid_argument("streaming_ik_timeout_s must be > 0");
   }
+  if (config.streaming_collision_timeout_s <= 0.0) {
+    throw std::invalid_argument("streaming_collision_timeout_s must be > 0");
+  }
   if (config.native_reset_completion_timeout_s <= 0.0) {
     throw std::invalid_argument(
         "native_reset_completion_timeout_s must be > 0");
@@ -565,6 +811,27 @@ ExecutionKernelConfig kernel_config_from_python(const py::object& config_obj) {
   if (config.native_streaming_stop_completion_timeout_s <= 0.0) {
     throw std::invalid_argument(
         "native_streaming_stop_completion_timeout_s must be > 0");
+  }
+  // Two optional controlled-stop profiles surfaced to Python so
+  // deployment YAML can carry them. Recommended defaults are
+  // spring_back_hold (fault) and soft_on_path (operator-stop); both
+  // default to unset → legacy backend.stop() so existing deployments
+  // see no behavior change.
+  if (config_dict.contains("default_fault_stop_profile") &&
+      !config_dict["default_fault_stop_profile"].is_none()) {
+    config.default_fault_stop_profile =
+        std::make_shared<MotionInterruptStopProfileDTO>(
+            stop_profile_from_python(
+                config_dict["default_fault_stop_profile"].cast<py::dict>(),
+                "default_fault_stop_profile"));
+  }
+  if (config_dict.contains("operator_stop_profile") &&
+      !config_dict["operator_stop_profile"].is_none()) {
+    config.operator_stop_profile =
+        std::make_shared<MotionInterruptStopProfileDTO>(
+            stop_profile_from_python(
+                config_dict["operator_stop_profile"].cast<py::dict>(),
+                "operator_stop_profile"));
   }
   return config;
 }
@@ -652,9 +919,29 @@ Ros2ControlExecutionBackendConfig ros2_control_config_from_python(
     config.disable_controller_path_tolerances =
         config_dict["disable_controller_path_tolerances"].cast<bool>();
   }
-  if (config_dict.contains("execution_state_source_mode")) {
-    config.execution_state_source_mode =
+  std::optional<std::string> execution_state_source_mode;
+  std::optional<std::string> execution_state_authority_profile;
+  if (config_dict.contains("execution_state_source_mode") &&
+      !config_dict["execution_state_source_mode"].is_none()) {
+    execution_state_source_mode =
         config_dict["execution_state_source_mode"].cast<std::string>();
+  }
+  if (config_dict.contains("execution_state_authority_profile") &&
+      !config_dict["execution_state_authority_profile"].is_none()) {
+    execution_state_authority_profile =
+        config_dict["execution_state_authority_profile"].cast<std::string>();
+  }
+  if (execution_state_source_mode.has_value() &&
+      execution_state_authority_profile.has_value() &&
+      *execution_state_source_mode != *execution_state_authority_profile) {
+    throw std::invalid_argument(
+        "execution_state_source_mode and execution_state_authority_profile "
+        "must match when both are provided");
+  }
+  if (execution_state_authority_profile.has_value()) {
+    config.execution_state_source_mode = *execution_state_authority_profile;
+  } else if (execution_state_source_mode.has_value()) {
+    config.execution_state_source_mode = *execution_state_source_mode;
   }
   if (config_dict.contains("initial_joint_positions_rad")) {
     config.initial_joint_positions_rad =
@@ -863,7 +1150,7 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
           req.motion = goal;
         }
 
-        // Phase 4.5E: motion-scoped interrupt scopes
+        // Motion-scoped interrupt scopes
         // (spec/210 §3.10 + spec/260 §2.6). Parse each scope's
         // stop_profile + node_category so MoveUntilSignal /
         // ProbeSearchMove can drive the kernel arm path. Without
@@ -882,8 +1169,8 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
                   sd.attr("get")("activation_mode",
                                   std::string("require_inactive_at_arm"))
                       .cast<std::string>();
-              // Phase 4.5E (codex review follow-up): a typoed or
-              // stale client value MUST fail before dispatch. Silently
+              // A typoed or stale client value MUST fail before
+              // dispatch. Silently
               // coercing "trip_if_already_inactive" → require_inactive
               // would dispatch a different scope than the operator
               // configured.
@@ -936,77 +1223,13 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
               }
               if (sd.contains("stop_profile") &&
                   !sd["stop_profile"].is_none()) {
-                auto sp = sd["stop_profile"].cast<py::dict>();
-                MotionInterruptStopProfileDTO profile;
-                profile.profile_id = sp["profile_id"].cast<std::string>();
-                const std::string sm = sp["stop_mode"].cast<std::string>();
-                if (sm == "spring_back_hold") {
-                  profile.stop_mode = MotionInterruptStopMode::kSpringBackHold;
-                } else if (sm == "soft_on_path") {
-                  profile.stop_mode = MotionInterruptStopMode::kSoftOnPath;
-                } else if (sm == "hard_deceleration") {
-                  profile.stop_mode = MotionInterruptStopMode::kHardDeceleration;
-                } else {
-                  throw std::invalid_argument(
-                      std::string("motion_interrupt_scopes[].stop_profile."
-                                  "stop_mode: unknown value '") +
-                      sm +
-                      "' (expected 'spring_back_hold', 'soft_on_path', or "
-                      "'hard_deceleration')");
-                }
-                if (sp.contains("deceleration_time_s") &&
-                    !sp["deceleration_time_s"].is_none()) {
-                  profile.deceleration_time_s =
-                      sp["deceleration_time_s"].cast<double>();
-                }
-                if (sp.contains("max_stop_time_s") &&
-                    !sp["max_stop_time_s"].is_none()) {
-                  profile.max_stop_time_s =
-                      sp["max_stop_time_s"].cast<double>();
-                }
-                if (sp.contains("joint_deceleration_profile_id") &&
-                    !sp["joint_deceleration_profile_id"].is_none()) {
-                  profile.joint_deceleration_profile_id =
-                      sp["joint_deceleration_profile_id"].cast<std::string>();
-                }
-                if (sp.contains("per_joint_max_deceleration_rad_s2") &&
-                    !sp["per_joint_max_deceleration_rad_s2"].is_none()) {
-                  profile.per_joint_max_deceleration_rad_s2 =
-                      sp["per_joint_max_deceleration_rad_s2"]
-                          .cast<std::map<std::string, double>>();
-                }
-                if (sp.contains("allowed_fallback_modes") &&
-                    !sp["allowed_fallback_modes"].is_none()) {
-                  for (auto m :
-                       sp["allowed_fallback_modes"].cast<py::list>()) {
-                    const std::string ms = m.cast<std::string>();
-                    if (ms == "spring_back_hold") {
-                      profile.allowed_fallback_modes.push_back(
-                          MotionInterruptStopMode::kSpringBackHold);
-                    } else if (ms == "soft_on_path") {
-                      profile.allowed_fallback_modes.push_back(
-                          MotionInterruptStopMode::kSoftOnPath);
-                    } else if (ms == "hard_deceleration") {
-                      profile.allowed_fallback_modes.push_back(
-                          MotionInterruptStopMode::kHardDeceleration);
-                    } else {
-                      throw std::invalid_argument(
-                          std::string("motion_interrupt_scopes[].stop_profile."
-                                      "allowed_fallback_modes: unknown value '") +
-                          ms +
-                          "' (expected 'spring_back_hold', 'soft_on_path', "
-                          "or 'hard_deceleration')");
-                    }
-                  }
-                }
-                profile.allow_natural_completion_on_short_path =
-                    sp.attr("get")(
-                          "allow_natural_completion_on_short_path", false)
-                        .cast<bool>();
-                profile.require_backend_confirmation =
-                    sp.attr("get")("require_backend_confirmation", true)
-                        .cast<bool>();
-                scope.stop_profile = profile;
+                // Single source of truth for parsing
+                // `MotionInterruptStopProfileDTO` from Python. Same
+                // helper feeds the kernel-config `default_fault_stop_profile`
+                // and `operator_stop_profile` fields.
+                scope.stop_profile = stop_profile_from_python(
+                    sd["stop_profile"].cast<py::dict>(),
+                    "motion_interrupt_scopes[].stop_profile");
               }
               req.motion_interrupt_scopes.push_back(std::move(scope));
             }
@@ -1022,7 +1245,7 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
       .def("get_execution_outcome",
            [](NativeKernelBundle& self, std::uint64_t execution_id)
                -> py::object {
-             // Phase 4.5E: expose the kernel's terminal motion outcome
+             // Expose the kernel's terminal motion outcome
              // store so the Python BT nodes can map terminal_cause to
              // py_trees Status. Returns None when no outcome is
              // recorded (e.g., the execution id was never seen or
@@ -1081,8 +1304,8 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
                td["stop_command_source"] = std::string(scs);
                td["backend_stop_confirmed"] =
                    trip.stop_snapshot.backend_stop_confirmed;
-               // Phase 4.5E (codex review follow-up): full stop
-               // snapshot fidelity. Downstream consumers need source +
+               // Full stop snapshot fidelity. Downstream consumers
+               // need source +
                // state + captured_at_ns so they can decide whether
                // the certified rest position is acceptable for the
                // node's precision contract.
@@ -1640,6 +1863,15 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
            [](NativeKernelBundle& self, std::string principal_id,
               std::string reason) -> py::dict {
              auto r = self.kernel->acknowledge_intervention(
+                 std::move(principal_id), std::move(reason));
+             return command_result(r.accepted, r.error);
+           },
+           py::arg("principal_id"),
+           py::arg("reason"))
+      .def("acknowledge_interrupted_for_retry",
+           [](NativeKernelBundle& self, std::string principal_id,
+              std::string reason) -> py::dict {
+             auto r = self.kernel->acknowledge_interrupted_for_retry(
                  std::move(principal_id), std::move(reason));
              return command_result(r.accepted, r.error);
            },
@@ -2251,6 +2483,78 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
         return d;
       }, py::arg("positions"),
       "Check collisions for active-group joint positions.")
+      .def("collision_compare_positions", [](
+              NativeKernelBundle& self,
+              const std::vector<double>& positions,
+              std::optional<std::int64_t> waypoint_index) {
+        RobotStateDTO state;
+        state.joint_names = self.context->get_joint_names();
+        state.positions_rad = positions;
+
+        CollisionQuery query;
+        query.query_id = "debug_collision_compare_positions";
+        query.surface = CollisionSurface::kDiagnosticCompare;
+        query.robot_state = state;
+        query.waypoint_index = waypoint_index;
+        query.sampling_mode = CollisionSamplingMode::kWaypointOnly;
+
+        auto snapshot = self.context->snapshot();
+        py::dict result;
+        if (!snapshot) {
+          result["ok"] = false;
+          result["error"] = "collision_world_snapshot_unavailable";
+          return result;
+        }
+        query.collision_world_revision = snapshot->revision;
+
+        auto policy = self.context->collision_policy_snapshot()
+                          .value_or(CollisionPolicySnapshot{});
+
+        CollisionResult legacy_result = [&]() {
+          py::gil_scoped_release release;
+          return self.context->collision_check_normalized(query);
+        }();
+
+        if (self.collision_validation_engines.empty() ||
+            !self.collision_validation_engines.front()) {
+          result["ok"] = false;
+          result["error"] = "manyforge_collision_engine_unavailable";
+          result["legacy"] = collision_result_to_python(legacy_result);
+          return result;
+        }
+
+        CollisionCancellationToken cancel;
+        CollisionResult manyforge_result = [&]() {
+          py::gil_scoped_release release;
+          return self.collision_validation_engines.front()->check(
+              *snapshot, query, policy, cancel);
+        }();
+
+        const bool in_collision_match =
+            legacy_result.in_collision == manyforge_result.in_collision;
+        const bool decision_match =
+            legacy_result.decision == manyforge_result.decision;
+        const bool pair_count_match =
+            legacy_result.normalized_pairs.size() ==
+            manyforge_result.normalized_pairs.size();
+        const bool normalized_pairs_match =
+            legacy_result.normalized_pairs == manyforge_result.normalized_pairs;
+
+        result["ok"] = true;
+        result["in_collision_match"] = in_collision_match;
+        result["decision_match"] = decision_match;
+        result["pair_count_match"] = pair_count_match;
+        result["normalized_pairs_match"] = normalized_pairs_match;
+        result["match"] = in_collision_match && decision_match &&
+                          normalized_pairs_match;
+        result["snapshot_revision_id"] = snapshot->revision.revision_id;
+        result["snapshot_content_hash"] = snapshot->revision.content_hash;
+        result["legacy"] = collision_result_to_python(legacy_result);
+        result["manyforge_collision"] =
+            collision_result_to_python(manyforge_result);
+        return result;
+      }, py::arg("positions"), py::arg("waypoint_index") = py::none(),
+      "Compare legacy RoboPlan and ManyForge collision engines for positions.")
       .def("get_cached_trajectory", [](NativeKernelBundle& self,
                                        const std::string& move_id) -> py::object {
         auto cached = self.cache->lookup(move_id);

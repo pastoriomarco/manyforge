@@ -144,6 +144,70 @@ class TestCycleManagerRun:
         manager.run()
         assert manager.state == CycleState.RUNNING
 
+    def test_run_from_stopped_motion_soft_fail_clears_interrupted_kernel_retry(
+        self, kernel
+    ):
+        """Run from STOPPED is an explicit retry after a motion soft-fail.
+
+        Runtime collision faults leave the kernel in INTERRUPTED with an
+        active latch. Removing the obstacle fixes the scene but does not clear
+        that execution-local latch. The operator pressing Run means "retry
+        this held motion"; CycleManager must acknowledge the interrupted
+        kernel execution boundary first so the motion node can submit a fresh
+        execute request.
+        This must not call kernel.reset(), because ROS/Isaac reset can command
+        the robot back to its initial pose. If the obstacle is still present,
+        the fresh execute/monitor path will latch a new collision.
+        """
+        slow_kernel = MockKernelClient(execute_duration_s=1.0)
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, slow_kernel)
+        manager = CycleManager(runner, slow_kernel)
+
+        bb = py_trees.blackboard.Client(name="test_motion_retry_after_collision")
+        bb.register_key(key="motion_paused_due_to_error", access=py_trees.common.Access.READ)
+        bb.register_key(key="motion_error_message", access=py_trees.common.Access.READ)
+        bb.register_key(key="motion_paused_node_name", access=py_trees.common.Access.READ)
+        bb.register_key(key="resume_after_error_requested", access=py_trees.common.Access.READ)
+
+        try:
+            manager.run()
+            deadline = time.time() + 1.0
+            while slow_kernel.execute_count == 0 and time.time() < deadline:
+                time.sleep(0.01)
+            assert slow_kernel.execute_count == 1
+
+            # Simulate a runtime collision fault while the authored motion node
+            # still owns the in-flight execution. This preserves the node's
+            # internal soft-fail state, matching the live path that Run must
+            # resume. Fabricating only blackboard keys after reset would build a
+            # fresh node that has no _soft_fail_error to consume.
+            initial_reset_count = slow_kernel.reset_count
+            slow_kernel._state = ExecutionState.INTERRUPTED
+
+            deadline = time.time() + 1.0
+            while manager.state != CycleState.STOPPED and time.time() < deadline:
+                time.sleep(0.01)
+            assert manager.state == CycleState.STOPPED
+            assert bb.get("motion_paused_due_to_error") is True
+            assert bb.get("motion_error_message") is not None
+            previous_execute_count = slow_kernel.execute_count
+
+            manager.run()
+            deadline = time.time() + 1.0
+            while slow_kernel.execute_count == previous_execute_count and time.time() < deadline:
+                time.sleep(0.01)
+
+            assert slow_kernel.reset_count == initial_reset_count
+            assert slow_kernel.acknowledge_interrupted_for_retry_count == 1
+            assert slow_kernel.execute_count > previous_execute_count
+            assert bb.get("motion_paused_due_to_error") is False
+            assert bb.get("motion_error_message") is None
+            assert bb.get("motion_paused_node_name") is None
+            assert bb.get("resume_after_error_requested") is False
+            assert manager.state == CycleState.RUNNING
+        finally:
+            manager.reset()
+
     def test_node_failure_feedback_is_exposed_as_cycle_error(self, kernel, tmp_path):
         """Clean node failures should surface node feedback in manager.error."""
         failing_program = tmp_path / "missing_bb.program.yaml"
@@ -293,16 +357,243 @@ class TestCycleManagerReset:
         """reset() from IDLE prepares a fresh software/runtime cycle state."""
         runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
         manager = CycleManager(runner, kernel)
-        
+
         assert manager.state == CycleState.IDLE
         initial_reset_count = kernel.reset_count
-        
+
         manager.reset()
         assert manager.state == CycleState.IDLE
         assert manager._tree is not None
         assert kernel.get_object_state("table").exists is True
         # Kernel reset is not used as a synthetic state-assignment path when already idle.
         assert kernel.reset_count == initial_reset_count
+
+    def test_reset_removes_runtime_added_scene_objects(self, kernel):
+        """Reset must clear scene objects that were added at runtime so the
+        planning scene matches the operator's authored intent. Without this,
+        a wall/obstacle spawned during a cycle (BT node, REST edit, etc.)
+        persists in the backend after reset and silently shapes the next
+        plan."""
+        from manyforge_behavior.kernel_client import SceneEditRequest
+
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        manager = CycleManager(runner, kernel)
+        # Materialise the authored scene first.
+        manager.reset()
+        assert kernel.get_object_state("table").exists is True
+
+        # Simulate something adding an object at runtime (this is what the
+        # AddCollisionObject BT node, an assistant runtime override, or a
+        # scene-edit REST call would do).
+        kernel.scene_edit(
+            SceneEditRequest(
+                operation="add",
+                object_id="runtime_wall",
+                shape_type="box",
+                box_dimensions_m=[0.02, 0.4, 0.8],
+                pose_position_m=[-0.3, 0.4, 0.4],
+                pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
+            )
+        )
+        assert kernel.get_object_state("runtime_wall").exists is True
+
+        manager.reset()
+        # Authored object survives, runtime-added object is gone.
+        assert kernel.get_object_state("table").exists is True
+        assert kernel.get_object_state("runtime_wall").exists is False
+
+    def test_reset_detaches_and_removes_runtime_attached_objects(self, kernel):
+        """Reset means 'robot is back to known authored state, not holding
+        anything from the previous cycle'. A runtime-added object that was
+        attached during the cycle (e.g., a part the BT picked up) must be
+        both detached and removed — it is not in the authored scene, so
+        apply_scene() will not re-add it."""
+        from manyforge_behavior.kernel_client import SceneEditRequest
+
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        manager = CycleManager(runner, kernel)
+        manager.reset()
+
+        kernel.scene_edit(
+            SceneEditRequest(
+                operation="add",
+                object_id="runtime_part",
+                shape_type="box",
+                box_dimensions_m=[0.05, 0.05, 0.05],
+                pose_position_m=[0.0, 0.0, 0.0],
+                pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
+            )
+        )
+        kernel.scene_edit(
+            SceneEditRequest(
+                operation="attach",
+                object_id="runtime_part",
+                frame_id="tool0",
+            )
+        )
+        assert kernel.get_object_state("runtime_part").attached is True
+
+        manager.reset()
+        # Runtime-added attached object: detached and removed entirely.
+        assert kernel.get_object_state("runtime_part").exists is False
+
+    def test_reset_detaches_authored_attached_objects_and_re_adds_them(self, kernel):
+        """Authored objects that became attached during the prior cycle (the
+        normal pick-and-place case: `attach_cheese_box` succeeded, then the
+        cycle was stopped and reset) must be detached and re-added at the
+        authored pose. Without the detach, apply_scene() would call
+        scene_edit(add, cheese_box) on a still-existing object and fail with
+        'Object already exists', breaking reset after a pick. The pick flow
+        is exactly the scenario the user is testing with Isaac live."""
+        from manyforge_behavior.kernel_client import SceneEditRequest
+
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        manager = CycleManager(runner, kernel)
+        manager.reset()
+        # Authored objects are present after the initial scene apply.
+        assert kernel.get_object_state("table").exists is True
+
+        # Simulate a successful pick: an authored object becomes attached.
+        kernel.scene_edit(
+            SceneEditRequest(
+                operation="attach",
+                object_id="table",
+                frame_id="tool0",
+            )
+        )
+        assert kernel.get_object_state("table").attached is True
+
+        # Reset must succeed (the bug: apply_scene would re-add `table` and
+        # the kernel would reject "Object already exists").
+        manager.reset()
+
+        # Authored object survives reset but is no longer attached.
+        state = kernel.get_object_state("table")
+        assert state.exists is True
+        assert state.attached is False
+
+    def test_event_harvest_prefers_collision_pair_over_latch(self, kernel):
+        """Issue #1/#3 rich-error rendering: when a runtime fault fires,
+        the kernel publishes a `collision_detected` event (carrying the
+        colliding pair, classification, waypoint, snapshot revision)
+        FIRST, then `interrupt_latched` (policy + latch identity). A
+        naive newest-first walk would surface the latch event and discard
+        the colliding-pair diagnostic, leaving the HMI with only
+        'Motion interrupted by runtime_collision_fault' when the real
+        operator-actionable info is 'wall <-> wrist_1_link at waypoint 0'.
+
+        This test pins the priority: collision_detected wins regardless
+        of buffer order, and the harvest emits the `runtime_collision`
+        code (not `validation_collision` — pre-execute validation
+        rejection is a distinct operator event)."""
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        manager = CycleManager(runner, kernel)
+
+        # Mirror the live event sequence: collision_detected at lower
+        # event_index, interrupt_latched after it. The kernel's runtime
+        # collision monitor emits in this order.
+        collision_details = {
+            "collision_result_first_failure_pair":
+                "object/wall/shape/0 <-> robot/robot0/link/wrist_1_link/collision/0",
+            "collision_result_first_failure_classification": "blocking_collision",
+            "collision_result_waypoint_index": "0",
+            "reason_code": "runtime_collision_monitor",
+            "surface": "observed_runtime_monitor",
+        }
+        latch_details = {
+            "policy_id": "manyforge.kernel.runtime_collision_fault.preempt_trajectory",
+            "preemption_action": "preempt_trajectory",
+            "latch_id": "interrupt-1",
+            "source_id": "manyforge.kernel.runtime_collision_fault",
+        }
+        with manager._lock:
+            manager._kernel_event_index += 1
+            manager._kernel_events.append({
+                "type": "collision_detected",
+                "execution_id": 1,
+                "timestamp_ns": 1_000,
+                "event_index": manager._kernel_event_index,
+                "details": collision_details,
+            })
+            manager._kernel_event_index += 1
+            manager._kernel_events.append({
+                "type": "interrupt_latched",
+                "execution_id": 1,
+                "timestamp_ns": 2_000,
+                "event_index": manager._kernel_event_index,
+                "details": latch_details,
+            })
+
+        code, details = manager._capture_kernel_error_diagnostics()
+        assert code == "runtime_collision", (
+            "Runtime collision monitor must surface as 'runtime_collision' "
+            "(distinct from pre-execute 'validation_collision'); got: " + str(code)
+        )
+        assert details is not None
+        assert details["collision_result_first_failure_pair"] == (
+            "object/wall/shape/0 <-> robot/robot0/link/wrist_1_link/collision/0"
+        ), "Colliding pair must be preserved when both events are buffered"
+        assert details["collision_result_waypoint_index"] == "0"
+        assert details["collision_result_first_failure_classification"] == (
+            "blocking_collision"
+        )
+
+    def test_event_harvest_falls_back_to_latch_when_no_collision(self, kernel):
+        """Drift-fault / operator-stop / other non-collision fault paths
+        publish `interrupt_latched` without a preceding `collision_detected`.
+        In that case the harvest must surface the latch details rather than
+        returning (None, None)."""
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        manager = CycleManager(runner, kernel)
+
+        with manager._lock:
+            manager._kernel_event_index += 1
+            manager._kernel_events.append({
+                "type": "interrupt_latched",
+                "execution_id": 1,
+                "timestamp_ns": 1_000,
+                "event_index": manager._kernel_event_index,
+                "details": {
+                    "policy_id": "manyforge.kernel.drift_fault.preempt_trajectory",
+                    "preemption_action": "preempt_trajectory",
+                    "latch_id": "interrupt-7",
+                },
+            })
+
+        code, details = manager._capture_kernel_error_diagnostics()
+        assert code == "motion_interrupt_latched"
+        assert details is not None
+        assert details["policy_id"] == (
+            "manyforge.kernel.drift_fault.preempt_trajectory"
+        )
+
+    def test_reset_fails_loudly_when_scene_remove_fails(self, kernel):
+        """Industrial reset semantics: if a runtime object cannot be cleared,
+        reset must surface that failure rather than silently producing a
+        half-clean scene. Otherwise a leftover wall (or whatever) silently
+        shapes the next plan."""
+        from manyforge_behavior.kernel_client import SceneEditRequest
+
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        manager = CycleManager(runner, kernel)
+        manager.reset()
+        kernel.scene_edit(
+            SceneEditRequest(
+                operation="add",
+                object_id="runtime_obstacle",
+                shape_type="box",
+                box_dimensions_m=[0.1, 0.1, 0.1],
+                pose_position_m=[0.0, 0.0, 0.0],
+                pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
+            )
+        )
+        # Inject a failure on the next scene_edit call.
+        kernel.fail_next_scene_edit = True
+
+        import pytest
+
+        with pytest.raises(RuntimeError, match="reset failed to (remove|detach)"):
+            manager.reset()
 
 
 class TestCycleManagerSignalRegistry:

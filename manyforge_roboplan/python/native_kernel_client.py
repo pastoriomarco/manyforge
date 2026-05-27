@@ -104,7 +104,7 @@ def _rpy_deg_to_xyzw(rpy_deg):
 def _serialize_motion_interrupt_scope(
     scope: MotionInterruptScope,
 ) -> Dict[str, Any]:
-    """Phase 4.5E: serialize a Python MotionInterruptScope DTO into the
+    """Serialize a Python MotionInterruptScope DTO into the
     dict shape the pybind `execute` parser consumes. Field names mirror
     the C++ MotionInterruptScopeDTO members so downstream parsing is
     straightforward."""
@@ -152,7 +152,7 @@ def _serialize_motion_interrupt_scope(
 def _deserialize_motion_execution_outcome(
     raw: Optional[Dict[str, Any]],
 ) -> Optional[MotionExecutionOutcome]:
-    """Phase 4.5E: deserialize the dict returned by the native bundle's
+    """Deserialize the dict returned by the native bundle's
     get_execution_outcome into the Python DTO. Returns None when the
     native surface returns a falsy value (no outcome recorded yet)."""
     if not raw:
@@ -185,7 +185,7 @@ def _deserialize_motion_execution_outcome(
             ),
             result_binding_key=trip.get("result_binding_key"),
         )
-        # Phase 4.5E (codex review follow-up): full outcome fidelity.
+        # Full outcome fidelity.
         # Snapshot source/state/captured_at_ns + requested-mode +
         # diagnostics + profile_id surface back through the Python DTO
         # so BT consumers can audit the trip without re-querying the
@@ -396,7 +396,7 @@ class NativeKernelClient(KernelClient):
         elif request.motion_type == "relative_move":
             req_dict["relative_move"] = relative_move
 
-        # Phase 4.5E: motion-scoped interrupt scopes (spec/210 §3.10 +
+        # Motion-scoped interrupt scopes (spec/210 §3.10 +
         # spec/260 §2.6). Each scope arms a move-scoped policy for
         # exactly this execute request; the kernel arms them
         # atomically after validation and reaps on every terminal
@@ -419,12 +419,12 @@ class NativeKernelClient(KernelClient):
         )
 
     def get_execution_outcome(self, execution_id):
-        """Phase 4.5E: fetch the terminal MotionExecutionOutcome for a
+        """Fetch the terminal MotionExecutionOutcome for a
         completed scoped execution from the native kernel."""
         try:
             raw = self._bundle.get_execution_outcome(int(execution_id))
         except (AttributeError, RuntimeError):
-            # Native bundle predates 4.5C outcome store. Return None
+            # Native bundle predates the outcome store. Return None
             # so callers (BT nodes) fail closed per spec/210 §3.11.
             return None
         return _deserialize_motion_execution_outcome(raw)
@@ -623,6 +623,14 @@ class NativeKernelClient(KernelClient):
         r = self._bundle.acknowledge_intervention(str(principal_id), str(reason))
         return CommandResult(accepted=r["accepted"], error=r.get("error"))
 
+    def acknowledge_interrupted_for_retry(
+        self, principal_id: str, reason: str
+    ) -> CommandResult:
+        r = self._bundle.acknowledge_interrupted_for_retry(
+            str(principal_id), str(reason)
+        )
+        return CommandResult(accepted=r["accepted"], error=r.get("error"))
+
     # ---- Streaming-session API (ADR-0016) ----
     def begin_streaming_session(
         self, config: StreamingSessionConfig
@@ -682,6 +690,7 @@ class NativeKernelClient(KernelClient):
             backend_sequence=int(r.get("backend_sequence", 0)),
             error=r.get("error"),
             error_code=r.get("error_code"),
+            error_details=dict(r.get("error_details", {})),
         )
 
     def end_streaming_session(
@@ -726,6 +735,9 @@ class NativeKernelClient(KernelClient):
             state=_state_from_native(s),
             progress=s.get("progress", 0.0),
             joint_positions_rad=list(s.get("joint_positions_rad", [])),
+            state_source=s.get("state_source", ""),
+            source_timestamp_ns=int(s.get("source_timestamp_ns", 0)),
+            source_age_ns=int(s.get("source_age_ns", 0)),
             error=s.get("error"),
             error_code=s.get("error_code"),
             error_details=dict(s.get("error_details", {})),
@@ -977,6 +989,20 @@ class NativeKernelClient(KernelClient):
     def collision_check_positions(self, positions_rad: list[float]) -> dict[str, Any]:
         """Check backend collisions for active-group joint positions."""
         return dict(self._bundle.collision_check_positions(list(positions_rad)))
+
+    def collision_compare_positions(
+        self,
+        positions_rad: list[float],
+        *,
+        waypoint_index: int | None = None,
+    ) -> dict[str, Any]:
+        """Compare legacy RoboPlan and ManyForge collision engines."""
+        return dict(
+            self._bundle.collision_compare_positions(
+                list(positions_rad),
+                waypoint_index,
+            )
+        )
 
     def get_link_pose(
         self, target_frame: str, base_frame: str

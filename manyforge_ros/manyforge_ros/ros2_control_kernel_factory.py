@@ -77,7 +77,14 @@ def create_ros2_control_kernel(
         kernel_config["runtime_dynamic_body_max_age_cap_ns"] = (
             runtime_dynamic_body_max_age_cap_ns
         )
-    for key in ("streaming_ik_timeout_s", "streaming_ik_timeout_ms"):
+    for key in (
+        "streaming_ik_timeout_s",
+        "streaming_ik_timeout_ms",
+        "streaming_collision_timeout_s",
+        "streaming_collision_timeout_ms",
+        "default_fault_stop_profile",
+        "operator_stop_profile",
+    ):
         if key in config:
             kernel_config[key] = config[key]
     kernel_config_arg = kernel_config or None

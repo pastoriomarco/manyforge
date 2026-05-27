@@ -6,6 +6,7 @@ from dataclasses import replace
 import logging
 import os
 from pathlib import Path
+from typing import Any
 
 import py_trees
 import uvicorn
@@ -334,8 +335,8 @@ def _kernel_config_from_deployment(
     collision_monitor_period_ns: int | None,
     runtime_collision_query_timeout_ns: int | None,
     runtime_dynamic_body_max_age_cap_ns: int | None,
-) -> dict[str, float | int] | None:
-    config: dict[str, float | int] = {}
+) -> dict[str, Any] | None:
+    config: dict[str, Any] = {}
     if collision_monitor_period_ns is not None:
         config["collision_monitor_period_ns"] = collision_monitor_period_ns
     if runtime_collision_query_timeout_ns is not None:
@@ -352,12 +353,35 @@ def _kernel_config_from_deployment(
     for key in (
         "streaming_ik_timeout_s",
         "streaming_ik_timeout_ms",
+        "streaming_collision_timeout_s",
+        "streaming_collision_timeout_ms",
         "native_reset_completion_timeout_s",
         "native_reset_completion_timeout_ms",
         "native_streaming_stop_completion_timeout_s",
         "native_streaming_stop_completion_timeout_ms",
     ):
         if key in execution_config:
+            config[key] = execution_config[key]
+
+    # Pass the deployment-declared fault-stop and operator-stop profiles
+    # through to the C++ kernel. Both are optional; deployments not
+    # opting in see no behavior change (legacy backend.stop() path
+    # is preserved when these are unset). Recommended deployment-
+    # YAML shape under `execution.config`:
+    #
+    #   default_fault_stop_profile:
+    #     profile_id: "default_fault_spring_back"
+    #     stop_mode: "spring_back_hold"
+    #     deceleration_time_s: 0.3
+    #   operator_stop_profile:
+    #     profile_id: "operator_soft_on_path"
+    #     stop_mode: "soft_on_path"
+    #     deceleration_time_s: 0.5
+    #     per_joint_max_deceleration_rad_s2:
+    #       shoulder_pan_joint: 8.0
+    #       ...
+    for key in ("default_fault_stop_profile", "operator_stop_profile"):
+        if key in execution_config and execution_config[key] is not None:
             config[key] = execution_config[key]
 
     return config or None

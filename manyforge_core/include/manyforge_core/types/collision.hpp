@@ -337,7 +337,7 @@ struct CollisionResult {
 
 /// Contact-policy mode for entries in CollisionPolicySnapshot::support_contacts.
 ///
-/// kContactRelease is the Phase 4-P1 production mode for moves that start in
+/// kContactRelease is the production mode for moves that start in
 /// bounded contact and must prove decreasing penetration / release.
 /// kContactProcess is reserved for future force/controller-backed contact-rich
 /// applications and intentionally fails closed until sensing envelopes and

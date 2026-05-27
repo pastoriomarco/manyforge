@@ -42,6 +42,12 @@ import type {
 
 const BASE_URL = import.meta.env.VITE_API_URL || '';
 
+/**
+ * Phase 2 of issue #1 + #3 (rich error rendering): cycle command routes now
+ * return `detail: { message, errorCode, errorDetails }` instead of a single
+ * string when a kernel/cycle-manager fault is the cause. This helper keeps
+ * back-compat with the legacy string-detail shape used by other routes.
+ */
 function errorMessageFromPayload(payload: unknown, fallback: string): string {
   if (!payload || typeof payload !== 'object') {
     return fallback;
@@ -50,6 +56,12 @@ function errorMessageFromPayload(payload: unknown, fallback: string): string {
   const detail = data.detail;
   if (typeof detail === 'string' && detail.trim()) {
     return detail;
+  }
+  if (detail && typeof detail === 'object') {
+    const detailMessage = (detail as Record<string, unknown>).message;
+    if (typeof detailMessage === 'string' && detailMessage.trim()) {
+      return detailMessage;
+    }
   }
   const error = data.error;
   if (error && typeof error === 'object') {
@@ -69,15 +81,50 @@ function errorMessageFromPayload(payload: unknown, fallback: string): string {
   return fallback;
 }
 
+/**
+ * Pull the structured (errorCode, errorDetails) tuple out of an HTTPException
+ * response body when present. Returns null fields when the payload is the
+ * legacy string-detail shape. Used by the HMI to render a kernel-cause
+ * panel for cycle command rejections.
+ */
+export function structuredErrorFromPayload(payload: unknown): {
+  errorCode: string | null;
+  errorDetails: Record<string, unknown> | null;
+} {
+  if (!payload || typeof payload !== 'object') {
+    return { errorCode: null, errorDetails: null };
+  }
+  const data = payload as Record<string, unknown>;
+  const detail = data.detail;
+  if (!detail || typeof detail !== 'object') {
+    return { errorCode: null, errorDetails: null };
+  }
+  const detailObj = detail as Record<string, unknown>;
+  const code = detailObj.errorCode;
+  const details = detailObj.errorDetails;
+  return {
+    errorCode: typeof code === 'string' && code.trim() ? code : null,
+    errorDetails:
+      details && typeof details === 'object'
+        ? (details as Record<string, unknown>)
+        : null,
+  };
+}
+
 export class ApiError extends Error {
   readonly status: number;
   readonly payload: unknown;
+  readonly errorCode: string | null;
+  readonly errorDetails: Record<string, unknown> | null;
 
   constructor(message: string, status: number, payload: unknown) {
     super(message);
     this.name = 'ApiError';
     this.status = status;
     this.payload = payload;
+    const structured = structuredErrorFromPayload(payload);
+    this.errorCode = structured.errorCode;
+    this.errorDetails = structured.errorDetails;
   }
 }
 

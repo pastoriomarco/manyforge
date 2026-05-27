@@ -57,7 +57,7 @@ from manyforge_behavior.skill_loader import (
 # Composites/decorators are handled separately since they need children.
 PLUGIN_FACTORY: dict[str, type] = {
     "move_manipulator_action": MoveManipulatorAction,
-    # Phase 4.5E motion-scoped trip nodes (spec/260 §2.6). Authored
+    # Motion-scoped trip nodes (spec/260 §2.6). Authored
     # programs reference these by catalog id; constructor kwargs map
     # to the node's __init__ parameters (move_id, policy_id, stop_mode,
     # etc.). The kernel owns signal arbitration; these nodes only
@@ -392,7 +392,7 @@ class OrchestratorRunner:
         # Inject robot profile defaults for motion nodes
         if tree_node.id in (
             "move_manipulator_action",
-            # Phase 4.5E: motion-scoped trip nodes are full motion
+            # Motion-scoped trip nodes are full motion
             # nodes — they need the same robot/frame defaults injected
             # so authored programs don't have to repeat them on every
             # MoveUntilSignal / ProbeSearchMove invocation.

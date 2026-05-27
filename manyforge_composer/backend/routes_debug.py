@@ -166,6 +166,83 @@ def build_ros2_medkit_trace_payload(
     ).model_dump(by_alias=True)
 
 
+def build_collision_compare_trajectory_waypoint_payload(
+    state: ComposerState,
+    *,
+    move_id: str,
+    waypoint_index: int = 0,
+) -> dict[str, Any]:
+    """Compare legacy and ManyForge collision engines for a cached waypoint."""
+    if state.kernel is None:
+        raise HTTPException(status_code=503, detail="Kernel is not available")
+    if not hasattr(state.kernel, "get_cached_trajectory"):
+        raise HTTPException(
+            status_code=501,
+            detail="Kernel client does not expose cached trajectories",
+        )
+    if not hasattr(state.kernel, "collision_compare_positions"):
+        raise HTTPException(
+            status_code=501,
+            detail="Kernel client does not expose collision comparison",
+        )
+
+    trajectory = state.kernel.get_cached_trajectory(move_id)
+    if trajectory is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No cached trajectory for move_id '{move_id}'",
+        )
+    if waypoint_index < 0 or waypoint_index >= len(trajectory.waypoints):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "waypoint_index must be in [0, "
+                f"{max(len(trajectory.waypoints) - 1, 0)}]"
+            ),
+        )
+
+    waypoint = trajectory.waypoints[waypoint_index]
+    comparison = state.kernel.collision_compare_positions(
+        waypoint.positions_rad,
+        waypoint_index=waypoint_index,
+    )
+    return {
+        "move_id": move_id,
+        "waypoint_index": waypoint_index,
+        "time_from_start_s": waypoint.time_from_start_s,
+        "joint_names": list(trajectory.joint_names),
+        "positions_rad": list(waypoint.positions_rad),
+        "comparison": comparison,
+    }
+
+
+def build_collision_compare_positions_payload(
+    state: ComposerState,
+    *,
+    positions_rad: list[float],
+    waypoint_index: int | None = None,
+) -> dict[str, Any]:
+    """Compare legacy and ManyForge collision engines for explicit positions."""
+    if state.kernel is None:
+        raise HTTPException(status_code=503, detail="Kernel is not available")
+    if not hasattr(state.kernel, "collision_compare_positions"):
+        raise HTTPException(
+            status_code=501,
+            detail="Kernel client does not expose collision comparison",
+        )
+    if not positions_rad:
+        raise HTTPException(status_code=400, detail="positions_rad is required")
+    comparison = state.kernel.collision_compare_positions(
+        [float(value) for value in positions_rad],
+        waypoint_index=waypoint_index,
+    )
+    return {
+        "positions_rad": [float(value) for value in positions_rad],
+        "waypoint_index": waypoint_index,
+        "comparison": comparison,
+    }
+
+
 def create_debug_router(state: ComposerState) -> APIRouter:
     """Create debug/export routes."""
     router = APIRouter()
@@ -184,6 +261,33 @@ def create_debug_router(state: ComposerState) -> APIRouter:
     def debug_export_ros2_medkit(run_id: str | None = None) -> dict[str, Any]:
         """Return normalized trace export for ros2_medkit-style tooling."""
         return build_ros2_medkit_trace_payload(state, run_id=run_id)
+
+    @router.get("/collision/compare-trajectory/{move_id}")
+    def debug_collision_compare_trajectory_waypoint(
+        move_id: str,
+        waypoint_index: int = 0,
+    ) -> dict[str, Any]:
+        """Compare legacy and ManyForge collision checks for a cached waypoint."""
+        return build_collision_compare_trajectory_waypoint_payload(
+            state,
+            move_id=move_id,
+            waypoint_index=waypoint_index,
+        )
+
+    @router.post("/collision/compare-positions")
+    def debug_collision_compare_positions(request: dict[str, Any]) -> dict[str, Any]:
+        """Compare legacy and ManyForge collision checks for explicit positions."""
+        positions = request.get("positions_rad")
+        if not isinstance(positions, list):
+            raise HTTPException(status_code=400, detail="positions_rad must be a list")
+        waypoint_index = request.get("waypoint_index")
+        if waypoint_index is not None:
+            waypoint_index = int(waypoint_index)
+        return build_collision_compare_positions_payload(
+            state,
+            positions_rad=positions,
+            waypoint_index=waypoint_index,
+        )
 
     @router.post("/signals/publish")
     def debug_publish_signal(request: DebugSignalPublishRequest) -> dict[str, Any]:

@@ -271,7 +271,7 @@ TEST(CollisionValidationCoordinatorTest,
   ASSERT_EQ(bundle.waypoint_records.size(), 3u);
 }
 
-// --- Contact-release (Phase 4-P1) on the engine-backed mock -----------------
+// --- Contact-release on the engine-backed mock -----------------
 
 TEST(CollisionValidationCoordinatorTest,
      ContactReleaseFailsClosedWhenNumericClearanceMissing) {

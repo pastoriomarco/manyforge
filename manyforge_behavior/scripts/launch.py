@@ -26,8 +26,8 @@ _ROS2_CONTROL_EXECUTION_ADAPTER_IDS = {
 }
 
 
-def _native_kernel_config_from_deployment(deployment: Deployment) -> dict[str, int]:
-    config: dict[str, int] = {}
+def _native_kernel_config_from_deployment(deployment: Deployment) -> dict[str, int | float]:
+    config: dict[str, int | float] = {}
     period_ms = deployment.orchestrator.config.get("collision_monitor_period_ms")
     if period_ms is not None:
         period_ms = float(period_ms)
@@ -58,6 +58,16 @@ def _native_kernel_config_from_deployment(deployment: Deployment) -> dict[str, i
                 "orchestrator.config.runtime_dynamic_body_max_age_cap_ms must be >= 0"
             )
         config["runtime_dynamic_body_max_age_cap_ns"] = int(cap_ms * 1_000_000.0)
+    execution_adapter = deployment.adapters.get("execution")
+    execution_config = dict(execution_adapter.config or {}) if execution_adapter else {}
+    for key in (
+        "streaming_ik_timeout_s",
+        "streaming_ik_timeout_ms",
+        "streaming_collision_timeout_s",
+        "streaming_collision_timeout_ms",
+    ):
+        if key in execution_config:
+            config[key] = execution_config[key]
     return config
 
 

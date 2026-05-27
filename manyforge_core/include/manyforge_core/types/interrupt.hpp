@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <optional>
 #include <set>
 #include <string>
@@ -80,7 +81,7 @@ enum class MotionInterruptActivationMode {
 
 /// Controlled-stop mode requested by a move-scoped interrupt scope
 /// (spec/260 §5.6 Stop-profile semantics; spec/210 §3.11
-/// `MotionInterruptStopProfileDTO`). Phase 4.5D-1.
+/// `MotionInterruptStopProfileDTO`).
 ///
 /// `kSpringBackHold` is the simplest controlled halt: observed-state
 /// anchor + zero-velocity hold target. `kSoftOnPath` is a
@@ -99,7 +100,7 @@ enum class MotionInterruptStopMode {
 /// stop (spec/210 §3.11 `MotionTripOutcomeDTO.stop_command_source`).
 /// `kDiagnosticOther` is reserved for backends whose stop path does
 /// not match a named taxonomy and MUST carry a stable reason in the
-/// outcome's `diagnostics`. Phase 4.5D-1.
+/// outcome's `diagnostics`.
 enum class MotionInterruptStopCommandSource {
   kFjtPreemptHold,
   kFjtPreemptPathRamp,
@@ -114,7 +115,7 @@ enum class MotionInterruptStopCommandSource {
 /// Motion-node category metadata carried on a `MotionInterruptScopeDTO`.
 /// The kernel uses the category to enforce default fallback rules at
 /// arm time (spec/210 §3.11 conjunctive fallback rule; motion-scoped
-/// design doc §B.4 node-category defaults). Phase 4.5D-1.
+/// design doc §B.4 node-category defaults).
 enum class MotionInterruptNodeCategory {
   /// `MoveUntilSignal` and other generic search nodes. May accept any
   /// fallback the backend capability profile and policy allow.
@@ -199,6 +200,13 @@ struct InterruptSourceDefinition {
   std::optional<std::string> description;
 };
 
+// Forward declaration of `MotionInterruptStopProfileDTO` so
+// `InterruptPolicyDefinition` (below) can carry an optional
+// `stop_profile` field without creating a circular include with
+// `motion_interrupt.hpp`. The shared_ptr storage in the field below
+// is what makes the incomplete type usable.
+struct MotionInterruptStopProfileDTO;
+
 struct InterruptPolicyDefinition {
   std::string policy_id;
   std::string source_id;
@@ -222,7 +230,7 @@ struct InterruptPolicyDefinition {
   /// Applies only when `scope_kind == kMove`. Empty set means the
   /// kernel default (only `kRequireInactiveAtArm` accepted).
   std::set<MotionInterruptActivationMode> allowed_activation_modes;
-  /// Spec/260 §2.2 Phase 4.5D-1: deployment policy gate listing the
+  /// Spec/260 §2.2: deployment policy gate listing the
   /// stop modes a move-scoped scope MAY request via its
   /// `MotionInterruptStopProfileDTO.stop_mode`. REQUIRED (non-empty)
   /// when `preemption_action == kCompleteMoveOnSignal`; rejected at
@@ -231,6 +239,25 @@ struct InterruptPolicyDefinition {
   /// arm-time validation enforces both (the requested mode and every
   /// element of `allowed_fallback_modes` MUST be in BOTH sets).
   std::set<MotionInterruptStopMode> allowed_stop_modes;
+  /// Fault-stop profile policy (spec/260 §2.2). Applies only when
+  /// `preemption_action == kPreemptTrajectory`; the policy
+  /// registration is rejected if this field is set for any other
+  /// action. When present, a latch on this policy routes the preempt
+  /// through `execution_backend_.execute_controlled_stop(*stop_profile)`
+  /// instead of the legacy `execution_backend_.stop()`. This extends
+  /// the controlled-stop machinery (originally defined only for
+  /// `kCompleteMoveOnSignal` desired-trip policies) to fault-session
+  /// preempts so the same `ControlledStopResultDTO` surface validates
+  /// end-to-end on the fault path. Unset means legacy preempt.
+  ///
+  /// Stored via `std::shared_ptr` because the full
+  /// `MotionInterruptStopProfileDTO` definition lives in
+  /// `motion_interrupt.hpp` which itself includes this header — using
+  /// `std::optional<MotionInterruptStopProfileDTO>` would force a
+  /// circular include. The shared_ptr works with the forward
+  /// declaration immediately above; the kernel constructs the
+  /// concrete value via `std::make_shared` at registration.
+  std::shared_ptr<MotionInterruptStopProfileDTO> stop_profile;
   std::optional<std::string> description;
 };
 

@@ -76,7 +76,7 @@ bool result_binding_key_body_char_ok(char c) {
 /// `[A-Za-z_][A-Za-z0-9_.:-]*`. Because the allowed character set is
 /// pure ASCII the byte-length and character-length coincide and we can
 /// reject any byte outside the set without a full UTF-8 decode.
-/// Phase 4.5D-1: validate the shape of a `MotionInterruptStopProfileDTO`.
+/// Validate the shape of a `MotionInterruptStopProfileDTO`.
 /// Mode-and-policy membership checks live in `build_scope_binding_locked`;
 /// this helper catches malformed fields that would otherwise pass the
 /// presence + membership gates and arm a fundamentally-broken profile.
@@ -263,7 +263,7 @@ Result<void> InterruptManager::register_policy(
     return Result<void>::Err(interrupt_error("duplicate_policy_id",
                                              "interrupt policy_id already registered"));
   }
-  // Phase 4.5D-1 defense in depth: allowed_stop_modes is only valid on
+  // Defense in depth: allowed_stop_modes is only valid on
   // complete_move_on_signal policies. Runs at the top level (independent
   // of scope_kind) so a session-scoped policy with a smuggled stop-mode
   // set is rejected at registration, not silently ignored at arm time.
@@ -274,7 +274,22 @@ Result<void> InterruptManager::register_policy(
         "allowed_stop_modes_requires_complete_move_on_signal",
         "allowed_stop_modes is only valid on complete_move_on_signal policies"));
   }
-  // Phase 4.5B: move-scoped invariants (spec/260 §2.2).
+  // Per spec/260 §2.2: `stop_profile` extends the controlled-stop
+  // machinery to fault-session preempts. It is meaningful only on
+  // `kPreemptTrajectory`;
+  // any other action with this field set is a configuration error.
+  // Defense-in-depth check at registration, mirroring the
+  // `allowed_stop_modes` gate above: a smuggled `stop_profile` on a
+  // `kLatchHeld` or `kCompleteMoveOnSignal` policy would otherwise
+  // sit ignored, masking the operator's intent.
+  if (policy.stop_profile &&
+      policy.preemption_action !=
+          InterruptPreemptionAction::kPreemptTrajectory) {
+    return Result<void>::Err(interrupt_error(
+        "stop_profile_requires_preempt_trajectory",
+        "stop_profile is only valid on preempt_trajectory policies"));
+  }
+  // Move-scoped invariants (spec/260 §2.2).
   if (auto vr = validate_move_scoped_policy_locked(policy); !vr.ok()) {
     return Result<void>::Err(vr.error());
   }
@@ -331,7 +346,7 @@ Result<void> InterruptManager::validate_move_scoped_policy_locked(
             "complete_move_on_signal_requires_auto_clear_after_motion_outcome",
             "complete_move_on_signal must use post_latch_disposition=auto_clear_after_motion_outcome"));
       }
-      // Phase 4.5D-1 (spec/260 §2.2): complete_move_on_signal policies
+      // Per spec/260 §2.2: complete_move_on_signal policies
       // MUST declare a non-empty allowed_stop_modes set. The deployment
       // policy gate exists independently of any backend's capability;
       // arm-time validation enforces both. Without this, a malformed
@@ -419,7 +434,7 @@ InterruptIngestResult InterruptManager::ingest_batch(
 
   std::lock_guard<std::mutex> lock(mutex_);
   for (const auto& update : updates) {
-    // Phase 4.5B: source-level data-quality gates (lane + freshness)
+    // Source-level data-quality gates (lane + freshness)
     // run before sample seeding so a stale or wrong-lane update can
     // never shift the baseline that drives activation-mode decisions
     // on armed move-scoped bindings. "No matching policy" is NOT a
@@ -564,7 +579,7 @@ InterruptIngestResult InterruptManager::ingest_batch(
   result.events.insert(result.events.end(), first.events.begin(), first.events.end());
   result.active_latch = first.active_latch;
 
-  // Phase 4.5B: when the winning latch is a move-scoped desired trip,
+  // When the winning latch is a move-scoped desired trip,
   // same-window losing candidates that are themselves move-scoped trips
   // emit `motion_trip_secondary_signal` and are NOT queued. Operator
   // dispositioning does not apply to desired-trip outcomes (spec/260
@@ -819,7 +834,7 @@ Result<InterruptManager::ResolvedPolicy> InterruptManager::resolve_policy_locked
     if (!policy.affected_phases.contains(context.phase)) {
       continue;
     }
-    // Phase 4.5B: move-scoped policies are inactive unless armed for
+    // Move-scoped policies are inactive unless armed for
     // the active execution+move, and the binding's activation mode
     // must permit a latch given the current update.
     if (policy.scope_kind == InterruptPolicyScopeKind::kMove) {
@@ -946,7 +961,7 @@ InterruptIngestResult InterruptManager::ingest_resolved_locked(
       active_policy ? active_policy->priority.value_or(
                           sources_.at(active_latch_->source_id).priority)
                     : 0;
-  // Phase 4.5B (spec/260 §7): when both the active latch and the
+  // Per spec/260 §7: when both the active latch and the
   // incoming candidate are move-scoped desired-trip policies, the
   // arbitration loser emits `motion_trip_secondary_signal` and is
   // dropped (not queued). Move-scoped desired-trip outcomes don't
@@ -1047,7 +1062,7 @@ InterruptLatch InterruptManager::make_latch_locked(
   } else {
     latch.preemption_result = InterruptPreemptionResult::kPending;
   }
-  // Phase 4.5B: when the matched policy is move-scoped, link the latch
+  // When the matched policy is move-scoped, link the latch
   // to its armed binding via scope_id so the kernel can correlate the
   // outcome record (spec/260 §2.4).
   if (resolved.policy.scope_kind == InterruptPolicyScopeKind::kMove) {
@@ -1170,7 +1185,7 @@ bool InterruptManager::disposition_allowed(
       return disposition.action == InterruptDispositionAction::kReset ||
              disposition.action == InterruptDispositionAction::kHold;
     case kAutoClearAfterMotionOutcome:
-      // Phase 4.5B / spec/260 §5.6: the latch clears automatically
+      // Per spec/260 §5.6: the latch clears automatically
       // after the motion-outcome record is durable. Operator
       // disposition is not used; only Reset is accepted from the
       // disposition surface (it's the kernel-level escape hatch).
@@ -1193,7 +1208,12 @@ std::optional<InterruptPolicyDefinition> InterruptManager::active_policy_locked(
   return it->second;
 }
 
-// ----- Phase 4.5B: motion-scoped binding lifecycle (spec/260 §2.6) -----
+std::optional<InterruptPolicyDefinition> InterruptManager::active_policy() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return active_policy_locked();
+}
+
+// ----- Motion-scoped binding lifecycle (spec/260 §2.6) -----
 
 void InterruptManager::update_source_sample_locked(
     const InterruptSignalUpdate& update) {
@@ -1310,7 +1330,7 @@ InterruptManager::build_scope_binding_locked(
         "motion_interrupt_activation_mode_not_allowed",
         "policy default only accepts require_inactive_at_arm"));
   }
-  // Phase 4.5D-1 (spec/260 §5.6 + spec/210 §3.11): pre-dispatch
+  // Per spec/260 §5.6 + spec/210 §3.11: pre-dispatch
   // policy-level capability validation. The kernel layer adds the
   // backend-capability check on top. Three independent gates here:
   //   1. complete_move_on_signal MUST carry a MotionInterruptStopProfileDTO.
@@ -1327,12 +1347,12 @@ InterruptManager::build_scope_binding_locked(
           "complete_move_on_signal scope MUST carry a MotionInterruptStopProfileDTO"));
     }
     const auto& profile = *scope.stop_profile;
-    // Phase 4.5D-1 (codex review follow-up): shape-validate the profile
-    // before membership checks. A profile that passes presence + mode
-    // membership but carries an empty profile_id, non-positive timing
-    // fields, missing soft_on_path ramp duration, or
-    // require_backend_confirmation=false would otherwise reach the
-    // 4.5D-2 dispatch path and fail mid-execution. Fail closed here.
+    // Shape-validate the profile before membership checks. A profile
+    // that passes presence + mode membership but carries an empty
+    // profile_id, non-positive timing fields, missing soft_on_path
+    // ramp duration, or require_backend_confirmation=false would
+    // otherwise reach the dispatch path and fail mid-execution. Fail
+    // closed here.
     if (auto shape_error = validate_stop_profile_shape(profile)) {
       return Result<ActiveScopeBinding>::Err(interrupt_error(
           *shape_error,

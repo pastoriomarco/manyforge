@@ -1259,7 +1259,7 @@ class TestProgramValidation:
             Program(path, catalog)
         os.unlink(path)
 
-    # ----- Phase 4.5E follow-up: scoped motion node validation parity -----
+    # ----- Scoped motion node validation parity -----
 
     @staticmethod
     def _scoped_program(*, node_id: str, params: dict, profile: str = "v0.2") -> dict:

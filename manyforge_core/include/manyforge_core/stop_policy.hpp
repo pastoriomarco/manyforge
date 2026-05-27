@@ -17,6 +17,11 @@ class StopPolicy {
  public:
   using CacheInvalidationCallback = std::function<void()>;
   using StopCallback = std::function<void()>;
+  /// Fired after the scheduled Stopping → Paused transition completes
+  /// inside `request_pause`. Lets the kernel emit the
+  /// `state_transition(Paused)` event of the spec/230 §6.1 pause chain
+  /// without polling.
+  using PauseCompletedCallback = std::function<void()>;
 
   StopPolicy(ExecutionStateMachine& sm, IScheduler& scheduler, IClock& clock,
              CacheInvalidationCallback on_invalidate = nullptr);
@@ -46,6 +51,7 @@ class StopPolicy {
   Result<void> request_reset();
 
   void set_stop_callback(StopCallback callback);
+  void set_pause_completed_callback(PauseCompletedCallback callback);
   bool stop_requested() const;
 
  private:
@@ -54,6 +60,7 @@ class StopPolicy {
   IClock& clock_;
   CacheInvalidationCallback on_invalidate_;
   StopCallback stop_callback_;
+  PauseCompletedCallback pause_completed_callback_;
   mutable std::mutex mutex_;
   bool stop_requested_{false};
   ScheduleHandle pending_soft_stop_{0};

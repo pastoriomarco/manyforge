@@ -205,6 +205,13 @@ void Ros2ControlExecutionBackend::validate_config() const {
           "soft_on_path_max_jerk_rad_s3 entries must have non-empty joint names and finite positive values");
     }
   }
+  if (config_.execution_state_source_mode != "authored_preview" &&
+      config_.execution_state_source_mode != "commanded_sim" &&
+      config_.execution_state_source_mode != "observed_ros2" &&
+      config_.execution_state_source_mode != "observed_robot") {
+    throw std::invalid_argument(
+        "execution_state_source_mode must be one of authored_preview, commanded_sim, observed_ros2");
+  }
   if (config_.execution_state_source_mode == "commanded_sim" &&
       config_.initial_joint_positions_rad.size() != config_.required_joints.size()) {
     throw std::invalid_argument(
@@ -422,7 +429,7 @@ void Ros2ControlExecutionBackend::on_action_result(
       return;
     }
     result_received_ = true;
-    // Phase 4.5D-4: persist the raw result code so a parallel
+    // Persist the raw result code so a parallel
     // `execute_controlled_stop(kHardDeceleration)` can verify the
     // cancel was actually honored. The stop_requested branch below
     // collapses SUCCEEDED + CANCELED into "stopped"; the raw code is
@@ -944,13 +951,27 @@ void Ros2ControlExecutionBackend::publish_snapshot(
     core::ExecutionState state,
     double progress,
     const std::vector<double>& joint_positions,
-    std::optional<core::ErrorDTO> error) {
+    std::optional<core::ErrorDTO> error,
+    std::string state_source) {
   std::lock_guard<std::mutex> lock(state_mutex_);
-  snapshot_.timestamp_ns = clock_.now();
+  const auto now_ns = clock_.now();
+  snapshot_.timestamp_ns = now_ns;
   snapshot_.sequence_number++;
   snapshot_.state = state;
   snapshot_.progress = clamp_progress(progress);
   snapshot_.joint_positions_rad = joint_positions;
+  if (state_source.empty()) {
+    if (is_commanded_sim_mode()) {
+      state_source = "commanded_sim_predicted";
+    } else if (config_.execution_state_source_mode == "authored_preview") {
+      state_source = "authored_preview";
+    } else {
+      state_source = "observed_ros2";
+    }
+  }
+  snapshot_.state_source = std::move(state_source);
+  snapshot_.source_timestamp_ns = now_ns;
+  snapshot_.source_age_ns = 0;
   snapshot_.error = std::move(error);
 }
 
@@ -1493,9 +1514,9 @@ core::ExecutionHandle Ros2ControlExecutionBackend::execute_trajectory(
     std::lock_guard<std::mutex> lock(execution_mutex_);
     active_goal_handle_ = goal_handle;
     active_goal_id_ = goal_handle->get_goal_id();
-    // Phase 4.5D-4: reset the persisted action result code at each
-    // new dispatch so a fresh execute_controlled_stop call doesn't
-    // observe stale codes from the previous trajectory.
+    // Reset the persisted action result code at each new dispatch
+    // so a fresh execute_controlled_stop call doesn't observe
+    // stale codes from the previous trajectory.
     last_action_result_code_.reset();
     goal_accepted_ = true;
     execution_started_at_ = std::chrono::steady_clock::now();
@@ -1750,13 +1771,13 @@ core::StopResultDTO Ros2ControlExecutionBackend::stop() {
   return core::StopResultDTO{true, std::nullopt};
 }
 
-// Phase 4.5D-3: controlled-stop capability + result surface.
+// Controlled-stop capability + result surface.
 //
 // The ros2_control adapter exposes `kSpringBackHold` only in v1.
 // `kSoftOnPath` requires a computed replacement trajectory with
-// path-deviation evidence (4.5D-5); `kHardDeceleration` requires
+// path-deviation evidence; `kHardDeceleration` requires
 // `decelerate_on_cancel=true` + per-joint deceleration limits in the
-// controller config (4.5D-4). Declaring only the qualified mode keeps
+// controller config. Declaring only the qualified mode keeps
 // the kernel's pre-dispatch capability gate honest.
 
 core::MotionInterruptStopCapabilityDTO
@@ -2315,8 +2336,8 @@ Ros2ControlExecutionBackend::execute_controlled_stop(
     }
   }
 
-  // Phase 4.5D-4 (spec/260 §5.6 hard_deceleration): native JTC
-  // deceleration path. Cancelling the action goal triggers the
+  // spec/260 §5.6 hard_deceleration: native JTC deceleration path.
+  // Cancelling the action goal triggers the
   // controller's `decelerate_on_cancel` profile; we wait for the
   // cancel callback to terminate (running_ flips false) and then
   // read the post-stop sample and compute joint-space stop
@@ -2357,7 +2378,7 @@ Ros2ControlExecutionBackend::execute_controlled_stop(
       return result;
     }
 
-    // Phase 4.5D-4 (codex review follow-up): proof of cancel.
+    // Proof of cancel.
     // `on_action_result` collapses SUCCEEDED + CANCELED into a single
     // "stopped" branch when `stop_requested_` is set, so the only
     // place that distinction survives is the persisted raw result
@@ -2440,8 +2461,8 @@ Ros2ControlExecutionBackend::execute_controlled_stop(
     }
     result.stop_distance_rad = std::sqrt(sum_sq);
 
-    // Phase 4.5D-4 (codex review follow-up): publish the snapshot
-    // with the trajectory progress observed at the moment of cancel,
+    // Publish the snapshot with the trajectory progress observed at
+    // the moment of cancel,
     // NOT progress=1.0. The trajectory did not reach its planned
     // endpoint — `decelerate_on_cancel` stopped it mid-flight, and
     // an off-path interrupt with progress=1.0 would falsely signal
@@ -2571,8 +2592,8 @@ Ros2ControlExecutionBackend::execute_controlled_stop(
 
   result.accepted = true;
   result.backend_stop_confirmed = true;
-  // Phase 4.5D-5 (codex review follow-up #2): `executed_stop_mode`
-  // MUST describe the physical behavior the controller exhibited, not
+  // `executed_stop_mode` MUST describe the physical behavior the
+  // controller exhibited, not
   // the requested mode. The scaffold dispatch is functionally
   // identical to spring_back_hold (anchored hold at observed
   // position). Reporting `executed_stop_mode = kSoftOnPath` would let
@@ -3959,7 +3980,28 @@ Ros2ControlExecutionBackend::begin_streaming_session(
   streaming_thread_ = std::jthread(
       [this](std::stop_token st) { this->streaming_dispatch_worker(st); });
 
-  publish_snapshot(core::ExecutionState::kStreaming, 0.0, {});
+  std::vector<double> snapshot_positions;
+  if (is_commanded_sim_mode()) {
+    snapshot_positions.reserve(config_.required_joints.size());
+    for (const auto& joint : config_.required_joints) {
+      auto position = scene_group_joint_position(group_name_, joint);
+      if (!position.has_value()) {
+        snapshot_positions.clear();
+        break;
+      }
+      snapshot_positions.push_back(*position);
+    }
+    if (snapshot_positions.empty() &&
+        config_.initial_joint_positions_rad.size() == config_.required_joints.size()) {
+      snapshot_positions = config_.initial_joint_positions_rad;
+    }
+  }
+  publish_snapshot(core::ExecutionState::kStreaming, 0.0,
+                   snapshot_positions,
+                   std::nullopt,
+                   is_commanded_sim_mode()
+                       ? "commanded_sim_predicted_streaming_begin"
+                       : "");
 
   result.accepted = true;
   result.session_id = session_id;
@@ -3971,6 +4013,7 @@ Ros2ControlExecutionBackend::push_streaming_target(
     uint64_t session_id,
     const core::StreamingTargetDTO& target) {
   core::StreamingPushResultDTO result;
+  std::vector<double> commanded_sim_positions;
 
   {
     std::lock_guard<std::mutex> lock(streaming_mutex_);
@@ -4008,10 +4051,22 @@ Ros2ControlExecutionBackend::push_streaming_target(
     }
     streaming_target_ = target;
     result.backend_sequence = next_streaming_backend_seq_++;
+    if (is_commanded_sim_mode() &&
+        target.kind == core::StreamingInputMode::kJoint &&
+        target.joint_positions_rad.size() == config_.required_joints.size()) {
+      commanded_sim_positions = target.joint_positions_rad;
+    }
   }
   streaming_cv_.notify_all();
 
   result.accepted = true;
+  if (!commanded_sim_positions.empty()) {
+    update_scene_positions(commanded_sim_positions, SceneUpdateMode::kBestEffort);
+    publish_snapshot(core::ExecutionState::kStreaming, 0.0,
+                     commanded_sim_positions,
+                     std::nullopt,
+                     "commanded_sim_predicted_streaming_target");
+  }
   return result;
 }
 

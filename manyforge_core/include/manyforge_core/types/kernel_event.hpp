@@ -60,7 +60,7 @@ enum class KernelEventType {
   kInterruptSourceClassViolation,
   kInterruptRecoveryHandlerStarted,
   kInterruptRecoveryHandlerCompleted,
-  // Phase 4.5C: motion-scoped interrupt outcomes (spec/260 §7).
+  // Motion-scoped interrupt outcomes (spec/260 §7).
   // `motion_interrupt_scope_armed` / `motion_interrupt_scope_reaped`
   // surface the binding lifecycle. `motion_interrupt_queued_update_dropped`
   // and `motion_trip_secondary_signal` come from the manager. Arm-time

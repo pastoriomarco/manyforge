@@ -19,6 +19,9 @@ struct ExecutionSnapshot {
   ExecutionState state = ExecutionState::kIdle;
   double progress = 0.0;
   std::vector<double> joint_positions_rad;
+  std::string state_source;
+  int64_t source_timestamp_ns = 0;
+  int64_t source_age_ns = 0;
   std::optional<ErrorDTO> error;
 };
 
@@ -32,7 +35,9 @@ struct ExecutionHandle {
 /// Stop result (spec 220 §4.2)
 struct StopResultDTO {
   bool accepted = false;
-  std::optional<ErrorDTO> error;  // present when accepted is false
+  // Present when the stop command failed or completed through a degraded
+  // fallback path that the operator/audit trail must see.
+  std::optional<ErrorDTO> error;
 };
 
 /// Pause result (spec 220 §4.2)
@@ -72,6 +77,16 @@ struct AcknowledgeCompletedResultDTO {
 /// about whether an ack is appropriate; the kernel only enforces
 /// "explicit, traceable, fail-closed on other states".
 struct AcknowledgeInterventionResultDTO {
+  bool accepted = false;
+  std::optional<ErrorDTO> error;
+};
+
+/// Explicit acknowledgement of an interrupted execution for operator retry.
+///
+/// Unlike Reset, this must not command or reset the execution backend. It is
+/// used when a fault interrupt stopped a motion, the operator fixed the
+/// condition, and Run means "retry from the current observed robot state".
+struct AcknowledgeInterruptedResultDTO {
   bool accepted = false;
   std::optional<ErrorDTO> error;
 };

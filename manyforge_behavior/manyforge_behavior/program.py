@@ -789,7 +789,7 @@ def _validate_tree_node_semantics(
 ) -> list[TreeValidationIssue]:
     issues: list[TreeValidationIssue] = []
 
-    # Phase 4.5E follow-up: scoped motion trip nodes share the same
+    # Scoped motion trip nodes share the same
     # motion-goal shape as `move_manipulator_action` (they declare the
     # full parameter set in the catalog for motion-field parity). The
     # original validator only covered `move_manipulator_action`, so

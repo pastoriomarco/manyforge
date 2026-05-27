@@ -42,8 +42,8 @@ struct Ros2ControlExecutionBackendConfig {
   // the replacement stop trajectory and violate wall-time deceleration_time_s.
   bool enable_jtc_speed_scaling_input = true;
 
-  // Phase 4.5D-4: kHardDeceleration capability evidence (spec/260
-  // §5.6 + ROS2_CONTROL_EXECUTION_ADAPTER_PLAN.md). The backend only
+  // kHardDeceleration capability evidence (spec/260 §5.6 +
+  // ROS2_CONTROL_EXECUTION_ADAPTER_PLAN.md). The backend only
   // advertises `kHardDeceleration` to the kernel when ALL THREE of
   // the following preconditions hold; deployments whose controller
   // configuration does not meet them MUST leave these fields at
@@ -64,9 +64,9 @@ struct Ros2ControlExecutionBackendConfig {
   std::set<std::string> velocity_state_interface_joints;
   std::map<std::string, double> max_deceleration_on_cancel_rad_s2;
 
-  // Phase 4.5G: production path-ramp gate. This may advertise
-  // `kSoftOnPath` only when JTC speed-scaling input is disabled above;
-  // otherwise the controller can stretch the stop ramp. The D-5 scaffold
+  // Production path-ramp gate. This may advertise `kSoftOnPath` only
+  // when JTC speed-scaling input is disabled above; otherwise the
+  // controller can stretch the stop ramp. The experimental scaffold
   // remains available through `enable_soft_on_path_experimental` below.
   bool enable_soft_on_path_path_ramp = false;
   double soft_on_path_stop_traj_delta_s = 0.05;
@@ -76,7 +76,7 @@ struct Ros2ControlExecutionBackendConfig {
   std::map<std::string, double> soft_on_path_max_jerk_rad_s3;
   bool allow_soft_on_path_model_velocity_fallback = false;
 
-  // Phase 4.5D-5: production-disabled scaffold. When true and the production
+  // Production-disabled scaffold. When true and the production
   // path-ramp gate above is not active, the backend advertises `kSoftOnPath`
   // with an `_experimental` capability id and physically executes
   // spring_back_hold through explicit fallback gating.

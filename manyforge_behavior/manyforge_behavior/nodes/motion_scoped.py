@@ -1,4 +1,4 @@
-"""Phase 4.5E motion-scoped interrupt behavior-tree nodes.
+"""Motion-scoped interrupt behavior-tree nodes.
 
 `MoveUntilSignal` and `ProbeSearchMove` submit scoped execute requests
 to the kernel (spec/260 §2.6 + spec/210 §3.10), wait for the terminal
@@ -29,7 +29,7 @@ Both nodes write the terminal outcome to a blackboard key
 nodes can branch on details (executed stop mode, stop snapshot, etc.)
 without re-querying the kernel.
 
-Motion-field parity (codex review follow-up #2): these nodes mirror
+Motion-field parity: these nodes mirror
 `MoveManipulatorAction` for velocity/acceleration scale, TCP linear
 cap, joint/translation/rotation tolerances, planning/execution
 timeouts, cache mode, blackboard pose-goal/relative-move resolution,
@@ -122,8 +122,7 @@ class _MotionScopedBase(py_trees.behaviour.Behaviour):
         self._scope_outcome_key = str(
             kwargs.get("scope_outcome_key", "motion_scope_outcome")
         )
-        # Phase 4.5E (codex review follow-up #2): motion-field parity
-        # with MoveManipulatorAction. Without these, scoped nodes
+        # Motion-field parity with MoveManipulatorAction. Without these, scoped nodes
         # would silently use kernel defaults for tolerances /
         # acceleration / timeouts / cache mode / TCP cap, and authored
         # programs could not control them per-move.

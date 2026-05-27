@@ -65,7 +65,7 @@ def _create_bundle(
         "start_tolerance_rad": 0.05,
         "final_tolerance_rad": 0.05,
         "require_fresh_state_before_planning": True,
-        "execution_state_source_mode": "observed_test",
+        "execution_state_source_mode": "observed_ros2",
     }
     if config_overrides:
         config.update(config_overrides)

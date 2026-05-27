@@ -156,6 +156,38 @@ def test_scene_state_reports_visual_snapshot_pending_without_live_fallback():
     assert "snapshot_read" in diagnostics["timings_ms"]
 
 
+def test_scene_state_pending_robot_includes_authority_metadata():
+    class AuthorityKernel(MockKernelClient):
+        def get_execution_snapshot(self):
+            return ExecutionSnapshot(
+                joint_positions_rad=[0.25],
+                state_source="commanded_sim_predicted_streaming_target",
+                source_timestamp_ns=123_456,
+                source_age_ns=789,
+            )
+
+    kernel = AuthorityKernel(joint_names=["joint_a"])
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state.program = SimpleNamespace(
+        robot=SimpleNamespace(base_frame="base_link", tcp_frame="tool0", base_pose={}),
+        scene=[],
+    )
+    state.deployment = SimpleNamespace(
+        robot_config=SimpleNamespace(robot_id="toy", group_id="arm"),
+        adapters={},
+        grippers={},
+    )
+    state.ensure_visual_state_publisher = lambda builder, period_s: None
+
+    payload = routes_scene.build_scene_state_payload(state)
+
+    assert payload["visual_state_diagnostics"]["mode"] == "visual_snapshot_pending"
+    assert payload["robot"]["joint_positions"] == {"joint_a": 0.25}
+    assert payload["robot"]["state_source"] == "commanded_sim_predicted_streaming_target"
+    assert payload["robot"]["source_timestamp_ns"] == 123_456
+    assert payload["robot"]["source_age_ns"] == 789
+
+
 @_REQUIRES_PINOCCHIO_VISUAL_FK
 def test_scene_state_visual_snapshot_fk_uses_independent_model_when_enabled(
     monkeypatch: pytest.MonkeyPatch,
@@ -170,7 +202,12 @@ def test_scene_state_visual_snapshot_fk_uses_independent_model_when_enabled(
             super().__init__(joint_names=["joint_a"])
 
         def get_execution_snapshot(self):
-            return ExecutionSnapshot(joint_positions_rad=[math.pi / 2.0])
+            return ExecutionSnapshot(
+                joint_positions_rad=[math.pi / 2.0],
+                state_source="commanded_sim_predicted_streaming_target",
+                source_timestamp_ns=123_000_000,
+                source_age_ns=4_000_000,
+            )
 
         def get_link_poses(self, link_names: list[str], reference_frame: str):
             raise AssertionError("visual snapshot must not use legacy kernel FK")
@@ -213,6 +250,9 @@ def test_scene_state_visual_snapshot_fk_uses_independent_model_when_enabled(
         [1.0, 0.0, 0.0],
         abs=1e-6,
     )
+    assert payload["robot"]["state_source"] == "commanded_sim_predicted_streaming_target"
+    assert payload["robot"]["source_timestamp_ns"] == 123_000_000
+    assert payload["robot"]["source_age_ns"] == 4_000_000
     link_pose = payload["link_poses"]["link_1"]
     assert link_pose["position_m"] == pytest.approx([1.0, 0.0, 0.0])
     assert link_pose["orientation_xyzw"][2] == pytest.approx(math.sqrt(0.5), abs=1e-6)
@@ -526,6 +566,9 @@ def test_scene_routes_read_cached_visual_snapshot_without_backend_calls(
                 tcp_frame="tool0",
                 joint_names=["joint_a"],
                 joint_positions={"joint_a": 0.0},
+                state_source="commanded_sim_predicted",
+                source_timestamp_ns=456,
+                source_age_ns=7,
             ),
             link_poses={
                 "base_link": {
@@ -546,6 +589,9 @@ def test_scene_routes_read_cached_visual_snapshot_without_backend_calls(
     assert state_payload["visual_state_diagnostics"]["served_from_visual_snapshot"] is True
     assert state_payload["visual_state_diagnostics"]["snapshot_sequence_number"] == 42
     assert state_payload["robot"]["robot_id"] == "toy"
+    assert state_payload["robot"]["state_source"] == "commanded_sim_predicted"
+    assert state_payload["robot"]["source_timestamp_ns"] == 456
+    assert state_payload["robot"]["source_age_ns"] == 7
     frames = {frame["name"]: frame for frame in frames_payload["frames"]}
     assert frames["base_link"]["poseAvailable"] is True
     assert (

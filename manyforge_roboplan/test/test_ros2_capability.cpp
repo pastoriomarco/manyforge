@@ -2,7 +2,7 @@
 
 #include <manyforge_roboplan/ros2_control_capability.hpp>
 
-// Phase 4.5D-4 (spec/260 §5.6): the ros2_control adapter's
+// spec/260 §5.6: the ros2_control adapter's
 // motion-interrupt stop capability is computed by a pure helper that
 // inspects the deployment's Ros2ControlExecutionBackendConfig. The
 // helper is callable without ROS so deployments can audit which stop
@@ -104,8 +104,8 @@ TEST(Ros2CapabilityTest,
 
 TEST(Ros2CapabilityTest,
      EmptyRequiredJointsReportsInvalidConfigWithEmptyCapability) {
-  // Phase 4.5D-4 (codex review follow-up): empty required_joints is
-  // a runtime-rejected misconfiguration. The audit-facing helper MUST
+  // Empty required_joints is a runtime-rejected misconfiguration.
+  // The audit-facing helper MUST
   // report an empty capability set with a dedicated invalid-config
   // profile id so deployment tools can distinguish "deployment cannot
   // start" from "deployment can start but does not declare a mode."
@@ -146,8 +146,8 @@ TEST(Ros2CapabilityTest,
 
 TEST(Ros2CapabilityTest,
      SoftOnPathOmittedByDefault) {
-  // Phase 4.5D-5: kSoftOnPath is production-disabled by default. A
-  // config that has not opted in MUST NOT advertise the mode, so the
+  // kSoftOnPath is production-disabled by default. A config that has
+  // not opted in MUST NOT advertise the mode, so the
   // kernel arm-time gate rejects any scope requesting it.
   auto cfg = base_config();
   // Even with full hard_decel evidence, soft_on_path stays off.
@@ -164,8 +164,8 @@ TEST(Ros2CapabilityTest,
 
 TEST(Ros2CapabilityTest,
      SoftOnPathAdvertisedWhenExperimentalOptInSet) {
-  // 4.5D-5: when the deployment opts in explicitly (after running the
-  // 4.5F qualification fixture on its controller), the mode appears
+  // When the deployment opts in explicitly (after running the
+  // qualification fixture on its controller), the mode appears
   // in the capability set with a profile id that includes the
   // experimental tag so audit tools can tell.
   auto cfg = base_config();
@@ -182,8 +182,8 @@ TEST(Ros2CapabilityTest,
 
 TEST(Ros2CapabilityTest,
      SoftOnPathPathRampOmittedWhenJtcSpeedScalingInputEnabled) {
-  // Phase 4.5G: real path-ramp dispatch cannot be advertised while
-  // the adapter also publishes JTC speed_scaling_input, because that
+  // Real path-ramp dispatch cannot be advertised while the adapter
+  // also publishes JTC speed_scaling_input, because that
   // controller-side scale can stretch the replacement stop trajectory.
   auto cfg = base_config();
   cfg.enable_soft_on_path_path_ramp = true;
@@ -249,9 +249,9 @@ TEST(Ros2CapabilityTest,
 
 TEST(Ros2CapabilityTest,
      SoftOnPathAndHardDecelerationCombinedProfileId) {
-  // Fully qualified deployment (4.5D-4 evidence + 4.5D-5 opt-in):
-  // both modes advertised, profile id reflects the combination so
-  // qualification audit can identify it.
+  // Fully qualified deployment (hard_deceleration evidence +
+  // soft_on_path opt-in): both modes advertised, profile id
+  // reflects the combination so qualification audit can identify it.
   auto cfg = base_config();
   cfg.decelerate_on_cancel = true;
   cfg.velocity_state_interface_joints = {"j1", "j2", "j3"};

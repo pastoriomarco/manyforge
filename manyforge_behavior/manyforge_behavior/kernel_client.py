@@ -35,7 +35,7 @@ class GripperCommandState(Enum):
 
 @dataclass
 class MotionInterruptStopProfile:
-    """Phase 4.5D-1: controlled-stop profile carried by a motion-scoped
+    """Controlled-stop profile carried by a motion-scoped
     interrupt scope (mirrors `MotionInterruptStopProfileDTO` in
     spec/210 §3.11). `stop_mode` is one of "spring_back_hold",
     "soft_on_path", or "hard_deceleration"."""
@@ -53,7 +53,7 @@ class MotionInterruptStopProfile:
 
 @dataclass
 class MotionInterruptScope:
-    """Phase 4.5B/D: per-move binding that arms a `kMove`-scoped
+    """Per-move binding that arms a `kMove`-scoped
     interrupt policy for exactly one execute request (spec/260 §2.6).
     `node_category` is one of "generic" (default; MoveUntilSignal) or
     "precision_contact" (ProbeSearchMove). `activation_mode` is one of
@@ -73,7 +73,7 @@ class MotionInterruptScope:
 
 @dataclass
 class MotionTripOutcome:
-    """Phase 4.5A/D: successful signal_trip outcome carried inside a
+    """Successful signal_trip outcome carried inside a
     `MotionExecutionOutcome`. Mirrors `MotionTripOutcomeDTO`."""
 
     latch_id: str = ""
@@ -95,7 +95,7 @@ class MotionTripOutcome:
 
 @dataclass
 class MotionExecutionOutcome:
-    """Phase 4.5A: immutable terminal outcome for one motion execution
+    """Immutable terminal outcome for one motion execution
     (mirrors `MotionExecutionOutcomeDTO`, spec/210 §3.11). The kernel
     emits one per terminal execution; behavior-tree nodes consume it
     via `KernelClient.get_execution_outcome(execution_id)`."""
@@ -132,7 +132,7 @@ class ExecuteRequest:
     planning_timeout_s: float = 2.0
     execution_timeout_s: float = 10.0
     cache_mode: str = "default"
-    # Phase 4.5: per-move bindings that arm move-scoped interrupt
+    # Per-move bindings that arm move-scoped interrupt
     # policies (spec/210 §3.10 + spec/260 §2.6). Empty list preserves
     # free-move semantics; non-empty arms each scope atomically with
     # dispatch and reaps on every terminal execution state.
@@ -156,6 +156,9 @@ class ExecutionSnapshot:
     state: ExecutionState = ExecutionState.IDLE
     progress: float = 0.0
     joint_positions_rad: List[float] = field(default_factory=list)
+    state_source: str = ""
+    source_timestamp_ns: int = 0
+    source_age_ns: int = 0
     error: Optional[str] = None
     error_code: Optional[str] = None
     error_details: Dict[str, str] = field(default_factory=dict)
@@ -240,6 +243,7 @@ class StreamingPushResult:
     backend_sequence: int = 0
     error: Optional[str] = None
     error_code: Optional[str] = None
+    error_details: Dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -552,6 +556,19 @@ class KernelClient(ABC):
         """
         ...
 
+    def acknowledge_interrupted_for_retry(
+        self, principal_id: str, reason: str
+    ) -> CommandResult:
+        """Clear an interrupted runtime-collision latch for operator retry.
+
+        This differs from reset(): it must not command the backend or reset
+        scene/robot state. Unsupported clients fail closed.
+        """
+        return CommandResult(
+            accepted=False,
+            error="acknowledge_interrupted_for_retry not supported by this kernel client",
+        )
+
     # Streaming-session API (ADR-0016). Default implementations make the new
     # surface optional for backends that don't support it; the kernel-bound
     # clients (NativeKernelClient) override with the real implementations.
@@ -605,7 +622,7 @@ class KernelClient(ABC):
     def get_execution_outcome(
         self, execution_id: int
     ) -> Optional[MotionExecutionOutcome]:
-        """Phase 4.5: return the immutable terminal MotionExecutionOutcome
+        """Return the immutable terminal MotionExecutionOutcome
         for `execution_id`, or None when no outcome has been recorded.
 
         Default returns None so kernel clients that do not yet implement
@@ -744,12 +761,13 @@ class MockKernelClient(KernelClient):
         self.pause_count = 0
         self.resume_count = 0
         self.reset_count = 0
+        self.acknowledge_interrupted_for_retry_count = 0
         self.invalidate_count = 0
         self.runtime_velocity_scale = 1.0
         self.runtime_velocity_scale_updates: List[float] = []
         self.scene_edits: List[SceneEditRequest] = []
         self.link_pose_calls: List[tuple[str, str]] = []
-        # Phase 4.5E: outcome store keyed by execution_id, populated
+        # Outcome store keyed by execution_id, populated
         # automatically when execute() returns. Tests can override the
         # default outcome shape via `next_outcome_factory`; if unset,
         # the mock emits `completed_normally` for free moves and
@@ -871,7 +889,7 @@ class MockKernelClient(KernelClient):
             self._metrics["executions_completed"] += 1
             self._emit_kernel_event("state_transition", from_state="idle", to_state="completed")
             self._emit_kernel_event("execute_completed")
-            # Phase 4.5E: stamp an outcome for the completed execution.
+            # Stamp an outcome for the completed execution.
             # Tests can override via `next_outcome_factory`; default
             # picks `no_signal_trip` for scoped moves and
             # `completed_normally` for free moves so the natural
@@ -1036,6 +1054,35 @@ class MockKernelClient(KernelClient):
         self._active_move_id = ""
         self._emit_kernel_event(
             "acknowledge_intervention",
+            details={
+                "principal_id": principal_id,
+                "reason": reason,
+                "prev_state": prev,
+            },
+        )
+        self._emit_kernel_event(
+            "state_transition", from_state=prev, to_state="idle"
+        )
+        return CommandResult(accepted=True)
+
+    def acknowledge_interrupted_for_retry(
+        self, principal_id: str, reason: str
+    ) -> CommandResult:
+        self.acknowledge_interrupted_for_retry_count += 1
+        if self._state != ExecutionState.INTERRUPTED:
+            return CommandResult(
+                accepted=False,
+                error=(
+                    "acknowledge_interrupted_for_retry is valid only from "
+                    f"INTERRUPTED; current state={self._state.value}"
+                ),
+            )
+        prev = self._state.value
+        self._state = ExecutionState.IDLE
+        self._execution_id = 0
+        self._active_move_id = ""
+        self._emit_kernel_event(
+            "acknowledge_interrupted_for_retry",
             details={
                 "principal_id": principal_id,
                 "reason": reason,

@@ -427,7 +427,7 @@ TEST(InterruptManager, EdgeDebounceRejectsSecondLatch) {
   EXPECT_EQ(result.reason, "debounced");
 }
 
-// ---------- Phase 4.5B: motion-scoped policy + manager semantics ----------
+// ---------- Motion-scoped policy + manager semantics ----------
 
 InterruptPolicyDefinition trip_policy(
     std::string policy_id,
@@ -445,16 +445,16 @@ InterruptPolicyDefinition trip_policy(
       InterruptPostLatchDisposition::kAutoClearAfterMotionOutcome;
   p.scope_kind = InterruptPolicyScopeKind::kMove;
   p.allowed_activation_modes = std::move(allowed);
-  // Phase 4.5D-1: complete_move_on_signal policies MUST declare a
-  // non-empty allowed_stop_modes set. Tests use kSpringBackHold as
+  // complete_move_on_signal policies MUST declare a non-empty
+  // allowed_stop_modes set. Tests use kSpringBackHold as
   // the simplest production-qualified mode.
   p.allowed_stop_modes = {MotionInterruptStopMode::kSpringBackHold};
   return p;
 }
 
-/// Phase 4.5D-1: build a minimal stop profile so test scopes can arm
-/// a complete_move_on_signal policy after the stop_profile_required
-/// gate landed.
+/// Build a minimal stop profile so test scopes can arm a
+/// complete_move_on_signal policy under the stop_profile_required
+/// gate.
 MotionInterruptStopProfileDTO trip_stop_profile(
     MotionInterruptStopMode mode = MotionInterruptStopMode::kSpringBackHold) {
   MotionInterruptStopProfileDTO p;
@@ -777,7 +777,7 @@ TEST(InterruptManagerMotionScopedTest,
   }
 }
 
-// -------- Phase 4.5B regression coverage for codex review findings --------
+// -------- Regression coverage --------
 
 TEST(InterruptManagerMotionScopedTest,
      ArmEventEmitsArmBaselineAgeNsAndOmitsBaselineSequenceId) {
@@ -1025,11 +1025,11 @@ TEST(InterruptManagerMotionScopedTest,
   EXPECT_FALSE(manager.active_latch().has_value());
 }
 
-// -------- Phase 4.5D-1: stop-profile + capability validation gates --------
+// -------- Stop-profile + capability validation gates --------
 
 TEST(InterruptManagerMotionScopedTest,
      PolicyRegistrationRequiresAllowedStopModesForCompleteMoveOnSignal) {
-  // Spec/260 §2.2 (Phase 4.5D-1): complete_move_on_signal policies
+  // Per spec/260 §2.2: complete_move_on_signal policies
   // MUST declare a non-empty allowed_stop_modes set. A policy that
   // omits this deployment gate is rejected at registration.
   InterruptManager manager;
@@ -1068,7 +1068,7 @@ TEST(InterruptManagerMotionScopedTest,
 
 TEST(InterruptManagerMotionScopedTest,
      ArmRejectsMoveScopedScopeMissingStopProfile) {
-  // Phase 4.5D-1: complete_move_on_signal scopes MUST carry a
+  // complete_move_on_signal scopes MUST carry a
   // MotionInterruptStopProfileDTO. Missing profile is an arm-time
   // rejection with reason `stop_profile_required`.
   InterruptManager manager;
@@ -1094,7 +1094,7 @@ TEST(InterruptManagerMotionScopedTest,
 
 TEST(InterruptManagerMotionScopedTest,
      ArmRejectsStopModeNotInPolicyAllowedSet) {
-  // Phase 4.5D-1: scope.stop_profile.stop_mode MUST be in
+  // scope.stop_profile.stop_mode MUST be in
   // policy.allowed_stop_modes.
   InterruptManager manager;
   ASSERT_TRUE(manager.register_source(source("probe")).ok());
@@ -1123,7 +1123,7 @@ TEST(InterruptManagerMotionScopedTest,
 
 TEST(InterruptManagerMotionScopedTest,
      ArmRejectsFallbackModeNotInPolicyAllowedSet) {
-  // Phase 4.5D-1: every element of stop_profile.allowed_fallback_modes
+  // Every element of stop_profile.allowed_fallback_modes
   // MUST be in policy.allowed_stop_modes.
   InterruptManager manager;
   ASSERT_TRUE(manager.register_source(source("probe")).ok());
@@ -1209,7 +1209,7 @@ TEST(InterruptManagerMotionScopedTest,
   EXPECT_EQ(manager.active_motion_interrupt_scopes().size(), 1u);
 }
 
-// -------- Phase 4.5D-1 stop-profile shape gates --------
+// -------- Stop-profile shape gates --------
 
 namespace {
 
@@ -1304,7 +1304,7 @@ TEST(InterruptManagerMotionScopedTest,
 
 TEST(InterruptManagerMotionScopedTest,
      ArmRejectsSoftOnPathProfileMissingPerJointDecelerationLimits) {
-  // Phase 4.5G: true soft_on_path cannot be armed without acceleration
+  // True soft_on_path cannot be armed without acceleration
   // evidence because the ramp planner must prove the wall-time stop
   // against per-joint limits before backend dispatch.
   InterruptManager manager;
@@ -1465,6 +1465,105 @@ TEST(InterruptManagerMotionScopedTest,
                   .arm_motion_interrupt_scopes(100, "probe_move", {scope},
                                                  1'020)
                   .ok());
+}
+
+// ----- Fault-stop profile policy registration gates -----
+
+TEST(InterruptManagerFaultStopProfileTest,
+     RegisterPolicy_PreemptTrajectoryWithStopProfile_Accepted) {
+  // Per spec/260 §2.2: a kPreemptTrajectory policy MAY carry an
+  // optional stop_profile, which routes the
+  // preempt through execute_controlled_stop instead of legacy stop.
+  InterruptManager manager;
+  ASSERT_TRUE(manager
+                  .register_source(source("runtime_collision_src", 500,
+                                          InterruptSourceClass::kFastExecutionRelevant))
+                  .ok());
+
+  auto def = policy("runtime_collision_fault_with_profile",
+                    "runtime_collision_src", 500,
+                    InterruptPreemptionAction::kPreemptTrajectory);
+  MotionInterruptStopProfileDTO sp;
+  sp.profile_id = "fault_spring_back_v1";
+  sp.stop_mode = MotionInterruptStopMode::kSpringBackHold;
+  def.stop_profile = std::make_shared<MotionInterruptStopProfileDTO>(sp);
+
+  EXPECT_TRUE(manager.register_policy(def).ok());
+}
+
+TEST(InterruptManagerFaultStopProfileTest,
+     RegisterPolicy_StopProfileOnNonPreemptTrajectory_Rejected) {
+  // Defense in depth: stop_profile on kLatchHeld / kCompleteMoveOnSignal /
+  // any non-kPreemptTrajectory action is a configuration error.
+  InterruptManager manager;
+  ASSERT_TRUE(manager.register_source(source("src", 100)).ok());
+
+  auto def = policy("hold_policy_with_profile", "src", 100,
+                    InterruptPreemptionAction::kLatchHeld);
+  MotionInterruptStopProfileDTO sp;
+  sp.profile_id = "should_not_be_here";
+  sp.stop_mode = MotionInterruptStopMode::kSpringBackHold;
+  def.stop_profile = std::make_shared<MotionInterruptStopProfileDTO>(sp);
+
+  const auto result = manager.register_policy(def);
+  ASSERT_FALSE(result.ok());
+  EXPECT_EQ(result.error().details.at("reason"),
+            "stop_profile_requires_preempt_trajectory");
+}
+
+TEST(InterruptManagerFaultStopProfileTest,
+     RegisterPolicy_NoStopProfile_LegacyBehaviorPreserved) {
+  // No-regression sanity check: deployments not opting into the
+  // fault-stop-profile surface still register policies the way they
+  // always have. This guards against the validator inadvertently
+  // requiring stop_profile on every kPreemptTrajectory policy.
+  InterruptManager manager;
+  ASSERT_TRUE(manager
+                  .register_source(source("legacy_runtime_src", 500,
+                                          InterruptSourceClass::kFastExecutionRelevant))
+                  .ok());
+
+  auto def = policy("legacy_runtime_fault", "legacy_runtime_src", 500,
+                    InterruptPreemptionAction::kPreemptTrajectory);
+  // stop_profile intentionally NOT set.
+
+  EXPECT_TRUE(manager.register_policy(def).ok());
+  EXPECT_FALSE(static_cast<bool>(def.stop_profile));
+}
+
+TEST(InterruptManagerFaultStopProfileTest,
+     ActivePolicy_ReturnsRegisteredPolicyWithStopProfile) {
+  // Verifies the new public `active_policy()` accessor the kernel uses
+  // to read the active fault policy's stop_profile on the preempt path.
+  InterruptManager manager;
+  ASSERT_TRUE(manager
+                  .register_source(source("runtime_src", 500,
+                                          InterruptSourceClass::kFastExecutionRelevant))
+                  .ok());
+  auto def = policy("runtime_fault_with_profile", "runtime_src", 500,
+                    InterruptPreemptionAction::kPreemptTrajectory);
+  MotionInterruptStopProfileDTO sp;
+  sp.profile_id = "fault_spring_back_v1";
+  sp.stop_mode = MotionInterruptStopMode::kSpringBackHold;
+  def.stop_profile = std::make_shared<MotionInterruptStopProfileDTO>(sp);
+  ASSERT_TRUE(manager.register_policy(def).ok());
+
+  // No latch yet → active_policy returns nullopt.
+  EXPECT_FALSE(manager.active_policy().has_value());
+
+  // Latch the policy. After ingest, active_policy returns it with the
+  // stop_profile intact so the kernel can route through
+  // execute_controlled_stop.
+  manager.ingest(update("runtime_src"),
+                 InterruptSourceClass::kFastExecutionRelevant,
+                 validation_context(), 2'000);
+  const auto active = manager.active_policy();
+  ASSERT_TRUE(active.has_value());
+  EXPECT_EQ(active->policy_id, "runtime_fault_with_profile");
+  ASSERT_TRUE(static_cast<bool>(active->stop_profile));
+  EXPECT_EQ(active->stop_profile->profile_id, "fault_spring_back_v1");
+  EXPECT_EQ(active->stop_profile->stop_mode,
+            MotionInterruptStopMode::kSpringBackHold);
 }
 
 }  // namespace

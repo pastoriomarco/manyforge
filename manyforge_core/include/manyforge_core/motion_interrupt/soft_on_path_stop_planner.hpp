@@ -22,7 +22,7 @@ enum class SoftOnPathStateSource {
   kModelDerived,
 };
 
-/// Trip-time state estimate for a Phase 4.5G soft-on-path stop.
+/// Trip-time state estimate for a soft-on-path stop.
 struct SoftOnPathInitialStateDTO {
   RobotStateDTO state;
   /// Optional active trajectory model time. Required when model-derived
@@ -103,7 +103,7 @@ Result<SoftOnPathStopPlanDTO> plan_soft_on_path_stop(
 
 /// Validate, before backend dispatch, that model-derived trip samples along the
 /// accepted trajectory can produce a `soft_on_path` ramp under the same planner
-/// limits. This is the Phase 4.5G plan-time feasibility envelope; it is
+/// limits. This is the plan-time feasibility envelope; it is
 /// conservative because it assumes runtime scale 1.0 for the original motion.
 Result<SoftOnPathFeasibilityEnvelopeDTO>
 validate_soft_on_path_feasibility_envelope(

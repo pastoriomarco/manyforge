@@ -90,24 +90,24 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
   core::ResetResultDTO reset() override;
   core::ExecutionSnapshot get_execution_snapshot() const override;
 
-  // Phase 4.5D-3..4.5G: controlled-stop capability + result surface
-  // for motion-scoped interrupt outcomes (spec/260 §5.6). The
-  // ros2_control adapter supports these stop modes:
-  // - `kSpringBackHold`: JTC preempt + anchored-hold (4.5D-3). Always
+  // Controlled-stop capability + result surface for motion-scoped
+  // interrupt outcomes (spec/260 §5.6). The ros2_control adapter
+  // supports these stop modes:
+  // - `kSpringBackHold`: JTC preempt + anchored-hold. Always
   //   available; cancel the active FollowJointTrajectory goal,
   //   dispatch a new goal anchored at the observed joint state with
   //   a future zero-velocity hold point, await the controller's
   //   terminal result, surface as `kFjtPreemptHold`.
-  // - `kHardDeceleration`: native JTC `decelerate_on_cancel` (4.5D-4).
+  // - `kHardDeceleration`: native JTC `decelerate_on_cancel`.
   //   Advertised only when controller-config evidence is complete
   //   (see `Ros2ControlExecutionBackendConfig` capability fields);
   //   cancel the active goal and let the controller decelerate
   //   in-place using its configured per-joint limits, surface as
   //   `kJtcCancelDecelerateOnCancel` with `stop_distance_rad`
   //   telemetry.
-  // - `kSoftOnPath`: Phase 4.5G path-ramp replacement trajectory,
-  //   advertised only when explicitly enabled and JTC speed-scaling
-  //   input is disabled. The older D-5 scaffold remains available behind
+  // - `kSoftOnPath`: path-ramp replacement trajectory, advertised
+  //   only when explicitly enabled and JTC speed-scaling input is
+  //   disabled. The older experimental scaffold remains available behind
   //   `enable_soft_on_path_experimental` and executes through explicit
   //   spring-back fallback gating.
   core::MotionInterruptStopCapabilityDTO
@@ -115,8 +115,8 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
   core::ControlledStopResultDTO execute_controlled_stop(
       const core::MotionInterruptStopProfileDTO& profile) override;
 
-  // Phase 4.5D-4: pure capability evaluation, exposed as a static so
-  // tests and deployment audit tools can verify which stop modes a
+  // Pure capability evaluation, exposed as a static so tests and
+  // deployment audit tools can verify which stop modes a
   // deployment's `Ros2ControlExecutionBackendConfig` will advertise
   // without instantiating ROS. The runtime
   // `get_motion_interrupt_stop_capability()` is just a thin wrapper
@@ -268,7 +268,8 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
   void publish_snapshot(core::ExecutionState state,
                         double progress,
                         const std::vector<double>& joint_positions,
-                        std::optional<core::ErrorDTO> error = std::nullopt);
+                        std::optional<core::ErrorDTO> error = std::nullopt,
+                        std::string state_source = "");
   core::ErrorDTO operator_intervention_error(
       core::ErrorCode code,
       std::string message,
@@ -351,7 +352,7 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
   bool resync_in_progress_ = false;
   GoalHandleFJT::SharedPtr active_goal_handle_;
   std::optional<rclcpp_action::GoalUUID> active_goal_id_;
-  // Phase 4.5D-4: the raw rclcpp_action result code from the last
+  // The raw rclcpp_action result code from the last
   // discrete-trajectory goal terminal callback. Persisted so the
   // hard_deceleration controlled-stop path can distinguish a true
   // `CANCELED` (controller honored decelerate_on_cancel) from a

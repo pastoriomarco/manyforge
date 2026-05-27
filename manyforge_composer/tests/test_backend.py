@@ -15,11 +15,21 @@ import asyncio
 import py_trees
 import yaml
 
-from manyforge_behavior.kernel_client import MockKernelClient, SceneEditRequest
+from manyforge_behavior.kernel_client import (
+    MockKernelClient,
+    SceneEditRequest,
+    Trajectory,
+    TrajectoryWaypoint,
+)
 from manyforge_behavior.cycle_manager import CycleState
 from manyforge_behavior.deployment import Deployment
 from manyforge_composer.backend.state import ComposerState
 from manyforge_composer.backend.app import create_app
+from manyforge_composer.backend.models import (
+    SceneObjectResponse,
+    SceneShapeResponse,
+    VisualSceneSnapshotResponse,
+)
 from manyforge_composer.backend.security import SecurityConfig
 from manyforge_composer.__main__ import build_program_loaded_callback
 from manyforge_composer.backend import routes_filesystem, routes_infra, routes_runtime
@@ -164,6 +174,26 @@ def test_run_no_program_409(client):
     assert response.status_code == 409
 
 
+def test_run_no_program_409_payload_is_structured(client):
+    """Rich error UX (#1 + #3): cycle-command 409 carries a structured
+    `detail.{message, errorCode, errorDetails}` payload so the HMI can
+    render a cause panel instead of a single string. Even when the cause
+    is a config-state error (no program), the errorCode must be present
+    so the panel maps to the right operator-facing hint."""
+    response = client.post("/api/cycle/run")
+    assert response.status_code == 409
+    body = response.json()
+    detail = body.get("detail")
+    assert isinstance(detail, dict), (
+        "cycle 409 detail must be a structured object, got: " + str(detail)
+    )
+    assert detail.get("message") == "No program loaded"
+    assert detail.get("errorCode") == "no_program_loaded"
+    # errorDetails is None when the cycle manager has no kernel diagnostics
+    # to attach (this case never reaches the kernel).
+    assert detail.get("errorDetails") in (None,)
+
+
 def test_stop_no_program_409(client):
     """POST /api/cycle/stop returns 409 when no program loaded."""
     response = client.post("/api/cycle/stop")
@@ -174,6 +204,39 @@ def test_reset_no_program_409(client):
     """POST /api/cycle/reset returns 409 when no program loaded."""
     response = client.post("/api/cycle/reset")
     assert response.status_code == 409
+
+
+def test_cycle_status_includes_error_fields_for_hmi(client):
+    """Rich error UX (#1 + #3): `/api/cycle/status` always returns the
+    error / errorCode / errorDetails fields so the HMI can poll one
+    endpoint and know whether to render a panel. Idle/no-program state
+    leaves them null."""
+    response = client.get("/api/cycle/status")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["state"] == "idle"
+    assert data["velocityScale"] == 1.0
+    assert "error" in data
+    assert "errorCode" in data
+    assert "errorDetails" in data
+    assert data["error"] is None
+    assert data["errorCode"] is None
+    assert data["errorDetails"] is None
+
+
+def test_kernel_snapshot_includes_structured_error_fields(client):
+    """The HMI uses `/api/kernel/snapshot.errorCode/errorDetails` to surface
+    the kernel ErrorDTO (collision pair, classification, waypoint index,
+    fault reason code, …). The fields must always be present so the
+    frontend can render the same panel shape whether or not an error is
+    active."""
+    response = client.get("/api/kernel/snapshot")
+    assert response.status_code == 200
+    data = response.json()
+    assert "error" in data
+    assert "error_code" in data
+    assert "error_details" in data
+    # Snake-case here because KernelSnapshotResponse does not use alias.
 
 
 def test_velocity_no_program_409(client):
@@ -221,6 +284,60 @@ def test_reset_from_running(client, state):
     assert response.status_code == 200
     data = response.json()
     assert data["state"] == "idle"
+
+
+def test_reset_refreshes_visual_scene_after_runtime_object_removal(client, state):
+    """Reset removes runtime objects from backend and stale observer caches."""
+    response = client.post("/api/program/load", json={"path": _PROGRAM_PATH})
+    assert response.status_code == 200
+    assert state.kernel is not None
+
+    edit = state.kernel.scene_edit(
+        SceneEditRequest(
+            operation="add",
+            object_id="wall",
+            shape_type="box",
+            box_dimensions_m=[0.1, 0.2, 0.3],
+            pose_position_m=[-0.3, 0.0, 0.4],
+            pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
+            frame_id="universe",
+        )
+    )
+    assert edit.success is True
+    refresh = state.refresh_visual_scene_objects_sync(reason="test_runtime_wall")
+    assert refresh["success"] is True
+    state.update_visual_state_snapshot(
+        VisualSceneSnapshotResponse(
+            sequence_number=42,
+            timestamp_ns=1,
+            objects=[
+                SceneObjectResponse(
+                    object_id="wall",
+                    shape=SceneShapeResponse(
+                        type="box", box_dimensions_m=[0.1, 0.2, 0.3]
+                    ),
+                    attached=False,
+                    source="runtime",
+                    persistable=False,
+                )
+            ],
+        ),
+        reason="test_stale_wall_snapshot",
+    )
+    assert any(obj.object_id == "wall" for obj in state.visual_scene_objects_snapshot()[0])
+    assert any(obj.object_id == "wall" for obj in state.visual_state_snapshot()[0].objects)
+
+    response = client.post("/api/cycle/reset")
+    assert response.status_code == 200
+    assert response.json()["state"] == "idle"
+
+    assert all(obj.object_id != "wall" for obj in state.kernel.get_scene_objects())
+    assert all(obj.object_id != "wall" for obj in state.visual_scene_objects_snapshot()[0])
+    visual_state, _meta = state.visual_state_snapshot()
+    assert visual_state is None or all(obj.object_id != "wall" for obj in visual_state.objects)
+    scene_response = client.get("/api/scene/state")
+    assert scene_response.status_code == 200
+    assert all(obj["object_id"] != "wall" for obj in scene_response.json()["objects"])
 
 
 def test_run_from_stopped():
@@ -624,7 +741,13 @@ def test_runtime_override_staged_in_direct_control_requires_reset_before_stopped
         state.cycle_manager._state = CycleState.STOPPED
         run_response = client.post("/api/cycle/run")
         assert run_response.status_code == 409
-        assert "reset the cycle first" in run_response.json()["detail"]
+        # Cycle command 409 now carries a structured detail payload
+        # ({message, errorCode, errorDetails}) so the HMI can render a
+        # cause panel; the human-readable string lives in detail.message.
+        detail = run_response.json()["detail"]
+        assert isinstance(detail, dict)
+        assert "reset the cycle first" in detail["message"]
+        assert detail["errorCode"] == "staged_overrides_blocked_resume"
 
 
 def test_runtime_override_activate_from_idle_promotes_staged_override(tmp_path):
@@ -2243,6 +2366,93 @@ def test_debug_scene_trace_endpoint_returns_backend_and_hmi_observability():
     assert data["hmi"][0]["event"] == "reconcile_render"
     assert data["objects"]
     assert "table" in data["objects"]
+
+
+def test_debug_collision_compare_trajectory_endpoint_uses_cached_waypoint():
+    """Debug endpoint compares old/new collision engines for cached waypoints."""
+
+    class CompareKernel(MockKernelClient):
+        def __init__(self):
+            super().__init__()
+            self.compared_positions = None
+            self.compared_waypoint_index = None
+
+        def get_cached_trajectory(self, move_id):
+            assert move_id == "pick_retreat"
+            return Trajectory(
+                joint_names=["joint_1", "joint_2"],
+                waypoints=[
+                    TrajectoryWaypoint(
+                        time_from_start_s=0.0,
+                        positions_rad=[0.1, 0.2],
+                    ),
+                    TrajectoryWaypoint(
+                        time_from_start_s=0.5,
+                        positions_rad=[0.3, 0.4],
+                    ),
+                ],
+            )
+
+        def collision_compare_positions(self, positions_rad, *, waypoint_index=None):
+            self.compared_positions = list(positions_rad)
+            self.compared_waypoint_index = waypoint_index
+            return {
+                "ok": True,
+                "match": False,
+                "legacy": {"in_collision": False},
+                "manyforge_collision": {"in_collision": True},
+            }
+
+    kernel = CompareKernel()
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    app = create_app(state)
+
+    with TestClient(app) as client:
+        response = client.get(
+            "/api/debug/collision/compare-trajectory/pick_retreat?waypoint_index=1"
+        )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["move_id"] == "pick_retreat"
+    assert data["waypoint_index"] == 1
+    assert data["positions_rad"] == [0.3, 0.4]
+    assert data["comparison"]["manyforge_collision"]["in_collision"] is True
+    assert kernel.compared_positions == [0.3, 0.4]
+    assert kernel.compared_waypoint_index == 1
+
+
+def test_debug_collision_compare_positions_endpoint_uses_explicit_positions():
+    """Debug endpoint accepts positions copied from a collision event."""
+
+    class CompareKernel(MockKernelClient):
+        def __init__(self):
+            super().__init__()
+            self.compared_positions = None
+
+        def collision_compare_positions(self, positions_rad, *, waypoint_index=None):
+            self.compared_positions = list(positions_rad)
+            return {
+                "ok": True,
+                "match": True,
+                "waypoint_index": waypoint_index,
+            }
+
+    kernel = CompareKernel()
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    app = create_app(state)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/debug/collision/compare-positions",
+            json={"positions_rad": [0.1, 0.2], "waypoint_index": 0},
+        )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["positions_rad"] == [0.1, 0.2]
+    assert data["comparison"]["match"] is True
+    assert kernel.compared_positions == [0.1, 0.2]
 
 
 def test_scene_snapshot_returns_503_without_hmi():

@@ -391,8 +391,8 @@ class MockExecution : public IExecutionBackend {
         true, active_streaming_session_id, std::nullopt};
   }
 
-  /// Phase 4.5D-1: test backend declares spring_back_hold + hard_deceleration
-  /// as supported. Individual tests may further customize via the
+  /// Test backend declares spring_back_hold + hard_deceleration as
+  /// supported. Individual tests may further customize via the
   /// `motion_interrupt_stop_capability` field.
   MotionInterruptStopCapabilityDTO motion_interrupt_stop_capability{
       {MotionInterruptStopMode::kSpringBackHold,
@@ -405,8 +405,8 @@ class MockExecution : public IExecutionBackend {
     return motion_interrupt_stop_capability;
   }
 
-  // Phase 4.5D-2: controlled-stop result surface. Default returns a
-  // successful native-simulated stop so trip tests using MockExecution
+  // Controlled-stop result surface. Default returns a successful
+  // native-simulated stop so trip tests using MockExecution
   // produce signal_trip outcomes; individual tests can override
   // `next_controlled_stop_result` to exercise failure / fallback paths.
   std::optional<ControlledStopResultDTO> next_controlled_stop_result;
@@ -464,9 +464,25 @@ class ControlledExecution : public IExecutionBackend {
     return Result<void>::Ok();
   }
 
+  // Failure-injection knob: when true, the next legacy
+  // `stop()` call counts the attempt but returns not-accepted so
+  // tests can exercise the "both controlled-stop and emergency-
+  // fallback failed" path without leaving the backend in an
+  // inconsistent state.
+  bool fail_next_legacy_stop = false;
+
   StopResultDTO stop() override {
     {
       std::lock_guard<std::mutex> lock(mu_);
+      if (fail_next_legacy_stop) {
+        fail_next_legacy_stop = false;
+        ++stop_count;  // record the attempt
+        return StopResultDTO{
+            false,
+            ErrorDTO{kErrorStopFailed,
+                     "injected legacy stop failure",
+                     {{"reason", "test_injected_legacy_stop_failure"}}}};
+      }
       if (!running_) {
         return StopResultDTO{
             false,
@@ -536,7 +552,7 @@ class ControlledExecution : public IExecutionBackend {
     return snapshot;
   }
 
-  /// Phase 4.5D-1: controlled-stop capability for trip tests using
+  /// Controlled-stop capability for trip tests using
   /// ControlledExecution. Mirrors MockExecution; individual tests
   /// may shrink the set to exercise capability-gate rejection.
   MotionInterruptStopCapabilityDTO motion_interrupt_stop_capability{
@@ -550,8 +566,8 @@ class ControlledExecution : public IExecutionBackend {
     return motion_interrupt_stop_capability;
   }
 
-  // Phase 4.5D-2: controlled-stop result surface. Default returns a
-  // successful native-simulated stop; trip tests override
+  // Controlled-stop result surface. Default returns a successful
+  // native-simulated stop; trip tests override
   // `next_controlled_stop_result` for failure / fallback variants.
   std::optional<ControlledStopResultDTO> next_controlled_stop_result;
   // Tests targeting the post-stop snapshot capture path can override
@@ -564,27 +580,39 @@ class ControlledExecution : public IExecutionBackend {
 
   ControlledStopResultDTO execute_controlled_stop(
       const MotionInterruptStopProfileDTO& profile) override {
+    ControlledStopResultDTO r;
+    if (next_controlled_stop_result) {
+      r = *next_controlled_stop_result;
+    } else {
+      r.accepted = true;
+      r.executed_stop_mode = profile.stop_mode;
+      r.stop_command_source =
+          MotionInterruptStopCommandSource::kNativeSimulatedStop;
+      r.backend_stop_confirmed = true;
+      r.confirmation_latency_ns = 1'000'000;
+    }
     {
       std::lock_guard<std::mutex> lock(mu_);
       ++controlled_stop_count;
       last_controlled_stop_profile = profile;
-      running_ = false;
-      snapshot.state = ExecutionState::kStopped;
-      if (next_post_stop_joint_positions_rad) {
-        snapshot.joint_positions_rad = *next_post_stop_joint_positions_rad;
+      // Only flip the backend's internal state to Stopped when the
+      // controlled-stop actually succeeded. A refused / unconfirmed /
+      // errored result means the controller did NOT actually stop,
+      // so the legacy emergency-fallback `stop()`
+      // must still find a running execution to stop. Mirror what
+      // a production backend does: a refused execute_controlled_stop
+      // leaves the running goal in flight.
+      const bool stop_succeeded =
+          r.accepted && r.backend_stop_confirmed && !r.error.has_value();
+      if (stop_succeeded) {
+        running_ = false;
+        snapshot.state = ExecutionState::kStopped;
+        if (next_post_stop_joint_positions_rad) {
+          snapshot.joint_positions_rad = *next_post_stop_joint_positions_rad;
+        }
       }
     }
     cv_.notify_all();
-    if (next_controlled_stop_result) {
-      return *next_controlled_stop_result;
-    }
-    ControlledStopResultDTO r;
-    r.accepted = true;
-    r.executed_stop_mode = profile.stop_mode;
-    r.stop_command_source =
-        MotionInterruptStopCommandSource::kNativeSimulatedStop;
-    r.backend_stop_confirmed = true;
-    r.confirmation_latency_ns = 1'000'000;
     return r;
   }
 
@@ -1634,6 +1662,9 @@ TEST_F(ExecutionKernelTest,
   policy.allowed_static_static_pairs.push_back(allowed_pair);
   collision_world_publisher.current_policy = policy;
 
+  std::vector<KernelEvent> events;
+  kernel.subscribe_events([&](const KernelEvent& e) { events.push_back(e); });
+
   execute_sync(make_test_request("classified_failure_diagnostics"));
 
   const auto snapshot = kernel.get_execution_snapshot();
@@ -1645,6 +1676,35 @@ TEST_F(ExecutionKernelTest,
             "object/box_a/shape/0 <-> robot/robot1/link/link1/collision/0");
   EXPECT_EQ(details.at("collision_result_first_failure_classification"),
             "blocking_collision");
+  EXPECT_EQ(details.at("collision_result_first_failure_joint_names"),
+            "j1,j2");
+  EXPECT_EQ(details.at("collision_result_first_failure_positions_rad"),
+            "0,0");
+  EXPECT_EQ(details.at("collision_result_first_failure_time_from_start_s"),
+            "0.000000");
+  bool found_error_event = false;
+  for (const auto& event : events) {
+    if (event.type != KernelEventType::kErrorRaised) {
+      continue;
+    }
+    ASSERT_TRUE(event.error.has_value());
+    if (event.error->code != kErrorValidationCollision) {
+      continue;
+    }
+    found_error_event = true;
+    EXPECT_EQ(
+        event.details.at("collision_result_first_failure_pair"),
+        "object/box_a/shape/0 <-> robot/robot1/link/link1/collision/0");
+    EXPECT_EQ(event.details.at("collision_result_first_failure_classification"),
+              "blocking_collision");
+    EXPECT_EQ(event.error->details.at("collision_result_first_failure_pair"),
+              event.details.at("collision_result_first_failure_pair"));
+    EXPECT_EQ(
+        event.details.at("collision_result_first_failure_positions_rad"),
+        "0,0");
+    break;
+  }
+  EXPECT_TRUE(found_error_event);
   EXPECT_EQ(execution.execute_count, 0);
 }
 
@@ -2250,6 +2310,688 @@ TEST_F(ExecutionKernelTest,
                            e.details.at("contact_b") ==
                                "robot/robot1/link/link1/collision/0";
                   }));
+}
+
+// When the deployment configures `default_fault_stop_profile`,
+// a runtime collision fault
+// must route the preempt through `execute_controlled_stop(profile)`
+// instead of the legacy `execution_backend_.stop()`. The legacy stop
+// count stays at zero; the controlled-stop count goes up by one. The
+// trip-outcome diagnostic surface (`requested_stop_mode`,
+// `executed_stop_mode`, `stop_command_source`) is carried on the
+// `kErrorRaised` event so the HMI panel can render the structured
+// cause without an extra round-trip.
+TEST_F(ExecutionKernelTest,
+       CollisionMonitoring_DefaultFaultStopProfileRoutesThroughControlledStop) {
+  ControlledExecution controlled_execution;
+  ThreadSafeFakeClock local_clock;
+  ThreadSafeManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  ExecutionKernelConfig config;
+  config.collision_monitor_period_ns = 10'000'000;
+  config.runtime_collision_query_timeout_ns = 10'000'000;
+  // The deployment opts the kernel into controlled-stop semantics for
+  // fault interrupts that don't carry a per-policy stop_profile (which
+  // includes the kernel's built-in runtime_collision_fault policy).
+  MotionInterruptStopProfileDTO fault_profile;
+  fault_profile.profile_id = "default_fault_spring_back";
+  fault_profile.stop_mode = MotionInterruptStopMode::kSpringBackHold;
+  config.default_fault_stop_profile =
+      std::make_shared<MotionInterruptStopProfileDTO>(fault_profile);
+
+  MockCollisionWorldPublisher local_collision_world;
+  auto local_collision_engine = std::make_shared<MockCollisionEngine>();
+  ExecutionKernel controlled_kernel{planner,
+                                    context,
+                                    controlled_execution,
+                                    local_clock,
+                                    local_scheduler,
+                                    local_cache,
+                                    config};
+  configure_authoritative_collision_validation(
+      controlled_kernel, local_collision_world, local_collision_engine);
+
+  auto result = controlled_kernel.execute(make_test_request());
+  ASSERT_TRUE(result.ok());
+  ASSERT_TRUE(controlled_execution.wait_until_execute_called());
+  ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kExecuting));
+  auto live_snapshot = make_test_collision_world_snapshot();
+  live_snapshot.revision =
+      CollisionWorldRevision{99, "live-scene-after-dispatch"};
+  local_collision_world.current_snapshot =
+      std::make_shared<const CollisionWorldSnapshot>(std::move(live_snapshot));
+  local_collision_engine->default_result =
+      make_authoritative_collision_result();
+  std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  local_clock.advance(10'000'000);
+  local_scheduler.advance_to(local_clock.now());
+  for (int attempt = 0;
+       attempt < 100 && controlled_execution.controlled_stop_count == 0;
+       ++attempt) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    local_scheduler.advance_to(local_clock.now());
+  }
+  bool completed = controlled_kernel.wait_for_completion(200'000'000);
+  if (!completed) {
+    controlled_execution.release();
+    completed = controlled_kernel.wait_for_completion(1'000'000'000);
+  }
+  EXPECT_TRUE(completed);
+
+  // Fault routed through controlled-stop, NOT legacy backend.stop().
+  EXPECT_EQ(controlled_execution.stop_count, 0);
+  EXPECT_EQ(controlled_execution.controlled_stop_count, 1);
+  EXPECT_EQ(controlled_execution.last_controlled_stop_profile.profile_id,
+            "default_fault_spring_back");
+  EXPECT_EQ(controlled_execution.last_controlled_stop_profile.stop_mode,
+            MotionInterruptStopMode::kSpringBackHold);
+  EXPECT_EQ(controlled_kernel.get_status().state,
+            ExecutionState::kInterrupted);
+  auto latch = controlled_kernel.get_active_interrupt_latch();
+  ASSERT_TRUE(latch.has_value());
+  EXPECT_EQ(latch->preemption_action_requested,
+            InterruptPreemptionAction::kPreemptTrajectory);
+  EXPECT_EQ(latch->preemption_result, InterruptPreemptionResult::kSucceeded);
+}
+
+// A per-policy `InterruptPolicyDefinition.stop_profile` wins over
+// the kernel-level `default_fault_stop_profile`. This lets
+// a deployment carry a kernel-wide default (e.g. spring_back_hold for
+// "generic faults") while overriding for specific fault categories
+// (e.g. soft_on_path for drift, hard_deceleration for protective
+// stops). Registration of the built-in runtime_collision_fault policy
+// happens inside `install_builtin_interrupt_sources()` and the policy
+// cannot be re-registered after the fact, so this test exercises the
+// precedence via a stand-alone user policy.
+TEST_F(ExecutionKernelTest,
+       FaultStopProfile_PerPolicyOverridesKernelDefault) {
+  ControlledExecution controlled_execution;
+  ThreadSafeFakeClock local_clock;
+  ThreadSafeManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  ExecutionKernelConfig config;
+  // Kernel-wide default would pick spring_back_hold, but the per-
+  // policy profile below requests hard_deceleration. The latter must
+  // win.
+  MotionInterruptStopProfileDTO kernel_default;
+  kernel_default.profile_id = "kernel_default_spring_back";
+  kernel_default.stop_mode = MotionInterruptStopMode::kSpringBackHold;
+  config.default_fault_stop_profile =
+      std::make_shared<MotionInterruptStopProfileDTO>(kernel_default);
+  ExecutionKernel local_kernel{planner,
+                               context,
+                               controlled_execution,
+                               local_clock,
+                               local_scheduler,
+                               local_cache,
+                               config};
+  MockCollisionWorldPublisher local_publisher;
+  auto local_engine = std::make_shared<MockCollisionEngine>();
+  configure_authoritative_collision_validation(local_kernel, local_publisher,
+                                                local_engine);
+  controlled_execution.motion_interrupt_stop_capability.supported_stop_modes =
+      {MotionInterruptStopMode::kSpringBackHold,
+       MotionInterruptStopMode::kHardDeceleration};
+
+  // Register a user fault source + policy whose per-policy stop_profile
+  // requests hard_deceleration.
+  InterruptSourceDefinition user_src;
+  user_src.source_id = "user_fault_src";
+  user_src.adapter = InterruptAdapter::kInternalTest;
+  user_src.signal = "user_fault_src_signal";
+  user_src.source_class = InterruptSourceClass::kFastExecutionRelevant;
+  user_src.kind = InterruptSourceKind::kEdge;
+  user_src.priority = 900;
+  ASSERT_TRUE(local_kernel.register_interrupt_source(user_src).ok());
+
+  InterruptPolicyDefinition user_policy;
+  user_policy.policy_id = "user_fault_with_profile";
+  user_policy.source_id = "user_fault_src";
+  user_policy.priority = 900;
+  user_policy.affected_phases = {InterruptExecutionPhase::kTrajectoryExecution};
+  user_policy.preemption_action = InterruptPreemptionAction::kPreemptTrajectory;
+  user_policy.post_latch_disposition =
+      InterruptPostLatchDisposition::kAwaitOperatorAck;
+  MotionInterruptStopProfileDTO per_policy;
+  per_policy.profile_id = "per_policy_hard_decel";
+  per_policy.stop_mode = MotionInterruptStopMode::kHardDeceleration;
+  user_policy.stop_profile =
+      std::make_shared<MotionInterruptStopProfileDTO>(per_policy);
+  ASSERT_TRUE(local_kernel.register_interrupt_policy(user_policy).ok());
+
+  auto exec_result = local_kernel.execute(make_test_request());
+  ASSERT_TRUE(exec_result.ok());
+  ASSERT_TRUE(controlled_execution.wait_until_execute_called());
+  ASSERT_TRUE(wait_for_state(local_kernel, ExecutionState::kExecuting));
+
+  // Publish the user fault signal.
+  InterruptSignalUpdate sig;
+  sig.source_id = "user_fault_src";
+  sig.sequence_id = 1;
+  sig.timestamp_ns = local_clock.now();
+  sig.value = true;
+  ASSERT_TRUE(local_kernel.publish_fast_interrupt_signal(sig).latched);
+  for (int attempt = 0;
+       attempt < 100 && controlled_execution.controlled_stop_count == 0;
+       ++attempt) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+
+  // Per-policy profile (hard_deceleration) wins; kernel default ignored.
+  EXPECT_EQ(controlled_execution.stop_count, 0);
+  EXPECT_EQ(controlled_execution.controlled_stop_count, 1);
+  EXPECT_EQ(controlled_execution.last_controlled_stop_profile.profile_id,
+            "per_policy_hard_decel");
+  EXPECT_EQ(controlled_execution.last_controlled_stop_profile.stop_mode,
+            MotionInterruptStopMode::kHardDeceleration);
+}
+
+// ExecutionKernel::stop() (the operator stop-button path)
+// routes through execute_controlled_stop(operator_stop_profile)
+// when the deployment configures one. Default unset → legacy
+// backend.stop() (no regression for deployments not opting in).
+TEST_F(ExecutionKernelTest,
+       Stop_OperatorStopProfileRoutesThroughControlledStop) {
+  ControlledExecution controlled_execution;
+  ThreadSafeFakeClock local_clock;
+  ThreadSafeManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  ExecutionKernelConfig config;
+  MotionInterruptStopProfileDTO op_profile;
+  op_profile.profile_id = "operator_stop_soft_on_path";
+  op_profile.stop_mode = MotionInterruptStopMode::kSoftOnPath;
+  // soft_on_path needs per-joint deceleration limits and a
+  // deceleration_time; provide deployment-default values.
+  op_profile.deceleration_time_s = 0.3;
+  op_profile.per_joint_max_deceleration_rad_s2 = {
+      {"j1", 8.0}, {"j2", 8.0}, {"j3", 8.0}};
+  config.operator_stop_profile =
+      std::make_shared<MotionInterruptStopProfileDTO>(op_profile);
+  ExecutionKernel local_kernel{planner,
+                               context,
+                               controlled_execution,
+                               local_clock,
+                               local_scheduler,
+                               local_cache,
+                               config};
+  MockCollisionWorldPublisher local_publisher;
+  auto local_engine = std::make_shared<MockCollisionEngine>();
+  configure_authoritative_collision_validation(local_kernel, local_publisher,
+                                                local_engine);
+  controlled_execution.motion_interrupt_stop_capability.supported_stop_modes =
+      {MotionInterruptStopMode::kSoftOnPath,
+       MotionInterruptStopMode::kSpringBackHold};
+
+  auto result = local_kernel.execute(make_test_request());
+  ASSERT_TRUE(result.ok());
+  ASSERT_TRUE(controlled_execution.wait_until_execute_called());
+  ASSERT_TRUE(wait_for_state(local_kernel, ExecutionState::kExecuting));
+
+  // Operator stop button.
+  auto stop_dto = local_kernel.stop();
+  EXPECT_TRUE(stop_dto.accepted);
+  EXPECT_EQ(controlled_execution.controlled_stop_count, 1);
+  EXPECT_EQ(controlled_execution.stop_count, 0);
+  EXPECT_EQ(controlled_execution.last_controlled_stop_profile.profile_id,
+            "operator_stop_soft_on_path");
+  EXPECT_EQ(controlled_execution.last_controlled_stop_profile.stop_mode,
+            MotionInterruptStopMode::kSoftOnPath);
+}
+
+// Emergency fallback:
+// `ExecutionKernel::stop()` must report the actual outcome of the
+// configured controlled-stop AND, on failure, immediately fall back
+// to the legacy `execution_backend_.stop()` so the robot's physical
+// stop is guaranteed. The operator-facing result distinguishes:
+//   - controlled-stop accepted+confirmed → accepted=true, no error
+//   - controlled-stop failed, legacy fallback succeeded → accepted=true
+//     with a degraded-stop diagnostic in error (audit trail)
+//   - controlled-stop failed, legacy fallback also failed → accepted=false
+TEST_F(ExecutionKernelTest,
+       Stop_OperatorProfileRefused_EmergencyLegacyFallback) {
+  ControlledExecution controlled_execution;
+  ThreadSafeFakeClock local_clock;
+  ThreadSafeManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  ExecutionKernelConfig config;
+  MotionInterruptStopProfileDTO op_profile;
+  op_profile.profile_id = "operator_soft_on_path";
+  op_profile.stop_mode = MotionInterruptStopMode::kSoftOnPath;
+  op_profile.deceleration_time_s = 0.3;
+  op_profile.per_joint_max_deceleration_rad_s2 = {{"j1", 8.0}, {"j2", 8.0}};
+  config.operator_stop_profile =
+      std::make_shared<MotionInterruptStopProfileDTO>(op_profile);
+  ExecutionKernel local_kernel{planner,
+                               context,
+                               controlled_execution,
+                               local_clock,
+                               local_scheduler,
+                               local_cache,
+                               config};
+  MockCollisionWorldPublisher local_publisher;
+  auto local_engine = std::make_shared<MockCollisionEngine>();
+  configure_authoritative_collision_validation(local_kernel, local_publisher,
+                                                local_engine);
+  controlled_execution.motion_interrupt_stop_capability.supported_stop_modes =
+      {MotionInterruptStopMode::kSpringBackHold};
+  // Backend refuses the controlled-stop (e.g. capability mismatch).
+  ControlledStopResultDTO refused;
+  refused.accepted = false;
+  refused.executed_stop_mode = MotionInterruptStopMode::kSpringBackHold;
+  refused.stop_command_source = MotionInterruptStopCommandSource::kDiagnosticOther;
+  refused.error = ErrorDTO{
+      std::string(kErrorMotionInterruptBackendStopFailed),
+      "soft_on_path not supported",
+      {{"reason", "soft_on_path_not_supported"}}};
+  controlled_execution.next_controlled_stop_result = refused;
+
+  auto exec_result = local_kernel.execute(make_test_request());
+  ASSERT_TRUE(exec_result.ok());
+  ASSERT_TRUE(controlled_execution.wait_until_execute_called());
+  ASSERT_TRUE(wait_for_state(local_kernel, ExecutionState::kExecuting));
+
+  auto stop_dto = local_kernel.stop();
+  // The controlled-stop returns not-accepted, so the kernel must
+  // emergency-fall-back to legacy backend.stop() — verify BOTH
+  // were called, and the result still reports success because the
+  // robot did physically stop via the legacy path.
+  EXPECT_EQ(controlled_execution.controlled_stop_count, 1);
+  EXPECT_EQ(controlled_execution.stop_count, 1);
+  EXPECT_TRUE(stop_dto.accepted);
+  ASSERT_TRUE(stop_dto.error.has_value());
+  EXPECT_EQ(stop_dto.error->details.at("reason"),
+            "operator_stop_profile_failed");
+  EXPECT_EQ(stop_dto.error->details.at("emergency_fallback"),
+            "legacy_stop_succeeded");
+}
+
+TEST_F(ExecutionKernelTest,
+       Stop_OperatorProfileAndLegacyBothFail_ReturnsAccepted_False) {
+  ControlledExecution controlled_execution;
+  ThreadSafeFakeClock local_clock;
+  ThreadSafeManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  ExecutionKernelConfig config;
+  MotionInterruptStopProfileDTO op_profile;
+  op_profile.profile_id = "operator_soft_on_path";
+  op_profile.stop_mode = MotionInterruptStopMode::kSoftOnPath;
+  op_profile.deceleration_time_s = 0.3;
+  op_profile.per_joint_max_deceleration_rad_s2 = {{"j1", 8.0}, {"j2", 8.0}};
+  config.operator_stop_profile =
+      std::make_shared<MotionInterruptStopProfileDTO>(op_profile);
+  ExecutionKernel local_kernel{planner,
+                               context,
+                               controlled_execution,
+                               local_clock,
+                               local_scheduler,
+                               local_cache,
+                               config};
+  MockCollisionWorldPublisher local_publisher;
+  auto local_engine = std::make_shared<MockCollisionEngine>();
+  configure_authoritative_collision_validation(local_kernel, local_publisher,
+                                                local_engine);
+  controlled_execution.motion_interrupt_stop_capability.supported_stop_modes =
+      {MotionInterruptStopMode::kSoftOnPath,
+       MotionInterruptStopMode::kSpringBackHold};
+  // Controlled-stop refused. The emergency-fallback legacy stop()
+  // also fails (e.g. the controller has disconnected mid-operation).
+  // The operator-facing result MUST surface this as a hard failure
+  // so escalation can occur — the robot may not be physically halted.
+  ControlledStopResultDTO refused;
+  refused.accepted = false;
+  refused.error = ErrorDTO{
+      std::string(kErrorMotionInterruptBackendStopFailed),
+      "soft_on_path not supported",
+      {{"reason", "soft_on_path_not_supported"}}};
+  controlled_execution.next_controlled_stop_result = refused;
+  controlled_execution.fail_next_legacy_stop = true;
+  std::vector<KernelEvent> events;
+  local_kernel.subscribe_events([&](const KernelEvent& e) {
+    events.push_back(e);
+  });
+
+  auto exec_result = local_kernel.execute(make_test_request());
+  ASSERT_TRUE(exec_result.ok());
+  ASSERT_TRUE(controlled_execution.wait_until_execute_called());
+  ASSERT_TRUE(wait_for_state(local_kernel, ExecutionState::kExecuting));
+
+  auto stop_dto = local_kernel.stop();
+  EXPECT_EQ(controlled_execution.controlled_stop_count, 1);
+  EXPECT_EQ(controlled_execution.stop_count, 1);
+  EXPECT_FALSE(stop_dto.accepted);
+  ASSERT_TRUE(stop_dto.error.has_value());
+  EXPECT_EQ(stop_dto.error->details.at("reason"),
+            "operator_stop_total_failure");
+  EXPECT_TRUE(local_kernel.wait_for_completion(1'000'000'000));
+  EXPECT_EQ(local_kernel.get_status().state,
+            ExecutionState::kInterventionRequired);
+  EXPECT_TRUE(std::any_of(events.begin(), events.end(),
+                          [](const KernelEvent& e) {
+                            return e.type == KernelEventType::kStateTransition &&
+                                   e.to_state == ExecutionState::kInterventionRequired &&
+                                   e.details.contains("reason") &&
+                                   e.details.at("reason") ==
+                                       "operator_stop_total_failure";
+                          }));
+}
+
+// Spec/230 §6.1 stop chain. Operator-stop from kExecuting MUST emit
+// the full sequence:
+//   kStopRequested → state_transition(Executing→Stopping)
+//                  → kStopIssued
+//                  → state_transition(Stopping→Stopped)
+// The intermediate kStopping transition makes the controlled-stop
+// deceleration window observable (1-2 s for soft-on-path); without
+// it the HMI cannot render "Stopping…" and trace reconstruction
+// loses the operator-intent vs backend-confirmation boundary.
+TEST_F(ExecutionKernelTest, Stop_EmitsFullEventChain_PerSpec_6_1) {
+  ControlledExecution controlled_execution;
+  FakeClock local_clock;
+  ManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  MockCollisionWorldPublisher local_collision_world;
+  auto local_collision_engine = std::make_shared<MockCollisionEngine>();
+  ExecutionKernel local_kernel{
+      planner, context, controlled_execution, local_clock,
+      local_scheduler, local_cache};
+  configure_authoritative_collision_validation(
+      local_kernel, local_collision_world, local_collision_engine);
+
+  std::mutex events_mutex;
+  std::vector<KernelEvent> events;
+  local_kernel.subscribe_events([&](const KernelEvent& e) {
+    std::lock_guard<std::mutex> lock(events_mutex);
+    events.push_back(e);
+  });
+
+  auto exec = local_kernel.execute(make_test_request());
+  ASSERT_TRUE(exec.ok());
+  ASSERT_TRUE(controlled_execution.wait_until_execute_called());
+  ASSERT_TRUE(wait_for_state(local_kernel, ExecutionState::kExecuting));
+
+  auto stop_dto = local_kernel.stop();
+  ASSERT_TRUE(stop_dto.accepted);
+  EXPECT_TRUE(local_kernel.wait_for_completion(1'000'000'000));
+  EXPECT_EQ(local_kernel.get_status().state, ExecutionState::kStopped);
+
+  std::lock_guard<std::mutex> lock(events_mutex);
+  EXPECT_TRUE(std::any_of(events.begin(), events.end(),
+                          [](const KernelEvent& e) {
+                            return e.type == KernelEventType::kStopRequested;
+                          }))
+      << "Missing kStopRequested event";
+  EXPECT_TRUE(std::any_of(events.begin(), events.end(),
+                          [](const KernelEvent& e) {
+                            return e.type == KernelEventType::kStateTransition &&
+                                   e.from_state == ExecutionState::kExecuting &&
+                                   e.to_state == ExecutionState::kStopping;
+                          }))
+      << "Missing state_transition(Executing→Stopping)";
+  EXPECT_TRUE(std::any_of(events.begin(), events.end(),
+                          [](const KernelEvent& e) {
+                            return e.type == KernelEventType::kStopIssued;
+                          }))
+      << "Missing kStopIssued event";
+  EXPECT_TRUE(std::any_of(events.begin(), events.end(),
+                          [](const KernelEvent& e) {
+                            return e.type == KernelEventType::kStateTransition &&
+                                   e.from_state == ExecutionState::kStopping &&
+                                   e.to_state == ExecutionState::kStopped;
+                          }))
+      << "Missing state_transition(Stopping→Stopped)";
+}
+
+// Spec/230 §6.1 pause chain. Pause from kExecuting MUST emit:
+//   kPauseRequested → state_transition(Executing→Stopping)
+//                   → state_transition(Stopping→Paused)
+// The Executing→Stopping transition is synchronous inside
+// stop_policy::request_pause; the Stopping→Paused transition fires
+// from the scheduled lambda there. The pause_completed_callback the
+// kernel wires in its constructor emits the terminal Paused event
+// when that lambda runs.
+TEST_F(ExecutionKernelTest, Pause_EmitsFullEventChain_PerSpec_6_1) {
+  ControlledExecution controlled_execution;
+  // The backend terminates its execution handle on pause so the
+  // async worker can quiesce cleanly when the test ends.
+  controlled_execution.terminal_handle_on_pause = true;
+  FakeClock local_clock;
+  ManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  MockCollisionWorldPublisher local_collision_world;
+  auto local_collision_engine = std::make_shared<MockCollisionEngine>();
+  ExecutionKernel local_kernel{
+      planner, context, controlled_execution, local_clock,
+      local_scheduler, local_cache};
+  configure_authoritative_collision_validation(
+      local_kernel, local_collision_world, local_collision_engine);
+
+  std::mutex events_mutex;
+  std::vector<KernelEvent> events;
+  local_kernel.subscribe_events([&](const KernelEvent& e) {
+    std::lock_guard<std::mutex> lock(events_mutex);
+    events.push_back(e);
+  });
+
+  auto exec = local_kernel.execute(make_test_request());
+  ASSERT_TRUE(exec.ok());
+  ASSERT_TRUE(controlled_execution.wait_until_execute_called());
+  ASSERT_TRUE(wait_for_state(local_kernel, ExecutionState::kExecuting));
+
+  auto pause_dto = local_kernel.pause();
+  ASSERT_TRUE(pause_dto.accepted);
+  local_scheduler.advance_to(local_clock.now());
+  ASSERT_TRUE(controlled_execution.wait_until_paused());
+  ASSERT_TRUE(wait_for_state(local_kernel, ExecutionState::kPaused));
+
+  {
+    std::lock_guard<std::mutex> lock(events_mutex);
+    EXPECT_TRUE(std::any_of(events.begin(), events.end(),
+                            [](const KernelEvent& e) {
+                              return e.type == KernelEventType::kPauseRequested;
+                            }))
+        << "Missing kPauseRequested event";
+    EXPECT_TRUE(std::any_of(events.begin(), events.end(),
+                            [](const KernelEvent& e) {
+                              return e.type == KernelEventType::kStateTransition &&
+                                     e.from_state == ExecutionState::kExecuting &&
+                                     e.to_state == ExecutionState::kStopping;
+                            }))
+        << "Missing state_transition(Executing→Stopping)";
+    EXPECT_TRUE(std::any_of(events.begin(), events.end(),
+                            [](const KernelEvent& e) {
+                              return e.type == KernelEventType::kStateTransition &&
+                                     e.from_state == ExecutionState::kStopping &&
+                                     e.to_state == ExecutionState::kPaused;
+                            }))
+        << "Missing state_transition(Stopping→Paused)";
+  }
+
+  // Clean up: reset clears the paused state and lets the worker
+  // thread quiesce before the kernel is destroyed.
+  auto reset_result = local_kernel.reset();
+  EXPECT_TRUE(reset_result.accepted);
+  EXPECT_TRUE(local_kernel.wait_for_completion(1'000'000'000));
+}
+
+// The operator-stop profile MUST NOT leak into internal hard-stop
+// call sites. The
+// planning-timeout watchdog and resume-validation-failure paths
+// call `stop_policy_.request_hard_stop()` directly, which fires the
+// stop_policy callback. That callback is now legacy `backend.stop()`
+// only — internal callers see no controlled-stop behavior.
+//
+// This test simulates an internal hard-stop by calling
+// `stop_policy_.request_hard_stop()` indirectly via a fault-trip
+// without an operator-stop profile invocation, and verifies the
+// legacy backend.stop() ran and controlled_stop_count did not.
+TEST_F(ExecutionKernelTest,
+       InternalHardStop_DoesNotUseOperatorStopProfile) {
+  ControlledExecution controlled_execution;
+  ThreadSafeFakeClock local_clock;
+  ThreadSafeManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  ExecutionKernelConfig config;
+  // Tighten the collision monitor cadence so the test fires within
+  // a deterministic 10 ms advance.
+  config.collision_monitor_period_ns = 10'000'000;
+  config.runtime_collision_query_timeout_ns = 10'000'000;
+  // Operator profile IS configured (would route ExecutionKernel::stop()
+  // through controlled-stop)…
+  MotionInterruptStopProfileDTO op_profile;
+  op_profile.profile_id = "operator_soft_on_path";
+  op_profile.stop_mode = MotionInterruptStopMode::kSoftOnPath;
+  op_profile.deceleration_time_s = 0.3;
+  op_profile.per_joint_max_deceleration_rad_s2 = {{"j1", 8.0}, {"j2", 8.0}};
+  config.operator_stop_profile =
+      std::make_shared<MotionInterruptStopProfileDTO>(op_profile);
+  // …but no fault-stop profile, so the runtime collision fault path
+  // uses the legacy backend.stop() preempt directly — that's the
+  // internal hard-stop we're guarding against accidentally routing
+  // through the operator profile.
+  ExecutionKernel local_kernel{planner,
+                               context,
+                               controlled_execution,
+                               local_clock,
+                               local_scheduler,
+                               local_cache,
+                               config};
+  MockCollisionWorldPublisher local_publisher;
+  auto local_engine = std::make_shared<MockCollisionEngine>();
+  configure_authoritative_collision_validation(local_kernel, local_publisher,
+                                                local_engine);
+
+  // Calling stop() while Idle must not invoke the operator controlled-stop
+  // profile and must not poison the one-shot backend-stop skip flag. The next
+  // internal fault preempt below still has to call legacy backend.stop().
+  auto idle_stop = local_kernel.stop();
+  EXPECT_FALSE(idle_stop.accepted);
+  EXPECT_EQ(controlled_execution.controlled_stop_count, 0);
+  EXPECT_EQ(controlled_execution.stop_count, 0);
+
+  auto result = local_kernel.execute(make_test_request());
+  ASSERT_TRUE(result.ok());
+  ASSERT_TRUE(controlled_execution.wait_until_execute_called());
+  ASSERT_TRUE(wait_for_state(local_kernel, ExecutionState::kExecuting));
+
+  // Trigger the built-in runtime_collision_fault interrupt directly.
+  auto live_snapshot = make_test_collision_world_snapshot();
+  live_snapshot.revision =
+      CollisionWorldRevision{77, "internal-hard-stop-test"};
+  local_publisher.current_snapshot =
+      std::make_shared<const CollisionWorldSnapshot>(std::move(live_snapshot));
+  local_engine->default_result = make_authoritative_collision_result();
+  std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  local_clock.advance(20'000'000);
+  local_scheduler.advance_to(local_clock.now());
+  for (int attempt = 0;
+       attempt < 100 && controlled_execution.stop_count == 0; ++attempt) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    local_scheduler.advance_to(local_clock.now());
+  }
+  bool completed = local_kernel.wait_for_completion(200'000'000);
+  if (!completed) {
+    controlled_execution.release();
+    completed = local_kernel.wait_for_completion(1'000'000'000);
+  }
+  EXPECT_TRUE(completed);
+
+  // Legacy backend.stop() ran; operator profile did NOT leak in.
+  EXPECT_EQ(controlled_execution.stop_count, 1);
+  EXPECT_EQ(controlled_execution.controlled_stop_count, 0);
+}
+
+// Emergency fallback: when a configured fault stop_profile is
+// refused/unsupported/unconfirmed by
+// the backend, the kernel must emergency-fall-back to legacy
+// `execution_backend_.stop()` so the runtime fault still physically
+// stops the robot. A misconfigured fault profile MUST NOT remove the
+// guaranteed physical-stop path.
+TEST_F(ExecutionKernelTest,
+       FaultStopProfile_ControlledStopRefused_EmergencyLegacyFallback) {
+  ControlledExecution controlled_execution;
+  ThreadSafeFakeClock local_clock;
+  ThreadSafeManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  ExecutionKernelConfig config;
+  config.collision_monitor_period_ns = 10'000'000;
+  config.runtime_collision_query_timeout_ns = 10'000'000;
+  MotionInterruptStopProfileDTO fault_profile;
+  fault_profile.profile_id = "fault_spring_back";
+  fault_profile.stop_mode = MotionInterruptStopMode::kSpringBackHold;
+  config.default_fault_stop_profile =
+      std::make_shared<MotionInterruptStopProfileDTO>(fault_profile);
+  // Backend refuses the controlled-stop (capability mismatch, etc.).
+  ControlledStopResultDTO refused;
+  refused.accepted = false;
+  refused.error = ErrorDTO{
+      std::string(kErrorMotionInterruptBackendStopFailed),
+      "spring_back_hold capability missing",
+      {{"reason", "stop_mode_not_supported"}}};
+  controlled_execution.next_controlled_stop_result = refused;
+
+  MockCollisionWorldPublisher local_publisher;
+  auto local_engine = std::make_shared<MockCollisionEngine>();
+  ExecutionKernel local_kernel{planner,
+                               context,
+                               controlled_execution,
+                               local_clock,
+                               local_scheduler,
+                               local_cache,
+                               config};
+  configure_authoritative_collision_validation(local_kernel, local_publisher,
+                                                local_engine);
+  std::vector<KernelEvent> events;
+  local_kernel.subscribe_events([&](const KernelEvent& e) {
+    events.push_back(e);
+  });
+
+  auto result = local_kernel.execute(make_test_request());
+  ASSERT_TRUE(result.ok());
+  ASSERT_TRUE(controlled_execution.wait_until_execute_called());
+  ASSERT_TRUE(wait_for_state(local_kernel, ExecutionState::kExecuting));
+  auto live_snapshot = make_test_collision_world_snapshot();
+  live_snapshot.revision =
+      CollisionWorldRevision{99, "live-scene-after-dispatch"};
+  local_publisher.current_snapshot =
+      std::make_shared<const CollisionWorldSnapshot>(std::move(live_snapshot));
+  local_engine->default_result = make_authoritative_collision_result();
+  std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  local_clock.advance(10'000'000);
+  local_scheduler.advance_to(local_clock.now());
+  for (int attempt = 0;
+       attempt < 100 && controlled_execution.stop_count == 0; ++attempt) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    local_scheduler.advance_to(local_clock.now());
+  }
+  bool completed = local_kernel.wait_for_completion(200'000'000);
+  if (!completed) {
+    controlled_execution.release();
+    completed = local_kernel.wait_for_completion(1'000'000'000);
+  }
+  EXPECT_TRUE(completed);
+
+  // Controlled-stop attempted, refused; legacy stop() emergency-fell-back.
+  EXPECT_EQ(controlled_execution.controlled_stop_count, 1);
+  EXPECT_EQ(controlled_execution.stop_count, 1);
+  // Kernel transitioned to Interrupted; the preempt succeeded
+  // (legacy stop ran), so the latch reports succeeded preemption.
+  auto latch = local_kernel.get_active_interrupt_latch();
+  ASSERT_TRUE(latch.has_value());
+  EXPECT_EQ(latch->preemption_result, InterruptPreemptionResult::kSucceeded);
+  EXPECT_TRUE(std::any_of(events.begin(), events.end(),
+                          [](const KernelEvent& e) {
+                            return e.type ==
+                                       KernelEventType::kInterruptPreemptApplied &&
+                                   e.details.contains("preempt_path") &&
+                                   e.details.at("preempt_path") ==
+                                       "controlled_stop_failed_legacy_fallback_succeeded" &&
+                                   e.details.contains("emergency_fallback") &&
+                                   e.details.at("emergency_fallback") ==
+                                       "legacy_stop_succeeded" &&
+                                   e.details.contains("fault_stop_profile_id") &&
+                                   e.details.at("fault_stop_profile_id") ==
+                                       "fault_spring_back";
+                          }));
 }
 
 TEST_F(ExecutionKernelTest,
@@ -3705,7 +4447,7 @@ TEST_F(ExecutionKernelTest, ConcurrentStress_RapidExecuteStopCycles) {
 }
 
 // =========================================================================
-// Phase 4.5C: motion-scoped interrupt arming/reaping/outcome store
+// Motion-scoped interrupt arming/reaping/outcome store
 // =========================================================================
 
 namespace motion_45c {
@@ -3740,8 +4482,8 @@ InterruptPolicyDefinition make_move_trip_policy(std::string policy_id,
   p.allowed_activation_modes = {
       MotionInterruptActivationMode::kRequireInactiveAtArm,
       MotionInterruptActivationMode::kTripIfAlreadyActive};
-  // Phase 4.5D-1: complete_move_on_signal policies MUST declare a
-  // non-empty allowed_stop_modes set. Defaults span the modes the
+  // complete_move_on_signal policies MUST declare a non-empty
+  // allowed_stop_modes set. Defaults span the modes the
   // kernel tests exercise (the kernel-level capability gate
   // additionally enforces the backend's supported_stop_modes).
   p.allowed_stop_modes = {MotionInterruptStopMode::kSpringBackHold,
@@ -3750,7 +4492,7 @@ InterruptPolicyDefinition make_move_trip_policy(std::string policy_id,
   return p;
 }
 
-/// Phase 4.5D-1: minimal stop profile so scopes can satisfy the
+/// Minimal stop profile so scopes can satisfy the
 /// stop_profile_required gate. Tests can override the mode.
 MotionInterruptStopProfileDTO make_stop_profile(
     MotionInterruptStopMode mode = MotionInterruptStopMode::kSpringBackHold) {
@@ -3897,7 +4639,7 @@ TEST_F(ExecutionKernelTest,
 
 TEST_F(ExecutionKernelTest,
        Execute_ScopedMoveArmFails_LastErrorClassifiedAsArmFailed) {
-  // Regression for codex review finding: `error_code_from_dto` must map
+  // Regression: `error_code_from_dto` must map
   // the motion_interrupt_* string codes back to their ErrorCode enum
   // entries so the state-machine `last_error` surface — which Composer
   // and release evidence consume — distinguishes arm failures from
@@ -3919,8 +4661,7 @@ TEST_F(ExecutionKernelTest,
             ErrorCode::kMotionInterruptArmFailed);
 }
 
-// Phase 4.5D-2 superseded the 4.5C bridge: legacy
-// `Execute_ScopedTripDuringExecution_LastErrorClassifiedAsBackendStopFailed`
+// Legacy `Execute_ScopedTripDuringExecution_LastErrorClassifiedAsBackendStopFailed`
 // was removed because the kCompleteMoveOnSignal latch now produces a
 // signal_trip success via execute_controlled_stop. The equivalent
 // last_error fidelity coverage for trip-time stop failures lives in
@@ -3969,8 +4710,8 @@ TEST_F(ExecutionKernelTest,
 TEST_F(ExecutionKernelTest,
        Execute_ScopedTripDuringExecution_EmitsSignalTripOutcome) {
   using namespace motion_45c;
-  // Phase 4.5D-2 success path: backend's default
-  // execute_controlled_stop returns accepted + confirmed +
+  // Success path: backend's default execute_controlled_stop
+  // returns accepted + confirmed +
   // native_simulated_stop. The kernel must transition
   // Executing -> Stopping -> Completed and emit a
   // MotionExecutionOutcomeDTO with terminal_cause = signal_trip and a
@@ -4028,7 +4769,7 @@ TEST_F(ExecutionKernelTest,
 TEST_F(ExecutionKernelTest,
        Execute_ScopedTrip_BackendStopFailureDowngradesToFailed) {
   using namespace motion_45c;
-  // Phase 4.5D-2 failure path: backend returns accepted=false.
+  // Failure path: backend returns accepted=false.
   // Kernel transitions Stopping -> Failed and emits terminal_cause =
   // failed with motion_interrupt_backend_stop_failed.
   ControlledExecution controlled_execution;
@@ -4092,7 +4833,7 @@ TEST_F(ExecutionKernelTest,
 TEST_F(ExecutionKernelTest,
        Execute_ScopedTrip_BackendNotConfirmedDowngradesToFailed) {
   using namespace motion_45c;
-  // Phase 4.5D-2 conjunctive rule #3: backend_stop_confirmed=false
+  // Conjunctive rule #3: backend_stop_confirmed=false
   // downgrades to failed even when accepted=true.
   ControlledExecution controlled_execution;
   ControlledStopResultDTO unconfirmed;
@@ -4142,7 +4883,7 @@ TEST_F(ExecutionKernelTest,
 TEST_F(ExecutionKernelTest,
        Execute_ScopedTrip_ExecutedModeNotInAllowedFallbackDowngradesToFailed) {
   using namespace motion_45c;
-  // Phase 4.5D-2 conjunctive rule #1: backend executed kHardDeceleration
+  // Conjunctive rule #1: backend executed kHardDeceleration
   // but the scope's allowed_fallback_modes does not include it.
   ControlledExecution controlled_execution;
   ControlledStopResultDTO unauthorized_fallback;
@@ -4197,7 +4938,7 @@ TEST_F(ExecutionKernelTest,
 TEST_F(ExecutionKernelTest,
        Execute_ScopedTrip_FallbackHonoredWhenAllowed) {
   using namespace motion_45c;
-  // Phase 4.5G fallback matrix v1: the only qualified generic
+  // Fallback matrix v1: the only qualified generic
   // requested/executed mismatch is soft_on_path -> spring_back_hold.
   // The scope listed the fallback, the backend reported a stable
   // fallback_reason, and the node category is kGeneric.
@@ -4342,7 +5083,7 @@ TEST_F(ExecutionKernelTest,
   using namespace motion_45c;
   // allowed_fallback_modes is a fail-closed guardrail, not production
   // approval for arbitrary substitutions. spring_back_hold -> hard_deceleration
-  // is not in the Phase 4.5G fallback matrix, so the outcome must fail even
+  // is not in the fallback matrix, so the outcome must fail even
   // though the profile listed the fallback and the backend confirmed it.
   ControlledExecution controlled_execution;
   ControlledStopResultDTO fallback_unqualified;
@@ -4468,7 +5209,7 @@ TEST_F(ExecutionKernelTest,
 
 TEST_F(ExecutionKernelTest,
        Execute_ScopedTrip_FallbackReasonRequiredWhenModeDiffers) {
-  // Phase 4.5D-2/4.5G conjunctive rule: even for a qualified fallback
+  // Conjunctive rule: even for a qualified fallback
   // pair, an unset fallback_reason produces a failed outcome.
   using namespace motion_45c;
   ControlledExecution controlled_execution;
@@ -4588,7 +5329,7 @@ TEST_F(ExecutionKernelTest,
 
 TEST_F(ExecutionKernelTest,
        Execute_ScopedTrip_ConfirmationLatencyExceedingMaxStopTimeFailsClosed) {
-  // Phase 4.5D-2 conjunctive rule: confirmation_latency_ns must not
+  // Conjunctive rule: confirmation_latency_ns must not
   // exceed max_stop_time_s (or complete_move_on_signal_timeout_ns).
   using namespace motion_45c;
   ControlledExecution controlled_execution;
@@ -4640,7 +5381,7 @@ TEST_F(ExecutionKernelTest,
   EXPECT_TRUE(local_kernel.get_active_interrupt_latch().has_value());
 }
 
-// -------- Phase 4.5D-2 codex-review-follow-up coverage --------
+// -------- Additional coverage --------
 
 TEST_F(ExecutionKernelTest,
        Execute_ScopedTrip_DefaultTimeoutEnforcedWhenMaxStopTimeUnset) {
@@ -4862,8 +5603,7 @@ TEST_F(ExecutionKernelTest,
   EXPECT_TRUE(local_kernel.get_active_interrupt_latch().has_value());
 }
 
-// Phase 4.5D-2 superseded the 4.5C bridge. Legacy
-// `Execute_ScopedTripDuringExecution_EmitsFailedOutcomePending45D`
+// Legacy `Execute_ScopedTripDuringExecution_EmitsFailedOutcomePending45D`
 // was removed because the kCompleteMoveOnSignal latch now produces a
 // real signal_trip outcome via `handle_motion_trip_latch`. The
 // equivalent coverage lives in the
@@ -4871,12 +5611,12 @@ TEST_F(ExecutionKernelTest,
 // test and the failure-path tests above.
 
 // =========================================================================
-// Phase 4.5D-1: backend controlled-stop capability gate at arm time
+// Backend controlled-stop capability gate at arm time
 // =========================================================================
 
 TEST_F(ExecutionKernelTest,
        Execute_ScopedMove_RejectsStopModeNotInBackendCapability) {
-  // Spec/260 §5.6 (Phase 4.5D-1 pre-dispatch capability validation):
+  // Per spec/260 §5.6: pre-dispatch capability validation —
   // every requested stop_mode MUST be in the backend's
   // supported_stop_modes. Shrinking the backend capability to drop
   // kHardDeceleration but requesting it in the scope produces a
@@ -4916,8 +5656,8 @@ TEST_F(ExecutionKernelTest,
 
 TEST_F(ExecutionKernelTest,
        Execute_ScopedMove_RejectsFallbackModeNotInBackendCapability) {
-  // Phase 4.5D-1: every element of allowed_fallback_modes must also
-  // be in the backend's supported_stop_modes. Backend supports
+  // Every element of allowed_fallback_modes must also be in the
+  // backend's supported_stop_modes. Backend supports
   // kSpringBackHold only; scope requests kSpringBackHold with
   // kHardDeceleration as a fallback. Pre-dispatch rejects with
   // `fallback_mode_not_supported_by_backend`.
@@ -4978,7 +5718,7 @@ TEST_F(ExecutionKernelTest,
 
 TEST_F(ExecutionKernelTest,
        Execute_ScopedMove_PrecisionContactWithEmptyFallbackArms) {
-  // Phase 4.5D-1 happy path for precision-contact node category:
+  // Happy path for precision-contact node category:
   // empty fallback list + supported mode + valid policy arms
   // cleanly, dispatches, and produces no_signal_trip on completion.
   using namespace motion_45c;
@@ -5004,7 +5744,7 @@ TEST_F(ExecutionKernelTest,
 
 TEST_F(ExecutionKernelTest,
        Execute_SoftOnPathWithoutFallbackRejectsInfeasibleEnvelope) {
-  // Phase 4.5G: exact soft_on_path must prove the plan-time feasibility
+  // Exact soft_on_path must prove the plan-time feasibility
   // envelope before arming. The default fixture trajectory has no explicit
   // natural-completion policy, so late trip points cannot satisfy the requested
   // wall-time ramp and the scoped move fails closed before backend dispatch.
@@ -5049,7 +5789,7 @@ TEST_F(ExecutionKernelTest,
 
 TEST_F(ExecutionKernelTest,
        Execute_SoftOnPathNaturalCompletionPolicyAllowsEnvelopeGap) {
-  // Phase 4.5G: generic search moves may explicitly say that a signal
+  // Generic search moves may explicitly say that a signal
   // arriving too close to the natural endpoint should complete as ordinary
   // no-trip/natural completion rather than depending on spring_back fallback.
   using namespace motion_45c;
@@ -5165,7 +5905,7 @@ TEST_F(ExecutionKernelTest,
 }
 
 // =========================================================================
-// Phase 4.5F: motion-scoped interrupt qualification. These tests live
+// Motion-scoped interrupt qualification. These tests live
 // alongside the rest of the kernel suite so they reuse the proven
 // ControlledExecution + freshness-aware mock infrastructure. Each
 // scenario emits a structured JSON evidence line on stdout that
@@ -5226,7 +5966,7 @@ void emit_qualification_evidence(
 TEST_F(ExecutionKernelTest,
        Qualification_SignalTripWithMeasuredLatencyEmitsEvidence) {
   using namespace motion_45c;
-  // Phase 4.5F: signal_trip happy path with measured signal_to_latch_ns,
+  // Signal_trip happy path with measured signal_to_latch_ns,
   // latch_to_backend_stop_call_ns, latch_to_stop_confirmed_ns. The
   // emitted JSON gives deployment qualification reproducible
   // measurement points without needing the kernel to expose new APIs.
@@ -5313,7 +6053,7 @@ TEST_F(ExecutionKernelTest,
 
 TEST_F(ExecutionKernelTest,
        Qualification_StaleSourceRejectedDoesNotLatch) {
-  // Phase 4.5F: stale-source qualification. With a 1us freshness
+  // Stale-source qualification. With a 1us freshness
   // budget, a signal whose timestamp is 100us in the past MUST be
   // rejected at ingest with reason=stale and MUST NOT latch. Emit a
   // null-outcome evidence line so the qualification archive records

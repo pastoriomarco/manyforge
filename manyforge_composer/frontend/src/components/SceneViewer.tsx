@@ -1,4 +1,4 @@
-import { Component, Suspense, useEffect, useMemo, useRef, useState } from 'react';
+import { Component, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { ErrorInfo, MutableRefObject, ReactNode } from 'react';
 import { Canvas } from '@react-three/fiber';
 import {
@@ -37,6 +37,13 @@ import type {
   TreeNode,
 } from '../types/api';
 import { computeMoveToTarget } from '../utils/moveTo';
+import {
+  composePose,
+  poseFromBasePoseRecord,
+  poseFromRecord,
+  relativePose,
+  type PoseTuple,
+} from '../utils/poseTransforms';
 import { ObjectEditPanel } from './ObjectEditPanel';
 import { RobotControlPanel } from './RobotControlPanel';
 import { SceneControls } from './SceneControls';
@@ -1317,9 +1324,17 @@ function TcpJogGizmo() {
   const cartesianFrame = useViewerSelectionStore((s) => s.cartesianFrame);
   const gizmoMode = useViewerSelectionStore((s) => s.cartesianGizmoMode);
   const commandGate = useRobotCommandAuthority({ allowFollowTargetActive: true });
-  const tcpPose = useSceneStateStore((s) => s.scene?.robot?.tcp_pose_in_base ?? null);
-  const tcpFrame = useSceneStateStore((s) => s.scene?.robot?.tcp_frame ?? null);
-  const baseFrame = useSceneStateStore((s) => s.scene?.robot?.base_frame ?? null);
+  const scene = useSceneStateStore((s) => s.scene ?? null);
+  const tcpPose = scene?.robot?.tcp_pose_in_base ?? null;
+  const tcpFrame = scene?.robot?.tcp_frame ?? null;
+  const baseFrame = scene?.robot?.base_frame ?? null;
+  const baseWorldPose = useMemo(() => {
+    if (scene?.link_poses !== undefined && baseFrame !== null) {
+      const pose = poseFromRecord(scene.link_poses[baseFrame]);
+      if (pose !== null) return pose;
+    }
+    return poseFromBasePoseRecord(scene?.robot?.base_pose);
+  }, [scene?.link_poses, scene?.robot?.base_pose, baseFrame]);
   // Joint list for the cartesian streaming session. Sourced from the
   // live scene's robot state (`scene.robot.joint_names`) rather than the
   // URDF manifest because the backend's IK uses scene-state ordering;
@@ -1340,16 +1355,35 @@ function TcpJogGizmo() {
   const dragTokenRef = useRef<FollowTargetDragToken | null>(null);
 
   const initialPose = useMemo(() => {
-    if (tcpPose === null) return null;
-    const pos = (tcpPose as { position_m?: number[] }).position_m;
-    const quat = (tcpPose as { orientation_xyzw?: number[] }).orientation_xyzw;
-    if (!Array.isArray(pos) || pos.length !== 3) return null;
-    if (!Array.isArray(quat) || quat.length !== 4) return null;
-    return {
-      position: pos as [number, number, number],
-      quaternion: quat as [number, number, number, number],
+    const tcpWorldPose =
+      tcpFrame !== null && scene?.link_poses !== undefined
+        ? poseFromRecord(scene.link_poses[tcpFrame])
+        : null;
+    if (tcpWorldPose !== null) return tcpWorldPose;
+    const tcpInBase = poseFromRecord(tcpPose);
+    if (tcpInBase === null) return null;
+    if (baseWorldPose !== null) {
+      return composePose(baseWorldPose, tcpInBase);
+    }
+    return tcpInBase;
+  }, [scene?.link_poses, tcpFrame, tcpPose, baseWorldPose]);
+
+  const targetInStreamingFrame = useCallback((): PoseTuple | null => {
+    if (anchor === null) return null;
+    const worldPose: PoseTuple = {
+      position: [anchor.position.x, anchor.position.y, anchor.position.z],
+      quaternion: [
+        anchor.quaternion.x,
+        anchor.quaternion.y,
+        anchor.quaternion.z,
+        anchor.quaternion.w,
+      ],
     };
-  }, [tcpPose]);
+    if (baseWorldPose !== null) {
+      return relativePose(worldPose, baseWorldPose);
+    }
+    return worldPose;
+  }, [anchor, baseWorldPose]);
 
   useEffect(() => {
     if (anchor === null || initialPose === null) return;
@@ -1395,16 +1429,16 @@ function TcpJogGizmo() {
       if (anchor === null) return;
       const token = dragTokenRef.current;
       if (token === null) return;
-      const p = anchor.position;
-      const q = anchor.quaternion;
+      const target = targetInStreamingFrame();
+      if (target === null) return;
       followTargetController.push(token, {
         kind: 'cartesian',
-        positionM: [p.x, p.y, p.z],
-        orientationXyzw: [q.x, q.y, q.z, q.w],
+        positionM: target.position,
+        orientationXyzw: target.quaternion,
       });
     }, 250);
     return () => clearInterval(interval);
-  }, [anchor]);
+  }, [targetInStreamingFrame]);
 
   // Global pointerup safety net: if drei TransformControls drops the
   // mouseUp event (which we've observed under certain raycast / event-
@@ -1489,8 +1523,13 @@ function TcpJogGizmo() {
             const token = followTargetController.begin({
               inputMode: 'cartesian',
               jointNames: drivableJointNamesRef.current,
-              cartesianReferenceFrame:
-                cartesianFrame === 'tcp' ? 'tcp' : 'base',
+              // The 3D anchor is rendered in scene/world coordinates so it
+              // coincides with the rendered grasp_frame. Streaming targets are
+              // converted back into the robot base frame before push(), which
+              // matches the Cartesian numeric fields and keeps IK reference
+              // semantics stable across manyforge-only and ros2_control modes.
+              // `cartesianFrame` controls TransformControls' axes only.
+              cartesianReferenceFrame: 'base',
               tcpFrame: tcpFrame ?? '',
               softStopStrategy: 'spring_back',
               maxDispatchRateHz: 30,
@@ -1505,13 +1544,14 @@ function TcpJogGizmo() {
             // Push the initial pose. If the controller is still in
             // ending/aborted phase this is dropped; the watchdog will
             // re-attempt once the queued begin fires.
-            const p = anchor.position;
-            const q = anchor.quaternion;
-            followTargetController.push(token, {
-              kind: 'cartesian',
-              positionM: [p.x, p.y, p.z],
-              orientationXyzw: [q.x, q.y, q.z, q.w],
-            });
+            const target = targetInStreamingFrame();
+            if (target !== null) {
+              followTargetController.push(token, {
+                kind: 'cartesian',
+                positionM: target.position,
+                orientationXyzw: target.quaternion,
+              });
+            }
           }}
           onObjectChange={() => {
             if (!draggingRef.current) return;
@@ -1554,13 +1594,14 @@ function TcpJogGizmo() {
               // push() drops if controller isn't streaming (queued or
               // already ended). end() drops if not streaming/opening.
               // Both safe.
-              const p = anchor.position;
-              const q = anchor.quaternion;
-              followTargetController.push(token, {
-                kind: 'cartesian',
-                positionM: [p.x, p.y, p.z],
-                orientationXyzw: [q.x, q.y, q.z, q.w],
-              });
+              const target = targetInStreamingFrame();
+              if (target !== null) {
+                followTargetController.push(token, {
+                  kind: 'cartesian',
+                  positionM: target.position,
+                  orientationXyzw: target.quaternion,
+                });
+              }
               followTargetController.end(token, 'spring_back');
             }
             // ALWAYS snap the gizmo back to the live TCP. The decisive
@@ -1570,7 +1611,6 @@ function TcpJogGizmo() {
               anchor.position.set(...initialPose.position);
               anchor.quaternion.set(...initialPose.quaternion);
             }
-            void baseFrame; // reserved for multi-base future work
           }}
         />
       )}

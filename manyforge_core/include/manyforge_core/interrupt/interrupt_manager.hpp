@@ -16,7 +16,7 @@ namespace manyforge::core {
 
 struct InterruptManagerConfig {
   std::size_t queue_depth = 16;
-  /// Phase 4.5B default for `arm_timeout_ns` when a
+  /// Default for `arm_timeout_ns` when a
   /// `MotionInterruptScopeDTO` omits it. Spec/260 §9 deployment
   /// example proposes 50 ms.
   std::int64_t motion_scope_arm_timeout_ns = 50'000'000;
@@ -123,6 +123,15 @@ class InterruptManager {
 
   std::optional<InterruptLatch> active_latch() const;
   std::size_t queued_count() const;
+
+  /// Return a copy of the policy whose latch is currently active.
+  /// The kernel uses this to read the active fault policy's
+  /// optional `stop_profile` field on the preempt-trajectory path
+  /// without exposing the manager's internal `policies_by_id_` map.
+  /// Returns nullopt when no latch is held or the latch's policy id
+  /// is no longer registered (the latter is a defensive case — the
+  /// manager never deletes registered policies during a session).
+  std::optional<InterruptPolicyDefinition> active_policy() const;
 
  private:
   struct ResolvedPolicy {

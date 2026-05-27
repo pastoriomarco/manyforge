@@ -51,7 +51,7 @@ bool ExecutionStateMachine::is_valid_transition(ExecutionState from, ExecutionSt
         case ExecutionState::kStopping:
             return to == ExecutionState::kStopped ||
                    to == ExecutionState::kPaused ||  // deceleration complete from pause
-                   // Phase 4.5D-2 (spec/230 §3.4): a successful
+                   // Per spec/230 §3.4: a successful
                    // complete_move_on_signal trip transitions
                    // Stopping -> Completed once the controlled stop
                    // is confirmed and the validated stop snapshot
@@ -76,7 +76,7 @@ bool ExecutionStateMachine::is_valid_transition(ExecutionState from, ExecutionSt
         case ExecutionState::kInterrupted:
             return to == ExecutionState::kInterventionRequired ||
                    to == ExecutionState::kFailed ||
-                   // Phase 4.5D-2: when a move-scoped
+                   // When a move-scoped
                    // complete_move_on_signal latch fires, the kernel
                    // transitions Interrupted -> Stopping while the
                    // controlled stop is in flight (spec/230 §3.4).

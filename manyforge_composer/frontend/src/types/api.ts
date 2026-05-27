@@ -2,6 +2,14 @@
 export interface CycleStatus {
   state: 'idle' | 'running' | 'stopped' | 'direct_control';
   velocityScale: number;
+  // Structured error surface: empty when no error is active. `errorCode` is
+  // a stable machine token (e.g. "validation_collision",
+  // "motion_interrupt_backend_stop_failed"); `errorDetails` carries the
+  // kernel diagnostics map (collision pair, classification, waypoint index,
+  // fault reason code, …).
+  error?: string | null;
+  errorCode?: string | null;
+  errorDetails?: Record<string, unknown> | null;
 }
 
 export interface CycleCommand {
@@ -587,6 +595,9 @@ export interface SceneRobotState {
   joint_names: string[];
   joint_positions: Record<string, number>;
   tcp_pose_in_base?: Record<string, unknown> | null;
+  state_source?: string | null;
+  source_timestamp_ns?: number | null;
+  source_age_ns?: number | null;
 }
 
 export type MeshAssetStatus =
@@ -967,6 +978,11 @@ export interface StateUpdate {
   nativeKernelEvents?: Record<string, unknown>[];
   runtimeOverrideStatus?: RuntimeOverrideStatus | null;
   error?: string | null;
+  // Structured cycle-manager error surface pushed alongside the human-
+  // readable message so the HMI can render a rich cause panel without
+  // a separate poll.
+  errorCode?: string | null;
+  errorDetails?: Record<string, unknown> | null;
   programLoaded?: boolean;
   programSessionGeneration?: number;
   timestamp: number;

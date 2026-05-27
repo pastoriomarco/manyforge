@@ -87,20 +87,51 @@ struct ExecutionKernelConfig {
   // freshness checks.
   Duration runtime_dynamic_body_max_age_cap_ns = 500'000'000;  // 500 ms
 
-  // Phase 4.5C: terminal motion-outcome retention. Outcomes are queryable
-  // via `get_execution_outcome(execution_id)` until the store reaches
-  // this depth; oldest entries are evicted FIFO. Audit-grade deployments
+  // Terminal motion-outcome retention. Outcomes are queryable via
+  // `get_execution_outcome(execution_id)` until the store reaches this
+  // depth; oldest entries are evicted FIFO. Audit-grade deployments
   // should raise this and pair with a streaming archive subscriber.
   std::size_t motion_execution_outcome_retention = 256;
 
-  // Phase 4.5D-2: deployment default for the backend-stop confirmation
-  // deadline used by `complete_move_on_signal` trip handling when the
+  // Deployment default for the backend-stop confirmation deadline used
+  // by `complete_move_on_signal` trip handling when the
   // scope's `MotionInterruptStopProfileDTO.max_stop_time_s` is unset
   // (spec/260 §5.6, motion-scoped design §B.4). 500 ms matches the
   // canonical default; deployments whose controllers cannot confirm
   // stop within that window MUST raise this knob explicitly so the
   // longer deadline is audit-visible.
   Duration complete_move_on_signal_timeout_ns = 500'000'000;  // 500 ms
+
+  // Deployment-default fault-stop profile. Used by
+  // `apply_latched_interrupt_preemption`
+  // when a latched fault policy has `preemption_action == kPreemptTrajectory`
+  // AND no `stop_profile` of its own. Deployments should normally configure
+  // `kSpringBackHold`, matching the operator's stated intent ("default on
+  // interrupts / collision-during-motion is spring-back"). Leave unset to
+  // preserve the legacy `execution_backend_.stop()` behavior.
+  //
+  // The per-policy `InterruptPolicyDefinition.stop_profile` wins when
+  // present. This kernel-level default applies only when the policy
+  // is otherwise unconfigured, so deployments can either opt the whole
+  // kernel into controlled-stop semantics here or override on a per-
+  // policy basis.
+  std::shared_ptr<MotionInterruptStopProfileDTO> default_fault_stop_profile;
+
+  // Deployment-default operator-stop profile. Used by
+  // `ExecutionKernel::stop()` (the operator stop-button path) to route
+  // active physical motion through `execute_controlled_stop` instead of the
+  // legacy `execution_backend_.stop()`. Deployments should normally configure
+  // `kSoftOnPath`, matching the operator's stated intent ("default on stop
+  // button press is soft stop on path"). Leave unset to keep the legacy
+  // behavior.
+  //
+  // The two defaults are intentionally distinct because the operator
+  // stop button and a fault interrupt are operationally different
+  // events: a fault is "the system noticed something wrong, stop now
+  // safely" (default spring-back to known state), while an operator
+  // stop is "I am taking back control, decelerate cleanly along the
+  // current path" (default soft-on-path).
+  std::shared_ptr<MotionInterruptStopProfileDTO> operator_stop_profile;
 };
 
 /// Execution Kernel — single authority for motion execution governance.
@@ -154,6 +185,17 @@ class ExecutionKernel {
   /// rejects with `kErrorInvalidRequest` while `kInterventionRequired`,
   /// requiring an explicit ack first. See `spec/200` and ADR-0005.
   AcknowledgeInterventionResultDTO acknowledge_intervention(
+      std::string principal_id, std::string reason);
+
+  /// Acknowledge a kernel-owned runtime collision interrupt for retry.
+  ///
+  /// Valid only from `kInterrupted` with the runtime-collision fault latch
+  /// active. Clears the latch, resets kernel execution bookkeeping to Idle,
+  /// and republishes the current backend snapshot without calling
+  /// `execution_backend.reset()`. This preserves the robot's actual stopped
+  /// pose so the next execute plans from that pose instead of commanding the
+  /// simulator/controller back to its reset/home state.
+  AcknowledgeInterruptedResultDTO acknowledge_interrupted_for_retry(
       std::string principal_id, std::string reason);
 
   // ---------------------------------------------------------------
@@ -226,7 +268,7 @@ class ExecutionKernel {
   /// query-engine workers. The publisher and engines are backend-agnostic
   /// ManyForge-owned ports; RoboPlan / MoveIt / Isaac may publish snapshots or
   /// implement the port, but the kernel never falls back to planner-internal
-  /// collision checks once Phase 3A is active.
+  /// collision checks.
   ///
   /// `publisher` must outlive the kernel. Engines are retained by shared_ptr
   /// so the composition root can hand them to the kernel without additional
@@ -245,8 +287,7 @@ class ExecutionKernel {
   // Kernel-native interrupt registration and latch surface (spec/260,
   // sprint Chunk I-2). This chunk owns source/policy registration, signal
   // ingestion, priority arbitration, latch visibility, disposition validation,
-  // and event emission. Phase-specific cancellation / execution preemption is
-  // wired in later Phase 3 chunks.
+  // and event emission.
   // ---------------------------------------------------------------
 
   Result<void> register_interrupt_source(
@@ -264,7 +305,7 @@ class ExecutionKernel {
       const InterruptDisposition& disposition);
 
   // ---------------------------------------------------------------
-  // Phase 4.5C: motion-scoped terminal outcome surface (spec/210 §3.11,
+  // Motion-scoped terminal outcome surface (spec/210 §3.11,
   // spec/230 §3.4). Read-only observer; Composer and the behavior
   // runtime consume outcomes here instead of polling signal state.
   // ---------------------------------------------------------------
@@ -346,7 +387,8 @@ class ExecutionKernel {
   void request_validation_cancel_from_interrupt(
       const InterruptIngestResult& result);
   void mark_active_interrupt_preemption_result(
-      InterruptPreemptionResult result);
+      InterruptPreemptionResult result,
+      const std::map<std::string, std::string>& extra_details = {});
   std::shared_ptr<CollisionCancellationToken>
   install_streaming_target_cancel_token(std::uint64_t validation_sequence);
   void clear_streaming_target_cancel_token(
@@ -361,7 +403,7 @@ class ExecutionKernel {
   InterruptRuntimeContext current_interrupt_context() const;
   void emit_interrupt_events(const InterruptIngestResult& result);
 
-  // Phase 4.5C: motion-scope lifecycle plumbing on the worker thread.
+  // Motion-scope lifecycle plumbing on the worker thread.
   // `active_motion_execution_` is reset at execute() entry and populated
   // by `arm_motion_scopes_for_dispatch_locked` after validation passes.
   // The worker MUST call `finalize_motion_execution_outcome` exactly
@@ -401,8 +443,8 @@ class ExecutionKernel {
       std::optional<MotionTripOutcomeDTO> trip,
       std::string reap_reason);
 
-  /// Phase 4.5D-2 (spec/260 §5.6): handle a `complete_move_on_signal`
-  /// latch by running the controlled-stop flow end to end. The
+  /// Handle a `complete_move_on_signal` latch (spec/260 §5.6) by
+  /// running the controlled-stop flow end to end. The
   /// function takes the worker's `motion_state`, the originating
   /// `request` (so the matching `MotionInterruptScopeDTO.stop_profile`
   /// can be resolved from `latch.motion_interrupt_scope_id`), the
@@ -435,7 +477,7 @@ class ExecutionKernel {
   InterruptManager interrupt_manager_;
   std::atomic<std::int64_t> runtime_collision_fault_sequence_{0};
 
-  // Authoritative collision validation pipeline (Phase 3A). Missing policy,
+  // Authoritative collision validation pipeline. Missing policy,
   // publisher, snapshot, or engines are configuration errors and fail closed;
   // the previous planner-context collision_check fallback is not a supported
   // execution path.
@@ -478,6 +520,13 @@ class ExecutionKernel {
   std::mutex completion_mutex_;
   std::atomic<bool> execution_complete_{false};
   std::atomic<bool> resume_requested_{false};
+  // Set by `ExecutionKernel::stop()` when the operator-stop
+  // profile path has already invoked the backend (controlled-stop
+  // plus optional emergency legacy fallback). The stop_policy callback
+  // consumes the flag with `exchange(false)` so internal hard-stop
+  // callers (planning-timeout watchdog, resume-validation failure)
+  // still get the legacy backend.stop() they expect.
+  std::atomic<bool> operator_stop_handled_backend_call_{false};
 
   mutable std::mutex collision_monitor_mutex_;
   ScheduleHandle collision_monitor_handle_{0};
@@ -528,7 +577,7 @@ class ExecutionKernel {
   mutable std::mutex metrics_mutex_;
   mutable MetricsSnapshot metrics_;
 
-  // Phase 4.5C: bounded outcome store keyed by execution_id. FIFO
+  // Bounded outcome store keyed by execution_id. FIFO
   // eviction beyond `motion_execution_outcome_retention`. The eviction
   // order is captured in `motion_outcome_order_` because std::map keeps
   // execution_ids sorted ascending, not insertion-ordered; eviction

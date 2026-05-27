@@ -158,7 +158,7 @@ class IExecutionBackend {
     }
 
     // ---------------------------------------------------------------
-    // Phase 4.5D-1: controlled-stop capability surface (spec/240).
+    // Controlled-stop capability surface (spec/240).
     //
     // The kernel reads this once at arm time to enforce pre-dispatch
     // capability gating on `complete_move_on_signal` scopes. Default
@@ -176,7 +176,7 @@ class IExecutionBackend {
     }
 
     // ---------------------------------------------------------------
-    // Phase 4.5D-2: controlled-stop result surface (spec/260 §5.6).
+    // Controlled-stop result surface (spec/260 §5.6).
     //
     // Called by the kernel at trip time when a `complete_move_on_signal`
     // latch fires. The backend MUST execute the requested stop mode (or
@@ -189,7 +189,7 @@ class IExecutionBackend {
     // The default implementation returns `accepted=false` with a
     // `motion_interrupt_backend_stop_failed` error so backends that
     // have not yet implemented the controlled-stop contract fail
-    // closed. Phase 4.5D-1's capability gate also rejects these
+    // closed. The capability gate also rejects these
     // backends at arm time when the supported_stop_modes set is empty;
     // this default exists for backends that mistakenly declare a
     // non-empty capability set without overriding this method.

@@ -736,6 +736,11 @@ class EventRecorder:
         if isinstance(error, dict):
             code = error.get("code")
             message = error.get("message")
+            error_details = error.get("details")
+            if isinstance(error_details, dict):
+                details.setdefault("error_details", dict(error_details))
+                for key, value in error_details.items():
+                    details.setdefault(str(key), value)
             if code:
                 details["error_code"] = code
             if message:
