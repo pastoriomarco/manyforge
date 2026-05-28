@@ -12,6 +12,7 @@ add_library(manyforge_core
   src/state_machine.cpp
   src/stop_policy.cpp
   src/trajectory_cache.cpp
+  src/trajectory_sampler.cpp
   src/collision_policy_evaluator.cpp
   src/collision_validation_coordinator.cpp
   src/parallel_collision_validation_worker_pool.cpp
@@ -73,6 +74,18 @@ if(BUILD_TESTING)
   add_executable(test_cache test/test_cache.cpp)
   target_link_libraries(test_cache PRIVATE manyforge_core GTest::gtest_main)
   gtest_discover_tests(test_cache
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_trajectory_sampler test/test_trajectory_sampler.cpp)
+  target_link_libraries(test_trajectory_sampler PRIVATE manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_trajectory_sampler
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_trajectory_sampler_parity
+    test/test_trajectory_sampler_parity.cpp)
+  target_link_libraries(test_trajectory_sampler_parity
+    PRIVATE manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_trajectory_sampler_parity
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_collision_policy_evaluator

@@ -357,9 +357,6 @@ class ExecutionKernel {
   TrajectoryDTO build_remaining_trajectory(
       const TrajectoryDTO& trajectory,
       const ExecutionSnapshot& snapshot) const;
-  std::vector<double> interpolate_joint_positions(
-      const TrajectoryDTO& trajectory,
-      double time_s) const;
 
   /// Async execution worker function.
   void async_execute_worker(std::stop_token st,

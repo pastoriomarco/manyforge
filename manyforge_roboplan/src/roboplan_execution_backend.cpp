@@ -3,6 +3,7 @@
 #include <Eigen/Dense>
 
 #include <manyforge_core/motion_interrupt/soft_on_path_stop_planner.hpp>
+#include <manyforge_core/trajectory/trajectory_sampler.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -119,46 +120,6 @@ void RoboPlanExecutionBackend::update_scene_positions(
   scene_->setJointPositions(q);
 }
 
-std::vector<double> RoboPlanExecutionBackend::interpolate_joint_positions(
-    const core::TrajectoryDTO& trajectory, double time_s) const {
-  if (trajectory.waypoints.empty()) {
-    return {};
-  }
-
-  if (trajectory.waypoints.size() == 1 ||
-      time_s <= trajectory.waypoints.front().time_from_start_s) {
-    return trajectory.waypoints.front().positions_rad;
-  }
-
-  if (time_s >= trajectory.waypoints.back().time_from_start_s) {
-    return trajectory.waypoints.back().positions_rad;
-  }
-
-  for (size_t i = 1; i < trajectory.waypoints.size(); ++i) {
-    const auto& prev = trajectory.waypoints[i - 1];
-    const auto& next = trajectory.waypoints[i];
-    if (time_s > next.time_from_start_s) {
-      continue;
-    }
-
-    const double dt = next.time_from_start_s - prev.time_from_start_s;
-    if (dt <= 1e-9) {
-      return next.positions_rad;
-    }
-
-    const double alpha = clamp_progress((time_s - prev.time_from_start_s) / dt);
-    std::vector<double> interpolated(prev.positions_rad.size(), 0.0);
-    for (size_t joint = 0; joint < prev.positions_rad.size(); ++joint) {
-      interpolated[joint] =
-          prev.positions_rad[joint] +
-          alpha * (next.positions_rad[joint] - prev.positions_rad[joint]);
-    }
-    return interpolated;
-  }
-
-  return trajectory.waypoints.back().positions_rad;
-}
-
 void RoboPlanExecutionBackend::execution_worker(std::stop_token st, core::TrajectoryDTO trajectory) {
   const double total_duration_s = trajectory.waypoints.empty()
                                       ? 0.0
@@ -235,7 +196,31 @@ void RoboPlanExecutionBackend::execution_worker(std::stop_token st, core::Trajec
 
     const double progress =
         total_duration_s <= 1e-9 ? 1.0 : clamp_progress(trajectory_time_s / total_duration_s);
-    latest_positions = interpolate_joint_positions(trajectory, trajectory_time_s);
+    {
+      auto sample =
+          core::sample_trajectory(trajectory, trajectory_time_s);
+      if (sample.ok()) {
+        latest_positions = std::move(sample.value().positions_rad);
+      } else {
+        // Fail closed: an active execution trajectory that the sampler
+        // rejects is structurally malformed. Continuing with an empty
+        // position vector would publish a meaningless kExecuting
+        // snapshot. Publish a structured Failed terminal and stop the
+        // worker so the kernel surfaces the fault instead of silently
+        // freezing the visual at an empty state.
+        publish_snapshot(
+            core::ExecutionState::kFailed, progress,
+            latest_positions,
+            core::ErrorDTO{
+                std::string(core::to_string(core::ErrorCode::kInternalError)),
+                "trajectory sampler rejected the active execution "
+                "trajectory",
+                {{"reason_code", "trajectory_sampler_error"},
+                 {"sampler_error", sample.error().code},
+                 {"time_s", std::to_string(trajectory_time_s)}}});
+        break;
+      }
+    }
     update_scene_positions(latest_positions);
     publish_snapshot(core::ExecutionState::kExecuting, progress, latest_positions);
 

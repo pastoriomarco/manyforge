@@ -1,5 +1,7 @@
 #include <manyforge_core/motion_interrupt/soft_on_path_stop_planner.hpp>
 
+#include <manyforge_core/trajectory/trajectory_sampler.hpp>
+
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
@@ -220,106 +222,48 @@ struct PathSample {
 };
 
 PathSample sample_path(const TrajectoryDTO& trajectory, double time_s) {
+  // Transitional shim: forward to the shared trajectory sampler and
+  // adapt the result into the planner's local PathSample shape. The
+  // shared sampler reproduces the per-segment polynomial math
+  // previously implemented here (parity tests cover linear / cubic
+  // Hermite / quintic equivalence on shared fixtures).
+  //
+  // Boundary semantics shift here in two narrow ways relative to the
+  // previous implementation:
+  //   - `time_s < t_first` and `time_s > t_last` now hold the boundary
+  //     waypoint position with EXACTLY zero velocity and acceleration,
+  //     rather than carrying the boundary waypoint's stored derivative
+  //     values out into the clamp. Callers that sample only inside
+  //     `[t_first, t_last]` (the planner's normal path-time loop) are
+  //     unaffected.
+  //   - `time_s == t_first` and `time_s == t_last` sample the adjacent
+  //     segment polynomial at alpha=0 or alpha=1, which evaluates to
+  //     the endpoint's stored velocity and acceleration via the
+  //     polynomial basis. Behavior at the exact endpoints is therefore
+  //     equivalent to the previous implementation.
+  //
+  // Structurally malformed trajectories trigger Result::Err on the
+  // sampler. Planner callers feed only validated trajectories, so the
+  // Err path is a defensive default that yields an empty sample.
   const size_t joint_count = trajectory.joint_names.size();
-  if (time_s <= trajectory.waypoints.front().time_from_start_s) {
-    const auto& wp = trajectory.waypoints.front();
-    PathSample sample;
-    sample.position = wp.positions_rad;
-    sample.d_position_dt.assign(joint_count, 0.0);
-    sample.d2_position_dt2.assign(joint_count, 0.0);
-    if (wp.velocities_rad_s.size() == joint_count) {
-      sample.d_position_dt = wp.velocities_rad_s;
-    }
-    if (wp.accelerations_rad_s2.size() == joint_count) {
-      sample.d2_position_dt2 = wp.accelerations_rad_s2;
-    }
-    return sample;
-  }
-  if (time_s >= trajectory.waypoints.back().time_from_start_s) {
-    const auto& wp = trajectory.waypoints.back();
-    PathSample sample;
-    sample.position = wp.positions_rad;
-    sample.d_position_dt.assign(joint_count, 0.0);
-    sample.d2_position_dt2.assign(joint_count, 0.0);
-    if (wp.velocities_rad_s.size() == joint_count) {
-      sample.d_position_dt = wp.velocities_rad_s;
-    }
-    if (wp.accelerations_rad_s2.size() == joint_count) {
-      sample.d2_position_dt2 = wp.accelerations_rad_s2;
-    }
-    return sample;
-  }
-
-  size_t next_index = 1;
-  while (next_index < trajectory.waypoints.size() &&
-         time_s > trajectory.waypoints[next_index].time_from_start_s) {
-    ++next_index;
-  }
-  const auto& p0 = trajectory.waypoints[next_index - 1];
-  const auto& p1 = trajectory.waypoints[next_index];
-  const double h = p1.time_from_start_s - p0.time_from_start_s;
-  const double s = std::clamp((time_s - p0.time_from_start_s) / h, 0.0, 1.0);
-  const bool has_vel = p0.velocities_rad_s.size() == joint_count &&
-                       p1.velocities_rad_s.size() == joint_count;
-  const bool has_acc = has_vel &&
-                       p0.accelerations_rad_s2.size() == joint_count &&
-                       p1.accelerations_rad_s2.size() == joint_count;
-
   PathSample sample;
   sample.position.assign(joint_count, 0.0);
   sample.d_position_dt.assign(joint_count, 0.0);
   sample.d2_position_dt2.assign(joint_count, 0.0);
-  for (size_t j = 0; j < joint_count; ++j) {
-    const double q0 = p0.positions_rad[j];
-    const double q1 = p1.positions_rad[j];
-    if (has_acc) {
-      const double v0 = p0.velocities_rad_s[j];
-      const double v1 = p1.velocities_rad_s[j];
-      const double a0 = p0.accelerations_rad_s2[j];
-      const double a1 = p1.accelerations_rad_s2[j];
-      const double c0 = q0;
-      const double c1 = v0 * h;
-      const double c2 = 0.5 * a0 * h * h;
-      const double p = q1 - c0 - c1 - c2;
-      const double v = v1 * h - c1 - 2.0 * c2;
-      const double a = a1 * h * h - 2.0 * c2;
-      const double c3 = 10.0 * p - 4.0 * v + 0.5 * a;
-      const double c4 = -15.0 * p + 7.0 * v - a;
-      const double c5 = 6.0 * p - 3.0 * v + 0.5 * a;
-      sample.position[j] =
-          c0 + c1 * s + c2 * s * s + c3 * s * s * s +
-          c4 * s * s * s * s + c5 * s * s * s * s * s;
-      sample.d_position_dt[j] =
-          (c1 + 2.0 * c2 * s + 3.0 * c3 * s * s +
-           4.0 * c4 * s * s * s + 5.0 * c5 * s * s * s * s) / h;
-      sample.d2_position_dt2[j] =
-          (2.0 * c2 + 6.0 * c3 * s + 12.0 * c4 * s * s +
-           20.0 * c5 * s * s * s) / (h * h);
-    } else if (has_vel) {
-      const double v0 = p0.velocities_rad_s[j];
-      const double v1 = p1.velocities_rad_s[j];
-      const double h00 = 2.0 * s * s * s - 3.0 * s * s + 1.0;
-      const double h10 = s * s * s - 2.0 * s * s + s;
-      const double h01 = -2.0 * s * s * s + 3.0 * s * s;
-      const double h11 = s * s * s - s * s;
-      sample.position[j] =
-          h00 * q0 + h10 * h * v0 + h01 * q1 + h11 * h * v1;
-      sample.d_position_dt[j] =
-          ((6.0 * s * s - 6.0 * s) * q0 +
-           (3.0 * s * s - 4.0 * s + 1.0) * h * v0 +
-           (-6.0 * s * s + 6.0 * s) * q1 +
-           (3.0 * s * s - 2.0 * s) * h * v1) / h;
-      sample.d2_position_dt2[j] =
-          ((12.0 * s - 6.0) * q0 +
-           (6.0 * s - 4.0) * h * v0 +
-           (-12.0 * s + 6.0) * q1 +
-           (6.0 * s - 2.0) * h * v1) / (h * h);
-    } else {
-      const double delta = q1 - q0;
-      sample.position[j] = q0 + s * delta;
-      sample.d_position_dt[j] = delta / h;
-      sample.d2_position_dt2[j] = 0.0;
-    }
+
+  auto result = sample_trajectory(trajectory, time_s);
+  if (!result.ok()) {
+    return sample;
+  }
+  auto& value = result.value();
+  if (value.positions_rad.size() == joint_count) {
+    sample.position = std::move(value.positions_rad);
+  }
+  if (value.velocities_rad_s.size() == joint_count) {
+    sample.d_position_dt = std::move(value.velocities_rad_s);
+  }
+  if (value.accelerations_rad_s2.size() == joint_count) {
+    sample.d2_position_dt2 = std::move(value.accelerations_rad_s2);
   }
   return sample;
 }

@@ -15,6 +15,7 @@
 #include <utility>
 
 #include <manyforge_core/motion_interrupt/soft_on_path_stop_planner.hpp>
+#include <manyforge_core/trajectory/trajectory_sampler.hpp>
 #include <manyforge_core/types/error_code.hpp>
 #include <manyforge_core/collision/parallel_collision_validation_worker_pool.hpp>
 #include <manyforge_collision/manyforge_collision_engine.hpp>
@@ -793,40 +794,6 @@ std::vector<double> Ros2ControlExecutionBackend::positions_for_joints(
     result.push_back(sample.positions[index]);
   }
   return result;
-}
-
-std::vector<double> Ros2ControlExecutionBackend::interpolate_joint_positions(
-    const core::TrajectoryDTO& trajectory, double time_s) const {
-  if (trajectory.waypoints.empty()) {
-    return {};
-  }
-  if (trajectory.waypoints.size() == 1 ||
-      time_s <= trajectory.waypoints.front().time_from_start_s) {
-    return trajectory.waypoints.front().positions_rad;
-  }
-  if (time_s >= trajectory.waypoints.back().time_from_start_s) {
-    return trajectory.waypoints.back().positions_rad;
-  }
-  for (size_t i = 1; i < trajectory.waypoints.size(); ++i) {
-    const auto& prev = trajectory.waypoints[i - 1];
-    const auto& next = trajectory.waypoints[i];
-    if (time_s > next.time_from_start_s) {
-      continue;
-    }
-    const double dt = next.time_from_start_s - prev.time_from_start_s;
-    if (dt <= 1e-9) {
-      return next.positions_rad;
-    }
-    const double alpha = clamp_progress((time_s - prev.time_from_start_s) / dt);
-    std::vector<double> interpolated(prev.positions_rad.size(), 0.0);
-    for (size_t joint = 0; joint < prev.positions_rad.size(); ++joint) {
-      interpolated[joint] =
-          prev.positions_rad[joint] +
-          alpha * (next.positions_rad[joint] - prev.positions_rad[joint]);
-    }
-    return interpolated;
-  }
-  return trajectory.waypoints.back().positions_rad;
 }
 
 bool Ros2ControlExecutionBackend::update_scene_positions(
@@ -1656,7 +1623,21 @@ void Ros2ControlExecutionBackend::monitor_worker(core::TrajectoryDTO trajectory)
     }
     const double progress =
         total_duration_s <= 1e-9 ? 1.0 : clamp_progress(trajectory_time_s / total_duration_s);
-    auto predicted_positions = interpolate_joint_positions(trajectory, trajectory_time_s);
+    std::vector<double> predicted_positions;
+    {
+      auto sample =
+          core::sample_trajectory(trajectory, trajectory_time_s);
+      if (sample.ok()) {
+        predicted_positions = std::move(sample.value().positions_rad);
+      } else {
+        std::cerr
+            << "trajectory_sampler error in Ros2ControlExecutionBackend "
+               "monitor predicted-state: "
+            << sample.error().code << " (time_s=" << trajectory_time_s
+            << ", waypoints=" << trajectory.waypoints.size() << ")"
+            << std::endl;
+      }
+    }
     if (!predicted_positions.empty()) {
       update_scene_positions(predicted_positions, SceneUpdateMode::kBestEffort);
     }
@@ -1672,7 +1653,36 @@ void Ros2ControlExecutionBackend::monitor_worker(core::TrajectoryDTO trajectory)
           if (!uses_authored_backend_state()) {
             snapshot_positions = observed;
           }
-          const auto expected = interpolate_joint_positions(trajectory, trajectory_time_s);
+          std::vector<double> expected;
+          {
+            auto expected_sample =
+                core::sample_trajectory(trajectory, trajectory_time_s);
+            if (expected_sample.ok()) {
+              expected = std::move(expected_sample.value().positions_rad);
+            } else {
+              std::cerr
+                  << "trajectory_sampler error in Ros2ControlExecutionBackend "
+                     "monitor tracking-error: "
+                  << expected_sample.error().code
+                  << " (time_s=" << trajectory_time_s
+                  << ", waypoints=" << trajectory.waypoints.size()
+                  << ")" << std::endl;
+            }
+          }
+          // Guard: an empty expected vector means either the
+          // trajectory was empty (no predicted state to compare
+          // against) or the sampler refused the input (logged
+          // separately). max_abs_error compares only
+          // min(lhs.size(), rhs.size()) and would silently return
+          // 0.0 on a zero-length overlap, which would falsely
+          // declare tracking-clean. Skip the diagnostic computation
+          // for this tick when the predicted state is unavailable;
+          // the monitor's snapshot publish and sleep continue
+          // normally after the diagnostic block.
+          if (expected.empty()) {
+            // Fall through to the post-try monitor publish/sleep
+            // without computing or accumulating tracking error.
+          } else {
           const double error = max_abs_error(observed, expected);
           JointSample error_sample;
           error_sample.joint_names = trajectory.joint_names;
@@ -1700,6 +1710,7 @@ void Ros2ControlExecutionBackend::monitor_worker(core::TrajectoryDTO trajectory)
           } else {
             tracking_error_since_.reset();
           }
+          }  // closes the `if (!expected.empty()) else` block above.
         } catch (const std::exception&) {
           // A malformed/incomplete sample is ignored here; start gate already
           // proves that at least one complete controller sample existed.

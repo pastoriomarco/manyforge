@@ -87,8 +87,6 @@ class RoboPlanExecutionBackend final : public core::IExecutionBackend {
                         const std::vector<double>& joint_positions,
                         std::optional<core::ErrorDTO> error = std::nullopt);
   void update_scene_positions(const std::vector<double>& joint_positions);
-  std::vector<double> interpolate_joint_positions(
-      const core::TrajectoryDTO& trajectory, double time_s) const;
   void execution_worker(std::stop_token st, core::TrajectoryDTO trajectory);
 
   // Streaming-session worker. Drives the scene toward the latest joint

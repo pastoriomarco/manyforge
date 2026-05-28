@@ -82,6 +82,14 @@ FORBIDDEN_PRODUCTION_PATTERNS: list[tuple[str, str]] = [
      "deleted IPlanningContext coordinator validate_state overload"),
     (r"std::vector\s*<\s*IPlanningContext\s*\*\s*>",
      "deleted std::vector<IPlanningContext*> worker-pool argument type"),
+    # Trajectory-sampler consolidation: the per-backend linear position
+    # helpers were deleted; production code consumes the shared
+    # `sample_trajectory` API from
+    # `manyforge_core/include/manyforge_core/trajectory/trajectory_sampler.hpp`
+    # directly.
+    (r"\binterpolate_joint_positions\b",
+     "deleted per-backend linear interpolation helper "
+     "(use sample_trajectory from manyforge_core/trajectory/)"),
 ]
 
 SCAN_DIRS = [

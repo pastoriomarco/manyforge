@@ -1,6 +1,7 @@
 #include <manyforge_core/execution_kernel.hpp>
 
 #include <manyforge_core/motion_interrupt/soft_on_path_stop_planner.hpp>
+#include <manyforge_core/trajectory/trajectory_sampler.hpp>
 
 #include <algorithm>
 #include <array>
@@ -8,6 +9,7 @@
 #include <cmath>
 #include <exception>
 #include <iomanip>
+#include <iostream>
 #include <limits>
 #include <sstream>
 #include <stdexcept>
@@ -2666,47 +2668,6 @@ void ExecutionKernel::schedule_next_collision_monitor_tick(uint64_t generation) 
       });
 }
 
-std::vector<double> ExecutionKernel::interpolate_joint_positions(
-    const TrajectoryDTO& trajectory, double time_s) const {
-  if (trajectory.waypoints.empty()) {
-    return {};
-  }
-
-  if (trajectory.waypoints.size() == 1 ||
-      time_s <= trajectory.waypoints.front().time_from_start_s) {
-    return trajectory.waypoints.front().positions_rad;
-  }
-
-  if (time_s >= trajectory.waypoints.back().time_from_start_s) {
-    return trajectory.waypoints.back().positions_rad;
-  }
-
-  for (size_t i = 1; i < trajectory.waypoints.size(); ++i) {
-    const auto& prev = trajectory.waypoints[i - 1];
-    const auto& next = trajectory.waypoints[i];
-    if (time_s > next.time_from_start_s) {
-      continue;
-    }
-
-    const double dt = next.time_from_start_s - prev.time_from_start_s;
-    if (dt <= 1e-9) {
-      return next.positions_rad;
-    }
-
-    const double alpha =
-        clamp_unit_interval((time_s - prev.time_from_start_s) / dt);
-    std::vector<double> interpolated(prev.positions_rad.size(), 0.0);
-    for (size_t joint = 0; joint < prev.positions_rad.size(); ++joint) {
-      interpolated[joint] =
-          prev.positions_rad[joint] +
-          alpha * (next.positions_rad[joint] - prev.positions_rad[joint]);
-    }
-    return interpolated;
-  }
-
-  return trajectory.waypoints.back().positions_rad;
-}
-
 TrajectoryDTO ExecutionKernel::build_remaining_trajectory(
     const TrajectoryDTO& trajectory, const ExecutionSnapshot& snapshot) const {
   if (trajectory.waypoints.empty()) {
@@ -2724,7 +2685,25 @@ TrajectoryDTO ExecutionKernel::build_remaining_trajectory(
 
   std::vector<double> current_positions = snapshot.joint_positions_rad;
   if (current_positions.empty()) {
-    current_positions = interpolate_joint_positions(trajectory, elapsed_s);
+    // Snapshot did not carry a joint vector (cold path / pre-execution
+    // entry); reconstruct the position from the trajectory at the
+    // observed elapsed time via the shared sampler.
+    auto sample = sample_trajectory(trajectory, elapsed_s);
+    if (sample.ok()) {
+      current_positions = std::move(sample.value().positions_rad);
+    } else {
+      // Fail closed: with no snapshot position and a sampler that
+      // rejects the active trajectory, the resume start state is
+      // unknown. Return a trajectory with NO waypoints so the caller's
+      // validate_trajectory gate rejects the resume rather than
+      // proceeding from an empty/garbage start waypoint.
+      std::cerr << "trajectory_sampler error in build_remaining_trajectory: "
+                << sample.error().code << " (time_s=" << elapsed_s
+                << ", waypoints=" << trajectory.waypoints.size() << ")"
+                << std::endl;
+      remaining.waypoints.clear();
+      return remaining;
+    }
   }
 
   TrajectoryWaypointDTO current_wp;
@@ -3289,7 +3268,19 @@ void ExecutionKernel::async_execute_worker(
 
           auto resumed_trajectory =
               build_remaining_trajectory(active_trajectory, latest_backend_snapshot);
-          auto resume_validation = validate_trajectory(resumed_trajectory, request);
+          // Fail closed: build_remaining_trajectory returns no waypoints
+          // when it cannot determine the resume start state (sampler
+          // rejected the active trajectory and no observed snapshot
+          // position was available). Treat that as a resume failure
+          // rather than validating an empty trajectory.
+          Result<CollisionWorldRevision> resume_validation =
+              resumed_trajectory.waypoints.empty()
+                  ? Result<CollisionWorldRevision>::Err(ErrorDTO{
+                        std::string(to_string(ErrorCode::kInternalError)),
+                        "resume could not reconstruct the remaining "
+                        "trajectory start state",
+                        {{"reason", "remaining_trajectory_unavailable"}}})
+                  : validate_trajectory(resumed_trajectory, request);
           if (!resume_validation.ok()) {
             if (validation_cancelled_by_interrupt(resume_validation.error()) &&
                 sm_.status().state == ExecutionState::kInterrupted) {

@@ -249,8 +249,6 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
   void set_command_gate(bool enabled);
   void publish_runtime_velocity_scale(double scale);
   core::Result<void> command_sim_initial_state(std::string phase);
-  std::vector<double> interpolate_joint_positions(
-      const core::TrajectoryDTO& trajectory, double time_s) const;
   bool update_scene_positions(const std::vector<double>& joint_positions,
                               SceneUpdateMode mode = SceneUpdateMode::kBlocking);
   std::optional<double> scene_group_joint_position(
