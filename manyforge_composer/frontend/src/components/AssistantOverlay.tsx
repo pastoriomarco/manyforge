@@ -4,6 +4,7 @@ import { ApiError, api } from '../api/client';
 import { useCycleStore } from '../store/cycleStore';
 import { useDeploymentStore } from '../store/deploymentStore';
 import { useProgramStore } from '../store/programStore';
+import { useViewerSelectionStore } from '../store/viewerSelectionStore';
 import type {
   AssistantChatResponse,
   AssistantModeDefinition,
@@ -442,6 +443,7 @@ export function AssistantOverlay() {
   const cycleState = useCycleStore((state) => state.state);
 
   const [open, setOpen] = useState(false);
+  const panelOpen = useViewerSelectionStore((s) => s.activePanel !== null);
   const [input, setInput] = useState('');
   const [selectedModeId, setSelectedModeId] = useState('');
   const [conversationId, setConversationId] = useState<string | undefined>();
@@ -771,6 +773,9 @@ export function AssistantOverlay() {
         <button
           type="button"
           onClick={() => setOpen(true)}
+          // Shift left while a right-side overlay panel (Tools / Robot Control /
+          // Object) is open so the floating button never overlaps it.
+          style={{ transform: panelOpen ? 'translateX(-18.75rem)' : undefined }}
           className="fixed bottom-20 right-20 z-40 flex h-12 w-12 items-center justify-center rounded-full border border-blue-400/70 bg-blue-600 text-sm font-semibold text-white shadow-xl shadow-black/40 transition hover:bg-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-300"
           title="Open assistant"
         >

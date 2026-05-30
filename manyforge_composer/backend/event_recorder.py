@@ -33,9 +33,6 @@ _ALLOWED_EVENT_TYPES = {
     "plan_failed",
     "plan_started",
     "stop_completed",
-    "streaming_session_ended",
-    "streaming_session_started",
-    "streaming_target_rejected",
     "validation_failed",
     "validation_started",
 }
@@ -60,11 +57,6 @@ _DEFAULT_FAILURE_ARCHIVE_MAX_BYTES = 1024 * 1024 * 1024
 _DEFAULT_HISTORY_LIMIT = 1000
 _MAX_HISTORY_LIMIT = 10000
 _NATIVE_KERNEL_EVENT_TYPES_TO_RECORD = {
-    # Keep high-rate accepted target events out of the durable recorder. The
-    # native kernel event buffer still carries them for short-term diagnostics.
-    "streaming_session_started",
-    "streaming_session_ended",
-    "streaming_target_rejected",
     "error_raised",
     "collision_detected",
 }
@@ -93,8 +85,6 @@ def _severity_for_event(event_type: str, details: Optional[dict[str, Any]]) -> s
         return "ERROR"
     if event_type.endswith("_failed"):
         return "ERROR"
-    if event_type == "streaming_target_rejected":
-        return "WARN"
     if details and details.get("error"):
         return "ERROR"
     return "INFO"
@@ -109,8 +99,6 @@ def _component_for_event(event_type: str) -> str:
         return "manyforge.runtime_override"
     if event_type.startswith("intervention_"):
         return "manyforge.intervention"
-    if event_type.startswith("streaming_"):
-        return "manyforge.direct_control"
     if event_type.startswith("cycle_"):
         return "manyforge.cycle"
     if event_type.startswith("kernel_") or event_type in {
@@ -467,11 +455,7 @@ class EventRecorder:
                 event_type=native_type,
                 execution_id=int(native_event.get("execution_id") or 0),
                 details=details or None,
-                execution_mode=(
-                    "direct_control"
-                    if native_type.startswith("streaming_")
-                    else None
-                ),
+                execution_mode=None,
                 timestamp_ns=int(native_event.get("timestamp_ns") or time.monotonic_ns()),
             )
 

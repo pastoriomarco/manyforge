@@ -40,8 +40,7 @@ interface ViewerSelectionStore {
   // SceneObjectMesh's TransformControls) can gate themselves on
   // panel focus without prop-drilling through the Canvas boundary.
   // Switching the active panel implicitly stops the relevant
-  // gizmos — the gizmo components unmount and their cleanup
-  // effects abort any open streaming session.
+  // gizmos — the gizmo components unmount and reset their drag state.
   activePanel: ActivePanel;
   // Day-5c: robot-panel mode. The Cartesian mode renders a TCP
   // gizmo inside the 3D Canvas (managed by SceneViewer reading from
@@ -59,23 +58,8 @@ interface ViewerSelectionStore {
   // the global edit-locked state ON so the rest of the UI behaves
   // the way it does during direct_control — even if the backend
   // hasn't entered the direct_control cycle state yet (the first
-  // jog request only races there on mouseUp / the first
-  // follow-throttle tick).
+  // jog request only races there on mouseUp).
   isDraggingGizmo: boolean;
-  // ADR-0016 streaming-session UX: short label shown when the most-
-  // recent streamed Cartesian target was rejected by the kernel/backend
-  // (e.g. IK failure when the gizmo is dragged out of reach). Held in
-  // the store rather than TcpJogGizmo's local state because frequent
-  // state changes on the gizmo component caused TransformControls to
-  // mount/remount and fire spurious onMouseDown events. The indicator
-  // is rendered by a separate sibling component that subscribes here.
-  cartesianRejectionLabel: string | null;
-  /// Live anchor pose used by the magenta indicator to track the gizmo
-  /// position. Vec3 + xyzw quat; null when no streaming session is active.
-  cartesianRejectionAnchor: {
-    position: [number, number, number];
-    quaternion: [number, number, number, number];
-  } | null;
   // Optional diagnostics overlay for external pose-source observations
   // (Isaac/perception measured state). Kept viewer-local and off by
   // default because it is an operator aid, not planning-scene truth.
@@ -93,13 +77,6 @@ interface ViewerSelectionStore {
   setCartesianFrame: (frame: CartesianFrame) => void;
   setCartesianGizmoMode: (mode: 'translate' | 'rotate') => void;
   setDraggingGizmo: (next: boolean) => void;
-  setCartesianRejection: (
-    label: string | null,
-    anchor?: {
-      position: [number, number, number];
-      quaternion: [number, number, number, number];
-    } | null,
-  ) => void;
   setMeasuredStateGhostVisible: (visible: boolean) => void;
 }
 
@@ -142,8 +119,6 @@ export const useViewerSelectionStore = create<ViewerSelectionStore>((set, get) =
   cartesianFrame: 'base',
   cartesianGizmoMode: 'translate',
   isDraggingGizmo: false,
-  cartesianRejectionLabel: null,
-  cartesianRejectionAnchor: null,
   measuredStateGhostVisible: false,
   setSelected: (id) => set({ selectedId: id }),
   toggleLocked: (id) =>
@@ -169,12 +144,6 @@ export const useViewerSelectionStore = create<ViewerSelectionStore>((set, get) =
   setCartesianFrame: (frame) => set({ cartesianFrame: frame }),
   setCartesianGizmoMode: (mode) => set({ cartesianGizmoMode: mode }),
   setDraggingGizmo: (next) => set({ isDraggingGizmo: next }),
-  setCartesianRejection: (label, anchor) =>
-    set((state) => ({
-      cartesianRejectionLabel: label,
-      cartesianRejectionAnchor:
-        anchor !== undefined ? anchor : state.cartesianRejectionAnchor,
-    })),
   setMeasuredStateGhostVisible: (visible) => set({ measuredStateGhostVisible: visible }),
 }));
 

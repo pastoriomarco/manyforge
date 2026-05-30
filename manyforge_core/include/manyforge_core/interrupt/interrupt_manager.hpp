@@ -42,7 +42,6 @@ struct InterruptRuntimeContext {
   InterruptExecutionPhase phase = InterruptExecutionPhase::kPlanning;
   std::optional<std::uint64_t> execution_id;
   std::optional<std::string> move_id;
-  std::optional<std::uint64_t> streaming_session_id;
   std::optional<CollisionWorldRevision> borrowed_collision_world_revision;
 };
 

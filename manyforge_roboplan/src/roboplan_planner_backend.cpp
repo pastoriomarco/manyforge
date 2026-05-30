@@ -3,6 +3,7 @@
 #include <manyforge_roboplan/collision_diagnostics_capture.hpp>
 
 #include <Eigen/Dense>
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <fmt/format.h>
@@ -274,6 +275,99 @@ void anchor_trajectory_endpoints(
 
 namespace manyforge::roboplan_backend {
 
+JointCapMeasurement measure_joint_cap_peaks(
+    const roboplan::JointTrajectory& traj,
+    const std::map<std::string, double>& vel_cap_by_name,
+    const std::map<std::string, double>& acc_cap_by_name) {
+  JointCapMeasurement m;
+  const size_t n = traj.times.size();
+  // Every capped joint MUST be present in the trajectory's joint set, otherwise
+  // its cap is never measured and would falsely report as satisfied. A capped
+  // joint absent from the trajectory cannot be verified -> fail closed. (The
+  // planner also rejects non-active-group cap names up front; this is the
+  // measurement-layer backstop against any trajectory/group-name divergence.)
+  auto trajectory_has_joint = [&](const std::string& jn) {
+    return std::find(traj.joint_names.begin(), traj.joint_names.end(), jn) !=
+           traj.joint_names.end();
+  };
+  for (const auto& [jn, cap] : vel_cap_by_name) {
+    (void)cap;
+    if (!trajectory_has_joint(jn)) {
+      m.samples_complete = false;
+      m.incomplete_dimension = "velocity";
+      m.incomplete_joint = jn;
+      return m;
+    }
+  }
+  for (const auto& [jn, cap] : acc_cap_by_name) {
+    (void)cap;
+    if (!trajectory_has_joint(jn)) {
+      m.samples_complete = false;
+      m.incomplete_dimension = "acceleration";
+      m.incomplete_joint = jn;
+      return m;
+    }
+  }
+  for (size_t j = 0; j < traj.joint_names.size(); ++j) {
+    const std::string& jn = traj.joint_names[j];
+    const auto v_it = vel_cap_by_name.find(jn);
+    const auto a_it = acc_cap_by_name.find(jn);
+    const bool want_v = v_it != vel_cap_by_name.end();
+    const bool want_a = a_it != acc_cap_by_name.end();
+    if (!want_v && !want_a) {
+      continue;  // joint not capped by this deployment (e.g. other group)
+    }
+    // A capped joint with no waypoints cannot be verified -> fail closed.
+    if (n == 0) {
+      m.samples_complete = false;
+      m.incomplete_dimension = want_v ? "velocity" : "acceleration";
+      m.incomplete_joint = jn;
+      return m;
+    }
+    double peak_v = 0.0;
+    double peak_a = 0.0;
+    for (size_t w = 0; w < n; ++w) {
+      if (want_v) {
+        if (w >= traj.velocities.size() ||
+            j >= static_cast<size_t>(traj.velocities[w].size())) {
+          m.samples_complete = false;
+          m.incomplete_dimension = "velocity";
+          m.incomplete_joint = jn;
+          return m;
+        }
+        peak_v = std::max(peak_v, std::abs(traj.velocities[w][j]));
+      }
+      if (want_a) {
+        if (w >= traj.accelerations.size() ||
+            j >= static_cast<size_t>(traj.accelerations[w].size())) {
+          m.samples_complete = false;
+          m.incomplete_dimension = "acceleration";
+          m.incomplete_joint = jn;
+          return m;
+        }
+        peak_a = std::max(peak_a, std::abs(traj.accelerations[w][j]));
+      }
+    }
+    if (want_v && peak_v > v_it->second) {
+      const double r = peak_v / v_it->second;
+      if (r > m.worst_vel_ratio) {
+        m.worst_vel_ratio = r;
+        m.worst_vel_joint = jn;
+        m.worst_vel_peak = peak_v;
+      }
+    }
+    if (want_a && peak_a > a_it->second) {
+      const double r = peak_a / a_it->second;
+      if (r > m.worst_acc_ratio) {
+        m.worst_acc_ratio = r;
+        m.worst_acc_joint = jn;
+        m.worst_acc_peak = peak_a;
+      }
+    }
+  }
+  return m;
+}
+
 RoboPlanPlannerBackend::RoboPlanPlannerBackend(
     std::shared_ptr<roboplan::Scene> scene,
     const roboplan::RRTOptions& rrt_options,
@@ -281,19 +375,19 @@ RoboPlanPlannerBackend::RoboPlanPlannerBackend(
     std::shared_ptr<roboplan::PathParameterizerTOPPRA> toppra,
     std::shared_ptr<roboplan::SimpleIk> ik,
     std::shared_ptr<std::mutex> scene_mutex,
-    std::shared_ptr<roboplan::SimpleIk> streaming_ik)
+    std::shared_ptr<roboplan::SimpleIk> single_shot_ik)
     : scene_(std::move(scene)),
       rrt_options_(rrt_options),
       shortcutter_(std::move(shortcutter)),
       toppra_(std::move(toppra)),
       ik_(std::move(ik)),
-      streaming_ik_(std::move(streaming_ik)),
+      single_shot_ik_(std::move(single_shot_ik)),
       scene_mutex_(std::move(scene_mutex)) {
   if (!scene_mutex_) {
     scene_mutex_ = std::make_shared<std::mutex>();
   }
-  if (!streaming_ik_) {
-    streaming_ik_ = ik_;
+  if (!single_shot_ik_) {
+    single_shot_ik_ = ik_;
   }
 }
 
@@ -452,6 +546,100 @@ core::PlanResultDTO RoboPlanPlannerBackend::plan(const core::PlanRequestDTO& req
       return result;
     }
 
+    // Per-joint dynamics caps (Phase 4-P5.1K). The deployment/operator caps in
+    // request.per_joint_dynamics_limits are ONE source only; the conservative
+    // effective limit is min(model, cap) per joint per dimension. This backend
+    // does NOT feed per-joint vectors into TOPP-RA: TOPP-RA receives only scalar
+    // velocity/acceleration scales. Instead we enforce the absolute caps with a
+    // conservative GLOBAL retiming loop (below) that slows the whole trajectory
+    // and then VERIFIES the result by sampling per-joint peak velocity and
+    // acceleration against the caps. This is approximate-but-conservative
+    // (the retiming can only make motion slower, never exceed a cap), and it
+    // fails closed when a cap cannot be met or verified. We validate the cap
+    // map up front and fail closed before spending the RRT budget.
+    //
+    // The active planning group's joint names: the kernel populates start_state
+    // with exactly the joints this plan drives, and the produced trajectory is
+    // over the same set. A cap keyed by a joint outside this set (a typo, or a
+    // joint that belongs to a different group) cannot be enforced by this plan,
+    // so we reject it rather than silently ignoring it.
+    const std::vector<std::string>& group_joint_names = start.joint_names;
+    auto is_active_group_joint = [&](const std::string& jn) {
+      return std::find(group_joint_names.begin(), group_joint_names.end(), jn) !=
+             group_joint_names.end();
+    };
+    std::map<std::string, double> vel_cap_by_name;  // rad/s, strictly positive
+    std::map<std::string, double> acc_cap_by_name;  // rad/s^2, strictly positive
+    for (const auto& [joint_name, limit] : request.per_joint_dynamics_limits) {
+      // Unknown / non-active joint name -> fail closed (never a silent no-op).
+      if (!is_active_group_joint(joint_name)) {
+        result.error = core::ErrorDTO{
+            core::kErrorUnsupportedCapability,
+            "per-joint dynamics cap names a joint that is not in the active "
+            "planning group",
+            {{"reason", "unsupported_joint_dynamics_limit"},
+             {"joint", joint_name},
+             {"group", rrt_options_.group_name},
+             {"failure_stage", "request_validation"}}};
+        return result;
+      }
+      // Jerk caps: validate the value first, THEN report enforceability. A
+      // malformed jerk (NaN/inf/<=0) is an invalid request regardless of
+      // whether the active path could enforce it; only a finite, strictly
+      // positive jerk cap is "well-formed but unsupported" on the discrete
+      // TOPP-RA path (this backend constrains jerk for no joint).
+      if (limit.max_jerk_rad_s3.has_value()) {
+        const double j = *limit.max_jerk_rad_s3;
+        if (!std::isfinite(j) || j <= 0.0) {
+          result.error = core::ErrorDTO{
+              core::kErrorInvalidRequest,
+              "per-joint max_jerk_rad_s3 must be finite and strictly positive",
+              {{"reason", "invalid_joint_dynamics_limit"},
+               {"joint", joint_name},
+               {"dimension", "jerk"}}};
+          return result;
+        }
+        result.error = core::ErrorDTO{
+            core::kErrorUnsupportedCapability,
+            "per-joint jerk caps are not enforceable by the discrete TOPP-RA "
+            "time-parameterization path",
+            {{"reason", "unsupported_joint_dynamics_limit"},
+             {"joint", joint_name},
+             {"dimension", "jerk"},
+             {"backend", "roboplan_toppra"}}};
+        return result;
+      }
+      if (limit.max_velocity_rad_s.has_value()) {
+        const double v = *limit.max_velocity_rad_s;
+        if (!std::isfinite(v) || v <= 0.0) {
+          result.error = core::ErrorDTO{
+              core::kErrorInvalidRequest,
+              "per-joint max_velocity_rad_s must be finite and strictly positive",
+              {{"reason", "invalid_joint_dynamics_limit"},
+               {"joint", joint_name},
+               {"dimension", "velocity"}}};
+          return result;
+        }
+        vel_cap_by_name[joint_name] = v;
+      }
+      if (limit.max_acceleration_rad_s2.has_value()) {
+        const double a = *limit.max_acceleration_rad_s2;
+        if (!std::isfinite(a) || a <= 0.0) {
+          result.error = core::ErrorDTO{
+              core::kErrorInvalidRequest,
+              "per-joint max_acceleration_rad_s2 must be finite and strictly "
+              "positive",
+              {{"reason", "invalid_joint_dynamics_limit"},
+               {"joint", joint_name},
+               {"dimension", "acceleration"}}};
+          return result;
+        }
+        acc_cap_by_name[joint_name] = a;
+      }
+    }
+    const bool has_joint_dynamics_caps =
+        !vel_cap_by_name.empty() || !acc_cap_by_name.empty();
+
     // Plan path with an RRT instance configured for this request's timeout.
     // This gives the native backend a hard, cooperative planning bound instead
     // of relying only on a post-hoc stop request in the kernel.
@@ -503,25 +691,48 @@ core::PlanResultDTO RoboPlanPlannerBackend::plan(const core::PlanRequestDTO& req
     // Shortcut the path
     auto smoothed_path = shortcutter_->shortcut(path_result.value(), 0.05);
 
-    // Time-parameterize with TOPPRA, enforcing TCP speed limit if set.
-    // Iteratively reduce velocity_scale until TCP linear speed is within bounds.
+    // Time-parameterize with TOPPRA. TOPP-RA itself takes only SCALAR velocity
+    // and acceleration scales — there is no per-joint vector-limit input on this
+    // path. We therefore enforce the global TCP linear-speed limit and the
+    // per-joint velocity/acceleration caps (Phase 4-P5.1K) with a conservative
+    // GLOBAL retiming loop: each pass generates a trajectory, then VERIFIES it
+    // by sampling per-joint peak velocity/acceleration (and TCP speed) and, if
+    // any cap is exceeded, slows the whole trajectory and regenerates. TCP speed
+    // and per-joint velocity caps pull down velocity_scale; per-joint
+    // acceleration caps pull down acceleration_scale and (for the velocity²
+    // centripetal component) velocity_scale by sqrt(ratio). velocity_scale
+    // starts at the operator value and is only ever reduced, so the resolved
+    // absolute caps bind regardless of the operator scale (cap resolved first;
+    // velocity_scale applies on top); the acceleration cap is never multiplied
+    // by the velocity scale. This is approximate-but-conservative (retiming only
+    // ever slows motion) and fails closed if a cap cannot be met within the
+    // iteration budget or cannot be verified for lack of samples.
     const double tcp_limit = request.speed_profile.max_tcp_linear_speed_mps.value_or(0.0);
     const std::string& tcp_frame = request.tcp_frame;
+    const bool has_tcp_limit = tcp_limit > 0.0 && !tcp_frame.empty();
     double vel_scale = request.speed_profile.velocity_scale;
-    constexpr int kMaxTcpIterations = 32;
-    constexpr double kTcpSpeedMargin = 0.99;  // aim slightly under the limit
+    double acc_scale = request.speed_profile.acceleration_scale;
+    constexpr int kMaxRetimeIterations = 32;
+    constexpr double kSpeedMargin = 0.99;  // aim slightly under each limit
 
     roboplan::JointTrajectory final_traj;
     TcpSpeedCheck final_tcp_check;
-    int tcp_iterations_used = 0;
+    int retime_iterations_used = 0;
+    // Worst measured/cap ratios on the final pass (> 1.0 == still violating).
+    double final_vel_cap_ratio = 1.0;
+    double final_acc_cap_ratio = 1.0;
+    std::string final_vel_cap_joint;
+    std::string final_acc_cap_joint;
+    double final_vel_cap_peak = 0.0;
+    double final_acc_cap_peak = 0.0;
 
-    for (int iter = 0; iter < kMaxTcpIterations; ++iter) {
-      tcp_iterations_used = iter + 1;
+    for (int iter = 0; iter < kMaxRetimeIterations; ++iter) {
+      retime_iterations_used = iter + 1;
       auto traj_result = toppra_->generate(
           smoothed_path, 0.01,
           roboplan::SplineFittingMode::Hermite,
           vel_scale,
-          request.speed_profile.acceleration_scale);
+          acc_scale);
 
       if (!traj_result.has_value()) {
         result.error = core::ErrorDTO{core::kErrorPlanningFailed,
@@ -533,31 +744,87 @@ core::PlanResultDTO RoboPlanPlannerBackend::plan(const core::PlanRequestDTO& req
       anchor_trajectory_endpoints(
           final_traj, start_config.positions, goal_config.positions);
 
-      // If no TCP speed limit, accept on first pass
-      if (tcp_limit <= 0.0 || tcp_frame.empty()) {
+      // --- Global TCP linear speed ---
+      bool tcp_ok = true;
+      if (has_tcp_limit) {
+        final_tcp_check = compute_tcp_speed_check(
+            scene_, rrt_options_.group_name, final_traj, tcp_frame);
+        tcp_ok = final_tcp_check.max_speed_mps <= tcp_limit;
+      }
+
+      // --- Per-joint velocity / acceleration caps ---
+      // Sample the generated trajectory and compare peaks against the caps. If a
+      // capped dimension lacks samples for a capped joint, the cap cannot be
+      // verified -> fail closed (do NOT treat the missing peak as zero, which
+      // would falsely pass the cap).
+      double vel_cap_ratio = 1.0;
+      double acc_cap_ratio = 1.0;
+      final_vel_cap_joint.clear();
+      final_acc_cap_joint.clear();
+      final_vel_cap_peak = 0.0;
+      final_acc_cap_peak = 0.0;
+      if (has_joint_dynamics_caps) {
+        const JointCapMeasurement meas =
+            measure_joint_cap_peaks(final_traj, vel_cap_by_name, acc_cap_by_name);
+        if (!meas.samples_complete) {
+          result.error = core::ErrorDTO{
+              core::kErrorUnsupportedCapability,
+              "trajectory lacks the samples required to verify a per-joint "
+              "dynamics cap; cannot prove enforcement",
+              {{"reason", "unsupported_joint_dynamics_limit"},
+               {"failure_stage", "time_parameterization"},
+               {"dimension", meas.incomplete_dimension},
+               {"joint", meas.incomplete_joint}}};
+          return result;
+        }
+        vel_cap_ratio = meas.worst_vel_ratio;
+        acc_cap_ratio = meas.worst_acc_ratio;
+        final_vel_cap_joint = meas.worst_vel_joint;
+        final_acc_cap_joint = meas.worst_acc_joint;
+        final_vel_cap_peak = meas.worst_vel_peak;
+        final_acc_cap_peak = meas.worst_acc_peak;
+      }
+      final_vel_cap_ratio = vel_cap_ratio;
+      final_acc_cap_ratio = acc_cap_ratio;
+      const bool joints_ok = vel_cap_ratio <= 1.0 && acc_cap_ratio <= 1.0;
+
+      if (tcp_ok && joints_ok) {
         break;
       }
 
-      final_tcp_check = compute_tcp_speed_check(
-          scene_, rrt_options_.group_name, final_traj, tcp_frame);
-
-      // If within limit, done
-      if (final_tcp_check.max_speed_mps <= tcp_limit) {
-        break;
+      // Reduce scales conservatively so every constraint moves toward
+      // satisfaction together; take the most aggressive factor on each lever.
+      // TCP speed and per-joint velocity act ~linearly on vel_scale. Per-joint
+      // acceleration has a tangential component (∝ acc_scale) and a centripetal
+      // component (∝ traversal speed²), so an acceleration violation pulls down
+      // acc_scale (tangential) AND vel_scale by sqrt(ratio) (centripetal) — the
+      // square root because the velocity-squared term scales the peak by
+      // vel_scale².
+      double vel_factor = 1.0;
+      double acc_factor = 1.0;
+      if (has_tcp_limit && !tcp_ok) {
+        vel_factor = std::min(
+            vel_factor, (tcp_limit * kSpeedMargin) / final_tcp_check.max_speed_mps);
       }
-
-      // Scale down proportionally: new_scale = old_scale * (limit / actual)
-      double ratio = (tcp_limit * kTcpSpeedMargin) / final_tcp_check.max_speed_mps;
-      vel_scale *= ratio;
-
-      // Clamp to a reasonable minimum
-      if (vel_scale < 0.001) {
-        vel_scale = 0.001;
+      if (vel_cap_ratio > 1.0) {
+        vel_factor = std::min(vel_factor, kSpeedMargin / vel_cap_ratio);
       }
+      if (acc_cap_ratio > 1.0) {
+        acc_factor = std::min(acc_factor, kSpeedMargin / acc_cap_ratio);
+        vel_factor =
+            std::min(vel_factor, kSpeedMargin / std::sqrt(acc_cap_ratio));
+      }
+      if (vel_factor < 1.0) {
+        vel_scale *= vel_factor;
+      }
+      if (acc_factor < 1.0) {
+        acc_scale *= acc_factor;
+      }
+      if (vel_scale < 0.001) vel_scale = 0.001;
+      if (acc_scale < 0.001) acc_scale = 0.001;
     }
 
-    if (tcp_limit > 0.0 && !tcp_frame.empty() &&
-        final_tcp_check.max_speed_mps > tcp_limit) {
+    if (has_tcp_limit && final_tcp_check.max_speed_mps > tcp_limit) {
       std::map<std::string, std::string> details;
       details["failure_stage"] = "time_parameterization";
       details["limit_type"] = "tcp_linear_speed";
@@ -570,11 +837,42 @@ core::PlanResultDTO RoboPlanPlannerBackend::plan(const core::PlanRequestDTO& req
           final_traj.times.empty() ? "0.000000" : std::to_string(final_traj.times.back());
       details["max_segment_index"] = std::to_string(final_tcp_check.segment_index);
       details["max_segment_dt_s"] = std::to_string(final_tcp_check.segment_dt_s);
-      details["toppra_iterations"] = std::to_string(tcp_iterations_used);
+      details["toppra_iterations"] = std::to_string(retime_iterations_used);
       details["final_velocity_scale"] = std::to_string(vel_scale);
       result.error = core::ErrorDTO{
           core::kErrorValidationLimitsViolation,
           "TCP linear speed exceeds limit after time-parameterization",
+          details};
+      return result;
+    }
+
+    if (has_joint_dynamics_caps &&
+        (final_vel_cap_ratio > 1.0 || final_acc_cap_ratio > 1.0)) {
+      std::map<std::string, std::string> details;
+      details["failure_stage"] = "time_parameterization";
+      details["reason"] = "unsupported_joint_dynamics_limit";
+      details["toppra_iterations"] = std::to_string(retime_iterations_used);
+      details["final_velocity_scale"] = std::to_string(vel_scale);
+      details["final_acceleration_scale"] = std::to_string(acc_scale);
+      details["trajectory_duration_s"] =
+          final_traj.times.empty() ? "0.000000" : std::to_string(final_traj.times.back());
+      if (final_vel_cap_ratio >= final_acc_cap_ratio) {
+        details["limit_type"] = "joint_velocity";
+        details["joint"] = final_vel_cap_joint;
+        details["measured"] = std::to_string(final_vel_cap_peak);
+        details["limit"] = std::to_string(vel_cap_by_name[final_vel_cap_joint]);
+        details["units"] = "rad/s";
+      } else {
+        details["limit_type"] = "joint_acceleration";
+        details["joint"] = final_acc_cap_joint;
+        details["measured"] = std::to_string(final_acc_cap_peak);
+        details["limit"] = std::to_string(acc_cap_by_name[final_acc_cap_joint]);
+        details["units"] = "rad/s^2";
+      }
+      result.error = core::ErrorDTO{
+          core::kErrorUnsupportedCapability,
+          "per-joint dynamics cap could not be enforced by conservative "
+          "retiming within the iteration budget",
           details};
       return result;
     }
@@ -624,11 +922,11 @@ core::TrajectoryDTO RoboPlanPlannerBackend::convert_trajectory(
 }
 
 // =================================================================
-// Single-shot IK for streaming-session execution mode (ADR-0016).
+// Single-shot IK (IPlannerBackend::solve_ik).
 //
 // Uses a separate low-budget SimpleIk solver when configured. Full plan()
-// keeps the planning IK budget; streaming solve_ik() is bounded for direct
-// control responsiveness.
+// keeps the planning IK budget; solve_ik() is bounded for interactive
+// (e.g. validated candidate Cartesian authoring) responsiveness.
 // Distinct from plan(): no trajectory shaping, no collision check, no
 // RRT — just a pose-to-joint resolve with the previous-frame joints as
 // seed for continuity across streamed frames.
@@ -637,7 +935,7 @@ core::IkResultDTO RoboPlanPlannerBackend::solve_ik(
     const core::IkRequestDTO& request) {
   core::IkResultDTO result;
 
-  if (!streaming_ik_) {
+  if (!single_shot_ik_) {
     result.ok = false;
     result.error = core::ErrorDTO{
         std::string(core::to_string(core::ErrorCode::kUnsupportedCapability)),
@@ -699,11 +997,11 @@ core::IkResultDTO RoboPlanPlannerBackend::solve_ik(
 
   {
     std::lock_guard<std::mutex> lock(*scene_mutex_);
-    if (!streaming_ik_->solveIk(cart_config, start_config, goal_config)) {
+    if (!single_shot_ik_->solveIk(cart_config, start_config, goal_config)) {
       result.ok = false;
       result.error = core::ErrorDTO{
           std::string(core::to_string(core::ErrorCode::kIkFailed)),
-          "IK failed for streaming target",
+          "IK failed for requested target",
           {{"base_frame", request.base_frame},
            {"tcp_frame", request.tcp_frame}}};
       return result;

@@ -273,24 +273,22 @@ std::shared_ptr<NativeKernelBundle> create_native_kernel(
   ik_opts.max_restarts = 50;
   ik_opts.max_time = 1.0;
   bundle->ik = std::make_shared<roboplan::SimpleIk>(bundle->scene, ik_opts);
-  auto streaming_ik_opts = ik_opts;
-  streaming_ik_opts.max_time = kernel_config.streaming_ik_timeout_s;
-  bundle->streaming_ik =
-      std::make_shared<roboplan::SimpleIk>(bundle->scene, streaming_ik_opts);
+  auto single_shot_ik_opts = ik_opts;
+  single_shot_ik_opts.max_time = kernel_config.single_shot_ik_timeout_s;
+  bundle->single_shot_ik =
+      std::make_shared<roboplan::SimpleIk>(bundle->scene, single_shot_ik_opts);
 
   // Create native backends
   auto scene_mutex = std::make_shared<std::mutex>();
   bundle->planner = std::make_unique<RoboPlanPlannerBackend>(
       bundle->scene, rrt_opts, bundle->shortcutter, bundle->toppra, bundle->ik,
-      scene_mutex, bundle->streaming_ik);
+      scene_mutex, bundle->single_shot_ik);
   bundle->context = std::make_unique<RoboPlanPlanningContext>(
       bundle->scene, group_name, scene_mutex);
   bundle->clock = std::make_unique<WallClock>();
   RoboPlanExecutionBackendConfig execution_config;
   execution_config.reset_completion_timeout_s =
       kernel_config.native_reset_completion_timeout_s;
-  execution_config.streaming_stop_completion_timeout_s =
-      kernel_config.native_streaming_stop_completion_timeout_s;
   bundle->execution = std::make_unique<RoboPlanExecutionBackend>(
       bundle->scene, group_name, *bundle->clock, scene_mutex, execution_config);
   bundle->scheduler = std::make_unique<SimpleScheduler>();

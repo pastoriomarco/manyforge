@@ -149,3 +149,41 @@ def test_runtime_dynamic_body_max_age_cap_absent_returns_none():
         composer_main._runtime_dynamic_body_max_age_cap_ns_from_deployment(deployment)
         is None
     )
+
+
+def test_kernel_config_forwards_single_shot_ik_timeout():
+    deployment = SimpleNamespace(
+        adapters={
+            "execution": SimpleNamespace(
+                adapter_id="execution.native",
+                config={"single_shot_ik_timeout_s": 0.08},
+            )
+        },
+        orchestrator=SimpleNamespace(config={}),
+    )
+    config = composer_main._kernel_config_from_deployment(
+        deployment,
+        collision_monitor_period_ns=None,
+        runtime_collision_query_timeout_ns=None,
+        runtime_dynamic_body_max_age_cap_ns=None,
+    )
+    assert config["single_shot_ik_timeout_s"] == 0.08
+
+
+def test_kernel_config_omits_single_shot_ik_timeout_when_absent():
+    deployment = SimpleNamespace(
+        adapters={
+            "execution": SimpleNamespace(adapter_id="execution.native", config={})
+        },
+        orchestrator=SimpleNamespace(config={}),
+    )
+    # Pass one non-None override so the builder returns a dict (it collapses to
+    # None only when nothing at all is configured).
+    config = composer_main._kernel_config_from_deployment(
+        deployment,
+        collision_monitor_period_ns=50_000_000,
+        runtime_collision_query_timeout_ns=None,
+        runtime_dynamic_body_max_age_cap_ns=None,
+    )
+    assert config is not None
+    assert "single_shot_ik_timeout_s" not in config

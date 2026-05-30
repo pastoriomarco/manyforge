@@ -13,8 +13,7 @@ bool ExecutionStateMachine::is_valid_transition(ExecutionState from, ExecutionSt
     switch (from) {
         case ExecutionState::kIdle:
             return to == ExecutionState::kPlanning ||
-                   to == ExecutionState::kValidating ||  // cache hit
-                   to == ExecutionState::kStreaming;     // begin_streaming_session (ADR-0016)
+                   to == ExecutionState::kValidating;  // cache hit
         case ExecutionState::kPlanning:
             return to == ExecutionState::kValidating ||
                    to == ExecutionState::kInterrupted ||
@@ -31,16 +30,6 @@ bool ExecutionStateMachine::is_valid_transition(ExecutionState from, ExecutionSt
             return to == ExecutionState::kStopping ||
                    to == ExecutionState::kInterrupted ||
                    to == ExecutionState::kCompleted ||
-                   to == ExecutionState::kFailed ||
-                   to == ExecutionState::kInterventionRequired;
-        case ExecutionState::kStreaming:
-            // ADR-0016: streaming exits via soft-stop (stop()) -> Stopping ->
-            // Stopped, or via hard cancel (reset()) -> Stopped directly, or
-            // via fault -> Failed/InterventionRequired. Per-target updates do
-            // not transition out of kStreaming.
-            return to == ExecutionState::kStopping ||
-                   to == ExecutionState::kInterrupted ||
-                   to == ExecutionState::kStopped ||
                    to == ExecutionState::kFailed ||
                    to == ExecutionState::kInterventionRequired;
         case ExecutionState::kPaused:
@@ -62,12 +51,9 @@ bool ExecutionStateMachine::is_valid_transition(ExecutionState from, ExecutionSt
                    to == ExecutionState::kFailed ||
                    to == ExecutionState::kInterventionRequired;
         case ExecutionState::kStopped:
-            // ADR-0016: streaming sessions auto-return to kIdle after a
-            // clean end_streaming_session (the operator's mouse release
-            // IS the acknowledgement; no separate ack step needed). For
-            // discrete trajectories, this transition is also acceptable
-            // since the existing kernel reset() path uses sm_.reset()
-            // which bypasses transition rules entirely.
+            // kStopped -> kIdle is acceptable: the kernel reset() path uses
+            // sm_.reset(), which bypasses transition rules entirely, and a
+            // clean stop may return to Idle for the next cycle.
             return to == ExecutionState::kIdle ||
                    to == ExecutionState::kInterventionRequired;
         case ExecutionState::kCompleted:

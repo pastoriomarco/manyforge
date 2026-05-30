@@ -18,7 +18,6 @@ function evaluate(
 ) {
   return evaluateRobotCommandAuthority({
     cycleState: 'idle',
-    followTargetPhase: 'idle',
     draftAuthority: CLEAN_DRAFT,
     sceneError: null,
     lastUpdatedAtMs: 1_000,
@@ -63,26 +62,6 @@ describe('evaluateRobotCommandAuthority', () => {
     expect(evaluate({ cycleState: 'direct_control' }).reason).toBe(
       ROBOT_COMMAND_AUTHORITY_REASONS.cycleOwnsRobot,
     );
-  });
-
-  it('blocks new robot commands while follow-target streaming owns the robot', () => {
-    const result = evaluate({
-      followTargetPhase: 'streaming',
-    });
-
-    expect(result.canCommand).toBe(false);
-    expect(result.reason).toBe(ROBOT_COMMAND_AUTHORITY_REASONS.streamingOwnsRobot);
-  });
-
-  it('can keep the active follow-target surface enabled during its own stream', () => {
-    const result = evaluate({
-      cycleState: 'direct_control',
-      followTargetPhase: 'streaming',
-      options: { allowFollowTargetActive: true },
-    });
-
-    expect(result.canCommand).toBe(true);
-    expect(result.reason).toBeNull();
   });
 
   it('uses user-facing reason labels for scene readiness failures', () => {

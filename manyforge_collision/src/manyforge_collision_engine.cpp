@@ -200,7 +200,6 @@ bool supported_required_capability(const std::string& capability,
 bool timeout_budget_covers_snapshot_sync(core::CollisionSurface surface) {
   switch (surface) {
     case core::CollisionSurface::kObservedRuntimeMonitor:
-    case core::CollisionSurface::kStreamingObservedMonitor:
       return false;
     default:
       return true;

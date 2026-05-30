@@ -225,7 +225,7 @@ remediations stay in the workflow docs:
   parse, allowlist issues.
 - [`ADDING_A_ROBOT.md`](ADDING_A_ROBOT.md) §"Troubleshooting"
   (lines 312-381) — URDF/mesh rendering, mimic chains,
-  streaming-session errors, frame visibility.
+  Robot Control joint-limit errors, frame visibility.
 - [`ASSISTANT_E2E_COOKBOOK.md`](ASSISTANT_E2E_COOKBOOK.md) §"Composer
   chat HTTP contract — required fields" (lines 474-517) — the canonical
   source for the mock-fallback gotcha.

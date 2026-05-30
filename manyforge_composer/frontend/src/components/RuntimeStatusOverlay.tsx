@@ -1,6 +1,13 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useStatusPolling, useStatusStore } from '../store/statusStore';
+import { useViewerSelectionStore } from '../store/viewerSelectionStore';
 import type { RuntimeComponentStatus, RuntimeStatus } from '../types/api';
+
+// A right-side overlay panel (Tools / Robot Control / Object) occupies the
+// `right-2 w-72` column. Shift the bottom-right floating buttons left by that
+// width while a panel is open so they never overlap it. translateX keeps the
+// buttons' relative layout and avoids reflow.
+const PANEL_CLEAR_SHIFT = 'translateX(-18.75rem)';
 
 function readinessClasses(readiness: string): string {
   switch (readiness) {
@@ -110,6 +117,7 @@ export function RuntimeStatusOverlay() {
   const summaryLabel = status?.summaryLabel ?? (error ? 'Offline' : 'Waiting');
   const buttonLabel = compactSummaryLabel(readiness, summaryLabel);
   const sortedComponents = useMemo(() => status?.components ?? [], [status]);
+  const panelOpen = useViewerSelectionStore((s) => s.activePanel !== null);
 
   return (
     <>
@@ -117,6 +125,7 @@ export function RuntimeStatusOverlay() {
         <button
           type="button"
           onClick={() => setOpen(true)}
+          style={{ transform: panelOpen ? PANEL_CLEAR_SHIFT : undefined }}
           className={`fixed bottom-20 right-6 z-40 flex h-12 w-12 items-center justify-center rounded-md border text-[11px] font-semibold shadow-xl shadow-black/40 transition focus:outline-none focus:ring-2 ${readinessClasses(readiness)}`}
           title={status?.userMessage || error || 'Runtime status'}
         >

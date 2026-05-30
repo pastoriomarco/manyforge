@@ -18,7 +18,6 @@
 #include <manyforge_core/types/kernel_event.hpp>
 #include <manyforge_core/types/metrics.hpp>
 #include <manyforge_core/types/motion_interrupt.hpp>
-#include <manyforge_core/types/streaming_session.hpp>
 
 #include <atomic>
 #include <condition_variable>
@@ -46,22 +45,19 @@ struct ExecutionKernelConfig {
   // configured monitor period before preempting execution.
   Duration runtime_collision_query_timeout_ns = 50'000'000;  // 50 ms
 
-  // Direct-control Cartesian pushes must not inherit full planning IK
-  // budgets. The kernel passes this value to the planner backend and rejects
-  // any target whose IK resolution exceeds the budget. 50 ms is conservative
-  // enough for operator feedback while allowing one missed 30 Hz frame.
-  double streaming_ik_timeout_s = 0.050;
-
-  // Direct-control collision validation has a tighter frame budget than
-  // batch trajectory validation. A target that cannot be validated inside
-  // this budget is rejected fail-closed instead of being dispatched late.
-  double streaming_collision_timeout_s = 0.010;
-
-  // Native execution-backend lifecycle drains. ROS adapters expose their own
-  // `stop_completion_timeout_s`; these fields provide equivalent knobs for
-  // the non-ROS RoboPlan backend used by Composer/native simulation.
+  // Native execution-backend lifecycle drain. ROS adapters expose their own
+  // `stop_completion_timeout_s`; this field provides the equivalent reset
+  // drain knob for the non-ROS RoboPlan backend used by Composer/native
+  // simulation.
   double native_reset_completion_timeout_s = 5.0;
-  double native_streaming_stop_completion_timeout_s = 5.0;
+
+  // Per-call budget (seconds) for single-shot IK resolution
+  // (`IPlannerBackend::solve_ik`), used by the RoboPlan/ros2_control factories
+  // to size the dedicated single-shot SimpleIk solver. This is deliberately
+  // tighter than the planning-IK budget so interactive solve_ik calls fail
+  // fast rather than stalling the caller; deployments needing more restart
+  // headroom on hard targets can raise it. Must be > 0.
+  double single_shot_ik_timeout_s = 0.05;
 
   // Authoritative collision validation worker-pool sizing. The concrete
   // engines are injected through core-owned ports; this knob only selects how
@@ -90,7 +86,7 @@ struct ExecutionKernelConfig {
   // Terminal motion-outcome retention. Outcomes are queryable via
   // `get_execution_outcome(execution_id)` until the store reaches this
   // depth; oldest entries are evicted FIFO. Audit-grade deployments
-  // should raise this and pair with a streaming archive subscriber.
+  // should raise this and pair with an audit archive subscriber.
   std::size_t motion_execution_outcome_retention = 256;
 
   // Deployment default for the backend-stop confirmation deadline used
@@ -198,45 +194,15 @@ class ExecutionKernel {
   AcknowledgeInterruptedResultDTO acknowledge_interrupted_for_retry(
       std::string principal_id, std::string reason);
 
-  // ---------------------------------------------------------------
-  // Streaming-session mode (ADR-0016).
-  //
-  // begin/push/end form the kernel-side surface for continuous direct-
-  // control inputs. Push targets are not motion-blocking; they are
-  // coalesced by the bound execution backend. stop() / reset() from
-  // kStreaming map to the soft-stop and hard-cancel paths respectively.
-  // Only one streaming session per kernel instance in v0.1.
-  // ---------------------------------------------------------------
-
-  /// Open a streaming session on the bound execution backend. Valid from
-  /// kIdle. Transitions the kernel to kStreaming on accept.
-  StreamingSessionBeginResultDTO begin_streaming_session(
-      const StreamingSessionConfigDTO& config);
-
-  /// Update the active streaming session's current target. Latest-wins
-  /// coalescing applies at the backend; this call MUST NOT block on motion.
-  StreamingPushResultDTO push_streaming_target(
-      uint64_t session_id,
-      const StreamingTargetDTO& target);
-
-  /// End the active streaming session. The backend runs the soft-stop
-  /// trajectory; the kernel transitions kStreaming -> kStopping -> kStopped.
-  StreamingSessionEndResultDTO end_streaming_session(
-      uint64_t session_id,
-      SoftStopStrategy strategy);
-
   /// ADR-0018: update the runtime velocity scale for active execution.
   ///
   /// The HMI velocity slider drives this through cycle_manager → kernel →
-  /// backend. Backends retime discrete trajectory execution and streaming
-  /// sessions continuously; changing the scale never stops an action by itself.
-  /// `scale` is validated finite and clamped to [0, 1]. NOT serialized through
-  /// lifecycle_mutex_: this is a high-rate operator surface and the backend's
-  /// atomic store handles concurrency.
+  /// backend. Backends retime discrete trajectory execution continuously;
+  /// changing the scale never stops an action by itself. `scale` is validated
+  /// finite and clamped to [0, 1]. NOT serialized through lifecycle_mutex_:
+  /// this is a high-rate operator surface and the backend's atomic store
+  /// handles concurrency.
   void set_runtime_velocity_scale(double scale);
-
-  /// Compatibility alias for older callers.
-  void set_streaming_velocity_scale(double scale);
 
   /// Get current kernel status.
   ExecutionStatus get_status() const;
@@ -341,19 +307,10 @@ class ExecutionKernel {
 
  private:
   Result<MotionSpecDTO> resolve_motion_spec(const ExecuteRequestDTO& request);
-  StreamingSessionEndResultDTO end_streaming_session_unlocked(
-      uint64_t session_id,
-      SoftStopStrategy strategy);
   Result<TrajectoryDTO> plan_trajectory(const ExecuteRequestDTO& request);
   Result<CollisionWorldRevision> validate_trajectory(
       const TrajectoryDTO& trajectory,
       const ExecuteRequestDTO& request);
-  Result<CollisionWorldRevision> validate_streaming_target_collision(
-      const StreamingSessionConfigDTO& active_config,
-      const StreamingTargetDTO& resolved_target,
-      std::uint64_t validation_sequence,
-      std::uint64_t session_id,
-      std::uint64_t source_sequence);
   TrajectoryDTO build_remaining_trajectory(
       const TrajectoryDTO& trajectory,
       const ExecutionSnapshot& snapshot) const;
@@ -386,11 +343,6 @@ class ExecutionKernel {
   void mark_active_interrupt_preemption_result(
       InterruptPreemptionResult result,
       const std::map<std::string, std::string>& extra_details = {});
-  std::shared_ptr<CollisionCancellationToken>
-  install_streaming_target_cancel_token(std::uint64_t validation_sequence);
-  void clear_streaming_target_cancel_token(
-      const std::shared_ptr<CollisionCancellationToken>& token);
-  void cancel_active_streaming_target_validation(std::string reason);
   void install_builtin_interrupt_sources();
   InterruptIngestResult publish_runtime_collision_fault_interrupt(
       const CollisionCheckResultDTO& check,
@@ -486,15 +438,9 @@ class ExecutionKernel {
   std::vector<std::shared_ptr<ICollisionQueryEngine>> collision_validation_engines_;
   mutable std::mutex validation_cancel_mutex_;
   std::weak_ptr<CollisionCancellationToken> active_validation_cancel_token_;
-  mutable std::mutex streaming_collision_validation_mutex_;
-  mutable std::mutex streaming_cancel_mutex_;
-  std::weak_ptr<CollisionCancellationToken> active_streaming_target_cancel_token_;
-  std::atomic<std::uint64_t> streaming_target_validation_sequence_{0};
 
-  // Serializes low-rate lifecycle authority transitions across execute,
-  // streaming begin/end, stop, pause, resume, reset, and acknowledge. High-rate
-  // streaming target pushes intentionally do not take this lock; they are
-  // protected by streaming_session_mutex_ and session generation checks.
+  // Serializes low-rate lifecycle authority transitions across execute, stop,
+  // pause, resume, reset, and acknowledge.
   std::mutex lifecycle_mutex_;
   std::atomic<uint64_t> next_execution_id_{1};
   std::atomic<double> runtime_velocity_scale_{1.0};
@@ -537,38 +483,6 @@ class ExecutionKernel {
   mutable std::mutex runtime_contact_release_mutex_;
   std::map<std::string, RuntimeContactReleasePairState>
       runtime_contact_release_state_;
-
-  // Streaming-session bookkeeping. Only one active session at a time in
-  // v0.1; `active_streaming_session_id_` is 0 when none is active.
-  // `active_backend_session_id_` is the id the backend assigned in its
-  // begin_streaming_session response; the kernel passes THIS id back to
-  // push/end calls so kernel↔backend id mapping stays correct even if
-  // the two counters diverge.
-  mutable std::mutex streaming_session_mutex_;
-  uint64_t next_streaming_session_id_ = 1;
-  uint64_t active_streaming_session_id_ = 0;
-  uint64_t active_backend_session_id_ = 0;
-  uint64_t active_streaming_generation_ = 0;
-  StreamingSessionConfigDTO active_streaming_config_;
-  SoftStopStrategy active_soft_stop_strategy_ = SoftStopStrategy::kSpringBack;
-  // Last accepted Cartesian target position (only meaningful when the
-  // active session is cartesian-mode). Used to compute the implied
-  // Cartesian speed between successive frames so the kernel can reject
-  // frames that would exceed `max_tcp_linear_speed_mps`.
-  std::array<double, 3> last_accepted_cartesian_pos_{0.0, 0.0, 0.0};
-  bool last_accepted_cartesian_pos_valid_ = false;
-  int64_t last_accepted_cartesian_ts_ns_ = 0;
-  // Last successfully commanded full joint vector (session-order, per
-  // `active_streaming_config_.joint_names`). Used to overlay partial
-  // joint-mode targets onto the full vector before backend dispatch
-  // — per spec/200 §2 partial-joint-map normalization rules. Seeded
-  // from `context_.get_current_state()` on the first push of a
-  // session; cleared at session begin/end. Updated on backend ACCEPT
-  // for both cartesian (from IK result) and joint (from overlaid
-  // vector) targets, so cartesian-then-joint or joint-then-joint
-  // sequences within a session compose correctly.
-  std::vector<double> last_commanded_joints_;
-  bool last_commanded_joints_valid_ = false;
 
   // Metrics (atomic counters for thread safety)
   mutable std::mutex metrics_mutex_;

@@ -60,12 +60,7 @@ def _native_kernel_config_from_deployment(deployment: Deployment) -> dict[str, i
         config["runtime_dynamic_body_max_age_cap_ns"] = int(cap_ms * 1_000_000.0)
     execution_adapter = deployment.adapters.get("execution")
     execution_config = dict(execution_adapter.config or {}) if execution_adapter else {}
-    for key in (
-        "streaming_ik_timeout_s",
-        "streaming_ik_timeout_ms",
-        "streaming_collision_timeout_s",
-        "streaming_collision_timeout_ms",
-    ):
+    for key in ("single_shot_ik_timeout_s", "single_shot_ik_timeout_ms"):
         if key in execution_config:
             config[key] = execution_config[key]
     return config

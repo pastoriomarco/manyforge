@@ -78,10 +78,8 @@ def create_ros2_control_kernel(
             runtime_dynamic_body_max_age_cap_ns
         )
     for key in (
-        "streaming_ik_timeout_s",
-        "streaming_ik_timeout_ms",
-        "streaming_collision_timeout_s",
-        "streaming_collision_timeout_ms",
+        "single_shot_ik_timeout_s",
+        "single_shot_ik_timeout_ms",
         "default_fault_stop_profile",
         "operator_stop_profile",
     ):

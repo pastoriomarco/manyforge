@@ -293,12 +293,13 @@ def _deployment_to_full_response(
             srdfPath=deployment.robot_config.srdf_path,
             packagePaths=deployment.robot_config.package_paths,
             globalMaxTcpLinearSpeedMps=deployment.robot_config.global_max_tcp_linear_speed_mps,
-            streamingJointLimits={
+            robotControlJointLimits={
                 name: {
                     "maxVelocityRadS": limit.max_velocity_rad_s,
                     "maxAccelerationRadS2": limit.max_acceleration_rad_s2,
+                    "maxJerkRadS3": limit.max_jerk_rad_s3,
                 }
-                for name, limit in deployment.robot_config.streaming_joint_limits.items()
+                for name, limit in deployment.robot_config.robot_control_joint_limits.items()
             },
         ),
         grippers={
@@ -886,12 +887,13 @@ def create_program_router(state: ComposerState) -> APIRouter:
                 srdfPath=robot_config.srdf_path,
                 packagePaths=robot_config.package_paths,
                 globalMaxTcpLinearSpeedMps=robot_config.global_max_tcp_linear_speed_mps,
-                streamingJointLimits={
+                robotControlJointLimits={
                     name: {
                         "maxVelocityRadS": limit.max_velocity_rad_s,
                         "maxAccelerationRadS2": limit.max_acceleration_rad_s2,
+                        "maxJerkRadS3": limit.max_jerk_rad_s3,
                     }
-                    for name, limit in robot_config.streaming_joint_limits.items()
+                    for name, limit in robot_config.robot_control_joint_limits.items()
                 },
             ),
             grippers={
@@ -919,12 +921,13 @@ def create_program_router(state: ComposerState) -> APIRouter:
                 srdfPath=robot_config.srdf_path,
                 packagePaths=robot_config.package_paths,
                 globalMaxTcpLinearSpeedMps=robot_config.global_max_tcp_linear_speed_mps,
-                streamingJointLimits={
+                robotControlJointLimits={
                     name: {
                         "maxVelocityRadS": limit.max_velocity_rad_s,
                         "maxAccelerationRadS2": limit.max_acceleration_rad_s2,
+                        "maxJerkRadS3": limit.max_jerk_rad_s3,
                     }
-                    for name, limit in robot_config.streaming_joint_limits.items()
+                    for name, limit in robot_config.robot_control_joint_limits.items()
                 },
             ),
             grippers={
@@ -1171,7 +1174,7 @@ def create_program_router(state: ComposerState) -> APIRouter:
                 except Exception:
                     drivable_joints = []
                 if drivable_joints:
-                    deployment.validate_streaming_joint_limits_against(drivable_joints)
+                    deployment.validate_robot_control_joint_limits_against(drivable_joints)
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc))
         except (ProgramValidationError, DeploymentValidationError) as exc:

@@ -39,7 +39,6 @@ PYBIND11_MODULE(manyforge_core_py, m) {
         .value("kPlanning", manyforge::core::ExecutionState::kPlanning)
         .value("kValidating", manyforge::core::ExecutionState::kValidating)
         .value("kExecuting", manyforge::core::ExecutionState::kExecuting)
-        .value("kStreaming", manyforge::core::ExecutionState::kStreaming)
         .value("kInterrupted", manyforge::core::ExecutionState::kInterrupted)
         .value("kPaused", manyforge::core::ExecutionState::kPaused)
         .value("kStopping", manyforge::core::ExecutionState::kStopping)
@@ -155,6 +154,26 @@ PYBIND11_MODULE(manyforge_core_py, m) {
             return py::str("SpeedProfileDTO(velocity_scale={}, acceleration_scale={}, max_tcp_linear_speed_mps={})")
                 .format(s.velocity_scale, s.acceleration_scale,
                        s.max_tcp_linear_speed_mps.has_value() ? py::cast(*s.max_tcp_linear_speed_mps) : py::none());
+        });
+
+    py::class_<manyforge::core::JointDynamicsLimitDTO>(m, "JointDynamicsLimitDTO")
+        .def(py::init<>())
+        .def(py::init<std::optional<double>, std::optional<double>, std::optional<double>>(),
+             py::arg("max_velocity_rad_s") = std::nullopt,
+             py::arg("max_acceleration_rad_s2") = std::nullopt,
+             py::arg("max_jerk_rad_s3") = std::nullopt)
+        .def_readwrite("max_velocity_rad_s",
+                       &manyforge::core::JointDynamicsLimitDTO::max_velocity_rad_s)
+        .def_readwrite("max_acceleration_rad_s2",
+                       &manyforge::core::JointDynamicsLimitDTO::max_acceleration_rad_s2)
+        .def_readwrite("max_jerk_rad_s3",
+                       &manyforge::core::JointDynamicsLimitDTO::max_jerk_rad_s3)
+        .def("__repr__", [](const manyforge::core::JointDynamicsLimitDTO& l) {
+            return py::str("JointDynamicsLimitDTO(max_velocity_rad_s={}, "
+                           "max_acceleration_rad_s2={}, max_jerk_rad_s3={})")
+                .format(l.max_velocity_rad_s.has_value() ? py::cast(*l.max_velocity_rad_s) : py::none(),
+                        l.max_acceleration_rad_s2.has_value() ? py::cast(*l.max_acceleration_rad_s2) : py::none(),
+                        l.max_jerk_rad_s3.has_value() ? py::cast(*l.max_jerk_rad_s3) : py::none());
         });
 
     py::class_<manyforge::core::TimeoutsDTO>(m, "TimeoutsDTO")
@@ -351,6 +370,7 @@ PYBIND11_MODULE(manyforge_core_py, m) {
         .def_readwrite("tcp_frame", &manyforge::core::ExecuteRequestDTO::tcp_frame)
         .def_readwrite("tolerances", &manyforge::core::ExecuteRequestDTO::tolerances)
         .def_readwrite("speed_profile", &manyforge::core::ExecuteRequestDTO::speed_profile)
+        .def_readwrite("per_joint_dynamics_limits", &manyforge::core::ExecuteRequestDTO::per_joint_dynamics_limits)
         .def_readwrite("timeouts", &manyforge::core::ExecuteRequestDTO::timeouts)
         .def_readwrite("cache_mode", &manyforge::core::ExecuteRequestDTO::cache_mode)
         .def_readwrite("motion", &manyforge::core::ExecuteRequestDTO::motion)
@@ -427,6 +447,7 @@ PYBIND11_MODULE(manyforge_core_py, m) {
         .def_readwrite("tolerances", &manyforge::core::PlanRequestDTO::tolerances)
         .def_readwrite("speed_profile", &manyforge::core::PlanRequestDTO::speed_profile)
         .def_readwrite("planning_timeout_s", &manyforge::core::PlanRequestDTO::planning_timeout_s)
+        .def_readwrite("per_joint_dynamics_limits", &manyforge::core::PlanRequestDTO::per_joint_dynamics_limits)
         .def("__repr__", [](const manyforge::core::PlanRequestDTO& p) {
             return py::str("PlanRequestDTO(robot_id='{}', group_id='{}')")
                 .format(p.robot_id, p.group_id);
@@ -651,13 +672,7 @@ PYBIND11_MODULE(manyforge_core_py, m) {
                manyforge::core::CollisionSurface::kObservedRuntimeMonitor)
         .value("kDiagnosticCompare",
                manyforge::core::CollisionSurface::kDiagnosticCompare)
-        .value("kPlannerHint", manyforge::core::CollisionSurface::kPlannerHint)
-        .value("kStreamingTargetValidation",
-               manyforge::core::CollisionSurface::kStreamingTargetValidation)
-        .value("kStreamingPredictedMonitor",
-               manyforge::core::CollisionSurface::kStreamingPredictedMonitor)
-        .value("kStreamingObservedMonitor",
-               manyforge::core::CollisionSurface::kStreamingObservedMonitor);
+        .value("kPlannerHint", manyforge::core::CollisionSurface::kPlannerHint);
 
     py::enum_<manyforge::core::CollisionSamplingMode>(m, "CollisionSamplingMode")
         .value("kWaypointOnly", manyforge::core::CollisionSamplingMode::kWaypointOnly)

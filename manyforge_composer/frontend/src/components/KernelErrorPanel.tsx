@@ -161,7 +161,6 @@ function prettyPolicyId(policy: string): string {
   // Heuristic: pick the longest segment that doesn't look like an action verb.
   const actionWords = new Set([
     'preempt_trajectory',
-    'preempt_streaming',
     'preempt',
     'pause',
     'fail',

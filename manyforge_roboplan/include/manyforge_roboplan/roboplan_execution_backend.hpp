@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -18,7 +19,6 @@ namespace manyforge::roboplan_backend {
 
 struct RoboPlanExecutionBackendConfig {
   double reset_completion_timeout_s = 5.0;
-  double streaming_stop_completion_timeout_s = 5.0;
   /// Native-sim handoff budget for soft_on_path. This is deliberately
   /// small but non-zero so tests exercise the same wall-time contract
   /// as controller deployments.
@@ -27,6 +27,14 @@ struct RoboPlanExecutionBackendConfig {
   std::optional<double> soft_on_path_max_initial_path_deviation_rad;
   std::optional<double> soft_on_path_max_initial_velocity_deviation_rad_s;
   std::map<std::string, double> soft_on_path_max_jerk_rad_s3;
+};
+
+struct RoboPlanSceneProjectionMetrics {
+  std::uint64_t misses_total = 0;
+  std::uint64_t successful_updates_total = 0;
+  std::uint64_t lag_max_ns = 0;
+  std::int64_t last_success_timestamp_ns = 0;
+  std::uint64_t last_success_age_ns = 0;
 };
 
 /// Simulated execution backend that updates the planning scene
@@ -48,21 +56,11 @@ class RoboPlanExecutionBackend final : public core::IExecutionBackend {
   core::ResetResultDTO reset() override;
   core::ExecutionSnapshot get_execution_snapshot() const override;
 
-  // Streaming-session mode (ADR-0016). v0.1 of the simulated path supports
-  // joint-mode targets only; cartesian targets are rejected with
-  // unsupported_capability and the caller is expected to pre-resolve IK
-  // (the ros2_control adapter handles cartesian IK internally via roboplan).
-  core::StreamingSessionBeginResultDTO begin_streaming_session(
-      const core::StreamingSessionConfigDTO& config) override;
-  core::StreamingPushResultDTO push_streaming_target(
-      uint64_t session_id,
-      const core::StreamingTargetDTO& target) override;
-  core::StreamingSessionEndResultDTO end_streaming_session(
-      uint64_t session_id,
-      core::SoftStopStrategy strategy) override;
   // ADR-0018: atomic per-tick read of the runtime velocity scale so the HMI
-  // slider retimes in-flight discrete and streaming motion without stopping.
+  // slider retimes in-flight discrete motion without stopping.
   void set_runtime_velocity_scale(double scale) override;
+
+  RoboPlanSceneProjectionMetrics scene_projection_metrics() const;
 
   // Controlled-stop capability + result surface for motion-scoped
   // interrupt outcomes (spec/260 §5.6). The native simulator supports
@@ -83,17 +81,28 @@ class RoboPlanExecutionBackend final : public core::IExecutionBackend {
     double active_runtime_velocity_scale = 1.0;
   };
 
-  void publish_snapshot(core::ExecutionState state, double progress,
-                        const std::vector<double>& joint_positions,
-                        std::optional<core::ErrorDTO> error = std::nullopt);
-  void update_scene_positions(const std::vector<double>& joint_positions);
-  void execution_worker(std::stop_token st, core::TrajectoryDTO trajectory);
+  enum class SceneUpdateMode {
+    kBlocking,
+    kBestEffort,
+  };
 
-  // Streaming-session worker. Drives the scene toward the latest joint
-  // target at a tick cadence governed by the session's max_dispatch_rate_hz.
-  // Cartesian targets are rejected at push time; the simulated path expects
-  // pre-resolved joint targets.
-  void streaming_worker(std::stop_token st);
+  std::int64_t publish_snapshot(
+      core::ExecutionState state, double progress,
+      const std::vector<double>& joint_positions,
+      std::optional<core::ErrorDTO> error = std::nullopt);
+
+  // Active execution must never block observed-state publication on
+  // `scene_mutex_`. During execution, call publish_snapshot() first and
+  // project into the RoboPlan scene with kBestEffort. The runtime collision
+  // monitor reads the published snapshot as the authoritative robot state;
+  // the scene projection is for visualization/planning convergence and may
+  // skip intermediate samples under contention.
+  void update_scene_positions(const std::vector<double>& joint_positions,
+                              SceneUpdateMode mode = SceneUpdateMode::kBlocking,
+                              std::int64_t source_timestamp_ns = 0);
+  void execution_worker(std::stop_token st, core::TrajectoryDTO trajectory);
+  void record_scene_projection_success(std::int64_t source_timestamp_ns);
+  void record_scene_projection_miss();
 
   std::shared_ptr<roboplan::Scene> scene_;
   std::string group_name_;
@@ -107,38 +116,14 @@ class RoboPlanExecutionBackend final : public core::IExecutionBackend {
   std::jthread worker_thread_;
   ExecutionStateData state_;
 
-  // Streaming-session state (ADR-0016).
-  mutable std::mutex streaming_mutex_;
-  std::condition_variable streaming_cv_;
-  std::jthread streaming_thread_;
-  std::atomic<bool> streaming_active_{false};
-  uint64_t streaming_session_id_ = 0;
-  uint64_t next_streaming_backend_seq_ = 1;
-  core::StreamingSessionConfigDTO streaming_config_;
-  std::optional<core::StreamingTargetDTO> streaming_target_;  // latest-wins
-  // Last-commanded joint vector for the streaming session. The worker
-  // interpolates toward the latest target one tick at a time, respecting
-  // both the joint-velocity cap and `min_time_from_start_s` (which the
-  // kernel populates from the deployment's
-  // `global_max_tcp_linear_speed_mps`, ADR-0015). Cleared on begin/end.
-  std::optional<std::vector<double>> streaming_commanded_joints_;
-  // Last-tick velocity per joint for the streaming session, parallel to
-  // `streaming_commanded_joints_`. Used by the acceleration limiter:
-  // velocity change per tick is bounded by `a_cap[i] * tick_s` so the
-  // arm doesn't snap to its velocity cap in one step. Cleared on
-  // begin/end alongside the position vector.
-  std::optional<std::vector<double>> streaming_commanded_velocities_;
   // Runtime velocity scale read on every worker tick. std::atomic<double> is
   // lock-free on all supported targets; memory_order_release on the setter pairs
   // with memory_order_acquire on the worker's per-tick read.
   std::atomic<double> runtime_velocity_scale_{1.0};
-  // One-shot diagnostic flag: set true when the streaming worker
-  // first enters the hold branch (because the published snapshot's
-  // joint vector doesn't cover every session joint, so it can't be
-  // used as a seed). Used to emit a stderr line once per session
-  // entry so docker logs catches the failure without spamming a
-  // log line every tick. Reset on each begin_streaming_session.
-  bool streaming_hold_emitted_ = false;
+  std::atomic<std::uint64_t> scene_projection_misses_total_{0};
+  std::atomic<std::uint64_t> scene_projection_successes_total_{0};
+  std::atomic<std::uint64_t> scene_projection_lag_max_ns_{0};
+  std::atomic<std::int64_t> scene_projection_last_success_timestamp_ns_{0};
 };
 
 }  // namespace manyforge::roboplan_backend

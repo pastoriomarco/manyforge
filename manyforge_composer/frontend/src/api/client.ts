@@ -38,6 +38,9 @@ import type {
   AssistantProviderCatalog,
   AssistantRequestStatus,
   AssistantCancelResponse,
+  CandidateCreateRequest,
+  CandidateResponse,
+  CandidateExecuteResponse,
 } from '../types/api';
 
 const BASE_URL = import.meta.env.VITE_API_URL || '';
@@ -288,6 +291,35 @@ export const api = {
         positionM,
         orientationXyzw,
       }),
+  },
+  // Phase 4-P5 validated Robot Control: author a server-owned candidate
+  // (no motion), poll its validated status, then Approve to move the robot
+  // through the normal execution path. Approve is the ONLY method here that
+  // can move the robot; create/get/revert never move it.
+  robotControl: {
+    candidates: {
+      create: (payload: CandidateCreateRequest) =>
+        request<CandidateResponse>(
+          'POST',
+          '/api/robot-control/candidates',
+          payload,
+        ),
+      get: (candidateId: string) =>
+        request<CandidateResponse>(
+          'GET',
+          `/api/robot-control/candidates/${encodeURIComponent(candidateId)}`,
+        ),
+      execute: (candidateId: string) =>
+        request<CandidateExecuteResponse>(
+          'POST',
+          `/api/robot-control/candidates/${encodeURIComponent(candidateId)}/execute`,
+        ),
+      revert: (candidateId: string) =>
+        request<CandidateResponse>(
+          'POST',
+          `/api/robot-control/candidates/${encodeURIComponent(candidateId)}/revert`,
+        ),
+    },
   },
   scene: {
     state: () => request<SceneStateResponse>('GET', '/api/scene/state'),

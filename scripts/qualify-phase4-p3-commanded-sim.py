@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
-"""Collect Phase 4-P3 live Isaac commanded-sim evidence.
+"""Collect Phase 4-P3 live Isaac commanded-sim evidence. HISTORICAL-ONLY.
 
-This probe is intentionally small and operator-auditable. It talks to a live
-Composer instance, exercises the same direct-control WebSocket used by the UI,
-and emits the JSON shape required by ``verify-kernel-architecture-phase4.py``
-for strict Phase 4 live-Isaac evidence.
+RETIRED: this probe drives the ADR-0016 ``/ws/follow-target`` streaming route,
+which was deleted when default Robot Control moved to validated candidates. It
+can no longer generate fresh evidence and refuses to run by default (see
+``main()``). It is preserved only to document the historical P3 evidence shape
+that ``verify-kernel-architecture-phase4.py`` still validates for ARCHIVED P3
+summaries.
 
-The probe assumes the Isaac commanded-sim lane is already running and ready.
-It sends only small joint/cartesian frames, commands the declared gripper open
-and closed, and finishes with a cycle reset so the command stream is refreshed
-to the deployment initial state.
+Fresh default Robot Control evidence is Phase 4-P5 candidate
+preview/approve/revert evidence, NOT P3 streaming evidence. To re-validate an
+archived P3 summary, pass it to verify-kernel-architecture-phase4.py via
+``--live-isaac-summary-json`` instead of regenerating it here.
+
+Historically: a small, operator-auditable probe that talked to a live Composer
+instance over the direct-control WebSocket, sent small joint/cartesian frames,
+commanded the declared gripper open/closed, and finished with a cycle reset.
 """
 from __future__ import annotations
 
@@ -18,6 +24,7 @@ import asyncio
 from dataclasses import dataclass, field
 import json
 import math
+import os
 from pathlib import Path
 import sys
 import time
@@ -32,7 +39,6 @@ REQUIRED_CHECKS = {
     "runtime_profile_commanded_sim",
     "kernel_snapshot_authority_metadata",
     "scene_state_robot_authority_metadata",
-    "streaming_collision_budget_configured",
     "joint_slider_accepted",
     "joint_spinner_input_accepted",
     "cartesian_gizmo_accepted",
@@ -129,28 +135,11 @@ def _runtime_profile(probe: Probe) -> tuple[str, str, dict[str, Any]]:
 def _execution_config(probe: Probe) -> dict[str, Any]:
     try:
         deployment = probe.get_json("/api/deployment/full")
-    except (HTTPError, URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
-        probe.add_check("streaming_collision_budget_configured", False, error=str(exc))
+    except (HTTPError, URLError, TimeoutError, OSError, json.JSONDecodeError):
         return {}
     adapters = deployment.get("adapters") or {}
     execution = adapters.get("execution") or {}
-    config = execution.get("config") or {}
-    timeout = _finite_float(
-        config.get("streaming_collision_timeout_s")
-        if "streaming_collision_timeout_s" in config
-        else config.get("streaming_collision_timeout_ms")
-    )
-    timeout_s = timeout
-    if timeout_s is not None and "streaming_collision_timeout_ms" in config and "streaming_collision_timeout_s" not in config:
-        timeout_s = timeout_s / 1000.0
-    probe.add_check(
-        "streaming_collision_budget_configured",
-        timeout_s is not None and timeout_s > 0.0,
-        streaming_collision_timeout_s=timeout_s,
-        execution_state_source_mode=config.get("execution_state_source_mode")
-        or config.get("execution_state_authority_profile"),
-    )
-    return config
+    return execution.get("config") or {}
 
 
 def _kernel_snapshot_authority(probe: Probe) -> dict[str, Any]:
@@ -607,9 +596,8 @@ async def run_probe(args: argparse.Namespace) -> dict[str, Any]:
             "summaryLabel": runtime.get("summaryLabel"),
         },
         "execution_config": {
-            "execution_state_source_mode": execution_config.get("execution_state_source_mode"),
-            "streaming_collision_timeout_s": execution_config.get("streaming_collision_timeout_s"),
-            "streaming_collision_timeout_ms": execution_config.get("streaming_collision_timeout_ms"),
+            "execution_state_source_mode": execution_config.get("execution_state_source_mode")
+            or execution_config.get("execution_state_authority_profile"),
         },
         "checks": [check.to_json() for check in probe.checks],
         "missing_checks": missing,
@@ -630,6 +618,22 @@ def _parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    # RETIRED probe: the /ws/follow-target streaming route it exercises was
+    # deleted with ADR-0016. Fail closed so this cannot masquerade as fresh
+    # default Robot Control evidence. The escape hatch exists only for replaying
+    # the probe against a legacy deployment/branch that still serves the route;
+    # it is audit-visible by design.
+    if os.environ.get("MANYFORGE_P3_PROBE_ALLOW_DELETED_ROUTE") != "1":
+        print(
+            "qualify-phase4-p3-commanded-sim.py is retired (historical-only): it drives\n"
+            "the deleted ADR-0016 /ws/follow-target streaming route and cannot generate\n"
+            "fresh evidence. Fresh default Robot Control evidence is Phase 4-P5 candidate\n"
+            "preview/approve/revert evidence. Re-validate an ARCHIVED P3 summary through\n"
+            "verify-kernel-architecture-phase4.py --live-isaac-summary-json instead.\n"
+            "(Set MANYFORGE_P3_PROBE_ALLOW_DELETED_ROUTE=1 to force a legacy replay.)",
+            file=sys.stderr,
+        )
+        return 4
     args = _parse_args()
     try:
         result = asyncio.run(run_probe(args))

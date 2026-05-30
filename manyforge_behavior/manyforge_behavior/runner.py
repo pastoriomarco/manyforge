@@ -27,7 +27,6 @@ from manyforge_behavior.nodes.logic import (
 )
 from manyforge_behavior.nodes.motion import MoveManipulatorAction, ResetTrajectories, _rpy_deg_to_xyzw
 from manyforge_behavior.nodes.motion_scoped import MoveUntilSignal, ProbeSearchMove
-from manyforge_behavior.nodes.streaming import TrackTargetAction
 from manyforge_behavior.nodes.scene import (
     AddCollisionObject,
     AttachObjectToLink,
@@ -64,7 +63,6 @@ PLUGIN_FACTORY: dict[str, type] = {
     # submit the request and consume the terminal MotionExecutionOutcome.
     "move_until_signal": MoveUntilSignal,
     "probe_search_move": ProbeSearchMove,
-    "track_target_action": TrackTargetAction,  # ADR-0016 streaming session
     "reset_trajectories": ResetTrajectories,
     "add_collision_object": AddCollisionObject,
     "upsert_collision_object": UpsertCollisionObject,

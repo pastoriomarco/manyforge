@@ -5,6 +5,7 @@ import pytest
 from manyforge_behavior.kernel_client import (
     ExecuteRequest,
     ExecutionState,
+    JointDynamicsLimit,
     MockKernelClient,
     ObjectState,
     SceneObjectSnapshot,
@@ -376,3 +377,37 @@ class TestMockKernelMisc:
         assert status.state == ExecutionState.IDLE
         assert status.execution_id == 0
         assert status.progress == 0.0
+
+
+class TestPerJointDynamicsLimits:
+    def test_default_request_has_empty_caps(self):
+        req = make_request()
+        assert req.per_joint_dynamics_limits == {}
+
+    def test_request_carries_per_joint_caps(self):
+        req = make_request()
+        req.per_joint_dynamics_limits = {
+            "j1": JointDynamicsLimit(max_velocity_rad_s=0.5),
+            "j2": JointDynamicsLimit(
+                max_velocity_rad_s=0.4, max_acceleration_rad_s2=1.2
+            ),
+        }
+        assert set(req.per_joint_dynamics_limits) == {"j1", "j2"}
+        assert req.per_joint_dynamics_limits["j1"].max_velocity_rad_s == 0.5
+        assert req.per_joint_dynamics_limits["j1"].max_acceleration_rad_s2 is None
+        assert req.per_joint_dynamics_limits["j2"].max_acceleration_rad_s2 == 1.2
+        assert req.per_joint_dynamics_limits["j2"].max_jerk_rad_s3 is None
+
+    def test_caps_do_not_break_mock_execute(self, kernel):
+        req = make_request()
+        req.per_joint_dynamics_limits = {
+            "j1": JointDynamicsLimit(max_velocity_rad_s=0.5)
+        }
+        result = kernel.execute(req)
+        assert result.ok
+
+    def test_joint_dynamics_limit_defaults_are_none(self):
+        limit = JointDynamicsLimit()
+        assert limit.max_velocity_rad_s is None
+        assert limit.max_acceleration_rad_s2 is None
+        assert limit.max_jerk_rad_s3 is None

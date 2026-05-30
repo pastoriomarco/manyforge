@@ -13,7 +13,7 @@ import type {
   PoseSourceObjectBindingConfig,
   SceneFrameState,
   SceneUrdfManifest,
-  StreamingJointLimit,
+  RobotControlJointLimit,
 } from '../types/api';
 import { useDeploymentStore } from '../store/deploymentStore';
 import { useEditLocked } from '../store/cycleStore';
@@ -393,8 +393,8 @@ function FrameMultiSelect({
 }
 
 /**
- * Per-joint streaming velocity/acceleration limits editor
- * (spec/430 §3.2 streaming-joint-limits + ADR-0016).
+ * Per-joint validated Robot Control velocity/acceleration limits editor
+ * (spec/430 §3.2 robot-control-joint-limits).
  *
  * Renders one row per drivable joint with two number inputs
  * (max velocity rad/s, max acceleration rad/s²). Empty input =
@@ -402,66 +402,96 @@ function FrameMultiSelect({
  * the placeholder reminds the operator what the default is.
  *
  * Persistence: the editor writes to
- * `deployment.robotConfig.streamingJointLimits` (Record<joint, limit>);
- * joints with both fields empty are omitted from the saved YAML so a
+ * `deployment.robotConfig.robotControlJointLimits` (Record<joint, limit>);
+ * joints with EVERY field empty are omitted from the saved YAML so a
  * "no overrides" deployment stays minimal.
  */
-function StreamingJointLimitsEditor({
+
+/**
+ * Pure reducer for one per-joint cap edit (Phase 4-P5.1K). Returns the next
+ * limits record. Invalid numeric input (non-finite or <= 0) is rejected and the
+ * SAME `limits` reference is returned unchanged (the caller can skip onChange).
+ * A joint is dropped only when velocity, acceleration AND jerk are all empty, so
+ * a jerk-only joint is never silently dropped on a vel/accel edit. Exported for
+ * unit testing.
+ */
+export function applyRobotControlJointLimitEdit(
+  limits: Record<string, RobotControlJointLimit>,
+  joint: string,
+  field: 'maxVelocityRadS' | 'maxAccelerationRadS2' | 'maxJerkRadS3',
+  raw: string,
+): Record<string, RobotControlJointLimit> {
+  const trimmed = raw.trim();
+  const next: Record<string, RobotControlJointLimit> = { ...limits };
+  const current: RobotControlJointLimit = { ...(next[joint] ?? {}) };
+  if (trimmed === '') {
+    current[field] = null;
+  } else {
+    const v = Number(trimmed);
+    if (!Number.isFinite(v) || v <= 0) return limits;
+    current[field] = v;
+  }
+  if (
+    current.maxVelocityRadS == null &&
+    current.maxAccelerationRadS2 == null &&
+    current.maxJerkRadS3 == null
+  ) {
+    delete next[joint];
+  } else {
+    next[joint] = current;
+  }
+  return next;
+}
+
+function RobotControlJointLimitsEditor({
   drivableJointNames,
   limits,
   onChange,
   disabled,
 }: {
   drivableJointNames: string[];
-  limits: Record<string, StreamingJointLimit>;
-  onChange: (next: Record<string, StreamingJointLimit>) => void;
+  limits: Record<string, RobotControlJointLimit>;
+  onChange: (next: Record<string, RobotControlJointLimit>) => void;
   disabled: boolean;
 }) {
   if (drivableJointNames.length === 0) {
     return (
       <div className="text-xs italic text-gray-500">
         URDF manifest not loaded yet (or no drivable joints found). Load a
-        program with a robot to edit per-joint streaming limits.
+        program with a robot to edit per-joint Robot Control limits.
       </div>
     );
   }
 
-  function commit(joint: string, field: 'maxVelocityRadS' | 'maxAccelerationRadS2', raw: string): void {
-    const trimmed = raw.trim();
-    const next: Record<string, StreamingJointLimit> = { ...limits };
-    const current: StreamingJointLimit = { ...(next[joint] ?? {}) };
-    if (trimmed === '') {
-      current[field] = null;
-    } else {
-      const v = Number(trimmed);
-      if (!Number.isFinite(v) || v <= 0) return;
-      current[field] = v;
-    }
-    if (current.maxVelocityRadS == null && current.maxAccelerationRadS2 == null) {
-      delete next[joint];
-    } else {
-      next[joint] = current;
-    }
-    onChange(next);
+  function commit(
+    joint: string,
+    field: 'maxVelocityRadS' | 'maxAccelerationRadS2' | 'maxJerkRadS3',
+    raw: string,
+  ): void {
+    const next = applyRobotControlJointLimitEdit(limits, joint, field, raw);
+    if (next !== limits) onChange(next);
   }
 
   return (
     <div className="space-y-1">
       <div className="text-[10px] text-gray-500">
-        Per-joint caps applied during streaming sessions (gizmo drag, joint
-        slider). Leave blank to use engine defaults (0.5 rad/s, 2.0 rad/s²).
-        Velocity is scaled by the operator's velocity slider; acceleration is
-        an absolute physical limit.
+        Per-joint caps bounding operator-authored Robot Control targets.
+        Leave blank to use engine defaults (0.5 rad/s, 2.0 rad/s²). Velocity
+        is scaled by the operator's velocity slider; acceleration is an
+        absolute physical limit. Jerk is carried through to the kernel but is
+        only enforced where the active planner supports it (the discrete path
+        rejects a jerk cap rather than silently ignoring it).
       </div>
-      <div className="grid grid-cols-[1fr_5rem_5rem] items-center gap-2 border-b border-gray-700/40 pb-1 text-[10px] uppercase tracking-wide text-gray-500">
+      <div className="grid grid-cols-[1fr_5rem_5rem_5rem] items-center gap-2 border-b border-gray-700/40 pb-1 text-[10px] uppercase tracking-wide text-gray-500">
         <span>Joint</span>
         <span className="text-right">vel (rad/s)</span>
         <span className="text-right">accel (rad/s²)</span>
+        <span className="text-right">jerk (rad/s³)</span>
       </div>
       {drivableJointNames.map((name) => {
         const limit = limits[name] ?? {};
         return (
-          <div key={name} className="grid grid-cols-[1fr_5rem_5rem] items-center gap-2">
+          <div key={name} className="grid grid-cols-[1fr_5rem_5rem_5rem] items-center gap-2">
             <span className="truncate font-mono text-[11px] text-gray-200">{name}</span>
             <DraftTextInput
               value={limit.maxVelocityRadS == null ? '' : String(limit.maxVelocityRadS)}
@@ -475,6 +505,14 @@ function StreamingJointLimitsEditor({
               value={limit.maxAccelerationRadS2 == null ? '' : String(limit.maxAccelerationRadS2)}
               onCommit={(v) => commit(name, 'maxAccelerationRadS2', v)}
               placeholder="2.0"
+              disabled={disabled}
+              className="w-full rounded bg-gray-800 px-1 py-0.5 text-right font-mono text-[10px] text-gray-200"
+              inputMode="decimal"
+            />
+            <DraftTextInput
+              value={limit.maxJerkRadS3 == null ? '' : String(limit.maxJerkRadS3)}
+              onCommit={(v) => commit(name, 'maxJerkRadS3', v)}
+              placeholder="—"
               disabled={disabled}
               className="w-full rounded bg-gray-800 px-1 py-0.5 text-right font-mono text-[10px] text-gray-200"
               inputMode="decimal"
@@ -1260,22 +1298,21 @@ export function DeploymentPanel() {
           disabled={editLocked}
           help={
             'Deployment-wide cap on TCP (end-effector) Cartesian speed in m/s. ' +
-            'Enforced for ALL moves: planned trajectories clamp ' +
-            'max_tcp_linear_speed_mps against this (min wins); streaming ' +
-            'sessions (gizmo drag, joint-slider follow) use it to compute ' +
-            'each frame’s minimum time-from-start so the robot tracks at ' +
-            '≤ this speed regardless of operator input rate. ' +
-            '0 means “unlimited” (not recommended for hardware). ' +
-            'See ADR-0015 / ADR-0016.'
+            'Required and MUST be > 0 — a value of 0 or less is rejected at ' +
+            'load. Enforced for ALL moves: planned trajectories clamp ' +
+            'max_tcp_linear_speed_mps against this (min wins); validated ' +
+            'Robot Control targets use it to bound the authored motion so ' +
+            'the robot tracks at ≤ this speed regardless of operator input. ' +
+            'See ADR-0015.'
           }
         />
       </Section>
 
-      <Section title="Streaming Joint Limits">
-        <StreamingJointLimitsEditor
+      <Section title="Robot Control Joint Limits">
+        <RobotControlJointLimitsEditor
           drivableJointNames={drivableJointNames}
-          limits={deployment.robotConfig.streamingJointLimits ?? {}}
-          onChange={(next) => setNestedField('robotConfig.streamingJointLimits', next)}
+          limits={deployment.robotConfig.robotControlJointLimits ?? {}}
+          onChange={(next) => setNestedField('robotConfig.robotControlJointLimits', next)}
           disabled={editLocked}
         />
       </Section>

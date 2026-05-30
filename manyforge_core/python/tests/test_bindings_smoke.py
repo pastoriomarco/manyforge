@@ -16,7 +16,6 @@ def test_execution_state_enum():
     assert manyforge_core_py.ExecutionState.kPlanning == manyforge_core_py.kPlanning
     assert manyforge_core_py.ExecutionState.kValidating == manyforge_core_py.kValidating
     assert manyforge_core_py.ExecutionState.kExecuting == manyforge_core_py.kExecuting
-    assert manyforge_core_py.ExecutionState.kStreaming == manyforge_core_py.kStreaming
     assert manyforge_core_py.ExecutionState.kInterrupted == manyforge_core_py.kInterrupted
     assert manyforge_core_py.ExecutionState.kPaused == manyforge_core_py.kPaused
     assert manyforge_core_py.ExecutionState.kStopping == manyforge_core_py.kStopping
@@ -93,10 +92,53 @@ def test_speed_profile_dto():
 def test_timeouts_dto():
     """Test TimeoutsDTO creation and attributes."""
     import manyforge_core_py
-    
+
     t = manyforge_core_py.TimeoutsDTO(2.0, 10.0)
     assert t.planning_timeout_s == 2.0
     assert t.execution_timeout_s == 10.0
+
+
+def test_joint_dynamics_limit_dto():
+    """Phase 4-P5.1K — JointDynamicsLimitDTO construction + optional fields."""
+    import manyforge_core_py
+
+    empty = manyforge_core_py.JointDynamicsLimitDTO()
+    assert empty.max_velocity_rad_s is None
+    assert empty.max_acceleration_rad_s2 is None
+    assert empty.max_jerk_rad_s3 is None
+
+    lim = manyforge_core_py.JointDynamicsLimitDTO(
+        max_velocity_rad_s=0.5, max_acceleration_rad_s2=1.2
+    )
+    assert lim.max_velocity_rad_s == 0.5
+    assert lim.max_acceleration_rad_s2 == 1.2
+    assert lim.max_jerk_rad_s3 is None
+
+
+def test_per_joint_dynamics_limits_round_trip():
+    """Phase 4-P5.1K — the per_joint_dynamics_limits map round-trips through the
+    ExecuteRequestDTO and PlanRequestDTO pybind11 surface."""
+    import manyforge_core_py
+
+    caps = {
+        "elbow_joint": manyforge_core_py.JointDynamicsLimitDTO(
+            max_velocity_rad_s=0.4, max_acceleration_rad_s2=1.5
+        )
+    }
+
+    exec_req = manyforge_core_py.ExecuteRequestDTO()
+    assert exec_req.per_joint_dynamics_limits == {}
+    exec_req.per_joint_dynamics_limits = caps
+    assert "elbow_joint" in exec_req.per_joint_dynamics_limits
+    assert exec_req.per_joint_dynamics_limits["elbow_joint"].max_velocity_rad_s == 0.4
+
+    plan_req = manyforge_core_py.PlanRequestDTO()
+    assert plan_req.per_joint_dynamics_limits == {}
+    plan_req.per_joint_dynamics_limits = caps
+    assert (
+        plan_req.per_joint_dynamics_limits["elbow_joint"].max_acceleration_rad_s2
+        == 1.5
+    )
 
 
 def test_error_dto():

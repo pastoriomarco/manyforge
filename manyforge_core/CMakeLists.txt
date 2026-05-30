@@ -163,11 +163,4 @@ if(BUILD_TESTING)
   gtest_discover_tests(test_execution_kernel
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
-  # ADR-0016 streaming-session contract tests (kernel lifecycle + state
-  # transitions + event emission against a streaming-capable mock backend).
-  add_executable(test_streaming_session test/test_streaming_session.cpp)
-  target_link_libraries(test_streaming_session PRIVATE manyforge_core GTest::gtest_main)
-  gtest_discover_tests(test_streaming_session
-    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
-
 endif()

@@ -9,6 +9,7 @@
 #include <condition_variable>
 #include <functional>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <stdexcept>
@@ -315,11 +316,8 @@ class MockExecution : public IExecutionBackend {
   int resume_count = 0;
   int reset_count = 0;
   int sync_count = 0;
-  int begin_streaming_count = 0;
   TrajectoryDTO last_trajectory;
   ExecutionSnapshot snapshot;
-  uint64_t next_streaming_session_id = 1;
-  uint64_t active_streaming_session_id = 0;
   Result<void> next_sync_result = Result<void>::Ok();
   std::function<void()> on_sync;
   /// Optional override for the terminal state reported back to the kernel
@@ -382,15 +380,6 @@ class MockExecution : public IExecutionBackend {
     return snapshot;
   }
 
-  StreamingSessionBeginResultDTO begin_streaming_session(
-      const StreamingSessionConfigDTO& /*config*/) override {
-    ++begin_streaming_count;
-    active_streaming_session_id = next_streaming_session_id++;
-    snapshot.state = ExecutionState::kStreaming;
-    return StreamingSessionBeginResultDTO{
-        true, active_streaming_session_id, std::nullopt};
-  }
-
   /// Test backend declares spring_back_hold + hard_deceleration as
   /// supported. Individual tests may further customize via the
   /// `motion_interrupt_stop_capability` field.
@@ -442,6 +431,7 @@ class ControlledExecution : public IExecutionBackend {
   TrajectoryDTO last_resume_trajectory;
   ExecutionSnapshot snapshot;
   bool terminal_handle_on_pause = false;
+  std::function<void()> on_get_snapshot;
 
   ExecutionHandle execute_trajectory(const TrajectoryDTO& trajectory) override {
     {
@@ -548,6 +538,9 @@ class ControlledExecution : public IExecutionBackend {
   }
 
   ExecutionSnapshot get_execution_snapshot() const override {
+    if (on_get_snapshot) {
+      on_get_snapshot();
+    }
     std::lock_guard<std::mutex> lock(mu_);
     return snapshot;
   }
@@ -829,15 +822,6 @@ ExecuteRequestDTO make_test_request(const std::string& move_id = "move_1") {
   return req;
 }
 
-StreamingSessionConfigDTO make_streaming_config() {
-  StreamingSessionConfigDTO cfg;
-  cfg.group_id = "arm";
-  cfg.joint_names = {"j1", "j2"};
-  cfg.principal_id = "test_operator";
-  cfg.default_input_mode = StreamingInputMode::kJoint;
-  return cfg;
-}
-
 CollisionWorldSnapshot make_test_collision_world_snapshot() {
   CollisionWorldSnapshot snapshot;
   snapshot.publisher_id = "mock_kernel_collision_world";
@@ -921,7 +905,7 @@ InterruptPolicyDefinition make_interrupt_policy(std::string policy_id,
   policy.policy_id = std::move(policy_id);
   policy.source_id = std::move(source_id);
   policy.priority = 500;
-  policy.affected_phases = {InterruptExecutionPhase::kStreaming};
+  policy.affected_phases = {InterruptExecutionPhase::kTrajectoryExecution};
   policy.preemption_action = InterruptPreemptionAction::kLatchHeld;
   policy.post_latch_disposition =
       InterruptPostLatchDisposition::kAwaitOperatorAck;
@@ -1130,6 +1114,23 @@ TEST_F(ExecutionKernelTest, Execute_RelativeMove_OffsetReference_UsesIndependent
   EXPECT_NEAR(pose_goal.goal.orientation.w, kInvSqrt2, 1e-9);
 }
 
+TEST_F(ExecutionKernelTest, Config_SingleShotIkTimeout_RejectsNonPositiveOrNonFinite) {
+  for (double bad : {0.0, -0.01, std::numeric_limits<double>::quiet_NaN(),
+                     std::numeric_limits<double>::infinity()}) {
+    ExecutionKernelConfig config;
+    config.single_shot_ik_timeout_s = bad;
+    EXPECT_THROW(
+        (ExecutionKernel{planner, context, execution, clock, scheduler, cache,
+                         config}),
+        std::invalid_argument);
+  }
+
+  ExecutionKernelConfig ok_config;
+  ok_config.single_shot_ik_timeout_s = 0.05;
+  EXPECT_NO_THROW((ExecutionKernel{planner, context, execution, clock, scheduler,
+                                   cache, ok_config}));
+}
+
 TEST_F(ExecutionKernelTest, Execute_HappyPath_ValidatesTrajectory) {
   execute_sync(make_test_request());
   EXPECT_GE(context.validate_count, 1);
@@ -1228,6 +1229,42 @@ TEST_F(ExecutionKernelTest, Execute_CacheHit_SkipsPlanning) {
   EXPECT_EQ(planner.plan_count, 0);
   EXPECT_GE(context.validate_count, 1);
   EXPECT_EQ(execution.execute_count, 1);
+}
+
+// Phase 4-P5.1K direction A: an existing (uncapped) cache entry must NOT be
+// served to a request carrying per-joint dynamics caps. Cache lookup is
+// disabled for capped requests — the move is re-planned and the stale entry is
+// invalidated with a recorded reason.
+TEST_F(ExecutionKernelTest, Execute_PerJointDynamicsLimitsBypassCacheAndReplan) {
+  store_cache("move_dyn_capped", make_test_trajectory());
+  auto req = make_test_request("move_dyn_capped");
+  JointDynamicsLimitDTO lim;
+  lim.max_velocity_rad_s = 0.5;
+  req.per_joint_dynamics_limits["joint1"] = lim;
+
+  auto result = execute_sync(req);
+
+  ASSERT_TRUE(result.ok());
+  EXPECT_EQ(planner.plan_count, 1);  // cache bypassed -> re-planned
+  EXPECT_EQ(kernel.get_metrics().cache_invalidations, 1u);
+}
+
+// Phase 4-P5.1K direction B: a capped request must NOT leave a reusable cache
+// entry. The TrajectoryCache key has no dynamics-limit fingerprint, so a capped
+// trajectory stored under move_id could otherwise be picked up by a later
+// uncapped request. Cache store is disabled for capped requests. (The uncapped
+// happy path DOES store — see Execute_HappyPath_CachesTrajectory.)
+TEST_F(ExecutionKernelTest, Execute_CappedRequest_DoesNotStoreReusableCacheEntry) {
+  auto req = make_test_request("move_capped_no_store");
+  JointDynamicsLimitDTO lim;
+  lim.max_velocity_rad_s = 0.5;
+  req.per_joint_dynamics_limits["joint1"] = lim;
+
+  auto result = execute_sync(req);
+
+  ASSERT_TRUE(result.ok());
+  EXPECT_EQ(planner.plan_count, 1);  // planned (cache miss), then dispatched
+  EXPECT_FALSE(cache.lookup("move_capped_no_store").has_value());
 }
 
 TEST_F(ExecutionKernelTest, Execute_CacheHitPoseGoalWithMatchingEndPose_SkipsPlanning) {
@@ -1362,8 +1399,10 @@ TEST_F(ExecutionKernelTest, Execute_RelativeMoveMissingReference_DoesNotUseStale
   context.next_reference_pose = Result<Pose3DTO>::Err(
       ErrorDTO{kErrorMissingReference, "Object reference not found", {}});
 
+  std::mutex events_mutex;
   std::vector<KernelEvent> events;
   kernel.subscribe_events([&](const KernelEvent& e) {
+    std::lock_guard<std::mutex> lock(events_mutex);
     events.push_back(e);
   });
 
@@ -1376,6 +1415,7 @@ TEST_F(ExecutionKernelTest, Execute_RelativeMoveMissingReference_DoesNotUseStale
   EXPECT_FALSE(cache.lookup("move_missing_reference").has_value());
   EXPECT_EQ(kernel.get_metrics().cache_invalidations, 1u);
   EXPECT_EQ(kernel.get_status().state, ExecutionState::kIdle);
+  std::lock_guard<std::mutex> lock(events_mutex);
   bool found_cache_invalidated = false;
   for (const auto& event : events) {
     if (event.type == KernelEventType::kCacheInvalidated) {
@@ -1662,8 +1702,12 @@ TEST_F(ExecutionKernelTest,
   policy.allowed_static_static_pairs.push_back(allowed_pair);
   collision_world_publisher.current_policy = policy;
 
+  std::mutex events_mutex;
   std::vector<KernelEvent> events;
-  kernel.subscribe_events([&](const KernelEvent& e) { events.push_back(e); });
+  kernel.subscribe_events([&](const KernelEvent& e) {
+    std::lock_guard<std::mutex> lock(events_mutex);
+    events.push_back(e);
+  });
 
   execute_sync(make_test_request("classified_failure_diagnostics"));
 
@@ -1682,6 +1726,7 @@ TEST_F(ExecutionKernelTest,
             "0,0");
   EXPECT_EQ(details.at("collision_result_first_failure_time_from_start_s"),
             "0.000000");
+  std::lock_guard<std::mutex> lock(events_mutex);
   bool found_error_event = false;
   for (const auto& event : events) {
     if (event.type != KernelEventType::kErrorRaised) {
@@ -1758,8 +1803,12 @@ TEST_F(ExecutionKernelTest,
   policy.preemption_action = InterruptPreemptionAction::kCancelValidation;
   ASSERT_TRUE(kernel.register_interrupt_policy(policy).ok());
 
+  std::mutex events_mutex;
   std::vector<KernelEvent> events;
-  kernel.subscribe_events([&](const KernelEvent& e) { events.push_back(e); });
+  kernel.subscribe_events([&](const KernelEvent& e) {
+    std::lock_guard<std::mutex> lock(events_mutex);
+    events.push_back(e);
+  });
 
   bool interrupt_sent = false;
   collision_engine->on_check = [&](const CollisionQuery&) {
@@ -1792,6 +1841,7 @@ TEST_F(ExecutionKernelTest,
   EXPECT_EQ(snapshot.error->details.at("reason"),
             "collision_validation_cancelled");
 
+  std::lock_guard<std::mutex> lock(events_mutex);
   bool saw_latched = false;
   bool saw_preempt_succeeded = false;
   bool saw_interrupted_transition = false;
@@ -1881,9 +1931,12 @@ TEST_F(ExecutionKernelTest, AcknowledgeIntervention_FromIntervention_Transitions
   ASSERT_TRUE(first.ok());
   EXPECT_EQ(kernel.get_status().state, ExecutionState::kInterventionRequired);
 
+  std::mutex events_mutex;
   std::vector<KernelEvent> events;
-  kernel.subscribe_events(
-      [&](const KernelEvent& e) { events.push_back(e); });
+  kernel.subscribe_events([&](const KernelEvent& e) {
+    std::lock_guard<std::mutex> lock(events_mutex);
+    events.push_back(e);
+  });
 
   auto ack = kernel.acknowledge_intervention("operator_alice", "ui_run_resume");
   ASSERT_TRUE(ack.accepted);
@@ -1895,6 +1948,7 @@ TEST_F(ExecutionKernelTest, AcknowledgeIntervention_FromIntervention_Transitions
   auto resumed = execute_sync(make_test_request());
   EXPECT_TRUE(resumed.ok());
 
+  std::lock_guard<std::mutex> lock(events_mutex);
   bool saw_ack_event = false;
   for (const auto& e : events) {
     if (e.type == KernelEventType::kInterventionAcknowledged) {
@@ -2645,8 +2699,10 @@ TEST_F(ExecutionKernelTest,
       {{"reason", "soft_on_path_not_supported"}}};
   controlled_execution.next_controlled_stop_result = refused;
   controlled_execution.fail_next_legacy_stop = true;
+  std::mutex events_mutex;
   std::vector<KernelEvent> events;
   local_kernel.subscribe_events([&](const KernelEvent& e) {
+    std::lock_guard<std::mutex> lock(events_mutex);
     events.push_back(e);
   });
 
@@ -2665,6 +2721,7 @@ TEST_F(ExecutionKernelTest,
   EXPECT_TRUE(local_kernel.wait_for_completion(1'000'000'000));
   EXPECT_EQ(local_kernel.get_status().state,
             ExecutionState::kInterventionRequired);
+  std::lock_guard<std::mutex> lock(events_mutex);
   EXPECT_TRUE(std::any_of(events.begin(), events.end(),
                           [](const KernelEvent& e) {
                             return e.type == KernelEventType::kStateTransition &&
@@ -2940,8 +2997,13 @@ TEST_F(ExecutionKernelTest,
                                config};
   configure_authoritative_collision_validation(local_kernel, local_publisher,
                                                 local_engine);
+  // Events are emitted from BOTH the execution-worker thread and the
+  // interrupt/monitor lane, so the capture must be mutex-guarded; an
+  // unsynchronized vector races (and corrupts/segfaults under load).
+  std::mutex events_mutex;
   std::vector<KernelEvent> events;
   local_kernel.subscribe_events([&](const KernelEvent& e) {
+    std::lock_guard<std::mutex> lock(events_mutex);
     events.push_back(e);
   });
 
@@ -2973,25 +3035,44 @@ TEST_F(ExecutionKernelTest,
   // Controlled-stop attempted, refused; legacy stop() emergency-fell-back.
   EXPECT_EQ(controlled_execution.controlled_stop_count, 1);
   EXPECT_EQ(controlled_execution.stop_count, 1);
-  // Kernel transitioned to Interrupted; the preempt succeeded
-  // (legacy stop ran), so the latch reports succeeded preemption.
+
+  // The kInterruptPreemptApplied event is published by the interrupt/monitor
+  // lane in apply_latched_interrupt_preemption, which runs AFTER the state
+  // transition to Interrupted that the execution worker uses to signal
+  // completion. wait_for_completion can therefore return before the event is
+  // emitted, so poll deterministically for it instead of racing the emission.
+  // This does not weaken the assertion: it still requires the exact preempt
+  // path and all three detail fields.
+  const auto has_preempt_event = [&]() {
+    std::lock_guard<std::mutex> lock(events_mutex);
+    return std::any_of(
+        events.begin(), events.end(), [](const KernelEvent& e) {
+          return e.type == KernelEventType::kInterruptPreemptApplied &&
+                 e.details.contains("preempt_path") &&
+                 e.details.at("preempt_path") ==
+                     "controlled_stop_failed_legacy_fallback_succeeded" &&
+                 e.details.contains("emergency_fallback") &&
+                 e.details.at("emergency_fallback") == "legacy_stop_succeeded" &&
+                 e.details.contains("fault_stop_profile_id") &&
+                 e.details.at("fault_stop_profile_id") == "fault_spring_back";
+        });
+  };
+  bool saw_preempt_event = false;
+  for (int attempt = 0; attempt < 500; ++attempt) {
+    if (has_preempt_event()) {
+      saw_preempt_event = true;
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  EXPECT_TRUE(saw_preempt_event);
+
+  // Once the preempt event is observed, the latch result it accompanies is
+  // guaranteed set (marked on the same lane just before the event is emitted),
+  // so this read is no longer racy.
   auto latch = local_kernel.get_active_interrupt_latch();
   ASSERT_TRUE(latch.has_value());
   EXPECT_EQ(latch->preemption_result, InterruptPreemptionResult::kSucceeded);
-  EXPECT_TRUE(std::any_of(events.begin(), events.end(),
-                          [](const KernelEvent& e) {
-                            return e.type ==
-                                       KernelEventType::kInterruptPreemptApplied &&
-                                   e.details.contains("preempt_path") &&
-                                   e.details.at("preempt_path") ==
-                                       "controlled_stop_failed_legacy_fallback_succeeded" &&
-                                   e.details.contains("emergency_fallback") &&
-                                   e.details.at("emergency_fallback") ==
-                                       "legacy_stop_succeeded" &&
-                                   e.details.contains("fault_stop_profile_id") &&
-                                   e.details.at("fault_stop_profile_id") ==
-                                       "fault_spring_back";
-                          }));
 }
 
 TEST_F(ExecutionKernelTest,
@@ -3070,6 +3151,55 @@ TEST_F(ExecutionKernelTest,
             "stale_observed_robot_state");
   EXPECT_EQ(latch->signal_snapshot.metadata.at("observed_state_age_ns"),
             "20000000");
+}
+
+TEST_F(ExecutionKernelTest,
+       CollisionMonitoring_FreshObservedStatePublishedDuringTickDoesNotLookStale) {
+  ControlledExecution controlled_execution;
+  ThreadSafeFakeClock local_clock;
+  ThreadSafeManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  ExecutionKernelConfig config;
+  config.runtime_observed_state_max_age_ns = 10'000'000;  // 10 ms
+  MockCollisionWorldPublisher local_collision_world;
+  auto local_collision_engine = std::make_shared<MockCollisionEngine>();
+  ExecutionKernel controlled_kernel{planner,
+                                    context,
+                                    controlled_execution,
+                                    local_clock,
+                                    local_scheduler,
+                                    local_cache,
+                                    config};
+  configure_authoritative_collision_validation(
+      controlled_kernel, local_collision_world, local_collision_engine);
+
+  auto result = controlled_kernel.execute(make_test_request());
+  ASSERT_TRUE(result.ok());
+  ASSERT_TRUE(controlled_execution.wait_until_execute_called())
+      << "wait_until_execute_called timed out";
+  ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kExecuting));
+  controlled_execution.set_progress(0.25, {0.25, 0.75}, local_clock.now());
+
+  bool refreshed_during_monitor_tick = false;
+  controlled_execution.on_get_snapshot = [&]() {
+    if (refreshed_during_monitor_tick) {
+      return;
+    }
+    refreshed_during_monitor_tick = true;
+    local_clock.advance(1);
+    controlled_execution.set_progress(0.25, {0.25, 0.75}, local_clock.now());
+  };
+  const int baseline_engine_checks = local_collision_engine->check_count.load();
+
+  auto tick = controlled_kernel.collision_check_tick();
+  ASSERT_TRUE(tick.ok());
+  EXPECT_TRUE(refreshed_during_monitor_tick);
+  EXPECT_GT(local_collision_engine->check_count.load(), baseline_engine_checks);
+  EXPECT_EQ(controlled_execution.stop_count, 0);
+  EXPECT_EQ(controlled_kernel.get_status().state, ExecutionState::kExecuting);
+
+  controlled_execution.complete();
+  controlled_kernel.wait_for_completion();
 }
 
 TEST_F(ExecutionKernelTest,
@@ -3391,13 +3521,16 @@ TEST_F(ExecutionKernelTest, WaitForCompletion_BlocksUntilDone) {
 // ============================================================================
 
 TEST_F(ExecutionKernelTest, Events_HappyPath_PlanAndExecute) {
+  std::mutex events_mutex;
   std::vector<KernelEventType> events;
   kernel.subscribe_events([&](const KernelEvent& e) {
+    std::lock_guard<std::mutex> lock(events_mutex);
     events.push_back(e.type);
   });
 
   execute_sync(make_test_request());
 
+  std::lock_guard<std::mutex> lock(events_mutex);
   // Spec 230 §6.1: state_transition -> cache_miss -> plan_started ->
   //   plan_completed -> state_transition -> validation_started ->
   //   validation_passed -> state_transition -> execute_started ->
@@ -3419,13 +3552,16 @@ TEST_F(ExecutionKernelTest, Events_HappyPath_PlanAndExecute) {
 TEST_F(ExecutionKernelTest, Events_CacheHit) {
   store_cache("cached_move", make_test_trajectory());
 
+  std::mutex events_mutex;
   std::vector<KernelEventType> events;
   kernel.subscribe_events([&](const KernelEvent& e) {
+    std::lock_guard<std::mutex> lock(events_mutex);
     events.push_back(e.type);
   });
 
   execute_sync(make_test_request("cached_move"));
 
+  std::lock_guard<std::mutex> lock(events_mutex);
   // Spec 230 §6.1 (cache hit): state_transition -> cache_hit -> validation_started ->
   //   validation_passed -> state_transition -> execute_started -> execute_completed ->
   //   state_transition
@@ -3445,13 +3581,16 @@ TEST_F(ExecutionKernelTest, Events_PlanningFailure) {
   plan_err.error = ErrorDTO{kErrorPlanningFailed, "No solution", {}};
   planner.next_result = plan_err;
 
+  std::mutex events_mutex;
   std::vector<KernelEventType> events;
   kernel.subscribe_events([&](const KernelEvent& e) {
+    std::lock_guard<std::mutex> lock(events_mutex);
     events.push_back(e.type);
   });
 
   execute_sync(make_test_request());
 
+  std::lock_guard<std::mutex> lock(events_mutex);
   // Spec 230 §6.1 (failure): state_transition -> cache_miss -> plan_started ->
   //   error_raised -> state_transition
   ASSERT_GE(events.size(), 5u);
@@ -3466,13 +3605,16 @@ TEST_F(ExecutionKernelTest, Events_ValidationFailure) {
   context.next_validation = ValidationResultDTO{
       false, ErrorDTO{kErrorValidationCollision, "Collision", {}}};
 
+  std::mutex events_mutex;
   std::vector<KernelEventType> events;
   kernel.subscribe_events([&](const KernelEvent& e) {
+    std::lock_guard<std::mutex> lock(events_mutex);
     events.push_back(e.type);
   });
 
   execute_sync(make_test_request());
 
+  std::lock_guard<std::mutex> lock(events_mutex);
   // state_transition -> cache_miss -> plan_started -> plan_completed ->
   //   state_transition -> validation_started -> validation_failed ->
   //   error_raised -> state_transition
@@ -3489,109 +3631,50 @@ TEST_F(ExecutionKernelTest, Events_ValidationFailure) {
 }
 
 TEST_F(ExecutionKernelTest, Events_SubscribeUnsubscribe) {
+  std::mutex events_mutex;
   std::vector<KernelEventType> events;
   auto handle = kernel.subscribe_events([&](const KernelEvent& e) {
+    std::lock_guard<std::mutex> lock(events_mutex);
     events.push_back(e.type);
   });
 
   execute_sync(make_test_request());
-  EXPECT_FALSE(events.empty());
+  {
+    std::lock_guard<std::mutex> lock(events_mutex);
+    EXPECT_FALSE(events.empty());
+  }
 
   kernel.reset();
   kernel.unsubscribe_events(handle);
 
-  size_t count_before = events.size();
+  size_t count_before;
+  {
+    std::lock_guard<std::mutex> lock(events_mutex);
+    count_before = events.size();
+  }
   execute_sync(make_test_request());
+  std::lock_guard<std::mutex> lock(events_mutex);
   EXPECT_EQ(events.size(), count_before);  // no new events
 }
 
 TEST_F(ExecutionKernelTest, Events_MultipleSubscribers) {
+  std::mutex events_mutex;
   std::vector<KernelEventType> events_a;
   std::vector<KernelEventType> events_b;
   kernel.subscribe_events([&](const KernelEvent& e) {
+    std::lock_guard<std::mutex> lock(events_mutex);
     events_a.push_back(e.type);
   });
   kernel.subscribe_events([&](const KernelEvent& e) {
+    std::lock_guard<std::mutex> lock(events_mutex);
     events_b.push_back(e.type);
   });
 
   execute_sync(make_test_request());
 
+  std::lock_guard<std::mutex> lock(events_mutex);
   EXPECT_FALSE(events_a.empty());
   EXPECT_EQ(events_a.size(), events_b.size());
-}
-
-TEST_F(ExecutionKernelTest, InterruptSignalLatchesAndEmitsKernelEvents) {
-  ASSERT_TRUE(kernel.register_interrupt_source(
-                        make_interrupt_source("controller_fault"))
-                  .ok());
-  ASSERT_TRUE(kernel.register_interrupt_policy(
-                        make_interrupt_policy("controller_fault_policy",
-                                              "controller_fault"))
-                  .ok());
-  std::vector<KernelEvent> events;
-  kernel.subscribe_events([&](const KernelEvent& e) { events.push_back(e); });
-
-  ASSERT_TRUE(kernel.begin_streaming_session(make_streaming_config()).accepted);
-  auto result =
-      kernel.publish_fast_interrupt_signal(make_interrupt_signal("controller_fault"));
-
-  EXPECT_TRUE(result.latched);
-  EXPECT_EQ(kernel.get_status().state, ExecutionState::kInterrupted);
-  auto latch = kernel.get_active_interrupt_latch();
-  ASSERT_TRUE(latch.has_value());
-  EXPECT_EQ(latch->source_id, "controller_fault");
-  EXPECT_EQ(latch->policy_id, "controller_fault_policy");
-  EXPECT_EQ(latch->execution_phase_at_latch, InterruptExecutionPhase::kStreaming);
-  EXPECT_EQ(latch->active_streaming_session_id, 1u);
-
-  bool saw_latched = false;
-  bool saw_preempt_applied = false;
-  bool saw_interrupted_transition = false;
-  for (const auto& event : events) {
-    saw_latched = saw_latched || event.type == KernelEventType::kInterruptLatched;
-    saw_preempt_applied =
-        saw_preempt_applied || event.type == KernelEventType::kInterruptPreemptApplied;
-    if (event.type == KernelEventType::kStateTransition &&
-        event.to_state == ExecutionState::kInterrupted) {
-      saw_interrupted_transition = true;
-      EXPECT_EQ(event.details.at("reason"), "interrupt_latched");
-    }
-  }
-  EXPECT_TRUE(saw_latched);
-  EXPECT_TRUE(saw_preempt_applied);
-  EXPECT_TRUE(saw_interrupted_transition);
-}
-
-TEST_F(ExecutionKernelTest, ResetClearsActiveInterruptLatch) {
-  ASSERT_TRUE(kernel.register_interrupt_source(
-                        make_interrupt_source("controller_fault"))
-                  .ok());
-  ASSERT_TRUE(kernel.register_interrupt_policy(
-                        make_interrupt_policy("controller_fault_policy",
-                                              "controller_fault"))
-                  .ok());
-  std::vector<KernelEvent> events;
-  kernel.subscribe_events([&](const KernelEvent& e) { events.push_back(e); });
-  ASSERT_TRUE(kernel.begin_streaming_session(make_streaming_config()).accepted);
-  ASSERT_TRUE(kernel.publish_fast_interrupt_signal(
-                        make_interrupt_signal("controller_fault"))
-                  .latched);
-  ASSERT_TRUE(kernel.get_active_interrupt_latch().has_value());
-
-  auto reset = kernel.reset();
-
-  EXPECT_TRUE(reset.accepted);
-  EXPECT_FALSE(kernel.get_active_interrupt_latch().has_value());
-  EXPECT_EQ(kernel.get_status().state, ExecutionState::kIdle);
-  bool saw_reset_clear = false;
-  for (const auto& event : events) {
-    if (event.type == KernelEventType::kInterruptCleared &&
-        event.details.at("clear_reason") == "reset") {
-      saw_reset_clear = true;
-    }
-  }
-  EXPECT_TRUE(saw_reset_clear);
 }
 
 TEST_F(ExecutionKernelTest, InterruptSignalFromIdleCannotCreateHeldLatch) {
@@ -3614,14 +3697,17 @@ TEST_F(ExecutionKernelTest, InterruptSignalFromIdleCannotCreateHeldLatch) {
 }
 
 TEST_F(ExecutionKernelTest, Events_ExecutionId_Matches) {
+  std::mutex events_mutex;
   std::vector<uint64_t> event_ids;
   kernel.subscribe_events([&](const KernelEvent& e) {
+    std::lock_guard<std::mutex> lock(events_mutex);
     event_ids.push_back(e.execution_id);
   });
 
   auto result = execute_sync(make_test_request());
   ASSERT_TRUE(result.ok());
 
+  std::lock_guard<std::mutex> lock(events_mutex);
   for (uint64_t id : event_ids) {
     EXPECT_EQ(id, result.value());
   }
@@ -3632,13 +3718,16 @@ TEST_F(ExecutionKernelTest, Events_ExecutionId_Matches) {
 // ============================================================================
 
 TEST_F(ExecutionKernelTest, Events_StateTransition_HappyPath) {
+  std::mutex events_mutex;
   std::vector<KernelEvent> events;
   kernel.subscribe_events([&](const KernelEvent& e) {
+    std::lock_guard<std::mutex> lock(events_mutex);
     events.push_back(e);
   });
 
   execute_sync(make_test_request());
 
+  std::lock_guard<std::mutex> lock(events_mutex);
   // Filter state transition events
   std::vector<std::pair<ExecutionState, ExecutionState>> transitions;
   for (const auto& e : events) {
@@ -3663,13 +3752,16 @@ TEST_F(ExecutionKernelTest, Events_StateTransition_HappyPath) {
 TEST_F(ExecutionKernelTest, Events_StateTransition_CacheHit) {
   store_cache("cached_move", make_test_trajectory());
 
+  std::mutex events_mutex;
   std::vector<KernelEvent> events;
   kernel.subscribe_events([&](const KernelEvent& e) {
+    std::lock_guard<std::mutex> lock(events_mutex);
     events.push_back(e);
   });
 
   execute_sync(make_test_request("cached_move"));
 
+  std::lock_guard<std::mutex> lock(events_mutex);
   // Filter state transition events
   std::vector<std::pair<ExecutionState, ExecutionState>> transitions;
   for (const auto& e : events) {
@@ -3694,13 +3786,16 @@ TEST_F(ExecutionKernelTest, Events_StateTransition_PlanFailure) {
   plan_err.error = ErrorDTO{kErrorPlanningFailed, "No solution", {}};
   planner.next_result = plan_err;
 
+  std::mutex events_mutex;
   std::vector<KernelEvent> events;
   kernel.subscribe_events([&](const KernelEvent& e) {
+    std::lock_guard<std::mutex> lock(events_mutex);
     events.push_back(e);
   });
 
   execute_sync(make_test_request());
 
+  std::lock_guard<std::mutex> lock(events_mutex);
   // Filter state transition events
   std::vector<std::pair<ExecutionState, ExecutionState>> transitions;
   for (const auto& e : events) {
@@ -3722,13 +3817,16 @@ TEST_F(ExecutionKernelTest, Events_StateTransition_ValidationFailure) {
   context.next_validation = ValidationResultDTO{
       false, ErrorDTO{kErrorValidationCollision, "Collision", {}}};
 
+  std::mutex events_mutex;
   std::vector<KernelEvent> events;
   kernel.subscribe_events([&](const KernelEvent& e) {
+    std::lock_guard<std::mutex> lock(events_mutex);
     events.push_back(e);
   });
 
   execute_sync(make_test_request());
 
+  std::lock_guard<std::mutex> lock(events_mutex);
   // Filter state transition events
   std::vector<std::pair<ExecutionState, ExecutionState>> transitions;
   for (const auto& e : events) {
@@ -3821,8 +3919,10 @@ TEST_F(ExecutionKernelTest, Cancel_StopDuringPlanning_EmitsCorrectEvents) {
   configure_authoritative_collision_validation(
       kernel, collision_world_publisher, collision_engine);
 
+  std::mutex events_mutex;
   std::vector<KernelEvent> events;
   kernel.subscribe_events([&](const KernelEvent& e) {
+    std::lock_guard<std::mutex> lock(events_mutex);
     events.push_back(e);
   });
 
@@ -3842,6 +3942,7 @@ TEST_F(ExecutionKernelTest, Cancel_StopDuringPlanning_EmitsCorrectEvents) {
   // Wait for completion
   kernel.wait_for_completion();
 
+  std::lock_guard<std::mutex> lock(events_mutex);
   // Verify events include kErrorRaised with planning_timeout error
   bool found_error = false;
   for (const auto& e : events) {
@@ -3883,13 +3984,16 @@ TEST_F(ExecutionKernelTest, Cancel_StopFromExecuting_TransitionsToStopped) {
 
 TEST_F(ExecutionKernelTest, Events_CacheMissEvent) {
   // Execute with empty cache -> verify kCacheMiss is emitted
+  std::mutex events_mutex;
   std::vector<KernelEvent> events;
   kernel.subscribe_events([&](const KernelEvent& e) {
+    std::lock_guard<std::mutex> lock(events_mutex);
     events.push_back(e);
   });
 
   execute_sync(make_test_request("new_move"));
 
+  std::lock_guard<std::mutex> lock(events_mutex);
   // Find kCacheMiss event
   bool found_cache_miss = false;
   for (const auto& e : events) {
@@ -3906,13 +4010,16 @@ TEST_F(ExecutionKernelTest, Events_CacheHitDoesNotEmitMiss) {
   // Execute after cache store -> verify kCacheMiss NOT emitted
   store_cache("cached_for_test", make_test_trajectory());
 
+  std::mutex events_mutex;
   std::vector<KernelEvent> events;
   kernel.subscribe_events([&](const KernelEvent& e) {
+    std::lock_guard<std::mutex> lock(events_mutex);
     events.push_back(e);
   });
 
   execute_sync(make_test_request("cached_for_test"));
 
+  std::lock_guard<std::mutex> lock(events_mutex);
   // Verify no kCacheMiss event
   for (const auto& e : events) {
     EXPECT_NE(e.type, KernelEventType::kCacheMiss);
@@ -3925,13 +4032,16 @@ TEST_F(ExecutionKernelTest, Events_CacheInvalidatedEvent) {
   context.next_validation = ValidationResultDTO{
       false, ErrorDTO{kErrorValidationCollision, "Collision", {}}};
 
+  std::mutex events_mutex;
   std::vector<KernelEvent> events;
   kernel.subscribe_events([&](const KernelEvent& e) {
+    std::lock_guard<std::mutex> lock(events_mutex);
     events.push_back(e);
   });
 
   execute_sync(make_test_request("invalidate_test"));
 
+  std::lock_guard<std::mutex> lock(events_mutex);
   // Find kCacheInvalidated event
   bool found_cache_invalidated = false;
   for (const auto& e : events) {
@@ -3953,13 +4063,16 @@ TEST_F(ExecutionKernelTest, Events_CacheInvalidatedEventIncludesCompatibilityRea
   req.motion = pose_goal;
   context.next_fk = make_pose(0.1, -0.1, 0.2);
 
+  std::mutex events_mutex;
   std::vector<KernelEvent> events;
   kernel.subscribe_events([&](const KernelEvent& e) {
+    std::lock_guard<std::mutex> lock(events_mutex);
     events.push_back(e);
   });
 
   execute_sync(req);
 
+  std::lock_guard<std::mutex> lock(events_mutex);
   bool found_cache_invalidated = false;
   for (const auto& e : events) {
     if (e.type == KernelEventType::kCacheInvalidated) {
@@ -3977,13 +4090,16 @@ TEST_F(ExecutionKernelTest, Events_ValidationFailedEvent) {
   context.next_validation = ValidationResultDTO{
       false, ErrorDTO{kErrorValidationCollision, "Collision", {}}};
 
+  std::mutex events_mutex;
   std::vector<KernelEvent> events;
   kernel.subscribe_events([&](const KernelEvent& e) {
+    std::lock_guard<std::mutex> lock(events_mutex);
     events.push_back(e);
   });
 
   execute_sync(make_test_request());
 
+  std::lock_guard<std::mutex> lock(events_mutex);
   // Find kValidationFailed and kErrorRaised events
   int validation_failed_idx = -1;
   int error_raised_idx = -1;
@@ -4014,8 +4130,10 @@ TEST_F(ExecutionKernelTest, Events_CollisionDetectedEvent) {
   configure_authoritative_collision_validation(
       kernel, collision_world_publisher, collision_engine);
 
+  std::mutex events_mutex;
   std::vector<KernelEvent> events;
   kernel.subscribe_events([&](const KernelEvent& e) {
+    std::lock_guard<std::mutex> lock(events_mutex);
     events.push_back(e);
   });
 
@@ -4303,8 +4421,12 @@ TEST_F(ExecutionKernelTest, ResetDuringPlanning_PrevStateIsPlanning) {
   configure_authoritative_collision_validation(
       local_kernel, collision_world_publisher, collision_engine);
 
+  std::mutex events_mutex;
   std::vector<KernelEvent> events;
-  local_kernel.subscribe_events([&](const KernelEvent& e) { events.push_back(e); });
+  local_kernel.subscribe_events([&](const KernelEvent& e) {
+    std::lock_guard<std::mutex> lock(events_mutex);
+    events.push_back(e);
+  });
 
   auto result = local_kernel.execute(make_test_request());
   ASSERT_TRUE(result.ok());
@@ -4316,6 +4438,7 @@ TEST_F(ExecutionKernelTest, ResetDuringPlanning_PrevStateIsPlanning) {
   slow_planner.release();
   local_kernel.wait_for_completion();
 
+  std::lock_guard<std::mutex> lock(events_mutex);
   // Find the transition to Idle
   for (const auto& e : events) {
     if (e.type == KernelEventType::kStateTransition && e.to_state == ExecutionState::kIdle) {

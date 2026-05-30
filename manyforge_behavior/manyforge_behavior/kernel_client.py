@@ -16,7 +16,6 @@ class ExecutionState(Enum):
     PLANNING = "planning"
     VALIDATING = "validating"
     EXECUTING = "executing"
-    STREAMING = "streaming"  # ADR-0016: streaming-session execution mode
     INTERRUPTED = "interrupted"
     PAUSED = "paused"
     STOPPING = "stopping"
@@ -112,6 +111,23 @@ class MotionExecutionOutcome:
 
 
 @dataclass
+class JointDynamicsLimit:
+    """Per-joint dynamics cap for one joint (Phase 4-P5.1K).
+
+    Each field is an ABSOLUTE cap in SI units, or None meaning "no cap from
+    this source for this dimension". The kernel resolves the effective cap as
+    the conservative minimum across model/backend/controller/deployment sources
+    and enforces velocity/acceleration in TOPP-RA time-parameterization. Jerk is
+    carried but only enforceable where the active predictor constrains jerk; the
+    discrete TOPP-RA path rejects a jerk cap as `unsupported_joint_dynamics_limit`
+    rather than claiming enforcement."""
+
+    max_velocity_rad_s: Optional[float] = None
+    max_acceleration_rad_s2: Optional[float] = None
+    max_jerk_rad_s3: Optional[float] = None
+
+
+@dataclass
 class ExecuteRequest:
     robot_id: str
     group_id: str
@@ -126,6 +142,13 @@ class ExecuteRequest:
     velocity_scale: float = 1.0
     acceleration_scale: float = 1.0
     max_tcp_linear_speed_mps: Optional[float] = None
+    # Per-joint absolute dynamics caps keyed by canonical drivable joint name
+    # (Phase 4-P5.1K). Empty preserves prior behavior. Carried through the
+    # native request channel into TOPP-RA; velocity_scale is applied AFTER the
+    # absolute per-joint velocity cap is resolved.
+    per_joint_dynamics_limits: Dict[str, JointDynamicsLimit] = field(
+        default_factory=dict
+    )
     joint_position_tol_rad: float = 0.05
     translation_tol_m: float = 0.005
     rotation_tol_rad: float = 0.05
@@ -176,74 +199,6 @@ class ObjectState:
 class CommandResult:
     accepted: bool = False
     error: Optional[str] = None
-
-
-@dataclass
-class StreamingSessionConfig:
-    """Configuration for a streaming-session begin call (ADR-0016)."""
-
-    group_id: str = ""
-    joint_names: List[str] = field(default_factory=list)
-    input_mode: str = "cartesian"  # "cartesian" | "joint"
-    cartesian_reference_frame: str = "base"
-    tcp_frame: str = ""  # required for cartesian sessions (ADR-0016 IK pre-resolution)
-    soft_stop_strategy: str = "spring_back"  # "spring_back" | "velocity_scaling"
-    soft_stop_deceleration_time_s: float = 0.4
-    anchor_negative_time_s: float = -0.010
-    target_time_from_start_min_s: float = 0.030
-    max_dispatch_rate_hz: float = 30.0
-    target_max_age_s: float = 0.200
-    velocity_scale: float = 1.0
-    # Absolute Cartesian (TCP) linear speed cap, m/s (ADR-0015 / ADR-0016).
-    # 0.0 = unlimited; deployments should populate from
-    # `robot_config.global_max_tcp_linear_speed_mps`.
-    max_tcp_linear_speed_mps: float = 0.0
-    # Per-joint streaming caps (parallel to joint_names), spec/430 §3.2
-    # streaming-joint-limits + ADR-0016. Sourced at session begin from
-    # `deployment.robot_config.streaming_joint_limits` and laid out in
-    # session-joint-order; zero entries fall back to backend engine
-    # defaults (0.5 rad/s velocity, 2.0 rad/s² acceleration).
-    per_joint_velocity_caps_rad_s: List[float] = field(default_factory=list)
-    per_joint_acceleration_caps_rad_s2: List[float] = field(default_factory=list)
-    principal_id: str = ""
-    authority_source: str = "human"
-    trigger_reason: str = "operator_direct_control"
-
-
-@dataclass
-class StreamingTarget:
-    """A single push_streaming_target payload (ADR-0016)."""
-
-    kind: str = "cartesian"  # "cartesian" | "joint"
-    position_m: List[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])
-    orientation_xyzw: List[float] = field(
-        default_factory=lambda: [0.0, 0.0, 0.0, 1.0]
-    )
-    joint_names: List[str] = field(default_factory=list)
-    joint_positions_rad: List[float] = field(default_factory=list)
-    source_timestamp_ns: int = 0
-    source_sequence: int = 0
-    # Floor on the backend's anchored-FJT time_from_start (s). Populated
-    # by the kernel when enforcing the Cartesian speed cap (ADR-0015 on
-    # streaming sessions); callers typically leave at 0.0.
-    min_time_from_start_s: float = 0.0
-
-
-@dataclass
-class StreamingBeginResult:
-    accepted: bool = False
-    session_id: int = 0
-    error: Optional[str] = None
-    error_code: Optional[str] = None
-
-
-@dataclass
-class StreamingPushResult:
-    accepted: bool = False
-    backend_sequence: int = 0
-    error: Optional[str] = None
-    error_code: Optional[str] = None
-    error_details: Dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -569,49 +524,16 @@ class KernelClient(ABC):
             error="acknowledge_interrupted_for_retry not supported by this kernel client",
         )
 
-    # Streaming-session API (ADR-0016). Default implementations make the new
-    # surface optional for backends that don't support it; the kernel-bound
-    # clients (NativeKernelClient) override with the real implementations.
-    def begin_streaming_session(
-        self, config: StreamingSessionConfig
-    ) -> StreamingBeginResult:
-        return StreamingBeginResult(
-            accepted=False,
-            error="streaming-session mode not supported by this kernel client",
-            error_code="unsupported_capability",
-        )
-
-    def push_streaming_target(
-        self, session_id: int, target: StreamingTarget
-    ) -> StreamingPushResult:
-        return StreamingPushResult(
-            accepted=False,
-            error="streaming-session mode not supported by this kernel client",
-        )
-
-    def end_streaming_session(
-        self, session_id: int, soft_stop_strategy: str = "spring_back"
-    ) -> CommandResult:
-        return CommandResult(
-            accepted=False,
-            error="streaming-session mode not supported by this kernel client",
-        )
-
     def set_runtime_velocity_scale(self, scale: float) -> None:
         """Forward the HMI runtime velocity-scale control to the kernel.
 
         ADR-0018: this is a live execution control, not a behavior-tree
         parameter override. Implementations clamp finite values to [0, 1] and
-        apply them to discrete and streaming execution without stopping the
-        active action.
+        apply them to discrete execution without stopping the active action.
         """
         # Default implementation: no-op. Native/mocked clients that support
         # runtime scaling override.
         return None
-
-    def set_streaming_velocity_scale(self, scale: float) -> None:
-        """Compatibility alias for older callers."""
-        self.set_runtime_velocity_scale(scale)
 
     @abstractmethod
     def get_status(self) -> ExecutionStatus: ...
@@ -774,6 +696,12 @@ class MockKernelClient(KernelClient):
         # `no_signal_trip` for moves carrying motion_interrupt_scopes.
         self._outcomes: Dict[int, MotionExecutionOutcome] = {}
         self.next_outcome_factory = None  # type: ignore[assignment]
+        # Optional one-shot preview-motion result injection for tests. When
+        # set, the next preview_motion() consumes it and returns it verbatim
+        # (mirrors next_outcome_factory). Lets tests drive ready/blocked
+        # candidate planning with structured diagnostics (IK failure,
+        # joint-limit, collision) without a real planner.
+        self.next_preview_result: Optional[MotionPreviewResult] = None
         # Allow tests to inject failures
         self.fail_next_execute = False
         self.fail_next_scene_edit = False
@@ -932,8 +860,19 @@ class MockKernelClient(KernelClient):
 
         The mock keeps this deliberately simple: it accepts all requests unless
         a failure has been injected via ``fail_next_execute`` and returns the
-        requested pose as the final TCP pose for pose-goal motions.
+        requested pose as the final TCP pose for pose-goal motions. Tests that
+        need a specific structured outcome (IK failure, joint-limit, collision)
+        set ``next_preview_result`` to a prebuilt MotionPreviewResult.
         """
+        if self.next_preview_result is not None:
+            result = self.next_preview_result
+            self.next_preview_result = None
+            if result.ok:
+                self._metrics["plans_succeeded"] += 1
+                self._metrics["validations_passed"] += 1
+            else:
+                self._metrics["plans_failed"] += 1
+            return result
         if self.fail_next_execute:
             self.fail_next_execute = False
             self._metrics["plans_failed"] += 1

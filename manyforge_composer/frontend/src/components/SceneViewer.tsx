@@ -1,4 +1,4 @@
-import { Component, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Component, Suspense, useEffect, useMemo, useRef, useState } from 'react';
 import type { ErrorInfo, MutableRefObject, ReactNode } from 'react';
 import { Canvas } from '@react-three/fiber';
 import {
@@ -14,12 +14,9 @@ import * as THREE from 'three';
 import type { Group, Mesh } from 'three';
 
 import { api } from '../api/client';
-import {
-  followTargetController,
-  type FollowTargetDragToken,
-} from '../streaming/followTargetController';
 import { usePointCloudStore, usePointCloudSubscription } from '../store/pointCloudStore';
 import { useProgramStore } from '../store/programStore';
+import { useRobotControlCandidateStore } from '../store/robotControlCandidateStore';
 import { useRobotCommandAuthority } from '../store/commandAuthority';
 import { useSceneStateStore, useScenePolling } from '../store/sceneStateStore';
 import { useStatusPolling, useStatusStore } from '../store/statusStore';
@@ -27,7 +24,6 @@ import { useViewerSelectionStore } from '../store/viewerSelectionStore';
 import type {
   MeshAssetStatus,
   PoseSourceStatusState,
-  PreviewLinkPosesRequest,
   PreviewLinkPosesResponse,
   SceneFrameState,
   SceneObjectState,
@@ -36,14 +32,14 @@ import type {
   SceneUrdfVisual,
   TreeNode,
 } from '../types/api';
+import { authorGizmoRelease } from '../utils/gizmoAuthoring';
 import { computeMoveToTarget } from '../utils/moveTo';
 import {
   composePose,
   poseFromBasePoseRecord,
   poseFromRecord,
-  relativePose,
-  type PoseTuple,
 } from '../utils/poseTransforms';
+import type { PoseTuple } from '../utils/poseTransforms';
 import { ObjectEditPanel } from './ObjectEditPanel';
 import { RobotControlPanel } from './RobotControlPanel';
 import { SceneControls } from './SceneControls';
@@ -57,8 +53,6 @@ import { SnapshotResponder } from './SnapshotResponder';
 const EMPTY_OBJECTS: SceneObjectState[] = [];
 
 const EMPTY_POSE_SOURCES: PoseSourceStatusState[] = [];
-
-const EMPTY_GRIPPERS: import('../types/api').SceneGripperState[] = [];
 
 const EMPTY_LINK_POSES: Record<
   string,
@@ -136,7 +130,7 @@ export function SceneViewerPanel({
   // unambiguous to read. The state lives in viewerSelectionStore so
   // Canvas descendants (TcpJogGizmo, SceneObjectMesh's
   // TransformControls) can gate themselves on panel focus and unmount
-  // — cleanly aborting any open streaming session — when the operator
+  // — resetting gizmo drag state — when the operator
   // switches panels mid-interaction.
   const activePanel = useViewerSelectionStore((s) => s.activePanel);
   const setActivePanel = useViewerSelectionStore((s) => s.setActivePanel);
@@ -539,8 +533,7 @@ function SceneCanvas({
       <PointCloud />
       <TcpJogGizmo />
       <MoveToTargetGhost />
-      <MoveToGhostRobot />
-      <CartesianRejectionIndicator />
+      <CandidateGhostRobot />
       <SnapshotResponder />
       {statsVisible && <Stats className="!left-2 !top-2" />}
     </Canvas>
@@ -1294,36 +1287,27 @@ function FrameAxes() {
 }
 
 function TcpJogGizmo() {
-  // End-effector jog gizmo, ADR-0016 streaming-session edition.
+  // End-effector authoring gizmo (author-only, no motion).
   //
-  // The gizmo is anchored to an invisible mesh at the current TCP pose
-  // (read from scene state). On mouseDown we open a WebSocket streaming
-  // session via /ws/follow-target; while dragging we push the gizmo's
-  // live pose to the session as fast as drei fires onObjectChange (the
-  // backend coalesces — latest-wins — so there's no need to rate-limit
-  // here); on mouseUp we close the session and the backend runs the
-  // configured soft-stop trajectory.
+  // The gizmo is anchored to an invisible mesh. With no active draft it rests
+  // at the live TCP pose (read from scene state); while a Cartesian draft
+  // candidate is active it rests at the authored target. Dragging moves the
+  // anchor for visual authoring only: it does NOT move the robot. On release it
+  // authors a validated candidate and stays at that target (no snap-back). The
+  // robot moves only via an explicit Approve.
   //
-  // Why this replaces the old one-shot /api/direct/cartesian-jog path:
-  // each one-shot per frame produced fresh plan+execute cycles, which
-  // (a) carried plan latency, (b) made the robot's motion chunky from
-  // back-to-back acceleration ramps, and (c) raced cycleState transitions
-  // such that the chain could deadlock if a WS state edge beat the HTTP
-  // response. The streaming session is one long-lived intervention with
-  // a mutable target register the C++ backend coalesces against — cycle
-  // stays in direct_control for the entire drag, no idle/direct_control
-  // flapping, smooth preempt via anchored FJT.
   // Robot-tab focus + cartesian-mode gate. The gizmo only mounts when
-  // BOTH conditions hold: the operator has the Robot panel open AND
-  // the robot panel's mode is set to Cartesian. Switching the active
-  // panel away (Object, Tools, or closed) — or switching robot mode
-  // to Joint — unmounts the gizmo, which triggers the cleanup effect
-  // below to abort any open streaming session.
+  // BOTH conditions hold: the operator has the Robot panel open AND the
+  // robot panel's mode is set to Cartesian. Switching the active panel
+  // away — or switching robot mode to Joint — unmounts the gizmo.
   const robotPanelActive = useViewerSelectionStore((s) => s.activePanel === 'robot');
   const robotMode = useViewerSelectionStore((s) => s.robotMode);
   const cartesianFrame = useViewerSelectionStore((s) => s.cartesianFrame);
   const gizmoMode = useViewerSelectionStore((s) => s.cartesianGizmoMode);
-  const commandGate = useRobotCommandAuthority({ allowFollowTargetActive: true });
+  const commandGate = useRobotCommandAuthority();
+  const author = useRobotControlCandidateStore((s) => s.author);
+  const rejectDraft = useRobotControlCandidateStore((s) => s.rejectDraft);
+  const candidate = useRobotControlCandidateStore((s) => s.candidate);
   const scene = useSceneStateStore((s) => s.scene ?? null);
   const tcpPose = scene?.robot?.tcp_pose_in_base ?? null;
   const tcpFrame = scene?.robot?.tcp_frame ?? null;
@@ -1335,24 +1319,39 @@ function TcpJogGizmo() {
     }
     return poseFromBasePoseRecord(scene?.robot?.base_pose);
   }, [scene?.link_poses, scene?.robot?.base_pose, baseFrame]);
-  // Joint list for the cartesian streaming session. Sourced from the
-  // live scene's robot state (`scene.robot.joint_names`) rather than the
-  // URDF manifest because the backend's IK uses scene-state ordering;
-  // a URDF/scene mismatch would make the kernel reject every frame with
-  // `unknown_joint_name`. Falls back to an empty list when the scene is
-  // still loading — the kernel's begin_streaming_session fallback (it
-  // populates joint_names from `context_.get_current_state()` when the
-  // session list is empty) covers that gap.
-  const sceneJointNames = useSceneStateStore(
-    (s) => s.scene?.robot?.joint_names ?? null,
-  );
-  const drivableJointNamesRef = useRef<string[]>([]);
-  useEffect(() => {
-    drivableJointNamesRef.current = sceneJointNames ?? [];
-  }, [sceneJointNames]);
   const [anchor, setAnchor] = useState<Mesh | null>(null);
   const draggingRef = useRef(false);
-  const dragTokenRef = useRef<FollowTargetDragToken | null>(null);
+
+  // Author a Cartesian candidate from the gizmo anchor's current world pose
+  // (set by TransformControls during drag), expressed in the robot base frame
+  // — exactly the shape the numeric Cartesian fields use. AUTHORING ONLY: this
+  // creates/updates the server-owned candidate and never moves the robot. The
+  // anchor then rests at the authored target (it is not snapped back to the
+  // live TCP); the validated candidate ghost shows the planned configuration.
+  const authorFromAnchorRef = useRef<() => void>(() => {});
+  authorFromAnchorRef.current = () => {
+    if (!commandGate.canCommand) return;
+    if (anchor === null) return;
+    // Read the anchor's world transform (top-level scene child; its local
+    // position/quaternion are world coordinates).
+    const anchorWorld: PoseTuple = {
+      position: [anchor.position.x, anchor.position.y, anchor.position.z],
+      quaternion: [
+        anchor.quaternion.x,
+        anchor.quaternion.y,
+        anchor.quaternion.z,
+        anchor.quaternion.w,
+      ],
+    };
+    // Author the target in the robot base frame, or fail closed when the base
+    // frame cannot be resolved (baseWorldPose unknown): authorGizmoRelease then
+    // does NOT author and instead makes any prior draft non-approvable via
+    // rejectDraft, so a mis-framed pose can never be authored or approved.
+    authorGizmoRelease(anchorWorld, baseWorldPose, tcpFrame, {
+      author,
+      rejectDraft,
+    });
+  };
 
   const initialPose = useMemo(() => {
     const tcpWorldPose =
@@ -1368,112 +1367,75 @@ function TcpJogGizmo() {
     return tcpInBase;
   }, [scene?.link_poses, tcpFrame, tcpPose, baseWorldPose]);
 
-  const targetInStreamingFrame = useCallback((): PoseTuple | null => {
-    if (anchor === null) return null;
-    const worldPose: PoseTuple = {
-      position: [anchor.position.x, anchor.position.y, anchor.position.z],
-      quaternion: [
-        anchor.quaternion.x,
-        anchor.quaternion.y,
-        anchor.quaternion.z,
-        anchor.quaternion.w,
-      ],
-    };
-    if (baseWorldPose !== null) {
-      return relativePose(worldPose, baseWorldPose);
+  // While a Cartesian draft candidate is active, the gizmo rests at the
+  // AUTHORED TARGET (the candidate's pose), not the live TCP — so editing is
+  // iterative and a release does not snap the gizmo back. The target is in the
+  // base frame; convert it to world. Falls back to live TCP when there is no
+  // active draft (e.g. after Revert), when the candidate is handing off to
+  // execution, or for an exotic non-base frame we cannot convert.
+  const draftTargetWorld = useMemo(() => {
+    if (candidate === null || baseWorldPose === null) return null;
+    const target = candidate.cartesianTarget;
+    if (target == null) return null;
+    const st = candidate.status;
+    if (
+      st === 'executing' ||
+      st === 'completed' ||
+      st === 'stopped' ||
+      st === 'interrupted' ||
+      st === 'failed' ||
+      st === 'reverted' ||
+      st === 'error'
+    ) return null;
+    if (target.frameId && target.frameId !== 'base' && target.frameId !== baseFrame) {
+      return null;
     }
-    return worldPose;
-  }, [anchor, baseWorldPose]);
+    return composePose(baseWorldPose, {
+      position: target.positionM as [number, number, number],
+      quaternion: target.orientationXyzw as [number, number, number, number],
+    });
+  }, [candidate, baseWorldPose, baseFrame]);
+
+  const anchorPose = draftTargetWorld ?? initialPose;
 
   useEffect(() => {
-    if (anchor === null || initialPose === null) return;
+    if (anchor === null || anchorPose === null) return;
     if (draggingRef.current) return;
-    anchor.position.set(...initialPose.position);
-    anchor.quaternion.set(...initialPose.quaternion);
-  }, [anchor, initialPose, robotMode]);
+    anchor.position.set(...anchorPose.position);
+    anchor.quaternion.set(...anchorPose.quaternion);
+  }, [anchor, anchorPose, robotMode]);
 
-  // Abort any active session on unmount (mode switch away from Cartesian,
-  // panel close, viewer remount). The controller owns the WebSocket
-  // lifecycle independent of this component; abort() ensures the socket
-  // is closed and the kernel session is released regardless of what
-  // caused the unmount.
-  useEffect(() => {
-    return () => {
-      if (followTargetController.phase() !== 'idle') {
-        followTargetController.abort('TcpJogGizmo unmount');
-      }
-    };
-  }, []);
+  // Single-shot drag release. Both the inline TransformControls onMouseUp and
+  // the window pointerup/pointercancel safety net route through this one path.
+  // The draggingRef guard makes whichever fires SECOND a no-op, so a release
+  // authors EXACTLY ONCE from the dragged anchor pose. The anchor is NOT
+  // snapped back to the live TCP: it stays at the authored target so editing is
+  // iterative (the new draft candidate's target keeps `anchorPose` there). It
+  // returns to the live TCP only when the draft is discarded (Revert / mode
+  // change) or hands off to execution. Authoring only; never moves the robot.
+  const finishDragRef = useRef<() => void>(() => {});
+  finishDragRef.current = () => {
+    if (!draggingRef.current) return;
+    draggingRef.current = false;
+    useViewerSelectionStore.getState().setDraggingGizmo(false);
+    authorFromAnchorRef.current();
+  };
 
-  // Retry watchdog: while dragging, fire a push at a steady rate
-  // independent of drei's onObjectChange cadence. Two failure modes
-  // this catches:
-  //   1. Operator holds the gizmo still in an unreachable region;
-  //      drei stops firing onObjectChange so no pushes go out, so IK
-  //      is never re-attempted. With the watchdog, the kernel keeps
-  //      retrying every 200 ms — if scene interpolation eventually
-  //      brings the kernel's IK seed into a config from which the
-  //      target is reachable, the next push lands and the indicator
-  //      clears without operator intervention.
-  //   2. drei's onObjectChange under fast re-renders firing slower
-  //      than the operator's actual hand motion (we observed 1 Hz
-  //      cadence in logs); the watchdog backs it up at 5 Hz.
-  // No-op when not dragging or when controller phase is not
-  // 'streaming' (the controller's push() drops the call cheaply).
+  // Window-level safety net: if drei TransformControls drops its mouseUp
+  // event, the window pointerup/pointercancel still finishes the drag.
+  // Routed through the single-shot finishDrag path so it can never
+  // double-author with the inline handler.
   useEffect(() => {
-    // 4 Hz watchdog — operator-visible motion stays smooth, kernel +
-    // controller see at most one in-flight frame, and the released
-    // pose is always covered by an explicit final push on onMouseUp.
-    const interval = setInterval(() => {
-      if (!draggingRef.current) return;
-      if (anchor === null) return;
-      const token = dragTokenRef.current;
-      if (token === null) return;
-      const target = targetInStreamingFrame();
-      if (target === null) return;
-      followTargetController.push(token, {
-        kind: 'cartesian',
-        positionM: target.position,
-        orientationXyzw: target.quaternion,
-      });
-    }, 250);
-    return () => clearInterval(interval);
-  }, [targetInStreamingFrame]);
-
-  // Global pointerup safety net: if drei TransformControls drops the
-  // mouseUp event (which we've observed under certain raycast / event-
-  // capture conditions), the window-level pointerup still fires. When
-  // it does and we're still in dragging state, force the release path
-  // so the gizmo snaps back, the controller ends the session, and the
-  // kernel doesn't stay locked in kStreaming. Without this, releasing
-  // in an unreachable region used to hang the chain for ~30 seconds
-  // until other timeouts eventually unstuck it.
-  useEffect(() => {
-    const onPointerUp = () => {
-      if (!draggingRef.current) return;
-      draggingRef.current = false;
-      const token = dragTokenRef.current;
-      dragTokenRef.current = null;
-      const vs = useViewerSelectionStore.getState();
-      vs.setDraggingGizmo(false);
-      vs.setCartesianRejection(null, null);
-      followTargetController.cancelPendingBegin(token);
-      followTargetController.end(token, 'spring_back');
-      // Always snap back — same invariant as the drei onMouseUp path.
-      if (anchor !== null && initialPose !== null) {
-        anchor.position.set(...initialPose.position);
-        anchor.quaternion.set(...initialPose.quaternion);
-      }
-    };
+    const onPointerUp = () => finishDragRef.current();
     window.addEventListener('pointerup', onPointerUp);
     window.addEventListener('pointercancel', onPointerUp);
     return () => {
       window.removeEventListener('pointerup', onPointerUp);
       window.removeEventListener('pointercancel', onPointerUp);
     };
-  }, [anchor, initialPose]);
+  }, []);
 
-  if (!robotPanelActive || robotMode !== 'cartesian' || initialPose === null || !commandGate.canCommand) {
+  if (!robotPanelActive || robotMode !== 'cartesian' || anchorPose === null || !commandGate.canCommand) {
     return null;
   }
 
@@ -1483,9 +1445,9 @@ function TcpJogGizmo() {
     <>
       <mesh
         ref={(m) => {
-          if (m !== null && initialPose !== null && !draggingRef.current) {
-            m.position.set(...initialPose.position);
-            m.quaternion.set(...initialPose.quaternion);
+          if (m !== null && anchorPose !== null && !draggingRef.current) {
+            m.position.set(...anchorPose.position);
+            m.quaternion.set(...anchorPose.quaternion);
           }
           setAnchor(m);
         }}
@@ -1493,14 +1455,6 @@ function TcpJogGizmo() {
       >
         <sphereGeometry args={[0.005, 8, 6]} />
       </mesh>
-      {/*
-        Unreachable/rejected indicator lives in a sibling component
-        (CartesianRejectionIndicator) subscribed to the viewer-selection
-        store. Pulled out of TcpJogGizmo's own render tree to avoid
-        re-rendering the TransformControls subtree on every per-frame
-        rejection — that triggered spurious onMouseDown events under
-        rapid rejection streams.
-      */}
       {anchor !== null && (
         <TransformControls
           object={anchor}
@@ -1508,110 +1462,14 @@ function TcpJogGizmo() {
           space={gizmoSpace}
           onMouseDown={() => {
             if (!commandGate.canCommand) return;
-            // Guard against drei firing onMouseDown twice before
-            // mouseUp. Local UI state (draggingRef + draggingGizmo
-            // store flag) is set unconditionally — independent of
-            // whether the controller can open a fresh session right
-            // now. If the previous session is still ending, the
-            // controller QUEUES the begin and auto-fires it once it
-            // reaches idle. Pushes during the queue window are
-            // dropped at the controller and harmless (backend
-            // coalesces). Decoupling the UI lifecycle from the
-            // session lifecycle is what fixes the "second drag
-            // doesn't snap back on release" bug.
             if (draggingRef.current) return;
-            const token = followTargetController.begin({
-              inputMode: 'cartesian',
-              jointNames: drivableJointNamesRef.current,
-              // The 3D anchor is rendered in scene/world coordinates so it
-              // coincides with the rendered grasp_frame. Streaming targets are
-              // converted back into the robot base frame before push(), which
-              // matches the Cartesian numeric fields and keeps IK reference
-              // semantics stable across manyforge-only and ros2_control modes.
-              // `cartesianFrame` controls TransformControls' axes only.
-              cartesianReferenceFrame: 'base',
-              tcpFrame: tcpFrame ?? '',
-              softStopStrategy: 'spring_back',
-              maxDispatchRateHz: 30,
-              principalId: 'composer_operator',
-              authoritySource: 'human',
-              triggerReason: 'composer_gizmo_drag',
-            });
-            if (token === null) return;
-            dragTokenRef.current = token;
             draggingRef.current = true;
             useViewerSelectionStore.getState().setDraggingGizmo(true);
-            // Push the initial pose. If the controller is still in
-            // ending/aborted phase this is dropped; the watchdog will
-            // re-attempt once the queued begin fires.
-            const target = targetInStreamingFrame();
-            if (target !== null) {
-              followTargetController.push(token, {
-                kind: 'cartesian',
-                positionM: target.position,
-                orientationXyzw: target.quaternion,
-              });
-            }
           }}
-          onObjectChange={() => {
-            if (!draggingRef.current) return;
-            // Server pushes are driven by the 4 Hz watchdog above —
-            // pushing on every drei frame here is redundant and
-            // floods the wire (drei fires at ~60 Hz). The watchdog
-            // reads the live anchor pose, so no per-frame motion is
-            // lost. We do still update the magenta indicator anchor
-            // here in-process (no server hit) so the rejection label
-            // tracks the gizmo smoothly through the unreachable
-            // region.
-            const p = anchor.position;
-            const q = anchor.quaternion;
-            const vsState = useViewerSelectionStore.getState();
-            if (vsState.cartesianRejectionLabel !== null) {
-              vsState.setCartesianRejection(vsState.cartesianRejectionLabel, {
-                position: [p.x, p.y, p.z],
-                quaternion: [q.x, q.y, q.z, q.w],
-              });
-            }
-          }}
-          onMouseUp={() => {
-            // Unconditional cleanup. Local UI state always resets on
-            // release, regardless of whether the session opened or
-            // queued, regardless of whether the controller phase is
-            // streaming / opening / ending. This guarantees the gizmo
-            // snaps back on every release.
-            const wasDragging = draggingRef.current;
-            draggingRef.current = false;
-            const vs = useViewerSelectionStore.getState();
-            vs.setDraggingGizmo(false);
-            vs.setCartesianRejection(null, null);
-            // Cancel any queued begin so a release-then-grab-then-
-            // release doesn't leave a phantom session pending.
-            const token = dragTokenRef.current;
-            dragTokenRef.current = null;
-            followTargetController.cancelPendingBegin(token);
-            if (wasDragging && token !== null) {
-              // Push the release pose and end the active session.
-              // push() drops if controller isn't streaming (queued or
-              // already ended). end() drops if not streaming/opening.
-              // Both safe.
-              const target = targetInStreamingFrame();
-              if (target !== null) {
-                followTargetController.push(token, {
-                  kind: 'cartesian',
-                  positionM: target.position,
-                  orientationXyzw: target.quaternion,
-                });
-              }
-              followTargetController.end(token, 'spring_back');
-            }
-            // ALWAYS snap the gizmo back to the live TCP. The decisive
-            // user-visible bit: never leave the gizmo floating in the
-            // unreachable region after a release.
-            if (anchor !== null && initialPose !== null) {
-              anchor.position.set(...initialPose.position);
-              anchor.quaternion.set(...initialPose.quaternion);
-            }
-          }}
+          // Single-shot release through finishDrag: authors exactly once and
+          // leaves the gizmo at the authored target (no snap-back); never moves
+          // the robot.
+          onMouseUp={() => finishDragRef.current()}
         />
       )}
     </>
@@ -1624,7 +1482,7 @@ function TcpJogGizmo() {
  * Reads the same store state as MoveToBody (source, entity selection,
  * orientation mode, offset) and computes the resulting target pose
  * through the shared `utils/moveTo.ts` helper — so the operator sees
- * exactly the pose that will be commanded on Go.
+ * exactly the pose that will be validated as a candidate.
  *
  * Renders an axesHelper at the target (red/green/blue = x/y/z of the
  * TCP frame) plus a label tag for orientation context. Joint-goal
@@ -1696,157 +1554,146 @@ function MoveToTargetGhost() {
 }
 
 /**
- * Transparent ghost-robot preview for the Move-To tab.
+ * Validated Robot Control candidate ghost (Phase 4-P5.2c).
  *
- * Posts the current Move-To target to /api/scene/preview-link-poses
- * on a 250 ms debounce; on success renders the full URDF at the
- * returned link_poses with 50 % alpha; on IK failure (unreachable
- * cartesian target) renders ONLY the TCP link at the supplied
- * tcp_pose in red 50 % alpha — the visual cue that the rest of
- * the kinematic chain can't reach this pose.
+ * Renders the server-owned candidate's final configuration as a translucent
+ * overlay, separate from the authoritative robot in `/api/scene/state`:
+ *   - a valid (ready) candidate shows a neutral ghost robot at its final
+ *     joint configuration;
+ *   - a blocked candidate shows only a red TCP marker at the requested target
+ *     pose. Do not render a full robot for blocked targets: when IK/collision
+ *     validation fails, any prior/reused joint ghost would imply a reachable
+ *     configuration that does not actually exist for this candidate.
  *
- * Lives as a sibling of MoveToTargetGhost (the axes preview) so
- * the two compose: axes always show the precise TCP point; the
- * ghost robot adds the "will the elbow fight me" reachability
- * answer.
+ * It prefers the per-link poses the backend computes (native FK at a
+ * hypothetical configuration); when absent it falls back to a debounced
+ * preview-link-poses fetch for the final joint vector. Never mutates scene
+ * state and never moves the robot.
  */
-function MoveToGhostRobot() {
-  const robotPanelActive = useViewerSelectionStore((s) => s.activePanel === 'robot');
-  const robotMode = useViewerSelectionStore((s) => s.robotMode);
-  const moveTo = useViewerSelectionStore((s) => s.moveTo);
-  const objects = useSceneStateStore((s) => s.scene?.objects ?? EMPTY_OBJECTS);
-  const tcpPose = useSceneStateStore((s) => s.scene?.robot?.tcp_pose_in_base ?? null);
-  const tcpFrame = useSceneStateStore((s) => s.scene?.robot?.tcp_frame ?? null);
+const _CANDIDATE_GHOST_ACTIVE = new Set([
+  'planning',
+  'ready',
+  'blocked',
+  'stale',
+  'approving',
+]);
+
+function CandidateGhostRobot() {
+  const candidate = useRobotControlCandidateStore((s) => s.candidate);
   const robotModelKey = useSceneStateStore(
     (s) => s.scene?.robot?.urdf_model_key ?? s.scene?.robot?.robot_id ?? null,
   );
-  const liveJointNames = useSceneStateStore((s) => s.scene?.robot?.joint_names ?? null);
-  const liveJointPositions = useSceneStateStore(
-    (s) => s.scene?.robot?.joint_positions ?? null,
-  );
-  // Backend auto-discovered gripper visualization metadata (ADR-0018
-  // unreachable-ghost fallback). Empty for deployments with no
-  // grippers; the unreachable path then falls through to the floor
-  // marker via Tier C in the render block below.
-  const grippers = useSceneStateStore((s) => s.scene?.grippers ?? EMPTY_GRIPPERS);
-  const appliedTree = useProgramStore((s) => s.appliedTree);
-  const [frames, setFrames] = useState<SceneFrameState[]>([]);
+  const tcpFrame = useSceneStateStore((s) => s.scene?.robot?.tcp_frame ?? null);
   const [manifest, setManifest] = useState<SceneUrdfManifest | null>(null);
-  const [preview, setPreview] = useState<PreviewLinkPosesResponse | null>(null);
-  const previewRequestSeqRef = useRef(0);
+  const [fetchedPreview, setFetchedPreview] = useState<PreviewLinkPosesResponse | null>(
+    null,
+  );
+  const fetchSeqRef = useRef(0);
+  // The joint-vector key the current fetchedPreview was computed for. Used to
+  // refetch ONLY when the target configuration actually changes, never on a
+  // mere candidate-object identity change (each status poll / debounce tick
+  // produces a new object with the same pose) — that churn was the ghost
+  // flicker.
+  const lastFetchKeyRef = useRef<string | null>(null);
 
-  // Fetch frames + URDF manifest once when Move-To becomes active. Both
-  // are needed to compute the target (frames feed the Frame source)
-  // and to render the ghost (manifest carries the link/visual tree).
+  const status = candidate?.status ?? null;
+  const active = status !== null && _CANDIDATE_GHOST_ACTIVE.has(status);
+  const ghost = active ? candidate?.ghost ?? null : null;
+
   useEffect(() => {
-    if (!robotPanelActive || robotMode !== 'move-to') return;
+    if (!active) {
+      setManifest(null);
+      // Candidate discarded / handed off: drop the cached preview so the next
+      // candidate fetches fresh.
+      setFetchedPreview(null);
+      lastFetchKeyRef.current = null;
+      return;
+    }
     let cancelled = false;
-    void Promise.all([api.scene.frames(), api.urdf.manifest()])
-      .then(([f, m]) => {
-        if (cancelled) return;
-        setFrames(f.frames.filter((fr) => fr.poseAvailable));
-        setManifest(m);
+    void api.urdf
+      .manifest()
+      .then((m) => {
+        if (!cancelled) setManifest(m);
       })
       .catch(() => {
-        if (cancelled) return;
-        setFrames([]);
-        setManifest(null);
+        if (!cancelled) setManifest(null);
       });
     return () => {
       cancelled = true;
     };
-  }, [robotPanelActive, robotMode, robotModelKey]);
+  }, [active, robotModelKey]);
 
-  const storedPoses = useMemo(() => {
-    const out: { nodeName: string; motionType: 'pose_goal' | 'joint_goal'; params: Record<string, unknown> }[] = [];
-    function visit(node: TreeNode | null): void {
-      if (node === null) return;
-      if (node.id === 'move_manipulator_action') {
-        const mt = node.params['motion_type'];
-        if (mt === 'pose_goal' || mt === 'joint_goal') {
-          out.push({ nodeName: node.name, motionType: mt, params: node.params });
-        }
-      }
-      for (const child of node.children ?? []) visit(child);
+  // Per-link poses the backend already computed (native FK), if present.
+  const directLinkPoses = useMemo<
+    Record<string, { position_m: number[]; orientation_xyzw: number[] }> | null
+  >(() => {
+    const linkPoses = ghost?.linkPoses;
+    if (!linkPoses || Object.keys(linkPoses).length === 0) return null;
+    const out: Record<string, { position_m: number[]; orientation_xyzw: number[] }> = {};
+    for (const [name, pose] of Object.entries(linkPoses)) {
+      out[name] = {
+        position_m: pose.positionM,
+        orientation_xyzw: pose.orientationXyzw,
+      };
     }
-    visit(appliedTree);
     return out;
-  }, [appliedTree]);
+  }, [ghost]);
 
-  const target = useMemo(() => {
-    if (!robotPanelActive || robotMode !== 'move-to') return null;
-    return computeMoveToTarget({
-      moveTo,
-      objects: objects.filter((o) => !o.attached),
-      frames,
-      storedPoses,
-      tcpPose,
-    });
-  }, [robotPanelActive, robotMode, moveTo, objects, frames, storedPoses, tcpPose]);
+  const finalJointNames = ghost?.finalJointNames ?? null;
+  const finalJointPositions = ghost?.finalJointPositionsRad ?? null;
 
-  // Debounced preview-link-poses request. Re-fires whenever the
-  // computed target changes (slider drag, offset edit, source switch)
-  // but always waits the 250 ms quiescence so we don't hammer the
-  // kernel during slider drags. IK is ~5-50 ms per call; per-link FK
-  // is sub-millisecond — comfortable budget at this rate.
+  // Stable key for the final joint vector (rounded so float jitter does not
+  // churn it). Null when there is no usable joint vector to fetch for.
+  const jointKey = useMemo(() => {
+    if (
+      finalJointNames === null ||
+      finalJointPositions === null ||
+      finalJointNames.length !== finalJointPositions.length ||
+      finalJointPositions.length === 0
+    ) {
+      return null;
+    }
+    const rounded = finalJointPositions.map((p) => Math.round(p * 1e6) / 1e6);
+    return JSON.stringify([finalJointNames, rounded]);
+  }, [finalJointNames, finalJointPositions]);
+
+  // Fallback: fetch link poses for the final joint vector when the backend did
+  // not inline them (e.g. non-native backends). Refetch ONLY when the joint
+  // vector actually changes, and KEEP the previous preview while a new fetch is
+  // pending — so the ghost stays put instead of blanking on every status poll
+  // or debounce tick (that was the flicker).
   useEffect(() => {
-    if (target === null || manifest === null) {
-      previewRequestSeqRef.current += 1;
-      setPreview(null);
+    if (!active || manifest === null || directLinkPoses !== null || jointKey === null) {
       return;
     }
+    if (lastFetchKeyRef.current === jointKey) {
+      return; // already showing this joint vector; do not refetch or blank
+    }
     const linkNames = manifest.links.map((l) => l.name);
+    const seq = fetchSeqRef.current + 1;
+    fetchSeqRef.current = seq;
     const handle = window.setTimeout(() => {
-      const requestSeq = ++previewRequestSeqRef.current;
-      let req: PreviewLinkPosesRequest;
-      if (target.kind === 'cartesian') {
-        // Pass the live joint configuration as the IK seed so the
-        // solver picks the branch nearest the current arm pose. Without
-        // a seed the kernel falls back to context.get_current_state(),
-        // which works but produces non-deterministic branch flips as
-        // the operator drags an offset slider — adjacent targets can
-        // land on opposite elbow-up/elbow-down solutions and visibly
-        // pop the ghost robot.
-        const seedJointNames: string[] = liveJointNames ?? [];
-        const seedJointPositions: number[] =
-          liveJointNames && liveJointPositions
-            ? liveJointNames.map((n) => Number(liveJointPositions[n] ?? 0))
-            : [];
-        req = {
-          kind: 'cartesian',
-          tcp_frame: tcpFrame ?? '',
-          tcp_position_m: target.position,
-          tcp_orientation_xyzw: target.quaternion,
-          link_names: linkNames,
-          joint_names: seedJointNames,
-          joint_positions_rad: seedJointPositions,
-        };
-      } else {
-        req = {
-          kind: 'joint',
-          joint_names: target.jointNames,
-          joint_positions_rad: target.jointPositionsRad,
-          link_names: linkNames,
-        };
-      }
       void api.scene
-        .previewLinkPoses(req)
+        .previewLinkPoses({
+          kind: 'joint',
+          joint_names: finalJointNames as string[],
+          joint_positions_rad: finalJointPositions as number[],
+          link_names: linkNames,
+        })
         .then((r) => {
-          if (requestSeq === previewRequestSeqRef.current) {
-            setPreview(r);
+          if (seq === fetchSeqRef.current) {
+            lastFetchKeyRef.current = jointKey;
+            setFetchedPreview(r);
           }
         })
         .catch(() => {
-          if (requestSeq === previewRequestSeqRef.current) {
-            setPreview(null);
-          }
+          // Keep the previous preview on failure (no blank/flicker).
         });
-    }, 250);
+    }, 200);
     return () => window.clearTimeout(handle);
-  }, [target, manifest, tcpFrame, liveJointNames, liveJointPositions]);
+  }, [active, manifest, directLinkPoses, jointKey, finalJointNames, finalJointPositions]);
 
-  if (!robotPanelActive || robotMode !== 'move-to') return null;
-  if (manifest === null || preview === null) return null;
+  if (!active || manifest === null || ghost === null) return null;
   if (
     robotModelKey !== null &&
     manifest.model_key !== undefined &&
@@ -1855,24 +1702,69 @@ function MoveToGhostRobot() {
     return null;
   }
 
-  if (preview.reachable) {
+  const blocked = ghost.blocked;
+  // A carried-forward ghost during planning/stale/approving is shown DIMMED and
+  // neutral-gray so it reads as "pending, not validated" and never implies a
+  // reachable/approvable target (Approve keys off status === 'ready'). A ready
+  // ghost is the normal cyan; a blocked ghost is red.
+  const pending =
+    status === 'planning' || status === 'stale' || status === 'approving';
+  const ghostColor = blocked ? '#ff3333' : pending ? '#9ca3af' : undefined;
+  const ghostOpacity = blocked ? 0.5 : pending ? 0.28 : 0.5;
+  const modelKey = manifest.model_key ?? manifest.robot_id ?? 'unknown';
+
+  if (blocked) {
+    const targetPose = ghost.blockedTargetPose ?? ghost.finalTcpPose ?? null;
+    if (targetPose === null) return null;
+    const tcpLink = tcpFrame
+      ? manifest.links.find((l) => l.name === tcpFrame)
+      : undefined;
     return (
-      <group name="manyforge-ghost-robot" key={manifest.model_key ?? manifest.robot_id ?? 'unknown'}>
+      <group
+        name="manyforge-candidate-ghost-tcp"
+        key={`${modelKey}:candidate-tcp-blocked`}
+        position={targetPose.positionM as [number, number, number]}
+        quaternion={targetPose.orientationXyzw as [number, number, number, number]}
+      >
+        {tcpLink?.visuals.map((visual) => (
+          <GhostVisual
+            key={`${modelKey}:candidate-tcp-blocked:${visual.index}`}
+            visual={visual}
+            opacity={ghostOpacity}
+            color="#ff3333"
+          />
+        ))}
+        <axesHelper args={[0.12]} />
+      </group>
+    );
+  }
+
+  const linkPoses =
+    directLinkPoses ??
+    (fetchedPreview && fetchedPreview.reachable
+      ? fetchedPreview.link_poses
+      : null);
+
+  if (linkPoses !== null) {
+    return (
+      <group name="manyforge-candidate-ghost" key={`${modelKey}:candidate`}>
         {manifest.links.map((link) => {
-          const pose = preview.link_poses[link.name];
+          const pose = linkPoses[link.name];
           if (!pose) return null;
-          const modelKey = manifest.model_key ?? manifest.robot_id ?? 'unknown';
           return (
             <group
-              key={`${modelKey}:ghost:${link.name}`}
+              key={`${modelKey}:candidate:${link.name}`}
               position={pose.position_m as [number, number, number]}
-              quaternion={pose.orientation_xyzw as [number, number, number, number]}
+              quaternion={
+                pose.orientation_xyzw as [number, number, number, number]
+              }
             >
               {link.visuals.map((visual) => (
                 <GhostVisual
-                  key={`${modelKey}:ghost:${link.name}:${visual.index}:${visual.mesh_url ?? 'primitive'}`}
+                  key={`${modelKey}:candidate:${link.name}:${visual.index}`}
                   visual={visual}
-                  opacity={0.5}
+                  opacity={ghostOpacity}
+                  color={ghostColor}
                 />
               ))}
             </group>
@@ -1882,113 +1774,33 @@ function MoveToGhostRobot() {
     );
   }
 
-  // Unreachable target. Render a red silhouette at the commanded TCP
-  // pose so the operator gets visual feedback. Render order, by
-  // preference:
-  //
-  //   1. tcp_frame is itself a link with visuals (e.g. UR5+simple
-  //      tool with primitive boxes on tool0). Render those.
-  //   2. Otherwise — and for most industrial grippers tcp_frame is a
-  //      virtual grasp/tcp frame with no mesh — render the
-  //      auto-discovered gripper subtree (root + all descendants)
-  //      that the backend resolves from `mount_frame`. See ADR-0018
-  //      and routes_urdf.resolve_gripper_visualization.
-  //   3. Floor marker: a small red wireframe sphere at the TCP pose.
-  //      Always renders so the operator never gets a silent "ghost
-  //      missing" state.
-  if (preview.tcp_pose === undefined) return null;
-  const modelKey = manifest.model_key ?? manifest.robot_id ?? 'unknown';
-  const ghostKey = `${modelKey}:ghost-unreachable:${tcpFrame ?? 'tcp'}`;
-  const tcpPos = preview.tcp_pose.position_m as [number, number, number];
-  const tcpQuat = preview.tcp_pose.orientation_xyzw as [number, number, number, number];
-
-  const tcpLink = tcpFrame
-    ? manifest.links.find((l) => l.name === tcpFrame)
-    : undefined;
-  const tcpLinkHasVisuals =
-    tcpLink !== undefined && tcpLink.visuals.length > 0;
-
-  // First gripper with an auto-discovered visualization wins: the
-  // common single-gripper deployment has exactly one, and a
-  // multi-gripper deployment should disambiguate by tcp_frame
-  // upstream (tracked as a separate refinement).
-  const gripperViz = (() => {
-    for (const g of grippers) {
-      if (g.visualization) return g.visualization;
-    }
-    return null;
-  })();
-
-  // The subtree path renders root + all descendants posed relative
-  // to root, at the URDF default joint configuration. Rendering only
-  // the root link is unintelligible — Robotiq's robotiq_base_link
-  // is a featureless block; the fingers and knuckles are what make
-  // the silhouette recognizable as a gripper.
-  const gripperSubtreeRenderables: Array<{
-    pose: { position: [number, number, number]; quaternion: [number, number, number, number] };
-    visuals: typeof manifest.links[number]['visuals'];
-    linkName: string;
-  }> = [];
-  if (gripperViz) {
-    for (const subtreeLink of gripperViz.subtree_links ?? []) {
-      const link = manifest.links.find((l) => l.name === subtreeLink.name);
-      if (link === undefined || link.visuals.length === 0) continue;
-      gripperSubtreeRenderables.push({
-        pose: {
-          position: subtreeLink.position_m as [number, number, number],
-          quaternion: subtreeLink.orientation_xyzw as [number, number, number, number],
-        },
-        visuals: link.visuals,
-        linkName: subtreeLink.name,
-      });
-    }
-  }
-  const gripperSubtreeHasVisuals = gripperSubtreeRenderables.length > 0;
-
-  return (
-    <group name="manyforge-ghost-tcp-unreachable" key={ghostKey} position={tcpPos} quaternion={tcpQuat}>
-      {tcpLinkHasVisuals && (
-        tcpLink!.visuals.map((visual) => (
+  // No per-link configuration available. Fall back to a TCP marker so the
+  // candidate remains visible even when FK link poses are unavailable.
+  const targetPose = ghost.finalTcpPose ?? null;
+  if (targetPose !== null) {
+    const tcpLink = tcpFrame
+      ? manifest.links.find((l) => l.name === tcpFrame)
+      : undefined;
+    return (
+      <group
+        name="manyforge-candidate-ghost-tcp"
+        key={`${modelKey}:candidate-tcp`}
+        position={targetPose.positionM as [number, number, number]}
+        quaternion={targetPose.orientationXyzw as [number, number, number, number]}
+      >
+        {tcpLink?.visuals.map((visual) => (
           <GhostVisual
-            key={`${modelKey}:ghost-unreachable:tcp:${tcpFrame}:${visual.index}:${visual.mesh_url ?? 'primitive'}`}
+            key={`${modelKey}:candidate-tcp:${visual.index}`}
             visual={visual}
-            opacity={0.5}
-            color="#ff3333"
+            opacity={ghostOpacity}
+            color={ghostColor}
           />
-        ))
-      )}
-      {!tcpLinkHasVisuals && gripperSubtreeHasVisuals && gripperViz && (
-        <group
-          position={gripperViz.tcp_to_root_position_m as [number, number, number]}
-          quaternion={gripperViz.tcp_to_root_orientation_xyzw as [number, number, number, number]}
-        >
-          {gripperSubtreeRenderables.map(({ pose, visuals, linkName }) => (
-            <group
-              key={`${modelKey}:ghost-unreachable:subtree:${linkName}`}
-              position={pose.position}
-              quaternion={pose.quaternion}
-            >
-              {visuals.map((visual) => (
-                <GhostVisual
-                  key={`${modelKey}:ghost-unreachable:subtree:${linkName}:${visual.index}:${visual.mesh_url ?? 'primitive'}`}
-                  visual={visual}
-                  opacity={0.5}
-                  color="#ff3333"
-                />
-              ))}
-            </group>
-          ))}
-        </group>
-      )}
-      {/* Always-on floor marker — a small red wireframe sphere at
-          the commanded TCP pose. Small enough that it doesn't
-          obscure the mesh silhouettes above when they render. */}
-      <mesh>
-        <sphereGeometry args={[0.02, 16, 12]} />
-        <meshBasicMaterial color="#ff3333" wireframe />
-      </mesh>
-    </group>
-  );
+        ))}
+        <axesHelper args={[0.12]} />
+      </group>
+    );
+  }
+  return null;
 }
 
 function GhostVisual({
@@ -2115,52 +1927,6 @@ function GhostPrimitiveMesh({
     );
   }
   return null;
-}
-
-/**
- * Sibling-component rendering for the streaming-session magenta
- * indicator. Subscribed to the viewer-selection store so it re-renders
- * independently of TcpJogGizmo — store updates from per-frame rejections
- * don't touch the gizmo's render tree (which under fast rejection
- * streams produced spurious onMouseDown events and burst WS opens).
- */
-function CartesianRejectionIndicator() {
-  const label = useViewerSelectionStore((s) => s.cartesianRejectionLabel);
-  const anchor = useViewerSelectionStore((s) => s.cartesianRejectionAnchor);
-  if (label === null || anchor === null) return null;
-  // Label only — no in-scene mesh. The HTML overlay carries all the
-  // information the operator needs; rendering a 3D mesh at the gizmo
-  // position is decorative and a raycast-intercept risk for drei's
-  // TransformControls. `pointerEvents="none"` keeps the label transparent
-  // to the gizmo's mouse handling.
-  return (
-    <group position={anchor.position} quaternion={anchor.quaternion}>
-      <Html
-        position={[0, 0.07, 0]}
-        center
-        distanceFactor={1.5}
-        pointerEvents="none"
-        prepend
-        zIndexRange={[0, 0]}
-        style={{
-          userSelect: 'none',
-          pointerEvents: 'none',
-          fontFamily: 'monospace',
-          fontWeight: 700,
-          fontSize: '10px',
-          letterSpacing: '0.1em',
-          color: '#ffffff',
-          background: '#ff00ff',
-          padding: '2px 6px',
-          borderRadius: '2px',
-          whiteSpace: 'nowrap',
-          boxShadow: '0 0 4px rgba(0,0,0,0.4)',
-        }}
-      >
-        {label}
-      </Html>
-    </group>
-  );
 }
 
 function PointCloud() {

@@ -34,13 +34,6 @@ enum class KernelEventType {
   // and `reason`. `execute()` MUST NOT clear the state implicitly — the
   // boundary is load-bearing for the operator-intervention audit trail.
   kInterventionAcknowledged,
-  // Streaming-session events (ADR-0016). `session_id` lives in `details`
-  // under the key "session_id" for correlation.
-  kStreamingSessionStarted,    // streaming session opened on backend
-  kStreamingTargetReceived,    // push_streaming_target accepted by kernel
-  kStreamingTargetDispatched,  // backend dispatched a goal for a coalesced target
-  kStreamingTargetRejected,    // target rejected (IK fail, validation, etc.)
-  kStreamingSessionEnded,      // streaming session terminal (soft-stop or hard cancel)
   kErrorRaised,        // error occurred
   kCollisionDetected,  // collision detected during execution
   // Kernel-native interrupt events (spec/260 §7). Details carry the required

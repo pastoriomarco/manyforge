@@ -212,9 +212,6 @@ enum class CollisionSurface {
   kObservedRuntimeMonitor,
   kDiagnosticCompare,
   kPlannerHint,
-  kStreamingTargetValidation,
-  kStreamingPredictedMonitor,
-  kStreamingObservedMonitor,
 };
 
 /// Engine sampling strategy for the query (spec §3.8.1).

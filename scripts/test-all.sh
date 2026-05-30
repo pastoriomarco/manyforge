@@ -228,6 +228,17 @@ run_composer_backend_tests() {
         skip "Missing Python deps for composer backend tests (need fastapi, py_trees, httpx)"
         return
     fi
+    # The full Composer lane runs ALL backend tests, including MCP. `mcp` is a
+    # declared image dependency (see Dockerfile); it is intentionally NOT part
+    # of the skip gate above, so a missing `mcp` fails the MCP tests loudly with
+    # a clear dependency error instead of silently skipping unrelated Composer
+    # coverage. A lightweight local lane may skip MCP-specific tests explicitly,
+    # but test-all must not.
+    #
+    # Provide a commit hash for the verification-runner metadata so
+    # test_scenario_runner stays meaningful even when the container workspace is
+    # not git-aware (uid mismatch / git absent). Honors a pre-set value.
+    export MANYFORGE_GIT_COMMIT="${MANYFORGE_GIT_COMMIT:-$(git -c safe.directory='*' -C "$WORKSPACE" rev-parse HEAD 2>/dev/null || true)}"
     if pytest manyforge_composer/tests/ -v; then
         PASS=$((PASS + 1))
     else

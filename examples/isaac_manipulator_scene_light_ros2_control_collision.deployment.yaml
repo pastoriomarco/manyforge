@@ -97,8 +97,9 @@ adapters:
       arm_action: /isaac_arm_controller/follow_joint_trajectory
       execution_state_authority_profile: commanded_sim
       execution_state_source_mode: commanded_sim
-      streaming_ik_timeout_s: 0.10
-      streaming_collision_timeout_s: 0.025
+      # Per-call budget for single-shot IK (IPlannerBackend::solve_ik). Tight
+      # so interactive cartesian targets fail fast instead of stalling.
+      single_shot_ik_timeout_s: 0.05
       require_fresh_state_before_planning: false
       command_gate_topic: /manyforge/isaac_arm_command_enable
       reset_to_initial_on_load: true

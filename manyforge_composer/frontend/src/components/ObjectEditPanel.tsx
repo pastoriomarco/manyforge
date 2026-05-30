@@ -1,10 +1,11 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 
 import { api } from '../api/client';
 import { useProgramStore } from '../store/programStore';
 import { useSceneStateStore } from '../store/sceneStateStore';
 import { useViewerSelectionStore } from '../store/viewerSelectionStore';
 import type { ProgramSceneResource, SceneObjectState, SceneShapeState } from '../types/api';
+import { restoreObjectToProgramPose } from '../utils/objectMoveDiscard';
 
 /**
  * Day-5 object-edit overlay panel. Renders metadata for whichever
@@ -25,10 +26,39 @@ interface ObjectEditPanelProps {
 export function ObjectEditPanel({ onClose }: ObjectEditPanelProps) {
   const selectedId = useViewerSelectionStore((s) => s.selectedId);
   const objects = useSceneStateStore((s) => s.scene?.objects ?? EMPTY_OBJECTS);
+  const sceneResources = useProgramStore((s) => s.sceneResources);
   const object = useMemo(
     () => (selectedId === null ? null : objects.find((o) => o.object_id === selectedId) ?? null),
     [objects, selectedId],
   );
+
+  // Switch-away discard. Leaving Object mode (Object -> Robot/Tools, closing the
+  // panel, or toggling Object off all unmount this component) must not leave a
+  // hidden live scene edit behind — "Save to program" is the explicit
+  // permanence action. On unmount we restore EVERY authored object whose live
+  // pose still diverges from its program pose back to the program pose, exactly
+  // like "Discard pending move" (no motion; no program mutation). Latest scene /
+  // resources are read via refs so the cleanup sees current state.
+  const objectsRef = useRef(objects);
+  const resourcesRef = useRef(sceneResources);
+  useEffect(() => {
+    objectsRef.current = objects;
+    resourcesRef.current = sceneResources;
+  });
+  useEffect(() => {
+    return () => {
+      for (const obj of objectsRef.current) {
+        if (obj.source !== 'authored' || obj.attached) continue;
+        const res =
+          resourcesRef.current.find((r) => r.objectId === obj.object_id) ?? null;
+        const programPose = normalizeProgramPose(res?.pose ?? null);
+        if (programPose === null) continue;
+        const livePose = (obj.pose_in_universe ?? {}) as Record<string, unknown>;
+        if (!posesDiffer(livePose, programPose)) continue;
+        void restoreObjectToProgramPose(obj.object_id, programPose).catch(() => {});
+      }
+    };
+  }, []);
 
   return (
     <div className="pointer-events-auto absolute right-2 top-2 z-20 flex max-h-[calc(100%-1rem)] w-72 flex-col overflow-hidden rounded-md border border-gray-700 bg-gray-900/50 text-xs text-gray-200 shadow-xl">
@@ -169,13 +199,8 @@ function DiscardPendingMoveRow({
     }
     setStatus('sending');
     setErrorDetail(null);
-    void api.scene
-      .edit({
-        operation: 'update_pose',
-        object_id: object.object_id,
-        pose_position_m: programPose.position,
-        pose_orientation_xyzw: programPose.quaternion,
-      })
+    // Same shared helper the switch-away path uses, so both behave identically.
+    void restoreObjectToProgramPose(object.object_id, programPose)
       .then(() => {
         setStatus('idle');
       })

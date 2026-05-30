@@ -19,6 +19,7 @@ from manyforge_composer.verification import (
     ScenarioMatrixDefinition,
     ScenarioRunner,
 )
+from manyforge_composer.verification.runner import _git_rev_parse
 
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -158,6 +159,17 @@ def test_runner_writes_metadata_and_matrix_summary(tmp_path):
     assert (tmp_path / "test_matrix.summary.json").exists()
     result_payload = (tmp_path / "cycle_status_idle.result.json").read_text(encoding="utf-8")
     assert '"gitCommit"' in result_payload
+
+
+def test_git_commit_metadata_can_come_from_environment(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv(
+        "MANYFORGE_GIT_COMMIT",
+        "0123456789abcdef0123456789abcdef01234567",
+    )
+
+    assert _git_rev_parse(tmp_path) == "0123456789abcdef0123456789abcdef01234567"
 
 
 def test_expand_matrix_scenarios_repeats_and_preserves_tags(tmp_path):

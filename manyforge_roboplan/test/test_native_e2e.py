@@ -382,6 +382,11 @@ class TestNativeKernelBasics:
         metrics = native_kernel.get_metrics()
         assert metrics["snapshots_published"] > 0
         assert metrics["observer_lag_max_ns"] > 0
+        assert metrics["scene_projection_successful_updates_total"] > 0
+        assert metrics["scene_projection_misses_total"] >= 0
+        assert metrics["scene_projection_lag_max_ns"] >= 0
+        assert metrics["scene_projection_last_success_timestamp_ns"] > 0
+        assert metrics["scene_projection_last_success_age_ns"] >= 0
 
     def test_set_joint_positions_refreshes_idle_execution_snapshot(self, native_kernel):
         native_kernel._bundle.set_joint_positions(DEMO_REST)

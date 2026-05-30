@@ -37,7 +37,7 @@ LLM agents can follow it without re-discovering the conventions.
 
 If those three checks pass, the rest is automatic: visual mesh loading,
 mimic-joint hiding in the jog panel, FK + link poses, frame inventory,
-streaming-session per-joint limits, named-frame defaults — all of it
+per-joint Robot Control limits, named-frame defaults — all of it
 flows from URDF metadata + the deployment YAML.
 
 ## What auto-handles itself (do not re-author)
@@ -61,8 +61,8 @@ YAML at load time. You should not add code per-robot for these:
   named in the deployment YAML (robot base, program TCP, gripper
   mount/attach/TCP/auxiliary) are visible by default; URDF link
   frames default off and the operator can toggle them on.
-- **Per-joint streaming limits.** When the deployment declares
-  `streaming_joint_limits`, the backend validates the joint names
+- **Per-joint Robot Control limits.** When the deployment declares
+  `robot_control_joint_limits`, the backend validates the joint names
   against the kernel's commandable joint set at load time and rejects
   unknown names with a structured error.
 
@@ -132,13 +132,13 @@ robot_config:
     - ..                                # relative to this YAML's directory
   global_max_tcp_linear_speed_mps: 0.25 # required; deployment-wide
                                         # ceiling on TCP linear speed
-                                        # for Cartesian/streaming moves
+                                        # for all moves
 
-  # Optional: per-joint streaming caps applied during direct-control /
-  # streaming sessions (independent of planned-trajectory limits).
-  # Joint names MUST be in the SRDF planning group above. Unknown names
-  # are rejected with a DeploymentValidationError at load time.
-  # streaming_joint_limits:
+  # Optional: per-joint caps bounding operator-authored Robot Control
+  # targets (independent of planned-trajectory limits). Joint names MUST
+  # be in the SRDF planning group above. Unknown names are rejected with
+  # a DeploymentValidationError at load time.
+  # robot_control_joint_limits:
   #   shoulder_pan_joint:    {max_velocity_rad_s: 0.5, max_acceleration_rad_s2: 1.0}
   #   shoulder_lift_joint:   {max_velocity_rad_s: 0.5, max_acceleration_rad_s2: 1.0}
 
@@ -363,17 +363,13 @@ sliders today. The clean fix is a dedicated Gripper widget driving the
 deployment's `command_gripper` node — that is a UX feature, not a
 config issue, and is tracked separately.
 
-### Streaming-session errors
+### Robot Control joint-limit errors
 
-**Error: "streaming_joint_limits references joint 'X' not in the SRDF
+**Error: "robot_control_joint_limits references joint 'X' not in the SRDF
 planning group".**
 The deployment declares a per-joint cap for a joint that the kernel
 cannot command. Check `robot_config.group_id` and that every name
-under `streaming_joint_limits` is in that SRDF group.
-
-**Error: "begin_streaming_session: snapshot size mismatch".**
-Older symptom — fixed in commit `streaming-session hardening + URDF
-render fixes`. Update if you see it in current code.
+under `robot_control_joint_limits` is in that SRDF group.
 
 ### Frame visibility unexpected
 
@@ -395,7 +391,7 @@ with `forceDiscardOverrides: true` clears all per-frame overrides.
 | Frame inventory + default visibility | `manyforge_composer/backend/routes_scene.py` (`_scene_frame_roles`, `_load_model_frame_names`) |
 | Deployment YAML parser | `manyforge_behavior/manyforge_behavior/deployment.py` |
 | Allowed gripper command modes | `deployment.py` `_ALLOWED_GRIPPER_COMMAND_MODES` |
-| Streaming-limits validator | `deployment.py` `validate_streaming_joint_limits_against` |
+| Robot Control limits validator | `deployment.py` `validate_robot_control_joint_limits_against` |
 | Composer state owner | `manyforge_composer/backend/state.py` |
 | Launcher entry | `scripts/launch.sh` |
 

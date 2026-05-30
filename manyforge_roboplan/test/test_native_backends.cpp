@@ -1,14 +1,21 @@
 #include <gtest/gtest.h>
 
 #include <manyforge_roboplan/native_kernel_factory.hpp>
+#include <manyforge_roboplan/roboplan_planner_backend.hpp>
 
+#include <Eigen/Dense>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
+#include <limits>
+#include <map>
+#include <mutex>
+#include <optional>
 #include <stdexcept>
+#include <string>
 #include <thread>
 
 using namespace manyforge::roboplan_backend;
@@ -50,13 +57,6 @@ TEST_F(NativeKernelTest, InitialStateIsIdle) {
 TEST_F(NativeKernelTest, NativeExecutionBackendRejectsInvalidLifecycleTimeouts) {
   RoboPlanExecutionBackendConfig config;
   config.reset_completion_timeout_s = 0.0;
-  EXPECT_THROW(
-      RoboPlanExecutionBackend(
-          bundle_->scene, "arm", *bundle_->clock, nullptr, config),
-      std::invalid_argument);
-
-  config.reset_completion_timeout_s = 5.0;
-  config.streaming_stop_completion_timeout_s = 0.0;
   EXPECT_THROW(
       RoboPlanExecutionBackend(
           bundle_->scene, "arm", *bundle_->clock, nullptr, config),
@@ -528,6 +528,90 @@ TEST_F(NativeKernelTest, ExecuteJointGoalSucceeds) {
   EXPECT_EQ(status.state, ExecutionState::kCompleted);
 }
 
+TEST_F(NativeKernelTest,
+       NativeExecutionSnapshotsStayFreshWhenSceneUpdateLockIsBusy) {
+  auto scene_mutex = std::make_shared<std::mutex>();
+  RoboPlanExecutionBackend backend(
+      bundle_->scene, "arm", *bundle_->clock, scene_mutex);
+
+  TrajectoryDTO trajectory;
+  trajectory.joint_names = {"shoulder_pan_joint", "shoulder_lift_joint",
+                            "elbow_joint", "wrist_1_joint",
+                            "wrist_2_joint", "wrist_3_joint"};
+  trajectory.waypoints.push_back(
+      TrajectoryWaypointDTO{0.0, {0.0, -0.5, 0.5, -0.5, -0.5, 0.0}, {}, {}});
+  trajectory.waypoints.push_back(
+      TrajectoryWaypointDTO{2.0, {0.2, -0.7, 0.7, -0.7, -0.4, 0.1}, {}, {}});
+
+  std::unique_lock<std::mutex> scene_lock(*scene_mutex);
+  std::optional<ExecutionHandle> handle;
+  std::atomic<bool> dispatch_returned{false};
+  std::thread dispatch_thread([&]() {
+    handle.emplace(backend.execute_trajectory(trajectory));
+    dispatch_returned.store(true);
+  });
+
+  const auto dispatch_deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+  while (!dispatch_returned.load() &&
+         std::chrono::steady_clock::now() < dispatch_deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  if (!dispatch_returned.load()) {
+    scene_lock.unlock();
+    dispatch_thread.join();
+    if (handle) {
+      auto stop = backend.stop();
+      EXPECT_TRUE(stop.accepted) << (stop.error ? stop.error->message : "");
+      EXPECT_TRUE(handle->wait_for_completion(1'000'000'000));
+    }
+    FAIL() << "execute_trajectory must not block behind scene projection";
+  }
+  dispatch_thread.join();
+  ASSERT_TRUE(handle.has_value());
+
+  const auto start_snapshot = backend.get_execution_snapshot();
+  auto observed = start_snapshot;
+  bool advanced_while_scene_locked = false;
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+  while (std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    observed = backend.get_execution_snapshot();
+    if (observed.sequence_number > start_snapshot.sequence_number) {
+      advanced_while_scene_locked = true;
+      break;
+    }
+  }
+
+  EXPECT_TRUE(advanced_while_scene_locked)
+      << "execution snapshots must not block behind best-effort scene updates";
+  const auto age_ns = bundle_->clock->now() - observed.timestamp_ns;
+  EXPECT_LT(age_ns, 100'000'000)
+      << "runtime collision monitor freshness budget is 100 ms";
+  const auto metrics_while_locked = backend.scene_projection_metrics();
+  EXPECT_GT(metrics_while_locked.misses_total, 0u)
+      << "best-effort scene projection misses must be observable";
+
+  scene_lock.unlock();
+  auto metrics_after_unlock = backend.scene_projection_metrics();
+  const auto projection_deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+  while (metrics_after_unlock.successful_updates_total == 0u &&
+         std::chrono::steady_clock::now() < projection_deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    metrics_after_unlock = backend.scene_projection_metrics();
+  }
+  EXPECT_GT(metrics_after_unlock.successful_updates_total, 0u);
+  EXPECT_GT(metrics_after_unlock.last_success_timestamp_ns, 0);
+  EXPECT_GE(metrics_after_unlock.last_success_age_ns, 0u);
+
+  auto stop = backend.stop();
+  EXPECT_TRUE(stop.accepted) << (stop.error ? stop.error->message : "");
+  ASSERT_TRUE(handle->wait_for_completion);
+  EXPECT_TRUE(handle->wait_for_completion(1'000'000'000));
+}
+
 TEST_F(NativeKernelTest, PlannerUsesPerRequestPlanningTimeout) {
   roboplan::RRTOptions rrt_opts;
   rrt_opts.group_name = "arm";
@@ -585,6 +669,340 @@ TEST_F(NativeKernelTest, PlannerRejectsUnsatisfiedTcpSpeedLimit) {
   EXPECT_EQ(result.error->details.at("failure_stage"), "time_parameterization");
   EXPECT_EQ(result.error->details.at("limit_type"), "tcp_linear_speed");
   EXPECT_EQ(result.error->details.at("toppra_iterations"), "32");
+}
+
+namespace {
+// Peak |value| for one joint across a trajectory's per-waypoint vectors.
+// `field` selects positions_rad / velocities_rad_s / accelerations_rad_s2.
+double peak_abs_for_joint(const TrajectoryDTO& traj, const std::string& joint,
+                          std::vector<double> TrajectoryWaypointDTO::*field) {
+  auto it = std::find(traj.joint_names.begin(), traj.joint_names.end(), joint);
+  if (it == traj.joint_names.end()) {
+    return -1.0;
+  }
+  const size_t j =
+      static_cast<size_t>(std::distance(traj.joint_names.begin(), it));
+  double peak = 0.0;
+  for (const auto& wp : traj.waypoints) {
+    const std::vector<double>& vec = wp.*field;
+    if (j < vec.size()) {
+      peak = std::max(peak, std::abs(vec[j]));
+    }
+  }
+  return peak;
+}
+}  // namespace
+
+// Phase 4-P5.1K: a tight per-joint velocity cap must reduce the sampled peak
+// joint velocity to at/below the cap and lengthen the trajectory, proving the
+// cap is enforced by the TOPP-RA retiming layer (not just carried).
+TEST_F(NativeKernelTest, PerJointVelocityCapSlowsTrajectoryAndBoundsPeak) {
+  auto make_req = [&](const char* move_id) {
+    PlanRequestDTO req;
+    req.robot_id = "robot1";
+    req.group_id = "arm";
+    req.move_id = move_id;
+    req.base_frame = "base_link";
+    req.tcp_frame = "tool0";
+    req.start_state = bundle_->context->get_current_state();
+    req.tolerances = {0.05, 0.005, 0.05};
+    req.speed_profile = {1.0, 1.0, std::nullopt};
+    req.planning_timeout_s = 10.0;
+    JointGoalDTO goal;
+    goal.joint_names = req.start_state.joint_names;
+    goal.positions_rad = {0.3, -0.8, 0.8, -0.3, -0.8, 0.1};
+    req.motion = goal;
+    return req;
+  };
+
+  auto base = bundle_->planner->plan(make_req("dyn_vel_baseline"));
+  ASSERT_TRUE(base.trajectory.has_value())
+      << (base.error ? base.error->message : "no error");
+  const double base_peak = peak_abs_for_joint(
+      *base.trajectory, "elbow_joint", &TrajectoryWaypointDTO::velocities_rad_s);
+  ASSERT_GT(base_peak, 0.0);
+  const double base_duration = base.trajectory->waypoints.back().time_from_start_s;
+
+  const double cap = base_peak * 0.5;  // force the limiter to engage
+  auto capped_req = make_req("dyn_vel_capped");
+  JointDynamicsLimitDTO lim;
+  lim.max_velocity_rad_s = cap;
+  capped_req.per_joint_dynamics_limits["elbow_joint"] = lim;
+
+  auto capped = bundle_->planner->plan(capped_req);
+  ASSERT_TRUE(capped.trajectory.has_value())
+      << (capped.error ? capped.error->message : "no error");
+  const double capped_peak = peak_abs_for_joint(
+      *capped.trajectory, "elbow_joint", &TrajectoryWaypointDTO::velocities_rad_s);
+  const double capped_duration =
+      capped.trajectory->waypoints.back().time_from_start_s;
+
+  EXPECT_LE(capped_peak, cap * 1.05);
+  EXPECT_GT(capped_duration, base_duration);
+}
+
+// Phase 4-P5.1K: a tight per-joint acceleration cap must reduce the sampled
+// peak joint acceleration to at/below the cap and lengthen the trajectory.
+TEST_F(NativeKernelTest, PerJointAccelerationCapBoundsPeak) {
+  auto make_req = [&](const char* move_id) {
+    PlanRequestDTO req;
+    req.robot_id = "robot1";
+    req.group_id = "arm";
+    req.move_id = move_id;
+    req.base_frame = "base_link";
+    req.tcp_frame = "tool0";
+    req.start_state = bundle_->context->get_current_state();
+    req.tolerances = {0.05, 0.005, 0.05};
+    req.speed_profile = {1.0, 1.0, std::nullopt};
+    req.planning_timeout_s = 10.0;
+    JointGoalDTO goal;
+    goal.joint_names = req.start_state.joint_names;
+    goal.positions_rad = {0.3, -0.8, 0.8, -0.3, -0.8, 0.1};
+    req.motion = goal;
+    return req;
+  };
+
+  auto base = bundle_->planner->plan(make_req("dyn_acc_baseline"));
+  ASSERT_TRUE(base.trajectory.has_value())
+      << (base.error ? base.error->message : "no error");
+  const double base_peak =
+      peak_abs_for_joint(*base.trajectory, "elbow_joint",
+                         &TrajectoryWaypointDTO::accelerations_rad_s2);
+  ASSERT_GT(base_peak, 0.0);
+  const double base_duration = base.trajectory->waypoints.back().time_from_start_s;
+
+  const double cap = base_peak * 0.7;  // achievable reduction; engages the limiter
+  auto capped_req = make_req("dyn_acc_capped");
+  JointDynamicsLimitDTO lim;
+  lim.max_acceleration_rad_s2 = cap;
+  capped_req.per_joint_dynamics_limits["elbow_joint"] = lim;
+
+  auto capped = bundle_->planner->plan(capped_req);
+  ASSERT_TRUE(capped.trajectory.has_value())
+      << (capped.error ? capped.error->message : "no error");
+  const double capped_peak =
+      peak_abs_for_joint(*capped.trajectory, "elbow_joint",
+                         &TrajectoryWaypointDTO::accelerations_rad_s2);
+  const double capped_duration =
+      capped.trajectory->waypoints.back().time_from_start_s;
+
+  EXPECT_LE(capped_peak, cap * 1.10);  // accel sampling carries more margin
+  EXPECT_GT(capped_duration, base_duration);
+}
+
+// Phase 4-P5.1K fail-closed: the discrete TOPP-RA path cannot enforce jerk, so
+// any supplied jerk cap is rejected rather than silently accepted.
+TEST_F(NativeKernelTest, PerJointJerkCapRejectedAsUnsupported) {
+  PlanRequestDTO req;
+  req.robot_id = "robot1";
+  req.group_id = "arm";
+  req.move_id = "dyn_jerk_rejected";
+  req.base_frame = "base_link";
+  req.tcp_frame = "tool0";
+  req.start_state = bundle_->context->get_current_state();
+  req.tolerances = {0.05, 0.005, 0.05};
+  req.speed_profile = {1.0, 1.0, std::nullopt};
+  req.planning_timeout_s = 10.0;
+  JointGoalDTO goal;
+  goal.joint_names = req.start_state.joint_names;
+  goal.positions_rad = {0.3, -0.8, 0.8, -0.3, -0.8, 0.1};
+  req.motion = goal;
+  JointDynamicsLimitDTO lim;
+  lim.max_jerk_rad_s3 = 5.0;
+  req.per_joint_dynamics_limits["elbow_joint"] = lim;
+
+  auto result = bundle_->planner->plan(req);
+  ASSERT_FALSE(result.trajectory.has_value());
+  ASSERT_TRUE(result.error.has_value());
+  EXPECT_EQ(result.error->code, kErrorUnsupportedCapability);
+  EXPECT_EQ(result.error->details.at("reason"), "unsupported_joint_dynamics_limit");
+  EXPECT_EQ(result.error->details.at("dimension"), "jerk");
+}
+
+// Phase 4-P5.1K: a MALFORMED jerk cap (NaN/inf/<=0) is an invalid request, not
+// merely "unsupported" — value validation precedes the enforceability verdict.
+TEST_F(NativeKernelTest, PerJointMalformedJerkCapRejectedAsInvalid) {
+  for (const double bad : {0.0, -1.0, std::numeric_limits<double>::infinity(),
+                           std::numeric_limits<double>::quiet_NaN()}) {
+    PlanRequestDTO req;
+    req.robot_id = "robot1";
+    req.group_id = "arm";
+    req.move_id = "dyn_jerk_invalid";
+    req.base_frame = "base_link";
+    req.tcp_frame = "tool0";
+    req.start_state = bundle_->context->get_current_state();
+    req.tolerances = {0.05, 0.005, 0.05};
+    req.speed_profile = {1.0, 1.0, std::nullopt};
+    req.planning_timeout_s = 10.0;
+    JointGoalDTO goal;
+    goal.joint_names = req.start_state.joint_names;
+    goal.positions_rad = {0.3, -0.8, 0.8, -0.3, -0.8, 0.1};
+    req.motion = goal;
+    JointDynamicsLimitDTO lim;
+    lim.max_jerk_rad_s3 = bad;
+    req.per_joint_dynamics_limits["elbow_joint"] = lim;
+
+    auto result = bundle_->planner->plan(req);
+    ASSERT_FALSE(result.trajectory.has_value());
+    ASSERT_TRUE(result.error.has_value());
+    EXPECT_EQ(result.error->code, kErrorInvalidRequest) << "bad jerk = " << bad;
+    EXPECT_EQ(result.error->details.at("reason"), "invalid_joint_dynamics_limit");
+    EXPECT_EQ(result.error->details.at("dimension"), "jerk");
+  }
+}
+
+// Phase 4-P5.1K fail-closed: a non-positive cap is rejected at the kernel
+// boundary even if upstream validation were bypassed.
+TEST_F(NativeKernelTest, PerJointNonPositiveVelocityCapRejected) {
+  PlanRequestDTO req;
+  req.robot_id = "robot1";
+  req.group_id = "arm";
+  req.move_id = "dyn_invalid_velocity";
+  req.base_frame = "base_link";
+  req.tcp_frame = "tool0";
+  req.start_state = bundle_->context->get_current_state();
+  req.tolerances = {0.05, 0.005, 0.05};
+  req.speed_profile = {1.0, 1.0, std::nullopt};
+  req.planning_timeout_s = 10.0;
+  JointGoalDTO goal;
+  goal.joint_names = req.start_state.joint_names;
+  goal.positions_rad = {0.3, -0.8, 0.8, -0.3, -0.8, 0.1};
+  req.motion = goal;
+  JointDynamicsLimitDTO lim;
+  lim.max_velocity_rad_s = -1.0;
+  req.per_joint_dynamics_limits["elbow_joint"] = lim;
+
+  auto result = bundle_->planner->plan(req);
+  ASSERT_FALSE(result.trajectory.has_value());
+  ASSERT_TRUE(result.error.has_value());
+  EXPECT_EQ(result.error->code, kErrorInvalidRequest);
+  EXPECT_EQ(result.error->details.at("reason"), "invalid_joint_dynamics_limit");
+}
+
+// Phase 4-P5.1K fail-closed: a cap keyed by a joint that is not in the active
+// planning group (e.g. a typo) must be rejected, never silently ignored.
+TEST_F(NativeKernelTest, PerJointCapUnknownJointRejected) {
+  PlanRequestDTO req;
+  req.robot_id = "robot1";
+  req.group_id = "arm";
+  req.move_id = "dyn_unknown_joint";
+  req.base_frame = "base_link";
+  req.tcp_frame = "tool0";
+  req.start_state = bundle_->context->get_current_state();
+  req.tolerances = {0.05, 0.005, 0.05};
+  req.speed_profile = {1.0, 1.0, std::nullopt};
+  req.planning_timeout_s = 10.0;
+  JointGoalDTO goal;
+  goal.joint_names = req.start_state.joint_names;
+  goal.positions_rad = {0.3, -0.8, 0.8, -0.3, -0.8, 0.1};
+  req.motion = goal;
+  JointDynamicsLimitDTO lim;
+  lim.max_velocity_rad_s = 0.5;
+  req.per_joint_dynamics_limits["elbow_joint_typo"] = lim;  // not a group joint
+
+  auto result = bundle_->planner->plan(req);
+  ASSERT_FALSE(result.trajectory.has_value());
+  ASSERT_TRUE(result.error.has_value());
+  EXPECT_EQ(result.error->code, kErrorUnsupportedCapability);
+  EXPECT_EQ(result.error->details.at("reason"), "unsupported_joint_dynamics_limit");
+  EXPECT_EQ(result.error->details.at("joint"), "elbow_joint_typo");
+  EXPECT_EQ(result.error->details.at("failure_stage"), "request_validation");
+}
+
+// Phase 4-P5.1K: the cap-measurement helper must fail closed when a capped
+// dimension lacks samples (rather than treating the missing peak as zero, which
+// would falsely pass the cap), and must measure peaks/ratios when complete.
+TEST(JointCapMeasurementTest, IncompleteVelocitySamplesFailClosed) {
+  roboplan::JointTrajectory traj;
+  traj.joint_names = {"elbow_joint"};
+  traj.times = {0.0, 0.1};
+  traj.positions = {Eigen::VectorXd::Zero(1), Eigen::VectorXd::Ones(1)};
+  // velocities intentionally left EMPTY -> cannot verify a velocity cap.
+  std::map<std::string, double> vel_caps{{"elbow_joint", 0.5}};
+  std::map<std::string, double> acc_caps;
+
+  auto m = measure_joint_cap_peaks(traj, vel_caps, acc_caps);
+  EXPECT_FALSE(m.samples_complete);
+  EXPECT_EQ(m.incomplete_dimension, "velocity");
+  EXPECT_EQ(m.incomplete_joint, "elbow_joint");
+}
+
+TEST(JointCapMeasurementTest, CompleteSamplesMeasurePeakAndRatio) {
+  roboplan::JointTrajectory traj;
+  traj.joint_names = {"elbow_joint"};
+  traj.times = {0.0, 0.1, 0.2};
+  traj.positions = {Eigen::VectorXd::Zero(1), Eigen::VectorXd::Zero(1),
+                    Eigen::VectorXd::Zero(1)};
+  auto v0 = (Eigen::VectorXd(1) << 0.2).finished();
+  auto v1 = (Eigen::VectorXd(1) << -1.0).finished();  // peak |v| = 1.0
+  auto v2 = (Eigen::VectorXd(1) << 0.4).finished();
+  traj.velocities = {v0, v1, v2};
+
+  std::map<std::string, double> vel_caps{{"elbow_joint", 0.5}};  // peak 1.0 > 0.5
+  std::map<std::string, double> acc_caps;
+
+  auto m = measure_joint_cap_peaks(traj, vel_caps, acc_caps);
+  EXPECT_TRUE(m.samples_complete);
+  EXPECT_DOUBLE_EQ(m.worst_vel_peak, 1.0);
+  EXPECT_EQ(m.worst_vel_joint, "elbow_joint");
+  EXPECT_DOUBLE_EQ(m.worst_vel_ratio, 2.0);  // 1.0 / 0.5
+  EXPECT_DOUBLE_EQ(m.worst_acc_ratio, 1.0);  // no accel cap -> unviolated
+}
+
+TEST(JointCapMeasurementTest, UncappedJointIgnoredEvenWithoutSamples) {
+  // A joint present in the trajectory but NOT capped must not trigger the
+  // incomplete-samples path (we only require samples for capped dimensions).
+  roboplan::JointTrajectory traj;
+  traj.joint_names = {"shoulder_pan_joint", "elbow_joint"};
+  traj.times = {0.0, 0.1};
+  traj.positions = {Eigen::VectorXd::Zero(2), Eigen::VectorXd::Zero(2)};
+  // Only provide velocities for the (single) capped joint scenario: leave empty.
+  std::map<std::string, double> vel_caps;  // no caps at all
+  std::map<std::string, double> acc_caps;
+
+  auto m = measure_joint_cap_peaks(traj, vel_caps, acc_caps);
+  EXPECT_TRUE(m.samples_complete);
+  EXPECT_DOUBLE_EQ(m.worst_vel_ratio, 1.0);
+  EXPECT_DOUBLE_EQ(m.worst_acc_ratio, 1.0);
+}
+
+TEST(JointCapMeasurementTest, CappedJointAbsentFromTrajectoryFailsClosed) {
+  // A capped joint that is not among the trajectory's joint names is never
+  // sampled; treating it as satisfied would be a silent enforcement gap. The
+  // measurement must fail closed and name the offending dimension/joint.
+  roboplan::JointTrajectory traj;
+  traj.joint_names = {"shoulder_pan_joint"};
+  traj.times = {0.0, 0.1};
+  traj.positions = {Eigen::VectorXd::Zero(1), Eigen::VectorXd::Zero(1)};
+  auto v0 = (Eigen::VectorXd(1) << 0.1).finished();
+  auto v1 = (Eigen::VectorXd(1) << 0.1).finished();
+  traj.velocities = {v0, v1};
+
+  std::map<std::string, double> vel_caps{{"elbow_joint", 0.5}};  // not in traj
+  std::map<std::string, double> acc_caps;
+
+  auto m = measure_joint_cap_peaks(traj, vel_caps, acc_caps);
+  EXPECT_FALSE(m.samples_complete);
+  EXPECT_EQ(m.incomplete_dimension, "velocity");
+  EXPECT_EQ(m.incomplete_joint, "elbow_joint");
+}
+
+TEST(JointCapMeasurementTest, AccelCappedJointAbsentFromTrajectoryFailsClosed) {
+  roboplan::JointTrajectory traj;
+  traj.joint_names = {"shoulder_pan_joint"};
+  traj.times = {0.0, 0.1};
+  traj.positions = {Eigen::VectorXd::Zero(1), Eigen::VectorXd::Zero(1)};
+  auto a0 = (Eigen::VectorXd(1) << 0.1).finished();
+  auto a1 = (Eigen::VectorXd(1) << 0.1).finished();
+  traj.accelerations = {a0, a1};
+
+  std::map<std::string, double> vel_caps;
+  std::map<std::string, double> acc_caps{{"wrist_2_joint", 1.0}};  // not in traj
+
+  auto m = measure_joint_cap_peaks(traj, vel_caps, acc_caps);
+  EXPECT_FALSE(m.samples_complete);
+  EXPECT_EQ(m.incomplete_dimension, "acceleration");
+  EXPECT_EQ(m.incomplete_joint, "wrist_2_joint");
 }
 
 TEST_F(NativeKernelTest, ExecutionBackendPublishesProgressAndInterpolatesSceneState) {
@@ -670,211 +1088,6 @@ TEST_F(NativeKernelTest, ExecutionBackendResetPublishesAuthoritativeIdleSnapshot
   EXPECT_EQ(later_snapshot.state, ExecutionState::kIdle);
   EXPECT_DOUBLE_EQ(later_snapshot.progress, 0.0);
   EXPECT_TRUE(later_snapshot.joint_positions_rad.empty());
-}
-
-TEST_F(NativeKernelTest, KernelStreamingSnapshotFollowsBackendLiveState) {
-  auto start_state = bundle_->context->get_current_state();
-  ASSERT_FALSE(start_state.joint_names.empty());
-  ASSERT_EQ(start_state.joint_names.size(), start_state.positions_rad.size());
-
-  StreamingSessionConfigDTO config;
-  config.group_id = "arm";
-  config.joint_names = start_state.joint_names;
-  config.default_input_mode = StreamingInputMode::kJoint;
-  config.max_dispatch_rate_hz = 30.0;
-
-  auto begin = bundle_->kernel->begin_streaming_session(config);
-  ASSERT_TRUE(begin.accepted) << (begin.error ? begin.error->message : "");
-
-  const double target = start_state.positions_rad[0] + 0.25;
-  StreamingTargetDTO command;
-  command.kind = StreamingInputMode::kJoint;
-  command.joint_names = {start_state.joint_names[0]};
-  command.joint_positions_rad = {target};
-  command.source_sequence = 1;
-
-  auto push = bundle_->kernel->push_streaming_target(begin.session_id, command);
-  ASSERT_TRUE(push.accepted) << (push.error ? push.error->message : "");
-
-  const auto deadline =
-      std::chrono::steady_clock::now() + std::chrono::seconds(3);
-  ExecutionSnapshot live_snapshot;
-  bool saw_live_progress = false;
-  bool reached_target = false;
-  do {
-    live_snapshot = bundle_->kernel->get_execution_snapshot();
-    if (live_snapshot.joint_positions_rad.size() ==
-        start_state.positions_rad.size()) {
-      if (std::abs(live_snapshot.joint_positions_rad[0] -
-                   start_state.positions_rad[0]) > 0.01) {
-        saw_live_progress = true;
-      }
-      if (std::abs(live_snapshot.joint_positions_rad[0] - target) < 1e-3) {
-        reached_target = true;
-      }
-    }
-    if (saw_live_progress && reached_target) {
-      break;
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(20));
-  } while (std::chrono::steady_clock::now() < deadline);
-
-  EXPECT_EQ(live_snapshot.state, ExecutionState::kStreaming);
-  ASSERT_EQ(live_snapshot.joint_positions_rad.size(),
-            start_state.positions_rad.size());
-  EXPECT_TRUE(saw_live_progress)
-      << "kernel observers must see backend streaming progress; otherwise "
-         "Composer joint controls cannot close deterministically";
-  ASSERT_TRUE(reached_target)
-      << "test must keep the streaming session open until arrival; "
-         "end_streaming_session is a soft-stop primitive, not a finish-to-target "
-         "primitive";
-
-  auto end =
-      bundle_->kernel->end_streaming_session(begin.session_id,
-                                             SoftStopStrategy::kSpringBack);
-  EXPECT_TRUE(end.accepted) << (end.error ? end.error->message : "");
-  EXPECT_EQ(bundle_->kernel->get_status().state, ExecutionState::kIdle);
-
-  const auto final_snapshot = bundle_->kernel->get_execution_snapshot();
-  EXPECT_EQ(final_snapshot.state, ExecutionState::kIdle);
-  ASSERT_EQ(final_snapshot.joint_positions_rad.size(),
-            start_state.positions_rad.size());
-  EXPECT_NEAR(final_snapshot.joint_positions_rad[0], target, 1e-3)
-      << "clean streaming end must retain the final backend joint state in "
-         "the observer snapshot; otherwise Composer controls jump back to "
-         "a stale pre-streaming value";
-}
-
-TEST_F(NativeKernelTest, StreamingRuntimeVelocityScaleAppliesPerTick) {
-  // ADR-0018: changing the velocity scale on an in-flight streaming session
-  // MUST take effect on worker ticks without tearing the session down.
-  //
-  // Strategy: open a session at scale=1.0, push a far-away joint
-  // target, sample worker progress for a fixed window. Then call
-  // set_runtime_velocity_scale(0.05), sample for the same window
-  // size. The second window's commanded-joint delta must be much
-  // smaller — the worker honored the runtime read. Tolerances are
-  // sized for the simulated backend (tick = 10 ms, v_cap = 0.5 rad/s
-  // default in the engine).
-  auto start_state = bundle_->context->get_current_state();
-  ASSERT_FALSE(start_state.joint_names.empty());
-
-  StreamingSessionConfigDTO config;
-  config.group_id = "arm";
-  config.joint_names = start_state.joint_names;
-  config.default_input_mode = StreamingInputMode::kJoint;
-  config.max_dispatch_rate_hz = 100.0;
-  config.velocity_scale = 1.0;
-
-  auto begin = bundle_->kernel->begin_streaming_session(config);
-  ASSERT_TRUE(begin.accepted) << (begin.error ? begin.error->message : "");
-
-  // Push a target far enough that the joint will travel for the
-  // entire ~600 ms sampling window even at full scale.
-  const double target = start_state.positions_rad[0] + 1.5;
-  StreamingTargetDTO command;
-  command.kind = StreamingInputMode::kJoint;
-  command.joint_names = {start_state.joint_names[0]};
-  command.joint_positions_rad = {target};
-  command.source_sequence = 1;
-
-  auto push = bundle_->kernel->push_streaming_target(begin.session_id, command);
-  ASSERT_TRUE(push.accepted) << (push.error ? push.error->message : "");
-
-  // Let the worker accelerate up to steady-state at scale=1.0
-  // (engine default a_cap = 2.0 rad/s², tick = 10 ms, so ramp from 0
-  // to 0.5 rad/s takes ~250 ms).
-  std::this_thread::sleep_for(std::chrono::milliseconds(300));
-
-  // Window 1: scale=1.0 (steady-state). Sample for 200 ms.
-  constexpr auto kSampleWindow = std::chrono::milliseconds(200);
-  const auto p_before_full = bundle_->kernel->get_execution_snapshot()
-                                 .joint_positions_rad;
-  ASSERT_EQ(p_before_full.size(), start_state.positions_rad.size());
-  std::this_thread::sleep_for(kSampleWindow);
-  const auto p_after_full = bundle_->kernel->get_execution_snapshot()
-                                .joint_positions_rad;
-  ASSERT_EQ(p_after_full.size(), start_state.positions_rad.size());
-  const double delta_full = p_after_full[0] - p_before_full[0];
-
-  // Drop the runtime scale. Phase 1 expects this to take effect on
-  // the next tick — no preempt, no replan, just a per-tick atomic
-  // read by the worker.
-  bundle_->kernel->set_runtime_velocity_scale(0.05);
-
-  // The accel limiter (engine default 2 rad/s², 10 ms tick → 0.02
-  // rad/s velocity change per tick) takes ~250 ms to decelerate
-  // from 0.5 rad/s steady-state down to 0.025 rad/s (the new cap at
-  // scale=0.05 × 0.5 rad/s v_cap). Wait it out before sampling so
-  // the test characterizes the *new steady-state* velocity, not the
-  // mid-ramp transient.
-  std::this_thread::sleep_for(std::chrono::milliseconds(350));
-
-  // Window 2: scale=0.05 (steady-state). Sample for the same 200 ms.
-  const auto p_before_slow = bundle_->kernel->get_execution_snapshot()
-                                 .joint_positions_rad;
-  std::this_thread::sleep_for(kSampleWindow);
-  const auto p_after_slow = bundle_->kernel->get_execution_snapshot()
-                                .joint_positions_rad;
-  const double delta_slow = p_after_slow[0] - p_before_slow[0];
-
-  // At scale=0.05 with v_cap=0.5, steady-state velocity is
-  // 0.025 rad/s → 5 mrad over 200 ms. At scale=1.0, ~100 mrad over
-  // 200 ms. Asserting slow < full / 4 leaves headroom for any
-  // residual ramp time without papering over the runtime read.
-  EXPECT_GT(delta_full, 0.05)
-      << "session must make material progress at scale=1.0";
-  EXPECT_LT(delta_slow, delta_full / 4.0)
-      << "runtime scale change to 0.05 must throttle commanded "
-         "velocity; delta_full=" << delta_full
-      << " delta_slow=" << delta_slow;
-
-  auto end = bundle_->kernel->end_streaming_session(
-      begin.session_id, SoftStopStrategy::kSpringBack);
-  EXPECT_TRUE(end.accepted) << (end.error ? end.error->message : "");
-}
-
-TEST_F(NativeKernelTest, StreamingRuntimeVelocityScaleRejectsNonFinite) {
-  // ADR-0018 / K2-aligned: non-finite inputs must NOT
-  // propagate into the worker's atomic read. The kernel itself
-  // filters before forwarding to the backend; the backend's setter
-  // re-checks. Test confirms the in-flight session is unperturbed.
-  auto start_state = bundle_->context->get_current_state();
-  StreamingSessionConfigDTO config;
-  config.group_id = "arm";
-  config.joint_names = start_state.joint_names;
-  config.default_input_mode = StreamingInputMode::kJoint;
-  config.max_dispatch_rate_hz = 100.0;
-  config.velocity_scale = 0.5;
-
-  auto begin = bundle_->kernel->begin_streaming_session(config);
-  ASSERT_TRUE(begin.accepted) << (begin.error ? begin.error->message : "");
-
-  // NaN, +Inf, -Inf: each must be ignored. The kernel returns void,
-  // so we verify by sampling the session is still alive afterward.
-  bundle_->kernel->set_runtime_velocity_scale(
-      std::numeric_limits<double>::quiet_NaN());
-  bundle_->kernel->set_runtime_velocity_scale(
-      std::numeric_limits<double>::infinity());
-  bundle_->kernel->set_runtime_velocity_scale(
-      -std::numeric_limits<double>::infinity());
-
-  // Session is still in kStreaming and accepting pushes — the
-  // failing setter calls did not corrupt state.
-  EXPECT_EQ(bundle_->kernel->get_status().state, ExecutionState::kStreaming);
-  StreamingTargetDTO command;
-  command.kind = StreamingInputMode::kJoint;
-  command.joint_names = {start_state.joint_names[0]};
-  command.joint_positions_rad = {start_state.positions_rad[0] + 0.1};
-  command.source_sequence = 1;
-  auto push = bundle_->kernel->push_streaming_target(begin.session_id, command);
-  EXPECT_TRUE(push.accepted)
-      << "non-finite scale write must not poison subsequent pushes";
-
-  auto end = bundle_->kernel->end_streaming_session(
-      begin.session_id, SoftStopStrategy::kSpringBack);
-  EXPECT_TRUE(end.accepted) << (end.error ? end.error->message : "");
 }
 
 TEST_F(NativeKernelTest, RuntimeVelocityScaleZeroHoldsDiscreteTrajectoryTime) {

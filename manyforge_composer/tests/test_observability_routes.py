@@ -161,7 +161,7 @@ def test_scene_state_pending_robot_includes_authority_metadata():
         def get_execution_snapshot(self):
             return ExecutionSnapshot(
                 joint_positions_rad=[0.25],
-                state_source="commanded_sim_predicted_streaming_target",
+                state_source="commanded_sim_predicted",
                 source_timestamp_ns=123_456,
                 source_age_ns=789,
             )
@@ -183,7 +183,7 @@ def test_scene_state_pending_robot_includes_authority_metadata():
 
     assert payload["visual_state_diagnostics"]["mode"] == "visual_snapshot_pending"
     assert payload["robot"]["joint_positions"] == {"joint_a": 0.25}
-    assert payload["robot"]["state_source"] == "commanded_sim_predicted_streaming_target"
+    assert payload["robot"]["state_source"] == "commanded_sim_predicted"
     assert payload["robot"]["source_timestamp_ns"] == 123_456
     assert payload["robot"]["source_age_ns"] == 789
 
@@ -204,7 +204,7 @@ def test_scene_state_visual_snapshot_fk_uses_independent_model_when_enabled(
         def get_execution_snapshot(self):
             return ExecutionSnapshot(
                 joint_positions_rad=[math.pi / 2.0],
-                state_source="commanded_sim_predicted_streaming_target",
+                state_source="commanded_sim_predicted",
                 source_timestamp_ns=123_000_000,
                 source_age_ns=4_000_000,
             )
@@ -250,7 +250,7 @@ def test_scene_state_visual_snapshot_fk_uses_independent_model_when_enabled(
         [1.0, 0.0, 0.0],
         abs=1e-6,
     )
-    assert payload["robot"]["state_source"] == "commanded_sim_predicted_streaming_target"
+    assert payload["robot"]["state_source"] == "commanded_sim_predicted"
     assert payload["robot"]["source_timestamp_ns"] == 123_000_000
     assert payload["robot"]["source_age_ns"] == 4_000_000
     link_pose = payload["link_poses"]["link_1"]

@@ -35,6 +35,7 @@ from .routes_execution import create_execution_router
 from .routes_debug import create_debug_router
 from .routes_skills import create_skills_router
 from .routes_direct import create_direct_router
+from .robot_control_candidates import create_robot_control_candidates_router
 from .routes_mcp import create_mcp_router
 from .routes_infra import create_infra_router
 from .routes_runtime import create_runtime_router
@@ -159,6 +160,11 @@ def create_app(
     app.include_router(create_skills_router(state), prefix="/api", tags=["skills"])
     app.include_router(create_debug_router(state), prefix="/api/debug", tags=["debug"])
     app.include_router(create_direct_router(state), prefix="/api/direct", tags=["direct"])
+    app.include_router(
+        create_robot_control_candidates_router(state),
+        prefix="/api/robot-control",
+        tags=["robot-control"],
+    )
     app.include_router(create_infra_router(state), prefix="/api/infra", tags=["infra"])
     app.include_router(create_runtime_router(state), prefix="/api/runtime", tags=["runtime"])
     app.include_router(create_assistant_router(state), prefix="/api/assistant", tags=["assistant"])
@@ -186,20 +192,6 @@ def create_app(
                     await ws.send_text("pong")
         except Exception:
             hub.disconnect(ws)
-
-    # Streaming-session WebSocket (ADR-0016).
-    # Consumes gizmo / joint-slider follow frames and forwards them directly
-    # to the kernel's streaming-session API. The first frame opens one kernel
-    # session; subsequent frames push ack-gated latest-wins targets; socket
-    # close ends the session with the configured soft-stop strategy.
-    from .follow_target_ws import handle_follow_target_ws  # noqa: PLC0415
-
-    @app.websocket("/ws/follow-target")
-    async def ws_follow_target(ws: WebSocket):
-        if security.api_token and not check_ws_bearer_token(ws, security.api_token):
-            await ws.close(code=4401, reason="Unauthorized")
-            return
-        await handle_follow_target_ws(ws, state)
 
     # Serve built frontend in production mode (must be last — catches all routes)
     resolved_static = _find_static_dir(static_dir)

@@ -465,47 +465,6 @@ class TestJSONLSink:
         assert status["last_archive_error"] == "failure archive queue full"
         assert rec.wait_for_failure_archives_idle(timeout_s=2.0)
 
-    def test_native_streaming_events_project_into_history_once(self):
-        rec = EventRecorder()
-        native_events = [
-            {
-                "event_index": 1,
-                "type": "streaming_session_started",
-                "timestamp_ns": 101,
-                "execution_id": 42,
-                "details": {"session_id": 7, "input_mode": "cartesian"},
-            },
-            {
-                "event_index": 2,
-                "type": "streaming_target_dispatched",
-                "timestamp_ns": 102,
-                "execution_id": 42,
-                "details": {"session_id": 7},
-            },
-            {
-                "event_index": 3,
-                "type": "streaming_target_rejected",
-                "timestamp_ns": 103,
-                "execution_id": 42,
-                "error": {"code": "ik_failed", "message": "IK failed"},
-                "details": {"session_id": 7, "source_sequence": 12},
-            },
-        ]
-
-        rec.record_native_kernel_events(native_events)
-        rec.record_native_kernel_events(native_events)
-
-        events = _memory_events(rec)
-        event_types = [event["type"] for event in events]
-        assert event_types == ["streaming_session_started", "streaming_target_rejected"]
-        assert events[0]["execution_mode"] == "direct_control"
-        assert events[0]["component"] == "manyforge.direct_control"
-        assert events[0]["details"]["native_kernel_event_index"] == 1
-        assert events[1]["severity"] == "WARN"
-        assert events[1]["details"]["error_code"] == "ik_failed"
-        assert events[1]["details"]["error"] == "IK failed"
-        assert events[1]["details"]["native_kernel_event_index"] == 3
-
     def test_native_error_event_preserves_structured_error_details(self):
         rec = EventRecorder()
         native_events = [

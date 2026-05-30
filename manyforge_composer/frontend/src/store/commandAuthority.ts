@@ -1,8 +1,6 @@
 import { useEffect, useState } from 'react';
 import { useShallow } from 'zustand/react/shallow';
 
-import { followTargetController } from '../streaming/followTargetController';
-import type { FollowTargetPhase } from '../streaming/followTargetController';
 import { useCycleStore } from './cycleStore';
 import { useDeploymentStore } from './deploymentStore';
 import { useProgramStore } from './programStore';
@@ -23,14 +21,12 @@ export const ROBOT_COMMAND_AUTHORITY_REASONS = {
   waitingForSceneState: 'waiting for scene state',
   sceneStateStale: 'scene state stale',
   cycleOwnsRobot: 'cycle owns robot',
-  streamingOwnsRobot: 'streaming owns robot',
 } as const;
 
 export interface RobotCommandAuthority {
   canCommand: boolean;
   reason: string | null;
   cycleState: string;
-  followTargetPhase: FollowTargetPhase;
   unappliedDraftDomains: string[];
 }
 
@@ -41,26 +37,18 @@ export interface DraftAuthorityStatus {
 }
 
 export interface RobotCommandAuthorityOptions {
-  allowFollowTargetActive?: boolean;
   requireFreshScene?: boolean;
   requireAppliedDrafts?: boolean;
 }
 
 export interface RobotCommandAuthorityInputs {
   cycleState: string;
-  followTargetPhase: FollowTargetPhase;
   draftAuthority: DraftAuthorityStatus;
   sceneError: string | null;
   lastUpdatedAtMs: number | null;
   nowMs: number;
   sceneStaleAfterMs?: number;
   options?: RobotCommandAuthorityOptions;
-}
-
-export function useFollowTargetPhase(): FollowTargetPhase {
-  const [phase, setPhase] = useState<FollowTargetPhase>(() => followTargetController.phase());
-  useEffect(() => followTargetController.subscribe(setPhase), []);
-  return phase;
 }
 
 export function useDraftAuthorityStatus(): DraftAuthorityStatus {
@@ -126,7 +114,6 @@ export function useDraftAuthorityStatus(): DraftAuthorityStatus {
 
 export function evaluateRobotCommandAuthority({
   cycleState,
-  followTargetPhase,
   draftAuthority,
   sceneError,
   lastUpdatedAtMs,
@@ -135,7 +122,6 @@ export function evaluateRobotCommandAuthority({
   options = {},
 }: RobotCommandAuthorityInputs): RobotCommandAuthority {
   const {
-    allowFollowTargetActive = false,
     requireFreshScene = true,
     requireAppliedDrafts = true,
   } = options;
@@ -144,7 +130,6 @@ export function evaluateRobotCommandAuthority({
     canCommand: false,
     reason,
     cycleState,
-    followTargetPhase,
     unappliedDraftDomains: draftAuthority.domains,
   });
 
@@ -167,37 +152,22 @@ export function evaluateRobotCommandAuthority({
     }
   }
 
-  if (cycleState === 'running') {
+  // The cycle owns the robot while a program is running or an
+  // intervention / direct-jog session is executing. Default Robot
+  // Control authoring is a no-motion overlay; it does not command the
+  // robot, so no streaming carve-out exists anymore.
+  if (cycleState === 'running' || cycleState === 'direct_control') {
     return blocked(ROBOT_COMMAND_AUTHORITY_REASONS.cycleOwnsRobot);
-  }
-  if (
-    cycleState === 'direct_control'
-    && (
-      !allowFollowTargetActive
-      || followTargetPhase === 'idle'
-      || followTargetPhase === 'aborted'
-    )
-  ) {
-    return blocked(ROBOT_COMMAND_AUTHORITY_REASONS.cycleOwnsRobot);
-  }
-  if (
-    !allowFollowTargetActive &&
-    followTargetPhase !== 'idle' &&
-    followTargetPhase !== 'aborted'
-  ) {
-    return blocked(ROBOT_COMMAND_AUTHORITY_REASONS.streamingOwnsRobot);
   }
   return {
     canCommand: true,
     reason: null,
     cycleState,
-    followTargetPhase,
     unappliedDraftDomains: draftAuthority.domains,
   };
 }
 
 export function useRobotCommandAuthority({
-  allowFollowTargetActive = false,
   requireFreshScene = true,
   requireAppliedDrafts = true,
 }: RobotCommandAuthorityOptions = {}): RobotCommandAuthority {
@@ -210,7 +180,6 @@ export function useRobotCommandAuthority({
   const cycleState = useCycleStore((s) => s.state);
   const sceneError = useSceneStateStore((s) => s.error);
   const lastUpdatedAtMs = useSceneStateStore((s) => s.lastUpdatedAtMs);
-  const followTargetPhase = useFollowTargetPhase();
   const draftAuthority = useDraftAuthorityStatus();
   const [nowMs, setNowMs] = useState(() => Date.now());
 
@@ -221,13 +190,11 @@ export function useRobotCommandAuthority({
 
   return evaluateRobotCommandAuthority({
     cycleState,
-    followTargetPhase,
     draftAuthority,
     sceneError,
     lastUpdatedAtMs,
     nowMs,
     options: {
-      allowFollowTargetActive,
       requireFreshScene,
       requireAppliedDrafts,
     },

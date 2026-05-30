@@ -1,10 +1,17 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import { api } from '../api/client';
+import { usePersistentDraft } from '../hooks/usePersistentDraft';
+import { gripperCandidateRequest } from '../utils/gripperAuthoring';
+import {
+  accumulateJointDrafts,
+  jointTargetFromDrafts,
+} from '../utils/jointAuthoring';
 import { useCycleStore, useEditLocked } from '../store/cycleStore';
 import type { RobotCommandAuthority } from '../store/commandAuthority';
 import { useRobotCommandAuthority } from '../store/commandAuthority';
 import { useProgramStore } from '../store/programStore';
+import { useRobotControlCandidateStore } from '../store/robotControlCandidateStore';
 import { useSceneStateStore } from '../store/sceneStateStore';
 import { useViewerSelectionStore } from '../store/viewerSelectionStore';
 import type {
@@ -12,10 +19,8 @@ import type {
   MoveToOrientationMode,
   MoveToSource,
 } from '../store/viewerSelectionStore';
-import { followTargetController } from '../streaming/followTargetController';
-import { useFollowTargetSession } from '../streaming/useFollowTargetSession';
-import type { BeginOptions } from '../api/followTargetWs';
 import type {
+  CandidateCreateRequest,
   SceneFrameState,
   SceneGripperState,
   SceneRobotState,
@@ -24,57 +29,16 @@ import type {
   TreeNode,
 } from '../types/api';
 import { computeMoveToTarget } from '../utils/moveTo';
-import type { StoredPoseTarget } from '../utils/moveTo';
+import type { MoveToTarget, StoredPoseTarget } from '../utils/moveTo';
 
-/**
- * Joint streaming-session hook (ADR-0016, input_mode=joint).
- *
- * Routes joint slider/numeric updates through the same WebSocket
- * streaming session the TCP gizmo uses. Replaces the previous
- * one-shot /api/direct/joint-jog path which produced 409 Conflict
- * badges whenever slider events arrived faster than the cycle could
- * return to idle.
- *
- * Per-joint throttle (4 Hz) bounds the wire rate; the ack-gated
- * latest-wins WS client coalesces faster-arriving frames to the
- * latest pose. On release (or numeric blur/Enter) `pushFinal`
- * bypasses the throttle so the released value is guaranteed to land
- * before the debounced End fires. A 500 ms idle window without any
- * new push closes the session via spring_back soft-stop; the next
- * interaction reopens automatically.
- *
- * One session is shared across all JointRows in the panel — the
- * hook lives at the body level. Switching the robot panel out of
- * Joint mode unmounts the body, the hook's cleanup aborts the
- * session, and the kernel returns to Idle.
- */
-const JOINT_PUSH_INTERVAL_MS = 250; // 4 Hz; matches the operator's "2-4 Hz is enough" note
-const JOINT_END_DEBOUNCE_MS = 500; // probe interval — re-check arrival every 500 ms idle
-const JOINT_ARRIVAL_TIMEOUT_MS = 10_000;
-const CARTESIAN_END_DEBOUNCE_MS = 500;
-const CARTESIAN_ARRIVAL_TIMEOUT_MS = 10_000;
-// UI settle thresholds — when to clear the operator's commanded
-// value from the displayed input (CartesianAxisInput draft +
-// CartesianModeBody commandedRefs). Tight, so the operator sees
-// their requested value linger until the robot is essentially at
-// the target.
+// UI settle thresholds — when to clear the operator's authored value
+// from the displayed input (CartesianAxisInput draft + CartesianModeBody
+// commandedRefs) once the live pose catches up.
 const CARTESIAN_POSITION_ARRIVAL_TOLERANCE_M = 1e-4;
 const CARTESIAN_ORIENTATION_ARRIVAL_TOLERANCE_RAD = 2e-3;
-// Session-close arrival tolerance — looser than the UI thresholds
-// above. Cartesian streaming goes through IK, which has its own
-// convergence budget (~0.5 mm position residual, ~3 mrad orientation
-// residual on a typical 6-DOF arm). Using the UI thresholds here
-// makes the session probe miss for several cycles after the robot
-// has visually arrived, leaving Stop active for several seconds per
-// click. Joint streaming never hits this because joint setpoints
-// converge to their commanded value below the joint tolerance.
-const CARTESIAN_SESSION_ARRIVAL_POSITION_M = 1e-3;
-const CARTESIAN_SESSION_ARRIVAL_ORIENTATION_RAD = 5e-3;
-// Joint-arrival tolerance for closing the streaming session. Keep this
-// at or below the fine jog step so a spinner click does not complete
-// early at a visibly different value. The backend's streaming worker
-// clamps actual target crossings to the requested value, so this
-// threshold is reachable without timing-specific exact equality.
+// Joint-arrival tolerance for clearing a stale draft once the live joint
+// state catches up. Keep at or below the fine jog step so a spinner click
+// does not clear early at a visibly different value.
 const REVOLUTE_JOINT_ARRIVAL_TOLERANCE_RAD = 1e-3;
 const PRISMATIC_JOINT_ARRIVAL_TOLERANCE_M = 1e-4;
 type RobotCommandGate = RobotCommandAuthority;
@@ -85,151 +49,74 @@ function jointArrivalTolerance(joint: SceneUrdfJoint): number {
     : REVOLUTE_JOINT_ARRIVAL_TOLERANCE_RAD;
 }
 
-function useJointStreaming(sessionJointNames: string[]): {
+// Validated Robot Control authoring (Phase 4-P5.2). Default Robot Control does
+// NOT open a streaming session and does NOT move the robot on edit/release:
+// slider / spinner / number-input / gizmo edits author a server-owned candidate
+// (debounced, latest-wins) that the backend plans + validates with no motion.
+// The robot moves ONLY via the explicit Approve control (CandidateApprovalBar).
+// Candidate statuses for which the accumulated joint drafts must be reset (no
+// live-editable draft remains): discarded (handled via candidate===null) or
+// handed off / terminal.
+const _JOINT_DRAFTS_DONE_STATUSES = new Set([
+  'executing',
+  'completed',
+  'stopped',
+  'interrupted',
+  'failed',
+  'reverted',
+  'superseded',
+  'expired',
+  'error',
+]);
+
+function useJointAuthoring(_sessionJointNames: string[]): {
   push: (jointName: string, valueRad: number) => void;
   pushFinal: (jointName: string, valueRad: number) => void;
   setJointArrivalTolerances: (tolerances: Map<string, number>) => void;
 } {
-  const lastPushTsRef = useRef<Map<string, number>>(new Map());
-  // Per-joint last-pushed target. The end-timer arrival probe checks
-  // the live joint state against these targets and only closes the
-  // session once every commanded joint has converged within tolerance.
-  // Without this, a click on the slider track produces one push +
-  // 500 ms of silence + spring_back, which latches the joint partway
-  // to its target and leaves the operator confused about why the
-  // robot didn't finish the move.
-  const lastPushTargetsRef = useRef<Map<string, number>>(new Map());
-  const jointArrivalToleranceRef = useRef<Map<string, number>>(new Map());
-  // Keep the latest known session joint list in a ref so begin() at
-  // any future drag picks up the freshest value, even if the manifest
-  // loaded after the hook mounted. The kernel uses this list to
-  // validate incoming partial joint names — an empty list rejects
-  // everything as `unknown_joint_name`, so we MUST pass the robot's
-  // drivable joints.
-  const jointNamesRef = useRef<string[]>(sessionJointNames);
+  const author = useRobotControlCandidateStore((s) => s.author);
+  const candidate = useRobotControlCandidateStore((s) => s.candidate);
+  // Accumulate EVERY edited joint so the authored candidate carries all of them
+  // (the backend overlays this partial set onto live; authoring only the last
+  // joint would drop earlier edits while the UI still showed them amber).
+  const draftsRef = useRef<Record<string, number>>({});
+
+  // Reset the accumulation when there is no live-editable draft candidate
+  // (Revert / mode switch -> candidate null; or handed off to execution / a
+  // terminal status), so the next jog starts from a clean set.
+  const draftsActive =
+    candidate !== null && !_JOINT_DRAFTS_DONE_STATUSES.has(candidate.status);
   useEffect(() => {
-    jointNamesRef.current = sessionJointNames;
-  }, [sessionJointNames]);
-
-  const setJointArrivalTolerances = useCallback(
-    (tolerances: Map<string, number>): void => {
-      jointArrivalToleranceRef.current = tolerances;
-    },
-    [],
-  );
-
-  const buildBeginParams = useCallback((): BeginOptions | null => {
-    if (jointNamesRef.current.length === 0) {
-      // Manifest still loading. The kernel would reject every partial
-      // frame; better to skip silently than open a doomed session.
-      return null;
+    if (!draftsActive) {
+      draftsRef.current = {};
     }
-    return {
-      inputMode: 'joint',
-      jointNames: jointNamesRef.current,
-      softStopStrategy: 'spring_back',
-      principalId: 'composer_operator',
-      authoritySource: 'human',
-      triggerReason: 'composer_joint_slider',
-    };
-  }, []);
+  }, [draftsActive]);
 
-  const arrived = useCallback((firstPendingAtMs: number | null): boolean => {
-    if (lastPushTargetsRef.current.size === 0) return true;
-    const live = useSceneStateStore.getState().scene?.robot?.joint_positions;
-    if (live === undefined) return false;
-    const elapsedMs =
-      firstPendingAtMs === null ? 0 : performance.now() - firstPendingAtMs;
-    for (const [name, target] of lastPushTargetsRef.current) {
-      const observed = live[name];
-      const tolerance =
-        jointArrivalToleranceRef.current.get(name)
-        ?? REVOLUTE_JOINT_ARRIVAL_TOLERANCE_RAD;
-      if (observed === undefined || Math.abs(observed - target) > tolerance) {
-        if (elapsedMs >= JOINT_ARRIVAL_TIMEOUT_MS) {
-          console.warn(
-            'Joint streaming did not converge before timeout; ending session',
-            { joint: name, observed, target, tolerance, elapsedMs },
-          );
-          return true;
-        }
-        return false;
-      }
-    }
-    return true;
-  }, []);
-
-  const onSessionClose = useCallback((): void => {
-    lastPushTsRef.current.clear();
-    lastPushTargetsRef.current.clear();
-  }, []);
-
-  // NOTE: we used to ALSO drive arrival from a scene-store
-  // subscription so the session would close the instant the joint
-  // reached its target. That introduced a race window: during the
-  // ~200 ms `ending` round-trip (WS goodbye + kernel
-  // kStreaming→kStopped→kIdle), the local token was already cleared
-  // but the controller's `activeDragToken` was also null (cleared
-  // synchronously inside `controller.end(...)`), so a follow-up
-  // spinner click on the same input was processed as:
-  //   - ensureSession() → begin() queues (phase === 'ending') and
-  //     returns a fresh token,
-  //   - the push frame is dropped because `token !== activeDragToken`,
-  //   - the new session eventually opens with no target,
-  //   - the arrival probe sees live ≠ target forever, session stays
-  //     open, Stop stays active, kernel sometimes rejects the new
-  //     begin with "valid only from Idle" because cleanup wasn't done.
-  // Timer-based close avoids this entirely — a fresh push re-arms
-  // the same session and the close only fires after the operator
-  // pauses for one full debounce interval.
-
-  const session = useFollowTargetSession({
-    buildBeginParams,
-    arrived,
-    onSessionClose,
-    endDebounceMs: JOINT_END_DEBOUNCE_MS,
-    hookDescription: 'joint streaming hook',
-  });
-
-  const push = useCallback(
+  const authorJoint = useCallback(
     (jointName: string, valueRad: number): void => {
-      const now = performance.now();
-      const last = lastPushTsRef.current.get(jointName) ?? 0;
-      if (now - last < JOINT_PUSH_INTERVAL_MS) return;
-      lastPushTsRef.current.set(jointName, now);
-      lastPushTargetsRef.current.set(jointName, valueRad);
-      session.push({
-        kind: 'joint',
-        jointNames: [jointName],
-        jointPositionsRad: [valueRad],
+      draftsRef.current = accumulateJointDrafts(
+        draftsRef.current,
+        jointName,
+        valueRad,
+      );
+      const target = jointTargetFromDrafts(draftsRef.current);
+      author({
+        sourceSurface: 'joint_slider',
+        inputMode: 'joint',
+        jointTarget: target,
       });
     },
-    [session],
+    [author],
   );
-
-  const pushFinal = useCallback(
-    (jointName: string, valueRad: number): void => {
-      // Bypass the throttle — the released value is the goal, the
-      // operator's last hand position must reach the backend before
-      // End closes the session.
-      lastPushTsRef.current.set(jointName, performance.now());
-      lastPushTargetsRef.current.set(jointName, valueRad);
-      session.push({
-        kind: 'joint',
-        jointNames: [jointName],
-        jointPositionsRad: [valueRad],
-      });
-    },
-    [session],
-  );
-
-  return { push, pushFinal, setJointArrivalTolerances };
+  const noop = useCallback((): void => {}, []);
+  return {
+    push: authorJoint,
+    pushFinal: authorJoint,
+    setJointArrivalTolerances: noop,
+  };
 }
 
-function useCartesianStreaming({
-  sessionJointNames,
-  tcpFrame,
-}: {
+function useCartesianAuthoring(options: {
   sessionJointNames: string[];
   tcpFrame: string | null;
 }): {
@@ -238,108 +125,26 @@ function useCartesianStreaming({
     orientationXyzw: [number, number, number, number],
   ) => void;
 } {
-  const targetRef = useRef<{
-    positionM: [number, number, number];
-    orientationXyzw: [number, number, number, number];
-  } | null>(null);
-  const jointNamesRef = useRef<string[]>(sessionJointNames);
-  const tcpFrameRef = useRef<string | null>(tcpFrame);
-
-  useEffect(() => {
-    jointNamesRef.current = sessionJointNames;
-  }, [sessionJointNames]);
-  useEffect(() => {
-    tcpFrameRef.current = tcpFrame;
-  }, [tcpFrame]);
-
-  const buildBeginParams = useCallback((): BeginOptions | null => {
-    if (tcpFrameRef.current === null || tcpFrameRef.current.trim() === '') {
-      return null;
-    }
-    return {
-      inputMode: 'cartesian',
-      // Empty joint_names is allowed by the kernel, which falls back
-      // to the current state ordering. Pass the scene list when
-      // available so Cartesian field streaming matches the gizmo path.
-      jointNames: jointNamesRef.current,
-      cartesianReferenceFrame: 'base',
-      tcpFrame: tcpFrameRef.current,
-      softStopStrategy: 'spring_back',
-      maxDispatchRateHz: 30,
-      principalId: 'composer_operator',
-      authoritySource: 'human',
-      triggerReason: 'composer_cartesian_fields',
-    };
-  }, []);
-
-  const arrived = useCallback((firstPendingAtMs: number | null): boolean => {
-    const target = targetRef.current;
-    if (target === null) return true;
-    const tcp = useSceneStateStore.getState().scene?.robot?.tcp_pose_in_base;
-    const elapsedMs =
-      firstPendingAtMs === null ? 0 : performance.now() - firstPendingAtMs;
-    let positionDeltaM: number | null = null;
-    let orientationDeltaRad: number | null = null;
-    if (tcp !== undefined && tcp !== null) {
-      const livePosition = readPosition(tcp as Record<string, unknown>);
-      const liveQuat = readQuat(tcp as Record<string, unknown>);
-      positionDeltaM = vectorDistance(livePosition, target.positionM);
-      orientationDeltaRad = quaternionAngularDistanceRad(
-        liveQuat,
-        target.orientationXyzw,
-      );
-      // Use the looser SESSION tolerance, not the UI settle one — see
-      // the constant comment for why these are split.
-      const positionReached =
-        positionDeltaM <= CARTESIAN_SESSION_ARRIVAL_POSITION_M;
-      const orientationReached =
-        orientationDeltaRad <= CARTESIAN_SESSION_ARRIVAL_ORIENTATION_RAD;
-      if (positionReached && orientationReached) return true;
-    }
-    if (elapsedMs >= CARTESIAN_ARRIVAL_TIMEOUT_MS) {
-      console.warn(
-        'Cartesian field streaming did not converge before timeout; ending session',
-        {
-          target,
-          elapsedMs,
-          positionDeltaM,
-          orientationDeltaRad,
-          positionToleranceM: CARTESIAN_SESSION_ARRIVAL_POSITION_M,
-          orientationToleranceRad: CARTESIAN_SESSION_ARRIVAL_ORIENTATION_RAD,
-        },
-      );
-      return true;
-    }
-    return false;
-  }, []);
-
-  const onSessionClose = useCallback((): void => {
-    targetRef.current = null;
-  }, []);
-
-  const session = useFollowTargetSession({
-    buildBeginParams,
-    arrived,
-    onSessionClose,
-    endDebounceMs: CARTESIAN_END_DEBOUNCE_MS,
-    hookDescription: 'cartesian field streaming hook',
-  });
-
+  const author = useRobotControlCandidateStore((s) => s.author);
+  const tcpFrame = options.tcpFrame;
   const pushFinal = useCallback(
     (
       positionM: [number, number, number],
       orientationXyzw: [number, number, number, number],
     ): void => {
-      targetRef.current = { positionM, orientationXyzw };
-      session.push({
-        kind: 'cartesian',
-        positionM,
-        orientationXyzw,
+      author({
+        sourceSurface: 'cartesian_gizmo',
+        inputMode: 'cartesian',
+        cartesianTarget: {
+          positionM: [...positionM],
+          orientationXyzw: [...orientationXyzw],
+          frameId: 'base',
+          tcpFrame: tcpFrame ?? undefined,
+        },
       });
     },
-    [session],
+    [author, tcpFrame],
   );
-
   return { pushFinal };
 }
 
@@ -388,8 +193,38 @@ export function RobotControlPanel({ onClose }: RobotControlPanelProps) {
   const setRobotMode = useViewerSelectionStore((s) => s.setRobotMode);
   const cartesianFrame = useViewerSelectionStore((s) => s.cartesianFrame);
   const setCartesianFrame = useViewerSelectionStore((s) => s.setCartesianFrame);
-  const streamingCommandGate = useRobotCommandAuthority({ allowFollowTargetActive: true });
-  const plannedCommandGate = useRobotCommandAuthority();
+  const commandGate = useRobotCommandAuthority();
+  const candidateRevert = useRobotControlCandidateStore((s) => s.revert);
+  const candidateClear = useRobotControlCandidateStore((s) => s.clear);
+
+  // Esc reverts the active candidate (no motion). Clearing on unmount discards
+  // any draft so a stale server candidate cannot linger after the panel closes.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent): void => {
+      if (e.key === 'Escape') {
+        void candidateRevert();
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => {
+      window.removeEventListener('keydown', onKey);
+      candidateClear();
+    };
+  }, [candidateRevert, candidateClear]);
+
+  // Switching Robot Control modes discards the prior mode's pending draft
+  // exactly like Revert (no motion; an `executing` candidate is preserved so
+  // Stop — not Revert — cancels it). This keeps the command source shown in the
+  // UI aligned with the active mode and prevents a hidden candidate from a
+  // prior tab carrying across. revert() also clears the input drafts and the
+  // ghost/gizmo overlay back to live for the newly selected mode.
+  const prevModeRef = useRef(robotMode);
+  useEffect(() => {
+    if (prevModeRef.current !== robotMode) {
+      prevModeRef.current = robotMode;
+      void candidateRevert();
+    }
+  }, [robotMode, candidateRevert]);
 
   useEffect(() => {
     let cancelled = false;
@@ -414,13 +249,13 @@ export function RobotControlPanel({ onClose }: RobotControlPanelProps) {
     if (manifest?.joints === undefined) return [];
     // Hide URDF `<mimic>` joints — they're pinned to a master joint
     // (multiplier·q_master + offset) and cannot be commanded
-    // independently. Also hide the masters, because the current
-    // MoveIt-planning-group streaming session has no command path to
-    // the gripper chain; moving the master slider would do nothing
-    // until a dedicated gripper widget owns it. Net effect: the
-    // Robotiq gripper chain disappears from the jog panel; the
-    // visualisation still follows when the gripper is commanded via
-    // its own controller through the deployment's gripper node.
+    // independently. Also hide the masters, because the default
+    // Robot Control surface has no command path to the gripper chain;
+    // moving the master slider would do nothing until a dedicated
+    // gripper widget owns it. Net effect: the Robotiq gripper chain
+    // disappears from the jog panel; the visualisation still follows
+    // when the gripper is commanded via its own controller through the
+    // deployment's gripper node.
     return manifest.joints.filter(
       (j) =>
         DRIVABLE_TYPES.has(j.type) &&
@@ -463,7 +298,7 @@ export function RobotControlPanel({ onClose }: RobotControlPanelProps) {
           robot={robot}
           jointRadStep={jointRadStep}
           onJointRadStepChange={setJointRadStep}
-          commandGate={streamingCommandGate}
+          commandGate={commandGate}
         />
       )}
       {robotMode === 'cartesian' && (
@@ -474,10 +309,142 @@ export function RobotControlPanel({ onClose }: RobotControlPanelProps) {
           onMStepChange={setCartesianMStep}
           cartesianRadStep={cartesianRadStep}
           onRadStepChange={setCartesianRadStep}
-          commandGate={streamingCommandGate}
+          commandGate={commandGate}
         />
       )}
-      {robotMode === 'move-to' && <MoveToBody commandGate={plannedCommandGate} />}
+      {robotMode === 'move-to' && <MoveToBody />}
+      <CandidateApprovalBar commandGate={commandGate} />
+    </div>
+  );
+}
+
+/**
+ * Validated Robot Control approval bar. Reads the server-owned candidate and
+ * is the ONLY surface in this panel that can move the robot (via Approve).
+ * Approve is enabled only for a fresh `ready` candidate; Revert discards the
+ * draft and clears overlays without motion.
+ */
+function CandidateApprovalBar({ commandGate }: { commandGate: RobotCommandGate }) {
+  const candidate = useRobotControlCandidateStore((s) => s.candidate);
+  const approving = useRobotControlCandidateStore((s) => s.approving);
+  const busy = useRobotControlCandidateStore((s) => s.busy);
+  const rejection = useRobotControlCandidateStore((s) => s.rejection);
+  const error = useRobotControlCandidateStore((s) => s.error);
+  const approve = useRobotControlCandidateStore((s) => s.approve);
+  const revert = useRobotControlCandidateStore((s) => s.revert);
+
+  if (candidate === null && rejection === null && error === null) {
+    return null;
+  }
+
+  const status = candidate?.status ?? null;
+  // Approve only a settled, current candidate: any new edit sets busy:true and
+  // swaps in a `planning` placeholder until its create() resolves, so a stale
+  // `ready` candidate can never be approved during the debounce/planning
+  // window.
+  const ready = status === 'ready' && candidate?.commitEligible === true && !busy;
+  const canApprove = ready && !approving && commandGate.canCommand;
+  // Once dispatched, the candidate is `executing`: Revert must not act on it
+  // (execution cancellation belongs to Stop, not Revert).
+  const executing = status === 'executing';
+  const terminal =
+    status === 'completed' ||
+    status === 'stopped' ||
+    status === 'interrupted' ||
+    status === 'failed';
+  const diagnostics = candidate?.diagnostics ?? null;
+  const execution = candidate?.execution ?? null;
+
+  const statusColor =
+    status === 'ready' || status === 'completed'
+      ? 'text-emerald-300'
+      : status === 'blocked' ||
+          status === 'error' ||
+          status === 'failed' ||
+          status === 'interrupted'
+        ? 'text-red-300'
+        : status === 'stale' ||
+            status === 'expired' ||
+            status === 'superseded' ||
+            status === 'stopped'
+          ? 'text-amber-300'
+          : 'text-gray-300';
+
+  return (
+    <div className="border-t border-gray-700 bg-gray-800/60 px-2 py-1.5">
+      <div className="mb-1 flex items-center justify-between text-[10px]">
+        <span className="uppercase tracking-wide text-gray-400">Candidate</span>
+        {status !== null && (
+          <span className={`font-mono ${statusColor}`}>{status}</span>
+        )}
+      </div>
+      {diagnostics !== null && status !== 'ready' && (
+        <div className="mb-1 rounded bg-gray-900/60 px-1.5 py-1 text-[10px] text-gray-300">
+          <span className="font-mono text-gray-400">{diagnostics.reasonCode}</span>
+          {diagnostics.summary ? ` — ${diagnostics.summary}` : ''}
+        </div>
+      )}
+      {execution !== null && (executing || terminal) && (
+        <div className="mb-1 flex items-center justify-between gap-2 text-[10px] text-gray-400">
+          <span className="truncate font-mono">
+            {execution.moveId ?? 'motion'}
+          </span>
+          <span className="shrink-0 font-mono">
+            {execution.executionId > 0 ? `#${execution.executionId}` : execution.sessionStatus ?? ''}
+          </span>
+        </div>
+      )}
+      {rejection !== null && (
+        <div className="mb-1 rounded border border-red-700/60 bg-red-950/30 px-1.5 py-1 text-[10px] text-red-300">
+          Not executed ({rejection.reasonCode}): {rejection.detail}
+        </div>
+      )}
+      {error !== null && (
+        <div className="mb-1 rounded border border-red-700/60 bg-red-950/30 px-1.5 py-1 text-[10px] text-red-300">
+          {error}
+        </div>
+      )}
+      {!commandGate.canCommand && ready && (
+        <div className="mb-1 text-[10px] text-amber-300">
+          Approve disabled: {commandGate.reason}
+        </div>
+      )}
+      <div className="flex gap-1">
+        <button
+          type="button"
+          onClick={() => void approve()}
+          disabled={!canApprove}
+          className="flex-1 rounded bg-emerald-700 px-2 py-1 text-[11px] text-white hover:bg-emerald-600 disabled:cursor-not-allowed disabled:opacity-50"
+          title={
+            !ready
+              ? 'Approve is enabled only for a fresh, validated candidate'
+              : undefined
+          }
+        >
+          {approving
+            ? 'Approving…'
+            : executing
+              ? 'Executing…'
+              : status === 'completed'
+                ? 'Completed'
+                : 'Approve & Execute'}
+        </button>
+        <button
+          type="button"
+          onClick={() => void revert()}
+          disabled={candidate === null || executing}
+          className="rounded bg-gray-700 px-2 py-1 text-[11px] text-gray-200 hover:bg-gray-600 disabled:cursor-not-allowed disabled:opacity-50"
+          title={
+            executing
+              ? 'Executing — use Stop to halt motion; Revert only discards a draft'
+              : terminal
+                ? 'Clear this execution result'
+                : 'Discard the draft and clear the preview (no motion)'
+          }
+        >
+          {terminal ? 'Clear' : 'Revert'}
+        </button>
+      </div>
     </div>
   );
 }
@@ -499,26 +466,20 @@ function JointModeBody({
   onJointRadStepChange: (next: number) => void;
   commandGate: RobotCommandGate;
 }) {
-  // The streaming hook lives at the body level so its lifecycle is
-  // tied to the joint-mode body — switching the panel to Cartesian
-  // unmounts this component and aborts the active session via the
-  // hook's cleanup effect. The session joint-name list MUST come from
-  // the backend's view (scene.robot.joint_names) rather than the URDF
-  // manifest, since the kernel validates incoming names against the
-  // session list and the URDF order/set may diverge from what the
-  // backend actually uses. Falls back to URDF drivable names when the
-  // scene state hasn't loaded yet; the kernel's begin_streaming_session
-  // fallback (populates from get_current_state when empty) covers any
-  // remaining gap.
+  // Joint-name list for authored joint targets. Sourced from the
+  // backend's view (scene.robot.joint_names) rather than the URDF
+  // manifest, since validated candidate planning keys off backend
+  // joint ordering and the URDF order/set may diverge.
+  // Falls back to URDF drivable names when scene state hasn't loaded.
   const sessionJointNames = useMemo(
     () => robot?.joint_names ?? drivableJoints.map((j) => j.name),
     [robot, drivableJoints],
   );
   const {
-    push: streamingPush,
-    pushFinal: streamingPushFinal,
+    push: jointDraftPush,
+    pushFinal: jointDraftPushFinal,
     setJointArrivalTolerances,
-  } = useJointStreaming(sessionJointNames);
+  } = useJointAuthoring(sessionJointNames);
   const jointArrivalTolerances = useMemo(() => {
     const out = new Map<string, number>();
     for (const joint of drivableJoints) {
@@ -566,8 +527,8 @@ function JointModeBody({
             joint={joint}
             currentValue={robot?.joint_positions[joint.name] ?? null}
             step={jointRadStep}
-            onStreamingPush={streamingPush}
-            onStreamingPushFinal={streamingPushFinal}
+            onDraftPush={jointDraftPush}
+            onDraftPushFinal={jointDraftPushFinal}
             disabled={!commandGate.canCommand}
             disabledReason={commandGate.reason}
           />
@@ -576,7 +537,7 @@ function JointModeBody({
         <PoseEditSnapshotSection mode="joint" commandGate={commandGate} />
       </div>
       <div className="border-t border-gray-700 bg-gray-800/50 px-2 py-1 text-[10px] text-gray-500">
-        Jog · slider streams at 4 Hz · release commits final pose · session auto-closes after 500 ms idle
+        Jog · sliders author a draft target only · release does not move the robot · Approve is the only motion path
       </div>
     </>
   );
@@ -585,24 +546,26 @@ function JointModeBody({
 /**
  * Move-To tab body. Operator picks an entity (scene object, named
  * frame, or stored move-node target), an orientation mode, and an
- * optional 6-DoF offset; the panel computes the resulting target
- * pose, the 3D ghost in SceneViewer renders it, and Go dispatches a
- * one-shot planned move via /api/direct/{cartesian-jog | joint-jog}.
+ * optional 6-DoF offset; the panel computes the resulting target and
+ * automatically authors a validated Robot Control candidate. NO MOTION:
+ * execution still requires Approve on the candidate bar.
  *
  * The actual math lives in `utils/moveTo.ts` so the ghost preview
- * computes the same target as the dispatched Go — no drift between
- * what the operator sees and what runs.
+ * computes the same target as the candidate — no drift between what
+ * the operator sees and what Approve can execute.
  */
-function MoveToBody({ commandGate }: { commandGate: RobotCommandGate }) {
+function MoveToBody() {
   const moveTo = useViewerSelectionStore((s) => s.moveTo);
   const patchMoveTo = useViewerSelectionStore((s) => s.patchMoveTo);
   const objects = useSceneStateStore((s) => s.scene?.objects ?? EMPTY_OBJECTS);
   const tcpPose = useSceneStateStore((s) => s.scene?.robot?.tcp_pose_in_base ?? null);
   const appliedTree = useProgramStore((s) => s.appliedTree);
+  const author = useRobotControlCandidateStore((s) => s.author);
+  const revertCandidate = useRobotControlCandidateStore((s) => s.revert);
+  const activeCandidate = useRobotControlCandidateStore((s) => s.candidate);
+  const lastAuthoredMoveToKeyRef = useRef<string | null>(null);
 
   const [frames, setFrames] = useState<SceneFrameState[]>([]);
-  const [status, setStatus] = useState<'idle' | 'sending' | 'error' | 'success'>('idle');
-  const [errorDetail, setErrorDetail] = useState<string | null>(null);
   const maxOffsetXyzM = 100;
   const maxOffsetRpyDeg = 720;
 
@@ -652,44 +615,85 @@ function MoveToBody({ commandGate }: { commandGate: RobotCommandGate }) {
     [moveTo, eligibleObjects, frames, storedPoses, tcpPose],
   );
 
-  function doGo(): void {
-    if (!commandGate.canCommand) {
-      setStatus('error');
-      setErrorDetail(commandGate.reason ?? 'robot command unavailable');
-      return;
-    }
+  const targetError = useMemo(() => {
     if (
       moveTo.offsetXyzM.some((v) => Math.abs(v) > maxOffsetXyzM)
       || moveTo.offsetRpyDeg.some((v) => Math.abs(v) > maxOffsetRpyDeg)
     ) {
-      setStatus('error');
-      setErrorDetail('offset exceeds workspace guard');
-      return;
+      return 'offset exceeds workspace guard';
     }
     if (target === null) {
-      setStatus('error');
-      setErrorDetail('no valid target selected');
+      return null;
+    }
+    return null;
+  }, [moveTo.offsetRpyDeg, moveTo.offsetXyzM, target]);
+
+  const candidateRequest = useMemo<CandidateCreateRequest | null>(() => {
+    if (target === null || targetError !== null) {
+      return null;
+    }
+    if (target.kind === 'joint') {
+      return {
+        sourceSurface: 'move_to',
+        inputMode: 'joint',
+        jointTarget: {
+          jointNames: target.jointNames,
+          positionsRad: target.jointPositionsRad,
+        },
+      };
+    }
+    return {
+      sourceSurface: 'move_to',
+      inputMode: 'cartesian',
+      cartesianTarget: {
+        positionM: target.position,
+        orientationXyzw: target.quaternion,
+        frameId: 'base',
+      },
+    };
+  }, [target, targetError]);
+
+  const candidateRequestKey = useMemo(
+    () => (candidateRequest === null ? null : JSON.stringify(candidateRequest)),
+    [candidateRequest],
+  );
+
+  useEffect(() => {
+    if (candidateRequest !== null && candidateRequestKey !== null) {
+      if (candidateRequestKey !== lastAuthoredMoveToKeyRef.current) {
+        lastAuthoredMoveToKeyRef.current = candidateRequestKey;
+        author(candidateRequest);
+      }
       return;
     }
-    setStatus('sending');
-    setErrorDetail(null);
-    const dispatched =
-      target.kind === 'joint'
-        ? api.direct.jointJog(target.jointNames, target.jointPositionsRad)
-        : api.direct.cartesianJog(target.position, target.quaternion);
-    void dispatched
-      .then(() => {
-        setStatus('success');
-        setErrorDetail(null);
-        window.setTimeout(() => {
-          setStatus((current) => (current === 'success' ? 'idle' : current));
-        }, 1500);
-      })
-      .catch((err: unknown) => {
-        setStatus('error');
-        setErrorDetail(err instanceof Error ? err.message : 'move failed');
-      });
-  }
+
+    if (
+      lastAuthoredMoveToKeyRef.current !== null &&
+      activeCandidate?.sourceSurface === 'move_to' &&
+      activeCandidate.status !== 'executing' &&
+      activeCandidate.status !== 'completed' &&
+      activeCandidate.status !== 'stopped' &&
+      activeCandidate.status !== 'interrupted' &&
+      activeCandidate.status !== 'failed'
+    ) {
+      lastAuthoredMoveToKeyRef.current = null;
+      void revertCandidate();
+      return;
+    }
+
+    if (target === null || targetError !== null) {
+      lastAuthoredMoveToKeyRef.current = null;
+    }
+  }, [
+    activeCandidate?.sourceSurface,
+    activeCandidate?.status,
+    author,
+    candidateRequest,
+    candidateRequestKey,
+    revertCandidate,
+    target,
+    targetError,
+  ]);
 
   return (
     <>
@@ -801,25 +805,15 @@ function MoveToBody({ commandGate }: { commandGate: RobotCommandGate }) {
         </div>
 
         <div className="mt-3 border-t border-gray-800 pt-2">
-          <button
-            type="button"
-            onClick={doGo}
-            disabled={target === null || status === 'sending' || !commandGate.canCommand}
-            title={!commandGate.canCommand ? commandGate.reason ?? undefined : undefined}
-            className="w-full rounded bg-blue-700 px-2 py-1 text-[11px] text-white hover:bg-blue-600 disabled:cursor-not-allowed disabled:opacity-50"
-          >
-            {status === 'sending' ? 'Sending…' : 'Go'}
-          </button>
           <MoveToStatusLine
-            status={status}
-            errorDetail={errorDetail}
             target={target}
+            errorDetail={targetError}
           />
         </div>
       </div>
 
       <div className="border-t border-gray-700 bg-gray-800/50 px-2 py-1 text-[10px] text-gray-500">
-        Move To · planned move via /api/direct/{'{cartesian|joint}'}-jog · ghost in 3D updates as you edit
+        Move To · target changes validate automatically · approve below to execute
       </div>
     </>
   );
@@ -970,17 +964,22 @@ function OffsetRow({
 }
 
 function MoveToStatusLine({
-  status,
   errorDetail,
   target,
 }: {
-  status: 'idle' | 'sending' | 'success' | 'error';
   errorDetail: string | null;
-  target: import('../utils/moveTo').MoveToTarget | null;
+  target: MoveToTarget | null;
 }) {
-  if (status === 'idle' && target !== null) {
+  if (errorDetail !== null) {
     return (
-      <div className="mt-1 space-y-0.5 text-[10px] text-gray-500" title="Target previewed in 3D">
+      <div className="mt-1 text-[10px] text-red-300" title={errorDetail}>
+        {errorDetail.slice(0, 60)}
+      </div>
+    );
+  }
+  if (target !== null) {
+    return (
+      <div className="mt-1 space-y-0.5 text-[10px] text-gray-500" title="Target is validated automatically">
         <div className="truncate">target: {target.label}</div>
         {target.kind === 'cartesian' ? (
           <div className="font-mono text-[9px] text-gray-400">
@@ -996,21 +995,8 @@ function MoveToStatusLine({
       </div>
     );
   }
-  if (status === 'idle') {
-    return (
-      <div className="mt-1 text-[10px] text-gray-500">Pick a source + entity to set target.</div>
-    );
-  }
-  if (status === 'sending') {
-    return <div className="mt-1 text-[10px] text-blue-300">sending move…</div>;
-  }
-  if (status === 'success') {
-    return <div className="mt-1 text-[10px] text-green-300">✓ accepted</div>;
-  }
   return (
-    <div className="mt-1 text-[10px] text-red-300" title={errorDetail ?? undefined}>
-      ✗ {(errorDetail ?? 'move failed').slice(0, 60)}
-    </div>
+    <div className="mt-1 text-[10px] text-gray-500">Pick a source + entity to set target.</div>
   );
 }
 
@@ -1066,7 +1052,7 @@ function CartesianModeBody({
   const robot = useSceneStateStore((s) => s.scene?.robot ?? null);
   const tcp = robot?.tcp_pose_in_base ?? null;
   const sessionJointNames = robot?.joint_names ?? [];
-  const cartesianStreaming = useCartesianStreaming({
+  const cartesianAuthoring = useCartesianAuthoring({
     sessionJointNames,
     tcpFrame: robot?.tcp_frame ?? null,
   });
@@ -1081,60 +1067,64 @@ function CartesianModeBody({
     () => (tcp === null ? [0, 0, 0] : quatToRpyRad(readQuat(tcp))),
     [tcp],
   );
-  const livePositionRef = useRef<[number, number, number]>(positionM);
-  const liveRpyRef = useRef<[number, number, number]>(rpyRad);
-  const commandedPositionRef = useRef<[number, number, number] | null>(null);
-  const commandedRpyRef = useRef<[number, number, number] | null>(null);
+  // The active Cartesian draft target (base frame), or null when there is no
+  // live draft. Both the numeric fields AND the gizmo author into
+  // candidate.cartesianTarget, so it is the single source of truth: the fields
+  // DISPLAY it (a gizmo drag flows into the fields, and diverging axes go amber)
+  // and ACCUMULATE onto it (a field edit builds on the gizmo's pose, never a
+  // stale local ref). A handed-off / discarded candidate is ignored so the
+  // fields fall back to the live TCP.
+  const candidate = useRobotControlCandidateStore((s) => s.candidate);
+  const cartesianTarget = useMemo(() => {
+    if (candidate === null) return null;
+    const t = candidate.cartesianTarget;
+    if (t == null) return null;
+    const st = candidate.status;
+    if (
+      st === 'executing' ||
+      st === 'completed' ||
+      st === 'stopped' ||
+      st === 'interrupted' ||
+      st === 'failed' ||
+      st === 'reverted' ||
+      st === 'error'
+    ) return null;
+    if (t.frameId && t.frameId !== 'base') return null;
+    return t;
+  }, [candidate]);
+  const targetPosition = useMemo<[number, number, number] | null>(() => {
+    if (cartesianTarget === null) return null;
+    const p = cartesianTarget.positionM;
+    const out: [number, number, number] = [Number(p[0]), Number(p[1]), Number(p[2])];
+    return out.every(Number.isFinite) ? out : null;
+  }, [cartesianTarget]);
+  const targetRpy = useMemo<[number, number, number] | null>(() => {
+    if (cartesianTarget === null) return null;
+    return quatToRpyRad(cartesianTarget.orientationXyzw as number[]);
+  }, [cartesianTarget]);
 
-  useEffect(() => {
-    livePositionRef.current = positionM;
-    if (
-      commandedPositionRef.current !== null
-      && vectorDistance(positionM, commandedPositionRef.current)
-        <= CARTESIAN_POSITION_ARRIVAL_TOLERANCE_M
-    ) {
-      commandedPositionRef.current = null;
-    }
-  }, [positionM]);
-  useEffect(() => {
-    liveRpyRef.current = rpyRad;
-    if (
-      commandedRpyRef.current !== null
-      && quaternionAngularDistanceRad(
-        rpyRadToQuat(rpyRad),
-        rpyRadToQuat(commandedRpyRef.current),
-      ) <= CARTESIAN_ORIENTATION_ARRIVAL_TOLERANCE_RAD
-    ) {
-      commandedRpyRef.current = null;
-    }
-  }, [rpyRad]);
-  useEffect(() => {
-    const unsubscribe = followTargetController.subscribe((phase) => {
-      if (phase === 'idle' || phase === 'aborted') {
-        commandedPositionRef.current = null;
-        commandedRpyRef.current = null;
-      }
-    });
-    return unsubscribe;
-  }, []);
+  // Displayed pose: the authored target when a draft is active, else live TCP.
+  const displayedPosition = targetPosition ?? positionM;
+  const displayedRpy = targetRpy ?? rpyRad;
 
   function commitXyz(next: [number, number, number]): void {
     if (!commandGate.canCommand) return;
     if (tcp === null) return;
-    commandedPositionRef.current = next;
-    const quat = commandedRpyRef.current !== null
-      ? rpyRadToQuat(commandedRpyRef.current)
-      : readQuat(tcp) as [number, number, number, number];
-    cartesianStreaming.pushFinal(next, quat);
+    // New position, current authored orientation (no rpy round-trip).
+    const quat = (cartesianTarget?.orientationXyzw ?? readQuat(tcp)) as [
+      number,
+      number,
+      number,
+      number,
+    ];
+    cartesianAuthoring.pushFinal(next, quat);
   }
 
   function commitRpy(nextRpy: [number, number, number]): void {
     if (!commandGate.canCommand) return;
     if (tcp === null) return;
-    commandedRpyRef.current = nextRpy;
-    const quat = rpyRadToQuat(nextRpy);
-    const pos = commandedPositionRef.current ?? livePositionRef.current;
-    cartesianStreaming.pushFinal(pos, quat);
+    // New orientation, current authored position.
+    cartesianAuthoring.pushFinal(displayedPosition, rpyRadToQuat(nextRpy));
   }
 
   return (
@@ -1195,8 +1185,8 @@ function CartesianModeBody({
             <CartesianAxisFields
               label="position (m, in base frame)"
               labels={['x', 'y', 'z']}
-              values={positionM}
-              getBaseValues={() => commandedPositionRef.current ?? livePositionRef.current}
+              values={displayedPosition}
+              liveValues={positionM}
               step={cartesianMStep}
               settleTolerance={CARTESIAN_POSITION_ARRIVAL_TOLERANCE_M}
               onCommit={commitXyz}
@@ -1205,8 +1195,8 @@ function CartesianModeBody({
             <CartesianAxisFields
               label="orientation (rpy, rad)"
               labels={['r', 'p', 'y']}
-              values={rpyRad}
-              getBaseValues={() => commandedRpyRef.current ?? liveRpyRef.current}
+              values={displayedRpy}
+              liveValues={rpyRad}
               step={cartesianRadStep}
               settleTolerance={CARTESIAN_ORIENTATION_ARRIVAL_TOLERANCE_RAD}
               onCommit={commitRpy}
@@ -1218,7 +1208,7 @@ function CartesianModeBody({
         <PoseEditSnapshotSection mode="cartesian" commandGate={commandGate} />
       </div>
       <div className="border-t border-gray-700 bg-gray-800/50 px-2 py-1 text-[10px] text-gray-500">
-        Cartesian · gizmo + fields stream to target · fields use base-frame TCP pose
+        Cartesian · gizmo + fields author a draft target only · fields show the authored target (amber when ≠ live)
       </div>
     </>
   );
@@ -1254,7 +1244,7 @@ function CartesianAxisFields({
   label,
   labels,
   values,
-  getBaseValues,
+  liveValues,
   step,
   settleTolerance,
   onCommit,
@@ -1263,8 +1253,10 @@ function CartesianAxisFields({
 }: {
   label: string;
   labels: readonly [string, string, string];
+  // Displayed authored target (or live TCP when there is no draft).
   values: [number, number, number];
-  getBaseValues: () => [number, number, number];
+  // Actual live TCP, for the authored-vs-live amber signal.
+  liveValues: [number, number, number];
   step: number;
   settleTolerance: number;
   onCommit: (next: [number, number, number]) => void;
@@ -1274,8 +1266,9 @@ function CartesianAxisFields({
   function commitAxis(idx: 0 | 1 | 2, v: number): void {
     if (disabled) return;
     if (!Number.isFinite(v)) return;
-    const base = getBaseValues();
-    const next: [number, number, number] = [base[0], base[1], base[2]];
+    // Build the new full pose on the CURRENT authored target (`values`), so a
+    // field edit accumulates onto the gizmo's pose rather than reverting it.
+    const next: [number, number, number] = [values[0], values[1], values[2]];
     next[idx] = v;
     onCommit(next);
   }
@@ -1289,7 +1282,8 @@ function CartesianAxisFields({
             <CartesianAxisInput
               key={axis}
               axis={axis}
-              live={values[i] ?? 0}
+              value={values[i] ?? 0}
+              liveValue={liveValues[i] ?? 0}
               step={step}
               settleTolerance={settleTolerance}
               disabled={disabled}
@@ -1312,19 +1306,29 @@ function CartesianAxisFields({
 // native listener pattern matches what JointRow already does.
 function CartesianAxisInput({
   axis,
-  live,
+  value,
+  liveValue,
   step,
   settleTolerance,
   disabled,
   onCommit,
 }: {
   axis: string;
-  live: number;
+  // Displayed base: the authored candidate target for this axis (so a gizmo
+  // drag updates the field), or live TCP when there is no draft.
+  value: number;
+  // Actual live TCP axis value — colours the field amber when the shown value
+  // diverges from it.
+  liveValue: number;
   step: number;
   settleTolerance: number;
   disabled: boolean;
   onCommit: (next: number) => void;
 }) {
+  // `draft` is only the in-progress typing buffer. A commit authors the
+  // candidate (which then drives `value`), so the authored target stays visible
+  // without a persistent local draft — and a gizmo drag, which also updates the
+  // candidate, flows straight into `value`.
   const [draft, setDraft] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement | null>(null);
   const disabledRef = useRef(disabled);
@@ -1335,31 +1339,14 @@ function CartesianAxisInput({
     disabledRef.current = disabled;
     onCommitRef.current = onCommit;
   }, [disabled, onCommit]);
-  // Clear any in-flight typed draft when the controller drops to a
-  // resting phase (session naturally closed, externally aborted).
-  // Matches JointRow's pattern (line ~1802) and ensures the field
-  // shows live readout after each motion settles even if the
-  // operator left an Arrow/typed draft sitting.
-  useEffect(() => {
-    const unsubscribe = followTargetController.subscribe((phase) => {
-      if (phase === 'idle' || phase === 'aborted') {
-        setDraft(null);
-      }
-    });
-    return unsubscribe;
-  }, []);
-  // Settle-tolerance fallback for drafts left over from Arrow-key /
-  // mid-typing edits — clear once live catches up. Spinner / Enter /
-  // blur clear the draft eagerly in commitRaw, so this only kicks in
-  // for the Arrow path.
+  // Clear a leftover typing/arrow draft once the live value catches up (e.g.
+  // after an Approve executes), so the field resumes following live state.
   useEffect(() => {
     if (draft === null) return;
     const target = Number(draft);
     if (!Number.isFinite(target)) return;
-    if (Math.abs(target - live) <= settleTolerance) {
-      setDraft(null);
-    }
-  }, [draft, live, settleTolerance]);
+    if (Math.abs(target - liveValue) <= settleTolerance) setDraft(null);
+  }, [draft, liveValue, settleTolerance]);
   useEffect(() => {
     const el = inputRef.current;
     if (el === null) return;
@@ -1367,11 +1354,9 @@ function CartesianAxisInput({
       if (disabledRef.current || raw === '') return;
       const v = Number(raw);
       if (!Number.isFinite(v)) return;
-      // Mirror JointRow: clear the draft so the display falls back
-      // to live TCP and the operator can watch the robot's residual
-      // settling in the same field. Cross-axis target accumulation
-      // is preserved by CartesianModeBody.commandedPositionRef /
-      // commandedRpyRef via getBaseValues, not by locking the draft.
+      // Author the value, then clear the typing buffer: the candidate target now
+      // drives `value`, so the authored value stays visible (no snap-back) and a
+      // later gizmo drag can update this field.
       setDraft(null);
       onCommitRef.current(v);
     };
@@ -1404,6 +1389,12 @@ function CartesianAxisInput({
       el.removeEventListener('change', onNativeChange);
     };
   }, []);
+  // The currently-shown value (draft while typing, else the authored target /
+  // live). Amber when it diverges from the actual live TCP — exactly like a
+  // direct edit, whether the divergence came from a field edit or a gizmo drag.
+  const shownNumber = draft !== null ? Number(draft) : value;
+  const divergesFromLive =
+    Number.isFinite(shownNumber) && Math.abs(shownNumber - liveValue) > settleTolerance;
   return (
     <div className="flex min-w-0 flex-col gap-0.5 font-mono text-[10px] text-gray-300">
       <span className="text-[9px] uppercase text-gray-500">{axis}</span>
@@ -1411,7 +1402,7 @@ function CartesianAxisInput({
         ref={inputRef}
         type="number"
         step={step}
-        value={draft ?? live.toFixed(3)}
+        value={draft ?? value.toFixed(3)}
         disabled={disabled}
         // Noop: real handlers are the native 'input' and 'change'
         // listeners installed via useEffect above. See JointRow.
@@ -1440,6 +1431,8 @@ function CartesianAxisInput({
             }
             (e.target as HTMLInputElement).blur();
           } else if (e.key === 'Escape') {
+            // Explicit cancel of the in-progress typing: drop the draft and blur
+            // (the field falls back to the authored target / live).
             e.preventDefault();
             skipNextBlurCommitRef.current = true;
             setDraft(null);
@@ -1448,18 +1441,22 @@ function CartesianAxisInput({
             e.preventDefault();
             if (disabled) return;
             const direction = e.key === 'ArrowUp' ? 1 : -1;
-            const base = Number(draft ?? live);
+            const base = Number(draft ?? value);
             const delta = (Number.isFinite(step) && step > 0 ? step : 0.001)
               * (e.shiftKey ? 10 : 1)
               * direction;
-            const next = (Number.isFinite(base) ? base : live) + delta;
+            const next = (Number.isFinite(base) ? base : value) + delta;
             if (!Number.isFinite(next)) return;
             const text = String(Number(next.toFixed(6)));
             setDraft(text);
             onCommit(next);
           }
         }}
-        className="w-full min-w-0 rounded bg-gray-800 py-0.5 pl-1 pr-2 text-right text-gray-200"
+        className={`w-full min-w-0 rounded py-0.5 pl-1 pr-2 text-right ${
+          divergesFromLive
+            ? 'bg-amber-950/40 text-amber-200 ring-1 ring-amber-600/50'
+            : 'bg-gray-800 text-gray-200'
+        }`}
       />
     </div>
   );
@@ -1499,21 +1496,6 @@ function rpyRadToQuat(rpy: [number, number, number]): [number, number, number, n
   const qy = cr * sp * cy + sr * cp * sy;
   const qz = cr * cp * sy - sr * sp * cy;
   return [qx, qy, qz, w];
-}
-
-function vectorDistance(a: number[], b: number[]): number {
-  if (a.length < 3 || b.length < 3) return Number.POSITIVE_INFINITY;
-  const dx = a[0] - b[0];
-  const dy = a[1] - b[1];
-  const dz = a[2] - b[2];
-  return Math.sqrt(dx * dx + dy * dy + dz * dz);
-}
-
-function quaternionAngularDistanceRad(a: number[], b: number[]): number {
-  if (a.length < 4 || b.length < 4) return Number.POSITIVE_INFINITY;
-  const dot = Math.abs(a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3]);
-  const clamped = Math.min(1, Math.max(0, dot));
-  return 2 * Math.acos(clamped);
 }
 
 /**
@@ -1569,6 +1551,16 @@ function GrippersSection({ commandGate }: { commandGate: RobotCommandGate }) {
 
 const EMPTY_GRIPPERS: SceneGripperState[] = [];
 
+// Candidate statuses for which a gripper widget shows its staged (authored,
+// not-yet-executed) target. Terminal/handed-off statuses fall back to live.
+const GRIPPER_STAGED_STATUSES = new Set<string>([
+  'planning',
+  'ready',
+  'blocked',
+  'stale',
+  'approving',
+]);
+
 function GripperRow({
   gripper,
   commandGate,
@@ -1582,13 +1574,11 @@ function GripperRow({
   // command target is displayed separately in the cmd label so the
   // operator sees both "where the finger actually is" and "where we
   // asked it to go".
+  const author = useRobotControlCandidateStore((s) => s.author);
+  const candidate = useRobotControlCandidateStore((s) => s.candidate);
   const [pending, setPending] = useState<number | null>(null);
   // Anything that releases the BT runner (Run or a direct-control session
-  // opened from a sibling panel) clears the
-  // operator's stale drag value. Without this, a drag that didn't
-  // close cleanly (mouseup outside the slider, a torn touch event)
-  // leaves pending set forever and the slider stops following live
-  // state on the next cycle transition.
+  // opened from a sibling panel) clears the operator's stale drag value.
   const cycleState = useCycleStore((s) => s.state);
   useEffect(() => {
     if (
@@ -1601,46 +1591,59 @@ function GripperRow({
   const lower = gripper.limit_lower ?? 0;
   const upper = gripper.limit_upper ?? 1;
   const current = gripper.current_position ?? lower;
-  const target = gripper.target_position ?? current;
-  // Clamp the displayed slider value to the URDF limits so a kernel
-  // overshoot or a stale-state read can't push the input outside the
-  // declared range (HTML5 range silently snaps; we just want the
-  // displayed number to be honest).
+  const liveTarget = gripper.target_position ?? current;
+  // The staged candidate target for THIS gripper, when it is the active draft.
+  // A slider/preset edit authors a gripper candidate; the robot moves only via
+  // the shared Approve action, so the widget shows the staged (not-yet-executed)
+  // target until Approve/Revert.
+  const stagedTarget =
+    candidate !== null &&
+    candidate.inputMode === 'gripper' &&
+    candidate.gripperTarget != null &&
+    candidate.gripperTarget.gripperId === gripper.gripper_id &&
+    GRIPPER_STAGED_STATUSES.has(candidate.status)
+      ? candidate.gripperTarget.targetPosition
+      : null;
+  // Slider follows the live drag, then the staged candidate target, then live.
   const displayValue = Math.min(
     upper,
-    Math.max(lower, pending ?? current),
+    Math.max(lower, pending ?? stagedTarget ?? current),
   );
+  const cmdTarget = stagedTarget ?? liveTarget;
+  const stagedDiverges =
+    stagedTarget !== null && Math.abs(stagedTarget - current) > 1e-4;
   const presetEntries = useMemo(
     () => Object.entries(gripper.srdf_presets ?? {}),
     [gripper.srdf_presets],
   );
 
-  function sendCommand(value: number): void {
+  // Author (NOT dispatch) a staged gripper candidate. Slider release and preset
+  // clicks no longer call /api/scene/gripper/command directly; the robot moves
+  // only via the shared Approve action (CandidateApprovalBar), and Revert
+  // discards the staged target. Backend validation marks an out-of-limit target
+  // as a blocked candidate.
+  function authorGripper(
+    value: number,
+    surface: 'gripper_slider' | 'gripper_preset',
+  ): void {
     setPending(null);
     if (!commandGate.canCommand) {
-      console.warn('gripper command rejected:', commandGate.reason);
+      console.warn('gripper authoring rejected:', commandGate.reason);
       return;
     }
     if (!Number.isFinite(value)) {
-      console.warn('gripper command rejected: non-finite target', value);
+      console.warn('gripper authoring rejected: non-finite target', value);
       return;
     }
-    const bounded = Math.min(upper, Math.max(lower, value));
-    if (bounded !== value) {
-      console.warn('gripper command clamped to URDF limits', {
-        requested: value,
-        bounded,
-        lower,
-        upper,
-      });
-    }
-    void api.scene
-      .commandGripper({ gripperId: gripper.gripper_id, targetPosition: bounded })
-      .catch((err) => console.warn('gripper command failed', err));
+    author(gripperCandidateRequest(gripper.gripper_id, value, surface));
   }
 
   const stateLabel = gripper.state.replace(/^GripperCommandState\./, '');
-  const busy = stateLabel.toLowerCase() === 'in_progress';
+  // The kernel reports an in-flight gripper command as `executing` (the
+  // GripperCommandState enum value); also accept `in_progress` defensively.
+  // While busy the widget disables authoring — the backend additionally
+  // fails closed if a command is approved against a busy gripper.
+  const busy = ['executing', 'in_progress'].includes(stateLabel.toLowerCase());
   const disabled = busy || !commandGate.canCommand;
   return (
     <div className="space-y-1 rounded border border-gray-700 bg-gray-900/40 p-2">
@@ -1657,7 +1660,12 @@ function GripperRow({
         </span>
         <span>
           cmd:{' '}
-          <span className="font-mono text-gray-300">{target.toFixed(3)}</span>
+          <span
+            className={`font-mono ${stagedDiverges ? 'text-amber-300' : 'text-gray-300'}`}
+            title={stagedDiverges ? 'staged target (not yet executed)' : undefined}
+          >
+            {cmdTarget.toFixed(3)}
+          </span>
         </span>
         <span className={busy ? 'text-amber-400' : 'text-gray-500'}>
           {stateLabel}
@@ -1671,16 +1679,20 @@ function GripperRow({
         // the slider invalid whenever the live kernel value lands
         // off-grid (which is almost always for a sim/real gripper
         // mid-motion) and shows a hover tooltip "Please select a valid
-        // value, the two nearest valid values are…". The streaming
-        // path validates the requested target server-side, so the
-        // step-grid constraint adds no safety.
+        // value, the two nearest valid values are…". The candidate
+        // validation path validates the requested target server-side, so
+        // the step-grid constraint adds no safety.
         step="any"
         value={displayValue}
         disabled={disabled}
         onChange={(e) => !disabled && setPending(Number(e.target.value))}
-        onMouseUp={(e) => sendCommand(Number((e.target as HTMLInputElement).value))}
-        onTouchEnd={(e) => sendCommand(Number((e.target as HTMLInputElement).value))}
-        className="w-full"
+        onMouseUp={(e) =>
+          authorGripper(Number((e.target as HTMLInputElement).value), 'gripper_slider')
+        }
+        onTouchEnd={(e) =>
+          authorGripper(Number((e.target as HTMLInputElement).value), 'gripper_slider')
+        }
+        className={`w-full ${stagedDiverges ? 'accent-amber-400' : ''}`}
       />
       <div className="flex flex-wrap gap-1">
         {presetEntries.length > 0 ? (
@@ -1688,7 +1700,7 @@ function GripperRow({
             <button
               key={name}
               type="button"
-              onClick={() => sendCommand(value)}
+              onClick={() => authorGripper(value, 'gripper_preset')}
               disabled={disabled}
               className="rounded border border-gray-600 px-2 py-0.5 text-[10px] text-gray-200 hover:bg-gray-700"
               title={`${name} = ${value.toFixed(3)}`}
@@ -1700,7 +1712,7 @@ function GripperRow({
           <>
             <button
               type="button"
-              onClick={() => sendCommand(lower)}
+              onClick={() => authorGripper(lower, 'gripper_preset')}
               disabled={disabled}
               className="rounded border border-gray-600 px-2 py-0.5 text-[10px] text-gray-200 hover:bg-gray-700"
               title={`lower limit (${lower.toFixed(3)})`}
@@ -1709,7 +1721,7 @@ function GripperRow({
             </button>
             <button
               type="button"
-              onClick={() => sendCommand(upper)}
+              onClick={() => authorGripper(upper, 'gripper_preset')}
               disabled={disabled}
               className="rounded border border-gray-600 px-2 py-0.5 text-[10px] text-gray-200 hover:bg-gray-700"
               title={`upper limit (${upper.toFixed(3)})`}
@@ -1985,16 +1997,16 @@ function JointRow({
   joint,
   currentValue,
   step,
-  onStreamingPush,
-  onStreamingPushFinal,
+  onDraftPush,
+  onDraftPushFinal,
   disabled = false,
   disabledReason = null,
 }: {
   joint: SceneUrdfJoint;
   currentValue: number | null;
   step: number;
-  onStreamingPush: (jointName: string, valueRad: number) => void;
-  onStreamingPushFinal: (jointName: string, valueRad: number) => void;
+  onDraftPush: (jointName: string, valueRad: number) => void;
+  onDraftPushFinal: (jointName: string, valueRad: number) => void;
   disabled?: boolean;
   disabledReason?: string | null;
 }) {
@@ -2014,56 +2026,37 @@ function JointRow({
     ),
     [displayValue, hasAuthoritativeRange, joint, currentValue],
   );
-  const [draft, setDraft] = useState<string | null>(null);
+  // Persistent authored-target draft. A commit (slider release, spinner click,
+  // Enter, blur) KEEPS the authored value visible — the control does not snap
+  // back to live. The hook clears the draft only when the authored candidate is
+  // discarded (Revert / mode-tab switch) or when the live value catches up to
+  // the draft within tolerance (after an Approve executes), so the slider
+  // resumes following live state. `isDraft` doubles as the authored-vs-live
+  // signal: a draft within tolerance of live auto-clears, so a held draft means
+  // the authored target diverges from the live joint position.
+  const { draft, isDraft, setDraft, clearDraft } = usePersistentDraft(
+    currentValue === null ? Number.NaN : currentValue,
+    jointArrivalTolerance(joint),
+  );
+  const divergesFromLive = isDraft;
   const draftNumeric = draft === null ? displayValue : Number(draft);
   const sliderValue = Number.isFinite(draftNumeric)
     ? Math.min(jointRange.max, Math.max(jointRange.min, draftNumeric))
     : displayValue;
 
-  // Clear the draft when the live value catches up — happens once
-  // the streamed pose lands and scene-state polls in the new
-  // position. Use the same tolerance as the session close gate:
-  // real controllers may not report exact floating-point equality,
-  // and a draft that never clears makes the slider/input look stuck
-  // while live state is actually moving underneath.
-  useEffect(() => {
-    if (draft !== null && Number.isFinite(Number(draft)) && currentValue !== null) {
-      if (Math.abs(Number(draft) - currentValue) < jointArrivalTolerance(joint)) {
-        setDraft(null);
-      }
-    }
-  }, [currentValue, draft, joint]);
-
-  // Also clear on any cycle transition that hands the joint over to
-  // an authoritative non-operator source (BT runner, interrupt
-  // handler, direct-control session). Without this, a draft set by
-  // the numeric input's arrow keys or by a slider drag that didn't
-  // close cleanly leaves the slider frozen at the operator's last
-  // commanded value while live state moves underneath.
+  // Clear on any cycle transition that hands the joint over to an authoritative
+  // non-operator source (BT runner, interrupt handler, direct-control session),
+  // so the slider resumes following live state instead of freezing at the
+  // operator's last authored value while live state moves underneath.
   const cycleState = useCycleStore((s) => s.state);
   useEffect(() => {
     if (
       cycleState === 'running'
       || cycleState === 'direct_control'
     ) {
-      setDraft(null);
+      clearDraft();
     }
-  }, [cycleState]);
-
-  // And clear when the follow-target streaming session aborts /
-  // returns to idle (operator hit Stop mid-motion). The post-stop
-  // refresh in ControlBar updates `currentValue` to the actual
-  // stopped pose immediately; this just ensures we're not still
-  // sitting on a torn-drag draft that would render before the new
-  // currentValue lands.
-  useEffect(() => {
-    const unsubscribe = followTargetController.subscribe((phase) => {
-      if (phase === 'aborted' || phase === 'idle') {
-        setDraft(null);
-      }
-    });
-    return unsubscribe;
-  }, []);
+  }, [cycleState, clearDraft]);
 
   const clamp = useCallback((value: number): number => {
     return Math.min(jointRange.max, Math.max(jointRange.min, value));
@@ -2084,21 +2077,21 @@ function JointRow({
   // moves underneath. Binding both events natively gives a
   // deterministic source of truth: 'input' tracks the operator's
   // draft text; 'change' fires once on a committed value (spinner
-  // click, Enter, blur) — which clears the draft and pushes the
-  // target through the streaming session.
+  // click, Enter, blur) — which authors and KEEPS that value. No
+  // motion; Approve is the only motion path.
   const numberInputRef = useRef<HTMLInputElement | null>(null);
   const clampRef = useRef(clamp);
   const jointNameRef = useRef(joint.name);
   const hasAuthoritativeRangeRef = useRef(hasAuthoritativeRange);
   const disabledRef = useRef(disabled);
-  const onStreamingPushFinalRef = useRef(onStreamingPushFinal);
+  const onDraftPushFinalRef = useRef(onDraftPushFinal);
   useEffect(() => {
     clampRef.current = clamp;
     jointNameRef.current = joint.name;
     hasAuthoritativeRangeRef.current = hasAuthoritativeRange;
     disabledRef.current = disabled;
-    onStreamingPushFinalRef.current = onStreamingPushFinal;
-  }, [clamp, disabled, hasAuthoritativeRange, joint.name, onStreamingPushFinal]);
+    onDraftPushFinalRef.current = onDraftPushFinal;
+  }, [clamp, disabled, hasAuthoritativeRange, joint.name, onDraftPushFinal]);
   useEffect(() => {
     const el = numberInputRef.current;
     if (el === null) return;
@@ -2106,15 +2099,19 @@ function JointRow({
       if (disabledRef.current || !hasAuthoritativeRangeRef.current) return;
       const inputEvent = event as InputEvent;
       // Browser spinner buttons usually emit a native input event
-      // without an inputType. Treat that as an operator jog command.
-      // Keyboard text input has inputType values such as insertText,
-      // so typing remains local draft state until blur/Enter.
+      // without an inputType. Treat that as an operator commit of the
+      // authored value. Keyboard text input has inputType values such
+      // as insertText, so typing remains local draft state until
+      // blur/Enter.
       if (!inputEvent.inputType) {
         const raw = el.value;
         const v = Number(raw);
         if (!Number.isFinite(v)) return;
-        setDraft(null);
-        onStreamingPushFinalRef.current(jointNameRef.current, clampRef.current(v));
+        const clamped = clampRef.current(v);
+        // Keep the authored target visible (no snap-back); it clears only on
+        // Revert / mode switch / live catch-up (see usePersistentDraft).
+        setDraft(String(Number(clamped.toFixed(6))));
+        onDraftPushFinalRef.current(jointNameRef.current, clamped);
         return;
       }
       setDraft(el.value);
@@ -2125,8 +2122,9 @@ function JointRow({
       if (raw === '') return;
       const v = Number(raw);
       if (!Number.isFinite(v)) return;
-      setDraft(null);
-      onStreamingPushFinalRef.current(jointNameRef.current, clampRef.current(v));
+      const clamped = clampRef.current(v);
+      setDraft(String(Number(clamped.toFixed(6))));
+      onDraftPushFinalRef.current(jointNameRef.current, clamped);
     };
     el.addEventListener('input', onNativeInput);
     el.addEventListener('change', onNativeChange);
@@ -2136,34 +2134,36 @@ function JointRow({
     };
   }, []);
 
-  function streamFollow(raw: string): void {
+  function draftFollow(raw: string): void {
     if (disabled) return;
     if (!hasAuthoritativeRange) return;
     const v = Number(raw);
     if (!Number.isFinite(v)) return;
-    // Streaming hook owns the rate throttle (4 Hz) and session
-    // lifecycle. No badge churn — robot motion is the feedback.
-    onStreamingPush(joint.name, clamp(v));
+    // Author-only: records the in-progress authored value. No motion;
+    // Approve is the only motion path.
+    onDraftPush(joint.name, clamp(v));
   }
 
-  function streamFinal(raw: string): void {
+  function draftFinal(raw: string): void {
     if (disabled) return;
     if (!hasAuthoritativeRange) return;
     const v = Number(raw);
     if (!Number.isFinite(v)) return;
-    onStreamingPushFinal(joint.name, clamp(v));
+    onDraftPushFinal(joint.name, clamp(v));
   }
 
   function commitValue(raw: string): void {
     const requested = Number(raw);
-    setDraft(null);
     if (disabled) {
       return;
     }
     if (!hasAuthoritativeRange || !Number.isFinite(requested)) {
       return;
     }
-    onStreamingPushFinal(joint.name, clamp(requested));
+    const clamped = clamp(requested);
+    // Keep the authored target visible after release/Enter (no snap-back).
+    setDraft(String(Number(clamped.toFixed(6))));
+    onDraftPushFinal(joint.name, clamped);
   }
 
   function commitTyped(): void {
@@ -2174,8 +2174,24 @@ function JointRow({
   return (
     <div className="border-b border-gray-800 py-1 last:border-b-0">
       <div className="flex items-baseline justify-between gap-1">
-        <span className="truncate font-mono text-[11px]">{joint.name}</span>
-        <span className="text-[10px] text-gray-500">{joint.type}</span>
+        <span className="truncate font-mono text-[11px]">
+          {joint.name}
+          {divergesFromLive && (
+            <span className="ml-1 rounded bg-amber-900/50 px-1 text-[9px] font-medium uppercase tracking-wide text-amber-300">
+              target
+            </span>
+          )}
+        </span>
+        {divergesFromLive && currentValue !== null ? (
+          <span
+            className="font-mono text-[10px] text-gray-400"
+            title="live joint position (not the authored target)"
+          >
+            live {formatJointValue(currentValue, step)}
+          </span>
+        ) : (
+          <span className="text-[10px] text-gray-500">{joint.type}</span>
+        )}
       </div>
       <div className="mt-0.5 flex items-center gap-2">
         <input
@@ -2190,20 +2206,20 @@ function JointRow({
           // are…" tooltip — operator UX-breaking even though the value
           // is correct. Keyboard arrows fall back to (max-min)/100
           // which is still useful for jog precision (~0.06 rad on a
-          // ±π joint). The streaming-hook + clamp() in the commit
-          // path are the authoritative validators.
+          // ±π joint). clamp() bounds the authored draft to the joint
+          // range; validated planning is the authoritative validator.
           step="any"
           value={sliderValue}
           disabled={disabled || !hasAuthoritativeRange}
           title={disabled ? disabledReason ?? undefined : undefined}
           onChange={(e) => {
             setDraft(e.target.value);
-            streamFollow(e.target.value);
+            draftFollow(e.target.value);
           }}
           onMouseUp={(e) => {
-            // Final push: the released slider value is the goal,
-            // bypass the throttle so it always lands before the
-            // streaming-session End fires.
+            // Release authors the draft target and KEEPS it visible (no
+            // snap-back to live); it never moves the robot (Approve is the only
+            // motion path).
             const input = e.target as HTMLInputElement;
             commitValue(input.value);
           }}
@@ -2211,7 +2227,7 @@ function JointRow({
             const input = e.target as HTMLInputElement;
             commitValue(input.value);
           }}
-          className="flex-1"
+          className={`flex-1 ${divergesFromLive ? 'accent-amber-400' : ''}`}
         />
         <input
           ref={numberInputRef}
@@ -2232,8 +2248,8 @@ function JointRow({
           // the real handlers are the native 'input' and 'change'
           // listeners installed via useEffect above. Going through
           // React onChange would interact badly with the native
-          // listener (race on setDraft(null) vs setDraft(value)) and
-          // freeze the slider after a spinner click.
+          // listener (synthetic-event ordering vs the directly-bound
+          // listeners) for spinner clicks.
           onChange={() => {}}
           onBlur={commitTyped}
           onKeyDown={(e) => {
@@ -2242,8 +2258,11 @@ function JointRow({
               commitTyped();
               (e.target as HTMLInputElement).blur();
             } else if (e.key === 'Escape') {
+              // Explicit cancel of the in-progress edit: return to the live
+              // value and blur. (Commits do NOT clear the draft; only this
+              // explicit gesture and Revert/mode-switch/live-catch-up do.)
               e.preventDefault();
-              setDraft(null);
+              clearDraft();
               (e.target as HTMLInputElement).blur();
             } else if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
               e.preventDefault();
@@ -2255,10 +2274,14 @@ function JointRow({
               const next = clamp((Number.isFinite(base) ? base : displayValue) + delta);
               const text = String(Number(next.toFixed(6)));
               setDraft(text);
-              streamFinal(text);
+              draftFinal(text);
             }
           }}
-          className="w-20 rounded bg-gray-800 py-0.5 pl-1 pr-2 text-right font-mono text-[10px] text-gray-200"
+          className={`w-20 rounded py-0.5 pl-1 pr-2 text-right font-mono text-[10px] ${
+            divergesFromLive
+              ? 'bg-amber-950/40 text-amber-200 ring-1 ring-amber-600/50'
+              : 'bg-gray-800 text-gray-200'
+          }`}
         />
       </div>
       {(joint.limit_lower !== null || joint.limit_upper !== null) && (

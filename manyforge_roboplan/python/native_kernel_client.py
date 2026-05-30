@@ -31,10 +31,6 @@ from manyforge_behavior.kernel_client import (
     SceneShape,
     SceneEditRequest,
     SceneEditResult,
-    StreamingBeginResult,
-    StreamingPushResult,
-    StreamingSessionConfig,
-    StreamingTarget,
     Trajectory,
     TrajectoryWaypoint,
 )
@@ -47,7 +43,6 @@ _STATE_NAME_MAP = {
     "Planning": ExecutionState.PLANNING,
     "Validating": ExecutionState.VALIDATING,
     "Executing": ExecutionState.EXECUTING,
-    "Streaming": ExecutionState.STREAMING,
     "Interrupted": ExecutionState.INTERRUPTED,
     "Paused": ExecutionState.PAUSED,
     "Stopping": ExecutionState.STOPPING,
@@ -214,6 +209,33 @@ def _deserialize_motion_execution_outcome(
     return outcome
 
 
+def _serialize_per_joint_dynamics_limits(
+    request: ExecuteRequest,
+) -> Optional[Dict[str, Dict[str, float]]]:
+    """Serialize ExecuteRequest.per_joint_dynamics_limits into the native dict
+    shape (Phase 4-P5.1K). Only present (non-None) fields are emitted; returns
+    None when there are no caps so the request dict omits the key (empty map =
+    prior behavior)."""
+    limits = getattr(request, "per_joint_dynamics_limits", None)
+    if not limits:
+        return None
+    out: Dict[str, Dict[str, float]] = {}
+    for joint_name, limit in limits.items():
+        entry: Dict[str, float] = {}
+        v = getattr(limit, "max_velocity_rad_s", None)
+        a = getattr(limit, "max_acceleration_rad_s2", None)
+        j = getattr(limit, "max_jerk_rad_s3", None)
+        if v is not None:
+            entry["max_velocity_rad_s"] = float(v)
+        if a is not None:
+            entry["max_acceleration_rad_s2"] = float(a)
+        if j is not None:
+            entry["max_jerk_rad_s3"] = float(j)
+        if entry:
+            out[str(joint_name)] = entry
+    return out or None
+
+
 def _normalize_pose_dict(pose: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     if pose is None:
         return None
@@ -343,6 +365,10 @@ class NativeKernelClient(KernelClient):
         if request.max_tcp_linear_speed_mps is not None:
             req_dict["max_tcp_linear_speed_mps"] = request.max_tcp_linear_speed_mps
 
+        dyn_limits = _serialize_per_joint_dynamics_limits(request)
+        if dyn_limits is not None:
+            req_dict["per_joint_dynamics_limits"] = dyn_limits
+
         if request.motion_type == "joint_goal":
             req_dict["joint_goal_names"] = request.joint_goal_names
             req_dict["joint_goal_positions_rad"] = request.joint_goal_positions_rad
@@ -387,6 +413,10 @@ class NativeKernelClient(KernelClient):
 
         if request.max_tcp_linear_speed_mps is not None:
             req_dict["max_tcp_linear_speed_mps"] = request.max_tcp_linear_speed_mps
+
+        dyn_limits = _serialize_per_joint_dynamics_limits(request)
+        if dyn_limits is not None:
+            req_dict["per_joint_dynamics_limits"] = dyn_limits
 
         if request.motion_type == "joint_goal":
             req_dict["joint_goal_names"] = request.joint_goal_names
@@ -470,6 +500,10 @@ class NativeKernelClient(KernelClient):
 
         if request.max_tcp_linear_speed_mps is not None:
             req_dict["max_tcp_linear_speed_mps"] = request.max_tcp_linear_speed_mps
+
+        dyn_limits = _serialize_per_joint_dynamics_limits(request)
+        if dyn_limits is not None:
+            req_dict["per_joint_dynamics_limits"] = dyn_limits
 
         if request.motion_type == "joint_goal":
             req_dict["joint_goal_names"] = request.joint_goal_names
@@ -631,79 +665,6 @@ class NativeKernelClient(KernelClient):
         )
         return CommandResult(accepted=r["accepted"], error=r.get("error"))
 
-    # ---- Streaming-session API (ADR-0016) ----
-    def begin_streaming_session(
-        self, config: StreamingSessionConfig
-    ) -> StreamingBeginResult:
-        cfg_dict = {
-            "group_id": config.group_id,
-            "joint_names": list(config.joint_names),
-            "input_mode": config.input_mode,
-            "cartesian_reference_frame": config.cartesian_reference_frame,
-            "tcp_frame": config.tcp_frame,
-            "soft_stop_strategy": config.soft_stop_strategy,
-            "soft_stop_deceleration_time_s": float(
-                config.soft_stop_deceleration_time_s
-            ),
-            "anchor_negative_time_s": float(config.anchor_negative_time_s),
-            "target_time_from_start_min_s": float(
-                config.target_time_from_start_min_s
-            ),
-            "max_dispatch_rate_hz": float(config.max_dispatch_rate_hz),
-            "target_max_age_s": float(config.target_max_age_s),
-            "velocity_scale": float(config.velocity_scale),
-            "max_tcp_linear_speed_mps": float(config.max_tcp_linear_speed_mps),
-            "per_joint_velocity_caps_rad_s": [
-                float(v) for v in config.per_joint_velocity_caps_rad_s
-            ],
-            "per_joint_acceleration_caps_rad_s2": [
-                float(v) for v in config.per_joint_acceleration_caps_rad_s2
-            ],
-            "principal_id": config.principal_id,
-            "authority_source": config.authority_source,
-            "trigger_reason": config.trigger_reason,
-        }
-        r = self._bundle.begin_streaming_session(cfg_dict)
-        return StreamingBeginResult(
-            accepted=bool(r.get("accepted", False)),
-            session_id=int(r.get("session_id", 0)),
-            error=r.get("error"),
-            error_code=r.get("error_code"),
-        )
-
-    def push_streaming_target(
-        self, session_id: int, target: StreamingTarget
-    ) -> StreamingPushResult:
-        tgt_dict = {
-            "kind": target.kind,
-            "position_m": list(target.position_m),
-            "orientation_xyzw": list(target.orientation_xyzw),
-            "joint_names": list(target.joint_names),
-            "joint_positions_rad": list(target.joint_positions_rad),
-            "source_timestamp_ns": int(target.source_timestamp_ns),
-            "source_sequence": int(target.source_sequence),
-            "min_time_from_start_s": float(target.min_time_from_start_s),
-        }
-        r = self._bundle.push_streaming_target(int(session_id), tgt_dict)
-        return StreamingPushResult(
-            accepted=bool(r.get("accepted", False)),
-            backend_sequence=int(r.get("backend_sequence", 0)),
-            error=r.get("error"),
-            error_code=r.get("error_code"),
-            error_details=dict(r.get("error_details", {})),
-        )
-
-    def end_streaming_session(
-        self, session_id: int, soft_stop_strategy: str = "spring_back"
-    ) -> CommandResult:
-        r = self._bundle.end_streaming_session(
-            int(session_id), soft_stop_strategy
-        )
-        return CommandResult(
-            accepted=bool(r.get("accepted", False)),
-            error=r.get("error"),
-        )
-
     def set_runtime_velocity_scale(self, scale: float) -> None:
         # ADR-0018: forward runtime HMI velocity-scale changes to the C++
         # kernel/backend. The kernel validates finiteness and clamps to [0, 1].
@@ -712,9 +673,6 @@ class NativeKernelClient(KernelClient):
         if not isinstance(scale, (int, float)) or math.isnan(scale) or math.isinf(scale):
             return
         self._bundle.set_runtime_velocity_scale(float(scale))
-
-    def set_streaming_velocity_scale(self, scale: float) -> None:
-        self.set_runtime_velocity_scale(scale)
 
     def get_status(self) -> ExecutionStatus:
         s = self._bundle.get_status()
@@ -1032,7 +990,8 @@ class NativeKernelClient(KernelClient):
     ) -> Dict[str, Any]:
         """Compute link poses at a hypothetical robot configuration.
 
-        Used by the Composer Move-To "ghost robot" preview (ADR-0016).
+        Used by the Composer Move-To / validated Robot Control candidate
+        "ghost robot" preview (no-motion authoring).
         Request shape:
             {
               "kind": "cartesian" | "joint",

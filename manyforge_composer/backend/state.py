@@ -2458,7 +2458,7 @@ class ComposerState:
             self._kernel, self.kernel_bundle = self._kernel_factory(deployment)
         drivable_joints = self.refresh_drivable_joint_names(kernel=self._kernel)
         if deployment is not None and drivable_joints:
-            deployment.validate_streaming_joint_limits_against(drivable_joints)
+            deployment.validate_robot_control_joint_limits_against(drivable_joints)
 
         runner = OrchestratorRunner(
             catalog_path=self._catalog_path,
@@ -2576,7 +2576,7 @@ class ComposerState:
 
         # Spec/430 §3.2 cross-validation requires the bound robot's drivable
         # joint list. Run it for both /api/session/apply and /api/program/load
-        # so typo'd per-joint streaming caps fail at load time, not on first jog.
+        # so typo'd per-joint Robot Control caps fail at load time, not on first use.
         drivable_joints: list[str] = []
         if deployment is not None and kernel is not None:
             try:
@@ -2584,7 +2584,7 @@ class ComposerState:
             except Exception:
                 drivable_joints = []
             if drivable_joints:
-                deployment.validate_streaming_joint_limits_against(drivable_joints)
+                deployment.validate_robot_control_joint_limits_against(drivable_joints)
 
         # Create runner
         runner = OrchestratorRunner(

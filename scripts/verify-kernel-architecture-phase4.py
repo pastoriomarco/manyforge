@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -38,7 +39,6 @@ REQUIRED_LIVE_ISAAC_PHASE4_P3_CHECKS = {
     "runtime_profile_commanded_sim",
     "kernel_snapshot_authority_metadata",
     "scene_state_robot_authority_metadata",
-    "streaming_collision_budget_configured",
     "joint_slider_accepted",
     "joint_spinner_input_accepted",
     "cartesian_gizmo_accepted",
@@ -47,6 +47,33 @@ REQUIRED_LIVE_ISAAC_PHASE4_P3_CHECKS = {
     "rejected_frame_recovery",
     "reset_home_command_stream_refresh",
 }
+
+# Phase 4-P5 (default Robot Control / validated candidate gate).
+#
+# REQUIRED_LIVE_ISAAC_PHASE4_P3_CHECKS above remains the historical
+# state-authority evidence set. The one removal is
+# `streaming_collision_budget_configured`: the `streaming_collision_timeout_s`
+# deployment field it asserted was deleted with the ADR-0016 streaming session
+# boundary, so neither the live probe nor any fresh evidence can carry it. The
+# remaining checks still validate archived commanded-sim evidence. Per the
+# sprint sequencing, live streaming / Advanced Jog evidence does NOT satisfy the
+# default Robot Control gate (VALIDATED_ROBOT_CONTROL_PLAN.md, Phase 4-P5).
+# Default Robot Control is certified separately by candidate
+# preview / approve / revert evidence.
+#
+# Scaffold only: this set is empty and not yet consumed by any check, so it
+# does not gate release today. It is populated when the live P5 candidate
+# qualification probe exists. Expected keys (final names land with the
+# candidate API):
+#   candidate_preview_no_motion, joint_candidate_ready,
+#   cartesian_candidate_ready, blocked_ghost_ik_failure,
+#   blocked_ghost_collision_failure, intermediate_trajectory_preview_present,
+#   approve_executes_fresh_candidate, approve_rejects_stale_candidate,
+#   revert_clears_overlays_no_motion, release_no_motion,
+#   no_default_path_opens_streaming,
+#   candidate_ghost_does_not_mutate_scene_state,
+#   manyforge_only_vs_commanded_sim_candidate_parity
+REQUIRED_LIVE_ISAAC_PHASE4_P5_CHECKS: set[str] = set()
 
 # Each entry is a regex pattern (Python `re` syntax) plus a human-readable
 # description. Patterns are matched with `re.MULTILINE | re.DOTALL`, so `\s+`
@@ -90,6 +117,27 @@ FORBIDDEN_PRODUCTION_PATTERNS: list[tuple[str, str]] = [
     (r"\binterpolate_joint_positions\b",
      "deleted per-backend linear interpolation helper "
      "(use sample_trajectory from manyforge_core/trajectory/)"),
+    # Validated Robot Control: default Robot Control no longer opens an
+    # ADR-0016 streaming session. The frontend follow-target entry points and
+    # the Composer follow-target WebSocket route were deleted in the FE/BE
+    # de-streaming chunks; the kernel/backend streaming-session API + DTOs and
+    # the streaming-only collision/interrupt surfaces were deleted in the
+    # streaming-session boundary chunk. Reintroducing any of these tokens in a
+    # production scan dir is a regression. Tokens are specific identifiers /
+    # routes — NOT the bare word "streaming" — so historical docs and true
+    # data streams (point-cloud / octomap WS, /ws/state, SSE/telemetry) are
+    # not falsely flagged.
+    (r"\bfollowTargetController\b", "deleted frontend follow-target streaming controller"),
+    (r"\buseFollowTargetSession\b", "deleted frontend follow-target streaming hook"),
+    (r"\bopenFollowTargetSession\b", "deleted frontend follow-target WS client opener"),
+    (r"/ws/follow-target", "deleted default Robot Control follow-target WebSocket route"),
+    (r"\bbegin_streaming_session\b", "deleted kernel/backend streaming-session begin API"),
+    (r"\bpush_streaming_target\b", "deleted kernel/backend streaming-target push API"),
+    (r"\bend_streaming_session\b", "deleted kernel/backend streaming-session end API"),
+    (r"\bStreamingSessionConfigDTO\b", "deleted streaming-session config DTO"),
+    (r"\bStreamingTargetDTO\b", "deleted streaming-target DTO"),
+    (r"\bkStreamingTargetValidation\b", "deleted streaming-target collision surface"),
+    (r"\bkPreemptStreaming\b", "deleted streaming interrupt preemption action"),
 ]
 
 SCAN_DIRS = [
@@ -116,6 +164,32 @@ SKIP_SUFFIXES = {
     ".so",
     ".a",
     ".o",
+}
+
+# Generated / vendored / VCS directories that never hold authored production
+# source. Pruning them keeps the release-cleanup scan fast in a normal dev
+# worktree (frontend deps installed, C++ already built) instead of walking
+# node_modules and build trees. Matched by directory basename at any depth.
+PRUNE_DIRS = {
+    ".git",
+    ".hg",
+    ".svn",
+    "node_modules",
+    "dist",
+    "build",
+    ".next",
+    ".turbo",
+    ".cache",
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".venv",
+    "venv",
+    ".tox",
+    "coverage",
+    ".coverage",
+    "htmlcov",
 }
 
 
@@ -358,12 +432,15 @@ def iter_text_files(root: Path):
         base = root / relative
         if not base.exists():
             continue
-        for path in base.rglob("*"):
-            if not path.is_file():
-                continue
-            if path.suffix.lower() in SKIP_SUFFIXES:
-                continue
-            yield path
+        # os.walk so we can prune generated/vendored/VCS dirs in place; rglob
+        # would still descend into them and stat every node_modules/build file.
+        for dirpath, dirnames, filenames in os.walk(base):
+            dirnames[:] = [d for d in dirnames if d not in PRUNE_DIRS]
+            for filename in filenames:
+                path = Path(dirpath) / filename
+                if path.suffix.lower() in SKIP_SUFFIXES:
+                    continue
+                yield path
 
 
 def validate_release_cleanup(repo_root: Path, failures: list[str]) -> list[dict[str, Any]]:

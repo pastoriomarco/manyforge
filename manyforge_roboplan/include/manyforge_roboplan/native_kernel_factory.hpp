@@ -126,7 +126,7 @@ struct NativeKernelBundle {
   std::shared_ptr<roboplan::PathShortcutter> shortcutter;
   std::shared_ptr<roboplan::PathParameterizerTOPPRA> toppra;
   std::shared_ptr<roboplan::SimpleIk> ik;
-  std::shared_ptr<roboplan::SimpleIk> streaming_ik;
+  std::shared_ptr<roboplan::SimpleIk> single_shot_ik;
 
   std::unique_ptr<RoboPlanPlannerBackend> planner;
   std::unique_ptr<RoboPlanPlanningContext> context;

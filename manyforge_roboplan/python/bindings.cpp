@@ -504,11 +504,6 @@ const char* kernel_event_type_to_string(KernelEventType type) {
     case KernelEventType::kResumeRequested: return "resume_requested";
     case KernelEventType::kCompletedAcknowledged: return "acknowledge_completed";
     case KernelEventType::kInterventionAcknowledged: return "acknowledge_intervention";
-    case KernelEventType::kStreamingSessionStarted: return "streaming_session_started";
-    case KernelEventType::kStreamingTargetReceived: return "streaming_target_received";
-    case KernelEventType::kStreamingTargetDispatched: return "streaming_target_dispatched";
-    case KernelEventType::kStreamingTargetRejected: return "streaming_target_rejected";
-    case KernelEventType::kStreamingSessionEnded: return "streaming_session_ended";
     case KernelEventType::kErrorRaised: return "error_raised";
     case KernelEventType::kCollisionDetected: return "collision_detected";
     case KernelEventType::kInterruptSignalIngested: return "interrupt_signal_ingested";
@@ -661,6 +656,51 @@ double finite_scale_from_python(const py::handle& value, const char* field_name)
   return result;
 }
 
+// Parse the optional per_joint_dynamics_limits map (Phase 4-P5.1K) from a
+// request dict into the native DTO. Shape:
+//   {joint_name: {"max_velocity_rad_s": f, "max_acceleration_rad_s2": f,
+//                 "max_jerk_rad_s3": f}}
+// Only present numeric fields are read; each must be finite and strictly
+// positive, otherwise the request fails closed before planning
+// (invalid_joint_dynamics_limit). Jerk is carried through to the backend,
+// which rejects it where the active path cannot enforce it
+// (unsupported_joint_dynamics_limit). An absent/None/empty map preserves
+// prior behavior.
+void parse_per_joint_dynamics_limits(const py::dict& request,
+                                     PerJointDynamicsLimitsDTO& out) {
+  if (!request.contains("per_joint_dynamics_limits")) {
+    return;
+  }
+  auto raw = request["per_joint_dynamics_limits"];
+  if (raw.is_none()) {
+    return;
+  }
+  auto limits = raw.cast<py::dict>();
+  for (auto item : limits) {
+    const std::string joint_name = py::cast<std::string>(item.first);
+    auto entry = item.second.cast<py::dict>();
+    JointDynamicsLimitDTO limit;
+    auto read_positive =
+        [&](const char* key, const char* dim) -> std::optional<double> {
+      if (!entry.contains(key) || entry[key].is_none()) {
+        return std::nullopt;
+      }
+      const double d = entry[key].cast<double>();
+      if (!std::isfinite(d) || d <= 0.0) {
+        throw std::invalid_argument(
+            std::string("per_joint_dynamics_limits['") + joint_name + "']." +
+            key + " (" + dim + ") must be finite and strictly positive");
+      }
+      return d;
+    };
+    limit.max_velocity_rad_s = read_positive("max_velocity_rad_s", "velocity");
+    limit.max_acceleration_rad_s2 =
+        read_positive("max_acceleration_rad_s2", "acceleration");
+    limit.max_jerk_rad_s3 = read_positive("max_jerk_rad_s3", "jerk");
+    out[joint_name] = limit;
+  }
+}
+
 // Helper used by both the motion-scoped scope parser (above) and the
 // kernel-config parser (default_fault_stop_profile /
 // operator_stop_profile). The body mirrors the inline parser in the
@@ -783,34 +823,19 @@ ExecutionKernelConfig kernel_config_from_python(const py::object& config_obj) {
     config.runtime_dynamic_body_max_age_cap_ns =
         static_cast<int64_t>(cap_ns);
   }
-  config.streaming_ik_timeout_s =
-      read_seconds("streaming_ik_timeout_s", "streaming_ik_timeout_ms",
-                   config.streaming_ik_timeout_s);
-  config.streaming_collision_timeout_s =
-      read_seconds("streaming_collision_timeout_s",
-                   "streaming_collision_timeout_ms",
-                   config.streaming_collision_timeout_s);
   config.native_reset_completion_timeout_s =
       read_seconds("native_reset_completion_timeout_s",
                    "native_reset_completion_timeout_ms",
                    config.native_reset_completion_timeout_s);
-  config.native_streaming_stop_completion_timeout_s =
-      read_seconds("native_streaming_stop_completion_timeout_s",
-                   "native_streaming_stop_completion_timeout_ms",
-                   config.native_streaming_stop_completion_timeout_s);
-  if (config.streaming_ik_timeout_s <= 0.0) {
-    throw std::invalid_argument("streaming_ik_timeout_s must be > 0");
-  }
-  if (config.streaming_collision_timeout_s <= 0.0) {
-    throw std::invalid_argument("streaming_collision_timeout_s must be > 0");
-  }
   if (config.native_reset_completion_timeout_s <= 0.0) {
     throw std::invalid_argument(
         "native_reset_completion_timeout_s must be > 0");
   }
-  if (config.native_streaming_stop_completion_timeout_s <= 0.0) {
-    throw std::invalid_argument(
-        "native_streaming_stop_completion_timeout_s must be > 0");
+  config.single_shot_ik_timeout_s =
+      read_seconds("single_shot_ik_timeout_s", "single_shot_ik_timeout_ms",
+                   config.single_shot_ik_timeout_s);
+  if (config.single_shot_ik_timeout_s <= 0.0) {
+    throw std::invalid_argument("single_shot_ik_timeout_s must be > 0");
   }
   // Two optional controlled-stop profiles surfaced to Python so
   // deployment YAML can carry them. Recommended defaults are
@@ -1075,6 +1100,11 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
             }
           }
         }
+
+        // Per-joint dynamics caps (Phase 4-P5.1K). Fail closed on malformed
+        // values before planning; the backend enforces vel/accel and rejects
+        // jerk where it cannot honor it.
+        parse_per_joint_dynamics_limits(request, req.per_joint_dynamics_limits);
 
         // Timeouts
         req.timeouts.planning_timeout_s = request.attr("get")("planning_timeout_s", 5.0).cast<double>();
@@ -1416,6 +1446,11 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
           }
         }
 
+        // Per-joint dynamics caps (Phase 4-P5.1K). Fail closed on malformed
+        // values before planning; the backend enforces vel/accel and rejects
+        // jerk where it cannot honor it.
+        parse_per_joint_dynamics_limits(request, req.per_joint_dynamics_limits);
+
         req.timeouts.planning_timeout_s = request.attr("get")("planning_timeout_s", 5.0).cast<double>();
         req.timeouts.execution_timeout_s = request.attr("get")("execution_timeout_s", 10.0).cast<double>();
 
@@ -1524,6 +1559,7 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
         plan_request.motion = std::move(resolved_motion);
         plan_request.tolerances = req.tolerances;
         plan_request.speed_profile = req.speed_profile;
+        plan_request.per_joint_dynamics_limits = req.per_joint_dynamics_limits;
         plan_request.planning_timeout_s = req.timeouts.planning_timeout_s;
 
         auto plan_result = [&]() {
@@ -1625,6 +1661,11 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
           }
         }
 
+        // Per-joint dynamics caps (Phase 4-P5.1K). Fail closed on malformed
+        // values before planning; the backend enforces vel/accel and rejects
+        // jerk where it cannot honor it.
+        parse_per_joint_dynamics_limits(request, req.per_joint_dynamics_limits);
+
         req.timeouts.planning_timeout_s = request.attr("get")("planning_timeout_s", 5.0).cast<double>();
         req.timeouts.execution_timeout_s = request.attr("get")("execution_timeout_s", 10.0).cast<double>();
 
@@ -1733,6 +1774,7 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
         plan_request.motion = std::move(resolved_motion);
         plan_request.tolerances = req.tolerances;
         plan_request.speed_profile = req.speed_profile;
+        plan_request.per_joint_dynamics_limits = req.per_joint_dynamics_limits;
         plan_request.planning_timeout_s = req.timeouts.planning_timeout_s;
 
         auto plan_result = [&]() {
@@ -1877,206 +1919,10 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
            },
            py::arg("principal_id"),
            py::arg("reason"))
-      // ---- Streaming-session API (ADR-0016) ----
-      .def("begin_streaming_session",
-           [](NativeKernelBundle& self, py::dict config_dict) -> py::dict {
-             StreamingSessionConfigDTO config;
-             auto get_str = [&](const char* key, std::string& dst) {
-               if (config_dict.contains(key) &&
-                   !config_dict[key].is_none()) {
-                 dst = config_dict[key].cast<std::string>();
-               }
-             };
-             auto get_double = [&](const char* key, double& dst) {
-               if (config_dict.contains(key) &&
-                   !config_dict[key].is_none()) {
-                 dst = config_dict[key].cast<double>();
-               }
-             };
-             get_str("group_id", config.group_id);
-             if (config_dict.contains("joint_names") &&
-                 !config_dict["joint_names"].is_none()) {
-               for (const auto& name :
-                    config_dict["joint_names"].cast<py::list>()) {
-                 config.joint_names.push_back(name.cast<std::string>());
-               }
-             }
-             if (config_dict.contains("input_mode") &&
-                 !config_dict["input_mode"].is_none()) {
-               const auto mode_str =
-                   config_dict["input_mode"].cast<std::string>();
-               config.default_input_mode =
-                   (mode_str == "cartesian")
-                       ? StreamingInputMode::kCartesian
-                       : StreamingInputMode::kJoint;
-             }
-             get_str("cartesian_reference_frame",
-                     config.cartesian_reference_frame);
-             get_str("tcp_frame", config.tcp_frame);
-             if (config_dict.contains("soft_stop_strategy") &&
-                 !config_dict["soft_stop_strategy"].is_none()) {
-               const auto strat_str =
-                   config_dict["soft_stop_strategy"].cast<std::string>();
-               config.default_soft_stop_strategy =
-                   (strat_str == "velocity_scaling")
-                       ? SoftStopStrategy::kVelocityScaling
-                       : SoftStopStrategy::kSpringBack;
-             }
-             get_double("soft_stop_deceleration_time_s",
-                        config.soft_stop_deceleration_time_s);
-             get_double("anchor_negative_time_s",
-                        config.anchor_negative_time_s);
-             get_double("target_time_from_start_min_s",
-                        config.target_time_from_start_min_s);
-             get_double("max_dispatch_rate_hz", config.max_dispatch_rate_hz);
-             get_double("target_max_age_s", config.target_max_age_s);
-             get_double("velocity_scale", config.velocity_scale);
-             get_double("max_tcp_linear_speed_mps",
-                        config.max_tcp_linear_speed_mps);
-             // Per-joint streaming caps (parallel to joint_names),
-             // spec/430 §3.2 streaming-joint-limits + ADR-0016.
-             // Sized to match joint_names; zero entries fall back to
-             // engine defaults at the backend (0.5 rad/s, 2.0 rad/s²).
-             if (config_dict.contains("per_joint_velocity_caps_rad_s")
-                 && !config_dict["per_joint_velocity_caps_rad_s"].is_none()) {
-               for (const auto& v : config_dict["per_joint_velocity_caps_rad_s"]
-                                        .cast<py::list>()) {
-                 config.per_joint_velocity_caps_rad_s.push_back(v.cast<double>());
-               }
-             }
-             if (config_dict.contains("per_joint_acceleration_caps_rad_s2")
-                 && !config_dict["per_joint_acceleration_caps_rad_s2"].is_none()) {
-               for (const auto& v :
-                    config_dict["per_joint_acceleration_caps_rad_s2"]
-                        .cast<py::list>()) {
-                 config.per_joint_acceleration_caps_rad_s2.push_back(
-                     v.cast<double>());
-               }
-             }
-             get_str("principal_id", config.principal_id);
-             get_str("authority_source", config.authority_source);
-             get_str("trigger_reason", config.trigger_reason);
-
-             auto r = [&]() {
-               py::gil_scoped_release release;
-               return self.kernel->begin_streaming_session(config);
-             }();
-             py::dict d;
-             d["accepted"] = r.accepted;
-             d["session_id"] = r.session_id;
-             if (r.error.has_value()) {
-               d["error"] = r.error->message;
-               d["error_code"] = r.error->code;
-               d["error_details"] =
-                   error_details_to_python(r.error->details);
-             } else {
-               d["error_code"] = py::none();
-               d["error_details"] = py::dict();
-             }
-             return d;
-           })
-      .def("push_streaming_target",
-           [](NativeKernelBundle& self,
-              uint64_t session_id,
-              py::dict target_dict) -> py::dict {
-             StreamingTargetDTO target;
-             if (target_dict.contains("kind") &&
-                 !target_dict["kind"].is_none()) {
-               const auto kind_str = target_dict["kind"].cast<std::string>();
-               target.kind = (kind_str == "cartesian")
-                                 ? StreamingInputMode::kCartesian
-                                 : StreamingInputMode::kJoint;
-             }
-             if (target_dict.contains("position_m") &&
-                 !target_dict["position_m"].is_none()) {
-               const auto pos = target_dict["position_m"].cast<py::list>();
-               if (pos.size() == 3) {
-                 for (size_t i = 0; i < 3; ++i) {
-                   target.position_m[i] = pos[i].cast<double>();
-                 }
-               }
-             }
-             if (target_dict.contains("orientation_xyzw") &&
-                 !target_dict["orientation_xyzw"].is_none()) {
-               const auto q = target_dict["orientation_xyzw"]
-                                  .cast<py::list>();
-               if (q.size() == 4) {
-                 for (size_t i = 0; i < 4; ++i) {
-                   target.orientation_xyzw[i] = q[i].cast<double>();
-                 }
-               }
-             }
-             if (target_dict.contains("joint_names") &&
-                 !target_dict["joint_names"].is_none()) {
-               for (const auto& name :
-                    target_dict["joint_names"].cast<py::list>()) {
-                 target.joint_names.push_back(name.cast<std::string>());
-               }
-             }
-             if (target_dict.contains("joint_positions_rad") &&
-                 !target_dict["joint_positions_rad"].is_none()) {
-               for (const auto& v :
-                    target_dict["joint_positions_rad"].cast<py::list>()) {
-                 target.joint_positions_rad.push_back(v.cast<double>());
-               }
-             }
-             if (target_dict.contains("source_timestamp_ns") &&
-                 !target_dict["source_timestamp_ns"].is_none()) {
-               target.source_timestamp_ns =
-                   target_dict["source_timestamp_ns"].cast<int64_t>();
-             }
-             if (target_dict.contains("source_sequence") &&
-                 !target_dict["source_sequence"].is_none()) {
-               target.source_sequence =
-                   target_dict["source_sequence"].cast<uint64_t>();
-             }
-             if (target_dict.contains("min_time_from_start_s") &&
-                 !target_dict["min_time_from_start_s"].is_none()) {
-               target.min_time_from_start_s =
-                   target_dict["min_time_from_start_s"].cast<double>();
-             }
-
-             auto r = [&]() {
-               py::gil_scoped_release release;
-               return self.kernel->push_streaming_target(session_id, target);
-             }();
-             py::dict d;
-             d["accepted"] = r.accepted;
-             d["backend_sequence"] = r.backend_sequence;
-             if (r.error.has_value()) {
-               d["error"] = r.error->message;
-               d["error_code"] = r.error->code;
-               d["error_details"] =
-                   error_details_to_python(r.error->details);
-             } else {
-               d["error_code"] = py::none();
-               d["error_details"] = py::dict();
-             }
-             return d;
-           })
-      .def("end_streaming_session",
-           [](NativeKernelBundle& self,
-              uint64_t session_id,
-              const std::string& strategy_str) -> py::dict {
-             const SoftStopStrategy strategy =
-                 (strategy_str == "velocity_scaling")
-                     ? SoftStopStrategy::kVelocityScaling
-                     : SoftStopStrategy::kSpringBack;
-             auto r = [&]() {
-               py::gil_scoped_release release;
-               return self.kernel->end_streaming_session(session_id, strategy);
-             }();
-             return command_result(r.accepted, r.error);
-           })
       .def("set_runtime_velocity_scale",
            [](NativeKernelBundle& self, double scale) {
              py::gil_scoped_release release;
              self.kernel->set_runtime_velocity_scale(scale);
-           })
-      .def("set_streaming_velocity_scale",
-           [](NativeKernelBundle& self, double scale) {
-             py::gil_scoped_release release;
-             self.kernel->set_streaming_velocity_scale(scale);
            })
       .def("get_status", [](NativeKernelBundle& self) -> py::dict {
         const auto status = [&]() {
@@ -2097,7 +1943,25 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
           py::gil_scoped_release release;
           return self.kernel->get_metrics();
         }();
-        return metrics_to_python(metrics);
+        auto out = metrics_to_python(metrics);
+        if (auto* native_execution =
+                dynamic_cast<RoboPlanExecutionBackend*>(self.execution.get())) {
+          const auto projection_metrics = [&]() {
+            py::gil_scoped_release release;
+            return native_execution->scene_projection_metrics();
+          }();
+          out["scene_projection_misses_total"] =
+              projection_metrics.misses_total;
+          out["scene_projection_successful_updates_total"] =
+              projection_metrics.successful_updates_total;
+          out["scene_projection_lag_max_ns"] =
+              projection_metrics.lag_max_ns;
+          out["scene_projection_last_success_timestamp_ns"] =
+              projection_metrics.last_success_timestamp_ns;
+          out["scene_projection_last_success_age_ns"] =
+              projection_metrics.last_success_age_ns;
+        }
+        return out;
       })
 #ifdef MANYFORGE_ROS2_CONTROL_ENABLED
       .def("configure_ros_gripper_action",
@@ -2650,8 +2514,9 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
         }
         return result;
       })
-      // Compute all link poses at a hypothetical robot configuration,
-      // for the Composer Move-To "ghost robot" preview (ADR-0016 §UX).
+      // Compute all link poses at a hypothetical robot configuration, for the
+      // Composer Move-To / validated Robot Control candidate "ghost robot"
+      // preview (no-motion authoring).
       // Stateless w.r.t. the live scene: builds a RobotStateDTO from the
       // caller's joint vector (or IK result), then calls FK per link.
       // For kind=="cartesian": runs IK first using the supplied tcp_pose

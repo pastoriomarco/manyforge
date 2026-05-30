@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 import hashlib
 import json
+import os
 from pathlib import Path
 import platform
 import re
@@ -664,14 +665,34 @@ def _sha256_path(path: Path | None) -> str | None:
 
 
 def _git_rev_parse(workspace_root: Path) -> str | None:
-    try:
-        completed = subprocess.run(
-            ["git", "-C", str(workspace_root), "rev-parse", "HEAD"],
-            capture_output=True,
-            check=True,
-            text=True,
-        )
-    except Exception:
-        return None
-    value = completed.stdout.strip()
-    return value or None
+    for env_name in ("MANYFORGE_GIT_COMMIT", "GIT_COMMIT"):
+        value = os.environ.get(env_name, "").strip()
+        if re.fullmatch(r"[0-9a-fA-F]{7,40}", value):
+            return value
+
+    commands = [
+        ["git", "-C", str(workspace_root), "rev-parse", "HEAD"],
+        [
+            "git",
+            "-c",
+            f"safe.directory={workspace_root}",
+            "-C",
+            str(workspace_root),
+            "rev-parse",
+            "HEAD",
+        ],
+    ]
+    for command in commands:
+        try:
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                check=True,
+                text=True,
+            )
+        except Exception:
+            continue
+        value = completed.stdout.strip()
+        if value:
+            return value
+    return None

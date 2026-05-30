@@ -228,8 +228,8 @@ class TestDeploymentLoading:
         assert deploy.robot_config.package_paths == []
         assert deploy.robot_config.global_max_tcp_linear_speed_mps == 0.25
 
-    def test_streaming_joint_limits_roundtrip(self):
-        """spec/430 §3.2 — streaming_joint_limits parse + serialize round-trip.
+    def test_robot_control_joint_limits_roundtrip(self):
+        """spec/430 §3.2 — robot_control_joint_limits parse + serialize round-trip.
 
         Regression: serializer used to drop the entire block so
         DeploymentPanel "Save" silently lost per-joint overrides.
@@ -240,7 +240,7 @@ class TestDeploymentLoading:
                 "group_id": "arm",
                 "urdf_path": "package://x/y.urdf",
                 "global_max_tcp_linear_speed_mps": 0.25,
-                "streaming_joint_limits": {
+                "robot_control_joint_limits": {
                     "shoulder_pan_joint": {
                         "max_velocity_rad_s": 0.5,
                         "max_acceleration_rad_s2": 2.0,
@@ -257,19 +257,19 @@ class TestDeploymentLoading:
         try:
             deploy_a = Deployment(path)
             assert (
-                deploy_a.robot_config.streaming_joint_limits[
+                deploy_a.robot_config.robot_control_joint_limits[
                     "shoulder_pan_joint"
                 ].max_velocity_rad_s
                 == 0.5
             )
             assert (
-                deploy_a.robot_config.streaming_joint_limits[
+                deploy_a.robot_config.robot_control_joint_limits[
                     "elbow_joint"
                 ].max_acceleration_rad_s2
                 is None
             )
             assert (
-                deploy_a.robot_config.streaming_joint_limits[
+                deploy_a.robot_config.robot_control_joint_limits[
                     "wrist_1_joint"
                 ].max_velocity_rad_s
                 is None
@@ -279,8 +279,8 @@ class TestDeploymentLoading:
             path_b = _write_deployment(serialized)
             try:
                 deploy_b = Deployment(path_b)
-                limits_a = deploy_a.robot_config.streaming_joint_limits
-                limits_b = deploy_b.robot_config.streaming_joint_limits
+                limits_a = deploy_a.robot_config.robot_control_joint_limits
+                limits_b = deploy_b.robot_config.robot_control_joint_limits
                 assert set(limits_a.keys()) == set(limits_b.keys())
                 for joint, a in limits_a.items():
                     b = limits_b[joint]
@@ -293,17 +293,17 @@ class TestDeploymentLoading:
         finally:
             os.unlink(path)
 
-    def test_streaming_joint_limits_empty_block_drops_from_serialize(self):
+    def test_robot_control_joint_limits_empty_block_drops_from_serialize(self):
         """A deployment with no per-joint overrides MUST NOT emit an
-        empty `streaming_joint_limits` block — keeps the YAML minimal
+        empty `robot_control_joint_limits` block — keeps the YAML minimal
         and matches existing deployments that don't use the feature.
         """
         deploy = Deployment(DEPLOYMENT_FIXTURE_PATH)
-        assert deploy.robot_config.streaming_joint_limits == {}
+        assert deploy.robot_config.robot_control_joint_limits == {}
         serialized = deploy.to_dict()
-        assert "streaming_joint_limits" not in serialized["robot_config"]
+        assert "robot_control_joint_limits" not in serialized["robot_config"]
 
-    def test_streaming_joint_limits_against_drivable_joints(self):
+    def test_robot_control_joint_limits_against_drivable_joints(self):
         """spec/430 §3.2 — keys not in the drivable joint set MUST be rejected."""
         data = _minimal_deployment(
             robot_config={
@@ -311,7 +311,7 @@ class TestDeploymentLoading:
                 "group_id": "arm",
                 "urdf_path": "package://x/y.urdf",
                 "global_max_tcp_linear_speed_mps": 0.25,
-                "streaming_joint_limits": {
+                "robot_control_joint_limits": {
                     "shoulder_pan_joint": {"max_velocity_rad_s": 0.5},
                     "typo_not_a_joint": {"max_velocity_rad_s": 0.3},
                 },
@@ -321,22 +321,147 @@ class TestDeploymentLoading:
         try:
             deploy = Deployment(path)
             # Valid joint set: validate OK
-            deploy.robot_config.streaming_joint_limits.pop("typo_not_a_joint")
-            deploy.validate_streaming_joint_limits_against(
+            deploy.robot_config.robot_control_joint_limits.pop("typo_not_a_joint")
+            deploy.validate_robot_control_joint_limits_against(
                 ["shoulder_pan_joint", "elbow_joint"]
             )
             # Reintroduce typo: validate rejects
-            from manyforge_behavior.deployment import StreamingJointLimit
-            deploy.robot_config.streaming_joint_limits["typo_not_a_joint"] = (
-                StreamingJointLimit(max_velocity_rad_s=0.3)
+            from manyforge_behavior.deployment import RobotControlJointLimit
+            deploy.robot_config.robot_control_joint_limits["typo_not_a_joint"] = (
+                RobotControlJointLimit(max_velocity_rad_s=0.3)
             )
             with pytest.raises(DeploymentValidationError) as exc:
-                deploy.validate_streaming_joint_limits_against(
+                deploy.validate_robot_control_joint_limits_against(
                     ["shoulder_pan_joint", "elbow_joint"]
                 )
             assert "typo_not_a_joint" in str(exc.value)
         finally:
             os.unlink(path)
+
+    def test_legacy_streaming_joint_limits_key_is_rejected(self):
+        """Clean break: the removed `streaming_joint_limits` key MUST fail loud
+        at load time, never silently drop the operator's per-joint caps."""
+        data = _minimal_deployment(
+            robot_config={
+                "robot_id": "ur5",
+                "group_id": "arm",
+                "urdf_path": "package://x/y.urdf",
+                "global_max_tcp_linear_speed_mps": 0.25,
+                "streaming_joint_limits": {
+                    "shoulder_pan_joint": {"max_velocity_rad_s": 0.5},
+                },
+            }
+        )
+        path = _write_deployment(data)
+        try:
+            with pytest.raises(DeploymentValidationError) as exc:
+                Deployment(path)
+            message = str(exc.value)
+            assert "streaming_joint_limits" in message
+            assert "robot_control_joint_limits" in message
+        finally:
+            os.unlink(path)
+
+    def test_robot_control_joint_limits_jerk_roundtrip(self):
+        """Phase 4-P5.1K — max_jerk_rad_s3 parses and survives the serialize
+        round-trip alongside velocity/acceleration, and a jerk-only entry keeps
+        velocity/acceleration as None (empty fields stay optional)."""
+        data = _minimal_deployment(
+            robot_config={
+                "robot_id": "ur5",
+                "group_id": "arm",
+                "urdf_path": "package://x/y.urdf",
+                "global_max_tcp_linear_speed_mps": 0.25,
+                "robot_control_joint_limits": {
+                    "shoulder_pan_joint": {
+                        "max_velocity_rad_s": 0.5,
+                        "max_acceleration_rad_s2": 2.0,
+                        "max_jerk_rad_s3": 10.0,
+                    },
+                    # Jerk-only entry: velocity/acceleration must remain None.
+                    "elbow_joint": {"max_jerk_rad_s3": 7.5},
+                },
+            }
+        )
+        path = _write_deployment(data)
+        try:
+            deploy = Deployment(path)
+            limits = deploy.robot_config.robot_control_joint_limits
+            assert limits["shoulder_pan_joint"].max_jerk_rad_s3 == 10.0
+            assert limits["elbow_joint"].max_jerk_rad_s3 == 7.5
+            assert limits["elbow_joint"].max_velocity_rad_s is None
+            assert limits["elbow_joint"].max_acceleration_rad_s2 is None
+            # Serialize emits jerk and a reload preserves it.
+            serialized = deploy.to_dict()
+            assert (
+                serialized["robot_config"]["robot_control_joint_limits"][
+                    "shoulder_pan_joint"
+                ]["max_jerk_rad_s3"]
+                == 10.0
+            )
+            path_b = _write_deployment(serialized)
+            try:
+                deploy_b = Deployment(path_b)
+                assert (
+                    deploy_b.robot_config.robot_control_joint_limits[
+                        "elbow_joint"
+                    ].max_jerk_rad_s3
+                    == 7.5
+                )
+            finally:
+                os.unlink(path_b)
+        finally:
+            os.unlink(path)
+
+    def test_robot_control_joint_limits_reject_non_finite_or_nonpositive(self):
+        """Phase 4-P5.1K fail-closed: every per-joint dynamics cap (velocity,
+        acceleration, jerk) must be a finite, strictly-positive number. NaN, inf,
+        zero, and negative values are rejected at load; non-numeric values too."""
+        for dim in (
+            "max_velocity_rad_s",
+            "max_acceleration_rad_s2",
+            "max_jerk_rad_s3",
+        ):
+            for bad in (0.0, -1.0, float("inf"), float("nan")):
+                data = _minimal_deployment(
+                    robot_config={
+                        "robot_id": "ur5",
+                        "group_id": "arm",
+                        "urdf_path": "package://x/y.urdf",
+                        "global_max_tcp_linear_speed_mps": 0.25,
+                        "robot_control_joint_limits": {
+                            "shoulder_pan_joint": {dim: bad},
+                        },
+                    }
+                )
+                path = _write_deployment(data)
+                try:
+                    with pytest.raises(DeploymentValidationError) as exc:
+                        Deployment(path)
+                    msg = str(exc.value)
+                    assert dim in msg
+                    assert "finite number > 0" in msg
+                finally:
+                    os.unlink(path)
+            # Non-numeric value → distinct "must be a number" rejection.
+            data = _minimal_deployment(
+                robot_config={
+                    "robot_id": "ur5",
+                    "group_id": "arm",
+                    "urdf_path": "package://x/y.urdf",
+                    "global_max_tcp_linear_speed_mps": 0.25,
+                    "robot_control_joint_limits": {
+                        "shoulder_pan_joint": {dim: "fast"},
+                    },
+                }
+            )
+            path = _write_deployment(data)
+            try:
+                with pytest.raises(DeploymentValidationError) as exc:
+                    Deployment(path)
+                assert "must be a number" in str(exc.value)
+            finally:
+                os.unlink(path)
 
     def test_robot_config_package_paths_parsed(self):
         data = _minimal_deployment(

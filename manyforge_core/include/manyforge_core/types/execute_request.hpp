@@ -5,6 +5,7 @@
 
 #include <manyforge_core/types/tolerances.hpp>
 #include <manyforge_core/types/speed_profile.hpp>
+#include <manyforge_core/types/joint_dynamics_limits.hpp>
 #include <manyforge_core/types/timeouts.hpp>
 #include <manyforge_core/types/execution_status.hpp>
 #include <manyforge_core/types/motion_spec.hpp>
@@ -31,6 +32,10 @@ struct ExecuteRequestDTO {
   /// backend dispatch, then auto-reaps on any terminal execution
   /// state. Empty preserves free-move semantics.
   std::vector<MotionInterruptScopeDTO> motion_interrupt_scopes;
+  /// Per-joint absolute dynamics caps (Phase 4-P5.1K). Empty preserves prior
+  /// behavior. Resolved against model/backend/controller limits and enforced in
+  /// time-parameterization; copied into the PlanRequestDTO by the kernel.
+  PerJointDynamicsLimitsDTO per_joint_dynamics_limits;
 };
 
 }  // namespace manyforge::core

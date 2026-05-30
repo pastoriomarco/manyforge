@@ -39,7 +39,6 @@ enum class InterruptPreemptionAction {
   kCancelPlanning,
   kCancelValidation,
   kPreemptTrajectory,
-  kPreemptStreaming,
   kLatchHeld,
   kLatchFaulted,
   /// Move-scoped non-fault completion (spec/260 §5.6). Reserved for
@@ -138,14 +137,12 @@ enum class InterruptPolicyScopeKind {
 /// Spec/260 §2.2.
 enum class InterruptPolicyScopeExpiry {
   kExecutionTerminal,
-  kStreamingSessionTerminal,
 };
 
 enum class InterruptExecutionPhase {
   kPlanning,
   kValidation,
   kTrajectoryExecution,
-  kStreaming,
   kPaused,
   kHeld,
   kRecovery,
@@ -290,7 +287,6 @@ struct InterruptLatch {
       InterruptExecutionPhase::kPlanning;
   std::optional<std::uint64_t> active_execution_id;
   std::optional<std::string> active_move_id;
-  std::optional<std::uint64_t> active_streaming_session_id;
   InterruptSignalUpdate signal_snapshot;
   InterruptPreemptionAction preemption_action_requested =
       InterruptPreemptionAction::kLatchHeld;
@@ -320,7 +316,6 @@ inline const char* to_string(InterruptExecutionPhase phase) {
     case kPlanning: return "planning";
     case kValidation: return "validation";
     case kTrajectoryExecution: return "trajectory_execution";
-    case kStreaming: return "streaming";
     case kPaused: return "paused";
     case kHeld: return "held";
     case kRecovery: return "recovery";
@@ -335,7 +330,6 @@ inline std::optional<InterruptExecutionPhase> interrupt_phase_from_state(
     case kPlanning: return InterruptExecutionPhase::kPlanning;
     case kValidating: return InterruptExecutionPhase::kValidation;
     case kExecuting: return InterruptExecutionPhase::kTrajectoryExecution;
-    case kStreaming: return InterruptExecutionPhase::kStreaming;
     case kPaused: return InterruptExecutionPhase::kPaused;
     case kInterrupted: return InterruptExecutionPhase::kHeld;
     case kInterventionRequired: return InterruptExecutionPhase::kHeld;

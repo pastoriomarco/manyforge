@@ -506,14 +506,17 @@ class LoadDeploymentRequest(BaseModel):
     path: str
 
 
-class StreamingJointLimitResponse(BaseModel):
-    """Per-joint streaming caps (ADR-0016, spec/430 §3.2)."""
+class RobotControlJointLimitResponse(BaseModel):
+    """Per-joint validated Robot Control operator caps (spec/430 §3.2)."""
 
     model_config = _ALIAS_CFG
     max_velocity_rad_s: Optional[float] = Field(default=None, alias="maxVelocityRadS")
     max_acceleration_rad_s2: Optional[float] = Field(
         default=None, alias="maxAccelerationRadS2"
     )
+    # Phase 4-P5.1K: per-joint jerk cap carried through end-to-end. Surfaced so a
+    # loaded deployment's configured jerk is not hidden or dropped on round-trip.
+    max_jerk_rad_s3: Optional[float] = Field(default=None, alias="maxJerkRadS3")
 
 
 class RobotConfigResponse(BaseModel):
@@ -524,10 +527,10 @@ class RobotConfigResponse(BaseModel):
     srdf_path: str = Field(default="", alias="srdfPath")
     package_paths: List[str] = Field(default_factory=list, alias="packagePaths")
     global_max_tcp_linear_speed_mps: float = Field(alias="globalMaxTcpLinearSpeedMps")
-    # Per-joint streaming caps keyed by joint name. Empty mapping = all
-    # joints use engine defaults (0.5 rad/s, 2.0 rad/s²).
-    streaming_joint_limits: Dict[str, StreamingJointLimitResponse] = Field(
-        default_factory=dict, alias="streamingJointLimits"
+    # Per-joint validated Robot Control operator caps keyed by joint name.
+    # Empty mapping = all joints use engine defaults (0.5 rad/s, 2.0 rad/s²).
+    robot_control_joint_limits: Dict[str, RobotControlJointLimitResponse] = Field(
+        default_factory=dict, alias="robotControlJointLimits"
     )
 
 

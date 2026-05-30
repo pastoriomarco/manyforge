@@ -351,14 +351,10 @@ def _kernel_config_from_deployment(
     execution = deployment.adapters.get("execution") if deployment is not None else None
     execution_config = dict(execution.config or {}) if execution is not None else {}
     for key in (
-        "streaming_ik_timeout_s",
-        "streaming_ik_timeout_ms",
-        "streaming_collision_timeout_s",
-        "streaming_collision_timeout_ms",
         "native_reset_completion_timeout_s",
         "native_reset_completion_timeout_ms",
-        "native_streaming_stop_completion_timeout_s",
-        "native_streaming_stop_completion_timeout_ms",
+        "single_shot_ik_timeout_s",
+        "single_shot_ik_timeout_ms",
     ):
         if key in execution_config:
             config[key] = execution_config[key]

@@ -10,11 +10,10 @@
 
 namespace manyforge::core {
 
-/// Single-shot IK request used by the streaming-session execution mode
-/// (ADR-0016). The kernel calls this to resolve cartesian streaming
-/// targets to joint targets before forwarding to the execution backend.
-/// Distinct from full plan() to avoid the planning ramp + collision-search
-/// budget on every streamed frame.
+/// Single-shot IK request: resolve a Cartesian target pose to a joint target
+/// without running a full plan(). Distinct from plan() to avoid the planning
+/// ramp + collision-search budget; used by validated Robot Control candidate
+/// Cartesian authoring.
 struct IkRequestDTO {
     /// TCP pose-in-base to solve for.
     Pose3DTO goal_pose;
@@ -26,8 +25,8 @@ struct IkRequestDTO {
     /// Empty seed falls back to the planner backend's current state.
     RobotStateDTO seed_state;
     /// Optional caller budget for this IK request. A value <= 0 means the
-    /// backend default applies. Streaming callers set this to the direct
-    /// control budget so a slow IK attempt cannot stall the operator loop.
+    /// backend default applies. Interactive callers set this to a small budget
+    /// so a slow IK attempt cannot stall the operator loop.
     double timeout_s = 0.0;
 };
 
@@ -46,8 +45,7 @@ struct IkResultDTO {
 ///
 /// Responsibilities:
 /// - Plan motions from a PlanRequestDTO and return a time-parameterized TrajectoryDTO
-/// - Resolve single-shot IK queries (no planning, no trajectory shaping) for the
-///   streaming-session execution mode (ADR-0016)
+/// - Resolve single-shot IK queries (no planning, no trajectory shaping)
 /// - Planner-specific knobs live in deployment configuration, not in the program artifact
 ///
 /// Threading:
@@ -64,10 +62,10 @@ class IPlannerBackend {
     /// @return PlanResultDTO containing the trajectory or error
     virtual PlanResultDTO plan(const PlanRequestDTO& request) = 0;
 
-    /// Single-shot IK for streaming-session cartesian-target resolution
-    /// (ADR-0016). Returns a joint target matching the requested pose, or
-    /// an IK error if no solution is reachable. Does NOT plan a trajectory,
-    /// run collision checks, or honor planner ramps.
+    /// Single-shot IK for Cartesian-target resolution. Returns a joint target
+    /// matching the requested pose, or an IK error if no solution is
+    /// reachable. Does NOT plan a trajectory, run collision checks, or honor
+    /// planner ramps.
     ///
     /// Default implementation returns unsupported_capability so existing
     /// planner backends without IK keep building; backends that wrap a real

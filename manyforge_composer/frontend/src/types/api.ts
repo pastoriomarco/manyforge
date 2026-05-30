@@ -400,9 +400,13 @@ export interface AuthorityDomainConfig {
   description: string;
 }
 
-export interface StreamingJointLimit {
+export interface RobotControlJointLimit {
   maxVelocityRadS?: number | null;
   maxAccelerationRadS2?: number | null;
+  // Phase 4-P5.1K: per-joint jerk cap. Carried so a loaded deployment's jerk is
+  // preserved on edit/round-trip; the discrete planner rejects it as
+  // unsupported, but the value must not be silently dropped here.
+  maxJerkRadS3?: number | null;
 }
 
 export type PoseSourceKind =
@@ -448,8 +452,8 @@ export interface RobotConfig {
   srdfPath: string;
   packagePaths: string[];
   globalMaxTcpLinearSpeedMps: number;
-  /** Per-joint streaming caps (ADR-0016). Empty = all joints use engine defaults. */
-  streamingJointLimits?: Record<string, StreamingJointLimit>;
+  /** Per-joint validated Robot Control operator caps. Empty = all joints use engine defaults. */
+  robotControlJointLimits?: Record<string, RobotControlJointLimit>;
 }
 
 // One link in the gripper subtree, posed relative to the gripper
@@ -986,4 +990,172 @@ export interface StateUpdate {
   programLoaded?: boolean;
   programSessionGeneration?: number;
   timestamp: number;
+}
+
+// --- Validated Robot Control candidates (Phase 4-P5) ----------------------
+
+export type CandidateStatus =
+  | 'planning'
+  | 'ready'
+  | 'blocked'
+  | 'stale'
+  | 'superseded'
+  | 'expired'
+  | 'approving'
+  | 'executing'
+  | 'completed'
+  | 'stopped'
+  | 'interrupted'
+  | 'failed'
+  | 'reverted'
+  | 'error';
+
+export type CandidateSourceSurface =
+  | 'joint_slider'
+  | 'joint_spinner'
+  | 'joint_input'
+  | 'cartesian_gizmo'
+  | 'cartesian_input'
+  | 'move_to'
+  | 'gripper_slider'
+  | 'gripper_preset';
+
+export type CandidateInputMode = 'joint' | 'cartesian' | 'gripper';
+
+export interface CandidatePose {
+  positionM: number[];
+  orientationXyzw: number[];
+}
+
+export interface CandidateJointTarget {
+  jointNames: string[];
+  positionsRad: number[];
+}
+
+export interface CandidateCartesianTarget {
+  positionM: number[];
+  orientationXyzw: number[];
+  frameId?: string;
+  tcpFrame?: string | null;
+}
+
+export interface CandidateGripperTarget {
+  gripperId: string;
+  targetPosition: number;
+  maxEffort?: number | null;
+  durationS?: number | null;
+}
+
+export interface CandidateDiagnostics {
+  reasonCode: string;
+  summary: string;
+  details?: Record<string, unknown>;
+}
+
+export interface CandidateRobotState {
+  jointNames: string[];
+  positionsRad: number[];
+}
+
+export interface CandidateGhost {
+  blocked: boolean;
+  finalJointNames?: string[] | null;
+  finalJointPositionsRad?: number[] | null;
+  finalTcpPose?: CandidatePose | null;
+  linkPoses?: Record<string, CandidatePose> | null;
+  blockedTargetPose?: CandidatePose | null;
+}
+
+export interface CandidateTrajectorySample {
+  timeFromStartS: number;
+  positionsRad: number[];
+}
+
+export interface CandidatePreviewTrajectory {
+  jointNames: string[];
+  samples: CandidateTrajectorySample[];
+  sampleCount: number;
+  timeSpanS: number;
+}
+
+export interface CandidateSourceRevisions {
+  stateSource: string;
+  robotStateKnown: boolean;
+  programLoaded: boolean;
+  deploymentLoaded: boolean;
+  // Scene/attached-object freshness signal (see backend CandidateSourceRevisions).
+  // sceneFingerprint is opaque — compare only, never parse.
+  sceneObjectCount: number;
+  sceneFingerprint: string;
+}
+
+export interface CandidateExecution {
+  moveId?: string | null;
+  executionId: number;
+  state?: string | null;
+  progress: number;
+  sessionId?: string | null;
+  sessionStatus?: string | null;
+  sessionActualOutcome?: string | null;
+  sessionError?: string | null;
+  error?: string | null;
+  errorCode?: string | null;
+  errorDetails?: Record<string, unknown> | null;
+}
+
+export interface CandidateResponse {
+  candidateId: string;
+  generation: number;
+  sourceSurface: CandidateSourceSurface;
+  inputMode: CandidateInputMode;
+  status: CandidateStatus;
+  commitEligible: boolean;
+  jointTarget?: CandidateJointTarget | null;
+  cartesianTarget?: CandidateCartesianTarget | null;
+  gripperTarget?: CandidateGripperTarget | null;
+  normalizedJointTarget?: CandidateJointTarget | null;
+  clientRequestId?: string | null;
+  diagnostics?: CandidateDiagnostics | null;
+  startState?: CandidateRobotState | null;
+  sourceRevisions?: CandidateSourceRevisions | null;
+  ghost?: CandidateGhost | null;
+  previewTrajectory?: CandidatePreviewTrajectory | null;
+  execution?: CandidateExecution | null;
+  trajectoryDurationS?: number | null;
+  maxAgeNs: number;
+  expiresAtNs: number;
+  createdAtNs: number;
+  updatedAtNs: number;
+}
+
+export interface CandidateCreateRequest {
+  clientRequestId?: string;
+  sourceSurface: CandidateSourceSurface;
+  inputMode: CandidateInputMode;
+  jointTarget?: CandidateJointTarget;
+  cartesianTarget?: CandidateCartesianTarget;
+  gripperTarget?: CandidateGripperTarget;
+}
+
+export interface CandidateSessionSummary {
+  sessionId: string;
+  status: string;
+  entryState?: string | null;
+  actualOutcome?: string | null;
+  error?: string | null;
+}
+
+export interface CandidateExecuteResponse {
+  candidate: CandidateResponse | null;
+  // Arm candidates dispatch through an intervention session; gripper candidates
+  // dispatch a single command through the bridge and carry no session.
+  session: CandidateSessionSummary | null;
+  timestamp_ns: number;
+}
+
+export interface CandidateExecuteRejection {
+  reasonCode: string;
+  detail: string;
+  candidate: CandidateResponse | null;
+  timestamp_ns: number;
 }

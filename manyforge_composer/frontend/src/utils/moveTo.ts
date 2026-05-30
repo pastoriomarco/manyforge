@@ -1,15 +1,16 @@
 /**
- * Move-To target computation (Robot panel → Move To tab, ADR-0015 + ADR-0016).
+ * Move-To target computation (Robot panel → Move To tab, ADR-0015).
+ * Feeds validated Robot Control candidate / Move-To preview authoring; it
+ * computes a target only and does not move the robot.
  *
  * Resolves a user-picked entity (scene object, named frame, or
  * stored move-node target) and a set of orientation/offset overrides
  * into a concrete cartesian-jog or joint-jog target. Shared between:
- *   - RobotControlPanel's MoveToBody (renders the picker, dispatches Go)
+ *   - RobotControlPanel's MoveToBody (renders picker + authors candidate)
  *   - SceneViewer's MoveToTargetGhost (renders the 3D ghost preview)
  *
  * Both call into the same `computeMoveToTarget` so the preview the
- * operator sees is what gets dispatched on Go — no drift between UI
- * preview and what the kernel actually executes.
+ * operator sees is what the validated candidate can execute on Approve.
  */
 import { Quaternion, Vector3 } from 'three';
 

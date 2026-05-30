@@ -54,7 +54,6 @@ std::string preemption_action_string(InterruptPreemptionAction action) {
     case kCancelPlanning: return "cancel_planning";
     case kCancelValidation: return "cancel_validation";
     case kPreemptTrajectory: return "preempt_trajectory";
-    case kPreemptStreaming: return "preempt_streaming";
     case kLatchHeld: return "latch_held";
     case kLatchFaulted: return "latch_faulted";
     case kCompleteMoveOnSignal: return "complete_move_on_signal";
@@ -1049,7 +1048,6 @@ InterruptLatch InterruptManager::make_latch_locked(
   latch.execution_phase_at_latch = context.phase;
   latch.active_execution_id = context.execution_id;
   latch.active_move_id = context.move_id;
-  latch.active_streaming_session_id = context.streaming_session_id;
   latch.signal_snapshot = update;
   latch.preemption_action_requested = resolved.policy.preemption_action;
   latch.borrowed_collision_world_revision =

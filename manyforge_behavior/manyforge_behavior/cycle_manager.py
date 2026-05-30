@@ -218,8 +218,8 @@ class CycleManager:
 
     Run-side auto-ack (spec/400 §6.6.2): if the kernel is in
     `INTERVENTION_REQUIRED` and the leftover state is provably
-    execution-local (no active streaming, scene/program/deployment
-    edits applied, next motion can pass kernel validation), the cycle
+    execution-local (scene/program/deployment edits applied, next
+    motion can pass kernel validation), the cycle
     manager MAY call `kernel.acknowledge_intervention(...)` on Run.
     Otherwise Run fails closed with a structured reason.
 
@@ -500,9 +500,9 @@ class CycleManager:
         """Pull pending native kernel events into the indexed event buffer.
 
         Normal behavior-tree execution drains native events from the tick loop.
-        Direct surfaces such as the streaming-target WebSocket bypass that loop,
-        so API routes and websocket status broadcasts call this explicit drain
-        before reading the buffered event stream.
+        Direct API surfaces (status routes, websocket status broadcasts) bypass
+        that loop, so they call this explicit drain before reading the buffered
+        event stream.
         """
         return self._drain_kernel_events()
 
@@ -936,16 +936,15 @@ class CycleManager:
         except Exception as exc:  # noqa: BLE001 — propagate as structured reason
             return False, f"kernel_status_unreadable:{type(exc).__name__}"
 
-        # Refuse if a streaming/direct-control session is still active. The
-        # kernel surface for these states cannot be safely overridden by a
-        # supervisory Run; the operator must end/stop them first.
+        # Refuse if the kernel is in a transitional/stopping state that a
+        # supervisory Run cannot safely override; the operator must
+        # end/stop it first.
         active_session_states = (
-            ExecutionState.STREAMING,
             ExecutionState.INTERRUPTED,
             ExecutionState.STOPPING,
         )
         if kernel_status.state in active_session_states:
-            return False, "active_streaming_or_stopping"
+            return False, "active_or_stopping"
 
         # Refuse if the cycle-manager-tracked intervention session is still
         # marked running: that means a direct-control lease still owns
@@ -1198,9 +1197,9 @@ class CycleManager:
         Rejects NaN and infinity — these would propagate to the robot.
 
         ADR-0018: also forward the new scale to the kernel/backend runtime
-        register. Discrete trajectories and streaming sessions read that
-        register while they are in flight, so the operator slider retimes the
-        current motion without stopping or re-dispatching behavior-tree nodes.
+        register. Discrete trajectories read that register while they are in
+        flight, so the operator slider retimes the current motion without
+        stopping or re-dispatching behavior-tree nodes.
         """
         import math
 

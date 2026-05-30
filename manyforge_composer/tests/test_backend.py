@@ -997,12 +997,12 @@ def test_load_program_with_force_discard_overrides(client, tmp_path):
     assert status["activeCount"] == 0
 
 
-def test_load_program_validates_streaming_joint_limits(client, tmp_path):
+def test_load_program_validates_robot_control_joint_limits(client, tmp_path):
     deployment_data = yaml.safe_load(Path(_DEPLOYMENT_PATH).read_text(encoding="utf-8"))
-    deployment_data["robot_config"]["streaming_joint_limits"] = {
+    deployment_data["robot_config"]["robot_control_joint_limits"] = {
         "typo_not_a_joint": {"max_velocity_rad_s": 0.2}
     }
-    deployment_path = tmp_path / "invalid_streaming_limits.deployment.yaml"
+    deployment_path = tmp_path / "invalid_robot_control_limits.deployment.yaml"
     deployment_path.write_text(yaml.safe_dump(deployment_data), encoding="utf-8")
 
     response = client.post(
@@ -1011,7 +1011,7 @@ def test_load_program_validates_streaming_joint_limits(client, tmp_path):
     )
 
     assert response.status_code == 400
-    assert "streaming_joint_limits references unknown" in response.json()["detail"]
+    assert "robot_control_joint_limits references unknown" in response.json()["detail"]
     assert "typo_not_a_joint" in response.json()["detail"]
 
 
@@ -1425,6 +1425,48 @@ def test_load_deployment(client, state):
     assert "description" in data
     assert "programProfile" in data
     assert "robotConfig" in data
+
+
+def test_get_deployment_surfaces_per_joint_max_jerk(client, state):
+    """Phase 4-P5.1K — a loaded deployment's per-joint max_jerk_rad_s3 must be
+    surfaced through the Composer deployment API, not hidden or dropped."""
+    from manyforge_behavior.deployment import RobotControlJointLimit
+
+    client.post("/api/deployment/load", json={"path": _DEPLOYMENT_PATH})
+    state.deployment.robot_config.robot_control_joint_limits = {
+        "shoulder_pan_joint": RobotControlJointLimit(
+            max_velocity_rad_s=0.4,
+            max_acceleration_rad_s2=1.5,
+            max_jerk_rad_s3=8.0,
+        )
+    }
+
+    data = client.get("/api/deployment").json()
+    limits = data["robotConfig"]["robotControlJointLimits"]
+    assert "shoulder_pan_joint" in limits
+    assert limits["shoulder_pan_joint"]["maxVelocityRadS"] == 0.4
+    assert limits["shoulder_pan_joint"]["maxAccelerationRadS2"] == 1.5
+    assert limits["shoulder_pan_joint"]["maxJerkRadS3"] == 8.0
+
+
+def test_save_deployment_round_trips_per_joint_max_jerk(client, state, tmp_path):
+    """Phase 4-P5.1K — saving a deployment with a per-joint jerk cap writes it to
+    YAML so it survives a reload (not dropped on the serialize round-trip)."""
+    import yaml
+    from manyforge_behavior.deployment import RobotControlJointLimit
+
+    client.post("/api/deployment/load", json={"path": _DEPLOYMENT_PATH})
+    state.deployment.robot_config.robot_control_joint_limits = {
+        "shoulder_pan_joint": RobotControlJointLimit(max_jerk_rad_s3=7.5),
+    }
+    target = str(tmp_path / "with_jerk")
+    resp = client.post("/api/deployment/save", json={"path": target})
+    assert resp.status_code == 200
+    saved_path = resp.json()["path"]
+    with open(saved_path) as fh:
+        saved = yaml.safe_load(fh)
+    jl = saved["robot_config"]["robot_control_joint_limits"]["shoulder_pan_joint"]
+    assert jl["max_jerk_rad_s3"] == 7.5
 
 
 def test_get_capabilities_returns_deployment_capability_summary(client):

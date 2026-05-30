@@ -12,9 +12,12 @@ from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import JSONResponse, Response
 
 from manyforge_behavior.cycle_manager import CycleState
-from manyforge_behavior.kernel_client import (
-    GripperCommandRequest,
-    SceneEditRequest,
+from manyforge_behavior.kernel_client import SceneEditRequest
+
+from .gripper_command import (
+    GRIPPER_REASON_BACKEND_UNAVAILABLE,
+    gripper_cycle_busy_detail,
+    validate_gripper_command,
 )
 
 from .models import (
@@ -664,7 +667,13 @@ def _build_visual_state_snapshot_for_publisher(state: ComposerState):
         **_execution_authority_metadata(state),
     )
 
-    grippers = _collect_gripper_states(state, advance_commands=False)
+    # Advance simulated/fallback gripper commands here: this publisher loop is
+    # the only ticker outside the BT `command_gripper` node, so without it a
+    # positive-duration operator gripper command (Robot Control Approve) never
+    # progresses past `executing` — the slider stays disabled and further
+    # candidates are blocked as `gripper_busy`. update_gripper_commands is
+    # idempotent wall-clock progression, safe to call alongside the BT node.
+    grippers = _collect_gripper_states(state, advance_commands=True)
     pose_sources = _pose_sources_payload(state)
 
     try:
@@ -876,46 +885,6 @@ def build_scene_state_payload(state: ComposerState) -> dict[str, Any]:
     )
 
 
-def _gripper_joint_limits(
-    state: ComposerState, joint_name: str
-) -> tuple[Optional[float], Optional[float]]:
-    """Look up a joint's URDF limit pair without re-importing the URDF
-    parser at the top of this module (avoids a circular import)."""
-    try:
-        from .routes_urdf import get_urdf_entry
-    except Exception:
-        return (None, None)
-    entry = get_urdf_entry(state)
-    if entry is None:
-        return (None, None)
-    for joint in entry.joints:
-        if joint.name == joint_name:
-            return (joint.limit_lower, joint.limit_upper)
-    return (None, None)
-
-
-def _direct_gripper_cycle_blocker(state: ComposerState) -> JSONResponse | None:
-    """Reject ad hoc gripper commands while another authority owns execution."""
-    cycle_manager = state.cycle_manager
-    if cycle_manager is None:
-        return None
-    cycle_state = cycle_manager.state
-    if cycle_state in {
-        CycleState.RUNNING,
-        CycleState.DIRECT_CONTROL,
-    }:
-        return JSONResponse(
-            status_code=409,
-            content={
-                "detail": (
-                    "Gripper direct commands are allowed only while the cycle is "
-                    f"idle or stopped; current cycle state is {cycle_state.value}"
-                )
-            },
-        )
-    return None
-
-
 def _advance_gripper_commands(state: ComposerState) -> None:
     kernel = state.kernel
     if kernel is None:
@@ -960,11 +929,11 @@ def _collect_gripper_states(
         logger.debug("gripper limit cache build failed", exc_info=True)
     # Resolve auto-discovered visualization root + tcp→root SE(3)
     # once per scene-state call. Pure read against the URDF cache, so
-    # the cost is one helper call per gripper per poll. ADR-0018 +
-    # ADR-0016 audit-second-pass R-tier note: this powers the
-    # Move-To unreachable-ghost frontend fallback so the operator
-    # always sees a recognizable gripper silhouette at the unreachable
-    # target, regardless of whether tcp_frame is itself a visual link.
+    # the cost is one helper call per gripper per poll. This powers the
+    # Move-To / validated Robot Control candidate unreachable-ghost
+    # frontend fallback so the operator always sees a recognizable
+    # gripper silhouette at the unreachable target, regardless of whether
+    # tcp_frame is itself a visual link.
     try:
         from .routes_urdf import resolve_gripper_visualization
     except Exception:
@@ -1461,90 +1430,32 @@ def create_scene_router(state: ComposerState) -> APIRouter:
         ``motion_time_s``); the operator only specifies the target
         position and optional overrides.
         """
-        deployment = state.deployment
-        if deployment is None:
-            return JSONResponse(
-                status_code=400,
-                content={"detail": "No deployment loaded"},
-            )
-        config = deployment.grippers.get(validated.gripper_id)
-        if config is None:
-            return JSONResponse(
-                status_code=400,
-                content={
-                    "detail": (
-                        f"Gripper '{validated.gripper_id}' is not declared in "
-                        "the active deployment"
-                    )
-                },
-            )
-        if state.kernel is None:
-            return JSONResponse(
-                status_code=503,
-                content={"detail": "Kernel is not attached"},
-            )
-        blocked = _direct_gripper_cycle_blocker(state)
-        if blocked is not None:
-            return blocked
-        target_position = float(validated.target_position)
-        if not math.isfinite(target_position):
-            return JSONResponse(
-                status_code=400,
-                content={"detail": "targetPosition must be finite"},
-            )
-        max_effort = (
-            None if validated.max_effort is None else float(validated.max_effort)
-        )
-        if max_effort is not None and (not math.isfinite(max_effort) or max_effort < 0.0):
-            return JSONResponse(
-                status_code=400,
-                content={"detail": "maxEffort must be finite and >= 0"},
-            )
-        duration_s = (
-            float(config.motion_time_s)
-            if validated.duration_s is None
-            else float(validated.duration_s)
-        )
-        if not math.isfinite(duration_s) or duration_s < 0.0:
-            return JSONResponse(
-                status_code=400,
-                content={"detail": "durationS must be finite and >= 0"},
-            )
-        limit_lower, limit_upper = _gripper_joint_limits(state, config.joint_name)
-        if limit_lower is None or limit_upper is None:
-            return JSONResponse(
-                status_code=400,
-                content={
-                    "detail": (
-                        f"Cannot command gripper '{validated.gripper_id}' because "
-                        f"joint '{config.joint_name}' has no finite URDF limits"
-                    )
-                },
-            )
-        if target_position < float(limit_lower) or target_position > float(limit_upper):
-            return JSONResponse(
-                status_code=400,
-                content={
-                    "detail": (
-                        f"targetPosition {target_position} is outside limits "
-                        f"[{float(limit_lower)}, {float(limit_upper)}] for "
-                        f"gripper joint '{config.joint_name}'"
-                    )
-                },
-            )
-        request = GripperCommandRequest(
+        # Reject ad hoc commands while another authority owns execution, then
+        # validate via the shared helper (same checks the candidate path uses).
+        busy = gripper_cycle_busy_detail(state)
+        if busy is not None:
+            return JSONResponse(status_code=409, content={"detail": busy})
+        validation = validate_gripper_command(
+            state,
             gripper_id=validated.gripper_id,
-            group_id=str(config.group_id),
-            joint_name=str(config.joint_name),
-            target_position=target_position,
-            duration_s=duration_s,
-            max_effort=max_effort,
+            target_position=validated.target_position,
+            max_effort=validated.max_effort,
+            duration_s=validated.duration_s,
         )
-        result = state.kernel.command_gripper(request)
+        if not validation.ok or validation.request is None:
+            status_code = (
+                503
+                if validation.reason_code == GRIPPER_REASON_BACKEND_UNAVAILABLE
+                else 400
+            )
+            return JSONResponse(
+                status_code=status_code, content={"detail": validation.detail}
+            )
+        result = state.kernel.command_gripper(validation.request)
         return SceneGripperCommandApiResponse(
             accepted=bool(result.accepted),
             gripperId=validated.gripper_id,
-            targetPosition=target_position,
+            targetPosition=validation.request.target_position,
             error=(None if result.accepted else (result.error or "rejected")),
             timestampNs=time.monotonic_ns(),
         ).model_dump(by_alias=True)

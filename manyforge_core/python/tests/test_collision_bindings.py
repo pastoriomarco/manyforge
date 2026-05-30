@@ -45,9 +45,6 @@ def test_collision_surface_enum():
         "kObservedRuntimeMonitor",
         "kDiagnosticCompare",
         "kPlannerHint",
-        "kStreamingTargetValidation",
-        "kStreamingPredictedMonitor",
-        "kStreamingObservedMonitor",
     ):
         assert getattr(e, name) is not None
 
@@ -419,7 +416,7 @@ def test_collision_query_round_trip():
     q = manyforge_core_py.CollisionQuery()
     q.query_id = "q-1"
     q.validation_id = "v-7"
-    q.surface = manyforge_core_py.CollisionSurface.kStreamingTargetValidation
+    q.surface = manyforge_core_py.CollisionSurface.kPreExecutionValidation
     rev = manyforge_core_py.CollisionWorldRevision(
         revision_id=3, content_hash="rev-content"
     )
@@ -435,7 +432,7 @@ def test_collision_query_round_trip():
 
     assert q.query_id == "q-1"
     assert q.validation_id == "v-7"
-    assert q.surface == manyforge_core_py.CollisionSurface.kStreamingTargetValidation
+    assert q.surface == manyforge_core_py.CollisionSurface.kPreExecutionValidation
     assert q.collision_world_revision.revision_id == 3
     assert q.collision_world_revision.content_hash == "rev-content"
     assert q.policy_revision == "policy.v0.1"

@@ -236,18 +236,23 @@ else
 fi
 
 if [[ "${MANYFORGE_PHASE4_RUN_LIVE_ISAAC:-0}" == "1" ]]; then
-  if [[ -z "${MANYFORGE_PHASE4_COMPOSER_URL:-}" ]]; then
-    live_isaac_status="failed"
-    echo "MANYFORGE_PHASE4_COMPOSER_URL is required for live Isaac evidence" \
-      >"${OUT_DIR}/live-isaac.log"
-  elif "${REPO_ROOT}/scripts/qualify-phase4-p3-commanded-sim.py" \
-        --base-url "${MANYFORGE_PHASE4_COMPOSER_URL}" \
-        --summary-json "${OUT_DIR}/live-isaac-summary.json" \
-        >"${OUT_DIR}/live-isaac.log" 2>&1; then
-    live_isaac_status="$(json_success_status "${OUT_DIR}/live-isaac-summary.json")"
-  else
-    live_isaac_status="failed"
-  fi
+  # The fresh Phase 4-P3 commanded-sim probe is RETIRED: qualify-phase4-p3-
+  # commanded-sim.py drives the deleted ADR-0016 /ws/follow-target streaming
+  # route, so it can no longer produce fresh evidence. Fail closed and direct
+  # operators to archived P3 evidence. Fresh default Robot Control evidence is
+  # Phase 4-P5 candidate preview/approve/revert, NOT P3 streaming evidence.
+  live_isaac_status="failed"
+  {
+    echo "Fresh Phase 4-P3 commanded-sim qualification is retired."
+    echo "qualify-phase4-p3-commanded-sim.py drives the deleted ADR-0016"
+    echo "/ws/follow-target streaming route and cannot generate fresh evidence."
+    echo
+    echo "Provide ARCHIVED P3 evidence instead:"
+    echo "  MANYFORGE_PHASE4_LIVE_ISAAC_EVIDENCE_JSON=<archived-summary.json>"
+    echo
+    echo "Fresh default Robot Control evidence is Phase 4-P5 candidate"
+    echo "preview/approve/revert evidence, not P3 streaming evidence."
+  } >"${OUT_DIR}/live-isaac.log"
 elif [[ -n "${MANYFORGE_PHASE4_LIVE_ISAAC_EVIDENCE_JSON:-}" ]]; then
   copy_evidence_json "${MANYFORGE_PHASE4_LIVE_ISAAC_EVIDENCE_JSON}" \
     "${OUT_DIR}/live-isaac-summary.json"

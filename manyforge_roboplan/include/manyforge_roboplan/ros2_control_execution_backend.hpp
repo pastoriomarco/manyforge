@@ -125,41 +125,8 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
   compute_motion_interrupt_stop_capability(
       const Ros2ControlExecutionBackendConfig& config);
 
-  // Streaming-session mode (ADR-0016).
-  //
-  // v0.1 ros2_control semantics:
-  //   - Joint-mode targets are first-class: each push builds an anchored
-  //     two-point FollowJointTrajectory (anchor at observed state with
-  //     negative time_from_start, target at the requested joint vector
-  //     with positive time_from_start computed from joint-velocity
-  //     limits). Latest-wins coalescing happens at the streaming worker.
-  //     The negative-time anchor gives JTC's spline a continuous starting
-  //     condition, so successive preempts produce smooth motion (no
-  //     velocity discontinuity at the goal-replacement seam).
-  //   - Cartesian-mode targets are NOT supported in this revision; the
-  //     IK pre-resolution path is deferred. Cartesian pushes return
-  //     unsupported_capability. Operators get Cartesian via the existing
-  //     one-shot /api/direct/cartesian-jog path until IK pre-resolution
-  //     lands; joint sliders are first-class today.
-  //   - Soft stop strategies:
-  //       spring_back  -> final goal: anchor at observed state with
-  //                       negative time_from_start; future point at
-  //                       observed *position* with zero velocity and
-  //                       time_from_start = config.soft_stop_deceleration_time_s.
-  //       velocity_scaling -> NOT YET implemented; falls back to spring_back
-  //                       with a structured warning event. Promoting it to
-  //                       the default requires the qualification matrix in
-  //                       docs/open-points.md.
-  core::StreamingSessionBeginResultDTO begin_streaming_session(
-      const core::StreamingSessionConfigDTO& config) override;
-  core::StreamingPushResultDTO push_streaming_target(
-      uint64_t session_id,
-      const core::StreamingTargetDTO& target) override;
-  core::StreamingSessionEndResultDTO end_streaming_session(
-      uint64_t session_id,
-      core::SoftStopStrategy strategy) override;
   // ADR-0018: per-tick runtime velocity scale for discrete trajectory
-  // monitoring and streaming dispatch.
+  // execution/monitoring.
   void set_runtime_velocity_scale(double scale) override;
 
   void configure_gripper_action(std::string gripper_id,
@@ -366,53 +333,48 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
   mutable std::mutex gripper_map_mutex_;
   std::unordered_map<std::string, std::shared_ptr<GripperRuntime>> grippers_;
 
-  // Streaming-session bookkeeping (ADR-0016).
-  void streaming_dispatch_worker(std::stop_token st);
-  bool streaming_send_anchored_goal(
+  // Managed FollowJointTrajectory preempt/controlled-stop substrate. Used by
+  // the motion-interrupt controlled-stop paths (spring_back_hold /
+  // soft_on_path) to dispatch preempting JTC goals and track their terminal
+  // result.
+  bool send_fjt_anchored_goal(
       const std::vector<std::string>& joint_names,
       const std::vector<double>& target_positions,
       double target_time_from_start_s,
       bool track_terminal_goal = false);
-  bool streaming_send_replacement_trajectory(
+  bool send_fjt_replacement_trajectory(
       const core::TrajectoryDTO& trajectory,
       bool track_terminal_goal = false);
-  bool streaming_send_spring_back_stop();
-  void begin_streaming_path_deviation_tracking(
+  void begin_controlled_stop_path_deviation_tracking(
       const core::TrajectoryDTO& accepted_trajectory,
       double initial_path_deviation_rad);
-  void record_streaming_path_deviation_feedback(
+  void record_controlled_stop_path_deviation_feedback(
       const std::vector<std::string>& joint_names,
       const std::vector<double>& positions);
-  void clear_streaming_path_deviation_tracking();
-  void on_streaming_terminal_result(
+  void clear_controlled_stop_path_deviation_tracking();
+  void on_managed_fjt_terminal_result(
       const GoalHandleFJT::WrappedResult& result);
 
-  mutable std::mutex streaming_mutex_;
-  std::condition_variable streaming_cv_;
-  std::jthread streaming_thread_;
-  std::atomic<bool> streaming_active_{false};
-  uint64_t streaming_session_id_ = 0;
-  uint64_t next_streaming_backend_seq_ = 1;
-  core::StreamingSessionConfigDTO streaming_config_;
-  // ADR-0018: runtime velocity scale read by monitor/dispatcher loops.
+  mutable std::mutex managed_fjt_mutex_;
+  std::condition_variable managed_fjt_cv_;
+  // ADR-0018: runtime velocity scale read by the monitor loop.
   std::atomic<double> runtime_velocity_scale_{1.0};
   std::atomic<double> applied_runtime_velocity_scale_{1.0};
   std::optional<core::TrajectoryDTO> active_trajectory_;
   double active_trajectory_time_s_ = 0.0;
   double active_runtime_velocity_scale_ = 1.0;
-  std::optional<core::StreamingTargetDTO> streaming_target_;
-  // The most-recent goal handle issued by the streaming dispatcher.
-  // Subsequent dispatches preempt it via async_send_goal; the existing
-  // on_action_result callback handles its terminal state.
-  GoalHandleFJT::SharedPtr streaming_active_goal_;
-  std::optional<rclcpp_action::GoalUUID> streaming_terminal_goal_id_;
-  bool streaming_terminal_result_received_ = true;
-  bool streaming_terminal_result_success_ = true;
-  std::optional<core::ErrorDTO> streaming_terminal_error_;
-  std::optional<core::TrajectoryDTO> streaming_path_deviation_reference_;
-  std::optional<double> streaming_path_deviation_max_rad_;
-  std::size_t streaming_path_deviation_feedback_samples_ = 0;
-  std::optional<core::ErrorDTO> streaming_path_deviation_error_;
+  // The most-recent managed FJT goal handle issued by a controlled-stop
+  // preempt. Subsequent dispatches preempt it via async_send_goal; the
+  // on_managed_fjt_terminal_result callback handles its terminal state.
+  GoalHandleFJT::SharedPtr managed_fjt_goal_;
+  std::optional<rclcpp_action::GoalUUID> managed_fjt_terminal_goal_id_;
+  bool managed_fjt_terminal_result_received_ = true;
+  bool managed_fjt_terminal_result_success_ = true;
+  std::optional<core::ErrorDTO> managed_fjt_terminal_error_;
+  std::optional<core::TrajectoryDTO> controlled_stop_path_deviation_reference_;
+  std::optional<double> controlled_stop_path_deviation_max_rad_;
+  std::size_t controlled_stop_path_deviation_feedback_samples_ = 0;
+  std::optional<core::ErrorDTO> controlled_stop_path_deviation_error_;
 };
 
 std::shared_ptr<NativeKernelBundle> create_ros2_control_kernel(

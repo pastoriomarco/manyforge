@@ -116,8 +116,7 @@ class _JointEntry:
     mimic: Optional[tuple[str, float, float]] = None  # (master, multiplier, offset)
     # True when at least one other joint mimics this one. The jog UI
     # also hides masters until a dedicated gripper widget exists, because
-    # the current MoveIt-planning-group streaming session has no command
-    # path to them.
+    # the MoveIt planning-group command path has no command path to them.
     is_mimic_master: bool = False
 
 
@@ -427,8 +426,8 @@ def _load_urdf_entry(urdf_path: str, package_paths: tuple[str, ...]) -> _UrdfCac
     # relation (multiplier·q_master + offset). They cannot be commanded
     # independently — the jog UI must filter them out, and the master
     # is also filtered until a dedicated gripper widget owns the chain
-    # (the current MoveIt planning-group streaming session has no path
-    # to gripper joints anyway). We collect mimic data in a first pass
+    # (the MoveIt planning-group command path has no path to gripper
+    # joints anyway). We collect mimic data in a first pass
     # and then back-fill `is_mimic_master` on the corresponding entries.
     joint_map = getattr(urdf_model, "joint_map", {}) or {}
 

@@ -656,20 +656,6 @@ bool validation_cancelled_by_interrupt(const ErrorDTO& error) {
          it->second == "collision_validation_cancelled";
 }
 
-const char* streaming_collision_reason_code(
-    const CollisionValidationDecisionBundle& bundle) {
-  if (!bundle.cancelled) {
-    return "streaming_collision_rejected";
-  }
-  if (bundle.decision.first_failing_waypoint &&
-      bundle.cancelled_at_waypoint_index &&
-      *bundle.decision.first_failing_waypoint <
-          *bundle.cancelled_at_waypoint_index) {
-    return "streaming_collision_rejected";
-  }
-  return "streaming_collision_cancelled";
-}
-
 std::optional<KernelEventType> interrupt_event_type_from_name(
     const std::string& name) {
   static const std::map<std::string, KernelEventType> kMap{
@@ -1064,24 +1050,15 @@ ExecutionKernel::ExecutionKernel(IPlannerBackend& planner,
     throw std::invalid_argument(
         "runtime_collision_query_timeout_ns must be > 0");
   }
-  if (config_.streaming_ik_timeout_s <= 0.0 ||
-      !std::isfinite(config_.streaming_ik_timeout_s)) {
-    throw std::invalid_argument("streaming_ik_timeout_s must be finite and > 0");
-  }
-  if (config_.streaming_collision_timeout_s <= 0.0 ||
-      !std::isfinite(config_.streaming_collision_timeout_s)) {
-    throw std::invalid_argument(
-        "streaming_collision_timeout_s must be finite and > 0");
-  }
   if (config_.native_reset_completion_timeout_s <= 0.0 ||
       !std::isfinite(config_.native_reset_completion_timeout_s)) {
     throw std::invalid_argument(
         "native_reset_completion_timeout_s must be finite and > 0");
   }
-  if (config_.native_streaming_stop_completion_timeout_s <= 0.0 ||
-      !std::isfinite(config_.native_streaming_stop_completion_timeout_s)) {
+  if (config_.single_shot_ik_timeout_s <= 0.0 ||
+      !std::isfinite(config_.single_shot_ik_timeout_s)) {
     throw std::invalid_argument(
-        "native_streaming_stop_completion_timeout_s must be finite and > 0");
+        "single_shot_ik_timeout_s must be finite and > 0");
   }
   if (config_.validation_collision_workers < 1) {
     config_.validation_collision_workers = 1;
@@ -1238,41 +1215,6 @@ void ExecutionKernel::clear_validation_cancel_token(
   }
 }
 
-std::shared_ptr<CollisionCancellationToken>
-ExecutionKernel::install_streaming_target_cancel_token(
-    std::uint64_t validation_sequence) {
-  auto token = std::make_shared<CollisionCancellationToken>();
-  std::scoped_lock lock(streaming_cancel_mutex_);
-  if (auto previous = active_streaming_target_cancel_token_.lock()) {
-    previous->request_cancel("superseded_by_newer_streaming_target");
-  }
-  if (validation_sequence != streaming_target_validation_sequence_.load(
-                                 std::memory_order_acquire)) {
-    token->request_cancel("superseded_by_newer_streaming_target");
-  }
-  active_streaming_target_cancel_token_ = token;
-  return token;
-}
-
-void ExecutionKernel::clear_streaming_target_cancel_token(
-    const std::shared_ptr<CollisionCancellationToken>& token) {
-  std::scoped_lock lock(streaming_cancel_mutex_);
-  auto active = active_streaming_target_cancel_token_.lock();
-  if (active && active == token) {
-    active_streaming_target_cancel_token_.reset();
-  }
-}
-
-void ExecutionKernel::cancel_active_streaming_target_validation(
-    std::string reason) {
-  streaming_target_validation_sequence_.fetch_add(
-      1, std::memory_order_acq_rel);
-  std::scoped_lock lock(streaming_cancel_mutex_);
-  if (auto active = active_streaming_target_cancel_token_.lock()) {
-    active->request_cancel(std::move(reason));
-  }
-}
-
 void ExecutionKernel::request_validation_cancel_from_interrupt(
     const InterruptIngestResult& result) {
   if (!result.latched || !result.active_latch ||
@@ -1364,76 +1306,6 @@ void ExecutionKernel::apply_latched_interrupt_preemption(
     return;
   }
   const auto& latch = *result.active_latch;
-  if (latch.preemption_action_requested ==
-      InterruptPreemptionAction::kPreemptStreaming) {
-    cancel_active_streaming_target_validation("interrupt:" + latch.latch_id);
-    std::uint64_t kernel_session_id = 0;
-    std::uint64_t backend_session_id = 0;
-    SoftStopStrategy strategy = SoftStopStrategy::kSpringBack;
-    {
-      std::lock_guard<std::mutex> lock(streaming_session_mutex_);
-      kernel_session_id = active_streaming_session_id_;
-      backend_session_id = active_backend_session_id_;
-      strategy = active_soft_stop_strategy_;
-    }
-
-    if (kernel_session_id == 0 || backend_session_id == 0) {
-      mark_active_interrupt_preemption_result(
-          InterruptPreemptionResult::kSucceeded);
-      return;
-    }
-
-    auto end_result =
-        execution_backend_.end_streaming_session(backend_session_id, strategy);
-    if (end_result.accepted) {
-      {
-        std::lock_guard<std::mutex> lock(streaming_session_mutex_);
-        if (active_streaming_session_id_ == kernel_session_id) {
-          active_streaming_session_id_ = 0;
-          active_backend_session_id_ = 0;
-          ++active_streaming_generation_;
-          active_streaming_config_ = StreamingSessionConfigDTO{};
-          active_soft_stop_strategy_ = SoftStopStrategy::kSpringBack;
-          last_accepted_cartesian_pos_valid_ = false;
-          last_accepted_cartesian_ts_ns_ = 0;
-          last_commanded_joints_valid_ = false;
-          last_commanded_joints_.clear();
-        }
-      }
-      emit_event({KernelEventType::kStreamingSessionEnded,
-                  0,
-                  clock_.now(),
-                  {},
-                  {},
-                  std::nullopt,
-                  {{"session_id", std::to_string(kernel_session_id)},
-                   {"backend_session_id", std::to_string(backend_session_id)},
-                   {"end_reason", "interrupt_preempt_streaming"},
-                   {"soft_stop_strategy", to_string(strategy)}}});
-      mark_active_interrupt_preemption_result(
-          InterruptPreemptionResult::kSucceeded);
-    } else {
-      mark_active_interrupt_preemption_result(
-          InterruptPreemptionResult::kBackendPreemptFailed);
-      if (end_result.error) {
-        sm_.set_last_error(error_code_from_dto(*end_result.error));
-        auto snapshot = get_execution_snapshot();
-        snapshot.timestamp_ns = clock_.now();
-        snapshot.state = ExecutionState::kInterrupted;
-        snapshot.error = end_result.error;
-        publish_execution_snapshot(std::move(snapshot));
-        emit_event({KernelEventType::kErrorRaised,
-                    sm_.status().execution_id,
-                    clock_.now(),
-                    {},
-                    {},
-                    end_result.error,
-                    {{"phase", "preempt_streaming"},
-                     {"session_id", std::to_string(kernel_session_id)}}});
-      }
-    }
-    return;
-  }
   if (latch.preemption_action_requested !=
       InterruptPreemptionAction::kPreemptTrajectory) {
     return;
@@ -1569,12 +1441,6 @@ InterruptRuntimeContext ExecutionKernel::current_interrupt_context() const {
     std::lock_guard<std::mutex> move_lock(active_move_id_mutex_);
     if (!active_move_id_.empty()) {
       context.move_id = active_move_id_;
-    }
-  }
-  {
-    std::lock_guard<std::mutex> streaming_lock(streaming_session_mutex_);
-    if (active_streaming_session_id_ != 0) {
-      context.streaming_session_id = active_streaming_session_id_;
     }
   }
   // Interrupt latches record the publisher's live revision at signal time.
@@ -3046,9 +2912,17 @@ void ExecutionKernel::async_execute_worker(
       return;
     }
 
-    // Store in cache
+    // Store in cache.
+    //
+    // Per-joint dynamics caps (Phase 4-P5.1K) disable BOTH cache lookup (the
+    // lookup path above declines and invalidates any pre-existing entry) and
+    // cache store: a trajectory planned under specific caps must never become a
+    // reusable entry that a later uncapped request — or a request with
+    // different caps — could pick up by move_id. The TrajectoryCache key does
+    // not carry a dynamics-limit fingerprint, so the cache-safe behavior is to
+    // not populate it from capped requests at all.
     if (request.cache_mode != CacheMode::kDisable && !cache_hit &&
-        val_result.ok() &&
+        request.per_joint_dynamics_limits.empty() && val_result.ok() &&
         collision_world_revision_is_set(val_result.value())) {
       // Tag every cache entry with the immutable snapshot revision that
       // validation actually used. If live pose-source updates publish newer
@@ -3701,6 +3575,14 @@ Result<uint64_t> ExecutionKernel::execute(const ExecuteRequestDTO& request) {
     auto cached =
         cache_.lookup_with_revision(request.move_id, active_revision);
     if (cached.has_value()) {
+      // Per-joint dynamics caps (Phase 4-P5.1K) disable cache lookup: a request
+      // carrying non-empty caps never serves from cache. It also invalidates any
+      // pre-existing entry for this move_id (which may have been planned under
+      // no caps, or different caps) so a stale trajectory cannot linger. The
+      // companion store guard (see "Store in cache" below) ensures a capped
+      // request also never populates the cache. Together these give cache safety
+      // without a dynamics-limit fingerprint on the cache key.
+      const bool has_dynamics_limits = !request.per_joint_dynamics_limits.empty();
       const auto goal_match =
           cached_trajectory_matches_request_goal(context_, *cached, resolved_request);
       const auto start_match =
@@ -3708,14 +3590,16 @@ Result<uint64_t> ExecutionKernel::execute(const ExecuteRequestDTO& request) {
               ? cached_trajectory_matches_current_start(
                     *cached, *synced_state, request.tolerances.joint_position_tol_rad)
               : incompatible_cache("start_state_changed");
-      if (goal_match.compatible && start_match.compatible) {
+      if (!has_dynamics_limits && goal_match.compatible && start_match.compatible) {
         prepared.cache_hit = true;
         prepared.trajectory = std::move(*cached);
       } else {
         cache_.invalidate(request.move_id);
         prepared.cache_invalidated = true;
         prepared.cache_invalidation_reason =
-            !start_match.compatible ? start_match.reason : goal_match.reason;
+            has_dynamics_limits
+                ? "per_joint_dynamics_limits_present"
+                : (!start_match.compatible ? start_match.reason : goal_match.reason);
       }
     } else {
       prepared.cache_miss = true;
@@ -3804,30 +3688,6 @@ Result<uint64_t> ExecutionKernel::execute(const ExecuteRequestDTO& request) {
 
 StopResultDTO ExecutionKernel::stop() {
   std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
-
-  // ADR-0016: stop() from kStreaming maps to a soft-end of the active
-  // streaming session using the session's configured soft-stop strategy
-  // (spring_back by default; velocity_scaling when qualification permits).
-  // Distinct from the hard cancel path used by reset().
-  uint64_t streaming_session_to_end = 0;
-  SoftStopStrategy streaming_strategy = SoftStopStrategy::kSpringBack;
-  {
-    std::lock_guard<std::mutex> lock(streaming_session_mutex_);
-    if (sm_.status().state == ExecutionState::kStreaming &&
-        active_streaming_session_id_ != 0) {
-      streaming_session_to_end = active_streaming_session_id_;
-      streaming_strategy = active_soft_stop_strategy_;
-    }
-  }
-  if (streaming_session_to_end != 0) {
-    auto end_result = end_streaming_session_unlocked(streaming_session_to_end,
-                                                     streaming_strategy);
-    if (end_result.accepted) {
-      std::lock_guard<std::mutex> lock(metrics_mutex_);
-      metrics_.stops_issued++;
-    }
-    return StopResultDTO{end_result.accepted, end_result.error};
-  }
 
   // Per spec/230 §6.1 Stop chain:
   //   stop_requested → state_transition(Stopping) → stop_issued
@@ -4075,47 +3935,11 @@ ResetResultDTO ExecutionKernel::reset() {
   std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
 
   auto prev_state = sm_.status().state;
-  cancel_active_streaming_target_validation("streaming_session_reset");
   if (get_active_interrupt_latch()) {
     auto clear = interrupt_manager_.clear_active_latch("reset", clock_.now());
     if (clear.ok()) {
       emit_interrupt_events(clear.value());
     }
-  }
-
-  // ADR-0016: reset() is the HARD-cancel path (max-decel cancel via
-  // backend.reset(), no soft-stop trajectory). Clear streaming session
-  // bookkeeping unconditionally when set — covers the kStreaming case
-  // and the recovery-from-InterventionRequired case (an error during
-  // streaming might leave the session id non-zero even after the state
-  // machine transitioned away from kStreaming). Without this clear, a
-  // subsequent begin_streaming_session would be rejected with
-  // "session already active".
-  uint64_t closed_streaming_id = 0;
-  {
-    std::lock_guard<std::mutex> lock(streaming_session_mutex_);
-    if (active_streaming_session_id_ != 0) {
-      closed_streaming_id = active_streaming_session_id_;
-      active_streaming_session_id_ = 0;
-      active_backend_session_id_ = 0;
-      ++active_streaming_generation_;
-      active_streaming_config_ = StreamingSessionConfigDTO{};
-      active_soft_stop_strategy_ = SoftStopStrategy::kSpringBack;
-      last_accepted_cartesian_pos_valid_ = false;
-      last_accepted_cartesian_ts_ns_ = 0;
-      last_commanded_joints_valid_ = false;
-      last_commanded_joints_.clear();
-    }
-  }
-  if (closed_streaming_id != 0) {
-    emit_event({KernelEventType::kStreamingSessionEnded,
-                0,
-                clock_.now(),
-                {},
-                {},
-                std::nullopt,
-                {{"session_id", std::to_string(closed_streaming_id)},
-                 {"end_reason", "reset_hard_cancel"}}});
   }
 
   if (prev_state == ExecutionState::kIdle) {
@@ -4434,8 +4258,7 @@ ExecutionStatus ExecutionKernel::get_status() const {
 
 ExecutionSnapshot ExecutionKernel::get_execution_snapshot() const {
   const auto kernel_state = sm_.status().state;
-  if (kernel_state == ExecutionState::kStreaming ||
-      kernel_state == ExecutionState::kStopping) {
+  if (kernel_state == ExecutionState::kStopping) {
     auto backend_snapshot = execution_backend_.get_execution_snapshot();
     backend_snapshot.state = kernel_state;
     if (backend_snapshot.timestamp_ns == 0) {
@@ -4602,10 +4425,10 @@ Result<void> ExecutionKernel::collision_check_tick() {
     return publish_runtime_monitor_fault(CollisionCheckResultDTO{}, monitor_details);
   }
 
-  const auto now_ns = clock_.now();
+  const auto dynamic_body_now_ns = clock_.now();
   if (auto freshness_reason = validate_dynamic_body_freshness(
           *world_snapshot,
-          now_ns,
+          dynamic_body_now_ns,
           config_.runtime_dynamic_body_max_age_cap_ns,
           monitor_details)) {
     monitor_details["reason"] = *freshness_reason;
@@ -4629,7 +4452,8 @@ Result<void> ExecutionKernel::collision_check_tick() {
     monitor_details["exception"] = "unknown";
     return publish_runtime_monitor_fault(CollisionCheckResultDTO{}, monitor_details);
   }
-  if (snapshot_too_old(now_ns,
+  const auto observed_now_ns = clock_.now();
+  if (snapshot_too_old(observed_now_ns,
                        observed_snapshot.timestamp_ns,
                        config_.runtime_observed_state_max_age_ns,
                        monitor_details,
@@ -4767,6 +4591,7 @@ Result<TrajectoryDTO> ExecutionKernel::plan_trajectory(
   plan_req.motion = std::move(resolved_motion.value());
   plan_req.tolerances = request.tolerances;
   plan_req.speed_profile = request.speed_profile;
+  plan_req.per_joint_dynamics_limits = request.per_joint_dynamics_limits;
   plan_req.planning_timeout_s = request.timeouts.planning_timeout_s;
 
   auto result = planner_.plan(plan_req);
@@ -5034,287 +4859,6 @@ Result<CollisionWorldRevision> ExecutionKernel::validate_trajectory(
                std::move(details)});
 }
 
-Result<CollisionWorldRevision>
-ExecutionKernel::validate_streaming_target_collision(
-    const StreamingSessionConfigDTO& active_config,
-    const StreamingTargetDTO& resolved_target,
-    std::uint64_t validation_sequence,
-    std::uint64_t session_id,
-    std::uint64_t source_sequence) {
-  const auto still_latest = [this, validation_sequence]() {
-    return validation_sequence == streaming_target_validation_sequence_.load(
-                                      std::memory_order_acquire);
-  };
-
-  if (!still_latest()) {
-    return Result<CollisionWorldRevision>::Err(
-        ErrorDTO{kErrorInvalidRequest,
-                 "streaming target superseded by a newer target",
-                 {{"reason_code", "superseded_by_newer_streaming_target"},
-                  {"phase", "streaming_target_validation"},
-                  {"validation_sequence", std::to_string(validation_sequence)},
-                  {"current_validation_sequence",
-                   std::to_string(streaming_target_validation_sequence_.load(
-                       std::memory_order_acquire))}}});
-  }
-
-  if (resolved_target.kind != StreamingInputMode::kJoint ||
-      resolved_target.joint_positions_rad.size() !=
-          active_config.joint_names.size()) {
-    return Result<CollisionWorldRevision>::Err(
-        ErrorDTO{kErrorInvalidRequest,
-                 "streaming target collision validation requires a full "
-                 "session-order joint target",
-                 {{"reason_code", "malformed_frame"},
-                  {"phase", "streaming_target_validation"},
-                  {"session_id", std::to_string(session_id)}}});
-  }
-
-  std::optional<CollisionPolicySnapshot> policy_snapshot;
-  ICollisionWorldSnapshotPublisher* snapshot_publisher = nullptr;
-  std::vector<std::shared_ptr<ICollisionQueryEngine>> validation_engines;
-  {
-    std::scoped_lock lock(coordinator_mutex_);
-    policy_snapshot = coordinator_policy_snapshot_;
-    snapshot_publisher = collision_snapshot_publisher_;
-    validation_engines = collision_validation_engines_;
-  }
-
-  if (snapshot_publisher == nullptr) {
-    return Result<CollisionWorldRevision>::Err(
-        authoritative_collision_validation_config_error(
-            "missing_collision_world_snapshot_publisher",
-            {{"reason_code", "collision_pipeline_not_configured"}},
-            "streaming_target_validation"));
-  }
-  if (validation_engines.empty()) {
-    return Result<CollisionWorldRevision>::Err(
-        authoritative_collision_validation_config_error(
-            "missing_collision_query_engines",
-            {{"reason_code", "collision_pipeline_not_configured"}},
-            "streaming_target_validation"));
-  }
-
-  CollisionWorldSnapshotPtr world_snapshot;
-  try {
-    world_snapshot = snapshot_publisher->snapshot();
-  } catch (const std::exception& e) {
-    return Result<CollisionWorldRevision>::Err(
-        authoritative_collision_validation_config_error(
-            "snapshot_publisher_exception",
-            {{"reason_code", "collision_pipeline_not_configured"},
-             {"exception", e.what()}},
-            "streaming_target_validation"));
-  } catch (...) {
-    return Result<CollisionWorldRevision>::Err(
-        authoritative_collision_validation_config_error(
-            "snapshot_publisher_exception",
-            {{"reason_code", "collision_pipeline_not_configured"},
-             {"exception", "unknown"}},
-            "streaming_target_validation"));
-  }
-  if (!world_snapshot) {
-    return Result<CollisionWorldRevision>::Err(
-        authoritative_collision_validation_config_error(
-            "snapshot_unavailable",
-            {{"reason_code", "collision_pipeline_not_configured"}},
-            "streaming_target_validation"));
-  }
-
-  try {
-    if (auto publisher_policy =
-            snapshot_publisher->collision_policy_snapshot()) {
-      policy_snapshot = std::move(publisher_policy);
-    }
-  } catch (const std::exception& e) {
-    return Result<CollisionWorldRevision>::Err(
-        authoritative_collision_validation_config_error(
-            "policy_publisher_exception",
-            {{"reason_code", "collision_pipeline_not_configured"},
-             {"exception", e.what()}},
-            "streaming_target_validation"));
-  } catch (...) {
-    return Result<CollisionWorldRevision>::Err(
-        authoritative_collision_validation_config_error(
-            "policy_publisher_exception",
-            {{"reason_code", "collision_pipeline_not_configured"},
-             {"exception", "unknown"}},
-            "streaming_target_validation"));
-  }
-  if (!policy_snapshot) {
-    return Result<CollisionWorldRevision>::Err(
-        authoritative_collision_validation_config_error(
-            "missing_collision_policy_snapshot",
-            {{"reason_code", "collision_pipeline_not_configured"}},
-            "streaming_target_validation"));
-  }
-
-  ICollisionQueryEngine* engine = nullptr;
-  for (const auto& candidate : validation_engines) {
-    if (candidate) {
-      engine = candidate.get();
-      break;
-    }
-  }
-  if (engine == nullptr) {
-    return Result<CollisionWorldRevision>::Err(
-        authoritative_collision_validation_config_error(
-            "missing_collision_query_engines",
-            {{"reason_code", "collision_pipeline_not_configured"}},
-            "streaming_target_validation"));
-  }
-
-  TrajectoryDTO one_state;
-  one_state.joint_names = active_config.joint_names;
-  one_state.waypoints.push_back(TrajectoryWaypointDTO{
-      resolved_target.min_time_from_start_s,
-      resolved_target.joint_positions_rad,
-      {},
-      {}});
-
-  CollisionValidationPassConfig cfg;
-  cfg.policy_snapshot = *policy_snapshot;
-  cfg.require_pose_source_borrow = false;
-  cfg.surface = CollisionSurface::kStreamingTargetValidation;
-  cfg.per_state_timeout_ns = static_cast<std::int64_t>(
-      config_.streaming_collision_timeout_s * 1'000'000'000.0);
-
-  auto cancel = install_streaming_target_cancel_token(validation_sequence);
-  struct StreamingCancelTokenGuard {
-    ExecutionKernel* kernel = nullptr;
-    std::shared_ptr<CollisionCancellationToken> token;
-    ~StreamingCancelTokenGuard() {
-      if (kernel) {
-        kernel->clear_streaming_target_cancel_token(token);
-      }
-    }
-  } cancel_guard{this, cancel};
-
-  CollisionValidationDecisionBundle bundle;
-  std::chrono::steady_clock::time_point started;
-  {
-    std::unique_lock<std::mutex> validation_lock(
-        streaming_collision_validation_mutex_);
-    if (!still_latest()) {
-      cancel->request_cancel("superseded_by_newer_streaming_target");
-    }
-    if (cancel->is_cancel_requested()) {
-      return Result<CollisionWorldRevision>::Err(
-          ErrorDTO{kErrorInvalidRequest,
-                   "streaming target superseded by a newer target",
-                   {{"reason_code", "superseded_by_newer_streaming_target"},
-                    {"phase", "streaming_target_validation"},
-                    {"session_id", std::to_string(session_id)},
-                    {"source_sequence", std::to_string(source_sequence)}}});
-    }
-    CollisionValidationCoordinator coord(std::move(cfg));
-    started = std::chrono::steady_clock::now();
-    try {
-      bundle = coord.validate_trajectory(*world_snapshot, *engine, one_state,
-                                         *cancel);
-    } catch (const std::exception& e) {
-      const auto elapsed_ns =
-          std::chrono::duration_cast<std::chrono::nanoseconds>(
-              std::chrono::steady_clock::now() - started)
-              .count();
-      return Result<CollisionWorldRevision>::Err(
-          ErrorDTO{kErrorValidationCollision,
-                   "streaming collision validation engine threw",
-                   {{"reason_code", "streaming_collision_engine_exception"},
-                    {"phase", "streaming_target_validation"},
-                    {"exception", e.what()},
-                    {"timeout_ns", std::to_string(cfg.per_state_timeout_ns)},
-                    {"elapsed_ns", std::to_string(elapsed_ns)},
-                    {"session_id", std::to_string(session_id)},
-                    {"source_sequence", std::to_string(source_sequence)},
-                    {"collision_world_revision_id",
-                     std::to_string(world_snapshot->revision.revision_id)}}});
-    } catch (...) {
-      const auto elapsed_ns =
-          std::chrono::duration_cast<std::chrono::nanoseconds>(
-              std::chrono::steady_clock::now() - started)
-              .count();
-      return Result<CollisionWorldRevision>::Err(
-          ErrorDTO{kErrorValidationCollision,
-                   "streaming collision validation engine threw",
-                   {{"reason_code", "streaming_collision_engine_exception"},
-                    {"phase", "streaming_target_validation"},
-                    {"exception", "unknown"},
-                    {"timeout_ns", std::to_string(cfg.per_state_timeout_ns)},
-                    {"elapsed_ns", std::to_string(elapsed_ns)},
-                    {"session_id", std::to_string(session_id)},
-                    {"source_sequence", std::to_string(source_sequence)},
-                    {"collision_world_revision_id",
-                     std::to_string(world_snapshot->revision.revision_id)}}});
-    }
-  }
-  const auto elapsed_ns =
-      std::chrono::duration_cast<std::chrono::nanoseconds>(
-          std::chrono::steady_clock::now() - started)
-          .count();
-
-  if (!still_latest()) {
-    cancel->request_cancel("superseded_by_newer_streaming_target");
-    return Result<CollisionWorldRevision>::Err(
-        ErrorDTO{kErrorInvalidRequest,
-                 "streaming target superseded by a newer target",
-                 {{"reason_code", "superseded_by_newer_streaming_target"},
-                  {"phase", "streaming_target_validation"},
-                  {"session_id", std::to_string(session_id)},
-                  {"source_sequence", std::to_string(source_sequence)}}});
-  }
-
-  const auto budget_ns = static_cast<std::int64_t>(
-      config_.streaming_collision_timeout_s * 1'000'000'000.0);
-  if (elapsed_ns > budget_ns) {
-    return Result<CollisionWorldRevision>::Err(
-        ErrorDTO{kErrorValidationCollision,
-                 "streaming collision validation exceeded per-frame budget",
-                 {{"reason_code", "streaming_collision_timeout"},
-                  {"phase", "streaming_target_validation"},
-                  {"timeout_ns", std::to_string(budget_ns)},
-                  {"elapsed_ns", std::to_string(elapsed_ns)},
-                  {"session_id", std::to_string(session_id)},
-                  {"source_sequence", std::to_string(source_sequence)},
-                  {"collision_world_revision_id",
-                   std::to_string(world_snapshot->revision.revision_id)}}});
-  }
-
-  if (bundle.decision.accepted) {
-    return Result<CollisionWorldRevision>::Ok(bundle.borrowed_world_revision);
-  }
-
-  std::map<std::string, std::string> details{
-      {"reason_code", streaming_collision_reason_code(bundle)},
-      {"phase", "streaming_target_validation"},
-      {"timeout_ns", std::to_string(budget_ns)},
-      {"elapsed_ns", std::to_string(elapsed_ns)},
-      {"session_id", std::to_string(session_id)},
-      {"source_sequence", std::to_string(source_sequence)},
-      {"collision_world_revision_id",
-       std::to_string(bundle.borrowed_world_revision.revision_id)},
-      {"collision_world_content_hash",
-       bundle.borrowed_world_revision.content_hash}};
-  if (bundle.decision.first_failing_waypoint) {
-    details["first_failing_waypoint"] =
-        std::to_string(*bundle.decision.first_failing_waypoint);
-  }
-  if (bundle.cancelled_at_waypoint_index) {
-    details["cancelled_at_waypoint_index"] =
-        std::to_string(*bundle.cancelled_at_waypoint_index);
-  }
-  if (bundle.cancellation_reason) {
-    details["cancellation_reason"] = *bundle.cancellation_reason;
-  }
-  append_collision_failure_diagnostics(details, bundle);
-  return Result<CollisionWorldRevision>::Err(
-      ErrorDTO{kErrorValidationCollision,
-               bundle.cancelled
-                   ? "streaming collision validation cancelled"
-                   : "streaming target rejected by collision validation",
-               std::move(details)});
-}
-
 void ExecutionKernel::set_collision_validation_policy_snapshot(
     std::optional<CollisionPolicySnapshot> snapshot) {
   std::scoped_lock lock(coordinator_mutex_);
@@ -5336,162 +4880,11 @@ void ExecutionKernel::set_collision_validation_retry_config(
   coordinator_per_state_timeout_ns_ = per_state_timeout_ns;
 }
 
-// -----------------------------------------------------------------
-// Streaming-session API (ADR-0016).
-//
-// Lifecycle invariants enforced here:
-//   - begin requires state == kIdle; transitions to kStreaming on accept.
-//   - push requires state == kStreaming and session_id match.
-//   - end transitions kStreaming -> kStopping -> kStopped (after the
-//     backend soft-stop completes).
-//
-// Concurrency: streaming_session_mutex_ protects the active session
-// metadata. We do NOT hold it across the backend call (the backend has
-// its own internal locks; we mustn't invert lock order with
-// lifecycle_mutex_).
-// -----------------------------------------------------------------
-
-StreamingSessionBeginResultDTO ExecutionKernel::begin_streaming_session(
-    const StreamingSessionConfigDTO& config) {
-  std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
-
-  StreamingSessionBeginResultDTO result;
-
-  {
-    std::lock_guard<std::mutex> lock(streaming_session_mutex_);
-    if (active_streaming_session_id_ != 0) {
-      result.accepted = false;
-      result.error = ErrorDTO{
-          std::string(to_string(ErrorCode::kInvalidStateTransition)),
-          "streaming session already active",
-          {{"active_session_id",
-            std::to_string(active_streaming_session_id_)}}};
-      return result;
-    }
-  }
-
-  const auto prev_state = sm_.status().state;
-  if (prev_state != ExecutionState::kIdle) {
-    result.accepted = false;
-    result.error = ErrorDTO{
-        std::string(to_string(ErrorCode::kInvalidStateTransition)),
-        "begin_streaming_session valid only from Idle",
-        {{"state", to_string(prev_state)}}};
-    return result;
-  }
-
-  // Defense-in-depth: if the caller did not specify the session's
-  // joint list, fall back to the backend's current joint snapshot.
-  // The frontend SHOULD pass `joint_names` explicitly (the canonical
-  // path), but if it ever forgets, the push-validation chain would
-  // reject every partial frame as `unknown_joint_name`. Populating
-  // from the live snapshot here keeps the session functional with
-  // the natural ordering the backend already uses.
-  StreamingSessionConfigDTO populated_config = config;
-  if (populated_config.joint_names.empty()) {
-    auto current_state = context_.get_current_state();
-    if (!current_state.joint_names.empty()) {
-      populated_config.joint_names = current_state.joint_names;
-    }
-  }
-  if (!populated_config.joint_names.empty()) {
-    const double unbounded_lower = -std::numeric_limits<double>::infinity();
-    const double unbounded_upper = std::numeric_limits<double>::infinity();
-    populated_config.per_joint_position_lower.assign(
-        populated_config.joint_names.size(), unbounded_lower);
-    populated_config.per_joint_position_upper.assign(
-        populated_config.joint_names.size(), unbounded_upper);
-
-    try {
-      auto limits = context_.get_joint_limits("", populated_config.group_id);
-      const bool have_position_limits =
-          limits.joint_names.size() == limits.position_lower_rad.size() &&
-          limits.joint_names.size() == limits.position_upper_rad.size();
-      if (have_position_limits) {
-        for (size_t si = 0; si < populated_config.joint_names.size(); ++si) {
-          const auto& joint_name = populated_config.joint_names[si];
-          auto lit = std::find(limits.joint_names.begin(),
-                               limits.joint_names.end(), joint_name);
-          if (lit == limits.joint_names.end()) {
-            continue;
-          }
-          const auto li = static_cast<size_t>(
-              std::distance(limits.joint_names.begin(), lit));
-          populated_config.per_joint_position_lower[si] =
-              limits.position_lower_rad[li];
-          populated_config.per_joint_position_upper[si] =
-              limits.position_upper_rad[li];
-        }
-      }
-    } catch (...) {
-      // Some lightweight test contexts/backends cannot expose limits. Keep
-      // entries unbounded rather than rejecting begin; push-time enforcement
-      // still applies for every finite limit the context can provide.
-    }
-  }
-
-  auto backend_result =
-      execution_backend_.begin_streaming_session(populated_config);
-  if (!backend_result.accepted) {
-    return backend_result;
-  }
-
-  auto sm_result = sm_.try_transition(ExecutionState::kStreaming);
-  if (!sm_result.ok()) {
-    // Roll back the backend session — kernel state machine refused the
-    // transition. End the session with spring-back as a defensive default.
-    (void)execution_backend_.end_streaming_session(
-        backend_result.session_id, SoftStopStrategy::kSpringBack);
-    result.accepted = false;
-    result.error = sm_result.error();
-    return result;
-  }
-
-  uint64_t kernel_session_id = 0;
-  {
-    std::lock_guard<std::mutex> lock(streaming_session_mutex_);
-    kernel_session_id = next_streaming_session_id_++;
-    active_streaming_session_id_ = kernel_session_id;
-    active_backend_session_id_ = backend_result.session_id;
-    ++active_streaming_generation_;
-    active_streaming_config_ = populated_config;
-    active_soft_stop_strategy_ = populated_config.default_soft_stop_strategy;
-    last_accepted_cartesian_pos_valid_ = false;
-    last_accepted_cartesian_ts_ns_ = 0;
-    last_commanded_joints_valid_ = false;
-    last_commanded_joints_.clear();
-  }
-
-  emit_event({KernelEventType::kStreamingSessionStarted,
-              0,  // no execution_id for streaming
-              clock_.now(),
-              {},
-              {},
-              std::nullopt,
-              {{"session_id", std::to_string(kernel_session_id)},
-               {"backend_session_id",
-                std::to_string(backend_result.session_id)},
-               {"group_id", config.group_id},
-               {"input_mode", to_string(config.default_input_mode)},
-               {"principal_id", config.principal_id}}});
-  emit_event({KernelEventType::kStateTransition,
-              0,
-              clock_.now(),
-              prev_state,
-              ExecutionState::kStreaming,
-              std::nullopt,
-              {{"session_id", std::to_string(kernel_session_id)}}});
-
-  result.accepted = true;
-  result.session_id = kernel_session_id;
-  return result;
-}
-
 void ExecutionKernel::set_runtime_velocity_scale(double scale) {
   // ADR-0018: HMI runtime velocity scale → backend runtime register.
   // Validate finiteness here; clamp to [0, 1]; forward to the backend's
-  // atomic store. No lifecycle_mutex_: this is a high-rate operator surface,
-  // peer to push_streaming_target. The backend's atomic handles concurrency.
+  // atomic store. No lifecycle_mutex_: this is a high-rate operator surface
+  // and the backend's atomic store handles concurrency.
   if (!std::isfinite(scale)) {
     // K2-style defense in depth: refuse NaN/Inf rather than
     // propagating into the worker.
@@ -5501,792 +4894,6 @@ void ExecutionKernel::set_runtime_velocity_scale(double scale) {
   if (scale > 1.0) scale = 1.0;
   runtime_velocity_scale_.store(scale, std::memory_order_release);
   execution_backend_.set_runtime_velocity_scale(scale);
-}
-
-void ExecutionKernel::set_streaming_velocity_scale(double scale) {
-  set_runtime_velocity_scale(scale);
-}
-
-StreamingPushResultDTO ExecutionKernel::push_streaming_target(
-    uint64_t session_id,
-    const StreamingTargetDTO& target) {
-  StreamingPushResultDTO result;
-
-  if (sm_.status().state != ExecutionState::kStreaming) {
-    result.accepted = false;
-    result.error = ErrorDTO{
-        std::string(to_string(ErrorCode::kInvalidStateTransition)),
-        "push_streaming_target valid only from Streaming",
-        {{"state", to_string(sm_.status().state)}}};
-    return result;
-  }
-
-  StreamingSessionConfigDTO active_config;
-  uint64_t backend_session_id = 0;
-  uint64_t session_generation = 0;
-  {
-    std::lock_guard<std::mutex> lock(streaming_session_mutex_);
-    if (active_streaming_session_id_ == 0 ||
-        active_streaming_session_id_ != session_id) {
-      result.accepted = false;
-      result.error = ErrorDTO{
-          std::string(to_string(ErrorCode::kInvalidRequest)),
-          "session_id does not match active streaming session",
-          {{"requested_session_id", std::to_string(session_id)},
-           {"active_session_id",
-            std::to_string(active_streaming_session_id_)}}};
-      return result;
-    }
-    active_config = active_streaming_config_;
-    backend_session_id = active_backend_session_id_;
-    session_generation = active_streaming_generation_;
-  }
-  const auto validation_sequence =
-      streaming_target_validation_sequence_.fetch_add(
-          1, std::memory_order_acq_rel) +
-      1;
-  const auto streaming_target_is_latest = [this, validation_sequence]() {
-    return validation_sequence == streaming_target_validation_sequence_.load(
-                                      std::memory_order_acquire);
-  };
-
-  auto reject_malformed_frame =
-      [&](const std::string& message,
-          std::map<std::string, std::string> details = {}) {
-        details.emplace("reason_code", "malformed_frame");
-        result.accepted = false;
-        result.backend_sequence = 0;
-        result.error = ErrorDTO{
-            std::string(to_string(ErrorCode::kInvalidRequest)),
-            message,
-            details};
-        emit_event({KernelEventType::kStreamingTargetRejected,
-                    0,
-                    clock_.now(),
-                    {},
-                    {},
-                    result.error,
-                    {{"session_id", std::to_string(session_id)},
-                     {"source_sequence",
-                      std::to_string(target.source_sequence)},
-                     {"kind", "malformed_frame"}}});
-        return result;
-      };
-
-  auto reject_streaming_collision =
-      [&](ErrorDTO error,
-          std::map<std::string, std::string> event_details = {}) {
-        event_details.emplace("session_id", std::to_string(session_id));
-        event_details.emplace("source_sequence",
-                              std::to_string(target.source_sequence));
-        event_details.emplace("kind", "streaming_collision_validation");
-        if (auto it = error.details.find("reason_code");
-            it != error.details.end()) {
-          event_details.emplace("reason_code", it->second);
-        }
-        result.accepted = false;
-        result.backend_sequence = 0;
-        result.error = std::move(error);
-        emit_event({KernelEventType::kStreamingTargetRejected,
-                    0,
-                    clock_.now(),
-                    {},
-                    {},
-                    result.error,
-                    std::move(event_details)});
-        return result;
-      };
-
-  if (!std::isfinite(target.min_time_from_start_s)
-      || target.min_time_from_start_s < 0.0) {
-    return reject_malformed_frame(
-        "streaming target min_time_from_start_s must be finite and >= 0",
-        {{"field", "min_time_from_start_s"}});
-  }
-
-  StreamingTargetDTO resolved_target = target;
-  if (target.kind == StreamingInputMode::kCartesian) {
-    for (size_t i = 0; i < target.position_m.size(); ++i) {
-      if (!std::isfinite(target.position_m[i])) {
-        return reject_malformed_frame(
-            "Cartesian streaming target contains non-finite position",
-            {{"field", "position_m"}, {"index", std::to_string(i)}});
-      }
-    }
-    double quat_norm_sq = 0.0;
-    for (size_t i = 0; i < target.orientation_xyzw.size(); ++i) {
-      const double value = target.orientation_xyzw[i];
-      if (!std::isfinite(value)) {
-        return reject_malformed_frame(
-            "Cartesian streaming target contains non-finite orientation",
-            {{"field", "orientation_xyzw"}, {"index", std::to_string(i)}});
-      }
-      quat_norm_sq += value * value;
-    }
-    if (quat_norm_sq < 1e-12) {
-      return reject_malformed_frame(
-          "Cartesian streaming target quaternion norm is too small",
-          {{"field", "orientation_xyzw"}});
-    }
-    const double quat_norm = std::sqrt(quat_norm_sq);
-    for (double& value : resolved_target.orientation_xyzw) {
-      value /= quat_norm;
-    }
-  } else if (target.kind == StreamingInputMode::kJoint) {
-    for (size_t i = 0; i < target.joint_positions_rad.size(); ++i) {
-      if (!std::isfinite(target.joint_positions_rad[i])) {
-        return reject_malformed_frame(
-            "Joint streaming target contains non-finite position",
-            {{"field", "joint_positions_rad"}, {"index", std::to_string(i)}});
-      }
-    }
-  }
-
-  // ADR-0015 / ADR-0016: enforce the deployment's Cartesian speed cap
-  // on the ROBOT's commanded motion, NOT on the operator's input rate.
-  // The operator can drag the gizmo at any speed; the robot tracks at
-  // ≤ the cap and the gizmo simply gets ahead during fast drags (the
-  // visual non-coincidence is documented UX — same as the legacy
-  // direct-jog path). We translate the cap into a minimum
-  // `time_from_start` for the backend's anchored FJT goal:
-  //   dt_min_cart = distance(prev_target, this_target) / max_speed_mps
-  // and the backend's dispatch worker max'es this with its own joint-
-  // velocity-cap-derived floor. The result is that the FJT goal is
-  // always scheduled to take long enough for the cap to hold.
-  if (target.kind == StreamingInputMode::kCartesian &&
-      active_config.max_tcp_linear_speed_mps > 0.0) {
-    std::array<double, 3> last_pos{0.0, 0.0, 0.0};
-    bool have_last = false;
-    {
-      std::lock_guard<std::mutex> lock(streaming_session_mutex_);
-      last_pos = last_accepted_cartesian_pos_;
-      have_last = last_accepted_cartesian_pos_valid_;
-    }
-    if (have_last) {
-      const double dx = target.position_m[0] - last_pos[0];
-      const double dy = target.position_m[1] - last_pos[1];
-      const double dz = target.position_m[2] - last_pos[2];
-      const double distance_m = std::sqrt(dx * dx + dy * dy + dz * dz);
-      const double dt_min_cart_s =
-          distance_m / active_config.max_tcp_linear_speed_mps;
-      if (dt_min_cart_s > resolved_target.min_time_from_start_s) {
-        resolved_target.min_time_from_start_s = dt_min_cart_s;
-      }
-    }
-  }
-
-  // ADR-0016 IK pre-resolution: Cartesian targets are resolved to joint
-  // targets here via the planner's single-shot IK, then forwarded to the
-  // backend as joint targets. This keeps execution backends free of IK
-  // logic (per ADR-0007 scene-ownership boundary) and lets every backend
-  // implement streaming uniformly against joint targets.
-  if (target.kind == StreamingInputMode::kCartesian) {
-    auto current_state = context_.get_current_state();
-    IkRequestDTO ik_req;
-    Pose3DTO pose;
-    pose.position_m.x_m = target.position_m[0];
-    pose.position_m.y_m = target.position_m[1];
-    pose.position_m.z_m = target.position_m[2];
-    pose.orientation.x = resolved_target.orientation_xyzw[0];
-    pose.orientation.y = resolved_target.orientation_xyzw[1];
-    pose.orientation.z = resolved_target.orientation_xyzw[2];
-    pose.orientation.w = resolved_target.orientation_xyzw[3];
-    ik_req.goal_pose = pose;
-    ik_req.base_frame = active_config.cartesian_reference_frame.empty()
-                             ? std::string("base")
-                             : active_config.cartesian_reference_frame;
-    ik_req.tcp_frame = active_config.tcp_frame;
-    if (ik_req.tcp_frame.empty()) {
-      // No TCP frame on the session — Cartesian streaming is not addressable.
-      result.accepted = false;
-      result.backend_sequence = 0;
-      result.error = ErrorDTO{
-          std::string(to_string(ErrorCode::kInvalidRequest)),
-          "Cartesian streaming target on a session that did not configure "
-          "tcp_frame — set StreamingSessionConfigDTO.tcp_frame at begin time",
-          {}};
-      emit_event({KernelEventType::kStreamingTargetRejected,
-                  0,
-                  clock_.now(),
-                  {},
-                  {},
-                  result.error,
-                  {{"session_id", std::to_string(session_id)},
-                   {"source_sequence",
-                    std::to_string(target.source_sequence)},
-                   {"kind", "missing_tcp_frame"}}});
-      return result;
-    }
-    ik_req.seed_state = current_state;
-    ik_req.timeout_s = config_.streaming_ik_timeout_s;
-
-    const auto ik_started = std::chrono::steady_clock::now();
-    auto ik_result = planner_.solve_ik(ik_req);
-    const double ik_elapsed_s =
-        std::chrono::duration<double>(
-            std::chrono::steady_clock::now() - ik_started)
-            .count();
-    if (ik_elapsed_s > config_.streaming_ik_timeout_s) {
-      result.accepted = false;
-      result.backend_sequence = 0;
-      result.error = ErrorDTO{
-          std::string(to_string(ErrorCode::kIkFailed)),
-          "streaming IK exceeded configured timeout",
-          {{"reason_code", "ik_timeout"},
-           {"timeout_s", std::to_string(config_.streaming_ik_timeout_s)},
-           {"elapsed_s", std::to_string(ik_elapsed_s)},
-           {"base_frame", ik_req.base_frame},
-           {"tcp_frame", ik_req.tcp_frame}}};
-      emit_event({KernelEventType::kStreamingTargetRejected,
-                  0,
-                  clock_.now(),
-                  {},
-                  {},
-                  result.error,
-                  {{"session_id", std::to_string(session_id)},
-                   {"source_sequence",
-                    std::to_string(target.source_sequence)},
-                   {"kind", "cartesian_ik_timeout"},
-                   {"elapsed_s", std::to_string(ik_elapsed_s)}}});
-      return result;
-    }
-    if (!ik_result.ok) {
-      result.accepted = false;
-      result.backend_sequence = 0;
-      result.error = ik_result.error.value_or(ErrorDTO{
-          std::string(to_string(ErrorCode::kIkFailed)),
-          "IK failed for streaming cartesian target",
-          {}});
-      emit_event({KernelEventType::kStreamingTargetRejected,
-                  0,
-                  clock_.now(),
-                  {},
-                  {},
-                  result.error,
-                  {{"session_id", std::to_string(session_id)},
-                   {"source_sequence",
-                    std::to_string(target.source_sequence)},
-                   {"kind", "cartesian_ik_failed"}}});
-      return result;
-    }
-
-    // Reorder IK output into session joint order. IK returns whatever
-    // order the planner uses; the rest of the kernel + backends rely
-    // on session-order vectors (so cartesian-then-joint sequences
-    // overlay correctly onto last_commanded_joints_).
-    std::vector<double> ordered_positions(active_config.joint_names.size());
-    for (size_t i = 0; i < active_config.joint_names.size(); ++i) {
-      const auto& sname = active_config.joint_names[i];
-      auto it = std::find(ik_result.joint_names.begin(),
-                          ik_result.joint_names.end(), sname);
-      if (it == ik_result.joint_names.end()) {
-        result.accepted = false;
-        result.backend_sequence = 0;
-        result.error = ErrorDTO{
-            std::string(to_string(ErrorCode::kIkFailed)),
-            "IK result missing session joint: " + sname,
-            {{"reason_code", "ik_failed"}, {"joint_name", sname}}};
-        emit_event({KernelEventType::kStreamingTargetRejected,
-                    0,
-                    clock_.now(),
-                    {},
-                    {},
-                    result.error,
-                    {{"session_id", std::to_string(session_id)},
-                     {"source_sequence",
-                      std::to_string(target.source_sequence)},
-                     {"kind", "cartesian_ik_failed"}}});
-        return result;
-      }
-      auto idx = static_cast<size_t>(
-          std::distance(ik_result.joint_names.begin(), it));
-      ordered_positions[i] = ik_result.positions_rad[idx];
-    }
-    resolved_target.kind = StreamingInputMode::kJoint;
-    resolved_target.joint_names = active_config.joint_names;
-    resolved_target.joint_positions_rad = ordered_positions;
-  } else if (target.kind == StreamingInputMode::kJoint) {
-    // Joint-mode normalization per spec/200 §2. Partial joint maps are
-    // valid input; the kernel overlays them onto the session's last
-    // commanded full vector before backend dispatch. Validation chain
-    // runs BEFORE any state mutation so rejected frames cannot move
-    // last_commanded_joints_.
-    if (target.joint_names.size() != target.joint_positions_rad.size()) {
-      result.accepted = false;
-      result.backend_sequence = 0;
-      result.error = ErrorDTO{
-          std::string(to_string(ErrorCode::kInvalidRequest)),
-          "joint_names.size() != joint_positions_rad.size()",
-          {{"reason_code", "malformed_frame"},
-           {"names_size", std::to_string(target.joint_names.size())},
-           {"positions_size",
-            std::to_string(target.joint_positions_rad.size())}}};
-      emit_event({KernelEventType::kStreamingTargetRejected,
-                  0,
-                  clock_.now(),
-                  {},
-                  {},
-                  result.error,
-                  {{"session_id", std::to_string(session_id)},
-                   {"source_sequence",
-                    std::to_string(target.source_sequence)},
-                   {"kind", "malformed_frame"}}});
-      return result;
-    }
-
-    // Duplicate-name check. Allowed-name check fused in (any partial
-    // entry whose name isn't in the session's joint_names is also
-    // implicitly a duplicate-or-unknown). We separate them so the
-    // operator sees the correct reason code.
-    std::map<std::string, size_t> seen;
-    for (size_t pi = 0; pi < target.joint_names.size(); ++pi) {
-      const auto& name = target.joint_names[pi];
-      auto inserted = seen.emplace(name, pi);
-      if (!inserted.second) {
-        result.accepted = false;
-        result.backend_sequence = 0;
-        result.error = ErrorDTO{
-            std::string(to_string(ErrorCode::kInvalidRequest)),
-            "duplicate joint name in streaming target: " + name,
-            {{"reason_code", "malformed_frame"}, {"joint_name", name}}};
-        emit_event({KernelEventType::kStreamingTargetRejected,
-                    0,
-                    clock_.now(),
-                    {},
-                    {},
-                    result.error,
-                    {{"session_id", std::to_string(session_id)},
-                     {"source_sequence",
-                      std::to_string(target.source_sequence)},
-                     {"kind", "malformed_frame"}}});
-        return result;
-      }
-    }
-
-    // Unknown-name check.
-    for (const auto& name : target.joint_names) {
-      if (std::find(active_config.joint_names.begin(),
-                    active_config.joint_names.end(), name)
-          == active_config.joint_names.end()) {
-        result.accepted = false;
-        result.backend_sequence = 0;
-        result.error = ErrorDTO{
-            std::string(to_string(ErrorCode::kUnknownJointName)),
-            "joint name not in session: " + name,
-            {{"joint_name", name}}};
-        emit_event({KernelEventType::kStreamingTargetRejected,
-                    0,
-                    clock_.now(),
-                    {},
-                    {},
-                    result.error,
-                    {{"session_id", std::to_string(session_id)},
-                     {"source_sequence",
-                      std::to_string(target.source_sequence)},
-                     {"kind", "unknown_joint_name"}}});
-        return result;
-      }
-    }
-
-    // Build the full session-order vector. Reuse last_commanded_joints_
-    // when valid; otherwise seed from the backend's current snapshot.
-    // A snapshot that doesn't cover every session joint is treated as
-    // stale and rejects the push without seeding.
-    std::vector<double> commanded_full;
-    bool need_seed = false;
-    {
-      std::lock_guard<std::mutex> lock(streaming_session_mutex_);
-      if (last_commanded_joints_valid_
-          && last_commanded_joints_.size() == active_config.joint_names.size()) {
-        commanded_full = last_commanded_joints_;
-      } else {
-        need_seed = true;
-      }
-    }
-    if (need_seed) {
-      auto current_state = context_.get_current_state();
-      commanded_full.assign(active_config.joint_names.size(), 0.0);
-      for (size_t i = 0; i < active_config.joint_names.size(); ++i) {
-        const auto& sname = active_config.joint_names[i];
-        auto cit = std::find(current_state.joint_names.begin(),
-                             current_state.joint_names.end(), sname);
-        if (cit == current_state.joint_names.end()) {
-          result.accepted = false;
-          result.backend_sequence = 0;
-          result.error = ErrorDTO{
-              std::string(to_string(ErrorCode::kInvalidRequest)),
-              "current robot state does not cover session joint: " + sname,
-              {{"reason_code", "stale_state"}, {"joint_name", sname}}};
-          emit_event({KernelEventType::kStreamingTargetRejected,
-                      0,
-                      clock_.now(),
-                      {},
-                      {},
-                      result.error,
-                      {{"session_id", std::to_string(session_id)},
-                       {"source_sequence",
-                        std::to_string(target.source_sequence)},
-                       {"kind", "stale_state"}}});
-          return result;
-        }
-        auto cidx = static_cast<size_t>(
-            std::distance(current_state.joint_names.begin(), cit));
-        commanded_full[i] = current_state.positions_rad[cidx];
-      }
-    }
-
-    // Overlay partial onto full. Names already validated as present in
-    // active_config.joint_names; the lookup is guaranteed to succeed.
-    for (size_t pi = 0; pi < target.joint_names.size(); ++pi) {
-      auto sit = std::find(active_config.joint_names.begin(),
-                           active_config.joint_names.end(),
-                           target.joint_names[pi]);
-      auto sidx = static_cast<size_t>(
-          std::distance(active_config.joint_names.begin(), sit));
-      commanded_full[sidx] = target.joint_positions_rad[pi];
-    }
-
-    resolved_target.kind = StreamingInputMode::kJoint;
-    resolved_target.joint_names = active_config.joint_names;
-    resolved_target.joint_positions_rad = commanded_full;
-  }
-
-  if (resolved_target.kind == StreamingInputMode::kJoint &&
-      resolved_target.joint_positions_rad.size()
-          == active_config.joint_names.size() &&
-      active_config.per_joint_position_lower.size()
-          == active_config.joint_names.size() &&
-      active_config.per_joint_position_upper.size()
-          == active_config.joint_names.size()) {
-    constexpr double kLimitTolerance = 1e-9;
-    for (size_t i = 0; i < resolved_target.joint_positions_rad.size(); ++i) {
-      const double value = resolved_target.joint_positions_rad[i];
-      const double lower = active_config.per_joint_position_lower[i];
-      const double upper = active_config.per_joint_position_upper[i];
-      if ((std::isfinite(lower) && value < lower - kLimitTolerance) ||
-          (std::isfinite(upper) && value > upper + kLimitTolerance)) {
-        result.accepted = false;
-        result.backend_sequence = 0;
-        result.error = ErrorDTO{
-            std::string(to_string(ErrorCode::kValidationLimitsViolation)),
-            "streaming target joint position exceeds configured limits",
-            {{"reason_code", "joint_position_limit"},
-             {"joint_name", active_config.joint_names[i]},
-             {"position_rad", std::to_string(value)},
-             {"limit_lower", std::to_string(lower)},
-             {"limit_upper", std::to_string(upper)}}};
-        emit_event({KernelEventType::kStreamingTargetRejected,
-                    0,
-                    clock_.now(),
-                    {},
-                    {},
-                    result.error,
-                    {{"session_id", std::to_string(session_id)},
-                     {"source_sequence",
-                      std::to_string(target.source_sequence)},
-                     {"kind", "joint_position_limit"}}});
-        return result;
-      }
-    }
-  }
-
-  if (!streaming_target_is_latest()) {
-    return reject_streaming_collision(
-        ErrorDTO{kErrorInvalidRequest,
-                 "streaming target superseded by a newer target",
-                 {{"reason_code", "superseded_by_newer_streaming_target"},
-                  {"phase", "streaming_target_validation"}}});
-  }
-
-  auto collision_validation = validate_streaming_target_collision(
-      active_config, resolved_target, validation_sequence, session_id,
-      target.source_sequence);
-  if (!collision_validation.ok()) {
-    return reject_streaming_collision(collision_validation.error());
-  }
-
-  // Forward to backend using the BACKEND's session_id (assigned at begin
-  // time), not the kernel's. Kernel and backend counters are independent;
-  // mapping must use the backend's view.
-  auto backend_result =
-      execution_backend_.push_streaming_target(backend_session_id,
-                                                resolved_target);
-  result = backend_result;
-
-  if (result.accepted) {
-    std::lock_guard<std::mutex> lock(streaming_session_mutex_);
-    if (active_streaming_session_id_ != session_id ||
-        active_backend_session_id_ != backend_session_id ||
-        active_streaming_generation_ != session_generation) {
-      result.accepted = false;
-      result.backend_sequence = 0;
-      result.error = ErrorDTO{
-          std::string(to_string(ErrorCode::kInvalidRequest)),
-          "streaming session changed while target was being processed",
-          {{"reason_code", "session_lost"},
-           {"requested_session_id", std::to_string(session_id)}}};
-      emit_event({KernelEventType::kStreamingTargetRejected,
-                  0,
-                  clock_.now(),
-                  {},
-                  {},
-                  result.error,
-                  {{"session_id", std::to_string(session_id)},
-                   {"source_sequence",
-                    std::to_string(target.source_sequence)},
-                   {"kind", "session_lost"}}});
-      return result;
-    }
-  }
-
-  // On accept: record the cartesian position as the new
-  // last-accepted-frame anchor for speed-limit enforcement on the next
-  // push. Track the kernel clock at acceptance time, not the
-  // source_timestamp_ns — the speed limit is on what the kernel
-  // actually commanded, not what the upstream client claimed.
-  if (result.accepted && target.kind == StreamingInputMode::kCartesian) {
-    std::lock_guard<std::mutex> lock(streaming_session_mutex_);
-    last_accepted_cartesian_pos_ = target.position_m;
-    last_accepted_cartesian_pos_valid_ = true;
-    last_accepted_cartesian_ts_ns_ = clock_.now();
-  }
-
-  // Update last_commanded_joints_ on backend ACCEPT (target register
-  // updated) for both joint and IK-resolved-cartesian targets, so a
-  // cartesian drag followed by a partial joint slider overlays onto
-  // the post-cartesian joint configuration rather than a stale
-  // pre-cartesian one. Spec/200 §2: last-commanded state moves on
-  // accept, not on theoretical controller dispatch.
-  if (result.accepted
-      && resolved_target.kind == StreamingInputMode::kJoint
-      && !resolved_target.joint_positions_rad.empty()
-      && resolved_target.joint_positions_rad.size()
-             == active_config.joint_names.size()) {
-    std::lock_guard<std::mutex> lock(streaming_session_mutex_);
-    last_commanded_joints_ = resolved_target.joint_positions_rad;
-    last_commanded_joints_valid_ = true;
-  }
-
-  // Per-target events are coalescible / sampled; spec 200 §4 explicitly
-  // allows them to not be 1:1 with calls. Emit on accept and on reject so
-  // the failure archive captures rejections.
-  if (result.accepted) {
-    emit_event({KernelEventType::kStreamingTargetReceived,
-                0,
-                clock_.now(),
-                {},
-                {},
-                std::nullopt,
-                {{"session_id", std::to_string(session_id)},
-                 {"backend_sequence",
-                  std::to_string(result.backend_sequence)},
-                 {"source_sequence",
-                  std::to_string(target.source_sequence)},
-                 {"kind", to_string(target.kind)}}});
-    // For the v0.1 backends the push call IS the dispatch (the backend's
-    // dispatcher worker reads the register at the next tick). Emit
-    // kStreamingTargetDispatched so the failure archive / event stream
-    // can correlate operator frame → controller goal submission. Future
-    // backends with deeper queueing should emit this separately when the
-    // goal actually reaches the controller.
-    emit_event({KernelEventType::kStreamingTargetDispatched,
-                0,
-                clock_.now(),
-                {},
-                {},
-                std::nullopt,
-                {{"session_id", std::to_string(session_id)},
-                 {"backend_sequence",
-                  std::to_string(result.backend_sequence)},
-                 {"source_sequence",
-                  std::to_string(target.source_sequence)},
-                 {"resolved_kind",
-                  to_string(resolved_target.kind)}}});
-  } else {
-    emit_event({KernelEventType::kStreamingTargetRejected,
-                0,
-                clock_.now(),
-                {},
-                {},
-                result.error,
-                {{"session_id", std::to_string(session_id)},
-                 {"source_sequence",
-                  std::to_string(target.source_sequence)},
-                 {"kind", to_string(target.kind)}}});
-  }
-  return result;
-}
-
-StreamingSessionEndResultDTO ExecutionKernel::end_streaming_session(
-    uint64_t session_id,
-    SoftStopStrategy strategy) {
-  std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
-  return end_streaming_session_unlocked(session_id, strategy);
-}
-
-StreamingSessionEndResultDTO ExecutionKernel::end_streaming_session_unlocked(
-    uint64_t session_id,
-    SoftStopStrategy strategy) {
-  StreamingSessionEndResultDTO result;
-
-  const auto prev_state = sm_.status().state;
-  if (prev_state != ExecutionState::kStreaming) {
-    result.accepted = false;
-    result.error = ErrorDTO{
-        std::string(to_string(ErrorCode::kInvalidStateTransition)),
-        "end_streaming_session valid only from Streaming",
-        {{"state", to_string(prev_state)}}};
-    return result;
-  }
-
-  uint64_t backend_session_id = 0;
-  {
-    std::lock_guard<std::mutex> lock(streaming_session_mutex_);
-    if (active_streaming_session_id_ == 0 ||
-        active_streaming_session_id_ != session_id) {
-      result.accepted = false;
-      result.error = ErrorDTO{
-          std::string(to_string(ErrorCode::kInvalidRequest)),
-          "session_id does not match active streaming session",
-          {{"requested_session_id", std::to_string(session_id)},
-           {"active_session_id",
-            std::to_string(active_streaming_session_id_)}}};
-      return result;
-    }
-    backend_session_id = active_backend_session_id_;
-  }
-  cancel_active_streaming_target_validation("streaming_session_ending");
-
-  // Move through Stopping during the backend soft-stop. The backend's
-  // soft-stop trajectory still has to play out; we report Stopping until
-  // the backend acks, then transition to Stopped.
-  auto stopping_result = sm_.try_transition(ExecutionState::kStopping);
-  if (!stopping_result.ok()) {
-    result.accepted = false;
-    result.error = stopping_result.error();
-    return result;
-  }
-  emit_event({KernelEventType::kStateTransition,
-              0,
-              clock_.now(),
-              prev_state,
-              ExecutionState::kStopping,
-              std::nullopt,
-              {{"session_id", std::to_string(session_id)},
-               {"soft_stop_strategy", to_string(strategy)}}});
-
-  auto backend_result =
-      execution_backend_.end_streaming_session(backend_session_id, strategy);
-  if (!backend_result.accepted) {
-    // The soft-stop itself failed; route to InterventionRequired since
-    // the backend may still be commanding motion in an unknown state.
-    (void)sm_.try_transition(ExecutionState::kInterventionRequired);
-    emit_event({KernelEventType::kErrorRaised,
-                0,
-                clock_.now(),
-                {},
-                {},
-                backend_result.error,
-                {{"session_id", std::to_string(session_id)}}});
-    // Still clear local bookkeeping — the kernel can't recover this
-    // session anyway, and a future begin must be permitted once the
-    // operator hits reset.
-    {
-      std::lock_guard<std::mutex> lock(streaming_session_mutex_);
-      active_streaming_session_id_ = 0;
-      active_backend_session_id_ = 0;
-      ++active_streaming_generation_;
-      active_streaming_config_ = StreamingSessionConfigDTO{};
-      active_soft_stop_strategy_ = SoftStopStrategy::kSpringBack;
-      last_accepted_cartesian_pos_valid_ = false;
-      last_accepted_cartesian_ts_ns_ = 0;
-      last_commanded_joints_valid_ = false;
-      last_commanded_joints_.clear();
-    }
-    return backend_result;
-  }
-
-  auto final_backend_snapshot = execution_backend_.get_execution_snapshot();
-
-  auto stopped_result = sm_.try_transition(ExecutionState::kStopped);
-  if (!stopped_result.ok()) {
-    // State machine refused the Stopped transition — surface as
-    // InterventionRequired rather than papering over.
-    (void)sm_.try_transition(ExecutionState::kInterventionRequired);
-    result.accepted = false;
-    result.error = stopped_result.error();
-    {
-      std::lock_guard<std::mutex> lock(streaming_session_mutex_);
-      active_streaming_session_id_ = 0;
-      active_backend_session_id_ = 0;
-      ++active_streaming_generation_;
-      active_streaming_config_ = StreamingSessionConfigDTO{};
-      active_soft_stop_strategy_ = SoftStopStrategy::kSpringBack;
-      last_accepted_cartesian_pos_valid_ = false;
-      last_accepted_cartesian_ts_ns_ = 0;
-      last_commanded_joints_valid_ = false;
-      last_commanded_joints_.clear();
-    }
-    return result;
-  }
-
-  uint64_t closed_kernel_id = 0;
-  {
-    std::lock_guard<std::mutex> lock(streaming_session_mutex_);
-    closed_kernel_id = active_streaming_session_id_;
-    active_streaming_session_id_ = 0;
-    active_backend_session_id_ = 0;
-    ++active_streaming_generation_;
-    active_streaming_config_ = StreamingSessionConfigDTO{};
-    active_soft_stop_strategy_ = SoftStopStrategy::kSpringBack;
-    last_accepted_cartesian_pos_valid_ = false;
-    last_accepted_cartesian_ts_ns_ = 0;
-    last_commanded_joints_valid_ = false;
-    last_commanded_joints_.clear();
-  }
-
-  emit_event({KernelEventType::kStreamingSessionEnded,
-              0,
-              clock_.now(),
-              {},
-              {},
-              std::nullopt,
-              {{"session_id", std::to_string(closed_kernel_id)},
-               {"soft_stop_strategy", to_string(strategy)}}});
-  emit_event({KernelEventType::kStateTransition,
-              0,
-              clock_.now(),
-              ExecutionState::kStopping,
-              ExecutionState::kStopped,
-              std::nullopt,
-              {{"session_id", std::to_string(closed_kernel_id)}}});
-
-  // ADR-0016: streaming-session end is operator-acknowledged at release
-  // time (mouseUp ≡ "I'm done"). Auto-return to kIdle so the next
-  // begin_streaming_session is admitted without requiring an explicit
-  // reset click. Distinct from discrete trajectories, which require
-  // acknowledge_completed.
-  auto idle_result = sm_.try_transition(ExecutionState::kIdle);
-  if (idle_result.ok()) {
-    emit_event({KernelEventType::kStateTransition,
-                0,
-                clock_.now(),
-                ExecutionState::kStopped,
-                ExecutionState::kIdle,
-                std::nullopt,
-                {{"session_id", std::to_string(closed_kernel_id)},
-                 {"reason", "streaming_session_acknowledged"}}});
-  }
-
-  final_backend_snapshot.state = sm_.status().state;
-  final_backend_snapshot.progress = 0.0;
-  final_backend_snapshot.execution_id = 0;
-  final_backend_snapshot.move_id.clear();
-  final_backend_snapshot.timestamp_ns = clock_.now();
-  publish_execution_snapshot(std::move(final_backend_snapshot));
-
-  result.accepted = true;
-  return result;
 }
 
 }  // namespace manyforge::core
