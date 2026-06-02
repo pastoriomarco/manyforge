@@ -507,6 +507,28 @@ _TREE_NODE_PAYLOAD_FOR_INSERT_SCHEMA: dict[str, Any] = {
                 "an existing identifier."
             ),
         },
+        # 2026-06-01 (validator-loop fix): accept-and-ignore `name`.
+        # Many models duplicate the top-level `nodeName` argument inside
+        # `node.name` (mirroring the older `_TREE_NODE_SCHEMA` shape used
+        # by replace_subtree/wrap_node). Previously `additionalProperties:
+        # false` rejected this, producing the misleading "node: must not
+        # have additional properties / node: must be string" error that
+        # sent models into a death spiral (object → string → object).
+        # The handler reads `nodeName` from the top level; `node.name` is
+        # accepted but not used. If models pass mismatched values, the
+        # top-level `nodeName` wins.
+        "name": {
+            "type": "string",
+            "minLength": 1,
+            "description": (
+                "Optional duplicate of the top-level `nodeName` argument. "
+                "Accepted for compatibility with payloads that mirror the "
+                "replace_subtree/wrap_node shape; the handler ignores this "
+                "field and uses the top-level `nodeName` instead. Prefer "
+                "omitting this and passing the instance name only at the "
+                "top level."
+            ),
+        },
         "params": {
             "type": "object",
             "additionalProperties": True,

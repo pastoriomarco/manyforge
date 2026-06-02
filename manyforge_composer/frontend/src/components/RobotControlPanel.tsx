@@ -1588,6 +1588,11 @@ function GripperRow({
       setPending(null);
     }
   }, [cycleState]);
+  useEffect(() => {
+    if (candidate?.inputMode !== 'gripper') {
+      setPending(null);
+    }
+  }, [candidate?.inputMode]);
   const lower = gripper.limit_lower ?? 0;
   const upper = gripper.limit_upper ?? 1;
   const current = gripper.current_position ?? lower;
@@ -2037,6 +2042,7 @@ function JointRow({
   const { draft, isDraft, setDraft, clearDraft } = usePersistentDraft(
     currentValue === null ? Number.NaN : currentValue,
     jointArrivalTolerance(joint),
+    'joint',
   );
   const divergesFromLive = isDraft;
   const draftNumeric = draft === null ? displayValue : Number(draft);

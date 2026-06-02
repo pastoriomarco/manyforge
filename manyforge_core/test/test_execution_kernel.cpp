@@ -1885,6 +1885,11 @@ TEST_F(ExecutionKernelTest, Execute_FromCompleted_RequiresAcknowledgement) {
   auto ack = kernel.acknowledge_completed(first.value());
   ASSERT_TRUE(ack.accepted);
   EXPECT_EQ(kernel.get_status().state, ExecutionState::kIdle);
+  auto idle_snapshot = kernel.get_execution_snapshot();
+  EXPECT_EQ(idle_snapshot.state, ExecutionState::kIdle);
+  ASSERT_EQ(idle_snapshot.joint_positions_rad.size(), 2u);
+  EXPECT_EQ(idle_snapshot.joint_positions_rad[0], 1.0);
+  EXPECT_EQ(idle_snapshot.joint_positions_rad[1], 1.0);
 
   auto result = execute_sync(make_test_request());
   EXPECT_TRUE(result.ok());

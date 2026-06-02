@@ -57,6 +57,9 @@ class TestMockKernelExecute:
         ack = kernel.acknowledge_completed(first.execution_id)
         assert ack.accepted
         assert kernel.get_status().state == ExecutionState.IDLE
+        snapshot = kernel.get_execution_snapshot()
+        assert snapshot.state == ExecutionState.IDLE
+        assert snapshot.joint_positions_rad == [0.5, 1.0]
 
         result = kernel.execute(make_request("move_2"))
         assert result.ok

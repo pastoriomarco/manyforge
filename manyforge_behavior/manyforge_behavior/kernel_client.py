@@ -677,6 +677,8 @@ class MockKernelClient(KernelClient):
         self._snapshot_sequence = 0
         self._execute_duration_s = execute_duration_s
         self._execute_start: Optional[float] = None
+        self._active_goal_positions_rad: List[float] = []
+        self._last_joint_positions_rad: List[float] = []
         self.last_execute_request: Optional[ExecuteRequest] = None
         self.execute_count = 0
         self.stop_count = 0
@@ -725,6 +727,7 @@ class MockKernelClient(KernelClient):
         }
         # Joint names (configurable for tests)
         self._joint_names = joint_names if joint_names is not None else ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6"]
+        self._last_joint_positions_rad = [0.0 for _ in self._joint_names]
         self.last_gripper_command_request: Optional[GripperCommandRequest] = None
         self.gripper_command_count = 0
         self.fail_next_gripper_command = False
@@ -806,6 +809,7 @@ class MockKernelClient(KernelClient):
         self._next_id += 1
         self._execution_id = eid
         self._active_move_id = request.move_id
+        self._active_goal_positions_rad = self._positions_for_request(request)
         self._emit_kernel_event("plan_started")
         if self._execute_duration_s > 0:
             self._state = ExecutionState.EXECUTING
@@ -814,6 +818,7 @@ class MockKernelClient(KernelClient):
             self._emit_kernel_event("execute_started")
         else:
             self._state = ExecutionState.COMPLETED
+            self._last_joint_positions_rad = list(self._active_goal_positions_rad)
             self._metrics["executions_completed"] += 1
             self._emit_kernel_event("state_transition", from_state="idle", to_state="completed")
             self._emit_kernel_event("execute_completed")
@@ -826,6 +831,14 @@ class MockKernelClient(KernelClient):
             outcome = self._stamp_outcome(eid, request)
             self._outcomes[eid] = outcome
         return ExecuteResult(ok=True, execution_id=eid)
+
+    def _positions_for_request(self, request: ExecuteRequest) -> List[float]:
+        if (
+            request.motion_type == "joint_goal"
+            and request.joint_goal_positions_rad
+        ):
+            return [float(v) for v in request.joint_goal_positions_rad]
+        return list(self._last_joint_positions_rad)
 
     def _stamp_outcome(
         self, execution_id: int, request: ExecuteRequest
@@ -1042,6 +1055,7 @@ class MockKernelClient(KernelClient):
             elapsed = time.monotonic() - self._execute_start
             if elapsed >= self._execute_duration_s:
                 self._state = ExecutionState.COMPLETED
+                self._last_joint_positions_rad = list(self._active_goal_positions_rad)
                 self._execute_start = None
                 self._metrics["executions_completed"] += 1
                 self._emit_kernel_event("execute_completed")
@@ -1078,6 +1092,7 @@ class MockKernelClient(KernelClient):
             move_id=self._active_move_id,
             state=status.state,
             progress=status.progress,
+            joint_positions_rad=list(self._last_joint_positions_rad),
         )
 
     def invalidate_trajectories(self) -> None:

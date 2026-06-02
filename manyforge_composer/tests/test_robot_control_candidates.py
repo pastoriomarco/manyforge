@@ -103,8 +103,8 @@ def _loaded_client(
     # which calls cycle_manager.reset()). Without it, an Approve dispatch would
     # tick a move node before the kernel is on the blackboard.
     state.cycle_manager.reset()
-    # The mock execution snapshot reports no joint positions, so seed a current
-    # full-joint vector matching the kernel's joints for candidate planning.
+    # Seed a current full-joint vector matching the kernel's joints for
+    # candidate planning before any execution has happened.
     state.record_current_joint_positions([0.0] * len(live_kernel.get_joint_names()))
     # Reset recorded calls so per-test assertions measure only candidate effects
     # (the prepare step applies the program scene via scene_edit).
@@ -132,6 +132,14 @@ def _cartesian_body() -> dict:
             "tcpFrame": "tool0",
         },
     }
+
+
+def _set_mock_robot_positions(
+    state: ComposerState, kernel: MockKernelClient, positions: list[float]
+) -> None:
+    """Update both the fallback Composer cache and the mock's live snapshot."""
+    state.record_current_joint_positions(positions)
+    kernel._last_joint_positions_rad = list(positions)  # type: ignore[attr-defined]
 
 
 # ---------------------------------------------------------------------------
@@ -488,6 +496,32 @@ def test_latest_wins_supersedes_prior_for_same_surface(tmp_path: Path) -> None:
     assert prior["commitEligible"] is False
 
 
+def test_latest_wins_supersedes_prior_across_move_groups() -> None:
+    """Robot Control has one shared Approve button, so the server keeps one
+    active unapproved candidate globally. A joint draft supersedes a prior
+    gripper draft even though they come from different source surfaces."""
+    from manyforge_composer.backend.robot_control_candidates import (
+        _CandidateStore,
+        CandidateCreateRequest,
+        CandidateStatus,
+    )
+
+    store = _CandidateStore()
+    gripper_req = CandidateCreateRequest.model_validate(_gripper_body(0.1))
+    joint_req = CandidateCreateRequest.model_validate(_joint_body())
+    gripper_id, _ = store.reserve(gripper_req)
+    joint_id, _ = store.reserve(joint_req)
+
+    should_plan_gripper, gripper_view = store.begin_planning(gripper_id)
+    should_plan_joint, joint_view = store.begin_planning(joint_id)
+    assert should_plan_gripper is False
+    assert gripper_view is not None
+    assert gripper_view.status is CandidateStatus.SUPERSEDED
+    assert gripper_view.commit_eligible is False
+    assert should_plan_joint is True
+    assert joint_view is None
+
+
 def test_latest_wins_ordered_by_request_arrival_not_planning_completion(
     tmp_path: Path,
 ) -> None:
@@ -495,9 +529,10 @@ def test_latest_wins_ordered_by_request_arrival_not_planning_completion(
     NEWER candidate must stay ready and the OLDER one must end superseded.
 
     Ordering is driven by REQUEST ARRIVAL (reserve() under the lock), not by
-    when each preview plan happens to finish. We make the first (older)
-    preview_motion block until the newer request has fully reserved+filled, so
-    the slow older request can no longer leap-frog the newer generation.
+    when each preview plan happens to finish. Composer serializes native preview
+    work, so the newer request may wait for the currently-running preview, but
+    its reservation still supersedes the older candidate before final state is
+    persisted.
     """
     client, _state, kernel = _loaded_client(tmp_path)
 
@@ -512,8 +547,8 @@ def test_latest_wins_ordered_by_request_arrival_not_planning_completion(
             call_index["n"] += 1
             my_index = call_index["n"]
         if my_index == 1:
-            # The older request: signal arrival, then block until the newer
-            # request has reserved a higher generation and filled.
+            # The older request: signal arrival, then block while the newer
+            # request reserves a higher generation.
             older_entered_preview.set()
             assert release_older_preview.wait(timeout=5.0)
         return real_preview_motion(request, start_state)
@@ -534,33 +569,67 @@ def test_latest_wins_ordered_by_request_arrival_not_planning_completion(
     # it has already reserved its (lower) generation slot.
     assert older_entered_preview.wait(timeout=5.0)
 
-    # Now fire the newer request; it reserves a HIGHER generation, supersedes
-    # the older PLANNING placeholder, plans fast, and fills to ready.
+    # Now fire the newer request; it reserves a HIGHER generation and supersedes
+    # the older PLANNING placeholder. Its preview is serialized behind the
+    # currently-running older preview.
     newer_thread = threading.Thread(target=post_newer)
     newer_thread.start()
-    newer_thread.join(timeout=5.0)
-    assert "newer" in results, "newer request did not complete"
+    time.sleep(0.05)
 
-    # Release the slow older preview so its fill() lands.
+    # Release the slow older preview so both route calls can complete.
     release_older_preview.set()
     older_thread.join(timeout=5.0)
+    newer_thread.join(timeout=5.0)
     assert "older" in results, "older request did not complete"
+    assert "newer" in results, "newer request did not complete"
 
     older = results["older"]
     newer = results["newer"]
     # Arrival order: older got the lower generation, newer the higher.
     assert newer["generation"] == older["generation"] + 1
-    # The newer candidate is the live ready one; the older ends superseded even
-    # though its planning finished LAST.
+    # The newer candidate is the live ready one; the older is superseded even
+    # though it was the request whose preview entered the planner first.
     assert newer["status"] == "ready"
-    assert older["status"] == "superseded"
-    assert older["commitEligible"] is False
     # GET confirms the persisted state matches.
     newer_get = client.get(f"{_BASE}/{newer['candidateId']}").json()
     older_get = client.get(f"{_BASE}/{older['candidateId']}").json()
     assert newer_get["status"] == "ready"
     assert older_get["status"] == "superseded"
+    assert older_get["commitEligible"] is False
     assert kernel.execute_count == 0
+
+
+def test_superseded_reserved_candidate_skips_preview_motion(tmp_path: Path) -> None:
+    """A candidate that was queued for planning but superseded before it claims
+    the planning slot must not call the native planner at all. This is the
+    server-side coalescing guard for slider/spinner bursts."""
+    from manyforge_composer.backend.robot_control_candidates import (
+        _CandidateStore,
+        _plan_reserved_candidate,
+        CandidateCreateRequest,
+    )
+
+    _client, state, kernel = _loaded_client(tmp_path)
+    store = _CandidateStore()
+    first_req = CandidateCreateRequest.model_validate(_joint_body())
+    first_id, _first_gen = store.reserve(first_req)
+    second_req = CandidateCreateRequest.model_validate(
+        {
+            "sourceSurface": "joint_slider",
+            "inputMode": "joint",
+            "jointTarget": {"jointNames": ["joint1"], "positionsRad": [0.8]},
+        }
+    )
+    second_id, _second_gen = store.reserve(second_req)
+    assert first_id != second_id
+
+    def fail_if_called(_request, _start_state=None):
+        raise AssertionError("superseded candidate should not call preview_motion")
+
+    kernel.preview_motion = fail_if_called  # type: ignore[assignment]
+    skipped = _plan_reserved_candidate(state, store, first_id, first_req)
+    assert skipped.status == "superseded"
+    assert skipped.commit_eligible is False
 
 
 def test_candidate_goes_stale_when_robot_moves(tmp_path: Path) -> None:
@@ -568,7 +637,9 @@ def test_candidate_goes_stale_when_robot_moves(tmp_path: Path) -> None:
     cid = client.post(_BASE, json=_joint_body()).json()["candidateId"]
     assert client.get(f"{_BASE}/{cid}").json()["status"] == "ready"
     # Authoritative robot state changes after planning.
-    state.record_current_joint_positions([0.9] + [0.0] * (len(kernel.get_joint_names()) - 1))
+    _set_mock_robot_positions(
+        state, kernel, [0.9] + [0.0] * (len(kernel.get_joint_names()) - 1)
+    )
     stale = client.get(f"{_BASE}/{cid}").json()
     assert stale["status"] == "stale"
     assert stale["commitEligible"] is False
@@ -674,7 +745,7 @@ def test_execute_fresh_ready_candidate_dispatches(tmp_path: Path) -> None:
 def test_get_executing_candidate_maps_completed_runtime_outcome(
     tmp_path: Path,
 ) -> None:
-    client, _state, kernel = _loaded_client(tmp_path)
+    client, state, kernel = _loaded_client(tmp_path)
     cid = client.post(_BASE, json=_joint_body()).json()["candidateId"]
     resp = client.post(f"{_BASE}/{cid}/execute")
     assert resp.status_code == 200, resp.text
@@ -694,7 +765,10 @@ def test_get_executing_candidate_maps_completed_runtime_outcome(
     assert body["commitEligible"] is False
     assert body["diagnostics"]["reasonCode"] == "execution_completed"
     assert body["execution"]["sessionStatus"] == "completed"
+    assert body["execution"]["state"] == "completed"
+    assert body["execution"]["progress"] == 1.0
     assert kernel.execute_count >= 1
+    assert state.get_current_joint_positions()[0] == pytest.approx(0.3)
 
 
 @pytest.mark.parametrize(
@@ -760,8 +834,8 @@ def test_execute_stale_candidate_409_no_motion(tmp_path: Path) -> None:
     client, state, kernel = _loaded_client(tmp_path)
     cid = client.post(_BASE, json=_joint_body()).json()["candidateId"]
     # Robot moves after planning -> approval must fail closed without motion.
-    state.record_current_joint_positions(
-        [0.9] + [0.0] * (len(kernel.get_joint_names()) - 1)
+    _set_mock_robot_positions(
+        state, kernel, [0.9] + [0.0] * (len(kernel.get_joint_names()) - 1)
     )
     resp = client.post(f"{_BASE}/{cid}/execute")
     assert resp.status_code == 409
@@ -1016,6 +1090,35 @@ def test_scene_state_path_clears_gripper_executing_after_completion(
     assert _primary(_collect_gripper_states(state, advance_commands=True)).state == (
         "completed"
     )
+
+
+def test_gripper_candidate_get_clears_executing_after_completion(
+    tmp_path: Path,
+) -> None:
+    """A gripper candidate has no arm execution/session payload, but the
+    candidate endpoint still owns the UI lifecycle after Approve. Polling it
+    must advance and report the gripper bridge terminal state so the browser
+    cannot stay locally stuck at `executing` and block the next command."""
+    client, _state, _kernel = _gripper_client(tmp_path)
+    cid = client.post(
+        _BASE,
+        json={
+            "sourceSurface": "gripper_slider",
+            "inputMode": "gripper",
+            "gripperTarget": {
+                "gripperId": "primary",
+                "targetPosition": 0.1,
+                "durationS": 0.05,
+            },
+        },
+    ).json()["candidateId"]
+    assert client.post(f"{_BASE}/{cid}/execute").status_code == 200
+    time.sleep(0.12)
+
+    body = client.get(f"{_BASE}/{cid}").json()
+    assert body["status"] == "completed", body
+    assert body["diagnostics"]["reasonCode"] == "execution_completed"
+    assert body["diagnostics"]["details"]["gripperState"] == "completed"
 
 
 def test_gripper_mode_requires_gripper_surface(tmp_path: Path) -> None:

@@ -1166,6 +1166,82 @@ def _scene_sync_resource_request(resource: Any) -> SceneEditRequest:
     )
 
 
+def _preview_joint_link_poses_via_visual_fk(
+    state: ComposerState,
+    payload: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Compute visual-only joint preview poses from the full URDF model.
+
+    Native planner FK can be scoped to the active planning group. That is
+    correct for planning, but gripper candidate ghosts need full-URDF visual
+    links outside the arm group. The visual snapshot model is kinematics-only
+    and observer-safe: it computes poses for rendering without mutating the
+    live scene or commanding motion.
+    """
+    try:
+        joint_names = [str(name) for name in (payload.get("joint_names") or [])]
+        joint_positions = [
+            float(position) for position in (payload.get("joint_positions_rad") or [])
+        ]
+        link_names = [str(name) for name in (payload.get("link_names") or [])]
+        if not joint_names or len(joint_names) != len(joint_positions) or not link_names:
+            return None
+
+        robot_id, group_id, base_frame, tcp_frame, base_pose = _base_robot_route_metadata(state)
+        joint_positions_by_name = {
+            name: position for name, position in zip(joint_names, joint_positions)
+        }
+        urdf_model_key = None
+        try:
+            from .routes_urdf import active_urdf_model_key
+
+            urdf_model_key = active_urdf_model_key(state)
+        except Exception:
+            urdf_model_key = None
+        robot_info = SceneRobotResponse(
+            robot_id=robot_id,
+            group_id=group_id,
+            urdf_model_key=urdf_model_key,
+            base_frame=base_frame,
+            tcp_frame=tcp_frame,
+            base_pose=base_pose,
+            joint_names=joint_names,
+            joint_positions=joint_positions_by_name,
+            **_execution_authority_metadata(state),
+        )
+        visual_state = build_robot_visual_snapshot(
+            state,
+            robot=robot_info,
+            joint_names=joint_names,
+            joint_positions_rad=joint_positions,
+            link_names=link_names,
+            reference_frame=str(payload.get("base_frame") or canonical_scene_world_frame(state)),
+            base_frame=base_frame,
+            base_pose=base_pose,
+        )
+    except (TypeError, ValueError) as exc:
+        logger.debug(
+            "visual FK preview rejected malformed joint payload",
+            exc_info=True,
+            extra={"event": "preview_link_poses_visual_fk_malformed"},
+        )
+        return {"reachable": False, "reason": f"malformed_joint_preview: {exc}"}
+    except VisualSnapshotUnavailable as exc:
+        logger.debug(
+            "visual FK preview unavailable: %s",
+            exc.reason,
+            exc_info=True,
+            extra={"event": "preview_link_poses_visual_fk_unavailable"},
+        )
+        return {"reachable": False, "reason": exc.reason}
+    return {
+        "reachable": True,
+        "joint_names": joint_names,
+        "joint_positions_rad": joint_positions,
+        "link_poses": dict(visual_state.link_poses),
+    }
+
+
 def create_scene_router(state: ComposerState) -> APIRouter:
     """Create the scene router with the given state."""
     router = APIRouter()
@@ -1343,14 +1419,19 @@ def create_scene_router(state: ComposerState) -> APIRouter:
         """
         if state.kernel is None:
             return {"reachable": False, "reason": "no_kernel"}
+        payload = dict(payload)
+        kind = str(payload.get("kind") or "joint")
         compute = getattr(state.kernel, "compute_target_link_poses", None)
         if compute is None:
             # Older kernel client without the FK preview binding.
+            if kind == "joint":
+                fallback = _preview_joint_link_poses_via_visual_fk(state, payload)
+                if fallback is not None:
+                    return fallback
             return {"reachable": False, "reason": "unsupported_capability"}
         # Default link_names to all visual links if caller didn't
         # supply (frontend usually has the URDF manifest and passes
         # the link list explicitly, but a missing list is non-fatal).
-        payload = dict(payload)
         if not payload.get("link_names"):
             try:
                 from .routes_urdf import visual_link_names_for_fk
@@ -1360,8 +1441,21 @@ def create_scene_router(state: ComposerState) -> APIRouter:
         if not payload.get("base_frame"):
             payload["base_frame"] = canonical_scene_world_frame(state)
         try:
-            return compute(payload)
+            result = compute(payload)
+            if (
+                kind == "joint"
+                and result.get("reachable") is True
+                and not result.get("link_poses")
+            ):
+                fallback = _preview_joint_link_poses_via_visual_fk(state, payload)
+                if fallback is not None:
+                    return fallback
+            return result
         except Exception as exc:  # pragma: no cover — defensive
+            if kind == "joint":
+                fallback = _preview_joint_link_poses_via_visual_fk(state, payload)
+                if fallback is not None:
+                    return fallback
             return {"reachable": False, "reason": f"internal_error: {exc}"}
 
     @router.get("/diagnostics")

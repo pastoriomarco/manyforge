@@ -4043,6 +4043,11 @@ AcknowledgeCompletedResultDTO ExecutionKernel::acknowledge_completed(
   if (!result.ok()) {
     return AcknowledgeCompletedResultDTO{false, result.error()};
   }
+  ExecutionSnapshot last_completed_snapshot;
+  {
+    std::lock_guard<std::mutex> snapshot_lock(snapshot_mutex_);
+    last_completed_snapshot = published_snapshot_;
+  }
   sm_.set_execution_id(0);
   {
     std::lock_guard<std::mutex> move_lock(active_move_id_mutex_);
@@ -4054,6 +4059,7 @@ AcknowledgeCompletedResultDTO ExecutionKernel::acknowledge_completed(
   snapshot.execution_id = 0;
   snapshot.state = ExecutionState::kIdle;
   snapshot.progress = 0.0;
+  snapshot.joint_positions_rad = std::move(last_completed_snapshot.joint_positions_rad);
   publish_execution_snapshot(std::move(snapshot));
 
   emit_event({KernelEventType::kCompletedAcknowledged,

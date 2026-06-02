@@ -11,6 +11,7 @@ Operator-facing wire contract: `docs/reference/ASSISTANT_PROVIDER_CONTRACT.md`.
 
 from __future__ import annotations
 
+import asyncio
 import collections
 import copy
 import hashlib
@@ -96,6 +97,157 @@ COMPOSER_DRAFT_MUTATING_EFFECT = "composer_draft_mutating"
 RUNTIME_MUTATING_EFFECT = "runtime_mutating"
 
 _CANCELLED_REQUESTS: set[str] = set()
+
+# ---------------------------------------------------------------------------
+# Direct-lane conversation history (Phase 1 of V9.1 plan)
+# ---------------------------------------------------------------------------
+# Brings the direct vLLM lane to feature parity with the OpenClaw lane for
+# multi-turn workflows. Stores per-conversation message history in memory,
+# keyed by the composer's `conversationId` field. Each request prepends the
+# stored history before the new user message; after a successful response,
+# the full message array (including intermediate tool calls and results) is
+# saved back. Sessions are LRU-evicted when MAX_SESSIONS is exceeded and
+# auto-evicted after IDLE_TTL_S seconds of inactivity.
+#
+# The OpenClaw lane is unaffected — it doesn't read/write conversation_id
+# through this code path; its history lives in the OpenClaw gateway.
+
+DIRECT_LANE_HISTORY_ENABLED = (
+    os.environ.get("DIRECT_LANE_HISTORY_ENABLED", "true").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
+DIRECT_LANE_HISTORY_MAX_SESSIONS = max(
+    1, int(os.environ.get("DIRECT_LANE_HISTORY_MAX_SESSIONS", "50"))
+)
+DIRECT_LANE_HISTORY_IDLE_TTL_S = max(
+    60, int(os.environ.get("DIRECT_LANE_HISTORY_IDLE_TTL_S", "1800"))
+)
+# Char-based budget proxy (4 chars ≈ 1 token rough average for English+code).
+# Default budget = 75% of typical 65536 max_model_len → ~196608 chars.
+DIRECT_LANE_HISTORY_CHAR_BUDGET = max(
+    4096, int(os.environ.get("DIRECT_LANE_HISTORY_CHAR_BUDGET", "196608"))
+)
+
+
+class SessionHistory:
+    """Per-conversation message history with LRU + TTL eviction.
+
+    Thread-safety: a single asyncio lock guards the entire dict. Writes
+    are short (append + truncate); contention is negligible at our request
+    rates (smoke runs hit ~1 concurrent session, production ≤3).
+    """
+
+    def __init__(
+        self,
+        *,
+        enabled: bool = True,
+        max_sessions: int = 50,
+        idle_ttl_s: int = 1800,
+        char_budget: int = 196608,
+    ) -> None:
+        self.enabled = enabled
+        self.max_sessions = max_sessions
+        self.idle_ttl_s = idle_ttl_s
+        self.char_budget = char_budget
+        # Each entry: {"messages": list, "last_use": float}
+        self._store: dict[str, dict[str, Any]] = {}
+        self._lock = asyncio.Lock()
+
+    async def get(self, conversation_id: str | None) -> list[dict[str, Any]]:
+        if not self.enabled or not conversation_id:
+            return []
+        async with self._lock:
+            self._evict_idle_locked()
+            entry = self._store.get(conversation_id)
+            if entry is None:
+                return []
+            entry["last_use"] = time.time()
+            return list(entry["messages"])
+
+    async def save(
+        self, conversation_id: str | None, messages: list[dict[str, Any]]
+    ) -> None:
+        if not self.enabled or not conversation_id:
+            return
+        truncated = self._truncate_to_budget(messages)
+        async with self._lock:
+            self._evict_idle_locked()
+            self._store[conversation_id] = {
+                "messages": truncated,
+                "last_use": time.time(),
+            }
+            self._evict_lru_locked()
+
+    async def clear(self, conversation_id: str) -> bool:
+        async with self._lock:
+            return self._store.pop(conversation_id, None) is not None
+
+    async def stats(self) -> dict[str, int]:
+        async with self._lock:
+            return {
+                "active_sessions": len(self._store),
+                "total_messages": sum(
+                    len(e["messages"]) for e in self._store.values()
+                ),
+            }
+
+    def _truncate_to_budget(
+        self, messages: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Drop oldest non-system messages until total char count ≤ budget."""
+        if not messages:
+            return messages
+        # Always keep system messages (they're typically first; chat-template
+        # bound). Drop oldest user/assistant/tool messages.
+        system_msgs = [m for m in messages if m.get("role") == "system"]
+        body_msgs = [m for m in messages if m.get("role") != "system"]
+
+        def _chars(msg_list: list[dict[str, Any]]) -> int:
+            try:
+                return sum(len(json.dumps(m, ensure_ascii=False)) for m in msg_list)
+            except (TypeError, ValueError):
+                return sum(len(str(m)) for m in msg_list)
+
+        total = _chars(system_msgs) + _chars(body_msgs)
+        if total <= self.char_budget:
+            return list(messages)
+        # Drop oldest body messages until under budget, but always keep last 2
+        # (the current user msg + the assistant response we just generated).
+        protected_tail = body_msgs[-2:] if len(body_msgs) >= 2 else body_msgs
+        droppable = body_msgs[: -len(protected_tail)] if protected_tail else body_msgs
+        while droppable and (
+            _chars(system_msgs) + _chars(droppable) + _chars(protected_tail)
+            > self.char_budget
+        ):
+            droppable.pop(0)
+        return system_msgs + droppable + protected_tail
+
+    def _evict_idle_locked(self) -> None:
+        now = time.time()
+        stale = [
+            cid
+            for cid, entry in self._store.items()
+            if now - entry["last_use"] > self.idle_ttl_s
+        ]
+        for cid in stale:
+            self._store.pop(cid, None)
+
+    def _evict_lru_locked(self) -> None:
+        if len(self._store) <= self.max_sessions:
+            return
+        excess = len(self._store) - self.max_sessions
+        ordered = sorted(self._store.items(), key=lambda kv: kv[1]["last_use"])
+        for cid, _ in ordered[:excess]:
+            self._store.pop(cid, None)
+
+
+_SESSION_HISTORY = SessionHistory(
+    enabled=DIRECT_LANE_HISTORY_ENABLED,
+    max_sessions=DIRECT_LANE_HISTORY_MAX_SESSIONS,
+    idle_ttl_s=DIRECT_LANE_HISTORY_IDLE_TTL_S,
+    char_budget=DIRECT_LANE_HISTORY_CHAR_BUDGET,
+)
+
 
 logger = logging.getLogger("manyforge-assistant-bridge")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -1587,6 +1739,29 @@ async def cancel_request(request_id: str) -> dict[str, Any]:
     return {"requestId": request_id, "cancelled": True}
 
 
+@app.post("/v1/sessions/{conversation_id}/clear")
+async def clear_session(conversation_id: str) -> dict[str, Any]:
+    """Drop a conversation's accumulated history (direct-lane only)."""
+    conversation_id = conversation_id.strip()
+    if not conversation_id:
+        return {"cleared": False, "detail": "conversation_id is blank"}
+    cleared = await _SESSION_HISTORY.clear(conversation_id)
+    return {"conversationId": conversation_id, "cleared": cleared}
+
+
+@app.get("/v1/sessions/stats")
+async def session_stats() -> dict[str, Any]:
+    """Direct-lane history visibility for ops + smoke harness."""
+    stats = await _SESSION_HISTORY.stats()
+    return {
+        "enabled": _SESSION_HISTORY.enabled,
+        "max_sessions": _SESSION_HISTORY.max_sessions,
+        "idle_ttl_s": _SESSION_HISTORY.idle_ttl_s,
+        "char_budget": _SESSION_HISTORY.char_budget,
+        **stats,
+    }
+
+
 @app.post("/v1/manyforge/assistant")
 async def assistant(request: Request) -> JSONResponse:
     started_ns = time.perf_counter_ns()
@@ -1677,7 +1852,10 @@ async def assistant(request: Request) -> JSONResponse:
     user_message = payload.get("message") or ""
     if not isinstance(user_message, str):
         user_message = json.dumps(user_message)
-    messages = [{"role": "user", "content": user_message}]
+    # Phase-1 direct-lane history: prepend prior turns for the same
+    # conversation. Empty for first turn or when feature disabled.
+    prior_messages = await _SESSION_HISTORY.get(conversation_id)
+    messages = list(prior_messages) + [{"role": "user", "content": user_message}]
 
     # Action-shape detection + first-turn tool pinning. When the user
     # prompt clearly requests a mutation, we both:
@@ -2016,6 +2194,10 @@ async def assistant(request: Request) -> JSONResponse:
                         "exitReason": "proposal_returned",
                     }
                 )
+                await _SESSION_HISTORY.save(
+                    conversation_id,
+                    messages + [{"role": "assistant", "content": message_text or ""}],
+                )
                 return JSONResponse(
                     status_code=200,
                     content=_success_envelope(
@@ -2046,6 +2228,10 @@ async def assistant(request: Request) -> JSONResponse:
                         "durationMs": round(duration_ms, 1),
                         "exitReason": "ok",
                     }
+                )
+                await _SESSION_HISTORY.save(
+                    conversation_id,
+                    messages + [{"role": "assistant", "content": message_text or ""}],
                 )
                 return JSONResponse(
                     status_code=200,

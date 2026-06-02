@@ -141,8 +141,17 @@ export const useRobotControlCandidateStore = create<RobotControlCandidateStore>(
       error: null,
 
       author: (request: CandidateCreateRequest) => {
-        if (get().candidate?.status === 'executing') {
+        const prior = get().candidate;
+        if (prior?.status === 'executing') {
           return;
+        }
+        if (
+          prior !== null &&
+          prior.candidateId !== '' &&
+          prior.inputMode !== request.inputMode &&
+          !SERVER_REVERT_SKIP_STATUSES.has(prior.status)
+        ) {
+          api.robotControl.candidates.revert(prior.candidateId).catch(() => {});
         }
         // Latest-wins: bump the generation immediately so any in-flight
         // create/poll for the prior draft is ignored when it resolves.
@@ -162,7 +171,6 @@ export const useRobotControlCandidateStore = create<RobotControlCandidateStore>(
         // validated/blocked ghost arrives. Because the Approve gate keys off
         // `status === 'ready'`, a carried ghost on a `planning` placeholder
         // never implies executability.
-        const prior = get().candidate;
         const placeholder: CandidateResponse = {
           candidateId: prior?.candidateId ?? '',
           generation: prior?.generation ?? 0,
@@ -295,15 +303,13 @@ export const useRobotControlCandidateStore = create<RobotControlCandidateStore>(
             approving: false,
           });
           const executingCandidate = result.candidate ?? candidate;
-          // Arm candidates execute through the cycle/intervention machinery.
           // Keep polling the server-owned candidate until it maps the concrete
-          // runtime outcome (completed / stopped / interrupted / failed). Do
-          // not infer completion from the global cycle state alone: that loses
-          // the execution id, move id, and structured kernel diagnostics.
-          if (
-            result.session !== null &&
-            executingCandidate.status === 'executing'
-          ) {
+          // runtime outcome (completed / stopped / interrupted / failed).
+          // Arm candidates carry an intervention session/execution record;
+          // gripper candidates intentionally return session:null and refresh
+          // from kernel gripper status instead. Both need polling so the UI
+          // cannot stay locally stuck at `executing`.
+          if (executingCandidate.status === 'executing') {
             schedulePoll(executingCandidate.candidateId, token, EXECUTION_POLL_MS);
           }
         } catch (err: unknown) {

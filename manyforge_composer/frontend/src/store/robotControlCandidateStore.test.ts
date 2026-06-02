@@ -234,6 +234,53 @@ describe('robotControlCandidateStore', () => {
     ).toBe('execution_completed');
   });
 
+  it('polls a sessionless gripper execution to its server terminal outcome', async () => {
+    const gripperReady = makeCandidate({
+      sourceSurface: 'gripper_slider',
+      inputMode: 'gripper',
+      gripperTarget: { gripperId: 'primary', targetPosition: 0.4 },
+      ghost: null,
+    });
+    candidates.create.mockResolvedValue(gripperReady);
+    candidates.execute.mockResolvedValue({
+      candidate: makeCandidate({
+        ...gripperReady,
+        status: 'executing',
+        commitEligible: false,
+      }),
+      session: null,
+      timestamp_ns: 1,
+    });
+    candidates.get.mockResolvedValueOnce(
+      makeCandidate({
+        ...gripperReady,
+        status: 'completed',
+        commitEligible: false,
+        diagnostics: {
+          reasonCode: 'execution_completed',
+          summary: 'Candidate execution completed.',
+        },
+      }),
+    );
+
+    useRobotControlCandidateStore.getState().author({
+      sourceSurface: 'gripper_slider',
+      inputMode: 'gripper',
+      gripperTarget: { gripperId: 'primary', targetPosition: 0.4 },
+    });
+    await vi.advanceTimersByTimeAsync(150);
+    await useRobotControlCandidateStore.getState().approve();
+    expect(useRobotControlCandidateStore.getState().candidate?.status).toBe(
+      'executing',
+    );
+
+    await vi.advanceTimersByTimeAsync(500);
+    expect(candidates.get).toHaveBeenCalledWith('cand-1');
+    expect(useRobotControlCandidateStore.getState().candidate?.status).toBe(
+      'completed',
+    );
+  });
+
   it('approve fails closed (no executing) on a freshness rejection', async () => {
     candidates.create.mockResolvedValue(makeCandidate());
     candidates.execute.mockRejectedValue(
@@ -277,6 +324,42 @@ describe('robotControlCandidateStore', () => {
     expect(pending.candidate?.commitEligible).toBe(false);
     // Nothing executed during this window.
     expect(candidates.execute).not.toHaveBeenCalled();
+  });
+
+  it('authoring a different move group best-effort reverts the prior server candidate', async () => {
+    candidates.create.mockResolvedValueOnce(makeCandidate({ candidateId: 'arm-1' }));
+    useRobotControlCandidateStore.getState().author(JOINT_REQUEST);
+    await vi.advanceTimersByTimeAsync(150);
+    expect(useRobotControlCandidateStore.getState().candidate?.inputMode).toBe('joint');
+
+    candidates.revert.mockClear();
+    candidates.create.mockResolvedValueOnce(
+      makeCandidate({
+        candidateId: 'gripper-1',
+        sourceSurface: 'gripper_slider',
+        inputMode: 'gripper',
+        gripperTarget: { gripperId: 'primary', targetPosition: 0.4 },
+        ghost: null,
+      }),
+    );
+
+    useRobotControlCandidateStore.getState().author({
+      sourceSurface: 'gripper_slider',
+      inputMode: 'gripper',
+      gripperTarget: { gripperId: 'primary', targetPosition: 0.4 },
+    });
+
+    expect(candidates.revert).toHaveBeenCalledTimes(1);
+    expect(candidates.revert).toHaveBeenCalledWith('arm-1');
+    expect(useRobotControlCandidateStore.getState().candidate?.inputMode).toBe(
+      'gripper',
+    );
+    expect(useRobotControlCandidateStore.getState().candidate?.commitEligible).toBe(false);
+
+    await vi.advanceTimersByTimeAsync(150);
+    expect(useRobotControlCandidateStore.getState().candidate?.candidateId).toBe(
+      'gripper-1',
+    );
   });
 
   it('after the new create resolves, approve targets the NEW candidateId only', async () => {

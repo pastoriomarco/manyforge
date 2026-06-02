@@ -37,6 +37,7 @@ real collision-world revision is the documented Phase 2 follow-up.
 from __future__ import annotations
 
 import json
+import logging
 import math
 import threading
 import time
@@ -52,6 +53,7 @@ from fastapi.responses import JSONResponse
 from manyforge_behavior.kernel_client import (
     ExecuteRequest,
     ExecutionState,
+    GripperCommandState,
     JointDynamicsLimit,
     MotionPreviewResult,
     RobotStateSnapshot,
@@ -79,6 +81,8 @@ from .gripper_command import (
 )
 from .intervention_validation import merged_intervention_blackboard_keys
 from .state import ComposerState
+
+_LOGGER = logging.getLogger(__name__)
 
 # Output models (server-constructed) only need alias population.
 _ALIAS_CFG = ConfigDict(populate_by_name=True)
@@ -1441,9 +1445,35 @@ class _CandidateStore:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
+        # Native preview planning is CPU-heavy and may contend on backend
+        # scene/planner locks. Serialize Composer candidate previews so input
+        # bursts do not fan out into many obsolete native planning jobs. Queued
+        # jobs call `begin_planning()` after acquiring this lock and skip if a
+        # newer draft already superseded them.
+        self._planning_lock = threading.Lock()
         self._by_id: dict[str, _StoredCandidate] = {}
         self._latest_by_surface: dict[str, str] = {}
         self._generation_by_surface: dict[str, int] = {}
+
+    def planning_lock(self) -> threading.Lock:
+        return self._planning_lock
+
+    def _mark_superseded_locked(self, candidate_id: str, now: int) -> None:
+        stored = self._by_id.get(candidate_id)
+        if stored is None or stored.response.status not in _SUPERSEDABLE_STATUSES:
+            return
+        response = stored.response
+        response.status = CandidateStatus.SUPERSEDED
+        response.commit_eligible = False
+        response.diagnostics = CandidateDiagnostics(
+            reason_code=REASON_SUPERSEDED,
+            summary="Replaced by a newer draft for Robot Control.",
+        )
+        response.updated_at_ns = now
+        stored.dispatch_params = None
+        surface = response.source_surface.value
+        if self._latest_by_surface.get(surface) == candidate_id:
+            self._latest_by_surface.pop(surface, None)
 
     def reserve(self, req: CandidateCreateRequest) -> tuple[str, int]:
         """Reserve a slot for a new candidate, ordered by REQUEST ARRIVAL.
@@ -1452,30 +1482,24 @@ class _CandidateStore:
         the generation + supersede ordering reflects when each request ARRIVED,
         not when its planning happened to finish. Holding the lock it:
           - assigns the next generation for the surface,
-          - supersedes the prior live candidate for that surface,
+          - supersedes every prior live Robot Control draft,
           - stores a PLANNING placeholder candidate keyed by a new id.
         `fill()` later updates that same id in place with the planning result
         (unless a newer reserve() already superseded it). Returns
         (candidate_id, generation).
         """
         with self._lock:
+            now = time.monotonic_ns()
             surface = req.source_surface.value
-            prior_id = self._latest_by_surface.get(surface)
-            if prior_id is not None:
-                prior = self._by_id.get(prior_id)
-                if prior is not None and prior.response.status in _SUPERSEDABLE_STATUSES:
-                    prior.response.status = CandidateStatus.SUPERSEDED
-                    prior.response.commit_eligible = False
-                    prior.response.diagnostics = CandidateDiagnostics(
-                        reason_code=REASON_SUPERSEDED,
-                        summary="Replaced by a newer draft for this control surface.",
-                    )
-                    prior.response.updated_at_ns = time.monotonic_ns()
-                    prior.dispatch_params = None
+            # One shared Approve button means one active unapproved Robot
+            # Control command. Enforce that server-side, including candidates
+            # from another source surface or move group whose preview has not
+            # finished yet.
+            for prior_id in list(self._by_id):
+                self._mark_superseded_locked(prior_id, now)
             generation = self._generation_by_surface.get(surface, 0) + 1
             self._generation_by_surface[surface] = generation
             candidate_id = str(uuid.uuid4())
-            now = time.monotonic_ns()
             placeholder = CandidateResponse(
                 candidate_id=candidate_id,
                 generation=generation,
@@ -1484,6 +1508,7 @@ class _CandidateStore:
                 status=CandidateStatus.PLANNING,
                 joint_target=req.joint_target,
                 cartesian_target=req.cartesian_target,
+                gripper_target=req.gripper_target,
                 client_request_id=req.client_request_id,
                 max_age_ns=_CANDIDATE_MAX_AGE_NS,
                 expires_at_ns=now + _CANDIDATE_MAX_AGE_NS,
@@ -1501,6 +1526,25 @@ class _CandidateStore:
             )
             self._latest_by_surface[surface] = candidate_id
             return candidate_id, generation
+
+    def begin_planning(
+        self, candidate_id: str
+    ) -> tuple[bool, Optional[CandidateResponse]]:
+        """Claim a reserved candidate for preview planning.
+
+        Call after acquiring `planning_lock()`. Returns (True, None) only while
+        the candidate is still the live PLANNING placeholder. If a newer draft
+        or Revert superseded it while it was queued behind another preview,
+        return (False, current-copy) so the route can respond without touching
+        the native planner.
+        """
+        with self._lock:
+            existing = self._by_id.get(candidate_id)
+            if existing is None:
+                return False, None
+            if existing.response.status is CandidateStatus.PLANNING:
+                return True, None
+            return False, existing.response.model_copy(deep=True)
 
     def fill(
         self,
@@ -1691,6 +1735,36 @@ class _CandidateStore:
                 stored.dispatch_params = None
             return response.model_copy(deep=True)
 
+    def refresh_gripper_execution(
+        self,
+        candidate_id: str,
+        *,
+        status: CandidateStatus,
+        diagnostics: CandidateDiagnostics,
+    ) -> Optional[CandidateResponse]:
+        """Update the lifecycle for a dispatched gripper candidate.
+
+        Gripper candidates dispatch through the lightweight gripper bridge, so
+        they intentionally do not carry an arm `CandidateExecution` record or
+        intervention session. Poll-time lifecycle still has to terminate from
+        the kernel gripper status; otherwise the browser can keep a stale local
+        `executing` candidate forever and block subsequent gripper commands.
+        """
+        with self._lock:
+            stored = self._by_id.get(candidate_id)
+            if stored is None:
+                return None
+            response = stored.response
+            if response.status is not CandidateStatus.EXECUTING:
+                return response.model_copy(deep=True)
+            response.status = status
+            response.commit_eligible = False
+            response.diagnostics = diagnostics
+            response.updated_at_ns = time.monotonic_ns()
+            if status is not CandidateStatus.EXECUTING:
+                stored.dispatch_params = None
+            return response.model_copy(deep=True)
+
     def commit_for_dispatch(
         self, candidate_id: str
     ) -> tuple[bool, Optional[CandidateResponse]]:
@@ -1797,6 +1871,83 @@ def _snapshot_error_details(snapshot: Any) -> Optional[dict[str, Any]]:
     return None
 
 
+def _refresh_gripper_candidate_execution_from_runtime(
+    state: ComposerState,
+    store: _CandidateStore,
+    candidate: CandidateResponse,
+) -> CandidateResponse:
+    """Refresh an EXECUTING gripper candidate from the kernel gripper status."""
+    if candidate.status is not CandidateStatus.EXECUTING:
+        return candidate
+    if candidate.input_mode is not CandidateInputMode.GRIPPER:
+        return candidate
+    if candidate.gripper_target is None or state.kernel is None:
+        return candidate
+
+    gripper_id = candidate.gripper_target.gripper_id
+    advance = getattr(state.kernel, "update_gripper_commands", None)
+    if callable(advance):
+        try:
+            advance()
+        except Exception:  # noqa: BLE001 - observer path must stay best-effort
+            pass
+    get_status = getattr(state.kernel, "get_gripper_status", None)
+    if not callable(get_status):
+        return candidate
+    try:
+        gripper_status = get_status(gripper_id)
+    except Exception:  # noqa: BLE001 - observer path must stay best-effort
+        return candidate
+
+    raw_state = getattr(gripper_status, "state", None)
+    candidate_status = CandidateStatus.EXECUTING
+    if raw_state == GripperCommandState.COMPLETED:
+        candidate_status = CandidateStatus.COMPLETED
+    elif raw_state == GripperCommandState.FAILED:
+        candidate_status = CandidateStatus.FAILED
+    elif raw_state == GripperCommandState.IDLE:
+        # A bridge that drops completed gripper commands from its status table
+        # is still no longer executing. If the reported position is at the
+        # requested target, classify as completed; otherwise fail closed so the
+        # operator sees that the lifecycle could not be proven successful.
+        current = getattr(gripper_status, "current_position", None)
+        target = candidate.gripper_target.target_position
+        if (
+            isinstance(current, (int, float))
+            and math.isfinite(float(current))
+            and abs(float(current) - float(target)) <= 1e-4
+        ):
+            candidate_status = CandidateStatus.COMPLETED
+        else:
+            candidate_status = CandidateStatus.FAILED
+
+    detail_error = getattr(gripper_status, "error", None)
+    diagnostics = CandidateDiagnostics(
+        reason_code=_execution_reason_for_status(candidate_status),
+        summary=_execution_summary_for_status(
+            candidate_status,
+            runtime_error=detail_error if isinstance(detail_error, str) else None,
+            session_error=None,
+        ),
+        details={
+            "gripperId": gripper_id,
+            "gripperState": (
+                raw_state.value if isinstance(raw_state, GripperCommandState) else str(raw_state)
+            ),
+            "progress": float(getattr(gripper_status, "progress", 0.0) or 0.0),
+            "currentPosition": getattr(gripper_status, "current_position", None),
+            "targetPosition": getattr(gripper_status, "target_position", None),
+            "error": detail_error,
+        },
+    )
+    refreshed = store.refresh_gripper_execution(
+        candidate.candidate_id,
+        status=candidate_status,
+        diagnostics=diagnostics,
+    )
+    return refreshed if refreshed is not None else candidate
+
+
 def _refresh_candidate_execution_from_runtime(
     state: ComposerState,
     store: _CandidateStore,
@@ -1812,6 +1963,8 @@ def _refresh_candidate_execution_from_runtime(
     """
     if candidate.status is not CandidateStatus.EXECUTING:
         return candidate
+    if candidate.input_mode is CandidateInputMode.GRIPPER:
+        return _refresh_gripper_candidate_execution_from_runtime(state, store, candidate)
     execution = candidate.execution
     if execution is None:
         return candidate
@@ -1850,12 +2003,14 @@ def _refresh_candidate_execution_from_runtime(
         view.error_details = _snapshot_error_details(snapshot)
 
     candidate_status = CandidateStatus.EXECUTING
+    matched_kernel_state = None
     if status is not None:
         status_move_id = getattr(status, "active_move_id", "") or ""
         status_execution_id = int(getattr(status, "execution_id", 0) or 0)
         same_move = bool(view.move_id) and status_move_id == view.move_id
         same_execution = bool(view.execution_id) and status_execution_id == view.execution_id
         if same_move or same_execution:
+            matched_kernel_state = status.state
             view.execution_id = status_execution_id
             view.state = status.state.value
             view.progress = float(getattr(status, "progress", 0.0) or 0.0)
@@ -1864,12 +2019,31 @@ def _refresh_candidate_execution_from_runtime(
             )
 
     if session is not None and session.status != "running":
-        if session.status == "completed":
+        if session.status == "completed" and matched_kernel_state is None:
+            # The intervention BT only reports "completed" after the motion
+            # node has seen kernel Completed and acknowledged it. That ack
+            # transitions the kernel to Idle and clears active_move_id, so the
+            # status read above no longer matches this move. Treat the session
+            # as the terminal proof in that post-ack case, and clear any stale
+            # pre-ack "executing" view carried from an earlier poll.
             candidate_status = CandidateStatus.COMPLETED
+            view.state = ExecutionState.COMPLETED.value
+            view.progress = 1.0
+            view.error = None
+            view.error_code = None
+            view.error_details = None
+            runtime_error = None
+        elif session.status == "completed":
+            # If the kernel still reports the same motion in a non-terminal
+            # state, keep the candidate executing. This avoids using session
+            # bookkeeping to mask an active or stale in-flight kernel motion.
+            pass
         elif session.status == "aborted":
             candidate_status = CandidateStatus.STOPPED
+            view.state = ExecutionState.STOPPED.value
         else:
             candidate_status = CandidateStatus.FAILED
+            view.state = ExecutionState.FAILED.value
 
     # Motion soft-fail / interrupt paths can leave the intervention session
     # running while the kernel has already latched a terminal state. The kernel
@@ -2155,6 +2329,52 @@ def _execute_gripper_candidate(
     )
 
 
+def _plan_reserved_candidate(
+    state: ComposerState,
+    store: _CandidateStore,
+    candidate_id: str,
+    req: CandidateCreateRequest,
+) -> CandidateResponse:
+    """Plan a reserved candidate if it is still current.
+
+    This is the backend half of latest-wins coalescing. `reserve()` records
+    request-arrival order immediately; this helper serializes the expensive
+    preview work and checks the reserved placeholder again before entering the
+    native planner. Superseded queued drafts return their current terminal
+    response without consuming planner time.
+    """
+    with store.planning_lock():
+        should_plan, current = store.begin_planning(candidate_id)
+        if not should_plan:
+            if current is not None:
+                _LOGGER.info(
+                    "robot-control candidate preview skipped: "
+                    "candidate_id=%s status=%s input_mode=%s source_surface=%s",
+                    candidate_id,
+                    current.status.value,
+                    current.input_mode.value,
+                    current.source_surface.value,
+                )
+                return current
+            raise RuntimeError(f"reserved candidate {candidate_id} disappeared")
+
+        started_ns = time.monotonic_ns()
+        planner = _CandidatePlanner(state)
+        response, stored = planner.plan(req)
+        committed = store.fill(candidate_id, response, stored)
+        duration_ms = (time.monotonic_ns() - started_ns) / 1_000_000.0
+        _LOGGER.info(
+            "robot-control candidate preview finished: "
+            "candidate_id=%s status=%s input_mode=%s source_surface=%s duration_ms=%.1f",
+            candidate_id,
+            committed.status.value,
+            committed.input_mode.value,
+            committed.source_surface.value,
+            duration_ms,
+        )
+        return committed
+
+
 def create_robot_control_candidates_router(state: ComposerState) -> APIRouter:
     router = APIRouter()
     store = _CandidateStore()
@@ -2174,15 +2394,14 @@ def create_robot_control_candidates_router(state: ComposerState) -> APIRouter:
             req = CandidateCreateRequest.model_validate(data)
         except ValidationError as exc:
             raise HTTPException(status_code=422, detail=jsonable_encoder(exc.errors()))
-        # Reserve the generation slot FIRST (ordered by request
-        # ARRIVAL), then run the synchronous preview plan OFF the event loop so
-        # concurrent creates actually interleave at the reserve() lock in
-        # arrival order, then fill the reserved candidate in place. A slower
-        # OLDER request can no longer leap-frog a newer one's generation.
+        # Reserve the generation slot FIRST (ordered by request ARRIVAL), then
+        # run the synchronous preview plan OFF the event loop. Preview work is
+        # serialized and rechecked before it enters the native planner, so
+        # obsolete queued drafts are skipped instead of consuming planner time.
         candidate_id, _generation = store.reserve(req)
-        planner = _CandidatePlanner(state)
-        response, stored = await run_in_threadpool(planner.plan, req)
-        committed = store.fill(candidate_id, response, stored)
+        committed = await run_in_threadpool(
+            _plan_reserved_candidate, state, store, candidate_id, req
+        )
         return JSONResponse(status_code=200, content=committed.model_dump(by_alias=True))
 
     @router.get("/candidates/{candidate_id}")

@@ -26,6 +26,7 @@ import type {
   PoseSourceStatusState,
   PreviewLinkPosesResponse,
   SceneFrameState,
+  SceneGripperState,
   SceneObjectState,
   SceneShapeState,
   SceneUrdfManifest,
@@ -33,6 +34,7 @@ import type {
   TreeNode,
 } from '../types/api';
 import { authorGizmoRelease } from '../utils/gizmoAuthoring';
+import { gripperGhostPreviewFromCandidate } from '../utils/gripperGhost';
 import { computeMoveToTarget } from '../utils/moveTo';
 import {
   composePose,
@@ -58,6 +60,8 @@ const EMPTY_LINK_POSES: Record<
   string,
   { position_m: number[]; orientation_xyzw: number[] }
 > = {};
+
+const EMPTY_GRIPPERS: SceneGripperState[] = [];
 
 interface SceneViewerPanelProps {
   onCollapse: () => void;
@@ -1567,8 +1571,10 @@ function MoveToTargetGhost() {
  *
  * It prefers the per-link poses the backend computes (native FK at a
  * hypothetical configuration); when absent it falls back to a debounced
- * preview-link-poses fetch for the final joint vector. Never mutates scene
- * state and never moves the robot.
+ * preview-link-poses fetch for the final joint vector. Gripper candidates use
+ * that same no-motion FK path with the staged gripper joint and render only the
+ * gripper subtree, avoiding a duplicate full robot. Never mutates scene state
+ * and never moves the robot.
  */
 const _CANDIDATE_GHOST_ACTIVE = new Set([
   'planning',
@@ -1580,6 +1586,8 @@ const _CANDIDATE_GHOST_ACTIVE = new Set([
 
 function CandidateGhostRobot() {
   const candidate = useRobotControlCandidateStore((s) => s.candidate);
+  const robot = useSceneStateStore((s) => s.scene?.robot ?? null);
+  const grippers = useSceneStateStore((s) => s.scene?.grippers ?? EMPTY_GRIPPERS);
   const robotModelKey = useSceneStateStore(
     (s) => s.scene?.robot?.urdf_model_key ?? s.scene?.robot?.robot_id ?? null,
   );
@@ -1595,10 +1603,37 @@ function CandidateGhostRobot() {
   // produces a new object with the same pose) — that churn was the ghost
   // flicker.
   const lastFetchKeyRef = useRef<string | null>(null);
+  const fetchedPreviewFamilyRef = useRef<string | null>(null);
 
   const status = candidate?.status ?? null;
   const active = status !== null && _CANDIDATE_GHOST_ACTIVE.has(status);
-  const ghost = active ? candidate?.ghost ?? null : null;
+  const gripperPreview = useMemo(
+    () =>
+      active
+        ? gripperGhostPreviewFromCandidate(candidate, robot, grippers)
+        : null,
+    [active, candidate, robot, grippers],
+  );
+  // Gripper candidates have no arm trajectory/ghost payload. Render them from
+  // a local FK preview of the staged gripper joint instead, and never reuse a
+  // carried arm ghost while the active candidate is gripper-mode.
+  const ghost =
+    active && candidate?.inputMode !== 'gripper'
+      ? candidate?.ghost ?? null
+      : null;
+  const previewFamilyKey = useMemo(() => {
+    if (!active) return 'inactive';
+    if (gripperPreview !== null) {
+      return `gripper:${gripperPreview.gripperId}:${gripperPreview.linkNames.join('\0')}`;
+    }
+    return candidate?.inputMode === 'gripper' ? 'gripper-unavailable' : 'arm';
+  }, [active, candidate?.inputMode, gripperPreview]);
+
+  useEffect(() => {
+    setFetchedPreview(null);
+    lastFetchKeyRef.current = null;
+    fetchedPreviewFamilyRef.current = null;
+  }, [previewFamilyKey]);
 
   useEffect(() => {
     if (!active) {
@@ -1607,6 +1642,7 @@ function CandidateGhostRobot() {
       // candidate fetches fresh.
       setFetchedPreview(null);
       lastFetchKeyRef.current = null;
+      fetchedPreviewFamilyRef.current = null;
       return;
     }
     let cancelled = false;
@@ -1639,13 +1675,25 @@ function CandidateGhostRobot() {
     return out;
   }, [ghost]);
 
-  const finalJointNames = ghost?.finalJointNames ?? null;
-  const finalJointPositions = ghost?.finalJointPositionsRad ?? null;
+  const finalJointNames =
+    gripperPreview?.request.joint_names ?? ghost?.finalJointNames ?? null;
+  const finalJointPositions =
+    gripperPreview?.request.joint_positions_rad ?? ghost?.finalJointPositionsRad ?? null;
+  const previewLinkNames = useMemo(() => {
+    if (manifest === null) return null;
+    if (gripperPreview !== null) return gripperPreview.linkNames;
+    return manifest.links.map((l) => l.name);
+  }, [manifest, gripperPreview]);
+  const renderLinkNameSet = useMemo(
+    () => (gripperPreview !== null ? new Set(gripperPreview.linkNames) : null),
+    [gripperPreview],
+  );
 
   // Stable key for the final joint vector (rounded so float jitter does not
   // churn it). Null when there is no usable joint vector to fetch for.
   const jointKey = useMemo(() => {
     if (
+      previewLinkNames === null ||
       finalJointNames === null ||
       finalJointPositions === null ||
       finalJointNames.length !== finalJointPositions.length ||
@@ -1654,8 +1702,8 @@ function CandidateGhostRobot() {
       return null;
     }
     const rounded = finalJointPositions.map((p) => Math.round(p * 1e6) / 1e6);
-    return JSON.stringify([finalJointNames, rounded]);
-  }, [finalJointNames, finalJointPositions]);
+    return JSON.stringify([finalJointNames, rounded, previewLinkNames]);
+  }, [finalJointNames, finalJointPositions, previewLinkNames]);
 
   // Fallback: fetch link poses for the final joint vector when the backend did
   // not inline them (e.g. non-native backends). Refetch ONLY when the joint
@@ -1663,26 +1711,35 @@ function CandidateGhostRobot() {
   // pending — so the ghost stays put instead of blanking on every status poll
   // or debounce tick (that was the flicker).
   useEffect(() => {
-    if (!active || manifest === null || directLinkPoses !== null || jointKey === null) {
+    if (
+      !active ||
+      manifest === null ||
+      directLinkPoses !== null ||
+      jointKey === null ||
+      previewLinkNames === null ||
+      previewLinkNames.length === 0 ||
+      finalJointNames === null ||
+      finalJointPositions === null
+    ) {
       return;
     }
     if (lastFetchKeyRef.current === jointKey) {
       return; // already showing this joint vector; do not refetch or blank
     }
-    const linkNames = manifest.links.map((l) => l.name);
     const seq = fetchSeqRef.current + 1;
     fetchSeqRef.current = seq;
     const handle = window.setTimeout(() => {
       void api.scene
         .previewLinkPoses({
           kind: 'joint',
-          joint_names: finalJointNames as string[],
-          joint_positions_rad: finalJointPositions as number[],
-          link_names: linkNames,
+          joint_names: finalJointNames,
+          joint_positions_rad: finalJointPositions,
+          link_names: previewLinkNames,
         })
         .then((r) => {
           if (seq === fetchSeqRef.current) {
             lastFetchKeyRef.current = jointKey;
+            fetchedPreviewFamilyRef.current = previewFamilyKey;
             setFetchedPreview(r);
           }
         })
@@ -1691,9 +1748,23 @@ function CandidateGhostRobot() {
         });
     }, 200);
     return () => window.clearTimeout(handle);
-  }, [active, manifest, directLinkPoses, jointKey, finalJointNames, finalJointPositions]);
+  }, [
+    active,
+    manifest,
+    directLinkPoses,
+    jointKey,
+    previewFamilyKey,
+    previewLinkNames,
+    finalJointNames,
+    finalJointPositions,
+  ]);
 
-  if (!active || manifest === null || ghost === null) return null;
+  if (!active || manifest === null) return null;
+  if (candidate?.inputMode === 'gripper') {
+    if (gripperPreview === null) return null;
+  } else if (ghost === null) {
+    return null;
+  }
   if (
     robotModelKey !== null &&
     manifest.model_key !== undefined &&
@@ -1702,7 +1773,7 @@ function CandidateGhostRobot() {
     return null;
   }
 
-  const blocked = ghost.blocked;
+  const blocked = ghost?.blocked ?? false;
   // A carried-forward ghost during planning/stale/approving is shown DIMMED and
   // neutral-gray so it reads as "pending, not validated" and never implies a
   // reachable/approvable target (Approve keys off status === 'ready'). A ready
@@ -1714,7 +1785,7 @@ function CandidateGhostRobot() {
   const modelKey = manifest.model_key ?? manifest.robot_id ?? 'unknown';
 
   if (blocked) {
-    const targetPose = ghost.blockedTargetPose ?? ghost.finalTcpPose ?? null;
+    const targetPose = ghost?.blockedTargetPose ?? ghost?.finalTcpPose ?? null;
     if (targetPose === null) return null;
     const tcpLink = tcpFrame
       ? manifest.links.find((l) => l.name === tcpFrame)
@@ -1739,16 +1810,23 @@ function CandidateGhostRobot() {
     );
   }
 
+  const fetchedPreviewForFamily =
+    fetchedPreviewFamilyRef.current === previewFamilyKey ? fetchedPreview : null;
+  const fetchedLinkPoses =
+    fetchedPreviewForFamily !== null && fetchedPreviewForFamily.reachable
+      ? fetchedPreviewForFamily.link_poses
+      : null;
   const linkPoses =
     directLinkPoses ??
-    (fetchedPreview && fetchedPreview.reachable
-      ? fetchedPreview.link_poses
-      : null);
+    fetchedLinkPoses;
 
   if (linkPoses !== null) {
     return (
       <group name="manyforge-candidate-ghost" key={`${modelKey}:candidate`}>
         {manifest.links.map((link) => {
+          if (renderLinkNameSet !== null && !renderLinkNameSet.has(link.name)) {
+            return null;
+          }
           const pose = linkPoses[link.name];
           if (!pose) return null;
           return (
@@ -1776,6 +1854,7 @@ function CandidateGhostRobot() {
 
   // No per-link configuration available. Fall back to a TCP marker so the
   // candidate remains visible even when FK link poses are unavailable.
+  if (ghost === null) return null;
   const targetPose = ghost.finalTcpPose ?? null;
   if (targetPose !== null) {
     const tcpLink = tcpFrame

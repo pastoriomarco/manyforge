@@ -527,6 +527,65 @@ def test_scene_state_visual_snapshot_includes_gripper_feedback_in_fk(
     )
 
 
+@_REQUIRES_PINOCCHIO_VISUAL_FK
+def test_preview_link_poses_joint_falls_back_to_visual_fk_for_gripper_links(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    """Gripper ghosts request visual links outside the arm planning group.
+
+    Native planner FK may report a reachable joint vector but no poses for
+    those visual-only gripper links. The route must fall back to the full URDF
+    visual FK model instead of returning an empty `link_poses` map.
+    """
+    urdf_path = _write_toy_visual_urdf(tmp_path)
+
+    class EmptyNativeFkKernel(MockKernelClient):
+        def __init__(self) -> None:
+            super().__init__(joint_names=["joint_a"])
+
+        def compute_target_link_poses(self, request):
+            return {
+                "reachable": True,
+                "joint_names": list(request["joint_names"]),
+                "joint_positions_rad": list(request["joint_positions_rad"]),
+                "link_poses": {},
+            }
+
+    entry = SimpleNamespace(urdf_path=str(urdf_path))
+    monkeypatch.setattr(routes_urdf, "get_urdf_entry", lambda _state: entry)
+    monkeypatch.setattr(routes_urdf, "active_urdf_model_key", lambda _state: "toy-gripper-key")
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=EmptyNativeFkKernel())
+    client = TestClient(create_app(state))
+    state.program = SimpleNamespace(
+        robot=SimpleNamespace(base_frame="base_link", tcp_frame="finger_link", base_pose={}),
+        scene=[],
+    )
+    state.deployment = SimpleNamespace(
+        robot_config=SimpleNamespace(robot_id="toy", group_id="arm"),
+        adapters={},
+        grippers={},
+    )
+
+    response = client.post(
+        "/api/scene/preview-link-poses",
+        json={
+            "kind": "joint",
+            "joint_names": ["joint_a", "finger_joint"],
+            "joint_positions_rad": [0.0, 0.3],
+            "link_names": ["finger_link"],
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["reachable"] is True
+    assert body["link_poses"]["finger_link"]["position_m"] == pytest.approx(
+        [1.3, 0.0, 0.0],
+        abs=1e-6,
+    )
+
+
 def test_scene_routes_read_cached_visual_snapshot_without_backend_calls(
     monkeypatch: pytest.MonkeyPatch,
 ):
