@@ -648,23 +648,48 @@ def create_assistant_router(state: ComposerState) -> APIRouter:
                 error=error_text or "rejected by policy/validation",
                 started_at_ns=live_started_ns,
             )
-            # On structural impasse return 200 with the structured body
-            # so the agent loop reads it as a tool result rather than
-            # a transport error. Otherwise re-raise the HTTPException
-            # with the enriched detail.
-            if impasse_envelope is not None:
-                return {
-                    "toolId": tool_id,
-                    "success": False,
-                    "result": impasse_envelope,
-                    "error": impasse_envelope.get("message", ""),
-                    "mutated": False,
-                    "draftMutated": False,
-                    "timestampNs": time.monotonic_ns(),
-                }
-            raise HTTPException(
-                status_code=exc.status_code, detail=enriched_detail
-            ) from exc
+            # OpenClaw 2026.4.24+ applies `erroredAssistantResultPolicy:
+            # "drop"` (hardcoded in src/agents/embedded-agent-runner/run/
+            # attempt.ts:3102-3107 as of 2026.5.22): when the upstream
+            # returns 4xx, the agent turn that triggered the tool call
+            # is silently REMOVED from chat history along with its
+            # result. The model then loses the validator's feedback and
+            # repeats the same bad call.
+            #
+            # To work around this without forking OpenClaw, the
+            # composer MCP returns HTTP 200 with a structured
+            # `success: false` envelope for ALL validation failures —
+            # not just the structural impasse path. The MCP bridge
+            # treats this as a successful tool call producing an
+            # error-shaped result; OpenClaw keeps the turn in history
+            # and the model can read the error and adjust.
+            #
+            # The impasse envelope (which provides a tree snapshot +
+            # rotating nudge) is still preferred when available; falls
+            # back to the enriched detail.
+            envelope = impasse_envelope if impasse_envelope is not None else {
+                "kind": "validation_error",
+                "httpStatus": exc.status_code,
+                "message": (
+                    enriched_detail.get("message", str(enriched_detail))
+                    if isinstance(enriched_detail, dict)
+                    else str(enriched_detail)
+                ),
+                "detail": enriched_detail,
+            }
+            return {
+                "toolId": tool_id,
+                "success": False,
+                "result": envelope,
+                "error": (
+                    envelope.get("message", "")
+                    if isinstance(envelope, dict)
+                    else str(envelope)
+                ),
+                "mutated": False,
+                "draftMutated": False,
+                "timestampNs": time.monotonic_ns(),
+            }
         except Exception as exc:
             result = {}
             success = False

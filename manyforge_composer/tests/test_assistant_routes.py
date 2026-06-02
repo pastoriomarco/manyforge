@@ -53,6 +53,26 @@ def client(state: ComposerState) -> TestClient:
     return TestClient(create_app(state, security=_TEST_SECURITY))
 
 
+def _assert_bridge_validation_error(
+    response,
+    *,
+    http_status: int,
+    message_contains: str | None = None,
+) -> dict:
+    assert response.status_code == 200
+    body = response.json()
+    assert body["success"] is False
+    assert body["mutated"] is False
+    assert body["draftMutated"] is False
+    result = body["result"]
+    assert result["kind"] == "validation_error"
+    assert result["httpStatus"] == http_status
+    if message_contains is not None:
+        assert message_contains in result["message"]
+        assert message_contains in body["error"]
+    return body
+
+
 def test_assistant_chat_returns_reviewable_mock_scene_proposal(
     client: TestClient,
     state: ComposerState,
@@ -608,9 +628,12 @@ def test_assistant_bridge_scene_resource_rejects_attachment_frame(
         },
     )
 
-    assert response.status_code == 400
-    assert "backend canonical world frame" in response.json()["detail"]
-    assert "attach_object_to_link" in response.json()["detail"]
+    data = _assert_bridge_validation_error(
+        response,
+        http_status=400,
+        message_contains="backend canonical world frame",
+    )
+    assert "attach_object_to_link" in data["result"]["message"]
 
 
 def test_assistant_bridge_scene_resource_rejects_flat_attachment_frame(
@@ -639,9 +662,12 @@ def test_assistant_bridge_scene_resource_rejects_flat_attachment_frame(
         },
     )
 
-    assert response.status_code == 400
-    assert "backend canonical world frame" in response.json()["detail"]
-    assert "attach_object_to_link" in response.json()["detail"]
+    data = _assert_bridge_validation_error(
+        response,
+        http_status=400,
+        message_contains="backend canonical world frame",
+    )
+    assert "attach_object_to_link" in data["result"]["message"]
 
 
 def test_assistant_bridge_scene_resource_rejects_nested_attachment_frame_with_world_alias(
@@ -669,9 +695,12 @@ def test_assistant_bridge_scene_resource_rejects_nested_attachment_frame_with_wo
         },
     )
 
-    assert response.status_code == 400
-    assert "backend canonical world frame" in response.json()["detail"]
-    assert "attach_object_to_link" in response.json()["detail"]
+    data = _assert_bridge_validation_error(
+        response,
+        http_status=400,
+        message_contains="backend canonical world frame",
+    )
+    assert "attach_object_to_link" in data["result"]["message"]
 
 
 def test_assistant_bridge_scene_resource_accepts_flat_box_arguments(
@@ -919,8 +948,11 @@ def test_assistant_bridge_composer_draft_callback_rejects_duplicate_upsert_ids(
         },
     )
 
-    assert response.status_code == 400
-    assert "duplicate objectId" in response.json()["detail"]
+    _assert_bridge_validation_error(
+        response,
+        http_status=400,
+        message_contains="duplicate objectId",
+    )
 
 
 def test_assistant_bridge_discovery_callbacks_return_catalog_skills_and_capabilities(
@@ -1182,7 +1214,11 @@ def test_assistant_bridge_wrap_node_rejects_non_empty_wrapper_children(
             },
         },
     )
-    assert response.status_code == 400
+    _assert_bridge_validation_error(
+        response,
+        http_status=400,
+        message_contains="wrapper must not include non-empty 'children'",
+    )
 
 
 def test_assistant_bridge_wrap_node_strips_empty_children_with_warning(
@@ -1293,8 +1329,12 @@ def test_assistant_bridge_wrap_node_unknown_id_rejected_by_allowlist(
             },
         },
     )
-    assert response.status_code == 403
-    detail = response.json()["detail"]
+    data = _assert_bridge_validation_error(
+        response,
+        http_status=403,
+        message_contains="not allowed",
+    )
+    detail = data["result"]["detail"]
     assert isinstance(detail, dict)
     assert "repeat_node" in detail["rejectedNodeKinds"]
     # The recovery hint includes 'repeat' — close enough to the typo that the
@@ -1333,8 +1373,12 @@ def test_assistant_bridge_wrap_node_enforces_mode_node_allowlist(
             },
         },
     )
-    assert response.status_code == 403
-    detail = response.json()["detail"]
+    data = _assert_bridge_validation_error(
+        response,
+        http_status=403,
+        message_contains="not allowed",
+    )
+    detail = data["result"]["detail"]
     assert isinstance(detail, dict)
     assert "command_gripper" in detail["rejectedNodeKinds"]
     assert "repeat" in detail["allowedNodeKinds"]
@@ -1370,8 +1414,12 @@ def test_assistant_bridge_insert_node_enforces_mode_node_allowlist(
             },
         },
     )
-    assert response.status_code == 403
-    detail = response.json()["detail"]
+    data = _assert_bridge_validation_error(
+        response,
+        http_status=403,
+        message_contains="not allowed",
+    )
+    detail = data["result"]["detail"]
     assert "command_gripper" in detail["rejectedNodeKinds"]
 
 
@@ -1397,8 +1445,12 @@ def test_assistant_bridge_wrap_node_unknown_target_returns_valid_names(
             },
         },
     )
-    assert response.status_code == 404
-    detail = response.json()["detail"]
+    data = _assert_bridge_validation_error(
+        response,
+        http_status=404,
+        message_contains="Target node not found",
+    )
+    detail = data["result"]["detail"]
     assert isinstance(detail, dict)
     assert detail["rootAlias"] == "@root"
     # The minimal program has root="root" and one child="reset_trajectories".
