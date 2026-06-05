@@ -1,6 +1,7 @@
 """Assistant routes - /api/assistant/*"""
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import os
@@ -677,6 +678,37 @@ def create_assistant_router(state: ComposerState) -> APIRouter:
                 ),
                 "detail": enriched_detail,
             }
+            # FIX 4: enrich the envelope with an explicit schema diff
+            # so the model can self-correct instead of looping on the
+            # same wrong shape. The diff lists which provided keys are
+            # NOT in the canonical schema (typically snake_case typos
+            # not caught by the normalizer) and which required keys are
+            # missing. The model is then told to re-emit using the
+            # canonical keys.
+            try:
+                tool_schema = _bridge_tool_input_schema(
+                    resolved_catalog, tool_id
+                )
+                if tool_schema:
+                    diff = _diff_against_schema(
+                        provided=request.arguments,
+                        schema=tool_schema,
+                    )
+                    if diff.get("unexpectedKeys") or diff.get("missingRequired"):
+                        if isinstance(envelope, dict):
+                            envelope["expectedSchema"] = {
+                                "required": tool_schema.get("required", []),
+                                "properties": list(
+                                    (tool_schema.get("properties") or {}).keys()
+                                ),
+                            }
+                            envelope["providedArgs"] = list(
+                                (request.arguments or {}).keys()
+                            )
+                            envelope["diff"] = diff
+            except Exception:
+                # Never fail the request because of envelope enrichment.
+                pass
             return {
                 "toolId": tool_id,
                 "success": False,
@@ -1271,6 +1303,405 @@ async def _execute_bridge_read_only_tool(
     )
 
 
+# =========================================================================
+# Argument normalization (snake_case + flat → camelCase + nested).
+# =========================================================================
+# Cosmos-reason2-8b (and other models trained on Python/snake_case
+# conventions) frequently emit tool arguments with snake_case keys and
+# flattened compound payloads (e.g. `target_name` + `wrapper_id` +
+# `wrapper_name` instead of `targetName` + `wrapper: {id, name}`).
+# Rather than let the validator reject every such call and force the
+# model into a 11-turn loop trying the same wrong shape, we normalize
+# at the boundary: rename known snake_case keys to camelCase and nest
+# the known flat-compound keys into their canonical objects, BEFORE
+# the validator sees them.
+#
+# This is a one-way translation: the model-facing schema (the catalog
+# manifest at /api/assistant/modes/<mode>) is unchanged — it still
+# advertises camelCase + nested. The normalization is forgiving on the
+# input side only. A tool error response (see _enrich_error_envelope)
+# still names the canonical camelCase field so the model learns the
+# correct shape over time.
+#
+# Per-tool RENAME_MAP entries handle straight key renames. Per-tool
+# NEST_MAP entries collapse flat-compound forms into nested objects.
+# Tools not listed here pass through unchanged.
+
+_TOOL_KEY_RENAMES: dict[str, dict[str, str]] = {
+    "tree_draft_wrap_node": {
+        "target_name": "targetName",
+        "force_discard_overrides": "forceDiscardOverrides",
+    },
+    "tree_draft_insert_node": {
+        # The actual schema (see _TREE_DRAFT_INSERT_NODE_SCHEMA in
+        # assistant_tool_schemas.py) puts ``nodeName``, ``parentName``,
+        # ``index``, ``afterName``, and ``beforeName`` ALL at top-level —
+        # there is NO ``position`` wrapper object. Previous versions of
+        # this map nested afterName/beforeName/index under ``position``,
+        # which the validator then rejected. Reference: reviewer finding
+        # 3 (2026-06-03).
+        "parent_name": "parentName",
+        "node_name": "nodeName",
+        "after_name": "afterName",
+        "before_name": "beforeName",
+        # ``index`` is the same key in both forms — no rename needed.
+    },
+    "tree_draft_update_node_params": {
+        "node_name": "nodeName",
+    },
+    "tree_draft_delete_node": {
+        "node_name": "nodeName",
+    },
+    "tree_draft_remove_node": {
+        "node_name": "nodeName",
+    },
+    "tree_draft_move_node": {
+        "node_name": "nodeName",
+        "new_parent": "newParentName",
+        "new_parent_name": "newParentName",
+    },
+    "tree_draft_change_node_kind": {
+        # The schema's required field is ``newId`` (the new catalog
+        # identifier), NOT ``newKind`` — earlier versions of Rule 8a
+        # and this map both said ``newKind`` and silently broke
+        # every change-kind call. See
+        # _TREE_DRAFT_CHANGE_NODE_KIND_SCHEMA in
+        # assistant_tool_schemas.py. Reference: drift test under
+        # nemoclaw bridge tests (test_bridge_correctness.py).
+        "node_name": "nodeName",
+        "new_kind": "newId",
+        "new_id": "newId",
+    },
+    "tree_draft_replace_subtree": {
+        # The schema's required fields are ``nodeName`` and
+        # ``subtree`` — NOT ``targetName`` and ``replacement``.
+        # Earlier Rule 8a and this map were copy-pasted from
+        # ``tree_draft_wrap_node``'s shape and silently broke every
+        # replace-subtree call. See
+        # _TREE_DRAFT_REPLACE_SUBTREE_SCHEMA in
+        # assistant_tool_schemas.py.
+        "target_name": "nodeName",
+        "node_name": "nodeName",
+    },
+    "tree_draft_replace_node": {
+        "node_name": "nodeName",
+    },
+    "scene_draft_add_object": {
+        # The ``add`` schema (see _SCENE_RESOURCE_SCHEMA in
+        # assistant_tool_schemas.py) requires ``objectId``, NOT ``name``.
+        # Models frequently emit ``object_id`` (Python style) or
+        # ``name`` (English). Map ``object_id`` here; ``name`` is left
+        # un-mapped because we don't want to silently coerce a
+        # caller-chosen descriptive label into a structural id —
+        # _diff_against_schema will surface ``name`` as unexpected and
+        # the model can correct on the next turn. Reference: reviewer
+        # finding 4 (2026-06-03).
+        "object_id": "objectId",
+    },
+    "scene_draft_update_object": {
+        "object_id": "objectId",
+    },
+    "scene_draft_remove_object": {
+        "object_id": "objectId",
+    },
+    "scene_draft_remove_objects": {
+        "object_ids": "objectIds",
+    },
+}
+
+# Per-tool nest map: maps a set of flat-compound keys onto a single
+# nested object key. E.g. wrapper_id + wrapper_name + wrapper_params
+# → wrapper: {id, name, params}.
+_TOOL_NEST_MAP: dict[str, dict[str, dict[str, str]]] = {
+    "tree_draft_wrap_node": {
+        # nested key: {flat_key_in_args: nested_field_name}
+        "wrapper": {
+            "wrapper_id": "id",
+            "wrapper_name": "name",
+            "wrapper_params": "params",
+            "wrapperId": "id",
+            "wrapperName": "name",
+            "wrapperParams": "params",
+        },
+    },
+    "tree_draft_insert_node": {
+        # NOTE: ``node`` does NOT carry ``name`` — the instance name is
+        # the top-level ``nodeName`` argument (see RENAMES above). The
+        # ``node`` payload schema is {id, params, children?}. Including
+        # ``name`` here was a 2026-06-03 bug (the validator rejected it
+        # via additionalProperties:false). Reference: reviewer finding 3.
+        "node": {
+            "node_id": "id",
+            "node_params": "params",
+            "node_children": "children",
+            "nodeId": "id",
+            "nodeChildren": "children",
+        },
+        # IMPORTANT: ``afterName``, ``beforeName``, and ``index`` are
+        # top-level on tree_draft_insert_node, NOT nested under a
+        # ``position`` object. They are mapped via RENAMES above. Do
+        # NOT add a ``position`` nest entry here — the validator will
+        # reject it.
+    },
+    "tree_draft_replace_subtree": {
+        # The schema's nested payload is ``subtree`` (a full tree
+        # node), NOT ``replacement``. Map flat ``subtree_*`` and the
+        # copy-pasted ``replacement_*`` to ``subtree.<field>`` —
+        # accepting both is forgiving on the input side; only the
+        # canonical key reaches the validator. See
+        # _TREE_DRAFT_REPLACE_SUBTREE_SCHEMA.
+        "subtree": {
+            "subtree_id": "id",
+            "subtree_name": "name",
+            "subtree_params": "params",
+            "subtree_children": "children",
+            "replacement_id": "id",
+            "replacement_name": "name",
+            "replacement_params": "params",
+            "replacement_children": "children",
+        },
+    },
+    "tree_draft_replace_node": {
+        "replacement": {
+            "replacement_id": "id",
+            "replacement_name": "name",
+            "replacement_params": "params",
+        },
+    },
+}
+
+# Per-tool nested-key rename map. Distinct from _TOOL_NEST_MAP because
+# this one renames keys INSIDE an already-nested dict that the caller
+# emitted (e.g. ``shape: {box_dims: [...]}``  →  ``shape:
+# {box_dimensions_m: [...]}``), whereas _TOOL_NEST_MAP collapses
+# top-level flat keys (e.g. ``shape_box_dims: [...]``) into a nested
+# object. Both passes coexist because models emit BOTH shapes.
+#
+# Format:
+#   _TOOL_NESTED_RENAMES[tool_id][nested_key][bad_inner_key] = good_inner_key
+#
+# Pass order: Pass 1 (nest flat-compounds) runs first, then Pass 1.5
+# (this map) renames inner keys on whatever nested dict exists at the
+# end of Pass 1 — whether the caller emitted it canonically or the
+# normalizer synthesized it.
+_TOOL_NESTED_RENAMES: dict[str, dict[str, dict[str, str]]] = {
+    "scene_draft_add_object": {
+        # ``shape`` schema uses ``box_dimensions_m`` (not ``box_dims``)
+        # per _SCENE_RESOURCE_SCHEMA. Sphere/cylinder/mesh variants
+        # use ``sphere_radius_m``, ``cylinder_radius_m``,
+        # ``cylinder_height_m``, etc. — we normalize the common
+        # ``box_dims`` confusion; rarer variants surface in the diff
+        # hint. Reference: reviewer finding 4 (2026-06-03).
+        "shape": {
+            "box_dims": "box_dimensions_m",
+            "box_dimensions": "box_dimensions_m",
+            "sphere_radius": "sphere_radius_m",
+            "cylinder_radius": "cylinder_radius_m",
+            "cylinder_height": "cylinder_height_m",
+        },
+        # ``pose`` schema uses ``orientation_xyzw`` (quaternion
+        # [x,y,z,w]) — NOT ``orientation_quat``. The canonical
+        # bridge Rule 8a now teaches this directly, but models
+        # trained on ROS-style naming reliably emit ``_quat``;
+        # we accept and normalize. Also accept the common
+        # ``position`` shorthand for ``position_m``.
+        "pose": {
+            "orientation_quat": "orientation_xyzw",
+            "orientation": "orientation_xyzw",
+            "position": "position_m",
+        },
+    },
+    "scene_draft_update_object": {
+        "shape": {
+            "box_dims": "box_dimensions_m",
+            "box_dimensions": "box_dimensions_m",
+            "sphere_radius": "sphere_radius_m",
+            "cylinder_radius": "cylinder_radius_m",
+            "cylinder_height": "cylinder_height_m",
+        },
+        "pose": {
+            "orientation_quat": "orientation_xyzw",
+            "orientation": "orientation_xyzw",
+            "position": "position_m",
+        },
+    },
+}
+
+
+def _bridge_tool_input_schema(
+    resolved_catalog: dict[str, Any], tool_id: str
+) -> dict[str, Any] | None:
+    """Return the JSON Schema for ``tool_id`` from the resolved mode catalog.
+
+    The mode-resolved catalog contains a `tools` list where each entry
+    has `id` and `inputSchema`. Returns None if the tool is not present
+    or the inputSchema is missing.
+    """
+    try:
+        for tool in resolved_catalog.get("tools", []) or []:
+            if isinstance(tool, dict) and tool.get("id") == tool_id:
+                schema = tool.get("inputSchema")
+                if isinstance(schema, dict):
+                    return schema
+                return None
+    except Exception:
+        return None
+    return None
+
+
+def _diff_against_schema(
+    *, provided: Any, schema: dict[str, Any]
+) -> dict[str, Any]:
+    """Compute a per-key diff between ``provided`` args and ``schema``.
+
+    Returns a dict with three lists:
+    - ``unexpectedKeys``: keys in ``provided`` that are NOT in the
+      schema's top-level properties. For each, includes a `suggestion`
+      that converts snake_case to camelCase if a matching schema key
+      exists. The model can use this to self-correct.
+    - ``missingRequired``: schema-required keys absent from ``provided``.
+    - ``hint``: a short human-readable instruction the model can read
+      as the actionable advice.
+
+    The diff is intentionally compact (key names only) — it does NOT
+    embed the full schema. The envelope's ``expectedSchema`` block
+    carries the schema view separately.
+    """
+    if not isinstance(provided, dict) or not isinstance(schema, dict):
+        return {"unexpectedKeys": [], "missingRequired": [], "hint": ""}
+    schema_props = schema.get("properties") or {}
+    schema_keys = set(schema_props.keys()) if isinstance(schema_props, dict) else set()
+    required = schema.get("required") or []
+    if not isinstance(required, list):
+        required = []
+
+    def _snake_to_camel(name: str) -> str:
+        parts = name.split("_")
+        return parts[0] + "".join(p.title() for p in parts[1:])
+
+    unexpected: list[dict[str, str]] = []
+    for key in provided.keys():
+        if key in schema_keys:
+            continue
+        # Try to suggest a camelCase form that does exist in the schema.
+        camel = _snake_to_camel(key)
+        suggestion = camel if camel in schema_keys else ""
+        if not suggestion:
+            # Maybe it's a flat-compound form like wrapper_id where the
+            # canonical is wrapper.id. Check by stripping a known prefix.
+            # NOTE: ``position_`` is intentionally NOT in this list —
+            # tree_draft_insert_node's afterName/beforeName/index are
+            # top-level on the schema (no ``position`` nest), so
+            # suggesting ``position.afterName`` would be wrong. The
+            # snake-to-camel conversion above handles those correctly.
+            for prefix in ("wrapper_", "node_", "replacement_", "shape_"):
+                if key.startswith(prefix):
+                    parent = prefix.rstrip("_")
+                    if parent in schema_keys:
+                        suggestion = f"{parent}.{key[len(prefix):]}"
+                        break
+        unexpected.append({"providedKey": key, "suggestion": suggestion or None})
+
+    missing_required = [k for k in required if k not in provided]
+    hints: list[str] = []
+    if unexpected:
+        renames = [
+            f"{u['providedKey']!r} → {u['suggestion']!r}"
+            for u in unexpected
+            if u.get("suggestion")
+        ]
+        if renames:
+            hints.append(
+                "Rename keys: " + ", ".join(renames)
+            )
+        bad_only = [u["providedKey"] for u in unexpected if not u.get("suggestion")]
+        if bad_only:
+            hints.append(
+                f"Drop unrecognized keys: {bad_only}"
+            )
+    if missing_required:
+        hints.append(
+            f"Provide missing required keys: {missing_required}"
+        )
+    if not hints:
+        hints.append("All provided keys are recognized; check value types.")
+    return {
+        "unexpectedKeys": unexpected,
+        "missingRequired": missing_required,
+        "hint": " | ".join(hints),
+    }
+
+
+def _normalize_bridge_tool_arguments(
+    tool_id: str, arguments: dict[str, Any]
+) -> dict[str, Any]:
+    """Normalize snake_case + flat-compound args to camelCase + nested.
+
+    Returns a deep-copied new dict; the input is NOT mutated, even
+    when canonical nested objects (e.g. ``wrapper``, ``node``, ``shape``)
+    are already present. Tools without a registered rename/nest map
+    pass through unchanged (a deep copy is still made for safety, so
+    callers can rely on the no-mutation guarantee unconditionally).
+
+    The deep copy matters because Pass 1 may call ``existing.setdefault``
+    on the nested object after merging — without it, the caller's
+    original nested dict would be mutated in place. Reference: reviewer
+    finding 5 (2026-06-03).
+    """
+    if not isinstance(arguments, dict):
+        return arguments
+    # Deep copy so subsequent mutations (Pass 1's setdefault on the
+    # canonical nested dict, Pass 2's rename pop/assign) never reach
+    # the caller's input.
+    out: dict[str, Any] = copy.deepcopy(arguments)
+
+    # Pass 1: nest flat-compound forms (e.g. wrapper_id → wrapper.id).
+    # If the canonical nested key (`wrapper`) is also present, we MERGE
+    # the synthesized nest into it rather than overwriting — the model
+    # may have emitted partial canonical + partial flat in the same
+    # call. The canonical fields always win on conflict.
+    nest_map = _TOOL_NEST_MAP.get(tool_id)
+    if nest_map:
+        for nested_key, field_map in nest_map.items():
+            synth: dict[str, Any] = {}
+            for flat_key, target_field in field_map.items():
+                if flat_key in out:
+                    synth[target_field] = out.pop(flat_key)
+            if synth:
+                existing = out.get(nested_key)
+                if isinstance(existing, dict):
+                    # canonical wins on conflict; only fill missing
+                    for k, v in synth.items():
+                        existing.setdefault(k, v)
+                else:
+                    out[nested_key] = synth
+
+    # Pass 1.5: rename keys INSIDE already-nested dicts. Covers the
+    # common case where the model correctly nested a compound (e.g.
+    # ``shape: {type, box_dims}``) but used a wrong inner key name
+    # (``box_dims`` instead of ``box_dimensions_m``). Runs after Pass 1
+    # so it operates on whatever nested dict exists at this point —
+    # whether the caller emitted it canonically or Pass 1 synthesized
+    # it from flat compounds. See _TOOL_NESTED_RENAMES docstring.
+    nested_renames = _TOOL_NESTED_RENAMES.get(tool_id)
+    if nested_renames:
+        for nested_key, inner_renames in nested_renames.items():
+            inner = out.get(nested_key)
+            if not isinstance(inner, dict):
+                continue
+            for bad_inner, good_inner in inner_renames.items():
+                if bad_inner in inner and good_inner not in inner:
+                    inner[good_inner] = inner.pop(bad_inner)
+
+    # Pass 2: rename top-level snake_case keys to camelCase.
+    rename_map = _TOOL_KEY_RENAMES.get(tool_id)
+    if rename_map:
+        for snake, camel in rename_map.items():
+            if snake in out and camel not in out:
+                out[camel] = out.pop(snake)
+    return out
+
+
 async def _execute_bridge_tool(
     state: ComposerState,
     *,
@@ -1280,6 +1711,11 @@ async def _execute_bridge_tool(
     assistant_mode: str | None = None,
     node_allowlist: set[str] | None = None,
 ) -> dict[str, Any]:
+    # Normalize args before dispatch — see _normalize_bridge_tool_arguments
+    # docstring for rationale. The normalization is forgiving on the
+    # input side only; the model-facing schema is unchanged.
+    arguments = _normalize_bridge_tool_arguments(tool_id, arguments)
+
     if effect == READ_ONLY_EFFECT:
         return await _execute_bridge_read_only_tool(
             state,
@@ -3720,8 +4156,16 @@ def _resolve_provider(state: ComposerState, request: AssistantChatRequest):
     provider = _configured_assistant_provider(state)
     if provider is None:
         raise HTTPException(status_code=503, detail="No assistant provider is configured")
-    if request.provider_id and request.provider_id != provider.provider_id:
-        raise HTTPException(status_code=404, detail="Requested assistant provider is not configured")
+    if request.provider_id:
+        # Normalize legacy aliases (e.g. 'nemoclaw' → 'direct') on both
+        # sides before comparing so a client sending the canonical id
+        # against a provider that records the alias (or vice-versa)
+        # doesn't get a spurious 404.
+        from .assistant_provider import LANE_ID_ALIASES
+        requested = LANE_ID_ALIASES.get(request.provider_id, request.provider_id)
+        configured = LANE_ID_ALIASES.get(provider.provider_id, provider.provider_id)
+        if requested != configured:
+            raise HTTPException(status_code=404, detail="Requested assistant provider is not configured")
     return provider
 
 

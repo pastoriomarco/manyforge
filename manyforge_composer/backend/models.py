@@ -1706,6 +1706,19 @@ class AssistantProviderDescriptorResponse(BaseModel):
     configured: bool = False
     requires_live_model: bool = Field(default=False, alias="requiresLiveModel")
     requires_live_isaac_sim: bool = Field(default=False, alias="requiresLiveIsaacSim")
+    # Structured metadata fields surfaced from
+    # ``manyforge_composer.backend.assistant_provider.LANE_REGISTRY``.
+    # Optional because the ``mock`` and ``deterministic-scene-authoring``
+    # rows do not back an engine lane and omit these. Engine-backed
+    # rows (``direct``, ``openclaw``, ``hermes``) carry all four. Tests
+    # and UI should assert on / render these, NOT description prose —
+    # see the LANE_REGISTRY docstring and test_assistant_lane_catalog
+    # for rationale (external review, 2026-06-03).
+    aliases: List[str] = Field(default_factory=list)
+    runtime: Optional[str] = None
+    routing: Optional[str] = None
+    isolation: Optional[str] = None
+    inert: bool = False
 
 
 class AssistantProviderCatalogResponse(BaseModel):

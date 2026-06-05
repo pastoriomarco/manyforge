@@ -6,7 +6,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MANYFORGE_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-NEMOCLAW_THOR="${NEMOCLAW_THOR:-$HOME/workspaces/nemoclaw/src/NemoClaw-Thor}"
+NEMOCLAW_THOR="${NEMOCLAW_THOR:-$HOME/workspaces/dev_ws/src/NemoClaw-Thor}"
 
 source "${NEMOCLAW_THOR}/setup/checks.sh"
 source "${NEMOCLAW_THOR}/serving/config.sh"

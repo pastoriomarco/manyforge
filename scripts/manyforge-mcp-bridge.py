@@ -24,35 +24,37 @@ Why this exists:
         to attribute the call to.
 
 Configuration (env vars):
+    MANYFORGE_LANE            — lane identifier; used to derive default
+                                principal and ID prefixes for
+                                conversation/request audit.
+                                default: openclaw (preserves pre-lane-aware
+                                deployments bit-identical)
     MANYFORGE_COMPOSER_BASE   — Composer HTTP root.
                                 default: http://host.openshell.internal:9000
     MANYFORGE_ASSISTANT_MODE  — assistant mode to expose.
                                 default: composer-assistant
     MANYFORGE_PRINCIPAL       — principal name recorded in audit.
-                                default: openclaw-sandbox
+                                default: <LANE>-sandbox
     MANYFORGE_REQUEST_TIMEOUT — per-HTTP-call timeout in seconds.
                                 default: 120
     MANYFORGE_CA_BUNDLE       — TLS CA bundle path.
                                 default: /etc/openshell-tls/ca-bundle.pem if present
-    MANYFORGE_ALLOWED_TOOLS   — optional comma-separated request-scoped tool ids.
-                                When set, tools/list exposes only those ids plus
-                                the helper ids below, intersected with the mode
-                                allowlist. tools/call is rejected outside the
-                                same filtered surface.
-    MANYFORGE_ALLOWED_TOOLS_FILE — optional file containing the same comma-
-                                separated list. Default:
-                                /tmp/manyforge-openclaw-allowed-tools.txt.
-                                This is used by the OpenClaw adapter because
-                                OpenClaw MCP server env is static in config.
-    MANYFORGE_HELPER_TOOLS    — comma-separated safe helper ids auto-exposed
-                                when MANYFORGE_ALLOWED_TOOLS is set.
-                                default: catalog_read,program_read,scene_inspect,
-                                         deployment_capabilities_read,skills_read,
-                                         status_read,program_validate
 
-Usage in openclaw.json mcpServers:
+Usage (per lane):
+  OpenClaw — emit into openclaw.json mcpServers:
     {"mcpServers": {"manyforge": {"command": "python3",
-        "args": ["/sandbox/.manyforge/manyforge-mcp-bridge.py"]}}}
+        "args": ["/sandbox/.manyforge/manyforge-mcp-bridge.py"],
+        "env": {"MANYFORGE_LANE": "openclaw"}}}}
+
+  Hermes — emit into Hermes config.yaml mcp_servers:
+    mcp_servers:
+      manyforge:
+        command: python3
+        args: ["/sandbox/manyforge/scripts/manyforge-mcp-bridge.py"]
+        env:
+          MANYFORGE_LANE: "hermes"
+          MANYFORGE_ASSISTANT_MODE: "composer-assistant"
+          MANYFORGE_COMPOSER_BASE: "http://host.openshell.internal:9000"
 """
 from __future__ import annotations
 
@@ -67,6 +69,13 @@ import uuid
 from typing import Any
 
 
+# Lane identifier — derives default principal and audit ID prefixes.
+# Defaults to "openclaw" so deployments that pre-date the lane-aware
+# refactor are bit-identical to the old behavior.
+# Sanitized via .strip() or "openclaw" so an empty env doesn't corrupt
+# IDs/log columns.
+LANE = (os.environ.get("MANYFORGE_LANE", "openclaw").strip() or "openclaw")
+
 COMPOSER_BASE = os.environ.get(
     "MANYFORGE_COMPOSER_BASE",
     "http://host.openshell.internal:9000",
@@ -80,39 +89,17 @@ COMPOSER_BASE = os.environ.get(
 # for the delta block must use endpoints the proxy allows (POST to
 # /api/assistant/bridge/* is allowed; arbitrary GETs may not be).
 ASSISTANT_MODE = os.environ.get("MANYFORGE_ASSISTANT_MODE", "composer-assistant")
-PRINCIPAL = os.environ.get("MANYFORGE_PRINCIPAL", "openclaw-sandbox")
+PRINCIPAL = os.environ.get("MANYFORGE_PRINCIPAL", f"{LANE}-sandbox")
 REQUEST_TIMEOUT = float(os.environ.get("MANYFORGE_REQUEST_TIMEOUT", "120"))
-_ALLOWED_TOOLS_FILE = os.environ.get(
-    "MANYFORGE_ALLOWED_TOOLS_FILE",
-    "/tmp/manyforge-openclaw-allowed-tools.txt",
-)
-_RAW_ALLOWED_TOOLS = os.environ.get("MANYFORGE_ALLOWED_TOOLS", "")
-if os.path.exists(_ALLOWED_TOOLS_FILE):
-    try:
-        _RAW_ALLOWED_TOOLS = open(_ALLOWED_TOOLS_FILE, encoding="utf-8").read()
-    except OSError:
-        pass
-REQUEST_ALLOWED_TOOLS = {
-    item
-    for item in (part.strip() for part in _RAW_ALLOWED_TOOLS.split(","))
-    if item
-}
-DEFAULT_HELPER_TOOLS = (
-    "catalog_read,program_read,scene_inspect,deployment_capabilities_read,"
-    "skills_read,status_read,program_validate"
-)
-REQUEST_HELPER_TOOLS = {
-    item
-    for item in (part.strip() for part in os.environ.get("MANYFORGE_HELPER_TOOLS", DEFAULT_HELPER_TOOLS).split(","))
-    if item
-}
 
 _CA_BUNDLE = os.environ.get("MANYFORGE_CA_BUNDLE", "/etc/openshell-tls/ca-bundle.pem")
 _SSL_CTX: ssl.SSLContext | None = None
 
-# Stable per-process identity. OpenClaw spawns one bridge per agent
-# session, so this maps cleanly to "one conversation".
-CONVERSATION_ID = f"openclaw-{uuid.uuid4().hex[:12]}"
+# Stable per-process identity. OpenClaw/Hermes spawns one bridge per
+# agent session, so this maps cleanly to "one conversation". The
+# LANE prefix lets cross-lane audit reports attribute each row to a lane
+# at a glance.
+CONVERSATION_ID = f"{LANE}-{uuid.uuid4().hex[:12]}"
 
 # Cached mode manifest — fetched lazily on first tools/list, refreshed on
 # 409 catalog-hash mismatches (deployment hot-reload window).
@@ -146,17 +133,32 @@ def _http(method: str, path: str, body: dict[str, Any] | None = None) -> dict[st
         headers["Content-Type"] = "application/json"
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
     ctx = _ssl_context() if url.startswith("https://") else None
+    _trace_event("http_start", method=method, path=path, timeout=REQUEST_TIMEOUT)
+    t0 = time.time()
     try:
         resp = urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT, context=ctx)
-        return json.loads(resp.read())
+        raw = resp.read()
+        _trace_event("http_recv", method=method, path=path,
+                     status=resp.status, elapsed=time.time() - t0, bytes=len(raw))
+        parsed = json.loads(raw)
+        _trace_event("http_done", method=method, path=path,
+                     elapsed=time.time() - t0)
+        return parsed
     except urllib.error.HTTPError as exc:
         raw = exc.read().decode("utf-8", errors="replace")
+        _trace_event("http_httperror", method=method, path=path,
+                     status=exc.code, elapsed=time.time() - t0)
         try:
             payload = json.loads(raw)
         except (ValueError, TypeError):
             payload = {"detail": raw[:1024]}
         # Re-raise as a typed exception so call sites can branch on status.
         raise _HttpError(exc.code, payload) from exc
+    except Exception as exc:
+        _trace_event("http_exc", method=method, path=path,
+                     elapsed=time.time() - t0,
+                     exc_type=type(exc).__name__, exc_msg=str(exc)[:200])
+        raise
 
 
 class _HttpError(Exception):
@@ -169,7 +171,12 @@ class _HttpError(Exception):
 def _refresh_mode_manifest() -> dict[str, Any]:
     """Fetch the mode-scoped tool/node manifest from Composer."""
     global _MODE_MANIFEST
+    _trace_event("manifest_fetch_start", mode=ASSISTANT_MODE,
+                 composer_base=COMPOSER_BASE)
     manifest = _http("GET", f"/api/assistant/modes/{ASSISTANT_MODE}")
+    _trace_event("manifest_fetch_done", mode=ASSISTANT_MODE,
+                 tools_count=len(manifest.get("tools") or []),
+                 catalog_hash=manifest.get("catalogHash"))
     _MODE_MANIFEST = manifest
     return manifest
 
@@ -207,13 +214,7 @@ def _mode_tool_entries(manifest: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _visible_tool_entries(manifest: dict[str, Any]) -> list[dict[str, Any]]:
-    tools = _mode_tool_entries(manifest)
-    if not REQUEST_ALLOWED_TOOLS:
-        return tools
-
-    mode_ids = {str(tool["id"]) for tool in tools}
-    visible_ids = (REQUEST_ALLOWED_TOOLS | REQUEST_HELPER_TOOLS) & mode_ids
-    return [tool for tool in tools if str(tool.get("id")) in visible_ids]
+    return _mode_tool_entries(manifest)
 
 
 def _visible_tool_ids(manifest: dict[str, Any]) -> set[str]:
@@ -231,16 +232,19 @@ def _handle_initialize(message: dict[str, Any]) -> dict[str, Any]:
                 "name": "manyforge-composer",
                 "version": "0.2.0",
                 "mode": ASSISTANT_MODE,
-                "requestScopedTools": sorted(REQUEST_ALLOWED_TOOLS),
+                "toolSurfaceScope": "assistant_mode",
             },
         },
     }
 
 
 def _handle_tools_list(message: dict[str, Any]) -> dict[str, Any]:
+    _trace_event("tools_list_enter", id=message.get("id"))
     try:
         manifest = _get_mode_manifest()
     except _HttpError as exc:
+        _trace_event("tools_list_http_err", id=message.get("id"),
+                     status=exc.status)
         return {
             "jsonrpc": "2.0",
             "id": message.get("id"),
@@ -253,7 +257,18 @@ def _handle_tools_list(message: dict[str, Any]) -> dict[str, Any]:
                 "data": exc.payload,
             },
         }
-    tools = [_mcp_tool_descriptor(t) for t in _visible_tool_entries(manifest)]
+    except Exception as exc:
+        _trace_event("tools_list_exc", id=message.get("id"),
+                     exc_type=type(exc).__name__, exc_msg=str(exc)[:200])
+        raise
+    _trace_event("tools_list_post_manifest", id=message.get("id"),
+                 visible_count_pre_filter=len(manifest.get("tools") or []))
+    visible = _visible_tool_entries(manifest)
+    _trace_event("tools_list_post_visible", id=message.get("id"),
+                 visible=len(visible))
+    tools = [_mcp_tool_descriptor(t) for t in visible]
+    _trace_event("tools_list_post_descriptors", id=message.get("id"),
+                 emitted=len(tools))
     return {
         "jsonrpc": "2.0",
         "id": message.get("id"),
@@ -316,16 +331,27 @@ def _log_tool_event(
 ) -> None:
     """Append one JSONL record per tools/call for observability.
 
-    Records {ts, tool, requestId, success, args}. Used by smoke
-    harnesses to inspect what the model invoked per prompt. Empty
+    Records {ts, lane, principal, conversationId, assistantMode, tool,
+    requestId, success, args}. Used by smoke harnesses to inspect what
+    the model invoked per prompt and by cross-lane compare reports to
+    attribute each row to a lane / conversation. Empty
     ``MANYFORGE_DELTA_LOG`` disables. Never raises — logging is
     advisory; failure here must not break the call.
+
+    The lane/principal/conversationId/assistantMode columns let the
+    local MCP bridge audit be self-contained for cross-lane debugging
+    (without them, you have to cross-reference Composer's bridge-tools
+    log to attribute a row to a session).
     """
     if not _DELTA_LOG_PATH:
         return
     try:
         record = {
             "ts": time.time(),
+            "lane": LANE,
+            "principal": PRINCIPAL,
+            "conversationId": CONVERSATION_ID,
+            "assistantMode": ASSISTANT_MODE,
             "tool": tool_id,
             "requestId": request_id,
             "success": success,
@@ -361,17 +387,15 @@ def _handle_tools_call(message: dict[str, Any]) -> dict[str, Any]:
     canonical_tool_id = _normalize_tool_id(raw_tool_id, allowed_ids)
     if canonical_tool_id is None:
         # Hard-stop client-side too. The bridge endpoint will reject it,
-        # but failing here gives the model a clearer, smaller error. When a
-        # request-scoped filter is active, this also keeps OpenClaw from
-        # wandering into unrelated mode tools.
+        # but failing here gives the model a clearer, smaller error.
         return {
             "jsonrpc": "2.0",
             "id": message.get("id"),
             "error": {
                 "code": -32601,
                 "message": (
-                    f"tool '{raw_tool_id}' is not exposed by this request's "
-                    f"assistant tool window for mode '{ASSISTANT_MODE}'"
+                    f"tool '{raw_tool_id}' is not exposed by assistant "
+                    f"mode '{ASSISTANT_MODE}'"
                 ),
                 "data": {"availableTools": sorted(allowed_ids)},
             },
@@ -418,7 +442,7 @@ def _handle_tools_call(message: dict[str, Any]) -> dict[str, Any]:
             }
 
     catalog_hash = manifest.get("catalogHash")
-    request_id = f"openclaw-{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
+    request_id = f"{LANE}-{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
     envelope = {
         "requestId": request_id,
         "conversationId": CONVERSATION_ID,
@@ -505,15 +529,35 @@ _HANDLERS = {
     "initialize": _handle_initialize,
     "tools/list": _handle_tools_list,
     "tools/call": _handle_tools_call,
-    # MCP also defines notifications/initialized and ping; both are no-ops here.
+    # MCP also defines notifications/initialized (notification, no response)
+    # and ping (request with id, MUST return a result). See _handle below.
 }
 
 
 def _handle(message: dict[str, Any]) -> dict[str, Any] | None:
     method = message.get("method")
-    if method in ("notifications/initialized", "ping"):
-        # Notifications get no response; ping has no useful payload from us.
+    if method == "notifications/initialized":
+        # Notifications never get a response per JSON-RPC 2.0 spec.
         return None
+    if method == "ping":
+        # MCP ping protocol: per
+        # https://modelcontextprotocol.io/specification/2024-11-05/basic/utilities/ping
+        # the receiver MUST respond promptly with an empty result object.
+        # OpenClaw's bundle-mcp StdioClientTransport sends ping after
+        # initialize as a liveness check; if we don't respond, the gateway
+        # treats the server as unresponsive and emits
+        #   McpError: MCP error -32001: Request timed out
+        # after its connectionTimeoutMs window — leaving the manyforge
+        # catalog unregistered for the entire session and the model
+        # seeing only OpenClaw core tools (verified 2026-06-03 on the
+        # 35B bake-off run; cosmos sessions had been working by chance
+        # because they used a different invocation path that did not
+        # trigger ping).
+        return {
+            "jsonrpc": "2.0",
+            "id": message.get("id"),
+            "result": {},
+        }
     handler = _HANDLERS.get(method)
     if handler is None:
         return {
@@ -531,7 +575,117 @@ def _handle(message: dict[str, Any]) -> dict[str, Any] | None:
         }
 
 
+# Optional MCP request/response trace logger. Set
+# MANYFORGE_MCP_TRACE to a writable file path to enable.
+# Each line is a single JSON object with { ts, dir, method, id, ... }.
+# Dir is "in" for incoming requests, "out" for responses we send,
+# "err" for parse/exception failures. Useful for diagnosing
+# "Unknown tool id" / "Request timed out" cycles in the gateway log
+# — those messages only tell you OpenClaw is unhappy; the trace tells
+# you whether the bridge actually received the request and what it
+# replied with. Empty / unset = no trace, no overhead.
+_TRACE_PATH = os.environ.get("MANYFORGE_MCP_TRACE", "").strip() or None
+
+
+def _trace(direction: str, payload: dict[str, Any]) -> None:
+    if not _TRACE_PATH:
+        return
+    try:
+        rec = {
+            "ts": time.time(),
+            "dir": direction,
+            "method": payload.get("method"),
+            "id": payload.get("id"),
+            # For request payloads, capture the params; for responses,
+            # capture result or error. Keep small to avoid bloating
+            # the trace on big tools/list responses.
+            "params_keys": sorted((payload.get("params") or {}).keys()) if isinstance(payload.get("params"), dict) else None,
+            "has_result": "result" in payload,
+            "error_code": (payload.get("error") or {}).get("code") if isinstance(payload.get("error"), dict) else None,
+            "lane": LANE,
+            "principal": PRINCIPAL,
+        }
+        with open(_TRACE_PATH, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec) + "\n")
+    except Exception:
+        # Trace is best-effort; never let it break the real RPC loop.
+        pass
+
+
+def _trace_event(stage: str, **fields: Any) -> None:
+    """Emit an ad-hoc trace marker keyed by `stage`. Safe to call from any
+    code path; never raises. Used to localize hangs inside request handlers.
+    """
+    if not _TRACE_PATH:
+        return
+    try:
+        rec = {"ts": time.time(), "dir": "evt", "stage": stage,
+               "lane": LANE, "principal": PRINCIPAL}
+        rec.update(fields)
+        with open(_TRACE_PATH, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec) + "\n")
+    except Exception:
+        pass
+
+
 def main() -> None:
+    # Emit a startup marker so an operator inspecting the trace knows
+    # the bridge actually started AND that the env is what we expect.
+    if _TRACE_PATH:
+        try:
+            import socket as _socket
+            _dns_t0 = time.time()
+            _dns_err = None
+            _dns_addrs = None
+            try:
+                _dns_addrs = [a[4][0] for a in _socket.getaddrinfo("host.openshell.internal", 9000, type=_socket.SOCK_STREAM)]
+            except Exception as _dns_e:
+                _dns_err = f"{type(_dns_e).__name__}: {_dns_e}"
+            _dns_elapsed = time.time() - _dns_t0
+            _tcp_t0 = time.time()
+            _tcp_err = None
+            try:
+                _s = _socket.create_connection(("host.openshell.internal", 9000), timeout=5)
+                _s.close()
+            except Exception as _tcp_e:
+                _tcp_err = f"{type(_tcp_e).__name__}: {_tcp_e}"
+            _tcp_elapsed = time.time() - _tcp_t0
+            with open(_TRACE_PATH, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps({
+                    "ts": time.time(),
+                    "dir": "boot_env",
+                    "HTTP_PROXY": os.environ.get("HTTP_PROXY"),
+                    "http_proxy": os.environ.get("http_proxy"),
+                    "NO_PROXY": os.environ.get("NO_PROXY"),
+                    "no_proxy": os.environ.get("no_proxy"),
+                    "ALL_PROXY": os.environ.get("ALL_PROXY"),
+                    "urllib_proxies": __import__("urllib.request", fromlist=["getproxies"]).getproxies(),
+                    "urllib_proxy_bypass": __import__("urllib.request", fromlist=["proxy_bypass"]).proxy_bypass("host.openshell.internal:9000"),
+                    "dns_addrs": _dns_addrs,
+                    "dns_err": _dns_err,
+                    "dns_elapsed": _dns_elapsed,
+                    "tcp_err": _tcp_err,
+                    "tcp_elapsed": _tcp_elapsed,
+                }) + "\n")
+        except Exception as _e:
+            pass
+    if _TRACE_PATH:
+        try:
+            with open(_TRACE_PATH, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps({
+                    "ts": time.time(),
+                    "dir": "boot",
+                    "lane": LANE,
+                    "principal": PRINCIPAL,
+                    "assistant_mode": ASSISTANT_MODE,
+                    "composer_base": os.environ.get("MANYFORGE_COMPOSER_BASE"),
+                    "no_proxy_has_host_openshell": "host.openshell.internal"
+                        in (os.environ.get("NO_PROXY") or os.environ.get("no_proxy") or ""),
+                    "http_proxy_set": bool(os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy")),
+                    "pythonunbuffered": os.environ.get("PYTHONUNBUFFERED"),
+                }) + "\n")
+        except Exception:
+            pass
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -544,11 +698,14 @@ def main() -> None:
                 "error": {"code": -32700, "message": f"Parse error: {exc}"},
                 "id": None,
             }
+            _trace("err", error)
             sys.stdout.write(json.dumps(error) + "\n")
             sys.stdout.flush()
             continue
+        _trace("in", message)
         response = _handle(message)
         if response is not None:
+            _trace("out", response)
             sys.stdout.write(json.dumps(response) + "\n")
             sys.stdout.flush()
 

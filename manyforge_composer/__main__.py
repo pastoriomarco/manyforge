@@ -610,12 +610,16 @@ def main():
             "none",
             "deterministic",
             "deterministic-scene-authoring",
-            "nemoclaw",
+            "direct",
+            "nemoclaw",  # legacy alias for "direct"
             "openclaw",
+            "hermes",  # registered but inert until Phase 4
         ],
         help=(
-            "Optional assistant provider. Defaults to MANYFORGE_ASSISTANT_PROVIDER "
-            "or mock-only mode."
+            "Optional assistant provider. Canonical lane ids are 'direct', "
+            "'openclaw', and 'hermes' (per THREE-LANE-MIGRATION-PLAN). "
+            "'nemoclaw' is accepted as a legacy alias for 'direct'. Defaults "
+            "to MANYFORGE_ASSISTANT_PROVIDER or mock-only mode."
         ),
     )
     parser.add_argument(

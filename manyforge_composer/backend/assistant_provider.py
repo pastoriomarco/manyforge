@@ -611,6 +611,126 @@ class NemoClawAssistantProvider:
         )
 
 
+# =========================================================================
+# LANE_REGISTRY — per THREE-LANE-MIGRATION-PLAN.md §8 Phase 1.
+# =========================================================================
+# Single source of truth for which provider ids the Composer accepts.
+# Keyed by provider id (lower-case); each entry describes the lane.
+# Phase 1 keeps the existing two providers fully wired; ``hermes`` is
+# registered but marked ``inert=True`` until Phase 4 lands the bridge.
+# Eliminates the "unknown provider falls back silently" foot-gun — any
+# id outside this registry now raises AssistantProviderError with a
+# clear message including the accepted ids.
+# Structured metadata enums for LANE_REGISTRY entries. These are stable
+# fields callers (tests, UI, docs, audit pipelines) can rely on without
+# parsing prose. New lanes MUST pick a value from these sets — typos
+# raise ImportError at module load instead of producing silently-wrong
+# behavior. Reference: external LLM review of three-lane-migration
+# branch on 2026-06-03 (suggestion: "tests assert metadata, not prose").
+_LANE_RUNTIMES: frozenset[str] = frozenset({"nemoclaw"})
+_LANE_ROUTINGS: frozenset[str] = frozenset(
+    {"direct-vllm", "openclaw-gateway", "hermes-sessions"}
+)
+_LANE_ISOLATIONS: frozenset[str] = frozenset({"sandbox"})
+
+
+def _validate_lane_entry(lane_id: str, entry: dict[str, Any]) -> None:
+    """Validate a LANE_REGISTRY entry's structured-metadata fields.
+
+    Called once at module import for every entry. Catches enum typos
+    (e.g. "sandobx") immediately rather than letting them surface
+    later as confusing test assertion failures or silent UI bugs.
+    """
+    runtime = entry.get("runtime")
+    routing = entry.get("routing")
+    isolation = entry.get("isolation")
+    if runtime not in _LANE_RUNTIMES:
+        raise ValueError(
+            f"LANE_REGISTRY[{lane_id!r}].runtime={runtime!r} not in {sorted(_LANE_RUNTIMES)}"
+        )
+    if routing not in _LANE_ROUTINGS:
+        raise ValueError(
+            f"LANE_REGISTRY[{lane_id!r}].routing={routing!r} not in {sorted(_LANE_ROUTINGS)}"
+        )
+    if isolation not in _LANE_ISOLATIONS:
+        raise ValueError(
+            f"LANE_REGISTRY[{lane_id!r}].isolation={isolation!r} not in {sorted(_LANE_ISOLATIONS)}"
+        )
+
+
+LANE_REGISTRY: dict[str, dict[str, Any]] = {
+    # Canonical id for the Direct lane is "direct" per the
+    # THREE-LANE-MIGRATION-PLAN. The "direct" name refers to direct
+    # vLLM endpoint dispatch (bypassing the OpenClaw agent path), NOT
+    # direct host execution — components still run inside the NemoClaw
+    # sandbox. ``runtime`` and ``isolation`` carry that safety signal
+    # so it is queryable by tests/UI/audit, not hidden in prose.
+    # ``nemoclaw`` remains an accepted alias for the same lane (see
+    # LANE_ID_ALIASES below) — meaningful, not a tombstone, because
+    # the sandbox-isolation property it described still holds.
+    "direct": {
+        "default_bridge_port": 8100,
+        "transport_class": "NemoClawAssistantProvider",
+        "lane_name": "direct",
+        "inert": False,
+        "aliases": ("nemoclaw",),
+        "runtime": "nemoclaw",
+        "routing": "direct-vllm",
+        "isolation": "sandbox",
+        "description": (
+            "Direct-vLLM routing lane. Runs inside the NemoClaw sandbox "
+            "(same isolation boundary as the OpenClaw lane); 'direct' "
+            "refers to direct vLLM endpoint dispatch, NOT direct host "
+            "execution. Bridge on :8100."
+        ),
+    },
+    "openclaw": {
+        "default_bridge_port": 8200,
+        "transport_class": "NemoClawAssistantProvider",
+        "lane_name": "openclaw",
+        "inert": False,
+        "aliases": (),
+        "runtime": "nemoclaw",
+        "routing": "openclaw-gateway",
+        "isolation": "sandbox",
+        "description": (
+            "OpenClaw gateway lane with discovery-protocol skill. "
+            "Runs inside the NemoClaw sandbox. Bridge on :8200."
+        ),
+    },
+    "hermes": {
+        "default_bridge_port": 8300,
+        "transport_class": "HermesAssistantProvider",  # Phase 4
+        "lane_name": "hermes",
+        "inert": True,
+        "aliases": (),
+        "runtime": "nemoclaw",
+        "routing": "hermes-sessions",
+        "isolation": "sandbox",
+        "description": (
+            "Hermes Agents lane with native mcp_servers + sessions API. "
+            "Runs inside the NemoClaw sandbox. Bridge on :8300. Inert "
+            "until Phase 4."
+        ),
+    },
+}
+
+# Validate every entry at module import. Enum typos fail loudly here
+# rather than silently passing through to UI/tests.
+for _lane_id, _lane_entry in LANE_REGISTRY.items():
+    _validate_lane_entry(_lane_id, _lane_entry)
+
+# Legacy alias map: alias → canonical lane id. The launcher's
+# scripts/lib/assistant.sh mirrors this map. Aliases carry meaningful
+# semantics (e.g. "nemoclaw" → "direct" because the lane runs inside
+# the NemoClaw sandbox), not deprecation — see LANE_REGISTRY[...].aliases
+# for the inverse relation and the lane's structured metadata for the
+# property the alias was naming.
+LANE_ID_ALIASES: dict[str, str] = {
+    "nemoclaw": "direct",
+}
+
+
 def build_assistant_provider(
     provider_id: str | None,
     *,
@@ -621,20 +741,48 @@ def build_assistant_provider(
     """Build a configured assistant provider by id.
 
     Empty, ``mock``, and ``none`` keep Composer in its default mock-only mode.
+
+    Other provider ids are resolved against ``LANE_REGISTRY``; unknown
+    ids raise AssistantProviderError naming the accepted set, so a typo
+    surfaces immediately instead of silently falling back to Direct
+    (the pre-Phase-1 behavior at launcher's ``assistant.sh``).
     """
     normalized = (provider_id or "").strip().lower()
     if normalized in {"", "none", "mock"}:
         return None
     if normalized in {"deterministic", "deterministic-scene-authoring"}:
         return DeterministicSceneAuthoringProvider()
-    if normalized in {"nemoclaw", "openclaw"}:
+
+    # Resolve legacy aliases (e.g. nemoclaw → direct) before consulting
+    # the registry. The original provider_id is preserved in the
+    # NemoClawAssistantProvider for audit-log compatibility.
+    resolved = LANE_ID_ALIASES.get(normalized, normalized)
+    lane_entry = LANE_REGISTRY.get(resolved)
+    if lane_entry is not None and lane_entry.get("inert"):
+        raise AssistantProviderError(
+            f"Provider '{provider_id}' is registered but inert in this build "
+            f"({lane_entry.get('description', '')}). Implement the transport class "
+            f"before selecting it as the active provider."
+        )
+    if resolved in {"direct", "openclaw"}:
+        # NemoClawAssistantProvider handles both the Direct lane (bridge
+        # on :8100) and the OpenClaw lane (bridge on :8200). The
+        # endpoint URL differs but the transport class is the same.
         return NemoClawAssistantProvider(
             endpoint_url=endpoint_url or _assistant_endpoint_from_env(),
-            provider_id=normalized,
+            provider_id=normalized,  # preserve original id for audit
             timeout_s=timeout_s if timeout_s is not None else _assistant_timeout_from_env(),
             api_token=api_token or os.environ.get("MANYFORGE_ASSISTANT_API_TOKEN"),
         )
-    raise AssistantProviderError(f"Unsupported assistant provider: {provider_id}")
+    accepted = sorted(
+        set(LANE_REGISTRY)
+        | set(LANE_ID_ALIASES)
+        | {"mock", "none", "deterministic", "deterministic-scene-authoring"}
+    )
+    raise AssistantProviderError(
+        f"Unsupported assistant provider: {provider_id!r}. "
+        f"Accepted ids: {accepted}"
+    )
 
 
 def _error_from_response_json(response: Any) -> AssistantProviderError | None:
@@ -679,32 +827,68 @@ def assistant_provider_catalog(configured_provider: AssistantProvider | None) ->
             "requiresLiveModel": False,
             "requiresLiveIsaacSim": False,
         },
+        # The three engine-backed lanes below carry structured metadata
+        # fields (runtime/routing/isolation/aliases) sourced from
+        # LANE_REGISTRY. Tests and UI should assert on these, NOT on
+        # description prose — prose drifts as wording is polished, the
+        # metadata is the stable contract. See LANE_REGISTRY in this
+        # module for the source of truth and _LANE_RUNTIMES/_LANE_ROUTINGS/
+        # _LANE_ISOLATIONS for the allowed enum values.
         {
-            "id": "nemoclaw",
-            "description": (
-                "Direct-vLLM assistant lane. The in-tree manyforge_assistant_bridge "
-                "runs the agent loop in-process against the configured vLLM "
-                "endpoint. Sub-2s warm latency; current known-good demo baseline "
+            "id": "direct",
+            "aliases": list(LANE_REGISTRY["direct"]["aliases"]),
+            "runtime": LANE_REGISTRY["direct"]["runtime"],
+            "routing": LANE_REGISTRY["direct"]["routing"],
+            "isolation": LANE_REGISTRY["direct"]["isolation"],
+            "description": LANE_REGISTRY["direct"]["description"] + (
+                " The in-tree manyforge_assistant_bridge runs the agent "
+                "loop in-process against the configured vLLM endpoint. "
+                "Sub-2s warm latency; current known-good demo baseline "
                 "and fallback when the OpenClaw lane is unhealthy."
             ),
-            "configured": configured_id == "nemoclaw",
+            # Match against both the canonical id and every registered
+            # alias so `configured_id="nemoclaw"` and `"direct"` both
+            # resolve true. Single catalog row keeps the contract
+            # unambiguous (one row per lane), while aliases preserve
+            # caller intent. configuredProviderId at the API surface
+            # still returns the original requested id for audit.
+            "configured": configured_id == "direct"
+            or configured_id in LANE_REGISTRY["direct"]["aliases"],
             "requiresLiveModel": True,
             "requiresLiveIsaacSim": False,
         },
         {
             "id": "openclaw",
-            "description": (
-                "Persistent-gateway assistant lane (demo default as of 2026-05-05). "
-                "The NemoClaw-Thor openclaw_assistant_bridge translates the "
-                "ManyForge assistant HTTP contract into /v1/chat/completions calls "
-                "against the OpenClaw gateway running in the NemoClaw sandbox. The "
-                "gateway runs the agent loop and the manyforge MCP server; "
-                "ManyForge still enforces every tool call via "
+            "aliases": list(LANE_REGISTRY["openclaw"]["aliases"]),
+            "runtime": LANE_REGISTRY["openclaw"]["runtime"],
+            "routing": LANE_REGISTRY["openclaw"]["routing"],
+            "isolation": LANE_REGISTRY["openclaw"]["isolation"],
+            "description": LANE_REGISTRY["openclaw"]["description"] + (
+                " The NemoClaw-Thor openclaw_assistant_bridge translates "
+                "the ManyForge assistant HTTP contract into "
+                "/v1/chat/completions calls against the OpenClaw gateway. "
+                "The gateway runs the agent loop and the manyforge MCP "
+                "server; ManyForge still enforces every tool call via "
                 "/api/assistant/bridge/tools/{toolId}. Warm latency 5-15s."
             ),
             "configured": configured_id == "openclaw",
             "requiresLiveModel": True,
             "requiresLiveIsaacSim": False,
+        },
+        {
+            "id": "hermes",
+            "aliases": list(LANE_REGISTRY["hermes"]["aliases"]),
+            "runtime": LANE_REGISTRY["hermes"]["runtime"],
+            "routing": LANE_REGISTRY["hermes"]["routing"],
+            "isolation": LANE_REGISTRY["hermes"]["isolation"],
+            "description": LANE_REGISTRY["hermes"]["description"] + (
+                " Will translate to Hermes sessions API with native "
+                "mcp_servers support."
+            ),
+            "configured": configured_id == "hermes",
+            "requiresLiveModel": True,
+            "requiresLiveIsaacSim": False,
+            "inert": True,
         },
     ]
 

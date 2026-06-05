@@ -39,7 +39,7 @@ BRIDGE_LIVENESS_GRACE_S="${BRIDGE_LIVENESS_GRACE_S:-5}"
 PROXY_LIVENESS_GRACE_S="${PROXY_LIVENESS_GRACE_S:-2}"
 
 # ── Configuration (env vars carried over from demo-assistant-known-good.sh) ──
-NEMOCLAW_THOR="${NEMOCLAW_THOR:-${HOME}/workspaces/nemoclaw/src/NemoClaw-Thor}"
+NEMOCLAW_THOR="${NEMOCLAW_THOR:-${HOME}/workspaces/dev_ws/src/NemoClaw-Thor}"
 MODEL_PROFILE="${MODEL_PROFILE:-cosmos-reason2-8b}"
 ASSISTANT_PROVIDER="${ASSISTANT_PROVIDER:-openclaw}"
 START_VLLM_PROXY="${START_VLLM_PROXY:-true}"
@@ -48,6 +48,36 @@ OPENCLAW_PROXY_THINKING_TOKEN_BUDGET="${OPENCLAW_PROXY_THINKING_TOKEN_BUDGET:-51
 OPENCLAW_ASSISTANT_COMPACT_EVERY_N="${OPENCLAW_ASSISTANT_COMPACT_EVERY_N:-2}"
 OPENCLAW_ASSISTANT_COMPACT_TIMEOUT_S="${OPENCLAW_ASSISTANT_COMPACT_TIMEOUT_S:-120}"
 OPENCLAW_ASSISTANT_METRICS_ENABLED="${OPENCLAW_ASSISTANT_METRICS_ENABLED:-false}"
+# FIX 5 — bridge-side cross-turn loop break thresholds.
+# Same-tool-name detector (existing): fires when N consecutive turns call
+# the same tool name even if args differ. Default 5.
+# Same-tool-same-args detector (new in 2026-06-03 lane parity work):
+# fires when the EXACT same tool+args fingerprint appears N+1 times,
+# meaning the model isn't reading the error envelope's diff/hint. Default
+# 2 (3 identical calls trigger the break). Setting either to 0 disables
+# that detector.
+OPENCLAW_ASSISTANT_LOOP_TOOL_THRESHOLD="${OPENCLAW_ASSISTANT_LOOP_TOOL_THRESHOLD:-5}"
+OPENCLAW_ASSISTANT_LOOP_ARGS_THRESHOLD="${OPENCLAW_ASSISTANT_LOOP_ARGS_THRESHOLD:-2}"
+# OPENCLAW_ASSISTANT_TOOL_SURFACE — selects which dispatch-surface
+# primer the bridge prompt teaches the model. Must match what the
+# sandbox-side OpenClaw config actually exposes in tools[]:
+#   "tools" → tools[] is {tool_search, tool_describe, tool_call}.
+#             PRODUCTION DEFAULT since Phase 3 (2026-06-03). Measured
+#             58.3% effective rate on cosmos-reason2-8b vs 29.0% for
+#             code mode (see docs/LANE-COMPARISON-three-lane.md).
+#             Requires sandbox openclaw.json to set
+#             tools.toolSearch = {enabled: true, mode: "tools"}.
+#   "code"  → tools[] is {tool_search_code}. OpenClaw 2026.5.6+
+#             baseline. Use only for the multi-model bake-off or
+#             to test the alternative surface; not the production
+#             default any more.
+# Forwarded to BOTH the bridge launcher AND the vllm-proxy launcher
+# (the proxy uses it to emit ``tool_surface_mismatch`` warnings if
+# the observed tools[] does not match the operator's declaration —
+# the load-bearing operator-error detector for this knob). Setting
+# the same value at both layers gives the drift check something to
+# compare against.
+OPENCLAW_ASSISTANT_TOOL_SURFACE="${OPENCLAW_ASSISTANT_TOOL_SURFACE:-tools}"
 ASSISTANT_TIMEOUT_S="${ASSISTANT_TIMEOUT_S:-300}"
 ASSISTANT_MAX_TURNS="${ASSISTANT_MAX_TURNS:-16}"
 DROP_CACHES="${DROP_CACHES:-true}"
@@ -71,9 +101,46 @@ if [[ -z "${VLLM_PORT:-}" ]]; then
 fi
 UPSTREAM_BASE_URL="${UPSTREAM_BASE_URL:-http://127.0.0.1:8000/v1}"
 VLLM_DIRECT_URL="http://127.0.0.1:${VLLM_PORT}/v1"
+
+# LANE_REGISTRY — per THREE-LANE-MIGRATION-PLAN.md §8 Phase 1.
+# Mirrors the Composer-side registry in
+# manyforge_composer/backend/assistant_provider.py (LANE_REGISTRY).
+# Eliminates the pre-Phase-1 "unknown provider silently falls back to
+# Direct" foot-gun.
+#
+# Format (case statement below):
+#   <provider id>) BRIDGE_URL=<default-port>;;
+#   The * branch errors out with a clear message including the accepted ids.
 case "${ASSISTANT_PROVIDER}" in
-    openclaw) BRIDGE_URL="${BRIDGE_URL:-http://127.0.0.1:8200}" ;;
-    nemoclaw|*) BRIDGE_URL="${BRIDGE_URL:-http://127.0.0.1:8100}" ;;
+    direct|nemoclaw)
+        # "direct" is the canonical id; "nemoclaw" is a legacy alias
+        # (see LANE_ID_ALIASES in manyforge_composer/backend/assistant_provider.py).
+        BRIDGE_URL="${BRIDGE_URL:-http://127.0.0.1:8100}"
+        ;;
+    openclaw)
+        BRIDGE_URL="${BRIDGE_URL:-http://127.0.0.1:8200}"
+        ;;
+    hermes)
+        # Phase 4: bridge implementation is wired up; until then this
+        # branch errors out so anyone trying to use it sees the gap.
+        if [[ "${HERMES_LANE_PHASE4_ENABLED:-false}" != "true" ]]; then
+            echo "ERROR: ASSISTANT_PROVIDER=hermes is registered but not yet implemented." >&2
+            echo "       Set HERMES_LANE_PHASE4_ENABLED=true once Phase 4 has landed." >&2
+            return 1 2>/dev/null || exit 1
+        fi
+        BRIDGE_URL="${BRIDGE_URL:-http://127.0.0.1:8300}"
+        ;;
+    "")
+        # Empty provider → mock mode; bridge URL doesn't matter, but
+        # don't fall through into the error branch.
+        BRIDGE_URL="${BRIDGE_URL:-http://127.0.0.1:8100}"
+        ;;
+    *)
+        echo "ERROR: Unknown ASSISTANT_PROVIDER='${ASSISTANT_PROVIDER}'." >&2
+        echo "       Accepted values: direct | nemoclaw (alias of direct) | openclaw | hermes (Phase 4) | '' (mock)." >&2
+        echo "       See LANE_REGISTRY in manyforge_composer/backend/assistant_provider.py." >&2
+        return 1 2>/dev/null || exit 1
+        ;;
 esac
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
@@ -197,9 +264,18 @@ start_model() {
     info "Starting ${VLLM_CONTAINER}; first launch can take 60+ min while vLLM loads/compiles. Supervisor will report readiness to the Composer status popup."
     docker rm -f "${VLLM_CONTAINER}" >/dev/null 2>&1 || true
     drop_caches
+    # THOR_RESTART_PROXY=0 prevents start-model.sh from spawning its own
+    # vllm-proxy. The launcher's start_vllm_proxy step (called next) is
+    # the sole owner of the proxy lifecycle — having two competing
+    # owners produced the "Found a vllm-proxy.py process that is NOT
+    # launcher-managed" error documented in
+    # docs/PHASE-3-OPENCLAW-NATIVE-RESULT.md. By forcing 0 here we
+    # eliminate the race at the source rather than relying on operators
+    # to remember the env var. 2026-06-03.
     (
         cd "${NEMOCLAW_THOR}"
         THOR_DETACH=1 \
+        THOR_RESTART_PROXY=0 \
         THOR_CONTAINER_NAME="${VLLM_CONTAINER}" \
         THOR_VLLM_PORT="${VLLM_PORT}" \
         ./serving/start-model.sh "${MODEL_PROFILE}"
@@ -300,6 +376,7 @@ start_vllm_proxy() {
             OPENCLAW_PROXY_LOG_PATH="${LOG_DIR}/vllm-proxy.jsonl" \
             OPENCLAW_PROXY_OVERRIDE_MAX_TOKENS="${OPENCLAW_PROXY_OVERRIDE_MAX_TOKENS}" \
             OPENCLAW_PROXY_THINKING_TOKEN_BUDGET="${OPENCLAW_PROXY_THINKING_TOKEN_BUDGET}" \
+            OPENCLAW_PROXY_TOOL_SURFACE="${OPENCLAW_ASSISTANT_TOOL_SURFACE}" \
             setsid python3 "${proxy_py}" </dev/null >"${LOG_DIR}/vllm-proxy.log" 2>&1 &
         echo $! >"${LOG_DIR}/vllm-proxy.pid"
     )
@@ -377,7 +454,30 @@ provision_openclaw_sandbox() {
 start_bridge() {
     case "${ASSISTANT_PROVIDER}" in
         openclaw) start_bridge_openclaw ;;
-        nemoclaw|*) start_bridge_nemoclaw ;;
+        hermes)
+            # Phase 4 of THREE-LANE-MIGRATION-PLAN.md.
+            # The case-match above (around line 74-115) gates the
+            # provider on HERMES_LANE_PHASE4_ENABLED, so we should
+            # never reach this branch unless it is set. Fail loudly
+            # rather than silently falling through to the Direct
+            # bridge.
+            if [[ "${HERMES_LANE_PHASE4_ENABLED:-false}" != "true" ]]; then
+                echo "ERROR: start_bridge() reached the hermes branch with HERMES_LANE_PHASE4_ENABLED=false." >&2
+                echo "       The earlier provider-id gate should have rejected this." >&2
+                return 1
+            fi
+            echo "ERROR: hermes lane bridge start is not yet implemented." >&2
+            echo "       Implement start_bridge_hermes() in scripts/lib/assistant.sh per the" >&2
+            echo "       THREE-LANE-MIGRATION-PLAN.md Phase 4 task list before re-enabling." >&2
+            return 1
+            ;;
+        direct|nemoclaw|"") start_bridge_nemoclaw ;;
+        *)
+            # Defensive — the provider-id case at line 74 already
+            # rejects unknown values, so we should not reach here.
+            echo "ERROR: start_bridge() reached an unknown ASSISTANT_PROVIDER='${ASSISTANT_PROVIDER}'." >&2
+            return 1
+            ;;
     esac
 }
 
@@ -404,10 +504,26 @@ start_bridge_nemoclaw() {
     local python
     python="$(bridge_python)"
     ensure_log_dir
+    # 2026-06-05: auto-size the direct-lane cross-request history budget to the
+    # served model's context window instead of the static 64K-era default
+    # (196608 chars). 75% of ctx at ~4 chars/token == ctx * 3. This scales
+    # automatically for every profile (each sets THOR_TARGET_MAX_MODEL_LEN,
+    # published to config.env by NemoClaw-Thor start-model.sh). An explicit
+    # operator-set DIRECT_LANE_HISTORY_CHAR_BUDGET always wins.
+    if [[ -z "${DIRECT_LANE_HISTORY_CHAR_BUDGET:-}" ]]; then
+        local _thor_cfg="${THOR_RUNTIME_CONFIG:-${HOME}/.config/nemoclaw-thor/config.env}"
+        local _ctx=""
+        [[ -r "${_thor_cfg}" ]] && _ctx="$(grep -E '^THOR_TARGET_MAX_MODEL_LEN=' "${_thor_cfg}" | tail -1 | cut -d= -f2 | tr -d '"' )"
+        if [[ "${_ctx}" =~ ^[0-9]+$ ]]; then
+            export DIRECT_LANE_HISTORY_CHAR_BUDGET=$(( _ctx * 3 ))
+            info "Direct-lane history budget auto-sized to ${DIRECT_LANE_HISTORY_CHAR_BUDGET} chars (75% of ${_ctx}-token context window)"
+        fi
+    fi
     (
         cd "${MANYFORGE_ROOT}"
         env \
             BRIDGE_HOST=127.0.0.1 \
+            DIRECT_LANE_HISTORY_CHAR_BUDGET="${DIRECT_LANE_HISTORY_CHAR_BUDGET:-196608}" \
             BRIDGE_PORT=8100 \
             BRIDGE_UPSTREAM_BASE_URL="${UPSTREAM_BASE_URL}" \
             BRIDGE_MANYFORGE_BASE_URL="${COMPOSER_URL}" \
@@ -416,6 +532,10 @@ start_bridge_nemoclaw() {
             BRIDGE_MAX_WALL_TIME_S="${ASSISTANT_TIMEOUT_S}" \
             BRIDGE_MAX_TURNS="${ASSISTANT_MAX_TURNS}" \
             BRIDGE_AUDIT_LOG="${BRIDGE_AUDIT_LOG}" \
+            MANYFORGE_STATE_CONTEXT="${MANYFORGE_STATE_CONTEXT:-first_then_every_n}" \
+            MANYFORGE_STATE_CONTEXT_EVERY_N="${MANYFORGE_STATE_CONTEXT_EVERY_N:-3}" \
+            BRIDGE_STATE_CONTEXT="${BRIDGE_STATE_CONTEXT:-${MANYFORGE_STATE_CONTEXT:-first_then_every_n}}" \
+            BRIDGE_STATE_CONTEXT_EVERY_N="${BRIDGE_STATE_CONTEXT_EVERY_N:-${MANYFORGE_STATE_CONTEXT_EVERY_N:-3}}" \
             setsid "${python}" -m manyforge_assistant_bridge.bridge \
             </dev/null >"${BRIDGE_LOG}" 2>&1 &
         echo $! >"${BRIDGE_PID_FILE}"
@@ -438,8 +558,33 @@ start_bridge_openclaw() {
         pass "Reusing bridge from ${BRIDGE_PID_FILE}"
         return 0
     fi
+    # 2026-06-03: idempotent adoption of an externally-started bridge.
+    # If port 8200 is listening and the listener responds to /healthz
+    # with our expected envelope, we trust it and write its PID into
+    # ${BRIDGE_PID_FILE} so future launcher invocations see it as
+    # managed. This handles the case where an operator manually started
+    # the bridge during stack recovery (e.g. after a partial launcher
+    # failure) — refusing to recognize it would force a destructive
+    # restart that would interrupt in-flight requests.
     if port_is_listening 8200; then
-        fail "Port 8200 is already in use by an unmanaged process; refusing to start another bridge."
+        local hostport="${BRIDGE_URL#http://}"
+        hostport="${hostport#https://}"
+        # Verify the bridge is OUR bridge (not some unrelated service)
+        # by hitting its /healthz endpoint and matching the provider tag.
+        local healthz_resp
+        healthz_resp="$(curl -fsS -m 2 "${BRIDGE_URL}/healthz" 2>/dev/null || true)"
+        if [[ "${healthz_resp}" == *'"provider":"openclaw"'* ]]; then
+            local adopted_pid
+            adopted_pid="$(ss -tlnp 2>/dev/null | awk -v port=":${BRIDGE_PORT:-8200}" '$4 ~ port {print}' \
+                | grep -oE 'pid=[0-9]+' | head -1 | cut -d= -f2)"
+            if [[ -n "${adopted_pid}" ]] && kill -0 "${adopted_pid}" 2>/dev/null; then
+                ensure_log_dir
+                echo "${adopted_pid}" > "${BRIDGE_PID_FILE}"
+                pass "Adopted externally-started bridge at ${BRIDGE_URL} (pid ${adopted_pid})"
+                return 0
+            fi
+        fi
+        fail "Port 8200 is in use by a non-OpenClaw service; refusing to start another bridge."
         port_listeners 8200 >&2
         return 1
     fi
@@ -450,10 +595,60 @@ start_bridge_openclaw() {
         return 1
     fi
     ensure_log_dir
+    # 2026-06-03: ensure the OpenClaw gateway is listening in the sandbox
+    # before starting the bridge. The bridge's CLI shell-out path
+    # invokes `openclaw agent` which expects the gateway at
+    # ws://127.0.0.1:18789. If the gateway is dead (e.g. after an
+    # earlier daemon-kill during tools-mode flip), `openclaw agent`
+    # falls back to embedded mode and most tool calls fail with a
+    # `GatewayTransportError: gateway closed`. Start it lazily here so
+    # the operator doesn't have to remember to do it.
+    local sandbox_name="${OPENCLAW_ASSISTANT_SANDBOX:-my-assistant}"
+    local cluster_container="${OPENCLAW_ASSISTANT_CLUSTER_CONTAINER:-openshell-cluster-nemoclaw}"
+    # OpenShell typically hosts the sandbox as a single docker container
+    # whose name starts with "openshell-${sandbox_name}-". Find it once.
+    local sandbox_container
+    sandbox_container="$(docker ps --format '{{.Names}}' 2>/dev/null \
+        | grep -E "^openshell-${sandbox_name}-" | head -1)"
+    if [[ -n "${sandbox_container}" ]]; then
+        if ! docker exec "${sandbox_container}" sh -c "ss -tlnp 2>/dev/null | grep -q ':18789'" 2>/dev/null; then
+            info "  OpenClaw gateway not listening in ${sandbox_container} — starting it"
+            docker exec -d "${sandbox_container}" bash -c \
+                'cd /sandbox; exec openclaw gateway --allow-unconfigured --bind loopback --auth token >/sandbox/openclaw-gateway.log 2>&1'
+            # Wait up to 30s for the gateway to come up.
+            local _gateway_attempt
+            for _gateway_attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+                if docker exec "${sandbox_container}" sh -c "ss -tlnp 2>/dev/null | grep -q ':18789'" 2>/dev/null; then
+                    pass "  OpenClaw gateway listening on :18789 in sandbox"
+                    break
+                fi
+                sleep 2
+            done
+            if ! docker exec "${sandbox_container}" sh -c "ss -tlnp 2>/dev/null | grep -q ':18789'" 2>/dev/null; then
+                fail "  OpenClaw gateway failed to start in ${sandbox_container} (see /sandbox/openclaw-gateway.log)"
+                # Don't return — the bridge can still run; just warn.
+            fi
+        else
+            pass "  OpenClaw gateway already listening in ${sandbox_container}"
+        fi
+    else
+        info "  No sandbox container matching openshell-${sandbox_name}-* found; bridge will spawn agents via nemoclaw exec only"
+    fi
+    # REVISED 2026-06-03 per THREE-LANE-MIGRATION-PLAN route fix:
+    # OPENCLAW_ASSISTANT_USE_GATEWAY defaults to false because OpenClaw
+    # 2026.5.22 does not expose /v1/chat/completions on the gateway
+    # HTTP server — only /v1/responses, /v1/embeddings, /v1/models,
+    # /v1/token. The gateway_http transport returns 404 "Not Found"
+    # in 50ms for every call. CLI shell-out (the false branch) uses
+    # `openclaw agent` via `nemoclaw exec`, which uses OpenClaw's
+    # internal agent runner and reaches the inference provider as
+    # intended. Set to "true" to force the legacy gateway_http path
+    # (will break until upstream OpenClaw exposes /v1/chat/completions
+    # or the bridge migrates to /v1/responses).
     (
         cd "${NEMOCLAW_THOR}"
         env \
-            OPENCLAW_ASSISTANT_USE_GATEWAY=true \
+            OPENCLAW_ASSISTANT_USE_GATEWAY="${OPENCLAW_ASSISTANT_USE_GATEWAY:-false}" \
             OPENCLAW_ASSISTANT_AGENT=manyforge-composer \
             OPENCLAW_ASSISTANT_LOCAL=false \
             OPENCLAW_ASSISTANT_TIMEOUT_S="${ASSISTANT_TIMEOUT_S}" \
@@ -462,6 +657,13 @@ start_bridge_openclaw() {
             OPENCLAW_ASSISTANT_COMPACT_EVERY_N="${OPENCLAW_ASSISTANT_COMPACT_EVERY_N}" \
             OPENCLAW_ASSISTANT_COMPACT_TIMEOUT_S="${OPENCLAW_ASSISTANT_COMPACT_TIMEOUT_S}" \
             OPENCLAW_ASSISTANT_METRICS_ENABLED="${OPENCLAW_ASSISTANT_METRICS_ENABLED}" \
+            OPENCLAW_ASSISTANT_LOOP_TOOL_THRESHOLD="${OPENCLAW_ASSISTANT_LOOP_TOOL_THRESHOLD}" \
+            OPENCLAW_ASSISTANT_LOOP_ARGS_THRESHOLD="${OPENCLAW_ASSISTANT_LOOP_ARGS_THRESHOLD}" \
+            OPENCLAW_ASSISTANT_TOOL_SURFACE="${OPENCLAW_ASSISTANT_TOOL_SURFACE}" \
+            MANYFORGE_STATE_CONTEXT="${MANYFORGE_STATE_CONTEXT:-first_then_every_n}" \
+            MANYFORGE_STATE_CONTEXT_EVERY_N="${MANYFORGE_STATE_CONTEXT_EVERY_N:-3}" \
+            OPENCLAW_ASSISTANT_STATE_CONTEXT="${OPENCLAW_ASSISTANT_STATE_CONTEXT:-${MANYFORGE_STATE_CONTEXT:-first_then_every_n}}" \
+            OPENCLAW_ASSISTANT_STATE_CONTEXT_EVERY_N="${OPENCLAW_ASSISTANT_STATE_CONTEXT_EVERY_N:-${MANYFORGE_STATE_CONTEXT_EVERY_N:-3}}" \
             setsid "${launcher}" </dev/null >"${BRIDGE_LOG}" 2>&1 &
         echo $! >"${BRIDGE_PID_FILE}"
     )

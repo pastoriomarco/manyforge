@@ -1669,11 +1669,29 @@ def test_assistant_providers_catalog_marks_configured_provider(
     response = client.get("/api/assistant/providers")
     assert response.status_code == 200
     data = response.json()
+    # configuredProviderId preserves the original alias for audit even
+    # though the catalog row id is canonical ("direct"). The Direct
+    # lane defaults provider_id="nemoclaw" on NemoClawAssistantProvider
+    # (see assistant_provider.py:354), so callers using the alias name
+    # see their request reflected back here.
     assert data["configuredProviderId"] == "nemoclaw"
-    nemoclaw = next(provider for provider in data["providers"] if provider["id"] == "nemoclaw")
-    assert nemoclaw["configured"] is True
-    assert nemoclaw["requiresLiveModel"] is True
-    assert nemoclaw["requiresLiveIsaacSim"] is False
+    # Single canonical "direct" row; the "nemoclaw" alias appears in
+    # the aliases list, not as a separate row (per three-lane-migration
+    # finding 6 + external review 2026-06-03 — keep ONE configured row
+    # to avoid ambiguity, structured aliases preserve caller intent).
+    direct = next(provider for provider in data["providers"] if provider["id"] == "direct")
+    assert direct["aliases"] == ["nemoclaw"]
+    assert direct["configured"] is True
+    assert direct["requiresLiveModel"] is True
+    assert direct["requiresLiveIsaacSim"] is False
+    # Structured metadata — the load-bearing safety signal the
+    # "nemoclaw" alias was carrying lives here, queryable by code.
+    assert direct["runtime"] == "nemoclaw"
+    assert direct["routing"] == "direct-vllm"
+    assert direct["isolation"] == "sandbox"
+    # No separate "nemoclaw" row exists — the alias does not produce
+    # a duplicate catalog entry.
+    assert not any(provider["id"] == "nemoclaw" for provider in data["providers"])
 
 
 def test_build_nemoclaw_provider_requires_endpoint(

@@ -38,7 +38,7 @@ MANYFORGE_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 # ── Source NemoClaw-Thor libs ──────────────────────────────────────────────────
 
-NEMOCLAW_THOR="${NEMOCLAW_THOR:-$HOME/workspaces/nemoclaw/src/NemoClaw-Thor}"
+NEMOCLAW_THOR="${NEMOCLAW_THOR:-$HOME/workspaces/dev_ws/src/NemoClaw-Thor}"
 
 if [[ ! -f "${NEMOCLAW_THOR}/setup/checks.sh" ]]; then
     echo "ERROR: NemoClaw-Thor not found at ${NEMOCLAW_THOR}" >&2

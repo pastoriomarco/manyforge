@@ -1,11 +1,10 @@
-"""Tests for the bridge's compound-prompt state-prep path.
+"""Tests for the bridge's pure-helper projections.
 
 Covers:
-  - `_needs_state_prep` trigger phrases (positive + negative cases)
   - `_build_program_summary` two-tier projection (always-complete
-    nodes_index + first-N + prompt-referenced detail)
+    nodes_index + first-N detail)
   - `_build_scene_summary` two-tier projection (always-complete
-    object_ids + first-N + prompt-referenced detail)
+    object_ids + first-N detail)
   - `_project_scene_object` non-null-only shape projection
 
 These are unit tests against the pure helpers; they do NOT require
@@ -23,38 +22,6 @@ import pytest
 pytest.importorskip("fastapi")
 
 from manyforge_assistant_bridge import bridge
-
-
-# ---- _needs_state_prep --------------------------------------------------
-
-@pytest.mark.parametrize(
-    "prompt,expected",
-    [
-        # Negative: simple action prompts with literals → no prep.
-        ("add a repeat node as root", (False, False)),
-        ("add a box of size 1.0, 0.02, 0.25 at position 0.0, -0.15, 0.125",
-         (False, False)),
-        ("remove the graspable object", (False, False)),
-
-        # Positive: scene-only references.
-        ("add a node that places graspable in the same position as scene start",
-         (False, True)),
-        ("create a sphere with the original size of graspable", (False, True)),
-        ("place the box where it is now", (False, True)),
-
-        # Positive: program-only references.
-        ("insert a wait at the end of pick_and_place", (True, False)),
-        ("add a node before the gripper open", (True, False)),
-
-        # Positive: both (the canonical compound prompt).
-        ("add an upsert node at the end of pick_and_place sequence "
-         "that places 'graspable' object in the same position and "
-         "orientation as the scene start, with the same original size",
-         (True, True)),
-    ],
-)
-def test_needs_state_prep(prompt: str, expected: tuple[bool, bool]) -> None:
-    assert bridge._needs_state_prep(prompt.lower()) == expected
 
 
 # ---- _project_scene_object ---------------------------------------------
@@ -138,30 +105,25 @@ def test_scene_summary_small_scene_full_detail() -> None:
     assert out["robot"]["robot_id"] == "ur10e"
 
 
-def test_scene_summary_large_scene_keeps_first_n_plus_referenced() -> None:
-    """Scene with > _DETAIL_RESOURCE_LIMIT objects: first N kept, AND
-    a prompt-referenced object beyond N is also kept. The complete
-    `object_ids` index always lists every id."""
+def test_scene_summary_large_scene_keeps_first_n_detail_only() -> None:
+    """Scene with > _DETAIL_RESOURCE_LIMIT objects: first N kept as
+    detail, while the complete `object_ids` index always lists every id."""
     n_total = bridge._DETAIL_RESOURCE_LIMIT + 5
-    referenced_idx = n_total - 1  # last one — definitely past the cap
+    beyond_cap_idx = n_total - 1
     snap = {
         "robot": {"robot_id": "ur10e"},
         "objects": [_make_object(i) for i in range(n_total)],
     }
-    prompt = f"place obj_{referenced_idx} in the same position as scene start"
-    out = bridge._build_scene_summary(snap, prompt_lower=prompt.lower())
+    out = bridge._build_scene_summary(snap)
     # Index is complete.
     assert len(out["object_ids"]) == n_total
-    assert out["object_ids"][referenced_idx] == f"obj_{referenced_idx}"
-    # Detail count = first N + the one extra referenced object.
+    assert out["object_ids"][beyond_cap_idx] == f"obj_{beyond_cap_idx}"
+    # Detail count = first N only. Prompt-derived promotion is deliberately gone.
     detail_ids = [o["object_id"] for o in out["objects"]]
-    assert f"obj_{referenced_idx}" in detail_ids, \
-        "prompt-referenced object beyond detail cap should still get a full record"
-    assert len(detail_ids) == bridge._DETAIL_RESOURCE_LIMIT + 1
+    assert f"obj_{beyond_cap_idx}" not in detail_ids
+    assert len(detail_ids) == bridge._DETAIL_RESOURCE_LIMIT
     # And the omitted-count counts what didn't get detail.
-    assert out["__objects_detail_omitted_count__"] == n_total - (
-        bridge._DETAIL_RESOURCE_LIMIT + 1
-    )
+    assert out["__objects_detail_omitted_count__"] == n_total - bridge._DETAIL_RESOURCE_LIMIT
 
 
 def test_scene_summary_handles_missing_objects_block() -> None:
@@ -223,12 +185,10 @@ def test_program_summary_carries_full_tree_when_under_cap() -> None:
     assert out["program"]["blackboard_keys"] == ["in_pick"]
 
 
-def test_program_summary_keeps_prompt_referenced_node_past_detail_cap() -> None:
+def test_program_summary_keeps_complete_index_without_prompt_promotion() -> None:
     """Build a wide tree where most nodes are on irrelevant branches.
-    The user prompt references one specific node deep on a single
-    branch — that node and its ancestors must end up with full detail
-    (not stubs), AND nodes on the irrelevant branches that fall past
-    the detail cap must end up as stubs (omitted_count > 0)."""
+    The complete index keeps every name, but detail past the first-N
+    cap is omitted regardless of prompt wording."""
     # Layout: root with many sibling branches. One branch contains the
     # referenced leaf; the rest are filler that should get omitted.
     target_leaf = _make_node("target_leaf", "leaf")
@@ -244,26 +204,25 @@ def test_program_summary_keeps_prompt_referenced_node_past_detail_cap() -> None:
         "programTreeHash": "h",
         "program": {"name": "p", "description": "d", "tree": root},
     }
-    prompt = "insert a wait before the target_leaf"
-    out = bridge._build_program_summary(snap, prompt_lower=prompt.lower())
+    out = bridge._build_program_summary(snap)
     # Index is always complete (target + branch + root + every filler).
     assert "target_leaf" in out["program"]["nodes_index"]
     assert "filler_0" in out["program"]["nodes_index"]
     assert f"filler_{filler_count - 1}" in out["program"]["nodes_index"]
     # Walk the projected tree.
-    found_detail: list[dict[str, Any]] = []
+    found_nodes: list[dict[str, Any]] = []
 
     def visit(node: dict[str, Any]) -> None:
         if node.get("name") == "target_leaf":
-            found_detail.append(node)
+            found_nodes.append(node)
         for c in node.get("children") or []:
             visit(c)
 
     visit(out["program"]["tree"])
-    # Referenced leaf reachable + carries full detail.
-    assert len(found_detail) == 1
-    assert found_detail[0].get("__detail_omitted__") is not True
-    assert found_detail[0]["id"] == "leaf"
+    # This specific shape appears before the detail cap, so target_leaf remains detailed.
+    assert len(found_nodes) == 1
+    assert found_nodes[0].get("__detail_omitted__") is not True
+    assert found_nodes[0]["id"] == "leaf"
     # Filler nodes past the cap rendered as stubs (still carry name).
     omitted_count = out["program"].get("__nodes_detail_omitted_count__", 0)
     assert omitted_count > 0
@@ -281,16 +240,15 @@ def test_program_summary_keeps_prompt_referenced_node_past_detail_cap() -> None:
 
 
 def test_program_summary_omitted_stub_carries_name() -> None:
-    """A node beyond the detail cap that isn't prompt-referenced
-    should still have its name in the stub so structural traversal
-    still works."""
+    """A node beyond the detail cap should still have its name in the
+    stub so structural traversal still works."""
     n_total = bridge._DETAIL_NODE_LIMIT + 3
     leaf = _make_node(f"node_{n_total - 1}", "leaf")
     cur = leaf
     for i in reversed(range(n_total - 1)):
         cur = _make_node(f"node_{i}", "MoveManipulator", children=[cur])
     snap = {"program": {"tree": cur}}
-    out = bridge._build_program_summary(snap, prompt_lower="")
+    out = bridge._build_program_summary(snap)
     # Find any stub.
     stubs = []
 

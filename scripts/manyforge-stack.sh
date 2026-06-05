@@ -59,7 +59,7 @@ mux_proxy_is_running() {
 }
 
 thor_runtime_summary_json() {
-    local nemoclaw_thor="${NEMOCLAW_THOR:-$HOME/workspaces/nemoclaw/src/NemoClaw-Thor}"
+    local nemoclaw_thor="${NEMOCLAW_THOR:-$HOME/workspaces/dev_ws/src/NemoClaw-Thor}"
     if [[ ! -f "${nemoclaw_thor}/serving/config.sh" ]]; then
         return 1
     fi
@@ -73,7 +73,7 @@ thor_runtime_summary_json() {
 }
 
 provider_base_url() {
-    local nemoclaw_thor="${NEMOCLAW_THOR:-$HOME/workspaces/nemoclaw/src/NemoClaw-Thor}"
+    local nemoclaw_thor="${NEMOCLAW_THOR:-$HOME/workspaces/dev_ws/src/NemoClaw-Thor}"
     if [[ ! -f "${nemoclaw_thor}/serving/config.sh" ]]; then
         return 1
     fi
@@ -167,7 +167,7 @@ cmd_up() {
     # ── [2] NemoClaw prerequisites ──
     header ">>> [2/3] NemoClaw prerequisites"
 
-    local nemoclaw_thor="${NEMOCLAW_THOR:-$HOME/workspaces/nemoclaw/src/NemoClaw-Thor}"
+    local nemoclaw_thor="${NEMOCLAW_THOR:-$HOME/workspaces/dev_ws/src/NemoClaw-Thor}"
     if [[ ! -f "${nemoclaw_thor}/serving/config.sh" ]]; then
         fail "NemoClaw-Thor not found at ${nemoclaw_thor}"
         exit 1

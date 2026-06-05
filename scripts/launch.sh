@@ -65,9 +65,13 @@ source "${SCRIPT_DIR}/lib/assistant.sh"
 install_error_trap
 
 # ── State variables (populated by CLI parsing and the wizard) ────────────────
-LANE=""
-ASSISTANT=""
-SCENARIO=""
+# 2026-06-03: accept env-set ASSISTANT / LANE / SCENARIO so non-interactive
+# callers (CI, scripts) can drive the launcher without remembering the exact
+# CLI flag spelling. CLI flags override env. Empty env is treated as unset
+# (the picker runs) so interactive use is unchanged.
+LANE="${LANE:-}"
+ASSISTANT="${ASSISTANT:-}"
+SCENARIO="${SCENARIO:-}"
 PROGRAM_PATH=""
 DEPLOYMENT_PATH=""
 VERB="start"
@@ -128,6 +132,7 @@ Common overrides (read by lib modules):
 
   Assistant:  MODEL_PROFILE  ASSISTANT_PROVIDER  START_VLLM_PROXY
               OPENCLAW_ASSISTANT_COMPACT_EVERY_N  VLLM_PORT
+              OPENCLAW_ASSISTANT_TOOL_SURFACE   (tools|code; default tools — see LANE-COMPARISON-three-lane)
   Isaac:      ARM_ACTION  GRIPPER_ACTION
               ISAAC_JOINT_STATE_TOPIC  ARM_CONTROLLER_STATE_TOPIC
 
@@ -389,7 +394,8 @@ step_preflight() {
         fi
         case "${ASSISTANT_PROVIDER}" in
             openclaw) ports+=(8200) ;;
-            nemoclaw|*) ports+=(8100) ;;
+            hermes) ports+=(8300) ;;
+            direct|nemoclaw|*) ports+=(8100) ;;
         esac
     fi
     if ! preflight_ports "${ports[@]}"; then

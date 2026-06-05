@@ -29,7 +29,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 SPECS_DIR="${MANYFORGE_SPECS_ROOT:-$REPO_DIR/../manyforge_specs}"
 SANDBOX_NAME="${1:-thor-assistant}"
-NEMOCLAW_THOR="$HOME/workspaces/nemoclaw/src/NemoClaw-Thor"
+NEMOCLAW_THOR="$HOME/workspaces/dev_ws/src/NemoClaw-Thor"
 
 echo "=== ManyForge Session Startup ==="
 echo "Sandbox: $SANDBOX_NAME"

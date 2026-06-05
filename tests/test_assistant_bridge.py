@@ -31,11 +31,13 @@ def test_bridge_rejects_out_of_catalog_tool_calls(
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
         timeout_s: float,
+        tool_choice: Any = "auto",
     ) -> dict[str, Any]:
         captured["model"] = model
         captured["messages"] = messages
         captured["tools"] = tools
         captured["timeout_s"] = timeout_s
+        captured["tool_choice"] = tool_choice
         return {
             "choices": [
                 {
@@ -194,6 +196,122 @@ def test_bridge_success_envelope_always_includes_message(
 
     assert response.status_code == 200
     assert response.json()["message"] == "Assistant completed without a text response."
+
+
+def test_bridge_parses_well_formed_content_tool_call_in_loop(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    audit_log = tmp_path / "audit.jsonl"
+    upstream_messages: list[list[dict[str, Any]]] = []
+    callbacks: list[dict[str, Any]] = []
+
+    async def resolve_model() -> str:
+        return "test-model"
+
+    async def call_upstream(
+        *,
+        messages: list[dict[str, Any]],
+        **_: Any,
+    ) -> dict[str, Any]:
+        upstream_messages.append(messages)
+        if len(upstream_messages) == 1:
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": (
+                                '<tool_call>{"name":"program_read",'
+                                '"arguments":{}}</tool_call>'
+                            ),
+                        }
+                    }
+                ]
+            }
+        assert upstream_messages[-1][-2]["role"] == "assistant"
+        assert upstream_messages[-1][-2]["content"] == ""
+        assert upstream_messages[-1][-2]["tool_calls"][0]["function"]["name"] == "program_read"
+        assert upstream_messages[-1][-1]["role"] == "tool"
+        return {"choices": [{"message": {"content": "The program is loaded."}}]}
+
+    async def execute_callback_tool(**kwargs: Any) -> dict[str, Any]:
+        callbacks.append(kwargs)
+        return {"success": True, "result": {"programLoaded": True}, "mutated": False}
+
+    monkeypatch.setattr(bridge, "AUDIT_LOG_PATH", audit_log)
+    monkeypatch.setattr(bridge, "_resolve_model", resolve_model)
+    monkeypatch.setattr(bridge, "_call_upstream", call_upstream)
+    monkeypatch.setattr(bridge, "_execute_callback_tool", execute_callback_tool)
+
+    response = TestClient(bridge.app).post(
+        "/v1/manyforge/assistant",
+        json=_bridge_payload(
+            request_id="req-content-tool-call",
+            assistant_mode="query",
+            catalog_tools=["program_read"],
+            tools=[
+                {
+                    "id": "program_read",
+                    "effect": "read_only",
+                    "description": "Read the loaded program.",
+                }
+            ],
+        ),
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert "error" not in payload
+    assert payload["message"] == "The program is loaded."
+    assert payload["toolCalls"][0]["name"] == "program_read"
+    assert callbacks[0]["tool_id"] == "program_read"
+    assert callbacks[0]["arguments"] == {}
+
+    audit_records = [
+        json.loads(line) for line in audit_log.read_text(encoding="utf-8").splitlines()
+    ]
+    parsed_records = [r for r in audit_records if r.get("contentToolCallsParsed")]
+    assert parsed_records
+    assert parsed_records[0]["contentToolCallFormats"] == ["tool_call_json"]
+
+
+def test_bridge_parses_qwen_arg_pair_content_tool_call() -> None:
+    content = """
+<arg_code>
+</arg_code>
+<arg_name>
+scene_inspect
+</arg_name>
+<arg_value>
+{"includeSubtrees":["/World"]}
+</arg_value>
+"""
+
+    cleaned, raw_tool_calls, assistant_msg, meta = bridge._extract_upstream_message(
+        {"choices": [{"message": {"content": content}}]}
+    )
+
+    assert cleaned == "<arg_code>\n</arg_code>"
+    assert meta["contentToolCallsParsed"] is True
+    assert meta["contentToolCallFormats"] == ["qwen_arg_pair"]
+    assert raw_tool_calls[0]["function"]["name"] == "scene_inspect"
+    assert json.loads(raw_tool_calls[0]["function"]["arguments"]) == {
+        "includeSubtrees": ["/World"]
+    }
+    assert assistant_msg["tool_calls"] == raw_tool_calls
+
+
+def test_bridge_does_not_repair_malformed_content_tool_call() -> None:
+    malformed = '<tool_call>{"name": "scene_inspect" />'
+
+    content, raw_tool_calls, assistant_msg, meta = bridge._extract_upstream_message(
+        {"choices": [{"message": {"content": malformed}}]}
+    )
+
+    assert content == malformed
+    assert raw_tool_calls == []
+    assert assistant_msg == {"role": "assistant", "content": malformed}
+    assert meta == {}
 
 
 def test_bridge_returns_descriptor_tool_calls_as_proposals(
