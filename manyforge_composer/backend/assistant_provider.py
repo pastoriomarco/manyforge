@@ -7,7 +7,9 @@ that separately from provider mutation.
 """
 from __future__ import annotations
 
+import logging
 import os
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -19,6 +21,44 @@ from .assistant_tools import (
     propose_scene_object_nodes,
     propose_scene_object_resources,
 )
+
+logger = logging.getLogger(__name__)
+
+# A Node.js process warning emitted via process.emitWarning() always renders in
+# a fixed, documented shape: "(node:<pid>) [CODE] <Type>Warning: <message>", e.g.
+# "(node:1610) [UNDICI-EHPA] Warning: EnvHttpProxyAgent is experimental ...".
+# The OpenClaw lane runs as a Node subprocess and the bridge forwards its raw
+# stderr into the assistant warnings channel (prefixed "OpenClaw stderr: ..."),
+# so these benign experimental/deprecation notices show up as user-facing
+# warnings. The "(node:<pid>)" token is written ONLY by Node's warning writer
+# and never by a ManyForge-emitted (English-sentence) warning, so matching on
+# this STRUCTURE — rather than on message keywords like "UNDICI"/"experimental",
+# which would rot as Node's messages change — reliably separates runtime noise
+# from actionable assistant warnings, and catches future Node notices too.
+_NODE_RUNTIME_WARNING_RE = re.compile(
+    r"\(node:\d+\)\s*"        # process-warning prefix (emitWarning only)
+    r"(?:\[[\w.+-]+\]\s*)?"   # optional warning code: [UNDICI-EHPA], [DEP0040], ...
+    r"\w*Warning:"            # Warning: / ExperimentalWarning: / DeprecationWarning:
+)
+
+
+def _partition_runtime_noise(warnings: list[str]) -> tuple[list[str], list[str]]:
+    """Split actionable assistant warnings from benign Node-subprocess noise.
+
+    Returns (kept, dropped). A warning is dropped only when it matches the Node
+    process-warning grammar (see _NODE_RUNTIME_WARNING_RE) — an allowlist of
+    noise with default-keep, so anything unexpected on the subprocess stderr (a
+    real trace or error) is NOT matched and still surfaces to the user. Callers
+    should log the dropped lines rather than discard them silently.
+    """
+    kept: list[str] = []
+    dropped: list[str] = []
+    for warning in warnings:
+        if _NODE_RUNTIME_WARNING_RE.search(warning):
+            dropped.append(warning)
+        else:
+            kept.append(warning)
+    return kept, dropped
 
 
 class AssistantProviderError(RuntimeError):
@@ -592,6 +632,14 @@ class NemoClawAssistantProvider:
         tool_calls = _normalize_provider_tool_calls(data.get("toolCalls", data.get("tool_calls", [])))
         _validate_provider_tool_calls_in_catalog(tool_calls, context)
         warnings = _normalize_string_list(data.get("warnings", []), field_name="warnings")
+        warnings, runtime_noise = _partition_runtime_noise(warnings)
+        if runtime_noise:
+            logger.debug(
+                "Suppressed %d benign Node-runtime warning(s) from the assistant "
+                "warnings channel: %s",
+                len(runtime_noise),
+                runtime_noise,
+            )
         requires_review = bool(data.get("requiresReview", data.get("requires_review", True)))
         if proposals and not requires_review:
             warnings.append(

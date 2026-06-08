@@ -82,11 +82,13 @@ preflight_managed_components() {
 # must have populated LANE,
 # ASSISTANT, ASSISTANT_PROVIDER, COMPOSE_CMD, VLLM_CONTAINER as appropriate.
 #
-# Owners by port (Composer/HMI ports are env-overridable — COMPOSER_PORT/
-# HMI_PORT — and the resolved values are compared, not hardcoded literals):
+# Owners by port (Composer and optional legacy HMI ports are env-overridable —
+# COMPOSER_PORT/HMI_PORT — and the resolved values are compared, not hardcoded
+# literals):
 #   ${COMPOSER_PORT:-9000}  →  manyforge-only: manyforge-e2e-composer container
 #                              isaac-sim:      composer-ros compose service
-#   ${HMI_PORT:-8081}       →  manyforge-only: manyforge-e2e-composer container
+#   ${HMI_PORT:-8081}       →  only when MANYFORGE_ENABLE_LEGACY_VISER_HMI=true;
+#                              manyforge-only: manyforge-e2e-composer container
 #                              isaac-sim:      composer-ros compose service (host network)
 #   8000                    →  assistant=on:   vllm-proxy.pid (if START_VLLM_PROXY=true), else vLLM container
 #   8050                    →  assistant=on:   vLLM container (when proxy is enabled)

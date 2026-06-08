@@ -1,6 +1,40 @@
 api_version: manyforge.model_endpoint_profiles.v0
 schema_version: "0.1.0"
+# Reference catalog of model-endpoint profiles for the NemoClaw-Thor serving
+# stack. A deployment selects one via `model_endpoints.<alias>.profile_ref`;
+# the referenced profile becomes the base and the deployment's inline fields
+# override it (capabilities deep-merge; every other field is replaced wholesale).
+#
+# Conventions (keep new entries consistent):
+#   model_id   MUST equal the id the server exposes at /v1/models. On this stack
+#              that is the serving profile name itself — NemoClaw-Thor
+#              serving/config.sh sets THOR_MODEL_ID_DEFAULT == profile name, and
+#              start-model.sh passes it as vLLM --served-model-name / llama.cpp
+#              --alias. (vLLM additionally serves a static `cosmos-reason2-8b`
+#              back-compat alias; llama.cpp/GGUF serves ONLY the profile name —
+#              which is exactly why the assistant panel must read the live
+#              /v1/models id, not this label, to know what is actually loaded.)
+#   base_url   the local vllm-proxy (:8000) that fronts whichever model is
+#              loaded. Deployments that route through the assistant bridge
+#              override this with the bridge URL (:8100/v1/manyforge/assistant).
+#   tool_call_family  the composer/bridge wire family — always openai_chat_tools
+#              (the OpenAI chat-completions tools contract). The native vLLM
+#              --tool-call-parser (gemma4 / hermes / qwen3_coder / qwen3_xml) is a
+#              serving-layer detail the composer never sees.
+#   supports_image_input  real multimodality only. FALSE for text-only profiles:
+#              every GGUF/llama.cpp profile (served --no-mmproj) and every vLLM
+#              profile launched --language-model-only.
 profiles:
+  # ───────────────────────────────────────────────────────────────────────
+  # Legacy / referenced by the existing pick deployments — DO NOT REMOVE.
+  # thor_manyforge_qwen36 is referenced by vision_guided_{pose,bin}_pick and
+  # semantic_shape_pick; thor_cosmos_reason2_8b by those plus
+  # assistant_modes_scene_authoring and isaac_manipulator_scene_light_assistant.
+  # Removing either breaks `profile_ref` resolution in those deployments.
+  # NOTE: thor_manyforge_qwen36's model_id is the pre-2026-05-31 production
+  # Qwen profile, which has since been superseded in serving/config.sh by
+  # qwen3.6-35b-a3b-nvfp4-nvidia (see thor_qwen36_35b_a3b_nvfp4 below).
+  # ───────────────────────────────────────────────────────────────────────
   thor_manyforge_qwen36:
     provider: openai
     model_id: qwen3.6-35b-a3b-nvfp4-tq-mtp-manyforge
@@ -39,3 +73,245 @@ profiles:
       supports_image_input: true
       supported_image_transports: [inline_data_url, http_url]
       tool_call_family: qwen3_coder
+
+  # ───────────────────────────────────────────────────────────────────────
+  # Qwen3.6 — agentic-tuned MoE (NVFP4 / FP8), --language-model-only (text).
+  # ───────────────────────────────────────────────────────────────────────
+  thor_qwen36_35b_a3b_nvfp4:
+    # Task-4 winner / current serving default (config.sh print_supported_*).
+    # NVIDIA W4A16 NVFP4 + Marlin + MTP K=3. 56/66 composer smoke, ~29 tok/s.
+    provider: openai
+    model_id: qwen3.6-35b-a3b-nvfp4-nvidia
+    base_url: http://127.0.0.1:8000/v1
+    default_timeout_s: 30.0
+    max_tokens: 16384
+    capabilities:
+      supports_response_tools: true
+      supports_json_object: true
+      supports_image_input: false
+      supported_image_transports: []
+      tool_call_family: openai_chat_tools
+
+  thor_qwen36_27b_fp8:
+    # Dense 27B official FP8 + MTP + FP8 KV (preserves MTP heads). TEB 84.
+    provider: openai
+    model_id: qwen3.6-27b-fp8-mtp-kvfp8
+    base_url: http://127.0.0.1:8000/v1
+    default_timeout_s: 30.0
+    max_tokens: 16384
+    capabilities:
+      supports_response_tools: true
+      supports_json_object: true
+      supports_image_input: false
+      supported_image_transports: []
+      tool_call_family: openai_chat_tools
+
+  # ───────────────────────────────────────────────────────────────────────
+  # Qwen3.5 — Claude-distilled VLM (DeltaNet hybrid), fast control loop.
+  # ───────────────────────────────────────────────────────────────────────
+  thor_qwen35_9b_distilled:
+    provider: openai
+    model_id: qwen3.5-9b-claude-distilled-nvfp4
+    base_url: http://127.0.0.1:8000/v1
+    default_timeout_s: 30.0
+    max_tokens: 16384
+    capabilities:
+      supports_response_tools: true
+      supports_json_object: true
+      supports_image_input: true
+      supported_image_transports: [inline_data_url, http_url]
+      tool_call_family: openai_chat_tools
+
+  # ───────────────────────────────────────────────────────────────────────
+  # Cosmos Reason 2 — NVIDIA physical-AI VLMs. vLLM variants are multimodal;
+  # the GGUF (llama.cpp) variants are served text-only.
+  # ───────────────────────────────────────────────────────────────────────
+  thor_cosmos_reason2_2b:
+    provider: openai
+    model_id: cosmos-reason2-2b
+    base_url: http://127.0.0.1:8000/v1
+    default_timeout_s: 30.0
+    max_tokens: 16384
+    capabilities:
+      supports_response_tools: true
+      supports_json_object: true
+      supports_image_input: true
+      supported_image_transports: [inline_data_url, http_url]
+      tool_call_family: openai_chat_tools
+
+  thor_cosmos_reason2_8b_gguf:
+    # GGUF Q4_K_M via llama.cpp (Jetson Thor image), text-only, 256K ctx.
+    provider: openai
+    model_id: cosmos-reason2-8b-gguf
+    base_url: http://127.0.0.1:8000/v1
+    default_timeout_s: 30.0
+    max_tokens: 16384
+    capabilities:
+      supports_response_tools: true
+      supports_json_object: true
+      supports_image_input: false
+      supported_image_transports: []
+      tool_call_family: openai_chat_tools
+
+  thor_cosmos_reason2_8b_gguf_orin:
+    # Same model/recipe as thor_cosmos_reason2_8b_gguf, Jetson Orin AGX image.
+    provider: openai
+    model_id: cosmos-reason2-8b-gguf-orin
+    base_url: http://127.0.0.1:8000/v1
+    default_timeout_s: 30.0
+    max_tokens: 16384
+    capabilities:
+      supports_response_tools: true
+      supports_json_object: true
+      supports_image_input: false
+      supported_image_transports: []
+      tool_call_family: openai_chat_tools
+
+  # ───────────────────────────────────────────────────────────────────────
+  # Nemotron 3 Nano — NVIDIA hybrid Mamba-2 + attn, text + tools.
+  # ───────────────────────────────────────────────────────────────────────
+  thor_nemotron3_nano_30b:
+    provider: openai
+    model_id: nemotron3-nano-30b-a3b-nvfp4
+    base_url: http://127.0.0.1:8000/v1
+    default_timeout_s: 30.0
+    max_tokens: 8192
+    capabilities:
+      supports_response_tools: true
+      supports_json_object: true
+      supports_image_input: false
+      supported_image_transports: []
+      tool_call_family: openai_chat_tools
+
+  thor_nemotron3_nano_4b_bf16:
+    # NVIDIA's explicit Jetson Thor/Orin agentic default (BF16, BFCL v3 61.1).
+    provider: openai
+    model_id: nemotron3-nano-4b-bf16
+    base_url: http://127.0.0.1:8000/v1
+    default_timeout_s: 30.0
+    max_tokens: 8192
+    capabilities:
+      supports_response_tools: true
+      supports_json_object: true
+      supports_image_input: false
+      supported_image_transports: []
+      tool_call_family: openai_chat_tools
+
+  thor_nemotron3_nano_4b_gguf:
+    # GGUF Q4_K_M via llama.cpp (Jetson Thor image), text-only, 256K ctx.
+    provider: openai
+    model_id: nemotron3-nano-4b-gguf
+    base_url: http://127.0.0.1:8000/v1
+    default_timeout_s: 30.0
+    max_tokens: 8192
+    capabilities:
+      supports_response_tools: true
+      supports_json_object: true
+      supports_image_input: false
+      supported_image_transports: []
+      tool_call_family: openai_chat_tools
+
+  thor_nemotron3_nano_4b_gguf_orin:
+    # Same model/recipe as thor_nemotron3_nano_4b_gguf, Jetson Orin AGX image.
+    provider: openai
+    model_id: nemotron3-nano-4b-gguf-orin
+    base_url: http://127.0.0.1:8000/v1
+    default_timeout_s: 30.0
+    max_tokens: 8192
+    capabilities:
+      supports_response_tools: true
+      supports_json_object: true
+      supports_image_input: false
+      supported_image_transports: []
+      tool_call_family: openai_chat_tools
+
+  # ───────────────────────────────────────────────────────────────────────
+  # Nemotron 3 Nano Omni — multimodal (vision/video/audio). Base (think-off)
+  # is thor_nemotron3_nano_omni above; this is the reasoning regime.
+  # ───────────────────────────────────────────────────────────────────────
+  thor_nemotron3_nano_omni_reasoning:
+    provider: openai
+    model_id: nemotron3-nano-omni-30b-a3b-nvfp4-reasoning
+    base_url: http://127.0.0.1:8000/v1
+    default_timeout_s: 30.0
+    max_tokens: 16384
+    capabilities:
+      supports_response_tools: true
+      supports_json_object: true
+      supports_image_input: true
+      supported_image_transports: [inline_data_url, http_url]
+      tool_call_family: qwen3_coder
+
+  # ───────────────────────────────────────────────────────────────────────
+  # Gemma 4 — Google vision+text+tools. The vLLM variants are multimodal;
+  # the 12B GGUF (llama.cpp) variants are served text-only (--no-mmproj).
+  # ───────────────────────────────────────────────────────────────────────
+  thor_gemma4_e4b_it:
+    provider: openai
+    model_id: gemma4-e4b-it
+    base_url: http://127.0.0.1:8000/v1
+    default_timeout_s: 30.0
+    max_tokens: 16384
+    capabilities:
+      supports_response_tools: true
+      supports_json_object: true
+      supports_image_input: true
+      supported_image_transports: [inline_data_url, http_url]
+      tool_call_family: openai_chat_tools
+
+  thor_gemma4_31b_it_nvfp4:
+    provider: openai
+    model_id: gemma4-31b-it-nvfp4
+    base_url: http://127.0.0.1:8000/v1
+    default_timeout_s: 30.0
+    max_tokens: 16384
+    capabilities:
+      supports_response_tools: true
+      supports_json_object: true
+      supports_image_input: true
+      supported_image_transports: [inline_data_url, http_url]
+      tool_call_family: openai_chat_tools
+
+  thor_gemma4_26b_a4b_it:
+    provider: openai
+    model_id: gemma4-26b-a4b-it
+    base_url: http://127.0.0.1:8000/v1
+    default_timeout_s: 30.0
+    max_tokens: 16384
+    capabilities:
+      supports_response_tools: true
+      supports_json_object: true
+      supports_image_input: true
+      supported_image_transports: [inline_data_url, http_url]
+      tool_call_family: openai_chat_tools
+
+  thor_gemma4_12b_gguf:
+    # ★ Smoke-corpus winner on BOTH Thor and Orin (QAT GGUF, 78.8% effective).
+    # Current default model in serving/config.sh + manyforge launch.sh.
+    # GGUF Q4_K_XL via llama.cpp + E2B speculative draft, text-only, Thor image.
+    provider: openai
+    model_id: gemma4-12b-it-gguf
+    base_url: http://127.0.0.1:8000/v1
+    default_timeout_s: 30.0
+    max_tokens: 16384
+    capabilities:
+      supports_response_tools: true
+      supports_json_object: true
+      supports_image_input: false
+      supported_image_transports: []
+      tool_call_family: openai_chat_tools
+
+  thor_gemma4_12b_gguf_orin:
+    # Same model/recipe as thor_gemma4_12b_gguf, Jetson Orin AGX image +
+    # NVMe-backed caches. Default model on Orin (launch-orin-gemma.sh).
+    provider: openai
+    model_id: gemma4-12b-it-gguf-orin
+    base_url: http://127.0.0.1:8000/v1
+    default_timeout_s: 30.0
+    max_tokens: 16384
+    capabilities:
+      supports_response_tools: true
+      supports_json_object: true
+      supports_image_input: false
+      supported_image_transports: []
+      tool_call_family: openai_chat_tools

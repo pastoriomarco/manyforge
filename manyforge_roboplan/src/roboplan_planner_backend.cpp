@@ -213,7 +213,7 @@ void normalize_ik_goal_for_rrt_limits(
     const std::string& group_name,
     const Eigen::VectorXd& start_positions,
     Eigen::VectorXd& goal_positions) {
-  auto pos_limits = scene->getPositionLimitVectors(group_name);
+  auto pos_limits = scene->getPositionLimitVectors(group_name, /*collapsed=*/false);
   if (!pos_limits.has_value()) {
     return;
   }

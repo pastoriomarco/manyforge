@@ -1547,7 +1547,7 @@ core::JointLimitsDTO RoboPlanPlanningContext::get_joint_limits(
   }
   limits.joint_names = maybe_group_info->joint_names;
 
-  auto pos_limits = scene_->getPositionLimitVectors(group_name_);
+  auto pos_limits = scene_->getPositionLimitVectors(group_name_, /*collapsed=*/false);
   if (pos_limits.has_value()) {
     const auto& [lower, upper] = pos_limits.value();
     limits.position_lower_rad.resize(lower.size());

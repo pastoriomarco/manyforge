@@ -22,9 +22,9 @@ steps:
     equals: idle
     timeout_s: 60
 assertions:
-  - endpoint: history
-    event_type: execute_completed
-    greater_equal: 1
+  - endpoint: debug_export
+    path: kernelMetrics.executions_completed
+    greater_equal: 2
   - endpoint: digest
     path: completedNodes
     contains: move_to_end

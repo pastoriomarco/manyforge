@@ -133,9 +133,11 @@ RUN PINOCCHIO_CMAKE_DIR=$(find "${MANYFORGE_VENV}" /usr -name "pinocchioConfig.c
          fi; \
        done \
     && ldconfig \
-    && cd /tmp/roboplan/bindings \
-    && CMAKE_PREFIX_PATH="/usr/local:${PINOCCHIO_PREFIX}:${CMAKE_PREFIX_PATH:-}" \
-       python -m pip install --no-build-isolation --no-cache-dir -v . \
+    && export CMAKE_PREFIX_PATH="/usr/local:${PINOCCHIO_PREFIX}:${CMAKE_PREFIX_PATH:-}" \
+    && for py_pkg in roboplan roboplan_example_models roboplan_simple_ik roboplan_oink roboplan_toppra roboplan_rrt; do \
+         cd "/tmp/roboplan/${py_pkg}"; \
+         python -m pip install --no-build-isolation --no-deps --no-cache-dir -v .; \
+       done \
     && rm -rf /tmp/roboplan
 
 WORKDIR /workspace

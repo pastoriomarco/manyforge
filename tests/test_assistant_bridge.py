@@ -15,7 +15,7 @@ from fastapi.testclient import TestClient
 from manyforge_assistant_bridge import bridge
 
 
-def test_bridge_rejects_out_of_catalog_tool_calls(
+def test_bridge_returns_out_of_catalog_tool_calls_as_review_proposals(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -80,45 +80,79 @@ def test_bridge_rejects_out_of_catalog_tool_calls(
                     "effect": "read_only",
                     "description": "Inspect the simulator scene.",
                 },
-                {
-                    "id": "delete_world",
-                    "effect": "runtime_mutating",
-                    "description": "Out-of-mode tool that must not be visible.",
-                },
+                    {
+                        "id": "delete_world",
+                        "effect": "runtime_mutating",
+                        "description": "Descriptor-only tool that must not execute.",
+                    },
             ],
         ),
     )
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["error"]["code"] == "response_rejected"
-    assert "delete_world" in payload["error"]["detail"]
-    assert payload["toolCalls"] == []
-    assert payload["proposals"] == []
-    assert payload["mutated"] is False
-    assert payload["requiresReview"] is True
-
-    assert captured["model"] == "test-model"
-    assert captured["tools"] == [
+    assert "error" not in payload
+    assert payload["toolCalls"] == [
         {
-            "type": "function",
-            "function": {
-                "name": "inspect_isaac_scene",
-                "description": "Inspect the simulator scene.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {},
-                    "additionalProperties": True,
-                },
+            "name": "delete_world",
+            "arguments": {"force": True},
+            "status": "proposed",
+        }
+    ]
+    assert payload["proposals"] == [
+        {
+            "id": "call-hidden",
+            "type": "tool_call_proposal",
+            "title": "call delete_world",
+            "summary": "LLM proposes calling delete_world with the supplied arguments.",
+            "payload": {
+                "toolCallId": "call-hidden",
+                "toolName": "delete_world",
+                "arguments": {"force": True},
             },
         }
     ]
+    assert payload["mutated"] is False
+    assert payload["requiresReview"] is True
+    assert payload["draftMutated"] is False
+    assert payload["warnings"] == [
+        "model returned callback-safe calls together with proposal/runtime "
+        "descriptors; descriptor response ended the loop"
+    ]
+
+    assert captured["model"] == "test-model"
+    assert [tool["function"]["name"] for tool in captured["tools"]] == [
+        "inspect_isaac_scene",
+        "delete_world",
+    ]
+    assert captured["tools"][0]["function"] == {
+        "name": "inspect_isaac_scene",
+        "description": "Inspect the simulator scene.",
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": True,
+        },
+    }
+    assert captured["tools"][1]["function"] == {
+        "name": "delete_world",
+        "description": "Descriptor-only tool that must not execute.",
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": True,
+        },
+    }
 
     audit_record = json.loads(audit_log.read_text(encoding="utf-8").splitlines()[-1])
-    assert audit_record["exitReason"] == "response_rejected"
+    assert audit_record["exitReason"] == "proposal_returned"
     assert audit_record["assistantMode"] == "composer-assistant"
-    assert audit_record["outOfMode"][0]["name"] == "delete_world"
-    assert audit_record["outOfMode"][0]["argumentsHash"]
+    assert audit_record["responseShape"] == {
+        "toolCallNames": ["delete_world"],
+        "proposalCount": 1,
+        "warnings": 1,
+        "draftMutated": False,
+    }
 
 
 def test_bridge_forwards_tool_input_schema_to_upstream(

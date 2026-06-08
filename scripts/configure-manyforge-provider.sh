@@ -590,7 +590,7 @@ if type ensure_sandbox_gateway_running &>/dev/null; then
         # Fallback: manual gateway start
         warn "NemoClaw gateway helper failed, starting manually"
         openshell sandbox exec -n "${SANDBOX_NAME}" -- \
-            bash -c 'HOME=/sandbox nohup openclaw gateway run --auth none --port 18789 > /tmp/gateway.log 2>&1 &' \
+            bash -c 'HOME=/sandbox nohup openclaw gateway --allow-unconfigured --bind loopback --auth token > /tmp/gateway.log 2>&1 &' \
             2>/dev/null || true
         sleep 3
     }
@@ -600,7 +600,7 @@ else
         bash -c 'pkill -f "openclaw gateway" 2>/dev/null || true' 2>/dev/null || true
     sleep 2
     openshell sandbox exec -n "${SANDBOX_NAME}" -- \
-        bash -c 'HOME=/sandbox nohup openclaw gateway run --auth none --port 18789 > /tmp/gateway.log 2>&1 &' \
+        bash -c 'HOME=/sandbox nohup openclaw gateway --allow-unconfigured --bind loopback --auth token > /tmp/gateway.log 2>&1 &' \
         2>/dev/null || true
         sleep 3
 fi

@@ -105,11 +105,11 @@ cd ${HOME}/workspaces/nemoclaw/src/NemoClaw-Thor
 ./setup/status.sh
 ```
 
-### 4. Start Composer With The Live Assistant Provider And HMI
+### 4. Start Composer With The Live Assistant Provider And Native Viewer
 
 Use host networking so Composer can reach the host bridge on `127.0.0.1:8100`.
-Start Composer with `--hmi-port 8081` for UI demos; otherwise the embedded
-Viser panel correctly reports that the HMI is unavailable.
+The Composer UI uses the native viewer by default. Add `--hmi-port 8081` only
+when deliberately testing the legacy Viser fallback.
 
 ```bash
 cd ${HOME}/workspaces/dev_ws/src/manyforge
@@ -130,7 +130,6 @@ docker run -d --rm \
     --catalog-path /workspace/manyforge_behavior/resources/node_catalog.yaml \
     --host 127.0.0.1 \
     --port 9000 \
-    --hmi-port 8081 \
     --assistant-provider nemoclaw \
     --assistant-endpoint http://127.0.0.1:8100/v1/manyforge/assistant \
     --assistant-timeout-s 300'
@@ -147,8 +146,7 @@ Expected status after loading a program in the UI or through the smoke runner:
 ```text
 composer.status = healthy
 composer.cycle_state = idle
-hmi.status = healthy
-hmi.port = 8081
+hmi.status = disabled
 deployment.status = loaded
 ```
 
@@ -249,8 +247,8 @@ What it does (default — `openclaw` sandboxed lane):
    stages the `manyforge-composer` skill, and registers the `manyforge`
    MCP server in the sandbox via `openclaw mcp set`. Skip with
    `PROVISION_OPENCLAW_SANDBOX=false` if the sandbox is already provisioned,
-5. starts Composer on `http://127.0.0.1:9000` with HMI/Viser on
-   `http://127.0.0.1:8081`, configured to use the `openclaw` provider at
+5. starts Composer on `http://127.0.0.1:9000` with the native Composer viewer,
+   configured to use the `openclaw` provider at
    `http://127.0.0.1:8200/v1/manyforge/assistant`,
 6. starts the OpenClaw assistant bridge (`openclaw_assistant_bridge`) on
    `http://127.0.0.1:8200`. The bridge translates Composer's
@@ -378,7 +376,7 @@ operator workflow.
 1. Open `http://127.0.0.1:9000`.
 2. Load `/workspace/examples/pick_and_place_ur10e_robotiq.program.yaml`.
 3. Load `/workspace/examples/assistant_modes_scene_authoring.deployment.yaml`.
-4. Confirm the Viser panel shows the robot/scene at `http://127.0.0.1:8081`.
+4. Confirm the native viewer in the Composer UI shows the robot/scene.
 5. Open the lower-right assistant button.
 6. Confirm the overlay shows:
    - configured provider `nemoclaw`,
@@ -403,14 +401,15 @@ operator workflow.
    ```
 
    Pass signal: Composer's normal draft/apply state becomes active, the
-   assistant transcript attributes the completed tool call, and Viser reflects
-   the draft scene after Composer refreshes. There is no separate LLM approval
-   layer; use the normal Composer apply/save/reload controls to keep or reject
-   the change.
+   assistant transcript attributes the completed tool call, and the native
+   viewer reflects the draft scene after Composer refreshes. There is no
+   separate LLM approval layer; use the normal Composer apply/save/reload
+   controls to keep or reject the change.
 
-If the Viser panel says HMI is unavailable, Composer was not launched with
-`--hmi-port 8081` or no program has been loaded yet. Restart Composer with the
-base recipe command above, then reload the program/deployment.
+If you are validating the legacy Viser fallback and the Viser panel says HMI is
+unavailable, Composer was not launched with `--hmi-port 8081` or no program has
+been loaded yet. Restart Composer with the fallback flag, then reload the
+program/deployment.
 
 ## Recipe: Automated Assistant E2E Checks
 
@@ -439,10 +438,11 @@ cd ${HOME}/workspaces/dev_ws/src/manyforge
 
 ./scripts/smoke-assistant-e2e.py \
   --profile cosmos-bridge-default \
-  --require-hmi \
   --strict \
   --output /tmp/manyforge-assistant-e2e/assistant-primary.json
 ```
+
+Use `--require-hmi` only for explicit legacy Viser fallback qualification.
 
 Model/profile bake-off:
 

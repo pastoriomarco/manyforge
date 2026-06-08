@@ -50,8 +50,28 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Python packages: testing, behavior trees, bindings, visualization
+# Pin the cmeel/pinocchio dependency set to the versions verified in the
+# working Thor manyforge-dev image. `pin==3.9.0`'s wheel links against
+# urdfdom 4.0 (liburdfdom_*.so.4.0); leaving the transitive `cmeel-urdfdom`
+# unpinned lets pip pull v6 (liburdfdom_*.so.6), which breaks the RoboPlan
+# bindings wheel build with `ImportError: liburdfdom_sensor.so.4.0`. A pip
+# constraints file enforces the compatible set regardless of resolution order.
 RUN pip install --no-cache-dir --upgrade pip setuptools && \
-    pip install --no-cache-dir \
+    printf '%s\n' \
+        'pin==3.9.0' \
+        'cmeel-urdfdom==4.0.1' \
+        'coal==3.0.2' \
+        'eigenpy==3.12.0' \
+        'cmeel==0.60.0' \
+        'cmeel-assimp==6.0.2' \
+        'cmeel-boost==1.89.0' \
+        'cmeel-console-bridge==1.0.2.3' \
+        'cmeel-octomap==1.10.0' \
+        'cmeel-qhull==8.0.2.1' \
+        'cmeel-tinyxml2==10.0.0' \
+        'cmeel-zlib==1.3.1' \
+        > /tmp/manyforge-cmeel-constraints.txt && \
+    pip install --no-cache-dir -c /tmp/manyforge-cmeel-constraints.txt \
         pytest==9.0.3 \
         numpy==2.3.5 \
         py_trees==2.4.0 \
@@ -81,6 +101,7 @@ RUN PINOCCHIO_CMAKE_DIR=$(find /usr -name "pinocchioConfig.cmake" -printf '%h\n'
     && cd /tmp/roboplan \
     && export CMAKE_PREFIX_PATH="${PINOCCHIO_PREFIX}:${CMAKE_PREFIX_PATH}" \
     && export LD_LIBRARY_PATH="${PINOCCHIO_PREFIX}/lib:${LD_LIBRARY_PATH}" \
+    && sed -i 's#-DCMAKE_INSTALL_PREFIX#-DBUILD_TESTING=OFF -DCMAKE_INSTALL_PREFIX#' scripts/build_cmake.bash \
     && ./scripts/build_cmake.bash \
     && ROBOPLAN_INSTALL=/tmp/roboplan/install \
     && mkdir -p /usr/local/lib/cmake /usr/local/include /usr/local/share \
@@ -100,9 +121,11 @@ RUN PINOCCHIO_CMAKE_DIR=$(find /usr -name "pinocchioConfig.cmake" -printf '%h\n'
          fi; \
        done \
     && ldconfig \
-    && cd /tmp/roboplan/bindings \
-    && CMAKE_PREFIX_PATH="/usr/local:${PINOCCHIO_PREFIX}:${CMAKE_PREFIX_PATH}" \
-       pip install --no-build-isolation --no-cache-dir -v . \
+    && export CMAKE_PREFIX_PATH="/usr/local:${PINOCCHIO_PREFIX}:${CMAKE_PREFIX_PATH}" \
+    && for py_pkg in roboplan roboplan_example_models roboplan_simple_ik roboplan_oink roboplan_toppra roboplan_rrt; do \
+         cd "/tmp/roboplan/${py_pkg}"; \
+         pip install --no-build-isolation --no-deps --no-cache-dir -v .; \
+       done \
     && rm -rf /tmp/roboplan
 
 WORKDIR /workspace

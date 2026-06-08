@@ -63,7 +63,28 @@ def native_kernel():
     if not HAS_NATIVE:
         pytest.skip("manyforge_roboplan_py not available")
     bundle = manyforge_roboplan_py.create_native_kernel("ur5_gripper", "arm")
-    return NativeKernelClient(bundle)
+    client = NativeKernelClient(bundle)
+    try:
+        yield client
+    finally:
+        client.reset()
+
+
+def wait_for_terminal(native_kernel, timeout_s=15.0):
+    deadline = time.monotonic() + timeout_s
+    last_status = native_kernel.get_status()
+    while time.monotonic() < deadline:
+        last_status = native_kernel.get_status()
+        if last_status.state in {
+            ExecutionState.COMPLETED,
+            ExecutionState.FAILED,
+            ExecutionState.STOPPED,
+        }:
+            return last_status
+        time.sleep(0.01)
+    pytest.fail(
+        f"Timed out waiting for terminal state; last status was {last_status.state}"
+    )
 
 
 # ============================================================================
@@ -229,6 +250,9 @@ class TestRunnerWithNativeKernel:
         )
         result = native_kernel.execute(request)
         assert result.ok is True
+        terminal = wait_for_terminal(native_kernel)
+        assert terminal.state == ExecutionState.COMPLETED
+        native_kernel.reset()
 
     def test_native_kernel_two_moves(self, native_kernel):
         """Two sequential moves complete."""
@@ -242,6 +266,8 @@ class TestRunnerWithNativeKernel:
         )
         result1 = native_kernel.execute(request1)
         assert result1.ok is True
+        terminal1 = wait_for_terminal(native_kernel)
+        assert terminal1.state == ExecutionState.COMPLETED
 
         native_kernel.reset()
 
@@ -255,6 +281,9 @@ class TestRunnerWithNativeKernel:
         )
         result2 = native_kernel.execute(request2)
         assert result2.ok is True
+        terminal2 = wait_for_terminal(native_kernel)
+        assert terminal2.state == ExecutionState.COMPLETED
+        native_kernel.reset()
 
     def test_native_kernel_reset_cycle(self, native_kernel):
         """Execute → reset → execute again."""
@@ -268,6 +297,8 @@ class TestRunnerWithNativeKernel:
         )
         result1 = native_kernel.execute(request)
         assert result1.ok is True
+        terminal1 = wait_for_terminal(native_kernel)
+        assert terminal1.state == ExecutionState.COMPLETED
 
         reset_result = native_kernel.reset()
         assert reset_result.accepted is True
@@ -282,6 +313,9 @@ class TestRunnerWithNativeKernel:
         )
         result2 = native_kernel.execute(request2)
         assert result2.ok is True
+        terminal2 = wait_for_terminal(native_kernel)
+        assert terminal2.state == ExecutionState.COMPLETED
+        native_kernel.reset()
 
     def test_native_kernel_status_idle_after_reset(self, native_kernel):
         """Status returns to IDLE after reset."""
@@ -295,6 +329,8 @@ class TestRunnerWithNativeKernel:
         )
         result = native_kernel.execute(request)
         assert result.ok is True
+        terminal = wait_for_terminal(native_kernel)
+        assert terminal.state == ExecutionState.COMPLETED
 
         reset_result = native_kernel.reset()
         assert reset_result.accepted is True

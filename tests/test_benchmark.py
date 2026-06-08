@@ -48,6 +48,23 @@ def make_request(move_id, goal, cache_mode="default"):
     )
 
 
+def wait_for_terminal(native_kernel, timeout_s=15.0):
+    deadline = time.monotonic() + timeout_s
+    last_status = native_kernel.get_status()
+    while time.monotonic() < deadline:
+        last_status = native_kernel.get_status()
+        if last_status.state in {
+            ExecutionState.COMPLETED,
+            ExecutionState.FAILED,
+            ExecutionState.STOPPED,
+        }:
+            return last_status
+        time.sleep(0.01)
+    pytest.fail(
+        f"Timed out waiting for terminal state; last status was {last_status.state}"
+    )
+
+
 # ============================================================================
 # Real RoboPlan Benchmarks
 # ============================================================================
@@ -64,6 +81,7 @@ class TestNativeBenchmark:
 
         # Warmup
         native_kernel.execute(make_request("warmup", self.GOAL_A))
+        wait_for_terminal(native_kernel)
         native_kernel.reset()
 
         times = []
@@ -71,8 +89,10 @@ class TestNativeBenchmark:
             req = make_request(f"bench_single_{i}", self.GOAL_A, cache_mode="disable")
             start = time.perf_counter()
             r = native_kernel.execute(req)
+            terminal = wait_for_terminal(native_kernel)
             times.append(time.perf_counter() - start)
             assert r.ok is True, f"Trial {i} failed: {r.error}"
+            assert terminal.state == ExecutionState.COMPLETED
             native_kernel.reset()
 
         avg = sum(times) / len(times) * 1000
@@ -86,15 +106,20 @@ class TestNativeBenchmark:
         # First execute (uncached)
         start1 = time.perf_counter()
         r1 = native_kernel.execute(req)
+        terminal1 = wait_for_terminal(native_kernel)
         uncached_time = time.perf_counter() - start1
         assert r1.ok is True
+        assert terminal1.state == ExecutionState.COMPLETED
         native_kernel.reset()
 
         # Second execute (cached)
         start2 = time.perf_counter()
         r2 = native_kernel.execute(req)
+        terminal2 = wait_for_terminal(native_kernel)
         cached_time = time.perf_counter() - start2
         assert r2.ok is True
+        assert terminal2.state == ExecutionState.COMPLETED
+        native_kernel.reset()
 
         speedup = uncached_time / cached_time if cached_time > 0 else float("inf")
         print(f"\n=== Cached vs Uncached ===")
@@ -114,6 +139,7 @@ class TestNativeBenchmark:
 
         # Warmup
         native_kernel.execute(make_request("warmup5", goals[0]))
+        wait_for_terminal(native_kernel)
         native_kernel.reset()
 
         start = time.perf_counter()
@@ -121,7 +147,9 @@ class TestNativeBenchmark:
             r = native_kernel.execute(
                 make_request(f"bench_multi_{i}", goal, cache_mode="disable")
             )
+            terminal = wait_for_terminal(native_kernel)
             assert r.ok is True, f"Move {i} failed: {r.error}"
+            assert terminal.state == ExecutionState.COMPLETED
             native_kernel.reset()
         elapsed = time.perf_counter() - start
 

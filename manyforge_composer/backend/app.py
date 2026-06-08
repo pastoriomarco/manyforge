@@ -196,15 +196,27 @@ def create_app(
     # Serve built frontend in production mode (must be last — catches all routes)
     resolved_static = _find_static_dir(static_dir)
     if resolved_static:
+        logger.info("Serving frontend static files from %s", resolved_static)
         app.mount("/", StaticFiles(directory=str(resolved_static), html=True), name="static")
+    elif static_dir:
+        raise RuntimeError(
+            f"Explicit frontend static dir is missing or has no index.html: {static_dir}"
+        )
+    else:
+        logger.warning("No frontend static dist found; '/' will not serve UI")
 
     return app
 
 
 def _find_static_dir(explicit: str | None) -> Path | None:
     """Find the frontend dist directory."""
+    if explicit:
+        p = Path(explicit)
+        if p.is_dir() and (p / "index.html").exists():
+            return p
+        return None
+
     candidates = [
-        Path(explicit) if explicit else None,
         Path(__file__).parent.parent / "frontend" / "dist",  # Dev (relative to backend/)
         Path("/opt/manyforge-frontend/dist"),  # Docker image (fallback)
     ]

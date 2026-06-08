@@ -12,8 +12,9 @@
 
 ManyForge is the deployment-side robot-execution framework: a behavior
 tree runtime, motion planner, scene/program/blackboard data model, a
-Composer (web UI + FastAPI backend), an HMI viewer, and an LLM
-assistant-provider HTTP bridge. **Everything required to install,
+Composer (web UI + FastAPI backend + native 3D viewer), a legacy Viser
+HMI fallback, and an LLM assistant-provider HTTP bridge. **Everything
+required to install,
 deploy, and operate ManyForge at runtime is in this repo**, including
 when the optional Composer-assistant lane is enabled.
 
@@ -25,6 +26,19 @@ authority map is:
 | **How do I install / deploy / run ManyForge?** | this repo (`manyforge`) | self-sufficient at runtime — no other repo required for non-AI use |
 | **How do I run the LLM assistant on Jetson Thor?** | `NemoClaw-Thor` | platform glue: vLLM serving, sandbox provisioner, OpenClaw bridge launcher. Required only when using the `openclaw` lane on Thor. |
 | **What is the spec / contract / ADR — what should this code do?** | `manyforge_specs` (private) | dev-only; **not required at runtime**. Specs/ADRs/plans live there for maintainer use. |
+
+### Repository locations and fallbacks
+
+Prefer local checkouts under `${HOME}/workspaces/dev_ws/src/`. If a referenced
+repo is missing locally, inspect or clone the matching repository under
+`https://github.com/pastoriomarco/` before treating a local link as stale.
+
+| Repo | Preferred local path | Accepted alternate local path | Remote |
+|---|---|---|---|
+| `manyforge` | `${HOME}/workspaces/dev_ws/src/manyforge` | - | `https://github.com/pastoriomarco/manyforge` |
+| `NemoClaw-Thor` | `${HOME}/workspaces/dev_ws/src/NemoClaw-Thor` | `${HOME}/workspaces/nemoclaw/src/NemoClaw-Thor` | `https://github.com/pastoriomarco/NemoClaw-Thor` |
+| `manyforge_specs` | `${HOME}/workspaces/dev_ws/src/manyforge_specs` | - | `https://github.com/pastoriomarco/manyforge_specs` |
+| `isaac_ros_custom_bringup` | `${HOME}/workspaces/dev_ws/src/isaac_ros_custom_bringup` | `${HOME}/workspaces/isaac_ros-dev/src/isaac_ros_custom_bringup` | `https://github.com/pastoriomarco/isaac_ros_custom_bringup` |
 
 **This file covers the runtime/operator side completely.** A brief
 section at the bottom points dev maintainers at `manyforge_specs` for
@@ -58,6 +72,13 @@ scripts outside the container.
 For a comprehensive operator runbook (deterministic-only mode,
 direct-LLM mode, full assistant mode), see
 [`docs/operations/STACK_SETUP.md`](docs/operations/STACK_SETUP.md).
+For a freshly formatted machine that needs the whole ManyForge +
+NemoClaw/OpenClaw assistant stack, start with
+[`docs/operations/STACK_SETUP.md`](docs/operations/STACK_SETUP.md#clean-machine-install-order)
+(`scripts/launch.sh` is a runtime launcher, not the first-time NemoClaw
+installer). On Jetson Orin AGX, use
+[`docs/operations/ORIN_STACK_SETUP.md`](docs/operations/ORIN_STACK_SETUP.md)
+instead so the NVMe/eMMC storage contract is handled first.
 
 ---
 
@@ -98,8 +119,9 @@ python -m manyforge_composer \
   --host 0.0.0.0 --port 9000
 ```
 
-Open `http://localhost:9000/` for the Composer UI. The HMI viewer is
-on `http://localhost:8081/` if launched with `--hmi-port 8081`.
+Open `http://localhost:9000/` for the Composer UI and native viewer.
+The legacy Viser HMI is available on `http://localhost:8081/` only if
+Composer is launched with `--hmi-port 8081`.
 
 ### Mode 2 — Composer + direct LLM endpoint
 
@@ -209,7 +231,7 @@ What lives where in this repo, and what it's for:
 | [`manyforge_roboplan/`](manyforge_roboplan/) | Native motion-planner backend bindings (RRT + TOPPRA) |
 | [`manyforge_composer/`](manyforge_composer/) | FastAPI backend + React frontend + MCP server |
 | [`manyforge_assistant_bridge/`](manyforge_assistant_bridge/) | Direct-lane assistant provider HTTP service (port 8100) |
-| [`manyforge_hmi/`](manyforge_hmi/) | Viser-based 3D viewer |
+| [`manyforge_hmi/`](manyforge_hmi/) | Legacy Viser-based 3D viewer fallback |
 | [`manyforge_ros/`](manyforge_ros/) | ROS 2 bridge (optional) |
 | [`agent-skills/manyforge-composer/`](agent-skills/manyforge-composer/) | OpenClaw skill manifest (used by Mode 3) |
 | [`examples/`](examples/) | Reference `*.program.yaml` + `*.deployment.yaml` |
@@ -322,13 +344,15 @@ Authoritative dev-side instructions:
 - `../manyforge_specs/docs/spec/`
 - `../manyforge_specs/docs/adr/`
 
-If `../manyforge_specs/` isn't present, it means this checkout is for
-*deployment* use or limited implementation work, not full maintainer
-development. **Don't fail the operator's runtime task** — answer their
-runtime question from this repo's content (which is complete for
-operation). For code changes, be explicit: small fixes may proceed from
-local code and tests, but spec-governed behavior changes need
-maintainer audit against `manyforge_specs` before merge.
+If `../manyforge_specs/` isn't present, first check whether it exists at
+`${HOME}/workspaces/dev_ws/src/manyforge_specs` or can be cloned from
+`https://github.com/pastoriomarco/manyforge_specs`. If it is still unavailable,
+it means this checkout is for *deployment* use or limited implementation work,
+not full maintainer development. **Don't fail the operator's runtime task** —
+answer their runtime question from this repo's content (which is complete for
+operation). For code changes, be explicit: small fixes may proceed from local
+code and tests, but spec-governed behavior changes need maintainer audit
+against `manyforge_specs` before merge.
 
 To seed an OpenClaw agent sandbox with the specs repo for development
 assistance, the dev-only script is at

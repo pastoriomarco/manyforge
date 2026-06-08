@@ -8,6 +8,7 @@ import os
 import re
 import time
 import uuid
+from collections import OrderedDict
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query
@@ -82,6 +83,232 @@ _CYLINDER_SHAPE_ALIASES = {"cylinder", "tube", "can"}
 _MESH_SHAPE_ALIASES = {"mesh", "trimesh", "stl", "obj", "dae", "usd"}
 
 
+def _env_flag(name: str, *, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in {"", "0", "false", "off", "no"}
+
+
+def _env_int(name: str, *, default: int, minimum: int = 1) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return max(minimum, int(raw.strip()))
+    except (TypeError, ValueError):
+        return default
+
+
+def _catalog_dedupe_enabled() -> bool:
+    return _env_flag("MANYFORGE_ASSISTANT_CATALOG_DEDUPE", default=True)
+
+
+def _catalog_dedupe_cache_limit() -> int:
+    return _env_int("MANYFORGE_ASSISTANT_CATALOG_DEDUPE_CACHE", default=256)
+
+
+def _read_result_dedupe_enabled() -> bool:
+    return _env_flag("MANYFORGE_ASSISTANT_READ_RESULT_DEDUPE", default=True)
+
+
+def _catalog_full_read_selector(arguments: dict[str, Any]) -> dict[str, Any] | None:
+    """Return a stable selector for unfiltered full-catalog reads.
+
+    Full catalog reads are the only responses eligible for dedupe. Filtered
+    reads, explicit entry reads, and category/kind reads continue returning
+    concrete entries because those are usually deliberate detail lookups.
+    """
+    entry_ids = arguments.get("entryIds", arguments.get("entry_ids", []))
+    if entry_ids is None:
+        entry_ids = []
+    category = arguments.get("category")
+    kind = arguments.get("kind")
+    include_parameters = arguments.get(
+        "includeParameters",
+        arguments.get("include_parameters", True),
+    )
+    if entry_ids or category or kind:
+        return None
+    if not isinstance(include_parameters, bool):
+        return None
+    return {"includeParameters": include_parameters}
+
+
+def _maybe_dedupe_catalog_result(
+    *,
+    cache: OrderedDict[tuple[str, str, str, str], dict[str, Any]],
+    request: AssistantBridgeToolRequest,
+    result: dict[str, Any],
+) -> dict[str, Any]:
+    if not _catalog_dedupe_enabled():
+        return result
+    conversation_id = request.conversation_id or ""
+    if not conversation_id:
+        return result
+    selector = _catalog_full_read_selector(request.arguments or {})
+    if selector is None:
+        return result
+    selector_json = json.dumps(selector, sort_keys=True, separators=(",", ":"))
+    key = (
+        request.assistant_mode,
+        conversation_id,
+        request.catalog_hash,
+        selector_json,
+    )
+    previous = cache.get(key)
+    if previous is None:
+        cache[key] = {
+            "requestId": request.request_id,
+            "version": result.get("version"),
+            "entryCount": result.get("entryCount"),
+            "selector": selector,
+            "timestampNs": time.monotonic_ns(),
+        }
+        cache.move_to_end(key)
+        limit = _catalog_dedupe_cache_limit()
+        while len(cache) > limit:
+            cache.popitem(last=False)
+        return result
+
+    cache.move_to_end(key)
+    return {
+        "version": result.get("version", previous.get("version")),
+        "entryCount": result.get("entryCount", previous.get("entryCount")),
+        "entries": [],
+        "catalogAlreadyProvided": True,
+        "catalogHash": request.catalog_hash,
+        "selector": selector,
+        "previousRequestId": previous.get("requestId"),
+        "message": (
+            "Full catalog_read output was already returned earlier in this "
+            "conversation with the same catalogHash. The catalog is unchanged; "
+            "use the prior entries from this conversation history, or call "
+            "catalog_read with entryIds/category/kind for a concrete detail "
+            "lookup."
+        ),
+    }
+
+
+def _scene_result_hash(result: dict[str, Any]) -> str:
+    stable = {
+        key: result.get(key)
+        for key in (
+            "robot",
+            "objects",
+            "linkPoses",
+            "link_poses",
+            "grippers",
+            "poseSources",
+            "pose_sources",
+            "visualState",
+            "visual_state",
+            "objectAxesGizmoSizeM",
+            "object_axes_gizmo_size_m",
+        )
+        if key in result
+    }
+    rendered = json.dumps(stable, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(rendered.encode("utf-8")).hexdigest()
+
+
+def _read_result_fingerprint(tool_id: str, result: dict[str, Any]) -> str | None:
+    if tool_id == "program_read":
+        return json.dumps(
+            {
+                "programLoaded": result.get("programLoaded"),
+                "programSessionGeneration": result.get("programSessionGeneration"),
+                "programTreeHash": result.get("programTreeHash"),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    if tool_id == "scene_inspect":
+        return _scene_result_hash(result)
+    return None
+
+
+def _compact_repeated_read_result(
+    *,
+    tool_id: str,
+    result: dict[str, Any],
+    fingerprint: str,
+    previous: dict[str, Any],
+) -> dict[str, Any]:
+    common = {
+        "snapshotAlreadyProvided": True,
+        "toolId": tool_id,
+        "fingerprint": fingerprint,
+        "previousRequestId": previous.get("requestId"),
+        "message": (
+            f"{tool_id} returned the same snapshot earlier in this "
+            "conversation. The large payload is omitted here; use the prior "
+            "snapshot from conversation history, or call the tool again after "
+            "state changes."
+        ),
+    }
+    if tool_id == "program_read":
+        return {
+            **common,
+            "programLoaded": result.get("programLoaded"),
+            "programSourcePath": result.get("programSourcePath"),
+            "programSessionGeneration": result.get("programSessionGeneration"),
+            "programTreeHash": result.get("programTreeHash"),
+            "program": None,
+        }
+    if tool_id == "scene_inspect":
+        objects = result.get("objects")
+        return {
+            **common,
+            "sceneStateHash": fingerprint,
+            "objectCount": len(objects) if isinstance(objects, list) else None,
+            "timestampNs": result.get("timestampNs", result.get("timestamp_ns")),
+        }
+    return result
+
+
+def _maybe_dedupe_read_result(
+    *,
+    cache: OrderedDict[tuple[str, str, str, str], dict[str, Any]],
+    tool_id: str,
+    request: AssistantBridgeToolRequest,
+    result: dict[str, Any],
+) -> dict[str, Any]:
+    if not _read_result_dedupe_enabled():
+        return result
+    conversation_id = request.conversation_id or ""
+    if not conversation_id:
+        return result
+    fingerprint = _read_result_fingerprint(tool_id, result)
+    if fingerprint is None:
+        return result
+    key = (
+        request.assistant_mode,
+        conversation_id,
+        tool_id,
+        fingerprint,
+    )
+    previous = cache.get(key)
+    if previous is None:
+        cache[key] = {
+            "requestId": request.request_id,
+            "timestampNs": time.monotonic_ns(),
+        }
+        cache.move_to_end(key)
+        limit = _catalog_dedupe_cache_limit()
+        while len(cache) > limit:
+            cache.popitem(last=False)
+        return result
+
+    cache.move_to_end(key)
+    return _compact_repeated_read_result(
+        tool_id=tool_id,
+        result=result,
+        fingerprint=fingerprint,
+        previous=previous,
+    )
+
+
 def create_assistant_router(state: ComposerState) -> APIRouter:
     """Create assistant routes.
 
@@ -90,6 +317,13 @@ def create_assistant_router(state: ComposerState) -> APIRouter:
     composer draft mutations to the in-memory session only.
     """
     router = APIRouter()
+    catalog_dedupe_cache: OrderedDict[tuple[str, str, str, str], dict[str, Any]] = (
+        OrderedDict()
+    )
+    read_result_dedupe_cache: OrderedDict[
+        tuple[str, str, str, str],
+        dict[str, Any],
+    ] = OrderedDict()
 
     @router.post(
         "/chat",
@@ -484,6 +718,19 @@ def create_assistant_router(state: ComposerState) -> APIRouter:
                 assistant_mode=request.assistant_mode,
                 node_allowlist=set(resolved_catalog["nodes"]),
             )
+            if tool_id == "catalog_read" and isinstance(result, dict):
+                result = _maybe_dedupe_catalog_result(
+                    cache=catalog_dedupe_cache,
+                    request=request,
+                    result=result,
+                )
+            elif tool_id in {"program_read", "scene_inspect"} and isinstance(result, dict):
+                result = _maybe_dedupe_read_result(
+                    cache=read_result_dedupe_cache,
+                    tool_id=tool_id,
+                    request=request,
+                    result=result,
+                )
             success = True
             error = None
         except HTTPException as exc:

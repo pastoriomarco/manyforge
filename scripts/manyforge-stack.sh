@@ -18,7 +18,6 @@ source "${SCRIPT_DIR}/manyforge-direct-route-common.sh"
 MANYFORGE_PORT="${MANYFORGE_PORT:-9000}"
 MUX_PROXY_PORT="${MUX_PROXY_PORT:-8888}"
 DIRECT_ROUTE_PORT="${MANYFORGE_DIRECT_ROUTE_PORT:-$(manyforge_direct_route_port)}"
-HMI_PORT="${HMI_PORT:-8081}"
 CONTAINER_PREFIX="${CONTAINER_PREFIX:-manyforge-dev}"
 PLUGIN_ARTIFACT_DIR="${MANYFORGE_PLUGIN_ARTIFACT_DIR:-$HOME/.manyforge/plugin-artifacts}"
 PLUGIN_STATE_DIR="${MANYFORGE_PLUGIN_STATE_DIR:-$HOME/.manyforge/plugin-state}"
@@ -131,7 +130,6 @@ cmd_up() {
             -v "${MANYFORGE_ROOT}:/workspace" \
             -w /workspace \
             -p "${MANYFORGE_PORT}:${MANYFORGE_PORT}" \
-            -p "${HMI_PORT}:${HMI_PORT}" \
             manyforge-dev \
             bash -lc "python -m manyforge_composer \
                 --catalog-path /workspace/manyforge_behavior/resources/node_catalog.yaml \

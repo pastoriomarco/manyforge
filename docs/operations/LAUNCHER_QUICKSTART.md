@@ -31,6 +31,19 @@ container.
 cd ~/workspaces/dev_ws/src/manyforge   # adjust to your checkout path
 ```
 
+## Prerequisite: first-time install already done
+
+`scripts/launch.sh` is a runtime orchestrator, not a clean-machine installer.
+Before using it for the full assistant stack, the host must already have Docker
+and the NVIDIA runtime, the ManyForge image, the local model-serving toolchain,
+and a first-time NemoClaw sandbox created with `nemoclaw onboard`.
+
+For a fresh Thor/workstation, follow
+[`STACK_SETUP.md`](STACK_SETUP.md#clean-machine-install-order). For Jetson Orin
+AGX, follow [`ORIN_STACK_SETUP.md`](ORIN_STACK_SETUP.md) first. After those
+one-time prerequisites exist, this launcher is the supported repeatable way to
+start, stop, restart, and smoke the stack.
+
 ## What the launcher offers
 
 Two orthogonal selectors:
@@ -135,7 +148,7 @@ through a 7-step wizard (same shape as
       Deployment:  /workspace/examples/pick_and_place.deployment.yaml
     Compose:     dev container (detached), no profile
     Supervisors: (none required for lane)
-    Endpoints:   Composer http://127.0.0.1:9000   HMI http://127.0.0.1:8081
+    Endpoints:   Composer http://127.0.0.1:9000   Viewer native Composer panel
 
   Continue? [Y/n] _
 ```
@@ -265,7 +278,6 @@ before continuing.
     --scenario ur5-pick-place --yes start
 
 # Browser:  http://127.0.0.1:9000 (Composer UI)
-#           http://127.0.0.1:8081 (Viser HMI)
 # Verify:   status pill green "Ready", 5 component rows in popup,
 #           AI button HIDDEN.
 
@@ -368,12 +380,14 @@ For where logs and observability endpoints live, see
   FJT/gripper action readiness as `waiting` until Isaac comes online,
   then `ready`. Watch the Composer popup. Use `smoke` to block on these
   with strict readiness (override budget with `ROS_DISCOVERY_TIMEOUT_S=NN`).
-- **Port 9000 or 8081 busy** from a stale prior run →
+- **Port 9000 busy** from a stale prior run →
   `./scripts/launch.sh stop` clears the `manyforge-e2e-composer`
   container; a leftover unmanaged process needs `docker ps` + `docker
   rm -f` or a process kill. To use different ports, set
-  `COMPOSER_PORT=NNNN HMI_PORT=NNNN` (preflight checks the resolved
-  values; `expected_port_owner` matches them).
+  `COMPOSER_PORT=NNNN` (preflight checks the resolved value;
+  `expected_port_owner` matches it). Port 8081 is only checked when
+  `MANYFORGE_ENABLE_LEGACY_VISER_HMI=true`; set `HMI_PORT=NNNN` with
+  that flag to move the legacy Viser fallback.
 - **CI/log-capture wants plain output** → live progress redraw uses
   ANSI cursor-up. For CI logs, set `MANYFORGE_PROGRESS_MODE=plain`;
   the helper reprints the full status block every 30 s instead of
@@ -397,12 +411,76 @@ For where logs and observability endpoints live, see
   for the exact rule) or set `DROP_CACHES=false` to suppress the
   attempt entirely.
 
+## Jetson Orin AGX — Gemma 4 12B (GGUF) assistant
+
+> **Bringing up the whole stack on a fresh Orin?** This section covers running
+> the launcher once the stack is installed. For the end-to-end install (host
+> storage → model serving → NemoClaw/OpenShell/OpenClaw toolchain → onboarding →
+> composer build → run → smoke) start at the master index:
+> [`ORIN_STACK_SETUP.md`](ORIN_STACK_SETUP.md).
+
+The assistant lane defaults to `MODEL_PROFILE=cosmos-reason2-8b` (a vLLM
+profile tuned for Thor). On a **Jetson Orin AGX Dev Kit (64 GB)** use the
+`gemma4-12b-it-gguf-orin` model profile instead: Gemma 4 12B (unsloth
+GGUF UD-Q4_K_XL) served by llama.cpp with the Gemma 4 E2B GGUF as the
+speculative draft, on the Orin llama.cpp image. It tracks the verified
+Thor profile's serving recipe — 128k context, q8_0 KV cache (model +
+draft) and `--flash-attn on` — so the two stay in lockstep; only the
+image and cache mounts are Orin-specific. There is a turnkey wrapper:
+
+```bash
+./scripts/launch-orin-gemma.sh            # interactive review gate, then start
+./scripts/launch-orin-gemma.sh -y         # skip the review gate
+./scripts/launch-orin-gemma.sh smoke      # start + strict assistant e2e smoke
+./scripts/launch-orin-gemma.sh stop
+```
+
+It is a thin shim over `launch.sh` that pins `MODEL_PROFILE` and selects
+`--lane manyforge-only --assistant on --scenario ur10e-scene-authoring`
+(Gemma 4 GGUF is text-only — `--no-mmproj` — so the non-vision scenario
+is the natural pairing). Override any flag by re-passing it. The
+equivalent explicit invocation is:
+
+```bash
+MODEL_PROFILE=gemma4-12b-it-gguf-orin ./scripts/launch.sh \
+    --lane manyforge-only --assistant on --scenario ur10e-scene-authoring start
+```
+
+**The NVMe mounts are load-bearing.** The `gemma4-12b-it-gguf-orin`
+profile (defined in `NemoClaw-Thor/serving/{config,launch}.sh`) points the
+llama.cpp caches at the ~1 TB NVMe so the ~7 GB GGUF + draft stay off the
+small eMMC and persist across `docker run --rm`:
+
+| Host (NVMe) | Container |
+| --- | --- |
+| `/mnt/nova_ssd/hf-cache-orin` | `/data/models/huggingface` and `/root/.cache/huggingface` |
+| `/mnt/nova_ssd/llama-cpp-cache` | `/root/.cache/llama.cpp` |
+
+This mirrors the operator's tested standalone `docker run` and the storage
+layout in
+[`isaac_ros_custom_bringup/jetson_orin_storage/README.md`](../../../isaac_ros_custom_bringup/jetson_orin_storage/README.md)
+(`/mnt/nova_ssd` is the NVMe, made persistent in `/etc/fstab` and
+`chown`'d to the user). If the sibling checkout is missing, use
+`https://github.com/pastoriomarco/isaac_ros_custom_bringup` or the accepted
+local alternate
+`${HOME}/workspaces/isaac_ros-dev/src/isaac_ros_custom_bringup`. Override the
+host roots with `THOR_HF_CACHE_DIR`
+and `THOR_LLAMACPP_CACHE_DIR_HOST` if your NVMe is mounted elsewhere. The
+first `start` downloads the GGUFs (several GB); subsequent starts reuse
+the NVMe cache. As with all assistant profiles, `start` returns once the
+container is live — model readiness is reported into the Composer popup,
+and `smoke` blocks on it strictly.
+
+---
+
 ## Where to go from here
 
 - **Run a real cycle**: open Composer in a browser, hit **Run** on
   the loaded program, watch the behavior tree execute.
 - **Bring up the assistant stack on Thor**: see
   [`docs/operations/ASSISTANT_E2E_COOKBOOK.md`](ASSISTANT_E2E_COOKBOOK.md).
+- **Bring up the assistant stack on Orin AGX**: use
+  `./scripts/launch-orin-gemma.sh` (see the Jetson Orin section above).
 - **Stack-level operational concerns**:
   [`docs/operations/STACK_SETUP.md`](STACK_SETUP.md).
 - **Add a new scenario**: edit

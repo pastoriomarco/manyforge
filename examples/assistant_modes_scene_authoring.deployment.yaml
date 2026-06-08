@@ -120,7 +120,12 @@ model_endpoint_profile_registry: model_endpoint_profiles.yaml
 
 model_endpoints:
   assistant_model:
-    profile_ref: thor_cosmos_reason2_8b
+    # profile_ref supplies model_id (gemma4-12b-it-gguf) — gemma4-12B-IT QAT
+    # GGUF is the smoke-corpus winner on Thor and Orin and the serving default
+    # (serving/config.sh + manyforge launch.sh). The inline fields below
+    # override the profile: provider/base_url route through the assistant
+    # bridge, not the direct proxy. See model_endpoint_profiles.yaml.
+    profile_ref: thor_gemma4_12b_gguf
     provider: nemoclaw
     base_url: http://127.0.0.1:8100/v1/manyforge/assistant
     default_timeout_s: 180.0
@@ -128,8 +133,10 @@ model_endpoints:
     capabilities:
       supports_response_tools: true
       supports_json_object: true
-      supports_image_input: true
-      supported_image_transports: [inline_data_url, http_url]
+      # gemma4-12b-it-gguf is served text-only (llama.cpp --no-mmproj); matches
+      # the thor_gemma4_12b_gguf profile. Scene authoring is a text lane.
+      supports_image_input: false
+      supported_image_transports: []
       tool_call_family: openai_chat_tools
 
 assistant:

@@ -190,9 +190,8 @@ Current gaps to keep visible:
   - `recompute_support_contact_policy_locked`
   - `set_support_contact_pairs_for_validation_locked`
   - mesh objects are added through RoboPlan's `Scene::addMeshGeometry` API,
-    available from PR 197 (`cylinder-and-mesh`) which is the default RoboPlan
-    pin in `scripts/setup-docker.sh` (`ROBOPLAN_PINNED_REF`) until the feature
-    lands in a tagged release
+    available in the RoboPlan 0.4.0 release pin used by
+    `scripts/setup-docker.sh` (`ROBOPLAN_PINNED_REF`)
 - `manyforge_roboplan/include/manyforge_roboplan/roboplan_planning_context.hpp`
   - `disabled_static_collision_pairs_`
   - `disabled_support_contact_pairs_`

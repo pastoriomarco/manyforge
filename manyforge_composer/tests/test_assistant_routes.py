@@ -449,6 +449,88 @@ def test_assistant_bridge_read_only_callback_returns_program_state(
     assert data["result"]["program"] is None
 
 
+def test_assistant_bridge_program_read_dedupes_only_unchanged_snapshot(
+    client: TestClient,
+    state: ComposerState,
+    tmp_path: Path,
+) -> None:
+    program_path = _write_minimal_program(tmp_path)
+    state.load_program(str(program_path))
+    state.deployment = _assistant_mode_deployment()
+    catalog_hash = _assistant_catalog_hash(state, "composer-assistant")
+
+    body = {
+        "conversationId": "conv-program-dedupe",
+        "assistantMode": "composer-assistant",
+        "catalogHash": catalog_hash,
+        "arguments": {},
+    }
+    first = client.post(
+        "/api/assistant/bridge/tools/program_read",
+        json={**body, "requestId": "req-program-read-1"},
+    )
+    second = client.post(
+        "/api/assistant/bridge/tools/program_read",
+        json={**body, "requestId": "req-program-read-2"},
+    )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    first_payload = first.json()["result"]
+    second_payload = second.json()["result"]
+    assert first_payload["programLoaded"] is True
+    assert first_payload["program"] is not None
+    assert second_payload["snapshotAlreadyProvided"] is True
+    assert second_payload["previousRequestId"] == "req-program-read-1"
+    assert second_payload["programLoaded"] is True
+    assert second_payload["program"] is None
+
+    state.load_program(str(program_path))
+    third = client.post(
+        "/api/assistant/bridge/tools/program_read",
+        json={**body, "requestId": "req-program-read-3"},
+    )
+    assert third.status_code == 200
+    third_payload = third.json()["result"]
+    assert third_payload.get("snapshotAlreadyProvided") is None
+    assert third_payload["programLoaded"] is True
+    assert third_payload["program"] is not None
+
+
+def test_assistant_bridge_scene_inspect_dedupes_unchanged_snapshot(
+    client: TestClient,
+    state: ComposerState,
+) -> None:
+    state.deployment = _assistant_mode_deployment()
+    catalog_hash = _assistant_catalog_hash(state, "composer-assistant")
+
+    body = {
+        "conversationId": "conv-scene-dedupe",
+        "assistantMode": "composer-assistant",
+        "catalogHash": catalog_hash,
+        "arguments": {},
+    }
+    first = client.post(
+        "/api/assistant/bridge/tools/scene_inspect",
+        json={**body, "requestId": "req-scene-inspect-1"},
+    )
+    second = client.post(
+        "/api/assistant/bridge/tools/scene_inspect",
+        json={**body, "requestId": "req-scene-inspect-2"},
+    )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    first_payload = first.json()["result"]
+    second_payload = second.json()["result"]
+    assert first_payload.get("snapshotAlreadyProvided") is None
+    assert "objects" in first_payload
+    assert second_payload["snapshotAlreadyProvided"] is True
+    assert second_payload["toolId"] == "scene_inspect"
+    assert second_payload["previousRequestId"] == "req-scene-inspect-1"
+    assert "objects" not in second_payload
+
+
 def test_assistant_bridge_read_only_callback_rejects_proposal_tools(
     client: TestClient,
     state: ComposerState,
@@ -1001,6 +1083,105 @@ def test_assistant_bridge_discovery_callbacks_return_catalog_skills_and_capabili
     result = capabilities_response.json()["result"]
     assert "scene.edit.remove" in result["scene"]
     assert result["adapterIds"]["context"] == "context.test"
+
+
+def test_assistant_bridge_full_catalog_read_dedupes_within_conversation(
+    client: TestClient,
+    state: ComposerState,
+) -> None:
+    state.deployment = _assistant_mode_deployment()
+    catalog_hash = _assistant_catalog_hash(state, "composer-assistant")
+
+    body = {
+        "conversationId": "conv-catalog-dedupe",
+        "assistantMode": "composer-assistant",
+        "catalogHash": catalog_hash,
+        "arguments": {},
+    }
+    first = client.post(
+        "/api/assistant/bridge/tools/catalog_read",
+        json={**body, "requestId": "req-catalog-full-1"},
+    )
+    assert first.status_code == 200
+    first_payload = first.json()["result"]
+    assert first_payload["entryCount"] > 0
+    assert len(first_payload["entries"]) == first_payload["entryCount"]
+    assert first_payload.get("catalogAlreadyProvided") is None
+
+    second = client.post(
+        "/api/assistant/bridge/tools/catalog_read",
+        json={**body, "requestId": "req-catalog-full-2"},
+    )
+    assert second.status_code == 200
+    second_payload = second.json()["result"]
+    assert second_payload["catalogAlreadyProvided"] is True
+    assert second_payload["catalogHash"] == catalog_hash
+    assert second_payload["previousRequestId"] == "req-catalog-full-1"
+    assert second_payload["entryCount"] == first_payload["entryCount"]
+    assert second_payload["entries"] == []
+
+
+def test_assistant_bridge_catalog_dedupe_keeps_filtered_reads_concrete(
+    client: TestClient,
+    state: ComposerState,
+) -> None:
+    state.deployment = _assistant_mode_deployment()
+    catalog_hash = _assistant_catalog_hash(state, "composer-assistant")
+
+    body = {
+        "conversationId": "conv-catalog-filter",
+        "assistantMode": "composer-assistant",
+        "catalogHash": catalog_hash,
+        "arguments": {"entryIds": ["reset_trajectories"]},
+    }
+    first = client.post(
+        "/api/assistant/bridge/tools/catalog_read",
+        json={**body, "requestId": "req-catalog-filter-1"},
+    )
+    second = client.post(
+        "/api/assistant/bridge/tools/catalog_read",
+        json={**body, "requestId": "req-catalog-filter-2"},
+    )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    for response in (first, second):
+        payload = response.json()["result"]
+        assert payload.get("catalogAlreadyProvided") is None
+        assert payload["entryCount"] == 1
+        assert payload["entries"][0]["id"] == "reset_trajectories"
+
+
+def test_assistant_bridge_catalog_dedupe_can_be_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+    state: ComposerState,
+) -> None:
+    monkeypatch.setenv("MANYFORGE_ASSISTANT_CATALOG_DEDUPE", "0")
+    client = TestClient(create_app(state, security=_TEST_SECURITY))
+    state.deployment = _assistant_mode_deployment()
+    catalog_hash = _assistant_catalog_hash(state, "composer-assistant")
+
+    body = {
+        "conversationId": "conv-catalog-disabled",
+        "assistantMode": "composer-assistant",
+        "catalogHash": catalog_hash,
+        "arguments": {},
+    }
+    first = client.post(
+        "/api/assistant/bridge/tools/catalog_read",
+        json={**body, "requestId": "req-catalog-disabled-1"},
+    )
+    second = client.post(
+        "/api/assistant/bridge/tools/catalog_read",
+        json={**body, "requestId": "req-catalog-disabled-2"},
+    )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.json()["result"]["entryCount"] > 0
+    assert second.json()["result"]["entryCount"] > 0
+    assert second.json()["result"].get("catalogAlreadyProvided") is None
+    assert second.json()["result"]["entries"]
 
 
 def test_assistant_bridge_composer_draft_callback_removes_scene_resources(

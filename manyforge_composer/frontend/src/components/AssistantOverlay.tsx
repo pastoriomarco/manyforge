@@ -12,6 +12,7 @@ import type {
   AssistantRequestStatus,
   AssistantToolCall,
   AssistantToolDefinition,
+  ModelEndpointCatalog,
 } from '../types/api';
 
 type TranscriptItem =
@@ -455,8 +456,10 @@ export function AssistantOverlay() {
   const [transcript, setTranscript] = useState<TranscriptItem[]>([]);
   const [assistantEditedDraft, setAssistantEditedDraft] = useState(false);
   const [lastError, setLastError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
   const [providerCatalog, setProviderCatalog] = useState<AssistantProviderCatalog | null>(null);
   const [providerError, setProviderError] = useState<string | null>(null);
+  const [modelEndpointCatalog, setModelEndpointCatalog] = useState<ModelEndpointCatalog | null>(null);
   const transcriptRef = useRef<HTMLDivElement | null>(null);
 
   const assistant = deployment?.assistant ?? null;
@@ -498,7 +501,34 @@ export function AssistantOverlay() {
     && input.trim().length > 0;
   const endpointAlias = assistant?.endpointAlias ?? null;
   const modelEndpoint = endpointAlias ? deployment?.modelEndpoints?.[endpointAlias] : undefined;
-  const modelLabel = modelEndpoint?.profileRef || modelEndpoint?.modelId || 'model not declared';
+  // Configured profile (static): the profile_ref / model_id declared in the
+  // deployment. This is what the panel used to show as "Model" — hence it was
+  // always the deployment's profile_ref label regardless of what was loaded.
+  const configuredProfileLabel = modelEndpoint?.profileRef || modelEndpoint?.modelId || 'model not declared';
+  // Actually-served model id(s): live-probed via /v1/models (same source the
+  // diagnostics panel uses). The assistant endpoint is the nemoclaw bridge,
+  // which /model-endpoints does not probe directly, so surface the served id
+  // from whichever openai/local endpoint the probe reached — that is the model
+  // the bridge's upstream proxy is serving. (llama.cpp/GGUF profiles serve only
+  // their own id; vLLM also serves the static cosmos-reason2-8b back-compat
+  // alias, so more than one id can appear — both are genuinely served.)
+  const liveServedModelIds = useMemo(() => {
+    if (!modelEndpointCatalog) return [] as string[];
+    const ids = new Set<string>();
+    for (const probe of Object.values(modelEndpointCatalog.endpoints)) {
+      if (probe.probeStatus === 'ok') {
+        for (const id of probe.availableModelIds) {
+          ids.add(id);
+        }
+      }
+    }
+    return Array.from(ids).sort();
+  }, [modelEndpointCatalog]);
+  const liveModelLabel = liveServedModelIds.length > 0 ? liveServedModelIds.join(', ') : null;
+  // Prefer the live served id; fall back to the resolved model_id (the id the
+  // bridge requests), then the profile label.
+  const modelLabel =
+    liveModelLabel ?? modelEndpoint?.modelId ?? modelEndpoint?.profileRef ?? 'model not declared';
   const activeDuration =
     runState !== 'idle' && activeRequestStartedMs
       ? formatDurationSeconds((nowMs - activeRequestStartedMs) / 1000)
@@ -530,6 +560,32 @@ export function AssistantOverlay() {
       cancelled = true;
     };
   }, [open, deploymentProviderId]);
+
+  // Live model probe — reuses /api/infra/model-endpoints (the same source the
+  // diagnostics panel uses) so the assistant panel reflects the actually-served
+  // model, not just the configured profile_ref. Refreshed when the overlay
+  // opens and whenever the deployment changes.
+  useEffect(() => {
+    if (!open || !deployment || Object.keys(deployment.modelEndpoints ?? {}).length === 0) {
+      setModelEndpointCatalog(null);
+      return;
+    }
+    let cancelled = false;
+    void api.infra.modelEndpoints()
+      .then((result) => {
+        if (!cancelled) {
+          setModelEndpointCatalog(result);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setModelEndpointCatalog(null);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [open, deployment]);
 
   useEffect(() => {
     if (selectedModeId && assistantModes[selectedModeId]?.enabled !== false) {
@@ -760,6 +816,29 @@ export function AssistantOverlay() {
     }
   };
 
+  // Reset the conversation: cancel any in-flight request (closes ongoing
+  // model work), drop the conversationId so the next turn starts a FRESH
+  // gateway session (no summary ported), and clear the transcript. Signals the
+  // user via a notice banner.
+  const resetConversation = async () => {
+    if (runState !== 'idle' && activeRequestId) {
+      setRunState('cancel_requested');
+      try {
+        await api.assistant.cancel(activeRequestId);
+      } catch {
+        // best-effort: reset proceeds even if the cancel call fails
+      }
+    }
+    setConversationId(undefined);
+    setActiveRequestId(null);
+    setActiveStatus(null);
+    setActiveRequestStartedMs(null);
+    setRunState('idle');
+    setTranscript([]);
+    setLastError(null);
+    setNotice('Conversation reset — context cleared; any in-flight request was cancelled.');
+  };
+
   const onKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
     if (event.key === 'Enter' && !event.shiftKey) {
       event.preventDefault();
@@ -867,13 +946,15 @@ export function AssistantOverlay() {
 
             <div className="grid min-h-0 flex-1 grid-cols-1 gap-0 lg:grid-cols-[minmax(0,1fr)_320px]">
               <div className="flex min-h-0 flex-col border-gray-800 lg:border-r">
+                {/* Pinned above the transcript (not inside the scroll area) so this
+                    actionable Save/Reload notice stays visible while a draft edit
+                    is pending instead of scrolling away with the conversation. */}
+                {assistantEditedDraft && (
+                  <div className="shrink-0 border-b border-amber-700/60 bg-amber-950/60 px-4 py-2 text-sm text-amber-100">
+                    Assistant edited the program. The changes are already applied to the active draft and ready to run; use Save to persist them, or Reload to revert to the last saved version.
+                  </div>
+                )}
                 <div ref={transcriptRef} className="min-h-0 flex-1 space-y-3 overflow-y-auto px-4 py-3">
-                  {assistantEditedDraft && (
-                    <div className="rounded border border-amber-700/80 bg-amber-950/50 px-3 py-2 text-sm text-amber-100">
-                      Assistant edited the program. The changes are already applied to the active draft and ready to run; use Save to persist them, or Reload to revert to the last saved version.
-                    </div>
-                  )}
-
                   {lastError && (
                     <div className="rounded border border-red-700/80 bg-red-950/50 px-3 py-2 text-sm text-red-100">
                       {lastError}
@@ -942,6 +1023,23 @@ export function AssistantOverlay() {
                   {!modeStatus.allowed && selectedModeId && (
                     <div className="mb-2 text-xs text-amber-300">{modeStatus.detail}</div>
                   )}
+                  {(notice || (activeStatus?.warnings?.length ?? 0) > 0) && (
+                    <div className="mb-2 space-y-1">
+                      {notice && (
+                        <div className="rounded border border-blue-700/50 bg-blue-950/40 px-3 py-1.5 text-xs text-blue-200">
+                          {notice}
+                        </div>
+                      )}
+                      {activeStatus?.warnings?.map((warning, index) => (
+                        <div
+                          key={`warn-${index}`}
+                          className="rounded border border-amber-700/50 bg-amber-950/40 px-3 py-1.5 text-xs text-amber-200"
+                        >
+                          ⚠ {warning}
+                        </div>
+                      ))}
+                    </div>
+                  )}
                   <div className="flex gap-2">
                     <textarea
                       value={input}
@@ -952,25 +1050,37 @@ export function AssistantOverlay() {
                       placeholder={assistantConfigured ? 'Ask the assistant...' : 'Assistant provider unavailable'}
                       className="min-h-14 flex-1 resize-none rounded border border-gray-700 bg-gray-900 px-3 py-2 text-sm text-white placeholder:text-gray-500 focus:border-blue-500 focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
                     />
-                    {runState === 'idle' ? (
+                    <div className="flex w-24 flex-col gap-2">
+                      {runState === 'idle' ? (
+                        <button
+                          type="button"
+                          onClick={() => { setNotice(null); void send(); }}
+                          disabled={!canSend}
+                          className="rounded bg-blue-600 px-3 py-2 text-sm font-medium text-white hover:bg-blue-500 disabled:cursor-not-allowed disabled:bg-gray-700 disabled:text-gray-400"
+                        >
+                          Send
+                        </button>
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={() => void cancel()}
+                          disabled={runState === 'cancel_requested'}
+                          className="rounded bg-red-700 px-3 py-2 text-sm font-medium text-white hover:bg-red-600 disabled:cursor-not-allowed disabled:bg-gray-700 disabled:text-gray-400"
+                        >
+                          Cancel
+                        </button>
+                      )}
                       <button
                         type="button"
-                        onClick={() => void send()}
-                        disabled={!canSend}
-                        className="w-24 rounded bg-blue-600 px-3 py-2 text-sm font-medium text-white hover:bg-blue-500 disabled:cursor-not-allowed disabled:bg-gray-700 disabled:text-gray-400"
+                        onClick={() => void resetConversation()}
+                        disabled={runState === 'cancel_requested'
+                          || (runState === 'idle' && !conversationId && transcript.length === 0)}
+                        title="Reset the conversation: clears context and cancels any in-flight request"
+                        className="rounded border border-gray-600 bg-gray-800 px-3 py-1.5 text-xs font-medium text-gray-200 hover:bg-gray-700 disabled:cursor-not-allowed disabled:opacity-50"
                       >
-                        Send
+                        Reset
                       </button>
-                    ) : (
-                      <button
-                        type="button"
-                        onClick={() => void cancel()}
-                        disabled={runState === 'cancel_requested'}
-                        className="w-24 rounded bg-red-700 px-3 py-2 text-sm font-medium text-white hover:bg-red-600 disabled:cursor-not-allowed disabled:bg-gray-700 disabled:text-gray-400"
-                      >
-                        Cancel
-                      </button>
-                    )}
+                    </div>
                   </div>
                 </div>
               </div>
@@ -994,7 +1104,11 @@ export function AssistantOverlay() {
                       <span className="truncate text-gray-300">{endpointAlias ?? 'none'}</span>
                     </div>
                     <div className="mt-2 flex items-center justify-between gap-2">
-                      <span>Model</span>
+                      <span>Profile</span>
+                      <span className="truncate text-gray-300">{configuredProfileLabel}</span>
+                    </div>
+                    <div className="mt-2 flex items-center justify-between gap-2">
+                      <span>{liveModelLabel ? 'Model (live)' : 'Model'}</span>
                       <span className="truncate text-gray-300">{modelLabel}</span>
                     </div>
                     {activeStatus && (

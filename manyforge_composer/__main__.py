@@ -585,6 +585,11 @@ def main():
     parser.add_argument("--port", type=int, default=9000)
     parser.add_argument("--hmi-port", type=int, default=None,
                         help="Enable Viser 3D HMI on this port (e.g. 8081)")
+    parser.add_argument(
+        "--static-dir",
+        default=None,
+        help="Explicit built frontend dist directory to serve. When set, no fallback dist is used.",
+    )
     parser.add_argument("--urdf", default=None,
                         help="Path to robot URDF (auto-resolved from roboplan if omitted)")
     parser.add_argument("--package-dir", action="append", default=[],
@@ -767,7 +772,12 @@ def main():
             "No MANYFORGE_API_TOKEN set — API is unauthenticated on %s:%d",
             args.host, args.port,
         )
-    app = create_app(state, security=security, enable_mcp_http=args.mcp_http)
+    app = create_app(
+        state,
+        static_dir=args.static_dir,
+        security=security,
+        enable_mcp_http=args.mcp_http,
+    )
     uvicorn.run(app, host=args.host, port=args.port)
 
 

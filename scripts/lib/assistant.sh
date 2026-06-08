@@ -40,7 +40,11 @@ PROXY_LIVENESS_GRACE_S="${PROXY_LIVENESS_GRACE_S:-2}"
 
 # ── Configuration (env vars carried over from demo-assistant-known-good.sh) ──
 NEMOCLAW_THOR="${NEMOCLAW_THOR:-${HOME}/workspaces/dev_ws/src/NemoClaw-Thor}"
-MODEL_PROFILE="${MODEL_PROFILE:-cosmos-reason2-8b}"
+# Default Thor model: gemma4-12b-it-gguf (QAT). Top effective rate on the
+# 2026-06-07 7-model sweep (78.8%) and the strongest model on both Thor and
+# Orin; lightweight GGUF, no vLLM, ~2x faster than plain gemma. Orin's
+# equivalent default is gemma4-12b-it-gguf-orin (scripts/launch-orin-gemma.sh).
+MODEL_PROFILE="${MODEL_PROFILE:-gemma4-12b-it-gguf}"
 ASSISTANT_PROVIDER="${ASSISTANT_PROVIDER:-openclaw}"
 START_VLLM_PROXY="${START_VLLM_PROXY:-true}"
 OPENCLAW_PROXY_OVERRIDE_MAX_TOKENS="${OPENCLAW_PROXY_OVERRIDE_MAX_TOKENS:-2048}"
@@ -80,6 +84,20 @@ OPENCLAW_ASSISTANT_LOOP_ARGS_THRESHOLD="${OPENCLAW_ASSISTANT_LOOP_ARGS_THRESHOLD
 OPENCLAW_ASSISTANT_TOOL_SURFACE="${OPENCLAW_ASSISTANT_TOOL_SURFACE:-tools}"
 ASSISTANT_TIMEOUT_S="${ASSISTANT_TIMEOUT_S:-300}"
 ASSISTANT_MAX_TURNS="${ASSISTANT_MAX_TURNS:-16}"
+# vllm-proxy upstream (per model-call) socket timeout. The proxy guards the
+# single llama.cpp slot, so by default we set it ~15s BELOW the per-case
+# assistant budget (ASSISTANT_TIMEOUT_S): the proxy then fails FIRST and closes
+# the upstream socket to release the slot before the case-level timeout fires,
+# instead of racing it. (The old hardcoded 200s sat far below the budget and
+# cut off legitimate prefill-heavy turns — see vllm-proxy.py _UPSTREAM_TIMEOUT_S.)
+# Canonical MANYFORGE_PROXY_ name; legacy OPENCLAW_PROXY_ accepted. Falls back to
+# the budget value when it isn't a plain integer.
+if [[ "${ASSISTANT_TIMEOUT_S}" =~ ^[0-9]+$ && "${ASSISTANT_TIMEOUT_S}" -gt 30 ]]; then
+    _proxy_upstream_default=$(( ASSISTANT_TIMEOUT_S - 15 ))
+else
+    _proxy_upstream_default="${ASSISTANT_TIMEOUT_S}"
+fi
+MANYFORGE_PROXY_UPSTREAM_TIMEOUT_S="${MANYFORGE_PROXY_UPSTREAM_TIMEOUT_S:-${OPENCLAW_PROXY_UPSTREAM_TIMEOUT_S:-${_proxy_upstream_default}}}"
 DROP_CACHES="${DROP_CACHES:-true}"
 PROVISION_OPENCLAW_SANDBOX="${PROVISION_OPENCLAW_SANDBOX:-true}"
 
@@ -367,6 +385,48 @@ start_vllm_proxy() {
         return 1
     fi
     ensure_log_dir
+    # Proxy history budget = the fail-open trim ceiling. The proxy's rung 1-4
+    # trim ladder keeps requests under it and NEVER hard-fails (rung 4
+    # hard-trims oldest content + warns). Selected via
+    # MANYFORGE_PROXY_HISTORY_BUDGET:
+    #   auto (default) -> proportional to the model context window, so it scales
+    #                     for EVERY profile: THOR_TARGET_MAX_MODEL_LEN tokens *
+    #                     ~4 chars/token * PCT% (MANYFORGE_PROXY_HISTORY_BUDGET_PCT,
+    #                     default 90), leaving headroom for the generation.
+    #   off            -> disabled (0): forward everything untrimmed.
+    #   <integer>      -> exact char budget.
+    # An explicit MANYFORGE_PROXY_MAX_REQUEST_CHARS (or legacy
+    # OPENCLAW_PROXY_MAX_REQUEST_CHARS) always wins over the mode.
+    if [[ -z "${MANYFORGE_PROXY_MAX_REQUEST_CHARS:-}" && -z "${OPENCLAW_PROXY_MAX_REQUEST_CHARS:-}" ]]; then
+        local _hb="${MANYFORGE_PROXY_HISTORY_BUDGET:-auto}"
+        case "${_hb}" in
+            off|OFF|none|0)
+                export MANYFORGE_PROXY_MAX_REQUEST_CHARS=0
+                info "Proxy history budget: off (trimming disabled)"
+                ;;
+            auto|AUTO|"")
+                local _pbpct="${MANYFORGE_PROXY_HISTORY_BUDGET_PCT:-90}"
+                local _pcfg="${THOR_RUNTIME_CONFIG:-${HOME}/.config/nemoclaw-thor/config.env}"
+                local _pctx=""
+                [[ -r "${_pcfg}" ]] && _pctx="$(grep -E '^THOR_TARGET_MAX_MODEL_LEN=' "${_pcfg}" | tail -1 | cut -d= -f2 | tr -d '"')"
+                if [[ "${_pctx}" =~ ^[0-9]+$ && "${_pbpct}" =~ ^[0-9]+$ ]]; then
+                    export MANYFORGE_PROXY_MAX_REQUEST_CHARS=$(( _pctx * 4 * _pbpct / 100 ))
+                    info "Proxy history budget: auto -> ${MANYFORGE_PROXY_MAX_REQUEST_CHARS} chars (${_pbpct}% of ${_pctx}-token context)"
+                else
+                    export MANYFORGE_PROXY_MAX_REQUEST_CHARS=0
+                    warn "Proxy history budget: auto requested but THOR_TARGET_MAX_MODEL_LEN unavailable in ${_pcfg}; disabling. Set MANYFORGE_PROXY_HISTORY_BUDGET=<chars> for a fixed size."
+                fi
+                ;;
+            *[!0-9]*)
+                export MANYFORGE_PROXY_MAX_REQUEST_CHARS=0
+                warn "Proxy history budget: invalid MANYFORGE_PROXY_HISTORY_BUDGET='${_hb}' (want off|auto|<integer-chars>); disabling."
+                ;;
+            *)
+                export MANYFORGE_PROXY_MAX_REQUEST_CHARS="${_hb}"
+                info "Proxy history budget: fixed ${MANYFORGE_PROXY_MAX_REQUEST_CHARS} chars"
+                ;;
+        esac
+    fi
     (
         cd "${NEMOCLAW_THOR}"
         env \
@@ -376,6 +436,8 @@ start_vllm_proxy() {
             OPENCLAW_PROXY_LOG_PATH="${LOG_DIR}/vllm-proxy.jsonl" \
             OPENCLAW_PROXY_OVERRIDE_MAX_TOKENS="${OPENCLAW_PROXY_OVERRIDE_MAX_TOKENS}" \
             OPENCLAW_PROXY_THINKING_TOKEN_BUDGET="${OPENCLAW_PROXY_THINKING_TOKEN_BUDGET}" \
+            MANYFORGE_PROXY_UPSTREAM_TIMEOUT_S="${MANYFORGE_PROXY_UPSTREAM_TIMEOUT_S}" \
+            MANYFORGE_PROXY_MAX_REQUEST_CHARS="${MANYFORGE_PROXY_MAX_REQUEST_CHARS:-}" \
             OPENCLAW_PROXY_TOOL_SURFACE="${OPENCLAW_ASSISTANT_TOOL_SURFACE}" \
             setsid python3 "${proxy_py}" </dev/null >"${LOG_DIR}/vllm-proxy.log" 2>&1 &
         echo $! >"${LOG_DIR}/vllm-proxy.pid"

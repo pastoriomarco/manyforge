@@ -25,6 +25,14 @@ fi
 COMPOSER_READY_TIMEOUT_S="${COMPOSER_READY_TIMEOUT_S:-600}"
 HMI_PORT_READY_TIMEOUT_S="${HMI_PORT_READY_TIMEOUT_S:-${HMI_STARTUP_WAIT_S:-30}}"
 
+legacy_viser_hmi_enabled() {
+    local raw="${MANYFORGE_ENABLE_LEGACY_VISER_HMI:-${ENABLE_LEGACY_VISER_HMI:-false}}"
+    case "${raw,,}" in
+        1|true|yes|on) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 # composer_ready / composer_logs — function-name handles for wait.sh.
 # composer_logs is lane-aware: the manyforge-only lane runs Composer as a
 # detached `docker run` container; the isaac-sim lane uses the `composer-ros`
@@ -62,6 +70,10 @@ wait_for_composer() {
 }
 
 wait_for_hmi() {
+    if ! legacy_viser_hmi_enabled; then
+        info "Legacy Viser HMI disabled; native Composer viewer is the active viewer."
+        return 0
+    fi
     # HMI binds only after a program load, so a slow HMI is not a fatal
     # condition for `start` — Composer is up, the runtime-status popup
     # reports the rest. Preserve the historical `return 0` semantics.

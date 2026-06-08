@@ -74,18 +74,19 @@ function ViewerCrashFallback({ viewerKind }: { viewerKind: 'viser' | 'native' })
   );
 }
 
-// Feature flag: `?viewer=native` opts into the in-React-tree R3F scene
-// viewer. Default keeps the legacy Viser iframe so incremental dev work
-// (during Days 1–4 of the migration plan) doesn't disturb operators who
-// need the running viewer. Day 5 cutover flips the default and removes
-// the flag. See
+// Day 6A native-default cutover (2026-06-06): the native in-React-tree R3F
+// viewer is the DEFAULT. `?viewer=viser` is an explicit, temporary
+// compatibility fallback to the legacy Viser iframe for the Day 6A acceptance
+// window — not a default product path. Day 6B removes the flag and deletes
+// `manyforge_hmi/` once acceptance evidence confirms native owns the full
+// operator + assistant-visible surface. See
 // `manyforge_specs/docs/implementation/composer-native-3d-visualizer-migration.md`.
 function readViewerFlag(): 'viser' | 'native' {
   if (typeof window === 'undefined') {
-    return 'viser';
+    return 'native';
   }
   const params = new URLSearchParams(window.location.search);
-  return params.get('viewer') === 'native' ? 'native' : 'viser';
+  return params.get('viewer') === 'viser' ? 'viser' : 'native';
 }
 
 const MIN_VISER_WIDTH = 480;

@@ -37,8 +37,9 @@
 #   -h | --help
 #
 # Common env overrides (REBUILD, STOP_KNOWN_CONFLICTS, COMPOSER_URL,
-# HMI_PORT, MODEL_PROFILE, ASSISTANT_PROVIDER, START_VLLM_PROXY, …) are
-# read by the relevant lib module.
+# MODEL_PROFILE, ASSISTANT_PROVIDER, START_VLLM_PROXY, …) are read by the
+# relevant lib module. Set MANYFORGE_ENABLE_LEGACY_VISER_HMI=true to also
+# start the legacy Viser HMI on HMI_PORT.
 
 set -euo pipefail
 
@@ -104,11 +105,12 @@ Selection (skip prompts when supplied):
 
 Common overrides (read by lib modules):
   REBUILD={auto|true|false}    STOP_KNOWN_CONFLICTS={true|false}  (default false)
-  COMPOSER_URL=...             COMPOSER_PORT=...   HMI_PORT=...
+  COMPOSER_URL=...             COMPOSER_PORT=...
+  MANYFORGE_ENABLE_LEGACY_VISER_HMI=true   HMI_PORT=...
 
   Start-side timeouts (seconds — applied during 'start'):
     COMPOSER_READY_TIMEOUT_S=600   (blocking — Composer /api/health)
-    HMI_PORT_READY_TIMEOUT_S=30    (non-fatal — HMI port bind, runs after program load)
+    HMI_PORT_READY_TIMEOUT_S=30    (non-fatal — legacy Viser HMI only)
     CTEST_TEST_TIMEOUT_S=60        (per-test deadlock guard for startup C++/RoboPlan ctests)
     VLLM_LIVENESS_GRACE_S=5        (container still running after launch)
     PROXY_LIVENESS_GRACE_S=2       (proxy pid alive + port bound)
@@ -348,9 +350,11 @@ EOF
     else
         printf '\n' >&2
     fi
-    cat >&2 <<EOF
-  Endpoints:   Composer ${COMPOSER_URL}   HMI ${HMI_URL}
-EOF
+    if legacy_viser_hmi_enabled; then
+        printf '  Endpoints:   Composer %s   Legacy Viser HMI %s\n' "${COMPOSER_URL}" "${HMI_URL}" >&2
+    else
+        printf '  Endpoints:   Composer %s   Viewer native Composer panel\n' "${COMPOSER_URL}" >&2
+    fi
     if [[ "${ASSISTANT}" == "on" ]]; then
         printf '               vLLM     %s   Bridge %s\n' "${UPSTREAM_BASE_URL}" "${BRIDGE_URL}" >&2
     fi
@@ -378,13 +382,16 @@ step_preflight() {
     else
         preflight_managed_components
     fi
-    # Composer/HMI ports are env-overridable; preflight checks the actual
-    # resolved values so a `COMPOSER_PORT=9010 ./scripts/launch.sh start`
-    # checks 9010 instead of the default 9000.
-    local ports=("${COMPOSER_PORT:-9000}" "${HMI_PORT:-8081}")
+    # Composer and optional legacy HMI ports are env-overridable; preflight
+    # checks the actual resolved values so a `COMPOSER_PORT=9010
+    # ./scripts/launch.sh start` checks 9010 instead of the default 9000.
+    local ports=("${COMPOSER_PORT:-9000}")
+    if legacy_viser_hmi_enabled; then
+        ports+=("${HMI_PORT:-8081}")
+    fi
     if [[ "${LANE}" == "isaac-sim" ]]; then
         # ros-full uses host network; composer-ros listens on the same
-        # COMPOSER_PORT/HMI_PORT, already in the list above.
+        # COMPOSER_PORT plus optional HMI_PORT, already in the list above.
         :
     fi
     if [[ "${ASSISTANT}" == "on" ]]; then
@@ -488,14 +495,8 @@ step_wait_and_load() {
             return 1
             ;;
     esac
-    # HMI binds AFTER the program is loaded (Composer creates the Viser
-    # scene as part of the load step). Running wait_for_hmi before
-    # load_program would always time out for the full
-    # HMI_PORT_READY_TIMEOUT_S budget and fall through with a warn;
-    # running it here means the probe usually succeeds within a couple
-    # of seconds of the load completing. For isaac-sim, the supervisor
-    # owns the load, so wait_for_hmi here is the operator's signal that
-    # the supervisor's deferred load has run.
+    # Legacy Viser HMI, when explicitly enabled, binds AFTER the program is
+    # loaded. With the default native viewer this helper is a no-op.
     wait_for_hmi
 }
 
@@ -522,8 +523,12 @@ print_final_summary() {
     cat <<EOF
 
   Composer UI:   ${COMPOSER_URL}
-  Viser HMI:     ${HMI_URL}
 EOF
+    if legacy_viser_hmi_enabled; then
+        printf '  Viser HMI:     %s\n' "${HMI_URL}"
+    else
+        printf '  Viewer:        native Composer panel\n'
+    fi
     if [[ "${ASSISTANT}" == "on" ]]; then
         cat <<EOF
   vLLM:          ${UPSTREAM_BASE_URL}
@@ -568,7 +573,10 @@ verb_status() {
     docker ps --format '    {{.Names}}\t{{.Image}}\t{{.Ports}}' \
         | grep -E "(manyforge-e2e-|composer-ros|isaac-topic-control|openshell)" >&2 || true
     echo >&2
-    local status_ports=("${COMPOSER_PORT:-9000}" "${HMI_PORT:-8081}" 8000)
+    local status_ports=("${COMPOSER_PORT:-9000}" 8000)
+    if legacy_viser_hmi_enabled; then
+        status_ports+=("${HMI_PORT:-8081}")
+    fi
     if [[ "${START_VLLM_PROXY:-true}" == "true" ]]; then
         status_ports+=("${VLLM_PORT:-8050}")
     fi
@@ -611,15 +619,19 @@ verb_smoke() {
             ;;
         manyforge-only)
             if [[ "${ASSISTANT}" == "on" ]]; then
+                local smoke_args=(
+                    --deployment-path "${DEPLOYMENT_PATH}"
+                    --program-path "${PROGRAM_PATH}"
+                    --strict
+                    --output "${LOG_DIR}/launcher-smoke.json"
+                )
+                if legacy_viser_hmi_enabled; then
+                    smoke_args+=(--require-hmi)
+                fi
                 wait_for_vllm_model
                 wait_for_vllm_proxy
                 wait_for_bridge
-                (cd "${MANYFORGE_ROOT}" && ./scripts/smoke-assistant-e2e.py \
-                    --deployment-path "${DEPLOYMENT_PATH}" \
-                    --program-path "${PROGRAM_PATH}" \
-                    --require-hmi \
-                    --strict \
-                    --output "${LOG_DIR}/launcher-smoke.json")
+                (cd "${MANYFORGE_ROOT}" && ./scripts/smoke-assistant-e2e.py "${smoke_args[@]}")
             else
                 info "No smoke test wired for manyforge-only without assistant; skipping."
             fi

@@ -35,6 +35,55 @@ For runtime/operator-facing reference docs see:
 sprint history are tracked in the private `manyforge_specs` repository, which
 is not required for deployment or operation of this repo.)
 
+## Clean Machine Install Order
+
+Use this section when a Thor/workstation has been freshly formatted and the
+whole ManyForge + NemoClaw/OpenClaw assistant stack needs to be installed from
+zero. For Jetson Orin AGX with a small eMMC root and a secondary NVMe, start at
+[`ORIN_STACK_SETUP.md`](ORIN_STACK_SETUP.md) instead; it adds the required
+storage staging before the same runtime flow.
+
+`scripts/launch.sh` is the repeatable runtime launcher. It starts and wires
+components after the host prerequisites and first-time NemoClaw sandbox
+onboarding already exist. It does **not** install Docker/NVIDIA runtime,
+Node.js, NemoClaw, or OpenShell, and it does **not** create the first
+`my-assistant` sandbox with `nemoclaw onboard`.
+
+1. Prepare the host: Docker Engine + Compose v2, NVIDIA Container Toolkit for
+   assistant/model serving, `git`, `curl`, enough disk for Docker images and
+   model caches, Hugging Face token/licence acceptance for gated models.
+2. Clone the sibling repos under `${HOME}/workspaces/dev_ws/src/`. Use the
+   same tested branch/tag across `manyforge` and `NemoClaw-Thor`; do not mix a
+   migration branch in one repo with `main` in the other.
+3. Build the ManyForge image:
+   ```bash
+   cd ${HOME}/workspaces/dev_ws/src/manyforge
+   ./scripts/setup-docker.sh
+   ```
+4. Install the NemoClaw/OpenShell toolchain from `NemoClaw-Thor` and verify
+   `nemoclaw`, `openshell`, and Docker work from the operator account.
+5. Start the local model once from `NemoClaw-Thor/serving/` and confirm
+   `curl http://127.0.0.1:8000/v1/models` returns the served model.
+6. Run first-time `nemoclaw onboard` to create the `my-assistant` sandbox.
+   The onboard wizard probes the model endpoint, so the model must already be
+   running.
+7. After `my-assistant` exists, use the launcher for repeatable bring-up:
+   ```bash
+   cd ${HOME}/workspaces/dev_ws/src/manyforge
+   ./scripts/launch.sh restart
+   ```
+8. Verify the live stack:
+   ```bash
+   curl -fsS http://127.0.0.1:9000/api/health
+   curl -fsS http://127.0.0.1:8000/v1/models
+   curl -fsS http://127.0.0.1:8200/healthz
+   ```
+
+The launcher may re-apply provider config, egress policy, skills, MCP server
+registration, gateway startup, and bridge startup on every run. That is
+intentional and idempotent. The non-idempotent first-time step is creating the
+sandbox itself with `nemoclaw onboard`.
+
 ## Current Supported Modes
 
 ### 1. Deterministic ManyForge only
@@ -198,7 +247,7 @@ manually; they are documented here for traceability.
 | Base dev image | `python:3.12-slim-bookworm` | Docker Hub | Dockerfile L31; ROS-free dev environment |
 | Frontend builder | `node:22-slim` | Docker Hub | Dockerfile L23; React/Vite build stage |
 | ROS image | `ros:jazzy-ros-base-noble` | Docker Hub | Dockerfile.ros-jazzy L11; Ubuntu Noble + ROS Jazzy |
-| RoboPlan | SHA `1c1edec04913a655db808f940a9dad8ef7f2c87e` (PR 197 `cylinder-and-mesh` head) | `https://github.com/open-planning/roboplan.git` | Pinned in `scripts/setup-docker.sh` as `ROBOPLAN_PINNED_REF`. The adapter code in `manyforge_roboplan/` requires `Scene::addMeshGeometry`, which is not yet in a tagged release. When mesh-geometry support lands upstream, the default will switch back to a release tag — see [`../reference/ROBOPLAN_ADAPTER_NOTES.md`](../reference/ROBOPLAN_ADAPTER_NOTES.md) "Removal Criteria". |
+| RoboPlan | `0.4.0` tag SHA `7bddd403cf679dd976135aff6d9412fae9c4c04d` | `https://github.com/open-planning/roboplan.git` | Pinned in `scripts/setup-docker.sh` as `ROBOPLAN_PINNED_REF`. This release includes the mesh/cylinder geometry APIs required by `manyforge_roboplan/`; the Dockerfiles install RoboPlan's modular Python packages from their package roots. |
 | Pinocchio (kinematics / dynamics) | `pin==3.9.0` | PyPI | Dockerfile L65; brings `hpp-fcl` / `coal` and Eigen helpers transitively |
 | `pybind11` | `3.0.3` | PyPI | Dockerfile L58 |
 | `nanobind` | `2.12.0` | PyPI | Dockerfile L63 |
@@ -210,7 +259,7 @@ manually; they are documented here for traceability.
 | `trimesh` | `4.11.5` | PyPI | Dockerfile L61; OBJ/mesh parsing |
 | `yourdfpy` | `0.0.60` | PyPI | Dockerfile L62; URDF Python loader |
 | FastAPI | `0.135.3` | PyPI | Dockerfile L67; Composer backend |
-| Viser | `1.0.26` | PyPI | Dockerfile L66; HMI viewer |
+| Viser | `1.0.26` | PyPI | Dockerfile L66; legacy HMI fallback, started only with `MANYFORGE_ENABLE_LEGACY_VISER_HMI=true` |
 | MCP (Model Context Protocol) | `1.27.0` | PyPI | Dockerfile L71; assistant-lane MCP server |
 
 The model endpoints used by Mode 2/3 are configured in
@@ -230,17 +279,16 @@ cat .docker/roboplan/.manyforge-roboplan-ref   # the ref passed to git fetch
 cat .docker/roboplan/.manyforge-roboplan-sha   # the resolved commit SHA
 ```
 
-**Force a refresh** (e.g. when the PR moves, or to test a release
-tag once mesh-geometry support is upstream):
+**Force a refresh** (e.g. to test a newer release tag or local branch):
 
 ```bash
 rm -rf .docker/roboplan/
 ROBOPLAN_REF=<branch|tag|sha> ./scripts/setup-docker.sh
 ```
 
-With no `ROBOPLAN_REF`, the script uses the SHA pinned at
-`scripts/setup-docker.sh` (`ROBOPLAN_PINNED_REF`). Maintainers move that
-pin forward as upstream PR 197 advances.
+With no `ROBOPLAN_REF`, the script uses the RoboPlan 0.4.0 SHA pinned at
+`scripts/setup-docker.sh` (`ROBOPLAN_PINNED_REF`). Maintainers move that pin
+forward only after Docker build and RoboPlan adapter tests pass.
 
 ## Primary Scripts
 
@@ -331,7 +379,13 @@ docker compose up --build
 Then use:
 
 - Composer API on port `9000`
-- HMI/Viser on port `8081`
+- native Composer viewer in the Composer UI
+
+The legacy Viser HMI can still be started for compatibility with:
+
+```bash
+MANYFORGE_ENABLE_LEGACY_VISER_HMI=true ./scripts/launch.sh start
+```
 
 This profile does not require ROS, Isaac Sim, or a robot controller. The
 native execution adapter is in-process: reset and retry only affect ManyForge's
@@ -348,8 +402,8 @@ simulator is commanded.
 
    Isaac Sim may be started before or after this command.  The bringup lane
    includes an Isaac demo supervisor that loads the Composer program/deployment
-   as soon as Composer is healthy, so the backend-authored scene and Viser HMI
-   are visible even if Isaac is still off.  It keeps the arm command gate closed
+   as soon as Composer is healthy, so the backend-authored scene is visible in
+   the native Composer viewer even if Isaac is still off.  It keeps the arm command gate closed
    until `/isaac_joint_states`, controller state, the arm FollowJointTrajectory
    action, and the gripper action are all reachable. Once they are ready, it
    requests a Composer reset so Isaac is commanded to the configured home pose

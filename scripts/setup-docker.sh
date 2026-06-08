@@ -11,8 +11,7 @@
 #
 #   # Optional: clone a different RoboPlan ref instead of the pinned SHA.
 #   ROBOPLAN_REF=main ./scripts/setup-docker.sh
-#   ROBOPLAN_REF=cylinder-and-mesh ./scripts/setup-docker.sh
-#   ROBOPLAN_REF=0.3.0 ./scripts/setup-docker.sh
+#   ROBOPLAN_REF=0.4.0 ./scripts/setup-docker.sh
 #
 # After setup:
 #   docker compose run --rm dev bash
@@ -22,12 +21,11 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 ROBOPLAN_DIR="$REPO_DIR/.docker/roboplan"
-# Pinned to PR 197 head (`cylinder-and-mesh` branch).
-# The manyforge_roboplan adapter requires Scene::addMeshGeometry, which is
-# not yet in any upstream RoboPlan release tag. Switch this back to a release
-# tag (e.g. "0.4.0") when mesh-geometry support lands upstream.
+# Pinned to RoboPlan 0.4.0, which includes PR 197 mesh/cylinder geometry
+# support required by the manyforge_roboplan adapter. Use the tag-resolved SHA
+# for reproducible Docker builds while still allowing ROBOPLAN_REF overrides.
 # See docs/reference/ROBOPLAN_ADAPTER_NOTES.md for the source-level dependency.
-ROBOPLAN_PINNED_REF="1c1edec04913a655db808f940a9dad8ef7f2c87e"
+ROBOPLAN_PINNED_REF="7bddd403cf679dd976135aff6d9412fae9c4c04d"
 ROBOPLAN_REF="${ROBOPLAN_REF:-$ROBOPLAN_PINNED_REF}"
 ROBOPLAN_REF_MARKER="$ROBOPLAN_DIR/.manyforge-roboplan-ref"
 ROBOPLAN_SHA_MARKER="$ROBOPLAN_DIR/.manyforge-roboplan-sha"
