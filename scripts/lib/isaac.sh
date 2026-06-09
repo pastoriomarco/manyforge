@@ -96,8 +96,26 @@ wait_for_arm_controller_state() {
         arm_controller_state_ready
 }
 
+# Does the ros-jazzy-full image exist locally? Derives the canonical name
+# from `docker compose config --images` so this honors COMPOSE_PROJECT_NAME
+# overrides instead of hard-coding `manyforge-ros-jazzy-full`.
+#
+# Used as an early gate in maybe_build_isaac_image. WITHOUT this gate, the
+# `isaac_image_runtime_ready` probe below silently triggers an implicit
+# `docker compose run` build on a missing image — and the probe redirects
+# stdout/stderr to /dev/null, so the operator stares at a black hole for
+# 10+ minutes instead of seeing compose's actual build progress.
+isaac_image_present() {
+    local image_name
+    image_name=$("${COMPOSE_CMD[@]}" config --images 2>/dev/null \
+        | awk '/ros-jazzy-full(:|$)/ {print; exit}')
+    [[ -n "${image_name}" ]] && docker image inspect "${image_name}" >/dev/null 2>&1
+}
+
 # image_has_isaac_runtime adapter — preflight.sh uses ros_shell via a callable;
-# we wire it here so the call site reads naturally.
+# we wire it here so the call site reads naturally. Assumes the image already
+# exists; callers must gate on `isaac_image_present` first to avoid the
+# silent-build pitfall documented above.
 isaac_image_runtime_ready() {
     local probe='source /opt/ros/jazzy/setup.bash; source /opt/manyforge/topic_based_ros2_control/install/setup.bash 2>/dev/null || true; ros2 pkg prefix '"${TOPIC_BASED_PKG}"' >/dev/null 2>&1; python3 -c "import rclpy; from control_msgs.action import GripperCommand; from sensor_msgs.msg import JointState"'
     ros_shell "${probe}" >/dev/null 2>&1
@@ -114,7 +132,15 @@ maybe_build_isaac_image() {
             info "Skipping image build (REBUILD=false)"
             ;;
         auto)
-            if isaac_image_runtime_ready; then
+            if ! isaac_image_present; then
+                # Cold path: image is not on disk. Go straight to the
+                # visible-output build path. Running the runtime-readiness
+                # probe here would trigger an implicit build under the
+                # probe's /dev/null redirect — exactly the silent black-
+                # hole behavior this gate exists to prevent.
+                step "ROS image not present; building"
+                "${COMPOSE_CMD[@]}" build ros-jazzy-full composer-ros isaac-topic-control
+            elif isaac_image_runtime_ready; then
                 pass "ROS image already contains ${TOPIC_BASED_PKG} and gripper-action Python deps"
             else
                 step "ROS image missing Isaac ros2_control runtime deps; rebuilding"
