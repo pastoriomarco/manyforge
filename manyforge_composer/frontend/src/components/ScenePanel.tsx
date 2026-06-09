@@ -970,7 +970,7 @@ export function ScenePanel() {
       <Section title="Viewer Frames">
         {!hmiAvailable && (
           <div className="rounded border border-gray-700 bg-gray-900/40 p-3 text-xs text-gray-500">
-            HMI frame toggles require the Viser HMI to be running.
+            Viewer frame toggles are unavailable until frame state loads.
           </div>
         )}
         <div className="rounded border border-gray-700 bg-gray-900/40 p-3">

@@ -46,6 +46,13 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export MANYFORGE_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
+# Capture the operator's EXPLICITLY-requested model profile and assistant lane
+# before lib/assistant.sh defaults MODEL_PROFILE / ASSISTANT_PROVIDER — so the
+# wizard can tell a real preset (env or flag) apart from the built-in default
+# and knows whether to prompt.
+MODEL_PROFILE_REQUESTED="${MODEL_PROFILE:-}"
+ASSISTANT_PROVIDER_REQUESTED="${ASSISTANT_PROVIDER:-}"
+
 # shellcheck source=lib/runner.sh
 source "${SCRIPT_DIR}/lib/runner.sh"
 # shellcheck source=lib/prompts.sh
@@ -73,6 +80,7 @@ install_error_trap
 LANE="${LANE:-}"
 ASSISTANT="${ASSISTANT:-}"
 SCENARIO="${SCENARIO:-}"
+PLATFORM="${PLATFORM:-}"
 PROGRAM_PATH=""
 DEPLOYMENT_PATH=""
 VERB="start"
@@ -95,6 +103,13 @@ Verbs:
 Selection (skip prompts when supplied):
   --lane {manyforge-only|isaac-sim}
   --assistant {on|off}
+  --provider {direct|openclaw|hermes}
+                              Assistant only: which lane/bridge to run.
+                              Env: ASSISTANT_PROVIDER. Default: openclaw.
+  --platform NAME             Assistant only: target platform (thor|orin|…),
+                              filters the recipe list. Default: auto-detected host.
+  --model-profile NAME        Assistant only: model recipe (see serving/config.sh).
+                              Env: MODEL_PROFILE. Skips the recipe prompt.
   --scenario NAME             Or --program/--deployment for free form
   --program PATH
   --deployment PATH
@@ -134,7 +149,7 @@ Common overrides (read by lib modules):
 
   Assistant:  MODEL_PROFILE  ASSISTANT_PROVIDER  START_VLLM_PROXY
               OPENCLAW_ASSISTANT_COMPACT_EVERY_N  VLLM_PORT
-              OPENCLAW_ASSISTANT_TOOL_SURFACE   (tools|code; default tools — see LANE-COMPARISON-three-lane)
+              OPENCLAW_ASSISTANT_TOOL_SURFACE   (tools|code; default tools — see LANE-COMPARISON)
   Isaac:      ARM_ACTION  GRIPPER_ACTION
               ISAAC_JOINT_STATE_TOPIC  ARM_CONTROLLER_STATE_TOPIC
 
@@ -157,6 +172,9 @@ parse_args() {
         case "$1" in
             --lane) LANE="$2"; shift 2 ;;
             --assistant) ASSISTANT="$2"; shift 2 ;;
+            --provider) ASSISTANT_PROVIDER_REQUESTED="$2"; shift 2 ;;
+            --platform) PLATFORM="$2"; shift 2 ;;
+            --model-profile) MODEL_PROFILE_REQUESTED="$2"; shift 2 ;;
             --scenario) SCENARIO="$2"; shift 2 ;;
             --program) PROGRAM_PATH="$2"; shift 2 ;;
             --deployment) DEPLOYMENT_PATH="$2"; shift 2 ;;
@@ -228,6 +246,133 @@ step_choose_assistant() {
         *) fail "Invalid assistant value: ${ASSISTANT}"; exit 2 ;;
     esac
     pass "Assistant: ${ASSISTANT}"
+
+    # When the assistant is on, choose the lane (direct/openclaw/hermes), the
+    # target platform, and the model recipe. The recipe catalog (names + platform
+    # tags) is the single source of truth in NemoClaw-Thor's serving/config.sh.
+    if [[ "${ASSISTANT}" == "on" ]]; then
+        step_choose_assistant_lane_and_model
+    fi
+}
+
+# Query the NemoClaw-Thor model catalog. config.sh is source-only and prepends
+# to PATH at load, so run it in an isolated subshell and capture only the helper
+# output — nothing leaks into the launcher's shell.
+_model_catalog() {
+    ( source "${NEMOCLAW_THOR}/serving/config.sh" >/dev/null 2>&1 && "$@" )
+}
+
+step_choose_assistant_lane_and_model() {
+    # ── Assistant lane / provider (direct / openclaw / hermes) ───────────────
+    # Independent of the model: every lane drives the same vLLM endpoint; the
+    # lane only chooses the bridge / agent-loop path.
+    local lanes=(direct openclaw hermes)
+    if [[ -n "${ASSISTANT_PROVIDER_REQUESTED}" ]]; then
+        ASSISTANT_PROVIDER="${ASSISTANT_PROVIDER_REQUESTED}"
+        info "Assistant lane preset: ${ASSISTANT_PROVIDER}"
+    else
+        printf '\n  %sAssistant lanes:%s\n' "${_C_BOLD}" "${_C_RESET}" >&2
+        printf '    %-9s %s\n' "direct"   "in-process bridge → vLLM (:8100); fastest, no gateway hops" >&2
+        printf '    %-9s %s\n' "openclaw" "OpenClaw gateway agent (:8200); current default" >&2
+        printf '    %-9s %s\n' "hermes"   "Hermes sessions + memory/skills (:8300); experimental, opt-in" >&2
+        local i default_lane_idx=1
+        for (( i = 0; i < ${#lanes[@]}; i++ )); do
+            [[ "${lanes[i]}" == "${ASSISTANT_PROVIDER:-openclaw}" ]] && { default_lane_idx=$((i + 1)); break; }
+        done
+        ASSISTANT_PROVIDER="$(pick_from_list "Assistant lane" "${default_lane_idx}" "${lanes[@]}")"
+    fi
+    case "${ASSISTANT_PROVIDER}" in
+        direct|nemoclaw|openclaw|hermes) ;;
+        *) fail "Unknown assistant lane '${ASSISTANT_PROVIDER}'. Choose: direct | openclaw | hermes."; exit 2 ;;
+    esac
+    # Hermes is gated (opt-in until its bake-off lands); an explicit choice here
+    # IS the opt-in, so enable the gate rather than erroring out at bring-up.
+    if [[ "${ASSISTANT_PROVIDER}" == "hermes" && "${HERMES_LANE_PHASE4_ENABLED:-false}" != "true" ]]; then
+        export HERMES_LANE_PHASE4_ENABLED=true
+        info "Hermes lane is experimental (Phase 4, opt-in) — enabling HERMES_LANE_PHASE4_ENABLED=true."
+    fi
+    export ASSISTANT_PROVIDER
+    # BRIDGE_URL was resolved at source time against the default provider;
+    # recompute it for the lane just chosen so the Composer endpoint, the
+    # supervisor /healthz probe, and the plan/status all target the right port.
+    resolve_assistant_bridge_url
+    pass "Assistant lane: ${ASSISTANT_PROVIDER} (bridge ${BRIDGE_URL})"
+
+    # ── Platform + model recipe (from the NemoClaw-Thor catalog) ─────────────
+    local config="${NEMOCLAW_THOR}/serving/config.sh"
+    if [[ ! -r "${config}" ]]; then
+        warn "Model catalog ${config} not found; using MODEL_PROFILE=${MODEL_PROFILE}."
+        return 0
+    fi
+
+    # ── Platform (filters the recipe list) ──────────────────────────────────
+    local platforms=()
+    mapfile -t platforms < <(_model_catalog list_model_platforms)
+    if (( ${#platforms[@]} == 0 )); then
+        warn "No platforms in catalog; using MODEL_PROFILE=${MODEL_PROFILE}."
+        return 0
+    fi
+    if [[ -n "${PLATFORM}" ]]; then
+        info "Platform preset via flag: ${PLATFORM}"
+    else
+        # Preselect the auto-detected host platform when it is in the catalog.
+        local detected default_idx=1 i
+        detected="$(_model_catalog detect_platform || true)"
+        if [[ -n "${detected}" ]]; then
+            info "Detected host platform: ${detected}"
+            for (( i = 0; i < ${#platforms[@]}; i++ )); do
+                [[ "${platforms[i]}" == "${detected}" ]] && { default_idx=$((i + 1)); break; }
+            done
+        fi
+        PLATFORM="$(pick_from_list "Target platform" "${default_idx}" "${platforms[@]}")"
+    fi
+    local p ok=0
+    for p in "${platforms[@]}"; do [[ "${p}" == "${PLATFORM}" ]] && ok=1; done
+    if (( ! ok )); then
+        fail "Unknown platform '${PLATFORM}'. Available: ${platforms[*]}"; exit 2
+    fi
+    pass "Platform: ${PLATFORM}"
+
+    # ── Model recipe (filtered by platform) ─────────────────────────────────
+    local rows=() names=() descs=() row name desc
+    mapfile -t rows < <(_model_catalog list_model_profiles "${PLATFORM}")
+    if (( ${#rows[@]} == 0 )); then
+        fail "No model recipes registered for platform '${PLATFORM}'."; exit 2
+    fi
+    for row in "${rows[@]}"; do
+        name="${row%%$'\t'*}"; desc="${row#*$'\t'}"
+        names+=("${name}"); descs+=("${desc}")
+    done
+
+    # An explicit request (env MODEL_PROFILE / --model-profile) wins if it is a
+    # recipe for the chosen platform — skip the prompt.
+    if [[ -n "${MODEL_PROFILE_REQUESTED}" ]]; then
+        local req_ok=0
+        for name in "${names[@]}"; do [[ "${name}" == "${MODEL_PROFILE_REQUESTED}" ]] && req_ok=1; done
+        if (( req_ok )); then
+            MODEL_PROFILE="${MODEL_PROFILE_REQUESTED}"; export MODEL_PROFILE
+            info "Model recipe preset: ${MODEL_PROFILE}"
+            pass "Model recipe: ${MODEL_PROFILE}"
+            return 0
+        fi
+        warn "Requested model '${MODEL_PROFILE_REQUESTED}' is not available for platform '${PLATFORM}'."
+        if is_non_interactive; then
+            fail "No valid model recipe for ${PLATFORM} in non-interactive mode."; exit 2
+        fi
+    fi
+
+    # Show the filtered recipe table, then pick by number. Default to the
+    # current MODEL_PROFILE if it is available for this platform (preserves the
+    # built-in default), else the platform's first recipe.
+    printf '\n  %sAvailable recipes for %s:%s\n' "${_C_BOLD}" "${PLATFORM}" "${_C_RESET}" >&2
+    local i default_idx=1
+    for (( i = 0; i < ${#names[@]}; i++ )); do
+        printf '    %-44s %s\n' "${names[i]}" "${descs[i]}" >&2
+        [[ "${names[i]}" == "${MODEL_PROFILE:-}" ]] && default_idx=$((i + 1))
+    done
+    MODEL_PROFILE="$(pick_from_list "Model recipe (${PLATFORM})" "${default_idx}" "${names[@]}")"
+    export MODEL_PROFILE
+    pass "Model recipe: ${MODEL_PROFILE}"
 }
 
 step_choose_scenario() {
@@ -399,11 +544,9 @@ step_preflight() {
         if [[ "${START_VLLM_PROXY:-true}" == "true" ]]; then
             ports+=("${VLLM_PORT:-8050}")
         fi
-        case "${ASSISTANT_PROVIDER}" in
-            openclaw) ports+=(8200) ;;
-            hermes) ports+=(8300) ;;
-            direct|nemoclaw|*) ports+=(8100) ;;
-        esac
+        # Bridge port for the chosen lane — derive from BRIDGE_URL (resolved by
+        # resolve_assistant_bridge_url) rather than re-mapping the provider here.
+        ports+=("${BRIDGE_URL##*:}")
     fi
     if ! preflight_ports "${ports[@]}"; then
         if [[ "${STOP_KNOWN_CONFLICTS}" == "true" ]]; then
@@ -539,7 +682,11 @@ EOF
         echo
     fi
     info "To reproduce non-interactively:"
-    info "  scripts/launch.sh --lane ${LANE} --assistant ${ASSISTANT} --scenario ${SCENARIO} --non-interactive --yes"
+    local _assistant_args=""
+    if [[ "${ASSISTANT}" == "on" ]]; then
+        _assistant_args=" --provider ${ASSISTANT_PROVIDER} --platform ${PLATFORM} --model-profile ${MODEL_PROFILE}"
+    fi
+    info "  scripts/launch.sh --lane ${LANE} --assistant ${ASSISTANT}${_assistant_args} --scenario ${SCENARIO} --non-interactive --yes"
 }
 
 # ── Verbs ────────────────────────────────────────────────────────────────────

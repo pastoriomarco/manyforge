@@ -68,7 +68,7 @@ OPENCLAW_ASSISTANT_LOOP_ARGS_THRESHOLD="${OPENCLAW_ASSISTANT_LOOP_ARGS_THRESHOLD
 #   "tools" → tools[] is {tool_search, tool_describe, tool_call}.
 #             PRODUCTION DEFAULT since Phase 3 (2026-06-03). Measured
 #             58.3% effective rate on cosmos-reason2-8b vs 29.0% for
-#             code mode (see docs/LANE-COMPARISON-three-lane.md).
+#             code mode (see docs/LANE-COMPARISON.md).
 #             Requires sandbox openclaw.json to set
 #             tools.toolSearch = {enabled: true, mode: "tools"}.
 #   "code"  → tools[] is {tool_search_code}. OpenClaw 2026.5.6+
@@ -129,37 +129,50 @@ VLLM_DIRECT_URL="http://127.0.0.1:${VLLM_PORT}/v1"
 # Format (case statement below):
 #   <provider id>) BRIDGE_URL=<default-port>;;
 #   The * branch errors out with a clear message including the accepted ids.
-case "${ASSISTANT_PROVIDER}" in
-    direct|nemoclaw)
-        # "direct" is the canonical id; "nemoclaw" is a legacy alias
-        # (see LANE_ID_ALIASES in manyforge_composer/backend/assistant_provider.py).
-        BRIDGE_URL="${BRIDGE_URL:-http://127.0.0.1:8100}"
-        ;;
-    openclaw)
-        BRIDGE_URL="${BRIDGE_URL:-http://127.0.0.1:8200}"
-        ;;
-    hermes)
-        # Phase 4: bridge implementation is wired up; until then this
-        # branch errors out so anyone trying to use it sees the gap.
-        if [[ "${HERMES_LANE_PHASE4_ENABLED:-false}" != "true" ]]; then
-            echo "ERROR: ASSISTANT_PROVIDER=hermes is registered but not yet implemented." >&2
-            echo "       Set HERMES_LANE_PHASE4_ENABLED=true once Phase 4 has landed." >&2
+# Capture an operator-pinned BRIDGE_URL (rare) so re-resolution still honors it.
+_ASSISTANT_BRIDGE_URL_REQUESTED="${BRIDGE_URL:-}"
+
+# resolve_assistant_bridge_url — set BRIDGE_URL from the CURRENT
+# ASSISTANT_PROVIDER (honoring an operator-pinned BRIDGE_URL). Safe to call
+# repeatedly. The launcher re-calls this after its lane wizard changes
+# ASSISTANT_PROVIDER, so BRIDGE_URL — and everything derived from it (the
+# Composer assistant endpoint, the supervisor /healthz probe, the plan/status
+# display) — tracks the chosen lane instead of the source-time default.
+resolve_assistant_bridge_url() {
+    case "${ASSISTANT_PROVIDER}" in
+        direct|nemoclaw)
+            # "direct" is the canonical id; "nemoclaw" is a legacy alias
+            # (see LANE_ID_ALIASES in manyforge_composer/backend/assistant_provider.py).
+            BRIDGE_URL="${_ASSISTANT_BRIDGE_URL_REQUESTED:-http://127.0.0.1:8100}"
+            ;;
+        openclaw)
+            BRIDGE_URL="${_ASSISTANT_BRIDGE_URL_REQUESTED:-http://127.0.0.1:8200}"
+            ;;
+        hermes)
+            # Phase 4 landed: the bridge (start_bridge_hermes) is implemented.
+            # Still gated behind HERMES_LANE_PHASE4_ENABLED so the lane is opt-in
+            # until the live bake-off has validated it as a production default.
+            if [[ "${HERMES_LANE_PHASE4_ENABLED:-false}" != "true" ]]; then
+                echo "ERROR: ASSISTANT_PROVIDER=hermes is opt-in until its bake-off lands." >&2
+                echo "       Set HERMES_LANE_PHASE4_ENABLED=true to enable the Hermes lane." >&2
+                return 1 2>/dev/null || exit 1
+            fi
+            BRIDGE_URL="${_ASSISTANT_BRIDGE_URL_REQUESTED:-http://127.0.0.1:8300}"
+            ;;
+        "")
+            # Empty provider → mock mode; bridge URL doesn't matter, but
+            # don't fall through into the error branch.
+            BRIDGE_URL="${_ASSISTANT_BRIDGE_URL_REQUESTED:-http://127.0.0.1:8100}"
+            ;;
+        *)
+            echo "ERROR: Unknown ASSISTANT_PROVIDER='${ASSISTANT_PROVIDER}'." >&2
+            echo "       Accepted values: direct | nemoclaw (alias of direct) | openclaw | hermes (Phase 4) | '' (mock)." >&2
+            echo "       See LANE_REGISTRY in manyforge_composer/backend/assistant_provider.py." >&2
             return 1 2>/dev/null || exit 1
-        fi
-        BRIDGE_URL="${BRIDGE_URL:-http://127.0.0.1:8300}"
-        ;;
-    "")
-        # Empty provider → mock mode; bridge URL doesn't matter, but
-        # don't fall through into the error branch.
-        BRIDGE_URL="${BRIDGE_URL:-http://127.0.0.1:8100}"
-        ;;
-    *)
-        echo "ERROR: Unknown ASSISTANT_PROVIDER='${ASSISTANT_PROVIDER}'." >&2
-        echo "       Accepted values: direct | nemoclaw (alias of direct) | openclaw | hermes (Phase 4) | '' (mock)." >&2
-        echo "       See LANE_REGISTRY in manyforge_composer/backend/assistant_provider.py." >&2
-        return 1 2>/dev/null || exit 1
-        ;;
-esac
+            ;;
+    esac
+}
+resolve_assistant_bridge_url
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
 
@@ -528,10 +541,7 @@ start_bridge() {
                 echo "       The earlier provider-id gate should have rejected this." >&2
                 return 1
             fi
-            echo "ERROR: hermes lane bridge start is not yet implemented." >&2
-            echo "       Implement start_bridge_hermes() in scripts/lib/assistant.sh per the" >&2
-            echo "       THREE-LANE-MIGRATION-PLAN.md Phase 4 task list before re-enabling." >&2
-            return 1
+            start_bridge_hermes
             ;;
         direct|nemoclaw|"") start_bridge_nemoclaw ;;
         *)
@@ -612,6 +622,75 @@ start_bridge_nemoclaw() {
         return 1
     fi
     pass "Bridge launched at ${BRIDGE_URL} (supervisor reports readiness)"
+}
+
+start_bridge_hermes() {
+    # Phase 4 of THREE-LANE-MIGRATION-PLAN.md. The Hermes lane bridge is a
+    # FastAPI service (NemoClaw-Thor manyforge/lanes/hermes/service.py) that
+    # submits each Composer turn as a Hermes /v1/runs run and observes its
+    # event stream. It runs host-side (like the direct bridge), talking to the
+    # Hermes gateway inside the sandbox at HERMES_BASE_URL. The Hermes SANDBOX
+    # itself (policy + mcp_servers + gateway) is provisioned separately by
+    # scripts/setup-hermes.sh per the Phase 0.5 spike's order-of-ops.
+    step "Starting Hermes assistant bridge (hermes / native /v1/runs lane)"
+    local port=8300
+    if bridge_pid_alive; then
+        pass "Reusing bridge from ${BRIDGE_PID_FILE}"
+        return 0
+    fi
+    # Idempotent adoption of an externally-started hermes bridge (mirrors the
+    # openclaw lane): adopt iff its /healthz self-identifies as provider=hermes.
+    if port_is_listening "${port}"; then
+        local healthz_resp
+        healthz_resp="$(curl -fsS -m 2 "${BRIDGE_URL}/healthz" 2>/dev/null || true)"
+        if [[ "${healthz_resp}" == *'"provider":"hermes"'* ]]; then
+            local adopted_pid
+            adopted_pid="$(ss -tlnp 2>/dev/null | awk -v p=":${port}" '$4 ~ p {print}' \
+                | grep -oE 'pid=[0-9]+' | head -1 | cut -d= -f2)"
+            if [[ -n "${adopted_pid}" ]] && kill -0 "${adopted_pid}" 2>/dev/null; then
+                ensure_log_dir
+                echo "${adopted_pid}" > "${BRIDGE_PID_FILE}"
+                pass "Adopted externally-started hermes bridge at ${BRIDGE_URL} (pid ${adopted_pid})"
+                return 0
+            fi
+        fi
+        fail "Port ${port} is in use by a non-hermes service; refusing to start another bridge."
+        port_listeners "${port}" >&2
+        return 1
+    fi
+    local hermes_root="${NEMOCLAW_THOR}/manyforge"
+    if [[ ! -f "${hermes_root}/lanes/hermes/service.py" ]]; then
+        fail "hermes bridge service not found at: ${hermes_root}/lanes/hermes/service.py"
+        info "Set NEMOCLAW_THOR or fall back to ASSISTANT_PROVIDER=direct."
+        return 1
+    fi
+    # Bridge venv: setup-hermes.sh creates lanes/hermes/.venv with
+    # fastapi+uvicorn+httpx(+prometheus). HERMES_BRIDGE_PYTHON overrides.
+    local python="${HERMES_BRIDGE_PYTHON:-${hermes_root}/lanes/hermes/.venv/bin/python}"
+    [[ -x "${python}" ]] || python="python3"
+    ensure_log_dir
+    (
+        cd "${hermes_root}"
+        env \
+            HERMES_BASE_URL="${HERMES_BASE_URL:-http://127.0.0.1:8642}" \
+            API_SERVER_KEY="${API_SERVER_KEY:-}" \
+            MANYFORGE_MODEL="${MODEL_PROFILE}" \
+            MANYFORGE_PRINCIPAL="${MANYFORGE_PRINCIPAL:-hermes-${OPENCLAW_ASSISTANT_SANDBOX:-hermes-spike}}" \
+            MANYFORGE_HERMES_RUN_TIMEOUT_S="${ASSISTANT_TIMEOUT_S}" \
+            MANYFORGE_HERMES_AUDIT_PATH="${BRIDGE_AUDIT_LOG%/*}/hermes-bridge-audit.jsonl" \
+            setsid "${python}" -m uvicorn lanes.hermes.service:app \
+            --host 127.0.0.1 --port "${port}" \
+            </dev/null >"${BRIDGE_LOG}" 2>&1 &
+        echo $! >"${BRIDGE_PID_FILE}"
+    )
+    sleep "${BRIDGE_LIVENESS_GRACE_S}"
+    if ! bridge_pid_alive; then
+        fail "Hermes bridge exited within ${BRIDGE_LIVENESS_GRACE_S}s; see ${BRIDGE_LOG}"
+        bridge_logs >&2
+        info "Common cause: lanes/hermes/.venv missing fastapi/uvicorn/httpx — run scripts/setup-hermes.sh."
+        return 1
+    fi
+    pass "Hermes bridge launched at ${BRIDGE_URL} (supervisor reports readiness)"
 }
 
 start_bridge_openclaw() {

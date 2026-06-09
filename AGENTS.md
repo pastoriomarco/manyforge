@@ -171,7 +171,7 @@ status. See the script header for env-var overrides
 Production model default (2026-05-08): `cosmos-reason2-8b`. Operator
 runbook for this lane lives in NemoClaw-Thor at
 `manyforge/docs/COMPOSER-ASSISTANT-RUNBOOK.md`; lane-comparison
-benchmark at `manyforge/docs/LANE-COMPARISON-direct-vs-openclaw.md`.
+benchmark at `manyforge/docs/LANE-COMPARISON.md`.
 
 ---
 

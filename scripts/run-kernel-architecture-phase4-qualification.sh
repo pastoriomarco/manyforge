@@ -236,16 +236,16 @@ else
 fi
 
 if [[ "${MANYFORGE_PHASE4_RUN_LIVE_ISAAC:-0}" == "1" ]]; then
-  # The fresh Phase 4-P3 commanded-sim probe is RETIRED: qualify-phase4-p3-
-  # commanded-sim.py drives the deleted ADR-0016 /ws/follow-target streaming
-  # route, so it can no longer produce fresh evidence. Fail closed and direct
+  # The fresh Phase 4-P3 commanded-sim probe is RETIRED: it drove the deleted
+  # ADR-0016 /ws/follow-target streaming route, so it can no longer produce
+  # fresh evidence and the probe script was removed. Fail closed and direct
   # operators to archived P3 evidence. Fresh default Robot Control evidence is
   # Phase 4-P5 candidate preview/approve/revert, NOT P3 streaming evidence.
   live_isaac_status="failed"
   {
     echo "Fresh Phase 4-P3 commanded-sim qualification is retired."
-    echo "qualify-phase4-p3-commanded-sim.py drives the deleted ADR-0016"
-    echo "/ws/follow-target streaming route and cannot generate fresh evidence."
+    echo "It drove the deleted ADR-0016 /ws/follow-target streaming route,"
+    echo "cannot generate fresh evidence, and the probe script was removed."
     echo
     echo "Provide ARCHIVED P3 evidence instead:"
     echo "  MANYFORGE_PHASE4_LIVE_ISAAC_EVIDENCE_JSON=<archived-summary.json>"

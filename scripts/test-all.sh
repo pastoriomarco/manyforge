@@ -19,9 +19,41 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m'
 
-FILTER="${1:-all}"
+FORCE=0
+FILTER=""
+for _arg in "$@"; do
+    case "${_arg}" in
+        --force|-f) FORCE=1 ;;
+        --) ;;
+        -*) echo "test-all.sh: unknown option '${_arg}'" >&2; exit 2 ;;
+        *)  FILTER="${_arg}" ;;
+    esac
+done
+FILTER="${FILTER:-all}"
 PASS=0
 FAIL=0
+
+# ── Re-test gate ─────────────────────────────────────────────────────────────
+# Tests run at build time; the code is identical until the next rebuild, so a
+# re-run against the same workspace HEAD is redundant. Record the commit of the
+# last fully-passing run of this filter and skip an identical re-run. --force
+# overrides. MANYFORGE_GIT_COMMIT may be pre-set (e.g. by the build) so the gate
+# also works when the container workspace is not git-aware.
+CURRENT_COMMIT="$(git -c safe.directory='*' -C "${WORKSPACE}" rev-parse HEAD 2>/dev/null || true)"
+export MANYFORGE_GIT_COMMIT="${MANYFORGE_GIT_COMMIT:-${CURRENT_COMMIT}}"
+REF_COMMIT="${MANYFORGE_GIT_COMMIT}"
+TEST_STAMP="${MANYFORGE_TEST_STAMP:-${WORKSPACE}/.manyforge-tested-${FILTER}.commit}"
+
+if (( FORCE == 0 )) && [[ -n "${REF_COMMIT}" && -f "${TEST_STAMP}" \
+      && "$(cat "${TEST_STAMP}" 2>/dev/null)" == "${REF_COMMIT}" ]]; then
+    echo -e "${GREEN}=== test-all (${FILTER}) ===${NC}"
+    echo "  Workspace HEAD ${REF_COMMIT:0:12} already passed the '${FILTER}' suite;"
+    echo "  code unchanged since (not rebuilt) — skipping re-test. Use --force to run anyway."
+    exit 0
+fi
+if [[ -z "${REF_COMMIT}" ]]; then
+    echo -e "${YELLOW}  (workspace not git-aware and MANYFORGE_GIT_COMMIT unset — running unconditionally; no stamp written)${NC}"
+fi
 
 section() { echo -e "\n${GREEN}=== $1 ===${NC}"; }
 skip()    { echo -e "${YELLOW}  SKIP: $1${NC}"; }
@@ -389,6 +421,13 @@ esac
 echo ""
 if [ "$FAIL" -eq 0 ]; then
     echo -e "${GREEN}All $PASS test suite(s) passed.${NC}"
+    # Record this commit so an identical re-run (same code, not rebuilt) is
+    # skipped by the gate above. Only stamp on a clean pass and a known commit.
+    if [[ -n "${REF_COMMIT}" ]]; then
+        if echo "${REF_COMMIT}" > "${TEST_STAMP}" 2>/dev/null; then
+            echo "  Recorded '${FILTER}' pass at ${REF_COMMIT:0:12} → re-test skipped until code changes (--force overrides)."
+        fi
+    fi
 else
     echo -e "${RED}$FAIL test suite(s) FAILED${NC} ($PASS passed)"
     exit 1

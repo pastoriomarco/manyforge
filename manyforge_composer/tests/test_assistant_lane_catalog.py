@@ -19,6 +19,7 @@ import pytest
 
 from manyforge_composer.backend.assistant_provider import (
     DeterministicSceneAuthoringProvider,
+    HermesAssistantProvider,
     LANE_ID_ALIASES,
     LANE_REGISTRY,
     NemoClawAssistantProvider,
@@ -26,6 +27,7 @@ from manyforge_composer.backend.assistant_provider import (
     _LANE_ROUTINGS,
     _LANE_RUNTIMES,
     assistant_provider_catalog,
+    build_assistant_provider,
 )
 
 
@@ -199,6 +201,18 @@ def test_catalog_openclaw_row_configured_for_canonical_id() -> None:
     assert rows["direct"]["configured"] is False
 
 
-def test_catalog_hermes_row_marked_inert_until_phase_4() -> None:
+def test_catalog_hermes_row_active_after_phase_4() -> None:
+    # Phase 4 landed: the Hermes lane is no longer inert. The row sources
+    # ``inert`` from LANE_REGISTRY so it tracks activation state.
     rows = _catalog_by_id(None)
-    assert rows["hermes"].get("inert") is True
+    assert rows["hermes"].get("inert") is False
+    assert LANE_REGISTRY["hermes"]["inert"] is False
+
+
+def test_build_assistant_provider_routes_hermes_after_phase_4() -> None:
+    # No longer raises "inert"; returns the Hermes provider speaking the same
+    # envelope, with the hermes provider_id preserved for audit.
+    provider = build_assistant_provider("hermes", endpoint_url="http://127.0.0.1:8300/v1/manyforge/assistant")
+    assert isinstance(provider, HermesAssistantProvider)
+    assert isinstance(provider, NemoClawAssistantProvider)  # shares the transport
+    assert provider.provider_id == "hermes"

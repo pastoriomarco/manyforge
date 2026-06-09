@@ -16,3 +16,6 @@ dist.*-old/
 .tsbuildinfo/
 .vite-temp/
 .vite/
+
+# test-all.sh re-test gate stamp (records last fully-passing commit per filter)
+.manyforge-tested-*.commit

@@ -14,13 +14,12 @@ interface StatusStore {
 /**
  * Shared status store backed by a single poll loop. Replaces the
  * per-component setInterval timers that previously ran in
- * ViserPanel and RuntimeStatusOverlay (and the duplicate runtime
- * fetch in ViserPanel). One subscriber-counted tick fires per
- * 2 seconds while the document is visible, dropping to 30 seconds
- * while hidden via the Page Visibility API.
+ * the viewer panel and RuntimeStatusOverlay. One subscriber-counted
+ * tick fires per 2 seconds while the document is visible, dropping
+ * to 30 seconds while hidden via the Page Visibility API.
  *
  * Why visibility-only (not window.focus / blur): when an operator
- * pulls focus to another window but Composer + Viser remain in
+ * pulls focus to another window but Composer remains in
  * view, we want the status panels to keep updating smoothly. The
  * browser already throttles setInterval to ~1 Hz when the tab is
  * hidden; we go further (30 s) because runtime status changes are

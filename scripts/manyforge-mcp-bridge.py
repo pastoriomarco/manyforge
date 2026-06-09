@@ -369,6 +369,27 @@ def _log_tool_event(
         pass
 
 
+# 2026-06-08: catalog_read loop-breaker. gemma-class models can fall into a tight
+# loop calling `catalog_read` over and over instead of acting on the first result.
+# No infra guard catches it — each read is a fast, successful, in-budget call (case
+# budget, turn backstop, stale/orphan, and the MCP breaker all key on slowness /
+# orphaning / FAILURES, none of which a quick successful re-read trips), so the run
+# just burns turns and never acts. We break it at the dispatch layer: on the 2nd+
+# CONSECUTIVE `catalog_read` within a burst, short-circuit with a nudge to use the
+# catalog already in context. A >30s gap (a new case/turn is ~a minute apart; an
+# intra-turn loop is seconds apart) and ANY other tool call both reset the streak,
+# so we never false-trip across cases or after real progress.
+#
+# Deliberately scoped to `catalog_read` ONLY — not other reads and not mutations.
+# A bulked request ("add several objects", multi-node authoring) legitimately fires
+# the same mutation tool back-to-back, and state reads (program_read/scene_inspect)
+# can legitimately recur between edits; catalog_read is reference data that does not
+# change within a turn, so a consecutive re-read is always pure waste.
+_LOOP_GUARDED_TOOLS = frozenset({"catalog_read"})
+_CONSEC_READ_GAP_S = 30.0
+_consec_read: dict[str, Any] = {"tool": None, "ts": 0.0, "n": 0}
+
+
 def _handle_tools_call(message: dict[str, Any]) -> dict[str, Any]:
     params = message.get("params") or {}
     raw_tool_id = params.get("name")
@@ -401,6 +422,83 @@ def _handle_tools_call(message: dict[str, Any]) -> dict[str, Any]:
             },
         }
     tool_id = canonical_tool_id
+
+    # catalog_read loop-breaker (see _LOOP_GUARDED_TOOLS note above). Scoped to
+    # catalog_read only; ANY other tool call resets the streak (real progress).
+    _now = time.time()
+    if tool_id in _LOOP_GUARDED_TOOLS:
+        if _consec_read["tool"] == tool_id and (_now - _consec_read["ts"]) <= _CONSEC_READ_GAP_S:
+            _consec_read["n"] += 1
+        else:
+            _consec_read["tool"] = tool_id
+            _consec_read["n"] = 1
+        _consec_read["ts"] = _now
+        if _consec_read["n"] >= 2:
+            loop_text = json.dumps({
+                "success": False,
+                "error": "redundant_catalog_read",
+                "tool": tool_id,
+                "hint": (
+                    "You already called `catalog_read` on the previous turn; the catalog "
+                    "(node kinds + parameters) is in the conversation above and does not "
+                    "change within a turn. Re-reading makes no progress. Use that catalog "
+                    "NOW: call the appropriate draft/mutation tool to act, or emit your "
+                    "final answer. Do not call `catalog_read` again this turn."
+                ),
+            }, sort_keys=False)
+            _log_tool_event(tool_id=tool_id,
+                            request_id=f"{LANE}-loopbreak-{int(_now * 1000)}",
+                            success=False, user_args=arguments)
+            return {
+                "jsonrpc": "2.0",
+                "id": message.get("id"),
+                "result": {"content": [{"type": "text", "text": loop_text}], "isError": True},
+            }
+    else:
+        _consec_read["tool"] = None
+        _consec_read["n"] = 0
+
+    # 2026-06-08: serve catalog_read LOCALLY from the manifest the bridge already
+    # holds (fetched once via GET /api/assistant/modes, which is NOT a counted
+    # bridge-tool dispatch), so catalog_read never POSTs to Composer's
+    # /api/assistant/bridge/tools and therefore never registers as an "observed
+    # tool call" in the corpus scorer. Why this matters: the native lane has no
+    # gateway-internal discovery, so the model reads the catalog via catalog_read
+    # (a read, not an action) — but as a Composer dispatch it was being counted,
+    # unfairly failing "expected NO tool calls" cases that OpenClaw (gateway-internal
+    # tool_search/describe, uncounted) and Direct (inline catalog, no read) pass.
+    # The mode manifest's nodeCatalog carries the full mode-visible kinds + their
+    # parameters (verified: covers repeat/command_gripper/wait_for_signal_bool/the
+    # collision family, etc.), so the model still gets everything it needs — just
+    # without a counted round-trip, and faster. Read-only; never mutates state.
+    if tool_id == "catalog_read":
+        _entries = [e for e in (manifest.get("nodeCatalog") or []) if isinstance(e, dict)]
+        _ids = arguments.get("entryIds") if isinstance(arguments.get("entryIds"), list) else None
+        _kind = arguments.get("kind") if isinstance(arguments.get("kind"), str) else None
+        _cat = arguments.get("category") if isinstance(arguments.get("category"), str) else None
+        if _ids:
+            _entries = [e for e in _entries if e.get("id") in _ids]
+        elif _kind:
+            _entries = [e for e in _entries if e.get("id") == _kind or e.get("kind") == _kind]
+        elif _cat:
+            _entries = [e for e in _entries if e.get("category") == _cat]
+        if arguments.get("includeParameters") is False:
+            _entries = [{k: v for k, v in e.items() if k != "parameters"} for e in _entries]
+        _local = {
+            "success": True,
+            "result": {"entries": _entries, "servedBy": "mcp-bridge-local",
+                       "catalogHash": manifest.get("catalogHash")},
+            "warnings": [], "error": None, "draftMutated": False,
+            "requestId": f"{LANE}-localcat-{int(_now * 1000)}",
+        }
+        _log_tool_event(tool_id=tool_id, request_id=_local["requestId"],
+                        success=True, user_args=arguments)
+        return {
+            "jsonrpc": "2.0",
+            "id": message.get("id"),
+            "result": {"content": [{"type": "text", "text": json.dumps(_local, sort_keys=False)}],
+                       "isError": False},
+        }
 
     # 2026-05-06: pre-validate required parameters before forwarding to
     # the bridge. Tracked down via OpenClaw transcript inspection: when

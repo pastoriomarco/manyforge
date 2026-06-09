@@ -29,6 +29,14 @@ branch/commit workflow).
     model/profile smoke checks, and the chat-required-fields gotcha that
     silently falls back to the mock provider.
 
+- [`operations/LANE_BRINGUP.md`](operations/LANE_BRINGUP.md)
+  - Per-lane bring-up, operate, and live-monitor for all three assistant
+    lanes (direct `:8100` / openclaw `:8200` / hermes `:8300`): start
+    commands, health checks, teardown. Lane **dev/analysis deep-dives**
+    (architecture, benchmarks, scorer-strictness analysis) live in the
+    sibling `NemoClaw-Thor` repo — start at its `INDEX.md` →
+    "The three assistant lanes".
+
 - [`operations/ISAAC_SCENE_AUTHORING.md`](operations/ISAAC_SCENE_AUTHORING.md)
   - Operator runbook for exporting Isaac Sim scene meshes and loading
     them through Composer.

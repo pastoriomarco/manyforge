@@ -1591,7 +1591,28 @@ def test_runtime_status_reports_composer_only_before_program_load(client):
     assert data["canPlan"] is False
     assert data["canExecute"] is False
     component_ids = {component["id"] for component in data["components"]}
-    assert {"composer", "program", "hmi", "planner", "execution_backend"} <= component_ids
+    assert {"composer", "program", "native_viewer", "planner", "execution_backend"} <= component_ids
+
+
+def test_runtime_status_treats_native_viewer_as_render_ready_without_hmi(client):
+    """Native viewer render readiness does not require the legacy HMI server."""
+    load_response = client.post(
+        "/api/program/load",
+        json={"path": _PROGRAM_PATH, "deployment_path": _DEPLOYMENT_PATH},
+    )
+    assert load_response.status_code == 200
+
+    response = client.get("/api/runtime/status")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["readiness"] == "ready"
+    assert data["canRender"] is True
+    assert data["canPlan"] is True
+    assert data["canExecute"] is True
+    component_ids = {component["id"] for component in data["components"]}
+    assert "native_viewer" in component_ids
+    assert "legacy_hmi" not in component_ids
 
 
 def test_runtime_status_classifies_unknown_kernel_status_as_fault(client, monkeypatch):
@@ -2303,13 +2324,62 @@ def test_program_load_callback_registers_scene_edit_callback(caplog):
     )
     visual_objects, visual_meta = state.visual_scene_objects_snapshot()
     assert visual_meta["timestamp_ns"] > 0
-    assert [obj.object_id for obj in visual_objects] == ["visual_box"]
-    assert visual_objects[0].attached is False
-    assert visual_objects[0].pose_in_universe["position_m"] == [0.4, 0.5, 0.6]
+    visual_box = next(obj for obj in visual_objects if obj.object_id == "visual_box")
+    assert visual_box.attached is False
+    assert visual_box.pose_in_universe["position_m"] == [0.4, 0.5, 0.6]
 
     state.cycle_manager._on_run_from_idle()
     assert server.scene_renderer.cleared
     assert server.scene_sync_requested > 0
+
+
+def test_program_load_callback_installs_native_visuals_without_legacy_hmi(caplog):
+    """Native visual scene-edit wiring works when Viser is not started."""
+    py_trees.blackboard.Blackboard.clear()
+
+    def forbidden_hmi_factory(**_kwargs):
+        pytest.fail("legacy HMI factory must not be called when hmi_port is None")
+
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=MockKernelClient())
+    state._on_program_loaded = build_program_loaded_callback(
+        host="127.0.0.1",
+        hmi_port=None,
+        urdf_path=None,
+        package_dirs=[],
+        bundle=None,
+        hmi_server_factory=forbidden_hmi_factory,
+    )
+
+    with caplog.at_level(logging.ERROR):
+        state.load_program(_PROGRAM_PATH)
+
+    assert not any("on_program_loaded callback failed" in rec.message for rec in caplog.records)
+    assert state.hmi_server is None
+    assert state.hmi_public_port is None
+    assert state.cycle_manager._on_run_from_idle is not None
+    assert state.cycle_manager._tree is not None
+
+    bb = py_trees.blackboard.Client(name="test_native_scene_edit_callback")
+    bb.register_key(key="scene_edit_callback", access=py_trees.common.Access.READ)
+    assert callable(bb.scene_edit_callback)
+
+    bb.scene_edit_callback(
+        "add",
+        SceneEditRequest(
+            operation="add",
+            object_id="visual_box",
+            shape_type="box",
+            box_dimensions_m=[0.1, 0.1, 0.1],
+            pose_position_m=[0.01, 0.02, 0.03],
+            pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
+            frame_id="universe",
+        ),
+    )
+    visual_objects, visual_meta = state.visual_scene_objects_snapshot()
+    assert visual_meta["timestamp_ns"] > 0
+    visual_box = next(obj for obj in visual_objects if obj.object_id == "visual_box")
+    assert visual_box.attached is False
+    assert visual_box.frame_id == "universe"
 
 
 def test_program_load_callback_applies_simulator_bootstrap_from_deployment(caplog):
@@ -2497,19 +2567,19 @@ def test_debug_collision_compare_positions_endpoint_uses_explicit_positions():
     assert kernel.compared_positions == [0.1, 0.2]
 
 
-def test_scene_snapshot_returns_503_without_hmi():
-    """GET /api/scene/snapshot returns 503 when HMI is not running."""
+def test_scene_snapshot_returns_503_without_snapshot_source():
+    """GET /api/scene/snapshot returns 503 when no viewer snapshot source exists."""
     kernel = MockKernelClient()
     state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
     app = create_app(state)
     with TestClient(app) as client:
         response = client.get("/api/scene/snapshot")
     assert response.status_code == 503
-    assert "HMI server not running" in response.json()["detail"]
+    assert "No native scene snapshot viewer connected" in response.json()["detail"]
 
 
-def test_scene_snapshot_returns_503_without_client():
-    """GET /api/scene/snapshot returns 503 when no Viser client is connected."""
+def test_scene_snapshot_returns_503_when_legacy_hmi_has_no_image():
+    """GET /api/scene/snapshot falls back to legacy HMI only when present."""
     kernel = MockKernelClient()
     state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
 
@@ -2522,7 +2592,7 @@ def test_scene_snapshot_returns_503_without_client():
     with TestClient(app) as client:
         response = client.get("/api/scene/snapshot")
     assert response.status_code == 503
-    assert "No Viser client" in response.json()["detail"]
+    assert "Legacy HMI snapshot source" in response.json()["detail"]
 
 
 def test_scene_snapshot_returns_image():

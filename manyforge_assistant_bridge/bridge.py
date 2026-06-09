@@ -2114,6 +2114,21 @@ async def assistant(request: Request) -> JSONResponse:
                 )
             except httpx.HTTPStatusError as exc:
                 detail = f"upstream HTTP {exc.response.status_code}: {exc.response.text[:300]}"
+                # 2026-06-09: the vllm-proxy returns 409 as its loop hard-stop
+                # ("proxy_loop_hard_stop") when the model repeats a tool past the
+                # stop threshold. That is the SAME condition this bridge detects
+                # internally and surfaces as a 409 `stuck_loop` envelope (see
+                # below). Mapping it to a bare 502 ("bad gateway") mis-attributed
+                # a model-looping case as a transport/infra failure. Surface it as
+                # the loop-stop it is. NOTE: this is attribution only — a case
+                # whose model looped is still a (correct) failure; it does not
+                # change scores. See the archived scorer-strictness note in NemoClaw-Thor (manyforge/docs/archive/THREE-LANE-SCORER-NOTE.md).
+                _is_upstream_loop_stop = exc.response.status_code == 409
+                _exit_code = (
+                    "upstream_loop_stop" if _is_upstream_loop_stop
+                    else "upstream_http_error"
+                )
+                _http_status = 409 if _is_upstream_loop_stop else 502
                 _audit_record(
                     {
                         "ts": time.time(),
@@ -2122,15 +2137,15 @@ async def assistant(request: Request) -> JSONResponse:
                         "catalogHash": catalog_hash,
                         "model": model,
                         "turnCount": turn_index,
-                        "exitReason": "upstream_http_error",
+                        "exitReason": _exit_code,
                         "detail": detail,
                     }
                 )
                 return _envelope_error(
                     request_id=request_id,
-                    code="upstream_http_error",
+                    code=_exit_code,
                     detail=detail,
-                    http_status=502,
+                    http_status=_http_status,
                 )
             except httpx.TimeoutException:
                 raise BridgeTimeout(f"upstream request exceeded {timeout_s:.1f}s") from None

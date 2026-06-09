@@ -1,8 +1,7 @@
-import { Component, useCallback, useMemo, useState } from 'react';
+import { Component, useCallback, useState } from 'react';
 import type { ErrorInfo, PointerEvent as ReactPointerEvent, ReactNode } from 'react';
 import { TreeCanvas } from './TreeCanvas';
 import { PropertyPanel } from './PropertyPanel';
-import { ViserPanel } from './ViserPanel';
 import { SceneViewerPanel } from './SceneViewer';
 import { CollapsedRail } from './CollapsedRail';
 import { useProgramStore } from '../store/programStore';
@@ -45,7 +44,7 @@ class ViewerErrorBoundary extends Component<
   }
 }
 
-function ViewerCrashFallback({ viewerKind }: { viewerKind: 'viser' | 'native' }) {
+function ViewerCrashFallback() {
   return (
     <div className="flex h-full w-full flex-col overflow-hidden bg-gray-900">
       <div className="flex h-10 items-center border-b border-gray-700 bg-gray-800 px-3">
@@ -56,14 +55,12 @@ function ViewerCrashFallback({ viewerKind }: { viewerKind: 'viser' | 'native' })
       <div className="flex flex-1 items-center justify-center p-6 text-center">
         <div className="max-w-sm rounded-lg border border-orange-700 bg-gray-900/95 p-4 shadow-xl">
           <div className="mb-2 text-sm font-semibold text-orange-300">
-            {viewerKind === 'native' ? 'Native viewer crashed' : 'Viser viewer crashed'}
+            Native viewer crashed
           </div>
           <p className="text-sm text-gray-300">
             The 3D viewer panel hit a runtime error and was isolated.
             Composer is still usable; the underlying program and runtime are unaffected.
-            {viewerKind === 'native'
-              ? ' Try reloading without ?viewer=native to fall back to the legacy Viser iframe.'
-              : ' Try reloading or use ?viewer=native to switch viewers.'}
+            Try reloading the page to recreate the WebGL context.
           </p>
           <p className="mt-2 text-xs text-gray-500">
             See browser devtools console for the full stack trace.
@@ -74,21 +71,10 @@ function ViewerCrashFallback({ viewerKind }: { viewerKind: 'viser' | 'native' })
   );
 }
 
-// Day 6A native-default cutover (2026-06-06): the native in-React-tree R3F
-// viewer is the DEFAULT. `?viewer=viser` is an explicit, temporary
-// compatibility fallback to the legacy Viser iframe for the Day 6A acceptance
-// window — not a default product path. Day 6B removes the flag and deletes
-// `manyforge_hmi/` once acceptance evidence confirms native owns the full
-// operator + assistant-visible surface. See
+// Native-only cutover: the in-React-tree R3F viewer owns the active viewport.
+// The legacy Viser panel remains dormant in the repository until the deletion
+// gate in the migration plan is approved. See
 // `manyforge_specs/docs/implementation/composer-native-3d-visualizer-migration.md`.
-function readViewerFlag(): 'viser' | 'native' {
-  if (typeof window === 'undefined') {
-    return 'native';
-  }
-  const params = new URLSearchParams(window.location.search);
-  return params.get('viewer') === 'viser' ? 'viser' : 'native';
-}
-
 const MIN_VISER_WIDTH = 480;
 const MAX_VISER_WIDTH = 960;
 const MIN_PROPERTIES_WIDTH = 260;
@@ -108,7 +94,6 @@ export function Viewport() {
   const [viserCollapsed, setViserCollapsed] = useState(false);
   const [propertyCollapsed, setPropertyCollapsed] = useState(false);
   const [activeResize, setActiveResize] = useState<'properties' | 'viser' | null>(null);
-  const viewerKind = useMemo(() => readViewerFlag(), []);
 
   const flowToTree = useProgramStore((state) => state.flowToTree);
   const appliedTree = useProgramStore((state) => state.appliedTree);
@@ -187,7 +172,7 @@ export function Viewport() {
 
       {viserCollapsed ? (
         <CollapsedRail
-          label={viewerKind === 'native' ? 'Viewer' : 'Viser'}
+          label="Viewer"
           side="right"
           onExpand={() => setViserCollapsed(false)}
         />
@@ -200,26 +185,18 @@ export function Viewport() {
               )
             }
             className="w-3 shrink-0 touch-none cursor-col-resize bg-gray-800/40 transition-colors hover:bg-blue-500/60"
-            title={viewerKind === 'native' ? 'Resize viewer panel' : 'Resize Viser panel'}
+            title="Resize viewer panel"
           />
           <div
             className="relative shrink-0 overflow-hidden border-l border-gray-700"
             style={{ width: viserWidth }}
           >
-            <ViewerErrorBoundary fallback={<ViewerCrashFallback viewerKind={viewerKind} />}>
-              {viewerKind === 'native' ? (
-                <SceneViewerPanel
-                  onCollapse={() => setViserCollapsed(true)}
-                  blocked={hasUnappliedChanges}
-                  resizing={activeResize === 'viser'}
-                />
-              ) : (
-                <ViserPanel
-                  onCollapse={() => setViserCollapsed(true)}
-                  blocked={hasUnappliedChanges}
-                  resizing={activeResize === 'viser'}
-                />
-              )}
+            <ViewerErrorBoundary fallback={<ViewerCrashFallback />}>
+              <SceneViewerPanel
+                onCollapse={() => setViserCollapsed(true)}
+                blocked={hasUnappliedChanges}
+                resizing={activeResize === 'viser'}
+              />
             </ViewerErrorBoundary>
           </div>
         </>

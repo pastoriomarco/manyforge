@@ -8,6 +8,11 @@ import time
 from pathlib import Path
 from typing import Any
 
+# Canonical quaternion->Euler converter (the same one the scene-state
+# augmentation and the selection node use) so a pose supplied as
+# orientation_xyzw is accepted without the caller having to pre-convert.
+from manyforge_behavior.nodes.selection import _xyzw_to_rpy_deg
+
 
 class AssistantToolError(RuntimeError):
     """Raised when an assistant tool cannot complete safely."""
@@ -515,7 +520,16 @@ def _validated_pose(value: Any) -> dict[str, Any]:
         raise AssistantToolError("recommended pose must be an object")
     frame_id = _required_string(value, "frame_id")
     position = _finite_number_list(value.get("position_m"), 3, "position_m")
-    rpy = _finite_number_list(value.get("orientation_rpy_deg"), 3, "orientation_rpy_deg")
+    # Accept orientation as Euler degrees (orientation_rpy_deg) OR quaternion
+    # (orientation_xyzw — the representation scene state reports). If only the
+    # quaternion is given, convert it so downstream stays canonical rpy_deg.
+    # This lets a model copy the scene's orientation_xyzw verbatim instead of
+    # doing the error-prone quaternion->Euler conversion itself.
+    if value.get("orientation_rpy_deg") is None and value.get("orientation_xyzw") is not None:
+        quat = _finite_number_list(value.get("orientation_xyzw"), 4, "orientation_xyzw")
+        rpy = [float(v) for v in _xyzw_to_rpy_deg(quat)]
+    else:
+        rpy = _finite_number_list(value.get("orientation_rpy_deg"), 3, "orientation_rpy_deg")
     return {
         "frame_id": frame_id,
         "position_m": position,

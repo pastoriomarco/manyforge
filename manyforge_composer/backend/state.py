@@ -2632,7 +2632,7 @@ class ComposerState:
         if not defer_initial_runtime_reset:
             self.reset_backend_authoritative_sim_if_needed(reason="program_load")
 
-        # Notify listeners (e.g. Viser HMI)
+        # Notify runtime visual listeners and optional legacy HMI.
         if self._on_program_loaded:
             try:
                 self._on_program_loaded(self)

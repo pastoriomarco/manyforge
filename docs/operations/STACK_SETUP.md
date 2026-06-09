@@ -178,7 +178,7 @@ side. Switching between them is a single env var on
 `scripts/demo-assistant-known-good.sh`. The lane-comparison data that
 justified the default flip (`nemoclaw` → `openclaw` on 2026-05-07)
 and the §10 ablation that validated 9/9 reliability live in
-[`LANE-COMPARISON-direct-vs-openclaw.md`](https://github.com/pastoriomarco/NemoClaw-Thor/blob/main/manyforge/docs/LANE-COMPARISON-direct-vs-openclaw.md)
+[`LANE-COMPARISON-direct-vs-openclaw.md`](https://github.com/pastoriomarco/NemoClaw-Thor/blob/main/manyforge/docs/archive/LANE-COMPARISON-direct-vs-openclaw.md)
 in NemoClaw-Thor.
 
 Setup recipe:

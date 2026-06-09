@@ -1136,12 +1136,12 @@ class TestRuntimeOverrideRevisionBinding:
 
 class TestSceneSnapshot:
 
-    def test_no_hmi_server(self):
+    def test_no_snapshot_source(self):
         state = _make_state()
         mcp = create_mcp_server(state)
         result = _call(mcp, "manyforge_scene_snapshot")
         assert "error" in result
-        assert "HMI" in result["error"]
+        assert "No native scene snapshot viewer connected" in result["error"]
 
     def test_invalid_format(self):
         state = _make_state()

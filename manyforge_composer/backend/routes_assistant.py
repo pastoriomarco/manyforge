@@ -69,7 +69,11 @@ from .models import (
     ProgramParameterResponse,
     TreeNodeResponse,
 )
-from .routes_scene import build_scene_state_payload, canonical_scene_world_frame
+from .routes_scene import (
+    augment_pose_orientation_rpy_deg,
+    build_scene_state_payload,
+    canonical_scene_world_frame,
+)
 from .state import ComposerState
 
 
@@ -1392,6 +1396,15 @@ def _provider_error_status_code(exc: AssistantProviderError) -> int:
         return 200
     if exc.code == "timeout":
         return 504
+    # 2026-06-09: model-behaviour loop/turn exits are NOT transport failures.
+    # The bridge surfaces them with these structured codes (a 409 loop-stop or
+    # a turn-budget exit); collapsing them to 502 ("bad gateway") mis-attributed
+    # genuine model looping/over-turn behaviour as an infra/transport fault in
+    # the harness. Surface as 409 so it reads as a model-side stop, not a
+    # gateway failure. (Reporting/attribution only — these cases still fail.)
+    # See the archived scorer-strictness note in NemoClaw-Thor (manyforge/docs/archive/THREE-LANE-SCORER-NOTE.md).
+    if exc.code in ("upstream_loop_stop", "stuck_loop", "max_turns_exceeded"):
+        return 409
     return 502
 
 
@@ -1528,7 +1541,7 @@ async def _execute_bridge_read_only_tool(
         }
 
     if tool_id == "scene_inspect":
-        return build_scene_state_payload(state)
+        return augment_pose_orientation_rpy_deg(build_scene_state_payload(state))
 
     if tool_id == "inspect_isaac_scene":
         request = AssistantInspectIsaacSceneRequest.model_validate(arguments or {})
@@ -3426,7 +3439,21 @@ def _apply_tree_draft_update_node_params(
             },
         )
     target = target_ref[0]
-    target["params"] = {**dict(target.get("params") or {}), **params} if merge else dict(params)
+    if merge:
+        old_params = dict(target.get("params") or {})
+        merged = {**old_params, **params}
+        # Deep-merge the nested `pose` so a partial pose update (e.g. orientation
+        # only) preserves the previously-stored position_m / frame_id. A shallow
+        # param-merge replaces the whole pose dict, which silently dropped
+        # position when a model set orientation alone (see the orientation/
+        # position investigation).
+        old_pose = old_params.get("pose")
+        new_pose = params.get("pose")
+        if isinstance(old_pose, dict) and isinstance(new_pose, dict):
+            merged["pose"] = {**old_pose, **new_pose}
+        target["params"] = merged
+    else:
+        target["params"] = dict(params)
     _apply_program_draft_data(
         state,
         program_data=program_data,
@@ -4363,7 +4390,9 @@ def _assistant_provider_context(
             }
         _scene_snapshot: dict[str, Any] | None = None
         try:
-            _scene_snapshot = build_scene_state_payload(state)
+            _scene_snapshot = augment_pose_orientation_rpy_deg(
+                build_scene_state_payload(state)
+            )
         except Exception:  # noqa: BLE001 — fall back gracefully
             _scene_snapshot = None
         return AssistantProviderContext(

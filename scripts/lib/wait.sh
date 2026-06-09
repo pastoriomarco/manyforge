@@ -91,7 +91,7 @@ wait_with_progress() {
     local start=$SECONDS
     local deadline=$((start + timeout_s))
     local next_log_at=0
-    local elapsed rendered_lines=0
+    local elapsed progress_line_drawn=0
     # Capture the most recent probe stdout/stderr so the timeout dump can
     # surface what the probe actually said (HTTP body, ros2 error, etc.).
     # Each poll overwrites the file; on success we delete it; on timeout
@@ -99,77 +99,59 @@ wait_with_progress() {
     local probe_output_file
     probe_output_file="$(mktemp -t manyforge-wait-probe-XXXXXX)"
 
+    # Static header — printed ONCE. The label and hint do not change while
+    # waiting, so re-printing them every tick is pure noise. Progress below
+    # updates a single line in place (TTY) or a sparse heartbeat (non-TTY).
+    printf '%s\n' "${label}" >&2
+    if [[ -n "${hint}" ]]; then
+        printf '  %s\n' "${hint}" >&2
+    fi
+
+    # _wait_render — update the live progress indicator.
+    #
+    # TTY: a single carriage-return line ("\r" + erase-to-EOL), so it
+    # overwrites itself in place rather than scrolling. Avoids the old
+    # multi-line cursor-up redraw, which corrupted (and visibly spammed) on
+    # terminals where a wrapped hint line threw off the line count.
+    #
+    # Non-TTY (or MANYFORGE_PROGRESS_MODE=plain): a one-line heartbeat every
+    # 30 s so CI logs show liveness without flooding.
     _wait_render() {
         local current_elapsed="$1"
-        local line
-        local log_lines=()
+        local snippet=""
         if [[ -n "${log_fn}" ]]; then
-            while IFS= read -r line; do
-                log_lines+=("${line}")
-            done < <("${log_fn}" 2>&1 | tail -n 3 || true)
+            snippet="$("${log_fn}" 2>&1 | tail -n 1 || true)"
         fi
 
         if _wait_progress_is_tty; then
-            if (( rendered_lines > 0 )); then
-                printf '\033[%sA\033[J' "${rendered_lines}" >&2
+            printf '\r\033[K  elapsed %ds (timeout %ds)' "${current_elapsed}" "${timeout_s}" >&2
+            if [[ -n "${snippet}" ]]; then
+                printf ' — ' >&2
+                print_truncated "${snippet}" >&2
             fi
-            rendered_lines=0
-            printf '%s\n' "${label}" >&2
-            rendered_lines=$((rendered_lines + 1))
-            if [[ -n "${hint}" ]]; then
-                printf '  %s\n' "${hint}" >&2
-                rendered_lines=$((rendered_lines + 1))
-            fi
-            printf '  elapsed %ds (timeout %ds)\n' "${current_elapsed}" "${timeout_s}" >&2
-            rendered_lines=$((rendered_lines + 1))
-            if [[ -n "${log_fn}" ]]; then
-                printf '  recent log:\n' >&2
-                rendered_lines=$((rendered_lines + 1))
-                if (( ${#log_lines[@]} == 0 )); then
-                    printf '    (no logs yet)\n' >&2
-                    rendered_lines=$((rendered_lines + 1))
-                else
-                    for line in "${log_lines[@]}"; do
-                        printf '    ' >&2
-                        print_truncated "${line}" >&2
-                        printf '\n' >&2
-                        rendered_lines=$((rendered_lines + 1))
-                    done
-                fi
-            fi
+            progress_line_drawn=1
             return
         fi
 
-        # Non-TTY (or MANYFORGE_PROGRESS_MODE=plain): reprint the whole
-        # block every 30 s. The first call always prints.
         if (( current_elapsed < next_log_at )); then
             return
         fi
-        printf '%s\n' "${label}" >&2
-        if [[ -n "${hint}" ]]; then
-            printf '  %s\n' "${hint}" >&2
-        fi
-        printf '  elapsed %ds (timeout %ds)\n' "${current_elapsed}" "${timeout_s}" >&2
-        if [[ -n "${log_fn}" ]]; then
-            printf '  recent log:\n' >&2
-            if (( ${#log_lines[@]} == 0 )); then
-                printf '    (no logs yet)\n' >&2
-            else
-                for line in "${log_lines[@]}"; do
-                    printf '    ' >&2
-                    print_truncated "${line}" >&2
-                    printf '\n' >&2
-                done
-            fi
-        fi
+        printf '  …still waiting (%ds elapsed, timeout %ds)\n' "${current_elapsed}" "${timeout_s}" >&2
         next_log_at=$((current_elapsed + 30))
+    }
+
+    # _wait_end_progress_line — terminate the in-place TTY line cleanly
+    # before printing a final pass/fail/dump on its own line.
+    _wait_end_progress_line() {
+        if _wait_progress_is_tty && (( progress_line_drawn > 0 )); then
+            printf '\r\033[K' >&2
+            progress_line_drawn=0
+        fi
     }
 
     _wait_dump_failure() {
         # Final state dump on timeout. Always to stderr.
-        if _wait_progress_is_tty && (( rendered_lines > 0 )); then
-            printf '\033[%sA\033[J' "${rendered_lines}" >&2
-        fi
+        _wait_end_progress_line
         elapsed=$((SECONDS - start))
         fail "${label} — timed out after ${elapsed}s (limit ${timeout_s}s)"
         if [[ -n "${hint}" ]]; then
@@ -210,9 +192,7 @@ wait_with_progress() {
 
     elapsed=$((SECONDS - start))
     rm -f "${probe_output_file}"
-    if _wait_progress_is_tty && (( rendered_lines > 0 )); then
-        printf '\033[%sA\033[J' "${rendered_lines}" >&2
-    fi
+    _wait_end_progress_line
     pass "${label} — ready after ${elapsed}s"
     return 0
 }

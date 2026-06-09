@@ -87,16 +87,29 @@ def build_infra_status_payload(state: ComposerState) -> dict[str, Any]:
         "status": "enabled" if hasattr(state, "_mcp_http_enabled") else "unknown",
     }
 
-    # HMI / Viser
+    visual_state, visual_meta = state.visual_state_snapshot()
+    visual_meta = visual_meta or {}
+    broker = getattr(state, "snapshot_broker", None)
+    broker_has_clients = False
+    if broker is not None:
+        try:
+            broker_has_clients = bool(broker.has_clients())
+        except Exception:
+            broker_has_clients = False
+    components["native_viewer"] = {
+        "status": "healthy" if state.program is not None and state.kernel is not None else "waiting",
+        "visual_state_cached": visual_state is not None,
+        "visual_state_publisher_running": bool(visual_meta.get("publisher_running", False)),
+        "visual_state_sequence_number": visual_meta.get("sequence_number"),
+        "snapshot_bridge_ready": broker is not None,
+        "snapshot_bridge_client_connected": broker_has_clients,
+    }
+
+    # Legacy HMI / Viser is dormant unless explicitly enabled.
     if state.hmi_server is not None:
-        components["hmi"] = {
+        components["legacy_hmi"] = {
             "status": "healthy",
             "port": state.hmi_public_port,
-        }
-    else:
-        components["hmi"] = {
-            "status": "unavailable",
-            "port": None,
         }
 
     # Deployment

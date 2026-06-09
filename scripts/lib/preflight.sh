@@ -99,11 +99,18 @@ expected_port_owner() {
     local container_name="${COMPOSER_CONTAINER:-manyforge-e2e-composer}"
     local composer_port="${COMPOSER_PORT:-9000}"
     local hmi_port="${HMI_PORT:-8081}"
+    local legacy_hmi_raw="${MANYFORGE_ENABLE_LEGACY_VISER_HMI:-${ENABLE_LEGACY_VISER_HMI:-false}}"
+    local legacy_hmi_enabled=false
+    case "${legacy_hmi_raw,,}" in
+        1|true|yes|on) legacy_hmi_enabled=true ;;
+    esac
 
     # Composer / HMI port match (env-overridable). Match against the
     # resolved values, then fall through to the rest of the case for
     # static-port owners (8000, 8050, 8100, 8200).
-    if [[ "${port}" == "${composer_port}" || "${port}" == "${hmi_port}" ]]; then
+    if [[ "${port}" == "${composer_port}" ]] || {
+        [[ "${legacy_hmi_enabled}" == "true" ]] && [[ "${port}" == "${hmi_port}" ]]
+    }; then
         case "${LANE:-}" in
             manyforge-only)
                 container_running "${container_name}"

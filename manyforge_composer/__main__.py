@@ -145,18 +145,21 @@ def _resolved_hmi_robot_paths(
 def build_program_loaded_callback(
     *,
     host: str,
-    hmi_port: int,
+    hmi_port: int | None,
     urdf_path: str | None,
     package_dirs: list[str],
     bundle,
     hmi_server_factory=None,
 ):
-    """Build the Composer program-load callback that wires Viser HMI state.
+    """Build the Composer program-load callback for runtime visual state.
 
-    Extracted for testability so backend tests can validate the callback
-    without spawning uvicorn or a real Viser server.
+    The native viewer path is always active: behavior-tree scene mutations
+    update ComposerState's visual object cache directly so attach/detach
+    effects are visible without a Viser process.  The legacy Viser server is
+    started only when ``hmi_port`` is provided, keeping the fallback dormant by
+    default.
     """
-    if hmi_server_factory is None:
+    if hmi_port is not None and hmi_server_factory is None:
         from manyforge_hmi.server import ViserHmiServer
         hmi_server_factory = ViserHmiServer
 
@@ -171,34 +174,44 @@ def build_program_loaded_callback(
     def on_program_loaded(st: ComposerState):
         nonlocal _hmi_server
 
-        runtime_urdf_path, runtime_package_dirs = _resolved_hmi_robot_paths(
-            st.deployment,
-            default_urdf_path=urdf_path,
-            default_package_dirs=package_dirs,
-        )
+        runtime_urdf_path = urdf_path
+        runtime_package_dirs = package_dirs
+        if hmi_port is not None:
+            runtime_urdf_path, runtime_package_dirs = _resolved_hmi_robot_paths(
+                st.deployment,
+                default_urdf_path=urdf_path,
+                default_package_dirs=package_dirs,
+            )
 
         # Stop previous HMI if reloading a program
         if _hmi_server is not None:
             _hmi_server.stop()
             st.hmi_server = None
+            st.hmi_public_port = None
+            _hmi_server = None
 
-        _hmi_server = hmi_server_factory(
-            cycle_manager=st.cycle_manager,
-            host=host,
-            port=hmi_port,
-            urdf_path=runtime_urdf_path,
-            joint_names=None,
-            package_dirs=runtime_package_dirs or None,
-        )
-        st.hmi_server = _hmi_server
-        st.hmi_public_port = hmi_port
+        if hmi_port is not None and hmi_server_factory is not None:
+            _hmi_server = hmi_server_factory(
+                cycle_manager=st.cycle_manager,
+                host=host,
+                port=hmi_port,
+                urdf_path=runtime_urdf_path,
+                joint_names=None,
+                package_dirs=runtime_package_dirs or None,
+            )
+            st.hmi_server = _hmi_server
+            st.hmi_public_port = hmi_port
         if (
             st.cycle_manager is not None
             and hasattr(st.cycle_manager, "_runner")
-            and _snapshot_provider_for_runtime(_hmi_server) is not None
+            and (
+                st._resolve_scene_snapshot_provider() is not None
+                or _snapshot_provider_for_runtime(_hmi_server) is not None
+            )
         ):
             st.cycle_manager._runner.set_scene_snapshot_provider(
-                _snapshot_provider_for_runtime(_hmi_server)
+                st._resolve_scene_snapshot_provider()
+                or _snapshot_provider_for_runtime(_hmi_server)
             )
             st.cycle_manager._runner.set_scene_snapshot_url_publisher(
                 lambda image_bytes, width, height, format, **kwargs: st.publish_scene_snapshot(
@@ -210,7 +223,8 @@ def build_program_loaded_callback(
                     model_base_url=kwargs.get("model_base_url"),
                 )
             )
-        _hmi_server.load_program(st.effective_program or st.program)
+        if _hmi_server is not None:
+            _hmi_server.load_program(st.effective_program or st.program)
 
         def on_scene_edit(operation: str, request):
             visual_request = request
@@ -224,11 +238,12 @@ def build_program_loaded_callback(
                 st.request_visual_scene_objects_refresh(
                     reason=f"scene_edit_callback_{operation}"
                 )
-            _hmi_server.request_scene_sync(
-                reason="scene_edit_callback",
-                operation=operation,
-                object_id=request.object_id,
-            )
+            if _hmi_server is not None and hasattr(_hmi_server, "request_scene_sync"):
+                _hmi_server.request_scene_sync(
+                    reason="scene_edit_callback",
+                    operation=operation,
+                    object_id=request.object_id,
+                )
             logger.debug(
                 "Scene invalidation requested after %s '%s'",
                 operation,
@@ -255,24 +270,31 @@ def build_program_loaded_callback(
             ):
                 _hmi_server.sync_robot_from_backend(force=force_robot)
 
-        # Reset Viser scene on each run from IDLE (e.g. after reset)
-        def _refresh_viser_scene():
-            if _hmi_server and _hmi_server.scene_renderer:
+        def _refresh_runtime_visuals():
+            st.clear_visual_scene_objects_snapshot()
+            st.refresh_visual_scene_objects_sync(reason="run_from_idle")
+            st.request_visual_state_publish(reason="run_from_idle")
+            if _hmi_server and getattr(_hmi_server, "scene_renderer", None):
                 _hmi_server.scene_renderer.clear()
-                _sync_runtime_views(force_robot=True)
+            _sync_runtime_views(force_robot=True)
 
-        st.cycle_manager._on_run_from_idle = _refresh_viser_scene
+        st.cycle_manager._on_run_from_idle = _refresh_runtime_visuals
         st.cycle_manager.reset()
         initial_positions = _get_simulator_initial_joint_positions(st)
         runtime_bundle = getattr(st, "kernel_bundle", None) or bundle
         if runtime_bundle is not None and initial_positions:
             runtime_bundle.set_joint_positions(initial_positions)
             logger.info("Applied simulator-only initial joint positions from deployment")
+        st.refresh_visual_scene_objects_sync(reason="program_loaded")
+        st.request_visual_state_publish(reason="program_loaded")
         _sync_runtime_views(force_robot=True)
 
-        _hmi_server.start()
-        _sync_runtime_views(force_robot=True)
-        logger.info("Viser HMI started on port %d", hmi_port)
+        if _hmi_server is not None:
+            _hmi_server.start()
+            _sync_runtime_views(force_robot=True)
+            logger.info("Legacy Viser HMI started on port %d", hmi_port)
+        else:
+            logger.info("Native visual runtime callbacks installed")
 
     return on_program_loaded
 
@@ -584,7 +606,7 @@ def main():
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=9000)
     parser.add_argument("--hmi-port", type=int, default=None,
-                        help="Enable Viser 3D HMI on this port (e.g. 8081)")
+                        help="Enable the legacy Viser HMI fallback on this port (e.g. 8081)")
     parser.add_argument(
         "--static-dir",
         default=None,
@@ -757,15 +779,13 @@ def main():
     )
     state.public_api_base_url = _default_public_api_base_url(args.host, args.port)
 
-    # Wire up Viser HMI if --hmi-port is set
-    if args.hmi_port is not None:
-        state._on_program_loaded = build_program_loaded_callback(
-            host=args.host,
-            hmi_port=args.hmi_port,
-            urdf_path=urdf_path,
-            package_dirs=package_dirs,
-            bundle=bundle,
-        )
+    state._on_program_loaded = build_program_loaded_callback(
+        host=args.host,
+        hmi_port=args.hmi_port,
+        urdf_path=urdf_path,
+        package_dirs=package_dirs,
+        bundle=bundle,
+    )
 
     if not security.api_token and args.host != "127.0.0.1":
         logger.warning(

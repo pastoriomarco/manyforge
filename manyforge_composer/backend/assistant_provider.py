@@ -748,17 +748,21 @@ LANE_REGISTRY: dict[str, dict[str, Any]] = {
     },
     "hermes": {
         "default_bridge_port": 8300,
-        "transport_class": "HermesAssistantProvider",  # Phase 4
+        "transport_class": "HermesAssistantProvider",  # Phase 4 — landed
         "lane_name": "hermes",
-        "inert": True,
+        # Phase 4 landed: the Hermes bridge (manyforge/lanes/hermes/) implements
+        # the AssistantTransport against Hermes' native /v1/runs API. Activated
+        # at the launcher behind HERMES_LANE_PHASE4_ENABLED (the empirical
+        # bake-off gate is run with that flag set).
+        "inert": False,
         "aliases": (),
         "runtime": "nemoclaw",
         "routing": "hermes-sessions",
         "isolation": "sandbox",
         "description": (
-            "Hermes Agents lane with native mcp_servers + sessions API. "
-            "Runs inside the NemoClaw sandbox. Bridge on :8300. Inert "
-            "until Phase 4."
+            "Hermes Agents lane with native mcp_servers + /v1/runs sessions "
+            "API (memory/skills/cron/todo/delegation enabled). Runs inside the "
+            "NemoClaw sandbox. Bridge on :8300."
         ),
     },
 }
@@ -777,6 +781,37 @@ for _lane_id, _lane_entry in LANE_REGISTRY.items():
 LANE_ID_ALIASES: dict[str, str] = {
     "nemoclaw": "direct",
 }
+
+
+class HermesAssistantProvider(NemoClawAssistantProvider):
+    """Hermes lane provider (Phase 4).
+
+    The Hermes bridge (NemoClaw-Thor ``manyforge/lanes/hermes/``) speaks the
+    same ManyForge provider-request envelope as the Direct/OpenClaw bridges, so
+    the Composer-side HTTP transport is identical — this subclass exists for
+    audit clarity (``provider_id="hermes"``) and a longer default client
+    timeout: the Hermes bridge runs a *full agent loop* (memory/skills/tools)
+    per turn over ``/v1/runs``, not a single round-trip, so the default timeout
+    is higher than the per-turn lanes'. The deployment's
+    ``model_endpoints.<alias>.default_timeout_s`` still overrides when set.
+    """
+
+    def __init__(
+        self,
+        *,
+        endpoint_url: str,
+        provider_id: str = "hermes",
+        timeout_s: float = 600.0,
+        api_token: str | None = None,
+        request_fn: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+    ) -> None:
+        super().__init__(
+            endpoint_url=endpoint_url,
+            provider_id=provider_id,
+            timeout_s=timeout_s,
+            api_token=api_token,
+            request_fn=request_fn,
+        )
 
 
 def build_assistant_provider(
@@ -819,6 +854,16 @@ def build_assistant_provider(
         return NemoClawAssistantProvider(
             endpoint_url=endpoint_url or _assistant_endpoint_from_env(),
             provider_id=normalized,  # preserve original id for audit
+            timeout_s=timeout_s if timeout_s is not None else _assistant_timeout_from_env(),
+            api_token=api_token or os.environ.get("MANYFORGE_ASSISTANT_API_TOKEN"),
+        )
+    if resolved == "hermes":
+        # Hermes lane (bridge on :8300). Same envelope/transport as above;
+        # HermesAssistantProvider just carries the hermes provider_id and a
+        # longer default timeout for Hermes' per-turn agent loop. The endpoint
+        # URL comes from the deployment's model_endpoint (or the env default).
+        return HermesAssistantProvider(
+            endpoint_url=endpoint_url or _assistant_endpoint_from_env(),
             timeout_s=timeout_s if timeout_s is not None else _assistant_timeout_from_env(),
             api_token=api_token or os.environ.get("MANYFORGE_ASSISTANT_API_TOKEN"),
         )
@@ -930,13 +975,17 @@ def assistant_provider_catalog(configured_provider: AssistantProvider | None) ->
             "routing": LANE_REGISTRY["hermes"]["routing"],
             "isolation": LANE_REGISTRY["hermes"]["isolation"],
             "description": LANE_REGISTRY["hermes"]["description"] + (
-                " Will translate to Hermes sessions API with native "
-                "mcp_servers support."
+                " The NemoClaw-Thor lanes/hermes bridge submits each turn as a "
+                "Hermes /v1/runs run and observes its lifecycle event stream; "
+                "Hermes owns the agent loop and fires manyforge MCP tools, which "
+                "ManyForge still enforces via /api/assistant/bridge/tools/{toolId}."
             ),
             "configured": configured_id == "hermes",
             "requiresLiveModel": True,
             "requiresLiveIsaacSim": False,
-            "inert": True,
+            # Sourced from the registry so the row tracks activation state
+            # rather than hardcoding it (flipped to False when Phase 4 landed).
+            "inert": LANE_REGISTRY["hermes"]["inert"],
         },
     ]
 

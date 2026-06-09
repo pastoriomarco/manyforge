@@ -159,6 +159,23 @@ _SCENE_RESOURCE_SCHEMA: dict[str, Any] = {
                     "items": {"type": "number"},
                     "minItems": 3,
                     "maxItems": 3,
+                    "description": (
+                        "Orientation as roll/pitch/yaw in DEGREES. Alternatively "
+                        "provide orientation_xyzw (quaternion) — e.g. copy the "
+                        "orientation_xyzw shown for this object in scene state "
+                        "verbatim; do not hand-convert a quaternion into degrees."
+                    ),
+                },
+                "orientation_xyzw": {
+                    "type": "array",
+                    "items": {"type": "number"},
+                    "minItems": 4,
+                    "maxItems": 4,
+                    "description": (
+                        "Orientation as a quaternion [x, y, z, w] — the same form "
+                        "scene state reports. Accepted as an alternative to "
+                        "orientation_rpy_deg; omit for identity."
+                    ),
                 },
             },
         },
@@ -1300,16 +1317,45 @@ def assistant_tool_input_schema(tool_id: str) -> dict[str, Any] | None:
 
 
 def enrich_assistant_tool_descriptor(tool: dict[str, Any]) -> dict[str, Any]:
-    """Add a known `inputSchema` to a tool descriptor when one is not declared."""
+    """Attach the canonical ``inputSchema`` to a built-in assistant tool descriptor.
+
+    SINGLE-SOURCE-OF-TRUTH PARITY CLEANUP (not a behavioural fix). The curated
+    schema in ``ASSISTANT_TOOL_INPUT_SCHEMAS`` is the schema the mode manifest
+    (``GET /api/assistant/modes/<mode>``) serves to the gateway lanes
+    (OpenClaw / Hermes via ``manyforge-mcp-bridge``). The deployment-resolved
+    catalog, however, carries a *legacy reduced* schema for the scene/tree tools
+    under ``input_schema`` / ``parameters`` (a flat alias set, e.g. ``size`` /
+    ``dimensions``, with no nested ``shape`` / ``pose`` and only ``objectId``
+    required). Because the provider-request envelope (direct lane) carries these
+    descriptors verbatim and the direct bridge's ``_tool_parameters_schema``
+    reads ``parameters`` -> ``inputSchema`` -> ``input_schema``, the direct lane
+    was sending vLLM a *different* tool schema than the gateway lanes. We
+    override with the curated schema and drop the legacy keys so all lanes see
+    one descriptor source. The catalog hash is keyed on tool *ids* only, so this
+    does not perturb it.
+
+    NOTE — this does NOT measurably change the smoke scores. Investigation
+    (2026-06-09) showed the direct-lane scene/tree calls already complete (200)
+    and ``state_after`` already passes with the reduced schema: the model emits
+    *accepted* flat aliases (top-level ``box_dimensions_m``, ``shape.shape_type``)
+    which Composer normalises correctly. Those cases fail the *test scorer*,
+    not Composer, because the corpus ``args_contain`` golden only credits the
+    nested ``shape.type`` / ``shape.box_dims`` form. The real lever is the
+    scorer contract (semantic-effect-first + accepted-form aliases) and,
+    longer-term, splitting the *accepted* runtime schema from a canonical
+    *model-facing* schema. See docs/operations/LANE_BRINGUP.md (schema-parity
+    note); full scorer-strictness analysis archived in NemoClaw-Thor (manyforge/docs/archive/THREE-LANE-SCORER-NOTE.md).
+    """
     enriched = copy.deepcopy(tool)
-    if any(key in enriched for key in ("inputSchema", "input_schema", "parameters")):
-        return enriched
     tool_id = enriched.get("id") or enriched.get("name")
-    if not isinstance(tool_id, str):
-        return enriched
-    schema = assistant_tool_input_schema(tool_id)
-    if schema is not None:
-        enriched["inputSchema"] = schema
+    if isinstance(tool_id, str):
+        schema = assistant_tool_input_schema(tool_id)
+        if schema is not None:
+            enriched["inputSchema"] = schema
+            enriched.pop("input_schema", None)
+            enriched.pop("parameters", None)
+            return enriched
+    # Unknown tool (no curated schema): preserve any declared schema verbatim.
     return enriched
 
 

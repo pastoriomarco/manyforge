@@ -55,7 +55,38 @@ from .models import (
     VisualStateRouteDiagnosticsResponse,
 )
 from manyforge_behavior.nodes.motion import _rpy_deg_to_xyzw
+from manyforge_behavior.nodes.selection import _xyzw_to_rpy_deg
 from .state import ComposerState
+
+
+def augment_pose_orientation_rpy_deg(value: Any) -> Any:
+    """Recursively add ``orientation_rpy_deg`` next to any ``orientation_xyzw``.
+
+    Scene state is authored/stored as quaternions, but the assistant pose-writing
+    tools/nodes take Euler degrees. Small models reliably botch the quaternion->
+    Euler conversion, so assistant-facing scene reads surface BOTH forms and the
+    model copies the degrees directly (as it already copies position_m). This is
+    lane-independent: applied to every assistant scene read — the direct provider
+    context, the in-tree scene_inspect tool, and the MCP scene-state tool used by
+    the gateway lanes. Additive + idempotent; ignores malformed quaternions.
+    """
+    if isinstance(value, dict):
+        quat = value.get("orientation_xyzw")
+        if (
+            "orientation_rpy_deg" not in value
+            and isinstance(quat, (list, tuple))
+            and len(quat) == 4
+        ):
+            try:
+                value["orientation_rpy_deg"] = _xyzw_to_rpy_deg(list(quat))
+            except Exception:  # noqa: BLE001 — never let a bad quat break state
+                pass
+        for v in value.values():
+            augment_pose_orientation_rpy_deg(v)
+    elif isinstance(value, list):
+        for v in value:
+            augment_pose_orientation_rpy_deg(v)
+    return value
 from .visual_state import (
     VisualSnapshotUnavailable,
     build_robot_visual_snapshot,
@@ -1008,10 +1039,17 @@ def _collect_gripper_states(
 
 
 def build_scene_diagnostics_payload(state: ComposerState) -> dict[str, Any]:
-    """Build backend vs HMI scene diagnostics."""
+    """Build backend vs active viewer scene diagnostics."""
     timestamp_ns = time.monotonic_ns()
     hmi_server = getattr(state, "hmi_server", None)
-    hmi_available = bool(hmi_server and hasattr(hmi_server, "get_object_render_diagnostics"))
+    legacy_hmi_available = bool(
+        hmi_server and hasattr(hmi_server, "get_object_render_diagnostics")
+    )
+    visual_objects, visual_meta = state.visual_scene_objects_snapshot()
+    visual_meta = visual_meta or {}
+    visual_index = {obj.object_id: obj for obj in visual_objects}
+    native_visual_available = bool(visual_meta.get("timestamp_ns") or visual_objects)
+    viewer_available = legacy_hmi_available or native_visual_available
 
     objects: list[SceneDiagnosticObjectResponse] = []
     if state.kernel is not None:
@@ -1024,7 +1062,7 @@ def build_scene_diagnostics_payload(state: ComposerState) -> dict[str, Any]:
             )
 
             mismatch_reason = None
-            if hmi_available:
+            if legacy_hmi_available:
                 render_diag = hmi_server.get_object_render_diagnostics(scene_object.object_id)
                 render_info = render_diag.get("render") or {}
                 rendered = bool(render_info.get("scene_node_present"))
@@ -1041,13 +1079,36 @@ def build_scene_diagnostics_payload(state: ComposerState) -> dict[str, Any]:
                     mismatch_reason = "Object exists in backend but not rendered in HMI"
                 elif scene_object.attached and not render_diag.get("frame_path"):
                     mismatch_reason = "Object is attached in backend but HMI render is not parented to a robot frame"
+            elif native_visual_available:
+                visual_object = visual_index.get(scene_object.object_id)
+                rendered = visual_object is not None
+                render_state_label = "synced" if rendered else "missing"
+                hmi = SceneDiagnosticHmiResponse(
+                    rendered=rendered,
+                    scene_name=scene_object.object_id if rendered else None,
+                    render_state=render_state_label,
+                )
+                if visual_object is None:
+                    mismatch_reason = "Object exists in backend but not rendered in native visual cache"
+                elif bool(visual_object.attached) != bool(scene_object.attached):
+                    mismatch_reason = (
+                        "Object attachment state differs between backend and native visual cache"
+                    )
+                elif (
+                    scene_object.frame_id is not None
+                    and visual_object.frame_id is not None
+                    and str(scene_object.frame_id) != str(visual_object.frame_id)
+                ):
+                    mismatch_reason = (
+                        "Object frame differs between backend and native visual cache"
+                    )
             else:
                 hmi = SceneDiagnosticHmiResponse(
                     rendered=False,
                     scene_name=None,
                     render_state="unavailable",
                 )
-                mismatch_reason = "HMI unavailable"
+                mismatch_reason = "Native visual cache unavailable"
 
             objects.append(
                 SceneDiagnosticObjectResponse(
@@ -1065,7 +1126,7 @@ def build_scene_diagnostics_payload(state: ComposerState) -> dict[str, Any]:
             total=len(objects),
             matched=sum(1 for obj in objects if obj.match),
             mismatched=sum(1 for obj in objects if not obj.match),
-            hmiAvailable=hmi_available,
+            hmiAvailable=viewer_available,
         ),
         timestamp_ns=timestamp_ns,
     ).model_dump(by_alias=True)
@@ -2077,15 +2138,15 @@ def create_scene_router(state: ComposerState) -> APIRouter:
             if image_bytes is None:
                 return JSONResponse(
                     status_code=503,
-                    content={"detail": "No Viser client connected"},
+                    content={"detail": "Legacy HMI snapshot source did not return an image"},
                 )
         else:
             return JSONResponse(
                 status_code=503,
                 content={
                     "detail": (
-                        "HMI server not running and no native scene snapshot "
-                        "viewer connected"
+                        "No native scene snapshot viewer connected and no legacy "
+                        "HMI snapshot source is running"
                     ),
                 },
             )

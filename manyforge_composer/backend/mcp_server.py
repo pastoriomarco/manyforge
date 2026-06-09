@@ -74,8 +74,20 @@ def create_mcp_server(state: ComposerState):
         - objects: list of scene objects with poses, shapes, and attachment status
         - timestamp_ns: monotonic timestamp
         """
-        from .routes_scene import build_scene_state_payload
-        return json.dumps(_snakecase_keys(build_scene_state_payload(state)))
+        from .routes_scene import (
+            augment_pose_orientation_rpy_deg,
+            build_scene_state_payload,
+        )
+
+        # Surface orientation_rpy_deg next to orientation_xyzw so the gateway
+        # lanes (OpenClaw/Hermes) can copy degrees directly into pose-writing
+        # tools instead of converting the quaternion — matching the direct
+        # lane's injected scene context. (Lane-independent representation fix.)
+        return json.dumps(
+            _snakecase_keys(
+                augment_pose_orientation_rpy_deg(build_scene_state_payload(state))
+            )
+        )
 
     # ── Scene Edit ───────────────────────────────────────────────────────
 
@@ -913,8 +925,10 @@ def create_mcp_server(state: ComposerState):
     ) -> str:
         """Render the 3D scene as a base64-encoded image.
 
-        Requires HMI server running (--hmi-port). Returns base64 string
-        and metadata, or error if no Viser client is connected.
+        Uses the native viewer snapshot bridge when a browser viewer is
+        connected, falling back to the legacy HMI renderer only when that
+        optional server is explicitly running. Returns base64 string and
+        metadata, or an error if no snapshot source is connected.
 
         Args:
             width: Image width in pixels (64-1920, default 640)
@@ -926,13 +940,18 @@ def create_mcp_server(state: ComposerState):
         width = max(64, min(1920, width))
         height = max(64, min(1080, height))
 
-        hmi = state.hmi_server
-        if hmi is None:
-            return json.dumps({"error": "HMI server not running (start with --hmi-port)"})
+        provider = state._resolve_scene_snapshot_provider()
+        if provider is None:
+            return json.dumps({
+                "error": (
+                    "No native scene snapshot viewer connected and no legacy "
+                    "HMI snapshot source is running"
+                )
+            })
 
-        image_bytes = hmi.render_scene(width=width, height=height, format=format)
+        image_bytes = provider(width, height, format)
         if image_bytes is None:
-            return json.dumps({"error": "No Viser client connected for rendering"})
+            return json.dumps({"error": "Scene snapshot source did not return an image"})
 
         return json.dumps({
             "image_base64": base64.b64encode(image_bytes).decode("ascii"),

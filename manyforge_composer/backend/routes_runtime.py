@@ -1,10 +1,10 @@
 """Runtime status routes.
 
 This surface is intentionally deployment-agnostic.  Composer reports the
-core/kernel/HMI state, while optional bringup supervisors can contribute
-external component status through a narrow HTTP endpoint.  The frontend renders
-the merged contract without knowing whether the deployment is Composer-only,
-Isaac commanded simulation, or a real ROS-controlled robot.
+core/kernel/native-viewer state, while optional bringup supervisors can
+contribute external component status through a narrow HTTP endpoint.  The
+frontend renders the merged contract without knowing whether the deployment is
+Composer-only, Isaac commanded simulation, or a real ROS-controlled robot.
 """
 from __future__ import annotations
 
@@ -92,12 +92,34 @@ def _execution_profile(state: ComposerState) -> tuple[str, str, str, dict[str, A
     )
 
 
+def _native_viewer_detail(state: ComposerState) -> str:
+    _snapshot, snapshot_meta = state.visual_state_snapshot()
+    snapshot_meta = snapshot_meta or {}
+    sequence_number = snapshot_meta.get("sequence_number") if snapshot_meta else None
+    if snapshot_meta.get("publisher_running"):
+        if sequence_number is not None:
+            return f"visual snapshot publisher running, frame {sequence_number}"
+        return "visual snapshot publisher running"
+    if snapshot_meta.get("last_error"):
+        return f"visual snapshot publisher last error: {snapshot_meta['last_error']}"
+    broker = getattr(state, "snapshot_broker", None)
+    if broker is not None:
+        try:
+            return (
+                "native snapshot bridge connected"
+                if broker.has_clients()
+                else "native snapshot bridge ready"
+            )
+        except Exception:
+            return "native snapshot bridge ready"
+    return "native scene state route ready"
+
+
 def build_runtime_status_payload(state: ComposerState) -> dict[str, Any]:
     now_ns = time.monotonic_ns()
     heartbeat = build_infra_heartbeat_payload(state)
     profile_kind, profile_label, authority, _execution_config = _execution_profile(state)
     program_loaded = state.program is not None
-    hmi_ready = state.hmi_server is not None
     kernel_payload = heartbeat.get("components", {}).get("kernel", {})
     kernel_available = bool(kernel_payload.get("available"))
     kernel_status = str(heartbeat.get("status", "__missing__"))
@@ -124,19 +146,17 @@ def build_runtime_status_payload(state: ComposerState) -> dict[str, Any]:
             detail=state.program.name if state.program else "No program loaded",
         ),
         _component(
-            "hmi",
-            "HMI / Viser",
-            "hmi",
-            "ready" if hmi_ready else ("waiting" if program_loaded else "disabled"),
+            "native_viewer",
+            "Native viewer",
+            "viewer",
+            "ready" if program_loaded and kernel_available else (
+                "waiting" if program_loaded else "disabled"
+            ),
             required_for=["render"],
             detail=(
-                f"Port {state.hmi_public_port}"
-                if hmi_ready and state.hmi_public_port
-                else (
-                    "Starts after a program/deployment is loaded"
-                    if not program_loaded
-                    else "HMI server not started"
-                )
+                _native_viewer_detail(state)
+                if program_loaded
+                else "Starts after a program/deployment is loaded"
             ),
         ),
         _component(
@@ -162,6 +182,21 @@ def build_runtime_status_payload(state: ComposerState) -> dict[str, Any]:
             detail=str(kernel_payload.get("state", kernel_payload.get("error", "")) or ""),
         ),
     ]
+
+    if state.hmi_server is not None:
+        components.append(
+            _component(
+                "legacy_hmi",
+                "Legacy Viser HMI",
+                "hmi",
+                "ready",
+                detail=(
+                    f"Port {state.hmi_public_port}"
+                    if state.hmi_public_port
+                    else "Legacy HMI server running"
+                ),
+            )
+        )
 
     external_statuses = state.external_runtime_statuses(max_age_s=6.0)
     external_ready = True
@@ -210,7 +245,7 @@ def build_runtime_status_payload(state: ComposerState) -> dict[str, Any]:
             )
         )
 
-    can_render = bool(program_loaded and hmi_ready)
+    can_render = bool(program_loaded and kernel_available)
     can_plan = bool(program_loaded and kernel_available)
     can_execute = bool(program_loaded and kernel_available)
     if profile_kind == "commanded_sim":

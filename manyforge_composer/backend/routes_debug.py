@@ -24,10 +24,35 @@ from .state import ComposerState
 
 
 def build_scene_trace_payload(state: ComposerState, *, limit: int = 200) -> dict[str, Any]:
-    """Build combined backend/HMI scene trace payload."""
+    """Build combined backend/native-viewer scene trace payload."""
     backend_trace = []
     if state.cycle_manager is not None:
         backend_trace = state.cycle_manager.get_scene_trace(limit=limit)
+
+    visual_objects, visual_objects_meta = state.visual_scene_objects_snapshot()
+    visual_state, visual_state_meta = state.visual_state_snapshot()
+    visual_objects_meta = visual_objects_meta or {}
+    visual_state_meta = visual_state_meta or {}
+    visual_trace = [
+        {
+            "source": "native_visual_cache",
+            "event": "visual_scene_objects_snapshot",
+            "object_count": len(visual_objects),
+            "objects_source": visual_objects_meta.get("source"),
+            "age_ms": visual_objects_meta.get("age_ms"),
+            "refresh_running": visual_objects_meta.get("refresh_running"),
+            "last_error": visual_objects_meta.get("last_error"),
+        },
+        {
+            "source": "native_visual_cache",
+            "event": "visual_state_snapshot",
+            "available": visual_state is not None,
+            "sequence_number": visual_state_meta.get("sequence_number"),
+            "age_ms": visual_state_meta.get("age_ms"),
+            "publisher_running": visual_state_meta.get("publisher_running"),
+            "last_error": visual_state_meta.get("last_error"),
+        },
+    ]
 
     hmi_trace = []
     object_diagnostics = {}
@@ -52,8 +77,9 @@ def build_scene_trace_payload(state: ComposerState, *, limit: int = 200) -> dict
         "scope": {
             "included": [
                 "backend scene mutation trace (add/remove/update_pose/attach/detach)",
-                "HMI invalidation hints and per-object reconciliation decisions",
-                "current per-object backend-vs-render diagnostics",
+                "native visual cache scene/object snapshot state",
+                "legacy HMI invalidation hints when the optional HMI is running",
+                "current per-object backend-vs-render diagnostics when available",
             ],
             "excluded": [
                 "browser-side WebGL/client rendering and pixels",
@@ -62,6 +88,7 @@ def build_scene_trace_payload(state: ComposerState, *, limit: int = 200) -> dict
             ],
         },
         "backend": backend_trace,
+        "visual": visual_trace,
         "hmi": hmi_trace,
         "objects": object_diagnostics,
     }
