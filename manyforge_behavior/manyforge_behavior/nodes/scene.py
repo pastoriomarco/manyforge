@@ -6,8 +6,8 @@ from typing import Any, Callable, Optional
 
 import py_trees
 
+from manyforge_behavior.geometry import rpy_deg_to_xyzw as _rpy_deg_to_xyzw
 from manyforge_behavior.kernel_client import KernelClient, SceneEditRequest
-from manyforge_behavior.nodes.motion import _rpy_deg_to_xyzw
 from manyforge_behavior.parameters import resolve_blackboard_value
 
 

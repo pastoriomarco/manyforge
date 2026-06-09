@@ -8,10 +8,9 @@ import time
 from pathlib import Path
 from typing import Any
 
-# Canonical quaternion->Euler converter (the same one the scene-state
-# augmentation and the selection node use) so a pose supplied as
-# orientation_xyzw is accepted without the caller having to pre-convert.
-from manyforge_behavior.nodes.selection import _xyzw_to_rpy_deg
+# Canonical quaternion->Euler converter (single source in the geometry module)
+# so a pose supplied as orientation_xyzw is accepted without pre-converting.
+from manyforge_behavior.geometry import xyzw_to_rpy_deg as _xyzw_to_rpy_deg
 
 
 class AssistantToolError(RuntimeError):

@@ -15,18 +15,9 @@ from manyforge_behavior.motion_runtime import MotionExecutionCoordinator
 from manyforge_behavior.parameters import resolve_blackboard_value
 
 
-def _rpy_deg_to_xyzw(rpy_deg: list[float]) -> list[float]:
-    """Convert roll/pitch/yaw in degrees to quaternion [x, y, z, w] (ZYX convention)."""
-    r, p, y = [math.radians(v) for v in rpy_deg]
-    cr, sr = math.cos(r / 2), math.sin(r / 2)
-    cp, sp = math.cos(p / 2), math.sin(p / 2)
-    cy, sy = math.cos(y / 2), math.sin(y / 2)
-    return [
-        sr * cp * cy - cr * sp * sy,
-        cr * sp * cy + sr * cp * sy,
-        cr * cp * sy - sr * sp * cy,
-        cr * cp * cy + sr * sp * sy,
-    ]
+# Canonical conversion is defined once in manyforge_behavior.geometry; re-exported
+# here under the historical private name for existing in-module callers.
+from manyforge_behavior.geometry import rpy_deg_to_xyzw as _rpy_deg_to_xyzw
 
 
 def _normalize_pose_dict(pose: dict[str, Any] | None) -> dict[str, Any] | None:

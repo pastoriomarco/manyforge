@@ -54,8 +54,10 @@ from .models import (
     SceneStateResponse,
     VisualStateRouteDiagnosticsResponse,
 )
-from manyforge_behavior.nodes.motion import _rpy_deg_to_xyzw
-from manyforge_behavior.nodes.selection import _xyzw_to_rpy_deg
+from manyforge_behavior.geometry import (
+    rpy_deg_to_xyzw as _rpy_deg_to_xyzw,
+    xyzw_to_rpy_deg as _xyzw_to_rpy_deg,
+)
 from .state import ComposerState
 
 

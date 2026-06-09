@@ -19,22 +19,8 @@ from manyforge_behavior.parameters import resolve_blackboard_value
 _SCENE_SNAPSHOT_WAIT_TIMEOUT_S = 2.0
 
 
-def _xyzw_to_rpy_deg(orientation_xyzw: list[float]) -> list[float]:
-    x, y, z, w = [float(v) for v in orientation_xyzw]
-    sinr_cosp = 2.0 * (w * x + y * z)
-    cosr_cosp = 1.0 - 2.0 * (x * x + y * y)
-    roll = math.atan2(sinr_cosp, cosr_cosp)
-
-    sinp = 2.0 * (w * y - z * x)
-    if abs(sinp) >= 1.0:
-        pitch = math.copysign(math.pi / 2.0, sinp)
-    else:
-        pitch = math.asin(sinp)
-
-    siny_cosp = 2.0 * (w * z + x * y)
-    cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
-    yaw = math.atan2(siny_cosp, cosy_cosp)
-    return [math.degrees(roll), math.degrees(pitch), math.degrees(yaw)]
+# Canonical conversion is defined once in manyforge_behavior.geometry.
+from manyforge_behavior.geometry import xyzw_to_rpy_deg as _xyzw_to_rpy_deg
 
 
 def _shape_summary(snapshot: SceneObjectSnapshot) -> dict[str, Any]:

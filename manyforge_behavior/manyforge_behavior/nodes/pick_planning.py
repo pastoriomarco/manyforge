@@ -21,17 +21,8 @@ from manyforge_behavior.parameters import resolve_blackboard_value
 _SCENE_SNAPSHOT_WAIT_TIMEOUT_S = 2.0
 
 
-def _rpy_deg_to_xyzw(rpy_deg: list[float]) -> list[float]:
-    r, p, y = [math.radians(v) for v in rpy_deg]
-    cr, sr = math.cos(r / 2), math.sin(r / 2)
-    cp, sp = math.cos(p / 2), math.sin(p / 2)
-    cy, sy = math.cos(y / 2), math.sin(y / 2)
-    return [
-        sr * cp * cy - cr * sp * sy,
-        cr * sp * cy + sr * cp * sy,
-        cr * cp * sy - sr * sp * cy,
-        cr * cp * cy + sr * sp * sy,
-    ]
+# Canonical conversion is defined once in manyforge_behavior.geometry.
+from manyforge_behavior.geometry import rpy_deg_to_xyzw as _rpy_deg_to_xyzw
 
 
 def _default_pick_offset_envelope() -> dict[str, Any]:
