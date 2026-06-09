@@ -97,6 +97,27 @@ def compose_world(current_xyzw: Any, delta_xyzw: Any) -> list[float]:
     return quat_mul(delta_xyzw, current_xyzw)
 
 
+def quat_conjugate(q: Any) -> list[float]:
+    """Inverse rotation of a unit quaternion [x, y, z, w]."""
+    x, y, z, w = normalize_quat(q)
+    return [-x, -y, -z, w]
+
+
+def quat_rotate_vector(q: Any, v: Any) -> list[float]:
+    """Rotate 3-vector ``v`` by unit quaternion ``q`` (q ⊗ v ⊗ q*)."""
+    x, y, z, w = normalize_quat(q)
+    vx, vy, vz = _finite_list(v, 3, "vector")
+    # t = 2 * cross(q_xyz, v); v' = v + w*t + cross(q_xyz, t)
+    tx = 2.0 * (y * vz - z * vy)
+    ty = 2.0 * (z * vx - x * vz)
+    tz = 2.0 * (x * vy - y * vx)
+    return [
+        vx + w * tx + (y * tz - z * ty),
+        vy + w * ty + (z * tx - x * tz),
+        vz + w * tz + (x * ty - y * tx),
+    ]
+
+
 # ── Canonical pose value ─────────────────────────────────────────────────────
 
 @dataclass(frozen=True)
@@ -166,6 +187,100 @@ def parse_pose(raw: Any, *, allow_legacy: bool = False) -> Pose:
             "Do not omit it — that silently re-orients the object."
         )
     return Pose(frame_id.strip(), (pos[0], pos[1], pos[2]), (q[0], q[1], q[2], q[3]))
+
+
+# ── Authoring intent resolution (spec 420 §4A.4) ─────────────────────────────
+
+_ABSOLUTE_INTENT_KEYS = ("orientation_xyzw", "orientation_rpy_deg")
+_RELATIVE_INTENT_KEYS = ("rotate_local_rpy_deg", "rotate_world_rpy_deg")
+_REFERENCE_INTENT_KEYS = ("orientation_from",)
+ORIENTATION_INTENT_KEYS = _ABSOLUTE_INTENT_KEYS + _RELATIVE_INTENT_KEYS + _REFERENCE_INTENT_KEYS
+
+
+def resolve_orientation(
+    intent: Any,
+    *,
+    current_xyzw: Any = None,
+    resolve_reference: Any = None,
+) -> list[float]:
+    """Resolve one orientation authoring intent → canonical unit quaternion.
+
+    Exactly one intent mode is present (an agreeing absolute xyzw/rpy pair counts
+    as one). Absolute modes need nothing else; relative modes
+    (``rotate_local_rpy_deg`` / ``rotate_world_rpy_deg``) compose a degrees delta
+    against ``current_xyzw`` in an explicit basis; the reference mode
+    (``orientation_from``) adopts orientation from another resource via
+    ``resolve_reference(ref) -> xyzw``. All conversion/composition happens here —
+    never in the agent. Fail closed: a missing current/source orientation is an
+    error, never an implicit identity.
+    """
+    if not isinstance(intent, dict):
+        raise PoseError("orientation intent must be an object")
+    present = [k for k in ORIENTATION_INTENT_KEYS if intent.get(k) is not None]
+    if set(present) == set(_ABSOLUTE_INTENT_KEYS):
+        # both absolute forms supplied — accept iff they agree, treat as one
+        q = normalize_quat(intent["orientation_xyzw"])
+        if not quats_close(q, rpy_deg_to_xyzw(intent["orientation_rpy_deg"])):
+            raise PoseError("orientation_xyzw and orientation_rpy_deg disagree")
+        return q
+    if len(present) != 1:
+        raise PoseError(
+            "exactly one orientation intent is required, one of: "
+            + ", ".join(ORIENTATION_INTENT_KEYS)
+        )
+    key = present[0]
+    if key == "orientation_xyzw":
+        return normalize_quat(intent["orientation_xyzw"])
+    if key == "orientation_rpy_deg":
+        return rpy_deg_to_xyzw(intent["orientation_rpy_deg"])
+    if key in _RELATIVE_INTENT_KEYS:
+        if current_xyzw is None:
+            raise PoseError(
+                f"{key} is relative and needs a current orientation to compose "
+                "against; none was resolvable"
+            )
+        delta = rpy_deg_to_xyzw(intent[key])
+        if key == "rotate_local_rpy_deg":
+            return compose_local(current_xyzw, delta)
+        return compose_world(current_xyzw, delta)
+    # orientation_from (reference)
+    if resolve_reference is None:
+        raise PoseError("orientation_from requires a reference resolver")
+    ref_xyzw = resolve_reference(intent["orientation_from"])
+    if ref_xyzw is None:
+        raise PoseError("orientation_from reference could not be resolved")
+    return normalize_quat(ref_xyzw)
+
+
+# ── Typed read-only spatial queries (spec 420 §4A.6) ─────────────────────────
+
+def distance_between(a_position_m: Any, b_position_m: Any) -> float:
+    """Euclidean distance (meters) between two positions."""
+    a = _finite_list(a_position_m, 3, "position_m")
+    b = _finite_list(b_position_m, 3, "position_m")
+    return math.sqrt(sum((p - q) ** 2 for p, q in zip(a, b)))
+
+
+def angle_between(a_xyzw: Any, b_xyzw: Any) -> float:
+    """Smallest rotation angle (degrees) between two orientations."""
+    qa, qb = normalize_quat(a_xyzw), normalize_quat(b_xyzw)
+    dot = min(1.0, abs(sum(p * q for p, q in zip(qa, qb))))
+    return math.degrees(2.0 * math.acos(dot))
+
+
+def pose_relative_to(target: Pose, reference: Pose) -> Pose:
+    """Express ``target`` in ``reference``'s local frame: T_ref⁻¹ ∘ T_target."""
+    inv = quat_conjugate(reference.orientation_xyzw)
+    rel_pos = quat_rotate_vector(
+        inv,
+        [t - r for t, r in zip(target.position_m, reference.position_m)],
+    )
+    rel_quat = quat_mul(inv, list(target.orientation_xyzw))
+    return Pose(
+        reference.frame_id,
+        (rel_pos[0], rel_pos[1], rel_pos[2]),
+        (rel_quat[0], rel_quat[1], rel_quat[2], rel_quat[3]),
+    )
 
 
 def _finite_list(value: Any, n: int, label: str) -> list[float]:

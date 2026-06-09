@@ -11,10 +11,14 @@ import pytest
 from manyforge_behavior.geometry import (
     Pose,
     PoseError,
+    angle_between,
     compose_local,
     compose_world,
+    distance_between,
     parse_pose,
+    pose_relative_to,
     quats_close,
+    resolve_orientation,
     rpy_deg_to_xyzw,
     xyzw_to_rpy_deg,
 )
@@ -119,3 +123,92 @@ def test_to_dict_includes_derived_rpy_only_on_request():
     assert "orientation_rpy_deg" not in p.to_dict()
     d = p.to_dict(include_rpy=True)
     assert d["orientation_rpy_deg"] == pytest.approx([0, 0, -45], abs=1e-6)
+
+
+# ── Phase 2: authoring intent resolution (§4A.4) ─────────────────────────────
+
+def test_resolve_orientation_absolute_modes():
+    assert quats_close(resolve_orientation({"orientation_rpy_deg": [0, 0, -45]}),
+                       rpy_deg_to_xyzw([0, 0, -45]))
+    q = rpy_deg_to_xyzw([0, 0, -45])
+    assert quats_close(resolve_orientation({"orientation_xyzw": q}), q)
+
+
+def test_resolve_orientation_absolute_pair_agree_and_disagree():
+    q = rpy_deg_to_xyzw([0, 0, -45])
+    assert quats_close(
+        resolve_orientation({"orientation_xyzw": q, "orientation_rpy_deg": [0, 0, -45]}), q)
+    with pytest.raises(PoseError):
+        resolve_orientation({"orientation_xyzw": q, "orientation_rpy_deg": [0, 0, 0]})
+
+
+def test_resolve_orientation_relative_local_then_undo_is_current():
+    current = rpy_deg_to_xyzw([0, 0, -45])
+    rotated = resolve_orientation({"rotate_local_rpy_deg": [0, 0, 90]}, current_xyzw=current)
+    back = resolve_orientation({"rotate_local_rpy_deg": [0, 0, -90]}, current_xyzw=rotated)
+    assert quats_close(back, current)
+
+
+def test_resolve_orientation_local_vs_world_differ_for_noncommuting():
+    current = rpy_deg_to_xyzw([0, 90, 0])
+    delta = {"rotate_local_rpy_deg": [90, 0, 0]}
+    world = {"rotate_world_rpy_deg": [90, 0, 0]}
+    local_q = resolve_orientation(delta, current_xyzw=current)
+    world_q = resolve_orientation(world, current_xyzw=current)
+    assert not quats_close(local_q, world_q)
+
+
+def test_resolve_orientation_relative_without_current_fails_closed():
+    with pytest.raises(PoseError):
+        resolve_orientation({"rotate_local_rpy_deg": [15, 0, 0]})
+
+
+def test_resolve_orientation_reference_mode():
+    target = rpy_deg_to_xyzw([0, 0, 90])
+    got = resolve_orientation(
+        {"orientation_from": {"type": "object", "id": "fixture"}},
+        resolve_reference=lambda ref: target,
+    )
+    assert quats_close(got, target)
+    # unresolvable reference fails closed
+    with pytest.raises(PoseError):
+        resolve_orientation({"orientation_from": {"id": "x"}}, resolve_reference=lambda r: None)
+
+
+def test_resolve_orientation_requires_exactly_one_mode():
+    with pytest.raises(PoseError):
+        resolve_orientation({})
+    with pytest.raises(PoseError):
+        resolve_orientation({"rotate_local_rpy_deg": [1, 0, 0], "orientation_rpy_deg": [0, 0, 0]})
+
+
+# ── Phase 2: typed read-only queries (§4A.6) ─────────────────────────────────
+
+def test_distance_between():
+    assert distance_between([0, 0, 0], [3, 4, 0]) == pytest.approx(5.0)
+
+
+def test_angle_between():
+    a = rpy_deg_to_xyzw([0, 0, 0])
+    b = rpy_deg_to_xyzw([0, 0, 90])
+    assert angle_between(a, b) == pytest.approx(90.0, abs=1e-6)
+    assert angle_between(a, a) == pytest.approx(0.0, abs=1e-6)
+
+
+def test_pose_relative_to_self_is_identity():
+    p = parse_pose({"frame_id": "universe", "position_m": [0.3, -0.3, 0.15],
+                    "orientation_rpy_deg": [0, 0, -45]})
+    rel = pose_relative_to(p, p)
+    assert rel.position_m == pytest.approx((0, 0, 0), abs=1e-9)
+    assert quats_close(rel.orientation_xyzw, [0, 0, 0, 1])
+
+
+def test_pose_relative_to_recovers_offset():
+    ref = parse_pose({"frame_id": "universe", "position_m": [1, 0, 0],
+                      "orientation_rpy_deg": [0, 0, 90]})
+    tgt = parse_pose({"frame_id": "universe", "position_m": [1, 1, 0],
+                      "orientation_rpy_deg": [0, 0, 90]})
+    rel = pose_relative_to(tgt, ref)
+    # tgt is +1 in world Y; ref is yawed +90°, so in ref's frame that is +X.
+    assert rel.position_m == pytest.approx((1, 0, 0), abs=1e-9)
+    assert quats_close(rel.orientation_xyzw, [0, 0, 0, 1])

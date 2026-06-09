@@ -8,9 +8,15 @@ import time
 from pathlib import Path
 from typing import Any
 
-# Canonical quaternion->Euler converter (single source in the geometry module)
-# so a pose supplied as orientation_xyzw is accepted without pre-converting.
-from manyforge_behavior.geometry import xyzw_to_rpy_deg as _xyzw_to_rpy_deg
+# Canonical pose parser + quaternion->Euler converter (single source in the
+# geometry module) so a pose supplied as orientation_xyzw is accepted without
+# pre-converting, and a disagreeing orientation_xyzw/orientation_rpy_deg pair is
+# rejected rather than silently picking one.
+from manyforge_behavior.geometry import (
+    PoseError,
+    parse_pose,
+    xyzw_to_rpy_deg as _xyzw_to_rpy_deg,
+)
 
 
 class AssistantToolError(RuntimeError):
@@ -517,18 +523,25 @@ def _validated_shape(value: Any) -> dict[str, Any]:
 def _validated_pose(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise AssistantToolError("recommended pose must be an object")
+    # Fail-closed canonical gate: requires an orientation (no silent identity),
+    # accepts orientation_xyzw OR orientation_rpy_deg, and rejects a both-present
+    # pair that disagrees — the exact footgun where a model emitted a correct
+    # quaternion alongside a wrong/zeroed rpy and the wrong one was kept.
+    try:
+        parse_pose(value)
+    except PoseError as exc:
+        raise AssistantToolError(str(exc)) from exc
     frame_id = _required_string(value, "frame_id")
     position = _finite_number_list(value.get("position_m"), 3, "position_m")
-    # Accept orientation as Euler degrees (orientation_rpy_deg) OR quaternion
-    # (orientation_xyzw — the representation scene state reports). If only the
-    # quaternion is given, convert it so downstream stays canonical rpy_deg.
-    # This lets a model copy the scene's orientation_xyzw verbatim instead of
-    # doing the error-prone quaternion->Euler conversion itself.
-    if value.get("orientation_rpy_deg") is None and value.get("orientation_xyzw") is not None:
+    # Emit the canonical single-orientation artifact shape (program.py requires
+    # exactly one form). Prefer the author's orientation_rpy_deg verbatim; when
+    # only the quaternion is given, convert it once via the shared geometry
+    # converter so the model never does quaternion->Euler math itself.
+    if value.get("orientation_rpy_deg") is not None:
+        rpy = _finite_number_list(value.get("orientation_rpy_deg"), 3, "orientation_rpy_deg")
+    else:
         quat = _finite_number_list(value.get("orientation_xyzw"), 4, "orientation_xyzw")
         rpy = [float(v) for v in _xyzw_to_rpy_deg(quat)]
-    else:
-        rpy = _finite_number_list(value.get("orientation_rpy_deg"), 3, "orientation_rpy_deg")
     return {
         "frame_id": frame_id,
         "position_m": position,

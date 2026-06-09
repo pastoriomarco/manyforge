@@ -69,6 +69,7 @@ from .models import (
     ProgramParameterResponse,
     TreeNodeResponse,
 )
+from manyforge_behavior.geometry import PoseError, quats_close, rpy_deg_to_xyzw
 from .routes_scene import (
     augment_pose_orientation_rpy_deg,
     build_scene_state_payload,
@@ -2528,6 +2529,30 @@ def _normalize_scene_pose_argument(
     if orientation is None:
         orientation = raw_resource.get("orientation")
 
+    if orientation_xyzw is not None and orientation_rpy is not None:
+        # Both forms supplied (e.g. copied verbatim from the canonical+derived
+        # read shape). Accept iff they describe the same rotation; reject a
+        # disagreeing pair rather than silently keeping one (the orientation
+        # footgun). The canonical xyzw branch below then emits exactly one form.
+        _q = _numeric_vector_argument(
+            orientation_xyzw, length=4, label=f"{label}.pose.orientation_xyzw"
+        )
+        _r = _numeric_vector_argument(
+            orientation_rpy, length=3, label=f"{label}.pose.orientation_rpy_deg"
+        )
+        try:
+            agree = quats_close(_q, rpy_deg_to_xyzw(_r))
+        except PoseError as exc:
+            raise HTTPException(status_code=400, detail=f"{tool_id} {label}.pose {exc}") from exc
+        if not agree:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"{tool_id} {label}.pose orientation_xyzw and "
+                    "orientation_rpy_deg disagree; supply only one, or matching values"
+                ),
+            )
+
     if orientation_xyzw is not None:
         pose["orientation_xyzw"] = _numeric_vector_argument(
             orientation_xyzw,
@@ -2554,7 +2579,22 @@ def _normalize_scene_pose_argument(
                 label=f"{label}.pose.orientation_rpy_deg",
             )
     else:
-        pose["orientation_xyzw"] = [0.0, 0.0, 0.0, 1.0]
+        # Fail closed. Omitting orientation when editing an existing object
+        # would silently re-orient it to identity (the historical footgun).
+        # Only a brand-new object declaration (add_object) may fall back to
+        # identity, and it does so explicitly here.
+        if tool_id == "scene_draft_add_object":
+            pose["orientation_xyzw"] = [0.0, 0.0, 0.0, 1.0]
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"{tool_id} {label}.pose orientation is required: supply "
+                    "orientation_xyzw (e.g. copied verbatim from scene state) or "
+                    "orientation_rpy_deg (degrees). Omitting it would reset the "
+                    "object's orientation to identity."
+                ),
+            )
 
     return pose
 
