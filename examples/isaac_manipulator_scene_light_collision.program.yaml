@@ -1,6 +1,6 @@
 api_version: manyforge.program.v0
 program_profile: v0.1
-name: isaac_manipulator_scene_light
+name: isaac_manipulator_scene_light_collision
 description: 'Isaac Sim light-scene reproduction for UR10e + Robotiq 2F-140: robot
   base pose and selected table/object meshes are authored from the live Isaac scene.
   The pick-and-place behavior tree is adapted from the known-good Robotiq demo and

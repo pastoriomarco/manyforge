@@ -41,6 +41,7 @@ from .models import (
     ApplySessionRequest,
     ApplySessionResponse,
 )
+from .runtime_requirements import RuntimeFactoryRequirementsError
 from .state import ComposerState
 from .security import normalize_existing_file_path, normalize_writable_file_path
 
@@ -498,6 +499,11 @@ def create_program_router(state: ComposerState) -> APIRouter:
             _reset_assistant_baselines()
         except HTTPException:
             raise
+        except RuntimeFactoryRequirementsError as exc:
+            # Structured 409: instead of the opaque "ROS 2 controller execution
+            # runtime factory failed" the operator now sees missing components,
+            # the expected lane, and a launcher command they can copy-paste.
+            raise HTTPException(status_code=409, detail=exc.to_detail())
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc))
         except (ProgramValidationError, DeploymentValidationError) as exc:
@@ -1009,6 +1015,24 @@ def create_program_router(state: ComposerState) -> APIRouter:
                 kind_label="Program path",
             )
             program_data = state.program.to_dict()
+            # Stamp the program with a pointer back to the deployment it was
+            # saved with, so the picker can highlight the linked deployment
+            # when this program is selected. Skip when no deployment is loaded
+            # or its source path is unknown (in-memory deployment).
+            if state.deployment is not None and state.deployment_source_path:
+                link: dict[str, Any] = {
+                    "name": state.deployment.name,
+                    "source_path": state.deployment_source_path,
+                }
+                try:
+                    import hashlib
+                    with open(state.deployment_source_path, "rb") as _f:
+                        link["content_sha256"] = hashlib.sha256(_f.read()).hexdigest()
+                except OSError:
+                    # Hash is advisory — drop it if the file is unreadable rather
+                    # than failing the save.
+                    pass
+                program_data["saved_with_deployment"] = link
             if request.tree is not None:
                 program_data["tree"] = request.tree.model_dump()
             if request.scene is not None:

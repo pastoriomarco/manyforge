@@ -1,6 +1,6 @@
 api_version: manyforge.deployment.v0
 schema_version: 0.1.0
-name: isaac_manipulator_scene_light_ros2_control
+name: isaac_manipulator_scene_light_ros2_control_collision
 description: 'Isaac Sim preview deployment for the saved light manipulator scene.
   Planning and scene validation stay on RoboPlan; execution is delegated to a ROS
   2 FollowJointTrajectory arm controller exposed by Isaac Sim through a topic_based_ros2_control

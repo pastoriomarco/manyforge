@@ -437,17 +437,38 @@ def _make_ros2_control_kernel(
     deployment selection and UI/server wiring; the ROS runtime package owns the
     ROS-specific backend that satisfies the core ``IExecutionBackend`` port.
     """
+    # Local import to avoid a top-level cycle and keep this module self-contained
+    # when the ROS adapter isn't installed in this image at all.
+    from .backend.runtime_requirements import (
+        RuntimeFactoryRequirementsError,
+        detect_current_lane,
+    )
+
+    adapter_id = _execution_adapter_id_from_deployment(deployment)
     try:
         from manyforge_ros.ros2_control_kernel_factory import (
             create_ros2_control_kernel,
         )
     except Exception as exc:
-        raise RuntimeError(
-            "Deployment selected ROS 2 controller execution "
-            f"({_execution_adapter_id_from_deployment(deployment)}), but the "
-            "ROS runtime kernel factory is not available. Start Composer in the "
-            "ROS-capable image and build/install the manyforge_ros runtime "
-            "adapter before loading this deployment."
+        # Adapter not present in this image — fundamental lane mismatch. Surface
+        # a structured rejection so the HTTP layer can show the operator what
+        # to launch instead of a generic message.
+        raise RuntimeFactoryRequirementsError(
+            reason_code="ros_adapter_missing",
+            message=(
+                f"Deployment selected ROS 2 controller execution ({adapter_id}), "
+                "but the ROS runtime kernel factory is not available in this "
+                "Composer image. Start Composer in the ROS-capable lane "
+                "(isaac-sim) before loading this deployment."
+            ),
+            missing=("ros_adapter",),
+            expected_lane="isaac-sim",
+            current_lane=detect_current_lane(),
+            suggested_command=(
+                "scripts/launch.sh --lane isaac-sim "
+                "--scenario isaac-ur10e-light-scene restart"
+            ),
+            original_error=str(exc),
         ) from exc
 
     try:
@@ -458,10 +479,25 @@ def _make_ros2_control_kernel(
             runtime_dynamic_body_max_age_cap_ns=runtime_dynamic_body_max_age_cap_ns,
         )
     except Exception as exc:
-        raise RuntimeError(
-            "ROS 2 controller execution runtime factory failed while building "
-            "the Composer kernel. Check the ROS adapter build, deployment "
-            "controller config, and ROS endpoint availability."
+        # Adapter installed but the runtime build failed — check ROS endpoint
+        # availability, controller config, and the adapter build itself. The
+        # cause is included verbatim so the operator can see what JTC / topic /
+        # action lookup actually threw.
+        raise RuntimeFactoryRequirementsError(
+            reason_code="ros_factory_runtime_failed",
+            message=(
+                "ROS 2 controller execution runtime factory failed while building "
+                "the Composer kernel. Check the ROS adapter build, deployment "
+                "controller config, and ROS endpoint availability."
+            ),
+            missing=(),
+            expected_lane="isaac-sim",
+            current_lane=detect_current_lane(),
+            suggested_command=(
+                "scripts/launch.sh --lane isaac-sim "
+                "--scenario isaac-ur10e-light-scene restart"
+            ),
+            original_error=str(exc),
         ) from exc
 
 

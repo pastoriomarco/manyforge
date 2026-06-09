@@ -1624,6 +1624,12 @@ class Program:
         self.blackboard_namespaces: dict[str, BlackboardNamespace] = {}
         self.blackboard_keys: dict[str, BlackboardKey] = {}
         self.tree: Optional[TreeNode] = None
+        # Optional pointer back to the deployment this program was saved with.
+        # Populated by the save endpoint from the currently-loaded deployment;
+        # round-trips through to_dict/from_dict so the picker can highlight the
+        # linked deployment when this program is selected. None for legacy
+        # programs that predate the field.
+        self.saved_with_deployment: Optional[dict[str, Any]] = None
         self._load_and_validate()
 
     @classmethod
@@ -1655,6 +1661,7 @@ class Program:
         self.parameters = {}
         self.blackboard_namespaces = {}
         self.blackboard_keys = {}
+        self.saved_with_deployment = None
         self.tree = None
         self._load_from_data_and_validate(data)
         return self
@@ -1720,6 +1727,7 @@ class Program:
         self.parameters = {}
         self.blackboard_namespaces = {}
         self.blackboard_keys = {}
+        self.saved_with_deployment = None
         self.tree = None
 
         if not isinstance(data, dict):
@@ -1750,6 +1758,17 @@ class Program:
 
         self.catalog_version = data.get("catalog_version", "")
         self.name = data.get("name", "")
+        # Optional save-time pointer to the deployment this program was paired
+        # with. None when absent (legacy programs); validated only as a dict so
+        # legacy YAMLs keep loading. The picker uses this to highlight the
+        # linked deployment when this program is selected.
+        link = data.get("saved_with_deployment")
+        if link is not None and not isinstance(link, dict):
+            raise ProgramValidationError(
+                "saved_with_deployment must be a mapping when present "
+                f"(got {type(link).__name__})"
+            )
+        self.saved_with_deployment = link
         if not isinstance(self.catalog_version, str) or not self.catalog_version.strip():
             raise ProgramValidationError("catalog_version is required")
         if not SEMVER_RE.match(self.catalog_version):
@@ -2035,6 +2054,8 @@ class Program:
                     for key in self.blackboard_keys.values()
                 ],
             }
+        if self.saved_with_deployment:
+            d["saved_with_deployment"] = self.saved_with_deployment
         d["tree"] = self.tree.to_dict() if self.tree else {}
         return d
 
