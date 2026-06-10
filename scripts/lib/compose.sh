@@ -17,17 +17,32 @@ _MANYFORGE_LIB_COMPOSE=1
 source "$(dirname "${BASH_SOURCE[0]}")/runner.sh"
 source "$(dirname "${BASH_SOURCE[0]}")/preflight.sh"
 
+# launch.sh exports MANYFORGE_ROOT; fall back to deriving it from this file's
+# location so compose targeting works even if this lib is sourced standalone.
+: "${MANYFORGE_ROOT:=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
+
 # Result variable for compose_set_lane.
 declare -a COMPOSE_CMD
 
 compose_set_lane() {
     local lane="$1"
+    # Pin --project-directory + -f so compose resolves the same project
+    # ("manyforge") and services regardless of the caller's CWD. Without this,
+    # invoking launch.sh from a directory with no compose file (e.g. the
+    # workspace root) makes up/stop/build silently target nothing — the stop
+    # path then no-ops while still printing "Stop complete", leaving orphaned
+    # containers that the next preflight rejects.
+    local base=(
+        docker compose
+        --project-directory "${MANYFORGE_ROOT}"
+        -f "${MANYFORGE_ROOT}/docker-compose.yaml"
+    )
     case "${lane}" in
         manyforge-only)
-            COMPOSE_CMD=(docker compose)
+            COMPOSE_CMD=("${base[@]}")
             ;;
         isaac-sim)
-            COMPOSE_CMD=(docker compose --profile ros-full)
+            COMPOSE_CMD=("${base[@]}" --profile ros-full)
             ;;
         *)
             fail "compose_set_lane: unknown lane '${lane}'"

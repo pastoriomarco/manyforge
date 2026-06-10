@@ -180,5 +180,12 @@ start_isaac_services() {
 
 stop_isaac_services() {
     step "Stopping Isaac ros2_control preview services"
-    "${COMPOSE_CMD[@]}" stop composer-ros isaac-topic-control >/dev/null 2>&1 || true
+    # Surface a real failure instead of disguising it as "Stop complete":
+    # capture output and warn on non-zero exit (compose stop is idempotent, so
+    # a clean no-op still exits 0). The caller continues either way.
+    local out
+    if ! out="$("${COMPOSE_CMD[@]}" stop composer-ros isaac-topic-control 2>&1)"; then
+        warn "compose stop reported an error (continuing):"
+        printf '%s\n' "${out}" | sed 's/^/    /' >&2
+    fi
 }
