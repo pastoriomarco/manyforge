@@ -177,6 +177,56 @@ _SCENE_RESOURCE_SCHEMA: dict[str, Any] = {
                         "orientation_rpy_deg; omit for identity."
                     ),
                 },
+                "rotate_local_rpy_deg": {
+                    "type": "array",
+                    "items": {"type": "number"},
+                    "minItems": 3,
+                    "maxItems": 3,
+                    "description": (
+                        "RELATIVE rotation: rotate the object's CURRENT orientation "
+                        "by this roll/pitch/yaw in DEGREES, expressed in the object's "
+                        "own (local) axes. Use for requests like 'rotate it 15° about "
+                        "X'. Only valid when the object already exists; supply exactly "
+                        "one orientation form."
+                    ),
+                },
+                "rotate_world_rpy_deg": {
+                    "type": "array",
+                    "items": {"type": "number"},
+                    "minItems": 3,
+                    "maxItems": 3,
+                    "description": (
+                        "RELATIVE rotation expressed in the world/scene axes instead "
+                        "of the object's local axes. Same rules as rotate_local_rpy_deg."
+                    ),
+                },
+                "rpy_delta_deg": {
+                    "type": "array",
+                    "items": {"type": "number"},
+                    "minItems": 3,
+                    "maxItems": 3,
+                    "description": (
+                        "RELATIVE adjustment by ADDING this roll/pitch/yaw delta (degrees) "
+                        "component-wise to the object's current RPY angles (e.g. current "
+                        "[0,11,-40] + [0,73,91] -> [0,84,51]). This is a per-axis angle "
+                        "nudge, not a rigid-body rotation about the axes (use "
+                        "rotate_local_rpy_deg for that). Only valid when the object exists; "
+                        "supply exactly one orientation form."
+                    ),
+                },
+                "orientation_from": {
+                    "type": "object",
+                    "additionalProperties": True,
+                    "description": (
+                        "REFERENCE: adopt orientation from another scene object, e.g. "
+                        "{\"type\": \"object\", \"id\": \"graspable\"}. Use for 'face it "
+                        "the same way as <object>'. Supply exactly one orientation form."
+                    ),
+                    "properties": {
+                        "type": {"type": "string", "enum": ["object"]},
+                        "id": {"type": "string"},
+                    },
+                },
             },
         },
     },
@@ -301,6 +351,10 @@ _SCENE_DRAFT_SINGLE_OBJECT_SCHEMA: dict[str, Any] = {
             "description": "Object orientation as [x, y, z, w]. Omit for identity.",
         },
         "orientation_rpy_deg": _SCENE_RESOURCE_SCHEMA["properties"]["pose"]["properties"]["orientation_rpy_deg"],
+        "rotate_local_rpy_deg": _SCENE_RESOURCE_SCHEMA["properties"]["pose"]["properties"]["rotate_local_rpy_deg"],
+        "rotate_world_rpy_deg": _SCENE_RESOURCE_SCHEMA["properties"]["pose"]["properties"]["rotate_world_rpy_deg"],
+        "rpy_delta_deg": _SCENE_RESOURCE_SCHEMA["properties"]["pose"]["properties"]["rpy_delta_deg"],
+        "orientation_from": _SCENE_RESOURCE_SCHEMA["properties"]["pose"]["properties"]["orientation_from"],
         "sceneResource": {
             **_SCENE_RESOURCE_SCHEMA,
             "description": "Legacy wrapper form accepted for compatibility.",

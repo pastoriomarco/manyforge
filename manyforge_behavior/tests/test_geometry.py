@@ -11,6 +11,7 @@ import pytest
 from manyforge_behavior.geometry import (
     Pose,
     PoseError,
+    add_rpy_deg,
     angle_between,
     compose_local,
     compose_world,
@@ -201,6 +202,45 @@ def test_pose_relative_to_self_is_identity():
     rel = pose_relative_to(p, p)
     assert rel.position_m == pytest.approx((0, 0, 0), abs=1e-9)
     assert quats_close(rel.orientation_xyzw, [0, 0, 0, 1])
+
+
+def test_add_rpy_deg_is_field_add():
+    # The exact case from the live session: [0,11,-40] + [0,73,91] = [0,84,51].
+    start = rpy_deg_to_xyzw([0, 11, -40])
+    got = add_rpy_deg(start, [0, 73, 91])
+    assert xyzw_to_rpy_deg(got) == pytest.approx([0, 84, 51], abs=1e-6)
+
+
+def test_add_rpy_deg_diverges_from_compose_when_tilted():
+    # From a tilted start, field-add != rigid-body composition (the 114° gap).
+    start = rpy_deg_to_xyzw([0, 11, -40])
+    field_add = add_rpy_deg(start, [0, 73, 91])
+    composed = compose_local(compose_local(start, rpy_deg_to_xyzw([0, 73, 0])),
+                             rpy_deg_to_xyzw([0, 0, 91]))
+    assert not quats_close(field_add, composed)
+    assert angle_between(field_add, composed) > 90.0
+
+
+def test_add_rpy_deg_matches_compose_from_pure_yaw():
+    # From a pure yaw the two coincide (why the easy case "worked").
+    start = rpy_deg_to_xyzw([0, 0, -45])
+    field_add = add_rpy_deg(start, [0, 11, 5])
+    composed = compose_local(compose_local(start, rpy_deg_to_xyzw([0, 0, 5])),
+                             rpy_deg_to_xyzw([0, 11, 0]))
+    assert quats_close(field_add, composed)
+
+
+def test_resolve_orientation_rpy_delta_mode():
+    start = rpy_deg_to_xyzw([0, 11, -40])
+    got = resolve_orientation({"rpy_delta_deg": [0, 73, 91]}, current_xyzw=start)
+    assert xyzw_to_rpy_deg(got) == pytest.approx([0, 84, 51], abs=1e-6)
+    # fail-closed without a current orientation
+    with pytest.raises(PoseError):
+        resolve_orientation({"rpy_delta_deg": [0, 73, 91]})
+    # still exactly-one: can't combine with another orientation form
+    with pytest.raises(PoseError):
+        resolve_orientation({"rpy_delta_deg": [0, 1, 0], "rotate_local_rpy_deg": [0, 1, 0]},
+                            current_xyzw=start)
 
 
 def test_pose_relative_to_recovers_offset():

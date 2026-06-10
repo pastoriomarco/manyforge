@@ -69,7 +69,13 @@ from .models import (
     ProgramParameterResponse,
     TreeNodeResponse,
 )
-from manyforge_behavior.geometry import PoseError, quats_close, rpy_deg_to_xyzw
+from manyforge_behavior.geometry import (
+    PoseError,
+    normalize_quat,
+    quats_close,
+    resolve_orientation,
+    rpy_deg_to_xyzw,
+)
 from .routes_scene import (
     augment_pose_orientation_rpy_deg,
     build_scene_state_payload,
@@ -2485,6 +2491,116 @@ def _normalize_scene_shape_argument(
     )
 
 
+_ORIENTATION_INTENT_PARAM_KEYS = (
+    "rotate_local_rpy_deg",
+    "rotate_world_rpy_deg",
+    "orientation_from",
+)
+
+
+def _pose_current_orientation_xyzw(pose: Any) -> list[float] | None:
+    """Current orientation of a stored pose dict as a quaternion, or None."""
+    if not isinstance(pose, dict):
+        return None
+    if pose.get("orientation_xyzw") is not None:
+        try:
+            return normalize_quat(pose["orientation_xyzw"])
+        except PoseError:
+            return None
+    if pose.get("orientation_rpy_deg") is not None:
+        try:
+            return rpy_deg_to_xyzw(pose["orientation_rpy_deg"])
+        except PoseError:
+            return None
+    return None
+
+
+def _draft_object_orientation_xyzw(state: ComposerState, object_id: Any) -> list[float] | None:
+    """A draft scene object's current orientation (quaternion), or None.
+
+    Resolves relative (rotate_*) and reference (orientation_from) pose authoring
+    intents against the live draft — never against an implicit identity.
+    """
+    if not isinstance(object_id, str) or not object_id.strip() or state.program is None:
+        return None
+    try:
+        scene = state.program.to_dict().get("scene") or []
+    except Exception:  # pragma: no cover - defensive against draft shape drift
+        return None
+    target = object_id.strip()
+    for item in scene:
+        if isinstance(item, dict) and item.get("object_id") == target:
+            return _pose_current_orientation_xyzw(item.get("pose"))
+    return None
+
+
+def _scene_reference_resolver(state: ComposerState):
+    def _resolve(ref: Any) -> list[float] | None:
+        if isinstance(ref, dict):
+            return _draft_object_orientation_xyzw(state, ref.get("id") or ref.get("object_id"))
+        return _draft_object_orientation_xyzw(state, ref)
+
+    return _resolve
+
+
+def _resolve_orientation_intent_or_400(
+    state: ComposerState,
+    *,
+    intent: dict[str, Any],
+    current_xyzw: list[float] | None,
+    detail_prefix: str,
+) -> list[float]:
+    """Resolve an authoring intent to a canonical quaternion, mapping the
+    fail-closed PoseError (missing current/source, disagreement) to HTTP 400."""
+    try:
+        return [
+            float(v)
+            for v in resolve_orientation(
+                intent,
+                current_xyzw=current_xyzw,
+                resolve_reference=_scene_reference_resolver(state),
+            )
+        ]
+    except PoseError as exc:
+        raise HTTPException(status_code=400, detail=f"{detail_prefix} {exc}") from exc
+
+
+def _merge_pose_params(
+    state: ComposerState,
+    old_pose: dict[str, Any],
+    new_pose: dict[str, Any],
+) -> dict[str, Any]:
+    """Deep-merge a partial pose update. Resolves orientation authoring intents
+    against the prior orientation and keeps exactly one orientation form (the
+    persisted-artifact contract, spec 420 §4A)."""
+    merged = {**old_pose, **new_pose}
+    intent = {k: new_pose[k] for k in _ORIENTATION_INTENT_PARAM_KEYS if new_pose.get(k) is not None}
+    has_absolute = (
+        new_pose.get("orientation_xyzw") is not None
+        or new_pose.get("orientation_rpy_deg") is not None
+    )
+    if intent:
+        if len(intent) > 1 or has_absolute:
+            raise HTTPException(
+                status_code=400,
+                detail="pose: supply exactly one orientation form",
+            )
+        merged["orientation_xyzw"] = _resolve_orientation_intent_or_400(
+            state,
+            intent=intent,
+            current_xyzw=_pose_current_orientation_xyzw(old_pose),
+            detail_prefix="pose",
+        )
+        merged.pop("orientation_rpy_deg", None)
+        for key in _ORIENTATION_INTENT_PARAM_KEYS:
+            merged.pop(key, None)
+    elif new_pose.get("orientation_xyzw") is not None:
+        merged.pop("orientation_rpy_deg", None)
+    elif new_pose.get("orientation_rpy_deg") is not None:
+        merged.pop("orientation_xyzw", None)
+    return merged
+
+
 def _normalize_scene_pose_argument(
     state: ComposerState,
     raw_resource: dict[str, Any],
@@ -2552,6 +2668,51 @@ def _normalize_scene_pose_argument(
                     "orientation_rpy_deg disagree; supply only one, or matching values"
                 ),
             )
+
+    # Relative (rotate_*) / reference (orientation_from) authoring intents resolve
+    # against the object's CURRENT orientation in the draft, at the geometry
+    # boundary — never against an implicit identity (spec 420 §4A.4).
+    rotate_local = _first_mapping_value(raw_pose, "rotate_local_rpy_deg", "rotateLocalRpyDeg")
+    if rotate_local is None:
+        rotate_local = _first_mapping_value(raw_resource, "rotate_local_rpy_deg", "rotateLocalRpyDeg")
+    rotate_world = _first_mapping_value(raw_pose, "rotate_world_rpy_deg", "rotateWorldRpyDeg")
+    if rotate_world is None:
+        rotate_world = _first_mapping_value(raw_resource, "rotate_world_rpy_deg", "rotateWorldRpyDeg")
+    orientation_from = _first_mapping_value(raw_pose, "orientation_from", "orientationFrom")
+    if orientation_from is None:
+        orientation_from = _first_mapping_value(raw_resource, "orientation_from", "orientationFrom")
+
+    intent: dict[str, Any] = {}
+    if rotate_local is not None:
+        intent["rotate_local_rpy_deg"] = _numeric_vector_argument(
+            rotate_local, length=3, label=f"{label}.pose.rotate_local_rpy_deg"
+        )
+    if rotate_world is not None:
+        intent["rotate_world_rpy_deg"] = _numeric_vector_argument(
+            rotate_world, length=3, label=f"{label}.pose.rotate_world_rpy_deg"
+        )
+    if orientation_from is not None:
+        intent["orientation_from"] = orientation_from
+
+    if intent:
+        if (
+            len(intent) > 1
+            or orientation_xyzw is not None
+            or orientation_rpy is not None
+            or orientation is not None
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=f"{tool_id} {label}.pose: supply exactly one orientation form",
+            )
+        object_id = _first_mapping_value(raw_resource, "objectId", "object_id", "id", "name")
+        pose["orientation_xyzw"] = _resolve_orientation_intent_or_400(
+            state,
+            intent=intent,
+            current_xyzw=_draft_object_orientation_xyzw(state, object_id),
+            detail_prefix=f"{tool_id} {label}.pose",
+        )
+        return pose
 
     if orientation_xyzw is not None:
         pose["orientation_xyzw"] = _numeric_vector_argument(
@@ -3489,8 +3650,15 @@ def _apply_tree_draft_update_node_params(
         # position investigation).
         old_pose = old_params.get("pose")
         new_pose = params.get("pose")
-        if isinstance(old_pose, dict) and isinstance(new_pose, dict):
-            merged["pose"] = {**old_pose, **new_pose}
+        if isinstance(new_pose, dict):
+            # Resolve relative/reference orientation intents against the prior
+            # pose and keep exactly one orientation form. Also preserves the
+            # previously-stored position_m / frame_id on a partial update.
+            merged["pose"] = _merge_pose_params(
+                state,
+                old_pose if isinstance(old_pose, dict) else {},
+                new_pose,
+            )
         target["params"] = merged
     else:
         target["params"] = dict(params)

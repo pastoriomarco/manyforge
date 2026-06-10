@@ -97,6 +97,22 @@ def compose_world(current_xyzw: Any, delta_xyzw: Any) -> list[float]:
     return quat_mul(delta_xyzw, current_xyzw)
 
 
+def add_rpy_deg(current_xyzw: Any, delta_rpy_deg: Any) -> list[float]:
+    """Component-wise add a degrees delta to the current orientation's RPY.
+
+    This is **field-add semantics**, NOT a rigid-body rotation: it decomposes
+    ``current_xyzw`` into intrinsic-ZYX roll/pitch/yaw, adds the per-component
+    delta, and recomposes. For a pure-yaw start it coincides with composing the
+    rotation, but in general it does not (e.g. from a tilted pose the two
+    diverge). The result therefore depends on the canonical RPY decomposition of
+    the current orientation. Offered as an explicit, user-selected alternative to
+    ``compose_local``/``compose_world`` for authoring in RPY space.
+    """
+    cur = xyzw_to_rpy_deg(current_xyzw)
+    d = _finite_list(delta_rpy_deg, 3, "rpy_delta_deg")
+    return rpy_deg_to_xyzw([cur[0] + d[0], cur[1] + d[1], cur[2] + d[2]])
+
+
 def quat_conjugate(q: Any) -> list[float]:
     """Inverse rotation of a unit quaternion [x, y, z, w]."""
     x, y, z, w = normalize_quat(q)
@@ -193,8 +209,11 @@ def parse_pose(raw: Any, *, allow_legacy: bool = False) -> Pose:
 
 _ABSOLUTE_INTENT_KEYS = ("orientation_xyzw", "orientation_rpy_deg")
 _RELATIVE_INTENT_KEYS = ("rotate_local_rpy_deg", "rotate_world_rpy_deg")
+_DELTA_INTENT_KEYS = ("rpy_delta_deg",)
 _REFERENCE_INTENT_KEYS = ("orientation_from",)
-ORIENTATION_INTENT_KEYS = _ABSOLUTE_INTENT_KEYS + _RELATIVE_INTENT_KEYS + _REFERENCE_INTENT_KEYS
+ORIENTATION_INTENT_KEYS = (
+    _ABSOLUTE_INTENT_KEYS + _RELATIVE_INTENT_KEYS + _DELTA_INTENT_KEYS + _REFERENCE_INTENT_KEYS
+)
 
 
 def resolve_orientation(
@@ -206,13 +225,15 @@ def resolve_orientation(
     """Resolve one orientation authoring intent → canonical unit quaternion.
 
     Exactly one intent mode is present (an agreeing absolute xyzw/rpy pair counts
-    as one). Absolute modes need nothing else; relative modes
+    as one). Absolute modes need nothing else; relative-compose modes
     (``rotate_local_rpy_deg`` / ``rotate_world_rpy_deg``) compose a degrees delta
-    against ``current_xyzw`` in an explicit basis; the reference mode
-    (``orientation_from``) adopts orientation from another resource via
-    ``resolve_reference(ref) -> xyzw``. All conversion/composition happens here —
-    never in the agent. Fail closed: a missing current/source orientation is an
-    error, never an implicit identity.
+    against ``current_xyzw`` in an explicit basis; ``rpy_delta_deg`` adds a
+    degrees delta component-wise to the current orientation's RPY (field-add, not
+    composition — see ``add_rpy_deg``); the reference mode (``orientation_from``)
+    adopts orientation from another resource via ``resolve_reference(ref) ->
+    xyzw``. All conversion/composition happens here — never in the agent. Fail
+    closed: a missing current/source orientation is an error, never an implicit
+    identity.
     """
     if not isinstance(intent, dict):
         raise PoseError("orientation intent must be an object")
@@ -243,6 +264,13 @@ def resolve_orientation(
         if key == "rotate_local_rpy_deg":
             return compose_local(current_xyzw, delta)
         return compose_world(current_xyzw, delta)
+    if key == "rpy_delta_deg":
+        if current_xyzw is None:
+            raise PoseError(
+                "rpy_delta_deg adds to the current orientation's angles and needs "
+                "a current orientation; none was resolvable"
+            )
+        return add_rpy_deg(current_xyzw, intent[key])
     # orientation_from (reference)
     if resolve_reference is None:
         raise PoseError("orientation_from requires a reference resolver")
