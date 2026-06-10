@@ -20,6 +20,7 @@
 #include <manyforge_core/types/motion_interrupt.hpp>
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
@@ -352,6 +353,22 @@ class ExecutionKernel {
   InterruptRuntimeContext current_interrupt_context() const;
   void emit_interrupt_events(const InterruptIngestResult& result);
 
+  /// Operator-stop worker lifecycle. Operator stops can run a
+  /// deployment-configured controlled-stop profile; that backend call may take
+  /// the soft-stop deceleration window. Keep the API admission path short and
+  /// run the long backend work on this cancellable worker instead.
+  bool cancel_operator_stop_worker(bool invalidate_generation);
+  void join_finished_operator_stop_worker();
+  bool wait_for_operator_stop_worker(std::chrono::steady_clock::duration timeout);
+  bool start_operator_stop_worker(MotionInterruptStopProfileDTO profile,
+                                  ExecutionState pre_completion_state);
+  void run_operator_stop_worker(std::uint64_t generation,
+                                MotionInterruptStopProfileDTO profile,
+                                ExecutionState pre_completion_state,
+                                std::stop_token stop_token);
+  bool operator_stop_worker_is_current(std::uint64_t generation,
+                                       std::stop_token stop_token) const;
+
   // Motion-scope lifecycle plumbing on the worker thread.
   // `active_motion_execution_` is reset at execute() entry and populated
   // by `arm_motion_scopes_for_dispatch_locked` after validation passes.
@@ -463,13 +480,19 @@ class ExecutionKernel {
   std::mutex completion_mutex_;
   std::atomic<bool> execution_complete_{false};
   std::atomic<bool> resume_requested_{false};
-  // Set by `ExecutionKernel::stop()` when the operator-stop
-  // profile path has already invoked the backend (controlled-stop
-  // plus optional emergency legacy fallback). The stop_policy callback
-  // consumes the flag with `exchange(false)` so internal hard-stop
-  // callers (planning-timeout watchdog, resume-validation failure)
-  // still get the legacy backend.stop() they expect.
-  std::atomic<bool> operator_stop_handled_backend_call_{false};
+  std::atomic<bool> execute_admission_interruptible_{false};
+  std::atomic<bool> lifecycle_stop_requested_while_busy_{false};
+  std::atomic<bool> lifecycle_stop_requested_event_emitted_{false};
+  std::atomic<bool> lifecycle_reset_requested_while_busy_{false};
+  std::atomic<bool> lifecycle_reset_waiting_for_stop_{false};
+  mutable std::mutex operator_stop_mutex_;
+  std::condition_variable operator_stop_cv_;
+  std::jthread operator_stop_thread_;
+  std::uint64_t operator_stop_generation_{0};
+  std::atomic<bool> operator_stop_worker_active_{false};
+  mutable std::mutex operator_stop_error_mutex_;
+  std::optional<ErrorDTO> operator_stop_terminal_error_;
+  std::optional<ErrorDTO> operator_stop_intervention_error_;
 
   mutable std::mutex collision_monitor_mutex_;
   ScheduleHandle collision_monitor_handle_{0};

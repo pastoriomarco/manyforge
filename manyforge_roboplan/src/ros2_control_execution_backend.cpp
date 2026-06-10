@@ -1799,8 +1799,32 @@ Ros2ControlExecutionBackend::get_motion_interrupt_stop_capability() const {
 core::ControlledStopResultDTO
 Ros2ControlExecutionBackend::execute_controlled_stop(
     const core::MotionInterruptStopProfileDTO& profile) {
+  return execute_controlled_stop(profile, std::stop_token{});
+}
+
+core::ControlledStopResultDTO
+Ros2ControlExecutionBackend::execute_controlled_stop(
+    const core::MotionInterruptStopProfileDTO& profile,
+    std::stop_token stop_token) {
   core::ControlledStopResultDTO result;
   result.executed_stop_mode = profile.stop_mode;
+  const auto cancelled_result = [&](std::string phase) {
+    result.accepted = true;
+    result.backend_stop_confirmed = false;
+    result.error = core::ErrorDTO{
+        std::string(core::kErrorMotionInterruptBackendStopFailed),
+        "ros2_control controlled stop was preempted by a later intervention",
+        {{"reason", "controlled_stop_cancelled"},
+         {"phase", std::move(phase)}}};
+    return result;
+  };
+  std::stop_callback stop_notify(stop_token, [this]() {
+    execution_cv_.notify_all();
+    managed_fjt_cv_.notify_all();
+  });
+  if (stop_token.stop_requested()) {
+    return cancelled_result("entry");
+  }
 
   // Defense in depth: kernel arm-time gate already rejects modes the
   // backend has not declared; this guard is a second line of defense
@@ -1923,7 +1947,7 @@ Ros2ControlExecutionBackend::execute_controlled_stop(
         if (!fallback_profile.deceleration_time_s.has_value()) {
           fallback_profile.deceleration_time_s = 0.05;
         }
-        auto fallback = execute_controlled_stop(fallback_profile);
+        auto fallback = execute_controlled_stop(fallback_profile, stop_token);
         fallback.executed_stop_mode =
             core::MotionInterruptStopMode::kSpringBackHold;
         fallback.fallback_reason = reason;
@@ -2025,7 +2049,12 @@ Ros2ControlExecutionBackend::execute_controlled_stop(
               lock,
               std::chrono::duration_cast<std::chrono::nanoseconds>(
                   std::chrono::duration<double>(wait_s)),
-              [this]() { return terminal_; });
+              [this, &stop_token]() {
+                return terminal_ || stop_token.stop_requested();
+              });
+        }
+        if (stop_token.stop_requested()) {
+          return cancelled_result("soft_on_path_natural_completion_wait");
         }
         const auto call_end = std::chrono::steady_clock::now();
         result.confirmation_latency_ns = std::max<std::int64_t>(
@@ -2082,6 +2111,10 @@ Ros2ControlExecutionBackend::execute_controlled_stop(
     const auto dispatch_start = std::chrono::steady_clock::now();
     const bool dispatched = send_fjt_replacement_trajectory(
         planned.value().replacement_trajectory, /*track_terminal_goal=*/true);
+    if (stop_token.stop_requested()) {
+      clear_controlled_stop_path_deviation_tracking();
+      return cancelled_result("soft_on_path_dispatch");
+    }
     const auto dispatch_accepted = std::chrono::steady_clock::now();
     const auto backend_call_to_goal_dispatch_ns =
         std::max<std::int64_t>(
@@ -2157,9 +2190,22 @@ Ros2ControlExecutionBackend::execute_controlled_stop(
           lock,
           std::chrono::duration_cast<std::chrono::nanoseconds>(
               std::chrono::duration<double>(wait_s)),
-          [this]() { return managed_fjt_terminal_result_received_; });
+          [this, &stop_token]() {
+            return managed_fjt_terminal_result_received_ ||
+                   stop_token.stop_requested();
+          });
       success = managed_fjt_terminal_result_success_;
       terminal_error = managed_fjt_terminal_error_;
+    }
+    if (stop_token.stop_requested()) {
+      GoalHandleFJT::SharedPtr path_ramp_goal;
+      {
+        std::lock_guard<std::mutex> lock(managed_fjt_mutex_);
+        path_ramp_goal = managed_fjt_goal_;
+      }
+      cancel_goal_if_known(path_ramp_goal);
+      clear_controlled_stop_path_deviation_tracking();
+      return cancelled_result("soft_on_path_terminal_wait");
     }
     const auto call_end = std::chrono::steady_clock::now();
     result.confirmation_latency_ns = std::max<std::int64_t>(
@@ -2345,8 +2391,13 @@ Ros2ControlExecutionBackend::execute_controlled_stop(
           lock,
           std::chrono::duration_cast<std::chrono::nanoseconds>(
               std::chrono::duration<double>(wait_s)),
-          [this]() { return !running_ || terminal_; });
+          [this, &stop_token]() {
+            return !running_ || terminal_ || stop_token.stop_requested();
+          });
       observed_result_code = last_action_result_code_;
+    }
+    if (stop_token.stop_requested()) {
+      return cancelled_result("hard_deceleration_wait");
     }
     {
       std::lock_guard<std::mutex> lock(state_mutex_);
@@ -2486,6 +2537,9 @@ Ros2ControlExecutionBackend::execute_controlled_stop(
   const auto call_start = std::chrono::steady_clock::now();
   const bool dispatched = send_fjt_anchored_goal(
       joint_names, observed_positions, ramp_s, /*track_terminal_goal=*/true);
+  if (stop_token.stop_requested()) {
+    return cancelled_result("spring_back_dispatch");
+  }
   if (!dispatched) {
     std::optional<core::ErrorDTO> dispatch_error;
     {
@@ -2516,9 +2570,15 @@ Ros2ControlExecutionBackend::execute_controlled_stop(
         lock,
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::duration<double>(wait_s)),
-        [this]() { return managed_fjt_terminal_result_received_; });
+        [this, &stop_token]() {
+          return managed_fjt_terminal_result_received_ ||
+                 stop_token.stop_requested();
+        });
     success = managed_fjt_terminal_result_success_;
     terminal_error = managed_fjt_terminal_error_;
+  }
+  if (stop_token.stop_requested()) {
+    return cancelled_result("spring_back_terminal_wait");
   }
   const auto call_end = std::chrono::steady_clock::now();
   result.confirmation_latency_ns = std::max<std::int64_t>(

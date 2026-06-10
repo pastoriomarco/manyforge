@@ -12,6 +12,7 @@
 #include <limits>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <thread>
 #include <vector>
@@ -432,6 +433,9 @@ class ControlledExecution : public IExecutionBackend {
   ExecutionSnapshot snapshot;
   bool terminal_handle_on_pause = false;
   std::function<void()> on_get_snapshot;
+  int sync_observed_state_count = 0;
+  bool block_sync_observed_state = false;
+  bool release_blocked_sync_observed_state = false;
 
   ExecutionHandle execute_trajectory(const TrajectoryDTO& trajectory) override {
     {
@@ -451,6 +455,14 @@ class ControlledExecution : public IExecutionBackend {
   }
 
   Result<void> sync_observed_state_before_planning() override {
+    std::unique_lock<std::mutex> lock(mu_);
+    ++sync_observed_state_count;
+    cv_.notify_all();
+    if (block_sync_observed_state) {
+      cv_.wait_for(lock, std::chrono::seconds(2), [this]() {
+        return release_blocked_sync_observed_state;
+      });
+    }
     return Result<void>::Ok();
   }
 
@@ -569,10 +581,19 @@ class ControlledExecution : public IExecutionBackend {
   // vector unchanged (the trajectory waypoints from execute_trajectory).
   std::optional<std::vector<double>> next_post_stop_joint_positions_rad;
   int controlled_stop_count = 0;
+  int controlled_stop_cancel_count = 0;
   MotionInterruptStopProfileDTO last_controlled_stop_profile;
+  bool block_controlled_stop = false;
+  bool release_blocked_controlled_stop = false;
 
   ControlledStopResultDTO execute_controlled_stop(
       const MotionInterruptStopProfileDTO& profile) override {
+    return execute_controlled_stop(profile, std::stop_token{});
+  }
+
+  ControlledStopResultDTO execute_controlled_stop(
+      const MotionInterruptStopProfileDTO& profile,
+      std::stop_token stop_token) override {
     ControlledStopResultDTO r;
     if (next_controlled_stop_result) {
       r = *next_controlled_stop_result;
@@ -585,9 +606,35 @@ class ControlledExecution : public IExecutionBackend {
       r.confirmation_latency_ns = 1'000'000;
     }
     {
-      std::lock_guard<std::mutex> lock(mu_);
+      std::unique_lock<std::mutex> lock(mu_);
       ++controlled_stop_count;
       last_controlled_stop_profile = profile;
+      cv_.notify_all();
+      if (block_controlled_stop) {
+        std::stop_callback stop_notify(stop_token, [this]() {
+          cv_.notify_all();
+        });
+        const bool released = cv_.wait_for(
+            lock, std::chrono::seconds(2), [this, &stop_token]() {
+              return release_blocked_controlled_stop ||
+                     stop_token.stop_requested();
+            });
+        if (!released || stop_token.stop_requested()) {
+          ++controlled_stop_cancel_count;
+          running_ = false;
+          paused_ = false;
+          snapshot.state = ExecutionState::kStopped;
+          r.accepted = true;
+          r.backend_stop_confirmed = false;
+          r.error = ErrorDTO{
+              std::string(kErrorMotionInterruptBackendStopFailed),
+              "controlled stop cancelled by test",
+              {{"reason", released ? "controlled_stop_cancelled"
+                                    : "controlled_stop_test_timeout"}}};
+          cv_.notify_all();
+          return r;
+        }
+      }
       // Only flip the backend's internal state to Stopped when the
       // controlled-stop actually succeeded. A refused / unconfirmed /
       // errored result means the controller did NOT actually stop,
@@ -663,6 +710,16 @@ class ControlledExecution : public IExecutionBackend {
                         [this]() { return execute_count > 0; });
   }
 
+  bool wait_until_sync_observed_state_count(
+      int count,
+      std::chrono::milliseconds timeout = std::chrono::milliseconds(2000)) {
+    std::unique_lock<std::mutex> lock(mu_);
+    return cv_.wait_for(lock, timeout,
+                        [this, count]() {
+                          return sync_observed_state_count >= count;
+                        });
+  }
+
   bool wait_until_execute_count(
       int count,
       std::chrono::milliseconds timeout = std::chrono::milliseconds(2000)) {
@@ -682,6 +739,50 @@ class ControlledExecution : public IExecutionBackend {
     std::unique_lock<std::mutex> lock(mu_);
     return cv_.wait_for(lock, timeout,
                         [this]() { return resume_count > 0; });
+  }
+
+  bool wait_until_stop_count(
+      int count,
+      std::chrono::milliseconds timeout = std::chrono::milliseconds(2000)) {
+    std::unique_lock<std::mutex> lock(mu_);
+    return cv_.wait_for(lock, timeout,
+                        [this, count]() { return stop_count >= count; });
+  }
+
+  bool wait_until_controlled_stop_count(
+      int count,
+      std::chrono::milliseconds timeout = std::chrono::milliseconds(2000)) {
+    std::unique_lock<std::mutex> lock(mu_);
+    return cv_.wait_for(lock, timeout,
+                        [this, count]() {
+                          return controlled_stop_count >= count;
+                        });
+  }
+
+  bool wait_until_controlled_stop_cancel_count(
+      int count,
+      std::chrono::milliseconds timeout = std::chrono::milliseconds(2000)) {
+    std::unique_lock<std::mutex> lock(mu_);
+    return cv_.wait_for(lock, timeout,
+                        [this, count]() {
+                          return controlled_stop_cancel_count >= count;
+                        });
+  }
+
+  void release_controlled_stop() {
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      release_blocked_controlled_stop = true;
+    }
+    cv_.notify_all();
+  }
+
+  void release_sync_observed_state() {
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      release_blocked_sync_observed_state = true;
+    }
+    cv_.notify_all();
   }
 
  private:
@@ -2033,6 +2134,9 @@ TEST_F(ExecutionKernelTest, Stop_FromCompleted_NotAccepted) {
 TEST_F(ExecutionKernelTest, Pause_FromIdle_NotAccepted) {
   auto result = kernel.pause();
   EXPECT_FALSE(result.accepted);
+  ASSERT_TRUE(result.error.has_value());
+  EXPECT_EQ(result.error->code, kErrorInvalidRequest);
+  EXPECT_EQ(result.error->details.at("reason_code"), "pause_not_executing");
 }
 
 // --- Resume ---
@@ -2589,6 +2693,8 @@ TEST_F(ExecutionKernelTest,
   // Operator stop button.
   auto stop_dto = local_kernel.stop();
   EXPECT_TRUE(stop_dto.accepted);
+  ASSERT_TRUE(controlled_execution.wait_until_controlled_stop_count(1));
+  ASSERT_TRUE(wait_for_state(local_kernel, ExecutionState::kStopped));
   EXPECT_EQ(controlled_execution.controlled_stop_count, 1);
   EXPECT_EQ(controlled_execution.stop_count, 0);
   EXPECT_EQ(controlled_execution.last_controlled_stop_profile.profile_id,
@@ -2597,15 +2703,447 @@ TEST_F(ExecutionKernelTest,
             MotionInterruptStopMode::kSoftOnPath);
 }
 
+TEST_F(ExecutionKernelTest,
+       Stop_OperatorStopProfileReturnsBeforeControlledStopCompletes) {
+  ControlledExecution controlled_execution;
+  controlled_execution.block_controlled_stop = true;
+  ThreadSafeFakeClock local_clock;
+  ThreadSafeManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  ExecutionKernelConfig config;
+  MotionInterruptStopProfileDTO op_profile;
+  op_profile.profile_id = "operator_stop_soft_on_path";
+  op_profile.stop_mode = MotionInterruptStopMode::kSoftOnPath;
+  op_profile.deceleration_time_s = 0.3;
+  op_profile.per_joint_max_deceleration_rad_s2 = {{"j1", 8.0}, {"j2", 8.0}};
+  config.operator_stop_profile =
+      std::make_shared<MotionInterruptStopProfileDTO>(op_profile);
+  ExecutionKernel local_kernel{planner,
+                               context,
+                               controlled_execution,
+                               local_clock,
+                               local_scheduler,
+                               local_cache,
+                               config};
+  MockCollisionWorldPublisher local_publisher;
+  auto local_engine = std::make_shared<MockCollisionEngine>();
+  configure_authoritative_collision_validation(local_kernel, local_publisher,
+                                                local_engine);
+  controlled_execution.motion_interrupt_stop_capability.supported_stop_modes =
+      {MotionInterruptStopMode::kSoftOnPath,
+       MotionInterruptStopMode::kSpringBackHold};
+  std::mutex events_mutex;
+  std::vector<KernelEvent> events;
+  local_kernel.subscribe_events([&](const KernelEvent& e) {
+    std::lock_guard<std::mutex> lock(events_mutex);
+    events.push_back(e);
+  });
+
+  auto result = local_kernel.execute(make_test_request());
+  ASSERT_TRUE(result.ok());
+  ASSERT_TRUE(controlled_execution.wait_until_execute_called());
+  ASSERT_TRUE(wait_for_state(local_kernel, ExecutionState::kExecuting));
+
+  const auto start = std::chrono::steady_clock::now();
+  auto stop_dto = local_kernel.stop();
+  const auto elapsed = std::chrono::steady_clock::now() - start;
+  EXPECT_TRUE(stop_dto.accepted);
+  EXPECT_LT(std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count(),
+            100);
+  ASSERT_TRUE(controlled_execution.wait_until_controlled_stop_count(1));
+  EXPECT_EQ(local_kernel.get_status().state, ExecutionState::kStopping);
+
+  controlled_execution.release_controlled_stop();
+  ASSERT_TRUE(wait_for_state(local_kernel, ExecutionState::kStopped));
+}
+
+TEST_F(ExecutionKernelTest,
+       Stop_SecondStopDuringOperatorControlledStopIsIdempotent) {
+  ControlledExecution controlled_execution;
+  controlled_execution.block_controlled_stop = true;
+  ThreadSafeFakeClock local_clock;
+  ThreadSafeManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  ExecutionKernelConfig config;
+  MotionInterruptStopProfileDTO op_profile;
+  op_profile.profile_id = "operator_stop_soft_on_path";
+  op_profile.stop_mode = MotionInterruptStopMode::kSoftOnPath;
+  op_profile.deceleration_time_s = 0.3;
+  op_profile.per_joint_max_deceleration_rad_s2 = {{"j1", 8.0}, {"j2", 8.0}};
+  config.operator_stop_profile =
+      std::make_shared<MotionInterruptStopProfileDTO>(op_profile);
+  ExecutionKernel local_kernel{planner,
+                               context,
+                               controlled_execution,
+                               local_clock,
+                               local_scheduler,
+                               local_cache,
+                               config};
+  MockCollisionWorldPublisher local_publisher;
+  auto local_engine = std::make_shared<MockCollisionEngine>();
+  configure_authoritative_collision_validation(local_kernel, local_publisher,
+                                                local_engine);
+  controlled_execution.motion_interrupt_stop_capability.supported_stop_modes =
+      {MotionInterruptStopMode::kSoftOnPath,
+       MotionInterruptStopMode::kSpringBackHold};
+
+  auto result = local_kernel.execute(make_test_request());
+  ASSERT_TRUE(result.ok());
+  ASSERT_TRUE(controlled_execution.wait_until_execute_called());
+  ASSERT_TRUE(wait_for_state(local_kernel, ExecutionState::kExecuting));
+
+  ASSERT_TRUE(local_kernel.stop().accepted);
+  ASSERT_TRUE(controlled_execution.wait_until_controlled_stop_count(1));
+  ASSERT_TRUE(wait_for_state(local_kernel, ExecutionState::kStopping));
+
+  const auto start = std::chrono::steady_clock::now();
+  auto second_stop = local_kernel.stop();
+  const auto elapsed = std::chrono::steady_clock::now() - start;
+  EXPECT_TRUE(second_stop.accepted);
+  EXPECT_LT(std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count(),
+            100);
+  EXPECT_EQ(controlled_execution.stop_count, 0);
+  EXPECT_EQ(controlled_execution.controlled_stop_cancel_count, 0);
+  EXPECT_EQ(local_kernel.get_status().state, ExecutionState::kStopping);
+
+  controlled_execution.release_controlled_stop();
+  ASSERT_TRUE(wait_for_state(local_kernel, ExecutionState::kStopped));
+}
+
+TEST_F(ExecutionKernelTest,
+       Reset_WaitsForBlockedOperatorControlledStopThenResets) {
+  ControlledExecution controlled_execution;
+  controlled_execution.block_controlled_stop = true;
+  ThreadSafeFakeClock local_clock;
+  ThreadSafeManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  ExecutionKernelConfig config;
+  MotionInterruptStopProfileDTO op_profile;
+  op_profile.profile_id = "operator_stop_soft_on_path";
+  op_profile.stop_mode = MotionInterruptStopMode::kSoftOnPath;
+  op_profile.deceleration_time_s = 0.3;
+  op_profile.per_joint_max_deceleration_rad_s2 = {{"j1", 8.0}, {"j2", 8.0}};
+  config.operator_stop_profile =
+      std::make_shared<MotionInterruptStopProfileDTO>(op_profile);
+  ExecutionKernel local_kernel{planner,
+                               context,
+                               controlled_execution,
+                               local_clock,
+                               local_scheduler,
+                               local_cache,
+                               config};
+  MockCollisionWorldPublisher local_publisher;
+  auto local_engine = std::make_shared<MockCollisionEngine>();
+  configure_authoritative_collision_validation(local_kernel, local_publisher,
+                                                local_engine);
+  controlled_execution.motion_interrupt_stop_capability.supported_stop_modes =
+      {MotionInterruptStopMode::kSoftOnPath,
+       MotionInterruptStopMode::kSpringBackHold};
+  std::mutex events_mutex;
+  std::vector<KernelEvent> events;
+  local_kernel.subscribe_events([&](const KernelEvent& e) {
+    std::lock_guard<std::mutex> lock(events_mutex);
+    events.push_back(e);
+  });
+
+  auto result = local_kernel.execute(make_test_request());
+  ASSERT_TRUE(result.ok());
+  ASSERT_TRUE(controlled_execution.wait_until_execute_called());
+  ASSERT_TRUE(wait_for_state(local_kernel, ExecutionState::kExecuting));
+
+  ASSERT_TRUE(local_kernel.stop().accepted);
+  ASSERT_TRUE(controlled_execution.wait_until_controlled_stop_count(1));
+  ASSERT_TRUE(wait_for_state(local_kernel, ExecutionState::kStopping));
+
+  std::optional<ResetResultDTO> reset;
+  std::thread reset_thread([&]() {
+    reset = local_kernel.reset();
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  EXPECT_FALSE(reset.has_value())
+      << "reset must wait for the selected stop before publishing Idle";
+  EXPECT_EQ(local_kernel.get_status().state, ExecutionState::kStopping);
+
+  controlled_execution.release_controlled_stop();
+  reset_thread.join();
+
+  ASSERT_TRUE(reset.has_value());
+  EXPECT_TRUE(reset->accepted);
+  EXPECT_EQ(controlled_execution.controlled_stop_cancel_count, 0);
+  EXPECT_EQ(controlled_execution.reset_count, 1);
+  EXPECT_EQ(local_kernel.get_status().state, ExecutionState::kIdle);
+  std::lock_guard<std::mutex> lock(events_mutex);
+  EXPECT_TRUE(std::any_of(events.begin(), events.end(),
+                          [](const KernelEvent& e) {
+                            return e.type == KernelEventType::kStateTransition &&
+                                   e.from_state == ExecutionState::kStopped &&
+                                   e.to_state == ExecutionState::kIdle;
+                          }));
+}
+
+TEST_F(ExecutionKernelTest,
+       Reset_FromExecutingUsesOperatorControlledStopThenResets) {
+  ControlledExecution controlled_execution;
+  controlled_execution.block_controlled_stop = true;
+  ThreadSafeFakeClock local_clock;
+  ThreadSafeManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  ExecutionKernelConfig config;
+  MotionInterruptStopProfileDTO op_profile;
+  op_profile.profile_id = "operator_stop_soft_on_path";
+  op_profile.stop_mode = MotionInterruptStopMode::kSoftOnPath;
+  op_profile.deceleration_time_s = 0.3;
+  op_profile.per_joint_max_deceleration_rad_s2 = {{"j1", 8.0}, {"j2", 8.0}};
+  config.operator_stop_profile =
+      std::make_shared<MotionInterruptStopProfileDTO>(op_profile);
+  ExecutionKernel local_kernel{planner,
+                               context,
+                               controlled_execution,
+                               local_clock,
+                               local_scheduler,
+                               local_cache,
+                               config};
+  MockCollisionWorldPublisher local_publisher;
+  auto local_engine = std::make_shared<MockCollisionEngine>();
+  configure_authoritative_collision_validation(local_kernel, local_publisher,
+                                                local_engine);
+  controlled_execution.motion_interrupt_stop_capability.supported_stop_modes =
+      {MotionInterruptStopMode::kSoftOnPath,
+       MotionInterruptStopMode::kSpringBackHold};
+
+  auto result = local_kernel.execute(make_test_request());
+  ASSERT_TRUE(result.ok());
+  ASSERT_TRUE(controlled_execution.wait_until_execute_called());
+  ASSERT_TRUE(wait_for_state(local_kernel, ExecutionState::kExecuting));
+
+  std::optional<ResetResultDTO> reset;
+  std::thread reset_thread([&]() {
+    reset = local_kernel.reset();
+  });
+
+  ASSERT_TRUE(controlled_execution.wait_until_controlled_stop_count(1));
+  ASSERT_TRUE(wait_for_state(local_kernel, ExecutionState::kStopping));
+  EXPECT_FALSE(reset.has_value())
+      << "reset must wait for the selected operator stop before resetting";
+  EXPECT_EQ(controlled_execution.stop_count, 0);
+  EXPECT_EQ(controlled_execution.last_controlled_stop_profile.profile_id,
+            "operator_stop_soft_on_path");
+  EXPECT_EQ(controlled_execution.last_controlled_stop_profile.stop_mode,
+            MotionInterruptStopMode::kSoftOnPath);
+
+  controlled_execution.release_controlled_stop();
+  reset_thread.join();
+
+  ASSERT_TRUE(reset.has_value());
+  EXPECT_TRUE(reset->accepted);
+  EXPECT_EQ(controlled_execution.controlled_stop_cancel_count, 0);
+  EXPECT_EQ(controlled_execution.reset_count, 1);
+  EXPECT_EQ(local_kernel.get_status().state, ExecutionState::kIdle);
+}
+
+TEST_F(ExecutionKernelTest,
+       Reset_EscalatesToHardStopWhenOperatorControlledStopMissesBudget) {
+  ControlledExecution controlled_execution;
+  controlled_execution.block_controlled_stop = true;
+  ThreadSafeFakeClock local_clock;
+  ThreadSafeManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  ExecutionKernelConfig config;
+  MotionInterruptStopProfileDTO op_profile;
+  op_profile.profile_id = "operator_stop_soft_on_path";
+  op_profile.stop_mode = MotionInterruptStopMode::kSoftOnPath;
+  op_profile.max_stop_time_s = 0.05;
+  op_profile.deceleration_time_s = 0.3;
+  op_profile.per_joint_max_deceleration_rad_s2 = {{"j1", 8.0}, {"j2", 8.0}};
+  config.operator_stop_profile =
+      std::make_shared<MotionInterruptStopProfileDTO>(op_profile);
+  ExecutionKernel local_kernel{planner,
+                               context,
+                               controlled_execution,
+                               local_clock,
+                               local_scheduler,
+                               local_cache,
+                               config};
+  MockCollisionWorldPublisher local_publisher;
+  auto local_engine = std::make_shared<MockCollisionEngine>();
+  configure_authoritative_collision_validation(local_kernel, local_publisher,
+                                                local_engine);
+  controlled_execution.motion_interrupt_stop_capability.supported_stop_modes =
+      {MotionInterruptStopMode::kSoftOnPath,
+       MotionInterruptStopMode::kSpringBackHold};
+  std::mutex events_mutex;
+  std::vector<KernelEvent> events;
+  local_kernel.subscribe_events([&](const KernelEvent& e) {
+    std::lock_guard<std::mutex> lock(events_mutex);
+    events.push_back(e);
+  });
+
+  auto result = local_kernel.execute(make_test_request());
+  ASSERT_TRUE(result.ok());
+  ASSERT_TRUE(controlled_execution.wait_until_execute_called());
+  ASSERT_TRUE(wait_for_state(local_kernel, ExecutionState::kExecuting));
+
+  ASSERT_TRUE(local_kernel.stop().accepted);
+  ASSERT_TRUE(controlled_execution.wait_until_controlled_stop_count(1));
+  ASSERT_TRUE(wait_for_state(local_kernel, ExecutionState::kStopping));
+
+  auto reset = local_kernel.reset();
+
+  EXPECT_TRUE(reset.accepted);
+  EXPECT_EQ(controlled_execution.controlled_stop_cancel_count, 1);
+  EXPECT_EQ(controlled_execution.reset_count, 1);
+  EXPECT_EQ(local_kernel.get_status().state, ExecutionState::kIdle);
+  std::lock_guard<std::mutex> lock(events_mutex);
+  EXPECT_TRUE(std::any_of(events.begin(), events.end(),
+                          [](const KernelEvent& e) {
+                            return e.type == KernelEventType::kStateTransition &&
+                                   e.details.contains("reason") &&
+                                   e.details.at("reason") ==
+                                       "reset_operator_stop_timeout_hard_stop";
+                          }));
+}
+
+TEST_F(ExecutionKernelTest,
+       Stop_ReturnsPromptlyDuringSlowExecuteAdmission) {
+  ControlledExecution controlled_execution;
+  controlled_execution.block_sync_observed_state = true;
+  ThreadSafeFakeClock local_clock;
+  ThreadSafeManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  ExecutionKernel local_kernel{planner,
+                               context,
+                               controlled_execution,
+                               local_clock,
+                               local_scheduler,
+                               local_cache};
+  MockCollisionWorldPublisher local_publisher;
+  auto local_engine = std::make_shared<MockCollisionEngine>();
+  configure_authoritative_collision_validation(local_kernel, local_publisher,
+                                                local_engine);
+
+  std::optional<Result<uint64_t>> execute_result;
+  std::thread execute_thread([&]() {
+    execute_result =
+        local_kernel.execute(make_test_request("slow_admission_stop"));
+  });
+
+  ASSERT_TRUE(controlled_execution.wait_until_sync_observed_state_count(1));
+  ASSERT_TRUE(wait_for_state(local_kernel, ExecutionState::kPlanning));
+
+  const auto start = std::chrono::steady_clock::now();
+  auto stop_result = local_kernel.stop();
+  const auto elapsed = std::chrono::steady_clock::now() - start;
+  EXPECT_TRUE(stop_result.accepted);
+  EXPECT_LT(std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count(),
+            100);
+
+  controlled_execution.release_sync_observed_state();
+  execute_thread.join();
+
+  ASSERT_TRUE(execute_result.has_value());
+  EXPECT_TRUE(execute_result->ok());
+  EXPECT_TRUE(wait_for_state(local_kernel, ExecutionState::kStopped));
+  EXPECT_EQ(controlled_execution.execute_count, 0);
+}
+
+TEST_F(ExecutionKernelTest,
+       Reset_ReturnsPromptlyDuringSlowExecuteAdmission) {
+  ControlledExecution controlled_execution;
+  controlled_execution.block_sync_observed_state = true;
+  ThreadSafeFakeClock local_clock;
+  ThreadSafeManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  ExecutionKernel local_kernel{planner,
+                               context,
+                               controlled_execution,
+                               local_clock,
+                               local_scheduler,
+                               local_cache};
+  MockCollisionWorldPublisher local_publisher;
+  auto local_engine = std::make_shared<MockCollisionEngine>();
+  configure_authoritative_collision_validation(local_kernel, local_publisher,
+                                                local_engine);
+
+  std::optional<Result<uint64_t>> execute_result;
+  std::thread execute_thread([&]() {
+    execute_result =
+        local_kernel.execute(make_test_request("slow_admission_reset"));
+  });
+
+  ASSERT_TRUE(controlled_execution.wait_until_sync_observed_state_count(1));
+  ASSERT_TRUE(wait_for_state(local_kernel, ExecutionState::kPlanning));
+
+  const auto start = std::chrono::steady_clock::now();
+  auto reset_result = local_kernel.reset();
+  const auto elapsed = std::chrono::steady_clock::now() - start;
+  EXPECT_TRUE(reset_result.accepted);
+  EXPECT_LT(std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count(),
+            100);
+
+  controlled_execution.release_sync_observed_state();
+  execute_thread.join();
+
+  ASSERT_TRUE(execute_result.has_value());
+  EXPECT_TRUE(execute_result->ok());
+  EXPECT_TRUE(wait_for_state(local_kernel, ExecutionState::kIdle));
+  EXPECT_EQ(controlled_execution.execute_count, 0);
+  EXPECT_EQ(controlled_execution.reset_count, 1);
+}
+
+TEST_F(ExecutionKernelTest,
+       Pause_ReturnsPromptlyRejectedDuringSlowExecuteAdmission) {
+  ControlledExecution controlled_execution;
+  controlled_execution.block_sync_observed_state = true;
+  ThreadSafeFakeClock local_clock;
+  ThreadSafeManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  ExecutionKernel local_kernel{planner,
+                               context,
+                               controlled_execution,
+                               local_clock,
+                               local_scheduler,
+                               local_cache};
+  MockCollisionWorldPublisher local_publisher;
+  auto local_engine = std::make_shared<MockCollisionEngine>();
+  configure_authoritative_collision_validation(local_kernel, local_publisher,
+                                                local_engine);
+
+  std::optional<Result<uint64_t>> execute_result;
+  std::thread execute_thread([&]() {
+    execute_result =
+        local_kernel.execute(make_test_request("slow_admission_pause"));
+  });
+
+  ASSERT_TRUE(controlled_execution.wait_until_sync_observed_state_count(1));
+  ASSERT_TRUE(wait_for_state(local_kernel, ExecutionState::kPlanning));
+
+  const auto start = std::chrono::steady_clock::now();
+  auto pause_result = local_kernel.pause();
+  const auto elapsed = std::chrono::steady_clock::now() - start;
+  EXPECT_FALSE(pause_result.accepted);
+  ASSERT_TRUE(pause_result.error.has_value());
+  EXPECT_EQ(pause_result.error->code, kErrorInvalidRequest);
+  EXPECT_EQ(pause_result.error->details.at("reason_code"),
+            "pause_not_executing");
+  EXPECT_LT(std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count(),
+            100);
+
+  controlled_execution.release_sync_observed_state();
+  execute_thread.join();
+
+  ASSERT_TRUE(execute_result.has_value());
+  EXPECT_TRUE(execute_result->ok());
+  ASSERT_TRUE(controlled_execution.wait_until_execute_called());
+  controlled_execution.complete();
+  local_kernel.wait_for_completion();
+}
+
 // Emergency fallback:
-// `ExecutionKernel::stop()` must report the actual outcome of the
-// configured controlled-stop AND, on failure, immediately fall back
-// to the legacy `execution_backend_.stop()` so the robot's physical
-// stop is guaranteed. The operator-facing result distinguishes:
-//   - controlled-stop accepted+confirmed → accepted=true, no error
-//   - controlled-stop failed, legacy fallback succeeded → accepted=true
-//     with a degraded-stop diagnostic in error (audit trail)
-//   - controlled-stop failed, legacy fallback also failed → accepted=false
+// `ExecutionKernel::stop()` is non-blocking: it accepts operator intent
+// immediately, then the worker reports the controlled-stop outcome via
+// backend state, events, and snapshots. On controlled-stop failure it still
+// falls back to legacy `execution_backend_.stop()` so the robot's physical
+// stop is guaranteed.
 TEST_F(ExecutionKernelTest,
        Stop_OperatorProfileRefused_EmergencyLegacyFallback) {
   ControlledExecution controlled_execution;
@@ -2651,21 +3189,23 @@ TEST_F(ExecutionKernelTest,
 
   auto stop_dto = local_kernel.stop();
   // The controlled-stop returns not-accepted, so the kernel must
-  // emergency-fall-back to legacy backend.stop() — verify BOTH
-  // were called, and the result still reports success because the
-  // robot did physically stop via the legacy path.
+  // emergency-fall-back to legacy backend.stop() — verify BOTH were called.
+  EXPECT_TRUE(stop_dto.accepted);
+  ASSERT_TRUE(controlled_execution.wait_until_controlled_stop_count(1));
+  ASSERT_TRUE(controlled_execution.wait_until_stop_count(1));
+  ASSERT_TRUE(wait_for_state(local_kernel, ExecutionState::kStopped));
   EXPECT_EQ(controlled_execution.controlled_stop_count, 1);
   EXPECT_EQ(controlled_execution.stop_count, 1);
-  EXPECT_TRUE(stop_dto.accepted);
-  ASSERT_TRUE(stop_dto.error.has_value());
-  EXPECT_EQ(stop_dto.error->details.at("reason"),
+  const auto snapshot = local_kernel.get_execution_snapshot();
+  ASSERT_TRUE(snapshot.error.has_value());
+  EXPECT_EQ(snapshot.error->details.at("reason"),
             "operator_stop_profile_failed");
-  EXPECT_EQ(stop_dto.error->details.at("emergency_fallback"),
+  EXPECT_EQ(snapshot.error->details.at("emergency_fallback"),
             "legacy_stop_succeeded");
 }
 
 TEST_F(ExecutionKernelTest,
-       Stop_OperatorProfileAndLegacyBothFail_ReturnsAccepted_False) {
+       Stop_OperatorProfileAndLegacyBothFail_EntersInterventionRequired) {
   ControlledExecution controlled_execution;
   ThreadSafeFakeClock local_clock;
   ThreadSafeManualScheduler local_scheduler;
@@ -2694,8 +3234,8 @@ TEST_F(ExecutionKernelTest,
        MotionInterruptStopMode::kSpringBackHold};
   // Controlled-stop refused. The emergency-fallback legacy stop()
   // also fails (e.g. the controller has disconnected mid-operation).
-  // The operator-facing result MUST surface this as a hard failure
-  // so escalation can occur — the robot may not be physically halted.
+  // The asynchronous worker MUST surface this as a hard failure so escalation
+  // can occur — the robot may not be physically halted.
   ControlledStopResultDTO refused;
   refused.accepted = false;
   refused.error = ErrorDTO{
@@ -2717,15 +3257,20 @@ TEST_F(ExecutionKernelTest,
   ASSERT_TRUE(wait_for_state(local_kernel, ExecutionState::kExecuting));
 
   auto stop_dto = local_kernel.stop();
+  EXPECT_TRUE(stop_dto.accepted);
+  ASSERT_TRUE(controlled_execution.wait_until_controlled_stop_count(1));
+  ASSERT_TRUE(controlled_execution.wait_until_stop_count(1));
+  ASSERT_TRUE(wait_for_state(local_kernel,
+                             ExecutionState::kInterventionRequired));
   EXPECT_EQ(controlled_execution.controlled_stop_count, 1);
   EXPECT_EQ(controlled_execution.stop_count, 1);
-  EXPECT_FALSE(stop_dto.accepted);
-  ASSERT_TRUE(stop_dto.error.has_value());
-  EXPECT_EQ(stop_dto.error->details.at("reason"),
-            "operator_stop_total_failure");
   EXPECT_TRUE(local_kernel.wait_for_completion(1'000'000'000));
   EXPECT_EQ(local_kernel.get_status().state,
             ExecutionState::kInterventionRequired);
+  const auto snapshot = local_kernel.get_execution_snapshot();
+  ASSERT_TRUE(snapshot.error.has_value());
+  EXPECT_EQ(snapshot.error->details.at("reason"),
+            "operator_stop_total_failure");
   std::lock_guard<std::mutex> lock(events_mutex);
   EXPECT_TRUE(std::any_of(events.begin(), events.end(),
                           [](const KernelEvent& e) {
@@ -3567,18 +4112,19 @@ TEST_F(ExecutionKernelTest, Events_CacheHit) {
   execute_sync(make_test_request("cached_move"));
 
   std::lock_guard<std::mutex> lock(events_mutex);
-  // Spec 230 §6.1 (cache hit): state_transition -> cache_hit -> validation_started ->
-  //   validation_passed -> state_transition -> execute_started -> execute_completed ->
-  //   state_transition
-  ASSERT_GE(events.size(), 8u);
+  // Spec 230 §6.1 plus stop-path latency hardening: execute admission first
+  // enters Planning so stop/reset can interrupt slow preparation even when the
+  // request later resolves to a cache hit.
+  ASSERT_GE(events.size(), 9u);
   EXPECT_EQ(events[0], KernelEventType::kStateTransition);
-  EXPECT_EQ(events[1], KernelEventType::kCacheHit);
-  EXPECT_EQ(events[2], KernelEventType::kValidationStarted);
-  EXPECT_EQ(events[3], KernelEventType::kValidationPassed);
-  EXPECT_EQ(events[4], KernelEventType::kStateTransition);
-  EXPECT_EQ(events[5], KernelEventType::kExecuteStarted);
-  EXPECT_EQ(events[6], KernelEventType::kExecuteCompleted);
-  EXPECT_EQ(events[7], KernelEventType::kStateTransition);
+  EXPECT_EQ(events[1], KernelEventType::kStateTransition);
+  EXPECT_EQ(events[2], KernelEventType::kCacheHit);
+  EXPECT_EQ(events[3], KernelEventType::kValidationStarted);
+  EXPECT_EQ(events[4], KernelEventType::kValidationPassed);
+  EXPECT_EQ(events[5], KernelEventType::kStateTransition);
+  EXPECT_EQ(events[6], KernelEventType::kExecuteStarted);
+  EXPECT_EQ(events[7], KernelEventType::kExecuteCompleted);
+  EXPECT_EQ(events[8], KernelEventType::kStateTransition);
 }
 
 TEST_F(ExecutionKernelTest, Events_PlanningFailure) {
@@ -3775,15 +4321,18 @@ TEST_F(ExecutionKernelTest, Events_StateTransition_CacheHit) {
     }
   }
 
-  // Expected transitions (cache hit):
-  // Idle -> Validating -> Executing -> Completed
-  EXPECT_EQ(transitions.size(), 3u);
+  // Expected transitions (cache hit): admission enters Planning first so
+  // stop/reset can interrupt slow preparation before the worker starts.
+  // Idle -> Planning -> Validating -> Executing -> Completed
+  EXPECT_EQ(transitions.size(), 4u);
   EXPECT_EQ(transitions[0].first, ExecutionState::kIdle);
-  EXPECT_EQ(transitions[0].second, ExecutionState::kValidating);
-  EXPECT_EQ(transitions[1].first, ExecutionState::kValidating);
-  EXPECT_EQ(transitions[1].second, ExecutionState::kExecuting);
-  EXPECT_EQ(transitions[2].first, ExecutionState::kExecuting);
-  EXPECT_EQ(transitions[2].second, ExecutionState::kCompleted);
+  EXPECT_EQ(transitions[0].second, ExecutionState::kPlanning);
+  EXPECT_EQ(transitions[1].first, ExecutionState::kPlanning);
+  EXPECT_EQ(transitions[1].second, ExecutionState::kValidating);
+  EXPECT_EQ(transitions[2].first, ExecutionState::kValidating);
+  EXPECT_EQ(transitions[2].second, ExecutionState::kExecuting);
+  EXPECT_EQ(transitions[3].first, ExecutionState::kExecuting);
+  EXPECT_EQ(transitions[3].second, ExecutionState::kCompleted);
 }
 
 TEST_F(ExecutionKernelTest, Events_StateTransition_PlanFailure) {

@@ -396,6 +396,13 @@ RoboPlanExecutionBackend::get_motion_interrupt_stop_capability() const {
 core::ControlledStopResultDTO
 RoboPlanExecutionBackend::execute_controlled_stop(
     const core::MotionInterruptStopProfileDTO& profile) {
+  return execute_controlled_stop(profile, std::stop_token{});
+}
+
+core::ControlledStopResultDTO
+RoboPlanExecutionBackend::execute_controlled_stop(
+    const core::MotionInterruptStopProfileDTO& profile,
+    std::stop_token stop_token) {
   // Defense in depth: the kernel's arm-time gate already rejects
   // unsupported modes, but a backend that has been mis-wired into
   // running the wrong mode at trip time MUST fail closed rather than
@@ -403,7 +410,30 @@ RoboPlanExecutionBackend::execute_controlled_stop(
   core::ControlledStopResultDTO result;
   result.executed_stop_mode = profile.stop_mode;
 
+  const auto cancelled_result = [&](std::string phase) {
+    state_.running.store(false);
+    const auto latest = get_execution_snapshot();
+    publish_snapshot(core::ExecutionState::kStopped,
+                     latest.progress,
+                     latest.joint_positions_rad);
+    execution_cv_.notify_all();
+    result.accepted = true;
+    result.backend_stop_confirmed = false;
+    result.error = core::ErrorDTO{
+        std::string(core::kErrorMotionInterruptBackendStopFailed),
+        "native controlled stop was preempted by a later intervention",
+        {{"reason", "controlled_stop_cancelled"},
+         {"phase", std::move(phase)}}};
+    return result;
+  };
+  std::stop_callback stop_notify(stop_token, [this]() {
+    execution_cv_.notify_all();
+  });
+
   if (profile.stop_mode == core::MotionInterruptStopMode::kSoftOnPath) {
+    if (stop_token.stop_requested()) {
+      return cancelled_result("soft_on_path_entry");
+    }
     core::TrajectoryDTO active_trajectory;
     core::ExecutionSnapshot active_snapshot;
     double active_time_s = 0.0;
@@ -459,13 +489,29 @@ RoboPlanExecutionBackend::execute_controlled_stop(
               planned.error())) {
         const auto call_start_ns = clock_.now();
         const auto wait_deadline_s = profile.max_stop_time_s.value_or(1.0);
-        std::unique_lock<std::mutex> lock(execution_mutex_);
-        const bool completed = execution_cv_.wait_for(
-            lock,
-            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::duration<double>(wait_deadline_s)),
-            [this]() { return !state_.running.load(); });
-        lock.unlock();
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::duration_cast<
+                                  std::chrono::steady_clock::duration>(
+                                  std::chrono::duration<double>(
+                                      wait_deadline_s));
+        bool completed = false;
+        {
+          std::unique_lock<std::mutex> lock(execution_mutex_);
+          while (!stop_token.stop_requested()) {
+            completed = !state_.running.load();
+            if (completed) {
+              break;
+            }
+            if (execution_cv_.wait_until(lock, deadline) ==
+                std::cv_status::timeout) {
+              completed = !state_.running.load();
+              break;
+            }
+          }
+        }
+        if (stop_token.stop_requested()) {
+          return cancelled_result("soft_on_path_natural_completion_wait");
+        }
         const auto call_end_ns = clock_.now();
         result.confirmation_latency_ns =
             std::max<std::int64_t>(0, call_end_ns - call_start_ns);
@@ -503,7 +549,7 @@ RoboPlanExecutionBackend::execute_controlled_stop(
       if (may_fallback) {
         core::MotionInterruptStopProfileDTO fallback_profile = profile;
         fallback_profile.stop_mode = core::MotionInterruptStopMode::kSpringBackHold;
-        auto fallback = execute_controlled_stop(fallback_profile);
+        auto fallback = execute_controlled_stop(fallback_profile, stop_token);
         fallback.executed_stop_mode = core::MotionInterruptStopMode::kSpringBackHold;
         fallback.fallback_reason = planned.error().details.count("reason") > 0
                                        ? planned.error().details.at("reason")
@@ -526,11 +572,26 @@ RoboPlanExecutionBackend::execute_controlled_stop(
     execution_cv_.notify_all();
     {
       std::unique_lock<std::mutex> lock(execution_mutex_);
-      const bool stopped = execution_cv_.wait_for(
-          lock,
-          std::chrono::duration_cast<std::chrono::nanoseconds>(
-              std::chrono::duration<double>(profile.max_stop_time_s.value_or(1.0))),
-          [this]() { return !state_.running.load(); });
+      const auto deadline = std::chrono::steady_clock::now() +
+                            std::chrono::duration_cast<
+                                std::chrono::steady_clock::duration>(
+                                std::chrono::duration<double>(
+                                    profile.max_stop_time_s.value_or(1.0)));
+      bool stopped = false;
+      while (!stop_token.stop_requested()) {
+        stopped = !state_.running.load();
+        if (stopped) {
+          break;
+        }
+        if (execution_cv_.wait_until(lock, deadline) ==
+            std::cv_status::timeout) {
+          stopped = !state_.running.load();
+          break;
+        }
+      }
+      if (stop_token.stop_requested()) {
+        return cancelled_result("soft_on_path_worker_stop_wait");
+      }
       if (!stopped) {
         result.accepted = true;
         result.backend_stop_confirmed = false;
@@ -553,7 +614,17 @@ RoboPlanExecutionBackend::execute_controlled_stop(
       const auto wake_time =
           steady_start + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
                              std::chrono::duration<double>(waypoint.time_from_start_s));
-      std::this_thread::sleep_until(wake_time);
+      while (!stop_token.stop_requested() &&
+             std::chrono::steady_clock::now() < wake_time) {
+        const auto remaining = wake_time - std::chrono::steady_clock::now();
+        const auto max_slice =
+            std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                kExecutionTick);
+        std::this_thread::sleep_for(std::min(remaining, max_slice));
+      }
+      if (stop_token.stop_requested()) {
+        return cancelled_result("soft_on_path_replay");
+      }
       const double progress =
           total_time_s <= 1e-9
               ? 1.0
@@ -654,6 +725,9 @@ RoboPlanExecutionBackend::execute_controlled_stop(
   }
 
   const auto call_start_ns = clock_.now();
+  if (stop_token.stop_requested()) {
+    return cancelled_result("spring_back_entry");
+  }
   // Request the worker to stop. The worker's stop_token wakes it,
   // it publishes a kStopped snapshot at its current observed
   // position, then clears `state_.running`.
@@ -672,12 +746,26 @@ RoboPlanExecutionBackend::execute_controlled_stop(
   const auto wait_deadline_s =
       profile.max_stop_time_s.value_or(1.0);
   std::unique_lock<std::mutex> lock(execution_mutex_);
-  const bool stopped = execution_cv_.wait_for(
-      lock,
-      std::chrono::duration_cast<std::chrono::nanoseconds>(
-          std::chrono::duration<double>(wait_deadline_s)),
-      [this]() { return !state_.running.load(); });
+  const auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::duration_cast<
+                            std::chrono::steady_clock::duration>(
+                            std::chrono::duration<double>(wait_deadline_s));
+  bool stopped = false;
+  while (!stop_token.stop_requested()) {
+    stopped = !state_.running.load();
+    if (stopped) {
+      break;
+    }
+    if (execution_cv_.wait_until(lock, deadline) ==
+        std::cv_status::timeout) {
+      stopped = !state_.running.load();
+      break;
+    }
+  }
   lock.unlock();
+  if (stop_token.stop_requested()) {
+    return cancelled_result("spring_back_wait");
+  }
 
   const auto call_end_ns = clock_.now();
   result.confirmation_latency_ns = std::max<std::int64_t>(0, call_end_ns -

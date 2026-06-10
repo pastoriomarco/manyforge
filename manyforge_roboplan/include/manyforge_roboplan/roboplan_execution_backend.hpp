@@ -70,6 +70,9 @@ class RoboPlanExecutionBackend final : public core::IExecutionBackend {
   get_motion_interrupt_stop_capability() const override;
   core::ControlledStopResultDTO execute_controlled_stop(
       const core::MotionInterruptStopProfileDTO& profile) override;
+  core::ControlledStopResultDTO execute_controlled_stop(
+      const core::MotionInterruptStopProfileDTO& profile,
+      std::stop_token stop_token) override;
 
  private:
   struct ExecutionStateData {

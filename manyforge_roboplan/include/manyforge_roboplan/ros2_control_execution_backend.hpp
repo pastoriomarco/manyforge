@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <memory>
 #include <mutex>
+#include <stop_token>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -114,6 +115,9 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
   get_motion_interrupt_stop_capability() const override;
   core::ControlledStopResultDTO execute_controlled_stop(
       const core::MotionInterruptStopProfileDTO& profile) override;
+  core::ControlledStopResultDTO execute_controlled_stop(
+      const core::MotionInterruptStopProfileDTO& profile,
+      std::stop_token stop_token) override;
 
   // Pure capability evaluation, exposed as a static so tests and
   // deployment audit tools can verify which stop modes a

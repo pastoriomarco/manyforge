@@ -5,6 +5,8 @@
 #include <manyforge_core/types/motion_interrupt.hpp>
 #include <manyforge_core/types/trajectory_dto.hpp>
 
+#include <stop_token>
+
 namespace manyforge::core {
 
 /// Execution backend interface (spec 220 §4)
@@ -12,10 +14,12 @@ namespace manyforge::core {
 /// Responsibilities:
 /// - Execute a time-parameterized joint trajectory
 /// - Provide phase feedback for kernel events
-/// - Provide non-blocking stop/pause/resume/reset primitives
+/// - Provide stop/pause/resume/reset primitives with bounded kernel semantics
 ///
 /// Threading:
-/// - Stop/Pause/Resume/Reset MUST be non-blocking from the kernel caller perspective
+/// - Stop/Pause/Resume admission MUST be non-blocking from the kernel caller perspective
+/// - Reset MUST be prompt during planning/validation cancellation, but may wait
+///   for a bounded stop-before-reset sequence while the robot is moving
 /// - Stop/Pause/Resume/Reset MUST be safe to call from a different thread than ExecuteTrajectory
 /// - The kernel MUST NOT issue concurrent ExecuteTrajectory calls to the same backend instance
 class IExecutionBackend {
@@ -132,6 +136,17 @@ class IExecutionBackend {
           "execute_controlled_stop is not implemented by this backend",
           {{"reason", "controlled_stop_port_not_implemented"}}};
       return result;
+    }
+
+    /// Cancellable controlled-stop variant used by operator interventions.
+    ///
+    /// The default keeps source compatibility for existing backends. Backends
+    /// with bounded waits or replay loops should override this overload and
+    /// poll the stop token so a later stop/reset can preempt a soft stop.
+    virtual ControlledStopResultDTO execute_controlled_stop(
+        const MotionInterruptStopProfileDTO& profile,
+        std::stop_token /*stop_token*/) {
+      return execute_controlled_stop(profile);
     }
 };
 

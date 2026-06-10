@@ -14,6 +14,7 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <stop_token>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -1520,6 +1521,62 @@ TEST_F(NativeKernelTest,
   ASSERT_EQ(stopped.joint_positions_rad.size(), start_state.positions_rad.size());
   EXPECT_NE(stopped.joint_positions_rad[0], goal[0])
       << "soft_on_path stop MUST NOT silently finish the original trajectory";
+}
+
+TEST_F(NativeKernelTest,
+       NativeBackend_ControlledStop_SoftOnPathReplayIsCancellable) {
+  auto start_state = bundle_->context->get_current_state();
+  ASSERT_FALSE(start_state.positions_rad.empty());
+
+  std::vector<double> goal = start_state.positions_rad;
+  goal[0] += 0.8;
+  if (goal.size() > 1) {
+    goal[1] += 0.3;
+  }
+
+  TrajectoryDTO traj;
+  traj.joint_names = start_state.joint_names;
+  traj.waypoints.push_back(
+      TrajectoryWaypointDTO{0.0, start_state.positions_rad, {}, {}});
+  traj.waypoints.push_back(TrajectoryWaypointDTO{3.0, goal, {}, {}});
+
+  auto handle = bundle_->execution->execute_trajectory(traj);
+  std::this_thread::sleep_for(std::chrono::milliseconds(180));
+
+  MotionInterruptStopProfileDTO profile;
+  profile.profile_id = "native_soft_on_path_cancellable";
+  profile.stop_mode = MotionInterruptStopMode::kSoftOnPath;
+  profile.deceleration_time_s = 0.45;
+  profile.max_stop_time_s = 1.0;
+  profile.allowed_fallback_modes = {MotionInterruptStopMode::kSpringBackHold};
+  for (const auto& joint_name : start_state.joint_names) {
+    profile.per_joint_max_deceleration_rad_s2[joint_name] = 100.0;
+  }
+
+  std::stop_source stop_source;
+  std::optional<ControlledStopResultDTO> result;
+  std::thread stop_thread([&]() {
+    result = bundle_->execution->execute_controlled_stop(
+        profile, stop_source.get_token());
+  });
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(40));
+  const auto cancel_start = std::chrono::steady_clock::now();
+  stop_source.request_stop();
+  stop_thread.join();
+  const auto cancel_elapsed =
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - cancel_start);
+
+  ASSERT_TRUE(result.has_value());
+  EXPECT_TRUE(result->accepted);
+  EXPECT_FALSE(result->backend_stop_confirmed);
+  ASSERT_TRUE(result->error.has_value());
+  EXPECT_EQ(result->error->details.at("reason"), "controlled_stop_cancelled");
+  EXPECT_LT(cancel_elapsed, std::chrono::milliseconds(150));
+  ASSERT_TRUE(handle.wait_for_completion(2'000'000'000LL));
+  auto stopped = bundle_->execution->get_execution_snapshot();
+  EXPECT_EQ(stopped.state, ExecutionState::kStopped);
 }
 
 TEST_F(NativeKernelTest,
