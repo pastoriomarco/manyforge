@@ -56,7 +56,6 @@ parameters:
     max_inclusive: 1
   description: Velocity scale for all moves.
 blackboard:
-  namespaces: []
   keys:
   - id: gripper_closed
     type: bool

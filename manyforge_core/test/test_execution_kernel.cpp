@@ -899,6 +899,20 @@ TrajectoryDTO make_test_trajectory() {
   return t;
 }
 
+TrajectoryDTO make_test_trajectory_from(std::vector<double> start,
+                                        std::vector<double> goal) {
+  TrajectoryDTO t;
+  t.joint_names = {"j1", "j2"};
+  TrajectoryWaypointDTO wp0;
+  wp0.time_from_start_s = 0.0;
+  wp0.positions_rad = std::move(start);
+  TrajectoryWaypointDTO wp1;
+  wp1.time_from_start_s = 1.0;
+  wp1.positions_rad = std::move(goal);
+  t.waypoints = {wp0, wp1};
+  return t;
+}
+
 Pose3DTO make_pose(double x, double y, double z, QuaternionDTO orientation = {0.0, 0.0, 0.0, 1.0}) {
   Pose3DTO pose;
   pose.position_m = {x, y, z};
@@ -2146,7 +2160,7 @@ TEST_F(ExecutionKernelTest, Resume_FromIdle_NotAccepted) {
   EXPECT_FALSE(result.accepted);
 }
 
-TEST_F(ExecutionKernelTest, Resume_FromPaused_RevalidatesRemainingTrajectory) {
+TEST_F(ExecutionKernelTest, Resume_FromPaused_ReplansFromFreshCurrentState) {
   ControlledExecution controlled_execution;
   FakeClock local_clock;
   ManualScheduler local_scheduler;
@@ -2157,6 +2171,13 @@ TEST_F(ExecutionKernelTest, Resume_FromPaused_RevalidatesRemainingTrajectory) {
       planner, context, controlled_execution, local_clock, local_scheduler, local_cache};
   configure_authoritative_collision_validation(
       controlled_kernel, local_collision_world, local_collision_engine);
+
+  std::mutex events_mutex;
+  std::vector<KernelEvent> events;
+  controlled_kernel.subscribe_events([&](const KernelEvent& event) {
+    std::lock_guard<std::mutex> lock(events_mutex);
+    events.push_back(event);
+  });
 
   auto result = controlled_kernel.execute(make_test_request());
   ASSERT_TRUE(result.ok());
@@ -2170,24 +2191,46 @@ TEST_F(ExecutionKernelTest, Resume_FromPaused_RevalidatesRemainingTrajectory) {
   ASSERT_TRUE(controlled_execution.wait_until_paused()) << "wait_until_paused timed out";
   ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kPaused));
 
-  context.current_state.positions_rad = {0.5, 0.5};
+  context.current_state.positions_rad = {0.25, 0.25};
+  PlanResultDTO resume_plan_ok;
+  resume_plan_ok.trajectory =
+      make_test_trajectory_from({0.25, 0.25}, {1.0, 1.0});
+  planner.next_result = resume_plan_ok;
 
   auto resume_result = controlled_kernel.resume();
   ASSERT_TRUE(resume_result.accepted);
   ASSERT_TRUE(controlled_execution.wait_until_resume_called()) << "wait_until_resume_called timed out";
   ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kExecuting));
 
+  EXPECT_EQ(planner.plan_count, 2);
+  EXPECT_EQ(controlled_execution.sync_observed_state_count, 2);
+  ASSERT_EQ(planner.last_request.start_state.positions_rad.size(), 2u);
+  EXPECT_DOUBLE_EQ(planner.last_request.start_state.positions_rad[0], 0.25);
+  EXPECT_DOUBLE_EQ(planner.last_request.start_state.positions_rad[1], 0.25);
   EXPECT_GE(context.validate_count, 2);
   ASSERT_FALSE(controlled_execution.last_resume_trajectory.waypoints.empty());
   EXPECT_DOUBLE_EQ(
-      controlled_execution.last_resume_trajectory.waypoints.front().positions_rad[0], 0.5);
+      controlled_execution.last_resume_trajectory.waypoints.front().positions_rad[0], 0.25);
   EXPECT_DOUBLE_EQ(
-      controlled_execution.last_resume_trajectory.waypoints.front().positions_rad[1], 0.5);
+      controlled_execution.last_resume_trajectory.waypoints.front().positions_rad[1], 0.25);
   EXPECT_GE(controlled_execution.last_resume_trajectory.waypoints.size(), 2u);
   EXPECT_DOUBLE_EQ(
       controlled_execution.last_resume_trajectory.waypoints.back().positions_rad[0], 1.0);
   EXPECT_DOUBLE_EQ(
       controlled_execution.last_resume_trajectory.waypoints.back().positions_rad[1], 1.0);
+
+  auto count_resume_audit_event = [&](KernelEventType type) {
+    std::lock_guard<std::mutex> lock(events_mutex);
+    return std::count_if(events.begin(), events.end(), [type](const KernelEvent& event) {
+      auto reason = event.details.find("reason");
+      return event.type == type && reason != event.details.end() &&
+             reason->second == "resume_replan";
+    });
+  };
+  EXPECT_EQ(count_resume_audit_event(KernelEventType::kPlanStarted), 1);
+  EXPECT_EQ(count_resume_audit_event(KernelEventType::kPlanCompleted), 1);
+  EXPECT_EQ(count_resume_audit_event(KernelEventType::kValidationStarted), 1);
+  EXPECT_EQ(count_resume_audit_event(KernelEventType::kValidationPassed), 1);
 
   controlled_execution.complete();
   controlled_kernel.wait_for_completion();
@@ -2237,15 +2280,27 @@ TEST_F(ExecutionKernelTest, Resume_FromPaused_WhenBackendPauseTerminatesHandle_K
   }
   EXPECT_EQ(controlled_kernel.get_status().state, ExecutionState::kPaused);
 
-  context.current_state.positions_rad = {0.5, 0.5};
+  context.current_state.positions_rad = {0.25, 0.25};
+  PlanResultDTO resume_plan_ok;
+  resume_plan_ok.trajectory =
+      make_test_trajectory_from({0.25, 0.25}, {1.0, 1.0});
+  planner.next_result = resume_plan_ok;
   auto resume_result = controlled_kernel.resume();
   ASSERT_TRUE(resume_result.accepted);
   ASSERT_TRUE(controlled_execution.wait_until_resume_called())
       << "wait_until_resume_called timed out";
   ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kExecuting));
 
+  EXPECT_EQ(planner.plan_count, 2);
+  EXPECT_EQ(controlled_execution.sync_observed_state_count, 2);
   EXPECT_GE(context.validate_count, 2);
   ASSERT_FALSE(controlled_execution.last_resume_trajectory.waypoints.empty());
+  EXPECT_DOUBLE_EQ(
+      controlled_execution.last_resume_trajectory.waypoints.front().positions_rad[0],
+      0.25);
+  EXPECT_DOUBLE_EQ(
+      controlled_execution.last_resume_trajectory.waypoints.front().positions_rad[1],
+      0.25);
 
   controlled_execution.complete();
   controlled_kernel.wait_for_completion();
@@ -2312,6 +2367,10 @@ TEST_F(ExecutionKernelTest, Resume_FromPaused_ValidationFailureTransitionsToFail
   ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kPaused));
 
   context.current_state.positions_rad = {0.5, 0.5};
+  PlanResultDTO resume_plan_ok;
+  resume_plan_ok.trajectory =
+      make_test_trajectory_from({0.5, 0.5}, {1.0, 1.0});
+  planner.next_result = resume_plan_ok;
   context.next_validation = ValidationResultDTO{
       false, ErrorDTO{kErrorValidationCollision, "Resume collision", {}}};
 
@@ -2319,9 +2378,150 @@ TEST_F(ExecutionKernelTest, Resume_FromPaused_ValidationFailureTransitionsToFail
   ASSERT_TRUE(resume_result.accepted);
   controlled_kernel.wait_for_completion();
 
+  EXPECT_EQ(planner.plan_count, 2);
   EXPECT_EQ(controlled_execution.resume_count, 0);
   EXPECT_EQ(controlled_execution.stop_count, 1);
   EXPECT_EQ(controlled_kernel.get_status().state, ExecutionState::kFailed);
+}
+
+TEST_F(ExecutionKernelTest, Resume_FromPaused_PlanningFailureStopsPausedBackend) {
+  ControlledExecution controlled_execution;
+  FakeClock local_clock;
+  ManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  MockCollisionWorldPublisher local_collision_world;
+  auto local_collision_engine = std::make_shared<MockCollisionEngine>();
+  ExecutionKernel controlled_kernel{
+      planner, context, controlled_execution, local_clock, local_scheduler, local_cache};
+  configure_authoritative_collision_validation(
+      controlled_kernel, local_collision_world, local_collision_engine);
+
+  auto result = controlled_kernel.execute(make_test_request());
+  ASSERT_TRUE(result.ok());
+  ASSERT_TRUE(controlled_execution.wait_until_execute_called())
+      << "wait_until_execute_called timed out";
+  ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kExecuting));
+
+  controlled_execution.set_progress(0.5, {0.5, 0.5});
+  auto pause_result = controlled_kernel.pause();
+  ASSERT_TRUE(pause_result.accepted);
+  local_scheduler.advance_to(local_clock.now());
+  ASSERT_TRUE(controlled_execution.wait_until_paused())
+      << "wait_until_paused timed out";
+  ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kPaused));
+
+  context.current_state.positions_rad = {0.5, 0.5};
+  PlanResultDTO resume_plan_error;
+  resume_plan_error.error =
+      ErrorDTO{kErrorPlanningFailed, "No resume path", {}};
+  planner.next_result = resume_plan_error;
+
+  auto resume_result = controlled_kernel.resume();
+  ASSERT_TRUE(resume_result.accepted);
+  controlled_kernel.wait_for_completion();
+
+  EXPECT_EQ(planner.plan_count, 2);
+  EXPECT_EQ(controlled_execution.resume_count, 0);
+  EXPECT_EQ(controlled_execution.stop_count, 1);
+  EXPECT_EQ(controlled_kernel.get_status().state, ExecutionState::kFailed);
+}
+
+TEST_F(ExecutionKernelTest, Resume_FromPaused_StopDuringStateSyncDoesNotDispatch) {
+  ControlledExecution controlled_execution;
+  FakeClock local_clock;
+  ManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  MockCollisionWorldPublisher local_collision_world;
+  auto local_collision_engine = std::make_shared<MockCollisionEngine>();
+  ExecutionKernel controlled_kernel{
+      planner, context, controlled_execution, local_clock, local_scheduler, local_cache};
+  configure_authoritative_collision_validation(
+      controlled_kernel, local_collision_world, local_collision_engine);
+
+  auto result = controlled_kernel.execute(make_test_request());
+  ASSERT_TRUE(result.ok());
+  ASSERT_TRUE(controlled_execution.wait_until_execute_called())
+      << "wait_until_execute_called timed out";
+  ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kExecuting));
+
+  controlled_execution.set_progress(0.5, {0.5, 0.5});
+  auto pause_result = controlled_kernel.pause();
+  ASSERT_TRUE(pause_result.accepted);
+  local_scheduler.advance_to(local_clock.now());
+  ASSERT_TRUE(controlled_execution.wait_until_paused())
+      << "wait_until_paused timed out";
+  ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kPaused));
+
+  context.current_state.positions_rad = {0.5, 0.5};
+  PlanResultDTO resume_plan_ok;
+  resume_plan_ok.trajectory =
+      make_test_trajectory_from({0.5, 0.5}, {1.0, 1.0});
+  planner.next_result = resume_plan_ok;
+  controlled_execution.block_sync_observed_state = true;
+
+  auto resume_result = controlled_kernel.resume();
+  ASSERT_TRUE(resume_result.accepted);
+  ASSERT_TRUE(controlled_execution.wait_until_sync_observed_state_count(2))
+      << "resume sync did not start";
+  ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kValidating));
+
+  auto stop_result = controlled_kernel.stop();
+  ASSERT_TRUE(stop_result.accepted);
+  controlled_execution.release_sync_observed_state();
+  controlled_kernel.wait_for_completion();
+
+  EXPECT_EQ(controlled_execution.resume_count, 0);
+  EXPECT_GE(controlled_execution.stop_count, 1);
+  EXPECT_EQ(controlled_kernel.get_status().state, ExecutionState::kStopped);
+}
+
+TEST_F(ExecutionKernelTest, Resume_FromPaused_ResetDuringStateSyncDoesNotDispatch) {
+  ControlledExecution controlled_execution;
+  FakeClock local_clock;
+  ManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  MockCollisionWorldPublisher local_collision_world;
+  auto local_collision_engine = std::make_shared<MockCollisionEngine>();
+  ExecutionKernel controlled_kernel{
+      planner, context, controlled_execution, local_clock, local_scheduler, local_cache};
+  configure_authoritative_collision_validation(
+      controlled_kernel, local_collision_world, local_collision_engine);
+
+  auto result = controlled_kernel.execute(make_test_request());
+  ASSERT_TRUE(result.ok());
+  ASSERT_TRUE(controlled_execution.wait_until_execute_called())
+      << "wait_until_execute_called timed out";
+  ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kExecuting));
+
+  controlled_execution.set_progress(0.5, {0.5, 0.5});
+  auto pause_result = controlled_kernel.pause();
+  ASSERT_TRUE(pause_result.accepted);
+  local_scheduler.advance_to(local_clock.now());
+  ASSERT_TRUE(controlled_execution.wait_until_paused())
+      << "wait_until_paused timed out";
+  ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kPaused));
+
+  context.current_state.positions_rad = {0.5, 0.5};
+  PlanResultDTO resume_plan_ok;
+  resume_plan_ok.trajectory =
+      make_test_trajectory_from({0.5, 0.5}, {1.0, 1.0});
+  planner.next_result = resume_plan_ok;
+  controlled_execution.block_sync_observed_state = true;
+
+  auto resume_result = controlled_kernel.resume();
+  ASSERT_TRUE(resume_result.accepted);
+  ASSERT_TRUE(controlled_execution.wait_until_sync_observed_state_count(2))
+      << "resume sync did not start";
+  ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kValidating));
+
+  auto reset_result = controlled_kernel.reset();
+  ASSERT_TRUE(reset_result.accepted);
+  controlled_execution.release_sync_observed_state();
+  controlled_kernel.wait_for_completion();
+
+  EXPECT_EQ(controlled_execution.resume_count, 0);
+  EXPECT_EQ(controlled_execution.reset_count, 1);
+  EXPECT_EQ(controlled_kernel.get_status().state, ExecutionState::kIdle);
 }
 
 // --- Reset ---

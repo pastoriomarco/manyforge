@@ -2730,6 +2730,7 @@ def _normalize_scene_shape_argument(
 _ORIENTATION_INTENT_PARAM_KEYS = (
     "rotate_local_rpy_deg",
     "rotate_world_rpy_deg",
+    "rpy_delta_deg",
     "orientation_from",
 )
 
@@ -3749,18 +3750,11 @@ def _apply_tree_draft_insert_node(
     # top-level `nodeName` argument (matching the rest of the
     # tree_draft_* family) instead of nested as `node.name`. Inject it
     # into the node payload here so the existing helper validates the
-    # familiar shape. If the caller still nested `name` inside `node`,
-    # the top-level `nodeName` wins.
-    node_name_arg = arguments.get("nodeName") or arguments.get("node_name")
-    if not isinstance(node_name_arg, str) or not node_name_arg.strip():
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "tree_draft_insert_node requires `nodeName` (the new "
-                "node's instance name) as a top-level argument."
-            ),
-        )
-    node_name_arg = node_name_arg.strip()
+    # familiar shape. Per the 485 alias-normalization contract, a name
+    # nested as `node.name` / `node.nodeName` is accepted as a
+    # model-friendly alias when the top-level argument is absent (small
+    # models reliably place it there); when both are present the
+    # top-level `nodeName` wins.
     raw_node = arguments.get("node")
     if isinstance(raw_node, str):
         try:
@@ -3770,8 +3764,24 @@ def _apply_tree_draft_insert_node(
         else:
             if isinstance(parsed, dict):
                 raw_node = parsed
+    node_name_arg = arguments.get("nodeName") or arguments.get("node_name")
+    if not (isinstance(node_name_arg, str) and node_name_arg.strip()) and isinstance(
+        raw_node, dict
+    ):
+        node_name_arg = raw_node.get("name") or raw_node.get("nodeName")
+    if not isinstance(node_name_arg, str) or not node_name_arg.strip():
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "tree_draft_insert_node requires `nodeName` (the new "
+                "node's instance name) as a top-level argument, or "
+                "`name` inside the `node` object."
+            ),
+        )
+    node_name_arg = node_name_arg.strip()
     if isinstance(raw_node, dict):
         raw_node = {**raw_node, "name": node_name_arg}
+        raw_node.pop("nodeName", None)
 
     new_node, normalization_warnings = _tree_node_from_draft_argument(
         raw_node, field_name="node"

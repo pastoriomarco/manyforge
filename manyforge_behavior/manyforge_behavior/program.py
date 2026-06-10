@@ -2254,55 +2254,64 @@ class Program:
         }
         if self.robot.base_pose:
             d["robot"]["base_pose"] = self.robot.base_pose
-        d["scene"] = []
-        for s in self.scene:
-            scene_resource = {
-                "object_id": s.object_id,
-                "shape": s.shape,
-                "pose": s.pose,
-            }
-            if s.metadata:
-                scene_resource["metadata"] = s.metadata
-            d["scene"].append(scene_resource)
-        d["parameters"] = [
-            {
-                "name": p.name,
-                "type": p.type,
-                "default": p.default,
-                "constraints": p.constraints,
-                "description": p.description,
-            }
-            for p in self.parameters.values()
-        ]
+        # Optional collections (spec 420): omit when empty so a load -> save
+        # round-trip does not add "scene: []" / "parameters: []" noise.
+        if self.scene:
+            d["scene"] = []
+            for s in self.scene:
+                scene_resource = {
+                    "object_id": s.object_id,
+                    "shape": s.shape,
+                    "pose": s.pose,
+                }
+                if s.metadata:
+                    scene_resource["metadata"] = s.metadata
+                d["scene"].append(scene_resource)
+        if self.parameters:
+            d["parameters"] = [
+                {
+                    "name": p.name,
+                    "type": p.type,
+                    "default": p.default,
+                    "constraints": p.constraints,
+                    "description": p.description,
+                }
+                for p in self.parameters.values()
+            ]
         if self.blackboard_namespaces or self.blackboard_keys:
-            d["blackboard"] = {
-                "namespaces": [
+            # Omit empty descriptions and empty namespace/key lists so a
+            # load -> save round-trip of a program that never declared them
+            # does not add "description: ''" / "keys: []" noise.
+            blackboard: dict[str, Any] = {}
+            if self.blackboard_namespaces:
+                blackboard["namespaces"] = [
                     {
                         "id": namespace.id,
                         "contract": namespace.contract,
                         "prefix": namespace.prefix,
-                        "description": namespace.description,
+                        **({"description": namespace.description} if namespace.description else {}),
                         "fields": [
                             {
                                 "name": field.name,
                                 "type": field.type,
-                                "description": field.description,
+                                **({"description": field.description} if field.description else {}),
                             }
                             for field in namespace.fields
                         ],
                     }
                     for namespace in self.blackboard_namespaces.values()
-                ],
-                "keys": [
+                ]
+            if self.blackboard_keys:
+                blackboard["keys"] = [
                     {
                         "id": key.id,
                         "type": key.type,
                         "key": key.key,
-                        "description": key.description,
+                        **({"description": key.description} if key.description else {}),
                     }
                     for key in self.blackboard_keys.values()
-                ],
-            }
+                ]
+            d["blackboard"] = blackboard
         if self.saved_with_deployment:
             d["saved_with_deployment"] = self.saved_with_deployment
         d["tree"] = self.tree.to_dict() if self.tree else {}

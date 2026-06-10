@@ -147,7 +147,7 @@ def create_cycle_router(state: ComposerState) -> APIRouter:
 
     @router.post("/stop", response_model=CycleCommandResponse, response_model_by_alias=True)
     def stop_cycle() -> dict:
-        """Stop the cycle (RUNNING→STOPPED)."""
+        """Pause/hold the cycle (RUNNING→STOPPED); hard kernel stop is separate."""
         if state.cycle_manager is None:
             raise HTTPException(
                 status_code=409,

@@ -1,6 +1,7 @@
 """Tests for ManyForge Composer Backend."""
 from __future__ import annotations
 
+import copy
 import logging
 import time
 import pytest
@@ -1044,8 +1045,14 @@ def test_update_tree_rejects_when_overrides_exist(client, tmp_path):
         },
     )
 
-    modified_tree = dict(original_tree)
-    modified_tree["params"] = {"new_param": True}
+    # Make a SCHEMA-VALID tree change: fail-closed v1 validation rejects unknown
+    # params with 400 before the overrides-conflict check can answer 409
+    # (sequence declares no params), so change a real catalog param on the
+    # overridden move node instead.
+    modified_tree = copy.deepcopy(original_tree)
+    move_node = modified_tree["children"][0]
+    move_node["params"] = dict(move_node.get("params") or {})
+    move_node["params"]["planning_timeout_s"] = 9.0
     response = client.put(
         "/api/program/tree",
         json={"tree": modified_tree, "forceDiscardOverrides": False},

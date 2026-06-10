@@ -613,6 +613,80 @@ TEST_F(NativeKernelTest,
   EXPECT_TRUE(handle->wait_for_completion(1'000'000'000));
 }
 
+TEST_F(NativeKernelTest, NativeExecutionBackendResumeFreshDispatchesSuppliedTrajectory) {
+  RoboPlanExecutionBackend backend(
+      bundle_->scene, "arm", *bundle_->clock, nullptr);
+
+  auto start_state = bundle_->context->get_current_state();
+  ASSERT_FALSE(start_state.joint_names.empty());
+  ASSERT_EQ(start_state.joint_names.size(), start_state.positions_rad.size());
+
+  TrajectoryDTO original;
+  original.joint_names = start_state.joint_names;
+  original.waypoints.push_back(
+      TrajectoryWaypointDTO{0.0, start_state.positions_rad, {}, {}});
+  auto original_goal = start_state.positions_rad;
+  original_goal.front() += 0.2;
+  original.waypoints.push_back(
+      TrajectoryWaypointDTO{3.0, original_goal, {}, {}});
+
+  auto original_handle = backend.execute_trajectory(original);
+  const auto executing_deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+  while (backend.get_execution_snapshot().state != ExecutionState::kExecuting &&
+         std::chrono::steady_clock::now() < executing_deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  ASSERT_EQ(backend.get_execution_snapshot().state, ExecutionState::kExecuting);
+
+  auto pause = backend.pause();
+  ASSERT_TRUE(pause.accepted) << (pause.error ? pause.error->message : "");
+  const auto paused_deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+  while (backend.get_execution_snapshot().state != ExecutionState::kPaused &&
+         std::chrono::steady_clock::now() < paused_deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  ASSERT_EQ(backend.get_execution_snapshot().state, ExecutionState::kPaused);
+
+  TrajectoryDTO resumed;
+  resumed.joint_names = start_state.joint_names;
+  auto resume_start = start_state.positions_rad;
+  resume_start.front() += 0.45;
+  auto resume_goal = resume_start;
+  resume_goal.front() += 0.05;
+  resumed.waypoints.push_back(
+      TrajectoryWaypointDTO{0.0, resume_start, {}, {}});
+  resumed.waypoints.push_back(
+      TrajectoryWaypointDTO{3.0, resume_goal, {}, {}});
+
+  auto resume_handle = backend.resume(resumed);
+  const auto resume_deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+  ExecutionSnapshot snapshot;
+  while (std::chrono::steady_clock::now() < resume_deadline) {
+    snapshot = backend.get_execution_snapshot();
+    if (snapshot.state == ExecutionState::kExecuting &&
+        snapshot.joint_positions_rad.size() == resume_start.size() &&
+        std::abs(snapshot.joint_positions_rad.front() - resume_start.front()) <
+            1e-9) {
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+
+  EXPECT_EQ(snapshot.state, ExecutionState::kExecuting);
+  ASSERT_EQ(snapshot.joint_positions_rad.size(), resume_start.size());
+  EXPECT_NEAR(snapshot.joint_positions_rad.front(), resume_start.front(), 1e-9);
+  EXPECT_NEAR(snapshot.joint_positions_rad.front(), start_state.positions_rad.front() + 0.45, 1e-9);
+
+  auto stop = backend.stop();
+  EXPECT_TRUE(stop.accepted) << (stop.error ? stop.error->message : "");
+  ASSERT_TRUE(resume_handle.wait_for_completion);
+  EXPECT_TRUE(resume_handle.wait_for_completion(1'000'000'000));
+  (void)original_handle;
+}
+
 TEST_F(NativeKernelTest, PlannerUsesPerRequestPlanningTimeout) {
   roboplan::RRTOptions rrt_opts;
   rrt_opts.group_name = "arm";

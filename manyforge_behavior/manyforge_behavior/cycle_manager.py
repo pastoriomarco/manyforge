@@ -1088,10 +1088,12 @@ class CycleManager:
 
     def stop(self) -> None:
         """
-        Stop program execution.
-        
+        Pause/hold program execution at the cycle layer.
+
         If RUNNING: set stop_requested=True on BB, suspend tick thread.
                     If kernel state is EXECUTING, call kernel.pause().
+                    A later Run from STOPPED resumes by replanning from
+                    fresh measured state to the original motion goal.
                     State → STOPPED.
         If STOPPED or IDLE: no-op.
         """

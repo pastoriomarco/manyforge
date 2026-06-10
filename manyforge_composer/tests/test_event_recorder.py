@@ -509,6 +509,98 @@ class TestJSONLSink:
             "collision_result_first_failure_pair"
         ] == details["collision_result_first_failure_pair"]
 
+    def test_native_resume_replan_lifecycle_is_recorded(self):
+        rec = EventRecorder()
+        native_events = [
+            {
+                "event_index": 10,
+                "type": "plan_started",
+                "timestamp_ns": 100,
+                "execution_id": 7,
+                "details": {
+                    "reason": "resume_replan",
+                    "resume_phase": "planning",
+                },
+            },
+            {
+                "event_index": 11,
+                "type": "plan_completed",
+                "timestamp_ns": 101,
+                "execution_id": 7,
+                "details": {
+                    "reason": "resume_replan",
+                    "resume_phase": "planning",
+                },
+            },
+            {
+                "event_index": 12,
+                "type": "validation_started",
+                "timestamp_ns": 102,
+                "execution_id": 7,
+                "details": {
+                    "reason": "resume_replan",
+                    "resume_phase": "validation",
+                },
+            },
+            {
+                "event_index": 13,
+                "type": "validation_passed",
+                "timestamp_ns": 103,
+                "execution_id": 7,
+                "details": {
+                    "reason": "resume_replan",
+                    "resume_phase": "validation",
+                },
+            },
+            {
+                "event_index": 14,
+                "type": "execute_started",
+                "timestamp_ns": 104,
+                "execution_id": 7,
+                "details": {
+                    "reason": "resume_replan",
+                },
+            },
+        ]
+
+        rec.record_native_kernel_events(native_events)
+
+        events = _memory_events(rec)
+        assert [event["type"] for event in events] == [
+            "plan_started",
+            "plan_completed",
+            "validation_started",
+            "validation_passed",
+        ]
+        assert all(event["execution_id"] == 7 for event in events)
+        assert all(event["details"]["reason"] == "resume_replan" for event in events)
+        assert events[0]["details"]["native_kernel_event_index"] == 10
+        assert events[-1]["details"]["native_kernel_event_index"] == 13
+
+    def test_regular_native_lifecycle_events_are_not_recorded(self):
+        rec = EventRecorder()
+        rec.record_native_kernel_events(
+            [
+                {
+                    "event_index": 1,
+                    "type": "plan_started",
+                    "timestamp_ns": 100,
+                    "execution_id": 1,
+                },
+                {
+                    "event_index": 2,
+                    "type": "validation_passed",
+                    "timestamp_ns": 101,
+                    "execution_id": 1,
+                    "details": {
+                        "reason": "normal_execute",
+                    },
+                },
+            ]
+        )
+
+        assert _memory_events(rec) == []
+
     def test_history_filters_by_severity_component_and_type(self):
         rec = EventRecorder()
         rec.observe(_StubState(cycle_manager=_StubCycleManager("idle")))

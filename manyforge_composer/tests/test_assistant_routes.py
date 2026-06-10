@@ -1670,6 +1670,44 @@ def test_assistant_bridge_insert_node_enforces_mode_node_allowlist(
     assert "command_gripper" in detail["rejectedNodeKinds"]
 
 
+def test_assistant_bridge_insert_node_accepts_nested_name_alias(
+    client: TestClient,
+    state: ComposerState,
+    tmp_path: Path,
+) -> None:
+    """`node.name` is accepted as the instance-name alias when the canonical
+    top-level `nodeName` is absent (485 alias normalization) — small models
+    reliably nest the name inside the node payload. The alias is resolved
+    before node-kind/profile/capability checks, so a capability-free leaf
+    exercises it fully."""
+    program_path = _write_minimal_program(tmp_path)
+    state.load_program(str(program_path))
+    state.deployment = _assistant_mode_deployment()
+    catalog_hash = _assistant_catalog_hash(state, "composer-assistant")
+
+    response = client.post(
+        "/api/assistant/bridge/tools/tree_draft_insert_node",
+        json={
+            "requestId": "req-insert-nested-name-alias",
+            "assistantMode": "composer-assistant",
+            "catalogHash": catalog_hash,
+            "arguments": {
+                "parentName": "root",
+                # no top-level nodeName — the name rides inside `node`
+                "node": {
+                    "id": "reset_trajectories",
+                    "name": "nested_name_target",
+                },
+            },
+        },
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["success"] is True, body
+    assert body["draftMutated"] is True
+    assert body["result"]["nodeName"] == "nested_name_target"
+
+
 def test_assistant_bridge_wrap_node_unknown_target_returns_valid_names(
     client: TestClient,
     state: ComposerState,

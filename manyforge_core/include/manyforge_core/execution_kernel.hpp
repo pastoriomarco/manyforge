@@ -309,12 +309,11 @@ class ExecutionKernel {
  private:
   Result<MotionSpecDTO> resolve_motion_spec(const ExecuteRequestDTO& request);
   Result<TrajectoryDTO> plan_trajectory(const ExecuteRequestDTO& request);
+  Result<TrajectoryDTO> plan_resume_trajectory(
+      const ExecuteRequestDTO& request);
   Result<CollisionWorldRevision> validate_trajectory(
       const TrajectoryDTO& trajectory,
       const ExecuteRequestDTO& request);
-  TrajectoryDTO build_remaining_trajectory(
-      const TrajectoryDTO& trajectory,
-      const ExecutionSnapshot& snapshot) const;
 
   /// Async execution worker function.
   void async_execute_worker(std::stop_token st,

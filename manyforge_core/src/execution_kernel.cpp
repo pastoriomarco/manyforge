@@ -1,7 +1,6 @@
 #include <manyforge_core/execution_kernel.hpp>
 
 #include <manyforge_core/motion_interrupt/soft_on_path_stop_planner.hpp>
-#include <manyforge_core/trajectory/trajectory_sampler.hpp>
 
 #include <algorithm>
 #include <array>
@@ -9,7 +8,6 @@
 #include <cmath>
 #include <exception>
 #include <iomanip>
-#include <iostream>
 #include <limits>
 #include <sstream>
 #include <stdexcept>
@@ -2735,70 +2733,6 @@ void ExecutionKernel::schedule_next_collision_monitor_tick(uint64_t generation) 
       });
 }
 
-TrajectoryDTO ExecutionKernel::build_remaining_trajectory(
-    const TrajectoryDTO& trajectory, const ExecutionSnapshot& snapshot) const {
-  if (trajectory.waypoints.empty()) {
-    return trajectory;
-  }
-
-  TrajectoryDTO remaining;
-  remaining.joint_names = trajectory.joint_names;
-
-  const double total_duration_s = trajectory.waypoints.back().time_from_start_s;
-  const double elapsed_s =
-      total_duration_s <= 1e-9
-          ? 0.0
-          : clamp_unit_interval(snapshot.progress) * total_duration_s;
-
-  std::vector<double> current_positions = snapshot.joint_positions_rad;
-  if (current_positions.empty()) {
-    // Snapshot did not carry a joint vector (cold path / pre-execution
-    // entry); reconstruct the position from the trajectory at the
-    // observed elapsed time via the shared sampler.
-    auto sample = sample_trajectory(trajectory, elapsed_s);
-    if (sample.ok()) {
-      current_positions = std::move(sample.value().positions_rad);
-    } else {
-      // Fail closed: with no snapshot position and a sampler that
-      // rejects the active trajectory, the resume start state is
-      // unknown. Return a trajectory with NO waypoints so the caller's
-      // validate_trajectory gate rejects the resume rather than
-      // proceeding from an empty/garbage start waypoint.
-      std::cerr << "trajectory_sampler error in build_remaining_trajectory: "
-                << sample.error().code << " (time_s=" << elapsed_s
-                << ", waypoints=" << trajectory.waypoints.size() << ")"
-                << std::endl;
-      remaining.waypoints.clear();
-      return remaining;
-    }
-  }
-
-  TrajectoryWaypointDTO current_wp;
-  current_wp.time_from_start_s = 0.0;
-  current_wp.positions_rad = current_positions;
-  remaining.waypoints.push_back(current_wp);
-
-  for (const auto& waypoint : trajectory.waypoints) {
-    if (waypoint.time_from_start_s <= elapsed_s + 1e-9) {
-      continue;
-    }
-    auto shifted = waypoint;
-    shifted.time_from_start_s -= elapsed_s;
-    remaining.waypoints.push_back(std::move(shifted));
-  }
-
-  if (remaining.waypoints.size() == 1) {
-    auto final_wp = trajectory.waypoints.back();
-    final_wp.time_from_start_s = std::max(0.0, total_duration_s - elapsed_s);
-    if (final_wp.positions_rad != current_positions ||
-        final_wp.time_from_start_s > 1e-9) {
-      remaining.waypoints.push_back(std::move(final_wp));
-    }
-  }
-
-  return remaining;
-}
-
 void ExecutionKernel::async_execute_worker(
     std::stop_token st, ExecuteRequestDTO request, uint64_t exec_id,
     std::optional<TrajectoryDTO> cached_trajectory) {
@@ -3202,7 +3136,6 @@ void ExecutionKernel::async_execute_worker(
         ? static_cast<int64_t>(request.timeouts.execution_timeout_s * 1e9) : 0;
 
     auto execution_handle = execution_backend_.execute_trajectory(trajectory);
-    auto active_trajectory = trajectory;
     core::ExecutionSnapshot final_snapshot;
     core::ExecutionSnapshot latest_backend_snapshot;
     start_collision_monitoring();
@@ -3338,30 +3271,155 @@ void ExecutionKernel::async_execute_worker(
         stop_collision_monitoring();
 
         if (resume_requested_.exchange(false)) {
-          emit_event({KernelEventType::kValidationStarted, exec_id, clock_.now(),
-                      {}, {}, std::nullopt, {}});
+          auto finish_resume_interrupted = [&](ExecutionState terminal_state,
+                                               ErrorDTO error,
+                                               const char* reap_reason) {
+            sm_.set_last_error(error_code_from_dto(error));
+            if (terminal_state != sm_.status().state) {
+              sm_.try_transition(terminal_state);
+            }
+            auto terminal_snapshot = latest_backend_snapshot;
+            terminal_snapshot.timestamp_ns = clock_.now();
+            terminal_snapshot.execution_id =
+                terminal_state == ExecutionState::kIdle ? 0 : exec_id;
+            terminal_snapshot.move_id =
+                terminal_state == ExecutionState::kIdle ? std::string{} : request.move_id;
+            terminal_snapshot.state = terminal_state;
+            terminal_snapshot.error = error;
+            publish_execution_snapshot(std::move(terminal_snapshot));
+            emit_event({KernelEventType::kStateTransition, exec_id, clock_.now(),
+                        ExecutionState::kValidating, terminal_state,
+                        std::nullopt, {{"reason", reap_reason}}});
+            finalize_motion_execution_outcome(
+                motion_state, MotionExecutionTerminalCause::kStopped,
+                std::nullopt, std::nullopt, reap_reason);
+            execution_complete_.store(true);
+            completion_cv_.notify_all();
+          };
 
-          auto resumed_trajectory =
-              build_remaining_trajectory(active_trajectory, latest_backend_snapshot);
-          // Fail closed: build_remaining_trajectory returns no waypoints
-          // when it cannot determine the resume start state (sampler
-          // rejected the active trajectory and no observed snapshot
-          // position was available). Treat that as a resume failure
-          // rather than validating an empty trajectory.
+          auto fail_resume_closed = [&](ErrorDTO error,
+                                        const char* failure_reason,
+                                        const char* outcome_reap_reason,
+                                        bool count_plan_failure,
+                                        bool count_validation_failure) {
+            if (count_validation_failure) {
+              emit_event({KernelEventType::kValidationFailed, exec_id, clock_.now(),
+                          {}, {}, std::nullopt,
+                          {{"reason", failure_reason},
+                           {"resume_phase", "validation"},
+                           {"resume_replan", "true"}}});
+            }
+            emit_event({KernelEventType::kErrorRaised, exec_id, clock_.now(),
+                        {}, {}, error, {}});
+            {
+              std::lock_guard<std::mutex> lock(metrics_mutex_);
+              if (count_plan_failure) {
+                metrics_.plans_failed++;
+              }
+              if (count_validation_failure) {
+                metrics_.validations_failed++;
+              }
+            }
+            sm_.set_last_error(error_code_from_dto(error));
+            (void)execution_backend_.stop();
+            const bool stop_completed =
+                drain_execution_handle_bounded(execution_handle);
+            auto prev_state = sm_.status().state;
+            const auto terminal_state = stop_completed
+                ? ExecutionState::kFailed
+                : ExecutionState::kInterventionRequired;
+            if (!stop_completed) {
+              sm_.set_last_error(ErrorCode::kStopFailed);
+            }
+            sm_.try_transition(terminal_state);
+            auto failed_snapshot = latest_backend_snapshot;
+            failed_snapshot.timestamp_ns = clock_.now();
+            failed_snapshot.execution_id = exec_id;
+            failed_snapshot.move_id = request.move_id;
+            failed_snapshot.state = terminal_state;
+            failed_snapshot.error = stop_completed
+                ? error
+                : operator_intervention_error(
+                      ErrorCode::kStopFailed,
+                      "Resume failed and software stop completion was not observed",
+                      "resume_failure_stop_drain",
+                      prev_state,
+                      exec_id,
+                      request.move_id);
+            publish_execution_snapshot(std::move(failed_snapshot));
+            emit_event({KernelEventType::kStateTransition, exec_id, clock_.now(),
+                        prev_state, terminal_state, std::nullopt, {}});
+            finalize_motion_execution_outcome(
+                motion_state, MotionExecutionTerminalCause::kFailed,
+                stop_completed
+                    ? error
+                    : ErrorDTO{kErrorStopFailed,
+                               "Resume failed and stop drain did not complete",
+                               {{"reason", "resume_failure_stop_drain"}}},
+                std::nullopt, outcome_reap_reason);
+            execution_complete_.store(true);
+            completion_cv_.notify_all();
+          };
+
+          emit_event({KernelEventType::kPlanStarted, exec_id, clock_.now(),
+                      {}, {}, std::nullopt,
+                      {{"reason", "resume_replan"},
+                       {"resume_phase", "planning"}}});
+          auto resume_plan = plan_resume_trajectory(request);
+          if (!resume_plan.ok()) {
+            fail_resume_closed(resume_plan.error(),
+                               "resume planning failed",
+                               "resume_planning_failed",
+                               true,
+                               false);
+            return;
+          }
+
+          auto resumed_trajectory = std::move(resume_plan.value());
+          emit_event({KernelEventType::kPlanCompleted, exec_id, clock_.now(),
+                      {}, {}, std::nullopt,
+                      {{"reason", "resume_replan"},
+                       {"resume_phase", "planning"}}});
+          {
+            std::lock_guard<std::mutex> lock(metrics_mutex_);
+            metrics_.plans_succeeded++;
+          }
+
+          if (stop_policy_.stop_requested() ||
+              sm_.status().state == ExecutionState::kStopped) {
+            finish_resume_interrupted(
+                ExecutionState::kStopped,
+                ErrorDTO{kErrorInternalError,
+                         "Resume planning interrupted by stop",
+                         {{"reason", "resume_planning_stop"}}},
+                "resume_planning_stop");
+            return;
+          }
+          if (sm_.status().state == ExecutionState::kIdle) {
+            finish_resume_interrupted(
+                ExecutionState::kIdle,
+                ErrorDTO{kErrorInternalError,
+                         "Resume planning interrupted by reset",
+                         {{"reason", "resume_planning_reset"}}},
+                "resume_planning_reset");
+            return;
+          }
+
+          emit_event({KernelEventType::kValidationStarted, exec_id, clock_.now(),
+                      {}, {}, std::nullopt,
+                      {{"reason", "resume_replan"},
+                       {"resume_phase", "validation"}}});
+
           Result<CollisionWorldRevision> resume_validation =
-              resumed_trajectory.waypoints.empty()
-                  ? Result<CollisionWorldRevision>::Err(ErrorDTO{
-                        std::string(to_string(ErrorCode::kInternalError)),
-                        "resume could not reconstruct the remaining "
-                        "trajectory start state",
-                        {{"reason", "remaining_trajectory_unavailable"}}})
-                  : validate_trajectory(resumed_trajectory, request);
+              validate_trajectory(resumed_trajectory, request);
           if (!resume_validation.ok()) {
             if (validation_cancelled_by_interrupt(resume_validation.error()) &&
                 sm_.status().state == ExecutionState::kInterrupted) {
               emit_event({KernelEventType::kValidationFailed, exec_id, clock_.now(),
                           {}, {}, std::nullopt,
-                          {{"reason", "resume validation cancelled by interrupt"}}});
+                          {{"reason", "resume validation cancelled by interrupt"},
+                           {"resume_phase", "validation"},
+                           {"resume_replan", "true"}}});
               emit_event({KernelEventType::kErrorRaised, exec_id, clock_.now(),
                           {}, {}, resume_validation.error(), {}});
               mark_active_interrupt_preemption_result(
@@ -3382,62 +3440,41 @@ void ExecutionKernel::async_execute_worker(
               completion_cv_.notify_all();
               return;
             }
-            emit_event({KernelEventType::kValidationFailed, exec_id, clock_.now(),
-                        {}, {}, std::nullopt,
-                        {{"reason", "resume validation failed"}}});
-            emit_event({KernelEventType::kErrorRaised, exec_id, clock_.now(),
-                        {}, {}, resume_validation.error(), {}});
-            {
-              std::lock_guard<std::mutex> lock(metrics_mutex_);
-              metrics_.validations_failed++;
-            }
-            sm_.set_last_error(error_code_from_dto(resume_validation.error()));
-            (void)execution_backend_.stop();
-            const bool stop_completed = drain_execution_handle_bounded(execution_handle);
-            auto prev_state = sm_.status().state;
-            const auto terminal_state = stop_completed
-                ? ExecutionState::kFailed
-                : ExecutionState::kInterventionRequired;
-            if (!stop_completed) {
-              sm_.set_last_error(ErrorCode::kStopFailed);
-            }
-            sm_.try_transition(terminal_state);
-            auto failed_snapshot = latest_backend_snapshot;
-            failed_snapshot.timestamp_ns = clock_.now();
-            failed_snapshot.execution_id = exec_id;
-            failed_snapshot.move_id = request.move_id;
-            failed_snapshot.state = terminal_state;
-            failed_snapshot.error = stop_completed
-                ? resume_validation.error()
-                : operator_intervention_error(
-                      ErrorCode::kStopFailed,
-                      "Resume validation failed and software stop completion was not observed",
-                      "resume_validation_stop_drain",
-                      prev_state,
-                      exec_id,
-                      request.move_id);
-            publish_execution_snapshot(std::move(failed_snapshot));
-            emit_event({KernelEventType::kStateTransition, exec_id, clock_.now(),
-                        prev_state, terminal_state, std::nullopt, {}});
-            finalize_motion_execution_outcome(
-                motion_state, MotionExecutionTerminalCause::kFailed,
-                stop_completed
-                    ? resume_validation.error()
-                    : ErrorDTO{kErrorStopFailed,
-                               "Resume validation failed and stop drain "
-                               "did not complete",
-                               {{"reason", "resume_validation_stop_drain"}}},
-                std::nullopt, "resume_validation_failed");
-            execution_complete_.store(true);
-            completion_cv_.notify_all();
+            fail_resume_closed(resume_validation.error(),
+                               "resume validation failed",
+                               "resume_validation_failed",
+                               false,
+                               true);
             return;
           }
 
           emit_event({KernelEventType::kValidationPassed, exec_id, clock_.now(),
-                      {}, {}, std::nullopt, {}});
+                      {}, {}, std::nullopt,
+                      {{"reason", "resume_replan"},
+                       {"resume_phase", "validation"}}});
           {
             std::lock_guard<std::mutex> lock(metrics_mutex_);
             metrics_.validations_passed++;
+          }
+
+          if (stop_policy_.stop_requested() ||
+              sm_.status().state == ExecutionState::kStopped) {
+            finish_resume_interrupted(
+                ExecutionState::kStopped,
+                ErrorDTO{kErrorInternalError,
+                         "Resume validation interrupted by stop",
+                         {{"reason", "resume_validation_stop"}}},
+                "resume_validation_stop");
+            return;
+          }
+          if (sm_.status().state == ExecutionState::kIdle) {
+            finish_resume_interrupted(
+                ExecutionState::kIdle,
+                ErrorDTO{kErrorInternalError,
+                         "Resume validation interrupted by reset",
+                         {{"reason", "resume_validation_reset"}}},
+                "resume_validation_reset");
+            return;
           }
 
           auto prev_state = sm_.status().state;
@@ -3484,7 +3521,6 @@ void ExecutionKernel::async_execute_worker(
           publish_execution_snapshot(std::move(resumed_snapshot));
 
           execution_handle = execution_backend_.resume(resumed_trajectory);
-          active_trajectory = std::move(resumed_trajectory);
           start_collision_monitoring();
         }
 
@@ -3492,9 +3528,10 @@ void ExecutionKernel::async_execute_worker(
           // Some real backends implement pause by cancelling the active
           // controller goal. Their execution handle is then terminal even
           // though the kernel state is intentionally kPaused. Keep the kernel
-          // worker alive so a later resume() can revalidate and dispatch the
-          // remaining trajectory; otherwise the state machine can advance to
-          // kValidating with no worker left to consume resume_requested_.
+          // worker alive so a later resume() can replan, validate, and
+          // fresh-dispatch the original motion intent; otherwise the state
+          // machine can advance to kValidating with no worker left to consume
+          // resume_requested_.
           std::this_thread::sleep_for(std::chrono::nanoseconds(kExecutionPollNs));
         }
         continue;
@@ -5154,6 +5191,39 @@ Result<TrajectoryDTO> ExecutionKernel::plan_trajectory(
   }
 
   return Result<TrajectoryDTO>::Err(ErrorCode::kPlanningFailed);
+}
+
+Result<TrajectoryDTO> ExecutionKernel::plan_resume_trajectory(
+    const ExecuteRequestDTO& request) {
+  auto sync_result = execution_backend_.sync_observed_state_before_planning();
+  if (!sync_result.ok()) {
+    auto error = sync_result.error();
+    error.details["resume_phase"] = "state_sync";
+    return Result<TrajectoryDTO>::Err(std::move(error));
+  }
+
+  try {
+    auto planned = plan_trajectory(request);
+    if (!planned.ok()) {
+      auto error = planned.error();
+      error.details["resume_phase"] = "planning";
+      return Result<TrajectoryDTO>::Err(std::move(error));
+    }
+    return Result<TrajectoryDTO>::Ok(std::move(planned.value()));
+  } catch (const std::exception& e) {
+    return Result<TrajectoryDTO>::Err(ErrorDTO{
+        kErrorPlanningFailed,
+        "Resume planning could not read the fresh current state",
+        {{"reason", "resume_current_state_unavailable"},
+         {"resume_phase", "current_state"},
+         {"exception", e.what()}}});
+  } catch (...) {
+    return Result<TrajectoryDTO>::Err(ErrorDTO{
+        kErrorPlanningFailed,
+        "Resume planning could not read the fresh current state",
+        {{"reason", "resume_current_state_unavailable"},
+         {"resume_phase", "current_state"}}});
+  }
 }
 
 Result<MotionSpecDTO> ExecutionKernel::resolve_motion_spec(

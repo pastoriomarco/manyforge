@@ -56,9 +56,6 @@ parameters:
     min_exclusive: 0
     max_inclusive: 1
   description: Velocity scale for all moves.
-blackboard:
-  namespaces: []
-  keys: []
 tree:
   id: sequence
   name: pick_and_place

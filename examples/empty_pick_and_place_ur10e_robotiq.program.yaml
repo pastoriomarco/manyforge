@@ -13,11 +13,6 @@ robot:
   group_id: arm
   base_frame: base_link
   tcp_frame: grasp_frame
-scene: []
-parameters: []
-blackboard:
-  namespaces: []
-  keys: []
 # Minimal placeholder tree: Composer requires SOME tree section AND
 # composites must have ≥1 child. We seed a `sequence` named "scaffold"
 # with one trivial `command_gripper` child as the only allowed-empty

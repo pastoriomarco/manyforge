@@ -806,21 +806,14 @@ core::PauseResultDTO RoboPlanExecutionBackend::pause() {
 
 core::ExecutionHandle RoboPlanExecutionBackend::resume(
     const core::TrajectoryDTO& trajectory) {
-  if (state_.running.load() && state_.pause_requested.load()) {
+  if (state_.running.load()) {
     state_.pause_requested.store(false);
+    if (worker_thread_.joinable()) {
+      worker_thread_.request_stop();
+    }
     execution_cv_.notify_all();
-    return core::ExecutionHandle{
-        [this](int64_t timeout_ns) {
-          std::unique_lock<std::mutex> lock(execution_mutex_);
-          if (timeout_ns > 0) {
-            return execution_cv_.wait_for(
-                lock, std::chrono::nanoseconds(timeout_ns),
-                [this]() { return !state_.running.load(); });
-          }
-          execution_cv_.wait(lock, [this]() { return !state_.running.load(); });
-          return true;
-        },
-        [this]() { return get_execution_snapshot(); }};
+    std::unique_lock<std::mutex> lock(execution_mutex_);
+    execution_cv_.wait(lock, [this]() { return !state_.running.load(); });
   }
   return execute_trajectory(trajectory);
 }

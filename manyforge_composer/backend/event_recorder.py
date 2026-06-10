@@ -34,6 +34,7 @@ _ALLOWED_EVENT_TYPES = {
     "plan_started",
     "stop_completed",
     "validation_failed",
+    "validation_passed",
     "validation_started",
 }
 _ALLOWED_EVENT_PREFIXES = (
@@ -56,10 +57,27 @@ _DEFAULT_FAILURE_ARCHIVE_MAX_AGE_S = 30 * 24 * 60 * 60
 _DEFAULT_FAILURE_ARCHIVE_MAX_BYTES = 1024 * 1024 * 1024
 _DEFAULT_HISTORY_LIMIT = 1000
 _MAX_HISTORY_LIMIT = 10000
-_NATIVE_KERNEL_EVENT_TYPES_TO_RECORD = {
+_NATIVE_KERNEL_ERROR_EVENT_TYPES_TO_RECORD = {
     "error_raised",
     "collision_detected",
 }
+_NATIVE_KERNEL_RESUME_AUDIT_EVENT_TYPES_TO_RECORD = {
+    "plan_started",
+    "plan_completed",
+    "validation_started",
+    "validation_passed",
+    "validation_failed",
+}
+
+
+def _is_resume_audit_native_event(native_event: dict[str, Any]) -> bool:
+    details = native_event.get("details")
+    if not isinstance(details, dict):
+        return False
+    return (
+        details.get("reason") == "resume_replan"
+        or str(details.get("resume_replan", "")).lower() == "true"
+    )
 
 
 def _wall_timestamp_iso() -> str:
@@ -106,6 +124,7 @@ def _component_for_event(event_type: str) -> str:
         "plan_completed",
         "plan_failed",
         "validation_started",
+        "validation_passed",
         "validation_failed",
         "execute_started",
         "execute_completed",
@@ -427,14 +446,20 @@ class EventRecorder:
 
         The native kernel event buffer is intentionally fine-grained and may
         include high-rate target-received/dispatched events. The recorder keeps
-        durable trace volume bounded by recording session lifecycle, rejects,
-        and explicit hazard/error events only. `event_index` dedupes events
-        drained through both `/api/kernel/events` and the websocket hub.
+        durable trace volume bounded by recording session lifecycle, explicit
+        hazard/error events, and resume-scoped replanning audit events only.
+        `event_index` dedupes events drained through both `/api/kernel/events`
+        and the websocket hub.
         """
         for native_event in events:
             native_type = str(native_event.get("type") or "")
             native_index = int(native_event.get("event_index") or 0)
-            if native_type not in _NATIVE_KERNEL_EVENT_TYPES_TO_RECORD:
+            should_record = native_type in _NATIVE_KERNEL_ERROR_EVENT_TYPES_TO_RECORD
+            should_record = should_record or (
+                native_type in _NATIVE_KERNEL_RESUME_AUDIT_EVENT_TYPES_TO_RECORD
+                and _is_resume_audit_native_event(native_event)
+            )
+            if not should_record:
                 continue
 
             with self._lock:
