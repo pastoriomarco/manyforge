@@ -1223,9 +1223,13 @@ def _scene_sync_resource_request(resource: Any) -> SceneEditRequest:
         cylinder_height_m=shape.get("cylinder_height_m"),
         mesh_resource_uri=shape.get("mesh_resource_uri"),
         mesh_scale=shape.get("mesh_scale"),
-        pose_position_m=pose.get("position_m") or [0.0, 0.0, 0.0],
-        pose_orientation_xyzw=orientation or [0.0, 0.0, 0.0, 1.0],
-        frame_id=pose.get("frame_id") or "base_link",
+        # No origin/identity/base_link defaults: authored scene resources are
+        # schema-validated (stored_pose requires frame_id + position_m +
+        # exactly one orientation form), and the kernel-client sink validator
+        # rejects an authored add without a full pose (spec 420 §4A.2).
+        pose_position_m=pose.get("position_m"),
+        pose_orientation_xyzw=orientation,
+        frame_id=pose.get("frame_id"),
     )
 
 

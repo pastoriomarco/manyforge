@@ -126,8 +126,11 @@ def create_mcp_server(state: ComposerState):
             cylinder_height_m: Height for cylinder shapes along local Z
             mesh_resource_uri: Mesh resource URI/path for mesh shapes
             mesh_scale: Optional [x, y, z] scale for mesh shapes
-            pose_position_m: [x, y, z] position in meters
+            pose_position_m: [x, y, z] position in meters (required for
+                add/upsert/update_pose)
             pose_orientation_xyzw: [x, y, z, w] quaternion orientation
+                (required for add/upsert/update_pose — the scene-edit sink
+                never defaults an orientation; choose deliberately or ask)
             frame_id: Robot link frame for attach/detach operations
         """
         from manyforge_behavior.cycle_manager import CycleState

@@ -406,9 +406,19 @@ def _validate_scene_edit_request(request: SceneEditRequest) -> Optional[str]:
                     return "mesh_scale must have exactly 3 elements"
                 if any(v <= 0.0 for v in request.mesh_scale):
                     return "mesh_scale values must be > 0"
-        if request.pose_position_m is not None and not _is_vector(request.pose_position_m, 3):
+        # Authored creation always carries a full pose (spec 420 §4A.2,
+        # create-exception revoked): the sink never invents position or
+        # orientation.
+        if request.pose_position_m is None:
+            return f"{request.operation} requires pose_position_m"
+        if not _is_vector(request.pose_position_m, 3):
             return "pose_position_m must have exactly 3 elements"
-        if request.pose_orientation_xyzw is not None and not _is_vector(request.pose_orientation_xyzw, 4):
+        if request.pose_orientation_xyzw is None:
+            return (
+                f"{request.operation} requires pose_orientation_xyzw — the "
+                "scene-edit sink never defaults an orientation"
+            )
+        if not _is_vector(request.pose_orientation_xyzw, 4):
             return "pose_orientation_xyzw must have exactly 4 elements"
         if request.support_contacts is not None:
             if not isinstance(request.support_contacts, list):
@@ -452,6 +462,16 @@ def _validate_scene_edit_request(request: SceneEditRequest) -> Optional[str]:
             return "update_pose requires pose_position_m"
         if not _is_vector(request.pose_position_m, 3):
             return "pose_position_m must have exactly 3 elements"
+        # AUTHORED update_pose (no source timing) must carry an orientation —
+        # spec 420 §4A.2. A pose-SOURCE update (live mirroring; identified by
+        # source_timestamp_ns) may be position-only: the sink then keeps the
+        # object's last known orientation, never identity.
+        if request.pose_orientation_xyzw is None and request.source_timestamp_ns is None:
+            return (
+                "update_pose requires pose_orientation_xyzw for authored edits; "
+                "only pose-source updates (with source_timestamp_ns) may omit it "
+                "to keep the last known orientation"
+            )
         if request.pose_orientation_xyzw is not None and not _is_vector(request.pose_orientation_xyzw, 4):
             return "pose_orientation_xyzw must have exactly 4 elements"
         source_timestamp = request.source_timestamp_ns
@@ -1166,8 +1186,8 @@ class MockKernelClient(KernelClient):
                 "mesh_scale": list(request.mesh_scale or [1.0, 1.0, 1.0])
                 if request.shape_type == "mesh"
                 else None,
-                "position_m": list(request.pose_position_m or [0.0, 0.0, 0.0]),
-                "orientation_xyzw": list(request.pose_orientation_xyzw or [0.0, 0.0, 0.0, 1.0]),
+                "position_m": list(request.pose_position_m),
+                "orientation_xyzw": list(request.pose_orientation_xyzw),
                 "frame_id": request.frame_id or "universe",
             }
         elif request.operation == "upsert":
@@ -1194,8 +1214,8 @@ class MockKernelClient(KernelClient):
                 "mesh_scale": list(request.mesh_scale or [1.0, 1.0, 1.0])
                 if request.shape_type == "mesh"
                 else None,
-                "position_m": list(request.pose_position_m or [0.0, 0.0, 0.0]),
-                "orientation_xyzw": list(request.pose_orientation_xyzw or [0.0, 0.0, 0.0, 1.0]),
+                "position_m": list(request.pose_position_m),
+                "orientation_xyzw": list(request.pose_orientation_xyzw),
                 "frame_id": request.frame_id or "universe",
             }
         elif request.operation == "update_pose":
@@ -1213,10 +1233,11 @@ class MockKernelClient(KernelClient):
                     error=error,
                 )
                 return SceneEditResult(success=False, error=error)
-            tracked["position_m"] = list(request.pose_position_m or [0.0, 0.0, 0.0])
-            tracked["orientation_xyzw"] = list(
-                request.pose_orientation_xyzw or [0.0, 0.0, 0.0, 1.0]
-            )
+            tracked["position_m"] = list(request.pose_position_m)
+            if request.pose_orientation_xyzw is not None:
+                tracked["orientation_xyzw"] = list(request.pose_orientation_xyzw)
+            # else: pose-source position-only update — keep the last known
+            # orientation (spec 420 §4A.2 mirroring semantics), never identity.
             tracked["frame_id"] = request.frame_id or tracked.get("frame_id", "universe")
         elif request.operation == "remove":
             if request.object_id not in self._objects:

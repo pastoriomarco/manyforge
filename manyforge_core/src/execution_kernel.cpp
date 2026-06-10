@@ -4843,10 +4843,25 @@ ExecutionStatus ExecutionKernel::get_status() const {
 }
 
 ExecutionSnapshot ExecutionKernel::get_execution_snapshot() const {
-  const auto kernel_state = sm_.status().state;
-  if (kernel_state == ExecutionState::kStopping) {
+  const auto kernel_status = sm_.status();
+  const auto kernel_state = kernel_status.state;
+  // Live backend read during kStopping (1B: the worker may be blocked inside
+  // execute_controlled_stop and cannot pump the cache, yet stop observability
+  // is safety-relevant) AND during kExecuting (visual/observer freshness: the
+  // backend samples the trajectory every kExecutionTick, and serving the
+  // cached copy makes display consumers see joints up to a publish-cycle
+  // stale — the native-viewer flicker). The kernel remains the lifecycle
+  // authority: state and execution identity are stamped from the state
+  // machine, never trusted from the backend's view.
+  if (kernel_state == ExecutionState::kStopping ||
+      kernel_state == ExecutionState::kExecuting) {
     auto backend_snapshot = execution_backend_.get_execution_snapshot();
     backend_snapshot.state = kernel_state;
+    backend_snapshot.execution_id = kernel_status.execution_id;
+    {
+      std::lock_guard<std::mutex> move_lock(active_move_id_mutex_);
+      backend_snapshot.move_id = active_move_id_;
+    }
     if (backend_snapshot.timestamp_ns == 0) {
       backend_snapshot.timestamp_ns = clock_.now();
     }

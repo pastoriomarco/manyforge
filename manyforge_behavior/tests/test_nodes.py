@@ -595,6 +595,7 @@ class TestUpsertCollisionObject:
                 shape_type="box",
                 box_dimensions_m=[0.1, 0.1, 0.1],
                 pose_position_m=[0.0, 0.0, 0.0],
+                pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
             )
         )
         node = UpsertCollisionObject(
@@ -680,6 +681,8 @@ class TestRemoveCollisionObject:
                 object_id="box1",
                 shape_type="box",
                 box_dimensions_m=[0.1, 0.1, 0.1],
+                pose_position_m=[0.0, 0.0, 0.0],
+                pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
             )
         )
         node = RemoveCollisionObject(name="remove_box", object_id="box1")
@@ -696,6 +699,8 @@ class TestUpdateCollisionObjectPose:
                 object_id="box1",
                 shape_type="box",
                 box_dimensions_m=[0.1, 0.1, 0.1],
+                pose_position_m=[0.0, 0.0, 0.0],
+                pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
             )
         )
         node = UpdateCollisionObjectPose(
@@ -725,6 +730,8 @@ class TestUpdateCollisionObjectPose:
                 object_id="box1",
                 shape_type="box",
                 box_dimensions_m=[0.1, 0.1, 0.1],
+                pose_position_m=[0.0, 0.0, 0.0],
+                pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
             )
         )
         node = UpdateCollisionObjectPose(

@@ -243,6 +243,23 @@ def test_resolve_orientation_rpy_delta_mode():
                             current_xyzw=start)
 
 
+def test_quats_close_near_boundary():
+    # |dot| = cos(theta/2): tol 1e-3 admits ~5.1 deg of rotation difference.
+    base = rpy_deg_to_xyzw([0, 0, 0])
+    assert quats_close(base, rpy_deg_to_xyzw([0, 0, 4]))       # 4 deg: agrees
+    assert not quats_close(base, rpy_deg_to_xyzw([0, 0, 6]))   # 6 deg: rejected
+    # sign-flipped quaternion is the same rotation
+    flipped = [-c for c in base]
+    assert quats_close(base, flipped)
+
+
+def test_quat_agreement_constant_is_wired():
+    from manyforge_behavior.geometry import QUAT_AGREEMENT_DOT_TOL
+    import inspect
+    sig = inspect.signature(quats_close)
+    assert sig.parameters["tol"].default == QUAT_AGREEMENT_DOT_TOL == 1e-3
+
+
 def test_pose_relative_to_recovers_offset():
     ref = parse_pose({"frame_id": "universe", "position_m": [1, 0, 0],
                       "orientation_rpy_deg": [0, 0, 90]})

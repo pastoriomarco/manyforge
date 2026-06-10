@@ -127,6 +127,8 @@ class TestMockKernelSceneEdit:
             object_id="box1",
             shape_type="box",
             box_dimensions_m=[0.1, 0.1, 0.1],
+            pose_position_m=[0.0, 0.0, 0.0],
+            pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
         )
         result = kernel.scene_edit(req)
         assert result.success
@@ -146,6 +148,8 @@ class TestMockKernelSceneEdit:
                     "require_separation_by_end": True,
                 }
             ],
+            pose_position_m=[0.0, 0.0, 0.0],
+            pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
         )
         result = kernel.scene_edit(req)
         assert result.success
@@ -170,6 +174,8 @@ class TestMockKernelSceneEdit:
                         "allow_recontact": "no",
                     }
                 ],
+                pose_position_m=[0.0, 0.0, 0.0],
+                pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
             )
         )
         assert result.success is False
@@ -198,6 +204,8 @@ class TestMockKernelSceneEdit:
             object_id="box1",
             shape_type="box",
             box_dimensions_m=[0.1, 0.1, 0.1],
+            pose_position_m=[0.0, 0.0, 0.0],
+            pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
         )
         result = kernel.scene_edit(req)
         assert not result.success
@@ -219,6 +227,7 @@ class TestMockKernelSceneEdit:
             shape_type="box",
             box_dimensions_m=[0.05, 0.05, 0.05],
             pose_position_m=[0.1, 0.2, 0.3],
+            pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
         )
         assert kernel.scene_edit(insert).success is True
         replace = SceneEditRequest(
@@ -227,6 +236,7 @@ class TestMockKernelSceneEdit:
             shape_type="sphere",
             sphere_radius_m=0.04,
             pose_position_m=[0.4, 0.5, 0.6],
+            pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
         )
         assert kernel.scene_edit(replace).success is True
         snapshot = kernel.get_scene_objects()[0]
@@ -243,6 +253,7 @@ class TestMockKernelSceneEdit:
             mesh_resource_uri="file:///tmp/mesh.obj",
             mesh_scale=[1.0, 2.0, 3.0],
             pose_position_m=[0.1, 0.2, 0.3],
+            pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
         ))
         assert result.success is True
         snapshot = kernel.get_scene_objects()[0]
@@ -273,6 +284,71 @@ class TestMockKernelSceneEdit:
         assert trace[-1]["attached"] is True
         assert trace[-1]["pose_in_frame"] is not None
         assert trace[-1]["pose_in_universe"] is not None
+
+
+    def test_scene_edit_add_rejects_missing_orientation(self, kernel):
+        """Spec 420 §4A.2: the sink never invents an orientation."""
+        result = kernel.scene_edit(SceneEditRequest(
+            operation="add",
+            object_id="no_orient",
+            shape_type="box",
+            box_dimensions_m=[0.1, 0.1, 0.1],
+            pose_position_m=[0.0, 0.0, 0.0],
+        ))
+        assert not result.success
+        assert "pose_orientation_xyzw" in (result.error or "")
+
+    def test_scene_edit_upsert_rejects_missing_position(self, kernel):
+        result = kernel.scene_edit(SceneEditRequest(
+            operation="upsert",
+            object_id="no_pos",
+            shape_type="box",
+            box_dimensions_m=[0.1, 0.1, 0.1],
+            pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
+        ))
+        assert not result.success
+        assert "pose_position_m" in (result.error or "")
+
+    def test_scene_edit_authored_update_pose_rejects_missing_orientation(self, kernel):
+        kernel.scene_edit(SceneEditRequest(
+            operation="add",
+            object_id="upd1",
+            shape_type="box",
+            box_dimensions_m=[0.1, 0.1, 0.1],
+            pose_position_m=[0.0, 0.0, 0.0],
+            pose_orientation_xyzw=[0.0, 0.0, -0.382683432365, 0.923879532511],
+        ))
+        result = kernel.scene_edit(SceneEditRequest(
+            operation="update_pose",
+            object_id="upd1",
+            pose_position_m=[0.5, 0.0, 0.0],
+        ))
+        assert not result.success
+        assert "authored" in (result.error or "")
+
+    def test_scene_edit_pose_source_update_keeps_last_known_orientation(self, kernel):
+        """A pose-source (live mirroring) position-only update keeps the last
+        known orientation — never identity (spec 420 §4A.2)."""
+        rotated = [0.0, 0.0, -0.382683432365, 0.923879532511]
+        kernel.scene_edit(SceneEditRequest(
+            operation="add",
+            object_id="tracked1",
+            shape_type="box",
+            box_dimensions_m=[0.1, 0.1, 0.1],
+            pose_position_m=[0.0, 0.0, 0.0],
+            pose_orientation_xyzw=rotated,
+        ))
+        result = kernel.scene_edit(SceneEditRequest(
+            operation="update_pose",
+            object_id="tracked1",
+            pose_position_m=[0.5, 0.1, 0.0],
+            source_timestamp_ns=1,
+            source_freshness_budget_ns=1_000_000_000,
+        ))
+        assert result.success, result.error
+        tracked = kernel._objects["tracked1"]
+        assert tracked["position_m"] == [0.5, 0.1, 0.0]
+        assert tracked["orientation_xyzw"] == rotated  # NOT identity
 
 
 class TestMockKernelMisc:

@@ -4247,6 +4247,51 @@ TEST_F(ExecutionKernelTest, GetExecutionSnapshot_AfterExecute_ContainsIdsAndFina
   EXPECT_GT(snapshot.sequence_number, 0u);
 }
 
+TEST_F(ExecutionKernelTest, GetExecutionSnapshot_DuringExecuting_ServesLiveBackendSnapshot) {
+  // Observer freshness contract: during kExecuting (like kStopping since 1B)
+  // get_execution_snapshot() reads the backend's live snapshot instead of the
+  // kernel's published cache, so display consumers (visual-state publisher)
+  // never see joints a publish-cycle stale. The kernel stays the lifecycle
+  // authority: state and execution identity come from the state machine.
+  ControlledExecution controlled_execution;
+  FakeClock local_clock;
+  ManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  MockCollisionWorldPublisher local_collision_world;
+  auto local_collision_engine = std::make_shared<MockCollisionEngine>();
+  ExecutionKernel controlled_kernel{
+      planner, context, controlled_execution, local_clock, local_scheduler, local_cache};
+  configure_authoritative_collision_validation(
+      controlled_kernel, local_collision_world, local_collision_engine);
+
+  auto result = controlled_kernel.execute(make_test_request("live_snapshot_move"));
+  ASSERT_TRUE(result.ok());
+  ASSERT_TRUE(controlled_execution.wait_until_execute_called())
+      << "wait_until_execute_called timed out";
+  ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kExecuting));
+
+  controlled_execution.set_progress(0.25, {0.3, 0.7});
+  const auto snapshot = controlled_kernel.get_execution_snapshot();
+
+  // Kernel-authoritative stamps.
+  EXPECT_EQ(snapshot.state, ExecutionState::kExecuting);
+  EXPECT_EQ(snapshot.execution_id, 1u);
+  EXPECT_EQ(snapshot.move_id, "live_snapshot_move");
+  // Live backend payload: the joints written a moment ago, and the RAW
+  // backend snapshot (sequence_number is the backend's own — the kernel
+  // cache would carry a kernel-assigned sequence >= 1). This is the
+  // deterministic tell that the live path, not the cache, served the read.
+  EXPECT_DOUBLE_EQ(snapshot.progress, 0.25);
+  ASSERT_EQ(snapshot.joint_positions_rad.size(), 2u);
+  EXPECT_DOUBLE_EQ(snapshot.joint_positions_rad[0], 0.3);
+  EXPECT_DOUBLE_EQ(snapshot.joint_positions_rad[1], 0.7);
+  EXPECT_EQ(snapshot.sequence_number, 0u);
+
+  controlled_execution.complete();
+  controlled_kernel.wait_for_completion();
+  EXPECT_EQ(controlled_kernel.get_status().state, ExecutionState::kCompleted);
+}
+
 // ============================================================================
 // Async behavior tests
 // ============================================================================

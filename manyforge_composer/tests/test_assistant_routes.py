@@ -739,6 +739,7 @@ def test_assistant_bridge_composer_draft_callback_accepts_mesh_scene_resource(
                 "meshResourceUri": str(mesh_path),
                 "meshScale": [1.0, 1.0, 1.0],
                 "position": [0.2, 0.1, 0.0],
+                "orientation_rpy_deg": [0, 0, 0],
                 "frameId": "universe",
             },
         },
@@ -805,6 +806,7 @@ def test_assistant_bridge_scene_resource_rejects_flat_attachment_frame(
                 "shapeType": "box",
                 "size": [1.0, 0.02, 0.2],
                 "position": [0.0, 0.2, 0.1],
+                "orientation_rpy_deg": [0, 0, 0],
                 "frameId": "tool0",
             },
         },
@@ -872,6 +874,7 @@ def test_assistant_bridge_scene_resource_accepts_flat_box_arguments(
                 "shapeType": "box",
                 "size": [1.0, 0.02, 0.2],
                 "position": [0.0, 0.2, 0.1],
+                "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
             },
         },
     )
@@ -913,6 +916,7 @@ def test_assistant_bridge_scene_resource_accepts_diameter_and_list_wrapper(
                         "shape_type": "sphere",
                         "diameter": 0.1,
                         "position_m": "0.3, 0.3, 0.3",
+                        "orientation_rpy_deg": [0, 0, 0],
                         "frame_id": "world",
                     }
                 ],
@@ -953,6 +957,7 @@ def test_assistant_bridge_scene_resource_accepts_cylinder_arguments(
                 "radius": 0.04,
                 "height": 0.2,
                 "position": [0.3, 0.3, 0.1],
+                "orientation_rpy_deg": [0, 0, 0],
                 "frameId": "world",
             },
         },
@@ -3189,14 +3194,19 @@ def _deterministic_assistant_deployment() -> Deployment:
                         "context.collision.check",
                         "context.kinematics.fk",
                         "context.limits.joint",
+                        "context.pose.resolve_reference",
+                        "context.scene.object_query",
                         "context.state.current",
                         "context.validation.trajectory",
+                        "observability.trace.scene",
                         "scene.edit.add",
                         "scene.edit.remove",
                         "scene.edit.update_pose",
+                        "scene.edit.upsert",
                         "scene.edit.attach_detach",
                         "scene.shape.box",
                         "scene.shape.sphere",
+                        "scene.shape.cylinder",
                         "scene.shape.mesh",
                     ],
                     "config": {},
@@ -3234,13 +3244,14 @@ def _deterministic_assistant_deployment() -> Deployment:
 def _assistant_mode_deployment(
     *,
     context_config: dict[str, object] | None = None,
+    program_profile: str = "v0.0",
 ) -> Deployment:
     return Deployment.from_dict(
         {
             "api_version": "manyforge.deployment.v0",
             "schema_version": "0.1.0",
             "name": "assistant-mode-test",
-            "program_profile": "v0.0",
+            "program_profile": program_profile,
             "robot_config": {
                 "robot_id": "ur5",
                 "group_id": "arm",
@@ -3265,14 +3276,19 @@ def _assistant_mode_deployment(
                         "context.collision.check",
                         "context.kinematics.fk",
                         "context.limits.joint",
+                        "context.pose.resolve_reference",
+                        "context.scene.object_query",
                         "context.state.current",
                         "context.validation.trajectory",
+                        "observability.trace.scene",
                         "scene.edit.add",
                         "scene.edit.remove",
                         "scene.edit.update_pose",
+                        "scene.edit.upsert",
                         "scene.edit.attach_detach",
                         "scene.shape.box",
                         "scene.shape.sphere",
+                        "scene.shape.cylinder",
                         "scene.shape.mesh",
                     ],
                     "config": context_config or {},
@@ -3529,3 +3545,153 @@ def _write_minimal_program(tmp_path: Path) -> Path:
         encoding="utf-8",
     )
     return program_path
+
+
+# ── Phase 2 pose-boundary evidence (audit-remediation plan) ──────────────────
+
+
+def _write_pose_target_program(tmp_path: Path) -> Path:
+    """v0.1 program containing a collision node with a stored rotated pose, so
+    relative/reference intents have a current pose to resolve against."""
+    program_path = tmp_path / "pose_target.program.yaml"
+    program_path.write_text(
+        yaml.safe_dump(
+            {
+                "api_version": "manyforge.program.v0",
+                "program_profile": "v0.1",
+                "name": "pose_target",
+                "catalog_version": "0.2.0",
+                "robot": {
+                    "robot_id": "ur5",
+                    "group_id": "arm",
+                    "base_frame": "base_link",
+                    "tcp_frame": "tool0",
+                },
+                "tree": {
+                    "id": "sequence",
+                    "name": "root",
+                    "children": [
+                        {
+                            "id": "upsert_collision_object",
+                            "name": "pose_target_node",
+                            "params": {
+                                "object_id": "graspable",
+                                "shape": {
+                                    "type": "box",
+                                    "box_dimensions_m": [0.1, 0.01, 0.01],
+                                },
+                                "pose": {
+                                    "frame_id": "universe",
+                                    "position_m": [0.3, -0.3, 0.15],
+                                    "orientation_rpy_deg": [0.0, 11.0, -40.0],
+                                },
+                            },
+                        },
+                    ],
+                },
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    return program_path
+
+
+def test_pose_intent_key_parity_across_surfaces() -> None:
+    """Every supported orientation intent key is present in the geometry
+    resolver, the assistant pose schema, and Composer route normalization
+    (audit plan Phase 2 parity evidence; spec 420 §4A.4)."""
+    from manyforge_behavior.geometry import ORIENTATION_INTENT_KEYS
+    from manyforge_composer.backend.assistant_tool_schemas import (
+        _SCENE_RESOURCE_SCHEMA,
+    )
+    from manyforge_composer.backend.routes_assistant import (
+        _ORIENTATION_INTENT_PARAM_KEYS,
+    )
+
+    geometry_keys = set(ORIENTATION_INTENT_KEYS)
+    schema_pose_keys = set(
+        _SCENE_RESOURCE_SCHEMA["properties"]["pose"]["properties"]
+    ) - {"frame_id", "position_m"}
+    route_keys = set(_ORIENTATION_INTENT_PARAM_KEYS) | {
+        "orientation_xyzw",
+        "orientation_rpy_deg",
+    }
+    assert geometry_keys == schema_pose_keys == route_keys, (
+        geometry_keys, schema_pose_keys, route_keys
+    )
+
+
+def test_update_node_params_rotate_local_preserves_position_and_frame(
+    client: TestClient,
+    state: ComposerState,
+    tmp_path: Path,
+) -> None:
+    from manyforge_behavior.geometry import (
+        compose_local,
+        quats_close,
+        rpy_deg_to_xyzw,
+    )
+
+    state.load_program(str(_write_pose_target_program(tmp_path)))
+    state.deployment = _assistant_mode_deployment(program_profile="v0.1")
+    catalog_hash = _assistant_catalog_hash(state, "composer-assistant")
+
+    response = client.post(
+        "/api/assistant/bridge/tools/tree_draft_update_node_params",
+        json={
+            "requestId": "req-phase2-rotate-local",
+            "assistantMode": "composer-assistant",
+            "catalogHash": catalog_hash,
+            "arguments": {
+                "nodeName": "pose_target_node",
+                "params": {"pose": {"rotate_local_rpy_deg": [0, 73, 91]}},
+            },
+        },
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["success"] is True, body
+
+    tree = client.get("/api/program/tree").json()["tree"]
+    node = next(n for n in tree["children"] if n["name"] == "pose_target_node")
+    pose = node["params"]["pose"]
+    assert pose["position_m"] == [0.3, -0.3, 0.15]
+    assert pose["frame_id"] == "universe"
+    expected = compose_local(
+        rpy_deg_to_xyzw([0.0, 11.0, -40.0]), rpy_deg_to_xyzw([0, 73, 91])
+    )
+    assert quats_close(pose["orientation_xyzw"], expected)
+
+
+def test_update_node_params_unresolvable_reference_structured_error(
+    client: TestClient,
+    state: ComposerState,
+    tmp_path: Path,
+) -> None:
+    state.load_program(str(_write_pose_target_program(tmp_path)))
+    state.deployment = _assistant_mode_deployment(program_profile="v0.1")
+    catalog_hash = _assistant_catalog_hash(state, "composer-assistant")
+
+    response = client.post(
+        "/api/assistant/bridge/tools/tree_draft_update_node_params",
+        json={
+            "requestId": "req-phase2-bad-reference",
+            "assistantMode": "composer-assistant",
+            "catalogHash": catalog_hash,
+            "arguments": {
+                "nodeName": "pose_target_node",
+                "params": {
+                    "pose": {
+                        "orientation_from": {"type": "object", "id": "ghost_object"}
+                    }
+                },
+            },
+        },
+    )
+    data = _assert_bridge_validation_error(
+        response,
+        http_status=400,
+        message_contains="could not be resolved",
+    )
+    assert data["draftMutated"] is False

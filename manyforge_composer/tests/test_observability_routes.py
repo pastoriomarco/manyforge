@@ -1026,6 +1026,10 @@ def test_authored_scene_sync_recreates_shape_changes_and_keeps_add_strict():
             "object_id": "table",
             "shape_type": "box",
             "box_dimensions_m": [0.1, 0.1, 0.1],
+            # full pose required (spec 420 §4A.2) so the request reaches the
+            # duplicate check this test exists to exercise
+            "pose_position_m": [0.5, 0.0, 0.4],
+            "pose_orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
         },
     )
     assert duplicate.status_code == 200

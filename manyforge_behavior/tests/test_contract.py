@@ -359,6 +359,8 @@ class TestSceneEditInvariants:
             object_id="to_remove",
             shape_type="box",
             box_dimensions_m=[0.1, 0.1, 0.1],
+            pose_position_m=[0.0, 0.0, 0.0],
+            pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
         )
         kernel.scene_edit(add_request)
         
@@ -399,6 +401,7 @@ class TestSceneEditInvariants:
             shape_type="box",
             box_dimensions_m=[0.1, 0.1, 0.1],
             pose_position_m=[0.0, 0.0, 0.0],
+            pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
         )
         kernel.scene_edit(add_request)
         
@@ -425,6 +428,8 @@ class TestSceneEditInvariants:
             object_id="duplicate_obj",
             shape_type="box",
             box_dimensions_m=[0.1, 0.1, 0.1],
+            pose_position_m=[0.0, 0.0, 0.0],
+            pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
         )
         kernel.scene_edit(add_request1)
         
@@ -434,6 +439,8 @@ class TestSceneEditInvariants:
             object_id="duplicate_obj",
             shape_type="box",
             box_dimensions_m=[0.2, 0.2, 0.2],
+            pose_position_m=[0.0, 0.0, 0.0],
+            pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
         )
         result = kernel.scene_edit(add_request2)
         assert isinstance(result, SceneEditResult)
@@ -450,6 +457,7 @@ class TestSceneEditInvariants:
             shape_type="box",
             box_dimensions_m=[0.1, 0.1, 0.1],
             pose_position_m=[0.0, 0.0, 0.0],
+            pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
         )
         insert_result = kernel.scene_edit(insert_request)
         assert insert_result.success is True
@@ -460,6 +468,7 @@ class TestSceneEditInvariants:
             shape_type="sphere",
             sphere_radius_m=0.03,
             pose_position_m=[0.2, 0.0, 0.1],
+            pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
         )
         replace_result = kernel.scene_edit(replace_request)
         assert replace_result.success is True

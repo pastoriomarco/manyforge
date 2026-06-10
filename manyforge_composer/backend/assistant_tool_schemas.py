@@ -773,7 +773,8 @@ _SCENE_RESOURCE_SCHEMA: dict[str, Any] = {
                     "description": (
                         "Orientation as a quaternion [x, y, z, w] — the same form "
                         "scene state reports. Accepted as an alternative to "
-                        "orientation_rpy_deg; omit for identity."
+                        "orientation_rpy_deg. An orientation form is required — "
+                        "choose deliberately from context or ask."
                     ),
                 },
                 "rotate_local_rpy_deg": {
@@ -947,7 +948,10 @@ _SCENE_DRAFT_SINGLE_OBJECT_SCHEMA: dict[str, Any] = {
             "items": {"type": "number"},
             "minItems": 4,
             "maxItems": 4,
-            "description": "Object orientation as [x, y, z, w]. Omit for identity.",
+            "description": (
+                "Object orientation as [x, y, z, w]. An orientation form is "
+                "required — choose deliberately from context or ask."
+            ),
         },
         "orientation_rpy_deg": _SCENE_RESOURCE_SCHEMA["properties"]["pose"]["properties"]["orientation_rpy_deg"],
         "rotate_local_rpy_deg": _SCENE_RESOURCE_SCHEMA["properties"]["pose"]["properties"]["rotate_local_rpy_deg"],

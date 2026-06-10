@@ -22,7 +22,14 @@ import math
 from dataclasses import dataclass
 from typing import Any
 
-_QUAT_AGREE_TOL = 1e-6  # |dot| within this of 1.0 ⇒ same rotation
+# Rotation-agreement tolerance on the quaternion dot product (spec 420 §4A.2):
+# two orientations "agree" iff |dot| >= 1 - QUAT_AGREEMENT_DOT_TOL. Angular
+# meaning: |dot| = cos(theta/2), so 1e-3 admits up to theta ≈ 2*acos(1-1e-3)
+# ≈ 5.1 degrees of rotation difference. Deliberately forgiving: the check
+# exists to catch representation mistakes (component transplants, wrong-axis
+# conversions — tens of degrees), while tolerating float/rounding noise in
+# hand-copied values. Single named constant; do not redeclare per-module.
+QUAT_AGREEMENT_DOT_TOL = 1e-3
 
 
 class PoseError(ValueError):
@@ -67,7 +74,7 @@ def normalize_quat(q: Any) -> list[float]:
     return [c / norm for c in vals]
 
 
-def quats_close(a: Any, b: Any, tol: float = 1e-3) -> bool:
+def quats_close(a: Any, b: Any, tol: float = QUAT_AGREEMENT_DOT_TOL) -> bool:
     """Rotation equality: |dot| ≈ 1 (a quaternion and its negation are equal)."""
     qa, qb = normalize_quat(a), normalize_quat(b)
     return abs(sum(x * y for x, y in zip(qa, qb))) >= 1.0 - tol

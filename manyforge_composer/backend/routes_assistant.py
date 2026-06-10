@@ -2977,22 +2977,20 @@ def _normalize_scene_pose_argument(
                 label=f"{label}.pose.orientation_rpy_deg",
             )
     else:
-        # Fail closed. Omitting orientation when editing an existing object
-        # would silently re-orient it to identity (the historical footgun).
-        # Only a brand-new object declaration (add_object) may fall back to
-        # identity, and it does so explicitly here.
-        if tool_id == "scene_draft_add_object":
-            pose["orientation_xyzw"] = [0.0, 0.0, 0.0, 1.0]
-        else:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"{tool_id} {label}.pose orientation is required: supply "
-                    "orientation_xyzw (e.g. copied verbatim from scene state) or "
-                    "orientation_rpy_deg (degrees). Omitting it would reset the "
-                    "object's orientation to identity."
-                ),
-            )
+        # Fail closed on EVERY surface, including brand-new objects (spec 420
+        # §4A.2, create-exception revoked 2026-06-10): the contract never
+        # invents an orientation. The agent chooses one deliberately from
+        # context or asks the user; the v1 stored_pose schema requires exactly
+        # one orientation form anyway, so a default here only masked that.
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"{tool_id} {label}.pose orientation is required: supply "
+                "orientation_rpy_deg (degrees) or orientation_xyzw (e.g. "
+                "copied verbatim from scene state) — choose deliberately "
+                "from context or ask."
+            ),
+        )
 
     return pose
 
