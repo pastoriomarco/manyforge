@@ -19,6 +19,7 @@ from manyforge_behavior.deployment import DeploymentValidationError
 from manyforge_behavior.program import (
     Program,
     ProgramValidationError,
+    merge_param_patch,
 )
 from pydantic import ValidationError
 
@@ -84,6 +85,14 @@ from .routes_scene import (
 from .state import ComposerState
 
 
+_ASSISTANT_ORIENTATION_FIELD_KEYS = {
+    "orientation_xyzw",
+    "orientation_rpy_deg",
+    "rotate_local_rpy_deg",
+    "rotate_world_rpy_deg",
+    "rpy_delta_deg",
+    "orientation_from",
+}
 READ_ONLY_EFFECT = "read_only"
 COMPOSER_DRAFT_MUTATING_EFFECT = "composer_draft_mutating"
 COMPOSER_ASSISTANT_MODE = "composer-assistant"
@@ -361,6 +370,7 @@ def create_assistant_router(state: ComposerState) -> APIRouter:
             conversation_id=conversation_id,
             provider_id=provider.provider_id,
             assistant_mode=provider_context.assistant_mode,
+            field_policy=provider_context.field_policy,
         )
 
         try:
@@ -469,6 +479,7 @@ def create_assistant_router(state: ComposerState) -> APIRouter:
         deployment = state.deployment
         assert deployment is not None
         tools_payload: list[dict[str, Any]] = []
+        node_id_set = set(resolved_catalog["nodes"])
         for entry in resolved_catalog["tools"]:
             tool_id = entry.get("id")
             if not isinstance(tool_id, str):
@@ -476,18 +487,25 @@ def create_assistant_router(state: ComposerState) -> APIRouter:
             descriptor = deployment.tool_catalog.get(tool_id)
             if descriptor is None:
                 continue
-            input_schema = assistant_tool_input_schema(tool_id) or {
-                "type": "object",
-                "additionalProperties": True,
-            }
-            tools_payload.append(
-                {
-                    "id": tool_id,
-                    "description": descriptor.description or "",
-                    "effect": descriptor.effect,
-                    "inputSchema": input_schema,
+            input_schema = entry.get("inputSchema")
+            if not isinstance(input_schema, dict):
+                input_schema = assistant_tool_input_schema(
+                    tool_id,
+                    catalog=state.catalog,
+                    node_ids=node_id_set,
+                ) or {
+                    "type": "object",
+                    "additionalProperties": True,
                 }
-            )
+            tool_payload = {
+                "id": tool_id,
+                "description": descriptor.description or "",
+                "effect": descriptor.effect,
+                "inputSchema": input_schema,
+            }
+            if isinstance(entry.get("inputSchemaHash"), str):
+                tool_payload["inputSchemaHash"] = entry["inputSchemaHash"]
+            tools_payload.append(tool_payload)
         # Rich per-node descriptors keyed by id, alongside the legacy
         # `nodes` string list. The legacy field is preserved verbatim
         # for back-compat with the direct-lane manyforge_assistant_bridge,
@@ -504,9 +522,12 @@ def create_assistant_router(state: ComposerState) -> APIRouter:
         # option, every required capability is in the preamble, the
         # model has no excuse to guess. Filtering by mode-allowed
         # nodes is the only deviation from a full catalog_read.
-        node_id_set = set(resolved_catalog["nodes"])
         node_catalog_payload: list[dict[str, Any]] = [
-            _catalog_entry_payload(entry, include_parameters=True)
+            _catalog_entry_payload(
+                entry,
+                include_parameters=True,
+                catalog=state.catalog,
+            )
             for entry in state.catalog.entries
             if entry.id in node_id_set
         ]
@@ -714,6 +735,41 @@ def create_assistant_router(state: ComposerState) -> APIRouter:
                 ),
             )
 
+        stored_field_policy = state.assistant_request_field_policy(
+            request_id=request.request_id,
+            conversation_id=request.conversation_id or "",
+            principal=request.principal or "",
+        )
+        request_field_policy = _normalize_assistant_field_policy(request.field_policy)
+        field_policy = _intersect_assistant_field_policies(
+            stored_field_policy,
+            request_field_policy,
+        )
+        if field_policy:
+            resolved_catalog = _with_catalog_projected_tool_schemas(
+                state,
+                resolved_catalog,
+                field_policy=field_policy,
+            )
+        expected_input_schema_hash = _bridge_tool_input_schema_hash(
+            resolved_catalog,
+            tool_id,
+        )
+        if (
+            request.input_schema_hash
+            and expected_input_schema_hash
+            and request.input_schema_hash != expected_input_schema_hash
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": "inputSchemaHash does not match the active tool schema",
+                    "toolId": tool_id,
+                    "inputSchemaHash": request.input_schema_hash,
+                    "expectedInputSchemaHash": expected_input_schema_hash,
+                },
+            )
+
         # Live tool-call streaming: surface this call on the active
         # assistant request as soon as it lands so the UI can render
         # progress without waiting for the full agent loop to finish.
@@ -728,6 +784,7 @@ def create_assistant_router(state: ComposerState) -> APIRouter:
                 arguments=request.arguments,
                 assistant_mode=request.assistant_mode,
                 node_allowlist=set(resolved_catalog["nodes"]),
+                field_policy=field_policy,
             )
             if tool_id == "catalog_read" and isinstance(result, dict):
                 result = _maybe_dedupe_catalog_result(
@@ -978,6 +1035,7 @@ def create_assistant_router(state: ComposerState) -> APIRouter:
                 ),
                 "mutated": False,
                 "draftMutated": False,
+                "inputSchemaHash": expected_input_schema_hash,
                 "timestampNs": time.monotonic_ns(),
             }
         except Exception as exc:
@@ -1037,6 +1095,7 @@ def create_assistant_router(state: ComposerState) -> APIRouter:
             "error": error,
             "mutated": tool_definition.effect == COMPOSER_DRAFT_MUTATING_EFFECT and success,
             "draftMutated": tool_definition.effect == COMPOSER_DRAFT_MUTATING_EFFECT and success,
+            "inputSchemaHash": expected_input_schema_hash,
             "timestampNs": time.monotonic_ns(),
         }
 
@@ -1209,7 +1268,130 @@ def _compute_assistant_catalog_hash(catalog: dict[str, list[str]], mode: str) ->
     return compute_catalog_hash(catalog, mode)
 
 
-def _catalog_entry_payload(entry: Any, *, include_parameters: bool = True) -> dict[str, Any]:
+def _normalize_assistant_field_policy(raw_policy: Any) -> dict[str, Any]:
+    if raw_policy in (None, {}):
+        return {}
+    if not isinstance(raw_policy, dict):
+        raise HTTPException(status_code=400, detail="fieldPolicy must be an object")
+    supported_keys = {"allowedOrientationFields", "orientationFields"}
+    unknown_keys = sorted(set(raw_policy) - supported_keys)
+    if unknown_keys:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "fieldPolicy contains unsupported keys",
+                "unsupportedKeys": unknown_keys,
+                "supportedKeys": sorted(supported_keys),
+            },
+        )
+    raw_orientation_fields = raw_policy.get("allowedOrientationFields")
+    if raw_orientation_fields is None:
+        raw_orientation_fields = raw_policy.get("orientationFields")
+    if raw_orientation_fields is None:
+        return {}
+    if not isinstance(raw_orientation_fields, list) or not all(
+        isinstance(item, str) for item in raw_orientation_fields
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="fieldPolicy.allowedOrientationFields must be a list of strings",
+        )
+    if not raw_orientation_fields:
+        raise HTTPException(
+            status_code=400,
+            detail="fieldPolicy.allowedOrientationFields must include at least one field",
+        )
+    invalid_fields = sorted(set(raw_orientation_fields) - _ASSISTANT_ORIENTATION_FIELD_KEYS)
+    if invalid_fields:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "fieldPolicy.allowedOrientationFields contains unsupported fields",
+                "unsupportedFields": invalid_fields,
+                "supportedFields": sorted(_ASSISTANT_ORIENTATION_FIELD_KEYS),
+            },
+        )
+    return {
+        "allowedOrientationFields": sorted(set(raw_orientation_fields)),
+    }
+
+
+def _intersect_assistant_field_policies(
+    left: dict[str, Any],
+    right: dict[str, Any],
+) -> dict[str, Any]:
+    if not left:
+        return dict(right)
+    if not right:
+        return dict(left)
+    left_fields = set(left.get("allowedOrientationFields", []))
+    right_fields = set(right.get("allowedOrientationFields", []))
+    return {
+        "allowedOrientationFields": sorted(left_fields & right_fields),
+    }
+
+
+def _orientation_field_violations(
+    value: Any,
+    *,
+    allowed_orientation_fields: set[str],
+    path: str = "$",
+) -> list[dict[str, str]]:
+    violations: list[dict[str, str]] = []
+    if isinstance(value, dict):
+        for key, nested_value in value.items():
+            nested_path = f"{path}.{key}" if path else key
+            if key in _ASSISTANT_ORIENTATION_FIELD_KEYS and key not in allowed_orientation_fields:
+                violations.append({"path": nested_path, "field": key})
+            violations.extend(
+                _orientation_field_violations(
+                    nested_value,
+                    allowed_orientation_fields=allowed_orientation_fields,
+                    path=nested_path,
+                )
+            )
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            violations.extend(
+                _orientation_field_violations(
+                    item,
+                    allowed_orientation_fields=allowed_orientation_fields,
+                    path=f"{path}[{index}]",
+                )
+            )
+    return violations
+
+
+def _enforce_assistant_field_policy(
+    arguments: dict[str, Any],
+    *,
+    field_policy: dict[str, Any],
+) -> None:
+    allowed = field_policy.get("allowedOrientationFields")
+    if allowed is None:
+        return
+    violations = _orientation_field_violations(
+        arguments,
+        allowed_orientation_fields=set(allowed),
+    )
+    if not violations:
+        return
+    raise HTTPException(
+        status_code=400,
+        detail={
+            "message": "fieldPolicy rejected disallowed orientation fields",
+            "allowedOrientationFields": list(allowed),
+            "violations": violations,
+        },
+    )
+
+
+def _catalog_entry_payload(
+    entry: Any,
+    *,
+    include_parameters: bool = True,
+    catalog: Any | None = None,
+) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "id": entry.id,
         "name": entry.name,
@@ -1234,8 +1416,9 @@ def _catalog_entry_payload(entry: Any, *, include_parameters: bool = True) -> di
         "swapParamAliases": dict(entry.swap_param_aliases) or None,
     }
     if include_parameters:
-        payload["parameters"] = [
-            {
+        parameters: list[dict[str, Any]] = []
+        for param in entry.parameters:
+            param_payload: dict[str, Any] = {
                 "name": param.name,
                 "type": param.type,
                 "required": param.required,
@@ -1268,8 +1451,11 @@ def _catalog_entry_payload(entry: Any, *, include_parameters: bool = True) -> di
                 "blackboardValueType": param.blackboard_value_type,
                 "description": param.description,
             }
-            for param in entry.parameters
-        ]
+            if catalog is not None and getattr(param, "schema", None) is not None:
+                param_payload["schema"] = catalog.schema_registry.to_json_schema(param.schema)
+                param_payload["schemaHash"] = catalog.schema_registry.schema_hash(param.schema)
+            parameters.append(param_payload)
+        payload["parameters"] = parameters
     return payload
 
 
@@ -1432,6 +1618,7 @@ def _resolve_bridge_tool_context(
     except DeploymentValidationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    resolved_catalog = _with_catalog_projected_tool_schemas(state, resolved_catalog)
     catalog_for_hash = {
         "skills": list(resolved_catalog["skills"]),
         "tools": [
@@ -1445,6 +1632,28 @@ def _resolve_bridge_tool_context(
         catalog_for_hash,
         assistant_mode,
     )
+
+
+def _with_catalog_projected_tool_schemas(
+    state: ComposerState,
+    resolved_catalog: dict[str, Any],
+    *,
+    field_policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    projected = dict(resolved_catalog)
+    node_ids = set(projected.get("nodes") or [])
+    tools = [
+        tool
+        for tool in projected.get("tools", []) or []
+        if isinstance(tool, dict)
+    ]
+    projected["tools"] = enrich_assistant_tool_descriptors(
+        tools,
+        catalog=state.catalog,
+        node_ids=node_ids,
+        field_policy=field_policy,
+    )
+    return projected
 
 
 async def _execute_bridge_read_only_tool(
@@ -1476,7 +1685,13 @@ async def _execute_bridge_read_only_tool(
                 continue
             if isinstance(kind, str) and kind and entry.kind != kind:
                 continue
-            entries.append(_catalog_entry_payload(entry, include_parameters=include_parameters))
+            entries.append(
+                _catalog_entry_payload(
+                    entry,
+                    include_parameters=include_parameters,
+                    catalog=state.catalog,
+                )
+            )
         return {
             "version": state.catalog.version,
             "entryCount": len(entries),
@@ -1816,6 +2031,22 @@ def _bridge_tool_input_schema(
     return None
 
 
+def _bridge_tool_input_schema_hash(
+    resolved_catalog: dict[str, Any], tool_id: str
+) -> str | None:
+    """Return the generated input-schema hash for ``tool_id``."""
+    try:
+        for tool in resolved_catalog.get("tools", []) or []:
+            if isinstance(tool, dict) and tool.get("id") == tool_id:
+                input_schema_hash = tool.get("inputSchemaHash")
+                if isinstance(input_schema_hash, str) and input_schema_hash:
+                    return input_schema_hash
+                return None
+    except Exception:
+        return None
+    return None
+
+
 def _diff_against_schema(
     *, provided: Any, schema: dict[str, Any]
 ) -> dict[str, Any]:
@@ -1977,11 +2208,16 @@ async def _execute_bridge_tool(
     arguments: dict[str, Any],
     assistant_mode: str | None = None,
     node_allowlist: set[str] | None = None,
+    field_policy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     # Normalize args before dispatch — see _normalize_bridge_tool_arguments
     # docstring for rationale. The normalization is forgiving on the
     # input side only; the model-facing schema is unchanged.
     arguments = _normalize_bridge_tool_arguments(tool_id, arguments)
+    _enforce_assistant_field_policy(
+        arguments,
+        field_policy=field_policy or {},
+    )
 
     if effect == READ_ONLY_EFFECT:
         return await _execute_bridge_read_only_tool(
@@ -3642,7 +3878,7 @@ def _apply_tree_draft_update_node_params(
     target = target_ref[0]
     if merge:
         old_params = dict(target.get("params") or {})
-        merged = {**old_params, **params}
+        merged = merge_param_patch(old_params, params)
         # Deep-merge the nested `pose` so a partial pose update (e.g. orientation
         # only) preserves the previously-stored position_m / frame_id. A shallow
         # param-merge replaces the whole pose dict, which silently dropped
@@ -4528,6 +4764,7 @@ def _assistant_provider_context(
     cycle_state: str,
 ) -> AssistantProviderContext:
     deployment = state.deployment
+    field_policy = _normalize_assistant_field_policy(request.field_policy)
     if request.mode == "provider" and deployment is not None and deployment.assistant_modes:
         assistant_mode = (request.assistant_mode or "").strip()
         if not assistant_mode:
@@ -4540,6 +4777,11 @@ def _assistant_provider_context(
             resolved_catalog = deployment.resolve_assistant_mode_catalog(assistant_mode)
         except DeploymentValidationError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        resolved_catalog = _with_catalog_projected_tool_schemas(
+            state,
+            resolved_catalog,
+            field_policy=field_policy,
+        )
 
         allowed_tool_ids = {
             tool.get("id")
@@ -4565,7 +4807,11 @@ def _assistant_provider_context(
         # and live tool calls.
         _visible_node_id_set = set(resolved_catalog["nodes"])
         _visible_node_catalog: list[dict[str, Any]] = [
-            _catalog_entry_payload(entry, include_parameters=True)
+            _catalog_entry_payload(
+                entry,
+                include_parameters=True,
+                catalog=state.catalog,
+            )
             for entry in state.catalog.entries
             if entry.id in _visible_node_id_set
         ]
@@ -4610,9 +4856,8 @@ def _assistant_provider_context(
             cycle_state=cycle_state,
             assistant_mode=assistant_mode,
             schema_version="0.1.0",
-            tool_catalog=enrich_assistant_tool_descriptors(
-                list(resolved_catalog["tools"])
-            ),
+            tool_catalog=list(resolved_catalog["tools"]),
+            field_policy=field_policy,
             visible_node_catalog=_visible_node_catalog,
             visible_skill_catalog=_visible_skill_catalog,
             program_snapshot=_program_snapshot,
@@ -4631,6 +4876,7 @@ def _assistant_provider_context(
         program_loaded=program_loaded,
         cycle_state=cycle_state,
         tool_catalog=assistant_tool_catalog(),
+        field_policy=field_policy,
     )
 
 

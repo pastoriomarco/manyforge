@@ -36,6 +36,41 @@ const EMPTY_ASSISTANT_MODES: Record<string, AssistantModeDefinition> = {};
 const EMPTY_TOOL_CATALOG: AssistantToolDefinition[] = [];
 const NS_PER_MS = 1_000_000;
 const NS_PER_S = 1_000_000_000;
+const ORIENTATION_FIELD_OPTIONS = [
+  {
+    key: 'orientation_rpy_deg',
+    label: 'RPY',
+    title: 'Absolute roll, pitch, yaw in degrees',
+  },
+  {
+    key: 'rpy_delta_deg',
+    label: 'Delta',
+    title: 'Component-wise RPY delta in degrees',
+  },
+  {
+    key: 'rotate_local_rpy_deg',
+    label: 'Local',
+    title: 'Physical local-frame RPY rotation in degrees',
+  },
+  {
+    key: 'rotate_world_rpy_deg',
+    label: 'World',
+    title: 'Physical world-frame RPY rotation in degrees',
+  },
+  {
+    key: 'orientation_xyzw',
+    label: 'Quat',
+    title: 'Absolute quaternion orientation',
+  },
+  {
+    key: 'orientation_from',
+    label: 'Ref',
+    title: 'Copy orientation from another scene reference',
+  },
+] as const;
+const DEFAULT_ASSISTANT_ORIENTATION_FIELDS = ORIENTATION_FIELD_OPTIONS.map((option) => option.key);
+
+type OrientationFieldKey = typeof ORIENTATION_FIELD_OPTIONS[number]['key'];
 
 function createRequestId(): string {
   const suffix = Math.random().toString(16).slice(2, 8);
@@ -460,6 +495,9 @@ export function AssistantOverlay() {
   const [providerCatalog, setProviderCatalog] = useState<AssistantProviderCatalog | null>(null);
   const [providerError, setProviderError] = useState<string | null>(null);
   const [modelEndpointCatalog, setModelEndpointCatalog] = useState<ModelEndpointCatalog | null>(null);
+  const [orientationFieldPolicy, setOrientationFieldPolicy] = useState<OrientationFieldKey[]>(
+    DEFAULT_ASSISTANT_ORIENTATION_FIELDS,
+  );
   const transcriptRef = useRef<HTMLDivElement | null>(null);
 
   const assistant = deployment?.assistant ?? null;
@@ -533,6 +571,37 @@ export function AssistantOverlay() {
     runState !== 'idle' && activeRequestStartedMs
       ? formatDurationSeconds((nowMs - activeRequestStartedMs) / 1000)
       : formatDurationFromNs(activeStatus?.startedAtNs, activeStatus?.finishedAtNs);
+  const orientationFieldSet = useMemo(
+    () => new Set<OrientationFieldKey>(orientationFieldPolicy),
+    [orientationFieldPolicy],
+  );
+  const assistantFieldPolicy = useMemo(
+    () => ({
+      allowedOrientationFields: orientationFieldPolicy,
+    }),
+    [orientationFieldPolicy],
+  );
+
+  const toggleOrientationField = (field: OrientationFieldKey) => {
+    if (runState !== 'idle') {
+      return;
+    }
+    const active = orientationFieldSet.has(field);
+    if (active && orientationFieldPolicy.length <= 1) {
+      return;
+    }
+    const next = new Set<OrientationFieldKey>(orientationFieldPolicy);
+    if (active) {
+      next.delete(field);
+    } else {
+      next.add(field);
+    }
+    setOrientationFieldPolicy(
+      ORIENTATION_FIELD_OPTIONS
+        .map((option) => option.key)
+        .filter((option): option is OrientationFieldKey => next.has(option)),
+    );
+  };
 
   useEffect(() => {
     if (!open) {
@@ -684,6 +753,7 @@ export function AssistantOverlay() {
         mode: 'provider',
         providerId,
         assistantMode: selectedModeId,
+        fieldPolicy: assistantFieldPolicy,
       });
       setConversationId(response.conversationId);
       const finishedAtNs = Date.now() * NS_PER_MS;
@@ -1136,6 +1206,38 @@ export function AssistantOverlay() {
                     <div className="mt-3 text-xs text-gray-500">
                       {summarizeMode(selectedMode, toolCatalog)}
                     </div>
+                  </div>
+                </section>
+
+                <section className="mb-4">
+                  <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-gray-500">
+                    Orientation
+                  </div>
+                  <div className="grid grid-cols-2 gap-2 rounded border border-gray-800 bg-gray-900/70 p-3">
+                    {ORIENTATION_FIELD_OPTIONS.map((option) => {
+                      const checked = orientationFieldSet.has(option.key);
+                      const disabled = runState !== 'idle' || (checked && orientationFieldPolicy.length <= 1);
+                      return (
+                        <label
+                          key={option.key}
+                          title={option.title}
+                          className={`flex items-center gap-2 rounded border px-2 py-1.5 text-xs ${
+                            checked
+                              ? 'border-blue-700/70 bg-blue-950/50 text-blue-100'
+                              : 'border-gray-800 bg-gray-950/50 text-gray-400'
+                          } ${disabled ? 'cursor-not-allowed opacity-70' : 'cursor-pointer hover:border-gray-600 hover:text-gray-100'}`}
+                        >
+                          <input
+                            type="checkbox"
+                            checked={checked}
+                            disabled={disabled}
+                            onChange={() => toggleOrientationField(option.key)}
+                            className="h-3.5 w-3.5 rounded border-gray-600 bg-gray-950 text-blue-600 focus:ring-blue-500"
+                          />
+                          <span>{option.label}</span>
+                        </label>
+                      );
+                    })}
                   </div>
                 </section>
 

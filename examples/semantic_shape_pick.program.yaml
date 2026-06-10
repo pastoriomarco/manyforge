@@ -8,7 +8,7 @@ description: >-
   node confirms the selection before planning a pick sequence. The planner
   validates current->approach, approach->pick, and pick->approach; later
   place logic stays outside the planner.
-catalog_version: "0.1.0"
+catalog_version: "0.2.0"
 
 robot:
   robot_id: ur5
@@ -259,6 +259,7 @@ tree:
         move_id: planned_place_descend
         motion_type: pose_goal
         pose_goal:
+          frame_id: base_link
           position_m: [0.22, 0.0, 0.30]
           orientation_rpy_deg: [180.0, 0.0, 0.0]
         velocity_scale: 0.20
@@ -278,7 +279,6 @@ tree:
             namespace: pick_plan
             field: selected_object_id
         link_frame: tool0
-        frame_id: universe
 
     - id: reset_trajectories
       name: invalidate_after_detach

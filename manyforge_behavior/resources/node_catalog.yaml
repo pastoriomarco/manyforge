@@ -1,14 +1,264 @@
-# ManyForge v0.0 Node Catalog (reference artifact)
+# ManyForge v1 Node Catalog (runtime artifact)
 #
-# This is the canonical v0.0 catalog. Implementations copy this file into
-# manyforge_behavior/resources/node_catalog.yaml.
+# This runtime catalog uses schema-backed parameters. Frozen reference
+# artifacts live under manyforge_specs/docs/spec/artifacts/.
 #
 # Schema: docs/spec/440-node-catalog-format-and-versioning.md
 # Node semantics: docs/spec/410-node-catalog-and-orchestration-adapters.md
 # Capability keys: docs/spec/240-supported-backend-capability-profile.md
 
-api_version: manyforge.node_catalog.v0
-catalog_version: "0.1.0"
+api_version: manyforge.node_catalog.v1
+catalog_version: "0.2.0"
+
+schema_types:
+  orientation_reference:
+    type: object
+    additional_properties: false
+    required: [source]
+    properties:
+      source:
+        type: enum
+        values: [current_pose, scene_object, frame]
+      object_id:
+        type: string
+        required_when: {source: scene_object}
+      frame_id:
+        type: string
+        required_when: {source: frame}
+
+  stored_pose:
+    type: object
+    additional_properties: false
+    required: [frame_id, position_m]
+    properties:
+      frame_id:
+        type: string
+      position_m:
+        type: array
+        items: float
+        length: 3
+      orientation_xyzw:
+        type: array
+        items: float
+        length: 4
+      orientation_rpy_deg:
+        type: array
+        items: float
+        length: 3
+    exactly_one:
+      - [orientation_xyzw, orientation_rpy_deg]
+  pose_authoring_input:
+    type: object
+    additional_properties: false
+    required: [frame_id, position_m]
+    resolves_to: "#/schema_types/stored_pose"
+    properties:
+      frame_id:
+        type: string
+      position_m:
+        type: array
+        items: float
+        length: 3
+      orientation_xyzw:
+        type: array
+        items: float
+        length: 4
+      orientation_rpy_deg:
+        type: array
+        items: float
+        length: 3
+      rotate_local_rpy_deg:
+        type: array
+        items: float
+        length: 3
+        requires_current_value: true
+      rotate_world_rpy_deg:
+        type: array
+        items: float
+        length: 3
+        requires_current_value: true
+      rpy_delta_deg:
+        type: array
+        items: float
+        length: 3
+        requires_current_value: true
+        description: Component-wise authored RPY field addition, not physical composition.
+      orientation_from:
+        schema_ref: "#/schema_types/orientation_reference"
+    exactly_one:
+      - [orientation_xyzw, orientation_rpy_deg, rotate_local_rpy_deg,
+         rotate_world_rpy_deg, rpy_delta_deg, orientation_from]
+  motion_pose_goal:
+    # ADR-0023 §3.8: a commanded absolute motion goal is unambiguous:
+    # frame_id + position_m + exactly one orientation form. Relative-move
+    # deltas use the separate loose `motion_pose_offset`.
+    # NOTE: this is the ABSOLUTE goal schema. Relative-move deltas use the
+    # separate loose `motion_pose_offset` (an offset has no frame_id of its own
+    # and may be position- or orientation-only).
+    type: object
+    additional_properties: false
+    required: [frame_id, position_m]
+    properties:
+      frame_id:
+        type: string
+      position_m:
+        type: array
+        items: float
+        length: 3
+      orientation_xyzw:
+        type: array
+        items: float
+        length: 4
+      orientation_rpy_deg:
+        type: array
+        items: float
+        length: 3
+    exactly_one:
+      - [orientation_xyzw, orientation_rpy_deg]
+  motion_pose_offset:
+    # A relative-move delta: expressed in the offset_reference frame, so it
+    # carries no frame_id and may be position-only, orientation-only, or both.
+    # Ambiguity is still bounded: at most one orientation form.
+    type: object
+    additional_properties: false
+    properties:
+      position_m:
+        type: array
+        items: float
+        length: 3
+      orientation_xyzw:
+        type: array
+        items: float
+        length: 4
+      orientation_rpy_deg:
+        type: array
+        items: float
+        length: 3
+    mutually_exclusive:
+      - [orientation_xyzw, orientation_rpy_deg]
+  shape:
+    type: object
+    additional_properties: false
+    required: [type]
+    properties:
+      type:
+        type: enum
+        values: [box, sphere, cylinder, mesh]
+      box_dimensions_m:
+        type: array
+        items:
+          type: float
+          constraints:
+            min_exclusive: 0.0
+        length: 3
+        required_when: {type: box}
+        allowed_when: {type: box}
+      sphere_radius_m:
+        type: float
+        constraints:
+          min_exclusive: 0.0
+        required_when: {type: sphere}
+        allowed_when: {type: sphere}
+      cylinder_radius_m:
+        type: float
+        constraints:
+          min_exclusive: 0.0
+        required_when: {type: cylinder}
+        allowed_when: {type: cylinder}
+      cylinder_height_m:
+        type: float
+        constraints:
+          min_exclusive: 0.0
+        required_when: {type: cylinder}
+        allowed_when: {type: cylinder}
+      mesh_resource_uri:
+        type: string
+        required_when: {type: mesh}
+        allowed_when: {type: mesh}
+      mesh_scale:
+        type: array
+        items:
+          type: float
+          constraints:
+            min_exclusive: 0.0
+        length: 3
+        allowed_when: {type: mesh}
+  relative_move_reference:
+    type: object
+    additional_properties: false
+    required: [type]
+    properties:
+      type:
+        type: enum
+        values: [frame, object, robot_link, pose]
+      id:
+        type: string
+      pose:
+        type: object
+        additional_properties: true
+  relative_move:
+    type: object
+    additional_properties: false
+    required: [target_reference, offset]
+    properties:
+      target_reference:
+        schema_ref: "#/schema_types/relative_move_reference"
+      offset_reference:
+        schema_ref: "#/schema_types/relative_move_reference"
+      offset:
+        schema_ref: "#/schema_types/motion_pose_offset"
+  per_joint_deceleration_limits:
+    type: object
+    additional_properties:
+      type: float
+      constraints:
+        min_exclusive: 0.0
+  template_variable_binding:
+    type: object
+    additional_properties: false
+    exactly_one:
+      - [key_ref, field_ref]
+    properties:
+      key_ref:
+        type: string
+      field_ref:
+        type: object
+        additional_properties: false
+        required: [namespace, field]
+        properties:
+          namespace:
+            type: string
+          field:
+            type: string
+  template_variable_map:
+    type: object
+    additional_properties:
+      schema_ref: "#/schema_types/template_variable_binding"
+  pose_offset_envelope:
+    type: object
+    additional_properties: false
+    required:
+      - position_min_m
+      - position_max_m
+      - orientation_rpy_min_deg
+      - orientation_rpy_max_deg
+    properties:
+      position_min_m:
+        type: array
+        items: float
+        length: 3
+      position_max_m:
+        type: array
+        items: float
+        length: 3
+      orientation_rpy_min_deg:
+        type: array
+        items: float
+        length: 3
+      orientation_rpy_max_deg:
+        type: array
+        items: float
+        length: 3
 
 entries:
 
@@ -143,7 +393,8 @@ entries:
       num_attempts: num_cycles
     parameters:
       - name: num_cycles
-        type: int
+        schema:
+          type: int
         required: true
         default: -1
         parameterizable: true
@@ -177,7 +428,8 @@ entries:
       num_cycles: num_attempts
     parameters:
       - name: num_attempts
-        type: int
+        schema:
+          type: int
         required: true
         default: -1
         parameterizable: true
@@ -208,10 +460,11 @@ entries:
       max: 0
     parameters:
       - name: duration_s
-        type: float
+        schema:
+          type: float
+          constraints:
+            min_exclusive: 0.0
         required: true
-        constraints:
-          min_exclusive: 0.0
         parameterizable: true
         description: Duration to wait in seconds.
     required_capabilities: []
@@ -247,14 +500,16 @@ entries:
       max: 0
     parameters:
       - name: move_id
-        type: string
+        schema:
+          type: string
         required: true
         description: >-
           Stable identifier for this move instance (used for trajectory caching).
       - name: motion_type
-        type: enum
+        schema:
+          type: enum
+          values: [joint_goal, pose_goal, relative_move]
         required: true
-        enum_values: [joint_goal, pose_goal, relative_move]
         enum_options:
           - value: joint_goal
           - value: pose_goal
@@ -265,7 +520,9 @@ entries:
               - context.pose.resolve_reference
         description: The type of motion to plan.
       - name: joint_goal_names
-        type: string_list
+        schema:
+          type: array
+          items: string
         required: false
         visible_when:
           param: motion_type
@@ -273,7 +530,9 @@ entries:
         description: >-
           Joint names for joint_goal motion type. Required when motion_type=joint_goal.
       - name: joint_goal_positions_rad
-        type: float_list
+        schema:
+          type: array
+          items: float
         required: false
         visible_when:
           param: motion_type
@@ -281,7 +540,7 @@ entries:
         description: >-
           Joint positions in radians for joint_goal. Required when motion_type=joint_goal.
       - name: pose_goal
-        type: pose
+        schema_ref: "#/schema_types/motion_pose_goal"
         required: false
         visible_when:
           param: motion_type
@@ -294,7 +553,7 @@ entries:
           Required when motion_type=pose_goal. May be an inline pose or a
           declared blackboard field_ref.
       - name: relative_move
-        type: dict
+        schema_ref: "#/schema_types/relative_move"
         required: false
         profiles:
           min_profile: v0.1
@@ -312,77 +571,86 @@ entries:
           Use `robot_link` for current TCP/link-relative moves, `frame` for arbitrary scene
           frames, and `pose` for either an inline reference pose or a declared pose field_ref.
       - name: velocity_scale
-        type: float
+        schema:
+          type: float
+          constraints:
+            min_exclusive: 0.0
+            max_inclusive: 1.0
         required: false
         default: 1.0
-        constraints:
-          min_exclusive: 0.0
-          max_inclusive: 1.0
         parameterizable: true
         description: Velocity scaling factor.
       - name: acceleration_scale
-        type: float
+        schema:
+          type: float
+          constraints:
+            min_exclusive: 0.0
+            max_inclusive: 1.0
         required: false
         default: 1.0
-        constraints:
-          min_exclusive: 0.0
-          max_inclusive: 1.0
         parameterizable: true
         description: Acceleration scaling factor.
       - name: max_tcp_linear_speed_mps
-        type: float
+        schema:
+          type: float
+          constraints:
+            min_exclusive: 0.0
         required: false
-        constraints:
-          min_exclusive: 0.0
         parameterizable: true
         description: >-
           Per-move TCP linear speed cap (m/s). Effective limit is
           min(global_max, this value). Omit to use global limit only.
       - name: joint_position_tol_rad
-        type: float
+        schema:
+          type: float
+          constraints:
+            min_inclusive: 0.0
         required: false
         default: 0.05
-        constraints:
-          min_inclusive: 0.0
         parameterizable: true
         description: Joint position tolerance in radians.
       - name: translation_tol_m
-        type: float
+        schema:
+          type: float
+          constraints:
+            min_inclusive: 0.0
         required: false
         default: 0.005
-        constraints:
-          min_inclusive: 0.0
         parameterizable: true
         description: Cartesian translation tolerance in meters.
       - name: rotation_tol_rad
-        type: float
+        schema:
+          type: float
+          constraints:
+            min_inclusive: 0.0
         required: false
         default: 0.05
-        constraints:
-          min_inclusive: 0.0
         parameterizable: true
         description: Cartesian rotation tolerance in radians.
       - name: planning_timeout_s
-        type: float
+        schema:
+          type: float
+          constraints:
+            min_exclusive: 0.0
         required: false
         default: 2.0
-        constraints:
-          min_exclusive: 0.0
         parameterizable: true
         description: Planning timeout in seconds.
       - name: execution_timeout_s
-        type: float
+        schema:
+          type: float
+          constraints:
+            min_exclusive: 0.0
         required: false
         default: 10.0
-        constraints:
-          min_exclusive: 0.0
         parameterizable: true
         description: Execution timeout in seconds.
       - name: cache_mode
-        type: enum
+        schema:
+          type: enum
+          values: [default, disable]
         required: false
         default: default
-        enum_values: [default, disable]
         description: Trajectory cache mode.
     required_capabilities:
       - planning.motion.joint_goal
@@ -441,13 +709,15 @@ entries:
       max: 0
     parameters:
       - name: move_id
-        type: string
+        schema:
+          type: string
         required: true
         description: Stable move identifier for trajectory caching.
       - name: motion_type
-        type: enum
+        schema:
+          type: enum
+          values: [joint_goal, pose_goal, relative_move]
         required: true
-        enum_values: [joint_goal, pose_goal, relative_move]
         enum_options:
           - value: joint_goal
           - value: pose_goal
@@ -458,7 +728,9 @@ entries:
               - context.pose.resolve_reference
         description: The type of motion to plan.
       - name: joint_goal_names
-        type: string_list
+        schema:
+          type: array
+          items: string
         required: false
         visible_when:
           param: motion_type
@@ -466,7 +738,9 @@ entries:
         description: >-
           Joint names for joint_goal motion type. Required when motion_type=joint_goal.
       - name: joint_goal_positions_rad
-        type: float_list
+        schema:
+          type: array
+          items: float
         required: false
         visible_when:
           param: motion_type
@@ -474,7 +748,7 @@ entries:
         description: >-
           Joint positions in radians for joint_goal. Required when motion_type=joint_goal.
       - name: pose_goal
-        type: pose
+        schema_ref: "#/schema_types/motion_pose_goal"
         required: false
         visible_when:
           param: motion_type
@@ -486,7 +760,7 @@ entries:
           Target end-effector pose in base_frame for pose_goal motion type.
           May be an inline pose or a declared blackboard field_ref.
       - name: relative_move
-        type: dict
+        schema_ref: "#/schema_types/relative_move"
         required: false
         visible_when:
           param: motion_type
@@ -495,43 +769,46 @@ entries:
         description: >-
           Relative move goal (see move_manipulator_action for structure).
       - name: policy_id
-        type: string
+        schema:
+          type: string
         required: true
         description: >-
           The registered move-scoped `complete_move_on_signal` policy
           this scope binds to.
       - name: scope_id
-        type: string
+        schema:
+          type: string
         required: false
         description: >-
           Per-move binding identifier (default `{move_id}_scope`).
       - name: stop_mode
-        type: enum
+        schema:
+          type: enum
+          values: [spring_back_hold, soft_on_path, hard_deceleration]
         required: true
-        enum_values: [spring_back_hold, soft_on_path, hard_deceleration]
         description: >-
           Controlled-stop mode requested at trip time. The backend's
           capability profile MUST advertise the mode or the kernel
           rejects the execute request before dispatch.
       - name: activation_mode
-        type: enum
+        schema:
+          type: enum
+          values: [require_inactive_at_arm, fresh_edge_after_arm, trip_if_already_active, maintain_level_with_hysteresis]
         required: false
-        enum_values:
-          - require_inactive_at_arm
-          - fresh_edge_after_arm
-          - trip_if_already_active
-          - maintain_level_with_hysteresis
         description: >-
           Spec/260 §2.6 activation mode for the binding. Default
           `require_inactive_at_arm`.
       - name: not_found_is_failure
-        type: bool
+        schema:
+          type: bool
         required: false
         description: >-
           When true, `no_signal_trip` terminal cause maps to FAILURE
           instead of SUCCESS. Use for "must contact" semantics.
       - name: allowed_fallback_modes
-        type: string_list
+        schema:
+          type: array
+          items: string
         required: false
         description: >-
           Stop modes the backend may execute as a fallback at trip
@@ -539,22 +816,25 @@ entries:
           be in the backend capability profile AND the kernel
           policy's `allowed_stop_modes`.
       - name: stop_max_time_s
-        type: float
+        schema:
+          type: float
         required: false
         description: Upper bound on backend stop confirmation.
       - name: stop_deceleration_time_s
-        type: float
+        schema:
+          type: float
         required: false
         description: Ramp duration for spring_back_hold / soft_on_path.
       - name: per_joint_max_deceleration_rad_s2
-        type: dict
+        schema_ref: "#/schema_types/per_joint_deceleration_limits"
         required: false
         description: >-
           Per-joint deceleration limits for soft_on_path feasibility
           and replacement-trajectory generation. Required when
           stop_mode is `soft_on_path`.
       - name: allow_natural_completion_on_short_path
-        type: bool
+        schema:
+          type: bool
         required: false
         default: true
         visible_when:
@@ -567,89 +847,100 @@ entries:
           complete and map the terminal outcome to no_signal_trip
           semantics. Disable when a controlled stop is mandatory.
       - name: scope_outcome_key
-        type: string
+        schema:
+          type: string
         required: false
         description: >-
           Blackboard key for the terminal MotionExecutionOutcome
           (default `motion_scope_outcome`).
       - name: result_binding_key
-        type: string
+        schema:
+          type: string
         required: false
         description: >-
           Optional spec/260 §2.6 result-binding key recorded on the
           trip outcome for downstream BT consumers.
       - name: velocity_scale
-        type: float
+        schema:
+          type: float
+          constraints:
+            min_exclusive: 0.0
+            max_inclusive: 1.0
         required: false
         default: 1.0
-        constraints:
-          min_exclusive: 0.0
-          max_inclusive: 1.0
         parameterizable: true
         description: Velocity scaling factor.
       - name: acceleration_scale
-        type: float
+        schema:
+          type: float
+          constraints:
+            min_exclusive: 0.0
+            max_inclusive: 1.0
         required: false
         default: 1.0
-        constraints:
-          min_exclusive: 0.0
-          max_inclusive: 1.0
         parameterizable: true
         description: Acceleration scaling factor.
       - name: max_tcp_linear_speed_mps
-        type: float
+        schema:
+          type: float
+          constraints:
+            min_exclusive: 0.0
         required: false
-        constraints:
-          min_exclusive: 0.0
         parameterizable: true
         description: >-
           Per-move TCP linear speed cap (m/s). Effective limit is
           min(global_max, this value). Omit to use global limit only.
       - name: joint_position_tol_rad
-        type: float
+        schema:
+          type: float
+          constraints:
+            min_inclusive: 0.0
         required: false
         default: 0.05
-        constraints:
-          min_inclusive: 0.0
         parameterizable: true
         description: Joint position tolerance in radians.
       - name: translation_tol_m
-        type: float
+        schema:
+          type: float
+          constraints:
+            min_inclusive: 0.0
         required: false
         default: 0.005
-        constraints:
-          min_inclusive: 0.0
         parameterizable: true
         description: Cartesian translation tolerance in meters.
       - name: rotation_tol_rad
-        type: float
+        schema:
+          type: float
+          constraints:
+            min_inclusive: 0.0
         required: false
         default: 0.05
-        constraints:
-          min_inclusive: 0.0
         parameterizable: true
         description: Cartesian rotation tolerance in radians.
       - name: planning_timeout_s
-        type: float
+        schema:
+          type: float
+          constraints:
+            min_exclusive: 0.0
         required: false
         default: 2.0
-        constraints:
-          min_exclusive: 0.0
         parameterizable: true
         description: Planning timeout in seconds.
       - name: execution_timeout_s
-        type: float
+        schema:
+          type: float
+          constraints:
+            min_exclusive: 0.0
         required: false
         default: 10.0
-        constraints:
-          min_exclusive: 0.0
         parameterizable: true
         description: Execution timeout in seconds.
       - name: cache_mode
-        type: enum
+        schema:
+          type: enum
+          values: [default, disable]
         required: false
         default: default
-        enum_values: [default, disable]
         description: Trajectory cache mode.
     required_capabilities:
       - kernel.motion_interrupt_scope
@@ -702,13 +993,15 @@ entries:
       max: 0
     parameters:
       - name: move_id
-        type: string
+        schema:
+          type: string
         required: true
         description: Stable move identifier for trajectory caching.
       - name: motion_type
-        type: enum
+        schema:
+          type: enum
+          values: [joint_goal, pose_goal, relative_move]
         required: true
-        enum_values: [joint_goal, pose_goal, relative_move]
         enum_options:
           - value: joint_goal
           - value: pose_goal
@@ -719,21 +1012,25 @@ entries:
               - context.pose.resolve_reference
         description: The type of motion to plan (default pose_goal for contact moves).
       - name: joint_goal_names
-        type: string_list
+        schema:
+          type: array
+          items: string
         required: false
         visible_when:
           param: motion_type
           equals: joint_goal
         description: Joint names when motion_type=joint_goal.
       - name: joint_goal_positions_rad
-        type: float_list
+        schema:
+          type: array
+          items: float
         required: false
         visible_when:
           param: motion_type
           equals: joint_goal
         description: Joint positions in radians when motion_type=joint_goal.
       - name: pose_goal
-        type: pose
+        schema_ref: "#/schema_types/motion_pose_goal"
         required: false
         visible_when:
           param: motion_type
@@ -743,7 +1040,7 @@ entries:
         blackboard_value_type: pose
         description: Target probe-search end pose for motion_type=pose_goal.
       - name: relative_move
-        type: dict
+        schema_ref: "#/schema_types/relative_move"
         required: false
         visible_when:
           param: motion_type
@@ -751,121 +1048,137 @@ entries:
         ui_editor: relative_move
         description: Relative move goal (see move_manipulator_action).
       - name: policy_id
-        type: string
+        schema:
+          type: string
         required: true
         description: >-
           The registered move-scoped `complete_move_on_signal` policy
           this scope binds to.
       - name: stop_mode
-        type: enum
+        schema:
+          type: enum
+          values: [spring_back_hold, soft_on_path, hard_deceleration]
         required: true
-        enum_values: [spring_back_hold, soft_on_path, hard_deceleration]
         description: >-
           Controlled-stop mode requested at trip time. Backend
           capability MUST advertise the mode.
       - name: scope_id
-        type: string
+        schema:
+          type: string
         required: false
         description: Per-move binding identifier.
       - name: stop_max_time_s
-        type: float
+        schema:
+          type: float
         required: false
         description: Upper bound on backend stop confirmation.
       - name: stop_deceleration_time_s
-        type: float
+        schema:
+          type: float
         required: false
         description: Ramp duration for spring_back_hold / soft_on_path.
       - name: per_joint_max_deceleration_rad_s2
-        type: dict
+        schema_ref: "#/schema_types/per_joint_deceleration_limits"
         required: false
         description: >-
           Per-joint deceleration limits for soft_on_path feasibility
           and replacement-trajectory generation. Required when
           stop_mode is `soft_on_path`.
       - name: scope_outcome_key
-        type: string
+        schema:
+          type: string
         required: false
         description: >-
           Blackboard key for the terminal MotionExecutionOutcome
           (default `motion_scope_outcome`).
       - name: result_binding_key
-        type: string
+        schema:
+          type: string
         required: false
         description: >-
           Optional spec/260 §2.6 result-binding key recorded on the
           trip outcome.
       - name: velocity_scale
-        type: float
+        schema:
+          type: float
+          constraints:
+            min_exclusive: 0.0
+            max_inclusive: 1.0
         required: false
         default: 1.0
-        constraints:
-          min_exclusive: 0.0
-          max_inclusive: 1.0
         parameterizable: true
         description: Velocity scaling factor.
       - name: acceleration_scale
-        type: float
+        schema:
+          type: float
+          constraints:
+            min_exclusive: 0.0
+            max_inclusive: 1.0
         required: false
         default: 1.0
-        constraints:
-          min_exclusive: 0.0
-          max_inclusive: 1.0
         parameterizable: true
         description: Acceleration scaling factor.
       - name: max_tcp_linear_speed_mps
-        type: float
+        schema:
+          type: float
+          constraints:
+            min_exclusive: 0.0
         required: false
-        constraints:
-          min_exclusive: 0.0
         parameterizable: true
         description: >-
           Per-move TCP linear speed cap (m/s). Effective limit is
           min(global_max, this value).
       - name: joint_position_tol_rad
-        type: float
+        schema:
+          type: float
+          constraints:
+            min_inclusive: 0.0
         required: false
         default: 0.05
-        constraints:
-          min_inclusive: 0.0
         parameterizable: true
         description: Joint position tolerance in radians.
       - name: translation_tol_m
-        type: float
+        schema:
+          type: float
+          constraints:
+            min_inclusive: 0.0
         required: false
         default: 0.005
-        constraints:
-          min_inclusive: 0.0
         parameterizable: true
         description: Cartesian translation tolerance in meters.
       - name: rotation_tol_rad
-        type: float
+        schema:
+          type: float
+          constraints:
+            min_inclusive: 0.0
         required: false
         default: 0.05
-        constraints:
-          min_inclusive: 0.0
         parameterizable: true
         description: Cartesian rotation tolerance in radians.
       - name: planning_timeout_s
-        type: float
+        schema:
+          type: float
+          constraints:
+            min_exclusive: 0.0
         required: false
         default: 2.0
-        constraints:
-          min_exclusive: 0.0
         parameterizable: true
         description: Planning timeout in seconds.
       - name: execution_timeout_s
-        type: float
+        schema:
+          type: float
+          constraints:
+            min_exclusive: 0.0
         required: false
         default: 10.0
-        constraints:
-          min_exclusive: 0.0
         parameterizable: true
         description: Execution timeout in seconds.
       - name: cache_mode
-        type: enum
+        schema:
+          type: enum
+          values: [default, disable]
         required: false
         default: default
-        enum_values: [default, disable]
         description: Trajectory cache mode.
     required_capabilities:
       - kernel.motion_interrupt_scope
@@ -950,7 +1263,8 @@ entries:
     swap_class: scene_object_create
     parameters:
       - name: object_id
-        type: string
+        schema:
+          type: string
         required: true
         parameterizable: true
         ui_editor: blackboard_key_selector
@@ -958,63 +1272,15 @@ entries:
         blackboard_value_type: string
         description: Unique identifier for the collision object. May be a literal
           ID, a program parameter, or a declared blackboard key/field binding.
-      - name: shape_type
-        type: enum
+      - name: shape
+        schema_ref: "#/schema_types/shape"
         required: true
-        enum_values: [box, sphere, cylinder, mesh]
-        description: Shape type.
-      - name: box_dimensions_m
-        type: float_list
-        required: false
-        visible_when:
-          param: shape_type
-          equals: box
+        ui_editor: shape
         description: >-
-          Box full dimensions [x, y, z] in meters (required when shape_type=box).
-      - name: sphere_radius_m
-        type: float
-        required: false
-        visible_when:
-          param: shape_type
-          equals: sphere
-        constraints:
-          min_exclusive: 0.0
-        description: Sphere radius in meters (required when shape_type=sphere).
-      - name: cylinder_radius_m
-        type: float
-        required: false
-        visible_when:
-          param: shape_type
-          equals: cylinder
-        constraints:
-          min_exclusive: 0.0
-        description: Cylinder radius in meters (required when shape_type=cylinder).
-      - name: cylinder_height_m
-        type: float
-        required: false
-        visible_when:
-          param: shape_type
-          equals: cylinder
-        constraints:
-          min_exclusive: 0.0
-        description: Cylinder height in meters along local Z (required when shape_type=cylinder).
-      - name: mesh_resource_uri
-        type: string
-        required: false
-        visible_when:
-          param: shape_type
-          equals: mesh
-        description: Mesh resource URI or path (required when shape_type=mesh).
-      - name: mesh_scale
-        type: float_list
-        required: false
-        visible_when:
-          param: shape_type
-          equals: mesh
-        default: [1.0, 1.0, 1.0]
-        description: Mesh scale [x, y, z]; defaults to [1, 1, 1].
+          Collision shape object with `type` plus the type-specific dimensions
+          required by the schema.
       - name: pose
-        type: pose
+        schema_ref: "#/schema_types/stored_pose"
         required: true
         description: >-
           Object PoseStamped — must contain `frame_id` (string,
@@ -1063,7 +1329,8 @@ entries:
     swap_class: scene_object_create
     parameters:
       - name: object_id
-        type: string
+        schema:
+          type: string
         required: true
         parameterizable: true
         ui_editor: blackboard_key_selector
@@ -1072,63 +1339,15 @@ entries:
         description: Identifier for the collision object to insert or replace.
           May be a literal ID, a program parameter, or a declared blackboard
           key/field binding.
-      - name: shape_type
-        type: enum
+      - name: shape
+        schema_ref: "#/schema_types/shape"
         required: true
-        enum_values: [box, sphere, cylinder, mesh]
-        description: Shape type.
-      - name: box_dimensions_m
-        type: float_list
-        required: false
-        visible_when:
-          param: shape_type
-          equals: box
+        ui_editor: shape
         description: >-
-          Box full dimensions [x, y, z] in meters (required when shape_type=box).
-      - name: sphere_radius_m
-        type: float
-        required: false
-        visible_when:
-          param: shape_type
-          equals: sphere
-        constraints:
-          min_exclusive: 0.0
-        description: Sphere radius in meters (required when shape_type=sphere).
-      - name: cylinder_radius_m
-        type: float
-        required: false
-        visible_when:
-          param: shape_type
-          equals: cylinder
-        constraints:
-          min_exclusive: 0.0
-        description: Cylinder radius in meters (required when shape_type=cylinder).
-      - name: cylinder_height_m
-        type: float
-        required: false
-        visible_when:
-          param: shape_type
-          equals: cylinder
-        constraints:
-          min_exclusive: 0.0
-        description: Cylinder height in meters along local Z (required when shape_type=cylinder).
-      - name: mesh_resource_uri
-        type: string
-        required: false
-        visible_when:
-          param: shape_type
-          equals: mesh
-        description: Mesh resource URI or path (required when shape_type=mesh).
-      - name: mesh_scale
-        type: float_list
-        required: false
-        visible_when:
-          param: shape_type
-          equals: mesh
-        default: [1.0, 1.0, 1.0]
-        description: Mesh scale [x, y, z]; defaults to [1, 1, 1].
+          Collision shape object with `type` plus the type-specific dimensions
+          required by the schema.
       - name: pose
-        type: pose
+        schema_ref: "#/schema_types/stored_pose"
         required: true
         description: >-
           Object PoseStamped — must contain `frame_id` (string,
@@ -1175,7 +1394,8 @@ entries:
       max: 0
     parameters:
       - name: object_id
-        type: string
+        schema:
+          type: string
         required: true
         parameterizable: true
         ui_editor: blackboard_key_selector
@@ -1217,7 +1437,8 @@ entries:
       max: 0
     parameters:
       - name: object_id
-        type: string
+        schema:
+          type: string
         required: true
         parameterizable: true
         ui_editor: blackboard_key_selector
@@ -1226,7 +1447,7 @@ entries:
         description: Identifier of the object to update. May be a literal ID,
           a program parameter, or a declared blackboard key/field binding.
       - name: pose
-        type: pose
+        schema_ref: "#/schema_types/stored_pose"
         required: true
         description: >-
           New object PoseStamped — must contain `frame_id` (string,
@@ -1269,7 +1490,8 @@ entries:
       max: 0
     parameters:
       - name: object_id
-        type: string
+        schema:
+          type: string
         required: true
         parameterizable: true
         ui_editor: blackboard_key_selector
@@ -1278,15 +1500,19 @@ entries:
         description: Object to attach (must exist in scene). May be a literal
           ID, a program parameter, or a declared blackboard key/field binding.
       - name: link_frame
-        type: string
+        schema:
+          type: string
         required: true
         description: Robot link to attach to (e.g. "tool0").
       - name: gripper_id
-        type: string
+        schema:
+          type: string
         required: false
         description: Optional gripper identifier. When provided, attach uses the gripper's deployment-defined touch_links for allowable grasp contact.
       - name: touch_links
-        type: string_list
+        schema:
+          type: array
+          items: string
         required: false
         description: Optional explicit list of robot link names that are allowed to touch the attached object during planning. Overrides gripper_id-derived touch_links when provided.
     required_capabilities:
@@ -1328,7 +1554,8 @@ entries:
       max: 0
     parameters:
       - name: object_id
-        type: string
+        schema:
+          type: string
         required: true
         parameterizable: true
         ui_editor: blackboard_key_selector
@@ -1338,7 +1565,8 @@ entries:
           "_attached"). May be a literal ID, a program parameter, or a
           declared blackboard key/field binding.
       - name: link_frame
-        type: string
+        schema:
+          type: string
         required: true
         description: Robot link it's attached to (e.g. "tool0").
     required_capabilities:
@@ -1377,14 +1605,16 @@ entries:
       max: 0
     parameters:
       - name: key
-        type: string
+        schema:
+          type: string
         required: true
         ui_editor: blackboard_key_selector
         blackboard_role: key_reader
         blackboard_value_type: bool
         description: Blackboard key name.
       - name: expected_value
-        type: bool
+        schema:
+          type: bool
         required: true
         description: The expected boolean value.
     bb_reader_params: [key]
@@ -1414,14 +1644,16 @@ entries:
       max: 0
     parameters:
       - name: key
-        type: string
+        schema:
+          type: string
         required: true
         ui_editor: blackboard_key_selector
         blackboard_role: key_writer
         blackboard_value_type: bool
         description: Blackboard key name.
       - name: value
-        type: bool
+        schema:
+          type: bool
         required: true
         description: The boolean value to set.
     bb_writer_params: [key]
@@ -1451,14 +1683,16 @@ entries:
       max: 0
     parameters:
       - name: key
-        type: string
+        schema:
+          type: string
         required: true
         ui_editor: blackboard_key_selector
         blackboard_role: key_reader
         blackboard_value_type: bool
         description: Blackboard key name.
       - name: expected_value
-        type: bool
+        schema:
+          type: bool
         required: true
         description: The expected boolean value to wait for.
     bb_reader_params: [key]
@@ -1495,14 +1729,16 @@ entries:
       max: 0
     parameters:
       - name: key
-        type: string
+        schema:
+          type: string
         required: true
         ui_editor: blackboard_key_selector
         blackboard_role: key_reader
         blackboard_value_type: bool
         description: Declared boolean signal key.
       - name: expected_value
-        type: bool
+        schema:
+          type: bool
         required: true
         description: The expected signal level.
     bb_reader_params: [key]
@@ -1532,14 +1768,16 @@ entries:
       max: 0
     parameters:
       - name: key
-        type: string
+        schema:
+          type: string
         required: true
         ui_editor: blackboard_key_selector
         blackboard_role: key_writer
         blackboard_value_type: bool
         description: Declared boolean signal key.
       - name: value
-        type: bool
+        schema:
+          type: bool
         required: true
         description: The signal level to set.
     bb_writer_params: [key]
@@ -1569,14 +1807,16 @@ entries:
       max: 0
     parameters:
       - name: key
-        type: string
+        schema:
+          type: string
         required: true
         ui_editor: blackboard_key_selector
         blackboard_role: key_reader
         blackboard_value_type: bool
         description: Declared boolean signal key.
       - name: expected_value
-        type: bool
+        schema:
+          type: bool
         required: true
         description: The signal level to wait for.
     bb_reader_params: [key]
@@ -1610,17 +1850,19 @@ entries:
       max: 0
     parameters:
       - name: key
-        type: string
+        schema:
+          type: string
         required: true
         ui_editor: blackboard_key_selector
         blackboard_role: key_reader
         blackboard_value_type: bool
         description: Declared boolean signal key.
       - name: edge
-        type: enum
+        schema:
+          type: enum
+          values: [rising, falling, any]
         required: true
         default: rising
-        enum_values: [rising, falling, any]
         description: Edge transition to wait for.
     bb_reader_params: [key]
     required_capabilities: []
@@ -1658,32 +1900,37 @@ entries:
       max: 0
     parameters:
       - name: gripper_id
-        type: string
+        schema:
+          type: string
         required: true
         description: Deployment gripper identifier to command.
       - name: position
-        type: float
+        schema:
+          type: float
         required: true
         description: >-
           Numeric gripper command-space target position. UI presets are parsed
           from the deployment robot SRDF's matching gripper group_state values.
       - name: max_effort
-        type: float
+        schema:
+          type: float
         required: false
         description: Optional maximum effort for backends that support gripper-command effort limits.
       - name: duration_s
-        type: float
+        schema:
+          type: float
+          constraints:
+            min_inclusive: 0
         required: false
-        constraints:
-          min_inclusive: 0
         description: >-
           Optional command duration. If omitted, the runtime uses the deployment
           gripper motion_time_s.
       - name: timeout_s
-        type: float
+        schema:
+          type: float
+          constraints:
+            min_inclusive: 0
         required: false
-        constraints:
-          min_inclusive: 0
         description: >-
           Maximum time to wait for the gripper command to complete. If omitted,
           the runtime derives a timeout from the selected command duration.
@@ -1720,17 +1967,19 @@ entries:
       max: 0
     parameters:
       - name: state_key
-        type: string
+        schema:
+          type: string
         required: true
         ui_editor: blackboard_key_selector
         blackboard_role: key_reader
         blackboard_value_type: bool
         description: Declared boolean key representing gripper closed/open state.
       - name: expected_state
-        type: enum
+        schema:
+          type: enum
+          values: [open, closed]
         required: true
         default: closed
-        enum_values: [open, closed]
         description: Expected logical gripper state.
     bb_reader_params: [state_key]
     required_capabilities: []
@@ -1760,17 +2009,19 @@ entries:
       max: 0
     parameters:
       - name: state_key
-        type: string
+        schema:
+          type: string
         required: true
         ui_editor: blackboard_key_selector
         blackboard_role: key_writer
         blackboard_value_type: bool
         description: Declared boolean key representing gripper closed/open state.
       - name: state
-        type: enum
+        schema:
+          type: enum
+          values: [open, closed]
         required: true
         default: closed
-        enum_values: [open, closed]
         description: Logical gripper state to write.
     bb_writer_params: [state_key]
     required_capabilities: []
@@ -1799,17 +2050,19 @@ entries:
       max: 0
     parameters:
       - name: state_key
-        type: string
+        schema:
+          type: string
         required: true
         ui_editor: blackboard_key_selector
         blackboard_role: key_reader
         blackboard_value_type: bool
         description: Declared boolean key representing gripper closed/open state.
       - name: expected_state
-        type: enum
+        schema:
+          type: enum
+          values: [open, closed]
         required: true
         default: closed
-        enum_values: [open, closed]
         description: Logical gripper state to wait for.
     bb_reader_params: [state_key]
     required_capabilities: []
@@ -1844,15 +2097,18 @@ entries:
       max: 0
     parameters:
       - name: target_frame
-        type: string
+        schema:
+          type: string
         required: true
         description: The link/frame to compute the pose for.
       - name: base_frame
-        type: string
+        schema:
+          type: string
         required: true
         description: The frame in which the result is expressed.
       - name: output_key
-        type: string
+        schema:
+          type: string
         required: true
         ui_editor: blackboard_key_selector
         blackboard_role: key_writer
@@ -1888,31 +2144,35 @@ entries:
       max: 0
     parameters:
       - name: pose_key_a
-        type: string
+        schema:
+          type: string
         required: true
         ui_editor: blackboard_key_selector
         blackboard_role: key_reader
         blackboard_value_type: pose
         description: Blackboard key for the first pose.
       - name: pose_key_b
-        type: string
+        schema:
+          type: string
         required: true
         ui_editor: blackboard_key_selector
         blackboard_role: key_reader
         blackboard_value_type: pose
         description: Blackboard key for the second pose.
       - name: translation_threshold_m
-        type: float
+        schema:
+          type: float
+          constraints:
+            min_inclusive: 0.0
         required: true
-        constraints:
-          min_inclusive: 0.0
         parameterizable: true
         description: Maximum translation distance in meters.
       - name: rotation_threshold_rad
-        type: float
+        schema:
+          type: float
+          constraints:
+            min_inclusive: 0.0
         required: true
-        constraints:
-          min_inclusive: 0.0
         parameterizable: true
         description: Maximum rotation distance in radians.
     bb_reader_params: [pose_key_a, pose_key_b]
@@ -1946,21 +2206,24 @@ entries:
       max: 1
     parameters:
       - name: fallback_params
-        type: object
+        schema:
+          type: object
+          additional_properties: true
         required: true
         description: >-
           Parameter overrides to apply to the blackboard on child failure.
           Keys are blackboard key paths, values are the fallback values.
       - name: max_retries
-        type: int
+        schema:
+          type: int
+          constraints:
+            min_inclusive: 0
         required: false
         default: 1
         parameterizable: true
         description: >-
           Maximum retry attempts after applying overrides.
           0 means apply overrides and run once without further retries.
-        constraints:
-          min_inclusive: 0
     required_capabilities: []
     execution:
       blocking: false
@@ -1997,22 +2260,26 @@ entries:
       max: 1
     parameters:
       - name: recovery_skill_id
-        type: string
+        schema:
+          type: string
         required: true
         description: Skill catalog ID to run as recovery action.
       - name: recovery_params
-        type: object
+        schema:
+          type: object
+          additional_properties: true
         required: false
         default: {}
         description: Parameters to pass to the recovery skill.
       - name: max_retries
-        type: int
+        schema:
+          type: int
+          constraints:
+            min_inclusive: 0
         required: false
         default: 1
         parameterizable: true
         description: Maximum retry attempts with recovery skill.
-        constraints:
-          min_inclusive: 0
     required_capabilities: []
     execution:
       blocking: false
@@ -2053,21 +2320,23 @@ entries:
       max: 0
     parameters:
       - name: model_endpoint_alias
-        type: string
+        schema:
+          type: string
         required: true
         ui_editor: deployment_model_endpoint_alias
         description: >-
           Deployment-configured model endpoint alias.
           Must match a key in deployment.model_endpoints.
       - name: prompt_template_id
-        type: string
+        schema:
+          type: string
         required: true
         ui_editor: deployment_prompt_template_id
         description: >-
           Deployment-side prompt template ID.
           Must match a key in deployment.prompt_templates.
       - name: template_variables
-        type: object
+        schema_ref: "#/schema_types/template_variable_map"
         required: false
         default: {}
         ui_editor: template_variable_map
@@ -2077,7 +2346,8 @@ entries:
           template text ({{var_name}}) are replaced with the current value of
           the referenced key or namespace field.
       - name: output_key_prefix
-        type: string
+        schema:
+          type: string
         required: true
         ui_editor: output_key_prefix_selector
         blackboard_role: namespace_writer
@@ -2087,26 +2357,29 @@ entries:
           The node publishes a single bundle at {prefix} with meta/status data
           under {prefix}.meta and the validated response under {prefix}.value.
       - name: timeout_s
-        type: float
+        schema:
+          type: float
+          constraints:
+            min_exclusive: 0.0
         required: false
         default: 30.0
         parameterizable: true
         description: Wall-clock timeout for the model call in seconds.
-        constraints:
-          min_exclusive: 0.0
       - name: min_confidence
-        type: float
+        schema:
+          type: float
+          constraints:
+            min_inclusive: 0.0
+            max_inclusive: 1.0
         required: false
         default: 0.0
         parameterizable: true
         description: >-
           Minimum confidence threshold. If the response confidence is below
           this threshold, the node returns FAILURE.
-        constraints:
-          min_inclusive: 0.0
-          max_inclusive: 1.0
       - name: retry_on_parse_failure
-        type: bool
+        schema:
+          type: bool
         required: false
         default: false
         parameterizable: true
@@ -2114,7 +2387,8 @@ entries:
           When true, allow at most one repair retry if the first model response
           cannot be parsed as the required structured output.
       - name: include_scene_snapshot
-        type: bool
+        schema:
+          type: bool
         required: false
         default: false
         description: >-
@@ -2122,36 +2396,40 @@ entries:
           model request as an image input. Requires a running HMI with at least
           one connected Viser client.
       - name: scene_snapshot_transport
-        type: enum
+        schema:
+          type: enum
+          values: [inline_data_url, http_url]
         required: false
         default: inline_data_url
-        enum_values: [inline_data_url, http_url]
         description: >-
           Transport used when attaching the scene snapshot to the model
           request. `inline_data_url` embeds the bytes directly in the request.
           `http_url` publishes the captured bytes under a temporary Composer URL
           and passes that URL to the model instead.
       - name: scene_snapshot_width
-        type: int
+        schema:
+          type: int
+          constraints:
+            min_inclusive: 64
+            max_inclusive: 1920
         required: false
         default: 640
         description: Render width in pixels when include_scene_snapshot=true.
-        constraints:
-          min_inclusive: 64
-          max_inclusive: 1920
       - name: scene_snapshot_height
-        type: int
+        schema:
+          type: int
+          constraints:
+            min_inclusive: 64
+            max_inclusive: 1080
         required: false
         default: 480
         description: Render height in pixels when include_scene_snapshot=true.
-        constraints:
-          min_inclusive: 64
-          max_inclusive: 1080
       - name: scene_snapshot_format
-        type: enum
+        schema:
+          type: enum
+          values: [jpeg, png]
         required: false
         default: jpeg
-        enum_values: [jpeg, png]
         description: Image format for the attached scene snapshot.
     required_capabilities: []
     execution:
@@ -2199,14 +2477,16 @@ entries:
       max: 0
     parameters:
       - name: selection_request_text
-        type: string
+        schema:
+          type: string
         required: true
         description: >-
           Human-authored selection request to resolve, for example "select the
           red object" or "select the sphere". This is authored as a literal
           string in the program.
       - name: output_key_prefix
-        type: string
+        schema:
+          type: string
         required: true
         ui_editor: output_key_prefix_selector
         blackboard_role: namespace_writer
@@ -2214,50 +2494,57 @@ entries:
         description: >-
           Blackboard prefix for the generated selection context.
       - name: object_source
-        type: enum
+        schema:
+          type: enum
+          values: [backend_scene]
         required: false
         default: backend_scene
-        enum_values: [backend_scene]
         description: >-
           Authoritative scene-object source. Initial implementation supports
           backend_scene only.
       - name: candidate_object_ids
-        type: string_list
+        schema:
+          type: array
+          items: string
         required: false
         default: []
         description: >-
           Optional explicit candidate object IDs. When omitted, all scene
           objects are exposed as candidates.
       - name: image_source
-        type: enum
+        schema:
+          type: enum
+          values: [none, hmi_snapshot]
         required: false
         default: none
-        enum_values: [none, hmi_snapshot]
         description: >-
           Optional auxiliary image source. When hmi_snapshot is used, the node
           verifies that an HMI render is available and records metadata for the
           prompt context.
       - name: image_snapshot_width
-        type: int
+        schema:
+          type: int
+          constraints:
+            min_inclusive: 64
+            max_inclusive: 1920
         required: false
         default: 640
         description: Render width in pixels when image_source=hmi_snapshot.
-        constraints:
-          min_inclusive: 64
-          max_inclusive: 1920
       - name: image_snapshot_height
-        type: int
+        schema:
+          type: int
+          constraints:
+            min_inclusive: 64
+            max_inclusive: 1080
         required: false
         default: 480
         description: Render height in pixels when image_source=hmi_snapshot.
-        constraints:
-          min_inclusive: 64
-          max_inclusive: 1080
       - name: image_snapshot_format
-        type: enum
+        schema:
+          type: enum
+          values: [jpeg, png]
         required: false
         default: jpeg
-        enum_values: [jpeg, png]
         description: Image format for the optional HMI snapshot metadata.
     required_capabilities: []
     execution:
@@ -2297,7 +2584,8 @@ entries:
       max: 0
     parameters:
       - name: selection_context_prefix
-        type: string
+        schema:
+          type: string
         required: true
         ui_editor: selection_context_prefix_selector
         blackboard_role: namespace_reader
@@ -2305,7 +2593,8 @@ entries:
         description: >-
           Blackboard prefix produced by build_scene_selection_context.
       - name: selection_response_prefix
-        type: string
+        schema:
+          type: string
         required: true
         ui_editor: selection_response_prefix_selector
         blackboard_role: namespace_reader
@@ -2313,14 +2602,16 @@ entries:
         description: >-
           Blackboard prefix produced by query_model for the selection response.
       - name: output_key_prefix
-        type: string
+        schema:
+          type: string
         required: true
         ui_editor: output_key_prefix_selector
         blackboard_role: namespace_writer
         blackboard_contract: validated_selection_v1
         description: Blackboard prefix for the validated selection result.
       - name: allow_no_match
-        type: bool
+        schema:
+          type: bool
         required: false
         default: false
         parameterizable: true
@@ -2328,7 +2619,8 @@ entries:
           When true, a valid no_match response is accepted. The node still
           writes the no_match outcome to the blackboard.
       - name: allow_ambiguous
-        type: bool
+        schema:
+          type: bool
         required: false
         default: false
         parameterizable: true
@@ -2375,7 +2667,8 @@ entries:
       max: 0
     parameters:
       - name: selected_object_id
-        type: string
+        schema:
+          type: string
         required: true
         ui_editor: string_or_blackboard_field_selector
         blackboard_role: field_reader
@@ -2384,7 +2677,8 @@ entries:
           Object ID to plan against. May be a literal ID or a declared
           blackboard field_ref.
       - name: output_key_prefix
-        type: string
+        schema:
+          type: string
         required: true
         ui_editor: output_key_prefix_selector
         blackboard_role: namespace_writer
@@ -2394,51 +2688,57 @@ entries:
           publishes the validated plan at {prefix}.value with status/meta data
           under {prefix}.meta.
       - name: object_source
-        type: enum
+        schema:
+          type: enum
+          values: [backend_scene]
         required: false
         default: backend_scene
-        enum_values: [backend_scene]
         description: >-
           Authoritative object snapshot source. Initial implementation supports
           backend_scene only.
       - name: image_source
-        type: enum
+        schema:
+          type: enum
+          values: [none, hmi_snapshot]
         required: false
         default: none
-        enum_values: [none, hmi_snapshot]
         description: >-
           Optional image-source hook kept for future perception-backed planning
           variants. The deterministic planner does not currently derive poses
           from the image.
       - name: image_snapshot_width
-        type: int
+        schema:
+          type: int
+          constraints:
+            min_inclusive: 64
+            max_inclusive: 1920
         required: false
         default: 640
         description: Render width in pixels when image_source=hmi_snapshot.
-        constraints:
-          min_inclusive: 64
-          max_inclusive: 1920
       - name: image_snapshot_height
-        type: int
+        schema:
+          type: int
+          constraints:
+            min_inclusive: 64
+            max_inclusive: 1080
         required: false
         default: 480
         description: Render height in pixels when image_source=hmi_snapshot.
-        constraints:
-          min_inclusive: 64
-          max_inclusive: 1080
       - name: image_snapshot_format
-        type: enum
+        schema:
+          type: enum
+          values: [jpeg, png]
         required: false
         default: jpeg
-        enum_values: [jpeg, png]
         description: Image format for the optional HMI snapshot.
       - name: tcp_frame
-        type: string
+        schema:
+          type: string
         required: false
         default: tool0
         description: Target TCP/tool frame for the planned pick.
       - name: pick_offset_envelope
-        type: dict
+        schema_ref: "#/schema_types/pose_offset_envelope"
         required: false
         ui_editor: pose_envelope
         default:
@@ -2450,7 +2750,7 @@ entries:
           Min/max XYZ and RPY offsets applied to the nominal grasp pose at the
           object top surface.
       - name: approach_offset_envelope
-        type: dict
+        schema_ref: "#/schema_types/pose_offset_envelope"
         required: false
         ui_editor: pose_envelope
         default:
@@ -2462,60 +2762,67 @@ entries:
           Min/max XYZ and RPY offsets applied to the nominal approach pose
           relative to the candidate pick pose.
       - name: search_strategy
-        type: enum
+        schema:
+          type: enum
+          values: [first_feasible_grid, best_cost_grid]
         required: false
         default: first_feasible_grid
-        enum_values: [first_feasible_grid, best_cost_grid]
         description: Deterministic candidate search policy.
       - name: translation_step_m
-        type: float
+        schema:
+          type: float
+          constraints:
+            min_exclusive: 0.0
         required: false
         default: 0.01
         parameterizable: true
         description: Grid step size for translational envelope sampling.
-        constraints:
-          min_exclusive: 0.0
       - name: rotation_step_deg
-        type: float
+        schema:
+          type: float
+          constraints:
+            min_exclusive: 0.0
         required: false
         default: 15.0
         parameterizable: true
         description: Grid step size for rotational envelope sampling.
-        constraints:
-          min_exclusive: 0.0
       - name: planning_timeout_s
-        type: float
+        schema:
+          type: float
+          constraints:
+            min_exclusive: 0.0
         required: false
         default: 2.0
         parameterizable: true
         description: Planning timeout per previewed motion leg.
-        constraints:
-          min_exclusive: 0.0
       - name: velocity_scale
-        type: float
+        schema:
+          type: float
+          constraints:
+            min_exclusive: 0.0
+            max_inclusive: 1.0
         required: false
         default: 0.35
         parameterizable: true
         description: Velocity scale used for motion previews.
-        constraints:
-          min_exclusive: 0.0
-          max_inclusive: 1.0
       - name: acceleration_scale
-        type: float
+        schema:
+          type: float
+          constraints:
+            min_exclusive: 0.0
+            max_inclusive: 1.0
         required: false
         default: 1.0
         parameterizable: true
         description: Acceleration scale used for motion previews.
-        constraints:
-          min_exclusive: 0.0
-          max_inclusive: 1.0
       - name: max_tcp_linear_speed_mps
-        type: float
+        schema:
+          type: float
+          constraints:
+            min_exclusive: 0.0
         required: false
         parameterizable: true
         description: Optional TCP speed cap enforced during preview validation.
-        constraints:
-          min_exclusive: 0.0
     required_capabilities:
       - planning.motion.pose_goal
       - planning.trajectory.time_parameterized

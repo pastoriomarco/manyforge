@@ -118,6 +118,15 @@ class SkillCatalog:
                 raise ValueError(
                     f"Missing required parameter '{parameter.name}' for skill '{skill_id}'"
                 )
+            if parameter.name in merged:
+                type_error = _validate_skill_param_type(
+                    parameter.type,
+                    merged[parameter.name],
+                )
+                if type_error is not None:
+                    raise ValueError(
+                        f"Parameter '{parameter.name}' for skill '{skill_id}' {type_error}"
+                    )
 
         return merged
 
@@ -203,6 +212,76 @@ def _parse_parameter(raw: dict[str, Any]) -> SkillParameter:
         default=raw.get("default"),
         description=raw.get("description", ""),
     )
+
+
+def _is_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _number_list_error(value: Any, *, expected_len: int | None = None) -> str | None:
+    if not isinstance(value, list) or not all(_is_number(item) for item in value):
+        return "must be a list of numeric values"
+    if expected_len is not None and len(value) != expected_len:
+        return f"must contain exactly {expected_len} numeric values"
+    return None
+
+
+def _validate_skill_pose(value: Any) -> str | None:
+    if not isinstance(value, dict):
+        return f"must be a pose mapping, got {type(value).__name__}"
+    if "position_m" not in value:
+        return "must include position_m"
+    position_error = _number_list_error(value.get("position_m"), expected_len=3)
+    if position_error is not None:
+        return f"position_m {position_error}"
+    has_xyzw = "orientation_xyzw" in value
+    has_rpy = "orientation_rpy_deg" in value
+    if has_xyzw == has_rpy:
+        return "must include exactly one of orientation_xyzw or orientation_rpy_deg"
+    if has_xyzw:
+        orientation_error = _number_list_error(value.get("orientation_xyzw"), expected_len=4)
+        if orientation_error is not None:
+            return f"orientation_xyzw {orientation_error}"
+    if has_rpy:
+        orientation_error = _number_list_error(value.get("orientation_rpy_deg"), expected_len=3)
+        if orientation_error is not None:
+            return f"orientation_rpy_deg {orientation_error}"
+    frame_id = value.get("frame_id")
+    if frame_id is not None and not isinstance(frame_id, str):
+        return "frame_id must be a string when provided"
+    return None
+
+
+def _validate_skill_param_type(param_type: str, value: Any) -> str | None:
+    if param_type == "string":
+        if not isinstance(value, str):
+            return f"must be a string, got {type(value).__name__}"
+        return None
+    if param_type == "float":
+        if not _is_number(value):
+            return f"must be a number, got {type(value).__name__}"
+        return None
+    if param_type == "int":
+        if not isinstance(value, int) or isinstance(value, bool):
+            return f"must be an integer, got {type(value).__name__}"
+        return None
+    if param_type == "bool":
+        if not isinstance(value, bool):
+            return f"must be a boolean, got {type(value).__name__}"
+        return None
+    if param_type == "pose":
+        return _validate_skill_pose(value)
+    if param_type == "float_list":
+        return _number_list_error(value)
+    if param_type == "string_list":
+        if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+            return "must be a list of strings"
+        return None
+    if param_type in {"dict", "object"}:
+        if not isinstance(value, dict):
+            return f"must be a mapping, got {type(value).__name__}"
+        return None
+    return None
 
 
 def _validate_requires_capabilities(value: Any, path_name: str) -> list[str]:

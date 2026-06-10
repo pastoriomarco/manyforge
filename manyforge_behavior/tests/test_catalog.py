@@ -11,6 +11,8 @@ from manyforge_behavior.catalog import (
     CatalogValidationError,
     NodeCatalog,
 )
+from manyforge_behavior.catalog_schema import validate_value
+from manyforge_behavior.catalog_schema import CatalogSchemaRegistry, parse_schema
 
 CATALOG_PATH = Path(__file__).parent.parent / "resources" / "node_catalog.yaml"
 
@@ -19,7 +21,13 @@ class TestCatalogLoading:
     def test_loads_shipped_catalog(self):
         catalog = NodeCatalog(CATALOG_PATH)
         assert len(catalog.entries) > 0
-        assert catalog.version == "0.1.0"
+        assert catalog.version == "0.2.0"
+        assert catalog.api_version == "manyforge.node_catalog.v1"
+        assert all(
+            param.schema is not None
+            for entry in catalog.entries
+            for param in entry.parameters
+        )
 
     def test_all_entries_have_ids(self):
         catalog = NodeCatalog(CATALOG_PATH)
@@ -70,6 +78,26 @@ class TestCatalogLoading:
         assert set_key.bb_reader_params == []
         assert check_pose.bb_reader_params == ["pose_key_a", "pose_key_b"]
         assert check_pose.bb_writer_params == []
+
+    def test_shipped_catalog_open_object_params_are_intentional(self):
+        catalog = NodeCatalog(CATALOG_PATH)
+        open_params = []
+        for entry in catalog.entries:
+            for param in entry.parameters:
+                if param.schema is None:
+                    continue
+                resolved = catalog.schema_registry.resolve(param.schema)
+                if (
+                    resolved.schema_type == "object"
+                    and resolved.additional_properties is True
+                    and resolved.additional_property_schema is None
+                ):
+                    open_params.append(f"{entry.id}.{param.name}")
+
+        assert open_params == [
+            "fallback_override_node.fallback_params",
+            "recovery_skill_node.recovery_params",
+        ]
 
     def test_interrupt_metadata_loaded_for_shipped_entries(self):
         catalog = NodeCatalog(CATALOG_PATH)
@@ -123,9 +151,307 @@ class TestCatalogValidation:
         f.close()
         return f.name
 
+    def _minimal_v1_catalog(self) -> dict:
+        return {
+            "api_version": "manyforge.node_catalog.v1",
+            "catalog_version": "0.2.0",
+            "schema_types": {
+                "stored_pose": {
+                    "type": "object",
+                    "additional_properties": False,
+                    "required": ["frame_id", "position_m"],
+                    "properties": {
+                        "frame_id": {"type": "string"},
+                        "position_m": {"type": "array", "items": "float", "length": 3},
+                        "orientation_xyzw": {"type": "array", "items": "float", "length": 4},
+                        "orientation_rpy_deg": {"type": "array", "items": "float", "length": 3},
+                    },
+                    "exactly_one": [["orientation_xyzw", "orientation_rpy_deg"]],
+                },
+                "shape": {
+                    "type": "object",
+                    "additional_properties": False,
+                    "required": ["type"],
+                    "properties": {
+                        "type": {"type": "enum", "values": ["box", "sphere"]},
+                        "box_dimensions_m": {
+                            "type": "array",
+                            "items": "float",
+                            "length": 3,
+                            "required_when": {"type": "box"},
+                            "allowed_when": {"type": "box"},
+                        },
+                        "sphere_radius_m": {
+                            "type": "float",
+                            "constraints": {"min_exclusive": 0.0},
+                            "required_when": {"type": "sphere"},
+                            "allowed_when": {"type": "sphere"},
+                        },
+                    },
+                },
+            },
+            "entries": [
+                {
+                    "id": "upsert_collision_object",
+                    "name": "UpsertCollisionObject",
+                    "kind": "leaf",
+                    "children": {"min": 0, "max": 0},
+                    "parameters": [
+                        {
+                            "name": "object_id",
+                            "required": True,
+                            "schema": {"type": "string"},
+                        },
+                        {
+                            "name": "pose",
+                            "required": True,
+                            "schema_ref": "#/schema_types/stored_pose",
+                            "ui_editor": "pose",
+                        },
+                        {
+                            "name": "shape",
+                            "required": True,
+                            "schema_ref": "#/schema_types/shape",
+                            "ui_editor": "shape",
+                        },
+                    ],
+                    "runners": {"py_trees": {"implementation_kind": "plugin"}},
+                },
+            ],
+        }
+
+    def test_loads_v1_schema_catalog_and_derives_legacy_labels(self):
+        path = self._write_catalog(self._minimal_v1_catalog())
+        try:
+            catalog = NodeCatalog(path)
+            assert catalog.api_version == "manyforge.node_catalog.v1"
+            assert catalog.version == "0.2.0"
+            entry = catalog.get("upsert_collision_object")
+            pose_param = next(param for param in entry.parameters if param.name == "pose")
+            shape_param = next(param for param in entry.parameters if param.name == "shape")
+            assert pose_param.schema is not None
+            assert pose_param.type == "dict"
+            assert shape_param.type == "dict"
+            projected = catalog.schema_registry.to_json_schema(shape_param.schema)
+            assert projected["type"] == "object"
+            assert projected["additionalProperties"] is False
+            assert "allOf" in projected
+        finally:
+            os.unlink(path)
+
+    def test_v1_rejects_legacy_parameter_keys(self):
+        data = self._minimal_v1_catalog()
+        data["entries"][0]["parameters"][0]["type"] = "string"
+        path = self._write_catalog(data)
+        try:
+            with pytest.raises(CatalogValidationError, match="remove legacy keys"):
+                NodeCatalog(path)
+        finally:
+            os.unlink(path)
+
+    def test_rejects_non_boolean_required_flag(self):
+        data = self._minimal_v1_catalog()
+        data["entries"][0]["parameters"][0]["required"] = "false - stray"
+        path = self._write_catalog(data)
+        try:
+            with pytest.raises(CatalogValidationError, match="required must be a boolean"):
+                NodeCatalog(path)
+        finally:
+            os.unlink(path)
+
+    def test_schema_hash_preserves_description_property_name(self):
+        registry = CatalogSchemaRegistry()
+        empty_schema = parse_schema(
+            {
+                "type": "object",
+                "additional_properties": False,
+                "properties": {},
+            },
+            path="empty",
+        )
+        description_string_schema = parse_schema(
+            {
+                "type": "object",
+                "additional_properties": False,
+                "properties": {
+                    "description": {"type": "string", "description": "prose"},
+                },
+            },
+            path="with_description",
+        )
+        description_int_schema = parse_schema(
+            {
+                "type": "object",
+                "additional_properties": False,
+                "properties": {
+                    "description": {"type": "int", "description": "prose"},
+                },
+            },
+            path="with_description",
+        )
+
+        assert registry.schema_hash(empty_schema) != registry.schema_hash(
+            description_string_schema
+        )
+        assert registry.schema_hash(description_string_schema) != registry.schema_hash(
+            description_int_schema
+        )
+
+    def test_v1_schema_validator_rejects_unknown_and_missing_pose_fields(self):
+        path = self._write_catalog(self._minimal_v1_catalog())
+        try:
+            catalog = NodeCatalog(path)
+            pose_schema = catalog.get("upsert_collision_object").parameters[1].schema
+            assert pose_schema is not None
+            issues = validate_value(
+                pose_schema,
+                {
+                    "frame_id": "base_link",
+                    "position_m": [0.0, 0.0, 0.0],
+                    "unexpected": True,
+                },
+                registry=catalog.schema_registry,
+                path="params.pose",
+            )
+            messages = [issue.message for issue in issues]
+            assert any("unknown fields" in message for message in messages)
+            assert any("exactly one" in message for message in messages)
+        finally:
+            os.unlink(path)
+
+    def test_v1_requires_parameter_schema(self):
+        data = self._minimal_v1_catalog()
+        del data["entries"][0]["parameters"][0]["schema"]
+        path = self._write_catalog(data)
+        try:
+            with pytest.raises(CatalogValidationError, match="v1 parameters require schema"):
+                NodeCatalog(path)
+        finally:
+            os.unlink(path)
+
+    def test_v1_rejects_invalid_schema_ref(self):
+        data = self._minimal_v1_catalog()
+        data["entries"][0]["parameters"][1]["schema_ref"] = "#/schema_types/missing"
+        path = self._write_catalog(data)
+        try:
+            with pytest.raises(CatalogValidationError, match="Unknown schema reference"):
+                NodeCatalog(path)
+        finally:
+            os.unlink(path)
+
+    def test_v1_rejects_invalid_schema_default(self):
+        data = self._minimal_v1_catalog()
+        data["entries"][0]["parameters"][0]["default"] = 123
+        path = self._write_catalog(data)
+        try:
+            with pytest.raises(CatalogValidationError, match="default.*must be a string"):
+                NodeCatalog(path)
+        finally:
+            os.unlink(path)
+
+    def test_v1_rejects_unknown_schema_keys(self):
+        data = self._minimal_v1_catalog()
+        data["schema_types"]["stored_pose"]["additionalProperties"] = False
+        path = self._write_catalog(data)
+        try:
+            with pytest.raises(CatalogValidationError, match="unsupported schema keys"):
+                NodeCatalog(path)
+        finally:
+            os.unlink(path)
+
+    def test_v1_rejects_invalid_allowed_when_ref(self):
+        data = self._minimal_v1_catalog()
+        data["schema_types"]["shape"]["properties"]["sphere_radius_m"]["allowed_when"] = {
+            "missing": "sphere",
+        }
+        path = self._write_catalog(data)
+        try:
+            with pytest.raises(CatalogValidationError, match="allowed_when references unknown field"):
+                NodeCatalog(path)
+        finally:
+            os.unlink(path)
+
+    def test_v1_schema_validator_rejects_disallowed_conditional_fields(self):
+        path = self._write_catalog(self._minimal_v1_catalog())
+        try:
+            catalog = NodeCatalog(path)
+            shape_schema = catalog.get("upsert_collision_object").parameters[2].schema
+            assert shape_schema is not None
+            issues = validate_value(
+                shape_schema,
+                {
+                    "type": "box",
+                    "box_dimensions_m": [0.1, 0.2, 0.3],
+                    "sphere_radius_m": 0.05,
+                },
+                registry=catalog.schema_registry,
+                path="params.shape",
+            )
+            assert any(
+                issue.path == "params.shape.sphere_radius_m"
+                and "only allowed when type=sphere" in issue.message
+                for issue in issues
+            )
+            projected = catalog.schema_registry.to_json_schema(shape_schema)
+            assert any(
+                branch.get("then") == {"not": {"required": ["sphere_radius_m"]}}
+                for branch in projected.get("allOf", [])
+            )
+        finally:
+            os.unlink(path)
+
+    def test_v1_schema_validator_checks_additional_property_schema(self):
+        data = self._minimal_v1_catalog()
+        data["entries"][0]["parameters"].append(
+            {
+                "name": "per_joint_limits",
+                "required": False,
+                "schema": {
+                    "type": "object",
+                    "additional_properties": {
+                        "type": "float",
+                        "constraints": {"min_exclusive": 0.0},
+                    },
+                },
+            }
+        )
+        path = self._write_catalog(data)
+        try:
+            catalog = NodeCatalog(path)
+            schema = catalog.get("upsert_collision_object").parameters[3].schema
+            assert schema is not None
+            issues = validate_value(
+                schema,
+                {"joint_1": 1.0, "joint_2": -0.1},
+                registry=catalog.schema_registry,
+                path="params.per_joint_limits",
+            )
+            assert any(
+                issue.path == "params.per_joint_limits.joint_2"
+                and "must be > 0.0" in issue.message
+                for issue in issues
+            )
+            projected = catalog.schema_registry.to_json_schema(schema)
+            assert projected["additionalProperties"] == {
+                "type": "number",
+                "exclusiveMinimum": 0.0,
+            }
+        finally:
+            os.unlink(path)
+
     def test_rejects_bad_api_version(self):
         path = self._write_catalog({
             "api_version": "wrong.version",
+            "catalog_version": "0.2.0",
+            "entries": [],
+        })
+        with pytest.raises(CatalogValidationError, match="api_version"):
+            NodeCatalog(path)
+        os.unlink(path)
+
+    def test_rejects_v0_runtime_catalog(self):
+        path = self._write_catalog({
+            "api_version": "manyforge.node_catalog.v0",
             "catalog_version": "0.1.0",
             "entries": [],
         })
@@ -135,7 +461,7 @@ class TestCatalogValidation:
 
     def test_rejects_bad_catalog_version(self):
         path = self._write_catalog({
-            "api_version": "manyforge.node_catalog.v0",
+            "api_version": "manyforge.node_catalog.v1",
             "catalog_version": "not-semver",
             "entries": [],
         })
@@ -145,8 +471,8 @@ class TestCatalogValidation:
 
     def test_rejects_duplicate_ids(self):
         path = self._write_catalog({
-            "api_version": "manyforge.node_catalog.v0",
-            "catalog_version": "0.1.0",
+            "api_version": "manyforge.node_catalog.v1",
+            "catalog_version": "0.2.0",
             "entries": [
                 {
                     "id": "dup",
@@ -170,8 +496,8 @@ class TestCatalogValidation:
 
     def test_rejects_leaf_with_children(self):
         path = self._write_catalog({
-            "api_version": "manyforge.node_catalog.v0",
-            "catalog_version": "0.1.0",
+            "api_version": "manyforge.node_catalog.v1",
+            "catalog_version": "0.2.0",
             "entries": [
                 {
                     "id": "bad_leaf",
@@ -188,8 +514,8 @@ class TestCatalogValidation:
 
     def test_rejects_decorator_wrong_children(self):
         path = self._write_catalog({
-            "api_version": "manyforge.node_catalog.v0",
-            "catalog_version": "0.1.0",
+            "api_version": "manyforge.node_catalog.v1",
+            "catalog_version": "0.2.0",
             "entries": [
                 {
                     "id": "bad_dec",
@@ -206,8 +532,8 @@ class TestCatalogValidation:
 
     def test_rejects_enum_without_values(self):
         path = self._write_catalog({
-            "api_version": "manyforge.node_catalog.v0",
-            "catalog_version": "0.1.0",
+            "api_version": "manyforge.node_catalog.v1",
+            "catalog_version": "0.2.0",
             "entries": [
                 {
                     "id": "bad_enum",
@@ -215,7 +541,7 @@ class TestCatalogValidation:
                     "kind": "leaf",
                     "children": {"min": 0, "max": 0},
                     "parameters": [
-                        {"name": "mode", "type": "enum", "required": True},
+                        {"name": "mode", "schema": {"type": "enum"}, "required": True},
                     ],
                     "runners": {"py_trees": {"implementation_kind": "plugin"}},
                 },
@@ -227,8 +553,8 @@ class TestCatalogValidation:
 
     def test_derives_enum_values_from_enum_options(self):
         path = self._write_catalog({
-            "api_version": "manyforge.node_catalog.v0",
-            "catalog_version": "0.1.0",
+            "api_version": "manyforge.node_catalog.v1",
+            "catalog_version": "0.2.0",
             "entries": [
                 {
                     "id": "enum_options_node",
@@ -238,7 +564,7 @@ class TestCatalogValidation:
                     "parameters": [
                         {
                             "name": "mode",
-                            "type": "enum",
+                            "schema": {"type": "enum", "values": ["a", "b"]},
                             "required": True,
                             "enum_options": [
                                 {"value": "a"},
@@ -260,8 +586,8 @@ class TestCatalogValidation:
 
     def test_rejects_enum_values_that_do_not_match_enum_options(self):
         path = self._write_catalog({
-            "api_version": "manyforge.node_catalog.v0",
-            "catalog_version": "0.1.0",
+            "api_version": "manyforge.node_catalog.v1",
+            "catalog_version": "0.2.0",
             "entries": [
                 {
                     "id": "bad_enum_options",
@@ -271,9 +597,8 @@ class TestCatalogValidation:
                     "parameters": [
                         {
                             "name": "mode",
-                            "type": "enum",
+                            "schema": {"type": "enum", "values": ["a", "b"]},
                             "required": True,
-                            "enum_values": ["a", "b"],
                             "enum_options": [{"value": "a"}, {"value": "c"}],
                         },
                     ],
@@ -281,14 +606,14 @@ class TestCatalogValidation:
                 },
             ],
         })
-        with pytest.raises(CatalogValidationError, match="enum_values must match"):
+        with pytest.raises(CatalogValidationError, match="enum_options values must match"):
             NodeCatalog(path)
         os.unlink(path)
 
     def test_rejects_duplicate_enum_options(self):
         path = self._write_catalog({
-            "api_version": "manyforge.node_catalog.v0",
-            "catalog_version": "0.1.0",
+            "api_version": "manyforge.node_catalog.v1",
+            "catalog_version": "0.2.0",
             "entries": [
                 {
                     "id": "bad_duplicate_enum_options",
@@ -298,7 +623,7 @@ class TestCatalogValidation:
                     "parameters": [
                         {
                             "name": "mode",
-                            "type": "enum",
+                            "schema": {"type": "enum", "values": ["a", "b"]},
                             "required": True,
                             "enum_options": [{"value": "a"}, {"value": "a"}],
                         },
@@ -307,14 +632,14 @@ class TestCatalogValidation:
                 },
             ],
         })
-        with pytest.raises(CatalogValidationError, match="duplicate"):
+        with pytest.raises(CatalogValidationError, match="enum_options values must match"):
             NodeCatalog(path)
         os.unlink(path)
 
     def test_rejects_unknown_enum_option_required_capability(self):
         path = self._write_catalog({
-            "api_version": "manyforge.node_catalog.v0",
-            "catalog_version": "0.1.0",
+            "api_version": "manyforge.node_catalog.v1",
+            "catalog_version": "0.2.0",
             "entries": [
                 {
                     "id": "bad_enum_option_capability",
@@ -324,7 +649,7 @@ class TestCatalogValidation:
                     "parameters": [
                         {
                             "name": "mode",
-                            "type": "enum",
+                            "schema": {"type": "enum", "values": ["a"]},
                             "required": True,
                             "enum_options": [
                                 {
@@ -344,8 +669,8 @@ class TestCatalogValidation:
 
     def test_rejects_visible_when_unknown_parameter(self):
         path = self._write_catalog({
-            "api_version": "manyforge.node_catalog.v0",
-            "catalog_version": "0.1.0",
+            "api_version": "manyforge.node_catalog.v1",
+            "catalog_version": "0.2.0",
             "entries": [
                 {
                     "id": "bad_visible_when",
@@ -355,7 +680,7 @@ class TestCatalogValidation:
                     "parameters": [
                         {
                             "name": "value",
-                            "type": "string",
+                            "schema": {"type": "string"},
                             "required": False,
                             "visible_when": {"param": "missing", "equals": "x"},
                         },
@@ -370,8 +695,8 @@ class TestCatalogValidation:
 
     def test_rejects_missing_py_trees_runner(self):
         path = self._write_catalog({
-            "api_version": "manyforge.node_catalog.v0",
-            "catalog_version": "0.1.0",
+            "api_version": "manyforge.node_catalog.v1",
+            "catalog_version": "0.2.0",
             "entries": [
                 {
                     "id": "no_runner",
@@ -388,8 +713,8 @@ class TestCatalogValidation:
 
     def test_rejects_unknown_required_capability(self):
         path = self._write_catalog({
-            "api_version": "manyforge.node_catalog.v0",
-            "catalog_version": "0.1.0",
+            "api_version": "manyforge.node_catalog.v1",
+            "catalog_version": "0.2.0",
             "entries": [
                 {
                     "id": "bad_capability",
@@ -407,8 +732,8 @@ class TestCatalogValidation:
 
     def test_rejects_unknown_stability(self):
         path = self._write_catalog({
-            "api_version": "manyforge.node_catalog.v0",
-            "catalog_version": "0.1.0",
+            "api_version": "manyforge.node_catalog.v1",
+            "catalog_version": "0.2.0",
             "entries": [
                 {
                     "id": "bad_stability",
@@ -426,8 +751,8 @@ class TestCatalogValidation:
 
     def test_rejects_blackboard_metadata_for_unknown_parameter(self):
         path = self._write_catalog({
-            "api_version": "manyforge.node_catalog.v0",
-            "catalog_version": "0.1.0",
+            "api_version": "manyforge.node_catalog.v1",
+            "catalog_version": "0.2.0",
             "entries": [
                 {
                     "id": "bb_bad",
@@ -435,7 +760,7 @@ class TestCatalogValidation:
                     "kind": "leaf",
                     "children": {"min": 0, "max": 0},
                     "parameters": [
-                        {"name": "known", "type": "string", "required": True},
+                        {"name": "known", "schema": {"type": "string"}, "required": True},
                     ],
                     "bb_reader_params": ["missing"],
                     "runners": {"py_trees": {"implementation_kind": "plugin"}},
@@ -448,8 +773,8 @@ class TestCatalogValidation:
 
     def test_rejects_duplicate_blackboard_metadata_names(self):
         path = self._write_catalog({
-            "api_version": "manyforge.node_catalog.v0",
-            "catalog_version": "0.1.0",
+            "api_version": "manyforge.node_catalog.v1",
+            "catalog_version": "0.2.0",
             "entries": [
                 {
                     "id": "bb_dup",
@@ -457,7 +782,7 @@ class TestCatalogValidation:
                     "kind": "leaf",
                     "children": {"min": 0, "max": 0},
                     "parameters": [
-                        {"name": "key", "type": "string", "required": True},
+                        {"name": "key", "schema": {"type": "string"}, "required": True},
                     ],
                     "bb_writer_params": ["key", "key"],
                     "runners": {"py_trees": {"implementation_kind": "plugin"}},
@@ -470,8 +795,8 @@ class TestCatalogValidation:
 
     def test_rejects_default_interrupt_scope_without_interruptible(self):
         path = self._write_catalog({
-            "api_version": "manyforge.node_catalog.v0",
-            "catalog_version": "0.1.0",
+            "api_version": "manyforge.node_catalog.v1",
+            "catalog_version": "0.2.0",
             "entries": [
                 {
                     "id": "interrupt_bad",

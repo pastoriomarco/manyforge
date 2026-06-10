@@ -1295,6 +1295,7 @@ async def _execute_callback_tool(
     conversation_id: str | None,
     assistant_mode: str,
     catalog_hash: str,
+    input_schema_hash: str | None = None,
     tool_id: str,
     arguments: dict[str, Any],
     effect: str,
@@ -1311,6 +1312,8 @@ async def _execute_callback_tool(
         "catalogHash": catalog_hash,
         "arguments": arguments,
     }
+    if input_schema_hash:
+        body["inputSchemaHash"] = input_schema_hash
     try:
         async with httpx.AsyncClient(timeout=CALLBACK_TIMEOUT_S) as client:
             resp = await client.post(url, json=body)
@@ -2372,11 +2375,16 @@ async def assistant(request: Request) -> JSONResponse:
             messages.append(assistant_msg)
             for call in callback_calls:
                 _raise_if_cancelled(request_id)
+                tool_entry = bindings.tool_by_id.get(call.canonical_name, {})
+                input_schema_hash = tool_entry.get("inputSchemaHash")
+                if not isinstance(input_schema_hash, str) or not input_schema_hash:
+                    input_schema_hash = None
                 result = await _execute_callback_tool(
                     request_id=request_id,
                     conversation_id=conversation_id,
                     assistant_mode=assistant_mode,
                     catalog_hash=catalog_hash,
+                    input_schema_hash=input_schema_hash,
                     tool_id=call.canonical_name,
                     arguments=call.arguments,
                     effect=call.effect,
@@ -2404,6 +2412,7 @@ async def assistant(request: Request) -> JSONResponse:
                     "success": bool(result.get("success") is not False and not _per_call_err),
                     "error": (_per_call_err or "")[:600],
                     "draftMutated": bool(result.get("draftMutated")),
+                    "inputSchemaHash": input_schema_hash,
                     **response_meta,
                 })
                 if result.get("draftMutated") is True:

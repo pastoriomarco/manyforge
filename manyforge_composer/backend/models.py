@@ -93,6 +93,8 @@ class CatalogParameterResponse(BaseModel):
     blackboard_role: Optional[str] = Field(default=None, alias="blackboardRole")
     blackboard_contract: Optional[str] = Field(default=None, alias="blackboardContract")
     blackboard_value_type: Optional[str] = Field(default=None, alias="blackboardValueType")
+    schema: Optional[Dict[str, Any]] = None
+    schema_hash: Optional[str] = Field(default=None, alias="schemaHash")
     description: str = ""
 
 
@@ -1555,6 +1557,7 @@ class AssistantChatRequest(BaseModel):
     assistant_mode: Optional[str] = Field(default=None, alias="assistantMode")
     context: Dict[str, Any] = Field(default_factory=dict)
     requested_tools: List[str] = Field(default_factory=list, alias="requestedTools")
+    field_policy: Dict[str, Any] = Field(default_factory=dict, alias="fieldPolicy")
 
     @model_validator(mode="after")
     def _validate_message(self) -> "AssistantChatRequest":
@@ -1679,12 +1682,14 @@ class AssistantBridgeToolRequest(BaseModel):
     conversation_id: Optional[str] = Field(default=None, alias="conversationId")
     assistant_mode: str = Field(alias="assistantMode", min_length=1)
     catalog_hash: str = Field(alias="catalogHash", min_length=1)
+    input_schema_hash: Optional[str] = Field(default=None, alias="inputSchemaHash")
     # Sent by the OpenClaw MCP wrapper (see manyforge-mcp-bridge.py
     # `envelope = {... "principal": PRINCIPAL ...}`) so the live
     # tool-call streaming layer in routes_assistant.py can correlate
     # tool calls back to the in-flight chat. Optional: the in-process
     # direct-lane bridge does not always set it.
     principal: Optional[str] = None
+    field_policy: Dict[str, Any] = Field(default_factory=dict, alias="fieldPolicy")
     arguments: Dict[str, Any] = Field(default_factory=dict)
 
 
@@ -1696,6 +1701,7 @@ class AssistantBridgeToolResponse(BaseModel):
     error: Optional[str] = None
     mutated: bool = False
     draft_mutated: bool = Field(default=False, alias="draftMutated")
+    input_schema_hash: Optional[str] = Field(default=None, alias="inputSchemaHash")
     timestamp_ns: int = Field(alias="timestampNs")
 
 

@@ -159,9 +159,13 @@ function buildDefaultNodeParams(
   }
 
   if (catalogId === 'add_collision_object' || catalogId === 'upsert_collision_object') {
-    defaults.shape_type = typeof defaults.shape_type === 'string' ? defaults.shape_type : 'box';
-    if (!Array.isArray(defaults.box_dimensions_m) || defaults.box_dimensions_m.length !== 3) {
-      defaults.box_dimensions_m = [0.1, 0.1, 0.1];
+    if (
+      defaults.shape === undefined
+      || defaults.shape === null
+      || typeof defaults.shape !== 'object'
+      || Array.isArray(defaults.shape)
+    ) {
+      defaults.shape = { type: 'box', box_dimensions_m: [0.1, 0.1, 0.1] };
     }
     if (
       defaults.pose === undefined
@@ -170,13 +174,11 @@ function buildDefaultNodeParams(
       || Array.isArray(defaults.pose)
     ) {
       defaults.pose = {
+        frame_id: 'universe',
         position_m: [0, 0, 0],
         orientation_rpy_deg: [0, 0, 0],
       };
     }
-    defaults.frame_id = typeof defaults.frame_id === 'string' && defaults.frame_id.trim()
-      ? defaults.frame_id
-      : 'universe';
   }
 
   if (catalogId === 'update_collision_object_pose') {

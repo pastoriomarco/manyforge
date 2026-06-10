@@ -2,7 +2,606 @@
 from __future__ import annotations
 
 import copy
+import hashlib
+import json
 from typing import Any
+
+
+def _strip_schema_descriptions(value: Any, *, in_properties_map: bool = False) -> Any:
+    """Deep-copy with schema prose annotations removed.
+
+    ``description`` is also a valid property name under JSON Schema
+    ``properties``. Keep those field names structural while excluding only the
+    annotation keyword from schema objects.
+    """
+    if isinstance(value, dict):
+        if in_properties_map:
+            return {
+                property_name: _strip_schema_descriptions(property_schema)
+                for property_name, property_schema in value.items()
+            }
+        result: dict[str, Any] = {}
+        for key, item in value.items():
+            if key == "description":
+                continue
+            result[key] = _strip_schema_descriptions(
+                item,
+                in_properties_map=key in {"properties", "$defs", "definitions"},
+            )
+        return result
+    if isinstance(value, list):
+        return [_strip_schema_descriptions(v) for v in value]
+    return value
+
+
+def _stable_schema_hash(schema: dict[str, Any]) -> str:
+    # Structural hash only — prose descriptions excluded so a docs-only schema
+    # edit does not invalidate in-flight bridge callbacks that gate on
+    # inputSchemaHash (ADR-0023 §6).
+    payload = json.dumps(
+        _strip_schema_descriptions(schema), sort_keys=True, separators=(",", ":")
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+_ORIENTATION_FIELD_KEYS = {
+    "orientation_xyzw",
+    "orientation_rpy_deg",
+    "rotate_local_rpy_deg",
+    "rotate_world_rpy_deg",
+    "rpy_delta_deg",
+    "orientation_from",
+}
+
+
+def _allowed_orientation_fields(field_policy: dict[str, Any] | None) -> set[str] | None:
+    if not field_policy:
+        return None
+    raw = field_policy.get("allowedOrientationFields")
+    if raw is None:
+        raw = field_policy.get("orientationFields")
+    if raw is None:
+        return None
+    if not isinstance(raw, list):
+        return set()
+    return {
+        item
+        for item in raw
+        if isinstance(item, str) and item in _ORIENTATION_FIELD_KEYS
+    }
+
+
+def _schema_depends_only_on_disallowed_orientation(
+    schema: dict[str, Any],
+    disallowed: set[str],
+) -> bool:
+    required = schema.get("required")
+    if isinstance(required, list) and required:
+        return all(item in disallowed for item in required if isinstance(item, str))
+    return False
+
+
+def _narrow_schema_for_field_policy(
+    schema: dict[str, Any],
+    field_policy: dict[str, Any] | None,
+) -> dict[str, Any]:
+    allowed_orientation = _allowed_orientation_fields(field_policy)
+    if allowed_orientation is None:
+        return copy.deepcopy(schema)
+    disallowed_orientation = _ORIENTATION_FIELD_KEYS - allowed_orientation
+
+    def narrow(value: Any) -> Any:
+        if isinstance(value, list):
+            narrowed_items = []
+            for item in value:
+                if (
+                    isinstance(item, dict)
+                    and _schema_depends_only_on_disallowed_orientation(
+                        item,
+                        disallowed_orientation,
+                    )
+                ):
+                    continue
+                narrowed_item = narrow(item)
+                if (
+                    isinstance(narrowed_item, dict)
+                    and _schema_depends_only_on_disallowed_orientation(
+                        narrowed_item,
+                        disallowed_orientation,
+                    )
+                ):
+                    continue
+                narrowed_items.append(narrowed_item)
+            return narrowed_items
+        if not isinstance(value, dict):
+            return copy.deepcopy(value)
+
+        result: dict[str, Any] = {}
+        for key, item in value.items():
+            if key == "properties" and isinstance(item, dict):
+                result[key] = {
+                    prop_name: narrow(prop_schema)
+                    for prop_name, prop_schema in item.items()
+                    if prop_name not in disallowed_orientation
+                }
+                continue
+            if key == "required" and isinstance(item, list):
+                result[key] = [
+                    required_name
+                    for required_name in item
+                    if required_name not in disallowed_orientation
+                ]
+                continue
+            result[key] = narrow(item)
+        return result
+
+    return narrow(schema)
+
+
+def _with_description(schema: dict[str, Any], description: str | None) -> dict[str, Any]:
+    if description and "description" not in schema:
+        schema = copy.deepcopy(schema)
+        schema["description"] = description
+    return schema
+
+
+def _legacy_param_json_schema(param: Any) -> dict[str, Any]:
+    param_type = getattr(param, "type", "dict")
+    if param_type == "string":
+        schema: dict[str, Any] = {"type": "string"}
+    elif param_type == "float":
+        schema = {"type": "number"}
+    elif param_type == "int":
+        schema = {"type": "integer"}
+    elif param_type == "bool":
+        schema = {"type": "boolean"}
+    elif param_type == "enum":
+        schema = {"type": "string", "enum": list(getattr(param, "enum_values", []) or [])}
+    elif param_type == "float_list":
+        schema = {"type": "array", "items": {"type": "number"}}
+    elif param_type == "string_list":
+        schema = {"type": "array", "items": {"type": "string"}}
+    elif param_type == "pose":
+        schema = {
+            "type": "object",
+            "additionalProperties": True,
+            "properties": copy.deepcopy(_SCENE_RESOURCE_SCHEMA["properties"]["pose"]["properties"]),
+        }
+    elif param_type == "dict":
+        schema = {"type": "object", "additionalProperties": True}
+    else:
+        schema = {}
+
+    constraints = getattr(param, "constraints", {}) or {}
+    if param_type in {"float", "int"} and isinstance(constraints, dict):
+        if "min_inclusive" in constraints:
+            schema["minimum"] = constraints["min_inclusive"]
+        if "max_inclusive" in constraints:
+            schema["maximum"] = constraints["max_inclusive"]
+        if "min_exclusive" in constraints:
+            schema["exclusiveMinimum"] = constraints["min_exclusive"]
+        if "max_exclusive" in constraints:
+            schema["exclusiveMaximum"] = constraints["max_exclusive"]
+    return _with_description(schema, getattr(param, "description", ""))
+
+
+def _key_ref_json_schema(param: Any) -> dict[str, Any]:
+    expected_type = getattr(param, "blackboard_value_type", None)
+    description = "Declared blackboard key reference."
+    if expected_type:
+        description += f" The referenced key must declare type `{expected_type}`."
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["key_ref"],
+        "properties": {
+            "key_ref": {
+                "type": "string",
+                "minLength": 1,
+                "description": description,
+            },
+        },
+    }
+
+
+def _field_ref_json_schema(param: Any) -> dict[str, Any]:
+    expected_type = getattr(param, "blackboard_value_type", None)
+    expected_contract = getattr(param, "blackboard_contract", None)
+    description = "Declared blackboard namespace field reference."
+    if expected_type:
+        description += f" The referenced field must declare type `{expected_type}`."
+    if expected_contract:
+        description += f" The namespace must declare contract `{expected_contract}`."
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["field_ref"],
+        "properties": {
+            "field_ref": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["namespace", "field"],
+                "properties": {
+                    "namespace": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "ID from program.blackboard.namespaces.",
+                    },
+                    "field": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Field name declared by the namespace.",
+                    },
+                },
+                "description": description,
+            },
+        },
+    }
+
+
+def _namespace_ref_json_schema(param: Any) -> dict[str, Any]:
+    expected_contract = getattr(param, "blackboard_contract", None)
+    description = "Declared blackboard namespace reference."
+    if expected_contract:
+        description += f" The namespace must declare contract `{expected_contract}`."
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["namespace_ref"],
+        "properties": {
+            "namespace_ref": {
+                "type": "string",
+                "minLength": 1,
+                "description": description,
+            },
+        },
+    }
+
+
+def _with_blackboard_binding_forms(param: Any, literal_schema: dict[str, Any]) -> dict[str, Any]:
+    role = getattr(param, "blackboard_role", None)
+    if role in {"namespace_reader", "namespace_writer"}:
+        return _namespace_ref_json_schema(param)
+    if role == "key_writer":
+        return _key_ref_json_schema(param)
+    if role == "key_reader":
+        return {
+            "anyOf": [
+                _key_ref_json_schema(param),
+                _field_ref_json_schema(param),
+            ],
+        }
+    if role == "literal_or_key_reader":
+        return {
+            "anyOf": [
+                literal_schema,
+                _key_ref_json_schema(param),
+                _field_ref_json_schema(param),
+            ],
+        }
+    if role == "field_reader":
+        return {
+            "anyOf": [
+                literal_schema,
+                _field_ref_json_schema(param),
+            ],
+        }
+    return literal_schema
+
+
+def _catalog_param_json_schema(param: Any, catalog: Any) -> dict[str, Any]:
+    if getattr(param, "schema", None) is not None:
+        schema = catalog.schema_registry.to_json_schema(param.schema)
+        if getattr(param, "default", None) is not None:
+            schema = copy.deepcopy(schema)
+            schema["default"] = param.default
+        schema = _with_description(schema, getattr(param, "description", ""))
+        return _with_description(
+            _with_blackboard_binding_forms(param, schema),
+            getattr(param, "description", ""),
+        )
+    schema = _legacy_param_json_schema(param)
+    if getattr(param, "default", None) is not None:
+        schema = copy.deepcopy(schema)
+        schema["default"] = param.default
+    return _with_description(
+        _with_blackboard_binding_forms(param, schema),
+        getattr(param, "description", ""),
+    )
+
+
+def _catalog_entry_params_json_schema(entry: Any, catalog: Any) -> dict[str, Any]:
+    properties: dict[str, Any] = {}
+    required: list[str] = []
+    for param in getattr(entry, "parameters", []):
+        properties[param.name] = _catalog_param_json_schema(param, catalog)
+        if getattr(param, "required", False) and getattr(param, "default", None) is None:
+            required.append(param.name)
+
+    schema: dict[str, Any] = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": properties,
+    }
+    if required:
+        schema["required"] = required
+    return schema
+
+
+def _catalog_entry_insert_node_schema(entry: Any, catalog: Any) -> dict[str, Any]:
+    schema = copy.deepcopy(_TREE_NODE_PAYLOAD_FOR_INSERT_SCHEMA)
+    schema["description"] = f"Insert payload for catalog node `{entry.id}`."
+    schema["properties"]["id"] = {
+        "type": "string",
+        "enum": [entry.id],
+        "description": f"Catalog identifier for {entry.id}.",
+    }
+    params_schema = _catalog_entry_params_json_schema(entry, catalog)
+    schema["properties"]["params"] = params_schema
+    if params_schema.get("required"):
+        required = list(schema.get("required", []))
+        if "params" not in required:
+            required.append("params")
+        schema["required"] = required
+    return schema
+
+
+def _catalog_entry_param_patch_schema(entry: Any, catalog: Any) -> dict[str, Any]:
+    params_schema = _catalog_entry_params_json_schema(entry, catalog)
+    patch_schema = copy.deepcopy(params_schema)
+    patch_schema.pop("required", None)
+    patch_schema["description"] = (
+        f"Sparse parameter patch for an existing `{entry.id}` node. Include only "
+        "parameters being changed; the callback validates the resolved target "
+        "node before mutation."
+    )
+    return patch_schema
+
+
+def _catalog_entries_for_projection(
+    catalog: Any | None,
+    *,
+    node_ids: set[str] | None = None,
+) -> list[Any]:
+    if catalog is None:
+        return []
+    return [
+        entry
+        for entry in getattr(catalog, "entries", [])
+        if node_ids is None or entry.id in node_ids
+    ]
+
+
+def _catalog_projected_insert_node_schema(
+    catalog: Any | None,
+    *,
+    node_ids: set[str] | None = None,
+) -> dict[str, Any]:
+    schema = copy.deepcopy(_TREE_DRAFT_INSERT_NODE_SCHEMA)
+    entries = _catalog_entries_for_projection(catalog, node_ids=node_ids)
+    if not entries:
+        return schema
+
+    variants = [
+        _catalog_entry_insert_node_schema(entry, catalog)
+        for entry in sorted(entries, key=lambda candidate: candidate.id)
+    ]
+    schema["properties"]["node"] = {
+        "anyOf": [*variants, copy.deepcopy(_TREE_NODE_SCHEMA_STRING_FORM)],
+        "description": (
+            "Concrete catalog-projected node payload. Prefer one of the "
+            "structured variants keyed by `id`; the stringified JSON form "
+            "is retained only as a compatibility fallback."
+        ),
+    }
+    return schema
+
+
+def _catalog_projected_update_node_params_schema(
+    catalog: Any | None,
+    *,
+    node_ids: set[str] | None = None,
+) -> dict[str, Any]:
+    schema = copy.deepcopy(_TREE_DRAFT_UPDATE_NODE_PARAMS_SCHEMA)
+    entries = _catalog_entries_for_projection(catalog, node_ids=node_ids)
+    if not entries:
+        return schema
+
+    variants = [
+        _catalog_entry_param_patch_schema(entry, catalog)
+        for entry in sorted(entries, key=lambda candidate: candidate.id)
+        if getattr(entry, "parameters", [])
+    ]
+    if not variants:
+        return schema
+
+    schema["properties"]["params"] = {
+        "anyOf": variants,
+        "description": (
+            "Catalog-projected sparse parameter patch. Pick the variant matching "
+            "the target node's catalog id; unknown parameter names are rejected "
+            "by the callback after nodeName resolves to the concrete draft node."
+        ),
+    }
+    return schema
+
+
+def _catalog_schema_type_json_schema(
+    catalog: Any | None,
+    schema_type_name: str,
+) -> dict[str, Any] | None:
+    registry = getattr(catalog, "schema_registry", None)
+    schema_types = getattr(registry, "types", None)
+    if registry is None or not hasattr(schema_types, "get"):
+        return None
+    schema = schema_types.get(schema_type_name)
+    if schema is None:
+        return None
+    return registry.to_json_schema(schema)
+
+
+def _with_replaced_description(
+    schema: dict[str, Any],
+    description: str,
+) -> dict[str, Any]:
+    projected = copy.deepcopy(schema)
+    projected["description"] = description
+    return projected
+
+
+def _property_schema(
+    schema: dict[str, Any],
+    property_name: str,
+) -> dict[str, Any] | None:
+    properties = schema.get("properties")
+    if not isinstance(properties, dict):
+        return None
+    property_schema = properties.get(property_name)
+    if not isinstance(property_schema, dict):
+        return None
+    return copy.deepcopy(property_schema)
+
+
+def _projected_property_or_fallback(
+    projected_schema: dict[str, Any],
+    property_name: str,
+    fallback_schema: dict[str, Any],
+) -> dict[str, Any]:
+    return _property_schema(projected_schema, property_name) or copy.deepcopy(fallback_schema)
+
+
+def _scene_pose_schema_from_catalog(catalog: Any | None) -> dict[str, Any] | None:
+    pose_schema = _catalog_schema_type_json_schema(catalog, "pose_authoring_input")
+    if pose_schema is None:
+        return None
+    projected = copy.deepcopy(pose_schema)
+    properties = projected.setdefault("properties", {})
+    if isinstance(properties, dict):
+        frame_schema = properties.get("frame_id")
+        if isinstance(frame_schema, dict):
+            frame_schema["enum"] = ["universe", "world", "World", "/World"]
+            frame_schema["description"] = (
+                "World-scene frame for a detached Composer draft object. "
+                "The callback normalizes common world-frame aliases to the "
+                "active backend's canonical scene frame. Use explicit "
+                "attach_object_to_link / detach_object_from_link tree nodes "
+                "for attachment semantics."
+            )
+        fallback_pose = _SCENE_RESOURCE_SCHEMA["properties"]["pose"]["properties"]
+        for field_name in _ORIENTATION_FIELD_KEYS:
+            fallback_field = fallback_pose.get(field_name)
+            target_field = properties.get(field_name)
+            if isinstance(fallback_field, dict) and isinstance(target_field, dict):
+                description = fallback_field.get("description")
+                if isinstance(description, str) and description:
+                    target_field.setdefault("description", description)
+    return projected
+
+
+def _scene_resource_schema_for_catalog(catalog: Any | None) -> dict[str, Any]:
+    scene_resource = copy.deepcopy(_SCENE_RESOURCE_SCHEMA)
+    shape_schema = _catalog_schema_type_json_schema(catalog, "shape")
+    if shape_schema is not None:
+        scene_resource["properties"]["shape"] = shape_schema
+    pose_schema = _scene_pose_schema_from_catalog(catalog)
+    if pose_schema is not None:
+        scene_resource["properties"]["pose"] = pose_schema
+    return scene_resource
+
+
+def _catalog_projected_scene_draft_single_object_schema(
+    catalog: Any | None,
+) -> dict[str, Any]:
+    if catalog is None:
+        return copy.deepcopy(_SCENE_DRAFT_SINGLE_OBJECT_SCHEMA)
+
+    scene_resource = _scene_resource_schema_for_catalog(catalog)
+    shape_schema = scene_resource["properties"]["shape"]
+    pose_schema = scene_resource["properties"]["pose"]
+    fallback_shape = _SCENE_RESOURCE_SCHEMA["properties"]["shape"]
+    fallback_pose = _SCENE_RESOURCE_SCHEMA["properties"]["pose"]
+    fallback_shape_properties = fallback_shape["properties"]
+    fallback_pose_properties = fallback_pose["properties"]
+
+    schema = copy.deepcopy(_SCENE_DRAFT_SINGLE_OBJECT_SCHEMA)
+    properties = schema["properties"]
+    properties["shape"] = copy.deepcopy(shape_schema)
+    properties["pose"] = copy.deepcopy(pose_schema)
+
+    shape_type_schema = _projected_property_or_fallback(
+        shape_schema,
+        "type",
+        properties["shapeType"],
+    )
+    properties["shapeType"] = _with_replaced_description(
+        shape_type_schema,
+        "Convenience alias for shape.type.",
+    )
+    properties["shape_type"] = _with_replaced_description(
+        shape_type_schema,
+        "Convenience alias for shape.type.",
+    )
+
+    box_dimensions_schema = _projected_property_or_fallback(
+        shape_schema,
+        "box_dimensions_m",
+        fallback_shape_properties["box_dimensions_m"],
+    )
+    for alias in ("size", "dimensions", "boxDimensionsM", "box_dimensions_m"):
+        properties[alias] = copy.deepcopy(box_dimensions_schema)
+
+    for alias, field_name in (
+        ("sphereRadiusM", "sphere_radius_m"),
+        ("sphere_radius_m", "sphere_radius_m"),
+        ("cylinderRadiusM", "cylinder_radius_m"),
+        ("cylinder_radius_m", "cylinder_radius_m"),
+        ("cylinderHeightM", "cylinder_height_m"),
+        ("cylinder_height_m", "cylinder_height_m"),
+        ("meshResourceUri", "mesh_resource_uri"),
+        ("mesh_resource_uri", "mesh_resource_uri"),
+        ("meshScale", "mesh_scale"),
+        ("mesh_scale", "mesh_scale"),
+    ):
+        properties[alias] = _projected_property_or_fallback(
+            shape_schema,
+            field_name,
+            fallback_shape_properties[field_name],
+        )
+
+    properties["frameId"] = _projected_property_or_fallback(
+        pose_schema,
+        "frame_id",
+        fallback_pose_properties["frame_id"],
+    )
+    properties["position"] = _projected_property_or_fallback(
+        pose_schema,
+        "position_m",
+        fallback_pose_properties["position_m"],
+    )
+    for field_name in ("frame_id", "position_m", *sorted(_ORIENTATION_FIELD_KEYS)):
+        properties[field_name] = _projected_property_or_fallback(
+            pose_schema,
+            field_name,
+            fallback_pose_properties[field_name],
+        )
+
+    properties["sceneResource"] = {
+        **scene_resource,
+        "description": "Legacy wrapper form accepted for compatibility.",
+    }
+    return schema
+
+
+def _catalog_projected_scene_draft_upsert_objects_schema(
+    catalog: Any | None,
+) -> dict[str, Any]:
+    if catalog is None:
+        return copy.deepcopy(_SCENE_DRAFT_UPSERT_OBJECTS_SCHEMA)
+    schema = copy.deepcopy(_SCENE_DRAFT_UPSERT_OBJECTS_SCHEMA)
+    schema["properties"]["sceneResources"]["items"] = (
+        _catalog_projected_scene_draft_single_object_schema(catalog)
+    )
+    return schema
 
 
 _NO_ARGUMENT_SCHEMA: dict[str, Any] = {
@@ -655,9 +1254,8 @@ _TREE_DRAFT_INSERT_NODE_SCHEMA: dict[str, Any] = {
         "The parent's declared arity is the binding constraint on "
         "insertion; an arity-saturated parent is rejected with a "
         "structural-error response that names the parent and reports its "
-        "allowed arity. Pose-bearing leaves declare their reference "
-        "frame as a parameter that is a sibling of the pose object, not "
-        "as a key inside the pose object."
+        "allowed arity. Pose and shape payloads must follow the concrete "
+        "schema projected for the selected catalog node."
     ),
     "properties": {
         "nodeName": {
@@ -1362,15 +1960,42 @@ ASSISTANT_TOOL_INPUT_SCHEMAS: dict[str, dict[str, Any]] = {
 }
 
 
-def assistant_tool_input_schema(tool_id: str) -> dict[str, Any] | None:
+def assistant_tool_input_schema(
+    tool_id: str,
+    *,
+    catalog: Any | None = None,
+    node_ids: set[str] | None = None,
+    field_policy: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
     """Return a defensive copy of a known built-in assistant tool schema."""
+    if tool_id == "tree_draft_insert_node":
+        schema = _catalog_projected_insert_node_schema(catalog, node_ids=node_ids)
+        return _narrow_schema_for_field_policy(schema, field_policy)
+    if tool_id == "tree_draft_update_node_params":
+        schema = _catalog_projected_update_node_params_schema(
+            catalog,
+            node_ids=node_ids,
+        )
+        return _narrow_schema_for_field_policy(schema, field_policy)
+    if tool_id in {"scene_draft_add_object", "scene_draft_update_object"}:
+        schema = _catalog_projected_scene_draft_single_object_schema(catalog)
+        return _narrow_schema_for_field_policy(schema, field_policy)
+    if tool_id == "scene_draft_upsert_objects":
+        schema = _catalog_projected_scene_draft_upsert_objects_schema(catalog)
+        return _narrow_schema_for_field_policy(schema, field_policy)
     schema = ASSISTANT_TOOL_INPUT_SCHEMAS.get(tool_id)
     if schema is None:
         return None
-    return copy.deepcopy(schema)
+    return _narrow_schema_for_field_policy(schema, field_policy)
 
 
-def enrich_assistant_tool_descriptor(tool: dict[str, Any]) -> dict[str, Any]:
+def enrich_assistant_tool_descriptor(
+    tool: dict[str, Any],
+    *,
+    catalog: Any | None = None,
+    node_ids: set[str] | None = None,
+    field_policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Attach the canonical ``inputSchema`` to a built-in assistant tool descriptor.
 
     SINGLE-SOURCE-OF-TRUTH PARITY CLEANUP (not a behavioural fix). The curated
@@ -1403,9 +2028,15 @@ def enrich_assistant_tool_descriptor(tool: dict[str, Any]) -> dict[str, Any]:
     enriched = copy.deepcopy(tool)
     tool_id = enriched.get("id") or enriched.get("name")
     if isinstance(tool_id, str):
-        schema = assistant_tool_input_schema(tool_id)
+        schema = assistant_tool_input_schema(
+            tool_id,
+            catalog=catalog,
+            node_ids=node_ids,
+            field_policy=field_policy,
+        )
         if schema is not None:
             enriched["inputSchema"] = schema
+            enriched["inputSchemaHash"] = _stable_schema_hash(schema)
             enriched.pop("input_schema", None)
             enriched.pop("parameters", None)
             return enriched
@@ -1413,6 +2044,20 @@ def enrich_assistant_tool_descriptor(tool: dict[str, Any]) -> dict[str, Any]:
     return enriched
 
 
-def enrich_assistant_tool_descriptors(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def enrich_assistant_tool_descriptors(
+    tools: list[dict[str, Any]],
+    *,
+    catalog: Any | None = None,
+    node_ids: set[str] | None = None,
+    field_policy: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
     """Add known schemas to all built-in assistant tool descriptors."""
-    return [enrich_assistant_tool_descriptor(tool) for tool in tools]
+    return [
+        enrich_assistant_tool_descriptor(
+            tool,
+            catalog=catalog,
+            node_ids=node_ids,
+            field_policy=field_policy,
+        )
+        for tool in tools
+    ]

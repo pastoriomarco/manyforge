@@ -6,7 +6,7 @@ description: >-
   HMI scene snapshot, asks the configured vision model which of two candidate
   objects should be picked next, and mirrors the validated decision onto the
   blackboard. The tree then routes into one of two fixed pick/place sequences.
-catalog_version: "0.1.0"
+catalog_version: "0.2.0"
 
 robot:
   robot_id: ur5
@@ -111,6 +111,7 @@ tree:
               params:
                 object_id: left_part
                 place_pose:
+                  frame_id: base_link
                   position_m: [0.22, 0.26, 0.28]
                   orientation_rpy_deg: [180.0, 0.0, -90.0]
                 approach_height_m: 0.08
@@ -145,6 +146,7 @@ tree:
               params:
                 object_id: right_part
                 place_pose:
+                  frame_id: base_link
                   position_m: [0.22, -0.26, 0.28]
                   orientation_rpy_deg: [180.0, 0.0, -90.0]
                 approach_height_m: 0.08

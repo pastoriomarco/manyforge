@@ -134,6 +134,22 @@ class TestLoadSkillCatalog:
         catalog = load_skill_catalog(SKILLS_DIR)
         assert catalog.get("nonexistent") is None
 
+    def test_validate_invocation_rejects_wrong_parameter_type(self):
+        catalog = load_skill_catalog(SKILLS_DIR)
+
+        with pytest.raises(
+            ValueError,
+            match="Parameter 'joint_names' for skill 'move_to_named_config' must be a list of strings",
+        ):
+            catalog.validate_invocation(
+                "move_to_named_config",
+                {
+                    "config_name": "home",
+                    "joint_names": "joint_1",
+                    "joint_positions_rad": [0.0],
+                },
+            )
+
     def test_nonexistent_dir_returns_empty(self, tmp_path):
         catalog = load_skill_catalog(tmp_path / "no_such_dir")
         assert len(catalog.skills) == 0

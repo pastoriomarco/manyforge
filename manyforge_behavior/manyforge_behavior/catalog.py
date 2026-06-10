@@ -10,10 +10,22 @@ from typing import Any, Optional
 import yaml
 
 from manyforge_behavior.capabilities import CAPABILITY_REGISTRY
+from manyforge_behavior.catalog_schema import (
+    CatalogSchema,
+    CatalogSchemaError,
+    CatalogSchemaRegistry,
+    parse_schema,
+    parse_schema_registry,
+    schema_type_label,
+    validate_value,
+)
 
 
 SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+$")
 EXPECTED_API_VERSION = "manyforge.node_catalog.v0"
+EXPECTED_API_VERSION_V1 = "manyforge.node_catalog.v1"
+SUPPORTED_API_VERSIONS = {EXPECTED_API_VERSION_V1}
+_V1_LEGACY_PARAMETER_KEYS = {"constraints", "enum_values", "type"}
 _BLACKBOARD_ROLES = {
     "namespace_writer",
     "namespace_reader",
@@ -65,6 +77,7 @@ class CatalogParameter:
     name: str
     type: str
     required: bool
+    schema: Optional[CatalogSchema] = None
     default: Any = None
     enum_values: list[str] = field(default_factory=list)
     enum_options: list[CatalogEnumOption] = field(default_factory=list)
@@ -123,6 +136,8 @@ class NodeCatalog:
         self._path = Path(path)
         self._entries: dict[str, CatalogEntry] = {}
         self._version: str = ""
+        self._api_version: str = ""
+        self._schema_registry = CatalogSchemaRegistry()
         self._load_and_validate()
 
     def _load_and_validate(self) -> None:
@@ -134,10 +149,12 @@ class NodeCatalog:
 
         # Validate api_version
         api_version = data.get("api_version")
-        if api_version != EXPECTED_API_VERSION:
+        if api_version not in SUPPORTED_API_VERSIONS:
             raise CatalogValidationError(
-                f"Expected api_version '{EXPECTED_API_VERSION}', got '{api_version}'"
+                "Expected api_version to be one of "
+                f"{sorted(SUPPORTED_API_VERSIONS)}, got '{api_version}'"
             )
+        self._api_version = str(api_version)
 
         # Validate catalog_version
         version = data.get("catalog_version", "")
@@ -146,6 +163,12 @@ class NodeCatalog:
                 f"catalog_version must match X.Y.Z, got '{version}'"
             )
         self._version = str(version)
+
+        if self._api_version == EXPECTED_API_VERSION_V1:
+            try:
+                self._schema_registry = parse_schema_registry(data.get("schema_types", {}))
+            except CatalogSchemaError as exc:
+                raise CatalogValidationError(str(exc)) from exc
 
         # Parse entries
         raw_entries = data.get("entries", [])
@@ -170,19 +193,73 @@ class NodeCatalog:
 
         params = []
         for p in raw.get("parameters", []):
+            schema = self._parse_parameter_schema(p, entry_id=entry_id)
+            if self._api_version == EXPECTED_API_VERSION_V1:
+                legacy_keys = sorted(set(p).intersection(_V1_LEGACY_PARAMETER_KEYS))
+                if legacy_keys:
+                    raise CatalogValidationError(
+                        f"Entry '{entry_id}', param '{p.get('name', '<unknown>')}': "
+                        "v1 parameters must derive type, enum_values, and constraints "
+                        f"from schema; remove legacy keys {legacy_keys}"
+                    )
+                param_type = None
+            else:
+                param_type = p.get("type")
+            if schema is not None and (param_type is None or str(param_type).strip() == ""):
+                try:
+                    param_type = schema_type_label(schema, self._schema_registry)
+                except CatalogSchemaError as exc:
+                    raise CatalogValidationError(
+                        f"Entry '{entry_id}', param '{p.get('name', '<unknown>')}': {exc}"
+                    ) from exc
+            if not isinstance(param_type, str) or not param_type.strip():
+                raise CatalogValidationError(
+                    f"Entry '{entry_id}', param '{p.get('name', '<unknown>')}': "
+                    "type is required for v0 catalogs and must be derivable "
+                    "from schema for v1 catalogs"
+                )
+            required = p.get("required", False)
+            if not isinstance(required, bool):
+                raise CatalogValidationError(
+                    f"Entry '{entry_id}', param '{p.get('name', '<unknown>')}': "
+                    "required must be a boolean"
+                )
             enum_values, enum_options = self._parse_enum_metadata(
                 p,
                 entry_id=entry_id,
             )
+            if schema is not None and param_type == "enum":
+                schema_enum_values = self._schema_enum_values(schema)
+                if enum_values and enum_values != schema_enum_values:
+                    raise CatalogValidationError(
+                        f"Entry '{entry_id}', param '{p.get('name', '<unknown>')}': "
+                        "enum_options values must match schema enum values"
+                    )
+                enum_values = schema_enum_values
+                if enum_options:
+                    option_values = [option.value for option in enum_options]
+                    if option_values != enum_values:
+                        raise CatalogValidationError(
+                            f"Entry '{entry_id}', param '{p.get('name', '<unknown>')}': "
+                            "enum_options values must match schema enum values"
+                        )
+                else:
+                    enum_options = [CatalogEnumOption(value=value) for value in enum_values]
+            constraints = (
+                self._schema_constraints(schema)
+                if schema is not None
+                else p.get("constraints", {})
+            )
             params.append(
                 CatalogParameter(
                     name=p["name"],
-                    type=p["type"],
-                    required=p.get("required", False),
+                    type=param_type,
+                    required=required,
+                    schema=schema,
                     default=p.get("default"),
                     enum_values=enum_values,
                     enum_options=enum_options,
-                    constraints=p.get("constraints", {}),
+                    constraints=constraints,
                     parameterizable=p.get("parameterizable", False),
                     profiles_min=self._parse_profile_min(
                         p.get("profiles"),
@@ -252,6 +329,58 @@ class NodeCatalog:
             swap_class=swap_class,
             swap_param_aliases=swap_param_aliases,
         )
+
+    def _parse_parameter_schema(
+        self,
+        raw_param: dict[str, Any],
+        *,
+        entry_id: str,
+    ) -> CatalogSchema | None:
+        if self._api_version != EXPECTED_API_VERSION_V1:
+            return None
+        param_name = raw_param.get("name", "<unknown>")
+        has_schema = "schema" in raw_param
+        has_schema_ref = "schema_ref" in raw_param
+        if has_schema and has_schema_ref:
+            raise CatalogValidationError(
+                f"Entry '{entry_id}', param '{param_name}': declare only one of schema or schema_ref"
+            )
+        if not has_schema and not has_schema_ref:
+            raise CatalogValidationError(
+                f"Entry '{entry_id}', param '{param_name}': v1 parameters require schema or schema_ref"
+            )
+        try:
+            if has_schema_ref:
+                return parse_schema(
+                    {"schema_ref": raw_param["schema_ref"]},
+                    path=f"entries.{entry_id}.parameters.{param_name}.schema_ref",
+                )
+            return parse_schema(
+                raw_param["schema"],
+                path=f"entries.{entry_id}.parameters.{param_name}.schema",
+            )
+        except CatalogSchemaError as exc:
+            raise CatalogValidationError(str(exc)) from exc
+
+    def _schema_enum_values(self, schema: CatalogSchema) -> list[str]:
+        try:
+            concrete = self._schema_registry.resolve(schema)
+        except CatalogSchemaError as exc:
+            raise CatalogValidationError(str(exc)) from exc
+        if concrete.schema_type != "enum":
+            return []
+        return list(concrete.enum_values)
+
+    def _schema_constraints(self, schema: CatalogSchema | None) -> dict[str, Any]:
+        if schema is None:
+            return {}
+        try:
+            concrete = self._schema_registry.resolve(schema)
+        except CatalogSchemaError as exc:
+            raise CatalogValidationError(str(exc)) from exc
+        if concrete.schema_type not in {"float", "int"}:
+            return {}
+        return dict(concrete.constraints)
 
     @staticmethod
     def _parse_profile_min(
@@ -443,6 +572,25 @@ class NodeCatalog:
                 p.profiles_min,
                 f"Entry '{entry.id}', param '{p.name}'",
             )
+            if p.schema is not None:
+                try:
+                    self._schema_registry.resolve(p.schema)
+                except CatalogSchemaError as exc:
+                    raise CatalogValidationError(
+                        f"Entry '{entry.id}', param '{p.name}': {exc}"
+                    ) from exc
+                if p.default is not None:
+                    default_issues = validate_value(
+                        p.schema,
+                        p.default,
+                        registry=self._schema_registry,
+                        path=f"Entry '{entry.id}', param '{p.name}'.default",
+                    )
+                    if default_issues:
+                        issue = default_issues[0]
+                        raise CatalogValidationError(
+                            f"{issue.path}: {issue.message}"
+                        )
             if p.type != "enum" and (p.enum_values or p.enum_options):
                 raise CatalogValidationError(
                     f"Entry '{entry.id}', param '{p.name}': enum metadata "
@@ -598,6 +746,14 @@ class NodeCatalog:
     @property
     def version(self) -> str:
         return self._version
+
+    @property
+    def api_version(self) -> str:
+        return self._api_version
+
+    @property
+    def schema_registry(self) -> CatalogSchemaRegistry:
+        return self._schema_registry
 
 
 def _profile_satisfied(min_profile: str, target: str) -> bool:

@@ -39,13 +39,16 @@ def _resolve_collision_object_request(
     operation: str,
 ) -> SceneEditRequest:
     object_id = resolve_blackboard_value(blackboard, params.get("object_id", ""))
-    shape_type = resolve_blackboard_value(blackboard, params.get("shape_type"))
-    box_dimensions_m = resolve_blackboard_value(blackboard, params.get("box_dimensions_m"))
-    sphere_radius_m = resolve_blackboard_value(blackboard, params.get("sphere_radius_m"))
-    cylinder_radius_m = resolve_blackboard_value(blackboard, params.get("cylinder_radius_m"))
-    cylinder_height_m = resolve_blackboard_value(blackboard, params.get("cylinder_height_m"))
-    mesh_resource_uri = resolve_blackboard_value(blackboard, params.get("mesh_resource_uri"))
-    mesh_scale = resolve_blackboard_value(blackboard, params.get("mesh_scale"))
+    shape = resolve_blackboard_value(blackboard, params.get("shape"))
+    if not isinstance(shape, dict):
+        raise KeyError("shape")
+    shape_type = resolve_blackboard_value(blackboard, shape.get("type"))
+    box_dimensions_m = resolve_blackboard_value(blackboard, shape.get("box_dimensions_m"))
+    sphere_radius_m = resolve_blackboard_value(blackboard, shape.get("sphere_radius_m"))
+    cylinder_radius_m = resolve_blackboard_value(blackboard, shape.get("cylinder_radius_m"))
+    cylinder_height_m = resolve_blackboard_value(blackboard, shape.get("cylinder_height_m"))
+    mesh_resource_uri = resolve_blackboard_value(blackboard, shape.get("mesh_resource_uri"))
+    mesh_scale = resolve_blackboard_value(blackboard, shape.get("mesh_scale"))
     support_contacts = resolve_blackboard_value(blackboard, params.get("support_contacts"))
     pose = resolve_blackboard_value(blackboard, params.get("pose", {}))
     # frame_id lives INSIDE pose (PoseStamped-shaped) — same shape as

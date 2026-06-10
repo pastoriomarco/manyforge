@@ -528,8 +528,10 @@ class TestAddCollisionObject:
         node = AddCollisionObject(
             name="add_box",
             object_id="box1",
-            shape_type="box",
-            box_dimensions_m=[1.0, 0.5, 0.1],
+            shape={
+                "type": "box",
+                "box_dimensions_m": [1.0, 0.5, 0.1],
+            },
             pose={
                 "frame_id": "base_link",
                 "position_m": [0.5, 0, 0.4],
@@ -540,14 +542,40 @@ class TestAddCollisionObject:
         assert status == py_trees.common.Status.SUCCESS
         assert len(kernel.scene_edits) == 1
 
+    def test_accepts_schema_backed_nested_shape(self, kernel, bb_with_kernel):
+        node = AddCollisionObject(
+            name="add_box",
+            object_id="box1",
+            shape={
+                "type": "box",
+                "box_dimensions_m": [1.0, 0.5, 0.1],
+            },
+            pose={
+                "frame_id": "base_link",
+                "position_m": [0.5, 0.0, 0.4],
+                "orientation_rpy_deg": [0.0, 0.0, 0.0],
+            },
+        )
+        status = _tick_node(node)
+
+        assert status == py_trees.common.Status.SUCCESS
+        request = kernel.scene_edits[-1]
+        assert request.shape_type == "box"
+        assert request.box_dimensions_m == [1.0, 0.5, 0.1]
+        assert request.frame_id == "base_link"
+        assert request.pose_position_m == [0.5, 0.0, 0.4]
+        assert request.pose_orientation_xyzw == [0.0, 0.0, 0.0, 1.0]
+
 
 class TestUpsertCollisionObject:
     def test_inserts_missing_object(self, kernel, bb_with_kernel):
         node = UpsertCollisionObject(
             name="upsert_box",
             object_id="box1",
-            shape_type="box",
-            box_dimensions_m=[1.0, 0.5, 0.1],
+            shape={
+                "type": "box",
+                "box_dimensions_m": [1.0, 0.5, 0.1],
+            },
             pose={
                 "frame_id": "base_link",
                 "position_m": [0.5, 0, 0.4],
@@ -572,8 +600,10 @@ class TestUpsertCollisionObject:
         node = UpsertCollisionObject(
             name="upsert_box",
             object_id="box1",
-            shape_type="sphere",
-            sphere_radius_m=0.05,
+            shape={
+                "type": "sphere",
+                "sphere_radius_m": 0.05,
+            },
             pose={
                 "frame_id": "base_link",
                 "position_m": [0.5, 0, 0.4],

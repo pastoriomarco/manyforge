@@ -43,6 +43,7 @@ import {
   SUPPORTED_PROGRAM_PARAMETER_TYPES,
 } from './property/ProgramParameterBindingEditor';
 import { profileSatisfies } from '../utils/profiles';
+import { firstCatalogSchemaValidationMessage } from '../utils/catalogSchema';
 import { DraftTextInput } from './common/DraftInputs';
 
 const KIND_COLORS: Record<string, string> = {
@@ -473,11 +474,25 @@ export function PropertyPanel({ onCollapse }: { onCollapse: () => void }) {
     () => (selectedNode?.data.params as Record<string, unknown> | undefined) ?? {},
     [selectedNode?.data.params],
   );
+  const usesSchemaBackedPoseParam = Boolean(
+    catalogEntry?.parameters.some(
+      (param) => param.name === 'pose' && param.schema?.type === 'object',
+    ),
+  );
+  const usesSchemaBackedShapeParam = Boolean(
+    catalogEntry?.parameters.some(
+      (param) =>
+        param.name === 'shape'
+        && param.schema?.type === 'object'
+        && Array.isArray(param.schema.properties?.type?.enum),
+    ),
+  );
   const isRunMode = cycleState === 'running';
   const [modelEndpointCatalog, setModelEndpointCatalog] = useState<ModelEndpointCatalog | null>(null);
   const [sceneState, setSceneState] = useState<SceneStateResponse | null>(null);
   const [sceneFrames, setSceneFrames] = useState<SceneFramesResponse | null>(null);
   const [expandedProgramParameterBinding, setExpandedProgramParameterBinding] = useState<string | null>(null);
+  const [rejectedParamValidationErrors, setRejectedParamValidationErrors] = useState<Record<string, string>>({});
   const deploymentModelEndpointSignature = JSON.stringify(deployment?.modelEndpoints ?? {});
   const sceneContextRequired = SCENE_NODE_IDS_REQUIRING_SCENE_CONTEXT.has(selectedCatalogId);
 
@@ -505,6 +520,7 @@ export function PropertyPanel({ onCollapse }: { onCollapse: () => void }) {
 
   useEffect(() => {
     setExpandedProgramParameterBinding(null);
+    setRejectedParamValidationErrors({});
   }, [selectedNodeId]);
 
   useEffect(() => {
@@ -603,20 +619,113 @@ export function PropertyPanel({ onCollapse }: { onCollapse: () => void }) {
     [selectedNodeId, updateNodeLabel, isRunMode],
   );
 
+  const validateParamCandidate = useCallback(
+    (paramName: string, value: unknown): string | null => {
+      const param = catalogEntry?.parameters.find((candidate) => candidate.name === paramName);
+      if (!param?.schema) {
+        return null;
+      }
+      if (getProgramParameterReferenceName(value) !== null) {
+        return null;
+      }
+      return firstCatalogSchemaValidationMessage(param.schema, value, param.name);
+    },
+    [catalogEntry?.parameters],
+  );
+
+  const currentParamValidationErrors = useMemo(() => {
+    const errors: Record<string, string> = {};
+    for (const param of catalogEntry?.parameters ?? []) {
+      if (!param.schema) {
+        continue;
+      }
+      const message = firstCatalogSchemaValidationMessage(
+        param.schema,
+        nodeParams[param.name] ?? param.default,
+        param.name,
+      );
+      if (getProgramParameterReferenceName(nodeParams[param.name]) !== null) {
+        continue;
+      }
+      if (message) {
+        errors[param.name] = message;
+      }
+    }
+    return errors;
+  }, [catalogEntry?.parameters, nodeParams]);
+
+  const paramValidationErrors = useMemo(
+    () => ({ ...currentParamValidationErrors, ...rejectedParamValidationErrors }),
+    [currentParamValidationErrors, rejectedParamValidationErrors],
+  );
+
+  const clearRejectedParamErrors = useCallback((paramNames: string[]) => {
+    setRejectedParamValidationErrors((current) => {
+      let changed = false;
+      const next = { ...current };
+      for (const paramName of paramNames) {
+        if (paramName in next) {
+          delete next[paramName];
+          changed = true;
+        }
+      }
+      return changed ? next : current;
+    });
+  }, []);
+
   const handleParamChange = useCallback(
     (paramName: string, value: unknown) => {
       if (isRunMode || !selectedNodeId) return;
+      const validationError = validateParamCandidate(paramName, value);
+      if (validationError) {
+        setRejectedParamValidationErrors((current) => ({
+          ...current,
+          [paramName]: validationError,
+        }));
+        return;
+      }
+      clearRejectedParamErrors([paramName]);
       updateNodeParams(selectedNodeId, { ...nodeParams, [paramName]: value });
     },
-    [selectedNodeId, updateNodeParams, nodeParams, isRunMode],
+    [
+      clearRejectedParamErrors,
+      isRunMode,
+      nodeParams,
+      selectedNodeId,
+      updateNodeParams,
+      validateParamCandidate,
+    ],
   );
 
   const handleParamPatch = useCallback(
     (patch: Record<string, unknown>) => {
       if (isRunMode || !selectedNodeId) return;
-      updateNodeParams(selectedNodeId, { ...nodeParams, ...patch });
+      const candidateParams = { ...nodeParams, ...patch };
+      const rejected: Record<string, string> = {};
+      for (const paramName of Object.keys(patch)) {
+        const validationError = validateParamCandidate(paramName, candidateParams[paramName]);
+        if (validationError) {
+          rejected[paramName] = validationError;
+        }
+      }
+      if (Object.keys(rejected).length > 0) {
+        setRejectedParamValidationErrors((current) => ({
+          ...current,
+          ...rejected,
+        }));
+        return;
+      }
+      clearRejectedParamErrors(Object.keys(patch));
+      updateNodeParams(selectedNodeId, candidateParams);
     },
-    [selectedNodeId, updateNodeParams, nodeParams, isRunMode],
+    [
+      clearRejectedParamErrors,
+      isRunMode,
+      nodeParams,
+      selectedNodeId,
+      updateNodeParams,
+      validateParamCandidate,
+    ],
   );
 
   useEffect(() => {
@@ -626,20 +735,29 @@ export function PropertyPanel({ onCollapse }: { onCollapse: () => void }) {
 
     if (selectedCatalogId === 'add_collision_object' || selectedCatalogId === 'upsert_collision_object') {
       const patch: Record<string, unknown> = {};
-      if (typeof nodeParams.shape_type !== 'string' || nodeParams.shape_type.length === 0) {
-        patch.shape_type = 'box';
-      }
-      if (
-        (nodeParams.shape_type === undefined || nodeParams.shape_type === 'box')
-        && (!Array.isArray(nodeParams.box_dimensions_m) || nodeParams.box_dimensions_m.length !== 3)
-      ) {
-        patch.box_dimensions_m = [0.1, 0.1, 0.1];
-      }
-      if (
-        nodeParams.shape_type === 'mesh'
-        && (!Array.isArray(nodeParams.mesh_scale) || nodeParams.mesh_scale.length !== 3)
-      ) {
-        patch.mesh_scale = [1, 1, 1];
+      if (usesSchemaBackedShapeParam) {
+        const shape = nodeParams.shape && typeof nodeParams.shape === 'object' && !Array.isArray(nodeParams.shape)
+          ? nodeParams.shape as Record<string, unknown>
+          : {};
+        if (typeof shape.type !== 'string') {
+          patch.shape = { type: 'box', box_dimensions_m: [0.1, 0.1, 0.1] };
+        }
+      } else {
+        if (typeof nodeParams.shape_type !== 'string' || nodeParams.shape_type.length === 0) {
+          patch.shape_type = 'box';
+        }
+        if (
+          (nodeParams.shape_type === undefined || nodeParams.shape_type === 'box')
+          && (!Array.isArray(nodeParams.box_dimensions_m) || nodeParams.box_dimensions_m.length !== 3)
+        ) {
+          patch.box_dimensions_m = [0.1, 0.1, 0.1];
+        }
+        if (
+          nodeParams.shape_type === 'mesh'
+          && (!Array.isArray(nodeParams.mesh_scale) || nodeParams.mesh_scale.length !== 3)
+        ) {
+          patch.mesh_scale = [1, 1, 1];
+        }
       }
       if (
         nodeParams.pose === undefined
@@ -647,9 +765,26 @@ export function PropertyPanel({ onCollapse }: { onCollapse: () => void }) {
         || typeof nodeParams.pose !== 'object'
         || Array.isArray(nodeParams.pose)
       ) {
-        patch.pose = { position_m: [0, 0, 0], orientation_rpy_deg: [0, 0, 0] };
+        patch.pose = usesSchemaBackedPoseParam
+          ? {
+            frame_id: sceneReferenceOptions.frameOptions[0] ?? 'universe',
+            position_m: [0, 0, 0],
+            orientation_rpy_deg: [0, 0, 0],
+          }
+          : { position_m: [0, 0, 0], orientation_rpy_deg: [0, 0, 0] };
+      } else if (usesSchemaBackedPoseParam) {
+        const pose = nodeParams.pose as Record<string, unknown>;
+        if (typeof pose.frame_id !== 'string' || pose.frame_id.trim().length === 0) {
+          patch.pose = {
+            ...pose,
+            frame_id: sceneReferenceOptions.frameOptions[0] ?? 'universe',
+          };
+        }
       }
-      if (typeof nodeParams.frame_id !== 'string' || nodeParams.frame_id.trim().length === 0) {
+      if (
+        !usesSchemaBackedPoseParam
+        && (typeof nodeParams.frame_id !== 'string' || nodeParams.frame_id.trim().length === 0)
+      ) {
         patch.frame_id = 'universe';
       }
       if (Object.keys(patch).length > 0) {
@@ -666,9 +801,26 @@ export function PropertyPanel({ onCollapse }: { onCollapse: () => void }) {
         || typeof nodeParams.pose !== 'object'
         || Array.isArray(nodeParams.pose)
       ) {
-        patch.pose = { position_m: [0, 0, 0], orientation_rpy_deg: [0, 0, 0] };
+        patch.pose = usesSchemaBackedPoseParam
+          ? {
+            frame_id: sceneReferenceOptions.frameOptions[0] ?? 'universe',
+            position_m: [0, 0, 0],
+            orientation_rpy_deg: [0, 0, 0],
+          }
+          : { position_m: [0, 0, 0], orientation_rpy_deg: [0, 0, 0] };
+      } else if (usesSchemaBackedPoseParam) {
+        const pose = nodeParams.pose as Record<string, unknown>;
+        if (typeof pose.frame_id !== 'string' || pose.frame_id.trim().length === 0) {
+          patch.pose = {
+            ...pose,
+            frame_id: sceneReferenceOptions.frameOptions[0] ?? 'universe',
+          };
+        }
       }
-      if (typeof nodeParams.frame_id !== 'string' || nodeParams.frame_id.trim().length === 0) {
+      if (
+        !usesSchemaBackedPoseParam
+        && (typeof nodeParams.frame_id !== 'string' || nodeParams.frame_id.trim().length === 0)
+      ) {
         patch.frame_id = 'universe';
       }
       if (Object.keys(patch).length > 0) {
@@ -692,9 +844,13 @@ export function PropertyPanel({ onCollapse }: { onCollapse: () => void }) {
     nodeParams.frame_id,
     nodeParams.gripper_id,
     nodeParams.pose,
+    nodeParams.shape,
     nodeParams.shape_type,
+    sceneReferenceOptions.frameOptions,
     selectedCatalogId,
     selectedNodeId,
+    usesSchemaBackedPoseParam,
+    usesSchemaBackedShapeParam,
   ]);
 
   const isParameterVisible = useCallback((param: CatalogParameter): boolean => {
@@ -810,6 +966,160 @@ export function PropertyPanel({ onCollapse }: { onCollapse: () => void }) {
       </div>
     );
   };
+
+  const renderSchemaBackedPoseEditor = (param: CatalogParameter, currentValue: unknown) => {
+    const pose = currentValue && typeof currentValue === 'object' && !Array.isArray(currentValue)
+      ? currentValue as Record<string, unknown>
+      : {};
+    const frameId = typeof pose.frame_id === 'string'
+      ? pose.frame_id
+      : sceneReferenceOptions.frameOptions[0] ?? 'universe';
+    const poseValue = {
+      frame_id: frameId,
+      position_m: Array.isArray(pose.position_m) ? pose.position_m : [0, 0, 0],
+      ...(Array.isArray(pose.orientation_xyzw)
+        ? { orientation_xyzw: pose.orientation_xyzw }
+        : { orientation_rpy_deg: Array.isArray(pose.orientation_rpy_deg) ? pose.orientation_rpy_deg : [0, 0, 0] }),
+    };
+
+    return (
+      <div className="space-y-2">
+        {renderConstrainedSelect(
+          frameId,
+          sceneReferenceOptions.frameOptions,
+          (value) => handleParamChange(param.name, { ...poseValue, frame_id: value }),
+          'Select reference frame',
+        )}
+        <PoseEditor
+          currentValue={poseValue}
+          isRunMode={isRunMode}
+          onCommit={(value) => {
+            const nextPose = value && typeof value === 'object' && !Array.isArray(value)
+              ? value as Record<string, unknown>
+              : {};
+            handleParamChange(param.name, {
+              ...nextPose,
+              frame_id: typeof nextPose.frame_id === 'string' ? nextPose.frame_id : frameId,
+            });
+          }}
+        />
+      </div>
+    );
+  };
+
+  const renderSchemaBackedShapeEditor = (param: CatalogParameter, currentValue: unknown) => {
+    const shape = currentValue && typeof currentValue === 'object' && !Array.isArray(currentValue)
+      ? currentValue as Record<string, unknown>
+      : {};
+    const schemaTypes = param.schema?.properties?.type?.enum ?? ['box', 'sphere', 'cylinder', 'mesh'];
+    const shapeType = typeof shape.type === 'string' && schemaTypes.includes(shape.type)
+      ? shape.type
+      : 'box';
+    const commitShape = (patch: Record<string, unknown>) => {
+      handleParamChange(param.name, { ...shape, type: shapeType, ...patch });
+    };
+
+    return (
+      <div className="space-y-2">
+        <select
+          value={shapeType}
+          onChange={(event) => {
+            const nextType = event.target.value;
+            const nextShape: Record<string, unknown> = { type: nextType };
+            if (nextType === 'box') {
+              nextShape.box_dimensions_m = Array.isArray(shape.box_dimensions_m) && shape.box_dimensions_m.length === 3
+                ? shape.box_dimensions_m
+                : [0.1, 0.1, 0.1];
+            }
+            if (nextType === 'sphere') {
+              nextShape.sphere_radius_m = typeof shape.sphere_radius_m === 'number'
+                ? shape.sphere_radius_m
+                : 0.05;
+            }
+            if (nextType === 'cylinder') {
+              nextShape.cylinder_radius_m = typeof shape.cylinder_radius_m === 'number'
+                ? shape.cylinder_radius_m
+                : 0.05;
+              nextShape.cylinder_height_m = typeof shape.cylinder_height_m === 'number'
+                ? shape.cylinder_height_m
+                : 0.1;
+            }
+            if (nextType === 'mesh') {
+              nextShape.mesh_resource_uri = typeof shape.mesh_resource_uri === 'string'
+                ? shape.mesh_resource_uri
+                : '';
+              nextShape.mesh_scale = Array.isArray(shape.mesh_scale) && shape.mesh_scale.length === 3
+                ? shape.mesh_scale
+                : [1, 1, 1];
+            }
+            handleParamChange(param.name, nextShape);
+          }}
+          disabled={isRunMode}
+          className={`w-full bg-gray-700 border border-gray-600 text-white rounded px-2 py-1 text-sm ${isRunMode ? 'opacity-50 cursor-not-allowed bg-gray-800' : ''}`}
+        >
+          {schemaTypes.map((option) => (
+            <option key={option} value={option}>{option}</option>
+          ))}
+        </select>
+
+        {shapeType === 'box' && (
+          <FixedFloatListEditor
+            currentValue={shape.box_dimensions_m}
+            isRunMode={isRunMode}
+            onCommit={(value) => commitShape({ box_dimensions_m: value })}
+            labels={['Dim x', 'Dim y', 'Dim z']}
+            requirePositive={true}
+          />
+        )}
+        {shapeType === 'sphere' && (
+          <NumericParamEditor
+            currentValue={shape.sphere_radius_m}
+            isRunMode={isRunMode}
+            onCommit={(value) => commitShape({ sphere_radius_m: value })}
+            paramType="float"
+            constraints={{ min_exclusive: 0 }}
+          />
+        )}
+        {shapeType === 'cylinder' && (
+          <div className="space-y-2">
+            <NumericParamEditor
+              currentValue={shape.cylinder_radius_m}
+              isRunMode={isRunMode}
+              onCommit={(value) => commitShape({ cylinder_radius_m: value })}
+              paramType="float"
+              constraints={{ min_exclusive: 0 }}
+            />
+            <NumericParamEditor
+              currentValue={shape.cylinder_height_m}
+              isRunMode={isRunMode}
+              onCommit={(value) => commitShape({ cylinder_height_m: value })}
+              paramType="float"
+              constraints={{ min_exclusive: 0 }}
+            />
+          </div>
+        )}
+        {shapeType === 'mesh' && (
+          <div className="space-y-2">
+            <DraftTextInput
+              type="text"
+              value={typeof shape.mesh_resource_uri === 'string' ? shape.mesh_resource_uri : ''}
+              disabled={isRunMode}
+              onCommit={(value) => commitShape({ mesh_resource_uri: value })}
+              className={`w-full rounded border border-gray-600 bg-gray-700 px-2 py-1 text-sm text-white ${isRunMode ? 'opacity-50 cursor-not-allowed bg-gray-800' : ''}`}
+            />
+            <FixedFloatListEditor
+              currentValue={shape.mesh_scale}
+              isRunMode={isRunMode}
+              onCommit={(value) => commitShape({ mesh_scale: value })}
+              labels={['Scale x', 'Scale y', 'Scale z']}
+              requirePositive={true}
+            />
+          </div>
+        )}
+      </div>
+    );
+  };
+
   const renderSceneObjectIdEditor = (param: CatalogParameter, currentValue: unknown) => {
     const currentFieldRef = getFieldRefTarget(currentValue);
     const currentKeyRefId = getKeyRefId(currentValue);
@@ -1157,6 +1467,23 @@ export function PropertyPanel({ onCollapse }: { onCollapse: () => void }) {
       );
     }
 
+    if (
+      param.name === 'pose'
+      && param.schema?.type === 'object'
+      && param.schema.properties?.frame_id
+      && param.schema.properties?.position_m
+    ) {
+      return renderSchemaBackedPoseEditor(param, currentValue);
+    }
+
+    if (
+      param.name === 'shape'
+      && param.schema?.type === 'object'
+      && Array.isArray(param.schema.properties?.type?.enum)
+    ) {
+      return renderSchemaBackedShapeEditor(param, currentValue);
+    }
+
     if (selectedCatalogId === 'add_collision_object' || selectedCatalogId === 'upsert_collision_object') {
       if (param.name === 'shape_type') {
         const currentShape = typeof currentValue === 'string' && currentValue.length > 0
@@ -1481,6 +1808,7 @@ export function PropertyPanel({ onCollapse }: { onCollapse: () => void }) {
           <div className="space-y-3">
             {catalogEntry.parameters.filter((param) => isParameterVisible(param)).map((param) => {
               const currentValue = nodeParams[param.name] ?? param.default;
+              const schemaError = paramValidationErrors[param.name];
               const usesInlineProgramParameterBinding =
                 param.name === 'object_id' && SCENE_OBJECT_ID_NODE_IDS.has(selectedCatalogId);
               const supportsProgramParameterBinding =
@@ -1549,6 +1877,11 @@ export function PropertyPanel({ onCollapse }: { onCollapse: () => void }) {
                       </ParameterBindingEditor>
                     ) : (
                       renderParameterInput(param)
+                    )}
+                    {schemaError && (
+                      <div className="mt-1 text-[11px] text-red-400">
+                        {schemaError}
+                      </div>
                     )}
                   </div>
                   {selectedNode.data.catalogId === 'move_manipulator_action'

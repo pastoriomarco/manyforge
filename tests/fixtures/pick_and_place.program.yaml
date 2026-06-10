@@ -4,7 +4,7 @@ name: pick_and_place_integration_test
 description: >-
   Full pick-and-place pipeline exercising scene edits, multiple motions,
   blackboard logic, timers, and cache invalidation via the kernel.
-catalog_version: "0.1.0"
+catalog_version: "0.2.0"
 
 robot:
   robot_id: robot1
@@ -46,8 +46,9 @@ tree:
       name: add_pick_object
       params:
         object_id: pick_object
-        shape_type: sphere
-        sphere_radius_m: 0.03
+        shape:
+          type: sphere
+          sphere_radius_m: 0.03
         pose:
           frame_id: base_link
           position_m: [0.4, 0.0, 0.45]
@@ -100,8 +101,9 @@ tree:
       name: add_placed_object
       params:
         object_id: placed_object
-        shape_type: sphere
-        sphere_radius_m: 0.03
+        shape:
+          type: sphere
+          sphere_radius_m: 0.03
         pose:
           frame_id: base_link
           position_m: [0.6, 0.2, 0.45]

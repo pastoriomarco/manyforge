@@ -21,6 +21,7 @@ from manyforge_behavior.program import (
     apply_tree_param_overrides,
     compute_program_tree_hash,
     find_tree_node_by_name,
+    merge_param_patch,
 )
 from manyforge_behavior.deployment import Deployment
 from manyforge_behavior.cycle_manager import CycleManager
@@ -206,6 +207,7 @@ class AssistantRequestRecord:
     error: dict[str, Any] | None = None
     warnings: list[str] = field(default_factory=list)
     draft_mutated: bool = False
+    field_policy: dict[str, Any] = field(default_factory=dict)
     tool_call_count: int = 0
     tool_calls: list[LiveToolCallEntry] = field(default_factory=list)
     started_at_ns: int = field(default_factory=time.monotonic_ns)
@@ -476,6 +478,7 @@ class ComposerState:
         conversation_id: str,
         provider_id: str,
         assistant_mode: str | None = None,
+        field_policy: dict[str, Any] | None = None,
     ) -> AssistantRequestRecord:
         now_ns = time.monotonic_ns()
         record = AssistantRequestRecord(
@@ -483,6 +486,7 @@ class ComposerState:
             conversation_id=conversation_id,
             provider_id=provider_id,
             assistant_mode=assistant_mode,
+            field_policy=dict(field_policy or {}),
             status="running",
             started_at_ns=now_ns,
             updated_at_ns=now_ns,
@@ -491,6 +495,34 @@ class ComposerState:
             self._assistant_requests[request_id] = record
             self._prune_assistant_requests_locked()
         return record
+
+    def assistant_request_field_policy(
+        self,
+        *,
+        request_id: str = "",
+        conversation_id: str = "",
+        principal: str = "",
+    ) -> dict[str, Any]:
+        """Return the field policy bound to an active assistant request."""
+        with self._assistant_request_lock:
+            if request_id:
+                record = self._assistant_requests.get(request_id)
+                if record is not None:
+                    return dict(record.field_policy)
+            if conversation_id:
+                for record in self._assistant_requests.values():
+                    if (
+                        record.conversation_id == conversation_id
+                        and record.status in ("running", "cancel_requested")
+                    ):
+                        return dict(record.field_policy)
+            if principal:
+                bound_request_id = self._assistant_principal_bindings.get(principal)
+                if bound_request_id is not None:
+                    record = self._assistant_requests.get(bound_request_id)
+                    if record is not None:
+                        return dict(record.field_policy)
+        return {}
 
     def finish_assistant_request(
         self,
@@ -1444,8 +1476,10 @@ class ComposerState:
             raise RuntimeError(f"Node '{node_name}' requires human approval for runtime override")
 
         existing = self._runtime_overrides.get(node_name)
-        merged_params = dict(existing.params) if existing is not None else {}
-        merged_params.update(params)
+        merged_params = merge_param_patch(
+            existing.params if existing is not None else {},
+            params,
+        )
 
         candidate = RuntimeOverrideRecord(
             node_name=node_name,

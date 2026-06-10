@@ -12,8 +12,10 @@ from manyforge_behavior.program import (
     Program,
     ProgramValidationError,
     TreeNode,
+    apply_tree_param_overrides,
     compute_program_tree_hash,
 )
+from manyforge_behavior.skill_loader import SkillCatalog
 
 CATALOG_PATH = Path(__file__).parent.parent / "resources" / "node_catalog.yaml"
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "pick_and_place.program.yaml"
@@ -31,6 +33,145 @@ def _write_program(data: dict) -> str:
     return f.name
 
 
+def _write_catalog(data: dict) -> str:
+    f = tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False)
+    yaml.dump(data, f, sort_keys=False)
+    f.close()
+    return f.name
+
+
+def _minimal_v1_catalog() -> dict:
+    return {
+        "api_version": "manyforge.node_catalog.v1",
+        "catalog_version": "0.2.0",
+        "schema_types": {
+            "stored_pose": {
+                "type": "object",
+                "additional_properties": False,
+                "required": ["frame_id", "position_m"],
+                "exactly_one": [["orientation_xyzw", "orientation_rpy_deg"]],
+                "properties": {
+                    "frame_id": {"type": "string"},
+                    "position_m": {
+                        "type": "array",
+                        "items": {"type": "float"},
+                        "length": 3,
+                    },
+                    "orientation_xyzw": {
+                        "type": "array",
+                        "items": {"type": "float"},
+                        "length": 4,
+                    },
+                    "orientation_rpy_deg": {
+                        "type": "array",
+                        "items": {"type": "float"},
+                        "length": 3,
+                    },
+                },
+            },
+            "shape": {
+                "type": "object",
+                "additional_properties": False,
+                "required": ["type"],
+                "properties": {
+                    "type": {
+                        "type": "enum",
+                        "values": ["box", "sphere", "cylinder", "mesh"],
+                    },
+                    "box_dimensions_m": {
+                        "type": "array",
+                        "items": {
+                            "type": "float",
+                            "constraints": {"min_exclusive": 0},
+                        },
+                        "length": 3,
+                        "required_when": {"type": "box"},
+                        "allowed_when": {"type": "box"},
+                    },
+                    "sphere_radius_m": {
+                        "type": "float",
+                        "constraints": {"min_exclusive": 0},
+                        "required_when": {"type": "sphere"},
+                        "allowed_when": {"type": "sphere"},
+                    },
+                    "cylinder_radius_m": {
+                        "type": "float",
+                        "constraints": {"min_exclusive": 0},
+                        "required_when": {"type": "cylinder"},
+                        "allowed_when": {"type": "cylinder"},
+                    },
+                    "cylinder_height_m": {
+                        "type": "float",
+                        "constraints": {"min_exclusive": 0},
+                        "required_when": {"type": "cylinder"},
+                        "allowed_when": {"type": "cylinder"},
+                    },
+                    "mesh_resource_uri": {
+                        "type": "string",
+                        "required_when": {"type": "mesh"},
+                        "allowed_when": {"type": "mesh"},
+                    },
+                    "mesh_scale": {
+                        "type": "array",
+                        "items": {
+                            "type": "float",
+                            "constraints": {"min_exclusive": 0},
+                        },
+                        "length": 3,
+                        "allowed_when": {"type": "mesh"},
+                    },
+                },
+            },
+        },
+        "entries": [
+            {
+                "id": "sequence",
+                "name": "Sequence",
+                "kind": "composite",
+                "children": {"min": 0, "max": "unbounded"},
+                "parameters": [],
+                "runners": {"py_trees": {"class": "py_trees.composites.Sequence"}},
+            },
+            {
+                "id": "upsert_collision_object",
+                "name": "Upsert Collision Object",
+                "kind": "leaf",
+                "children": {"min": 0, "max": 0},
+                "parameters": [
+                    {
+                        "name": "object_id",
+                        "required": True,
+                        "schema": {"type": "string"},
+                    },
+                    {
+                        "name": "pose",
+                        "required": True,
+                        "schema_ref": "#/schema_types/stored_pose",
+                    },
+                    {
+                        "name": "shape",
+                        "required": True,
+                        "schema_ref": "#/schema_types/shape",
+                    },
+                ],
+                "runners": {
+                    "py_trees": {
+                        "class": "manyforge_behavior.nodes.scene.UpsertCollisionObject",
+                    }
+                },
+            },
+        ],
+    }
+
+
+def _load_minimal_v1_catalog() -> NodeCatalog:
+    path = _write_catalog(_minimal_v1_catalog())
+    try:
+        return NodeCatalog(path)
+    finally:
+        os.unlink(path)
+
+
 def _raw_blackboard_reference(path: str) -> str:
     return "$" + "{bb:" + path + "}"
 
@@ -40,7 +181,7 @@ def _minimal_program(**overrides) -> dict:
         "api_version": "manyforge.program.v0",
         "program_profile": "v0.0",
         "name": "test",
-        "catalog_version": "0.1.0",
+        "catalog_version": "0.2.0",
         "robot": {
             "robot_id": "ur5",
             "group_id": "arm",
@@ -121,6 +262,114 @@ class TestProgramLoading:
         assert defaults["pick_velocity_scale"] == 0.5
 
 
+class TestTreeParamOverrides:
+    def test_nested_param_patch_preserves_discriminator(self):
+        node = TreeNode(
+            id="upsert_collision_object",
+            name="upsert_box",
+            params={
+                "shape": {
+                    "type": "box",
+                    "box_dimensions_m": [0.1, 0.1, 0.1],
+                },
+                "object_id": "box1",
+            },
+        )
+
+        updated = apply_tree_param_overrides(
+            node,
+            {
+                "upsert_box": {
+                    "shape": {
+                        "box_dimensions_m": [0.2, 0.3, 0.4],
+                    }
+                }
+            },
+        )
+
+        assert updated.params["shape"] == {
+            "type": "box",
+            "box_dimensions_m": [0.2, 0.3, 0.4],
+        }
+        assert node.params["shape"]["box_dimensions_m"] == [0.1, 0.1, 0.1]
+
+    def test_nested_param_patch_replaces_when_discriminator_changes(self):
+        node = TreeNode(
+            id="upsert_collision_object",
+            name="upsert_box",
+            params={
+                "shape": {
+                    "type": "box",
+                    "box_dimensions_m": [0.1, 0.1, 0.1],
+                },
+                "object_id": "box1",
+            },
+        )
+
+        updated = apply_tree_param_overrides(
+            node,
+            {
+                "upsert_box": {
+                    "shape": {
+                        "type": "sphere",
+                        "sphere_radius_m": 0.05,
+                    }
+                }
+            },
+        )
+
+        assert updated.params["shape"] == {
+            "type": "sphere",
+            "sphere_radius_m": 0.05,
+        }
+
+    def test_discriminator_change_patch_validates_without_stale_fields(self):
+        catalog = _load_minimal_v1_catalog()
+        base_child = TreeNode(
+            id="upsert_collision_object",
+            name="upsert_box",
+            params={
+                "object_id": "box1",
+                "pose": {
+                    "frame_id": "base_link",
+                    "position_m": [0.0, 0.0, 0.1],
+                    "orientation_rpy_deg": [0.0, 0.0, 0.0],
+                },
+                "shape": {
+                    "type": "box",
+                    "box_dimensions_m": [0.1, 0.2, 0.3],
+                },
+            },
+        )
+        updated_child = apply_tree_param_overrides(
+            base_child,
+            {
+                "upsert_box": {
+                    "shape": {
+                        "type": "sphere",
+                        "sphere_radius_m": 0.05,
+                    }
+                }
+            },
+        )
+        data = _minimal_program(
+            catalog_version="0.2.0",
+            tree={
+                "id": "sequence",
+                "name": "root",
+                "children": [updated_child.to_dict()],
+            },
+        )
+
+        program = Program.from_dict(data, catalog, skill_catalog=SkillCatalog())
+
+        child = program.tree.children[0]
+        assert child.params["shape"] == {
+            "type": "sphere",
+            "sphere_radius_m": 0.05,
+        }
+
+
 class TestProgramValidation:
     def test_rejects_bad_api_version(self, catalog):
         path = _write_program(_minimal_program(api_version="wrong"))
@@ -164,6 +413,15 @@ class TestProgramValidation:
     def test_rejects_invalid_catalog_version(self, catalog):
         path = _write_program(_minimal_program(catalog_version="not-semver"))
         with pytest.raises(ProgramValidationError, match="catalog_version must match X.Y.Z"):
+            Program(path, catalog)
+        os.unlink(path)
+
+    def test_rejects_catalog_version_mismatch(self, catalog):
+        path = _write_program(_minimal_program(catalog_version="0.1.0"))
+        with pytest.raises(
+            ProgramValidationError,
+            match="catalog_version must match loaded catalog version",
+        ):
             Program(path, catalog)
         os.unlink(path)
 
@@ -353,6 +611,138 @@ class TestProgramValidation:
         assert program.to_dict()["scene"][0]["metadata"]["support_contacts"][0][
             "support_object_id"
         ] == "table"
+
+    def test_v1_catalog_schema_accepts_pose_shape_node_params(self):
+        catalog = _load_minimal_v1_catalog()
+        data = _minimal_program(
+            catalog_version="0.2.0",
+            tree={
+                "id": "sequence",
+                "name": "root",
+                "children": [
+                    {
+                        "id": "upsert_collision_object",
+                        "name": "upsert_box",
+                        "params": {
+                            "object_id": "box1",
+                            "pose": {
+                                "frame_id": "base_link",
+                                "position_m": [0.0, 0.0, 0.1],
+                                "orientation_rpy_deg": [0.0, 0.0, 0.0],
+                            },
+                            "shape": {
+                                "type": "box",
+                                "box_dimensions_m": [0.1, 0.2, 0.3],
+                            },
+                        },
+                    },
+                ],
+            },
+        )
+
+        program = Program.from_dict(data, catalog, skill_catalog=SkillCatalog())
+
+        assert program.tree.children[0].params["shape"]["type"] == "box"
+
+    def test_v1_catalog_schema_rejects_unknown_pose_fields(self):
+        catalog = _load_minimal_v1_catalog()
+        data = _minimal_program(
+            catalog_version="0.2.0",
+            tree={
+                "id": "sequence",
+                "name": "root",
+                "children": [
+                    {
+                        "id": "upsert_collision_object",
+                        "name": "upsert_box",
+                        "params": {
+                            "object_id": "box1",
+                            "pose": {
+                                "frame_id": "base_link",
+                                "position_m": [0.0, 0.0, 0.1],
+                                "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+                                "confidence": 0.9,
+                            },
+                            "shape": {
+                                "type": "box",
+                                "box_dimensions_m": [0.1, 0.2, 0.3],
+                            },
+                        },
+                    },
+                ],
+            },
+        )
+
+        with pytest.raises(
+            ProgramValidationError,
+            match="pose must not contain unknown fields: confidence",
+        ):
+            Program.from_dict(data, catalog, skill_catalog=SkillCatalog())
+
+    def test_v1_catalog_schema_rejects_missing_conditional_shape_fields(self):
+        catalog = _load_minimal_v1_catalog()
+        data = _minimal_program(
+            catalog_version="0.2.0",
+            tree={
+                "id": "sequence",
+                "name": "root",
+                "children": [
+                    {
+                        "id": "upsert_collision_object",
+                        "name": "upsert_box",
+                        "params": {
+                            "object_id": "box1",
+                            "pose": {
+                                "frame_id": "base_link",
+                                "position_m": [0.0, 0.0, 0.1],
+                                "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+                            },
+                            "shape": {"type": "box"},
+                        },
+                    },
+                ],
+            },
+        )
+
+        with pytest.raises(
+            ProgramValidationError,
+            match=r"shape\.box_dimensions_m is required by condition",
+        ):
+            Program.from_dict(data, catalog, skill_catalog=SkillCatalog())
+
+    def test_v1_catalog_schema_rejects_pose_array_arity(self):
+        catalog = _load_minimal_v1_catalog()
+        data = _minimal_program(
+            catalog_version="0.2.0",
+            tree={
+                "id": "sequence",
+                "name": "root",
+                "children": [
+                    {
+                        "id": "upsert_collision_object",
+                        "name": "upsert_box",
+                        "params": {
+                            "object_id": "box1",
+                            "pose": {
+                                "frame_id": "base_link",
+                                "position_m": [0.0, 0.0],
+                                "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+                            },
+                            "shape": {
+                                "type": "box",
+                                "box_dimensions_m": [0.1, 0.2, 0.3],
+                            },
+                        },
+                    },
+                ],
+            },
+        )
+
+        with pytest.raises(
+            ProgramValidationError,
+            match=r"pose\.position_m must contain exactly 3 items",
+        ):
+            Program.from_dict(data, catalog, skill_catalog=SkillCatalog())
 
     def test_rejects_scene_resource_support_contact_invalid_boolean_policy_field(self, catalog):
         data = _minimal_program(
@@ -546,8 +936,10 @@ class TestProgramValidation:
                     "name": "spawn_selected",
                     "params": {
                         "object_id": {"key_ref": "target_object_id"},
-                        "shape_type": "box",
-                        "box_dimensions_m": [0.1, 0.1, 0.1],
+                        "shape": {
+                            "type": "box",
+                            "box_dimensions_m": [0.1, 0.1, 0.1],
+                        },
                         "pose": {
                             "frame_id": "base_link",
                             "position_m": [0.0, 0.0, 0.0],
@@ -585,8 +977,10 @@ class TestProgramValidation:
                     "name": "spawn_selected",
                     "params": {
                         "object_id": {"key_ref": "target_object_id"},
-                        "shape_type": "box",
-                        "box_dimensions_m": [0.1, 0.1, 0.1],
+                        "shape": {
+                            "type": "box",
+                            "box_dimensions_m": [0.1, 0.1, 0.1],
+                        },
                         "pose": {
                             "frame_id": "base_link",
                             "position_m": [0.0, 0.0, 0.0],
@@ -1254,7 +1648,7 @@ class TestProgramValidation:
         path = _write_program(data)
         with pytest.raises(
             ProgramValidationError,
-            match=r"relative_move\.target_reference\.pose must use a field_ref binding",
+            match=r"relative_move\.target_reference\.pose must be an object",
         ):
             Program(path, catalog)
         os.unlink(path)
@@ -1428,6 +1822,119 @@ class TestProgramValidation:
         try:
             program = Program(path, catalog)
             assert program.tree.children[0].id == node_id
+        finally:
+            os.unlink(path)
+
+
+class TestRecoveryParameterValidation:
+    def test_rejects_unknown_regular_node_param(self, catalog):
+        data = _minimal_program(
+            tree={
+                "id": "reset_trajectories",
+                "name": "reset",
+                "params": {"unexpected": True},
+            },
+        )
+        path = _write_program(data)
+        try:
+            with pytest.raises(
+                ProgramValidationError,
+                match="Unexpected parameter 'unexpected'",
+            ):
+                Program(path, catalog)
+        finally:
+            os.unlink(path)
+
+    def test_fallback_params_reject_unknown_child_param(self, catalog):
+        data = _minimal_program(
+            tree={
+                "id": "fallback_override_node",
+                "name": "fallback",
+                "params": {
+                    "fallback_params": {"unexpected": True},
+                    "max_retries": 1,
+                },
+                "children": [
+                    {
+                        "id": "reset_trajectories",
+                        "name": "reset",
+                    }
+                ],
+            },
+        )
+        path = _write_program(data)
+        try:
+            with pytest.raises(
+                ProgramValidationError,
+                match="Unknown fallback override parameter 'unexpected'",
+            ):
+                Program(path, catalog)
+        finally:
+            os.unlink(path)
+
+    def test_fallback_params_validate_child_param_schema(self, catalog):
+        data = _minimal_program(
+            tree={
+                "id": "fallback_override_node",
+                "name": "fallback",
+                "params": {
+                    "fallback_params": {"num_cycles": "twice"},
+                    "max_retries": 1,
+                },
+                "children": [
+                    {
+                        "id": "repeat",
+                        "name": "repeat_child",
+                        "params": {"num_cycles": 1},
+                        "children": [
+                            {
+                                "id": "reset_trajectories",
+                                "name": "reset",
+                            }
+                        ],
+                    }
+                ],
+            },
+        )
+        path = _write_program(data)
+        try:
+            with pytest.raises(
+                ProgramValidationError,
+                match="num_cycles must be an integer",
+            ):
+                Program(path, catalog)
+        finally:
+            os.unlink(path)
+
+    def test_recovery_params_validate_selected_skill_params(self, catalog):
+        data = _minimal_program(
+            tree={
+                "id": "recovery_skill_node",
+                "name": "recover",
+                "params": {
+                    "recovery_skill_id": "move_to_named_config",
+                    "recovery_params": {
+                        "config_name": "home",
+                        "joint_names": "joint_1",
+                        "joint_positions_rad": [0.0],
+                    },
+                    "max_retries": 1,
+                },
+                "children": [
+                    {
+                        "id": "reset_trajectories",
+                        "name": "reset",
+                    }
+                ],
+            },
+        )
+        path = _write_program(data)
+        try:
+            with pytest.raises(
+                ProgramValidationError,
+                match="Parameter 'joint_names' for skill 'move_to_named_config' must be a list of strings",
+            ):
+                Program(path, catalog)
         finally:
             os.unlink(path)
 

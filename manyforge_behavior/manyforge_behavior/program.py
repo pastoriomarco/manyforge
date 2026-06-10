@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import math
@@ -24,6 +25,7 @@ from manyforge_behavior.blackboard_bindings import (
 )
 from manyforge_behavior.capabilities import get_required_keys
 from manyforge_behavior.catalog import NodeCatalog, SEMVER_RE, profile_satisfied
+from manyforge_behavior.catalog_schema import CatalogValueIssue, validate_value
 from manyforge_behavior.parameters import (
     PARAM_REF_RE,
     ParameterResolver,
@@ -340,14 +342,43 @@ def find_tree_node_by_name(node: TreeNode, node_name: str) -> TreeNode | None:
     return None
 
 
+def merge_param_patch(
+    base: Mapping[str, Any],
+    patch: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Deep-merge a parameter patch while respecting discriminated objects."""
+    return _merge_mapping_patch(base, patch)
+
+
+def _merge_mapping_patch(
+    base: Mapping[str, Any],
+    patch: Mapping[str, Any],
+) -> dict[str, Any]:
+    if (
+        "type" in base
+        and "type" in patch
+        and base.get("type") != patch.get("type")
+    ):
+        return copy.deepcopy(dict(patch))
+
+    merged = copy.deepcopy(dict(base))
+    for key, value in patch.items():
+        existing = merged.get(key)
+        if isinstance(existing, Mapping) and isinstance(value, Mapping):
+            merged[key] = _merge_mapping_patch(existing, value)
+        else:
+            merged[key] = copy.deepcopy(value)
+    return merged
+
+
 def apply_tree_param_overrides(
     node: TreeNode,
     overrides_by_name: Mapping[str, Mapping[str, Any]],
 ) -> TreeNode:
     """Return a deep-copied tree with per-node param patches applied by node name."""
-    merged_params = dict(node.params)
+    merged_params = merge_param_patch({}, node.params)
     if node.name in overrides_by_name:
-        merged_params.update(dict(overrides_by_name[node.name]))
+        merged_params = merge_param_patch(merged_params, overrides_by_name[node.name])
     return TreeNode(
         id=node.id,
         name=node.name,
@@ -780,12 +811,27 @@ def _validate_param_type(param_type: str, value: Any) -> str | None:
     return None
 
 
+def _format_catalog_schema_issue(param_name: str, issue: CatalogValueIssue) -> str:
+    """Format schema validation errors without leaking implementation-only schema names."""
+    path = issue.path
+    suffix = ""
+    marker = f".params.{param_name}"
+    if marker in path:
+        suffix = path.split(marker, 1)[1]
+    elif path.endswith(param_name):
+        suffix = ""
+    else:
+        suffix = f" at {path}"
+    return f"{param_name}{suffix} {issue.message}"
+
+
 def _validate_tree_node_semantics(
     node: TreeNode,
     resolved_params: dict[str, Any],
     path: str,
     namespace_by_id: Mapping[str, BlackboardNamespace],
     namespace_fields_by_id: Mapping[str, Mapping[str, BlackboardNamespaceField]],
+    entry: Any | None = None,
 ) -> list[TreeValidationIssue]:
     issues: list[TreeValidationIssue] = []
 
@@ -864,7 +910,14 @@ def _validate_tree_node_semantics(
                     )
                 )
 
-    if node.id in {"add_collision_object", "upsert_collision_object"}:
+    has_schema_backed_shape = any(
+        param.name == "shape" and getattr(param, "schema", None) is not None
+        for param in getattr(entry, "parameters", [])
+    )
+    if (
+        node.id in {"add_collision_object", "upsert_collision_object"}
+        and not has_schema_backed_shape
+    ):
         shape_type = resolved_params.get("shape_type")
         pose = resolved_params.get("pose")
         if pose is None:
@@ -965,6 +1018,100 @@ def _enum_option_for_value(param: Any, value: Any) -> Any | None:
         if option.value == value:
             return option
     return None
+
+
+def _validate_catalog_param_patch(
+    *,
+    catalog: NodeCatalog,
+    entry: Any,
+    patch: Mapping[str, Any],
+    path: str,
+    program_profile: str | None,
+) -> list[TreeValidationIssue]:
+    """Validate a partial parameter patch against one catalog entry.
+
+    Used for contextual payloads such as fallback overrides: the object is not a
+    standalone schema, it is a sparse map of parameter names for another node.
+    Each supplied value still has to satisfy the target parameter's catalog
+    schema.
+    """
+    issues: list[TreeValidationIssue] = []
+    declared_params = {param.name: param for param in entry.parameters}
+    for param_name, value in patch.items():
+        param = declared_params.get(param_name)
+        if param is None:
+            valid = ", ".join(sorted(declared_params)) or "<none>"
+            issues.append(
+                TreeValidationIssue(
+                    path=f"{path}.{param_name}",
+                    message=(
+                        f"Unknown fallback override parameter '{param_name}' for "
+                        f"child node '{entry.id}'. Valid parameters: {valid}"
+                    ),
+                )
+            )
+            continue
+
+        if (
+            program_profile is not None
+            and not profile_satisfied(param.profiles_min, program_profile)
+        ):
+            issues.append(
+                TreeValidationIssue(
+                    path=f"{path}.{param_name}",
+                    message=(
+                        f"Fallback override parameter '{param_name}' requires program "
+                        f"profile >= {param.profiles_min}, got {program_profile}"
+                    ),
+                )
+            )
+            continue
+
+        if getattr(param, "schema", None) is not None:
+            schema_issues = validate_value(
+                param.schema,
+                value,
+                registry=catalog.schema_registry,
+                path=f"{path}.{param_name}",
+            )
+            issues.extend(
+                TreeValidationIssue(
+                    path=issue.path,
+                    message=_format_catalog_schema_issue(param.name, issue),
+                )
+                for issue in schema_issues
+            )
+        else:
+            type_error = _validate_param_type(param.type, value)
+            if type_error is not None:
+                issues.append(
+                    TreeValidationIssue(
+                        path=f"{path}.{param_name}",
+                        message=f"{param_name} {type_error}",
+                    )
+                )
+                continue
+
+        if param.schema is None and param.type == "enum" and value not in param.enum_values:
+            issues.append(
+                TreeValidationIssue(
+                    path=f"{path}.{param_name}",
+                    message=(
+                        f"{param_name} must be one of {param.enum_values}, got {value!r}"
+                    ),
+                )
+            )
+
+        if param.type in {"float", "int"} and param.constraints and param.schema is None:
+            constraint_error = _validate_constraints(float(value), param.constraints)
+            if constraint_error is not None:
+                issues.append(
+                    TreeValidationIssue(
+                        path=f"{path}.{param_name}",
+                        message=f"{param_name} {constraint_error}",
+                    )
+                )
+    return issues
 
 
 def collect_tree_validation_issues(
@@ -1375,17 +1522,34 @@ def collect_tree_validation_issues(
                     continue
 
             if not skip_type_validation:
-                type_error = _validate_param_type(param.type, value)
-                if type_error is not None:
-                    errors.append(
-                        TreeValidationIssue(
-                            path=f"{path}.params.{param.name}",
-                            message=f"{param.name} {type_error}",
-                        )
+                if getattr(param, "schema", None) is not None:
+                    schema_issues = validate_value(
+                        param.schema,
+                        value,
+                        registry=catalog.schema_registry,
+                        path=f"{path}.params.{param.name}",
                     )
-                    continue
+                    if schema_issues:
+                        errors.extend(
+                            TreeValidationIssue(
+                                path=issue.path,
+                                message=_format_catalog_schema_issue(param.name, issue),
+                            )
+                            for issue in schema_issues
+                        )
+                        continue
+                else:
+                    type_error = _validate_param_type(param.type, value)
+                    if type_error is not None:
+                        errors.append(
+                            TreeValidationIssue(
+                                path=f"{path}.params.{param.name}",
+                                message=f"{param.name} {type_error}",
+                            )
+                        )
+                        continue
 
-            if param.type == "enum" and value not in param.enum_values:
+            if param.schema is None and param.type == "enum" and value not in param.enum_values:
                 errors.append(
                     TreeValidationIssue(
                         path=f"{path}.params.{param.name}",
@@ -1413,7 +1577,7 @@ def collect_tree_validation_issues(
                     )
                     continue
 
-            if param.type in {"float", "int"} and param.constraints:
+            if param.type in {"float", "int"} and param.constraints and param.schema is None:
                 constraint_error = _validate_constraints(float(value), param.constraints)
                 if constraint_error is not None:
                     errors.append(
@@ -1459,7 +1623,7 @@ def collect_tree_validation_issues(
 
         for param_name in current.params:
             if param_name not in declared_params:
-                warnings.append(
+                errors.append(
                     TreeValidationIssue(
                         path=f"{path}.params.{param_name}",
                         message=(
@@ -1495,8 +1659,88 @@ def collect_tree_validation_issues(
                 path,
                 namespace_by_id,
                 namespace_fields_by_id,
+                entry,
             )
         )
+        if current.id == "fallback_override_node":
+            fallback_params = resolved_params.get("fallback_params")
+            if isinstance(fallback_params, Mapping) and len(current.children) == 1:
+                target = current.children[0]
+                target_path = f"{path}.children[0]"
+                if skill_catalog is not None and skill_catalog.contains(target.id):
+                    target_params = dict(target.params)
+                    if resolver is not None:
+                        try:
+                            target_params = resolver.resolve(target.params)
+                        except ValueError as exc:
+                            errors.append(
+                                TreeValidationIssue(
+                                    path=f"{target_path}.params",
+                                    message=str(exc),
+                                )
+                            )
+                            target_params = dict(target.params)
+                    try:
+                        target = tree_node_from_dict(
+                            skill_catalog.expand_node_dict(
+                                {
+                                    "id": target.id,
+                                    "name": target.name,
+                                    "params": target_params,
+                                    "children": [],
+                                }
+                            ),
+                            path=target_path,
+                        )
+                    except ValueError as exc:
+                        errors.append(
+                            TreeValidationIssue(
+                                path=target_path,
+                                message=str(exc),
+                            )
+                        )
+                        target = current.children[0]
+                try:
+                    target_entry = catalog.get(target.id)
+                except KeyError:
+                    target_entry = None
+                if target_entry is not None:
+                    errors.extend(
+                        _validate_catalog_param_patch(
+                            catalog=catalog,
+                            entry=target_entry,
+                            patch=fallback_params,
+                            path=f"{path}.params.fallback_params",
+                            program_profile=program_profile,
+                        )
+                    )
+
+        if (
+            current.id == "recovery_skill_node"
+            and skill_catalog is not None
+            and isinstance(resolved_params.get("recovery_params", {}), Mapping)
+        ):
+            recovery_skill_id = resolved_params.get("recovery_skill_id")
+            recovery_params = dict(resolved_params.get("recovery_params") or {})
+            if isinstance(recovery_skill_id, str) and recovery_skill_id:
+                try:
+                    skill_catalog.validate_invocation(
+                        recovery_skill_id,
+                        recovery_params,
+                    )
+                except ValueError as exc:
+                    error_path = (
+                        f"{path}.params.recovery_skill_id"
+                        if "Unknown skill:" in str(exc)
+                        else f"{path}.params.recovery_params"
+                    )
+                    errors.append(
+                        TreeValidationIssue(
+                            path=error_path,
+                            message=str(exc),
+                        )
+                    )
+
         # query_model deployment cross-validation (OP-7)
         if current.id == "query_model" and deployment is not None:
             ep_alias = resolved_params.get("model_endpoint_alias", "")
@@ -1774,6 +2018,11 @@ class Program:
         if not SEMVER_RE.match(self.catalog_version):
             raise ProgramValidationError(
                 f"catalog_version must match X.Y.Z, got '{self.catalog_version}'"
+            )
+        if self.catalog_version != self._catalog.version:
+            raise ProgramValidationError(
+                "catalog_version must match loaded catalog version "
+                f"'{self._catalog.version}', got '{self.catalog_version}'"
             )
         if not isinstance(self.name, str) or not self.name.strip():
             raise ProgramValidationError("name is required")

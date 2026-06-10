@@ -34,6 +34,30 @@ export interface CatalogVisibleWhen {
   equals: unknown;
 }
 
+export interface CatalogJsonSchema {
+  type?: string;
+  description?: string;
+  properties?: Record<string, CatalogJsonSchema>;
+  required?: string[];
+  additionalProperties?: boolean | CatalogJsonSchema;
+  items?: CatalogJsonSchema;
+  enum?: string[];
+  oneOf?: CatalogJsonSchema[];
+  anyOf?: CatalogJsonSchema[];
+  allOf?: CatalogJsonSchema[];
+  not?: CatalogJsonSchema;
+  if?: CatalogJsonSchema;
+  then?: CatalogJsonSchema;
+  const?: unknown;
+  minimum?: number;
+  maximum?: number;
+  exclusiveMinimum?: number;
+  exclusiveMaximum?: number;
+  minItems?: number;
+  maxItems?: number;
+  default?: unknown;
+}
+
 export interface CatalogParameter {
   name: string;
   type: string;
@@ -49,6 +73,8 @@ export interface CatalogParameter {
   blackboardRole?: string | null;
   blackboardContract?: string | null;
   blackboardValueType?: string | null;
+  schema?: CatalogJsonSchema | null;
+  schemaHash?: string | null;
   description: string;
 }
 
@@ -304,6 +330,7 @@ export interface AssistantChatRequest {
   assistantMode?: string;
   context?: Record<string, unknown>;
   requestedTools?: string[];
+  fieldPolicy?: Record<string, unknown>;
 }
 
 export interface AssistantProposal {

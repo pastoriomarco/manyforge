@@ -216,7 +216,7 @@ class TestCycleManagerRun:
 program_profile: v0.0
 name: missing_bb_failure
 description: Motion node fails on missing blackboard key.
-catalog_version: "0.1.0"
+catalog_version: "0.2.0"
 
 robot:
   robot_id: ur5

@@ -87,7 +87,7 @@ def _minimal_program(**overrides) -> dict:
         "api_version": "manyforge.program.v0",
         "program_profile": "v0.0",
         "name": "test_program",
-        "catalog_version": "0.1.0",
+        "catalog_version": "0.2.0",
         "robot": {
             "robot_id": "ur5",
             "group_id": "arm",
@@ -1462,7 +1462,7 @@ class TestCrossArtifactValidation:
             "api_version": "manyforge.program.v0",
             "program_profile": "v0.1",  # different from deployment
             "name": "test",
-            "catalog_version": "0.1.0",
+            "catalog_version": "0.2.0",
             "robot": {
                 "robot_id": "ur5",
                 "group_id": "arm",
@@ -1483,7 +1483,7 @@ class TestCrossArtifactValidation:
             "api_version": "manyforge.program.v0",
             "program_profile": "v0.0",
             "name": "test",
-            "catalog_version": "0.1.0",
+            "catalog_version": "0.2.0",
             "robot": {
                 "robot_id": "ur10",  # different from deployment
                 "group_id": "arm",
@@ -1504,7 +1504,7 @@ class TestCrossArtifactValidation:
             "api_version": "manyforge.program.v0",
             "program_profile": "v0.0",
             "name": "test",
-            "catalog_version": "0.1.0",
+            "catalog_version": "0.2.0",
             "robot": {
                 "robot_id": "ur5",
                 "group_id": "manipulator",  # different from deployment

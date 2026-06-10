@@ -123,6 +123,7 @@ body:
 example:
   object_id: graspable
   place_pose:
+    frame_id: base_link
     position_m: [0.3, 0.3, 0.2]
     orientation_rpy_deg: [180.0, 0.0, -90.0]
   approach_height_m: 0.05

@@ -1,6 +1,7 @@
 """Tests for Composer assistant routes."""
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 import sys
@@ -23,6 +24,7 @@ from manyforge_composer.backend.assistant_provider import (
     build_assistant_provider,
 )
 from manyforge_composer.backend import routes_assistant
+from manyforge_composer.backend.assistant_tool_schemas import _stable_schema_hash
 from manyforge_composer.backend.app import create_app
 from manyforge_composer.backend.security import SecurityConfig
 from manyforge_composer.backend.state import ComposerState
@@ -314,6 +316,9 @@ def test_nemoclaw_provider_sends_v01_assistant_mode_catalog(
             "assistantMode": "query",
             "requestId": "req-v01-catalog",
             "requestedTools": ["program_read"],
+            "fieldPolicy": {
+                "allowedOrientationFields": ["rpy_delta_deg"],
+            },
         },
     )
 
@@ -327,6 +332,12 @@ def test_nemoclaw_provider_sends_v01_assistant_mode_catalog(
     assert payload["requestId"] == "req-v01-catalog"
     assert payload["schemaVersion"] == "0.1.0"
     assert payload["assistantMode"] == "query"
+    assert payload["fieldPolicy"] == {
+        "allowedOrientationFields": ["rpy_delta_deg"],
+    }
+    assert payload["constraints"]["fieldPolicy"] == {
+        "allowedOrientationFields": ["rpy_delta_deg"],
+    }
     # The envelope carries rich catalog payloads at the top level
     # only. The nested `catalog` block was dropped (single source of
     # truth — consumers derive ids from `nodeCatalog[*].id`,
@@ -406,6 +417,23 @@ def test_assistant_modes_endpoint_returns_mode_scoped_manifest(
         assert tool["effect"] in {"read_only", "composer_draft_mutating", "proposal"}
         assert isinstance(tool["inputSchema"], dict)
         assert tool["inputSchema"].get("type") == "object"
+    insert_tool = next(
+        tool for tool in body["tools"] if tool["id"] == "tree_draft_insert_node"
+    )
+    # inputSchemaHash is a STRUCTURAL hash (prose descriptions excluded), so
+    # recompute via the canonical helper rather than hashing the raw schema.
+    assert insert_tool["inputSchemaHash"] == _stable_schema_hash(insert_tool["inputSchema"])
+    node_schema = insert_tool["inputSchema"]["properties"]["node"]
+    upsert_variant = next(
+        variant
+        for variant in node_schema["anyOf"]
+        if variant.get("properties", {}).get("id", {}).get("enum")
+        == ["upsert_collision_object"]
+    )
+    upsert_params = upsert_variant["properties"]["params"]["properties"]
+    assert set(upsert_params) == {"object_id", "pose", "shape"}
+    assert upsert_params["shape"]["additionalProperties"] is False
+    assert "shape_type" not in upsert_params
     # Node allowlist surfaced via the rich nodeCatalog (the legacy
     # bare-id `nodes` field was dropped from the manifest).
     assert isinstance(body["nodeCatalog"], list)
@@ -420,6 +448,44 @@ def test_assistant_modes_endpoint_404_on_unknown_mode(
     state.deployment = _assistant_mode_deployment()
     response = client.get("/api/assistant/modes/no-such-mode")
     assert response.status_code in (400, 404)
+
+
+def test_assistant_bridge_field_policy_rejects_disallowed_orientation_field(
+    client: TestClient,
+    state: ComposerState,
+) -> None:
+    state.deployment = _assistant_mode_deployment()
+    catalog_hash = _assistant_catalog_hash(state, "composer-assistant")
+
+    response = client.post(
+        "/api/assistant/bridge/tools/scene_draft_update_object",
+        json={
+            "requestId": "req-field-policy-reject",
+            "assistantMode": "composer-assistant",
+            "catalogHash": catalog_hash,
+            "fieldPolicy": {
+                "allowedOrientationFields": ["rpy_delta_deg"],
+            },
+            "arguments": {
+                "objectId": "box_1",
+                "pose": {
+                    "frame_id": "universe",
+                    "position_m": [0.0, 0.0, 0.0],
+                    "rotate_local_rpy_deg": [0.0, 0.0, 15.0],
+                },
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["success"] is False
+    assert data["mutated"] is False
+    assert "fieldPolicy rejected disallowed orientation fields" in data["error"]
+    violations = data["result"]["detail"]["violations"]
+    assert violations == [
+        {"path": "$.pose.rotate_local_rpy_deg", "field": "rotate_local_rpy_deg"}
+    ]
 
 
 def test_assistant_bridge_read_only_callback_returns_program_state(
@@ -1759,6 +1825,57 @@ def test_assistant_bridge_read_only_callback_rejects_stale_catalog_hash(
 
     assert response.status_code == 409
     assert "catalogHash" in response.json()["detail"]
+
+
+def test_assistant_bridge_callback_accepts_current_input_schema_hash(
+    client: TestClient,
+    state: ComposerState,
+) -> None:
+    state.deployment = _assistant_mode_deployment()
+    manifest = client.get("/api/assistant/modes/query").json()
+    program_read = next(tool for tool in manifest["tools"] if tool["id"] == "program_read")
+
+    response = client.post(
+        "/api/assistant/bridge/tools/program_read",
+        json={
+            "requestId": "req-schema-hash-current",
+            "assistantMode": "query",
+            "catalogHash": manifest["catalogHash"],
+            "inputSchemaHash": program_read["inputSchemaHash"],
+            "arguments": {},
+        },
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["success"] is True
+    assert data["inputSchemaHash"] == program_read["inputSchemaHash"]
+
+
+def test_assistant_bridge_callback_rejects_stale_input_schema_hash(
+    client: TestClient,
+    state: ComposerState,
+) -> None:
+    state.deployment = _assistant_mode_deployment()
+    manifest = client.get("/api/assistant/modes/query").json()
+
+    response = client.post(
+        "/api/assistant/bridge/tools/program_read",
+        json={
+            "requestId": "req-schema-hash-stale",
+            "assistantMode": "query",
+            "catalogHash": manifest["catalogHash"],
+            "inputSchemaHash": "not-the-active-tool-schema-hash",
+            "arguments": {},
+        },
+    )
+
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert detail["message"] == "inputSchemaHash does not match the active tool schema"
+    assert detail["toolId"] == "program_read"
+    assert detail["inputSchemaHash"] == "not-the-active-tool-schema-hash"
+    assert isinstance(detail["expectedInputSchemaHash"], str)
 
 
 def test_nemoclaw_provider_rejects_out_of_catalog_tool_response(
@@ -3350,7 +3467,7 @@ def _write_minimal_program(tmp_path: Path) -> Path:
                 "api_version": "manyforge.program.v0",
                 "program_profile": "v0.0",
                 "name": "minimal",
-                "catalog_version": "0.1.0",
+                "catalog_version": "0.2.0",
                 "description": "minimal program",
                 "robot": {
                     "robot_id": "ur5",

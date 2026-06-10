@@ -12,7 +12,7 @@ from .models import (
 from .state import ComposerState
 
 
-def _parameter_response(param) -> dict:
+def _parameter_response(param, *, catalog=None) -> dict:
     """Convert a catalog parameter to an API response dictionary."""
     visible_when = None
     if param.visible_when is not None:
@@ -20,6 +20,11 @@ def _parameter_response(param) -> dict:
             param=param.visible_when.param,
             equals=param.visible_when.equals,
         )
+    schema = None
+    schema_hash = None
+    if catalog is not None and getattr(param, "schema", None) is not None:
+        schema = catalog.schema_registry.to_json_schema(param.schema)
+        schema_hash = catalog.schema_registry.schema_hash(param.schema)
     return CatalogParameterResponse(
         name=param.name,
         type=param.type,
@@ -44,6 +49,8 @@ def _parameter_response(param) -> dict:
         blackboardRole=param.blackboard_role,
         blackboardContract=param.blackboard_contract,
         blackboardValueType=param.blackboard_value_type,
+        schema=schema,
+        schemaHash=schema_hash,
         description=param.description,
     ).model_dump(by_alias=True)
 
@@ -57,7 +64,10 @@ def create_catalog_router(state: ComposerState) -> APIRouter:
         """Get all catalog entries."""
         entries = []
         for entry in state.catalog.entries:
-            params = [_parameter_response(param) for param in entry.parameters]
+            params = [
+                _parameter_response(param, catalog=state.catalog)
+                for param in entry.parameters
+            ]
             entries.append(CatalogEntryResponse(
                 id=entry.id,
                 name=entry.name,
@@ -88,7 +98,10 @@ def create_catalog_router(state: ComposerState) -> APIRouter:
         except KeyError:
             raise HTTPException(status_code=404, detail=f"Entry '{entry_id}' not found")
         
-        params = [_parameter_response(param) for param in entry.parameters]
+        params = [
+            _parameter_response(param, catalog=state.catalog)
+            for param in entry.parameters
+        ]
         
         return CatalogEntryResponse(
             id=entry.id,

@@ -195,7 +195,7 @@ def _mcp_tool_descriptor(tool: dict[str, Any]) -> dict[str, Any]:
         # Append the effect tag so the model can route by inspection of the
         # tool list itself; mirrors the deployment YAML's scope-tag pattern.
         description = f"{description}\n\n[effect: {effect}]"
-    return {
+    descriptor = {
         "name": tool.get("id"),
         "description": description,
         "inputSchema": tool.get("inputSchema") or {
@@ -203,6 +203,10 @@ def _mcp_tool_descriptor(tool: dict[str, Any]) -> dict[str, Any]:
             "additionalProperties": True,
         },
     }
+    input_schema_hash = tool.get("inputSchemaHash")
+    if isinstance(input_schema_hash, str) and input_schema_hash:
+        descriptor["inputSchemaHash"] = input_schema_hash
+    return descriptor
 
 
 def _mode_tool_entries(manifest: dict[str, Any]) -> list[dict[str, Any]]:
@@ -549,15 +553,32 @@ def _handle_tools_call(message: dict[str, Any]) -> dict[str, Any]:
         "principal": PRINCIPAL,
         "arguments": arguments,
     }
+    input_schema_hash = (tool_entry or {}).get("inputSchemaHash")
+    if isinstance(input_schema_hash, str) and input_schema_hash:
+        envelope["inputSchemaHash"] = input_schema_hash
 
     try:
         body = _http("POST", f"/api/assistant/bridge/tools/{tool_id}", envelope)
     except _HttpError as exc:
-        if exc.status == 409 and "catalogHash" in str(exc.payload):
+        if exc.status == 409 and (
+            "catalogHash" in str(exc.payload) or "inputSchemaHash" in str(exc.payload)
+        ):
             # Deployment was hot-reloaded; refresh and retry once.
             try:
-                _refresh_mode_manifest()
+                refreshed_manifest = _refresh_mode_manifest()
                 envelope["catalogHash"] = (_MODE_MANIFEST or {}).get("catalogHash")
+                refreshed_tool = next(
+                    (
+                        t for t in _visible_tool_entries(refreshed_manifest)
+                        if str(t.get("id")) == tool_id
+                    ),
+                    None,
+                )
+                refreshed_input_schema_hash = (refreshed_tool or {}).get("inputSchemaHash")
+                if isinstance(refreshed_input_schema_hash, str) and refreshed_input_schema_hash:
+                    envelope["inputSchemaHash"] = refreshed_input_schema_hash
+                else:
+                    envelope.pop("inputSchemaHash", None)
                 body = _http("POST", f"/api/assistant/bridge/tools/{tool_id}", envelope)
             except _HttpError as retry_exc:
                 return _bridge_error_to_mcp(message, retry_exc)

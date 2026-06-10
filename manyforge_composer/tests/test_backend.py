@@ -1398,7 +1398,7 @@ def test_session_apply_surfaces_validation_reason(client):
 
     response = client.post("/api/session/apply", json={"tree": invalid_tree})
     assert response.status_code == 400
-    assert "missing required parameter 'shape_type'" in response.json()["detail"]
+    assert "missing required parameter 'shape'" in response.json()["detail"]
 
 
 # =============================================================================

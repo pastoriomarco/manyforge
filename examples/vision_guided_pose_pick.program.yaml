@@ -7,7 +7,7 @@ description: >-
   validated `approach_pose` and `grasp_pose` values in the robot base frame,
   and downstream `move_manipulator_action` nodes consume those poses through
   declared blackboard field refs.
-catalog_version: "0.1.0"
+catalog_version: "0.2.0"
 
 robot:
   robot_id: ur5
@@ -136,6 +136,7 @@ tree:
         move_id: vlm_place_pose
         motion_type: pose_goal
         pose_goal:
+          frame_id: base_link
           position_m: [0.22, 0.0, 0.30]
           orientation_rpy_deg: [180.0, 0.0, -90.0]
         velocity_scale: 0.35

@@ -87,6 +87,7 @@ class AssistantProviderContext:
     assistant_mode: str | None = None
     schema_version: str = "0.1.0"
     tool_catalog: list[dict[str, Any]] = field(default_factory=list)
+    field_policy: dict[str, Any] = field(default_factory=dict)
     # Rich per-node descriptors (id, kind, childrenMin, childrenMax,
     # description, parameters, requiredCapabilities, ...) for nodes
     # visible in this assistant mode. The same shape `catalog_read`
@@ -443,6 +444,7 @@ class NemoClawAssistantProvider:
             "conversationId": context.conversation_id,
             "message": request.message,
             "requestedTools": list(request.requested_tools),
+            "fieldPolicy": dict(context.field_policy),
             "context": dict(request.context),
             "runtime": {
                 "programLoaded": context.program_loaded,
@@ -453,6 +455,7 @@ class NemoClawAssistantProvider:
                 "mutatesState": False,
                 "requiresReview": True,
                 "proposalStatus": "draft",
+                "fieldPolicy": dict(context.field_policy),
                 "allowedToolCallStatuses": [
                     "proposed",
                     "skipped",
