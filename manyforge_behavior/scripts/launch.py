@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import sys
 import time
+from typing import Any
 
 import py_trees
 
@@ -26,8 +27,8 @@ _ROS2_CONTROL_EXECUTION_ADAPTER_IDS = {
 }
 
 
-def _native_kernel_config_from_deployment(deployment: Deployment) -> dict[str, int | float]:
-    config: dict[str, int | float] = {}
+def _native_kernel_config_from_deployment(deployment: Deployment) -> dict[str, Any]:
+    config: dict[str, Any] = {}
     period_ms = deployment.orchestrator.config.get("collision_monitor_period_ms")
     if period_ms is not None:
         period_ms = float(period_ms)
@@ -60,9 +61,19 @@ def _native_kernel_config_from_deployment(deployment: Deployment) -> dict[str, i
         config["runtime_dynamic_body_max_age_cap_ns"] = int(cap_ms * 1_000_000.0)
     execution_adapter = deployment.adapters.get("execution")
     execution_config = dict(execution_adapter.config or {}) if execution_adapter else {}
+    planning_adapter = deployment.adapters.get("planning")
+    planning_config = dict(planning_adapter.config or {}) if planning_adapter else {}
     for key in ("single_shot_ik_timeout_s", "single_shot_ik_timeout_ms"):
         if key in execution_config:
             config[key] = execution_config[key]
+    for key in ("planner_max_planning_time_s", "planner_max_planning_time_ms"):
+        if key in planning_config:
+            config[key] = planning_config[key]
+        elif key in execution_config:
+            config[key] = execution_config[key]
+    baseline_policy = deployment.baseline_collision_policy_snapshot()
+    if baseline_policy is not None:
+        config["baseline_collision_policy_snapshot"] = baseline_policy
     return config
 
 

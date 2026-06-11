@@ -404,8 +404,13 @@ class TestCycleControl:
         result = _call(mcp, "manyforge_cycle_control", {
             "command": "velocity",
             "velocity_scale": 0.5,
+            "principal_id": "assistant_operator",
         })
         assert result["velocity_scale"] == 0.5
+        assert (
+            state.cycle_manager._kernel.runtime_velocity_scale_principal_ids[-1]
+            == "assistant_operator"
+        )
 
     def test_unknown_command(self):
         state = _make_state()

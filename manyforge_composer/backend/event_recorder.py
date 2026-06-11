@@ -42,6 +42,7 @@ _ALLOWED_EVENT_PREFIXES = (
     "model_call_",
     "pose_source_",
     "runtime_override_",
+    "simulation_control_",
 )
 _SEVERITY_ORDER = {"DEBUG": 10, "INFO": 20, "WARN": 30, "WARNING": 30, "ERROR": 40, "CRITICAL": 50}
 _FAILURE_ARCHIVE_EVENT_TYPES = {
@@ -113,6 +114,8 @@ def _component_for_event(event_type: str) -> str:
         return "manyforge.model"
     if event_type.startswith("pose_source_"):
         return "manyforge.scene"
+    if event_type.startswith("simulation_control_"):
+        return "manyforge.simulation"
     if event_type.startswith("runtime_override_"):
         return "manyforge.runtime_override"
     if event_type.startswith("intervention_"):
@@ -810,6 +813,26 @@ class EventRecorder:
         self._record_event(
             event_type=f"pose_source_{action}",
             details=details,
+        )
+
+    def record_simulation_control_event(
+        self,
+        action: str,
+        *,
+        details: Optional[dict[str, Any]] = None,
+        run_id: Optional[str] = None,
+        authority_source: Optional[str] = None,
+        trigger_node_instance: Optional[str] = None,
+        execution_mode: Optional[str] = None,
+    ) -> None:
+        """Record a simulator lifecycle/control event."""
+        self._record_event(
+            event_type=f"simulation_control_{action}",
+            details=details,
+            run_id=run_id,
+            authority_source=authority_source,
+            trigger_node_instance=trigger_node_instance,
+            execution_mode=execution_mode,
         )
 
     def record_delegated_recovery_requested(self, request) -> None:

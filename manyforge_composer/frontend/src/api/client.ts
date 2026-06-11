@@ -41,6 +41,11 @@ import type {
   CandidateCreateRequest,
   CandidateResponse,
   CandidateExecuteResponse,
+  SimulationControlResponse,
+  SimulationSetEntityStateRequest,
+  SimulationSetStateRequest,
+  SimulationStepRequest,
+  SimulationResetResponse,
 } from '../types/api';
 
 const BASE_URL = import.meta.env.VITE_API_URL || '';
@@ -156,6 +161,15 @@ export const api = {
     reset: () => request<CycleCommand>('POST', '/api/cycle/reset'),
     setVelocityScale: (value: number) =>
       request<VelocityScaleResponse>('PUT', '/api/cycle/velocity-scale', { value }),
+  },
+  simulation: {
+    reset: () => request<SimulationResetResponse>('POST', '/api/simulation/reset'),
+    setState: (payload: SimulationSetStateRequest) =>
+      request<SimulationControlResponse>('POST', '/api/simulation/state', payload),
+    step: (payload: SimulationStepRequest = {}) =>
+      request<SimulationControlResponse>('POST', '/api/simulation/step', payload),
+    setEntityState: (payload: SimulationSetEntityStateRequest) =>
+      request<SimulationControlResponse>('POST', '/api/simulation/entity-state', payload),
   },
   catalog: {
     list: () => request<CatalogResponse>('GET', '/api/catalog'),

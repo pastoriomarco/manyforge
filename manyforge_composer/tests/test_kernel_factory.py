@@ -170,6 +170,52 @@ def test_kernel_config_forwards_single_shot_ik_timeout():
     assert config["single_shot_ik_timeout_s"] == 0.08
 
 
+def test_kernel_config_forwards_planner_budget_from_planning_adapter():
+    deployment = SimpleNamespace(
+        adapters={
+            "planning": SimpleNamespace(
+                adapter_id="planning.roboplan",
+                config={"planner_max_planning_time_s": 12.0},
+            ),
+            "execution": SimpleNamespace(
+                adapter_id="execution.native",
+                config={"planner_max_planning_time_s": 3.0},
+            ),
+        },
+        orchestrator=SimpleNamespace(config={}),
+    )
+    config = composer_main._kernel_config_from_deployment(
+        deployment,
+        collision_monitor_period_ns=None,
+        runtime_collision_query_timeout_ns=None,
+        runtime_dynamic_body_max_age_cap_ns=None,
+    )
+    assert config["planner_max_planning_time_s"] == 12.0
+
+
+def test_kernel_config_forwards_baseline_collision_policy_snapshot():
+    snapshot = {
+        "policy_id": "deployment_baseline",
+        "revision_id": 1,
+        "content_hash": "abc123",
+        "require_full_diagnostics": True,
+    }
+    deployment = SimpleNamespace(
+        adapters={
+            "execution": SimpleNamespace(adapter_id="execution.native", config={})
+        },
+        orchestrator=SimpleNamespace(config={}),
+        baseline_collision_policy_snapshot=lambda: snapshot,
+    )
+    config = composer_main._kernel_config_from_deployment(
+        deployment,
+        collision_monitor_period_ns=None,
+        runtime_collision_query_timeout_ns=None,
+        runtime_dynamic_body_max_age_cap_ns=None,
+    )
+    assert config["baseline_collision_policy_snapshot"] == snapshot
+
+
 def test_kernel_config_omits_single_shot_ik_timeout_when_absent():
     deployment = SimpleNamespace(
         adapters={

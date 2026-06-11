@@ -209,7 +209,10 @@ def create_cycle_router(state: ComposerState) -> APIRouter:
                     state, "No program loaded", error_code="no_program_loaded"
                 ),
             )
-        state.cycle_manager.set_velocity_scale(request.value)
+        state.cycle_manager.set_velocity_scale(
+            request.value,
+            principal_id=request.principal_id,
+        )
         logger.info("Velocity scale set to %.2f", request.value)
         return {"velocityScale": state.cycle_manager.velocity_scale}
     

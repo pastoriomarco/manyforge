@@ -1506,6 +1506,7 @@ def _deployment_capabilities_payload(state: ComposerState) -> dict[str, Any]:
         "context": set(),
         "scene": set(),
         "execution": set(),
+        "simulator": set(),
         "sensing": set(),
         "other": set(),
     }
@@ -1513,10 +1514,10 @@ def _deployment_capabilities_payload(state: ComposerState) -> dict[str, Any]:
     all_keys: set[str] = set()
     for slot, adapter in state.deployment.adapters.items():
         adapter_ids[slot] = adapter.adapter_id
-        for key in adapter.capability_keys:
-            all_keys.add(key)
-            prefix = key.split(".", 1)[0]
-            by_category[prefix if prefix in by_category else "other"].add(key)
+    for key in state.deployment.capability_keys():
+        all_keys.add(key)
+        prefix = key.split(".", 1)[0]
+        by_category[prefix if prefix in by_category else "other"].add(key)
     return {
         "programProfile": state.deployment.program_profile,
         "adapterIds": adapter_ids,
@@ -1525,6 +1526,7 @@ def _deployment_capabilities_payload(state: ComposerState) -> dict[str, Any]:
         "context": sorted(by_category["context"]),
         "scene": sorted(by_category["scene"]),
         "execution": sorted(by_category["execution"]),
+        "simulator": sorted(by_category["simulator"]),
         "sensing": sorted(by_category["sensing"]),
         "other": sorted(by_category["other"]),
         "timestampNs": time.monotonic_ns(),
@@ -5050,7 +5052,4 @@ def _materialize_scene_resource_add(
 def _deployment_capability_keys(state: ComposerState) -> set[str] | None:
     if state.deployment is None:
         return None
-    capability_keys: set[str] = set()
-    for adapter in state.deployment.adapters.values():
-        capability_keys.update(adapter.capability_keys)
-    return capability_keys
+    return state.deployment.capability_keys()

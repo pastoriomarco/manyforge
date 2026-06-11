@@ -36,6 +36,7 @@ def build_capabilities_payload(state: ComposerState) -> dict:
         "context": set(),
         "scene": set(),
         "execution": set(),
+        "simulator": set(),
         "sensing": set(),
         "other": set(),
     }
@@ -44,19 +45,20 @@ def build_capabilities_payload(state: ComposerState) -> dict:
 
     for slot, adapter in state.deployment.adapters.items():
         adapter_ids[slot] = adapter.adapter_id
-        for key in adapter.capability_keys:
-            all_keys.add(key)
-            prefix = key.split(".", 1)[0]
-            if prefix in categories:
-                categories[prefix].add(key)
-            else:
-                categories["other"].add(key)
+    for key in state.deployment.capability_keys():
+        all_keys.add(key)
+        prefix = key.split(".", 1)[0]
+        if prefix in categories:
+            categories[prefix].add(key)
+        else:
+            categories["other"].add(key)
 
     return CapabilitiesResponse(
         planning=sorted(categories["planning"]),
         context=sorted(categories["context"]),
         scene=sorted(categories["scene"]),
         execution=sorted(categories["execution"]),
+        simulator=sorted(categories["simulator"]),
         sensing=sorted(categories["sensing"]),
         other=sorted(categories["other"]),
         adapterIds=adapter_ids,

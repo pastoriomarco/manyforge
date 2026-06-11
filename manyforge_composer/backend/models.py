@@ -45,6 +45,7 @@ class CycleCommandErrorResponse(BaseModel):
 
 class VelocityScaleRequest(BaseModel):
     value: float = Field(ge=0.0, le=1.0)
+    principal_id: Optional[str] = Field(default=None, alias="principalId")
 
 
 class VelocityScaleResponse(BaseModel):
@@ -54,6 +55,49 @@ class VelocityScaleResponse(BaseModel):
 
 class CycleCommandResponse(BaseModel):
     state: str
+
+
+class SimulationResetResponse(BaseModel):
+    model_config = _ALIAS_CFG
+    success: bool
+    operation: str = "reset"
+    control_id: str = Field(alias="controlId")
+    scope: str
+    service_name: Optional[str] = Field(default=None, alias="serviceName")
+    duration_s: float = Field(alias="durationS")
+    command_gate_closed: bool = Field(default=False, alias="commandGateClosed")
+    command_gate_reopened: bool = Field(default=False, alias="commandGateReopened")
+    readiness: Optional[Dict[str, Any]] = None
+
+
+class SimulationSetStateRequest(BaseModel):
+    state: Literal["playing", "paused"]
+    reason: str = ""
+
+
+class SimulationStepRequest(BaseModel):
+    steps: int = Field(default=1, ge=1)
+    reason: str = ""
+
+
+class SimulationSetEntityStateRequest(BaseModel):
+    entity: str
+    pose: Dict[str, Any]
+    reason: str = ""
+
+
+class SimulationControlResponse(BaseModel):
+    model_config = _ALIAS_CFG
+    success: bool
+    operation: str
+    control_id: str = Field(alias="controlId")
+    service_name: Optional[str] = Field(default=None, alias="serviceName")
+    duration_s: float = Field(alias="durationS")
+    result_code: Optional[int] = Field(default=None, alias="resultCode")
+    result_message: str = Field(default="", alias="resultMessage")
+    state: Optional[str] = None
+    steps: Optional[int] = None
+    entity: Optional[str] = None
 
 
 # --- Catalog ---
@@ -339,6 +383,7 @@ class CapabilitiesResponse(BaseModel):
     context: List[str] = Field(default_factory=list)
     scene: List[str] = Field(default_factory=list)
     execution: List[str] = Field(default_factory=list)
+    simulator: List[str] = Field(default_factory=list)
     sensing: List[str] = Field(default_factory=list)
     other: List[str] = Field(default_factory=list)
     adapter_ids: Dict[str, str] = Field(default_factory=dict, alias="adapterIds")
@@ -755,6 +800,32 @@ class PoseSourceConfigResponse(BaseModel):
     )
 
 
+class SimulationControlCapabilitiesResponse(BaseModel):
+    model_config = _ALIAS_CFG
+    reset: bool = False
+    pause: bool = False
+    play: bool = False
+    step: bool = False
+    set_entity_state: bool = Field(default=False, alias="setEntityState")
+
+
+class SimulationResetConfigResponse(BaseModel):
+    model_config = _ALIAS_CFG
+    default_scope: str = Field(default="state", alias="defaultScope")
+    close_command_gate: bool = Field(default=True, alias="closeCommandGate")
+    wait_ready_s: float = Field(default=3.0, alias="waitReadyS")
+
+
+class SimulationControlConfigResponse(BaseModel):
+    model_config = _ALIAS_CFG
+    kind: str
+    service_prefix: str = Field(default="auto", alias="servicePrefix")
+    capabilities: SimulationControlCapabilitiesResponse = Field(
+        default_factory=SimulationControlCapabilitiesResponse
+    )
+    reset: Optional[SimulationResetConfigResponse] = None
+
+
 class FullDeploymentResponse(BaseModel):
     model_config = _ALIAS_CFG
     api_version: str = Field(alias="apiVersion")
@@ -799,6 +870,10 @@ class FullDeploymentResponse(BaseModel):
     pose_sources: List[PoseSourceConfigResponse] = Field(
         default_factory=list,
         alias="poseSources",
+    )
+    simulation_control: Optional[SimulationControlConfigResponse] = Field(
+        default=None,
+        alias="simulationControl",
     )
     source_path: str = Field(alias="sourcePath", default="")
 
@@ -853,6 +928,10 @@ class UpdateDeploymentRequest(BaseModel):
     pose_sources: Optional[List[Dict[str, Any]]] = Field(
         None,
         alias="poseSources",
+    )
+    simulation_control: Optional[Dict[str, Any]] = Field(
+        None,
+        alias="simulationControl",
     )
 
 

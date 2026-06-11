@@ -96,6 +96,27 @@ class RecoveryTrigger(Enum):
     NODE_FAILURE = "node_failure"
 
 
+RECOVERY_TRIGGER_CANONICAL_VALUES = frozenset({
+    "planning_failed",
+    "validation_failed",
+    "execute_failed",
+    "execute_timeout",
+    "scene_mismatch",
+    "precondition_failed",
+    "postcondition_failed",
+})
+
+
+def canonical_recovery_trigger_values() -> set[str]:
+    """Return live-authoring recovery trigger values.
+
+    Deprecated aliases remain parseable for persisted traces, but live
+    model/API allowlists must expose only the canonical spec/460 taxonomy.
+    """
+
+    return set(RECOVERY_TRIGGER_CANONICAL_VALUES)
+
+
 @dataclass
 class InterventionSession:
     """Tracks a direct-control intervention session."""
@@ -394,7 +415,8 @@ class CycleManager:
     @property
     def velocity_scale(self) -> float:
         """Current velocity scale (0.0 to 1.0)."""
-        return self._velocity_scale
+        with self._lock:
+            return self._velocity_scale
 
     @property
     def error(self) -> Optional[str]:
@@ -1193,7 +1215,9 @@ class CycleManager:
             self._state = CycleState.IDLE
             self._pending_delegated_recovery = None
 
-    def set_velocity_scale(self, scale: float) -> None:
+    def set_velocity_scale(
+        self, scale: float, principal_id: str | None = None
+    ) -> None:
         """Set velocity_scale on blackboard. Clamped to [0.0, 1.0].
 
         Rejects NaN and infinity — these would propagate to the robot.
@@ -1208,8 +1232,9 @@ class CycleManager:
         if not isinstance(scale, (int, float)) or math.isnan(scale) or math.isinf(scale):
             raise ValueError(f"velocity_scale must be a finite number, got {scale!r}")
         scale = max(0.0, min(1.0, float(scale)))
-        previous_scale = self._velocity_scale
-        self._velocity_scale = scale
+        with self._lock:
+            previous_scale = self._velocity_scale
+            self._velocity_scale = scale
 
         bb = py_trees.blackboard.Client(name="cycle_manager_vs")
         bb.register_key(key="velocity_scale", access=py_trees.common.Access.WRITE)
@@ -1218,7 +1243,7 @@ class CycleManager:
         try:
             forward = getattr(self._kernel, "set_runtime_velocity_scale", None)
             if forward is not None:
-                forward(scale)
+                forward(scale, principal_id=principal_id)
         except Exception:
             logger.debug(
                 "kernel.set_runtime_velocity_scale failed; HMI runtime "
@@ -1226,14 +1251,17 @@ class CycleManager:
                 exc_info=True,
             )
         if previous_scale != scale:
+            details = {
+                "event": "runtime_velocity_scale_changed",
+                "previous_scale": previous_scale,
+                "new_scale": scale,
+                "backend_status": "forwarded",
+            }
+            if principal_id:
+                details["principal_id"] = principal_id
             logger.info(
                 "runtime_velocity_scale_changed",
-                extra={
-                    "event": "runtime_velocity_scale_changed",
-                    "previous_scale": previous_scale,
-                    "new_scale": scale,
-                    "backend_status": "forwarded",
-                },
+                extra=details,
             )
 
     def _refresh_signal_registry(self) -> None:

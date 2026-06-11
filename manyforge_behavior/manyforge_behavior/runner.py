@@ -25,7 +25,17 @@ from manyforge_behavior.nodes.logic import (
     WaitForSignalEdge,
     WaitForGripperState,
 )
-from manyforge_behavior.nodes.motion import MoveManipulatorAction, ResetTrajectories, _rpy_deg_to_xyzw
+from manyforge_behavior.nodes.motion import (
+    MoveManipulatorAction,
+    ResetTrajectories,
+    _rpy_deg_to_xyzw,
+)
+from manyforge_behavior.nodes.simulation import (
+    ResetSimulation,
+    SetEntityState,
+    SetSimulationState,
+    StepSimulation,
+)
 from manyforge_behavior.nodes.motion_scoped import MoveUntilSignal, ProbeSearchMove
 from manyforge_behavior.nodes.scene import (
     AddCollisionObject,
@@ -64,6 +74,10 @@ PLUGIN_FACTORY: dict[str, type] = {
     "move_until_signal": MoveUntilSignal,
     "probe_search_move": ProbeSearchMove,
     "reset_trajectories": ResetTrajectories,
+    "reset_simulation": ResetSimulation,
+    "set_simulation_state": SetSimulationState,
+    "step_simulation": StepSimulation,
+    "set_entity_state": SetEntityState,
     "add_collision_object": AddCollisionObject,
     "upsert_collision_object": UpsertCollisionObject,
     "remove_collision_object": RemoveCollisionObject,
@@ -110,6 +124,12 @@ class OrchestratorRunner:
         pose_source_between_nodes_callback: Optional[
             Callable[..., dict[str, Any]]
         ] = None,
+        simulation_control_callback: Optional[
+            Callable[..., dict[str, Any]]
+        ] = None,
+        simulation_reset_callback: Optional[
+            Callable[..., dict[str, Any]]
+        ] = None,
     ):
         self._catalog_path = catalog_path
         self._program_path = program_path
@@ -130,6 +150,8 @@ class OrchestratorRunner:
         self._scene_snapshot_url_publisher = scene_snapshot_url_publisher
         self._pose_source_apply_callback = pose_source_apply_callback
         self._pose_source_between_nodes_callback = pose_source_between_nodes_callback
+        self._simulation_control_callback = simulation_control_callback
+        self._simulation_reset_callback = simulation_reset_callback
         self._motion_coordinator = MotionExecutionCoordinator(kernel)
         # Intervention context — set by cycle_manager before building
         # intervention subtrees so nodes like QueryModelNode can attribute
@@ -249,9 +271,28 @@ class OrchestratorRunner:
             access=py_trees.common.Access.WRITE,
         )
         bb.pose_source_between_nodes_callback = self._pose_source_between_nodes_callback
+        bb.register_key(
+            key="simulation_control_callback",
+            access=py_trees.common.Access.WRITE,
+        )
+        bb.simulation_control_callback = self._simulation_control_callback
+        if (
+            bb.simulation_control_callback is None
+            and self._simulation_reset_callback is not None
+        ):
+            bb.simulation_control_callback = self._legacy_simulation_reset_adapter
 
         self._tree = tree
         return tree
+
+    def _legacy_simulation_reset_adapter(self, **kwargs: Any) -> dict[str, Any]:
+        if kwargs.get("operation") != "reset":
+            raise RuntimeError("legacy simulation reset callback only supports reset")
+        payload = dict(kwargs)
+        payload.pop("operation", None)
+        if self._simulation_reset_callback is None:
+            raise RuntimeError("simulation reset callback is not configured")
+        return self._simulation_reset_callback(**payload)
 
     def apply_scene(self) -> None:
         """Apply program scene resources via kernel.scene_edit() before execution."""

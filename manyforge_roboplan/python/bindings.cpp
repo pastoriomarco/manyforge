@@ -502,6 +502,8 @@ const char* kernel_event_type_to_string(KernelEventType type) {
     case KernelEventType::kStopIssued: return "stop_issued";
     case KernelEventType::kPauseRequested: return "pause_requested";
     case KernelEventType::kResumeRequested: return "resume_requested";
+    case KernelEventType::kRuntimeVelocityScaleChanged:
+      return "runtime_velocity_scale_changed";
     case KernelEventType::kCompletedAcknowledged: return "acknowledge_completed";
     case KernelEventType::kInterventionAcknowledged: return "acknowledge_intervention";
     case KernelEventType::kErrorRaised: return "error_raised";
@@ -771,6 +773,32 @@ MotionInterruptStopProfileDTO stop_profile_from_python(
   return profile;
 }
 
+CollisionPolicySnapshot collision_policy_snapshot_from_python(
+    const py::dict& policy_dict, const char* context) {
+  CollisionPolicySnapshot policy;
+  if (!policy_dict.contains("policy_id") || policy_dict["policy_id"].is_none()) {
+    throw std::invalid_argument(std::string(context) + ".policy_id is required");
+  }
+  policy.policy_id = policy_dict["policy_id"].cast<std::string>();
+  if (policy.policy_id.empty()) {
+    throw std::invalid_argument(std::string(context) + ".policy_id must not be empty");
+  }
+  if (policy_dict.contains("revision_id") && !policy_dict["revision_id"].is_none()) {
+    policy.revision.revision_id =
+        policy_dict["revision_id"].cast<std::uint64_t>();
+  }
+  if (policy_dict.contains("content_hash") && !policy_dict["content_hash"].is_none()) {
+    policy.revision.content_hash =
+        policy_dict["content_hash"].cast<std::string>();
+  }
+  if (policy_dict.contains("require_full_diagnostics") &&
+      !policy_dict["require_full_diagnostics"].is_none()) {
+    policy.require_full_diagnostics =
+        policy_dict["require_full_diagnostics"].cast<bool>();
+  }
+  return policy;
+}
+
 ExecutionKernelConfig kernel_config_from_python(const py::object& config_obj) {
   ExecutionKernelConfig config;
   if (config_obj.is_none()) {
@@ -836,6 +864,20 @@ ExecutionKernelConfig kernel_config_from_python(const py::object& config_obj) {
                    config.single_shot_ik_timeout_s);
   if (config.single_shot_ik_timeout_s <= 0.0) {
     throw std::invalid_argument("single_shot_ik_timeout_s must be > 0");
+  }
+  config.planner_max_planning_time_s =
+      read_seconds("planner_max_planning_time_s",
+                   "planner_max_planning_time_ms",
+                   config.planner_max_planning_time_s);
+  if (config.planner_max_planning_time_s <= 0.0) {
+    throw std::invalid_argument("planner_max_planning_time_s must be > 0");
+  }
+  if (config_dict.contains("baseline_collision_policy_snapshot") &&
+      !config_dict["baseline_collision_policy_snapshot"].is_none()) {
+    config.baseline_collision_policy_snapshot =
+        collision_policy_snapshot_from_python(
+            config_dict["baseline_collision_policy_snapshot"].cast<py::dict>(),
+            "baseline_collision_policy_snapshot");
   }
   // Two optional controlled-stop profiles surfaced to Python so
   // deployment YAML can carry them. Recommended defaults are
@@ -1920,10 +1962,16 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
            py::arg("principal_id"),
            py::arg("reason"))
       .def("set_runtime_velocity_scale",
-           [](NativeKernelBundle& self, double scale) {
+           [](NativeKernelBundle& self, double scale, py::object principal_id) {
+             std::optional<std::string> principal;
+             if (!principal_id.is_none()) {
+               principal = principal_id.cast<std::string>();
+             }
              py::gil_scoped_release release;
-             self.kernel->set_runtime_velocity_scale(scale);
-           })
+             self.kernel->set_runtime_velocity_scale(scale, std::move(principal));
+           },
+           py::arg("scale"),
+           py::arg("principal_id") = py::none())
       .def("get_status", [](NativeKernelBundle& self) -> py::dict {
         const auto status = [&]() {
           py::gil_scoped_release release;

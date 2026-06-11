@@ -82,6 +82,11 @@ class TestGetRequiredKeys:
         assert "scene.edit.upsert" in CAPABILITY_REGISTRY
         assert "tool.gripper.command" in CAPABILITY_REGISTRY
         assert "execution.contact.force_torque" in CAPABILITY_REGISTRY
+        assert "simulator.control.reset" in CAPABILITY_REGISTRY
+        assert "simulator.control.pause" in CAPABILITY_REGISTRY
+        assert "simulator.control.play" in CAPABILITY_REGISTRY
+        assert "simulator.control.step" in CAPABILITY_REGISTRY
+        assert "simulator.entity_state.set" in CAPABILITY_REGISTRY
 
     def test_is_known_profile(self):
         assert is_known_profile("v0.0") is True

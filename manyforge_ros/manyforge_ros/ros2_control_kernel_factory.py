@@ -49,6 +49,8 @@ def create_ros2_control_kernel(
     if execution is None:
         raise RuntimeError("ROS 2 controller execution requires an execution adapter")
     config = dict(execution.config or {})
+    planning = deployment.adapters.get("planning")
+    planning_config = dict(planning.config or {}) if planning is not None else {}
 
     import manyforge_roboplan_py
     from native_kernel_client import NativeKernelClient
@@ -66,7 +68,7 @@ def create_ros2_control_kernel(
         deployment_path=deployment.source_path,
         extra_package_paths=default_package_paths(),
     )
-    kernel_config: dict[str, float | int] = {}
+    kernel_config: dict[str, Any] = {}
     if collision_monitor_period_ns is not None:
         kernel_config["collision_monitor_period_ns"] = collision_monitor_period_ns
     if runtime_collision_query_timeout_ns is not None:
@@ -85,6 +87,14 @@ def create_ros2_control_kernel(
     ):
         if key in config:
             kernel_config[key] = config[key]
+    for key in ("planner_max_planning_time_s", "planner_max_planning_time_ms"):
+        if key in planning_config:
+            kernel_config[key] = planning_config[key]
+        elif key in config:
+            kernel_config[key] = config[key]
+    baseline_policy = deployment.baseline_collision_policy_snapshot()
+    if baseline_policy is not None:
+        kernel_config["baseline_collision_policy_snapshot"] = baseline_policy
     kernel_config_arg = kernel_config or None
 
     required_joints = tuple(str(joint) for joint in config.get("required_joints", []))

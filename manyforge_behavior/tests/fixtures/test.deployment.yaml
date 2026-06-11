@@ -25,11 +25,13 @@ adapters:
       - context.state.current
       - context.validation.trajectory
       - context.collision.check
+      - context.collision.check.detailed
       - context.kinematics.fk
       - context.limits.joint
       - scene.shape.box
       - scene.shape.sphere
       - scene.edit.add
+      - scene.edit.upsert
       - scene.edit.remove
       - scene.edit.update_pose
     config: {}

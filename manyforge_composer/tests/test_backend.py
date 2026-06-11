@@ -53,6 +53,86 @@ _TEST_SECURITY = SecurityConfig(
 )
 
 
+class _FakeCycleState:
+    def __init__(self, value: str) -> None:
+        self.value = value
+
+
+class _FakeCycleManager:
+    def __init__(self, state_value: str) -> None:
+        self.state = _FakeCycleState(state_value)
+        self.aborted = False
+
+    def abort_intervention(self) -> None:
+        self.aborted = True
+        self.state = _FakeCycleState("idle")
+
+
+def _simulation_control_deployment(
+    *,
+    command_gate_topic: str = "/manyforge/test_command_enable",
+    source_mode: str = "commanded_sim",
+    capabilities: dict[str, bool] | None = None,
+) -> Deployment:
+    control_capabilities = {"reset": True}
+    if capabilities:
+        control_capabilities.update(capabilities)
+    return Deployment.from_dict(
+        {
+            "api_version": "manyforge.deployment.v0",
+            "schema_version": "0.1.0",
+            "name": "simulation_control_test",
+            "program_profile": "v0.1",
+            "robot_config": {
+                "robot_id": "ur5",
+                "group_id": "arm",
+                "urdf_path": "package://test.urdf",
+                "global_max_tcp_linear_speed_mps": 0.5,
+            },
+            "simulation_control": {
+                "kind": "ros2_simulation_interfaces",
+                "service_prefix": "auto",
+                "capabilities": control_capabilities,
+                "reset": {
+                    "default_scope": "state",
+                    "close_command_gate": True,
+                    "wait_ready_s": 0.1,
+                },
+            },
+            "adapters": {
+                "planning": {
+                    "adapter_id": "planning.test",
+                    "adapter_version": "0.1.0",
+                    "config": {},
+                },
+                "context": {
+                    "adapter_id": "context.test",
+                    "adapter_version": "0.1.0",
+                    "config": {},
+                },
+                "execution": {
+                    "adapter_id": "execution.test",
+                    "adapter_version": "0.1.0",
+                    "config": {
+                        "execution_state_source_mode": source_mode,
+                        "command_gate_topic": command_gate_topic,
+                    },
+                },
+            },
+            "orchestrator": {
+                "engine": "py_trees",
+                "config": {},
+            },
+            "launch": {
+                "runner": {
+                    "module": "manyforge_behavior.runner",
+                    "args": [],
+                },
+            },
+        }
+    )
+
+
 def _write_program_with_runtime_policy(
     tmp_path: Path,
     *,
@@ -341,6 +421,256 @@ def test_reset_refreshes_visual_scene_after_runtime_object_removal(client, state
     assert all(obj["object_id"] != "wall" for obj in scene_response.json()["objects"])
 
 
+def test_simulation_reset_route_uses_deployment_contract_and_records_events(state):
+    state.deployment = _simulation_control_deployment()
+    state.update_external_runtime_status(
+        "isaac_demo_supervisor",
+        {"readiness": "ready", "canExecute": True},
+    )
+    state._refresh_runtime_after_simulation_reset = lambda: None
+    calls = []
+
+    def fake_reset(**kwargs):
+        calls.append(kwargs)
+        return {
+            "success": True,
+            "service_name": "/reset_simulation",
+            "scope": "state",
+            "duration_s": 0.01,
+            "command_gate_closed": True,
+            "command_gate_reopened": True,
+            "readiness": {"ready": True, "status": "ready"},
+        }
+
+    state._run_ros_simulation_reset = fake_reset
+    app = create_app(state, security=_TEST_SECURITY)
+    with TestClient(app) as test_client:
+        response = test_client.post("/api/simulation/reset")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["success"] is True
+    assert body["operation"] == "reset"
+    assert body["scope"] == "state"
+    assert body["serviceName"] == "/reset_simulation"
+    assert body["commandGateClosed"] is True
+    assert body["commandGateReopened"] is True
+    assert calls
+    assert calls[0]["service_prefix"] == "auto"
+    assert calls[0]["command_gate_topic"] == "/manyforge/test_command_enable"
+    assert calls[0]["close_command_gate"] is True
+
+    events = state.event_recorder.get_events_since(0, include_node_transitions=True)
+    event_types = [event["type"] for event in events]
+    assert "simulation_control_requested" in event_types
+    assert "simulation_control_completed" in event_types
+
+
+def test_simulation_reset_route_rejects_active_program_cycle(state):
+    state.deployment = _simulation_control_deployment()
+    state.cycle_manager = _FakeCycleManager("running")
+    state._run_ros_simulation_reset = lambda **_kwargs: pytest.fail(
+        "reset service must not be called during ad-hoc active cycle reset"
+    )
+    app = create_app(state, security=_TEST_SECURITY)
+    with TestClient(app) as test_client:
+        response = test_client.post("/api/simulation/reset")
+
+    assert response.status_code == 409
+    assert "active program cycle" in response.json()["detail"]
+
+
+def test_simulation_reset_aborts_direct_control_before_service(state):
+    state.deployment = _simulation_control_deployment(source_mode="authored_preview")
+    manager = _FakeCycleManager("direct_control")
+    state.cycle_manager = manager
+    state._refresh_runtime_after_simulation_reset = lambda: None
+    state._run_ros_simulation_reset = lambda **_kwargs: {
+        "success": True,
+        "service_name": "/reset_simulation",
+        "scope": "state",
+        "duration_s": 0.01,
+        "command_gate_closed": True,
+        "command_gate_reopened": True,
+        "readiness": {"ready": True, "status": "not_required"},
+    }
+
+    result = state.reset_simulation(reason="test", source="api")
+
+    assert result["success"] is True
+    assert manager.aborted is True
+
+
+def test_behavior_node_reset_allows_running_cycle(state):
+    state.deployment = _simulation_control_deployment(source_mode="authored_preview")
+    state.cycle_manager = _FakeCycleManager("running")
+    state._refresh_runtime_after_simulation_reset = lambda: None
+    calls = []
+    state._run_ros_simulation_reset = lambda **kwargs: calls.append(kwargs) or {
+        "success": True,
+        "service_name": "/reset_simulation",
+        "scope": "state",
+        "duration_s": 0.01,
+        "command_gate_closed": True,
+        "command_gate_reopened": True,
+        "readiness": {"ready": True, "status": "not_required"},
+    }
+
+    result = state.reset_simulation_for_behavior_node(reason="reset_node")
+
+    assert result["success"] is True
+    assert calls
+
+
+def test_simulation_reset_requires_command_gate_topic(state):
+    state.deployment = _simulation_control_deployment(command_gate_topic="")
+    state._run_ros_simulation_reset = lambda **_kwargs: pytest.fail(
+        "reset service must not be called without command gate topic"
+    )
+
+    with pytest.raises(RuntimeError, match="command_gate_topic"):
+        state.reset_simulation(reason="test", source="api")
+
+
+def test_set_simulation_state_route_uses_deployment_capability_and_records_events(state):
+    state.deployment = _simulation_control_deployment(
+        capabilities={"pause": True, "play": True},
+    )
+    calls = []
+
+    def fake_control(**kwargs):
+        calls.append(kwargs)
+        return {
+            "success": True,
+            "operation": "set_state",
+            "service_name": "/set_simulation_state",
+            "duration_s": 0.01,
+            "result_code": 1,
+            "result_message": "",
+            "state": kwargs["payload"]["state"],
+        }
+
+    state._run_ros_simulation_control_operation = fake_control
+    app = create_app(state, security=_TEST_SECURITY)
+    with TestClient(app) as test_client:
+        response = test_client.post(
+            "/api/simulation/state",
+            json={"state": "paused"},
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["success"] is True
+    assert body["operation"] == "set_state"
+    assert body["state"] == "paused"
+    assert body["serviceName"] == "/set_simulation_state"
+    assert calls[0]["payload"] == {"state": "paused"}
+
+    events = state.event_recorder.get_events_since(0, include_node_transitions=True)
+    event_types = [event["type"] for event in events]
+    assert "simulation_control_requested" in event_types
+    assert "simulation_control_completed" in event_types
+
+
+def test_simulation_step_and_entity_state_route_payloads(state):
+    state.deployment = _simulation_control_deployment(
+        capabilities={"step": True, "set_entity_state": True},
+    )
+    calls = []
+
+    def fake_control(**kwargs):
+        calls.append(kwargs)
+        payload = kwargs["payload"]
+        return {
+            "success": True,
+            "operation": kwargs["operation"],
+            "service_name": f"/{kwargs['operation']}",
+            "duration_s": 0.01,
+            "result_code": 1,
+            "result_message": "",
+            "steps": payload.get("steps"),
+            "entity": payload.get("entity"),
+        }
+
+    state._run_ros_simulation_control_operation = fake_control
+    app = create_app(state, security=_TEST_SECURITY)
+    pose = {
+        "frame_id": "world",
+        "position_m": [0.1, 0.2, 0.3],
+        "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+    }
+    with TestClient(app) as test_client:
+        step_response = test_client.post(
+            "/api/simulation/step",
+            json={"steps": 4},
+        )
+        entity_response = test_client.post(
+            "/api/simulation/entity-state",
+            json={"entity": "/World/box", "pose": pose},
+        )
+
+    assert step_response.status_code == 200
+    assert step_response.json()["steps"] == 4
+    assert entity_response.status_code == 200
+    assert entity_response.json()["entity"] == "/World/box"
+    assert calls[0]["payload"] == {"steps": 4}
+    assert calls[1]["payload"] == {"entity": "/World/box", "pose": pose}
+
+
+def test_behavior_node_simulation_control_allows_running_cycle(state):
+    state.deployment = _simulation_control_deployment(capabilities={"step": True})
+    state.cycle_manager = _FakeCycleManager("running")
+    calls = []
+    state._run_ros_simulation_control_operation = lambda **kwargs: calls.append(kwargs) or {
+        "success": True,
+        "operation": kwargs["operation"],
+        "service_name": "/step_simulation",
+        "duration_s": 0.01,
+        "result_code": 1,
+        "steps": kwargs["payload"]["steps"],
+    }
+
+    result = state.simulation_control_for_behavior_node(
+        operation="step",
+        reason="node_step",
+        steps=2,
+    )
+
+    assert result["success"] is True
+    assert result["steps"] == 2
+    assert calls
+
+
+def test_simulation_control_route_rejects_missing_capability(state):
+    state.deployment = _simulation_control_deployment()
+    state._run_ros_simulation_control_operation = lambda **_kwargs: pytest.fail(
+        "control service must not be called without deployment capability"
+    )
+    app = create_app(state, security=_TEST_SECURITY)
+    with TestClient(app) as test_client:
+        response = test_client.post("/api/simulation/step", json={"steps": 1})
+
+    assert response.status_code == 409
+    assert "simulator.control.step" in response.json()["detail"]
+
+
+def test_simulation_control_route_rejects_active_program_cycle(state):
+    state.deployment = _simulation_control_deployment(capabilities={"pause": True})
+    state.cycle_manager = _FakeCycleManager("running")
+    state._run_ros_simulation_control_operation = lambda **_kwargs: pytest.fail(
+        "control service must not be called during ad-hoc active cycle control"
+    )
+    app = create_app(state, security=_TEST_SECURITY)
+    with TestClient(app) as test_client:
+        response = test_client.post(
+            "/api/simulation/state",
+            json={"state": "paused"},
+        )
+
+    assert response.status_code == 409
+    assert "active program cycle" in response.json()["detail"]
+
+
 def test_run_from_stopped():
     """Run, stop, run again, verify state=running."""
     with make_client(execute_duration_s=1.0) as client:
@@ -365,10 +695,17 @@ def test_velocity_scale(client, state):
     client.post("/api/program/load", json={"path": _PROGRAM_PATH})
     
     # Set velocity scale
-    response = client.put("/api/cycle/velocity-scale", json={"value": 0.5})
+    response = client.put(
+        "/api/cycle/velocity-scale",
+        json={"value": 0.5, "principalId": "operator_alice"},
+    )
     assert response.status_code == 200
     data = response.json()
     assert data["velocityScale"] == 0.5
+    assert (
+        state.cycle_manager._kernel.runtime_velocity_scale_principal_ids[-1]
+        == "operator_alice"
+    )
 
 
 # =============================================================================

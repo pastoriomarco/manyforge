@@ -70,6 +70,20 @@ pose_sources:
         entity: /mac_n_cheese_centered
         apply_policy: before_planning
 
+simulation_control:
+  kind: ros2_simulation_interfaces
+  service_prefix: auto
+  capabilities:
+    reset: true
+    pause: true
+    play: true
+    step: true
+    set_entity_state: true
+  reset:
+    default_scope: state
+    close_command_gate: true
+    wait_ready_s: 3.0
+
 adapters:
   planning:
     adapter_id: planning.roboplan
@@ -89,6 +103,7 @@ adapters:
       - context.state.current
       - context.validation.trajectory
       - context.collision.check
+      - context.collision.check.detailed
       - context.kinematics.fk
       - context.limits.joint
       - context.pose.resolve_reference
@@ -98,6 +113,7 @@ adapters:
       - scene.shape.cylinder
       - scene.shape.mesh
       - scene.edit.add
+      - scene.edit.upsert
       - scene.edit.remove
       - scene.edit.update_pose
       - scene.edit.attach_detach
@@ -281,6 +297,13 @@ assistant_modes:
         - timer
         - wait_for_signal_bool
         - set_key_bool_value
+        # Simulation control nodes — authorable because this deployment grants
+        # the matching simulator.control.* / simulator.entity_state.set
+        # capabilities; per-node required_capabilities gate them at resolve.
+        - reset_simulation
+        - set_simulation_state
+        - step_simulation
+        - set_entity_state
 
 tool_catalog:
   - id: catalog_read

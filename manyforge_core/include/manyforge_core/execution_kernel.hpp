@@ -15,6 +15,7 @@
 #include <manyforge_core/time/ischeduler.hpp>
 #include <manyforge_core/types/execute_request.hpp>
 #include <manyforge_core/types/execution_result.hpp>
+#include <manyforge_core/types/collision.hpp>
 #include <manyforge_core/types/kernel_event.hpp>
 #include <manyforge_core/types/metrics.hpp>
 #include <manyforge_core/types/motion_interrupt.hpp>
@@ -69,6 +70,16 @@ struct ExecutionKernelConfig {
   // deployments can override with MANYFORGE_VALIDATION_COLLISION_WORKERS.
   int validation_collision_workers = 4;
   int validation_collision_min_waypoints_for_parallel = 8;
+
+  // Deployment-configured RRT planning budget ceiling. Per-request
+  // `planning_timeout_s` can lower this budget; deployments that need longer
+  // planning windows must raise this value explicitly so the authority surface
+  // is visible in the deployment artifact.
+  double planner_max_planning_time_s = 5.0;
+
+  // Optional deployment-baseline collision policy. Factories synthesize the
+  // historical `default_free_space` policy only when this is absent.
+  std::optional<CollisionPolicySnapshot> baseline_collision_policy_snapshot;
 
   // Runtime collision monitoring must run against live observed robot state,
   // not authored/planning-context state. A backend snapshot older than this
@@ -202,8 +213,10 @@ class ExecutionKernel {
   /// changing the scale never stops an action by itself. `scale` is validated
   /// finite and clamped to [0, 1]. NOT serialized through lifecycle_mutex_:
   /// this is a high-rate operator surface and the backend's atomic store
-  /// handles concurrency.
-  void set_runtime_velocity_scale(double scale);
+  /// handles concurrency. `principal_id` is optional because lower-level
+  /// backend/direct callers may not have a supervisory actor identity.
+  void set_runtime_velocity_scale(
+      double scale, std::optional<std::string> principal_id = std::nullopt);
 
   /// Get current kernel status.
   ExecutionStatus get_status() const;

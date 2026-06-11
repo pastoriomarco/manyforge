@@ -54,10 +54,7 @@ _DEPLOYMENT_SUFFIXES = (".deployment.yaml", ".deployment.yml")
 def _deployment_capability_keys(state: ComposerState) -> set[str] | None:
     if state.deployment is None:
         return None
-    capability_keys: set[str] = set()
-    for adapter in state.deployment.adapters.values():
-        capability_keys.update(adapter.capability_keys)
-    return capability_keys
+    return state.deployment.capability_keys()
 
 
 def _coerce_artifact_save_path(
@@ -405,6 +402,36 @@ def _deployment_to_full_response(
             }
             for source in deployment.pose_sources.values()
         ],
+        simulationControl=(
+            {
+                "kind": deployment.simulation_control.kind,
+                "servicePrefix": deployment.simulation_control.service_prefix,
+                "capabilities": {
+                    "reset": deployment.simulation_control.capabilities.reset,
+                    "pause": deployment.simulation_control.capabilities.pause,
+                    "play": deployment.simulation_control.capabilities.play,
+                    "step": deployment.simulation_control.capabilities.step,
+                    "setEntityState": (
+                        deployment.simulation_control.capabilities.set_entity_state
+                    ),
+                },
+                "reset": (
+                    {
+                        "defaultScope": (
+                            deployment.simulation_control.reset.default_scope
+                        ),
+                        "closeCommandGate": (
+                            deployment.simulation_control.reset.close_command_gate
+                        ),
+                        "waitReadyS": deployment.simulation_control.reset.wait_ready_s,
+                    }
+                    if deployment.simulation_control.capabilities.reset
+                    else None
+                ),
+            }
+            if deployment.simulation_control is not None
+            else None
+        ),
         sourcePath=source_path,
     ).model_dump(by_alias=True)
 

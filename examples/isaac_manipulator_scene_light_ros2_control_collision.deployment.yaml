@@ -42,6 +42,19 @@ grippers:
     tcp_frame: grasp_frame
     auxiliary_frames:
     - gripper_frame
+simulation_control:
+  kind: ros2_simulation_interfaces
+  service_prefix: auto
+  capabilities:
+    reset: true
+    pause: true
+    play: true
+    step: true
+    set_entity_state: true
+  reset:
+    default_scope: state
+    close_command_gate: true
+    wait_ready_s: 3.0
 adapters:
   planning:
     adapter_id: planning.roboplan
@@ -63,6 +76,7 @@ adapters:
     - context.state.current
     - context.validation.trajectory
     - context.collision.check
+    - context.collision.check.detailed
     - context.kinematics.fk
     - context.limits.joint
     - context.pose.resolve_reference
@@ -72,6 +86,7 @@ adapters:
     - scene.shape.cylinder
     - scene.shape.mesh
     - scene.edit.add
+    - scene.edit.upsert
     - scene.edit.remove
     - scene.edit.update_pose
     - scene.edit.attach_detach

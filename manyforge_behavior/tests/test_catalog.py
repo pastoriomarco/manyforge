@@ -124,10 +124,14 @@ class TestCatalogLoading:
         assert "upsert_collision_object" not in v0_ids
         assert "attach_object_to_link" not in v0_ids
         assert "detach_object_from_link" not in v0_ids
+        assert "reset_simulation" not in v0_ids
+        assert "set_simulation_state" not in v0_ids
+        assert "step_simulation" not in v0_ids
+        assert "set_entity_state" not in v0_ids
         # v0.2 entries: motion-scoped trip nodes
         assert "move_until_signal" not in v0_ids
         assert "probe_search_move" not in v0_ids
-        assert len(v0_entries) == len(catalog.entries) - 6
+        assert len(v0_entries) == len(catalog.entries) - 10
 
     def test_command_gripper_is_marked_experimental(self):
         catalog = NodeCatalog(CATALOG_PATH)

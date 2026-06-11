@@ -16,7 +16,16 @@ from manyforge_behavior.kernel_client import (
     MockKernelClient,
     SceneEditRequest,
 )
-from manyforge_behavior.nodes.motion import MoveManipulatorAction, ResetTrajectories
+from manyforge_behavior.nodes.motion import (
+    MoveManipulatorAction,
+    ResetTrajectories,
+)
+from manyforge_behavior.nodes.simulation import (
+    ResetSimulation,
+    SetEntityState,
+    SetSimulationState,
+    StepSimulation,
+)
 from manyforge_behavior.nodes.control_flow import RepeatDecorator
 from manyforge_behavior.nodes.scene import (
     AddCollisionObject,
@@ -218,6 +227,7 @@ class TestMoveManipulatorAction:
         assert kernel.last_execute_request.relative_move is not None
         assert kernel.last_execute_request.relative_move["target_reference"] == {
             "type": "object",
+
             "id": "graspable",
         }
         assert "offset_reference" not in kernel.last_execute_request.relative_move
@@ -513,6 +523,114 @@ class TestMoveManipulatorAction:
             "type": "object",
             "id": "dynamic_box",
         }
+
+
+class TestResetSimulation:
+    def _install_callback(self, callback):
+        client = py_trees.blackboard.Client(name="simulation_reset_writer")
+        client.register_key(
+            key="simulation_control_callback",
+            access=py_trees.common.Access.WRITE,
+        )
+        client.simulation_control_callback = callback
+
+    def test_calls_composer_callback_with_running_authority(self):
+        calls = []
+
+        def callback(**kwargs):
+            calls.append(kwargs)
+            return {"success": True, "control_id": "reset1"}
+
+        self._install_callback(callback)
+        node = ResetSimulation(name="reset_sim", reason="program_reset")
+
+        assert _tick_node(node) == py_trees.common.Status.SUCCESS
+        assert calls == [
+            {
+                "operation": "reset",
+                "reason": "program_reset",
+                "source": "behavior_node",
+                "allow_running": True,
+            }
+        ]
+
+    def test_fails_without_callback(self):
+        self._install_callback(None)
+        node = ResetSimulation(name="reset_sim")
+
+        assert _tick_node(node) == py_trees.common.Status.FAILURE
+        assert "callback" in node.feedback_message
+
+    def test_fails_when_callback_rejects(self):
+        self._install_callback(lambda **_kwargs: {"success": False, "error": "denied"})
+        node = ResetSimulation(name="reset_sim")
+
+        assert _tick_node(node) == py_trees.common.Status.FAILURE
+        assert node.feedback_message == "denied"
+
+
+class TestSimulationControlNodes:
+    def _install_callback(self, callback):
+        client = py_trees.blackboard.Client(name="simulation_control_writer")
+        client.register_key(
+            key="simulation_control_callback",
+            access=py_trees.common.Access.WRITE,
+        )
+        client.simulation_control_callback = callback
+
+    def test_set_simulation_state_calls_composer_callback(self):
+        calls = []
+        self._install_callback(lambda **kwargs: calls.append(kwargs) or {"success": True})
+        node = SetSimulationState(name="pause_sim", state="paused", reason="pause")
+
+        assert _tick_node(node) == py_trees.common.Status.SUCCESS
+        assert calls == [
+            {
+                "operation": "set_state",
+                "reason": "pause",
+                "source": "behavior_node",
+                "allow_running": True,
+                "state": "paused",
+            }
+        ]
+
+    def test_step_simulation_calls_composer_callback(self):
+        calls = []
+        self._install_callback(lambda **kwargs: calls.append(kwargs) or {"success": True})
+        node = StepSimulation(name="step_sim", steps=3)
+
+        assert _tick_node(node) == py_trees.common.Status.SUCCESS
+        assert calls == [
+            {
+                "operation": "step",
+                "reason": "step_sim",
+                "source": "behavior_node",
+                "allow_running": True,
+                "steps": 3,
+            }
+        ]
+
+    def test_set_entity_state_calls_composer_callback(self):
+        calls = []
+        self._install_callback(lambda **kwargs: calls.append(kwargs) or {"success": True})
+        pose = {
+            "frame_id": "world",
+            "position_m": [0.1, 0.2, 0.3],
+            "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+        }
+        node = SetEntityState(name="set_entity", entity="/World/box", pose=pose)
+
+        assert _tick_node(node) == py_trees.common.Status.SUCCESS
+        assert calls == [
+            {
+                "operation": "set_entity_state",
+                "reason": "set_entity",
+                "source": "behavior_node",
+                "allow_running": True,
+                "entity": "/World/box",
+                "pose": pose,
+            }
+        ]
 
 
 class TestResetTrajectories:

@@ -544,12 +544,16 @@ class KernelClient(ABC):
             error="acknowledge_interrupted_for_retry not supported by this kernel client",
         )
 
-    def set_runtime_velocity_scale(self, scale: float) -> None:
+    def set_runtime_velocity_scale(
+        self, scale: float, principal_id: str | None = None
+    ) -> None:
         """Forward the HMI runtime velocity-scale control to the kernel.
 
         ADR-0018: this is a live execution control, not a behavior-tree
         parameter override. Implementations clamp finite values to [0, 1] and
         apply them to discrete execution without stopping the active action.
+        `principal_id` is optional because not every direct kernel caller has
+        supervisory actor context.
         """
         # Default implementation: no-op. Native/mocked clients that support
         # runtime scaling override.
@@ -709,6 +713,7 @@ class MockKernelClient(KernelClient):
         self.invalidate_count = 0
         self.runtime_velocity_scale = 1.0
         self.runtime_velocity_scale_updates: List[float] = []
+        self.runtime_velocity_scale_principal_ids: List[Optional[str]] = []
         self.scene_edits: List[SceneEditRequest] = []
         self.link_pose_calls: List[tuple[str, str]] = []
         # Outcome store keyed by execution_id, populated
@@ -1119,12 +1124,15 @@ class MockKernelClient(KernelClient):
         self.invalidate_count += 1
         self._metrics["cache_invalidations"] += 1
 
-    def set_runtime_velocity_scale(self, scale: float) -> None:
+    def set_runtime_velocity_scale(
+        self, scale: float, principal_id: str | None = None
+    ) -> None:
         if not isinstance(scale, (int, float)) or math.isnan(scale) or math.isinf(scale):
             return
         clamped = max(0.0, min(1.0, float(scale)))
         self.runtime_velocity_scale = clamped
         self.runtime_velocity_scale_updates.append(clamped)
+        self.runtime_velocity_scale_principal_ids.append(principal_id)
 
     def set_robot_base_pose(self, pose: Optional[Dict[str, Any]]) -> None:
         self.robot_base_pose = None if not pose else dict(pose)

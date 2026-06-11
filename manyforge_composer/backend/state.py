@@ -311,6 +311,7 @@ class ComposerState:
         self._assistant_failure_counts: dict[str, int] = {}
         self._external_runtime_status_lock = threading.Lock()
         self._external_runtime_statuses: dict[str, dict[str, Any]] = {}
+        self._simulation_control_lock = threading.Lock()
         self._pose_source_lock = threading.Lock()
         self._pose_source_snapshots: dict[str, dict[str, Any]] = {}
         self._pose_source_apply_lock = threading.Lock()
@@ -952,10 +953,7 @@ class ComposerState:
     def _deployment_capability_keys(self) -> set[str] | None:
         if self.deployment is None:
             return None
-        capability_keys: set[str] = set()
-        for adapter in self.deployment.adapters.values():
-            capability_keys.update(adapter.capability_keys)
-        return capability_keys
+        return self.deployment.capability_keys()
 
     def _build_program_with_overrides(
         self,
@@ -2507,6 +2505,7 @@ class ComposerState:
             scene_snapshot_url_publisher=self.publish_scene_snapshot,
             pose_source_apply_callback=self.apply_pose_sources_before_planning,
             pose_source_between_nodes_callback=self.apply_pose_sources_between_nodes,
+            simulation_control_callback=self.simulation_control_for_behavior_node,
         )
         runner.load()
 
@@ -2633,6 +2632,7 @@ class ComposerState:
             scene_snapshot_url_publisher=self.publish_scene_snapshot,
             pose_source_apply_callback=self.apply_pose_sources_before_planning,
             pose_source_between_nodes_callback=self.apply_pose_sources_between_nodes,
+            simulation_control_callback=self.simulation_control_for_behavior_node,
         )
         runner.load()
 
@@ -3246,6 +3246,644 @@ class ComposerState:
             require_idle=False,
             reason=reason or "between_nodes",
         )
+
+    def reset_simulation_for_behavior_node(
+        self,
+        *,
+        reason: str = "",
+        source: str = "behavior_node",
+        allow_running: bool = True,
+    ) -> dict[str, Any]:
+        """BT callback for the ResetSimulation node."""
+        return self.simulation_control_for_behavior_node(
+            operation="reset",
+            reason=reason or "reset_simulation_node",
+            source=source,
+            allow_running=allow_running,
+        )
+
+    def simulation_control_for_behavior_node(
+        self,
+        *,
+        operation: str,
+        reason: str = "",
+        source: str = "behavior_node",
+        allow_running: bool = True,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """BT callback for simulator-control nodes."""
+        if operation == "reset":
+            return self.reset_simulation(
+                reason=reason or "reset_simulation_node",
+                source=source,
+                allow_running=allow_running,
+            )
+        if operation == "set_state":
+            return self.set_simulation_state(
+                state=kwargs.get("state"),
+                reason=reason or "set_simulation_state_node",
+                source=source,
+                allow_running=allow_running,
+            )
+        if operation == "step":
+            return self.step_simulation(
+                steps=kwargs.get("steps", 1),
+                reason=reason or "step_simulation_node",
+                source=source,
+                allow_running=allow_running,
+            )
+        if operation == "set_entity_state":
+            return self.set_simulation_entity_state(
+                entity=kwargs.get("entity", ""),
+                pose=kwargs.get("pose", {}),
+                reason=reason or "set_entity_state_node",
+                source=source,
+                allow_running=allow_running,
+            )
+        raise RuntimeError(f"Unsupported simulation control operation: {operation}")
+
+    def set_simulation_state(
+        self,
+        *,
+        state: Any,
+        reason: str = "",
+        source: str = "api",
+        allow_running: bool = False,
+    ) -> dict[str, Any]:
+        target_state = self._normalize_simulation_state_target(state)
+        required_capability = (
+            "simulator.control.play"
+            if target_state == "playing"
+            else "simulator.control.pause"
+        )
+        return self._run_simulation_control_operation(
+            operation="set_state",
+            required_capability=required_capability,
+            reason=reason,
+            source=source,
+            allow_running=allow_running,
+            payload={"state": target_state},
+        )
+
+    def step_simulation(
+        self,
+        *,
+        steps: Any = 1,
+        reason: str = "",
+        source: str = "api",
+        allow_running: bool = False,
+    ) -> dict[str, Any]:
+        try:
+            step_count = int(steps)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("simulation step count must be an integer") from exc
+        if step_count < 1:
+            raise RuntimeError("simulation step count must be >= 1")
+        return self._run_simulation_control_operation(
+            operation="step",
+            required_capability="simulator.control.step",
+            reason=reason,
+            source=source,
+            allow_running=allow_running,
+            payload={"steps": step_count},
+        )
+
+    def set_simulation_entity_state(
+        self,
+        *,
+        entity: Any,
+        pose: Any,
+        reason: str = "",
+        source: str = "api",
+        allow_running: bool = False,
+    ) -> dict[str, Any]:
+        entity_name = str(entity or "").strip()
+        if not entity_name:
+            raise RuntimeError("simulation entity is required")
+        if not isinstance(pose, dict):
+            raise RuntimeError("simulation entity pose must be a mapping")
+        return self._run_simulation_control_operation(
+            operation="set_entity_state",
+            required_capability="simulator.entity_state.set",
+            reason=reason,
+            source=source,
+            allow_running=allow_running,
+            payload={"entity": entity_name, "pose": dict(pose)},
+        )
+
+    def reset_simulation(
+        self,
+        *,
+        reason: str = "",
+        source: str = "api",
+        allow_running: bool = False,
+    ) -> dict[str, Any]:
+        """Reset simulator state through the deployment-declared control surface."""
+        control_id = uuid.uuid4().hex[:12]
+        control, execution_config = self._simulation_reset_contract()
+        scope = control.reset.default_scope
+        close_command_gate = control.reset.close_command_gate
+        command_gate_topic = self._simulation_command_gate_topic(execution_config)
+        wait_ready_s = control.reset.wait_ready_s
+        cycle_state = (
+            self.cycle_manager.state.value if self.cycle_manager is not None else "none"
+        )
+        started = time.monotonic()
+        base_details = {
+            "operation": "reset",
+            "control_id": control_id,
+            "source": source,
+            "reason": reason,
+            "scope": scope,
+            "required_capability": "simulator.control.reset",
+            "cycle_state": cycle_state,
+            "allow_running": bool(allow_running),
+        }
+        self.event_recorder.record_simulation_control_event(
+            "requested",
+            details=base_details,
+            authority_source=source,
+            trigger_node_instance=reason if source == "behavior_node" else None,
+            execution_mode="program" if source == "behavior_node" else None,
+        )
+
+        with self._simulation_control_lock:
+            try:
+                self._validate_simulation_reset_cycle_state(
+                    allow_running=allow_running,
+                )
+                if close_command_gate and not command_gate_topic:
+                    raise RuntimeError(
+                        "simulation reset requires close_command_gate=true, but the "
+                        "execution adapter does not declare command_gate_topic"
+                    )
+                result = self._run_ros_simulation_reset(
+                    control_id=control_id,
+                    scope=scope,
+                    service_prefix=control.service_prefix,
+                    command_gate_topic=command_gate_topic,
+                    close_command_gate=close_command_gate,
+                    service_timeout_s=wait_ready_s,
+                    wait_ready_s=wait_ready_s,
+                    execution_config=execution_config,
+                    source=source,
+                    reason=reason,
+                )
+                if not result.get("success", False):
+                    raise RuntimeError(str(result.get("error") or "simulation reset failed"))
+                self._refresh_runtime_after_simulation_reset()
+                duration_s = time.monotonic() - started
+                completed_details = {
+                    **base_details,
+                    "duration_s": duration_s,
+                    "service_name": result.get("service_name"),
+                    "close_command_gate": close_command_gate,
+                    "command_gate_topic": command_gate_topic,
+                    "command_gate_reopened": result.get("command_gate_reopened"),
+                    "readiness": result.get("readiness"),
+                }
+                self.event_recorder.record_simulation_control_event(
+                    "completed",
+                    details=completed_details,
+                    authority_source=source,
+                    trigger_node_instance=reason if source == "behavior_node" else None,
+                    execution_mode="program" if source == "behavior_node" else None,
+                )
+                return {
+                    **result,
+                    "success": True,
+                    "operation": "reset",
+                    "control_id": control_id,
+                    "scope": scope,
+                    "duration_s": duration_s,
+                }
+            except Exception as exc:
+                duration_s = time.monotonic() - started
+                self.event_recorder.record_simulation_control_event(
+                    "failed",
+                    details={
+                        **base_details,
+                        "duration_s": duration_s,
+                        "error": str(exc),
+                        "close_command_gate": close_command_gate,
+                        "command_gate_topic": command_gate_topic,
+                    },
+                    authority_source=source,
+                    trigger_node_instance=reason if source == "behavior_node" else None,
+                    execution_mode="program" if source == "behavior_node" else None,
+                )
+                if isinstance(exc, RuntimeError):
+                    raise
+                raise RuntimeError(str(exc)) from exc
+
+    def _run_simulation_control_operation(
+        self,
+        *,
+        operation: str,
+        required_capability: str,
+        reason: str,
+        source: str,
+        allow_running: bool,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        control_id = uuid.uuid4().hex[:12]
+        control, _execution_config = self._simulation_control_contract(
+            required_capability=required_capability,
+        )
+        service_timeout_s = control.reset.wait_ready_s
+        cycle_state = (
+            self.cycle_manager.state.value if self.cycle_manager is not None else "none"
+        )
+        started = time.monotonic()
+        base_details = {
+            "operation": operation,
+            "control_id": control_id,
+            "source": source,
+            "reason": reason,
+            "required_capability": required_capability,
+            "cycle_state": cycle_state,
+            "allow_running": bool(allow_running),
+            **self._simulation_control_audit_payload(payload),
+        }
+        self.event_recorder.record_simulation_control_event(
+            "requested",
+            details=base_details,
+            authority_source=source,
+            trigger_node_instance=reason if source == "behavior_node" else None,
+            execution_mode="program" if source == "behavior_node" else None,
+        )
+
+        with self._simulation_control_lock:
+            try:
+                self._validate_simulation_control_cycle_state(
+                    operation=operation,
+                    allow_running=allow_running,
+                )
+                result = self._run_ros_simulation_control_operation(
+                    operation=operation,
+                    control_id=control_id,
+                    service_prefix=control.service_prefix,
+                    service_timeout_s=service_timeout_s,
+                    source=source,
+                    reason=reason,
+                    payload=payload,
+                )
+                if not result.get("success", False):
+                    raise RuntimeError(str(result.get("error") or "simulation control failed"))
+                duration_s = time.monotonic() - started
+                self.event_recorder.record_simulation_control_event(
+                    "completed",
+                    details={
+                        **base_details,
+                        "duration_s": duration_s,
+                        "service_name": result.get("service_name"),
+                    },
+                    authority_source=source,
+                    trigger_node_instance=reason if source == "behavior_node" else None,
+                    execution_mode="program" if source == "behavior_node" else None,
+                )
+                return {
+                    **result,
+                    "success": True,
+                    "operation": operation,
+                    "control_id": control_id,
+                    "duration_s": duration_s,
+                }
+            except Exception as exc:
+                duration_s = time.monotonic() - started
+                self.event_recorder.record_simulation_control_event(
+                    "failed",
+                    details={
+                        **base_details,
+                        "duration_s": duration_s,
+                        "error": str(exc),
+                    },
+                    authority_source=source,
+                    trigger_node_instance=reason if source == "behavior_node" else None,
+                    execution_mode="program" if source == "behavior_node" else None,
+                )
+                if isinstance(exc, RuntimeError):
+                    raise
+                raise RuntimeError(str(exc)) from exc
+
+    def _simulation_reset_contract(self):
+        control, execution_config = self._simulation_control_contract(
+            required_capability="simulator.control.reset",
+        )
+        if control.reset.default_scope != "state":
+            raise RuntimeError(
+                "Only simulation_control.reset.default_scope=state is supported"
+            )
+        return control, execution_config
+
+    def _simulation_control_contract(self, *, required_capability: str):
+        deployment = self.deployment
+        if deployment is None:
+            raise RuntimeError("No deployment loaded")
+        control = deployment.simulation_control
+        if control is None:
+            raise RuntimeError("simulation_control is not configured for this deployment")
+        if control.kind != "ros2_simulation_interfaces":
+            raise RuntimeError(
+                f"Unsupported simulation_control.kind: {control.kind}"
+            )
+        if required_capability not in control.capability_keys():
+            raise RuntimeError(
+                f"simulation_control does not declare {required_capability}"
+            )
+        execution = deployment.adapters.get("execution")
+        execution_config = dict(execution.config or {}) if execution is not None else {}
+        return control, execution_config
+
+    def _simulation_command_gate_topic(self, execution_config: dict[str, Any]) -> str:
+        topic = (
+            execution_config.get("command_gate_topic")
+            or execution_config.get("command_gate_enable_topic")
+            or ""
+        )
+        return str(topic).strip()
+
+    def _validate_simulation_reset_cycle_state(self, *, allow_running: bool) -> None:
+        self._validate_simulation_control_cycle_state(
+            operation="reset",
+            allow_running=allow_running,
+        )
+
+    def _validate_simulation_control_cycle_state(
+        self,
+        *,
+        operation: str,
+        allow_running: bool,
+    ) -> None:
+        manager = self.cycle_manager
+        if manager is None:
+            return
+        cycle_state = manager.state.value
+        if cycle_state == "running" and not allow_running:
+            raise RuntimeError(
+                f"Cannot {operation} simulation during an active program cycle; "
+                "author an explicit simulator-control node or stop/reset the cycle first"
+            )
+        if cycle_state == "direct_control":
+            if operation != "reset":
+                raise RuntimeError(
+                    f"Cannot {operation} simulation during direct-control intervention; "
+                    "stop direct control first"
+                )
+            manager.abort_intervention()
+            deadline = time.monotonic() + 2.0
+            while manager.state.value == "direct_control" and time.monotonic() < deadline:
+                time.sleep(0.01)
+            if manager.state.value == "direct_control":
+                raise RuntimeError(
+                    "Cannot reset simulation: direct-control intervention did not abort"
+                )
+
+    def _run_ros_simulation_control_operation(
+        self,
+        *,
+        operation: str,
+        control_id: str,
+        service_prefix: str,
+        service_timeout_s: float,
+        source: str,
+        reason: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        from manyforge_ros.simulation_control import SimulationControlClient
+
+        import rclpy
+
+        initialized_here = False
+        if not rclpy.ok():
+            rclpy.init(args=None)
+            initialized_here = True
+        node = rclpy.create_node("manyforge_composer_simulation_control")
+        try:
+            client = SimulationControlClient(
+                node,
+                service_prefix=service_prefix,
+                service_timeout_s=service_timeout_s,
+            )
+            self.event_recorder.record_simulation_control_event(
+                "started",
+                details={
+                    "operation": operation,
+                    "control_id": control_id,
+                    "source": source,
+                    "reason": reason,
+                    "service_prefix": service_prefix,
+                    "service_timeout_s": service_timeout_s,
+                    **self._simulation_control_audit_payload(payload),
+                },
+                authority_source=source,
+                trigger_node_instance=reason if source == "behavior_node" else None,
+                execution_mode="program" if source == "behavior_node" else None,
+            )
+            if operation == "set_state":
+                return client.set_simulation_state(
+                    state=str(payload.get("state") or "")
+                ).to_dict()
+            if operation == "step":
+                return client.step(steps=int(payload.get("steps", 1))).to_dict()
+            if operation == "set_entity_state":
+                return client.set_entity_state(
+                    entity=str(payload.get("entity") or ""),
+                    pose=dict(payload.get("pose") or {}),
+                ).to_dict()
+            raise RuntimeError(f"Unsupported simulation control operation: {operation}")
+        finally:
+            node.destroy_node()
+            if initialized_here:
+                rclpy.shutdown()
+
+    @staticmethod
+    def _normalize_simulation_state_target(state: Any) -> str:
+        value = str(state or "").strip().lower()
+        aliases = {
+            "play": "playing",
+            "playing": "playing",
+            "pause": "paused",
+            "paused": "paused",
+        }
+        target = aliases.get(value)
+        if target is None:
+            raise RuntimeError(
+                "simulation state must be one of: playing, paused"
+            )
+        return target
+
+    @staticmethod
+    def _simulation_control_audit_payload(payload: dict[str, Any]) -> dict[str, Any]:
+        audit: dict[str, Any] = {}
+        if "state" in payload:
+            audit["state"] = payload.get("state")
+        if "steps" in payload:
+            audit["steps"] = payload.get("steps")
+        if "entity" in payload:
+            audit["entity"] = payload.get("entity")
+        pose = payload.get("pose")
+        if isinstance(pose, dict):
+            audit["frame_id"] = pose.get("frame_id")
+            audit["position_m"] = pose.get("position_m")
+        return audit
+
+    def _run_ros_simulation_reset(
+        self,
+        *,
+        control_id: str,
+        scope: str,
+        service_prefix: str,
+        command_gate_topic: str,
+        close_command_gate: bool,
+        service_timeout_s: float,
+        wait_ready_s: float,
+        execution_config: dict[str, Any],
+        source: str,
+        reason: str,
+    ) -> dict[str, Any]:
+        from manyforge_ros.simulation_control import SimulationControlClient
+
+        import rclpy
+
+        initialized_here = False
+        if not rclpy.ok():
+            rclpy.init(args=None)
+            initialized_here = True
+        node = rclpy.create_node("manyforge_composer_simulation_reset")
+        command_gate_closed = False
+        command_gate_reopened = False
+        try:
+            client = SimulationControlClient(
+                node,
+                service_prefix=service_prefix,
+                service_timeout_s=service_timeout_s,
+            )
+            if close_command_gate:
+                client.publish_command_gate(command_gate_topic, enabled=False)
+                command_gate_closed = True
+            self.event_recorder.record_simulation_control_event(
+                "started",
+                details={
+                    "operation": "reset",
+                    "control_id": control_id,
+                    "source": source,
+                    "reason": reason,
+                    "scope": scope,
+                    "service_prefix": service_prefix,
+                    "close_command_gate": close_command_gate,
+                    "command_gate_topic": command_gate_topic,
+                    "service_timeout_s": service_timeout_s,
+                    "wait_ready_s": wait_ready_s,
+                },
+                authority_source=source,
+                trigger_node_instance=reason if source == "behavior_node" else None,
+                execution_mode="program" if source == "behavior_node" else None,
+            )
+            reset_result = client.reset(scope=scope).to_dict()
+            if not reset_result.get("success", False):
+                return {
+                    **reset_result,
+                    "success": False,
+                    "command_gate_closed": command_gate_closed,
+                    "command_gate_reopened": False,
+                }
+            readiness = self._wait_for_simulation_reset_readiness(
+                wait_ready_s=wait_ready_s,
+                execution_config=execution_config,
+            )
+            if not readiness.get("ready", False):
+                return {
+                    **reset_result,
+                    "success": False,
+                    "error": "simulation reset readiness check failed",
+                    "readiness": readiness,
+                    "command_gate_closed": command_gate_closed,
+                    "command_gate_reopened": False,
+                }
+            if close_command_gate:
+                client.publish_command_gate(command_gate_topic, enabled=True)
+                command_gate_reopened = True
+            return {
+                **reset_result,
+                "success": True,
+                "readiness": readiness,
+                "command_gate_closed": command_gate_closed,
+                "command_gate_reopened": command_gate_reopened,
+            }
+        finally:
+            node.destroy_node()
+            if initialized_here:
+                rclpy.shutdown()
+
+    def _wait_for_simulation_reset_readiness(
+        self,
+        *,
+        wait_ready_s: float,
+        execution_config: dict[str, Any],
+    ) -> dict[str, Any]:
+        pose_source_result: dict[str, Any] | None = None
+        if self.deployment is not None and self.deployment.pose_sources:
+            pose_source_result = self.apply_pose_sources_between_nodes(
+                reason="simulation_reset",
+            )
+            if not pose_source_result.get("success", False):
+                return {
+                    "ready": False,
+                    "status": "pose_source_failed",
+                    "poseSourceApply": pose_source_result,
+                }
+
+        authority_profile = (
+            execution_config.get("execution_state_authority_profile")
+            or execution_config.get("execution_state_source_mode")
+            or ""
+        )
+        if authority_profile != "commanded_sim":
+            return {
+                "ready": True,
+                "status": "not_required",
+                "poseSourceApply": pose_source_result,
+            }
+
+        deadline = time.monotonic() + wait_ready_s
+        last_status: dict[str, Any] | None = None
+        while time.monotonic() < deadline:
+            statuses = self.external_runtime_statuses(max_age_s=6.0)
+            last_status = statuses.get("isaac_demo_supervisor")
+            if (
+                isinstance(last_status, dict)
+                and last_status.get("canExecute") is True
+                and str(last_status.get("readiness", "")) == "ready"
+            ):
+                return {
+                    "ready": True,
+                    "status": "ready",
+                    "provider": "isaac_demo_supervisor",
+                    "poseSourceApply": pose_source_result,
+                    "providerStatus": dict(last_status),
+                }
+            time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+        return {
+            "ready": False,
+            "status": "timeout",
+            "provider": "isaac_demo_supervisor",
+            "poseSourceApply": pose_source_result,
+            "providerStatus": dict(last_status or {}),
+        }
+
+    def _refresh_runtime_after_simulation_reset(self) -> None:
+        self.clear_visual_state_snapshot()
+        self.clear_visual_scene_objects_snapshot()
+        refresh_result = self.refresh_visual_scene_objects_sync(
+            reason="simulation_reset"
+        )
+        if not refresh_result.get("success", False):
+            logger.warning(
+                "simulation reset visual scene refresh failed: %s",
+                refresh_result.get("error"),
+            )
+        self.request_visual_state_publish(reason="simulation_reset")
 
     def external_runtime_statuses(self, *, max_age_s: float = 5.0) -> dict[str, dict[str, Any]]:
         """Return fresh external runtime status contributions keyed by provider."""

@@ -665,14 +665,16 @@ class NativeKernelClient(KernelClient):
         )
         return CommandResult(accepted=r["accepted"], error=r.get("error"))
 
-    def set_runtime_velocity_scale(self, scale: float) -> None:
+    def set_runtime_velocity_scale(
+        self, scale: float, principal_id: str | None = None
+    ) -> None:
         # ADR-0018: forward runtime HMI velocity-scale changes to the C++
         # kernel/backend. The kernel validates finiteness and clamps to [0, 1].
         import math
 
         if not isinstance(scale, (int, float)) or math.isnan(scale) or math.isinf(scale):
             return
-        self._bundle.set_runtime_velocity_scale(float(scale))
+        self._bundle.set_runtime_velocity_scale(float(scale), principal_id)
 
     def get_status(self) -> ExecutionStatus:
         s = self._bundle.get_status()

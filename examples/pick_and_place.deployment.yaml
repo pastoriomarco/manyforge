@@ -31,6 +31,7 @@ adapters:
       - context.state.current
       - context.validation.trajectory
       - context.collision.check
+      - context.collision.check.detailed
       - context.kinematics.fk
       - context.limits.joint
       - context.pose.resolve_reference
@@ -40,6 +41,7 @@ adapters:
       - scene.shape.cylinder
       - scene.shape.mesh
       - scene.edit.add
+      - scene.edit.upsert
       - scene.edit.remove
       - scene.edit.update_pose
       - scene.edit.attach_detach

@@ -1,4 +1,13 @@
-from manyforge_behavior.nodes.motion import MoveManipulatorAction, ResetTrajectories
+from manyforge_behavior.nodes.motion import (
+    MoveManipulatorAction,
+    ResetTrajectories,
+)
+from manyforge_behavior.nodes.simulation import (
+    ResetSimulation,
+    SetEntityState,
+    SetSimulationState,
+    StepSimulation,
+)
 from manyforge_behavior.nodes.scene import (
     AddCollisionObject,
     AttachObjectToLink,
@@ -28,6 +37,10 @@ from manyforge_behavior.nodes.recovery import FallbackOverrideNode, RecoverySkil
 
 __all__ = [
     "MoveManipulatorAction",
+    "ResetSimulation",
+    "SetEntityState",
+    "SetSimulationState",
+    "StepSimulation",
     "ResetTrajectories",
     "AddCollisionObject",
     "AttachObjectToLink",

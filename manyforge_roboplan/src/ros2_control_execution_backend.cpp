@@ -3230,7 +3230,7 @@ std::shared_ptr<NativeKernelBundle> create_ros2_control_kernel(
 
   roboplan::RRTOptions rrt_opts;
   rrt_opts.group_name = group_name;
-  rrt_opts.max_planning_time = 5.0;
+  rrt_opts.max_planning_time = kernel_config.planner_max_planning_time_s;
   rrt_opts.max_nodes = 5000;
   bundle->rrt = std::make_shared<roboplan::RRT>(bundle->scene, rrt_opts);
   bundle->shortcutter = std::make_shared<roboplan::PathShortcutter>(
@@ -3261,7 +3261,8 @@ std::shared_ptr<NativeKernelBundle> create_ros2_control_kernel(
   bundle->scheduler = std::make_unique<SimpleScheduler>();
   bundle->cache = std::make_unique<core::TrajectoryCache>();
 
-  const auto policy = default_collision_policy_snapshot();
+  const auto policy = kernel_config.baseline_collision_policy_snapshot.value_or(
+      default_collision_policy_snapshot());
   bundle->context->set_collision_policy_snapshot(policy);
   const int collision_worker_count =
       core::env_validation_collision_workers(

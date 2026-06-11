@@ -372,6 +372,8 @@ def _kernel_config_from_deployment(
 
     execution = deployment.adapters.get("execution") if deployment is not None else None
     execution_config = dict(execution.config or {}) if execution is not None else {}
+    planning = deployment.adapters.get("planning") if deployment is not None else None
+    planning_config = dict(planning.config or {}) if planning is not None else {}
     for key in (
         "native_reset_completion_timeout_s",
         "native_reset_completion_timeout_ms",
@@ -380,6 +382,21 @@ def _kernel_config_from_deployment(
     ):
         if key in execution_config:
             config[key] = execution_config[key]
+    for key in ("planner_max_planning_time_s", "planner_max_planning_time_ms"):
+        if key in planning_config:
+            config[key] = planning_config[key]
+        elif key in execution_config:
+            config[key] = execution_config[key]
+
+    if deployment is not None:
+        baseline_provider = getattr(
+            deployment,
+            "baseline_collision_policy_snapshot",
+            None,
+        )
+        baseline_policy = baseline_provider() if callable(baseline_provider) else None
+        if baseline_policy is not None:
+            config["baseline_collision_policy_snapshot"] = baseline_policy
 
     # Pass the deployment-declared fault-stop and operator-stop profiles
     # through to the C++ kernel. Both are optional; deployments not

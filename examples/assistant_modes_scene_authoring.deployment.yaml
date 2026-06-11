@@ -62,6 +62,7 @@ adapters:
       - context.state.current
       - context.validation.trajectory
       - context.collision.check
+      - context.collision.check.detailed
       - context.kinematics.fk
       - context.pose.resolve_reference
       - context.scene.object_query

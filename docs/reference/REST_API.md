@@ -82,6 +82,10 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer`.
 | `GET` | `/api/program/tree` | program | Get Program Tree |
 | `PUT` | `/api/program/tree` | program | Update Program Tree |
 | `POST` | `/api/program/validate` | program | Validate Program Tree |
+| `POST` | `/api/simulation/entity-state` | simulation | Set Entity State |
+| `POST` | `/api/simulation/reset` | simulation | Reset Simulation |
+| `POST` | `/api/simulation/state` | simulation | Set Simulation State |
+| `POST` | `/api/simulation/step` | simulation | Step Simulation |
 | `GET` | `/api/scene/diagnostics` | scene | Get Scene Diagnostics |
 | `POST` | `/api/scene/edit` | scene | Edit Scene |
 | `GET` | `/api/scene/frames` | scene | Get Scene Frames |

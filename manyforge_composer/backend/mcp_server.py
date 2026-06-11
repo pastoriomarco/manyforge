@@ -34,9 +34,9 @@ def _valid_trigger_reasons() -> set[str]:
     not a recovery trigger. The MCP allowlist mirrors the canonical
     `RecoveryTrigger` taxonomy from spec/460 §6.2.2 exactly.
     """
-    from manyforge_behavior.cycle_manager import RecoveryTrigger
+    from manyforge_behavior.cycle_manager import canonical_recovery_trigger_values
 
-    return {member.value for member in RecoveryTrigger}
+    return canonical_recovery_trigger_values()
 
 
 def create_mcp_server(state: ComposerState):
@@ -292,9 +292,7 @@ def create_mcp_server(state: ComposerState):
                 from manyforge_behavior.program import Program
                 capability_keys: set[str] | None = None
                 if state.deployment is not None:
-                    capability_keys = set()
-                    for adapter in state.deployment.adapters.values():
-                        capability_keys.update(adapter.capability_keys)
+                    capability_keys = state.deployment.capability_keys()
                 program_data = state.program.to_dict()
                 program_data["tree"] = tree
                 updated_program = Program.from_dict(
@@ -360,11 +358,7 @@ def create_mcp_server(state: ComposerState):
                 else None
             ),
             deployment_capability_keys=(
-                {
-                    capability
-                    for adapter in state.deployment.adapters.values()
-                    for capability in adapter.capability_keys
-                }
+                state.deployment.capability_keys()
                 if state.deployment is not None
                 else None
             ),
@@ -381,6 +375,7 @@ def create_mcp_server(state: ComposerState):
     def manyforge_cycle_control(
         command: str,
         velocity_scale: Optional[float] = None,
+        principal_id: Optional[str] = None,
     ) -> str:
         """Control program execution lifecycle.
 
@@ -388,6 +383,7 @@ def create_mcp_server(state: ComposerState):
             command: One of "run", "stop", "reset", "status", "velocity"
             velocity_scale: Required when command is "velocity" (0.0 to 1.0).
                            0.0 will stall the robot — use "stop" to pause instead.
+            principal_id: Optional actor identity for velocity-change audit.
 
         Cycle states include idle, running, stopped, and direct_control.
         Kernel terminal acknowledgement is runtime-owned and is not a
@@ -452,7 +448,10 @@ def create_mcp_server(state: ComposerState):
             if velocity_scale is None:
                 return json.dumps({"error": "velocity_scale required for velocity command"})
             try:
-                state.cycle_manager.set_velocity_scale(velocity_scale)
+                state.cycle_manager.set_velocity_scale(
+                    velocity_scale,
+                    principal_id=principal_id,
+                )
             except ValueError as exc:
                 return json.dumps({"error": str(exc)})
             return json.dumps({"velocity_scale": state.cycle_manager.velocity_scale})
@@ -589,11 +588,7 @@ def create_mcp_server(state: ComposerState):
 
             capability_keys = None
             if state.deployment is not None:
-                capability_keys = {
-                    capability
-                    for adapter in state.deployment.adapters.values()
-                    for capability in adapter.capability_keys
-                }
+                capability_keys = state.deployment.capability_keys()
             errors, _warnings = collect_tree_validation_issues(
                 tree_node,
                 state.catalog,

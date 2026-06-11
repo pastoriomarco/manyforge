@@ -40,6 +40,7 @@ from .routes_mcp import create_mcp_router
 from .routes_infra import create_infra_router
 from .routes_runtime import create_runtime_router
 from .routes_assistant import create_assistant_router
+from .routes_simulation import create_simulation_router
 
 logger = logging.getLogger(__name__)
 
@@ -168,6 +169,11 @@ def create_app(
     app.include_router(create_infra_router(state), prefix="/api/infra", tags=["infra"])
     app.include_router(create_runtime_router(state), prefix="/api/runtime", tags=["runtime"])
     app.include_router(create_assistant_router(state), prefix="/api/assistant", tags=["assistant"])
+    app.include_router(
+        create_simulation_router(state),
+        prefix="/api/simulation",
+        tags=["simulation"],
+    )
 
     if enable_mcp_http:
         app.include_router(create_mcp_router(state), prefix="/api/mcp", tags=["mcp"])

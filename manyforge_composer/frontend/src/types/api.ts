@@ -472,6 +472,68 @@ export interface PoseSourceConfig {
   objects: Record<string, PoseSourceObjectBindingConfig>;
 }
 
+export interface SimulationControlCapabilitiesConfig {
+  reset: boolean;
+  pause: boolean;
+  play: boolean;
+  step: boolean;
+  setEntityState: boolean;
+}
+
+export interface SimulationResetConfig {
+  defaultScope: 'state';
+  closeCommandGate: boolean;
+  waitReadyS: number;
+}
+
+export interface SimulationControlConfig {
+  kind: 'ros2_simulation_interfaces';
+  servicePrefix: string;
+  capabilities: SimulationControlCapabilitiesConfig;
+  reset?: SimulationResetConfig | null;
+}
+
+export interface SimulationResetResponse {
+  success: boolean;
+  operation: 'reset';
+  controlId: string;
+  scope: 'state';
+  serviceName?: string | null;
+  durationS: number;
+  commandGateClosed: boolean;
+  commandGateReopened: boolean;
+  readiness?: Record<string, unknown> | null;
+}
+
+export interface SimulationSetStateRequest {
+  state: 'playing' | 'paused';
+  reason?: string;
+}
+
+export interface SimulationStepRequest {
+  steps?: number;
+  reason?: string;
+}
+
+export interface SimulationSetEntityStateRequest {
+  entity: string;
+  pose: Record<string, unknown>;
+  reason?: string;
+}
+
+export interface SimulationControlResponse {
+  success: boolean;
+  operation: string;
+  controlId: string;
+  serviceName?: string | null;
+  durationS: number;
+  resultCode?: number | null;
+  resultMessage?: string;
+  state?: string | null;
+  steps?: number | null;
+  entity?: string | null;
+}
+
 export interface RobotConfig {
   robotId: string;
   groupId: string;
@@ -552,6 +614,7 @@ export interface FullDeployment {
   promptTemplates: Record<string, PromptTemplateConfig>;
   authorityMatrix: Record<string, AuthorityDomainConfig>;
   poseSources: PoseSourceConfig[];
+  simulationControl?: SimulationControlConfig | null;
   sourcePath: string;
 }
 

@@ -782,6 +782,144 @@ class TestDeploymentLoading:
         with pytest.raises(DeploymentValidationError, match=match):
             Deployment.from_dict(_minimal_deployment(pose_sources=pose_sources))
 
+    def test_simulation_control_parse_roundtrip_and_capability_keys(self):
+        data = _minimal_deployment(
+            simulation_control={
+                "kind": "ros2_simulation_interfaces",
+                "service_prefix": "auto",
+                "capabilities": {
+                    "reset": True,
+                    "pause": False,
+                    "play": False,
+                    "step": False,
+                    "set_entity_state": True,
+                },
+                "reset": {
+                    "default_scope": "state",
+                    "close_command_gate": True,
+                    "wait_ready_s": 4.5,
+                },
+            },
+        )
+        deploy = Deployment.from_dict(data)
+
+        control = deploy.simulation_control
+        assert control is not None
+        assert control.kind == "ros2_simulation_interfaces"
+        assert control.service_prefix == "auto"
+        assert control.capabilities.reset is True
+        assert control.capabilities.set_entity_state is True
+        assert control.reset.default_scope == "state"
+        assert control.reset.close_command_gate is True
+        assert control.reset.wait_ready_s == 4.5
+        assert "simulator.control.reset" in deploy.capability_keys()
+        assert "simulator.entity_state.set" in deploy.capability_keys()
+
+        reloaded = Deployment.from_dict(deploy.to_dict())
+        assert reloaded.simulation_control is not None
+        assert reloaded.simulation_control.capabilities.reset is True
+        assert reloaded.simulation_control.reset.wait_ready_s == 4.5
+
+    @pytest.mark.parametrize(
+        ("simulation_control", "match"),
+        [
+            (
+                {
+                    "kind": "raw_isaac_python",
+                    "capabilities": {"reset": True},
+                },
+                "simulation_control.kind must be one of",
+            ),
+            (
+                {
+                    "kind": "ros2_simulation_interfaces",
+                    "service": "/isaac",
+                    "capabilities": {"reset": True},
+                },
+                "simulation_control contains unknown fields",
+            ),
+            (
+                {
+                    "kind": "ros2_simulation_interfaces",
+                    "capabilities": {"reset": "true"},
+                },
+                "simulation_control.capabilities.reset must be a boolean",
+            ),
+            (
+                {
+                    "kind": "ros2_simulation_interfaces",
+                    "capabilities": {"pause": True},
+                    "reset": {"default_scope": "state"},
+                },
+                "reset may be configured only",
+            ),
+            (
+                {
+                    "kind": "ros2_simulation_interfaces",
+                    "capabilities": {},
+                },
+                "must declare at least one supported operation",
+            ),
+            (
+                {
+                    "kind": "ros2_simulation_interfaces",
+                    "capabilities": {"reset": True},
+                    "reset": {"default_scope": "time"},
+                },
+                "simulation_control.reset.default_scope must be one of",
+            ),
+        ],
+    )
+    def test_simulation_control_validation_rejects_invalid_contract(
+        self,
+        simulation_control,
+        match,
+    ):
+        with pytest.raises(DeploymentValidationError, match=match):
+            Deployment.from_dict(
+                _minimal_deployment(simulation_control=simulation_control)
+            )
+
+    def test_validate_capabilities_includes_simulation_control_keys(self):
+        data = _minimal_deployment(
+            simulation_control={
+                "kind": "ros2_simulation_interfaces",
+                "capabilities": {"reset": True},
+            },
+        )
+        data["adapters"]["planning"]["capability_keys"] = [
+            "planning.motion.joint_goal",
+            "planning.motion.pose_goal",
+            "planning.trajectory.time_parameterized",
+        ]
+        data["adapters"]["context"]["capability_keys"] = [
+            "context.state.current",
+            "context.validation.trajectory",
+            "context.collision.check",
+            "context.kinematics.fk",
+            "context.limits.joint",
+            "scene.shape.box",
+            "scene.shape.sphere",
+            "scene.edit.add",
+            "scene.edit.remove",
+            "scene.edit.update_pose",
+        ]
+        data["adapters"]["execution"]["capability_keys"] = [
+            "execution.trajectory.execute",
+            "execution.feedback.phase_events",
+            "execution.feedback.state_snapshots",
+            "execution.stop.soft",
+            "execution.pause",
+            "execution.resume",
+            "execution.reset",
+        ]
+
+        class ProgramRequiresReset:
+            def required_capabilities(self):
+                return ["simulator.control.reset"]
+
+        Deployment.from_dict(data).validate_capabilities(ProgramRequiresReset())
+
     def test_authority_matrix_parsed(self):
         data = _minimal_deployment(
             authority_matrix={
@@ -1651,13 +1789,21 @@ class TestAdapterCapabilityKeys:
             "context.state.current",
             "context.validation.trajectory",
             "context.collision.check",
+            "context.collision.check.detailed",
             "context.kinematics.fk",
             "context.limits.joint",
+            "context.pose.resolve_reference",
+            "context.scene.object_query",
             "scene.shape.box",
             "scene.shape.sphere",
+            "scene.shape.cylinder",
+            "scene.shape.mesh",
             "scene.edit.add",
+            "scene.edit.upsert",
             "scene.edit.remove",
             "scene.edit.update_pose",
+            "scene.edit.attach_detach",
+            "observability.trace.scene",
         ]
         
         # Execution adapter
@@ -1671,6 +1817,44 @@ class TestAdapterCapabilityKeys:
             "execution.resume",
             "execution.reset",
         ]
+
+    def test_known_adapter_capability_manifest_must_match(self):
+        """Known adapter declarations must match code-owned manifests exactly."""
+        data = yaml.safe_load(DEPLOYMENT_FIXTURE_PATH.read_text())
+        data["adapters"]["context"]["capability_keys"].remove(
+            "context.collision.check.detailed"
+        )
+        path = _write_deployment(data)
+        try:
+            with pytest.raises(
+                DeploymentValidationError,
+                match="published capability manifest",
+            ):
+                Deployment(path)
+        finally:
+            os.unlink(path)
+
+    def test_contact_policies_publish_baseline_collision_policy_snapshot(self):
+        data = _minimal_deployment(
+            contact_policies=[
+                {
+                    "policy_id": "deployment_baseline",
+                    "require_full_diagnostics": False,
+                    "notes": "fixture policy",
+                }
+            ]
+        )
+        deploy = Deployment.from_dict(data)
+
+        snapshot = deploy.baseline_collision_policy_snapshot()
+        assert snapshot is not None
+        assert snapshot["policy_id"] == "deployment_baseline"
+        assert snapshot["revision_id"] == 1
+        assert len(snapshot["content_hash"]) == 64
+        assert snapshot["require_full_diagnostics"] is False
+
+        reloaded = Deployment.from_dict(deploy.to_dict())
+        assert reloaded.baseline_collision_policy_snapshot() == snapshot
 
 
 class TestValidateCapabilities:

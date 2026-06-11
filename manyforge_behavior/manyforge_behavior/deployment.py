@@ -12,7 +12,11 @@ from typing import Any, Optional
 
 import yaml
 
-from manyforge_behavior.capabilities import CAPABILITY_REGISTRY, get_required_keys
+from manyforge_behavior.capabilities import (
+    CAPABILITY_REGISTRY,
+    get_adapter_capability_manifest,
+    get_required_keys,
+)
 from manyforge_behavior.catalog import SEMVER_RE
 from manyforge_behavior.model_paths import normalize_package_paths, resolve_resource_path
 
@@ -83,6 +87,12 @@ class AdapterConfig:
     capability_keys: list[str] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class ContactPolicyConfig:
+    policy_id: str
+    raw: dict[str, Any]
+
+
 @dataclass
 class OrchestratorConfig:
     engine: str
@@ -136,6 +146,52 @@ class PoseSourceConfig:
     objects: dict[str, PoseSourceObjectBinding] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class SimulationControlCapabilities:
+    """Deployment-declared simulator control operations."""
+
+    reset: bool = False
+    pause: bool = False
+    play: bool = False
+    step: bool = False
+    set_entity_state: bool = False
+
+
+@dataclass(frozen=True)
+class SimulationResetConfig:
+    """Reset policy for simulator lifecycle control."""
+
+    default_scope: str = "state"
+    close_command_gate: bool = True
+    wait_ready_s: float = 3.0
+
+
+@dataclass(frozen=True)
+class SimulationControlConfig:
+    """Contract-only simulator control declaration."""
+
+    kind: str
+    service_prefix: str = "auto"
+    capabilities: SimulationControlCapabilities = field(
+        default_factory=SimulationControlCapabilities
+    )
+    reset: SimulationResetConfig = field(default_factory=SimulationResetConfig)
+
+    def capability_keys(self) -> set[str]:
+        keys: set[str] = set()
+        if self.capabilities.reset:
+            keys.add("simulator.control.reset")
+        if self.capabilities.pause:
+            keys.add("simulator.control.pause")
+        if self.capabilities.play:
+            keys.add("simulator.control.play")
+        if self.capabilities.step:
+            keys.add("simulator.control.step")
+        if self.capabilities.set_entity_state:
+            keys.add("simulator.entity_state.set")
+        return keys
+
+
 @dataclass
 class AuthorityDomain:
     owner: str
@@ -170,6 +226,19 @@ _ALLOWED_POSE_SOURCE_APPLY_POLICIES = {
     "before_planning",
     "between_nodes",
 }
+_ALLOWED_SIMULATION_CONTROL_KINDS = {
+    "ros2_simulation_interfaces",
+}
+_ALLOWED_SIMULATION_RESET_SCOPES = {
+    "state",
+}
+_SIMULATION_CONTROL_CAPABILITY_FLAGS = {
+    "reset",
+    "pause",
+    "play",
+    "step",
+    "set_entity_state",
+}
 _ALLOWED_GRIPPER_COMMAND_MODES = {
     "simulated_joint",
     "ros_gripper_command",
@@ -181,6 +250,7 @@ _ALLOWED_AUTHORITY_DOMAINS = {
     "plc_signals",
     "robot_signals",
     "perception",
+    "simulation",
 }
 _ALLOWED_AUTHORITY_OWNERS = {
     "manyforge",
@@ -360,6 +430,8 @@ class Deployment:
         self.orchestrator: Optional[OrchestratorConfig] = None
         self.launch: Optional[LaunchConfig] = None
         self.pose_sources: dict[str, PoseSourceConfig] = {}
+        self.simulation_control: Optional[SimulationControlConfig] = None
+        self.contact_policies: list[ContactPolicyConfig] = []
         self.authority_matrix: dict[str, AuthorityDomain] = {}
         self.model_audit_policy: Optional[ModelAuditPolicy] = None
         self.model_endpoint_profile_registry: Optional[str] = None
@@ -394,6 +466,8 @@ class Deployment:
         self.orchestrator = None
         self.launch = None
         self.pose_sources = {}
+        self.simulation_control = None
+        self.contact_policies = []
         self.authority_matrix = {}
         self.model_audit_policy = None
         self.model_endpoint_profile_registry = None
@@ -738,6 +812,226 @@ class Deployment:
                 description=description,
                 objects=objects,
             )
+        return parsed
+
+    def _parse_simulation_control(
+        self,
+        simulation_control_data: dict[str, Any] | None,
+    ) -> Optional[SimulationControlConfig]:
+        if simulation_control_data is None:
+            return None
+        if not isinstance(simulation_control_data, dict):
+            raise DeploymentValidationError("simulation_control must be a mapping")
+
+        def get_alias(data: dict[str, Any], snake: str, camel: str, default: Any) -> Any:
+            if snake in data:
+                return data[snake]
+            if camel in data:
+                return data[camel]
+            return default
+
+        if any(
+            not isinstance(field, str) or not field.strip()
+            for field in simulation_control_data
+        ):
+            raise DeploymentValidationError(
+                "simulation_control keys must be non-empty strings"
+            )
+        unknown_top_fields = sorted(
+            field
+            for field in simulation_control_data
+            if field
+            not in {
+                "kind",
+                "service_prefix",
+                "servicePrefix",
+                "capabilities",
+                "reset",
+            }
+        )
+        if unknown_top_fields:
+            raise DeploymentValidationError(
+                "simulation_control contains unknown fields: "
+                f"{unknown_top_fields}"
+            )
+
+        kind_raw = simulation_control_data.get("kind")
+        if not isinstance(kind_raw, str):
+            raise DeploymentValidationError("simulation_control.kind must be a string")
+        kind = kind_raw.strip()
+        if kind not in _ALLOWED_SIMULATION_CONTROL_KINDS:
+            allowed = ", ".join(sorted(_ALLOWED_SIMULATION_CONTROL_KINDS))
+            raise DeploymentValidationError(
+                f"simulation_control.kind must be one of: {allowed}"
+            )
+
+        service_prefix = self._parse_optional_text(
+            get_alias(
+                simulation_control_data,
+                "service_prefix",
+                "servicePrefix",
+                "auto",
+            ),
+            "simulation_control.service_prefix",
+        )
+        if not service_prefix:
+            raise DeploymentValidationError(
+                "simulation_control.service_prefix must be non-empty"
+            )
+
+        capabilities_input = simulation_control_data.get("capabilities", {})
+        if capabilities_input is None:
+            capabilities_input = {}
+        if not isinstance(capabilities_input, dict):
+            raise DeploymentValidationError(
+                "simulation_control.capabilities must be a mapping"
+            )
+        capabilities_raw: dict[str, Any] = {}
+        for raw_flag, value in capabilities_input.items():
+            if not isinstance(raw_flag, str) or not raw_flag.strip():
+                raise DeploymentValidationError(
+                    "simulation_control.capabilities keys must be non-empty strings"
+                )
+            flag = "set_entity_state" if raw_flag == "setEntityState" else raw_flag
+            if flag in capabilities_raw:
+                raise DeploymentValidationError(
+                    "simulation_control.capabilities declares duplicate aliases "
+                    f"for '{flag}'"
+                )
+            capabilities_raw[flag] = value
+        unknown_flags = sorted(
+            flag
+            for flag in capabilities_raw
+            if flag not in _SIMULATION_CONTROL_CAPABILITY_FLAGS
+        )
+        if unknown_flags:
+            allowed = ", ".join(sorted(_SIMULATION_CONTROL_CAPABILITY_FLAGS))
+            raise DeploymentValidationError(
+                "simulation_control.capabilities contains unknown flags "
+                f"{unknown_flags}; allowed flags: {allowed}"
+            )
+
+        def parse_capability_flag(name: str) -> bool:
+            value = capabilities_raw.get(name, False)
+            if not isinstance(value, bool):
+                raise DeploymentValidationError(
+                    f"simulation_control.capabilities.{name} must be a boolean"
+                )
+            return value
+
+        capabilities = SimulationControlCapabilities(
+            reset=parse_capability_flag("reset"),
+            pause=parse_capability_flag("pause"),
+            play=parse_capability_flag("play"),
+            step=parse_capability_flag("step"),
+            set_entity_state=parse_capability_flag("set_entity_state"),
+        )
+        if not any(
+            (
+                capabilities.reset,
+                capabilities.pause,
+                capabilities.play,
+                capabilities.step,
+                capabilities.set_entity_state,
+            )
+        ):
+            raise DeploymentValidationError(
+                "simulation_control.capabilities must declare at least one supported operation"
+            )
+
+        reset_present = "reset" in simulation_control_data
+        reset_raw = simulation_control_data.get("reset", {})
+        if reset_raw is None:
+            reset_raw = {}
+        if not isinstance(reset_raw, dict):
+            raise DeploymentValidationError("simulation_control.reset must be a mapping")
+        if reset_present and not capabilities.reset:
+            raise DeploymentValidationError(
+                "simulation_control.reset may be configured only when "
+                "simulation_control.capabilities.reset is true"
+            )
+        if any(not isinstance(field, str) or not field.strip() for field in reset_raw):
+            raise DeploymentValidationError(
+                "simulation_control.reset keys must be non-empty strings"
+            )
+        unknown_reset_fields = sorted(
+            field
+            for field in reset_raw
+            if field
+            not in {
+                "default_scope",
+                "defaultScope",
+                "close_command_gate",
+                "closeCommandGate",
+                "wait_ready_s",
+                "waitReadyS",
+            }
+        )
+        if unknown_reset_fields:
+            raise DeploymentValidationError(
+                "simulation_control.reset contains unknown fields: "
+                f"{unknown_reset_fields}"
+            )
+
+        default_scope = self._parse_optional_text(
+            get_alias(reset_raw, "default_scope", "defaultScope", "state"),
+            "simulation_control.reset.default_scope",
+        )
+        if default_scope not in _ALLOWED_SIMULATION_RESET_SCOPES:
+            allowed = ", ".join(sorted(_ALLOWED_SIMULATION_RESET_SCOPES))
+            raise DeploymentValidationError(
+                f"simulation_control.reset.default_scope must be one of: {allowed}"
+            )
+        close_command_gate = get_alias(
+            reset_raw,
+            "close_command_gate",
+            "closeCommandGate",
+            True,
+        )
+        if not isinstance(close_command_gate, bool):
+            raise DeploymentValidationError(
+                "simulation_control.reset.close_command_gate must be a boolean"
+            )
+        reset_config = SimulationResetConfig(
+            default_scope=default_scope,
+            close_command_gate=close_command_gate,
+            wait_ready_s=self._parse_positive_float(
+                get_alias(reset_raw, "wait_ready_s", "waitReadyS", 3.0),
+                "simulation_control.reset.wait_ready_s",
+            ),
+        )
+
+        return SimulationControlConfig(
+            kind=kind,
+            service_prefix=service_prefix,
+            capabilities=capabilities,
+            reset=reset_config,
+        )
+
+    def _parse_contact_policies(
+        self,
+        contact_policies_data: Any,
+    ) -> list[ContactPolicyConfig]:
+        if contact_policies_data is None:
+            return []
+        if not isinstance(contact_policies_data, list):
+            raise DeploymentValidationError("contact_policies must be a list")
+        parsed: list[ContactPolicyConfig] = []
+        seen: set[str] = set()
+        for index, raw_policy in enumerate(contact_policies_data):
+            path = f"contact_policies[{index}]"
+            if not isinstance(raw_policy, dict):
+                raise DeploymentValidationError(f"{path} must be a mapping")
+            policy_id = raw_policy.get("policy_id")
+            if not isinstance(policy_id, str) or not policy_id.strip():
+                raise DeploymentValidationError(f"{path}.policy_id is required")
+            policy_id = policy_id.strip()
+            if policy_id in seen:
+                raise DeploymentValidationError(
+                    f"contact_policies contains duplicate policy_id '{policy_id}'"
+                )
+            seen.add(policy_id)
+            parsed.append(ContactPolicyConfig(policy_id=policy_id, raw=dict(raw_policy)))
         return parsed
 
     def _parse_grippers(
@@ -1591,6 +1885,8 @@ class Deployment:
         self.orchestrator = None
         self.launch = None
         self.pose_sources = {}
+        self.simulation_control = None
+        self.contact_policies = []
         self.authority_matrix = {}
         self.model_audit_policy = None
         self.model_endpoint_profile_registry = None
@@ -1677,6 +1973,7 @@ class Deployment:
                     f"adapters.{slot}.capability_keys",
                 ),
             )
+        self._validate_adapter_capability_manifests()
 
         # Orchestrator
         orchestrator_data = data.get("orchestrator")
@@ -1721,6 +2018,14 @@ class Deployment:
 
         # Object pose sources (optional, contract-only in this slice)
         self.pose_sources = self._parse_pose_sources(data.get("pose_sources"))
+
+        # Simulator lifecycle/control surface (optional, contract-only in this slice)
+        self.simulation_control = self._parse_simulation_control(
+            data.get("simulation_control")
+        )
+        self.contact_policies = self._parse_contact_policies(
+            data.get("contact_policies")
+        )
 
         # Authority matrix (optional)
         authority_matrix_data = data.get("authority_matrix", {})
@@ -1855,10 +2160,7 @@ class Deployment:
         Missing capability declarations fail closed; supported backends must
         declare the capability keys they provide.
         """
-        # Collect all capability keys from all adapters (union)
-        all_capability_keys: set[str] = set()
-        for slot, adapter in self.adapters.items():
-            all_capability_keys.update(adapter.capability_keys)
+        all_capability_keys = self.capability_keys()
 
         # Check that each adapter that declares supported_profiles includes our profile
         for slot, adapter in self.adapters.items():
@@ -1895,6 +2197,55 @@ class Deployment:
                 raise DeploymentValidationError(
                     "Missing capability keys for program nodes: "
                     f"{sorted(missing_program_keys)}"
+                )
+
+    def capability_keys(self) -> set[str]:
+        """Return all capability keys advertised by this deployment."""
+        capability_keys: set[str] = set()
+        for adapter in self.adapters.values():
+            capability_keys.update(adapter.capability_keys)
+        if self.simulation_control is not None:
+            capability_keys.update(self.simulation_control.capability_keys())
+        return capability_keys
+
+    def baseline_collision_policy_snapshot(self) -> dict[str, Any] | None:
+        """Return the deployment-baseline collision policy for kernel config."""
+        if not self.contact_policies:
+            return None
+        policy = self.contact_policies[0]
+        canonical = yaml.safe_dump(
+            policy.raw,
+            sort_keys=True,
+            allow_unicode=False,
+        )
+        return {
+            "policy_id": policy.policy_id,
+            "revision_id": 1,
+            "content_hash": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+            "require_full_diagnostics": bool(
+                policy.raw.get("require_full_diagnostics", True)
+            ),
+        }
+
+    def _validate_adapter_capability_manifests(self) -> None:
+        grippers_configured = bool(self.grippers)
+        for slot, adapter in self.adapters.items():
+            manifest = get_adapter_capability_manifest(adapter.adapter_id)
+            if manifest is None:
+                continue
+            declared = set(adapter.capability_keys)
+            published = set(
+                manifest.capability_keys_for(
+                    grippers_configured=grippers_configured
+                )
+            )
+            if declared != published:
+                missing = sorted(published - declared)
+                extra = sorted(declared - published)
+                raise DeploymentValidationError(
+                    f"adapters.{slot}.capability_keys do not match published "
+                    f"capability manifest for '{adapter.adapter_id}': "
+                    f"missing={missing}, extra={extra}"
                 )
 
     def validate_assistant_modes(
@@ -2198,6 +2549,31 @@ class Deployment:
                         binding_d["metadata"] = dict(binding.metadata)
                     source_d["objects"][object_id] = binding_d
                 d["pose_sources"].append(source_d)
+        if self.simulation_control is not None:
+            simulation_control_d: dict[str, Any] = {
+                "kind": self.simulation_control.kind,
+                "service_prefix": self.simulation_control.service_prefix,
+                "capabilities": {
+                    "reset": self.simulation_control.capabilities.reset,
+                    "pause": self.simulation_control.capabilities.pause,
+                    "play": self.simulation_control.capabilities.play,
+                    "step": self.simulation_control.capabilities.step,
+                    "set_entity_state": (
+                        self.simulation_control.capabilities.set_entity_state
+                    ),
+                },
+            }
+            if self.simulation_control.capabilities.reset:
+                simulation_control_d["reset"] = {
+                    "default_scope": self.simulation_control.reset.default_scope,
+                    "close_command_gate": (
+                        self.simulation_control.reset.close_command_gate
+                    ),
+                    "wait_ready_s": self.simulation_control.reset.wait_ready_s,
+                }
+            d["simulation_control"] = simulation_control_d
+        if self.contact_policies:
+            d["contact_policies"] = [dict(policy.raw) for policy in self.contact_policies]
         if self.authority_matrix:
             d["authority_matrix"] = {
                 domain: {
@@ -2369,6 +2745,14 @@ class Deployment:
             )
         if "pose_sources" in data:
             self.pose_sources = self._parse_pose_sources(data["pose_sources"])
+        if "simulation_control" in data:
+            self.simulation_control = self._parse_simulation_control(
+                data["simulation_control"]
+            )
+        if "contact_policies" in data:
+            self.contact_policies = self._parse_contact_policies(
+                data["contact_policies"]
+            )
         if "authority_matrix" in data:
             merged_matrix = {
                 domain: {
@@ -2396,3 +2780,4 @@ class Deployment:
                     ),
                 }
             self.authority_matrix = self._parse_authority_matrix(merged_matrix)
+        self._validate_adapter_capability_manifests()

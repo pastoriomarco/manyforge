@@ -23,7 +23,7 @@ from manyforge_behavior.program import Program
 from manyforge_behavior.runner import OrchestratorRunner
 
 # Import launcher functions
-from scripts.launch import create_kernel, main
+from scripts.launch import _native_kernel_config_from_deployment, create_kernel, main
 
 
 CATALOG_PATH = Path(__file__).parent.parent / "resources" / "node_catalog.yaml"
@@ -183,6 +183,31 @@ class TestLauncherArgParser:
 class TestLauncherKernelCreation:
     """Tests for kernel creation logic."""
 
+    def test_native_kernel_config_forwards_planning_budget_and_policy_snapshot(self):
+        data = _minimal_deployment(
+            contact_policies=[
+                {
+                    "policy_id": "deployment_baseline",
+                    "require_full_diagnostics": True,
+                }
+            ]
+        )
+        data["adapters"]["planning"]["config"] = {
+            "planner_max_planning_time_s": 9.0
+        }
+        data["adapters"]["execution"]["config"] = {
+            "single_shot_ik_timeout_s": 0.04
+        }
+        deployment = Deployment.from_dict(data)
+
+        config = _native_kernel_config_from_deployment(deployment)
+
+        assert config["planner_max_planning_time_s"] == 9.0
+        assert config["single_shot_ik_timeout_s"] == 0.04
+        assert config["baseline_collision_policy_snapshot"]["policy_id"] == (
+            "deployment_baseline"
+        )
+
     def test_create_kernel_returns_mock_for_unknown_adapter(self):
         """When adapter is not roboplan, return MockKernelClient."""
         data = _minimal_deployment()
@@ -201,6 +226,11 @@ class TestLauncherKernelCreation:
         """When roboplan adapter but module not available, return MockKernelClient."""
         data = _minimal_deployment()
         data["adapters"]["planning"]["adapter_id"] = "planning.roboplan"
+        data["adapters"]["planning"]["capability_keys"] = [
+            "planning.motion.joint_goal",
+            "planning.motion.pose_goal",
+            "planning.trajectory.time_parameterized",
+        ]
         deploy_path = _write_yaml(data)
 
         try:
@@ -235,6 +265,11 @@ class TestLauncherKernelCreation:
                 "planning": {
                     "adapter_id": "planning.roboplan",
                     "adapter_version": "0.1.0",
+                    "capability_keys": [
+                        "planning.motion.joint_goal",
+                        "planning.motion.pose_goal",
+                        "planning.trajectory.time_parameterized",
+                    ],
                     "config": {},
                 },
                 "context": {

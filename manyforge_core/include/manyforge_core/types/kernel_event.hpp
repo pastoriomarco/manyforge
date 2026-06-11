@@ -28,6 +28,7 @@ enum class KernelEventType {
   kStopIssued,         // stop issued to backend
   kPauseRequested,     // pause requested
   kResumeRequested,    // resume requested
+  kRuntimeVelocityScaleChanged,  // runtime velocity scale changed
   kCompletedAcknowledged,  // completed terminal outcome acknowledged
   // Intervention acknowledgement. Emitted when an explicit operator/runtime
   // call clears `kInterventionRequired`. `details` carries `principal_id`

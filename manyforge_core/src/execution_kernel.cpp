@@ -65,6 +65,12 @@ std::string comma_join_doubles(const std::vector<double>& values) {
   return out.str();
 }
 
+std::string format_double(double value) {
+  std::ostringstream out;
+  out << std::setprecision(17) << value;
+  return out.str();
+}
+
 Pose3DTO multiply_poses(const Pose3DTO& a, const Pose3DTO& b) {
   auto pose_to_matrix = [](const Pose3DTO& pose) {
     std::array<std::array<double, 4>, 4> m{{
@@ -1057,6 +1063,11 @@ ExecutionKernel::ExecutionKernel(IPlannerBackend& planner,
       !std::isfinite(config_.single_shot_ik_timeout_s)) {
     throw std::invalid_argument(
         "single_shot_ik_timeout_s must be finite and > 0");
+  }
+  if (config_.planner_max_planning_time_s <= 0.0 ||
+      !std::isfinite(config_.planner_max_planning_time_s)) {
+    throw std::invalid_argument(
+        "planner_max_planning_time_s must be finite and > 0");
   }
   if (config_.validation_collision_workers < 1) {
     config_.validation_collision_workers = 1;
@@ -4603,14 +4614,16 @@ AcknowledgeCompletedResultDTO ExecutionKernel::acknowledge_completed(
         false,
         ErrorDTO{kErrorInvalidRequest,
                  "Can only acknowledge a Completed execution",
-                 {{"state", to_string(status.state)}}}};
+                 {{"reason_code", "wrong_state"},
+                  {"state", to_string(status.state)}}}};
   }
   if (status.execution_id != execution_id) {
     return AcknowledgeCompletedResultDTO{
         false,
         ErrorDTO{kErrorInvalidRequest,
                  "Execution acknowledgement id mismatch",
-                 {{"current_execution_id", std::to_string(status.execution_id)},
+                 {{"reason_code", "mismatched_execution_id"},
+                  {"current_execution_id", std::to_string(status.execution_id)},
                   {"requested_execution_id", std::to_string(execution_id)}}}};
   }
 
@@ -5514,7 +5527,8 @@ void ExecutionKernel::set_collision_validation_retry_config(
   coordinator_per_state_timeout_ns_ = per_state_timeout_ns;
 }
 
-void ExecutionKernel::set_runtime_velocity_scale(double scale) {
+void ExecutionKernel::set_runtime_velocity_scale(
+    double scale, std::optional<std::string> principal_id) {
   // ADR-0018: HMI runtime velocity scale → backend runtime register.
   // Validate finiteness here; clamp to [0, 1]; forward to the backend's
   // atomic store. No lifecycle_mutex_: this is a high-rate operator surface
@@ -5526,8 +5540,28 @@ void ExecutionKernel::set_runtime_velocity_scale(double scale) {
   }
   if (scale < 0.0) scale = 0.0;
   if (scale > 1.0) scale = 1.0;
+  const double previous =
+      runtime_velocity_scale_.load(std::memory_order_acquire);
   runtime_velocity_scale_.store(scale, std::memory_order_release);
   execution_backend_.set_runtime_velocity_scale(scale);
+  const auto status = sm_.status();
+  std::map<std::string, std::string> details{
+      {"previous_scale", format_double(previous)},
+      {"new_scale", format_double(scale)},
+      {"applied_scale", format_double(scale)},
+      {"backend_status", "forwarded"},
+      {"source", "kernel_api"},
+      {"state", to_string(status.state)}};
+  if (principal_id.has_value() && !principal_id->empty()) {
+    details["principal_id"] = *principal_id;
+  }
+  emit_event({KernelEventType::kRuntimeVelocityScaleChanged,
+              status.execution_id,
+              clock_.now(),
+              {},
+              {},
+              std::nullopt,
+              std::move(details)});
 }
 
 }  // namespace manyforge::core

@@ -25,10 +25,7 @@ logger = logging.getLogger(__name__)
 def _deployment_capability_keys(state: ComposerState) -> set[str] | None:
     if state.deployment is None:
         return None
-    capability_keys: set[str] = set()
-    for adapter in state.deployment.adapters.values():
-        capability_keys.update(adapter.capability_keys)
-    return capability_keys
+    return state.deployment.capability_keys()
 
 
 def _parent_run_id_for_intervention(state: ComposerState) -> str | None:

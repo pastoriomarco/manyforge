@@ -31,13 +31,21 @@ adapters:
       - context.state.current
       - context.validation.trajectory
       - context.collision.check
+      - context.collision.check.detailed
       - context.kinematics.fk
       - context.limits.joint
+      - context.pose.resolve_reference
+      - context.scene.object_query
       - scene.shape.box
       - scene.shape.sphere
+      - scene.shape.cylinder
+      - scene.shape.mesh
       - scene.edit.add
+      - scene.edit.upsert
       - scene.edit.remove
       - scene.edit.update_pose
+      - scene.edit.attach_detach
+      - observability.trace.scene
     config: {}
   execution:
     adapter_id: execution.ros2_control_fjt

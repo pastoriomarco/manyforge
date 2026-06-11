@@ -17,6 +17,7 @@ from manyforge_behavior.cycle_manager import (
     CycleState,
     InterventionSession,
     RecoveryTrigger,
+    canonical_recovery_trigger_values,
 )
 
 CATALOG_PATH = str(Path(__file__).parent.parent / "resources" / "node_catalog.yaml")
@@ -118,8 +119,9 @@ class TestCycleManagerRun:
     
     def test_run_from_running_is_noop(self, kernel):
         """run() from RUNNING state is a no-op."""
-        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
-        manager = CycleManager(runner, kernel)
+        slow_kernel = MockKernelClient(execute_duration_s=1.0)
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, slow_kernel)
+        manager = CycleManager(runner, slow_kernel)
         
         manager.run()
         assert manager.state == CycleState.RUNNING
@@ -655,7 +657,7 @@ class TestCycleManagerVelocityScale:
         runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
         manager = CycleManager(runner, kernel)
         
-        manager.set_velocity_scale(0.75)
+        manager.set_velocity_scale(0.75, principal_id="operator_alice")
         
         # Check blackboard has the value
         bb = py_trees.blackboard.Client(name="test_vs")
@@ -663,6 +665,7 @@ class TestCycleManagerVelocityScale:
         assert bb.velocity_scale == 0.75
         assert kernel.runtime_velocity_scale == pytest.approx(0.75)
         assert kernel.runtime_velocity_scale_updates[-1] == pytest.approx(0.75)
+        assert kernel.runtime_velocity_scale_principal_ids[-1] == "operator_alice"
     
     def test_stop_flag_blocks_new_motion(self, kernel):
         """stop_requested flag is written to blackboard."""
@@ -1464,6 +1467,11 @@ class TestRecoveryTriggerTaxonomy:
     def test_canonical_set_is_subset_of_enum(self):
         present = {member.value for member in RecoveryTrigger}
         assert self.CANONICAL.issubset(present)
+
+    def test_live_authoring_allowlist_excludes_legacy_aliases(self):
+        assert canonical_recovery_trigger_values() == self.CANONICAL
+        assert "timeout" not in canonical_recovery_trigger_values()
+        assert "node_failure" not in canonical_recovery_trigger_values()
 
     def test_legacy_aliases_still_parse(self):
         # These are kept for serialised-trace round-trip during the

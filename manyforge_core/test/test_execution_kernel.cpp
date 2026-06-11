@@ -1995,6 +1995,9 @@ TEST_F(ExecutionKernelTest, Execute_FromCompleted_RequiresAcknowledgement) {
 
   auto stale_ack = kernel.acknowledge_completed(first.value() + 1);
   EXPECT_FALSE(stale_ack.accepted);
+  ASSERT_TRUE(stale_ack.error.has_value());
+  EXPECT_EQ(stale_ack.error->details.at("reason_code"),
+            "mismatched_execution_id");
   EXPECT_EQ(kernel.get_status().state, ExecutionState::kCompleted);
 
   auto ack = kernel.acknowledge_completed(first.value());
@@ -2021,6 +2024,8 @@ TEST_F(ExecutionKernelTest, AcknowledgeCompleted_FromFailed_Rejected) {
 
   auto ack = kernel.acknowledge_completed(result.value());
   EXPECT_FALSE(ack.accepted);
+  ASSERT_TRUE(ack.error.has_value());
+  EXPECT_EQ(ack.error->details.at("reason_code"), "wrong_state");
   EXPECT_EQ(kernel.get_status().state, ExecutionState::kFailed);
 }
 
@@ -4451,6 +4456,30 @@ TEST_F(ExecutionKernelTest, Events_SubscribeUnsubscribe) {
   execute_sync(make_test_request());
   std::lock_guard<std::mutex> lock(events_mutex);
   EXPECT_EQ(events.size(), count_before);  // no new events
+}
+
+TEST_F(ExecutionKernelTest, Events_RuntimeVelocityScaleChangedEmitted) {
+  std::mutex events_mutex;
+  std::vector<KernelEvent> events;
+  kernel.subscribe_events([&](const KernelEvent& e) {
+    std::lock_guard<std::mutex> lock(events_mutex);
+    events.push_back(e);
+  });
+
+  kernel.set_runtime_velocity_scale(0.5, std::string{"operator_alice"});
+
+  std::lock_guard<std::mutex> lock(events_mutex);
+  auto it = std::find_if(events.begin(), events.end(), [](const KernelEvent& e) {
+    return e.type == KernelEventType::kRuntimeVelocityScaleChanged;
+  });
+  ASSERT_NE(it, events.end());
+  EXPECT_EQ(it->details.at("previous_scale"), "1");
+  EXPECT_EQ(it->details.at("new_scale"), "0.5");
+  EXPECT_EQ(it->details.at("applied_scale"), "0.5");
+  EXPECT_EQ(it->details.at("backend_status"), "forwarded");
+  EXPECT_EQ(it->details.at("source"), "kernel_api");
+  EXPECT_EQ(it->details.at("state"), "Idle");
+  EXPECT_EQ(it->details.at("principal_id"), "operator_alice");
 }
 
 TEST_F(ExecutionKernelTest, Events_MultipleSubscribers) {

@@ -1168,6 +1168,89 @@ class TestProgramValidation:
         finally:
             os.unlink(path)
 
+    def test_reset_simulation_requires_simulator_control_capability(self, catalog):
+        data = _minimal_program(program_profile="v0.1")
+        data["tree"] = {
+            "id": "reset_simulation",
+            "name": "reset_sim",
+        }
+        path = _write_program(data)
+        try:
+            program = Program(path, catalog)
+            assert "simulator.control.reset" in program.required_capabilities()
+
+            with pytest.raises(ProgramValidationError, match="simulator.control.reset"):
+                Program(path, catalog, deployment_capability_keys=set())
+
+            Program(
+                path,
+                catalog,
+                deployment_capability_keys={"simulator.control.reset"},
+            )
+        finally:
+            os.unlink(path)
+
+    @pytest.mark.parametrize(
+        ("node_id", "params", "capability"),
+        [
+            (
+                "set_simulation_state",
+                {"state": "paused"},
+                "simulator.control.pause",
+            ),
+            (
+                "set_simulation_state",
+                {"state": "playing"},
+                "simulator.control.play",
+            ),
+            (
+                "step_simulation",
+                {"steps": 2},
+                "simulator.control.step",
+            ),
+            (
+                "set_entity_state",
+                {
+                    "entity": "/World/box",
+                    "pose": {
+                        "frame_id": "world",
+                        "position_m": [0.1, 0.2, 0.3],
+                        "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+                    },
+                },
+                "simulator.entity_state.set",
+            ),
+        ],
+    )
+    def test_simulation_control_nodes_require_deployment_capabilities(
+        self,
+        catalog,
+        node_id,
+        params,
+        capability,
+    ):
+        data = _minimal_program(program_profile="v0.1")
+        data["tree"] = {
+            "id": node_id,
+            "name": node_id,
+            "params": params,
+        }
+        path = _write_program(data)
+        try:
+            program = Program(path, catalog)
+            assert capability in program.required_capabilities()
+
+            with pytest.raises(ProgramValidationError, match=capability):
+                Program(path, catalog, deployment_capability_keys=set())
+
+            Program(
+                path,
+                catalog,
+                deployment_capability_keys={capability},
+            )
+        finally:
+            os.unlink(path)
+
     def test_rejects_duplicate_node_names(self, catalog):
         data = _minimal_program()
         data["tree"] = {

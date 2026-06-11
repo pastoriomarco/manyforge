@@ -1,5 +1,9 @@
 """Capability key registry and profile definitions for ManyForge v0.0/v0.1/v0.2."""
 
+from __future__ import annotations
+
+from dataclasses import dataclass
+
 CAPABILITY_REGISTRY: frozenset[str] = frozenset({
     # Planning
     "planning.motion.joint_goal",
@@ -62,11 +66,108 @@ CAPABILITY_REGISTRY: frozenset[str] = frozenset({
     "controller_mgmt.load_unload",
     # Perception / pose-source
     "perception.pose_updates",
+    # Simulator lifecycle/control
+    "simulator.control.reset",
+    "simulator.control.pause",
+    "simulator.control.play",
+    "simulator.control.step",
+    "simulator.entity_state.set",
     # Observability
     "observability.trace.kernel",
     "observability.trace.scene",
     "observability.logging.operational",
 })
+
+
+@dataclass(frozen=True)
+class AdapterCapabilityManifest:
+    """Code-owned capability manifest published by a concrete adapter."""
+
+    adapter_id: str
+    capability_keys: frozenset[str]
+    gripper_capability_keys: frozenset[str] = frozenset()
+
+    def capability_keys_for(self, *, grippers_configured: bool = False) -> frozenset[str]:
+        keys = set(self.capability_keys)
+        if grippers_configured:
+            keys.update(self.gripper_capability_keys)
+        return frozenset(keys)
+
+
+_PLANNING_ROBOPLAN_CAPABILITY_KEYS = frozenset({
+    "planning.motion.joint_goal",
+    "planning.motion.pose_goal",
+    "planning.trajectory.time_parameterized",
+})
+
+_ROBOPLAN_CONTEXT_CAPABILITY_KEYS = frozenset({
+    "context.state.current",
+    "context.validation.trajectory",
+    "context.collision.check",
+    "context.collision.check.detailed",
+    "context.kinematics.fk",
+    "context.limits.joint",
+    "context.pose.resolve_reference",
+    "context.scene.object_query",
+    "scene.shape.box",
+    "scene.shape.sphere",
+    "scene.shape.cylinder",
+    "scene.shape.mesh",
+    "scene.edit.add",
+    "scene.edit.upsert",
+    "scene.edit.remove",
+    "scene.edit.update_pose",
+    "scene.edit.attach_detach",
+    "observability.trace.scene",
+})
+
+_EXECUTION_CORE_CAPABILITY_KEYS = frozenset({
+    "execution.trajectory.execute",
+    "execution.feedback.phase_events",
+    "execution.feedback.state_snapshots",
+    "execution.stop.soft",
+    "execution.pause",
+    "execution.resume",
+    "execution.reset",
+})
+
+_GRIPPER_CAPABILITY_KEYS = frozenset({
+    "tool.gripper.command",
+    "tool.gripper.feedback",
+})
+
+ADAPTER_CAPABILITY_MANIFESTS: dict[str, AdapterCapabilityManifest] = {
+    "planning.roboplan": AdapterCapabilityManifest(
+        adapter_id="planning.roboplan",
+        capability_keys=_PLANNING_ROBOPLAN_CAPABILITY_KEYS,
+    ),
+    "planning.roboplan_context": AdapterCapabilityManifest(
+        adapter_id="planning.roboplan_context",
+        capability_keys=_ROBOPLAN_CONTEXT_CAPABILITY_KEYS,
+    ),
+    "execution.roboplan_native": AdapterCapabilityManifest(
+        adapter_id="execution.roboplan_native",
+        capability_keys=_EXECUTION_CORE_CAPABILITY_KEYS,
+        gripper_capability_keys=_GRIPPER_CAPABILITY_KEYS,
+    ),
+    "execution.ros2_control_follow_joint_trajectory": AdapterCapabilityManifest(
+        adapter_id="execution.ros2_control_follow_joint_trajectory",
+        capability_keys=_EXECUTION_CORE_CAPABILITY_KEYS,
+        gripper_capability_keys=_GRIPPER_CAPABILITY_KEYS,
+    ),
+    # Legacy short id retained for historic fixtures/deployments.
+    "execution.ros2_control_fjt": AdapterCapabilityManifest(
+        adapter_id="execution.ros2_control_fjt",
+        capability_keys=_EXECUTION_CORE_CAPABILITY_KEYS,
+        gripper_capability_keys=_GRIPPER_CAPABILITY_KEYS,
+    ),
+}
+
+
+def get_adapter_capability_manifest(
+    adapter_id: str,
+) -> AdapterCapabilityManifest | None:
+    return ADAPTER_CAPABILITY_MANIFESTS.get(adapter_id)
 
 # v0.0 required capability keys (from SPEC-240)
 V0_0_REQUIRED_KEYS: frozenset[str] = frozenset({

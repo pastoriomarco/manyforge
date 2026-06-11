@@ -1237,6 +1237,190 @@ entries:
       emits_events: []
       consumes_events: []
 
+  - id: reset_simulation
+    name: ResetSimulation
+    category: simulation
+    description: >-
+      Reset the connected simulator state through the deployment-declared
+      simulation control surface.
+    tags: [motion, simulator, reset]
+    profiles:
+      min_profile: v0.1
+    kind: leaf
+    children:
+      min: 0
+      max: 0
+    parameters:
+      - name: reason
+        schema:
+          type: string
+        required: false
+        default: ""
+        description: Optional trace reason for the simulator reset request.
+    required_capabilities:
+      - simulator.control.reset
+    execution:
+      blocking: true
+      cancellable: false
+    runners:
+      py_trees:
+        implementation_kind: plugin
+        class: manyforge_behavior.nodes.ResetSimulation
+    observability:
+      emits_events:
+        - simulation_control_requested
+        - simulation_control_started
+        - simulation_control_completed
+        - simulation_control_failed
+      consumes_events: []
+
+  - id: set_simulation_state
+    name: SetSimulationState
+    category: simulation
+    description: >-
+      Set the connected simulator lifecycle state through the
+      deployment-declared simulation control surface.
+    tags: [simulator, lifecycle]
+    profiles:
+      min_profile: v0.1
+    kind: leaf
+    children:
+      min: 0
+      max: 0
+    parameters:
+      - name: state
+        schema:
+          type: enum
+          values: [playing, paused]
+        required: true
+        enum_options:
+          - value: playing
+            required_capabilities:
+              - simulator.control.play
+          - value: paused
+            required_capabilities:
+              - simulator.control.pause
+        description: Target simulator state.
+      - name: reason
+        schema:
+          type: string
+        required: false
+        default: ""
+        description: Optional trace reason for the simulator state request.
+    required_capabilities: []
+    execution:
+      blocking: true
+      cancellable: false
+    runners:
+      py_trees:
+        implementation_kind: plugin
+        class: manyforge_behavior.nodes.SetSimulationState
+    observability:
+      emits_events:
+        - simulation_control_requested
+        - simulation_control_started
+        - simulation_control_completed
+        - simulation_control_failed
+      consumes_events: []
+
+  - id: step_simulation
+    name: StepSimulation
+    category: simulation
+    description: >-
+      Advance a paused simulator by a finite number of steps through the
+      deployment-declared simulation control surface.
+    tags: [simulator, lifecycle]
+    profiles:
+      min_profile: v0.1
+    kind: leaf
+    children:
+      min: 0
+      max: 0
+    parameters:
+      - name: steps
+        schema:
+          type: int
+          constraints:
+            min_inclusive: 1
+        required: false
+        default: 1
+        parameterizable: true
+        description: Number of simulation steps to advance.
+      - name: reason
+        schema:
+          type: string
+        required: false
+        default: ""
+        description: Optional trace reason for the simulator step request.
+    required_capabilities:
+      - simulator.control.step
+    execution:
+      blocking: true
+      cancellable: false
+    runners:
+      py_trees:
+        implementation_kind: plugin
+        class: manyforge_behavior.nodes.StepSimulation
+    observability:
+      emits_events:
+        - simulation_control_requested
+        - simulation_control_started
+        - simulation_control_completed
+        - simulation_control_failed
+      consumes_events: []
+
+  - id: set_entity_state
+    name: SetEntityState
+    category: simulation
+    description: >-
+      Set a simulator entity pose through the deployment-declared
+      simulation control surface.
+    tags: [simulator, entity, pose]
+    profiles:
+      min_profile: v0.1
+    kind: leaf
+    children:
+      min: 0
+      max: 0
+    parameters:
+      - name: entity
+        schema:
+          type: string
+        required: true
+        parameterizable: true
+        ui_editor: blackboard_key_selector
+        blackboard_role: literal_or_key_reader
+        blackboard_value_type: string
+        description: Simulator entity path/name to set.
+      - name: pose
+        schema_ref: "#/schema_types/stored_pose"
+        required: true
+        description: >-
+          Target entity pose. Must contain `frame_id`, `position_m`, and
+          exactly one orientation form.
+      - name: reason
+        schema:
+          type: string
+        required: false
+        default: ""
+        description: Optional trace reason for the entity-state request.
+    required_capabilities:
+      - simulator.entity_state.set
+    execution:
+      blocking: true
+      cancellable: false
+    runners:
+      py_trees:
+        implementation_kind: plugin
+        class: manyforge_behavior.nodes.SetEntityState
+    observability:
+      emits_events:
+        - simulation_control_requested
+        - simulation_control_started
+        - simulation_control_completed
+        - simulation_control_failed
+      consumes_events: []
+
   # ---------------------------------------------------------------------------
   # Scene / objects
   # ---------------------------------------------------------------------------
