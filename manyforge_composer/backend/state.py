@@ -2999,14 +2999,31 @@ class ComposerState:
                         rejected_count += 1
                         details.append(detail)
                         continue
+                    # Safe-point applies validate freshness before mutating the
+                    # backend scene. After that mutation, the backend owns the
+                    # scene state for planning/execution; carrying the source
+                    # timestamp forward would make long moves fail as "stale"
+                    # even though no continuous source is expected. Continuous
+                    # policies keep runtime freshness metadata because the
+                    # source remains authoritative while execution is active.
+                    runtime_freshness_required = policy in {
+                        "continuous",
+                        "continuous_unattached",
+                    }
                     scene_request = SceneEditRequest(
                         operation="update_pose",
                         object_id=object_id,
                         pose_position_m=edit_position,
                         pose_orientation_xyzw=edit_orientation,
                         frame_id=edit_frame_id,
-                        source_timestamp_ns=source_timestamp_ns,
-                        source_freshness_budget_ns=source_freshness_budget_ns,
+                        source_timestamp_ns=(
+                            source_timestamp_ns if runtime_freshness_required else None
+                        ),
+                        source_freshness_budget_ns=(
+                            source_freshness_budget_ns
+                            if runtime_freshness_required
+                            else None
+                        ),
                     )
                     result = self.kernel.scene_edit(scene_request)
                     if not result.success:

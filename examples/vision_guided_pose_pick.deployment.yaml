@@ -88,8 +88,18 @@ model_endpoint_profile_registry: model_endpoint_profiles.yaml
 
 model_endpoints:
   vision_model:
-    profile_ref: thor_manyforge_qwen36
+    # thor_cosmos_reason2_8b: the actually-vision-capable served recipe.
+    # Was thor_manyforge_qwen36, whose pinned model_id is the pre-2026-05-31
+    # qwen profile — vLLM 404s ("model does not exist") whenever the serving
+    # stack runs anything else, which silently stalled this scenario's
+    # infer_grasp_pose node (Day 6A finding F3).
+    profile_ref: thor_cosmos_reason2_8b
     max_tokens: 512
+    # cosmos-reason2 generates reasoning tokens before the structured answer;
+    # at Thor 8B speeds an image prefill + up-to-512-token completion can
+    # exceed the profile's 30 s default (measured: simple 50-token describe
+    # call = 4.9 s warm; grasp inference > 30 s).
+    default_timeout_s: 120.0
   # Chat-capable endpoint used by the assistant overlay (the AI button
   # in the Composer UI). Independent of `vision_model`, which is used
   # by the program's `query_model` behavior-tree nodes for the

@@ -1,20 +1,25 @@
 #!/usr/bin/env bash
-# configure-manyforge-provider.sh — Wire ManyForge into a NemoClaw-Thor sandbox
+# configure-manyforge-provider.sh — Legacy mux/plugin wiring for NemoClaw-Thor
 #
 # Prerequisites:
 #   - NemoClaw-Thor configured: ./setup/configure-local-provider.sh already run
 #   - ManyForge container running with Composer on port 9000 (--mcp-http)
 #
 # Usage:
-#   ./scripts/configure-manyforge-provider.sh
+#   MANYFORGE_ENABLE_LEGACY_MUX_PROVIDER=true ./scripts/configure-manyforge-provider.sh
 #
-# Integration paths:
+# Legacy integration paths:
 #   preferred: sandbox main agent → installed OpenClaw plugin → direct HTTPS route on
 #              https://host.openshell.internal/api/mcp
 #   fallback:  sandbox main agent → installed OpenClaw plugin → inference.local →
 #              mux-proxy → ManyForge
 #
 # Notes:
+#   - This is not the current Composer-assistant path. Current operator bring-up
+#     uses scripts/launch.sh (or demo-assistant-known-good.sh), one
+#     ASSISTANT_PROVIDER-selected bridge, and no manyforge-mux-proxy.
+#   - Direct invocation is gated by MANYFORGE_ENABLE_LEGACY_MUX_PROVIDER=true so
+#     old mux transport cannot be selected accidentally.
 #   - We do not depend on root-level `mcp.servers` in openclaw.json for the
 #     embedded main agent; this OpenClaw build rejects that config shape.
 #   - The direct host HTTPS route remains experimental and is skipped by
@@ -50,6 +55,13 @@ source "${NEMOCLAW_THOR}/setup/checks.sh"
 source "${NEMOCLAW_THOR}/serving/config.sh"
 source "${NEMOCLAW_THOR}/setup/sandbox-runtime.sh"
 source "${SCRIPT_DIR}/manyforge-direct-route-common.sh"
+
+if [[ "${MANYFORGE_ENABLE_LEGACY_MUX_PROVIDER:-false}" != "true" ]]; then
+    echo "ERROR: configure-manyforge-provider.sh is a legacy mux/plugin helper." >&2
+    echo "       Use scripts/launch.sh or demo-assistant-known-good.sh for the current assistant path." >&2
+    echo "       To intentionally run the legacy path, set MANYFORGE_ENABLE_LEGACY_MUX_PROVIDER=true." >&2
+    exit 2
+fi
 
 push_tarball_to_sandbox() {
     local sandbox_name="$1"
@@ -287,7 +299,7 @@ if [[ "${MANYFORGE_ENABLE_DIRECT_ROUTE_EXPERIMENT,,}" == "true" ]]; then
                 THOR_LOCAL_VLLM_BASE_URL="http://host.openshell.internal:8000/v1"
                 openshell provider update "${THOR_LOCAL_PROVIDER_NAME}" \
                     --config OPENAI_BASE_URL="${THOR_LOCAL_VLLM_BASE_URL}" 2>/dev/null
-                pass "Provider ${THOR_LOCAL_PROVIDER_NAME} restored to direct vLLM (port 8000)"
+                pass "Provider ${THOR_LOCAL_PROVIDER_NAME} restored to direct local-model route (port 8000)"
                 sync_sandbox_runtime_config "${SANDBOX_NAME}" 2>/dev/null
                 pass "Sandbox OpenClaw config synced for dedicated-route mode"
             else
@@ -657,7 +669,7 @@ echo "  Origin:   ${plugin_runtime_origin}"
 echo "  Tools:    ${host_tool_count}"
 echo "  Skills:   ${skill_count}"
 echo ""
-echo "  To restore direct vLLM mode only:"
+echo "  To restore direct local-model mode only:"
 echo "    cd ${NEMOCLAW_THOR} && ./setup/configure-local-provider.sh --without-manyforge-mux"
 echo ""
 echo "  To redeploy a pinned artifact without rebuilding:"

@@ -28,10 +28,11 @@ from typing import Any
 
 
 REQUEST_VERSION = "manyforge.assistant.provider_request.v0"
-DEFAULT_MODEL = "cosmos-reason2-8b"
+DEFAULT_MODEL = "gemma4-12b-it-gguf"
+RECOMMENDED_PROFILE = "gemma-bridge-default"
 DEFAULT_PROFILES = [
     "vllm-generation-config",
-    "cosmos-bridge-default",
+    RECOMMENDED_PROFILE,
 ]
 
 
@@ -51,7 +52,7 @@ PROFILES: dict[str, Profile] = {
         bridge_env={},
         upstream_body={},
         start_bridge=False,
-        note="Direct vLLM probe with no per-request generation overrides.",
+        note="Direct model-endpoint probe with no per-request generation overrides.",
     ),
     "bridge-default": Profile(
         name="bridge-default",
@@ -68,6 +69,21 @@ PROFILES: dict[str, Profile] = {
         upstream_body={"temperature": 0.0, "max_tokens": 8192},
         expect_e2e_success=True,
         note="Cosmos Reason2 8B bridge smoke profile; uses NemoClaw-Thor serving defaults plus a bounded output cap.",
+    ),
+    "gemma-bridge-default": Profile(
+        name="gemma-bridge-default",
+        bridge_env={
+            "BRIDGE_UPSTREAM_MAX_TOKENS": "8192",
+            "BRIDGE_UPSTREAM_TEMPERATURE": "0.0",
+            "BRIDGE_UPSTREAM_ENABLE_THINKING": "false",
+        },
+        upstream_body={
+            "temperature": 0.0,
+            "max_tokens": 8192,
+            "chat_template_kwargs": {"enable_thinking": False},
+        },
+        expect_e2e_success=True,
+        note="Gemma 4 12B GGUF bridge smoke profile; current ManyForge assistant default.",
     ),
     "omni-vendor-tool": Profile(
         name="omni-vendor-tool",
@@ -223,7 +239,7 @@ def main() -> int:
         "startedAt": time.time(),
         "profiles": {},
         "negativeCases": {},
-        "recommendedProfile": "cosmos-bridge-default",
+        "recommendedProfile": RECOMMENDED_PROFILE,
     }
 
     try:
@@ -343,7 +359,7 @@ def _run_profile(args: argparse.Namespace, profile: Profile, model: str) -> dict
 def _run_negative_cases(args: argparse.Namespace, model: str) -> dict[str, Any]:
     if args.skip_negative:
         return {"skipped": True}
-    profile = PROFILES["cosmos-bridge-default"]
+    profile = PROFILES[RECOMMENDED_PROFILE]
     log_dir = Path(args.log_dir)
     log_dir.mkdir(parents=True, exist_ok=True)
     audit_path = log_dir / "negative-audit.jsonl"

@@ -15,7 +15,7 @@
 #   3. POST to load the example program:
 #      curl -X POST http://localhost:9000/api/program/load \
 #        -H 'Content-Type: application/json' \
-#        -d '{"path":"/workspace/manyforge_behavior/tests/fixtures/pick_and_place.program.yaml",
+#        -d '{"path":"/workspace/examples/pick_and_place_minimal.program.yaml",
 #             "deploymentPath":"/workspace/manyforge_behavior/tests/fixtures/ur5_roboplan.deployment.yaml"}'
 #   4. GET /api/program/tree to see the behavior tree
 #   5. POST /api/cycle/run to start the cycle

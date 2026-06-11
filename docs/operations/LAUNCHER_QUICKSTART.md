@@ -419,14 +419,15 @@ For where logs and observability endpoints live, see
 > composer build → run → smoke) start at the master index:
 > [`ORIN_STACK_SETUP.md`](ORIN_STACK_SETUP.md).
 
-The assistant lane defaults to `MODEL_PROFILE=cosmos-reason2-8b` (a vLLM
-profile tuned for Thor). On a **Jetson Orin AGX Dev Kit (64 GB)** use the
-`gemma4-12b-it-gguf-orin` model profile instead: Gemma 4 12B (unsloth
-GGUF UD-Q4_K_XL) served by llama.cpp with the Gemma 4 E2B GGUF as the
-speculative draft, on the Orin llama.cpp image. It tracks the verified
-Thor profile's serving recipe — 128k context, q8_0 KV cache (model +
-draft) and `--flash-attn on` — so the two stay in lockstep; only the
-image and cache mounts are Orin-specific. There is a turnkey wrapper:
+The Thor assistant lane defaults to `MODEL_PROFILE=gemma4-12b-it-gguf`.
+On a **Jetson Orin AGX Dev Kit (64 GB)** use the
+`gemma4-12b-it-gguf-orin` sibling profile: the same Gemma 4 12B
+(unsloth GGUF UD-Q4_K_XL) model served by llama.cpp with the Gemma 4
+E2B GGUF as the speculative draft, on the Orin llama.cpp image. It
+tracks the verified Thor serving recipe — 128k context, q8_0 KV cache
+(model + draft) and `--flash-attn on` — so the two stay in lockstep;
+only the image and cache mounts are Orin-specific. There is a turnkey
+wrapper:
 
 ```bash
 ./scripts/launch-orin-gemma.sh            # interactive review gate, then start

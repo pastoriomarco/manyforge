@@ -15,9 +15,9 @@ source "$(dirname "${BASH_SOURCE[0]}")/runner.sh"
 # Each line: name|lane|assistant|program|deployment|description
 _SCENARIO_TABLE=(
     "ur5-pick-place|manyforge-only|off|/workspace/examples/pick_and_place.program.yaml|/workspace/examples/pick_and_place.deployment.yaml|UR5 pick-and-place baseline (12-step)"
-    "ur5-simple-pick-place|manyforge-only|off|/workspace/manyforge_behavior/tests/fixtures/pick_and_place.program.yaml|/workspace/examples/pick_and_place.deployment.yaml|UR5 3-step minimal test fixture (was demo.sh --simple)"
+    "ur5-simple-pick-place|manyforge-only|off|/workspace/examples/pick_and_place_minimal.program.yaml|/workspace/examples/pick_and_place.deployment.yaml|UR5 minimal smoke: one move + scene edit (was demo.sh --simple)"
     "ur10e-pick-place|manyforge-only|off|/workspace/examples/pick_and_place_ur10e_robotiq.program.yaml|/workspace/examples/pick_and_place_ur10e_robotiq.deployment.yaml|UR10e + Robotiq 2F-140 self-contained preview"
-    "ur5-semantic-shape-pick|manyforge-only|on|/workspace/examples/semantic_shape_pick.program.yaml|/workspace/examples/semantic_shape_pick.deployment.yaml|UR5 semantic shape pick (vision LLM)"
+    "ur5-semantic-shape-pick|manyforge-only|on|/workspace/examples/semantic_shape_pick.program.yaml|/workspace/examples/semantic_shape_pick.deployment.yaml|UR5 semantic shape pick (text LLM: image_source=none)"
     "ur5-vision-pose-pick|manyforge-only|on|/workspace/examples/vision_guided_pose_pick.program.yaml|/workspace/examples/vision_guided_pose_pick.deployment.yaml|UR5 vision-guided pose pick (vision LLM)"
     "ur10e-scene-authoring|manyforge-only|on|/workspace/examples/pick_and_place_ur10e_robotiq.program.yaml|/workspace/examples/assistant_modes_scene_authoring.deployment.yaml|UR10e + Robotiq with full Cosmos assistant + scene authoring"
     "isaac-ur10e-light-scene|isaac-sim|off|/workspace/examples/isaac_manipulator_scene_light.program.yaml|/workspace/examples/isaac_manipulator_scene_light_ros2_control.deployment.yaml|Isaac commanded sim with UR10e light manipulator scene"

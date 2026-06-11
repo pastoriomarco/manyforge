@@ -562,7 +562,7 @@ bridge_healthz_ready() {
 }
 
 start_bridge_nemoclaw() {
-    step "Starting ManyForge assistant bridge (nemoclaw / direct-vLLM lane)"
+    step "Starting ManyForge assistant bridge (nemoclaw / direct model lane)"
     if bridge_pid_alive; then
         pass "Reusing bridge from ${BRIDGE_PID_FILE}"
         return 0
@@ -732,7 +732,7 @@ start_bridge_openclaw() {
     local launcher="${NEMOCLAW_THOR}/manyforge/start-openclaw-assistant-bridge.sh"
     if [[ ! -x "${launcher}" ]]; then
         fail "openclaw bridge launcher not found at: ${launcher}"
-        info "Set NEMOCLAW_THOR or fall back to ASSISTANT_PROVIDER=nemoclaw."
+        info "Set NEMOCLAW_THOR or fall back to ASSISTANT_PROVIDER=direct."
         return 1
     fi
     ensure_log_dir

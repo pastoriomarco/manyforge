@@ -712,7 +712,7 @@ def _validate_lane_entry(lane_id: str, entry: dict[str, Any]) -> None:
 LANE_REGISTRY: dict[str, dict[str, Any]] = {
     # Canonical id for the Direct lane is "direct" per the
     # THREE-LANE-MIGRATION-PLAN. The "direct" name refers to direct
-    # vLLM endpoint dispatch (bypassing the OpenClaw agent path), NOT
+    # model endpoint dispatch (bypassing the OpenClaw agent path), NOT
     # direct host execution — components still run inside the NemoClaw
     # sandbox. ``runtime`` and ``isolation`` carry that safety signal
     # so it is queryable by tests/UI/audit, not hidden in prose.
@@ -729,9 +729,9 @@ LANE_REGISTRY: dict[str, dict[str, Any]] = {
         "routing": "direct-vllm",
         "isolation": "sandbox",
         "description": (
-            "Direct-vLLM routing lane. Runs inside the NemoClaw sandbox "
+            "Direct model-endpoint routing lane. Runs inside the NemoClaw sandbox "
             "(same isolation boundary as the OpenClaw lane); 'direct' "
-            "refers to direct vLLM endpoint dispatch, NOT direct host "
+            "refers to direct model endpoint dispatch, NOT direct host "
             "execution. Bridge on :8100."
         ),
     },

@@ -1,7 +1,7 @@
 /// <reference types="node" />
 
 import { describe, expect, it } from 'vitest';
-import { headlineForError, prettyPair } from './KernelErrorPanel';
+import { headlineForError, hintForError, prettyBodyId, prettyPair } from './KernelErrorPanel';
 
 describe('KernelErrorPanel mapping', () => {
   describe('prettyPair', () => {
@@ -18,6 +18,14 @@ describe('KernelErrorPanel mapping', () => {
 
     it('falls back to last path segment when neither side matches object/robot', () => {
       expect(prettyPair('frame/world <-> sensor/probe/tip')).toBe('world ↔ tip');
+    });
+  });
+
+  describe('prettyBodyId', () => {
+    it('shortens object and robot body ids without dropping unfamiliar ids', () => {
+      expect(prettyBodyId('object/isaac_cheese_box/shape/0')).toBe('isaac_cheese_box');
+      expect(prettyBodyId('robot/ur10e/link/wrist_3_link/collision/0')).toBe('wrist_3_link');
+      expect(prettyBodyId('custom/body/token')).toBe('token');
     });
   });
 
@@ -52,6 +60,30 @@ describe('KernelErrorPanel mapping', () => {
       );
       expect(headline).toBe(
         'Runtime collision: wall ↔ wrist_1_link at waypoint 0',
+      );
+    });
+
+    it('renders stale runtime dynamic bodies as freshness faults, not contact collisions', () => {
+      const details = {
+        dynamic_body_age_ns: '526186753',
+        dynamic_body_effective_freshness_budget_ns: '500000000',
+        dynamic_body_id: 'object/isaac_cheese_box/shape/0',
+        reason: 'stale_dynamic_collision_body',
+        reason_code: 'runtime_collision_monitor',
+        surface: 'observed_runtime_monitor',
+      };
+
+      expect(
+        headlineForError(
+          'runtime_collision',
+          details,
+          'Motion execution ended in interrupted',
+        ),
+      ).toBe(
+        'Dynamic collision-world pose stale: isaac_cheese_box (526 ms > 500 ms)',
+      );
+      expect(hintForError('runtime_collision', details)).toContain(
+        'No geometric collision pair was reported',
       );
     });
 

@@ -3,7 +3,7 @@
 #
 # Bring the Direct lane up from a clean state:
 #   1. Verify vLLM + proxy are running (the foundation; brought up by
-#      ``./scripts/launch.sh start`` with ASSISTANT_PROVIDER=nemoclaw).
+#      ``./scripts/launch.sh start`` with ASSISTANT_PROVIDER=direct).
 #   2. Verify Composer is running on :9000.
 #   3. Verify the manyforge_assistant_bridge venv is provisioned at
 #      manyforge_assistant_bridge/.venv with httpx + fastapi + uvicorn.

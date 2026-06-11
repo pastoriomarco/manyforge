@@ -1,7 +1,8 @@
 # manyforge_assistant_bridge — assistant-provider HTTP bridge (v0.1)
 
-> **Lane status**: this is the **direct-vLLM lane** (Composer's `nemoclaw`
-> provider id), available as a fallback / known-good demo baseline. As of
+> **Lane status**: this is the **direct model lane** (Composer's canonical
+> `direct` provider id; `nemoclaw` remains a legacy alias), available as a
+> fallback / known-good demo baseline. As of
 > 2026-05-05, the demo launcher
 > ([`../scripts/demo-assistant-known-good.sh`](../scripts/demo-assistant-known-good.sh))
 > defaults to the **OpenClaw lane** (Composer's `openclaw` provider id;

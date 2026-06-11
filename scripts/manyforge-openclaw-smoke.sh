@@ -39,7 +39,8 @@ cleanup() {
     fi
 
     if [[ "${INITIAL_MUX_ENABLED}" == "true" ]]; then
-        "${SCRIPT_DIR}/configure-manyforge-provider.sh" >/dev/null
+        MANYFORGE_ENABLE_LEGACY_MUX_PROVIDER=true \
+            "${SCRIPT_DIR}/configure-manyforge-provider.sh" >/dev/null
     else
         (cd "${NEMOCLAW_THOR}" && ./setup/configure-local-provider.sh --without-manyforge-mux >/dev/null)
     fi
@@ -244,9 +245,11 @@ mux_smoke() {
     CURRENT_PHASE="mux"
     header "ManyForge Mux Smoke"
     if [[ "${SMOKE_PLUGIN_DEPLOY_MODE}" == "latest" ]]; then
-        "${SCRIPT_DIR}/configure-manyforge-provider.sh" >/dev/null
+        MANYFORGE_ENABLE_LEGACY_MUX_PROVIDER=true \
+            "${SCRIPT_DIR}/configure-manyforge-provider.sh" >/dev/null
     else
-        "${SCRIPT_DIR}/configure-manyforge-provider.sh" --use-current-artifact >/dev/null
+        MANYFORGE_ENABLE_LEGACY_MUX_PROVIDER=true \
+            "${SCRIPT_DIR}/configure-manyforge-provider.sh" --use-current-artifact >/dev/null
     fi
     RESTORE_MODE="true"
     load_thor_runtime_config ""

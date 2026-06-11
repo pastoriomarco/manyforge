@@ -283,9 +283,8 @@ def test_when_idle_apply_updates_planning_scene_from_fresh_snapshot(tmp_path: Pa
     assert object_pose["position_m"] == [1.0, 2.0, 3.0]
     edit = state.kernel.scene_edits[-1]
     assert edit.operation == "update_pose"
-    snapshot = state.pose_source_snapshots()["isaac_scene_objects"]
-    assert edit.source_freshness_budget_ns == 1_000_000_000
-    assert edit.source_timestamp_ns == snapshot["received_at_ns"] - 50_000_000
+    assert edit.source_freshness_budget_ns is None
+    assert edit.source_timestamp_ns is None
 
 
 def test_pose_source_apply_rejects_fresh_pose_without_age(tmp_path: Path) -> None:
@@ -338,6 +337,12 @@ def test_continuous_snapshot_applies_planning_scene_without_operator_apply(tmp_p
     assert object_pose["position_m"] == [1.0, 2.0, 3.0]
     assert state.kernel.scene_edits[-1].operation == "update_pose"
     assert state.kernel.scene_edits[-1].frame_id == "universe"
+    snapshot = state.pose_source_snapshots()["isaac_scene_objects"]
+    assert state.kernel.scene_edits[-1].source_freshness_budget_ns == 1_000_000_000
+    assert (
+        state.kernel.scene_edits[-1].source_timestamp_ns
+        == snapshot["received_at_ns"] - 50_000_000
+    )
     visual_objects, _meta = state.visual_scene_objects_snapshot()
     assert visual_objects[0].pose_in_universe["position_m"] == [1.0, 2.0, 3.0]
     assert refresh_reasons == []
@@ -539,6 +544,9 @@ def test_before_planning_latch_can_apply_during_running_cycle(tmp_path: Path) ->
     scene = client.get("/api/scene/state").json()
     object_pose = scene["objects"][0]["pose_in_universe"]
     assert object_pose["position_m"] == [1.0, 2.0, 3.0]
+    edit = state.kernel.scene_edits[-1]
+    assert edit.source_freshness_budget_ns is None
+    assert edit.source_timestamp_ns is None
 
 
 def test_pose_source_apply_uses_configured_frame_not_provider_frame(tmp_path: Path) -> None:
@@ -591,6 +599,9 @@ def test_between_nodes_latch_can_apply_during_running_cycle(tmp_path: Path) -> N
     scene = client.get("/api/scene/state").json()
     object_pose = scene["objects"][0]["pose_in_universe"]
     assert object_pose["position_m"] == [1.0, 2.0, 3.0]
+    edit = state.kernel.scene_edits[-1]
+    assert edit.source_freshness_budget_ns is None
+    assert edit.source_timestamp_ns is None
 
 
 def test_before_planning_latch_fails_closed_without_fresh_pose(tmp_path: Path) -> None:

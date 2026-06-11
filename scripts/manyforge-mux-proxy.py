@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Lightweight reverse proxy that multiplexes vLLM and ManyForge through a single port.
+"""Legacy reverse proxy that multiplexes vLLM and ManyForge through one port.
+
+This is not the current Composer-assistant transport. The supported assistant
+path is one ASSISTANT_PROVIDER-selected bridge per Composer process
+(`openclaw` on :8200 or direct/nemoclaw on :8100). Keep this script only for
+historical mux/plugin reproduction and diagnostics.
 
 OpenShell 0.0.26's sandbox proxy only allows outbound traffic through the
 `inference.local:443` TLS route.  The proxy enforces L7 path rules — only

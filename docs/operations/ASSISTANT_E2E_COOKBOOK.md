@@ -41,11 +41,12 @@ it" is better than a large demo that hides which part failed.
 - NemoClaw-Thor vLLM image/profile support is already set up.
 - Thor memory protocol is followed before each model switch.
 
-Current primary candidate profiles:
+Current primary profiles:
 
 ```text
-cosmos-reason2-8b                  # current known-good single-model demo default
+gemma4-12b-it-gguf                 # current ManyForge assistant default on Thor
 qwen3.6-35b-a3b-nvfp4-tq-mtp-manyforge
+cosmos-reason2-8b                  # historical anchor / comparison profile
 nemotron3-nano-omni-30b-a3b-nvfp4
 ```
 
@@ -76,13 +77,14 @@ cd ${HOME}/workspaces/nemoclaw/src/NemoClaw-Thor
 
 THOR_DETACH=1 \
 THOR_CONTAINER_NAME=manyforge-e2e-vllm \
-./serving/start-model.sh cosmos-reason2-8b
+./serving/start-model.sh gemma4-12b-it-gguf
 ```
 
-For Qwen3.6 or Nemotron Omni comparison runs, replace the profile with:
+For Qwen3.6, Cosmos, or Nemotron Omni comparison runs, replace the profile with:
 
 ```text
 qwen3.6-35b-a3b-nvfp4-tq-mtp-manyforge
+cosmos-reason2-8b
 nemotron3-nano-omni-30b-a3b-nvfp4
 ```
 
@@ -101,7 +103,7 @@ route, sandbox runtime config, and warmup should still be updated.
 ```bash
 cd ${HOME}/workspaces/nemoclaw/src/NemoClaw-Thor
 
-./setup/configure-local-provider.sh cosmos-reason2-8b
+./setup/configure-local-provider.sh gemma4-12b-it-gguf
 ./setup/status.sh
 ```
 
@@ -122,7 +124,7 @@ docker run -d --rm \
   -v ${HOME}/workspaces/dev_ws/src/manyforge:/workspace \
   -v manyforge_build-cache:/tmp/manyforge-build \
   -w /workspace \
-  -e MANYFORGE_ASSISTANT_PROVIDER=nemoclaw \
+  -e MANYFORGE_ASSISTANT_PROVIDER=direct \
   -e MANYFORGE_ASSISTANT_ENDPOINT_URL=http://127.0.0.1:8100/v1/manyforge/assistant \
   -e MANYFORGE_ASSISTANT_TIMEOUT_S=300 \
   manyforge-dev:latest \
@@ -171,7 +173,7 @@ BRIDGE_HOST=127.0.0.1 \
 BRIDGE_PORT=8100 \
 BRIDGE_UPSTREAM_BASE_URL=http://127.0.0.1:8000/v1 \
 BRIDGE_MANYFORGE_BASE_URL=http://127.0.0.1:9000 \
-BRIDGE_MODEL=cosmos-reason2-8b \
+BRIDGE_MODEL=gemma4-12b-it-gguf \
 BRIDGE_REQUEST_TIMEOUT_S=180 \
 BRIDGE_MAX_WALL_TIME_S=180 \
 BRIDGE_MAX_TURNS=16 \
@@ -193,16 +195,16 @@ curl -s http://127.0.0.1:8100/healthz | python3 -m json.tool
 
 Use this when you want the current best single-model assistant path without
 manually stitching together the model, Composer, HMI, and bridge. The launcher
-defaults to `cosmos-reason2-8b`, the current preferred lightweight
-single-model candidate for the known-good assistant lane.
+defaults to `gemma4-12b-it-gguf`, the current preferred lightweight
+single-model candidate for the known-good assistant lane on Thor.
 
 The launcher has two assistant-provider lanes; **OpenClaw (`openclaw`) is the
 default** for the known-good assistant workflow:
 
-| Lane | Default? | Bridge | Latency (median/test, cosmos-reason2-8b) | Notes |
+| Lane | Default? | Bridge | Evidence | Notes |
 |---|---|---|---|---|
-| `openclaw` | ✅ default | NemoClaw-Thor `openclaw_assistant_bridge` on `:8200` | ~25 s/test (P1 ~22 s, P2 ~25 s, P3 ~31 s; 2026-05-08) | Persistent gateway in NemoClaw `my-assistant` sandbox. Adds bounded-autonomy enforcement (per-tool audit with assistantMode + catalogHash + principal). Use for the known-good assistant lane and shared/multi-tenant deployments. Provisions the OpenClaw sandbox automatically (egress preset, skill, MCP server). |
-| `nemoclaw` | backup | in-tree `manyforge_assistant_bridge` on `:8100` | ~17 s/test (P1 ~11 s, P2 ~17 s, P3 ~19 s; 2026-05-08) | Direct vLLM. Bridge runs the tool loop in-process; for compound prompts the bridge inlines a structured `programSnapshot` / `sceneSnapshot` extract into the user message before pinning the action tool. Useful for fast local iteration when sandbox isolation is not needed. |
+| `openclaw` | default | NemoClaw-Thor `openclaw_assistant_bridge` on `:8200` | Gemma QAT 51/66 in the 2026-06-09 three-lane head-to-head; 52/66 in the 2026-06-07 model sweep | Persistent gateway in NemoClaw `my-assistant` sandbox. Adds bounded-autonomy enforcement (per-tool audit with assistantMode + catalogHash + principal). Use for the known-good assistant lane and shared/multi-tenant deployments. Provisions the OpenClaw sandbox automatically (egress preset, skill, MCP server). |
+| `direct` (`nemoclaw` alias) | backup | in-tree `manyforge_assistant_bridge` on `:8100` | Gemma QAT 47/66 after semantic scorer correction; fastest lane in the 2026-06-09 sweep | Direct local-model endpoint. Bridge runs the tool loop in-process; for compound prompts the bridge inlines a structured `programSnapshot` / `sceneSnapshot` extract into the user message before pinning the action tool. Useful for fast local iteration and explicit fallback validation. |
 
 Both lanes preserve the same bounded-autonomy contract on the ManyForge side
 (mode-scoped MCP wrapper + `/api/assistant/bridge/tools/{toolId}` + audit envelope).
@@ -217,8 +219,8 @@ cd ${HOME}/workspaces/dev_ws/src/manyforge
 ./scripts/demo-assistant-known-good.sh preflight
 ./scripts/demo-assistant-known-good.sh start
 
-# direct vLLM backup lane:
-ASSISTANT_PROVIDER=nemoclaw ./scripts/demo-assistant-known-good.sh start
+# direct model backup lane:
+ASSISTANT_PROVIDER=direct ./scripts/demo-assistant-known-good.sh start
 ```
 
 The known-good launcher defaults to `ASSISTANT_MAX_TURNS=16`. This is a bridge
@@ -235,7 +237,7 @@ What it does (default — `openclaw` sandboxed lane):
 
 1. stops stale `manyforge-e2e-vllm` state if needed and runs the Thor memory
    protocol before model launch,
-2. starts `cosmos-reason2-8b` through NemoClaw-Thor
+2. starts `gemma4-12b-it-gguf` through NemoClaw-Thor
    `serving/start-model.sh`,
 3. runs `setup/configure-local-provider.sh` for the same profile (which also
    spawns the OpenClaw gateway in its SSH-session network namespace),
@@ -257,10 +259,11 @@ What it does (default — `openclaw` sandboxed lane):
 7. loads `pick_and_place_ur10e_robotiq.program.yaml` with
    `assistant_modes_scene_authoring.deployment.yaml`.
 
-The direct backup lane (`ASSISTANT_PROVIDER=nemoclaw`) uses the same model
+The direct backup lane (`ASSISTANT_PROVIDER=direct`; `nemoclaw` remains a
+legacy alias) uses the same model
 profile and Composer deployment but starts the in-tree
 `manyforge_assistant_bridge` on `http://127.0.0.1:8100` and drives the tool
-loop in-process against vLLM.
+loop in-process against the local model endpoint.
 
 The preflight refuses to start if ports `8000`, `8080`, `8081`, `8100`,
 `8200`, or `9000` are already owned by unmanaged processes. This prevents
@@ -416,7 +419,7 @@ program/deployment.
 The reusable runner starts and stops the bridge for each sampling profile. It
 loads the assistant-mode deployment and a baseline program, then exercises:
 
-- direct vLLM tool-call probing,
+- direct model-endpoint tool-call probing,
 - query-mode `program_read`,
 - operator-facing Composer assistant flow with provider discovery, HMI status,
   draft mutation, request status, diagnostics, and discard,
@@ -437,7 +440,7 @@ Primary qualification:
 cd ${HOME}/workspaces/dev_ws/src/manyforge
 
 ./scripts/smoke-assistant-e2e.py \
-  --profile cosmos-bridge-default \
+  --profile gemma-bridge-default \
   --strict \
   --output /tmp/manyforge-assistant-e2e/assistant-primary.json
 ```
@@ -456,9 +459,10 @@ Available runner profiles:
 
 | Profile | Purpose |
 |---|---|
-| `vllm-generation-config` | Direct vLLM probe with no per-request generation overrides |
+| `vllm-generation-config` | Direct model-endpoint probe with no per-request generation overrides |
 | `bridge-default` | Bridge defaults: `temperature=0.0`, `max_tokens=512`, thinking unset |
-| `cosmos-bridge-default` | Current known-good Cosmos bridge profile: `temperature=0.0`, `max_tokens=8192` |
+| `gemma-bridge-default` | Recommended current Gemma QAT bridge profile: `temperature=0.0`, `max_tokens=8192`, `enable_thinking=false` |
+| `cosmos-bridge-default` | Historical Cosmos bridge comparison profile: `temperature=0.0`, `max_tokens=8192` |
 | `omni-vendor-tool` | NVIDIA tool-call sampling: `temperature=0.6`, `top_p=0.95`, `max_tokens=512`, thinking unset |
 | `omni-vendor-tool-no-think` | Vendor sampling with `enable_thinking=false`, `max_tokens=512` |
 | `omni-vendor-tool-no-think-32768` | Vendor sampling with `enable_thinking=false`, `max_tokens=32768` |
@@ -529,7 +533,7 @@ Command:
 
 ```bash
 ./scripts/smoke-assistant-e2e.py \
-  --profile cosmos-bridge-default \
+  --profile gemma-bridge-default \
   --skip-negative \
   --output /tmp/manyforge-assistant-e2e/query-and-draft.json
 ```
@@ -562,7 +566,7 @@ Command:
 
 ```bash
 ./scripts/smoke-assistant-e2e.py \
-  --profile cosmos-bridge-default \
+  --profile gemma-bridge-default \
   --require-hmi \
   --skip-negative \
   --output /tmp/manyforge-assistant-e2e/operator-flow.json
@@ -643,7 +647,7 @@ Command:
 
 ```bash
 ./scripts/smoke-assistant-e2e.py \
-  --profile cosmos-bridge-default \
+  --profile gemma-bridge-default \
   --output /tmp/manyforge-assistant-e2e/fail-closed.json
 ```
 

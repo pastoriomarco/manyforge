@@ -144,10 +144,11 @@ Use when:
 
 ### 4. ManyForge plus NemoClaw/OpenClaw
 
-Two assistant-provider lanes coexist; **OpenClaw + Cosmos-Reason2-8B
-(`openclaw` provider) is the demo default** as of 2026-05-07. The
+Two assistant-provider lanes coexist; **OpenClaw + Gemma 4 12B GGUF
+(`openclaw` provider, `gemma4-12b-it-gguf`) is the demo default** as
+of 2026-06-11. The
 launcher [`scripts/demo-assistant-known-good.sh`](../../scripts/demo-assistant-known-good.sh)
-sets `ASSISTANT_PROVIDER=openclaw` and `MODEL_PROFILE=cosmos-reason2-8b`
+sets `ASSISTANT_PROVIDER=openclaw` and `MODEL_PROFILE=gemma4-12b-it-gguf`
 by default.
 
 - **OpenClaw lane (default — `ASSISTANT_PROVIDER=openclaw`)**: persistent
@@ -157,17 +158,17 @@ by default.
   forwards to `/v1/chat/completions` on the gateway. The gateway runs
   the agent loop internally; ManyForge enforces every tool call via the
   mode-scoped MCP wrapper + `/api/assistant/bridge/tools/{toolId}`.
-  Production-validated 9/9 on the 3×3 lane-comparison smoke (P1 wrap-
-  root, P2 scene add, P3 tree insert) once envelope reductions and
-  load-bearing fields landed (2026-05-08); Cosmos-Reason2-8B at 256K
-  context with the cascading 120s chain timeout. Recommended whenever
-  sandbox isolation + the bounded-autonomy audit envelope
-  (assistantMode + catalogHash + requestId + principal) matter, which
-  for the production deployment shape is always.
+  Current evidence: Gemma QAT scored 52/66 on the 2026-06-07
+  OpenClaw sweep and 51/66 in the 2026-06-09 three-lane head-to-head
+  (75 total / 66 scored). Recommended whenever sandbox isolation +
+  the bounded-autonomy audit envelope (assistantMode + catalogHash +
+  requestId + principal) matter, which for the production deployment
+  shape is always.
 
-- **Direct vLLM lane (`ASSISTANT_PROVIDER=nemoclaw`)**: in-tree
+- **Direct model lane (`ASSISTANT_PROVIDER=direct`; `nemoclaw` is accepted as
+  a legacy alias)**: in-tree
   `manyforge_assistant_bridge` on `:8100` makes chat-completions calls
-  against vLLM directly, runs the agent loop in-process. Sub-2 s warm
+  against the local model endpoint directly, runs the agent loop in-process. Sub-2 s warm
   latency, ~22 s/test p50 — fastest end-to-end, but no sandbox
   isolation and no per-call audit envelope. Use this for local
   development, debugging the bridge in isolation, or single-tenant
@@ -325,14 +326,15 @@ Notes:
 
 ### `scripts/manyforge-stack.sh`
 
-**Not a replacement for `scripts/launch.sh`.** This script is the
-NemoClaw/OpenClaw integration lifecycle helper. Use `launch.sh` for
-ManyForge bring-up; use `manyforge-stack.sh` only when you need to
-wire the running stack into NemoClaw mux/plugin workflows.
+**Legacy / diagnostic; not a replacement for `scripts/launch.sh`.** This
+script belongs to the older NemoClaw mux/plugin integration path. Use
+`launch.sh` for ManyForge bring-up and the assistant-provider bridge path; use
+`manyforge-stack.sh` only when you intentionally need to reproduce or debug the
+legacy mux/plugin workflow.
 
 Purpose:
 
-- start/stop the ManyForge stack with NemoClaw mux integration
+- start/stop the ManyForge stack with legacy NemoClaw mux integration
 - manage the NemoClaw plugin lifecycle (`plugin deploy`,
   `plugin rollback`, `plugin status`, `plugin list`)
 - drive sandbox smoke tests (`smoke direct|mux|all`)
@@ -340,8 +342,8 @@ Purpose:
 Typical usage:
 
 ```bash
-./scripts/manyforge-stack.sh up                  # ManyForge + mux proxy
-./scripts/manyforge-stack.sh up --with-nemoclaw  # + NemoClaw integration
+./scripts/manyforge-stack.sh up                  # legacy ManyForge + mux proxy
+./scripts/manyforge-stack.sh up --with-nemoclaw  # + legacy NemoClaw integration
 ./scripts/manyforge-stack.sh status
 ./scripts/manyforge-stack.sh smoke all
 ./scripts/manyforge-stack.sh plugin status
@@ -350,10 +352,10 @@ Typical usage:
 
 ### `scripts/configure-manyforge-provider.sh`
 
-NemoClaw/OpenClaw configuration helper, not a ManyForge entrypoint.
-Configures the current mux/plugin-based ManyForge provider path on the
-NemoClaw side. Use only when wiring a sandbox to ManyForge through the
-current mux baseline; the transport design is not final.
+Legacy NemoClaw/OpenClaw configuration helper, not a ManyForge entrypoint.
+Configures the mux/plugin-based ManyForge provider path on the NemoClaw side.
+It is outside the current assistant-provider bridge path; use it only for
+historical repro, plugin diagnostics, or mux-specific debugging.
 
 ### `scripts/dev-agent-session-start.sh` (dev-only)
 
@@ -509,8 +511,10 @@ ManyForge-authored state. In this profile:
 
 ### NemoClaw/OpenClaw integration
 
-1. Bring up the local provider/model path in `NemoClaw-Thor`.
-2. Run `scripts/configure-manyforge-provider.sh`.
+1. Bring up the current assistant path with `scripts/launch.sh` or
+   `scripts/demo-assistant-known-good.sh`.
+2. Use `scripts/configure-manyforge-provider.sh` only for legacy mux/plugin
+   reproduction.
 3. Validate tool discovery and health before testing agent behavior.
 
 (Maintainers working on specs/ADRs additionally run

@@ -159,8 +159,8 @@ observability artifacts.
 - **`./scripts/launch.sh smoke`** — full bring-up + smoke probe;
   writes `$LOG_DIR/launcher-smoke.json`.
 - **`./scripts/manyforge-stack.sh status`** — `docker ps` summary
-  for the `manyforge-dev` family + `/api/health` curl. Used when
-  driving the NemoClaw integration path; see
+  for the `manyforge-dev` family + `/api/health` curl. Used only when
+  driving the legacy NemoClaw mux/plugin path; see
   [`STACK_SETUP.md`](STACK_SETUP.md).
 
 ### Smoke tests
@@ -170,7 +170,7 @@ observability artifacts.
 | `scripts/smoke-assistant-e2e.py` | Live ManyForge assistant E2E smoke + sampling-profile probe. Expects a live vLLM endpoint + live Composer. |
 | `scripts/smoke-assistant-provider-bridge.py` | Smoke-test a ManyForge assistant provider endpoint (v0.1 envelope, fail-closed checks). |
 | `scripts/smoke-assistant-scene-authoring.py` | Smoke the deterministic scene-authoring path (`inspect_isaac_scene → propose_scene_objects`). |
-| `scripts/manyforge-openclaw-smoke.sh` | OpenClaw / NemoClaw ↔ ManyForge end-to-end validation. Modes: `direct|mux|all`. |
+| `scripts/manyforge-openclaw-smoke.sh` | Legacy OpenClaw / NemoClaw ↔ ManyForge mux/plugin validation. Modes: `direct|mux|all`. |
 
 ### Qualification harnesses
 
@@ -222,7 +222,7 @@ via `docker ps`):
   Both run with `network_mode: host` and `ipc: host`
   (`docker-compose.yaml:104-105,135-136`) to share DDS discovery with
   Isaac.
-- **NemoClaw mux/plugin path.** `scripts/manyforge-stack.sh` uses
+- **Legacy NemoClaw mux/plugin path.** `scripts/manyforge-stack.sh` uses
   `${CONTAINER_PREFIX:-manyforge-dev}-…` naming. The MCP-enabled
   variant is `manyforge-dev-mcp`.
 

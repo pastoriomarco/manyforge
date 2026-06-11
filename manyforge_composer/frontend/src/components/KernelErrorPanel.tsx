@@ -32,7 +32,7 @@ interface HeadlineMapping {
   /** Operator-facing one-line cause. May reference errorDetails. */
   headline: (details: Record<string, unknown> | null) => string;
   /** Optional "what to do next" hint shown under the headline. */
-  hint?: string;
+  hint?: string | ((details: Record<string, unknown> | null) => string);
   /** Severity chip color (Tailwind class fragment). */
   severity?: 'fault' | 'config' | 'state' | 'unknown';
 }
@@ -59,10 +59,26 @@ const ERROR_CODE_MAPPING: Record<string, HeadlineMapping> = {
   },
   runtime_collision: {
     headline: (d) => {
-      // Runtime monitor caught a collision DURING execution — the
-      // trajectory passed pre-validation but a dynamic body appeared
-      // (or moved) mid-flight. Operator action is to clear the dynamic
-      // body or accept the stop.
+      // Runtime monitor stopped motion DURING execution. This may be a
+      // geometric collision, but it may also be a fail-closed monitor fault
+      // such as a stale dynamic collision-world body. Keep those distinct in
+      // the HMI so operators do not hunt for a non-existent contact pair.
+      const reason = stringField(d, 'reason');
+      const body = stringField(d, 'dynamic_body_id');
+      const ageMs = numberFieldAsMs(d, 'dynamic_body_age_ns');
+      const budgetMs = numberFieldAsMs(d, 'dynamic_body_effective_freshness_budget_ns');
+      if (reason === 'stale_dynamic_collision_body') {
+        const bodyLabel = body ? `: ${prettyBodyId(body)}` : '';
+        if (ageMs !== null && budgetMs !== null) {
+          return `Dynamic collision-world pose stale${bodyLabel} (${ageMs} ms > ${budgetMs} ms)`;
+        }
+        return `Dynamic collision-world pose stale${bodyLabel}`;
+      }
+      if (reason === 'dynamic_body_missing_source_timestamp') {
+        return body
+          ? `Dynamic collision-world pose missing timestamp: ${prettyBodyId(body)}`
+          : 'Dynamic collision-world pose missing timestamp';
+      }
       const pair = stringField(d, 'collision_result_first_failure_pair');
       const wp = stringField(d, 'collision_result_waypoint_index');
       if (pair && wp) {
@@ -71,9 +87,21 @@ const ERROR_CODE_MAPPING: Record<string, HeadlineMapping> = {
       if (pair) {
         return `Runtime collision: ${prettyPair(pair)}`;
       }
+      if (reason) {
+        return `Runtime collision monitor stopped execution: ${reason}`;
+      }
       return 'Runtime collision detected during execution';
     },
-    hint: 'A dynamic body intersected the trajectory during execution. Inspect the colliding pair below, clear the runtime obstacle (Reset removes runtime-added scene objects), then retry.',
+    hint: (d) => {
+      const reason = stringField(d, 'reason');
+      if (
+        reason === 'stale_dynamic_collision_body' ||
+        reason === 'dynamic_body_missing_source_timestamp'
+      ) {
+        return 'No geometric collision pair was reported. The runtime monitor stopped before collision query because a dynamic collision-world body was not fresh enough.';
+      }
+      return 'A dynamic body intersected the trajectory during execution. Inspect the colliding pair below, clear the runtime obstacle (Reset removes runtime-added scene objects), then retry.';
+    },
     severity: 'fault',
   },
   motion_interrupt_backend_stop_failed: {
@@ -147,6 +175,28 @@ function stringField(
   return typeof value === 'string' ? value : '';
 }
 
+function numberFieldAsMs(
+  details: Record<string, unknown> | null | undefined,
+  key: string,
+): string | null {
+  if (!details) {
+    return null;
+  }
+  const value = details[key];
+  const raw = typeof value === 'number' ? value : typeof value === 'string' ? Number(value) : NaN;
+  if (!Number.isFinite(raw)) {
+    return null;
+  }
+  const ms = raw / 1_000_000;
+  if (ms >= 100) {
+    return ms.toFixed(0);
+  }
+  if (ms >= 10) {
+    return ms.toFixed(1);
+  }
+  return ms.toFixed(2);
+}
+
 /**
  * Convert the kernel's verbose policy id into an operator-friendly token.
  * Example: "manyforge.kernel.runtime_collision_fault.preempt_trajectory"
@@ -200,6 +250,20 @@ export function prettyPair(pair: string): string {
   return `${short(parts[0])} ↔ ${short(parts[1])}`;
 }
 
+export function prettyBodyId(bodyId: string): string {
+  const segments = bodyId.split('/').filter(Boolean);
+  if (segments[0] === 'object' && segments.length >= 2) {
+    return segments[1];
+  }
+  if (segments[0] === 'robot' && segments.length >= 4 && segments[2] === 'link') {
+    return segments[3];
+  }
+  if (segments[0] === 'robot' && segments.length >= 4 && segments[2] === 'attached') {
+    return segments[3];
+  }
+  return segments[segments.length - 1] || bodyId;
+}
+
 /**
  * Resolve an (errorCode, errorDetails, fallbackMessage) tuple to the
  * operator-facing headline. Exported so the mapping can be unit-tested.
@@ -217,6 +281,21 @@ export function headlineForError(
     return fallbackMessage;
   }
   return mapping.headline(errorDetails ?? null);
+}
+
+export function hintForError(
+  errorCode: string | null | undefined,
+  errorDetails: Record<string, unknown> | null | undefined,
+): string | undefined {
+  if (!errorCode) {
+    return undefined;
+  }
+  const mapping = ERROR_CODE_MAPPING[errorCode];
+  const hint = mapping?.hint;
+  if (!hint) {
+    return undefined;
+  }
+  return typeof hint === 'function' ? hint(errorDetails ?? null) : hint;
 }
 
 function severityClasses(severity: HeadlineMapping['severity']): {
@@ -249,6 +328,7 @@ export function KernelErrorPanel({
   const headline = mapping
     ? mapping.headline(errorDetails ?? null)
     : message;
+  const hint = hintForError(errorCode, errorDetails);
   const subline =
     mapping && headline !== message ? message : undefined;
   const detailEntries = errorDetails
@@ -271,8 +351,8 @@ export function KernelErrorPanel({
                 {errorCode}
               </span>
             )}
-            {mapping?.hint && (
-              <span className="text-xs text-red-200/90">{mapping.hint}</span>
+            {hint && (
+              <span className="text-xs text-red-200/90">{hint}</span>
             )}
           </div>
           {detailEntries.length > 0 && (

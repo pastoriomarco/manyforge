@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# manyforge-stack.sh — Start/stop ManyForge, optionally wire into NemoClaw
+# manyforge-stack.sh — Legacy mux/plugin stack helper
 #
 # Usage:
-#   ./scripts/manyforge-stack.sh up                     # ManyForge only
-#   ./scripts/manyforge-stack.sh up --with-nemoclaw    # Full stack
+#   ./scripts/manyforge-stack.sh up                     # legacy ManyForge only
+#   ./scripts/manyforge-stack.sh up --with-nemoclaw    # legacy mux/plugin stack
 #   ./scripts/manyforge-stack.sh down [--stop-container]
 #   ./scripts/manyforge-stack.sh status
 #   ./scripts/manyforge-stack.sh smoke [direct|mux|all]
@@ -201,11 +201,12 @@ except: print('unknown')
         warn "vLLM not reachable on port 8000 (agent LLM calls may fail)"
     fi
 
-    info "Dedicated route / mux transport will be selected by configure-manyforge-provider.sh"
+    info "Legacy dedicated-route / mux transport will be selected by configure-manyforge-provider.sh"
 
     # ── [3] Integration ──
     header ">>> [3/3] ManyForge ↔ NemoClaw integration"
-    "${SCRIPT_DIR}/configure-manyforge-provider.sh"
+    MANYFORGE_ENABLE_LEGACY_MUX_PROVIDER=true \
+        "${SCRIPT_DIR}/configure-manyforge-provider.sh"
 
     echo -e "\n${BOLD}=== Stack ready ===${NC}"
     echo "  ManyForge:  http://localhost:${MANYFORGE_PORT} (MCP HTTP enabled)"
@@ -518,11 +519,14 @@ PY
                     fail "--artifact requires a path"
                     return 1
                 fi
-                "${SCRIPT_DIR}/configure-manyforge-provider.sh" --artifact "${2}"
+                MANYFORGE_ENABLE_LEGACY_MUX_PROVIDER=true \
+                    "${SCRIPT_DIR}/configure-manyforge-provider.sh" --artifact "${2}"
             elif [[ "${1:-}" == "--use-current-artifact" ]]; then
-                "${SCRIPT_DIR}/configure-manyforge-provider.sh" --use-current-artifact
+                MANYFORGE_ENABLE_LEGACY_MUX_PROVIDER=true \
+                    "${SCRIPT_DIR}/configure-manyforge-provider.sh" --use-current-artifact
             else
-                "${SCRIPT_DIR}/configure-manyforge-provider.sh"
+                MANYFORGE_ENABLE_LEGACY_MUX_PROVIDER=true \
+                    "${SCRIPT_DIR}/configure-manyforge-provider.sh"
             fi
             ;;
         rollback)
@@ -558,7 +562,8 @@ PY
             fi
             target_archive="${archives[${target_index}]}"
             info "Rolling back to $(basename "${target_archive}")"
-            "${SCRIPT_DIR}/configure-manyforge-provider.sh" --artifact "${target_archive}"
+            MANYFORGE_ENABLE_LEGACY_MUX_PROVIDER=true \
+                "${SCRIPT_DIR}/configure-manyforge-provider.sh" --artifact "${target_archive}"
             ;;
         *)
             echo "Usage: $0 plugin {list|status|deploy [--artifact PATH|--use-current-artifact]|rollback [steps]}" >&2

@@ -168,8 +168,12 @@ launch → deployment load → OpenClaw provisioner → bridge launch →
 status. See the script header for env-var overrides
 (`MODEL_PROFILE`, `NEMOCLAW_THOR`, `ASSISTANT_PROVIDER`, etc.).
 
-Production model default (2026-05-08): `cosmos-reason2-8b`. Operator
-runbook for this lane lives in NemoClaw-Thor at
+Production model default (2026-06-11): `gemma4-12b-it-gguf` on Thor
+(`gemma4-12b-it-gguf-orin` on Jetson Orin AGX via
+`scripts/launch-orin-gemma.sh`). The launcher default is
+`ASSISTANT_PROVIDER=openclaw` plus `MODEL_PROFILE=gemma4-12b-it-gguf`;
+explicit `MODEL_PROFILE=...` still wins for bake-offs or historical
+Cosmos reruns. Operator runbook for this lane lives in NemoClaw-Thor at
 `manyforge/docs/COMPOSER-ASSISTANT-RUNBOOK.md`; lane-comparison
 benchmark at `manyforge/docs/LANE-COMPARISON.md`.
 
