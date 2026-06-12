@@ -10,7 +10,7 @@ import py_trees
 import yaml
 
 from manyforge_behavior.capabilities import V0_0_REQUIRED_KEYS
-from manyforge_behavior.kernel_client import ExecutionState, MockKernelClient
+from manyforge_behavior.kernel_client import CommandResult, ExecutionState, MockKernelClient
 from manyforge_behavior.runner import OrchestratorRunner
 from manyforge_behavior.cycle_manager import (
     ROS2_CONTROL_BACKEND_FAULT_CLASSES,
@@ -1808,3 +1808,80 @@ class TestGripperFaultDiagnostics:
         code, details = manager._capture_kernel_error_diagnostics()
         assert code is None
         assert details is None
+
+
+class TestStopQuiescesPreparationPhase:
+    """Stop must halt an in-flight execution even when the kernel is still
+    preparing (planning/validating): pausing only EXECUTING let the async
+    worker dispatch the motion after the cycle had already reported stopped
+    (observed live: plan_completed + execute_started 100ms after Stop, arm
+    moving 10.8s post-Stop)."""
+
+    class _StubKernel(MockKernelClient):
+        def __init__(self, states):
+            super().__init__()
+            self._scripted_states = list(states)
+            self.pause_calls = 0
+            self.stop_calls = 0
+
+        def get_status(self):
+            status = super().get_status()
+            if self._scripted_states:
+                status.state = self._scripted_states.pop(0)
+            return status
+
+        def pause(self):
+            self.pause_calls += 1
+            return CommandResult(accepted=True)
+
+        def stop(self):
+            self.stop_calls += 1
+            return CommandResult(accepted=True)
+
+    def _quiesce(self, kernel):
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        manager = CycleManager(runner, kernel)
+        manager._quiesce_runtime(
+            client_name="test_stop_quiesce",
+            kernel_action="pause_if_executing",
+        )
+
+    def test_planning_phase_is_stopped_not_ignored(self, kernel):
+        stub = self._StubKernel([
+            ExecutionState.PLANNING,  # pre-loop status read
+            ExecutionState.PLANNING,  # loop check -> stop()
+            ExecutionState.STOPPED,   # re-check -> done
+        ])
+        self._quiesce(stub)
+        assert stub.stop_calls == 1
+        assert stub.pause_calls == 0
+
+    def test_executing_phase_is_paused_unchanged_behavior(self, kernel):
+        stub = self._StubKernel([
+            ExecutionState.EXECUTING,
+            ExecutionState.EXECUTING,
+        ])
+        self._quiesce(stub)
+        assert stub.pause_calls == 1
+        assert stub.stop_calls == 0
+
+    def test_preparation_to_executing_race_is_closed(self, kernel):
+        # Stop lands during VALIDATING; the kernel crosses into EXECUTING
+        # between the stop attempt and the re-check.
+        stub = self._StubKernel([
+            ExecutionState.VALIDATING,  # pre-loop status read
+            ExecutionState.VALIDATING,  # loop check -> stop()
+            ExecutionState.EXECUTING,   # raced past the stop -> pause()
+        ])
+        self._quiesce(stub)
+        assert stub.stop_calls == 1
+        assert stub.pause_calls == 1
+
+    def test_idle_kernel_is_untouched(self, kernel):
+        stub = self._StubKernel([
+            ExecutionState.IDLE,
+            ExecutionState.IDLE,
+        ])
+        self._quiesce(stub)
+        assert stub.stop_calls == 0
+        assert stub.pause_calls == 0

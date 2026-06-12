@@ -952,8 +952,28 @@ class CycleManager:
 
         kernel_status = self._kernel.get_status()
         if kernel_action == "pause_if_executing":
-            if kernel_status.state == ExecutionState.EXECUTING:
-                self._kernel.pause()
+            # The in-flight execution may still be in its preparation phase
+            # (planning/validating). Pausing only EXECUTING leaves the
+            # kernel's async worker free to finish preparation and dispatch
+            # the motion AFTER the cycle has reported stopped — the operator
+            # sees the arm start/keep moving post-Stop. Preparation-phase
+            # executions are stopped outright (Run from STOPPED replans from
+            # fresh state anyway, so nothing is lost); actual motion is
+            # paused to stay resumable. Re-check a bounded number of times
+            # because the kernel can cross the preparation->executing
+            # boundary between the status read and the action.
+            for _ in range(3):
+                kernel_status = self._kernel.get_status()
+                if kernel_status.state == ExecutionState.EXECUTING:
+                    self._kernel.pause()
+                    break
+                if kernel_status.state in (
+                    ExecutionState.PLANNING,
+                    ExecutionState.VALIDATING,
+                ):
+                    self._kernel.stop()
+                    continue
+                break
         elif kernel_action == "stop_if_active":
             stoppable = {
                 ExecutionState.EXECUTING,
