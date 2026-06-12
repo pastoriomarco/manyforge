@@ -20,7 +20,7 @@ import { useState } from 'react';
 export interface KernelErrorPanelProps {
   /** Top-line human-readable message (the cause string). */
   message: string;
-  /** Stable machine token for HMI mapping, when known. */
+  /** Stable machine token for viewer mapping, when known. */
   errorCode?: string | null;
   /** Kernel diagnostics map, when known. */
   errorDetails?: Record<string, unknown> | null;
@@ -62,7 +62,7 @@ const ERROR_CODE_MAPPING: Record<string, HeadlineMapping> = {
       // Runtime monitor stopped motion DURING execution. This may be a
       // geometric collision, but it may also be a fail-closed monitor fault
       // such as a stale dynamic collision-world body. Keep those distinct in
-      // the HMI so operators do not hunt for a non-existent contact pair.
+      // the viewer so operators do not hunt for a non-existent contact pair.
       const reason = stringField(d, 'reason');
       const body = stringField(d, 'dynamic_body_id');
       const ageMs = numberFieldAsMs(d, 'dynamic_body_age_ns');

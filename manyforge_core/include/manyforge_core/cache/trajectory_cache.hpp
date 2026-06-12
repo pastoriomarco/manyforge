@@ -27,18 +27,21 @@ class TrajectoryCache {
  public:
   explicit TrajectoryCache(CacheConfig config = {});
 
-  /// Store trajectory for a move_id without a revision tag (overwrites
-  /// existing). Back-compat: revision-aware callers SHOULD use the overload
-  /// with a CollisionWorldRevision so cache hits can be gated by revision.
-  void store(const std::string& move_id, TrajectoryDTO trajectory);
-
   /// Store trajectory for a move_id with the collision-world revision it
-  /// was validated against (overwrites existing).
+  /// was validated against (overwrites existing). There is deliberately no
+  /// revision-less overload: every stored trajectory must declare what
+  /// collision world it was validated against.
   void store(const std::string& move_id, TrajectoryDTO trajectory,
              CollisionWorldRevision revision);
 
-  /// Look up trajectory by move_id without revision gating (back-compat).
-  std::optional<TrajectoryDTO> lookup(const std::string& move_id) const;
+  /// Whether an entry exists for move_id, regardless of revision. Existence
+  /// probe only (e.g. invalidate-if-present); never use to serve a hit.
+  bool contains(const std::string& move_id) const;
+
+  /// Revision-UNCHECKED read for observability/debug surfaces only. The
+  /// returned trajectory may be stale relative to the live collision world;
+  /// planning/execution callers must use lookup_with_revision.
+  std::optional<TrajectoryDTO> peek_unvalidated(const std::string& move_id) const;
 
   /// Look up trajectory by move_id, returning the trajectory only when its
   /// stored revision matches `expected_revision`. On a revision mismatch,
@@ -73,9 +76,7 @@ class TrajectoryCache {
  private:
   struct Entry {
     TrajectoryDTO trajectory;
-    /// Revision the trajectory was validated against. A default-constructed
-    /// revision (revision_id == 0, empty content_hash) means "no revision
-    /// tag" — set by the back-compat store(key, trajectory) overload.
+    /// Revision the trajectory was validated against.
     CollisionWorldRevision revision;
   };
 

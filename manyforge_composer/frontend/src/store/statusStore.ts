@@ -42,7 +42,7 @@ export const useStatusStore = create<StatusStore>((set) => ({
         runtimeError = err instanceof Error ? err.message : 'Runtime status unavailable';
       });
     // infra status is best-effort; preserve the previous payload on failure
-    // so transient disconnects don't blink the HMI panel into "unavailable".
+    // so transient disconnects don't blink the viewer panel into "unavailable".
     const infraPromise = api.infra
       .status()
       .then((value) => {

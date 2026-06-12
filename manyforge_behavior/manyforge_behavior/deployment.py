@@ -164,6 +164,7 @@ class SimulationResetConfig:
     default_scope: str = "state"
     close_command_gate: bool = True
     wait_ready_s: float = 3.0
+    resume_play_after_reset: bool = True
 
 
 @dataclass(frozen=True)
@@ -965,6 +966,8 @@ class Deployment:
                 "closeCommandGate",
                 "wait_ready_s",
                 "waitReadyS",
+                "resume_play_after_reset",
+                "resumePlayAfterReset",
             }
         )
         if unknown_reset_fields:
@@ -992,6 +995,16 @@ class Deployment:
             raise DeploymentValidationError(
                 "simulation_control.reset.close_command_gate must be a boolean"
             )
+        resume_play_after_reset = get_alias(
+            reset_raw,
+            "resume_play_after_reset",
+            "resumePlayAfterReset",
+            True,
+        )
+        if not isinstance(resume_play_after_reset, bool):
+            raise DeploymentValidationError(
+                "simulation_control.reset.resume_play_after_reset must be a boolean"
+            )
         reset_config = SimulationResetConfig(
             default_scope=default_scope,
             close_command_gate=close_command_gate,
@@ -999,6 +1012,7 @@ class Deployment:
                 get_alias(reset_raw, "wait_ready_s", "waitReadyS", 3.0),
                 "simulation_control.reset.wait_ready_s",
             ),
+            resume_play_after_reset=resume_play_after_reset,
         )
 
         return SimulationControlConfig(
@@ -2570,6 +2584,9 @@ class Deployment:
                         self.simulation_control.reset.close_command_gate
                     ),
                     "wait_ready_s": self.simulation_control.reset.wait_ready_s,
+                    "resume_play_after_reset": (
+                        self.simulation_control.reset.resume_play_after_reset
+                    ),
                 }
             d["simulation_control"] = simulation_control_d
         if self.contact_policies:

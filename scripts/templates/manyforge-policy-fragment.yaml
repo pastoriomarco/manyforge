@@ -8,7 +8,6 @@
 # Allows the sandbox agent to reach:
 #   - ManyForge dedicated TLS route (port 443, end-to-end TLS via access: full)
 #   - ManyForge Composer REST API + MCP server (port 9000)
-#   - ManyForge Viser HMI for scene snapshots (port 8081)
 
 network_policies:
   manyforge:

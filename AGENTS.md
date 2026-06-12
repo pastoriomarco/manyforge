@@ -11,10 +11,9 @@
 ## What this repo is
 
 ManyForge is the deployment-side robot-execution framework: a behavior
-tree runtime, motion planner, scene/program/blackboard data model, a
-Composer (web UI + FastAPI backend + native 3D viewer), a legacy Viser
-HMI fallback, and an LLM assistant-provider HTTP bridge. **Everything
-required to install,
+tree runtime, motion planner, scene/program/blackboard data model, Composer
+(web UI + FastAPI backend + native 3D viewer), and an LLM assistant-provider
+HTTP bridge. **Everything required to install,
 deploy, and operate ManyForge at runtime is in this repo**, including
 when the optional Composer-assistant lane is enabled.
 
@@ -120,8 +119,6 @@ python -m manyforge_composer \
 ```
 
 Open `http://localhost:9000/` for the Composer UI and native viewer.
-The legacy Viser HMI is available on `http://localhost:8081/` only if
-Composer is launched with `--hmi-port 8081`.
 
 ### Mode 2 — Composer + direct LLM endpoint
 
@@ -235,7 +232,6 @@ What lives where in this repo, and what it's for:
 | [`manyforge_roboplan/`](manyforge_roboplan/) | Native motion-planner backend bindings (RRT + TOPPRA) |
 | [`manyforge_composer/`](manyforge_composer/) | FastAPI backend + React frontend + MCP server |
 | [`manyforge_assistant_bridge/`](manyforge_assistant_bridge/) | Direct-lane assistant provider HTTP service (port 8100) |
-| [`manyforge_hmi/`](manyforge_hmi/) | Legacy Viser-based 3D viewer fallback |
 | [`manyforge_ros/`](manyforge_ros/) | ROS 2 bridge (optional) |
 | [`agent-skills/manyforge-composer/`](agent-skills/manyforge-composer/) | OpenClaw skill manifest (used by Mode 3) |
 | [`examples/`](examples/) | Reference `*.program.yaml` + `*.deployment.yaml` |

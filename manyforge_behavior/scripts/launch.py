@@ -138,28 +138,6 @@ def create_kernel(deployment: Deployment) -> KernelClient:
     return MockKernelClient()
 
 
-def start_hmi(cycle_manager: CycleManager, runner: OrchestratorRunner):
-    """Start the HMI server if available."""
-    try:
-        from manyforge_hmi import ViserHmiServer
-        hmi = ViserHmiServer(
-            cycle_manager=cycle_manager,
-            host="127.0.0.1",
-            port=8081,
-        )
-        if runner.program:
-            hmi.load_program(runner.program)
-        hmi.start()
-        runner.set_scene_snapshot_provider(
-            getattr(hmi, "get_cached_scene_snapshot", None) or hmi.render_scene
-        )
-        print("HMI started on http://127.0.0.1:8081")
-        return hmi
-    except ImportError:
-        print("WARNING: manyforge_hmi not available, skipping HMI")
-        return None
-
-
 def main():
     parser = argparse.ArgumentParser(description="Launch a ManyForge program")
     parser.add_argument("--program", required=True, help="Path to program YAML")
@@ -195,12 +173,7 @@ def main():
     runner.load()
     cycle_manager = CycleManager(runner, kernel)
 
-    # 4. Optionally start HMI
-    hmi = None
-    if deployment.launch and deployment.launch.ui_backend and deployment.launch.ui_backend.enabled:
-        hmi = start_hmi(cycle_manager, runner)
-
-    # 5. Run
+    # 4. Run
     if args.auto_run:
         print("Running program...")
         cycle_manager.run()
@@ -214,14 +187,12 @@ def main():
         print(f"Program {status}")
         sys.exit(0 if success else 1)
     else:
-        print("Ready. Waiting for HMI 'Run' button or Ctrl+C to exit.")
+        print("Ready. Re-run with --auto-run to execute, or press Ctrl+C to exit.")
         try:
             while True:
                 time.sleep(1.0)
         except KeyboardInterrupt:
             print("\nShutting down...")
-            if hmi:
-                hmi.stop()
 
 
 if __name__ == "__main__":

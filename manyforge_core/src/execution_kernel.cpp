@@ -2984,7 +2984,7 @@ void ExecutionKernel::async_execute_worker(
       emit_event({KernelEventType::kStateTransition, exec_id, clock_.now(),
                    ExecutionState::kValidating, ExecutionState::kFailed, std::nullopt, {}});
       if (request.cache_mode != CacheMode::kDisable &&
-          cache_.lookup(request.move_id).has_value()) {
+          cache_.contains(request.move_id)) {
         cache_.invalidate(request.move_id);
         // Emit cache invalidated event
         emit_event({KernelEventType::kCacheInvalidated, exec_id, clock_.now(),
@@ -3923,7 +3923,7 @@ Result<uint64_t> ExecutionKernel::execute(const ExecuteRequestDTO& request) {
   auto resolved_motion = resolve_motion_spec(request);
   if (!resolved_motion.ok()) {
     if (request.cache_mode != CacheMode::kDisable &&
-        cache_.lookup(request.move_id).has_value()) {
+        cache_.contains(request.move_id)) {
       cache_.invalidate(request.move_id);
       emit_event({KernelEventType::kCacheInvalidated,
                   0,
@@ -4178,7 +4178,7 @@ StopResultDTO ExecutionKernel::stop() {
   // kStopRequested marks operator intent at the API boundary; the
   // intermediate kStopping covers the controlled-stop deceleration
   // window (1-2 s for soft-on-path), making the "stopping…" period
-  // observable to the HMI and to trace reconstruction.
+  // observable to the UI and to trace reconstruction.
   const auto prev_state = sm_.status().state;
   emit_event({KernelEventType::kStopRequested, sm_.status().execution_id,
               clock_.now(), {}, {}, std::nullopt, {}});
@@ -5515,8 +5515,10 @@ Result<CollisionWorldRevision> ExecutionKernel::validate_trajectory(
                  "Collision validation inconclusive",
                  std::move(details)});
   }
-  append_legacy_collision_compare_diagnostics(details, bundle, trajectory,
-                                              context_);
+  if (config_.enable_legacy_collision_compare_diagnostics) {
+    append_legacy_collision_compare_diagnostics(details, bundle, trajectory,
+                                                context_);
+  }
   return Result<CollisionWorldRevision>::Err(
       ErrorDTO{kErrorValidationCollision,
                "Collision validation rejected trajectory",
@@ -5546,7 +5548,7 @@ void ExecutionKernel::set_collision_validation_retry_config(
 
 void ExecutionKernel::set_runtime_velocity_scale(
     double scale, std::optional<std::string> principal_id) {
-  // ADR-0018: HMI runtime velocity scale → backend runtime register.
+  // ADR-0018: UI runtime velocity scale → backend runtime register.
   // Validate finiteness here; clamp to [0, 1]; forward to the backend's
   // atomic store. No lifecycle_mutex_: this is a high-rate operator surface
   // and the backend's atomic store handles concurrency.

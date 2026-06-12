@@ -22,8 +22,8 @@ from .gripper_command import (
 
 from .models import (
     SceneDiagnosticBackendResponse,
-    SceneDiagnosticHmiResponse,
     SceneDiagnosticObjectResponse,
+    SceneDiagnosticViewerResponse,
     SceneDiagnosticsResponse,
     SceneDiagnosticsSummaryResponse,
     SceneAuthoredSyncRequest,
@@ -311,14 +311,10 @@ def _scene_frame_roles(state: ComposerState) -> dict[str, set[str]]:
 def build_scene_frames_payload(state: ComposerState) -> dict[str, Any]:
     """Build known frame inventory plus current viewer visibility.
 
-    Day-4 of the native-viewer migration: visibility state is owned by
-    ComposerState (see `set_frame_visibility` / `get_frame_visibility`
-    on the state object), so this works without the Viser HMI server
-    attached. ``hmi_available`` in the response now reflects whether
-    *any* viewer is wired up (always true now that state owns it) —
-    the field is preserved for backward compatibility with clients
-    that still gate on it; legacy Viser callers see the same value
-    they did before.
+    Visibility state is owned by ComposerState (see `set_frame_visibility` /
+    `get_frame_visibility` on the state object), so the response is independent
+    of any browser connection. ``viewer_available`` therefore reports whether
+    the native viewer surface is available for this route.
     """
     build_started = time.monotonic()
     timings_ms: dict[str, float] = {}
@@ -428,7 +424,7 @@ def build_scene_frames_payload(state: ComposerState) -> dict[str, Any]:
     )
     payload = SceneFramesResponse(
         frames=frames,
-        hmiAvailable=True,
+        viewerAvailable=True,
         frameGizmoSizeM=state.get_frame_gizmo_size(),
         visualStateDiagnostics=diagnostics,
         timestampNs=timestamp_ns,
@@ -1043,15 +1039,11 @@ def _collect_gripper_states(
 def build_scene_diagnostics_payload(state: ComposerState) -> dict[str, Any]:
     """Build backend vs active viewer scene diagnostics."""
     timestamp_ns = time.monotonic_ns()
-    hmi_server = getattr(state, "hmi_server", None)
-    legacy_hmi_available = bool(
-        hmi_server and hasattr(hmi_server, "get_object_render_diagnostics")
-    )
     visual_objects, visual_meta = state.visual_scene_objects_snapshot()
     visual_meta = visual_meta or {}
     visual_index = {obj.object_id: obj for obj in visual_objects}
     native_visual_available = bool(visual_meta.get("timestamp_ns") or visual_objects)
-    viewer_available = legacy_hmi_available or native_visual_available
+    viewer_available = native_visual_available
 
     objects: list[SceneDiagnosticObjectResponse] = []
     if state.kernel is not None:
@@ -1064,28 +1056,11 @@ def build_scene_diagnostics_payload(state: ComposerState) -> dict[str, Any]:
             )
 
             mismatch_reason = None
-            if legacy_hmi_available:
-                render_diag = hmi_server.get_object_render_diagnostics(scene_object.object_id)
-                render_info = render_diag.get("render") or {}
-                rendered = bool(render_info.get("scene_node_present"))
-                render_state = render_info.get("render_state")
-                render_state_label = "missing"
-                if rendered:
-                    render_state_label = "synced" if render_state is not None else "rendered"
-                hmi = SceneDiagnosticHmiResponse(
-                    rendered=rendered,
-                    scene_name=render_info.get("scene_name"),
-                    render_state=render_state_label,
-                )
-                if not rendered:
-                    mismatch_reason = "Object exists in backend but not rendered in HMI"
-                elif scene_object.attached and not render_diag.get("frame_path"):
-                    mismatch_reason = "Object is attached in backend but HMI render is not parented to a robot frame"
-            elif native_visual_available:
+            if native_visual_available:
                 visual_object = visual_index.get(scene_object.object_id)
                 rendered = visual_object is not None
                 render_state_label = "synced" if rendered else "missing"
-                hmi = SceneDiagnosticHmiResponse(
+                viewer = SceneDiagnosticViewerResponse(
                     rendered=rendered,
                     scene_name=scene_object.object_id if rendered else None,
                     render_state=render_state_label,
@@ -1105,7 +1080,7 @@ def build_scene_diagnostics_payload(state: ComposerState) -> dict[str, Any]:
                         "Object frame differs between backend and native visual cache"
                     )
             else:
-                hmi = SceneDiagnosticHmiResponse(
+                viewer = SceneDiagnosticViewerResponse(
                     rendered=False,
                     scene_name=None,
                     render_state="unavailable",
@@ -1116,7 +1091,7 @@ def build_scene_diagnostics_payload(state: ComposerState) -> dict[str, Any]:
                 SceneDiagnosticObjectResponse(
                     object_id=scene_object.object_id,
                     backend=backend,
-                    hmi=hmi,
+                    viewer=viewer,
                     match=mismatch_reason is None,
                     mismatch_reason=mismatch_reason,
                 )
@@ -1128,7 +1103,7 @@ def build_scene_diagnostics_payload(state: ComposerState) -> dict[str, Any]:
             total=len(objects),
             matched=sum(1 for obj in objects if obj.match),
             mismatched=sum(1 for obj in objects if not obj.match),
-            hmiAvailable=viewer_available,
+            viewerAvailable=viewer_available,
         ),
         timestamp_ns=timestamp_ns,
     ).model_dump(by_alias=True)
@@ -1527,7 +1502,7 @@ def create_scene_router(state: ComposerState) -> APIRouter:
 
     @router.get("/diagnostics")
     def get_scene_diagnostics() -> dict[str, Any]:
-        """Compare backend-authoritative scene truth with HMI render state."""
+        """Compare backend-authoritative scene truth with the native visual cache."""
         return build_scene_diagnostics_payload(state)
 
     @router.get("/frames")
@@ -1543,7 +1518,7 @@ def create_scene_router(state: ComposerState) -> APIRouter:
             success=True,
             frameName=validated.frame_name,
             visible=validated.visible,
-            hmiAvailable=True,
+            viewerAvailable=True,
             timestampNs=time.monotonic_ns(),
         ).model_dump(by_alias=True)
 
@@ -1560,7 +1535,7 @@ def create_scene_router(state: ComposerState) -> APIRouter:
         return SceneFrameGizmoSizeResponse(
             success=True,
             axesLengthM=state.get_frame_gizmo_size(),
-            hmiAvailable=True,
+            viewerAvailable=True,
             timestampNs=time.monotonic_ns(),
         ).model_dump(by_alias=True)
 
@@ -1574,7 +1549,7 @@ def create_scene_router(state: ComposerState) -> APIRouter:
             success=True,
             objectId=validated.object_id,
             visible=validated.visible,
-            hmiAvailable=True,
+            viewerAvailable=True,
             timestampNs=time.monotonic_ns(),
         ).model_dump(by_alias=True)
 
@@ -2118,17 +2093,12 @@ def create_scene_router(state: ComposerState) -> APIRouter:
     ) -> Response:
         """Render the active 3D viewport as an image.
 
-        Day-4 of the native-viewer migration serves this through the same
-        native-viewer broker → legacy HMI fallback chain used by the BT-node
-        provider path. Keep the failure modes distinct so operators and tests
-        can tell "no snapshot source exists" from "a connected source timed
-        out".
+        This serves through the native-viewer snapshot broker used by the
+        BT-node provider path. Keep the failure modes distinct so operators and
+        tests can tell "no snapshot source exists" from "a connected source
+        timed out".
         """
         broker = getattr(state, "snapshot_broker", None)
-        hmi_provider = (
-            getattr(state.hmi_server, "get_cached_scene_snapshot", None)
-            or getattr(state.hmi_server, "render_scene", None)
-        )
 
         if broker is not None and broker.has_clients():
             image_bytes = broker.render_sync(width, height, format)
@@ -2139,21 +2109,11 @@ def create_scene_router(state: ComposerState) -> APIRouter:
                         "detail": "Scene snapshot source did not return an image in time"
                     },
                 )
-        elif hmi_provider is not None:
-            image_bytes = hmi_provider(width, height, format)
-            if image_bytes is None:
-                return JSONResponse(
-                    status_code=503,
-                    content={"detail": "Legacy HMI snapshot source did not return an image"},
-                )
         else:
             return JSONResponse(
                 status_code=503,
                 content={
-                    "detail": (
-                        "No native scene snapshot viewer connected and no legacy "
-                        "HMI snapshot source is running"
-                    ),
+                    "detail": "No native scene snapshot viewer connected",
                 },
             )
 

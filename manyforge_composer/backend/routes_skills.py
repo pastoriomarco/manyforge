@@ -102,7 +102,6 @@ def create_skills_router(state: ComposerState) -> APIRouter:
                     for p in skill.parameters
                 ],
                 body=skill.body,
-                expandsTo=skill.expands_to,
                 example=skill.example,
             ))
         return SkillCatalogResponse(

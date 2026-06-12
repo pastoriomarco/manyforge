@@ -15,7 +15,7 @@ steps:
     timeout_s: 60
 assertions:
   - endpoint: history
-    event_type: plan_started
+    event_type: execute_started
     greater_equal: 1
   - endpoint: debug_export
     path: kernelMetrics.executions_completed

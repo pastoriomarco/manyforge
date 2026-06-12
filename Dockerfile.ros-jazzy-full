@@ -96,7 +96,6 @@ RUN python3 -m venv --system-site-packages "${MANYFORGE_VENV}" \
         nanobind==2.12.0 \
         scikit-build-core==0.12.2 \
         pin==3.9.0 \
-        viser==1.0.26 \
         fastapi==0.135.3 \
         "uvicorn[standard]==0.44.0" \
         httpx==0.28.1 \

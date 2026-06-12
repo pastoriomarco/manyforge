@@ -184,7 +184,7 @@ def build_execution_digest_payload(state: ComposerState) -> dict[str, Any]:
         scene_diagnostics = None
 
     if scene_diagnostics is not None:
-        if scene_diagnostics.get("summary", {}).get("hmiAvailable", False):
+        if scene_diagnostics.get("summary", {}).get("viewerAvailable", False):
             for obj in scene_diagnostics.get("objects", []):
                 if not obj.get("match", False) and obj.get("mismatch_reason"):
                     warnings.append(f"{obj['object_id']}: {obj['mismatch_reason']}")

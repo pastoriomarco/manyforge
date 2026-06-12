@@ -40,11 +40,11 @@ git clone https://github.com/pastoriomarco/isaac_ros_custom_bringup.git
 git clone https://github.com/pastoriomarco/manyforge_specs.git
 
 # Use one tested stack ref across the repos that participate in runtime.
-# This Orin runbook was verified on three-lane-migration for manyforge,
-# NemoClaw-Thor, and manyforge_specs; isaac_ros_custom_bringup used main.
-git -C manyforge checkout three-lane-migration
-git -C NemoClaw-Thor checkout three-lane-migration
-[ ! -d manyforge_specs ] || git -C manyforge_specs checkout three-lane-migration
+# Deployment ref is `main` in every repo (the former three-lane-migration
+# branch, merged 2026-06-12).
+git -C manyforge checkout main
+git -C NemoClaw-Thor checkout main
+[ ! -d manyforge_specs ] || git -C manyforge_specs checkout main
 ```
 
 ---

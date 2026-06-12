@@ -2,8 +2,8 @@
 
 Native R3F visualizer Day 3: round-trips scene snapshot requests
 between the backend and the browser-side viewer over a dedicated
-WebSocket. Replaces the Viser HMI server-side render path with a
-fail-closed client-side render so the VLM-driven behavior-tree nodes
+WebSocket. The native viewer is the only render source; it fails closed
+when no browser snapshot client is connected so the VLM-driven behavior-tree nodes
 (`pick_planning`, `selection` in `manyforge_behavior`) keep their
 `scene_snapshot_provider(width, height, format) -> bytes` contract.
 
@@ -23,11 +23,8 @@ Flow:
    which stashes them and signals the event. The waiting provider
    thread unblocks and returns the bytes.
 
-If no client is connected, `render_sync` returns `None` immediately
-so the caller can fall back to the legacy Viser HMI provider when
-present. Operators running the native viewer with no live HMI fall
-through to a fail-closed `None`, identical to Viser's behavior when
-no browser was connected.
+If no client is connected, `render_sync` returns `None` immediately and
+callers fail closed.
 """
 from __future__ import annotations
 
@@ -160,7 +157,9 @@ def create_snapshot_router(
     VLM input via the upload route.
     """
     router = APIRouter()
-    broker = SnapshotBroker()
+    broker = getattr(state, "snapshot_broker", None)
+    if broker is None:
+        broker = SnapshotBroker()
     # Attach to state so the runner-provider resolver in state.py can find it
     # without importing the route module.
     state.snapshot_broker = broker  # type: ignore[attr-defined]

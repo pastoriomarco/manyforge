@@ -92,7 +92,7 @@ function errorMessageFromPayload(payload: unknown, fallback: string): string {
 /**
  * Pull the structured (errorCode, errorDetails) tuple out of an HTTPException
  * response body when present. Returns null fields when the payload is the
- * legacy string-detail shape. Used by the HMI to render a kernel-cause
+ * legacy string-detail shape. Used by the viewer to render a kernel-cause
  * panel for cycle command rejections.
  */
 export function structuredErrorFromPayload(payload: unknown): {

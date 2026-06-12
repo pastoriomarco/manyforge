@@ -68,12 +68,6 @@ License: MIT
 Source: https://github.com/pmndrs/zustand
 Used by: manyforge_composer/frontend (state management)
 
-### Viser
-Copyright (c) Brent Yi and Viser contributors
-License: MIT
-Source: https://github.com/nerfstudio-project/viser
-Used by: manyforge_hmi (3D HMI / robot visualization)
-
 ### Tailwind CSS
 Copyright (c) Tailwind Labs, Inc.
 License: MIT
@@ -104,7 +98,7 @@ The following license categories cover all third-party software listed
 above:
 
 - Apache-2.0: ROS 2 message/action packages, control_msgs
-- MIT: RoboPlan, FastAPI, React, React Flow, Zustand, Viser, Tailwind
+- MIT: RoboPlan, FastAPI, React, React Flow, Zustand, Tailwind
 - BSD-2-Clause: Pinocchio
 - BSD-3-Clause: HPP-FCL, py_trees, pybind11, topic_based_ros2_control,
   ROS 2 Python tooling

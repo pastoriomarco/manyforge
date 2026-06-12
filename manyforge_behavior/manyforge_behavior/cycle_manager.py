@@ -74,10 +74,8 @@ class RecoveryTrigger(Enum):
     - ``precondition_failed``
     - ``postcondition_failed``
 
-    Two legacy values (``timeout``, ``node_failure``) are kept as
-    deprecated aliases for migration. They MUST NOT be used by new
-    code and will be removed once all in-tree call sites and traces
-    have been migrated. See ``open-points.md`` for the removal target.
+    Persisted traces carry these as plain strings and are never parsed
+    back into this enum, so there are no legacy aliases here.
     """
     PLANNING_FAILED = "planning_failed"
     VALIDATION_FAILED = "validation_failed"
@@ -86,14 +84,6 @@ class RecoveryTrigger(Enum):
     SCENE_MISMATCH = "scene_mismatch"
     PRECONDITION_FAILED = "precondition_failed"
     POSTCONDITION_FAILED = "postcondition_failed"
-
-    # --- Deprecated legacy aliases ---
-    # Kept as distinct enum members rather than aliasing canonical
-    # values so existing serialised traces (which carry the legacy
-    # string) continue to round-trip. Code SHOULD prefer the canonical
-    # values above.
-    TIMEOUT = "timeout"
-    NODE_FAILURE = "node_failure"
 
 
 RECOVERY_TRIGGER_CANONICAL_VALUES = frozenset({
@@ -309,7 +299,7 @@ class CycleManager:
         self._lock = threading.Lock()
         self._on_run_from_idle: Optional[Callable[[], None]] = None
         self._error: Optional[str] = None
-        # Structured cause for the HMI: when the cycle's `_error` is set from
+        # Structured cause for the viewer: when the cycle's `_error` is set from
         # a kernel-side fault (collision, intervention, etc.), the kernel's
         # ErrorDTO carries a stable `error_code` plus a `details` map (e.g.
         # `collision_result_first_failure_pair`, `reason_code`,
@@ -442,6 +432,7 @@ class CycleManager:
             self._runner.load()
 
         self._clear_motion_paused_blackboard()
+        self._clear_gripper_fault_blackboard()
         self._set_resume_after_error_flag(False)
         self._clear_runtime_scene()
         self._tree = self._runner.build_tree()
@@ -550,7 +541,7 @@ class CycleManager:
         with self._lock:
             return dict(self._node_statuses)
 
-    def _drain_kernel_events(self) -> None:
+    def _drain_kernel_events(self) -> list[dict[str, Any]]:
         """Pull native kernel events from the kernel and buffer them."""
         events = self._kernel.drain_kernel_events()
         if not events:
@@ -741,7 +732,7 @@ class CycleManager:
         same tree with the same node holding its position.
 
         Also captures the kernel's structured error_code / error_details
-        from the latest execution snapshot when available, so the HMI can
+        from the latest execution snapshot when available, so the viewer can
         render the actual cause (collision pair, classification, waypoint
         index, fault reason code) instead of only the blackboard string.
         """
@@ -804,7 +795,49 @@ class CycleManager:
         # surfacing. `collision_detected` is the strongest signal (full
         # collision-result map); `interrupt_latched` is next (policy +
         # latch identity). Other event types are not currently mapped.
-        return self._harvest_kernel_event_diagnostics()
+        event_code, event_details = self._harvest_kernel_event_diagnostics()
+        if event_code or event_details:
+            return event_code, event_details
+        # Gripper faults never reach the execution snapshot or the kernel
+        # event stream — the gripper runtime reports through command/status
+        # results only. The command_gripper node mirrors a classified
+        # failure onto the blackboard so the digest can carry the reason
+        # token instead of bare tree-failure prose.
+        return self._read_gripper_fault_diagnostics()
+
+    def _read_gripper_fault_diagnostics(
+        self,
+    ) -> tuple[Optional[str], Optional[dict[str, Any]]]:
+        try:
+            bb = py_trees.blackboard.Client(name="cycle_manager_gripper_fault_read")
+            bb.register_key(
+                key="gripper_fault_details",
+                access=py_trees.common.Access.READ,
+            )
+            details = bb.get("gripper_fault_details")
+        except (KeyError, AttributeError):
+            return None, None
+        if not isinstance(details, dict) or not details:
+            return None, None
+        reason_code = details.get("reason_code")
+        code = (
+            reason_code
+            if isinstance(reason_code, str)
+            and reason_code in _ROS2_CONTROL_BACKEND_REASON_CODES
+            else None
+        )
+        return code, dict(details)
+
+    def _clear_gripper_fault_blackboard(self) -> None:
+        try:
+            bb = py_trees.blackboard.Client(name="cycle_manager_gripper_fault_clear")
+            bb.register_key(
+                key="gripper_fault_details",
+                access=py_trees.common.Access.WRITE,
+            )
+            bb.set("gripper_fault_details", None)
+        except (KeyError, AttributeError):
+            pass
 
     def _harvest_kernel_event_diagnostics(
         self,
@@ -862,7 +895,7 @@ class CycleManager:
             # pre-execute validation rejection: the trajectory PASSED
             # validation, then a dynamic body appeared during execution
             # and the runtime monitor latched. Use a separate code so
-            # the HMI can route to the right operator-facing copy.
+            # the viewer can route to the right operator-facing copy.
             return "runtime_collision", latest_collision
         if latest_latch is not None:
             return "motion_interrupt_latched", latest_latch
@@ -1293,7 +1326,7 @@ class CycleManager:
                 forward(scale, principal_id=principal_id)
         except Exception:
             logger.debug(
-                "kernel.set_runtime_velocity_scale failed; HMI runtime "
+                "kernel.set_runtime_velocity_scale failed; viewer runtime "
                 "velocity slider will retain the backend's previous scale",
                 exc_info=True,
             )

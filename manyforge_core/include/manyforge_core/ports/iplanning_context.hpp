@@ -65,7 +65,7 @@ class IPlanningContext {
     /// Get the current pose of a runtime scene object in the requested base frame.
     ///
     /// This is a backend-authoritative object query surface intended for
-    /// object-relative runtime flows and live-connected HMI reconciliation.
+    /// object-relative runtime flows and live-connected viewer reconciliation.
     ///
     /// @param object_id Stable object identifier in the backend-owned scene
     /// @param base_frame Requested reference frame for the returned pose

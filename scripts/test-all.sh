@@ -11,6 +11,7 @@
 set -euo pipefail
 
 WORKSPACE="${WORKSPACE:-/workspace}"
+export PYTHONPYCACHEPREFIX="${PYTHONPYCACHEPREFIX:-/tmp/manyforge-pycache}"
 BUILD_DIR="${MANYFORGE_BUILD_DIR:-/tmp/manyforge-build}"
 CTEST_TEST_TIMEOUT_S="${CTEST_TEST_TIMEOUT_S:-60}"
 
@@ -230,17 +231,6 @@ run_python_tests() {
     fi
 }
 
-run_hmi_tests() {
-    section "Python manyforge_hmi tests"
-    cd "$WORKSPACE"
-    setup_pythonpath
-    if pytest manyforge_hmi/tests/ -v; then
-        PASS=$((PASS + 1))
-    else
-        FAIL=$((FAIL + 1))
-    fi
-}
-
 run_integration_tests() {
     section "Integration tests"
     cd "$WORKSPACE"
@@ -374,7 +364,6 @@ case "$FILTER" in
         ;;
     python)
         run_python_tests
-        run_hmi_tests
         ;;
     composer)
         run_composer_backend_tests
@@ -405,7 +394,6 @@ case "$FILTER" in
         run_roboplan_tests
         run_pybind_tests
         run_python_tests
-        run_hmi_tests
         run_integration_tests
         run_composer_backend_tests
         run_composer_frontend_build

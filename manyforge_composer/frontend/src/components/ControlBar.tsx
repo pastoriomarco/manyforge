@@ -698,7 +698,7 @@ export function ControlBar() {
             floating "Ready" overlay. Run/Stop/Reset + velocity-scale
             slider were missing from the Composer UI (only existed as
             backend routes + cycleStore actions); landing them here
-            gives the operator parity with the legacy Viser GUI's
+            gives the operator parity with the legacy viewer GUI's
             control panel without a separate overlay. */}
         <CycleControls />
 

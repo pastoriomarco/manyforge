@@ -110,8 +110,7 @@ cd ${HOME}/workspaces/nemoclaw/src/NemoClaw-Thor
 ### 4. Start Composer With The Live Assistant Provider And Native Viewer
 
 Use host networking so Composer can reach the host bridge on `127.0.0.1:8100`.
-The Composer UI uses the native viewer by default. Add `--hmi-port 8081` only
-when deliberately testing the legacy Viser fallback.
+The Composer UI uses the native viewer.
 
 ```bash
 cd ${HOME}/workspaces/dev_ws/src/manyforge
@@ -194,7 +193,7 @@ curl -s http://127.0.0.1:8100/healthz | python3 -m json.tool
 ## Recipe: Known-Good Assistant Demo Launcher
 
 Use this when you want the current best single-model assistant path without
-manually stitching together the model, Composer, HMI, and bridge. The launcher
+manually stitching together the model, Composer, native viewer, and bridge. The launcher
 defaults to `gemma4-12b-it-gguf`, the current preferred lightweight
 single-model candidate for the known-good assistant lane on Thor.
 
@@ -265,9 +264,9 @@ profile and Composer deployment but starts the in-tree
 `manyforge_assistant_bridge` on `http://127.0.0.1:8100` and drives the tool
 loop in-process against the local model endpoint.
 
-The preflight refuses to start if ports `8000`, `8080`, `8081`, `8100`,
+The preflight refuses to start if ports `8000`, `8080`, `8100`,
 `8200`, or `9000` are already owned by unmanaged processes. This prevents
-accidental duplicate Composer, HMI, bridge (either lane), OpenShell, or vLLM
+accidental duplicate Composer, bridge (either lane), OpenShell, or vLLM
 instances. **As of `c3c492c` the preflight is strict against
 launcher-managed state too** — already-running launcher Composer / vLLM /
 bridge / supervisor containers or PID files are reported as conflicts.
@@ -300,7 +299,7 @@ During startup the launcher waits on real readiness endpoints without showing a
 fake percentage or timeout-budget countdown. In an interactive terminal it
 refreshes a small block in place with `Loading, please wait...` and the latest
 three vLLM/Composer log lines. The final success signal is the
-`Known-good assistant demo is ready` block with Composer, HMI, bridge, and model
+`Known-good assistant demo is ready` block with Composer, native viewer, bridge, and model
 details. If model startup takes a long time, inspect the full log in another
 terminal with `docker logs -f manyforge-e2e-vllm`.
 
@@ -409,11 +408,6 @@ operator workflow.
    separate LLM approval layer; use the normal Composer apply/save/reload
    controls to keep or reject the change.
 
-If you are validating the legacy Viser fallback and the Viser panel says HMI is
-unavailable, Composer was not launched with `--hmi-port 8081` or no program has
-been loaded yet. Restart Composer with the fallback flag, then reload the
-program/deployment.
-
 ## Recipe: Automated Assistant E2E Checks
 
 The reusable runner starts and stops the bridge for each sampling profile. It
@@ -421,7 +415,7 @@ loads the assistant-mode deployment and a baseline program, then exercises:
 
 - direct model-endpoint tool-call probing,
 - query-mode `program_read`,
-- operator-facing Composer assistant flow with provider discovery, HMI status,
+- operator-facing Composer assistant flow with provider discovery, viewer status,
   draft mutation, request status, diagnostics, and discard,
 - composer-assistant `scene_draft_add_object`,
 - golden-scene `scene_draft_upsert_objects` with expected object IDs, shapes,
@@ -445,7 +439,7 @@ cd ${HOME}/workspaces/dev_ws/src/manyforge
   --output /tmp/manyforge-assistant-e2e/assistant-primary.json
 ```
 
-Use `--require-hmi` only for explicit legacy Viser fallback qualification.
+Use `--require-viewer` when the run must fail if no native viewer snapshot source is connected.
 
 Model/profile bake-off:
 
@@ -559,7 +553,7 @@ by accepting a separate LLM-only shadow draft.
 ### Operator Composer Flow
 
 Goal: verify the same path an operator sees in the Composer UI: configured
-provider discovery, active mode, HMI availability, assistant draft mutation,
+provider discovery, active mode, viewer availability, assistant draft mutation,
 request-status visibility, tool-call attribution, and normal discard.
 
 Command:
@@ -567,16 +561,16 @@ Command:
 ```bash
 ./scripts/smoke-assistant-e2e.py \
   --profile gemma-bridge-default \
-  --require-hmi \
+  --require-viewer \
   --skip-negative \
   --output /tmp/manyforge-assistant-e2e/operator-flow.json
 ```
 
 Pass signal: `operatorComposerFlow.ok: true`, `providerCatalog.configuredProviderId`
-matches the configured provider, `hmi.status: healthy`, exactly one
+matches the configured provider, `viewer.status: healthy`, exactly one
 `scene_draft_upsert_objects` call completes, no tool call is outside
 `composer-assistant`, the draft program contains the expected object before
-reload, HMI diagnostics match when available, request status is `completed`,
+reload, viewer diagnostics match when available, request status is `completed`,
 and reload/discard removes the assistant-authored object.
 
 ### Golden Scene Upsert

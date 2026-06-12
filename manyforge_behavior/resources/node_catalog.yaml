@@ -1,9 +1,8 @@
 # ManyForge v1 Node Catalog (runtime artifact)
 #
 # This runtime catalog uses schema-backed parameters. Frozen reference
-# artifacts live under manyforge_specs/docs/spec/artifacts/.
-#
-# Schema: docs/spec/440-node-catalog-format-and-versioning.md
+# artifacts are versioned in the private spec repo (spec 440:
+# node-catalog format and versioning).
 # Node semantics: docs/spec/410-node-catalog-and-orchestration-adapters.md
 # Capability keys: docs/spec/240-supported-backend-capability-profile.md
 
@@ -2576,9 +2575,9 @@ entries:
         required: false
         default: false
         description: >-
-          When true, capture a live HMI scene snapshot and attach it to the
-          model request as an image input. Requires a running HMI with at least
-          one connected Viser client.
+          When true, capture a live native viewer scene snapshot and attach it to the
+          model request as an image input. Requires a running viewer with at least
+          one connected native viewer snapshot client.
       - name: scene_snapshot_transport
         schema:
           type: enum
@@ -2698,12 +2697,12 @@ entries:
       - name: image_source
         schema:
           type: enum
-          values: [none, hmi_snapshot]
+          values: [none, viewer_snapshot]
         required: false
         default: none
         description: >-
-          Optional auxiliary image source. When hmi_snapshot is used, the node
-          verifies that an HMI render is available and records metadata for the
+          Optional auxiliary image source. When viewer_snapshot is used, the node
+          verifies that an native viewer render is available and records metadata for the
           prompt context.
       - name: image_snapshot_width
         schema:
@@ -2713,7 +2712,7 @@ entries:
             max_inclusive: 1920
         required: false
         default: 640
-        description: Render width in pixels when image_source=hmi_snapshot.
+        description: Render width in pixels when image_source=viewer_snapshot.
       - name: image_snapshot_height
         schema:
           type: int
@@ -2722,14 +2721,14 @@ entries:
             max_inclusive: 1080
         required: false
         default: 480
-        description: Render height in pixels when image_source=hmi_snapshot.
+        description: Render height in pixels when image_source=viewer_snapshot.
       - name: image_snapshot_format
         schema:
           type: enum
           values: [jpeg, png]
         required: false
         default: jpeg
-        description: Image format for the optional HMI snapshot metadata.
+        description: Image format for the optional viewer snapshot metadata.
     required_capabilities: []
     execution:
       blocking: true
@@ -2883,7 +2882,7 @@ entries:
       - name: image_source
         schema:
           type: enum
-          values: [none, hmi_snapshot]
+          values: [none, viewer_snapshot]
         required: false
         default: none
         description: >-
@@ -2898,7 +2897,7 @@ entries:
             max_inclusive: 1920
         required: false
         default: 640
-        description: Render width in pixels when image_source=hmi_snapshot.
+        description: Render width in pixels when image_source=viewer_snapshot.
       - name: image_snapshot_height
         schema:
           type: int
@@ -2907,14 +2906,14 @@ entries:
             max_inclusive: 1080
         required: false
         default: 480
-        description: Render height in pixels when image_source=hmi_snapshot.
+        description: Render height in pixels when image_source=viewer_snapshot.
       - name: image_snapshot_format
         schema:
           type: enum
           values: [jpeg, png]
         required: false
         default: jpeg
-        description: Image format for the optional HMI snapshot.
+        description: Image format for the optional viewer snapshot.
       - name: tcp_frame
         schema:
           type: string

@@ -485,7 +485,6 @@ def create_mcp_server(state: ComposerState):
         - parameters with types and defaults
         - pre/postconditions (requires/provides/modifies)
         - body: the raw node subtree the skill produces
-        - expands_to: legacy compatibility alias for body
         - example: a concrete usage example
 
         Prefer skills over raw nodes for standard operations like pick/place.
@@ -514,7 +513,6 @@ def create_mcp_server(state: ComposerState):
                     for p in skill.parameters
                 ],
                 "body": skill.body,
-                "expands_to": skill.expands_to,
                 "example": skill.example,
             })
         return json.dumps({"skills": skills, "timestamp_ns": time.time_ns()})
@@ -924,9 +922,8 @@ def create_mcp_server(state: ComposerState):
         """Render the 3D scene as a base64-encoded image.
 
         Uses the native viewer snapshot bridge when a browser viewer is
-        connected, falling back to the legacy HMI renderer only when that
-        optional server is explicitly running. Returns base64 string and
-        metadata, or an error if no snapshot source is connected.
+        connected. Returns base64 string and metadata, or an error if no
+        snapshot source is connected.
 
         Args:
             width: Image width in pixels (64-1920, default 640)
@@ -941,10 +938,7 @@ def create_mcp_server(state: ComposerState):
         provider = state._resolve_scene_snapshot_provider()
         if provider is None:
             return json.dumps({
-                "error": (
-                    "No native scene snapshot viewer connected and no legacy "
-                    "HMI snapshot source is running"
-                )
+                "error": "No native scene snapshot viewer connected"
             })
 
         image_bytes = provider(width, height, format)

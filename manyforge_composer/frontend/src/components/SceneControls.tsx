@@ -10,7 +10,7 @@ import type {
 } from '../types/api';
 
 /**
- * Viser-parity controls for the native viewer (Day 4): frame axis
+ * Viewer controls for the native viewer: frame axis
  * gizmo size, per-frame visibility, per-object frame visibility, and
  * a runtime scene tree grouped by source. Rendered as a floating
  * overlay panel in the top-left of the viewer area, mutually

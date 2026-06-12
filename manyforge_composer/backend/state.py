@@ -246,8 +246,6 @@ class ComposerState:
         self.deployment: Optional[Deployment] = None
         self.deployment_source_path: str = ""
         self.cycle_manager: Optional[CycleManager] = None
-        self.hmi_server = None
-        self.hmi_public_port: int | None = None
         self.public_api_base_url: str | None = None
         self._on_program_loaded: Optional[Callable[["ComposerState"], None]] = None
         self.started_at_ns = time.monotonic_ns()
@@ -259,11 +257,10 @@ class ComposerState:
             failure_archive_max_bytes=failure_archive_max_bytes,
         )
         self.scene_edit_lock = threading.Lock()
-        # Viewer-side visibility state. Previously owned by the Viser HMI
-        # server; the Day-4 parity work makes ComposerState the source of
-        # truth so the native viewer works without HMI. Robot/tool frames
-        # default visible. Object frames default hidden and are opt-in so
-        # runtime scene additions do not clutter the operator view.
+        # Viewer-side visibility state. ComposerState is the source of truth
+        # for the native viewer. Robot/tool frames default visible. Object
+        # frames default hidden and are opt-in so runtime scene additions do
+        # not clutter the operator view.
         self._scene_viewer_lock = threading.Lock()
         # Explicit operator overrides. A frame in `_hidden_frames` is
         # forced off; a frame in `_explicit_visible_frames` is forced
@@ -2371,11 +2368,9 @@ class ComposerState:
         with self._visual_state_lock:
             self._visual_state_publisher_running = False
 
-    # Viewer-state accessors: frame + object-frame visibility + gizmo
-    # size. Day-4 makes these state-owned so the native viewer is
-    # functional without the Viser HMI server attached. The accessors
-    # accept both the new state-local path and the legacy HMI-server
-    # path, so an in-process HMI (if present) sees consistent state.
+    # Viewer-state accessors: frame + object-frame visibility + gizmo size.
+    # These are state-owned so the native viewer and observer routes share one
+    # source of truth.
 
     def get_frame_visibility(self, frame_name: str, default: bool = True) -> bool:
         with self._scene_viewer_lock:
@@ -2393,12 +2388,6 @@ class ComposerState:
             else:
                 self._explicit_visible_frames.discard(frame_name)
                 self._hidden_frames.add(frame_name)
-        hmi = self.hmi_server
-        if hmi is not None and hasattr(hmi, "set_frame_visibility"):
-            try:
-                hmi.set_frame_visibility(frame_name, visible)
-            except Exception:
-                logger.debug("HMI frame visibility mirror failed", exc_info=True)
 
     def get_object_frame_visibility(self, object_id: str) -> bool:
         with self._scene_viewer_lock:
@@ -2410,12 +2399,6 @@ class ComposerState:
                 self._visible_object_frames.add(object_id)
             else:
                 self._visible_object_frames.discard(object_id)
-        hmi = self.hmi_server
-        if hmi is not None and hasattr(hmi, "set_object_frame_visibility"):
-            try:
-                hmi.set_object_frame_visibility(object_id, visible)
-            except Exception:
-                logger.debug("HMI object frame visibility mirror failed", exc_info=True)
 
     def get_frame_gizmo_size(self) -> float:
         with self._scene_viewer_lock:
@@ -2427,12 +2410,6 @@ class ComposerState:
             raise ValueError("frame gizmo size must be positive")
         with self._scene_viewer_lock:
             self._frame_gizmo_size_m = size
-        hmi = self.hmi_server
-        if hmi is not None and hasattr(hmi, "set_frame_gizmo_size"):
-            try:
-                hmi.set_frame_gizmo_size(size)
-            except Exception:
-                logger.debug("HMI gizmo size mirror failed", exc_info=True)
 
     def get_object_axes_gizmo_size(self) -> float:
         with self._scene_viewer_lock:
@@ -2450,32 +2427,17 @@ class ComposerState:
     ) -> Optional[Callable[[int, int, str], Optional[bytes]]]:
         """Pick the active snapshot source for the runner.
 
-        Priority order:
-        1. The native-viewer broker if a browser is currently connected
-           (Day-3 of the native-viewer migration).
-        2. The legacy Viser HMI's cached snapshot / render path.
-
-        We do NOT mix the two within a single capture: if a native
-        client is connected and the round-trip fails (timeout, client
-        disconnects mid-render), the provider returns ``None`` rather
-        than silently falling back to Viser. The legacy path remains
-        the active source only when no native viewer is currently
-        attached, which keeps capture semantics consistent within a
-        single operator session.
+        The native viewer broker is the only supported render source. If no
+        browser viewer is connected, the provider returns ``None`` and the
+        model-facing snapshot request fails closed.
         """
         broker = getattr(self, "snapshot_broker", None)
-        hmi_provider = (
-            getattr(self.hmi_server, "get_cached_scene_snapshot", None)
-            or getattr(self.hmi_server, "render_scene", None)
-        )
         if broker is None:
-            return hmi_provider
+            return None
 
         def provider(width: int, height: int, format: str) -> Optional[bytes]:
             if broker.has_clients():
                 return broker.render_sync(width, height, format)
-            if hmi_provider is not None:
-                return hmi_provider(width, height, format)
             return None
 
         return provider
@@ -2672,7 +2634,7 @@ class ComposerState:
         if not defer_initial_runtime_reset:
             self.reset_backend_authoritative_sim_if_needed(reason="program_load")
 
-        # Notify runtime visual listeners and optional legacy HMI.
+        # Notify runtime visual listeners.
         if self._on_program_loaded:
             try:
                 self._on_program_loaded(self)
@@ -2862,11 +2824,13 @@ class ComposerState:
             }
 
         requested_ids = {str(object_id) for object_id in object_ids or [] if str(object_id)}
+        require_all_bound = policy == "before_planning" and not requested_ids
         snapshots = self.pose_source_snapshots()
         details: list[dict[str, Any]] = []
         applied_count = 0
         skipped_count = 0
         rejected_count = 0
+        required_ids: set[str] = set()
 
         with self.scene_edit_lock:
             for source_id, source in sorted(deployment.pose_sources.items()):
@@ -2883,6 +2847,8 @@ class ComposerState:
                         continue
                     if requested_ids and object_id not in requested_ids:
                         continue
+                    if require_all_bound:
+                        required_ids.add(object_id)
                     observed = snapshot_objects.get(object_id)
                     detail = {
                         "source_id": source_id,
@@ -2890,6 +2856,16 @@ class ComposerState:
                         "policy": policy,
                         "reason": reason,
                     }
+                    if policy == "before_planning":
+                        object_state = self.kernel.get_object_state(object_id)
+                        if object_state.attached:
+                            detail["status"] = "skipped"
+                            detail["skip_reason"] = "attached_object"
+                            detail["attached"] = True
+                            detail["attached_frame_id"] = str(object_state.frame_id or "")
+                            skipped_count += 1
+                            details.append(detail)
+                            continue
                     if not observed:
                         detail["status"] = "skipped"
                         detail["skip_reason"] = "missing_observation"
@@ -3058,15 +3034,17 @@ class ComposerState:
         if applied_count > 0:
             self.request_visual_state_publish(reason=f"pose_source_{policy}")
 
+        if not require_all_bound:
+            required_ids = set(requested_ids)
         required_missing = [
             object_id
-            for object_id in requested_ids
+            for object_id in required_ids
             if not any(
                 detail["object_id"] == object_id
                 and (
                         detail["status"] == "applied"
                         or (
-                            policy == "continuous_unattached"
+                            policy in {"continuous_unattached", "before_planning"}
                             and detail["status"] == "skipped"
                             and detail.get("skip_reason") == "attached_object"
                         )
@@ -3090,6 +3068,8 @@ class ComposerState:
             "policy": policy,
             "reason": reason,
             "object_ids": sorted(requested_ids),
+            "required_object_ids": sorted(required_ids),
+            "require_all_bound": require_all_bound,
             "applied_count": applied_count,
             "skipped_count": skipped_count,
             "rejected_count": rejected_count,
@@ -3240,9 +3220,10 @@ class ComposerState:
         reason: str = "",
     ) -> dict[str, Any]:
         """Apply `before_planning` source updates at the BT latch point."""
+        del object_ids
         return self.apply_pose_source_updates(
             policy="before_planning",
-            object_ids=object_ids,
+            object_ids=[],
             require_idle=False,
             reason=reason or "before_planning",
         )
@@ -3397,6 +3378,7 @@ class ComposerState:
         control, execution_config = self._simulation_reset_contract()
         scope = control.reset.default_scope
         close_command_gate = control.reset.close_command_gate
+        resume_play_after_reset = control.reset.resume_play_after_reset
         command_gate_topic = self._simulation_command_gate_topic(execution_config)
         wait_ready_s = control.reset.wait_ready_s
         cycle_state = (
@@ -3412,6 +3394,7 @@ class ComposerState:
             "required_capability": "simulator.control.reset",
             "cycle_state": cycle_state,
             "allow_running": bool(allow_running),
+            "resume_play_after_reset": bool(resume_play_after_reset),
         }
         self.event_recorder.record_simulation_control_event(
             "requested",
@@ -3437,6 +3420,8 @@ class ComposerState:
                     service_prefix=control.service_prefix,
                     command_gate_topic=command_gate_topic,
                     close_command_gate=close_command_gate,
+                    resume_play_after_reset=resume_play_after_reset,
+                    play_capability_declared=control.capabilities.play,
                     service_timeout_s=wait_ready_s,
                     wait_ready_s=wait_ready_s,
                     execution_config=execution_config,
@@ -3454,6 +3439,10 @@ class ComposerState:
                     "close_command_gate": close_command_gate,
                     "command_gate_topic": command_gate_topic,
                     "command_gate_reopened": result.get("command_gate_reopened"),
+                    "resume_play_after_reset": result.get(
+                        "resume_play_after_reset", False
+                    ),
+                    "resume_play_result": result.get("resume_play_result"),
                     "readiness": result.get("readiness"),
                 }
                 self.event_recorder.record_simulation_control_event(
@@ -3470,6 +3459,10 @@ class ComposerState:
                     "control_id": control_id,
                     "scope": scope,
                     "duration_s": duration_s,
+                    "resume_play_after_reset": result.get(
+                        "resume_play_after_reset", False
+                    ),
+                    "resume_play_result": result.get("resume_play_result"),
                 }
             except Exception as exc:
                 duration_s = time.monotonic() - started
@@ -3750,6 +3743,8 @@ class ComposerState:
         service_prefix: str,
         command_gate_topic: str,
         close_command_gate: bool,
+        resume_play_after_reset: bool,
+        play_capability_declared: bool,
         service_timeout_s: float,
         wait_ready_s: float,
         execution_config: dict[str, Any],
@@ -3796,6 +3791,7 @@ class ComposerState:
                     "service_prefix": service_prefix,
                     "close_command_gate": close_command_gate,
                     "command_gate_topic": command_gate_topic,
+                    "resume_play_after_reset": resume_play_after_reset,
                     "service_timeout_s": service_timeout_s,
                     "wait_ready_s": wait_ready_s,
                 },
@@ -3810,6 +3806,8 @@ class ComposerState:
                     "success": False,
                     "command_gate_closed": command_gate_closed,
                     "command_gate_reopened": False,
+                    "resume_play_after_reset": False,
+                    "resume_play_result": None,
                 }
             readiness = self._wait_for_simulation_reset_readiness(
                 wait_ready_s=wait_ready_s,
@@ -3823,7 +3821,44 @@ class ComposerState:
                     "readiness": readiness,
                     "command_gate_closed": command_gate_closed,
                     "command_gate_reopened": False,
+                    "resume_play_after_reset": False,
+                    "resume_play_result": None,
                 }
+            resume_play_result: dict[str, Any] | None = None
+            should_resume_play = (
+                resume_play_after_reset
+                and self._is_commanded_sim_execution_config(execution_config)
+            )
+            if should_resume_play:
+                if not play_capability_declared:
+                    return {
+                        **reset_result,
+                        "success": False,
+                        "error": (
+                            "simulation_control.reset.resume_play_after_reset=true "
+                            "requires simulation_control.capabilities.play=true "
+                            "for commanded-sim deployments"
+                        ),
+                        "readiness": readiness,
+                        "command_gate_closed": command_gate_closed,
+                        "command_gate_reopened": False,
+                        "resume_play_after_reset": True,
+                        "resume_play_result": None,
+                    }
+                resume_play_result = client.set_simulation_state(
+                    state="playing"
+                ).to_dict()
+                if not resume_play_result.get("success", False):
+                    return {
+                        **reset_result,
+                        "success": False,
+                        "error": "simulation reset play-state resume failed",
+                        "readiness": readiness,
+                        "command_gate_closed": command_gate_closed,
+                        "command_gate_reopened": False,
+                        "resume_play_after_reset": True,
+                        "resume_play_result": resume_play_result,
+                    }
             if close_command_gate:
                 command_gate_reopened = self._kernel.set_command_gate(True)
             return {
@@ -3832,11 +3867,22 @@ class ComposerState:
                 "readiness": readiness,
                 "command_gate_closed": command_gate_closed,
                 "command_gate_reopened": command_gate_reopened,
+                "resume_play_after_reset": should_resume_play,
+                "resume_play_result": resume_play_result,
             }
         finally:
             node.destroy_node()
             if initialized_here:
                 rclpy.shutdown()
+
+    @staticmethod
+    def _is_commanded_sim_execution_config(execution_config: dict[str, Any]) -> bool:
+        authority_profile = (
+            execution_config.get("execution_state_authority_profile")
+            or execution_config.get("execution_state_source_mode")
+            or ""
+        )
+        return authority_profile == "commanded_sim"
 
     def _wait_for_simulation_reset_readiness(
         self,
@@ -3856,12 +3902,7 @@ class ComposerState:
                     "poseSourceApply": pose_source_result,
                 }
 
-        authority_profile = (
-            execution_config.get("execution_state_authority_profile")
-            or execution_config.get("execution_state_source_mode")
-            or ""
-        )
-        if authority_profile != "commanded_sim":
+        if not self._is_commanded_sim_execution_config(execution_config):
             return {
                 "ready": True,
                 "status": "not_required",

@@ -84,6 +84,7 @@ def _pose_sources(
     *,
     enabled: bool = True,
     box_policy: str = "before_planning",
+    can_policy: str = "observe_only",
 ) -> list[dict]:
     return [
         {
@@ -101,26 +102,81 @@ def _pose_sources(
                 },
                 "can": {
                     "entity": "/World/can",
-                    "apply_policy": "observe_only",
+                    "apply_policy": can_policy,
                 },
             },
         }
     ]
 
 
-def _add_box(client: TestClient) -> None:
+def _add_object(
+    client: TestClient,
+    object_id: str = "box",
+    *,
+    position_m: list[float] | None = None,
+) -> None:
     response = client.post(
         "/api/scene/edit",
         json={
             "operation": "add",
-            "object_id": "box",
+            "object_id": object_id,
             "shape_type": "box",
             "box_dimensions_m": [0.1, 0.1, 0.1],
-            "pose_position_m": [0.0, 0.0, 0.0],
+            "pose_position_m": position_m or [0.0, 0.0, 0.0],
             "pose_orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
         },
     )
     assert response.status_code == 200
+
+
+def _add_box(client: TestClient) -> None:
+    _add_object(client, "box")
+
+
+def _pose_source_observation(
+    object_id: str,
+    *,
+    observed_frame_id: str = "universe",
+    age_s: float | None = 0.05,
+    position_xyz: list[float] | None = None,
+) -> dict[str, Any]:
+    observed: dict[str, Any] = {
+        "objectId": object_id,
+        "status": "fresh",
+        "update": {
+            "poseSourceId": "isaac_scene_objects",
+            "objectId": object_id,
+            "entity": "/wrong",
+            "monotonicS": 10.0,
+            "applyPolicy": "observe_only",
+            "pose": {
+                "frameId": observed_frame_id,
+                "stampSec": 100.0,
+                "positionXYZ": position_xyz or [1.0, 2.0, 3.0],
+                "orientationXYZW": [0.0, 0.0, 0.0, 1.0],
+            },
+        },
+    }
+    if age_s is not None:
+        observed["ageS"] = age_s
+    return observed
+
+
+def _post_fresh_snapshot(
+    client: TestClient,
+    observations: list[dict[str, Any]],
+) -> Any:
+    response = client.post(
+        "/api/scene/pose-sources/isaac_scene_objects/snapshot",
+        json={
+            "poseSourceId": "isaac_scene_objects",
+            "status": "fresh",
+            "monotonicS": 10.0,
+            "objects": observations,
+        },
+    )
+    assert response.status_code == 200
+    return response
 
 
 def _post_fresh_box_snapshot(
@@ -129,36 +185,16 @@ def _post_fresh_box_snapshot(
     observed_frame_id: str = "universe",
     age_s: float | None = 0.05,
 ) -> Any:
-    observed: dict[str, Any] = {
-        "objectId": "box",
-        "status": "fresh",
-        "update": {
-            "poseSourceId": "isaac_scene_objects",
-            "objectId": "box",
-            "entity": "/wrong",
-            "monotonicS": 10.0,
-            "applyPolicy": "observe_only",
-            "pose": {
-                "frameId": observed_frame_id,
-                "stampSec": 100.0,
-                "positionXYZ": [1.0, 2.0, 3.0],
-                "orientationXYZW": [0.0, 0.0, 0.0, 1.0],
-            },
-        },
-    }
-    if age_s is not None:
-        observed["ageS"] = age_s
-    response = client.post(
-        "/api/scene/pose-sources/isaac_scene_objects/snapshot",
-        json={
-            "poseSourceId": "isaac_scene_objects",
-            "status": "fresh",
-            "monotonicS": 10.0,
-            "objects": [observed],
-        },
+    return _post_fresh_snapshot(
+        client,
+        [
+            _pose_source_observation(
+                "box",
+                observed_frame_id=observed_frame_id,
+                age_s=age_s,
+            )
+        ],
     )
-    assert response.status_code == 200
-    return response
 
 
 def _wait_for_pose_source_apply(state: ComposerState) -> dict[str, Any]:
@@ -547,6 +583,41 @@ def test_before_planning_latch_can_apply_during_running_cycle(tmp_path: Path) ->
     edit = state.kernel.scene_edits[-1]
     assert edit.source_freshness_budget_ns is None
     assert edit.source_timestamp_ns is None
+
+
+def test_before_planning_latch_refreshes_non_referenced_bound_objects(
+    tmp_path: Path,
+) -> None:
+    client, state = _client(tmp_path)
+    state.deployment = _minimal_deployment(
+        pose_sources=_pose_sources(can_policy="before_planning")
+    )
+    _add_box(client)
+    _add_object(client, "can")
+    _post_fresh_snapshot(
+        client,
+        [
+            _pose_source_observation("box", position_xyz=[1.0, 2.0, 3.0]),
+            _pose_source_observation("can", position_xyz=[4.0, 5.0, 6.0]),
+        ],
+    )
+
+    result = state.apply_pose_sources_before_planning(object_ids=["box"])
+
+    assert result["success"] is True
+    assert result["applied_count"] == 2
+    assert {detail["object_id"] for detail in result["details"]} == {"box", "can"}
+    assert [edit.object_id for edit in state.kernel.scene_edits[-2:]] == [
+        "box",
+        "can",
+    ]
+    scene = client.get("/api/scene/state").json()
+    poses = {
+        obj["object_id"]: obj["pose_in_universe"]["position_m"]
+        for obj in scene["objects"]
+    }
+    assert poses["box"] == [1.0, 2.0, 3.0]
+    assert poses["can"] == [4.0, 5.0, 6.0]
 
 
 def test_pose_source_apply_uses_configured_frame_not_provider_frame(tmp_path: Path) -> None:

@@ -2,8 +2,8 @@ api_version: manyforge.deployment.v0
 schema_version: "0.1.0"
 name: ur5_roboplan_local_vision_guided_pose_pick
 description: >-
-  Local deployment for the vision-guided pose-pick example. Requires the HMI
-  to be running with at least one connected Viser client so `query_model` can
+  Local deployment for the vision-guided pose-pick example. Requires the viewer
+  to be running with at least one connected native viewer snapshot client so `query_model` can
   attach a live scene snapshot.
 
 program_profile: v0.1

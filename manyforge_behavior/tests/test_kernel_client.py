@@ -1,10 +1,14 @@
 """Tests for the mock kernel client."""
 
+import sys
+import threading
+
 import pytest
 
 from manyforge_behavior.kernel_client import (
     ExecuteRequest,
     ExecutionState,
+    GripperCommandRequest,
     JointDynamicsLimit,
     MockKernelClient,
     ObjectState,
@@ -490,3 +494,58 @@ class TestPerJointDynamicsLimits:
         assert limit.max_velocity_rad_s is None
         assert limit.max_acceleration_rad_s2 is None
         assert limit.max_jerk_rad_s3 is None
+
+
+class TestMockKernelGripperConcurrency:
+    """Gripper command/position state must be lock-protected: the executing
+    tree commands the gripper while status polls (and failure-injecting test
+    threads) read it concurrently.
+    """
+
+    @staticmethod
+    def _request(duration_s: float) -> GripperCommandRequest:
+        return GripperCommandRequest(
+            gripper_id="primary",
+            group_id="gripper",
+            joint_name="finger_joint",
+            target_position=0.7,
+            duration_s=duration_s,
+        )
+
+    def test_exactly_one_concurrent_command_wins_per_idle_gripper(self):
+        # A tiny switch interval makes the pre-lock check-then-act race and
+        # counter lost-updates observable within few rounds.
+        switch_interval = sys.getswitchinterval()
+        sys.setswitchinterval(1e-5)
+        try:
+            for _ in range(25):
+                kernel = MockKernelClient()
+                thread_count = 8
+                barrier = threading.Barrier(thread_count)
+                accepted: list[bool] = []
+                errors: list[Exception] = []
+
+                def worker() -> None:
+                    try:
+                        barrier.wait()
+                        result = kernel.command_gripper(self._request(duration_s=30.0))
+                        kernel.get_gripper_status("primary")
+                        kernel.update_gripper_commands()
+                        if result.accepted:
+                            accepted.append(True)
+                    except Exception as exc:  # noqa: BLE001
+                        errors.append(exc)
+
+                threads = [
+                    threading.Thread(target=worker) for _ in range(thread_count)
+                ]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join()
+
+                assert errors == []
+                assert len(accepted) == 1
+                assert kernel.gripper_command_count == thread_count
+        finally:
+            sys.setswitchinterval(switch_interval)

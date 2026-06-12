@@ -142,11 +142,20 @@ Use when:
 - validating bounded model interactions
 - running the semantic selection demo on the current text-only baseline
 
-### 4. ManyForge plus NemoClaw/OpenClaw
+### 4. ManyForge plus an assistant lane (NemoClaw/OpenClaw, Direct, or Hermes)
 
-Two assistant-provider lanes coexist; **OpenClaw + Gemma 4 12B GGUF
+Three first-class assistant-provider lanes exist — `direct`, `openclaw`,
+`hermes` — and the live stack runs exactly one per Composer process,
+selected at startup via `ASSISTANT_PROVIDER`. **OpenClaw + Gemma 4 12B GGUF
 (`openclaw` provider, `gemma4-12b-it-gguf`) is the demo default** as
-of 2026-06-11. The
+of 2026-06-11. The canonical per-lane bring-up, switch procedure, and
+provisioning/onboarding matrix is
+[`LANE_BRINGUP.md`](LANE_BRINGUP.md); the two most common lanes are
+summarized below. The Hermes lane (native MCP, opt-in
+`HERMES_LANE_PHASE4_ENABLED=true`, sandbox provisioned by
+`scripts/setup-hermes.sh` — not by `nemoclaw onboard`) is covered in
+`LANE_BRINGUP.md` and in NemoClaw-Thor's `manyforge/lanes/hermes/README.md`.
+The
 launcher [`scripts/demo-assistant-known-good.sh`](../../scripts/demo-assistant-known-good.sh)
 sets `ASSISTANT_PROVIDER=openclaw` and `MODEL_PROFILE=gemma4-12b-it-gguf`
 by default.
@@ -174,7 +183,7 @@ by default.
   development, debugging the bridge in isolation, or single-tenant
   setups where the model is fully trusted.
 
-Both lanes preserve the same bounded-autonomy contract on the ManyForge
+All lanes preserve the same bounded-autonomy contract on the ManyForge
 side. Switching between them is a single env var on
 `scripts/demo-assistant-known-good.sh`. The lane-comparison data that
 justified the default flip (`nemoclaw` → `openclaw` on 2026-05-07)
@@ -260,7 +269,6 @@ manually; they are documented here for traceability.
 | `trimesh` | `4.11.5` | PyPI | Dockerfile L61; OBJ/mesh parsing |
 | `yourdfpy` | `0.0.60` | PyPI | Dockerfile L62; URDF Python loader |
 | FastAPI | `0.135.3` | PyPI | Dockerfile L67; Composer backend |
-| Viser | `1.0.26` | PyPI | Dockerfile L66; legacy HMI fallback, started only with `MANYFORGE_ENABLE_LEGACY_VISER_HMI=true` |
 | MCP (Model Context Protocol) | `1.27.0` | PyPI | Dockerfile L71; assistant-lane MCP server |
 
 The model endpoints used by Mode 2/3 are configured in
@@ -342,10 +350,10 @@ Purpose:
 Typical usage:
 
 ```bash
-./scripts/manyforge-stack.sh up                  # legacy ManyForge + mux proxy
-./scripts/manyforge-stack.sh up --with-nemoclaw  # + legacy NemoClaw integration
+./scripts/manyforge-stack.sh up                  # legacy ManyForge container only
+MANYFORGE_ENABLE_LEGACY_MUX_PROVIDER=true ./scripts/manyforge-stack.sh up --with-nemoclaw
 ./scripts/manyforge-stack.sh status
-./scripts/manyforge-stack.sh smoke all
+MANYFORGE_ENABLE_LEGACY_MUX_PROVIDER=true ./scripts/manyforge-stack.sh smoke all
 ./scripts/manyforge-stack.sh plugin status
 ./scripts/manyforge-stack.sh down
 ```
@@ -382,12 +390,6 @@ Then use:
 
 - Composer API on port `9000`
 - native Composer viewer in the Composer UI
-
-The legacy Viser HMI can still be started for compatibility with:
-
-```bash
-MANYFORGE_ENABLE_LEGACY_VISER_HMI=true ./scripts/launch.sh start
-```
 
 This profile does not require ROS, Isaac Sim, or a robot controller. The
 native execution adapter is in-process: reset and retry only affect ManyForge's

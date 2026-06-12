@@ -4,6 +4,13 @@
 namespace manyforge::core {
 namespace {
 
+CollisionWorldRevision make_revision(uint64_t id = 1) {
+  CollisionWorldRevision revision;
+  revision.revision_id = id;
+  revision.content_hash = "test_hash_" + std::to_string(id);
+  return revision;
+}
+
 TrajectoryDTO make_trajectory(const std::string& label) {
   TrajectoryDTO t;
   t.joint_names = {label};
@@ -21,23 +28,23 @@ class TrajectoryCacheTest : public ::testing::Test {
 
 // --- Store and lookup ---
 TEST_F(TrajectoryCacheTest, StoreAndLookup) {
-  cache.store("move_1", make_trajectory("t1"));
-  auto result = cache.lookup("move_1");
+  cache.store("move_1", make_trajectory("t1"), make_revision());
+  auto result = cache.peek_unvalidated("move_1");
   ASSERT_TRUE(result.has_value());
   EXPECT_EQ(result->joint_names[0], "t1");
   EXPECT_EQ(result->waypoints.size(), 1u);
 }
 
 TEST_F(TrajectoryCacheTest, LookupMiss_ReturnsNullopt) {
-  auto result = cache.lookup("nonexistent");
+  auto result = cache.peek_unvalidated("nonexistent");
   EXPECT_FALSE(result.has_value());
 }
 
 // --- Overwrite ---
 TEST_F(TrajectoryCacheTest, StoreOverwritesExisting) {
-  cache.store("move_1", make_trajectory("v1"));
-  cache.store("move_1", make_trajectory("v2"));
-  auto result = cache.lookup("move_1");
+  cache.store("move_1", make_trajectory("v1"), make_revision());
+  cache.store("move_1", make_trajectory("v2"), make_revision());
+  auto result = cache.peek_unvalidated("move_1");
   ASSERT_TRUE(result.has_value());
   EXPECT_EQ(result->joint_names[0], "v2");
   EXPECT_EQ(cache.size(), 1u);
@@ -45,47 +52,47 @@ TEST_F(TrajectoryCacheTest, StoreOverwritesExisting) {
 
 // --- Invalidate ---
 TEST_F(TrajectoryCacheTest, InvalidateSpecificMoveId) {
-  cache.store("move_1", make_trajectory("t1"));
-  cache.store("move_2", make_trajectory("t2"));
+  cache.store("move_1", make_trajectory("t1"), make_revision());
+  cache.store("move_2", make_trajectory("t2"), make_revision());
   cache.invalidate("move_1");
-  EXPECT_FALSE(cache.lookup("move_1").has_value());
-  EXPECT_TRUE(cache.lookup("move_2").has_value());
+  EXPECT_FALSE(cache.peek_unvalidated("move_1").has_value());
+  EXPECT_TRUE(cache.peek_unvalidated("move_2").has_value());
   EXPECT_EQ(cache.size(), 1u);
 }
 
 TEST_F(TrajectoryCacheTest, InvalidateNonExistent_NoOp) {
-  cache.store("move_1", make_trajectory("t1"));
+  cache.store("move_1", make_trajectory("t1"), make_revision());
   cache.invalidate("nonexistent");
   EXPECT_EQ(cache.size(), 1u);
 }
 
 TEST_F(TrajectoryCacheTest, InvalidateAll) {
-  cache.store("move_1", make_trajectory("t1"));
-  cache.store("move_2", make_trajectory("t2"));
+  cache.store("move_1", make_trajectory("t1"), make_revision());
+  cache.store("move_2", make_trajectory("t2"), make_revision());
   cache.invalidate_all();
   EXPECT_EQ(cache.size(), 0u);
-  EXPECT_FALSE(cache.lookup("move_1").has_value());
-  EXPECT_FALSE(cache.lookup("move_2").has_value());
+  EXPECT_FALSE(cache.peek_unvalidated("move_1").has_value());
+  EXPECT_FALSE(cache.peek_unvalidated("move_2").has_value());
 }
 
 // --- Multiple independent entries ---
 TEST_F(TrajectoryCacheTest, MultipleMovesIndependent) {
-  cache.store("move_1", make_trajectory("t1"));
-  cache.store("move_2", make_trajectory("t2"));
-  cache.store("move_3", make_trajectory("t3"));
+  cache.store("move_1", make_trajectory("t1"), make_revision());
+  cache.store("move_2", make_trajectory("t2"), make_revision());
+  cache.store("move_3", make_trajectory("t3"), make_revision());
 
   EXPECT_EQ(cache.size(), 3u);
-  EXPECT_EQ(cache.lookup("move_1")->joint_names[0], "t1");
-  EXPECT_EQ(cache.lookup("move_2")->joint_names[0], "t2");
-  EXPECT_EQ(cache.lookup("move_3")->joint_names[0], "t3");
+  EXPECT_EQ(cache.peek_unvalidated("move_1")->joint_names[0], "t1");
+  EXPECT_EQ(cache.peek_unvalidated("move_2")->joint_names[0], "t2");
+  EXPECT_EQ(cache.peek_unvalidated("move_3")->joint_names[0], "t3");
 }
 
 // --- Size and capacity ---
 TEST_F(TrajectoryCacheTest, SizeCorrect) {
   EXPECT_EQ(cache.size(), 0u);
-  cache.store("a", make_trajectory("a"));
+  cache.store("a", make_trajectory("a"), make_revision());
   EXPECT_EQ(cache.size(), 1u);
-  cache.store("b", make_trajectory("b"));
+  cache.store("b", make_trajectory("b"), make_revision());
   EXPECT_EQ(cache.size(), 2u);
 }
 
@@ -102,31 +109,31 @@ TEST_F(TrajectoryCacheTest, DefaultCapacity) {
 
 // --- Safety bound: FIFO eviction ---
 TEST_F(TrajectoryCacheTest, EvictsOldestWhenFull) {
-  cache.store("move_1", make_trajectory("t1"));
-  cache.store("move_2", make_trajectory("t2"));
-  cache.store("move_3", make_trajectory("t3"));
+  cache.store("move_1", make_trajectory("t1"), make_revision());
+  cache.store("move_2", make_trajectory("t2"), make_revision());
+  cache.store("move_3", make_trajectory("t3"), make_revision());
   EXPECT_EQ(cache.size(), 3u);
 
   // 4th entry evicts oldest (move_1).
-  cache.store("move_4", make_trajectory("t4"));
+  cache.store("move_4", make_trajectory("t4"), make_revision());
   EXPECT_EQ(cache.size(), 3u);
-  EXPECT_FALSE(cache.lookup("move_1").has_value());
-  EXPECT_TRUE(cache.lookup("move_2").has_value());
-  EXPECT_TRUE(cache.lookup("move_3").has_value());
-  EXPECT_TRUE(cache.lookup("move_4").has_value());
+  EXPECT_FALSE(cache.peek_unvalidated("move_1").has_value());
+  EXPECT_TRUE(cache.peek_unvalidated("move_2").has_value());
+  EXPECT_TRUE(cache.peek_unvalidated("move_3").has_value());
+  EXPECT_TRUE(cache.peek_unvalidated("move_4").has_value());
 }
 
 TEST_F(TrajectoryCacheTest, OverwriteDoesNotEvict) {
-  cache.store("move_1", make_trajectory("t1"));
-  cache.store("move_2", make_trajectory("t2"));
-  cache.store("move_3", make_trajectory("t3"));
+  cache.store("move_1", make_trajectory("t1"), make_revision());
+  cache.store("move_2", make_trajectory("t2"), make_revision());
+  cache.store("move_3", make_trajectory("t3"), make_revision());
 
   // Overwrite move_1 — should not evict anything.
-  cache.store("move_1", make_trajectory("t1_updated"));
+  cache.store("move_1", make_trajectory("t1_updated"), make_revision());
   EXPECT_EQ(cache.size(), 3u);
-  EXPECT_EQ(cache.lookup("move_1")->joint_names[0], "t1_updated");
-  EXPECT_TRUE(cache.lookup("move_2").has_value());
-  EXPECT_TRUE(cache.lookup("move_3").has_value());
+  EXPECT_EQ(cache.peek_unvalidated("move_1")->joint_names[0], "t1_updated");
+  EXPECT_TRUE(cache.peek_unvalidated("move_2").has_value());
+  EXPECT_TRUE(cache.peek_unvalidated("move_3").has_value());
 }
 
 // --- Empty trajectory ---
@@ -148,7 +155,7 @@ TEST_F(TrajectoryCacheTest, RevisionAware_MismatchRevisionMissesAndEvicts) {
   EXPECT_FALSE(miss.has_value());
 
   // Subsequent lookup-by-key sees the entry was evicted.
-  EXPECT_FALSE(cache.lookup("move_1").has_value());
+  EXPECT_FALSE(cache.peek_unvalidated("move_1").has_value());
   EXPECT_EQ(cache.size(), 0u);
 }
 
@@ -164,13 +171,12 @@ TEST_F(TrajectoryCacheTest, RevisionAware_DifferentHashSameIdIsMiss) {
 
 TEST_F(TrajectoryCacheTest, RevisionAware_ExpectedUnsetMissesEvenWhenStoredUnset) {
   // Revision-aware lookup fails closed when the caller cannot identify the
-  // authoritative collision-world revision. Legacy callers can still use
-  // lookup() explicitly.
-  cache.store("move_1", make_trajectory("t1"));
+  // authoritative collision-world revision.
+  cache.store("move_1", make_trajectory("t1"), CollisionWorldRevision{});
   auto miss =
       cache.lookup_with_revision("move_1", CollisionWorldRevision{});
   EXPECT_FALSE(miss.has_value());
-  EXPECT_TRUE(cache.lookup("move_1").has_value());
+  EXPECT_TRUE(cache.peek_unvalidated("move_1").has_value());
 }
 
 TEST_F(TrajectoryCacheTest, RevisionAware_ExpectedUnsetButStoredTaggedMisses) {
@@ -191,8 +197,8 @@ TEST_F(TrajectoryCacheTest, RevisionAware_ExpectedUnsetButStoredTaggedMisses) {
 
 TEST_F(TrajectoryCacheTest, RevisionAware_ExpectedTaggedButStoredUnsetEvicts) {
   // Adapter promoted to publishing revisions after this entry was stored
-  // without a tag. The pre-promotion entry can no longer be trusted.
-  cache.store("move_1", make_trajectory("t1"));
+  // with an unset tag. The pre-promotion entry can no longer be trusted.
+  cache.store("move_1", make_trajectory("t1"), CollisionWorldRevision{});
   CollisionWorldRevision rev{7, "abc"};
   EXPECT_FALSE(cache.lookup_with_revision("move_1", rev).has_value());
   EXPECT_EQ(cache.size(), 0u);
@@ -208,7 +214,7 @@ TEST_F(TrajectoryCacheTest, RevisionAware_RevisionOfReturnsTaggedValue) {
 }
 
 TEST_F(TrajectoryCacheTest, RevisionAware_RevisionOfReturnsNulloptForUntagged) {
-  cache.store("move_1", make_trajectory("t1"));
+  cache.store("move_1", make_trajectory("t1"), CollisionWorldRevision{});
   EXPECT_FALSE(cache.revision_of("move_1").has_value());
 }
 
@@ -227,8 +233,8 @@ TEST_F(TrajectoryCacheTest, RevisionAware_OverwriteUpdatesRevision) {
 TEST_F(TrajectoryCacheTest, StoreEmptyTrajectory) {
   TrajectoryDTO empty;
   EXPECT_TRUE(empty.empty());
-  cache.store("move_empty", empty);
-  auto result = cache.lookup("move_empty");
+  cache.store("move_empty", empty, make_revision());
+  auto result = cache.peek_unvalidated("move_empty");
   ASSERT_TRUE(result.has_value());
   EXPECT_TRUE(result->empty());
 }

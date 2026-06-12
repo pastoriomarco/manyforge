@@ -2,7 +2,7 @@
 #
 # Provides the complete build/test toolchain:
 #   - C++20 (g++, cmake, gtest, eigen3)
-#   - Python 3.12 (pytest, py_trees, pybind11, numpy, viser, pyyaml)
+#   - Python 3.12 (pytest, py_trees, pybind11, numpy, pyyaml)
 #   - Pinocchio (robot kinematics/dynamics/collision)
 #   - RoboPlan (motion planning: RRT, TOPPRA, IK, collision checking)
 #   - Node.js 22 (React frontend build)
@@ -83,7 +83,6 @@ RUN pip install --no-cache-dir --upgrade pip setuptools && \
         nanobind==2.12.0 \
         scikit-build-core==0.12.2 \
         pin==3.9.0 \
-        viser==1.0.26 \
         fastapi==0.135.3 \
         "uvicorn[standard]==0.44.0" \
         httpx==0.28.1 \

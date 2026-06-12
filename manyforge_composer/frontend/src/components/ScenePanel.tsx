@@ -341,7 +341,7 @@ function AuthoredSceneCard({
   resource,
   frameOptions,
   disabled,
-  hmiAvailable,
+  viewerAvailable,
   objectFrameVisible,
   onUpdate,
   onRemove,
@@ -350,7 +350,7 @@ function AuthoredSceneCard({
   resource: ProgramSceneResource;
   frameOptions: string[];
   disabled: boolean;
-  hmiAvailable: boolean;
+  viewerAvailable: boolean;
   objectFrameVisible: boolean;
   onUpdate: (previousObjectId: string, resource: ProgramSceneResource) => void;
   onRemove: (objectId: string) => void;
@@ -460,7 +460,7 @@ function AuthoredSceneCard({
               type="checkbox"
               checked={objectFrameVisible}
               onChange={(event) => onObjectFrameVisibilityChange(resource.objectId, event.target.checked)}
-              disabled={!hmiAvailable}
+              disabled={!viewerAvailable}
               className="h-3 w-3"
             />
             <span>Gizmo frame</span>
@@ -619,11 +619,11 @@ function AuthoredSceneCard({
 
 function LiveSceneObjectCard({
   objectState,
-  hmiAvailable,
+  viewerAvailable,
   onObjectFrameVisibilityChange,
 }: {
   objectState: SceneObjectState;
-  hmiAvailable: boolean;
+  viewerAvailable: boolean;
   onObjectFrameVisibilityChange: (objectId: string, visible: boolean) => void;
 }) {
   const pose = objectState.pose_in_universe as Record<string, unknown> | undefined;
@@ -649,7 +649,7 @@ function LiveSceneObjectCard({
               type="checkbox"
               checked={objectState.viewer_frame_visible}
               onChange={(event) => onObjectFrameVisibilityChange(objectState.object_id, event.target.checked)}
-              disabled={!hmiAvailable}
+              disabled={!viewerAvailable}
               className="h-3 w-3"
             />
             <span>Gizmo frame</span>
@@ -746,7 +746,7 @@ export function ScenePanel() {
   const editLocked = useEditLocked();
   const [sceneState, setSceneState] = useState<SceneStateResponse | null>(null);
   const [frames, setFrames] = useState<SceneFrameState[]>([]);
-  const [hmiAvailable, setHmiAvailable] = useState(false);
+  const [viewerAvailable, setViewerAvailable] = useState(false);
   const [frameGizmoSizeM, setFrameGizmoSizeM] = useState(0.1);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -773,7 +773,7 @@ export function ScenePanel() {
       ]);
       setSceneState(nextState);
       setFrames(frameState.frames);
-      setHmiAvailable(frameState.hmiAvailable);
+      setViewerAvailable(frameState.viewerAvailable);
       setFrameGizmoSizeM(frameState.frameGizmoSizeM ?? 0.1);
       setError(null);
     } catch (refreshError) {
@@ -968,7 +968,7 @@ export function ScenePanel() {
       </div>
 
       <Section title="Viewer Frames">
-        {!hmiAvailable && (
+        {!viewerAvailable && (
           <div className="rounded border border-gray-700 bg-gray-900/40 p-3 text-xs text-gray-500">
             Viewer frame toggles are unavailable until frame state loads.
           </div>
@@ -979,7 +979,7 @@ export function ScenePanel() {
             value={frameGizmoSizeM}
             onChange={(next) => void updateFrameGizmoSize(next)}
             step="0.01"
-            disabled={!hmiAvailable}
+            disabled={!viewerAvailable}
           />
         </div>
         <div className="space-y-2">
@@ -997,7 +997,7 @@ export function ScenePanel() {
                 type="checkbox"
                 checked={frame.viewerVisible}
                 onChange={(event) => void toggleFrameVisibility(frame.name, event.target.checked)}
-                disabled={!hmiAvailable}
+                disabled={!viewerAvailable}
                 className="mt-0.5"
               />
               <div className="min-w-0 flex-1">
@@ -1189,7 +1189,7 @@ export function ScenePanel() {
             resource={resource}
             frameOptions={frameOptions}
             disabled={editLocked}
-            hmiAvailable={hmiAvailable}
+            viewerAvailable={viewerAvailable}
             objectFrameVisible={liveObjectsById.get(resource.objectId)?.viewer_frame_visible ?? false}
             onUpdate={replaceSceneResource}
             onRemove={removeSceneResource}
@@ -1208,7 +1208,7 @@ export function ScenePanel() {
           <LiveSceneObjectCard
             key={objectState.object_id}
             objectState={objectState}
-            hmiAvailable={hmiAvailable}
+            viewerAvailable={viewerAvailable}
             onObjectFrameVisibilityChange={toggleObjectFrameVisibility}
           />
         ))}

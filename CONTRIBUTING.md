@@ -29,8 +29,7 @@ machine-readable companion to this doc.
   (native + ros2_control).
 - `manyforge_behavior/` — Python py_trees behavior-tree runner.
 - `manyforge_composer/` — FastAPI backend + React frontend for the
-  authoring UI.
-- `manyforge_hmi/` — Viser-based 3D HMI.
+  authoring UI and native 3D viewer.
 - `manyforge_assistant_bridge/` — Assistant-provider HTTP bridge +
   status supervisor.
 - `manyforge_ros/`, `manyforge_ros_bringup/` — ROS adapter modules

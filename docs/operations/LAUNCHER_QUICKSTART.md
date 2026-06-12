@@ -385,9 +385,7 @@ For where logs and observability endpoints live, see
   container; a leftover unmanaged process needs `docker ps` + `docker
   rm -f` or a process kill. To use different ports, set
   `COMPOSER_PORT=NNNN` (preflight checks the resolved value;
-  `expected_port_owner` matches it). Port 8081 is only checked when
-  `MANYFORGE_ENABLE_LEGACY_VISER_HMI=true`; set `HMI_PORT=NNNN` with
-  that flag to move the legacy Viser fallback.
+  `expected_port_owner` matches it).
 - **CI/log-capture wants plain output** → live progress redraw uses
   ANSI cursor-up. For CI logs, set `MANYFORGE_PROGRESS_MODE=plain`;
   the helper reprints the full status block every 30 s instead of

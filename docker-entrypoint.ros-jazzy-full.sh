@@ -1,6 +1,12 @@
 #!/bin/bash
 set -e
 
+
+# Keep bytecode caches out of the bind-mounted workspace: container
+# processes run as root and root-owned __pycache__ dirs break host-side
+# tooling. The prefix keeps the bytecode-cache speedup on a container path.
+export PYTHONPYCACHEPREFIX="/tmp/manyforge-pycache"
+
 ROS_DISTRO="${ROS_DISTRO:-jazzy}"
 MANYFORGE_VENV="${MANYFORGE_VENV:-/opt/manyforge/venv}"
 

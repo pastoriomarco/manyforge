@@ -57,7 +57,7 @@ extract_pyproject_version() {
         | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || true
 }
 
-for pkg in manyforge_behavior manyforge_ros manyforge_composer manyforge_hmi manyforge_assistant_bridge; do
+for pkg in manyforge_behavior manyforge_ros manyforge_composer manyforge_assistant_bridge; do
     file="${REPO_ROOT}/${pkg}/pyproject.toml"
     if [[ ! -f "${file}" ]]; then
         printf '  ✗ %-50s pyproject.toml missing\n' "${pkg}"

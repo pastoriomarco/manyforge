@@ -12,7 +12,7 @@ source "${NEMOCLAW_THOR}/setup/checks.sh"
 source "${NEMOCLAW_THOR}/serving/config.sh"
 source "${NEMOCLAW_THOR}/setup/sandbox-runtime.sh"
 
-MODE="${1:-all}"
+MODE="${1:-direct}"
 KEEP_FINAL_MODE="${KEEP_FINAL_MODE:-false}"
 THOR_AGENT_TIMEOUT_SECONDS="${THOR_AGENT_TIMEOUT_SECONDS:-120}"
 SMOKE_TERMINAL_ANSWER_DIR="${SMOKE_TERMINAL_ANSWER_DIR:-/sandbox/.manyforge/terminal-answers}"
@@ -24,9 +24,15 @@ case "${MODE}" in
     direct|mux|all) ;;
     *)
         echo "Usage: $0 [direct|mux|all]" >&2
+        echo "mux/all are legacy diagnostic modes and require MANYFORGE_ENABLE_LEGACY_MUX_PROVIDER=true" >&2
         exit 1
         ;;
 esac
+if [[ "${MODE}" != "direct" && "${MANYFORGE_ENABLE_LEGACY_MUX_PROVIDER:-false}" != "true" ]]; then
+    echo "ERROR: ${MODE} includes the legacy mux diagnostic path." >&2
+    echo "Set MANYFORGE_ENABLE_LEGACY_MUX_PROVIDER=true to run it intentionally." >&2
+    exit 1
+fi
 
 load_thor_runtime_config ""
 SANDBOX_NAME="${THOR_MANAGED_SANDBOX_NAME:-thor-v5}"
@@ -245,11 +251,9 @@ mux_smoke() {
     CURRENT_PHASE="mux"
     header "ManyForge Mux Smoke"
     if [[ "${SMOKE_PLUGIN_DEPLOY_MODE}" == "latest" ]]; then
-        MANYFORGE_ENABLE_LEGACY_MUX_PROVIDER=true \
-            "${SCRIPT_DIR}/configure-manyforge-provider.sh" >/dev/null
+        "${SCRIPT_DIR}/configure-manyforge-provider.sh" >/dev/null
     else
-        MANYFORGE_ENABLE_LEGACY_MUX_PROVIDER=true \
-            "${SCRIPT_DIR}/configure-manyforge-provider.sh" --use-current-artifact >/dev/null
+        "${SCRIPT_DIR}/configure-manyforge-provider.sh" --use-current-artifact >/dev/null
     fi
     RESTORE_MODE="true"
     load_thor_runtime_config ""

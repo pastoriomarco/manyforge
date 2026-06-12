@@ -41,7 +41,7 @@
 // map, reparenting updates parentJoint, and add*Geometry passes Pinocchio's
 // JointIndex/FrameIndex arguments in the current order. This adapter therefore
 // uses RoboPlan's direct scene APIs again and keeps object_states_ only as the
-// semantic ManyForge view exposed to the Composer/HMI layers.
+// semantic ManyForge view exposed to the Composer/native-viewer layers.
 // ----------------------------------------------------------------------------
 
 namespace manyforge::roboplan_backend {

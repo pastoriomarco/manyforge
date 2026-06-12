@@ -7,6 +7,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
 import math
+import threading
 import time
 from typing import Any, Deque, Dict, List, Optional
 
@@ -199,6 +200,9 @@ class ObjectState:
 class CommandResult:
     accepted: bool = False
     error: Optional[str] = None
+    # Stable fault token from the backend fault taxonomy; None when accepted
+    # or when the rejecting surface has no classified cause.
+    reason_code: Optional[str] = None
 
 
 @dataclass
@@ -306,6 +310,8 @@ class GripperCommandStatus:
     current_position: Optional[float] = None
     target_position: Optional[float] = None
     error: Optional[str] = None
+    # Stable fault token from the backend fault taxonomy; None unless FAILED.
+    reason_code: Optional[str] = None
 
 
 def _pose_to_matrix(pos: List[float], orient_xyzw: List[float]) -> List[List[float]]:
@@ -547,7 +553,7 @@ class KernelClient(ABC):
     def set_runtime_velocity_scale(
         self, scale: float, principal_id: str | None = None
     ) -> None:
-        """Forward the HMI runtime velocity-scale control to the kernel.
+        """Forward the viewer runtime velocity-scale control to the kernel.
 
         ADR-0018: this is a live execution control, not a behavior-tree
         parameter override. Implementations clamp finite values to [0, 1] and
@@ -776,6 +782,11 @@ class MockKernelClient(KernelClient):
         self.fail_next_gripper_command = False
         self._gripper_commands: Dict[str, Dict[str, Any]] = {}
         self._gripper_positions: Dict[str, float] = {}
+        # Gripper command/position state is mutated by the executing tree and
+        # read by status polls (and test threads injecting failures). RLock:
+        # command_gripper re-enters via update_gripper_commands/
+        # get_gripper_status.
+        self._gripper_lock = threading.RLock()
         # Kernel event buffer (mirrors C++ KernelEventCollector)
         self._kernel_events: Deque[Dict[str, Any]] = deque(maxlen=4096)
 
@@ -1588,78 +1599,86 @@ class MockKernelClient(KernelClient):
         )
 
     def command_gripper(self, request: GripperCommandRequest) -> CommandResult:
-        self.gripper_command_count += 1
-        self.last_gripper_command_request = request
-        if self.fail_next_gripper_command:
-            self.fail_next_gripper_command = False
-            return CommandResult(accepted=False, error="Gripper command failed (injected)")
-
-        self.update_gripper_commands()
-        current_status = self.get_gripper_status(request.gripper_id)
-        if current_status.state == GripperCommandState.EXECUTING:
-            return CommandResult(
+        with self._gripper_lock:
+            self.gripper_command_count += 1
+            self.last_gripper_command_request = request
+            if self.fail_next_gripper_command:
+                self.fail_next_gripper_command = False
+                return CommandResult(
                 accepted=False,
-                error=f"Gripper '{request.gripper_id}' is already executing a command",
+                error="Gripper command failed (injected)",
+                reason_code="gripper_goal_rejected",
             )
 
-        current_position = current_status.current_position
-        if current_position is None:
-            current_position = self._gripper_positions.get(request.gripper_id, 0.0)
-        if request.duration_s <= 0.0:
-            self._gripper_positions[request.gripper_id] = request.target_position
+            self.update_gripper_commands()
+            current_status = self.get_gripper_status(request.gripper_id)
+            if current_status.state == GripperCommandState.EXECUTING:
+                return CommandResult(
+                    accepted=False,
+                    error=f"Gripper '{request.gripper_id}' is already executing a command",
+                    reason_code="gripper_busy",
+                )
+
+            current_position = current_status.current_position
+            if current_position is None:
+                current_position = self._gripper_positions.get(request.gripper_id, 0.0)
+            if request.duration_s <= 0.0:
+                self._gripper_positions[request.gripper_id] = request.target_position
+                self._gripper_commands[request.gripper_id] = {
+                    "state": GripperCommandState.COMPLETED,
+                    "current_position": request.target_position,
+                    "target_position": request.target_position,
+                    "progress": 1.0,
+                    "error": None,
+                }
+                return CommandResult(accepted=True)
+
             self._gripper_commands[request.gripper_id] = {
-                "state": GripperCommandState.COMPLETED,
-                "current_position": request.target_position,
+                "state": GripperCommandState.EXECUTING,
+                "group_id": request.group_id,
+                "joint_name": request.joint_name,
+                "start_position": current_position,
+                "current_position": current_position,
                 "target_position": request.target_position,
-                "progress": 1.0,
+                "duration_s": request.duration_s,
+                "start_time": time.monotonic(),
+                "progress": 0.0,
                 "error": None,
             }
             return CommandResult(accepted=True)
 
-        self._gripper_commands[request.gripper_id] = {
-            "state": GripperCommandState.EXECUTING,
-            "group_id": request.group_id,
-            "joint_name": request.joint_name,
-            "start_position": current_position,
-            "current_position": current_position,
-            "target_position": request.target_position,
-            "duration_s": request.duration_s,
-            "start_time": time.monotonic(),
-            "progress": 0.0,
-            "error": None,
-        }
-        return CommandResult(accepted=True)
-
     def update_gripper_commands(self) -> None:
-        for gripper_id in list(self._gripper_commands):
-            status = self._compute_gripper_status(gripper_id)
-            command = self._gripper_commands.get(gripper_id)
-            if command is None:
-                continue
-            command["state"] = status.state
-            command["current_position"] = status.current_position
-            command["progress"] = status.progress
-            if status.state == GripperCommandState.COMPLETED:
-                self._gripper_positions[gripper_id] = (
-                    float(status.current_position)
-                    if status.current_position is not None
-                    else self._gripper_positions.get(gripper_id, 0.0)
-                )
+        with self._gripper_lock:
+            for gripper_id in list(self._gripper_commands):
+                status = self._compute_gripper_status(gripper_id)
+                command = self._gripper_commands.get(gripper_id)
+                if command is None:
+                    continue
+                command["state"] = status.state
+                command["current_position"] = status.current_position
+                command["progress"] = status.progress
+                if status.state == GripperCommandState.COMPLETED:
+                    self._gripper_positions[gripper_id] = (
+                        float(status.current_position)
+                        if status.current_position is not None
+                        else self._gripper_positions.get(gripper_id, 0.0)
+                    )
 
     def get_gripper_status(self, gripper_id: str) -> GripperCommandStatus:
-        command = self._gripper_commands.get(gripper_id)
-        if command is None:
-            return GripperCommandStatus(
-                state=GripperCommandState.IDLE,
-                gripper_id=gripper_id,
-                current_position=self._gripper_positions.get(gripper_id),
-            )
+        with self._gripper_lock:
+            command = self._gripper_commands.get(gripper_id)
+            if command is None:
+                return GripperCommandStatus(
+                    state=GripperCommandState.IDLE,
+                    gripper_id=gripper_id,
+                    current_position=self._gripper_positions.get(gripper_id),
+                )
 
-        return GripperCommandStatus(
-            state=command["state"],
-            gripper_id=gripper_id,
-            progress=float(command.get("progress", 0.0)),
-            current_position=command.get("current_position"),
-            target_position=command.get("target_position"),
-            error=command.get("error"),
-        )
+            return GripperCommandStatus(
+                state=command["state"],
+                gripper_id=gripper_id,
+                progress=float(command.get("progress", 0.0)),
+                current_position=command.get("current_position"),
+                target_position=command.get("target_position"),
+                error=command.get("error"),
+            )

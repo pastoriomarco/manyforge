@@ -266,8 +266,42 @@ class TestMoveManipulatorAction:
         assert status == py_trees.common.Status.SUCCESS
         assert calls == [
             {
-                "object_ids": ["graspable"],
+                "object_ids": [],
                 "reason": "motion_node:test_relative_move_apply_source",
+            }
+        ]
+
+    def test_pose_goal_applies_all_pose_sources_before_planning(self, kernel, bb_with_kernel):
+        calls = []
+
+        def apply_pose_source(**kwargs):
+            calls.append(kwargs)
+            return {"success": True}
+
+        client = py_trees.blackboard.Client(name="pose_source_pose_goal_setup")
+        client.register_key(
+            key="pose_source_apply_callback",
+            access=py_trees.common.Access.WRITE,
+        )
+        client.pose_source_apply_callback = apply_pose_source
+
+        node = MoveManipulatorAction(
+            name="test_pose_goal_apply_source",
+            move_id="m_pose_source",
+            motion_type="pose_goal",
+            pose_goal={
+                "position_m": [0.1, 0.2, 0.3],
+                "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+            },
+        )
+
+        status = _tick_node(node)
+
+        assert status == py_trees.common.Status.SUCCESS
+        assert calls == [
+            {
+                "object_ids": [],
+                "reason": "motion_node:test_pose_goal_apply_source",
             }
         ]
 
@@ -1259,6 +1293,67 @@ class TestCommandGripper:
             status = node.update()
 
         assert status == py_trees.common.Status.SUCCESS
+
+
+    def test_command_gripper_failure_records_structured_fault(self, kernel, bb_with_kernel):
+        writer = py_trees.blackboard.Client(name="gripper_setup")
+        writer.register_key(key="gripper_configs", access=py_trees.common.Access.WRITE)
+        writer.gripper_configs = {
+            "primary": {
+                "command_mode": "simulated_joint",
+                "group_id": "gripper",
+                "joint_name": "finger_joint",
+                "motion_time_s": 0.02,
+            }
+        }
+        kernel.fail_next_gripper_command = True
+
+        node = CommandGripper(
+            name="move_gripper",
+            gripper_id="primary",
+            position=0.7,
+            timeout_s=1.0,
+        )
+        node.setup()
+        node.initialise()
+
+        assert node.update() == py_trees.common.Status.FAILURE
+
+        reader = py_trees.blackboard.Client(name="gripper_fault_reader")
+        reader.register_key(
+            key="gripper_fault_details", access=py_trees.common.Access.READ
+        )
+        details = reader.get("gripper_fault_details")
+        assert isinstance(details, dict)
+        assert details["reason_code"] == "gripper_goal_rejected"
+        assert details["gripper_id"] == "primary"
+        assert details["surface"] == "command_gripper"
+        assert "injected" in details["message"]
+
+        # A fresh command must clear the stale fault record.
+        node.initialise()
+        assert reader.get("gripper_fault_details") is None
+
+    def test_command_gripper_unclassified_failure_records_nothing(self, kernel, bb_with_kernel):
+        writer = py_trees.blackboard.Client(name="gripper_setup")
+        writer.register_key(key="gripper_configs", access=py_trees.common.Access.WRITE)
+        writer.gripper_configs = {}
+
+        node = CommandGripper(
+            name="move_gripper",
+            gripper_id="missing",
+            position=0.7,
+        )
+        node.setup()
+        node.initialise()
+
+        assert node.update() == py_trees.common.Status.FAILURE
+
+        reader = py_trees.blackboard.Client(name="gripper_fault_reader_2")
+        reader.register_key(
+            key="gripper_fault_details", access=py_trees.common.Access.READ
+        )
+        assert reader.get("gripper_fault_details") is None
 
     def test_command_gripper_zero_timeout_disables_timeout(self, kernel, bb_with_kernel):
         writer = py_trees.blackboard.Client(name="gripper_setup")

@@ -43,9 +43,8 @@ from fastapi.responses import JSONResponse
 # Falls back to the local copies below when NemoClaw-Thor isn't on the
 # host (production deploys that ship only dev_ws/ keep working).
 #
-# Open question Q1 of the plan resolves to: keep the bridge in
-# dev_ws/manyforge/ per the manyforge_specs cross-workspace convention
-# (``manyforge/manyforge_assistant_bridge/``), but cross-repo import the
+# The bridge lives in this repo (``manyforge/manyforge_assistant_bridge/``)
+# per the cross-workspace layout convention, but cross-repo imports the
 # shared package. This eliminates the documented projection mirror
 # without moving any files.
 _MANYFORGE_THOR_ROOT = os.environ.get(

@@ -180,19 +180,19 @@ class BuildSceneSelectionContextNode(BlackboardOutputMixin, py_trees.behaviour.B
 
         image_context: dict[str, Any] = {
             "source": self._image_source,
-            "role": "auxiliary" if self._image_source == "hmi_snapshot" else "none",
+            "role": "auxiliary" if self._image_source == "viewer_snapshot" else "none",
             "is_canonical_view": False,
             "view_semantics": (
-                "current_hmi_view_may_be_user_controlled"
-                if self._image_source == "hmi_snapshot"
+                "current_viewer_may_be_user_controlled"
+                if self._image_source == "viewer_snapshot"
                 else "no_image_used"
             ),
         }
-        if self._image_source == "hmi_snapshot":
+        if self._image_source == "viewer_snapshot":
             provider = self._scene_snapshot_provider
             if provider is None:
                 self.feedback_message = (
-                    "image_source=hmi_snapshot requested but no scene snapshot provider is configured"
+                    "image_source=viewer_snapshot requested but no scene snapshot provider is configured"
                 )
                 self._write_failure_response(
                     selection_request_text=selection_request_text,

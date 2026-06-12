@@ -4,13 +4,18 @@ set -e
 # Add Python packages to PYTHONPATH
 # manyforge_behavior lives at /workspace/manyforge_behavior/manyforge_behavior/
 # manyforge_ros lives at /workspace/manyforge_ros/manyforge_ros/
-# manyforge_hmi lives at /workspace/manyforge_hmi/ (flat layout)
 # manyforge_composer lives at /workspace/manyforge_composer/ (flat layout)
 export PYTHONPATH="/workspace/manyforge_ros:/workspace/manyforge_behavior:/workspace:${PYTHONPATH:-}"
 
 # Use container-specific build directories (avoids cmake cache conflicts
 # when the same source tree is also built on the host)
 export MANYFORGE_BUILD_DIR="/tmp/manyforge-build"
+
+# Keep bytecode caches out of the bind-mounted workspace: container
+# processes run as root and root-owned __pycache__ dirs break host-side
+# tooling. The prefix keeps the bytecode-cache speedup on a container path.
+export PYTHONPYCACHEPREFIX="/tmp/manyforge-pycache"
+
 
 # Fix ownership if the build-cache volume was created by an older root-based
 # image.  The Dockerfile now runs as uid 1000 (manyforge), but Docker named

@@ -2056,6 +2056,9 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
             if (!result.error.empty()) {
               d["error"] = result.error;
             }
+            if (!result.reason_code.empty()) {
+              d["reason_code"] = result.reason_code;
+            }
             return d;
           },
           py::arg("gripper_id"), py::arg("target_position"),
@@ -2105,6 +2108,9 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
             }
             if (!status.error.empty()) {
               d["error"] = status.error;
+            }
+            if (!status.reason_code.empty()) {
+              d["reason_code"] = status.reason_code;
             }
             return d;
           },
@@ -2496,7 +2502,7 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
       "Compare legacy RoboPlan and ManyForge collision engines for positions.")
       .def("get_cached_trajectory", [](NativeKernelBundle& self,
                                        const std::string& move_id) -> py::object {
-        auto cached = self.cache->lookup(move_id);
+        auto cached = self.cache->peek_unvalidated(move_id);
         if (!cached.has_value() || cached->waypoints.empty()) {
           return py::none();
         }

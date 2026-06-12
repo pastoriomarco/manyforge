@@ -12,7 +12,7 @@ import type { CycleStatus } from '../types/api';
  * `detail.{message, errorCode, errorDetails}` response. Other Error types
  * carry only a message; the structured fields fall back to null. This is
  * needed because the cycle store's run/stop/reset/setVelocityScale catch
- * blocks would otherwise discard the structured cause and force the HMI
+ * blocks would otherwise discard the structured cause and force the viewer
  * KernelErrorPanel to render its generic-banner fallback.
  */
 function structuredErrorFromException(e: unknown): {
@@ -109,7 +109,7 @@ interface CycleStore {
   programLoaded: boolean;
   programSessionGeneration: number;
   error: string | null;
-  // Structured cause from the cycle manager / kernel ErrorDTO so the HMI
+  // Structured cause from the cycle manager / kernel ErrorDTO so the viewer
   // can render the KernelErrorPanel without a separate /api/cycle/status
   // poll. Updated from the same WebSocket push as `error`.
   errorCode: string | null;

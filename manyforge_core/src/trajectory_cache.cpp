@@ -7,12 +7,6 @@ namespace manyforge::core {
 TrajectoryCache::TrajectoryCache(CacheConfig config)
     : config_(config) {}
 
-void TrajectoryCache::store(const std::string& move_id, TrajectoryDTO trajectory) {
-  // Back-compat: store without a revision tag. Use the revision-aware
-  // overload from new callers so cache hits can be gated by revision.
-  store(move_id, std::move(trajectory), CollisionWorldRevision{});
-}
-
 void TrajectoryCache::store(const std::string& move_id, TrajectoryDTO trajectory,
                             CollisionWorldRevision revision) {
   std::lock_guard<std::mutex> lock(mutex_);
@@ -34,7 +28,13 @@ void TrajectoryCache::store(const std::string& move_id, TrajectoryDTO trajectory
   insertion_order_.push_back(move_id);
 }
 
-std::optional<TrajectoryDTO> TrajectoryCache::lookup(const std::string& move_id) const {
+bool TrajectoryCache::contains(const std::string& move_id) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return entries_.find(move_id) != entries_.end();
+}
+
+std::optional<TrajectoryDTO> TrajectoryCache::peek_unvalidated(
+    const std::string& move_id) const {
   std::lock_guard<std::mutex> lock(mutex_);
   auto it = entries_.find(move_id);
   if (it == entries_.end()) {

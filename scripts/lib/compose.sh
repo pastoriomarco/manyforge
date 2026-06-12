@@ -83,9 +83,6 @@ stop_known_conflicts() {
 #
 # Ports are env-overridable:
 #   COMPOSER_PORT (default 9000) — Composer API + UI
-#   HMI_PORT      (default 8081) — legacy Viser HMI, only when
-#                  MANYFORGE_ENABLE_LEGACY_VISER_HMI=true
-#
 # Note: the container runs with --network host, so -p HOST:CONT mappings
 # are no-ops. The override path is to pass the chosen ports as env vars
 # into the container and have the inline Python command read them. The
@@ -96,12 +93,6 @@ stop_known_conflicts() {
 start_composer_dev_container() {
     local container_name="${COMPOSER_CONTAINER:-manyforge-e2e-composer}"
     local composer_port="${COMPOSER_PORT:-9000}"
-    local hmi_port="${HMI_PORT:-8081}"
-    local legacy_hmi_raw="${MANYFORGE_ENABLE_LEGACY_VISER_HMI:-${ENABLE_LEGACY_VISER_HMI:-false}}"
-    local legacy_hmi_enabled=false
-    case "${legacy_hmi_raw,,}" in
-        1|true|yes|on) legacy_hmi_enabled=true ;;
-    esac
     if container_running "${container_name}"; then
         info "Reusing existing ${container_name}"
         return 0
@@ -117,13 +108,7 @@ start_composer_dev_container() {
     if [[ -n "${MANYFORGE_ASSISTANT_TIMEOUT_S:-}" ]]; then
         assistant_env+=(-e "MANYFORGE_ASSISTANT_TIMEOUT_S=${MANYFORGE_ASSISTANT_TIMEOUT_S}")
     fi
-    local hmi_env=(-e "MANYFORGE_ENABLE_LEGACY_VISER_HMI=${legacy_hmi_enabled}")
-    if [[ "${legacy_hmi_enabled}" == "true" ]]; then
-        hmi_env+=(-e "MANYFORGE_HMI_PORT=${hmi_port}")
-        info "Starting ${container_name} (detached dev container) on Composer ${composer_port}, legacy Viser HMI ${hmi_port}"
-    else
-        info "Starting ${container_name} (detached dev container) on Composer ${composer_port}; native viewer is default"
-    fi
+    info "Starting ${container_name} (detached dev container) on Composer ${composer_port}; native viewer is default"
     docker run -d --rm \
         --name "${container_name}" \
         --network host \
@@ -131,16 +116,11 @@ start_composer_dev_container() {
         -v manyforge_build-cache:/tmp/manyforge-build \
         -w /workspace \
         -e MANYFORGE_COMPOSER_PORT="${composer_port}" \
-        "${hmi_env[@]}" \
         -e CTEST_TEST_TIMEOUT_S="${CTEST_TEST_TIMEOUT_S:-60}" \
         "${assistant_env[@]}" \
         manyforge-dev:latest \
         bash -lc '
             set -euo pipefail
-            hmi_args=()
-            if [[ "${MANYFORGE_ENABLE_LEGACY_VISER_HMI:-false}" == "true" ]]; then
-                hmi_args+=(--hmi-port "${MANYFORGE_HMI_PORT:-8081}")
-            fi
             # Build output streams live to docker logs so the launcher
             # wait helper (docker logs --tail 20, then last 3 in the
             # render) can show real progress — cmake compile lines,
@@ -158,7 +138,6 @@ start_composer_dev_container() {
                 --catalog-path /workspace/manyforge_behavior/resources/node_catalog.yaml \
                 --host 0.0.0.0 \
                 --port "${MANYFORGE_COMPOSER_PORT:-9000}" \
-                "${hmi_args[@]}" \
                 --static-dir "${MANYFORGE_FRONTEND_STATIC_DIR}"
         ' >/dev/null
 }

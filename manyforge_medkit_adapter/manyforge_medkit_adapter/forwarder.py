@@ -1,4 +1,4 @@
-"""Fault forwarding decisions for the ros2_medkit adapter (audit Phase 6I).
+"""Fault forwarding decisions for the ros2_medkit adapter.
 
 Pure data-in/data-out: consumes ManyForge execution digests (dicts from
 ``GET /api/execution/digest``) and yields AUTOSAR-DEM-style fault reports
@@ -8,8 +8,8 @@ Pure data-in/data-out: consumes ManyForge execution digests (dicts from
 contract tests run hermetically in any lane.
 
 ManyForge core stays medkit-free: this package depends one-way on
-``manyforge_ros`` (shared fault-code/severity mapping from the Phase 6A
-taxonomy) and on the Composer REST surface.
+``manyforge_ros`` (shared fault-code/severity mapping from the backend
+fault taxonomy) and on the Composer REST surface.
 """
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+from manyforge_behavior.fault_taxonomy import classify_digest_fault
 from manyforge_ros.diagnostics_bridge import external_fault_code, fault_severity
 
 # ros2_medkit_msgs/srv/ReportFault event types and Fault severities (pinned
@@ -67,26 +68,15 @@ class FaultForwarder:
     ) -> list[FaultReport]:
         if digest is None:
             # Composer unreachable: no state change. Reachability itself is
-            # surfaced by the 6H diagnostics bridge, not invented here.
+            # surfaced by the diagnostics bridge, not invented here.
             return []
 
-        error_message = digest.get("error")
-        error_details = digest.get("errorDetails") or digest.get("error_details") or {}
-        error_code = digest.get("errorCode") or digest.get("error_code")
-        reason_code = None
-        if isinstance(error_details, dict):
-            reason_code = error_details.get("reason_code")
-        if reason_code is None and isinstance(error_code, str) and error_code:
-            reason_code = error_code
-
-        state = str(digest.get("state") or "").lower()
-        fault_active = bool(error_message) and bool(reason_code) and state not in (
-            "running",
-            "idle",
-        )
+        fault = classify_digest_fault(digest)
+        error_message = fault.message
+        reason_code = fault.reason_code
 
         reports: list[FaultReport] = []
-        if fault_active:
+        if fault.active:
             fault_code = external_fault_code(str(reason_code))
             # A re-latching fault cancels its healing stream.
             self._healing.pop(fault_code, None)

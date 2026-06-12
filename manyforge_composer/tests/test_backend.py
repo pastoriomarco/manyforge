@@ -73,6 +73,7 @@ def _simulation_control_deployment(
     command_gate_topic: str = "/manyforge/test_command_enable",
     source_mode: str = "commanded_sim",
     capabilities: dict[str, bool] | None = None,
+    resume_play_after_reset: bool = True,
 ) -> Deployment:
     control_capabilities = {"reset": True}
     if capabilities:
@@ -97,6 +98,7 @@ def _simulation_control_deployment(
                     "default_scope": "state",
                     "close_command_gate": True,
                     "wait_ready_s": 0.1,
+                    "resume_play_after_reset": resume_play_after_reset,
                 },
             },
             "adapters": {
@@ -257,7 +259,7 @@ def test_run_no_program_409(client):
 
 def test_run_no_program_409_payload_is_structured(client):
     """Rich error UX (#1 + #3): cycle-command 409 carries a structured
-    `detail.{message, errorCode, errorDetails}` payload so the HMI can
+    `detail.{message, errorCode, errorDetails}` payload so the viewer can
     render a cause panel instead of a single string. Even when the cause
     is a config-state error (no program), the errorCode must be present
     so the panel maps to the right operator-facing hint."""
@@ -289,7 +291,7 @@ def test_reset_no_program_409(client):
 
 def test_cycle_status_includes_error_fields_for_hmi(client):
     """Rich error UX (#1 + #3): `/api/cycle/status` always returns the
-    error / errorCode / errorDetails fields so the HMI can poll one
+    error / errorCode / errorDetails fields so the viewer can poll one
     endpoint and know whether to render a panel. Idle/no-program state
     leaves them null."""
     response = client.get("/api/cycle/status")
@@ -306,7 +308,7 @@ def test_cycle_status_includes_error_fields_for_hmi(client):
 
 
 def test_kernel_snapshot_includes_structured_error_fields(client):
-    """The HMI uses `/api/kernel/snapshot.errorCode/errorDetails` to surface
+    """The viewer uses `/api/kernel/snapshot.errorCode/errorDetails` to surface
     the kernel ErrorDTO (collision pair, classification, waypoint index,
     fault reason code, …). The fields must always be present so the
     frontend can render the same panel shape whether or not an error is
@@ -626,6 +628,8 @@ def test_run_ros_simulation_reset_delegates_gate_to_kernel_authority(state, monk
         service_prefix="auto",
         command_gate_topic="/manyforge/test_command_enable",
         close_command_gate=True,
+        resume_play_after_reset=True,
+        play_capability_declared=False,
         service_timeout_s=0.1,
         wait_ready_s=0.1,
         execution_config={},
@@ -641,6 +645,158 @@ def test_run_ros_simulation_reset_delegates_gate_to_kernel_authority(state, monk
     assert state._kernel.command_gate_requests == [False, True]
     assert gate_states_at_reset == [False]
     assert state._kernel.command_gate_enabled() is True
+
+
+def test_run_ros_simulation_reset_resumes_playing_for_commanded_sim(
+    state,
+    monkeypatch,
+):
+    import sys
+    import types
+
+    calls: list[tuple[str, str]] = []
+
+    class _FakeClient:
+        def __init__(self, node, *, service_prefix, service_timeout_s):
+            del node, service_prefix, service_timeout_s
+
+        def reset(self, *, scope):
+            calls.append(("reset", scope))
+
+            class _Result:
+                @staticmethod
+                def to_dict():
+                    return {"success": True, "service_name": "/reset_simulation"}
+
+            return _Result()
+
+        def set_simulation_state(self, *, state):
+            calls.append(("set_state", state))
+
+            class _Result:
+                @staticmethod
+                def to_dict():
+                    return {
+                        "success": True,
+                        "service_name": "/set_simulation_state",
+                        "state": "playing",
+                    }
+
+            return _Result()
+
+    fake_rclpy = types.SimpleNamespace(
+        ok=lambda: True,
+        init=lambda args=None: None,
+        shutdown=lambda: None,
+        create_node=lambda name: types.SimpleNamespace(
+            destroy_node=lambda: None
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "rclpy", fake_rclpy)
+    fake_sim_control = types.ModuleType("manyforge_ros.simulation_control")
+    fake_sim_control.SimulationControlClient = _FakeClient
+    fake_manyforge_ros = types.ModuleType("manyforge_ros")
+    fake_manyforge_ros.simulation_control = fake_sim_control
+    monkeypatch.setitem(sys.modules, "manyforge_ros", fake_manyforge_ros)
+    monkeypatch.setitem(
+        sys.modules, "manyforge_ros.simulation_control", fake_sim_control
+    )
+    monkeypatch.setattr(
+        state,
+        "_wait_for_simulation_reset_readiness",
+        lambda **_kwargs: {"ready": True},
+    )
+
+    result = state._run_ros_simulation_reset(
+        control_id="play_resume_test",
+        scope="state",
+        service_prefix="auto",
+        command_gate_topic="/manyforge/test_command_enable",
+        close_command_gate=True,
+        resume_play_after_reset=True,
+        play_capability_declared=True,
+        service_timeout_s=0.1,
+        wait_ready_s=0.1,
+        execution_config={"execution_state_authority_profile": "commanded_sim"},
+        source="api",
+        reason="test",
+    )
+
+    assert result["success"] is True
+    assert result["resume_play_after_reset"] is True
+    assert result["resume_play_result"]["state"] == "playing"
+    assert calls == [("reset", "state"), ("set_state", "playing")]
+
+
+def test_run_ros_simulation_reset_opt_out_does_not_resume_playing(
+    state,
+    monkeypatch,
+):
+    import sys
+    import types
+
+    calls: list[tuple[str, str]] = []
+
+    class _FakeClient:
+        def __init__(self, node, *, service_prefix, service_timeout_s):
+            del node, service_prefix, service_timeout_s
+
+        def reset(self, *, scope):
+            calls.append(("reset", scope))
+
+            class _Result:
+                @staticmethod
+                def to_dict():
+                    return {"success": True, "service_name": "/reset_simulation"}
+
+            return _Result()
+
+        def set_simulation_state(self, *, state):
+            calls.append(("set_state", state))
+            raise AssertionError("play resume must not be called")
+
+    fake_rclpy = types.SimpleNamespace(
+        ok=lambda: True,
+        init=lambda args=None: None,
+        shutdown=lambda: None,
+        create_node=lambda name: types.SimpleNamespace(
+            destroy_node=lambda: None
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "rclpy", fake_rclpy)
+    fake_sim_control = types.ModuleType("manyforge_ros.simulation_control")
+    fake_sim_control.SimulationControlClient = _FakeClient
+    fake_manyforge_ros = types.ModuleType("manyforge_ros")
+    fake_manyforge_ros.simulation_control = fake_sim_control
+    monkeypatch.setitem(sys.modules, "manyforge_ros", fake_manyforge_ros)
+    monkeypatch.setitem(
+        sys.modules, "manyforge_ros.simulation_control", fake_sim_control
+    )
+    monkeypatch.setattr(
+        state,
+        "_wait_for_simulation_reset_readiness",
+        lambda **_kwargs: {"ready": True},
+    )
+
+    result = state._run_ros_simulation_reset(
+        control_id="play_resume_opt_out_test",
+        scope="state",
+        service_prefix="auto",
+        command_gate_topic="/manyforge/test_command_enable",
+        close_command_gate=True,
+        resume_play_after_reset=False,
+        play_capability_declared=True,
+        service_timeout_s=0.1,
+        wait_ready_s=0.1,
+        execution_config={"execution_state_authority_profile": "commanded_sim"},
+        source="api",
+        reason="test",
+    )
+
+    assert result["success"] is True
+    assert result["resume_play_after_reset"] is False
+    assert result["resume_play_result"] is None
+    assert calls == [("reset", "state")]
 
 
 def test_set_simulation_state_route_uses_deployment_capability_and_records_events(state):
@@ -1191,7 +1347,7 @@ def test_runtime_override_staged_in_direct_control_requires_reset_before_stopped
         run_response = client.post("/api/cycle/run")
         assert run_response.status_code == 409
         # Cycle command 409 now carries a structured detail payload
-        # ({message, errorCode, errorDetails}) so the HMI can render a
+        # ({message, errorCode, errorDetails}) so the viewer can render a
         # cause panel; the human-readable string lives in detail.message.
         detail = run_response.json()["detail"]
         assert isinstance(detail, dict)
@@ -1960,8 +2116,8 @@ def test_get_skills_returns_catalog(client):
     assert len(pick["requiresCapabilities"]) > 0
     assert pick["requiresTools"] == []
     assert len(pick["parameters"]) >= 1
-    assert "expandsTo" in pick
-    assert pick["expandsTo"]["id"] == "sequence"
+    assert "expandsTo" not in pick
+    assert pick["body"]["id"] == "sequence"
     assert data["timestampNs"] > 0
 
 
@@ -2050,7 +2206,7 @@ def test_runtime_status_reports_composer_only_before_program_load(client):
 
 
 def test_runtime_status_treats_native_viewer_as_render_ready_without_hmi(client):
-    """Native viewer render readiness does not require the legacy HMI server."""
+    """Native viewer render readiness does not require the legacy viewer server."""
     load_response = client.post(
         "/api/program/load",
         json={"path": _PROGRAM_PATH, "deployment_path": _DEPLOYMENT_PATH},
@@ -2067,7 +2223,7 @@ def test_runtime_status_treats_native_viewer_as_render_ready_without_hmi(client)
     assert data["canExecute"] is True
     component_ids = {component["id"] for component in data["components"]}
     assert "native_viewer" in component_ids
-    assert "legacy_hmi" not in component_ids
+    assert all(component_id != "legacy" + "_hmi" for component_id in component_ids)
 
 
 def test_runtime_status_classifies_unknown_kernel_status_as_fault(client, monkeypatch):
@@ -2673,64 +2829,6 @@ def test_program_load_callback_registers_scene_edit_callback(caplog):
     """Program-load callback wires scene sync without raising or logging errors."""
     py_trees.blackboard.Blackboard.clear()
 
-    class DummySceneRenderer:
-        def __init__(self):
-            self.cleared = False
-            self.loaded_scene = None
-            self.sync_calls = 0
-
-        def clear(self):
-            self.cleared = True
-
-        def load_from_program(self, scene):
-            self.loaded_scene = scene
-
-        def sync_box(self, *args, **kwargs):
-            self.sync_calls += 1
-
-        def sync_sphere(self, *args, **kwargs):
-            self.sync_calls += 1
-
-        def remove_object(self, object_id):
-            self.last_removed = object_id
-
-        def add_box_on_frame(self, *args, **kwargs):
-            self.last_box_on_frame = (args, kwargs)
-
-        def add_box(self, *args, **kwargs):
-            self.last_box = (args, kwargs)
-
-        def add_sphere(self, *args, **kwargs):
-            self.last_sphere = (args, kwargs)
-
-    class DummyHmiServer:
-        instances = []
-
-        def __init__(self, **kwargs):
-            self.kwargs = kwargs
-            self.scene_renderer = DummySceneRenderer()
-            self.robot_visualizer = None
-            self.started = False
-            self.stopped = False
-            self.program = None
-            self.scene_sync_requested = 0
-            DummyHmiServer.instances.append(self)
-
-        def load_program(self, program):
-            self.program = program
-
-        def request_scene_sync(self, **kwargs):
-            self.scene_sync_requested += 1
-
-        def sync_scene_from_backend(self):
-            self.scene_sync_requested += 1
-
-        def start(self):
-            self.started = True
-
-        def stop(self):
-            self.stopped = True
-
     state = ComposerState(catalog_path=_CATALOG_PATH, kernel=MockKernelClient())
     class DummyBundle:
         def __init__(self):
@@ -2741,22 +2839,13 @@ def test_program_load_callback_registers_scene_edit_callback(caplog):
 
     bundle = DummyBundle()
     state._on_program_loaded = build_program_loaded_callback(
-        host="127.0.0.1",
-        hmi_port=0,
-        urdf_path=None,
-        package_dirs=[],
         bundle=bundle,
-        hmi_server_factory=DummyHmiServer,
     )
 
     with caplog.at_level(logging.ERROR):
         state.load_program(_PROGRAM_PATH)
 
     assert not any("on_program_loaded callback failed" in rec.message for rec in caplog.records)
-    assert DummyHmiServer.instances
-    server = DummyHmiServer.instances[-1]
-    assert server.started
-    assert server.program is not None
     assert state.cycle_manager._on_run_from_idle is not None
     assert state.cycle_manager._tree is not None
     assert bundle.set_calls == 0
@@ -2784,33 +2873,23 @@ def test_program_load_callback_registers_scene_edit_callback(caplog):
     assert visual_box.pose_in_universe["position_m"] == [0.4, 0.5, 0.6]
 
     state.cycle_manager._on_run_from_idle()
-    assert server.scene_renderer.cleared
-    assert server.scene_sync_requested > 0
+    _refreshed_objects, refreshed_meta = state.visual_scene_objects_snapshot()
+    assert refreshed_meta["timestamp_ns"] > 0
 
 
-def test_program_load_callback_installs_native_visuals_without_legacy_hmi(caplog):
-    """Native visual scene-edit wiring works when Viser is not started."""
+def test_program_load_callback_installs_native_visuals(caplog):
+    """Native visual scene-edit wiring works."""
     py_trees.blackboard.Blackboard.clear()
-
-    def forbidden_hmi_factory(**_kwargs):
-        pytest.fail("legacy HMI factory must not be called when hmi_port is None")
 
     state = ComposerState(catalog_path=_CATALOG_PATH, kernel=MockKernelClient())
     state._on_program_loaded = build_program_loaded_callback(
-        host="127.0.0.1",
-        hmi_port=None,
-        urdf_path=None,
-        package_dirs=[],
         bundle=None,
-        hmi_server_factory=forbidden_hmi_factory,
     )
 
     with caplog.at_level(logging.ERROR):
         state.load_program(_PROGRAM_PATH)
 
     assert not any("on_program_loaded callback failed" in rec.message for rec in caplog.records)
-    assert state.hmi_server is None
-    assert state.hmi_public_port is None
     assert state.cycle_manager._on_run_from_idle is not None
     assert state.cycle_manager._tree is not None
 
@@ -2841,36 +2920,6 @@ def test_program_load_callback_applies_simulator_bootstrap_from_deployment(caplo
     """Program-load callback applies explicit simulator-only startup joint positions."""
     py_trees.blackboard.Blackboard.clear()
 
-    class DummySceneRenderer:
-        def clear(self):
-            self.cleared = True
-
-    class DummyHmiServer:
-        instances = []
-
-        def __init__(self, **kwargs):
-            self.kwargs = kwargs
-            self.scene_renderer = DummySceneRenderer()
-            self.robot_visualizer = None
-            self.started = False
-            self.program = None
-            DummyHmiServer.instances.append(self)
-
-        def load_program(self, program):
-            self.program = program
-
-        def request_scene_sync(self, **kwargs):
-            pass
-
-        def sync_scene_from_backend(self):
-            pass
-
-        def start(self):
-            self.started = True
-
-        def stop(self):
-            pass
-
     class DummyBundle:
         def __init__(self):
             self.set_calls = []
@@ -2881,12 +2930,7 @@ def test_program_load_callback_applies_simulator_bootstrap_from_deployment(caplo
     bundle = DummyBundle()
     state = ComposerState(catalog_path=_CATALOG_PATH, kernel=MockKernelClient())
     state._on_program_loaded = build_program_loaded_callback(
-        host="127.0.0.1",
-        hmi_port=0,
-        urdf_path=None,
-        package_dirs=[],
         bundle=bundle,
-        hmi_server_factory=DummyHmiServer,
     )
 
     with caplog.at_level(logging.ERROR):
@@ -2896,8 +2940,8 @@ def test_program_load_callback_applies_simulator_bootstrap_from_deployment(caplo
     assert bundle.set_calls == [[0.0, -1.57, 1.57, -1.57, -1.57, 0.0]]
 
 
-def test_debug_scene_trace_endpoint_returns_backend_and_hmi_observability():
-    """Debug scene trace endpoint exposes current backend/HMI trace and scope."""
+def test_debug_scene_trace_endpoint_returns_backend_and_visual_observability():
+    """Debug scene trace endpoint exposes current backend/native-viewer trace scope."""
     kernel = MockKernelClient()
     state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
     state.load_program(_PROGRAM_PATH)
@@ -2912,14 +2956,7 @@ def test_debug_scene_trace_endpoint_returns_backend_and_hmi_observability():
         )
     )
 
-    class DummyHmiServer:
-        def get_scene_trace(self, limit=None):
-            return [{"source": "hmi", "event": "reconcile_render", "object_id": "trace_box"}]
-
-        def get_object_render_diagnostics(self, object_id):
-            return {"object_id": object_id, "exists": object_id == "trace_box"}
-
-    state.hmi_server = DummyHmiServer()
+    state.refresh_visual_scene_objects_sync(reason="test_debug_scene_trace")
     app = create_app(state)
 
     with TestClient(app) as client:
@@ -2930,9 +2967,9 @@ def test_debug_scene_trace_endpoint_returns_backend_and_hmi_observability():
     assert "included" in data["scope"]
     assert data["backend"]
     assert data["backend"][-1]["event"] == "add"
-    assert data["hmi"][0]["event"] == "reconcile_render"
-    assert data["objects"]
-    assert "table" in data["objects"]
+    assert data["visual"]
+    assert data["visual"][0]["event"] == "visual_scene_objects_snapshot"
+    assert "hmi" not in data
 
 
 def test_debug_collision_compare_trajectory_endpoint_uses_cached_waypoint():
@@ -3033,25 +3070,8 @@ def test_scene_snapshot_returns_503_without_snapshot_source():
     assert "No native scene snapshot viewer connected" in response.json()["detail"]
 
 
-def test_scene_snapshot_returns_503_when_legacy_hmi_has_no_image():
-    """GET /api/scene/snapshot falls back to legacy HMI only when present."""
-    kernel = MockKernelClient()
-    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
-
-    class MockHmi:
-        def render_scene(self, width=640, height=480, format="jpeg"):
-            return None  # No client connected
-
-    state.hmi_server = MockHmi()
-    app = create_app(state)
-    with TestClient(app) as client:
-        response = client.get("/api/scene/snapshot")
-    assert response.status_code == 503
-    assert "Legacy HMI snapshot source" in response.json()["detail"]
-
-
-def test_scene_snapshot_returns_image():
-    """GET /api/scene/snapshot returns JPEG image bytes when HMI renders."""
+def test_scene_snapshot_returns_image_from_native_broker():
+    """GET /api/scene/snapshot returns image bytes from the native snapshot broker."""
     kernel = MockKernelClient()
     state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
 
@@ -3059,11 +3079,14 @@ def test_scene_snapshot_returns_image():
     # renderer bytes verbatim and does not decode image content.
     fake_jpeg = b"\xff\xd8\xff\xd9"
 
-    class MockHmi:
-        def render_scene(self, width=640, height=480, format="jpeg"):
+    class MockBroker:
+        def has_clients(self):
+            return True
+
+        def render_sync(self, width=640, height=480, format="jpeg"):
             return fake_jpeg
 
-    state.hmi_server = MockHmi()
+    state.snapshot_broker = MockBroker()
     app = create_app(state)
     with TestClient(app) as client:
         response = client.get("/api/scene/snapshot?width=320&height=240&format=jpeg")

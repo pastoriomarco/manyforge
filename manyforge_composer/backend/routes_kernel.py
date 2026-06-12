@@ -18,7 +18,7 @@ def build_kernel_snapshot_payload(state: ComposerState) -> dict[str, Any]:
 
     The error surface exposes both the human-readable `error` message and
     the structured `error_code` / `error_details` map the kernel produces
-    via its ErrorDTO. The HMI uses the structured fields to render a
+    via its ErrorDTO. The viewer uses the structured fields to render a
     cause-specific panel (colliding pair, classification, waypoint index,
     fault reason code, etc.) instead of a generic banner.
     """
@@ -54,7 +54,7 @@ def build_kernel_snapshot_payload(state: ComposerState) -> dict[str, Any]:
     joint_positions = snapshot.joint_positions_rad if snapshot.joint_positions_rad else None
     snapshot_error_details = getattr(snapshot, "error_details", None)
     # The kernel client populates `error_details` as a dict[str, str]; an
-    # empty dict has no diagnostic value to the HMI, so collapse it to None
+    # empty dict has no diagnostic value to the viewer, so collapse it to None
     # so the frontend can fall back to the headline message cleanly.
     if not snapshot_error_details:
         snapshot_error_details = None

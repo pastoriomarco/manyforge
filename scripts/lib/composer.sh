@@ -12,8 +12,6 @@ source "$(dirname "${BASH_SOURCE[0]}")/wait.sh"
 
 COMPOSER_PORT="${COMPOSER_PORT:-9000}"
 COMPOSER_URL="${COMPOSER_URL:-http://127.0.0.1:${COMPOSER_PORT}}"
-HMI_PORT="${HMI_PORT:-8081}"
-HMI_URL="${HMI_URL:-http://127.0.0.1:${HMI_PORT}}"
 
 # HEALTH_TIMEOUT_S → COMPOSER_READY_TIMEOUT_S deprecation bridge.
 # Existing runbooks may set HEALTH_TIMEOUT_S; honour it for one minor
@@ -23,15 +21,6 @@ if [[ -n "${HEALTH_TIMEOUT_S:-}" ]] && [[ -z "${COMPOSER_READY_TIMEOUT_S:-}" ]];
     COMPOSER_READY_TIMEOUT_S="${HEALTH_TIMEOUT_S}"
 fi
 COMPOSER_READY_TIMEOUT_S="${COMPOSER_READY_TIMEOUT_S:-600}"
-HMI_PORT_READY_TIMEOUT_S="${HMI_PORT_READY_TIMEOUT_S:-${HMI_STARTUP_WAIT_S:-30}}"
-
-legacy_viser_hmi_enabled() {
-    local raw="${MANYFORGE_ENABLE_LEGACY_VISER_HMI:-${ENABLE_LEGACY_VISER_HMI:-false}}"
-    case "${raw,,}" in
-        1|true|yes|on) return 0 ;;
-        *) return 1 ;;
-    esac
-}
 
 # composer_ready / composer_logs — function-name handles for wait.sh.
 # composer_logs is lane-aware: the manyforge-only lane runs Composer as a
@@ -55,10 +44,6 @@ composer_logs() {
     esac
 }
 
-hmi_port_ready() {
-    port_is_listening "${HMI_PORT}"
-}
-
 wait_for_composer() {
     local hint="First-run cold-cache builds can take several minutes (C++ + roboplan inside the dev container). Override with COMPOSER_READY_TIMEOUT_S=NN."
     wait_with_progress \
@@ -67,25 +52,6 @@ wait_for_composer() {
         "${hint}" \
         composer_logs \
         composer_ready
-}
-
-wait_for_hmi() {
-    if ! legacy_viser_hmi_enabled; then
-        info "Legacy Viser HMI disabled; native Composer viewer is the active viewer."
-        return 0
-    fi
-    # HMI binds only after a program load, so a slow HMI is not a fatal
-    # condition for `start` — Composer is up, the runtime-status popup
-    # reports the rest. Preserve the historical `return 0` semantics.
-    local hint="HMI binds within ~1-2 s of load_program completing. If this times out, check Composer logs (docker logs ${COMPOSER_CONTAINER:-manyforge-e2e-composer}) for a load failure."
-    wait_with_progress \
-        "Viser HMI on ${HMI_URL}" \
-        "${HMI_PORT_READY_TIMEOUT_S}" \
-        "${hint}" \
-        "" \
-        hmi_port_ready \
-        || warn "Viser HMI port ${HMI_PORT} not listening after ${HMI_PORT_READY_TIMEOUT_S}s — Composer may not have loaded a program yet."
-    return 0
 }
 
 # load_program PROGRAM_PATH DEPLOYMENT_PATH

@@ -555,7 +555,7 @@ class TestRunnerDeployment:
         runner.build_tree()  # Should not raise
 
     def test_query_model_receives_scene_snapshot_provider(self, kernel):
-        """Runner threads the configured HMI render callback into query_model nodes."""
+        """Runner threads the configured native viewer render callback into query_model nodes."""
         catalog = NodeCatalog(CATALOG_PATH)
         program = Program.from_dict(
             {

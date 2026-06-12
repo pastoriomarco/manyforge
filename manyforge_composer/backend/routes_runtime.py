@@ -183,21 +183,6 @@ def build_runtime_status_payload(state: ComposerState) -> dict[str, Any]:
         ),
     ]
 
-    if state.hmi_server is not None:
-        components.append(
-            _component(
-                "legacy_hmi",
-                "Legacy Viser HMI",
-                "hmi",
-                "ready",
-                detail=(
-                    f"Port {state.hmi_public_port}"
-                    if state.hmi_public_port
-                    else "Legacy HMI server running"
-                ),
-            )
-        )
-
     external_statuses = state.external_runtime_statuses(max_age_s=6.0)
     external_ready = True
     external_waiting = False

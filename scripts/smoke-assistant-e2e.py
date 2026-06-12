@@ -301,9 +301,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-e2e", action="store_true")
     parser.add_argument("--skip-negative", action="store_true")
     parser.add_argument(
-        "--require-hmi",
+        "--require-viewer",
         action="store_true",
-        help="Fail operator-flow checks unless Composer reports a healthy HMI/Viser.",
+        help="Fail operator-flow checks unless Composer reports a healthy native viewer.",
     )
     parser.add_argument("--strict", action="store_true")
     parser.add_argument("--output", default="")
@@ -696,14 +696,14 @@ def _operator_composer_flow_case(args: argparse.Namespace, profile_name: str) ->
     try:
         providers = _get_json(f"{args.composer_url}/api/assistant/providers", timeout_s=args.case_timeout_s)
         infra_before = _get_json(f"{args.composer_url}/api/infra/status", timeout_s=args.case_timeout_s)
-        hmi_status = _hmi_status(infra_before)
+        viewer_status = _viewer_status(infra_before)
         validation_errors: list[str] = []
         if providers.get("configuredProviderId") != args.provider_id:
             validation_errors.append(
                 f"configuredProviderId expected {args.provider_id!r}, got {providers.get('configuredProviderId')!r}"
             )
-        if args.require_hmi and hmi_status.get("status") != "healthy":
-            validation_errors.append(f"HMI required but unavailable: {hmi_status}")
+        if args.require_viewer and viewer_status.get("status") != "healthy":
+            validation_errors.append(f"Viewer required but unavailable: {viewer_status}")
 
         data = _post_json(
             f"{args.composer_url}/api/assistant/chat",
@@ -741,13 +741,13 @@ def _operator_composer_flow_case(args: argparse.Namespace, profile_name: str) ->
             )
         )
 
-        diagnostics = _scene_diagnostic_for_object(args, resource["objectId"], hmi_status)
+        diagnostics = _scene_diagnostic_for_object(args, resource["objectId"], viewer_status)
         if diagnostics.get("checked"):
             if not diagnostics.get("present"):
                 validation_errors.append(f"scene diagnostics missing {resource['objectId']}")
-            if diagnostics.get("hmiAvailable") and not diagnostics.get("match"):
+            if diagnostics.get("viewerAvailable") and not diagnostics.get("match"):
                 validation_errors.append(
-                    f"HMI diagnostics mismatch for {resource['objectId']}: {diagnostics.get('mismatchReason')}"
+                    f"Viewer diagnostics mismatch for {resource['objectId']}: {diagnostics.get('mismatchReason')}"
                 )
 
         status = _request_status(args, request_id)
@@ -771,7 +771,7 @@ def _operator_composer_flow_case(args: argparse.Namespace, profile_name: str) ->
                     for provider in providers.get("providers") or []
                 ),
             },
-            "hmi": hmi_status,
+            "viewer": viewer_status,
             "draftMutated": data.get("draftMutated"),
             "expectedObjectId": resource["objectId"],
             "sceneContainsObject": resource["objectId"] in scene_by_id,
@@ -1673,19 +1673,21 @@ def _request_status(args: argparse.Namespace, request_id: str) -> dict[str, Any]
     )
 
 
-def _hmi_status(infra_status: dict[str, Any]) -> dict[str, Any]:
+def _viewer_status(infra_status: dict[str, Any]) -> dict[str, Any]:
     components = infra_status.get("components") if isinstance(infra_status.get("components"), dict) else {}
-    hmi = components.get("hmi") if isinstance(components.get("hmi"), dict) else {}
+    viewer = components.get("native_viewer") if isinstance(components.get("native_viewer"), dict) else {}
     return {
-        "status": hmi.get("status"),
-        "port": hmi.get("port"),
+        "status": viewer.get("status"),
+        "visualStateCached": viewer.get("visual_state_cached"),
+        "snapshotBridgeReady": viewer.get("snapshot_bridge_ready"),
+        "snapshotBridgeClientConnected": viewer.get("snapshot_bridge_client_connected"),
     }
 
 
 def _scene_diagnostic_for_object(
     args: argparse.Namespace,
     object_id: str,
-    hmi_status: dict[str, Any],
+    viewer_status: dict[str, Any],
 ) -> dict[str, Any]:
     try:
         diagnostics = _get_json(
@@ -1696,7 +1698,7 @@ def _scene_diagnostic_for_object(
         return {
             "checked": False,
             "present": False,
-            "hmiAvailable": hmi_status.get("status") == "healthy",
+            "viewerAvailable": viewer_status.get("status") == "healthy",
             "error": str(exc)[:240],
         }
     objects = diagnostics.get("objects") if isinstance(diagnostics.get("objects"), list) else []
@@ -1713,7 +1715,7 @@ def _scene_diagnostic_for_object(
     return {
         "checked": True,
         "present": match is not None,
-        "hmiAvailable": bool(summary.get("hmiAvailable")),
+        "viewerAvailable": bool(summary.get("viewerAvailable")),
         "match": bool(match.get("match")) if isinstance(match, dict) else False,
         "mismatchReason": (
             match.get("mismatchReason") or match.get("mismatch_reason")

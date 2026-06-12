@@ -49,6 +49,8 @@ struct Ros2GripperActionConfig {
 struct Ros2GripperCommandResult {
   bool accepted = false;
   std::string error;
+  // Stable fault token from ros2_control_fault_reason; empty when accepted.
+  std::string reason_code;
 };
 
 struct Ros2GripperStatus {
@@ -57,6 +59,9 @@ struct Ros2GripperStatus {
   std::optional<double> current_position;
   std::optional<double> target_position;
   std::string error;
+  // Stable fault token from ros2_control_fault_reason; empty unless
+  // state == "failed".
+  std::string reason_code;
 };
 
 /// Controller-backed execution backend for ros2_control/JTC deployments.
@@ -209,6 +214,7 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
     std::chrono::steady_clock::time_point started_at;
     std::optional<std::chrono::steady_clock::time_point> deadline_at;
     std::string error;
+    std::string reason_code;
   };
 
   void validate_config() const;

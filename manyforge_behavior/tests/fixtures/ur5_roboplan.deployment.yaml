@@ -73,6 +73,6 @@ launch:
     module: manyforge_behavior.runner
     args: []
   ui_backend:
-    module: manyforge_hmi.backend
+    module: manyforge_composer
     args: []
     enabled: true

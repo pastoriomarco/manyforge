@@ -68,7 +68,11 @@ pose_sources:
     objects:
       isaac_cheese_box:
         entity: /mac_n_cheese_centered
-        apply_policy: before_planning
+        # continuous_unattached (parity with the two ros2_control isaac
+        # deployments): the free-moving object tracks Isaac whenever it is
+        # not attached, while attached objects remain at their canonical
+        # attachment offset.
+        apply_policy: continuous_unattached
 
 simulation_control:
   kind: ros2_simulation_interfaces
@@ -83,6 +87,7 @@ simulation_control:
     default_scope: state
     close_command_gate: true
     wait_ready_s: 3.0
+    resume_play_after_reset: true
 
 adapters:
   planning:

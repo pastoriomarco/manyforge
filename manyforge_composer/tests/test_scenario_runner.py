@@ -9,7 +9,12 @@ pytest.importorskip("fastapi")
 
 from fastapi.testclient import TestClient
 
-from manyforge_behavior.kernel_client import MockKernelClient, SceneEditRequest
+from manyforge_behavior.kernel_client import (
+    MockKernelClient,
+    SceneEditRequest,
+    SceneObjectSnapshot,
+    SceneShape,
+)
 from manyforge_composer.backend.app import create_app
 from manyforge_composer.backend.security import SecurityConfig
 from manyforge_composer.backend.state import ComposerState
@@ -72,23 +77,20 @@ def test_runner_can_assert_visual_scene_consistency_without_manual_inspection():
         allowed_fs_roots=[str(_REPO_ROOT), "/tmp", "/workspace"],
     )
 
-    class RenderedHmi:
-        def get_object_render_diagnostics(self, object_id):
-            return {
-                "object_id": object_id,
-                "frame_path": ["universe"],
-                "render": {
-                    "object_id": object_id,
-                    "scene_name": object_id,
-                    "render_state": {"synced": True},
-                    "scene_node_present": True,
+    state.update_visual_scene_objects_snapshot(
+        [
+            SceneObjectSnapshot(
+                object_id="diag_box",
+                shape=SceneShape(type="box", box_dimensions_m=[0.1, 0.1, 0.1]),
+                pose_in_universe={
+                    "position_m": [0.4, 0.1, 0.2],
+                    "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
                 },
-            }
-
-        def get_scene_trace(self, limit=200):
-            return []
-
-    state.hmi_server = RenderedHmi()
+                attached=False,
+                frame_id="universe",
+            )
+        ]
+    )
     app = create_app(state, security=_TEST_SECURITY)
     scenario = ScenarioDefinition(
         scenario_id="visual_scene_consistency",
@@ -96,7 +98,7 @@ def test_runner_can_assert_visual_scene_consistency_without_manual_inspection():
         assertions=[
             {
                 "endpoint": "scene_diagnostics",
-                "path": "summary.hmiAvailable",
+                "path": "summary.viewerAvailable",
                 "equals": True,
             },
             {
@@ -141,7 +143,7 @@ def test_runner_writes_metadata_and_matrix_summary(tmp_path):
                 assertions=[
                     {
                         "endpoint": "scene_diagnostics",
-                        "path": "summary.hmiAvailable",
+                        "path": "summary.viewerAvailable",
                         "equals": False,
                     },
                 ],
@@ -219,11 +221,14 @@ def test_runner_can_assert_scene_snapshot_and_archive_matrix_output(tmp_path):
         allowed_fs_roots=[str(_REPO_ROOT), "/tmp", "/workspace"],
     )
 
-    class SnapshotHmi:
-        def render_scene(self, width=640, height=480, format="jpeg"):
+    class SnapshotBroker:
+        def has_clients(self):
+            return True
+
+        def render_sync(self, width=640, height=480, format="jpeg"):
             return b"\xff\xd8\xffdemo"
 
-    state.hmi_server = SnapshotHmi()
+    state.snapshot_broker = SnapshotBroker()
     app = create_app(state, security=_TEST_SECURITY)
     scenario = ScenarioDefinition(
         scenario_id="scene_snapshot_available",

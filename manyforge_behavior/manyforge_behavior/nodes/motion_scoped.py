@@ -301,18 +301,26 @@ class _MotionScopedBase(py_trees.behaviour.Behaviour):
     def _apply_pose_source_callbacks(
         self, relative_move: dict[str, Any] | None
     ) -> str | None:
-        """Invoke the pose-source apply callbacks if the relative move
-        references scene objects. Returns an error string on failure
-        or None on success / nothing-to-do. Mirrors lines 278-309 of
-        `MoveManipulatorAction.update`."""
+        """Invoke pose-source apply callbacks before dispatch.
+
+        The before-planning callback intentionally refreshes all deployment
+        `before_planning` bindings; planning collision-checks the whole scene,
+        not just objects referenced by this node. The between-nodes callback
+        remains scoped to relative-move references.
+        """
         referenced_object_ids = _relative_move_object_ids(relative_move)
-        if not referenced_object_ids:
-            return None
-        callbacks = (
-            ("pose_source_apply_callback", "before-planning"),
-            ("pose_source_between_nodes_callback", "between-nodes"),
-        )
-        for blackboard_key, label in callbacks:
+        callbacks = [
+            ("pose_source_apply_callback", "before-planning", []),
+        ]
+        if referenced_object_ids:
+            callbacks.append(
+                (
+                    "pose_source_between_nodes_callback",
+                    "between-nodes",
+                    referenced_object_ids,
+                )
+            )
+        for blackboard_key, label, object_ids in callbacks:
             apply_callback = self._read_optional_blackboard_value(
                 blackboard_key
             )
@@ -320,7 +328,7 @@ class _MotionScopedBase(py_trees.behaviour.Behaviour):
                 continue
             try:
                 apply_result = apply_callback(
-                    object_ids=referenced_object_ids,
+                    object_ids=object_ids,
                     reason=f"motion_node:{self.name}",
                 )
             except Exception as exc:  # noqa: BLE001 — callback boundary

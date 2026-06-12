@@ -77,7 +77,9 @@ Behavior to know when operating:
 - One FAILED per fault occurrence (medkit aggregates `occurrence_count`).
 - On clear the adapter emits a **PASSED stream** (`healing_passes`, default
   5 polls). A single PASSED never heals a CONFIRMED fault under the DEM
-  debounce model — verified against a real fault_manager.
+  debounce model — verified against a real fault_manager. While the Composer
+  is unreachable the forwarder no-ops, so an in-flight healing stream pauses
+  and resumes when the digest is observable again.
 - `source_id` is `/manyforge/<deployment>/composer`; the description carries
   the ManyForge failure-archive id when one exists (freeze-frame parity for
   post-mortems — medkit snapshots only ROS topics).

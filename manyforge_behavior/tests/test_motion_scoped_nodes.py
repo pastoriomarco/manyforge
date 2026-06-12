@@ -555,7 +555,7 @@ def test_pose_source_apply_callback_invoked_for_object_relative_move():
     bb.set("pose_source_apply_callback", apply_callback)
     _tick(node)
     assert apply_calls, "pose-source apply callback must be invoked"
-    assert apply_calls[0]["object_ids"] == ["part_a"]
+    assert apply_calls[0]["object_ids"] == []
 
 
 def test_pose_source_apply_callback_failure_surfaces_as_failure():

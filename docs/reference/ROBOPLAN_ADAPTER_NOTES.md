@@ -67,7 +67,7 @@ T_parent_joint_object = T_parent_joint_frame * T_frame_object
 before calling RoboPlan `add*Geometry` or `updateGeometryPlacement`.
 
 This conversion is load-bearing for collision safety. Without it, an attached
-object can be checked at a different pose from the one shown in Composer/HMI.
+object can be checked at a different pose from the one shown in Composer's viewer.
 That can fail closed, as a false gripper/object collision, or fail open, as a
 missed collision between the carried object and an external obstacle.
 

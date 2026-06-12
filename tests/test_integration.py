@@ -3,7 +3,7 @@
 These tests exercise the full stack from program YAML through behavior tree
 execution to the kernel layer.
 
-- Groups A, C, D, E use MockKernelClient (pure Python mock — tests runner/HMI logic).
+- Groups A, C, and D use MockKernelClient (pure Python mock runner logic).
 - Group B uses the native C++ kernel with real RoboPlan (requires roboplan).
 """
 
@@ -18,13 +18,10 @@ from manyforge_behavior.kernel_client import (
     MockKernelClient, ExecuteRequest, ExecuteResult,
     CommandResult, ExecutionState, ExecutionStatus, SceneEditRequest,
 )
-from manyforge_behavior.cycle_manager import CycleManager, CycleState
+from manyforge_behavior.cycle_manager import CycleManager
 from manyforge_behavior.runner import OrchestratorRunner
 from manyforge_behavior.catalog import NodeCatalog
 from manyforge_behavior.program import Program
-
-# HMI
-from manyforge_hmi import ViserHmiServer, StateBridge
 
 # Native kernel (optional — requires roboplan + manyforge_roboplan_py)
 try:
@@ -53,7 +50,7 @@ def node_catalog_path():
 
 @pytest.fixture
 def mock_kernel():
-    """Create a MockKernelClient for runner/HMI tests."""
+    """Create a MockKernelClient for runner tests."""
     return MockKernelClient()
 
 
@@ -340,81 +337,7 @@ class TestRunnerWithNativeKernel:
 
 
 # ============================================================================
-# Group C: HMI + MockKernelClient (4 tests)
-# ============================================================================
-
-class TestHmiWithMockKernel:
-    """Tests for ViserHmiServer with MockKernelClient."""
-
-    def _make_cycle_manager(
-        self, simple_motion_program_path, node_catalog_path, mock_kernel
-    ) -> CycleManager:
-        runner = OrchestratorRunner(
-            catalog_path=node_catalog_path,
-            program_path=simple_motion_program_path,
-            kernel=mock_kernel,
-        )
-        runner.load()
-        return CycleManager(runner, mock_kernel)
-
-    def test_hmi_creates(
-        self, simple_motion_program_path, node_catalog_path, mock_kernel
-    ):
-        """ViserHmiServer(cycle_manager=..., port=0) works."""
-        cycle_manager = self._make_cycle_manager(
-            simple_motion_program_path, node_catalog_path, mock_kernel
-        )
-        server = ViserHmiServer(cycle_manager=cycle_manager, port=0)
-        assert server is not None
-        assert server.viser_server is not None
-        server.stop()
-
-    def test_hmi_bridge_status(
-        self, simple_motion_program_path, node_catalog_path, mock_kernel
-    ):
-        """StateBridge exposes IDLE state before a cycle starts."""
-        cycle_manager = self._make_cycle_manager(
-            simple_motion_program_path, node_catalog_path, mock_kernel
-        )
-        bridge = StateBridge(cycle_manager)
-        assert bridge.state == CycleState.IDLE
-
-    def test_hmi_bridge_run(
-        self, simple_motion_program_path, node_catalog_path, mock_kernel
-    ):
-        """Bridge run() starts a cycle and the kernel executes motions."""
-        cycle_manager = self._make_cycle_manager(
-            simple_motion_program_path, node_catalog_path, mock_kernel
-        )
-        bridge = StateBridge(cycle_manager)
-
-        assert bridge.state == CycleState.IDLE
-        bridge.run()
-        assert bridge.state == CycleState.RUNNING
-
-        deadline = time.monotonic() + 1.0
-        while bridge.state == CycleState.RUNNING and time.monotonic() < deadline:
-            time.sleep(0.01)
-
-        assert mock_kernel.execute_count >= 1
-        assert mock_kernel.get_status().state == ExecutionState.IDLE
-        assert bridge.state == CycleState.IDLE
-
-    def test_hmi_load_program(
-        self, simple_motion_program_path, node_catalog_path, mock_kernel
-    ):
-        """Load program into HMI server."""
-        cycle_manager = self._make_cycle_manager(
-            simple_motion_program_path, node_catalog_path, mock_kernel
-        )
-        server = ViserHmiServer(cycle_manager=cycle_manager, port=0)
-
-        server.load_program(cycle_manager._runner.program)
-        server.stop()
-
-
-# ============================================================================
-# Group D: Error Paths (4 tests)
+# Group C: Error Paths (4 tests)
 # ============================================================================
 
 class TestErrorPaths:
@@ -507,7 +430,7 @@ class TestErrorPaths:
 
 
 # ============================================================================
-# Group E: Scene Edit Verification (2 tests)
+# Group D: Scene Edit Verification (2 tests)
 # ============================================================================
 
 class TestSceneEdits:

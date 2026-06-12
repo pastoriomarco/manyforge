@@ -3,7 +3,7 @@
 This node deliberately lives in ``manyforge_ros_bringup`` because it is demo
 orchestration, not ManyForge core behavior.  It asks Composer to load the
 Isaac light-scene program/deployment as soon as Composer is reachable so the
-backend-authored scene and Viser HMI are available even before Isaac starts.
+backend-authored scene and native viewer are available even before Isaac starts.
 It keeps the arm command gate closed until Isaac Sim, the
 topic_based_ros2_control arm controller, and the gripper action bridge are all
 reachable; once they are ready it requests a Composer reset so Isaac receives

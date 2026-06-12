@@ -116,7 +116,7 @@ def test_build_scene_selection_context_fails_when_snapshot_requested_without_pro
         output_key_prefix="selection/context",
         object_source="backend_scene",
         candidate_object_ids=["sphere_part", "cube_part"],
-        image_source="hmi_snapshot",
+        image_source="viewer_snapshot",
         base_frame="base_link",
     )
 
@@ -142,7 +142,7 @@ def test_build_scene_selection_context_waits_for_snapshot_without_blocking():
         output_key_prefix="selection/context",
         object_source="backend_scene",
         candidate_object_ids=["sphere_part", "cube_part"],
-        image_source="hmi_snapshot",
+        image_source="viewer_snapshot",
         base_frame="base_link",
         scene_snapshot_provider=lambda width, height, format: renders.pop(0),
     )

@@ -55,6 +55,7 @@ simulation_control:
     default_scope: state
     close_command_gate: true
     wait_ready_s: 3.0
+    resume_play_after_reset: true
 adapters:
   planning:
     adapter_id: planning.roboplan

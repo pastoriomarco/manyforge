@@ -600,7 +600,7 @@ class TestDeploymentLoading:
         assert deploy.launch.runner.module == "manyforge_behavior.runner"
         assert deploy.launch.runner.args == []
         assert deploy.launch.ui_backend is not None
-        assert deploy.launch.ui_backend.module == "manyforge_hmi.backend"
+        assert deploy.launch.ui_backend.module == "manyforge_composer"
         assert deploy.launch.ui_backend.enabled is True
 
     def test_pose_sources_parse_and_roundtrip(self):
@@ -790,7 +790,7 @@ class TestDeploymentLoading:
                 "capabilities": {
                     "reset": True,
                     "pause": False,
-                    "play": False,
+                    "play": True,
                     "step": False,
                     "set_entity_state": True,
                 },
@@ -798,6 +798,7 @@ class TestDeploymentLoading:
                     "default_scope": "state",
                     "close_command_gate": True,
                     "wait_ready_s": 4.5,
+                    "resume_play_after_reset": False,
                 },
             },
         )
@@ -812,13 +813,16 @@ class TestDeploymentLoading:
         assert control.reset.default_scope == "state"
         assert control.reset.close_command_gate is True
         assert control.reset.wait_ready_s == 4.5
+        assert control.reset.resume_play_after_reset is False
         assert "simulator.control.reset" in deploy.capability_keys()
+        assert "simulator.control.play" in deploy.capability_keys()
         assert "simulator.entity_state.set" in deploy.capability_keys()
 
         reloaded = Deployment.from_dict(deploy.to_dict())
         assert reloaded.simulation_control is not None
         assert reloaded.simulation_control.capabilities.reset is True
         assert reloaded.simulation_control.reset.wait_ready_s == 4.5
+        assert reloaded.simulation_control.reset.resume_play_after_reset is False
 
     @pytest.mark.parametrize(
         ("simulation_control", "match"),
@@ -867,6 +871,14 @@ class TestDeploymentLoading:
                     "reset": {"default_scope": "time"},
                 },
                 "simulation_control.reset.default_scope must be one of",
+            ),
+            (
+                {
+                    "kind": "ros2_simulation_interfaces",
+                    "capabilities": {"reset": True},
+                    "reset": {"resume_play_after_reset": "yes"},
+                },
+                "simulation_control.reset.resume_play_after_reset must be a boolean",
             ),
         ],
     )

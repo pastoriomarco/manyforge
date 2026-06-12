@@ -58,6 +58,16 @@ class TestLoadSkill:
         with pytest.raises(ValueError, match="body"):
             load_skill(bad)
 
+    def test_rejects_legacy_expands_to_without_body(self, tmp_path):
+        bad = tmp_path / "bad.skill.yaml"
+        bad.write_text(
+            "api_version: manyforge.skill.v0\n"
+            "skill_id: test\n"
+            "expands_to: {id: reset_trajectories, name: noop}\n",
+        )
+        with pytest.raises(ValueError, match="body"):
+            load_skill(bad)
+
     def test_rejects_requires_capabilities_when_not_list(self, tmp_path):
         bad = tmp_path / "bad.skill.yaml"
         bad.write_text(

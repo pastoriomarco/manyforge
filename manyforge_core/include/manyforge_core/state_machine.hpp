@@ -11,7 +11,7 @@ namespace manyforge::core {
 
 /// Thread-safe execution state machine.
 /// Encodes valid transitions between execution states.
-/// ADR-0005: Kernel owns the state machine; BT/HMI observe via status.
+/// ADR-0005: Kernel owns the state machine; BT/UI observe via status.
 class ExecutionStateMachine {
  public:
   /// Callback signature for state transitions: (from_state, to_state).

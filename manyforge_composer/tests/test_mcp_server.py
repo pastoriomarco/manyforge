@@ -488,9 +488,9 @@ class TestSkills:
             "parameters",
             "requires_tools",
             "body",
-            "expands_to",
         ):
             assert field in skill, f"Skill missing field: {field}"
+        assert "expands_to" not in skill
 
 
 # =============================================================================

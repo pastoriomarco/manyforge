@@ -57,11 +57,6 @@ class SkillDefinition:
         """Compatibility alias for legacy callers."""
         return self.skill_id
 
-    @property
-    def expands_to(self) -> dict[str, Any]:
-        """Compatibility alias for legacy callers."""
-        return self.body
-
 
 @dataclass
 class SkillCatalog:
@@ -369,8 +364,6 @@ def load_skill(path: Path) -> SkillDefinition:
         raise ValueError(f"{path.name}: missing required field 'skill_id'")
 
     body = data.get("body")
-    if body is None:
-        body = data.get("expands_to")
     if body is None:
         raise ValueError(f"{path.name}: missing required field 'body'")
     if not isinstance(body, dict):

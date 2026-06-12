@@ -114,6 +114,27 @@ inline constexpr const char* kStaleControllerState =
 inline constexpr const char* kStartStateMismatch = "start_state_mismatch";
 inline constexpr const char* kTrackingErrorExceeded =
     "tracking_error_exceeded";
+// Gripper fault classes. Same taxonomy contract as the
+// FollowJointTrajectory classes above: the stable token travels in
+// `reason_code` next to the prose error so digest promotion and the
+// external diagnostics surfaces classify gripper faults instead of seeing
+// bare `tree_failed` prose. All gripper classes are ERROR severity: a
+// gripper fault aborts the tree fail-closed but does not leave arm motion
+// unconfirmed (the CRITICAL rule is reserved for unconfirmed-stop /
+// stuck-lifecycle classes).
+inline constexpr const char* kGripperActionServerUnavailable =
+    "gripper_action_server_unavailable";
+inline constexpr const char* kGripperBusy = "gripper_busy";
+inline constexpr const char* kGripperGoalAborted = "gripper_goal_aborted";
+inline constexpr const char* kGripperGoalDispatchFailed =
+    "gripper_goal_dispatch_failed";
+inline constexpr const char* kGripperGoalRejected = "gripper_goal_rejected";
+inline constexpr const char* kGripperInvalidCommand =
+    "gripper_invalid_command";
+inline constexpr const char* kGripperNotConfigured = "gripper_not_configured";
+inline constexpr const char* kGripperResultFailed = "gripper_result_failed";
+inline constexpr const char* kGripperResultTimeout =
+    "gripper_result_timeout";
 }  // namespace ros2_control_fault_reason
 
 /// Build a backend ErrorDTO with the stable reason token carried in

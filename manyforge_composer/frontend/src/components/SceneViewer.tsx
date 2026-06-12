@@ -70,12 +70,12 @@ interface SceneViewerPanelProps {
 }
 
 /**
- * Native R3F replacement for ViserPanel.
+ * Native R3F scene viewer.
  *
  * The Canvas runs `frameloop="demand"` so it only paints when the
  * React tree changes (scene-state poll) or the user interacts
  * (OrbitControls invalidates internally). This is the load-bearing
- * difference vs Viser's `frameloop="always"` 60 fps continuous render
+ * difference vs continuous 60 fps rendering
  * loop — the JS-per-frame work that starves Composer's typing on Thor
  * does not happen here.
  *
@@ -1268,7 +1268,7 @@ function FrameAxes() {
   // Render an axes triad at every frame the operator has flagged
   // visible. Pose + size come from /api/scene/frames (Day-4 parity
   // work moved frame visibility ownership into ComposerState so
-  // this works without the Viser HMI server attached). Frames
+  // this works without an external viewer server attached). Frames
   // without a kernel-resolved pose are skipped silently.
   const frames = useSceneStateStore((s) => s.frames?.frames ?? EMPTY_FRAMES);
   const gizmoSize = useSceneStateStore((s) => s.frames?.frameGizmoSizeM ?? 0.1);

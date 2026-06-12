@@ -220,10 +220,38 @@ class CommandGripper(py_trees.behaviour.Behaviour):
         self.blackboard.register_key(
             key="gripper_configs", access=py_trees.common.Access.READ
         )
+        self.blackboard.register_key(
+            key="gripper_fault_details", access=py_trees.common.Access.WRITE
+        )
 
     def initialise(self) -> None:
         self._started = False
         self._deadline = 0.0
+        try:
+            self.blackboard.set("gripper_fault_details", None)
+        except (KeyError, AttributeError):
+            pass
+
+    def _record_gripper_fault(
+        self, reason_code: str | None, message: str
+    ) -> None:
+        # Cycle digest diagnostics read this key when the tree fails: the
+        # gripper runtime has no kernel-snapshot error surface, so without it
+        # the digest would carry only the prose feedback message.
+        if not reason_code:
+            return
+        try:
+            self.blackboard.set(
+                "gripper_fault_details",
+                {
+                    "reason_code": str(reason_code),
+                    "gripper_id": self._gripper_id,
+                    "surface": "command_gripper",
+                    "message": message,
+                },
+            )
+        except (KeyError, AttributeError):
+            pass
 
     def _load_gripper_config(self) -> dict[str, Any] | None:
         try:
@@ -307,6 +335,9 @@ class CommandGripper(py_trees.behaviour.Behaviour):
             )
             if not result.accepted:
                 self.feedback_message = result.error or "Gripper command was rejected"
+                self._record_gripper_fault(
+                    getattr(result, "reason_code", None), self.feedback_message
+                )
                 return py_trees.common.Status.FAILURE
 
         kernel.update_gripper_commands()
@@ -315,6 +346,9 @@ class CommandGripper(py_trees.behaviour.Behaviour):
             return py_trees.common.Status.SUCCESS
         if status.state == GripperCommandState.FAILED:
             self.feedback_message = status.error or "Gripper command failed"
+            self._record_gripper_fault(
+                getattr(status, "reason_code", None), self.feedback_message
+            )
             return py_trees.common.Status.FAILURE
 
         now = time.monotonic()
@@ -322,6 +356,9 @@ class CommandGripper(py_trees.behaviour.Behaviour):
             self.feedback_message = (
                 f"Timed out waiting for gripper '{self._gripper_id}' to reach "
                 f"position {target_position}"
+            )
+            self._record_gripper_fault(
+                "gripper_result_timeout", self.feedback_message
             )
             return py_trees.common.Status.FAILURE
 

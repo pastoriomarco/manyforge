@@ -87,12 +87,6 @@ are not orphans, just not bound to a launcher entry:
     `thor_nemotron3_nano_omni`. Deployments reference profiles via
     `model_endpoint_profile_registry: model_endpoint_profiles.yaml` +
     `model_endpoints.<alias>.profile_ref`.
-- [`examples/pick_and_place_demo.py`](../../examples/pick_and_place_demo.py)
-  - Standalone developer Viser-on-8081 demo. Drives a UR5 pick-place
-    via `CycleManager` + Viser without going through Composer. Run it
-    with `docker compose run --rm -p 8081:8081 dev bash -c './scripts/test-all.sh roboplan && python3 examples/pick_and_place_demo.py'`.
-    Not used by the launcher.
-
 ## Qualification fixtures (not in `examples/`)
 
 For completeness — these are not operator scenarios, but they are

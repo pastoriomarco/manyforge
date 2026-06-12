@@ -147,14 +147,14 @@ class TestPlanPickSequenceNode:
         assert metrics["plans_succeeded"] == 3
         assert metrics["validations_passed"] == 3
 
-    def test_missing_hmi_snapshot_provider_fails_closed(self, kernel, bb_with_kernel):
+    def test_missing_viewer_snapshot_provider_fails_closed(self, kernel, bb_with_kernel):
         _seed_scene(kernel)
         node = PlanPickSequenceNode(
             name="plan_pick",
             selected_object_id="sphere_part",
             output_key_prefix="planning/pick_plan",
             object_source="backend_scene",
-            image_source="hmi_snapshot",
+            image_source="viewer_snapshot",
             robot_id="ur5",
             group_id="arm",
             base_frame="base_link",
@@ -169,7 +169,7 @@ class TestPlanPickSequenceNode:
         assert plan_bundle["value"]["outcome"] == "image_source_unavailable"
         assert plan_bundle["meta"]["status"] == "failed"
 
-    def test_hmi_snapshot_waits_for_cached_frame_without_blocking(self, kernel, bb_with_kernel):
+    def test_viewer_snapshot_waits_for_cached_frame_without_blocking(self, kernel, bb_with_kernel):
         _seed_scene(kernel)
         renders = [None, b"fake-image"]
         node = PlanPickSequenceNode(
@@ -177,7 +177,7 @@ class TestPlanPickSequenceNode:
             selected_object_id="sphere_part",
             output_key_prefix="planning/pick_plan",
             object_source="backend_scene",
-            image_source="hmi_snapshot",
+            image_source="viewer_snapshot",
             robot_id="ur5",
             group_id="arm",
             base_frame="base_link",

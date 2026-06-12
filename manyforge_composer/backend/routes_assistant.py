@@ -1493,7 +1493,6 @@ def _skills_payload(state: ComposerState, *, skill_ids: list[str] | None, includ
         }
         if include_bodies:
             payload["body"] = skill.body
-            payload["expandsTo"] = skill.expands_to
         skills.append(payload)
     return skills
 

@@ -39,6 +39,15 @@ header() { echo -e "\n${BOLD}$*${NC}"; }
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+require_legacy_mux_opt_in() {
+    if [[ "${MANYFORGE_ENABLE_LEGACY_MUX_PROVIDER:-false}" == "true" ]]; then
+        return 0
+    fi
+    fail "Legacy mux/plugin transport is diagnostic-only and must be opted in explicitly"
+    info "Set MANYFORGE_ENABLE_LEGACY_MUX_PROVIDER=true to run this legacy path."
+    return 1
+}
+
 find_container() {
     docker ps --filter "name=${CONTAINER_PREFIX}" --format '{{.Names}}' 2>/dev/null | head -1
 }
@@ -113,6 +122,9 @@ cmd_up() {
     done
 
     echo -e "\n${BOLD}=== ManyForge Stack ===${NC}"
+    if ${with_nemoclaw}; then
+        require_legacy_mux_opt_in
+    fi
 
     # ── [1] Container ──
     header ">>> [1/$(${with_nemoclaw} && echo 3 || echo 1)] ManyForge container"
@@ -201,12 +213,11 @@ except: print('unknown')
         warn "vLLM not reachable on port 8000 (agent LLM calls may fail)"
     fi
 
-    info "Legacy dedicated-route / mux transport will be selected by configure-manyforge-provider.sh"
+    info "Legacy dedicated-route / mux transport selected by explicit opt-in"
 
     # ── [3] Integration ──
     header ">>> [3/3] ManyForge ↔ NemoClaw integration"
-    MANYFORGE_ENABLE_LEGACY_MUX_PROVIDER=true \
-        "${SCRIPT_DIR}/configure-manyforge-provider.sh"
+    "${SCRIPT_DIR}/configure-manyforge-provider.sh"
 
     echo -e "\n${BOLD}=== Stack ready ===${NC}"
     echo "  ManyForge:  http://localhost:${MANYFORGE_PORT} (MCP HTTP enabled)"
@@ -513,23 +524,22 @@ PY
             fi
             ;;
         deploy)
+            require_legacy_mux_opt_in
             shift 2 || true
             if [[ "${1:-}" == "--artifact" ]]; then
                 if [[ -z "${2:-}" ]]; then
                     fail "--artifact requires a path"
                     return 1
                 fi
-                MANYFORGE_ENABLE_LEGACY_MUX_PROVIDER=true \
-                    "${SCRIPT_DIR}/configure-manyforge-provider.sh" --artifact "${2}"
+                "${SCRIPT_DIR}/configure-manyforge-provider.sh" --artifact "${2}"
             elif [[ "${1:-}" == "--use-current-artifact" ]]; then
-                MANYFORGE_ENABLE_LEGACY_MUX_PROVIDER=true \
-                    "${SCRIPT_DIR}/configure-manyforge-provider.sh" --use-current-artifact
+                "${SCRIPT_DIR}/configure-manyforge-provider.sh" --use-current-artifact
             else
-                MANYFORGE_ENABLE_LEGACY_MUX_PROVIDER=true \
-                    "${SCRIPT_DIR}/configure-manyforge-provider.sh"
+                "${SCRIPT_DIR}/configure-manyforge-provider.sh"
             fi
             ;;
         rollback)
+            require_legacy_mux_opt_in
             local steps="${3:-1}"
             local archives=()
             while IFS= read -r archive; do
@@ -562,8 +572,7 @@ PY
             fi
             target_archive="${archives[${target_index}]}"
             info "Rolling back to $(basename "${target_archive}")"
-            MANYFORGE_ENABLE_LEGACY_MUX_PROVIDER=true \
-                "${SCRIPT_DIR}/configure-manyforge-provider.sh" --artifact "${target_archive}"
+            "${SCRIPT_DIR}/configure-manyforge-provider.sh" --artifact "${target_archive}"
             ;;
         *)
             echo "Usage: $0 plugin {list|status|deploy [--artifact PATH|--use-current-artifact]|rollback [steps]}" >&2

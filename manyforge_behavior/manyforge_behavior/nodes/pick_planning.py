@@ -338,11 +338,11 @@ class PlanPickSequenceNode(BlackboardOutputMixin, py_trees.behaviour.Behaviour):
         if pose_source_status is not None:
             return pose_source_status
 
-        if self._image_source == "hmi_snapshot":
+        if self._image_source == "viewer_snapshot":
             provider = self._scene_snapshot_provider
             if provider is None:
                 self.feedback_message = (
-                    "image_source=hmi_snapshot requested but no scene snapshot provider is configured"
+                    "image_source=viewer_snapshot requested but no scene snapshot provider is configured"
                 )
                 self._write_failure_response(
                     selected_object_id=selected_object_id,

@@ -668,7 +668,7 @@ class NativeKernelClient(KernelClient):
     def set_runtime_velocity_scale(
         self, scale: float, principal_id: str | None = None
     ) -> None:
-        # ADR-0018: forward runtime HMI velocity-scale changes to the C++
+        # ADR-0018: forward runtime UI velocity-scale changes to the C++
         # kernel/backend. The kernel validates finiteness and clamps to [0, 1].
         import math
 
@@ -784,6 +784,7 @@ class NativeKernelClient(KernelClient):
                 return CommandResult(
                     accepted=bool(result.get("accepted", False)),
                     error=result.get("error"),
+                    reason_code=result.get("reason_code"),
                 )
 
         self.update_gripper_commands()
@@ -792,6 +793,7 @@ class NativeKernelClient(KernelClient):
             return CommandResult(
                 accepted=False,
                 error=f"Gripper '{request.gripper_id}' is already executing a command",
+                reason_code="gripper_busy",
             )
 
         try:
@@ -849,6 +851,7 @@ class NativeKernelClient(KernelClient):
                     current_position=status.get("current_position"),
                     target_position=status.get("target_position"),
                     error=status.get("error"),
+                    reason_code=status.get("reason_code"),
                 )
         return self._gripper_status_cache.get(
             gripper_id,

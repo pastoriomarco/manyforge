@@ -30,7 +30,6 @@ class ManagedComposerProcess:
         catalog_path: Path,
         host: str,
         port: int,
-        hmi_port: int | None,
         log_level: str,
         kernel_mode: str,
         mock_execute_duration_s: float,
@@ -41,7 +40,6 @@ class ManagedComposerProcess:
         self._catalog_path = catalog_path
         self._host = host
         self._port = port
-        self._hmi_port = hmi_port
         self._log_level = log_level
         self._kernel_mode = kernel_mode
         self._mock_execute_duration_s = mock_execute_duration_s
@@ -62,7 +60,31 @@ class ManagedComposerProcess:
     def base_url(self) -> str:
         return f"http://{self._host}:{self._port}"
 
+    # Grace window after first readiness 200 before trusting it: a foreign
+    # composer already on the port answers immediately while our bind-failed
+    # child takes a moment to exit.
+    _POST_READY_GRACE_S = 0.5
+
+    def _refuse_foreign_composer(self) -> None:
+        """Fail closed when the target port is already served.
+
+        The readiness probe cannot distinguish the spawned worker from a
+        composer that was already listening, so it would silently adopt and
+        drive whatever is on the port.
+        """
+        try:
+            with httpx.Client(base_url=self.base_url, timeout=2.0) as client:
+                response = client.get("/api/health")
+        except Exception:
+            return  # nothing answering: the port is ours to take
+        raise RuntimeError(
+            f"Refusing to launch: {self.base_url} already serves a composer this "
+            f"harness did not spawn (HTTP {response.status_code} from /api/health). "
+            "Stop it or pass a dedicated --port."
+        )
+
     def start(self) -> None:
+        self._refuse_foreign_composer()
         env = os.environ.copy()
         allowed_roots = [str(self._workspace_root), "/workspace", "/tmp"]
         env["MANYFORGE_FS_ROOTS"] = ",".join(dict.fromkeys(allowed_roots))
@@ -84,9 +106,6 @@ class ManagedComposerProcess:
             "--mock-execute-duration-s",
             str(self._mock_execute_duration_s),
         ]
-        if self._hmi_port is not None:
-            cmd.extend(["--hmi-port", str(self._hmi_port)])
-
         if self._output_dir is not None:
             self._output_dir.mkdir(parents=True, exist_ok=True)
             self._stdout_handle = (self._output_dir / "composer.stdout.log").open("w", encoding="utf-8")
@@ -113,12 +132,22 @@ class ManagedComposerProcess:
                         raise RuntimeError(
                             f"Composer exited early with code {self._process.returncode}"
                         )
+                    healthy = False
                     try:
                         response = client.get("/api/health")
-                        if response.status_code == 200:
-                            return
+                        healthy = response.status_code == 200
                     except Exception:
                         pass
+                    if healthy:
+                        time.sleep(self._POST_READY_GRACE_S)
+                        if self._process.poll() is not None:
+                            raise RuntimeError(
+                                "Composer exited with code "
+                                f"{self._process.returncode} immediately after "
+                                "readiness; the health answer likely came from "
+                                f"a foreign composer already on {self.base_url}"
+                            )
+                        return
                     time.sleep(0.1)
             raise RuntimeError("Timed out waiting for Composer health endpoint")
         except Exception:
@@ -184,12 +213,6 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--host", default="127.0.0.1", help="Host for launched Composer")
     parser.add_argument("--port", type=int, default=9000, help="Port for launched Composer")
     parser.add_argument(
-        "--hmi-port",
-        type=int,
-        default=None,
-        help="Optional HMI port when launching Composer",
-    )
-    parser.add_argument(
         "--wait-timeout-s",
         type=float,
         default=20.0,
@@ -251,7 +274,6 @@ def main() -> int:
                 catalog_path=(workspace_root / args.catalog_path).resolve(),
                 host=args.host,
                 port=args.port,
-                hmi_port=args.hmi_port,
                 log_level=args.log_level,
                 kernel_mode=args.kernel_mode,
                 mock_execute_duration_s=args.mock_execute_duration_s,

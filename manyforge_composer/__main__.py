@@ -1,4 +1,4 @@
-"""python -m manyforge_composer --catalog-path <path> [--host 0.0.0.0] [--port 9000] [--hmi-port 8081]"""
+"""python -m manyforge_composer --catalog-path <path> [--host 0.0.0.0] [--port 9000]"""
 from __future__ import annotations
 
 import argparse
@@ -16,8 +16,6 @@ from manyforge_behavior.kernel_client import MockKernelClient
 from manyforge_behavior.model_paths import (
     ResolvedRobotModel,
     default_package_paths,
-    normalize_package_paths,
-    resolve_resource_path,
     resolve_robot_model,
 )
 from manyforge_composer.backend.logging_config import setup_logging
@@ -122,96 +120,24 @@ def _resolved_robot_model_from_deployment(
     )
 
 
-def _resolved_hmi_robot_paths(
-    deployment: Deployment | None,
-    *,
-    default_urdf_path: str | None,
-    default_package_dirs: list[str],
-) -> tuple[str | None, list[str]]:
-    try:
-        resolved_model = _resolved_robot_model_from_deployment(deployment)
-    except FileNotFoundError as exc:
-        logger.warning(
-            "Could not resolve deployment robot model for HMI; falling back to "
-            "launcher defaults: %s",
-            exc,
-        )
-        resolved_model = None
-    if resolved_model is not None:
-        return resolved_model.urdf_path, resolved_model.package_paths
-    return default_urdf_path, default_package_dirs
-
-
 def build_program_loaded_callback(
     *,
-    host: str,
-    hmi_port: int | None,
-    urdf_path: str | None,
-    package_dirs: list[str],
     bundle,
-    hmi_server_factory=None,
 ):
     """Build the Composer program-load callback for runtime visual state.
 
     The native viewer path is always active: behavior-tree scene mutations
     update ComposerState's visual object cache directly so attach/detach
-    effects are visible without a Viser process.  The legacy Viser server is
-    started only when ``hmi_port`` is provided, keeping the fallback dormant by
-    default.
+    effects are visible without any external viewer server.
     """
-    if hmi_port is not None and hmi_server_factory is None:
-        from manyforge_hmi.server import ViserHmiServer
-        hmi_server_factory = ViserHmiServer
-
-    _hmi_server = None
-
-    def _snapshot_provider_for_runtime(hmi_server):
-        return (
-            getattr(hmi_server, "get_cached_scene_snapshot", None)
-            or getattr(hmi_server, "render_scene", None)
-        )
-
     def on_program_loaded(st: ComposerState):
-        nonlocal _hmi_server
-
-        runtime_urdf_path = urdf_path
-        runtime_package_dirs = package_dirs
-        if hmi_port is not None:
-            runtime_urdf_path, runtime_package_dirs = _resolved_hmi_robot_paths(
-                st.deployment,
-                default_urdf_path=urdf_path,
-                default_package_dirs=package_dirs,
-            )
-
-        # Stop previous HMI if reloading a program
-        if _hmi_server is not None:
-            _hmi_server.stop()
-            st.hmi_server = None
-            st.hmi_public_port = None
-            _hmi_server = None
-
-        if hmi_port is not None and hmi_server_factory is not None:
-            _hmi_server = hmi_server_factory(
-                cycle_manager=st.cycle_manager,
-                host=host,
-                port=hmi_port,
-                urdf_path=runtime_urdf_path,
-                joint_names=None,
-                package_dirs=runtime_package_dirs or None,
-            )
-            st.hmi_server = _hmi_server
-            st.hmi_public_port = hmi_port
         if (
             st.cycle_manager is not None
             and hasattr(st.cycle_manager, "_runner")
-            and (
-                st._resolve_scene_snapshot_provider() is not None
-                or _snapshot_provider_for_runtime(_hmi_server) is not None
-            )
+            and st._resolve_scene_snapshot_provider() is not None
         ):
             st.cycle_manager._runner.set_scene_snapshot_provider(
                 st._resolve_scene_snapshot_provider()
-                or _snapshot_provider_for_runtime(_hmi_server)
             )
             st.cycle_manager._runner.set_scene_snapshot_url_publisher(
                 lambda image_bytes, width, height, format, **kwargs: st.publish_scene_snapshot(
@@ -223,8 +149,6 @@ def build_program_loaded_callback(
                     model_base_url=kwargs.get("model_base_url"),
                 )
             )
-        if _hmi_server is not None:
-            _hmi_server.load_program(st.effective_program or st.program)
 
         def on_scene_edit(operation: str, request):
             visual_request = request
@@ -237,12 +161,6 @@ def build_program_loaded_callback(
             if visual_update.get("needs_refresh"):
                 st.request_visual_scene_objects_refresh(
                     reason=f"scene_edit_callback_{operation}"
-                )
-            if _hmi_server is not None and hasattr(_hmi_server, "request_scene_sync"):
-                _hmi_server.request_scene_sync(
-                    reason="scene_edit_callback",
-                    operation=operation,
-                    object_id=request.object_id,
                 )
             logger.debug(
                 "Scene invalidation requested after %s '%s'",
@@ -261,22 +179,10 @@ def build_program_loaded_callback(
         bb.register_key(key="scene_edit_callback", access=py_trees.common.Access.WRITE)
         bb.scene_edit_callback = on_scene_edit
 
-        def _sync_runtime_views(force_robot: bool = False):
-            if _hmi_server and hasattr(_hmi_server, "sync_scene_from_backend"):
-                _hmi_server.sync_scene_from_backend()
-            if (
-                _hmi_server
-                and hasattr(_hmi_server, "sync_robot_from_backend")
-            ):
-                _hmi_server.sync_robot_from_backend(force=force_robot)
-
         def _refresh_runtime_visuals():
             st.clear_visual_scene_objects_snapshot()
             st.refresh_visual_scene_objects_sync(reason="run_from_idle")
             st.request_visual_state_publish(reason="run_from_idle")
-            if _hmi_server and getattr(_hmi_server, "scene_renderer", None):
-                _hmi_server.scene_renderer.clear()
-            _sync_runtime_views(force_robot=True)
 
         st.cycle_manager._on_run_from_idle = _refresh_runtime_visuals
         st.cycle_manager.reset()
@@ -287,14 +193,7 @@ def build_program_loaded_callback(
             logger.info("Applied simulator-only initial joint positions from deployment")
         st.refresh_visual_scene_objects_sync(reason="program_loaded")
         st.request_visual_state_publish(reason="program_loaded")
-        _sync_runtime_views(force_robot=True)
-
-        if _hmi_server is not None:
-            _hmi_server.start()
-            _sync_runtime_views(force_robot=True)
-            logger.info("Legacy Viser HMI started on port %d", hmi_port)
-        else:
-            logger.info("Native visual runtime callbacks installed")
+        logger.info("Native visual runtime callbacks installed")
 
     return on_program_loaded
 
@@ -601,23 +500,6 @@ def _make_kernel(
         return MockKernelClient(execute_duration_s=mock_execute_duration_s), None
 
 
-def _resolve_roboplan_paths():
-    """Get URDF path and package share dir from installed roboplan.
-
-    Returns:
-        (urdf_path, package_share_dir) or (None, None) if not available.
-    """
-    try:
-        from roboplan import example_models
-
-        models_dir = example_models.get_package_models_dir()
-        share_dir = example_models.get_package_share_dir()
-        urdf_path = str(models_dir / "ur_robot_model" / "ur5_gripper.urdf")
-        return urdf_path, str(share_dir)
-    except Exception:
-        return None, None
-
-
 def _run_mcp(args):
     """Run ManyForge as an MCP server over stdio."""
     from manyforge_composer.backend.mcp_server import create_mcp_server
@@ -658,17 +540,11 @@ def main():
     parser.add_argument("--catalog-path", required=True, help="Path to node_catalog.yaml")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=9000)
-    parser.add_argument("--hmi-port", type=int, default=None,
-                        help="Enable the legacy Viser HMI fallback on this port (e.g. 8081)")
     parser.add_argument(
         "--static-dir",
         default=None,
         help="Explicit built frontend dist directory to serve. When set, no fallback dist is used.",
     )
-    parser.add_argument("--urdf", default=None,
-                        help="Path to robot URDF (auto-resolved from roboplan if omitted)")
-    parser.add_argument("--package-dir", action="append", default=[],
-                        help="Directory for package:// URI resolution (repeatable)")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     parser.add_argument(
         "--kernel-mode",
@@ -783,30 +659,6 @@ def main():
         mock_execute_duration_s=args.mock_execute_duration_s,
     )
 
-    # Auto-resolve URDF and package dirs from roboplan if not specified via CLI
-    urdf_path = args.urdf
-    package_dirs = normalize_package_paths(
-        args.package_dir or [],
-        base_dir=Path.cwd(),
-    )
-    if not urdf_path or not package_dirs:
-        roboplan_urdf, roboplan_share = _resolve_roboplan_paths()
-        if not urdf_path and roboplan_urdf:
-            urdf_path = roboplan_urdf
-            logger.info("URDF auto-resolved from roboplan: %s", urdf_path)
-        if not package_dirs and roboplan_share:
-            package_dirs = [roboplan_share]
-            logger.info("Package dir auto-resolved from roboplan: %s", roboplan_share)
-    if urdf_path and package_dirs:
-        try:
-            urdf_path = resolve_resource_path(
-                urdf_path,
-                base_dir=Path.cwd(),
-                package_paths=package_dirs,
-            )
-        except FileNotFoundError:
-            pass
-
     state = ComposerState(
         catalog_path=args.catalog_path,
         kernel=kernel,
@@ -833,10 +685,6 @@ def main():
     state.public_api_base_url = _default_public_api_base_url(args.host, args.port)
 
     state._on_program_loaded = build_program_loaded_callback(
-        host=args.host,
-        hmi_port=args.hmi_port,
-        urdf_path=urdf_path,
-        package_dirs=package_dirs,
         bundle=bundle,
     )
 

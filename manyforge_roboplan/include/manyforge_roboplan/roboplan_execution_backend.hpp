@@ -56,7 +56,7 @@ class RoboPlanExecutionBackend final : public core::IExecutionBackend {
   core::ResetResultDTO reset() override;
   core::ExecutionSnapshot get_execution_snapshot() const override;
 
-  // ADR-0018: atomic per-tick read of the runtime velocity scale so the HMI
+  // ADR-0018: atomic per-tick read of the runtime velocity scale so the UI
   // slider retimes in-flight discrete motion without stopping.
   void set_runtime_velocity_scale(double scale) override;
 

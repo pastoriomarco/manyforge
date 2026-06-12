@@ -105,13 +105,6 @@ def build_infra_status_payload(state: ComposerState) -> dict[str, Any]:
         "snapshot_bridge_client_connected": broker_has_clients,
     }
 
-    # Legacy HMI / Viser is dormant unless explicitly enabled.
-    if state.hmi_server is not None:
-        components["legacy_hmi"] = {
-            "status": "healthy",
-            "port": state.hmi_public_port,
-        }
-
     # Deployment
     if state.deployment is not None:
         components["deployment"] = {

@@ -80,7 +80,7 @@ export const useSceneStateStore = create<SceneStateStore>((set) => ({
 // poll at 10 Hz; when idle we stay at the 500 ms editor-friendly
 // rate; when the document is hidden we drop to 5 s to save battery.
 // 10 Hz is the empirical knee — high enough to read as smooth
-// motion on Thor, low enough that the 36-callback / 60 fps Viser
+// motion on Thor, low enough for the native-viewer invalidation path
 // failure mode the migration was triggered to fix doesn't return.
 const POLL_INTERVAL_MS_ACTIVE = 100;
 const POLL_INTERVAL_MS_IDLE = 250;

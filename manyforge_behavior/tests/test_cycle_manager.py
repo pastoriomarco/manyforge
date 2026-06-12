@@ -507,7 +507,7 @@ class TestCycleManagerReset:
         colliding pair, classification, waypoint, snapshot revision)
         FIRST, then `interrupt_latched` (policy + latch identity). A
         naive newest-first walk would surface the latch event and discard
-        the colliding-pair diagnostic, leaving the HMI with only
+        the colliding-pair diagnostic, leaving the viewer with only
         'Motion interrupted by runtime_collision_fault' when the real
         operator-actionable info is 'wall <-> wrist_1_link at waypoint 0'.
 
@@ -600,7 +600,7 @@ class TestCycleManagerReset:
         """ROS2-control backend faults keep the top-level ErrorDTO code
         compatible with the core enum and carry the exact operator-facing
         cause in error_details.reason_code. The cycle manager should surface
-        that exact token to the HMI instead of a generic execution_aborted
+        that exact token to the viewer instead of a generic execution_aborted
         banner."""
 
         class TrackingFaultKernel(MockKernelClient):
@@ -1534,11 +1534,14 @@ class TestRecoveryTriggerTaxonomy:
         assert "timeout" not in canonical_recovery_trigger_values()
         assert "node_failure" not in canonical_recovery_trigger_values()
 
-    def test_legacy_aliases_still_parse(self):
-        # These are kept for serialised-trace round-trip during the
-        # migration window. Removal target lives in open-points.md.
-        assert RecoveryTrigger("timeout") is RecoveryTrigger.TIMEOUT
-        assert RecoveryTrigger("node_failure") is RecoveryTrigger.NODE_FAILURE
+    def test_legacy_aliases_are_removed(self):
+        # Persisted traces carry trigger strings outward only and are never
+        # parsed back into the enum, so the legacy aliases are gone.
+        with pytest.raises(ValueError):
+            RecoveryTrigger("timeout")
+        with pytest.raises(ValueError):
+            RecoveryTrigger("node_failure")
+        assert {member.value for member in RecoveryTrigger} == self.CANONICAL
 
     def test_unknown_string_is_rejected(self):
         with pytest.raises(ValueError):
@@ -1743,3 +1746,65 @@ class TestCycleManagerRunSideAutoAck:
         assert ok is False
         assert reason.startswith("kernel_status_unreadable:")
         assert "RuntimeError" in reason
+
+
+class TestGripperFaultDiagnostics:
+    """The digest must carry the gripper reason token when a tree fails on a
+    gripper fault: the gripper runtime has no kernel-snapshot error surface,
+    so the cycle manager reads the structured record the command_gripper
+    node mirrors onto the blackboard."""
+
+    def _write_fault(self, details):
+        bb = py_trees.blackboard.Client(name="gripper_fault_writer")
+        bb.register_key(
+            key="gripper_fault_details", access=py_trees.common.Access.WRITE
+        )
+        bb.set("gripper_fault_details", details)
+
+    def test_classified_gripper_fault_is_promoted(self, kernel):
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        manager = CycleManager(runner, kernel)
+        self._write_fault(
+            {
+                "reason_code": "gripper_goal_rejected",
+                "gripper_id": "primary",
+                "surface": "command_gripper",
+                "message": "Gripper action goal was rejected",
+            }
+        )
+
+        code, details = manager._capture_kernel_error_diagnostics()
+        assert code == "gripper_goal_rejected"
+        assert details["gripper_id"] == "primary"
+        assert details["surface"] == "command_gripper"
+
+    def test_unknown_reason_token_is_not_promoted(self, kernel):
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        manager = CycleManager(runner, kernel)
+        self._write_fault({"reason_code": "not_a_real_token", "gripper_id": "g"})
+
+        code, details = manager._capture_kernel_error_diagnostics()
+        assert code is None
+        assert details == {"reason_code": "not_a_real_token", "gripper_id": "g"}
+
+    def test_snapshot_error_wins_over_gripper_record(self, kernel):
+        from types import SimpleNamespace
+
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        manager = CycleManager(runner, kernel)
+        kernel.get_execution_snapshot = lambda: SimpleNamespace(
+            error_code="execution_aborted",
+            error_details={"reason_code": "tracking_error_exceeded"},
+        )
+        self._write_fault({"reason_code": "gripper_goal_rejected"})
+
+        code, details = manager._capture_kernel_error_diagnostics()
+        assert code == "tracking_error_exceeded"
+        assert details == {"reason_code": "tracking_error_exceeded"}
+
+    def test_no_sources_returns_nothing(self, kernel):
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        manager = CycleManager(runner, kernel)
+        code, details = manager._capture_kernel_error_diagnostics()
+        assert code is None
+        assert details is None

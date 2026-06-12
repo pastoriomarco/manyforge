@@ -23,19 +23,9 @@ manyforge_build_frontend_dist \
 BUILD_DIR="${MANYFORGE_ROBOPLAN_BUILD_DIR:-${MANYFORGE_BUILD_DIR:-/tmp/manyforge-build}/roboplan}"
 export PYTHONPATH="${BUILD_DIR}:/workspace/manyforge_roboplan/python:${PYTHONPATH:-}"
 COMPOSER_PORT="${MANYFORGE_COMPOSER_PORT:-${COMPOSER_PORT:-9000}}"
-HMI_PORT="${MANYFORGE_HMI_PORT:-${HMI_PORT:-8081}}"
-ENABLE_LEGACY_HMI="${MANYFORGE_ENABLE_LEGACY_VISER_HMI:-${ENABLE_LEGACY_VISER_HMI:-false}}"
-
-hmi_args=()
-case "${ENABLE_LEGACY_HMI,,}" in
-    1|true|yes|on)
-        hmi_args+=(--hmi-port "${HMI_PORT}")
-        ;;
-esac
 
 exec python -m manyforge_composer \
     --catalog-path /workspace/manyforge_behavior/resources/node_catalog.yaml \
     --host 0.0.0.0 \
     --port "${COMPOSER_PORT}" \
-    "${hmi_args[@]}" \
     --static-dir "${MANYFORGE_FRONTEND_STATIC_DIR}"

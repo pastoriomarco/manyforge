@@ -1,8 +1,8 @@
-"""Standard ROS 2 diagnostics surface for ManyForge (audit Phase 6H).
+"""Standard ROS 2 diagnostics surface for ManyForge.
 
 Publishes ``diagnostic_msgs/DiagnosticArray`` on ``/diagnostics`` from the
 Composer's execution digest: one ``DiagnosticStatus`` per active backend
-fault (level/values mapped from the Phase 6A fault taxonomy) and an OK
+fault (level/values mapped from the backend fault taxonomy) and an OK
 heartbeat when healthy. The heartbeat is what drives PASSED/healing on
 AUTOSAR-DEM-style consumers (e.g. ros2_medkit's stock diagnostic bridge),
 so it is not optional.
@@ -10,7 +10,7 @@ so it is not optional.
 Deliberately medkit-free: this module depends only on standard
 ``diagnostic_msgs`` and the ManyForge fault taxonomy. Vendor-specific
 enrichment (discovery hints, direct fault reporting) lives in the separate
-``manyforge_medkit_adapter`` package (Phase 6I).
+``manyforge_medkit_adapter`` package.
 
 The mapping core (`build_diagnostic_statuses`) is pure data-in/data-out so
 it tests hermetically; the rclpy node is a thin shell around it.
@@ -25,7 +25,10 @@ import time
 import urllib.request
 from typing import Any, Optional
 
-from manyforge_behavior.fault_taxonomy import ROS2_CONTROL_BACKEND_FAULT_CLASSES
+from manyforge_behavior.fault_taxonomy import (
+    ROS2_CONTROL_BACKEND_FAULT_CLASSES,
+    classify_digest_fault,
+)
 
 # diagnostic_msgs/DiagnosticStatus levels (bytes); kept as ints here so the
 # mapping core stays import-free.
@@ -40,13 +43,14 @@ _SEVERITY_TO_LEVEL = {
     "ERROR": LEVEL_ERROR,
     # diagnostic_msgs has no CRITICAL level; CRITICAL maps to ERROR and the
     # operational severity is preserved in values["manyforge_severity"]
-    # (medkit-style consumers needing debounce bypass use the 6I adapter,
-    # which reports CRITICAL natively).
+    # (medkit-style consumers needing debounce bypass use the medkit
+    # adapter, which reports CRITICAL natively).
     "CRITICAL": LEVEL_ERROR,
 }
 
 _SURFACE_TO_COMPONENT = {
     "ros2_control_execution_backend": "execution",
+    "command_gripper": "gripper",
 }
 
 _FAULT_CODE_SAFE = re.compile(r"[^A-Z0-9_]")
@@ -94,27 +98,13 @@ def build_diagnostic_statuses(
             }
         ]
 
-    error_code = digest.get("errorCode") or digest.get("error_code")
-    error_details = digest.get("errorDetails") or digest.get("error_details") or {}
-    error_message = digest.get("error")
-    reason_code = None
-    if isinstance(error_details, dict):
-        reason_code = error_details.get("reason_code")
-    if reason_code is None and isinstance(error_code, str) and error_code:
-        reason_code = error_code
+    fault = classify_digest_fault(digest)
+    error_details = fault.details
+    error_message = fault.message
+    reason_code = fault.reason_code
+    state = fault.state
 
-    state = str(digest.get("state") or "").lower()
-    # The digest can carry the previous run's error prose while a new run is
-    # active; only non-running/idle states with a message latch a fault
-    # (same guard as the medkit forwarder — a stale fault must not mask the
-    # healthy heartbeat).
-    fault_active = (
-        bool(error_message)
-        and bool(reason_code)
-        and state not in ("running", "idle")
-    )
-
-    if not fault_active:
+    if not fault.active:
         return [
             {
                 "name": "manyforge/execution",

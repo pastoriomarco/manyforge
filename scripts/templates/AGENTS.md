@@ -74,7 +74,7 @@ Edit the collision scene. Not allowed while cycle state is `running`.
 Returns: `{success, error, timestamp_ns}`
 
 **`manyforge_scene_snapshot(width=640, height=480, format="jpeg")`**
-Render the 3D scene as a base64-encoded image. Requires HMI server.
+Render the 3D scene as a base64-encoded image. Requires a connected native viewer.
 Returns: `{image_base64, width, height, format, timestamp_ns}`
 
 ### Program

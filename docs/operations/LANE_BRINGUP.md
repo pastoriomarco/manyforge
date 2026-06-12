@@ -30,6 +30,7 @@ shared across lanes.
 | Sandbox | none — talks straight to vLLM | OpenClaw gateway in `openshell-my-assistant-*` (`:18789` in-sandbox) | Hermes `/v1/runs` gateway in `openshell-hermes-*` (forwarded to host `:8642`) |
 | Smoke `--self-heal-lane` | `state-only` | `openclaw` | `hermes` |
 | Enable gate | none | none | `HERMES_LANE_PHASE4_ENABLED=true` |
+| First-time provisioning | `scripts/setup-direct.sh` (host venv only — no sandbox, no onboarding) | one-time `nemoclaw onboard` creates the `my-assistant` sandbox (see `NemoClaw-Thor/USER_QUICKSTART_MANUAL.md` — some onboard defaults need the local-provider fixups), then `NemoClaw-Thor/manyforge/setup-manyforge-assistant.sh` applies the merged policy | `scripts/setup-hermes.sh <sandbox>` provisions its own born-with-MCP sandbox — `nemoclaw onboard` is NOT used for this lane |
 
 > **Lane dev/analysis** (cross-lane numbers, speed, scorer-strictness) lives in
 > the sibling `NemoClaw-Thor` repo: `manyforge/docs/LANE-COMPARISON.md`; the full

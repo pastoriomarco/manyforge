@@ -469,7 +469,7 @@ class QueryModelNode(py_trees.behaviour.Behaviour):
                 None,
                 None,
                 None,
-                "scene snapshot requested but no HMI render provider configured",
+                "scene snapshot requested but no native viewer render provider configured",
                 False,
             )
 

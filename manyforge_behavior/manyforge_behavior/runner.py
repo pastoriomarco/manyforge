@@ -364,7 +364,7 @@ class OrchestratorRunner:
         self,
         provider: Optional[Callable[[int, int, str], Optional[bytes]]],
     ) -> None:
-        """Update the HMI-backed render provider used by query_model nodes."""
+        """Update the viewer-backed render provider used by query_model nodes."""
         self._scene_snapshot_provider = provider
 
     def set_scene_snapshot_url_publisher(

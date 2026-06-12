@@ -27,15 +27,13 @@ old demos:
   `STOP_KNOWN_CONFLICTS={true|false}`, `DROP_CACHES={true|false}`,
   `PRESERVE_OPENSHELL`. `STOP_KNOWN_CONFLICTS` now defaults to `false`;
   normal `start` fails when launcher-managed components are already running.
-- **Composer / HMI endpoints**: `COMPOSER_URL` (full URL —
-  `http://HOST:PORT`, no `/api/` suffix), `HMI_URL`.
-- **Composer / HMI ports** (new — host-network aware):
-  `COMPOSER_PORT` (default 9000), `HMI_PORT` (default 8081). The
-  launcher passes these into the dev container as env vars; the
-  inline Composer process reads them. Preflight honours the resolved
-  values and now treats already-running launcher-managed components as
-  conflicts; use `scripts/launch.sh stop` or `scripts/launch.sh restart`
-  before starting again.
+- **Composer endpoint / port**: `COMPOSER_URL` (full URL —
+  `http://HOST:PORT`, no `/api/` suffix) and `COMPOSER_PORT`
+  (default 9000). The launcher passes the port into the dev container
+  as an env var; the inline Composer process reads it. Preflight
+  honours the resolved value and now treats already-running
+  launcher-managed components as conflicts; use `scripts/launch.sh stop`
+  or `scripts/launch.sh restart` before starting again.
 - **Isaac auto-load escape hatch**: `LOAD_ARTIFACTS={true|false}`.
   Setting `LOAD_ARTIFACTS=false` brings up the Isaac compose
   services without the supervisor auto-loading the program (operator
@@ -100,13 +98,12 @@ each old workflow to its current correct command:
 |---|---|
 | `./scripts/demo.sh --simple` | Same flag, same effect (3-step test fixture). The shim strips `--simple` from any position in `$@` and forwards `--scenario ur5-simple-pick-place`. No env-var migration needed |
 | `./scripts/demo-shape-pick.sh --api-port 9010` | `COMPOSER_PORT=9010 ./scripts/demo-shape-pick.sh start` (the old `--api-port` was undocumented as a port number, not a URL fragment; the new env-var path is what every shim respects) |
-| `./scripts/demo-shape-pick.sh --hmi-port 8090` | `HMI_PORT=8090 ./scripts/demo-shape-pick.sh start` |
 | `./scripts/demo-assistant-known-good.sh restart-bridge` | `./scripts/demo-assistant-known-good.sh restart` (full restart — see "Partial-restart workflow" below for the kill-and-`start` recipe if iteration velocity matters) |
 | `./scripts/demo-assistant-known-good.sh reload-composer` / `restart-composer` | `./scripts/demo-assistant-known-good.sh restart` |
 | `./scripts/demo-isaac-ros2-control.sh load` / `recover` | `./scripts/demo-isaac-ros2-control.sh start` (idempotent — re-runs the program/deployment load via `isaac_demo_supervisor`) |
 | **Strict ROS-readiness gating** on Isaac lane start | Use `./scripts/launch.sh smoke` (or `./scripts/demo-isaac-ros2-control.sh smoke`) instead of `start`. The old script's `start` blocked synchronously on `/isaac_joint_states` + FJT + gripper + controller_state; the new launcher's `start` returns once Composer can report runtime status, and the `isaac_demo_supervisor` row in the popup tracks external readiness. CI scripts that need the strict gate should switch from `... start` to `... smoke` |
 | **Strict vLLM-readiness gating** on assistant lane start | Same pattern: `start` checks that the vLLM container, proxy, and bridge launched and didn't immediately exit (process liveness); the `assistant_supervisor` row in the popup tracks full readiness (`/v1/models` ready, served model id matches, bridge `/healthz`). Use `./scripts/launch.sh smoke` to block synchronously on the strict probes |
-| `HEALTH_TIMEOUT_S=NN` (single ceiling for Composer health) | Replaced by per-service env vars, split by whether they apply during `start` or only during `smoke`. **Start-side** (default): `COMPOSER_READY_TIMEOUT_S=600` (Composer health, blocking), `HMI_PORT_READY_TIMEOUT_S=30` (non-fatal, runs after program load), `VLLM_LIVENESS_GRACE_S=5` / `PROXY_LIVENESS_GRACE_S=2` / `BRIDGE_LIVENESS_GRACE_S=5` (process-up checks), `ASSISTANT_SUPERVISOR_GRACE_S=3`. **Smoke-side** (strict readiness, default): `VLLM_MODEL_READY_TIMEOUT_S=900`, `VLLM_PROXY_READY_TIMEOUT_S=30`, `ASSISTANT_BRIDGE_READY_TIMEOUT_S=60`, `ROS_DISCOVERY_TIMEOUT_S=45`. The old `HEALTH_TIMEOUT_S` still works as an alias for `COMPOSER_READY_TIMEOUT_S` (for one release cycle, with a one-time deprecation warning). See `scripts/launch.sh --help` for the same table. |
+| `HEALTH_TIMEOUT_S=NN` (single ceiling for Composer health) | Replaced by per-service env vars, split by whether they apply during `start` or only during `smoke`. **Start-side** (default): `COMPOSER_READY_TIMEOUT_S=600` (Composer health, blocking), `VLLM_LIVENESS_GRACE_S=5` / `PROXY_LIVENESS_GRACE_S=2` / `BRIDGE_LIVENESS_GRACE_S=5` (process-up checks), `ASSISTANT_SUPERVISOR_GRACE_S=3`. **Smoke-side** (strict readiness, default): `VLLM_MODEL_READY_TIMEOUT_S=900`, `VLLM_PROXY_READY_TIMEOUT_S=30`, `ASSISTANT_BRIDGE_READY_TIMEOUT_S=60`, `ROS_DISCOVERY_TIMEOUT_S=45`. The old `HEALTH_TIMEOUT_S` still works as an alias for `COMPOSER_READY_TIMEOUT_S` (for one release cycle, with a one-time deprecation warning). See `scripts/launch.sh --help` for the same table. |
 
 ### Restart workflow (replaces `restart-bridge` / `reload-composer`)
 

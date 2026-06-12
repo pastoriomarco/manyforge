@@ -4,7 +4,7 @@ name: ur5_roboplan_local_semantic_shape_pick
 description: >-
   Local deployment for the semantic object-selection demo. A VLM selects one
   backend-authoritative scene object from a deterministic manifest plus an
-  auxiliary HMI snapshot, and the backend computes the actual pick sequence
+  auxiliary viewer snapshot, and the backend computes the actual pick sequence
   deterministically from backend scene state.
 
 program_profile: v0.1

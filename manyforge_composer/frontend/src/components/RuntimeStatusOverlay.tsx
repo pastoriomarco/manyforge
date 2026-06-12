@@ -97,7 +97,7 @@ function ComponentRow({ component }: { component: RuntimeComponentStatus }) {
 export function RuntimeStatusOverlay() {
   const [open, setOpen] = useState(false);
   // Single shared poll loop in ../store/statusStore.ts. This component
-  // is one of two subscribers (ViserPanel is the other); together they
+  // is one of the persistent runtime-status subscribers; together they
   // replace what used to be two independent setInterval timers fetching
   // the same /api/runtime/status endpoint every 2 s.
   useStatusPolling();

@@ -185,7 +185,7 @@ class MoveManipulatorAction(py_trees.behaviour.Behaviour):
             else:
                 return py_trees.common.Status.RUNNING
 
-        # This is the authored per-move planning/execution scale. The HMI runtime
+        # This is the authored per-move planning/execution scale. The viewer runtime
         # velocity slider is a separate live control surface: CycleManager forwards
         # it to the kernel/backend, which retimes in-flight execution without
         # stopping or re-dispatching this behavior node.
@@ -267,37 +267,41 @@ class MoveManipulatorAction(py_trees.behaviour.Behaviour):
                 )
 
             referenced_object_ids = _relative_move_object_ids(relative_move)
+            callbacks = [
+                (
+                    "pose_source_apply_callback",
+                    "before-planning",
+                    [],
+                ),
+            ]
             if referenced_object_ids:
-                callbacks = (
-                    (
-                        "pose_source_apply_callback",
-                        "before-planning",
-                    ),
+                callbacks.append(
                     (
                         "pose_source_between_nodes_callback",
                         "between-nodes",
-                    ),
-                )
-                for blackboard_key, label in callbacks:
-                    apply_callback = self._read_optional_blackboard_value(
-                        blackboard_key
+                        referenced_object_ids,
                     )
-                    if not callable(apply_callback):
-                        continue
-                    try:
-                        apply_result = apply_callback(
-                            object_ids=referenced_object_ids,
-                            reason=f"motion_node:{self.name}",
-                        )
-                    except Exception as exc:  # noqa: BLE001 - callback boundary
-                        return self._enter_soft_fail(
-                            f"{label} pose-source apply raised: {exc}"
-                        )
-                    if not apply_result.get("success", False):
-                        error = apply_result.get("error") or (
-                            f"{label} pose-source apply failed"
-                        )
-                        return self._enter_soft_fail(str(error))
+                )
+            for blackboard_key, label, object_ids in callbacks:
+                apply_callback = self._read_optional_blackboard_value(
+                    blackboard_key
+                )
+                if not callable(apply_callback):
+                    continue
+                try:
+                    apply_result = apply_callback(
+                        object_ids=object_ids,
+                        reason=f"motion_node:{self.name}",
+                    )
+                except Exception as exc:  # noqa: BLE001 - callback boundary
+                    return self._enter_soft_fail(
+                        f"{label} pose-source apply raised: {exc}"
+                    )
+                if not apply_result.get("success", False):
+                    error = apply_result.get("error") or (
+                        f"{label} pose-source apply failed"
+                    )
+                    return self._enter_soft_fail(str(error))
 
             request = ExecuteRequest(
                 robot_id=self._params.get("robot_id", ""),

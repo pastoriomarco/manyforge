@@ -23,6 +23,7 @@ if [ -f "${WORKSPACE}/install/setup.bash" ]; then
     set -u
 fi
 
+export PYTHONPYCACHEPREFIX="${PYTHONPYCACHEPREFIX:-/tmp/manyforge-pycache}"
 export PYTHONPATH="${WORKSPACE}/manyforge_ros:${WORKSPACE}/manyforge_behavior:${WORKSPACE}/manyforge_medkit_adapter:${WORKSPACE}:${PYTHONPATH:-}"
 
 cd "$WORKSPACE"

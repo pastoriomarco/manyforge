@@ -484,6 +484,7 @@ export interface SimulationResetConfig {
   defaultScope: 'state';
   closeCommandGate: boolean;
   waitReadyS: number;
+  resumePlayAfterReset: boolean;
 }
 
 export interface SimulationControlConfig {
@@ -502,6 +503,8 @@ export interface SimulationResetResponse {
   durationS: number;
   commandGateClosed: boolean;
   commandGateReopened: boolean;
+  resumePlayAfterReset: boolean;
+  resumePlayResult?: Record<string, unknown> | null;
   readiness?: Record<string, unknown> | null;
 }
 
@@ -1001,7 +1004,7 @@ export interface SceneFrameState {
 
 export interface SceneFramesResponse {
   frames: SceneFrameState[];
-  hmiAvailable: boolean;
+  viewerAvailable: boolean;
   frameGizmoSizeM: number;
   visualStateDiagnostics?: VisualStateRouteDiagnostics | null;
   timestampNs: number;
@@ -1011,7 +1014,7 @@ export interface SceneFrameVisibilityResponse {
   success: boolean;
   frameName: string;
   visible: boolean;
-  hmiAvailable: boolean;
+  viewerAvailable: boolean;
   timestampNs: number;
   error?: string | null;
 }
@@ -1019,7 +1022,7 @@ export interface SceneFrameVisibilityResponse {
 export interface SceneFrameGizmoSizeResponse {
   success: boolean;
   axesLengthM: number;
-  hmiAvailable: boolean;
+  viewerAvailable: boolean;
   timestampNs: number;
   error?: string | null;
 }
@@ -1028,7 +1031,7 @@ export interface SceneObjectFrameVisibilityResponse {
   success: boolean;
   objectId: string;
   visible: boolean;
-  hmiAvailable: boolean;
+  viewerAvailable: boolean;
   timestampNs: number;
   error?: string | null;
 }
@@ -1073,7 +1076,7 @@ export interface StateUpdate {
   runtimeOverrideStatus?: RuntimeOverrideStatus | null;
   error?: string | null;
   // Structured cycle-manager error surface pushed alongside the human-
-  // readable message so the HMI can render a rich cause panel without
+  // readable message so the viewer can render a rich cause panel without
   // a separate poll.
   errorCode?: string | null;
   errorDetails?: Record<string, unknown> | null;

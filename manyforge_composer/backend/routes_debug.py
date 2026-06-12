@@ -54,32 +54,11 @@ def build_scene_trace_payload(state: ComposerState, *, limit: int = 200) -> dict
         },
     ]
 
-    hmi_trace = []
-    object_diagnostics = {}
-    hmi_server = getattr(state, "hmi_server", None)
-    if hmi_server is not None:
-        if hasattr(hmi_server, "get_scene_trace"):
-            hmi_trace = hmi_server.get_scene_trace(limit=limit)
-        if hasattr(hmi_server, "get_object_render_diagnostics"):
-            object_ids = set()
-            if state.kernel is not None:
-                object_ids.update(
-                    scene_object.object_id for scene_object in state.kernel.get_scene_objects()
-                )
-            if state.program is not None:
-                object_ids.update(resource.object_id for resource in state.program.scene or [])
-            for object_id in sorted(object_ids):
-                object_diagnostics[object_id] = (
-                    hmi_server.get_object_render_diagnostics(object_id)
-                )
-
     return {
         "scope": {
             "included": [
                 "backend scene mutation trace (add/remove/update_pose/attach/detach)",
                 "native visual cache scene/object snapshot state",
-                "legacy HMI invalidation hints when the optional HMI is running",
-                "current per-object backend-vs-render diagnostics when available",
             ],
             "excluded": [
                 "browser-side WebGL/client rendering and pixels",
@@ -89,8 +68,6 @@ def build_scene_trace_payload(state: ComposerState, *, limit: int = 200) -> dict
         },
         "backend": backend_trace,
         "visual": visual_trace,
-        "hmi": hmi_trace,
-        "objects": object_diagnostics,
     }
 
 
@@ -276,7 +253,7 @@ def create_debug_router(state: ComposerState) -> APIRouter:
 
     @router.get("/scene-trace")
     def debug_scene_trace(limit: int = 200) -> dict[str, Any]:
-        """Return current backend/HMI scene trace data."""
+        """Return current backend/native-viewer scene trace data."""
         return build_scene_trace_payload(state, limit=limit)
 
     @router.get("/export")

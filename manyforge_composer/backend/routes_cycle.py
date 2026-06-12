@@ -25,7 +25,7 @@ def _structured_command_error(
 ) -> dict[str, Any]:
     """Build a structured `detail` payload for a cycle-command 409.
 
-    The HMI renders `errorCode` + `errorDetails` into a cause panel so the
+    The native viewer renders `errorCode` + `errorDetails` into a cause panel so the
     operator sees the actual kernel diagnostics (collision pair, waypoint
     index, fault reason code) instead of only the human-readable message.
     Pulls structured fields from the cycle manager when available, falling
@@ -67,7 +67,7 @@ def create_cycle_router(state: ComposerState) -> APIRouter:
         """Get current cycle status.
 
         The error fields surface the kernel/cycle-manager's structured fault
-        so the HMI can render a cause panel without polling the kernel
+        so the viewer can render a cause panel without polling the kernel
         snapshot separately. Empty when no error is active.
         """
         if state.cycle_manager is None:
@@ -135,7 +135,7 @@ def create_cycle_router(state: ComposerState) -> APIRouter:
             # Cycle-manager Run-side auto-ack refusals (e.g. "Cannot
             # auto-acknowledge kernel INTERVENTION_REQUIRED on Run:
             # intervention_session_running.") surface as RuntimeError.
-            # Translate to a structured 409 so the HMI can render the
+            # Translate to a structured 409 so the viewer can render the
             # kernel's actual cause from the cycle-manager's preserved
             # error_code / error_details instead of a generic banner.
             raise HTTPException(

@@ -3117,6 +3117,7 @@ void Ros2ControlExecutionBackend::on_gripper_feedback(
       runtime->cancel_pending = false;
       runtime->active_goal_handle.reset();
       runtime->error.clear();
+      runtime->reason_code.clear();
     }
   }
   if (feedback_position.has_value() && (!is_commanded_sim_mode() || reached_goal)) {
@@ -3149,25 +3150,32 @@ void Ros2ControlExecutionBackend::on_gripper_result(
         if (result.result && result.result->reached_goal) {
           runtime->state = "completed";
           runtime->error.clear();
+          runtime->reason_code.clear();
           if (!result_position.has_value()) {
             result_position = runtime->target_position;
           }
         } else {
           runtime->state = "failed";
           runtime->error = "Gripper action succeeded without reaching the goal";
+          runtime->reason_code =
+              ros2_control_fault_reason::kGripperResultFailed;
         }
         break;
       case rclcpp_action::ResultCode::ABORTED:
         runtime->state = "failed";
         runtime->error = "Gripper action aborted";
+        runtime->reason_code = ros2_control_fault_reason::kGripperGoalAborted;
         break;
       case rclcpp_action::ResultCode::CANCELED:
         runtime->state = "idle";
         runtime->error.clear();
+        runtime->reason_code.clear();
         break;
       default:
         runtime->state = "failed";
         runtime->error = "Gripper action returned an unknown result code";
+        runtime->reason_code =
+            ros2_control_fault_reason::kGripperResultFailed;
         break;
     }
   }
@@ -3220,14 +3228,16 @@ Ros2GripperCommandResult Ros2ControlExecutionBackend::command_gripper(
     double max_effort) {
   if (!std::isfinite(target_position) || !std::isfinite(duration_s) ||
       !std::isfinite(max_effort) || duration_s < 0.0) {
-    return {false, "Invalid gripper command target, duration, or max effort"};
+    return {false, "Invalid gripper command target, duration, or max effort",
+            ros2_control_fault_reason::kGripperInvalidCommand};
   }
   std::shared_ptr<GripperRuntime> runtime;
   {
     std::lock_guard<std::mutex> lock(gripper_map_mutex_);
     const auto it = grippers_.find(gripper_id);
     if (it == grippers_.end()) {
-      return {false, "No ROS GripperCommand action configured for " + gripper_id};
+      return {false, "No ROS GripperCommand action configured for " + gripper_id,
+              ros2_control_fault_reason::kGripperNotConfigured};
     }
     runtime = it->second;
   }
@@ -3240,7 +3250,8 @@ Ros2GripperCommandResult Ros2ControlExecutionBackend::command_gripper(
       return {false,
               "Cannot project gripper '" + gripper_id +
                   "' into RoboPlan scene group '" + runtime_config.group_id +
-                  "' joint '" + runtime_config.joint_name + "'"};
+                  "' joint '" + runtime_config.joint_name + "'",
+              ros2_control_fault_reason::kGripperNotConfigured};
     }
   }
 
@@ -3249,13 +3260,15 @@ Ros2GripperCommandResult Ros2ControlExecutionBackend::command_gripper(
   if (!runtime->action_client->wait_for_action_server(wait_timeout)) {
     return {false,
             "Timed out waiting for gripper action server " +
-                runtime->config.action_name};
+                runtime->config.action_name,
+            ros2_control_fault_reason::kGripperActionServerUnavailable};
   }
 
   {
     std::lock_guard<std::mutex> lock(runtime->mutex);
     if (runtime->executing) {
-      return {false, "Gripper " + gripper_id + " is already executing"};
+      return {false, "Gripper " + gripper_id + " is already executing",
+              ros2_control_fault_reason::kGripperBusy};
     }
     runtime->state = "executing";
     runtime->executing = true;
@@ -3277,6 +3290,7 @@ Ros2GripperCommandResult Ros2ControlExecutionBackend::command_gripper(
     }
     runtime->active_goal_handle.reset();
     runtime->error.clear();
+    runtime->reason_code.clear();
   }
 
   GripperCommand::Goal goal;
@@ -3312,6 +3326,8 @@ Ros2GripperCommandResult Ros2ControlExecutionBackend::command_gripper(
                         "closed: simulator reset incomplete or failed — run "
                         "simulation reset)"
                       : "Gripper action goal was rejected";
+              runtime->reason_code =
+                  ros2_control_fault_reason::kGripperGoalRejected;
             }
             return;
           }
@@ -3324,6 +3340,7 @@ Ros2GripperCommandResult Ros2ControlExecutionBackend::command_gripper(
             runtime->cancel_pending = false;
             runtime->state = "idle";
             runtime->error.clear();
+            runtime->reason_code.clear();
           } else {
             runtime->goal_accepted = true;
             runtime->active_goal_handle = goal_handle;
@@ -3360,13 +3377,16 @@ Ros2GripperCommandResult Ros2ControlExecutionBackend::command_gripper(
       runtime->cancel_pending = false;
       runtime->error = std::string("Failed to dispatch gripper action goal: ") +
                        exc.what();
+      runtime->reason_code =
+          ros2_control_fault_reason::kGripperGoalDispatchFailed;
     }
-    return {false, runtime->error};
+    return {false, runtime->error,
+            ros2_control_fault_reason::kGripperGoalDispatchFailed};
   }
   if (duration_s <= 0.0 && start_position.has_value()) {
     project_gripper_position_to_scene(runtime_config, target_position);
   }
-  return {true, ""};
+  return {true, "", ""};
 }
 
 void Ros2ControlExecutionBackend::update_gripper_commands() {
@@ -3398,6 +3418,8 @@ void Ros2ControlExecutionBackend::update_gripper_commands() {
         runtime->goal_accepted = false;
         runtime->cancel_pending = false;
         runtime->error = "Timed out waiting for gripper action result";
+        runtime->reason_code =
+            ros2_control_fault_reason::kGripperResultTimeout;
       } else if (!runtime_config.group_id.empty() &&
                  !runtime_config.joint_name.empty()) {
         if (is_commanded_sim_mode() && runtime->start_position.has_value()) {
@@ -3459,6 +3481,7 @@ Ros2GripperStatus Ros2ControlExecutionBackend::get_gripper_status(
     status.progress = 0.0;
   }
   status.error = runtime->error;
+  status.reason_code = runtime->reason_code;
   return status;
 }
 

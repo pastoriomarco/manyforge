@@ -48,7 +48,7 @@ includes the canonical pair, body ids, and
 2. `GET /api/kernel/snapshot` — confirm the active world revision and
    read the structured error.
 3. `GET /api/scene/diagnostics` — compare backend-authoritative scene
-   state with HMI render state. **First place to look on the Isaac
+   state with native viewer render state. **First place to look on the Isaac
    lane**: a stale Isaac pose can drive a rejection even when the
    viewer looks correct (this was the live regression fixed in commit
    `35684b0 Fix collision snapshot validation for Isaac pose sources`).

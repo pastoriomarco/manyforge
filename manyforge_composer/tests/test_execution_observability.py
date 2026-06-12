@@ -16,7 +16,12 @@ pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient
 
 from manyforge_behavior.capabilities import V0_0_REQUIRED_KEYS
-from manyforge_behavior.kernel_client import MockKernelClient, SceneEditRequest
+from manyforge_behavior.kernel_client import (
+    MockKernelClient,
+    SceneEditRequest,
+    SceneObjectSnapshot,
+    SceneShape,
+)
 from manyforge_composer.backend.app import create_app
 from manyforge_composer.backend.security import SecurityConfig
 from manyforge_composer.backend.state import ComposerState
@@ -206,7 +211,7 @@ def test_infra_heartbeat_degrades_when_failure_archives_drop(tmp_path):
         assert archive["status"] == "degraded"
         assert archive["dropped_archives"] == 1
 
-def test_scene_diagnostics_reports_hmi_mismatch():
+def test_scene_diagnostics_reports_native_visual_mismatch():
     kernel = MockKernelClient()
     kernel.scene_edit(
         SceneEditRequest(
@@ -220,21 +225,20 @@ def test_scene_diagnostics_reports_hmi_mismatch():
         )
     )
     state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
-
-    class DummyHmi:
-        def get_object_render_diagnostics(self, object_id):
-            return {
-                "object_id": object_id,
-                "frame_path": None,
-                "render": {
-                    "object_id": object_id,
-                    "scene_name": None,
-                    "render_state": None,
-                    "scene_node_present": False,
+    state.update_visual_scene_objects_snapshot(
+        [
+            SceneObjectSnapshot(
+                object_id="other_box",
+                shape=SceneShape(type="box", box_dimensions_m=[0.1, 0.1, 0.1]),
+                pose_in_universe={
+                    "position_m": [0.0, 0.0, 0.0],
+                    "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
                 },
-            }
-
-    state.hmi_server = DummyHmi()
+                attached=False,
+                frame_id="universe",
+            )
+        ]
+    )
     app = create_app(state)
 
     with TestClient(app) as client:
@@ -245,10 +249,10 @@ def test_scene_diagnostics_reports_hmi_mismatch():
         assert data["summary"]["total"] == 1
         assert data["summary"]["matched"] == 0
         assert data["summary"]["mismatched"] == 1
-        assert data["summary"]["hmiAvailable"] is True
+        assert data["summary"]["viewerAvailable"] is True
         assert data["objects"][0]["object_id"] == "diag_box"
         assert data["objects"][0]["match"] is False
-        assert "not rendered" in data["objects"][0]["mismatch_reason"]
+        assert "not rendered in native visual cache" in data["objects"][0]["mismatch_reason"]
 
 
 def test_execution_digest_and_debug_export_report_signal_provider_health():

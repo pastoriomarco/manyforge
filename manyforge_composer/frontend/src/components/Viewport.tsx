@@ -71,12 +71,9 @@ function ViewerCrashFallback() {
   );
 }
 
-// Native-only cutover: the in-React-tree R3F viewer owns the active viewport.
-// The legacy Viser panel remains dormant in the repository until the deletion
-// gate in the migration plan is approved. See
-// `manyforge_specs/docs/implementation/composer-native-3d-visualizer-migration.md`.
-const MIN_VISER_WIDTH = 480;
-const MAX_VISER_WIDTH = 960;
+// The in-React-tree R3F viewer owns the active viewport.
+const MIN_VIEWER_WIDTH = 480;
+const MAX_VIEWER_WIDTH = 960;
 const MIN_PROPERTIES_WIDTH = 260;
 const MAX_PROPERTIES_WIDTH = 520;
 
@@ -89,11 +86,11 @@ function clamp(value: number, min: number, max: number): number {
 }
 
 export function Viewport() {
-  const [viserWidth, setViserWidth] = useState(720);
+  const [viewerWidth, setViewerWidth] = useState(720);
   const [propertyWidth, setPropertyWidth] = useState(320);
-  const [viserCollapsed, setViserCollapsed] = useState(false);
+  const [viewerCollapsed, setViewerCollapsed] = useState(false);
   const [propertyCollapsed, setPropertyCollapsed] = useState(false);
-  const [activeResize, setActiveResize] = useState<'properties' | 'viser' | null>(null);
+  const [activeResize, setActiveResize] = useState<'properties' | 'viewer' | null>(null);
 
   const flowToTree = useProgramStore((state) => state.flowToTree);
   const appliedTree = useProgramStore((state) => state.appliedTree);
@@ -107,7 +104,7 @@ export function Viewport() {
   const beginResize = useCallback(
     (
       event: ReactPointerEvent<HTMLDivElement>,
-      target: 'properties' | 'viser',
+      target: 'properties' | 'viewer',
       startWidth: number,
       onMoveWidth: (nextWidth: number, delta: number) => void,
     ) => {
@@ -170,18 +167,18 @@ export function Viewport() {
         </>
       )}
 
-      {viserCollapsed ? (
+      {viewerCollapsed ? (
         <CollapsedRail
           label="Viewer"
           side="right"
-          onExpand={() => setViserCollapsed(false)}
+          onExpand={() => setViewerCollapsed(false)}
         />
       ) : (
         <>
           <div
             onPointerDown={(event) =>
-              beginResize(event, 'viser', viserWidth, (startWidth, delta) =>
-                setViserWidth(clamp(startWidth - delta, MIN_VISER_WIDTH, MAX_VISER_WIDTH)),
+              beginResize(event, 'viewer', viewerWidth, (startWidth, delta) =>
+                setViewerWidth(clamp(startWidth - delta, MIN_VIEWER_WIDTH, MAX_VIEWER_WIDTH)),
               )
             }
             className="w-3 shrink-0 touch-none cursor-col-resize bg-gray-800/40 transition-colors hover:bg-blue-500/60"
@@ -189,13 +186,13 @@ export function Viewport() {
           />
           <div
             className="relative shrink-0 overflow-hidden border-l border-gray-700"
-            style={{ width: viserWidth }}
+            style={{ width: viewerWidth }}
           >
             <ViewerErrorBoundary fallback={<ViewerCrashFallback />}>
               <SceneViewerPanel
-                onCollapse={() => setViserCollapsed(true)}
+                onCollapse={() => setViewerCollapsed(true)}
                 blocked={hasUnappliedChanges}
-                resizing={activeResize === 'viser'}
+                resizing={activeResize === 'viewer'}
               />
             </ViewerErrorBoundary>
           </div>

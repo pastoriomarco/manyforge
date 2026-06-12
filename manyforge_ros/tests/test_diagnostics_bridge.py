@@ -169,3 +169,30 @@ def test_bridge_import_chain_is_py_trees_free():
     )
     assert result.returncode == 0, result.stderr
     assert "IMPORT_OK" in result.stdout
+
+
+def test_gripper_fault_maps_to_gripper_component_with_alias():
+    digest = {
+        "state": "idle",
+        "error": "Gripper action goal was rejected",
+        "errorCode": "gripper_goal_rejected",
+        "errorDetails": {
+            "reason_code": "gripper_goal_rejected",
+            "surface": "command_gripper",
+            "gripper_id": "primary",
+            "message": "Gripper action goal was rejected",
+        },
+    }
+    # Tree-terminal failures rest in idle with the error latched: idle must
+    # latch (proven by the 2026-06-12 live acceptance, where the guard's old
+    # idle exclusion made a real gripper rejection invisible externally).
+    statuses = build_diagnostic_statuses(digest, deployment_name="isaac_preview")
+    assert len(statuses) == 1
+    status = statuses[0]
+    assert status["name"] == "manyforge/gripper"
+    assert status["level"] == LEVEL_ERROR
+    values = dict(status["values"])
+    assert values["fault_code"] == "MANYFORGE_GRIPPER_GOAL_REJECTED"
+    assert values["reason_code"] == "gripper_goal_rejected"
+    assert values["manyforge_severity"] == "ERROR"
+    assert values["gripper_id"] == "primary"

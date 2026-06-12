@@ -82,14 +82,10 @@ preflight_managed_components() {
 # must have populated LANE,
 # ASSISTANT, ASSISTANT_PROVIDER, COMPOSE_CMD, VLLM_CONTAINER as appropriate.
 #
-# Owners by port (Composer and optional legacy HMI ports are env-overridable —
-# COMPOSER_PORT/HMI_PORT — and the resolved values are compared, not hardcoded
-# literals):
+# Owners by port (Composer is env-overridable via COMPOSER_PORT; resolved values
+# are compared, not hardcoded literals):
 #   ${COMPOSER_PORT:-9000}  →  manyforge-only: manyforge-e2e-composer container
 #                              isaac-sim:      composer-ros compose service
-#   ${HMI_PORT:-8081}       →  only when MANYFORGE_ENABLE_LEGACY_VISER_HMI=true;
-#                              manyforge-only: manyforge-e2e-composer container
-#                              isaac-sim:      composer-ros compose service (host network)
 #   8000                    →  assistant=on:   vllm-proxy.pid (if START_VLLM_PROXY=true), else vLLM container
 #   8050                    →  assistant=on:   vLLM container (when proxy is enabled)
 #   8100                    →  assistant=on, provider=nemoclaw: bridge PID file
@@ -98,19 +94,10 @@ expected_port_owner() {
     local port="$1"
     local container_name="${COMPOSER_CONTAINER:-manyforge-e2e-composer}"
     local composer_port="${COMPOSER_PORT:-9000}"
-    local hmi_port="${HMI_PORT:-8081}"
-    local legacy_hmi_raw="${MANYFORGE_ENABLE_LEGACY_VISER_HMI:-${ENABLE_LEGACY_VISER_HMI:-false}}"
-    local legacy_hmi_enabled=false
-    case "${legacy_hmi_raw,,}" in
-        1|true|yes|on) legacy_hmi_enabled=true ;;
-    esac
 
-    # Composer / HMI port match (env-overridable). Match against the
-    # resolved values, then fall through to the rest of the case for
-    # static-port owners (8000, 8050, 8100, 8200).
-    if [[ "${port}" == "${composer_port}" ]] || {
-        [[ "${legacy_hmi_enabled}" == "true" ]] && [[ "${port}" == "${hmi_port}" ]]
-    }; then
+    # Composer port match (env-overridable). Match against the resolved value,
+    # then fall through to the rest of the case for static-port owners.
+    if [[ "${port}" == "${composer_port}" ]]; then
         case "${LANE:-}" in
             manyforge-only)
                 container_running "${container_name}"

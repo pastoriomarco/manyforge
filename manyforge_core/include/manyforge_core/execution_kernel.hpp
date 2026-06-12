@@ -47,6 +47,14 @@ struct ExecutionKernelConfig {
   // configured monitor period before preempting execution.
   Duration runtime_collision_query_timeout_ns = 50'000'000;  // 50 ms
 
+  // When true, a collision-validation rejection re-runs the failing waypoint
+  // through the planning context's normalized collision query and appends
+  // `legacy_collision_compare_*` engine-parity keys to the error details.
+  // Default OFF: the duplicate check costs a full collision query on every
+  // rejection and the parity evidence belongs to qualification runs, not
+  // production rejections.
+  bool enable_legacy_collision_compare_diagnostics = false;
+
   // Native execution-backend lifecycle drain. ROS adapters expose their own
   // `stop_completion_timeout_s`; this field provides the equivalent reset
   // drain knob for the non-ROS RoboPlan backend used by Composer/native
@@ -208,7 +216,7 @@ class ExecutionKernel {
 
   /// ADR-0018: update the runtime velocity scale for active execution.
   ///
-  /// The HMI velocity slider drives this through cycle_manager → kernel →
+  /// The UI velocity slider drives this through cycle_manager → kernel →
   /// backend. Backends retime discrete trajectory execution continuously;
   /// changing the scale never stops an action by itself. `scale` is validated
   /// finite and clamped to [0, 1]. NOT serialized through lifecycle_mutex_:

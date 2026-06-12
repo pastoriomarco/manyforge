@@ -13,10 +13,10 @@ class CycleStatusResponse(BaseModel):
     model_config = _ALIAS_CFG
     state: str
     velocity_scale: float = Field(alias="velocityScale")
-    # Structured error surface so the HMI can render the actual cause of a
+    # Structured error surface so the viewer can render the actual cause of a
     # runtime fault / restart-blocked condition instead of a generic banner.
     # `error` is the human-readable message; `error_code` is a stable machine
-    # token for HMI mapping (e.g. "validation_collision",
+    # token for viewer mapping (e.g. "validation_collision",
     # "motion_interrupt_backend_stop_failed"); `error_details` is the kernel
     # diagnostics map (colliding pair, classification, waypoint index, etc.).
     error: Optional[str] = None
@@ -31,7 +31,7 @@ class CycleCommandErrorResponse(BaseModel):
     reset/velocity) when the kernel or cycle manager rejects the operation.
 
     FastAPI's `HTTPException` carries an arbitrary `detail` value, and the
-    routes pass an instance of this model as that detail so the HMI can
+    routes pass an instance of this model as that detail so the viewer can
     surface the kernel's actual cause instead of a single string.
     """
 
@@ -67,6 +67,10 @@ class SimulationResetResponse(BaseModel):
     duration_s: float = Field(alias="durationS")
     command_gate_closed: bool = Field(default=False, alias="commandGateClosed")
     command_gate_reopened: bool = Field(default=False, alias="commandGateReopened")
+    resume_play_after_reset: bool = Field(default=False, alias="resumePlayAfterReset")
+    resume_play_result: Optional[Dict[str, Any]] = Field(
+        default=None, alias="resumePlayResult"
+    )
     readiness: Optional[Dict[str, Any]] = None
 
 
@@ -416,7 +420,6 @@ class SkillResponse(BaseModel):
     requires_tools: List[str] = Field(default_factory=list, alias="requiresTools")
     parameters: List[SkillParameterResponse]
     body: Dict[str, Any]
-    expands_to: Dict[str, Any] = Field(alias="expandsTo")
     example: Dict[str, Any]
 
 
@@ -814,6 +817,9 @@ class SimulationResetConfigResponse(BaseModel):
     default_scope: str = Field(default="state", alias="defaultScope")
     close_command_gate: bool = Field(default=True, alias="closeCommandGate")
     wait_ready_s: float = Field(default=3.0, alias="waitReadyS")
+    resume_play_after_reset: bool = Field(
+        default=True, alias="resumePlayAfterReset"
+    )
 
 
 class SimulationControlConfigResponse(BaseModel):
@@ -972,7 +978,7 @@ class KernelSnapshotResponse(BaseModel):
     # (collision pair, classification, waypoint index, snapshot revision,
     # fault reason code, etc.). The kernel already produces these via the
     # ErrorDTO; pybind already serializes them into the Python snapshot.
-    # The HMI needs both fields to render a structured cause panel instead
+    # The viewer needs both fields to render a structured cause panel instead
     # of a generic banner.
     error_code: Optional[str] = None
     error_details: Optional[Dict[str, Any]] = None
@@ -1211,7 +1217,7 @@ class SceneFrameResponse(BaseModel):
 class SceneFramesResponse(BaseModel):
     model_config = _ALIAS_CFG
     frames: List[SceneFrameResponse] = Field(default_factory=list)
-    hmi_available: bool = Field(alias="hmiAvailable")
+    viewer_available: bool = Field(alias="viewerAvailable")
     frame_gizmo_size_m: float = Field(default=0.1, alias="frameGizmoSizeM")
     visual_state_diagnostics: Optional[VisualStateRouteDiagnosticsResponse] = Field(
         default=None,
@@ -1231,7 +1237,7 @@ class SceneFrameVisibilityResponse(BaseModel):
     success: bool
     frame_name: str = Field(alias="frameName")
     visible: bool
-    hmi_available: bool = Field(alias="hmiAvailable")
+    viewer_available: bool = Field(alias="viewerAvailable")
     timestamp_ns: int = Field(alias="timestampNs")
     error: Optional[str] = None
 
@@ -1245,7 +1251,7 @@ class SceneFrameGizmoSizeResponse(BaseModel):
     model_config = _ALIAS_CFG
     success: bool
     axes_length_m: float = Field(alias="axesLengthM")
-    hmi_available: bool = Field(alias="hmiAvailable")
+    viewer_available: bool = Field(alias="viewerAvailable")
     timestamp_ns: int = Field(alias="timestampNs")
     error: Optional[str] = None
 
@@ -1291,7 +1297,7 @@ class SceneObjectFrameVisibilityResponse(BaseModel):
     success: bool
     object_id: str = Field(alias="objectId")
     visible: bool
-    hmi_available: bool = Field(alias="hmiAvailable")
+    viewer_available: bool = Field(alias="viewerAvailable")
     timestamp_ns: int = Field(alias="timestampNs")
     error: Optional[str] = None
 
@@ -1409,7 +1415,7 @@ class SceneDiagnosticBackendResponse(BaseModel):
     pose_in_universe: Optional[Dict[str, Any]] = None
 
 
-class SceneDiagnosticHmiResponse(BaseModel):
+class SceneDiagnosticViewerResponse(BaseModel):
     rendered: bool
     scene_name: Optional[str] = None
     render_state: Optional[str] = None
@@ -1418,7 +1424,7 @@ class SceneDiagnosticHmiResponse(BaseModel):
 class SceneDiagnosticObjectResponse(BaseModel):
     object_id: str
     backend: SceneDiagnosticBackendResponse
-    hmi: SceneDiagnosticHmiResponse
+    viewer: SceneDiagnosticViewerResponse
     match: bool
     mismatch_reason: Optional[str] = None
 
@@ -1427,7 +1433,7 @@ class SceneDiagnosticsSummaryResponse(BaseModel):
     total: int
     matched: int
     mismatched: int
-    hmi_available: bool = Field(alias="hmiAvailable")
+    viewer_available: bool = Field(alias="viewerAvailable")
 
 
 class SceneDiagnosticsResponse(BaseModel):
@@ -1985,7 +1991,7 @@ class StateUpdate(BaseModel):
     error: Optional[str] = None
     # Phase 2 of issue #1/#3 rich-error rendering: WebSocket carries the
     # cycle manager's structured (errorCode, errorDetails) tuple so the
-    # HMI can render the KernelErrorPanel from a single push instead of
+    # viewer can render the KernelErrorPanel from a single push instead of
     # falling back to polling /api/cycle/status.
     error_code: Optional[str] = Field(default=None, alias="errorCode")
     error_details: Optional[Dict[str, Any]] = Field(
