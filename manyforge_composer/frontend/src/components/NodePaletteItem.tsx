@@ -16,6 +16,32 @@ export function NodePaletteItem({ entry, disabled = false }: Props) {
     // Store the catalog entry ID for React Flow drop handler
     e.dataTransfer.setData('application/manyforge-node', entry.id);
     e.dataTransfer.effectAllowed = 'copy';
+    // The default drag image snapshots the whole palette row (name +
+    // description), which reads as a huge white rectangle and badly
+    // overstates where the node will land. Hand the browser a ghost the
+    // size and shape of an actual canvas node instead.
+    const ghost = document.createElement('div');
+    ghost.textContent = entry.name;
+    Object.assign(ghost.style, {
+      position: 'fixed',
+      top: '-1000px',
+      left: '-1000px',
+      width: '120px',
+      padding: '8px 4px',
+      borderRadius: '4px',
+      border: '2px solid #9ca3af',
+      background: 'rgba(17, 24, 39, 0.9)',
+      color: '#e5e7eb',
+      font: '500 12px sans-serif',
+      textAlign: 'center',
+      whiteSpace: 'nowrap',
+      overflow: 'hidden',
+      textOverflow: 'ellipsis',
+      pointerEvents: 'none',
+    } as CSSStyleDeclaration);
+    document.body.appendChild(ghost);
+    e.dataTransfer.setDragImage(ghost, 60, 18);
+    window.setTimeout(() => ghost.remove(), 0);
   };
 
   return (

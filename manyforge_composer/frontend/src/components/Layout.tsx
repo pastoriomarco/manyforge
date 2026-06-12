@@ -2,7 +2,7 @@ import { useCallback, useState } from 'react';
 import type { PointerEvent as ReactPointerEvent } from 'react';
 import { Sidebar } from './Sidebar';
 import { Viewport } from './Viewport';
-import { ControlBar } from './ControlBar';
+import { HeaderBar } from './HeaderBar';
 import { CollapsedRail } from './CollapsedRail';
 import { AssistantOverlay } from './AssistantOverlay';
 import { RuntimeStatusOverlay } from './RuntimeStatusOverlay';
@@ -58,6 +58,7 @@ export function Layout() {
 
   return (
     <div className="flex h-screen flex-col bg-gray-900 text-white">
+      <HeaderBar />
       <div className="flex flex-1 overflow-hidden">
         {sidebarCollapsed ? (
           <CollapsedRail label="Sidebar" side="left" onExpand={() => setSidebarCollapsed(false)} />
@@ -83,7 +84,6 @@ export function Layout() {
 
         <Viewport />
       </div>
-      <ControlBar />
       <RuntimeStatusOverlay />
       {assistantEnabled ? <AssistantOverlay /> : null}
     </div>

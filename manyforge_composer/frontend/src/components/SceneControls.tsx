@@ -40,7 +40,7 @@ export function SceneControls({ onClose }: SceneControlsProps) {
   const [openSection, setOpenSection] = useState<Section>('frames');
 
   return (
-    <div className="pointer-events-auto absolute right-2 top-2 z-20 flex max-h-[calc(100%-1rem)] w-72 flex-col overflow-hidden rounded-md border border-gray-700 bg-gray-900/50 text-xs text-gray-200 shadow-xl">
+    <div className="pointer-events-auto absolute right-2 top-2 z-20 flex max-h-[calc(100%-5rem)] w-72 flex-col overflow-hidden rounded-md border border-gray-700 bg-gray-900/50 text-xs text-gray-200 shadow-xl">
       <div className="flex items-center justify-between border-b border-gray-700 bg-gray-800/50 px-2 py-1">
         <div className="text-[11px] font-semibold uppercase tracking-wide text-gray-300">
           Scene Tools

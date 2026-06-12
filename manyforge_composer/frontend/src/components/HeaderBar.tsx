@@ -1,15 +1,11 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useState } from 'react';
 import { api, ApiError } from '../api/client';
 import { useCycleStore, useEditLocked } from '../store/cycleStore';
 import { KernelErrorPanel } from './KernelErrorPanel';
-import { useRobotCommandAuthority } from '../store/commandAuthority';
-import { useSceneStateStore } from '../store/sceneStateStore';
-import { useComposerStore } from '../store/composerStore';
 import { useProgramStore } from '../store/programStore';
 import { useDeploymentStore } from '../store/deploymentStore';
 import { FileBrowserDialog } from './FileBrowserDialog';
 import type { FullDeployment, TreeNode } from '../types/api';
-import type { EdgeStyle } from '../store/composerStore';
 
 function signature(value: unknown): string {
   return JSON.stringify(value ?? null);
@@ -25,15 +21,78 @@ interface BrowserSession {
   deploymentPath: string;
 }
 
-export function ControlBar() {
+// Quiet, neutral chrome for every document/runtime action except Apply:
+// per industrial-HMI practice, color is reserved for state and for the
+// one primary commit action.
+const NEUTRAL_BUTTON =
+  'rounded border border-gray-600 bg-gray-800 px-3 py-1 text-sm font-medium text-gray-200 ' +
+  'transition-colors hover:bg-gray-700 hover:text-white ' +
+  'disabled:cursor-not-allowed disabled:border-gray-700 disabled:bg-gray-800/60 disabled:text-gray-600';
+
+function IconButton({
+  onClick,
+  disabled,
+  label,
+  children,
+}: {
+  onClick: () => void;
+  disabled?: boolean;
+  label: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <span className="group relative inline-flex">
+      <button
+        type="button"
+        onClick={onClick}
+        disabled={disabled}
+        aria-label={label}
+        className="rounded border border-gray-600 bg-gray-800 p-1.5 text-gray-300 transition-colors hover:bg-gray-700 hover:text-white disabled:cursor-not-allowed disabled:border-gray-700 disabled:bg-gray-800/60 disabled:text-gray-600"
+      >
+        {children}
+      </button>
+      {/* Instant tooltip: native title= has a ~1s delay; this shows on hover
+          immediately so icon-only buttons stay self-explanatory. */}
+      <span className="pointer-events-none absolute left-1/2 top-full z-50 mt-1.5 -translate-x-1/2 whitespace-nowrap rounded border border-gray-600 bg-gray-900 px-2 py-0.5 text-xs text-gray-200 opacity-0 shadow-lg shadow-black/50 transition-opacity duration-75 group-hover:opacity-100">
+        {label}
+      </span>
+    </span>
+  );
+}
+
+function StatusDot({
+  ok,
+  okLabel,
+  pendingLabel,
+  title,
+}: {
+  ok: boolean;
+  okLabel: string;
+  pendingLabel: string;
+  title: string;
+}) {
+  return (
+    <span
+      className="flex items-center gap-1.5 font-mono text-[11px] uppercase tracking-wider"
+      title={title}
+    >
+      <span
+        className={`h-2 w-2 rounded-full ${ok ? 'bg-emerald-500' : 'bg-amber-400'}`}
+      />
+      <span className={ok ? 'text-gray-400' : 'text-amber-300'}>
+        {ok ? okLabel : pendingLabel}
+      </span>
+    </span>
+  );
+}
+
+export function HeaderBar() {
   const {
     error,
     errorCode: cycleErrorCode,
     errorDetails: cycleErrorDetails,
   } = useCycleStore();
-  const { edgeStyle, setEdgeStyle } = useComposerStore();
   const {
-    nodes,
     flowToTree,
     appliedTree,
     savedTree,
@@ -49,9 +108,6 @@ export function ControlBar() {
     blackboardKeys,
     appliedBlackboardKeys,
     savedBlackboardKeys,
-    layoutDirection,
-    setLayoutDirection,
-    autoLayout,
     discardToApplied: discardProgramToApplied,
     setAppliedToDraft,
     saveProgram,
@@ -202,20 +258,6 @@ export function ControlBar() {
     }
     return `${summary} | …and ${errors.length - 3} more`;
   };
-
-  const modifiedBadge = hasUnappliedChanges
-    ? { label: 'MODIFIED', color: 'bg-orange-600' }
-    : { label: 'APPLIED', color: 'bg-emerald-700' };
-  const savedBadge = hasUnsavedChanges
-    ? { label: 'UNSAVED', color: 'bg-amber-700' }
-    : { label: 'SAVED', color: 'bg-slate-700' };
-  const edgeStyleOptions: { value: EdgeStyle; label: string }[] = [
-    { value: 'smoothstep', label: 'Orthogonal' },
-    { value: 'simplebezier', label: 'Smooth' },
-    { value: 'default', label: 'Bezier' },
-    { value: 'straight', label: 'Straight' },
-    { value: 'step', label: 'Step' },
-  ];
 
   const applyDrafts = useCallback(async (forceDiscardOverrides: boolean) => {
     const payload: {
@@ -604,301 +646,127 @@ export function ControlBar() {
   const canSaveAs = (!editLocked && !!programInfo) || (!editLocked && !!deployment);
 
   return (
-      <div className="border-t border-gray-700 bg-gray-800 px-4 py-2">
-        {activeError && (
+    <div className="border-b border-gray-700 bg-gray-900">
+      <div className="flex h-11 items-center gap-3 px-3">
+        {/* Program identity + passive state indicators */}
+        <div className="flex min-w-0 items-center gap-3">
+          <span
+            className="truncate text-sm font-semibold text-gray-100"
+            title={programInfo?.sourcePath ?? 'No program loaded'}
+          >
+            {programInfo?.name ?? 'No program'}
+          </span>
+          <StatusDot
+            ok={!hasUnappliedChanges}
+            okLabel="applied"
+            pendingLabel="modified"
+            title="Whether the draft matches the applied runtime session"
+          />
+          <StatusDot
+            ok={!hasUnsavedChanges}
+            okLabel="saved"
+            pendingLabel="unsaved"
+            title="Whether the draft matches the files on disk"
+          />
+          {programLoading && (
+            <span className="text-xs text-gray-400">Loading program…</span>
+          )}
+        </div>
+
+        {/* Document group, then runtime group — Apply is the one accent */}
+        <div className="ml-auto flex items-center gap-1.5">
+          <IconButton
+            onClick={() => void handleSaveAll()}
+            disabled={!hasUnsavedChanges || editLocked}
+            label="Save"
+          >
+            <svg viewBox="0 0 16 16" className="h-4 w-4 fill-none stroke-current" strokeWidth="1.4" aria-hidden>
+              <path d="M3 2.5h8L13.5 5v8.5a.5.5 0 0 1-.5.5H3a.5.5 0 0 1-.5-.5v-10a.5.5 0 0 1 .5-.5z" strokeLinejoin="round" />
+              <path d="M5 2.5V6h5.5V2.5M5 14v-4.5h6V14" strokeLinejoin="round" />
+            </svg>
+          </IconButton>
+          <IconButton onClick={() => void handleSaveAs()} disabled={!canSaveAs} label="Save As…">
+            <svg viewBox="0 0 16 16" className="h-4 w-4 fill-none stroke-current" strokeWidth="1.4" aria-hidden>
+              <path d="M3 2.5h6.5L12 5v3" strokeLinejoin="round" />
+              <path d="M3 2.5a.5.5 0 0 0-.5.5v10a.5.5 0 0 0 .5.5h4.5" strokeLinejoin="round" />
+              <path d="M5 2.5V5.5h4V2.5" strokeLinejoin="round" />
+              <path d="M13.7 9.6l-3.9 3.9-1.4.4.4-1.4 3.9-3.9a1 1 0 0 1 1 1z" strokeLinejoin="round" />
+            </svg>
+          </IconButton>
+          <IconButton onClick={() => void handleLoad()} disabled={editLocked} label="Load…">
+            <svg viewBox="0 0 16 16" className="h-4 w-4 fill-none stroke-current" strokeWidth="1.4" aria-hidden>
+              <path d="M2 4.5a.5.5 0 0 1 .5-.5H6l1.5 1.5h6a.5.5 0 0 1 .5.5V7H2z" strokeLinejoin="round" />
+              <path d="M2 7h12.5l-1.6 5.6a.5.5 0 0 1-.5.4H3.3a.5.5 0 0 1-.5-.4L2 7z" strokeLinejoin="round" />
+            </svg>
+          </IconButton>
+          <div className="mx-1.5 h-6 w-px bg-gray-600/80" />
+          <button
+            onClick={handleDiscard}
+            disabled={!hasUnappliedChanges || editLocked}
+            title="Throw away draft edits and return to the applied session."
+            className={NEUTRAL_BUTTON}
+          >
+            Discard
+          </button>
+          <button
+            onClick={handleRevert}
+            disabled={!hasAppliedUnsavedChanges || editLocked}
+            title="Restore the applied runtime session to the last saved program/deployment."
+            className={NEUTRAL_BUTTON}
+          >
+            Revert
+          </button>
+          <button
+            onClick={handleApply}
+            disabled={!hasUnappliedChanges || editLocked}
+            title="Commit the draft to the runtime session."
+            className="rounded border border-sky-500 bg-sky-700 px-4 py-1 text-sm font-semibold text-white transition-colors hover:bg-sky-600 disabled:cursor-not-allowed disabled:border-gray-700 disabled:bg-gray-800/60 disabled:text-gray-600"
+          >
+            Apply
+          </button>
+        </div>
+      </div>
+
+      {activeError && (
+        <div className="px-3 pb-2">
           <KernelErrorPanel
             message={activeError.message}
             errorCode={activeError.errorCode}
             errorDetails={activeError.errorDetails}
           />
-        )}
-        <div className="flex min-h-12 items-center gap-4">
-        <button
-          onClick={() => setLayoutDirection(layoutDirection === 'vertical' ? 'horizontal' : 'vertical')}
-          disabled={editLocked || nodes.length === 0}
-          className="px-4 py-1.5 bg-violet-600 hover:bg-violet-500 disabled:bg-gray-600 disabled:cursor-not-allowed rounded text-sm font-medium"
-        >
-          {layoutDirection === 'vertical' ? 'Horizontal View' : 'Vertical View'}
-        </button>
-        <button
-          onClick={autoLayout}
-          disabled={editLocked || nodes.length === 0}
-          className="px-4 py-1.5 bg-sky-600 hover:bg-sky-500 disabled:bg-gray-600 disabled:cursor-not-allowed rounded text-sm font-medium"
-        >
-          Auto Align
-        </button>
-        <select
-          value={edgeStyle}
-          onChange={(e) => setEdgeStyle(e.target.value as EdgeStyle)}
-          disabled={editLocked}
-          className="px-3 py-1.5 rounded bg-gray-700 border border-gray-600 text-sm text-white disabled:bg-gray-600 disabled:cursor-not-allowed"
-          title="Connection line style"
-        >
-          {edgeStyleOptions.map((option) => (
-            <option key={option.value} value={option.value}>
-              {option.label}
-            </option>
-          ))}
-        </select>
-        <button
-          onClick={handleApply}
-          disabled={!hasUnappliedChanges || editLocked}
-          className="px-4 py-1.5 bg-indigo-600 hover:bg-indigo-500 disabled:bg-gray-600 disabled:cursor-not-allowed rounded text-sm font-medium"
-        >
-          Apply
-        </button>
-        <button
-          onClick={handleRevert}
-          disabled={!hasAppliedUnsavedChanges || editLocked}
-          className="px-4 py-1.5 bg-fuchsia-700 hover:bg-fuchsia-600 disabled:bg-gray-600 disabled:cursor-not-allowed rounded text-sm font-medium"
-          title="Restore the applied runtime session to the last saved program/deployment."
-        >
-          Revert
-        </button>
-        <button
-          onClick={handleDiscard}
-          disabled={!hasUnappliedChanges || editLocked}
-          className="px-4 py-1.5 bg-red-700 hover:bg-red-600 disabled:bg-gray-600 disabled:cursor-not-allowed rounded text-sm font-medium"
-        >
-          Discard
-        </button>
-        <button
-          onClick={handleSaveAll}
-          disabled={!hasUnsavedChanges || editLocked}
-          className="px-4 py-1.5 bg-amber-600 hover:bg-amber-500 disabled:bg-gray-600 disabled:cursor-not-allowed rounded text-sm font-medium"
-        >
-          Save
-        </button>
-        <button
-          onClick={handleSaveAs}
-          disabled={!canSaveAs}
-          className="px-4 py-1.5 bg-teal-600 hover:bg-teal-500 disabled:bg-gray-600 disabled:cursor-not-allowed rounded text-sm font-medium"
-        >
-          Save As
-        </button>
-        <button
-          onClick={handleLoad}
-          disabled={editLocked}
-          className="px-4 py-1.5 bg-yellow-600 hover:bg-yellow-500 disabled:bg-gray-600 disabled:cursor-not-allowed rounded text-sm font-medium"
-        >
-          Load
-        </button>
-        <span className={`px-3 py-1 rounded text-xs font-mono ${modifiedBadge.color}`}>
-          {modifiedBadge.label}
-        </span>
-        <span className={`px-3 py-1 rounded text-xs font-mono ${savedBadge.color}`}>
-          {savedBadge.label}
-        </span>
-
-        {programLoading && (
-          <span className="text-gray-400 text-sm">Loading program...</span>
-        )}
-
-        {/* Cycle controls — pushed right so they sit next to the
-            floating "Ready" overlay. Run/Stop/Reset + velocity-scale
-            slider were missing from the Composer UI (only existed as
-            backend routes + cycleStore actions); landing them here
-            gives the operator parity with the legacy viewer GUI's
-            control panel without a separate overlay. */}
-        <CycleControls />
-
-        {browserSession && (
-          <FileBrowserDialog
-            open={true}
-            title={
-              browserSession.intent === 'load'
-                ? browserSession.step === 'program'
-                  ? 'Load Program'
-                  : 'Load Deployment (Optional)'
-                : browserSession.step === 'program'
-                  ? 'Save Program As'
-                  : 'Save Deployment As (Optional)'
-            }
-            kind={browserSession.step}
-            mode={browserSession.intent === 'load' ? 'open' : 'save'}
-            initialPath={
-              browserSession.step === 'program'
-                ? browserSession.programPath
-                : browserSession.deploymentPath
-            }
-            allowSkip={browserSession.step === 'deployment'}
-            skipLabel={
-              browserSession.intent === 'load'
-                ? 'Keep Current Deployment'
-                : 'Skip Deployment Save'
-            }
-            onConfirm={advanceBrowserSession}
-            onCancel={closeBrowserSession}
-            onSkip={skipBrowserDeployment}
-          />
-        )}
         </div>
-      </div>
-  );
-}
+      )}
 
-/**
- * Cycle-control surface: Run / Stop / Reset + velocity-scale slider.
- *
- * Sits in the bottom bar, pushed right with `ml-auto` so it lands
- * next to the floating <RuntimeStatusOverlay /> "Ready" indicator
- * at bottom-right of the screen. Button enabled-state mirrors the
- * cycle-state machine: Run only fires from idle/stopped, Stop from
- * running / direct_control, Reset from any
- * state except where the kernel forbids it (the backend returns
- * 409 in that case; we let it surface via the cycle store's error).
- */
-function CycleControls() {
-  const { state, velocityScale, run, stop, reset, setVelocityScale } = useCycleStore();
-  const runAuthority = useRobotCommandAuthority({
-    requireFreshScene: true,
-  });
-  const [cycleBusy, setCycleBusy] = useState(false);
-  const [velocityDraft, setVelocityDraft] = useState(velocityScale);
-  const pendingVelocityScaleRef = useRef<number | null>(null);
-  const velocityScaleInFlightRef = useRef(false);
-  const velocityScaleTimerRef = useRef<number | null>(null);
-  const lastVelocityScaleSentAtRef = useRef(0);
-  const canRun =
-    (state === 'idle' || state === 'stopped') &&
-    runAuthority.canCommand;
-  // Stop applies to in-flight motion the operator can see — BT
-  // execution (state==='running') or an intervention / direct-jog
-  // session (direct_control). Default Robot Control authoring no longer
-  // streams, so there is no separate streaming-session stop path.
-  const cycleStoppable =
-    state === 'running' || state === 'direct_control';
-  const canStop = cycleStoppable;
-
-  const runCycleCommand = useCallback(
-    (command: () => Promise<void>) => {
-      void (async () => {
-        setCycleBusy(true);
-        try {
-          await command();
-        } finally {
-          setCycleBusy(false);
-        }
-      })();
-    },
-    [],
-  );
-
-  const flushVelocityScale = useCallback(() => {
-    if (velocityScaleTimerRef.current !== null) {
-      window.clearTimeout(velocityScaleTimerRef.current);
-      velocityScaleTimerRef.current = null;
-    }
-    if (velocityScaleInFlightRef.current || pendingVelocityScaleRef.current === null) {
-      return;
-    }
-    const nextScale = pendingVelocityScaleRef.current;
-    pendingVelocityScaleRef.current = null;
-    velocityScaleInFlightRef.current = true;
-    lastVelocityScaleSentAtRef.current = performance.now();
-    void setVelocityScale(nextScale).finally(() => {
-      velocityScaleInFlightRef.current = false;
-      if (pendingVelocityScaleRef.current !== null) {
-        const elapsed = performance.now() - lastVelocityScaleSentAtRef.current;
-        const delay = Math.max(0, 250 - elapsed);
-        velocityScaleTimerRef.current = window.setTimeout(flushVelocityScale, delay);
-      }
-    });
-  }, [setVelocityScale]);
-
-  const queueVelocityScale = useCallback((value: number) => {
-    const clamped = Math.max(0, Math.min(1, value));
-    setVelocityDraft(clamped);
-    pendingVelocityScaleRef.current = clamped;
-    if (velocityScaleInFlightRef.current) {
-      return;
-    }
-    const elapsed = performance.now() - lastVelocityScaleSentAtRef.current;
-    const delay = Math.max(0, 250 - elapsed);
-    if (delay === 0) {
-      flushVelocityScale();
-    } else if (velocityScaleTimerRef.current === null) {
-      velocityScaleTimerRef.current = window.setTimeout(flushVelocityScale, delay);
-    }
-  }, [flushVelocityScale]);
-
-  useEffect(() => {
-    if (pendingVelocityScaleRef.current === null && !velocityScaleInFlightRef.current) {
-      setVelocityDraft(velocityScale);
-    }
-  }, [velocityScale]);
-
-  useEffect(() => () => {
-    if (velocityScaleTimerRef.current !== null) {
-      window.clearTimeout(velocityScaleTimerRef.current);
-      velocityScaleTimerRef.current = null;
-    }
-  }, []);
-
-  return (
-    <div className="ml-auto flex items-center gap-2">
-      <button
-        type="button"
-        onClick={() => void run()}
-        disabled={cycleBusy || !canRun}
-        title={
-          canRun
-            ? 'Start the loaded program'
-            : runAuthority.reason !== null
-              ? runAuthority.reason
-              : `Cycle is ${state}`
-        }
-        className="rounded bg-emerald-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-emerald-500 disabled:cursor-not-allowed disabled:bg-gray-600"
-      >
-        Run
-      </button>
-      <button
-        type="button"
-        onClick={() => {
-          // Stop the active cycle, then force a scene refresh so the
-          // viewer reflects the kStopped pose without waiting a full
-          // poll interval.
-          runCycleCommand(async () => {
-            await stop();
-            try {
-              await useSceneStateStore.getState().refresh();
-            } catch (err) {
-              console.warn('post-stop scene refresh failed', err);
-            }
-          });
-        }}
-        disabled={cycleBusy || !canStop}
-        title={canStop ? 'Stop the active cycle' : `Cycle is ${state}`}
-        className="rounded bg-orange-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-orange-500 disabled:cursor-not-allowed disabled:bg-gray-600"
-      >
-        Stop
-      </button>
-      <button
-        type="button"
-        onClick={() => {
-          runCycleCommand(reset);
-        }}
-        disabled={cycleBusy}
-        title="Reset the cycle to its initial state"
-        className="rounded bg-rose-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-rose-500 disabled:cursor-not-allowed disabled:bg-gray-600"
-      >
-        Reset
-      </button>
-      <label className="ml-2 flex items-center gap-1.5 text-xs text-gray-300" title="Runtime velocity scale (0.0 - 1.0; 0 holds motion)">
-        <span className="font-mono text-[11px] text-gray-400">vel</span>
-        <input
-          type="range"
-          min={0.0}
-          max={1.0}
-          step={0.01}
-          value={velocityDraft}
-          onChange={(e) => queueVelocityScale(Number(e.target.value))}
-          className="w-24 accent-emerald-500"
+      {browserSession && (
+        <FileBrowserDialog
+          open={true}
+          title={
+            browserSession.intent === 'load'
+              ? browserSession.step === 'program'
+                ? 'Load Program'
+                : 'Load Deployment (Optional)'
+              : browserSession.step === 'program'
+                ? 'Save Program As'
+                : 'Save Deployment As (Optional)'
+          }
+          kind={browserSession.step}
+          mode={browserSession.intent === 'load' ? 'open' : 'save'}
+          initialPath={
+            browserSession.step === 'program'
+              ? browserSession.programPath
+              : browserSession.deploymentPath
+          }
+          allowSkip={browserSession.step === 'deployment'}
+          skipLabel={
+            browserSession.intent === 'load'
+              ? 'Keep Current Deployment'
+              : 'Skip Deployment Save'
+          }
+          onConfirm={advanceBrowserSession}
+          onCancel={closeBrowserSession}
+          onSkip={skipBrowserDeployment}
         />
-        <span className="w-8 text-right font-mono text-[11px]">
-          {velocityDraft.toFixed(2)}
-        </span>
-      </label>
+      )}
     </div>
   );
 }

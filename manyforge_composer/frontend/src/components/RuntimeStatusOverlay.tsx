@@ -135,8 +135,8 @@ export function RuntimeStatusOverlay() {
 
       {open && (
         <div className="pointer-events-none fixed inset-x-0 bottom-16 z-40 px-6 pb-4">
-          <section className="pointer-events-auto ml-auto flex max-h-[min(62vh,640px)] w-[min(520px,calc(100vw-3rem))] flex-col overflow-hidden rounded-lg border border-gray-700/90 bg-gray-950/90 text-white shadow-2xl shadow-black/50 backdrop-blur-md">
-            <header className="flex shrink-0 items-center gap-3 border-b border-gray-800 bg-gray-950/75 px-4 py-3">
+          <section className="pointer-events-auto ml-auto flex max-h-[min(62vh,640px)] w-[min(520px,calc(100vw-3rem))] flex-col overflow-hidden rounded-lg border border-gray-700/90 bg-gray-950/60 text-white shadow-2xl shadow-black/50 backdrop-blur-md">
+            <header className="flex shrink-0 items-center gap-3 border-b border-gray-800 bg-gray-950/50 px-4 py-3">
               <div className={`flex h-10 w-16 shrink-0 items-center justify-center rounded-md text-xs font-semibold ${readinessClasses(readiness)}`}>
                 {summaryLabel}
               </div>

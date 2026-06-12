@@ -6,22 +6,28 @@ import { useProgramStore } from '../store/programStore';
 import { useCatalogStore } from '../store/catalogStore';
 
 const CONTROL_FLOW_COLORS: Record<string, string> = {
-  sequence: 'bg-blue-900/45',
-  fallback: 'bg-orange-900/45',
-  parallel: 'bg-purple-900/45',
-  inverter: 'bg-yellow-900/45',
-  repeat: 'bg-cyan-900/45',
-  retry: 'bg-cyan-900/45',
-  timer: 'bg-teal-900/45',
-  default: 'bg-slate-800/80',
+  sequence: 'bg-blue-700/65',
+  fallback: 'bg-orange-700/65',
+  parallel: 'bg-violet-700/65',
+  inverter: 'bg-yellow-600/55',
+  repeat: 'bg-cyan-700/65',
+  retry: 'bg-cyan-600/55',
+  timer: 'bg-teal-700/65',
+  default: 'bg-slate-700/75',
 };
 
 const CATEGORY_COLORS: Record<string, string> = {
-  motion: 'bg-orange-700/55',
-  logic: 'bg-yellow-700/55',
-  geometry: 'bg-pink-800/55',
-  scene: 'bg-purple-900/45',
-  default: 'bg-slate-800/80',
+  motion: 'bg-orange-600/70',
+  logic: 'bg-yellow-600/60',
+  geometry: 'bg-pink-700/65',
+  scene: 'bg-purple-700/65',
+  simulation: 'bg-emerald-700/65',
+  model: 'bg-indigo-600/65',
+  selection: 'bg-lime-700/60',
+  pick_planning: 'bg-amber-700/65',
+  recovery: 'bg-rose-700/65',
+  blackboard_output: 'bg-sky-800/65',
+  default: 'bg-slate-700/75',
 };
 
 const STATUS_BORDER_COLORS: Record<string, string> = {
@@ -83,7 +89,7 @@ export function BtNode({ data, selected, id }: NodeProps) {
         type="target"
         position={targetPosition}
         isConnectable={targetConnectable}
-        className={`!w-3 !h-3 transition-all ${targetConnectable ? '!bg-gray-400 hover:!bg-green-400 hover:!w-4 hover:!h-4' : '!bg-gray-700 opacity-60'}`}
+        className={`!w-4 !h-4 !border-2 !border-gray-900 transition-all ${targetConnectable ? '!bg-gray-300 hover:!bg-green-400 hover:!w-5 hover:!h-5' : '!bg-gray-700 opacity-60'}`}
       />
       <div className="text-xs text-gray-500 mb-0.5">{kindGlyph}</div>
       <div className="text-xs text-gray-300 uppercase">{data.catalogId as string}</div>
@@ -95,7 +101,7 @@ export function BtNode({ data, selected, id }: NodeProps) {
           type="source"
           position={sourcePosition}
           isConnectable={sourceConnectable}
-          className={`!w-3 !h-3 transition-all ${sourceConnectable ? '!bg-gray-400 hover:!bg-blue-400 hover:!w-4 hover:!h-4' : '!bg-gray-700 opacity-60'}`}
+          className={`!w-4 !h-4 !border-2 !border-gray-900 transition-all ${sourceConnectable ? '!bg-gray-300 hover:!bg-blue-400 hover:!w-5 hover:!h-5' : '!bg-gray-700 opacity-60'}`}
         />
       ) : null}
     </div>

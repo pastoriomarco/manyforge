@@ -108,6 +108,15 @@ start_composer_dev_container() {
     if [[ -n "${MANYFORGE_ASSISTANT_TIMEOUT_S:-}" ]]; then
         assistant_env+=(-e "MANYFORGE_ASSISTANT_TIMEOUT_S=${MANYFORGE_ASSISTANT_TIMEOUT_S}")
     fi
+    # Frontend dev-build knobs must cross the docker boundary or
+    # `MANYFORGE_FRONTEND_SOURCE_MODE=worktree launch.sh restart` silently
+    # builds from committed HEAD inside the container.
+    if [[ -n "${MANYFORGE_FRONTEND_SOURCE_MODE:-}" ]]; then
+        assistant_env+=(-e "MANYFORGE_FRONTEND_SOURCE_MODE=${MANYFORGE_FRONTEND_SOURCE_MODE}")
+    fi
+    if [[ -n "${MANYFORGE_FRONTEND_FORCE_REBUILD:-}" ]]; then
+        assistant_env+=(-e "MANYFORGE_FRONTEND_FORCE_REBUILD=${MANYFORGE_FRONTEND_FORCE_REBUILD}")
+    fi
     info "Starting ${container_name} (detached dev container) on Composer ${composer_port}; native viewer is default"
     docker run -d --rm \
         --name "${container_name}" \

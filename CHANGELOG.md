@@ -150,6 +150,22 @@ hardening done before the first tag was granted.
 
 ### Changed
 
+- **Composer editor chrome restructured (industrial-HMI pass)**: the
+  full-width bottom bar is replaced by a slim top header (program name,
+  passive applied/saved status dots, Save/Save As/Load as uniform icon
+  buttons with instant tooltips, Discard/Revert/Apply with Apply as the
+  single accent), a floating view-options pill on the graph canvas, and a
+  pendant-style transport pill (Run/Stop/Reset + velocity) docked
+  bottom-center of the 3D viewer — width-stable across state changes, color
+  reserved for state (Run green only when armable, Stop the only red
+  control, Reset amber when it would discard live cycle state). Node
+  palette drag previews are node-sized, link handles are larger, node
+  category colors are richer, and viewer side panels scroll instead of
+  covering the transport controls.
+- **Launcher forwards frontend dev-build env vars**
+  (`MANYFORGE_FRONTEND_SOURCE_MODE`, `MANYFORGE_FRONTEND_FORCE_REBUILD`)
+  into both lane containers — previously a worktree dev build requested at
+  the launcher silently fell back to committed HEAD inside the container.
 - **Native viewer is the sole render path**: `hmiAvailable`/`hmi_available`
   renamed to `viewerAvailable` across Composer models, routes, and frontend;
   the `hmi_snapshot` node image source is now `viewer_snapshot` (node catalog
@@ -219,6 +235,14 @@ hardening done before the first tag was granted.
 
 ### Contract changes before first tag
 
+- **Cycle Stop now halts preparation-phase executions**: `cycle.stop()`
+  previously paused the kernel only when it was already `EXECUTING`; a stop
+  landing during `PLANNING`/`VALIDATING` left the async worker free to
+  dispatch the motion after the cycle had reported stopped (observed live:
+  the arm moved for ~11 s post-Stop). Preparation-phase executions are now
+  stopped outright (Run-from-STOPPED replans from fresh state, so nothing
+  is lost) and the preparation→executing race is closed with a bounded
+  re-check.
 - `TrajectoryCache` revision-less `store`/`lookup` overloads are removed:
   every stored trajectory must declare the collision-world revision it was
   validated against; planning/execution hits use `lookup_with_revision`,

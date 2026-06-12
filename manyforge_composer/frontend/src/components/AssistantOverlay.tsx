@@ -934,8 +934,8 @@ export function AssistantOverlay() {
 
       {open && (
         <div className="pointer-events-none fixed inset-x-0 bottom-16 z-40 px-6 pb-4">
-          <section className="pointer-events-auto mx-auto flex h-[min(50vh,520px)] min-h-[320px] max-w-[1440px] flex-col overflow-hidden rounded-lg border border-gray-700/90 bg-gray-950/85 text-white shadow-2xl shadow-black/50 backdrop-blur-md">
-            <header className="flex shrink-0 flex-wrap items-center gap-3 border-b border-gray-800 bg-gray-950/70 px-4 py-3">
+          <section className="pointer-events-auto mx-auto flex h-[min(50vh,520px)] min-h-[320px] max-w-[1440px] flex-col overflow-hidden rounded-lg border border-gray-700/90 bg-gray-950/60 text-white shadow-2xl shadow-black/50 backdrop-blur-md">
+            <header className="flex shrink-0 flex-wrap items-center gap-3 border-b border-gray-800 bg-gray-950/50 px-4 py-3">
               <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-blue-600 text-xs font-semibold">
                 AI
               </div>

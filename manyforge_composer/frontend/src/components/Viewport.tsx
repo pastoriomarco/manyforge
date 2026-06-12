@@ -1,6 +1,8 @@
 import { Component, useCallback, useState } from 'react';
 import type { ErrorInfo, PointerEvent as ReactPointerEvent, ReactNode } from 'react';
 import { TreeCanvas } from './TreeCanvas';
+import { CanvasViewControls } from './CanvasViewControls';
+import { TransportControls } from './TransportControls';
 import { PropertyPanel } from './PropertyPanel';
 import { SceneViewerPanel } from './SceneViewer';
 import { CollapsedRail } from './CollapsedRail';
@@ -137,8 +139,9 @@ export function Viewport() {
 
   return (
     <div className="flex flex-1 overflow-hidden">
-      <div className="flex min-h-0 min-w-0 flex-1 overflow-hidden">
+      <div className="relative flex min-h-0 min-w-0 flex-1 overflow-hidden">
         <TreeCanvas />
+        <CanvasViewControls />
       </div>
 
       {propertyCollapsed ? (
@@ -195,6 +198,7 @@ export function Viewport() {
                 resizing={activeResize === 'viewer'}
               />
             </ViewerErrorBoundary>
+            <TransportControls />
           </div>
         </>
       )}
