@@ -2065,6 +2065,24 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
         py::gil_scoped_release release;
         backend.update_gripper_commands();
       })
+      // Command-enable gate: the ros2_control backend is the single
+      // publishing authority (reliable + transient_local). Returns false
+      // when the deployment configures no gate topic.
+      .def("set_command_gate", [](NativeKernelBundle& self, bool enabled) {
+        auto& backend = require_ros2_control_execution(self);
+        py::gil_scoped_release release;
+        return backend.request_command_gate(enabled);
+      }, py::arg("enabled"))
+      .def("command_gate_enabled", [](NativeKernelBundle& self) {
+        auto& backend = require_ros2_control_execution(self);
+        py::gil_scoped_release release;
+        return backend.command_gate_enabled();
+      })
+      .def("command_gate_configured", [](NativeKernelBundle& self) {
+        auto& backend = require_ros2_control_execution(self);
+        py::gil_scoped_release release;
+        return backend.command_gate_configured();
+      })
       .def("get_ros_gripper_status",
           [](NativeKernelBundle& self, const std::string& gripper_id) -> py::dict {
             auto& backend = require_ros2_control_execution(self);
@@ -2112,10 +2130,19 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
         return result;
       })
       .def("invalidate_trajectories", [](NativeKernelBundle& self) {
+        // Audit 6E (finding 2.13): release the GIL through the native cache
+        // mutation, matching the neighbouring defs — under scene-mutation
+        // contention these otherwise pin the GIL for milliseconds and stall
+        // unrelated Python threads (status pollers, visual publisher).
+        py::gil_scoped_release release;
         self.cache->invalidate_all();
       })
       .def("set_robot_base_pose", [](NativeKernelBundle& self, py::dict pose) {
-        self.context->set_robot_base_pose(pose_from_python(pose));
+        // Convert from Python BEFORE releasing the GIL (pose_from_python
+        // touches the py::dict); only the native mutation runs unlocked.
+        auto native_pose = pose_from_python(pose);
+        py::gil_scoped_release release;
+        self.context->set_robot_base_pose(std::move(native_pose));
         self.cache->invalidate_all();
       }, py::arg("pose"))
       .def("scene_edit", [](NativeKernelBundle& self, py::dict request) -> py::dict {

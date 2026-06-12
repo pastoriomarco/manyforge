@@ -59,7 +59,13 @@ class IsaacDemoSupervisor(Node):
             "gripper_action_name", "/robotiq_gripper_controller/gripper_cmd"
         )
         self.declare_parameter(
-            "command_gate_enable_topic", "/manyforge/isaac_arm_command_enable"
+            # Supervisor-owned veto topic. Deliberately distinct from the
+            # backend's enable topic: each gate authority is the SINGLE
+            # writer of its own transient-local topic and the command-gate
+            # node ANDs them (fail-closed). Sharing one topic between
+            # several latched writers makes the effective gate value
+            # reader/timing-dependent.
+            "supervisor_enable_topic", "/manyforge/isaac_supervisor_command_enable"
         )
         self.declare_parameter(
             "status_topic", "/manyforge/isaac_demo_supervisor/status"
@@ -104,8 +110,8 @@ class IsaacDemoSupervisor(Node):
         )
         arm_action_name = str(self.get_parameter("arm_action_name").value)
         gripper_action_name = str(self.get_parameter("gripper_action_name").value)
-        command_gate_enable_topic = str(
-            self.get_parameter("command_gate_enable_topic").value
+        supervisor_enable_topic = str(
+            self.get_parameter("supervisor_enable_topic").value
         )
         status_topic = str(self.get_parameter("status_topic").value)
         poll_period_s = float(self.get_parameter("poll_period_s").value)
@@ -118,7 +124,7 @@ class IsaacDemoSupervisor(Node):
             reliability=ReliabilityPolicy.RELIABLE,
         )
         self._command_gate_pub = self.create_publisher(
-            Bool, command_gate_enable_topic, gate_qos
+            Bool, supervisor_enable_topic, gate_qos
         )
         self._status_pub = self.create_publisher(String, status_topic, 1)
         self.create_subscription(
@@ -196,6 +202,11 @@ class IsaacDemoSupervisor(Node):
         self._not_ready_since_s = None
         if not self._last_ready:
             self.get_logger().info("Isaac demo dependencies are ready")
+            # Withdraw the supervisor veto on recovery. Before the topic
+            # split this node never re-enabled and silently relied on the
+            # other gate publishers' latches winning the race — the exact
+            # split-brain that stranded the gate closed across restarts.
+            self._publish_command_gate(True)
         self._last_ready = True
 
         if self._auto_load and self._load_complete and not self._home_reset_complete:

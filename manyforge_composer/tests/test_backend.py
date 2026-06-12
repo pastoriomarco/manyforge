@@ -320,6 +320,39 @@ def test_kernel_snapshot_includes_structured_error_fields(client):
     # Snake-case here because KernelSnapshotResponse does not use alias.
 
 
+def test_kernel_snapshot_preserves_backend_reason_details():
+    class TrackingFaultKernel(MockKernelClient):
+        def get_execution_snapshot(self):
+            snapshot = super().get_execution_snapshot()
+            snapshot.error = (
+                "Controller tracking error exceeded tolerance: 0.125 rad"
+            )
+            snapshot.error_code = "execution_aborted"
+            snapshot.error_details = {
+                "backend": "ros2_control",
+                "reason_code": "tracking_error_exceeded",
+                "joint_name": "shoulder_pan_joint",
+                "peak_tracking_error_rad": "0.125",
+                "tracking_error_tolerance_rad": "0.05",
+            }
+            return snapshot
+
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=TrackingFaultKernel())
+    app = create_app(state, security=_TEST_SECURITY)
+
+    with TestClient(app) as client:
+        response = client.get("/api/kernel/snapshot")
+        assert response.status_code == 200
+        data = response.json()
+
+    assert data["error"] == (
+        "Controller tracking error exceeded tolerance: 0.125 rad"
+    )
+    assert data["error_code"] == "execution_aborted"
+    assert data["error_details"]["reason_code"] == "tracking_error_exceeded"
+    assert data["error_details"]["joint_name"] == "shoulder_pan_joint"
+
+
 def test_velocity_no_program_409(client):
     """PUT /api/cycle/velocity-scale returns 409 when no program loaded."""
     response = client.put("/api/cycle/velocity-scale", json={"value": 0.5})
@@ -530,6 +563,84 @@ def test_simulation_reset_requires_command_gate_topic(state):
 
     with pytest.raises(RuntimeError, match="command_gate_topic"):
         state.reset_simulation(reason="test", source="api")
+
+
+def test_run_ros_simulation_reset_delegates_gate_to_kernel_authority(state, monkeypatch):
+    """Single gate authority: the reset flow must request the command gate
+    from the kernel client (backend = sole publisher), never publish the
+    topic itself, closing before the reset service call and reopening only
+    after readiness."""
+    import sys
+    import types
+
+    gate_states_at_reset: list[bool] = []
+
+    class _FakeClient:
+        def __init__(self, node, *, service_prefix, service_timeout_s):
+            del node, service_prefix, service_timeout_s
+
+        def reset(self, *, scope):
+            del scope
+            # Record the kernel-side gate state at the moment the simulator
+            # reset service runs: it must be closed.
+            gate_states_at_reset.append(state._kernel.command_gate_enabled())
+
+            class _Result:
+                @staticmethod
+                def to_dict():
+                    return {"success": True, "service_name": "/reset_simulation"}
+
+            return _Result()
+
+    # Hermetic environment: the flow under test is state.py's gate
+    # delegation, so both ROS-side imports inside _run_ros_simulation_reset
+    # are faked (no rclpy/manyforge_ros needed in this lane). The
+    # "sidecar exposes no gate publisher" contract is asserted by
+    # manyforge_ros/tests/test_simulation_control.py in the ros lane.
+    fake_rclpy = types.SimpleNamespace(
+        ok=lambda: True,
+        init=lambda args=None: None,
+        shutdown=lambda: None,
+        create_node=lambda name: types.SimpleNamespace(
+            destroy_node=lambda: None
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "rclpy", fake_rclpy)
+    fake_sim_control = types.ModuleType("manyforge_ros.simulation_control")
+    fake_sim_control.SimulationControlClient = _FakeClient
+    fake_manyforge_ros = types.ModuleType("manyforge_ros")
+    fake_manyforge_ros.simulation_control = fake_sim_control
+    monkeypatch.setitem(sys.modules, "manyforge_ros", fake_manyforge_ros)
+    monkeypatch.setitem(
+        sys.modules, "manyforge_ros.simulation_control", fake_sim_control
+    )
+    monkeypatch.setattr(
+        state,
+        "_wait_for_simulation_reset_readiness",
+        lambda **_kwargs: {"ready": True},
+    )
+
+    result = state._run_ros_simulation_reset(
+        control_id="gate_authority_test",
+        scope="state",
+        service_prefix="auto",
+        command_gate_topic="/manyforge/test_command_enable",
+        close_command_gate=True,
+        service_timeout_s=0.1,
+        wait_ready_s=0.1,
+        execution_config={},
+        source="api",
+        reason="test",
+    )
+
+    assert result["success"] is True
+    assert result["command_gate_closed"] is True
+    assert result["command_gate_reopened"] is True
+    # Kernel-authority request ordering: closed before the service call,
+    # reopened after readiness.
+    assert state._kernel.command_gate_requests == [False, True]
+    assert gate_states_at_reset == [False]
+    assert state._kernel.command_gate_enabled() is True
 
 
 def test_set_simulation_state_route_uses_deployment_capability_and_records_events(state):

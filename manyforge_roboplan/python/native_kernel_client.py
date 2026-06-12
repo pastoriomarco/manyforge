@@ -676,6 +676,27 @@ class NativeKernelClient(KernelClient):
             return
         self._bundle.set_runtime_velocity_scale(float(scale), principal_id)
 
+    def set_command_gate(self, enabled: bool) -> bool:
+        """Request the command-enable gate from the backend gate authority.
+
+        The ros2_control backend is the single publisher of the gate topic
+        (reliable + transient_local); external flows such as the
+        simulator-reset sequence must go through here rather than publishing
+        the topic themselves. Returns False when the deployment configures
+        no gate topic or the backend is not ros2_control.
+        """
+        try:
+            return bool(self._bundle.set_command_gate(bool(enabled)))
+        except RuntimeError:
+            # Non-ros2_control execution backend: no gate surface.
+            return False
+
+    def command_gate_enabled(self) -> bool:
+        try:
+            return bool(self._bundle.command_gate_enabled())
+        except RuntimeError:
+            return False
+
     def get_status(self) -> ExecutionStatus:
         s = self._bundle.get_status()
         return ExecutionStatus(

@@ -13,6 +13,7 @@ from manyforge_behavior.capabilities import V0_0_REQUIRED_KEYS
 from manyforge_behavior.kernel_client import ExecutionState, MockKernelClient
 from manyforge_behavior.runner import OrchestratorRunner
 from manyforge_behavior.cycle_manager import (
+    ROS2_CONTROL_BACKEND_FAULT_CLASSES,
     CycleManager,
     CycleState,
     InterventionSession,
@@ -287,6 +288,32 @@ class TestCycleManagerStop:
         manager.stop()
         assert manager.state == CycleState.STOPPED
     
+    def test_tick_loop_sleeps_via_interruptible_stop_event(self, kernel):
+        """Audit 6D (finding 2.9): the tick loop's inter-tick sleep must be
+        `_tick_stop_event.wait(timeout=...)` so a stop request wakes it
+        immediately; reverting to a bare time.sleep() fails this guard."""
+        slow_kernel = MockKernelClient(execute_duration_s=1.0)
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, slow_kernel)
+        manager = CycleManager(runner, slow_kernel)
+
+        wait_timeouts = []
+        original_wait = manager._tick_stop_event.wait
+
+        def recording_wait(timeout=None):
+            if timeout is not None:
+                wait_timeouts.append(timeout)
+            return original_wait(timeout=timeout)
+
+        manager._tick_stop_event.wait = recording_wait
+        manager.run()
+        time.sleep(0.1)
+        manager.stop()
+        assert manager.state == CycleState.STOPPED
+        assert wait_timeouts, (
+            "tick loop must sleep via _tick_stop_event.wait(timeout=...), "
+            "not time.sleep()"
+        )
+
     def test_stop_from_stopped_is_noop(self, kernel):
         """stop() from STOPPED is a no-op."""
         slow_kernel = MockKernelClient(execute_duration_s=1.0)
@@ -568,6 +595,40 @@ class TestCycleManagerReset:
         assert details["policy_id"] == (
             "manyforge.kernel.drift_fault.preempt_trajectory"
         )
+
+    def test_snapshot_error_promotes_ros2_backend_reason_code(self, kernel):
+        """ROS2-control backend faults keep the top-level ErrorDTO code
+        compatible with the core enum and carry the exact operator-facing
+        cause in error_details.reason_code. The cycle manager should surface
+        that exact token to the HMI instead of a generic execution_aborted
+        banner."""
+
+        class TrackingFaultKernel(MockKernelClient):
+            def get_execution_snapshot(self):
+                snapshot = super().get_execution_snapshot()
+                snapshot.error = (
+                    "Controller tracking error exceeded tolerance: 0.125 rad"
+                )
+                snapshot.error_code = "execution_aborted"
+                snapshot.error_details = {
+                    "backend": "ros2_control",
+                    "reason_code": "tracking_error_exceeded",
+                    "joint_name": "shoulder_pan_joint",
+                    "peak_tracking_error_rad": "0.125",
+                    "tracking_error_tolerance_rad": "0.05",
+                }
+                return snapshot
+
+        fault_kernel = TrackingFaultKernel()
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, fault_kernel)
+        manager = CycleManager(runner, fault_kernel)
+
+        code, details = manager._capture_kernel_error_diagnostics()
+
+        assert code == "tracking_error_exceeded"
+        assert details is not None
+        assert details["joint_name"] == "shoulder_pan_joint"
+        assert details["peak_tracking_error_rad"] == "0.125"
 
     def test_reset_fails_loudly_when_scene_remove_fails(self, kernel):
         """Industrial reset semantics: if a runtime object cannot be cleared,
@@ -1482,6 +1543,99 @@ class TestRecoveryTriggerTaxonomy:
     def test_unknown_string_is_rejected(self):
         with pytest.raises(ValueError):
             RecoveryTrigger("made_up_reason")
+
+
+# --- ros2_control backend fault taxonomy (audit Phase 6A) ---
+
+
+_ROS2_CONTROL_FAULT_REASON_HEADER = (
+    Path(__file__).parent.parent.parent
+    / "manyforge_roboplan"
+    / "include"
+    / "manyforge_roboplan"
+    / "ros2_control_capability.hpp"
+)
+
+
+class TestRos2ControlBackendFaultTaxonomy:
+    """C++/Python parity + external-publication constraints for the 6A
+    backend fault taxonomy.
+
+    The C++ header (namespace `ros2_control_fault_reason`) is the emitting
+    source of truth; `ROS2_CONTROL_BACKEND_FAULT_CLASSES` is the consuming
+    mirror that digest promotion and the Phase 6H/6I external diagnostics
+    surfaces read. Drift in either direction must fail loudly here, not
+    surface as a silently unpromoted fault in production.
+    """
+
+    @staticmethod
+    def _header_reason_tokens() -> set[str]:
+        import re
+
+        assert _ROS2_CONTROL_FAULT_REASON_HEADER.is_file(), (
+            "ros2_control_capability.hpp not found at "
+            f"{_ROS2_CONTROL_FAULT_REASON_HEADER}; the taxonomy parity test "
+            "requires the monorepo layout (manyforge_roboplan next to "
+            "manyforge_behavior)."
+        )
+        text = _ROS2_CONTROL_FAULT_REASON_HEADER.read_text(encoding="utf-8")
+        match = re.search(
+            r"namespace ros2_control_fault_reason \{(.*?)\}\s*//\s*namespace"
+            r"\s+ros2_control_fault_reason",
+            text,
+            flags=re.DOTALL,
+        )
+        assert match, (
+            "namespace ros2_control_fault_reason not found in "
+            "ros2_control_capability.hpp — the 6A taxonomy moved; update "
+            "this parity test alongside it."
+        )
+        tokens = set(re.findall(r'"([a-z0-9_]+)"', match.group(1)))
+        assert tokens, "no reason tokens parsed from the C++ namespace"
+        return tokens
+
+    def test_python_taxonomy_matches_cpp_header(self):
+        cpp_tokens = self._header_reason_tokens()
+        py_tokens = set(ROS2_CONTROL_BACKEND_FAULT_CLASSES)
+        assert py_tokens == cpp_tokens, (
+            f"taxonomy drift: only-in-cpp={sorted(cpp_tokens - py_tokens)}, "
+            f"only-in-python={sorted(py_tokens - cpp_tokens)}"
+        )
+
+    def test_external_aliases_satisfy_fault_code_constraints(self):
+        # medkit/diagnostics fault-code convention: UPPER_SNAKE_CASE,
+        # [A-Z0-9_], <=64 chars, globally unique, namespaced to manyforge.
+        import re
+
+        aliases = [
+            fault.external_alias
+            for fault in ROS2_CONTROL_BACKEND_FAULT_CLASSES.values()
+        ]
+        assert len(aliases) == len(set(aliases)), "aliases must be unique"
+        for fault in ROS2_CONTROL_BACKEND_FAULT_CLASSES.values():
+            alias = fault.external_alias
+            assert re.fullmatch(r"[A-Z][A-Z0-9_]*", alias), alias
+            assert len(alias) <= 64, f"{alias} exceeds 64 chars"
+            assert alias == f"MANYFORGE_{fault.reason_code.upper()}", (
+                f"{alias} must be the MANYFORGE_-prefixed uppercase of "
+                f"{fault.reason_code}"
+            )
+
+    def test_severities_use_operational_levels_with_documented_rule(self):
+        # spec/520 levels; CRITICAL is reserved for unconfirmed-stop /
+        # stuck-lifecycle classes per the taxonomy docstring.
+        allowed = {"INFO", "WARN", "ERROR", "CRITICAL"}
+        for fault in ROS2_CONTROL_BACKEND_FAULT_CLASSES.values():
+            assert fault.severity in allowed, fault
+        critical = {
+            code
+            for code, fault in ROS2_CONTROL_BACKEND_FAULT_CLASSES.items()
+            if fault.severity == "CRITICAL"
+        }
+        assert critical == {
+            "controller_cancel_timeout",
+            "monitor_thread_still_shutting_down",
+        }
 
 
 # --- Cycle-state machine + Run-side auto-ack ---

@@ -3543,7 +3543,21 @@ void ExecutionKernel::async_execute_worker(
           // fresh-dispatch the original motion intent; otherwise the state
           // machine can advance to kValidating with no worker left to consume
           // resume_requested_.
-          std::this_thread::sleep_for(std::chrono::nanoseconds(kExecutionPollNs));
+          //
+          // Audit 6D (finding 2.19): condvar wait instead of a bare sleep —
+          // resume()/stop()/reset() notify `completion_cv_`, so the worker
+          // wakes immediately on intent instead of up to one poll period
+          // later. The poll period remains only as the deadline fallback.
+          std::unique_lock<std::mutex> wake_lock(completion_mutex_);
+          completion_cv_.wait_for(
+              wake_lock, std::chrono::nanoseconds(kExecutionPollNs),
+              [this]() {
+                return resume_requested_.load(std::memory_order_acquire) ||
+                       lifecycle_stop_requested_while_busy_.load(
+                           std::memory_order_acquire) ||
+                       lifecycle_reset_requested_while_busy_.load(
+                           std::memory_order_acquire);
+              });
         }
         continue;
       }
@@ -4317,6 +4331,9 @@ ResumeResultDTO ExecutionKernel::resume() {
   auto result = stop_policy_.request_resume();
   if (result.ok()) {
     resume_requested_.store(true);
+    // Audit 6D: wake the paused worker immediately (it waits on
+    // completion_cv_ keyed on resume_requested_ instead of sleep-polling).
+    completion_cv_.notify_all();
     auto snapshot = get_execution_snapshot();
     snapshot.timestamp_ns = clock_.now();
     snapshot.state = ExecutionState::kValidating;

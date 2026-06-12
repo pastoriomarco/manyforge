@@ -142,6 +142,23 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
   Ros2GripperStatus get_gripper_status(const std::string& gripper_id) const;
   void update_gripper_commands();
 
+  // Command-enable gate: this backend is the SINGLE publishing authority
+  // for the gate topic (reliable + transient_local, so the latched value is
+  // the truth for late-joining bridge subscribers). External flows that need
+  // command suppression — e.g. the simulator-reset flow — must request it
+  // here instead of publishing the topic themselves; a second publisher
+  // makes the latched gate value reader-dependent (split-brain).
+  bool command_gate_configured() const {
+    return !config_.command_gate_topic.empty();
+  }
+  bool command_gate_enabled() const {
+    return command_gate_enabled_.load(std::memory_order_acquire);
+  }
+  // Public request form of the gate write. Returns false when no gate is
+  // configured for this deployment (callers must treat that as a contract
+  // error when they required gating).
+  bool request_command_gate(bool enabled);
+
  private:
   using FollowJointTrajectory = control_msgs::action::FollowJointTrajectory;
   using GoalHandleFJT = rclcpp_action::ClientGoalHandle<FollowJointTrajectory>;
@@ -243,7 +260,8 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
       core::ErrorCode code,
       std::string message,
       std::string phase,
-      core::ExecutionState backend_state = core::ExecutionState::kInterventionRequired)
+      core::ExecutionState backend_state = core::ExecutionState::kInterventionRequired,
+      std::map<std::string, std::string> details = {})
       const;
   core::Result<void> resync_after_intervention_if_needed(std::string phase);
   void cancel_goal_if_known(const GoalHandleFJT::SharedPtr& goal_handle) noexcept;
@@ -256,13 +274,22 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
       const std::vector<double>* observed_velocities = nullptr);
   void fail_execution(std::string message,
                       core::ErrorCode code = core::ErrorCode::kExecutionAborted);
+  void fail_execution(std::string message,
+                      core::ErrorCode code,
+                      std::string reason_code,
+                      std::map<std::string, std::string> details);
   void require_operator_intervention(std::string message,
                                      core::ErrorCode code = core::ErrorCode::kStopFailed);
+  void require_operator_intervention(std::string message,
+                                     core::ErrorCode code,
+                                     std::string reason_code,
+                                     std::map<std::string, std::string> details);
   void complete_execution();
   void monitor_worker(core::TrajectoryDTO trajectory);
   bool start_state_matches(const core::TrajectoryDTO& trajectory,
                            const JointSample& sample,
-                           std::string& error) const;
+                           std::string& error,
+                           std::map<std::string, std::string>* details = nullptr) const;
   bool final_state_matches(const core::TrajectoryDTO& trajectory,
                            const JointSample& sample,
                            std::string& error) const;
@@ -293,6 +320,10 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
   rclcpp::Subscription<control_msgs::msg::JointTrajectoryControllerState>::SharedPtr
       controller_state_sub_;
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr command_gate_pub_;
+  // Last value published on the command-gate topic. Read by goal-rejection
+  // diagnostics so a closed gate is named as the rejection cause instead of
+  // surfacing as an unexplained controller refusal.
+  std::atomic<bool> command_gate_enabled_{false};
 #ifdef MANYFORGE_HAS_SPEED_SCALING_FACTOR_MSG
   rclcpp::Publisher<control_msgs::msg::SpeedScalingFactor>::SharedPtr
       speed_scaling_pub_;

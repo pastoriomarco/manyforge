@@ -39,6 +39,12 @@ double clamp_progress(double progress) {
   return std::max(0.0, std::min(1.0, progress));
 }
 
+std::string format_double(double value) {
+  std::ostringstream out;
+  out << std::setprecision(17) << value;
+  return out.str();
+}
+
 core::ErrorDTO make_error(core::ErrorCode code, std::string message) {
   return core::ErrorDTO{std::string(core::to_string(code)), std::move(message), {}};
 }
@@ -73,10 +79,12 @@ bool wait_for_fjt_action_server(
   const auto deadline = std::chrono::steady_clock::now() +
                         std::chrono::duration<double>(std::max(0.0, timeout_s));
   do {
+    // Audit 6C (finding 2.12): no trailing sleep — wait_for_action_server
+    // already blocks on graph discovery events for the slice; an extra
+    // sleep only added startup latency per iteration.
     if (client->wait_for_action_server(std::chrono::milliseconds(100))) {
       return true;
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(25));
   } while (std::chrono::steady_clock::now() < deadline);
   return client->wait_for_action_server(std::chrono::milliseconds(0));
 }
@@ -371,6 +379,8 @@ void Ros2ControlExecutionBackend::on_action_feedback(
       first_feedback_seen_ = true;
       execution_started_at_ = now;
       tracking_error_since_.reset();
+      // Audit 6C: the monitor's first-feedback wait keys on this flag.
+      execution_cv_.notify_all();
     }
     elapsed_s = seconds_since(execution_started_at_, now);
   }
@@ -467,7 +477,16 @@ void Ros2ControlExecutionBackend::on_action_result(
     }
     fail_execution(detail.empty()
                        ? "FollowJointTrajectory goal failed"
-                       : "FollowJointTrajectory goal failed: " + detail);
+                       : "FollowJointTrajectory goal failed: " + detail,
+                   core::ErrorCode::kExecutionAborted,
+                   ros2_control_fault_reason::kControllerResultFailed,
+                   {{"action_result_code",
+                     std::to_string(static_cast<int>(result.code))},
+                    {"controller_result_code",
+                     result.result
+                         ? std::to_string(result.result->error_code)
+                         : "unavailable"},
+                    {"controller_error", controller_error}});
     return;
   }
 
@@ -546,9 +565,21 @@ void Ros2ControlExecutionBackend::set_command_gate(bool enabled) {
   if (!command_gate_pub_) {
     return;
   }
+  // Tracked so goal-rejection diagnostics can state when the gate is the
+  // cause (a closed gate makes the bridge reject every goal, which would
+  // otherwise surface as an unexplained rejection).
+  command_gate_enabled_.store(enabled, std::memory_order_release);
   std_msgs::msg::Bool msg;
   msg.data = enabled;
   command_gate_pub_->publish(msg);
+}
+
+bool Ros2ControlExecutionBackend::request_command_gate(bool enabled) {
+  if (!command_gate_pub_) {
+    return false;
+  }
+  set_command_gate(enabled);
+  return true;
 }
 
 void Ros2ControlExecutionBackend::publish_runtime_velocity_scale(double scale) {
@@ -940,17 +971,19 @@ core::ErrorDTO Ros2ControlExecutionBackend::operator_intervention_error(
     core::ErrorCode code,
     std::string message,
     std::string phase,
-    core::ExecutionState backend_state) const {
+    core::ExecutionState backend_state,
+    std::map<std::string, std::string> details) const {
+  details["requires_operator_intervention"] = "true";
+  details["resync_required"] = "true";
+  details["phase"] = std::move(phase);
+  details["backend_state"] = core::to_string(backend_state);
+  details["action_name"] = config_.action_name;
+  details["stop_completion_timeout_s"] =
+      format_double(config_.stop_completion_timeout_s);
   return make_error(
       code,
       std::move(message),
-      {{"requires_operator_intervention", "true"},
-       {"resync_required", "true"},
-       {"phase", std::move(phase)},
-       {"backend_state", core::to_string(backend_state)},
-       {"action_name", config_.action_name},
-       {"stop_completion_timeout_s",
-        std::to_string(config_.stop_completion_timeout_s)}});
+      std::move(details));
 }
 
 core::Result<void> Ros2ControlExecutionBackend::resync_after_intervention_if_needed(
@@ -1203,6 +1236,36 @@ void Ros2ControlExecutionBackend::fail_execution(std::string message,
   execution_cv_.notify_all();
 }
 
+void Ros2ControlExecutionBackend::fail_execution(
+    std::string message,
+    core::ErrorCode code,
+    std::string reason_code,
+    std::map<std::string, std::string> details) {
+  const auto snapshot = get_execution_snapshot();
+  details["action_name"] = config_.action_name;
+  {
+    std::lock_guard<std::mutex> lock(execution_mutex_);
+    if (terminal_) {
+      return;
+    }
+    running_ = false;
+    terminal_ = true;
+    resync_required_ = true;
+    active_goal_handle_.reset();
+    active_goal_id_.reset();
+    active_trajectory_.reset();
+    active_trajectory_time_s_ = 0.0;
+    active_runtime_velocity_scale_ = 1.0;
+  }
+  publish_snapshot(core::ExecutionState::kFailed,
+                   snapshot.progress,
+                   snapshot.joint_positions_rad,
+                   make_ros2_control_fault_error(
+                       code, std::move(message), std::move(reason_code),
+                       std::move(details)));
+  execution_cv_.notify_all();
+}
+
 void Ros2ControlExecutionBackend::require_operator_intervention(
     std::string message,
     core::ErrorCode code) {
@@ -1227,6 +1290,42 @@ void Ros2ControlExecutionBackend::require_operator_intervention(
       snapshot.joint_positions_rad,
       operator_intervention_error(
           code, std::move(message), "controller_cancel_timeout", snapshot.state));
+  execution_cv_.notify_all();
+}
+
+void Ros2ControlExecutionBackend::require_operator_intervention(
+    std::string message,
+    core::ErrorCode code,
+    std::string reason_code,
+    std::map<std::string, std::string> details) {
+  const auto snapshot = get_execution_snapshot();
+  details["action_name"] = config_.action_name;
+  details["stop_completion_timeout_s"] =
+      format_double(config_.stop_completion_timeout_s);
+  {
+    std::lock_guard<std::mutex> lock(execution_mutex_);
+    if (terminal_) {
+      return;
+    }
+    running_ = false;
+    terminal_ = true;
+    resync_required_ = true;
+    active_goal_handle_.reset();
+    active_goal_id_.reset();
+    active_trajectory_.reset();
+    active_trajectory_time_s_ = 0.0;
+    active_runtime_velocity_scale_ = 1.0;
+  }
+  auto error = make_ros2_control_fault_error(
+      code, std::move(message), std::move(reason_code), std::move(details));
+  error.details["requires_operator_intervention"] = "true";
+  error.details["resync_required"] = "true";
+  error.details["phase"] = "controller_cancel_timeout";
+  error.details["backend_state"] = core::to_string(snapshot.state);
+  publish_snapshot(core::ExecutionState::kInterventionRequired,
+                   snapshot.progress,
+                   snapshot.joint_positions_rad,
+                   std::move(error));
   execution_cv_.notify_all();
 }
 
@@ -1258,7 +1357,8 @@ void Ros2ControlExecutionBackend::complete_execution() {
 bool Ros2ControlExecutionBackend::start_state_matches(
     const core::TrajectoryDTO& trajectory,
     const JointSample& sample,
-    std::string& error) const {
+    std::string& error,
+    std::map<std::string, std::string>* details) const {
   if (trajectory.waypoints.empty()) {
     return true;
   }
@@ -1270,10 +1370,32 @@ bool Ros2ControlExecutionBackend::start_state_matches(
     return false;
   }
   const auto& start = trajectory.waypoints.front().positions_rad;
-  const double max_error = max_abs_error(observed, start);
+  const size_t count = std::min(observed.size(), start.size());
+  double max_error = 0.0;
+  size_t max_index = 0;
+  for (size_t i = 0; i < count; ++i) {
+    const double joint_error = std::abs(observed[i] - start[i]);
+    if (joint_error > max_error) {
+      max_error = joint_error;
+      max_index = i;
+    }
+  }
   if (max_error > config_.start_tolerance_rad) {
     error = "Start state mismatch: max joint error " + std::to_string(max_error) +
             " rad exceeds tolerance " + std::to_string(config_.start_tolerance_rad);
+    if (details != nullptr) {
+      (*details)["max_joint_error_rad"] = format_double(max_error);
+      (*details)["start_tolerance_rad"] =
+          format_double(config_.start_tolerance_rad);
+      (*details)["observed_position_rad"] =
+          max_index < observed.size() ? format_double(observed[max_index]) : "";
+      (*details)["expected_position_rad"] =
+          max_index < start.size() ? format_double(start[max_index]) : "";
+      (*details)["joint_name"] =
+          max_index < trajectory.joint_names.size()
+              ? trajectory.joint_names[max_index]
+              : "joint[" + std::to_string(max_index) + "]";
+    }
     return false;
   }
   return true;
@@ -1371,7 +1493,12 @@ core::ExecutionHandle Ros2ControlExecutionBackend::execute_trajectory(
   std::vector<double> start_positions;
   if (uses_authored_backend_state()) {
     if (trajectory.waypoints.empty()) {
-      fail_execution("Trajectory has no waypoints");
+      fail_execution("Trajectory has no waypoints",
+                     core::ErrorCode::kInvalidRequest,
+                     ros2_control_fault_reason::kEmptyTrajectory,
+                     {{"waypoint_count", "0"},
+                      {"joint_count",
+                       std::to_string(trajectory.joint_names.size())}});
       return core::ExecutionHandle{
           [](int64_t) { return true; },
           [this]() { return get_execution_snapshot(); }};
@@ -1380,7 +1507,15 @@ core::ExecutionHandle Ros2ControlExecutionBackend::execute_trajectory(
   } else {
     auto start_sample = wait_for_fresh_sample(config_.wait_for_state_timeout_s);
     if (!start_sample.has_value()) {
-      fail_execution("No fresh complete controller state sample before dispatch");
+      fail_execution("No fresh complete controller state sample before dispatch",
+                     core::ErrorCode::kExecutionRejected,
+                     ros2_control_fault_reason::kStaleControllerState,
+                     {{"wait_for_state_timeout_s",
+                       format_double(config_.wait_for_state_timeout_s)},
+                      {"joint_state_topic", config_.joint_state_topic},
+                      {"controller_state_topic", config_.controller_state_topic},
+                      {"required_joint_count",
+                       std::to_string(config_.required_joints.size())}});
       return core::ExecutionHandle{
           [this](int64_t timeout_ns) {
             std::unique_lock<std::mutex> lock(execution_mutex_);
@@ -1396,8 +1531,13 @@ core::ExecutionHandle Ros2ControlExecutionBackend::execute_trajectory(
     }
 
     std::string start_error;
-    if (!start_state_matches(trajectory, *start_sample, start_error)) {
-      fail_execution(start_error);
+    std::map<std::string, std::string> start_details;
+    if (!start_state_matches(
+            trajectory, *start_sample, start_error, &start_details)) {
+      fail_execution(start_error,
+                     core::ErrorCode::kStartStateMismatch,
+                     ros2_control_fault_reason::kStartStateMismatch,
+                     std::move(start_details));
       return core::ExecutionHandle{
           [](int64_t) { return true; },
           [this]() { return get_execution_snapshot(); }};
@@ -1411,7 +1551,11 @@ core::ExecutionHandle Ros2ControlExecutionBackend::execute_trajectory(
   if (!wait_for_fjt_action_server(action_client_,
                                   config_.wait_for_action_server_timeout_s)) {
     fail_execution("FollowJointTrajectory action server unavailable: " +
-                   config_.action_name);
+                       config_.action_name,
+                   core::ErrorCode::kExecutionRejected,
+                   ros2_control_fault_reason::kActionServerUnavailable,
+                   {{"wait_for_action_server_timeout_s",
+                     format_double(config_.wait_for_action_server_timeout_s)}});
     return core::ExecutionHandle{
         [](int64_t) { return true; },
         [this]() { return get_execution_snapshot(); }};
@@ -1449,7 +1593,11 @@ core::ExecutionHandle Ros2ControlExecutionBackend::execute_trajectory(
           std::chrono::duration<double>(config_.wait_for_action_server_timeout_s)) !=
       std::future_status::ready) {
     fail_execution("Timed out waiting for FollowJointTrajectory goal response: " +
-                   config_.action_name);
+                       config_.action_name,
+                   core::ErrorCode::kExecutionRejected,
+                   ros2_control_fault_reason::kControllerGoalResponseTimeout,
+                   {{"wait_for_action_server_timeout_s",
+                     format_double(config_.wait_for_action_server_timeout_s)}});
     return core::ExecutionHandle{
         [](int64_t) { return true; },
         [this]() { return get_execution_snapshot(); }};
@@ -1459,13 +1607,33 @@ core::ExecutionHandle Ros2ControlExecutionBackend::execute_trajectory(
   try {
     goal_handle = goal_handle_future.get();
   } catch (const std::exception& exc) {
-    fail_execution(std::string("FollowJointTrajectory goal dispatch failed: ") + exc.what());
+    fail_execution(std::string("FollowJointTrajectory goal dispatch failed: ") + exc.what(),
+                   core::ErrorCode::kExecutionRejected,
+                   ros2_control_fault_reason::kControllerGoalDispatchFailed,
+                   {{"exception", exc.what()}});
     return core::ExecutionHandle{
         [](int64_t) { return true; },
         [this]() { return get_execution_snapshot(); }};
   }
   if (!goal_handle) {
-    fail_execution("FollowJointTrajectory goal rejected");
+    // Only name the gate when one is configured: non-gated deployments
+    // (real controllers) must not get a false gate attribution.
+    const bool gate_configured = !config_.command_gate_topic.empty();
+    const bool gate_closed =
+        gate_configured &&
+        !command_gate_enabled_.load(std::memory_order_acquire);
+    std::map<std::string, std::string> details;
+    if (gate_configured) {
+      details["command_gate_enabled"] = gate_closed ? "false" : "true";
+    }
+    fail_execution(gate_closed
+                       ? "FollowJointTrajectory goal rejected (command gate "
+                         "closed: simulator reset incomplete or failed — run "
+                         "simulation reset)"
+                       : "FollowJointTrajectory goal rejected",
+                   core::ErrorCode::kExecutionRejected,
+                   ros2_control_fault_reason::kControllerGoalRejected,
+                   std::move(details));
     return core::ExecutionHandle{
         [](int64_t) { return true; },
         [this]() { return get_execution_snapshot(); }};
@@ -1487,7 +1655,10 @@ core::ExecutionHandle Ros2ControlExecutionBackend::execute_trajectory(
   }
 
   if (monitor_thread_.joinable() && monitor_active_.load()) {
-    fail_execution("Previous ros2_control monitor thread is still shutting down");
+    fail_execution("Previous ros2_control monitor thread is still shutting down",
+                   core::ErrorCode::kExecutionRejected,
+                   ros2_control_fault_reason::kMonitorThreadStillShuttingDown,
+                   {});
     return core::ExecutionHandle{
         [](int64_t) { return true; },
         [this]() { return get_execution_snapshot(); }};
@@ -1551,7 +1722,11 @@ void Ros2ControlExecutionBackend::monitor_worker(core::TrajectoryDTO trajectory)
     }
     if (cancel_timeout) {
       require_operator_intervention(
-          "Timed out waiting for FollowJointTrajectory cancel confirmation");
+          "Timed out waiting for FollowJointTrajectory cancel confirmation",
+          core::ErrorCode::kStopFailed,
+          ros2_control_fault_reason::kControllerCancelTimeout,
+          {{"stop_completion_timeout_s",
+            format_double(config_.stop_completion_timeout_s)}});
       return;
     }
     if (cancel_pending) {
@@ -1559,12 +1734,25 @@ void Ros2ControlExecutionBackend::monitor_worker(core::TrajectoryDTO trajectory)
       publish_snapshot(core::ExecutionState::kStopping,
                        snapshot.progress,
                        snapshot.joint_positions_rad);
-      std::this_thread::sleep_for(
-          std::chrono::duration<double>(config_.monitor_period_s));
+      // Audit 6C (finding 2.5): wake immediately when the cancel result
+      // confirms terminal (on_action_result notifies execution_cv_); the
+      // period remains only the deadline pacing the kStopping publish and
+      // the cancel-timeout check. stop/pause flags are already true here,
+      // so the predicate must key on terminal progress only.
+      {
+        std::unique_lock<std::mutex> lock(execution_mutex_);
+        execution_cv_.wait_for(
+            lock, std::chrono::duration<double>(config_.monitor_period_s),
+            [this]() { return terminal_ || !running_; });
+      }
       continue;
     }
     if (first_feedback_timeout) {
-      fail_execution("Timed out waiting for first FollowJointTrajectory feedback");
+      fail_execution("Timed out waiting for first FollowJointTrajectory feedback",
+                     core::ErrorCode::kExecutionRejected,
+                     ros2_control_fault_reason::kControllerFeedbackTimeout,
+                     {{"wait_for_state_timeout_s",
+                       format_double(config_.wait_for_state_timeout_s)}});
       return;
     }
     if (waiting_for_first_feedback) {
@@ -1587,8 +1775,19 @@ void Ros2ControlExecutionBackend::monitor_worker(core::TrajectoryDTO trajectory)
         snapshot_positions = trajectory.waypoints.front().positions_rad;
       }
       publish_snapshot(core::ExecutionState::kExecuting, 0.0, snapshot_positions);
-      std::this_thread::sleep_for(
-          std::chrono::duration<double>(config_.monitor_period_s));
+      // Audit 6C (finding 2.5): wake on first feedback / terminal /
+      // stop-pause intent instead of sleeping out the period
+      // (on_action_feedback notifies execution_cv_ on the first-feedback
+      // transition).
+      {
+        std::unique_lock<std::mutex> lock(execution_mutex_);
+        execution_cv_.wait_for(
+            lock, std::chrono::duration<double>(config_.monitor_period_s),
+            [this]() {
+              return first_feedback_seen_ || terminal_ || !running_ ||
+                     stop_requested_ || pause_requested_;
+            });
+      }
       continue;
     }
     const double dt_s =
@@ -1624,12 +1823,16 @@ void Ros2ControlExecutionBackend::monitor_worker(core::TrajectoryDTO trajectory)
       if (sample.ok()) {
         predicted_positions = std::move(sample.value().positions_rad);
       } else {
-        std::cerr
-            << "trajectory_sampler error in Ros2ControlExecutionBackend "
-               "monitor predicted-state: "
-            << sample.error().code << " (time_s=" << trajectory_time_s
-            << ", waypoints=" << trajectory.waypoints.size() << ")"
-            << std::endl;
+        // Audit 6F: this runs on the 100 Hz monitor tick — a persistently
+        // failing sampler must emit one bounded structured warning per
+        // window, not one line per tick (and through the ROS logger, not a
+        // bare std::cerr that structured consumers never see).
+        RCLCPP_WARN_THROTTLE(
+            node_->get_logger(), *node_->get_clock(), 5000,
+            "trajectory_sampler error in Ros2ControlExecutionBackend "
+            "monitor predicted-state: %s (time_s=%.3f, waypoints=%zu)",
+            sample.error().code.c_str(), trajectory_time_s,
+            trajectory.waypoints.size());
       }
     }
     if (!predicted_positions.empty()) {
@@ -1638,45 +1841,34 @@ void Ros2ControlExecutionBackend::monitor_worker(core::TrajectoryDTO trajectory)
 
     std::vector<double> snapshot_positions = predicted_positions;
     std::optional<std::string> tracking_failure;
+    std::map<std::string, std::string> tracking_failure_details;
+    // Audit 6C (findings 2.14 + 2.15): copy the sample under a short
+    // state_mutex_ hold, run joint mapping and the tracking-error math
+    // lock-free (joint-state callbacks contend on the same mutex at
+    // 100 Hz), then re-take the lock briefly only for the peak/streak
+    // bookkeeping it actually guards. The expected positions reuse this
+    // tick's predicted sample (same trajectory, same time) instead of
+    // re-sampling the trajectory inside the critical section.
+    std::optional<JointSample> sample;
     {
       std::lock_guard<std::mutex> state_lock(state_mutex_);
-      auto sample = select_latest_sample_locked(now);
-      if (sample.has_value()) {
-        try {
-          auto observed = positions_for_joints(*sample, trajectory.joint_names);
-          if (!uses_authored_backend_state()) {
-            snapshot_positions = observed;
-          }
-          std::vector<double> expected;
-          {
-            auto expected_sample =
-                core::sample_trajectory(trajectory, trajectory_time_s);
-            if (expected_sample.ok()) {
-              expected = std::move(expected_sample.value().positions_rad);
-            } else {
-              std::cerr
-                  << "trajectory_sampler error in Ros2ControlExecutionBackend "
-                     "monitor tracking-error: "
-                  << expected_sample.error().code
-                  << " (time_s=" << trajectory_time_s
-                  << ", waypoints=" << trajectory.waypoints.size()
-                  << ")" << std::endl;
-            }
-          }
-          // Guard: an empty expected vector means either the
-          // trajectory was empty (no predicted state to compare
-          // against) or the sampler refused the input (logged
-          // separately). max_abs_error compares only
-          // min(lhs.size(), rhs.size()) and would silently return
-          // 0.0 on a zero-length overlap, which would falsely
-          // declare tracking-clean. Skip the diagnostic computation
-          // for this tick when the predicted state is unavailable;
-          // the monitor's snapshot publish and sleep continue
-          // normally after the diagnostic block.
-          if (expected.empty()) {
-            // Fall through to the post-try monitor publish/sleep
-            // without computing or accumulating tracking error.
-          } else {
+      sample = select_latest_sample_locked(now);
+    }
+    if (sample.has_value()) {
+      try {
+        auto observed = positions_for_joints(*sample, trajectory.joint_names);
+        if (!uses_authored_backend_state()) {
+          snapshot_positions = observed;
+        }
+        const std::vector<double>& expected = predicted_positions;
+        // Guard: an empty expected vector means either the trajectory was
+        // empty (no predicted state to compare against) or the sampler
+        // refused the input (logged where it was sampled). max_abs_error
+        // compares only min(lhs.size(), rhs.size()) and would silently
+        // return 0.0 on a zero-length overlap, which would falsely declare
+        // tracking-clean. Skip the diagnostic computation for this tick
+        // when the predicted state is unavailable.
+        if (!expected.empty()) {
           const double error = max_abs_error(observed, expected);
           JointSample error_sample;
           error_sample.joint_names = trajectory.joint_names;
@@ -1688,27 +1880,60 @@ void Ros2ControlExecutionBackend::monitor_worker(core::TrajectoryDTO trajectory)
           error_sample.received_at = now;
           error_sample.source = sample->source + "_tracking_error";
           error_sample.topic = sample->topic;
-          update_tracking_error_peak_locked(
-              error_sample, trajectory_time_s, &observed, &expected, &sample->velocities);
-          if (error > config_.tracking_error_tolerance_rad &&
-              config_.tracking_error_timeout_s > 0.0) {
-            if (!tracking_error_since_.has_value()) {
-              tracking_error_since_ = now;
+          {
+            std::lock_guard<std::mutex> state_lock(state_mutex_);
+            update_tracking_error_peak_locked(
+                error_sample, trajectory_time_s, &observed, &expected,
+                &sample->velocities);
+            if (error > config_.tracking_error_tolerance_rad &&
+                config_.tracking_error_timeout_s > 0.0) {
+              if (!tracking_error_since_.has_value()) {
+                tracking_error_since_ = now;
+              }
+              if (seconds_since(*tracking_error_since_, now) >=
+                  config_.tracking_error_timeout_s) {
+                tracking_failure =
+                    "Controller tracking error exceeded tolerance: " +
+                    std::to_string(error) + " rad";
+                tracking_failure_details["tracking_error_rad"] =
+                    format_double(error);
+                tracking_failure_details["tracking_error_tolerance_rad"] =
+                    format_double(config_.tracking_error_tolerance_rad);
+                tracking_failure_details["tracking_error_timeout_s"] =
+                    format_double(config_.tracking_error_timeout_s);
+                tracking_failure_details["trajectory_elapsed_s"] =
+                    format_double(trajectory_time_s);
+                if (peak_tracking_error_.has_value()) {
+                  const auto& peak = *peak_tracking_error_;
+                  tracking_failure_details["joint_name"] = peak.joint_name;
+                  tracking_failure_details["signed_error_rad"] =
+                      format_double(peak.signed_error_rad);
+                  tracking_failure_details["peak_tracking_error_rad"] =
+                      format_double(peak.abs_error_rad);
+                  tracking_failure_details["peak_elapsed_s"] =
+                      format_double(peak.elapsed_s);
+                  if (peak.has_expected_position) {
+                    tracking_failure_details["expected_position_rad"] =
+                        format_double(peak.expected_position_rad);
+                  }
+                  if (peak.has_observed_position) {
+                    tracking_failure_details["observed_position_rad"] =
+                        format_double(peak.observed_position_rad);
+                  }
+                  if (peak.has_observed_velocity) {
+                    tracking_failure_details["observed_velocity_rad_s"] =
+                        format_double(peak.observed_velocity_rad_s);
+                  }
+                }
+              }
+            } else {
+              tracking_error_since_.reset();
             }
-            if (seconds_since(*tracking_error_since_, now) >=
-                config_.tracking_error_timeout_s) {
-              tracking_failure =
-                  "Controller tracking error exceeded tolerance: " +
-                  std::to_string(error) + " rad";
-            }
-          } else {
-            tracking_error_since_.reset();
           }
-          }  // closes the `if (!expected.empty()) else` block above.
-        } catch (const std::exception&) {
-          // A malformed/incomplete sample is ignored here; start gate already
-          // proves that at least one complete controller sample existed.
         }
+      } catch (const std::exception&) {
+        // A malformed/incomplete sample is ignored here; start gate already
+        // proves that at least one complete controller sample existed.
       }
     }
     if (tracking_failure.has_value()) {
@@ -1722,12 +1947,26 @@ void Ros2ControlExecutionBackend::monitor_worker(core::TrajectoryDTO trajectory)
         handle_to_cancel = active_goal_handle_;
       }
       cancel_goal_if_known(handle_to_cancel);
-      fail_execution(*tracking_failure);
+      fail_execution(*tracking_failure,
+                     core::ErrorCode::kExecutionAborted,
+                     ros2_control_fault_reason::kTrackingErrorExceeded,
+                     std::move(tracking_failure_details));
       return;
     }
     publish_snapshot(core::ExecutionState::kExecuting, progress, snapshot_positions);
-    std::this_thread::sleep_for(
-        std::chrono::duration<double>(config_.monitor_period_s));
+    // Audit 6C (finding 2.5): the period still PACES the tick (waking on
+    // every 100 Hz sample would burn CPU for nothing), but terminal and
+    // stop/pause intent wake the worker immediately instead of waiting out
+    // the remainder of the slice.
+    {
+      std::unique_lock<std::mutex> lock(execution_mutex_);
+      execution_cv_.wait_for(
+          lock, std::chrono::duration<double>(config_.monitor_period_s),
+          [this]() {
+            return terminal_ || !running_ || stop_requested_ ||
+                   pause_requested_;
+          });
+    }
   }
 }
 
@@ -3045,8 +3284,18 @@ Ros2GripperCommandResult Ros2ControlExecutionBackend::command_gripper(
   goal.command.max_effort = max_effort;
 
   rclcpp_action::Client<GripperCommand>::SendGoalOptions options;
+  // Captured by value at dispatch (the callback must not touch backend
+  // members: `runtime` is shared_ptr precisely so it can outlive `this`).
+  // A closed command gate makes the bridge reject every goal; name that
+  // cause instead of leaving an unexplained rejection. Only when a gate is
+  // configured — non-gated (real-controller) deployments must not get a
+  // false gate attribution.
+  const bool gate_closed_at_dispatch =
+      !config_.command_gate_topic.empty() &&
+      !command_gate_enabled_.load(std::memory_order_acquire);
   options.goal_response_callback =
-      [runtime](const GoalHandleGripper::SharedPtr& goal_handle) {
+      [runtime, gate_closed_at_dispatch](
+          const GoalHandleGripper::SharedPtr& goal_handle) {
         GoalHandleGripper::SharedPtr handle_to_cancel;
         rclcpp_action::Client<GripperCommand>::SharedPtr action_client;
         {
@@ -3057,7 +3306,12 @@ Ros2GripperCommandResult Ros2ControlExecutionBackend::command_gripper(
               runtime->executing = false;
               runtime->goal_accepted = false;
               runtime->cancel_pending = false;
-              runtime->error = "Gripper action goal was rejected";
+              runtime->error =
+                  gate_closed_at_dispatch
+                      ? "Gripper action goal was rejected (command gate "
+                        "closed: simulator reset incomplete or failed — run "
+                        "simulation reset)"
+                      : "Gripper action goal was rejected";
             }
             return;
           }

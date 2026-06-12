@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 
+#include <manyforge_core/types/error_code.hpp>
 #include <manyforge_core/types/motion_interrupt.hpp>
 
 namespace manyforge::roboplan_backend {
@@ -89,5 +90,41 @@ struct Ros2ControlExecutionBackendConfig {
 core::MotionInterruptStopCapabilityDTO
 compute_ros2_control_motion_interrupt_stop_capability(
     const Ros2ControlExecutionBackendConfig& config);
+
+namespace ros2_control_fault_reason {
+inline constexpr const char* kActionServerUnavailable =
+    "action_server_unavailable";
+inline constexpr const char* kControllerCancelTimeout =
+    "controller_cancel_timeout";
+inline constexpr const char* kControllerFeedbackTimeout =
+    "controller_feedback_timeout";
+inline constexpr const char* kControllerGoalDispatchFailed =
+    "controller_goal_dispatch_failed";
+inline constexpr const char* kControllerGoalRejected =
+    "controller_goal_rejected";
+inline constexpr const char* kControllerGoalResponseTimeout =
+    "controller_goal_response_timeout";
+inline constexpr const char* kControllerResultFailed =
+    "controller_result_failed";
+inline constexpr const char* kEmptyTrajectory = "empty_trajectory";
+inline constexpr const char* kMonitorThreadStillShuttingDown =
+    "monitor_thread_still_shutting_down";
+inline constexpr const char* kStaleControllerState =
+    "stale_controller_state";
+inline constexpr const char* kStartStateMismatch = "start_state_mismatch";
+inline constexpr const char* kTrackingErrorExceeded =
+    "tracking_error_exceeded";
+}  // namespace ros2_control_fault_reason
+
+/// Build a backend ErrorDTO with the stable reason token carried in
+/// `details["reason_code"]`. The top-level ErrorDTO code remains one of the
+/// core error-code constants so existing kernel state-machine handling stays
+/// compatible; UI/observability surfaces use the reason token for the exact
+/// operator-facing cause.
+core::ErrorDTO make_ros2_control_fault_error(
+    core::ErrorCode code,
+    std::string message,
+    std::string reason_code,
+    std::map<std::string, std::string> details = {});
 
 }  // namespace manyforge::roboplan_backend

@@ -6,23 +6,28 @@ import time
 import pytest
 
 
-def test_simulation_control_resets_state_and_publishes_command_gate():
+def test_simulation_control_resets_state_without_touching_command_gate():
+    # Single gate authority: the execution backend owns the command-enable
+    # gate topic. The simulation-control client must NOT publish it (a second
+    # transient-local publisher makes the latched value reader-dependent).
     rclpy = pytest.importorskip("rclpy")
     pytest.importorskip("simulation_interfaces")
 
     from rclpy.executors import MultiThreadedExecutor
-    from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
     from simulation_interfaces.srv import ResetSimulation
-    from std_msgs.msg import Bool
 
     from manyforge_ros.simulation_control import SimulationControlClient
+
+    assert not hasattr(SimulationControlClient, "publish_command_gate"), (
+        "SimulationControlClient must not regrow a command-gate publisher; "
+        "the execution backend is the single gate authority"
+    )
 
     rclpy.init(args=None)
     executor = MultiThreadedExecutor(num_threads=2)
     server_node = rclpy.create_node("manyforge_sim_control_fake_sim")
     client_node = rclpy.create_node("manyforge_sim_control_client")
     scopes: list[int] = []
-    gate_messages: list[bool] = []
 
     def reset_service(request, response):
         scopes.append(int(request.scope))
@@ -34,17 +39,6 @@ def test_simulation_control_resets_state_and_publishes_command_gate():
         "/reset_simulation",
         reset_service,
     )
-    gate_qos = QoSProfile(
-        depth=1,
-        durability=DurabilityPolicy.TRANSIENT_LOCAL,
-        reliability=ReliabilityPolicy.RELIABLE,
-    )
-    subscription = server_node.create_subscription(
-        Bool,
-        "/manyforge/test_command_enable",
-        lambda msg: gate_messages.append(bool(msg.data)),
-        gate_qos,
-    )
 
     executor.add_node(server_node)
     executor.add_node(client_node)
@@ -53,29 +47,19 @@ def test_simulation_control_resets_state_and_publishes_command_gate():
 
     try:
         client = SimulationControlClient(client_node, service_timeout_s=2.0)
-        client.publish_command_gate(
-            "/manyforge/test_command_enable",
-            enabled=False,
-            settle_s=0.1,
-        )
         result = client.reset(scope="state")
-        client.publish_command_gate(
-            "/manyforge/test_command_enable",
-            enabled=True,
-            settle_s=0.1,
-        )
-
-        deadline = time.monotonic() + 1.0
-        while len(gate_messages) < 2 and time.monotonic() < deadline:
-            time.sleep(0.01)
 
         assert result.success is True
         assert result.service_name == "/reset_simulation"
         assert scopes == [ResetSimulation.Request.SCOPE_STATE]
-        assert gate_messages[:2] == [False, True]
+        # The client node must not have created any publisher on the gate
+        # topic during the reset.
+        gate_publishers = client_node.get_publishers_info_by_topic(
+            "/manyforge/test_command_enable"
+        )
+        assert gate_publishers == []
     finally:
         server_node.destroy_service(service)
-        server_node.destroy_subscription(subscription)
         executor.shutdown()
         server_node.destroy_node()
         client_node.destroy_node()

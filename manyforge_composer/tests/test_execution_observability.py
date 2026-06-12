@@ -75,6 +75,41 @@ def test_execution_digest_reports_running_state_and_object_summary():
         assert any(obj["id"] == "table" for obj in data["objectSummary"])
 
 
+def test_execution_digest_reports_structured_backend_fault_details():
+    class TrackingFaultKernel(MockKernelClient):
+        def get_execution_snapshot(self):
+            snapshot = super().get_execution_snapshot()
+            snapshot.error = (
+                "Controller tracking error exceeded tolerance: 0.125 rad"
+            )
+            snapshot.error_code = "execution_aborted"
+            snapshot.error_details = {
+                "backend": "ros2_control",
+                "reason_code": "tracking_error_exceeded",
+                "joint_name": "shoulder_pan_joint",
+                "peak_tracking_error_rad": "0.125",
+                "tracking_error_tolerance_rad": "0.05",
+            }
+            return snapshot
+
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=TrackingFaultKernel())
+    app = create_app(state, security=_TEST_SECURITY)
+
+    with TestClient(app) as client:
+        assert client.post("/api/program/load", json={"path": _PROGRAM_PATH}).status_code == 200
+
+        response = client.get("/api/execution/digest")
+        assert response.status_code == 200
+        data = response.json()
+
+        assert data["error"] == (
+            "Controller tracking error exceeded tolerance: 0.125 rad"
+        )
+        assert data["errorCode"] == "tracking_error_exceeded"
+        assert data["errorDetails"]["reason_code"] == "tracking_error_exceeded"
+        assert data["errorDetails"]["joint_name"] == "shoulder_pan_joint"
+
+
 def test_execution_history_and_export_use_trace_sink(tmp_path):
     kernel = MockKernelClient(execute_duration_s=1.0)
     state = ComposerState(
@@ -100,6 +135,11 @@ def test_execution_history_and_export_use_trace_sink(tmp_path):
         assert all("trace_source" in event for event in history["events"])
         assert any(event["type"] in {"execute_started", "kernel_state_transition"} for event in history["events"])
         trace_file = tmp_path / f"{history['runId']}.events.jsonl"
+        # JSONL appends are asynchronous since audit 6B; bound the wait
+        # instead of asserting instantaneous existence.
+        deadline = time.monotonic() + 2.0
+        while not trace_file.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
         assert trace_file.exists()
 
         export_response = client.get("/api/debug/export")
@@ -238,3 +278,113 @@ def test_execution_digest_and_debug_export_report_signal_provider_health():
         exported = export_response.json()
         assert exported["signalSnapshot"]["providers"]["roxsie"]["connected"] is False
         assert "connector offline" in exported["signalSnapshot"]["providers"]["roxsie"]["lastError"]
+
+
+# --- Audit 6B: event-recorder hot path (findings 2.3, 2.11, 2.16) ---
+
+
+def test_record_event_does_not_block_on_slow_disk(tmp_path):
+    """Finding 2.3: a slow JSONL sink must not stall observers; appends run
+    on the writer thread while `_record_event` returns promptly."""
+    import threading
+
+    from manyforge_composer.backend.event_recorder import EventRecorder
+
+    recorder = EventRecorder(trace_dir=tmp_path, failure_archive_enabled=False)
+    release_disk = threading.Event()
+    writes = []
+    original_write = EventRecorder._write_jsonl_line
+
+    def slow_write(file_path, json_text):
+        release_disk.wait(timeout=5.0)
+        writes.append(json_text)
+        original_write(file_path, json_text)
+
+    recorder._write_jsonl_line = staticmethod(slow_write)
+    try:
+        t0 = time.monotonic()
+        for index in range(20):
+            recorder._record_event(
+                event_type="cycle_state_changed",
+                details={"index": index},
+                run_id="run-slow-disk",
+            )
+        hot_path_s = time.monotonic() - t0
+        # The disk is fully blocked, yet recording 20 events must be quick.
+        assert hot_path_s < 0.5, f"hot path stalled on disk: {hot_path_s:.3f}s"
+        release_disk.set()
+        assert recorder.wait_for_jsonl_idle(timeout_s=5.0)
+        assert len(writes) >= 20
+    finally:
+        release_disk.set()
+        recorder.close()
+
+
+def test_jsonl_order_preserved_and_close_joins_workers(tmp_path):
+    """Findings 2.3 + 2.11: per-run JSONL ordering is fixed at enqueue time,
+    and close() terminates both workers via sentinel."""
+    from manyforge_composer.backend.event_recorder import EventRecorder
+
+    recorder = EventRecorder(trace_dir=tmp_path)
+    for index in range(50):
+        recorder._record_event(
+            event_type="cycle_state_changed",
+            details={"index": index},
+            run_id="run-order",
+        )
+    assert recorder.wait_for_jsonl_idle(timeout_s=5.0)
+    assert recorder.close(timeout_s=5.0)
+
+    jsonl_files = list(tmp_path.glob("*.events.jsonl"))
+    assert jsonl_files
+    import json as _json
+
+    indices = []
+    for line in jsonl_files[0].read_text(encoding="utf-8").splitlines():
+        event = _json.loads(line)
+        if event.get("type") == "cycle_state_changed" and "details" in event:
+            if "index" in event["details"]:
+                indices.append(event["details"]["index"])
+    assert indices == sorted(indices), "JSONL event order must be FIFO"
+    # Workers are gone after close().
+    assert recorder._jsonl_worker is not None
+    assert not recorder._jsonl_worker.is_alive()
+    if recorder._failure_archive_worker is not None:
+        assert not recorder._failure_archive_worker.is_alive()
+    # close() is idempotent.
+    assert recorder.close(timeout_s=1.0)
+
+
+def test_observe_is_rate_limited_and_force_bypasses(tmp_path):
+    """Finding 2.16: polling observe() calls are budgeted; force=True is
+    exact for export/recovery callers."""
+    from manyforge_composer.backend.event_recorder import EventRecorder
+
+    class _CountingState:
+        def __init__(self):
+            self.reads = 0
+
+        @property
+        def cycle_manager(self):
+            self.reads += 1
+            return None
+
+        _kernel = None
+
+    recorder = EventRecorder(trace_dir=tmp_path, failure_archive_enabled=False)
+    state = _CountingState()
+    try:
+        recorder.observe(state)
+        assert state.reads == 1
+        # Immediately repolled: budgeted away.
+        recorder.observe(state)
+        assert state.reads == 1
+        # Exactness path bypasses the budget.
+        recorder.observe(state, force=True)
+        assert state.reads == 2
+        # After the budget elapses, polling observes scan again.
+        recorder._last_observe_monotonic = 0.0
+        recorder.observe(state)
+        assert state.reads == 3
+    finally:
+        recorder.close()

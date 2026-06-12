@@ -124,12 +124,12 @@ class TestRunLifecycle:
     """Run start / finish and run_id tracking."""
 
     def test_no_run_initially(self):
-        rec = EventRecorder()
+        rec = EventRecorder(observe_min_interval_s=0.0)
         assert rec.current_run_id is None
         assert rec.last_run_id is None
 
     def test_idle_to_running_starts_run(self):
-        rec = EventRecorder()
+        rec = EventRecorder(observe_min_interval_s=0.0)
         # First observe idle
         rec.observe(_StubState(cycle_manager=_StubCycleManager("idle")))
         assert rec.current_run_id is None
@@ -140,7 +140,7 @@ class TestRunLifecycle:
         assert rec.current_run_id.startswith("run-")
 
     def test_running_to_idle_finishes_run(self):
-        rec = EventRecorder()
+        rec = EventRecorder(observe_min_interval_s=0.0)
         rec.observe(_StubState(cycle_manager=_StubCycleManager("idle")))
         rec.observe(_StubState(cycle_manager=_StubCycleManager("running")))
         run_id = rec.current_run_id
@@ -150,7 +150,7 @@ class TestRunLifecycle:
         assert rec.last_run_id == run_id
 
     def test_multiple_runs_increment_counter(self):
-        rec = EventRecorder()
+        rec = EventRecorder(observe_min_interval_s=0.0)
         rec.observe(_StubState(cycle_manager=_StubCycleManager("idle")))
 
         rec.observe(_StubState(cycle_manager=_StubCycleManager("running")))
@@ -193,7 +193,7 @@ class TestSemanticEvents:
         return [e for e in _memory_events(rec) if e["event_index"] > idx_before]
 
     def test_planning_to_validating_emits_plan_completed(self):
-        rec = EventRecorder()
+        rec = EventRecorder(observe_min_interval_s=0.0)
         # Bootstrap cycle state
         rec.observe(_StubState(cycle_manager=_StubCycleManager("idle")))
         rec.observe(_StubState(cycle_manager=_StubCycleManager("running")))
@@ -205,7 +205,7 @@ class TestSemanticEvents:
         assert "plan_completed" in semantic_types
 
     def test_validating_to_executing_emits_execute_started(self):
-        rec = EventRecorder()
+        rec = EventRecorder(observe_min_interval_s=0.0)
         rec.observe(_StubState(cycle_manager=_StubCycleManager("idle")))
         rec.observe(_StubState(cycle_manager=_StubCycleManager("running")))
 
@@ -216,7 +216,7 @@ class TestSemanticEvents:
         assert "execute_started" in semantic_types
 
     def test_executing_to_completed(self):
-        rec = EventRecorder()
+        rec = EventRecorder(observe_min_interval_s=0.0)
         rec.observe(_StubState(cycle_manager=_StubCycleManager("idle")))
         rec.observe(_StubState(cycle_manager=_StubCycleManager("running")))
 
@@ -227,7 +227,7 @@ class TestSemanticEvents:
         assert "execute_completed" in semantic_types
 
     def test_executing_to_failed(self):
-        rec = EventRecorder()
+        rec = EventRecorder(observe_min_interval_s=0.0)
         rec.observe(_StubState(cycle_manager=_StubCycleManager("idle")))
         rec.observe(_StubState(cycle_manager=_StubCycleManager("running")))
 
@@ -238,7 +238,7 @@ class TestSemanticEvents:
         assert "execute_failed" in semantic_types
 
     def test_stopping_to_intervention_required(self):
-        rec = EventRecorder()
+        rec = EventRecorder(observe_min_interval_s=0.0)
         rec.observe(_StubState(cycle_manager=_StubCycleManager("idle")))
         rec.observe(_StubState(cycle_manager=_StubCycleManager("running")))
 
@@ -250,7 +250,7 @@ class TestSemanticEvents:
         assert intervention_events[-1]["severity"] == "ERROR"
 
     def test_executing_to_paused(self):
-        rec = EventRecorder()
+        rec = EventRecorder(observe_min_interval_s=0.0)
         rec.observe(_StubState(cycle_manager=_StubCycleManager("idle")))
         rec.observe(_StubState(cycle_manager=_StubCycleManager("running")))
 
@@ -265,13 +265,14 @@ class TestJSONLSink:
     """JSONL file persistence."""
 
     def test_events_written_to_jsonl(self, tmp_path):
-        rec = EventRecorder(trace_dir=tmp_path)
+        rec = EventRecorder(observe_min_interval_s=0.0, trace_dir=tmp_path)
         rec.observe(_StubState(cycle_manager=_StubCycleManager("idle")))
         rec.observe(_StubState(cycle_manager=_StubCycleManager("running")))
         run_id = rec.current_run_id
 
         rec.observe(_StubState(cycle_manager=_StubCycleManager("stopped")))
 
+        assert rec.wait_for_jsonl_idle()
         jsonl_path = tmp_path / f"{run_id}.events.jsonl"
         assert jsonl_path.exists()
 
@@ -285,27 +286,28 @@ class TestJSONLSink:
             assert event["run_id"] == run_id
 
     def test_no_trace_dir_no_file(self):
-        rec = EventRecorder(trace_dir=None)
+        rec = EventRecorder(observe_min_interval_s=0.0, trace_dir=None)
         rec.observe(_StubState(cycle_manager=_StubCycleManager("idle")))
         rec.observe(_StubState(cycle_manager=_StubCycleManager("running")))
         # Should not raise
         rec.observe(_StubState(cycle_manager=_StubCycleManager("stopped")))
 
     def test_history_loads_from_jsonl(self, tmp_path):
-        rec = EventRecorder(trace_dir=tmp_path)
+        rec = EventRecorder(observe_min_interval_s=0.0, trace_dir=tmp_path)
         rec.observe(_StubState(cycle_manager=_StubCycleManager("idle")))
         rec.observe(_StubState(cycle_manager=_StubCycleManager("running")))
         run_id = rec.current_run_id
         rec.observe(_StubState(cycle_manager=_StubCycleManager("idle")))
+        assert rec.wait_for_jsonl_idle()
 
         # Create a fresh recorder pointing at the same trace dir
-        rec2 = EventRecorder(trace_dir=tmp_path)
+        rec2 = EventRecorder(observe_min_interval_s=0.0, trace_dir=tmp_path)
         result = rec2.history(run_id=run_id)
         assert result["run_id"] == run_id
         assert len(result["events"]) > 0
 
     def test_events_include_operational_envelope_fields(self, tmp_path):
-        rec = EventRecorder(trace_dir=tmp_path)
+        rec = EventRecorder(observe_min_interval_s=0.0, trace_dir=tmp_path)
         rec.observe(_StubState(cycle_manager=_StubCycleManager("idle")))
         rec.observe(_StubState(cycle_manager=_StubCycleManager("running")))
 
@@ -322,7 +324,7 @@ class TestJSONLSink:
         assert event["program_run_id"] == event["run_id"]
 
     def test_export_ros2_medkit_trace_normalizes_records(self, tmp_path):
-        rec = EventRecorder(trace_dir=tmp_path)
+        rec = EventRecorder(observe_min_interval_s=0.0, trace_dir=tmp_path)
         rec.observe(_StubState(cycle_manager=_StubCycleManager("idle")))
         rec.observe(_StubState(cycle_manager=_StubCycleManager("running")))
         run_id = rec.current_run_id
@@ -336,7 +338,7 @@ class TestJSONLSink:
         assert exported["records"]
 
     def test_failure_archive_written_for_execution_failure(self, tmp_path):
-        rec = EventRecorder(trace_dir=tmp_path)
+        rec = EventRecorder(observe_min_interval_s=0.0, trace_dir=tmp_path)
         rec.observe(_StubState(cycle_manager=_StubCycleManager("idle")))
         rec.observe(_StubState(cycle_manager=_StubCycleManager("running")))
         run_id = rec.current_run_id
@@ -447,7 +449,7 @@ class TestJSONLSink:
             return archive_path
 
         monkeypatch.setattr(EventRecorder, "_write_failure_archive", slow_archive)
-        rec = EventRecorder(trace_dir=tmp_path)
+        rec = EventRecorder(observe_min_interval_s=0.0, trace_dir=tmp_path)
         rec.observe(_StubState(cycle_manager=_StubCycleManager("idle")))
         rec.observe(_StubState(cycle_manager=_StubCycleManager("running")))
         run_id = rec.current_run_id
@@ -466,7 +468,7 @@ class TestJSONLSink:
         assert rec.wait_for_failure_archives_idle(timeout_s=2.0)
 
     def test_native_error_event_preserves_structured_error_details(self):
-        rec = EventRecorder()
+        rec = EventRecorder(observe_min_interval_s=0.0)
         native_events = [
             {
                 "event_index": 4,
@@ -510,7 +512,7 @@ class TestJSONLSink:
         ] == details["collision_result_first_failure_pair"]
 
     def test_native_resume_replan_lifecycle_is_recorded(self):
-        rec = EventRecorder()
+        rec = EventRecorder(observe_min_interval_s=0.0)
         native_events = [
             {
                 "event_index": 10,
@@ -578,7 +580,7 @@ class TestJSONLSink:
         assert events[-1]["details"]["native_kernel_event_index"] == 13
 
     def test_regular_native_lifecycle_events_are_not_recorded(self):
-        rec = EventRecorder()
+        rec = EventRecorder(observe_min_interval_s=0.0)
         rec.record_native_kernel_events(
             [
                 {
@@ -602,7 +604,7 @@ class TestJSONLSink:
         assert _memory_events(rec) == []
 
     def test_history_filters_by_severity_component_and_type(self):
-        rec = EventRecorder()
+        rec = EventRecorder(observe_min_interval_s=0.0)
         rec.observe(_StubState(cycle_manager=_StubCycleManager("idle")))
         rec.observe(_StubState(cycle_manager=_StubCycleManager("running")))
         run_id = rec.current_run_id
@@ -656,7 +658,7 @@ class TestInterventionProjection:
     """Intervention session events projected into the unified stream."""
 
     def test_intervention_events_appear_in_stream(self):
-        rec = EventRecorder()
+        rec = EventRecorder(observe_min_interval_s=0.0)
         rec.observe(_StubState(cycle_manager=_StubCycleManager("idle")))
 
         intervention = _StubIntervention(
@@ -687,7 +689,7 @@ class TestInterventionProjection:
         assert matching[0]["execution_mode"] == "intervention"
 
     def test_intervention_events_include_principal_id_and_grant_type(self):
-        rec = EventRecorder()
+        rec = EventRecorder(observe_min_interval_s=0.0)
         rec.observe(_StubState(cycle_manager=_StubCycleManager("idle")))
 
         intervention = _StubIntervention(
@@ -718,7 +720,7 @@ class TestInterventionProjection:
         assert matching[0]["grant_type"] == "human_approved"
 
     def test_duplicate_intervention_events_not_re_projected(self):
-        rec = EventRecorder()
+        rec = EventRecorder(observe_min_interval_s=0.0)
         rec.observe(_StubState(cycle_manager=_StubCycleManager("idle")))
 
         intervention = _StubIntervention(session_id="sess-dup")
@@ -739,7 +741,7 @@ class TestInterventionProjection:
         assert count_after == count_before
 
     def test_delegated_recovery_request_event_is_recorded(self):
-        rec = EventRecorder()
+        rec = EventRecorder(observe_min_interval_s=0.0)
         request = _StubDelegatedRecoveryRequest()
 
         rec.record_delegated_recovery_requested(request)
@@ -758,7 +760,7 @@ class TestGetEventsSince:
     """Incremental event polling."""
 
     def test_returns_events_after_index(self):
-        rec = EventRecorder()
+        rec = EventRecorder(observe_min_interval_s=0.0)
         rec.observe(_StubState(cycle_manager=_StubCycleManager("idle")))
         rec.observe(_StubState(cycle_manager=_StubCycleManager("running")))
 
@@ -770,7 +772,81 @@ class TestGetEventsSince:
         assert all(e["event_index"] > idx for e in new_events)
 
     def test_returns_empty_when_caught_up(self):
-        rec = EventRecorder()
+        rec = EventRecorder(observe_min_interval_s=0.0)
         rec.observe(_StubState(cycle_manager=_StubCycleManager("idle")))
         idx = rec._event_index
         assert rec.get_events_since(idx) == []
+
+
+# --- Audit 6G: synthesized semantic events on poll-skipped edges ---
+
+
+class TestSynthesizedSemanticEvents:
+    """A fast move can flash through Executing between polls (found by the
+    6G soak gate). Completed proves an execution window happened."""
+
+    def _observe_pair(self, rec, from_state, to_state, *,
+                      from_id=1, to_id=1, move_id="m1"):
+        idx_before = rec._event_index
+        snap = _StubSnapshot()
+        status_from = _StubStatus(
+            state=from_state, execution_id=from_id, active_move_id=move_id)
+        rec.observe(_StubState(
+            cycle_manager=_StubCycleManager(
+                "running", kernel_status=status_from, kernel_snapshot=snap),
+            kernel=_StubKernel(status=status_from, snapshot=snap)))
+        status_to = _StubStatus(
+            state=to_state, execution_id=to_id, active_move_id=move_id)
+        rec.observe(_StubState(
+            cycle_manager=_StubCycleManager(
+                "running", kernel_status=status_to, kernel_snapshot=snap),
+            kernel=_StubKernel(status=status_to, snapshot=snap)))
+        return [e for e in _memory_events(rec) if e["event_index"] > idx_before]
+
+    def test_skipped_executing_window_synthesizes_execute_events(self):
+        rec = EventRecorder(observe_min_interval_s=0.0)
+        events = self._observe_pair(
+            rec, ExecutionState.VALIDATING, ExecutionState.COMPLETED)
+        types = [e["type"] for e in events]
+        assert "execute_started" in types
+        assert "execute_completed" in types
+        started = next(e for e in events if e["type"] == "execute_started")
+        assert started["details"]["synthesized_from_edge"] == (
+            "validating->completed")
+        rec.close()
+
+    def test_back_to_back_moves_synthesize_boundary_events(self):
+        rec = EventRecorder(observe_min_interval_s=0.0)
+        events = self._observe_pair(
+            rec, ExecutionState.EXECUTING, ExecutionState.EXECUTING,
+            from_id=1, to_id=2)
+        # First observe legitimately emits execute_started for id 1
+        # (None->executing); the boundary synthesis adds completed(1) +
+        # started(2).
+        started_ids = [
+            e["execution_id"] for e in events if e["type"] == "execute_started"
+        ]
+        completed_ids = [
+            e["execution_id"] for e in events if e["type"] == "execute_completed"
+        ]
+        assert started_ids == [1, 2]
+        assert completed_ids == [1]
+        rec.close()
+
+    def test_planning_to_executing_jump_synthesizes_plan_completed(self):
+        rec = EventRecorder(observe_min_interval_s=0.0)
+        events = self._observe_pair(
+            rec, ExecutionState.PLANNING, ExecutionState.EXECUTING)
+        types = [e["type"] for e in events]
+        assert "plan_completed" in types
+        assert "execute_started" in types
+        rec.close()
+
+    def test_failure_edges_are_not_interpolated(self):
+        rec = EventRecorder(observe_min_interval_s=0.0)
+        events = self._observe_pair(
+            rec, ExecutionState.VALIDATING, ExecutionState.FAILED)
+        types = [e["type"] for e in events]
+        assert "execute_started" not in types
+        assert "validation_failed" in types
+        rec.close()

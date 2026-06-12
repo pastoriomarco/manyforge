@@ -1,5 +1,9 @@
 #include <gtest/gtest.h>
 
+#include <map>
+#include <string>
+#include <vector>
+
 #include <manyforge_roboplan/ros2_control_capability.hpp>
 
 // spec/260 §5.6: the ros2_control adapter's
@@ -38,6 +42,121 @@ TEST(Ros2CapabilityTest,
       MotionInterruptStopMode::kHardDeceleration));
   ASSERT_TRUE(cap.capability_profile_id.has_value());
   EXPECT_EQ(*cap.capability_profile_id, "ros2_control_v1");
+}
+
+TEST(Ros2CapabilityTest,
+     FaultErrorCarriesStableReasonTokenAndMeasurements) {
+  auto error = make_ros2_control_fault_error(
+      ErrorCode::kExecutionAborted,
+      "Controller tracking error exceeded tolerance",
+      ros2_control_fault_reason::kTrackingErrorExceeded,
+      {{"joint_name", "shoulder_pan_joint"},
+       {"tracking_error_rad", "0.125"},
+       {"tracking_error_tolerance_rad", "0.05"},
+       {"elapsed_s", "1.25"}});
+
+  EXPECT_EQ(error.code, kErrorExecutionAborted);
+  EXPECT_EQ(error.message, "Controller tracking error exceeded tolerance");
+  EXPECT_EQ(error.details.at("backend"), "ros2_control");
+  EXPECT_EQ(error.details.at("surface"), "ros2_control_execution_backend");
+  EXPECT_EQ(error.details.at("reason_code"), "tracking_error_exceeded");
+  EXPECT_EQ(error.details.at("joint_name"), "shoulder_pan_joint");
+  EXPECT_EQ(error.details.at("tracking_error_rad"), "0.125");
+  EXPECT_EQ(error.details.at("tracking_error_tolerance_rad"), "0.05");
+  EXPECT_EQ(error.details.at("elapsed_s"), "1.25");
+}
+
+TEST(Ros2CapabilityTest,
+     FaultReasonTokensCoverPhase6ATaxonomy) {
+  struct Case {
+    const char* reason_code;
+    ErrorCode top_level_code;
+    std::map<std::string, std::string> details;
+    std::vector<std::string> required_keys;
+  };
+
+  const std::vector<Case> cases = {
+      {ros2_control_fault_reason::kTrackingErrorExceeded,
+       ErrorCode::kExecutionAborted,
+       {{"joint_name", "shoulder_pan_joint"},
+        {"peak_tracking_error_rad", "0.125"},
+        {"tracking_error_tolerance_rad", "0.05"},
+        {"trajectory_elapsed_s", "1.25"}},
+       {"joint_name",
+        "peak_tracking_error_rad",
+        "tracking_error_tolerance_rad",
+        "trajectory_elapsed_s"}},
+      {ros2_control_fault_reason::kStartStateMismatch,
+       ErrorCode::kStartStateMismatch,
+       {{"joint_name", "elbow_joint"},
+        {"max_joint_error_rad", "0.031"},
+        {"start_tolerance_rad", "0.02"},
+        {"expected_position_rad", "0.1"},
+        {"observed_position_rad", "0.131"}},
+       {"joint_name", "max_joint_error_rad", "start_tolerance_rad"}},
+      {ros2_control_fault_reason::kActionServerUnavailable,
+       ErrorCode::kExecutionRejected,
+       {{"action_name", "/arm/follow_joint_trajectory"},
+        {"wait_for_action_server_timeout_s", "2"}},
+       {"action_name", "wait_for_action_server_timeout_s"}},
+      {ros2_control_fault_reason::kEmptyTrajectory,
+       ErrorCode::kInvalidRequest,
+       {{"waypoint_count", "0"}, {"joint_count", "6"}},
+       {"waypoint_count", "joint_count"}},
+      {ros2_control_fault_reason::kStaleControllerState,
+       ErrorCode::kExecutionRejected,
+       {{"joint_state_topic", "/joint_states"},
+        {"controller_state_topic", "/arm/state"},
+        {"required_joint_count", "6"},
+        {"wait_for_state_timeout_s", "1"}},
+       {"joint_state_topic", "required_joint_count", "wait_for_state_timeout_s"}},
+      {ros2_control_fault_reason::kControllerCancelTimeout,
+       ErrorCode::kStopFailed,
+       {{"stop_completion_timeout_s", "2"}},
+       {"stop_completion_timeout_s"}},
+      {ros2_control_fault_reason::kControllerFeedbackTimeout,
+       ErrorCode::kExecutionRejected,
+       {{"wait_for_state_timeout_s", "1"}},
+       {"wait_for_state_timeout_s"}},
+      {ros2_control_fault_reason::kControllerGoalDispatchFailed,
+       ErrorCode::kExecutionRejected,
+       {{"exception", "dispatch failed"}},
+       {"exception"}},
+      {ros2_control_fault_reason::kControllerGoalRejected,
+       ErrorCode::kExecutionRejected,
+       {},
+       {}},
+      {ros2_control_fault_reason::kControllerGoalResponseTimeout,
+       ErrorCode::kExecutionRejected,
+       {{"wait_for_action_server_timeout_s", "2"}},
+       {"wait_for_action_server_timeout_s"}},
+      {ros2_control_fault_reason::kControllerResultFailed,
+       ErrorCode::kExecutionAborted,
+       {{"action_result_code", "4"},
+        {"controller_result_code", "6"},
+        {"controller_error", "path tolerance violated"}},
+       {"action_result_code", "controller_result_code", "controller_error"}},
+      {ros2_control_fault_reason::kMonitorThreadStillShuttingDown,
+       ErrorCode::kExecutionRejected,
+       {},
+       {}},
+  };
+
+  for (const auto& entry : cases) {
+    const auto error = make_ros2_control_fault_error(
+        entry.top_level_code, "backend fault", entry.reason_code,
+        entry.details);
+    EXPECT_EQ(error.details.at("backend"), "ros2_control");
+    EXPECT_EQ(error.details.at("surface"),
+              "ros2_control_execution_backend");
+    EXPECT_EQ(error.details.at("reason_code"), entry.reason_code);
+    EXPECT_EQ(error.code, std::string(to_string(entry.top_level_code)));
+    for (const auto& key : entry.required_keys) {
+      EXPECT_TRUE(error.details.contains(key))
+          << "missing detail key '" << key << "' for "
+          << entry.reason_code;
+    }
+  }
 }
 
 TEST(Ros2CapabilityTest,

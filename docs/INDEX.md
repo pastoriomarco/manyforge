@@ -37,6 +37,12 @@ branch/commit workflow).
     sibling `NemoClaw-Thor` repo — start at its `INDEX.md` →
     "The three assistant lanes".
 
+- [`operations/ROS2_MEDKIT.md`](operations/ROS2_MEDKIT.md)
+  - ros2_medkit integration runbook: install/build medkit, run the
+    fault-manager + ManyForge adapter and the generic diagnostics bridge,
+    test layers (hermetic vs real-lifecycle), production checklist and
+    fail-closed semantics.
+
 - [`operations/ISAAC_SCENE_AUTHORING.md`](operations/ISAAC_SCENE_AUTHORING.md)
   - Operator runbook for exporting Isaac Sim scene meshes and loading
     them through Composer.

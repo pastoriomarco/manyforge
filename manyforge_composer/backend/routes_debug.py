@@ -96,7 +96,7 @@ def build_scene_trace_payload(state: ComposerState, *, limit: int = 200) -> dict
 
 def build_debug_export_payload(state: ComposerState, *, run_id: str | None = None) -> dict[str, Any]:
     """Build single-call trace/debug export payload."""
-    state.event_recorder.observe(state)
+    state.event_recorder.observe(state, force=True)
     selected_run_id = run_id or state.event_recorder.last_run_id
     medkit_trace = build_ros2_medkit_trace_payload(state, run_id=selected_run_id)
     history = build_execution_history_payload(state, run_id=selected_run_id)
@@ -176,7 +176,7 @@ def build_ros2_medkit_trace_payload(
     run_id: str | None = None,
 ) -> dict[str, Any]:
     """Build a normalized execution trace for ros2_medkit-style correlation tooling."""
-    state.event_recorder.observe(state)
+    state.event_recorder.observe(state, force=True)
     payload = state.event_recorder.export_ros2_medkit_trace(
         run_id=run_id,
         exported_at_ns=time.monotonic_ns(),

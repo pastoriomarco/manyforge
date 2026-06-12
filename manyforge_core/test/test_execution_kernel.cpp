@@ -1038,8 +1038,13 @@ InterruptSignalUpdate make_interrupt_signal(std::string source_id,
   return signal;
 }
 
+// Audit 6G: 2 s bound (2000 x 1 ms), matching the cv-based fake-backend
+// helpers. The previous 200 ms bound flaked under first-run parallel ctest
+// load (observed once on Stop_OperatorProfileRefused_EmergencyLegacyFallback,
+// whose stop path crosses several thread handoffs). Passing tests return
+// early; only genuine failures pay the longer bound.
 bool wait_for_state(ExecutionKernel& kernel, ExecutionState target_state,
-                    int max_attempts = 200) {
+                    int max_attempts = 2000) {
   for (int attempt = 0; attempt < max_attempts; ++attempt) {
     if (kernel.get_status().state == target_state) {
       return true;
@@ -1050,7 +1055,7 @@ bool wait_for_state(ExecutionKernel& kernel, ExecutionState target_state,
 }
 
 bool wait_for_pending_scheduler_work(ThreadSafeManualScheduler& scheduler,
-                                     int max_attempts = 200) {
+                                     int max_attempts = 2000) {
   for (int attempt = 0; attempt < max_attempts; ++attempt) {
     if (scheduler.pending_count() > 0) {
       return true;
@@ -4927,18 +4932,38 @@ TEST_F(ExecutionKernelTest, Events_ValidationFailedEvent) {
 
   execute_sync(make_test_request());
 
-  std::lock_guard<std::mutex> lock(events_mutex);
-  // Find kValidationFailed and kErrorRaised events
+  // Audit 6G: completion can be observable a beat before the final event
+  // callbacks land under load; wait (bounded) for both events instead of
+  // racing the emission, then assert ordering as before.
   int validation_failed_idx = -1;
   int error_raised_idx = -1;
-  for (size_t i = 0; i < events.size(); ++i) {
-    if (events[i].type == KernelEventType::kValidationFailed) {
-      validation_failed_idx = static_cast<int>(i);
+  const auto find_events = [&]() {
+    validation_failed_idx = -1;
+    error_raised_idx = -1;
+    for (size_t i = 0; i < events.size(); ++i) {
+      if (events[i].type == KernelEventType::kValidationFailed) {
+        validation_failed_idx = static_cast<int>(i);
+      }
+      if (events[i].type == KernelEventType::kErrorRaised &&
+          error_raised_idx < 0) {
+        error_raised_idx = static_cast<int>(i);
+      }
     }
-    if (events[i].type == KernelEventType::kErrorRaised && error_raised_idx < 0) {
-      error_raised_idx = static_cast<int>(i);
+    return validation_failed_idx >= 0 && error_raised_idx >= 0;
+  };
+  for (int attempt = 0; attempt < 2000; ++attempt) {
+    {
+      std::lock_guard<std::mutex> lock(events_mutex);
+      if (find_events()) {
+        break;
+      }
     }
+    // Sleep outside the lock: the kernel emitter takes events_mutex in the
+    // subscription callback.
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
+  std::lock_guard<std::mutex> lock(events_mutex);
+  find_events();
   EXPECT_GE(validation_failed_idx, 0);
   EXPECT_GE(error_raised_idx, 0);
   EXPECT_LT(validation_failed_idx, error_raised_idx);  // validation_failed before error_raised

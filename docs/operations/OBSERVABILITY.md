@@ -141,7 +141,7 @@ operator-facing subset grouped by what you'd query for.
 | --- | --- |
 | `GET /api/debug/scene-trace?limit=200` | Current backend/HMI scene trace data. |
 | `GET /api/debug/export?run_id=…` | **Single-call debug bundle** for a run — capture this for bug reports. |
-| `GET /api/debug/export/ros2-medkit?run_id=…` | Normalized trace export for ros2_medkit-style tooling. |
+| `GET /api/debug/export/ros2-medkit?run_id=…` | Normalized trace export for ros2_medkit-style tooling (schema pinned in specs `docs/spec/520` §7.2.1; full medkit integration runbook: [`ROS2_MEDKIT.md`](ROS2_MEDKIT.md)). |
 | `POST /api/debug/signals/publish` | Manually publish a signal sample into the runtime signal registry — for interrupt-source probing. |
 
 ## Diagnostic scripts

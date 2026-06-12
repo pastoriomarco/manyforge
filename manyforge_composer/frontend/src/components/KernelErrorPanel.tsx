@@ -104,6 +104,94 @@ const ERROR_CODE_MAPPING: Record<string, HeadlineMapping> = {
     },
     severity: 'fault',
   },
+  tracking_error_exceeded: {
+    headline: (d) => {
+      const joint = stringField(d, 'joint_name');
+      const error = stringField(d, 'peak_tracking_error_rad')
+        || stringField(d, 'tracking_error_rad');
+      const tolerance = stringField(d, 'tracking_error_tolerance_rad');
+      if (joint && error && tolerance) {
+        return `Controller tracking error: ${joint} ${error} rad > ${tolerance} rad`;
+      }
+      if (error && tolerance) {
+        return `Controller tracking error exceeded tolerance (${error} rad > ${tolerance} rad)`;
+      }
+      return 'Controller tracking error exceeded tolerance';
+    },
+    hint: 'The controller deviated from the commanded trajectory. Inspect the measured joint error, clear the fault, and re-plan from the current robot state.',
+    severity: 'fault',
+  },
+  stale_controller_state: {
+    headline: () => 'Controller state was not fresh enough before dispatch',
+    hint: 'Check the ROS joint/controller-state publishers and retry after fresh complete state is available.',
+    severity: 'state',
+  },
+  start_state_mismatch: {
+    headline: (d) => {
+      const joint = stringField(d, 'joint_name');
+      const error = stringField(d, 'max_joint_error_rad');
+      const tolerance = stringField(d, 'start_tolerance_rad');
+      if (joint && error && tolerance) {
+        return `Start state mismatch: ${joint} ${error} rad > ${tolerance} rad`;
+      }
+      if (error && tolerance) {
+        return `Start state mismatch exceeded tolerance (${error} rad > ${tolerance} rad)`;
+      }
+      return 'Start state does not match the trajectory';
+    },
+    hint: 'The measured robot state does not match the first trajectory point. Re-plan from the current measured state before retrying.',
+    severity: 'fault',
+  },
+  action_server_unavailable: {
+    headline: (d) => {
+      const action = stringField(d, 'action_name');
+      return action
+        ? `FollowJointTrajectory action server unavailable: ${action}`
+        : 'FollowJointTrajectory action server unavailable';
+    },
+    hint: 'Check that the ros2_control controller is active and the action name matches the deployment.',
+    severity: 'state',
+  },
+  controller_cancel_timeout: {
+    headline: () => 'Controller cancel did not complete before the timeout',
+    hint: 'The backend entered operator intervention because software stop completion was not observed. Inspect the controller and reset when safe.',
+    severity: 'fault',
+  },
+  controller_feedback_timeout: {
+    headline: () => 'Controller feedback did not arrive after dispatch',
+    hint: 'Check the FollowJointTrajectory feedback stream and controller health before retrying.',
+    severity: 'state',
+  },
+  controller_goal_response_timeout: {
+    headline: () => 'Controller did not respond to the trajectory goal',
+    hint: 'Check the FollowJointTrajectory action server and controller executor.',
+    severity: 'state',
+  },
+  controller_goal_dispatch_failed: {
+    headline: (d) => stringField(d, 'exception') || 'Trajectory goal dispatch failed',
+    hint: 'Inspect the dispatch exception and controller action server state.',
+    severity: 'fault',
+  },
+  controller_goal_rejected: {
+    headline: () => 'Controller rejected the trajectory goal',
+    hint: 'Inspect controller constraints and active controller state before retrying.',
+    severity: 'fault',
+  },
+  controller_result_failed: {
+    headline: (d) => stringField(d, 'controller_error') || 'Controller reported trajectory failure',
+    hint: 'Inspect the controller result and tracking diagnostics, then re-plan from current state.',
+    severity: 'fault',
+  },
+  empty_trajectory: {
+    headline: () => 'Execution rejected an empty trajectory',
+    hint: 'This indicates an upstream planning/adapter bug; re-plan and inspect planner output.',
+    severity: 'fault',
+  },
+  monitor_thread_still_shutting_down: {
+    headline: () => 'Previous controller monitor thread is still shutting down',
+    hint: 'Wait for the backend to settle or reset before dispatching another trajectory.',
+    severity: 'state',
+  },
   motion_interrupt_backend_stop_failed: {
     headline: (d) => {
       const reason = stringField(d, 'reason') || stringField(d, 'reason_code');
@@ -132,11 +220,6 @@ const ERROR_CODE_MAPPING: Record<string, HeadlineMapping> = {
     hint: 'Inspect the latch diagnostics for the cause; click Reset to clear the kernel intervention state.',
     severity: 'fault',
   },
-  start_state_mismatch: {
-    headline: () => 'Start-state mismatch: robot is not at the trajectory start',
-    hint: 'Move the robot to the expected start state or re-plan from current state.',
-    severity: 'state',
-  },
   validation_limits_violation: {
     headline: () => 'Trajectory exceeds joint/TCP limits',
     hint: 'Adjust velocity/acceleration scale or limits and re-plan.',
@@ -163,6 +246,13 @@ const ERROR_CODE_MAPPING: Record<string, HeadlineMapping> = {
     severity: 'state',
   },
 };
+
+const GENERIC_BACKEND_ERROR_CODES = new Set([
+  'execution_aborted',
+  'execution_rejected',
+  'invalid_request',
+  'stop_failed',
+]);
 
 function stringField(
   details: Record<string, unknown> | null | undefined,
@@ -264,6 +354,24 @@ export function prettyBodyId(bodyId: string): string {
   return segments[segments.length - 1] || bodyId;
 }
 
+function mappingForError(
+  errorCode: string | null | undefined,
+  errorDetails: Record<string, unknown> | null | undefined,
+): HeadlineMapping | undefined {
+  const reasonCode = stringField(errorDetails, 'reason_code');
+  if (
+    reasonCode
+    && ERROR_CODE_MAPPING[reasonCode]
+    && (!errorCode || GENERIC_BACKEND_ERROR_CODES.has(errorCode))
+  ) {
+    return ERROR_CODE_MAPPING[reasonCode];
+  }
+  if (errorCode && ERROR_CODE_MAPPING[errorCode]) {
+    return ERROR_CODE_MAPPING[errorCode];
+  }
+  return reasonCode ? ERROR_CODE_MAPPING[reasonCode] : undefined;
+}
+
 /**
  * Resolve an (errorCode, errorDetails, fallbackMessage) tuple to the
  * operator-facing headline. Exported so the mapping can be unit-tested.
@@ -273,10 +381,7 @@ export function headlineForError(
   errorDetails: Record<string, unknown> | null | undefined,
   fallbackMessage: string,
 ): string {
-  if (!errorCode) {
-    return fallbackMessage;
-  }
-  const mapping = ERROR_CODE_MAPPING[errorCode];
+  const mapping = mappingForError(errorCode, errorDetails);
   if (!mapping) {
     return fallbackMessage;
   }
@@ -287,10 +392,7 @@ export function hintForError(
   errorCode: string | null | undefined,
   errorDetails: Record<string, unknown> | null | undefined,
 ): string | undefined {
-  if (!errorCode) {
-    return undefined;
-  }
-  const mapping = ERROR_CODE_MAPPING[errorCode];
+  const mapping = mappingForError(errorCode, errorDetails);
   const hint = mapping?.hint;
   if (!hint) {
     return undefined;
@@ -322,7 +424,7 @@ export function KernelErrorPanel({
   onDismiss,
 }: KernelErrorPanelProps) {
   const [showDetails, setShowDetails] = useState(false);
-  const mapping = errorCode ? ERROR_CODE_MAPPING[errorCode] : undefined;
+  const mapping = mappingForError(errorCode, errorDetails);
   const severity = mapping?.severity ?? 'unknown';
   const classes = severityClasses(severity);
   const headline = mapping

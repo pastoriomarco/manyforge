@@ -110,4 +110,16 @@ compute_ros2_control_motion_interrupt_stop_capability(
   return cap;
 }
 
+core::ErrorDTO make_ros2_control_fault_error(
+    core::ErrorCode code,
+    std::string message,
+    std::string reason_code,
+    std::map<std::string, std::string> details) {
+  details["backend"] = "ros2_control";
+  details["reason_code"] = std::move(reason_code);
+  details["surface"] = "ros2_control_execution_backend";
+  return core::ErrorDTO{
+      std::string(core::to_string(code)), std::move(message), std::move(details)};
+}
+
 }  // namespace manyforge::roboplan_backend

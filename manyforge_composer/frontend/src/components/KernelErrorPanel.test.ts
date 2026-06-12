@@ -116,6 +116,48 @@ describe('KernelErrorPanel mapping', () => {
       expect(headline).toBe('Generic fallback message');
     });
 
+    it('uses backend reason_code when the top-level code is generic', () => {
+      const details = {
+        reason_code: 'tracking_error_exceeded',
+        joint_name: 'shoulder_pan_joint',
+        peak_tracking_error_rad: '0.125',
+        tracking_error_tolerance_rad: '0.05',
+      };
+
+      expect(
+        headlineForError(
+          'execution_aborted',
+          details,
+          'Controller tracking error exceeded tolerance: 0.125 rad',
+        ),
+      ).toBe(
+        'Controller tracking error: shoulder_pan_joint 0.125 rad > 0.05 rad',
+      );
+      expect(hintForError('execution_aborted', details)).toContain(
+        're-plan from the current robot state',
+      );
+    });
+
+    it('renders structured start-state mismatch diagnostics', () => {
+      const details = {
+        reason_code: 'start_state_mismatch',
+        joint_name: 'elbow_joint',
+        max_joint_error_rad: '0.031',
+        start_tolerance_rad: '0.02',
+      };
+
+      expect(
+        headlineForError(
+          'execution_rejected',
+          details,
+          'Start state mismatch',
+        ),
+      ).toBe('Start state mismatch: elbow_joint 0.031 rad > 0.02 rad');
+      expect(hintForError('execution_rejected', details)).toContain(
+        'current measured state',
+      );
+    });
+
     it('returns the human message when errorCode is null (legacy string-only path)', () => {
       const headline = headlineForError(null, null, 'No program loaded');
       expect(headline).toBe('No program loaded');

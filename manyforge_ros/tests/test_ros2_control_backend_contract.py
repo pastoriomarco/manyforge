@@ -445,7 +445,18 @@ def test_ros2_control_backend_preserves_monitor_failure_after_late_result():
         rclpy.shutdown()
 
 
-def test_ros2_control_backend_resyncs_after_reset_timeout_before_next_run():
+def test_ros2_control_backend_resyncs_after_fault_before_next_run():
+    """A backend fault leaves resync_required set; the next execute must
+    resync observed state and proceed instead of requiring a service restart.
+
+    Note: this scenario previously forced resync via a monitor-join timeout
+    on reset (stop_completion_timeout_s=0.01 while the worker slept out
+    monitor_period_s=0.5). Audit 6C made the monitor wake on terminal intent
+    via condvar, which structurally eliminated that failure mode — the join
+    cannot be made to time out through configuration anymore. The recovery
+    contract is therefore exercised through a real production trigger: a
+    tracking fault (fail_execution sets resync_required_).
+    """
     rclpy = pytest.importorskip("rclpy")
     pytest.importorskip("control_msgs")
     pytest.importorskip("trajectory_msgs")
@@ -475,6 +486,8 @@ def test_ros2_control_backend_resyncs_after_reset_timeout_before_next_run():
         fake_server = FakeFollowJointTrajectoryServer(
             node,
             action_name=action_name,
+            # Keep the goal active long enough for the tracking-fault streak
+            # to fire (~0.1 s); the fake frees up after the hold for run two.
             hold_after_first_feedback_s=1.0,
         )
         joint_pub = node.create_publisher(JointState, joint_state_topic, 10)
@@ -512,28 +525,51 @@ def test_ros2_control_backend_resyncs_after_reset_timeout_before_next_run():
             controller_state_topic=controller_state_topic,
             wait_s=5.0,
             config_overrides={
-                "monitor_period_s": 0.5,
-                "stop_completion_timeout_s": 0.01,
+                "monitor_period_s": 0.05,
+                # The fake server publishes a static pose, so observed state
+                # diverges from the trajectory immediately: a tight tolerance
+                # plus a short streak window faults the execution quickly.
+                "tracking_error_tolerance_rad": 0.005,
+                "tracking_error_timeout_s": 0.05,
             },
         )
         time.sleep(1.5)
 
-        first = _execute_joint_goal(bundle, "reset_timeout_first")
+        first = _execute_joint_goal(bundle, "resync_fault_first")
         assert first["ok"] is True
-        time.sleep(0.1)
 
-        reset_result = bundle.reset()
-        assert reset_result["accepted"] is False
-        snapshot = bundle.get_execution_snapshot()
-        assert snapshot.get("state_name") == "InterventionRequired"
-        assert (snapshot.get("error_details") or {}).get("resync_required") == "true"
+        deadline = time.monotonic() + 10.0
+        snapshot = {}
+        while time.monotonic() < deadline:
+            snapshot = bundle.get_execution_snapshot()
+            if snapshot.get("state_name") == "Failed":
+                break
+            time.sleep(0.02)
+        assert snapshot.get("state_name") == "Failed", snapshot.get("state_name")
+        details = snapshot.get("error_details") or {}
+        assert details.get("reason_code") == "tracking_error_exceeded", details
 
-        # Once the old monitor has naturally exited, a fresh run from
-        # intervention_required must resync observed state and proceed instead
-        # of requiring a service restart.
-        time.sleep(0.7)
-        second = _execute_joint_goal(bundle, "reset_timeout_second")
+        # Let the fake server drain its hold for the cancelled goal.
+        time.sleep(1.5)
+
+        # The fault left the backend requiring an observed-state resync; a
+        # fresh run must recover without a service restart.
+        second = _execute_joint_goal(bundle, "resync_fault_second")
         assert second["ok"] is True
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            state_name = bundle.get_execution_snapshot().get("state_name")
+            if state_name in ("Executing", "Completed", "Failed"):
+                break
+            time.sleep(0.02)
+        # Reaching any execution state proves admission + resync succeeded;
+        # the second run will also tracking-fault eventually (static fake),
+        # which is irrelevant to the recovery contract under test.
+        assert bundle.get_execution_snapshot().get("state_name") in (
+            "Executing",
+            "Completed",
+            "Failed",
+        )
     finally:
         stop_event.set()
         if bundle is not None:
@@ -762,3 +798,145 @@ def test_ros2_control_backend_documents_lock_order_contract():
     assert "Lock-order contract:" in header
     assert "Do not hold state_mutex_ while taking execution_mutex_" in header
     assert "best-effort scene updates" in header
+
+
+def test_ros2_control_monitor_exits_promptly_after_stop_confirmation():
+    """Audit 6C (finding 2.5): the monitor worker must wake on terminal/stop
+    intent via condvar instead of sleeping out monitor_period_s. With a large
+    period (0.5 s), reset-during-execution must complete well under one
+    period; before the fix the worker lingered for the remainder of its
+    current sleep and reset's monitor join paid it (uniform in phase, up to
+    the full period)."""
+    rclpy = pytest.importorskip("rclpy")
+    pytest.importorskip("control_msgs")
+    pytest.importorskip("trajectory_msgs")
+
+    from control_msgs.msg import JointTrajectoryControllerState
+    from rclpy.executors import MultiThreadedExecutor
+    from sensor_msgs.msg import JointState
+    from trajectory_msgs.msg import JointTrajectoryPoint
+
+    from manyforge_ros.testing.fake_follow_joint_trajectory import (
+        FakeFollowJointTrajectoryServer,
+    )
+
+    suffix = uuid.uuid4().hex
+    action_name = f"/manyforge_contract_stopwake_{suffix}/follow_joint_trajectory"
+    joint_state_topic = f"/manyforge_contract_stopwake_{suffix}/joint_states"
+    controller_state_topic = f"/manyforge_contract_stopwake_{suffix}/controller_state"
+
+    rclpy.init(args=None)
+    executor = MultiThreadedExecutor(num_threads=2)
+    node = rclpy.create_node(f"manyforge_contract_stopwake_{suffix}")
+    stop_event = threading.Event()
+    fake_server = None
+    bundle = None
+
+    try:
+        joint_pub = node.create_publisher(JointState, joint_state_topic, 10)
+        state_pub = node.create_publisher(
+            JointTrajectoryControllerState,
+            controller_state_topic,
+            10,
+        )
+
+        def publish_state_loop() -> None:
+            while not stop_event.is_set():
+                joint_state = JointState()
+                joint_state.name = list(JOINTS)
+                joint_state.position = list(START_POSITIONS)
+                joint_pub.publish(joint_state)
+
+                controller_state = JointTrajectoryControllerState()
+                controller_state.joint_names = list(JOINTS)
+                controller_state.feedback = JointTrajectoryPoint()
+                controller_state.feedback.positions = list(START_POSITIONS)
+                controller_state.error = JointTrajectoryPoint()
+                controller_state.error.positions = [0.0] * len(JOINTS)
+                state_pub.publish(controller_state)
+                time.sleep(0.01)
+
+        executor.add_node(node)
+        spin_thread = threading.Thread(target=executor.spin, daemon=True)
+        publish_thread = threading.Thread(target=publish_state_loop, daemon=True)
+        spin_thread.start()
+        publish_thread.start()
+
+        bundle = _create_bundle(
+            action_name=action_name,
+            joint_state_topic=joint_state_topic,
+            controller_state_topic=controller_state_topic,
+            wait_s=5.0,
+            config_overrides={
+                # Large period makes any sleep-gated path visible; the
+                # condvar fix must keep latencies far below it.
+                "monitor_period_s": 0.5,
+                # The fake server never moves the joints; disable the
+                # tracking fault so it cannot race this latency probe.
+                "tracking_error_timeout_s": 0.0,
+            },
+        )
+        time.sleep(1.5)
+
+        samples = []
+        # Vary the reset phase within the 0.5 s monitor period; a fresh fake
+        # server per iteration (its hold blocks per goal).
+        for index, phase_delay_s in enumerate((0.15, 0.35, 0.55)):
+            fake_server = FakeFollowJointTrajectoryServer(
+                node,
+                action_name=action_name,
+                hold_after_first_feedback_s=10.0,
+            )
+            try:
+                # Settle: let the recreated action server finish discovery
+                # before dispatching (guards a teardown/recreate race).
+                time.sleep(0.25)
+                result = _execute_joint_goal(bundle, f"stop_wake_probe_{index}")
+                assert result["ok"] is True
+                deadline = time.monotonic() + 5.0
+                while time.monotonic() < deadline:
+                    state_name = bundle.get_execution_snapshot().get("state_name")
+                    if state_name == "Executing":
+                        break
+                    time.sleep(0.01)
+                assert (
+                    bundle.get_execution_snapshot().get("state_name") == "Executing"
+                )
+                time.sleep(phase_delay_s)
+
+                t0 = time.monotonic()
+                reset_result = bundle.reset()
+                duration_s = time.monotonic() - t0
+                assert reset_result["accepted"] is True, (
+                    "reset rejected: %r" % (reset_result,)
+                )
+                samples.append(duration_s)
+                time.sleep(0.2)
+            finally:
+                fake_server.destroy()
+                fake_server = None
+
+        print(
+            "\n6C_LATENCY_EVIDENCE reset_during_execution_s="
+            + ",".join(f"{s:.3f}" for s in samples)
+            + f" max={max(samples):.3f} monitor_period_s=0.5"
+        )
+        # After the condvar fix every sample sits near the cancel round-trip
+        # (tens of ms); before it, the max across phases approaches the full
+        # period. Half the period bounds the max robustly.
+        assert max(samples) < 0.25, (
+            f"reset paid a monitor-period sleep: max={max(samples):.3f}s "
+            "(worker not woken by terminal intent)"
+        )
+    finally:
+        stop_event.set()
+        if bundle is not None:
+            try:
+                bundle.reset()
+            except RuntimeError:
+                pass
+        if fake_server is not None:
+            fake_server.destroy()
+        executor.shutdown()
+        node.destroy_node()
+        rclpy.shutdown()

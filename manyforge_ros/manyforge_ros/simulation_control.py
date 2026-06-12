@@ -279,43 +279,13 @@ class SimulationControlClient:
             entity=entity_name,
         )
 
-    def publish_command_gate(
-        self,
-        topic: str,
-        *,
-        enabled: bool,
-        settle_s: float = 0.05,
-    ) -> None:
-        """Publish the ManyForge command-enable gate with transient-local QoS."""
-        gate_topic = str(topic or "").strip()
-        if not gate_topic:
-            raise ValueError("command gate topic is required")
-        qos = self._qos.QoSProfile(
-            depth=1,
-            durability=self._qos.DurabilityPolicy.TRANSIENT_LOCAL,
-            reliability=self._qos.ReliabilityPolicy.RELIABLE,
-        )
-        publisher = self.node.create_publisher(self._std_msgs.Bool, gate_topic, qos)
-        try:
-            msg = self._std_msgs.Bool()
-            msg.data = bool(enabled)
-            publisher.publish(msg)
-            if settle_s > 0.0:
-                executor = getattr(self.node, "executor", None)
-                if executor is not None and getattr(executor, "is_spinning", False):
-                    time.sleep(settle_s)
-                else:
-                    deadline = time.monotonic() + settle_s
-                    while time.monotonic() < deadline:
-                        self._rclpy.spin_once(
-                            self.node,
-                            timeout_sec=min(
-                                0.01,
-                                max(0.0, deadline - time.monotonic()),
-                            ),
-                        )
-        finally:
-            self.node.destroy_publisher(publisher)
+    # NOTE: this client deliberately has NO command-gate publisher. The
+    # ros2_control execution backend is the single publishing authority for
+    # the gate topic (reliable + transient_local); a second transient-local
+    # publisher here made the latched gate value reader-dependent and could
+    # strand the gate closed when this short-lived node was destroyed.
+    # Flows that need command suppression request it through the kernel
+    # client's `set_command_gate` instead.
 
     def _resolve_reset_service_name(self) -> str | None:
         return self._resolve_service_name(self._RESET_SERVICE_TYPE)
@@ -450,11 +420,14 @@ def reset_once(
     scope: str = "state",
     service_prefix: str = "auto",
     service_timeout_s: float = 3.0,
-    command_gate_enable_topic: str = "",
-    close_command_gate: bool = False,
-    reopen_command_gate: bool = False,
 ) -> SimulationResetResult:
-    """One-shot CLI/programmatic reset helper."""
+    """One-shot CLI/programmatic reset helper.
+
+    Deliberately does NOT touch the command-enable gate: the execution
+    backend is the gate's single publishing authority, and gated resets are
+    owned by the Composer flow (`POST /api/simulation/reset`), which
+    requests gating through the kernel client.
+    """
     rclpy = _import_module("rclpy")
     initialized_here = False
     if not rclpy.ok():
@@ -467,12 +440,7 @@ def reset_once(
             service_prefix=service_prefix,
             service_timeout_s=service_timeout_s,
         )
-        if close_command_gate:
-            client.publish_command_gate(command_gate_enable_topic, enabled=False)
-        result = client.reset(scope=scope)
-        if result.success and reopen_command_gate:
-            client.publish_command_gate(command_gate_enable_topic, enabled=True)
-        return result
+        return client.reset(scope=scope)
     finally:
         node.destroy_node()
         if initialized_here:
@@ -484,18 +452,12 @@ def main() -> int:
     parser.add_argument("--scope", default="state", choices=sorted(SimulationControlClient._RESET_SCOPE_VALUES))
     parser.add_argument("--service-prefix", default="auto")
     parser.add_argument("--timeout", type=float, default=3.0)
-    parser.add_argument("--command-gate-enable-topic", default="")
-    parser.add_argument("--close-command-gate", action="store_true")
-    parser.add_argument("--reopen-command-gate", action="store_true")
     args = parser.parse_args()
 
     result = reset_once(
         scope=args.scope,
         service_prefix=args.service_prefix,
         service_timeout_s=args.timeout,
-        command_gate_enable_topic=args.command_gate_enable_topic,
-        close_command_gate=args.close_command_gate,
-        reopen_command_gate=args.reopen_command_gate,
     )
     print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
     return 0 if result.success else 2

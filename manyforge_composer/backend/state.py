@@ -34,9 +34,13 @@ from manyforge_behavior.kernel_client import (
 )
 from manyforge_behavior.skill_loader import SkillCatalog, load_skill_catalog, default_skills_dir
 from .event_recorder import EventRecorder
+from .log_throttle import ThrottledLog
 from .security import normalize_allowed_roots
 
 logger = logging.getLogger(__name__)
+
+# Audit 6F: bounded hot-path diagnostics (one record per window per key).
+_log_throttle = ThrottledLog(min_interval_s=5.0)
 _MAX_ASSISTANT_REQUEST_RECORDS = 200
 _MAX_ASSISTANT_PROPOSAL_RECORDS = 500
 _COMPOSER_STATE_INSTANCES: weakref.WeakSet[Any] = weakref.WeakSet()
@@ -873,7 +877,7 @@ class ComposerState:
         )
 
     def _current_or_last_run_id_for_recovery(self) -> Optional[str]:
-        self.event_recorder.observe(self)
+        self.event_recorder.observe(self, force=True)
         return self.event_recorder.current_run_id or self.event_recorder.last_run_id
 
     def _record_delegated_recovery_requested(self, request) -> None:
@@ -2349,7 +2353,9 @@ class ComposerState:
                         },
                     )
                     if duration_ms >= 100.0:
-                        logger.warning(
+                        _log_throttle.warning(
+                            logger,
+                            "visual.snapshot_build_slow",
                             "visual-state publisher slow: reason=%s duration_ms=%.1f",
                             reason,
                             duration_ms,
@@ -3203,20 +3209,28 @@ class ComposerState:
             with self._pose_source_apply_lock:
                 self._pose_source_apply_last_result = copy.deepcopy(result)
             if duration_ms >= 100.0:
-                logger.warning(
+                _log_throttle.warning(
+                    logger,
+                    "pose_source.apply_slow",
                     "pose-source apply worker slow: policy=%s objects=%s "
                     "duration_ms=%.1f success=%s",
                     request.get("policy"),
                     request.get("object_ids"),
                     duration_ms,
                     result.get("success", False),
+                    extra={"event": "manyforge.pose_source.apply_slow"},
                 )
             if not result.get("success", False):
-                logger.warning(
+                # Continuous-policy feeds retry at up to max_update_hz; a
+                # persistently failing source must not flood the log.
+                _log_throttle.warning(
+                    logger,
+                    "pose_source.apply_failed",
                     "pose-source apply worker failed: policy=%s objects=%s error=%s",
                     request.get("policy"),
                     request.get("object_ids"),
                     result.get("error"),
+                    extra={"event": "manyforge.pose_source.apply_failed"},
                 )
 
     def apply_pose_sources_before_planning(
@@ -3760,7 +3774,16 @@ class ComposerState:
                 service_timeout_s=service_timeout_s,
             )
             if close_command_gate:
-                client.publish_command_gate(command_gate_topic, enabled=False)
+                # Single gate authority: the execution backend owns the gate
+                # topic (sole transient-local publisher). Publishing from a
+                # second node here made the latched value reader-dependent
+                # and could strand the gate closed across process restarts.
+                if not self._kernel.set_command_gate(False):
+                    raise RuntimeError(
+                        "simulation reset requires close_command_gate=true, "
+                        "but the execution backend exposes no command-gate "
+                        "surface"
+                    )
                 command_gate_closed = True
             self.event_recorder.record_simulation_control_event(
                 "started",
@@ -3802,8 +3825,7 @@ class ComposerState:
                     "command_gate_reopened": False,
                 }
             if close_command_gate:
-                client.publish_command_gate(command_gate_topic, enabled=True)
-                command_gate_reopened = True
+                command_gate_reopened = self._kernel.set_command_gate(True)
             return {
                 **reset_result,
                 "success": True,

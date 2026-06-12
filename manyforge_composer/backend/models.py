@@ -1518,6 +1518,11 @@ class ExecutionDigestResponse(BaseModel):
     remaining_nodes: List[str] = Field(default_factory=list, alias="remainingNodes")
     object_summary: List[ExecutionDigestObjectResponse] = Field(default_factory=list, alias="objectSummary")
     error: Optional[str] = None
+    error_code: Optional[str] = Field(default=None, alias="errorCode")
+    error_details: Optional[Dict[str, Any]] = Field(
+        default=None,
+        alias="errorDetails",
+    )
     warnings: List[str] = Field(default_factory=list)
     runtime_override_state: Dict[str, Any] = Field(default_factory=dict, alias="runtimeOverrideState")
     delegated_recovery_request: Optional[Dict[str, Any]] = Field(

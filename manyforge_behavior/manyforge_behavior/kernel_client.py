@@ -559,6 +559,21 @@ class KernelClient(ABC):
         # runtime scaling override.
         return None
 
+    def set_command_gate(self, enabled: bool) -> bool:
+        """Request the backend command-enable gate (single gate authority).
+
+        The execution backend is the only publisher of the gate topic;
+        flows that need command suppression (simulator reset) must request
+        it through the kernel client instead of publishing the topic
+        themselves. Returns False (fail-closed) when the backend has no
+        gate surface.
+        """
+        return False
+
+    def command_gate_enabled(self) -> bool:
+        """Last gate value requested from the backend gate authority."""
+        return False
+
     @abstractmethod
     def get_status(self) -> ExecutionStatus: ...
 
@@ -703,6 +718,9 @@ class MockKernelClient(KernelClient):
         self._execute_start: Optional[float] = None
         self._active_goal_positions_rad: List[float] = []
         self._last_joint_positions_rad: List[float] = []
+        # Mock command-gate authority state (see set_command_gate).
+        self.command_gate_requests: List[bool] = []
+        self._command_gate_enabled = False
         self.last_execute_request: Optional[ExecuteRequest] = None
         self.execute_count = 0
         self.stop_count = 0
@@ -1133,6 +1151,16 @@ class MockKernelClient(KernelClient):
         self.runtime_velocity_scale = clamped
         self.runtime_velocity_scale_updates.append(clamped)
         self.runtime_velocity_scale_principal_ids.append(principal_id)
+
+    def set_command_gate(self, enabled: bool) -> bool:
+        # Mock gate authority: records requests so composer simulation-reset
+        # tests can assert close/reopen ordering.
+        self.command_gate_requests.append(bool(enabled))
+        self._command_gate_enabled = bool(enabled)
+        return True
+
+    def command_gate_enabled(self) -> bool:
+        return self._command_gate_enabled
 
     def set_robot_base_pose(self, pose: Optional[Dict[str, Any]]) -> None:
         self.robot_base_pose = None if not pose else dict(pose)

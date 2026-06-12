@@ -56,7 +56,20 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument(
                 "command_gate_enable_topic",
                 default_value="/manyforge/isaac_arm_command_enable",
-                description="ManyForge Bool topic that enables Isaac arm command publishing.",
+                description=(
+                    "ManyForge Bool topic that enables Isaac arm command "
+                    "publishing. Written ONLY by the execution backend (the "
+                    "single backend gate authority)."
+                ),
+            ),
+            DeclareLaunchArgument(
+                "supervisor_command_gate_enable_topic",
+                default_value="/manyforge/isaac_supervisor_command_enable",
+                description=(
+                    "Supervisor veto Bool topic, written ONLY by the Isaac "
+                    "demo supervisor. The command gate node requires this AND "
+                    "the backend enable topic to be true before commands flow."
+                ),
             ),
             DeclareLaunchArgument(
                 "stop_joint_commands_topic",
@@ -273,6 +286,9 @@ def _launch_setup(context, *_, **__) -> list[object]:
                 "enable_topic": LaunchConfiguration(
                     "command_gate_enable_topic"
                 ).perform(context),
+                "supervisor_enable_topic": LaunchConfiguration(
+                    "supervisor_command_gate_enable_topic"
+                ).perform(context),
                 "stop_topic": LaunchConfiguration(
                     "stop_joint_commands_topic"
                 ).perform(context),
@@ -305,8 +321,8 @@ def _launch_setup(context, *_, **__) -> list[object]:
                 "gripper_action_name": LaunchConfiguration(
                     "gripper_action_name"
                 ).perform(context),
-                "command_gate_enable_topic": LaunchConfiguration(
-                    "command_gate_enable_topic"
+                "supervisor_enable_topic": LaunchConfiguration(
+                    "supervisor_command_gate_enable_topic"
                 ).perform(context),
                 "auto_load": LaunchConfiguration("supervisor_auto_load").perform(
                     context

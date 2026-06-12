@@ -106,6 +106,25 @@ RECOVERY_TRIGGER_CANONICAL_VALUES = frozenset({
     "postcondition_failed",
 })
 
+# Backend fault taxonomy (audit Phase 6A): the table lives in the
+# dependency-light `fault_taxonomy` module so external-surface consumers
+# (6H diagnostics bridge, 6I medkit adapter) can import it without pulling
+# py_trees. Re-exported here for backward compatibility.
+from manyforge_behavior.fault_taxonomy import (  # noqa: F401  (re-export)
+    BackendFaultClass,
+    ROS2_CONTROL_BACKEND_FAULT_CLASSES,
+)
+
+_ROS2_CONTROL_BACKEND_REASON_CODES = frozenset(ROS2_CONTROL_BACKEND_FAULT_CLASSES)
+
+_GENERIC_BACKEND_ERROR_CODES = frozenset({
+    None,
+    "execution_aborted",
+    "execution_rejected",
+    "invalid_request",
+    "stop_failed",
+})
+
 
 def canonical_recovery_trigger_values() -> set[str]:
     """Return live-authoring recovery trigger values.
@@ -115,6 +134,31 @@ def canonical_recovery_trigger_values() -> set[str]:
     """
 
     return set(RECOVERY_TRIGGER_CANONICAL_VALUES)
+
+
+def preferred_structured_error_code(
+    error_code: Optional[str],
+    error_details: Optional[dict[str, Any]],
+) -> Optional[str]:
+    """Prefer exact backend reason tokens over generic transport codes.
+
+    ROS2-control backend faults keep the top-level ErrorDTO code compatible
+    with the core enum (`execution_aborted`, `execution_rejected`,
+    `stop_failed`, ...), then carry the operator-facing cause in
+    `details.reason_code`. Promote only that known backend taxonomy so
+    unrelated details such as runtime-collision monitor internals do not
+    replace their stronger top-level codes.
+    """
+
+    if isinstance(error_details, dict):
+        reason_code = error_details.get("reason_code")
+        if (
+            isinstance(reason_code, str)
+            and reason_code in _ROS2_CONTROL_BACKEND_REASON_CODES
+            and error_code in _GENERIC_BACKEND_ERROR_CODES
+        ):
+            return reason_code
+    return error_code
 
 
 @dataclass
@@ -751,7 +795,10 @@ class CycleManager:
         if not snapshot_details:
             snapshot_details = None
         if snapshot_code or snapshot_details:
-            return snapshot_code, snapshot_details
+            return (
+                preferred_structured_error_code(snapshot_code, snapshot_details),
+                snapshot_details,
+            )
         # Snapshot has nothing — try the event stream. Walk recent events
         # newest-first looking for a record that carries diagnostics worth
         # surfacing. `collision_detected` is the strongest signal (full
@@ -1434,7 +1481,10 @@ class CycleManager:
             elapsed = time.monotonic() - start_time
             sleep_time = period_s - elapsed
             if sleep_time > 0:
-                time.sleep(sleep_time)
+                # Audit 6D (finding 2.9): interruptible slice — a stop
+                # request wakes the loop immediately instead of waiting out
+                # the remainder of the tick period.
+                self._tick_stop_event.wait(timeout=sleep_time)
 
         with self._lock:
             if self._tick_thread is threading.current_thread():
@@ -2164,7 +2214,10 @@ class CycleManager:
             elapsed = time.monotonic() - start_time
             sleep_time = period_s - elapsed
             if sleep_time > 0:
-                time.sleep(sleep_time)
+                # Audit 6D (finding 2.9): interruptible slice — a stop
+                # request wakes the loop immediately instead of waiting out
+                # the remainder of the tick period.
+                self._tick_stop_event.wait(timeout=sleep_time)
 
         if session.status == "running":
             self._finish_intervention(

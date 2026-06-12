@@ -54,6 +54,14 @@ _FAILURE_ARCHIVE_EVENT_TYPES = {
 }
 _FAILURE_ARCHIVE_RECENT_EVENT_LIMIT = 1000
 _FAILURE_ARCHIVE_QUEUE_SIZE = 16
+# Audit 6B: bounded JSONL writer queue (events, small strings). Sized for
+# bursts; overflow drops from the file sink only and is counted.
+_JSONL_QUEUE_SIZE = 1024
+# Audit 6B: minimum wall-clock interval between full observe() state scans
+# from polling callers. Half the fastest UI poll cadence (100 ms), so
+# pollers see at most one-interval-stale events while the scan+record cost
+# is paid at a bounded rate.
+_OBSERVE_MIN_INTERVAL_S = 0.05
 _DEFAULT_FAILURE_ARCHIVE_MAX_AGE_S = 30 * 24 * 60 * 60
 _DEFAULT_FAILURE_ARCHIVE_MAX_BYTES = 1024 * 1024 * 1024
 _DEFAULT_HISTORY_LIMIT = 1000
@@ -207,6 +215,7 @@ class EventRecorder:
         failure_archive_enabled: bool = True,
         failure_archive_max_age_s: float | None = None,
         failure_archive_max_bytes: int | None = None,
+        observe_min_interval_s: float | None = None,
     ) -> None:
         self._trace_dir = Path(trace_dir) if trace_dir is not None else None
         if self._trace_dir is not None:
@@ -267,7 +276,7 @@ class EventRecorder:
         }
 
         self._lock = threading.RLock()
-        self._failure_archive_queue: queue.Queue[_FailureArchiveJob] | None = None
+        self._failure_archive_queue: queue.Queue[_FailureArchiveJob | None] | None = None
         self._failure_archive_worker: threading.Thread | None = None
         if self._failure_archive_dir is not None:
             self._failure_archive_queue = queue.Queue(maxsize=_FAILURE_ARCHIVE_QUEUE_SIZE)
@@ -277,6 +286,37 @@ class EventRecorder:
                 daemon=True,
             )
             self._failure_archive_worker.start()
+
+        # Audit 6B (finding 2.3): per-run JSONL appends run on a dedicated
+        # writer thread so observers never stall on disk latency inside the
+        # `_lock` critical section. Serialization still happens under the
+        # lock (ordering is fixed at enqueue time); only the file I/O is
+        # asynchronous. Bounded queue: on overflow the event is dropped from
+        # the FILE sink only (the in-memory deque and failure archive still
+        # see it) and the drop is counted, never blocking the hot path.
+        self._jsonl_queue: queue.Queue[tuple[Path, str] | None] | None = None
+        self._jsonl_worker: threading.Thread | None = None
+        self._jsonl_dropped = 0
+        self._last_jsonl_error: Optional[str] = None
+        if self._trace_dir is not None:
+            self._jsonl_queue = queue.Queue(maxsize=_JSONL_QUEUE_SIZE)
+            self._jsonl_worker = threading.Thread(
+                target=self._jsonl_writer_loop,
+                name="manyforge-jsonl-writer",
+                daemon=True,
+            )
+            self._jsonl_worker.start()
+
+        # Audit 6B (finding 2.16): observe() is called from every polling
+        # HTTP handler; rate-limit the full state scan by wall-clock budget.
+        # Exactness-sensitive callers (debug export, recovery correlation)
+        # pass force=True.
+        self._observe_min_interval_s = (
+            observe_min_interval_s
+            if observe_min_interval_s is not None
+            else _OBSERVE_MIN_INTERVAL_S
+        )
+        self._last_observe_monotonic = 0.0
 
     @property
     def current_run_id(self) -> Optional[str]:
@@ -329,10 +369,30 @@ class EventRecorder:
                     if self._failure_archive_worker is not None
                     else False
                 ),
+                # Audit 6B: JSONL sink health (async writer thread). Lives on
+                # the same recorder-health surface supervisors already poll.
+                "jsonl_worker_alive": (
+                    self._jsonl_worker.is_alive()
+                    if self._jsonl_worker is not None
+                    else False
+                ),
+                "jsonl_dropped": self._jsonl_dropped,
+                "last_jsonl_error": self._last_jsonl_error,
             }
 
-    def observe(self, state) -> None:
-        """Poll the current ComposerState and record semantic deltas."""
+    def observe(self, state, *, force: bool = False) -> None:
+        """Poll the current ComposerState and record semantic deltas.
+
+        Polling callers (history/digest routes, websocket pump) are
+        rate-limited to one full scan per `_OBSERVE_MIN_INTERVAL_S`;
+        exactness-sensitive callers (debug export, recovery correlation)
+        pass ``force=True`` to bypass the budget (audit 6B, finding 2.16).
+        """
+        now = time.monotonic()
+        if not force:
+            if now - self._last_observe_monotonic < self._observe_min_interval_s:
+                return
+        self._last_observe_monotonic = now
         cycle_manager = getattr(state, "cycle_manager", None)
         kernel = getattr(state, "_kernel", None)
 
@@ -1085,6 +1145,7 @@ class EventRecorder:
                 move_id=current_move_id,
                 error=snapshot.error,
                 progress=status.progress,
+                previous_execution_id=previous_execution_id,
             )
 
         kernel_error = snapshot.error
@@ -1212,12 +1273,98 @@ class EventRecorder:
         move_id: Optional[str],
         error: Optional[str],
         progress: float,
+        previous_execution_id: int = 0,
     ) -> None:
         details: dict[str, Any] = {"progress": progress}
         if error:
             details["error"] = error
 
         event_type = self._TRANSITION_TABLE.get((previous_state, current_state))
+
+        # Audit 6G: the observer is poll-based, so a fast move can flash
+        # through Executing between two polls and the table sees e.g.
+        # validating -> completed — losing execute_started/execute_completed
+        # even though `completed` PROVES an execution window happened.
+        # Synthesize only the certainty cases (found by the 6G soak gate):
+        #   * any non-executing state -> completed: an executing window was
+        #     skipped — emit execute_started + execute_completed;
+        #   * executing -> executing with a new execution_id: the previous
+        #     move completed and a new one started between polls.
+        # Failure edges are NOT interpolated (a plan/validation failure
+        # never executed; fabricating execute_started there would lie).
+        if (
+            event_type is None
+            and current_state == "completed"
+            and previous_state is not None
+            and previous_state != "executing"
+        ):
+            synthesized = dict(details)
+            synthesized["synthesized_from_edge"] = (
+                f"{previous_state}->{current_state}"
+            )
+            if previous_state == "planning":
+                self._record_event(
+                    event_type="plan_completed",
+                    execution_id=execution_id,
+                    move_id=move_id,
+                    details=dict(synthesized),
+                )
+            self._record_event(
+                event_type="execute_started",
+                execution_id=execution_id,
+                move_id=move_id,
+                details=dict(synthesized),
+            )
+            self._record_event(
+                event_type="execute_completed",
+                execution_id=execution_id,
+                move_id=move_id,
+                details=synthesized,
+            )
+            return
+        if (
+            event_type is None
+            and previous_state == "planning"
+            and current_state == "executing"
+        ):
+            # The poll skipped only Validating: reaching Executing implies
+            # the plan completed and validation passed.
+            synthesized = dict(details)
+            synthesized["synthesized_from_edge"] = "planning->executing"
+            self._record_event(
+                event_type="plan_completed",
+                execution_id=execution_id,
+                move_id=move_id,
+                details=dict(synthesized),
+            )
+            self._record_event(
+                event_type="execute_started",
+                execution_id=execution_id,
+                move_id=move_id,
+                details=synthesized,
+            )
+            return
+        if (
+            event_type is None
+            and current_state == "executing"
+            and previous_state == "executing"
+            and previous_execution_id
+            and execution_id != previous_execution_id
+        ):
+            synthesized = dict(details)
+            synthesized["synthesized_from_edge"] = "executing->executing"
+            self._record_event(
+                event_type="execute_completed",
+                execution_id=previous_execution_id,
+                details=dict(synthesized),
+            )
+            self._record_event(
+                event_type="execute_started",
+                execution_id=execution_id,
+                move_id=move_id,
+                details=synthesized,
+            )
+            return
 
         if event_type is not None:
             self._record_event(
@@ -1337,7 +1484,7 @@ class EventRecorder:
                     json_text=json_text,
                 )
             )
-            self._append_jsonl_locked(run_id=run_id, json_text=json_text)
+            self._enqueue_jsonl_locked(run_id=run_id, json_text=json_text)
             self._maybe_write_failure_archive_locked(event)
 
     def _intervention_run_id(self, session) -> str:
@@ -1417,13 +1564,82 @@ class EventRecorder:
     def _decode_stored_event(event: _StoredEvent) -> dict[str, Any]:
         return json.loads(event.json_text)
 
-    def _append_jsonl_locked(self, *, run_id: Optional[str], json_text: str) -> None:
+    def _enqueue_jsonl_locked(self, *, run_id: Optional[str], json_text: str) -> None:
+        """Hand the serialized event to the JSONL writer thread (audit 6B).
+
+        Path resolution and FIFO ordering are fixed here, under `_lock`;
+        only the disk append runs on the writer thread, so a slow disk can
+        never stall observers contending on the recorder lock.
+        """
+        queue_ = self._jsonl_queue
+        if queue_ is None:
+            return
         file_path = self._path_for_run(run_id)
         if file_path is None:
             return
+        try:
+            queue_.put_nowait((file_path, json_text))
+        except queue.Full:
+            self._jsonl_dropped += 1
+            self._last_jsonl_error = "jsonl writer queue full"
+
+    def _jsonl_writer_loop(self) -> None:
+        queue_ = self._jsonl_queue
+        if queue_ is None:  # pragma: no cover - defensive
+            return
+        while True:
+            job = queue_.get()
+            try:
+                if job is None:
+                    return
+                file_path, json_text = job
+                try:
+                    self._write_jsonl_line(file_path, json_text)
+                except Exception as exc:  # pragma: no cover - disk failure surface
+                    with self._lock:
+                        self._last_jsonl_error = str(exc)
+            finally:
+                queue_.task_done()
+
+    @staticmethod
+    def _write_jsonl_line(file_path: Path, json_text: str) -> None:
         with file_path.open("a", encoding="utf-8") as handle:
             handle.write(json_text)
             handle.write("\n")
+
+    def wait_for_jsonl_idle(self, timeout_s: float = 5.0) -> bool:
+        """Wait until queued JSONL appends have hit disk.
+
+        For tests and controlled shutdown; request paths must not call this.
+        """
+        queue_ = self._jsonl_queue
+        if queue_ is None:
+            return True
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if queue_.unfinished_tasks == 0:
+                return True
+            time.sleep(0.01)
+        return queue_.unfinished_tasks == 0
+
+    def close(self, timeout_s: float = 5.0) -> bool:
+        """Stop both writer threads via sentinel and join them (audit 6B).
+
+        Returns True when both workers exited within the timeout. Safe to
+        call more than once.
+        """
+        ok = True
+        for queue_, worker in (
+            (self._jsonl_queue, self._jsonl_worker),
+            (self._failure_archive_queue, self._failure_archive_worker),
+        ):
+            if queue_ is None or worker is None:
+                continue
+            if worker.is_alive():
+                queue_.put(None)
+            worker.join(timeout=timeout_s)
+            ok = ok and not worker.is_alive()
+        return ok
 
     def _maybe_write_failure_archive_locked(self, event: dict[str, Any]) -> None:
         if self._failure_archive_dir is None:
@@ -1472,6 +1688,11 @@ class EventRecorder:
         while True:
             job = queue_.get()
             try:
+                # Audit 6B (finding 2.11): None is the shutdown sentinel
+                # enqueued by close(); the worker exits cleanly instead of
+                # blocking on get() forever.
+                if job is None:
+                    return
                 try:
                     archive_path = self._write_failure_archive(job)
                     cleanup = self._prune_failure_archives()

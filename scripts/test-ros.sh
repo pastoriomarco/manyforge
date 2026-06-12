@@ -23,7 +23,7 @@ if [ -f "${WORKSPACE}/install/setup.bash" ]; then
     set -u
 fi
 
-export PYTHONPATH="${WORKSPACE}/manyforge_ros:${WORKSPACE}/manyforge_behavior:${WORKSPACE}:${PYTHONPATH:-}"
+export PYTHONPATH="${WORKSPACE}/manyforge_ros:${WORKSPACE}/manyforge_behavior:${WORKSPACE}/manyforge_medkit_adapter:${WORKSPACE}:${PYTHONPATH:-}"
 
 cd "$WORKSPACE"
-pytest manyforge_ros/tests/ -v
+pytest manyforge_ros/tests/ manyforge_medkit_adapter/tests/ -v

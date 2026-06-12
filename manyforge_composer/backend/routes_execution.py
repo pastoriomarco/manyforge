@@ -6,6 +6,8 @@ from typing import Any, Iterable
 
 from fastapi import APIRouter, Query
 
+from manyforge_behavior.cycle_manager import preferred_structured_error_code
+
 from .models import (
     BlackboardSnapshotResponse,
     ExecutionDigestObjectResponse,
@@ -93,6 +95,41 @@ def build_execution_digest_payload(state: ComposerState) -> dict[str, Any]:
         if state.cycle_manager is not None
         else state.kernel.get_status()
         if state.kernel is not None
+        else None
+    )
+    kernel_snapshot = (
+        state.cycle_manager.get_execution_snapshot()
+        if state.cycle_manager is not None
+        else state.kernel.get_execution_snapshot()
+        if state.kernel is not None
+        else None
+    )
+    snapshot_error_details = (
+        getattr(kernel_snapshot, "error_details", None)
+        if kernel_snapshot is not None
+        else None
+    )
+    if not snapshot_error_details:
+        snapshot_error_details = None
+    cycle_error_details = (
+        state.cycle_manager.error_details
+        if state.cycle_manager is not None
+        else None
+    )
+    error_details = cycle_error_details or snapshot_error_details
+    raw_error_code = (
+        state.cycle_manager.error_code
+        if state.cycle_manager is not None and state.cycle_manager.error_code
+        else getattr(kernel_snapshot, "error_code", None)
+        if kernel_snapshot is not None
+        else None
+    )
+    error_code = preferred_structured_error_code(raw_error_code, error_details)
+    error_message = (
+        state.cycle_manager.error
+        if state.cycle_manager is not None and state.cycle_manager.error is not None
+        else getattr(kernel_snapshot, "error", None)
+        if kernel_snapshot is not None
         else None
     )
 
@@ -252,11 +289,9 @@ def build_execution_digest_payload(state: ComposerState) -> dict[str, Any]:
         completedNodes=completed_nodes,
         remainingNodes=remaining_nodes,
         objectSummary=object_summary,
-        error=(
-            state.cycle_manager.error
-            if state.cycle_manager is not None and state.cycle_manager.error is not None
-            else getattr(kernel_status, "error", None)
-        ),
+        error=error_message,
+        errorCode=error_code,
+        errorDetails=error_details,
         warnings=warnings,
         runtimeOverrideState=runtime_override_state,
         delegatedRecoveryRequest=delegated_recovery_request,
