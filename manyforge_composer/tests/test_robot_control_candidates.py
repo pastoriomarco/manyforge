@@ -17,6 +17,7 @@ import time
 from pathlib import Path
 
 import pytest
+import yaml
 from fastapi.testclient import TestClient
 
 from manyforge_behavior.deployment import Deployment
@@ -73,6 +74,8 @@ def _loaded_client(
     tmp_path: Path,
     *,
     execute_duration_s: float = 0.0,
+    deployment_path: str = _DEPLOYMENT_PATH,
+    kernel_bundle=None,
 ) -> tuple[TestClient, ComposerState, MockKernelClient]:
     """Client with a program + deployment loaded so candidate planning has a
     robot profile, a cycle manager (for Approve), and a start joint state."""
@@ -80,6 +83,7 @@ def _loaded_client(
     state = ComposerState(
         catalog_path=_CATALOG_PATH,
         kernel=kernel,
+        kernel_bundle=kernel_bundle,
         allowed_fs_roots=[str(tmp_path), str(_REPO_ROOT)],
     )
     app = create_app(
@@ -92,7 +96,7 @@ def _loaded_client(
     client = TestClient(app)
     resp = client.post(
         "/api/program/load",
-        json={"path": _PROGRAM_PATH, "deploymentPath": _DEPLOYMENT_PATH},
+        json={"path": _PROGRAM_PATH, "deploymentPath": deployment_path},
     )
     assert resp.status_code == 200, resp.text
     live_kernel = state.kernel  # load reuses the injected mock
@@ -132,6 +136,28 @@ def _cartesian_body() -> dict:
             "tcpFrame": "tool0",
         },
     }
+
+
+class _SpringOnlyStopCapabilityBundle:
+    def get_motion_interrupt_stop_capability(self) -> dict:
+        return {
+            "supported_stop_modes": ["spring_back_hold"],
+            "capability_profile_id": "test_spring_only",
+            "hard_stop_level": "jtc_cancel_unprofiled_hold",
+        }
+
+
+def _write_deployment_with_stop_profile(tmp_path: Path, *, stop_mode: str) -> str:
+    data = yaml.safe_load(Path(_DEPLOYMENT_PATH).read_text(encoding="utf-8"))
+    config = data["adapters"]["execution"].setdefault("config", {})
+    config["operator_stop_profile"] = {
+        "profile_id": f"operator_{stop_mode}",
+        "stop_mode": stop_mode,
+        "deceleration_time_s": 0.5,
+    }
+    target = tmp_path / f"deployment_{stop_mode}.deployment.yaml"
+    target.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    return str(target)
 
 
 def _set_mock_robot_positions(
@@ -740,6 +766,29 @@ def test_execute_fresh_ready_candidate_dispatches(tmp_path: Path) -> None:
     while kernel.execute_count == 0 and time.time() < deadline:
         time.sleep(0.02)
     assert kernel.execute_count >= 1
+
+
+def test_execute_candidate_blocks_unsupported_configured_stop_profile(
+    tmp_path: Path,
+) -> None:
+    deployment_path = _write_deployment_with_stop_profile(
+        tmp_path, stop_mode="hard_deceleration"
+    )
+    client, _state, kernel = _loaded_client(
+        tmp_path,
+        deployment_path=deployment_path,
+        kernel_bundle=_SpringOnlyStopCapabilityBundle(),
+    )
+    cid = client.post(_BASE, json=_joint_body()).json()["candidateId"]
+
+    resp = client.post(f"{_BASE}/{cid}/execute")
+
+    assert resp.status_code == 409
+    assert resp.json()["reasonCode"] == "stop_profile_unsupported"
+    assert kernel.execute_count == 0
+    candidate = client.get(f"{_BASE}/{cid}").json()
+    assert candidate["status"] == "ready"
+    assert candidate["commitEligible"] is True
 
 
 def test_get_executing_candidate_maps_completed_runtime_outcome(

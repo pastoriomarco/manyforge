@@ -1741,7 +1741,9 @@ Result<void> ExecutionKernel::arm_motion_scopes_for_dispatch(
   motion_state.arm_succeeded = false;
   motion_state.motion_trip_latch.reset();
   motion_state.outcome_emitted = false;
-  if (!motion_state.had_scopes) {
+  const bool has_configured_stop_profiles =
+      config_.operator_stop_profile || config_.default_fault_stop_profile;
+  if (!motion_state.had_scopes && !has_configured_stop_profiles) {
     return Result<void>::Ok();
   }
   // Spec/260 §5.6 dual-boundary capability validation:
@@ -1756,6 +1758,65 @@ Result<void> ExecutionKernel::arm_motion_scopes_for_dispatch(
   // before arming if the backend has not declared support.
   const auto capability =
       execution_backend_.get_motion_interrupt_stop_capability();
+  const auto validate_profile_against_capability =
+      [&capability](const MotionInterruptStopProfileDTO& profile,
+                    const std::string& profile_slot,
+                    const std::string& scope_id,
+                    const std::string& policy_id)
+          -> std::optional<ErrorDTO> {
+    if (!capability.supported_stop_modes.contains(profile.stop_mode)) {
+      std::map<std::string, std::string> details{
+          {"reason", "stop_mode_not_supported_by_backend"},
+          {"profile_slot", profile_slot},
+          {"requested_stop_mode", stop_mode_string(profile.stop_mode)}};
+      if (!scope_id.empty()) {
+        details["scope_id"] = scope_id;
+      }
+      if (!policy_id.empty()) {
+        details["policy_id"] = policy_id;
+      }
+      return ErrorDTO{
+          kErrorMotionInterruptArmFailed,
+          "configured stop_profile stop_mode is not in backend supported_stop_modes",
+          std::move(details)};
+    }
+    for (const auto& fallback : profile.allowed_fallback_modes) {
+      if (!capability.supported_stop_modes.contains(fallback)) {
+        std::map<std::string, std::string> details{
+            {"reason", "fallback_mode_not_supported_by_backend"},
+            {"profile_slot", profile_slot},
+            {"requested_stop_mode", stop_mode_string(profile.stop_mode)},
+            {"fallback_stop_mode", stop_mode_string(fallback)}};
+        if (!scope_id.empty()) {
+          details["scope_id"] = scope_id;
+        }
+        if (!policy_id.empty()) {
+          details["policy_id"] = policy_id;
+        }
+        return ErrorDTO{
+            kErrorMotionInterruptArmFailed,
+            "configured stop_profile fallback is not in backend supported_stop_modes",
+            std::move(details)};
+      }
+    }
+    return std::nullopt;
+  };
+  if (config_.operator_stop_profile) {
+    if (auto error = validate_profile_against_capability(
+            *config_.operator_stop_profile, "operator_stop_profile", "", "")) {
+      return Result<void>::Err(*error);
+    }
+  }
+  if (config_.default_fault_stop_profile) {
+    if (auto error = validate_profile_against_capability(
+            *config_.default_fault_stop_profile, "default_fault_stop_profile",
+            "", "")) {
+      return Result<void>::Err(*error);
+    }
+  }
+  if (!motion_state.had_scopes) {
+    return Result<void>::Ok();
+  }
   for (const auto& scope : request.motion_interrupt_scopes) {
     if (!scope.stop_profile) {
       // Manager will reject this with stop_profile_required if the
@@ -1764,23 +1825,10 @@ Result<void> ExecutionKernel::arm_motion_scopes_for_dispatch(
       continue;
     }
     const auto& profile = *scope.stop_profile;
-    if (!capability.supported_stop_modes.contains(profile.stop_mode)) {
-      return Result<void>::Err(ErrorDTO{
-          kErrorMotionInterruptArmFailed,
-          "requested stop_mode is not in backend supported_stop_modes",
-          {{"reason", "stop_mode_not_supported_by_backend"},
-           {"scope_id", scope.scope_id},
-           {"policy_id", scope.policy_id}}});
-    }
-    for (const auto& fallback : profile.allowed_fallback_modes) {
-      if (!capability.supported_stop_modes.contains(fallback)) {
-        return Result<void>::Err(ErrorDTO{
-            kErrorMotionInterruptArmFailed,
-            "allowed_fallback_modes entry is not in backend supported_stop_modes",
-            {{"reason", "fallback_mode_not_supported_by_backend"},
-             {"scope_id", scope.scope_id},
-             {"policy_id", scope.policy_id}}});
-      }
+    if (auto error = validate_profile_against_capability(
+            profile, "motion_interrupt_scope", scope.scope_id,
+            scope.policy_id)) {
+      return Result<void>::Err(*error);
     }
     if (profile.stop_mode == MotionInterruptStopMode::kSoftOnPath) {
       const auto planner_config =
@@ -4348,6 +4396,11 @@ ResumeResultDTO ExecutionKernel::resume() {
     return ResumeResultDTO{true, std::nullopt};
   }
   return ResumeResultDTO{false, result.error()};
+}
+
+MotionInterruptStopCapabilityDTO
+ExecutionKernel::get_motion_interrupt_stop_capability() const {
+  return execution_backend_.get_motion_interrupt_stop_capability();
 }
 
 ResetResultDTO ExecutionKernel::reset() {

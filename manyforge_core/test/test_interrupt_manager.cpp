@@ -2,6 +2,7 @@
 
 #include <manyforge_core/interrupt/interrupt_manager.hpp>
 
+#include <limits>
 #include <optional>
 
 namespace manyforge::core {
@@ -1358,6 +1359,56 @@ TEST(InterruptManagerMotionScopedTest,
 }
 
 TEST(InterruptManagerMotionScopedTest,
+     ArmRejectsStopProfileDecelerationTimeOverMax) {
+  InterruptManager manager;
+  MotionInterruptStopProfileDTO p;
+  p.profile_id = "too_slow_soft_stop";
+  p.stop_mode = MotionInterruptStopMode::kSpringBackHold;
+  p.deceleration_time_s = kMaxControlledStopDecelerationTimeS + 0.001;
+  auto result = arm_with_profile(manager, p);
+  EXPECT_TRUE(result.rejected);
+  EXPECT_EQ(result.reason,
+            "stop_profile_deceleration_time_s_must_not_exceed_1s");
+}
+
+TEST(InterruptManagerMotionScopedTest,
+     ArmAcceptsStopProfileDecelerationTimeAtMax) {
+  InterruptManager manager;
+  MotionInterruptStopProfileDTO p;
+  p.profile_id = "max_decel";
+  p.stop_mode = MotionInterruptStopMode::kSpringBackHold;
+  p.deceleration_time_s = kMaxControlledStopDecelerationTimeS;
+  auto result = arm_with_profile(manager, p);
+  EXPECT_FALSE(result.rejected);
+}
+
+TEST(InterruptManagerMotionScopedTest,
+     ArmRejectsStopProfileNonFiniteDecelerationTime) {
+  InterruptManager manager;
+  MotionInterruptStopProfileDTO p;
+  p.profile_id = "nan_decel";
+  p.stop_mode = MotionInterruptStopMode::kSpringBackHold;
+  p.deceleration_time_s = std::numeric_limits<double>::quiet_NaN();
+  auto result = arm_with_profile(manager, p);
+  EXPECT_TRUE(result.rejected);
+  EXPECT_EQ(result.reason,
+            "stop_profile_deceleration_time_s_must_be_positive");
+}
+
+TEST(InterruptManagerMotionScopedTest,
+     StopProfileDecelerationTimeDefaultsToHalfSecond) {
+  MotionInterruptStopProfileDTO p;
+  p.profile_id = "default_decel";
+  p.stop_mode = MotionInterruptStopMode::kSpringBackHold;
+  EXPECT_DOUBLE_EQ(motion_interrupt_deceleration_time_or_default(p),
+                   kDefaultDecelerationTimeS);
+  EXPECT_DOUBLE_EQ(motion_interrupt_deceleration_time_or_default(p), 0.5);
+
+  p.deceleration_time_s = 0.75;
+  EXPECT_DOUBLE_EQ(motion_interrupt_deceleration_time_or_default(p), 0.75);
+}
+
+TEST(InterruptManagerMotionScopedTest,
      ArmRejectsStopProfileNonPositiveMaxStopTime) {
   InterruptManager manager;
   MotionInterruptStopProfileDTO p;
@@ -1377,6 +1428,20 @@ TEST(InterruptManagerMotionScopedTest,
   p.profile_id = "bad_per_joint";
   p.stop_mode = MotionInterruptStopMode::kSpringBackHold;
   p.per_joint_max_deceleration_rad_s2["j1"] = -2.0;
+  auto result = arm_with_profile(manager, p);
+  EXPECT_TRUE(result.rejected);
+  EXPECT_EQ(result.reason,
+            "stop_profile_per_joint_max_deceleration_must_be_positive");
+}
+
+TEST(InterruptManagerMotionScopedTest,
+     ArmRejectsStopProfileNonFinitePerJointDeceleration) {
+  InterruptManager manager;
+  MotionInterruptStopProfileDTO p;
+  p.profile_id = "nan_per_joint";
+  p.stop_mode = MotionInterruptStopMode::kSpringBackHold;
+  p.per_joint_max_deceleration_rad_s2["j1"] =
+      std::numeric_limits<double>::quiet_NaN();
   auto result = arm_with_profile(manager, p);
   EXPECT_TRUE(result.rejected);
   EXPECT_EQ(result.reason,

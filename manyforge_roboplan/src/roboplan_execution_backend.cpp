@@ -379,6 +379,12 @@ RoboPlanExecutionBackend::get_motion_interrupt_stop_capability() const {
   cap.supported_stop_modes = {core::MotionInterruptStopMode::kSpringBackHold,
                               core::MotionInterruptStopMode::kSoftOnPath};
   cap.capability_profile_id = "roboplan_native_v2_soft_on_path";
+  cap.hard_stop_level = "native_immediate_hold";
+  cap.derivative_proof_level = "manyforge_core_native_path_ramp";
+  cap.scaling_source_visibility = "native_runtime_scale";
+  cap.scaling_source_probe_status = "not_applicable";
+  cap.unsupported_reasons["hard_deceleration"] =
+      "ros2_control_jtc_only_in_current_native_backend";
   core::MotionInterruptSoftOnPathPlannerConfigDTO soft_config;
   soft_config.stop_traj_delta_s = config_.soft_on_path_stop_traj_delta_s;
   soft_config.sample_period_s = config_.soft_on_path_sample_period_s;

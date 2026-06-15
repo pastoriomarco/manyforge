@@ -109,14 +109,26 @@ std::optional<std::string> validate_stop_profile_shape(
       profile.per_joint_max_deceleration_rad_s2.empty()) {
     return "soft_on_path_requires_per_joint_deceleration_limits";
   }
-  // 4. Optional timing fields, when present, MUST be strictly positive.
+  // 4. Optional timing fields, when present, MUST be finite and strictly
+  //    positive. deceleration_time_s is capped to the v1 soft-stop wall-time
+  //    envelope so an operator/fault stop cannot silently become a long
+  //    coast-down profile.
   //    Zero or negative values are configuration errors: a zero ramp
   //    is degenerate, a negative ramp is meaningless, and the
   //    arithmetic in 4.5D-2's ramp generation would silently misbehave.
-  if (profile.deceleration_time_s && *profile.deceleration_time_s <= 0.0) {
+  if (profile.deceleration_time_s &&
+      (!std::isfinite(*profile.deceleration_time_s) ||
+       *profile.deceleration_time_s <= 0.0)) {
     return "stop_profile_deceleration_time_s_must_be_positive";
   }
-  if (profile.max_stop_time_s && *profile.max_stop_time_s <= 0.0) {
+  if (profile.deceleration_time_s &&
+      *profile.deceleration_time_s >
+          kMaxControlledStopDecelerationTimeS) {
+    return "stop_profile_deceleration_time_s_must_not_exceed_1s";
+  }
+  if (profile.max_stop_time_s &&
+      (!std::isfinite(*profile.max_stop_time_s) ||
+       *profile.max_stop_time_s <= 0.0)) {
     return "stop_profile_max_stop_time_s_must_be_positive";
   }
   // 5. Per-joint deceleration limits, when provided inline, MUST all
@@ -124,7 +136,7 @@ std::optional<std::string> validate_stop_profile_shape(
   //    let the backend produce an unbounded stop.
   for (const auto& [joint_name, limit] :
        profile.per_joint_max_deceleration_rad_s2) {
-    if (limit <= 0.0) {
+    if (!std::isfinite(limit) || limit <= 0.0) {
       return "stop_profile_per_joint_max_deceleration_must_be_positive";
     }
     if (joint_name.empty()) {

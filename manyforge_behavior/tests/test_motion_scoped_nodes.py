@@ -7,6 +7,8 @@ terminal_cause it wants to verify."""
 
 from __future__ import annotations
 
+import math
+
 import pytest
 import py_trees
 
@@ -255,6 +257,48 @@ def test_move_until_signal_passes_soft_on_path_joint_deceleration_limits():
         "j1": 2.0,
         "j2": 1.5,
     }
+
+
+def test_move_until_signal_rejects_stop_deceleration_time_over_one_second():
+    kernel = MockKernelClient()
+    node = _move_until_signal(stop_deceleration_time_s=1.001)
+    _wire_blackboard(node, kernel)
+
+    with pytest.raises(ValueError, match="deceleration_time_s must be <= 1.0"):
+        _tick(node)
+
+
+def test_move_until_signal_accepts_stop_deceleration_time_at_one_second():
+    kernel = MockKernelClient()
+    node = _move_until_signal(stop_deceleration_time_s=1.0)
+    _wire_blackboard(node, kernel)
+
+    _tick(node)
+
+    scope = kernel.last_execute_request.motion_interrupt_scopes[0]
+    assert scope.stop_profile.deceleration_time_s == 1.0
+
+
+def test_move_until_signal_rejects_non_finite_per_joint_deceleration_limit():
+    kernel = MockKernelClient()
+    node = _move_until_signal(
+        stop_mode="soft_on_path",
+        stop_deceleration_time_s=0.35,
+        per_joint_max_deceleration_rad_s2={"j1": math.nan},
+    )
+    _wire_blackboard(node, kernel)
+
+    with pytest.raises(ValueError, match="limits must be finite"):
+        _tick(node)
+
+
+def test_move_until_signal_rejects_unknown_allowed_fallback_mode():
+    kernel = MockKernelClient()
+    node = _move_until_signal(allowed_fallback_modes=["not_a_stop_mode"])
+    _wire_blackboard(node, kernel)
+
+    with pytest.raises(ValueError, match="allowed_fallback_modes"):
+        _tick(node)
 
 
 # ----- ProbeSearchMove -----

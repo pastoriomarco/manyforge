@@ -97,6 +97,22 @@ def create_cycle_router(state: ComposerState) -> APIRouter:
                     state, "No program loaded", error_code="no_program_loaded"
                 ),
             )
+        # Fail closed: never arm a program whose configured operator/fault stop
+        # profile names a stop mode the execution backend does not advertise.
+        # Running it would mean an operator Stop silently degrades to a
+        # different stop behavior than the deployment declared. The operator
+        # must select a supported profile first (the runtime status already
+        # surfaces this as canExecute=false / degraded).
+        stop_block = state.motion_arm_admission_block_reason()
+        if stop_block:
+            raise HTTPException(
+                status_code=409,
+                detail=_structured_command_error(
+                    state,
+                    stop_block["message"],
+                    error_code=stop_block["error_code"],
+                ),
+            )
         override_status = state.runtime_override_status()
         if (
             state.cycle_manager.state.value == "stopped"

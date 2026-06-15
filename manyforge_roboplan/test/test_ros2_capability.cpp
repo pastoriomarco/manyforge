@@ -42,6 +42,16 @@ TEST(Ros2CapabilityTest,
       MotionInterruptStopMode::kHardDeceleration));
   ASSERT_TRUE(cap.capability_profile_id.has_value());
   EXPECT_EQ(*cap.capability_profile_id, "ros2_control_v1");
+  ASSERT_TRUE(cap.hard_stop_level.has_value());
+  EXPECT_EQ(*cap.hard_stop_level, "jtc_cancel_unprofiled_hold");
+  ASSERT_TRUE(cap.derivative_proof_level.has_value());
+  EXPECT_EQ(*cap.derivative_proof_level, "none");
+  ASSERT_TRUE(cap.scaling_source_visibility.has_value());
+  EXPECT_EQ(*cap.scaling_source_visibility, "jtc_speed_scaling_input");
+  ASSERT_TRUE(cap.scaling_source_probe_status.has_value());
+  EXPECT_EQ(*cap.scaling_source_probe_status, "configured_not_live_probed");
+  EXPECT_EQ(cap.unsupported_reasons.at("hard_deceleration"),
+            "decelerate_on_cancel_evidence_incomplete");
 }
 
 TEST(Ros2CapabilityTest,
@@ -261,6 +271,8 @@ TEST(Ros2CapabilityTest,
       MotionInterruptStopMode::kHardDeceleration));
   ASSERT_TRUE(cap.capability_profile_id.has_value());
   EXPECT_EQ(*cap.capability_profile_id, "ros2_control_v1_hard_decel");
+  ASSERT_TRUE(cap.hard_stop_level.has_value());
+  EXPECT_EQ(*cap.hard_stop_level, "hard_deceleration");
 }
 
 TEST(Ros2CapabilityTest,
@@ -300,19 +312,28 @@ TEST(Ros2CapabilityTest,
 }
 
 TEST(Ros2CapabilityTest,
-     SoftOnPathPathRampOmittedWhenJtcSpeedScalingInputEnabled) {
-  // Real path-ramp dispatch cannot be advertised while the adapter
-  // also publishes JTC speed_scaling_input, because that
-  // controller-side scale can stretch the replacement stop trajectory.
+     SoftOnPathPathRampAdvertisedEvenWithJtcSpeedScalingInputEnabled) {
+  // soft_on_path is NOT gated on JTC speed-scaling: when speed-scaling is
+  // active, the backend asserts unit
+  // execution scale atomically with the preempting stop dispatch, so the
+  // computed wall-time stop holds. With path-ramp enabled, speed-scaling
+  // enabled, AND a valid soft_on_path config, kSoftOnPath is advertised.
   auto cfg = base_config();
   cfg.enable_soft_on_path_path_ramp = true;
   ASSERT_TRUE(cfg.enable_jtc_speed_scaling_input);
+  cfg.soft_on_path_stop_traj_delta_s = 0.04;
+  cfg.soft_on_path_sample_period_s = 0.005;
+  cfg.soft_on_path_max_jerk_rad_s3 = {{"j1", 20.0}, {"j2", 21.0}};
   auto cap =
       compute_ros2_control_motion_interrupt_stop_capability(cfg);
-  EXPECT_FALSE(cap.supported_stop_modes.contains(
+  EXPECT_TRUE(cap.supported_stop_modes.contains(
       MotionInterruptStopMode::kSoftOnPath));
   ASSERT_TRUE(cap.capability_profile_id.has_value());
-  EXPECT_EQ(*cap.capability_profile_id, "ros2_control_v1");
+  EXPECT_EQ(*cap.capability_profile_id,
+            "ros2_control_v1_soft_on_path_path_ramp");
+  ASSERT_TRUE(cap.derivative_proof_level.has_value());
+  EXPECT_EQ(*cap.derivative_proof_level,
+            "manyforge_core_sampled_path_ramp");
 }
 
 TEST(Ros2CapabilityTest,

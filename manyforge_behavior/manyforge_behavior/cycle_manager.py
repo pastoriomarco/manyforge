@@ -1210,22 +1210,30 @@ class CycleManager:
 
     def stop(self) -> None:
         """
-        Pause/hold program execution at the cycle layer.
+        Stop program execution at the cycle layer — the operator Stop button.
 
-        If RUNNING: set stop_requested=True on BB, suspend tick thread.
-                    If kernel state is EXECUTING, call kernel.pause().
-                    A later Run from STOPPED resumes by replanning from
-                    fresh measured state to the original motion goal.
-                    State → STOPPED.
-        If STOPPED or IDLE: no-op.
+        The operator Stop is the industrial controlled stop (preempt), not a
+        resumable pause. If RUNNING: set stop_requested=True on BB, suspend the
+        tick thread, and route the in-flight motion through the kernel's
+        controlled stop. State -> STOPPED. If STOPPED or IDLE: no-op.
         """
         with self._lock:
             if self._state != CycleState.RUNNING:
                 return  # Not running, no-op
 
+        # Operator Stop is the industrial controlled stop, not a resumable
+        # pause: `stop_if_active` invokes `kernel.stop()` for any active state,
+        # which the C++ kernel routes through the operator_stop_profile
+        # controlled-stop path (industrial default soft_on_path: a self-computed
+        # jerk-continuous preempting stop trajectory; legacy hard stop when no
+        # profile is set). This also subsumes the planning-phase stop (a stop
+        # during PLANNING/VALIDATING stops preparation) with no prep->executing
+        # slip, since kernel.stop() handles whatever state the kernel is in.
+        # The motion-soft-fail hold path keeps the pause semantics — see
+        # `_enter_motion_paused_state`.
         self._quiesce_runtime(
             client_name="cycle_manager_stop",
-            kernel_action="pause_if_executing",
+            kernel_action="stop_if_active",
         )
 
         with self._lock:

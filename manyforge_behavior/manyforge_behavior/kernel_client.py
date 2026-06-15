@@ -12,6 +12,15 @@ import time
 from typing import Any, Deque, Dict, List, Optional
 
 
+MAX_CONTROLLED_STOP_DECELERATION_TIME_S = 1.0
+_STOP_MODES = {"spring_back_hold", "soft_on_path", "hard_deceleration"}
+
+
+def _max_controlled_stop_deceleration_time_label() -> str:
+    label = f"{MAX_CONTROLLED_STOP_DECELERATION_TIME_S:.15g}"
+    return f"{label}.0" if "." not in label and "e" not in label.lower() else label
+
+
 class ExecutionState(Enum):
     IDLE = "idle"
     PLANNING = "planning"
@@ -49,6 +58,51 @@ class MotionInterruptStopProfile:
     allowed_fallback_modes: List[str] = field(default_factory=list)
     allow_natural_completion_on_short_path: bool = False
     require_backend_confirmation: bool = True
+
+    def __post_init__(self) -> None:
+        if not self.profile_id:
+            raise ValueError("stop_profile.profile_id must be non-empty")
+        if self.stop_mode not in _STOP_MODES:
+            raise ValueError(
+                "stop_profile.stop_mode must be one of "
+                "'spring_back_hold', 'soft_on_path', or 'hard_deceleration'"
+            )
+        for mode in self.allowed_fallback_modes:
+            if mode not in _STOP_MODES:
+                raise ValueError(
+                    "stop_profile.allowed_fallback_modes contains unknown "
+                    f"mode '{mode}'"
+                )
+        if self.deceleration_time_s is not None:
+            decel = float(self.deceleration_time_s)
+            if not math.isfinite(decel) or decel <= 0.0:
+                raise ValueError(
+                    "stop_profile.deceleration_time_s must be finite and > 0"
+                )
+            if decel > MAX_CONTROLLED_STOP_DECELERATION_TIME_S:
+                raise ValueError(
+                    "stop_profile.deceleration_time_s must be <= "
+                    f"{_max_controlled_stop_deceleration_time_label()}"
+                )
+            self.deceleration_time_s = decel
+        if self.max_stop_time_s is not None:
+            max_stop = float(self.max_stop_time_s)
+            if not math.isfinite(max_stop) or max_stop <= 0.0:
+                raise ValueError(
+                    "stop_profile.max_stop_time_s must be finite and > 0"
+                )
+            self.max_stop_time_s = max_stop
+        for joint, limit in self.per_joint_max_deceleration_rad_s2.items():
+            if not joint:
+                raise ValueError(
+                    "stop_profile.per_joint_max_deceleration_rad_s2 "
+                    "joint names must be non-empty"
+                )
+            if not math.isfinite(float(limit)) or float(limit) <= 0.0:
+                raise ValueError(
+                    "stop_profile.per_joint_max_deceleration_rad_s2 "
+                    "limits must be finite and > 0"
+                )
 
 
 @dataclass

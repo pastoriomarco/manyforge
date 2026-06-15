@@ -139,6 +139,31 @@ adapters:
       - -2.038544566
       joint_state_max_age_ms: 250
       wait_for_state_timeout_s: 1
+      # Industrial controlled stop. soft_on_path is the default operator-stop:
+      # a self-computed jerk-continuous stop trajectory preempts the active
+      # goal over a 0.5 s ramp. enable_jtc_speed_scaling_input stays true
+      # (velocity slider via JTC scaling); the stop asserts unit scale
+      # atomically with the preempt, so soft_on_path works WITH speed-scaling
+      # (no longer gated on it).
+      enable_soft_on_path_path_ramp: true
+      soft_on_path_sample_period_s: 0.01
+      soft_on_path_stop_traj_delta_s: 0.05
+      operator_stop_profile:
+        profile_id: "operator_soft_on_path"
+        stop_mode: "soft_on_path"
+        deceleration_time_s: 0.5
+        allowed_fallback_modes: ["spring_back_hold"]
+        per_joint_max_deceleration_rad_s2:
+          shoulder_pan_joint: 10.0
+          shoulder_lift_joint: 10.0
+          elbow_joint: 10.0
+          wrist_1_joint: 10.0
+          wrist_2_joint: 10.0
+          wrist_3_joint: 10.0
+      default_fault_stop_profile:
+        profile_id: "default_fault_spring_back"
+        stop_mode: "spring_back_hold"
+        deceleration_time_s: 0.5
       wait_for_action_server_timeout_s: 2
       stop_completion_timeout_s: 2
       start_tolerance_rad: 0.15

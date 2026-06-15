@@ -40,6 +40,13 @@ core::MotionInterruptStopCapabilityDTO
 compute_ros2_control_motion_interrupt_stop_capability(
     const Ros2ControlExecutionBackendConfig& config) {
   core::MotionInterruptStopCapabilityDTO cap;
+  cap.derivative_proof_level = "none";
+  cap.scaling_source_visibility =
+      config.enable_jtc_speed_scaling_input ? "jtc_speed_scaling_input"
+                                            : "not_configured";
+  cap.scaling_source_probe_status =
+      config.enable_jtc_speed_scaling_input ? "configured_not_live_probed"
+                                            : "not_applicable";
 
   // Empty `required_joints` is a runtime-rejected misconfiguration. The
   // audit-facing helper reports it separately so deployment tools can
@@ -47,6 +54,8 @@ compute_ros2_control_motion_interrupt_stop_capability(
   // declaring a specific stop mode."
   if (config.required_joints.empty()) {
     cap.capability_profile_id = "ros2_control_v1_invalid_config";
+    cap.hard_stop_level = "unavailable";
+    cap.unsupported_reasons["all"] = "required_joints_empty";
     return cap;
   }
 
@@ -72,8 +81,12 @@ compute_ros2_control_motion_interrupt_stop_capability(
     cap.supported_stop_modes.insert(
         core::MotionInterruptStopMode::kHardDeceleration);
     cap.capability_profile_id = "ros2_control_v1_hard_decel";
+    cap.hard_stop_level = "hard_deceleration";
   } else {
     cap.capability_profile_id = "ros2_control_v1";
+    cap.hard_stop_level = "jtc_cancel_unprofiled_hold";
+    cap.unsupported_reasons["hard_deceleration"] =
+        "decelerate_on_cancel_evidence_incomplete";
   }
 
   const auto append_soft_profile = [&](const std::string& suffix) {
@@ -86,6 +99,7 @@ compute_ros2_control_motion_interrupt_stop_capability(
       cap.capability_profile_id = "ros2_control_v1_" + suffix;
     }
     core::MotionInterruptSoftOnPathPlannerConfigDTO soft_config;
+    cap.derivative_proof_level = "manyforge_core_sampled_path_ramp";
     soft_config.stop_traj_delta_s = config.soft_on_path_stop_traj_delta_s;
     soft_config.sample_period_s = config.soft_on_path_sample_period_s;
     soft_config.max_initial_path_deviation_rad =
@@ -99,13 +113,24 @@ compute_ros2_control_motion_interrupt_stop_capability(
     cap.soft_on_path_planner_config = std::move(soft_config);
   };
 
+  // soft_on_path is NOT gated on the JTC speed-scaling configuration: when
+  // speed-scaling is active the
+  // backend asserts unit execution scale atomically with the preempting stop
+  // dispatch (see execute_controlled_stop), so the computed wall-time stop is
+  // honored regardless. The path-ramp profile is therefore advertised whenever
+  // it is enabled and validly configured.
   if (config.enable_soft_on_path_path_ramp &&
-      !config.enable_jtc_speed_scaling_input &&
       soft_on_path_capability_config_valid(config)) {
     append_soft_profile("soft_on_path_path_ramp");
   } else if (config.enable_soft_on_path_experimental &&
              soft_on_path_capability_config_valid(config)) {
     append_soft_profile("soft_on_path_experimental");
+  } else if (config.enable_soft_on_path_path_ramp ||
+             config.enable_soft_on_path_experimental) {
+    cap.unsupported_reasons["soft_on_path"] =
+        "soft_on_path_capability_config_invalid";
+  } else {
+    cap.unsupported_reasons["soft_on_path"] = "soft_on_path_not_enabled";
   }
   return cap;
 }

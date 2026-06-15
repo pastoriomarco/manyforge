@@ -1,8 +1,11 @@
 #pragma once
 
+#include <cmath>
 #include <cstdint>
+#include <iomanip>
 #include <map>
 #include <optional>
+#include <sstream>
 #include <set>
 #include <string>
 #include <vector>
@@ -14,6 +17,17 @@
 #include <manyforge_core/types/robot_state.hpp>
 
 namespace manyforge::core {
+
+/// Default controlled-stop deceleration ramp (seconds) when a stop profile
+/// leaves `deceleration_time_s` unset. 0.5 s matches the proven manymove
+/// reference and is a smooth industrial stop; the prior 50 ms default was a
+/// near-instant stop. Backends MUST resolve an unset `deceleration_time_s`
+/// to this value rather than an ad-hoc local literal.
+inline constexpr double kDefaultDecelerationTimeS = 0.5;
+/// Maximum configured wall-time deceleration ramp for operator/fault soft-stop
+/// profiles. Longer stops are an explicit deployment-policy change and must not
+/// slip through profile parsing as a "soft stop".
+inline constexpr double kMaxControlledStopDecelerationTimeS = 1.0;
 
 /// Backend-declared planner parameters for production `soft_on_path`.
 /// These are deployment/runtime facts, not behavior-node policy: the
@@ -48,6 +62,22 @@ struct MotionInterruptStopCapabilityDTO {
   /// and drift/jerk limits.
   std::optional<MotionInterruptSoftOnPathPlannerConfigDTO>
       soft_on_path_planner_config;
+  /// Hard-stop floor the backend can prove for critical fallback logic. This
+  /// is intentionally a string capability rather than a stop-mode enum because
+  /// "immediate" / controller-native brake semantics are backend-family facts,
+  /// not user-selectable controlled-stop profiles in the current API.
+  std::optional<std::string> hard_stop_level;
+  /// Level of derivative-continuity proof available for `kSoftOnPath`.
+  /// Examples: `none`, `manyforge_core_sampled_path_ramp`,
+  /// `manyforge_core_native_path_ramp`.
+  std::optional<std::string> derivative_proof_level;
+  /// What speed-scaling source the backend can observe/control when executing
+  /// a controlled stop, and whether that visibility has been live-probed.
+  std::optional<std::string> scaling_source_visibility;
+  std::optional<std::string> scaling_source_probe_status;
+  /// Stable backend-family reasons for capability omissions. Composer adds the
+  /// deployment-profile dimension when it turns these into UI/log payloads.
+  std::map<std::string, std::string> unsupported_reasons;
 };
 
 /// Controlled-stop profile requested by a motion-scoped interrupt
@@ -99,6 +129,81 @@ struct MotionInterruptStopProfileDTO {
   /// / qualification artifact id).
   InterruptStructuredValue diagnostics;
 };
+
+inline double motion_interrupt_deceleration_time_or_default(
+    const MotionInterruptStopProfileDTO& profile) {
+  return profile.deceleration_time_s.value_or(kDefaultDecelerationTimeS);
+}
+
+inline std::string motion_interrupt_max_deceleration_time_label() {
+  std::ostringstream out;
+  out << std::setprecision(15) << kMaxControlledStopDecelerationTimeS;
+  std::string label = out.str();
+  const bool has_exponent =
+      label.find('e') != std::string::npos ||
+      label.find('E') != std::string::npos;
+  const auto dot = label.find('.');
+  if (dot == std::string::npos && !has_exponent) {
+    label += ".0";
+  } else if (dot != std::string::npos) {
+    while (label.size() > dot + 2 && label.back() == '0') {
+      label.pop_back();
+    }
+  }
+  return label;
+}
+
+inline std::string motion_interrupt_deceleration_time_max_error() {
+  return "deceleration_time_s must be <= " +
+         motion_interrupt_max_deceleration_time_label();
+}
+
+/// Validate the mode-specific REQUIRED fields of a stop profile at the
+/// config-parse / load boundary, so a malformed profile fails to load rather
+/// than only failing the moment an operator presses Stop. Returns an empty
+/// string when valid, else a human-readable reason. `kSoftOnPath` requires a
+/// finite positive `deceleration_time_s` and a non-empty per-joint
+/// deceleration map whose entries are named and finite-positive. (Coverage of
+/// every bound robot joint is checked by the load gate / planner, which hold
+/// the joint list; the planner re-checks these same fields at trip time as
+/// defense in depth.)
+inline std::string motion_interrupt_stop_profile_field_error(
+    const MotionInterruptStopProfileDTO& profile) {
+  if (profile.stop_mode == MotionInterruptStopMode::kSoftOnPath) {
+    if (!profile.deceleration_time_s ||
+        !std::isfinite(*profile.deceleration_time_s) ||
+        *profile.deceleration_time_s <= 0.0) {
+      return "soft_on_path requires a finite positive deceleration_time_s";
+    }
+    if (*profile.deceleration_time_s >
+        kMaxControlledStopDecelerationTimeS) {
+      return motion_interrupt_deceleration_time_max_error();
+    }
+    if (profile.per_joint_max_deceleration_rad_s2.empty()) {
+      return "soft_on_path requires a non-empty "
+             "per_joint_max_deceleration_rad_s2";
+    }
+    for (const auto& [joint, limit] :
+         profile.per_joint_max_deceleration_rad_s2) {
+      if (joint.empty() || !std::isfinite(limit) || limit <= 0.0) {
+        return "soft_on_path per_joint_max_deceleration_rad_s2 entries must "
+               "have non-empty joint names and finite positive values";
+      }
+    }
+  }
+  if (profile.stop_mode != MotionInterruptStopMode::kSoftOnPath &&
+      profile.deceleration_time_s.has_value()) {
+    if (!std::isfinite(*profile.deceleration_time_s) ||
+        *profile.deceleration_time_s <= 0.0) {
+      return "deceleration_time_s must be finite and positive";
+    }
+    if (*profile.deceleration_time_s >
+        kMaxControlledStopDecelerationTimeS) {
+      return motion_interrupt_deceleration_time_max_error();
+    }
+  }
+  return "";
+}
 
 /// Result of a controlled-stop request issued to the execution backend
 /// at trip time (spec/260 §5.6). The backend MUST set

@@ -70,6 +70,20 @@ def _session_response(session, status_code: int = 200) -> JSONResponse:
     )
 
 
+def _motion_arm_admission_error(state: ComposerState) -> JSONResponse | None:
+    stop_block = state.motion_arm_admission_block_reason()
+    if not stop_block:
+        return None
+    return JSONResponse(
+        status_code=409,
+        content={
+            "error": stop_block["message"],
+            "error_code": stop_block["error_code"],
+            "timestamp_ns": time.monotonic_ns(),
+        },
+    )
+
+
 def _delegated_recovery_response(request, status_code: int = 200) -> JSONResponse:
     return JSONResponse(
         status_code=status_code,
@@ -171,6 +185,10 @@ def create_direct_router(state: ComposerState) -> APIRouter:
                     "timestamp_ns": time.monotonic_ns(),
                 },
             )
+
+        admission_error = _motion_arm_admission_error(state)
+        if admission_error is not None:
+            return admission_error
 
         try:
             session = state.cycle_manager.execute_intervention(
@@ -366,6 +384,10 @@ def create_direct_router(state: ComposerState) -> APIRouter:
                 },
             )
 
+        admission_error = _motion_arm_admission_error(state)
+        if admission_error is not None:
+            return admission_error
+
         try:
             session = state.cycle_manager.execute_intervention(
                 tree_dict,
@@ -507,6 +529,10 @@ def create_direct_router(state: ComposerState) -> APIRouter:
                     "timestamp_ns": time.monotonic_ns(),
                 },
             )
+
+        admission_error = _motion_arm_admission_error(state)
+        if admission_error is not None:
+            return admission_error
 
         try:
             session = state.cycle_manager.execute_intervention(

@@ -1444,6 +1444,16 @@ TEST_F(NativeKernelTest,
       MotionInterruptStopMode::kHardDeceleration));
   ASSERT_TRUE(cap.capability_profile_id.has_value());
   EXPECT_EQ(*cap.capability_profile_id, "roboplan_native_v2_soft_on_path");
+  ASSERT_TRUE(cap.hard_stop_level.has_value());
+  EXPECT_EQ(*cap.hard_stop_level, "native_immediate_hold");
+  ASSERT_TRUE(cap.derivative_proof_level.has_value());
+  EXPECT_EQ(*cap.derivative_proof_level, "manyforge_core_native_path_ramp");
+  ASSERT_TRUE(cap.scaling_source_visibility.has_value());
+  EXPECT_EQ(*cap.scaling_source_visibility, "native_runtime_scale");
+  ASSERT_TRUE(cap.scaling_source_probe_status.has_value());
+  EXPECT_EQ(*cap.scaling_source_probe_status, "not_applicable");
+  EXPECT_EQ(cap.unsupported_reasons.at("hard_deceleration"),
+            "ros2_control_jtc_only_in_current_native_backend");
   ASSERT_TRUE(cap.soft_on_path_planner_config.has_value());
   EXPECT_DOUBLE_EQ(cap.soft_on_path_planner_config->stop_traj_delta_s, 0.02);
   EXPECT_DOUBLE_EQ(cap.soft_on_path_planner_config->sample_period_s, 0.01);
@@ -1543,6 +1553,74 @@ TEST_F(NativeKernelTest,
       << "spring_back_hold MUST NOT silently complete the trajectory";
   EXPECT_NE(stopped.joint_positions_rad[0], start_state.positions_rad[0])
       << "spring_back_hold MUST anchor at observed (mid-flight) state";
+}
+
+TEST_F(NativeKernelTest,
+       NativeBackend_ControlledStop_SpringBackHoldZeroVelocityTermination) {
+  // spring_back_hold parity: the native backend MUST end a
+  // spring_back stop in a STABLE ZERO-VELOCITY HOLD at the observed anchor —
+  // the same terminus the JTC backend reaches via its anchored hold goal
+  // (send_fjt_anchored_goal: target = observed position, zero terminal
+  // velocity over deceleration_time_s). Parity is the zero-velocity held
+  // terminus, not an identical decel ramp: the native simulator is kinematic
+  // and freezes at the observed sample, while JTC lets controller dynamics
+  // settle to the same rest state. This test pins the property that matters
+  // for safety — after the stop the arm carries no residual velocity (no
+  // coasting toward the goal, no overshoot) and the held anchor is stable.
+  auto start_state = bundle_->context->get_current_state();
+  ASSERT_FALSE(start_state.positions_rad.empty());
+
+  std::vector<double> goal = start_state.positions_rad;
+  goal[0] += 0.5;
+  if (goal.size() > 1) {
+    goal[1] -= 0.3;
+  }
+
+  TrajectoryDTO traj;
+  traj.joint_names = start_state.joint_names;
+  traj.waypoints.push_back(
+      TrajectoryWaypointDTO{0.0, start_state.positions_rad, {}, {}});
+  traj.waypoints.push_back(TrajectoryWaypointDTO{2.0, goal, {}, {}});
+
+  auto handle = bundle_->execution->execute_trajectory(traj);
+  std::this_thread::sleep_for(std::chrono::milliseconds(150));
+
+  MotionInterruptStopProfileDTO profile;
+  profile.profile_id = "native_spring_back_zero_velocity";
+  profile.stop_mode = MotionInterruptStopMode::kSpringBackHold;
+  profile.deceleration_time_s = 0.2;
+  profile.max_stop_time_s = 1.0;
+
+  auto result = bundle_->execution->execute_controlled_stop(profile);
+  ASSERT_TRUE(result.accepted);
+  ASSERT_TRUE(result.backend_stop_confirmed);
+  EXPECT_EQ(result.executed_stop_mode,
+            MotionInterruptStopMode::kSpringBackHold);
+
+  // Worker yielded under the stop — it is no longer driving the arm.
+  ASSERT_TRUE(handle.wait_for_completion(2'000'000'000LL));
+
+  auto held = bundle_->execution->get_execution_snapshot();
+  EXPECT_EQ(held.state, ExecutionState::kStopped);
+  ASSERT_EQ(held.joint_positions_rad.size(), start_state.positions_rad.size());
+  // Anchored mid-flight: did not silently complete the trajectory.
+  EXPECT_NE(held.joint_positions_rad[0], goal[0])
+      << "spring_back_hold must not complete the trajectory";
+
+  // Zero-velocity terminus + stable hold: sample again after a hold window;
+  // the anchor must be unchanged. A nonzero residual velocity (coasting /
+  // overshoot) or a still-running worker would move the joint here.
+  const auto held_positions = held.joint_positions_rad;
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  auto still = bundle_->execution->get_execution_snapshot();
+  EXPECT_EQ(still.state, ExecutionState::kStopped)
+      << "spring_back_hold must hold kStopped (no re-entry to motion)";
+  ASSERT_EQ(still.joint_positions_rad.size(), held_positions.size());
+  for (size_t i = 0; i < held_positions.size(); ++i) {
+    EXPECT_DOUBLE_EQ(still.joint_positions_rad[i], held_positions[i])
+        << "spring_back_hold must hold a stable zero-velocity anchor (joint "
+        << i << ")";
+  }
 }
 
 TEST_F(NativeKernelTest,

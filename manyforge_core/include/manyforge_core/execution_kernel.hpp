@@ -185,6 +185,16 @@ class ExecutionKernel {
   /// Non-blocking reset. Valid from any state except Idle.
   ResetResultDTO reset();
 
+  /// Backend-agnostic accessor for the active execution backend's
+  /// motion-interrupt stop capability (the advertised supported stop modes
+  /// and the soft_on_path planner config it would use). This is the same
+  /// capability the arm-time gate validates against; exposing it lets a
+  /// deployment load-time check fail closed — disabling execution before any
+  /// motion is armed — when the configured operator/fault stop profile names
+  /// a mode the backend does not advertise. Delegates to
+  /// IExecutionBackend::get_motion_interrupt_stop_capability.
+  MotionInterruptStopCapabilityDTO get_motion_interrupt_stop_capability() const;
+
   /// Acknowledge a successful terminal execution and return to Idle.
   ///
   /// Valid only when the kernel is currently Completed for exactly the supplied

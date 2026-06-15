@@ -183,6 +183,53 @@ def build_runtime_status_payload(state: ComposerState) -> dict[str, Any]:
         ),
     ]
 
+    stop_cap = state.stop_capability_status
+    stop_modes_unsupported = list(stop_cap.get("unsupported") or [])
+    supported_stop_modes = stop_cap.get("supported_stop_modes")
+    hard_stop_level = stop_cap.get("hard_stop_level")
+    derivative_proof_level = stop_cap.get("derivative_proof_level")
+    scaling_source_visibility = stop_cap.get("scaling_source_visibility")
+    scaling_source_probe_status = stop_cap.get("scaling_source_probe_status")
+    stop_capability_unsupported = bool(stop_modes_unsupported)
+    stop_capability_query_failed = bool(stop_cap.get("capability_query_failed"))
+    advertised = ", ".join(supported_stop_modes) if supported_stop_modes else "none"
+    unsupported_desc = ", ".join(
+        f"{u.get('profile')}={u.get('stop_mode')}" for u in stop_modes_unsupported
+    )
+    # The component renders whenever a real backend was queried (success: modes
+    # known; failure: capability_query_failed) for a program-loaded deployment.
+    if program_loaded and (supported_stop_modes is not None or stop_capability_query_failed):
+        if stop_capability_query_failed:
+            stop_detail = (
+                "Execution backend could not report its supported stop modes; the "
+                f"configured stop profile(s) ({unsupported_desc}) cannot be verified."
+            )
+        elif stop_capability_unsupported:
+            stop_detail = (
+                f"Configured stop profile unsupported by backend: {unsupported_desc}. "
+                f"Backend advertises: {advertised}."
+            )
+        else:
+            evidence = []
+            if hard_stop_level:
+                evidence.append(f"hard stop: {hard_stop_level}")
+            if derivative_proof_level:
+                evidence.append(f"derivative proof: {derivative_proof_level}")
+            if scaling_source_visibility:
+                evidence.append(f"scaling: {scaling_source_visibility}")
+            suffix = f" ({'; '.join(evidence)})" if evidence else ""
+            stop_detail = f"Supported stop modes: {advertised}.{suffix}"
+        components.append(
+            _component(
+                "stop_capability",
+                "Stop capability",
+                "safety",
+                "fault" if stop_capability_unsupported else "ready",
+                required_for=["execute"],
+                detail=stop_detail,
+            )
+        )
+
     external_statuses = state.external_runtime_statuses(max_age_s=6.0)
     external_ready = True
     external_waiting = False
@@ -237,6 +284,10 @@ def build_runtime_status_payload(state: ComposerState) -> dict[str, Any]:
         can_execute = can_execute and external_ready
     if kernel_fault:
         can_execute = False
+    if stop_capability_unsupported:
+        # Fail closed: never let a deployment whose configured stop profile is
+        # not advertised by the backend reach an armed/executing state.
+        can_execute = False
 
     if kernel_status == "intervention_required":
         readiness = "fault"
@@ -250,6 +301,23 @@ def build_runtime_status_payload(state: ComposerState) -> dict[str, Any]:
             if not kernel_status_known
             else external_user_message or "A runtime component reported a fault."
         )
+    elif stop_capability_unsupported:
+        readiness = "degraded"
+        summary_label = "Degraded"
+        if stop_capability_query_failed:
+            user_message = (
+                "Execution disabled: the execution backend could not report its "
+                f"supported stop modes, so the configured stop profile(s) "
+                f"({unsupported_desc}) cannot be verified. Reload once the backend "
+                "is healthy."
+            )
+        else:
+            user_message = (
+                "Execution disabled: the deployment's configured stop profile uses a "
+                f"stop mode the execution backend does not support ({unsupported_desc}). "
+                f"Backend advertises: {advertised}. Choose a supported stop profile in "
+                "the Deployment tab."
+            )
     elif external_waiting or (profile_kind == "commanded_sim" and not can_execute):
         readiness = "waiting"
         summary_label = "Waiting"
@@ -284,6 +352,17 @@ def build_runtime_status_payload(state: ComposerState) -> dict[str, Any]:
         "userMessage": user_message,
         "components": components,
         "externalProviders": sorted(external_statuses.keys()),
+        "supportedStopModes": supported_stop_modes,
+        "configuredStopModes": stop_cap.get("configured_stop_modes") or {},
+        "stopCapabilityProfileId": stop_cap.get("capability_profile_id"),
+        "hardStopLevel": hard_stop_level,
+        "derivativeProofLevel": derivative_proof_level,
+        "scalingSourceVisibility": scaling_source_visibility,
+        "scalingSourceProbeStatus": scaling_source_probe_status,
+        "stopProfileUnsupportedReasons": stop_modes_unsupported,
+        "backendUnsupportedStopReasons": stop_cap.get("unsupported_reasons") or {},
+        "stopProfileUnsupported": stop_capability_unsupported,
+        "stopCapabilityQueryFailed": stop_capability_query_failed,
         "timestampNs": now_ns,
     }
 

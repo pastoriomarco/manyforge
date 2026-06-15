@@ -2183,9 +2183,9 @@ Ros2ControlExecutionBackend::execute_controlled_stop(
         fallback_profile.stop_mode =
             core::MotionInterruptStopMode::kSpringBackHold;
         fallback_profile.allowed_fallback_modes.clear();
-        if (!fallback_profile.deceleration_time_s.has_value()) {
-          fallback_profile.deceleration_time_s = 0.05;
-        }
+        fallback_profile.deceleration_time_s =
+            core::motion_interrupt_deceleration_time_or_default(
+                fallback_profile);
         auto fallback = execute_controlled_stop(fallback_profile, stop_token);
         fallback.executed_stop_mode =
             core::MotionInterruptStopMode::kSpringBackHold;
@@ -2209,14 +2209,14 @@ Ros2ControlExecutionBackend::execute_controlled_stop(
 
   if (profile.stop_mode == core::MotionInterruptStopMode::kSoftOnPath &&
       config_.enable_soft_on_path_path_ramp) {
-    if (config_.enable_jtc_speed_scaling_input) {
-      return execute_soft_on_path_spring_back_fallback(
-          "soft_on_path_scale_isolation_unavailable",
-          core::ErrorDTO{
-              std::string(core::kErrorMotionInterruptBackendStopFailed),
-              "ros2_control soft_on_path path ramp requires JTC speed_scaling_input disabled",
-              {{"reason", "soft_on_path_scale_isolation_unavailable"}}});
-    }
+    // soft_on_path is NOT gated on the speed-scaling configuration: ManyForge
+    // owns the stop timeline. When
+    // JTC speed-scaling is active, unit execution scale is asserted atomically
+    // with the preempting replacement-goal dispatch below (see the dispatch
+    // block) so the controller cannot retime the computed wall-time stop. The
+    // replacement trajectory already encodes the actual current (scaled)
+    // velocity, so the unit-scale assertion is "execute as computed," not a
+    // scaling burst, and introduces no seam discontinuity.
 
     core::TrajectoryDTO active_trajectory;
     double active_trajectory_time_s = 0.0;
@@ -2342,9 +2342,18 @@ Ros2ControlExecutionBackend::execute_controlled_stop(
       stop_requested_ = true;
       pause_requested_ = false;
       stop_requested_at_ = std::chrono::steady_clock::now();
-      // Do not publish a scale jump or explicitly cancel the old goal here.
       // The replacement FJT goal preempts the original at the controller
       // boundary; old-goal terminal callbacks route through stop_requested_.
+    }
+
+    // Assert unit execution scale atomically with the preempting
+    // goal so JTC speed-scaling does not retime the computed wall-time stop.
+    // The replacement trajectory's first waypoint already carries the actual
+    // current (scaled) velocity, so this is not a scaling burst and adds no
+    // seam discontinuity. Only meaningful when the deployment uses JTC
+    // speed-scaling; otherwise the publisher is inert/absent.
+    if (config_.enable_jtc_speed_scaling_input) {
+      publish_runtime_velocity_scale(1.0);
     }
 
     const auto dispatch_start = std::chrono::steady_clock::now();
@@ -2772,7 +2781,8 @@ Ros2ControlExecutionBackend::execute_controlled_stop(
   // zero velocity at +deceleration_time_s. The existing helper
   // captures the anchor, builds the JTC trajectory message, and
   // tracks the terminal result via on_managed_fjt_terminal_result.
-  const double ramp_s = profile.deceleration_time_s.value_or(0.05);
+  const double ramp_s =
+      core::motion_interrupt_deceleration_time_or_default(profile);
   const auto call_start = std::chrono::steady_clock::now();
   const bool dispatched = send_fjt_anchored_goal(
       joint_names, observed_positions, ramp_s, /*track_terminal_goal=*/true);

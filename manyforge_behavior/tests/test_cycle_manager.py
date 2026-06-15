@@ -338,18 +338,21 @@ class TestCycleManagerStop:
         manager.stop()
         assert manager.state == CycleState.IDLE
     
-    def test_stop_calls_kernel_pause_if_executing(self, kernel):
-        """stop() calls kernel.pause() if kernel is EXECUTING."""
+    def test_stop_routes_through_controlled_stop_not_pause(self, kernel):
+        """Operator stop() routes the in-flight motion through the kernel's
+        controlled stop (kernel.stop()), not a resumable pause. The controlled
+        stop is the industrial default operator-stop path."""
         slow_kernel = MockKernelClient(execute_duration_s=1.0)
         runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, slow_kernel)
         manager = CycleManager(runner, slow_kernel)
-        
+
         manager.run()
         time.sleep(0.05)
         manager.stop()
-        
-        # Kernel should have been paused
-        assert slow_kernel.pause_count == 1
+
+        # Controlled stop, not pause: kernel.stop() invoked, kernel.pause() not.
+        assert slow_kernel.stop_count == 1
+        assert slow_kernel.pause_count == 0
 
 
 class TestCycleManagerReset:
@@ -1241,12 +1244,23 @@ class TestIntervention:
         manager.reset()
 
     def test_execute_from_stopped_rejects_paused_kernel(self, kernel):
-        """Wrapper-only intervention does not hijack a paused kernel motion."""
+        """Wrapper-only intervention does not hijack a paused kernel motion.
+
+        Operator stop() now preempts via the controlled stop (kernel STOPPED,
+        no held motion), so it no longer produces a paused kernel. The guard
+        still protects the motion-soft-fail hold case, where the kernel is
+        genuinely PAUSED with the cycle STOPPED — recreate that condition
+        directly and assert the guard still rejects the wrapper-only
+        intervention."""
         kernel = MockKernelClient(execute_duration_s=1.0)
         manager = self._make_manager(kernel, execute_duration_s=1.0)
         manager.run()
         time.sleep(0.05)
         manager.stop()
+        # Recreate the soft-fail held-motion condition: cycle STOPPED + kernel
+        # PAUSED (the only state the guard protects against now). _make_manager
+        # builds its own kernel, so override the manager's actual kernel.
+        manager._kernel._state = ExecutionState.PAUSED
 
         with pytest.raises(RuntimeError, match="paused motion"):
             manager.execute_intervention(

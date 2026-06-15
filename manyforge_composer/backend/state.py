@@ -2480,6 +2480,7 @@ class ComposerState:
         self.program = program
         self._effective_program = effective_program or program
         self.deployment = deployment
+        self._evaluate_stop_capability()
         self._update_program_tree_hash()
         self._program_session_generation += 1
         self.reset_authored_scene_sync_managed_ids()
@@ -2495,6 +2496,183 @@ class ComposerState:
                 self._on_program_loaded(self)
             except Exception:
                 logger.exception("on_program_loaded callback failed")
+
+    @property
+    def stop_capability_status(self) -> dict:
+        """Cached result of the load-time stop-capability check.
+
+        Keys: ``supported_stop_modes`` (sorted list, or None when the active
+        backend does not expose a capability — e.g. the mock kernel),
+        ``configured_stop_modes`` (mapping of profile slot -> declared mode),
+        ``unsupported`` (list of {profile, stop_mode, reason} the backend does
+        not advertise or could not verify), ``capability_query_failed``, and
+        ``capability_profile_id``. Additional audit fields mirror the backend
+        capability payload: ``hard_stop_level``, ``derivative_proof_level``,
+        ``scaling_source_visibility``, ``scaling_source_probe_status``, and
+        ``unsupported_reasons``. Empty before any load.
+        """
+        return getattr(self, "_stop_capability_status", {})
+
+    def motion_arm_admission_block_reason(self) -> Optional[dict]:
+        """Authoritative Composer-side pre-motion admission gate.
+
+        Every surface that can arm motion through Composer must call this
+        immediately before dispatch. It re-queries the backend capability at
+        arm time (not on runtime-status polls), so dispatch fails closed if
+        the backend can no longer report its capability.
+        """
+        self._evaluate_stop_capability(reason="motion_arm")
+        return self.stop_capability_block_reason()
+
+    def stop_capability_block_reason(self) -> Optional[dict]:
+        """Shared fail-closed pre-motion gate. Returns a structured
+        ``{message, error_code}`` when the active deployment's configured stop
+        profile cannot be honored by the backend (unsupported mode, or the
+        capability could not be verified), else None. Every motion-arming
+        surface (cycle run, MCP run, future) must consult this so the gate is
+        defined once, not duplicated per-route (which is how surfaces drift
+        out of coverage)."""
+        stop_cap = self.stop_capability_status
+        unsupported = stop_cap.get("unsupported") or []
+        if not unsupported:
+            return None
+        desc = ", ".join(
+            f"{u.get('profile')}={u.get('stop_mode')}" for u in unsupported
+        )
+        if stop_cap.get("capability_query_failed"):
+            return {
+                "message": (
+                    "Execution blocked: the execution backend could not report its "
+                    f"supported stop modes, so the configured stop profile(s) ({desc}) "
+                    "cannot be verified. Reload once the backend is healthy."
+                ),
+                "error_code": "stop_capability_query_failed",
+            }
+        advertised = ", ".join(stop_cap.get("supported_stop_modes") or []) or "none"
+        return {
+            "message": (
+                "Execution blocked: the deployment's configured stop profile uses a "
+                f"stop mode the execution backend does not support ({desc}). Backend "
+                f"advertises: {advertised}. Choose a supported stop profile."
+            ),
+            "error_code": "stop_profile_unsupported",
+        }
+
+    def _evaluate_stop_capability(self, *, reason: str = "load") -> None:
+        """Evaluate once, at program load, whether the deployment's configured
+        operator/fault stop profiles are advertised by the active execution
+        backend, and cache the result for the runtime-status gate.
+
+        Fail-closed contract:
+        - If a configured stop mode is not in the backend's
+          ``supported_stop_modes`` -> block (reason ``stop_mode_not_supported``).
+        - If the deployment declares stop profiles but the backend capability
+          query FAILS (throws, or returns a non-dict) -> block (reason
+          ``capability_query_failed``); an unverifiable profile is never allowed
+          to run.
+        - If there is no capability accessor at all and the deployment declares
+          stop profiles, the configured profiles are unverifiable -> block
+          (reason ``capability_query_failed``). Deployments without configured
+          stop profiles remain ungated for composer-only/test lanes.
+
+        The backend capability is authoritative (computed in C++ from the
+        deployment's controller config). Runtime-status reads consume this
+        cache without polling. Motion-arm admission re-runs this method so a
+        backend that can no longer report capability is caught before dispatch.
+        """
+        status: dict = {
+            "supported_stop_modes": None,
+            "configured_stop_modes": {},
+            "unsupported": [],
+            "unsupported_reasons": {},
+            "capability_profile_id": None,
+            "hard_stop_level": None,
+            "derivative_proof_level": None,
+            "scaling_source_visibility": None,
+            "scaling_source_probe_status": None,
+            "capability_query_failed": False,
+            "evaluated_at_ns": time.monotonic_ns(),
+            "evaluation_reason": reason,
+        }
+        deployment = self.deployment
+        # Read the configured stop profiles FIRST, independently of the backend
+        # query, so that even if the query fails we still know whether the
+        # deployment declared profiles that must be verified (fail-closed).
+        configured: dict = {}
+        if deployment is not None:
+            execution = deployment.adapters.get("execution")
+            cfg = getattr(execution, "config", None) or {}
+            for slot in ("operator_stop_profile", "default_fault_stop_profile"):
+                profile = cfg.get(slot)
+                if isinstance(profile, dict) and profile.get("stop_mode"):
+                    configured[slot] = profile["stop_mode"]
+        status["configured_stop_modes"] = configured
+
+        bundle = self.kernel_bundle
+        # The native path exposes the raw NativeKernelBundle; the ros2_control
+        # path wraps it (Ros2ControlRuntimeBundle.native_bundle). Reach the
+        # underlying bundle that carries the capability accessor either way.
+        get_cap = getattr(bundle, "get_motion_interrupt_stop_capability", None)
+        if not callable(get_cap):
+            inner = getattr(bundle, "native_bundle", None)
+            get_cap = getattr(inner, "get_motion_interrupt_stop_capability", None)
+        if not callable(get_cap):
+            get_cap = getattr(self._kernel, "get_motion_interrupt_stop_capability", None)
+
+        if deployment is None:
+            self._stop_capability_status = status
+            return
+        if not callable(get_cap):
+            if configured:
+                status["capability_query_failed"] = True
+                for slot, mode in configured.items():
+                    status["unsupported"].append(
+                        {"profile": slot, "stop_mode": mode,
+                         "reason": "capability_query_failed"}
+                    )
+            self._stop_capability_status = status
+            return
+
+        cap = None
+        query_failed = False
+        try:
+            cap = get_cap()
+        except Exception:
+            logger.exception("stop-capability query failed during %s", reason)
+            query_failed = True
+        if not isinstance(cap, dict):
+            query_failed = True
+
+        if query_failed:
+            # A real backend could not report its stop capability: any
+            # configured stop profile is unverifiable -> block, fail-closed.
+            if configured:
+                status["capability_query_failed"] = True
+                for slot, mode in configured.items():
+                    status["unsupported"].append(
+                        {"profile": slot, "stop_mode": mode,
+                         "reason": "capability_query_failed"}
+                    )
+            self._stop_capability_status = status
+            return
+
+        supported = set(cap.get("supported_stop_modes") or [])
+        status["supported_stop_modes"] = sorted(supported)
+        status["capability_profile_id"] = cap.get("capability_profile_id")
+        status["hard_stop_level"] = cap.get("hard_stop_level")
+        status["derivative_proof_level"] = cap.get("derivative_proof_level")
+        status["scaling_source_visibility"] = cap.get("scaling_source_visibility")
+        status["scaling_source_probe_status"] = cap.get("scaling_source_probe_status")
+        if isinstance(cap.get("unsupported_reasons"), dict):
+            status["unsupported_reasons"] = dict(cap["unsupported_reasons"])
+        for slot, mode in configured.items():
+            if mode not in supported:
+                backend_reason = status["unsupported_reasons"].get(mode)
+                status["unsupported"].append(
+                    {"profile": slot, "stop_mode": mode,
+                     "reason": backend_reason or "stop_mode_not_supported"}
+                )
+        self._stop_capability_status = status
 
     def apply_models(
         self,
@@ -2611,6 +2789,7 @@ class ComposerState:
         self.deployment_source_path = deployment_source_path
         self._kernel = kernel
         self.kernel_bundle = kernel_bundle
+        self._evaluate_stop_capability()
         joint_names_to_cache = (
             drivable_joints
             if drivable_joints or deployment is not None

@@ -770,6 +770,15 @@ MotionInterruptStopProfileDTO stop_profile_from_python(
           .cast<bool>();
   profile.require_backend_confirmation =
       sp.attr("get")("require_backend_confirmation", true).cast<bool>();
+  // Fail closed at the config-parse boundary: a stop profile missing the
+  // fields its mode requires (e.g. soft_on_path without a positive
+  // deceleration_time_s or per-joint limits) must fail the deployment LOAD,
+  // not silently pass readiness and only fail when an operator presses Stop.
+  const std::string field_error =
+      motion_interrupt_stop_profile_field_error(profile);
+  if (!field_error.empty()) {
+    throw std::invalid_argument(std::string(context) + ": " + field_error);
+  }
   return profile;
 }
 
@@ -1938,6 +1947,69 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
 #endif
         return command_result(r.accepted, r.error);
       })
+      .def("get_motion_interrupt_stop_capability",
+           [](NativeKernelBundle& self) -> py::dict {
+             // Read-only view of the active execution backend's advertised
+             // stop capability, used by the composer's deployment load-time
+             // gate to fail closed when a configured stop profile names an
+             // unsupported mode. Backend-agnostic (native + ros2_control).
+             py::dict d;
+             py::list modes;
+             if (self.kernel) {
+               const auto cap =
+                   self.kernel->get_motion_interrupt_stop_capability();
+               const auto mode_to_string =
+                   [](MotionInterruptStopMode m) -> const char* {
+                 switch (m) {
+                   case MotionInterruptStopMode::kSpringBackHold:
+                     return "spring_back_hold";
+                   case MotionInterruptStopMode::kSoftOnPath:
+                     return "soft_on_path";
+                   case MotionInterruptStopMode::kHardDeceleration:
+                     return "hard_deceleration";
+                 }
+                 return "unknown";
+               };
+               for (const auto& m : cap.supported_stop_modes) {
+                 modes.append(std::string(mode_to_string(m)));
+               }
+               if (cap.capability_profile_id) {
+                 d["capability_profile_id"] = *cap.capability_profile_id;
+               } else {
+                 d["capability_profile_id"] = py::none();
+               }
+               const auto set_optional_string =
+                   [&](const char* key,
+                       const std::optional<std::string>& value) {
+                     if (value) {
+                       d[key] = *value;
+                     } else {
+                       d[key] = py::none();
+                     }
+                   };
+               set_optional_string("hard_stop_level", cap.hard_stop_level);
+               set_optional_string("derivative_proof_level",
+                                   cap.derivative_proof_level);
+               set_optional_string("scaling_source_visibility",
+                                   cap.scaling_source_visibility);
+               set_optional_string("scaling_source_probe_status",
+                                   cap.scaling_source_probe_status);
+               py::dict unsupported_reasons;
+               for (const auto& [mode, reason] : cap.unsupported_reasons) {
+                 unsupported_reasons[py::str(mode)] = reason;
+               }
+               d["unsupported_reasons"] = unsupported_reasons;
+             } else {
+               d["capability_profile_id"] = py::none();
+               d["hard_stop_level"] = py::none();
+               d["derivative_proof_level"] = py::none();
+               d["scaling_source_visibility"] = py::none();
+               d["scaling_source_probe_status"] = py::none();
+               d["unsupported_reasons"] = py::dict();
+             }
+             d["supported_stop_modes"] = modes;
+             return d;
+           })
       .def("acknowledge_completed", [](NativeKernelBundle& self,
                                         uint64_t execution_id) -> py::dict {
         auto r = self.kernel->acknowledge_completed(execution_id);

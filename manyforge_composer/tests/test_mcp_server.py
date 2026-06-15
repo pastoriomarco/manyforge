@@ -99,6 +99,28 @@ def _make_state(execute_duration_s: float = 0.0) -> ComposerState:
     )
 
 
+class _StopCapabilityBundle:
+    def get_motion_interrupt_stop_capability(self) -> dict:
+        return {
+            "supported_stop_modes": ["spring_back_hold"],
+            "capability_profile_id": "test_spring_only",
+            "hard_stop_level": "jtc_cancel_unprofiled_hold",
+        }
+
+
+def _write_deployment_with_stop_profile(tmp_path: Path, *, stop_mode: str) -> str:
+    data = yaml.safe_load(Path(_DEPLOYMENT_PATH).read_text(encoding="utf-8"))
+    config = data["adapters"]["execution"].setdefault("config", {})
+    config["operator_stop_profile"] = {
+        "profile_id": f"operator_{stop_mode}",
+        "stop_mode": stop_mode,
+        "deceleration_time_s": 0.5,
+    }
+    target = tmp_path / f"deployment_{stop_mode}.deployment.yaml"
+    target.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    return str(target)
+
+
 def _call(mcp, tool_name: str, arguments: dict | None = None) -> dict:
     """Synchronously call an MCP tool and parse the JSON result."""
     contents, _raw = asyncio.run(mcp.call_tool(tool_name, arguments or {}))
@@ -397,6 +419,25 @@ class TestCycleControl:
         result = _call(mcp, "manyforge_cycle_control", {"command": "reset"})
         assert result["state"] == "idle"
 
+    def test_run_blocks_unsupported_configured_stop_profile(self, tmp_path):
+        state = ComposerState(
+            catalog_path=_CATALOG_PATH,
+            kernel=MockKernelClient(execute_duration_s=0.0),
+            kernel_bundle=_StopCapabilityBundle(),
+            allowed_fs_roots=[str(_REPO_ROOT), "/workspace", "/tmp"],
+        )
+        state.load_program(
+            _PROGRAM_PATH,
+            _write_deployment_with_stop_profile(
+                tmp_path, stop_mode="hard_deceleration"
+            ),
+        )
+        mcp = create_mcp_server(state)
+
+        result = _call(mcp, "manyforge_cycle_control", {"command": "run"})
+
+        assert result["error_code"] == "stop_profile_unsupported"
+
     def test_velocity_scale(self):
         state = _make_state()
         state.load_program(_PROGRAM_PATH, _DEPLOYMENT_PATH)
@@ -626,6 +667,37 @@ class TestIntervention:
         assert result["principal_id"] == "human:test-operator"
         assert result["grant_type"] == "human_approved"
         assert result["status"] in ("running", "completed")
+
+    def test_intervention_execute_blocks_unsupported_configured_stop_profile(self, tmp_path):
+        state = ComposerState(
+            catalog_path=_CATALOG_PATH,
+            kernel=MockKernelClient(execute_duration_s=0.0),
+            kernel_bundle=_StopCapabilityBundle(),
+            allowed_fs_roots=[str(_REPO_ROOT), "/workspace", "/tmp"],
+        )
+        state.load_program(
+            _PROGRAM_PATH,
+            _write_deployment_with_stop_profile(
+                tmp_path, stop_mode="hard_deceleration"
+            ),
+        )
+        mcp = create_mcp_server(state)
+
+        result = _call(mcp, "manyforge_intervention", {
+            "action": "execute",
+            "tree": {
+                "id": "timer",
+                "name": "blocked_mcp_intervention",
+                "params": {"duration_s": 0.01},
+                "children": [],
+            },
+            "session_kind": "manual_intervention",
+            "authority_source": "human",
+            "principal_id": "human:test-operator",
+            "approval_mode": "human_approved",
+        })
+
+        assert result["error_code"] == "stop_profile_unsupported"
 
     def test_intervention_execute_from_idle_requires_human_approval(self):
         state = _make_state(execute_duration_s=0.0)

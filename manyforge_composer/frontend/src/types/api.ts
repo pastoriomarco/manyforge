@@ -679,6 +679,17 @@ export interface RuntimeStatus {
   userMessage: string;
   components: RuntimeComponentStatus[];
   externalProviders: string[];
+  supportedStopModes?: string[] | null;
+  configuredStopModes?: Record<string, string>;
+  stopCapabilityProfileId?: string | null;
+  hardStopLevel?: string | null;
+  derivativeProofLevel?: string | null;
+  scalingSourceVisibility?: string | null;
+  scalingSourceProbeStatus?: string | null;
+  stopProfileUnsupportedReasons?: Array<Record<string, unknown>>;
+  backendUnsupportedStopReasons?: Record<string, string>;
+  stopProfileUnsupported?: boolean;
+  stopCapabilityQueryFailed?: boolean;
   timestampNs: number;
 }
 

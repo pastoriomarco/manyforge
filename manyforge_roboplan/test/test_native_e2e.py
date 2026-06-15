@@ -5,6 +5,7 @@ error recovery, caching, and benchmarks.
 """
 
 import time
+import math
 from pathlib import Path
 import pytest
 
@@ -109,6 +110,132 @@ def test_create_native_kernel_accepts_collision_monitor_config():
     status = kernel.get_status()
 
     assert status.state == ExecutionState.IDLE
+
+
+def test_create_native_kernel_rejects_stop_profile_deceleration_time_over_cap():
+    if not HAS_NATIVE:
+        pytest.skip("manyforge_roboplan_py not available")
+
+    with pytest.raises(ValueError, match="deceleration_time_s must be <= 1.0"):
+        manyforge_roboplan_py.create_native_kernel(
+            "ur5_gripper",
+            "arm",
+            {
+                "operator_stop_profile": {
+                    "profile_id": "operator_soft_too_slow",
+                    "stop_mode": "soft_on_path",
+                    "deceleration_time_s": 1.001,
+                    "max_stop_time_s": 1.0,
+                    "per_joint_max_deceleration_rad_s2": {
+                        "shoulder_pan_joint": 8.0,
+                    },
+                }
+            },
+        )
+
+
+def test_create_native_kernel_accepts_stop_profile_deceleration_time_at_cap():
+    if not HAS_NATIVE:
+        pytest.skip("manyforge_roboplan_py not available")
+
+    bundle = manyforge_roboplan_py.create_native_kernel(
+        "ur5_gripper",
+        "arm",
+        {
+            "operator_stop_profile": {
+                "profile_id": "operator_spring_cap",
+                "stop_mode": "spring_back_hold",
+                "deceleration_time_s": 1.0,
+            }
+        },
+    )
+    capability = bundle.get_motion_interrupt_stop_capability()
+    assert "spring_back_hold" in capability["supported_stop_modes"]
+
+
+def test_create_native_kernel_rejects_spring_back_deceleration_time_over_cap():
+    if not HAS_NATIVE:
+        pytest.skip("manyforge_roboplan_py not available")
+
+    with pytest.raises(ValueError, match="deceleration_time_s must be <= 1.0"):
+        manyforge_roboplan_py.create_native_kernel(
+            "ur5_gripper",
+            "arm",
+            {
+                "operator_stop_profile": {
+                    "profile_id": "operator_spring_too_slow",
+                    "stop_mode": "spring_back_hold",
+                    "deceleration_time_s": 1.001,
+                }
+            },
+        )
+
+
+def test_create_native_kernel_rejects_non_finite_per_joint_deceleration_limit():
+    if not HAS_NATIVE:
+        pytest.skip("manyforge_roboplan_py not available")
+
+    with pytest.raises(ValueError, match="finite positive values"):
+        manyforge_roboplan_py.create_native_kernel(
+            "ur5_gripper",
+            "arm",
+            {
+                "operator_stop_profile": {
+                    "profile_id": "operator_soft_nan_joint_limit",
+                    "stop_mode": "soft_on_path",
+                    "deceleration_time_s": 0.5,
+                    "max_stop_time_s": 1.0,
+                    "per_joint_max_deceleration_rad_s2": {
+                        "shoulder_pan_joint": math.nan,
+                    },
+                }
+            },
+        )
+
+
+def test_create_native_kernel_rejects_unknown_stop_profile_fallback_mode():
+    if not HAS_NATIVE:
+        pytest.skip("manyforge_roboplan_py not available")
+
+    with pytest.raises(ValueError, match="allowed_fallback_modes"):
+        manyforge_roboplan_py.create_native_kernel(
+            "ur5_gripper",
+            "arm",
+            {
+                "operator_stop_profile": {
+                    "profile_id": "operator_soft_bad_fallback",
+                    "stop_mode": "soft_on_path",
+                    "deceleration_time_s": 0.5,
+                    "max_stop_time_s": 1.0,
+                    "per_joint_max_deceleration_rad_s2": {
+                        "shoulder_pan_joint": 8.0,
+                    },
+                    "allowed_fallback_modes": ["not_a_stop_mode"],
+                }
+            },
+        )
+
+
+def test_native_kernel_stop_capability_binding_reports_audit_fields():
+    if not HAS_NATIVE:
+        pytest.skip("manyforge_roboplan_py not available")
+
+    bundle = manyforge_roboplan_py.create_native_kernel("ur5_gripper", "arm")
+    capability = bundle.get_motion_interrupt_stop_capability()
+
+    assert capability["supported_stop_modes"] == [
+        "spring_back_hold",
+        "soft_on_path",
+    ]
+    assert capability["capability_profile_id"] == "roboplan_native_v2_soft_on_path"
+    assert capability["hard_stop_level"] == "native_immediate_hold"
+    assert capability["derivative_proof_level"] == "manyforge_core_native_path_ramp"
+    assert capability["scaling_source_visibility"] == "native_runtime_scale"
+    assert capability["scaling_source_probe_status"] == "not_applicable"
+    assert (
+        capability["unsupported_reasons"]["hard_deceleration"]
+        == "ros2_control_jtc_only_in_current_native_backend"
+    )
 
 
 def test_native_state_mapping_uses_stable_state_name_only():

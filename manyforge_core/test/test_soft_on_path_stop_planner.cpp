@@ -365,5 +365,57 @@ TEST(SoftOnPathStopPlannerTest,
   EXPECT_FALSE(envelope.error().details.contains("recommended_fallback"));
 }
 
+
+
+// --- Jerk-continuity of the stop ramp ---
+//
+// The directive: the stop trajectory must be acceleration- AND jerk-continuous
+// at the seam (r=0, matching the steady pre-stop traversal where path-time
+// accel and jerk are zero) and at the terminus (r=1, at rest). With the
+// minimum-jerk quintic time-scaling factor, both the path-time acceleration
+// and jerk vanish at r=0 and r=1, so the finite-difference jerk of the
+// generated joint trajectory tends to zero at both ends as the sampling
+// refines, and stays bounded throughout.
+TEST(SoftOnPathStopPlannerTest, RampIsAccelerationAndJerkContinuousAtSeamAndTerminus) {
+  auto profile = soft_profile(0.5);
+  profile.per_joint_max_deceleration_rad_s2 = {{"joint_1", 1000.0}};
+  profile.per_joint_max_deceleration_rad_s2["joint_2"] = 1000.0;
+  SoftOnPathInitialStateDTO state = measured_state_1d(0.2, 1.0);
+  SoftOnPathPlannerConfig config;
+  config.stop_traj_delta_s = 0.0;   // no handoff offset: r=0 sample is the seam
+  config.sample_period_s = 0.001;   // fine sampling for finite-difference checks
+  config.per_joint_max_jerk_rad_s3 = {{"joint_1", 1e9}};
+
+  auto planned = plan_soft_on_path_stop(linear_trajectory_1d(), profile, state, config);
+  ASSERT_TRUE(planned.ok()) << planned.error().message;
+  const auto& wps = planned.value().replacement_trajectory.waypoints;
+  ASSERT_GE(wps.size(), 4u);
+
+  // Endpoints: zero velocity AND zero acceleration at the terminus; the seam
+  // carries the incoming velocity and (for a straight path at steady rate)
+  // near-zero acceleration.
+  EXPECT_NEAR(wps.back().velocities_rad_s.at(0), 0.0, 1e-9);
+  EXPECT_NEAR(wps.back().accelerations_rad_s2.at(0), 0.0, 1e-9);
+  EXPECT_NEAR(wps.front().accelerations_rad_s2.at(0), 0.0, 1e-6);
+
+  // Finite-difference jerk across the ramp; assert it is bounded and that the
+  // first and last jerk samples (seam + terminus) are near zero — the property
+  // the cubic factor violated (it had |jerk| ~ const != 0 at the ends).
+  std::vector<double> jerk;
+  for (size_t i = 1; i < wps.size(); ++i) {
+    const double dt = wps[i].time_from_start_s - wps[i - 1].time_from_start_s;
+    if (dt <= 1e-9) continue;
+    jerk.push_back((wps[i].accelerations_rad_s2.at(0) -
+                    wps[i - 1].accelerations_rad_s2.at(0)) / dt);
+  }
+  ASSERT_GE(jerk.size(), 3u);
+  double max_abs_jerk = 0.0;
+  for (double j : jerk) max_abs_jerk = std::max(max_abs_jerk, std::abs(j));
+  EXPECT_LT(max_abs_jerk, 1e6);  // bounded
+  // Seam and terminus jerk → 0 (within a tolerance scaled by the fine dt).
+  EXPECT_LT(std::abs(jerk.front()), 0.05 * max_abs_jerk + 1e-6);
+  EXPECT_LT(std::abs(jerk.back()), 0.05 * max_abs_jerk + 1e-6);
+}
+
 }  // namespace
 }  // namespace manyforge::core

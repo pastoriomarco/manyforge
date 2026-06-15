@@ -217,6 +217,46 @@ def make_client(execute_duration_s: float = 0.0) -> TestClient:
     return TestClient(app)
 
 
+class _StopCapabilityBundle:
+    def __init__(self, payload: dict) -> None:
+        self.payload = payload
+        self.calls = 0
+
+    def get_motion_interrupt_stop_capability(self) -> dict:
+        self.calls += 1
+        return copy.deepcopy(self.payload)
+
+
+class _FlakyStopCapabilityBundle:
+    def __init__(self, payload: dict) -> None:
+        self.payload = payload
+        self.calls = 0
+
+    def get_motion_interrupt_stop_capability(self) -> dict:
+        self.calls += 1
+        if self.calls > 1:
+            raise RuntimeError("capability query unavailable")
+        return copy.deepcopy(self.payload)
+
+
+def _write_deployment_with_stop_profile(
+    tmp_path: Path,
+    *,
+    stop_mode: str,
+    profile_id: str | None = None,
+) -> str:
+    data = yaml.safe_load(Path(_DEPLOYMENT_PATH).read_text(encoding="utf-8"))
+    config = data["adapters"]["execution"].setdefault("config", {})
+    config["operator_stop_profile"] = {
+        "profile_id": profile_id or f"operator_{stop_mode}",
+        "stop_mode": stop_mode,
+        "deceleration_time_s": 0.5,
+    }
+    target = tmp_path / f"deployment_{stop_mode}.deployment.yaml"
+    target.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    return str(target)
+
+
 # =============================================================================
 # Cycle Control Tests
 # =============================================================================
@@ -2224,6 +2264,197 @@ def test_runtime_status_treats_native_viewer_as_render_ready_without_hmi(client)
     component_ids = {component["id"] for component in data["components"]}
     assert "native_viewer" in component_ids
     assert all(component_id != "legacy" + "_hmi" for component_id in component_ids)
+
+
+def test_runtime_status_reports_stop_capability_audit_fields_without_poll_requery(
+    tmp_path: Path,
+):
+    bundle = _StopCapabilityBundle({
+        "supported_stop_modes": ["spring_back_hold"],
+        "capability_profile_id": "test_stop_capability",
+        "hard_stop_level": "hard_deceleration",
+        "derivative_proof_level": "manyforge_core_sampled_path_ramp",
+        "scaling_source_visibility": "jtc_speed_scaling_input",
+        "scaling_source_probe_status": "live_probe_passed",
+        "unsupported_reasons": {
+            "soft_on_path": "soft_on_path_not_enabled",
+        },
+    })
+    state = ComposerState(
+        catalog_path=_CATALOG_PATH,
+        kernel=MockKernelClient(),
+        kernel_bundle=bundle,
+    )
+    app = create_app(state, security=_TEST_SECURITY)
+    deployment_path = _write_deployment_with_stop_profile(
+        tmp_path, stop_mode="spring_back_hold"
+    )
+
+    with TestClient(app) as local_client:
+        load = local_client.post(
+            "/api/program/load",
+            json={"path": _PROGRAM_PATH, "deployment_path": deployment_path},
+        )
+        assert load.status_code == 200, load.text
+        assert bundle.calls == 1
+
+        first = local_client.get("/api/runtime/status").json()
+        second = local_client.get("/api/runtime/status").json()
+        assert bundle.calls == 1
+        run = local_client.post("/api/cycle/run")
+
+    assert run.status_code == 200, run.text
+    assert bundle.calls == 2
+    assert first["supportedStopModes"] == ["spring_back_hold"]
+    assert first["configuredStopModes"] == {
+        "operator_stop_profile": "spring_back_hold"
+    }
+    assert first["stopCapabilityProfileId"] == "test_stop_capability"
+    assert first["hardStopLevel"] == "hard_deceleration"
+    assert first["derivativeProofLevel"] == "manyforge_core_sampled_path_ramp"
+    assert first["scalingSourceVisibility"] == "jtc_speed_scaling_input"
+    assert first["scalingSourceProbeStatus"] == "live_probe_passed"
+    assert first["backendUnsupportedStopReasons"] == {
+        "soft_on_path": "soft_on_path_not_enabled"
+    }
+    assert first["stopProfileUnsupported"] is False
+    assert second["stopCapabilityProfileId"] == "test_stop_capability"
+
+
+def test_stop_capability_query_failure_blocks_configured_profile(tmp_path: Path):
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=MockKernelClient())
+    app = create_app(state, security=_TEST_SECURITY)
+    deployment_path = _write_deployment_with_stop_profile(
+        tmp_path, stop_mode="spring_back_hold"
+    )
+
+    with TestClient(app) as local_client:
+        load = local_client.post(
+            "/api/program/load",
+            json={"path": _PROGRAM_PATH, "deployment_path": deployment_path},
+        )
+        assert load.status_code == 200, load.text
+
+        status = local_client.get("/api/runtime/status").json()
+        run = local_client.post("/api/cycle/run")
+
+    assert status["readiness"] == "degraded"
+    assert status["canExecute"] is False
+    assert status["stopCapabilityQueryFailed"] is True
+    assert status["stopProfileUnsupported"] is True
+    assert status["stopProfileUnsupportedReasons"] == [
+        {
+            "profile": "operator_stop_profile",
+            "stop_mode": "spring_back_hold",
+            "reason": "capability_query_failed",
+        }
+    ]
+    assert run.status_code == 409
+    assert run.json()["detail"]["errorCode"] == "stop_capability_query_failed"
+
+
+def test_stop_capability_accessor_throw_blocks_motion_arm(tmp_path: Path):
+    bundle = _FlakyStopCapabilityBundle({
+        "supported_stop_modes": ["spring_back_hold"],
+        "capability_profile_id": "test_flaky_capability",
+    })
+    state = ComposerState(
+        catalog_path=_CATALOG_PATH,
+        kernel=MockKernelClient(),
+        kernel_bundle=bundle,
+    )
+    app = create_app(state, security=_TEST_SECURITY)
+    deployment_path = _write_deployment_with_stop_profile(
+        tmp_path, stop_mode="spring_back_hold"
+    )
+
+    with TestClient(app) as local_client:
+        load = local_client.post(
+            "/api/program/load",
+            json={"path": _PROGRAM_PATH, "deployment_path": deployment_path},
+        )
+        assert load.status_code == 200, load.text
+        status = local_client.get("/api/runtime/status").json()
+        run = local_client.post("/api/cycle/run")
+
+    assert bundle.calls == 2
+    assert status["stopProfileUnsupported"] is False
+    assert run.status_code == 409
+    assert run.json()["detail"]["errorCode"] == "stop_capability_query_failed"
+
+
+def test_unsupported_stop_profile_blocks_direct_intervention(tmp_path: Path):
+    bundle = _StopCapabilityBundle({
+        "supported_stop_modes": ["spring_back_hold"],
+        "capability_profile_id": "test_spring_only",
+        "hard_stop_level": "jtc_cancel_unprofiled_hold",
+    })
+    state = ComposerState(
+        catalog_path=_CATALOG_PATH,
+        kernel=MockKernelClient(),
+        kernel_bundle=bundle,
+    )
+    app = create_app(state, security=_TEST_SECURITY)
+    deployment_path = _write_deployment_with_stop_profile(
+        tmp_path, stop_mode="hard_deceleration"
+    )
+
+    with TestClient(app) as local_client:
+        load = local_client.post(
+            "/api/program/load",
+            json={"path": _PROGRAM_PATH, "deployment_path": deployment_path},
+        )
+        assert load.status_code == 200, load.text
+        response = local_client.post(
+            "/api/direct/execute",
+            json={
+                "tree": {
+                    "id": "timer",
+                    "name": "blocked_direct_intervention",
+                    "params": {"duration_s": 0.01},
+                    "children": [],
+                },
+                "principalId": "operator",
+            },
+        )
+
+    assert response.status_code == 409
+    assert response.json()["error_code"] == "stop_profile_unsupported"
+
+
+def test_unsupported_stop_profile_blocks_direct_joint_jog(
+    tmp_path: Path,
+):
+    state = ComposerState(
+        catalog_path=_CATALOG_PATH,
+        kernel=MockKernelClient(),
+        kernel_bundle=_StopCapabilityBundle({
+            "supported_stop_modes": ["spring_back_hold"],
+            "capability_profile_id": "test_spring_only",
+        }),
+    )
+    app = create_app(state, security=_TEST_SECURITY)
+    deployment_path = _write_deployment_with_stop_profile(
+        tmp_path, stop_mode="hard_deceleration"
+    )
+
+    with TestClient(app) as local_client:
+        load = local_client.post(
+            "/api/program/load",
+            json={"path": _PROGRAM_PATH, "deployment_path": deployment_path},
+        )
+        assert load.status_code == 200, load.text
+        response = local_client.post(
+            "/api/direct/joint-jog",
+            json={
+                "jointNames": ["joint1"],
+                "jointPositionsRad": [0.1],
+                "principalId": "human:test-operator",
+            },
+        )
+
+    assert response.status_code == 409
+    assert response.json()["error_code"] == "stop_profile_unsupported"
 
 
 def test_runtime_status_classifies_unknown_kernel_status_as_fault(client, monkeypatch):

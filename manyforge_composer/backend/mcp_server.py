@@ -401,6 +401,15 @@ def create_mcp_server(state: ComposerState):
             return json.dumps({"error": "No program loaded"})
 
         if command == "run":
+            # Fail closed: same stop-capability gate as POST /api/cycle/run, so
+            # the MCP control surface cannot arm a program whose configured stop
+            # profile the backend can't honor.
+            stop_block = state.motion_arm_admission_block_reason()
+            if stop_block:
+                return json.dumps({
+                    "error": stop_block["message"],
+                    "error_code": stop_block["error_code"],
+                })
             override_status = state.runtime_override_status()
             if (
                 state.cycle_manager.state.value == "stopped"
@@ -627,6 +636,13 @@ def create_mcp_server(state: ComposerState):
                         ],
                     }
                 )
+
+            stop_block = state.motion_arm_admission_block_reason()
+            if stop_block:
+                return json.dumps({
+                    "error": stop_block["message"],
+                    "error_code": stop_block["error_code"],
+                })
 
             parent_run_id = state.event_recorder.current_run_id
             if parent_run_id is None and state.cycle_manager.state.value == "stopped":

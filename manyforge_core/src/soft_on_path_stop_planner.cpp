@@ -332,16 +332,51 @@ TrajectoryDTO make_two_point_trajectory(
   return trajectory;
 }
 
+// Time-scaling ramp factors for the stop, on the normalized ramp parameter
+// r in [0, 1]. The ramp slows the path-time rate u̇ from path_time_rate
+// (steady traversal) to 0:
+//
+//   u̇(r)  = path_time_rate · ramp_velocity_factor(r)
+//   ü(r)  = (path_time_rate / ramp_s) · ramp_acceleration_factor(r)
+//   u(r)  = handoff + path_time_rate · ramp_s · ramp_position_factor(r)
+//
+// where ramp_acceleration_factor = d/dr(ramp_velocity_factor) and
+// ramp_position_factor = ∫ ramp_velocity_factor.
+//
+// The velocity factor is the minimum-jerk quintic v(r) = 1 − 10r³ + 15r⁴ − 6r⁵
+// (= 1 − smootherstep(r)). Its boundary conditions give an
+// acceleration-AND-jerk-continuous stop at both the seam and the terminus:
+//
+//   v(0) = 1, v(1) = 0                       full incoming rate → rest
+//   v'(0) = v'(1) = 0   → accel = 0 at both ends (continuous with the steady
+//                          ü = 0 before the seam; zero at rest)
+//   v''(0) = v''(1) = 0 → jerk  = 0 at both ends (continuous with the steady
+//                          u⃛ = 0 before the seam; zero at rest)
+//
+// The earlier cubic factor (1 − 3r² + 2r³) was acceleration-continuous but
+// left a nonzero path-time jerk (v'' = −6 + 12r ≠ 0) at the endpoints — a jerk
+// step at the preemption seam that propagated to every joint through the
+// chain rule. The quintic removes it. ramp_position_factor(1) = 0.5 is
+// unchanged and correct: a deceleration from full rate to rest covers half
+// the constant-rate path distance.
 double ramp_position_factor(double r) {
-  return r - r * r * r + 0.5 * r * r * r * r;
+  // ∫₀ʳ (1 − 10s³ + 15s⁴ − 6s⁵) ds = r − 2.5r⁴ + 3r⁵ − r⁶
+  const double r2 = r * r;
+  const double r4 = r2 * r2;
+  return r - 2.5 * r4 + 3.0 * r4 * r - r4 * r2;
 }
 
 double ramp_velocity_factor(double r) {
-  return 1.0 - 3.0 * r * r + 2.0 * r * r * r;
+  // 1 − 10r³ + 15r⁴ − 6r⁵
+  const double r2 = r * r;
+  const double r3 = r2 * r;
+  return 1.0 - 10.0 * r3 + 15.0 * r3 * r - 6.0 * r3 * r2;
 }
 
 double ramp_acceleration_factor(double r) {
-  return -6.0 * r + 6.0 * r * r;
+  // d/dr(velocity factor) = −30r² + 60r³ − 30r⁴ = −30 r² (r − 1)²
+  const double r2 = r * r;
+  return -30.0 * r2 + 60.0 * r2 * r - 30.0 * r2 * r2;
 }
 
 }  // namespace

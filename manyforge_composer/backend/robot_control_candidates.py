@@ -2425,6 +2425,17 @@ def create_robot_control_candidates_router(state: ComposerState) -> APIRouter:
         if not store.contains(candidate_id):
             raise HTTPException(status_code=404, detail="candidate not found")
 
+        stop_block = state.motion_arm_admission_block_reason()
+        if stop_block:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "reasonCode": stop_block["error_code"],
+                    "detail": stop_block["message"],
+                    "timestamp_ns": time.monotonic_ns(),
+                },
+            )
+
         current = _compute_planning_snapshot(state)
         stored, snapshot_view = store.begin_approval(candidate_id, current)
         if stored is None:

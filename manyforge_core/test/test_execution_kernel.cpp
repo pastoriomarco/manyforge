@@ -384,11 +384,17 @@ class MockExecution : public IExecutionBackend {
   /// Test backend declares spring_back_hold + hard_deceleration as
   /// supported. Individual tests may further customize via the
   /// `motion_interrupt_stop_capability` field.
-  MotionInterruptStopCapabilityDTO motion_interrupt_stop_capability{
-      {MotionInterruptStopMode::kSpringBackHold,
-       MotionInterruptStopMode::kHardDeceleration},
-      std::string{"mock_backend_capability"},
-      std::nullopt};
+  MotionInterruptStopCapabilityDTO motion_interrupt_stop_capability = [] {
+    MotionInterruptStopCapabilityDTO cap;
+    cap.supported_stop_modes = {MotionInterruptStopMode::kSpringBackHold,
+                                MotionInterruptStopMode::kHardDeceleration};
+    cap.capability_profile_id = "mock_backend_capability";
+    cap.hard_stop_level = "mock_hard_stop";
+    cap.derivative_proof_level = "mock_derivative_proof";
+    cap.scaling_source_visibility = "mock_scaling_visibility";
+    cap.scaling_source_probe_status = "mock_scaling_probe";
+    return cap;
+  }();
 
   MotionInterruptStopCapabilityDTO
   get_motion_interrupt_stop_capability() const override {
@@ -560,11 +566,17 @@ class ControlledExecution : public IExecutionBackend {
   /// Controlled-stop capability for trip tests using
   /// ControlledExecution. Mirrors MockExecution; individual tests
   /// may shrink the set to exercise capability-gate rejection.
-  MotionInterruptStopCapabilityDTO motion_interrupt_stop_capability{
-      {MotionInterruptStopMode::kSpringBackHold,
-       MotionInterruptStopMode::kHardDeceleration},
-      std::string{"controlled_backend_capability"},
-      std::nullopt};
+  MotionInterruptStopCapabilityDTO motion_interrupt_stop_capability = [] {
+    MotionInterruptStopCapabilityDTO cap;
+    cap.supported_stop_modes = {MotionInterruptStopMode::kSpringBackHold,
+                                MotionInterruptStopMode::kHardDeceleration};
+    cap.capability_profile_id = "controlled_backend_capability";
+    cap.hard_stop_level = "mock_hard_stop";
+    cap.derivative_proof_level = "mock_derivative_proof";
+    cap.scaling_source_visibility = "mock_scaling_visibility";
+    cap.scaling_source_probe_status = "mock_scaling_probe";
+    return cap;
+  }();
 
   MotionInterruptStopCapabilityDTO
   get_motion_interrupt_stop_capability() const override {
@@ -3430,7 +3442,8 @@ TEST_F(ExecutionKernelTest,
   configure_authoritative_collision_validation(local_kernel, local_publisher,
                                                 local_engine);
   controlled_execution.motion_interrupt_stop_capability.supported_stop_modes =
-      {MotionInterruptStopMode::kSpringBackHold};
+      {MotionInterruptStopMode::kSpringBackHold,
+       MotionInterruptStopMode::kSoftOnPath};
   // Backend refuses the controlled-stop (e.g. capability mismatch).
   ControlledStopResultDTO refused;
   refused.accepted = false;
@@ -3732,6 +3745,9 @@ TEST_F(ExecutionKernelTest,
   auto local_engine = std::make_shared<MockCollisionEngine>();
   configure_authoritative_collision_validation(local_kernel, local_publisher,
                                                 local_engine);
+  controlled_execution.motion_interrupt_stop_capability.supported_stop_modes =
+      {MotionInterruptStopMode::kSpringBackHold,
+       MotionInterruptStopMode::kSoftOnPath};
 
   // Calling stop() while Idle must not invoke the operator controlled-stop
   // profile and must not poison the one-shot backend-stop skip flag. The next
@@ -6775,6 +6791,84 @@ TEST_F(ExecutionKernelTest,
   EXPECT_EQ(outcome->error->code, kErrorMotionInterruptArmFailed);
   EXPECT_EQ(outcome->error->details.at("reason"),
             "fallback_mode_not_supported_by_backend");
+}
+
+TEST_F(ExecutionKernelTest,
+       Execute_OperatorStopProfileRejectsUnsupportedBackendMode) {
+  execution.motion_interrupt_stop_capability.supported_stop_modes = {
+      MotionInterruptStopMode::kSpringBackHold};
+
+  MotionInterruptStopProfileDTO op_profile;
+  op_profile.profile_id = "operator_hard_decel";
+  op_profile.stop_mode = MotionInterruptStopMode::kHardDeceleration;
+  ExecutionKernelConfig config;
+  config.operator_stop_profile =
+      std::make_shared<MotionInterruptStopProfileDTO>(op_profile);
+
+  FakeClock local_clock;
+  ManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  ExecutionKernel local_kernel{
+      planner, context, execution, local_clock, local_scheduler, local_cache,
+      config};
+  configure_authoritative_collision_validation(
+      local_kernel, collision_world_publisher, collision_engine);
+
+  const int execute_calls_before = execution.execute_count;
+  auto result = local_kernel.execute(make_test_request("operator_cap_drop"));
+  ASSERT_TRUE(result.ok());
+  local_kernel.wait_for_completion();
+
+  EXPECT_EQ(local_kernel.get_status().state, ExecutionState::kFailed);
+  EXPECT_EQ(execution.execute_count, execute_calls_before);
+  auto outcome = local_kernel.get_execution_outcome(result.value());
+  ASSERT_TRUE(outcome.has_value());
+  ASSERT_TRUE(outcome->error.has_value());
+  EXPECT_EQ(outcome->error->code, kErrorMotionInterruptArmFailed);
+  EXPECT_EQ(outcome->error->details.at("reason"),
+            "stop_mode_not_supported_by_backend");
+  EXPECT_EQ(outcome->error->details.at("profile_slot"),
+            "operator_stop_profile");
+}
+
+TEST_F(ExecutionKernelTest,
+       Execute_DefaultFaultStopProfileRejectsUnsupportedFallbackMode) {
+  execution.motion_interrupt_stop_capability.supported_stop_modes = {
+      MotionInterruptStopMode::kSpringBackHold};
+
+  MotionInterruptStopProfileDTO fault_profile;
+  fault_profile.profile_id = "fault_spring_with_hard_fallback";
+  fault_profile.stop_mode = MotionInterruptStopMode::kSpringBackHold;
+  fault_profile.allowed_fallback_modes = {
+      MotionInterruptStopMode::kHardDeceleration};
+  ExecutionKernelConfig config;
+  config.default_fault_stop_profile =
+      std::make_shared<MotionInterruptStopProfileDTO>(fault_profile);
+
+  FakeClock local_clock;
+  ManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  ExecutionKernel local_kernel{
+      planner, context, execution, local_clock, local_scheduler, local_cache,
+      config};
+  configure_authoritative_collision_validation(
+      local_kernel, collision_world_publisher, collision_engine);
+
+  const int execute_calls_before = execution.execute_count;
+  auto result = local_kernel.execute(make_test_request("fault_fallback_drop"));
+  ASSERT_TRUE(result.ok());
+  local_kernel.wait_for_completion();
+
+  EXPECT_EQ(local_kernel.get_status().state, ExecutionState::kFailed);
+  EXPECT_EQ(execution.execute_count, execute_calls_before);
+  auto outcome = local_kernel.get_execution_outcome(result.value());
+  ASSERT_TRUE(outcome.has_value());
+  ASSERT_TRUE(outcome->error.has_value());
+  EXPECT_EQ(outcome->error->code, kErrorMotionInterruptArmFailed);
+  EXPECT_EQ(outcome->error->details.at("reason"),
+            "fallback_mode_not_supported_by_backend");
+  EXPECT_EQ(outcome->error->details.at("profile_slot"),
+            "default_fault_stop_profile");
 }
 
 TEST_F(ExecutionKernelTest,
