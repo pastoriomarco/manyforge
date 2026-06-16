@@ -5,7 +5,7 @@ description: 'Isaac Sim light-scene reproduction for UR10e + Robotiq 2F-140: rob
   base pose and selected table/object meshes are authored from the live Isaac scene.
   The pick-and-place behavior tree is adapted from the known-good Robotiq demo and
   targets the Isaac cheese box instead of the legacy graspable.'
-catalog_version: "0.2.0"
+catalog_version: 0.2.0
 robot:
   robot_id: ur10e
   group_id: arm
@@ -120,230 +120,259 @@ parameters:
     min_exclusive: 0
     max_inclusive: 1
   description: Velocity scale for all moves.
+saved_with_deployment:
+  name: isaac_manipulator_scene_light_ros2_control
+  source_path: /workspace/examples/isaac_manipulator_scene_light_ros2_control.deployment.yaml
+  content_sha256: 3be6b792aeb4d4c6e1bb6e33f6371270d02e5c6680ce36dc4aea7837c5de1b92
 tree:
-  id: sequence
-  name: pick_and_place
+  id: repeat
+  name: repeat
+  params:
+    num_cycles: -1
   children:
-  - id: command_gripper
-    name: command_gripper
-    params:
-      gripper_id: primary
-      position: 0
-      max_effort: 40
-      duration_s: 1
-      timeout_s: 0
-  - id: move_manipulator_action
-    name: move_to_pick_approach
-    params:
-      move_id: pick_approach
-      motion_type: relative_move
-      relative_move:
-        target_reference:
-          type: object
-          id: isaac_cheese_box
-        offset:
-          position_m:
-          - 0
-          - 0
-          - 0.2
-          orientation_rpy_deg:
-          - 180
-          - 0
-          - 180
-        offset_reference:
-          type: frame
-          id: base_link
-      velocity_scale: ${param:velocity_scale}
-      planning_timeout_s: 10
-      execution_timeout_s: 30
-  - id: move_manipulator_action
-    name: move_to_pick
-    params:
-      move_id: pick_down
-      motion_type: relative_move
-      relative_move:
-        target_reference:
-          type: object
-          id: isaac_cheese_box
-        offset:
-          position_m:
-          - 0
-          - 0
-          - 0.08
-          orientation_rpy_deg:
-          - 180
-          - 0
-          - 180
-        offset_reference:
-          type: frame
-          id: base_link
-      velocity_scale: ${param:velocity_scale}
-      planning_timeout_s: 10
-      execution_timeout_s: 30
   - id: sequence
-    name: gripper_close_sequence
+    name: sequence
     children:
-    - id: command_gripper
-      name: close_gripper
+    - id: set_simulation_state
+      name: set_simulation_state
       params:
-        gripper_id: primary
-        position: 0.55
-        max_effort: 40
-        duration_s: 1
-        timeout_s: 0
+        state: playing
+        reason: ''
     - id: timer
-      name: attach_timer
+      name: timer
       params:
-        duration_s: 0.5
-    - id: attach_object_to_link
-      name: attach_cheese_box
+        duration_s: 1
+    - id: sequence
+      name: pick_and_place
+      children:
+      - id: command_gripper
+        name: command_gripper
+        params:
+          gripper_id: primary
+          position: 0
+          max_effort: 40
+          duration_s: 1
+          timeout_s: 0
+      - id: move_manipulator_action
+        name: move_to_pick_approach
+        params:
+          move_id: pick_approach
+          motion_type: relative_move
+          relative_move:
+            target_reference:
+              type: object
+              id: isaac_cheese_box
+            offset:
+              position_m:
+              - 0
+              - 0
+              - 0.2
+              orientation_rpy_deg:
+              - 180
+              - 0
+              - 180
+            offset_reference:
+              type: frame
+              id: base_link
+          velocity_scale: ${param:velocity_scale}
+          planning_timeout_s: 10
+          execution_timeout_s: 30
+      - id: move_manipulator_action
+        name: move_to_pick
+        params:
+          move_id: pick_down
+          motion_type: relative_move
+          relative_move:
+            target_reference:
+              type: object
+              id: isaac_cheese_box
+            offset:
+              position_m:
+              - 0
+              - 0
+              - 0.08
+              orientation_rpy_deg:
+              - 180
+              - 0
+              - 180
+            offset_reference:
+              type: frame
+              id: base_link
+          velocity_scale: ${param:velocity_scale}
+          planning_timeout_s: 10
+          execution_timeout_s: 30
+      - id: sequence
+        name: gripper_close_sequence
+        children:
+        - id: command_gripper
+          name: close_gripper
+          params:
+            gripper_id: primary
+            position: 0.55
+            max_effort: 40
+            duration_s: 1
+            timeout_s: 0
+        - id: timer
+          name: attach_timer
+          params:
+            duration_s: 0.5
+        - id: attach_object_to_link
+          name: attach_cheese_box
+          params:
+            object_id: isaac_cheese_box
+            link_frame: grasp_frame
+            gripper_id: primary
+      - id: move_manipulator_action
+        name: pick_retreat
+        params:
+          move_id: pick_retreat
+          motion_type: relative_move
+          relative_move:
+            target_reference:
+              type: robot_link
+              id: grasp_frame
+            offset:
+              position_m:
+              - 0
+              - 0
+              - -0.2
+              orientation_rpy_deg:
+              - 0
+              - 0
+              - 0
+          velocity_scale: ${param:velocity_scale}
+          planning_timeout_s: 10
+          execution_timeout_s: 30
+      - id: move_manipulator_action
+        name: move_to_drop_approach
+        params:
+          move_id: drop_approach
+          motion_type: relative_move
+          relative_move:
+            target_reference:
+              type: object
+              id: isaac_small_KLT
+            offset:
+              position_m:
+              - 0
+              - 0
+              - 0.4
+              orientation_rpy_deg:
+              - 180
+              - 0
+              - 180
+            offset_reference:
+              type: frame
+              id: base_link
+          velocity_scale: ${param:velocity_scale}
+          planning_timeout_s: 10
+          execution_timeout_s: 30
+      - id: move_manipulator_action
+        name: move_to_drop
+        params:
+          move_id: drop_down
+          motion_type: relative_move
+          pose_goal:
+            frame_id: base_link
+            position_m:
+            - 0.3
+            - 0.3
+            - 0.05
+            orientation_rpy_deg:
+            - 180
+            - 0
+            - -180
+          velocity_scale: ${param:velocity_scale}
+          planning_timeout_s: 10
+          execution_timeout_s: 30
+          joint_position_tol_rad: 0.05
+          relative_move:
+            target_reference:
+              type: object
+              id: isaac_small_KLT
+            offset:
+              position_m:
+              - 0
+              - 0
+              - 0.25
+              orientation_rpy_deg:
+              - 180
+              - 0
+              - 180
+            offset_reference:
+              type: frame
+              id: base_link
+      - id: sequence
+        name: gripper_open_sequence
+        children:
+        - id: detach_object_from_link
+          name: detach_cheese_box
+          params:
+            object_id: isaac_cheese_box
+            link_frame: grasp_frame
+        - id: timer
+          name: detach_timer
+          params:
+            duration_s: 1
+        - id: command_gripper
+          name: open_gripper
+          params:
+            gripper_id: primary
+            position: 0
+            max_effort: 40
+            duration_s: 1
+            timeout_s: 0
+      - id: move_manipulator_action
+        name: drop_retreat
+        params:
+          move_id: drop_retreat
+          motion_type: relative_move
+          relative_move:
+            target_reference:
+              type: object
+              id: isaac_small_KLT
+            offset:
+              position_m:
+              - 0
+              - 0
+              - 0.4
+              orientation_rpy_deg:
+              - 180
+              - 0
+              - 180
+            offset_reference:
+              type: frame
+              id: base_link
+          velocity_scale: ${param:velocity_scale}
+          planning_timeout_s: 10
+          execution_timeout_s: 30
+      - id: move_manipulator_action
+        name: return_rest
+        params:
+          move_id: return_rest
+          motion_type: joint_goal
+          joint_goal_names:
+          - shoulder_pan_joint
+          - shoulder_lift_joint
+          - elbow_joint
+          - wrist_1_joint
+          - wrist_2_joint
+          - wrist_3_joint
+          joint_goal_positions_rad:
+          - 2.63422544
+          - -0.875980752
+          - 1.551074106
+          - -2.29231544
+          - -1.560498884
+          - -2.038544566
+          velocity_scale: ${param:velocity_scale}
+          planning_timeout_s: 10
+          execution_timeout_s: 30
+    - id: reset_simulation
+      name: reset_simulation
       params:
-        object_id: isaac_cheese_box
-        link_frame: grasp_frame
-        gripper_id: primary
-  - id: move_manipulator_action
-    name: pick_retreat
-    params:
-      move_id: pick_retreat
-      motion_type: relative_move
-      relative_move:
-        target_reference:
-          type: robot_link
-          id: grasp_frame
-        offset:
-          position_m:
-          - 0
-          - 0
-          - -0.2
-          orientation_rpy_deg:
-          - 0
-          - 0
-          - 0
-      velocity_scale: ${param:velocity_scale}
-      planning_timeout_s: 10
-      execution_timeout_s: 30
-  - id: move_manipulator_action
-    name: move_to_drop_approach
-    params:
-      move_id: drop_approach
-      motion_type: relative_move
-      relative_move:
-        target_reference:
-          type: object
-          id: isaac_small_KLT
-        offset:
-          position_m:
-          - 0
-          - 0
-          - 0.4
-          orientation_rpy_deg:
-          - 180
-          - 0
-          - 180
-        offset_reference:
-          type: frame
-          id: base_link
-      velocity_scale: ${param:velocity_scale}
-      planning_timeout_s: 10
-      execution_timeout_s: 30
-  - id: move_manipulator_action
-    name: move_to_drop
-    params:
-      move_id: drop_down
-      motion_type: relative_move
-      pose_goal:
-        frame_id: base_link
-        position_m:
-        - 0.3
-        - 0.3
-        - 0.05
-        orientation_rpy_deg:
-        - 180
-        - 0
-        - -180
-      velocity_scale: ${param:velocity_scale}
-      planning_timeout_s: 10
-      execution_timeout_s: 30
-      joint_position_tol_rad: 0.05
-      relative_move:
-        target_reference:
-          type: object
-          id: isaac_small_KLT
-        offset:
-          position_m:
-          - 0
-          - 0
-          - 0.25
-          orientation_rpy_deg:
-          - 180
-          - 0
-          - 180
-        offset_reference:
-          type: frame
-          id: base_link
-  - id: sequence
-    name: gripper_open_sequence
-    children:
-    - id: detach_object_from_link
-      name: detach_cheese_box
-      params:
-        object_id: isaac_cheese_box
-        link_frame: grasp_frame
+        reason: ''
     - id: timer
-      name: detach_timer
+      name: reset_timer
       params:
-        duration_s: 1
-    - id: command_gripper
-      name: open_gripper
-      params:
-        gripper_id: primary
-        position: 0
-        max_effort: 40
-        duration_s: 1
-        timeout_s: 0
-  - id: move_manipulator_action
-    name: drop_retreat
-    params:
-      move_id: drop_retreat
-      motion_type: relative_move
-      relative_move:
-        target_reference:
-          type: object
-          id: isaac_small_KLT
-        offset:
-          position_m:
-          - 0
-          - 0
-          - 0.4
-          orientation_rpy_deg:
-          - 180
-          - 0
-          - 180
-        offset_reference:
-          type: frame
-          id: base_link
-      velocity_scale: ${param:velocity_scale}
-      planning_timeout_s: 10
-      execution_timeout_s: 30
-  - id: move_manipulator_action
-    name: return_rest
-    params:
-      move_id: return_rest
-      motion_type: joint_goal
-      joint_goal_names:
-      - shoulder_pan_joint
-      - shoulder_lift_joint
-      - elbow_joint
-      - wrist_1_joint
-      - wrist_2_joint
-      - wrist_3_joint
-      joint_goal_positions_rad:
-      - 2.63422544
-      - -0.875980752
-      - 1.551074106
-      - -2.29231544
-      - -1.560498884
-      - -2.038544566
-      velocity_scale: ${param:velocity_scale}
-      planning_timeout_s: 10
-      execution_timeout_s: 30
+        duration_s: 3

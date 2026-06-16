@@ -2309,6 +2309,9 @@ def test_runtime_status_reports_stop_capability_audit_fields_without_poll_requer
     assert first["configuredStopModes"] == {
         "operator_stop_profile": "spring_back_hold"
     }
+    assert first["configuredStopDecelerationTimes"] == {
+        "operator_stop_profile": 0.5
+    }
     assert first["stopCapabilityProfileId"] == "test_stop_capability"
     assert first["hardStopLevel"] == "hard_deceleration"
     assert first["derivativeProofLevel"] == "manyforge_core_sampled_path_ramp"

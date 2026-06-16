@@ -147,4 +147,17 @@ core::ErrorDTO make_ros2_control_fault_error(
       std::string(core::to_string(code)), std::move(message), std::move(details)};
 }
 
+core::SoftOnPathStateSource resolve_soft_on_path_anchor_velocity_source(
+    const Ros2ControlExecutionBackendConfig& config,
+    bool has_measured_velocity) {
+  const bool is_commanded_sim =
+      config.execution_state_source_mode == "commanded_sim";
+  const bool prefer_model =
+      config.prefer_model_anchor_velocity.value_or(is_commanded_sim);
+  if (!prefer_model && has_measured_velocity) {
+    return core::SoftOnPathStateSource::kMeasuredFeedback;
+  }
+  return core::SoftOnPathStateSource::kModelDerived;
+}
+
 }  // namespace manyforge::roboplan_backend

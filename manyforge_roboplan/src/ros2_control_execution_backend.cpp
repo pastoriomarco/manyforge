@@ -2179,6 +2179,30 @@ Ros2ControlExecutionBackend::execute_controlled_stop(
   const auto execute_soft_on_path_spring_back_fallback =
       [&](std::string reason,
           std::optional<core::ErrorDTO> cause = std::nullopt) {
+        // A requested soft_on_path operator stop is being refused and
+        // downgraded to a spring-back hold. This escalation MUST be loudly
+        // observable, not silent: log the planner error code plus EVERY
+        // structured detail (joint, measured jerk/accel, the limit it broke,
+        // recommended disposition) so the disposition is fully traceable in
+        // operator logs, not only buried on the event stream.
+        std::string cause_code;
+        std::string cause_details_str;
+        if (cause.has_value()) {
+          cause_code = cause->code;
+          for (const auto& [detail_key, detail_value] : cause->details) {
+            if (!cause_details_str.empty()) {
+              cause_details_str += " ";
+            }
+            cause_details_str += detail_key;
+            cause_details_str += "=";
+            cause_details_str += detail_value;
+          }
+        }
+        RCLCPP_WARN(
+            node_->get_logger(),
+            "controlled-stop ESCALATION: soft_on_path -> spring_back_hold "
+            "(fallback_reason=%s cause_code=%s cause_details=[%s])",
+            reason.c_str(), cause_code.c_str(), cause_details_str.c_str());
         core::MotionInterruptStopProfileDTO fallback_profile = profile;
         fallback_profile.stop_mode =
             core::MotionInterruptStopMode::kSpringBackHold;
@@ -2253,11 +2277,20 @@ Ros2ControlExecutionBackend::execute_controlled_stop(
     initial.runtime_velocity_scale_at_trip = active_runtime_scale;
     initial.sample_age_ns = static_cast<std::int64_t>(
         std::max(0.0, observed_sample_age_s) * 1e9);
-    if (observed_velocities.size() == joint_names.size()) {
+    // Anchor velocity source per the per-lane authority
+    // (resolve_soft_on_path_anchor_velocity_source): on the commanded-sim lane the
+    // reported feedback velocity is decoupled from the commanded motion (it can be
+    // opposite-signed), so anchoring the seam on it sign-flips the command. The
+    // trajectory model (path tangent x runtime scale) reproduces the commanded
+    // velocity, giving a continuous seam. A lane with faithful velocity feedback
+    // can force measured feedback via the config.
+    const bool has_measured_velocity =
+        observed_velocities.size() == joint_names.size();
+    initial.velocity_source = resolve_soft_on_path_anchor_velocity_source(
+        config_, has_measured_velocity);
+    if (initial.velocity_source ==
+        core::SoftOnPathStateSource::kMeasuredFeedback) {
       initial.state.velocities_rad_s = observed_velocities;
-      initial.velocity_source = core::SoftOnPathStateSource::kMeasuredFeedback;
-    } else {
-      initial.velocity_source = core::SoftOnPathStateSource::kModelDerived;
     }
 
     core::SoftOnPathPlannerConfig planner_config;
@@ -2271,7 +2304,8 @@ Ros2ControlExecutionBackend::execute_controlled_stop(
         config_.soft_on_path_max_jerk_rad_s3;
     planner_config.allow_model_velocity_fallback =
         config_.allow_soft_on_path_model_velocity_fallback ||
-        is_commanded_sim_mode();
+        is_commanded_sim_mode() ||
+        initial.velocity_source == core::SoftOnPathStateSource::kModelDerived;
 
     auto planned = core::plan_soft_on_path_stop(
         active_trajectory, profile, initial, planner_config);

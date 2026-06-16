@@ -170,20 +170,21 @@ class MoveManipulatorAction(py_trees.behaviour.Behaviour):
         if stop_requested:
             return py_trees.common.Status.RUNNING  # block, don't start new motion
 
-        # Soft-fail handling: if a previous tick captured a kernel failure,
-        # hold RUNNING until the operator's resume signal arrives. The
-        # cycle manager sets resume_after_error_requested when the
-        # operator clicks Run after a soft-fail; the flag is consumed
-        # here and the motion is re-issued on the next pass.
-        if self._soft_fail_error is not None:
-            resume_requested = self._read_optional_blackboard_value(
-                "resume_after_error_requested"
-            )
-            if resume_requested:
-                self._clear_soft_fail_state()
-                # Fall through and re-execute with a fresh goal.
-            else:
-                return py_trees.common.Status.RUNNING
+        # Resume handling. The cycle manager sets resume_after_error_requested on
+        # Run from STOPPED — after either a collision soft-fail or a plain operator
+        # stop, both of which leave our owned execution terminal in the kernel. In
+        # either case we re-dispatch the goal from fresh state rather than
+        # re-reading the prior (failed/stopped) execution, which would re-surface
+        # its terminal cause ("Motion execution ended in stopped"). Without the
+        # signal a captured soft-fail keeps holding RUNNING until the operator acts.
+        resume_requested = self._read_optional_blackboard_value(
+            "resume_after_error_requested"
+        )
+        if resume_requested:
+            self._clear_soft_fail_state()
+            # Fall through and re-execute with a fresh goal.
+        elif self._soft_fail_error is not None:
+            return py_trees.common.Status.RUNNING
 
         # This is the authored per-move planning/execution scale. The viewer runtime
         # velocity slider is a separate live control surface: CycleManager forwards

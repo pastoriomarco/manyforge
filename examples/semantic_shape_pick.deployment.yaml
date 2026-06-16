@@ -69,13 +69,13 @@ adapters:
       initial_joint_positions_rad: [0.0, -1.57, 1.57, -1.57, -1.57, 0.0]
       # Industrial controlled stop: the
       # operator Stop button decelerates along the current path with a
-      # jerk-continuous 0.5 s ramp, falling back to spring-back hold if the
+      # jerk-continuous 2.0 s ramp, falling back to spring-back hold if the
       # path is too short to ramp. per_joint_max_deceleration_rad_s2 bounds
       # the decel; soft_on_path jerk limits auto-default from accel + ramp.
       operator_stop_profile:
         profile_id: "operator_soft_on_path"
         stop_mode: "soft_on_path"
-        deceleration_time_s: 0.5
+        deceleration_time_s: 2.0
         allowed_fallback_modes: ["spring_back_hold"]
         per_joint_max_deceleration_rad_s2:
           shoulder_pan_joint: 10.0
@@ -87,7 +87,7 @@ adapters:
       default_fault_stop_profile:
         profile_id: "default_fault_spring_back"
         stop_mode: "spring_back_hold"
-        deceleration_time_s: 0.5
+        deceleration_time_s: 2.0
 
 orchestrator:
   engine: py_trees

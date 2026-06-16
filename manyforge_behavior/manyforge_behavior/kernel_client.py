@@ -12,7 +12,7 @@ import time
 from typing import Any, Deque, Dict, List, Optional
 
 
-MAX_CONTROLLED_STOP_DECELERATION_TIME_S = 1.0
+MAX_CONTROLLED_STOP_DECELERATION_TIME_S = 2.0
 _STOP_MODES = {"spring_back_hold", "soft_on_path", "hard_deceleration"}
 
 

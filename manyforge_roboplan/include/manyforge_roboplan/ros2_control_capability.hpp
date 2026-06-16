@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 
+#include <manyforge_core/motion_interrupt/soft_on_path_stop_planner.hpp>
 #include <manyforge_core/types/error_code.hpp>
 #include <manyforge_core/types/motion_interrupt.hpp>
 
@@ -76,6 +77,14 @@ struct Ros2ControlExecutionBackendConfig {
   std::optional<double> soft_on_path_max_initial_velocity_deviation_rad_s;
   std::map<std::string, double> soft_on_path_max_jerk_rad_s3;
   bool allow_soft_on_path_model_velocity_fallback = false;
+  // Anchor the soft-stop seam velocity on the trajectory model (path tangent x
+  // runtime scale) rather than measured feedback. Unset = auto: prefer the model
+  // on the commanded-sim lane, where the reported feedback velocity is decoupled
+  // from the commanded motion (it can be opposite-signed) and anchoring on it
+  // sign-flips the seam; prefer measured feedback otherwise. Set explicitly to
+  // force a lane's choice (e.g. feedback-first on a real robot with faithful
+  // velocity feedback).
+  std::optional<bool> prefer_model_anchor_velocity;
 
   // Production-disabled scaffold. When true and the production
   // path-ramp gate above is not active, the backend advertises `kSoftOnPath`
@@ -90,6 +99,17 @@ struct Ros2ControlExecutionBackendConfig {
 core::MotionInterruptStopCapabilityDTO
 compute_ros2_control_motion_interrupt_stop_capability(
     const Ros2ControlExecutionBackendConfig& config);
+
+/// Resolve which state source feeds the `soft_on_path` seam anchor's velocity,
+/// per the per-lane anchor-state authority. Returns `kMeasuredFeedback` only
+/// when measured velocity is present AND the lane is not configured to prefer
+/// the model; otherwise `kModelDerived` (the planner then derives the velocity
+/// from the trajectory tangent x runtime scale). `prefer_model_anchor_velocity`
+/// defaults to true on the commanded-sim lane, where reported feedback velocity
+/// is decoupled from the commanded motion. Pure (no ROS) so it is unit-testable.
+core::SoftOnPathStateSource resolve_soft_on_path_anchor_velocity_source(
+    const Ros2ControlExecutionBackendConfig& config,
+    bool has_measured_velocity);
 
 namespace ros2_control_fault_reason {
 inline constexpr const char* kActionServerUnavailable =

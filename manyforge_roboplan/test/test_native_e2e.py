@@ -116,7 +116,7 @@ def test_create_native_kernel_rejects_stop_profile_deceleration_time_over_cap():
     if not HAS_NATIVE:
         pytest.skip("manyforge_roboplan_py not available")
 
-    with pytest.raises(ValueError, match="deceleration_time_s must be <= 1.0"):
+    with pytest.raises(ValueError, match="deceleration_time_s must be <= 2.0"):
         manyforge_roboplan_py.create_native_kernel(
             "ur5_gripper",
             "arm",
@@ -124,8 +124,8 @@ def test_create_native_kernel_rejects_stop_profile_deceleration_time_over_cap():
                 "operator_stop_profile": {
                     "profile_id": "operator_soft_too_slow",
                     "stop_mode": "soft_on_path",
-                    "deceleration_time_s": 1.001,
-                    "max_stop_time_s": 1.0,
+                    "deceleration_time_s": 2.001,
+                    "max_stop_time_s": 2.0,
                     "per_joint_max_deceleration_rad_s2": {
                         "shoulder_pan_joint": 8.0,
                     },
@@ -145,7 +145,7 @@ def test_create_native_kernel_accepts_stop_profile_deceleration_time_at_cap():
             "operator_stop_profile": {
                 "profile_id": "operator_spring_cap",
                 "stop_mode": "spring_back_hold",
-                "deceleration_time_s": 1.0,
+                "deceleration_time_s": 2.0,
             }
         },
     )
@@ -157,7 +157,7 @@ def test_create_native_kernel_rejects_spring_back_deceleration_time_over_cap():
     if not HAS_NATIVE:
         pytest.skip("manyforge_roboplan_py not available")
 
-    with pytest.raises(ValueError, match="deceleration_time_s must be <= 1.0"):
+    with pytest.raises(ValueError, match="deceleration_time_s must be <= 2.0"):
         manyforge_roboplan_py.create_native_kernel(
             "ur5_gripper",
             "arm",
@@ -165,7 +165,7 @@ def test_create_native_kernel_rejects_spring_back_deceleration_time_over_cap():
                 "operator_stop_profile": {
                     "profile_id": "operator_spring_too_slow",
                     "stop_mode": "spring_back_hold",
-                    "deceleration_time_s": 1.001,
+                    "deceleration_time_s": 2.001,
                 }
             },
         )

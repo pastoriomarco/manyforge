@@ -425,3 +425,60 @@ TEST(Ros2CapabilityTest,
   ASSERT_TRUE(cap.capability_profile_id.has_value());
   EXPECT_EQ(*cap.capability_profile_id, "ros2_control_v1_invalid_config");
 }
+
+// resolve_soft_on_path_anchor_velocity_source — the per-lane anchor-state
+// authority. The commanded-sim lane's reported feedback velocity is decoupled
+// from the commanded motion, so the seam anchor must take the model-derived
+// velocity even when measured feedback is present (anchoring on the decoupled
+// feedback sign-flips the seam). A lane with faithful feedback keeps measured;
+// an explicit config forces either choice. These pin the decision the seam
+// dispatch depends on.
+TEST(SoftOnPathAnchorVelocityAuthority, CommandedSimPrefersModelEvenWithFeedback) {
+  auto cfg = base_config();
+  cfg.execution_state_source_mode = "commanded_sim";
+  EXPECT_EQ(
+      resolve_soft_on_path_anchor_velocity_source(cfg, /*has_measured=*/true),
+      SoftOnPathStateSource::kModelDerived);
+}
+
+TEST(SoftOnPathAnchorVelocityAuthority, CommandedSimModelWhenNoFeedback) {
+  auto cfg = base_config();
+  cfg.execution_state_source_mode = "commanded_sim";
+  EXPECT_EQ(
+      resolve_soft_on_path_anchor_velocity_source(cfg, /*has_measured=*/false),
+      SoftOnPathStateSource::kModelDerived);
+}
+
+TEST(SoftOnPathAnchorVelocityAuthority, NonSimUsesMeasuredWhenPresent) {
+  auto cfg = base_config();
+  cfg.execution_state_source_mode = "observed_ros2";
+  EXPECT_EQ(
+      resolve_soft_on_path_anchor_velocity_source(cfg, /*has_measured=*/true),
+      SoftOnPathStateSource::kMeasuredFeedback);
+}
+
+TEST(SoftOnPathAnchorVelocityAuthority, NonSimModelFallbackWhenNoFeedback) {
+  auto cfg = base_config();
+  cfg.execution_state_source_mode = "observed_ros2";
+  EXPECT_EQ(
+      resolve_soft_on_path_anchor_velocity_source(cfg, /*has_measured=*/false),
+      SoftOnPathStateSource::kModelDerived);
+}
+
+TEST(SoftOnPathAnchorVelocityAuthority, ExplicitPreferModelOverridesNonSim) {
+  auto cfg = base_config();
+  cfg.execution_state_source_mode = "observed_ros2";
+  cfg.prefer_model_anchor_velocity = true;
+  EXPECT_EQ(
+      resolve_soft_on_path_anchor_velocity_source(cfg, /*has_measured=*/true),
+      SoftOnPathStateSource::kModelDerived);
+}
+
+TEST(SoftOnPathAnchorVelocityAuthority, ExplicitMeasuredOverridesCommandedSim) {
+  auto cfg = base_config();
+  cfg.execution_state_source_mode = "commanded_sim";
+  cfg.prefer_model_anchor_velocity = false;
+  EXPECT_EQ(
+      resolve_soft_on_path_anchor_velocity_source(cfg, /*has_measured=*/true),
+      SoftOnPathStateSource::kMeasuredFeedback);
+}

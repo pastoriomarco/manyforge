@@ -5,6 +5,7 @@
 #include <map>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include <manyforge_core/types/error_code.hpp>
 #include <manyforge_core/types/motion_interrupt.hpp>
@@ -123,5 +124,128 @@ bool soft_on_path_error_recommends_natural_completion(
 Result<double> measure_soft_on_path_path_deviation(
     const TrajectoryDTO& accepted_trajectory,
     const RobotStateDTO& observed_state);
+
+/// Configuration for re-aligning a soft-stop replacement trajectory to the
+/// compute latency between the trip instant and dispatch.
+struct DispatchLatencyShiftConfig {
+  /// Leading continuity-anchor time (negative; seconds before dispatch "now").
+  double anchor_negative_time_s = -0.010;
+  /// Reject (→ hard stop) once the compute latency reaches this fraction of the
+  /// requested stop duration. Compute is a few ms, so this only trips on a
+  /// too-small stop time or a compute hiccup.
+  double max_latency_fraction = 0.2;
+};
+
+/// Re-align a planned soft-stop replacement trajectory for the compute latency
+/// between the trip instant (when `planned` was computed) and dispatch, and
+/// prepend a negative-time continuity anchor at the fresh dispatch-time observed
+/// state so stock JTC's spline starts continuously (no backward-pull bump).
+///
+/// Subtracts `compute_latency_s` from every planned waypoint's `time_from_start`
+/// and drops those that become negative (consumed during the gap), then prepends
+/// the anchor. Returns `Err` — signalling the caller to escalate to a hard stop —
+/// when `compute_latency_s >= config.max_latency_fraction * stop_duration_s`, or
+/// when every future waypoint was consumed.
+Result<TrajectoryDTO> shift_soft_stop_for_dispatch_latency(
+    const TrajectoryDTO& planned,
+    double compute_latency_s,
+    double stop_duration_s,
+    const RobotStateDTO& dispatch_anchor_state,
+    const DispatchLatencyShiftConfig& config = {});
+
+/// Result of the minimum-time on-path stop feasibility sweep.
+struct SoftOnPathMinStopTimeDTO {
+  /// Fastest budget-respecting time to bring the path-rate to zero from the
+  /// trip rate, decelerating along the validated path within the per-joint
+  /// limits. This is the lower bound on the soft-stop duration: a requested
+  /// `deceleration_time_s` below it is infeasible (caller escalates to a hard
+  /// stop); at or above it the stop can be re-timed to land exactly on time.
+  double min_stop_time_s = 0.0;
+  /// Path cursor (`time_from_start` along the accepted trajectory) where the
+  /// path-rate reaches zero under the minimum-time profile.
+  double stop_path_time_s = 0.0;
+  /// Path-length the minimum-time stop consumes (`stop_path_time_s` minus the
+  /// trip cursor), in accepted-trajectory time units.
+  double stop_distance_path_s = 0.0;
+  /// False when the minimum-time stop would run past the accepted trajectory's
+  /// final waypoint (the path ends before the robot can stop on it).
+  bool reaches_rest_on_path = true;
+  /// Joint whose deceleration limit bound the sweep most often (diagnostic).
+  std::string binding_joint;
+};
+
+/// Compute the minimum-time on-path stop: forward-integrate the path-rate phase
+/// plane from `(trip_path_time_s, trip_path_rate)` applying, at each step, the
+/// most negative path-rate acceleration that keeps every joint's executed
+/// acceleration `q''(u)·u̇² + q'(u)·u̇_dot` within its per-joint deceleration
+/// limit, until the path-rate reaches zero. Side-effect free; the planner uses
+/// it to gate exact-time feasibility (and the redistribution target). `Err` on
+/// malformed inputs (non-finite rate, missing per-joint limit, etc.).
+Result<SoftOnPathMinStopTimeDTO> compute_soft_on_path_min_stop_time(
+    const TrajectoryDTO& accepted_trajectory,
+    double trip_path_time_s,
+    double trip_path_rate,
+    const std::map<std::string, double>& per_joint_max_deceleration_rad_s2,
+    double integration_step_s = 0.001);
+
+/// One sample of a jerk-limited soft-stop path-rate profile.
+struct JerkLimitedStopSampleDTO {
+  double time_from_ramp_start_s = 0.0;  // t within the ramp (0 at handoff end)
+  double path_time_s = 0.0;             // path cursor s = u(t)
+  double path_rate = 0.0;               // u̇(t)
+  double path_rate_accel = 0.0;         // ü(t)
+};
+
+struct JerkLimitedStopProfileDTO {
+  std::vector<JerkLimitedStopSampleDTO> samples;  // from (u_dot0, u_ddot0) to rest
+  double achieved_stop_time_s = 0.0;
+  bool reaches_rest_on_path = false;
+  /// True iff the achieved stop time matches the requested time within the
+  /// retimer's sample-resolution tolerance.
+  bool hits_target_time = false;
+  /// True iff the emitted terminal sample is a clean hold point:
+  /// `path_rate == 0` and `path_rate_accel == 0`.
+  bool terminal_state_zero = false;
+  /// True iff the emitted trajectory, sampled through the same Hermite/quintic
+  /// interpolation used for dispatch, stays within per-joint acceleration and
+  /// finite-difference jerk limits.
+  bool within_budget = false;
+  /// Single caller-facing predicate: only true when the profile is suitable to
+  /// turn into a replacement trajectory. False means fall back / hard-stop.
+  bool dispatchable = false;
+  /// First validation reason that made `within_budget`/`dispatchable` false.
+  std::string validation_failure_reason;
+  /// True when the generic retimer used the backward velocity envelope to
+  /// pre-slow for a future path bottleneck.
+  bool used_backward_envelope = false;
+  double target_decel_path_rate = 0.0;  // the time-fit's converged target (diag)
+};
+
+/// Jerk-limited exact-time re-timing of the soft stop's ramp. Forward-integrates
+/// the path-rate phase plane `(s, u̇, ü)` from the C2 seam `(u̇0, ü0)`, slewing ü
+/// within a path-rate jerk budget derived from the per-joint jerk limits and
+/// clamping it to the per-joint acceleration budget (riding corners at the
+/// budget edge), with an S-curve endpoint that brings `(u̇, ü)` to `(0, 0)`. The
+/// target deceleration is binary-searched so the ramp reaches rest at exactly
+/// `target_stop_time_s`. A conservative backward velocity envelope is applied
+/// as a future-corner viability/look-ahead gate; when it binds but the emitted
+/// profile cannot be proven safe, `dispatchable` remains false. The first
+/// emitted sample is the exact incoming seam state. The final emitted sample
+/// must be a zero-rate, zero-acceleration hold before `dispatchable` can become
+/// true. The emitted samples are also converted back into a derivative-complete
+/// joint trajectory and oversampled through the dispatch interpolation path; any
+/// acceleration/jerk overrun clears `within_budget`/`dispatchable`. When the
+/// jerk limit or path shape makes the requested stop infeasible, the helper
+/// returns the best profile it found with `dispatchable=false` so the caller
+/// falls back. `Err` only on malformed inputs.
+Result<JerkLimitedStopProfileDTO> compute_jerk_limited_stop_profile(
+    const TrajectoryDTO& accepted_trajectory,
+    double start_path_time_s,
+    double start_path_rate,
+    double start_path_rate_accel,
+    double target_stop_time_s,
+    const std::map<std::string, double>& per_joint_max_deceleration_rad_s2,
+    const std::map<std::string, double>& per_joint_max_jerk_rad_s3,
+    double sample_period_s = 0.01);
 
 }  // namespace manyforge::core

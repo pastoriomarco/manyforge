@@ -141,7 +141,7 @@ adapters:
       wait_for_state_timeout_s: 1
       # Industrial controlled stop. soft_on_path is the default operator-stop:
       # a self-computed jerk-continuous stop trajectory preempts the active
-      # goal over a 0.5 s ramp. enable_jtc_speed_scaling_input stays true
+      # goal over a 2.0 s ramp. enable_jtc_speed_scaling_input stays true
       # (velocity slider via JTC scaling); the stop asserts unit scale
       # atomically with the preempt, so soft_on_path works WITH speed-scaling
       # (no longer gated on it).
@@ -151,7 +151,13 @@ adapters:
       operator_stop_profile:
         profile_id: "operator_soft_on_path"
         stop_mode: "soft_on_path"
-        deceleration_time_s: 0.5
+        deceleration_time_s: 2.0
+        # Backend waits max_stop_time_s for the dispatched soft_on_path goal to
+        # confirm terminal; it MUST exceed the realized stop duration
+        # (deceleration_time_s ramp + stop_traj_delta_s handoff + dispatch
+        # latency) or the goal is cancelled mid-ramp and the legacy stop()
+        # fallback truncates the decel. 2.0 s ramp + ~0.4 s dispatch -> 3.0 s.
+        max_stop_time_s: 3.0
         allowed_fallback_modes: ["spring_back_hold"]
         per_joint_max_deceleration_rad_s2:
           shoulder_pan_joint: 10.0
@@ -163,7 +169,7 @@ adapters:
       default_fault_stop_profile:
         profile_id: "default_fault_spring_back"
         stop_mode: "spring_back_hold"
-        deceleration_time_s: 0.5
+        deceleration_time_s: 2.0
       wait_for_action_server_timeout_s: 2
       stop_completion_timeout_s: 2
       start_tolerance_rad: 0.15

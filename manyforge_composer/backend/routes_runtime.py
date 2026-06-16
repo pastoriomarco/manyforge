@@ -354,6 +354,7 @@ def build_runtime_status_payload(state: ComposerState) -> dict[str, Any]:
         "externalProviders": sorted(external_statuses.keys()),
         "supportedStopModes": supported_stop_modes,
         "configuredStopModes": stop_cap.get("configured_stop_modes") or {},
+        "configuredStopDecelerationTimes": stop_cap.get("configured_stop_deceleration_times") or {},
         "stopCapabilityProfileId": stop_cap.get("capability_profile_id"),
         "hardStopLevel": hard_stop_level,
         "derivativeProofLevel": derivative_proof_level,

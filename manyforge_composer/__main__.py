@@ -310,7 +310,7 @@ def _kernel_config_from_deployment(
     #   operator_stop_profile:
     #     profile_id: "operator_soft_on_path"
     #     stop_mode: "soft_on_path"
-    #     deceleration_time_s: 0.5
+    #     deceleration_time_s: 2.0
     #     per_joint_max_deceleration_rad_s2:
     #       shoulder_pan_joint: 8.0
     #       ...

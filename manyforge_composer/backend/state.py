@@ -2504,10 +2504,12 @@ class ComposerState:
         Keys: ``supported_stop_modes`` (sorted list, or None when the active
         backend does not expose a capability — e.g. the mock kernel),
         ``configured_stop_modes`` (mapping of profile slot -> declared mode),
-        ``unsupported`` (list of {profile, stop_mode, reason} the backend does
-        not advertise or could not verify), ``capability_query_failed``, and
-        ``capability_profile_id``. Additional audit fields mirror the backend
-        capability payload: ``hard_stop_level``, ``derivative_proof_level``,
+        ``configured_stop_deceleration_times`` (mapping of profile slot ->
+        declared ``deceleration_time_s``), ``unsupported`` (list of
+        {profile, stop_mode, reason} the backend does not advertise or could
+        not verify), ``capability_query_failed``, and ``capability_profile_id``.
+        Additional audit fields mirror the backend capability payload:
+        ``hard_stop_level``, ``derivative_proof_level``,
         ``scaling_source_visibility``, ``scaling_source_probe_status``, and
         ``unsupported_reasons``. Empty before any load.
         """
@@ -2583,6 +2585,7 @@ class ComposerState:
         status: dict = {
             "supported_stop_modes": None,
             "configured_stop_modes": {},
+            "configured_stop_deceleration_times": {},
             "unsupported": [],
             "unsupported_reasons": {},
             "capability_profile_id": None,
@@ -2599,6 +2602,7 @@ class ComposerState:
         # query, so that even if the query fails we still know whether the
         # deployment declared profiles that must be verified (fail-closed).
         configured: dict = {}
+        configured_deceleration_times: dict = {}
         if deployment is not None:
             execution = deployment.adapters.get("execution")
             cfg = getattr(execution, "config", None) or {}
@@ -2606,7 +2610,11 @@ class ComposerState:
                 profile = cfg.get(slot)
                 if isinstance(profile, dict) and profile.get("stop_mode"):
                     configured[slot] = profile["stop_mode"]
+                    decel = profile.get("deceleration_time_s")
+                    if isinstance(decel, (int, float)) and not isinstance(decel, bool):
+                        configured_deceleration_times[slot] = float(decel)
         status["configured_stop_modes"] = configured
+        status["configured_stop_deceleration_times"] = configured_deceleration_times
 
         bundle = self.kernel_bundle
         # The native path exposes the raw NativeKernelBundle; the ros2_control

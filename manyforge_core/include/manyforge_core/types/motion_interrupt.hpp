@@ -19,15 +19,15 @@
 namespace manyforge::core {
 
 /// Default controlled-stop deceleration ramp (seconds) when a stop profile
-/// leaves `deceleration_time_s` unset. 0.5 s matches the proven manymove
-/// reference and is a smooth industrial stop; the prior 50 ms default was a
+/// leaves `deceleration_time_s` unset. 2.0 s is the current operator-visible
+/// default for live stop-profile validation; the prior 50 ms default was a
 /// near-instant stop. Backends MUST resolve an unset `deceleration_time_s`
 /// to this value rather than an ad-hoc local literal.
-inline constexpr double kDefaultDecelerationTimeS = 0.5;
+inline constexpr double kDefaultDecelerationTimeS = 2.0;
 /// Maximum configured wall-time deceleration ramp for operator/fault soft-stop
 /// profiles. Longer stops are an explicit deployment-policy change and must not
 /// slip through profile parsing as a "soft stop".
-inline constexpr double kMaxControlledStopDecelerationTimeS = 1.0;
+inline constexpr double kMaxControlledStopDecelerationTimeS = 2.0;
 
 /// Backend-declared planner parameters for production `soft_on_path`.
 /// These are deployment/runtime facts, not behavior-node policy: the

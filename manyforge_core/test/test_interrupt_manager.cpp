@@ -1368,7 +1368,7 @@ TEST(InterruptManagerMotionScopedTest,
   auto result = arm_with_profile(manager, p);
   EXPECT_TRUE(result.rejected);
   EXPECT_EQ(result.reason,
-            "stop_profile_deceleration_time_s_must_not_exceed_1s");
+            "stop_profile_deceleration_time_s_must_not_exceed_max");
 }
 
 TEST(InterruptManagerMotionScopedTest,
@@ -1396,13 +1396,13 @@ TEST(InterruptManagerMotionScopedTest,
 }
 
 TEST(InterruptManagerMotionScopedTest,
-     StopProfileDecelerationTimeDefaultsToHalfSecond) {
+     StopProfileDecelerationTimeDefaultsToTwoSeconds) {
   MotionInterruptStopProfileDTO p;
   p.profile_id = "default_decel";
   p.stop_mode = MotionInterruptStopMode::kSpringBackHold;
   EXPECT_DOUBLE_EQ(motion_interrupt_deceleration_time_or_default(p),
                    kDefaultDecelerationTimeS);
-  EXPECT_DOUBLE_EQ(motion_interrupt_deceleration_time_or_default(p), 0.5);
+  EXPECT_DOUBLE_EQ(motion_interrupt_deceleration_time_or_default(p), 2.0);
 
   p.deceleration_time_s = 0.75;
   EXPECT_DOUBLE_EQ(motion_interrupt_deceleration_time_or_default(p), 0.75);

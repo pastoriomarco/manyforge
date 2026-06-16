@@ -1222,21 +1222,43 @@ void ExecutionKernel::run_operator_stop_worker(
         fallback_legacy_result->accepted
             ? std::string("legacy_stop_succeeded")
             : std::string("legacy_stop_failed");
+    // Propagate the underlying controlled-stop failure cause into the
+    // escalation event. A downgraded operator stop MUST be self-describing on
+    // the event stream: it has to carry WHY soft_on_path was refused (the
+    // planner error code + reason + the soft_on_path->spring_back fallback
+    // pair), not only the fact that a downgrade happened.
+    std::map<std::string, std::string> escalation_details{
+        {"reason", "operator_stop_profile_failed"},
+        {"requested_stop_mode", requested_mode},
+        {"executed_stop_mode", executed_mode},
+        {"emergency_fallback", fallback_outcome},
+        {"phase", "operator_stop"}};
+    if (controlled_result.error.has_value()) {
+      escalation_details["controlled_stop_error_code"] =
+          controlled_result.error->code;
+      const auto reason_it = controlled_result.error->details.find("reason");
+      if (reason_it != controlled_result.error->details.end()) {
+        escalation_details["controlled_stop_error_reason"] = reason_it->second;
+      }
+    }
+    // Carry the whole soft_on_path / fallback diagnostic surface (error code,
+    // reason, per-detail jerk/accel/joint, and the fallback pairing) so the
+    // escalation event is fully self-describing — nothing about WHY the
+    // requested stop was refused is left only in dropped backend state.
+    for (const auto& [diag_key, diag_value] : controlled_result.diagnostics) {
+      if (diag_key.rfind("soft_on_path", 0) == 0 ||
+          diag_key.rfind("fallback", 0) == 0) {
+        escalation_details[diag_key] = diag_value;
+      }
+    }
     emit_event({KernelEventType::kErrorRaised,
                 sm_.status().execution_id, clock_.now(), {}, {},
                 std::optional<ErrorDTO>{ErrorDTO{
                     std::string(kErrorMotionInterruptBackendStopFailed),
                     "operator stop profile failed; emergency legacy "
                     "backend.stop() fallback engaged",
-                    {{"reason", "operator_stop_profile_failed"},
-                     {"requested_stop_mode", requested_mode},
-                     {"executed_stop_mode", executed_mode},
-                     {"emergency_fallback", fallback_outcome},
-                     {"phase", "operator_stop"}}}},
-                {{"phase", "operator_stop"},
-                 {"requested_stop_mode", requested_mode},
-                 {"executed_stop_mode", executed_mode},
-                 {"emergency_fallback", fallback_outcome}}});
+                    escalation_details}},
+                escalation_details});
   }
 
   std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);

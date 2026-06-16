@@ -1151,12 +1151,38 @@ class CycleManager:
                         )
                     kernel_status = self._kernel.get_status()
 
-                # Clear the soft-fail blackboard keys and set the resume
-                # signal so the holding motion node retries its goal on the
-                # next tick rather than re-emitting the same error.
+                # A controlled stop issued within the deceleration budget of a
+                # move's natural end lets the original motion finish on-path
+                # (recommends_natural_completion); the kernel then rests in
+                # COMPLETED — the move reached its goal — rather than STOPPED.
+                # execute() only auto-clears STOPPED/FAILED, so re-dispatching the
+                # held motion node against a COMPLETED kernel is rejected and the
+                # stop becomes unresumable without a Reset. Acknowledge the
+                # completed execution boundary here so Run clears it, mirroring the
+                # INTERRUPTED/INTERVENTION acks. The held move actually finished,
+                # so the subsequent re-dispatch from the reached goal is trivial
+                # and advances the program.
+                if kernel_status.state == ExecutionState.COMPLETED:
+                    ack_completed = self._kernel.acknowledge_completed(
+                        kernel_status.execution_id
+                    )
+                    if not ack_completed.accepted:
+                        raise RuntimeError(
+                            "kernel.acknowledge_completed rejected: "
+                            f"{ack_completed.error}"
+                        )
+                    kernel_status = self._kernel.get_status()
+
+                # Signal the held motion node to re-dispatch its goal from fresh
+                # state on the next tick instead of re-reading the already-terminal
+                # execution. This covers both a collision soft-fail and a plain
+                # operator stop, which leaves the kernel in STOPPED with no
+                # motion_paused_error; execute() from STOPPED clears the stop and
+                # replans, so Run from STOPPED resumes rather than re-surfacing
+                # "Motion execution ended in stopped".
+                self._set_resume_after_error_flag(True)
                 if motion_paused_error is not None:
                     self._clear_motion_paused_blackboard()
-                    self._set_resume_after_error_flag(True)
 
                 # Run-side auto-ack of `INTERVENTION_REQUIRED`.
                 # The kernel rejects `execute()` while intervention is

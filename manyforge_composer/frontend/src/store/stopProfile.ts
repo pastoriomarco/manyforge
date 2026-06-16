@@ -55,6 +55,8 @@ export interface StopProfileView {
   available: boolean;
   operatorMode: string | null;
   faultMode: string | null;
+  operatorDecelerationTimeS: number | null;
+  faultDecelerationTimeS: number | null;
   options: StopModeOption[];
   /** Backend could not report its supported modes — fail-closed, all disabled. */
   queryFailed: boolean;
@@ -84,6 +86,18 @@ function configuredModeForSlot(
   }
   const value = configured[slot];
   return typeof value === 'string' && value.length > 0 ? value : null;
+}
+
+function configuredDecelerationTimeForSlot(
+  runtime: RuntimeStatus,
+  slot: string,
+): number | null {
+  const configured = runtime.configuredStopDecelerationTimes;
+  if (!configured) {
+    return null;
+  }
+  const value = configured[slot];
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : null;
 }
 
 /**
@@ -123,6 +137,8 @@ export function buildStopProfileView(
       available: false,
       operatorMode: null,
       faultMode: null,
+      operatorDecelerationTimeS: null,
+      faultDecelerationTimeS: null,
       options: [],
       queryFailed: false,
       unsupported: false,
@@ -132,6 +148,14 @@ export function buildStopProfileView(
   const queryFailed = runtime.stopCapabilityQueryFailed === true;
   const operatorMode = configuredModeForSlot(runtime, OPERATOR_STOP_SLOT);
   const faultMode = configuredModeForSlot(runtime, FAULT_STOP_SLOT);
+  const operatorDecelerationTimeS = configuredDecelerationTimeForSlot(
+    runtime,
+    OPERATOR_STOP_SLOT,
+  );
+  const faultDecelerationTimeS = configuredDecelerationTimeForSlot(
+    runtime,
+    FAULT_STOP_SLOT,
+  );
   const supportedList = runtime.supportedStopModes ?? null;
   const supported = new Set<string>(supportedList ?? []);
 
@@ -150,6 +174,8 @@ export function buildStopProfileView(
       available: false,
       operatorMode,
       faultMode,
+      operatorDecelerationTimeS,
+      faultDecelerationTimeS,
       options: [],
       queryFailed,
       unsupported: runtime.stopProfileUnsupported === true,
@@ -200,6 +226,8 @@ export function buildStopProfileView(
     available,
     operatorMode,
     faultMode,
+    operatorDecelerationTimeS,
+    faultDecelerationTimeS,
     options,
     queryFailed,
     unsupported: runtime.stopProfileUnsupported === true,

@@ -11,6 +11,36 @@ import {
   shouldFreezeVelocitySlider,
 } from '../store/stopProfile';
 
+const DEFAULT_CONTROLLED_STOP_DECELERATION_TIME_S = 2.0;
+const MAX_CONTROLLED_STOP_DECELERATION_TIME_S = 2.0;
+
+function formatStopDuration(value: number): string {
+  return value.toFixed(2);
+}
+
+function deploymentAdaptersForUpdate(
+  adapters: Record<string, {
+    adapterId?: string;
+    adapterVersion?: string;
+    config?: Record<string, unknown>;
+    supportedProfiles?: string[];
+    capabilityKeys?: string[];
+  }>,
+) {
+  return Object.fromEntries(
+    Object.entries(adapters).map(([key, adapter]) => [
+      key,
+      {
+        adapter_id: adapter.adapterId,
+        adapter_version: adapter.adapterVersion,
+        config: adapter.config ?? {},
+        supported_profiles: adapter.supportedProfiles ?? [],
+        capability_keys: adapter.capabilityKeys ?? [],
+      },
+    ]),
+  );
+}
+
 /**
  * TransportControls — Run / Stop / Reset + velocity-scale slider.
  *
@@ -32,10 +62,14 @@ export function TransportControls() {
   const [cycleBusy, setCycleBusy] = useState(false);
   const [stopInProgress, setStopInProgress] = useState(false);
   const [velocityDraft, setVelocityDraft] = useState(velocityScale);
+  const [stopDurationDraft, setStopDurationDraft] = useState(
+    formatStopDuration(DEFAULT_CONTROLLED_STOP_DECELERATION_TIME_S),
+  );
   const pendingVelocityScaleRef = useRef<number | null>(null);
   const velocityScaleInFlightRef = useRef(false);
   const velocityScaleTimerRef = useRef<number | null>(null);
   const lastVelocityScaleSentAtRef = useRef(0);
+  const stopDurationDirtyRef = useRef(false);
 
   const stopProfile = buildStopProfileView(runtime);
   const stopGate = evaluateStopRunGate(runtime);
@@ -165,24 +199,23 @@ export function TransportControls() {
     (state === 'idle' || state === 'stopped') &&
     !cycleBusy &&
     !stopProfile.queryFailed;
+  const stopDurationApplies =
+    stopProfile.operatorMode === 'soft_on_path' ||
+    stopProfile.operatorMode === 'spring_back_hold';
+  const canChangeStopDuration = canChangeStopProfile && stopDurationApplies;
+  const resolvedStopDuration =
+    stopProfile.operatorDecelerationTimeS ??
+    DEFAULT_CONTROLLED_STOP_DECELERATION_TIME_S;
 
-  const deploymentAdaptersForUpdate = (
-    adapters: Record<string, { adapterId?: string; adapterVersion?: string; config?: Record<string, unknown>; supportedProfiles?: string[]; capabilityKeys?: string[] }>,
-  ) =>
-    Object.fromEntries(
-      Object.entries(adapters).map(([key, adapter]) => [
-        key,
-        {
-          adapter_id: adapter.adapterId,
-          adapter_version: adapter.adapterVersion,
-          config: adapter.config ?? {},
-          supported_profiles: adapter.supportedProfiles ?? [],
-          capability_keys: adapter.capabilityKeys ?? [],
-        },
-      ]),
-    );
+  useEffect(() => {
+    if (!stopDurationDirtyRef.current) {
+      setStopDurationDraft(formatStopDuration(resolvedStopDuration));
+    }
+  }, [resolvedStopDuration]);
 
-  const changeOperatorStopProfile = useCallback((mode: string) => {
+  const updateOperatorStopProfile = useCallback((
+    mutate: (profile: Record<string, unknown>) => Record<string, unknown>,
+  ) => {
     void (async () => {
       setCycleBusy(true);
       try {
@@ -198,11 +231,7 @@ export function TransportControls() {
           !Array.isArray(config.operator_stop_profile)
             ? { ...(config.operator_stop_profile as Record<string, unknown>) }
             : {};
-        config.operator_stop_profile = {
-          ...existingProfile,
-          profile_id: `operator_${mode}`,
-          stop_mode: mode,
-        };
+        config.operator_stop_profile = mutate(existingProfile);
         const adapters = deploymentAdaptersForUpdate(deployment.adapters);
         adapters.execution = {
           ...adapters.execution,
@@ -219,6 +248,57 @@ export function TransportControls() {
       }
     })();
   }, []);
+
+  const changeOperatorStopProfile = useCallback((mode: string) => {
+    updateOperatorStopProfile((existingProfile) => ({
+      ...existingProfile,
+      profile_id: `operator_${mode}`,
+      stop_mode: mode,
+      deceleration_time_s:
+        typeof existingProfile.deceleration_time_s === 'number'
+          ? existingProfile.deceleration_time_s
+          : DEFAULT_CONTROLLED_STOP_DECELERATION_TIME_S,
+    }));
+  }, [updateOperatorStopProfile]);
+
+  const commitStopDurationDraft = useCallback(() => {
+    if (!canChangeStopDuration) {
+      stopDurationDirtyRef.current = false;
+      setStopDurationDraft(formatStopDuration(resolvedStopDuration));
+      return;
+    }
+    const parsed = Number.parseFloat(stopDurationDraft);
+    const clamped = Number.isFinite(parsed)
+      ? Math.min(
+          MAX_CONTROLLED_STOP_DECELERATION_TIME_S,
+          Math.max(0.05, parsed),
+        )
+      : resolvedStopDuration;
+    stopDurationDirtyRef.current = false;
+    setStopDurationDraft(formatStopDuration(clamped));
+    updateOperatorStopProfile((existingProfile) => {
+      const mode =
+        typeof existingProfile.stop_mode === 'string' && existingProfile.stop_mode.length > 0
+          ? existingProfile.stop_mode
+          : stopProfile.operatorMode ?? 'soft_on_path';
+      return {
+        ...existingProfile,
+        profile_id:
+          typeof existingProfile.profile_id === 'string' &&
+          existingProfile.profile_id.length > 0
+            ? existingProfile.profile_id
+            : `operator_${mode}`,
+        stop_mode: mode,
+        deceleration_time_s: clamped,
+      };
+    });
+  }, [
+    canChangeStopDuration,
+    resolvedStopDuration,
+    stopDurationDraft,
+    stopProfile.operatorMode,
+    updateOperatorStopProfile,
+  ]);
 
   return (
     <div className="pointer-events-none absolute inset-x-0 bottom-3 z-30 flex flex-col items-center gap-2">
@@ -363,6 +443,40 @@ export function TransportControls() {
                   </option>
                 ))}
               </select>
+            </label>
+            <label
+              className="flex items-center gap-1.5 text-xs text-gray-300"
+              title={
+                canChangeStopDuration
+                  ? 'Operator controlled-stop duration for this loaded deployment session'
+                  : stopDurationApplies
+                    ? 'Stop duration can be changed while idle or stopped'
+                    : 'Selected stop mode does not use a ManyForge-timed replacement trajectory'
+              }
+            >
+              <span className="font-mono text-[11px] uppercase tracking-wide text-gray-400">
+                sec
+              </span>
+              <input
+                aria-label="Configured operator stop duration in seconds"
+                type="number"
+                min={0.05}
+                max={MAX_CONTROLLED_STOP_DECELERATION_TIME_S}
+                step={0.05}
+                value={stopDurationDraft}
+                onChange={(event) => {
+                  stopDurationDirtyRef.current = true;
+                  setStopDurationDraft(event.target.value);
+                }}
+                onBlur={commitStopDurationDraft}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter') {
+                    event.currentTarget.blur();
+                  }
+                }}
+                disabled={!canChangeStopDuration}
+                className="w-16 rounded border border-gray-600 bg-gray-800 px-1.5 py-1 text-right font-mono text-[11px] text-gray-200 disabled:cursor-not-allowed disabled:opacity-40"
+              />
             </label>
           </>
         )}

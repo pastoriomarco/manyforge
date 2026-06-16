@@ -681,6 +681,7 @@ export interface RuntimeStatus {
   externalProviders: string[];
   supportedStopModes?: string[] | null;
   configuredStopModes?: Record<string, string>;
+  configuredStopDecelerationTimes?: Record<string, number>;
   stopCapabilityProfileId?: string | null;
   hardStopLevel?: string | null;
   derivativeProofLevel?: string | null;

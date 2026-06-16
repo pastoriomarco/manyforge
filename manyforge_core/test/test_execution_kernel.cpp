@@ -6080,7 +6080,7 @@ TEST_F(ExecutionKernelTest,
                             MotionInterruptStopMode::kSoftOnPath);
   scope.stop_profile->deceleration_time_s = 0.2;
   scope.stop_profile->per_joint_max_deceleration_rad_s2 = {
-      {"j1", 10.0}, {"j2", 10.0}};
+      {"j1", 1000.0}, {"j2", 1000.0}};
   scope.stop_profile->allowed_fallback_modes = {
       MotionInterruptStopMode::kSpringBackHold};
   scope.node_category = MotionInterruptNodeCategory::kGeneric;
@@ -6284,7 +6284,7 @@ TEST_F(ExecutionKernelTest,
                             MotionInterruptStopMode::kSoftOnPath);
   scope.stop_profile->deceleration_time_s = 0.2;
   scope.stop_profile->per_joint_max_deceleration_rad_s2 = {
-      {"j1", 10.0}, {"j2", 10.0}};
+      {"j1", 1000.0}, {"j2", 1000.0}};
   scope.stop_profile->allowed_fallback_modes = {
       MotionInterruptStopMode::kSpringBackHold};
   scope.node_category = MotionInterruptNodeCategory::kGeneric;
@@ -6350,7 +6350,7 @@ TEST_F(ExecutionKernelTest,
                             MotionInterruptStopMode::kSoftOnPath);
   scope.stop_profile->deceleration_time_s = 0.2;
   scope.stop_profile->per_joint_max_deceleration_rad_s2 = {
-      {"j1", 10.0}, {"j2", 10.0}};
+      {"j1", 1000.0}, {"j2", 1000.0}};
   scope.stop_profile->allowed_fallback_modes = {
       MotionInterruptStopMode::kSpringBackHold};
   req.motion_interrupt_scopes = {scope};
@@ -7291,7 +7291,7 @@ TEST_F(ExecutionKernelTest,
                             MotionInterruptStopMode::kSoftOnPath);
   scope.stop_profile->deceleration_time_s = 0.2;
   scope.stop_profile->per_joint_max_deceleration_rad_s2 = {
-      {"j1", 10.0}, {"j2", 10.0}};
+      {"j1", 1000.0}, {"j2", 1000.0}};
   scope.stop_profile->allowed_fallback_modes = {
       MotionInterruptStopMode::kSpringBackHold};
   req.motion_interrupt_scopes = {scope};

@@ -110,7 +110,7 @@ std::optional<std::string> validate_stop_profile_shape(
     return "soft_on_path_requires_per_joint_deceleration_limits";
   }
   // 4. Optional timing fields, when present, MUST be finite and strictly
-  //    positive. deceleration_time_s is capped to the v1 soft-stop wall-time
+  //    positive. deceleration_time_s is capped to the controlled-stop wall-time
   //    envelope so an operator/fault stop cannot silently become a long
   //    coast-down profile.
   //    Zero or negative values are configuration errors: a zero ramp
@@ -124,7 +124,7 @@ std::optional<std::string> validate_stop_profile_shape(
   if (profile.deceleration_time_s &&
       *profile.deceleration_time_s >
           kMaxControlledStopDecelerationTimeS) {
-    return "stop_profile_deceleration_time_s_must_not_exceed_1s";
+    return "stop_profile_deceleration_time_s_must_not_exceed_max";
   }
   if (profile.max_stop_time_s &&
       (!std::isfinite(*profile.max_stop_time_s) ||

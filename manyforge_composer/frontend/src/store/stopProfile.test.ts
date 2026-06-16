@@ -28,6 +28,7 @@ function makeRuntime(overrides: Partial<RuntimeStatus> = {}): RuntimeStatus {
     externalProviders: [],
     supportedStopModes: ['soft_on_path', 'spring_back_hold'],
     configuredStopModes: { [OPERATOR_STOP_SLOT]: 'soft_on_path', [FAULT_STOP_SLOT]: 'spring_back_hold' },
+    configuredStopDecelerationTimes: { [OPERATOR_STOP_SLOT]: 2.0, [FAULT_STOP_SLOT]: 1.25 },
     stopCapabilityProfileId: 'ros2_control_v1',
     hardStopLevel: 'immediate',
     derivativeProofLevel: 'none',
@@ -56,6 +57,8 @@ describe('buildStopProfileView', () => {
     expect(view.available).toBe(true);
     expect(view.operatorMode).toBe('soft_on_path');
     expect(view.faultMode).toBe('spring_back_hold');
+    expect(view.operatorDecelerationTimeS).toBe(2.0);
+    expect(view.faultDecelerationTimeS).toBe(1.25);
     expect(view.unsupported).toBe(false);
 
     const soft = view.options.find((o) => o.mode === 'soft_on_path');
@@ -165,6 +168,19 @@ describe('buildStopProfileView', () => {
     );
     expect(view.operatorMode).toBeNull();
     expect(view.faultMode).toBeNull();
+  });
+
+  it('ignores malformed configured stop deceleration values', () => {
+    const view = buildStopProfileView(
+      makeRuntime({
+        configuredStopDecelerationTimes: {
+          [OPERATOR_STOP_SLOT]: Number.NaN,
+          [FAULT_STOP_SLOT]: -1,
+        },
+      }),
+    );
+    expect(view.operatorDecelerationTimeS).toBeNull();
+    expect(view.faultDecelerationTimeS).toBeNull();
   });
 
   it('always keeps the disabled === !supported invariant', () => {
