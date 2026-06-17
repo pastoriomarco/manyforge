@@ -11,17 +11,20 @@ import pytest
 
 from manyforge_behavior.kernel_client import (
     ExecuteRequest, ExecutionState, GripperCommandRequest,
-    GripperCommandState, SceneEditRequest,
+    GripperCommandState, MotionInterruptScope, MotionInterruptStopProfile,
+    SceneEditRequest,
 )
 
 try:
     from native_kernel_client import (
         NativeKernelClient,
+        _serialize_motion_interrupt_scope,
         _gripper_state_from_native,
         _state_from_native,
     )
 except ImportError:
     NativeKernelClient = None
+    _serialize_motion_interrupt_scope = None
     _gripper_state_from_native = None
     _state_from_native = None
     HAS_NATIVE_CLIENT = False
@@ -110,6 +113,28 @@ def test_create_native_kernel_accepts_collision_monitor_config():
     status = kernel.get_status()
 
     assert status.state == ExecutionState.IDLE
+
+
+def test_motion_interrupt_scope_serializes_settle_velocity_threshold():
+    if not HAS_NATIVE_CLIENT:
+        pytest.skip("native_kernel_client not available")
+
+    scope = MotionInterruptScope(
+        scope_id="scope_a",
+        policy_id="probe_trip",
+        activation_mode="trip_if_already_active",
+        stop_profile=MotionInterruptStopProfile(
+            profile_id="operator_soft",
+            stop_mode="soft_on_path",
+            deceleration_time_s=0.5,
+            max_stop_time_s=0.7,
+            settle_velocity_threshold_rad_s=0.02,
+            per_joint_max_deceleration_rad_s2={"j1": 8.0},
+        ),
+    )
+
+    serialized = _serialize_motion_interrupt_scope(scope)
+    assert serialized["stop_profile"]["settle_velocity_threshold_rad_s"] == 0.02
 
 
 def test_create_native_kernel_rejects_stop_profile_deceleration_time_over_cap():

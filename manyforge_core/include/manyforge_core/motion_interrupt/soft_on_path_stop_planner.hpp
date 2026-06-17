@@ -118,6 +118,14 @@ validate_soft_on_path_feasibility_envelope(
 bool soft_on_path_error_recommends_natural_completion(
     const ErrorDTO& error);
 
+/// True when a planner rejection means no feasible on-path soft stop exists and
+/// the caller MUST escalate to a hard stop (e.g. the requested time is below the
+/// minimum budget-respecting on-path stop, or neither the retimer nor the ALI
+/// backtracking candidate could prove a dispatchable replacement). Backends
+/// MUST honor this with a real hard deceleration, not route it through
+/// `spring_back_hold`.
+bool soft_on_path_error_recommends_hard_stop(const ErrorDTO& error);
+
 /// Measure joint-space projection residual from an observed state to the
 /// accepted trajectory path. Used by backends to turn controller feedback into
 /// runtime path-deviation evidence for `soft_on_path`.
@@ -126,31 +134,32 @@ Result<double> measure_soft_on_path_path_deviation(
     const RobotStateDTO& observed_state);
 
 /// Configuration for re-aligning a soft-stop replacement trajectory to the
-/// compute latency between the trip instant and dispatch.
+/// compute+dispatch latency between the trip cursor snapshot and dispatch.
 struct DispatchLatencyShiftConfig {
-  /// Leading continuity-anchor time (negative; seconds before dispatch "now").
+  /// Leading continuity-pin time (negative; seconds before dispatch "now").
   double anchor_negative_time_s = -0.010;
-  /// Reject (→ hard stop) once the compute latency reaches this fraction of the
-  /// requested stop duration. Compute is a few ms, so this only trips on a
-  /// too-small stop time or a compute hiccup.
-  double max_latency_fraction = 0.2;
 };
 
-/// Re-align a planned soft-stop replacement trajectory for the compute latency
-/// between the trip instant (when `planned` was computed) and dispatch, and
-/// prepend a negative-time continuity anchor at the fresh dispatch-time observed
-/// state so stock JTC's spline starts continuously (no backward-pull bump).
-///
-/// Subtracts `compute_latency_s` from every planned waypoint's `time_from_start`
-/// and drops those that become negative (consumed during the gap), then prepends
-/// the anchor. Returns `Err` — signalling the caller to escalate to a hard stop —
-/// when `compute_latency_s >= config.max_latency_fraction * stop_duration_s`, or
-/// when every future waypoint was consumed.
+/// Re-align a planned soft-stop replacement for the compute+dispatch latency
+/// between the trip cursor snapshot (when `planned` was computed) and dispatch.
+/// During that latency the controller's command advances along the path, so the
+/// lead-in's earliest points fall behind the live command frame. Subtracts
+/// `compute_latency_s` from every planned waypoint's `time_from_start`, drops
+/// those that become negative (consumed during the gap), and prepends a
+/// negative-time continuity pin sampled from `accepted_trajectory` at the
+/// advanced command cursor (`command_cursor_s + path_time_rate*compute_latency_s`)
+/// carrying the full command-frame `(q, qdot, qddot)` — so stock JTC's spline
+/// starts through the live command (no backward-pull bump). Returns `Err`
+/// (caller escalates to a hard stop) when `compute_latency_s >= lead_in_budget_s`
+/// (the latency consumed the command-continuation lead-in) or when every future
+/// waypoint was consumed.
 Result<TrajectoryDTO> shift_soft_stop_for_dispatch_latency(
     const TrajectoryDTO& planned,
     double compute_latency_s,
-    double stop_duration_s,
-    const RobotStateDTO& dispatch_anchor_state,
+    double lead_in_budget_s,
+    const TrajectoryDTO& accepted_trajectory,
+    double command_cursor_s,
+    double path_time_rate,
     const DispatchLatencyShiftConfig& config = {});
 
 /// Result of the minimum-time on-path stop feasibility sweep.

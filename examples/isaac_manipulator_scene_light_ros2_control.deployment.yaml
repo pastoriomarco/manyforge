@@ -142,16 +142,41 @@ adapters:
       # Industrial controlled stop. soft_on_path is the default operator-stop:
       # a self-computed jerk-continuous stop trajectory preempts the active
       # goal over a 2.0 s ramp. enable_jtc_speed_scaling_input stays true
-      # (velocity slider via JTC scaling); the stop asserts unit scale
-      # atomically with the preempt, so soft_on_path works WITH speed-scaling
-      # (no longer gated on it).
+      # (velocity slider via JTC scaling); the stop publishes unit scale
+      # immediately before the preempt, so soft_on_path works WITH speed-scaling
+      # once the controller seam has been validated for that ordering.
       enable_soft_on_path_path_ramp: true
       soft_on_path_sample_period_s: 0.01
-      soft_on_path_stop_traj_delta_s: 0.05
+      # Command-frame lead-in budget (D_lead): the replacement opens with the
+      # in-flight command resampled from the cursor for this long, then the decel
+      # ramp. The compute+dispatch latency (stage A) is consumed from it and the
+      # rest rides to rest at deceleration_time_s; if the latency exceeds this
+      # budget the stop escalates to a hard stop. Sized > the worst-case planner
+      # compute incl. the ALI/backtracking tail (~12 ms): 0.1 s gives ~8x margin
+      # (measured normal-path Delta ~0.8 ms). Decel ramp = deceleration_time_s - D_lead.
+      soft_on_path_stop_traj_delta_s: 0.1
+      # Explicit per-joint jerk ceiling for the stop ramp + handoff. Without
+      # this the planner falls back to default_jerk_limit (= accel_limit /
+      # (0.15*effective_ramp_s) = 10 / 0.2925 ~= 34 rad/s^3), which is a
+      # heuristic, not a joint limit, and is tight enough that the path's
+      # natural handoff jerk marginally exceeds it at sharp trip points. 50
+      # rad/s^3 (reach the 10 rad/s^2 accel limit in 0.2 s) gives headroom.
+      soft_on_path_max_jerk_rad_s3:
+        shoulder_pan_joint: 50.0
+        shoulder_lift_joint: 50.0
+        elbow_joint: 50.0
+        wrist_1_joint: 50.0
+        wrist_2_joint: 50.0
+        wrist_3_joint: 50.0
       operator_stop_profile:
         profile_id: "operator_soft_on_path"
         stop_mode: "soft_on_path"
         deceleration_time_s: 2.0
+        # Default policy, made explicit here for operator audit: if the
+        # accepted trajectory will finish sooner than a useful 2 s stop ramp
+        # can be generated, keep running that trajectory and report Stopping
+        # until the controller reaches the endpoint.
+        allow_natural_completion_on_short_path: true
         # Backend waits max_stop_time_s for the dispatched soft_on_path goal to
         # confirm terminal; it MUST exceed the realized stop duration
         # (deceleration_time_s ramp + stop_traj_delta_s handoff + dispatch

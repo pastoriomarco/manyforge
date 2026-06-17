@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stop_token>
 #include <string>
 #include <thread>
@@ -192,6 +193,11 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
     bool has_observed_velocity = false;
   };
 
+  struct ControlledStopCommandReference {
+    core::TrajectoryDTO trajectory;
+    std::chrono::steady_clock::time_point started_at;
+  };
+
   enum class SceneUpdateMode {
     kBlocking,
     kBestEffort,
@@ -235,6 +241,9 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
   std::optional<JointSample> wait_for_fresh_sample_after(
       double timeout_s,
       std::chrono::steady_clock::time_point not_before);
+  std::vector<double> velocities_for_joints(
+      const JointSample& sample,
+      const std::vector<std::string>& joints) const;
   std::vector<double> positions_for_joints(const JointSample& sample,
                                            const std::vector<std::string>& joints) const;
   void sync_idle_scene_from_latest_sample();
@@ -242,6 +251,16 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
   bool uses_authored_backend_state() const;
   void set_command_gate(bool enabled);
   void publish_runtime_velocity_scale(double scale);
+  void begin_controlled_stop_runtime_scale_freeze(bool assert_unit_scale);
+  void assert_controlled_stop_unit_runtime_scale();
+  bool end_controlled_stop_runtime_scale_freeze();
+  void install_controlled_stop_command_reference(
+      const core::TrajectoryDTO& trajectory,
+      std::chrono::steady_clock::time_point started_at);
+  void clear_managed_controlled_stop_state();
+  bool publish_controlled_stop_command_reference_snapshot(
+      std::chrono::steady_clock::time_point now);
+  void complete_managed_controlled_stop_execution();
   core::Result<void> command_sim_initial_state(std::string phase);
   bool update_scene_positions(const std::vector<double>& joint_positions,
                               SceneUpdateMode mode = SceneUpdateMode::kBlocking);
@@ -350,10 +369,12 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
   bool running_ = false;
   bool terminal_ = true;
   bool stop_requested_ = false;
+  bool natural_completion_stop_requested_ = false;
   bool pause_requested_ = false;
   bool goal_accepted_ = false;
   bool first_feedback_seen_ = false;
   bool result_received_ = false;
+  bool controlled_stop_preempt_in_progress_ = false;
   bool resync_required_ = false;
   bool resync_in_progress_ = false;
   GoalHandleFJT::SharedPtr active_goal_handle_;
@@ -401,7 +422,14 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
   // ADR-0018: runtime velocity scale read by the monitor loop.
   std::atomic<double> runtime_velocity_scale_{1.0};
   std::atomic<double> applied_runtime_velocity_scale_{1.0};
+  mutable std::mutex runtime_velocity_scale_mutex_;
+  int controlled_stop_runtime_scale_freeze_depth_ = 0;
+  bool controlled_stop_unit_scale_asserted_ = false;
+  std::optional<double> controlled_stop_runtime_scale_restore_;
+  std::optional<double> deferred_runtime_velocity_scale_;
   std::optional<core::TrajectoryDTO> active_trajectory_;
+  std::optional<ControlledStopCommandReference>
+      controlled_stop_command_reference_;
   double active_trajectory_time_s_ = 0.0;
   double active_runtime_velocity_scale_ = 1.0;
   // The most-recent managed FJT goal handle issued by a controlled-stop

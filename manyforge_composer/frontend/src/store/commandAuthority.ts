@@ -152,11 +152,15 @@ export function evaluateRobotCommandAuthority({
     }
   }
 
-  // The cycle owns the robot while a program is running or an
+  // The cycle owns the robot while a program is running, stopping, or an
   // intervention / direct-jog session is executing. Default Robot
   // Control authoring is a no-motion overlay; it does not command the
   // robot, so no streaming carve-out exists anymore.
-  if (cycleState === 'running' || cycleState === 'direct_control') {
+  if (
+    cycleState === 'running' ||
+    cycleState === 'stopping' ||
+    cycleState === 'direct_control'
+  ) {
     return blocked(ROBOT_COMMAND_AUTHORITY_REASONS.cycleOwnsRobot);
   }
   return {

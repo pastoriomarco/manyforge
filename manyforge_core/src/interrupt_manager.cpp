@@ -131,6 +131,15 @@ std::optional<std::string> validate_stop_profile_shape(
        *profile.max_stop_time_s <= 0.0)) {
     return "stop_profile_max_stop_time_s_must_be_positive";
   }
+  // settle_velocity_threshold_rad_s, when present, MUST be finite and strictly
+  // positive — it is the at-rest verdict threshold; a zero/negative threshold
+  // would make no joint ever read as settled (or the inverse), defeating the
+  // measured-stop confirmation.
+  if (profile.settle_velocity_threshold_rad_s &&
+      (!std::isfinite(*profile.settle_velocity_threshold_rad_s) ||
+       *profile.settle_velocity_threshold_rad_s <= 0.0)) {
+    return "stop_profile_settle_velocity_threshold_rad_s_must_be_positive";
+  }
   // 5. Per-joint deceleration limits, when provided inline, MUST all
   //    be strictly positive. Negative or zero per-axis limits would
   //    let the backend produce an unbounded stop.

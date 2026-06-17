@@ -19,6 +19,10 @@ struct ExecutionSnapshot {
   ExecutionState state = ExecutionState::kIdle;
   double progress = 0.0;
   std::vector<double> joint_positions_rad;
+  /// Measured joint velocities (rad/s) when the backend has controller
+  /// feedback available. Empty means unknown/not-available; consumers MUST
+  /// treat empty as "no measured settle evidence" rather than at-rest.
+  std::vector<double> joint_velocities_rad_s;
   std::string state_source;
   int64_t source_timestamp_ns = 0;
   int64_t source_age_ns = 0;

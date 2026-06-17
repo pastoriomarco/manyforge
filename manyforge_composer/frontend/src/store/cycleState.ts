@@ -3,6 +3,7 @@ import type { CycleStatus } from '../types/api';
 export const CYCLE_STATES = [
   'idle',
   'running',
+  'stopping',
   'stopped',
   'direct_control',
 ] as const satisfies readonly CycleStatus['state'][];

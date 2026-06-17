@@ -109,13 +109,9 @@ struct ExecutionKernelConfig {
   // should raise this and pair with an audit archive subscriber.
   std::size_t motion_execution_outcome_retention = 256;
 
-  // Deployment default for the backend-stop confirmation deadline used
-  // by `complete_move_on_signal` trip handling when the
-  // scope's `MotionInterruptStopProfileDTO.max_stop_time_s` is unset
-  // (spec/260 §5.6, motion-scoped design §B.4). 500 ms matches the
-  // canonical default; deployments whose controllers cannot confirm
-  // stop within that window MUST raise this knob explicitly so the
-  // longer deadline is audit-visible.
+  // Deployment stop-confirmation tolerance. When a controlled-stop profile
+  // leaves `max_stop_time_s` unset, the effective stop deadline is the
+  // requested/default deceleration time plus this tolerance.
   Duration complete_move_on_signal_timeout_ns = 500'000'000;  // 500 ms
 
   // Deployment-default fault-stop profile. Used by
@@ -398,6 +394,8 @@ class ExecutionKernel {
                                 std::stop_token stop_token);
   bool operator_stop_worker_is_current(std::uint64_t generation,
                                        std::stop_token stop_token) const;
+  void begin_runtime_velocity_scale_freeze();
+  void end_runtime_velocity_scale_freeze();
 
   // Motion-scope lifecycle plumbing on the worker thread.
   // `active_motion_execution_` is reset at execute() entry and populated
@@ -422,7 +420,6 @@ class ExecutionKernel {
   /// manager's failure reason; the caller fails the execution closed.
   Result<void> arm_motion_scopes_for_dispatch(
       const ExecuteRequestDTO& request,
-      const TrajectoryDTO& trajectory,
       std::uint64_t execution_id,
       ActiveMotionExecution& motion_state);
 
@@ -491,6 +488,10 @@ class ExecutionKernel {
   std::mutex lifecycle_mutex_;
   std::atomic<uint64_t> next_execution_id_{1};
   std::atomic<double> runtime_velocity_scale_{1.0};
+  mutable std::mutex runtime_velocity_scale_mutex_;
+  int runtime_velocity_scale_freeze_depth_ = 0;
+  std::optional<double> deferred_runtime_velocity_scale_;
+  std::optional<std::string> deferred_runtime_velocity_scale_principal_id_;
   mutable std::mutex active_move_id_mutex_;
   std::string active_move_id_;
 
@@ -528,6 +529,17 @@ class ExecutionKernel {
   ScheduleHandle collision_monitor_handle_{0};
   uint64_t collision_monitor_generation_ = 0;
   bool collision_monitor_active_ = false;
+  // Stop-path collision monitoring. While a motion-trip controlled stop is in
+  // flight, `motion_trip_stop_active_` is true and the runtime collision
+  // monitor keeps running over the decelerating robot. On a collision the
+  // monitor does NOT latch a new fault or touch the state machine (no race
+  // with the trip handler) — it sets `motion_trip_stop_collision_` and cancels
+  // the in-flight stop via `motion_trip_stop_source_`. The trip handler then
+  // escalates to the hard-stop floor. Monitor signals; worker acts.
+  std::atomic<bool> motion_trip_stop_active_{false};
+  std::atomic<bool> motion_trip_stop_collision_{false};
+  std::mutex motion_trip_stop_mutex_;
+  std::optional<std::stop_source> motion_trip_stop_source_;
   struct RuntimeContactReleasePairState {
     double initial_penetration_m = 0.0;
     double last_penetration_m = 0.0;

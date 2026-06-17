@@ -49,7 +49,7 @@ export function NodePaletteItem({ entry, disabled = false }: Props) {
       draggable={!disabled}
       onDragStart={onDragStart}
       className={`flex items-start gap-2 px-2 py-1.5 rounded cursor-grab hover:bg-gray-700 active:cursor-grabbing ${disabled ? 'opacity-50 cursor-not-allowed' : ''}`}
-      title={disabled ? 'Editing disabled while running' : entry.description}
+      title={disabled ? 'Editing disabled while running or stopping' : entry.description}
     >
       <span className="text-xs mt-0.5 opacity-60">{KIND_ICONS[entry.kind] || '●'}</span>
       <div className="min-w-0">

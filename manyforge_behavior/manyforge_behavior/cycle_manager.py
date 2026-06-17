@@ -40,6 +40,7 @@ class CycleState(Enum):
     """Lifecycle states for the CycleManager."""
     IDLE = "idle"
     RUNNING = "running"
+    STOPPING = "stopping"
     STOPPED = "stopped"
     DIRECT_CONTROL = "direct_control"
 
@@ -292,6 +293,8 @@ class CycleManager:
         self._tree = None
         self._tick_thread = None
         self._tick_cleanup_thread: Optional[threading.Thread] = None
+        self._stop_settle_thread: Optional[threading.Thread] = None
+        self._stop_settle_generation = 0
         self._tick_stop_event = threading.Event()  # signals tick thread to exit
         self._tick_exit_event = threading.Event()
         self._tick_pause_event = threading.Event()  # cleared = paused, set = running
@@ -329,6 +332,46 @@ class CycleManager:
         # Set initial pause event to set (not paused)
         self._tick_pause_event.set()
         self._tick_exit_event.set()
+
+    @staticmethod
+    def _kernel_stop_terminal(state: ExecutionState) -> bool:
+        return state in {
+            ExecutionState.IDLE,
+            ExecutionState.STOPPED,
+            ExecutionState.COMPLETED,
+            ExecutionState.FAILED,
+            ExecutionState.INTERVENTION_REQUIRED,
+        }
+
+    def _await_kernel_stop_terminal(self, generation: int) -> None:
+        while True:
+            try:
+                kernel_state = self._kernel.get_status().state
+            except Exception:
+                logger.exception("Failed while waiting for kernel stop terminal state")
+                time.sleep(0.05)
+                continue
+            if self._kernel_stop_terminal(kernel_state):
+                with self._lock:
+                    if (
+                        self._state == CycleState.STOPPING
+                        and self._stop_settle_generation == generation
+                    ):
+                        self._state = CycleState.STOPPED
+                    if self._stop_settle_generation == generation:
+                        self._stop_settle_thread = None
+                return
+            time.sleep(0.02)
+
+    def _start_stop_settle_watcher_locked(self) -> None:
+        self._stop_settle_generation += 1
+        generation = self._stop_settle_generation
+        self._stop_settle_thread = threading.Thread(
+            target=self._await_kernel_stop_terminal,
+            args=(generation,),
+            daemon=True,
+        )
+        self._stop_settle_thread.start()
 
     def _tree_is_terminal(self) -> bool:
         """True when the current tree has already reached a terminal status."""
@@ -1068,6 +1111,16 @@ class CycleManager:
         if kernel_status.state in active_session_states:
             return False, "active_or_stopping"
 
+        if kernel_status.state == ExecutionState.INTERVENTION_REQUIRED:
+            try:
+                snapshot = self._kernel.get_execution_snapshot()
+            except Exception as exc:  # noqa: BLE001 — fail closed
+                return False, f"kernel_snapshot_unreadable:{type(exc).__name__}"
+            details = getattr(snapshot, "error_details", None) or {}
+            reason = details.get("reason") or details.get("reason_code")
+            if reason == "stop_not_settled_measured_velocity":
+                return False, "stop_not_settled_measured_velocity"
+
         # Refuse if the cycle-manager-tracked intervention session is still
         # marked running: that means a direct-control lease still owns
         # blackboard scope. The operator must end the intervention session
@@ -1241,11 +1294,13 @@ class CycleManager:
         The operator Stop is the industrial controlled stop (preempt), not a
         resumable pause. If RUNNING: set stop_requested=True on BB, suspend the
         tick thread, and route the in-flight motion through the kernel's
-        controlled stop. State -> STOPPED. If STOPPED or IDLE: no-op.
+        controlled stop. State stays STOPPING until the kernel reaches a
+        terminal stop state, then -> STOPPED. If STOPPED or IDLE: no-op.
         """
         with self._lock:
             if self._state != CycleState.RUNNING:
                 return  # Not running, no-op
+            self._state = CycleState.STOPPING
 
         # Operator Stop is the industrial controlled stop, not a resumable
         # pause: `stop_if_active` invokes `kernel.stop()` for any active state,
@@ -1257,13 +1312,30 @@ class CycleManager:
         # slip, since kernel.stop() handles whatever state the kernel is in.
         # The motion-soft-fail hold path keeps the pause semantics — see
         # `_enter_motion_paused_state`.
-        self._quiesce_runtime(
-            client_name="cycle_manager_stop",
-            kernel_action="stop_if_active",
-        )
+        try:
+            self._quiesce_runtime(
+                client_name="cycle_manager_stop",
+                kernel_action="stop_if_active",
+            )
+        except Exception:
+            with self._lock:
+                if self._state == CycleState.STOPPING:
+                    self._state = CycleState.RUNNING
+            raise
+
+        try:
+            kernel_state = self._kernel.get_status().state
+        except Exception:
+            logger.exception("Failed to read kernel state after operator stop")
+            kernel_state = ExecutionState.STOPPING
 
         with self._lock:
-            self._state = CycleState.STOPPED
+            if self._state != CycleState.STOPPING:
+                return
+            if self._kernel_stop_terminal(kernel_state):
+                self._state = CycleState.STOPPED
+            else:
+                self._start_stop_settle_watcher_locked()
 
     def _await_zombie_thread_exit(self, thread_to_join) -> None:
         thread_to_join.join()
@@ -1282,6 +1354,8 @@ class CycleManager:
         program without teleporting the robot.
         """
         with self._lock:
+            if self._state == CycleState.STOPPING:
+                raise RuntimeError("Cannot reset while cycle is stopping")
             need_stop = (self._state == CycleState.RUNNING)
 
         if need_stop:

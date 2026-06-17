@@ -1694,6 +1694,7 @@ def create_scene_router(state: ComposerState) -> APIRouter:
         with state.scene_edit_lock:
             if state.cycle_manager is not None and state.cycle_manager.state in {
                 CycleState.RUNNING,
+                CycleState.STOPPING,
                 CycleState.DIRECT_CONTROL,
             }:
                 return JSONResponse(
@@ -2021,6 +2022,7 @@ def create_scene_router(state: ComposerState) -> APIRouter:
         with state.scene_edit_lock:
             if state.cycle_manager is not None and state.cycle_manager.state in {
                 CycleState.RUNNING,
+                CycleState.STOPPING,
                 CycleState.DIRECT_CONTROL,
             }:
                 cycle_state = state.cycle_manager.state

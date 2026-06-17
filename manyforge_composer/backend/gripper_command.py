@@ -152,13 +152,18 @@ def validate_gripper_command(
 
 def gripper_cycle_busy_detail(state: ComposerState) -> Optional[str]:
     """Return a reason string when gripper dispatch must be blocked because
-    another authority owns execution (cycle RUNNING / DIRECT_CONTROL), else
-    None. Applies only at dispatch time, not to no-motion candidate preview."""
+    another authority owns execution (cycle RUNNING / STOPPING /
+    DIRECT_CONTROL), else None. Applies only at dispatch time, not to no-motion
+    candidate preview."""
     cycle_manager = state.cycle_manager
     if cycle_manager is None:
         return None
     cycle_state = cycle_manager.state
-    if cycle_state in {CycleState.RUNNING, CycleState.DIRECT_CONTROL}:
+    if cycle_state in {
+        CycleState.RUNNING,
+        CycleState.STOPPING,
+        CycleState.DIRECT_CONTROL,
+    }:
         return (
             "Gripper commands are allowed only while the cycle is idle or "
             f"stopped; current cycle state is {cycle_state.value}"

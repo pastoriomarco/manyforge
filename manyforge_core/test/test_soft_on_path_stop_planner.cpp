@@ -64,6 +64,11 @@ MotionInterruptStopProfileDTO soft_profile(double decel_s = 0.5) {
   return profile;
 }
 
+TEST(SoftOnPathStopPlannerTest, StopProfileDefaultsAllowShortPathNaturalCompletion) {
+  MotionInterruptStopProfileDTO profile;
+  EXPECT_TRUE(profile.allow_natural_completion_on_short_path);
+}
+
 SoftOnPathInitialStateDTO measured_state_1d(double q, double qdot) {
   SoftOnPathInitialStateDTO state;
   state.state.joint_names = {"joint_1"};
@@ -106,7 +111,12 @@ TEST(SoftOnPathStopPlannerTest,
 }
 
 TEST(SoftOnPathStopPlannerTest,
-     PreservesMeasuredOffPathVelocityAndReportsHandoffDrift) {
+     CommandFrameSeamUsesOnPathVelocityAndReportsMeasuredDrift) {
+  // Under the command-frame lead-in the seam continues the on-path COMMAND, not
+  // the measured off-path velocity. A measured joint_2 velocity the path does not
+  // have is a tracking error: it is reported for the drift guard / audit, but is
+  // NOT injected into the seam (the old synthetic handoff did inject it, which is
+  // what created the handoff excursion this seam removes).
   auto profile = soft_profile(0.5);
   profile.per_joint_max_deceleration_rad_s2 = {
       {"joint_1", 1000.0},
@@ -131,13 +141,18 @@ TEST(SoftOnPathStopPlannerTest,
   ASSERT_TRUE(planned.ok()) << planned.error().message;
   const auto& plan = planned.value();
   ASSERT_GE(plan.replacement_trajectory.waypoints.size(), 2u);
+  EXPECT_EQ(plan.diagnostics.at("seam"), "command_frame_lead_in");
+  // Seam velocity is on-path: the off-path measured joint_2 velocity (1.0) is
+  // NOT carried into the command.
   EXPECT_NEAR(
       plan.replacement_trajectory.waypoints.front().velocities_rad_s.at(1),
-      1.0,
+      0.0,
       1e-9);
+  // The measured deviation is still measured and reported (drift guard input).
   EXPECT_NEAR(plan.initial_velocity_deviation_rad_s, 1.0, 1e-9);
   EXPECT_EQ(plan.diagnostics.at("initial_velocity_deviation_rad_s"), "1");
-  EXPECT_GT(plan.path_deviation_max_rad, plan.initial_path_deviation_rad);
+  // The lead-in rides the accepted path, so it adds no handoff excursion.
+  EXPECT_NEAR(plan.path_deviation_max_rad, plan.initial_path_deviation_rad, 1e-9);
 }
 
 TEST(SoftOnPathStopPlannerTest,
@@ -193,15 +208,13 @@ TEST(SoftOnPathStopPlannerTest,
 }
 
 TEST(SoftOnPathStopPlannerTest,
-     ModelAuthorityAnchorsOnProjectedPathNotMeasuredDrift) {
-  // Regression for the handoff-jerk escalation: under model/command authority
-  // the seam anchor (first replacement waypoint AND handoff bridge start) MUST
-  // use the projected on-path position, not the raw measured position. Seeding
-  // the short stop_traj_delta_s handoff from an off-path measured position
-  // while using path-derived velocity/acceleration amplifies the drift into a
-  // huge handoff jerk (~deviation / T^3) that rejects the soft stop. The
-  // coherent anchor keeps q0,v0,a0 path-consistent so the stop plans cleanly;
-  // the measured drift is still retained for diagnostics.
+     CommandFrameSeamRidesProjectedPathNotMeasuredDrift) {
+  // Regression for the handoff-jerk escalation: the command-frame lead-in seam
+  // rides the on-path COMMAND (the accepted trajectory resampled from the trip
+  // cursor), so even with an off-path measured position the seam's first
+  // waypoint is the projected on-path point — never the raw measured drift that
+  // the old synthetic handoff amplified into a limit-breaking jerk. The measured
+  // drift is still measured and reported for the drift guard.
   auto profile = soft_profile(0.5);
   SoftOnPathInitialStateDTO state;
   state.state.joint_names = {"joint_1", "joint_2"};
@@ -220,13 +233,41 @@ TEST(SoftOnPathStopPlannerTest,
   ASSERT_TRUE(planned.ok()) << planned.error().message;
   const auto& plan = planned.value();
   EXPECT_TRUE(plan.used_model_velocity);
-  EXPECT_EQ(plan.diagnostics.at("anchor_authority"), "model_projected_path");
-  // Anchor position is the projected ON-PATH point: joint_2 snapped to the
-  // path (0.0), not the measured 0.1 drift.
+  EXPECT_EQ(plan.diagnostics.at("seam"), "command_frame_lead_in");
+  // The seam's first waypoint is the projected ON-PATH point: joint_2 snapped to
+  // the path (0.0), not the measured 0.1 drift.
   const auto& anchor = plan.replacement_trajectory.waypoints.front();
   EXPECT_NEAR(anchor.positions_rad.at(1), 0.0, 1e-9);
-  // Measured drift is still measured and reported (diagnostics retain it).
-  EXPECT_NEAR(plan.initial_path_deviation_rad, 0.1, 1e-9);
+}
+
+TEST(SoftOnPathStopPlannerTest, SeamAnchorsAtCommandCursorNotLaggingMeasured) {
+  // Command-frame authority: when the measured position lags the command cursor
+  // (the controller has commanded further along the path than the robot has
+  // physically reached), the lead-in must open at the COMMAND cursor, not the
+  // lagging measured-position projection — otherwise the seam re-issues points
+  // the controller's command has already passed (a backward step at the seam).
+  // q(t) = t on linear_trajectory_1d, so the cursor maps directly to position.
+  auto profile = soft_profile(0.5);
+  SoftOnPathInitialStateDTO state;
+  state.state.joint_names = {"joint_1"};
+  state.state.positions_rad = {0.2};         // measured projects to t = 0.2
+  state.velocity_source = SoftOnPathStateSource::kModelDerived;
+  state.trajectory_time_from_start_s = 0.3;  // command cursor is ahead (0.1 lag)
+  state.runtime_velocity_scale_at_trip = 1.0;
+  SoftOnPathPlannerConfig config;
+  config.stop_traj_delta_s = 0.05;
+  config.sample_period_s = 0.05;
+  config.allow_model_velocity_fallback = true;
+
+  auto planned = plan_soft_on_path_stop(
+      linear_trajectory_1d(), profile, state, config);
+
+  ASSERT_TRUE(planned.ok()) << planned.error().message;
+  const auto& plan = planned.value();
+  // Lead-in opens at the command cursor (q(0.3) = 0.3), not the measured 0.2.
+  EXPECT_NEAR(plan.replacement_trajectory.waypoints.front().positions_rad.at(0),
+              0.3, 1e-9);
+  EXPECT_NEAR(plan.initial_path_deviation_rad, 0.0, 1e-9);  // measured is on-path
 }
 
 TEST(SoftOnPathStopPlannerTest,
@@ -410,6 +451,7 @@ TEST(SoftOnPathStopPlannerTest,
      RejectsRampThatWouldPassAcceptedTrajectoryEnd) {
   auto profile = soft_profile(0.5);
   profile.allowed_fallback_modes.clear();
+  profile.allow_natural_completion_on_short_path = false;
   auto state = measured_state_1d(0.9, 0.8);
   SoftOnPathPlannerConfig config;
   config.stop_traj_delta_s = 0.05;
@@ -450,6 +492,7 @@ TEST(SoftOnPathStopPlannerTest,
      FeasibilityEnvelopeRejectsLateTripPointsBeforeDispatch) {
   auto profile = soft_profile(0.5);
   profile.allowed_fallback_modes.clear();
+  profile.allow_natural_completion_on_short_path = false;
   SoftOnPathPlannerConfig config;
   config.stop_traj_delta_s = 0.05;
   config.sample_period_s = 0.05;
@@ -571,30 +614,23 @@ TrajectoryDTO planned_stop_1d() {
   return t;
 }
 
-RobotStateDTO dispatch_anchor_1d(double q, double qdot) {
-  RobotStateDTO s;
-  s.joint_names = {"joint_1"};
-  s.positions_rad = {q};
-  s.velocities_rad_s = {qdot};
-  return s;
-}
-
-TEST(SoftStopDispatchLatencyTest, ShiftsDropsConsumedAndPrependsAnchor) {
+TEST(SoftStopDispatchLatencyTest, ShiftsDropsConsumedAndPrependsCommandPin) {
+  // accepted q(t)=t (vel 1); command cursor 0.2, rate 1.0, latency 0.05 ->
+  // advanced cursor 0.25. The pin is the COMMAND state there (full q,qdot,qddot
+  // sampled from the accepted trajectory), not a measured/partial state.
   auto r = shift_soft_stop_for_dispatch_latency(
-      planned_stop_1d(), /*compute_latency_s=*/0.05, /*stop_duration_s=*/1.0,
-      dispatch_anchor_1d(0.07, 0.45));
+      planned_stop_1d(), /*compute_latency_s=*/0.05, /*lead_in_budget_s=*/0.5,
+      linear_trajectory_1d(), /*command_cursor_s=*/0.2, /*path_time_rate=*/1.0);
   ASSERT_TRUE(r.ok()) << r.error().message;
   const auto& wps = r.value().waypoints;
-  // Leading negative-time anchor carries the fresh dispatch-time state.
   EXPECT_NEAR(wps.front().time_from_start_s, -0.010, 1e-9);
-  EXPECT_NEAR(wps.front().positions_rad[0], 0.07, 1e-9);
-  EXPECT_NEAR(wps.front().velocities_rad_s[0], 0.45, 1e-9);
-  // The t=0 planned anchor (< Δ=0.05) is dropped; first future ≈ 0.10 − 0.05.
+  EXPECT_NEAR(wps.front().positions_rad[0], 0.25, 1e-9);     // q(0.25)
+  EXPECT_NEAR(wps.front().velocities_rad_s[0], 1.0, 1e-9);   // rate * dq/dt
+  EXPECT_NEAR(wps.front().accelerations_rad_s2[0], 0.0, 1e-9);  // straight: qddot=0
+  // The t=0 planned point (< Δ=0.05) is dropped; first future = 0.10 − 0.05.
   ASSERT_GE(wps.size(), 2u);
   EXPECT_NEAR(wps[1].time_from_start_s, 0.05, 1e-9);
-  // Anchor + the 10 points originally at 0.1..1.0 (the t=0 anchor dropped).
-  EXPECT_EQ(wps.size(), 11u);
-  // Strictly increasing times.
+  EXPECT_EQ(wps.size(), 11u);  // pin + 10 (the t=0 planned point dropped)
   for (size_t i = 1; i < wps.size(); ++i) {
     EXPECT_GT(wps[i].time_from_start_s, wps[i - 1].time_from_start_s);
   }
@@ -602,30 +638,33 @@ TEST(SoftStopDispatchLatencyTest, ShiftsDropsConsumedAndPrependsAnchor) {
 
 TEST(SoftStopDispatchLatencyTest, TinyLatencyKeepsAllFuturePoints) {
   auto r = shift_soft_stop_for_dispatch_latency(
-      planned_stop_1d(), /*compute_latency_s=*/0.02, /*stop_duration_s=*/1.0,
-      dispatch_anchor_1d(0.005, 0.5));
+      planned_stop_1d(), /*compute_latency_s=*/0.02, /*lead_in_budget_s=*/0.5,
+      linear_trajectory_1d(), /*command_cursor_s=*/0.0, /*path_time_rate=*/1.0);
   ASSERT_TRUE(r.ok()) << r.error().message;
   const auto& wps = r.value().waypoints;
-  EXPECT_EQ(wps.size(), 11u);  // anchor + 10 (only the t=0 anchor dropped)
+  EXPECT_EQ(wps.size(), 11u);  // pin + 10 (only the t=0 planned point dropped)
   EXPECT_NEAR(wps[1].time_from_start_s, 0.08, 1e-9);  // 0.10 − 0.02
 }
 
-TEST(SoftStopDispatchLatencyTest, GuardEscalatesWhenLatencyExceedsBudget) {
-  // Δ = 0.25 ≥ 0.2 · stop(1.0) → reject, recommend hard stop.
+TEST(SoftStopDispatchLatencyTest, GuardEscalatesWhenLatencyConsumesLeadIn) {
+  // Δ = 0.25 ≥ lead-in budget 0.2 → reject, recommend hard stop.
   auto r = shift_soft_stop_for_dispatch_latency(
-      planned_stop_1d(), 0.25, 1.0, dispatch_anchor_1d(0.1, 0.4));
+      planned_stop_1d(), 0.25, 0.2, linear_trajectory_1d(), 0.1, 1.0);
   ASSERT_FALSE(r.ok());
-  EXPECT_EQ(r.error().details.at("reason"), "dispatch_latency_exceeds_budget");
+  EXPECT_EQ(r.error().details.at("reason"), "dispatch_latency_exceeds_lead_in");
   EXPECT_EQ(r.error().details.at("recommended_disposition"), "hard_stop");
 }
 
 TEST(SoftStopDispatchLatencyTest, RejectsInvalidInputs) {
   EXPECT_FALSE(shift_soft_stop_for_dispatch_latency(
-                   planned_stop_1d(), -0.01, 1.0, dispatch_anchor_1d(0.1, 0.4))
+                   planned_stop_1d(), -0.01, 0.5, linear_trajectory_1d(), 0.1, 1.0)
                    .ok());  // negative latency
   EXPECT_FALSE(shift_soft_stop_for_dispatch_latency(
-                   planned_stop_1d(), 0.05, 0.0, dispatch_anchor_1d(0.1, 0.4))
-                   .ok());  // zero stop duration
+                   planned_stop_1d(), 0.05, 0.0, linear_trajectory_1d(), 0.1, 1.0)
+                   .ok());  // zero lead-in budget
+  EXPECT_FALSE(shift_soft_stop_for_dispatch_latency(
+                   planned_stop_1d(), 0.05, 0.5, linear_trajectory_1d(), 0.1, -1.0)
+                   .ok());  // negative rate
 }
 
 // compute_soft_on_path_min_stop_time — the exact-time feasibility gate. On a
@@ -710,6 +749,7 @@ TEST(SoftOnPathStopPlannerTest, InfeasibleDecelerationTimeEscalatesToHardStop) {
 TEST(SoftOnPathStopPlannerTest, CannotStopOnPathWithinBudgetEscalatesToHardStop) {
   auto profile = soft_profile(0.5);
   profile.per_joint_max_deceleration_rad_s2 = {{"joint_1", 0.5}};
+  profile.allow_natural_completion_on_short_path = false;
   auto state = measured_state_1d(0.9, 0.8);
   SoftOnPathPlannerConfig config;
   config.stop_traj_delta_s = 0.05;
@@ -739,6 +779,41 @@ TEST(SoftOnPathStopPlannerTest, CannotStopOnPathButNaturalCompletionAllowed) {
   ASSERT_FALSE(planned.ok());
   EXPECT_EQ(planned.error().details.at("recommended_disposition"),
             "natural_completion");
+}
+
+// The backend routes a real hard deceleration on this helper, so pin it to the
+// planner's actual escalation dispositions: a soft-stop infeasibility must be
+// classified hard_stop (never silently downgraded to spring_back), while a
+// natural-completion disposition must NOT read as hard_stop.
+TEST(SoftOnPathStopPlannerTest, HardStopDispositionHelperMatchesPlannerEscalations) {
+  {
+    auto profile = soft_profile(/*decel_s=*/0.1);
+    profile.per_joint_max_deceleration_rad_s2 = {{"joint_1", 4.0}};
+    profile.allow_natural_completion_on_short_path = false;
+    SoftOnPathPlannerConfig config;
+    config.stop_traj_delta_s = 0.02;
+    config.sample_period_s = 0.01;
+    auto planned = plan_soft_on_path_stop(
+        linear_trajectory_1d(), profile, measured_state_1d(0.2, 1.0), config);
+    ASSERT_FALSE(planned.ok());
+    EXPECT_TRUE(soft_on_path_error_recommends_hard_stop(planned.error()));
+    EXPECT_FALSE(
+        soft_on_path_error_recommends_natural_completion(planned.error()));
+  }
+  {
+    auto profile = soft_profile(0.5);
+    profile.per_joint_max_deceleration_rad_s2 = {{"joint_1", 0.5}};
+    profile.allow_natural_completion_on_short_path = true;
+    SoftOnPathPlannerConfig config;
+    config.stop_traj_delta_s = 0.05;
+    config.sample_period_s = 0.05;
+    auto planned = plan_soft_on_path_stop(
+        linear_trajectory_1d(), profile, measured_state_1d(0.9, 0.8), config);
+    ASSERT_FALSE(planned.ok());
+    EXPECT_FALSE(soft_on_path_error_recommends_hard_stop(planned.error()));
+    EXPECT_TRUE(
+        soft_on_path_error_recommends_natural_completion(planned.error()));
+  }
 }
 
 // compute_jerk_limited_stop_profile — the jerk-bounded exact-time retimer. On a

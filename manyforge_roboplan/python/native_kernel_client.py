@@ -130,6 +130,10 @@ def _serialize_motion_interrupt_scope(
             sp["deceleration_time_s"] = float(profile.deceleration_time_s)
         if profile.max_stop_time_s is not None:
             sp["max_stop_time_s"] = float(profile.max_stop_time_s)
+        if profile.settle_velocity_threshold_rad_s is not None:
+            sp["settle_velocity_threshold_rad_s"] = float(
+                profile.settle_velocity_threshold_rad_s
+            )
         if profile.joint_deceleration_profile_id is not None:
             sp["joint_deceleration_profile_id"] = (
                 profile.joint_deceleration_profile_id
@@ -195,6 +199,12 @@ def _deserialize_motion_execution_outcome(
         outcome.trip.stop_snapshot_robot_state = trip.get(
             "stop_snapshot_robot_state"
         )
+        # Measured settle signal (M3): surface confirmed-at-rest evidence to
+        # BT/HMI/audit consumers. Absent => settle UNKNOWN (no measured velocity).
+        outcome.trip.stop_snapshot_max_abs_velocity_rad_s = trip.get(
+            "stop_snapshot_max_abs_velocity_rad_s"
+        )
+        outcome.trip.stop_snapshot_at_rest = trip.get("stop_snapshot_at_rest")
         outcome.trip.requested_stop_mode = trip.get("requested_stop_mode")
         outcome.trip.requested_stop_profile_id = trip.get(
             "requested_stop_profile_id"

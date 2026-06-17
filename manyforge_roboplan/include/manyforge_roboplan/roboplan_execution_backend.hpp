@@ -79,6 +79,7 @@ class RoboPlanExecutionBackend final : public core::IExecutionBackend {
     core::ExecutionSnapshot snapshot;
     std::atomic<bool> running{false};
     std::atomic<bool> pause_requested{false};
+    std::atomic<bool> natural_completion_stop_requested{false};
     std::optional<core::TrajectoryDTO> active_trajectory;
     double active_trajectory_time_s = 0.0;
     double active_runtime_velocity_scale = 1.0;
@@ -104,6 +105,8 @@ class RoboPlanExecutionBackend final : public core::IExecutionBackend {
                               SceneUpdateMode mode = SceneUpdateMode::kBlocking,
                               std::int64_t source_timestamp_ns = 0);
   void execution_worker(std::stop_token st, core::TrajectoryDTO trajectory);
+  void begin_controlled_stop_runtime_scale_freeze();
+  bool end_controlled_stop_runtime_scale_freeze();
   void record_scene_projection_success(std::int64_t source_timestamp_ns);
   void record_scene_projection_miss();
 
@@ -123,6 +126,9 @@ class RoboPlanExecutionBackend final : public core::IExecutionBackend {
   // lock-free on all supported targets; memory_order_release on the setter pairs
   // with memory_order_acquire on the worker's per-tick read.
   std::atomic<double> runtime_velocity_scale_{1.0};
+  mutable std::mutex runtime_velocity_scale_mutex_;
+  int controlled_stop_runtime_scale_freeze_depth_ = 0;
+  std::optional<double> deferred_runtime_velocity_scale_;
   std::atomic<std::uint64_t> scene_projection_misses_total_{0};
   std::atomic<std::uint64_t> scene_projection_successes_total_{0};
   std::atomic<std::uint64_t> scene_projection_lag_max_ns_{0};

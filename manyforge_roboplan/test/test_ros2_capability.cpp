@@ -314,10 +314,10 @@ TEST(Ros2CapabilityTest,
 TEST(Ros2CapabilityTest,
      SoftOnPathPathRampAdvertisedEvenWithJtcSpeedScalingInputEnabled) {
   // soft_on_path is NOT gated on JTC speed-scaling: when speed-scaling is
-  // active, the backend asserts unit
-  // execution scale atomically with the preempting stop dispatch, so the
-  // computed wall-time stop holds. With path-ramp enabled, speed-scaling
-  // enabled, AND a valid soft_on_path config, kSoftOnPath is advertised.
+  // active, the backend publishes unit execution scale immediately before the
+  // preempting stop dispatch. With path-ramp enabled, speed-scaling enabled,
+  // AND a valid soft_on_path config, kSoftOnPath is advertised; live seam
+  // qualification covers the non-atomic DDS/controller ordering.
   auto cfg = base_config();
   cfg.enable_soft_on_path_path_ramp = true;
   ASSERT_TRUE(cfg.enable_jtc_speed_scaling_input);

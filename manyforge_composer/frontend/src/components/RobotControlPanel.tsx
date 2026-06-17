@@ -1583,6 +1583,7 @@ function GripperRow({
   useEffect(() => {
     if (
       cycleState === 'running'
+      || cycleState === 'stopping'
       || cycleState === 'direct_control'
     ) {
       setPending(null);
@@ -2058,6 +2059,7 @@ function JointRow({
   useEffect(() => {
     if (
       cycleState === 'running'
+      || cycleState === 'stopping'
       || cycleState === 'direct_control'
     ) {
       clearDraft();

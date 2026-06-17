@@ -59,6 +59,9 @@ describe('evaluateRobotCommandAuthority', () => {
     expect(evaluate({ cycleState: 'running' }).reason).toBe(
       ROBOT_COMMAND_AUTHORITY_REASONS.cycleOwnsRobot,
     );
+    expect(evaluate({ cycleState: 'stopping' }).reason).toBe(
+      ROBOT_COMMAND_AUTHORITY_REASONS.cycleOwnsRobot,
+    );
     expect(evaluate({ cycleState: 'direct_control' }).reason).toBe(
       ROBOT_COMMAND_AUTHORITY_REASONS.cycleOwnsRobot,
     );

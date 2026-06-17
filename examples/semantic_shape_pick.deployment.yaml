@@ -76,6 +76,7 @@ adapters:
         profile_id: "operator_soft_on_path"
         stop_mode: "soft_on_path"
         deceleration_time_s: 2.0
+        allow_natural_completion_on_short_path: true
         allowed_fallback_modes: ["spring_back_hold"]
         per_joint_max_deceleration_rad_s2:
           shoulder_pan_joint: 10.0

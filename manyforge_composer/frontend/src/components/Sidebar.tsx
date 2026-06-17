@@ -39,7 +39,7 @@ function NodePaletteContent() {
           Node Palette
         </h2>
         {isRunMode && (
-          <p className="text-xs text-yellow-500 mt-1">Editing disabled while running</p>
+          <p className="text-xs text-yellow-500 mt-1">Editing disabled while running or stopping</p>
         )}
         {programProfile && (
           <p className="text-xs text-gray-500 mt-1">Profile filter: {programProfile}</p>

@@ -314,24 +314,6 @@ bool planner_reason_allows_spring_back_fallback(const std::string& reason) {
          reason == "initial_velocity_deviation_exceeds_limit";
 }
 
-TrajectoryDTO make_two_point_trajectory(
-    const std::vector<std::string>& joint_names,
-    const std::vector<double>& q0,
-    const std::vector<double>& v0,
-    const std::vector<double>& a0,
-    const std::vector<double>& q1,
-    const std::vector<double>& v1,
-    const std::vector<double>& a1,
-    double duration_s) {
-  TrajectoryDTO trajectory;
-  trajectory.joint_names = joint_names;
-  trajectory.waypoints.push_back(
-      TrajectoryWaypointDTO{0.0, q0, v0, a0});
-  trajectory.waypoints.push_back(
-      TrajectoryWaypointDTO{duration_s, q1, v1, a1});
-  return trajectory;
-}
-
 // Time-scaling ramp factors for the stop, on the normalized ramp parameter
 // r in [0, 1]. The ramp slows the path-time rate u̇ from path_time_rate
 // (steady traversal) to 0:
@@ -803,6 +785,22 @@ Result<SoftOnPathStopPlanDTO> plan_soft_on_path_stop(
                "soft_on_path requires measured velocity unless model fallback is authorized");
   }
 
+  // Seam cursor (TARGET §4.8 authority): the lead-in and ramp anchor here, so it
+  // MUST be the command frame, not the lagging measured-position projection —
+  // anchoring on the projection re-issues points the controller's command has
+  // already passed. Model/command authority uses the active command cursor
+  // (trajectory_time_from_start_s, required here); the feedback lane keeps the
+  // measured projection. projection.* stays the drift/velocity guard input only.
+  double seam_cursor_s = projection.time_from_start_s;
+  if (use_model_velocity) {
+    if (!initial_state.trajectory_time_from_start_s.has_value()) {
+      return err("missing_command_cursor",
+                 "soft_on_path model/command authority requires "
+                 "trajectory_time_from_start_s (the active command cursor)");
+    }
+    seam_cursor_s = *initial_state.trajectory_time_from_start_s;
+  }
+
   double path_time_rate = 0.0;
   std::vector<double> projected_velocity(joint_count, 0.0);
   if (use_model_velocity) {
@@ -852,7 +850,7 @@ Result<SoftOnPathStopPlanDTO> plan_soft_on_path_stop(
   // fastest budget-respecting on-path stop (T_min) from the trip rate.
   {
     const auto min_stop = compute_soft_on_path_min_stop_time(
-        accepted_trajectory, projection.time_from_start_s, path_time_rate,
+        accepted_trajectory, seam_cursor_s, path_time_rate,
         stop_profile.per_joint_max_deceleration_rad_s2);
     if (min_stop.ok()) {
       // Cannot stop on-path within the budget at all: even the fastest
@@ -892,7 +890,7 @@ Result<SoftOnPathStopPlanDTO> plan_soft_on_path_stop(
   }
 
   const double handoff_path_time =
-      projection.time_from_start_s + path_time_rate * config.stop_traj_delta_s;
+      seam_cursor_s + path_time_rate * config.stop_traj_delta_s;
   const double stop_path_time =
       handoff_path_time + 0.5 * path_time_rate * effective_ramp_s;
   const double final_path_time =
@@ -952,6 +950,12 @@ Result<SoftOnPathStopPlanDTO> plan_soft_on_path_stop(
       format_double(plan.runtime_velocity_scale_at_trip);
   plan.diagnostics["stop_traj_delta_s"] = format_double(plan.stop_traj_delta_s);
   plan.diagnostics["effective_ramp_s"] = format_double(plan.effective_ramp_s);
+  // Seam cursor (where the lead-in/ramp anchor) vs the measured-position
+  // projection: their difference is the command-vs-measured tracking lag the
+  // command-frame seam corrects for.
+  plan.diagnostics["seam_cursor_s"] = format_double(seam_cursor_s);
+  plan.diagnostics["measured_projection_s"] =
+      format_double(projection.time_from_start_s);
   plan.diagnostics["initial_path_deviation_rad"] =
       format_double(plan.initial_path_deviation_rad);
   plan.diagnostics["initial_velocity_deviation_rad_s"] =
@@ -959,115 +963,40 @@ Result<SoftOnPathStopPlanDTO> plan_soft_on_path_stop(
   plan.diagnostics["jerk_limit_source"] = plan.jerk_limit_source;
 
   plan.replacement_trajectory.joint_names = accepted_trajectory.joint_names;
-  // Anchor-authority rule for the stop seam. The first replacement waypoint AND
-  // the handoff bridge start MUST be a single coherent (q, qdot, qddot) state
-  // drawn from one authority. Mixing sources makes q0 incoherent with v0/a0,
-  // and the short stop_traj_delta_s handoff quintic amplifies the
-  // measured-vs-path deviation (~60*deviation / T^3) into a per-joint jerk far
-  // over the limit — which rejects the soft stop and forces the spring-back
-  // fallback. Measured feedback is still retained for diagnostics (initial path
-  // deviation, velocity deviation, sample age/lag, stop confirmation, audit) —
-  // those are computed above and are unaffected by this seam choice.
-  //
-  //   model/command authoritative (use_model_velocity): projected on-path
-  //       q, qdot, qddot together.
-  //   feedback authoritative: measured q and measured qdot together. Measured
-  //       acceleration is not exposed on the observed state (and
-  //       double-differenced feedback is too noisy to seed a jerk-checked
-  //       quintic), so qddot = 0 — a self-consistent zero-acceleration feedback
-  //       seam rather than borrowing the model's path acceleration.
-  std::vector<double> anchor_position;
-  std::vector<double> anchor_velocity;
-  std::vector<double> anchor_acceleration(joint_count, 0.0);
-  if (use_model_velocity) {
-    anchor_position = projected_sample.position;
-    anchor_velocity = projected_velocity;
+  // Command-frame lead-in seam (TARGET §5.4): open the replacement with the
+  // in-flight accepted trajectory itself, resampled at the current command rate
+  // from the trip cursor for the lead-in budget D_lead (config.stop_traj_delta_s),
+  // then the decel ramp. The lead-in IS the backend command, so the seam
+  // continues identical motion — continuity holds by construction, with no
+  // synthetic bridge reconciling a measured anchor against the path (the source
+  // of the handoff-jerk escalation that forced spring-back). The first sample
+  // (tau = 0) carries the live command (q, qdot, qddot) as the seam pin; the ramp
+  // continues from the on-path point at cursor + path_time_rate * D_lead,
+  // derivative-coherent for free. The lead-in is the already-validated original
+  // command, so it is NOT re-checked against the stop's deceleration budget (the
+  // move may legitimately run faster than the stop decel). Measured feedback is
+  // retained only as a monitor (initial path/velocity deviation, sample age, stop
+  // confirmation), computed above and unaffected by this seam.
+  plan.diagnostics["seam"] = "command_frame_lead_in";
+  const double lead_in_s = config.stop_traj_delta_s;
+  const size_t lead_in_samples = std::max<size_t>(
+      1, static_cast<size_t>(std::ceil(lead_in_s / config.sample_period_s)));
+  for (size_t i = 0; i < lead_in_samples; ++i) {
+    const double tau =
+        lead_in_s * static_cast<double>(i) / static_cast<double>(lead_in_samples);
+    const double path_time = seam_cursor_s + path_time_rate * tau;
+    const PathSample lead_sample = sample_path(accepted_trajectory, path_time);
+    TrajectoryWaypointDTO wp;
+    wp.time_from_start_s = tau;
+    wp.positions_rad = lead_sample.position;
+    wp.velocities_rad_s.resize(joint_count, 0.0);
+    wp.accelerations_rad_s2.resize(joint_count, 0.0);
     for (size_t j = 0; j < joint_count; ++j) {
-      anchor_acceleration[j] =
-          projected_sample.d2_position_dt2[j] * path_time_rate * path_time_rate;
+      wp.velocities_rad_s[j] = lead_sample.d_position_dt[j] * path_time_rate;
+      wp.accelerations_rad_s2[j] =
+          lead_sample.d2_position_dt2[j] * path_time_rate * path_time_rate;
     }
-  } else {
-    anchor_position = ordered_state.positions;
-    anchor_velocity = ordered_state.velocities;
-    // anchor_acceleration stays zero: no measured acceleration is available.
-  }
-  plan.diagnostics["anchor_authority"] =
-      use_model_velocity ? "model_projected_path" : "measured_feedback";
-
-  TrajectoryWaypointDTO anchor;
-  anchor.time_from_start_s = 0.0;
-  anchor.positions_rad = anchor_position;
-  anchor.velocities_rad_s = anchor_velocity;
-  anchor.accelerations_rad_s2 = anchor_acceleration;
-  plan.replacement_trajectory.waypoints.push_back(std::move(anchor));
-
-  const PathSample handoff_sample =
-      sample_path(accepted_trajectory, handoff_path_time);
-  std::vector<double> handoff_velocity(joint_count, 0.0);
-  std::vector<double> handoff_acceleration(joint_count, 0.0);
-  for (size_t j = 0; j < joint_count; ++j) {
-    handoff_velocity[j] = handoff_sample.d_position_dt[j] * path_time_rate;
-    handoff_acceleration[j] =
-        handoff_sample.d2_position_dt2[j] * path_time_rate * path_time_rate;
-  }
-  if (config.stop_traj_delta_s > kEpsilon) {
-    const auto handoff_trajectory = make_two_point_trajectory(
-        accepted_trajectory.joint_names,
-        anchor_position,
-        anchor_velocity,
-        anchor_acceleration,
-        handoff_sample.position,
-        handoff_velocity,
-        handoff_acceleration,
-        config.stop_traj_delta_s);
-    const size_t handoff_samples = std::max<size_t>(
-        1, static_cast<size_t>(
-               std::ceil(config.stop_traj_delta_s / config.sample_period_s)));
-    std::vector<double> previous_handoff_accel;
-    double previous_handoff_time = 0.0;
-    for (size_t i = 0; i <= handoff_samples; ++i) {
-      const double t = config.stop_traj_delta_s *
-                       static_cast<double>(i) /
-                       static_cast<double>(handoff_samples);
-      const auto handoff_state = sample_path(handoff_trajectory, t);
-      const auto handoff_projection =
-          project_to_path(accepted_trajectory, handoff_state.position);
-      plan.path_deviation_max_rad = std::max(
-          plan.path_deviation_max_rad, handoff_projection.distance_rad);
-      for (size_t j = 0; j < joint_count; ++j) {
-        const auto& joint_name = accepted_trajectory.joint_names[j];
-        const double accel_limit =
-            stop_profile.per_joint_max_deceleration_rad_s2.at(joint_name);
-        if (std::abs(handoff_state.d2_position_dt2[j]) >
-            accel_limit + 1e-8) {
-          return err("soft_on_path_handoff_acceleration_limit_exceeded",
-                     "soft_on_path handoff segment exceeds a per-joint acceleration limit",
-                     {{"joint", joint_name},
-                      {"acceleration_rad_s2",
-                       format_double(handoff_state.d2_position_dt2[j])},
-                      {"limit_rad_s2", format_double(accel_limit)}});
-        }
-        if (!previous_handoff_accel.empty()) {
-          const double dt = t - previous_handoff_time;
-          if (dt > kEpsilon) {
-            const double jerk =
-                (handoff_state.d2_position_dt2[j] -
-                 previous_handoff_accel[j]) /
-                dt;
-            const double jerk_limit = jerk_limits.at(joint_name);
-            if (std::abs(jerk) > jerk_limit + 1e-8) {
-              return err("soft_on_path_handoff_jerk_limit_exceeded",
-                         "soft_on_path handoff segment exceeds a per-joint jerk limit",
-                         {{"joint", joint_name},
-                          {"jerk_rad_s3", format_double(jerk)},
-                          {"limit_rad_s3", format_double(jerk_limit)}});
-            }
-          }
-        }
-      }
-      previous_handoff_accel = handoff_state.d2_position_dt2;
-      previous_handoff_time = t;
-    }
+    plan.replacement_trajectory.waypoints.push_back(std::move(wp));
   }
 
   const SoftOnPathStopPlanDTO base_plan_before_ramp = plan;
@@ -1416,6 +1345,12 @@ bool soft_on_path_error_recommends_natural_completion(
          disposition_it->second == "natural_completion";
 }
 
+bool soft_on_path_error_recommends_hard_stop(const ErrorDTO& error) {
+  const auto disposition_it = error.details.find("recommended_disposition");
+  return disposition_it != error.details.end() &&
+         disposition_it->second == "hard_stop";
+}
+
 Result<double> measure_soft_on_path_path_deviation(
     const TrajectoryDTO& accepted_trajectory,
     const RobotStateDTO& observed_state) {
@@ -1443,12 +1378,18 @@ Result<double> measure_soft_on_path_path_deviation(
 Result<TrajectoryDTO> shift_soft_stop_for_dispatch_latency(
     const TrajectoryDTO& planned,
     double compute_latency_s,
-    double stop_duration_s,
-    const RobotStateDTO& dispatch_anchor_state,
+    double lead_in_budget_s,
+    const TrajectoryDTO& accepted_trajectory,
+    double command_cursor_s,
+    double path_time_rate,
     const DispatchLatencyShiftConfig& config) {
   const auto valid_shape = validate_trajectory_shape(planned);
   if (!valid_shape.ok()) {
     return Result<TrajectoryDTO>::Err(valid_shape.error());
+  }
+  const auto valid_accepted = validate_trajectory_shape(accepted_trajectory);
+  if (!valid_accepted.ok()) {
+    return Result<TrajectoryDTO>::Err(valid_accepted.error());
   }
   if (!std::isfinite(compute_latency_s) || compute_latency_s < 0.0) {
     return Result<TrajectoryDTO>::Err(ErrorDTO{
@@ -1457,18 +1398,19 @@ Result<TrajectoryDTO> shift_soft_stop_for_dispatch_latency(
         {{"reason", "invalid_compute_latency_s"},
          {"compute_latency_s", format_double(compute_latency_s)}}});
   }
-  if (!finite_positive(stop_duration_s)) {
+  if (!finite_positive(lead_in_budget_s)) {
     return Result<TrajectoryDTO>::Err(ErrorDTO{
         std::string(to_string(ErrorCode::kInvalidRequest)),
-        "dispatch-latency shift requires a finite, positive stop duration",
-        {{"reason", "invalid_stop_duration_s"},
-         {"stop_duration_s", format_double(stop_duration_s)}}});
+        "dispatch-latency shift requires a finite, positive lead-in budget",
+        {{"reason", "invalid_lead_in_budget_s"},
+         {"lead_in_budget_s", format_double(lead_in_budget_s)}}});
   }
-  if (!finite_positive(config.max_latency_fraction)) {
+  if (!std::isfinite(path_time_rate) || path_time_rate < 0.0) {
     return Result<TrajectoryDTO>::Err(ErrorDTO{
         std::string(to_string(ErrorCode::kInvalidRequest)),
-        "dispatch-latency shift requires a finite, positive max_latency_fraction",
-        {{"reason", "invalid_max_latency_fraction"}}});
+        "dispatch-latency shift requires a finite, non-negative path_time_rate",
+        {{"reason", "invalid_path_time_rate"},
+         {"path_time_rate", format_double(path_time_rate)}}});
   }
   if (!std::isfinite(config.anchor_negative_time_s) ||
       config.anchor_negative_time_s >= 0.0) {
@@ -1480,41 +1422,45 @@ Result<TrajectoryDTO> shift_soft_stop_for_dispatch_latency(
           format_double(config.anchor_negative_time_s)}}});
   }
 
-  // Guard: the compute latency must not eat too much of the stop budget. Compute
-  // is a few ms; this trips only on a too-small stop time or a compute hiccup,
-  // and the caller escalates to a hard stop (stop-time violation).
-  if (compute_latency_s >= config.max_latency_fraction * stop_duration_s) {
+  // Reliability guard: if the compute+dispatch latency consumed the command-frame
+  // lead-in budget there is no command-continuation left to seam onto, so escalate
+  // to a hard stop rather than emit a degraded seam. This is the worst-case path
+  // (a slow planner — e.g. the ALI/backtracking tail — or a too-small lead-in),
+  // not the common few-ms case.
+  if (compute_latency_s >= lead_in_budget_s) {
     return Result<TrajectoryDTO>::Err(ErrorDTO{
         std::string(to_string(ErrorCode::kMotionInterruptBackendStopFailed)),
-        "dispatch latency reached the stop-budget fraction; escalate to hard stop",
-        {{"reason", "dispatch_latency_exceeds_budget"},
+        "dispatch latency consumed the lead-in budget; escalate to hard stop",
+        {{"reason", "dispatch_latency_exceeds_lead_in"},
          {"recommended_disposition", "hard_stop"},
          {"compute_latency_s", format_double(compute_latency_s)},
-         {"stop_duration_s", format_double(stop_duration_s)},
-         {"max_latency_fraction", format_double(config.max_latency_fraction)}}});
+         {"lead_in_budget_s", format_double(lead_in_budget_s)}}});
   }
 
-  const auto ordered_anchor =
-      order_state_for_trajectory(dispatch_anchor_state, planned.joint_names);
-  if (!ordered_anchor.ok()) {
-    return Result<TrajectoryDTO>::Err(ordered_anchor.error());
-  }
-  const OrderedState& anchor = ordered_anchor.value();
   const size_t joint_count = planned.joint_names.size();
 
   TrajectoryDTO shifted;
   shifted.joint_names = planned.joint_names;
 
-  // Leading negative-time continuity anchor at the fresh dispatch-time state, so
-  // JTC's spline takes over from where the robot actually is now (mirrors the
-  // proven spring_back anchor; see send_fjt_anchored_goal).
+  // Leading negative-time continuity pin at the COMMAND state at the advanced
+  // cursor (where the controller's command has reached by dispatch), carrying the
+  // full q, qdot, qddot sampled from the accepted trajectory — command-frame, not
+  // a measured or partial (qddot=0) state — so stock JTC's spline starts through
+  // the live command frame (mirrors send_fjt_anchored_goal's past-anchor).
+  const double advanced_cursor_s =
+      command_cursor_s + path_time_rate * compute_latency_s;
+  const PathSample pin_sample =
+      sample_path(accepted_trajectory, advanced_cursor_s);
   TrajectoryWaypointDTO anchor_wp;
   anchor_wp.time_from_start_s = config.anchor_negative_time_s;
-  anchor_wp.positions_rad = anchor.positions;
-  anchor_wp.velocities_rad_s =
-      anchor.has_velocity ? anchor.velocities
-                          : std::vector<double>(joint_count, 0.0);
+  anchor_wp.positions_rad = pin_sample.position;
+  anchor_wp.velocities_rad_s.assign(joint_count, 0.0);
   anchor_wp.accelerations_rad_s2.assign(joint_count, 0.0);
+  for (size_t j = 0; j < joint_count; ++j) {
+    anchor_wp.velocities_rad_s[j] = pin_sample.d_position_dt[j] * path_time_rate;
+    anchor_wp.accelerations_rad_s2[j] =
+        pin_sample.d2_position_dt2[j] * path_time_rate * path_time_rate;
+  }
   shifted.waypoints.push_back(std::move(anchor_wp));
 
   // Shift every planned waypoint earlier by the elapsed compute latency and drop

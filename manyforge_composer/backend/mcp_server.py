@@ -138,6 +138,7 @@ def create_mcp_server(state: ComposerState):
 
         if state.cycle_manager is not None and state.cycle_manager.state in {
             CycleState.RUNNING,
+            CycleState.STOPPING,
             CycleState.DIRECT_CONTROL,
         }:
             cycle_state = state.cycle_manager.state
@@ -385,7 +386,8 @@ def create_mcp_server(state: ComposerState):
                            0.0 will stall the robot — use "stop" to pause instead.
             principal_id: Optional actor identity for velocity-change audit.
 
-        Cycle states include idle, running, stopped, and direct_control.
+        Cycle states include idle, running, stopping, stopped, and
+        direct_control.
         Kernel terminal acknowledgement is runtime-owned and is not a
         behavior-tree authoring action.
         """

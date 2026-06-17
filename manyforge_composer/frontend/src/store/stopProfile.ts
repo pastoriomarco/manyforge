@@ -286,25 +286,25 @@ export function evaluateStopRunGate(runtime: RuntimeStatus | null): StopRunGate 
 /**
  * Whether the velocity-scale slider must be frozen.
  *
- * The cycle FSM jumps running→stopped synchronously (there is no intermediate
- * 'stopping' state), and the controlled-stop deceleration ramp executes while
- * the cycle is already 'stopped'. So the slider is frozen both while a stop is
- * in flight (operator pressed Stop, state has not yet settled) and for the
- * whole 'stopped' hold — rescaling motion is meaningless/unsafe there. 'idle',
- * 'running' and 'direct_control' keep the slider live.
+ * The slider is frozen while the stop command is in flight, while the backend
+ * explicitly reports 'stopping', and for the whole 'stopped' hold — rescaling
+ * motion is meaningless/unsafe there. 'idle', 'running' and 'direct_control'
+ * keep the slider live unless the local stop latch is active.
  */
 export function shouldFreezeVelocitySlider(
   cycleState: string,
   stopInProgress: boolean,
 ): boolean {
-  return stopInProgress || cycleState === 'stopped';
+  return stopInProgress || cycleState === 'stopping' || cycleState === 'stopped';
 }
 
 /**
  * Whether the transient stop-in-progress latch should clear. Once the cycle
- * leaves the running/jog states it has settled — to 'stopped' (which freezes
- * the slider on its own) or 'idle' — so the latch is no longer needed.
+ * leaves the running/stopping/jog states it has settled — to 'stopped' (which
+ * freezes the slider on its own) or 'idle' — so the latch is no longer needed.
  */
 export function shouldClearStopInProgress(cycleState: string): boolean {
-  return cycleState !== 'running' && cycleState !== 'direct_control';
+  return cycleState !== 'running' &&
+    cycleState !== 'stopping' &&
+    cycleState !== 'direct_control';
 }

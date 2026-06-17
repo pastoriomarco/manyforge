@@ -5,6 +5,7 @@ describe('cycle state boundary parsing', () => {
   it('accepts every backend cycle state currently exposed to Composer', () => {
     expect(parseCycleState('idle')).toBe('idle');
     expect(parseCycleState('running')).toBe('running');
+    expect(parseCycleState('stopping')).toBe('stopping');
     expect(parseCycleState('stopped')).toBe('stopped');
     expect(parseCycleState('direct_control')).toBe('direct_control');
   });

@@ -195,11 +195,22 @@ const ERROR_CODE_MAPPING: Record<string, HeadlineMapping> = {
   motion_interrupt_backend_stop_failed: {
     headline: (d) => {
       const reason = stringField(d, 'reason') || stringField(d, 'reason_code');
+      if (reason === 'soft_on_path_escalated_to_hard_deceleration') {
+        // Not a failure: the path-preserving soft stop was infeasible, so the
+        // backend escalated to a hard deceleration. The robot is at rest.
+        return 'On-path soft stop infeasible — escalated to a hard stop (robot stopped)';
+      }
       return reason
         ? `Backend stop failed: ${reason}`
         : 'Backend stop failed during motion-scoped interrupt';
     },
-    hint: 'Reset the cycle to clear the kernel intervention state.',
+    hint: (d) => {
+      const reason = stringField(d, 'reason') || stringField(d, 'reason_code');
+      if (reason === 'soft_on_path_escalated_to_hard_deceleration') {
+        return 'The path-preserving soft stop could not be produced within the configured stop limits, so the robot was brought to rest on a hard deceleration. Review the stop diagnostics below, then press Run or Reset to clear the kernel intervention and continue.';
+      }
+      return 'Reset the cycle to clear the kernel intervention state.';
+    },
     severity: 'fault',
   },
   motion_interrupt_latched: {

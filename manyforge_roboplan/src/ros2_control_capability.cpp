@@ -114,11 +114,10 @@ compute_ros2_control_motion_interrupt_stop_capability(
   };
 
   // soft_on_path is NOT gated on the JTC speed-scaling configuration: when
-  // speed-scaling is active the
-  // backend asserts unit execution scale atomically with the preempting stop
-  // dispatch (see execute_controlled_stop), so the computed wall-time stop is
-  // honored regardless. The path-ramp profile is therefore advertised whenever
-  // it is enabled and validly configured.
+  // speed-scaling is active the backend publishes unit execution scale
+  // immediately before the preempting stop dispatch (see execute_controlled_stop).
+  // DDS does not make that publish/action pair atomic; qualification must verify
+  // the seam on the target controller with speed-scaling enabled.
   if (config.enable_soft_on_path_path_ramp &&
       soft_on_path_capability_config_valid(config)) {
     append_soft_profile("soft_on_path_path_ramp");

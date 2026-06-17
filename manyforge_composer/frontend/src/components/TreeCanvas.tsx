@@ -38,7 +38,7 @@ export function TreeCanvas() {
   const cycleState = useCycleStore((state) => state.state);
   const reactFlowWrapper = useRef<HTMLDivElement>(null);
   const reactFlowInstance = useRef<ReactFlowInstance<Node, Edge> | null>(null);
-  const isRunning = cycleState === 'running';
+  const isRunning = cycleState === 'running' || cycleState === 'stopping';
 
   const validateConnection = useCallback(
     (connection: Connection | Edge): string | null => {

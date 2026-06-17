@@ -107,6 +107,18 @@ describe('KernelErrorPanel mapping', () => {
       expect(headline).toBe('Backend stop failed: hard_deceleration_not_canceled');
     });
 
+    it('shows an explicit escalation message for soft_on_path -> hard_deceleration', () => {
+      const details = { reason: 'soft_on_path_escalated_to_hard_deceleration' };
+      // Not "Backend stop failed: ..." — the stop did not fail, it escalated
+      // and the robot is at rest.
+      expect(
+        headlineForError('motion_interrupt_backend_stop_failed', details, 'Backend stop failed'),
+      ).toBe('On-path soft stop infeasible — escalated to a hard stop (robot stopped)');
+      const hint = hintForError('motion_interrupt_backend_stop_failed', details);
+      expect(hint).toContain('hard deceleration');
+      expect(hint).toContain('Run or Reset');
+    });
+
     it('returns the human message when no errorCode mapping exists', () => {
       const headline = headlineForError(
         'totally_made_up_code',

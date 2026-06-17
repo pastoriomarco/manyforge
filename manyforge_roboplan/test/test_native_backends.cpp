@@ -10,6 +10,7 @@
 #include <cmath>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <limits>
 #include <map>
 #include <mutex>
@@ -1783,6 +1784,10 @@ TEST_F(NativeKernelTest,
   EXPECT_EQ(result.stop_command_source,
             MotionInterruptStopCommandSource::kNativeSimulatedPathRamp);
   EXPECT_EQ(result.diagnostics.at("runtime_scale_isolated"), "true");
+  EXPECT_EQ(result.diagnostics.at("runtime_scale_isolation"),
+            "owned_scale_frozen_during_stop");
+  EXPECT_EQ(result.diagnostics.at("timeline_authority_tier"),
+            "owned_scale_asserted");
   EXPECT_EQ(result.diagnostics.at("runtime_velocity_scale_at_trip"), "0.25");
   EXPECT_LT(call_elapsed, std::chrono::milliseconds(700))
       << "soft_on_path replacement trajectory must run in wall time; "
@@ -1793,6 +1798,71 @@ TEST_F(NativeKernelTest,
   ASSERT_TRUE(handle.wait_for_completion(2'000'000'000LL));
   auto stopped = bundle_->execution->get_execution_snapshot();
   EXPECT_EQ(stopped.state, ExecutionState::kStopped);
+}
+
+TEST_F(NativeKernelTest,
+       NativeBackend_ControlledStop_DefersDirectScaleWriteUntilStopExits) {
+  auto start_state = bundle_->context->get_current_state();
+  ASSERT_FALSE(start_state.positions_rad.empty());
+
+  std::vector<double> goal = start_state.positions_rad;
+  goal[0] += 0.7;
+  if (goal.size() > 1) {
+    goal[1] += 0.2;
+  }
+
+  TrajectoryDTO traj;
+  traj.joint_names = start_state.joint_names;
+  traj.waypoints.push_back(
+      TrajectoryWaypointDTO{0.0, start_state.positions_rad, {}, {}});
+  traj.waypoints.push_back(TrajectoryWaypointDTO{3.0, goal, {}, {}});
+
+  bundle_->execution->set_runtime_velocity_scale(1.0);
+  auto handle = bundle_->execution->execute_trajectory(traj);
+  std::this_thread::sleep_for(std::chrono::milliseconds(180));
+
+  MotionInterruptStopProfileDTO profile;
+  profile.profile_id = "native_soft_on_path_direct_scale_defer";
+  profile.stop_mode = MotionInterruptStopMode::kSoftOnPath;
+  profile.deceleration_time_s = 0.45;
+  profile.max_stop_time_s = 1.0;
+  profile.allowed_fallback_modes = {MotionInterruptStopMode::kSpringBackHold};
+  for (const auto& joint_name : start_state.joint_names) {
+    profile.per_joint_max_deceleration_rad_s2[joint_name] = 100.0;
+  }
+
+  auto* execution = bundle_->execution.get();
+  std::thread slider_thread([execution]() {
+    std::this_thread::sleep_for(std::chrono::milliseconds(40));
+    execution->set_runtime_velocity_scale(0.0);
+  });
+
+  auto result = bundle_->execution->execute_controlled_stop(profile);
+  slider_thread.join();
+
+  EXPECT_TRUE(result.accepted);
+  EXPECT_TRUE(result.backend_stop_confirmed);
+  EXPECT_EQ(result.executed_stop_mode, MotionInterruptStopMode::kSoftOnPath);
+  ASSERT_TRUE(handle.wait_for_completion(2'000'000'000LL));
+
+  auto restart_goal = start_state.positions_rad;
+  restart_goal[0] += 0.4;
+  TrajectoryDTO restart;
+  restart.joint_names = start_state.joint_names;
+  restart.waypoints.push_back(
+      TrajectoryWaypointDTO{0.0, start_state.positions_rad, {}, {}});
+  restart.waypoints.push_back(TrajectoryWaypointDTO{1.0, restart_goal, {}, {}});
+
+  auto restart_handle = bundle_->execution->execute_trajectory(restart);
+  std::this_thread::sleep_for(std::chrono::milliseconds(350));
+  const auto held = restart_handle.get_snapshot();
+  ASSERT_EQ(held.joint_positions_rad.size(), start_state.positions_rad.size());
+  EXPECT_NEAR(held.joint_positions_rad[0], start_state.positions_rad[0], 0.02)
+      << "direct backend scale write made during a controlled stop must be "
+         "applied after the stop exits, freezing the next trajectory at scale=0";
+
+  bundle_->execution->set_runtime_velocity_scale(1.0);
+  ASSERT_TRUE(restart_handle.wait_for_completion(3'000'000'000LL));
 }
 
 TEST_F(NativeKernelTest,
@@ -1817,7 +1887,6 @@ TEST_F(NativeKernelTest,
   profile.stop_mode = MotionInterruptStopMode::kSoftOnPath;
   profile.deceleration_time_s = 1.0;
   profile.max_stop_time_s = 1.0;
-  profile.allow_natural_completion_on_short_path = true;
   for (const auto& joint_name : start_state.joint_names) {
     profile.per_joint_max_deceleration_rad_s2[joint_name] = 100.0;
   }
@@ -1835,6 +1904,60 @@ TEST_F(NativeKernelTest,
   ASSERT_TRUE(handle.wait_for_completion(2'000'000'000LL));
   auto completed = bundle_->execution->get_execution_snapshot();
   EXPECT_EQ(completed.state, ExecutionState::kCompleted);
+}
+
+TEST_F(NativeKernelTest,
+       NativeBackend_NaturalCompletionPublishesStoppingWhileOriginalTrajectoryFinishes) {
+  auto start_state = bundle_->context->get_current_state();
+  ASSERT_FALSE(start_state.positions_rad.empty());
+
+  std::vector<double> goal = start_state.positions_rad;
+  goal[0] += 0.2;
+
+  TrajectoryDTO traj;
+  traj.joint_names = start_state.joint_names;
+  traj.waypoints.push_back(
+      TrajectoryWaypointDTO{0.0, start_state.positions_rad, {}, {}});
+  traj.waypoints.push_back(TrajectoryWaypointDTO{0.8, goal, {}, {}});
+
+  auto handle = bundle_->execution->execute_trajectory(traj);
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+  MotionInterruptStopProfileDTO profile;
+  profile.profile_id = "native_soft_on_path_natural_completion_visible";
+  profile.stop_mode = MotionInterruptStopMode::kSoftOnPath;
+  profile.deceleration_time_s = 1.0;
+  profile.max_stop_time_s = 1.0;
+  for (const auto& joint_name : start_state.joint_names) {
+    profile.per_joint_max_deceleration_rad_s2[joint_name] = 100.0;
+  }
+
+  auto future = std::async(std::launch::async, [this, profile]() {
+    return bundle_->execution->execute_controlled_stop(profile);
+  });
+
+  bool saw_stopping = false;
+  for (int i = 0; i < 50; ++i) {
+    if (future.wait_for(std::chrono::milliseconds(0)) ==
+        std::future_status::ready) {
+      break;
+    }
+    if (bundle_->execution->get_execution_snapshot().state ==
+        ExecutionState::kStopping) {
+      saw_stopping = true;
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+
+  auto result = future.get();
+  EXPECT_TRUE(saw_stopping);
+  EXPECT_TRUE(result.accepted);
+  EXPECT_TRUE(result.backend_stop_confirmed);
+  EXPECT_TRUE(result.completed_by_natural_completion);
+  ASSERT_TRUE(handle.wait_for_completion(2'000'000'000LL));
+  EXPECT_EQ(bundle_->execution->get_execution_snapshot().state,
+            ExecutionState::kCompleted);
 }
 
 TEST_F(NativeKernelTest,

@@ -1,6 +1,6 @@
 // Cycle
 export interface CycleStatus {
-  state: 'idle' | 'running' | 'stopped' | 'direct_control';
+  state: 'idle' | 'running' | 'stopping' | 'stopped' | 'direct_control';
   velocityScale: number;
   // Structured error surface: empty when no error is active. `errorCode` is
   // a stable machine token (e.g. "validation_collision",
@@ -1081,7 +1081,7 @@ export interface ModelEndpointCatalog {
 
 // WebSocket
 export interface StateUpdate {
-  state: 'idle' | 'running' | 'stopped' | 'direct_control';
+  state: 'idle' | 'running' | 'stopping' | 'stopped' | 'direct_control';
   velocityScale: number;
   nodeStatuses?: Record<string, string>;
   nativeKernelEvents?: Record<string, unknown>[];

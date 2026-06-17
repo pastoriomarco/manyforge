@@ -39,13 +39,23 @@ backend-authored replacement goals.
 | `spring_back_hold` | Backend sends a seam-preserving anchored FJT goal to the trip/observed joint position with zero terminal velocity. Native stops the worker and holds the observed position. | Non-critical fallback / visible hold behavior. It must not be implemented as cancel-first. |
 | `hard_deceleration` | JTC cancel path when `decelerate_on_cancel` is configured and proven. | Preferred hard-stop floor where available. |
 | `immediate` hard-stop floor | Plain cancel/hold. | Last-resort physical stop when controlled replacement cannot be trusted. |
-| Natural completion | Let the already accepted trajectory finish when it will reach rest sooner than the requested stop window and policy allows it. | Short-path case only, bounded by `max_stop_time_s`. |
+| Natural completion | Let the already accepted trajectory finish when it will reach rest sooner than the requested stop window and policy allows it. | Short-path case only, bounded by the effective stop deadline. Enabled by default; precision-contact lanes must opt out explicitly. |
 
 `soft_on_path` and `spring_back_hold` are replacement/preemption profiles. They
 must be sent before JTC enters cancel hold or `decelerate_on_cancel`, otherwise
 the controller can introduce exactly the bump these profiles are meant to avoid.
 `hard_deceleration` and `immediate` are native JTC cancel functions and are a
 different category.
+
+Hard-stop floors are only issued while ManyForge has reason to believe a
+controller goal may still be active or untrusted: refused controlled stop,
+unconfirmed stop, deadline watchdog, stop-path collision, or explicit hard-stop
+disposition. If a controlled stop was accepted and backend-confirmed but
+measured velocity still fails to settle within the effective stop deadline, ManyForge does
+not issue another JTC cancel. At that point there is no known active trajectory
+to cancel; the condition means the robot/controller is not following the
+confirmed command, so ManyForge records `stop_not_settled_measured_velocity` and
+holds `INTERVENTION_REQUIRED` for operator/robot-safety recovery.
 
 ## 3. Defaults And Profile Validation
 
@@ -56,6 +66,15 @@ Shared constants are in
 - `kMaxControlledStopDecelerationTimeS = 2.0`.
 - `motion_interrupt_deceleration_time_or_default(profile)` is the only supported
   way for backends to resolve an unset stop deceleration time.
+- `allow_natural_completion_on_short_path` defaults to `true` on all lanes. The
+  short-path case is the least disruptive stop: the already accepted trajectory is
+  allowed to finish while snapshots report `Stopping`, then the backend reports
+  stopped/completed after fresh terminal evidence.
+- `max_stop_time_s` is optional. When set, it is the hard stop-confirmation
+  deadline. When unset, each backend derives the deadline from the requested stop
+  time plus its stop-confirmation tolerance: ros2_control uses
+  `deceleration_time_s + stop_completion_timeout_s`; the native backend uses
+  `deceleration_time_s + soft_on_path_sample_period_s`.
 
 Profile shape is validated in three layers:
 
@@ -217,10 +236,13 @@ For `soft_on_path`:
    executed as authored.
 6. Dispatch the replacement trajectory with
    `send_fjt_replacement_trajectory(...)`.
-7. Wait for the managed FJT result within `max_stop_time_s`.
-8. Read a fresh post-stop sample and publish a stopped snapshot.
-9. Set `backend_stop_confirmed=true` only after command completion and fresh
-   post-stop state are available.
+7. Wait for the managed FJT result within the effective stop deadline.
+8. Wait, bounded by the same stop budget, for measured velocity to settle when
+   the backend exposes velocity feedback. Normal controller-feedback lag is not
+   classified as failure from a single instantaneous sample.
+9. Read a fresh post-stop sample and publish a stopped snapshot.
+10. Set `backend_stop_confirmed=true` only after command completion and fresh
+    post-stop state are available.
 
 For `spring_back_hold`:
 
@@ -253,10 +275,11 @@ The stop planner starts from the effective trip state. If the robot is moving at
 reduced runtime scale, the measured/model-derived trip velocity already includes
 that scale, so the planned stop sheds the velocity that is actually present.
 
-On the ros2_control lane, ManyForge asserts unit execution scale when dispatching
-the replacement trajectory. This does not speed up the robot; the replacement
-trajectory already encodes the effective current velocity. The assertion prevents
-JTC from scaling the stop a second time.
+On the ros2_control lane, ManyForge publishes unit execution scale immediately
+before dispatching the replacement trajectory. This does not speed up the robot;
+the replacement trajectory already encodes the effective current velocity. The
+publish/action pair is not a DDS-atomic transaction, so speed-scaling-enabled
+lanes require seam validation on the target controller.
 
 Owned scaling must be frozen during stop. Hardware/vendor scaling that ManyForge
 cannot freeze must be monitored; a material change invalidates a timed soft-stop
@@ -269,7 +292,7 @@ Fallback decisions are deterministic from the trip-time planner result:
 | Planner/backend condition | Disposition |
 | --- | --- |
 | Planner succeeds | execute `soft_on_path`. |
-| Original trajectory naturally reaches rest within policy window | natural completion, if allowed. |
+| Original trajectory naturally reaches rest within policy window | natural completion, enabled by default unless the profile opts out. |
 | Recoverable soft planner failure and `spring_back_hold` is allowed | execute `spring_back_hold`. |
 | Infeasible stop time, ALI cannot prove a valid trajectory, dispatch timeout, scaling-source change, or stop monitor timeout | hard-stop category. |
 

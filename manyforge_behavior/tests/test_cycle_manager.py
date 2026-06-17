@@ -10,7 +10,12 @@ import py_trees
 import yaml
 
 from manyforge_behavior.capabilities import V0_0_REQUIRED_KEYS
-from manyforge_behavior.kernel_client import CommandResult, ExecutionState, MockKernelClient
+from manyforge_behavior.kernel_client import (
+    CommandResult,
+    ExecutionState,
+    ExecutionStatus,
+    MockKernelClient,
+)
 from manyforge_behavior.runner import OrchestratorRunner
 from manyforge_behavior.cycle_manager import (
     ROS2_CONTROL_BACKEND_FAULT_CLASSES,
@@ -286,6 +291,90 @@ class TestCycleManagerStop:
         time.sleep(0.05)
         
         manager.stop()
+        assert manager.state == CycleState.STOPPED
+
+    def test_stop_exposes_stopping_state_and_run_is_noop_until_settled(self):
+        """The HMI must see the controlled-stop window as STOPPING so Run can
+        stay disabled and Stop can render "Stopping" until the backend returns."""
+
+        class BlockingStopKernel(MockKernelClient):
+            def __init__(self):
+                super().__init__(execute_duration_s=1.0)
+                self.stop_entered = threading.Event()
+                self.release_stop = threading.Event()
+
+            def stop(self):  # type: ignore[override]
+                self.stop_entered.set()
+                assert self.release_stop.wait(timeout=2.0)
+                return super().stop()
+
+        slow_kernel = BlockingStopKernel()
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, slow_kernel)
+        manager = CycleManager(runner, slow_kernel)
+
+        manager.run()
+        assert manager.state == CycleState.RUNNING
+        time.sleep(0.05)
+
+        stop_thread = threading.Thread(target=manager.stop, daemon=True)
+        stop_thread.start()
+        assert slow_kernel.stop_entered.wait(timeout=2.0)
+        assert manager.state == CycleState.STOPPING
+
+        manager.run()
+        assert manager.state == CycleState.STOPPING
+
+        slow_kernel.release_stop.set()
+        stop_thread.join(timeout=2.0)
+        assert not stop_thread.is_alive()
+        assert manager.state == CycleState.STOPPED
+
+    def test_stop_remains_stopping_until_async_kernel_stop_terminal(self):
+        """The production kernel accepts stop asynchronously. Cycle STOPPING
+        must remain visible after kernel.stop() returns until the kernel itself
+        reaches a terminal state."""
+
+        class AsyncStoppingKernel(MockKernelClient):
+            def __init__(self):
+                super().__init__(execute_duration_s=1.0)
+                self.stop_called = threading.Event()
+                self.release_terminal = threading.Event()
+                self._reported_state = ExecutionState.EXECUTING
+
+            def stop(self):  # type: ignore[override]
+                self.stop_called.set()
+                self._reported_state = ExecutionState.STOPPING
+                return CommandResult(accepted=True)
+
+            def get_status(self):  # type: ignore[override]
+                if self.release_terminal.is_set():
+                    self._reported_state = ExecutionState.STOPPED
+                return ExecutionStatus(
+                    state=self._reported_state,
+                    execution_id=self._execution_id,
+                    progress=0.0,
+                    active_move_id=self._active_move_id,
+                )
+
+        slow_kernel = AsyncStoppingKernel()
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, slow_kernel)
+        manager = CycleManager(runner, slow_kernel)
+
+        manager.run()
+        assert manager.state == CycleState.RUNNING
+        time.sleep(0.05)
+
+        manager.stop()
+        assert slow_kernel.stop_called.wait(timeout=2.0)
+        assert manager.state == CycleState.STOPPING
+
+        manager.run()
+        assert manager.state == CycleState.STOPPING
+
+        slow_kernel.release_terminal.set()
+        deadline = time.time() + 2.0
+        while manager.state == CycleState.STOPPING and time.time() < deadline:
+            time.sleep(0.01)
         assert manager.state == CycleState.STOPPED
     
     def test_tick_loop_sleeps_via_interruptible_stop_event(self, kernel):
@@ -1659,14 +1748,15 @@ class TestRos2ControlBackendFaultTaxonomy:
 
 
 class TestCycleStateMachine:
-    """spec/400 §6.6.2 — four-state machine."""
+    """spec/400 §6.6.2 — cycle state machine."""
 
     def test_all_documented_states_exist(self):
         names = {state.name for state in CycleState}
-        # The three baseline operator states plus the intervention state.
+        # The baseline operator states plus the stopping and intervention states.
         assert names >= {
             "IDLE",
             "RUNNING",
+            "STOPPING",
             "STOPPED",
             "DIRECT_CONTROL",
         }
@@ -1726,6 +1816,33 @@ class TestCycleManagerRunSideAutoAck:
         with pytest.raises(RuntimeError, match="Cannot auto-acknowledge"):
             manager.run()
         assert manager.state == CycleState.STOPPED
+
+    def test_run_from_stopped_refuses_auto_ack_when_stop_did_not_settle(self):
+        # A measured-settle intervention means the robot/controller did not
+        # prove rest after a confirmed stop. Run must not auto-ack that into a
+        # backend reset because commanded-sim and some real backends reset by
+        # commanding an initial/home state.
+        from types import SimpleNamespace
+
+        manager, kernel = self._make_manager()
+        manager.run()
+        time.sleep(0.1)
+        manager.stop()
+        assert manager.state == CycleState.STOPPED
+
+        kernel._state = ExecutionState.INTERVENTION_REQUIRED
+        kernel.get_execution_snapshot = lambda: SimpleNamespace(
+            error_code="motion_interrupt_backend_stop_failed",
+            error_details={"reason": "stop_not_settled_measured_velocity"},
+        )
+
+        with pytest.raises(
+            RuntimeError,
+            match="stop_not_settled_measured_velocity",
+        ):
+            manager.run()
+        assert manager.state == CycleState.STOPPED
+        assert kernel.get_status().state == ExecutionState.INTERVENTION_REQUIRED
 
     def test_run_from_stopped_normal_path_unchanged(self):
         # The auto-ack code path only fires when the kernel is in

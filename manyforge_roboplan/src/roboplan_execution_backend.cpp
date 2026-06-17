@@ -18,6 +18,16 @@ namespace {
 constexpr auto kExecutionTick = std::chrono::milliseconds(10);
 constexpr double kRuntimeScaleSlewPerSecond = 4.0;  // 0→1 in 250 ms.
 
+double controlled_stop_wait_timeout_s(
+    const core::MotionInterruptStopProfileDTO& profile,
+    double stop_completion_tolerance_s) {
+  if (profile.max_stop_time_s.has_value()) {
+    return *profile.max_stop_time_s;
+  }
+  return core::motion_interrupt_deceleration_time_or_default(profile) +
+         std::max(0.0, stop_completion_tolerance_s);
+}
+
 double clamp_progress(double progress) {
   return std::max(0.0, std::min(1.0, progress));
 }
@@ -183,6 +193,8 @@ void RoboPlanExecutionBackend::execution_worker(std::stop_token st, core::Trajec
 
   if (st.stop_requested()) {
     state_.running.store(false);
+    state_.natural_completion_stop_requested.store(false,
+                                                   std::memory_order_release);
     execution_cv_.notify_all();
     return;
   }
@@ -277,7 +289,10 @@ void RoboPlanExecutionBackend::execution_worker(std::stop_token st, core::Trajec
       }
     }
     const auto snapshot_ns = publish_snapshot(
-        core::ExecutionState::kExecuting, progress, latest_positions);
+        state_.natural_completion_stop_requested.load(std::memory_order_acquire)
+            ? core::ExecutionState::kStopping
+            : core::ExecutionState::kExecuting,
+        progress, latest_positions);
     update_scene_positions(latest_positions, SceneUpdateMode::kBestEffort,
                            snapshot_ns);
 
@@ -305,6 +320,8 @@ void RoboPlanExecutionBackend::execution_worker(std::stop_token st, core::Trajec
 
   state_.running.store(false);
   state_.pause_requested.store(false);
+  state_.natural_completion_stop_requested.store(false,
+                                                 std::memory_order_release);
   execution_cv_.notify_all();
 }
 
@@ -318,6 +335,8 @@ core::ExecutionHandle RoboPlanExecutionBackend::execute_trajectory(
 
   state_.running.store(true);
   state_.pause_requested.store(false);
+  state_.natural_completion_stop_requested.store(false,
+                                                 std::memory_order_release);
   {
     std::lock_guard<std::mutex> lock(state_mutex_);
     state_.active_trajectory = trajectory;
@@ -360,6 +379,8 @@ core::StopResultDTO RoboPlanExecutionBackend::stop() {
         false, core::ErrorDTO{core::kErrorInvalidRequest, "No execution in flight", {}}};
   }
   state_.pause_requested.store(false);
+  state_.natural_completion_stop_requested.store(false,
+                                                 std::memory_order_release);
   worker_thread_.request_stop();
   execution_cv_.notify_all();
   return core::StopResultDTO{true, std::nullopt};
@@ -409,6 +430,12 @@ core::ControlledStopResultDTO
 RoboPlanExecutionBackend::execute_controlled_stop(
     const core::MotionInterruptStopProfileDTO& profile,
     std::stop_token stop_token) {
+  begin_controlled_stop_runtime_scale_freeze();
+  const auto runtime_scale_freeze_scope =
+      std::shared_ptr<void>(nullptr, [this](void*) {
+        end_controlled_stop_runtime_scale_freeze();
+      });
+
   // Defense in depth: the kernel's arm-time gate already rejects
   // unsupported modes, but a backend that has been mis-wired into
   // running the wrong mode at trip time MUST fail closed rather than
@@ -418,6 +445,8 @@ RoboPlanExecutionBackend::execute_controlled_stop(
 
   const auto cancelled_result = [&](std::string phase) {
     state_.running.store(false);
+    state_.natural_completion_stop_requested.store(false,
+                                                   std::memory_order_release);
     const auto latest = get_execution_snapshot();
     publish_snapshot(core::ExecutionState::kStopped,
                      latest.progress,
@@ -493,8 +522,19 @@ RoboPlanExecutionBackend::execute_controlled_stop(
       if (profile.allow_natural_completion_on_short_path &&
           core::soft_on_path_error_recommends_natural_completion(
               planned.error())) {
+        state_.natural_completion_stop_requested.store(true,
+                                                       std::memory_order_release);
+        execution_cv_.notify_all();
+        const auto natural_completion_scope =
+            std::shared_ptr<void>(nullptr, [this](void*) {
+              state_.natural_completion_stop_requested.store(
+                  false, std::memory_order_release);
+              execution_cv_.notify_all();
+            });
+        (void)natural_completion_scope;
         const auto call_start_ns = clock_.now();
-        const auto wait_deadline_s = profile.max_stop_time_s.value_or(1.0);
+        const auto wait_deadline_s = controlled_stop_wait_timeout_s(
+            profile, config_.soft_on_path_sample_period_s);
         const auto deadline = std::chrono::steady_clock::now() +
                               std::chrono::duration_cast<
                                   std::chrono::steady_clock::duration>(
@@ -527,6 +567,11 @@ RoboPlanExecutionBackend::execute_controlled_stop(
         result.diagnostics["soft_on_path_phase"] =
             "4.5G_natural_completion";
         result.diagnostics["requested_stop_mode"] = "soft_on_path";
+        result.diagnostics["wait_s"] = std::to_string(wait_deadline_s);
+        if (!profile.max_stop_time_s.has_value()) {
+          result.diagnostics["wait_s_default_source"] =
+              "deceleration_time_s_plus_soft_on_path_sample_period_s";
+        }
         result.stop_command_source =
             core::MotionInterruptStopCommandSource::kDiagnosticOther;
         if (!completed ||
@@ -537,7 +582,7 @@ RoboPlanExecutionBackend::execute_controlled_stop(
           result.error = core::ErrorDTO{
               std::string(core::kErrorMotionInterruptBackendStopFailed),
               "native soft_on_path natural completion did not reach the "
-              "trajectory endpoint within max_stop_time_s",
+              "trajectory endpoint within the effective stop deadline",
               {{"reason", "soft_on_path_natural_completion_timeout"},
                {"deadline_s", std::to_string(wait_deadline_s)}}};
           return result;
@@ -545,6 +590,22 @@ RoboPlanExecutionBackend::execute_controlled_stop(
         result.accepted = true;
         result.backend_stop_confirmed = true;
         result.completed_by_natural_completion = true;
+        return result;
+      }
+      if (core::soft_on_path_error_recommends_hard_stop(planned.error())) {
+        // The planner determined no feasible on-path soft stop exists and
+        // recommends a hard stop. The native backend has no hard_deceleration
+        // mode (ros2_control/JTC-only); its hard-stop floor is the kernel's
+        // emergency backend.stop() immediate hold. So REFUSE the soft stop here
+        // (do NOT downgrade to a spring-back hold, which is slower than the hard
+        // stop the situation demands) and let the kernel escalate to the
+        // immediate hold. The backend-agnostic enriched kernel escalation event
+        // carries the planner cause (code, reason, recommended_disposition) for
+        // observability. Mirrors the ros2_control hard-stop disposition, adapted
+        // to the native lane's stop-mode floor.
+        result.accepted = false;
+        result.backend_stop_confirmed = false;
+        result.error = planned.error();
         return result;
       }
       const bool may_fallback = std::find(
@@ -574,6 +635,8 @@ RoboPlanExecutionBackend::execute_controlled_stop(
 
     const auto call_start_ns = clock_.now();
     state_.pause_requested.store(false);
+    state_.natural_completion_stop_requested.store(false,
+                                                   std::memory_order_release);
     worker_thread_.request_stop();
     execution_cv_.notify_all();
     {
@@ -582,7 +645,9 @@ RoboPlanExecutionBackend::execute_controlled_stop(
                             std::chrono::duration_cast<
                                 std::chrono::steady_clock::duration>(
                                 std::chrono::duration<double>(
-                                    profile.max_stop_time_s.value_or(1.0)));
+                                    controlled_stop_wait_timeout_s(
+                                        profile,
+                                        config_.soft_on_path_sample_period_s)));
       bool stopped = false;
       while (!stop_token.stop_requested()) {
         stopped = !state_.running.load();
@@ -611,6 +676,8 @@ RoboPlanExecutionBackend::execute_controlled_stop(
 
     const auto& replacement = planned.value().replacement_trajectory;
     state_.running.store(true);
+    state_.natural_completion_stop_requested.store(false,
+                                                   std::memory_order_release);
     const auto steady_start = std::chrono::steady_clock::now();
     const double total_time_s =
         replacement.waypoints.empty()
@@ -651,6 +718,8 @@ RoboPlanExecutionBackend::execute_controlled_stop(
     update_scene_positions(final_wp.positions_rad, SceneUpdateMode::kBlocking,
                            stopped_snapshot_ns);
     state_.running.store(false);
+    state_.natural_completion_stop_requested.store(false,
+                                                   std::memory_order_release);
     execution_cv_.notify_all();
 
     result.accepted = true;
@@ -677,6 +746,9 @@ RoboPlanExecutionBackend::execute_controlled_stop(
     result.diagnostics = planned.value().diagnostics;
     result.diagnostics["command_source"] = "native_simulated_path_ramp";
     result.diagnostics["runtime_scale_isolated"] = "true";
+    result.diagnostics["runtime_scale_isolation"] =
+        "owned_scale_frozen_during_stop";
+    result.diagnostics["timeline_authority_tier"] = "owned_scale_asserted";
     result.diagnostics["soft_on_path_phase"] = "4.5G_native";
     return result;
   }
@@ -727,6 +799,9 @@ RoboPlanExecutionBackend::execute_controlled_stop(
     result.stop_command_source =
         core::MotionInterruptStopCommandSource::kNativeSimulatedStop;
     result.confirmation_latency_ns = 0;
+    result.diagnostics["runtime_scale_isolation"] =
+        "owned_scale_frozen_during_stop";
+    result.diagnostics["timeline_authority_tier"] = "owned_scale_asserted";
     return result;
   }
 
@@ -738,19 +813,17 @@ RoboPlanExecutionBackend::execute_controlled_stop(
   // it publishes a kStopped snapshot at its current observed
   // position, then clears `state_.running`.
   state_.pause_requested.store(false);
+  state_.natural_completion_stop_requested.store(false,
+                                                 std::memory_order_release);
   worker_thread_.request_stop();
   execution_cv_.notify_all();
 
-  // Wait bounded by the profile's max_stop_time_s when set; the
-  // ExecutionKernelConfig default fallback is applied by the kernel
-  // before this method is called (the kernel enforces deadline
-  // overflow on top of whatever value the backend reports). Default
-  // backend wait is 1 s which exceeds the 500 ms kernel default so
-  // the kernel's enforcement always wins; we still bound here to
-  // avoid pinning the kernel's worker forever on a misbehaving
-  // simulator stop.
-  const auto wait_deadline_s =
-      profile.max_stop_time_s.value_or(1.0);
+  // Wait bounded by the profile's max_stop_time_s when set; otherwise
+  // derive the bound from the requested stop duration plus the native
+  // sample-period tolerance. This keeps a 2 s default stop from timing
+  // out on a legacy 1 s backend fallback.
+  const auto wait_deadline_s = controlled_stop_wait_timeout_s(
+      profile, config_.soft_on_path_sample_period_s);
   std::unique_lock<std::mutex> lock(execution_mutex_);
   const auto deadline = std::chrono::steady_clock::now() +
                         std::chrono::duration_cast<
@@ -797,6 +870,9 @@ RoboPlanExecutionBackend::execute_controlled_stop(
   result.backend_stop_confirmed = true;
   result.stop_command_source =
       core::MotionInterruptStopCommandSource::kNativeSimulatedStop;
+  result.diagnostics["runtime_scale_isolation"] =
+      "owned_scale_frozen_during_stop";
+  result.diagnostics["timeline_authority_tier"] = "owned_scale_asserted";
   return result;
 }
 
@@ -806,6 +882,8 @@ core::PauseResultDTO RoboPlanExecutionBackend::pause() {
         false, core::ErrorDTO{core::kErrorInvalidRequest, "No execution in flight", {}}};
   }
   state_.pause_requested.store(true);
+  state_.natural_completion_stop_requested.store(false,
+                                                 std::memory_order_release);
   execution_cv_.notify_all();
   return core::PauseResultDTO{true, std::nullopt};
 }
@@ -814,6 +892,8 @@ core::ExecutionHandle RoboPlanExecutionBackend::resume(
     const core::TrajectoryDTO& trajectory) {
   if (state_.running.load()) {
     state_.pause_requested.store(false);
+    state_.natural_completion_stop_requested.store(false,
+                                                   std::memory_order_release);
     if (worker_thread_.joinable()) {
       worker_thread_.request_stop();
     }
@@ -829,6 +909,8 @@ core::ResetResultDTO RoboPlanExecutionBackend::reset() {
       std::chrono::duration<double>(config_.reset_completion_timeout_s);
 
   state_.pause_requested.store(false);
+  state_.natural_completion_stop_requested.store(false,
+                                                 std::memory_order_release);
   if (worker_thread_.joinable()) {
     worker_thread_.request_stop();
   }
@@ -883,9 +965,46 @@ void RoboPlanExecutionBackend::set_runtime_velocity_scale(double scale) {
   if (!std::isfinite(scale)) return;
   if (scale < 0.0) scale = 0.0;
   if (scale > 1.0) scale = 1.0;
-  runtime_velocity_scale_.store(scale, std::memory_order_release);
+  {
+    std::lock_guard<std::mutex> lock(runtime_velocity_scale_mutex_);
+    if (controlled_stop_runtime_scale_freeze_depth_ > 0) {
+      // M4: freeze the owned runtime scale during controlled stops. Slider/API
+      // intent is applied after the stop so it cannot stretch, freeze, or
+      // accelerate the commanded stop profile.
+      deferred_runtime_velocity_scale_ = scale;
+      return;
+    }
+    runtime_velocity_scale_.store(scale, std::memory_order_release);
+  }
   // Wake the execution worker so a scale=0 hold or resume takes effect promptly.
   execution_cv_.notify_all();
+}
+
+void RoboPlanExecutionBackend::begin_controlled_stop_runtime_scale_freeze() {
+  std::lock_guard<std::mutex> lock(runtime_velocity_scale_mutex_);
+  ++controlled_stop_runtime_scale_freeze_depth_;
+}
+
+bool RoboPlanExecutionBackend::end_controlled_stop_runtime_scale_freeze() {
+  bool applied_deferred_scale = false;
+  {
+    std::lock_guard<std::mutex> lock(runtime_velocity_scale_mutex_);
+    if (controlled_stop_runtime_scale_freeze_depth_ <= 0) {
+      return false;
+    }
+    --controlled_stop_runtime_scale_freeze_depth_;
+    if (controlled_stop_runtime_scale_freeze_depth_ == 0 &&
+        deferred_runtime_velocity_scale_.has_value()) {
+      runtime_velocity_scale_.store(*deferred_runtime_velocity_scale_,
+                                    std::memory_order_release);
+      deferred_runtime_velocity_scale_.reset();
+      applied_deferred_scale = true;
+    }
+  }
+  if (applied_deferred_scale) {
+    execution_cv_.notify_all();
+  }
+  return applied_deferred_scale;
 }
 
 }  // namespace manyforge::roboplan_backend

@@ -82,14 +82,18 @@ export function TransportControls() {
     frozenRef.current = frozen;
   }, [frozen]);
 
+  const running = state === 'running';
+  const stopping = state === 'stopping' || stopInProgress;
   const canRun =
     (state === 'idle' || state === 'stopped') &&
+    !stopping &&
     runAuthority.canCommand &&
     !stopGate.blocked;
   // Stop applies to in-flight motion the operator can see — BT
   // execution (state==='running') or an intervention / direct-jog
   // session (direct_control).
-  const canStop = state === 'running' || state === 'direct_control';
+  const canStop =
+    !stopping && (state === 'running' || state === 'direct_control');
 
   const runCycleCommand = useCallback(
     (command: () => Promise<void>) => {
@@ -190,7 +194,6 @@ export function TransportControls() {
     }
   }, [state]);
 
-  const running = state === 'running';
   // Reset is a no-op from idle; from any other state it discards live cycle
   // state (stopped position, latched errors, run context) — give it an
   // amber accent exactly when it carries that weight.
@@ -326,7 +329,9 @@ export function TransportControls() {
                 ? stopGate.reason
                 : runAuthority.reason !== null
                   ? runAuthority.reason
-                  : `Cycle is ${state}`
+                  : stopping
+                    ? 'Robot is stopping'
+                    : `Cycle is ${state}`
           }
           className={`flex items-center gap-1.5 rounded px-3.5 py-1.5 text-sm font-semibold transition-colors ${
             canRun && !cycleBusy
@@ -371,26 +376,43 @@ export function TransportControls() {
             });
           }}
           disabled={cycleBusy || !canStop}
-          title={canStop ? 'Stop the active cycle' : `Cycle is ${state}`}
+          title={
+            stopping
+              ? 'Stop command is in progress'
+              : canStop
+                ? 'Stop the active cycle'
+                : `Cycle is ${state}`
+          }
           className={`flex items-center gap-1.5 rounded px-3.5 py-1.5 text-sm font-semibold transition-colors ${
             canStop && !cycleBusy
               ? 'bg-red-700 text-white hover:bg-red-600'
+              : stopping
+                ? 'border border-amber-600/70 bg-amber-950/50 text-amber-300'
               : 'border border-gray-600 bg-gray-800 text-gray-500'
           } disabled:cursor-not-allowed`}
         >
-          <svg viewBox="0 0 16 16" className="h-3 w-3 fill-current" aria-hidden>
+          <svg
+            viewBox="0 0 16 16"
+            className={`h-3 w-3 fill-current ${stopping ? 'animate-pulse' : ''}`}
+            aria-hidden
+          >
             <rect x="3" y="3" width="10" height="10" rx="1" />
           </svg>
-          Stop
+          <span className="grid text-center">
+            <span className={`col-start-1 row-start-1 ${stopping ? 'invisible' : ''}`}>Stop</span>
+            <span className={`col-start-1 row-start-1 ${stopping ? '' : 'invisible'}`}>Stopping</span>
+          </span>
         </button>
         <button
           type="button"
           onClick={() => {
             runCycleCommand(reset);
           }}
-          disabled={cycleBusy}
+          disabled={cycleBusy || stopping}
           title={
-            resetMeaningful
+            stopping
+              ? 'Robot is stopping'
+              : resetMeaningful
               ? `Reset the cycle to its initial state (discards the current ${state} state)`
               : 'Reset the cycle to its initial state'
           }

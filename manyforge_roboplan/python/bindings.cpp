@@ -732,6 +732,11 @@ MotionInterruptStopProfileDTO stop_profile_from_python(
   if (sp.contains("max_stop_time_s") && !sp["max_stop_time_s"].is_none()) {
     profile.max_stop_time_s = sp["max_stop_time_s"].cast<double>();
   }
+  if (sp.contains("settle_velocity_threshold_rad_s") &&
+      !sp["settle_velocity_threshold_rad_s"].is_none()) {
+    profile.settle_velocity_threshold_rad_s =
+        sp["settle_velocity_threshold_rad_s"].cast<double>();
+  }
   if (sp.contains("joint_deceleration_profile_id") &&
       !sp["joint_deceleration_profile_id"].is_none()) {
     profile.joint_deceleration_profile_id =
@@ -766,7 +771,7 @@ MotionInterruptStopProfileDTO stop_profile_from_python(
     }
   }
   profile.allow_natural_completion_on_short_path =
-      sp.attr("get")("allow_natural_completion_on_short_path", false)
+      sp.attr("get")("allow_natural_completion_on_short_path", true)
           .cast<bool>();
   profile.require_backend_confirmation =
       sp.attr("get")("require_backend_confirmation", true).cast<bool>();
@@ -1407,7 +1412,19 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
                rs["joint_names"] = trip.stop_snapshot.robot_state.joint_names;
                rs["positions_rad"] =
                    trip.stop_snapshot.robot_state.positions_rad;
+               rs["velocities_rad_s"] =
+                   trip.stop_snapshot.robot_state.velocities_rad_s;
                td["stop_snapshot_robot_state"] = rs;
+               // Measured settle signal (M3): the audit/HMI boundary must see
+               // confirmed-at-rest, not only positions. Absent values mean the
+               // settle verdict is UNKNOWN (no measured velocity evidence).
+               if (trip.stop_snapshot.max_abs_velocity_rad_s) {
+                 td["stop_snapshot_max_abs_velocity_rad_s"] =
+                     *trip.stop_snapshot.max_abs_velocity_rad_s;
+               }
+               if (trip.stop_snapshot.at_rest) {
+                 td["stop_snapshot_at_rest"] = *trip.stop_snapshot.at_rest;
+               }
                if (trip.stop_distance_rad) {
                  td["stop_distance_rad"] = *trip.stop_distance_rad;
                }

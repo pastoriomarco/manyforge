@@ -936,7 +936,7 @@ export function ScenePanel() {
           <span className="font-mono text-gray-100">Save</span> include scene changes too.
         </div>
         <div>
-          Manual scene editing is disabled while running. Runtime behavior edits still appear below as
+          Manual scene editing is disabled while running or stopping. Runtime behavior edits still appear below as
           live/runtime state and are not persisted automatically.
         </div>
         <div>

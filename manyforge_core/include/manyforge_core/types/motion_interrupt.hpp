@@ -28,6 +28,10 @@ inline constexpr double kDefaultDecelerationTimeS = 2.0;
 /// profiles. Longer stops are an explicit deployment-policy change and must not
 /// slip through profile parsing as a "soft stop".
 inline constexpr double kMaxControlledStopDecelerationTimeS = 2.0;
+/// Default measured-velocity threshold (rad/s) below which a joint is treated
+/// as at rest for the settle signal. Used to derive `at_rest` from controller
+/// feedback when a profile leaves `settle_velocity_threshold_rad_s` unset.
+inline constexpr double kDefaultSettleVelocityThresholdRadS = 0.01;
 
 /// Backend-declared planner parameters for production `soft_on_path`.
 /// These are deployment/runtime facts, not behavior-node policy: the
@@ -100,8 +104,9 @@ struct MotionInterruptStopProfileDTO {
   /// Required for `kSoftOnPath`; deployments MAY provide defaults for
   /// `kSpringBackHold`.
   std::optional<double> deceleration_time_s;
-  /// Upper bound on backend stop confirmation. If absent, the kernel
-  /// uses the deployment's `complete_move_on_signal_timeout_ns`.
+  /// Upper bound on backend stop confirmation. If absent, the effective
+  /// deadline is `deceleration_time_s` (or its profile default) plus the
+  /// deployment stop-confirmation tolerance.
   std::optional<double> max_stop_time_s;
   /// Deployment-defined joint-limit / controller profile used by
   /// `kHardDeceleration`.
@@ -118,13 +123,20 @@ struct MotionInterruptStopProfileDTO {
   /// When `kSoftOnPath` is requested and the remaining accepted
   /// trajectory would finish before a useful wall-time stop ramp
   /// can be accepted, allow the motion to complete naturally
-  /// instead of requiring a stop-mode fallback. Default false preserves
-  /// precision-contact semantics.
-  bool allow_natural_completion_on_short_path = false;
+  /// instead of requiring a stop-mode fallback. Default true keeps
+  /// operator-stop semantics resumable: short remaining moves finish
+  /// normally while the kernel/backend report Stopping until terminal.
+  /// Precision-contact lanes that require fallback instead of natural
+  /// completion must opt out explicitly.
+  bool allow_natural_completion_on_short_path = true;
   /// v1 production profiles MUST use `true`; `false` is reserved for
   /// diagnostic simulators and MUST NOT produce
   /// `terminal_cause=signal_trip`.
   bool require_backend_confirmation = true;
+  /// Measured-velocity threshold (rad/s) for the at-rest settle verdict. When
+  /// unset the kernel uses `kDefaultSettleVelocityThresholdRadS`. The monitor
+  /// uses this to confirm a stop reached measured rest within the deadline.
+  std::optional<double> settle_velocity_threshold_rad_s;
   /// Bounded JSON-safe profile metadata (controller family / version
   /// / qualification artifact id).
   InterruptStructuredValue diagnostics;
@@ -201,6 +213,11 @@ inline std::string motion_interrupt_stop_profile_field_error(
         kMaxControlledStopDecelerationTimeS) {
       return motion_interrupt_deceleration_time_max_error();
     }
+  }
+  if (profile.settle_velocity_threshold_rad_s.has_value() &&
+      (!std::isfinite(*profile.settle_velocity_threshold_rad_s) ||
+       *profile.settle_velocity_threshold_rad_s <= 0.0)) {
+    return "settle_velocity_threshold_rad_s must be finite and positive";
   }
   return "";
 }
@@ -345,6 +362,14 @@ struct ExecutionStopSnapshotDTO {
   std::optional<double> trajectory_progress;
   /// MUST be `true` for a successful `signal_trip` outcome.
   bool backend_stop_confirmed = false;
+  /// Largest measured |joint velocity| (rad/s) at the captured stop state.
+  /// Absent when the backend exposes no measured velocities (no settle
+  /// evidence); present values are the audit/monitor settle signal.
+  std::optional<double> max_abs_velocity_rad_s;
+  /// Measured settle verdict: `true` when every measured joint velocity is
+  /// within `settle_velocity_threshold_rad_s`. Absent when velocities are
+  /// unavailable (settle UNKNOWN — consumers MUST NOT treat as at-rest).
+  std::optional<bool> at_rest;
   InterruptStructuredValue diagnostics;
 };
 

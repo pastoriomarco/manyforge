@@ -250,8 +250,9 @@ describe('evaluateStopRunGate', () => {
 });
 
 describe('shouldClearStopInProgress', () => {
-  it('keeps the latch while running or jogging', () => {
+  it('keeps the latch while running, stopping, or jogging', () => {
     expect(shouldClearStopInProgress('running')).toBe(false);
+    expect(shouldClearStopInProgress('stopping')).toBe(false);
     expect(shouldClearStopInProgress('direct_control')).toBe(false);
   });
 
@@ -267,7 +268,8 @@ describe('shouldFreezeVelocitySlider', () => {
     expect(shouldFreezeVelocitySlider('direct_control', true)).toBe(true);
   });
 
-  it('freezes for the whole stopped hold (the deceleration ramp runs here)', () => {
+  it('freezes while stopping and for the whole stopped hold', () => {
+    expect(shouldFreezeVelocitySlider('stopping', false)).toBe(true);
     expect(shouldFreezeVelocitySlider('stopped', false)).toBe(true);
   });
 

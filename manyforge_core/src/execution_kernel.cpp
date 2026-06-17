@@ -9,6 +9,7 @@
 #include <exception>
 #include <iomanip>
 #include <limits>
+#include <memory>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -31,6 +32,122 @@ constexpr int64_t kExecutionPollNs = 10'000'000;  // 10 ms
 constexpr int kExecutionDrainMaxPolls = 100;      // bounded 1 s software drain
 constexpr double kExecutionDrainTimeoutS =
     static_cast<double>(kExecutionPollNs * kExecutionDrainMaxPolls) / 1e9;
+
+struct HardStopFloorAttempt {
+  std::mutex mutex;
+  bool attempted = false;
+  StopResultDTO result;
+};
+
+StopResultDTO request_hard_stop_floor_once(
+    IExecutionBackend& backend,
+    const std::shared_ptr<HardStopFloorAttempt>& attempt) {
+  std::lock_guard<std::mutex> lock(attempt->mutex);
+  if (!attempt->attempted) {
+    attempt->result = backend.stop();
+    attempt->attempted = true;
+  }
+  return attempt->result;
+}
+
+std::int64_t effective_controlled_stop_deadline_ns(
+    const MotionInterruptStopProfileDTO& profile,
+    Duration stop_completion_tolerance_ns) {
+  if (profile.max_stop_time_s.has_value()) {
+    return static_cast<std::int64_t>(*profile.max_stop_time_s * 1e9);
+  }
+  const auto deceleration_ns = static_cast<std::int64_t>(
+      motion_interrupt_deceleration_time_or_default(profile) * 1e9);
+  return deceleration_ns + std::max<Duration>(0, stop_completion_tolerance_ns);
+}
+
+std::chrono::steady_clock::duration effective_controlled_stop_deadline_duration(
+    const MotionInterruptStopProfileDTO& profile,
+    Duration stop_completion_tolerance_ns) {
+  const auto deadline_ns =
+      std::max<std::int64_t>(
+          0, effective_controlled_stop_deadline_ns(
+                 profile, stop_completion_tolerance_ns));
+  return std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+      std::chrono::nanoseconds(deadline_ns));
+}
+
+std::optional<double> measured_max_abs_velocity_from_snapshot(
+    const ExecutionSnapshot& snapshot) {
+  if (snapshot.joint_velocities_rad_s.empty() ||
+      snapshot.joint_velocities_rad_s.size() !=
+          snapshot.joint_positions_rad.size()) {
+    return std::nullopt;
+  }
+  double max_abs = 0.0;
+  for (double v : snapshot.joint_velocities_rad_s) {
+    max_abs = std::max(max_abs, std::abs(v));
+  }
+  return max_abs;
+}
+
+struct MeasuredRestWaitResult {
+  std::optional<double> max_abs_velocity_rad_s;
+  bool settle_signal_available = false;
+  bool at_rest = true;
+  bool timed_out = false;
+};
+
+bool is_command_authoritative_stop_snapshot(const ExecutionSnapshot& snapshot) {
+  return snapshot.state_source.rfind("commanded_sim", 0) == 0 ||
+         snapshot.state_source == "controlled_stop_command_reference";
+}
+
+MeasuredRestWaitResult wait_for_measured_rest_after_confirmed_stop(
+    IExecutionBackend& backend,
+    double settle_velocity_threshold_rad_s,
+    std::chrono::steady_clock::time_point deadline,
+    std::stop_token stop_token) {
+  MeasuredRestWaitResult result;
+  while (true) {
+    const auto snapshot = backend.get_execution_snapshot();
+    if (is_command_authoritative_stop_snapshot(snapshot)) {
+      // In commanded-sim lanes the backend command/reference trajectory is the
+      // execution authority; measured velocities are diagnostic evidence and
+      // can lag the accepted command stream. Tracking/path-deviation monitors
+      // remain responsible for proving the simulated/real plant followed the
+      // command within tolerance.
+      result.at_rest = true;
+      return result;
+    }
+    const auto max_abs_velocity =
+        measured_max_abs_velocity_from_snapshot(snapshot);
+    if (!max_abs_velocity.has_value()) {
+      // Settle UNKNOWN falls back to the backend's own confirmation. Never
+      // fabricate a failed measured-rest verdict from absent velocity data.
+      return result;
+    }
+    result.settle_signal_available = true;
+    result.max_abs_velocity_rad_s = *max_abs_velocity;
+    result.at_rest = *max_abs_velocity <= settle_velocity_threshold_rad_s;
+    if (result.at_rest) {
+      return result;
+    }
+    if (stop_token.stop_requested()) {
+      result.timed_out = true;
+      return result;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= deadline) {
+      result.timed_out = true;
+      return result;
+    }
+    const auto remaining = deadline - now;
+    const auto sleep_for =
+        std::min(std::chrono::milliseconds(10),
+                 std::chrono::duration_cast<std::chrono::milliseconds>(
+                     remaining));
+    std::this_thread::sleep_for(
+        sleep_for > std::chrono::milliseconds(0)
+            ? sleep_for
+            : std::chrono::milliseconds(1));
+  }
+}
 
 double clamp_unit_interval(double value) {
   return std::max(0.0, std::min(1.0, value));
@@ -1201,38 +1318,143 @@ void ExecutionKernel::run_operator_stop_worker(
     }
   } active_guard{this};
 
+  begin_runtime_velocity_scale_freeze();
+  const auto runtime_scale_freeze_scope =
+      std::shared_ptr<void>(nullptr, [this](void*) {
+        end_runtime_velocity_scale_freeze();
+      });
+
+  const std::int64_t effective_deadline_ns =
+      effective_controlled_stop_deadline_ns(
+          profile, config_.complete_move_on_signal_timeout_ns);
+  auto hard_stop_floor_attempt = std::make_shared<HardStopFloorAttempt>();
+  auto controlled_stop_source = std::make_shared<std::stop_source>();
+  std::stop_callback worker_stop_notify(stop_token, [controlled_stop_source]() {
+    controlled_stop_source->request_stop();
+  });
+  ScheduleHandle stop_deadline_handle = 0;
+  if (effective_deadline_ns > 0) {
+    const auto requested_mode = std::string(stop_mode_string(profile.stop_mode));
+    stop_deadline_handle = scheduler_.schedule(
+        clock_.now() + effective_deadline_ns,
+        [this, controlled_stop_source, hard_stop_floor_attempt,
+         requested_mode]() {
+          controlled_stop_source->request_stop();
+          const auto legacy =
+              request_hard_stop_floor_once(execution_backend_,
+                                           hard_stop_floor_attempt);
+          const auto fallback_outcome =
+              legacy.accepted ? std::string("legacy_stop_succeeded")
+                              : std::string("legacy_stop_failed");
+          std::map<std::string, std::string> details{
+              {"reason", "in_stop_completion_timeout"},
+              {"phase", "operator_stop_deadline_watchdog"},
+              {"requested_stop_mode", requested_mode},
+              {"emergency_fallback", fallback_outcome},
+              {"hard_stop_transitioned", "true"}};
+          emit_event({KernelEventType::kErrorRaised,
+                      sm_.status().execution_id,
+                      clock_.now(),
+                      {},
+                      {},
+                      ErrorDTO{std::string(kErrorMotionInterruptBackendStopFailed),
+                               "operator controlled stop exceeded "
+                               "effective stop deadline; emergency hard-stop "
+                               "floor issued by deadline watchdog",
+                               details},
+                      details});
+        },
+        SchedulerPriority::Monitoring);
+  }
+
+  const auto stop_wall_start = std::chrono::steady_clock::now();
+  const auto stop_wall_deadline =
+      effective_deadline_ns > 0
+          ? stop_wall_start + std::chrono::nanoseconds(effective_deadline_ns)
+          : stop_wall_start;
   auto controlled_result =
-      execution_backend_.execute_controlled_stop(profile, stop_token);
+      execution_backend_.execute_controlled_stop(
+          profile, controlled_stop_source->get_token());
+  if (stop_deadline_handle != 0) {
+    scheduler_.cancel(stop_deadline_handle);
+  }
   if (!operator_stop_worker_is_current(generation, stop_token)) {
     return;
   }
 
-  const bool controlled_ok =
+  bool controlled_ok =
       controlled_result.accepted &&
       controlled_result.backend_stop_confirmed &&
       !controlled_result.error.has_value();
+  bool confirmed_but_not_settled = false;
+  std::string stop_failure_reason = "operator_stop_profile_failed";
+  std::string stop_failure_message =
+      "operator stop profile failed; emergency legacy backend.stop() "
+      "fallback engaged";
+  std::map<std::string, std::string> settle_details;
+
+  if (controlled_ok) {
+    const double threshold = profile.settle_velocity_threshold_rad_s.value_or(
+        kDefaultSettleVelocityThresholdRadS);
+    const auto settle_result = wait_for_measured_rest_after_confirmed_stop(
+        execution_backend_, threshold, stop_wall_deadline, stop_token);
+    if (settle_result.settle_signal_available &&
+        !settle_result.at_rest) {
+      controlled_ok = false;
+      confirmed_but_not_settled = true;
+      stop_failure_reason = "stop_not_settled_measured_velocity";
+      stop_failure_message =
+          "operator controlled stop confirmed but measured velocity did not "
+          "settle within the effective stop deadline";
+      controlled_result.error = ErrorDTO{
+          std::string(kErrorMotionInterruptBackendStopFailed),
+          stop_failure_message,
+          {{"reason", stop_failure_reason},
+           {"measured_max_abs_velocity_rad_s",
+            std::to_string(
+                settle_result.max_abs_velocity_rad_s.value_or(0.0))},
+           {"settle_velocity_threshold_rad_s", std::to_string(threshold)}}};
+      settle_details["measured_max_abs_velocity_rad_s"] =
+          std::to_string(
+              settle_result.max_abs_velocity_rad_s.value_or(0.0));
+      settle_details["settle_velocity_threshold_rad_s"] =
+          std::to_string(threshold);
+      settle_details["settle_wait_timed_out"] =
+          settle_result.timed_out ? "true" : "false";
+    }
+  }
 
   std::optional<StopResultDTO> fallback_legacy_result;
+  if (!controlled_ok && !confirmed_but_not_settled) {
+    fallback_legacy_result = request_hard_stop_floor_once(
+        execution_backend_, hard_stop_floor_attempt);
+  }
   if (!controlled_ok) {
-    fallback_legacy_result = execution_backend_.stop();
     const std::string requested_mode = stop_mode_string(profile.stop_mode);
     const std::string executed_mode =
         stop_mode_string(controlled_result.executed_stop_mode);
     const std::string fallback_outcome =
-        fallback_legacy_result->accepted
-            ? std::string("legacy_stop_succeeded")
-            : std::string("legacy_stop_failed");
+        confirmed_but_not_settled
+            ? std::string("not_attempted_controlled_stop_already_confirmed")
+            : (fallback_legacy_result && fallback_legacy_result->accepted
+                   ? std::string("legacy_stop_succeeded")
+                   : std::string("legacy_stop_failed"));
     // Propagate the underlying controlled-stop failure cause into the
     // escalation event. A downgraded operator stop MUST be self-describing on
     // the event stream: it has to carry WHY soft_on_path was refused (the
     // planner error code + reason + the soft_on_path->spring_back fallback
     // pair), not only the fact that a downgrade happened.
     std::map<std::string, std::string> escalation_details{
-        {"reason", "operator_stop_profile_failed"},
+        {"reason", stop_failure_reason},
         {"requested_stop_mode", requested_mode},
         {"executed_stop_mode", executed_mode},
         {"emergency_fallback", fallback_outcome},
+        {"hard_stop_transitioned",
+         confirmed_but_not_settled ? "false" : "true"},
         {"phase", "operator_stop"}};
+    for (const auto& [key, value] : settle_details) {
+      escalation_details[key] = value;
+    }
     if (controlled_result.error.has_value()) {
       escalation_details["controlled_stop_error_code"] =
           controlled_result.error->code;
@@ -1255,8 +1477,7 @@ void ExecutionKernel::run_operator_stop_worker(
                 sm_.status().execution_id, clock_.now(), {}, {},
                 std::optional<ErrorDTO>{ErrorDTO{
                     std::string(kErrorMotionInterruptBackendStopFailed),
-                    "operator stop profile failed; emergency legacy "
-                    "backend.stop() fallback engaged",
+                    stop_failure_message,
                     escalation_details}},
                 escalation_details});
   }
@@ -1270,6 +1491,57 @@ void ExecutionKernel::run_operator_stop_worker(
   const std::string executed_mode =
       stop_mode_string(controlled_result.executed_stop_mode);
 
+  if (!controlled_ok && confirmed_but_not_settled) {
+    ErrorDTO unsettled_stop_error{
+        std::string(kErrorMotionInterruptBackendStopFailed),
+        "operator controlled stop was accepted and confirmed, but measured "
+        "velocity did not settle within the effective stop deadline; redundant "
+        "JTC cancel "
+        "was not attempted",
+        {{"reason", "stop_not_settled_measured_velocity"},
+         {"controlled_stop_error_reason", stop_failure_reason},
+         {"requested_stop_mode", requested_mode},
+         {"executed_stop_mode", executed_mode},
+         {"emergency_fallback",
+          "not_attempted_controlled_stop_already_confirmed"},
+         {"hard_stop_transitioned", "false"},
+         {"phase", "operator_stop"}}};
+    for (const auto& [key, value] : settle_details) {
+      unsettled_stop_error.details[key] = value;
+    }
+    {
+      std::lock_guard<std::mutex> error_lock(operator_stop_error_mutex_);
+      operator_stop_intervention_error_ = unsettled_stop_error;
+    }
+    sm_.set_last_error(error_code_from_dto(unsettled_stop_error));
+    stop_collision_monitoring();
+    cache_.invalidate_all();
+    auto transition = sm_.try_transition(ExecutionState::kInterventionRequired);
+    if (!transition.ok()) {
+      return;
+    }
+    auto snapshot = execution_backend_.get_execution_snapshot();
+    snapshot.timestamp_ns = clock_.now();
+    snapshot.state = sm_.status().state;
+    snapshot.error = unsettled_stop_error;
+    publish_execution_snapshot(std::move(snapshot));
+    emit_event({KernelEventType::kErrorRaised,
+                sm_.status().execution_id,
+                clock_.now(),
+                {},
+                {},
+                unsettled_stop_error,
+                unsettled_stop_error.details});
+    emit_event({KernelEventType::kStateTransition,
+                sm_.status().execution_id,
+                clock_.now(),
+                pre_completion_state,
+                ExecutionState::kInterventionRequired,
+                std::nullopt,
+                {{"reason", "stop_not_settled_measured_velocity"}}});
+    return;
+  }
+
   if (!controlled_ok && fallback_legacy_result &&
       !fallback_legacy_result->accepted) {
     ErrorDTO total_failure{
@@ -1277,10 +1549,48 @@ void ExecutionKernel::run_operator_stop_worker(
         "operator stop failed: controlled-stop refused and emergency "
         "legacy backend.stop() also failed",
         {{"reason", "operator_stop_total_failure"},
+         {"controlled_stop_error_reason", stop_failure_reason},
          {"requested_stop_mode", requested_mode},
          {"executed_stop_mode", executed_mode},
          {"emergency_fallback", "legacy_stop_failed"},
+         {"hard_stop_transitioned", "true"},
          {"phase", "operator_stop"}}};
+    for (const auto& [key, value] : settle_details) {
+      total_failure.details[key] = value;
+    }
+    if (controlled_result.error.has_value()) {
+      total_failure.details["controlled_stop_error_code"] =
+          controlled_result.error->code;
+      const auto reason_it = controlled_result.error->details.find("reason");
+      if (reason_it != controlled_result.error->details.end()) {
+        total_failure.details["controlled_stop_error_reason"] =
+            reason_it->second;
+      }
+      for (const auto& [key, value] : controlled_result.error->details) {
+        total_failure.details["controlled_stop_detail_" + key] = value;
+      }
+    }
+    for (const auto& [diag_key, diag_value] :
+         controlled_result.diagnostics) {
+      if (diag_key.rfind("soft_on_path", 0) == 0 ||
+          diag_key.rfind("fallback", 0) == 0) {
+        total_failure.details[diag_key] = diag_value;
+      }
+    }
+    if (fallback_legacy_result && fallback_legacy_result->error.has_value()) {
+      total_failure.details["legacy_stop_error_code"] =
+          fallback_legacy_result->error->code;
+      const auto reason_it =
+          fallback_legacy_result->error->details.find("reason");
+      if (reason_it != fallback_legacy_result->error->details.end()) {
+        total_failure.details["legacy_stop_error_reason"] =
+            reason_it->second;
+      }
+      for (const auto& [key, value] :
+           fallback_legacy_result->error->details) {
+        total_failure.details["legacy_stop_detail_" + key] = value;
+      }
+    }
     {
       std::lock_guard<std::mutex> error_lock(operator_stop_error_mutex_);
       operator_stop_intervention_error_ = total_failure;
@@ -1292,7 +1602,7 @@ void ExecutionKernel::run_operator_stop_worker(
     if (!transition.ok()) {
       return;
     }
-    auto snapshot = get_execution_snapshot();
+    auto snapshot = execution_backend_.get_execution_snapshot();
     snapshot.timestamp_ns = clock_.now();
     snapshot.state = sm_.status().state;
     snapshot.error = total_failure;
@@ -1303,10 +1613,7 @@ void ExecutionKernel::run_operator_stop_worker(
                 {},
                 {},
                 total_failure,
-                {{"phase", "operator_stop"},
-                 {"requested_stop_mode", requested_mode},
-                 {"executed_stop_mode", executed_mode},
-                 {"emergency_fallback", "legacy_stop_failed"}}});
+                total_failure.details});
     emit_event({KernelEventType::kStateTransition,
                 sm_.status().execution_id,
                 clock_.now(),
@@ -1317,24 +1624,28 @@ void ExecutionKernel::run_operator_stop_worker(
     return;
   }
 
+  auto snapshot = execution_backend_.get_execution_snapshot();
+  snapshot.timestamp_ns = clock_.now();
+
   auto transition = sm_.try_transition(ExecutionState::kStopped);
   if (!transition.ok() && sm_.status().state != ExecutionState::kStopped) {
     return;
   }
 
-  auto snapshot = get_execution_snapshot();
-  snapshot.timestamp_ns = clock_.now();
   snapshot.state = sm_.status().state;
   if (!controlled_ok && fallback_legacy_result &&
       fallback_legacy_result->accepted) {
     ErrorDTO degraded_stop_error{
         std::string(kErrorMotionInterruptBackendStopFailed),
-        "operator stop profile failed; emergency legacy backend.stop() "
-        "guaranteed physical stop",
-        {{"reason", "operator_stop_profile_failed"},
+        stop_failure_message,
+        {{"reason", stop_failure_reason},
          {"requested_stop_mode", requested_mode},
          {"executed_stop_mode", executed_mode},
-         {"emergency_fallback", "legacy_stop_succeeded"}}};
+         {"emergency_fallback", "legacy_stop_succeeded"},
+         {"hard_stop_transitioned", "true"}}};
+    for (const auto& [key, value] : settle_details) {
+      degraded_stop_error.details[key] = value;
+    }
     {
       std::lock_guard<std::mutex> error_lock(operator_stop_error_mutex_);
       operator_stop_terminal_error_ = degraded_stop_error;
@@ -1730,31 +2041,10 @@ const char* terminal_cause_string(MotionExecutionTerminalCause cause) {
   return "unknown";
 }
 
-SoftOnPathPlannerConfig soft_on_path_planner_config_from_capability(
-    const MotionInterruptStopCapabilityDTO& capability) {
-  SoftOnPathPlannerConfig config;
-  if (!capability.soft_on_path_planner_config.has_value()) {
-    return config;
-  }
-  const auto& declared = *capability.soft_on_path_planner_config;
-  config.stop_traj_delta_s = declared.stop_traj_delta_s;
-  config.sample_period_s = declared.sample_period_s;
-  config.allow_model_velocity_fallback =
-      declared.allow_model_velocity_fallback;
-  config.max_initial_path_deviation_rad =
-      declared.max_initial_path_deviation_rad;
-  config.max_initial_velocity_deviation_rad_s =
-      declared.max_initial_velocity_deviation_rad_s;
-  config.per_joint_max_jerk_rad_s3 =
-      declared.per_joint_max_jerk_rad_s3;
-  return config;
-}
-
 }  // namespace
 
 Result<void> ExecutionKernel::arm_motion_scopes_for_dispatch(
     const ExecuteRequestDTO& request,
-    const TrajectoryDTO& trajectory,
     std::uint64_t execution_id,
     ActiveMotionExecution& motion_state) {
   motion_state.execution_id = execution_id;
@@ -1852,29 +2142,13 @@ Result<void> ExecutionKernel::arm_motion_scopes_for_dispatch(
             scope.policy_id)) {
       return Result<void>::Err(*error);
     }
-    if (profile.stop_mode == MotionInterruptStopMode::kSoftOnPath) {
-      const auto planner_config =
-          soft_on_path_planner_config_from_capability(capability);
-      const auto envelope = validate_soft_on_path_feasibility_envelope(
-          trajectory, profile, planner_config);
-      if (!envelope.ok()) {
-        ErrorDTO error = envelope.error();
-        error.code = kErrorMotionInterruptArmFailed;
-        error.details["scope_id"] = scope.scope_id;
-        error.details["policy_id"] = scope.policy_id;
-        const bool recommends_spring_back =
-            error.details.contains("recommended_fallback") &&
-            error.details.at("recommended_fallback") == "spring_back_hold";
-        const bool allows_spring_back =
-            std::find(profile.allowed_fallback_modes.begin(),
-                      profile.allowed_fallback_modes.end(),
-                      MotionInterruptStopMode::kSpringBackHold) !=
-            profile.allowed_fallback_modes.end();
-        if (!recommends_spring_back || !allows_spring_back) {
-          return Result<void>::Err(std::move(error));
-        }
-      }
-    }
+    // Arm-time soft_on_path feasibility pre-check removed: the feasibility +
+    // fallback disposition (hard_stop / spring_back / natural completion) is
+    // decided at TRIP time by plan_soft_on_path_stop, which both backends now
+    // honor. Arm time keeps only the backend-capability gate (above) + profile
+    // well-formedness; per-emitted-trajectory accel/jerk consistency is checked
+    // when the stop trajectory is generated, not pre-proven against every trip
+    // point here.
   }
   auto arm = interrupt_manager_.arm_motion_interrupt_scopes(
       execution_id, request.move_id,
@@ -2147,10 +2421,31 @@ std::optional<ExecutionStopSnapshotDTO> capture_stop_snapshot(
     bool backend_stop_confirmed,
     MotionInterruptNodeCategory node_category,
     std::int64_t captured_at_ns,
+    double settle_velocity_threshold_rad_s,
     std::string& failure_reason) {
   ExecutionStopSnapshotDTO snap;
   snap.captured_at_ns = captured_at_ns;
   snap.backend_stop_confirmed = backend_stop_confirmed;
+  const bool command_authoritative =
+      is_command_authoritative_stop_snapshot(post_stop_backend_snapshot);
+
+  // Settle signal: derive max |velocity| and the at-rest verdict from whatever
+  // measured velocities the chosen state source carries. Absent velocities
+  // leave both fields unset (settle UNKNOWN) — never silently "at rest".
+  const auto apply_settle_signal = [&](ExecutionStopSnapshotDTO& s) {
+    if (s.robot_state.velocities_rad_s.empty() ||
+        s.robot_state.velocities_rad_s.size() !=
+            s.robot_state.positions_rad.size()) {
+      return;
+    }
+    double max_abs = 0.0;
+    for (double v : s.robot_state.velocities_rad_s) {
+      max_abs = std::max(max_abs, std::abs(v));
+    }
+    s.max_abs_velocity_rad_s = max_abs;
+    s.at_rest = command_authoritative ||
+                max_abs <= settle_velocity_threshold_rad_s;
+  };
 
   // Priority 1: execution-backend feedback (preferred). Joint names
   // come from the planning context (the IExecutionBackend's snapshot
@@ -2164,6 +2459,11 @@ std::optional<ExecutionStopSnapshotDTO> capture_stop_snapshot(
     snap.robot_state.joint_names = planning_context_state->joint_names;
     snap.robot_state.positions_rad =
         post_stop_backend_snapshot.joint_positions_rad;
+    if (post_stop_backend_snapshot.joint_velocities_rad_s.size() ==
+        snap.robot_state.positions_rad.size()) {
+      snap.robot_state.velocities_rad_s =
+          post_stop_backend_snapshot.joint_velocities_rad_s;
+    }
     if (post_stop_backend_snapshot.progress > 0.0 &&
         post_stop_backend_snapshot.progress <= 1.0) {
       snap.trajectory_progress = post_stop_backend_snapshot.progress;
@@ -2172,6 +2472,7 @@ std::optional<ExecutionStopSnapshotDTO> capture_stop_snapshot(
       failure_reason = "stop_snapshot_robot_state_size_ordering_invalid";
       return std::nullopt;
     }
+    apply_settle_signal(snap);
     return snap;
   }
 
@@ -2196,6 +2497,7 @@ std::optional<ExecutionStopSnapshotDTO> capture_stop_snapshot(
       failure_reason = "stop_snapshot_robot_state_size_ordering_invalid";
       return std::nullopt;
     }
+    apply_settle_signal(snap);
     return snap;
   }
   failure_reason = "stop_snapshot_no_usable_state_available";
@@ -2270,13 +2572,110 @@ void ExecutionKernel::handle_motion_trip_latch(
 
   // Issue the controlled stop. The backend performs the stop and
   // reports what it actually did. Timing is captured around the call
-  // so the kernel can validate against `max_stop_time_s` (with the
-  // deployment default `complete_move_on_signal_timeout_ns` as the
-  // fallback when the scope leaves the field unset) and embed
+  // so the kernel can validate against the effective stop deadline:
+  // explicit `max_stop_time_s`, or `deceleration_time_s` (defaulted)
+  // plus the deployment stop-confirmation tolerance when unset. Embed
   // latch->call and call->confirm latencies in the trip outcome.
+  // Keep the runtime collision monitor running over the decelerating robot for
+  // the duration of the stop. A collision on the stop path signals the trip
+  // handler (via the stop token) to escalate to a hard stop. The monitor is
+  // observed-state based, so this is the same monitoring a normal motion gets;
+  // the only difference is the stop trajectory is not pre-validated (it stays
+  // on the already-validated path).
+  const std::int64_t effective_deadline_ns =
+      effective_controlled_stop_deadline_ns(
+          profile, config_.complete_move_on_signal_timeout_ns);
+
+  std::stop_source trip_stop_source;
+  {
+    std::lock_guard<std::mutex> lk(motion_trip_stop_mutex_);
+    motion_trip_stop_source_ = trip_stop_source;
+    motion_trip_stop_collision_.store(false, std::memory_order_release);
+  }
+  motion_trip_stop_active_.store(true, std::memory_order_release);
+  start_collision_monitoring();
+  begin_runtime_velocity_scale_freeze();
+  const auto runtime_scale_freeze_scope =
+      std::shared_ptr<void>(nullptr, [this](void*) {
+        end_runtime_velocity_scale_freeze();
+      });
+  auto hard_stop_floor_attempt = std::make_shared<HardStopFloorAttempt>();
+
+  // Kernel-enforced stop deadline. If the backend blocks past the effective
+  // deadline, the Monitoring lane requests cancellation AND issues the
+  // hard-stop floor.
+  // The worker still owns final state/outcome publication when the backend
+  // returns, but the physical hard-stop command is not delayed by that return.
+  ScheduleHandle stop_deadline_handle = 0;
+  if (effective_deadline_ns > 0) {
+    const auto requested_mode = std::string(stop_mode_string(profile.stop_mode));
+    const auto latch_id = latch.latch_id;
+    const auto source_id = latch.source_id;
+    const auto policy_id = latch.policy_id;
+    const auto scope_id = latch.motion_interrupt_scope_id.value_or("");
+    stop_deadline_handle = scheduler_.schedule(
+        clock_.now() + effective_deadline_ns,
+        [this, hard_stop_floor_attempt, requested_mode, latch_id, source_id,
+         policy_id, scope_id]() {
+          {
+            std::lock_guard<std::mutex> lk(motion_trip_stop_mutex_);
+            if (motion_trip_stop_source_.has_value()) {
+              motion_trip_stop_source_->request_stop();
+            }
+          }
+          const auto legacy =
+              request_hard_stop_floor_once(execution_backend_,
+                                           hard_stop_floor_attempt);
+          const auto fallback_outcome =
+              legacy.accepted ? std::string("legacy_stop_succeeded")
+                              : std::string("legacy_stop_failed");
+          std::map<std::string, std::string> details{
+              {"reason", "in_stop_completion_timeout"},
+              {"phase", "motion_trip_deadline_watchdog"},
+              {"requested_stop_mode", requested_mode},
+              {"latch_id", latch_id},
+              {"source_id", source_id},
+              {"policy_id", policy_id},
+              {"scope_id", scope_id},
+              {"emergency_fallback", fallback_outcome},
+              {"hard_stop_transitioned", "true"}};
+          emit_event({KernelEventType::kErrorRaised,
+                      sm_.status().execution_id,
+                      clock_.now(),
+                      {},
+                      {},
+                      ErrorDTO{std::string(kErrorMotionInterruptBackendStopFailed),
+                               "motion-scoped controlled stop exceeded "
+                               "effective stop deadline; emergency hard-stop "
+                               "floor issued by deadline watchdog",
+                               details},
+                      details});
+        },
+        SchedulerPriority::Monitoring);
+  }
+
   const auto call_start_ns = clock_.now();
-  auto stop_result = execution_backend_.execute_controlled_stop(profile);
+  const auto stop_wall_start = std::chrono::steady_clock::now();
+  const auto stop_wall_deadline =
+      effective_deadline_ns > 0
+          ? stop_wall_start + std::chrono::nanoseconds(effective_deadline_ns)
+          : stop_wall_start;
+  auto stop_result = execution_backend_.execute_controlled_stop(
+      profile, trip_stop_source.get_token());
   const auto call_end_ns = clock_.now();
+
+  if (stop_deadline_handle != 0) {
+    scheduler_.cancel(stop_deadline_handle);
+  }
+  motion_trip_stop_active_.store(false, std::memory_order_release);
+  stop_collision_monitoring();
+  bool stop_path_collision = false;
+  {
+    std::lock_guard<std::mutex> lk(motion_trip_stop_mutex_);
+    stop_path_collision =
+        motion_trip_stop_collision_.load(std::memory_order_acquire);
+    motion_trip_stop_source_.reset();
+  }
 
   // Common failure-path downgrader. Industrial behavior (spec/230
   // §3.4 lines 563-564): backend-stop and stop-snapshot failures
@@ -2286,8 +2685,9 @@ void ExecutionKernel::handle_motion_trip_latch(
   // `terminal_cause` is still `failed` per spec/210 §3.11.
   const auto downgrade_to_intervention =
       [&](std::string reason, std::string message,
-          std::string error_code = std::string(
-              kErrorMotionInterruptBackendStopFailed)) {
+          std::string error_code =
+              std::string(kErrorMotionInterruptBackendStopFailed),
+          std::map<std::string, std::string> extra_details = {}) {
         sm_.set_last_error(
             error_code == kErrorMotionInterruptStopStateInvalid
                 ? ErrorCode::kMotionInterruptStopStateInvalid
@@ -2303,6 +2703,12 @@ void ExecutionKernel::handle_motion_trip_latch(
              {"requested_stop_mode", stop_mode_string(profile.stop_mode)},
              {"executed_stop_mode",
               stop_mode_string(stop_result.executed_stop_mode)}}};
+        // Escalation evidence (e.g. hard_stop_transitioned) must ride the
+        // terminal outcome, not only the transient event stream, so industrial
+        // audit can reconstruct the disposition from the durable record alone.
+        for (auto& [k, v] : extra_details) {
+          err.details[k] = std::move(v);
+        }
         emit_event({KernelEventType::kMotionTripFailed, exec_id,
                      clock_.now(), {}, {}, err, err.details});
         emit_event({KernelEventType::kStateTransition, exec_id, clock_.now(),
@@ -2314,10 +2720,83 @@ void ExecutionKernel::handle_motion_trip_latch(
         // Latch persists. Do NOT auto-clear.
       };
 
-  const std::int64_t effective_deadline_ns =
-      profile.max_stop_time_s
-          ? static_cast<std::int64_t>(*profile.max_stop_time_s * 1e9)
-          : config_.complete_move_on_signal_timeout_ns;
+  // Build a fully self-describing escalation detail map for the scoped
+  // motion-trip failure/escalation paths. Carries the controlled-stop
+  // error code/reason and the whole soft_on_path/fallback diagnostic
+  // surface so escalation events on the event stream describe WHY the
+  // requested stop was refused or escalated — not only the fact that an
+  // escalation happened. Mirrors the operator-stop worker enrichment.
+  const auto build_escalation_details =
+      [&](std::string reason, std::string phase) {
+        std::map<std::string, std::string> details{
+            {"reason", std::move(reason)},
+            {"phase", std::move(phase)},
+            {"requested_stop_mode", stop_mode_string(profile.stop_mode)},
+            {"executed_stop_mode",
+             stop_mode_string(stop_result.executed_stop_mode)},
+            {"latch_id", latch.latch_id},
+            {"source_id", latch.source_id},
+            {"policy_id", latch.policy_id},
+            {"scope_id", latch.motion_interrupt_scope_id.value_or("")}};
+        if (stop_result.error.has_value()) {
+          details["controlled_stop_error_code"] = stop_result.error->code;
+          const auto reason_it = stop_result.error->details.find("reason");
+          if (reason_it != stop_result.error->details.end()) {
+            details["controlled_stop_error_reason"] = reason_it->second;
+          }
+        }
+        for (const auto& [k, v] : stop_result.diagnostics) {
+          if (k.rfind("soft_on_path", 0) == 0 || k.rfind("fallback", 0) == 0) {
+            details[k] = v;
+          }
+        }
+        return details;
+      };
+
+  // First-class hard-stop floor for the scoped motion-trip path. The legacy
+  // `backend.stop()` IS the hard stop the escalation ladder calls for when a
+  // controlled stop is refused, not confirmed within the deadline, or did not
+  // reach measured rest. The escalation is marked `hard_stop_transitioned` so
+  // the monitor/audit stream sees it as a hard-stop transition, not a generic
+  // failure. Returns the durable escalation evidence (hard_stop_transitioned,
+  // emergency_fallback) so the caller can fold it into the terminal outcome.
+  const auto emergency_stop_floor =
+      [&](std::string reason,
+          std::string phase) -> std::map<std::string, std::string> {
+    const auto legacy = request_hard_stop_floor_once(
+        execution_backend_, hard_stop_floor_attempt);
+    auto details =
+        build_escalation_details(std::move(reason), std::move(phase));
+    details["emergency_fallback"] =
+        legacy.accepted ? "legacy_stop_succeeded" : "legacy_stop_failed";
+    details["hard_stop_transitioned"] = "true";
+    emit_event({KernelEventType::kErrorRaised, exec_id, clock_.now(), {}, {},
+                 std::optional<ErrorDTO>{ErrorDTO{
+                     std::string(kErrorMotionInterruptBackendStopFailed),
+                     "scoped motion-trip controlled stop escalated to the "
+                     "emergency hard-stop floor",
+                     details}},
+                 details});
+    return {{"hard_stop_transitioned", "true"},
+            {"emergency_fallback", details["emergency_fallback"]}};
+  };
+
+  // Stop-path collision escalation (checked first). A dynamic obstacle entered
+  // the stop path during the controlled stop, so the runtime monitor cancelled
+  // the soft stop mid-ramp — the robot may still be moving toward the obstacle.
+  // Escalate to the hard-stop floor (first-class) and hold for operator
+  // acknowledgment.
+  if (stop_path_collision) {
+    auto floor_evidence = emergency_stop_floor("stop_path_collision",
+                                                "motion_trip_stop_path_collision");
+    downgrade_to_intervention(
+        "stop_path_collision",
+        "collision detected on the stop path during the controlled stop; "
+        "escalated to a hard stop",
+        std::string(kErrorMotionInterruptBackendStopFailed),
+        std::move(floor_evidence));
+    return;
+  }
 
   // Short-path policy: a generic soft_on_path scope may
   // explicitly allow the original trajectory to complete naturally
@@ -2341,7 +2820,7 @@ void ExecutionKernel::handle_motion_trip_latch(
         stop_result.confirmation_latency_ns > effective_deadline_ns) {
       downgrade_to_intervention(
           "natural_completion_exceeded_max_stop_time_s",
-          "soft_on_path natural completion exceeded max_stop_time_s");
+          "soft_on_path natural completion exceeded the effective stop deadline");
       return;
     }
 
@@ -2361,7 +2840,9 @@ void ExecutionKernel::handle_motion_trip_latch(
     return;
   }
 
-  // (1) Backend accepted the call.
+  // (1) Backend accepted the call. A refused controlled stop means the
+  //     robot may still be in motion, so engage the emergency hard-stop
+  //     floor before downgrading to intervention.
   if (!stop_result.accepted) {
     auto reason = stop_result.error && stop_result.error->details.contains(
                                             "reason")
@@ -2369,28 +2850,105 @@ void ExecutionKernel::handle_motion_trip_latch(
                       : std::string("controlled_stop_not_accepted");
     auto msg = stop_result.error ? stop_result.error->message
                                   : "execute_controlled_stop returned accepted=false";
-    downgrade_to_intervention(std::move(reason), std::move(msg));
+    auto floor_evidence = emergency_stop_floor(
+        "scoped_trip_controlled_stop_refused",
+        "motion_trip_controlled_stop_refused");
+    downgrade_to_intervention(std::move(reason), std::move(msg),
+                              std::string(kErrorMotionInterruptBackendStopFailed),
+                              std::move(floor_evidence));
     return;
   }
-  // (2) Backend confirmed the stop within max_stop_time_s (or the
-  //     deployment default `complete_move_on_signal_timeout_ns` when
-  //     the profile leaves `max_stop_time_s` unset).
+  // (2) Backend confirmed the stop within the effective stop deadline. An
+  //     unconfirmed stop means the robot may still be in motion: engage the
+  //     emergency hard-stop floor before downgrading.
   if (!stop_result.backend_stop_confirmed) {
+    // In-stop completion timeout: the controlled stop did not reach confirmed
+    // rest within max_stop_time_s. First-class escalation to the hard-stop
+    // floor (the robot may still be moving), then intervention.
+    auto floor_evidence = emergency_stop_floor(
+        "in_stop_completion_timeout",
+        "motion_trip_controlled_stop_unconfirmed");
     downgrade_to_intervention(
         "backend_stop_not_confirmed",
-        "backend did not confirm controlled stop within deadline");
+        "backend did not confirm controlled stop within the effective stop "
+        "deadline",
+        std::string(kErrorMotionInterruptBackendStopFailed),
+        std::move(floor_evidence));
     return;
   }
   if (effective_deadline_ns > 0 &&
       stop_result.confirmation_latency_ns > effective_deadline_ns) {
     downgrade_to_intervention(
         "backend_stop_confirmation_exceeded_max_stop_time_s",
-        "controlled-stop confirmation exceeded max_stop_time_s");
+        "controlled-stop confirmation exceeded the effective stop deadline");
+    return;
+  }
+  const double settle_velocity_threshold_rad_s =
+      profile.settle_velocity_threshold_rad_s.value_or(
+          kDefaultSettleVelocityThresholdRadS);
+  const auto settle_result = wait_for_measured_rest_after_confirmed_stop(
+      execution_backend_, settle_velocity_threshold_rad_s, stop_wall_deadline,
+      trip_stop_source.get_token());
+  if (settle_result.settle_signal_available && !settle_result.at_rest) {
+    std::map<std::string, std::string> details{
+        {"hard_stop_transitioned", "false"},
+        {"emergency_fallback",
+         "not_attempted_controlled_stop_already_confirmed"},
+        {"settle_velocity_threshold_rad_s",
+         std::to_string(settle_velocity_threshold_rad_s)},
+        {"settle_wait_timed_out",
+         settle_result.timed_out ? "true" : "false"}};
+    if (settle_result.max_abs_velocity_rad_s) {
+      details["measured_max_abs_velocity_rad_s"] =
+          std::to_string(*settle_result.max_abs_velocity_rad_s);
+    }
+    downgrade_to_intervention(
+        "stop_not_settled_measured_velocity",
+        "backend confirmed the stop but measured velocity did not settle "
+        "within the effective stop deadline; redundant hard-stop cancel was "
+        "not attempted",
+        std::string(kErrorMotionInterruptBackendStopFailed),
+        std::move(details));
     return;
   }
   // (3) Executed mode matches requested OR is an allowed fallback.
   const StopFallbackQualificationRow* fallback_qualification_row = nullptr;
   if (stop_result.executed_stop_mode != profile.stop_mode) {
+    // Explicit hard-stop escalation. When soft_on_path is infeasible the
+    // backend escalates to a hard deceleration: a fail-closed,
+    // operator-visible intervention — NOT a silent qualified fallback
+    // like spring_back_hold. The robot is at rest here (past the
+    // accepted+confirmed gates), so no emergency floor is needed, but
+    // this escalation is encoded and traced explicitly instead of
+    // falling through to the generic "fallback_pair_not_qualified"
+    // downgrade.
+    //
+    // Disposition decision: an executed stop more aggressive than the
+    // requested mode is HELD for operator acknowledgment (intervention),
+    // never auto-cleared as a qualified-success outcome. An escalation
+    // past the requested stop mode must not be silently accepted, so it
+    // is not promoted to an auto-clearing outcome (with settle-signal
+    // confirmation and a resume policy) on this path.
+    if (profile.stop_mode == MotionInterruptStopMode::kSoftOnPath &&
+        stop_result.executed_stop_mode ==
+            MotionInterruptStopMode::kHardDeceleration) {
+      auto details = build_escalation_details(
+          "soft_on_path_escalated_to_hard_deceleration",
+          "motion_trip_hard_decel_escalation");
+      emit_event({KernelEventType::kErrorRaised, exec_id, clock_.now(), {},
+                   {},
+                   std::optional<ErrorDTO>{ErrorDTO{
+                       std::string(kErrorMotionInterruptBackendStopFailed),
+                       "soft_on_path stop infeasible; backend escalated to a "
+                       "hard deceleration (operator intervention required)",
+                       details}},
+                   details});
+      downgrade_to_intervention(
+          "soft_on_path_escalated_to_hard_deceleration",
+          "soft_on_path stop infeasible; backend escalated to a hard "
+          "deceleration (operator intervention required)");
+      return;
+    }
     const auto& allowed = profile.allowed_fallback_modes;
     const bool fallback_allowed =
         std::find(allowed.begin(), allowed.end(),
@@ -2449,12 +3007,39 @@ void ExecutionKernel::handle_motion_trip_latch(
   auto snap_opt = capture_stop_snapshot(
       post_stop_backend_snapshot, planning_state,
       stop_result.backend_stop_confirmed, node_category, clock_.now(),
-      snap_failure_reason);
+      settle_velocity_threshold_rad_s, snap_failure_reason);
   if (!snap_opt) {
     downgrade_to_intervention(
         std::move(snap_failure_reason),
         "controlled-stop snapshot capture or validation failed",
         std::string(kErrorMotionInterruptStopStateInvalid));
+    return;
+  }
+  // (4b) Measured-stop confirmation. A backend-confirmed stop must also show
+  // measured rest. When the settle signal is available and the robot is NOT at
+  // rest even after the bounded wait above, the reported stop did not actually
+  // quiesce the robot. At this point the stop command was already accepted and
+  // confirmed, so issuing another JTC cancel would be redundant and possibly
+  // misleading; hold intervention for explicit recovery instead. An absent
+  // settle signal (UNKNOWN) falls back to the backend's confirmation and does
+  // not block the outcome.
+  if (snap_opt->at_rest.has_value() && !*snap_opt->at_rest) {
+    std::map<std::string, std::string> settle_evidence{
+        {"hard_stop_transitioned", "false"},
+        {"emergency_fallback",
+         "not_attempted_controlled_stop_already_confirmed"},
+        {"settle_velocity_threshold_rad_s",
+         std::to_string(settle_velocity_threshold_rad_s)}};
+    if (snap_opt->max_abs_velocity_rad_s) {
+      settle_evidence["measured_max_abs_velocity_rad_s"] =
+          std::to_string(*snap_opt->max_abs_velocity_rad_s);
+    }
+    downgrade_to_intervention(
+        "stop_not_settled_measured_velocity",
+        "backend confirmed the stop but measured velocity shows the robot is "
+        "not at rest; redundant hard-stop cancel was not attempted",
+        std::string(kErrorMotionInterruptBackendStopFailed),
+        std::move(settle_evidence));
     return;
   }
   // (5) Build and publish the signal_trip outcome.
@@ -2807,7 +3392,8 @@ void ExecutionKernel::schedule_next_collision_monitor_tick(uint64_t generation) 
         std::lock_guard<std::mutex> lock(collision_monitor_mutex_);
         if (!collision_monitor_active_ ||
             collision_monitor_generation_ != generation ||
-            sm_.status().state != ExecutionState::kExecuting) {
+            (sm_.status().state != ExecutionState::kExecuting &&
+             !motion_trip_stop_active_.load(std::memory_order_acquire))) {
           return;
         }
         schedule_next_collision_monitor_tick(generation);
@@ -3154,7 +3740,7 @@ void ExecutionKernel::async_execute_worker(
     // legacy free-move dispatch path.
     {
       auto arm_result = arm_motion_scopes_for_dispatch(
-          request, trajectory, exec_id, motion_state);
+          request, exec_id, motion_state);
       if (!arm_result.ok()) {
         auto prev = sm_.status().state;
         // Stamp the state machine with the specific arm-failure code
@@ -4548,17 +5134,13 @@ ResetResultDTO ExecutionKernel::reset() {
   resume_requested_.store(false);
 
   const auto operator_stop_timeout = [&]() {
-    double seconds = 1.0;
     if (config_.operator_stop_profile) {
-      if (config_.operator_stop_profile->max_stop_time_s.has_value()) {
-        seconds = *config_.operator_stop_profile->max_stop_time_s;
-      } else if (config_.operator_stop_profile->deceleration_time_s.has_value()) {
-        seconds = *config_.operator_stop_profile->deceleration_time_s + 0.25;
-      }
+      return effective_controlled_stop_deadline_duration(
+          *config_.operator_stop_profile,
+          config_.complete_move_on_signal_timeout_ns);
     }
-    seconds = std::max(0.05, seconds);
     return std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-        std::chrono::duration<double>(seconds));
+        std::chrono::seconds(1));
   };
 
   const auto hard_stop_before_reset =
@@ -5026,7 +5608,11 @@ MetricsSnapshot ExecutionKernel::get_metrics() const {
 
 Result<void> ExecutionKernel::collision_check_tick() {
   auto prev_state = sm_.status().state;
-  if (prev_state != ExecutionState::kExecuting) {
+  const bool trip_stop_active =
+      motion_trip_stop_active_.load(std::memory_order_acquire);
+  // The monitor runs over the decelerating robot during a motion-trip stop
+  // (state kStopping) as well as during normal execution (kExecuting).
+  if (!trip_stop_active && prev_state != ExecutionState::kExecuting) {
     return Result<void>::Ok();
   }
 
@@ -5034,6 +5620,54 @@ Result<void> ExecutionKernel::collision_check_tick() {
       [this](CollisionCheckResultDTO check,
              std::map<std::string, std::string> details) -> Result<void> {
     details["surface"] = "observed_runtime_monitor";
+    // Stop-path collision: during an active motion-trip stop, a collision (or
+    // any monitor fault that means the stop path cannot be verified clear) must
+    // NOT latch a new fault or transition the state machine — the trip handler
+    // owns the lifecycle and is mid-stop. Signal it to escalate to a hard stop
+    // (monitor signals, worker acts) and cancel the in-flight stop.
+    if (motion_trip_stop_active_.load(std::memory_order_acquire)) {
+      // Only an ACTUAL detected collision escalates the in-flight stop. A
+      // monitor availability/config fault (no contact) must NOT disrupt a
+      // stop already in progress — the post-stop confirmation gates still
+      // apply — but it MUST be auditable: emit a diagnostic so "collision
+      // monitor unavailable during stop" is on the record, then fall through
+      // without escalating.
+      if (!check.in_collision) {
+        details["reason_during_stop"] = "stop_monitor_unavailable";
+        KernelEvent monitor_fault_event;
+        monitor_fault_event.type = KernelEventType::kErrorRaised;
+        monitor_fault_event.execution_id = sm_.status().execution_id;
+        monitor_fault_event.timestamp_ns = clock_.now();
+        monitor_fault_event.details = details;
+        monitor_fault_event.error = ErrorDTO{
+            std::string(kErrorExecutionAborted),
+            "runtime collision monitor unavailable during controlled stop",
+            details};
+        emit_event(monitor_fault_event);
+        return Result<void>::Ok();
+      }
+      details["reason_during_stop"] = "stop_path_collision";
+      KernelEvent stop_collision_event;
+      stop_collision_event.type = KernelEventType::kCollisionDetected;
+      stop_collision_event.execution_id = sm_.status().execution_id;
+      stop_collision_event.timestamp_ns = clock_.now();
+      stop_collision_event.details = details;
+      if (check.contact_body_a) {
+        stop_collision_event.details["contact_a"] = *check.contact_body_a;
+      }
+      if (check.contact_body_b) {
+        stop_collision_event.details["contact_b"] = *check.contact_body_b;
+      }
+      emit_event(stop_collision_event);
+      {
+        std::lock_guard<std::mutex> lk(motion_trip_stop_mutex_);
+        motion_trip_stop_collision_.store(true, std::memory_order_release);
+        if (motion_trip_stop_source_.has_value()) {
+          motion_trip_stop_source_->request_stop();
+        }
+      }
+      return Result<void>::Ok();
+    }
     KernelEvent collision_event;
     collision_event.type = KernelEventType::kCollisionDetected;
     collision_event.execution_id = sm_.status().execution_id;
@@ -5621,6 +6255,33 @@ void ExecutionKernel::set_collision_validation_retry_config(
   coordinator_per_state_timeout_ns_ = per_state_timeout_ns;
 }
 
+void ExecutionKernel::begin_runtime_velocity_scale_freeze() {
+  std::lock_guard<std::mutex> lock(runtime_velocity_scale_mutex_);
+  ++runtime_velocity_scale_freeze_depth_;
+}
+
+void ExecutionKernel::end_runtime_velocity_scale_freeze() {
+  std::optional<double> deferred_scale;
+  std::optional<std::string> deferred_principal_id;
+  {
+    std::lock_guard<std::mutex> lock(runtime_velocity_scale_mutex_);
+    if (runtime_velocity_scale_freeze_depth_ <= 0) {
+      return;
+    }
+    --runtime_velocity_scale_freeze_depth_;
+    if (runtime_velocity_scale_freeze_depth_ == 0 &&
+        deferred_runtime_velocity_scale_.has_value()) {
+      deferred_scale = deferred_runtime_velocity_scale_;
+      deferred_principal_id = deferred_runtime_velocity_scale_principal_id_;
+      deferred_runtime_velocity_scale_.reset();
+      deferred_runtime_velocity_scale_principal_id_.reset();
+    }
+  }
+  if (deferred_scale.has_value()) {
+    set_runtime_velocity_scale(*deferred_scale, deferred_principal_id);
+  }
+}
+
 void ExecutionKernel::set_runtime_velocity_scale(
     double scale, std::optional<std::string> principal_id) {
   // ADR-0018: UI runtime velocity scale → backend runtime register.
@@ -5634,16 +6295,29 @@ void ExecutionKernel::set_runtime_velocity_scale(
   }
   if (scale < 0.0) scale = 0.0;
   if (scale > 1.0) scale = 1.0;
-  const double previous =
-      runtime_velocity_scale_.load(std::memory_order_acquire);
-  runtime_velocity_scale_.store(scale, std::memory_order_release);
-  execution_backend_.set_runtime_velocity_scale(scale);
   const auto status = sm_.status();
+  double previous = 1.0;
+  bool deferred = false;
+  {
+    std::lock_guard<std::mutex> lock(runtime_velocity_scale_mutex_);
+    previous = runtime_velocity_scale_.load(std::memory_order_acquire);
+    if (runtime_velocity_scale_freeze_depth_ > 0) {
+      deferred_runtime_velocity_scale_ = scale;
+      deferred_runtime_velocity_scale_principal_id_ = principal_id;
+      deferred = true;
+    } else {
+      runtime_velocity_scale_.store(scale, std::memory_order_release);
+    }
+  }
+  if (!deferred) {
+    execution_backend_.set_runtime_velocity_scale(scale);
+  }
   std::map<std::string, std::string> details{
       {"previous_scale", format_double(previous)},
       {"new_scale", format_double(scale)},
-      {"applied_scale", format_double(scale)},
-      {"backend_status", "forwarded"},
+      {"applied_scale", format_double(deferred ? previous : scale)},
+      {"backend_status", deferred ? "deferred_controlled_stop_freeze"
+                                  : "forwarded"},
       {"source", "kernel_api"},
       {"state", to_string(status.state)}};
   if (principal_id.has_value() && !principal_id->empty()) {

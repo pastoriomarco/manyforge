@@ -56,8 +56,11 @@ class MotionInterruptStopProfile:
     joint_deceleration_profile_id: Optional[str] = None
     per_joint_max_deceleration_rad_s2: Dict[str, float] = field(default_factory=dict)
     allowed_fallback_modes: List[str] = field(default_factory=list)
-    allow_natural_completion_on_short_path: bool = False
+    allow_natural_completion_on_short_path: bool = True
     require_backend_confirmation: bool = True
+    # Measured-velocity threshold (rad/s) for the at-rest settle verdict. When
+    # None the kernel uses its default. Drives the measured-stop confirmation.
+    settle_velocity_threshold_rad_s: Optional[float] = None
 
     def __post_init__(self) -> None:
         if not self.profile_id:
@@ -92,6 +95,14 @@ class MotionInterruptStopProfile:
                     "stop_profile.max_stop_time_s must be finite and > 0"
                 )
             self.max_stop_time_s = max_stop
+        if self.settle_velocity_threshold_rad_s is not None:
+            settle = float(self.settle_velocity_threshold_rad_s)
+            if not math.isfinite(settle) or settle <= 0.0:
+                raise ValueError(
+                    "stop_profile.settle_velocity_threshold_rad_s must be "
+                    "finite and > 0"
+                )
+            self.settle_velocity_threshold_rad_s = settle
         for joint, limit in self.per_joint_max_deceleration_rad_s2.items():
             if not joint:
                 raise ValueError(

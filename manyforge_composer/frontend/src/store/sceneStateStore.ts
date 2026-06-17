@@ -96,6 +96,7 @@ function nextInterval(): number {
   const cycleState = useCycleStore.getState().state;
   if (
     cycleState === 'running'
+    || cycleState === 'stopping'
     || cycleState === 'direct_control'
   ) {
     return POLL_INTERVAL_MS_ACTIVE;

@@ -487,7 +487,7 @@ export function PropertyPanel({ onCollapse }: { onCollapse: () => void }) {
         && Array.isArray(param.schema.properties?.type?.enum),
     ),
   );
-  const isRunMode = cycleState === 'running';
+  const isRunMode = cycleState === 'running' || cycleState === 'stopping';
   const [modelEndpointCatalog, setModelEndpointCatalog] = useState<ModelEndpointCatalog | null>(null);
   const [sceneState, setSceneState] = useState<SceneStateResponse | null>(null);
   const [sceneFrames, setSceneFrames] = useState<SceneFramesResponse | null>(null);
