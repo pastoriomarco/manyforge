@@ -594,13 +594,27 @@ class KernelClient(ABC):
     ) -> CommandResult:
         """Explicitly clear `kInterventionRequired`.
 
-        Mirrors the C++ kernel API. Callers (cycle manager Run-side
-        auto-ack, MCP, operator UI) hold the policy decision about
-        whether the leftover state is safe to clear; the kernel only
-        enforces fail-closed semantics. `execute()` rejects while the
-        kernel is in `INTERVENTION_REQUIRED` until this is called.
+        Mirrors the C++ kernel API. This is the reset/resync recovery path;
+        callers must only use it after the operator explicitly selected a
+        reset-style recovery. `execute()` rejects while the kernel is in
+        `INTERVENTION_REQUIRED` until an explicit recovery action clears it.
         """
         ...
+
+    def acknowledge_intervention_for_retry(
+        self, principal_id: str, reason: str
+    ) -> CommandResult:
+        """Clear a classified stop/fault intervention without backend reset.
+
+        This is the acknowledge-and-continue recovery path. The production
+        kernel performs the fresh stopped/readable checks and preserves the
+        current robot pose for the next execute. Unsupported clients fail
+        closed.
+        """
+        return CommandResult(
+            accepted=False,
+            error="acknowledge_intervention_for_retry not supported by this kernel client",
+        )
 
     def acknowledge_interrupted_for_retry(
         self, principal_id: str, reason: str
@@ -798,6 +812,8 @@ class MockKernelClient(KernelClient):
         self.pause_count = 0
         self.resume_count = 0
         self.reset_count = 0
+        self.acknowledge_intervention_count = 0
+        self.acknowledge_intervention_for_retry_count = 0
         self.acknowledge_interrupted_for_retry_count = 0
         self.invalidate_count = 0
         self.runtime_velocity_scale = 1.0
@@ -1112,6 +1128,7 @@ class MockKernelClient(KernelClient):
     def acknowledge_intervention(
         self, principal_id: str, reason: str
     ) -> CommandResult:
+        self.acknowledge_intervention_count += 1
         if self._state != ExecutionState.INTERVENTION_REQUIRED:
             return CommandResult(
                 accepted=False,
@@ -1129,6 +1146,37 @@ class MockKernelClient(KernelClient):
                 "principal_id": principal_id,
                 "reason": reason,
                 "prev_state": prev,
+            },
+        )
+        self._emit_kernel_event(
+            "state_transition", from_state=prev, to_state="idle"
+        )
+        return CommandResult(accepted=True)
+
+    def acknowledge_intervention_for_retry(
+        self, principal_id: str, reason: str
+    ) -> CommandResult:
+        self.acknowledge_intervention_for_retry_count += 1
+        if self._state != ExecutionState.INTERVENTION_REQUIRED:
+            return CommandResult(
+                accepted=False,
+                error=(
+                    "acknowledge_intervention_for_retry is valid only from "
+                    f"INTERVENTION_REQUIRED; current state={self._state.value}"
+                ),
+            )
+        prev = self._state.value
+        self._state = ExecutionState.IDLE
+        self._execution_id = 0
+        self._active_move_id = ""
+        self._emit_kernel_event(
+            "acknowledge_intervention",
+            details={
+                "principal_id": principal_id,
+                "reason": reason,
+                "prev_state": prev,
+                "recovery_mode": "acknowledge_and_continue",
+                "backend_reset_performed": "false",
             },
         )
         self._emit_kernel_event(

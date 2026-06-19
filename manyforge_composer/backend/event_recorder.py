@@ -20,6 +20,7 @@ _ALLOWED_EVENT_TYPES = {
     "cycle_state_changed",
     "delegated_recovery_requested",
     "collision_detected",
+    "controlled_stop_completed",
     "error_raised",
     "execute_completed",
     "execute_failed",
@@ -66,6 +67,18 @@ _DEFAULT_FAILURE_ARCHIVE_MAX_AGE_S = 30 * 24 * 60 * 60
 _DEFAULT_FAILURE_ARCHIVE_MAX_BYTES = 1024 * 1024 * 1024
 _DEFAULT_HISTORY_LIMIT = 1000
 _MAX_HISTORY_LIMIT = 10000
+_DEFAULT_CHANNEL_EVENT_LIMIT = 300
+_DEFAULT_INCIDENT_SNAPSHOT_LIMIT = 32
+_INCIDENT_ALL_EVENT_LIMIT = 200
+_INCIDENT_CHANNEL_EVENT_LIMIT = 80
+_EVENT_CHANNEL_LIMITS = {
+    "controlled_stop": 500,
+    "fault_safety_stop": 1000,
+    "command_runtime": 800,
+    "execution_lifecycle": 1000,
+    "pose_source": 300,
+    "telemetry_debug": 500,
+}
 _NATIVE_KERNEL_ERROR_EVENT_TYPES_TO_RECORD = {
     "error_raised",
     "collision_detected",
@@ -77,6 +90,11 @@ _NATIVE_KERNEL_RESUME_AUDIT_EVENT_TYPES_TO_RECORD = {
     "validation_passed",
     "validation_failed",
 }
+_NATIVE_KERNEL_CONTROLLED_STOP_SUCCESS_EVENT_TYPES_TO_RECORD = {
+    "interrupt_preempt_applied",
+    "motion_trip_completed",
+    "stop_issued",
+}
 
 
 def _is_resume_audit_native_event(native_event: dict[str, Any]) -> bool:
@@ -86,6 +104,19 @@ def _is_resume_audit_native_event(native_event: dict[str, Any]) -> bool:
     return (
         details.get("reason") == "resume_replan"
         or str(details.get("resume_replan", "")).lower() == "true"
+    )
+
+
+def _is_controlled_stop_success_native_event(native_event: dict[str, Any]) -> bool:
+    if (
+        native_event.get("type")
+        not in _NATIVE_KERNEL_CONTROLLED_STOP_SUCCESS_EVENT_TYPES_TO_RECORD
+    ):
+        return False
+    details = native_event.get("details")
+    return (
+        isinstance(details, dict)
+        and str(details.get("controlled_stop_success", "")).lower() == "true"
     )
 
 
@@ -128,6 +159,8 @@ def _component_for_event(event_type: str) -> str:
         return "manyforge.runtime_override"
     if event_type.startswith("intervention_"):
         return "manyforge.intervention"
+    if event_type == "controlled_stop_completed":
+        return "manyforge.execution"
     if event_type.startswith("cycle_"):
         return "manyforge.cycle"
     if event_type.startswith("kernel_") or event_type in {
@@ -172,6 +205,63 @@ def _message_for_event(
     if details and isinstance(details.get("error"), str) and details["error"]:
         return details["error"]
     return event_type.replace("_", " ")
+
+
+def _event_channel(event_type: str, details: Optional[dict[str, Any]]) -> str:
+    """Classify an event into an independently retained diagnostic stream."""
+    details = details or {}
+    if (
+        event_type == "controlled_stop_completed"
+        or str(details.get("controlled_stop_success", "")).lower() == "true"
+    ):
+        return "controlled_stop"
+    stop_keys = {
+        "requested_stop_mode",
+        "executed_stop_mode",
+        "fallback_pair",
+        "fallback_reason",
+        "hard_stop_transitioned",
+        "controlled_stop_error_code",
+        "controlled_stop_error_reason",
+    }
+    if (
+        event_type in {
+            "cycle_error",
+            "kernel_error",
+            "intervention_required",
+            "error_raised",
+            "collision_detected",
+        }
+        or event_type.endswith("_failed")
+        or any(key in details for key in stop_keys)
+    ):
+        return "fault_safety_stop"
+    if event_type.startswith("pose_source_"):
+        return "pose_source"
+    if event_type.startswith("model_call_"):
+        return "telemetry_debug"
+    if (
+        event_type.startswith("runtime_override_")
+        or event_type.startswith("simulation_control_")
+        or event_type.startswith("intervention_")
+        or event_type == "delegated_recovery_requested"
+    ):
+        return "command_runtime"
+    return "execution_lifecycle"
+
+
+def _event_should_create_incident(
+    event_type: str,
+    details: Optional[dict[str, Any]],
+    severity: str,
+    channel: str,
+) -> bool:
+    severity_value = _SEVERITY_ORDER.get(severity.upper(), 0)
+    return (
+        severity_value >= _SEVERITY_ORDER["WARN"]
+        or channel == "fault_safety_stop"
+        or event_type in _FAILURE_ARCHIVE_EVENT_TYPES
+    )
 
 
 @dataclass
@@ -248,6 +338,13 @@ class EventRecorder:
         )
 
         self._events: deque[_StoredEvent] = deque(maxlen=max_events)
+        self._events_by_channel: dict[str, deque[_StoredEvent]] = {
+            channel: deque(maxlen=limit)
+            for channel, limit in _EVENT_CHANNEL_LIMITS.items()
+        }
+        self._incident_snapshots: deque[dict[str, Any]] = deque(
+            maxlen=_DEFAULT_INCIDENT_SNAPSHOT_LIMIT
+        )
         self._event_index = 0
         self._run_counter = 0
         self._current_run: Optional[_RunInfo] = None
@@ -504,6 +601,46 @@ class EventRecorder:
             ]
         return result
 
+    def channel_histories(
+        self,
+        *,
+        limit: Optional[int] = None,
+        include_node_transitions: bool = False,
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Return protected per-channel event windows.
+
+        These rings are intentionally independent from the short chronological
+        history so high-volume pose-source traffic cannot evict fault/stop
+        causality.
+        """
+        effective_limit = (
+            _DEFAULT_CHANNEL_EVENT_LIMIT
+            if limit is None
+            else max(0, min(int(limit), _MAX_HISTORY_LIMIT))
+        )
+        with self._lock:
+            result: dict[str, list[dict[str, Any]]] = {}
+            for channel, events in self._events_by_channel.items():
+                decoded = [
+                    self._decode_stored_event(event)
+                    for event in events
+                    if include_node_transitions
+                    or event.event_type != "node_status_transition"
+                ]
+                result[channel] = [] if effective_limit == 0 else decoded[-effective_limit:]
+            return result
+
+    def incident_snapshots(self, *, limit: Optional[int] = None) -> list[dict[str, Any]]:
+        """Return recent incident snapshots newest-last."""
+        effective_limit = (
+            _DEFAULT_INCIDENT_SNAPSHOT_LIMIT
+            if limit is None
+            else max(0, min(int(limit), _DEFAULT_INCIDENT_SNAPSHOT_LIMIT))
+        )
+        with self._lock:
+            snapshots = [dict(snapshot) for snapshot in self._incident_snapshots]
+        return [] if effective_limit == 0 else snapshots[-effective_limit:]
+
     def record_native_kernel_events(self, events: list[dict[str, Any]]) -> None:
         """Project selected native kernel events into durable history.
 
@@ -517,11 +654,15 @@ class EventRecorder:
         for native_event in events:
             native_type = str(native_event.get("type") or "")
             native_index = int(native_event.get("event_index") or 0)
+            is_controlled_stop_success = (
+                _is_controlled_stop_success_native_event(native_event)
+            )
             should_record = native_type in _NATIVE_KERNEL_ERROR_EVENT_TYPES_TO_RECORD
             should_record = should_record or (
                 native_type in _NATIVE_KERNEL_RESUME_AUDIT_EVENT_TYPES_TO_RECORD
                 and _is_resume_audit_native_event(native_event)
             )
+            should_record = should_record or is_controlled_stop_success
             if not should_record:
                 continue
 
@@ -540,7 +681,11 @@ class EventRecorder:
                 details["error"] = error_message
 
             self._record_event(
-                event_type=native_type,
+                event_type=(
+                    "controlled_stop_completed"
+                    if is_controlled_stop_success
+                    else native_type
+                ),
                 execution_id=int(native_event.get("execution_id") or 0),
                 details=details or None,
                 execution_mode=None,
@@ -1421,6 +1566,8 @@ class EventRecorder:
                 intervention_run_id = run_id
 
             details_payload = dict(details) if details else None
+            channel = _event_channel(event_type, details_payload)
+            severity = _severity_for_event(event_type, details_payload)
             event: dict[str, Any] = {
                 "event_index": self._event_index,
                 "sequence": self._event_index,
@@ -1434,8 +1581,9 @@ class EventRecorder:
                 "execution_id": execution_id,
                 "type": event_type,
                 "event": event_type,
-                "severity": _severity_for_event(event_type, details_payload),
+                "severity": severity,
                 "component": _component_for_event(event_type),
+                "channel": channel,
             }
             if intervention_run_id is not None:
                 event["intervention_run_id"] = intervention_run_id
@@ -1476,14 +1624,26 @@ class EventRecorder:
             )
 
             json_text = self._serialize_event(event)
-            self._events.append(
-                _StoredEvent(
-                    event_index=self._event_index,
-                    run_id=run_id,
-                    event_type=event_type,
-                    json_text=json_text,
-                )
+            stored = _StoredEvent(
+                event_index=self._event_index,
+                run_id=run_id,
+                event_type=event_type,
+                json_text=json_text,
             )
+            self._events.append(stored)
+            self._events_by_channel.setdefault(
+                channel,
+                deque(maxlen=_DEFAULT_CHANNEL_EVENT_LIMIT),
+            ).append(stored)
+            if _event_should_create_incident(
+                event_type,
+                details_payload,
+                severity,
+                channel,
+            ):
+                self._incident_snapshots.append(
+                    self._build_incident_snapshot_locked(event)
+                )
             self._enqueue_jsonl_locked(run_id=run_id, json_text=json_text)
             self._maybe_write_failure_archive_locked(event)
 
@@ -1563,6 +1723,36 @@ class EventRecorder:
     @staticmethod
     def _decode_stored_event(event: _StoredEvent) -> dict[str, Any]:
         return json.loads(event.json_text)
+
+    def _build_incident_snapshot_locked(self, trigger_event: dict[str, Any]) -> dict[str, Any]:
+        """Freeze recent chronology + protected channels for an incident."""
+        all_events = [
+            self._decode_stored_event(event)
+            for event in list(self._events)[-_INCIDENT_ALL_EVENT_LIMIT:]
+        ]
+        events_by_channel = {
+            channel: [
+                self._decode_stored_event(event)
+                for event in list(events)[-_INCIDENT_CHANNEL_EVENT_LIMIT:]
+            ]
+            for channel, events in self._events_by_channel.items()
+        }
+        return {
+            "incidentId": f"incident-{trigger_event.get('event_index', 0)}",
+            "timestampNs": trigger_event.get("timestamp_ns"),
+            "timestamp": trigger_event.get("timestamp"),
+            "triggerEventIndex": trigger_event.get("event_index"),
+            "triggerType": trigger_event.get("type"),
+            "triggerChannel": trigger_event.get("channel"),
+            "triggerSeverity": trigger_event.get("severity"),
+            "triggerEvent": dict(trigger_event),
+            "allEvents": all_events,
+            "eventsByChannel": events_by_channel,
+            "channelEventCounts": {
+                channel: len(events)
+                for channel, events in events_by_channel.items()
+            },
+        }
 
     def _enqueue_jsonl_locked(self, *, run_id: Optional[str], json_text: str) -> None:
         """Hand the serialized event to the JSONL writer thread (audit 6B).

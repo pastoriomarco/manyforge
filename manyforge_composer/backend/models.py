@@ -1452,6 +1452,7 @@ class ExecutionEventResponse(BaseModel):
     trace_source: Optional[str] = None
     severity: Optional[str] = None
     component: Optional[str] = None
+    channel: Optional[str] = None
     message: Optional[str] = None
     event: Optional[str] = None
     run_id: Optional[str] = None
@@ -1613,6 +1614,14 @@ class DebugExportResponse(BaseModel):
     kernel_metrics: Dict[str, int] = Field(alias="kernelMetrics")
     execution_digest: Dict[str, Any] = Field(alias="executionDigest")
     execution_history: Dict[str, Any] = Field(alias="executionHistory")
+    event_channels: Dict[str, List[Dict[str, Any]]] = Field(
+        default_factory=dict,
+        alias="eventChannels",
+    )
+    incident_snapshots: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        alias="incidentSnapshots",
+    )
     scene_state: Dict[str, Any] = Field(alias="sceneState")
     scene_diagnostics: Dict[str, Any] = Field(alias="sceneDiagnostics")
     scene_trace: Dict[str, Any] = Field(alias="sceneTrace")

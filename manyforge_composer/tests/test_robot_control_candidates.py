@@ -155,6 +155,11 @@ def _write_deployment_with_stop_profile(tmp_path: Path, *, stop_mode: str) -> st
         "stop_mode": stop_mode,
         "deceleration_time_s": 0.5,
     }
+    config["default_fault_stop_profile"] = {
+        "profile_id": "default_fault_spring_back_hold",
+        "stop_mode": "spring_back_hold",
+        "deceleration_time_s": 0.5,
+    }
     target = tmp_path / f"deployment_{stop_mode}.deployment.yaml"
     target.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
     return str(target)

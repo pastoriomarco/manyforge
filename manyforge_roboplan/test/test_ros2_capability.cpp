@@ -30,9 +30,9 @@ Ros2ControlExecutionBackendConfig base_config() {
 
 TEST(Ros2CapabilityTest,
      SpringBackHoldIsAlwaysSupported) {
-  // kSpringBackHold has no controller-config preconditions — the
-  // existing JTC preempt + anchored-hold pattern is universally
-  // available. Capability profile id is the v1 baseline.
+  // kSpringBackHold has no controller-config preconditions: it is a
+  // backend-computed on-path replacement goal dispatched through stock JTC.
+  // Capability profile id is the v1 baseline.
   auto cfg = base_config();
   auto cap =
       compute_ros2_control_motion_interrupt_stop_capability(cfg);

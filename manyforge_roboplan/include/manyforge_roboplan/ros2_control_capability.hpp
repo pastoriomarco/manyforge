@@ -27,7 +27,7 @@ struct Ros2ControlExecutionBackendConfig {
   double tracking_error_tolerance_rad = 0.05;
   double tracking_error_timeout_s = 0.1;
   double monitor_period_s = 0.01;
-  double stop_completion_timeout_s = 2.0;
+  double stop_completion_timeout_s = 0.5;
   double sim_reset_motion_duration_s = 2.0;
   bool require_fresh_state_before_planning = true;
   bool disable_controller_path_tolerances = false;

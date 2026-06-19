@@ -168,6 +168,45 @@ def test_execution_history_and_export_use_trace_sink(tmp_path):
         assert all("timelineId" in record for record in medkit["records"])
 
 
+def test_execution_channels_and_debug_export_surface_incident_snapshot(tmp_path):
+    state = ComposerState(
+        catalog_path=_CATALOG_PATH,
+        kernel=MockKernelClient(),
+        trace_dir=str(tmp_path),
+    )
+    app = create_app(state, security=_TEST_SECURITY)
+    state.event_recorder._record_event(
+        event_type="pose_source_applied",
+        details={"object_id": "box", "status": "applied"},
+    )
+    state.event_recorder._record_event(
+        event_type="error_raised",
+        details={
+            "requested_stop_mode": "spring_back_hold",
+            "fallback_reason": "controller_cancel_timeout",
+            "reason_code": "controller_cancel_timeout",
+        },
+    )
+
+    with TestClient(app) as client:
+        channels_response = client.get("/api/execution/channels")
+        assert channels_response.status_code == 200
+        channels = channels_response.json()
+        assert channels["channels"]["fault_safety_stop"]
+        assert channels["channels"]["pose_source"]
+        assert channels["incidentSnapshots"]
+        snapshot = channels["incidentSnapshots"][-1]
+        assert snapshot["triggerType"] == "error_raised"
+        assert "allEvents" in snapshot
+        assert "eventsByChannel" in snapshot
+
+        export_response = client.get("/api/debug/export")
+        assert export_response.status_code == 200
+        exported = export_response.json()
+        assert exported["eventChannels"]["fault_safety_stop"]
+        assert exported["incidentSnapshots"][-1]["triggerType"] == "error_raised"
+
+
 def test_infra_heartbeat_reports_kernel_and_archive_status(tmp_path):
     state = ComposerState(
         catalog_path=_CATALOG_PATH,

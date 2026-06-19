@@ -12,6 +12,7 @@ from .models import (
     VelocityScaleRequest,
     VelocityScaleResponse,
 )
+from .cycle_diagnostics import active_cycle_error_fields
 from .state import ComposerState
 
 logger = logging.getLogger(__name__)
@@ -36,8 +37,9 @@ def _structured_command_error(
     details: Optional[dict[str, Any]] = None
     manager = state.cycle_manager
     if manager is not None:
-        code = code or manager.error_code
-        details = manager.error_details
+        _, manager_code, manager_details = active_cycle_error_fields(manager)
+        code = code or manager_code
+        details = manager_details
     return CycleCommandErrorResponse(
         message=message,
         error_code=code,
@@ -79,12 +81,13 @@ def create_cycle_router(state: ComposerState) -> APIRouter:
                 "errorDetails": None,
             }
         manager = state.cycle_manager
+        error, error_code, error_details = active_cycle_error_fields(manager)
         return {
             "state": manager.state.value,
             "velocityScale": manager.velocity_scale,
-            "error": manager.error,
-            "errorCode": manager.error_code,
-            "errorDetails": manager.error_details,
+            "error": error,
+            "errorCode": error_code,
+            "errorDetails": error_details,
         }
 
     @router.post("/run", response_model=CycleCommandResponse, response_model_by_alias=True)
@@ -148,12 +151,12 @@ def create_cycle_router(state: ComposerState) -> APIRouter:
         try:
             state.cycle_manager.run()
         except RuntimeError as exc:
-            # Cycle-manager Run-side auto-ack refusals (e.g. "Cannot
-            # auto-acknowledge kernel INTERVENTION_REQUIRED on Run:
-            # intervention_session_running.") surface as RuntimeError.
-            # Translate to a structured 409 so the viewer can render the
-            # kernel's actual cause from the cycle-manager's preserved
-            # error_code / error_details instead of a generic banner.
+            # Cycle-manager recovery refusals (e.g. a latched
+            # INTERVENTION_REQUIRED that needs an explicit operator choice)
+            # surface as RuntimeError. Translate to a structured 409 so the
+            # viewer can render the kernel's actual cause from the
+            # cycle-manager's preserved error_code / error_details instead of
+            # a generic banner.
             raise HTTPException(
                 status_code=409,
                 detail=_structured_command_error(state, str(exc)),
@@ -213,6 +216,38 @@ def create_cycle_router(state: ComposerState) -> APIRouter:
             )
         _refresh_visual_scene_after_reset(state)
         logger.info("Cycle state: %s → %s", prev, state.cycle_manager.state.value)
+        return {"state": state.cycle_manager.state.value}
+
+    @router.post(
+        "/acknowledge-intervention-for-retry",
+        response_model=CycleCommandResponse,
+        response_model_by_alias=True,
+    )
+    def acknowledge_intervention_for_retry() -> dict:
+        """Acknowledge a retryable stop/fault intervention without reset."""
+        if state.cycle_manager is None:
+            raise HTTPException(
+                status_code=409,
+                detail=_structured_command_error(
+                    state, "No program loaded", error_code="no_program_loaded"
+                ),
+            )
+        prev = state.cycle_manager.state.value
+        try:
+            state.cycle_manager.acknowledge_intervention_for_retry(
+                principal_id="operator_ui",
+                reason="ui_acknowledge_and_continue",
+            )
+        except RuntimeError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail=_structured_command_error(state, str(exc)),
+            )
+        logger.info(
+            "Cycle intervention acknowledged for retry: %s → %s",
+            prev,
+            state.cycle_manager.state.value,
+        )
         return {"state": state.cycle_manager.state.value}
 
     @router.put("/velocity-scale", response_model=VelocityScaleResponse, response_model_by_alias=True)

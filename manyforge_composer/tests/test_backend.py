@@ -17,6 +17,7 @@ import py_trees
 import yaml
 
 from manyforge_behavior.kernel_client import (
+    ExecutionState,
     MockKernelClient,
     SceneEditRequest,
     Trajectory,
@@ -58,6 +59,12 @@ class _FakeCycleState:
         self.value = value
 
 
+class _FakeKernelState:
+    def __init__(self, value: str) -> None:
+        self.name = value
+        self.value = value
+
+
 class _FakeCycleManager:
     def __init__(self, state_value: str) -> None:
         self.state = _FakeCycleState(state_value)
@@ -66,6 +73,55 @@ class _FakeCycleManager:
     def abort_intervention(self) -> None:
         self.aborted = True
         self.state = _FakeCycleState("idle")
+
+
+class _KernelSnapshotFaultCycleManager:
+    """Cycle manager fake whose fault exists only in the kernel snapshot."""
+
+    state = _FakeCycleState("stopped")
+    velocity_scale = 1.0
+    error = None
+    error_code = None
+    error_details = None
+    intervention = None
+
+    def get_status(self):
+        return type(
+            "KernelStatus",
+            (),
+            {
+                "state": _FakeKernelState("INTERVENTION_REQUIRED"),
+                "execution_id": 1,
+                "active_move_id": "pick_approach",
+                "progress": 0.5,
+            },
+        )()
+
+    def get_execution_snapshot(self):
+        return type(
+            "KernelSnapshot",
+            (),
+            {
+                "error": "Timed out waiting for FollowJointTrajectory cancel confirmation",
+                "error_code": "stop_failed",
+                "error_details": {
+                    "backend": "ros2_control",
+                    "backend_state": "Stopping",
+                    "phase": "controller_cancel_timeout",
+                    "reason_code": "controller_cancel_timeout",
+                    "stop_completion_timeout_s": "0.5",
+                },
+            },
+        )()
+
+    def drain_kernel_events_now(self) -> None:
+        return None
+
+    def get_kernel_events_since(self, _index: int):
+        return []
+
+    def get_node_statuses(self):
+        return {}
 
 
 def _simulation_control_deployment(
@@ -239,11 +295,24 @@ class _FlakyStopCapabilityBundle:
         return copy.deepcopy(self.payload)
 
 
+class _StopCapabilityKernel(MockKernelClient):
+    def __init__(self, payload: dict) -> None:
+        super().__init__()
+        self.payload = payload
+        self.calls = 0
+
+    def get_motion_interrupt_stop_capability(self) -> dict:
+        self.calls += 1
+        return copy.deepcopy(self.payload)
+
+
 def _write_deployment_with_stop_profile(
     tmp_path: Path,
     *,
     stop_mode: str,
     profile_id: str | None = None,
+    fault_stop_mode: str | None = None,
+    include_fault_stop: bool = True,
 ) -> str:
     data = yaml.safe_load(Path(_DEPLOYMENT_PATH).read_text(encoding="utf-8"))
     config = data["adapters"]["execution"].setdefault("config", {})
@@ -252,6 +321,15 @@ def _write_deployment_with_stop_profile(
         "stop_mode": stop_mode,
         "deceleration_time_s": 0.5,
     }
+    if include_fault_stop:
+        fault_mode = fault_stop_mode or stop_mode
+        config["default_fault_stop_profile"] = {
+            "profile_id": f"default_fault_{fault_mode}",
+            "stop_mode": fault_mode,
+            "deceleration_time_s": 0.5,
+        }
+    else:
+        config.pop("default_fault_stop_profile", None)
     target = tmp_path / f"deployment_{stop_mode}.deployment.yaml"
     target.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
     return str(target)
@@ -329,6 +407,12 @@ def test_reset_no_program_409(client):
     assert response.status_code == 409
 
 
+def test_acknowledge_intervention_for_retry_no_program_409(client):
+    """POST /api/cycle/acknowledge-intervention-for-retry returns 409 without program."""
+    response = client.post("/api/cycle/acknowledge-intervention-for-retry")
+    assert response.status_code == 409
+
+
 def test_cycle_status_includes_error_fields_for_hmi(client):
     """Rich error UX (#1 + #3): `/api/cycle/status` always returns the
     error / errorCode / errorDetails fields so the viewer can poll one
@@ -345,6 +429,25 @@ def test_cycle_status_includes_error_fields_for_hmi(client):
     assert data["error"] is None
     assert data["errorCode"] is None
     assert data["errorDetails"] is None
+
+
+def test_cycle_status_falls_back_to_kernel_snapshot_fault(state):
+    """A stop fault can leave CycleManager.error empty while the kernel is in
+    INTERVENTION_REQUIRED. `/api/cycle/status` must still surface the backend
+    reason so the HMI explains why Run is blocked."""
+    state.cycle_manager = _KernelSnapshotFaultCycleManager()
+    app = create_app(state, security=_TEST_SECURITY)
+
+    with TestClient(app) as local_client:
+        response = local_client.get("/api/cycle/status")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["state"] == "stopped"
+    assert data["error"] == "Timed out waiting for FollowJointTrajectory cancel confirmation"
+    assert data["errorCode"] == "controller_cancel_timeout"
+    assert data["errorDetails"]["reason_code"] == "controller_cancel_timeout"
+    assert data["errorDetails"]["stop_completion_timeout_s"] == "0.5"
 
 
 def test_kernel_snapshot_includes_structured_error_fields(client):
@@ -425,6 +528,27 @@ def test_stop_from_running():
         assert response.status_code == 200
         data = response.json()
         assert data["state"] == "stopped"
+
+
+def test_acknowledge_intervention_for_retry_does_not_reset_backend(client, state):
+    """Explicit acknowledge-and-continue clears intervention without backend reset."""
+    assert isinstance(state.kernel, MockKernelClient)
+    state.kernel._execute_duration_s = 1.0  # noqa: SLF001 - keep mock running for stop
+    client.post("/api/program/load", json={"path": _PROGRAM_PATH})
+    assert client.post("/api/cycle/run").status_code == 200
+    assert client.post("/api/cycle/stop").status_code == 200
+
+    assert state.cycle_manager is not None
+    kernel = state.cycle_manager._kernel  # noqa: SLF001 - test fixture introspection
+    assert isinstance(kernel, MockKernelClient)
+    kernel._state = ExecutionState.INTERVENTION_REQUIRED  # noqa: SLF001
+    before_reset_count = kernel.reset_count
+
+    response = client.post("/api/cycle/acknowledge-intervention-for-retry")
+    assert response.status_code == 200
+    assert response.json()["state"] == "stopped"
+    assert kernel.get_status().state == ExecutionState.IDLE
+    assert kernel.reset_count == before_reset_count
 
 
 def test_reset_from_running(client, state):
@@ -2307,10 +2431,12 @@ def test_runtime_status_reports_stop_capability_audit_fields_without_poll_requer
     assert bundle.calls == 2
     assert first["supportedStopModes"] == ["spring_back_hold"]
     assert first["configuredStopModes"] == {
-        "operator_stop_profile": "spring_back_hold"
+        "operator_stop_profile": "spring_back_hold",
+        "default_fault_stop_profile": "spring_back_hold",
     }
     assert first["configuredStopDecelerationTimes"] == {
-        "operator_stop_profile": 0.5
+        "operator_stop_profile": 0.5,
+        "default_fault_stop_profile": 0.5,
     }
     assert first["stopCapabilityProfileId"] == "test_stop_capability"
     assert first["hardStopLevel"] == "hard_deceleration"
@@ -2322,6 +2448,37 @@ def test_runtime_status_reports_stop_capability_audit_fields_without_poll_requer
     }
     assert first["stopProfileUnsupported"] is False
     assert second["stopCapabilityProfileId"] == "test_stop_capability"
+
+
+def test_runtime_status_uses_kernel_stop_capability_when_bundle_absent(
+    tmp_path: Path,
+):
+    kernel = _StopCapabilityKernel({
+        "supported_stop_modes": ["spring_back_hold", "soft_on_path"],
+        "capability_profile_id": "native_client_stop_capability",
+        "hard_stop_level": "native_immediate_hold",
+    })
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    app = create_app(state, security=_TEST_SECURITY)
+    deployment_path = _write_deployment_with_stop_profile(
+        tmp_path, stop_mode="soft_on_path"
+    )
+
+    with TestClient(app) as local_client:
+        load = local_client.post(
+            "/api/program/load",
+            json={"path": _PROGRAM_PATH, "deployment_path": deployment_path},
+        )
+        assert load.status_code == 200, load.text
+        status = local_client.get("/api/runtime/status").json()
+
+    assert kernel.calls == 1
+    assert status["supportedStopModes"] == ["soft_on_path", "spring_back_hold"]
+    assert status["stopCapabilityProfileId"] == "native_client_stop_capability"
+    assert status["hardStopLevel"] == "native_immediate_hold"
+    assert status["stopCapabilityQueryFailed"] is False
+    assert status["stopProfileUnsupported"] is False
+    assert status["canExecute"] is True
 
 
 def test_stop_capability_query_failure_blocks_configured_profile(tmp_path: Path):
@@ -2350,16 +2507,100 @@ def test_stop_capability_query_failure_blocks_configured_profile(tmp_path: Path)
             "profile": "operator_stop_profile",
             "stop_mode": "spring_back_hold",
             "reason": "capability_query_failed",
-        }
+        },
+        {
+            "profile": "default_fault_stop_profile",
+            "stop_mode": "spring_back_hold",
+            "reason": "capability_query_failed",
+        },
     ]
     assert run.status_code == 409
     assert run.json()["detail"]["errorCode"] == "stop_capability_query_failed"
+
+
+def test_missing_required_fault_stop_profile_blocks_motion_arm(tmp_path: Path):
+    bundle = _StopCapabilityBundle({
+        "supported_stop_modes": ["spring_back_hold"],
+        "capability_profile_id": "test_stop_capability",
+        "hard_stop_level": "jtc_cancel_unprofiled_hold",
+    })
+    state = ComposerState(
+        catalog_path=_CATALOG_PATH,
+        kernel=MockKernelClient(),
+        kernel_bundle=bundle,
+    )
+    app = create_app(state, security=_TEST_SECURITY)
+    deployment_path = _write_deployment_with_stop_profile(
+        tmp_path, stop_mode="spring_back_hold", include_fault_stop=False
+    )
+
+    with TestClient(app) as local_client:
+        load = local_client.post(
+            "/api/program/load",
+            json={"path": _PROGRAM_PATH, "deployment_path": deployment_path},
+        )
+        assert load.status_code == 200, load.text
+        status = local_client.get("/api/runtime/status").json()
+        run = local_client.post("/api/cycle/run")
+
+    assert status["readiness"] == "degraded"
+    assert status["canExecute"] is False
+    assert status["stopProfileUnsupported"] is True
+    assert status["stopProfileUnsupportedReasons"] == [
+        {
+            "profile": "default_fault_stop_profile",
+            "stop_mode": "",
+            "reason": "stop_profile_required",
+        }
+    ]
+    assert run.status_code == 409
+    assert run.json()["detail"]["errorCode"] == "stop_profile_required"
+
+
+def test_missing_hard_stop_floor_blocks_motion_arm(tmp_path: Path):
+    bundle = _StopCapabilityBundle({
+        "supported_stop_modes": ["spring_back_hold"],
+        "capability_profile_id": "test_stop_capability",
+        "hard_stop_level": "unavailable",
+    })
+    state = ComposerState(
+        catalog_path=_CATALOG_PATH,
+        kernel=MockKernelClient(),
+        kernel_bundle=bundle,
+    )
+    app = create_app(state, security=_TEST_SECURITY)
+    deployment_path = _write_deployment_with_stop_profile(
+        tmp_path, stop_mode="spring_back_hold"
+    )
+
+    with TestClient(app) as local_client:
+        load = local_client.post(
+            "/api/program/load",
+            json={"path": _PROGRAM_PATH, "deployment_path": deployment_path},
+        )
+        assert load.status_code == 200, load.text
+        status = local_client.get("/api/runtime/status").json()
+        run = local_client.post("/api/cycle/run")
+
+    assert status["readiness"] == "degraded"
+    assert status["canExecute"] is False
+    assert status["stopProfileUnsupported"] is True
+    assert status["stopProfileUnsupportedReasons"] == [
+        {
+            "profile": "hard_stop_floor",
+            "stop_mode": "unavailable",
+            "reason": "hard_stop_floor_unavailable",
+        }
+    ]
+    assert run.status_code == 409
+    assert run.json()["detail"]["errorCode"] == "hard_stop_floor_unavailable"
 
 
 def test_stop_capability_accessor_throw_blocks_motion_arm(tmp_path: Path):
     bundle = _FlakyStopCapabilityBundle({
         "supported_stop_modes": ["spring_back_hold"],
         "capability_profile_id": "test_flaky_capability",
+        "hard_stop_level": "jtc_cancel_unprofiled_hold",
     })
     state = ComposerState(
         catalog_path=_CATALOG_PATH,
@@ -2434,6 +2675,7 @@ def test_unsupported_stop_profile_blocks_direct_joint_jog(
         kernel_bundle=_StopCapabilityBundle({
             "supported_stop_modes": ["spring_back_hold"],
             "capability_profile_id": "test_spring_only",
+            "hard_stop_level": "jtc_cancel_unprofiled_hold",
         }),
     )
     app = create_app(state, security=_TEST_SECURITY)
@@ -2726,6 +2968,18 @@ def test_ws_includes_node_statuses(state):
             assert isinstance(data["nodeStatuses"], dict)
 
 
+def test_ws_state_falls_back_to_kernel_snapshot_fault(state):
+    """WebSocket state mirrors `/api/cycle/status` fault visibility."""
+    state.cycle_manager = _KernelSnapshotFaultCycleManager()
+    app = create_app(state, security=_TEST_SECURITY)
+    with TestClient(app) as tc:
+        with tc.websocket_connect("/ws/state") as ws:
+            data = ws.receive_json()
+            assert data["state"] == "stopped"
+            assert data["errorCode"] == "controller_cancel_timeout"
+            assert data["errorDetails"]["reason_code"] == "controller_cancel_timeout"
+
+
 # =============================================================================
 # Program Save/Update Tests
 # =============================================================================
@@ -2906,6 +3160,67 @@ def test_apply_session_updates_program_and_deployment_together(client):
     current_deployment = client.get("/api/deployment/full").json()
     assert current_tree["name"] == "applied_sequence"
     assert current_deployment["name"] == "applied_deployment"
+
+
+def test_apply_session_program_uses_candidate_deployment_capabilities(client):
+    """Atomic apply validates program modes against the edited deployment payload."""
+    client.post(
+        "/api/program/load",
+        json={"path": _EXAMPLE_PROGRAM_PATH, "deployment_path": _EXAMPLE_DEPLOYMENT_PATH},
+    )
+    full_deployment = client.get("/api/deployment/full").json()
+    assert full_deployment.get("simulationControl") is None
+
+    modified_tree = {
+        "id": "sequence",
+        "name": "sim_control_sequence",
+        "children": [
+            {
+                "id": "reset_simulation",
+                "name": "reset_sim",
+                "params": {"reason": "apply regression"},
+            },
+            {
+                "id": "set_simulation_state",
+                "name": "play_sim",
+                "params": {"state": "playing", "reason": "apply regression"},
+            },
+        ],
+    }
+    modified_deployment = {
+        **full_deployment,
+        "name": "sim_control_deployment",
+        "simulationControl": {
+            "kind": "ros2_simulation_interfaces",
+            "servicePrefix": "auto",
+            "capabilities": {
+                "reset": True,
+                "pause": True,
+                "play": True,
+                "step": True,
+                "setEntityState": True,
+            },
+            "reset": {
+                "defaultScope": "state",
+                "closeCommandGate": True,
+                "waitReadyS": 3.0,
+                "resumePlayAfterReset": True,
+            },
+        },
+    }
+
+    response = client.post(
+        "/api/session/apply",
+        json={"tree": modified_tree, "deployment": modified_deployment},
+    )
+    assert response.status_code == 200
+
+    current_tree = client.get("/api/program/tree").json()["tree"]
+    current_deployment = client.get("/api/deployment/full").json()
+    assert current_tree["name"] == "sim_control_sequence"
+    assert current_deployment["name"] == "sim_control_deployment"
+    assert current_deployment["simulationControl"]["capabilities"]["reset"] is True
+    assert current_deployment["simulationControl"]["capabilities"]["play"] is True
 
 
 def test_apply_session_updates_program_parameters_without_touching_saved_artifact(client):

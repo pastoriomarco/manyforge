@@ -171,6 +171,9 @@ def test_create_native_kernel_accepts_stop_profile_deceleration_time_at_cap():
                 "profile_id": "operator_spring_cap",
                 "stop_mode": "spring_back_hold",
                 "deceleration_time_s": 2.0,
+                "per_joint_max_deceleration_rad_s2": {
+                    "shoulder_pan_joint": 8.0,
+                },
             }
         },
     )
@@ -261,6 +264,23 @@ def test_native_kernel_stop_capability_binding_reports_audit_fields():
         capability["unsupported_reasons"]["hard_deceleration"]
         == "ros2_control_jtc_only_in_current_native_backend"
     )
+
+
+def test_native_kernel_client_forwards_stop_capability_for_composer_gate():
+    if not HAS_NATIVE:
+        pytest.skip("manyforge_roboplan_py not available")
+
+    bundle = manyforge_roboplan_py.create_native_kernel("ur5_gripper", "arm")
+    kernel = NativeKernelClient(bundle)
+
+    capability = kernel.get_motion_interrupt_stop_capability()
+
+    assert capability["supported_stop_modes"] == [
+        "spring_back_hold",
+        "soft_on_path",
+    ]
+    assert capability["capability_profile_id"] == "roboplan_native_v2_soft_on_path"
+    assert capability["hard_stop_level"] == "native_immediate_hold"
 
 
 def test_native_state_mapping_uses_stable_state_name_only():

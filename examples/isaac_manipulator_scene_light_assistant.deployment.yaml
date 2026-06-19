@@ -160,6 +160,22 @@ adapters:
         - wrist_1_joint
         - wrist_2_joint
         - wrist_3_joint
+      # Hard-stop evidence for JTC `constraints.decelerate_on_cancel`.
+      decelerate_on_cancel: true
+      velocity_state_interface_joints:
+        - shoulder_pan_joint
+        - shoulder_lift_joint
+        - elbow_joint
+        - wrist_1_joint
+        - wrist_2_joint
+        - wrist_3_joint
+      max_deceleration_on_cancel_rad_s2:
+        shoulder_pan_joint: 10.0
+        shoulder_lift_joint: 10.0
+        elbow_joint: 10.0
+        wrist_1_joint: 10.0
+        wrist_2_joint: 10.0
+        wrist_3_joint: 10.0
       initial_joint_positions_rad:
         - 2.63422544
         - -0.875980752
@@ -170,7 +186,7 @@ adapters:
       joint_state_max_age_ms: 250
       wait_for_state_timeout_s: 1.0
       wait_for_action_server_timeout_s: 2.0
-      stop_completion_timeout_s: 2.0
+      stop_completion_timeout_s: 0.5
       start_tolerance_rad: 0.15
       final_tolerance_rad: 0.15
       tracking_error_tolerance_rad: 0.05

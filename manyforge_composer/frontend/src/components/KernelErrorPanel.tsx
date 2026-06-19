@@ -24,6 +24,10 @@ export interface KernelErrorPanelProps {
   errorCode?: string | null;
   /** Kernel diagnostics map, when known. */
   errorDetails?: Record<string, unknown> | null;
+  /** Captured event snapshot for the latest fault/stop incident, when known. */
+  incidentSnapshot?: Record<string, unknown> | null;
+  /** Explicit non-reset recovery for retryable stop/fault interventions. */
+  onAcknowledgeAndContinue?: () => void | Promise<void>;
   /** Optional close handler for a dismissible banner. */
   onDismiss?: () => void;
 }
@@ -154,7 +158,7 @@ const ERROR_CODE_MAPPING: Record<string, HeadlineMapping> = {
   },
   controller_cancel_timeout: {
     headline: () => 'Controller cancel did not complete before the timeout',
-    hint: 'The backend entered operator intervention because software stop completion was not observed. Inspect the controller and reset when safe.',
+    hint: 'The backend entered operator intervention because software stop completion was not observed. If the robot is stopped and the controller is healthy, acknowledge and continue; otherwise reset when safe.',
     severity: 'fault',
   },
   controller_feedback_timeout: {
@@ -428,10 +432,285 @@ function severityClasses(severity: HeadlineMapping['severity']): {
   }
 }
 
+const STOP_CHAIN_KEYS = [
+  'requested_stop_mode',
+  'executed_stop_mode',
+  'configured_stop_mode',
+  'fallback_pair',
+  'fallback_reason',
+  'hard_stop_floor',
+  'hard_stop_level',
+  'hard_stop_floor_command_source',
+  'command_source',
+  'stop_command_source',
+  'phase',
+  'reason_code',
+  'reason',
+  'controlled_stop_error_reason',
+  'wait_s',
+  'max_stop_time_s',
+  'stop_completion_timeout_s',
+  'deceleration_time_s',
+];
+
+const INCIDENT_DETAIL_KEYS = [
+  'requested_stop_mode',
+  'executed_stop_mode',
+  'fallback_pair',
+  'fallback_reason',
+  'hard_stop_floor',
+  'hard_stop_level',
+  'hard_stop_floor_command_source',
+  'controlled_stop_error_reason',
+  'reason_code',
+  'reason',
+  'phase',
+  'command_source',
+  'stop_command_source',
+  'emergency_fallback',
+  'hard_stop_transitioned',
+];
+
+function hasStopChain(details: Record<string, unknown> | null | undefined): boolean {
+  if (!details) {
+    return false;
+  }
+  return STOP_CHAIN_KEYS.some((key) => details[key] !== undefined && details[key] !== null);
+}
+
+function isRetryableStopIntervention(details: Record<string, unknown> | null | undefined): boolean {
+  if (!details) {
+    return false;
+  }
+  const reason = stringField(details, 'reason') || stringField(details, 'reason_code');
+  if (
+    reason === 'stop_not_settled_measured_velocity' ||
+    reason === 'operator_stop_total_failure' ||
+    reason === 'in_stop_completion_timeout' ||
+    reason === 'stop_path_collision' ||
+    reason === 'hard_deceleration_not_settled' ||
+    reason === 'controller_cancel_timeout'
+  ) {
+    return true;
+  }
+  const phase = stringField(details, 'phase');
+  return (
+    (phase === 'operator_stop' ||
+      phase === 'motion_trip_stop' ||
+      phase === 'motion_trip_stop_path_collision') &&
+    (stringField(details, 'requested_stop_mode') !== null ||
+      stringField(details, 'executed_stop_mode') !== null ||
+      stringField(details, 'hard_stop_transitioned') !== null)
+  );
+}
+
+function stopChainRows(details: Record<string, unknown>): Array<[string, string]> {
+  const requested =
+    stringField(details, 'requested_stop_mode') ||
+    stringField(details, 'configured_stop_mode');
+  const executed = stringField(details, 'executed_stop_mode');
+  const fallbackPair = stringField(details, 'fallback_pair');
+  const fallbackReason = stringField(details, 'fallback_reason');
+  const command =
+    stringField(details, 'stop_command_source') ||
+    stringField(details, 'command_source') ||
+    stringField(details, 'surface');
+  const hardStopFloor = stringField(details, 'hard_stop_floor');
+  const hardStopLevel = stringField(details, 'hard_stop_level');
+  const hardStopCommand =
+    stringField(details, 'hard_stop_floor_command_source');
+  const phase = stringField(details, 'phase');
+  const reason =
+    stringField(details, 'controlled_stop_error_reason') ||
+    stringField(details, 'reason_code') ||
+    stringField(details, 'reason');
+  const timing = [
+    stringField(details, 'deceleration_time_s')
+      ? `decel ${stringField(details, 'deceleration_time_s')}s`
+      : '',
+    stringField(details, 'wait_s') ? `wait ${stringField(details, 'wait_s')}s` : '',
+    stringField(details, 'max_stop_time_s')
+      ? `max ${stringField(details, 'max_stop_time_s')}s`
+      : '',
+    stringField(details, 'stop_completion_timeout_s')
+      ? `completion/cancel tolerance ${stringField(details, 'stop_completion_timeout_s')}s`
+      : '',
+  ].filter(Boolean).join(', ');
+
+  const rows: Array<[string, string]> = [];
+  if (requested) {
+    rows.push(['Requested', requested]);
+  }
+  if (executed) {
+    rows.push(['Executed', executed]);
+  }
+  if (fallbackPair || fallbackReason) {
+    rows.push(['Fallback', [fallbackPair, fallbackReason].filter(Boolean).join(' — ')]);
+  }
+  if (hardStopFloor || hardStopLevel || hardStopCommand) {
+    rows.push([
+      'Hard stop floor',
+      [hardStopFloor, hardStopLevel, hardStopCommand].filter(Boolean).join(' — '),
+    ]);
+  }
+  if (command) {
+    rows.push(['Backend action', command]);
+  }
+  if (phase) {
+    rows.push(['Phase', phase]);
+  }
+  if (reason) {
+    rows.push(['Reason', reason]);
+  }
+  if (timing) {
+    rows.push(['Timing', timing]);
+  }
+  return rows;
+}
+
+function StopChainSummary({
+  details,
+}: {
+  details: Record<string, unknown>;
+}) {
+  const rows = stopChainRows(details);
+  if (rows.length === 0) {
+    return null;
+  }
+  return (
+    <div className="mt-2 rounded border border-red-800/70 bg-black/25 p-2 text-xs text-red-100/90">
+      <div className="mb-1 font-semibold text-red-100">Stop chain</div>
+      <div className="grid gap-1 sm:grid-cols-[7rem_1fr]">
+        {rows.map(([label, value]) => (
+          <div key={label} className="contents">
+            <span className="text-red-300/80">{label}</span>
+            <span className="break-words font-mono">{value}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function objectField(
+  details: Record<string, unknown> | null | undefined,
+  key: string,
+): Record<string, unknown> | null {
+  if (!details) {
+    return null;
+  }
+  const value = details[key];
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function objectArrayField(
+  details: Record<string, unknown> | null | undefined,
+  key: string,
+): Array<Record<string, unknown>> {
+  if (!details) {
+    return [];
+  }
+  const value = details[key];
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.filter(
+    (item): item is Record<string, unknown> =>
+      item !== null && typeof item === 'object' && !Array.isArray(item),
+  );
+}
+
+function incidentEventDetails(event: Record<string, unknown>): string {
+  const details = objectField(event, 'details');
+  if (!details) {
+    return '';
+  }
+  return INCIDENT_DETAIL_KEYS
+    .map((key) => {
+      const value = details[key];
+      if (value === undefined || value === null || value === '') {
+        return '';
+      }
+      return `${key}=${String(value)}`;
+    })
+    .filter(Boolean)
+    .join('  ');
+}
+
+function incidentEventSummary(event: Record<string, unknown>): string {
+  const type = stringField(event, 'type') || stringField(event, 'event') || 'event';
+  const message = stringField(event, 'message');
+  const details = incidentEventDetails(event);
+  return [type, message, details].filter(Boolean).join(' | ');
+}
+
+function IncidentSnapshotSummary({
+  snapshot,
+}: {
+  snapshot: Record<string, unknown> | null | undefined;
+}) {
+  if (!snapshot) {
+    return null;
+  }
+  const allEvents = objectArrayField(snapshot, 'allEvents');
+  const eventsByChannel = objectField(snapshot, 'eventsByChannel');
+  const faultEvents = objectArrayField(eventsByChannel, 'fault_safety_stop');
+  const timeline = allEvents.slice(-16);
+  const triggerType = stringField(snapshot, 'triggerType');
+  const triggerChannel = stringField(snapshot, 'triggerChannel');
+  const triggerSeverity = stringField(snapshot, 'triggerSeverity');
+  if (timeline.length === 0 && faultEvents.length === 0) {
+    return null;
+  }
+  return (
+    <details className="mt-2 rounded border border-red-800/70 bg-black/25 p-2 text-xs text-red-100/90">
+      <summary className="cursor-pointer font-semibold text-red-100">
+        Captured incident chain
+        {triggerType ? `: ${triggerType}` : ''}
+        {triggerChannel ? ` (${triggerChannel}${triggerSeverity ? `, ${triggerSeverity}` : ''})` : ''}
+      </summary>
+      {faultEvents.length > 0 && (
+        <div className="mt-2">
+          <div className="mb-1 text-red-300/80">Stop/fault channel</div>
+          <ol className="space-y-1">
+            {faultEvents.slice(-12).map((event, index) => (
+              <li
+                key={`${stringField(event, 'event_index') || stringField(event, 'sequence') || index}`}
+                className="break-words font-mono"
+              >
+                {incidentEventSummary(event)}
+              </li>
+            ))}
+          </ol>
+        </div>
+      )}
+      {timeline.length > 0 && (
+        <div className="mt-2">
+          <div className="mb-1 text-red-300/80">All-events window</div>
+          <ol className="space-y-1">
+            {timeline.map((event, index) => (
+              <li
+                key={`${stringField(event, 'event_index') || stringField(event, 'sequence') || index}`}
+                className="break-words font-mono"
+              >
+                {incidentEventSummary(event)}
+              </li>
+            ))}
+          </ol>
+        </div>
+      )}
+    </details>
+  );
+}
+
 export function KernelErrorPanel({
   message,
   errorCode,
   errorDetails,
+  incidentSnapshot,
+  onAcknowledgeAndContinue,
   onDismiss,
 }: KernelErrorPanelProps) {
   const [showDetails, setShowDetails] = useState(false);
@@ -447,6 +726,9 @@ export function KernelErrorPanel({
   const detailEntries = errorDetails
     ? Object.entries(errorDetails).filter(([, v]) => v !== null && v !== undefined)
     : [];
+  const showStopChain = hasStopChain(errorDetails);
+  const canAcknowledgeAndContinue =
+    Boolean(onAcknowledgeAndContinue) && isRetryableStopIntervention(errorDetails);
   return (
     <div className={`mb-2 rounded border px-3 py-2 text-sm text-red-200 ${classes.border}`}>
       <div className="flex items-start justify-between gap-2">
@@ -468,6 +750,22 @@ export function KernelErrorPanel({
               <span className="text-xs text-red-200/90">{hint}</span>
             )}
           </div>
+          {showStopChain && errorDetails && (
+            <StopChainSummary details={errorDetails} />
+          )}
+          <IncidentSnapshotSummary snapshot={incidentSnapshot} />
+          {canAcknowledgeAndContinue && (
+            <div className="mt-2 flex flex-wrap gap-2">
+              <button
+                type="button"
+                onClick={() => void onAcknowledgeAndContinue?.()}
+                className="rounded border border-red-300/50 bg-red-900/40 px-2.5 py-1 text-xs font-semibold text-red-100 hover:bg-red-800/60"
+                title="Clear this classified stop/fault intervention without resetting the backend. The kernel will refuse if fresh backend state is unreadable or still moving."
+              >
+                Acknowledge error
+              </button>
+            </div>
+          )}
           {detailEntries.length > 0 && (
             <div className="mt-2">
               <button

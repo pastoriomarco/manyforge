@@ -41,6 +41,10 @@ def _state() -> ComposerState:
 
 
 def _mcp_sessions_from_client(client: TestClient) -> dict[str, Any]:
+    app_store = getattr(client.app.state, "manyforge_mcp_sessions", None)
+    if isinstance(app_store, dict):
+        return app_store
+
     def find_session_store(value: Any, seen: set[int]) -> dict[str, Any] | None:
         if id(value) in seen:
             return None
@@ -62,6 +66,9 @@ def _mcp_sessions_from_client(client: TestClient) -> dict[str, Any]:
         if getattr(route, "path", None) != "/api/mcp":
             continue
         endpoint = getattr(route, "endpoint", None)
+        explicit_store = getattr(endpoint, "_manyforge_mcp_sessions", None)
+        if isinstance(explicit_store, dict):
+            return explicit_store
         found = find_session_store(endpoint, set())
         if found is not None:
             return found

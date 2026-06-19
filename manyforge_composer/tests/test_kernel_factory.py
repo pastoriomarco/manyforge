@@ -8,6 +8,9 @@ import sys
 import pytest
 
 from manyforge_composer import __main__ as composer_main
+from manyforge_composer.backend.runtime_requirements import (
+    RuntimeFactoryRequirementsError,
+)
 
 
 def _deployment_with_execution_adapter(adapter_id: str):
@@ -30,6 +33,19 @@ def test_ros2_control_adapter_fails_closed_when_runtime_factory_missing():
     sys.modules.pop("manyforge_ros.ros2_control_kernel_factory", None)
     with pytest.raises(RuntimeError, match="ROS 2 controller execution"):
         composer_main._make_kernel(deployment)
+
+
+def test_native_adapter_fails_closed_when_runtime_factory_missing(monkeypatch):
+    deployment = _deployment_with_execution_adapter("execution.roboplan_native")
+
+    monkeypatch.setitem(sys.modules, "manyforge_roboplan_py", None)
+    with pytest.raises(RuntimeFactoryRequirementsError) as exc_info:
+        composer_main._make_kernel(deployment)
+
+    detail = exc_info.value.to_detail()
+    assert detail["reason_code"] == "native_factory_runtime_failed"
+    assert detail["missing"] == ["native_roboplan_runtime"]
+    assert "MockKernelClient" not in str(exc_info.value)
 
 
 def test_ros2_control_adapter_dispatches_to_runtime_factory(monkeypatch):

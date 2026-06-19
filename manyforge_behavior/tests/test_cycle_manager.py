@@ -1744,7 +1744,7 @@ class TestRos2ControlBackendFaultTaxonomy:
         }
 
 
-# --- Cycle-state machine + Run-side auto-ack ---
+# --- Cycle-state machine + explicit intervention recovery ---
 
 
 class TestCycleStateMachine:
@@ -1762,7 +1762,7 @@ class TestCycleStateMachine:
         }
 
 
-class TestCycleManagerRunSideAutoAck:
+class TestCycleManagerExplicitInterventionRecovery:
     """Run on STOPPED + kernel INTERVENTION_REQUIRED (spec/400 §6.6.2)."""
 
     def _make_manager(self) -> tuple[CycleManager, MockKernelClient]:
@@ -1771,7 +1771,9 @@ class TestCycleManagerRunSideAutoAck:
         manager = CycleManager(runner, kernel)
         return manager, kernel
 
-    def test_run_from_stopped_with_kernel_intervention_auto_acks(self):
+    def test_run_from_stopped_with_kernel_intervention_requires_explicit_recovery(
+        self,
+    ):
         manager, kernel = self._make_manager()
         manager.run()
         time.sleep(0.1)
@@ -1780,21 +1782,43 @@ class TestCycleManagerRunSideAutoAck:
 
         # Drive the kernel into INTERVENTION_REQUIRED via direct mutation
         # of the in-memory mock. Production kernels reach this via backend
-        # snapshots or reset failure; both paths converge on
-        # `acknowledge_intervention` as the only legitimate exit.
+        # snapshots or reset failure; Run must not silently acknowledge it.
         kernel._state = ExecutionState.INTERVENTION_REQUIRED
 
-        # Run should auto-ack and transition back to RUNNING.
+        with pytest.raises(RuntimeError, match="Acknowledge and continue"):
+            manager.run()
+        assert manager.state == CycleState.STOPPED
+        assert kernel.get_status().state == ExecutionState.INTERVENTION_REQUIRED
+        assert kernel.acknowledge_intervention_count == 0
+        assert kernel.acknowledge_intervention_for_retry_count == 0
+
+    def test_acknowledge_intervention_for_retry_preserves_backend_reset_count(
+        self,
+    ):
+        manager, kernel = self._make_manager()
         manager.run()
-        assert manager.state == CycleState.RUNNING
-        assert kernel.get_status().state != ExecutionState.INTERVENTION_REQUIRED
+        time.sleep(0.1)
+        manager.stop()
+        assert manager.state == CycleState.STOPPED
+
+        kernel._state = ExecutionState.INTERVENTION_REQUIRED
+        manager.acknowledge_intervention_for_retry(
+            principal_id="operator:test",
+            reason="test_acknowledge_and_continue",
+        )
+
+        assert manager.state == CycleState.STOPPED
+        assert kernel.get_status().state == ExecutionState.IDLE
+        assert kernel.acknowledge_intervention_for_retry_count == 1
+        assert kernel.acknowledge_intervention_count == 0
+        assert kernel.reset_count == 0
 
     def test_run_from_stopped_with_kernel_intervention_fails_closed_if_intervention_session_running(
         self,
     ):
         # An intervention session that the cycle manager still considers
-        # running is a direct-control lease per spec/400 §6.6.2 — auto-ack
-        # MUST refuse until the operator ends/promotes/aborts that session.
+        # running is a direct-control lease per spec/400 §6.6.2 — Run MUST
+        # refuse until the operator ends/promotes/aborts that session.
         manager, kernel = self._make_manager()
         manager.run()
         time.sleep(0.1)
@@ -1813,13 +1837,13 @@ class TestCycleManagerRunSideAutoAck:
         )
         manager._intervention.status = "running"
 
-        with pytest.raises(RuntimeError, match="Cannot auto-acknowledge"):
+        with pytest.raises(RuntimeError, match="intervention_session_running"):
             manager.run()
         assert manager.state == CycleState.STOPPED
 
     def test_run_from_stopped_refuses_auto_ack_when_stop_did_not_settle(self):
         # A measured-settle intervention means the robot/controller did not
-        # prove rest after a confirmed stop. Run must not auto-ack that into a
+        # prove rest after a confirmed stop. Run must not acknowledge that into a
         # backend reset because commanded-sim and some real backends reset by
         # commanding an initial/home state.
         from types import SimpleNamespace
@@ -1845,7 +1869,7 @@ class TestCycleManagerRunSideAutoAck:
         assert kernel.get_status().state == ExecutionState.INTERVENTION_REQUIRED
 
     def test_run_from_stopped_normal_path_unchanged(self):
-        # The auto-ack code path only fires when the kernel is in
+        # The explicit recovery path only applies when the kernel is in
         # INTERVENTION_REQUIRED. Normal STOPPED resume must not call
         # acknowledge_intervention, so no new event is emitted.
         manager, kernel = self._make_manager()

@@ -102,6 +102,22 @@ Result<SoftOnPathStopPlanDTO> plan_soft_on_path_stop(
     const SoftOnPathInitialStateDTO& initial_state,
     const SoftOnPathPlannerConfig& config = {});
 
+/// Build the non-critical `spring_back_hold` replacement as a two-phase,
+/// path-preserving trajectory:
+///   1. a normal soft-on-path deceleration over half of `deceleration_time_s`;
+///   2. a rest-to-rest return on the same accepted path back to the trip cursor
+///      over the remaining half.
+///
+/// This is intentionally a replacement/preemption trajectory, not a JTC cancel
+/// path. The first phase reuses `plan_soft_on_path_stop`, so it inherits the
+/// command-frame lead-in, dispatch-latency compatibility, and limit checks used
+/// by `soft_on_path`.
+Result<SoftOnPathStopPlanDTO> plan_spring_back_on_path_stop(
+    const TrajectoryDTO& accepted_trajectory,
+    const MotionInterruptStopProfileDTO& stop_profile,
+    const SoftOnPathInitialStateDTO& initial_state,
+    const SoftOnPathPlannerConfig& config = {});
+
 /// Validate, before backend dispatch, that model-derived trip samples along the
 /// accepted trajectory can produce a `soft_on_path` ramp under the same planner
 /// limits. This is the plan-time feasibility envelope; it is

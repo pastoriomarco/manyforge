@@ -19,11 +19,11 @@
 namespace manyforge::core {
 
 /// Default controlled-stop deceleration ramp (seconds) when a stop profile
-/// leaves `deceleration_time_s` unset. 2.0 s is the current operator-visible
+/// leaves `deceleration_time_s` unset. 1.0 s is the current operator-visible
 /// default for live stop-profile validation; the prior 50 ms default was a
 /// near-instant stop. Backends MUST resolve an unset `deceleration_time_s`
 /// to this value rather than an ad-hoc local literal.
-inline constexpr double kDefaultDecelerationTimeS = 2.0;
+inline constexpr double kDefaultDecelerationTimeS = 1.0;
 /// Maximum configured wall-time deceleration ramp for operator/fault soft-stop
 /// profiles. Longer stops are an explicit deployment-policy change and must not
 /// slip through profile parsing as a "soft stop".
@@ -102,7 +102,8 @@ struct MotionInterruptStopProfileDTO {
   MotionInterruptStopMode stop_mode = MotionInterruptStopMode::kSpringBackHold;
   /// Requested ramp duration for `kSpringBackHold` and `kSoftOnPath`.
   /// Required for `kSoftOnPath`; deployments MAY provide defaults for
-  /// `kSpringBackHold`.
+  /// `kSpringBackHold`. For on-path spring-back the value is split into equal
+  /// forward-deceleration and reverse-return halves.
   std::optional<double> deceleration_time_s;
   /// Upper bound on backend stop confirmation. If absent, the effective
   /// deadline is `deceleration_time_s` (or its profile default) plus the
@@ -181,29 +182,33 @@ inline std::string motion_interrupt_deceleration_time_max_error() {
 /// defense in depth.)
 inline std::string motion_interrupt_stop_profile_field_error(
     const MotionInterruptStopProfileDTO& profile) {
-  if (profile.stop_mode == MotionInterruptStopMode::kSoftOnPath) {
+  if (profile.stop_mode == MotionInterruptStopMode::kSoftOnPath ||
+      profile.stop_mode == MotionInterruptStopMode::kSpringBackHold) {
     if (!profile.deceleration_time_s ||
         !std::isfinite(*profile.deceleration_time_s) ||
         *profile.deceleration_time_s <= 0.0) {
-      return "soft_on_path requires a finite positive deceleration_time_s";
+      return "soft_on_path/spring_back_hold requires a finite positive "
+             "deceleration_time_s";
     }
     if (*profile.deceleration_time_s >
         kMaxControlledStopDecelerationTimeS) {
       return motion_interrupt_deceleration_time_max_error();
     }
     if (profile.per_joint_max_deceleration_rad_s2.empty()) {
-      return "soft_on_path requires a non-empty "
+      return "soft_on_path/spring_back_hold requires a non-empty "
              "per_joint_max_deceleration_rad_s2";
     }
     for (const auto& [joint, limit] :
          profile.per_joint_max_deceleration_rad_s2) {
       if (joint.empty() || !std::isfinite(limit) || limit <= 0.0) {
-        return "soft_on_path per_joint_max_deceleration_rad_s2 entries must "
-               "have non-empty joint names and finite positive values";
+        return "soft_on_path/spring_back_hold "
+               "per_joint_max_deceleration_rad_s2 entries must have non-empty "
+               "joint names and finite positive values";
       }
     }
   }
   if (profile.stop_mode != MotionInterruptStopMode::kSoftOnPath &&
+      profile.stop_mode != MotionInterruptStopMode::kSpringBackHold &&
       profile.deceleration_time_s.has_value()) {
     if (!std::isfinite(*profile.deceleration_time_s) ||
         *profile.deceleration_time_s <= 0.0) {

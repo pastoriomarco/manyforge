@@ -9,6 +9,7 @@
 #include <exception>
 #include <iomanip>
 #include <limits>
+#include <map>
 #include <memory>
 #include <sstream>
 #include <stdexcept>
@@ -50,6 +51,110 @@ StopResultDTO request_hard_stop_floor_once(
   return attempt->result;
 }
 
+std::string backend_hard_stop_level(IExecutionBackend& backend) {
+  try {
+    const auto cap = backend.get_motion_interrupt_stop_capability();
+    return cap.hard_stop_level.value_or("unknown");
+  } catch (const std::exception&) {
+    return "unknown";
+  }
+}
+
+std::string hard_stop_floor_role_from_level(const std::string& level) {
+  if (level == "hard_deceleration") {
+    return "hard_deceleration";
+  }
+  if (level == "native_immediate_hold" ||
+      level == "jtc_cancel_unprofiled_hold") {
+    return "immediate_hard_stop";
+  }
+  return "immediate_hard_stop";
+}
+
+std::string hard_stop_floor_command_source_from_level(
+    const std::string& level) {
+  if (level == "hard_deceleration") {
+    return "jtc_cancel_decelerate_on_cancel";
+  }
+  if (level == "native_immediate_hold") {
+    return "native_simulated_stop";
+  }
+  if (level == "jtc_cancel_unprofiled_hold") {
+    return "jtc_cancel_unprofiled_hold";
+  }
+  return "backend_stop";
+}
+
+void add_hard_stop_floor_details(
+    std::map<std::string, std::string>& details,
+    IExecutionBackend& backend) {
+  const auto level = backend_hard_stop_level(backend);
+  details["hard_stop_level"] = level;
+  details["hard_stop_floor"] = hard_stop_floor_role_from_level(level);
+  details["hard_stop_floor_command_source"] =
+      hard_stop_floor_command_source_from_level(level);
+}
+
+void add_optional_double_detail(std::map<std::string, std::string>& details,
+                                const char* key,
+                                const std::optional<double>& value) {
+  if (value.has_value()) {
+    details[key] = std::to_string(*value);
+  }
+}
+
+void merge_controlled_stop_diagnostics(
+    std::map<std::string, std::string>& details,
+    const InterruptStructuredValue& diagnostics) {
+  for (const auto& [key, value] : diagnostics) {
+    if (details.contains(key)) {
+      details["controlled_stop_detail_" + key] = value;
+    } else {
+      details[key] = value;
+    }
+  }
+}
+
+std::map<std::string, std::string> controlled_stop_success_event_details(
+    const MotionInterruptStopProfileDTO& profile,
+    const ControlledStopResultDTO& result,
+    IExecutionBackend& backend,
+    const std::string& phase) {
+  std::map<std::string, std::string> details{
+      {"phase", phase},
+      {"controlled_stop_success", "true"},
+      {"requested_stop_profile_id", profile.profile_id},
+      {"requested_stop_mode", stop_mode_string(profile.stop_mode)},
+      {"executed_stop_mode", stop_mode_string(result.executed_stop_mode)},
+      {"stop_command_source",
+       stop_command_source_string(result.stop_command_source)},
+      {"backend_stop_confirmed",
+       result.backend_stop_confirmed ? "true" : "false"},
+      {"completed_by_natural_completion",
+       result.completed_by_natural_completion ? "true" : "false"},
+      {"confirmation_latency_ns",
+       std::to_string(result.confirmation_latency_ns)},
+      {"deceleration_time_s",
+       std::to_string(motion_interrupt_deceleration_time_or_default(profile))},
+      {"emergency_fallback", "none"},
+      {"hard_stop_transitioned", "false"}};
+  if (profile.max_stop_time_s.has_value()) {
+    details["max_stop_time_s"] = std::to_string(*profile.max_stop_time_s);
+  }
+  if (result.fallback_reason.has_value()) {
+    details["fallback_reason"] = *result.fallback_reason;
+  }
+  add_optional_double_detail(details, "stop_distance_rad",
+                             result.stop_distance_rad);
+  add_optional_double_detail(details, "path_deviation_max_rad",
+                             result.path_deviation_max_rad);
+  add_optional_double_detail(details, "initial_path_deviation_rad",
+                             result.initial_path_deviation_rad);
+  merge_controlled_stop_diagnostics(details, result.diagnostics);
+  add_hard_stop_floor_details(details, backend);
+  return details;
+}
+
 std::int64_t effective_controlled_stop_deadline_ns(
     const MotionInterruptStopProfileDTO& profile,
     Duration stop_completion_tolerance_ns) {
@@ -84,6 +189,73 @@ std::optional<double> measured_max_abs_velocity_from_snapshot(
     max_abs = std::max(max_abs, std::abs(v));
   }
   return max_abs;
+}
+
+bool all_joint_positions_finite(const ExecutionSnapshot& snapshot) {
+  if (snapshot.joint_positions_rad.empty()) {
+    return false;
+  }
+  for (double q : snapshot.joint_positions_rad) {
+    if (!std::isfinite(q)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool all_joint_velocities_finite_when_present(
+    const ExecutionSnapshot& snapshot) {
+  for (double v : snapshot.joint_velocities_rad_s) {
+    if (!std::isfinite(v)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+std::optional<double> parse_positive_double_detail(
+    const std::map<std::string, std::string>& details,
+    const std::string& key) {
+  const auto it = details.find(key);
+  if (it == details.end()) {
+    return std::nullopt;
+  }
+  try {
+    std::size_t parsed = 0;
+    const double value = std::stod(it->second, &parsed);
+    if (parsed != it->second.size() || !std::isfinite(value) ||
+        value <= 0.0) {
+      return std::nullopt;
+    }
+    return value;
+  } catch (const std::exception&) {
+    return std::nullopt;
+  }
+}
+
+bool is_classified_stop_intervention(
+    const std::map<std::string, std::string>& details) {
+  const auto reason_it = details.find("reason");
+  const std::string reason =
+      reason_it != details.end() ? reason_it->second : std::string{};
+  if (reason == "stop_not_settled_measured_velocity" ||
+      reason == "operator_stop_total_failure" ||
+      reason == "in_stop_completion_timeout" ||
+      reason == "stop_path_collision" ||
+      reason == "hard_deceleration_not_settled") {
+    return true;
+  }
+  const auto phase_it = details.find("phase");
+  const bool stop_phase =
+      phase_it != details.end() &&
+      (phase_it->second == "operator_stop" ||
+       phase_it->second == "motion_trip_stop" ||
+       phase_it->second == "motion_trip_stop_path_collision");
+  const bool has_stop_mode =
+      details.contains("requested_stop_mode") ||
+      details.contains("executed_stop_mode") ||
+      details.contains("hard_stop_transitioned");
+  return stop_phase && has_stop_mode;
 }
 
 struct MeasuredRestWaitResult {
@@ -1339,10 +1511,10 @@ void ExecutionKernel::run_operator_stop_worker(
         clock_.now() + effective_deadline_ns,
         [this, controlled_stop_source, hard_stop_floor_attempt,
          requested_mode]() {
-          controlled_stop_source->request_stop();
           const auto legacy =
               request_hard_stop_floor_once(execution_backend_,
                                            hard_stop_floor_attempt);
+          controlled_stop_source->request_stop();
           const auto fallback_outcome =
               legacy.accepted ? std::string("legacy_stop_succeeded")
                               : std::string("legacy_stop_failed");
@@ -1352,6 +1524,7 @@ void ExecutionKernel::run_operator_stop_worker(
               {"requested_stop_mode", requested_mode},
               {"emergency_fallback", fallback_outcome},
               {"hard_stop_transitioned", "true"}};
+          add_hard_stop_floor_details(details, execution_backend_);
           emit_event({KernelEventType::kErrorRaised,
                       sm_.status().execution_id,
                       clock_.now(),
@@ -1452,6 +1625,9 @@ void ExecutionKernel::run_operator_stop_worker(
         {"hard_stop_transitioned",
          confirmed_but_not_settled ? "false" : "true"},
         {"phase", "operator_stop"}};
+    if (!confirmed_but_not_settled) {
+      add_hard_stop_floor_details(escalation_details, execution_backend_);
+    }
     for (const auto& [key, value] : settle_details) {
       escalation_details[key] = value;
     }
@@ -1469,7 +1645,8 @@ void ExecutionKernel::run_operator_stop_worker(
     // requested stop was refused is left only in dropped backend state.
     for (const auto& [diag_key, diag_value] : controlled_result.diagnostics) {
       if (diag_key.rfind("soft_on_path", 0) == 0 ||
-          diag_key.rfind("fallback", 0) == 0) {
+          diag_key.rfind("fallback", 0) == 0 ||
+          diag_key.rfind("hard_stop", 0) == 0) {
         escalation_details[diag_key] = diag_value;
       }
     }
@@ -1555,6 +1732,7 @@ void ExecutionKernel::run_operator_stop_worker(
          {"emergency_fallback", "legacy_stop_failed"},
          {"hard_stop_transitioned", "true"},
          {"phase", "operator_stop"}}};
+    add_hard_stop_floor_details(total_failure.details, execution_backend_);
     for (const auto& [key, value] : settle_details) {
       total_failure.details[key] = value;
     }
@@ -1573,7 +1751,8 @@ void ExecutionKernel::run_operator_stop_worker(
     for (const auto& [diag_key, diag_value] :
          controlled_result.diagnostics) {
       if (diag_key.rfind("soft_on_path", 0) == 0 ||
-          diag_key.rfind("fallback", 0) == 0) {
+          diag_key.rfind("fallback", 0) == 0 ||
+          diag_key.rfind("hard_stop", 0) == 0) {
         total_failure.details[diag_key] = diag_value;
       }
     }
@@ -1643,6 +1822,8 @@ void ExecutionKernel::run_operator_stop_worker(
          {"executed_stop_mode", executed_mode},
          {"emergency_fallback", "legacy_stop_succeeded"},
          {"hard_stop_transitioned", "true"}}};
+    add_hard_stop_floor_details(degraded_stop_error.details,
+                                execution_backend_);
     for (const auto& [key, value] : settle_details) {
       degraded_stop_error.details[key] = value;
     }
@@ -1653,8 +1834,14 @@ void ExecutionKernel::run_operator_stop_worker(
     snapshot.error = std::move(degraded_stop_error);
   }
   publish_execution_snapshot(std::move(snapshot));
+  std::map<std::string, std::string> stop_issued_details;
+  if (controlled_ok) {
+    stop_issued_details = controlled_stop_success_event_details(
+        profile, controlled_result, execution_backend_, "operator_stop");
+  }
   emit_event({KernelEventType::kStopIssued, sm_.status().execution_id,
-              clock_.now(), {}, {}, std::nullopt, {}});
+              clock_.now(), {}, {}, std::nullopt,
+              std::move(stop_issued_details)});
   emit_event({KernelEventType::kStateTransition, sm_.status().execution_id,
               clock_.now(), pre_completion_state, sm_.status().state,
               std::nullopt, {}});
@@ -1895,7 +2082,12 @@ void ExecutionKernel::apply_latched_interrupt_preemption(
         stop_command_source_string(controlled_stop->stop_command_source);
     if (controlled_ok) {
       preempt_accepted = true;
+      preempt_event_details = controlled_stop_success_event_details(
+          *fault_stop_profile, *controlled_stop, execution_backend_,
+          "fault_preempt");
       preempt_event_details["preempt_path"] = "controlled_stop";
+      preempt_event_details["fault_stop_profile_id"] =
+          fault_stop_profile->profile_id;
     } else {
       // Emergency fallback: industrial guarantee that a fault
       // preempt physically stops the robot even when the
@@ -2327,6 +2519,7 @@ const char* stop_command_source_string(MotionInterruptStopCommandSource s) {
     case kFjtPreemptPathRamp: return "fjt_preempt_path_ramp";
     case kJtcSpeedScalingRamp: return "jtc_speed_scaling_ramp";
     case kJtcCancelDecelerateOnCancel: return "jtc_cancel_decelerate_on_cancel";
+    case kJtcCancelUnprofiledHold: return "jtc_cancel_unprofiled_hold";
     case kNativeSimulatedStop: return "native_simulated_stop";
     case kNativeSimulatedPathRamp: return "native_simulated_path_ramp";
     case kRobotNativeStop: return "robot_native_stop";
@@ -2339,7 +2532,7 @@ struct StopFallbackQualificationRow {
   MotionInterruptStopMode requested;
   MotionInterruptStopMode executed;
   MotionInterruptNodeCategory node_category;
-  std::array<MotionInterruptStopCommandSource, 3> allowed_command_sources;
+  std::array<MotionInterruptStopCommandSource, 5> allowed_command_sources;
   std::size_t allowed_command_source_count;
   const char* qualification_id;
   const char* rationale;
@@ -2354,10 +2547,12 @@ constexpr std::array<StopFallbackQualificationRow, 1>
          MotionInterruptNodeCategory::kGeneric,
          {MotionInterruptStopCommandSource::kDiagnosticOther,
           MotionInterruptStopCommandSource::kFjtPreemptHold,
-          MotionInterruptStopCommandSource::kNativeSimulatedStop},
-         3,
+          MotionInterruptStopCommandSource::kNativeSimulatedStop,
+          MotionInterruptStopCommandSource::kFjtPreemptPathRamp,
+          MotionInterruptStopCommandSource::kNativeSimulatedPathRamp},
+         5,
          "4.5G-soft_on_path-to-spring_back_hold-generic-v1",
-         "path-preserving ramp unavailable; generic node accepts observed-state halt",
+         "path-preserving soft stop unavailable; generic node accepts the qualified spring-back stop",
          "fallback_reason, requested/executed modes, command source, stop snapshot, stop timing",
          "in_tree_qualified; live_adapter_evidence_required_for_release"},
     }};
@@ -2617,15 +2812,15 @@ void ExecutionKernel::handle_motion_trip_latch(
         clock_.now() + effective_deadline_ns,
         [this, hard_stop_floor_attempt, requested_mode, latch_id, source_id,
          policy_id, scope_id]() {
+          const auto legacy =
+              request_hard_stop_floor_once(execution_backend_,
+                                           hard_stop_floor_attempt);
           {
             std::lock_guard<std::mutex> lk(motion_trip_stop_mutex_);
             if (motion_trip_stop_source_.has_value()) {
               motion_trip_stop_source_->request_stop();
             }
           }
-          const auto legacy =
-              request_hard_stop_floor_once(execution_backend_,
-                                           hard_stop_floor_attempt);
           const auto fallback_outcome =
               legacy.accepted ? std::string("legacy_stop_succeeded")
                               : std::string("legacy_stop_failed");
@@ -2746,7 +2941,9 @@ void ExecutionKernel::handle_motion_trip_latch(
           }
         }
         for (const auto& [k, v] : stop_result.diagnostics) {
-          if (k.rfind("soft_on_path", 0) == 0 || k.rfind("fallback", 0) == 0) {
+          if (k.rfind("soft_on_path", 0) == 0 ||
+              k.rfind("fallback", 0) == 0 ||
+              k.rfind("hard_stop", 0) == 0) {
             details[k] = v;
           }
         }
@@ -2770,6 +2967,7 @@ void ExecutionKernel::handle_motion_trip_latch(
     details["emergency_fallback"] =
         legacy.accepted ? "legacy_stop_succeeded" : "legacy_stop_failed";
     details["hard_stop_transitioned"] = "true";
+    add_hard_stop_floor_details(details, execution_backend_);
     emit_event({KernelEventType::kErrorRaised, exec_id, clock_.now(), {}, {},
                  std::optional<ErrorDTO>{ErrorDTO{
                      std::string(kErrorMotionInterruptBackendStopFailed),
@@ -2777,8 +2975,14 @@ void ExecutionKernel::handle_motion_trip_latch(
                      "emergency hard-stop floor",
                      details}},
                  details});
-    return {{"hard_stop_transitioned", "true"},
+    std::map<std::string, std::string> evidence{
+            {"hard_stop_transitioned", "true"},
             {"emergency_fallback", details["emergency_fallback"]}};
+    evidence["hard_stop_level"] = details["hard_stop_level"];
+    evidence["hard_stop_floor"] = details["hard_stop_floor"];
+    evidence["hard_stop_floor_command_source"] =
+        details["hard_stop_floor_command_source"];
+    return evidence;
   };
 
   // Stop-path collision escalation (checked first). A dynamic obstacle entered
@@ -3097,14 +3301,29 @@ void ExecutionKernel::handle_motion_trip_latch(
   // the outcome is durable via the auto_clear_after_motion_outcome
   // disposition path.
   sm_.try_transition(ExecutionState::kCompleted);
+  auto trip_success_details = controlled_stop_success_event_details(
+      profile, stop_result, execution_backend_, "motion_trip");
+  trip_success_details["latch_id"] = latch.latch_id;
+  trip_success_details["source_id"] = latch.source_id;
+  trip_success_details["policy_id"] = latch.policy_id;
+  trip_success_details["scope_id"] = trip.scope_id;
+  trip_success_details["signal_to_latch_ns"] =
+      std::to_string(trip.signal_to_latch_ns);
+  trip_success_details["latch_to_backend_stop_call_ns"] =
+      std::to_string(trip.latch_to_backend_stop_call_ns);
+  trip_success_details["latch_to_stop_confirmed_ns"] =
+      std::to_string(trip.latch_to_stop_confirmed_ns);
+  if (trip.stop_snapshot.max_abs_velocity_rad_s.has_value()) {
+    trip_success_details["stop_snapshot_max_abs_velocity_rad_s"] =
+        std::to_string(*trip.stop_snapshot.max_abs_velocity_rad_s);
+  }
+  if (trip.stop_snapshot.at_rest.has_value()) {
+    trip_success_details["stop_snapshot_at_rest"] =
+        *trip.stop_snapshot.at_rest ? "true" : "false";
+  }
   emit_event({KernelEventType::kMotionTripCompleted, exec_id, clock_.now(),
                {}, {}, std::nullopt,
-               {{"latch_id", latch.latch_id},
-                {"scope_id", trip.scope_id},
-                {"executed_stop_mode",
-                 stop_mode_string(trip.executed_stop_mode)},
-                {"stop_command_source",
-                 stop_command_source_string(trip.stop_command_source)}}});
+               std::move(trip_success_details)});
   emit_event({KernelEventType::kStateTransition, exec_id, clock_.now(),
                ExecutionState::kStopping, ExecutionState::kCompleted,
                std::nullopt, {}});
@@ -4434,17 +4653,14 @@ Result<uint64_t> ExecutionKernel::execute(const ExecuteRequestDTO& request) {
         {{"reason_code", "reset_waiting_for_stop"}}});
   }
 
-  // `kInterventionRequired` MUST be cleared by an explicit
-  // `acknowledge_intervention(principal_id, reason)` call, not silently by
-  // `execute()`. An implicit clear here would erase the operator
-  // intervention boundary — any caller (including LLMs) could re-issue
-  // `execute` to bypass the intervention gate with no audit event. The
-  // policy decision about whether the leftover state is safe to clear
-  // lives in the caller (cycle manager Run-side auto-ack, MCP, operator UI).
+  // `kInterventionRequired` MUST be cleared by an explicit recovery action,
+  // not silently by `execute()`. An implicit clear here would erase the
+  // operator intervention boundary: any caller could re-issue `execute` to
+  // bypass the intervention gate with no audit event.
   if (sm_.status().state == ExecutionState::kInterventionRequired) {
     return Result<uint64_t>::Err(ErrorDTO{
         kErrorInvalidRequest,
-        "Execution is in InterventionRequired; explicit acknowledge_intervention required",
+        "Execution is in InterventionRequired; explicit recovery action required",
         {{"requires_operator_intervention", "true"},
          {"reason_code", "intervention_required"},
          {"state", to_string(sm_.status().state)}}});
@@ -5421,6 +5637,190 @@ AcknowledgeInterventionResultDTO ExecutionKernel::acknowledge_intervention(
               ExecutionState::kIdle,
               std::nullopt,
               {}});
+
+  return AcknowledgeInterventionResultDTO{true, std::nullopt};
+}
+
+AcknowledgeInterventionResultDTO
+ExecutionKernel::acknowledge_intervention_for_retry(
+    std::string principal_id, std::string reason) {
+  std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
+
+  const auto status = sm_.status();
+  if (principal_id.empty()) {
+    return AcknowledgeInterventionResultDTO{
+        false,
+        ErrorDTO{kErrorInvalidRequest,
+                 "acknowledge_intervention_for_retry requires principal_id",
+                 {{"state", to_string(status.state)}}}};
+  }
+  if (status.state != ExecutionState::kInterventionRequired) {
+    return AcknowledgeInterventionResultDTO{
+        false,
+        ErrorDTO{kErrorInvalidRequest,
+                 "acknowledge_intervention_for_retry is valid only from "
+                 "InterventionRequired",
+                 {{"state", to_string(status.state)}}}};
+  }
+
+  ExecutionSnapshot snapshot;
+  try {
+    snapshot = execution_backend_.get_execution_snapshot();
+  } catch (const std::exception& exc) {
+    return AcknowledgeInterventionResultDTO{
+        false,
+        ErrorDTO{kErrorInvalidRequest,
+                 "Cannot acknowledge intervention for retry: backend state is "
+                 "unreadable",
+                 {{"reason", "backend_snapshot_unreadable"},
+                  {"exception", exc.what()}}}};
+  }
+  if (snapshot.state == ExecutionState::kStopping) {
+    return AcknowledgeInterventionResultDTO{
+        false,
+        ErrorDTO{kErrorInvalidRequest,
+                 "Cannot acknowledge intervention for retry while backend is "
+                 "still stopping",
+                 {{"reason", "backend_still_stopping"}}}};
+  }
+  if (!all_joint_positions_finite(snapshot)) {
+    return AcknowledgeInterventionResultDTO{
+        false,
+        ErrorDTO{kErrorInvalidRequest,
+                 "Cannot acknowledge intervention for retry: backend pose is "
+                 "missing or non-finite",
+                 {{"reason", "backend_pose_unreadable"}}}};
+  }
+  if (!all_joint_velocities_finite_when_present(snapshot)) {
+    return AcknowledgeInterventionResultDTO{
+        false,
+        ErrorDTO{kErrorInvalidRequest,
+                 "Cannot acknowledge intervention for retry: measured "
+                 "velocity is non-finite",
+                 {{"reason", "backend_velocity_non_finite"}}}};
+  }
+
+  std::optional<ErrorDTO> intervention_error;
+  {
+    std::lock_guard<std::mutex> error_lock(operator_stop_error_mutex_);
+    intervention_error = operator_stop_intervention_error_;
+  }
+  if (!intervention_error.has_value() && snapshot.error.has_value()) {
+    intervention_error = snapshot.error;
+  }
+  if (!intervention_error.has_value()) {
+    return AcknowledgeInterventionResultDTO{
+        false,
+        ErrorDTO{kErrorInvalidRequest,
+                 "Cannot acknowledge intervention for retry: missing "
+                 "classified intervention error",
+                 {{"reason", "intervention_error_missing"}}}};
+  }
+  if (!is_classified_stop_intervention(intervention_error->details)) {
+    return AcknowledgeInterventionResultDTO{
+        false,
+        ErrorDTO{kErrorInvalidRequest,
+                 "Cannot acknowledge intervention for retry: intervention is "
+                 "not a classified stop/fault boundary",
+                 {{"reason", "intervention_not_retryable"},
+                  {"error_code", intervention_error->code}}}};
+  }
+
+  try {
+    const auto cap = execution_backend_.get_motion_interrupt_stop_capability();
+    if (!cap.hard_stop_level.has_value() || cap.hard_stop_level->empty()) {
+      return AcknowledgeInterventionResultDTO{
+          false,
+          ErrorDTO{kErrorInvalidRequest,
+                   "Cannot acknowledge intervention for retry: backend hard "
+                   "stop floor is not reportable",
+                   {{"reason", "hard_stop_floor_unreportable"}}}};
+    }
+  } catch (const std::exception& exc) {
+    return AcknowledgeInterventionResultDTO{
+        false,
+        ErrorDTO{kErrorInvalidRequest,
+                 "Cannot acknowledge intervention for retry: backend stop "
+                 "capability is unreadable",
+                 {{"reason", "stop_capability_unreadable"},
+                  {"exception", exc.what()}}}};
+  }
+
+  const double settle_threshold =
+      parse_positive_double_detail(intervention_error->details,
+                                   "settle_velocity_threshold_rad_s")
+          .value_or(kDefaultSettleVelocityThresholdRadS);
+  const auto max_abs_velocity =
+      measured_max_abs_velocity_from_snapshot(snapshot);
+  if (max_abs_velocity.has_value() && *max_abs_velocity > settle_threshold) {
+    return AcknowledgeInterventionResultDTO{
+        false,
+        ErrorDTO{kErrorInvalidRequest,
+                 "Cannot acknowledge intervention for retry: robot is not "
+                 "settled",
+                 {{"reason", "robot_not_settled"},
+                  {"measured_max_abs_velocity_rad_s",
+                   std::to_string(*max_abs_velocity)},
+                  {"settle_velocity_threshold_rad_s",
+                   std::to_string(settle_threshold)}}}};
+  }
+  const auto reason_it = intervention_error->details.find("reason");
+  if (reason_it != intervention_error->details.end() &&
+      reason_it->second == "stop_not_settled_measured_velocity" &&
+      !max_abs_velocity.has_value() &&
+      !is_command_authoritative_stop_snapshot(snapshot)) {
+    return AcknowledgeInterventionResultDTO{
+        false,
+        ErrorDTO{kErrorInvalidRequest,
+                 "Cannot acknowledge measured-settle intervention for retry: "
+                 "measured velocity is unavailable",
+                 {{"reason", "settle_signal_unavailable"}}}};
+  }
+
+  auto reset_result = stop_policy_.request_reset();
+  if (!reset_result.ok()) {
+    return AcknowledgeInterventionResultDTO{false, reset_result.error()};
+  }
+
+  const auto prev_state = status.state;
+  const auto prev_execution_id = status.execution_id;
+  sm_.set_execution_id(0);
+  {
+    std::lock_guard<std::mutex> move_lock(active_move_id_mutex_);
+    active_move_id_.clear();
+  }
+
+  snapshot.timestamp_ns = clock_.now();
+  snapshot.execution_id = 0;
+  snapshot.move_id.clear();
+  snapshot.state = ExecutionState::kIdle;
+  snapshot.progress = 0.0;
+  snapshot.error.reset();
+  publish_execution_snapshot(std::move(snapshot));
+  {
+    std::lock_guard<std::mutex> error_lock(operator_stop_error_mutex_);
+    operator_stop_terminal_error_.reset();
+    operator_stop_intervention_error_.reset();
+  }
+
+  emit_event({KernelEventType::kInterventionAcknowledged,
+              prev_execution_id,
+              clock_.now(),
+              {},
+              {},
+              std::nullopt,
+              {{"principal_id", principal_id},
+               {"reason", reason},
+               {"prev_state", to_string(prev_state)},
+               {"recovery_mode", "acknowledge_and_continue"},
+               {"backend_reset_performed", "false"}}});
+  emit_event({KernelEventType::kStateTransition,
+              prev_execution_id,
+              clock_.now(),
+              prev_state,
+              ExecutionState::kIdle,
+              std::nullopt,
+              {{"reason", "intervention_acknowledged_for_retry"}}});
 
   return AcknowledgeInterventionResultDTO{true, std::nullopt};
 }

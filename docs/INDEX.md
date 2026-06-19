@@ -43,6 +43,11 @@ branch/commit workflow).
     test layers (hermetic vs real-lifecycle), production checklist and
     fail-closed semantics.
 
+- [`operations/STOP_PROFILES.md`](operations/STOP_PROFILES.md)
+  - Operator runbook for controlled-stop profiles: selectable modes,
+    editable deployment fields, mandatory hard-stop floor, stop history,
+    offline qualification, and live validation checklist.
+
 - [`operations/ISAAC_SCENE_AUTHORING.md`](operations/ISAAC_SCENE_AUTHORING.md)
   - Operator runbook for exporting Isaac Sim scene meshes and loading
     them through Composer.

@@ -3,7 +3,7 @@
   Regenerate with:
     cd /workspace
     python3 scripts/regen-public-contracts.py
-  Last regenerated: 2026-05-11 07:40:49 UTC
+  Last regenerated: 2026-06-19 12:07:56 UTC
   Generator source: scripts/regen-public-contracts.py:gen_assistant_provider_contract
 -->
 
@@ -22,6 +22,8 @@ Both speak the same wire envelope; this doc covers the wire format the provider 
 | `GET` | `/healthz` | Healthz |
 | `POST` | `/v1/manyforge/assistant` | Assistant |
 | `POST` | `/v1/manyforge/assistant/{request_id}/cancel` | Cancel Request |
+| `GET` | `/v1/sessions/stats` | Session Stats |
+| `POST` | `/v1/sessions/{conversation_id}/clear` | Clear Session |
 
 ## Envelope wire format
 

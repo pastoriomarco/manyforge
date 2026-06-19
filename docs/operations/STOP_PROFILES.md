@@ -1,0 +1,155 @@
+# Controlled Stop Profiles
+
+This runbook covers the operator-facing controlled-stop behavior in Composer.
+Implementation details live in
+[`../reference/STOP_PROFILES_INTERNALS.md`](../reference/STOP_PROFILES_INTERNALS.md).
+
+ManyForge controlled stops are operational software stops. They are designed to
+be deterministic, auditable, and compatible with robot safety functions, but they
+are not a certified E-stop or protective-stop channel.
+
+## Stop Modes
+
+| Mode | What It Does | When To Use |
+| --- | --- | --- |
+| `soft_on_path` | Sends a backend-authored replacement trajectory that decelerates on the already accepted path. | Default operator stop for ordinary motion. |
+| `spring_back_hold` | Sends a two-phase on-path replacement: decelerate forward, then return on the same path to the trip cursor. | Operator-selected visible return-to-trip behavior. |
+| `hard_deceleration` | Uses JTC `decelerate_on_cancel` when the ros2_control deployment proves that capability. | Fast profiled stop floor on ros2_control lanes that support it. |
+| Immediate hard-stop floor | ros2_control plain cancel/hold or native immediate hold. | Mandatory final floor when a controlled replacement is refused, times out, or cannot be trusted. Not a normal operator profile. |
+| Natural completion | Keeps the accepted trajectory running when it will reach rest before a useful injected stop can be generated. | Short remaining path. Composer stays in `Stopping` until terminal evidence arrives. |
+
+`spring_back_hold` is not the default fallback for `soft_on_path`. It is often
+harder to generate because the forward deceleration gets only part of the total
+time and then the robot must return to the trip cursor. Infeasible, refused,
+timed-out, or unconfirmed stops use the hard-stop floor instead.
+
+## Editable Fields
+
+The Deployment tab exposes the controlled-stop parameters while the runtime is
+idle or stopped. They are frozen during an active stop.
+
+| Field | Default | Rule |
+| --- | --- | --- |
+| Mode | Deployment-specific | Must be one of the backend-supported modes. `Not configured` is only a disabled placeholder. |
+| Deceleration Time | `1.0 s` | Requested wall-time stop duration. Must be `> 0` and `<= 2.0 s`. |
+| Max Stop Time | Auto | Optional confirmation deadline. If unset, ManyForge derives it from the requested stop time plus lane tolerance. |
+| Settle Velocity | `0.01 rad/s` | Optional measured-rest threshold where measured velocity exists. |
+| Max Deceleration | `10 rad/s^2` in examples | Per-joint operational limit used by the planner. |
+| Lead-In | `0.1 s` | Command-frame lead-in budget for seam-preserving replacement trajectories. Must be less than the requested stop duration. |
+| Sample Period | `0.01 s` in examples | Stop trajectory sampling period. |
+| Max Jerk | Derived unless set | Per-joint operational jerk limit. |
+| Path Ramp Enabled | Enabled | If disabled, `soft_on_path` may not be advertised. |
+| Stop Completion Timeout | Lane-specific | Extra ros2_control confirmation margin stored as `stop_completion_timeout_s`. |
+
+Executable deployments must configure both:
+
+- `operator_stop_profile`;
+- `default_fault_stop_profile`.
+
+The backend must also report a valid hard-stop floor:
+
+- `hard_deceleration` when JTC `decelerate_on_cancel` is proven;
+- `jtc_cancel_unprofiled_hold` for ros2_control plain cancel/hold;
+- `native_immediate_hold` for the native lane.
+
+If either profile or the hard-stop floor is missing, Composer degrades readiness
+and blocks Run.
+
+## Velocity Scaling
+
+ManyForge freezes the owned runtime velocity scale during timed controlled stops.
+Operator slider edits made during the stop are deferred and applied after the
+stop window ends. The slider should be disabled only while the cycle is
+`Stopping`, not after it has reached `Stopped`.
+
+Hardware or pendant scaling that ManyForge cannot read/freeze is deferred from
+the current release gate. It must be qualified on the real robot lane before
+claiming timed behavior under external scaling.
+
+## Stop History And Incidents
+
+Successful controlled stops publish compact success summaries. Faults, warnings,
+and fallback transitions publish incident snapshots containing:
+
+- all recent events in order;
+- events grouped by channel;
+- requested and executed stop modes;
+- hard-stop floor level;
+- timing and settle evidence;
+- fallback/escalation reasons.
+
+In Composer, inspect the error panel and the execution history after any stop
+that reports a warning or fault. Important fields include:
+
+- `requested_stop_mode`;
+- `executed_stop_mode`;
+- `fallback_reason`;
+- `hard_stop_transitioned`;
+- `hard_stop_level`;
+- `backend_stop_confirmed`;
+- `stop_snapshot_at_rest`;
+- `stop_snapshot_max_abs_velocity_rad_s`.
+
+## Offline Qualification
+
+Run the offline controlled-stop suite from the repo root:
+
+```bash
+./scripts/qualify-controlled-stop-offline.sh
+```
+
+This runs Docker-contained tests for:
+
+- Composer stop-capability admission gates;
+- frontend stop profile selectors and build;
+- core soft-on-path, interrupt-manager, and execution-kernel tests;
+- native backend and ros2_control capability tests;
+- planner latency evidence.
+
+Offline qualification does not prove live controller behavior. It proves the
+deterministic math, policies, UI gates, and native/ros2 capability surfaces.
+
+## Live Validation Checklist
+
+When Isaac or a real robot is available, capture evidence for:
+
+1. `soft_on_path` at the selected stop time.
+2. `spring_back_hold` returning to the trip cursor.
+3. `hard_deceleration` when supported by JTC.
+4. Natural completion when remaining trajectory time is shorter than the stop
+   window.
+5. Stop while planning, validating, executing, and stopping.
+6. Run-from-stopped replans from current state and does not reset.
+7. Velocity slider is frozen only during `Stopping`.
+8. Stop history shows requested/executed mode, hard-stop floor, timing, and
+   settle evidence.
+9. Stop/fault intervention recovery choices work as labeled:
+   **Acknowledge and continue** clears the error without backend reset and the
+   next Run replans from the current pose; **Reset cycle and run** explicitly
+   uses the reset path and may command the configured initial pose in
+   commanded-sim deployments.
+10. For real robots, hardware/pendant scaling behavior is observed and classified
+   before claiming timed guarantees.
+
+For Lite6 real-robot validation, first reproduce the lane in Isaac with the Lite6
+scene and deployment, then repeat the same stop matrix on the physical robot.
+
+## Intervention Recovery Choices
+
+Stop/fault `INTERVENTION_REQUIRED` is a recovery boundary. Pressing Run while it
+is latched does not silently acknowledge the fault. Composer presents:
+
+- **Acknowledge and continue**: the kernel verifies the backend state is readable,
+  the backend is not still stopping, the pose is finite, the hard-stop floor is
+  reportable, and measured velocity is settled when a settle signal exists. It
+  then clears the stop/fault latch without calling backend reset. The cycle
+  remains stopped; the next Run replans from the current robot pose.
+- **Reset cycle and run**: Composer explicitly uses the reset path first. In
+  commanded-sim lanes this can command the declared initial pose and must be
+  treated as a reset action, not a resume.
+- **Cancel**: leave the intervention latched.
+
+The error panel also exposes **Acknowledge error** for classified stop/fault
+interventions. Unknown/unclassified interventions, unreadable backend state,
+active direct-control leases, backend still stopping, or non-settled measured
+velocity remain fail-closed until the operator fixes the cause or chooses Reset.

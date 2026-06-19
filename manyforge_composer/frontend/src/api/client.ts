@@ -2,6 +2,7 @@ import type {
   CycleStatus,
   CycleCommand,
   VelocityScaleResponse,
+  ExecutionChannelsResponse,
   CatalogResponse,
   CatalogEntry,
   ProgramInfo,
@@ -159,8 +160,17 @@ export const api = {
     run: () => request<CycleCommand>('POST', '/api/cycle/run'),
     stop: () => request<CycleCommand>('POST', '/api/cycle/stop'),
     reset: () => request<CycleCommand>('POST', '/api/cycle/reset'),
+    acknowledgeInterventionForRetry: () =>
+      request<CycleCommand>('POST', '/api/cycle/acknowledge-intervention-for-retry'),
     setVelocityScale: (value: number) =>
       request<VelocityScaleResponse>('PUT', '/api/cycle/velocity-scale', { value }),
+  },
+  execution: {
+    channels: (limit = 80) =>
+      request<ExecutionChannelsResponse>(
+        'GET',
+        `/api/execution/channels?limit=${encodeURIComponent(String(limit))}`,
+      ),
   },
   simulation: {
     reset: () => request<SimulationResetResponse>('POST', '/api/simulation/reset'),

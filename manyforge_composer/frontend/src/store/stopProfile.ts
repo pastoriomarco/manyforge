@@ -1,5 +1,11 @@
 import type { RuntimeStatus } from '../types/api';
 
+export const DEFAULT_CONTROLLED_STOP_DECELERATION_TIME_S = 1.0;
+export const MAX_CONTROLLED_STOP_DECELERATION_TIME_S = 2.0;
+export const DEFAULT_SOFT_ON_PATH_DECELERATION_LIMIT_RAD_S2 = 10.0;
+export const DEFAULT_SOFT_ON_PATH_LEAD_IN_S = 0.1;
+export const DEFAULT_SOFT_ON_PATH_SAMPLE_PERIOD_S = 0.01;
+
 /**
  * Controlled-stop profile view + run-gate derivation.
  *
@@ -10,9 +16,9 @@ import type { RuntimeStatus } from '../types/api';
  * stopProfileUnsupported(+Reasons), backendUnsupportedStopReasons,
  * stopCapabilityQueryFailed); nothing here mutates or extends that contract.
  *
- * Profile selection is deployment-config-driven: the dropdown can update the
- * loaded operator stop profile while idle/stopped, with backend-unsupported
- * modes disabled by this status-derived view.
+ * Profile selection is deployment-config-driven: the Deployment panel edits the
+ * loaded stop profiles while idle/stopped, with backend-unsupported modes
+ * disabled by this status-derived view.
  */
 
 /**
@@ -76,6 +82,74 @@ export function stopModeLabel(mode: string): string {
   return STOP_MODE_LABELS[mode] ?? mode;
 }
 
+export function hardStopLevelLabel(level: string | null | undefined): string {
+  switch (level) {
+    case 'hard_deceleration':
+      return 'Profiled hard deceleration (JTC decelerate-on-cancel)';
+    case 'jtc_cancel_unprofiled_hold':
+      return 'Immediate cancel/hold (unprofiled JTC floor)';
+    case 'native_immediate_hold':
+      return 'Immediate native hold';
+    case 'immediate_hard_stop':
+      return 'Immediate hard stop';
+    case 'unavailable':
+      return 'Unavailable';
+    case null:
+    case undefined:
+    case '':
+      return 'Not reported';
+    default:
+      return level;
+  }
+}
+
+function stringDetail(
+  details: Record<string, unknown> | null | undefined,
+  key: string,
+): string | null {
+  if (details == null) {
+    return null;
+  }
+  const value = details[key];
+  return typeof value === 'string' && value.length > 0 ? value : null;
+}
+
+function boolDetail(
+  details: Record<string, unknown> | null | undefined,
+  key: string,
+): boolean {
+  if (details == null) {
+    return false;
+  }
+  const value = details[key];
+  return value === true || value === 'true';
+}
+
+export function buildStopExecutionWarning(
+  details: Record<string, unknown> | null | undefined,
+): string | null {
+  const requested = stringDetail(details, 'requested_stop_mode');
+  const executed = stringDetail(details, 'executed_stop_mode');
+  const reason =
+    stringDetail(details, 'fallback_reason') ??
+    stringDetail(details, 'controlled_stop_error_reason') ??
+    stringDetail(details, 'reason');
+  const floor =
+    stringDetail(details, 'hard_stop_level') ??
+    stringDetail(details, 'hard_stop_floor');
+  if (requested && executed && requested !== executed) {
+    return (
+      `Controlled stop used ${stopModeLabel(executed)} instead of ` +
+      `${stopModeLabel(requested)}${reason ? ` — ${reason}` : ''}.`
+    );
+  }
+  if (boolDetail(details, 'hard_stop_transitioned')) {
+    const floorText = floor ? ` (${hardStopLevelLabel(floor)})` : '';
+    return `Controlled stop escalated to hard stop${floorText}${reason ? ` — ${reason}` : ''}.`;
+  }
+  return null;
+}
+
 function configuredModeForSlot(
   runtime: RuntimeStatus,
   slot: string,
@@ -123,6 +197,16 @@ function backendReasonForMode(
     }
   }
   return null;
+}
+
+function hasUnsupportedReason(runtime: RuntimeStatus, reason: string): boolean {
+  const entries = runtime.stopProfileUnsupportedReasons ?? [];
+  return entries.some((entry) => {
+    if (entry == null || typeof entry !== 'object') {
+      return false;
+    }
+    return (entry as Record<string, unknown>).reason === reason;
+  });
 }
 
 /**
@@ -258,6 +342,22 @@ export function evaluateStopRunGate(runtime: RuntimeStatus | null): StopRunGate 
     };
   }
   if (runtime.stopProfileUnsupported === true) {
+    if (hasUnsupportedReason(runtime, 'stop_profile_required')) {
+      return {
+        blocked: true,
+        severity: 'degraded',
+        reason:
+          'Run blocked: executable deployments must configure both operator and fault stop profiles.',
+      };
+    }
+    if (hasUnsupportedReason(runtime, 'hard_stop_floor_unavailable')) {
+      return {
+        blocked: true,
+        severity: 'degraded',
+        reason:
+          'Run blocked: the execution backend did not report a valid hard-stop floor.',
+      };
+    }
     const operatorMode = configuredModeForSlot(runtime, OPERATOR_STOP_SLOT);
     const faultMode = configuredModeForSlot(runtime, FAULT_STOP_SLOT);
     const offending = operatorMode ?? faultMode;
@@ -295,7 +395,7 @@ export function shouldFreezeVelocitySlider(
   cycleState: string,
   stopInProgress: boolean,
 ): boolean {
-  return stopInProgress || cycleState === 'stopping' || cycleState === 'stopped';
+  return stopInProgress || cycleState === 'stopping';
 }
 
 /**

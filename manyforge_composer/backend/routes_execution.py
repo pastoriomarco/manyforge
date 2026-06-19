@@ -56,6 +56,20 @@ def build_execution_history_payload(
     ).model_dump(by_alias=True)
 
 
+def build_execution_channels_payload(
+    state: ComposerState,
+    *,
+    limit: int | None = None,
+) -> dict[str, Any]:
+    """Build protected per-channel execution history payload."""
+    state.event_recorder.observe(state)
+    return {
+        "channels": state.event_recorder.channel_histories(limit=limit),
+        "incidentSnapshots": state.event_recorder.incident_snapshots(),
+        "timestampNs": time.monotonic_ns(),
+    }
+
+
 def _split_csv_query(value: str | None) -> list[str] | None:
     if value is None:
         return None
@@ -334,6 +348,13 @@ def create_execution_router(state: ComposerState) -> APIRouter:
             program_run_id=program_run_id,
             intervention_run_id=intervention_run_id,
         )
+
+    @router.get("/channels")
+    def get_execution_channels(
+        limit: int | None = Query(default=None, ge=0, le=10000),
+    ) -> dict[str, Any]:
+        """Return independently retained event streams by diagnostic channel."""
+        return build_execution_channels_payload(state, limit=limit)
 
     @router.get("/digest")
     def get_execution_digest() -> dict[str, Any]:

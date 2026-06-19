@@ -310,7 +310,7 @@ def _kernel_config_from_deployment(
     #   operator_stop_profile:
     #     profile_id: "operator_soft_on_path"
     #     stop_mode: "soft_on_path"
-    #     deceleration_time_s: 2.0
+    #     deceleration_time_s: 1.0
     #     per_joint_max_deceleration_rad_s2:
     #       shoulder_pan_joint: 8.0
     #       ...
@@ -333,10 +333,11 @@ def _execution_adapter_id_from_deployment(deployment: Deployment | None) -> str:
 def _native_model_and_group_from_deployment(
     deployment: Deployment | None,
 ) -> tuple[str, str]:
-    if deployment is None or deployment.robot_config is None:
+    robot_config = getattr(deployment, "robot_config", None)
+    if deployment is None or robot_config is None:
         return "ur5_gripper", "arm"
-    model_name = Path(deployment.robot_config.urdf_path).stem or "ur5_gripper"
-    group_name = deployment.robot_config.group_id or "arm"
+    model_name = Path(robot_config.urdf_path).stem or "ur5_gripper"
+    group_name = robot_config.group_id or "arm"
     return model_name, group_name
 
 
@@ -496,8 +497,27 @@ def _make_kernel(
             logger.info("Using NativeKernelClient (real RoboPlan planning)")
         return kernel, bundle
     except Exception as e:
-        logger.info("NativeKernelClient unavailable (%s), using MockKernelClient", e)
-        return MockKernelClient(execute_duration_s=mock_execute_duration_s), None
+        if deployment is None or execution_adapter_id == "execution.test":
+            logger.info("NativeKernelClient unavailable (%s), using MockKernelClient", e)
+            return MockKernelClient(execute_duration_s=mock_execute_duration_s), None
+        from .backend.runtime_requirements import (
+            RuntimeFactoryRequirementsError,
+            detect_current_lane,
+        )
+
+        raise RuntimeFactoryRequirementsError(
+            reason_code="native_factory_runtime_failed",
+            message=(
+                "Native RoboPlan execution runtime factory failed while building "
+                "the Composer kernel. Check the native RoboPlan build, robot "
+                "model paths, and deployment configuration."
+            ),
+            missing=("native_roboplan_runtime",),
+            expected_lane="manyforge-only",
+            current_lane=detect_current_lane(),
+            suggested_command="scripts/launch.sh --lane manyforge-only restart",
+            original_error=str(e),
+        ) from e
 
 
 def _run_mcp(args):

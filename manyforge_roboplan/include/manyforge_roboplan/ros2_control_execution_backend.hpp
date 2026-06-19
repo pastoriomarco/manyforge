@@ -100,11 +100,10 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
   // Controlled-stop capability + result surface for motion-scoped
   // interrupt outcomes (spec/260 §5.6). The ros2_control adapter
   // supports these stop modes:
-  // - `kSpringBackHold`: JTC preempt + anchored-hold. Always
-  //   available; cancel the active FollowJointTrajectory goal,
-  //   dispatch a new goal anchored at the observed joint state with
-  //   a future zero-velocity hold point, await the controller's
-  //   terminal result, surface as `kFjtPreemptHold`.
+  // - `kSpringBackHold`: JTC preempt + backend-computed on-path replacement.
+  //   The replacement decelerates forward for half the configured time, then
+  //   returns along the accepted path to the trip cursor for the remaining half.
+  //   It is not implemented through cancel-first hold behavior.
   // - `kHardDeceleration`: native JTC `decelerate_on_cancel`.
   //   Advertised only when controller-config evidence is complete
   //   (see `Ros2ControlExecutionBackendConfig` capability fields);
@@ -113,10 +112,7 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
   //   `kJtcCancelDecelerateOnCancel` with `stop_distance_rad`
   //   telemetry.
   // - `kSoftOnPath`: path-ramp replacement trajectory, advertised
-  //   only when explicitly enabled and JTC speed-scaling input is
-  //   disabled. The older experimental scaffold remains available behind
-  //   `enable_soft_on_path_experimental` and executes through explicit
-  //   spring-back fallback gating.
+  //   only when explicitly enabled and qualified by the active deployment.
   core::MotionInterruptStopCapabilityDTO
   get_motion_interrupt_stop_capability() const override;
   core::ControlledStopResultDTO execute_controlled_stop(
@@ -198,6 +194,16 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
     std::chrono::steady_clock::time_point started_at;
   };
 
+  struct PostStopObservation {
+    std::vector<double> positions;
+    std::vector<double> velocities;
+    std::string source;
+    double max_abs_velocity_rad_s = 0.0;
+    bool velocity_available = false;
+    bool at_rest = false;
+    std::chrono::steady_clock::time_point observed_at;
+  };
+
   enum class SceneUpdateMode {
     kBlocking,
     kBestEffort,
@@ -260,6 +266,14 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
   void clear_managed_controlled_stop_state();
   bool publish_controlled_stop_command_reference_snapshot(
       std::chrono::steady_clock::time_point now);
+  bool publish_observed_cancel_stop_snapshot(
+      const std::vector<std::string>& joint_names,
+      double progress,
+      std::chrono::steady_clock::time_point now);
+  std::optional<PostStopObservation> wait_for_post_stop_observation(
+      const std::vector<std::string>& joint_names,
+      double settle_velocity_threshold_rad_s,
+      std::chrono::steady_clock::time_point deadline);
   void complete_managed_controlled_stop_execution();
   core::Result<void> command_sim_initial_state(std::string phase);
   bool update_scene_positions(const std::vector<double>& joint_positions,
@@ -397,13 +411,8 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
 
   // Managed FollowJointTrajectory preempt/controlled-stop substrate. Used by
   // the motion-interrupt controlled-stop paths (spring_back_hold /
-  // soft_on_path) to dispatch preempting JTC goals and track their terminal
-  // result.
-  bool send_fjt_anchored_goal(
-      const std::vector<std::string>& joint_names,
-      const std::vector<double>& target_positions,
-      double target_time_from_start_s,
-      bool track_terminal_goal = false);
+  // soft_on_path) to dispatch preempting replacement goals and track their
+  // terminal result.
   bool send_fjt_replacement_trajectory(
       const core::TrajectoryDTO& trajectory,
       bool track_terminal_goal = false);

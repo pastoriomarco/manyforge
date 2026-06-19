@@ -82,9 +82,10 @@ enum class MotionInterruptActivationMode {
 /// (spec/260 §5.6 Stop-profile semantics; spec/210 §3.11
 /// `MotionInterruptStopProfileDTO`).
 ///
-/// `kSpringBackHold` is the simplest controlled halt: observed-state
-/// anchor + zero-velocity hold target. `kSoftOnPath` is a
-/// path-preserving ramp along the accepted trajectory.
+/// `kSpringBackHold` is the non-critical path-preserving return profile:
+/// forward decelerate on the accepted path, then return on the same path to the
+/// trip cursor. `kSoftOnPath` is a path-preserving ramp along the accepted
+/// trajectory.
 /// `kHardDeceleration` is an acceleration-limited stop that may leave
 /// the path. None of these is a safety e-stop; e-stop / protective
 /// stops remain higher-priority session/fault policies and produce
@@ -105,6 +106,7 @@ enum class MotionInterruptStopCommandSource {
   kFjtPreemptPathRamp,
   kJtcSpeedScalingRamp,
   kJtcCancelDecelerateOnCancel,
+  kJtcCancelUnprofiledHold,
   kNativeSimulatedStop,
   kNativeSimulatedPathRamp,
   kRobotNativeStop,

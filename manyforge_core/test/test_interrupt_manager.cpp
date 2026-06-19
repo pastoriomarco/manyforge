@@ -1396,13 +1396,13 @@ TEST(InterruptManagerMotionScopedTest,
 }
 
 TEST(InterruptManagerMotionScopedTest,
-     StopProfileDecelerationTimeDefaultsToTwoSeconds) {
+     StopProfileDecelerationTimeDefaultsToOneSecond) {
   MotionInterruptStopProfileDTO p;
   p.profile_id = "default_decel";
   p.stop_mode = MotionInterruptStopMode::kSpringBackHold;
   EXPECT_DOUBLE_EQ(motion_interrupt_deceleration_time_or_default(p),
                    kDefaultDecelerationTimeS);
-  EXPECT_DOUBLE_EQ(motion_interrupt_deceleration_time_or_default(p), 2.0);
+  EXPECT_DOUBLE_EQ(motion_interrupt_deceleration_time_or_default(p), 1.0);
 
   p.deceleration_time_s = 0.75;
   EXPECT_DOUBLE_EQ(motion_interrupt_deceleration_time_or_default(p), 0.75);

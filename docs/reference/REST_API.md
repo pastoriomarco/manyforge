@@ -3,7 +3,7 @@
   Regenerate with:
     cd /workspace
     python3 scripts/regen-public-contracts.py
-  Last regenerated: 2026-05-11 20:29:50 UTC
+  Last regenerated: 2026-06-19 12:07:56 UTC
   Generator source: scripts/regen-public-contracts.py:gen_rest_api
 -->
 
@@ -35,11 +35,14 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer`.
 | `GET` | `/api/capabilities` | skills | Get Capabilities |
 | `GET` | `/api/catalog` | catalog | Get Catalog |
 | `GET` | `/api/catalog/{entry_id}` | catalog | Get Catalog Entry |
+| `POST` | `/api/cycle/acknowledge-intervention-for-retry` | cycle | Acknowledge Intervention For Retry |
 | `POST` | `/api/cycle/reset` | cycle | Reset Cycle |
 | `POST` | `/api/cycle/run` | cycle | Run Cycle |
 | `GET` | `/api/cycle/status` | cycle | Get Status |
 | `POST` | `/api/cycle/stop` | cycle | Stop Cycle |
 | `PUT` | `/api/cycle/velocity-scale` | cycle | Set Velocity Scale |
+| `POST` | `/api/debug/collision/compare-positions` | debug | Debug Collision Compare Positions |
+| `GET` | `/api/debug/collision/compare-trajectory/{move_id}` | debug | Debug Collision Compare Trajectory Waypoint |
 | `GET` | `/api/debug/export` | debug | Debug Export |
 | `GET` | `/api/debug/export/ros2-medkit` | debug | Debug Export Ros2 Medkit |
 | `GET` | `/api/debug/scene-trace` | debug | Debug Scene Trace |
@@ -51,16 +54,20 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer`.
 | `POST` | `/api/deployment/save` | program | Save Deployment |
 | `GET` | `/api/deployment/saved/full` | program | Get Saved Full Deployment |
 | `POST` | `/api/direct/abort` | direct | Abort Intervention |
+| `POST` | `/api/direct/cartesian-jog` | direct | Cartesian Jog |
 | `POST` | `/api/direct/execute` | direct | Execute Intervention |
 | `POST` | `/api/direct/heartbeat` | direct | Renew Intervention Lease |
+| `POST` | `/api/direct/joint-jog` | direct | Joint Jog |
 | `GET` | `/api/direct/pending-recovery` | direct | Get Pending Delegated Recovery |
 | `POST` | `/api/direct/promote` | direct | Promote Intervention Blackboard |
 | `GET` | `/api/direct/status` | direct | Get Intervention Status |
 | `GET` | `/api/execution/blackboard` | execution | Get Blackboard Snapshot |
+| `GET` | `/api/execution/channels` | execution | Get Execution Channels |
 | `GET` | `/api/execution/digest` | execution | Get Execution Digest |
 | `GET` | `/api/execution/history` | execution | Get Execution History |
 | `GET` | `/api/files/browse` | files | Browse Filesystem |
 | `GET` | `/api/health` |  | Health |
+| `GET` | `/api/infra/heartbeat` | infra | Infra Heartbeat |
 | `GET` | `/api/infra/model-endpoints` | infra | Infra Model Endpoints |
 | `GET` | `/api/infra/status` | infra | Infra Status |
 | `GET` | `/api/kernel/events` | kernel | Get Kernel Events |
@@ -82,18 +89,36 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer`.
 | `GET` | `/api/program/tree` | program | Get Program Tree |
 | `PUT` | `/api/program/tree` | program | Update Program Tree |
 | `POST` | `/api/program/validate` | program | Validate Program Tree |
-| `POST` | `/api/simulation/entity-state` | simulation | Set Entity State |
-| `POST` | `/api/simulation/reset` | simulation | Reset Simulation |
-| `POST` | `/api/simulation/state` | simulation | Set Simulation State |
-| `POST` | `/api/simulation/step` | simulation | Step Simulation |
+| `POST` | `/api/robot-control/candidates` | robot-control | Create Candidate |
+| `GET` | `/api/robot-control/candidates/{candidate_id}` | robot-control | Get Candidate |
+| `POST` | `/api/robot-control/candidates/{candidate_id}/execute` | robot-control | Execute Candidate |
+| `POST` | `/api/robot-control/candidates/{candidate_id}/revert` | robot-control | Revert Candidate |
+| `POST` | `/api/runtime/external/{provider_id}` | runtime | Update External Runtime Status |
+| `GET` | `/api/runtime/status` | runtime | Runtime Status |
 | `GET` | `/api/scene/diagnostics` | scene | Get Scene Diagnostics |
 | `POST` | `/api/scene/edit` | scene | Edit Scene |
 | `GET` | `/api/scene/frames` | scene | Get Scene Frames |
 | `POST` | `/api/scene/frames/gizmo-size` | scene | Set Frame Gizmo Size |
 | `POST` | `/api/scene/frames/visibility` | scene | Set Frame Visibility |
+| `POST` | `/api/scene/gripper/command` | scene | Command Gripper |
+| `GET` | `/api/scene/object-meshes/{asset_hash}.glb` | scene-object-meshes | Get Scene Object Mesh |
 | `POST` | `/api/scene/objects/frame-visibility` | scene | Set Object Frame Visibility |
+| `POST` | `/api/scene/objects/gizmo-size` | scene | Set Object Axes Gizmo Size |
+| `POST` | `/api/scene/pose-sources/apply` | scene | Apply Pose Source Updates |
+| `POST` | `/api/scene/pose-sources/{pose_source_id}/snapshot` | scene | Update Pose Source Snapshot |
+| `POST` | `/api/scene/preview-link-poses` | scene | Preview Link Poses |
+| `POST` | `/api/scene/program-resource/update` | scene | Update Program Scene Resource |
 | `GET` | `/api/scene/snapshot` | scene | Get Scene Snapshot |
+| `POST` | `/api/scene/snapshot/upload/{request_id}` | scene-snapshot | Upload Snapshot |
 | `GET` | `/api/scene/snapshots/{snapshot_id}` | scene | Get Published Scene Snapshot |
 | `GET` | `/api/scene/state` | scene | Get Scene State |
+| `POST` | `/api/scene/sync-authored` | scene | Sync Authored Scene |
+| `GET` | `/api/scene/urdf/manifest` | scene-urdf | Get Manifest |
+| `GET` | `/api/scene/urdf/meshes/{link_name}/{visual_index}` | scene-urdf | Get Mesh |
+| `GET` | `/api/scene/urdf/models/{model_key}/meshes/{link_name}/{visual_index}` | scene-urdf | Get Model Mesh |
 | `POST` | `/api/session/apply` | program | Apply Session |
+| `POST` | `/api/simulation/entity-state` | simulation | Set Entity State |
+| `POST` | `/api/simulation/reset` | simulation | Reset Simulation |
+| `POST` | `/api/simulation/state` | simulation | Set Simulation State |
+| `POST` | `/api/simulation/step` | simulation | Step Simulation |
 | `GET` | `/api/skills` | skills | Get Skills |

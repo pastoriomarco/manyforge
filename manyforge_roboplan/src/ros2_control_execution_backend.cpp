@@ -1143,6 +1143,113 @@ bool Ros2ControlExecutionBackend::publish_controlled_stop_command_reference_snap
   return true;
 }
 
+bool Ros2ControlExecutionBackend::publish_observed_cancel_stop_snapshot(
+    const std::vector<std::string>& joint_names,
+    double progress,
+    std::chrono::steady_clock::time_point now) {
+  std::vector<double> positions;
+  std::vector<double> velocities;
+  std::string sample_source;
+  {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    const auto sample = select_latest_sample_locked(now);
+    if (!sample.has_value()) {
+      return false;
+    }
+    try {
+      positions = positions_for_joints(*sample, joint_names);
+      velocities = velocities_for_joints(*sample, joint_names);
+      sample_source = sample->source;
+    } catch (const std::exception&) {
+      return false;
+    }
+  }
+  if (positions.empty() || positions.size() != joint_names.size()) {
+    return false;
+  }
+
+  update_scene_positions(positions, SceneUpdateMode::kBestEffort);
+  publish_snapshot(
+      core::ExecutionState::kStopping, progress, positions, std::nullopt,
+      "measured_cancel_stop_feedback");
+  if (!velocities.empty()) {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    snapshot_.joint_velocities_rad_s = std::move(velocities);
+    if (!sample_source.empty()) {
+      snapshot_.state_source += ":" + sample_source;
+    }
+  }
+  return true;
+}
+
+std::optional<Ros2ControlExecutionBackend::PostStopObservation>
+Ros2ControlExecutionBackend::wait_for_post_stop_observation(
+    const std::vector<std::string>& joint_names,
+    double settle_velocity_threshold_rad_s,
+    std::chrono::steady_clock::time_point deadline) {
+  std::unique_lock<std::mutex> lock(state_mutex_);
+  std::optional<PostStopObservation> best;
+  while (true) {
+    const auto now = std::chrono::steady_clock::now();
+    const auto consider = [&](const std::optional<JointSample>& sample) {
+      if (!sample.has_value() ||
+          seconds_since(sample->received_at, now) >
+              config_.joint_state_max_age_s) {
+        return false;
+      }
+      PostStopObservation observation;
+      try {
+        observation.positions = positions_for_joints(*sample, joint_names);
+        observation.velocities = velocities_for_joints(*sample, joint_names);
+      } catch (const std::exception&) {
+        return false;
+      }
+      if (observation.positions.size() != joint_names.size()) {
+        return false;
+      }
+      observation.source = sample->source;
+      observation.observed_at = sample->received_at;
+      observation.velocity_available =
+          observation.velocities.size() == joint_names.size();
+      if (observation.velocity_available) {
+        for (const double velocity : observation.velocities) {
+          observation.max_abs_velocity_rad_s =
+              std::max(observation.max_abs_velocity_rad_s, std::abs(velocity));
+        }
+        observation.at_rest =
+            observation.max_abs_velocity_rad_s <= settle_velocity_threshold_rad_s;
+      }
+
+      if (!best.has_value() ||
+          (!best->velocity_available && observation.velocity_available) ||
+          (best->velocity_available && observation.velocity_available &&
+           observation.max_abs_velocity_rad_s <
+               best->max_abs_velocity_rad_s)) {
+        best = observation;
+      }
+      if (observation.velocity_available && observation.at_rest) {
+        best = std::move(observation);
+        return true;
+      }
+      return false;
+    };
+
+    const bool settled =
+        consider(latest_action_feedback_) ||
+        consider(latest_controller_state_) ||
+        consider(latest_joint_state_);
+    if (settled) {
+      return best;
+    }
+    if (now >= deadline) {
+      return best;
+    }
+    const auto next_wakeup =
+        std::min(deadline, now + std::chrono::milliseconds(20));
+    state_cv_.wait_until(lock, next_wakeup);
+  }
+}
+
 void Ros2ControlExecutionBackend::complete_managed_controlled_stop_execution() {
   {
     std::lock_guard<std::mutex> lock(execution_mutex_);
@@ -1908,6 +2015,7 @@ void Ros2ControlExecutionBackend::monitor_worker(core::TrajectoryDTO trajectory)
     const auto now = std::chrono::steady_clock::now();
     bool cancel_pending = false;
     bool cancel_timeout = false;
+    bool controlled_stop_replacement_active = false;
     bool natural_completion_stop_requested = false;
     bool waiting_for_first_feedback = false;
     bool first_feedback_timeout = false;
@@ -1917,9 +2025,11 @@ void Ros2ControlExecutionBackend::monitor_worker(core::TrajectoryDTO trajectory)
         return;
       }
       cancel_pending = stop_requested_ || pause_requested_;
+      controlled_stop_replacement_active = controlled_stop_preempt_in_progress_;
       natural_completion_stop_requested = natural_completion_stop_requested_;
       cancel_timeout =
-          cancel_pending && stop_requested_at_.has_value() &&
+          cancel_pending && !controlled_stop_replacement_active &&
+          stop_requested_at_.has_value() &&
           seconds_since(*stop_requested_at_, now) >= config_.stop_completion_timeout_s;
       waiting_for_first_feedback = !first_feedback_seen_;
       first_feedback_timeout =
@@ -1938,15 +2048,18 @@ void Ros2ControlExecutionBackend::monitor_worker(core::TrajectoryDTO trajectory)
     if (cancel_pending) {
       if (!publish_controlled_stop_command_reference_snapshot(now)) {
         const auto snapshot = get_execution_snapshot();
-        publish_snapshot(core::ExecutionState::kStopping,
-                         snapshot.progress,
-                         snapshot.joint_positions_rad);
+        if (!publish_observed_cancel_stop_snapshot(
+                trajectory.joint_names, snapshot.progress, now)) {
+          publish_snapshot(core::ExecutionState::kStopping,
+                           snapshot.progress,
+                           snapshot.joint_positions_rad);
+        }
       }
-      // Audit 6C (finding 2.5): wake immediately when the cancel result
-      // confirms terminal (on_action_result notifies execution_cv_); the
-      // period remains only the deadline pacing the kStopping publish and
-      // the cancel-timeout check. stop/pause flags are already true here,
-      // so the predicate must key on terminal progress only.
+      // Plain JTC cancel/pause waits for the old goal to terminate and is
+      // guarded by `stop_completion_timeout_s` above. Managed controlled-stop
+      // replacements also set stop_requested_ so the UI sees Stopping, but their
+      // terminal deadline is enforced by execute_controlled_stop(wait_s). Do not
+      // apply the cancel-confirmation timeout to those timed replacement goals.
       {
         std::unique_lock<std::mutex> lock(execution_mutex_);
         execution_cv_.wait_for(
@@ -2465,12 +2578,14 @@ Ros2ControlExecutionBackend::execute_controlled_stop(
         return fallback;
       };
 
-  // Honor a planner `recommended_disposition=hard_stop` with a REAL hard
-  // deceleration instead of a soft spring-back hold. The planner returns this
-  // when no feasible on-path soft stop exists (requested time below the minimum
-  // budget-respecting on-path stop, or neither retimer nor ALI could prove a
-  // dispatchable replacement); a spring-back would be slower than the situation
-  // demands. Loudly observable, like the spring-back escalation.
+  // Honor a planner `recommended_disposition=hard_stop` with the active lane's
+  // hard-stop floor instead of a soft spring-back hold. If the deployment proves
+  // JTC `decelerate_on_cancel`, use the profiled hard_deceleration mode. If not,
+  // refuse the controlled soft stop with a first-class immediate-hard-stop floor
+  // diagnostic; the kernel then issues exactly one plain JTC cancel/hold through
+  // backend.stop(). This avoids the old misleading path that first attempted an
+  // unsupported hard_deceleration profile and only reached unprofiled cancel as
+  // a generic emergency fallback.
   const auto execute_soft_on_path_hard_stop_fallback =
       [&](std::string reason, const core::ErrorDTO& cause) {
         std::string cause_details_str;
@@ -2481,6 +2596,59 @@ Ros2ControlExecutionBackend::execute_controlled_stop(
           cause_details_str += detail_key;
           cause_details_str += "=";
           cause_details_str += detail_value;
+        }
+        const bool can_run_hard_deceleration =
+            current_capability.supported_stop_modes.contains(
+                core::MotionInterruptStopMode::kHardDeceleration) &&
+            current_capability.hard_stop_level.value_or("") ==
+                "hard_deceleration";
+        const auto hard_stop_level =
+            current_capability.hard_stop_level.value_or(
+                "jtc_cancel_unprofiled_hold");
+        if (!can_run_hard_deceleration) {
+          RCLCPP_WARN(
+              node_->get_logger(),
+              "controlled-stop ESCALATION: soft_on_path -> immediate_hard_stop "
+              "(fallback_reason=%s hard_stop_level=%s cause_code=%s "
+              "cause_details=[%s])",
+              reason.c_str(), hard_stop_level.c_str(), cause.code.c_str(),
+              cause_details_str.c_str());
+          core::ControlledStopResultDTO hard;
+          hard.accepted = false;
+          hard.backend_stop_confirmed = false;
+          hard.executed_stop_mode = core::MotionInterruptStopMode::kSoftOnPath;
+          hard.stop_command_source =
+              core::MotionInterruptStopCommandSource::kJtcCancelUnprofiledHold;
+          hard.fallback_reason = reason;
+          hard.diagnostics["requested_stop_mode"] = "soft_on_path";
+          hard.diagnostics["fallback_reason"] = reason;
+          hard.diagnostics["fallback_pair"] =
+              "soft_on_path->immediate_hard_stop";
+          hard.diagnostics["hard_stop_floor"] = "immediate_hard_stop";
+          hard.diagnostics["hard_stop_level"] = hard_stop_level;
+          hard.diagnostics["hard_stop_floor_command_source"] =
+              "jtc_cancel_unprofiled_hold";
+          hard.diagnostics["soft_on_path_error_code"] = cause.code;
+          hard.diagnostics["soft_on_path_error_message"] = cause.message;
+          for (const auto& [key, value] : cause.details) {
+            hard.diagnostics["soft_on_path_error_detail_" + key] = value;
+          }
+          const auto it = cause.details.find("reason");
+          if (it != cause.details.end()) {
+            hard.diagnostics["soft_on_path_error_reason"] = it->second;
+          }
+          hard.error = core::ErrorDTO{
+              std::string(core::kErrorMotionInterruptBackendStopFailed),
+              "soft_on_path stop infeasible; profiled hard_deceleration is "
+              "not proven, so the immediate unprofiled cancel/hold hard-stop "
+              "floor must be issued",
+              {{"reason", "soft_on_path_escalated_to_immediate_hard_stop"},
+               {"recommended_disposition", "hard_stop"},
+               {"hard_stop_floor", "immediate_hard_stop"},
+               {"hard_stop_level", hard_stop_level},
+               {"hard_stop_floor_command_source",
+                "jtc_cancel_unprofiled_hold"}}};
+          return hard;
         }
         RCLCPP_WARN(
             node_->get_logger(),
@@ -2498,6 +2666,10 @@ Ros2ControlExecutionBackend::execute_controlled_stop(
         hard.diagnostics["requested_stop_mode"] = "soft_on_path";
         hard.diagnostics["fallback_reason"] = reason;
         hard.diagnostics["fallback_pair"] = "soft_on_path->hard_deceleration";
+        hard.diagnostics["hard_stop_floor"] = "hard_deceleration";
+        hard.diagnostics["hard_stop_level"] = hard_stop_level;
+        hard.diagnostics["hard_stop_floor_command_source"] =
+            "jtc_cancel_decelerate_on_cancel";
         hard.diagnostics["soft_on_path_error_code"] = cause.code;
         hard.diagnostics["soft_on_path_error_message"] = cause.message;
         for (const auto& [key, value] : cause.details) {
@@ -2508,6 +2680,28 @@ Ros2ControlExecutionBackend::execute_controlled_stop(
           hard.diagnostics["soft_on_path_error_reason"] = it->second;
         }
         return hard;
+      };
+
+  const auto soft_on_path_error_recommends_spring_back =
+      [](const core::ErrorDTO& error) {
+        const auto it = error.details.find("recommended_fallback");
+        return it != error.details.end() && it->second == "spring_back_hold";
+      };
+  const auto profile_allows_spring_back_fallback = [&profile]() {
+    return std::find(profile.allowed_fallback_modes.begin(),
+                     profile.allowed_fallback_modes.end(),
+                     core::MotionInterruptStopMode::kSpringBackHold) !=
+           profile.allowed_fallback_modes.end();
+  };
+  const auto execute_soft_on_path_recommended_fallback =
+      [&](std::string reason, const core::ErrorDTO& cause) {
+        if (profile_allows_spring_back_fallback() &&
+            soft_on_path_error_recommends_spring_back(cause)) {
+          return execute_soft_on_path_spring_back_fallback(
+              std::move(reason), cause);
+        }
+        return execute_soft_on_path_hard_stop_fallback(
+            "soft_on_path_no_qualified_spring_back_fallback", cause);
       };
 
   if (profile.stop_mode == core::MotionInterruptStopMode::kSoftOnPath &&
@@ -2536,7 +2730,7 @@ Ros2ControlExecutionBackend::execute_controlled_stop(
         return result;
       }
       if (!active_trajectory_.has_value()) {
-        return execute_soft_on_path_spring_back_fallback(
+        return execute_soft_on_path_recommended_fallback(
             "soft_on_path_missing_active_trajectory",
             core::ErrorDTO{
                 std::string(core::kErrorMotionInterruptBackendStopFailed),
@@ -2668,7 +2862,7 @@ Ros2ControlExecutionBackend::execute_controlled_stop(
         return execute_soft_on_path_hard_stop_fallback(
             "soft_on_path_planner_recommends_hard_stop", planned.error());
       }
-      return execute_soft_on_path_spring_back_fallback(
+      return execute_soft_on_path_recommended_fallback(
           planned.error().details.contains("recommended_fallback")
               ? "soft_on_path_planner_rejected"
               : "soft_on_path_planner_failed",
@@ -2772,7 +2966,7 @@ Ros2ControlExecutionBackend::execute_controlled_stop(
           std::to_string(goal_dispatch_to_accept_ns);
       clear_managed_controlled_stop_state();
       clear_controlled_stop_path_deviation_tracking();
-      return execute_soft_on_path_spring_back_fallback(
+      return execute_soft_on_path_recommended_fallback(
           "soft_on_path_path_ramp_dispatch_failed", error);
     }
     if (stop_delta_budget_ns > 0 &&
@@ -2785,7 +2979,7 @@ Ros2ControlExecutionBackend::execute_controlled_stop(
       cancel_goal_if_known(path_ramp_goal);
       clear_managed_controlled_stop_state();
       clear_controlled_stop_path_deviation_tracking();
-      return execute_soft_on_path_spring_back_fallback(
+      return execute_soft_on_path_recommended_fallback(
           "soft_on_path_stop_delta_budget_exceeded",
           core::ErrorDTO{
               std::string(core::kErrorMotionInterruptBackendStopFailed),
@@ -2928,11 +3122,28 @@ Ros2ControlExecutionBackend::execute_controlled_stop(
       const double delta = post_stop_positions[i] - observed_positions[i];
       stop_distance_sq += delta * delta;
     }
+    std::vector<double> snapshot_positions = post_stop_positions;
+    std::string snapshot_source;
+    if (is_commanded_sim_mode() && !dispatch_trajectory.waypoints.empty() &&
+        dispatch_trajectory.waypoints.back().positions_rad.size() ==
+            joint_names.size()) {
+      // In commanded-sim the Composer visualizer and the next planning start
+      // state are command-frame authoritative. The measured/controller sample is
+      // still captured above for settle evidence, but publishing it here would
+      // make the visual robot jump from the stop command reference to a slightly
+      // different simulator/controller sample after the stop confirms.
+      snapshot_positions =
+          dispatch_trajectory.waypoints.back().positions_rad;
+      snapshot_source = "commanded_sim_controlled_stop_terminal";
+    }
     const auto snapshot_before_publish = get_execution_snapshot();
     complete_managed_controlled_stop_execution();
+    update_scene_positions(snapshot_positions);
     publish_snapshot(core::ExecutionState::kStopped,
                      snapshot_before_publish.progress,
-                     post_stop_positions);
+                     snapshot_positions,
+                     std::nullopt,
+                     snapshot_source);
     if (!post_stop_velocities.empty()) {
       std::lock_guard<std::mutex> lock(state_mutex_);
       snapshot_.joint_velocities_rad_s = post_stop_velocities;
@@ -2987,6 +3198,392 @@ Ros2ControlExecutionBackend::execute_controlled_stop(
         std::to_string(backend_call_to_goal_accept_ns);
     result.diagnostics["stop_traj_delta_budget_margin_ns"] =
         std::to_string(stop_delta_budget_ns - backend_call_to_goal_accept_ns);
+    result.diagnostics["post_stop_sample_source"] = post_stop_source;
+    result.diagnostics["path_deviation_source"] =
+        path_deviation_feedback_samples > 0
+            ? "action_feedback_plus_post_stop_sample"
+            : "post_stop_sample_plus_planner_projection_no_action_feedback";
+    result.diagnostics["path_deviation_feedback_samples"] =
+        std::to_string(path_deviation_feedback_samples);
+    result.diagnostics["path_deviation_max_rad"] =
+        std::to_string(path_deviation_max_rad);
+    if (path_deviation_feedback_error.has_value()) {
+      result.diagnostics["path_deviation_feedback_error_code"] =
+          path_deviation_feedback_error->code;
+      result.diagnostics["path_deviation_feedback_error_message"] =
+          path_deviation_feedback_error->message;
+      const auto it = path_deviation_feedback_error->details.find("reason");
+      if (it != path_deviation_feedback_error->details.end()) {
+        result.diagnostics["path_deviation_feedback_error_reason"] =
+            it->second;
+      }
+    }
+    clear_controlled_stop_path_deviation_tracking();
+    return result;
+  }
+
+  if (profile.stop_mode == core::MotionInterruptStopMode::kSpringBackHold) {
+    core::TrajectoryDTO active_trajectory;
+    double active_trajectory_time_s = 0.0;
+    double active_runtime_scale = 1.0;
+    {
+      std::lock_guard<std::mutex> lock(execution_mutex_);
+      if (!running_ && terminal_) {
+        result.accepted = false;
+        result.backend_stop_confirmed = false;
+        result.error = core::ErrorDTO{
+            std::string(core::kErrorMotionInterruptBackendStopFailed),
+            "no discrete-trajectory execution in flight",
+            {{"reason", "controlled_stop_no_execution_in_flight"}}};
+        return result;
+      }
+      if (!active_trajectory_.has_value()) {
+        result.accepted = false;
+        result.backend_stop_confirmed = false;
+        result.error = core::ErrorDTO{
+            std::string(core::kErrorMotionInterruptBackendStopFailed),
+            "spring_back_hold requires an active accepted trajectory record",
+            {{"reason", "spring_back_missing_active_trajectory"}}};
+        return result;
+      }
+      active_trajectory = *active_trajectory_;
+      active_trajectory_time_s = active_trajectory_time_s_;
+      active_runtime_scale = active_runtime_velocity_scale_;
+    }
+
+    const auto seam_reference_time = std::chrono::steady_clock::now();
+
+    core::SoftOnPathInitialStateDTO initial;
+    initial.state.joint_names = joint_names;
+    initial.state.positions_rad = observed_positions;
+    initial.position_source = core::SoftOnPathStateSource::kMeasuredFeedback;
+    initial.trajectory_time_from_start_s = active_trajectory_time_s;
+    initial.runtime_velocity_scale_at_trip = active_runtime_scale;
+    initial.sample_age_ns = static_cast<std::int64_t>(
+        std::max(0.0, observed_sample_age_s) * 1e9);
+    const bool has_measured_velocity =
+        observed_velocities.size() == joint_names.size();
+    initial.velocity_source = resolve_soft_on_path_anchor_velocity_source(
+        config_, has_measured_velocity);
+    if (initial.velocity_source ==
+        core::SoftOnPathStateSource::kMeasuredFeedback) {
+      initial.state.velocities_rad_s = observed_velocities;
+    }
+
+    core::SoftOnPathPlannerConfig planner_config;
+    planner_config.stop_traj_delta_s = config_.soft_on_path_stop_traj_delta_s;
+    planner_config.sample_period_s = config_.soft_on_path_sample_period_s;
+    planner_config.max_initial_path_deviation_rad =
+        config_.soft_on_path_max_initial_path_deviation_rad;
+    planner_config.max_initial_velocity_deviation_rad_s =
+        config_.soft_on_path_max_initial_velocity_deviation_rad_s;
+    planner_config.per_joint_max_jerk_rad_s3 =
+        config_.soft_on_path_max_jerk_rad_s3;
+    planner_config.allow_model_velocity_fallback =
+        config_.allow_soft_on_path_model_velocity_fallback ||
+        is_commanded_sim_mode() ||
+        initial.velocity_source == core::SoftOnPathStateSource::kModelDerived;
+
+    core::MotionInterruptStopProfileDTO spring_profile = profile;
+    spring_profile.deceleration_time_s =
+        core::motion_interrupt_deceleration_time_or_default(profile);
+    auto planned = core::plan_spring_back_on_path_stop(
+        active_trajectory, spring_profile, initial, planner_config);
+    if (!planned.ok()) {
+      result.accepted = false;
+      result.backend_stop_confirmed = false;
+      result.error = planned.error();
+      return result;
+    }
+
+    core::TrajectoryDTO dispatch_trajectory =
+        planned.value().replacement_trajectory;
+    double dispatch_latency_applied_s = 0.0;
+    if (planned.value().used_model_velocity) {
+      dispatch_latency_applied_s =
+          std::chrono::duration_cast<std::chrono::duration<double>>(
+              std::chrono::steady_clock::now() - seam_reference_time)
+              .count();
+      auto shifted = core::shift_soft_stop_for_dispatch_latency(
+          planned.value().replacement_trajectory, dispatch_latency_applied_s,
+          planner_config.stop_traj_delta_s, active_trajectory,
+          active_trajectory_time_s, std::min(1.0, active_runtime_scale));
+      if (!shifted.ok()) {
+        result.accepted = false;
+        result.backend_stop_confirmed = false;
+        result.error = shifted.error();
+        return result;
+      }
+      dispatch_trajectory = std::move(shifted.value());
+    }
+
+    begin_controlled_stop_path_deviation_tracking(
+        active_trajectory, planned.value().path_deviation_max_rad);
+    const auto call_start = std::chrono::steady_clock::now();
+    {
+      std::lock_guard<std::mutex> lock(execution_mutex_);
+      stop_requested_ = true;
+      natural_completion_stop_requested_ = false;
+      pause_requested_ = false;
+      stop_requested_at_ = std::chrono::steady_clock::now();
+      controlled_stop_preempt_in_progress_ = true;
+      controlled_stop_command_reference_.reset();
+    }
+
+    assert_controlled_stop_unit_runtime_scale();
+
+    const auto dispatch_start = std::chrono::steady_clock::now();
+    const bool dispatched = send_fjt_replacement_trajectory(
+        dispatch_trajectory, /*track_terminal_goal=*/true);
+    if (stop_token.stop_requested()) {
+      clear_managed_controlled_stop_state();
+      clear_controlled_stop_path_deviation_tracking();
+      return cancelled_result("spring_back_dispatch");
+    }
+    const auto dispatch_accepted = std::chrono::steady_clock::now();
+    const auto backend_call_to_goal_dispatch_ns =
+        std::max<std::int64_t>(
+            0, std::chrono::duration_cast<std::chrono::nanoseconds>(
+                   dispatch_start - call_start)
+                   .count());
+    const auto goal_dispatch_to_accept_ns =
+        std::max<std::int64_t>(
+            0, std::chrono::duration_cast<std::chrono::nanoseconds>(
+                   dispatch_accepted - dispatch_start)
+                   .count());
+    const auto backend_call_to_goal_accept_ns =
+        std::max<std::int64_t>(
+            0, std::chrono::duration_cast<std::chrono::nanoseconds>(
+                   dispatch_accepted - call_start)
+                   .count());
+    const auto stop_delta_budget_ns = static_cast<std::int64_t>(
+        std::max(0.0, config_.soft_on_path_stop_traj_delta_s) * 1e9);
+    if (!dispatched) {
+      std::optional<core::ErrorDTO> dispatch_error;
+      {
+        std::lock_guard<std::mutex> lock(managed_fjt_mutex_);
+        dispatch_error = managed_fjt_terminal_error_;
+      }
+      result.accepted = false;
+      result.backend_stop_confirmed = false;
+      result.error = dispatch_error.value_or(core::ErrorDTO{
+          std::string(core::kErrorMotionInterruptBackendStopFailed),
+          "failed to dispatch spring_back_hold on-path replacement trajectory",
+          {{"reason", "spring_back_path_ramp_dispatch_failed"}}});
+      clear_managed_controlled_stop_state();
+      clear_controlled_stop_path_deviation_tracking();
+      return result;
+    }
+    if (stop_delta_budget_ns > 0 &&
+        backend_call_to_goal_accept_ns > stop_delta_budget_ns) {
+      GoalHandleFJT::SharedPtr path_ramp_goal;
+      {
+        std::lock_guard<std::mutex> lock(managed_fjt_mutex_);
+        path_ramp_goal = managed_fjt_goal_;
+      }
+      cancel_goal_if_known(path_ramp_goal);
+      result.accepted = false;
+      result.backend_stop_confirmed = false;
+      result.error = core::ErrorDTO{
+          std::string(core::kErrorMotionInterruptBackendStopFailed),
+          "spring_back_hold path-ramp goal was accepted after the configured handoff budget",
+          {{"reason", "spring_back_stop_delta_budget_exceeded"},
+           {"recommended_disposition", "hard_stop"},
+           {"configured_stop_traj_delta_ns",
+            std::to_string(stop_delta_budget_ns)},
+           {"backend_call_to_goal_accept_ns",
+            std::to_string(backend_call_to_goal_accept_ns)},
+           {"backend_call_to_goal_dispatch_ns",
+            std::to_string(backend_call_to_goal_dispatch_ns)},
+           {"goal_dispatch_to_accept_ns",
+            std::to_string(goal_dispatch_to_accept_ns)}}};
+      clear_managed_controlled_stop_state();
+      clear_controlled_stop_path_deviation_tracking();
+      return result;
+    }
+    install_controlled_stop_command_reference(dispatch_trajectory,
+                                              dispatch_accepted);
+
+    const double wait_s =
+        controlled_stop_wait_timeout_s(profile, config_.stop_completion_timeout_s);
+    bool received = false;
+    bool success = false;
+    std::optional<core::ErrorDTO> terminal_error;
+    {
+      std::unique_lock<std::mutex> lock(managed_fjt_mutex_);
+      received = managed_fjt_cv_.wait_for(
+          lock,
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::duration<double>(wait_s)),
+          [this, &stop_token]() {
+            return managed_fjt_terminal_result_received_ ||
+                   stop_token.stop_requested();
+          });
+      success = managed_fjt_terminal_result_success_;
+      terminal_error = managed_fjt_terminal_error_;
+    }
+    if (stop_token.stop_requested()) {
+      GoalHandleFJT::SharedPtr path_ramp_goal;
+      {
+        std::lock_guard<std::mutex> lock(managed_fjt_mutex_);
+        path_ramp_goal = managed_fjt_goal_;
+      }
+      cancel_goal_if_known(path_ramp_goal);
+      clear_managed_controlled_stop_state();
+      clear_controlled_stop_path_deviation_tracking();
+      return cancelled_result("spring_back_terminal_wait");
+    }
+    const auto call_end = std::chrono::steady_clock::now();
+    result.confirmation_latency_ns = std::max<std::int64_t>(
+        0, std::chrono::duration_cast<std::chrono::nanoseconds>(
+               call_end - call_start)
+               .count());
+    if (!received) {
+      GoalHandleFJT::SharedPtr path_ramp_goal;
+      {
+        std::lock_guard<std::mutex> lock(managed_fjt_mutex_);
+        path_ramp_goal = managed_fjt_goal_;
+      }
+      cancel_goal_if_known(path_ramp_goal);
+      result.accepted = true;
+      result.backend_stop_confirmed = false;
+      result.error = core::ErrorDTO{
+          std::string(core::kErrorMotionInterruptBackendStopFailed),
+          "controller did not confirm spring_back_hold path-ramp goal within the deadline",
+          {{"reason", "backend_stop_not_confirmed"},
+           {"wait_s", std::to_string(wait_s)},
+           {"mode", "spring_back_hold"}}};
+      clear_managed_controlled_stop_state();
+      clear_controlled_stop_path_deviation_tracking();
+      return result;
+    }
+    if (!success) {
+      result.accepted = true;
+      result.backend_stop_confirmed = false;
+      result.error = terminal_error.value_or(core::ErrorDTO{
+          std::string(core::kErrorMotionInterruptBackendStopFailed),
+          "spring_back_hold path-ramp goal terminated unsuccessfully",
+          {{"reason", "controller_terminal_result_unsuccessful"},
+           {"mode", "spring_back_hold"}}});
+      clear_managed_controlled_stop_state();
+      clear_controlled_stop_path_deviation_tracking();
+      return result;
+    }
+
+    std::vector<double> post_stop_positions;
+    std::vector<double> post_stop_velocities;
+    std::string post_stop_source;
+    {
+      const auto now = std::chrono::steady_clock::now();
+      std::lock_guard<std::mutex> lock(state_mutex_);
+      const auto post_stop_sample = select_latest_sample_locked(now);
+      if (post_stop_sample.has_value()) {
+        post_stop_positions =
+            positions_for_joints(*post_stop_sample, joint_names);
+        post_stop_velocities =
+            velocities_for_joints(*post_stop_sample, joint_names);
+        post_stop_source = post_stop_sample->source;
+      }
+    }
+    if (post_stop_positions.empty() ||
+        post_stop_positions.size() != joint_names.size()) {
+      result.accepted = true;
+      result.backend_stop_confirmed = false;
+      result.error = core::ErrorDTO{
+          std::string(core::kErrorMotionInterruptStopStateInvalid),
+          "controller confirmed spring_back_hold path ramp but no fresh post-stop sample is available",
+          {{"reason", "controlled_stop_post_hold_state_unavailable"},
+           {"sample_source", post_stop_source},
+           {"mode", "spring_back_hold"}}};
+      clear_managed_controlled_stop_state();
+      clear_controlled_stop_path_deviation_tracking();
+      return result;
+    }
+    double path_deviation_max_rad = planned.value().path_deviation_max_rad;
+    std::size_t path_deviation_feedback_samples = 0;
+    std::optional<core::ErrorDTO> path_deviation_feedback_error;
+    {
+      std::lock_guard<std::mutex> lock(managed_fjt_mutex_);
+      if (controlled_stop_path_deviation_max_rad_.has_value()) {
+        path_deviation_max_rad =
+            std::max(path_deviation_max_rad,
+                     *controlled_stop_path_deviation_max_rad_);
+      }
+      path_deviation_feedback_samples =
+          controlled_stop_path_deviation_feedback_samples_;
+      path_deviation_feedback_error = controlled_stop_path_deviation_error_;
+    }
+    core::RobotStateDTO post_stop_state;
+    post_stop_state.joint_names = joint_names;
+    post_stop_state.positions_rad = post_stop_positions;
+    auto post_stop_deviation = core::measure_soft_on_path_path_deviation(
+        active_trajectory, post_stop_state);
+    if (post_stop_deviation.ok()) {
+      path_deviation_max_rad =
+          std::max(path_deviation_max_rad, post_stop_deviation.value());
+    } else {
+      path_deviation_feedback_error = post_stop_deviation.error();
+    }
+    double stop_distance_sq = 0.0;
+    for (std::size_t i = 0; i < joint_names.size(); ++i) {
+      const double delta = post_stop_positions[i] - observed_positions[i];
+      stop_distance_sq += delta * delta;
+    }
+    std::vector<double> snapshot_positions = post_stop_positions;
+    std::string snapshot_source;
+    if (is_commanded_sim_mode() && !dispatch_trajectory.waypoints.empty() &&
+        dispatch_trajectory.waypoints.back().positions_rad.size() ==
+            joint_names.size()) {
+      snapshot_positions =
+          dispatch_trajectory.waypoints.back().positions_rad;
+      snapshot_source = "commanded_sim_spring_back_path_terminal";
+    }
+    const auto snapshot_before_publish = get_execution_snapshot();
+    complete_managed_controlled_stop_execution();
+    update_scene_positions(snapshot_positions);
+    publish_snapshot(core::ExecutionState::kStopped,
+                     snapshot_before_publish.progress,
+                     snapshot_positions,
+                     std::nullopt,
+                     snapshot_source);
+    if (!post_stop_velocities.empty()) {
+      std::lock_guard<std::mutex> lock(state_mutex_);
+      snapshot_.joint_velocities_rad_s = post_stop_velocities;
+    }
+
+    result.accepted = true;
+    result.backend_stop_confirmed = true;
+    result.executed_stop_mode = core::MotionInterruptStopMode::kSpringBackHold;
+    result.stop_command_source =
+        core::MotionInterruptStopCommandSource::kFjtPreemptPathRamp;
+    result.stop_distance_rad = std::sqrt(stop_distance_sq);
+    result.initial_path_deviation_rad =
+        planned.value().initial_path_deviation_rad;
+    result.path_deviation_max_rad = path_deviation_max_rad;
+    result.diagnostics = planned.value().diagnostics;
+    result.diagnostics["runtime_scale_isolation"] =
+        config_.enable_jtc_speed_scaling_input
+            ? "owned_scale_asserted_unit_during_stop"
+            : "wall_rate_no_controller_scaling";
+    result.diagnostics["timeline_authority_tier"] =
+        config_.enable_jtc_speed_scaling_input ? "owned_scale_asserted"
+                                               : "wall_rate";
+    result.diagnostics["runtime_velocity_scale_at_trip"] =
+        std::to_string(active_runtime_scale);
+    result.diagnostics["stop_command_source"] =
+        "fjt_preempt_spring_back_path_ramp";
+    result.diagnostics["configured_stop_traj_delta_ns"] =
+        std::to_string(stop_delta_budget_ns);
+    result.diagnostics["backend_call_to_goal_dispatch_ns"] =
+        std::to_string(backend_call_to_goal_dispatch_ns);
+    result.diagnostics["goal_dispatch_to_accept_ns"] =
+        std::to_string(goal_dispatch_to_accept_ns);
+    result.diagnostics["backend_call_to_goal_accept_ns"] =
+        std::to_string(backend_call_to_goal_accept_ns);
+    result.diagnostics["stop_traj_delta_budget_margin_ns"] =
+        std::to_string(stop_delta_budget_ns - backend_call_to_goal_accept_ns);
+    result.diagnostics["dispatch_latency_shift_s"] =
+        std::to_string(dispatch_latency_applied_s);
     result.diagnostics["post_stop_sample_source"] = post_stop_source;
     result.diagnostics["path_deviation_source"] =
         path_deviation_feedback_samples > 0
@@ -3124,28 +3721,35 @@ Ros2ControlExecutionBackend::execute_controlled_stop(
       return result;
     }
 
-    // Read the post-stop sample. The controller's terminal callback
-    // fires after `decelerate_on_cancel` completes, so the latest
-    // sample should reflect the actuator's rest position. Use the
-    // same freshness gate as the pre-trip capture so we never
-    // certify a stale post-stop position.
-    std::vector<double> post_stop_positions;
-    std::vector<double> post_stop_velocities;
-    std::string post_stop_source;
-    {
-      const auto now = std::chrono::steady_clock::now();
-      std::lock_guard<std::mutex> lock(state_mutex_);
-      const auto post_stop_sample = select_latest_sample_locked(now);
-      if (post_stop_sample.has_value()) {
-        post_stop_positions =
-            positions_for_joints(*post_stop_sample, joint_names);
-        post_stop_velocities =
-            velocities_for_joints(*post_stop_sample, joint_names);
-        post_stop_source = post_stop_sample->source;
-      }
-    }
-    if (post_stop_positions.empty() ||
-        post_stop_positions.size() != joint_names.size()) {
+    // Read the post-stop sample from measured/controller feedback, not from an
+    // authored trajectory. JTC owns the decelerate_on_cancel profile, so the
+    // only portable terminal authority is a fresh settled observation. Waiting
+    // here also prevents Composer from rendering a random early read-back pose
+    // while Isaac/robot feedback is still converging after the cancel result.
+    const auto settle_start = std::chrono::steady_clock::now();
+    const auto settle_deadline =
+        cancel_start_ns +
+        std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+            std::chrono::duration<double>(wait_s));
+    const double settle_velocity_threshold_rad_s =
+        profile.settle_velocity_threshold_rad_s.value_or(
+            core::kDefaultSettleVelocityThresholdRadS);
+    const auto post_stop_observation = wait_for_post_stop_observation(
+        joint_names, settle_velocity_threshold_rad_s, settle_deadline);
+    const auto settle_end = std::chrono::steady_clock::now();
+    const auto settle_wait_ns =
+        std::max<std::int64_t>(
+            0, std::chrono::duration_cast<std::chrono::nanoseconds>(
+                   settle_end - settle_start)
+                   .count());
+    result.diagnostics["controller_cancel_confirmation_latency_ns"] =
+        std::to_string(result.confirmation_latency_ns);
+    result.confirmation_latency_ns = std::max<std::int64_t>(
+        0, std::chrono::duration_cast<std::chrono::nanoseconds>(
+               settle_end - cancel_start_ns)
+               .count());
+    if (!post_stop_observation.has_value() ||
+        post_stop_observation->positions.size() != joint_names.size()) {
       result.accepted = true;
       result.backend_stop_confirmed = false;
       result.error = core::ErrorDTO{
@@ -3153,7 +3757,51 @@ Ros2ControlExecutionBackend::execute_controlled_stop(
           "controller finished decelerate_on_cancel but no fresh post-stop "
           "sample is available",
           {{"reason", "controlled_stop_post_hold_state_unavailable"},
+           {"settle_wait_ns", std::to_string(settle_wait_ns)},
+           {"mode", "hard_deceleration"}}};
+      return result;
+    }
+    const auto& post_stop_positions = post_stop_observation->positions;
+    const auto& post_stop_velocities = post_stop_observation->velocities;
+    const auto& post_stop_source = post_stop_observation->source;
+    result.diagnostics["post_stop_sample_source"] = post_stop_source;
+    result.diagnostics["post_stop_velocity_available"] =
+        post_stop_observation->velocity_available ? "true" : "false";
+    result.diagnostics["post_stop_at_rest"] =
+        post_stop_observation->at_rest ? "true" : "false";
+    result.diagnostics["post_stop_max_abs_velocity_rad_s"] =
+        format_double(post_stop_observation->max_abs_velocity_rad_s);
+    result.diagnostics["settle_velocity_threshold_rad_s"] =
+        format_double(settle_velocity_threshold_rad_s);
+    result.diagnostics["post_stop_settle_wait_ns"] =
+        std::to_string(settle_wait_ns);
+    if (!post_stop_observation->velocity_available) {
+      result.accepted = true;
+      result.backend_stop_confirmed = false;
+      result.error = core::ErrorDTO{
+          std::string(core::kErrorMotionInterruptStopStateInvalid),
+          "controller finished decelerate_on_cancel but no measured velocity "
+          "sample is available to certify settle",
+          {{"reason", "hard_deceleration_settle_velocity_unavailable"},
            {"sample_source", post_stop_source},
+           {"settle_wait_ns", std::to_string(settle_wait_ns)},
+           {"mode", "hard_deceleration"}}};
+      return result;
+    }
+    if (!post_stop_observation->at_rest) {
+      result.accepted = true;
+      result.backend_stop_confirmed = false;
+      result.error = core::ErrorDTO{
+          std::string(core::kErrorMotionInterruptBackendStopFailed),
+          "controller finished decelerate_on_cancel but measured velocity did "
+          "not settle before the deadline",
+          {{"reason", "hard_deceleration_not_settled"},
+           {"sample_source", post_stop_source},
+           {"measured_max_abs_velocity_rad_s",
+            format_double(post_stop_observation->max_abs_velocity_rad_s)},
+           {"settle_velocity_threshold_rad_s",
+            format_double(settle_velocity_threshold_rad_s)},
+           {"settle_wait_ns", std::to_string(settle_wait_ns)},
            {"mode", "hard_deceleration"}}};
       return result;
     }
@@ -3177,7 +3825,9 @@ Ros2ControlExecutionBackend::execute_controlled_stop(
     // an off-path interrupt with progress=1.0 would falsely signal
     // trajectory completion to downstream stop-snapshot consumers.
     publish_snapshot(core::ExecutionState::kStopped,
-                     observed_progress_at_stop, post_stop_positions);
+                     observed_progress_at_stop, post_stop_positions,
+                     std::nullopt,
+                     "measured_hard_deceleration_feedback");
     if (!post_stop_velocities.empty()) {
       std::lock_guard<std::mutex> lock(state_mutex_);
       snapshot_.joint_velocities_rad_s = post_stop_velocities;
@@ -3190,175 +3840,12 @@ Ros2ControlExecutionBackend::execute_controlled_stop(
     return result;
   }
 
-  // Reset the managed-FJT terminal-result tracking state used by the
-  // anchored hold goal before dispatching this controlled stop.
-  {
-    std::lock_guard<std::mutex> lock(managed_fjt_mutex_);
-    managed_fjt_terminal_goal_id_.reset();
-    managed_fjt_terminal_result_received_ = false;
-    managed_fjt_terminal_result_success_ = false;
-    managed_fjt_terminal_error_.reset();
-  }
-
-  // Dispatch the anchored hold goal: target = observed position with
-  // zero velocity at +deceleration_time_s. The existing helper
-  // captures the anchor, builds the JTC trajectory message, and
-  // tracks the terminal result via on_managed_fjt_terminal_result.
-  const double ramp_s =
-      core::motion_interrupt_deceleration_time_or_default(profile);
-  const auto call_start = std::chrono::steady_clock::now();
-  assert_controlled_stop_unit_runtime_scale();
-  const bool dispatched = send_fjt_anchored_goal(
-      joint_names, observed_positions, ramp_s, /*track_terminal_goal=*/true);
-  if (stop_token.stop_requested()) {
-    return cancelled_result("spring_back_dispatch");
-  }
-  if (!dispatched) {
-    std::optional<core::ErrorDTO> dispatch_error;
-    {
-      std::lock_guard<std::mutex> lock(managed_fjt_mutex_);
-      dispatch_error = managed_fjt_terminal_error_;
-    }
-    result.accepted = false;
-    result.backend_stop_confirmed = false;
-    result.error = dispatch_error.value_or(core::ErrorDTO{
-        std::string(core::kErrorMotionInterruptBackendStopFailed),
-        "failed to dispatch anchored hold goal",
-        {{"reason", "controlled_stop_dispatch_failed"}}});
-    return result;
-  }
-
-  // Bounded wait for the terminal result. The kernel's
-  // complete_move_on_signal_timeout_ns deadline is applied on top of
-  // this; we still bound here so a misbehaving controller never pins
-  // the kernel worker forever. profile.max_stop_time_s wins when set;
-  // otherwise derive the deadline from the requested stop duration plus
-  // the deployment's stop-completion tolerance.
-  const double wait_s =
-      controlled_stop_wait_timeout_s(profile, config_.stop_completion_timeout_s);
-  bool received = false;
-  bool success = false;
-  std::optional<core::ErrorDTO> terminal_error;
-  {
-    std::unique_lock<std::mutex> lock(managed_fjt_mutex_);
-    received = managed_fjt_cv_.wait_for(
-        lock,
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::duration<double>(wait_s)),
-        [this, &stop_token]() {
-          return managed_fjt_terminal_result_received_ ||
-                 stop_token.stop_requested();
-        });
-    success = managed_fjt_terminal_result_success_;
-    terminal_error = managed_fjt_terminal_error_;
-  }
-  if (stop_token.stop_requested()) {
-    return cancelled_result("spring_back_terminal_wait");
-  }
-  const auto call_end = std::chrono::steady_clock::now();
-  result.confirmation_latency_ns = std::max<std::int64_t>(
-      0, std::chrono::duration_cast<std::chrono::nanoseconds>(
-             call_end - call_start)
-             .count());
-
-  if (!received) {
-    result.accepted = true;  // command accepted; controller didn't confirm
-    result.backend_stop_confirmed = false;
-    result.error = core::ErrorDTO{
-        std::string(core::kErrorMotionInterruptBackendStopFailed),
-        "controller did not confirm anchored hold goal within the deadline",
-        {{"reason", "backend_stop_not_confirmed"},
-         {"wait_s", std::to_string(wait_s)}}};
-    return result;
-  }
-  if (!success) {
-    result.accepted = true;
-    result.backend_stop_confirmed = false;
-    result.error = terminal_error.value_or(core::ErrorDTO{
-        std::string(core::kErrorMotionInterruptBackendStopFailed),
-        "anchored hold goal terminated unsuccessfully",
-        {{"reason", "controller_terminal_result_unsuccessful"}}});
-    return result;
-  }
-
-  // Publish a fresh stopped snapshot from the post-hold sample BEFORE
-  // returning success. The kernel calls `get_execution_snapshot()`
-  // immediately after this method returns to populate the
-  // `ExecutionStopSnapshotDTO`; without an updated publish the
-  // snapshot would still reflect the pre-trip state. Failing to
-  // refresh the snapshot here is a fail-closed condition because the
-  // signal_trip outcome MUST certify where the robot actually came to
-  // rest under the hold goal (spec/210 §3.11 stop-snapshot semantic
-  // rules).
-  std::vector<double> hold_positions;
-  std::vector<double> hold_velocities;
-  std::string hold_source;
-  {
-    const auto now = std::chrono::steady_clock::now();
-    std::lock_guard<std::mutex> lock(state_mutex_);
-    const auto post_hold_sample = select_latest_sample_locked(now);
-    if (post_hold_sample.has_value()) {
-      hold_positions =
-          positions_for_joints(*post_hold_sample, joint_names);
-      hold_velocities = velocities_for_joints(*post_hold_sample, joint_names);
-      hold_source = post_hold_sample->source;
-    }
-  }
-  if (hold_positions.empty() || hold_positions.size() != joint_names.size()) {
-    result.accepted = true;
-    result.backend_stop_confirmed = false;
-    result.error = core::ErrorDTO{
-        std::string(core::kErrorMotionInterruptStopStateInvalid),
-        "controller confirmed hold but no fresh post-hold sample is available",
-        {{"reason", "controlled_stop_post_hold_state_unavailable"},
-         {"sample_source", hold_source}}};
-    return result;
-  }
-  publish_snapshot(core::ExecutionState::kStopped, /*progress=*/1.0,
-                    hold_positions);
-  if (!hold_velocities.empty()) {
-    std::lock_guard<std::mutex> lock(state_mutex_);
-    snapshot_.joint_velocities_rad_s = hold_velocities;
-  }
-
-  result.accepted = true;
-  result.backend_stop_confirmed = true;
-  // `executed_stop_mode` MUST describe the physical behavior the
-  // controller exhibited, not
-  // the requested mode. The scaffold dispatch is functionally
-  // identical to spring_back_hold (anchored hold at observed
-  // position). Reporting `executed_stop_mode = kSoftOnPath` would let
-  // audit consumers believe a path-preserving ramp ran when none did.
-  //
-  // The honest sequence: physical behavior is spring_back_hold;
-  // surface that. The kernel's conjunctive fallback rule then gates
-  // the outcome against the scope's `allowed_fallback_modes`: scopes
-  // that do not list kSpringBackHold as a fallback fail closed with
-  // motion_interrupt_backend_stop_failed. Deployments using the
-  // experimental scaffold MUST opt in to the fallback explicitly,
-  // which makes the substitution visible in the operational log.
-  if (profile.stop_mode == core::MotionInterruptStopMode::kSoftOnPath) {
-    result.executed_stop_mode = core::MotionInterruptStopMode::kSpringBackHold;
-    result.stop_command_source =
-        core::MotionInterruptStopCommandSource::kDiagnosticOther;
-    result.fallback_reason =
-        std::string("soft_on_path_scaffold_anchored_hold_fallback");
-    result.diagnostics["command_source_reason"] =
-        std::string("soft_on_path_scaffold_anchored_hold_fallback");
-    result.diagnostics["scaffold_phase"] = std::string("4.5D-5");
-    result.diagnostics["qualification_pending"] = std::string("4.5F");
-    result.diagnostics["requested_stop_mode"] = std::string("soft_on_path");
-  } else {
-    result.stop_command_source =
-        core::MotionInterruptStopCommandSource::kFjtPreemptHold;
-  }
-  result.diagnostics["runtime_scale_isolation"] =
-      config_.enable_jtc_speed_scaling_input
-          ? "owned_scale_asserted_unit_during_stop"
-          : "wall_rate_no_controller_scaling";
-  result.diagnostics["timeline_authority_tier"] =
-      config_.enable_jtc_speed_scaling_input ? "owned_scale_asserted"
-                                             : "wall_rate";
+  result.accepted = false;
+  result.backend_stop_confirmed = false;
+  result.error = core::ErrorDTO{
+      std::string(core::kErrorMotionInterruptBackendStopFailed),
+      "requested stop_mode reached an unsupported ros2_control stop path",
+      {{"reason", "stop_mode_not_supported_by_backend"}}};
   return result;
 }
 
@@ -4036,207 +4523,6 @@ std::shared_ptr<NativeKernelBundle> create_ros2_control_kernel(
 // (spring_back_hold / soft_on_path) — see execute_controlled_stop.
 // =================================================================
 
-bool Ros2ControlExecutionBackend::send_fjt_anchored_goal(
-    const std::vector<std::string>& joint_names,
-    const std::vector<double>& target_positions,
-    double target_time_from_start_s,
-    bool track_terminal_goal) {
-  // FJT preempt-goal anchor timing. The anchor point sits a small negative
-  // time before "now" so JTC's spline has a continuous start; the target
-  // floor bounds the replacement goal's minimum duration. Fixed constants so
-  // controlled-stop does not depend on any deleted ADR-0016 session config.
-  constexpr double kFjtAnchorNegativeTimeS = -0.010;
-  constexpr double kFjtTargetTimeFromStartMinS = 0.030;
-  if (joint_names.empty() || target_positions.empty()) {
-    if (track_terminal_goal) {
-      std::lock_guard<std::mutex> lock(managed_fjt_mutex_);
-      managed_fjt_terminal_result_received_ = true;
-      managed_fjt_terminal_result_success_ = false;
-      managed_fjt_terminal_error_ = make_error(
-          core::ErrorCode::kStopFailed,
-          "managed FJT terminal soft-stop target is empty",
-          {{"reason_code", "soft_stop_dispatch_failed"},
-           {"failure_stage", "empty_terminal_target"}});
-      managed_fjt_cv_.notify_all();
-    }
-    return false;
-  }
-  if (target_positions.size() != joint_names.size()) {
-    if (track_terminal_goal) {
-      std::lock_guard<std::mutex> lock(managed_fjt_mutex_);
-      managed_fjt_terminal_result_received_ = true;
-      managed_fjt_terminal_result_success_ = false;
-      managed_fjt_terminal_error_ = make_error(
-          core::ErrorCode::kStopFailed,
-          "managed FJT terminal soft-stop target size does not match joint names",
-          {{"reason_code", "soft_stop_dispatch_failed"},
-           {"failure_stage", "terminal_target_size_mismatch"},
-           {"joint_count", std::to_string(joint_names.size())},
-           {"position_count", std::to_string(target_positions.size())}});
-      managed_fjt_cv_.notify_all();
-    }
-    return false;
-  }
-
-  // Anchor at the latest controller-source sample if available; otherwise
-  // anchor at the requested target (degenerate but safe for the first goal
-  // of a session).
-  std::vector<double> anchor_positions;
-  std::vector<double> anchor_velocities;
-  {
-    std::lock_guard<std::mutex> lock(state_mutex_);
-    if (latest_action_feedback_.has_value()) {
-      anchor_positions = positions_for_joints(
-          *latest_action_feedback_, joint_names);
-      anchor_velocities.resize(joint_names.size(), 0.0);
-      const auto& sample = *latest_action_feedback_;
-      for (size_t i = 0; i < joint_names.size(); ++i) {
-        const auto it = std::find(
-            sample.joint_names.begin(), sample.joint_names.end(),
-            joint_names[i]);
-        if (it != sample.joint_names.end() &&
-            static_cast<size_t>(it - sample.joint_names.begin()) <
-                sample.velocities.size()) {
-          anchor_velocities[i] =
-              sample.velocities[it - sample.joint_names.begin()];
-        }
-      }
-    } else if (latest_controller_state_.has_value()) {
-      anchor_positions = positions_for_joints(
-          *latest_controller_state_, joint_names);
-      anchor_velocities.assign(joint_names.size(), 0.0);
-    } else if (latest_joint_state_.has_value()) {
-      anchor_positions = positions_for_joints(
-          *latest_joint_state_, joint_names);
-      anchor_velocities.assign(joint_names.size(), 0.0);
-    }
-  }
-  if (anchor_positions.empty() || anchor_positions.size() != joint_names.size()) {
-    // No fresh state to anchor on — fall back to the target as anchor.
-    // This degrades smoothness on the first preempt but recovers on the
-    // next. The kernel's freshness gates should normally ensure observed
-    // state is present before a controlled stop dispatches.
-    anchor_positions = target_positions;
-    anchor_velocities.assign(joint_names.size(), 0.0);
-  }
-
-  if (!wait_for_fjt_action_server(action_client_,
-                                  config_.wait_for_action_server_timeout_s)) {
-    if (track_terminal_goal) {
-      std::lock_guard<std::mutex> lock(managed_fjt_mutex_);
-      managed_fjt_terminal_result_received_ = true;
-      managed_fjt_terminal_result_success_ = false;
-      managed_fjt_terminal_error_ = make_error(
-          core::ErrorCode::kStopFailed,
-          "FollowJointTrajectory action server unavailable for managed FJT "
-          "terminal soft-stop",
-          {{"reason_code", "soft_stop_dispatch_failed"},
-           {"failure_stage", "action_server_unavailable"},
-           {"action_name", config_.action_name}});
-      managed_fjt_cv_.notify_all();
-    }
-    return false;
-  }
-
-  if (track_terminal_goal) {
-    std::lock_guard<std::mutex> lock(managed_fjt_mutex_);
-    managed_fjt_terminal_goal_id_.reset();
-    managed_fjt_terminal_result_received_ = false;
-    managed_fjt_terminal_result_success_ = false;
-    managed_fjt_terminal_error_.reset();
-  }
-  const auto mark_terminal_dispatch_failed = [&](std::string message) {
-    if (!track_terminal_goal) {
-      return;
-    }
-    std::lock_guard<std::mutex> lock(managed_fjt_mutex_);
-    managed_fjt_terminal_result_received_ = true;
-    managed_fjt_terminal_result_success_ = false;
-    managed_fjt_terminal_error_ = make_error(
-        core::ErrorCode::kStopFailed, std::move(message));
-    managed_fjt_cv_.notify_all();
-  };
-
-  FollowJointTrajectory::Goal goal;
-  goal.trajectory.joint_names = joint_names;
-  if (config_.disable_controller_path_tolerances) {
-    disable_fjt_controller_tolerances(goal, joint_names);
-  }
-
-  // Anchor point: observed state with negative time_from_start. JTC's
-  // spline uses this to compute continuous starting conditions for the
-  // new trajectory, so the preempt does not introduce a velocity
-  // discontinuity at the goal-replacement seam.
-  trajectory_msgs::msg::JointTrajectoryPoint anchor_point;
-  anchor_point.positions = anchor_positions;
-  anchor_point.velocities = anchor_velocities;
-  anchor_point.accelerations.assign(joint_names.size(), 0.0);
-  anchor_point.time_from_start = duration_from_seconds(
-      kFjtAnchorNegativeTimeS);
-  goal.trajectory.points.push_back(std::move(anchor_point));
-
-  // Target point: requested final position, zero velocity (the next
-  // streamed target will reset velocity at the next preempt anyway).
-  trajectory_msgs::msg::JointTrajectoryPoint target_point;
-  target_point.positions = target_positions;
-  target_point.velocities.assign(joint_names.size(), 0.0);
-  target_point.accelerations.assign(joint_names.size(), 0.0);
-  target_point.time_from_start = duration_from_seconds(
-      std::max(target_time_from_start_s,
-               kFjtTargetTimeFromStartMinS));
-  goal.trajectory.points.push_back(std::move(target_point));
-
-  rclcpp_action::Client<FollowJointTrajectory>::SendGoalOptions options;
-  options.feedback_callback =
-      [this](GoalHandleFJT::SharedPtr goal_handle,
-             const std::shared_ptr<const FollowJointTrajectory::Feedback> feedback) {
-        on_action_feedback(goal_handle, feedback);
-      };
-  options.result_callback =
-      [this, track_terminal_goal](const GoalHandleFJT::WrappedResult& result) {
-        // Preempting goals are dispatched async (async_send_goal) and do
-        // not block on per-goal results. Route the result through the
-        // existing callback so feedback freshness gates and tracking
-        // peak telemetry continue to work uniformly.
-        if (track_terminal_goal) {
-          on_managed_fjt_terminal_result(result);
-        } else {
-          on_action_result(result);
-        }
-      };
-
-  auto goal_handle_future = action_client_->async_send_goal(goal, options);
-  if (goal_handle_future.wait_for(
-          std::chrono::duration<double>(
-              config_.wait_for_action_server_timeout_s)) !=
-      std::future_status::ready) {
-    mark_terminal_dispatch_failed(
-        "timed out waiting for managed FJT terminal soft-stop goal acceptance");
-    return false;
-  }
-  GoalHandleFJT::SharedPtr goal_handle;
-  try {
-    goal_handle = goal_handle_future.get();
-  } catch (const std::exception&) {
-    mark_terminal_dispatch_failed(
-        "managed FJT terminal soft-stop goal acceptance threw an exception");
-    return false;
-  }
-  if (!goal_handle) {
-    mark_terminal_dispatch_failed(
-        "managed FJT terminal soft-stop goal was rejected by the controller");
-    return false;
-  }
-  {
-    std::lock_guard<std::mutex> lock(managed_fjt_mutex_);
-    managed_fjt_goal_ = goal_handle;
-    if (track_terminal_goal) {
-      managed_fjt_terminal_goal_id_ = goal_handle->get_goal_id();
-    }
-  }
-  return true;
-}
-
 bool Ros2ControlExecutionBackend::send_fjt_replacement_trajectory(
     const core::TrajectoryDTO& trajectory,
     bool track_terminal_goal) {
@@ -4288,8 +4574,8 @@ bool Ros2ControlExecutionBackend::send_fjt_replacement_trajectory(
     // dispatch-latency shift (shift_soft_stop_for_dispatch_latency) and the
     // seam-preserving preempt prepend one past-anchor carrying the live seam
     // state so stock JTC's spline starts continuously (no backward-pull bump),
-    // matching send_fjt_anchored_goal. Every later point must be non-negative;
-    // all points must be finite and monotonically increasing.
+    // without using a cancel-first hold. Every later point must be
+    // non-negative; all points must be finite and monotonically increasing.
     const bool leading_anchor = (i == 0);
     if (!std::isfinite(waypoint.time_from_start_s) ||
         (!leading_anchor && waypoint.time_from_start_s < 0.0) ||

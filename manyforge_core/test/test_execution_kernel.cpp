@@ -829,6 +829,25 @@ class ControlledExecution : public IExecutionBackend {
                         });
   }
 
+  bool wait_until_runtime_velocity_scale_set_count(
+      int count,
+      std::chrono::milliseconds timeout = std::chrono::milliseconds(2000)) {
+    std::unique_lock<std::mutex> lock(mu_);
+    return cv_.wait_for(lock, timeout, [this, count]() {
+      return runtime_velocity_scale_set_count >= count;
+    });
+  }
+
+  int runtime_velocity_scale_set_count_value() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return runtime_velocity_scale_set_count;
+  }
+
+  double last_runtime_velocity_scale_value() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return last_runtime_velocity_scale;
+  }
+
   void release_controlled_stop() {
     {
       std::lock_guard<std::mutex> lock(mu_);
@@ -2201,6 +2220,77 @@ TEST_F(ExecutionKernelTest, AcknowledgeIntervention_FromIntervention_Transitions
       << "kInterventionAcknowledged event was not emitted";
 }
 
+TEST_F(ExecutionKernelTest,
+       AcknowledgeInterventionForRetry_FromStopIntervention_DoesNotResetBackend) {
+  execution.next_terminal_state = ExecutionState::kInterventionRequired;
+  execution.snapshot.error = ErrorDTO{
+      std::string(kErrorMotionInterruptBackendStopFailed),
+      "operator stop total failure",
+      {{"reason", "operator_stop_total_failure"},
+       {"phase", "operator_stop"},
+       {"requested_stop_mode", "hard_deceleration"},
+       {"executed_stop_mode", "hard_deceleration"}}};
+  auto first = execute_sync(make_test_request());
+  ASSERT_TRUE(first.ok());
+  EXPECT_EQ(kernel.get_status().state, ExecutionState::kInterventionRequired);
+  EXPECT_EQ(execution.reset_count, 0);
+
+  std::mutex events_mutex;
+  std::vector<KernelEvent> events;
+  kernel.subscribe_events([&](const KernelEvent& e) {
+    std::lock_guard<std::mutex> lock(events_mutex);
+    events.push_back(e);
+  });
+
+  auto ack = kernel.acknowledge_intervention_for_retry(
+      "operator_alice", "ui_acknowledge_and_continue");
+  ASSERT_TRUE(ack.accepted);
+  EXPECT_EQ(kernel.get_status().state, ExecutionState::kIdle);
+  EXPECT_EQ(execution.reset_count, 0);
+  const auto snapshot = kernel.get_execution_snapshot();
+  EXPECT_EQ(snapshot.state, ExecutionState::kIdle);
+  ASSERT_EQ(snapshot.joint_positions_rad.size(), 2u);
+  EXPECT_EQ(snapshot.joint_positions_rad[0], 1.0);
+  EXPECT_EQ(snapshot.joint_positions_rad[1], 1.0);
+
+  std::lock_guard<std::mutex> lock(events_mutex);
+  bool saw_retry_ack = false;
+  for (const auto& e : events) {
+    if (e.type == KernelEventType::kInterventionAcknowledged &&
+        e.details.contains("recovery_mode")) {
+      saw_retry_ack = true;
+      EXPECT_EQ(e.details.at("recovery_mode"), "acknowledge_and_continue");
+      EXPECT_EQ(e.details.at("backend_reset_performed"), "false");
+    }
+  }
+  EXPECT_TRUE(saw_retry_ack);
+}
+
+TEST_F(ExecutionKernelTest,
+       AcknowledgeInterventionForRetry_RejectsWhenMeasuredVelocityStillMoving) {
+  execution.next_terminal_state = ExecutionState::kInterventionRequired;
+  execution.snapshot.joint_velocities_rad_s = {0.2, 0.0};
+  execution.snapshot.error = ErrorDTO{
+      std::string(kErrorMotionInterruptBackendStopFailed),
+      "operator stop not settled",
+      {{"reason", "stop_not_settled_measured_velocity"},
+       {"phase", "operator_stop"},
+       {"requested_stop_mode", "soft_on_path"},
+       {"executed_stop_mode", "soft_on_path"},
+       {"settle_velocity_threshold_rad_s", "0.01"}}};
+  auto first = execute_sync(make_test_request());
+  ASSERT_TRUE(first.ok());
+  EXPECT_EQ(kernel.get_status().state, ExecutionState::kInterventionRequired);
+
+  auto ack = kernel.acknowledge_intervention_for_retry(
+      "operator_alice", "ui_acknowledge_and_continue");
+  EXPECT_FALSE(ack.accepted);
+  ASSERT_TRUE(ack.error.has_value());
+  EXPECT_EQ(ack.error->details.at("reason"), "robot_not_settled");
+  EXPECT_EQ(kernel.get_status().state, ExecutionState::kInterventionRequired);
+  EXPECT_EQ(execution.reset_count, 0);
+}
+
 TEST_F(ExecutionKernelTest, AcknowledgeIntervention_FromIdle_Rejected) {
   EXPECT_EQ(kernel.get_status().state, ExecutionState::kIdle);
 
@@ -2984,6 +3074,8 @@ TEST_F(ExecutionKernelTest,
       {"j1", 8.0}, {"j2", 8.0}, {"j3", 8.0}};
   config.operator_stop_profile =
       std::make_shared<MotionInterruptStopProfileDTO>(op_profile);
+  std::mutex events_mutex;
+  std::vector<KernelEvent> events;
   ExecutionKernel local_kernel{planner,
                                context,
                                controlled_execution,
@@ -2998,6 +3090,10 @@ TEST_F(ExecutionKernelTest,
   controlled_execution.motion_interrupt_stop_capability.supported_stop_modes =
       {MotionInterruptStopMode::kSoftOnPath,
        MotionInterruptStopMode::kSpringBackHold};
+  local_kernel.subscribe_events([&](const KernelEvent& e) {
+    std::lock_guard<std::mutex> lock(events_mutex);
+    events.push_back(e);
+  });
 
   auto result = local_kernel.execute(make_test_request());
   ASSERT_TRUE(result.ok());
@@ -3015,6 +3111,33 @@ TEST_F(ExecutionKernelTest,
             "operator_stop_soft_on_path");
   EXPECT_EQ(controlled_execution.last_controlled_stop_profile.stop_mode,
             MotionInterruptStopMode::kSoftOnPath);
+  // The state transition can become observable before the async event
+  // subscriber callback has copied kStopIssued into the local vector under
+  // full-suite load. Poll for the exact event instead of racing delivery.
+  std::optional<KernelEvent> stop_event;
+  for (int attempt = 0; attempt < 2000; ++attempt) {
+    {
+      std::lock_guard<std::mutex> lock(events_mutex);
+      auto it = std::find_if(events.begin(), events.end(),
+                             [](const KernelEvent& e) {
+                               return e.type == KernelEventType::kStopIssued;
+                             });
+      if (it != events.end()) {
+        stop_event = *it;
+        break;
+      }
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  ASSERT_TRUE(stop_event.has_value());
+  EXPECT_EQ(stop_event->details.at("controlled_stop_success"), "true");
+  EXPECT_EQ(stop_event->details.at("phase"), "operator_stop");
+  EXPECT_EQ(stop_event->details.at("requested_stop_mode"), "soft_on_path");
+  EXPECT_EQ(stop_event->details.at("executed_stop_mode"), "soft_on_path");
+  EXPECT_EQ(stop_event->details.at("stop_command_source"),
+            "native_simulated_stop");
+  EXPECT_EQ(stop_event->details.at("backend_stop_confirmed"), "true");
+  EXPECT_EQ(stop_event->details.at("hard_stop_floor"), "immediate_hard_stop");
 }
 
 TEST_F(ExecutionKernelTest,
@@ -3287,18 +3410,26 @@ TEST_F(ExecutionKernelTest,
   ASSERT_TRUE(local_kernel.stop().accepted);
   ASSERT_TRUE(controlled_execution.wait_until_controlled_stop_count(1));
   ASSERT_TRUE(wait_for_state(local_kernel, ExecutionState::kStopping));
+  ASSERT_TRUE(wait_for_pending_scheduler_work(local_scheduler));
 
-  for (int attempt = 0;
-       attempt < 200 && controlled_execution.stop_attempt_count == 0;
-       ++attempt) {
+  bool watchdog_cancel_seen = false;
+  for (int attempt = 0; attempt < 200 && !watchdog_cancel_seen; ++attempt) {
     local_clock.advance(20'000'000);
     local_scheduler.advance_to(local_clock.now());
-    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    watchdog_cancel_seen =
+        controlled_execution.wait_until_controlled_stop_cancel_count(
+        1, std::chrono::milliseconds(1));
   }
 
-  EXPECT_GE(controlled_execution.stop_attempt_count, 1)
+  ASSERT_TRUE(
+      watchdog_cancel_seen ||
+      controlled_execution.wait_until_controlled_stop_cancel_count(1))
+      << "deadline watchdog must cancel the blocked controlled stop itself";
+  ASSERT_TRUE(controlled_execution.wait_until_stop_attempt_count(1))
       << "deadline watchdog must issue backend.stop() itself";
-  ASSERT_TRUE(wait_for_state(local_kernel, ExecutionState::kStopped));
+  controlled_execution.release_controlled_stop();
+  ASSERT_TRUE(wait_for_state(local_kernel, ExecutionState::kStopped))
+      << "state=" << to_string(local_kernel.get_status().state);
   const auto snapshot = local_kernel.get_execution_snapshot();
   ASSERT_TRUE(snapshot.error.has_value());
   EXPECT_EQ(snapshot.error->details.at("hard_stop_transitioned"), "true");
@@ -3322,6 +3453,10 @@ TEST_F(ExecutionKernelTest,
   op_profile.per_joint_max_deceleration_rad_s2 = {{"j1", 8.0}, {"j2", 8.0}};
   config.operator_stop_profile =
       std::make_shared<MotionInterruptStopProfileDTO>(op_profile);
+  // Captured by the kernel's event callback: must outlive the kernel
+  // (the kernel destructor joins its workers).
+  std::mutex events_mutex;
+  std::vector<KernelEvent> events;
   ExecutionKernel local_kernel{planner,
                                context,
                                controlled_execution,
@@ -3337,8 +3472,6 @@ TEST_F(ExecutionKernelTest,
       {MotionInterruptStopMode::kSoftOnPath,
        MotionInterruptStopMode::kSpringBackHold};
 
-  std::mutex events_mutex;
-  std::vector<KernelEvent> events;
   local_kernel.subscribe_events([&](const KernelEvent& e) {
     std::lock_guard<std::mutex> lock(events_mutex);
     events.push_back(e);
@@ -3356,7 +3489,7 @@ TEST_F(ExecutionKernelTest,
   local_kernel.set_runtime_velocity_scale(0.25, std::string{"operator_alice"});
   local_kernel.set_runtime_velocity_scale(0.75, std::string{"operator_bob"});
 
-  EXPECT_EQ(controlled_execution.runtime_velocity_scale_set_count, 0)
+  EXPECT_EQ(controlled_execution.runtime_velocity_scale_set_count_value(), 0)
       << "backend scale writes must be deferred while the controlled stop is "
          "in flight";
   {
@@ -3376,8 +3509,8 @@ TEST_F(ExecutionKernelTest,
 
   controlled_execution.release_controlled_stop();
   ASSERT_TRUE(wait_for_state(local_kernel, ExecutionState::kStopped));
-  EXPECT_EQ(controlled_execution.runtime_velocity_scale_set_count, 1);
-  EXPECT_DOUBLE_EQ(controlled_execution.last_runtime_velocity_scale, 0.75);
+  ASSERT_TRUE(controlled_execution.wait_until_runtime_velocity_scale_set_count(1));
+  EXPECT_DOUBLE_EQ(controlled_execution.last_runtime_velocity_scale_value(), 0.75);
 }
 
 TEST_F(ExecutionKernelTest,
@@ -3432,18 +3565,18 @@ TEST_F(ExecutionKernelTest,
   ASSERT_TRUE(wait_for_state(local_kernel, ExecutionState::kStopping));
 
   local_kernel.set_runtime_velocity_scale(0.4, std::string{"operator_alice"});
-  EXPECT_EQ(controlled_execution.runtime_velocity_scale_set_count, 0);
+  EXPECT_EQ(controlled_execution.runtime_velocity_scale_set_count_value(), 0);
 
   controlled_execution.release_controlled_stop();
   ASSERT_TRUE(wait_for_state(local_kernel,
                              ExecutionState::kInterventionRequired));
+  ASSERT_TRUE(controlled_execution.wait_until_runtime_velocity_scale_set_count(1))
+      << "deferred scale must release even when controlled stop exits through "
+         "intervention";
   const auto snapshot = local_kernel.get_execution_snapshot();
   ASSERT_TRUE(snapshot.error.has_value());
   EXPECT_EQ(snapshot.error->details.at("reason"), "operator_stop_total_failure");
-  EXPECT_EQ(controlled_execution.runtime_velocity_scale_set_count, 1)
-      << "deferred scale must release even when controlled stop exits through "
-         "intervention";
-  EXPECT_DOUBLE_EQ(controlled_execution.last_runtime_velocity_scale, 0.4);
+  EXPECT_DOUBLE_EQ(controlled_execution.last_runtime_velocity_scale_value(), 0.4);
 }
 
 TEST_F(ExecutionKernelTest,
@@ -3896,6 +4029,12 @@ TEST_F(ExecutionKernelTest,
             "operator_stop_profile_failed");
   EXPECT_EQ(snapshot.error->details.at("emergency_fallback"),
             "legacy_stop_succeeded");
+  EXPECT_EQ(snapshot.error->details.at("hard_stop_floor"),
+            "immediate_hard_stop");
+  EXPECT_EQ(snapshot.error->details.at("hard_stop_level"),
+            "mock_hard_stop");
+  EXPECT_EQ(snapshot.error->details.at("hard_stop_floor_command_source"),
+            "backend_stop");
 }
 
 TEST_F(ExecutionKernelTest,
@@ -3984,6 +4123,10 @@ TEST_F(ExecutionKernelTest,
             "soft_on_path_planner_rejected");
   EXPECT_EQ(snapshot.error->details.at("fallback_pair"),
             "soft_on_path->spring_back_hold");
+  EXPECT_EQ(snapshot.error->details.at("hard_stop_floor"),
+            "immediate_hard_stop");
+  EXPECT_EQ(snapshot.error->details.at("hard_stop_floor_command_source"),
+            "backend_stop");
   std::lock_guard<std::mutex> lock(events_mutex);
   EXPECT_TRUE(std::any_of(events.begin(), events.end(),
                           [](const KernelEvent& e) {
@@ -6331,6 +6474,10 @@ TEST_F(ExecutionKernelTest,
   TrajectoryCache local_cache{CacheConfig{10}};
   MockCollisionWorldPublisher local_publisher;
   auto local_engine = std::make_shared<MockCollisionEngine>();
+  // Captured by the kernel's event callback: must outlive the kernel
+  // (the kernel destructor joins its workers).
+  std::mutex events_mutex;
+  std::vector<KernelEvent> events;
   ExecutionKernel local_kernel{planner,      context,         controlled_execution,
                                local_clock,  local_scheduler, local_cache};
   configure_authoritative_collision_validation(local_kernel, local_publisher,
@@ -6340,8 +6487,6 @@ TEST_F(ExecutionKernelTest,
   ASSERT_TRUE(local_kernel.register_interrupt_policy(
                   make_move_trip_policy("probe_trip", "probe")).ok());
 
-  std::mutex events_mutex;
-  std::vector<KernelEvent> events;
   local_kernel.subscribe_events([&](const KernelEvent& e) {
     std::lock_guard<std::mutex> lock(events_mutex);
     events.push_back(e);
@@ -6364,7 +6509,7 @@ TEST_F(ExecutionKernelTest,
   local_kernel.set_runtime_velocity_scale(0.2, std::string{"operator_alice"});
   local_kernel.set_runtime_velocity_scale(0.6, std::string{"operator_bob"});
 
-  EXPECT_EQ(controlled_execution.runtime_velocity_scale_set_count, 0)
+  EXPECT_EQ(controlled_execution.runtime_velocity_scale_set_count_value(), 0)
       << "motion-scoped stop path must freeze backend scale writes while the "
          "controlled stop is in flight";
   {
@@ -6385,8 +6530,8 @@ TEST_F(ExecutionKernelTest,
   controlled_execution.release_controlled_stop();
   ASSERT_TRUE(local_kernel.wait_for_completion(2'000'000'000));
   EXPECT_EQ(local_kernel.get_status().state, ExecutionState::kCompleted);
-  EXPECT_EQ(controlled_execution.runtime_velocity_scale_set_count, 1);
-  EXPECT_DOUBLE_EQ(controlled_execution.last_runtime_velocity_scale, 0.6);
+  ASSERT_TRUE(controlled_execution.wait_until_runtime_velocity_scale_set_count(1));
+  EXPECT_DOUBLE_EQ(controlled_execution.last_runtime_velocity_scale_value(), 0.6);
 }
 
 TEST_F(ExecutionKernelTest,
@@ -6789,6 +6934,8 @@ TEST_F(ExecutionKernelTest,
                             "simulated backend refusal",
                             {{"reason", "controller_rejected_goal"}}};
   controlled_execution.next_controlled_stop_result = failure;
+  controlled_execution.motion_interrupt_stop_capability.hard_stop_level =
+      "jtc_cancel_unprofiled_hold";
 
   FakeClock local_clock;
   ManualScheduler local_scheduler;
@@ -6832,6 +6979,12 @@ TEST_F(ExecutionKernelTest,
   EXPECT_EQ(outcome->error->code, kErrorMotionInterruptBackendStopFailed);
   EXPECT_EQ(outcome->error->details.at("reason"),
             "controller_rejected_goal");
+  EXPECT_EQ(outcome->error->details.at("hard_stop_floor"),
+            "immediate_hard_stop");
+  EXPECT_EQ(outcome->error->details.at("hard_stop_level"),
+            "jtc_cancel_unprofiled_hold");
+  EXPECT_EQ(outcome->error->details.at("hard_stop_floor_command_source"),
+            "jtc_cancel_unprofiled_hold");
   EXPECT_FALSE(outcome->trip.has_value());
   // A refused controlled stop means the robot may still be in motion, so
   // the scoped-trip path MUST engage the emergency hard-stop floor
@@ -6890,6 +7043,12 @@ TEST_F(ExecutionKernelTest,
   ASSERT_TRUE(outcome->error.has_value());
   EXPECT_EQ(outcome->error->details.at("reason"),
             "backend_stop_not_confirmed");
+  EXPECT_EQ(outcome->error->details.at("hard_stop_floor"),
+            "immediate_hard_stop");
+  EXPECT_EQ(outcome->error->details.at("hard_stop_level"),
+            "mock_hard_stop");
+  EXPECT_EQ(outcome->error->details.at("hard_stop_floor_command_source"),
+            "backend_stop");
   // An unconfirmed stop is indistinguishable from a still-moving robot,
   // so the emergency hard-stop floor MUST fire exactly once here too.
   EXPECT_EQ(controlled_execution.stop_count, 1);
@@ -6970,6 +7129,8 @@ TEST_F(ExecutionKernelTest,
   fallback_ok.stop_command_source =
       MotionInterruptStopCommandSource::kDiagnosticOther;
   fallback_ok.fallback_reason = "soft_on_path_scaffold_anchored_hold_fallback";
+  fallback_ok.confirmation_latency_ns = 2'000'000;
+  fallback_ok.diagnostics["command_source"] = "mock_fallback_source";
   controlled_execution.next_controlled_stop_result = fallback_ok;
 
   FakeClock local_clock;
@@ -6977,10 +7138,16 @@ TEST_F(ExecutionKernelTest,
   TrajectoryCache local_cache{CacheConfig{10}};
   MockCollisionWorldPublisher local_publisher;
   auto local_engine = std::make_shared<MockCollisionEngine>();
+  std::mutex events_mutex;
+  std::vector<KernelEvent> events;
   ExecutionKernel local_kernel{planner, context, controlled_execution,
                                 local_clock, local_scheduler, local_cache};
   configure_authoritative_collision_validation(local_kernel, local_publisher,
                                                 local_engine);
+  local_kernel.subscribe_events([&](const KernelEvent& e) {
+    std::lock_guard<std::mutex> lock(events_mutex);
+    events.push_back(e);
+  });
   ASSERT_TRUE(local_kernel.register_interrupt_source(
                   make_fast_probe_source("probe")).ok());
   ASSERT_TRUE(local_kernel.register_interrupt_policy(
@@ -7024,6 +7191,24 @@ TEST_F(ExecutionKernelTest,
   EXPECT_EQ(outcome->trip->diagnostics.at(
                 "fallback_qualification_evidence_status"),
             "in_tree_qualified; live_adapter_evidence_required_for_release");
+  std::lock_guard<std::mutex> lock(events_mutex);
+  auto trip_event = std::find_if(
+      events.begin(), events.end(), [](const KernelEvent& e) {
+        return e.type == KernelEventType::kMotionTripCompleted;
+      });
+  ASSERT_NE(trip_event, events.end());
+  EXPECT_EQ(trip_event->details.at("controlled_stop_success"), "true");
+  EXPECT_EQ(trip_event->details.at("phase"), "motion_trip");
+  EXPECT_EQ(trip_event->details.at("requested_stop_mode"), "soft_on_path");
+  EXPECT_EQ(trip_event->details.at("executed_stop_mode"), "spring_back_hold");
+  EXPECT_EQ(trip_event->details.at("fallback_reason"),
+            "soft_on_path_scaffold_anchored_hold_fallback");
+  EXPECT_EQ(trip_event->details.at("stop_command_source"),
+            "diagnostic_other");
+  EXPECT_EQ(trip_event->details.at("command_source"),
+            "mock_fallback_source");
+  EXPECT_EQ(trip_event->details.at("latch_id"), outcome->trip->latch_id);
+  EXPECT_EQ(trip_event->details.at("scope_id"), "scope_a");
 }
 
 TEST_F(ExecutionKernelTest,

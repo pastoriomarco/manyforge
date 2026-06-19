@@ -272,12 +272,11 @@ class CycleManager:
     See `spec/400` §6.6.2 for the canonical states and `spec/460` §6.2
     for the intervention/direct-control transitions.
 
-    Run-side auto-ack (spec/400 §6.6.2): if the kernel is in
-    `INTERVENTION_REQUIRED` and the leftover state is provably
-    execution-local (scene/program/deployment edits applied, next
-    motion can pass kernel validation), the cycle
-    manager MAY call `kernel.acknowledge_intervention(...)` on Run.
-    Otherwise Run fails closed with a structured reason.
+    Intervention recovery (M5.5): Run never silently clears
+    `INTERVENTION_REQUIRED`. The operator must explicitly choose
+    acknowledge-and-continue (no backend reset) or Reset before the cycle can
+    run again. The kernel owns the fresh stopped/readable checks for the
+    non-reset path.
 
     The CycleManager owns:
     - The OrchestratorRunner (tree builder)
@@ -1087,11 +1086,11 @@ class CycleManager:
     def _can_auto_acknowledge_leftover_state(self) -> tuple[bool, str]:
         """Check whether kernel-side leftover state is safe to clear on Run.
 
-        Per `spec/400` §6.6.2, Run-side auto-ack of `INTERVENTION_REQUIRED`
-        is permitted only when the leftover state is execution-local and
-        the next command can pass ManyForge-owned checks. External plant
-        safety (PLC, scanners, robot safety controllers) is intentionally
-        out of scope; this method only validates ManyForge-owned state.
+        M5.5 removes Run-side implicit acknowledgement of
+        `INTERVENTION_REQUIRED`: operator stop/fault interventions must be
+        cleared through an explicit recovery action. This helper remains as a
+        fail-closed diagnostic classifier for callers/tests that need a stable
+        reason before presenting the recovery choices.
 
         Returns (ok, reason). When ok is False, reason is a stable
         identifier suitable for surfacing to the operator.
@@ -1124,11 +1123,59 @@ class CycleManager:
         # Refuse if the cycle-manager-tracked intervention session is still
         # marked running: that means a direct-control lease still owns
         # blackboard scope. The operator must end the intervention session
-        # via the explicit end/promote path before Run can auto-ack.
+        # via the explicit end/promote path before any recovery action.
         if self._intervention is not None and self._intervention.status == "running":
             return False, "intervention_session_running"
 
+        if kernel_status.state == ExecutionState.INTERVENTION_REQUIRED:
+            return False, "explicit_recovery_choice_required"
+
         return True, "ok"
+
+    def acknowledge_intervention_for_retry(
+        self,
+        *,
+        principal_id: str = "operator",
+        reason: str = "operator_acknowledge_and_continue",
+    ) -> None:
+        """Explicitly clear a retryable intervention without backend reset.
+
+        This is the operator's "acknowledge error and continue" path. The
+        kernel performs the stop/fault classification and fresh stopped-state
+        checks. The cycle manager only enforces that no direct intervention
+        lease is still active and keeps the cycle STOPPED so the next Run
+        replans from the current backend pose.
+        """
+        with self._lock:
+            if self._state != CycleState.STOPPED:
+                raise RuntimeError(
+                    "Cannot acknowledge intervention for retry unless the "
+                    f"cycle is STOPPED (current state={self._state.value})"
+                )
+            if self._intervention is not None and self._intervention.status == "running":
+                raise RuntimeError(
+                    "Cannot acknowledge intervention for retry while a "
+                    "direct-control intervention session is running"
+                )
+            kernel_status = self._kernel.get_status()
+            if kernel_status.state != ExecutionState.INTERVENTION_REQUIRED:
+                raise RuntimeError(
+                    "Cannot acknowledge intervention for retry: kernel is "
+                    f"{kernel_status.state.value}, not intervention_required"
+                )
+            ack = self._kernel.acknowledge_intervention_for_retry(
+                principal_id=principal_id,
+                reason=reason,
+            )
+            if not ack.accepted:
+                raise RuntimeError(
+                    "kernel.acknowledge_intervention_for_retry rejected: "
+                    f"{ack.error}"
+                )
+            self._error = None
+            self._error_code = None
+            self._error_details = None
+            self._set_resume_after_error_flag(True)
 
     def run(self) -> None:
         """
@@ -1237,32 +1284,18 @@ class CycleManager:
                 if motion_paused_error is not None:
                     self._clear_motion_paused_blackboard()
 
-                # Run-side auto-ack of `INTERVENTION_REQUIRED`.
-                # The kernel rejects `execute()` while intervention is
-                # required, so a stopped cycle whose underlying kernel
-                # ended in intervention cannot resume without an explicit
-                # ack. spec/400 §6.6.2 permits an automatic ack only when
-                # the leftover state is execution-local and the next
-                # command can pass ManyForge-owned checks; otherwise Run
-                # MUST fail closed.
+                # M5.5: Run must not silently acknowledge
+                # `INTERVENTION_REQUIRED`. The operator must explicitly choose
+                # acknowledge-and-continue (no backend reset) or reset. That
+                # preserves the stopped pose and makes reset-to-home a visible
+                # operator choice, never a side effect of pressing Run.
                 if kernel_status.state == ExecutionState.INTERVENTION_REQUIRED:
-                    ok, reason = self._can_auto_acknowledge_leftover_state()
-                    if not ok:
-                        raise RuntimeError(
-                            "Cannot auto-acknowledge kernel "
-                            f"INTERVENTION_REQUIRED on Run: {reason}. "
-                            "Explicit operator recovery required."
-                        )
-                    ack = self._kernel.acknowledge_intervention(
-                        principal_id="cycle_manager_run",
-                        reason="run_auto_ack_local_leftover",
+                    _, recovery_reason = self._can_auto_acknowledge_leftover_state()
+                    raise RuntimeError(
+                        "Kernel INTERVENTION_REQUIRED blocks Run. Choose "
+                        "Acknowledge and continue or Reset cycle before "
+                        f"running. reason={recovery_reason}"
                     )
-                    if not ack.accepted:
-                        raise RuntimeError(
-                            "kernel.acknowledge_intervention rejected: "
-                            f"{ack.error}"
-                        )
-                    kernel_status = self._kernel.get_status()
 
                 if kernel_status.state == ExecutionState.PAUSED:
                     self._kernel.resume()

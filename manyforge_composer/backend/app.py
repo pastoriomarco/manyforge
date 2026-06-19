@@ -176,7 +176,11 @@ def create_app(
     )
 
     if enable_mcp_http:
-        app.include_router(create_mcp_router(state), prefix="/api/mcp", tags=["mcp"])
+        mcp_router = create_mcp_router(state)
+        mcp_sessions = getattr(mcp_router, "_manyforge_mcp_sessions", None)
+        if mcp_sessions is not None:
+            app.state.manyforge_mcp_sessions = mcp_sessions
+        app.include_router(mcp_router, prefix="/api/mcp", tags=["mcp"])
         logger.info("HTTP/SSE MCP transport enabled on /api/mcp")
 
     # WebSocket endpoint

@@ -193,6 +193,13 @@ def create_mcp_router(state) -> APIRouter:
             },
         )
 
+    # Private regression-test seam. Session retention must remain bounded, and
+    # relying on FastAPI endpoint closure layout makes that test environment-
+    # dependent.
+    router._manyforge_mcp_sessions = _sessions  # type: ignore[attr-defined]
+    mcp_message._manyforge_mcp_sessions = _sessions  # type: ignore[attr-defined]
+    mcp_sse._manyforge_mcp_sessions = _sessions  # type: ignore[attr-defined]
+
     return router
 
 

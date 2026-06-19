@@ -2,11 +2,13 @@ import { describe, expect, it } from 'vitest';
 
 import type { RuntimeStatus } from '../types/api';
 import {
+  buildStopExecutionWarning,
   buildStopProfileView,
   evaluateStopRunGate,
   FAULT_STOP_SLOT,
   KNOWN_STOP_MODES,
   OPERATOR_STOP_SLOT,
+  hardStopLevelLabel,
   shouldClearStopInProgress,
   shouldFreezeVelocitySlider,
 } from './stopProfile';
@@ -30,7 +32,7 @@ function makeRuntime(overrides: Partial<RuntimeStatus> = {}): RuntimeStatus {
     configuredStopModes: { [OPERATOR_STOP_SLOT]: 'soft_on_path', [FAULT_STOP_SLOT]: 'spring_back_hold' },
     configuredStopDecelerationTimes: { [OPERATOR_STOP_SLOT]: 2.0, [FAULT_STOP_SLOT]: 1.25 },
     stopCapabilityProfileId: 'ros2_control_v1',
-    hardStopLevel: 'immediate',
+    hardStopLevel: 'jtc_cancel_unprofiled_hold',
     derivativeProofLevel: 'none',
     scalingSourceVisibility: 'observed',
     scalingSourceProbeStatus: 'ok',
@@ -82,6 +84,19 @@ describe('buildStopProfileView', () => {
     expect(hard?.supported).toBe(false);
     expect(hard?.disabled).toBe(true);
     expect(hard?.reason).toBe('decelerate_on_cancel_evidence_incomplete');
+  });
+
+  it('makes hard_deceleration selectable when advertised by the backend', () => {
+    const view = buildStopProfileView(
+      makeRuntime({
+        supportedStopModes: ['soft_on_path', 'spring_back_hold', 'hard_deceleration'],
+        hardStopLevel: 'hard_deceleration',
+      }),
+    );
+    const hard = view.options.find((o) => o.mode === 'hard_deceleration');
+    expect(hard?.supported).toBe(true);
+    expect(hard?.disabled).toBe(false);
+    expect(hard?.reason).toBeNull();
   });
 
   it('falls back to the structured stopProfileUnsupportedReasons entry when no per-mode reason exists', () => {
@@ -247,6 +262,86 @@ describe('evaluateStopRunGate', () => {
     expect(gate.reason).toBe('Run blocked: a configured stop profile is not supported by the backend.');
     expect(gate.reason).not.toMatch(/\(configured\)/);
   });
+
+  it('explains when a required operator or fault stop profile is missing', () => {
+    const gate = evaluateStopRunGate(
+      makeRuntime({
+        configuredStopModes: { [OPERATOR_STOP_SLOT]: 'soft_on_path' },
+        stopProfileUnsupported: true,
+        stopProfileUnsupportedReasons: [
+          { profile: FAULT_STOP_SLOT, stop_mode: '', reason: 'stop_profile_required' },
+        ],
+      }),
+    );
+    expect(gate.blocked).toBe(true);
+    expect(gate.severity).toBe('degraded');
+    expect(gate.reason).toBe(
+      'Run blocked: executable deployments must configure both operator and fault stop profiles.',
+    );
+  });
+
+  it('explains when the mandatory hard-stop floor is unavailable', () => {
+    const gate = evaluateStopRunGate(
+      makeRuntime({
+        hardStopLevel: 'unavailable',
+        stopProfileUnsupported: true,
+        stopProfileUnsupportedReasons: [
+          { profile: 'hard_stop_floor', stop_mode: 'unavailable', reason: 'hard_stop_floor_unavailable' },
+        ],
+      }),
+    );
+    expect(gate.blocked).toBe(true);
+    expect(gate.severity).toBe('degraded');
+    expect(gate.reason).toBe(
+      'Run blocked: the execution backend did not report a valid hard-stop floor.',
+    );
+  });
+});
+
+describe('buildStopExecutionWarning', () => {
+  it('returns null when the stop executed as requested', () => {
+    expect(buildStopExecutionWarning({
+      requested_stop_mode: 'soft_on_path',
+      executed_stop_mode: 'soft_on_path',
+    })).toBeNull();
+  });
+
+  it('warns when the backend executed a fallback stop mode', () => {
+    expect(buildStopExecutionWarning({
+      requested_stop_mode: 'soft_on_path',
+      executed_stop_mode: 'spring_back_hold',
+      fallback_reason: 'soft_on_path_planner_rejected',
+    })).toBe(
+      'Controlled stop used Spring-back hold instead of Soft on-path — soft_on_path_planner_rejected.',
+    );
+  });
+
+  it('warns when a controlled stop transitioned to hard stop', () => {
+    expect(buildStopExecutionWarning({
+      hard_stop_transitioned: 'true',
+      reason: 'stop_path_collision',
+    })).toBe('Controlled stop escalated to hard stop — stop_path_collision.');
+  });
+
+  it('includes the hard-stop floor when reported', () => {
+    expect(buildStopExecutionWarning({
+      hard_stop_transitioned: 'true',
+      hard_stop_level: 'jtc_cancel_unprofiled_hold',
+      reason: 'backend_stop_not_confirmed',
+    })).toBe(
+      'Controlled stop escalated to hard stop ' +
+      '(Immediate cancel/hold (unprofiled JTC floor)) — backend_stop_not_confirmed.',
+    );
+  });
+});
+
+describe('hardStopLevelLabel', () => {
+  it('labels the profiled and immediate hard-stop levels', () => {
+    expect(hardStopLevelLabel('hard_deceleration')).toContain('Profiled');
+    expect(hardStopLevelLabel('jtc_cancel_unprofiled_hold')).toContain('Immediate cancel/hold');
+    expect(hardStopLevelLabel('native_immediate_hold')).toBe('Immediate native hold');
+    expect(hardStopLevelLabel(null)).toBe('Not reported');
+  });
 });
 
 describe('shouldClearStopInProgress', () => {
@@ -268,9 +363,9 @@ describe('shouldFreezeVelocitySlider', () => {
     expect(shouldFreezeVelocitySlider('direct_control', true)).toBe(true);
   });
 
-  it('freezes while stopping and for the whole stopped hold', () => {
+  it('freezes while stopping but releases after the cycle is stopped', () => {
     expect(shouldFreezeVelocitySlider('stopping', false)).toBe(true);
-    expect(shouldFreezeVelocitySlider('stopped', false)).toBe(true);
+    expect(shouldFreezeVelocitySlider('stopped', false)).toBe(false);
   });
 
   it('keeps the slider live while running, jogging, or idle', () => {

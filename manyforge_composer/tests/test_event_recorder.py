@@ -336,6 +336,12 @@ class TestJSONLSink:
         assert exported["run_id"] == run_id
         assert exported["program_run_id"] == run_id
         assert exported["records"]
+        # The Composer event stream now has internal diagnostic channels, but
+        # ros2_medkit gets the stable v1 normalized record schema. Keep channel
+        # routing out of the medkit contract unless that schema is versioned.
+        first_record = exported["records"][0]
+        assert "channel" not in first_record
+        assert "channel" not in first_record["attributes"]
 
     def test_failure_archive_written_for_execution_failure(self, tmp_path):
         rec = EventRecorder(observe_min_interval_s=0.0, trace_dir=tmp_path)
@@ -511,6 +517,90 @@ class TestJSONLSink:
             "collision_result_first_failure_pair"
         ] == details["collision_result_first_failure_pair"]
 
+    def test_native_controlled_stop_success_records_single_summary(self):
+        rec = EventRecorder(observe_min_interval_s=0.0)
+        native_events = [
+            {
+                "event_index": 20,
+                "type": "stop_issued",
+                "timestamp_ns": 120,
+                "execution_id": 9,
+                "details": {
+                    "controlled_stop_success": "true",
+                    "phase": "operator_stop",
+                    "requested_stop_mode": "soft_on_path",
+                    "executed_stop_mode": "soft_on_path",
+                    "stop_command_source": "fjt_preempt_path_ramp",
+                    "deceleration_time_s": "1.000000",
+                    "confirmation_latency_ns": "910000000",
+                    "hard_stop_floor": "hard_deceleration",
+                },
+            },
+            {
+                "event_index": 21,
+                "type": "state_transition",
+                "timestamp_ns": 121,
+                "execution_id": 9,
+                "details": {
+                    "from": "stopping",
+                    "to": "stopped",
+                },
+            },
+        ]
+
+        rec.record_native_kernel_events(native_events)
+
+        events = _memory_events(rec)
+        assert len(events) == 1
+        assert events[0]["type"] == "controlled_stop_completed"
+        assert events[0]["execution_id"] == 9
+        assert events[0]["channel"] == "controlled_stop"
+        details = events[0]["details"]
+        assert details["requested_stop_mode"] == "soft_on_path"
+        assert details["executed_stop_mode"] == "soft_on_path"
+        assert details["stop_command_source"] == "fjt_preempt_path_ramp"
+        assert details["native_kernel_event_type"] == "stop_issued"
+        assert details["native_kernel_event_index"] == 20
+
+    def test_native_hard_deceleration_success_keeps_settle_evidence(self):
+        rec = EventRecorder(observe_min_interval_s=0.0)
+        rec.record_native_kernel_events(
+            [
+                {
+                    "event_index": 30,
+                    "type": "stop_issued",
+                    "timestamp_ns": 220,
+                    "execution_id": 12,
+                    "details": {
+                        "controlled_stop_success": "true",
+                        "phase": "operator_stop",
+                        "requested_stop_mode": "hard_deceleration",
+                        "executed_stop_mode": "hard_deceleration",
+                        "stop_command_source": "jtc_cancel_decelerate_on_cancel",
+                        "confirmation_latency_ns": "850000000",
+                        "controller_cancel_confirmation_latency_ns": "31000000",
+                        "post_stop_sample_source": "controller_state",
+                        "post_stop_velocity_available": "true",
+                        "post_stop_at_rest": "true",
+                        "post_stop_max_abs_velocity_rad_s": "0.002",
+                        "settle_velocity_threshold_rad_s": "0.01",
+                        "post_stop_settle_wait_ns": "819000000",
+                    },
+                }
+            ]
+        )
+
+        events = _memory_events(rec)
+        assert len(events) == 1
+        assert events[0]["type"] == "controlled_stop_completed"
+        assert events[0]["channel"] == "controlled_stop"
+        details = events[0]["details"]
+        assert details["executed_stop_mode"] == "hard_deceleration"
+        assert details["post_stop_sample_source"] == "controller_state"
+        assert details["post_stop_at_rest"] == "true"
+        assert details["controller_cancel_confirmation_latency_ns"] == "31000000"
+        assert details["confirmation_latency_ns"] == "850000000"
+
     def test_native_resume_replan_lifecycle_is_recorded(self):
         rec = EventRecorder(observe_min_interval_s=0.0)
         native_events = [
@@ -596,6 +686,15 @@ class TestJSONLSink:
                     "execution_id": 1,
                     "details": {
                         "reason": "normal_execute",
+                    },
+                },
+                {
+                    "event_index": 3,
+                    "type": "stop_issued",
+                    "timestamp_ns": 102,
+                    "execution_id": 1,
+                    "details": {
+                        "reason": "legacy_stop_without_controlled_summary",
                     },
                 },
             ]
@@ -755,6 +854,67 @@ class TestInterventionProjection:
         assert matching[0]["session_kind"] == "delegated_recovery"
         assert matching[0]["authority_source"] == "program_node"
         assert matching[0]["trigger_node_instance"] == "move_to_pick"
+
+
+class TestEventChannelsAndIncidents:
+    """Protected channel retention and incident snapshots."""
+
+    def test_pose_source_spam_does_not_evict_fault_channel(self):
+        rec = EventRecorder(max_events=5, observe_min_interval_s=0.0)
+        rec._record_event(
+            event_type="kernel_error",
+            details={
+                "error": "Timed out waiting for FollowJointTrajectory cancel confirmation",
+                "reason_code": "controller_cancel_timeout",
+            },
+        )
+        for index in range(20):
+            rec.record_pose_source_event(
+                "applied",
+                details={"object_id": f"obj-{index}", "status": "applied"},
+            )
+
+        all_recent = rec.history()["events"]
+        assert all(event["type"] != "kernel_error" for event in all_recent)
+
+        channels = rec.channel_histories()
+        fault_events = channels["fault_safety_stop"]
+        assert [event["type"] for event in fault_events] == ["kernel_error"]
+        assert fault_events[0]["details"]["reason_code"] == "controller_cancel_timeout"
+
+    def test_incident_snapshot_freezes_all_events_and_channels(self):
+        rec = EventRecorder(observe_min_interval_s=0.0)
+        rec.record_pose_source_event(
+            "applied",
+            details={"object_id": "box", "status": "applied"},
+        )
+        rec._record_event(
+            event_type="error_raised",
+            details={
+                "error": "Backend stop failed",
+                "requested_stop_mode": "spring_back_hold",
+                "reason_code": "controller_cancel_timeout",
+            },
+        )
+
+        snapshots = rec.incident_snapshots()
+        assert len(snapshots) == 1
+        snapshot = snapshots[0]
+        assert snapshot["triggerType"] == "error_raised"
+        assert snapshot["triggerChannel"] == "fault_safety_stop"
+        assert [event["type"] for event in snapshot["allEvents"]] == [
+            "pose_source_applied",
+            "error_raised",
+        ]
+        assert (
+            snapshot["eventsByChannel"]["fault_safety_stop"][0]["type"]
+            == "error_raised"
+        )
+        assert (
+            snapshot["eventsByChannel"]["pose_source"][0]["type"]
+            == "pose_source_applied"
+        )
+
 
 class TestGetEventsSince:
     """Incremental event polling."""

@@ -201,12 +201,21 @@ class ExecutionKernel {
   ///
   /// Valid only from `kInterventionRequired`. Emits a traceable
   /// `kInterventionAcknowledged` event with the supplied `principal_id` and
-  /// `reason`. The caller (cycle manager Run-side auto-ack, MCP, operator UI)
-  /// holds the policy decision about whether the leftover state is safe to
-  /// clear; the kernel only enforces fail-closed semantics: `execute()`
-  /// rejects with `kErrorInvalidRequest` while `kInterventionRequired`,
-  /// requiring an explicit ack first. See `spec/200` and ADR-0005.
+  /// `reason`. This is the reset/resync recovery path. `execute()` rejects
+  /// with `kErrorInvalidRequest` while `kInterventionRequired`, requiring an
+  /// explicit recovery action first. See `spec/200` and ADR-0005.
   AcknowledgeInterventionResultDTO acknowledge_intervention(
+      std::string principal_id, std::string reason);
+
+  /// Acknowledge a stop/fault intervention for retry without backend reset.
+  ///
+  /// Valid only from `kInterventionRequired` when the latched error is a
+  /// classified stop/fault intervention and fresh backend state proves the
+  /// robot is readable and stopped when measured velocity evidence exists.
+  /// Unlike `acknowledge_intervention`, this path MUST NOT call
+  /// `execution_backend.reset()`: it preserves the current robot pose so the
+  /// next execute replans from where the robot actually stopped.
+  AcknowledgeInterventionResultDTO acknowledge_intervention_for_retry(
       std::string principal_id, std::string reason);
 
   /// Acknowledge a kernel-owned runtime collision interrupt for retry.

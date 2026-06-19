@@ -57,6 +57,16 @@ def stop_all_visual_state_publishers(*, timeout_s: float = 0.5) -> None:
 atexit.register(stop_all_visual_state_publishers)
 
 
+def _format_stop_capability_issue(issue: dict) -> str:
+    profile = issue.get("profile") or "unknown_profile"
+    mode = issue.get("stop_mode")
+    mode_text = mode if isinstance(mode, str) and mode else "missing"
+    reason = issue.get("reason")
+    if isinstance(reason, str) and reason:
+        return f"{profile}={mode_text} ({reason})"
+    return f"{profile}={mode_text}"
+
+
 def _normalize_scene_snapshot_base_url(value: str, *, field_name: str) -> str:
     candidate = value.strip().rstrip("/")
     if not candidate:
@@ -2538,9 +2548,7 @@ class ComposerState:
         unsupported = stop_cap.get("unsupported") or []
         if not unsupported:
             return None
-        desc = ", ".join(
-            f"{u.get('profile')}={u.get('stop_mode')}" for u in unsupported
-        )
+        desc = ", ".join(_format_stop_capability_issue(u) for u in unsupported)
         if stop_cap.get("capability_query_failed"):
             return {
                 "message": (
@@ -2549,6 +2557,25 @@ class ComposerState:
                     "cannot be verified. Reload once the backend is healthy."
                 ),
                 "error_code": "stop_capability_query_failed",
+            }
+        reasons = {u.get("reason") for u in unsupported}
+        if "stop_profile_required" in reasons:
+            return {
+                "message": (
+                    "Execution blocked: executable deployments must configure both "
+                    "operator and fault controlled-stop profiles. Configure a real "
+                    f"stop profile for: {desc}."
+                ),
+                "error_code": "stop_profile_required",
+            }
+        if "hard_stop_floor_unavailable" in reasons:
+            return {
+                "message": (
+                    "Execution blocked: the execution backend did not report a valid "
+                    "hard-stop floor. Controlled stops need a mandatory hard-stop "
+                    f"floor for refused, timed-out, or unconfirmed stops ({desc})."
+                ),
+                "error_code": "hard_stop_floor_unavailable",
             }
         advertised = ", ".join(stop_cap.get("supported_stop_modes") or []) or "none"
         return {
@@ -2598,6 +2625,8 @@ class ComposerState:
             "evaluation_reason": reason,
         }
         deployment = self.deployment
+        required_slots = ("operator_stop_profile", "default_fault_stop_profile")
+        execution_config_present = False
         # Read the configured stop profiles FIRST, independently of the backend
         # query, so that even if the query fails we still know whether the
         # deployment declared profiles that must be verified (fail-closed).
@@ -2606,7 +2635,8 @@ class ComposerState:
         if deployment is not None:
             execution = deployment.adapters.get("execution")
             cfg = getattr(execution, "config", None) or {}
-            for slot in ("operator_stop_profile", "default_fault_stop_profile"):
+            execution_config_present = execution is not None
+            for slot in required_slots:
                 profile = cfg.get(slot)
                 if isinstance(profile, dict) and profile.get("stop_mode"):
                     configured[slot] = profile["stop_mode"]
@@ -2673,6 +2703,24 @@ class ComposerState:
         status["scaling_source_probe_status"] = cap.get("scaling_source_probe_status")
         if isinstance(cap.get("unsupported_reasons"), dict):
             status["unsupported_reasons"] = dict(cap["unsupported_reasons"])
+        if execution_config_present:
+            for slot in required_slots:
+                if slot not in configured:
+                    status["unsupported"].append(
+                        {"profile": slot, "stop_mode": "",
+                         "reason": "stop_profile_required"}
+                    )
+        hard_stop_level = status["hard_stop_level"]
+        hard_stop_level_text = hard_stop_level if isinstance(hard_stop_level, str) else ""
+        if execution_config_present and (
+            not hard_stop_level_text.strip()
+            or hard_stop_level_text == "unavailable"
+        ):
+            status["unsupported"].append(
+                {"profile": "hard_stop_floor",
+                 "stop_mode": hard_stop_level_text or "",
+                 "reason": "hard_stop_floor_unavailable"}
+            )
         for slot, mode in configured.items():
             if mode not in supported:
                 backend_reason = status["unsupported_reasons"].get(mode)

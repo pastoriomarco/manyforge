@@ -1494,12 +1494,10 @@ TEST_F(NativeKernelTest,
 
 TEST_F(NativeKernelTest,
        NativeBackend_ControlledStop_SpringBackHoldPreemptsActiveExecution) {
-  // Spec/260 §5.6 spring_back_hold semantics: preempt the active
-  // trajectory, leave the worker at its observed joint position,
-  // confirm the stop. The post-stop snapshot's joint vector MUST
-  // anchor to a point along the trajectory (not at the endpoint,
-  // since the worker was preempted mid-flight) and MUST be reported
-  // with kStopped state and kNativeSimulatedStop command source.
+  // spring_back_hold is now a two-phase on-path replacement: forward decel,
+  // then return along the accepted path to the trip cursor. It must not silently
+  // complete the original trajectory, and it must not use the old native
+  // stop-and-hold shortcut.
   auto start_state = bundle_->context->get_current_state();
   ASSERT_FALSE(start_state.positions_rad.empty());
 
@@ -1523,7 +1521,11 @@ TEST_F(NativeKernelTest,
   MotionInterruptStopProfileDTO profile;
   profile.profile_id = "test_spring_back";
   profile.stop_mode = MotionInterruptStopMode::kSpringBackHold;
-  profile.max_stop_time_s = 1.0;  // generous; well above the worker tick
+  profile.deceleration_time_s = 0.5;
+  profile.max_stop_time_s = 1.5;
+  for (const auto& joint_name : traj.joint_names) {
+    profile.per_joint_max_deceleration_rad_s2[joint_name] = 100.0;
+  }
 
   const auto call_start = bundle_->clock->now();
   auto result = bundle_->execution->execute_controlled_stop(profile);
@@ -1533,7 +1535,8 @@ TEST_F(NativeKernelTest,
   EXPECT_EQ(result.executed_stop_mode,
             MotionInterruptStopMode::kSpringBackHold);
   EXPECT_EQ(result.stop_command_source,
-            MotionInterruptStopCommandSource::kNativeSimulatedStop);
+            MotionInterruptStopCommandSource::kNativeSimulatedPathRamp);
+  EXPECT_EQ(result.diagnostics["spring_back_mode"], "on_path_two_phase");
   EXPECT_GE(result.confirmation_latency_ns, 0);
   EXPECT_LE(result.confirmation_latency_ns,
             std::int64_t{call_end - call_start});
@@ -1542,32 +1545,96 @@ TEST_F(NativeKernelTest,
   // exited under stop_token).
   ASSERT_TRUE(handle.wait_for_completion(2'000'000'000LL));
 
-  // Post-stop snapshot reflects the anchored (preempted) position.
+  // Post-stop snapshot reflects the returned trip point, not the planned
+  // endpoint. It should also have advanced from the trajectory start because
+  // the worker had time to move before the stop was requested.
   auto stopped = bundle_->execution->get_execution_snapshot();
   EXPECT_EQ(stopped.state, ExecutionState::kStopped);
   ASSERT_EQ(stopped.joint_positions_rad.size(),
             start_state.positions_rad.size());
-  // Anchor MUST be different from the planned endpoint (worker was
-  // preempted) and SHOULD be advanced past the start position
-  // (worker had ~150 ms of forward motion).
   EXPECT_NE(stopped.joint_positions_rad[0], goal[0])
       << "spring_back_hold MUST NOT silently complete the trajectory";
   EXPECT_NE(stopped.joint_positions_rad[0], start_state.positions_rad[0])
-      << "spring_back_hold MUST anchor at observed (mid-flight) state";
+      << "spring_back_hold MUST return to the trip cursor, not reset to start";
+}
+
+TEST_F(NativeKernelTest,
+       NativeBackend_ControlledStop_SpringBackHoldPublishesReplaySnapshots) {
+  // The native viewer consumes the backend/kernel execution snapshot stream.
+  // spring_back_hold must therefore publish the authored two-phase replacement
+  // while it runs, not only the terminal returned trip point.
+  auto start_state = bundle_->context->get_current_state();
+  ASSERT_FALSE(start_state.positions_rad.empty());
+
+  std::vector<double> goal = start_state.positions_rad;
+  goal[0] += 0.7;
+  if (goal.size() > 1) {
+    goal[1] -= 0.3;
+  }
+
+  TrajectoryDTO traj;
+  traj.joint_names = start_state.joint_names;
+  traj.waypoints.push_back(
+      TrajectoryWaypointDTO{0.0, start_state.positions_rad, {}, {}});
+  traj.waypoints.push_back(TrajectoryWaypointDTO{3.0, goal, {}, {}});
+
+  auto handle = bundle_->execution->execute_trajectory(traj);
+  std::this_thread::sleep_for(std::chrono::milliseconds(250));
+
+  MotionInterruptStopProfileDTO profile;
+  profile.profile_id = "test_spring_back_snapshot_stream";
+  profile.stop_mode = MotionInterruptStopMode::kSpringBackHold;
+  profile.deceleration_time_s = 1.0;
+  profile.max_stop_time_s = 2.0;
+  for (const auto& joint_name : traj.joint_names) {
+    profile.per_joint_max_deceleration_rad_s2[joint_name] = 100.0;
+  }
+
+  auto stop_future = std::async(std::launch::async, [&]() {
+    return bundle_->execution->execute_controlled_stop(profile);
+  });
+
+  bool observed_stopping = false;
+  double min_j0 = std::numeric_limits<double>::infinity();
+  double max_j0 = -std::numeric_limits<double>::infinity();
+  std::uint64_t min_sequence = std::numeric_limits<std::uint64_t>::max();
+  std::uint64_t max_sequence = 0;
+  const auto sample_deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(900);
+  while (std::chrono::steady_clock::now() < sample_deadline) {
+    auto snapshot = bundle_->execution->get_execution_snapshot();
+    if (snapshot.state == ExecutionState::kStopping &&
+        !snapshot.joint_positions_rad.empty()) {
+      observed_stopping = true;
+      min_j0 = std::min(min_j0, snapshot.joint_positions_rad[0]);
+      max_j0 = std::max(max_j0, snapshot.joint_positions_rad[0]);
+      min_sequence = std::min(min_sequence, snapshot.sequence_number);
+      max_sequence = std::max(max_sequence, snapshot.sequence_number);
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
+
+  auto result = stop_future.get();
+  EXPECT_TRUE(result.accepted);
+  EXPECT_TRUE(result.backend_stop_confirmed);
+  EXPECT_EQ(result.executed_stop_mode,
+            MotionInterruptStopMode::kSpringBackHold);
+  EXPECT_TRUE(observed_stopping)
+      << "spring_back_hold must expose an in-progress Stopping snapshot";
+  EXPECT_GT(max_sequence, min_sequence)
+      << "spring_back_hold must publish multiple replay snapshots";
+  EXPECT_GT(max_j0 - min_j0, 1e-4)
+      << "spring_back_hold replay snapshots must move through the path ramp";
+
+  ASSERT_TRUE(handle.wait_for_completion(2'000'000'000LL));
 }
 
 TEST_F(NativeKernelTest,
        NativeBackend_ControlledStop_SpringBackHoldZeroVelocityTermination) {
-  // spring_back_hold parity: the native backend MUST end a
-  // spring_back stop in a STABLE ZERO-VELOCITY HOLD at the observed anchor —
-  // the same terminus the JTC backend reaches via its anchored hold goal
-  // (send_fjt_anchored_goal: target = observed position, zero terminal
-  // velocity over deceleration_time_s). Parity is the zero-velocity held
-  // terminus, not an identical decel ramp: the native simulator is kinematic
-  // and freezes at the observed sample, while JTC lets controller dynamics
-  // settle to the same rest state. This test pins the property that matters
-  // for safety — after the stop the arm carries no residual velocity (no
-  // coasting toward the goal, no overshoot) and the held anchor is stable.
+  // spring_back_hold parity: the native backend MUST end the two-phase
+  // spring-back replay in a stable stopped state. The native simulator is
+  // kinematic, so the safety property we pin here is no residual motion after
+  // the returned trip cursor is published.
   auto start_state = bundle_->context->get_current_state();
   ASSERT_FALSE(start_state.positions_rad.empty());
 
@@ -1589,8 +1656,11 @@ TEST_F(NativeKernelTest,
   MotionInterruptStopProfileDTO profile;
   profile.profile_id = "native_spring_back_zero_velocity";
   profile.stop_mode = MotionInterruptStopMode::kSpringBackHold;
-  profile.deceleration_time_s = 0.2;
-  profile.max_stop_time_s = 1.0;
+  profile.deceleration_time_s = 0.5;
+  profile.max_stop_time_s = 1.5;
+  for (const auto& joint_name : traj.joint_names) {
+    profile.per_joint_max_deceleration_rad_s2[joint_name] = 100.0;
+  }
 
   auto result = bundle_->execution->execute_controlled_stop(profile);
   ASSERT_TRUE(result.accepted);
@@ -1604,7 +1674,7 @@ TEST_F(NativeKernelTest,
   auto held = bundle_->execution->get_execution_snapshot();
   EXPECT_EQ(held.state, ExecutionState::kStopped);
   ASSERT_EQ(held.joint_positions_rad.size(), start_state.positions_rad.size());
-  // Anchored mid-flight: did not silently complete the trajectory.
+  // Returned to the trip area: did not silently complete the trajectory.
   EXPECT_NE(held.joint_positions_rad[0], goal[0])
       << "spring_back_hold must not complete the trajectory";
 
@@ -1998,9 +2068,9 @@ TEST_F(NativeKernelTest,
   // Build the request: a long(ish) joint goal so the worker is
   // mid-flight when we publish the trip.
   std::vector<double> goal = start_state.positions_rad;
-  goal[0] += 0.4;
+  goal[0] += 1.0;
   if (goal.size() > 1) {
-    goal[1] -= 0.3;
+    goal[1] -= 0.6;
   }
 
   MotionInterruptScopeDTO scope;
@@ -2010,7 +2080,15 @@ TEST_F(NativeKernelTest,
   MotionInterruptStopProfileDTO profile;
   profile.profile_id = "spring_back_v1";
   profile.stop_mode = MotionInterruptStopMode::kSpringBackHold;
-  profile.max_stop_time_s = 1.0;
+  // Keep this scoped-trip fixture out of the short-path refusal branch: the
+  // trajectory is deliberately long enough for the two-phase spring-back ramp
+  // to fit before the accepted endpoint, so this test exercises the successful
+  // signal-trip outcome rather than planner-limit rejection.
+  profile.deceleration_time_s = 0.5;
+  profile.max_stop_time_s = 1.5;
+  for (const auto& joint_name : start_state.joint_names) {
+    profile.per_joint_max_deceleration_rad_s2[joint_name] = 100.0;
+  }
   scope.stop_profile = profile;
 
   ExecuteRequestDTO req;
@@ -2042,7 +2120,7 @@ TEST_F(NativeKernelTest,
   }
   ASSERT_EQ(bundle_->kernel->get_status().state, ExecutionState::kExecuting);
 
-  // Let the worker advance so the anchored stop point is not at the
+  // Let the worker advance so the spring-back trip point is not at the
   // trajectory's start position.
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
@@ -2067,7 +2145,7 @@ TEST_F(NativeKernelTest,
   EXPECT_EQ(outcome->trip->executed_stop_mode,
             MotionInterruptStopMode::kSpringBackHold);
   EXPECT_EQ(outcome->trip->stop_command_source,
-            MotionInterruptStopCommandSource::kNativeSimulatedStop);
+            MotionInterruptStopCommandSource::kNativeSimulatedPathRamp);
   EXPECT_TRUE(outcome->trip->stop_snapshot.backend_stop_confirmed);
   EXPECT_EQ(outcome->trip->stop_snapshot.source,
             ExecutionStopSnapshotSource::kExecutionBackendFeedback);
@@ -2081,10 +2159,9 @@ TEST_F(NativeKernelTest,
 
 TEST_F(NativeKernelTest,
        NativeBackend_ControlledStop_RespectsMaxStopTimeBudget) {
-  // The backend's own internal wait honors profile.max_stop_time_s.
-  // A short profile budget MUST be observed by the controlled-stop
-  // path. (The kernel still enforces its own deadline on top of
-  // this; this test isolates the backend wait.)
+  // spring_back_hold is now a timed two-phase path ramp. The backend should
+  // spend approximately the requested stop time replaying it, and still remain
+  // bounded by the profile stop deadline.
   auto start_state = bundle_->context->get_current_state();
   ASSERT_FALSE(start_state.positions_rad.empty());
 
@@ -2103,7 +2180,11 @@ TEST_F(NativeKernelTest,
   MotionInterruptStopProfileDTO profile;
   profile.profile_id = "test_budget";
   profile.stop_mode = MotionInterruptStopMode::kSpringBackHold;
-  profile.max_stop_time_s = 0.5;  // 500 ms budget
+  profile.deceleration_time_s = 0.5;
+  profile.max_stop_time_s = 1.5;
+  for (const auto& joint_name : traj.joint_names) {
+    profile.per_joint_max_deceleration_rad_s2[joint_name] = 100.0;
+  }
 
   const auto call_start = bundle_->clock->now();
   auto result = bundle_->execution->execute_controlled_stop(profile);
@@ -2111,12 +2192,132 @@ TEST_F(NativeKernelTest,
   const auto elapsed_ns = call_end - call_start;
   EXPECT_TRUE(result.accepted);
   EXPECT_TRUE(result.backend_stop_confirmed);
-  // The worker should exit promptly (the tick is 10 ms). Latency
-  // recorded by the backend must not exceed the elapsed time.
+  // The worker yields promptly, then the backend replays the two-phase
+  // replacement over the requested stop time. Latency recorded by the backend
+  // must not exceed the elapsed time.
   EXPECT_LE(result.confirmation_latency_ns, elapsed_ns);
-  EXPECT_LT(elapsed_ns, std::int64_t{500'000'000})
-      << "spring_back_hold MUST exit well before max_stop_time_s under "
-      << "nominal conditions";
+  EXPECT_GE(elapsed_ns, std::int64_t{400'000'000})
+      << "spring_back_hold should visibly execute the requested path ramp";
+  EXPECT_LT(elapsed_ns, std::int64_t{1'500'000'000})
+      << "spring_back_hold MUST remain inside max_stop_time_s under nominal "
+      << "conditions";
 
   ASSERT_TRUE(handle.wait_for_completion(2'000'000'000LL));
+}
+
+TEST_F(NativeKernelTest,
+       NativeKernel_OperatorSpringBackStopRemainsStoppingForPathRamp) {
+  ExecutionKernelConfig kernel_config;
+  MotionInterruptStopProfileDTO profile;
+  profile.profile_id = "operator_spring_back_hold";
+  profile.stop_mode = MotionInterruptStopMode::kSpringBackHold;
+  profile.deceleration_time_s = 0.5;
+  profile.max_stop_time_s = 1.5;
+  auto start_state = bundle_->context->get_current_state();
+  ASSERT_FALSE(start_state.joint_names.empty());
+  for (const auto& joint_name : start_state.joint_names) {
+    profile.per_joint_max_deceleration_rad_s2[joint_name] = 100.0;
+  }
+  kernel_config.operator_stop_profile =
+      std::make_shared<MotionInterruptStopProfileDTO>(profile);
+
+  auto local_bundle = create_native_kernel("ur5_gripper", "arm", kernel_config);
+  ASSERT_NE(local_bundle, nullptr);
+  auto local_start = local_bundle->context->get_current_state();
+  ASSERT_FALSE(local_start.positions_rad.empty());
+
+  std::vector<double> goal = local_start.positions_rad;
+  goal[0] += 0.8;
+  if (goal.size() > 1) {
+    goal[1] -= 0.4;
+  }
+
+  ExecuteRequestDTO req;
+  req.robot_id = "robot1";
+  req.group_id = "arm";
+  req.move_id = "operator_spring_back_e2e";
+  req.base_frame = "base_link";
+  req.tcp_frame = "tool0";
+  req.tolerances = {0.05, 0.005, 0.05};
+  // Keep the source trajectory comfortably longer than the fixed stop
+  // observation window. This test is about native spring-back replay staying
+  // observable in kStopping; if the nominal move completes before stop captures
+  // the active trajectory, the kernel correctly reports kCompleted instead.
+  req.speed_profile = {0.2, 0.2, std::nullopt};
+  req.timeouts = {10.0, 30.0};
+  req.cache_mode = CacheMode::kDefault;
+  JointGoalDTO jg;
+  jg.joint_names = local_start.joint_names;
+  jg.positions_rad = goal;
+  req.motion = jg;
+
+  auto exec_result = local_bundle->kernel->execute(req);
+  ASSERT_TRUE(exec_result.ok())
+      << "execute failed: " << exec_result.error().message;
+  for (int attempt = 0; attempt < 200; ++attempt) {
+    if (local_bundle->kernel->get_status().state == ExecutionState::kExecuting) {
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  ASSERT_EQ(local_bundle->kernel->get_status().state, ExecutionState::kExecuting);
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+  const auto stop_start = std::chrono::steady_clock::now();
+  auto stop = local_bundle->kernel->stop();
+  ASSERT_TRUE(stop.accepted);
+
+  // stop() returns after accepting operator intent, but the native backend
+  // should still be replaying the spring-back replacement rather than
+  // immediately collapsing to Stopped.
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  EXPECT_EQ(local_bundle->kernel->get_status().state, ExecutionState::kStopping);
+
+  bool observed_stopping_snapshot = false;
+  double min_j0 = std::numeric_limits<double>::infinity();
+  double max_j0 = -std::numeric_limits<double>::infinity();
+  std::uint64_t min_sequence = std::numeric_limits<std::uint64_t>::max();
+  std::uint64_t max_sequence = 0;
+  const auto sample_deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(900);
+  while (std::chrono::steady_clock::now() < sample_deadline) {
+    auto snapshot = local_bundle->kernel->get_execution_snapshot();
+    if (snapshot.state == ExecutionState::kStopping &&
+        !snapshot.joint_positions_rad.empty()) {
+      observed_stopping_snapshot = true;
+      min_j0 = std::min(min_j0, snapshot.joint_positions_rad[0]);
+      max_j0 = std::max(max_j0, snapshot.joint_positions_rad[0]);
+      min_sequence = std::min(min_sequence, snapshot.sequence_number);
+      max_sequence = std::max(max_sequence, snapshot.sequence_number);
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
+  EXPECT_TRUE(observed_stopping_snapshot)
+      << "operator spring_back_hold must expose live Stopping snapshots";
+  EXPECT_GT(max_sequence, min_sequence)
+      << "operator spring_back_hold must publish multiple replay snapshots";
+  EXPECT_GT(max_j0 - min_j0, 1e-4)
+      << "operator spring_back_hold replay snapshots must move through the path ramp";
+
+  for (int attempt = 0; attempt < 200; ++attempt) {
+    const auto state = local_bundle->kernel->get_status().state;
+    if (state == ExecutionState::kStopped ||
+        state == ExecutionState::kCompleted ||
+        state == ExecutionState::kInterventionRequired ||
+        state == ExecutionState::kFailed) {
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  const auto stop_elapsed = std::chrono::steady_clock::now() - stop_start;
+  EXPECT_EQ(local_bundle->kernel->get_status().state, ExecutionState::kStopped);
+  EXPECT_GE(std::chrono::duration_cast<std::chrono::milliseconds>(
+                stop_elapsed).count(),
+            400)
+      << "operator spring_back_hold should visibly execute the requested path ramp";
+
+  auto final_snapshot = local_bundle->kernel->get_execution_snapshot();
+  ASSERT_FALSE(final_snapshot.joint_positions_rad.empty());
+  EXPECT_NE(final_snapshot.joint_positions_rad[0], goal[0])
+      << "spring_back_hold must not complete the original trajectory";
 }

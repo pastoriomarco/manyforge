@@ -1381,6 +1381,8 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
                  case kJtcSpeedScalingRamp:      scs = "jtc_speed_scaling_ramp"; break;
                  case kJtcCancelDecelerateOnCancel:
                    scs = "jtc_cancel_decelerate_on_cancel"; break;
+                 case kJtcCancelUnprofiledHold:
+                   scs = "jtc_cancel_unprofiled_hold"; break;
                  case kNativeSimulatedStop:      scs = "native_simulated_stop"; break;
                  case kNativeSimulatedPathRamp:
                    scs = "native_simulated_path_ramp"; break;
@@ -2036,6 +2038,15 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
            [](NativeKernelBundle& self, std::string principal_id,
               std::string reason) -> py::dict {
              auto r = self.kernel->acknowledge_intervention(
+                 std::move(principal_id), std::move(reason));
+             return command_result(r.accepted, r.error);
+           },
+           py::arg("principal_id"),
+           py::arg("reason"))
+      .def("acknowledge_intervention_for_retry",
+           [](NativeKernelBundle& self, std::string principal_id,
+              std::string reason) -> py::dict {
+             auto r = self.kernel->acknowledge_intervention_for_retry(
                  std::move(principal_id), std::move(reason));
              return command_result(r.accepted, r.error);
            },

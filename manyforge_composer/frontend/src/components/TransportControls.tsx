@@ -3,41 +3,47 @@ import { useCycleStore } from '../store/cycleStore';
 import { useRobotCommandAuthority } from '../store/commandAuthority';
 import { useSceneStateStore } from '../store/sceneStateStore';
 import { useStatusPolling, useStatusStore } from '../store/statusStore';
-import { api } from '../api/client';
 import {
-  buildStopProfileView,
+  buildStopExecutionWarning,
   evaluateStopRunGate,
   shouldClearStopInProgress,
   shouldFreezeVelocitySlider,
 } from '../store/stopProfile';
 
-const DEFAULT_CONTROLLED_STOP_DECELERATION_TIME_S = 2.0;
-const MAX_CONTROLLED_STOP_DECELERATION_TIME_S = 2.0;
-
-function formatStopDuration(value: number): string {
-  return value.toFixed(2);
+function stringDetail(details: Record<string, unknown> | null | undefined, key: string): string | null {
+  if (!details) {
+    return null;
+  }
+  const value = details[key];
+  return typeof value === 'string' && value.trim() ? value : null;
 }
 
-function deploymentAdaptersForUpdate(
-  adapters: Record<string, {
-    adapterId?: string;
-    adapterVersion?: string;
-    config?: Record<string, unknown>;
-    supportedProfiles?: string[];
-    capabilityKeys?: string[];
-  }>,
-) {
-  return Object.fromEntries(
-    Object.entries(adapters).map(([key, adapter]) => [
-      key,
-      {
-        adapter_id: adapter.adapterId,
-        adapter_version: adapter.adapterVersion,
-        config: adapter.config ?? {},
-        supported_profiles: adapter.supportedProfiles ?? [],
-        capability_keys: adapter.capabilityKeys ?? [],
-      },
-    ]),
+function requiresExplicitInterventionRecovery(
+  state: string,
+  details: Record<string, unknown> | null | undefined,
+): boolean {
+  if (state !== 'stopped' || !details) {
+    return false;
+  }
+  const reason = stringDetail(details, 'reason') || stringDetail(details, 'reason_code');
+  if (
+    reason === 'stop_not_settled_measured_velocity' ||
+    reason === 'operator_stop_total_failure' ||
+    reason === 'in_stop_completion_timeout' ||
+    reason === 'stop_path_collision' ||
+    reason === 'hard_deceleration_not_settled' ||
+    reason === 'controller_cancel_timeout'
+  ) {
+    return true;
+  }
+  const phase = stringDetail(details, 'phase');
+  return (
+    (phase === 'operator_stop' ||
+      phase === 'motion_trip_stop' ||
+      phase === 'motion_trip_stop_path_collision') &&
+    (stringDetail(details, 'requested_stop_mode') !== null ||
+      stringDetail(details, 'executed_stop_mode') !== null ||
+      stringDetail(details, 'hard_stop_transitioned') !== null)
   );
 }
 
@@ -51,7 +57,17 @@ function deploymentAdaptersForUpdate(
  * cycle is actually armable (color = state, not decoration).
  */
 export function TransportControls() {
-  const { state, velocityScale, run, stop, reset, setVelocityScale } = useCycleStore();
+  const {
+    state,
+    velocityScale,
+    errorDetails,
+    run,
+    stop,
+    reset,
+    acknowledgeInterventionForRetry,
+    resetAndRun,
+    setVelocityScale,
+  } = useCycleStore();
   const runAuthority = useRobotCommandAuthority({
     requireFreshScene: true,
   });
@@ -61,20 +77,18 @@ export function TransportControls() {
   const runtime = useStatusStore((s) => s.runtime);
   const [cycleBusy, setCycleBusy] = useState(false);
   const [stopInProgress, setStopInProgress] = useState(false);
+  const [showRecoveryChoice, setShowRecoveryChoice] = useState(false);
   const [velocityDraft, setVelocityDraft] = useState(velocityScale);
-  const [stopDurationDraft, setStopDurationDraft] = useState(
-    formatStopDuration(DEFAULT_CONTROLLED_STOP_DECELERATION_TIME_S),
-  );
   const pendingVelocityScaleRef = useRef<number | null>(null);
   const velocityScaleInFlightRef = useRef(false);
   const velocityScaleTimerRef = useRef<number | null>(null);
   const lastVelocityScaleSentAtRef = useRef(0);
-  const stopDurationDirtyRef = useRef(false);
 
-  const stopProfile = buildStopProfileView(runtime);
   const stopGate = evaluateStopRunGate(runtime);
-  // The velocity slider is frozen while a stop is in flight and for the whole
-  // stopped hold (the deceleration ramp runs while the cycle is 'stopped').
+  const stopExecutionWarning = buildStopExecutionWarning(errorDetails);
+  const needsRecoveryChoice = requiresExplicitInterventionRecovery(state, errorDetails);
+  // The velocity slider is frozen only while a stop is in flight; after the
+  // robot reaches STOPPED the operator may choose the resume scale.
   const frozen = shouldFreezeVelocitySlider(state, stopInProgress);
   const frozenRef = useRef(frozen);
   const wasFrozenRef = useRef(frozen);
@@ -198,110 +212,6 @@ export function TransportControls() {
   // state (stopped position, latched errors, run context) — give it an
   // amber accent exactly when it carries that weight.
   const resetMeaningful = state !== 'idle';
-  const canChangeStopProfile =
-    (state === 'idle' || state === 'stopped') &&
-    !cycleBusy &&
-    !stopProfile.queryFailed;
-  const stopDurationApplies =
-    stopProfile.operatorMode === 'soft_on_path' ||
-    stopProfile.operatorMode === 'spring_back_hold';
-  const canChangeStopDuration = canChangeStopProfile && stopDurationApplies;
-  const resolvedStopDuration =
-    stopProfile.operatorDecelerationTimeS ??
-    DEFAULT_CONTROLLED_STOP_DECELERATION_TIME_S;
-
-  useEffect(() => {
-    if (!stopDurationDirtyRef.current) {
-      setStopDurationDraft(formatStopDuration(resolvedStopDuration));
-    }
-  }, [resolvedStopDuration]);
-
-  const updateOperatorStopProfile = useCallback((
-    mutate: (profile: Record<string, unknown>) => Record<string, unknown>,
-  ) => {
-    void (async () => {
-      setCycleBusy(true);
-      try {
-        const deployment = await api.deployment.getFull();
-        const execution = deployment.adapters.execution;
-        if (execution == null) {
-          throw new Error('Loaded deployment has no execution adapter');
-        }
-        const config = { ...execution.config };
-        const existingProfile =
-          config.operator_stop_profile &&
-          typeof config.operator_stop_profile === 'object' &&
-          !Array.isArray(config.operator_stop_profile)
-            ? { ...(config.operator_stop_profile as Record<string, unknown>) }
-            : {};
-        config.operator_stop_profile = mutate(existingProfile);
-        const adapters = deploymentAdaptersForUpdate(deployment.adapters);
-        adapters.execution = {
-          ...adapters.execution,
-          config,
-        };
-        await api.deployment.update({
-          adapters: adapters as unknown as typeof deployment.adapters,
-        });
-        await useStatusStore.getState().refresh();
-      } catch (err) {
-        console.error('Failed to update operator stop profile', err);
-      } finally {
-        setCycleBusy(false);
-      }
-    })();
-  }, []);
-
-  const changeOperatorStopProfile = useCallback((mode: string) => {
-    updateOperatorStopProfile((existingProfile) => ({
-      ...existingProfile,
-      profile_id: `operator_${mode}`,
-      stop_mode: mode,
-      deceleration_time_s:
-        typeof existingProfile.deceleration_time_s === 'number'
-          ? existingProfile.deceleration_time_s
-          : DEFAULT_CONTROLLED_STOP_DECELERATION_TIME_S,
-    }));
-  }, [updateOperatorStopProfile]);
-
-  const commitStopDurationDraft = useCallback(() => {
-    if (!canChangeStopDuration) {
-      stopDurationDirtyRef.current = false;
-      setStopDurationDraft(formatStopDuration(resolvedStopDuration));
-      return;
-    }
-    const parsed = Number.parseFloat(stopDurationDraft);
-    const clamped = Number.isFinite(parsed)
-      ? Math.min(
-          MAX_CONTROLLED_STOP_DECELERATION_TIME_S,
-          Math.max(0.05, parsed),
-        )
-      : resolvedStopDuration;
-    stopDurationDirtyRef.current = false;
-    setStopDurationDraft(formatStopDuration(clamped));
-    updateOperatorStopProfile((existingProfile) => {
-      const mode =
-        typeof existingProfile.stop_mode === 'string' && existingProfile.stop_mode.length > 0
-          ? existingProfile.stop_mode
-          : stopProfile.operatorMode ?? 'soft_on_path';
-      return {
-        ...existingProfile,
-        profile_id:
-          typeof existingProfile.profile_id === 'string' &&
-          existingProfile.profile_id.length > 0
-            ? existingProfile.profile_id
-            : `operator_${mode}`,
-        stop_mode: mode,
-        deceleration_time_s: clamped,
-      };
-    });
-  }, [
-    canChangeStopDuration,
-    resolvedStopDuration,
-    stopDurationDraft,
-    stopProfile.operatorMode,
-    updateOperatorStopProfile,
-  ]);
 
   return (
     <div className="pointer-events-none absolute inset-x-0 bottom-3 z-30 flex flex-col items-center gap-2">
@@ -317,10 +227,72 @@ export function TransportControls() {
           {stopGate.reason}
         </div>
       )}
+      {stopExecutionWarning && (
+        <div
+          role="status"
+          className="pointer-events-auto max-w-md rounded-md border border-amber-600/70 bg-amber-950/85 px-3 py-1.5 text-xs text-amber-200 shadow-lg"
+        >
+          {stopExecutionWarning}
+        </div>
+      )}
+      {showRecoveryChoice && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-label="Intervention recovery choice"
+          className="pointer-events-auto w-[min(520px,calc(100vw-24px))] rounded-lg border border-amber-500/70 bg-gray-950/95 p-3 text-sm text-amber-100 shadow-2xl shadow-black/60"
+        >
+          <div className="font-semibold text-amber-100">Recovery choice required</div>
+          <div className="mt-1 text-xs leading-5 text-amber-100/85">
+            The last stop/fault entered operator intervention. Continue keeps
+            the current backend pose and lets the next Run replan from there;
+            reset clears the cycle and may command the backend to its reset
+            state.
+          </div>
+          <div className="mt-3 flex flex-wrap gap-2">
+            <button
+              type="button"
+              className="rounded border border-emerald-500/60 bg-emerald-700 px-3 py-1.5 text-xs font-semibold text-white hover:bg-emerald-600"
+              onClick={() => {
+                setShowRecoveryChoice(false);
+                runCycleCommand(async () => {
+                  await acknowledgeInterventionForRetry();
+                  await run();
+                });
+              }}
+            >
+              Acknowledge and continue
+            </button>
+            <button
+              type="button"
+              className="rounded border border-amber-500/70 bg-amber-800 px-3 py-1.5 text-xs font-semibold text-amber-50 hover:bg-amber-700"
+              onClick={() => {
+                setShowRecoveryChoice(false);
+                runCycleCommand(resetAndRun);
+              }}
+            >
+              Reset cycle and run
+            </button>
+            <button
+              type="button"
+              className="rounded border border-gray-600 bg-gray-800 px-3 py-1.5 text-xs font-semibold text-gray-200 hover:bg-gray-700"
+              onClick={() => setShowRecoveryChoice(false)}
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
       <div className="pointer-events-auto flex items-center gap-2 rounded-lg border border-gray-600/80 bg-gray-900/90 px-3 py-2 shadow-xl shadow-black/50 backdrop-blur-sm">
         <button
           type="button"
-          onClick={() => void run()}
+          onClick={() => {
+            if (needsRecoveryChoice) {
+              setShowRecoveryChoice(true);
+              return;
+            }
+            runCycleCommand(run);
+          }}
           disabled={cycleBusy || !canRun}
           title={
             canRun
@@ -359,9 +331,8 @@ export function TransportControls() {
         <button
           type="button"
           onClick={() => {
-            // Freeze the velocity slider immediately on Stop: the cycle FSM
-            // jumps running→stopped synchronously, but the deceleration ramp
-            // continues afterward, so rescaling now must be deferred.
+            // Freeze the velocity slider immediately on Stop, before the next
+            // status poll reports the stopping/stopped state.
             setStopInProgress(true);
             // Stop the active cycle, then force a scene refresh so the
             // viewer reflects the kStopped pose without waiting a full
@@ -427,87 +398,12 @@ export function TransportControls() {
           </svg>
           Reset
         </button>
-        {stopProfile.available && (
-          <>
-            <div className="mx-1 h-6 w-px bg-gray-600/80" />
-            <label
-              className="flex items-center gap-1.5 text-xs text-gray-300"
-              title={
-                canChangeStopProfile
-                  ? 'Operator stop profile for this loaded deployment session'
-                  : 'Operator stop profile can be changed while idle or stopped'
-              }
-            >
-              <span className="font-mono text-[11px] uppercase tracking-wide text-gray-400">
-                stop
-              </span>
-              <select
-                aria-label="Configured operator stop mode"
-                value={stopProfile.operatorMode ?? ''}
-                onChange={(event) => changeOperatorStopProfile(event.target.value)}
-                disabled={!canChangeStopProfile}
-                className={`rounded border bg-gray-800 px-1.5 py-1 text-[11px] disabled:cursor-not-allowed ${
-                  stopProfile.unsupported || stopProfile.queryFailed
-                    ? 'border-amber-600/70 text-amber-300'
-                    : 'border-gray-600 text-gray-200'
-                }`}
-              >
-                {stopProfile.operatorMode === null && <option value="">— none —</option>}
-                {stopProfile.options.map((option) => (
-                  <option
-                    key={option.mode}
-                    value={option.mode}
-                    disabled={option.disabled}
-                    title={option.reason ?? undefined}
-                  >
-                    {option.label}
-                    {option.disabled ? ' (unsupported)' : ''}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label
-              className="flex items-center gap-1.5 text-xs text-gray-300"
-              title={
-                canChangeStopDuration
-                  ? 'Operator controlled-stop duration for this loaded deployment session'
-                  : stopDurationApplies
-                    ? 'Stop duration can be changed while idle or stopped'
-                    : 'Selected stop mode does not use a ManyForge-timed replacement trajectory'
-              }
-            >
-              <span className="font-mono text-[11px] uppercase tracking-wide text-gray-400">
-                sec
-              </span>
-              <input
-                aria-label="Configured operator stop duration in seconds"
-                type="number"
-                min={0.05}
-                max={MAX_CONTROLLED_STOP_DECELERATION_TIME_S}
-                step={0.05}
-                value={stopDurationDraft}
-                onChange={(event) => {
-                  stopDurationDirtyRef.current = true;
-                  setStopDurationDraft(event.target.value);
-                }}
-                onBlur={commitStopDurationDraft}
-                onKeyDown={(event) => {
-                  if (event.key === 'Enter') {
-                    event.currentTarget.blur();
-                  }
-                }}
-                disabled={!canChangeStopDuration}
-                className="w-16 rounded border border-gray-600 bg-gray-800 px-1.5 py-1 text-right font-mono text-[11px] text-gray-200 disabled:cursor-not-allowed disabled:opacity-40"
-              />
-            </label>
-          </>
-        )}
         <div className="mx-1 h-6 w-px bg-gray-600/80" />
         <label
           className="flex items-center gap-1.5 text-xs text-gray-300"
           title={
             frozen
-              ? 'Velocity locked while the cycle is stopping/stopped'
+              ? 'Velocity locked while the robot is stopping'
               : 'Runtime velocity scale (0.0 - 1.0; 0 holds motion)'
           }
         >

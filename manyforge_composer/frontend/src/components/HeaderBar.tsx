@@ -1,4 +1,4 @@
-import { useCallback, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { api, ApiError } from '../api/client';
 import { useCycleStore, useEditLocked } from '../store/cycleStore';
 import { KernelErrorPanel } from './KernelErrorPanel';
@@ -28,6 +28,15 @@ const NEUTRAL_BUTTON =
   'rounded border border-gray-600 bg-gray-800 px-3 py-1 text-sm font-medium text-gray-200 ' +
   'transition-colors hover:bg-gray-700 hover:text-white ' +
   'disabled:cursor-not-allowed disabled:border-gray-700 disabled:bg-gray-800/60 disabled:text-gray-600';
+
+function confirmRuntimeReload(actionLabel: string, cycleState: string): boolean {
+  return window.confirm(
+    `${actionLabel} reloads the runtime session and can reset the backend-authored ` +
+      'simulation/robot state to the deployment initial state.\n\n' +
+      `Current cycle state: ${cycleState}. Any held/stopped execution context may be discarded.\n\n` +
+      'Continue?',
+  );
+}
 
 function IconButton({
   onClick,
@@ -88,9 +97,12 @@ function StatusDot({
 
 export function HeaderBar() {
   const {
+    state: cycleState,
     error,
     errorCode: cycleErrorCode,
     errorDetails: cycleErrorDetails,
+    acknowledgeInterventionForRetry,
+    refreshStatus,
   } = useCycleStore();
   const {
     flowToTree,
@@ -246,6 +258,34 @@ export function HeaderBar() {
       errorDetails: null,
     };
   }
+  const activeErrorFingerprint = activeError
+    ? `${activeError.message}|${activeError.errorCode ?? ''}|${signature(activeError.errorDetails)}`
+    : '';
+  const [incidentSnapshot, setIncidentSnapshot] = useState<Record<string, unknown> | null>(null);
+  useEffect(() => {
+    if (!activeErrorFingerprint) {
+      setIncidentSnapshot(null);
+      return;
+    }
+    let cancelled = false;
+    void api.execution.channels(80)
+      .then((payload) => {
+        if (cancelled) {
+          return;
+        }
+        const snapshots = payload.incidentSnapshots;
+        const latest = snapshots.length > 0 ? snapshots[snapshots.length - 1] : null;
+        setIncidentSnapshot(latest ?? null);
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setIncidentSnapshot(null);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeErrorFingerprint]);
   const hasRuntimeOverrides = !!runtimeOverrideStatus && (runtimeOverrideStatus.hasActive || runtimeOverrideStatus.hasStaged);
 
   const summarizeValidationErrors = (errors: Array<{ path: string; message: string }>): string => {
@@ -371,6 +411,9 @@ export function HeaderBar() {
   ]);
 
   const handleApply = useCallback(async () => {
+    if (!confirmRuntimeReload('Applying draft changes', cycleState)) {
+      return;
+    }
     if (
       hasRuntimeOverrides
       && !window.confirm(
@@ -388,7 +431,7 @@ export function HeaderBar() {
     } finally {
       setBusy(false);
     }
-  }, [applyDrafts, hasRuntimeOverrides, setActionError]);
+  }, [applyDrafts, cycleState, hasRuntimeOverrides, setActionError]);
 
   const handleSaveAll = useCallback(async () => {
     try {
@@ -553,7 +596,10 @@ export function HeaderBar() {
     }
     if (
       !window.confirm(
-        'Revert the applied session back to the last saved program/deployment and discard current draft changes?',
+        'Reverting restores the applied session to the last saved program/deployment, ' +
+          'reloads the runtime, and can reset the backend-authored simulation/robot ' +
+          `state to the deployment initial state.\n\nCurrent cycle state: ${cycleState}. ` +
+          'Current draft edits and any held/stopped execution context may be discarded.\n\nContinue?',
       )
     ) {
       return;
@@ -639,6 +685,7 @@ export function HeaderBar() {
     savedProgramParameters,
     savedTree,
     setActionError,
+    cycleState,
   ]);
 
   const cycleEditLocked = useEditLocked();
@@ -733,6 +780,19 @@ export function HeaderBar() {
             message={activeError.message}
             errorCode={activeError.errorCode}
             errorDetails={activeError.errorDetails}
+            incidentSnapshot={incidentSnapshot}
+            onAcknowledgeAndContinue={async () => {
+              setBusy(true);
+              try {
+                await acknowledgeInterventionForRetry();
+                setActionError(null);
+                await refreshStatus();
+              } catch (e) {
+                setActionError(e);
+              } finally {
+                setBusy(false);
+              }
+            }}
           />
         </div>
       )}

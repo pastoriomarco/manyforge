@@ -3,7 +3,7 @@
   Regenerate with:
     cd /workspace
     python3 scripts/regen-public-contracts.py
-  Last regenerated: 2026-05-11 07:40:49 UTC
+  Last regenerated: 2026-06-19 12:07:56 UTC
   Generator source: scripts/regen-public-contracts.py:gen_mcp_contract
 -->
 
@@ -76,6 +76,18 @@ Input schema:
       ],
       "default": null,
       "title": "Velocity Scale"
+    },
+    "principal_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Principal Id"
     }
   },
   "required": [
@@ -668,6 +680,30 @@ Input schema:
       ],
       "default": null,
       "title": "Sphere Radius M"
+    },
+    "cylinder_radius_m": {
+      "anyOf": [
+        {
+          "type": "number"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Cylinder Radius M"
+    },
+    "cylinder_height_m": {
+      "anyOf": [
+        {
+          "type": "number"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Cylinder Height M"
     },
     "mesh_resource_uri": {
       "anyOf": [

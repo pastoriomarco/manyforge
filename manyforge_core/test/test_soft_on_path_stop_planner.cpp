@@ -2,6 +2,8 @@
 
 #include <manyforge_core/motion_interrupt/soft_on_path_stop_planner.hpp>
 
+#include <algorithm>
+
 namespace manyforge::core {
 namespace {
 
@@ -64,6 +66,13 @@ MotionInterruptStopProfileDTO soft_profile(double decel_s = 0.5) {
   return profile;
 }
 
+MotionInterruptStopProfileDTO spring_back_profile(double decel_s = 1.0) {
+  auto profile = soft_profile(decel_s);
+  profile.profile_id = "spring_back_profile";
+  profile.stop_mode = MotionInterruptStopMode::kSpringBackHold;
+  return profile;
+}
+
 TEST(SoftOnPathStopPlannerTest, StopProfileDefaultsAllowShortPathNaturalCompletion) {
   MotionInterruptStopProfileDTO profile;
   EXPECT_TRUE(profile.allow_natural_completion_on_short_path);
@@ -108,6 +117,148 @@ TEST(SoftOnPathStopPlannerTest,
   // 50 ms handoff at 0.5 rad/s, then a smooth decel whose average
   // path-time speed is 0.25 rad/s for 450 ms.
   EXPECT_NEAR(final_wp.positions_rad.at(0), 0.3375, 1e-9);
+}
+
+TEST(SpringBackOnPathStopPlannerTest, BuildsTwoPhaseOnPathReturnToTripCursor) {
+  auto profile = spring_back_profile(1.0);
+  auto state = measured_state_1d(0.2, 0.5);
+  SoftOnPathPlannerConfig config;
+  config.stop_traj_delta_s = 0.05;
+  config.sample_period_s = 0.05;
+  config.per_joint_max_jerk_rad_s3 = {{"joint_1", 1e6}, {"joint_2", 1e6}};
+
+  auto planned = plan_spring_back_on_path_stop(
+      linear_trajectory_1d(), profile, state, config);
+
+  ASSERT_TRUE(planned.ok()) << planned.error().message;
+  const auto& plan = planned.value();
+  EXPECT_EQ(plan.diagnostics.at("spring_back_mode"), "on_path_two_phase");
+  EXPECT_EQ(plan.diagnostics.at("spring_back_return_profile"),
+            "quintic_rest_to_rest");
+  ASSERT_GE(plan.replacement_trajectory.waypoints.size(), 4u);
+  const auto& first = plan.replacement_trajectory.waypoints.front();
+  const auto& last = plan.replacement_trajectory.waypoints.back();
+  EXPECT_NEAR(first.time_from_start_s, 0.0, 1e-9);
+  EXPECT_NEAR(last.time_from_start_s, 1.0, 1e-9);
+  EXPECT_NEAR(last.positions_rad.at(0), first.positions_rad.at(0), 1e-9);
+  EXPECT_NEAR(last.velocities_rad_s.at(0), 0.0, 1e-9);
+  EXPECT_NEAR(last.accelerations_rad_s2.at(0), 0.0, 1e-9);
+
+  double max_position = -1.0;
+  bool saw_forward_motion = false;
+  bool saw_return_motion = false;
+  double previous_time = -1.0;
+  double previous_position = first.positions_rad.at(0);
+  for (const auto& wp : plan.replacement_trajectory.waypoints) {
+    EXPECT_GT(wp.time_from_start_s, previous_time);
+    previous_time = wp.time_from_start_s;
+    max_position = std::max(max_position, wp.positions_rad.at(0));
+    if (wp.positions_rad.at(0) > previous_position + 1e-9) {
+      saw_forward_motion = true;
+    }
+    if (wp.positions_rad.at(0) < previous_position - 1e-9) {
+      saw_return_motion = true;
+    }
+    previous_position = wp.positions_rad.at(0);
+  }
+  EXPECT_TRUE(saw_forward_motion);
+  EXPECT_TRUE(saw_return_motion);
+  EXPECT_GT(max_position, first.positions_rad.at(0) + 0.02);
+
+  const auto seam_it = std::find_if(
+      plan.replacement_trajectory.waypoints.begin(),
+      plan.replacement_trajectory.waypoints.end(),
+      [](const TrajectoryWaypointDTO& wp) {
+        return std::abs(wp.time_from_start_s - 0.5) < 1e-9;
+      });
+  ASSERT_NE(seam_it, plan.replacement_trajectory.waypoints.end());
+  ASSERT_FALSE(seam_it->velocities_rad_s.empty());
+  ASSERT_FALSE(seam_it->accelerations_rad_s2.empty());
+  EXPECT_NEAR(seam_it->velocities_rad_s.at(0), 0.0, 1e-9);
+  EXPECT_NEAR(seam_it->accelerations_rad_s2.at(0), 0.0, 1e-9);
+  const auto next_it = std::next(seam_it);
+  ASSERT_NE(next_it, plan.replacement_trajectory.waypoints.end());
+  EXPECT_LT(next_it->velocities_rad_s.at(0), 0.0);
+}
+
+TEST(SpringBackOnPathStopPlannerTest, RejectsWhenForwardHalfCannotContainLeadIn) {
+  auto profile = spring_back_profile(0.1);
+  auto state = measured_state_1d(0.2, 0.5);
+  SoftOnPathPlannerConfig config;
+  config.stop_traj_delta_s = 0.05;
+  config.sample_period_s = 0.01;
+
+  auto planned = plan_spring_back_on_path_stop(
+      linear_trajectory_1d(), profile, state, config);
+
+  ASSERT_FALSE(planned.ok());
+  EXPECT_EQ(planned.error().details.at("reason"),
+            "spring_back_phase_time_not_larger_than_handoff");
+  EXPECT_EQ(planned.error().details.at("recommended_disposition"),
+            "hard_stop");
+}
+
+TEST(SpringBackOnPathStopPlannerTest, ForwardPhaseFailureEscalatesToHardStop) {
+  auto profile = spring_back_profile(0.5);
+  profile.per_joint_max_deceleration_rad_s2 = {{"joint_1", 0.01}};
+  auto state = measured_state_1d(0.2, 0.5);
+  SoftOnPathPlannerConfig config;
+  config.stop_traj_delta_s = 0.05;
+  config.sample_period_s = 0.05;
+  config.per_joint_max_jerk_rad_s3 = {{"joint_1", 1e6}};
+
+  auto planned = plan_spring_back_on_path_stop(
+      linear_trajectory_1d(), profile, state, config);
+
+  ASSERT_FALSE(planned.ok());
+  EXPECT_EQ(planned.error().details.at("spring_back_phase"),
+            "forward_deceleration");
+  EXPECT_EQ(planned.error().details.at("requested_stop_mode"),
+            "spring_back_hold");
+  EXPECT_EQ(planned.error().details.at("recommended_disposition"),
+            "hard_stop");
+  EXPECT_FALSE(planned.error().details.contains("recommended_fallback"));
+}
+
+TEST(SpringBackOnPathStopPlannerTest, RejectsReturnAccelerationLimitExceeded) {
+  auto profile = spring_back_profile(1.0);
+  profile.per_joint_max_deceleration_rad_s2 = {{"joint_1", 3.0}};
+  auto state = measured_state_1d(0.2, 0.5);
+  SoftOnPathPlannerConfig config;
+  config.stop_traj_delta_s = 0.05;
+  config.sample_period_s = 0.05;
+  config.per_joint_max_jerk_rad_s3 = {{"joint_1", 1e6}};
+
+  auto planned = plan_spring_back_on_path_stop(
+      linear_trajectory_1d(), profile, state, config);
+
+  ASSERT_FALSE(planned.ok());
+  EXPECT_EQ(planned.error().details.at("reason"),
+            "spring_back_return_acceleration_limit_exceeded");
+  EXPECT_EQ(planned.error().details.at("spring_back_phase"),
+            "reverse_return");
+  EXPECT_EQ(planned.error().details.at("recommended_disposition"),
+            "hard_stop");
+}
+
+TEST(SpringBackOnPathStopPlannerTest, RejectsReturnJerkLimitExceeded) {
+  auto profile = spring_back_profile(1.0);
+  auto state = measured_state_1d(0.2, 0.5);
+  SoftOnPathPlannerConfig config;
+  config.stop_traj_delta_s = 0.05;
+  config.sample_period_s = 0.05;
+  config.per_joint_max_jerk_rad_s3 = {{"joint_1", 40.0}};
+
+  auto planned = plan_spring_back_on_path_stop(
+      linear_trajectory_1d(), profile, state, config);
+
+  ASSERT_FALSE(planned.ok());
+  EXPECT_EQ(planned.error().details.at("reason"),
+            "spring_back_return_jerk_limit_exceeded");
+  EXPECT_EQ(planned.error().details.at("spring_back_phase"),
+            "reverse_return");
+  EXPECT_EQ(planned.error().details.at("recommended_disposition"),
+            "hard_stop");
 }
 
 TEST(SoftOnPathStopPlannerTest,
@@ -283,8 +434,9 @@ TEST(SoftOnPathStopPlannerTest,
   ASSERT_FALSE(planned.ok());
   EXPECT_EQ(planned.error().details.at("reason"),
             "deceleration_time_not_larger_than_handoff");
-  EXPECT_EQ(planned.error().details.at("recommended_fallback"),
-            "spring_back_hold");
+  EXPECT_EQ(planned.error().details.at("recommended_disposition"),
+            "hard_stop");
+  EXPECT_FALSE(planned.error().details.contains("recommended_fallback"));
 }
 
 TEST(SoftOnPathStopPlannerTest,
@@ -337,6 +489,7 @@ TEST(SoftOnPathStopPlannerTest, EscalatesAccelBindWhenRetimerCannotProveDispatch
             "soft_on_path_acceleration_limit_exceeded");
   EXPECT_EQ(planned.error().details.at("recommended_disposition"),
             "hard_stop");
+  EXPECT_FALSE(planned.error().details.contains("recommended_fallback"));
   EXPECT_TRUE(planned.error().details.contains("ali_validation_failure_reason"));
   EXPECT_TRUE(planned.error().details.contains("ali_motion_stop_time_s"));
 }

@@ -667,6 +667,14 @@ class NativeKernelClient(KernelClient):
         r = self._bundle.acknowledge_intervention(str(principal_id), str(reason))
         return CommandResult(accepted=r["accepted"], error=r.get("error"))
 
+    def acknowledge_intervention_for_retry(
+        self, principal_id: str, reason: str
+    ) -> CommandResult:
+        r = self._bundle.acknowledge_intervention_for_retry(
+            str(principal_id), str(reason)
+        )
+        return CommandResult(accepted=r["accepted"], error=r.get("error"))
+
     def acknowledge_interrupted_for_retry(
         self, principal_id: str, reason: str
     ) -> CommandResult:
@@ -685,6 +693,16 @@ class NativeKernelClient(KernelClient):
         if not isinstance(scale, (int, float)) or math.isnan(scale) or math.isinf(scale):
             return
         self._bundle.set_runtime_velocity_scale(float(scale), principal_id)
+
+    def get_motion_interrupt_stop_capability(self) -> dict:
+        """Return the active native backend's controlled-stop capability.
+
+        Composer may only have a KernelClient handle for native/composer-only
+        deployments. Forwarding the bundle capability here keeps the same
+        fail-closed stop-profile gate available whether Composer cached the
+        raw NativeKernelBundle or only the wrapped NativeKernelClient.
+        """
+        return dict(self._bundle.get_motion_interrupt_stop_capability())
 
     def set_command_gate(self, enabled: bool) -> bool:
         """Request the command-enable gate from the backend gate authority.

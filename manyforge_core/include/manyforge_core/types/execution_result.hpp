@@ -76,10 +76,8 @@ struct AcknowledgeCompletedResultDTO {
 ///
 /// Valid only from `kInterventionRequired`. Clears the intervention flag
 /// and transitions to `kIdle`, emitting a `kInterventionAcknowledged`
-/// event with `principal_id` and `reason` for traceability. Callers (cycle
-/// manager Run-side auto-ack, MCP, operator UI) hold the policy decision
-/// about whether an ack is appropriate; the kernel only enforces
-/// "explicit, traceable, fail-closed on other states".
+/// event with `principal_id` and `reason` for traceability. The reset/resync
+/// and retry-without-reset intervention APIs share this result shape.
 struct AcknowledgeInterventionResultDTO {
   bool accepted = false;
   std::optional<ErrorDTO> error;

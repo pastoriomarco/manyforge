@@ -193,8 +193,16 @@ def build_runtime_status_payload(state: ComposerState) -> dict[str, Any]:
     stop_capability_unsupported = bool(stop_modes_unsupported)
     stop_capability_query_failed = bool(stop_cap.get("capability_query_failed"))
     advertised = ", ".join(supported_stop_modes) if supported_stop_modes else "none"
+    def _format_stop_issue(issue: dict) -> str:
+        profile = issue.get("profile") or "unknown_profile"
+        mode = issue.get("stop_mode")
+        mode_text = mode if isinstance(mode, str) and mode else "missing"
+        reason = issue.get("reason")
+        suffix = f" ({reason})" if isinstance(reason, str) and reason else ""
+        return f"{profile}={mode_text}{suffix}"
+
     unsupported_desc = ", ".join(
-        f"{u.get('profile')}={u.get('stop_mode')}" for u in stop_modes_unsupported
+        _format_stop_issue(u) for u in stop_modes_unsupported
     )
     # The component renders whenever a real backend was queried (success: modes
     # known; failure: capability_query_failed) for a program-loaded deployment.

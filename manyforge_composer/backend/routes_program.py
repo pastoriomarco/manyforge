@@ -1164,6 +1164,16 @@ def create_program_router(state: ComposerState) -> APIRouter:
             raise HTTPException(status_code=409, detail="Cannot apply changes while execution is active")
 
         try:
+            deployment = state.deployment
+            deployment_capability_keys = _deployment_capability_keys(state)
+            if request.deployment is not None:
+                deployment = Deployment.from_dict(
+                    request.deployment.model_dump(),
+                    path=state.deployment_source_path or "<memory>",
+                )
+                _validate_deployment_against_catalogs(state, deployment)
+                deployment_capability_keys = deployment.capability_keys()
+
             program = state.program
             if (
                 request.tree is not None
@@ -1191,16 +1201,8 @@ def create_program_router(state: ComposerState) -> APIRouter:
                     state.catalog,
                     path=state.program_source_path or "<memory>",
                     skill_catalog=state.skill_catalog,
-                    deployment_capability_keys=_deployment_capability_keys(state),
+                    deployment_capability_keys=deployment_capability_keys,
                 )
-
-            deployment = state.deployment
-            if request.deployment is not None:
-                deployment = Deployment.from_dict(
-                    request.deployment.model_dump(),
-                    path=state.deployment_source_path or "<memory>",
-                )
-                _validate_deployment_against_catalogs(state, deployment)
 
             if deployment is not None:
                 deployment.validate_against_program(program)

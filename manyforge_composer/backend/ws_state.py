@@ -7,6 +7,7 @@ import time
 from typing import TYPE_CHECKING, List
 
 from fastapi import WebSocket, WebSocketDisconnect
+from .cycle_diagnostics import active_cycle_error_fields
 from .models import StateUpdate, RuntimeOverrideStatusResponse
 
 if TYPE_CHECKING:
@@ -100,6 +101,9 @@ class StateHub:
                         )
 
                 if self._state and self._state.cycle_manager is not None:
+                    error, error_code, error_details = active_cycle_error_fields(
+                        self._state.cycle_manager
+                    )
                     runtime_override_status = None
                     if self._state.program is not None:
                         runtime_override_status = RuntimeOverrideStatusResponse(
@@ -111,9 +115,9 @@ class StateHub:
                         nodeStatuses=self._state.cycle_manager.get_node_statuses(),
                         kernelEvents=kernel_events,
                         nativeKernelEvents=native_kernel_events,
-                        error=self._state.cycle_manager.error,
-                        errorCode=self._state.cycle_manager.error_code,
-                        errorDetails=self._state.cycle_manager.error_details,
+                        error=error,
+                        errorCode=error_code,
+                        errorDetails=error_details,
                         programLoaded=bool(has_program),
                         programSessionGeneration=self._state.program_session_generation,
                         runtimeOverrideStatus=runtime_override_status,

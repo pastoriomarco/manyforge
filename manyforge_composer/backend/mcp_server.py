@@ -434,12 +434,11 @@ def create_mcp_server(state: ComposerState):
             try:
                 state.cycle_manager.run()
             except RuntimeError as exc:
-                # Cycle-manager auto-ack refusals (e.g. running
-                # intervention session, unreadable kernel status) and
-                # other resume-path refusals surface as RuntimeError.
-                # Return them as
-                # structured errors so MCP clients see a consistent
-                # shape rather than an internal exception.
+                # Cycle-manager recovery refusals (e.g. explicit operator
+                # recovery required for INTERVENTION_REQUIRED) and other
+                # resume-path refusals surface as RuntimeError. Return them
+                # as structured errors so MCP clients see a consistent shape
+                # rather than an internal exception.
                 return json.dumps({"error": str(exc)})
             return json.dumps({"state": state.cycle_manager.state.value})
         elif command == "stop":

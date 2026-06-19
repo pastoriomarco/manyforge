@@ -20,6 +20,12 @@ export interface VelocityScaleResponse {
   velocityScale: number;
 }
 
+export interface ExecutionChannelsResponse {
+  channels: Record<string, Array<Record<string, unknown>>>;
+  incidentSnapshots: Array<Record<string, unknown>>;
+  timestampNs: number;
+}
+
 // Catalog
 export interface CatalogEnumOption {
   value: string;

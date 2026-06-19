@@ -130,6 +130,25 @@ adapters:
       - wrist_1_joint
       - wrist_2_joint
       - wrist_3_joint
+      # Hard-stop evidence for JTC `constraints.decelerate_on_cancel`.
+      # These fields intentionally mirror the controller YAML and let
+      # ManyForge advertise `hard_deceleration` only when the controller has
+      # velocity state and positive per-joint cancel-deceleration limits.
+      decelerate_on_cancel: true
+      velocity_state_interface_joints:
+      - shoulder_pan_joint
+      - shoulder_lift_joint
+      - elbow_joint
+      - wrist_1_joint
+      - wrist_2_joint
+      - wrist_3_joint
+      max_deceleration_on_cancel_rad_s2:
+        shoulder_pan_joint: 10.0
+        shoulder_lift_joint: 10.0
+        elbow_joint: 10.0
+        wrist_1_joint: 10.0
+        wrist_2_joint: 10.0
+        wrist_3_joint: 10.0
       initial_joint_positions_rad:
       - 2.63422544
       - -0.875980752
@@ -141,7 +160,7 @@ adapters:
       wait_for_state_timeout_s: 1
       # Industrial controlled stop. soft_on_path is the default operator-stop:
       # a self-computed jerk-continuous stop trajectory preempts the active
-      # goal over a 2.0 s ramp. enable_jtc_speed_scaling_input stays true
+      # goal over a 1.0 s ramp. enable_jtc_speed_scaling_input stays true
       # (velocity slider via JTC scaling); the stop publishes unit scale
       # immediately before the preempt, so soft_on_path works WITH speed-scaling
       # once the controller seam has been validated for that ordering.
@@ -156,11 +175,9 @@ adapters:
       # (measured normal-path Delta ~0.8 ms). Decel ramp = deceleration_time_s - D_lead.
       soft_on_path_stop_traj_delta_s: 0.1
       # Explicit per-joint jerk ceiling for the stop ramp + handoff. Without
-      # this the planner falls back to default_jerk_limit (= accel_limit /
-      # (0.15*effective_ramp_s) = 10 / 0.2925 ~= 34 rad/s^3), which is a
-      # heuristic, not a joint limit, and is tight enough that the path's
-      # natural handoff jerk marginally exceeds it at sharp trip points. 50
-      # rad/s^3 (reach the 10 rad/s^2 accel limit in 0.2 s) gives headroom.
+      # this the planner derives a heuristic jerk limit from accel + ramp time;
+      # deployments should instead record the intended operational ceiling.
+      # 50 rad/s^3 reaches the 10 rad/s^2 accel limit in 0.2 s.
       soft_on_path_max_jerk_rad_s3:
         shoulder_pan_joint: 50.0
         shoulder_lift_joint: 50.0
@@ -171,19 +188,15 @@ adapters:
       operator_stop_profile:
         profile_id: "operator_soft_on_path"
         stop_mode: "soft_on_path"
-        deceleration_time_s: 2.0
+        deceleration_time_s: 1.0
         # Default policy, made explicit here for operator audit: if the
-        # accepted trajectory will finish sooner than a useful 2 s stop ramp
+        # accepted trajectory will finish sooner than a useful 1 s stop ramp
         # can be generated, keep running that trajectory and report Stopping
         # until the controller reaches the endpoint.
         allow_natural_completion_on_short_path: true
-        # Backend waits max_stop_time_s for the dispatched soft_on_path goal to
-        # confirm terminal; it MUST exceed the realized stop duration
-        # (deceleration_time_s ramp + stop_traj_delta_s handoff + dispatch
-        # latency) or the goal is cancelled mid-ramp and the legacy stop()
-        # fallback truncates the decel. 2.0 s ramp + ~0.4 s dispatch -> 3.0 s.
-        max_stop_time_s: 3.0
-        allowed_fallback_modes: ["spring_back_hold"]
+        # No spring_back_hold fallback: spring-back is a distinct operator
+        # profile and is harder to generate than soft_on_path when both share
+        # the same deceleration time.
         per_joint_max_deceleration_rad_s2:
           shoulder_pan_joint: 10.0
           shoulder_lift_joint: 10.0
@@ -194,9 +207,18 @@ adapters:
       default_fault_stop_profile:
         profile_id: "default_fault_spring_back"
         stop_mode: "spring_back_hold"
-        deceleration_time_s: 2.0
+        deceleration_time_s: 1.0
+        per_joint_max_deceleration_rad_s2:
+          shoulder_pan_joint: 10.0
+          shoulder_lift_joint: 10.0
+          elbow_joint: 10.0
+          wrist_1_joint: 10.0
+          wrist_2_joint: 10.0
+          wrist_3_joint: 10.0
       wait_for_action_server_timeout_s: 2
-      stop_completion_timeout_s: 2
+      # Auto max stop time for profiles without explicit max_stop_time_s is
+      # deceleration_time_s + this margin: 1.0 + 0.5 = 1.5 s.
+      stop_completion_timeout_s: 0.5
       start_tolerance_rad: 0.15
       final_tolerance_rad: 0.15
       tracking_error_tolerance_rad: 0.05

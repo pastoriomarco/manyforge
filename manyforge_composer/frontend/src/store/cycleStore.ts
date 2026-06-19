@@ -120,6 +120,8 @@ interface CycleStore {
   run: () => Promise<void>;
   stop: () => Promise<void>;
   reset: () => Promise<void>;
+  acknowledgeInterventionForRetry: () => Promise<void>;
+  resetAndRun: () => Promise<void>;
   setVelocityScale: (value: number) => Promise<void>;
   refreshStatus: () => Promise<void>;
 
@@ -174,6 +176,37 @@ export const useCycleStore = create<CycleStore>((set, get) => ({
     } catch (e) {
       const s = structuredErrorFromException(e);
       set({ error: s.message, errorCode: s.errorCode, errorDetails: s.errorDetails });
+    }
+  },
+
+  acknowledgeInterventionForRetry: async () => {
+    try {
+      const result = await api.cycle.acknowledgeInterventionForRetry();
+      set(cycleStatePatchFromCommand(result.state));
+    } catch (e) {
+      const s = structuredErrorFromException(e);
+      set({ error: s.message, errorCode: s.errorCode, errorDetails: s.errorDetails });
+      throw e;
+    }
+  },
+
+  resetAndRun: async () => {
+    try {
+      const resetResult = await api.cycle.reset();
+      set(cycleStatePatchFromCommand(resetResult.state));
+      const programStore = useProgramStore.getState();
+      if (get().programLoaded || programStore.programInfo !== null) {
+        await Promise.all([
+          programStore.fetchProgramInfo(),
+          programStore.fetchTree(),
+        ]);
+      }
+      const runResult = await api.cycle.run();
+      set(cycleStatePatchFromCommand(runResult.state));
+    } catch (e) {
+      const s = structuredErrorFromException(e);
+      set({ error: s.message, errorCode: s.errorCode, errorDetails: s.errorDetails });
+      throw e;
     }
   },
 
