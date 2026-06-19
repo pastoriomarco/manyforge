@@ -50,25 +50,33 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Python packages: testing, behavior trees, bindings, visualization
-# Pin the cmeel/pinocchio dependency set to the versions verified in the
-# working Thor manyforge-dev image. `pin==3.9.0`'s wheel links against
-# urdfdom 4.0 (liburdfdom_*.so.4.0); leaving the transitive `cmeel-urdfdom`
-# unpinned lets pip pull v6 (liburdfdom_*.so.6), which breaks the RoboPlan
-# bindings wheel build with `ImportError: liburdfdom_sensor.so.4.0`. A pip
-# constraints file enforces the compatible set regardless of resolution order.
+# Pin the cmeel/pinocchio dependency set to a self-consistent Pinocchio 4 stack.
+# `pin==4.0.0` and `coal==3.0.3` link urdfdom 6 (liburdfdom_*.so.6), so
+# `cmeel-urdfdom` is pinned to 6.0.0 to keep the whole stack on one urdfdom
+# soname; an older/unpinned urdfdom would reintroduce a `liburdfdom_*.so.X`
+# ImportError at the RoboPlan bindings build. urdfdom 6 in turn links tinyxml2
+# 11 (libtinyxml2.so.11), so `cmeel-tinyxml2` is pinned to 11.0.0 to match
+# (10.0.0 ships only .so.10 and breaks urdfdom 6 at load time). Pinocchio 4
+# also splits its C++
+# libraries into `libpinocchio`/`libcoal`, pinned explicitly so they cannot
+# float (they ship the pinocchio/coal headers + .so the C++ build links
+# against). A pip constraints file enforces the compatible set regardless of
+# resolution order.
 RUN pip install --no-cache-dir --upgrade pip setuptools && \
     printf '%s\n' \
-        'pin==3.9.0' \
-        'cmeel-urdfdom==4.0.1' \
-        'coal==3.0.2' \
-        'eigenpy==3.12.0' \
+        'pin==4.0.0' \
+        'libpinocchio==4.0.0' \
+        'coal==3.0.3' \
+        'libcoal==3.0.3' \
+        'cmeel-urdfdom==6.0.0' \
+        'eigenpy==3.13.0' \
         'cmeel==0.60.0' \
-        'cmeel-assimp==6.0.2' \
-        'cmeel-boost==1.89.0' \
+        'cmeel-assimp==6.0.5' \
+        'cmeel-boost==1.90.0' \
         'cmeel-console-bridge==1.0.2.3' \
         'cmeel-octomap==1.10.0' \
         'cmeel-qhull==8.0.2.1' \
-        'cmeel-tinyxml2==10.0.0' \
+        'cmeel-tinyxml2==11.0.0' \
         'cmeel-zlib==1.3.1' \
         > /tmp/manyforge-cmeel-constraints.txt && \
     pip install --no-cache-dir -c /tmp/manyforge-cmeel-constraints.txt \
@@ -82,7 +90,7 @@ RUN pip install --no-cache-dir --upgrade pip setuptools && \
         yourdfpy==0.0.60 \
         nanobind==2.12.0 \
         scikit-build-core==0.12.2 \
-        pin==3.9.0 \
+        pin==4.0.0 \
         fastapi==0.135.3 \
         "uvicorn[standard]==0.44.0" \
         httpx==0.28.1 \

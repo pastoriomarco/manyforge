@@ -24,9 +24,9 @@
 #include <pinocchio/parsers/srdf.hpp>
 #include <pinocchio/parsers/urdf.hpp>
 
-#include <hpp/fcl/BVH/BVH_model.h>
-#include <hpp/fcl/mesh_loader/loader.h>
-#include <hpp/fcl/shape/geometric_shapes.h>
+#include <coal/BVH/BVH_model.h>
+#include <coal/mesh_loader/loader.h>
+#include <coal/shape/geometric_shapes.h>
 
 #ifndef MANYFORGE_COLLISION_ENGINE_VERSION
 #define MANYFORGE_COLLISION_ENGINE_VERSION "0.1.0+unknown"
@@ -1173,13 +1173,13 @@ std::optional<std::string> ManyForgeCollisionEngine::sync_snapshot_locked(
              body.body_id;
     }
 
-    std::shared_ptr<hpp::fcl::CollisionGeometry> shape;
+    std::shared_ptr<coal::CollisionGeometry> shape;
     switch (geom.geometry_kind) {
       case core::CollisionGeometryKind::kBox: {
         if (!geom.box_dimensions_m) {
           return "box geometry missing dimensions: " + body.body_id;
         }
-        shape = std::make_shared<hpp::fcl::Box>(geom.box_dimensions_m->x_m,
+        shape = std::make_shared<coal::Box>(geom.box_dimensions_m->x_m,
                                                 geom.box_dimensions_m->y_m,
                                                 geom.box_dimensions_m->z_m);
         break;
@@ -1188,14 +1188,14 @@ std::optional<std::string> ManyForgeCollisionEngine::sync_snapshot_locked(
         if (!geom.sphere_radius_m) {
           return "sphere geometry missing radius: " + body.body_id;
         }
-        shape = std::make_shared<hpp::fcl::Sphere>(*geom.sphere_radius_m);
+        shape = std::make_shared<coal::Sphere>(*geom.sphere_radius_m);
         break;
       }
       case core::CollisionGeometryKind::kCylinder: {
         if (!geom.cylinder_radius_m || !geom.cylinder_height_m) {
           return "cylinder geometry missing dimensions: " + body.body_id;
         }
-        shape = std::make_shared<hpp::fcl::Cylinder>(*geom.cylinder_radius_m,
+        shape = std::make_shared<coal::Cylinder>(*geom.cylinder_radius_m,
                                                      *geom.cylinder_height_m);
         break;
       }
@@ -1217,7 +1217,7 @@ std::optional<std::string> ManyForgeCollisionEngine::sync_snapshot_locked(
           return "triangle mesh geometry could not resolve source_uri for " +
                  body.body_id + ": " + mesh_error;
         }
-        hpp::fcl::MeshLoader loader;
+        coal::MeshLoader loader;
         auto mesh = loader.load(mesh_path->string(), scale);
         if (!mesh) {
           return "triangle mesh loader returned null for " + body.body_id +
