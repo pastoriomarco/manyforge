@@ -205,8 +205,8 @@ adapters:
           wrist_2_joint: 10.0
           wrist_3_joint: 10.0
       default_fault_stop_profile:
-        profile_id: "default_fault_spring_back"
-        stop_mode: "spring_back_hold"
+        profile_id: "default_fault_hard_deceleration"
+        stop_mode: "hard_deceleration"
         deceleration_time_s: 1.0
         per_joint_max_deceleration_rad_s2:
           shoulder_pan_joint: 10.0

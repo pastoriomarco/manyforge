@@ -39,6 +39,21 @@ def _valid_trigger_reasons() -> set[str]:
     return canonical_recovery_trigger_values()
 
 
+def _live_scene_mutation_block_message(reason: str) -> str:
+    if reason == "resumable_stopped_context":
+        return (
+            "Live scene edits are not allowed while execution is stopped with a "
+            "resumable behavior-tree context. Resume the cycle, or Reset/re-plan "
+            "before changing the live scene."
+        )
+    if reason.startswith("execution_active:"):
+        return (
+            "Scene edits not allowed while execution is active "
+            f"(state={reason.split(':', 1)[1]})"
+        )
+    return f"Live scene mutation is not allowed in the current runtime state ({reason})"
+
+
 def create_mcp_server(state: ComposerState):
     """Create an MCP server wrapping the given ComposerState.
 
@@ -133,23 +148,22 @@ def create_mcp_server(state: ComposerState):
                 never defaults an orientation; choose deliberately or ask)
             frame_id: Robot link frame for attach/detach operations
         """
-        from manyforge_behavior.cycle_manager import CycleState
         from manyforge_behavior.kernel_client import SceneEditRequest
 
-        if state.cycle_manager is not None and state.cycle_manager.state in {
-            CycleState.RUNNING,
-            CycleState.STOPPING,
-            CycleState.DIRECT_CONTROL,
-        }:
-            cycle_state = state.cycle_manager.state
+        block_reason = state.live_scene_mutation_block_reason()
+        if block_reason is not None:
+            cycle_state = (
+                getattr(state.cycle_manager, "state", None)
+                if state.cycle_manager is not None
+                else None
+            )
+            cycle_state_value = getattr(cycle_state, "value", None)
             return json.dumps(
                 {
                     "success": False,
-                    "error": (
-                        "Scene edits not allowed while execution is active "
-                        f"(state={cycle_state.name})"
-                    ),
-                    "cycle_state": cycle_state.value,
+                    "error": _live_scene_mutation_block_message(block_reason),
+                    "cycle_state": cycle_state_value,
+                    "reason": block_reason,
                 }
             )
 

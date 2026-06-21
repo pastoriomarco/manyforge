@@ -6,6 +6,7 @@ import json
 import logging
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -262,6 +263,27 @@ class TestSceneEdit:
         })
         # Mock kernel returns success=False with an error for missing objects
         assert "success" in result
+
+    def test_scene_edit_rejects_resumable_stopped_context(self):
+        state = _make_state()
+        state.cycle_manager = SimpleNamespace(
+            state=CycleState.STOPPED,
+            live_scene_mutation_block_reason=lambda: "resumable_stopped_context",
+        )
+        mcp = create_mcp_server(state)
+
+        result = _call(mcp, "manyforge_scene_edit", {
+            "operation": "add",
+            "object_id": "blocked_box",
+            "shape_type": "box",
+            "box_dimensions_m": [0.05, 0.05, 0.05],
+            "pose_position_m": [0.3, 0.0, 0.15],
+            "pose_orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+        })
+
+        assert result["success"] is False
+        assert result["reason"] == "resumable_stopped_context"
+        assert "resumable behavior-tree context" in result["error"]
 
 class TestProgramLoad:
 

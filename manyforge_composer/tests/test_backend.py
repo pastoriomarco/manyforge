@@ -679,6 +679,34 @@ def test_simulation_reset_route_rejects_active_program_cycle(state):
     assert "active program cycle" in response.json()["detail"]
 
 
+def test_simulation_reset_rejects_resumable_stopped_context(state):
+    state.deployment = _simulation_control_deployment()
+    manager = _FakeCycleManager("stopped")
+    manager.live_scene_mutation_block_reason = lambda: "resumable_stopped_context"
+    state.cycle_manager = manager
+    state._run_ros_simulation_reset = lambda **_kwargs: pytest.fail(
+        "reset service must not be called while stopped context is resumable"
+    )
+
+    with pytest.raises(RuntimeError, match="resumable behavior-tree context"):
+        state.reset_simulation(reason="test", source="api")
+
+
+def test_simulation_reset_rejects_when_scene_guard_unavailable(state):
+    state.deployment = _simulation_control_deployment()
+    manager = _FakeCycleManager("stopped")
+    manager.live_scene_mutation_block_reason = (
+        lambda: "scene_mutation_guard_unavailable"
+    )
+    state.cycle_manager = manager
+    state._run_ros_simulation_reset = lambda **_kwargs: pytest.fail(
+        "reset service must not be called without a live scene mutation guard"
+    )
+
+    with pytest.raises(RuntimeError, match="guard is unavailable"):
+        state.reset_simulation(reason="test", source="api")
+
+
 def test_simulation_reset_aborts_direct_control_before_service(state):
     state.deployment = _simulation_control_deployment(source_mode="authored_preview")
     manager = _FakeCycleManager("direct_control")

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import json
+import math
 import sys
 import threading
 import time
@@ -260,6 +261,72 @@ def _find_failure_feedback(node) -> Optional[str]:
     return None
 
 
+def _scene_resume_fingerprint_from_objects(
+    objects: list[SceneObjectSnapshot],
+) -> str:
+    """Return a stable fingerprint for live scene state that affects resume.
+
+    This is stricter than UI candidate freshness: a resumable STOPPED cycle
+    must preserve the execution-world state, including attachment and geometry,
+    or Run must fail closed instead of resuming a stale behavior-tree context.
+    """
+
+    def finite_values(raw: Any) -> tuple[float | str, ...]:
+        if not isinstance(raw, (list, tuple)):
+            return ()
+        values: list[float | str] = []
+        for item in raw:
+            if isinstance(item, (int, float)):
+                value = float(item)
+                if math.isfinite(value):
+                    values.append(round(value, 9))
+                else:
+                    values.append(str(value))
+            else:
+                values.append(str(item))
+        return tuple(values)
+
+    def shape_key(shape: Any) -> tuple[Any, ...]:
+        if shape is None:
+            return ()
+        return (
+            str(getattr(shape, "type", "") or ""),
+            finite_values(getattr(shape, "box_dimensions_m", None)),
+            finite_values([getattr(shape, "sphere_radius_m", None)]),
+            finite_values([getattr(shape, "cylinder_radius_m", None)]),
+            finite_values([getattr(shape, "cylinder_height_m", None)]),
+            str(getattr(shape, "mesh_resource_uri", "") or ""),
+            finite_values(getattr(shape, "mesh_scale", None)),
+        )
+
+    def pose_key(pose: Any) -> tuple[float | str, ...]:
+        if not isinstance(pose, dict):
+            return ()
+        return finite_values(pose.get("position_m")) + finite_values(
+            pose.get("orientation_xyzw")
+        )
+
+    descriptors: list[tuple[Any, ...]] = []
+    for obj in objects:
+        attached = bool(getattr(obj, "attached", False))
+        pose = (
+            getattr(obj, "pose_in_frame", None)
+            if attached
+            else getattr(obj, "pose_in_universe", None)
+        )
+        descriptors.append(
+            (
+                str(getattr(obj, "object_id", "") or ""),
+                attached,
+                str(getattr(obj, "frame_id", "") or ""),
+                shape_key(getattr(obj, "shape", None)),
+                pose_key(pose),
+            )
+        )
+    descriptors.sort(key=lambda item: item[0])
+    return json.dumps(descriptors, sort_keys=True, separators=(",", ":"))
+
+
 class CycleManager:
     """Runtime lifecycle controller for continuous robot programs.
 
@@ -327,6 +394,8 @@ class CycleManager:
         self._kernel_event_index: int = 0
         self._signal_registry = RuntimeSignalRegistry()
         self._signal_managed_keys: set[str] = set()
+        self._resumable_stop_scene_fingerprint: Optional[str] = None
+        self._resumable_stop_scene_fingerprint_error: Optional[str] = None
 
         # Set initial pause event to set (not paused)
         self._tick_pause_event.set()
@@ -351,12 +420,27 @@ class CycleManager:
                 time.sleep(0.05)
                 continue
             if self._kernel_stop_terminal(kernel_state):
+                should_capture = False
+                with self._lock:
+                    should_capture = (
+                        self._state == CycleState.STOPPING
+                        and self._stop_settle_generation == generation
+                    )
+                fingerprint, fingerprint_error = (
+                    self._capture_scene_resume_fingerprint()
+                    if should_capture
+                    else (None, None)
+                )
                 with self._lock:
                     if (
                         self._state == CycleState.STOPPING
                         and self._stop_settle_generation == generation
                     ):
                         self._state = CycleState.STOPPED
+                        self._store_resumable_stop_scene_fingerprint_locked(
+                            fingerprint,
+                            fingerprint_error,
+                        )
                     if self._stop_settle_generation == generation:
                         self._stop_settle_thread = None
                 return
@@ -380,6 +464,87 @@ class CycleManager:
             py_trees.common.Status.SUCCESS,
             py_trees.common.Status.FAILURE,
         )
+
+    def _has_resumable_execution_context_locked(self) -> bool:
+        return (
+            self._state == CycleState.STOPPED
+            and self._tree is not None
+            and not self._tree_is_terminal()
+        )
+
+    def has_resumable_execution_context(self) -> bool:
+        """True when STOPPED still holds a behavior-tree context that Run resumes."""
+        with self._lock:
+            return self._has_resumable_execution_context_locked()
+
+    def live_scene_mutation_block_reason(self) -> Optional[str]:
+        """Return a stable reason if live scene mutation would invalidate runtime state."""
+        with self._lock:
+            if self._state in {
+                CycleState.RUNNING,
+                CycleState.STOPPING,
+                CycleState.DIRECT_CONTROL,
+            }:
+                return f"execution_active:{self._state.name}"
+            if self._has_resumable_execution_context_locked():
+                return "resumable_stopped_context"
+            return None
+
+    def _capture_scene_resume_fingerprint(self) -> tuple[Optional[str], Optional[str]]:
+        try:
+            return (
+                _scene_resume_fingerprint_from_objects(self._kernel.get_scene_objects()),
+                None,
+            )
+        except Exception as exc:  # noqa: BLE001 - unreadable scene must fail closed
+            return None, f"{type(exc).__name__}: {exc}"
+
+    def _store_resumable_stop_scene_fingerprint_locked(
+        self,
+        fingerprint: Optional[str],
+        error: Optional[str],
+    ) -> None:
+        if not self._has_resumable_execution_context_locked():
+            self._resumable_stop_scene_fingerprint = None
+            self._resumable_stop_scene_fingerprint_error = None
+            return
+        self._resumable_stop_scene_fingerprint = fingerprint
+        self._resumable_stop_scene_fingerprint_error = error
+
+    def _assert_resumable_stop_scene_unchanged(self) -> None:
+        with self._lock:
+            if not self._has_resumable_execution_context_locked():
+                return
+        current, current_error = self._capture_scene_resume_fingerprint()
+        with self._lock:
+            if not self._has_resumable_execution_context_locked():
+                return
+            stored_error = self._resumable_stop_scene_fingerprint_error
+            stored = self._resumable_stop_scene_fingerprint
+            changed = (
+                stored_error is not None
+                or current_error is not None
+                or stored != current
+            )
+        if changed:
+            details = {
+                "reason_code": "resumable_scene_changed",
+                "stored_scene_fingerprint_available": str(stored is not None).lower(),
+                "current_scene_fingerprint_available": str(current is not None).lower(),
+            }
+            if stored_error is not None:
+                details["stored_scene_fingerprint_error"] = stored_error
+            if current_error is not None:
+                details["current_scene_fingerprint_error"] = current_error
+            message = (
+                "Cannot resume stopped cycle because the live scene changed while "
+                "execution was stopped. Reset or re-plan before running."
+            )
+            with self._lock:
+                self._error = message
+                self._error_code = "resumable_scene_changed"
+                self._error_details = details
+            raise RuntimeError(message)
 
     def _clear_runtime_scene(self) -> None:
         """Return the planning scene to its authored baseline.
@@ -483,6 +648,8 @@ class CycleManager:
         with self._lock:
             self._node_statuses = {}
             self._pending_delegated_recovery = None
+            self._resumable_stop_scene_fingerprint = None
+            self._resumable_stop_scene_fingerprint_error = None
 
     @property
     def state(self) -> CycleState:
@@ -783,11 +950,16 @@ class CycleManager:
             kernel_action="pause_if_executing",
         )
         structured_code, structured_details = self._capture_kernel_error_diagnostics()
+        fingerprint, fingerprint_error = self._capture_scene_resume_fingerprint()
         with self._lock:
             self._error = error_message
             self._error_code = structured_code
             self._error_details = structured_details
             self._state = CycleState.STOPPED
+            self._store_resumable_stop_scene_fingerprint_locked(
+                fingerprint,
+                fingerprint_error,
+            )
 
     def _capture_kernel_error_diagnostics(
         self,
@@ -1196,6 +1368,7 @@ class CycleManager:
         start_from_idle = False
         on_run_from_idle: Optional[Callable[[], None]] = None
 
+        self._assert_resumable_stop_scene_unchanged()
         with self._lock:
             if self._state == CycleState.RUNNING:
                 return  # Already running, no-op
@@ -1306,6 +1479,8 @@ class CycleManager:
                         raise RuntimeError("Cannot resume stopped cycle without a tree")
                     self._start_tick_thread(self._tick_loop)
                 self._state = CycleState.RUNNING
+                self._resumable_stop_scene_fingerprint = None
+                self._resumable_stop_scene_fingerprint_error = None
 
         if start_from_idle:
             if prepare_fresh:
@@ -1362,11 +1537,26 @@ class CycleManager:
             logger.exception("Failed to read kernel state after operator stop")
             kernel_state = ExecutionState.STOPPING
 
+        should_capture = False
+        with self._lock:
+            should_capture = (
+                self._state == CycleState.STOPPING
+                and self._kernel_stop_terminal(kernel_state)
+            )
+        fingerprint, fingerprint_error = (
+            self._capture_scene_resume_fingerprint()
+            if should_capture
+            else (None, None)
+        )
         with self._lock:
             if self._state != CycleState.STOPPING:
                 return
             if self._kernel_stop_terminal(kernel_state):
                 self._state = CycleState.STOPPED
+                self._store_resumable_stop_scene_fingerprint_locked(
+                    fingerprint,
+                    fingerprint_error,
+                )
             else:
                 self._start_stop_settle_watcher_locked()
 
@@ -1424,6 +1614,8 @@ class CycleManager:
                     self._error_details = None
                     self._state = CycleState.IDLE
                     self._pending_delegated_recovery = None
+                    self._resumable_stop_scene_fingerprint = None
+                    self._resumable_stop_scene_fingerprint_error = None
                     cleanup_alive = (
                         self._tick_cleanup_thread is not None
                         and self._tick_cleanup_thread.is_alive()
@@ -1455,6 +1647,8 @@ class CycleManager:
             self._error_details = None
             self._state = CycleState.IDLE
             self._pending_delegated_recovery = None
+            self._resumable_stop_scene_fingerprint = None
+            self._resumable_stop_scene_fingerprint_error = None
 
     def set_velocity_scale(
         self, scale: float, principal_id: str | None = None
@@ -1560,6 +1754,8 @@ class CycleManager:
                     self._error_details = None
                     self._state = CycleState.IDLE
                     self._tick_thread = None
+                    self._resumable_stop_scene_fingerprint = None
+                    self._resumable_stop_scene_fingerprint_error = None
                 break
             
             # Drain native kernel events
@@ -1615,6 +1811,9 @@ class CycleManager:
                             tick_code, tick_details = (
                                 self._capture_kernel_error_diagnostics()
                             )
+                            fingerprint, fingerprint_error = (
+                                self._capture_scene_resume_fingerprint()
+                            )
                             with self._lock:
                                 self._error = failure_feedback
                                 self._error_code = (
@@ -1623,6 +1822,10 @@ class CycleManager:
                                 self._error_details = tick_details
                                 self._state = CycleState.STOPPED
                                 self._tick_thread = None
+                                self._store_resumable_stop_scene_fingerprint_locked(
+                                    fingerprint,
+                                    fingerprint_error,
+                                )
                             self._notify_recovery_exhausted(
                                 delegated_candidate, trigger
                             )
@@ -1640,6 +1843,9 @@ class CycleManager:
                         delegated_code, delegated_details = (
                             self._capture_kernel_error_diagnostics()
                         )
+                        fingerprint, fingerprint_error = (
+                            self._capture_scene_resume_fingerprint()
+                        )
                         with self._lock:
                             self._error = failure_feedback
                             self._error_code = (
@@ -1649,6 +1855,10 @@ class CycleManager:
                             self._pending_delegated_recovery = request
                             self._state = CycleState.STOPPED
                             self._tick_thread = None
+                            self._store_resumable_stop_scene_fingerprint_locked(
+                                fingerprint,
+                                fingerprint_error,
+                            )
                         self._notify_delegated_recovery_requested(request)
                         break
                 terminal_code, terminal_details = (
@@ -1669,6 +1879,8 @@ class CycleManager:
                         self._error_details = None
                     self._state = CycleState.IDLE
                     self._tick_thread = None
+                    self._resumable_stop_scene_fingerprint = None
+                    self._resumable_stop_scene_fingerprint_error = None
                 break
             
             # Sleep remainder of period
@@ -2013,6 +2225,18 @@ class CycleManager:
                 else CycleState.STOPPED
             )
         )
+        rebaseline_resumable_scene = (
+            base_state == CycleState.STOPPED
+            and session.entry_state == CycleState.STOPPED.value
+            and session.status == "completed"
+            and requested_outcome != "reset"
+        )
+        if rebaseline_resumable_scene:
+            resume_fingerprint, resume_fingerprint_error = (
+                self._capture_scene_resume_fingerprint()
+            )
+        else:
+            resume_fingerprint, resume_fingerprint_error = None, None
         with self._lock:
             if context is not None:
                 self._tree = context.tree
@@ -2026,6 +2250,21 @@ class CycleManager:
             self._tick_stop_event.clear()
             self._tick_pause_event.set()
             self._intervention_context = None
+            if rebaseline_resumable_scene:
+                self._store_resumable_stop_scene_fingerprint_locked(
+                    resume_fingerprint,
+                    resume_fingerprint_error,
+                )
+                session.record_event(
+                    "resume_scene_baselined",
+                    fingerprint_available=str(
+                        resume_fingerprint is not None
+                    ).lower(),
+                    fingerprint_error=resume_fingerprint_error,
+                )
+            elif base_state != CycleState.STOPPED:
+                self._resumable_stop_scene_fingerprint = None
+                self._resumable_stop_scene_fingerprint_error = None
 
         if forced_state is not None:
             if session.actual_outcome is None:

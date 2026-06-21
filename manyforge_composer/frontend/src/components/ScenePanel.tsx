@@ -686,7 +686,7 @@ export function SceneDraftMirror() {
   const lastMirroredKeyRef = useRef<string | null>(null);
 
   useEffect(() => {
-    const safeToMirror = cycleState === 'idle' || cycleState === 'stopped';
+    const safeToMirror = cycleState === 'idle';
     // Do not treat the store's default empty scene as authoritative before the
     // loaded program draft has hydrated, or we can wipe the backend-seeded
     // authored scene on first load.

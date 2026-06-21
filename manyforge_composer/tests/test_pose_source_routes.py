@@ -389,6 +389,62 @@ def test_continuous_snapshot_applies_planning_scene_without_operator_apply(tmp_p
     ]
 
 
+def test_continuous_snapshot_skips_live_mutation_during_resumable_stop(
+    tmp_path: Path,
+) -> None:
+    client, state = _client(tmp_path)
+    state.deployment = _minimal_deployment(
+        pose_sources=_pose_sources(box_policy="continuous")
+    )
+    _add_box(client)
+    state.cycle_manager = SimpleNamespace(
+        state=CycleState.STOPPED,
+        live_scene_mutation_block_reason=lambda: "resumable_stopped_context",
+    )
+
+    response = _post_fresh_box_snapshot(client)
+
+    assert response.json()["continuous_apply"]["queued"] is True
+    apply_result = _wait_for_pose_source_apply(state)
+    assert apply_result["success"] is True
+    assert apply_result["applied_count"] == 0
+    assert apply_result["skipped_count"] == 1
+    assert apply_result["details"][0]["skip_reason"] == "resumable_stopped_context"
+    assert state.kernel.get_scene_objects()[0].pose_in_universe["position_m"] == [
+        0.0,
+        0.0,
+        0.0,
+    ]
+    assert state.kernel.scene_edits[-1].operation == "add"
+
+
+def test_continuous_snapshot_fails_closed_when_scene_guard_unavailable(
+    tmp_path: Path,
+) -> None:
+    client, state = _client(tmp_path)
+    state.deployment = _minimal_deployment(
+        pose_sources=_pose_sources(box_policy="continuous")
+    )
+    _add_box(client)
+    state.cycle_manager = SimpleNamespace(
+        state=CycleState.STOPPED,
+        live_scene_mutation_block_reason=lambda: "scene_mutation_guard_unavailable",
+    )
+
+    response = _post_fresh_box_snapshot(client)
+
+    assert response.json()["continuous_apply"]["queued"] is True
+    apply_result = _wait_for_pose_source_apply(state)
+    assert apply_result["success"] is False
+    assert apply_result["applied_count"] == 0
+    assert apply_result["rejected_count"] == 1
+    assert (
+        apply_result["details"][0]["reject_reason"]
+        == "scene_mutation_guard_unavailable"
+    )
+    assert state.kernel.scene_edits[-1].operation == "add"
+
+
 def test_scene_state_does_not_wait_for_blocked_pose_source_apply(tmp_path: Path) -> None:
     client, state = _client(tmp_path)
     state.deployment = _minimal_deployment(

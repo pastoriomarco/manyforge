@@ -15,6 +15,9 @@ from manyforge_behavior.kernel_client import (
     ExecutionState,
     ExecutionStatus,
     MockKernelClient,
+    SceneEditRequest,
+    SceneObjectSnapshot,
+    SceneShape,
 )
 from manyforge_behavior.runner import OrchestratorRunner
 from manyforge_behavior.cycle_manager import (
@@ -23,6 +26,7 @@ from manyforge_behavior.cycle_manager import (
     CycleState,
     InterventionSession,
     RecoveryTrigger,
+    _scene_resume_fingerprint_from_objects,
     canonical_recovery_trigger_values,
 )
 
@@ -151,6 +155,112 @@ class TestCycleManagerRun:
         # Run again — should resume
         manager.run()
         assert manager.state == CycleState.RUNNING
+
+    def test_run_from_stopped_rejects_if_live_scene_changed(self, kernel):
+        """A resumable STOPPED cycle owns the live scene state.
+
+        If an external route detaches/moves/removes scene objects while stopped,
+        the memory behavior tree may otherwise resume past an already-successful
+        attach node with stale assumptions. Run must fail closed instead.
+        """
+
+        slow_kernel = MockKernelClient(execute_duration_s=1.0)
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, slow_kernel)
+        manager = CycleManager(runner, slow_kernel)
+
+        try:
+            manager.run()
+            time.sleep(0.2)
+            manager.stop()
+            assert manager.state == CycleState.STOPPED
+
+            result = slow_kernel.scene_edit(
+                SceneEditRequest(
+                    operation="update_pose",
+                    object_id="table",
+                    pose_position_m=[0.3, 0.1, 0.2],
+                    pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
+                    frame_id="base_link",
+                )
+            )
+            assert result.success is True
+
+            with pytest.raises(RuntimeError, match="live scene changed"):
+                manager.run()
+            assert manager.state == CycleState.STOPPED
+            assert manager.error_code == "resumable_scene_changed"
+        finally:
+            manager.reset()
+
+    def test_run_from_stopped_rejects_if_attached_object_detached(self, kernel):
+        """Resume must not trust a memory tree after held attachment is lost."""
+
+        slow_kernel = MockKernelClient(execute_duration_s=1.0)
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, slow_kernel)
+        manager = CycleManager(runner, slow_kernel)
+
+        try:
+            manager.run()
+            attach = slow_kernel.scene_edit(
+                SceneEditRequest(
+                    operation="attach",
+                    object_id="table",
+                    frame_id="tool0",
+                )
+            )
+            assert attach.success is True
+            time.sleep(0.2)
+            manager.stop()
+            assert manager.state == CycleState.STOPPED
+
+            detach = slow_kernel.scene_edit(
+                SceneEditRequest(operation="detach", object_id="table")
+            )
+            assert detach.success is True
+
+            with pytest.raises(RuntimeError, match="live scene changed"):
+                manager.run()
+            assert manager.state == CycleState.STOPPED
+            assert manager.error_code == "resumable_scene_changed"
+        finally:
+            manager.reset()
+
+    def test_attached_scene_fingerprint_uses_attachment_frame_not_world_pose(self):
+        """Real feedback/FK drift must not look like an attachment mutation."""
+
+        shape = SceneShape(type="box", box_dimensions_m=[0.1, 0.2, 0.3])
+        first = SceneObjectSnapshot(
+            object_id="part",
+            shape=shape,
+            pose_in_frame={
+                "position_m": [0.01, 0.0, 0.02],
+                "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+            },
+            pose_in_universe={
+                "position_m": [1.0, 2.0, 3.0],
+                "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+            },
+            attached=True,
+            frame_id="tool0",
+        )
+        second = SceneObjectSnapshot(
+            object_id="part",
+            shape=shape,
+            pose_in_frame={
+                "position_m": [0.01, 0.0, 0.02],
+                "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+            },
+            pose_in_universe={
+                "position_m": [1.1, 2.1, 3.1],
+                "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+            },
+            attached=True,
+            frame_id="tool0",
+        )
+
+        assert _scene_resume_fingerprint_from_objects([first]) == (
+            _scene_resume_fingerprint_from_objects([second])
+        )
 
     def test_run_from_stopped_motion_soft_fail_clears_interrupted_kernel_retry(
         self, kernel
@@ -1314,6 +1424,62 @@ class TestIntervention:
         time.sleep(0.3)
         assert session.status in ("completed", "failed")
         assert manager.state == CycleState.STOPPED
+
+    def test_completed_intervention_rebaselines_resumable_stopped_scene(self, kernel):
+        """A successful direct-control recovery may intentionally change the scene.
+
+        The STOPPED resume guard must keep blocking unapproved scene edits, but
+        once an explicit intervention completes and returns to STOPPED, the
+        post-intervention scene is the new operator-approved resume baseline.
+        """
+
+        slow_kernel = MockKernelClient(execute_duration_s=1.0)
+        manager = self._make_manager(slow_kernel)
+
+        try:
+            manager.run()
+            time.sleep(0.05)
+            manager.stop()
+            assert manager.state == CycleState.STOPPED
+
+            session = manager.execute_intervention(
+                {
+                    "id": "timer",
+                    "name": "scene_recovery_timer",
+                    "params": {"duration_s": 0.15},
+                },
+                resume_target="stop",
+                **self._stopped_manual_metadata(authority_source="human"),
+            )
+            assert manager.state == CycleState.DIRECT_CONTROL
+
+            result = slow_kernel.scene_edit(
+                SceneEditRequest(
+                    operation="update_pose",
+                    object_id="table",
+                    pose_position_m=[0.35, 0.1, 0.2],
+                    pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
+                    frame_id="base_link",
+                )
+            )
+            assert result.success is True
+
+            for _ in range(50):
+                if session.status != "running" and manager.state == CycleState.STOPPED:
+                    break
+                time.sleep(0.02)
+
+            assert session.status == "completed"
+            assert manager.state == CycleState.STOPPED
+            assert any(
+                event["type"] == "resume_scene_baselined"
+                for event in session.events
+            )
+
+            manager.run()
+            assert manager.state == CycleState.RUNNING
+        finally:
+            manager.reset()
 
     def test_execute_from_running_raises(self, kernel):
         """Intervention raises RuntimeError when cycle is RUNNING."""

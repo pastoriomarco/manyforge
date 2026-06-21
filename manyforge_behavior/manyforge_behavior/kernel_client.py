@@ -334,6 +334,7 @@ class SceneShape:
 class SceneObjectSnapshot:
     object_id: str
     shape: Optional[SceneShape] = None
+    pose_in_frame: Optional[Dict[str, Any]] = None
     pose_in_universe: Optional[Dict[str, Any]] = None
     attached: bool = False
     frame_id: Optional[str] = None
@@ -1653,6 +1654,9 @@ class MockKernelClient(KernelClient):
                 SceneObjectSnapshot(
                     object_id=object_id,
                     shape=shape,
+                    pose_in_frame=self.get_object_pose(
+                        object_id, tracked.get("frame_id") or "universe"
+                    ),
                     pose_in_universe=self.get_object_pose(object_id, "universe"),
                     attached=tracked.get("frame_id") not in {None, "universe", "base_link"},
                     frame_id=tracked.get("frame_id"),

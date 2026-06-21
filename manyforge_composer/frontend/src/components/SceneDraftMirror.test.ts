@@ -25,4 +25,11 @@ describe('SceneDraftMirror authority boundary', () => {
     expect(source).not.toMatch(/\bapi\.scene\.state\(/);
     expect(source).not.toMatch(/\bapi\.scene\.edit\(/);
   });
+
+  it('does not auto-mirror while stopped because STOPPED can be resumable', () => {
+    const source = sceneDraftMirrorSource();
+
+    expect(source).toContain("cycleState === 'idle'");
+    expect(source).not.toContain("cycleState === 'stopped'");
+  });
 });

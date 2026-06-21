@@ -1098,6 +1098,79 @@ def test_authored_scene_sync_rejects_while_running():
     assert "not allowed while execution is active" in (body["error"] or "")
 
 
+def test_live_scene_mutation_rejects_while_stopped_context_is_resumable():
+    client, state, _kernel = _load_program_for_scene_sync()
+    assert state.cycle_manager is not None
+    state.cycle_manager._state = CycleState.STOPPED
+    state.cycle_manager._tree = SimpleNamespace(root=SimpleNamespace(status="RUNNING"))
+
+    sync_response = client.post(
+        "/api/scene/sync-authored",
+        json=_authored_sync_payload(state),
+    )
+    assert sync_response.status_code == 409
+    sync_body = sync_response.json()
+    assert sync_body["success"] is False
+    assert "resumable behavior-tree context" in (sync_body["error"] or "")
+
+    edit_response = client.post(
+        "/api/scene/edit",
+        json={
+            "operation": "add",
+            "object_id": "operator_box",
+            "shape_type": "box",
+            "box_dimensions_m": [0.1, 0.2, 0.3],
+            "pose_position_m": [0.4, 0.5, 0.6],
+            "pose_orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+        },
+    )
+    assert edit_response.status_code == 409
+    edit_body = edit_response.json()
+    assert edit_body["success"] is False
+    assert "resumable behavior-tree context" in (edit_body["error"] or "")
+
+
+def test_authored_scene_sync_rejects_attached_object_recreate():
+    client, state, kernel = _load_program_for_scene_sync()
+    assert client.post(
+        "/api/scene/sync-authored",
+        json=_authored_sync_payload(state),
+    ).json()["success"] is True
+    assert kernel.scene_edit(
+        SceneEditRequest(operation="attach", object_id="table", frame_id="tool0")
+    ).success is True
+
+    response = client.post("/api/scene/sync-authored", json=_authored_sync_payload(state))
+
+    assert response.status_code == 409
+    body = response.json()
+    assert body["success"] is False
+    assert body["failedObjectId"] == "table"
+    assert "attached object" in (body["error"] or "")
+
+
+def test_authored_scene_sync_rejects_attached_object_removal():
+    client, state, kernel = _load_program_for_scene_sync()
+    assert client.post(
+        "/api/scene/sync-authored",
+        json=_authored_sync_payload(state),
+    ).json()["success"] is True
+    assert kernel.scene_edit(
+        SceneEditRequest(operation="attach", object_id="table", frame_id="tool0")
+    ).success is True
+
+    response = client.post(
+        "/api/scene/sync-authored",
+        json=_authored_sync_payload(state, [], signature="empty-draft"),
+    )
+
+    assert response.status_code == 409
+    body = response.json()
+    assert body["success"] is False
+    assert body["failedObjectId"] == "table"
+    assert "remove an attached object" in (body["error"] or "")
+
+
 def test_authored_scene_sync_concurrent_identical_requests_are_idempotent():
     client, state, kernel = _load_program_for_scene_sync()
     payload = _authored_sync_payload(state)

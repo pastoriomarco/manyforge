@@ -11,7 +11,6 @@ from typing import Any, Optional
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import JSONResponse, Response
 
-from manyforge_behavior.cycle_manager import CycleState
 from manyforge_behavior.kernel_client import SceneEditRequest
 
 from .gripper_command import (
@@ -1288,6 +1287,23 @@ def create_scene_router(state: ComposerState) -> APIRouter:
     """Create the scene router with the given state."""
     router = APIRouter()
 
+    def live_scene_mutation_block_reason() -> str | None:
+        return state.live_scene_mutation_block_reason()
+
+    def live_scene_mutation_block_message(reason: str) -> str:
+        if reason == "resumable_stopped_context":
+            return (
+                "Live scene edits are not allowed while execution is stopped "
+                "with a resumable behavior-tree context. Resume the cycle, or "
+                "Reset/re-plan before changing the live scene."
+            )
+        if reason.startswith("execution_active:"):
+            return (
+                "Scene edits are not allowed while execution is active "
+                f"(state={reason.split(':', 1)[1]})"
+            )
+        return f"Live scene mutation is not allowed in the current runtime state ({reason})"
+
     @router.get("/state")
     def get_scene_state() -> dict[str, Any]:
         """Get full scene state including robot and objects."""
@@ -1692,19 +1708,13 @@ def create_scene_router(state: ComposerState) -> APIRouter:
             ).model_dump(by_alias=True)
 
         with state.scene_edit_lock:
-            if state.cycle_manager is not None and state.cycle_manager.state in {
-                CycleState.RUNNING,
-                CycleState.STOPPING,
-                CycleState.DIRECT_CONTROL,
-            }:
+            block_reason = live_scene_mutation_block_reason()
+            if block_reason is not None:
                 return JSONResponse(
                     status_code=409,
                     content=response(
                         success=False,
-                        error=(
-                            "Authored scene sync is not allowed while execution "
-                            f"is active (state={state.cycle_manager.state.name})"
-                        ),
+                        error=live_scene_mutation_block_message(block_reason),
                     ),
                 )
 
@@ -1813,8 +1823,27 @@ def create_scene_router(state: ComposerState) -> APIRouter:
                 return result
 
             for object_id in sorted(managed_ids - desired_ids):
-                if object_id not in live_objects:
+                live_object = live_objects.get(object_id)
+                if live_object is None:
                     continue
+                if getattr(live_object, "attached", False):
+                    return JSONResponse(
+                        status_code=409,
+                        content=response(
+                            success=False,
+                            added=added,
+                            updated=updated,
+                            removed=removed,
+                            unchanged=unchanged,
+                            failed_object_id=object_id,
+                            error=(
+                                "Authored scene sync would remove an attached "
+                                "object from the live scene"
+                            ),
+                            visual_refresh_requested=visual_refresh_requested,
+                            visual_publish_requested=visual_publish_requested,
+                        ),
+                    )
                 request = SceneEditRequest(operation="remove", object_id=object_id)
                 result = state.kernel.scene_edit(request)
                 if not result.success:
@@ -1896,7 +1925,26 @@ def create_scene_router(state: ComposerState) -> APIRouter:
                     _scene_sync_pose_key_from_object(live_object)
                     == _scene_sync_pose_key_from_request(request)
                 )
-                if getattr(live_object, "attached", False) or not same_shape:
+                if getattr(live_object, "attached", False):
+                    return JSONResponse(
+                        status_code=409,
+                        content=response(
+                            success=False,
+                            added=added,
+                            updated=updated,
+                            removed=removed,
+                            unchanged=unchanged,
+                            failed_object_id=object_id,
+                            error=(
+                                "Authored scene sync would detach/recreate an "
+                                "attached object in the live scene"
+                            ),
+                            visual_refresh_requested=visual_refresh_requested,
+                            visual_publish_requested=visual_publish_requested,
+                        ),
+                    )
+
+                if not same_shape:
                     remove_request = SceneEditRequest(
                         operation="remove",
                         object_id=object_id,
@@ -2020,21 +2068,18 @@ def create_scene_router(state: ComposerState) -> APIRouter:
     def edit_scene(validated: SceneEditApiRequest) -> dict[str, Any]:
         """Edit the scene at runtime (add, upsert, remove, update_pose, attach, detach)."""
         with state.scene_edit_lock:
-            if state.cycle_manager is not None and state.cycle_manager.state in {
-                CycleState.RUNNING,
-                CycleState.STOPPING,
-                CycleState.DIRECT_CONTROL,
-            }:
-                cycle_state = state.cycle_manager.state
+            block_reason = live_scene_mutation_block_reason()
+            if block_reason is not None:
                 return JSONResponse(
                     status_code=409,
                     content={
                         "success": False,
-                        "error": (
-                            "Scene edits are not allowed while execution is active "
-                            f"(state={cycle_state.name})"
+                        "error": live_scene_mutation_block_message(block_reason),
+                        "cycleState": (
+                            state.cycle_manager.state.value
+                            if state.cycle_manager is not None
+                            else "idle"
                         ),
-                        "cycleState": cycle_state.value,
                         "timestamp_ns": time.monotonic_ns(),
                     },
                 )

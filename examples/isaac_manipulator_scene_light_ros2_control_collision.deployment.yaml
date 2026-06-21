@@ -146,6 +146,32 @@ adapters:
         wrist_1_joint: 10.0
         wrist_2_joint: 10.0
         wrist_3_joint: 10.0
+      # Controlled-stop defaults: operator Stop button = soft_on_path
+      # (backend-computed path ramp); fault = hard_deceleration, which rides the
+      # controller decelerate_on_cancel + velocity state interface declared above.
+      operator_stop_profile:
+        profile_id: "operator_soft_on_path"
+        stop_mode: "soft_on_path"
+        deceleration_time_s: 1.0
+        allow_natural_completion_on_short_path: true
+        per_joint_max_deceleration_rad_s2:
+          shoulder_pan_joint: 10.0
+          shoulder_lift_joint: 10.0
+          elbow_joint: 10.0
+          wrist_1_joint: 10.0
+          wrist_2_joint: 10.0
+          wrist_3_joint: 10.0
+      default_fault_stop_profile:
+        profile_id: "default_fault_hard_deceleration"
+        stop_mode: "hard_deceleration"
+        deceleration_time_s: 1.0
+        per_joint_max_deceleration_rad_s2:
+          shoulder_pan_joint: 10.0
+          shoulder_lift_joint: 10.0
+          elbow_joint: 10.0
+          wrist_1_joint: 10.0
+          wrist_2_joint: 10.0
+          wrist_3_joint: 10.0
       initial_joint_positions_rad:
       - 2.63422544
       - -0.875980752

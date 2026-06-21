@@ -3002,6 +3002,34 @@ class ComposerState:
         with self._pose_source_lock:
             self._pose_source_snapshots.clear()
 
+    def live_scene_mutation_block_reason(self) -> str | None:
+        """Return why live scene mutation is unsafe right now, if blocked."""
+        manager = self.cycle_manager
+        if manager is None:
+            return None
+        checker = getattr(manager, "live_scene_mutation_block_reason", None)
+        if callable(checker):
+            try:
+                reason = checker()
+            except Exception as exc:  # noqa: BLE001 - unreadable guard fails closed
+                logger.warning(
+                    "live scene mutation guard failed closed: %s",
+                    exc,
+                    exc_info=True,
+                )
+                return "scene_mutation_guard_unavailable"
+            if reason is None:
+                return None
+            if isinstance(reason, str):
+                return reason if reason else None
+
+        cycle_state = getattr(manager, "state", None)
+        cycle_value = str(getattr(cycle_state, "value", "") or "").lower()
+        cycle_name = str(getattr(cycle_state, "name", "") or cycle_value).upper()
+        if cycle_value in {"running", "stopping", "direct_control"}:
+            return f"execution_active:{cycle_name}"
+        return "scene_mutation_guard_unavailable"
+
     def apply_pose_source_updates(
         self,
         *,
@@ -3046,6 +3074,40 @@ class ComposerState:
                 "skipped_count": 0,
                 "rejected_count": 1,
                 "details": [],
+            }
+        block_reason = self.live_scene_mutation_block_reason()
+        if block_reason == "resumable_stopped_context":
+            return {
+                "success": True,
+                "policy": policy,
+                "applied_count": 0,
+                "skipped_count": 1,
+                "rejected_count": 0,
+                "details": [
+                    {
+                        "status": "skipped",
+                        "skip_reason": "resumable_stopped_context",
+                        "reason": reason,
+                    }
+                ],
+                "blocked_reason": block_reason,
+            }
+        if block_reason == "scene_mutation_guard_unavailable":
+            return {
+                "success": False,
+                "policy": policy,
+                "error": "live scene mutation guard unavailable",
+                "applied_count": 0,
+                "skipped_count": 0,
+                "rejected_count": 1,
+                "details": [
+                    {
+                        "status": "rejected",
+                        "reject_reason": "scene_mutation_guard_unavailable",
+                        "reason": reason,
+                    }
+                ],
+                "blocked_reason": block_reason,
             }
         deployment = self.deployment
         if deployment is None or not getattr(deployment, "pose_sources", {}):
@@ -3860,6 +3922,18 @@ class ComposerState:
         manager = self.cycle_manager
         if manager is None:
             return
+        block_reason = self.live_scene_mutation_block_reason()
+        if block_reason == "resumable_stopped_context":
+            raise RuntimeError(
+                "Cannot reset simulation while a stopped cycle still has a "
+                "resumable behavior-tree context; reset the cycle or resume it "
+                "before resetting the simulator"
+            )
+        if block_reason == "scene_mutation_guard_unavailable":
+            raise RuntimeError(
+                f"Cannot {operation} simulation: live scene mutation guard is "
+                "unavailable"
+            )
         cycle_state = manager.state.value
         if cycle_state == "running" and not allow_running:
             raise RuntimeError(

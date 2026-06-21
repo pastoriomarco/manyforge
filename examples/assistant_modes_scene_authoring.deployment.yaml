@@ -96,6 +96,32 @@ adapters:
       mode: simulated
       execution_tick_hz: 100
       initial_joint_positions_rad: [0.0, -1.57, 1.57, -1.57, -1.57, 0.0]
+      # Controlled-stop defaults (backend-computed, native lane): operator Stop
+      # button = soft_on_path (1.0 s jerk-continuous path ramp); fault =
+      # spring_back_hold. per_joint_max_deceleration_rad_s2 bounds the ramp.
+      operator_stop_profile:
+        profile_id: "operator_soft_on_path"
+        stop_mode: "soft_on_path"
+        deceleration_time_s: 1.0
+        allow_natural_completion_on_short_path: true
+        per_joint_max_deceleration_rad_s2:
+          shoulder_pan_joint: 10.0
+          shoulder_lift_joint: 10.0
+          elbow_joint: 10.0
+          wrist_1_joint: 10.0
+          wrist_2_joint: 10.0
+          wrist_3_joint: 10.0
+      default_fault_stop_profile:
+        profile_id: "default_fault_spring_back"
+        stop_mode: "spring_back_hold"
+        deceleration_time_s: 1.0
+        per_joint_max_deceleration_rad_s2:
+          shoulder_pan_joint: 10.0
+          shoulder_lift_joint: 10.0
+          elbow_joint: 10.0
+          wrist_1_joint: 10.0
+          wrist_2_joint: 10.0
+          wrist_3_joint: 10.0
 
 orchestrator:
   engine: py_trees

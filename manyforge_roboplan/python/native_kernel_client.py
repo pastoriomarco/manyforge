@@ -783,10 +783,17 @@ class NativeKernelClient(KernelClient):
                     "position_m": list(pose_in_universe["position_m"]),
                     "orientation_xyzw": list(pose_in_universe["orientation_xyzw"]),
                 }
+            pose_in_frame = object_data.get("pose_in_frame")
+            if pose_in_frame is not None:
+                pose_in_frame = {
+                    "position_m": list(pose_in_frame["position_m"]),
+                    "orientation_xyzw": list(pose_in_frame["orientation_xyzw"]),
+                }
             objects.append(
                 SceneObjectSnapshot(
                     object_id=object_data["object_id"],
                     shape=shape,
+                    pose_in_frame=pose_in_frame,
                     pose_in_universe=pose_in_universe,
                     attached=bool(object_data.get("attached", False)),
                     frame_id=object_data.get("frame_id"),
