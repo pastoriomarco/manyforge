@@ -1960,6 +1960,95 @@ class Program:
         visit(self.tree)
         return required
 
+    @staticmethod
+    def iter_per_move_tcp_caps(
+        tree: "TreeNode | None",
+        resolver: "ParameterResolver | None",
+        skill_catalog: Any = None,
+    ) -> list[tuple[str, float]]:
+        """Walk a tree (mirroring ``required_capabilities``, including skill
+        expansion) and return ``(node_name, value)`` for every node that sets a
+        finite, numeric ``max_tcp_linear_speed_mps``, resolving ``${param:...}``
+        via ``resolver``.
+
+        Values that are unset, non-numeric, or reference an unknown parameter are
+        skipped (surfaced by the catalog/parameter validators). Shared so the
+        load/save/apply check (``Deployment.validate_against_program``), the
+        editor ``/program/validate`` check, and the runtime override-apply check
+        all use one walk and cannot drift.
+        """
+        if tree is None:
+            return []
+        found: list[tuple[str, float]] = []
+
+        def _record(node_name: str, params: dict[str, Any]) -> None:
+            raw = params.get("max_tcp_linear_speed_mps")
+            if raw is None:
+                return
+            if resolver is not None:
+                try:
+                    raw = resolver.resolve_value(raw)
+                except ValueError:
+                    return  # unknown ${param:...} ref — caught by tree validation
+            try:
+                value = float(raw)
+            except (TypeError, ValueError):
+                return  # non-numeric — caught by catalog/schema validation
+            if math.isfinite(value):
+                found.append((node_name, value))
+
+        def visit(current: TreeNode) -> None:
+            if skill_catalog is not None and skill_catalog.contains(current.id):
+                resolved_params = dict(current.params)
+                if resolver is not None:
+                    try:
+                        resolved_params = resolver.resolve(current.params)
+                    except ValueError:
+                        return  # unresolved ref — caught by tree validation
+                try:
+                    expanded_tree = tree_node_from_dict(
+                        skill_catalog.expand_node_dict(
+                            {
+                                "id": current.id,
+                                "name": current.name,
+                                "params": resolved_params,
+                                "children": [],
+                            }
+                        ),
+                        path="tree",
+                    )
+                except Exception:
+                    return  # malformed skill expansion — caught by tree validation
+                visit(expanded_tree)
+                return
+
+            _record(current.name, current.params)
+            for child in current.children:
+                visit(child)
+
+        visit(tree)
+        return found
+
+    def collect_per_move_tcp_speed_caps(
+        self, overrides: dict[str, Any] | None = None
+    ) -> list[tuple[str, float]]:
+        """Return ``(node_name, max_tcp_linear_speed_mps)`` for every tree node
+        that sets a finite, numeric per-move TCP linear-speed cap.
+
+        ``${param:...}`` references resolve against program-parameter defaults
+        plus optional runtime ``overrides``. Used by
+        ``Deployment.validate_against_program`` to reject a per-move cap that
+        exceeds the deployment-wide global cap.
+        """
+        if self.tree is None:
+            return []
+        resolver = (
+            ParameterResolver(self.get_parameter_defaults(), overrides)
+            if (self.parameters or overrides)
+            else None
+        )
+        return self.iter_per_move_tcp_caps(self.tree, resolver, self._skill_catalog)
+
     def _load_and_validate(self) -> None:
         with open(self._path) as f:
             data = yaml.safe_load(f)

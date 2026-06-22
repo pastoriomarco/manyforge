@@ -1512,6 +1512,79 @@ def test_runtime_override_requires_node_policy(client, tmp_path):
     assert "does not allow runtime overrides" in response.json()["detail"]
 
 
+def test_runtime_override_rejects_per_move_tcp_above_global(client, state, tmp_path):
+    """Fail closed: a runtime override setting a per-move TCP cap above the
+    deployment global cap is rejected, not silently clamped at runtime."""
+    state.deployment = Deployment(_DEPLOYMENT_PATH)  # global cap 0.25
+    state.deployment_source_path = _DEPLOYMENT_PATH
+    program_path = _write_program_with_runtime_policy(tmp_path)
+    client.post("/api/program/load", json={"path": program_path})
+
+    response = client.post(
+        "/api/program/runtime-overrides",
+        json={
+            "nodeName": "move_to_pick",
+            "params": {"max_tcp_linear_speed_mps": 0.4},
+            "authoritySource": "human",
+            "approvalMode": "human_approved",
+        },
+    )
+    assert response.status_code == 400
+    assert "exceeds the deployment global cap" in response.json()["detail"]
+
+
+def test_runtime_override_allows_per_move_tcp_within_global(client, state, tmp_path):
+    """A runtime override at or below the global cap is accepted."""
+    state.deployment = Deployment(_DEPLOYMENT_PATH)  # global cap 0.25
+    state.deployment_source_path = _DEPLOYMENT_PATH
+    program_path = _write_program_with_runtime_policy(tmp_path)
+    client.post("/api/program/load", json={"path": program_path})
+
+    response = client.post(
+        "/api/program/runtime-overrides",
+        json={
+            "nodeName": "move_to_pick",
+            "params": {"max_tcp_linear_speed_mps": 0.2},
+            "authoritySource": "human",
+            "approvalMode": "human_approved",
+        },
+    )
+    assert response.status_code == 200
+
+
+def test_program_validate_flags_per_move_tcp_above_global(client, state):
+    """Inline /program/validate surfaces an over-cap per-move value as an error
+    (early editor feedback mirroring the load/save/apply reject)."""
+    state.deployment = Deployment(_DEPLOYMENT_PATH)  # global cap 0.25
+    tree = {
+        "id": "sequence",
+        "name": "main",
+        "children": [
+            {
+                "id": "move_manipulator_action",
+                "name": "move_to_pick",
+                "params": {
+                    "move_id": "m",
+                    "motion_type": "joint_goal",
+                    "joint_goal_names": ["j1", "j2", "j3", "j4", "j5", "j6"],
+                    "joint_goal_positions_rad": [0.2, -1.2, 1.0, -1.5, -1.3, 0.4],
+                    "max_tcp_linear_speed_mps": 0.4,
+                    "planning_timeout_s": 2.0,
+                    "execution_timeout_s": 10.0,
+                },
+            }
+        ],
+    }
+    response = client.post("/api/program/validate", json={"tree": tree})
+    assert response.status_code == 200
+    data = response.json()
+    assert data["valid"] is False
+    assert any(
+        "exceeds the deployment global cap" in issue["message"]
+        for issue in data["errors"]
+    )
+
+
 def test_runtime_override_staged_in_direct_control_requires_reset_before_stopped_resume(tmp_path):
     kernel = MockKernelClient()
     state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)

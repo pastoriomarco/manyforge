@@ -29,7 +29,7 @@ function formatProgramParameterValue(value: unknown): string {
   }
 }
 
-function resolveProgramParameterLiteralValue(
+export function resolveProgramParameterLiteralValue(
   currentValue: unknown,
   fallbackValue: unknown,
   programParameters: ProgramParameter[],

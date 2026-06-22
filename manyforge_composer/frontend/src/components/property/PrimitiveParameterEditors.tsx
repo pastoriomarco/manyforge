@@ -152,18 +152,55 @@ function getNumericConstraintError(value: number, constraints: ConstraintMap): s
   return null;
 }
 
+/**
+ * Error if `value` exceeds a dynamic upper-bound cap (e.g. the deployment global
+ * TCP linear-speed cap). Equality with the cap is allowed; an undefined cap
+ * imposes no bound.
+ */
+export function getNumericCapError(
+  value: number,
+  capLimit: number | undefined,
+  capLabel?: string,
+): string | null {
+  if (
+    capLimit !== undefined
+    && Number.isFinite(capLimit)
+    && value > capLimit + 1e-9
+  ) {
+    return `Exceeds ${capLabel ?? 'cap'} ${capLimit} m/s`;
+  }
+  return null;
+}
+
+/**
+ * True when an OPTIONAL catalog param is left empty (omitted/null). Such a value
+ * is valid — not a "must be a number" error — because the backend applies a
+ * fallback (e.g. max_tcp_linear_speed_mps falls back to the deployment global
+ * cap). A REQUIRED param left empty, or an optional param holding a wrong-typed
+ * value (e.g. ''), is NOT omitted-optional and must still validate.
+ */
+export function isOmittedOptionalParam(required: boolean, rawValue: unknown): boolean {
+  return !required && (rawValue === undefined || rawValue === null);
+}
+
 export function NumericParamEditor({
   currentValue,
   isRunMode,
   onCommit,
   paramType,
   constraints,
+  placeholder,
+  capLimit,
+  capLabel,
 }: {
   currentValue: unknown;
   isRunMode: boolean;
   onCommit: (value: number) => void;
   paramType: 'float' | 'int';
   constraints: ConstraintMap;
+  placeholder?: string;
+  capLimit?: number;
+  capLabel?: string;
 }) {
   const [draft, setDraft] = useState(() =>
     currentValue !== undefined && currentValue !== null ? String(currentValue) : ''
@@ -203,6 +240,13 @@ export function NumericParamEditor({
     const constraintError = getNumericConstraintError(parsed, constraints);
     if (constraintError) {
       setError(constraintError);
+      return;
+    }
+    // Hard upper bound from a dynamic source (e.g. the deployment global TCP
+    // speed cap). Reject rather than accept a value the backend would clamp.
+    const capError = getNumericCapError(parsed, capLimit, capLabel);
+    if (capError) {
+      setError(capError);
       return;
     }
     setError(null);
@@ -255,6 +299,7 @@ export function NumericParamEditor({
           }
         }}
         disabled={isRunMode}
+        placeholder={placeholder}
         className={`w-full bg-gray-700 border border-gray-600 text-white rounded px-2 py-1 text-sm ${isRunMode ? 'opacity-50 cursor-not-allowed bg-gray-800' : ''}`}
       />
       {error && <div className="mt-1 text-[11px] text-red-400">{error}</div>}

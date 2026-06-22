@@ -204,6 +204,106 @@ def test_simulation_interfaces_pose_source_rejects_missing_entity_pose():
         rclpy.shutdown()
 
 
+def test_simulation_interfaces_pose_source_uses_configured_external_frame():
+    rclpy = pytest.importorskip("rclpy")
+    pytest.importorskip("simulation_interfaces")
+
+    from rclpy.executors import MultiThreadedExecutor
+    from simulation_interfaces.msg import SimulatorFeatures
+    from simulation_interfaces.srv import GetEntityState, GetSimulatorFeatures
+
+    from manyforge_ros.pose_source_sidecar import (
+        POSE_SOURCE_STATUS_FRESH,
+        SimulationInterfacesPoseSource,
+    )
+    from manyforge_ros.scene_mirror_probe import SimulationSceneMirrorClient
+
+    class Obj:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    rclpy.init(args=None)
+    executor = MultiThreadedExecutor(num_threads=2)
+    server_node = rclpy.create_node("manyforge_pose_source_frame_fake_sim")
+    client_node = rclpy.create_node("manyforge_pose_source_frame_client")
+    services = []
+
+    def get_features(_request, response):
+        response.features.features = [SimulatorFeatures.ENTITY_STATE_GETTING]
+        return response
+
+    def get_entity_state(request, response):
+        response.result.result = response.result.RESULT_OK
+        response.state.header.frame_id = request.entity.rsplit("/", 1)[-1]
+        response.state.pose.position.x = 0.5 if request.entity.endswith("tool0") else 1.0
+        response.state.pose.position.y = 2.0
+        response.state.pose.position.z = 3.0
+        response.state.pose.orientation.w = 1.0
+        return response
+
+    services.append(
+        server_node.create_service(
+            GetSimulatorFeatures,
+            "/get_simulator_features",
+            get_features,
+        )
+    )
+    services.append(
+        server_node.create_service(GetEntityState, "/get_entity_state", get_entity_state)
+    )
+
+    executor.add_node(server_node)
+    executor.add_node(client_node)
+    thread = threading.Thread(target=executor.spin, daemon=True)
+    thread.start()
+
+    try:
+        client = SimulationSceneMirrorClient(client_node, service_timeout_s=2.0)
+        source = SimulationInterfacesPoseSource.from_deployment_config(
+            client=client,
+            source_config=Obj(
+                source_id="isaac_scene_objects",
+                frame_id="universe",
+                max_update_hz=4.0,
+                stale_after_s=1.0,
+                measured_tcp=Obj(
+                    entity="/World/tool0",
+                    tcp_frame_id="tool0",
+                    frame_id="universe",
+                ),
+                objects={
+                    "isaac_cheese_box": Obj(
+                        object_id="isaac_cheese_box",
+                        entity="/mac_n_cheese_centered",
+                        apply_policy="continuous_unattached",
+                        frame_id="",
+                        confidence_min=None,
+                    )
+                },
+            ),
+            now_fn=lambda: 42.0,
+        )
+
+        result = source.poll_once()
+        assert result.status == POSE_SOURCE_STATUS_FRESH
+        assert result.updates[0].pose.frame_id == "universe"
+
+        snapshot = source.state.snapshot(monotonic_s=42.0)
+        assert snapshot.measured_tcp is not None
+        assert snapshot.measured_tcp.frame_id == "universe"
+        assert snapshot.measured_tcp.pose.frame_id == "universe"
+        payload = snapshot.to_dict()
+        assert payload["objects"][0]["update"]["pose"]["frameId"] == "universe"
+        assert payload["measuredTcp"]["pose"]["frameId"] == "universe"
+    finally:
+        for service in services:
+            server_node.destroy_service(service)
+        executor.shutdown()
+        server_node.destroy_node()
+        client_node.destroy_node()
+        rclpy.shutdown()
+
+
 def test_pose_stamped_topic_source_normalizes_latest_wins_state():
     rclpy = pytest.importorskip("rclpy")
     pytest.importorskip("geometry_msgs")

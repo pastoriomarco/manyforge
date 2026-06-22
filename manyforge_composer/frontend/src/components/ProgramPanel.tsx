@@ -4,6 +4,11 @@ import { useShallow } from 'zustand/react/shallow';
 import { useCatalogStore } from '../store/catalogStore';
 import { useEditLocked } from '../store/cycleStore';
 import { useProgramStore } from '../store/programStore';
+import {
+  getProgramParameterReferenceName,
+  resolveProgramParameterLiteralValue,
+  SUPPORTED_PROGRAM_PARAMETER_TYPES,
+} from './property/ProgramParameterBindingEditor';
 import type {
   CatalogEntry,
   CatalogParameter,
@@ -99,6 +104,68 @@ function collectParameterUsages(nodes: Node[]): Record<string, UsageRecord[]> {
       }),
     ]),
   );
+}
+
+interface BindCandidate {
+  nodeId: string;
+  nodeLabel: string;
+  fieldName: string;
+}
+
+/** Human-readable preview of the literal a field reverts to when unbound. */
+function formatLiteralPreview(value: unknown): string {
+  if (value === undefined) {
+    return 'unset';
+  }
+  if (value === null) {
+    return 'null';
+  }
+  if (typeof value === 'string') {
+    return value === '' ? '(empty)' : value;
+  }
+  return String(value);
+}
+
+/**
+ * Enumerate (node, field) pairs that can be BOUND to a program parameter of
+ * `paramType` — the complement of collectParameterUsages. A field qualifies when
+ * its catalog parameter is parameterizable, of a supported program-parameter
+ * type, type-compatible with the target parameter, and not already bound to a
+ * program parameter (bound fields appear in "Used By" as removable instead).
+ */
+export function collectBindCandidates(
+  nodes: Node[],
+  catalogIndex: Map<string, Map<string, CatalogParameter>>,
+  paramType: string,
+): BindCandidate[] {
+  const candidates: BindCandidate[] = [];
+  for (const node of nodes) {
+    const catalogId = String((node.data as { catalogId?: string }).catalogId ?? '');
+    const catalogParams = catalogIndex.get(catalogId);
+    if (!catalogParams) {
+      continue;
+    }
+    const params = (node.data as { params?: Record<string, unknown> }).params ?? {};
+    for (const [fieldName, catalogParam] of catalogParams) {
+      if (
+        !catalogParam.parameterizable
+        || !SUPPORTED_PROGRAM_PARAMETER_TYPES.has(catalogParam.type)
+        || catalogParam.type !== paramType
+      ) {
+        continue;
+      }
+      if (getProgramParameterReferenceName(params[fieldName]) !== null) {
+        continue;
+      }
+      candidates.push({ nodeId: node.id, nodeLabel: getNodeLabel(node), fieldName });
+    }
+  }
+  candidates.sort((left, right) =>
+    left.nodeLabel === right.nodeLabel
+      ? left.fieldName.localeCompare(right.fieldName)
+      : left.nodeLabel.localeCompare(right.nodeLabel),
+  );
+  return candidates;
 }
 
 function collectBlackboardUsages(
@@ -528,10 +595,16 @@ function UsageList({
   label,
   usages,
   onSelectNode,
+  onUnbind,
+  unbindDisabled,
+  revertPreview,
 }: {
   label: string;
   usages: UsageRecord[];
   onSelectNode: (nodeId: string) => void;
+  onUnbind?: (usage: UsageRecord) => void;
+  unbindDisabled?: boolean;
+  revertPreview?: (usage: UsageRecord) => string;
 }) {
   return (
     <div className="mt-3 border-t border-gray-700 pt-3">
@@ -542,20 +615,48 @@ function UsageList({
         <p className="text-xs text-gray-500">Unused in the current draft tree.</p>
       ) : (
         <div className="space-y-2">
-          {usages.map((usage) => (
-            <button
-              key={`${usage.nodeId}:${usage.paramPath}`}
-              type="button"
-              onClick={() => onSelectNode(usage.nodeId)}
-              className="flex w-full items-center justify-between rounded border border-gray-700 bg-gray-800/80 px-3 py-2 text-left hover:border-blue-500"
-            >
-              <div>
-                <div className="text-sm text-gray-100">{usage.nodeLabel}</div>
-                <div className="text-xs text-gray-500">{usage.paramPath}</div>
+          {usages.map((usage) => {
+            // Unbind rewrites a single top-level field back to a literal; nested
+            // paths (foo.bar / arr[0]) can't be safely rewritten by the
+            // whole-params store action, so they stay Select-only.
+            const canUnbind =
+              !!onUnbind
+              && !usage.paramPath.includes('.')
+              && !usage.paramPath.includes('[');
+            const preview = canUnbind && revertPreview ? revertPreview(usage) : null;
+            return (
+              <div
+                key={`${usage.nodeId}:${usage.paramPath}`}
+                className="flex items-center justify-between gap-2 rounded border border-gray-700 bg-gray-800/80 px-3 py-2"
+              >
+                <button
+                  type="button"
+                  onClick={() => onSelectNode(usage.nodeId)}
+                  className="min-w-0 flex-1 text-left hover:text-blue-300"
+                >
+                  <div className="truncate text-sm text-gray-100">{usage.nodeLabel}</div>
+                  <div className="truncate text-xs text-gray-500">{usage.paramPath}</div>
+                </button>
+                {canUnbind ? (
+                  <button
+                    type="button"
+                    disabled={unbindDisabled}
+                    onClick={() => onUnbind?.(usage)}
+                    title={
+                      preview !== null
+                        ? `Unbind — field reverts to ${preview}`
+                        : 'Unbind this field'
+                    }
+                    className="shrink-0 rounded border border-gray-600 px-2 py-0.5 text-[11px] text-gray-200 hover:bg-gray-700 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    Remove
+                  </button>
+                ) : (
+                  <span className="shrink-0 text-[11px] text-blue-400">Select</span>
+                )}
               </div>
-              <span className="text-[11px] text-blue-400">Select</span>
-            </button>
-          ))}
+            );
+          })}
         </div>
       )}
     </div>
@@ -576,6 +677,7 @@ export function ProgramPanel() {
     blackboardKeys,
     nodes,
     selectNode,
+    updateNodeParams,
     updateProgramParameter,
     addProgramParameter,
     deleteProgramParameter,
@@ -593,6 +695,7 @@ export function ProgramPanel() {
       blackboardKeys: s.blackboardKeys,
       nodes: s.nodes,
       selectNode: s.selectNode,
+      updateNodeParams: s.updateNodeParams,
       updateProgramParameter: s.updateProgramParameter,
       addProgramParameter: s.addProgramParameter,
       deleteProgramParameter: s.deleteProgramParameter,
@@ -608,6 +711,50 @@ export function ProgramPanel() {
   const editLocked = useEditLocked();
 
   const parameterUsageMap = useMemo(() => collectParameterUsages(nodes), [nodes]);
+  const catalogParamIndex = useMemo(() => buildCatalogParamIndex(entries), [entries]);
+
+  // Literal a bound field reverts to on unbind: the bound program parameter's
+  // default, else the node-field catalog default (matches the per-field
+  // "Literal value" path in ParameterBindingEditor).
+  const revertLiteralForUsage = (usage: UsageRecord): unknown => {
+    const node = nodes.find((candidate) => candidate.id === usage.nodeId);
+    if (!node) {
+      return undefined;
+    }
+    const params = (node.data as { params?: Record<string, unknown> }).params ?? {};
+    const catalogId = String((node.data as { catalogId?: string }).catalogId ?? '');
+    const catalogParam = catalogParamIndex.get(catalogId)?.get(usage.paramPath);
+    return resolveProgramParameterLiteralValue(
+      params[usage.paramPath],
+      catalogParam?.default,
+      programParameters,
+    );
+  };
+
+  const handleUnbindUsage = (usage: UsageRecord) => {
+    const node = nodes.find((candidate) => candidate.id === usage.nodeId);
+    if (!node) {
+      return;
+    }
+    const params = (node.data as { params?: Record<string, unknown> }).params ?? {};
+    updateNodeParams(usage.nodeId, {
+      ...params,
+      [usage.paramPath]: revertLiteralForUsage(usage),
+    });
+  };
+
+  const handleBindField = (parameterName: string, candidate: BindCandidate) => {
+    const node = nodes.find((entry) => entry.id === candidate.nodeId);
+    if (!node) {
+      return;
+    }
+    const params = (node.data as { params?: Record<string, unknown> }).params ?? {};
+    updateNodeParams(candidate.nodeId, {
+      ...params,
+      [candidate.fieldName]: `\${param:${parameterName}}`,
+    });
+  };
+
   const { namespaceUsages, keyUsages, fieldUsages } = useMemo(
     () => collectBlackboardUsages(nodes, entries),
     [nodes, entries],
@@ -751,7 +898,50 @@ export function ProgramPanel() {
               />
 
               <ConstraintSummary constraints={parameter.constraints ?? {}} />
-              <UsageList label="Used By" usages={usages} onSelectNode={selectNode} />
+              <UsageList
+                label="Used By"
+                usages={usages}
+                onSelectNode={selectNode}
+                onUnbind={handleUnbindUsage}
+                unbindDisabled={editLocked}
+                revertPreview={(usage) =>
+                  formatLiteralPreview(revertLiteralForUsage(usage))
+                }
+              />
+              {(() => {
+                const candidates = collectBindCandidates(
+                  nodes,
+                  catalogParamIndex,
+                  parameter.type,
+                );
+                if (candidates.length === 0) {
+                  return null;
+                }
+                return (
+                  <select
+                    disabled={editLocked}
+                    value=""
+                    onChange={(event) => {
+                      const index = Number(event.target.value);
+                      if (!Number.isNaN(index) && candidates[index]) {
+                        handleBindField(parameter.name, candidates[index]);
+                      }
+                    }}
+                    title="Bind a node field to this parameter"
+                    className="mt-2 w-full rounded border border-gray-600 bg-gray-800 px-2 py-1 text-xs text-gray-200 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    <option value="">+ Bind a node field…</option>
+                    {candidates.map((candidate, index) => (
+                      <option
+                        key={`${candidate.nodeId}:${candidate.fieldName}`}
+                        value={index}
+                      >
+                        {candidate.nodeLabel} · {candidate.fieldName}
+                      </option>
+                    ))}
+                  </select>
+                );
+              })()}
             </div>
           );
         })}

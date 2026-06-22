@@ -9,8 +9,10 @@ import yaml
 
 from manyforge_behavior.catalog import NodeCatalog
 from manyforge_behavior.deployment import (
+    DEFAULT_GLOBAL_MAX_TCP_LINEAR_SPEED_MPS,
     Deployment,
     DeploymentValidationError,
+    RobotConfig,
 )
 from manyforge_behavior.program import Program
 from manyforge_behavior.skill_loader import (
@@ -80,6 +82,49 @@ def _write_deployment(data: dict) -> str:
     yaml.dump(data, f)
     f.close()
     return f.name
+
+
+def _program_with_move_tcp(tcp_value=None, *, parameters=None) -> dict:
+    """Program dict with one valid move_manipulator_action node, optionally
+    carrying a per-move max_tcp_linear_speed_mps (literal number or
+    ``${param:...}`` reference)."""
+    move_params = {
+        "move_id": "pick_approach",
+        "motion_type": "joint_goal",
+        "joint_goal_names": ["j1", "j2", "j3", "j4", "j5", "j6"],
+        "joint_goal_positions_rad": [0.2, -1.2, 1.0, -1.5, -1.3, 0.4],
+        "velocity_scale": 0.5,
+        "planning_timeout_s": 2.0,
+        "execution_timeout_s": 10.0,
+    }
+    if tcp_value is not None:
+        move_params["max_tcp_linear_speed_mps"] = tcp_value
+    data = {
+        "api_version": "manyforge.program.v0",
+        "program_profile": "v0.0",
+        "name": "tcp_cap_test",
+        "catalog_version": "0.2.0",
+        "robot": {
+            "robot_id": "ur5",
+            "group_id": "arm",
+            "base_frame": "base_link",
+            "tcp_frame": "tool0",
+        },
+        "tree": {
+            "id": "sequence",
+            "name": "main",
+            "children": [
+                {
+                    "id": "move_manipulator_action",
+                    "name": "move_to_pick",
+                    "params": move_params,
+                }
+            ],
+        },
+    }
+    if parameters is not None:
+        data["parameters"] = parameters
+    return data
 
 
 def _minimal_program(**overrides) -> dict:
@@ -227,6 +272,29 @@ class TestDeploymentLoading:
         assert deploy.robot_config.srdf_path == "package://roboplan_example_models/models/ur_robot_model/ur5_gripper.srdf"
         assert deploy.robot_config.package_paths == []
         assert deploy.robot_config.global_max_tcp_linear_speed_mps == 0.25
+
+    def test_robot_config_default_global_cap_is_safe_positive(self):
+        """R4: a RobotConfig constructed in code is born with a positive,
+        conservative global TCP cap (not 0.0), so programmatic/scaffold
+        construction is mandatory-compliant instead of failing the > 0 rule."""
+        rc = RobotConfig(robot_id="r", group_id="g", urdf_path="package://x.urdf")
+        assert (
+            rc.global_max_tcp_linear_speed_mps
+            == DEFAULT_GLOBAL_MAX_TCP_LINEAR_SPEED_MPS
+        )
+        assert rc.global_max_tcp_linear_speed_mps > 0
+
+    def test_deployment_missing_global_cap_rejected(self):
+        """R4: the global cap is mandatory — an omitted value fails loud at load
+        (no silent fallback to the in-code default)."""
+        data = _minimal_deployment()
+        del data["robot_config"]["global_max_tcp_linear_speed_mps"]
+        path = _write_deployment(data)
+        try:
+            with pytest.raises(DeploymentValidationError, match="must be > 0"):
+                Deployment(path)
+        finally:
+            os.unlink(path)
 
     def test_robot_control_joint_limits_roundtrip(self):
         """spec/430 §3.2 — robot_control_joint_limits parse + serialize round-trip.
@@ -2279,6 +2347,52 @@ class TestCrossArtifactValidation:
         with pytest.raises(DeploymentValidationError, match="group_id"):
             deploy.validate_against_program(prog)
         os.unlink(path)
+
+    def test_validate_per_move_tcp_below_global_allowed(self, catalog):
+        """R3: a per-move cap below the global cap loads fine."""
+        deploy = Deployment(DEPLOYMENT_FIXTURE_PATH)  # global cap 0.25
+        prog = Program.from_dict(_program_with_move_tcp(0.1), catalog)
+        deploy.validate_against_program(prog)  # no raise
+
+    def test_validate_per_move_tcp_equal_global_allowed(self, catalog):
+        """R3: a per-move cap exactly equal to the global cap is allowed."""
+        deploy = Deployment(DEPLOYMENT_FIXTURE_PATH)
+        prog = Program.from_dict(_program_with_move_tcp(0.25), catalog)
+        deploy.validate_against_program(prog)  # no raise
+
+    def test_validate_per_move_tcp_above_global_rejected(self, catalog):
+        """R3 (fail-closed): a per-move cap above the global cap is rejected at
+        validation rather than silently clamped at runtime."""
+        deploy = Deployment(DEPLOYMENT_FIXTURE_PATH)
+        prog = Program.from_dict(_program_with_move_tcp(0.4), catalog)
+        with pytest.raises(
+            DeploymentValidationError, match="exceeds the deployment global cap"
+        ):
+            deploy.validate_against_program(prog)
+
+    def test_validate_per_move_tcp_param_ref_above_global_rejected(self, catalog):
+        """R3: a ${param:...} per-move cap is resolved against program defaults
+        and rejected when the default exceeds the global cap."""
+        deploy = Deployment(DEPLOYMENT_FIXTURE_PATH)
+        params = [
+            {
+                "name": "approach_tcp_cap",
+                "type": "float",
+                "default": 0.4,
+                "constraints": {"min_exclusive": 0.0},
+                "description": "per-move tcp cap",
+            }
+        ]
+        prog = Program.from_dict(
+            _program_with_move_tcp(
+                "${param:approach_tcp_cap}", parameters=params
+            ),
+            catalog,
+        )
+        with pytest.raises(
+            DeploymentValidationError, match="exceeds the deployment global cap"
+        ):
+            deploy.validate_against_program(prog)
 
     def test_validate_against_example_v0_1_program_success(self, catalog):
         """The real pick-and-place demo deployment matches the v0.1 example program."""

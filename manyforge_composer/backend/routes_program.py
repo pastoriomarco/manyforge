@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import logging
+import math
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Query
 from manyforge_behavior.deployment import Deployment, DeploymentValidationError
+from manyforge_behavior.parameters import ParameterResolver
 from manyforge_behavior.program import (
     BlackboardKey,
     BlackboardNamespaceField,
@@ -746,12 +748,34 @@ def create_program_router(state: ComposerState) -> APIRouter:
             program_profile=state.program.program_profile if state.program is not None else None,
             deployment_capability_keys=_deployment_capability_keys(state),
         )
+        error_responses = [
+            ProgramValidationIssueResponse(path=issue.path, message=issue.message)
+            for issue in errors
+        ]
+        # Per-move TCP cap inline check: early editor feedback mirroring the
+        # authoritative reject in Deployment.validate_against_program. Only runs
+        # when a deployment (hence a global cap) is loaded.
+        if state.deployment is not None:
+            global_cap = state.deployment.robot_config.global_max_tcp_linear_speed_mps
+            cap_resolver = (
+                ParameterResolver(parameter_defaults) if parameter_defaults else None
+            )
+            for node_name, per_move_cap in Program.iter_per_move_tcp_caps(
+                tree, cap_resolver, state.skill_catalog
+            ):
+                if per_move_cap > global_cap + 1e-9:
+                    error_responses.append(
+                        ProgramValidationIssueResponse(
+                            path=f"{node_name}.max_tcp_linear_speed_mps",
+                            message=(
+                                f"{per_move_cap} m/s exceeds the deployment global "
+                                f"cap {global_cap} m/s"
+                            ),
+                        )
+                    )
         return ProgramValidateResponse(
-            valid=not errors,
-            errors=[
-                ProgramValidationIssueResponse(path=issue.path, message=issue.message)
-                for issue in errors
-            ],
+            valid=not error_responses,
+            errors=error_responses,
             warnings=[
                 ProgramValidationIssueResponse(path=issue.path, message=issue.message)
                 for issue in warnings
@@ -783,6 +807,34 @@ def create_program_router(state: ComposerState) -> APIRouter:
         """Apply or stage a runtime override for a single node instance."""
         if state.program is None:
             raise HTTPException(status_code=404, detail="No program loaded")
+        # Fail closed: a runtime override that sets a per-move TCP cap above the
+        # deployment global cap is rejected here rather than silently clamped at
+        # runtime (the motion-node min() clamp stays as defense-in-depth).
+        if (
+            state.deployment is not None
+            and "max_tcp_linear_speed_mps" in request.params
+        ):
+            global_cap = state.deployment.robot_config.global_max_tcp_linear_speed_mps
+            resolver = ParameterResolver(state.program.get_parameter_defaults())
+            try:
+                resolved = resolver.resolve_value(
+                    request.params["max_tcp_linear_speed_mps"]
+                )
+                value: float | None = float(resolved)
+            except (ValueError, TypeError):
+                value = None
+            if (
+                value is not None
+                and math.isfinite(value)
+                and value > global_cap + 1e-9
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Runtime override max_tcp_linear_speed_mps={value} m/s "
+                        f"exceeds the deployment global cap {global_cap} m/s"
+                    ),
+                )
         try:
             state.apply_runtime_override(
                 node_name=request.node_name,

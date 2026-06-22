@@ -26,6 +26,14 @@ EXPECTED_MODEL_ENDPOINT_PROFILE_REGISTRY_API_VERSION = (
 )
 _REMOVED_COOPERATIVE_INTERRUPT_FIELDS = frozenset({"interrupt_sources"})
 
+# Conservative deployment-wide TCP linear-speed safety cap (m/s) used as the
+# default when a RobotConfig is constructed in code (e.g. a new-deployment
+# scaffold). Deployment YAML loaders still REQUIRE the cap explicitly and reject
+# an omitted or non-positive value (see _parse_robot_config) — the cap is
+# mandatory; this default only gives programmatic construction a safe starting
+# value and resolves the 0.0-vs-">0" inconsistency the bare default used to have.
+DEFAULT_GLOBAL_MAX_TCP_LINEAR_SPEED_MPS = 0.25
+
 
 @dataclass
 class RobotControlJointLimit:
@@ -53,7 +61,7 @@ class RobotConfig:
     urdf_path: str
     srdf_path: str = ""
     package_paths: list[str] = field(default_factory=list)
-    global_max_tcp_linear_speed_mps: float = 0.0
+    global_max_tcp_linear_speed_mps: float = DEFAULT_GLOBAL_MAX_TCP_LINEAR_SPEED_MPS
     # Per-joint validated Robot Control operator caps keyed by joint name.
     # Absent joints fall back to backend engine defaults (0.5 rad/s velocity,
     # 2.0 rad/s² acceleration). Validation: joint names must be in the
@@ -2490,6 +2498,9 @@ class Deployment:
         - program_profile doesn't match
         - robot_config.robot_id doesn't match program.robot.robot_id
         - robot_config.group_id doesn't match program.robot.group_id
+        - any node's per-move max_tcp_linear_speed_mps exceeds the deployment
+          global_max_tcp_linear_speed_mps (fail closed: an authored per-move cap
+          above the global safety cap is rejected rather than silently clamped)
         """
         if self.program_profile != program.program_profile:
             raise DeploymentValidationError(
@@ -2508,6 +2519,24 @@ class Deployment:
                 f"group_id mismatch: deployment has '{self.robot_config.group_id}', "
                 f"program has '{program.robot.group_id}'"
             )
+
+        # Per-move TCP linear-speed caps must not exceed the deployment-wide
+        # global cap. Fail closed: an authored per-move cap above the global
+        # safety limit is a misconfiguration — the motion nodes would otherwise
+        # silently clamp it via min(per-move, global) and run something other
+        # than authored. Reject at load/save/apply with an actionable error.
+        # Equality with the global cap is allowed. The runtime min() clamp in
+        # the motion nodes stays as defense-in-depth for paths that bypass this
+        # validation (e.g. runtime parameter overrides applied after load).
+        global_cap = self.robot_config.global_max_tcp_linear_speed_mps
+        for node_name, per_move_cap in program.collect_per_move_tcp_speed_caps():
+            if per_move_cap > global_cap + 1e-9:
+                raise DeploymentValidationError(
+                    f"Node '{node_name}': max_tcp_linear_speed_mps={per_move_cap} m/s "
+                    f"exceeds the deployment global cap "
+                    f"global_max_tcp_linear_speed_mps={global_cap} m/s. Lower the "
+                    f"per-move cap to <= {global_cap} m/s, or raise the global cap."
+                )
 
     def validate_robot_control_joint_limits_against(
         self, drivable_joint_names: list[str]

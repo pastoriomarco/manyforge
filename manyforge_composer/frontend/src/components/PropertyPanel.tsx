@@ -34,6 +34,7 @@ import {
   FixedFloatListEditor,
   ListParamEditor,
   NumericParamEditor,
+  isOmittedOptionalParam,
   StructuredParamEditor,
   TemplateVariableMapEditor,
 } from './property/PrimitiveParameterEditors';
@@ -465,6 +466,8 @@ export function PropertyPanel({ onCollapse }: { onCollapse: () => void }) {
   const { entries } = useCatalogStore();
   const cycleState = useCycleStore((state) => state.state);
   const deployment = useDeploymentStore((state) => state.deployment);
+  const globalTcpCap = deployment?.robotConfig?.globalMaxTcpLinearSpeedMps;
+  const hasTcpCap = typeof globalTcpCap === 'number' && globalTcpCap > 0;
   const selectedNode = selectedNodeId ? nodes.find(n => n.id === selectedNodeId) : undefined;
   const catalogEntry = selectedNode ? entries.find(e => e.id === selectedNode.data.catalogId) : undefined;
   const colorClass = selectedNode ? (KIND_COLORS[selectedNode.data.catalogId as string] || KIND_COLORS.default) : KIND_COLORS.default;
@@ -639,14 +642,21 @@ export function PropertyPanel({ onCollapse }: { onCollapse: () => void }) {
       if (!param.schema) {
         continue;
       }
-      const message = firstCatalogSchemaValidationMessage(
-        param.schema,
-        nodeParams[param.name] ?? param.default,
-        param.name,
-      );
-      if (getProgramParameterReferenceName(nodeParams[param.name]) !== null) {
+      const rawValue = nodeParams[param.name];
+      if (getProgramParameterReferenceName(rawValue) !== null) {
         continue;
       }
+      // An omitted OPTIONAL value is valid, not "must be a number": e.g. an
+      // empty max_tcp_linear_speed_mps falls back to the deployment global cap.
+      // Required-empty and genuinely-wrong-type values still error.
+      if (isOmittedOptionalParam(param.required, rawValue)) {
+        continue;
+      }
+      const message = firstCatalogSchemaValidationMessage(
+        param.schema,
+        rawValue ?? param.default,
+        param.name,
+      );
       if (message) {
         errors[param.name] = message;
       }
@@ -1623,7 +1633,8 @@ export function PropertyPanel({ onCollapse }: { onCollapse: () => void }) {
         );
 
       case 'float':
-      case 'int':
+      case 'int': {
+        const isTcpCapField = param.name === 'max_tcp_linear_speed_mps';
         return (
           <NumericParamEditor
             currentValue={currentValue}
@@ -1631,8 +1642,14 @@ export function PropertyPanel({ onCollapse }: { onCollapse: () => void }) {
             onCommit={(value) => handleParamChange(param.name, value)}
             paramType={param.type}
             constraints={param.constraints}
+            placeholder={
+              isTcpCapField && hasTcpCap ? `${globalTcpCap} (global cap)` : undefined
+            }
+            capLimit={isTcpCapField && hasTcpCap ? globalTcpCap : undefined}
+            capLabel={isTcpCapField ? 'global cap' : undefined}
           />
         );
+      }
 
       case 'float_list':
       case 'string_list':
@@ -1883,6 +1900,15 @@ export function PropertyPanel({ onCollapse }: { onCollapse: () => void }) {
                         {schemaError}
                       </div>
                     )}
+                    {param.name === 'max_tcp_linear_speed_mps'
+                      && hasTcpCap
+                      && (nodeParams[param.name] === undefined
+                        || nodeParams[param.name] === null)
+                      && getProgramParameterReferenceName(currentValue) === null && (
+                        <div className="mt-1 text-[11px] text-amber-400/80">
+                          Per-move limit unset — global cap {globalTcpCap} m/s applies.
+                        </div>
+                      )}
                   </div>
                   {selectedNode.data.catalogId === 'move_manipulator_action'
                     && param.name === 'motion_type'

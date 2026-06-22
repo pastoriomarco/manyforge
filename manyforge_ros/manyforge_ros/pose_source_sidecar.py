@@ -308,6 +308,7 @@ class SimulationInterfacesPoseSource:
         """
 
         bindings = []
+        source_frame_id = getattr(source_config, "frame_id", "")
         objects = getattr(source_config, "objects")
         for object_id, binding in objects.items():
             bindings.append(
@@ -315,7 +316,7 @@ class SimulationInterfacesPoseSource:
                     object_id=getattr(binding, "object_id", object_id),
                     entity=getattr(binding, "entity"),
                     apply_policy=getattr(binding, "apply_policy", "observe_only"),
-                    frame_id=getattr(binding, "frame_id", ""),
+                    frame_id=getattr(binding, "frame_id", "") or source_frame_id,
                     confidence_min=getattr(binding, "confidence_min", None),
                 )
             )
@@ -397,7 +398,7 @@ class SimulationInterfacesPoseSource:
                         pose_source_id=self.pose_source_id,
                         object_id=binding.object_id,
                         entity=binding.entity,
-                        pose=entity.pose,
+                        pose=_pose_with_frame(entity.pose, binding.frame_id),
                         monotonic_s=now,
                         apply_policy=binding.apply_policy,
                     )
@@ -422,7 +423,7 @@ class SimulationInterfacesPoseSource:
                         entity=self.measured_tcp.entity,
                         tcp_frame_id=self.measured_tcp.tcp_frame_id,
                         frame_id=self.measured_tcp.frame_id or entity.pose.frame_id,
-                        pose=entity.pose,
+                        pose=_pose_with_frame(entity.pose, self.measured_tcp.frame_id),
                         monotonic_s=now,
                     )
         except Exception as exc:  # pragma: no cover - exercised through ROS errors.
@@ -1319,6 +1320,18 @@ def _measured_tcp_to_dict(
             "orientationXYZW": list(update.pose.orientation_xyzw),
         },
     }
+
+
+def _pose_with_frame(pose: PoseSnapshot, frame_id: str) -> PoseSnapshot:
+    normalized_frame_id = str(frame_id or "").strip()
+    if not normalized_frame_id or pose.frame_id == normalized_frame_id:
+        return pose
+    return PoseSnapshot(
+        frame_id=normalized_frame_id,
+        stamp_sec=pose.stamp_sec,
+        position_xyz=pose.position_xyz,
+        orientation_xyzw=pose.orientation_xyzw,
+    )
 
 
 def _rejection_to_dict(

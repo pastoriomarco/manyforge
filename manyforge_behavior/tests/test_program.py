@@ -198,6 +198,56 @@ def _minimal_program(**overrides) -> dict:
     return prog
 
 
+def test_collect_per_move_tcp_speed_caps_resolves_overrides(catalog):
+    """The per-move TCP cap walk resolves ${param:...} against program defaults
+    and, when given, runtime overrides."""
+    data = {
+        "api_version": "manyforge.program.v0",
+        "program_profile": "v0.0",
+        "name": "tcp_override_test",
+        "catalog_version": "0.2.0",
+        "robot": {
+            "robot_id": "ur5",
+            "group_id": "arm",
+            "base_frame": "base_link",
+            "tcp_frame": "tool0",
+        },
+        "parameters": [
+            {
+                "name": "tcp_cap",
+                "type": "float",
+                "default": 0.1,
+                "constraints": {"min_exclusive": 0.0},
+                "description": "cap",
+            }
+        ],
+        "tree": {
+            "id": "sequence",
+            "name": "main",
+            "children": [
+                {
+                    "id": "move_manipulator_action",
+                    "name": "move_to_pick",
+                    "params": {
+                        "move_id": "m",
+                        "motion_type": "joint_goal",
+                        "joint_goal_names": ["j1", "j2", "j3", "j4", "j5", "j6"],
+                        "joint_goal_positions_rad": [0.2, -1.2, 1.0, -1.5, -1.3, 0.4],
+                        "max_tcp_linear_speed_mps": "${param:tcp_cap}",
+                        "planning_timeout_s": 2.0,
+                        "execution_timeout_s": 10.0,
+                    },
+                }
+            ],
+        },
+    }
+    prog = Program.from_dict(data, catalog)
+    assert prog.collect_per_move_tcp_speed_caps() == [("move_to_pick", 0.1)]
+    assert prog.collect_per_move_tcp_speed_caps(overrides={"tcp_cap": 0.4}) == [
+        ("move_to_pick", 0.4)
+    ]
+
+
 class TestProgramLoading:
     def test_loads_fixture(self, catalog):
         prog = Program(FIXTURE_PATH, catalog)

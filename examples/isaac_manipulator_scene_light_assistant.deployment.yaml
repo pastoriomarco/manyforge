@@ -64,6 +64,10 @@ pose_sources:
     max_update_hz: 4.0
     stale_after_s: 1.0
     frame_id: universe
+    measured_tcp:
+      entity: /World/ur10e_robotiq2f_140_ROS/ur10e_robotiq2f_140/ee_link
+      tcp_frame_id: ee_link
+      frame_id: universe
     description: Isaac Sim entity poses for scene objects that can move between plans.
     objects:
       isaac_cheese_box:
@@ -73,6 +77,22 @@ pose_sources:
         # not attached, while attached objects remain at their canonical
         # attachment offset.
         apply_policy: continuous_unattached
+        measured_state_ghost:
+          enabled: true
+          robot_tcp: true
+          object: true
+          opacity: 0.5
+        measured_attachment_baseline:
+          capture: on_attach_or_first_paired_sample
+          require_same_time_robot_tcp: true
+        attached_drift_monitor:
+          enabled: true
+          translation_threshold_m: 0.02
+          rotation_threshold_rad: 0.2
+          debounce_s: 0.1
+          stale_behavior: fault
+          action: diagnostic_only
+          signal_id: attached_object_drift/isaac_cheese_box
 
 simulation_control:
   kind: ros2_simulation_interfaces
