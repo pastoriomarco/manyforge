@@ -36,6 +36,15 @@ class PoseSourceBinding:
 
 
 @dataclass(frozen=True)
+class PoseSourceMeasuredTcpBinding:
+    """Optional source-level measured TCP entity."""
+
+    entity: str
+    tcp_frame_id: str
+    frame_id: str = ""
+
+
+@dataclass(frozen=True)
 class PoseSourceUpdate:
     """Accepted pose update for a bound object."""
 
@@ -60,6 +69,18 @@ class PoseSourceRejection:
 
 
 @dataclass(frozen=True)
+class PoseSourceMeasuredTcpUpdate:
+    """Accepted measured TCP update sampled with source object poses."""
+
+    pose_source_id: str
+    entity: str
+    tcp_frame_id: str
+    frame_id: str
+    pose: PoseSnapshot
+    monotonic_s: float
+
+
+@dataclass(frozen=True)
 class PoseSourceObjectState:
     """Latest object state exposed by the sidecar."""
 
@@ -78,9 +99,11 @@ class PoseSourceSnapshot:
     status: str
     monotonic_s: float
     objects: tuple[PoseSourceObjectState, ...]
+    measured_tcp: PoseSourceMeasuredTcpUpdate | None = None
+    measured_tcp_age_s: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "poseSourceId": self.pose_source_id,
             "status": self.status,
             "monotonicS": self.monotonic_s,
@@ -95,6 +118,12 @@ class PoseSourceSnapshot:
                 for obj in self.objects
             ],
         }
+        if self.measured_tcp is not None:
+            payload["measuredTcp"] = _measured_tcp_to_dict(
+                self.measured_tcp,
+                age_s=self.measured_tcp_age_s,
+            )
+        return payload
 
 
 @dataclass(frozen=True)
@@ -106,6 +135,7 @@ class PoseSourcePollResult:
     monotonic_s: float
     updates: tuple[PoseSourceUpdate, ...] = ()
     rejections: tuple[PoseSourceRejection, ...] = ()
+    measured_tcp_update: PoseSourceMeasuredTcpUpdate | None = None
     source_errors: tuple[str, ...] = ()
 
 
@@ -123,14 +153,17 @@ class PoseSourceLatestState:
         pose_source_id: str,
         object_ids: Iterable[str],
         stale_after_s: float,
+        measured_tcp_enabled: bool = False,
     ) -> None:
         if stale_after_s <= 0.0:
             raise ValueError("stale_after_s must be > 0")
         self.pose_source_id = pose_source_id
         self.object_ids = tuple(object_ids)
         self.stale_after_s = float(stale_after_s)
+        self.measured_tcp_enabled = bool(measured_tcp_enabled)
         self._updates: dict[str, PoseSourceUpdate] = {}
         self._rejections: dict[str, PoseSourceRejection] = {}
+        self._measured_tcp: PoseSourceMeasuredTcpUpdate | None = None
         self._lock = threading.Lock()
 
     def apply_poll_result(self, result: PoseSourcePollResult) -> None:
@@ -145,6 +178,8 @@ class PoseSourceLatestState:
                 self._rejections.pop(update.object_id, None)
             for rejection in result.rejections:
                 self._rejections[rejection.object_id] = rejection
+            if result.measured_tcp_update is not None:
+                self._measured_tcp = result.measured_tcp_update
 
     def snapshot(self, *, monotonic_s: float | None = None) -> PoseSourceSnapshot:
         now = time.monotonic() if monotonic_s is None else float(monotonic_s)
@@ -152,6 +187,7 @@ class PoseSourceLatestState:
         with self._lock:
             updates = dict(self._updates)
             rejections = dict(self._rejections)
+            measured_tcp = self._measured_tcp
 
         any_fresh = False
         any_rejected = False
@@ -207,6 +243,12 @@ class PoseSourceLatestState:
             status=status,
             monotonic_s=now,
             objects=tuple(objects),
+            measured_tcp=measured_tcp,
+            measured_tcp_age_s=(
+                max(0.0, now - measured_tcp.monotonic_s)
+                if measured_tcp is not None
+                else None
+            ),
         )
 
 
@@ -219,6 +261,7 @@ class SimulationInterfacesPoseSource:
         client: SimulationSceneMirrorClient,
         pose_source_id: str,
         bindings: Iterable[PoseSourceBinding],
+        measured_tcp: PoseSourceMeasuredTcpBinding | None = None,
         max_update_hz: float = 4.0,
         stale_after_s: float = 1.0,
         now_fn: Callable[[], float] | None = None,
@@ -228,6 +271,7 @@ class SimulationInterfacesPoseSource:
         self.client = client
         self.pose_source_id = pose_source_id
         self.bindings = tuple(bindings)
+        self.measured_tcp = measured_tcp
         if not self.bindings:
             raise ValueError("bindings must not be empty")
         for binding in self.bindings:
@@ -242,6 +286,7 @@ class SimulationInterfacesPoseSource:
             pose_source_id=pose_source_id,
             object_ids=[binding.object_id for binding in self.bindings],
             stale_after_s=stale_after_s,
+            measured_tcp_enabled=measured_tcp is not None,
         )
 
     @classmethod
@@ -270,10 +315,19 @@ class SimulationInterfacesPoseSource:
                     confidence_min=getattr(binding, "confidence_min", None),
                 )
             )
+        measured_tcp_raw = getattr(source_config, "measured_tcp", None)
+        measured_tcp = None
+        if measured_tcp_raw is not None:
+            measured_tcp = PoseSourceMeasuredTcpBinding(
+                entity=getattr(measured_tcp_raw, "entity"),
+                tcp_frame_id=getattr(measured_tcp_raw, "tcp_frame_id"),
+                frame_id=getattr(measured_tcp_raw, "frame_id", ""),
+            )
         return cls(
             client=client,
             pose_source_id=getattr(source_config, "source_id"),
             bindings=bindings,
+            measured_tcp=measured_tcp,
             max_update_hz=getattr(source_config, "max_update_hz", 4.0),
             stale_after_s=getattr(source_config, "stale_after_s", 1.0),
             now_fn=now_fn,
@@ -286,8 +340,12 @@ class SimulationInterfacesPoseSource:
     def poll_once(self) -> PoseSourcePollResult:
         now = self.now_fn()
         entity_names = [binding.entity for binding in self.bindings]
+        if self.measured_tcp is not None:
+            entity_names.append(self.measured_tcp.entity)
+        entity_names = list(dict.fromkeys(entity_names))
         updates: list[PoseSourceUpdate] = []
         rejections: list[PoseSourceRejection] = []
+        measured_tcp_update: PoseSourceMeasuredTcpUpdate | None = None
         source_errors: tuple[str, ...] = ()
         try:
             snapshot = self.client.capture(
@@ -340,6 +398,29 @@ class SimulationInterfacesPoseSource:
                         apply_policy=binding.apply_policy,
                     )
                 )
+            if self.measured_tcp is not None:
+                entity = by_entity.get(self.measured_tcp.entity)
+                if entity is None:
+                    source_errors = source_errors + (
+                        "measured_tcp missing from simulation snapshot",
+                    )
+                elif entity.errors:
+                    source_errors = source_errors + (
+                        f"measured_tcp source error: {'; '.join(entity.errors)}",
+                    )
+                elif entity.pose is None:
+                    source_errors = source_errors + (
+                        "measured_tcp entity state did not include pose",
+                    )
+                else:
+                    measured_tcp_update = PoseSourceMeasuredTcpUpdate(
+                        pose_source_id=self.pose_source_id,
+                        entity=self.measured_tcp.entity,
+                        tcp_frame_id=self.measured_tcp.tcp_frame_id,
+                        frame_id=self.measured_tcp.frame_id or entity.pose.frame_id,
+                        pose=entity.pose,
+                        monotonic_s=now,
+                    )
         except Exception as exc:  # pragma: no cover - exercised through ROS errors.
             source_errors = (str(exc),)
             for binding in self.bindings:
@@ -364,6 +445,7 @@ class SimulationInterfacesPoseSource:
             monotonic_s=now,
             updates=tuple(updates),
             rejections=tuple(rejections),
+            measured_tcp_update=measured_tcp_update,
             source_errors=source_errors,
         )
         self.state.apply_poll_result(result)
@@ -429,6 +511,25 @@ def _update_to_dict(update: PoseSourceUpdate | None) -> dict[str, Any] | None:
         "applyPolicy": update.apply_policy,
         "pose": {
             "frameId": update.pose.frame_id,
+            "stampSec": update.pose.stamp_sec,
+            "positionXYZ": list(update.pose.position_xyz),
+            "orientationXYZW": list(update.pose.orientation_xyzw),
+        },
+    }
+
+
+def _measured_tcp_to_dict(
+    update: PoseSourceMeasuredTcpUpdate,
+    *,
+    age_s: float | None,
+) -> dict[str, Any]:
+    return {
+        "frameId": update.frame_id or update.pose.frame_id,
+        "tcpFrameId": update.tcp_frame_id,
+        "monotonicS": update.monotonic_s,
+        "ageS": age_s,
+        "pose": {
+            "frameId": update.frame_id or update.pose.frame_id,
             "stampSec": update.pose.stamp_sec,
             "positionXYZ": list(update.pose.position_xyz),
             "orientationXYZW": list(update.pose.orientation_xyzw),

@@ -152,6 +152,28 @@ def _invert_matrix(matrix: list[list[float]]) -> list[list[float]]:
     ]
 
 
+def _relative_pose_delta(
+    baseline_pose: dict[str, Any],
+    observed_pose: dict[str, Any],
+) -> tuple[float, float]:
+    baseline_matrix = _pose_to_matrix(
+        list(baseline_pose["position_m"]),
+        list(baseline_pose["orientation_xyzw"]),
+    )
+    observed_matrix = _pose_to_matrix(
+        list(observed_pose["position_m"]),
+        list(observed_pose["orientation_xyzw"]),
+    )
+    delta_position, delta_orientation = _matrix_to_pose(
+        _multiply_matrices(_invert_matrix(baseline_matrix), observed_matrix)
+    )
+    translation_m = math.sqrt(sum(float(value) * float(value) for value in delta_position))
+    x, y, z, w = [float(value) for value in delta_orientation]
+    vector_norm = math.sqrt(x * x + y * y + z * z)
+    rotation_rad = 2.0 * math.atan2(vector_norm, abs(w))
+    return translation_m, rotation_rad
+
+
 @dataclass
 class RuntimeOverrideRecord:
     node_name: str
@@ -324,6 +346,11 @@ class ComposerState:
         self._simulation_control_lock = threading.Lock()
         self._pose_source_lock = threading.Lock()
         self._pose_source_snapshots: dict[str, dict[str, Any]] = {}
+        self._pose_source_drift_lock = threading.Lock()
+        self._pose_source_drift_baselines: dict[tuple[str, str], dict[str, Any]] = {}
+        self._pose_source_drift_states: dict[tuple[str, str], dict[str, Any]] = {}
+        self._pose_source_drift_exceeded_since_ns: dict[tuple[str, str], int] = {}
+        self._pose_source_drift_raised: set[tuple[str, str]] = set()
         self._pose_source_apply_lock = threading.Lock()
         self._pose_source_apply_pending: dict[str, dict[str, Any]] = {}
         self._pose_source_apply_running = False
@@ -2902,6 +2929,7 @@ class ComposerState:
         record["received_at_ns"] = time.monotonic_ns()
         with self._pose_source_lock:
             self._pose_source_snapshots[source] = record
+        self._evaluate_pose_source_grasp_integrity(source, record)
 
     def _pose_source_scene_edit_pose(
         self,
@@ -2978,6 +3006,544 @@ class ComposerState:
         detail["observed_apply_frame_id"] = apply_frame
         return local_position, local_orientation, attached_frame
 
+    def _pose_source_relative_tcp_object_pose(
+        self,
+        *,
+        tcp_pose: dict[str, Any],
+        object_pose: dict[str, Any],
+    ) -> dict[str, Any]:
+        tcp_matrix = _pose_to_matrix(
+            list(tcp_pose["position_m"]),
+            list(tcp_pose["orientation_xyzw"]),
+        )
+        object_matrix = _pose_to_matrix(
+            list(object_pose["position_m"]),
+            list(object_pose["orientation_xyzw"]),
+        )
+        position, orientation = _matrix_to_pose(
+            _multiply_matrices(_invert_matrix(tcp_matrix), object_matrix)
+        )
+        return {"position_m": position, "orientation_xyzw": orientation}
+
+    def _pose_source_pose_dict(self, pose: dict[str, Any]) -> dict[str, Any] | None:
+        position = pose.get("position_xyz") or pose.get("positionXYZ")
+        orientation = pose.get("orientation_xyzw") or pose.get("orientationXYZW")
+        if (
+            not isinstance(position, list)
+            or len(position) != 3
+            or not isinstance(orientation, list)
+            or len(orientation) != 4
+        ):
+            return None
+        try:
+            return {
+                "position_m": [float(value) for value in position],
+                "orientation_xyzw": [float(value) for value in orientation],
+            }
+        except (TypeError, ValueError):
+            return None
+
+    def _set_pose_source_drift_state(
+        self,
+        key: tuple[str, str],
+        state: dict[str, Any],
+    ) -> None:
+        with self._pose_source_drift_lock:
+            self._pose_source_drift_states[key] = copy.deepcopy(state)
+
+    def _publish_pose_source_drift_condition(
+        self,
+        *,
+        source_id: str,
+        object_id: str,
+        signal_id: str,
+        value: bool,
+        stale_after_s: float,
+        metadata: dict[str, Any],
+    ) -> None:
+        manager = self.cycle_manager
+        if manager is None:
+            return
+        try:
+            manager.publish_signal(
+                adapter=f"pose_source:{source_id}",
+                signal=signal_id,
+                value=value,
+                stale_after_ms=max(1, int(float(stale_after_s) * 1000.0)),
+                mirror_key=signal_id,
+                clear_on_stale=True,
+                metadata={
+                    "source_id": source_id,
+                    "object_id": object_id,
+                    **copy.deepcopy(metadata),
+                },
+            )
+        except Exception:
+            logger.debug("pose-source drift signal publish failed", exc_info=True)
+
+    def _record_pose_source_drift_event(
+        self,
+        action: str,
+        *,
+        details: dict[str, Any],
+    ) -> None:
+        try:
+            self.event_recorder.record_pose_source_event(
+                f"drift_{action}",
+                details=copy.deepcopy(details),
+            )
+        except Exception:
+            logger.debug("pose-source drift event recording failed", exc_info=True)
+
+    def pose_source_drift_states(self) -> dict[tuple[str, str], dict[str, Any]]:
+        with self._pose_source_drift_lock:
+            return copy.deepcopy(self._pose_source_drift_states)
+
+    def _pose_source_baseline_captured(self, key: tuple[str, str]) -> bool:
+        with self._pose_source_drift_lock:
+            return key in self._pose_source_drift_baselines
+
+    def _set_pose_source_unverifiable(
+        self,
+        *,
+        source_id: str,
+        object_id: str,
+        key: tuple[str, str],
+        source: Any,
+        monitor: Any,
+        reason: str,
+        baseline_captured: bool,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        signal_id = getattr(monitor, "signal_id", f"attached_object_drift/{object_id}")
+        action = getattr(monitor, "action", "diagnostic_only")
+        stale_behavior = getattr(monitor, "stale_behavior", "unverifiable")
+        details = {
+            "source_id": source_id,
+            "object_id": object_id,
+            "signal_id": signal_id,
+            "reason": reason,
+            "stale_behavior": stale_behavior,
+            "action": action,
+            "baseline_captured": baseline_captured,
+            **copy.deepcopy(metadata or {}),
+        }
+        with self._pose_source_drift_lock:
+            previous_state = copy.deepcopy(self._pose_source_drift_states.get(key))
+        state_changed = (
+            not isinstance(previous_state, dict)
+            or previous_state.get("status") != "unverifiable"
+            or previous_state.get("unverifiable_reason") != reason
+            or previous_state.get("baseline_captured") != baseline_captured
+        )
+        self._set_pose_source_drift_state(
+            key,
+            {
+                "status": "unverifiable",
+                "action": action,
+                "signal_id": signal_id,
+                "baseline_captured": baseline_captured,
+                "unverifiable_reason": reason,
+                "metadata": details,
+            },
+        )
+        if state_changed:
+            self._record_pose_source_drift_event("unverifiable", details=details)
+
+        if monitor is None or not getattr(monitor, "enabled", False):
+            return
+        should_fault = stale_behavior == "fault"
+        self._publish_pose_source_drift_condition(
+            source_id=source_id,
+            object_id=object_id,
+            signal_id=signal_id,
+            value=bool(should_fault),
+            stale_after_s=getattr(source, "stale_after_s", 1.0),
+            metadata=details,
+        )
+        if not should_fault or action != "interrupt" or self.cycle_manager is None:
+            return
+
+        with self._pose_source_drift_lock:
+            already_raised = key in self._pose_source_drift_raised
+            if not already_raised:
+                self._pose_source_drift_raised.add(key)
+        if already_raised:
+            return
+        try:
+            self.cycle_manager.raise_runtime_condition_fault(
+                condition_id=signal_id,
+                message=(
+                    f"Attached object '{object_id}' measured grasp became "
+                    f"unverifiable: {reason}"
+                ),
+                details={
+                    "reason_code": "attached_object_drift_unverifiable",
+                    **details,
+                },
+            )
+        except AttributeError:
+            logger.warning(
+                "attached object drift unverifiable but cycle fault hook is unavailable",
+                extra={
+                    "event": "manyforge.pose_source.drift_unverifiable_interrupt_unavailable",
+                    "object_id": object_id,
+                    "source_id": source_id,
+                    "reason": reason,
+                },
+            )
+        except Exception:
+            logger.exception("attached object drift unverifiable interrupt failed")
+
+    def _evaluate_pose_source_grasp_integrity(
+        self,
+        source_id: str,
+        snapshot: dict[str, Any],
+    ) -> None:
+        deployment = self.deployment
+        if deployment is None:
+            return
+        source = deployment.pose_sources.get(source_id)
+        if source is None or not source.enabled:
+            return
+
+        measured_tcp = snapshot.get("measured_tcp") or snapshot.get("measuredTcp")
+        measured_tcp_pose_payload = (
+            measured_tcp.get("pose") if isinstance(measured_tcp, dict) else None
+        )
+        measured_tcp_pose = (
+            self._pose_source_pose_dict(measured_tcp_pose_payload)
+            if isinstance(measured_tcp_pose_payload, dict)
+            else None
+        )
+        measured_tcp_frame = ""
+        measured_tcp_monotonic_s: float | None = None
+        if isinstance(measured_tcp, dict):
+            if isinstance(measured_tcp_pose_payload, dict):
+                measured_tcp_frame = str(
+                    measured_tcp.get("frame_id")
+                    or measured_tcp.get("frameId")
+                    or measured_tcp_pose_payload.get("frame_id")
+                    or measured_tcp_pose_payload.get("frameId")
+                    or ""
+                )
+            else:
+                measured_tcp_frame = str(
+                    measured_tcp.get("frame_id")
+                    or measured_tcp.get("frameId")
+                    or ""
+                )
+            try:
+                measured_tcp_monotonic_s = float(
+                    measured_tcp.get("monotonic_s") or measured_tcp.get("monotonicS")
+                )
+            except (TypeError, ValueError):
+                measured_tcp_monotonic_s = None
+
+        snapshot_objects = {
+            str(item.get("object_id") or item.get("objectId") or ""): item
+            for item in snapshot.get("objects", [])
+            if isinstance(item, dict)
+        }
+        now_ns = time.monotonic_ns()
+        for object_id, binding in sorted(source.objects.items()):
+            monitor = binding.attached_drift_monitor
+            ghost = binding.measured_state_ghost
+            baseline_config = binding.measured_attachment_baseline
+            key = (source_id, object_id)
+            if monitor is None and baseline_config is None and ghost is None:
+                with self._pose_source_drift_lock:
+                    self._pose_source_drift_states.pop(key, None)
+                    self._pose_source_drift_baselines.pop(key, None)
+                    self._pose_source_drift_exceeded_since_ns.pop(key, None)
+                    self._pose_source_drift_raised.discard(key)
+                continue
+            try:
+                object_state = self.kernel.get_object_state(object_id)
+            except Exception as exc:
+                self._set_pose_source_unverifiable(
+                    source_id=source_id,
+                    object_id=object_id,
+                    key=key,
+                    source=source,
+                    monitor=monitor,
+                    reason=f"object_state_unavailable:{type(exc).__name__}",
+                    baseline_captured=False,
+                )
+                continue
+            if not getattr(object_state, "attached", False):
+                with self._pose_source_drift_lock:
+                    self._pose_source_drift_baselines.pop(key, None)
+                    self._pose_source_drift_exceeded_since_ns.pop(key, None)
+                    self._pose_source_drift_raised.discard(key)
+                self._set_pose_source_drift_state(
+                    key,
+                    {
+                        "status": "disarmed",
+                        "action": getattr(monitor, "action", "diagnostic_only"),
+                        "signal_id": getattr(
+                            monitor,
+                            "signal_id",
+                            f"attached_object_drift/{object_id}",
+                        ),
+                        "baseline_captured": False,
+                        "unverifiable_reason": "object_not_attached",
+                    },
+                )
+                continue
+
+            observed = snapshot_objects.get(object_id)
+            update = observed.get("update") if isinstance(observed, dict) else None
+            pose_payload = update.get("pose") if isinstance(update, dict) else None
+            object_pose = (
+                self._pose_source_pose_dict(pose_payload)
+                if isinstance(pose_payload, dict)
+                else None
+            )
+            if not isinstance(observed, dict) or observed.get("status") != "fresh":
+                self._set_pose_source_unverifiable(
+                    source_id=source_id,
+                    object_id=object_id,
+                    key=key,
+                    source=source,
+                    monitor=monitor,
+                    reason="object_sample_not_fresh",
+                    baseline_captured=self._pose_source_baseline_captured(key),
+                )
+                continue
+            if object_pose is None:
+                self._set_pose_source_unverifiable(
+                    source_id=source_id,
+                    object_id=object_id,
+                    key=key,
+                    source=source,
+                    monitor=monitor,
+                    reason="object_pose_malformed",
+                    baseline_captured=self._pose_source_baseline_captured(key),
+                )
+                continue
+            if measured_tcp_pose is None or measured_tcp_monotonic_s is None:
+                self._set_pose_source_unverifiable(
+                    source_id=source_id,
+                    object_id=object_id,
+                    key=key,
+                    source=source,
+                    monitor=monitor,
+                    reason="measured_tcp_missing",
+                    baseline_captured=self._pose_source_baseline_captured(key),
+                )
+                continue
+            if isinstance(pose_payload, dict):
+                object_frame = str(
+                    pose_payload.get("frame_id")
+                    or pose_payload.get("frameId")
+                    or binding.frame_id
+                    or source.frame_id
+                    or ""
+                )
+            else:
+                object_frame = str(binding.frame_id or source.frame_id or "")
+            if measured_tcp_frame and object_frame and measured_tcp_frame != object_frame:
+                self._set_pose_source_unverifiable(
+                    source_id=source_id,
+                    object_id=object_id,
+                    key=key,
+                    source=source,
+                    monitor=monitor,
+                    reason="frame_mismatch",
+                    baseline_captured=self._pose_source_baseline_captured(key),
+                    metadata={
+                        "tcp_frame_id": measured_tcp_frame,
+                        "object_frame_id": object_frame,
+                    },
+                )
+                continue
+            try:
+                object_monotonic_s = float(
+                    update.get("monotonic_s") or update.get("monotonicS")
+                )
+            except (TypeError, ValueError, AttributeError):
+                object_monotonic_s = None
+            tolerance_s = (
+                monitor.sample_time_tolerance_s
+                if monitor is not None
+                else 0.05
+            )
+            sample_time_delta_s = (
+                abs(float(measured_tcp_monotonic_s) - float(object_monotonic_s))
+                if object_monotonic_s is not None
+                else None
+            )
+            if sample_time_delta_s is None or sample_time_delta_s > tolerance_s:
+                self._set_pose_source_unverifiable(
+                    source_id=source_id,
+                    object_id=object_id,
+                    key=key,
+                    source=source,
+                    monitor=monitor,
+                    reason="sample_time_mismatch",
+                    baseline_captured=self._pose_source_baseline_captured(key),
+                    metadata={"sample_time_delta_s": sample_time_delta_s},
+                )
+                continue
+
+            current_relative = self._pose_source_relative_tcp_object_pose(
+                tcp_pose=measured_tcp_pose,
+                object_pose=object_pose,
+            )
+            with self._pose_source_drift_lock:
+                baseline = self._pose_source_drift_baselines.get(key)
+                if baseline is None:
+                    baseline = {
+                        "pose": copy.deepcopy(current_relative),
+                        "captured_at_ns": now_ns,
+                        "tcp_monotonic_s": measured_tcp_monotonic_s,
+                        "object_monotonic_s": object_monotonic_s,
+                        "attached_frame_id": str(getattr(object_state, "frame_id", "") or ""),
+                    }
+                    self._pose_source_drift_baselines[key] = baseline
+                    self._pose_source_drift_exceeded_since_ns.pop(key, None)
+                    self._pose_source_drift_raised.discard(key)
+                    self._record_pose_source_drift_event(
+                        "baseline_captured",
+                        details={
+                            "source_id": source_id,
+                            "object_id": object_id,
+                            "attached_frame_id": str(
+                                getattr(object_state, "frame_id", "") or ""
+                            ),
+                            "tcp_monotonic_s": measured_tcp_monotonic_s,
+                            "object_monotonic_s": object_monotonic_s,
+                            "sample_time_delta_s": sample_time_delta_s,
+                        },
+                    )
+            if monitor is None or not monitor.enabled:
+                self._set_pose_source_drift_state(
+                    key,
+                    {
+                        "status": "baseline_captured",
+                        "action": getattr(monitor, "action", "diagnostic_only"),
+                        "signal_id": getattr(
+                            monitor,
+                            "signal_id",
+                            f"attached_object_drift/{object_id}",
+                        ),
+                        "baseline_captured": True,
+                        "sample_time_delta_s": sample_time_delta_s,
+                        "metadata": {
+                            "attached_frame_id": str(getattr(object_state, "frame_id", "") or ""),
+                        },
+                    },
+                )
+                continue
+
+            translation_m, rotation_rad = _relative_pose_delta(
+                baseline["pose"],
+                current_relative,
+            )
+            translation_exceeded = (
+                monitor.translation_threshold_m is not None
+                and translation_m > monitor.translation_threshold_m
+            )
+            rotation_exceeded = (
+                monitor.rotation_threshold_rad is not None
+                and rotation_rad > monitor.rotation_threshold_rad
+            )
+            exceeded = translation_exceeded or rotation_exceeded
+            with self._pose_source_drift_lock:
+                if exceeded:
+                    exceeded_since_ns = self._pose_source_drift_exceeded_since_ns.setdefault(
+                        key,
+                        now_ns,
+                    )
+                else:
+                    self._pose_source_drift_exceeded_since_ns.pop(key, None)
+                    self._pose_source_drift_raised.discard(key)
+                    exceeded_since_ns = None
+                debounced = (
+                    exceeded_since_ns is not None
+                    and (now_ns - exceeded_since_ns)
+                    >= int(float(monitor.debounce_s) * 1_000_000_000)
+                )
+                already_raised = key in self._pose_source_drift_raised
+                if debounced:
+                    self._pose_source_drift_raised.add(key)
+
+            status = "exceeded" if debounced else ("near_limit" if exceeded else "ok")
+            condition_payload = {
+                "source_id": source_id,
+                "object_id": object_id,
+                "attached_frame_id": str(getattr(object_state, "frame_id", "") or ""),
+                "signal_id": monitor.signal_id,
+                "translation_m": translation_m,
+                "rotation_rad": rotation_rad,
+                "translation_threshold_m": monitor.translation_threshold_m,
+                "rotation_threshold_rad": monitor.rotation_threshold_rad,
+                "sample_time_delta_s": sample_time_delta_s,
+                "debounce_s": monitor.debounce_s,
+                "baseline": copy.deepcopy(baseline),
+                "current_measured_offset": copy.deepcopy(current_relative),
+            }
+            drift_state = {
+                "status": status,
+                "action": monitor.action,
+                "signal_id": monitor.signal_id,
+                "baseline_captured": True,
+                "translation_m": translation_m,
+                "rotation_rad": rotation_rad,
+                "translation_threshold_m": monitor.translation_threshold_m,
+                "rotation_threshold_rad": monitor.rotation_threshold_rad,
+                "debounce_s": monitor.debounce_s,
+                "sample_time_delta_s": sample_time_delta_s,
+                "exceeded_since_ns": exceeded_since_ns,
+                "condition_raised": debounced,
+                "metadata": condition_payload,
+            }
+            self._set_pose_source_drift_state(key, drift_state)
+            self._publish_pose_source_drift_condition(
+                source_id=source_id,
+                object_id=object_id,
+                signal_id=monitor.signal_id,
+                value=bool(debounced),
+                stale_after_s=source.stale_after_s,
+                metadata=condition_payload,
+            )
+            if debounced and not already_raised:
+                self._record_pose_source_drift_event(
+                    "exceeded",
+                    details=condition_payload,
+                )
+            if (
+                debounced
+                and not already_raised
+                and monitor.action == "interrupt"
+                and self.cycle_manager is not None
+            ):
+                message = (
+                    f"Attached object '{object_id}' drift exceeded measured "
+                    "TCP/object threshold"
+                )
+                try:
+                    self.cycle_manager.raise_runtime_condition_fault(
+                        condition_id=monitor.signal_id,
+                        message=message,
+                        details={
+                            "reason_code": "attached_object_drift",
+                            **condition_payload,
+                        },
+                    )
+                except AttributeError:
+                    logger.warning(
+                        "attached object drift exceeded but cycle fault hook is unavailable",
+                        extra={
+                            "event": "manyforge.pose_source.drift_interrupt_unavailable",
+                            "object_id": object_id,
+                            "source_id": source_id,
+                        },
+                    )
+                except Exception:
+                    logger.exception("attached object drift interrupt failed")
+
     def pose_source_snapshots(self) -> dict[str, dict[str, Any]]:
         """Return a defensive copy of latest pose-source snapshots."""
         with self._pose_source_lock:
@@ -2987,6 +3553,11 @@ class ComposerState:
         """Drop observed source state when the runtime scene changes."""
         with self._pose_source_lock:
             self._pose_source_snapshots.clear()
+        with self._pose_source_drift_lock:
+            self._pose_source_drift_baselines.clear()
+            self._pose_source_drift_states.clear()
+            self._pose_source_drift_exceeded_since_ns.clear()
+            self._pose_source_drift_raised.clear()
 
     def live_scene_mutation_block_reason(self) -> str | None:
         """Return why live scene mutation is unsafe right now, if blocked."""

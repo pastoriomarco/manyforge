@@ -784,6 +784,18 @@ class PoseSourceObjectBindingConfigResponse(BaseModel):
     frame_id: str = Field(default="", alias="frameId")
     apply_policy: str = Field(default="observe_only", alias="applyPolicy")
     confidence_min: Optional[float] = Field(default=None, alias="confidenceMin")
+    measured_state_ghost: Optional[Dict[str, Any]] = Field(
+        default=None,
+        alias="measuredStateGhost",
+    )
+    measured_attachment_baseline: Optional[Dict[str, Any]] = Field(
+        default=None,
+        alias="measuredAttachmentBaseline",
+    )
+    attached_drift_monitor: Optional[Dict[str, Any]] = Field(
+        default=None,
+        alias="attachedDriftMonitor",
+    )
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
@@ -798,6 +810,7 @@ class PoseSourceConfigResponse(BaseModel):
     service_prefix: str = Field(default="auto", alias="servicePrefix")
     topic: str = ""
     description: str = ""
+    measured_tcp: Optional[Dict[str, Any]] = Field(default=None, alias="measuredTcp")
     objects: Dict[str, PoseSourceObjectBindingConfigResponse] = Field(
         default_factory=dict
     )
@@ -1078,6 +1091,42 @@ class PoseSourceUpdateResponse(BaseModel):
     pose: PoseSourcePoseResponse
 
 
+class PoseSourceMeasuredTcpResponse(BaseModel):
+    model_config = _ALIAS_CFG
+    frame_id: str = Field(default="", alias="frameId")
+    tcp_frame_id: str = Field(default="", alias="tcpFrameId")
+    monotonic_s: float = Field(alias="monotonicS")
+    age_s: Optional[float] = Field(default=None, alias="ageS")
+    pose: PoseSourcePoseResponse
+
+
+class PoseSourceAttachedDriftStateResponse(BaseModel):
+    model_config = _ALIAS_CFG
+    status: str
+    action: str = "diagnostic_only"
+    signal_id: str = Field(default="", alias="signalId")
+    baseline_captured: bool = Field(default=False, alias="baselineCaptured")
+    translation_m: Optional[float] = Field(default=None, alias="translationM")
+    rotation_rad: Optional[float] = Field(default=None, alias="rotationRad")
+    translation_threshold_m: Optional[float] = Field(
+        default=None,
+        alias="translationThresholdM",
+    )
+    rotation_threshold_rad: Optional[float] = Field(
+        default=None,
+        alias="rotationThresholdRad",
+    )
+    debounce_s: float = Field(default=0.0, alias="debounceS")
+    sample_time_delta_s: Optional[float] = Field(
+        default=None,
+        alias="sampleTimeDeltaS",
+    )
+    unverifiable_reason: str = Field(default="", alias="unverifiableReason")
+    exceeded_since_ns: Optional[int] = Field(default=None, alias="exceededSinceNs")
+    condition_raised: bool = Field(default=False, alias="conditionRaised")
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
 class PoseSourceRejectionResponse(BaseModel):
     model_config = _ALIAS_CFG
     pose_source_id: str = Field(alias="poseSourceId")
@@ -1098,6 +1147,14 @@ class PoseSourceObjectStateResponse(BaseModel):
     age_s: Optional[float] = Field(default=None, alias="ageS")
     update: Optional[PoseSourceUpdateResponse] = None
     rejection: Optional[PoseSourceRejectionResponse] = None
+    measured_state_ghost: Optional[Dict[str, Any]] = Field(
+        default=None,
+        alias="measuredStateGhost",
+    )
+    attached_drift: Optional[PoseSourceAttachedDriftStateResponse] = Field(
+        default=None,
+        alias="attachedDrift",
+    )
 
 
 class PoseSourceStatusResponse(BaseModel):
@@ -1111,6 +1168,10 @@ class PoseSourceStatusResponse(BaseModel):
     frame_id: str = Field(default="", alias="frameId")
     description: str = ""
     received_at_ns: Optional[int] = Field(default=None, alias="receivedAtNs")
+    measured_tcp: Optional[PoseSourceMeasuredTcpResponse] = Field(
+        default=None,
+        alias="measuredTcp",
+    )
     objects: List[PoseSourceObjectStateResponse] = Field(default_factory=list)
 
 
@@ -1119,6 +1180,10 @@ class PoseSourceSnapshotRequest(BaseModel):
     pose_source_id: str = Field(alias="poseSourceId")
     status: str
     monotonic_s: float = Field(alias="monotonicS")
+    measured_tcp: Optional[PoseSourceMeasuredTcpResponse] = Field(
+        default=None,
+        alias="measuredTcp",
+    )
     objects: List[PoseSourceObjectStateResponse] = Field(default_factory=list)
 
 

@@ -17,6 +17,7 @@ def test_simulation_interfaces_pose_source_polls_latest_wins_state():
         POSE_SOURCE_STATUS_FRESH,
         POSE_SOURCE_STATUS_STALE,
         PoseSourceBinding,
+        PoseSourceMeasuredTcpBinding,
         SimulationInterfacesPoseSource,
     )
     from manyforge_ros.scene_mirror_probe import SimulationSceneMirrorClient
@@ -37,9 +38,14 @@ def test_simulation_interfaces_pose_source_polls_latest_wins_state():
         response.result.result = response.result.RESULT_OK
         response.state.header.frame_id = "world"
         response.state.header.stamp.sec = int(now["value"])
-        response.state.pose.position.x = x_position["value"]
-        response.state.pose.position.y = 2.0
-        response.state.pose.position.z = 3.0
+        if request.entity == "/World/tool0":
+            response.state.pose.position.x = 0.5
+            response.state.pose.position.y = 0.0
+            response.state.pose.position.z = 0.25
+        else:
+            response.state.pose.position.x = x_position["value"]
+            response.state.pose.position.y = 2.0
+            response.state.pose.position.z = 3.0
         response.state.pose.orientation.w = 1.0
         return response
 
@@ -71,6 +77,11 @@ def test_simulation_interfaces_pose_source_polls_latest_wins_state():
                     apply_policy="observe_only",
                 )
             ],
+            measured_tcp=PoseSourceMeasuredTcpBinding(
+                entity="/World/tool0",
+                tcp_frame_id="tool0",
+                frame_id="world",
+            ),
             max_update_hz=4.0,
             stale_after_s=1.0,
             now_fn=lambda: now["value"],
@@ -92,11 +103,18 @@ def test_simulation_interfaces_pose_source_polls_latest_wins_state():
         assert live.objects[0].status == POSE_SOURCE_STATUS_FRESH
         assert live.objects[0].update is not None
         assert live.objects[0].update.pose.position_xyz == (4.0, 2.0, 3.0)
+        assert live.measured_tcp is not None
+        assert live.measured_tcp.tcp_frame_id == "tool0"
+        assert live.measured_tcp.pose.position_xyz == (0.5, 0.0, 0.25)
+        payload = live.to_dict()
+        assert payload["measuredTcp"]["tcpFrameId"] == "tool0"
+        assert payload["measuredTcp"]["pose"]["positionXYZ"] == [0.5, 0.0, 0.25]
 
         stale = source.state.snapshot(monotonic_s=102.0)
         assert stale.status == POSE_SOURCE_STATUS_STALE
         assert stale.objects[0].status == POSE_SOURCE_STATUS_STALE
         assert stale.objects[0].age_s == pytest.approx(1.75)
+        assert stale.measured_tcp_age_s == pytest.approx(1.75)
     finally:
         for service in services:
             server_node.destroy_service(service)

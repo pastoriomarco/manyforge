@@ -462,6 +462,26 @@ export interface PoseSourceObjectBindingConfig {
   frameId?: string;
   applyPolicy?: PoseSourceApplyPolicy;
   confidenceMin?: number | null;
+  measuredStateGhost?: {
+    enabled?: boolean;
+    robotTcp?: boolean;
+    object?: boolean;
+    opacity?: number;
+  } | null;
+  measuredAttachmentBaseline?: {
+    capture?: 'on_attach_or_first_paired_sample' | string;
+    requireSameTimeRobotTcp?: boolean;
+  } | null;
+  attachedDriftMonitor?: {
+    enabled?: boolean;
+    translationThresholdM?: number | null;
+    rotationThresholdRad?: number | null;
+    debounceS?: number;
+    staleBehavior?: 'fault' | 'unverifiable' | 'ignore' | string;
+    action?: 'interrupt' | 'diagnostic_only' | string;
+    signalId?: string;
+    sampleTimeToleranceS?: number;
+  } | null;
   metadata?: Record<string, unknown>;
 }
 
@@ -475,6 +495,11 @@ export interface PoseSourceConfig {
   servicePrefix?: string;
   topic?: string;
   description?: string;
+  measuredTcp?: {
+    entity?: string;
+    tcpFrameId?: string;
+    frameId?: string;
+  } | null;
   objects: Record<string, PoseSourceObjectBindingConfig>;
 }
 
@@ -794,6 +819,31 @@ export interface PoseSourceUpdateState {
   pose: PoseSourcePoseState;
 }
 
+export interface PoseSourceMeasuredTcpState {
+  frame_id: string;
+  tcp_frame_id: string;
+  monotonic_s: number;
+  age_s?: number | null;
+  pose: PoseSourcePoseState;
+}
+
+export interface PoseSourceAttachedDriftState {
+  status: string;
+  action: string;
+  signal_id: string;
+  baseline_captured: boolean;
+  translation_m?: number | null;
+  rotation_rad?: number | null;
+  translation_threshold_m?: number | null;
+  rotation_threshold_rad?: number | null;
+  debounce_s: number;
+  sample_time_delta_s?: number | null;
+  unverifiable_reason?: string;
+  exceeded_since_ns?: number | null;
+  condition_raised: boolean;
+  metadata?: Record<string, unknown>;
+}
+
 export interface PoseSourceRejectionState {
   pose_source_id: string;
   object_id: string;
@@ -812,6 +862,8 @@ export interface PoseSourceObjectState {
   age_s?: number | null;
   update?: PoseSourceUpdateState | null;
   rejection?: PoseSourceRejectionState | null;
+  measured_state_ghost?: Record<string, unknown> | null;
+  attached_drift?: PoseSourceAttachedDriftState | null;
 }
 
 export interface PoseSourceStatusState {
@@ -824,6 +876,7 @@ export interface PoseSourceStatusState {
   frame_id: string;
   description: string;
   received_at_ns?: number | null;
+  measured_tcp?: PoseSourceMeasuredTcpState | null;
   objects: PoseSourceObjectState[];
 }
 

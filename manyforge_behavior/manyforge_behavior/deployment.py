@@ -113,6 +113,47 @@ class UiBackendConfig:
 
 
 @dataclass(frozen=True)
+class PoseSourceMeasuredStateGhostConfig:
+    """Per-object external measured-state overlay settings."""
+
+    enabled: bool = False
+    robot_tcp: bool = True
+    object: bool = True
+    opacity: float = 0.5
+
+
+@dataclass(frozen=True)
+class PoseSourceMeasuredAttachmentBaselineConfig:
+    """Measured grasp-baseline capture policy for an attached object."""
+
+    capture: str = "on_attach_or_first_paired_sample"
+    require_same_time_robot_tcp: bool = True
+
+
+@dataclass(frozen=True)
+class PoseSourceAttachedDriftMonitorConfig:
+    """Measured TCP/object drift monitor policy for an attached object."""
+
+    enabled: bool = False
+    translation_threshold_m: Optional[float] = None
+    rotation_threshold_rad: Optional[float] = None
+    debounce_s: float = 0.1
+    stale_behavior: str = "fault"
+    action: str = "interrupt"
+    signal_id: str = ""
+    sample_time_tolerance_s: float = 0.05
+
+
+@dataclass(frozen=True)
+class PoseSourceMeasuredTcpConfig:
+    """Optional source-level measured TCP entity sampled with object poses."""
+
+    entity: str
+    tcp_frame_id: str = ""
+    frame_id: str = ""
+
+
+@dataclass(frozen=True)
 class PoseSourceObjectBinding:
     """Deployment binding from an external pose source to a scene object."""
 
@@ -121,6 +162,11 @@ class PoseSourceObjectBinding:
     entity: str = ""
     frame_id: str = ""
     confidence_min: Optional[float] = None
+    measured_state_ghost: Optional[PoseSourceMeasuredStateGhostConfig] = None
+    measured_attachment_baseline: Optional[
+        PoseSourceMeasuredAttachmentBaselineConfig
+    ] = None
+    attached_drift_monitor: Optional[PoseSourceAttachedDriftMonitorConfig] = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -143,6 +189,7 @@ class PoseSourceConfig:
     service_prefix: str = "auto"
     topic: str = ""
     description: str = ""
+    measured_tcp: Optional[PoseSourceMeasuredTcpConfig] = None
     objects: dict[str, PoseSourceObjectBinding] = field(default_factory=dict)
 
 
@@ -659,6 +706,208 @@ class Deployment:
                 return data[camel]
             return default
 
+        def parse_bool(value: Any, field_path: str) -> bool:
+            if not isinstance(value, bool):
+                raise DeploymentValidationError(f"{field_path} must be a boolean")
+            return value
+
+        def parse_ghost_config(
+            raw: Any,
+            field_path: str,
+        ) -> Optional[PoseSourceMeasuredStateGhostConfig]:
+            if raw is None:
+                return None
+            if not isinstance(raw, dict):
+                raise DeploymentValidationError(f"{field_path} must be a mapping")
+            enabled = parse_bool(
+                get_alias(raw, "enabled", "enabled", False),
+                f"{field_path}.enabled",
+            )
+            robot_tcp = parse_bool(
+                get_alias(raw, "robot_tcp", "robotTcp", True),
+                f"{field_path}.robot_tcp",
+            )
+            object_enabled = parse_bool(
+                get_alias(raw, "object", "object", True),
+                f"{field_path}.object",
+            )
+            opacity = self._parse_bounded_float(
+                get_alias(raw, "opacity", "opacity", 0.5),
+                f"{field_path}.opacity",
+                minimum=0.05,
+                maximum=1.0,
+            )
+            return PoseSourceMeasuredStateGhostConfig(
+                enabled=enabled,
+                robot_tcp=robot_tcp,
+                object=object_enabled,
+                opacity=opacity,
+            )
+
+        def parse_baseline_config(
+            raw: Any,
+            field_path: str,
+        ) -> Optional[PoseSourceMeasuredAttachmentBaselineConfig]:
+            if raw is None:
+                return None
+            if not isinstance(raw, dict):
+                raise DeploymentValidationError(f"{field_path} must be a mapping")
+            capture = self._parse_optional_text(
+                get_alias(
+                    raw,
+                    "capture",
+                    "capture",
+                    "on_attach_or_first_paired_sample",
+                ),
+                f"{field_path}.capture",
+            )
+            if capture != "on_attach_or_first_paired_sample":
+                raise DeploymentValidationError(
+                    f"{field_path}.capture must be on_attach_or_first_paired_sample"
+                )
+            require_same_time = get_alias(
+                raw,
+                "require_same_time_robot_tcp",
+                "requireSameTimeRobotTcp",
+                True,
+            )
+            if not isinstance(require_same_time, bool):
+                raise DeploymentValidationError(
+                    f"{field_path}.require_same_time_robot_tcp must be a boolean"
+                )
+            return PoseSourceMeasuredAttachmentBaselineConfig(
+                capture=capture,
+                require_same_time_robot_tcp=require_same_time,
+            )
+
+        def parse_measured_tcp_config(
+            raw: Any,
+            field_path: str,
+            *,
+            kind: str,
+        ) -> Optional[PoseSourceMeasuredTcpConfig]:
+            if raw is None:
+                return None
+            if not isinstance(raw, dict):
+                raise DeploymentValidationError(f"{field_path} must be a mapping")
+            entity = self._parse_optional_text(
+                get_alias(raw, "entity", "entity", ""),
+                f"{field_path}.entity",
+            )
+            if kind == "simulation_interfaces" and not entity:
+                raise DeploymentValidationError(
+                    f"{field_path}.entity is required for simulation_interfaces"
+                )
+            tcp_frame_id = self._parse_optional_text(
+                get_alias(raw, "tcp_frame_id", "tcpFrameId", ""),
+                f"{field_path}.tcp_frame_id",
+            )
+            if not tcp_frame_id:
+                raise DeploymentValidationError(
+                    f"{field_path}.tcp_frame_id must be non-empty"
+                )
+            frame_id_value = self._parse_optional_text(
+                get_alias(raw, "frame_id", "frameId", ""),
+                f"{field_path}.frame_id",
+            )
+            return PoseSourceMeasuredTcpConfig(
+                entity=entity,
+                tcp_frame_id=tcp_frame_id,
+                frame_id=frame_id_value,
+            )
+
+        def parse_drift_monitor_config(
+            raw: Any,
+            field_path: str,
+            *,
+            object_id: str,
+        ) -> Optional[PoseSourceAttachedDriftMonitorConfig]:
+            if raw is None:
+                return None
+            if not isinstance(raw, dict):
+                raise DeploymentValidationError(f"{field_path} must be a mapping")
+            enabled_raw = get_alias(raw, "enabled", "enabled", False)
+            if not isinstance(enabled_raw, bool):
+                raise DeploymentValidationError(f"{field_path}.enabled must be a boolean")
+            translation_raw = get_alias(
+                raw,
+                "translation_threshold_m",
+                "translationThresholdM",
+                None,
+            )
+            translation_threshold_m: Optional[float] = None
+            if translation_raw is not None:
+                translation_threshold_m = self._parse_positive_float(
+                    translation_raw,
+                    f"{field_path}.translation_threshold_m",
+                )
+            rotation_raw = get_alias(
+                raw,
+                "rotation_threshold_rad",
+                "rotationThresholdRad",
+                None,
+            )
+            rotation_threshold_rad: Optional[float] = None
+            if rotation_raw is not None:
+                rotation_threshold_rad = self._parse_positive_float(
+                    rotation_raw,
+                    f"{field_path}.rotation_threshold_rad",
+                )
+            if enabled_raw and translation_threshold_m is None and rotation_threshold_rad is None:
+                raise DeploymentValidationError(
+                    f"{field_path} enabled monitors require at least one threshold"
+                )
+            debounce_s = self._parse_positive_float(
+                get_alias(raw, "debounce_s", "debounceS", 0.1),
+                f"{field_path}.debounce_s",
+            )
+            stale_behavior = self._parse_optional_text(
+                get_alias(raw, "stale_behavior", "staleBehavior", "fault"),
+                f"{field_path}.stale_behavior",
+            )
+            if stale_behavior not in {"fault", "unverifiable", "ignore"}:
+                raise DeploymentValidationError(
+                    f"{field_path}.stale_behavior must be one of: fault, unverifiable, ignore"
+                )
+            action = self._parse_optional_text(
+                get_alias(raw, "action", "action", "interrupt"),
+                f"{field_path}.action",
+            )
+            if action not in {"interrupt", "diagnostic_only"}:
+                raise DeploymentValidationError(
+                    f"{field_path}.action must be one of: interrupt, diagnostic_only"
+                )
+            signal_id = self._parse_optional_text(
+                get_alias(
+                    raw,
+                    "signal_id",
+                    "signalId",
+                    f"attached_object_drift/{object_id}",
+                ),
+                f"{field_path}.signal_id",
+            )
+            if not signal_id:
+                raise DeploymentValidationError(f"{field_path}.signal_id must be non-empty")
+            sample_time_tolerance_s = self._parse_positive_float(
+                get_alias(
+                    raw,
+                    "sample_time_tolerance_s",
+                    "sampleTimeToleranceS",
+                    0.05,
+                ),
+                f"{field_path}.sample_time_tolerance_s",
+            )
+            return PoseSourceAttachedDriftMonitorConfig(
+                enabled=enabled_raw,
+                translation_threshold_m=translation_threshold_m,
+                rotation_threshold_rad=rotation_threshold_rad,
+                debounce_s=debounce_s,
+                stale_behavior=stale_behavior,
+                action=action,
+                signal_id=signal_id,
+                sample_time_tolerance_s=sample_time_tolerance_s,
+            )
+
         parsed: dict[str, PoseSourceConfig] = {}
         object_writers: dict[str, str] = {}
         for index, source_data in enumerate(pose_sources_data):
@@ -715,6 +964,11 @@ class Deployment:
                 f"{field_path}.topic",
             )
             description = str(source_data.get("description", ""))
+            measured_tcp = parse_measured_tcp_config(
+                get_alias(source_data, "measured_tcp", "measuredTcp", None),
+                f"{field_path}.measured_tcp",
+                kind=kind,
+            )
 
             objects_data = source_data.get("objects", {})
             if not isinstance(objects_data, dict) or not objects_data:
@@ -780,6 +1034,34 @@ class Deployment:
                     get_alias(object_data, "frame_id", "frameId", ""),
                     f"{object_path}.frame_id",
                 )
+                measured_state_ghost = parse_ghost_config(
+                    get_alias(
+                        object_data,
+                        "measured_state_ghost",
+                        "measuredStateGhost",
+                        None,
+                    ),
+                    f"{object_path}.measured_state_ghost",
+                )
+                measured_attachment_baseline = parse_baseline_config(
+                    get_alias(
+                        object_data,
+                        "measured_attachment_baseline",
+                        "measuredAttachmentBaseline",
+                        None,
+                    ),
+                    f"{object_path}.measured_attachment_baseline",
+                )
+                attached_drift_monitor = parse_drift_monitor_config(
+                    get_alias(
+                        object_data,
+                        "attached_drift_monitor",
+                        "attachedDriftMonitor",
+                        None,
+                    ),
+                    f"{object_path}.attached_drift_monitor",
+                    object_id=object_id,
+                )
 
                 objects[object_id] = PoseSourceObjectBinding(
                     object_id=object_id,
@@ -787,6 +1069,9 @@ class Deployment:
                     entity=entity,
                     frame_id=binding_frame_id,
                     confidence_min=confidence_min,
+                    measured_state_ghost=measured_state_ghost,
+                    measured_attachment_baseline=measured_attachment_baseline,
+                    attached_drift_monitor=attached_drift_monitor,
                     metadata=dict(metadata),
                 )
 
@@ -811,6 +1096,7 @@ class Deployment:
                 service_prefix=service_prefix or "auto",
                 topic=topic,
                 description=description,
+                measured_tcp=measured_tcp,
                 objects=objects,
             )
         return parsed
@@ -2549,6 +2835,15 @@ class Deployment:
                     source_d["topic"] = source.topic
                 if source.description:
                     source_d["description"] = source.description
+                if source.measured_tcp is not None:
+                    source_d["measured_tcp"] = {
+                        "entity": source.measured_tcp.entity,
+                        "tcp_frame_id": source.measured_tcp.tcp_frame_id,
+                    }
+                    if source.measured_tcp.frame_id:
+                        source_d["measured_tcp"]["frame_id"] = (
+                            source.measured_tcp.frame_id
+                        )
                 for object_id, binding in source.objects.items():
                     binding_d: dict[str, Any] = {
                         "apply_policy": binding.apply_policy,
@@ -2559,6 +2854,39 @@ class Deployment:
                         binding_d["frame_id"] = binding.frame_id
                     if binding.confidence_min is not None:
                         binding_d["confidence_min"] = binding.confidence_min
+                    if binding.measured_state_ghost is not None:
+                        binding_d["measured_state_ghost"] = {
+                            "enabled": binding.measured_state_ghost.enabled,
+                            "robot_tcp": binding.measured_state_ghost.robot_tcp,
+                            "object": binding.measured_state_ghost.object,
+                            "opacity": binding.measured_state_ghost.opacity,
+                        }
+                    if binding.measured_attachment_baseline is not None:
+                        binding_d["measured_attachment_baseline"] = {
+                            "capture": binding.measured_attachment_baseline.capture,
+                            "require_same_time_robot_tcp": (
+                                binding.measured_attachment_baseline.require_same_time_robot_tcp
+                            ),
+                        }
+                    if binding.attached_drift_monitor is not None:
+                        drift = binding.attached_drift_monitor
+                        drift_d: dict[str, Any] = {
+                            "enabled": drift.enabled,
+                            "debounce_s": drift.debounce_s,
+                            "stale_behavior": drift.stale_behavior,
+                            "action": drift.action,
+                            "signal_id": drift.signal_id,
+                            "sample_time_tolerance_s": drift.sample_time_tolerance_s,
+                        }
+                        if drift.translation_threshold_m is not None:
+                            drift_d["translation_threshold_m"] = (
+                                drift.translation_threshold_m
+                            )
+                        if drift.rotation_threshold_rad is not None:
+                            drift_d["rotation_threshold_rad"] = (
+                                drift.rotation_threshold_rad
+                            )
+                        binding_d["attached_drift_monitor"] = drift_d
                     if binding.metadata:
                         binding_d["metadata"] = dict(binding.metadata)
                     source_d["objects"][object_id] = binding_d

@@ -366,6 +366,7 @@ function defaultPoseSource(id: string): PoseSourceConfig {
     servicePrefix: 'auto',
     topic: '',
     description: '',
+    measuredTcp: null,
     objects: {},
   };
 }
@@ -376,6 +377,26 @@ function defaultPoseSourceObject(): PoseSourceObjectBindingConfig {
     frameId: '',
     applyPolicy: 'observe_only',
     confidenceMin: null,
+    measuredStateGhost: {
+      enabled: false,
+      robotTcp: true,
+      object: true,
+      opacity: 0.5,
+    },
+    measuredAttachmentBaseline: {
+      capture: 'on_attach_or_first_paired_sample',
+      requireSameTimeRobotTcp: true,
+    },
+    attachedDriftMonitor: {
+      enabled: false,
+      translationThresholdM: 0.02,
+      rotationThresholdRad: 0.2,
+      debounceS: 0.1,
+      staleBehavior: 'fault',
+      action: 'interrupt',
+      signalId: '',
+      sampleTimeToleranceS: 0.05,
+    },
     metadata: {},
   };
 }
@@ -1462,6 +1483,36 @@ function PoseSourcesEditor({
                 help="simulation_interfaces service namespace. Use auto for discovery."
               />
               <FieldInput
+                label="Measured TCP Entity"
+                value={source.measuredTcp?.entity ?? ''}
+                onChange={(value) => updateSource(sourceIndex, {
+                  measuredTcp: value.trim()
+                    ? {
+                        ...(source.measuredTcp ?? {}),
+                        entity: value.trim(),
+                        tcpFrameId: source.measuredTcp?.tcpFrameId || 'tool0',
+                        frameId: source.measuredTcp?.frameId || source.frameId || '',
+                      }
+                    : null,
+                })}
+                disabled={disabled}
+                help="Optional simulation entity for the robot TCP sampled with object poses. Required for measured grasp drift monitoring."
+              />
+              <FieldInput
+                label="Measured TCP Frame"
+                value={source.measuredTcp?.tcpFrameId ?? ''}
+                onChange={(value) => updateSource(sourceIndex, {
+                  measuredTcp: {
+                    ...(source.measuredTcp ?? {}),
+                    entity: source.measuredTcp?.entity ?? '',
+                    tcpFrameId: value.trim(),
+                    frameId: source.measuredTcp?.frameId || source.frameId || '',
+                  },
+                })}
+                disabled={disabled || !source.measuredTcp}
+                help="Frame name for the measured TCP sample, for example tool0."
+              />
+              <FieldInput
                 label="Topic"
                 value={source.topic ?? ''}
                 onChange={(value) => updateSource(sourceIndex, { topic: value })}
@@ -1548,6 +1599,117 @@ function PoseSourcesEditor({
                       disabled={disabled}
                       help="Optional threshold for perception-driven sources."
                     />
+                    <div className="md:col-span-2 rounded border border-cyan-900/60 bg-cyan-950/10 p-2">
+                      <div className="mb-2 text-[10px] font-semibold uppercase tracking-wide text-cyan-200">
+                        Measured Grasp Integrity
+                      </div>
+                      <div className="grid gap-2 md:grid-cols-2">
+                        <CheckboxInput
+                          label="Measured-state ghost"
+                          checked={Boolean(binding.measuredStateGhost?.enabled)}
+                          onChange={(value) => updateObject(sourceIndex, objectId, {
+                            measuredStateGhost: {
+                              ...defaultPoseSourceObject().measuredStateGhost,
+                              ...(binding.measuredStateGhost ?? {}),
+                              enabled: value,
+                            },
+                          })}
+                          disabled={disabled}
+                          help="Shows external object/TCP samples as diagnostics only; it never changes the planning scene."
+                        />
+                        <CheckboxInput
+                          label="Drift monitor enabled"
+                          checked={Boolean(binding.attachedDriftMonitor?.enabled)}
+                          onChange={(value) => updateObject(sourceIndex, objectId, {
+                            attachedDriftMonitor: {
+                              ...defaultPoseSourceObject().attachedDriftMonitor,
+                              ...(binding.attachedDriftMonitor ?? {}),
+                              enabled: value,
+                              signalId: binding.attachedDriftMonitor?.signalId || `attached_object_drift/${objectId}`,
+                            },
+                          })}
+                          disabled={disabled}
+                          help="When enabled, same-time measured TCP/object samples arm a baseline at grasp and detect object slip."
+                        />
+                        <FieldInput
+                          label="Translation threshold (m)"
+                          value={binding.attachedDriftMonitor?.translationThresholdM ?? ''}
+                          type="number"
+                          min={0.001}
+                          step={0.001}
+                          onChange={(value) => {
+                            const trimmed = value.trim();
+                            updateObject(sourceIndex, objectId, {
+                              attachedDriftMonitor: {
+                                ...defaultPoseSourceObject().attachedDriftMonitor,
+                                ...(binding.attachedDriftMonitor ?? {}),
+                                translationThresholdM: trimmed === '' ? null : Math.max(0.001, Number(trimmed) || 0.02),
+                                signalId: binding.attachedDriftMonitor?.signalId || `attached_object_drift/${objectId}`,
+                              },
+                            });
+                          }}
+                          disabled={disabled}
+                          help="Object slip relative to measured TCP above this distance raises the configured action after debounce."
+                        />
+                        <FieldInput
+                          label="Rotation threshold (rad)"
+                          value={binding.attachedDriftMonitor?.rotationThresholdRad ?? ''}
+                          type="number"
+                          min={0.001}
+                          step={0.01}
+                          onChange={(value) => {
+                            const trimmed = value.trim();
+                            updateObject(sourceIndex, objectId, {
+                              attachedDriftMonitor: {
+                                ...defaultPoseSourceObject().attachedDriftMonitor,
+                                ...(binding.attachedDriftMonitor ?? {}),
+                                rotationThresholdRad: trimmed === '' ? null : Math.max(0.001, Number(trimmed) || 0.2),
+                                signalId: binding.attachedDriftMonitor?.signalId || `attached_object_drift/${objectId}`,
+                              },
+                            });
+                          }}
+                          disabled={disabled}
+                          help="Angular slip relative to measured TCP above this angle raises the configured action after debounce."
+                        />
+                        <FieldInput
+                          label="Debounce (s)"
+                          value={binding.attachedDriftMonitor?.debounceS ?? 0.1}
+                          type="number"
+                          min={0.0}
+                          step={0.01}
+                          onChange={(value) => updateObject(sourceIndex, objectId, {
+                            attachedDriftMonitor: {
+                              ...defaultPoseSourceObject().attachedDriftMonitor,
+                              ...(binding.attachedDriftMonitor ?? {}),
+                              debounceS: Math.max(0.001, Number(value) || 0.1),
+                              signalId: binding.attachedDriftMonitor?.signalId || `attached_object_drift/${objectId}`,
+                            },
+                          })}
+                          disabled={disabled}
+                          help="Threshold must remain exceeded for this time before the condition is raised."
+                        />
+                        <label className="block mb-2">
+                          <span className="text-xs text-gray-400">Action</span>
+                          <select
+                            value={binding.attachedDriftMonitor?.action ?? 'interrupt'}
+                            onChange={(event) => updateObject(sourceIndex, objectId, {
+                              attachedDriftMonitor: {
+                                ...defaultPoseSourceObject().attachedDriftMonitor,
+                                ...(binding.attachedDriftMonitor ?? {}),
+                                action: event.target.value,
+                                signalId: binding.attachedDriftMonitor?.signalId || `attached_object_drift/${objectId}`,
+                              },
+                            })}
+                            disabled={disabled}
+                            className="w-full mt-0.5 px-2 py-1 bg-gray-700 border border-gray-600 rounded text-sm text-gray-200 focus:border-blue-500 focus:outline-none disabled:opacity-50 disabled:cursor-not-allowed"
+                            title="interrupt stops the cycle when drift is confirmed; diagnostic_only uses the same monitor but does not stop execution."
+                          >
+                            <option value="interrupt">Interrupt</option>
+                            <option value="diagnostic_only">Diagnostic only</option>
+                          </select>
+                        </label>
+                      </div>
+                    </div>
                     <div className="flex items-end">
                       <button
                         type="button"

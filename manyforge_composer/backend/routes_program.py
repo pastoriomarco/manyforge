@@ -389,12 +389,63 @@ def _deployment_to_full_response(
                 "servicePrefix": source.service_prefix,
                 "topic": source.topic,
                 "description": source.description,
+                "measuredTcp": (
+                    None
+                    if source.measured_tcp is None
+                    else {
+                        "entity": source.measured_tcp.entity,
+                        "tcpFrameId": source.measured_tcp.tcp_frame_id,
+                        "frameId": source.measured_tcp.frame_id,
+                    }
+                ),
                 "objects": {
                     object_id: {
                         "entity": binding.entity,
                         "frameId": binding.frame_id,
                         "applyPolicy": binding.apply_policy,
                         "confidenceMin": binding.confidence_min,
+                        "measuredStateGhost": (
+                            None
+                            if binding.measured_state_ghost is None
+                            else {
+                                "enabled": binding.measured_state_ghost.enabled,
+                                "robotTcp": binding.measured_state_ghost.robot_tcp,
+                                "object": binding.measured_state_ghost.object,
+                                "opacity": binding.measured_state_ghost.opacity,
+                            }
+                        ),
+                        "measuredAttachmentBaseline": (
+                            None
+                            if binding.measured_attachment_baseline is None
+                            else {
+                                "capture": binding.measured_attachment_baseline.capture,
+                                "requireSameTimeRobotTcp": (
+                                    binding.measured_attachment_baseline.require_same_time_robot_tcp
+                                ),
+                            }
+                        ),
+                        "attachedDriftMonitor": (
+                            None
+                            if binding.attached_drift_monitor is None
+                            else {
+                                "enabled": binding.attached_drift_monitor.enabled,
+                                "translationThresholdM": (
+                                    binding.attached_drift_monitor.translation_threshold_m
+                                ),
+                                "rotationThresholdRad": (
+                                    binding.attached_drift_monitor.rotation_threshold_rad
+                                ),
+                                "debounceS": binding.attached_drift_monitor.debounce_s,
+                                "staleBehavior": (
+                                    binding.attached_drift_monitor.stale_behavior
+                                ),
+                                "action": binding.attached_drift_monitor.action,
+                                "signalId": binding.attached_drift_monitor.signal_id,
+                                "sampleTimeToleranceS": (
+                                    binding.attached_drift_monitor.sample_time_tolerance_s
+                                ),
+                            }
+                        ),
                         "metadata": dict(binding.metadata),
                     }
                     for object_id, binding in source.objects.items()

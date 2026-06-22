@@ -541,6 +541,7 @@ def _pose_sources_payload(state: ComposerState) -> list[PoseSourceStatusResponse
     if not pose_sources:
         return []
     snapshots = state.pose_source_snapshots()
+    drift_states = state.pose_source_drift_states()
     responses: list[PoseSourceStatusResponse] = []
 
     for source_id, source in sorted(pose_sources.items()):
@@ -575,8 +576,20 @@ def _pose_sources_payload(state: ComposerState) -> list[PoseSourceStatusResponse
                     age_s=observed.get("age_s"),
                     update=observed.get("update"),
                     rejection=observed.get("rejection"),
+                    measured_state_ghost=(
+                        None
+                        if binding.measured_state_ghost is None
+                        else {
+                            "enabled": binding.measured_state_ghost.enabled,
+                            "robotTcp": binding.measured_state_ghost.robot_tcp,
+                            "object": binding.measured_state_ghost.object,
+                            "opacity": binding.measured_state_ghost.opacity,
+                        }
+                    ),
+                    attached_drift=drift_states.get((source_id, object_id)),
                 )
             )
+        measured_tcp = snapshot.get("measured_tcp") or snapshot.get("measuredTcp")
         responses.append(
             PoseSourceStatusResponse(
                 pose_source_id=source_id,
@@ -588,6 +601,7 @@ def _pose_sources_payload(state: ComposerState) -> list[PoseSourceStatusResponse
                 frame_id=source.frame_id,
                 description=source.description,
                 received_at_ns=snapshot.get("received_at_ns"),
+                measured_tcp=measured_tcp if isinstance(measured_tcp, dict) else None,
                 objects=object_states,
             )
         )

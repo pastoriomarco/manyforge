@@ -614,11 +614,36 @@ class TestDeploymentLoading:
                     "stale_after_s": 1.25,
                     "frame_id": "universe",
                     "description": "Isaac entity poses for known scene objects.",
+                    "measured_tcp": {
+                        "entity": "/World/tool0",
+                        "tcp_frame_id": "tool0",
+                        "frame_id": "universe",
+                    },
                     "objects": {
                         "isaac_cheese_box": {
                             "entity": "/mac_n_cheese_centered",
                             "apply_policy": "before_planning",
                             "confidence_min": 0.8,
+                            "measured_state_ghost": {
+                                "enabled": True,
+                                "robot_tcp": True,
+                                "object": True,
+                                "opacity": 0.5,
+                            },
+                            "measured_attachment_baseline": {
+                                "capture": "on_attach_or_first_paired_sample",
+                                "require_same_time_robot_tcp": True,
+                            },
+                            "attached_drift_monitor": {
+                                "enabled": True,
+                                "translation_threshold_m": 0.02,
+                                "rotation_threshold_rad": 0.2,
+                                "debounce_s": 0.1,
+                                "stale_behavior": "fault",
+                                "action": "interrupt",
+                                "signal_id": "attached_object_drift/isaac_cheese_box",
+                                "sample_time_tolerance_s": 0.05,
+                            },
                             "metadata": {"source": "fixture"},
                         },
                         "isaac_soup_can": {
@@ -636,10 +661,27 @@ class TestDeploymentLoading:
         assert source.max_update_hz == 4.0
         assert source.stale_after_s == 1.25
         assert source.frame_id == "universe"
+        assert source.measured_tcp is not None
+        assert source.measured_tcp.entity == "/World/tool0"
+        assert source.measured_tcp.tcp_frame_id == "tool0"
         assert set(source.objects) == {"isaac_cheese_box", "isaac_soup_can"}
         assert source.objects["isaac_cheese_box"].entity == "/mac_n_cheese_centered"
         assert source.objects["isaac_cheese_box"].apply_policy == "before_planning"
         assert source.objects["isaac_cheese_box"].confidence_min == 0.8
+        assert source.objects["isaac_cheese_box"].measured_state_ghost is not None
+        assert source.objects["isaac_cheese_box"].measured_state_ghost.enabled is True
+        assert source.objects["isaac_cheese_box"].measured_attachment_baseline is not None
+        assert (
+            source.objects[
+                "isaac_cheese_box"
+            ].measured_attachment_baseline.require_same_time_robot_tcp
+            is True
+        )
+        assert source.objects["isaac_cheese_box"].attached_drift_monitor is not None
+        assert (
+            source.objects["isaac_cheese_box"].attached_drift_monitor.translation_threshold_m
+            == 0.02
+        )
         assert source.objects["isaac_cheese_box"].metadata == {"source": "fixture"}
 
         serialized = deploy.to_dict()
@@ -647,6 +689,65 @@ class TestDeploymentLoading:
         assert reloaded.pose_sources["isaac_scene_objects"].objects[
             "isaac_soup_can"
         ].apply_policy == "observe_only"
+        assert (
+            reloaded.pose_sources["isaac_scene_objects"]
+            .objects["isaac_cheese_box"]
+            .attached_drift_monitor
+            .signal_id
+            == "attached_object_drift/isaac_cheese_box"
+        )
+        assert (
+            reloaded.pose_sources["isaac_scene_objects"].measured_tcp.entity
+            == "/World/tool0"
+        )
+
+    def test_pose_source_rejects_enabled_drift_monitor_without_thresholds(self):
+        data = _minimal_deployment(
+            pose_sources=[
+                {
+                    "id": "isaac_scene_objects",
+                    "kind": "simulation_interfaces",
+                    "objects": {
+                        "box": {
+                            "entity": "/World/box",
+                            "apply_policy": "continuous_unattached",
+                            "attached_drift_monitor": {
+                                "enabled": True,
+                                "debounce_s": 0.1,
+                            },
+                        },
+                    },
+                },
+            ],
+        )
+        with pytest.raises(
+            DeploymentValidationError,
+            match="enabled monitors require at least one threshold",
+        ):
+            Deployment.from_dict(data)
+
+    def test_pose_source_rejects_non_boolean_measured_ghost_fields(self):
+        data = _minimal_deployment(
+            pose_sources=[
+                {
+                    "id": "isaac_scene_objects",
+                    "kind": "simulation_interfaces",
+                    "objects": {
+                        "box": {
+                            "entity": "/World/box",
+                            "measured_state_ghost": {
+                                "enabled": "false",
+                            },
+                        },
+                    },
+                },
+            ],
+        )
+        with pytest.raises(
+            DeploymentValidationError,
+            match="measured_state_ghost.enabled must be a boolean",
+        ):
+            Deployment.from_dict(data)
 
     def test_pose_source_rejects_duplicate_object_authority(self):
         data = _minimal_deployment(

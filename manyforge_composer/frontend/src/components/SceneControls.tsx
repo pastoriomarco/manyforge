@@ -448,17 +448,43 @@ function PoseSourcesSection({ sources }: { sources: PoseSourceStatusState[] }) {
           <div className="truncate text-[10px] text-gray-500">
             {source.kind} · max {source.max_update_hz.toFixed(1)} Hz · stale{' '}
             {source.stale_after_s.toFixed(2)} s
+            {source.measured_tcp && (
+              <>
+                {' '}· TCP age {formatMaybeSeconds(source.measured_tcp.age_s)}
+              </>
+            )}
           </div>
           <ul className="ml-2 space-y-0.5">
             {source.objects.map((objectState) => (
-              <li key={objectState.object_id} className="flex items-center gap-2 text-[11px]">
-                <span className="min-w-0 flex-1 truncate font-mono text-gray-300">
-                  {objectState.object_id}
-                </span>
-                <span className="truncate text-[10px] text-gray-500">
-                  {objectState.apply_policy}
-                </span>
-                <StatusPill status={objectState.status} compact />
+              <li key={objectState.object_id} className="space-y-0.5 text-[11px]">
+                <div className="flex items-center gap-2">
+                  <span className="min-w-0 flex-1 truncate font-mono text-gray-300">
+                    {objectState.object_id}
+                  </span>
+                  <span className="truncate text-[10px] text-gray-500">
+                    {objectState.apply_policy}
+                  </span>
+                  <StatusPill status={objectState.status} compact />
+                </div>
+                {objectState.attached_drift && (
+                  <div className="ml-2 rounded border border-gray-800 bg-gray-950/60 px-2 py-1 text-[10px] text-gray-400">
+                    <div className="flex items-center justify-between gap-2">
+                      <span>Drift</span>
+                      <StatusPill status={objectState.attached_drift.status} compact />
+                    </div>
+                    <div className="mt-0.5 grid grid-cols-2 gap-x-2 gap-y-0.5">
+                      <span>dx {formatMaybeMeters(objectState.attached_drift.translation_m)}</span>
+                      <span>dθ {formatMaybeRadians(objectState.attached_drift.rotation_rad)}</span>
+                      <span>dt {formatMaybeSeconds(objectState.attached_drift.sample_time_delta_s)}</span>
+                      <span>{objectState.attached_drift.action}</span>
+                    </div>
+                    {objectState.attached_drift.unverifiable_reason && (
+                      <div className="mt-0.5 truncate text-yellow-300/80">
+                        {objectState.attached_drift.unverifiable_reason}
+                      </div>
+                    )}
+                  </div>
+                )}
               </li>
             ))}
           </ul>
@@ -466,6 +492,21 @@ function PoseSourcesSection({ sources }: { sources: PoseSourceStatusState[] }) {
       ))}
     </div>
   );
+}
+
+function formatMaybeMeters(value: number | null | undefined): string {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return '-';
+  return `${value.toFixed(3)} m`;
+}
+
+function formatMaybeRadians(value: number | null | undefined): string {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return '-';
+  return `${value.toFixed(3)} rad`;
+}
+
+function formatMaybeSeconds(value: number | null | undefined): string {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return '-';
+  return `${value.toFixed(2)} s`;
 }
 
 function StatusPill({

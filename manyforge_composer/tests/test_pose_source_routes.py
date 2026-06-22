@@ -85,7 +85,39 @@ def _pose_sources(
     enabled: bool = True,
     box_policy: str = "before_planning",
     can_policy: str = "observe_only",
+    measured_grasp: bool = False,
+    drift_action: str = "interrupt",
+    debounce_s: float = 0.001,
 ) -> list[dict]:
+    box_binding: dict[str, Any] = {
+        "entity": "/World/box",
+        "apply_policy": box_policy,
+    }
+    if measured_grasp:
+        box_binding.update(
+            {
+                "measured_state_ghost": {
+                    "enabled": True,
+                    "robot_tcp": True,
+                    "object": True,
+                    "opacity": 0.5,
+                },
+                "measured_attachment_baseline": {
+                    "capture": "on_attach_or_first_paired_sample",
+                    "require_same_time_robot_tcp": True,
+                },
+                "attached_drift_monitor": {
+                    "enabled": True,
+                    "translation_threshold_m": 0.02,
+                    "rotation_threshold_rad": 0.2,
+                    "debounce_s": debounce_s,
+                    "stale_behavior": "fault",
+                    "action": drift_action,
+                    "signal_id": "attached_object_drift/box",
+                    "sample_time_tolerance_s": 0.05,
+                },
+            }
+        )
     return [
         {
             "id": "isaac_scene_objects",
@@ -96,10 +128,7 @@ def _pose_sources(
             "stale_after_s": 1.0,
             "frame_id": "universe",
             "objects": {
-                "box": {
-                    "entity": "/World/box",
-                    "apply_policy": box_policy,
-                },
+                "box": box_binding,
                 "can": {
                     "entity": "/World/can",
                     "apply_policy": can_policy,
@@ -139,6 +168,7 @@ def _pose_source_observation(
     observed_frame_id: str = "universe",
     age_s: float | None = 0.05,
     position_xyz: list[float] | None = None,
+    monotonic_s: float = 10.0,
 ) -> dict[str, Any]:
     observed: dict[str, Any] = {
         "objectId": object_id,
@@ -147,7 +177,7 @@ def _pose_source_observation(
             "poseSourceId": "isaac_scene_objects",
             "objectId": object_id,
             "entity": "/wrong",
-            "monotonicS": 10.0,
+            "monotonicS": monotonic_s,
             "applyPolicy": "observe_only",
             "pose": {
                 "frameId": observed_frame_id,
@@ -165,15 +195,20 @@ def _pose_source_observation(
 def _post_fresh_snapshot(
     client: TestClient,
     observations: list[dict[str, Any]],
+    *,
+    measured_tcp: dict[str, Any] | None = None,
 ) -> Any:
+    payload: dict[str, Any] = {
+        "poseSourceId": "isaac_scene_objects",
+        "status": "fresh",
+        "monotonicS": 10.0,
+        "objects": observations,
+    }
+    if measured_tcp is not None:
+        payload["measuredTcp"] = measured_tcp
     response = client.post(
         "/api/scene/pose-sources/isaac_scene_objects/snapshot",
-        json={
-            "poseSourceId": "isaac_scene_objects",
-            "status": "fresh",
-            "monotonicS": 10.0,
-            "objects": observations,
-        },
+        json=payload,
     )
     assert response.status_code == 200
     return response
@@ -708,6 +743,194 @@ def test_pose_source_apply_failure_event_includes_object_reject_details(tmp_path
     assert detail["reject_reason"] == "scene_edit_failed"
     assert detail["frame_id"] == "universe"
     assert detail["observed_frame_id"] == "box_provider_frame"
+
+
+class _ConditionFaultRecorder:
+    def __init__(self) -> None:
+        self.published: list[dict[str, Any]] = []
+        self.faults: list[dict[str, Any]] = []
+
+    def publish_signal(self, **kwargs: Any) -> None:
+        self.published.append(kwargs)
+
+    def raise_runtime_condition_fault(self, **kwargs: Any) -> None:
+        self.faults.append(kwargs)
+
+
+def _measured_tcp_sample(*, monotonic_s: float = 10.0) -> dict[str, Any]:
+    return {
+        "frameId": "universe",
+        "tcpFrameId": "tool0",
+        "monotonicS": monotonic_s,
+        "ageS": 0.05,
+        "pose": {
+            "frameId": "universe",
+            "stampSec": 100.0,
+            "positionXYZ": [0.0, 0.0, 0.0],
+            "orientationXYZW": [0.0, 0.0, 0.0, 1.0],
+        },
+    }
+
+
+def test_measured_grasp_drift_baseline_and_scene_state_status(tmp_path: Path) -> None:
+    client, state = _client(tmp_path)
+    state.deployment = _minimal_deployment(
+        pose_sources=_pose_sources(
+            box_policy="continuous_unattached",
+            measured_grasp=True,
+            drift_action="diagnostic_only",
+        )
+    )
+    _add_box(client)
+    attach = state.kernel.scene_edit(
+        SceneEditRequest(operation="attach", object_id="box", frame_id="tool0")
+    )
+    assert attach.success is True
+
+    _post_fresh_snapshot(
+        client,
+        [
+            _pose_source_observation(
+                "box",
+                position_xyz=[0.10, 0.0, 0.0],
+                monotonic_s=10.0,
+            )
+        ],
+        measured_tcp=_measured_tcp_sample(monotonic_s=10.0),
+    )
+
+    scene = client.get("/api/scene/state").json()
+    source = scene["pose_sources"][0]
+    assert source["measured_tcp"]["tcp_frame_id"] == "tool0"
+    drift = source["objects"][0]["attached_drift"]
+    assert drift["baseline_captured"] is True
+    assert drift["status"] == "ok"
+    assert drift["translation_m"] == 0.0
+    assert drift["sample_time_delta_s"] == 0.0
+
+
+def test_measured_grasp_drift_interrupts_after_debounce(tmp_path: Path) -> None:
+    client, state = _client(tmp_path)
+    recorder = _ConditionFaultRecorder()
+    state.deployment = _minimal_deployment(
+        pose_sources=_pose_sources(
+            box_policy="continuous_unattached",
+            measured_grasp=True,
+            drift_action="interrupt",
+            debounce_s=0.001,
+        )
+    )
+    _add_box(client)
+    attach = state.kernel.scene_edit(
+        SceneEditRequest(operation="attach", object_id="box", frame_id="tool0")
+    )
+    assert attach.success is True
+    state.cycle_manager = recorder
+
+    _post_fresh_snapshot(
+        client,
+        [_pose_source_observation("box", position_xyz=[0.10, 0.0, 0.0])],
+        measured_tcp=_measured_tcp_sample(),
+    )
+    _post_fresh_snapshot(
+        client,
+        [_pose_source_observation("box", position_xyz=[0.15, 0.0, 0.0])],
+        measured_tcp=_measured_tcp_sample(),
+    )
+    assert recorder.faults == []
+    time.sleep(0.005)
+    _post_fresh_snapshot(
+        client,
+        [_pose_source_observation("box", position_xyz=[0.15, 0.0, 0.0])],
+        measured_tcp=_measured_tcp_sample(),
+    )
+
+    assert recorder.published[-1]["signal"] == "attached_object_drift/box"
+    assert recorder.published[-1]["value"] is True
+    assert recorder.faults
+    fault = recorder.faults[-1]
+    assert fault["condition_id"] == "attached_object_drift/box"
+    assert fault["details"]["reason_code"] == "attached_object_drift"
+    assert fault["details"]["translation_m"] > 0.02
+
+
+def test_measured_grasp_drift_unverifiable_on_mixed_time_samples(tmp_path: Path) -> None:
+    client, state = _client(tmp_path)
+    state.deployment = _minimal_deployment(
+        pose_sources=_pose_sources(
+            box_policy="continuous_unattached",
+            measured_grasp=True,
+            drift_action="interrupt",
+        )
+    )
+    _add_box(client)
+    attach = state.kernel.scene_edit(
+        SceneEditRequest(operation="attach", object_id="box", frame_id="tool0")
+    )
+    assert attach.success is True
+
+    _post_fresh_snapshot(
+        client,
+        [_pose_source_observation("box", position_xyz=[0.10, 0.0, 0.0], monotonic_s=12.0)],
+        measured_tcp=_measured_tcp_sample(monotonic_s=10.0),
+    )
+
+    drift = client.get("/api/scene/state").json()["pose_sources"][0]["objects"][0][
+        "attached_drift"
+    ]
+    assert drift["status"] == "unverifiable"
+    assert drift["unverifiable_reason"] == "sample_time_mismatch"
+
+
+def test_measured_grasp_stale_fault_interrupts_when_tcp_missing(tmp_path: Path) -> None:
+    client, state = _client(tmp_path)
+    recorder = _ConditionFaultRecorder()
+    state.deployment = _minimal_deployment(
+        pose_sources=_pose_sources(
+            box_policy="continuous_unattached",
+            measured_grasp=True,
+            drift_action="interrupt",
+        )
+    )
+    _add_box(client)
+    attach = state.kernel.scene_edit(
+        SceneEditRequest(operation="attach", object_id="box", frame_id="tool0")
+    )
+    assert attach.success is True
+    state.cycle_manager = recorder
+
+    _post_fresh_snapshot(
+        client,
+        [_pose_source_observation("box", position_xyz=[0.10, 0.0, 0.0])],
+    )
+
+    assert recorder.published[-1]["signal"] == "attached_object_drift/box"
+    assert recorder.published[-1]["value"] is True
+    fault = recorder.faults[-1]
+    assert fault["condition_id"] == "attached_object_drift/box"
+    assert fault["details"]["reason_code"] == "attached_object_drift_unverifiable"
+    assert fault["details"]["reason"] == "measured_tcp_missing"
+    drift = state.pose_source_drift_states()[("isaac_scene_objects", "box")]
+    assert drift["status"] == "unverifiable"
+    assert drift["unverifiable_reason"] == "measured_tcp_missing"
+    event_count = sum(
+        1
+        for event in state.event_recorder.get_events_since(0)
+        if event["type"] == "pose_source_drift_unverifiable"
+    )
+    _post_fresh_snapshot(
+        client,
+        [_pose_source_observation("box", position_xyz=[0.10, 0.0, 0.0])],
+    )
+    assert len(recorder.faults) == 1
+    assert (
+        sum(
+            1
+            for event in state.event_recorder.get_events_since(0)
+            if event["type"] == "pose_source_drift_unverifiable"
+        )
+        == event_count
+    )
 
 
 def test_between_nodes_latch_can_apply_during_running_cycle(tmp_path: Path) -> None:

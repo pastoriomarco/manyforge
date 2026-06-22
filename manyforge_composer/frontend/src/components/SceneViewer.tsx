@@ -590,6 +590,17 @@ interface MeasuredGhost {
   shapeType: string | null;
 }
 
+function measuredGhostEnabled(
+  config: Record<string, unknown> | null | undefined,
+  key: 'object' | 'robotTcp',
+  defaultEnabled = false,
+): boolean {
+  if (!config) return defaultEnabled;
+  if (config.enabled === false) return false;
+  if (config[key] === false) return false;
+  return config.enabled === true;
+}
+
 function MeasuredPoseSourceGhosts() {
   const visible = useViewerSelectionStore((s) => s.measuredStateGhostVisible);
   const poseSources = useSceneStateStore(
@@ -609,8 +620,32 @@ function MeasuredPoseSourceGhosts() {
     if (!visible) return [];
     const next: MeasuredGhost[] = [];
     for (const source of poseSources) {
+      const renderTcp = source.objects.some((observed) => (
+        measuredGhostEnabled(observed.measured_state_ghost, 'robotTcp')
+      ));
+      if (renderTcp && source.measured_tcp) {
+        const tcpPose = source.measured_tcp.pose;
+        if (isRenderableWorldPoseFrame(tcpPose.frame_id, source.frame_id)) {
+          const position = tuple3(tcpPose.position_xyz);
+          const quaternion = tuple4(tcpPose.orientation_xyzw);
+          if (position !== null && quaternion !== null) {
+            next.push({
+              key: `${source.pose_source_id}:measured_tcp`,
+              objectId: source.measured_tcp.tcp_frame_id || 'measured_tcp',
+              sourceId: source.pose_source_id,
+              position,
+              quaternion,
+              shape: null,
+              shapeType: null,
+            });
+          }
+        }
+      }
       for (const observed of source.objects) {
         if (observed.status !== 'fresh' || observed.update === null || observed.update === undefined) {
+          continue;
+        }
+        if (!measuredGhostEnabled(observed.measured_state_ghost, 'object', true)) {
           continue;
         }
         const pose = observed.update.pose;

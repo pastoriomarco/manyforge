@@ -977,6 +977,50 @@ class CycleManager:
                 fingerprint_error,
             )
 
+    def raise_runtime_condition_fault(
+        self,
+        *,
+        condition_id: str,
+        message: str,
+        details: Optional[dict[str, Any]] = None,
+    ) -> None:
+        """Fail closed on an externally evaluated runtime condition.
+
+        Pose-source measured-grasp integrity and similar supervisors run
+        outside the behavior tree but still need the same operator-visible
+        stop/error semantics. This method is the narrow bridge: it quiesces
+        active motion through the kernel stop path, stores structured error
+        details, and leaves the held tree resumable only after the operator
+        explicitly handles the error.
+        """
+        detail_payload = dict(details or {})
+        detail_payload.setdefault("condition_id", condition_id)
+        detail_payload.setdefault("reason_code", condition_id)
+        with self._lock:
+            current_state = self._state
+        if current_state not in {
+            CycleState.RUNNING,
+            CycleState.STOPPING,
+            CycleState.STOPPED,
+        }:
+            return
+
+        if current_state in {CycleState.RUNNING, CycleState.STOPPING}:
+            self._quiesce_runtime(
+                client_name="cycle_manager_runtime_condition_fault",
+                kernel_action="stop_if_active",
+            )
+        fingerprint, fingerprint_error = self._capture_scene_resume_fingerprint()
+        with self._lock:
+            self._error = message
+            self._error_code = condition_id
+            self._error_details = detail_payload
+            self._state = CycleState.STOPPED
+            self._store_resumable_stop_scene_fingerprint_locked(
+                fingerprint,
+                fingerprint_error,
+            )
+
     def _capture_kernel_error_diagnostics(
         self,
     ) -> tuple[Optional[str], Optional[dict[str, Any]]]:
