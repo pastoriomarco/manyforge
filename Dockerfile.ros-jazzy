@@ -30,6 +30,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ros-${ROS_DISTRO}-sensor-msgs \
         ros-${ROS_DISTRO}-simulation-interfaces \
         ros-${ROS_DISTRO}-trajectory-msgs \
+        ros-${ROS_DISTRO}-vision-msgs \
         ros-${ROS_DISTRO}-controller-manager \
         ros-${ROS_DISTRO}-joint-state-broadcaster \
         ros-${ROS_DISTRO}-joint-trajectory-controller \

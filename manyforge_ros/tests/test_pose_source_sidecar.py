@@ -202,3 +202,658 @@ def test_simulation_interfaces_pose_source_rejects_missing_entity_pose():
         server_node.destroy_node()
         client_node.destroy_node()
         rclpy.shutdown()
+
+
+def test_pose_stamped_topic_source_normalizes_latest_wins_state():
+    rclpy = pytest.importorskip("rclpy")
+    pytest.importorskip("geometry_msgs")
+
+    from geometry_msgs.msg import PoseStamped
+    from rclpy.executors import SingleThreadedExecutor
+
+    from manyforge_ros.pose_source_sidecar import (
+        POSE_SOURCE_STATUS_FRESH,
+        POSE_SOURCE_STATUS_STALE,
+        PoseSourceBinding,
+        PoseStampedTopicPoseSource,
+    )
+
+    rclpy.init(args=None)
+    node = rclpy.create_node("manyforge_pose_stamped_topic_source_test")
+    executor = SingleThreadedExecutor()
+    executor.add_node(node)
+    publisher = node.create_publisher(PoseStamped, "/tracked_box_pose", 1)
+    now = {"value": 20.0}
+
+    source = PoseStampedTopicPoseSource(
+        node=node,
+        pose_source_id="tracked_box",
+        binding=PoseSourceBinding(
+            object_id="box",
+            entity="/tracked_box_pose",
+            apply_policy="before_planning",
+        ),
+        topic="/tracked_box_pose",
+        stale_after_s=0.5,
+        now_fn=lambda: now["value"],
+    )
+
+    try:
+        msg = PoseStamped()
+        msg.header.frame_id = "world"
+        msg.header.stamp.sec = 12
+        msg.header.stamp.nanosec = 250_000_000
+        msg.pose.position.x = 1.0
+        msg.pose.position.y = 2.0
+        msg.pose.position.z = 3.0
+        msg.pose.orientation.w = 2.0
+        _publish_until(
+            executor,
+            publisher,
+            msg,
+            lambda: source.snapshot(monotonic_s=20.0).objects[0].update
+            is not None,
+        )
+
+        live = source.snapshot(monotonic_s=20.0)
+        assert live.status == POSE_SOURCE_STATUS_FRESH
+        assert live.objects[0].status == POSE_SOURCE_STATUS_FRESH
+        update = live.objects[0].update
+        assert update is not None
+        assert update.object_id == "box"
+        assert update.entity == "/tracked_box_pose"
+        assert update.apply_policy == "before_planning"
+        assert update.pose.frame_id == "world"
+        assert update.pose.stamp_sec == pytest.approx(12.25)
+        assert update.pose.position_xyz == (1.0, 2.0, 3.0)
+        assert update.pose.orientation_xyzw == (0.0, 0.0, 0.0, 1.0)
+        assert live.to_dict()["objects"][0]["update"]["pose"]["frameId"] == "world"
+
+        msg.pose.position.x = 9.0
+        now["value"] = 20.01
+        for _ in range(5):
+            publisher.publish(msg)
+            executor.spin_once(timeout_sec=0.02)
+        throttled = source.snapshot(monotonic_s=20.01).objects[0].update
+        assert throttled is not None
+        assert throttled.pose.position_xyz == (1.0, 2.0, 3.0)
+
+        now["value"] = 20.10
+        _publish_until(
+            executor,
+            publisher,
+            msg,
+            lambda: (
+                source.snapshot(monotonic_s=20.10).objects[0].update is not None
+                and source.snapshot(
+                    monotonic_s=20.10,
+                ).objects[0].update.pose.position_xyz
+                == (9.0, 2.0, 3.0)
+            ),
+        )
+
+        stale = source.snapshot(monotonic_s=20.75)
+        assert stale.status == POSE_SOURCE_STATUS_STALE
+        assert stale.objects[0].status == POSE_SOURCE_STATUS_STALE
+        assert stale.objects[0].age_s == pytest.approx(0.65)
+    finally:
+        source.close()
+        node.destroy_publisher(publisher)
+        executor.shutdown()
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+def test_pose_stamped_topic_source_rejects_invalid_pose():
+    rclpy = pytest.importorskip("rclpy")
+    pytest.importorskip("geometry_msgs")
+
+    from geometry_msgs.msg import PoseStamped
+    from rclpy.executors import SingleThreadedExecutor
+
+    from manyforge_ros.pose_source_sidecar import (
+        POSE_SOURCE_STATUS_REJECTED,
+        PoseSourceBinding,
+        PoseStampedTopicPoseSource,
+    )
+
+    rclpy.init(args=None)
+    node = rclpy.create_node("manyforge_pose_stamped_topic_reject_test")
+    executor = SingleThreadedExecutor()
+    executor.add_node(node)
+    publisher = node.create_publisher(PoseStamped, "/bad_pose", 1)
+    source = PoseStampedTopicPoseSource(
+        node=node,
+        pose_source_id="bad_pose_source",
+        binding=PoseSourceBinding(object_id="box", entity="/bad_pose"),
+        topic="/bad_pose",
+        now_fn=lambda: 30.0,
+    )
+
+    try:
+        msg = PoseStamped()
+        msg.header.frame_id = "world"
+        msg.pose.orientation.w = 0.0
+        _publish_until(
+            executor,
+            publisher,
+            msg,
+            lambda: source.snapshot(monotonic_s=30.0).objects[0].rejection
+            is not None,
+        )
+
+        live = source.snapshot(monotonic_s=30.0)
+        assert live.status == POSE_SOURCE_STATUS_REJECTED
+        rejection = live.objects[0].rejection
+        assert rejection is not None
+        assert rejection.reason == "invalid_pose"
+        assert "zero norm" in rejection.detail
+    finally:
+        source.close()
+        node.destroy_publisher(publisher)
+        executor.shutdown()
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+def test_pose_array_topic_source_updates_indexed_objects():
+    rclpy = pytest.importorskip("rclpy")
+    pytest.importorskip("geometry_msgs")
+
+    from geometry_msgs.msg import PoseArray
+    from rclpy.executors import SingleThreadedExecutor
+
+    from manyforge_ros.pose_source_sidecar import (
+        POSE_SOURCE_STATUS_FRESH,
+        PoseArrayTopicPoseSource,
+    )
+
+    rclpy.init(args=None)
+    node = rclpy.create_node("manyforge_pose_array_topic_source_test")
+    executor = SingleThreadedExecutor()
+    executor.add_node(node)
+    publisher = node.create_publisher(PoseArray, "/tracked_object_poses", 1)
+    now = {"value": 40.0}
+    source = PoseArrayTopicPoseSource(
+        node=node,
+        pose_source_id="tracked_objects",
+        bindings=[
+            _pose_array_binding("box", 0, apply_policy="observe_only"),
+            _pose_array_binding("can", 1, apply_policy="before_planning"),
+        ],
+        topic="/tracked_object_poses",
+        frame_id="world",
+        stale_after_s=0.5,
+        now_fn=lambda: now["value"],
+    )
+
+    try:
+        msg = PoseArray()
+        msg.header.frame_id = "world"
+        msg.header.stamp.sec = 41
+        msg.poses.append(_pose(1.0, 2.0, 3.0))
+        msg.poses.append(_pose(4.0, 5.0, 6.0))
+        _publish_until(
+            executor,
+            publisher,
+            msg,
+            lambda: source.snapshot(monotonic_s=40.0).objects[1].update
+            is not None,
+        )
+
+        live = source.snapshot(monotonic_s=40.0)
+        assert live.status == POSE_SOURCE_STATUS_FRESH
+        by_object = {obj.object_id: obj for obj in live.objects}
+        assert by_object["box"].update is not None
+        assert by_object["box"].update.pose.position_xyz == (1.0, 2.0, 3.0)
+        assert by_object["box"].update.entity == "/tracked_object_poses[0]"
+        assert by_object["can"].update is not None
+        assert by_object["can"].update.pose.position_xyz == (4.0, 5.0, 6.0)
+        assert by_object["can"].update.apply_policy == "before_planning"
+    finally:
+        source.close()
+        node.destroy_publisher(publisher)
+        executor.shutdown()
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+def test_pose_array_topic_source_rejects_missing_index_without_dropping_valid_pose():
+    rclpy = pytest.importorskip("rclpy")
+    pytest.importorskip("geometry_msgs")
+
+    from geometry_msgs.msg import PoseArray
+    from rclpy.executors import SingleThreadedExecutor
+
+    from manyforge_ros.pose_source_sidecar import (
+        POSE_SOURCE_STATUS_FRESH,
+        PoseArrayTopicPoseSource,
+    )
+
+    rclpy.init(args=None)
+    node = rclpy.create_node("manyforge_pose_array_topic_reject_test")
+    executor = SingleThreadedExecutor()
+    executor.add_node(node)
+    publisher = node.create_publisher(PoseArray, "/partial_object_poses", 1)
+    now = {"value": 50.0}
+    source = PoseArrayTopicPoseSource(
+        node=node,
+        pose_source_id="partial_objects",
+        bindings=[
+            _pose_array_binding("box", 0),
+            _pose_array_binding("missing", 2),
+        ],
+        topic="/partial_object_poses",
+        frame_id="world",
+        now_fn=lambda: now["value"],
+    )
+
+    try:
+        full = PoseArray()
+        full.header.frame_id = "world"
+        full.poses.append(_pose(1.0, 0.0, 0.0))
+        full.poses.append(_pose(99.0, 0.0, 0.0))
+        full.poses.append(_pose(2.0, 0.0, 0.0))
+        _publish_until(
+            executor,
+            publisher,
+            full,
+            lambda: source.snapshot(monotonic_s=50.0).objects[1].update
+            is not None,
+        )
+
+        now["value"] = 50.2
+        msg = PoseArray()
+        msg.header.frame_id = "world"
+        msg.poses.append(_pose(1.0, 0.0, 0.0))
+        _publish_until(
+            executor,
+            publisher,
+            msg,
+            lambda: source.snapshot(monotonic_s=50.2).objects[1].rejection
+            is not None,
+        )
+
+        live = source.snapshot(monotonic_s=50.2)
+        assert live.status == POSE_SOURCE_STATUS_FRESH
+        by_object = {obj.object_id: obj for obj in live.objects}
+        assert by_object["box"].update is not None
+        assert by_object["missing"].update is None
+        assert by_object["missing"].rejection is not None
+        assert by_object["missing"].rejection.reason == "pose_index_missing"
+    finally:
+        source.close()
+        node.destroy_publisher(publisher)
+        executor.shutdown()
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+def test_tf_pose_source_polls_configured_frame_pairs():
+    pytest.importorskip("geometry_msgs")
+
+    from manyforge_ros.pose_source_sidecar import (
+        POSE_SOURCE_STATUS_FRESH,
+        PoseSourceBinding,
+        TfPoseSource,
+    )
+
+    buffer = _FakeTfBuffer(
+        {
+            ("world", "box_frame"): _transform("world", "box_frame", 1.0, 2.0, 3.0),
+            ("map", "can_frame"): _transform("map", "can_frame", 4.0, 5.0, 6.0),
+        }
+    )
+    source = TfPoseSource(
+        node=object(),
+        pose_source_id="tracked_tf_objects",
+        bindings=[
+            PoseSourceBinding(
+                object_id="box",
+                entity="box_frame",
+                frame_id="world",
+                apply_policy="observe_only",
+            ),
+            PoseSourceBinding(
+                object_id="can",
+                entity="can_frame",
+                frame_id="map",
+                apply_policy="before_planning",
+            ),
+        ],
+        buffer=buffer,
+        now_fn=lambda: 60.0,
+    )
+
+    result = source.poll_once()
+    assert result.status == POSE_SOURCE_STATUS_FRESH
+    live = source.state.snapshot(monotonic_s=60.0)
+    assert live.status == POSE_SOURCE_STATUS_FRESH
+    by_object = {obj.object_id: obj for obj in live.objects}
+    assert by_object["box"].update is not None
+    assert by_object["box"].update.pose.frame_id == "world"
+    assert by_object["box"].update.pose.position_xyz == (1.0, 2.0, 3.0)
+    assert by_object["can"].update is not None
+    assert by_object["can"].update.apply_policy == "before_planning"
+    assert buffer.lookups == [("world", "box_frame"), ("map", "can_frame")]
+
+
+def test_tf_pose_source_rejects_lookup_failures_and_clears_prior_update():
+    pytest.importorskip("geometry_msgs")
+
+    from manyforge_ros.pose_source_sidecar import (
+        POSE_SOURCE_STATUS_FRESH,
+        PoseSourceBinding,
+        TfPoseSource,
+    )
+
+    buffer = _FakeTfBuffer(
+        {("world", "box_frame"): _transform("world", "box_frame", 1.0, 0.0, 0.0)}
+    )
+    source = TfPoseSource(
+        node=object(),
+        pose_source_id="tracked_tf_objects",
+        bindings=[
+            PoseSourceBinding(
+                object_id="box",
+                entity="box_frame",
+                frame_id="world",
+            )
+        ],
+        buffer=buffer,
+        now_fn=lambda: 70.0,
+    )
+    assert source.poll_once().status == POSE_SOURCE_STATUS_FRESH
+
+    buffer.transforms.clear()
+    source.poll_once()
+    live = source.state.snapshot(monotonic_s=70.0)
+    assert live.objects[0].update is None
+    assert live.objects[0].rejection is not None
+    assert live.objects[0].rejection.reason == "tf_lookup_failed"
+
+
+def test_detection3d_array_topic_source_updates_associated_objects():
+    rclpy = pytest.importorskip("rclpy")
+    pytest.importorskip("vision_msgs")
+
+    from rclpy.executors import SingleThreadedExecutor
+    from vision_msgs.msg import Detection3DArray
+
+    from manyforge_ros.pose_source_sidecar import (
+        Detection3DArrayTopicPoseSource,
+        POSE_SOURCE_STATUS_FRESH,
+        PoseSourceBinding,
+        _Detection3DObjectBinding,
+    )
+
+    rclpy.init(args=None)
+    node = rclpy.create_node("manyforge_detection3d_source_test")
+    executor = SingleThreadedExecutor()
+    executor.add_node(node)
+    publisher = node.create_publisher(Detection3DArray, "/detections", 1)
+    now = {"value": 80.0}
+    source = Detection3DArrayTopicPoseSource(
+        node=node,
+        pose_source_id="detections",
+        bindings=[
+            _Detection3DObjectBinding(
+                binding=PoseSourceBinding(
+                    object_id="box",
+                    entity="box",
+                    frame_id="world",
+                    apply_policy="observe_only",
+                    confidence_min=0.5,
+                ),
+                class_id="box",
+            ),
+            _Detection3DObjectBinding(
+                binding=PoseSourceBinding(
+                    object_id="can",
+                    entity="can-01",
+                    frame_id="world",
+                    apply_policy="before_planning",
+                    confidence_min=0.8,
+                ),
+                detection_id="can-01",
+                max_position_variance_m2=0.01,
+            ),
+        ],
+        topic="/detections",
+        frame_id="world",
+        now_fn=lambda: now["value"],
+    )
+
+    try:
+        msg = Detection3DArray()
+        msg.header.frame_id = "world"
+        msg.detections.append(
+            _detection3d("box-01", "box", 0.7, 1.0, 2.0, 3.0, covariance=0.02)
+        )
+        msg.detections.append(
+            _detection3d("can-01", "can", 0.9, 4.0, 5.0, 6.0, covariance=0.001)
+        )
+        _publish_until(
+            executor,
+            publisher,
+            msg,
+            lambda: source.snapshot(monotonic_s=80.0).objects[1].update is not None,
+        )
+
+        live = source.snapshot(monotonic_s=80.0)
+        assert live.status == POSE_SOURCE_STATUS_FRESH
+        by_object = {obj.object_id: obj for obj in live.objects}
+        assert by_object["box"].update is not None
+        assert by_object["box"].update.pose.position_xyz == (1.0, 2.0, 3.0)
+        assert by_object["box"].update.metadata["classId"] == "box"
+        assert by_object["box"].update.metadata["confidence"] == pytest.approx(0.7)
+        assert by_object["can"].update is not None
+        assert by_object["can"].update.pose.position_xyz == (4.0, 5.0, 6.0)
+        assert by_object["can"].update.metadata["detectionId"] == "can-01"
+        payload = live.to_dict()
+        assert payload["objects"][1]["update"]["metadata"]["confidence"] == pytest.approx(
+            0.9
+        )
+    finally:
+        source.close()
+        node.destroy_publisher(publisher)
+        executor.shutdown()
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+def test_detection3d_array_topic_source_rejects_quality_failures_and_clears_update():
+    rclpy = pytest.importorskip("rclpy")
+    pytest.importorskip("vision_msgs")
+
+    from rclpy.executors import SingleThreadedExecutor
+    from vision_msgs.msg import Detection3DArray
+
+    from manyforge_ros.pose_source_sidecar import (
+        Detection3DArrayTopicPoseSource,
+        PoseSourceBinding,
+        _Detection3DObjectBinding,
+    )
+
+    rclpy.init(args=None)
+    node = rclpy.create_node("manyforge_detection3d_reject_test")
+    executor = SingleThreadedExecutor()
+    executor.add_node(node)
+    publisher = node.create_publisher(Detection3DArray, "/quality_detections", 1)
+    now = {"value": 90.0}
+    source = Detection3DArrayTopicPoseSource(
+        node=node,
+        pose_source_id="quality_detections",
+        bindings=[
+            _Detection3DObjectBinding(
+                binding=PoseSourceBinding(
+                    object_id="box",
+                    entity="box",
+                    frame_id="world",
+                    confidence_min=0.8,
+                ),
+                class_id="box",
+                max_position_variance_m2=0.01,
+            )
+        ],
+        topic="/quality_detections",
+        frame_id="world",
+        now_fn=lambda: now["value"],
+    )
+
+    try:
+        good = Detection3DArray()
+        good.header.frame_id = "world"
+        good.detections.append(
+            _detection3d("box-01", "box", 0.9, 1.0, 0.0, 0.0, covariance=0.001)
+        )
+        _publish_until(
+            executor,
+            publisher,
+            good,
+            lambda: source.snapshot(monotonic_s=90.0).objects[0].update is not None,
+        )
+
+        now["value"] = 90.2
+        low_confidence = Detection3DArray()
+        low_confidence.header.frame_id = "world"
+        low_confidence.detections.append(
+            _detection3d("box-01", "box", 0.1, 2.0, 0.0, 0.0, covariance=0.001)
+        )
+        _publish_until(
+            executor,
+            publisher,
+            low_confidence,
+            lambda: source.snapshot(monotonic_s=90.2).objects[0].rejection
+            is not None,
+        )
+        live = source.snapshot(monotonic_s=90.2)
+        assert live.objects[0].update is None
+        assert live.objects[0].rejection.reason == "confidence_below_min"
+
+        now["value"] = 90.4
+        high_covariance = Detection3DArray()
+        high_covariance.header.frame_id = "world"
+        high_covariance.detections.append(
+            _detection3d("box-01", "box", 0.95, 3.0, 0.0, 0.0, covariance=0.5)
+        )
+        _publish_until(
+            executor,
+            publisher,
+            high_covariance,
+            lambda: (
+                source.snapshot(monotonic_s=90.4).objects[0].rejection is not None
+                and source.snapshot(
+                    monotonic_s=90.4,
+                ).objects[0].rejection.reason
+                == "covariance_exceeded"
+            ),
+        )
+        live = source.snapshot(monotonic_s=90.4)
+        assert live.objects[0].update is None
+        assert live.objects[0].rejection.reason == "covariance_exceeded"
+    finally:
+        source.close()
+        node.destroy_publisher(publisher)
+        executor.shutdown()
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+class _FakeTfBuffer:
+    def __init__(self, transforms):
+        self.transforms = dict(transforms)
+        self.lookups = []
+
+    def lookup_transform(self, target_frame, source_frame, _time):
+        self.lookups.append((target_frame, source_frame))
+        try:
+            return self.transforms[(target_frame, source_frame)]
+        except KeyError as exc:
+            raise RuntimeError(
+                f"missing transform {target_frame} <- {source_frame}"
+            ) from exc
+
+
+def _transform(frame_id: str, child_frame_id: str, x: float, y: float, z: float):
+    from geometry_msgs.msg import TransformStamped
+
+    transform = TransformStamped()
+    transform.header.frame_id = frame_id
+    transform.header.stamp.sec = 61
+    transform.header.stamp.nanosec = 500_000_000
+    transform.child_frame_id = child_frame_id
+    transform.transform.translation.x = x
+    transform.transform.translation.y = y
+    transform.transform.translation.z = z
+    transform.transform.rotation.w = 2.0
+    return transform
+
+
+def _detection3d(
+    detection_id: str,
+    class_id: str,
+    score: float,
+    x: float,
+    y: float,
+    z: float,
+    *,
+    covariance: float,
+):
+    from vision_msgs.msg import Detection3D, ObjectHypothesisWithPose
+
+    detection = Detection3D()
+    detection.header.frame_id = "world"
+    detection.id = detection_id
+    result = ObjectHypothesisWithPose()
+    result.hypothesis.class_id = class_id
+    result.hypothesis.score = score
+    result.pose.pose.position.x = x
+    result.pose.pose.position.y = y
+    result.pose.pose.position.z = z
+    result.pose.pose.orientation.w = 1.0
+    result.pose.covariance[0] = covariance
+    result.pose.covariance[7] = covariance
+    result.pose.covariance[14] = covariance
+    detection.results.append(result)
+    return detection
+
+
+def _pose_array_binding(
+    object_id: str,
+    pose_index: int,
+    *,
+    apply_policy: str = "observe_only",
+):
+    from manyforge_ros.pose_source_sidecar import _PoseArrayObjectBinding
+    from manyforge_ros.pose_source_sidecar import PoseSourceBinding
+
+    return _PoseArrayObjectBinding(
+        binding=PoseSourceBinding(
+            object_id=object_id,
+            entity=f"/tracked_object_poses[{pose_index}]",
+            apply_policy=apply_policy,
+            frame_id="world",
+        ),
+        pose_index=pose_index,
+    )
+
+
+def _pose(x: float, y: float, z: float):
+    from geometry_msgs.msg import Pose
+
+    pose = Pose()
+    pose.position.x = x
+    pose.position.y = y
+    pose.position.z = z
+    pose.orientation.w = 1.0
+    return pose
+
+
+def _publish_until(executor, publisher, msg, predicate, *, max_spins: int = 50) -> None:
+    for _ in range(max_spins):
+        publisher.publish(msg)
+        executor.spin_once(timeout_sec=0.05)
+        if predicate():
+            return
+    raise AssertionError("published condition was not reached before timeout")

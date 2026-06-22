@@ -749,6 +749,36 @@ class TestDeploymentLoading:
         ):
             Deployment.from_dict(data)
 
+    def test_pose_stamped_topic_source_parse_and_roundtrip(self):
+        data = _minimal_deployment(
+            pose_sources=[
+                {
+                    "id": "tracked_box",
+                    "kind": "pose_stamped_topic",
+                    "topic": "/tracked_box_pose",
+                    "max_update_hz": 12,
+                    "frame_id": "world",
+                    "objects": {
+                        "box": {
+                            "apply_policy": "before_planning",
+                            "frame_id": "world",
+                        },
+                    },
+                }
+            ],
+        )
+        deploy = Deployment.from_dict(data)
+        source = deploy.pose_sources["tracked_box"]
+        assert source.kind == "pose_stamped_topic"
+        assert source.topic == "/tracked_box_pose"
+        assert source.max_update_hz == 12.0
+        assert source.objects["box"].apply_policy == "before_planning"
+        assert source.objects["box"].entity == ""
+
+        reloaded = Deployment.from_dict(deploy.to_dict())
+        assert reloaded.pose_sources["tracked_box"].topic == "/tracked_box_pose"
+        assert reloaded.pose_sources["tracked_box"].objects["box"].frame_id == "world"
+
     def test_pose_source_rejects_duplicate_object_authority(self):
         data = _minimal_deployment(
             pose_sources=[
@@ -777,6 +807,486 @@ class TestDeploymentLoading:
         with pytest.raises(
             DeploymentValidationError,
             match="multiple write authorities for object 'box'",
+        ):
+            Deployment.from_dict(data)
+
+    def test_pose_stamped_topic_source_rejects_multiple_objects(self):
+        data = _minimal_deployment(
+            pose_sources=[
+                {
+                    "id": "tracked_box",
+                    "kind": "pose_stamped_topic",
+                    "topic": "/tracked_box_pose",
+                    "objects": {
+                        "box_a": {"apply_policy": "observe_only"},
+                        "box_b": {"apply_policy": "observe_only"},
+                    },
+                }
+            ],
+        )
+        with pytest.raises(
+            DeploymentValidationError,
+            match="exactly one object for pose_stamped_topic",
+        ):
+            Deployment.from_dict(data)
+
+    def test_pose_stamped_topic_source_rejects_unsupported_confidence(self):
+        data = _minimal_deployment(
+            pose_sources=[
+                {
+                    "id": "tracked_box",
+                    "kind": "pose_stamped_topic",
+                    "topic": "/tracked_box_pose",
+                    "objects": {
+                        "box": {
+                            "apply_policy": "observe_only",
+                            "confidence_min": 0.5,
+                        },
+                    },
+                }
+            ],
+        )
+        with pytest.raises(
+            DeploymentValidationError,
+            match="confidence_min is not supported for pose_stamped_topic",
+        ):
+            Deployment.from_dict(data)
+
+    def test_pose_stamped_topic_source_rejects_measured_tcp(self):
+        data = _minimal_deployment(
+            pose_sources=[
+                {
+                    "id": "tracked_box",
+                    "kind": "pose_stamped_topic",
+                    "topic": "/tracked_box_pose",
+                    "measured_tcp": {
+                        "tcp_frame_id": "tool0",
+                    },
+                    "objects": {
+                        "box": {"apply_policy": "observe_only"},
+                    },
+                }
+            ],
+        )
+        with pytest.raises(
+            DeploymentValidationError,
+            match="measured_tcp is not supported for pose_stamped_topic",
+        ):
+            Deployment.from_dict(data)
+
+    def test_pose_array_topic_source_parse_and_roundtrip(self):
+        data = _minimal_deployment(
+            pose_sources=[
+                {
+                    "id": "tracked_objects",
+                    "kind": "pose_array_topic",
+                    "topic": "/tracked_object_poses",
+                    "frame_id": "world",
+                    "objects": {
+                        "box": {
+                            "apply_policy": "observe_only",
+                            "metadata": {"pose_index": 0},
+                        },
+                        "can": {
+                            "apply_policy": "before_planning",
+                            "metadata": {"pose_index": 1},
+                        },
+                    },
+                }
+            ],
+        )
+        deploy = Deployment.from_dict(data)
+        source = deploy.pose_sources["tracked_objects"]
+        assert source.kind == "pose_array_topic"
+        assert source.topic == "/tracked_object_poses"
+        assert source.objects["box"].metadata["pose_index"] == 0
+        assert source.objects["can"].metadata["pose_index"] == 1
+
+        reloaded = Deployment.from_dict(deploy.to_dict())
+        assert reloaded.pose_sources["tracked_objects"].objects["can"].metadata[
+            "pose_index"
+        ] == 1
+
+    def test_pose_array_topic_source_rejects_missing_pose_index(self):
+        data = _minimal_deployment(
+            pose_sources=[
+                {
+                    "id": "tracked_objects",
+                    "kind": "pose_array_topic",
+                    "topic": "/tracked_object_poses",
+                    "objects": {
+                        "box": {"apply_policy": "observe_only"},
+                    },
+                }
+            ],
+        )
+        with pytest.raises(
+            DeploymentValidationError,
+            match="metadata.pose_index must be a non-negative integer",
+        ):
+            Deployment.from_dict(data)
+
+    def test_pose_array_topic_source_rejects_duplicate_pose_index(self):
+        data = _minimal_deployment(
+            pose_sources=[
+                {
+                    "id": "tracked_objects",
+                    "kind": "pose_array_topic",
+                    "topic": "/tracked_object_poses",
+                    "objects": {
+                        "box": {
+                            "apply_policy": "observe_only",
+                            "metadata": {"pose_index": 0},
+                        },
+                        "can": {
+                            "apply_policy": "observe_only",
+                            "metadata": {"pose_index": 0},
+                        },
+                    },
+                }
+            ],
+        )
+        with pytest.raises(
+            DeploymentValidationError,
+            match="duplicates object 'box'",
+        ):
+            Deployment.from_dict(data)
+
+    def test_pose_array_topic_source_rejects_unsupported_confidence(self):
+        data = _minimal_deployment(
+            pose_sources=[
+                {
+                    "id": "tracked_objects",
+                    "kind": "pose_array_topic",
+                    "topic": "/tracked_object_poses",
+                    "objects": {
+                        "box": {
+                            "apply_policy": "observe_only",
+                            "confidence_min": 0.5,
+                            "metadata": {"pose_index": 0},
+                        },
+                    },
+                }
+            ],
+        )
+        with pytest.raises(
+            DeploymentValidationError,
+            match="confidence_min is not supported for pose_array_topic",
+        ):
+            Deployment.from_dict(data)
+
+    def test_pose_array_topic_source_rejects_measured_tcp(self):
+        data = _minimal_deployment(
+            pose_sources=[
+                {
+                    "id": "tracked_objects",
+                    "kind": "pose_array_topic",
+                    "topic": "/tracked_object_poses",
+                    "measured_tcp": {
+                        "tcp_frame_id": "tool0",
+                    },
+                    "objects": {
+                        "box": {
+                            "apply_policy": "observe_only",
+                            "metadata": {"pose_index": 0},
+                        },
+                    },
+                }
+            ],
+        )
+        with pytest.raises(
+            DeploymentValidationError,
+            match="measured_tcp is not supported for pose_array_topic",
+        ):
+            Deployment.from_dict(data)
+
+    def test_tf_pose_source_parse_and_roundtrip(self):
+        data = _minimal_deployment(
+            pose_sources=[
+                {
+                    "id": "tracked_tf_objects",
+                    "kind": "tf",
+                    "frame_id": "world",
+                    "max_update_hz": 20,
+                    "objects": {
+                        "box": {
+                            "entity": "box_frame",
+                            "apply_policy": "observe_only",
+                        },
+                        "can": {
+                            "entity": "can_frame",
+                            "frame_id": "map",
+                            "apply_policy": "before_planning",
+                        },
+                    },
+                }
+            ],
+        )
+        deploy = Deployment.from_dict(data)
+        source = deploy.pose_sources["tracked_tf_objects"]
+        assert source.kind == "tf"
+        assert source.frame_id == "world"
+        assert source.objects["box"].entity == "box_frame"
+        assert source.objects["can"].frame_id == "map"
+
+        reloaded = Deployment.from_dict(deploy.to_dict())
+        assert reloaded.pose_sources["tracked_tf_objects"].objects["box"].entity == (
+            "box_frame"
+        )
+
+    def test_tf_pose_source_rejects_missing_target_frame(self):
+        data = _minimal_deployment(
+            pose_sources=[
+                {
+                    "id": "tracked_tf_objects",
+                    "kind": "tf",
+                    "objects": {
+                        "box": {
+                            "entity": "box_frame",
+                            "apply_policy": "observe_only",
+                        },
+                    },
+                }
+            ],
+        )
+        with pytest.raises(
+            DeploymentValidationError,
+            match="frame_id.*is required for tf",
+        ):
+            Deployment.from_dict(data)
+
+    def test_tf_pose_source_rejects_unsupported_confidence(self):
+        data = _minimal_deployment(
+            pose_sources=[
+                {
+                    "id": "tracked_tf_objects",
+                    "kind": "tf",
+                    "frame_id": "world",
+                    "objects": {
+                        "box": {
+                            "entity": "box_frame",
+                            "apply_policy": "observe_only",
+                            "confidence_min": 0.5,
+                        },
+                    },
+                }
+            ],
+        )
+        with pytest.raises(
+            DeploymentValidationError,
+            match="confidence_min is not supported for tf",
+        ):
+            Deployment.from_dict(data)
+
+    def test_tf_pose_source_rejects_measured_tcp(self):
+        data = _minimal_deployment(
+            pose_sources=[
+                {
+                    "id": "tracked_tf_objects",
+                    "kind": "tf",
+                    "frame_id": "world",
+                    "measured_tcp": {
+                        "tcp_frame_id": "tool0",
+                    },
+                    "objects": {
+                        "box": {
+                            "entity": "box_frame",
+                            "apply_policy": "observe_only",
+                        },
+                    },
+                }
+            ],
+        )
+        with pytest.raises(
+            DeploymentValidationError,
+            match="measured_tcp is not supported for tf",
+        ):
+            Deployment.from_dict(data)
+
+    def test_detection3d_array_topic_source_parse_and_roundtrip(self):
+        data = _minimal_deployment(
+            pose_sources=[
+                {
+                    "id": "detections",
+                    "kind": "detection3d_array_topic",
+                    "topic": "/detections",
+                    "frame_id": "world",
+                    "objects": {
+                        "box": {
+                            "apply_policy": "observe_only",
+                            "confidence_min": 0.6,
+                            "metadata": {"class_id": "box"},
+                        },
+                        "can": {
+                            "apply_policy": "before_planning",
+                            "confidence_min": 0.8,
+                            "metadata": {
+                                "detection_id": "can-01",
+                                "max_position_variance_m2": 0.0025,
+                            },
+                        },
+                    },
+                }
+            ],
+        )
+        deploy = Deployment.from_dict(data)
+        source = deploy.pose_sources["detections"]
+        assert source.kind == "detection3d_array_topic"
+        assert source.objects["box"].metadata["class_id"] == "box"
+        assert source.objects["can"].metadata["detection_id"] == "can-01"
+        assert source.objects["can"].confidence_min == 0.8
+
+        reloaded = Deployment.from_dict(deploy.to_dict())
+        assert reloaded.pose_sources["detections"].objects["can"].metadata[
+            "max_position_variance_m2"
+        ] == 0.0025
+
+    def test_detection3d_array_topic_source_rejects_missing_association(self):
+        data = _minimal_deployment(
+            pose_sources=[
+                {
+                    "id": "detections",
+                    "kind": "detection3d_array_topic",
+                    "topic": "/detections",
+                    "objects": {
+                        "box": {"apply_policy": "observe_only"},
+                    },
+                }
+            ],
+        )
+        with pytest.raises(
+            DeploymentValidationError,
+            match="exactly one of detection_id or class_id",
+        ):
+            Deployment.from_dict(data)
+
+    def test_detection3d_array_topic_source_rejects_ambiguous_association(self):
+        data = _minimal_deployment(
+            pose_sources=[
+                {
+                    "id": "detections",
+                    "kind": "detection3d_array_topic",
+                    "topic": "/detections",
+                    "objects": {
+                        "box": {
+                            "apply_policy": "observe_only",
+                            "metadata": {
+                                "detection_id": "box-01",
+                                "class_id": "box",
+                            },
+                        },
+                    },
+                }
+            ],
+        )
+        with pytest.raises(
+            DeploymentValidationError,
+            match="exactly one of detection_id or class_id",
+        ):
+            Deployment.from_dict(data)
+
+    def test_detection3d_array_topic_source_rejects_duplicate_association(self):
+        data = _minimal_deployment(
+            pose_sources=[
+                {
+                    "id": "detections",
+                    "kind": "detection3d_array_topic",
+                    "topic": "/detections",
+                    "objects": {
+                        "box": {
+                            "apply_policy": "observe_only",
+                            "metadata": {"class_id": "grocery_box"},
+                        },
+                        "box_duplicate": {
+                            "apply_policy": "observe_only",
+                            "metadata": {"class_id": "grocery_box"},
+                        },
+                    },
+                }
+            ],
+        )
+        with pytest.raises(
+            DeploymentValidationError,
+            match="class_id.*duplicates object 'box'",
+        ):
+            Deployment.from_dict(data)
+
+    def test_detection3d_array_topic_source_rejects_invalid_optional_variance(self):
+        data = _minimal_deployment(
+            pose_sources=[
+                {
+                    "id": "detections",
+                    "kind": "detection3d_array_topic",
+                    "topic": "/detections",
+                    "objects": {
+                        "box": {
+                            "apply_policy": "observe_only",
+                            "metadata": {
+                                "class_id": "grocery_box",
+                                "max_position_variance_m2": 0.0,
+                            },
+                        },
+                    },
+                }
+            ],
+        )
+        with pytest.raises(
+            DeploymentValidationError,
+            match="max_position_variance_m2 must be a positive finite number",
+        ):
+            Deployment.from_dict(data)
+
+    def test_detection3d_array_topic_source_requires_quality_gates_for_mutation(self):
+        data = _minimal_deployment(
+            pose_sources=[
+                {
+                    "id": "detections",
+                    "kind": "detection3d_array_topic",
+                    "topic": "/detections",
+                    "objects": {
+                        "box": {
+                            "apply_policy": "before_planning",
+                            "metadata": {"class_id": "box"},
+                        },
+                    },
+                }
+            ],
+        )
+        with pytest.raises(
+            DeploymentValidationError,
+            match="confidence_min is required",
+        ):
+            Deployment.from_dict(data)
+
+        data["pose_sources"][0]["objects"]["box"]["confidence_min"] = 0.8
+        with pytest.raises(
+            DeploymentValidationError,
+            match="max_position_variance_m2 is required",
+        ):
+            Deployment.from_dict(data)
+
+    def test_detection3d_array_topic_source_rejects_measured_tcp(self):
+        data = _minimal_deployment(
+            pose_sources=[
+                {
+                    "id": "detections",
+                    "kind": "detection3d_array_topic",
+                    "topic": "/detections",
+                    "measured_tcp": {
+                        "tcp_frame_id": "tool0",
+                    },
+                    "objects": {
+                        "box": {
+                            "apply_policy": "observe_only",
+                            "metadata": {"class_id": "box"},
+                        },
+                    },
+                }
+            ],
+        )
+        with pytest.raises(
+            DeploymentValidationError,
+            match="measured_tcp is not supported for detection3d_array_topic",
         ):
             Deployment.from_dict(data)
 

@@ -1,9 +1,10 @@
-"""Publish configured Isaac/simulation object-pose snapshots to Composer.
+"""Publish configured ROS object-pose snapshots to Composer.
 
 The node is intentionally narrow:
 
 * it reads ``pose_sources`` from the loaded deployment artifact;
-* it polls only enabled ``simulation_interfaces`` sources;
+* it polls enabled ``simulation_interfaces`` sources and samples supported ROS
+  topic sources;
 * it posts observe-only latest-wins snapshots to Composer;
 * it never mutates the planning scene directly.
 
@@ -27,13 +28,19 @@ import rclpy
 from rclpy.node import Node
 
 from manyforge_behavior.deployment import Deployment
-from manyforge_ros.pose_source_sidecar import SimulationInterfacesPoseSource
+from manyforge_ros.pose_source_sidecar import (
+    Detection3DArrayTopicPoseSource,
+    PoseArrayTopicPoseSource,
+    PoseStampedTopicPoseSource,
+    SimulationInterfacesPoseSource,
+    TfPoseSource,
+)
 from manyforge_ros.scene_mirror_probe import SimulationSceneMirrorClient
 
 
 @dataclass
 class _RuntimeSource:
-    source: SimulationInterfacesPoseSource
+    source: Any
     next_poll_s: float
     consecutive_post_failures: int = 0
 
@@ -76,7 +83,7 @@ class PoseSourceSnapshotPublisher(Node):
     def run(self) -> None:
         if not self._sources:
             self.get_logger().info(
-                "No enabled simulation_interfaces pose sources declared in "
+                "No enabled runtime pose sources declared in "
                 f"{self.deployment_path}; snapshot publisher is idle."
             )
             while rclpy.ok() and not self._stop_event.wait(1.0):
@@ -88,6 +95,7 @@ class PoseSourceSnapshotPublisher(Node):
             f"{self.composer_url}"
         )
         while rclpy.ok() and not self._stop_event.is_set():
+            rclpy.spin_once(self, timeout_sec=0.0)
             now = time.monotonic()
             next_due_s = None
             for runtime in self._sources:
@@ -116,23 +124,61 @@ class PoseSourceSnapshotPublisher(Node):
             )
             return []
 
-        client = SimulationSceneMirrorClient(
-            self,
-            service_timeout_s=self.service_timeout_s,
-        )
+        client: SimulationSceneMirrorClient | None = None
+        tf_buffer: Any | None = None
+        tf_listener: Any | None = None
         runtime_sources: list[_RuntimeSource] = []
         for source in deployment.pose_sources.values():
-            if not source.enabled or source.kind != "simulation_interfaces":
+            if not source.enabled:
                 continue
             try:
-                runtime_sources.append(
-                    _RuntimeSource(
-                        source=SimulationInterfacesPoseSource.from_deployment_config(
-                            client=client,
-                            source_config=source,
-                        ),
-                        next_poll_s=0.0,
+                if source.kind == "simulation_interfaces":
+                    if client is None:
+                        client = SimulationSceneMirrorClient(
+                            self,
+                            service_timeout_s=self.service_timeout_s,
+                        )
+                    runtime_source = SimulationInterfacesPoseSource.from_deployment_config(
+                        client=client,
+                        source_config=source,
                     )
+                elif source.kind == "pose_stamped_topic":
+                    runtime_source = PoseStampedTopicPoseSource.from_deployment_config(
+                        node=self,
+                        source_config=source,
+                    )
+                elif source.kind == "pose_array_topic":
+                    runtime_source = PoseArrayTopicPoseSource.from_deployment_config(
+                        node=self,
+                        source_config=source,
+                    )
+                elif source.kind == "detection3d_array_topic":
+                    runtime_source = (
+                        Detection3DArrayTopicPoseSource.from_deployment_config(
+                            node=self,
+                            source_config=source,
+                        )
+                    )
+                elif source.kind == "tf":
+                    if tf_buffer is None:
+                        from tf2_ros import Buffer, TransformListener
+
+                        tf_buffer = Buffer()
+                        tf_listener = TransformListener(tf_buffer, self)
+                    runtime_source = TfPoseSource.from_deployment_config(
+                        node=self,
+                        source_config=source,
+                        buffer=tf_buffer,
+                        listener=tf_listener,
+                    )
+                else:
+                    self.get_logger().warning(
+                        "Ignoring unsupported pose source kind "
+                        f"'{source.kind}' for source '{source.source_id}'"
+                    )
+                    continue
+                runtime_sources.append(
+                    _RuntimeSource(source=runtime_source, next_poll_s=0.0)
                 )
             except Exception as exc:
                 self.get_logger().error(
@@ -144,7 +190,11 @@ class PoseSourceSnapshotPublisher(Node):
     def _poll_and_publish(self, runtime: _RuntimeSource) -> None:
         source_id = runtime.source.pose_source_id
         try:
-            result = runtime.source.poll_once()
+            result = (
+                runtime.source.poll_once()
+                if hasattr(runtime.source, "poll_once")
+                else None
+            )
             snapshot = runtime.source.state.snapshot()
             self._post_snapshot(source_id, snapshot.to_dict())
             if runtime.consecutive_post_failures:
@@ -153,7 +203,7 @@ class PoseSourceSnapshotPublisher(Node):
                     f"{runtime.consecutive_post_failures} post failure(s)"
                 )
             runtime.consecutive_post_failures = 0
-            if result.source_errors:
+            if result is not None and result.source_errors:
                 self.get_logger().warning(
                     f"pose source '{source_id}' polled with source errors: "
                     f"{'; '.join(result.source_errors)}"

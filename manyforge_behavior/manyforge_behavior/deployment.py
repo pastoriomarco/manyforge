@@ -1013,6 +1013,10 @@ class Deployment:
                         minimum=0.0,
                         maximum=1.0,
                     )
+                    if kind in {"pose_stamped_topic", "pose_array_topic", "tf"}:
+                        raise DeploymentValidationError(
+                            f"{object_path}.confidence_min is not supported for {kind}"
+                        )
 
                 metadata = object_data.get("metadata", {})
                 if metadata is None:
@@ -1026,9 +1030,9 @@ class Deployment:
                     object_data.get("entity", ""),
                     f"{object_path}.entity",
                 )
-                if kind == "simulation_interfaces" and not entity:
+                if kind in {"simulation_interfaces", "tf"} and not entity:
                     raise DeploymentValidationError(
-                        f"{object_path}.entity is required for simulation_interfaces"
+                        f"{object_path}.entity is required for {kind}"
                     )
                 binding_frame_id = self._parse_optional_text(
                     get_alias(object_data, "frame_id", "frameId", ""),
@@ -1085,6 +1089,89 @@ class Deployment:
                 "detection3d_array_topic",
             } and not topic:
                 raise DeploymentValidationError(f"{field_path}.topic is required")
+            if kind in {
+                "pose_stamped_topic",
+                "pose_array_topic",
+                "detection3d_array_topic",
+                "tf",
+            } and measured_tcp is not None:
+                raise DeploymentValidationError(
+                    f"{field_path}.measured_tcp is not supported for {kind}"
+                )
+            if kind == "pose_stamped_topic" and len(objects) != 1:
+                raise DeploymentValidationError(
+                    f"{field_path}.objects must contain exactly one object for pose_stamped_topic"
+                )
+            if kind == "pose_array_topic":
+                seen_pose_indexes: dict[int, str] = {}
+                for object_id, binding in objects.items():
+                    pose_index = binding.metadata.get("pose_index")
+                    if not isinstance(pose_index, int) or isinstance(pose_index, bool) or pose_index < 0:
+                        raise DeploymentValidationError(
+                            f"{field_path}.objects.{object_id}.metadata.pose_index must be a non-negative integer for pose_array_topic"
+                        )
+                    previous = seen_pose_indexes.get(pose_index)
+                    if previous is not None:
+                        raise DeploymentValidationError(
+                            f"{field_path}.objects.{object_id}.metadata.pose_index duplicates object '{previous}'"
+                        )
+                    seen_pose_indexes[pose_index] = object_id
+            if kind == "detection3d_array_topic":
+                seen_detection_associations: dict[tuple[str, str], str] = {}
+                for object_id, binding in objects.items():
+                    detection_id = binding.metadata.get("detection_id")
+                    class_id = binding.metadata.get("class_id")
+                    has_detection_id = (
+                        isinstance(detection_id, str) and bool(detection_id.strip())
+                    )
+                    has_class_id = isinstance(class_id, str) and bool(class_id.strip())
+                    if has_detection_id == has_class_id:
+                        raise DeploymentValidationError(
+                            f"{field_path}.objects.{object_id}.metadata must define exactly one of detection_id or class_id for detection3d_array_topic"
+                        )
+                    association = (
+                        "detection_id",
+                        detection_id.strip()
+                        if isinstance(detection_id, str)
+                        else class_id.strip(),
+                    )
+                    if has_class_id:
+                        association = ("class_id", class_id.strip())
+                    previous = seen_detection_associations.get(association)
+                    if previous is not None:
+                        association_key, association_value = association
+                        raise DeploymentValidationError(
+                            f"{field_path}.objects.{object_id}.metadata.{association_key} "
+                            f"duplicates object '{previous}' for value '{association_value}'"
+                        )
+                    seen_detection_associations[association] = object_id
+                    max_position_variance = binding.metadata.get(
+                        "max_position_variance_m2"
+                    )
+                    if max_position_variance is not None and (
+                        isinstance(max_position_variance, bool)
+                        or not isinstance(max_position_variance, (int, float))
+                        or not math.isfinite(float(max_position_variance))
+                        or float(max_position_variance) <= 0.0
+                    ):
+                        raise DeploymentValidationError(
+                            f"{field_path}.objects.{object_id}.metadata.max_position_variance_m2 must be a positive finite number"
+                        )
+                    if binding.apply_policy != "observe_only":
+                        if binding.confidence_min is None:
+                            raise DeploymentValidationError(
+                                f"{field_path}.objects.{object_id}.confidence_min is required for execution-affecting detection3d_array_topic policies"
+                            )
+                        if max_position_variance is None:
+                            raise DeploymentValidationError(
+                                f"{field_path}.objects.{object_id}.metadata.max_position_variance_m2 is required for execution-affecting detection3d_array_topic policies"
+                            )
+            if kind == "tf":
+                for object_id, binding in objects.items():
+                    if not (binding.frame_id or frame_id):
+                        raise DeploymentValidationError(
+                            f"{field_path}.objects.{object_id}.frame_id or {field_path}.frame_id is required for tf"
+                        )
 
             parsed[source_id] = PoseSourceConfig(
                 source_id=source_id,
