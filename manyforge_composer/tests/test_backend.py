@@ -3403,7 +3403,7 @@ def test_request_logging(client, capsys):
 
 
 def test_program_load_callback_registers_scene_edit_callback(caplog):
-    """Program-load callback wires scene sync without raising or logging errors."""
+    """Program-load callback wires scene callbacks without raising or logging errors."""
     py_trees.blackboard.Blackboard.clear()
 
     state = ComposerState(catalog_path=_CATALOG_PATH, kernel=MockKernelClient())

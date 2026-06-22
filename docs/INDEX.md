@@ -84,6 +84,11 @@ FastMCP tool registry). Regenerate with
     OpenAPI). The live schema is also at `:9000/openapi.json` once
     Composer is running.
 
+- [`reference/SCENE_AUTHORITY.md`](reference/SCENE_AUTHORITY.md)
+  - Contract for live planning-scene writers: program scene nodes,
+    explicit reset/load seed, lifecycle-safe operator edits, and
+    configured pose-source feeds.
+
 - [`reference/MCP_RUNTIME_CONTRACT.md`](reference/MCP_RUNTIME_CONTRACT.md)
   - MCP tool contract used by the OpenClaw assistant lane (generated
     from the `@mcp.tool()` decorators in

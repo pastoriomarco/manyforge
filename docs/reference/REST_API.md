@@ -112,7 +112,6 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer`.
 | `POST` | `/api/scene/snapshot/upload/{request_id}` | scene-snapshot | Upload Snapshot |
 | `GET` | `/api/scene/snapshots/{snapshot_id}` | scene | Get Published Scene Snapshot |
 | `GET` | `/api/scene/state` | scene | Get Scene State |
-| `POST` | `/api/scene/sync-authored` | scene | Sync Authored Scene |
 | `GET` | `/api/scene/urdf/manifest` | scene-urdf | Get Manifest |
 | `GET` | `/api/scene/urdf/meshes/{link_name}/{visual_index}` | scene-urdf | Get Mesh |
 | `GET` | `/api/scene/urdf/models/{model_key}/meshes/{link_name}/{visual_index}` | scene-urdf | Get Model Mesh |

@@ -4,7 +4,7 @@ import { NodePaletteItem } from './NodePaletteItem';
 import { useComposerStore } from '../store/composerStore';
 import { DeploymentPanel } from './DeploymentPanel';
 import { ProgramPanel } from './ProgramPanel';
-import { SceneDraftMirror, ScenePanel } from './ScenePanel';
+import { ScenePanel } from './ScenePanel';
 import { useProgramStore } from '../store/programStore';
 import { profileSatisfies } from '../utils/profiles';
 
@@ -82,7 +82,6 @@ export function Sidebar({ onCollapse }: { onCollapse: () => void }) {
 
   return (
     <div className="flex h-full w-full flex-col overflow-hidden bg-gray-800">
-      <SceneDraftMirror />
       <div className="flex items-center border-b border-gray-700">
         <button
           onClick={() => setTab('nodes')}

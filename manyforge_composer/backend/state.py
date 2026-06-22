@@ -297,7 +297,6 @@ class ComposerState:
         self._runtime_overrides: dict[str, RuntimeOverrideRecord] = {}
         self._program_tree_hash: str = ""
         self._program_session_generation: int = 0
-        self._authored_scene_sync_object_ids: set[str] = set()
         self._scene_snapshot_lock = threading.Lock()
         self._published_scene_snapshots: dict[str, PublishedSceneSnapshot] = {}
         self.assistant_provider: Any = None
@@ -909,29 +908,6 @@ class ComposerState:
     def program_session_generation(self) -> int:
         """Monotonic generation for the loaded/applied program snapshot."""
         return self._program_session_generation
-
-    def authored_scene_sync_managed_ids(self) -> set[str]:
-        """Object ids managed by backend-authored scene reconciliation.
-
-        The loaded program's static scene resources are always managed.
-        Draft-only resources become managed after the first successful
-        authored-scene sync, so a later draft removal can delete them from the
-        live scene even before the draft is saved to disk.
-        """
-        base_ids = {
-            resource.object_id
-            for resource in (self.program.scene if self.program is not None else [])
-        }
-        return base_ids | set(self._authored_scene_sync_object_ids)
-
-    def set_authored_scene_sync_managed_ids(self, object_ids: set[str]) -> None:
-        self._authored_scene_sync_object_ids = set(object_ids)
-
-    def reset_authored_scene_sync_managed_ids(self) -> None:
-        self._authored_scene_sync_object_ids = {
-            resource.object_id
-            for resource in (self.program.scene if self.program is not None else [])
-        }
 
     @property
     def runtime_overrides(self) -> dict[str, RuntimeOverrideRecord]:
@@ -2493,13 +2469,19 @@ class ComposerState:
         self._evaluate_stop_capability()
         self._update_program_tree_hash()
         self._program_session_generation += 1
-        self.reset_authored_scene_sync_managed_ids()
         self._clear_published_scene_snapshots()
         self.clear_pose_source_snapshots()
         self.clear_visual_state_snapshot()
         self.cycle_manager = CycleManager(runner, self._kernel)
         self._bind_cycle_manager_callbacks()
         self.reset_backend_authoritative_sim_if_needed(reason="program_load")
+        # Explicit load-time scene seed: populate the live planning scene with
+        # the program's authored objects now, so they are visible at idle before
+        # the first Run. Scene-only (no tree, no robot reset); the first Run/Reset
+        # re-seeds via _prepare_fresh_cycle. Replaces the removed implicit
+        # frontend authored-scene mirror; the live scene is now written only by
+        # the program cycle, explicit Reset, and this explicit load seed.
+        self.cycle_manager.seed_authored_scene()
 
         if self._on_program_loaded:
             try:
@@ -2855,7 +2837,6 @@ class ComposerState:
             self._drivable_joint_names = list(joint_names_to_cache)
         self._update_program_tree_hash()
         self._program_session_generation += 1
-        self.reset_authored_scene_sync_managed_ids()
         self._clear_published_scene_snapshots()
         with self._scene_viewer_lock:
             self._hidden_frames.clear()
@@ -2868,6 +2849,11 @@ class ComposerState:
         self._bind_cycle_manager_callbacks()
         if not defer_initial_runtime_reset:
             self.reset_backend_authoritative_sim_if_needed(reason="program_load")
+            # Explicit load-time scene seed (see _rebuild_runtime): populate the
+            # live planning scene with the program's authored objects at load so
+            # they are visible at idle before the first Run. Scene-only; replaces
+            # the removed implicit frontend authored-scene mirror.
+            self.cycle_manager.seed_authored_scene()
 
         # Notify runtime visual listeners.
         if self._on_program_loaded:

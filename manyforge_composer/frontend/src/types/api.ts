@@ -956,31 +956,6 @@ export interface SceneEditResponse {
   timestamp_ns: number;
 }
 
-export interface SceneAuthoredSyncRequest {
-  programSessionGeneration: number;
-  programTreeHash?: string | null;
-  sceneSignature: string;
-  sceneResources: ProgramSceneResource[];
-}
-
-export interface SceneAuthoredSyncResponse {
-  success: boolean;
-  syncId: string;
-  programSessionGeneration: number;
-  programTreeHash: string;
-  sceneSignature: string;
-  added: string[];
-  updated: string[];
-  removed: string[];
-  unchanged: string[];
-  failedObjectId?: string | null;
-  error?: string | null;
-  visualRefreshRequested: boolean;
-  visualPublishRequested: boolean;
-  startedNs: number;
-  completedNs: number;
-}
-
 /**
  * Ghost-robot preview request — see /api/scene/preview-link-poses.
  * `kind: 'joint'` uses joint_names + joint_positions_rad directly;

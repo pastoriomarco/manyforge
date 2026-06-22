@@ -651,6 +651,22 @@ class CycleManager:
             self._resumable_stop_scene_fingerprint = None
             self._resumable_stop_scene_fingerprint_error = None
 
+    def seed_authored_scene(self) -> None:
+        """Seed the live planning scene with the program's authored objects.
+
+        This is the explicit, load-time scene seed. Unlike `_prepare_fresh_cycle`
+        it does NOT build a behavior tree or change cycle state: it only clears
+        any stale runtime objects and re-applies the program's authored scene,
+        leaving the cycle IDLE with `_tree is None` so the first Run still
+        prepares a fresh cycle. This populates the live scene for at-idle
+        visualization without any implicit reset loop — the only writers of the
+        live scene remain the program cycle and explicit Reset.
+        """
+        if self._runner.program is None:
+            self._runner.load()
+        self._clear_runtime_scene()
+        self._runner.apply_scene()
+
     @property
     def state(self) -> CycleState:
         """Current lifecycle state."""

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api } from '../api/client';
-import { useCycleStore, useEditLocked } from '../store/cycleStore';
+import { useEditLocked } from '../store/cycleStore';
 import { useProgramStore } from '../store/programStore';
 import type {
   ProgramSceneResource,
@@ -9,22 +9,7 @@ import type {
   SceneStateResponse,
 } from '../types/api';
 
-const SCENE_MUTATED_EVENT = 'manyforge:scene-mutated';
-const SCENE_SYNC_STATUS_EVENT = 'manyforge:scene-sync-status';
-const SCENE_SYNC_ERROR_PREFIX = 'Live scene sync failed: ';
 type SceneShapeType = 'box' | 'sphere' | 'cylinder' | 'mesh';
-
-function emitSceneMutated(): void {
-  window.dispatchEvent(new CustomEvent(SCENE_MUTATED_EVENT));
-}
-
-function emitSceneSyncStatus(error: string | null): void {
-  window.dispatchEvent(new CustomEvent(SCENE_SYNC_STATUS_EVENT, { detail: { error } }));
-}
-
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
 
 function Section({ title, children }: { title: string; children: React.ReactNode }) {
   return (
@@ -318,10 +303,6 @@ function shapeSummary(shape: Record<string, unknown> | null | undefined): string
     return `mesh (${uri})`;
   }
   return String(shape.type);
-}
-
-function authoredSceneSignature(sceneResources: ProgramSceneResource[]): string {
-  return JSON.stringify(sceneResources);
 }
 
 function sourceBadge(source: SceneObjectState['source']): { label: string; classes: string } {
@@ -675,71 +656,6 @@ function LiveSceneObjectCard({
   );
 }
 
-export function SceneDraftMirror() {
-  const cycleState = useCycleStore((state) => state.state);
-  const programInfo = useProgramStore((state) => state.programInfo);
-  const loading = useProgramStore((state) => state.loading);
-  const sceneResources = useProgramStore((state) => state.sceneResources);
-  const setProgramError = useProgramStore((state) => state.setError);
-  const sceneSignature = useMemo(() => authoredSceneSignature(sceneResources), [sceneResources]);
-  const inFlightRef = useRef(false);
-  const lastMirroredKeyRef = useRef<string | null>(null);
-
-  useEffect(() => {
-    const safeToMirror = cycleState === 'idle';
-    // Do not treat the store's default empty scene as authoritative before the
-    // loaded program draft has hydrated, or we can wipe the backend-seeded
-    // authored scene on first load.
-    const hasLoadedProgramScene = programInfo !== null && !loading;
-    const mirrorKey = hasLoadedProgramScene
-      ? `${programInfo?.sourcePath ?? '<memory>'}::${sceneSignature}`
-      : null;
-    if (!safeToMirror || !hasLoadedProgramScene || inFlightRef.current || mirrorKey === lastMirroredKeyRef.current) {
-      return;
-    }
-
-    let cancelled = false;
-    const sync = async () => {
-      inFlightRef.current = true;
-      try {
-        const result = await api.scene.syncAuthored({
-          programSessionGeneration: programInfo.programSessionGeneration,
-          programTreeHash: programInfo.programTreeHash,
-          sceneSignature,
-          sceneResources,
-        });
-        if (cancelled) {
-          return;
-        }
-        if (!result.success) {
-          throw new Error(result.error ?? 'Authored scene sync failed');
-        }
-
-        emitSceneMutated();
-        emitSceneSyncStatus(null);
-        if (useProgramStore.getState().error?.startsWith(SCENE_SYNC_ERROR_PREFIX)) {
-          setProgramError(null);
-        }
-        lastMirroredKeyRef.current = mirrorKey;
-      } catch (error) {
-        const message = `${SCENE_SYNC_ERROR_PREFIX}${errorMessage(error)}`;
-        emitSceneSyncStatus(message);
-        setProgramError(message);
-        console.error('Failed to mirror authored scene into live scene', error);
-      } finally {
-        inFlightRef.current = false;
-      }
-    };
-
-    void sync();
-    return () => {
-      cancelled = true;
-    };
-  }, [cycleState, loading, programInfo, sceneResources, sceneSignature, setProgramError]);
-
-  return null;
-}
-
 export function ScenePanel() {
   const sceneResources = useProgramStore((state) => state.sceneResources);
   const setSceneResources = useProgramStore((state) => state.setSceneResources);
@@ -750,7 +666,6 @@ export function ScenePanel() {
   const [frameGizmoSizeM, setFrameGizmoSizeM] = useState(0.1);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [syncError, setSyncError] = useState<string | null>(null);
   const [newObjectId, setNewObjectId] = useState('');
   const [newShapeType, setNewShapeType] = useState<SceneShapeType>('box');
   const [newBoxDimensions, setNewBoxDimensions] = useState<number[]>([0.05, 0.05, 0.1]);
@@ -786,27 +701,6 @@ export function ScenePanel() {
   useEffect(() => {
     void refresh();
   }, [refresh]);
-
-  useEffect(() => {
-    const handle = () => {
-      void refresh();
-    };
-    window.addEventListener(SCENE_MUTATED_EVENT, handle);
-    return () => {
-      window.removeEventListener(SCENE_MUTATED_EVENT, handle);
-    };
-  }, [refresh]);
-
-  useEffect(() => {
-    const handle = (event: Event) => {
-      const detail = (event as CustomEvent<{ error?: string | null }>).detail;
-      setSyncError(detail?.error ?? null);
-    };
-    window.addEventListener(SCENE_SYNC_STATUS_EVENT, handle);
-    return () => {
-      window.removeEventListener(SCENE_SYNC_STATUS_EVENT, handle);
-    };
-  }, []);
 
   const frameOptions = useMemo(() => {
     const names = new Set<string>(['universe', 'base_link', 'tool0']);
@@ -926,8 +820,9 @@ export function ScenePanel() {
       <div className="rounded border border-gray-700 bg-gray-900/60 p-3 text-xs text-gray-300 space-y-1">
         <div className="font-medium text-gray-100">Program Scene</div>
         <div>
-          Scene edits in this tab change the authored program scene draft. While the cycle is idle or
-          stopped, those authored changes are mirrored into the live scene immediately.
+          Scene edits in this tab change the authored program scene draft. Authored changes are
+          applied to the live scene when the program is loaded and on Reset/Run — they are not
+          mirrored implicitly while idle or stopped.
         </div>
         <div>
           Global <span className="font-mono text-gray-100">Apply</span>,{' '}
@@ -950,9 +845,6 @@ export function ScenePanel() {
         )}
         {error && (
           <div className="rounded bg-red-900/60 px-2 py-1 text-red-200">{error}</div>
-        )}
-        {syncError && (
-          <div className="rounded bg-red-900/60 px-2 py-1 text-red-200">{syncError}</div>
         )}
       </div>
 
