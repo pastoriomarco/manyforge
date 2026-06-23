@@ -222,22 +222,17 @@ def relative_pose_from_world(
         raise VisualSnapshotUnavailable("visual_relative_pose_failed", str(exc)) from exc
 
 
-def build_robot_visual_snapshot(
+def compute_robot_visual_link_poses(
     state: ComposerState,
     *,
-    robot: SceneRobotResponse | None,
     joint_names: list[str],
     joint_positions_rad: list[float] | None,
     link_names: list[str],
     reference_frame: str,
     base_frame: str,
     base_pose: dict[str, Any],
-    grippers: list[Any] | None = None,
-    pose_sources: list[Any] | None = None,
-) -> VisualSceneSnapshotResponse:
-    """Build an immutable robot visual snapshot from observer-safe inputs."""
-    if robot is None:
-        raise VisualSnapshotUnavailable("robot_metadata_unavailable")
+) -> dict[str, dict[str, Any]]:
+    """Compute visual FK link poses from observer-safe joint inputs."""
     if not joint_names or joint_positions_rad is None:
         raise VisualSnapshotUnavailable("joint_state_unavailable")
     if len(joint_names) != len(joint_positions_rad):
@@ -303,6 +298,35 @@ def build_robot_visual_snapshot(
     if not link_poses:
         raise VisualSnapshotUnavailable("visual_fk_empty")
 
+    return link_poses
+
+
+def build_robot_visual_snapshot(
+    state: ComposerState,
+    *,
+    robot: SceneRobotResponse | None,
+    joint_names: list[str],
+    joint_positions_rad: list[float] | None,
+    link_names: list[str],
+    reference_frame: str,
+    base_frame: str,
+    base_pose: dict[str, Any],
+    grippers: list[Any] | None = None,
+    pose_sources: list[Any] | None = None,
+) -> VisualSceneSnapshotResponse:
+    """Build an immutable robot visual snapshot from observer-safe inputs."""
+    if robot is None:
+        raise VisualSnapshotUnavailable("robot_metadata_unavailable")
+    link_poses = compute_robot_visual_link_poses(
+        state,
+        joint_names=joint_names,
+        joint_positions_rad=joint_positions_rad,
+        link_names=link_names,
+        reference_frame=reference_frame,
+        base_frame=base_frame,
+        base_pose=base_pose,
+    )
+    fk_model = _load_visual_fk_model(state)
     return VisualSceneSnapshotResponse(
         sequence_number=_next_sequence_number(),
         timestamp_ns=time.monotonic_ns(),

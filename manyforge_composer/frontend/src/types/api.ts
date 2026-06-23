@@ -500,6 +500,9 @@ export interface PoseSourceConfig {
     tcpFrameId?: string;
     frameId?: string;
   } | null;
+  measuredRobot?: {
+    jointStateTopic?: string;
+  } | null;
   objects: Record<string, PoseSourceObjectBindingConfig>;
 }
 
@@ -827,6 +830,16 @@ export interface PoseSourceMeasuredTcpState {
   pose: PoseSourcePoseState;
 }
 
+export interface PoseSourceMeasuredRobotState {
+  joint_state_topic: string;
+  joint_names: string[];
+  joint_positions_rad: number[];
+  monotonic_s: number;
+  age_s?: number | null;
+  stamp_sec?: number | null;
+  link_poses?: Record<string, { position_m: number[]; orientation_xyzw: number[] }>;
+}
+
 export interface PoseSourceAttachedDriftState {
   status: string;
   action: string;
@@ -877,6 +890,7 @@ export interface PoseSourceStatusState {
   description: string;
   received_at_ns?: number | null;
   measured_tcp?: PoseSourceMeasuredTcpState | null;
+  measured_robot?: PoseSourceMeasuredRobotState | null;
   objects: PoseSourceObjectState[];
 }
 

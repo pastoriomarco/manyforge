@@ -582,6 +582,7 @@ function SceneObjects({
 
 interface MeasuredGhost {
   key: string;
+  markerKind: 'object' | 'tcp';
   objectId: string;
   sourceId: string;
   position: [number, number, number];
@@ -631,6 +632,7 @@ function MeasuredPoseSourceGhosts() {
           if (position !== null && quaternion !== null) {
             next.push({
               key: `${source.pose_source_id}:measured_tcp`,
+              markerKind: 'tcp',
               objectId: source.measured_tcp.tcp_frame_id || 'measured_tcp',
               sourceId: source.pose_source_id,
               position,
@@ -666,6 +668,7 @@ function MeasuredPoseSourceGhosts() {
         const shapeType = typeof shape?.type === 'string' ? shape.type : null;
         next.push({
           key: `${source.pose_source_id}:${observed.object_id}`,
+          markerKind: 'object',
           objectId: observed.object_id,
           sourceId: source.pose_source_id,
           position,
@@ -691,22 +694,84 @@ function MeasuredPoseSourceGhosts() {
           position={ghost.position}
           quaternion={ghost.quaternion}
         >
-          <MeasuredGhostBody shape={ghost.shape} shapeType={ghost.shapeType} />
+          <MeasuredGhostBody
+            markerKind={ghost.markerKind}
+            shape={ghost.shape}
+            shapeType={ghost.shapeType}
+          />
         </group>
       ))}
     </group>
   );
 }
 
+function measuredRobotGhostOpacity(source: PoseSourceStatusState): number | null {
+  for (const observed of source.objects) {
+    const config = observed.measured_state_ghost;
+    if (!measuredGhostEnabled(config, 'robotTcp')) {
+      continue;
+    }
+    const opacity = typeof config?.opacity === 'number' ? config.opacity : 0.35;
+    return Math.min(0.8, Math.max(0.08, opacity));
+  }
+  return null;
+}
+
 function MeasuredGhostBody({
+  markerKind,
   shape,
   shapeType,
 }: {
+  markerKind: 'object' | 'tcp';
   shape: SceneShapeState | null;
   shapeType: string | null;
 }) {
   const ghostColor = '#22d3ee';
   const ghostOpacity = 0.45;
+  if (markerKind === 'tcp') {
+    return (
+      <group name="measured-tcp-marker" renderOrder={21}>
+        <mesh>
+          <sphereGeometry args={[0.025, 16, 12]} />
+          <meshStandardMaterial
+            color={ghostColor}
+            emissive={ghostColor}
+            emissiveIntensity={0.35}
+            transparent
+            opacity={0.8}
+            depthWrite={false}
+          />
+        </mesh>
+        <mesh position={[0.045, 0, 0]}>
+          <boxGeometry args={[0.09, 0.006, 0.006]} />
+          <meshBasicMaterial
+            color="#ef4444"
+            transparent
+            opacity={0.85}
+            depthWrite={false}
+          />
+        </mesh>
+        <mesh position={[0, 0.045, 0]}>
+          <boxGeometry args={[0.006, 0.09, 0.006]} />
+          <meshBasicMaterial
+            color="#22c55e"
+            transparent
+            opacity={0.85}
+            depthWrite={false}
+          />
+        </mesh>
+        <mesh position={[0, 0, 0.045]}>
+          <boxGeometry args={[0.006, 0.006, 0.09]} />
+          <meshBasicMaterial
+            color="#60a5fa"
+            transparent
+            opacity={0.85}
+            depthWrite={false}
+          />
+        </mesh>
+      </group>
+    );
+  }
   if (shapeType === 'mesh') {
     return (
       <SceneObjectMeshAsset
@@ -1108,29 +1173,109 @@ function RobotModel() {
     return null;
   }
 
+  const modelKey = manifest.model_key ?? manifest.robot_id ?? 'unknown';
+
   return (
-    <group name="manyforge-urdf" key={manifest.model_key ?? manifest.robot_id ?? 'unknown'}>
-      {manifest.links.map((link) => {
-        const pose = linkPoses[link.name];
-        if (pose === undefined) {
+    <>
+      <group name="manyforge-urdf" key={modelKey}>
+        {manifest.links.map((link) => {
+          const pose = linkPoses[link.name];
+          if (pose === undefined) {
+            return null;
+          }
+          return (
+            <group
+              key={`${modelKey}:${link.name}`}
+              position={pose.position_m as [number, number, number]}
+              quaternion={pose.orientation_xyzw as [number, number, number, number]}
+            >
+              {link.visuals.map((visual) => (
+                <RobotLinkVisual
+                  key={`${modelKey}:${link.name}:${visual.index}:${visual.mesh_url ?? 'primitive'}`}
+                  visual={visual}
+                />
+              ))}
+            </group>
+          );
+        })}
+      </group>
+      <MeasuredRobotGhosts manifest={manifest} modelKey={modelKey} />
+    </>
+  );
+}
+
+function MeasuredRobotGhosts({
+  manifest,
+  modelKey,
+}: {
+  manifest: SceneUrdfManifest;
+  modelKey: string;
+}) {
+  const visible = useViewerSelectionStore((s) => s.measuredStateGhostVisible);
+  const poseSources = useSceneStateStore(
+    (state) => state.scene?.pose_sources ?? EMPTY_POSE_SOURCES,
+  );
+  const ghosts = useMemo(() => {
+    if (!visible) return [];
+    return poseSources
+      .map((source) => {
+        const opacity = measuredRobotGhostOpacity(source);
+        const measuredRobot = source.measured_robot ?? null;
+        const linkPoses = measuredRobot?.link_poses ?? null;
+        const ageS = measuredRobot?.age_s;
+        if (
+          opacity === null ||
+          linkPoses === null ||
+          Object.keys(linkPoses).length === 0 ||
+          (typeof ageS === 'number' && ageS > source.stale_after_s)
+        ) {
           return null;
         }
-        const modelKey = manifest.model_key ?? manifest.robot_id ?? 'unknown';
-        return (
-          <group
-            key={`${modelKey}:${link.name}`}
-            position={pose.position_m as [number, number, number]}
-            quaternion={pose.orientation_xyzw as [number, number, number, number]}
-          >
-            {link.visuals.map((visual) => (
-              <RobotLinkVisual
-                key={`${modelKey}:${link.name}:${visual.index}:${visual.mesh_url ?? 'primitive'}`}
-                visual={visual}
-              />
-            ))}
-          </group>
-        );
-      })}
+        return {
+          key: source.pose_source_id,
+          opacity,
+          linkPoses,
+        };
+      })
+      .filter((item): item is {
+        key: string;
+        opacity: number;
+        linkPoses: Record<string, { position_m: number[]; orientation_xyzw: number[] }>;
+      } => item !== null);
+  }, [poseSources, visible]);
+
+  if (!visible || ghosts.length === 0) {
+    return null;
+  }
+
+  return (
+    <group name="manyforge-measured-robot-ghosts" renderOrder={18}>
+      {ghosts.map((ghost) => (
+        <group key={`${modelKey}:measured:${ghost.key}`} name={`measured-robot:${ghost.key}`}>
+          {manifest.links.map((link) => {
+            const pose = ghost.linkPoses[link.name];
+            if (pose === undefined) {
+              return null;
+            }
+            return (
+              <group
+                key={`${modelKey}:measured:${ghost.key}:${link.name}`}
+                position={pose.position_m as [number, number, number]}
+                quaternion={pose.orientation_xyzw as [number, number, number, number]}
+              >
+                {link.visuals.map((visual) => (
+                  <GhostVisual
+                    key={`${modelKey}:measured:${ghost.key}:${link.name}:${visual.index}`}
+                    visual={visual}
+                    opacity={ghost.opacity}
+                    color="#22d3ee"
+                  />
+                ))}
+              </group>
+            );
+          })}
+        </group>
+      ))}
     </group>
   );
 }

@@ -215,6 +215,8 @@ pose_sources:
     entity: /World/ur10e_robotiq2f_140_ROS/ur10e_robotiq2f_140/ee_link
     tcp_frame_id: ee_link
     frame_id: universe
+  measured_robot:
+    joint_state_topic: /joint_states
   objects:
     isaac_cheese_box:
       apply_policy: continuous_unattached

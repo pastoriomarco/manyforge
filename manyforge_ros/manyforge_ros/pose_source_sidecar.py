@@ -84,6 +84,18 @@ class PoseSourceMeasuredTcpUpdate:
 
 
 @dataclass(frozen=True)
+class PoseSourceMeasuredRobotUpdate:
+    """Accepted measured robot joint-state sample."""
+
+    pose_source_id: str
+    joint_state_topic: str
+    joint_names: tuple[str, ...]
+    joint_positions_rad: tuple[float, ...]
+    monotonic_s: float
+    stamp_sec: float | None = None
+
+
+@dataclass(frozen=True)
 class PoseSourceObjectState:
     """Latest object state exposed by the sidecar."""
 
@@ -104,6 +116,8 @@ class PoseSourceSnapshot:
     objects: tuple[PoseSourceObjectState, ...]
     measured_tcp: PoseSourceMeasuredTcpUpdate | None = None
     measured_tcp_age_s: float | None = None
+    measured_robot: PoseSourceMeasuredRobotUpdate | None = None
+    measured_robot_age_s: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         payload = {
@@ -125,6 +139,11 @@ class PoseSourceSnapshot:
             payload["measuredTcp"] = _measured_tcp_to_dict(
                 self.measured_tcp,
                 age_s=self.measured_tcp_age_s,
+            )
+        if self.measured_robot is not None:
+            payload["measuredRobot"] = _measured_robot_to_dict(
+                self.measured_robot,
+                age_s=self.measured_robot_age_s,
             )
         return payload
 
@@ -167,6 +186,7 @@ class PoseSourceLatestState:
         self._updates: dict[str, PoseSourceUpdate] = {}
         self._rejections: dict[str, PoseSourceRejection] = {}
         self._measured_tcp: PoseSourceMeasuredTcpUpdate | None = None
+        self._measured_robot: PoseSourceMeasuredRobotUpdate | None = None
         self._lock = threading.Lock()
 
     def apply_poll_result(self, result: PoseSourcePollResult) -> None:
@@ -185,6 +205,18 @@ class PoseSourceLatestState:
             if result.measured_tcp_update is not None:
                 self._measured_tcp = result.measured_tcp_update
 
+    def apply_measured_robot_update(
+        self,
+        update: PoseSourceMeasuredRobotUpdate,
+    ) -> None:
+        if update.pose_source_id != self.pose_source_id:
+            raise ValueError(
+                f"measured robot source '{update.pose_source_id}' does not match "
+                f"state source '{self.pose_source_id}'"
+            )
+        with self._lock:
+            self._measured_robot = update
+
     def snapshot(self, *, monotonic_s: float | None = None) -> PoseSourceSnapshot:
         now = time.monotonic() if monotonic_s is None else float(monotonic_s)
         objects: list[PoseSourceObjectState] = []
@@ -192,6 +224,7 @@ class PoseSourceLatestState:
             updates = dict(self._updates)
             rejections = dict(self._rejections)
             measured_tcp = self._measured_tcp
+            measured_robot = self._measured_robot
 
         any_fresh = False
         any_rejected = False
@@ -253,7 +286,76 @@ class PoseSourceLatestState:
                 if measured_tcp is not None
                 else None
             ),
+            measured_robot=measured_robot,
+            measured_robot_age_s=(
+                max(0.0, now - measured_robot.monotonic_s)
+                if measured_robot is not None
+                else None
+            ),
         )
+
+
+class MeasuredRobotJointStateTracker:
+    """Latest-wins measured robot joint-state subscriber."""
+
+    def __init__(
+        self,
+        *,
+        node: Any,
+        pose_source_id: str,
+        joint_state_topic: str,
+        now_fn: Callable[[], float] | None = None,
+    ) -> None:
+        topic = str(joint_state_topic or "").strip()
+        if not topic:
+            raise ValueError("joint_state_topic must be non-empty")
+        self.pose_source_id = pose_source_id
+        self.joint_state_topic = topic
+        self.now_fn = now_fn or time.monotonic
+        self._latest: PoseSourceMeasuredRobotUpdate | None = None
+        self._lock = threading.Lock()
+        try:
+            from sensor_msgs.msg import JointState
+        except Exception as exc:  # pragma: no cover - exercised only without ROS.
+            raise RuntimeError("sensor_msgs.msg.JointState is required") from exc
+        self._subscription = node.create_subscription(
+            JointState,
+            self.joint_state_topic,
+            self._on_joint_state,
+            10,
+        )
+
+    def _on_joint_state(self, msg: Any) -> None:
+        names = tuple(str(name).strip() for name in getattr(msg, "name", ()))
+        positions = tuple(float(value) for value in getattr(msg, "position", ()))
+        if not names or len(names) != len(positions):
+            return
+        if any(not name for name in names) or any(not isfinite(value) for value in positions):
+            return
+        stamp_sec: float | None = None
+        header = getattr(msg, "header", None)
+        stamp = getattr(header, "stamp", None)
+        if stamp is not None:
+            sec = getattr(stamp, "sec", None)
+            nanosec = getattr(stamp, "nanosec", None)
+            try:
+                stamp_sec = float(sec) + float(nanosec) * 1e-9
+            except (TypeError, ValueError):
+                stamp_sec = None
+        update = PoseSourceMeasuredRobotUpdate(
+            pose_source_id=self.pose_source_id,
+            joint_state_topic=self.joint_state_topic,
+            joint_names=names,
+            joint_positions_rad=positions,
+            monotonic_s=self.now_fn(),
+            stamp_sec=stamp_sec,
+        )
+        with self._lock:
+            self._latest = update
+
+    def latest_update(self) -> PoseSourceMeasuredRobotUpdate | None:
+        with self._lock:
+            return self._latest
 
 
 class SimulationInterfacesPoseSource:
@@ -1319,6 +1421,21 @@ def _measured_tcp_to_dict(
             "positionXYZ": list(update.pose.position_xyz),
             "orientationXYZW": list(update.pose.orientation_xyzw),
         },
+    }
+
+
+def _measured_robot_to_dict(
+    update: PoseSourceMeasuredRobotUpdate,
+    *,
+    age_s: float | None,
+) -> dict[str, Any]:
+    return {
+        "jointStateTopic": update.joint_state_topic,
+        "jointNames": list(update.joint_names),
+        "jointPositionsRad": list(update.joint_positions_rad),
+        "monotonicS": update.monotonic_s,
+        "ageS": age_s,
+        "stampSec": update.stamp_sec,
     }
 
 

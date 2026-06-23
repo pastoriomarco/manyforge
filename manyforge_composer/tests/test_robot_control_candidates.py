@@ -147,6 +147,19 @@ class _SpringOnlyStopCapabilityBundle:
         }
 
 
+class _AllStopModesCapabilityBundle:
+    def get_motion_interrupt_stop_capability(self) -> dict:
+        return {
+            "supported_stop_modes": [
+                "soft_on_path",
+                "spring_back_hold",
+                "hard_deceleration",
+            ],
+            "capability_profile_id": "test_all_stop_modes",
+            "hard_stop_level": "jtc_cancel_unprofiled_hold",
+        }
+
+
 def _write_deployment_with_stop_profile(tmp_path: Path, *, stop_mode: str) -> str:
     data = yaml.safe_load(Path(_DEPLOYMENT_PATH).read_text(encoding="utf-8"))
     config = data["adapters"]["execution"].setdefault("config", {})
@@ -927,6 +940,7 @@ def _gripper_client(
     client, state, kernel = _client(tmp_path)
     state.deployment = Deployment(_GRIPPER_DEPLOYMENT_PATH)
     state.deployment_source_path = _GRIPPER_DEPLOYMENT_PATH
+    state.kernel_bundle = _AllStopModesCapabilityBundle()
     return client, state, kernel
 
 
@@ -1032,6 +1046,7 @@ def _gripper_status_client(
     state = ComposerState(
         catalog_path=_CATALOG_PATH,
         kernel=kernel,
+        kernel_bundle=_AllStopModesCapabilityBundle(),
         allowed_fs_roots=[str(tmp_path), str(_REPO_ROOT)],
     )
     app = create_app(

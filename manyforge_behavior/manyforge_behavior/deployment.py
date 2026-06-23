@@ -162,6 +162,13 @@ class PoseSourceMeasuredTcpConfig:
 
 
 @dataclass(frozen=True)
+class PoseSourceMeasuredRobotConfig:
+    """Optional measured robot joint-state stream for visual overlays."""
+
+    joint_state_topic: str = "/joint_states"
+
+
+@dataclass(frozen=True)
 class PoseSourceObjectBinding:
     """Deployment binding from an external pose source to a scene object."""
 
@@ -198,6 +205,7 @@ class PoseSourceConfig:
     topic: str = ""
     description: str = ""
     measured_tcp: Optional[PoseSourceMeasuredTcpConfig] = None
+    measured_robot: Optional[PoseSourceMeasuredRobotConfig] = None
     objects: dict[str, PoseSourceObjectBinding] = field(default_factory=dict)
 
 
@@ -824,6 +832,26 @@ class Deployment:
                 frame_id=frame_id_value,
             )
 
+        def parse_measured_robot_config(
+            raw: Any,
+            field_path: str,
+        ) -> Optional[PoseSourceMeasuredRobotConfig]:
+            if raw is None:
+                return None
+            if not isinstance(raw, dict):
+                raise DeploymentValidationError(f"{field_path} must be a mapping")
+            joint_state_topic = self._parse_optional_text(
+                get_alias(raw, "joint_state_topic", "jointStateTopic", "/joint_states"),
+                f"{field_path}.joint_state_topic",
+            )
+            if not joint_state_topic:
+                raise DeploymentValidationError(
+                    f"{field_path}.joint_state_topic must be non-empty"
+                )
+            return PoseSourceMeasuredRobotConfig(
+                joint_state_topic=joint_state_topic,
+            )
+
         def parse_drift_monitor_config(
             raw: Any,
             field_path: str,
@@ -976,6 +1004,10 @@ class Deployment:
                 get_alias(source_data, "measured_tcp", "measuredTcp", None),
                 f"{field_path}.measured_tcp",
                 kind=kind,
+            )
+            measured_robot = parse_measured_robot_config(
+                get_alias(source_data, "measured_robot", "measuredRobot", None),
+                f"{field_path}.measured_robot",
             )
 
             objects_data = source_data.get("objects", {})
@@ -1192,6 +1224,7 @@ class Deployment:
                 topic=topic,
                 description=description,
                 measured_tcp=measured_tcp,
+                measured_robot=measured_robot,
                 objects=objects,
             )
         return parsed
@@ -2960,6 +2993,10 @@ class Deployment:
                         source_d["measured_tcp"]["frame_id"] = (
                             source.measured_tcp.frame_id
                         )
+                if source.measured_robot is not None:
+                    source_d["measured_robot"] = {
+                        "joint_state_topic": source.measured_robot.joint_state_topic,
+                    }
                 for object_id, binding in source.objects.items():
                     binding_d: dict[str, Any] = {
                         "apply_policy": binding.apply_policy,

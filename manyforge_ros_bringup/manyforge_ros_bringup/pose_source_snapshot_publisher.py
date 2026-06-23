@@ -30,6 +30,7 @@ from rclpy.node import Node
 from manyforge_behavior.deployment import Deployment
 from manyforge_ros.pose_source_sidecar import (
     Detection3DArrayTopicPoseSource,
+    MeasuredRobotJointStateTracker,
     PoseArrayTopicPoseSource,
     PoseStampedTopicPoseSource,
     SimulationInterfacesPoseSource,
@@ -42,6 +43,7 @@ from manyforge_ros.scene_mirror_probe import SimulationSceneMirrorClient
 class _RuntimeSource:
     source: Any
     next_poll_s: float
+    measured_robot: MeasuredRobotJointStateTracker | None = None
     consecutive_post_failures: int = 0
 
 
@@ -177,8 +179,20 @@ class PoseSourceSnapshotPublisher(Node):
                         f"'{source.kind}' for source '{source.source_id}'"
                     )
                     continue
+                measured_robot = None
+                measured_robot_config = getattr(source, "measured_robot", None)
+                if measured_robot_config is not None:
+                    measured_robot = MeasuredRobotJointStateTracker(
+                        node=self,
+                        pose_source_id=source.source_id,
+                        joint_state_topic=measured_robot_config.joint_state_topic,
+                    )
                 runtime_sources.append(
-                    _RuntimeSource(source=runtime_source, next_poll_s=0.0)
+                    _RuntimeSource(
+                        source=runtime_source,
+                        next_poll_s=0.0,
+                        measured_robot=measured_robot,
+                    )
                 )
             except Exception as exc:
                 self.get_logger().error(
@@ -195,6 +209,10 @@ class PoseSourceSnapshotPublisher(Node):
                 if hasattr(runtime.source, "poll_once")
                 else None
             )
+            if runtime.measured_robot is not None:
+                update = runtime.measured_robot.latest_update()
+                if update is not None:
+                    runtime.source.state.apply_measured_robot_update(update)
             snapshot = runtime.source.state.snapshot()
             self._post_snapshot(source_id, snapshot.to_dict())
             if runtime.consecutive_post_failures:

@@ -37,10 +37,24 @@ _TEST_SECURITY = SecurityConfig(
 )
 
 
+class _AllStopModesCapabilityBundle:
+    def get_motion_interrupt_stop_capability(self) -> dict:
+        return {
+            "supported_stop_modes": [
+                "soft_on_path",
+                "spring_back_hold",
+                "hard_deceleration",
+            ],
+            "capability_profile_id": "test_all_stop_modes",
+            "hard_stop_level": "jtc_cancel_unprofiled_hold",
+        }
+
+
 def test_basic_pick_and_place_scenario_runs_to_completion():
     state = ComposerState(
         catalog_path=_CATALOG_PATH,
         kernel=MockKernelClient(execute_duration_s=0.05),
+        kernel_bundle=_AllStopModesCapabilityBundle(),
         allowed_fs_roots=[str(_REPO_ROOT), "/tmp", "/workspace"],
     )
     app = create_app(state, security=_TEST_SECURITY)
@@ -121,6 +135,7 @@ def test_runner_writes_metadata_and_matrix_summary(tmp_path):
     state = ComposerState(
         catalog_path=_CATALOG_PATH,
         kernel=MockKernelClient(execute_duration_s=0.05),
+        kernel_bundle=_AllStopModesCapabilityBundle(),
         allowed_fs_roots=[str(_REPO_ROOT), "/tmp", "/workspace"],
     )
     app = create_app(state, security=_TEST_SECURITY)
@@ -218,6 +233,7 @@ def test_runner_can_assert_scene_snapshot_and_archive_matrix_output(tmp_path):
     state = ComposerState(
         catalog_path=_CATALOG_PATH,
         kernel=MockKernelClient(execute_duration_s=0.05),
+        kernel_bundle=_AllStopModesCapabilityBundle(),
         allowed_fs_roots=[str(_REPO_ROOT), "/tmp", "/workspace"],
     )
 

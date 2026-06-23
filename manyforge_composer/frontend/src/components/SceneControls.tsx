@@ -396,11 +396,12 @@ function PoseSourcesSection({ sources }: { sources: PoseSourceStatusState[] }) {
             checked={measuredStateGhostVisible}
             onChange={(event) => setMeasuredStateGhostVisible(event.target.checked)}
           />
-          <span>Measured-state ghost</span>
+          <span>Measured-state ghosts</span>
         </label>
         <div className="mt-1 text-[10px] leading-snug text-gray-500">
-          Shows fresh external object observations as a cyan translucent overlay.
-          Composer's planning scene remains the authoritative state.
+          Shows the measured robot joint-state overlay when configured, plus
+          fresh external object observations and the measured TCP marker.
+          Composer's planning scene remains authoritative.
         </div>
       </div>
       <div className="rounded border border-gray-800 bg-gray-950/50 p-2">

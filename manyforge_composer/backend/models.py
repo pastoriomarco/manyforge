@@ -811,6 +811,10 @@ class PoseSourceConfigResponse(BaseModel):
     topic: str = ""
     description: str = ""
     measured_tcp: Optional[Dict[str, Any]] = Field(default=None, alias="measuredTcp")
+    measured_robot: Optional[Dict[str, Any]] = Field(
+        default=None,
+        alias="measuredRobot",
+    )
     objects: Dict[str, PoseSourceObjectBindingConfigResponse] = Field(
         default_factory=dict
     )
@@ -1100,6 +1104,20 @@ class PoseSourceMeasuredTcpResponse(BaseModel):
     pose: PoseSourcePoseResponse
 
 
+class PoseSourceMeasuredRobotResponse(BaseModel):
+    model_config = _ALIAS_CFG
+    joint_state_topic: str = Field(alias="jointStateTopic")
+    joint_names: List[str] = Field(alias="jointNames")
+    joint_positions_rad: List[float] = Field(alias="jointPositionsRad")
+    monotonic_s: float = Field(alias="monotonicS")
+    age_s: Optional[float] = Field(default=None, alias="ageS")
+    stamp_sec: Optional[float] = Field(default=None, alias="stampSec")
+    link_poses: Dict[str, Dict[str, Any]] = Field(
+        default_factory=dict,
+        alias="linkPoses",
+    )
+
+
 class PoseSourceAttachedDriftStateResponse(BaseModel):
     model_config = _ALIAS_CFG
     status: str
@@ -1172,6 +1190,10 @@ class PoseSourceStatusResponse(BaseModel):
         default=None,
         alias="measuredTcp",
     )
+    measured_robot: Optional[PoseSourceMeasuredRobotResponse] = Field(
+        default=None,
+        alias="measuredRobot",
+    )
     objects: List[PoseSourceObjectStateResponse] = Field(default_factory=list)
 
 
@@ -1183,6 +1205,10 @@ class PoseSourceSnapshotRequest(BaseModel):
     measured_tcp: Optional[PoseSourceMeasuredTcpResponse] = Field(
         default=None,
         alias="measuredTcp",
+    )
+    measured_robot: Optional[PoseSourceMeasuredRobotResponse] = Field(
+        default=None,
+        alias="measuredRobot",
     )
     objects: List[PoseSourceObjectStateResponse] = Field(default_factory=list)
 

@@ -367,6 +367,7 @@ function defaultPoseSource(id: string): PoseSourceConfig {
     topic: '',
     description: '',
     measuredTcp: null,
+    measuredRobot: null,
     objects: {},
   };
 }
@@ -1513,6 +1514,19 @@ function PoseSourcesEditor({
                 help="Frame name for the measured TCP sample, for example tool0."
               />
               <FieldInput
+                label="Measured Robot Joint State Topic"
+                value={source.measuredRobot?.jointStateTopic ?? ''}
+                onChange={(value) => updateSource(sourceIndex, {
+                  measuredRobot: value.trim()
+                    ? {
+                        jointStateTopic: value.trim(),
+                      }
+                    : null,
+                })}
+                disabled={disabled}
+                help="Optional ROS JointState topic used to render the measured robot ghost overlay, for example /joint_states."
+              />
+              <FieldInput
                 label="Topic"
                 value={source.topic ?? ''}
                 onChange={(value) => updateSource(sourceIndex, { topic: value })}
@@ -1605,7 +1619,7 @@ function PoseSourcesEditor({
                       </div>
                       <div className="grid gap-2 md:grid-cols-2">
                         <CheckboxInput
-                          label="Measured-state ghost"
+                          label="Measured-state ghosts"
                           checked={Boolean(binding.measuredStateGhost?.enabled)}
                           onChange={(value) => updateObject(sourceIndex, objectId, {
                             measuredStateGhost: {
@@ -1615,7 +1629,7 @@ function PoseSourcesEditor({
                             },
                           })}
                           disabled={disabled}
-                          help="Shows external object/TCP samples as diagnostics only; it never changes the planning scene."
+                          help="Shows the measured robot joint-state overlay when configured, plus external object samples and the measured TCP marker. These are diagnostics; Composer's planning scene remains authoritative."
                         />
                         <CheckboxInput
                           label="Drift monitor enabled"

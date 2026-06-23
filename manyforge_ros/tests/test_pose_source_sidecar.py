@@ -124,6 +124,72 @@ def test_simulation_interfaces_pose_source_polls_latest_wins_state():
         rclpy.shutdown()
 
 
+def test_measured_robot_joint_state_tracker_snapshots_latest():
+    rclpy = pytest.importorskip("rclpy")
+    sensor_msgs = pytest.importorskip("sensor_msgs.msg")
+
+    from manyforge_ros.pose_source_sidecar import (
+        MeasuredRobotJointStateTracker,
+        PoseSourceLatestState,
+    )
+
+    rclpy.init(args=None)
+    node = rclpy.create_node("manyforge_measured_robot_joint_state_test")
+    publisher = node.create_publisher(
+        sensor_msgs.JointState,
+        "/manyforge_test_joint_states",
+        10,
+    )
+    now = {"value": 12.0}
+    tracker = MeasuredRobotJointStateTracker(
+        node=node,
+        pose_source_id="isaac_scene_objects",
+        joint_state_topic="/manyforge_test_joint_states",
+        now_fn=lambda: now["value"],
+    )
+    state = PoseSourceLatestState(
+        pose_source_id="isaac_scene_objects",
+        object_ids=["isaac_cheese_box"],
+        stale_after_s=1.0,
+    )
+
+    try:
+        msg = sensor_msgs.JointState()
+        msg.header.stamp.sec = 17
+        msg.header.stamp.nanosec = 250_000_000
+        msg.name = ["shoulder_pan_joint", "elbow_joint"]
+        msg.position = [0.25, -0.5]
+        for _ in range(20):
+            publisher.publish(msg)
+            rclpy.spin_once(node, timeout_sec=0.05)
+            if tracker.latest_update() is not None:
+                break
+
+        update = tracker.latest_update()
+        assert update is not None
+        assert update.joint_state_topic == "/manyforge_test_joint_states"
+        assert update.joint_names == ("shoulder_pan_joint", "elbow_joint")
+        assert update.joint_positions_rad == (0.25, -0.5)
+        assert update.stamp_sec == pytest.approx(17.25)
+
+        state.apply_measured_robot_update(update)
+        snapshot = state.snapshot(monotonic_s=12.5)
+        assert snapshot.measured_robot is not None
+        assert snapshot.measured_robot_age_s == pytest.approx(0.5)
+        payload = snapshot.to_dict()
+        assert payload["measuredRobot"]["jointStateTopic"] == (
+            "/manyforge_test_joint_states"
+        )
+        assert payload["measuredRobot"]["jointNames"] == [
+            "shoulder_pan_joint",
+            "elbow_joint",
+        ]
+        assert payload["measuredRobot"]["jointPositionsRad"] == [0.25, -0.5]
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
 def test_simulation_interfaces_pose_source_rejects_missing_entity_pose():
     rclpy = pytest.importorskip("rclpy")
     pytest.importorskip("simulation_interfaces")

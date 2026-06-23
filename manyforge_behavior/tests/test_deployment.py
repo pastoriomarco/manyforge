@@ -687,6 +687,9 @@ class TestDeploymentLoading:
                         "tcp_frame_id": "tool0",
                         "frame_id": "universe",
                     },
+                    "measured_robot": {
+                        "joint_state_topic": "/joint_states",
+                    },
                     "objects": {
                         "isaac_cheese_box": {
                             "entity": "/mac_n_cheese_centered",
@@ -732,6 +735,8 @@ class TestDeploymentLoading:
         assert source.measured_tcp is not None
         assert source.measured_tcp.entity == "/World/tool0"
         assert source.measured_tcp.tcp_frame_id == "tool0"
+        assert source.measured_robot is not None
+        assert source.measured_robot.joint_state_topic == "/joint_states"
         assert set(source.objects) == {"isaac_cheese_box", "isaac_soup_can"}
         assert source.objects["isaac_cheese_box"].entity == "/mac_n_cheese_centered"
         assert source.objects["isaac_cheese_box"].apply_policy == "before_planning"
@@ -768,6 +773,12 @@ class TestDeploymentLoading:
             reloaded.pose_sources["isaac_scene_objects"].measured_tcp.entity
             == "/World/tool0"
         )
+        assert (
+            reloaded.pose_sources[
+                "isaac_scene_objects"
+            ].measured_robot.joint_state_topic
+            == "/joint_states"
+        )
 
     def test_pose_source_rejects_enabled_drift_monitor_without_thresholds(self):
         data = _minimal_deployment(
@@ -791,6 +802,28 @@ class TestDeploymentLoading:
         with pytest.raises(
             DeploymentValidationError,
             match="enabled monitors require at least one threshold",
+        ):
+            Deployment.from_dict(data)
+
+    def test_pose_source_rejects_empty_measured_robot_topic(self):
+        data = _minimal_deployment(
+            pose_sources=[
+                {
+                    "id": "isaac_scene_objects",
+                    "kind": "simulation_interfaces",
+                    "measured_robot": {"joint_state_topic": "  "},
+                    "objects": {
+                        "box": {
+                            "entity": "/World/box",
+                            "apply_policy": "observe_only",
+                        },
+                    },
+                },
+            ],
+        )
+        with pytest.raises(
+            DeploymentValidationError,
+            match="measured_robot.joint_state_topic must be non-empty",
         ):
             Deployment.from_dict(data)
 

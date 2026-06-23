@@ -400,6 +400,13 @@ def _deployment_to_full_response(
                         "frameId": source.measured_tcp.frame_id,
                     }
                 ),
+                "measuredRobot": (
+                    None
+                    if source.measured_robot is None
+                    else {
+                        "jointStateTopic": source.measured_robot.joint_state_topic,
+                    }
+                ),
                 "objects": {
                     object_id: {
                         "entity": binding.entity,

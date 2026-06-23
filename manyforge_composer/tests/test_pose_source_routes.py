@@ -86,6 +86,7 @@ def _pose_sources(
     box_policy: str = "before_planning",
     can_policy: str = "observe_only",
     measured_grasp: bool = False,
+    measured_robot: bool = False,
     drift_action: str = "interrupt",
     debounce_s: float = 0.001,
 ) -> list[dict]:
@@ -118,24 +119,25 @@ def _pose_sources(
                 },
             }
         )
-    return [
-        {
-            "id": "isaac_scene_objects",
-            "kind": "simulation_interfaces",
-            "enabled": enabled,
-            "service_prefix": "auto",
-            "max_update_hz": 4.0,
-            "stale_after_s": 1.0,
-            "frame_id": "universe",
-            "objects": {
-                "box": box_binding,
-                "can": {
-                    "entity": "/World/can",
-                    "apply_policy": can_policy,
-                },
+    source: dict[str, Any] = {
+        "id": "isaac_scene_objects",
+        "kind": "simulation_interfaces",
+        "enabled": enabled,
+        "service_prefix": "auto",
+        "max_update_hz": 4.0,
+        "stale_after_s": 1.0,
+        "frame_id": "universe",
+        "objects": {
+            "box": box_binding,
+            "can": {
+                "entity": "/World/can",
+                "apply_policy": can_policy,
             },
-        }
-    ]
+        },
+    }
+    if measured_robot:
+        source["measured_robot"] = {"joint_state_topic": "/joint_states"}
+    return [source]
 
 
 def _add_object(
@@ -197,6 +199,7 @@ def _post_fresh_snapshot(
     observations: list[dict[str, Any]],
     *,
     measured_tcp: dict[str, Any] | None = None,
+    measured_robot: dict[str, Any] | None = None,
 ) -> Any:
     payload: dict[str, Any] = {
         "poseSourceId": "isaac_scene_objects",
@@ -206,6 +209,8 @@ def _post_fresh_snapshot(
     }
     if measured_tcp is not None:
         payload["measuredTcp"] = measured_tcp
+    if measured_robot is not None:
+        payload["measuredRobot"] = measured_robot
     response = client.post(
         "/api/scene/pose-sources/isaac_scene_objects/snapshot",
         json=payload,
@@ -297,6 +302,35 @@ def test_pose_source_snapshot_is_observe_only_and_normalizes_policy(tmp_path: Pa
     assert observed["update"]["entity"] == "/World/box"
     assert observed["update"]["apply_policy"] == "before_planning"
     assert observed["update"]["pose"]["position_xyz"] == [1.0, 2.0, 3.0]
+
+
+def test_pose_source_snapshot_exposes_measured_robot_state(tmp_path: Path) -> None:
+    client, state = _client(tmp_path)
+    state.deployment = _minimal_deployment(
+        pose_sources=_pose_sources(measured_robot=True)
+    )
+
+    _post_fresh_snapshot(
+        client,
+        [_pose_source_observation("box")],
+        measured_robot={
+            "jointStateTopic": "/joint_states",
+            "jointNames": ["shoulder_pan_joint", "elbow_joint"],
+            "jointPositionsRad": [0.25, -0.5],
+            "monotonicS": 10.0,
+            "ageS": 0.0,
+            "stampSec": 17.25,
+        },
+    )
+
+    scene = client.get("/api/scene/state").json()
+    source = scene["pose_sources"][0]
+    assert source["measured_robot"]["joint_state_topic"] == "/joint_states"
+    assert source["measured_robot"]["joint_names"] == [
+        "shoulder_pan_joint",
+        "elbow_joint",
+    ]
+    assert source["measured_robot"]["joint_positions_rad"] == [0.25, -0.5]
 
 
 def test_pose_source_snapshot_rejects_unknown_objects(tmp_path: Path) -> None:

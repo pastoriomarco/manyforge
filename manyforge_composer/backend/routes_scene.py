@@ -89,6 +89,7 @@ def augment_pose_orientation_rpy_deg(value: Any) -> Any:
 from .visual_state import (
     VisualSnapshotUnavailable,
     build_robot_visual_snapshot,
+    compute_robot_visual_link_poses,
     relative_pose_from_world,
 )
 
@@ -590,6 +591,7 @@ def _pose_sources_payload(state: ComposerState) -> list[PoseSourceStatusResponse
                 )
             )
         measured_tcp = snapshot.get("measured_tcp") or snapshot.get("measuredTcp")
+        measured_robot = snapshot.get("measured_robot") or snapshot.get("measuredRobot")
         responses.append(
             PoseSourceStatusResponse(
                 pose_source_id=source_id,
@@ -602,10 +604,70 @@ def _pose_sources_payload(state: ComposerState) -> list[PoseSourceStatusResponse
                 description=source.description,
                 received_at_ns=snapshot.get("received_at_ns"),
                 measured_tcp=measured_tcp if isinstance(measured_tcp, dict) else None,
+                measured_robot=(
+                    measured_robot if isinstance(measured_robot, dict) else None
+                ),
                 objects=object_states,
             )
         )
     return responses
+
+
+def _source_requests_measured_robot_ghost(
+    source: PoseSourceStatusResponse,
+) -> bool:
+    for observed in source.objects:
+        config = observed.measured_state_ghost
+        if not isinstance(config, dict):
+            continue
+        if config.get("enabled") is not True:
+            continue
+        if config.get("robotTcp", True) is False:
+            continue
+        return True
+    return False
+
+
+def _enrich_measured_robot_link_poses(
+    state: ComposerState,
+    *,
+    pose_sources: list[PoseSourceStatusResponse],
+    link_names: list[str],
+    reference_frame: str,
+    base_frame: str,
+    base_pose: dict[str, Any],
+) -> None:
+    """Attach measured-robot visual FK link poses to pose-source status rows."""
+
+    for source in pose_sources:
+        measured_robot = source.measured_robot
+        if measured_robot is None:
+            continue
+        if not _source_requests_measured_robot_ghost(source):
+            continue
+        joint_names = list(measured_robot.joint_names)
+        joint_positions = list(measured_robot.joint_positions_rad)
+        if not joint_names or len(joint_names) != len(joint_positions):
+            continue
+        try:
+            link_poses = compute_robot_visual_link_poses(
+                state,
+                joint_names=joint_names,
+                joint_positions_rad=joint_positions,
+                link_names=link_names,
+                reference_frame=reference_frame,
+                base_frame=base_frame,
+                base_pose=base_pose,
+            )
+        except VisualSnapshotUnavailable:
+            logger.debug(
+                "measured robot visual FK unavailable for pose source %s",
+                source.pose_source_id,
+                exc_info=True,
+                extra={"event": "manyforge.visual.measured_robot_fk_unavailable"},
+            )
+            continue
+        measured_robot.link_poses = dict(link_poses)
 
 
 def _base_robot_route_metadata(
@@ -739,6 +801,14 @@ def _build_visual_state_snapshot_for_publisher(state: ComposerState):
         base_pose=base_pose,
         grippers=grippers,
         pose_sources=pose_sources,
+    )
+    _enrich_measured_robot_link_poses(
+        state,
+        pose_sources=pose_sources,
+        link_names=link_names,
+        reference_frame=world_frame,
+        base_frame=base_frame,
+        base_pose=base_pose,
     )
     link_poses = dict(visual_state.link_poses)
     if base_frame in link_poses and tcp_frame in link_poses:
