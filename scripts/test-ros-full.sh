@@ -59,7 +59,9 @@ for module in required:
 PY
 
 pytest manyforge_ros/tests/ -q
-pytest manyforge_composer/tests/test_assistant_routes.py -q
+# Composer assistant route tests are owned by the Python package CI lane, which
+# runs manyforge_composer from its package root. Keep this ROS-full lane focused
+# on ROS adapter contracts plus the assistant scene-authoring smokes below.
 ./scripts/smoke-assistant-scene-authoring.py \
   --fixture manyforge_composer/tests/fixtures/isaac_scene_authoring_soup_can.json \
   --include-subtree /World/soup_can \

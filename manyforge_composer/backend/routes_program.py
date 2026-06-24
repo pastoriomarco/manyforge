@@ -103,6 +103,7 @@ def _tree_to_response(node) -> dict:
         id=node.id,
         name=node.name,
         params=node.params,
+        operatorStopPolicy=node.operator_stop_policy,
         modificationPolicy=node.modification_policy,
         recoveryPolicy=node.recovery_policy,
         children=[_tree_to_response(child) for child in node.children],

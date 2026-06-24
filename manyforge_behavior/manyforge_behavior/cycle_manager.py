@@ -233,7 +233,8 @@ class _InterventionContext:
 
 def _collect_statuses(node, result):
     """Recursively collect node statuses from a py_trees node and its children."""
-    result[node.name] = node.status.value if node.status else "INVALID"
+    if not getattr(node, "_manyforge_internal_status_node", False):
+        result[node.name] = node.status.value if node.status else "INVALID"
     if hasattr(node, 'children'):
         for child in node.children:
             _collect_statuses(child, result)
@@ -361,6 +362,9 @@ class CycleManager:
         self._tick_cleanup_thread: Optional[threading.Thread] = None
         self._stop_settle_thread: Optional[threading.Thread] = None
         self._stop_settle_generation = 0
+        self._motion_stop_thread: Optional[threading.Thread] = None
+        self._motion_stop_generation = 0
+        self._motion_stop_state = "idle"
         self._tick_stop_event = threading.Event()  # signals tick thread to exit
         self._tick_exit_event = threading.Event()
         self._tick_pause_event = threading.Event()  # cleared = paused, set = running
@@ -455,6 +459,76 @@ class CycleManager:
             daemon=True,
         )
         self._stop_settle_thread.start()
+
+    def _await_motion_stop_terminal(self, generation: int) -> None:
+        while True:
+            try:
+                kernel_state = self._kernel.get_status().state
+            except Exception:
+                logger.exception("Failed while waiting for motion stop terminal state")
+                time.sleep(0.05)
+                continue
+            if self._kernel_stop_terminal(kernel_state):
+                self._complete_motion_stop_from_kernel_state(
+                    kernel_state,
+                    generation=generation,
+                )
+                return
+            time.sleep(0.02)
+
+    def _start_motion_stop_watcher_locked(self) -> None:
+        self._motion_stop_generation += 1
+        generation = self._motion_stop_generation
+        self._motion_stop_thread = threading.Thread(
+            target=self._await_motion_stop_terminal,
+            args=(generation,),
+            daemon=True,
+        )
+        self._motion_stop_thread.start()
+
+    def _complete_motion_stop_from_kernel_state(
+        self,
+        kernel_state: ExecutionState,
+        *,
+        generation: Optional[int] = None,
+    ) -> None:
+        clear_motion_stop_flag = False
+        set_stop_requested = False
+        with self._lock:
+            if generation is not None and self._motion_stop_generation != generation:
+                return
+            if self._motion_stop_state != "stopping":
+                if generation is not None and self._motion_stop_generation == generation:
+                    self._motion_stop_thread = None
+                return
+            if kernel_state in {
+                ExecutionState.FAILED,
+                ExecutionState.INTERVENTION_REQUIRED,
+            }:
+                self._motion_stop_state = "idle"
+                self._state = CycleState.STOPPED
+                self._error = (
+                    "Motion stop failed or entered intervention; cycle was fully stopped"
+                )
+                self._error_code = "motion_stop_failed"
+                self._error_details = {"kernel_state": kernel_state.value}
+                self._tick_pause_event.clear()
+                clear_motion_stop_flag = True
+                set_stop_requested = True
+            else:
+                self._motion_stop_state = "held"
+            if generation is not None and self._motion_stop_generation == generation:
+                self._motion_stop_thread = None
+        if clear_motion_stop_flag:
+            self._set_motion_stop_active_flag(
+                False,
+                client_name="cycle_manager_motion_stop_failed",
+            )
+        if set_stop_requested:
+            self._set_stop_requested_flag(
+                True,
+                client_name="cycle_manager_motion_stop_failed",
+            )
 
     def _tree_is_terminal(self) -> bool:
         """True when the current tree has already reached a terminal status."""
@@ -641,6 +715,12 @@ class CycleManager:
         self._clear_motion_paused_blackboard()
         self._clear_gripper_fault_blackboard()
         self._set_resume_after_error_flag(False)
+        self._set_motion_stop_active_flag(
+            False,
+            client_name="cycle_manager_prepare_fresh",
+        )
+        with self._lock:
+            self._motion_stop_state = "idle"
         self._clear_runtime_scene()
         self._tree = self._runner.build_tree()
         self._runner.apply_scene()
@@ -671,6 +751,12 @@ class CycleManager:
     def state(self) -> CycleState:
         """Current lifecycle state."""
         return self._state
+
+    @property
+    def motion_stop_state(self) -> str:
+        """Motion-stop lifecycle independent of cycle tick state."""
+        with self._lock:
+            return self._motion_stop_state
     
     @property
     def velocity_scale(self) -> float:
@@ -913,6 +999,11 @@ class CycleManager:
         bb = py_trees.blackboard.Client(name=client_name)
         bb.register_key(key="stop_requested", access=py_trees.common.Access.WRITE)
         bb.stop_requested = stop_requested
+
+    def _set_motion_stop_active_flag(self, active: bool, *, client_name: str) -> None:
+        bb = py_trees.blackboard.Client(name=client_name)
+        bb.register_key(key="motion_stop_active", access=py_trees.common.Access.WRITE)
+        bb.motion_stop_active = active
 
     def _read_motion_paused_error(self) -> Optional[str]:
         """Read the motion-soft-fail signal a motion node may have set on the blackboard.
@@ -1431,6 +1522,28 @@ class CycleManager:
         self._assert_resumable_stop_scene_unchanged()
         with self._lock:
             if self._state == CycleState.RUNNING:
+                if self._motion_stop_state == "held":
+                    kernel_status = self._kernel.get_status()
+                    if kernel_status.state == ExecutionState.COMPLETED:
+                        ack_completed = self._kernel.acknowledge_completed(
+                            kernel_status.execution_id
+                        )
+                        if not ack_completed.accepted:
+                            raise RuntimeError(
+                                "kernel.acknowledge_completed rejected: "
+                                f"{ack_completed.error}"
+                            )
+                    self._motion_stop_state = "idle"
+                    self._set_resume_after_error_flag(True)
+                    self._set_motion_stop_active_flag(
+                        False,
+                        client_name="cycle_manager_resume_motion_stop",
+                    )
+                    self._error = None
+                    self._error_code = None
+                    self._error_details = None
+                elif self._motion_stop_state == "stopping":
+                    raise RuntimeError("Cannot run: motion stop is still in progress")
                 return  # Already running, no-op
 
             self._error = None
@@ -1454,6 +1567,11 @@ class CycleManager:
                 bb = py_trees.blackboard.Client(name="cycle_manager_resume")
                 bb.register_key(key="stop_requested", access=py_trees.common.Access.WRITE)
                 bb.stop_requested = False
+                self._set_motion_stop_active_flag(
+                    False,
+                    client_name="cycle_manager_resume",
+                )
+                self._motion_stop_state = "idle"
 
                 motion_paused_error = self._read_motion_paused_error()
                 kernel_status = self._kernel.get_status()
@@ -1488,8 +1606,8 @@ class CycleManager:
                 # move's natural end lets the original motion finish on-path
                 # (recommends_natural_completion); the kernel then rests in
                 # COMPLETED — the move reached its goal — rather than STOPPED.
-                # execute() only auto-clears STOPPED/FAILED, so re-dispatching the
-                # held motion node against a COMPLETED kernel is rejected and the
+                # execute() only auto-clears STOPPED, so re-dispatching the held
+                # motion node against a COMPLETED kernel is rejected and the
                 # stop becomes unresumable without a Reset. Acknowledge the
                 # completed execution boundary here so Run clears it, mirroring the
                 # INTERRUPTED/INTERVENTION acks. The held move actually finished,
@@ -1556,21 +1674,74 @@ class CycleManager:
                 self._state = CycleState.RUNNING
 
     def stop(self) -> None:
-        """
-        Stop program execution at the cycle layer — the operator Stop button.
+        """Stop active robot motion while keeping the behavior tree ticking."""
+        with self._lock:
+            if self._state != CycleState.RUNNING:
+                return
+            if self._motion_stop_state in {"stopping", "held"}:
+                return
+            self._motion_stop_state = "stopping"
 
-        The operator Stop is the industrial controlled stop (preempt), not a
-        resumable pause. If RUNNING: set stop_requested=True on BB, suspend the
-        tick thread, and route the in-flight motion through the kernel's
-        controlled stop. State stays STOPPING until the kernel reaches a
-        terminal stop state, then -> STOPPED. If STOPPED or IDLE: no-op.
+        self._set_motion_stop_active_flag(
+            True,
+            client_name="cycle_manager_motion_stop",
+        )
+
+        try:
+            kernel_status = self._kernel.get_status()
+            stoppable = {
+                ExecutionState.EXECUTING,
+                ExecutionState.PLANNING,
+                ExecutionState.VALIDATING,
+                ExecutionState.INTERRUPTED,
+                ExecutionState.PAUSED,
+                ExecutionState.STOPPING,
+            }
+            if kernel_status.state in stoppable:
+                self._kernel.stop()
+            kernel_state = self._kernel.get_status().state
+        except Exception:
+            with self._lock:
+                self._motion_stop_state = "idle"
+            self._set_motion_stop_active_flag(
+                False,
+                client_name="cycle_manager_motion_stop_failed",
+            )
+            raise
+
+        with self._lock:
+            if self._motion_stop_state != "stopping":
+                return
+            if self._kernel_stop_terminal(kernel_state):
+                start_watcher = False
+            else:
+                self._start_motion_stop_watcher_locked()
+                start_watcher = True
+        if not start_watcher:
+            self._complete_motion_stop_from_kernel_state(kernel_state)
+
+    def full_stop(self) -> None:
+        """
+        Stop program execution at the cycle layer — the Full Stop action.
+
+        Full Stop preserves the old whole-cycle quiesce behavior. If RUNNING:
+        set stop_requested=True on BB, suspend the tick thread, and route the
+        in-flight motion through the kernel controlled stop. State stays
+        STOPPING until the kernel reaches a terminal stop state, then -> STOPPED.
+        If STOPPED or IDLE: no-op.
         """
         with self._lock:
             if self._state != CycleState.RUNNING:
                 return  # Not running, no-op
             self._state = CycleState.STOPPING
+            self._motion_stop_state = "idle"
 
-        # Operator Stop is the industrial controlled stop, not a resumable
+        self._set_motion_stop_active_flag(
+            False,
+            client_name="cycle_manager_full_stop",
+        )
+
+        # Full Stop is the industrial controlled stop, not a resumable
         # pause: `stop_if_active` invokes `kernel.stop()` for any active state,
         # which the C++ kernel routes through the operator_stop_profile
         # controlled-stop path (industrial default soft_on_path: a self-computed
@@ -1632,17 +1803,19 @@ class CycleManager:
         """
         Reset program to initial state.
         
-        If RUNNING: stop() first.
+        If RUNNING: full_stop() first.
         Rebuilds the software/runtime scene state for the currently-loaded
         program without teleporting the robot.
         """
         with self._lock:
             if self._state == CycleState.STOPPING:
                 raise RuntimeError("Cannot reset while cycle is stopping")
+            if self._motion_stop_state == "stopping":
+                raise RuntimeError("Cannot reset while motion stop is in progress")
             need_stop = (self._state == CycleState.RUNNING)
 
         if need_stop:
-            self.stop()
+            self.full_stop()
 
         thread_to_join = None
         with self._lock:
@@ -2739,6 +2912,8 @@ class CycleManager:
         """Write stop_requested=False and velocity_scale to blackboard."""
         bb = py_trees.blackboard.Client(name="cycle_manager_init")
         bb.register_key(key="stop_requested", access=py_trees.common.Access.WRITE)
+        bb.register_key(key="motion_stop_active", access=py_trees.common.Access.WRITE)
         bb.register_key(key="velocity_scale", access=py_trees.common.Access.WRITE)
         bb.stop_requested = False
+        bb.motion_stop_active = False
         bb.velocity_scale = self._velocity_scale

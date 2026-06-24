@@ -1,6 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useCycleStore } from '../store/cycleStore';
-import { useRobotCommandAuthority } from '../store/commandAuthority';
+import {
+  ROBOT_COMMAND_AUTHORITY_REASONS,
+  useRobotCommandAuthority,
+} from '../store/commandAuthority';
 import { useSceneStateStore } from '../store/sceneStateStore';
 import { useStatusPolling, useStatusStore } from '../store/statusStore';
 import {
@@ -59,10 +62,12 @@ function requiresExplicitInterventionRecovery(
 export function TransportControls() {
   const {
     state,
+    motionStopState,
     velocityScale,
     errorDetails,
     run,
     stop,
+    fullStop,
     reset,
     acknowledgeInterventionForRetry,
     resetAndRun,
@@ -77,6 +82,7 @@ export function TransportControls() {
   const runtime = useStatusStore((s) => s.runtime);
   const [cycleBusy, setCycleBusy] = useState(false);
   const [stopInProgress, setStopInProgress] = useState(false);
+  const [showFullStopMenu, setShowFullStopMenu] = useState(false);
   const [showRecoveryChoice, setShowRecoveryChoice] = useState(false);
   const [velocityDraft, setVelocityDraft] = useState(velocityScale);
   const pendingVelocityScaleRef = useRef<number | null>(null);
@@ -89,25 +95,35 @@ export function TransportControls() {
   const needsRecoveryChoice = requiresExplicitInterventionRecovery(state, errorDetails);
   // The velocity slider is frozen only while a stop is in flight; after the
   // robot reaches STOPPED the operator may choose the resume scale.
-  const frozen = shouldFreezeVelocitySlider(state, stopInProgress);
+  const frozen = shouldFreezeVelocitySlider(state, stopInProgress, motionStopState);
   const frozenRef = useRef(frozen);
   const wasFrozenRef = useRef(frozen);
   useEffect(() => {
     frozenRef.current = frozen;
   }, [frozen]);
 
-  const running = state === 'running';
-  const stopping = state === 'stopping' || stopInProgress;
+  const motionHeld = state === 'running' && motionStopState === 'held';
+  const running = state === 'running' && motionStopState === 'idle';
+  const stopping = state === 'stopping' || motionStopState === 'stopping' || stopInProgress;
+  const runAuthorityAllowsResume =
+    runAuthority.canCommand ||
+    (
+      motionHeld &&
+      runAuthority.reason === ROBOT_COMMAND_AUTHORITY_REASONS.cycleOwnsRobot
+    );
   const canRun =
-    (state === 'idle' || state === 'stopped') &&
+    (state === 'idle' || state === 'stopped' || motionHeld) &&
     !stopping &&
-    runAuthority.canCommand &&
+    runAuthorityAllowsResume &&
     !stopGate.blocked;
   // Stop applies to in-flight motion the operator can see — BT
   // execution (state==='running') or an intervention / direct-jog
   // session (direct_control).
   const canStop =
-    !stopping && (state === 'running' || state === 'direct_control');
+    !stopping &&
+    motionStopState === 'idle' &&
+    (state === 'running' || state === 'direct_control');
+  const canFullStop = !cycleBusy && state === 'running';
 
   const runCycleCommand = useCallback(
     (command: () => Promise<void>) => {
@@ -199,14 +215,14 @@ export function TransportControls() {
     }
   }, [frozen, velocityScale]);
 
-  // A stop is "in progress" from the moment Stop is pressed until the cycle
-  // settles out of the running/jog state (it then becomes 'stopped', which
-  // freezes on its own). Clearing here avoids latching the flag forever.
+  // A stop is "in progress" from the moment Stop is pressed until motion is
+  // held or the cycle reaches a terminal non-running state. Clearing here
+  // avoids latching the flag forever.
   useEffect(() => {
-    if (shouldClearStopInProgress(state)) {
+    if (shouldClearStopInProgress(state, motionStopState)) {
       setStopInProgress(false);
     }
-  }, [state]);
+  }, [state, motionStopState]);
 
   // Reset is a no-op from idle; from any other state it discards live cycle
   // state (stopped position, latched errors, run context) — give it an
@@ -296,10 +312,12 @@ export function TransportControls() {
           disabled={cycleBusy || !canRun}
           title={
             canRun
-              ? 'Start the loaded program'
+              ? motionHeld
+                ? 'Resume the held motion branch'
+                : 'Start the loaded program'
               : stopGate.blocked && stopGate.reason !== null
                 ? stopGate.reason
-                : runAuthority.reason !== null
+                : runAuthority.reason !== null && !runAuthorityAllowsResume
                   ? runAuthority.reason
                   : stopping
                     ? 'Robot is stopping'
@@ -324,56 +342,104 @@ export function TransportControls() {
               wide as the widest label — no layout shift on state change,
               and it adapts to whatever the labels are. */}
           <span className="grid text-center">
-            <span className={`col-start-1 row-start-1 ${running ? 'invisible' : ''}`}>Run</span>
+            <span className={`col-start-1 row-start-1 ${running || motionHeld ? 'invisible' : ''}`}>Run</span>
             <span className={`col-start-1 row-start-1 ${running ? '' : 'invisible'}`}>Running</span>
+            <span className={`col-start-1 row-start-1 ${motionHeld ? '' : 'invisible'}`}>Resume Motion</span>
           </span>
         </button>
-        <button
-          type="button"
-          onClick={() => {
-            // Freeze the velocity slider immediately on Stop, before the next
-            // status poll reports the stopping/stopped state.
-            setStopInProgress(true);
-            // Stop the active cycle, then force a scene refresh so the
-            // viewer reflects the kStopped pose without waiting a full
-            // poll interval.
-            runCycleCommand(async () => {
-              await stop();
-              try {
-                await useSceneStateStore.getState().refresh();
-              } catch (err) {
-                console.warn('post-stop scene refresh failed', err);
-              }
-            });
-          }}
-          disabled={cycleBusy || !canStop}
-          title={
-            stopping
-              ? 'Stop command is in progress'
-              : canStop
-                ? 'Stop the active cycle'
-                : `Cycle is ${state}`
-          }
-          className={`flex items-center gap-1.5 rounded px-3.5 py-1.5 text-sm font-semibold transition-colors ${
-            canStop && !cycleBusy
-              ? 'bg-red-700 text-white hover:bg-red-600'
-              : stopping
-                ? 'border border-amber-600/70 bg-amber-950/50 text-amber-300'
-              : 'border border-gray-600 bg-gray-800 text-gray-500'
-          } disabled:cursor-not-allowed`}
-        >
-          <svg
-            viewBox="0 0 16 16"
-            className={`h-3 w-3 fill-current ${stopping ? 'animate-pulse' : ''}`}
-            aria-hidden
+        <div className="relative flex">
+          <button
+            type="button"
+            onClick={() => {
+              setShowFullStopMenu(false);
+              // Freeze the velocity slider immediately on Stop, before the next
+              // status poll reports the stopping/stopped state.
+              setStopInProgress(true);
+              // Stop active robot motion, then force a scene refresh so the
+              // viewer reflects the held pose without waiting a full poll interval.
+              runCycleCommand(async () => {
+                await stop();
+                try {
+                  await useSceneStateStore.getState().refresh();
+                } catch (err) {
+                  console.warn('post-stop scene refresh failed', err);
+                }
+              });
+            }}
+            disabled={cycleBusy || !canStop}
+            title={
+              stopping
+                ? 'Stop command is in progress'
+                : canStop
+                  ? 'Stop active robot motion; eligible background branches keep ticking'
+                  : `Cycle is ${state}`
+            }
+            className={`flex items-center gap-1.5 rounded-l px-3.5 py-1.5 text-sm font-semibold transition-colors ${
+              canStop && !cycleBusy
+                ? 'bg-red-700 text-white hover:bg-red-600'
+                : stopping
+                  ? 'border border-amber-600/70 bg-amber-950/50 text-amber-300'
+                : 'border border-gray-600 bg-gray-800 text-gray-500'
+            } disabled:cursor-not-allowed`}
           >
-            <rect x="3" y="3" width="10" height="10" rx="1" />
-          </svg>
-          <span className="grid text-center">
-            <span className={`col-start-1 row-start-1 ${stopping ? 'invisible' : ''}`}>Stop</span>
-            <span className={`col-start-1 row-start-1 ${stopping ? '' : 'invisible'}`}>Stopping</span>
-          </span>
-        </button>
+            <svg
+              viewBox="0 0 16 16"
+              className={`h-3 w-3 fill-current ${stopping ? 'animate-pulse' : ''}`}
+              aria-hidden
+            >
+              <rect x="3" y="3" width="10" height="10" rx="1" />
+            </svg>
+            <span className="grid text-center">
+              <span className={`col-start-1 row-start-1 ${stopping ? 'invisible' : ''}`}>Stop</span>
+              <span className={`col-start-1 row-start-1 ${stopping ? '' : 'invisible'}`}>Stopping</span>
+            </span>
+          </button>
+          <button
+            type="button"
+            disabled={!canFullStop}
+            onClick={() => setShowFullStopMenu((current) => !current)}
+            title="More stop actions. Full Stop halts background tree branches too; use it when the whole program must freeze, not just robot motion."
+            className={`border-l px-2 text-xs font-semibold transition-colors ${
+              canFullStop
+                ? 'rounded-r bg-red-800 text-white hover:bg-red-700'
+                : 'rounded-r border-gray-600 bg-gray-800 text-gray-500'
+            } disabled:cursor-not-allowed`}
+            aria-haspopup="menu"
+            aria-expanded={showFullStopMenu}
+          >
+            v
+          </button>
+          {showFullStopMenu && canFullStop && (
+            <div
+              role="menu"
+              className="absolute bottom-9 right-0 z-40 w-56 rounded-md border border-gray-600 bg-gray-950 p-1 text-xs text-gray-100 shadow-xl"
+            >
+              <button
+                type="button"
+                role="menuitem"
+                className="w-full rounded px-2 py-1.5 text-left hover:bg-red-950/80"
+                title="Stops active motion and halts every behavior-tree branch until Run or Reset."
+                onClick={() => {
+                  setShowFullStopMenu(false);
+                  setStopInProgress(true);
+                  runCycleCommand(async () => {
+                    await fullStop();
+                    try {
+                      await useSceneStateStore.getState().refresh();
+                    } catch (err) {
+                      console.warn('post-full-stop scene refresh failed', err);
+                    }
+                  });
+                }}
+              >
+                <div className="font-semibold">Full Stop</div>
+                <div className="mt-0.5 text-[11px] leading-4 text-gray-400">
+                  Halt background tree branches too.
+                </div>
+              </button>
+            </div>
+          )}
+        </div>
         <button
           type="button"
           onClick={() => {

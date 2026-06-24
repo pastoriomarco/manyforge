@@ -110,6 +110,7 @@ class InspectIsaacSceneClient:
 
         try:
             self._wait_for_request_subscriber(publisher)
+            self._wait_for_response_publisher(subscription)
             message = self._String()
             message.data = json.dumps(query.to_request_payload(), allow_nan=False)
             publisher.publish(message)
@@ -138,6 +139,19 @@ class InspectIsaacSceneClient:
             self._spin_once(deadline)
         raise TimeoutError(
             f"Timed out waiting for subscriber on request topic {self.request_topic}"
+        )
+
+    def _wait_for_response_publisher(self, subscription: object) -> None:
+        deadline = time.monotonic() + self.timeout_s
+        get_publisher_count = getattr(subscription, "get_publisher_count", None)
+        if get_publisher_count is None:
+            return
+        while time.monotonic() < deadline:
+            if get_publisher_count() > 0:
+                return
+            self._spin_once(deadline)
+        raise TimeoutError(
+            f"Timed out waiting for publisher on response topic {self.response_topic}"
         )
 
     def _spin_once(self, deadline: float) -> None:

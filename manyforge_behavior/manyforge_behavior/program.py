@@ -96,12 +96,15 @@ class TreeNode:
     children: list["TreeNode"] = field(default_factory=list)
     modification_policy: dict[str, str] = field(default_factory=dict)
     recovery_policy: dict[str, Any] = field(default_factory=dict)
+    operator_stop_policy: str = "inherit"
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to dict matching program YAML schema."""
         d: dict[str, Any] = {"id": self.id, "name": self.name}
         if self.params:
             d["params"] = self.params
+        if self.operator_stop_policy != "inherit":
+            d["operator_stop_policy"] = self.operator_stop_policy
         if self.modification_policy:
             d["modification_policy"] = self.modification_policy
         if self.recovery_policy:
@@ -114,8 +117,9 @@ class TreeNode:
 def compute_program_tree_hash(tree: TreeNode) -> str:
     """Compute a deterministic SHA-256 hash of the normalized program tree.
 
-    The hash covers node IDs, names, params, modification_policy, and children
-    structure — everything that affects whether a runtime override is valid.
+    The hash covers node IDs, names, params, operator_stop_policy,
+    modification_policy, and children structure — everything that affects
+    whether a runtime override is valid.
     """
     canonical = json.dumps(tree.to_dict(), sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
@@ -165,6 +169,21 @@ _MODIFICATION_POLICY_ALLOWED_VALUES: dict[str, set[str]] = {
     "persistent_edit": {"forbidden", "human_approval", "llm_allowed"},
     "intervention_delegate": {"forbidden", "human_only", "llm_allowed", "program_only"},
 }
+
+OPERATOR_STOP_POLICY_VALUES = frozenset({"inherit", "hold", "continue"})
+
+
+def _parse_operator_stop_policy(raw_policy: Any, *, path: str) -> str:
+    if raw_policy is None:
+        return "inherit"
+    if not isinstance(raw_policy, str):
+        raise ProgramValidationError(f"{path}.operator_stop_policy must be a string")
+    if raw_policy not in OPERATOR_STOP_POLICY_VALUES:
+        allowed = ", ".join(sorted(OPERATOR_STOP_POLICY_VALUES))
+        raise ProgramValidationError(
+            f"{path}.operator_stop_policy must be one of: {allowed}"
+        )
+    return raw_policy
 
 
 def _parse_modification_policy(
@@ -321,6 +340,10 @@ def tree_node_from_dict(
         data.get("recovery_policy"),
         path=path,
     )
+    operator_stop_policy = _parse_operator_stop_policy(
+        data.get("operator_stop_policy"),
+        path=path,
+    )
     return TreeNode(
         id=node_id,
         name=name,
@@ -328,6 +351,7 @@ def tree_node_from_dict(
         children=children,
         modification_policy=modification_policy,
         recovery_policy=recovery_policy,
+        operator_stop_policy=operator_stop_policy,
     )
 
 
@@ -389,6 +413,7 @@ def apply_tree_param_overrides(
         ],
         modification_policy=dict(node.modification_policy),
         recovery_policy=dict(node.recovery_policy),
+        operator_stop_policy=node.operator_stop_policy,
     )
 
 

@@ -387,23 +387,32 @@ export function evaluateStopRunGate(runtime: RuntimeStatus | null): StopRunGate 
  * Whether the velocity-scale slider must be frozen.
  *
  * The slider is frozen while the stop command is in flight, while the backend
- * explicitly reports 'stopping', and for the whole 'stopped' hold — rescaling
- * motion is meaningless/unsafe there. 'idle', 'running' and 'direct_control'
- * keep the slider live unless the local stop latch is active.
+ * explicitly reports 'stopping'. 'idle', 'running', 'stopped', and
+ * 'direct_control' keep the slider live unless the local stop latch is active.
  */
 export function shouldFreezeVelocitySlider(
   cycleState: string,
   stopInProgress: boolean,
+  motionStopState = 'idle',
 ): boolean {
-  return stopInProgress || cycleState === 'stopping';
+  return stopInProgress || cycleState === 'stopping' || motionStopState === 'stopping';
 }
 
 /**
- * Whether the transient stop-in-progress latch should clear. Once the cycle
- * leaves the running/stopping/jog states it has settled — to 'stopped' (which
- * freezes the slider on its own) or 'idle' — so the latch is no longer needed.
+ * Whether the transient stop-in-progress latch should clear. The default Stop
+ * leaves the cycle running and reports motionStopState='held' once robot motion
+ * is stopped; Full Stop and terminal paths leave running/stopping/jog states.
  */
-export function shouldClearStopInProgress(cycleState: string): boolean {
+export function shouldClearStopInProgress(
+  cycleState: string,
+  motionStopState = 'idle',
+): boolean {
+  if (motionStopState === 'held') {
+    return true;
+  }
+  if (motionStopState === 'stopping') {
+    return false;
+  }
   return cycleState !== 'running' &&
     cycleState !== 'stopping' &&
     cycleState !== 'direct_control';

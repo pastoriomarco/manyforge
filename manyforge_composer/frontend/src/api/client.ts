@@ -157,6 +157,7 @@ export const api = {
     status: () => request<CycleStatus>('GET', '/api/cycle/status'),
     run: () => request<CycleCommand>('POST', '/api/cycle/run'),
     stop: () => request<CycleCommand>('POST', '/api/cycle/stop'),
+    fullStop: () => request<CycleCommand>('POST', '/api/cycle/full-stop'),
     reset: () => request<CycleCommand>('POST', '/api/cycle/reset'),
     acknowledgeInterventionForRetry: () =>
       request<CycleCommand>('POST', '/api/cycle/acknowledge-intervention-for-retry'),

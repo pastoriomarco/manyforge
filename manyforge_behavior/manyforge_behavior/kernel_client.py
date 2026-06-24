@@ -932,6 +932,10 @@ class MockKernelClient(KernelClient):
         import time
         self.execute_count += 1
         self.last_execute_request = request
+        if self._state == ExecutionState.STOPPED:
+            self._state = ExecutionState.IDLE
+            self._execution_id = 0
+            self._active_move_id = None
         if self._state != ExecutionState.IDLE:
             return ExecuteResult(ok=False, error="Not in IDLE state")
         if self.fail_next_execute:

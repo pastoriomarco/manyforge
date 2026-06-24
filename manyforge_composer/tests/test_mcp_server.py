@@ -441,7 +441,12 @@ class TestCycleControl:
         assert result["state"] == "running"
 
         result = _call(mcp, "manyforge_cycle_control", {"command": "stop"})
+        assert result["state"] == "running"
+        assert result["motion_stop_state"] == "held"
+
+        result = _call(mcp, "manyforge_cycle_control", {"command": "full_stop"})
         assert result["state"] == "stopped"
+        assert result["motion_stop_state"] == "idle"
 
         result = _call(mcp, "manyforge_cycle_control", {"command": "reset"})
         assert result["state"] == "idle"

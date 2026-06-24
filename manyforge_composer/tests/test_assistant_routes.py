@@ -2307,6 +2307,7 @@ def test_assistant_chat_golden_program_build_matches_expected_draft(
     }
     expected_tree_node = {
         **expected_node,
+        "operatorStopPolicy": "inherit",
         "children": [],
         "modificationPolicy": {},
         "recoveryPolicy": {},

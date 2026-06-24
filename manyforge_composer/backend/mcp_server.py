@@ -395,9 +395,9 @@ def create_mcp_server(state: ComposerState):
         """Control program execution lifecycle.
 
         Args:
-            command: One of "run", "stop", "reset", "status", "velocity"
+            command: One of "run", "stop", "full_stop", "reset", "status", "velocity"
             velocity_scale: Required when command is "velocity" (0.0 to 1.0).
-                           0.0 will stall the robot — use "stop" to pause instead.
+                           0.0 will stall the robot; use "stop" for motion stop.
             principal_id: Optional actor identity for velocity-change audit.
 
         Cycle states include idle, running, stopping, stopped, and
@@ -410,6 +410,7 @@ def create_mcp_server(state: ComposerState):
                 return json.dumps({"state": "idle", "velocity_scale": 1.0})
             return json.dumps({
                 "state": state.cycle_manager.state.value,
+                "motion_stop_state": state.cycle_manager.motion_stop_state,
                 "velocity_scale": state.cycle_manager.velocity_scale,
             })
 
@@ -454,10 +455,22 @@ def create_mcp_server(state: ComposerState):
                 # as structured errors so MCP clients see a consistent shape
                 # rather than an internal exception.
                 return json.dumps({"error": str(exc)})
-            return json.dumps({"state": state.cycle_manager.state.value})
+            return json.dumps({
+                "state": state.cycle_manager.state.value,
+                "motion_stop_state": state.cycle_manager.motion_stop_state,
+            })
         elif command == "stop":
             state.cycle_manager.stop()
-            return json.dumps({"state": state.cycle_manager.state.value})
+            return json.dumps({
+                "state": state.cycle_manager.state.value,
+                "motion_stop_state": state.cycle_manager.motion_stop_state,
+            })
+        elif command == "full_stop":
+            state.cycle_manager.full_stop()
+            return json.dumps({
+                "state": state.cycle_manager.state.value,
+                "motion_stop_state": state.cycle_manager.motion_stop_state,
+            })
         elif command == "reset":
             override_status = state.runtime_override_status()
             if override_status["has_staged"]:
@@ -467,7 +480,10 @@ def create_mcp_server(state: ComposerState):
                     return json.dumps({"error": str(exc)})
             else:
                 state.cycle_manager.reset()
-            return json.dumps({"state": state.cycle_manager.state.value})
+            return json.dumps({
+                "state": state.cycle_manager.state.value,
+                "motion_stop_state": state.cycle_manager.motion_stop_state,
+            })
         elif command == "velocity":
             if velocity_scale is None:
                 return json.dumps({"error": "velocity_scale required for velocity command"})

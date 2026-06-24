@@ -80,6 +80,10 @@ interface ProgramStore {
   selectNode: (id: string | null) => void;
   updateNodeParams: (nodeId: string, params: Record<string, unknown>) => void;
   updateNodeLabel: (nodeId: string, label: string) => void;
+  updateNodeOperatorStopPolicy: (
+    nodeId: string,
+    policy: 'inherit' | 'hold' | 'continue',
+  ) => void;
   updateNodeModificationPolicy: (nodeId: string, policy: Record<string, string>) => void;
   updateProgramParameter: (name: string, patch: Partial<ProgramParameter>) => void;
   addProgramParameter: (parameter: ProgramParameter) => void;
@@ -270,13 +274,14 @@ function collectTreeToFlow(
     type: 'btNode',
     position: { x: 0, y: 0 },
     ...getNodeHandlePositions('vertical'),
-    data: {
-      label: node.name,
-      catalogId: node.id,
-      params: node.params,
-      modificationPolicy: node.modificationPolicy ?? {},
-      recoveryPolicy: node.recoveryPolicy ?? {},
-    },
+      data: {
+        label: node.name,
+        catalogId: node.id,
+        params: node.params,
+        operatorStopPolicy: node.operatorStopPolicy ?? 'inherit',
+        modificationPolicy: node.modificationPolicy ?? {},
+        recoveryPolicy: node.recoveryPolicy ?? {},
+      },
   });
   
   if (parentId) {
@@ -482,6 +487,7 @@ function buildFlowTree(
       catalogId?: string;
       label?: string;
       params?: Record<string, unknown>;
+      operatorStopPolicy?: 'inherit' | 'hold' | 'continue';
       modificationPolicy?: Record<string, string>;
       recoveryPolicy?: Record<string, unknown>;
     };
@@ -489,6 +495,7 @@ function buildFlowTree(
       id: data.catalogId || node.id,
       name: data.label || "",
       params: data.params || {},
+      operatorStopPolicy: data.operatorStopPolicy || 'inherit',
       modificationPolicy: data.modificationPolicy || {},
       recoveryPolicy: data.recoveryPolicy || {},
       children: childIds.map(buildTree),
@@ -747,6 +754,7 @@ export const useProgramStore = create<ProgramStore>((set, get) => ({
         label: catalogId,
         catalogId,
         params: buildDefaultNodeParams(catalogId, get().programInfo?.programProfile ?? null),
+        operatorStopPolicy: 'inherit',
         modificationPolicy: {},
       },
     };
@@ -823,6 +831,18 @@ export const useProgramStore = create<ProgramStore>((set, get) => ({
       nodes: get().nodes.map(node =>
         node.id === nodeId
           ? { ...node, data: { ...node.data, label } }
+          : node
+      ),
+      error: null,
+      isDirty: true,
+    });
+  },
+
+  updateNodeOperatorStopPolicy: (nodeId, policy) => {
+    set({
+      nodes: get().nodes.map(node =>
+        node.id === nodeId
+          ? { ...node, data: { ...node.data, operatorStopPolicy: policy } }
           : node
       ),
       error: null,

@@ -149,7 +149,7 @@ class TestCycleManagerRun:
         # Run then stop
         manager.run()
         time.sleep(0.2)
-        manager.stop()
+        manager.full_stop()
         assert manager.state == CycleState.STOPPED
         
         # Run again — should resume
@@ -171,7 +171,7 @@ class TestCycleManagerRun:
         try:
             manager.run()
             time.sleep(0.2)
-            manager.stop()
+            manager.full_stop()
             assert manager.state == CycleState.STOPPED
 
             result = slow_kernel.scene_edit(
@@ -210,7 +210,7 @@ class TestCycleManagerRun:
             )
             assert attach.success is True
             time.sleep(0.2)
-            manager.stop()
+            manager.full_stop()
             assert manager.state == CycleState.STOPPED
 
             detach = slow_kernel.scene_edit(
@@ -400,7 +400,7 @@ class TestCycleManagerStop:
         assert manager.state == CycleState.RUNNING
         time.sleep(0.05)
         
-        manager.stop()
+        manager.full_stop()
         assert manager.state == CycleState.STOPPED
 
     def test_stop_exposes_stopping_state_and_run_is_noop_until_settled(self):
@@ -426,7 +426,7 @@ class TestCycleManagerStop:
         assert manager.state == CycleState.RUNNING
         time.sleep(0.05)
 
-        stop_thread = threading.Thread(target=manager.stop, daemon=True)
+        stop_thread = threading.Thread(target=manager.full_stop, daemon=True)
         stop_thread.start()
         assert slow_kernel.stop_entered.wait(timeout=2.0)
         assert manager.state == CycleState.STOPPING
@@ -474,7 +474,7 @@ class TestCycleManagerStop:
         assert manager.state == CycleState.RUNNING
         time.sleep(0.05)
 
-        manager.stop()
+        manager.full_stop()
         assert slow_kernel.stop_called.wait(timeout=2.0)
         assert manager.state == CycleState.STOPPING
 
@@ -506,7 +506,7 @@ class TestCycleManagerStop:
         manager._tick_stop_event.wait = recording_wait
         manager.run()
         time.sleep(0.1)
-        manager.stop()
+        manager.full_stop()
         assert manager.state == CycleState.STOPPED
         assert wait_timeouts, (
             "tick loop must sleep via _tick_stop_event.wait(timeout=...), "
@@ -521,11 +521,11 @@ class TestCycleManagerStop:
         
         manager.run()
         time.sleep(0.2)
-        manager.stop()
+        manager.full_stop()
         assert manager.state == CycleState.STOPPED
         
         # Stop again — should be no-op
-        manager.stop()
+        manager.full_stop()
         assert manager.state == CycleState.STOPPED
     
     def test_stop_from_idle_is_noop(self, kernel):
@@ -534,7 +534,7 @@ class TestCycleManagerStop:
         manager = CycleManager(runner, kernel)
         
         assert manager.state == CycleState.IDLE
-        manager.stop()
+        manager.full_stop()
         assert manager.state == CycleState.IDLE
     
     def test_stop_routes_through_controlled_stop_not_pause(self, kernel):
@@ -547,11 +547,193 @@ class TestCycleManagerStop:
 
         manager.run()
         time.sleep(0.05)
-        manager.stop()
+        manager.full_stop()
 
         # Controlled stop, not pause: kernel.stop() invoked, kernel.pause() not.
         assert slow_kernel.stop_count == 1
         assert slow_kernel.pause_count == 0
+
+
+class TestCycleManagerMotionStop:
+    """Test the cooperative operator Motion Stop path."""
+
+    @staticmethod
+    def _parallel_motion_timer_program(timer_duration_s: float = 0.2) -> str:
+        return _write_yaml_file(
+            {
+                "api_version": "manyforge.program.v0",
+                "program_profile": "v0.0",
+                "name": "motion_stop_parallel_test",
+                "description": "Motion stop cooperative ticking test.",
+                "catalog_version": "0.2.0",
+                "robot": {
+                    "robot_id": "ur5",
+                    "group_id": "arm",
+                    "base_frame": "base_link",
+                    "tcp_frame": "tool0",
+                },
+                "tree": {
+                    "id": "parallel",
+                    "name": "root_parallel",
+                    "children": [
+                        {
+                            "id": "move_manipulator_action",
+                            "name": "held_motion",
+                            "params": {
+                                "move_id": "held_motion",
+                                "motion_type": "joint_goal",
+                                "joint_goal_names": ["j1", "j2", "j3", "j4", "j5", "j6"],
+                                "joint_goal_positions_rad": [0.1, -0.8, 0.7, -1.0, -0.9, 0.2],
+                                "planning_timeout_s": 2.0,
+                                "execution_timeout_s": 10.0,
+                            },
+                        },
+                        {
+                            "id": "timer",
+                            "name": "background_wait",
+                            "operator_stop_policy": "continue",
+                            "params": {"duration_s": timer_duration_s},
+                        },
+                    ],
+                },
+            }
+        )
+
+    def test_motion_stop_keeps_cycle_running_and_holds_motion(self):
+        slow_kernel = MockKernelClient(execute_duration_s=1.0)
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, slow_kernel)
+        manager = CycleManager(runner, slow_kernel)
+
+        try:
+            manager.run()
+            deadline = time.time() + 1.0
+            while slow_kernel.execute_count == 0 and time.time() < deadline:
+                time.sleep(0.01)
+            assert slow_kernel.execute_count == 1
+
+            manager.stop()
+
+            deadline = time.time() + 1.0
+            while manager.motion_stop_state != "held" and time.time() < deadline:
+                time.sleep(0.01)
+            assert manager.state == CycleState.RUNNING
+            assert manager.motion_stop_state == "held"
+            assert manager._tick_pause_event.is_set()
+            assert slow_kernel.stop_count == 1
+        finally:
+            manager.full_stop()
+
+    def test_motion_stop_resume_redispatches_held_motion(self):
+        slow_kernel = MockKernelClient(execute_duration_s=1.0)
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, slow_kernel)
+        manager = CycleManager(runner, slow_kernel)
+
+        try:
+            manager.run()
+            deadline = time.time() + 1.0
+            while slow_kernel.execute_count == 0 and time.time() < deadline:
+                time.sleep(0.01)
+            manager.stop()
+            deadline = time.time() + 1.0
+            while manager.motion_stop_state != "held" and time.time() < deadline:
+                time.sleep(0.01)
+            previous_execute_count = slow_kernel.execute_count
+
+            manager.run()
+
+            deadline = time.time() + 1.0
+            while slow_kernel.execute_count == previous_execute_count and time.time() < deadline:
+                time.sleep(0.01)
+            assert manager.state == CycleState.RUNNING
+            assert manager.motion_stop_state == "idle"
+            assert slow_kernel.execute_count > previous_execute_count
+        finally:
+            manager.full_stop()
+
+    def test_motion_stop_resume_acknowledges_natural_completion(self):
+        class NaturalCompletionStopKernel(MockKernelClient):
+            def __init__(self) -> None:
+                super().__init__(execute_duration_s=1.0)
+
+            def stop(self):  # type: ignore[override]
+                self.stop_count += 1
+                if self._state != ExecutionState.EXECUTING:
+                    return CommandResult(
+                        accepted=False, error="Cannot stop from current state"
+                    )
+                self._emit_kernel_event("stop_requested")
+                self._emit_kernel_event(
+                    "state_transition", from_state="executing", to_state="stopping"
+                )
+                self._state = ExecutionState.COMPLETED
+                self._execute_start = None
+                self._metrics["executions_completed"] += 1
+                self._emit_kernel_event("execute_completed")
+                self._emit_kernel_event(
+                    "state_transition", from_state="stopping", to_state="completed"
+                )
+                return CommandResult(accepted=True)
+
+        kernel = NaturalCompletionStopKernel()
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, kernel)
+        manager = CycleManager(runner, kernel)
+
+        try:
+            manager.run()
+            deadline = time.time() + 1.0
+            while kernel.execute_count == 0 and time.time() < deadline:
+                time.sleep(0.01)
+            assert kernel.execute_count == 1
+
+            manager.stop()
+            deadline = time.time() + 1.0
+            while manager.motion_stop_state != "held" and time.time() < deadline:
+                time.sleep(0.01)
+            assert manager.state == CycleState.RUNNING
+            assert manager.motion_stop_state == "held"
+            assert kernel.get_status().state == ExecutionState.COMPLETED
+            previous_execute_count = kernel.execute_count
+
+            manager.run()
+
+            deadline = time.time() + 1.0
+            while kernel.execute_count == previous_execute_count and time.time() < deadline:
+                time.sleep(0.01)
+            assert manager.state == CycleState.RUNNING
+            assert manager.motion_stop_state == "idle"
+            assert kernel.execute_count > previous_execute_count
+            assert manager.error is None
+        finally:
+            manager.full_stop()
+
+    def test_parallel_continue_branch_ticks_while_motion_is_held(self):
+        slow_kernel = MockKernelClient(execute_duration_s=1.0)
+        program_path = self._parallel_motion_timer_program(timer_duration_s=0.2)
+        runner = OrchestratorRunner(CATALOG_PATH, program_path, slow_kernel)
+        manager = CycleManager(runner, slow_kernel)
+
+        try:
+            manager.run()
+            deadline = time.time() + 1.0
+            while slow_kernel.execute_count == 0 and time.time() < deadline:
+                time.sleep(0.01)
+            manager.stop()
+            deadline = time.time() + 1.0
+            while manager.motion_stop_state != "held" and time.time() < deadline:
+                time.sleep(0.01)
+
+            deadline = time.time() + 1.0
+            while (
+                manager.get_node_statuses().get("background_wait") != "SUCCESS"
+                and time.time() < deadline
+            ):
+                time.sleep(0.01)
+            assert manager.state == CycleState.RUNNING
+            assert manager.motion_stop_state == "held"
+            assert manager.get_node_statuses().get("background_wait") == "SUCCESS"
+        finally:
+            manager.full_stop()
+            os.unlink(program_path)
 
 
 class TestCycleManagerReset:
@@ -576,7 +758,7 @@ class TestCycleManagerReset:
         
         manager.run()
         time.sleep(0.2)
-        manager.stop()
+        manager.full_stop()
         assert manager.state == CycleState.STOPPED
         
         manager.reset()
@@ -944,7 +1126,7 @@ class TestCycleManagerVelocityScale:
         bb.register_key(key="stop_requested", access=py_trees.common.Access.READ)
         assert bb.stop_requested == False
         
-        manager.stop()
+        manager.full_stop()
         
         # Check stop flag is True when stopped
         assert bb.stop_requested == True
@@ -1138,7 +1320,7 @@ class TestConcurrentRapidCycles:
             assert manager.state == CycleState.RUNNING
             time.sleep(0.02)  # Let a few ticks execute
 
-            manager.stop()
+            manager.full_stop()
             assert manager.state == CycleState.STOPPED
 
             manager.reset()
@@ -1186,7 +1368,7 @@ class TestConcurrentRapidCycles:
             for _ in range(10):
                 manager.run()
                 time.sleep(0.03)
-                manager.stop()
+                manager.full_stop()
                 manager.reset()
         finally:
             stop_reader.set()
@@ -1236,7 +1418,7 @@ class TestObserverLagIndependence:
         # Key check: the manager is still running and hasn't deadlocked.
         assert manager.state == CycleState.RUNNING
 
-        manager.stop()
+        manager.full_stop()
         manager.reset()
 
 
@@ -1405,7 +1587,7 @@ class TestIntervention:
         manager = self._make_manager(kernel, execute_duration_s=1.0)
         manager.run()
         time.sleep(0.05)
-        manager.stop()
+        manager.full_stop()
         assert manager.state == CycleState.STOPPED
 
         # The tick thread from the main cycle may still be alive (paused).
@@ -1439,7 +1621,7 @@ class TestIntervention:
         try:
             manager.run()
             time.sleep(0.05)
-            manager.stop()
+            manager.full_stop()
             assert manager.state == CycleState.STOPPED
 
             session = manager.execute_intervention(
@@ -1495,7 +1677,7 @@ class TestIntervention:
                 **self._idle_manual_metadata(),
             )
 
-        manager.stop()
+        manager.full_stop()
         manager.reset()
 
     def test_execute_from_stopped_rejects_paused_kernel(self, kernel):
@@ -1511,7 +1693,7 @@ class TestIntervention:
         manager = self._make_manager(kernel, execute_duration_s=1.0)
         manager.run()
         time.sleep(0.05)
-        manager.stop()
+        manager.full_stop()
         # Recreate the soft-fail held-motion condition: cycle STOPPED + kernel
         # PAUSED (the only state the guard protects against now). _make_manager
         # builds its own kernel, so override the manager's actual kernel.
@@ -1551,7 +1733,7 @@ class TestIntervention:
         manager = self._make_manager(kernel, execute_duration_s=1.0)
         manager.run()
         time.sleep(0.05)
-        manager.stop()
+        manager.full_stop()
         manager.reset()
         manager._state = CycleState.STOPPED
 
@@ -1943,7 +2125,7 @@ class TestCycleManagerExplicitInterventionRecovery:
         manager, kernel = self._make_manager()
         manager.run()
         time.sleep(0.1)
-        manager.stop()
+        manager.full_stop()
         assert manager.state == CycleState.STOPPED
 
         # Drive the kernel into INTERVENTION_REQUIRED via direct mutation
@@ -1964,7 +2146,7 @@ class TestCycleManagerExplicitInterventionRecovery:
         manager, kernel = self._make_manager()
         manager.run()
         time.sleep(0.1)
-        manager.stop()
+        manager.full_stop()
         assert manager.state == CycleState.STOPPED
 
         kernel._state = ExecutionState.INTERVENTION_REQUIRED
@@ -1988,7 +2170,7 @@ class TestCycleManagerExplicitInterventionRecovery:
         manager, kernel = self._make_manager()
         manager.run()
         time.sleep(0.1)
-        manager.stop()
+        manager.full_stop()
         assert manager.state == CycleState.STOPPED
 
         kernel._state = ExecutionState.INTERVENTION_REQUIRED
@@ -2017,7 +2199,7 @@ class TestCycleManagerExplicitInterventionRecovery:
         manager, kernel = self._make_manager()
         manager.run()
         time.sleep(0.1)
-        manager.stop()
+        manager.full_stop()
         assert manager.state == CycleState.STOPPED
 
         kernel._state = ExecutionState.INTERVENTION_REQUIRED
@@ -2041,7 +2223,7 @@ class TestCycleManagerExplicitInterventionRecovery:
         manager, kernel = self._make_manager()
         manager.run()
         time.sleep(0.1)
-        manager.stop()
+        manager.full_stop()
         assert manager.state == CycleState.STOPPED
 
         events_before = list(manager.drain_kernel_events_now())

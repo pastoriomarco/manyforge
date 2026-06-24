@@ -144,6 +144,15 @@ const MODIFICATION_POLICY_OPTIONS = {
 
 type ModificationPolicyKey = keyof typeof MODIFICATION_POLICY_OPTIONS;
 
+const OPERATOR_STOP_POLICY_HELP: Record<'inherit' | 'hold' | 'continue', string> = {
+  inherit:
+    'Use the parent/catalog default. Motion nodes normally hold; timers and read-only checks may continue.',
+  hold:
+    'During operator Motion Stop, this subtree returns RUNNING without ticking children or causing side effects.',
+  continue:
+    'During operator Motion Stop, this subtree keeps ticking. Use only for branches that are safe to run while robot motion is held.',
+};
+
 // Hover-tooltip copy for the three policy keys + each of their
 // enum values. Kept short enough to read as a tooltip — the
 // authoritative semantics live in `manyforge_behavior/program.py`
@@ -251,6 +260,49 @@ function ModificationPolicySection({
           );
         })}
       </div>
+    </div>
+  );
+}
+
+function OperatorStopPolicySection({
+  selectedNode,
+  onChange,
+  isRunMode,
+}: {
+  selectedNode: { data: { operatorStopPolicy?: 'inherit' | 'hold' | 'continue' } };
+  onChange: (policy: 'inherit' | 'hold' | 'continue') => void;
+  isRunMode: boolean;
+}) {
+  const value = selectedNode.data.operatorStopPolicy ?? 'inherit';
+  return (
+    <div className="border-t border-gray-800 p-3">
+      <h3
+        className="text-xs uppercase tracking-wide text-gray-400"
+        title="Controls whether this node/subtree keeps ticking during the default operator Stop, which stops robot motion but does not freeze the whole tree."
+      >
+        Operator stop policy
+      </h3>
+      <label className="mt-2 block text-[11px] text-gray-300">
+        <span className="mb-1 block text-gray-400">Motion Stop behavior</span>
+        <select
+          value={value}
+          disabled={isRunMode}
+          onChange={(event) =>
+            onChange(event.target.value as 'inherit' | 'hold' | 'continue')
+          }
+          title={OPERATOR_STOP_POLICY_HELP[value]}
+          className="w-full rounded border border-gray-700 bg-gray-800 px-2 py-1 text-[11px] text-gray-200 disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          {(['inherit', 'hold', 'continue'] as const).map((option) => (
+            <option key={option} value={option} title={OPERATOR_STOP_POLICY_HELP[option]}>
+              {option}
+            </option>
+          ))}
+        </select>
+      </label>
+      <p className="mt-1 text-[10px] leading-4 text-gray-500">
+        Full Stop always freezes the whole tree; this only affects the default Stop button.
+      </p>
     </div>
   );
 }
@@ -458,6 +510,7 @@ export function PropertyPanel({ onCollapse }: { onCollapse: () => void }) {
     blackboardKeys,
     updateNodeParams,
     updateNodeLabel,
+    updateNodeOperatorStopPolicy,
     updateNodeModificationPolicy,
     removeNode,
     addProgramParameter,
@@ -1932,6 +1985,14 @@ export function PropertyPanel({ onCollapse }: { onCollapse: () => void }) {
           </div>
           </>
         )}
+
+        <OperatorStopPolicySection
+          selectedNode={selectedNode}
+          onChange={(policy) =>
+            updateNodeOperatorStopPolicy(selectedNode.id, policy)
+          }
+          isRunMode={isRunMode}
+        />
 
         {/* Modification policy lives at the foot of the card body,
             inside the same scroll container so it's part of the node

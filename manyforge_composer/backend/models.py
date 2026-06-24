@@ -12,6 +12,7 @@ _ALIAS_EXTRA_CFG = ConfigDict(populate_by_name=True, extra="allow")
 class CycleStatusResponse(BaseModel):
     model_config = _ALIAS_CFG
     state: str
+    motion_stop_state: str = Field(default="idle", alias="motionStopState")
     velocity_scale: float = Field(alias="velocityScale")
     # Structured error surface so the viewer can render the actual cause of a
     # runtime fault / restart-blocked condition instead of a generic banner.
@@ -54,7 +55,9 @@ class VelocityScaleResponse(BaseModel):
 
 
 class CycleCommandResponse(BaseModel):
+    model_config = _ALIAS_CFG
     state: str
+    motion_stop_state: str = Field(default="idle", alias="motionStopState")
 
 
 class SimulationResetResponse(BaseModel):
@@ -196,6 +199,10 @@ class TreeNodeResponse(BaseModel):
     id: str
     name: str
     params: Dict[str, Any] = Field(default_factory=dict)
+    operator_stop_policy: Literal["inherit", "hold", "continue"] = Field(
+        default="inherit",
+        alias="operatorStopPolicy",
+    )
     modification_policy: Dict[str, str] = Field(
         default_factory=dict,
         alias="modificationPolicy",
@@ -2049,6 +2056,7 @@ class FileBrowserResponse(BaseModel):
 class StateUpdate(BaseModel):
     model_config = _ALIAS_CFG
     state: str
+    motion_stop_state: str = Field(default="idle", alias="motionStopState")
     velocity_scale: float = Field(alias="velocityScale")
     node_statuses: Dict[str, str] = Field(default_factory=dict, alias="nodeStatuses")
     kernel_events: List[ExecutionEventResponse] = Field(default_factory=list, alias="kernelEvents")

@@ -517,7 +517,7 @@ def test_run_from_idle(client, state):
 
 
 def test_stop_from_running():
-    """Run then stop, verify state=stopped."""
+    """Run then motion-stop, verify the cycle keeps ticking in held motion state."""
     with make_client(execute_duration_s=1.0) as client:
         client.post("/api/program/load", json={"path": _PROGRAM_PATH})
         run_response = client.post("/api/cycle/run")
@@ -527,7 +527,23 @@ def test_stop_from_running():
         response = client.post("/api/cycle/stop")
         assert response.status_code == 200
         data = response.json()
+        assert data["state"] == "running"
+        assert data["motionStopState"] == "held"
+
+
+def test_full_stop_from_running():
+    """Run then full-stop, verify the legacy whole-cycle STOPPED state."""
+    with make_client(execute_duration_s=1.0) as client:
+        client.post("/api/program/load", json={"path": _PROGRAM_PATH})
+        run_response = client.post("/api/cycle/run")
+        assert run_response.status_code == 200
+        assert run_response.json()["state"] == "running"
+
+        response = client.post("/api/cycle/full-stop")
+        assert response.status_code == 200
+        data = response.json()
         assert data["state"] == "stopped"
+        assert data["motionStopState"] == "idle"
 
 
 def test_acknowledge_intervention_for_retry_does_not_reset_backend(client, state):
@@ -536,7 +552,7 @@ def test_acknowledge_intervention_for_retry_does_not_reset_backend(client, state
     state.kernel._execute_duration_s = 1.0  # noqa: SLF001 - keep mock running for stop
     client.post("/api/program/load", json={"path": _PROGRAM_PATH})
     assert client.post("/api/cycle/run").status_code == 200
-    assert client.post("/api/cycle/stop").status_code == 200
+    assert client.post("/api/cycle/full-stop").status_code == 200
 
     assert state.cycle_manager is not None
     kernel = state.cycle_manager._kernel  # noqa: SLF001 - test fixture introspection
@@ -1131,7 +1147,7 @@ def test_simulation_control_route_rejects_active_program_cycle(state):
 
 
 def test_run_from_stopped():
-    """Run, stop, run again, verify state=running."""
+    """Run, motion-stop, run again, verify motion resumes."""
     with make_client(execute_duration_s=1.0) as client:
         client.post("/api/program/load", json={"path": _PROGRAM_PATH})
         first_run = client.post("/api/cycle/run")
@@ -1140,12 +1156,14 @@ def test_run_from_stopped():
 
         stop_response = client.post("/api/cycle/stop")
         assert stop_response.status_code == 200
-        assert stop_response.json()["state"] == "stopped"
+        assert stop_response.json()["state"] == "running"
+        assert stop_response.json()["motionStopState"] == "held"
 
         response = client.post("/api/cycle/run")
         assert response.status_code == 200
         data = response.json()
         assert data["state"] == "running"
+        assert data["motionStopState"] == "idle"
 
 
 def test_velocity_scale(client, state):

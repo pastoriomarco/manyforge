@@ -14,6 +14,7 @@ from manyforge_behavior.program import (
     TreeNode,
     apply_tree_param_overrides,
     compute_program_tree_hash,
+    tree_node_from_dict,
 )
 from manyforge_behavior.skill_loader import SkillCatalog
 
@@ -300,6 +301,29 @@ class TestProgramLoading:
         assert "main_sequence" in names
         assert "move_to_pick" in names
         assert "remove_table" in names
+
+    def test_operator_stop_policy_round_trips(self):
+        node = tree_node_from_dict(
+            {
+                "id": "timer",
+                "name": "background_wait",
+                "operator_stop_policy": "continue",
+                "params": {"duration_s": 1.0},
+            }
+        )
+
+        assert node.operator_stop_policy == "continue"
+        assert node.to_dict()["operator_stop_policy"] == "continue"
+
+    def test_operator_stop_policy_rejects_unknown_value(self):
+        with pytest.raises(ProgramValidationError, match="operator_stop_policy"):
+            tree_node_from_dict(
+                {
+                    "id": "timer",
+                    "name": "bad_background_wait",
+                    "operator_stop_policy": "background",
+                }
+            )
 
     def _collect_names(self, node, names):
         names.append(node.name)
@@ -2103,6 +2127,15 @@ class TestComputeProgramTreeHash:
     def test_modification_policy_affects_hash(self):
         t1 = TreeNode(id="move_to_waypoint", name="m")
         t2 = TreeNode(id="move_to_waypoint", name="m", modification_policy={"runtime_override": "llm_allowed"})
+        assert compute_program_tree_hash(t1) != compute_program_tree_hash(t2)
+
+    def test_operator_stop_policy_affects_hash(self):
+        t1 = TreeNode(id="timer", name="background_wait")
+        t2 = TreeNode(
+            id="timer",
+            name="background_wait",
+            operator_stop_policy="continue",
+        )
         assert compute_program_tree_hash(t1) != compute_program_tree_hash(t2)
 
     def test_hash_is_hex_sha256(self):

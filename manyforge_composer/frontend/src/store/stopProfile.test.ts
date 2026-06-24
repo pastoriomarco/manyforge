@@ -354,6 +354,7 @@ describe('shouldClearStopInProgress', () => {
   it('clears the latch once the cycle has settled to stopped or idle', () => {
     expect(shouldClearStopInProgress('stopped')).toBe(true);
     expect(shouldClearStopInProgress('idle')).toBe(true);
+    expect(shouldClearStopInProgress('running', 'held')).toBe(true);
   });
 });
 

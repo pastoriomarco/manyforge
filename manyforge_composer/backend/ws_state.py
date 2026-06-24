@@ -111,6 +111,11 @@ class StateHub:
                         ).model_dump(by_alias=True)
                     data = StateUpdate(
                         state=self._state.cycle_manager.state.value,
+                        motionStopState=getattr(
+                            self._state.cycle_manager,
+                            "motion_stop_state",
+                            "idle",
+                        ),
                         velocityScale=self._state.cycle_manager.velocity_scale,
                         nodeStatuses=self._state.cycle_manager.get_node_statuses(),
                         kernelEvents=kernel_events,
@@ -131,6 +136,7 @@ class StateHub:
                         ).model_dump(by_alias=True)
                     data = StateUpdate(
                         state="idle",
+                        motionStopState="idle",
                         velocityScale=1.0,
                         nodeStatuses={},
                         kernelEvents=kernel_events,

@@ -1,6 +1,7 @@
 // Cycle
 export interface CycleStatus {
   state: 'idle' | 'running' | 'stopping' | 'stopped' | 'direct_control';
+  motionStopState?: 'idle' | 'stopping' | 'held';
   velocityScale: number;
   // Structured error surface: empty when no error is active. `errorCode` is
   // a stable machine token (e.g. "validation_collision",
@@ -14,6 +15,7 @@ export interface CycleStatus {
 
 export interface CycleCommand {
   state: string;
+  motionStopState?: 'idle' | 'stopping' | 'held';
 }
 
 export interface VelocityScaleResponse {
@@ -116,6 +118,7 @@ export interface TreeNode {
   id: string;
   name: string;
   params: Record<string, unknown>;
+  operatorStopPolicy?: 'inherit' | 'hold' | 'continue';
   modificationPolicy?: Record<string, string>;
   recoveryPolicy?: Record<string, unknown>;
   children: TreeNode[];
@@ -1130,6 +1133,7 @@ export interface ModelEndpointCatalog {
 // WebSocket
 export interface StateUpdate {
   state: 'idle' | 'running' | 'stopping' | 'stopped' | 'direct_control';
+  motionStopState?: 'idle' | 'stopping' | 'held';
   velocityScale: number;
   nodeStatuses?: Record<string, string>;
   nativeKernelEvents?: Record<string, unknown>[];

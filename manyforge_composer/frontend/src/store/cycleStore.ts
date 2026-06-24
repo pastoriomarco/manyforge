@@ -35,15 +35,17 @@ function structuredErrorFromException(e: unknown): {
 
 type CycleStatePatch = Pick<
   CycleStore,
-  'state' | 'velocityScale' | 'error' | 'errorCode' | 'errorDetails'
+  'state' | 'motionStopState' | 'velocityScale' | 'error' | 'errorCode' | 'errorDetails'
 >;
 
 function cycleStatePatchFromCommand(
   state: string,
-): Pick<CycleStore, 'state' | 'error' | 'errorCode' | 'errorDetails'> {
+  motionStopState: CycleStore['motionStopState'] = 'idle',
+): Pick<CycleStore, 'state' | 'motionStopState' | 'error' | 'errorCode' | 'errorDetails'> {
   const parsed = coerceCycleStateFailClosed(state);
   return {
     state: parsed.state,
+    motionStopState,
     error: parsed.error,
     errorCode: null,
     errorDetails: null,
@@ -54,6 +56,7 @@ function cycleStatePatchFromStatus(status: CycleStatus): CycleStatePatch {
   const parsed = coerceCycleStateFailClosed(status.state);
   return {
     state: parsed.state,
+    motionStopState: status.motionStopState ?? 'idle',
     velocityScale: status.velocityScale,
     error: parsed.error ?? status.error ?? null,
     errorCode: status.errorCode ?? null,
@@ -105,6 +108,7 @@ function startStatusFallbackPoll(
 
 interface CycleStore {
   state: CycleStatus['state'];
+  motionStopState: NonNullable<CycleStatus['motionStopState']>;
   velocityScale: number;
   nodeStatuses: Record<string, string>;
   programLoaded: boolean;
@@ -119,6 +123,7 @@ interface CycleStore {
   // Actions
   run: () => Promise<void>;
   stop: () => Promise<void>;
+  fullStop: () => Promise<void>;
   reset: () => Promise<void>;
   acknowledgeInterventionForRetry: () => Promise<void>;
   resetAndRun: () => Promise<void>;
@@ -133,6 +138,7 @@ interface CycleStore {
 
 export const useCycleStore = create<CycleStore>((set, get) => ({
   state: 'idle',
+  motionStopState: 'idle',
   velocityScale: 1.0,
   nodeStatuses: {},
   programLoaded: false,
@@ -145,7 +151,7 @@ export const useCycleStore = create<CycleStore>((set, get) => ({
   run: async () => {
     try {
       const result = await api.cycle.run();
-      set(cycleStatePatchFromCommand(result.state));
+      set(cycleStatePatchFromCommand(result.state, result.motionStopState));
     } catch (e) {
       const s = structuredErrorFromException(e);
       set({ error: s.message, errorCode: s.errorCode, errorDetails: s.errorDetails });
@@ -155,7 +161,17 @@ export const useCycleStore = create<CycleStore>((set, get) => ({
   stop: async () => {
     try {
       const result = await api.cycle.stop();
-      set(cycleStatePatchFromCommand(result.state));
+      set(cycleStatePatchFromCommand(result.state, result.motionStopState));
+    } catch (e) {
+      const s = structuredErrorFromException(e);
+      set({ error: s.message, errorCode: s.errorCode, errorDetails: s.errorDetails });
+    }
+  },
+
+  fullStop: async () => {
+    try {
+      const result = await api.cycle.fullStop();
+      set(cycleStatePatchFromCommand(result.state, result.motionStopState));
     } catch (e) {
       const s = structuredErrorFromException(e);
       set({ error: s.message, errorCode: s.errorCode, errorDetails: s.errorDetails });
@@ -165,7 +181,7 @@ export const useCycleStore = create<CycleStore>((set, get) => ({
   reset: async () => {
     try {
       const result = await api.cycle.reset();
-      set(cycleStatePatchFromCommand(result.state));
+      set(cycleStatePatchFromCommand(result.state, result.motionStopState));
       const programStore = useProgramStore.getState();
       if (get().programLoaded || programStore.programInfo !== null) {
         await Promise.all([
@@ -182,7 +198,7 @@ export const useCycleStore = create<CycleStore>((set, get) => ({
   acknowledgeInterventionForRetry: async () => {
     try {
       const result = await api.cycle.acknowledgeInterventionForRetry();
-      set(cycleStatePatchFromCommand(result.state));
+      set(cycleStatePatchFromCommand(result.state, result.motionStopState));
     } catch (e) {
       const s = structuredErrorFromException(e);
       set({ error: s.message, errorCode: s.errorCode, errorDetails: s.errorDetails });
@@ -193,7 +209,7 @@ export const useCycleStore = create<CycleStore>((set, get) => ({
   resetAndRun: async () => {
     try {
       const resetResult = await api.cycle.reset();
-      set(cycleStatePatchFromCommand(resetResult.state));
+      set(cycleStatePatchFromCommand(resetResult.state, resetResult.motionStopState));
       const programStore = useProgramStore.getState();
       if (get().programLoaded || programStore.programInfo !== null) {
         await Promise.all([
@@ -202,7 +218,7 @@ export const useCycleStore = create<CycleStore>((set, get) => ({
         ]);
       }
       const runResult = await api.cycle.run();
-      set(cycleStatePatchFromCommand(runResult.state));
+      set(cycleStatePatchFromCommand(runResult.state, runResult.motionStopState));
     } catch (e) {
       const s = structuredErrorFromException(e);
       set({ error: s.message, errorCode: s.errorCode, errorDetails: s.errorDetails });
@@ -244,6 +260,7 @@ export const useCycleStore = create<CycleStore>((set, get) => ({
       const parsed = coerceCycleStateFailClosed(update.state);
       set({
         state: parsed.state,
+        motionStopState: update.motionStopState ?? 'idle',
         velocityScale: update.velocityScale,
         nodeStatuses: update.nodeStatuses || {},
         programLoaded: update.programLoaded ?? false,

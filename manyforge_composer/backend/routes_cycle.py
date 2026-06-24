@@ -75,6 +75,7 @@ def create_cycle_router(state: ComposerState) -> APIRouter:
         if state.cycle_manager is None:
             return {
                 "state": "idle",
+                "motionStopState": "idle",
                 "velocityScale": 1.0,
                 "error": None,
                 "errorCode": None,
@@ -84,6 +85,7 @@ def create_cycle_router(state: ComposerState) -> APIRouter:
         error, error_code, error_details = active_cycle_error_fields(manager)
         return {
             "state": manager.state.value,
+            "motionStopState": getattr(manager, "motion_stop_state", "idle"),
             "velocityScale": manager.velocity_scale,
             "error": error,
             "errorCode": error_code,
@@ -162,11 +164,14 @@ def create_cycle_router(state: ComposerState) -> APIRouter:
                 detail=_structured_command_error(state, str(exc)),
             )
         logger.info("Cycle state: %s → %s", prev, state.cycle_manager.state.value)
-        return {"state": state.cycle_manager.state.value}
+        return {
+            "state": state.cycle_manager.state.value,
+            "motionStopState": state.cycle_manager.motion_stop_state,
+        }
 
     @router.post("/stop", response_model=CycleCommandResponse, response_model_by_alias=True)
     def stop_cycle() -> dict:
-        """Pause/hold the cycle (RUNNING→STOPPED); hard kernel stop is separate."""
+        """Stop active robot motion while eligible tree branches keep ticking."""
         if state.cycle_manager is None:
             raise HTTPException(
                 status_code=409,
@@ -177,7 +182,32 @@ def create_cycle_router(state: ComposerState) -> APIRouter:
         prev = state.cycle_manager.state.value
         state.cycle_manager.stop()
         logger.info("Cycle state: %s → %s", prev, state.cycle_manager.state.value)
-        return {"state": state.cycle_manager.state.value}
+        return {
+            "state": state.cycle_manager.state.value,
+            "motionStopState": state.cycle_manager.motion_stop_state,
+        }
+
+    @router.post("/full-stop", response_model=CycleCommandResponse, response_model_by_alias=True)
+    def full_stop_cycle() -> dict:
+        """Quiesce the whole cycle (RUNNING→STOPPING→STOPPED)."""
+        if state.cycle_manager is None:
+            raise HTTPException(
+                status_code=409,
+                detail=_structured_command_error(
+                    state, "No program loaded", error_code="no_program_loaded"
+                ),
+            )
+        prev = state.cycle_manager.state.value
+        state.cycle_manager.full_stop()
+        logger.info(
+            "Cycle full-stop state: %s → %s",
+            prev,
+            state.cycle_manager.state.value,
+        )
+        return {
+            "state": state.cycle_manager.state.value,
+            "motionStopState": state.cycle_manager.motion_stop_state,
+        }
 
     @router.post("/reset", response_model=CycleCommandResponse, response_model_by_alias=True)
     def reset_cycle() -> dict:
@@ -216,7 +246,10 @@ def create_cycle_router(state: ComposerState) -> APIRouter:
             )
         _refresh_visual_scene_after_reset(state)
         logger.info("Cycle state: %s → %s", prev, state.cycle_manager.state.value)
-        return {"state": state.cycle_manager.state.value}
+        return {
+            "state": state.cycle_manager.state.value,
+            "motionStopState": state.cycle_manager.motion_stop_state,
+        }
 
     @router.post(
         "/acknowledge-intervention-for-retry",
@@ -248,7 +281,10 @@ def create_cycle_router(state: ComposerState) -> APIRouter:
             prev,
             state.cycle_manager.state.value,
         )
-        return {"state": state.cycle_manager.state.value}
+        return {
+            "state": state.cycle_manager.state.value,
+            "motionStopState": state.cycle_manager.motion_stop_state,
+        }
 
     @router.put("/velocity-scale", response_model=VelocityScaleResponse, response_model_by_alias=True)
     def set_velocity_scale(request: VelocityScaleRequest) -> dict:
