@@ -789,15 +789,15 @@ def test_ros2_control_backend_documents_lock_order_contract():
     repo_root = Path(__file__).resolve().parents[2]
     header = (
         repo_root
-        / "manyforge_roboplan"
+        / "manyforge_ros2_control_execution"
         / "include"
-        / "manyforge_roboplan"
+        / "manyforge_ros2_control_execution"
         / "ros2_control_execution_backend.hpp"
     ).read_text()
 
     assert "Lock-order contract:" in header
     assert "Do not hold state_mutex_ while taking execution_mutex_" in header
-    assert "best-effort scene updates" in header
+    assert "best-effort execution-state sink updates" in header
 
 
 def test_ros2_control_monitor_exits_promptly_after_stop_confirmation():

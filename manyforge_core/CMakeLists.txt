@@ -51,6 +51,11 @@ if(BUILD_TESTING)
   gtest_discover_tests(test_contracts_compile
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
+  add_executable(test_execution_state_sink test/test_execution_state_sink.cpp)
+  target_link_libraries(test_execution_state_sink PRIVATE manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_execution_state_sink
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
   add_executable(test_fake_clock test/test_fake_clock.cpp)
   target_link_libraries(test_fake_clock PRIVATE manyforge_core GTest::gtest_main)
   gtest_discover_tests(test_fake_clock

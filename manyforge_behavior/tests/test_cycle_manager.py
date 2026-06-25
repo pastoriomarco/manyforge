@@ -781,6 +781,31 @@ class TestCycleManagerReset:
         # Kernel reset is not used as a synthetic state-assignment path when already idle.
         assert kernel.reset_count == initial_reset_count
 
+    def test_reset_refusal_is_not_reported_as_idle(self):
+        """A refused kernel reset must stay visible; CycleManager must not
+        force a fresh IDLE cycle over an uncleared kernel fault."""
+
+        class RefusingResetKernel(MockKernelClient):
+            def reset(self):  # type: ignore[override]
+                self.reset_count += 1
+                return CommandResult(
+                    accepted=False,
+                    error="reset refused by test",
+                    reason_code="test_reset_refused",
+                )
+
+        refused_kernel = RefusingResetKernel()
+        refused_kernel._state = ExecutionState.INTERVENTION_REQUIRED
+        runner = OrchestratorRunner(CATALOG_PATH, FIXTURE_PATH, refused_kernel)
+        manager = CycleManager(runner, refused_kernel)
+
+        manager.reset()
+
+        assert manager.state == CycleState.STOPPED
+        assert manager.error == "reset refused by test"
+        assert manager.error_code == "test_reset_refused"
+        assert refused_kernel.reset_count == 1
+
     def test_reset_removes_runtime_added_scene_objects(self, kernel):
         """Reset must clear scene objects that were added at runtime so the
         planning scene matches the operator's authored intent. Without this,
@@ -2002,12 +2027,18 @@ class TestRecoveryTriggerTaxonomy:
 # --- ros2_control backend fault taxonomy (audit Phase 6A) ---
 
 
-_ROS2_CONTROL_FAULT_REASON_HEADER = (
-    Path(__file__).parent.parent.parent
+_WORKSPACE_ROOT = Path(__file__).parent.parent.parent
+_ROS2_CONTROL_FAULT_REASON_HEADERS = (
+    _WORKSPACE_ROOT
+    / "manyforge_ros2_control_execution"
+    / "include"
+    / "manyforge_ros2_control_execution"
+    / "ros2_control_capability.hpp",
+    _WORKSPACE_ROOT
     / "manyforge_roboplan"
     / "include"
     / "manyforge_roboplan"
-    / "ros2_control_capability.hpp"
+    / "ros2_control_capability.hpp",
 )
 
 
@@ -2026,13 +2057,21 @@ class TestRos2ControlBackendFaultTaxonomy:
     def _header_reason_tokens() -> set[str]:
         import re
 
-        assert _ROS2_CONTROL_FAULT_REASON_HEADER.is_file(), (
-            "ros2_control_capability.hpp not found at "
-            f"{_ROS2_CONTROL_FAULT_REASON_HEADER}; the taxonomy parity test "
-            "requires the monorepo layout (manyforge_roboplan next to "
-            "manyforge_behavior)."
+        header = next(
+            (
+                candidate
+                for candidate in _ROS2_CONTROL_FAULT_REASON_HEADERS
+                if candidate.is_file()
+            ),
+            None,
         )
-        text = _ROS2_CONTROL_FAULT_REASON_HEADER.read_text(encoding="utf-8")
+        assert header is not None, (
+            "ros2_control_capability.hpp not found at any expected location: "
+            f"{', '.join(str(path) for path in _ROS2_CONTROL_FAULT_REASON_HEADERS)}; "
+            "the taxonomy parity test requires the monorepo layout with the "
+            "ros2_control execution package next to manyforge_behavior."
+        )
+        text = header.read_text(encoding="utf-8")
         match = re.search(
             r"namespace ros2_control_fault_reason \{(.*?)\}\s*//\s*namespace"
             r"\s+ros2_control_fault_reason",
@@ -2041,7 +2080,7 @@ class TestRos2ControlBackendFaultTaxonomy:
         )
         assert match, (
             "namespace ros2_control_fault_reason not found in "
-            "ros2_control_capability.hpp — the 6A taxonomy moved; update "
+            f"{header} — the 6A taxonomy moved; update "
             "this parity test alongside it."
         )
         tokens = set(re.findall(r'"([a-z0-9_]+)"', match.group(1)))

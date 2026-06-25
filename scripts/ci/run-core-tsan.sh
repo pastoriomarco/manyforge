@@ -5,6 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 BUILD_DIR="${BUILD_DIR:-${REPO_ROOT}/build/tsan-manyforge-core}"
 PARALLEL="${CMAKE_BUILD_PARALLEL_LEVEL:-2}"
+GTEST_TIMEOUT_SECONDS="${MANYFORGE_TSAN_GTEST_TIMEOUT_SECONDS:-300}"
 
 # `-Wno-error=array-bounds` works around a known gcc-13 false positive on
 # `std::vector<T>::push_back` where the inner element is itself a small
@@ -18,6 +19,7 @@ cmake \
   -B "${BUILD_DIR}" \
   -DBUILD_TESTING=ON \
   -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+  -DMANYFORGE_GTEST_TIMEOUT_SECONDS="${GTEST_TIMEOUT_SECONDS}" \
   -DCMAKE_CXX_FLAGS="-fsanitize=thread -fno-omit-frame-pointer -g -Wno-error=array-bounds" \
   -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread" \
   -DCMAKE_SHARED_LINKER_FLAGS="-fsanitize=thread"

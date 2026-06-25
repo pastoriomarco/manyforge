@@ -50,7 +50,7 @@ if(MANYFORGE_ENABLE_ROS2_CONTROL)
   find_package(trajectory_msgs REQUIRED)
   find_package(builtin_interfaces REQUIRED)
   list(APPEND _MANYFORGE_ROS2_CONTROL_SOURCES
-    src/ros2_control_execution_backend.cpp)
+    src/ros2_control_kernel_factory.cpp)
 endif()
 
 if(NOT fmt_FOUND)
@@ -68,6 +68,14 @@ if(NOT TARGET manyforge_core)
                    ${CMAKE_CURRENT_BINARY_DIR}/manyforge_core)
 endif()
 
+# Planner-neutral ros2_control execution boundary. This sibling package is
+# included from the RoboPlan composition build for now, but it must remain free
+# of RoboPlan/Pinocchio/collision dependencies.
+if(MANYFORGE_ENABLE_ROS2_CONTROL AND NOT TARGET manyforge_ros2_control_execution)
+  add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_ros2_control_execution
+                   ${CMAKE_CURRENT_BINARY_DIR}/manyforge_ros2_control_execution)
+endif()
+
 # manyforge_collision is a neutral ManyForge-owned module. This package links
 # it only at the composition boundary (NativeKernelFactory) so kernels created
 # through the RoboPlan adapter can receive the authoritative ManyForge
@@ -83,7 +91,7 @@ add_library(manyforge_roboplan
   src/roboplan_planner_backend.cpp
   src/roboplan_planning_context.cpp
   src/roboplan_execution_backend.cpp
-  src/ros2_control_capability.cpp
+  src/roboplan_execution_state_sink.cpp
   src/native_kernel_factory.cpp
   src/collision_body_id_mapper.cpp
   ${_MANYFORGE_ROS2_CONTROL_SOURCES}
@@ -108,6 +116,8 @@ target_link_libraries(manyforge_roboplan
 )
 
 if(MANYFORGE_ENABLE_ROS2_CONTROL)
+  target_link_libraries(manyforge_roboplan
+    manyforge_ros2_control_execution)
   target_compile_definitions(manyforge_roboplan PUBLIC MANYFORGE_ROS2_CONTROL_ENABLED)
   ament_target_dependencies(manyforge_roboplan
     rclcpp
@@ -141,14 +151,6 @@ if(BUILD_TESTING)
     target_link_libraries(test_native_backends PRIVATE
       manyforge_roboplan GTest::gtest_main)
 
-    # Phase 4.5D-4: pure capability-helper tests for the ros2_control
-    # adapter. The helper is a static function on
-    # Ros2ControlExecutionBackend that inspects a config and returns
-    # the capability set; no ROS runtime required.
-    add_executable(test_ros2_capability test/test_ros2_capability.cpp)
-    target_link_libraries(test_ros2_capability PRIVATE
-      manyforge_roboplan GTest::gtest_main)
-
     add_executable(test_collision_body_id_mapper
       test/test_collision_body_id_mapper.cpp)
     target_link_libraries(test_collision_body_id_mapper PRIVATE
@@ -160,6 +162,11 @@ if(BUILD_TESTING)
     add_executable(test_collision_world_publisher
       test/test_collision_world_publisher.cpp)
     target_link_libraries(test_collision_world_publisher PRIVATE
+      manyforge_roboplan GTest::gtest_main)
+
+    add_executable(test_roboplan_execution_state_sink
+      test/test_roboplan_execution_state_sink.cpp)
+    target_link_libraries(test_roboplan_execution_state_sink PRIVATE
       manyforge_roboplan GTest::gtest_main)
 
     # Informational perf measurement for the collision-ownership Chunk 1
@@ -194,12 +201,6 @@ if(BUILD_TESTING)
         TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS}
       DISCOVERY_EXTRA_ARGS --gtest_filter=*)
 
-    gtest_discover_tests(test_ros2_capability
-      PROPERTIES
-        ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
-        TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS}
-      DISCOVERY_EXTRA_ARGS --gtest_filter=*)
-
     gtest_discover_tests(test_collision_body_id_mapper
       PROPERTIES
         ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
@@ -207,6 +208,12 @@ if(BUILD_TESTING)
       DISCOVERY_EXTRA_ARGS --gtest_filter=*)
 
     gtest_discover_tests(test_collision_world_publisher
+      PROPERTIES
+        ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
+        TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS}
+      DISCOVERY_EXTRA_ARGS --gtest_filter=*)
+
+    gtest_discover_tests(test_roboplan_execution_state_sink
       PROPERTIES
         ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
         TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS}

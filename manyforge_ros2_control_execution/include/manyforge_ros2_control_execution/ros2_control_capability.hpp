@@ -10,7 +10,7 @@
 #include <manyforge_core/types/error_code.hpp>
 #include <manyforge_core/types/motion_interrupt.hpp>
 
-namespace manyforge::roboplan_backend {
+namespace manyforge::ros2_control_execution {
 
 struct Ros2ControlExecutionBackendConfig {
   std::string node_name = "manyforge_ros2_control_execution_backend";
@@ -168,4 +168,4 @@ core::ErrorDTO make_ros2_control_fault_error(
     std::string reason_code,
     std::map<std::string, std::string> details = {});
 
-}  // namespace manyforge::roboplan_backend
+}  // namespace manyforge::ros2_control_execution

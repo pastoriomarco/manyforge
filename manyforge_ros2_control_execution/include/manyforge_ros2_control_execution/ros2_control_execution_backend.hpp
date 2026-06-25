@@ -21,26 +21,24 @@
 #endif
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_action/rclcpp_action.hpp>
-#include <roboplan/core/scene.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
 #include <std_msgs/msg/bool.hpp>
 #include <trajectory_msgs/msg/joint_trajectory_point.hpp>
 
 #include <manyforge_core/execution_kernel.hpp>
 #include <manyforge_core/ports/iexecution_backend.hpp>
+#include <manyforge_core/ports/iexecution_state_sink.hpp>
 #include <manyforge_core/time/iclock.hpp>
-#include <manyforge_roboplan/ros2_control_capability.hpp>
+#include <manyforge_ros2_control_execution/ros2_control_capability.hpp>
 
-namespace manyforge::roboplan_backend {
-
-struct NativeKernelBundle;
+namespace manyforge::ros2_control_execution {
 
 struct Ros2GripperActionConfig {
   std::string action_name = "/robotiq_gripper_controller/gripper_cmd";
-  // Optional RoboPlan scene projection metadata. When set, the ROS gripper
-  // command/status path also updates the declared gripper group so Composer's
-  // FK/link-pose scene state renders the gripper through the same robot-state
-  // path as the arm.
+  // Optional execution-state sink projection metadata. When set, the ROS
+  // gripper command/status path also updates the declared gripper group so
+  // Composer's FK/link-pose scene state renders the gripper through the same
+  // robot-state path as the arm.
   std::string group_id;
   std::string joint_name;
   double wait_for_action_server_timeout_s = 2.0;
@@ -75,18 +73,17 @@ struct Ros2GripperStatus {
 /// Lock-order contract:
 /// - Do not hold state_mutex_ while taking execution_mutex_.
 /// - Do not hold gripper_map_mutex_ while taking execution_mutex_ or state_mutex_.
-/// - scene_mutex_ is an external RoboPlan-scene lock; monitor/callback paths
-///   must use best-effort scene updates so long validation sweeps cannot block
-///   reset/stop completion.
+/// - monitor/callback paths must use best-effort execution-state sink updates
+///   so long validation sweeps cannot block reset/stop completion.
 /// - Per-GripperRuntime::mutex is taken only after gripper_map_mutex_ has been
 ///   released, using a copied shared_ptr to the runtime.
 class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
  public:
-  Ros2ControlExecutionBackend(std::shared_ptr<roboplan::Scene> scene,
+  Ros2ControlExecutionBackend(std::shared_ptr<core::IExecutionStateSink>
+                                  execution_state_sink,
                               std::string group_name,
                               core::IClock& clock,
-                              Ros2ControlExecutionBackendConfig config,
-                              std::shared_ptr<std::mutex> scene_mutex = nullptr);
+                              Ros2ControlExecutionBackendConfig config);
   ~Ros2ControlExecutionBackend() override;
 
   core::ExecutionHandle execute_trajectory(const core::TrajectoryDTO& trajectory) override;
@@ -344,11 +341,10 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
       const GoalHandleGripper::WrappedResult& result);
   void cancel_all_gripper_commands();
 
-  std::shared_ptr<roboplan::Scene> scene_;
+  std::shared_ptr<core::IExecutionStateSink> execution_state_sink_;
   std::string group_name_;
   core::IClock& clock_;
   Ros2ControlExecutionBackendConfig config_;
-  std::shared_ptr<std::mutex> scene_mutex_;
 
   std::shared_ptr<rclcpp::Context> context_;
   rclcpp::Node::SharedPtr node_;
@@ -455,13 +451,4 @@ class Ros2ControlExecutionBackend final : public core::IExecutionBackend {
   std::optional<core::ErrorDTO> controlled_stop_path_deviation_error_;
 };
 
-std::shared_ptr<NativeKernelBundle> create_ros2_control_kernel(
-    const std::string& model_name,
-    const std::string& group_name,
-    const std::string& urdf_path,
-    const std::string& srdf_path,
-    const std::vector<std::string>& package_paths,
-    const Ros2ControlExecutionBackendConfig& ros_config,
-    const core::ExecutionKernelConfig& kernel_config = {});
-
-}  // namespace manyforge::roboplan_backend
+}  // namespace manyforge::ros2_control_execution

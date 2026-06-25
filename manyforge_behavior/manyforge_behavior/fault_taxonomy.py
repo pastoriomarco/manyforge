@@ -44,10 +44,11 @@ def _fault_class(reason_code: str, severity: str) -> BackendFaultClass:
     )
 
 
-# Keyed by `details.reason_code` as emitted by the ros2_control backend
-# (manyforge_roboplan/include/manyforge_roboplan/ros2_control_capability.hpp,
-# namespace ros2_control_fault_reason). A parity test in
-# tests/test_cycle_manager.py parses that header and fails on drift.
+# Keyed by `details.reason_code` as emitted by the ros2_control execution
+# backend
+# (manyforge_ros2_control_execution/include/manyforge_ros2_control_execution/
+# ros2_control_capability.hpp, namespace ros2_control_fault_reason). A parity
+# test in tests/test_cycle_manager.py parses that header and fails on drift.
 ROS2_CONTROL_BACKEND_FAULT_CLASSES: dict[str, BackendFaultClass] = {
     fault.reason_code: fault
     for fault in (

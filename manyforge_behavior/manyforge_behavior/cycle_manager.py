@@ -1868,7 +1868,28 @@ class CycleManager:
 
         kernel_status = self._kernel.get_status()
         if kernel_status.state != ExecutionState.IDLE:
-            self._kernel.reset()
+            reset_result = self._kernel.reset()
+            if not reset_result.accepted:
+                reason_code = (
+                    reset_result.reason_code
+                    or "kernel_reset_refused"
+                )
+                error_message = (
+                    reset_result.error
+                    or "Kernel reset was refused"
+                )
+                with self._lock:
+                    self._error = error_message
+                    self._error_code = reason_code
+                    self._error_details = {
+                        "reason": reason_code,
+                        "kernel_state": kernel_status.state.value,
+                    }
+                    self._state = CycleState.STOPPED
+                    self._pending_delegated_recovery = None
+                    self._resumable_stop_scene_fingerprint = None
+                    self._resumable_stop_scene_fingerprint_error = None
+                return
 
         self._prepare_fresh_cycle()
 

@@ -12,12 +12,17 @@
 
 #include <manyforge_roboplan/native_kernel_factory.hpp>
 #ifdef MANYFORGE_ROS2_CONTROL_ENABLED
-#include <manyforge_roboplan/ros2_control_execution_backend.hpp>
+#include <manyforge_roboplan/ros2_control_kernel_factory.hpp>
+#include <manyforge_ros2_control_execution/ros2_control_capability.hpp>
+#include <manyforge_ros2_control_execution/ros2_control_execution_backend.hpp>
 #endif
 
 namespace py = pybind11;
 using namespace manyforge::roboplan_backend;
 using namespace manyforge::core;
+#ifdef MANYFORGE_ROS2_CONTROL_ENABLED
+namespace ros2_exec = manyforge::ros2_control_execution;
+#endif
 
 namespace {
 
@@ -918,13 +923,13 @@ ExecutionKernelConfig kernel_config_from_python(const py::object& config_obj) {
 }
 
 #ifdef MANYFORGE_ROS2_CONTROL_ENABLED
-Ros2ControlExecutionBackendConfig ros2_control_config_from_python(
+ros2_exec::Ros2ControlExecutionBackendConfig ros2_control_config_from_python(
     const py::object& config_obj) {
   if (config_obj.is_none()) {
     throw std::invalid_argument("ros2_control config must not be None");
   }
   py::dict config_dict = config_obj.cast<py::dict>();
-  Ros2ControlExecutionBackendConfig config;
+  ros2_exec::Ros2ControlExecutionBackendConfig config;
   if (config_dict.contains("node_name")) {
     config.node_name = config_dict["node_name"].cast<std::string>();
   }
@@ -1107,10 +1112,10 @@ Ros2ControlExecutionBackendConfig ros2_control_config_from_python(
   return config;
 }
 
-Ros2ControlExecutionBackend& require_ros2_control_execution(
+ros2_exec::Ros2ControlExecutionBackend& require_ros2_control_execution(
     NativeKernelBundle& self) {
   auto* backend =
-      dynamic_cast<Ros2ControlExecutionBackend*>(self.execution.get());
+      dynamic_cast<ros2_exec::Ros2ControlExecutionBackend*>(self.execution.get());
   if (backend == nullptr) {
     throw std::runtime_error(
         "Native kernel execution backend is not ros2_control");
@@ -2115,7 +2120,7 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
       .def("configure_ros_gripper_action",
           [](NativeKernelBundle& self, const std::string& gripper_id,
              py::dict config_dict) {
-            Ros2GripperActionConfig config;
+            ros2_exec::Ros2GripperActionConfig config;
             if (config_dict.contains("action_name")) {
               config.action_name =
                   config_dict["action_name"].cast<std::string>();

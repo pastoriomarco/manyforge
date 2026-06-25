@@ -4,17 +4,17 @@
 #include <string>
 #include <vector>
 
-#include <manyforge_roboplan/ros2_control_capability.hpp>
+#include <manyforge_ros2_control_execution/ros2_control_capability.hpp>
 
-// spec/260 §5.6: the ros2_control adapter's
-// motion-interrupt stop capability is computed by a pure helper that
-// inspects the deployment's Ros2ControlExecutionBackendConfig. The
-// helper is callable without ROS so deployments can audit which stop
-// modes a configuration will advertise BEFORE running the controller.
+// spec/260 §5.6: the ros2_control adapter's motion-interrupt stop
+// capability is computed by a pure package helper that inspects the
+// deployment's Ros2ControlExecutionBackendConfig. The helper is callable
+// without a running controller so deployments can audit which stop modes a
+// configuration will advertise before launching execution.
 // These tests pin the evidence-gating rules so the capability gate
 // stays honest as the config evolves.
 
-using namespace manyforge::roboplan_backend;
+using namespace manyforge::ros2_control_execution;
 using namespace manyforge::core;
 
 namespace {

@@ -34,6 +34,7 @@ run_in_container() {
   export PYTHONPATH="${workspace}/manyforge_behavior:${workspace}/manyforge_composer:${workspace}/manyforge_core/python:${workspace}/manyforge_roboplan/python:${PYTHONPATH:-}"
 
   run_step pytest -q \
+    --ignore=manyforge_composer/tests/test_soak_qualification.py \
     manyforge_composer/tests/test_backend.py \
     manyforge_composer/tests/test_event_recorder.py
 
@@ -90,7 +91,11 @@ run_in_container() {
     test_native_backends \
     test_ros2_capability
   run_step "${roboplan_build}/test_native_backends"
-  run_step "${roboplan_build}/test_ros2_capability"
+  local ros2_capability_test="${roboplan_build}/manyforge_ros2_control_execution/test_ros2_capability"
+  if [[ ! -x "${ros2_capability_test}" ]]; then
+    ros2_capability_test="${roboplan_build}/test_ros2_capability"
+  fi
+  run_step "${ros2_capability_test}"
 
   echo
   echo "Offline controlled-stop qualification passed."

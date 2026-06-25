@@ -26,6 +26,7 @@
 #include <manyforge_core/ports/iplanner_backend.hpp>
 #include <manyforge_core/ports/iplanning_context.hpp>
 #include <manyforge_core/ports/iexecution_backend.hpp>
+#include <manyforge_core/ports/iexecution_state_sink.hpp>
 
 // Test that Result works
 TEST(ContractsCompile, ResultOk) {
@@ -366,13 +367,16 @@ TEST(ContractsCompile, PortInterfaces) {
   using PlannerBackendType = manyforge::core::IPlannerBackend;
   using PlanningContextType = manyforge::core::IPlanningContext;
   using ExecutionBackendType = manyforge::core::IExecutionBackend;
+  using ExecutionStateSinkType = manyforge::core::IExecutionStateSink;
   
   // Verify they're pointers (abstract classes)
   PlannerBackendType* planner = nullptr;
   PlanningContextType* context = nullptr;
   ExecutionBackendType* execution = nullptr;
+  ExecutionStateSinkType* execution_state_sink = nullptr;
   
   EXPECT_EQ(planner, nullptr);
   EXPECT_EQ(context, nullptr);
   EXPECT_EQ(execution, nullptr);
+  EXPECT_EQ(execution_state_sink, nullptr);
 }

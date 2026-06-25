@@ -535,9 +535,11 @@ class ExecutionKernel {
   std::optional<ErrorDTO> operator_stop_intervention_error_;
 
   mutable std::mutex collision_monitor_mutex_;
+  std::condition_variable collision_monitor_cv_;
   ScheduleHandle collision_monitor_handle_{0};
   uint64_t collision_monitor_generation_ = 0;
   bool collision_monitor_active_ = false;
+  std::uint64_t collision_monitor_callbacks_in_flight_ = 0;
   // Stop-path collision monitoring. While a motion-trip controlled stop is in
   // flight, `motion_trip_stop_active_` is true and the runtime collision
   // monitor keeps running over the decelerating robot. On a collision the

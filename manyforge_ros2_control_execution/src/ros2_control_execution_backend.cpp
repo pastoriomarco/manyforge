@@ -1,11 +1,8 @@
-#include <manyforge_roboplan/ros2_control_execution_backend.hpp>
-
-#include <Eigen/Dense>
+#include <manyforge_ros2_control_execution/ros2_control_execution_backend.hpp>
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
-#include <filesystem>
 #include <future>
 #include <iomanip>
 #include <limits>
@@ -17,11 +14,8 @@
 #include <manyforge_core/motion_interrupt/soft_on_path_stop_planner.hpp>
 #include <manyforge_core/trajectory/trajectory_sampler.hpp>
 #include <manyforge_core/types/error_code.hpp>
-#include <manyforge_core/collision/parallel_collision_validation_worker_pool.hpp>
-#include <manyforge_collision/manyforge_collision_engine.hpp>
-#include <manyforge_roboplan/native_kernel_factory.hpp>
 
-namespace manyforge::roboplan_backend {
+namespace manyforge::ros2_control_execution {
 namespace {
 
 constexpr double kRuntimeScaleSlewPerSecond = 4.0;  // 0→1 in 250 ms.
@@ -34,15 +28,6 @@ double controlled_stop_wait_timeout_s(
   }
   return core::motion_interrupt_deceleration_time_or_default(profile) +
          std::max(0.0, stop_completion_tolerance_s);
-}
-
-core::CollisionPolicySnapshot default_collision_policy_snapshot() {
-  core::CollisionPolicySnapshot policy;
-  policy.policy_id = "default_free_space";
-  policy.revision.revision_id = 1;
-  policy.revision.content_hash = "default_free_space_v1";
-  policy.require_full_diagnostics = false;
-  return policy;
 }
 
 double clamp_progress(double progress) {
@@ -118,21 +103,16 @@ void disable_fjt_controller_tolerances(
 }  // namespace
 
 Ros2ControlExecutionBackend::Ros2ControlExecutionBackend(
-    std::shared_ptr<roboplan::Scene> scene,
+    std::shared_ptr<core::IExecutionStateSink> execution_state_sink,
     std::string group_name,
     core::IClock& clock,
-    Ros2ControlExecutionBackendConfig config,
-    std::shared_ptr<std::mutex> scene_mutex)
-    : scene_(std::move(scene)),
+    Ros2ControlExecutionBackendConfig config)
+    : execution_state_sink_(std::move(execution_state_sink)),
       group_name_(std::move(group_name)),
       clock_(clock),
-      config_(std::move(config)),
-      scene_mutex_(std::move(scene_mutex)) {
-  if (!scene_) {
-    throw std::invalid_argument("scene must not be null");
-  }
-  if (!scene_mutex_) {
-    scene_mutex_ = std::make_shared<std::mutex>();
+      config_(std::move(config)) {
+  if (!execution_state_sink_) {
+    throw std::invalid_argument("execution state sink must not be null");
   }
   validate_config();
   snapshot_.timestamp_ns = clock_.now();
@@ -940,57 +920,27 @@ std::vector<double> Ros2ControlExecutionBackend::velocities_for_joints(
 bool Ros2ControlExecutionBackend::update_scene_positions(
     const std::vector<double>& joint_positions,
     SceneUpdateMode mode) {
-  if (joint_positions.empty()) {
+  const auto sink_mode =
+      mode == SceneUpdateMode::kBestEffort
+          ? core::ExecutionStateUpdateMode::kBestEffort
+          : core::ExecutionStateUpdateMode::kBlocking;
+  const auto result = execution_state_sink_->apply_group_joint_positions(
+      group_name_, joint_positions, sink_mode);
+  if (result.applied()) {
     return true;
   }
-  std::unique_lock<std::mutex> scene_lock(*scene_mutex_, std::defer_lock);
   if (mode == SceneUpdateMode::kBestEffort) {
-    if (!scene_lock.try_lock()) {
-      return false;
-    }
-  } else {
-    scene_lock.lock();
+    return false;
   }
-  Eigen::VectorXd q(joint_positions.size());
-  for (size_t i = 0; i < joint_positions.size(); ++i) {
-    q[static_cast<Eigen::Index>(i)] = joint_positions[i];
-  }
-  if (q.size() != scene_->getCurrentJointPositions().size()) {
-    q = scene_->toFullJointPositions(group_name_, q);
-  }
-  scene_->setJointPositions(q);
-  return true;
+  throw std::runtime_error(
+      "failed to update execution state sink: " +
+      std::string(core::execution_state_sink_status_reason(result.status)));
 }
 
 std::optional<double> Ros2ControlExecutionBackend::scene_group_joint_position(
     const std::string& group_id,
     const std::string& joint_name) const {
-  if (group_id.empty() || joint_name.empty() || !scene_) {
-    return std::nullopt;
-  }
-  std::lock_guard<std::mutex> scene_lock(*scene_mutex_);
-  const auto maybe_group_info = scene_->getJointGroupInfo(group_id);
-  if (!maybe_group_info) {
-    return std::nullopt;
-  }
-  const auto& group_info = *maybe_group_info;
-  const auto joint_it =
-      std::find(group_info.joint_names.begin(), group_info.joint_names.end(),
-                joint_name);
-  if (joint_it == group_info.joint_names.end()) {
-    return std::nullopt;
-  }
-  const auto index =
-      static_cast<size_t>(std::distance(group_info.joint_names.begin(), joint_it));
-  if (index >= static_cast<size_t>(group_info.q_indices.size())) {
-    return std::nullopt;
-  }
-  const auto q = scene_->getCurrentJointPositions();
-  const auto q_index = group_info.q_indices[static_cast<Eigen::Index>(index)];
-  if (q_index < 0 || q_index >= q.size()) {
-    return std::nullopt;
-  }
-  return q[q_index];
+  return execution_state_sink_->group_joint_position(group_id, joint_name);
 }
 
 bool Ros2ControlExecutionBackend::update_scene_group_joint_position(
@@ -998,50 +948,13 @@ bool Ros2ControlExecutionBackend::update_scene_group_joint_position(
     const std::string& joint_name,
     double position,
     SceneUpdateMode mode) {
-  if (group_id.empty() || joint_name.empty() || !std::isfinite(position) || !scene_) {
-    return false;
-  }
-  std::unique_lock<std::mutex> scene_lock(*scene_mutex_, std::defer_lock);
-  if (mode == SceneUpdateMode::kBestEffort) {
-    if (!scene_lock.try_lock()) {
-      return false;
-    }
-  } else {
-    scene_lock.lock();
-  }
-  const auto maybe_group_info = scene_->getJointGroupInfo(group_id);
-  if (!maybe_group_info) {
-    return false;
-  }
-  const auto& group_info = *maybe_group_info;
-  const auto joint_it =
-      std::find(group_info.joint_names.begin(), group_info.joint_names.end(),
-                joint_name);
-  if (joint_it == group_info.joint_names.end()) {
-    return false;
-  }
-  if (group_info.joint_names.size() !=
-      static_cast<size_t>(group_info.q_indices.size())) {
-    return false;
-  }
-  const auto q_current = scene_->getCurrentJointPositions();
-  Eigen::VectorXd group_q(group_info.q_indices.size());
-  for (Eigen::Index i = 0; i < group_info.q_indices.size(); ++i) {
-    const auto q_index = group_info.q_indices[i];
-    if (q_index < 0 || q_index >= q_current.size()) {
-      return false;
-    }
-    group_q[i] = q_current[q_index];
-  }
-  const auto group_index =
-      static_cast<Eigen::Index>(std::distance(group_info.joint_names.begin(), joint_it));
-  group_q[group_index] = position;
-  auto q_full = group_q;
-  if (q_full.size() != q_current.size()) {
-    q_full = scene_->toFullJointPositions(group_id, group_q);
-  }
-  scene_->setJointPositions(q_full);
-  return true;
+  const auto sink_mode =
+      mode == SceneUpdateMode::kBestEffort
+          ? core::ExecutionStateUpdateMode::kBestEffort
+          : core::ExecutionStateUpdateMode::kBlocking;
+  const auto result = execution_state_sink_->apply_group_joint_position(
+      group_id, joint_name, position, sink_mode);
+  return result.applied();
 }
 
 void Ros2ControlExecutionBackend::project_gripper_position_to_scene(
@@ -4195,7 +4108,7 @@ Ros2GripperCommandResult Ros2ControlExecutionBackend::command_gripper(
     if (!start_position.has_value()) {
       return {false,
               "Cannot project gripper '" + gripper_id +
-                  "' into RoboPlan scene group '" + runtime_config.group_id +
+                  "' into execution-state sink group '" + runtime_config.group_id +
                   "' joint '" + runtime_config.joint_name + "'",
               ros2_control_fault_reason::kGripperNotConfigured};
     }
@@ -4429,90 +4342,6 @@ Ros2GripperStatus Ros2ControlExecutionBackend::get_gripper_status(
   status.error = runtime->error;
   status.reason_code = runtime->reason_code;
   return status;
-}
-
-std::shared_ptr<NativeKernelBundle> create_ros2_control_kernel(
-    const std::string& model_name,
-    const std::string& group_name,
-    const std::string& urdf_path,
-    const std::string& srdf_path,
-    const std::vector<std::string>& package_paths,
-    const Ros2ControlExecutionBackendConfig& ros_config,
-    const core::ExecutionKernelConfig& kernel_config) {
-  auto bundle = std::make_shared<NativeKernelBundle>();
-  bundle->group_name = group_name;
-
-  std::vector<std::filesystem::path> pkg_paths;
-  for (const auto& path : package_paths) {
-    pkg_paths.emplace_back(path);
-  }
-
-  bundle->scene = std::make_shared<roboplan::Scene>(
-      model_name, std::filesystem::path(urdf_path),
-      std::filesystem::path(srdf_path), pkg_paths);
-
-  roboplan::RRTOptions rrt_opts;
-  rrt_opts.group_name = group_name;
-  rrt_opts.max_planning_time = kernel_config.planner_max_planning_time_s;
-  rrt_opts.max_nodes = 5000;
-  bundle->rrt = std::make_shared<roboplan::RRT>(bundle->scene, rrt_opts);
-  bundle->shortcutter = std::make_shared<roboplan::PathShortcutter>(
-      bundle->scene, group_name);
-  bundle->toppra = std::make_shared<roboplan::PathParameterizerTOPPRA>(
-      bundle->scene, group_name);
-
-  roboplan::SimpleIkOptions ik_opts;
-  ik_opts.group_name = group_name;
-  ik_opts.step_size = 0.25;
-  ik_opts.max_restarts = 50;
-  ik_opts.max_time = 1.0;
-  bundle->ik = std::make_shared<roboplan::SimpleIk>(bundle->scene, ik_opts);
-  auto single_shot_ik_opts = ik_opts;
-  single_shot_ik_opts.max_time = kernel_config.single_shot_ik_timeout_s;
-  bundle->single_shot_ik =
-      std::make_shared<roboplan::SimpleIk>(bundle->scene, single_shot_ik_opts);
-
-  auto scene_mutex = std::make_shared<std::mutex>();
-  bundle->planner = std::make_unique<RoboPlanPlannerBackend>(
-      bundle->scene, rrt_opts, bundle->shortcutter, bundle->toppra, bundle->ik,
-      scene_mutex, bundle->single_shot_ik);
-  bundle->context = std::make_unique<RoboPlanPlanningContext>(
-      bundle->scene, group_name, scene_mutex);
-  bundle->clock = std::make_unique<WallClock>();
-  bundle->execution = std::make_unique<Ros2ControlExecutionBackend>(
-      bundle->scene, group_name, *bundle->clock, ros_config, scene_mutex);
-  bundle->scheduler = std::make_unique<SimpleScheduler>();
-  bundle->cache = std::make_unique<core::TrajectoryCache>();
-
-  const auto policy = kernel_config.baseline_collision_policy_snapshot.value_or(
-      default_collision_policy_snapshot());
-  bundle->context->set_collision_policy_snapshot(policy);
-  const int collision_worker_count =
-      core::env_validation_collision_workers(
-          std::max(1, kernel_config.validation_collision_workers));
-  bundle->collision_validation_engines.reserve(collision_worker_count);
-  for (int i = 0; i < collision_worker_count; ++i) {
-    bundle->collision_validation_engines.push_back(
-        std::make_shared<manyforge::collision::ManyForgeCollisionEngine>(
-            model_name,
-            std::filesystem::path(urdf_path),
-            std::filesystem::path(srdf_path),
-            pkg_paths,
-            group_name));
-  }
-
-  core::ExecutionKernelConfig resolved_kernel_config = kernel_config;
-  resolved_kernel_config.validation_collision_workers = collision_worker_count;
-  bundle->kernel = std::make_unique<core::ExecutionKernel>(
-      *bundle->planner, *bundle->context, *bundle->execution,
-      *bundle->clock, *bundle->scheduler, *bundle->cache,
-      resolved_kernel_config);
-  bundle->kernel->set_collision_validation_policy_snapshot(policy);
-  bundle->kernel->set_collision_validation_pipeline(
-      *bundle->context,
-      bundle->collision_validation_engines);
-  bundle->event_collector.subscribe(*bundle->kernel);
-  return bundle;
 }
 
 // =================================================================
@@ -4780,4 +4609,4 @@ void Ros2ControlExecutionBackend::set_runtime_velocity_scale(double scale) {
   managed_fjt_cv_.notify_all();
 }
 
-}  // namespace manyforge::roboplan_backend
+}  // namespace manyforge::ros2_control_execution

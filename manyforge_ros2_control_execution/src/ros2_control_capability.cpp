@@ -1,10 +1,10 @@
-#include <manyforge_roboplan/ros2_control_capability.hpp>
+#include <manyforge_ros2_control_execution/ros2_control_capability.hpp>
 
 #include <cmath>
 #include <string>
 #include <utility>
 
-namespace manyforge::roboplan_backend {
+namespace manyforge::ros2_control_execution {
 namespace {
 
 bool soft_on_path_capability_config_valid(
@@ -159,4 +159,4 @@ core::SoftOnPathStateSource resolve_soft_on_path_anchor_velocity_source(
   return core::SoftOnPathStateSource::kModelDerived;
 }
 
-}  // namespace manyforge::roboplan_backend
+}  // namespace manyforge::ros2_control_execution
