@@ -514,6 +514,10 @@ export function AssistantOverlay() {
   const modeStatus = modeEntryStatus(selectedModeId, cycleState);
   const deploymentProviderId = assistant?.provider ?? null;
   const configuredProviderId = providerCatalog?.configuredProviderId ?? null;
+  // Model the configured provider's bridge is actually running, read live at
+  // runtime from the bridge /healthz (decoupled from the deployment model_id /
+  // profile_ref). null when the backend's live read was unavailable.
+  const liveBridgeModel = providerCatalog?.liveModel ?? null;
   const providerId = configuredProviderId ?? deploymentProviderId ?? 'mock';
   const configuredProvider = providerCatalog?.providers.find((provider) => provider.id === providerId);
   const providerCatalogReady = !!providerCatalog || !!providerError;
@@ -563,10 +567,21 @@ export function AssistantOverlay() {
     return Array.from(ids).sort();
   }, [modelEndpointCatalog]);
   const liveModelLabel = liveServedModelIds.length > 0 ? liveServedModelIds.join(', ') : null;
-  // Prefer the live served id; fall back to the resolved model_id (the id the
-  // bridge requests), then the profile label.
+  // The live bridge model (read at runtime from the bridge /healthz via the
+  // providers catalog) is authoritative for what is ACTUALLY running. Prefer
+  // it; then the /v1/models probe; then the resolved model_id (the id the
+  // bridge requests); then the profile label. Each fallback only applies when
+  // the more authoritative source is null, so behavior is unchanged when the
+  // live read is unavailable.
   const modelLabel =
-    liveModelLabel ?? modelEndpoint?.modelId ?? modelEndpoint?.profileRef ?? 'model not declared';
+    liveBridgeModel
+    ?? liveModelLabel
+    ?? modelEndpoint?.modelId
+    ?? modelEndpoint?.profileRef
+    ?? 'model not declared';
+  // Whether the displayed model came from a live source (bridge /healthz or the
+  // /v1/models probe) rather than a static deployment label.
+  const modelIsLive = !!(liveBridgeModel ?? liveModelLabel);
   const activeDuration =
     runState !== 'idle' && activeRequestStartedMs
       ? formatDurationSeconds((nowMs - activeRequestStartedMs) / 1000)
@@ -1178,7 +1193,7 @@ export function AssistantOverlay() {
                       <span className="truncate text-gray-300">{configuredProfileLabel}</span>
                     </div>
                     <div className="mt-2 flex items-center justify-between gap-2">
-                      <span>{liveModelLabel ? 'Model (live)' : 'Model'}</span>
+                      <span>{modelIsLive ? 'Model (live)' : 'Model'}</span>
                       <span className="truncate text-gray-300">{modelLabel}</span>
                     </div>
                     {activeStatus && (

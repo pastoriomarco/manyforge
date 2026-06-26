@@ -18,6 +18,10 @@ from manyforge_behavior.model_paths import (
     default_package_paths,
     resolve_robot_model,
 )
+from manyforge_behavior.robot_model_runtime import (
+    attach_robot_model_metadata,
+    prepare_roboplan_runtime_model_view,
+)
 from manyforge_behavior.program import Program
 from manyforge_behavior.runner import OrchestratorRunner
 
@@ -117,12 +121,16 @@ def create_kernel(deployment: Deployment) -> KernelClient:
                     deployment_path=deployment.source_path,
                     extra_package_paths=extra_package_paths,
                 )
+                runtime_model = prepare_roboplan_runtime_model_view(
+                    resolved_model=resolved_model,
+                    grippers=deployment.grippers,
+                )
                 bundle = manyforge_roboplan_py.create_native_kernel_from_paths(
-                    resolved_model.model_name,
+                    runtime_model.model_name,
                     group,
-                    resolved_model.urdf_path,
-                    resolved_model.srdf_path,
-                    resolved_model.package_paths,
+                    runtime_model.urdf_path,
+                    runtime_model.srdf_path,
+                    runtime_model.package_paths,
                     _native_kernel_config_from_deployment(deployment),
                 )
             else:
@@ -130,7 +138,19 @@ def create_kernel(deployment: Deployment) -> KernelClient:
                 bundle = manyforge_roboplan_py.create_native_kernel(
                     model_name, group, _native_kernel_config_from_deployment(deployment)
                 )
-            return NativeKernelClient(bundle)
+                runtime_model = None
+            if runtime_model is not None:
+                kernel = NativeKernelClient(
+                    bundle,
+                    robot_model_authority_metadata=runtime_model.metadata,
+                    robot_model_authority_temp_dir=runtime_model._temp_dir,
+                )
+            else:
+                kernel = NativeKernelClient(bundle)
+            if runtime_model is not None:
+                attach_robot_model_metadata(kernel, runtime_model)
+                attach_robot_model_metadata(bundle, runtime_model)
+            return kernel
         except ImportError:
             print("WARNING: manyforge_roboplan_py not available, using MockKernelClient")
 

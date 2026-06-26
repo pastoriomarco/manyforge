@@ -1,0 +1,27 @@
+{
+  "schema": "manyforge.lite6_runtime_capture.v1",
+  "node": "/move_group",
+  "robot_description_param": "robot_description",
+  "robot_description_semantic_param": "robot_description_semantic",
+  "manymove": {
+    "image": "manymove-xarm:jazzy",
+    "launch_command": [
+      "ros2",
+      "launch",
+      "manymove_bringup",
+      "lite_foundationpose_movegroup_fake_cpp_trees.launch.py",
+      "no_gui_ctrl:=true"
+    ],
+    "runtime_owner_node": "/move_group"
+  },
+  "xarm_ros2": {
+    "repo": "https://github.com/pastoriomarco/xarm_ros2",
+    "branch": "jazzy_no_gazebo",
+    "commit": "012731afb9ef1d4289ec45112e8d083ab59a5c1e"
+  },
+  "artifacts": {
+    "urdf": "manyforge_example_models/models/lite6_lite_gripper/manymove_runtime_capture/manymove_lite6_runtime.urdf",
+    "srdf": "manyforge_example_models/models/lite6_lite_gripper/manymove_runtime_capture/manymove_lite6_runtime.srdf"
+  },
+  "captured_at_utc": "2026-06-25T12:21:02+00:00"
+}

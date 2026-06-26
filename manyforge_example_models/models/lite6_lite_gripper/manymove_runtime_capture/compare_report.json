@@ -1,0 +1,12 @@
+{
+  "passed": true,
+  "failures": [],
+  "warnings": [],
+  "facts": {
+    "runtime_capture_schema": "manyforge.lite6_runtime_capture.v1",
+    "runtime_capture_xarm_branch": "jazzy_no_gazebo",
+    "runtime_capture_xarm_commit": "012731afb9ef1d4289ec45112e8d083ab59a5c1e",
+    "runtime_link_count": 13,
+    "snapshot_link_count": 13
+  }
+}

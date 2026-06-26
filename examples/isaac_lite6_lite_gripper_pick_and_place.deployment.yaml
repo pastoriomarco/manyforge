@@ -1,0 +1,194 @@
+api_version: manyforge.deployment.v0
+schema_version: 0.1.0
+name: isaac_lite6_lite_gripper_pick_and_place
+description: >-
+  Isaac Sim pick-and-place deployment for UFACTORY Lite6 with the lite
+  pneumatic gripper. Planning and validation use ManyForge's static Lite6
+  model; execution is delegated to a stock ros2_control JointTrajectoryController
+  exposed through Isaac's topic_based_ros2_control bridge.
+program_profile: v0.1
+robot_config:
+  robot_id: lite6
+  group_id: lite6
+  urdf_path: package://manyforge_example_models/models/lite6_lite_gripper/lite6_lite_gripper.urdf
+  srdf_path: package://manyforge_example_models/models/lite6_lite_gripper/lite6_lite_gripper.srdf
+  package_paths:
+  - ..
+  global_max_tcp_linear_speed_mps: 0.15
+grippers:
+  primary:
+    command_mode: ros_gripper_command
+    group_id: lite_gripper
+    joint_name: right_finger_joint
+    motion_time_s: 0.8
+    description: UFACTORY lite pneumatic gripper through a standard ROS GripperCommand action.
+    touch_links:
+    - lite_gripper_base_link
+    - lite_gripper_left_finger
+    - lite_gripper_right_finger
+    mount_frame: link_eef
+    attach_frame: link_tcp
+    tcp_frame: link_tcp
+    auxiliary_frames:
+    - lite_gripper_base_link
+simulation_control:
+  kind: ros2_simulation_interfaces
+  service_prefix: auto
+  capabilities:
+    reset: true
+    pause: true
+    play: true
+    step: true
+    set_entity_state: true
+  reset:
+    default_scope: state
+    close_command_gate: true
+    wait_ready_s: 3.0
+    resume_play_after_reset: true
+adapters:
+  planning:
+    adapter_id: planning.roboplan
+    adapter_version: 0.1.0
+    supported_profiles:
+    - v0.1
+    capability_keys:
+    - planning.motion.joint_goal
+    - planning.motion.pose_goal
+    - planning.trajectory.time_parameterized
+    config:
+      rng_seed: 12345
+  context:
+    adapter_id: planning.roboplan_context
+    adapter_version: 0.1.0
+    supported_profiles:
+    - v0.1
+    capability_keys:
+    - context.state.current
+    - context.validation.trajectory
+    - context.collision.check
+    - context.collision.check.detailed
+    - context.kinematics.fk
+    - context.limits.joint
+    - context.pose.resolve_reference
+    - context.scene.object_query
+    - scene.shape.box
+    - scene.shape.sphere
+    - scene.shape.cylinder
+    - scene.shape.mesh
+    - scene.edit.add
+    - scene.edit.upsert
+    - scene.edit.remove
+    - scene.edit.update_pose
+    - scene.edit.attach_detach
+    - observability.trace.scene
+    config: {}
+  execution:
+    adapter_id: execution.ros2_control_follow_joint_trajectory
+    adapter_version: 0.1.0
+    supported_profiles:
+    - v0.1
+    capability_keys:
+    - execution.trajectory.execute
+    - execution.feedback.phase_events
+    - execution.feedback.state_snapshots
+    - execution.stop.soft
+    - execution.pause
+    - execution.resume
+    - execution.reset
+    - tool.gripper.command
+    - tool.gripper.feedback
+    config:
+      action_name: /isaac_arm_controller/follow_joint_trajectory
+      arm_action: /isaac_arm_controller/follow_joint_trajectory
+      execution_state_authority_profile: commanded_sim
+      execution_state_source_mode: commanded_sim
+      single_shot_ik_timeout_s: 0.05
+      require_fresh_state_before_planning: false
+      command_gate_topic: /manyforge/isaac_arm_command_enable
+      reset_to_initial_on_load: true
+      sim_reset_motion_duration_s: 0.0
+      joint_state_topic: /joint_states
+      controller_state_topic: /isaac_arm_controller/controller_state
+      controller_manager: /controller_manager
+      required_joints:
+      - joint1
+      - joint2
+      - joint3
+      - joint4
+      - joint5
+      - joint6
+      decelerate_on_cancel: true
+      velocity_state_interface_joints:
+      - joint1
+      - joint2
+      - joint3
+      - joint4
+      - joint5
+      - joint6
+      max_deceleration_on_cancel_rad_s2:
+        joint1: 8.0
+        joint2: 8.0
+        joint3: 8.0
+        joint4: 8.0
+        joint5: 8.0
+        joint6: 8.0
+      initial_joint_positions_rad: [0.0, 0.0, 1.57, 0.0, 0.0, 0.0]
+      joint_state_max_age_ms: 250
+      wait_for_state_timeout_s: 1
+      enable_soft_on_path_path_ramp: true
+      soft_on_path_sample_period_s: 0.01
+      soft_on_path_stop_traj_delta_s: 0.1
+      soft_on_path_max_jerk_rad_s3:
+        joint1: 40.0
+        joint2: 40.0
+        joint3: 40.0
+        joint4: 40.0
+        joint5: 40.0
+        joint6: 40.0
+      operator_stop_profile:
+        profile_id: operator_soft_on_path
+        stop_mode: soft_on_path
+        deceleration_time_s: 1.0
+        allow_natural_completion_on_short_path: true
+        per_joint_max_deceleration_rad_s2:
+          joint1: 4.0
+          joint2: 4.0
+          joint3: 4.0
+          joint4: 4.0
+          joint5: 4.0
+          joint6: 4.0
+      default_fault_stop_profile:
+        profile_id: default_fault_hard_deceleration
+        stop_mode: hard_deceleration
+        deceleration_time_s: 1.0
+        per_joint_max_deceleration_rad_s2:
+          joint1: 4.0
+          joint2: 4.0
+          joint3: 4.0
+          joint4: 4.0
+          joint5: 4.0
+          joint6: 4.0
+      wait_for_action_server_timeout_s: 2
+      stop_completion_timeout_s: 1.5
+      start_tolerance_rad: 0.15
+      final_tolerance_rad: 0.15
+      tracking_error_tolerance_rad: 0.05
+      tracking_error_timeout_s: 0
+      disable_controller_path_tolerances: true
+      controller_result_timeout_s: 30
+      gripper:
+        action_name: /lite_gripper_controller/gripper_cmd
+        wait_for_action_server_timeout_s: 2
+        result_timeout_s: 5
+orchestrator:
+  engine: py_trees
+  config:
+    collision_monitor_period_ms: 50
+launch:
+  runner:
+    module: manyforge_behavior.runner
+    args: []
+  ui_backend:
+    module: manyforge_composer
+    args: []
+    enabled: true

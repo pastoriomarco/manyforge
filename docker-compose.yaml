@@ -147,6 +147,7 @@ services:
       COMPOSER_URL: ${COMPOSER_URL:-http://127.0.0.1:9000}
       PROGRAM_PATH: ${PROGRAM_PATH:-/workspace/examples/isaac_manipulator_scene_light.program.yaml}
       DEPLOYMENT_PATH: ${DEPLOYMENT_PATH:-/workspace/examples/isaac_manipulator_scene_light_ros2_control.deployment.yaml}
+      ISAAC_TOPIC_CONTROL_PROFILE: ${ISAAC_TOPIC_CONTROL_PROFILE:-}
       SUPERVISOR_AUTO_LOAD: ${SUPERVISOR_AUTO_LOAD:-${LOAD_ARTIFACTS:-true}}
     working_dir: /workspace
     command: ["bash", "-lc", "./scripts/ros/launch-isaac-topic-based-control.sh"]

@@ -564,7 +564,10 @@ ManyForgeCollisionEngine::ManyForgeCollisionEngine(
       engine_id_("manyforge_collision/" + model_name),
       engine_version_(MANYFORGE_COLLISION_ENGINE_VERSION) {
   package_paths_ = package_paths;
-  pinocchio::urdf::buildModel(urdf_path.string(), model_, false, false);
+  pinocchio::urdf::buildModel(urdf_path.string(),
+                              model_,
+                              /*verbose=*/false,
+                              /*mimic=*/true);
   std::vector<std::string> package_path_strings;
   package_path_strings.reserve(package_paths.size());
   for (const auto& path : package_paths) {

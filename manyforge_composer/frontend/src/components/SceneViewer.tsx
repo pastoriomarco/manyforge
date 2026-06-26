@@ -29,6 +29,7 @@ import type {
   SceneGripperState,
   SceneObjectState,
   SceneShapeState,
+  SceneUrdfCollision,
   SceneUrdfManifest,
   SceneUrdfVisual,
   TreeNode,
@@ -1139,6 +1140,7 @@ function RobotModel() {
   const robotModelKey = useSceneStateStore(
     (state) => state.scene?.robot?.urdf_model_key ?? state.scene?.robot?.robot_id ?? null,
   );
+  const collisionMeshesVisible = useViewerSelectionStore((s) => s.collisionMeshesVisible);
 
   useEffect(() => {
     let cancelled = false;
@@ -1199,8 +1201,52 @@ function RobotModel() {
           );
         })}
       </group>
+      {collisionMeshesVisible && (
+        <RobotCollisionMeshes manifest={manifest} modelKey={modelKey} linkPoses={linkPoses} />
+      )}
       <MeasuredRobotGhosts manifest={manifest} modelKey={modelKey} />
     </>
+  );
+}
+
+function RobotCollisionMeshes({
+  manifest,
+  modelKey,
+  linkPoses,
+}: {
+  manifest: SceneUrdfManifest;
+  modelKey: string;
+  linkPoses: Record<string, { position_m: number[]; orientation_xyzw: number[] }>;
+}) {
+  const hasCollisions = manifest.links.some((link) => (link.collisions ?? []).length > 0);
+  if (!hasCollisions) {
+    return null;
+  }
+
+  return (
+    <group name="manyforge-urdf-collisions" key={`${modelKey}:collisions`} renderOrder={19}>
+      {manifest.links.map((link) => {
+        const pose = linkPoses[link.name];
+        const collisions = link.collisions ?? [];
+        if (pose === undefined || collisions.length === 0) {
+          return null;
+        }
+        return (
+          <group
+            key={`${modelKey}:collision:${link.name}`}
+            position={pose.position_m as [number, number, number]}
+            quaternion={pose.orientation_xyzw as [number, number, number, number]}
+          >
+            {collisions.map((collision) => (
+              <RobotLinkCollision
+                key={`${modelKey}:collision:${link.name}:${collision.index}:${collision.mesh_url ?? 'primitive'}`}
+                collision={collision}
+              />
+            ))}
+          </group>
+        );
+      })}
+    </group>
   );
 }
 
@@ -1280,6 +1326,26 @@ function MeasuredRobotGhosts({
   );
 }
 
+function RobotLinkCollision({ collision }: { collision: SceneUrdfCollision }) {
+  const offsetPos = collision.collision_origin.position_m as [number, number, number];
+  const offsetQuat = urdfOriginQuaternion(collision.collision_origin);
+  if (collision.mesh_url !== null) {
+    return (
+      <group position={offsetPos} quaternion={offsetQuat}>
+        <CollisionMeshGltf url={collision.mesh_url} />
+      </group>
+    );
+  }
+  if (collision.primitive !== null) {
+    return (
+      <group position={offsetPos} quaternion={offsetQuat}>
+        <CollisionPrimitiveMesh primitive={collision.primitive} />
+      </group>
+    );
+  }
+  return null;
+}
+
 function RobotLinkVisual({ visual }: { visual: SceneUrdfVisual }) {
   const offsetPos = visual.visual_origin.position_m as [number, number, number];
   const offsetQuat = visualOriginQuaternion(visual);
@@ -1340,6 +1406,85 @@ function PrimitiveMesh({
       <mesh>
         <sphereGeometry args={[primitive.radius_m, 24, 16]} />
         <meshStandardMaterial color="#a8aab0" metalness={0.2} roughness={0.6} />
+      </mesh>
+    );
+  }
+  return null;
+}
+
+function CollisionMeshGltf({ url }: { url: string }) {
+  const gltf = useGLTF(url);
+  const cloned = useMemo(() => {
+    const c = gltf.scene.clone(true);
+    c.traverse((obj) => {
+      const mesh = obj as THREE.Mesh;
+      if (!mesh.isMesh) return;
+      const sourceMaterials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+      const collisionMaterials = sourceMaterials.map((src) => {
+        const mat = src.clone() as THREE.MeshStandardMaterial;
+        if (mat.color) {
+          mat.color.set('#f59e0b');
+        }
+        if (mat.emissive) {
+          mat.emissive.set('#7c2d12');
+        }
+        mat.transparent = true;
+        mat.opacity = 0.42;
+        mat.wireframe = true;
+        mat.depthWrite = false;
+        mat.side = THREE.DoubleSide;
+        return mat;
+      });
+      mesh.material = Array.isArray(mesh.material)
+        ? collisionMaterials
+        : collisionMaterials[0];
+      mesh.renderOrder = 19;
+    });
+    return c;
+  }, [gltf.scene]);
+  return <primitive key={url} object={cloned} />;
+}
+
+function CollisionPrimitiveMesh({
+  primitive,
+}: {
+  primitive: NonNullable<SceneUrdfCollision['primitive']>;
+}) {
+  const material = (
+    <meshStandardMaterial
+      color="#f59e0b"
+      emissive="#7c2d12"
+      transparent
+      opacity={0.42}
+      wireframe
+      depthWrite={false}
+      side={THREE.DoubleSide}
+    />
+  );
+  if (primitive.type === 'box') {
+    const dims = primitive.size_m as [number, number, number];
+    return (
+      <mesh renderOrder={19}>
+        <boxGeometry args={dims} />
+        {material}
+      </mesh>
+    );
+  }
+  if (primitive.type === 'cylinder') {
+    return (
+      <mesh rotation={[Math.PI / 2, 0, 0]} renderOrder={19}>
+        <cylinderGeometry
+          args={[primitive.radius_m, primitive.radius_m, primitive.length_m, 24]}
+        />
+        {material}
+      </mesh>
+    );
+  }
+  if (primitive.type === 'sphere') {
+    return (
+      <mesh renderOrder={19}>
+        <sphereGeometry args={[primitive.radius_m, 24, 16]} />
+        {material}
       </mesh>
     );
   }
@@ -1415,7 +1560,14 @@ function isRenderableWorldPoseFrame(poseFrameId: string, sourceFrameId: string):
 function visualOriginQuaternion(
   visual: SceneUrdfVisual,
 ): [number, number, number, number] {
-  const xyzw = visual.visual_origin.orientation_xyzw;
+  return urdfOriginQuaternion(visual.visual_origin);
+}
+
+function urdfOriginQuaternion(origin: {
+  orientation_xyzw?: number[];
+  orientation_rpy_rad: number[];
+}): [number, number, number, number] {
+  const xyzw = origin.orientation_xyzw;
   if (Array.isArray(xyzw) && xyzw.length === 4) {
     return [
       Number(xyzw[0]) || 0,
@@ -1424,7 +1576,7 @@ function visualOriginQuaternion(
       Number(xyzw[3]) || 1,
     ];
   }
-  const rpy = visual.visual_origin.orientation_rpy_rad;
+  const rpy = origin.orientation_rpy_rad;
   const roll = Number(rpy?.[0]) || 0;
   const pitch = Number(rpy?.[1]) || 0;
   const yaw = Number(rpy?.[2]) || 0;

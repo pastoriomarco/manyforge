@@ -459,6 +459,13 @@ step_choose_scenario() {
         warn "  Add an 'assistant: { enabled: true, provider: …, endpointAlias: … }' block to the deployment"
         warn "  YAML to expose the overlay."
     fi
+    case "${SCENARIO}" in
+        isaac-lite6-pick-place)
+            export ISAAC_TOPIC_CONTROL_PROFILE="${ISAAC_TOPIC_CONTROL_PROFILE:-lite6}"
+            GRIPPER_ACTION="/lite_gripper_controller/gripper_cmd"
+            export GRIPPER_ACTION
+            ;;
+    esac
     pass "Scenario: ${SCENARIO}"
 }
 
@@ -741,7 +748,17 @@ verb_smoke() {
                 wait_for_vllm_proxy
                 wait_for_bridge
             fi
-            ros_shell "source /opt/ros/jazzy/setup.bash; python3 /workspace/scripts/ros/smoke_isaac_arm_action.py --action-name ${ARM_ACTION} --joint-state-topic ${ARM_JOINT_STATE_TOPIC}"
+            if [[ "${SCENARIO}" == "isaac-lite6-pick-place" ]]; then
+                mkdir -p "${LOG_DIR}"
+                local lite6_live_probe_artifact="${LOG_DIR}/isaac-lite6-pick-place-live-smoke.json"
+                ros_shell "source /opt/ros/jazzy/setup.bash; python3 /workspace/scripts/ros/validate-isaac-lite6-smoke.py --arm-action-name ${ARM_ACTION} --gripper-action-name ${GRIPPER_ACTION} --arm-joint-state-topic ${ARM_JOINT_STATE_TOPIC} --isaac-joint-state-topic ${ISAAC_JOINT_STATE_TOPIC} --json" \
+                    | tee "${lite6_live_probe_artifact}"
+                python3 "${MANYFORGE_ROOT}/scripts/ros/validate-isaac-lite6-smoke-artifact.py" \
+                    "${lite6_live_probe_artifact}"
+                pass "Lite6 live smoke artifact: ${lite6_live_probe_artifact}"
+            else
+                ros_shell "source /opt/ros/jazzy/setup.bash; python3 /workspace/scripts/ros/smoke_isaac_arm_action.py --action-name ${ARM_ACTION} --joint-state-topic ${ARM_JOINT_STATE_TOPIC}"
+            fi
             ;;
         manyforge-only)
             if [[ "${ASSISTANT}" == "on" ]]; then

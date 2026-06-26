@@ -42,9 +42,51 @@ class _FakeVisual:
         self.origin = None
 
 
+class _FakeCollision:
+    def __init__(self, filename: str) -> None:
+        self.geometry = _FakeGeometry(filename)
+        self.origin = None
+
+
 class _FakeLink:
-    def __init__(self, visuals: list[_FakeVisual] | None = None) -> None:
+    def __init__(
+        self,
+        visuals: list[_FakeVisual] | None = None,
+        collisions: list[_FakeCollision] | None = None,
+    ) -> None:
         self.visuals = visuals or []
+        self.collisions = collisions or []
+
+
+class _FakeManifestMimic:
+    def __init__(
+        self,
+        joint: str,
+        multiplier: float = 1.0,
+        offset: float = 0.0,
+    ) -> None:
+        self.joint = joint
+        self.multiplier = multiplier
+        self.offset = offset
+
+
+class _FakeManifestJoint:
+    def __init__(
+        self,
+        name: str,
+        *,
+        joint_type: str = "revolute",
+        parent: str = "base_link",
+        child: str | None = None,
+        mimic: _FakeManifestMimic | None = None,
+    ) -> None:
+        self.name = name
+        self.type = joint_type
+        self.axis = [1.0, 0.0, 0.0]
+        self.parent = parent
+        self.child = child or f"{name}_link"
+        self.limit = SimpleNamespace(lower=-1.0, upper=1.0, effort=1.0, velocity=1.0)
+        self.mimic = mimic
 
 
 def test_urdf_manifest_uses_content_model_key_for_mesh_cache(
@@ -132,6 +174,193 @@ def test_urdf_manifest_uses_content_model_key_for_mesh_cache(
     assert legacy_current.status_code in (200, 404)
     if legacy_current.status_code == 200:
         assert legacy_current.headers["cache-control"] == "no-store"
+
+
+def test_urdf_manifest_exposes_collision_geometry_separately(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    urdf = tmp_path / "robot.urdf"
+    visual_mesh = tmp_path / "visual.stl"
+    collision_mesh = tmp_path / "collision.stl"
+    for path in (urdf, visual_mesh, collision_mesh):
+        path.write_text("fixture")
+
+    class FakeUrdf:
+        base_link = "base_link"
+        joint_map: dict[str, object] = {}
+
+        def __init__(self) -> None:
+            self.link_map = {
+                "tool_link": _FakeLink(
+                    visuals=[_FakeVisual(str(visual_mesh))],
+                    collisions=[_FakeCollision(str(collision_mesh))],
+                ),
+            }
+
+        @staticmethod
+        def load(_urdf_path: str, **_: object) -> "FakeUrdf":
+            return FakeUrdf()
+
+    monkeypatch.setattr(routes_urdf, "default_package_paths", lambda: [])
+    monkeypatch.setattr(
+        routes_urdf,
+        "resolve_robot_model",
+        lambda **kwargs: SimpleNamespace(
+            urdf_path=str(kwargs["urdf_path"]),
+            package_paths=[],
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "yourdfpy", SimpleNamespace(URDF=FakeUrdf))
+    routes_urdf._urdf_cache.clear()  # type: ignore[attr-defined]
+
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=MockKernelClient())
+    state.deployment_source_path = str(tmp_path / "deployment.yaml")
+    state.deployment = SimpleNamespace(
+        robot_config=SimpleNamespace(
+            robot_id="ur",
+            group_id="arm",
+            urdf_path=str(urdf),
+            srdf_path=None,
+            package_paths=[],
+        )
+    )
+    client = TestClient(create_app(state))
+
+    response = client.get("/api/scene/urdf/manifest")
+    assert response.status_code == 200
+    manifest = response.json()
+    link = manifest["links"][0]
+    assert link["visuals"][0]["mesh_url"] != link["collisions"][0]["mesh_url"]
+    assert "/meshes/tool_link/0" in link["visuals"][0]["mesh_url"]
+    assert "/collision-meshes/tool_link/0" in link["collisions"][0]["mesh_url"]
+    assert link["collisions"][0]["collision_origin"]["orientation_xyzw"] == [0.0, 0.0, 0.0, 1.0]
+
+
+def test_urdf_manifest_surfaces_robot_model_authority_and_keys_by_fingerprint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    urdf = tmp_path / "lite6.urdf"
+    urdf.write_text("fixture")
+
+    class FakeUrdf:
+        base_link = "base_link"
+
+        def __init__(self) -> None:
+            self.link_map = {
+                "base_link": _FakeLink(),
+                "link6": _FakeLink([_FakeVisual(str(tmp_path / "mesh.stl"))]),
+                "left_finger_link": _FakeLink(),
+                "right_finger_link": _FakeLink(),
+            }
+            self.joint_map = {
+                **{
+                    f"joint{i}": _FakeManifestJoint(
+                        f"joint{i}",
+                        parent="base_link",
+                        child=f"link{i}",
+                    )
+                    for i in range(1, 7)
+                },
+                "right_finger_joint": _FakeManifestJoint(
+                    "right_finger_joint",
+                    joint_type="prismatic",
+                    parent="link6",
+                    child="right_finger_link",
+                ),
+                "left_finger_joint": _FakeManifestJoint(
+                    "left_finger_joint",
+                    joint_type="prismatic",
+                    parent="link6",
+                    child="left_finger_link",
+                    mimic=_FakeManifestMimic("right_finger_joint"),
+                ),
+            }
+
+        @staticmethod
+        def load(_urdf_path: str, **_: object) -> "FakeUrdf":
+            return FakeUrdf()
+
+    def fake_resolve_robot_model(**kwargs: object) -> SimpleNamespace:
+        return SimpleNamespace(
+            urdf_path=str(kwargs["urdf_path"]),
+            package_paths=[],
+        )
+
+    monkeypatch.setattr(routes_urdf, "default_package_paths", lambda: [])
+    monkeypatch.setattr(routes_urdf, "resolve_robot_model", fake_resolve_robot_model)
+    monkeypatch.setitem(sys.modules, "yourdfpy", SimpleNamespace(URDF=FakeUrdf))
+    routes_urdf._urdf_cache.clear()  # type: ignore[attr-defined]
+
+    kernel = MockKernelClient()
+    kernel.robot_model_authority_metadata = {
+        "canonical_fingerprint": "fingerprint-a",
+        "view_fingerprint": "view-a",
+        "view_changed": True,
+        "commandable_joint_names": [
+            "joint1",
+            "joint2",
+            "joint3",
+            "joint4",
+            "joint5",
+            "joint6",
+            "right_finger_joint",
+        ],
+        "group_commandable_joint_names": {
+            "lite6": ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6"],
+            "lite_gripper": ["right_finger_joint"],
+        },
+        "grippers": {
+            "primary": {
+                "group_id": "lite_gripper",
+                "command_joint": "right_finger_joint",
+                "derived_joints": ["left_finger_joint"],
+                "presets": {"open": 0.0081, "close": 0.0},
+            }
+        },
+    }
+
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state.deployment_source_path = str(tmp_path / "deployment.yaml")
+    state.deployment = SimpleNamespace(
+        robot_config=SimpleNamespace(
+            robot_id="lite6",
+            group_id="lite6",
+            urdf_path=str(urdf),
+            srdf_path=None,
+            package_paths=[],
+        )
+    )
+    client = TestClient(create_app(state))
+
+    first = client.get("/api/scene/urdf/manifest")
+    assert first.status_code == 200
+    manifest = first.json()
+    assert manifest["authority"]["canonical_fingerprint"] == "fingerprint-a"
+    assert manifest["authority"]["group_commandable_joint_names"]["lite6"] == [
+        "joint1",
+        "joint2",
+        "joint3",
+        "joint4",
+        "joint5",
+        "joint6",
+    ]
+    assert manifest["authority"]["grippers"]["primary"]["command_joint"] == (
+        "right_finger_joint"
+    )
+    assert manifest["authority"]["grippers"]["primary"]["derived_joints"] == [
+        "left_finger_joint"
+    ]
+    assert "models/" + manifest["model_key"] in manifest["links"][0]["visuals"][0]["mesh_url"]
+
+    kernel.robot_model_authority_metadata = {
+        **kernel.robot_model_authority_metadata,
+        "canonical_fingerprint": "fingerprint-b",
+    }
+    second = client.get("/api/scene/urdf/manifest")
+    assert second.status_code == 200
+    assert second.json()["model_key"] != manifest["model_key"]
 
 
 # ----------------------------------------------------------------------

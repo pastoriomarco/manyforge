@@ -1539,7 +1539,6 @@ class Deployment:
                 gripper_data.get("auxiliary_frames", []),
                 f"grippers.{gripper_id}.auxiliary_frames",
             )
-
             parsed[gripper_id] = GripperConfig(
                 command_mode=command_mode,
                 group_id=group_id,
@@ -3117,6 +3116,10 @@ class Deployment:
                     "motion_time_s": config.motion_time_s,
                     "description": config.description,
                     "touch_links": list(config.touch_links),
+                    "mount_frame": config.mount_frame,
+                    "attach_frame": config.attach_frame,
+                    "tcp_frame": config.tcp_frame,
+                    "auxiliary_frames": list(config.auxiliary_frames),
                 }
                 for gripper_id, config in self.grippers.items()
             }

@@ -1,0 +1,17 @@
+manyforge_isaac_gripper_action_bridge:
+  ros__parameters:
+    action_name: /lite_gripper_controller/gripper_cmd
+    command_topic: /isaac_joint_commands_gripper
+    state_topic: /isaac_joint_states
+    commanded_joint: right_finger_joint
+    joint_names:
+      - right_finger_joint
+    multipliers: [1.0]
+    offsets: [0.0]
+    completion_tolerance_rad: 0.004
+    state_freshness_timeout_s: 1.0
+    goal_timeout_s: 5.0
+    publish_period_s: 0.05
+    hold_last_target: true
+    require_state_before_goal: true
+    require_all_state_joints: true

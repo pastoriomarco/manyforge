@@ -120,7 +120,16 @@ EOF
     source_if_exists "${WORKSPACE}/install/setup.bash"
 fi
 
+isaac_profile="${ISAAC_TOPIC_CONTROL_PROFILE:-}"
+if [ -z "${isaac_profile}" ]; then
+    case "${DEPLOYMENT_PATH:-}" in
+        *lite6*) isaac_profile="lite6" ;;
+        *) isaac_profile="ur10e" ;;
+    esac
+fi
+
 exec ros2 launch manyforge_ros_bringup isaac_topic_based_control.launch.py \
+    isaac_profile:="${isaac_profile}" \
     composer_url:="${COMPOSER_URL:-http://127.0.0.1:9000}" \
     program_path:="${PROGRAM_PATH:-/workspace/examples/isaac_manipulator_scene_light.program.yaml}" \
     deployment_path:="${DEPLOYMENT_PATH:-/workspace/examples/isaac_manipulator_scene_light_ros2_control.deployment.yaml}" \

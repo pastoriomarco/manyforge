@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 import sys
 
@@ -23,6 +24,68 @@ def _deployment_with_execution_adapter(adapter_id: str):
         },
         orchestrator=SimpleNamespace(config={"collision_monitor_period_ms": 50.0}),
     )
+
+
+def _write_one_joint_model(root: Path) -> tuple[Path, Path]:
+    urdf = root / "robot.urdf"
+    srdf = root / "robot.srdf"
+    urdf.write_text(
+        """
+        <robot name="one_joint">
+          <link name="base"/>
+          <link name="tool"/>
+          <joint name="joint1" type="revolute">
+            <parent link="base"/>
+            <child link="tool"/>
+            <axis xyz="0 0 1"/>
+            <limit lower="-1" upper="1" effort="10" velocity="2"/>
+          </joint>
+        </robot>
+        """,
+        encoding="utf-8",
+    )
+    srdf.write_text(
+        """
+        <robot name="one_joint">
+          <group name="arm">
+            <joint name="joint1"/>
+          </group>
+        </robot>
+        """,
+        encoding="utf-8",
+    )
+    return urdf, srdf
+
+
+def _write_invalid_mimic_model(root: Path) -> tuple[Path, Path]:
+    urdf = root / "invalid.urdf"
+    srdf = root / "invalid.srdf"
+    urdf.write_text(
+        """
+        <robot name="invalid">
+          <link name="base"/>
+          <link name="left"/>
+          <joint name="left_joint" type="prismatic">
+            <parent link="base"/>
+            <child link="left"/>
+            <mimic joint="missing_master"/>
+            <limit lower="0" upper="1" effort="10" velocity="1"/>
+          </joint>
+        </robot>
+        """,
+        encoding="utf-8",
+    )
+    srdf.write_text(
+        """
+        <robot name="invalid">
+          <group name="arm">
+            <joint name="left_joint"/>
+          </group>
+        </robot>
+        """,
+        encoding="utf-8",
+    )
+    return urdf, srdf
 
 
 def test_ros2_control_adapter_fails_closed_when_runtime_factory_missing():
@@ -249,3 +312,121 @@ def test_kernel_config_omits_single_shot_ik_timeout_when_absent():
     )
     assert config is not None
     assert "single_shot_ik_timeout_s" not in config
+
+
+def test_native_kernel_factory_attaches_robot_model_authority_metadata(
+    monkeypatch,
+    tmp_path,
+):
+    urdf, srdf = _write_one_joint_model(tmp_path)
+    deployment = SimpleNamespace(
+        adapters={
+            "execution": SimpleNamespace(
+                adapter_id="execution.roboplan_native",
+                config={},
+            )
+        },
+        orchestrator=SimpleNamespace(config={}),
+        robot_config=SimpleNamespace(
+            group_id="arm",
+            urdf_path=str(urdf),
+            srdf_path=str(srdf),
+            package_paths=[str(tmp_path)],
+        ),
+        grippers={},
+        source_path=str(tmp_path / "deployment.yaml"),
+        baseline_collision_policy_snapshot=lambda: None,
+    )
+    recorded: dict[str, object] = {}
+    fake_bundle = object()
+
+    fake_roboplan = ModuleType("manyforge_roboplan_py")
+
+    def create_native_kernel_from_paths(
+        model_name,
+        group_name,
+        urdf_path,
+        srdf_path,
+        package_paths,
+        config,
+    ):
+        recorded["model_name"] = model_name
+        recorded["group_name"] = group_name
+        recorded["urdf_path"] = urdf_path
+        recorded["srdf_path"] = srdf_path
+        recorded["package_paths"] = package_paths
+        recorded["config"] = config
+        return fake_bundle
+
+    fake_roboplan.create_native_kernel_from_paths = create_native_kernel_from_paths
+    monkeypatch.setitem(sys.modules, "manyforge_roboplan_py", fake_roboplan)
+
+    fake_client_module = ModuleType("native_kernel_client")
+
+    class FakeNativeKernelClient:
+        def __init__(self, bundle, **kwargs):
+            self.bundle = bundle
+            self.kwargs = kwargs
+
+    fake_client_module.NativeKernelClient = FakeNativeKernelClient
+    monkeypatch.setitem(sys.modules, "native_kernel_client", fake_client_module)
+
+    kernel, bundle = composer_main._make_kernel(deployment)
+
+    assert isinstance(kernel, FakeNativeKernelClient)
+    assert bundle is fake_bundle
+    assert recorded["model_name"] == "robot"
+    assert recorded["group_name"] == "arm"
+    assert recorded["urdf_path"] == str(urdf)
+    assert recorded["srdf_path"] == str(srdf)
+    assert recorded["package_paths"] == [str(tmp_path)]
+    assert recorded["config"] is None
+    assert kernel.robot_model_authority_metadata["view_changed"] is False
+    assert kernel.robot_model_authority_metadata["canonical_urdf_path"] == str(urdf)
+    assert kernel.kwargs["robot_model_authority_metadata"] == (
+        kernel.robot_model_authority_metadata
+    )
+    assert kernel.kwargs["robot_model_authority_temp_dir"] is None
+
+
+def test_native_kernel_factory_fails_closed_on_invalid_authority_model(
+    monkeypatch,
+    tmp_path,
+):
+    urdf, srdf = _write_invalid_mimic_model(tmp_path)
+    deployment = SimpleNamespace(
+        adapters={
+            "execution": SimpleNamespace(
+                adapter_id="execution.roboplan_native",
+                config={},
+            )
+        },
+        orchestrator=SimpleNamespace(config={}),
+        robot_config=SimpleNamespace(
+            group_id="arm",
+            urdf_path=str(urdf),
+            srdf_path=str(srdf),
+            package_paths=[str(tmp_path)],
+        ),
+        grippers={},
+        source_path=str(tmp_path / "deployment.yaml"),
+        baseline_collision_policy_snapshot=lambda: None,
+    )
+    fake_roboplan = ModuleType("manyforge_roboplan_py")
+
+    def create_native_kernel_from_paths(*_args, **_kwargs):
+        raise AssertionError("invalid authority model reached RoboPlan factory")
+
+    fake_roboplan.create_native_kernel_from_paths = create_native_kernel_from_paths
+    monkeypatch.setitem(sys.modules, "manyforge_roboplan_py", fake_roboplan)
+
+    fake_client_module = ModuleType("native_kernel_client")
+    fake_client_module.NativeKernelClient = object
+    monkeypatch.setitem(sys.modules, "native_kernel_client", fake_client_module)
+
+    with pytest.raises(RuntimeFactoryRequirementsError) as exc_info:
+        composer_main._make_kernel(deployment)
+
+    detail = exc_info.value.to_detail()
+    assert detail["reason_code"] == "native_factory_runtime_failed"
+    assert "unknown master joint" in detail["original_error"]

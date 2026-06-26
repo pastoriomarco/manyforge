@@ -3,6 +3,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api } from '../api/client';
 import { usePersistentDraft } from '../hooks/usePersistentDraft';
 import { gripperCandidateRequest } from '../utils/gripperAuthoring';
+import { robotControlJointsForGroup } from '../utils/robotModelAuthority';
 import {
   accumulateJointDrafts,
   jointTargetFromDrafts,
@@ -170,9 +171,6 @@ interface RobotControlPanelProps {
   onClose: () => void;
 }
 
-const DRIVABLE_TYPES = new Set(['revolute', 'prismatic', 'continuous']);
-
-
 const REVOLUTE_STEPS: readonly number[] = [0.001, 0.01, 0.1, 0.5];
 const PRISMATIC_STEPS: readonly number[] = [0.001, 0.01, 0.1];
 
@@ -246,23 +244,8 @@ export function RobotControlPanel({ onClose }: RobotControlPanelProps) {
   }, [robotModelKey]);
 
   const drivableJoints = useMemo(() => {
-    if (manifest?.joints === undefined) return [];
-    // Hide URDF `<mimic>` joints — they're pinned to a master joint
-    // (multiplier·q_master + offset) and cannot be commanded
-    // independently. Also hide the masters, because the default
-    // Robot Control surface has no command path to the gripper chain;
-    // moving the master slider would do nothing until a dedicated
-    // gripper widget owns it. Net effect: the Robotiq gripper chain
-    // disappears from the jog panel; the visualisation still follows
-    // when the gripper is commanded via its own controller through the
-    // deployment's gripper node.
-    return manifest.joints.filter(
-      (j) =>
-        DRIVABLE_TYPES.has(j.type) &&
-        !j.mimic &&
-        !j.is_mimic_master,
-    );
-  }, [manifest]);
+    return robotControlJointsForGroup(manifest, robot?.group_id ?? null);
+  }, [manifest, robot?.group_id]);
 
   return (
     <div className="pointer-events-auto absolute right-2 top-2 z-20 flex max-h-[calc(100%-5rem)] w-72 flex-col overflow-hidden rounded-md border border-gray-700 bg-gray-900/50 text-xs text-gray-200 shadow-xl">
@@ -466,13 +449,14 @@ function JointModeBody({
   onJointRadStepChange: (next: number) => void;
   commandGate: RobotCommandGate;
 }) {
-  // Joint-name list for authored joint targets. Sourced from the
-  // backend's view (scene.robot.joint_names) rather than the URDF
-  // manifest, since validated candidate planning keys off backend
-  // joint ordering and the URDF order/set may diverge.
-  // Falls back to URDF drivable names when scene state hasn't loaded.
+  // Joint-name list for authored joint targets. RMA-5 makes this the active
+  // arm group's commandable joints from canonical Robot Model Authority
+  // metadata, so gripper mimic chains never leak into arm jogging.
   const sessionJointNames = useMemo(
-    () => robot?.joint_names ?? drivableJoints.map((j) => j.name),
+    () =>
+      drivableJoints.length > 0
+        ? drivableJoints.map((j) => j.name)
+        : robot?.joint_names ?? [],
     [robot, drivableJoints],
   );
   const {
@@ -1622,6 +1606,7 @@ function GripperRow({
     () => Object.entries(gripper.srdf_presets ?? {}),
     [gripper.srdf_presets],
   );
+  const derivedJoints = gripper.derived_joints ?? [];
 
   // Author (NOT dispatch) a staged gripper candidate. Slider release and preset
   // clicks no longer call /api/scene/gripper/command directly; the robot moves
@@ -1659,6 +1644,14 @@ function GripperRow({
         </span>
         <span className="text-[10px] text-gray-500">{gripper.joint_name}</span>
       </div>
+      {derivedJoints.length > 0 && (
+        <div
+          className="truncate text-[10px] text-gray-500"
+          title={`Mimic followers: ${derivedJoints.join(', ')}`}
+        >
+          follows: {derivedJoints.join(', ')}
+        </div>
+      )}
       <div className="flex items-baseline justify-between gap-2 text-[10px] text-gray-400">
         <span>
           live:{' '}

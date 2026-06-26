@@ -121,6 +121,16 @@ class KernelEventCollector {
 struct NativeKernelBundle {
   std::string group_name;
 
+  // Robot Model Authority metadata. Empty for legacy/example models that do
+  // not require a private RoboPlan import view. When populated, public binding
+  // readout maps private view joint names back to canonical deployment names.
+  std::string canonical_model_fingerprint;
+  std::string roboplan_view_fingerprint;
+  std::map<std::string, std::string> canonical_to_view_joint_names;
+  std::map<std::string, std::string> view_to_canonical_joint_names;
+  std::map<std::string, std::vector<std::string>>
+      group_commandable_joint_names;
+
   // Owned components — order matters for destruction
   std::shared_ptr<roboplan::Scene> scene;
   std::shared_ptr<roboplan::RRT> rrt;

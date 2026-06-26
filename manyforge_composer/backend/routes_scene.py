@@ -1026,8 +1026,9 @@ def _collect_gripper_states(
     if advance_commands:
         _advance_gripper_commands(state)
     joint_limits: dict[str, tuple[Optional[float], Optional[float]]] = {}
+    derived_joints_by_gripper: dict[str, list[str]] = {}
     try:
-        from .routes_urdf import get_urdf_entry
+        from .routes_urdf import get_urdf_entry, robot_model_authority_metadata
 
         entry = get_urdf_entry(state)
         if entry is not None:
@@ -1035,6 +1036,17 @@ def _collect_gripper_states(
                 joint.name: (joint.limit_lower, joint.limit_upper)
                 for joint in entry.joints
             }
+        metadata = robot_model_authority_metadata(state)
+        raw_grippers = metadata.get("grippers") if isinstance(metadata, dict) else None
+        if isinstance(raw_grippers, dict):
+            for gripper_id, profile in raw_grippers.items():
+                if not isinstance(profile, dict):
+                    continue
+                raw_derived = profile.get("derived_joints", [])
+                if isinstance(raw_derived, (list, tuple)):
+                    derived_joints_by_gripper[str(gripper_id)] = [
+                        str(name) for name in raw_derived
+                    ]
     except Exception:
         logger.debug("gripper limit cache build failed", exc_info=True)
     # Resolve auto-discovered visualization root + tcp→root SE(3)
@@ -1061,6 +1073,19 @@ def _collect_gripper_states(
             config.joint_name,
             (None, None),
         )
+        derived_joints = derived_joints_by_gripper.get(gripper_id)
+        if derived_joints is None:
+            try:
+                from .routes_urdf import get_urdf_entry
+
+                entry = get_urdf_entry(state)
+                derived_joints = [
+                    joint.name
+                    for joint in (entry.joints if entry is not None else ())
+                    if joint.mimic is not None and joint.mimic[0] == config.joint_name
+                ]
+            except Exception:
+                derived_joints = []
         visualization = None
         if resolve_gripper_visualization is not None:
             srdf_gripper_joints: tuple[str, ...] = ()
@@ -1103,6 +1128,7 @@ def _collect_gripper_states(
             SceneGripperStateResponse(
                 gripper_id=gripper_id,
                 joint_name=config.joint_name,
+                derived_joints=list(derived_joints),
                 state=str(getattr(status.state, "value", status.state)),
                 current_position=status.current_position,
                 target_position=status.target_position,

@@ -1073,6 +1073,7 @@ class SceneGripperVisualizationResponse(BaseModel):
 class SceneGripperStateResponse(BaseModel):
     gripper_id: str
     joint_name: str
+    derived_joints: List[str] = Field(default_factory=list)
     state: str
     current_position: Optional[float] = None
     target_position: Optional[float] = None
@@ -1898,6 +1899,13 @@ class AssistantProviderCatalogResponse(BaseModel):
     model_config = _ALIAS_CFG
     providers: List[AssistantProviderDescriptorResponse] = Field(default_factory=list)
     configured_provider_id: Optional[str] = Field(default=None, alias="configuredProviderId")
+    # The model the configured provider's bridge is actually running, read live
+    # at request time from the bridge /healthz. Decoupled from the static
+    # deployment model_id/profile_ref. None when the live read is unavailable
+    # (no endpoint, probe failure, timeout) so the frontend falls back to the
+    # deployment-declared label.
+    live_model: Optional[str] = Field(default=None, alias="liveModel")
+    live_model_source: Optional[str] = Field(default=None, alias="liveModelSource")
 
 
 class AssistantInspectIsaacSceneRequest(BaseModel):

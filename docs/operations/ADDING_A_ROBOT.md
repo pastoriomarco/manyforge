@@ -40,6 +40,13 @@ mimic-joint hiding in the jog panel, FK + link poses, frame inventory,
 per-joint Robot Control limits, named-frame defaults — all of it
 flows from URDF metadata + the deployment YAML.
 
+ManyForge treats the URDF/SRDF as the canonical robot description. Do
+not create reduced "compatibility" URDF/SRDF variants or deployment-level
+joint-coupling schemas to work around a parser. If a third-party backend needs
+a private import view, ManyForge derives that view internally while keeping the
+public joint names, gripper command joint, mimic laws, and fingerprints tied to
+the canonical model.
+
 ## What auto-handles itself (do not re-author)
 
 Everything in this list is derived from the URDF/SRDF + deployment
@@ -51,12 +58,14 @@ YAML at load time. You should not add code per-robot for these:
   `<origin rpy="..." />` rotations go through a quaternion path so
   Three.js renders them correctly.
 - **Mimic chains.** URDF `<mimic>` joints (e.g. Robotiq 2F-140's
-  knuckle/finger joints chained to `finger_joint`) are auto-detected
-  by the URDF parser; the jog panel hides both the mimic joints and
-  their master. FK + visualization still follow the master.
-- **Drivable-joint detection.** The jog panel lists revolute /
-  continuous / prismatic joints from the SRDF planning group,
-  minus any mimic chain.
+  knuckle/finger joints chained to `finger_joint`, or a two-finger gripper
+  where one prismatic finger follows the other) are auto-detected from the
+  canonical model. FK, collision, and visualization still include the derived
+  mimic joints.
+- **Drivable-joint detection.** The jog panel lists the active SRDF planning
+  group's commandable arm joints. Gripper command joints are driven through the
+  gripper controls, not through the arm jog sliders; derived mimic joints are
+  never directly joggable.
 - **Frame inventory.** Every URDF link is a candidate frame. Frames
   named in the deployment YAML (robot base, program TCP, gripper
   mount/attach/TCP/auxiliary) are visible by default; URDF link
@@ -249,9 +258,10 @@ Then check these three signals in the browser at
 
 1. **Robot panel shows the expected joint sliders.** Open the Robot
    overlay (top-right). The slider count should match the SRDF
-   planning group's revolute/continuous/prismatic joint count, with
-   the gripper mimic chain hidden. If a gripper master slider shows
-   up, see [§ Mimic chains and the jog panel](#mimic-chains-and-the-jog-panel).
+   planning group's commandable arm joint count. Gripper command joints belong
+   in the gripper controls; mimic followers must not appear as jog sliders. If
+   a gripper joint shows up in the arm jog panel, see
+   [§ Mimic chains and the jog panel](#mimic-chains-and-the-jog-panel).
 2. **Tools → Frames lists only the named frames as visible.**
    Expected visible-by-default set:
    `universe` (world), `<base_frame>` (robot_base),
@@ -299,7 +309,7 @@ curl -sX POST http://localhost:9000/api/program/load \
 curl -s http://localhost:9000/api/scene/state \
   | python3 -c "import json,sys; print(json.load(sys.stdin)['robot']['joint_names'])"
 
-# 3) Drivable joints in jog panel after mimic filter
+# 3) Drivable joints in the active arm jog panel
 curl -s http://localhost:9000/api/scene/urdf/manifest \
   | python3 -c "import json,sys; m=json.load(sys.stdin); \
       print([j['name'] for j in m['joints'] \
@@ -342,9 +352,11 @@ in `/api/scene/state` matches the `model_key` in `/api/scene/urdf/manifest`.
 
 ### Mimic chains and the jog panel
 
-If the master joint of your gripper mimic chain shows up in the jog
-panel, the URDF probably did not declare it as a master via `<mimic>`
-on at least one other joint. Verify:
+If a gripper joint shows up in the arm jog panel, first verify the loaded model
+still declares the mimic relation in the canonical URDF and that the deployment
+uses the arm SRDF group as `robot_config.group_id`, not the gripper group. The
+gripper's command joint should be declared in `grippers.<id>.joint_name` and
+driven by the gripper controls. Verify the mimic relation with:
 
 ```bash
 python3 -c "
@@ -357,11 +369,11 @@ for j in root.findall('joint'):
 "
 ```
 
-If your gripper genuinely has **two independent driven joints** (e.g.
-a three-finger gripper without mimic links), the panel will list both
-sliders today. The clean fix is a dedicated Gripper widget driving the
-deployment's `command_gripper` node — that is a UX feature, not a
-config issue, and is tracked separately.
+If your gripper genuinely has **multiple independent driven joints** (e.g. a
+three-finger gripper without mimic links), model those joints truthfully in the
+URDF/SRDF and use a gripper command mode that supports the hardware contract.
+Do not fake independence with mimic tags, and do not add deployment-level
+coupling rules.
 
 ### Robot Control joint-limit errors
 
@@ -386,6 +398,7 @@ with `forceDiscardOverrides: true` clears all per-frame overrides.
 
 | Concern | File / module |
 |---|---|
+| Canonical robot metadata, mimic laws, commandable-vs-derived joints | `manyforge_behavior/manyforge_behavior/robot_model_authority.py` |
 | URDF parsing + manifest | `manyforge_composer/backend/routes_urdf.py` |
 | Mimic-joint detection | `routes_urdf.py` `_extract_mimic` |
 | Frame inventory + default visibility | `manyforge_composer/backend/routes_scene.py` (`_scene_frame_roles`, `_load_model_frame_names`) |

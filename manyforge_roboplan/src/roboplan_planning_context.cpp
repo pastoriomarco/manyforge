@@ -1857,6 +1857,44 @@ RoboPlanPlanningContext::object_snapshot_bodies_locked(
   return bodies;
 }
 
+std::string RoboPlanPlanningContext::robot_model_frame_id_locked() const {
+  if (!scene_) {
+    return "base_link";
+  }
+  const auto& model = scene_->getModel();
+  for (const auto& frame : model.frames) {
+    if (frame.name.empty() || is_world_frame(frame.name)) {
+      continue;
+    }
+    if (frame.type == pinocchio::BODY && frame.parentJoint == 0) {
+      return frame.name;
+    }
+  }
+  if (model.existFrame("base_link")) {
+    return "base_link";
+  }
+  for (const auto& frame : model.frames) {
+    if (!frame.name.empty() && !is_world_frame(frame.name) &&
+        frame.type == pinocchio::BODY) {
+      return frame.name;
+    }
+  }
+  return "base_link";
+}
+
+Eigen::Matrix4d RoboPlanPlanningContext::robot_model_frame_world_matrix_locked(
+    const std::string& model_frame_id) const {
+  if (is_world_frame(model_frame_id)) {
+    return Eigen::Matrix4d::Identity();
+  }
+  const auto& positions = scene_->getCurrentJointPositions();
+  Eigen::VectorXd q(positions.size());
+  for (Eigen::Index i = 0; i < positions.size(); ++i) {
+    q[i] = positions[i];
+  }
+  return world_from_robot_base_ * scene_->forwardKinematics(q, model_frame_id);
+}
+
 core::CollisionWorldSnapshotPtr
 RoboPlanPlanningContext::build_collision_world_snapshot_locked() const {
   std::string robot_id;
@@ -1872,8 +1910,9 @@ RoboPlanPlanningContext::build_collision_world_snapshot_locked() const {
 
   core::CollisionRobotModelFrame robot_frame;
   robot_frame.robot_id = robot_id;
-  robot_frame.model_frame_id = "base_link";
-  robot_frame.world_pose = matrix_to_pose(world_from_robot_base_);
+  robot_frame.model_frame_id = robot_model_frame_id_locked();
+  robot_frame.world_pose =
+      matrix_to_pose(robot_model_frame_world_matrix_locked(robot_frame.model_frame_id));
   builder.add_robot_model_frame(std::move(robot_frame));
 
   for (auto& body : robot_snapshot_bodies_locked(robot_id)) {
@@ -2341,7 +2380,19 @@ core::Pose3DTO RoboPlanPlanningContext::pose_in_base_from_tracked_locked(
 
 bool RoboPlanPlanningContext::infer_attached_from_frame(
     const std::string& frame_id) const {
-  return !is_world_frame(frame_id) && frame_id != "base_link";
+  if (is_world_frame(frame_id) || frame_id == "base_link") {
+    return false;
+  }
+  if (scene_) {
+    try {
+      if (frame_id == robot_model_frame_id_locked()) {
+        return false;
+      }
+    } catch (const std::exception&) {
+      // Fall back to the historical conservative rule below.
+    }
+  }
+  return true;
 }
 
 std::vector<std::string> RoboPlanPlanningContext::normalize_touch_links_locked(

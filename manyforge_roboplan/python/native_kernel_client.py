@@ -265,18 +265,80 @@ class NativeKernelClient(KernelClient):
     native C++ — no pybind11 trampolines on the hot path.
     """
 
-    def __init__(self, bundle) -> None:
+    def __init__(
+        self,
+        bundle,
+        *,
+        robot_model_authority_metadata: Optional[Dict[str, Any]] = None,
+        robot_model_authority_temp_dir: Any = None,
+    ) -> None:
         """Initialize with a NativeKernelBundle from manyforge_roboplan_py.
 
         Args:
             bundle: NativeKernelBundle returned by create_native_kernel()
         """
         self._bundle = bundle
+        self.robot_model_authority_metadata = dict(
+            robot_model_authority_metadata or {}
+        )
+        self._robot_model_authority_temp_dir = robot_model_authority_temp_dir
+        self._canonical_to_view_joint_names = dict(
+            self.robot_model_authority_metadata.get(
+                "canonical_to_view_joint_names",
+                {},
+            )
+            or {}
+        )
+        self._view_to_canonical_joint_names = dict(
+            self.robot_model_authority_metadata.get(
+                "view_to_canonical_joint_names",
+                {},
+            )
+            or {}
+        )
+        self._group_commandable_joint_names = {
+            str(group_id): [str(joint) for joint in joints]
+            for group_id, joints in (
+                self.robot_model_authority_metadata.get(
+                    "group_commandable_joint_names",
+                    {},
+                )
+                or {}
+            ).items()
+        }
+        attach_metadata = getattr(
+            self._bundle,
+            "set_robot_model_authority_metadata",
+            None,
+        )
+        if callable(attach_metadata) and self.robot_model_authority_metadata:
+            attach_metadata(self.robot_model_authority_metadata)
         self._active_gripper_commands: Dict[str, Dict[str, Any]] = {}
         self._gripper_status_cache: Dict[str, GripperCommandStatus] = {}
 
+    def _view_joint_name(self, canonical_joint_name: str) -> str:
+        return self._canonical_to_view_joint_names.get(
+            canonical_joint_name,
+            canonical_joint_name,
+        )
+
     def _get_group_joint_index(self, group_id: str, joint_name: str) -> int:
-        joint_names = list(self._bundle.get_group_joint_names(group_id))
+        commandable = self._group_commandable_joint_names.get(group_id)
+        joint_names = (
+            list(commandable)
+            if commandable
+            else list(self._bundle.get_group_joint_names(group_id))
+        )
+        group_positions = self._get_group_joint_positions(group_id)
+        if len(joint_names) != len(group_positions):
+            commandable = self._group_commandable_joint_names.get(group_id)
+            if commandable and joint_names != list(commandable):
+                joint_names = list(commandable)
+        if len(joint_names) != len(group_positions):
+            raise ValueError(
+                f"Gripper group '{group_id}' reports {len(joint_names)} joints "
+                f"but {len(group_positions)} position slots"
+            )
         if joint_name not in joint_names:
             raise ValueError(
                 f"Joint '{joint_name}' was not found in gripper group '{group_id}'"
@@ -284,6 +346,13 @@ class NativeKernelClient(KernelClient):
         return joint_names.index(joint_name)
 
     def _get_group_joint_positions(self, group_id: str) -> list[float]:
+        commandable_positions = getattr(
+            self._bundle,
+            "get_group_commandable_joint_positions",
+            None,
+        )
+        if callable(commandable_positions):
+            return list(commandable_positions(group_id))
         return list(self._bundle.get_group_joint_positions(group_id))
 
     def _compute_gripper_command_status(self, gripper_id: str) -> GripperCommandStatus:

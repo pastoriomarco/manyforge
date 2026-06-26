@@ -378,19 +378,20 @@ function PoseSourcesSection({ sources }: { sources: PoseSourceStatusState[] }) {
   const setMeasuredStateGhostVisible = useViewerSelectionStore(
     (s) => s.setMeasuredStateGhostVisible,
   );
-
-  if (sources.length === 0) {
-    return (
-      <div className="text-[11px] italic text-gray-500">
-        No pose sources declared in deployment.
-      </div>
-    );
-  }
+  const collisionMeshesVisible = useViewerSelectionStore(
+    (s) => s.collisionMeshesVisible,
+  );
+  const setCollisionMeshesVisible = useViewerSelectionStore(
+    (s) => s.setCollisionMeshesVisible,
+  );
 
   return (
     <div className="space-y-3">
-      <div className="rounded border border-cyan-800/60 bg-cyan-950/20 p-2">
-        <label className="flex items-center gap-2 text-[11px] text-gray-200">
+      <div className="space-y-2 rounded border border-cyan-800/60 bg-cyan-950/20 p-2">
+        <label
+          className="flex items-center gap-2 text-[11px] text-gray-200"
+          title="Overlay external measured robot/object observations. This does not modify the planning scene."
+        >
           <input
             type="checkbox"
             checked={measuredStateGhostVisible}
@@ -398,16 +399,31 @@ function PoseSourcesSection({ sources }: { sources: PoseSourceStatusState[] }) {
           />
           <span>Measured-state ghosts</span>
         </label>
+        <label
+          className="flex items-center gap-2 text-[11px] text-gray-200"
+          title="Overlay the robot URDF collision geometry used by validation. Useful when a path is rejected even though the visual mesh appears clear."
+        >
+          <input
+            type="checkbox"
+            checked={collisionMeshesVisible}
+            onChange={(event) => setCollisionMeshesVisible(event.target.checked)}
+          />
+          <span>Robot collision meshes</span>
+        </label>
         <div className="mt-1 text-[10px] leading-snug text-gray-500">
-          Shows the measured robot joint-state overlay when configured, plus
-          fresh external object observations and the measured TCP marker.
-          Composer's planning scene remains authoritative.
+          Shows optional diagnostics overlays only. Composer's planning scene
+          and collision validator remain authoritative.
         </div>
       </div>
+      {sources.length === 0 && (
+        <div className="text-[11px] italic text-gray-500">
+          No pose sources declared in deployment.
+        </div>
+      )}
       <div className="rounded border border-gray-800 bg-gray-950/50 p-2">
         <button
           type="button"
-          disabled={applyState.status === 'applying'}
+          disabled={applyState.status === 'applying' || sources.length === 0}
           onClick={async () => {
             setApplyState({ status: 'applying', message: 'Applying idle-safe updates...' });
             try {

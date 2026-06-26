@@ -18,6 +18,10 @@ from manyforge_behavior.model_paths import (
     default_package_paths,
     resolve_robot_model,
 )
+from manyforge_behavior.robot_model_runtime import (
+    attach_robot_model_metadata,
+    prepare_roboplan_runtime_model_view,
+)
 from manyforge_composer.backend.logging_config import setup_logging
 from manyforge_composer.backend.state import ComposerState
 from manyforge_composer.backend.app import create_app
@@ -475,19 +479,39 @@ def _make_kernel(
         )
         resolved_model = _resolved_robot_model_from_deployment(deployment)
         if resolved_model is not None:
+            runtime_model = prepare_roboplan_runtime_model_view(
+                resolved_model=resolved_model,
+                grippers=getattr(deployment, "grippers", {}),
+            )
             bundle = manyforge_roboplan_py.create_native_kernel_from_paths(
-                resolved_model.model_name,
+                runtime_model.model_name,
                 group_name,
-                resolved_model.urdf_path,
-                resolved_model.srdf_path,
-                resolved_model.package_paths,
+                runtime_model.urdf_path,
+                runtime_model.srdf_path,
+                runtime_model.package_paths,
                 kernel_config,
             )
         else:
+            runtime_model = None
             bundle = manyforge_roboplan_py.create_native_kernel(
                 model_name, group_name, kernel_config
             )
-        kernel = NativeKernelClient(bundle)
+        if runtime_model is not None:
+            kernel = NativeKernelClient(
+                bundle,
+                robot_model_authority_metadata=runtime_model.metadata,
+                robot_model_authority_temp_dir=runtime_model._temp_dir,
+            )
+            attach_robot_model_metadata(kernel, runtime_model)
+            attach_robot_model_metadata(bundle, runtime_model)
+            logger.info(
+                "Robot model authority view prepared: canonical=%s view=%s changed=%s",
+                runtime_model.authority.canonical_fingerprint,
+                runtime_model.import_view.view_fingerprint,
+                runtime_model.import_view.changed,
+            )
+        else:
+            kernel = NativeKernelClient(bundle)
         if collision_monitor_period_ns is not None:
             logger.info(
                 "Using NativeKernelClient (real RoboPlan planning), collision monitor period=%d ns",

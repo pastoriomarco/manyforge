@@ -1,7 +1,14 @@
 """Tests for deployment artifact loading and validation."""
 
+import hashlib
+import importlib.util
+import json
 import os
+import shutil
+import subprocess
+import sys
 import tempfile
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import pytest
@@ -51,6 +58,106 @@ ISAAC_LIGHT_PROGRAM_PATH = (
     / "examples"
     / "isaac_manipulator_scene_light.program.yaml"
 )
+ISAAC_LITE6_PICK_PLACE_DEPLOYMENT_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "examples"
+    / "isaac_lite6_lite_gripper_pick_and_place.deployment.yaml"
+)
+ISAAC_LITE6_PICK_PLACE_PROGRAM_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "examples"
+    / "isaac_lite6_lite_gripper_pick_and_place.program.yaml"
+)
+LITE6_PICK_PLACE_DEPLOYMENT_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "examples"
+    / "lite6_lite_gripper_pick_and_place.deployment.yaml"
+)
+LITE6_PICK_PLACE_PROGRAM_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "examples"
+    / "lite6_lite_gripper_pick_and_place.program.yaml"
+)
+LITE6_MODEL_DIR = (
+    Path(__file__).resolve().parents[2]
+    / "manyforge_example_models"
+    / "models"
+    / "lite6_lite_gripper"
+)
+LITE6_STATIC_MANIFEST_PATH = LITE6_MODEL_DIR / "STATIC_MANIFEST.json"
+LITE6_RUNTIME_CAPTURE_DIR = LITE6_MODEL_DIR / "manymove_runtime_capture"
+LITE6_RUNTIME_CAPTURE_JSON_PATH = (
+    LITE6_RUNTIME_CAPTURE_DIR / "manymove_lite6_runtime_capture.json"
+)
+LITE6_RUNTIME_CAPTURE_URDF_PATH = (
+    LITE6_RUNTIME_CAPTURE_DIR / "manymove_lite6_runtime.urdf"
+)
+LITE6_RUNTIME_CAPTURE_SRDF_PATH = (
+    LITE6_RUNTIME_CAPTURE_DIR / "manymove_lite6_runtime.srdf"
+)
+LITE6_ISAAC_ROS2_CONTROL_URDF_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "manyforge_ros_bringup"
+    / "urdf"
+    / "isaac_lite6_topic_based.ros2_control.urdf"
+)
+LITE6_ISAAC_CONTROLLER_CONFIG_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "manyforge_ros_bringup"
+    / "config"
+    / "isaac_lite6_topic_based_controllers.yaml"
+)
+LITE6_ISAAC_GRIPPER_BRIDGE_CONFIG_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "manyforge_ros_bringup"
+    / "config"
+    / "isaac_lite6_gripper_bridge.yaml"
+)
+LITE6_RUNTIME_COMPARE_SCRIPT = (
+    Path(__file__).resolve().parents[2]
+    / "scripts"
+    / "models"
+    / "compare_lite6_runtime_snapshot.py"
+)
+LITE6_RUNTIME_CAPTURE_SCRIPT = (
+    Path(__file__).resolve().parents[2]
+    / "scripts"
+    / "models"
+    / "capture_manymove_lite6_descriptions.py"
+)
+LITE6_STATIC_MANIFEST_VALIDATOR_SCRIPT = (
+    Path(__file__).resolve().parents[2]
+    / "scripts"
+    / "models"
+    / "validate_lite6_static_manifest.py"
+)
+LITE6_AUTHORITY_RUNTIME_CONTRACT_VALIDATOR_SCRIPT = (
+    Path(__file__).resolve().parents[2]
+    / "scripts"
+    / "models"
+    / "validate_lite6_authority_runtime_contract.py"
+)
+LITE6_ISAAC_SMOKE_VALIDATOR_SCRIPT = (
+    Path(__file__).resolve().parents[2]
+    / "scripts"
+    / "ros"
+    / "validate-isaac-lite6-smoke.py"
+)
+LITE6_ISAAC_SMOKE_ARTIFACT_VALIDATOR_SCRIPT = (
+    Path(__file__).resolve().parents[2]
+    / "scripts"
+    / "ros"
+    / "validate-isaac-lite6-smoke-artifact.py"
+)
+LAUNCH_SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "launch.sh"
+LITE6_LIMITED_ARM_BOUNDS = {
+    "joint1": ("-3.1101767270538954", "3.1101767270538954"),
+    "joint2": ("-2.61799", "2.61799"),
+    "joint3": ("-0.061087", "3.1101767270538954"),
+    "joint4": ("-3.1101767270538954", "3.1101767270538954"),
+    "joint5": ("-2.1642", "2.1642"),
+    "joint6": ("-3.1101767270538954", "3.1101767270538954"),
+}
 ASSISTANT_MODES_EXAMPLE_DEPLOYMENT_PATH = (
     Path(__file__).resolve().parents[2]
     / "examples"
@@ -74,6 +181,61 @@ def _minimal_tree() -> dict:
                 "name": "noop",
             }
         ],
+    }
+
+
+def _lite6_live_smoke_artifact_payload() -> dict:
+    joints = ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6"]
+    start = {joint: 0.0 for joint in joints}
+    probe = dict(start)
+    probe["joint1"] = 0.03
+
+    def arm_result(target):
+        return {
+            "target_positions_rad": target,
+            "final_arm_state_rad": target,
+            "final_isaac_state_rad": target,
+            "max_abs_target_error_rad": 0.0,
+        }
+
+    return {
+        "passed": True,
+        "details": {
+            "schema": "manyforge.isaac_lite6_live_smoke.v1",
+            "started_at_utc": "2026-06-25T10:00:00+00:00",
+            "ended_at_utc": "2026-06-25T10:00:03+00:00",
+            "arm_action": "/isaac_arm_controller/follow_joint_trajectory",
+            "gripper_action": "/lite_gripper_controller/gripper_cmd",
+            "arm_joint_state_topic": "/joint_states",
+            "isaac_joint_state_topic": "/isaac_joint_states",
+            "gripper_command_topic": "/isaac_joint_commands_gripper",
+            "arm_joints": joints,
+            "gripper_joint": "right_finger_joint",
+            "start_positions_rad": start,
+            "probe_positions_rad": probe,
+            "arm_delta_rad": 0.03,
+            "arm_motion_duration_s": 0.8,
+            "gripper_open_position": 0.0081,
+            "gripper_close_position": 0.0,
+            "arm_probe_result": arm_result(probe),
+            "arm_restore_result": arm_result(start),
+            "gripper_close_result": {
+                "target_position": 0.0,
+                "raw_command_position": 0.0,
+                "result_position": 0.0,
+                "reached_goal": True,
+                "stalled": False,
+                "isaac_state_position": 0.0,
+            },
+            "gripper_open_result": {
+                "target_position": 0.0081,
+                "raw_command_position": 0.0081,
+                "result_position": 0.0081,
+                "reached_goal": True,
+                "stalled": False,
+                "isaac_state_position": 0.0081,
+            },
+        },
     }
 
 
@@ -2468,6 +2630,542 @@ class TestCrossArtifactValidation:
         )
         deploy.validate_against_program(prog)
         deploy.validate_capabilities()
+
+    def test_validate_against_isaac_lite6_ros2_control_program_success(self, catalog):
+        """The Isaac Lite6 ROS execution deployment matches its pick-and-place program."""
+        deploy = Deployment(ISAAC_LITE6_PICK_PLACE_DEPLOYMENT_PATH)
+        prog = Program(ISAAC_LITE6_PICK_PLACE_PROGRAM_PATH, catalog)
+
+        assert deploy.robot_config is not None
+        assert deploy.robot_config.robot_id == "lite6"
+        assert deploy.robot_config.group_id == "lite6"
+        assert (
+            deploy.adapters["execution"].adapter_id
+            == "execution.ros2_control_follow_joint_trajectory"
+        )
+        execution_config = deploy.adapters["execution"].config
+        assert execution_config["required_joints"] == [
+            "joint1",
+            "joint2",
+            "joint3",
+            "joint4",
+            "joint5",
+            "joint6",
+        ]
+        assert execution_config["arm_action"] == (
+            "/isaac_arm_controller/follow_joint_trajectory"
+        )
+        assert execution_config["decelerate_on_cancel"] is True
+        assert execution_config["gripper"]["action_name"] == (
+            "/lite_gripper_controller/gripper_cmd"
+        )
+        assert deploy.grippers["primary"].command_mode == "ros_gripper_command"
+        assert deploy.grippers["primary"].group_id == "lite_gripper"
+        assert deploy.grippers["primary"].joint_name == "right_finger_joint"
+        assert deploy.grippers["primary"].srdf_presets == {
+            "open": 0.0081,
+            "close": 0.0,
+            "closed": 0.0,
+        }
+
+        deploy.validate_against_program(prog)
+        deploy.validate_capabilities()
+
+    def test_lite6_isaac_ros2_control_scaffold_matches_bridge_contract(self):
+        """The Lite6 Isaac bridge exposes the same joints as the deployment."""
+        urdf_text = LITE6_ISAAC_ROS2_CONTROL_URDF_PATH.read_text(encoding="utf-8")
+        urdf = ET.fromstring(urdf_text.format(
+            joint_commands_topic="/isaac_joint_commands",
+            joint_states_topic="/isaac_joint_states",
+            trigger_joint_command_threshold="-1.0",
+            sum_wrapped_joint_states="false",
+            joint1_initial="0.0",
+            joint2_initial="0.0",
+            joint3_initial="1.57",
+            joint4_initial="0.0",
+            joint5_initial="0.0",
+            joint6_initial="0.0",
+        ))
+        ros2_control = urdf.find("./ros2_control")
+        assert ros2_control is not None
+        assert [
+            joint.attrib["name"] for joint in ros2_control.findall("./joint")
+        ] == ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6"]
+        assert urdf.find("./link[@name='base_link']") is None
+        assert urdf.find("./joint[@name='base_link_to_link_base']") is None
+        assert urdf.find("./link[@name='link_base']") is not None
+        assert urdf.find("./link[@name='link_tcp']") is not None
+        assert urdf.find("./link[@name='lite_gripper_left_finger']") is not None
+        assert urdf.find("./link[@name='lite_gripper_right_finger']") is not None
+        left_finger = urdf.find("./joint[@name='left_finger_joint']")
+        assert left_finger is not None
+        mimic = left_finger.find("mimic")
+        assert mimic is not None
+        assert mimic.attrib.get("joint") == "right_finger_joint"
+        assert urdf.find("./gazebo") is not None
+        assert urdf.find("./transmission") is not None
+
+        controller_config = yaml.safe_load(
+            LITE6_ISAAC_CONTROLLER_CONFIG_PATH.read_text(encoding="utf-8")
+        )
+        controller = controller_config["isaac_arm_controller"]["ros__parameters"]
+        assert controller["joints"] == [
+            "joint1",
+            "joint2",
+            "joint3",
+            "joint4",
+            "joint5",
+            "joint6",
+        ]
+        assert controller["command_interfaces"] == ["position"]
+        assert controller["state_interfaces"] == ["position", "velocity"]
+        assert controller["constraints"]["decelerate_on_cancel"] is True
+
+        bridge_config = yaml.safe_load(
+            LITE6_ISAAC_GRIPPER_BRIDGE_CONFIG_PATH.read_text(encoding="utf-8")
+        )["manyforge_isaac_gripper_action_bridge"]["ros__parameters"]
+        assert bridge_config["action_name"] == "/lite_gripper_controller/gripper_cmd"
+        assert bridge_config["command_topic"] == "/isaac_joint_commands_gripper"
+        assert bridge_config["commanded_joint"] == "right_finger_joint"
+        assert bridge_config["joint_names"] == ["right_finger_joint"]
+
+    def test_lite6_authority_runtime_contract_validator_accepts_static_scaffold(self):
+        """The non-live RMA-7 validator pins the Lite6 Isaac static contract."""
+        spec = importlib.util.spec_from_file_location(
+            "validate_lite6_authority_runtime_contract",
+            LITE6_AUTHORITY_RUNTIME_CONTRACT_VALIDATOR_SCRIPT,
+        )
+        assert spec is not None
+        assert spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        args = type(
+            "Args",
+            (),
+            {
+                "deployment": ISAAC_LITE6_PICK_PLACE_DEPLOYMENT_PATH,
+                "ros2_control_urdf": LITE6_ISAAC_ROS2_CONTROL_URDF_PATH,
+                "controllers": LITE6_ISAAC_CONTROLLER_CONFIG_PATH,
+                "gripper_bridge": LITE6_ISAAC_GRIPPER_BRIDGE_CONFIG_PATH,
+            },
+        )()
+        report = module.validate(args)
+
+        assert report["schema"] == "manyforge.lite6_authority_runtime_contract.v1"
+        assert report["robot_id"] == "lite6"
+        assert report["arm_group"] == "lite6"
+        assert report["arm_joints"] == [
+            "joint1",
+            "joint2",
+            "joint3",
+            "joint4",
+            "joint5",
+            "joint6",
+        ]
+        assert report["gripper_group"] == "lite_gripper"
+        assert report["gripper_command_joint"] == "right_finger_joint"
+        assert report["gripper_derived_joints"] == ["left_finger_joint"]
+        assert len(report["canonical_fingerprint"]) == 64
+
+    def test_lite6_isaac_live_smoke_gate_is_profile_aware(self):
+        """The Lite6 launcher smoke must validate Lite6 joints, not UR joints."""
+        validator_text = LITE6_ISAAC_SMOKE_VALIDATOR_SCRIPT.read_text(
+            encoding="utf-8"
+        )
+        launch_text = LAUNCH_SCRIPT.read_text(encoding="utf-8")
+
+        for joint in ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6"]:
+            assert joint in validator_text
+        assert "/lite_gripper_controller/gripper_cmd" in validator_text
+        assert "/isaac_joint_commands_gripper" in validator_text
+        assert "right_finger_joint" in validator_text
+
+        assert 'SCENARIO}" == "isaac-lite6-pick-place"' in launch_text
+        assert "validate-isaac-lite6-smoke.py" in launch_text
+        assert "validate-isaac-lite6-smoke-artifact.py" in launch_text
+        assert "isaac-lite6-pick-place-live-smoke.json" in launch_text
+        assert "| tee" in launch_text
+        assert "smoke_isaac_arm_action.py" in launch_text
+        assert "--output" in validator_text
+        assert "manyforge.isaac_lite6_live_smoke.v1" in validator_text
+        assert "arm_restore_result" in validator_text
+        assert "raw_command_position" in validator_text
+
+    def test_lite6_rma0_active_artifacts_do_not_use_rejected_surfaces(self):
+        """RMA-0 keeps Lite6 active artifacts on canonical model semantics."""
+        repo_root = Path(__file__).resolve().parents[2]
+        active_paths = [
+            LITE6_PICK_PLACE_DEPLOYMENT_PATH,
+            ISAAC_LITE6_PICK_PLACE_DEPLOYMENT_PATH,
+            LITE6_MODEL_DIR / "README.md",
+            LITE6_MODEL_DIR / "lite6_lite_gripper.urdf",
+            LITE6_MODEL_DIR / "lite6_lite_gripper.srdf",
+            LITE6_ISAAC_ROS2_CONTROL_URDF_PATH,
+            repo_root / "scripts" / "models" / "export_lite6_lite_gripper_model.py",
+            LITE6_AUTHORITY_RUNTIME_CONTRACT_VALIDATOR_SCRIPT,
+            repo_root / "scripts" / "qualify-lite6-bringup.sh",
+        ]
+        forbidden_terms = [
+            "coupled_joints",
+            "coupledJoints",
+            "GripperCoupled",
+            "roboplan_compat",
+            "strip_mimic_tags_for_roboplan_compat",
+            "write_roboplan_compat",
+        ]
+        for path in active_paths:
+            text = path.read_text(encoding="utf-8")
+            for term in forbidden_terms:
+                assert term not in text, f"{term} present in {path}"
+        assert not list(LITE6_MODEL_DIR.glob("*roboplan_compat*"))
+
+        qualifier = (repo_root / "scripts" / "qualify-lite6-bringup.sh").read_text(
+            encoding="utf-8"
+        )
+        assert "test_native_e2e.py -k \"lite6\"" not in qualifier
+        assert "validate_lite6_authority_runtime_contract.py" in qualifier
+        assert "Lite6 non-live model-authority qualification passed" in qualifier
+
+    def test_lite6_live_smoke_artifact_validator_accepts_complete_evidence(
+        self, tmp_path
+    ):
+        """The recorded live-smoke artifact has a deterministic acceptance gate."""
+        artifact = tmp_path / "isaac-lite6-pick-place-live-smoke.json"
+        artifact.write_text(
+            json.dumps(_lite6_live_smoke_artifact_payload()),
+            encoding="utf-8",
+        )
+
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(LITE6_ISAAC_SMOKE_ARTIFACT_VALIDATOR_SCRIPT),
+                str(artifact),
+                "--json",
+            ],
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+        report = json.loads(completed.stdout)
+        assert report["passed"] is True
+
+    def test_lite6_live_smoke_artifact_validator_rejects_incomplete_evidence(
+        self, tmp_path
+    ):
+        """The recorded live-smoke artifact gate fails closed on weak evidence."""
+        cases = {
+            "failed_run": lambda payload: payload.update({"passed": False}),
+            "backwards_timestamps": lambda payload: payload["details"].update(
+                {
+                    "started_at_utc": "2026-06-25T10:00:03+00:00",
+                    "ended_at_utc": "2026-06-25T10:00:00+00:00",
+                }
+            ),
+            "missing_lite6_joint": lambda payload: payload["details"][
+                "arm_joints"
+            ].pop(),
+            "missing_raw_gripper_command": lambda payload: payload["details"][
+                "gripper_open_result"
+            ].pop("raw_command_position"),
+            "excessive_arm_target_error": lambda payload: payload["details"][
+                "arm_restore_result"
+            ].update(
+                {
+                    "final_arm_state_rad": {
+                        **payload["details"]["arm_restore_result"][
+                            "final_arm_state_rad"
+                        ],
+                        "joint1": 0.5,
+                    },
+                    "max_abs_target_error_rad": 0.5,
+                }
+            ),
+            "forged_arm_target_error": lambda payload: payload["details"][
+                "arm_restore_result"
+            ]["final_arm_state_rad"].update({"joint1": 0.5}),
+        }
+        for name, mutate in cases.items():
+            payload = json.loads(json.dumps(_lite6_live_smoke_artifact_payload()))
+            mutate(payload)
+            artifact = tmp_path / f"{name}.json"
+            artifact.write_text(json.dumps(payload), encoding="utf-8")
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(LITE6_ISAAC_SMOKE_ARTIFACT_VALIDATOR_SCRIPT),
+                    str(artifact),
+                    "--json",
+                ],
+                text=True,
+                capture_output=True,
+            )
+
+            assert completed.returncode != 0, name
+            report = json.loads(completed.stdout)
+            assert report["passed"] is False
+            assert report["error"]
+
+    def test_lite6_lite_gripper_pick_and_place_deployment_validates(self, catalog):
+        """The self-contained Lite6 native pick-and-place deployment matches its program."""
+        deploy = Deployment(LITE6_PICK_PLACE_DEPLOYMENT_PATH)
+        prog = Program(LITE6_PICK_PLACE_PROGRAM_PATH, catalog)
+
+        assert deploy.robot_config is not None
+        assert deploy.robot_config.robot_id == "lite6"
+        assert deploy.robot_config.group_id == "lite6"
+        assert deploy.robot_config.urdf_path.endswith("lite6_lite_gripper.urdf")
+        assert deploy.robot_config.srdf_path.endswith("lite6_lite_gripper.srdf")
+        assert "primary" in deploy.grippers
+        assert deploy.grippers["primary"].command_mode == "simulated_joint"
+        assert deploy.grippers["primary"].group_id == "lite_gripper"
+        assert deploy.grippers["primary"].joint_name == "right_finger_joint"
+        assert deploy.grippers["primary"].mount_frame == "link_eef"
+        assert deploy.grippers["primary"].attach_frame == "link_tcp"
+        assert deploy.grippers["primary"].tcp_frame == "link_tcp"
+        assert deploy.grippers["primary"].srdf_presets == {
+            "open": 0.0081,
+            "close": 0.0,
+            "closed": 0.0,
+        }
+
+        deploy.validate_against_program(prog)
+        deploy.validate_capabilities()
+
+    def test_lite6_lite_gripper_model_bundle_is_self_contained(self):
+        """The vendored Lite6 model must not depend on xarm_ros2 at runtime."""
+        urdf_path = LITE6_MODEL_DIR / "lite6_lite_gripper.urdf"
+        srdf_path = LITE6_MODEL_DIR / "lite6_lite_gripper.srdf"
+        assert urdf_path.exists()
+        assert srdf_path.exists()
+        assert LITE6_STATIC_MANIFEST_PATH.exists()
+
+        urdf_text = urdf_path.read_text(encoding="utf-8")
+        assert "package://xarm_description" not in urdf_text
+        assert "<gazebo" in urdf_text
+        assert "<ros2_control" in urdf_text
+        assert "<transmission" in urdf_text
+        assert "<mimic" in urdf_text
+
+        root = ET.parse(urdf_path).getroot()
+        mesh_refs = [
+            mesh.attrib["filename"]
+            for mesh in root.iter("mesh")
+            if mesh.attrib.get("filename")
+        ]
+        assert mesh_refs
+        prefix = "package://manyforge_example_models/models/lite6_lite_gripper/"
+        for ref in mesh_refs:
+            assert ref.startswith(prefix)
+            resolved = LITE6_MODEL_DIR / ref.removeprefix(prefix)
+            assert resolved.exists(), ref
+        for joint_name, (lower, upper) in LITE6_LIMITED_ARM_BOUNDS.items():
+            joint = root.find(f"./joint[@name='{joint_name}']")
+            assert joint is not None
+            limit = joint.find("limit")
+            assert limit is not None
+            assert limit.attrib.get("lower") == lower
+            assert limit.attrib.get("upper") == upper
+        assert root.find("./link[@name='base_link']") is None
+        assert root.find("./joint[@name='base_link_to_link_base']") is None
+        left_finger = root.find("./joint[@name='left_finger_joint']")
+        assert left_finger is not None
+        mimic = left_finger.find("mimic")
+        assert mimic is not None
+        assert mimic.attrib.get("joint") == "right_finger_joint"
+
+        srdf = ET.parse(srdf_path).getroot()
+        lite6_joints = {
+            joint.attrib.get("name")
+            for joint in srdf.findall("./group[@name='lite6']/joint")
+        }
+        assert {"world_joint", "joint1", "joint2", "joint3", "joint4", "joint5", "joint6", "joint_eef", "gripper_fix", "joint_tcp"} <= lite6_joints
+        assert srdf.find("./group[@name='lite_gripper']/joint[@name='right_finger_joint']") is not None
+        assert srdf.find("./group[@name='lite_gripper']/joint[@name='left_finger_joint']") is not None
+        state_names = {
+            state.attrib.get("name")
+            for state in srdf.findall("./group_state[@group='lite_gripper']")
+        }
+        assert {"open", "close", "closed"} <= state_names
+        closed = srdf.find("./group_state[@group='lite_gripper'][@name='closed']")
+        assert closed is not None
+        assert {
+            joint.attrib.get("name"): joint.attrib.get("value")
+            for joint in closed.findall("./joint")
+        } == {"left_finger_joint": "0", "right_finger_joint": "0"}
+        assert srdf.findall("./disable_collisions")
+
+        manifest = json.loads(LITE6_STATIC_MANIFEST_PATH.read_text(encoding="utf-8"))
+        assert manifest["schema"] == "manyforge.lite6_static_model_manifest.v1"
+        assert manifest["source"]["repository"] == (
+            "https://github.com/pastoriomarco/xarm_ros2"
+        )
+        assert manifest["source"]["branch"] == "jazzy_no_gazebo"
+        assert (
+            manifest["source"]["commit"]
+            == "012731afb9ef1d4289ec45112e8d083ab59a5c1e"
+        )
+        expected_paths = {
+            "README.md",
+            "licenses/xarm_ros2.LICENSE",
+            "lite6_lite_gripper.srdf",
+            "lite6_lite_gripper.urdf",
+        } | {
+            ref.removeprefix(prefix)
+            for ref in mesh_refs
+        }
+        manifest_entries = manifest["files"]
+        manifest_paths = {entry["path"] for entry in manifest_entries}
+        assert manifest_paths == expected_paths
+        for entry in manifest_entries:
+            path = LITE6_MODEL_DIR / entry["path"]
+            assert path.is_file(), entry["path"]
+            data = path.read_bytes()
+            assert entry["size_bytes"] == len(data), entry["path"]
+            assert entry["sha256"] == hashlib.sha256(data).hexdigest(), entry["path"]
+
+    def test_lite6_static_manifest_validator_accepts_and_rejects_drift(
+        self, tmp_path
+    ):
+        """The standalone manifest gate rejects static asset drift."""
+        accepted = subprocess.run(
+            [
+                sys.executable,
+                str(LITE6_STATIC_MANIFEST_VALIDATOR_SCRIPT),
+                "--model-dir",
+                str(LITE6_MODEL_DIR),
+                "--json",
+            ],
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+        accepted_report = json.loads(accepted.stdout)
+        assert accepted_report["passed"] is True
+        assert accepted_report["file_count"] == 22
+
+        copied_model = tmp_path / "lite6_lite_gripper"
+        shutil.copytree(
+            LITE6_MODEL_DIR,
+            copied_model,
+            ignore=shutil.ignore_patterns("manymove_runtime_capture"),
+        )
+        with (copied_model / "README.md").open("a", encoding="utf-8") as handle:
+            handle.write("\nChecksum drift fixture.\n")
+
+        rejected = subprocess.run(
+            [
+                sys.executable,
+                str(LITE6_STATIC_MANIFEST_VALIDATOR_SCRIPT),
+                "--model-dir",
+                str(copied_model),
+                "--json",
+            ],
+            text=True,
+            capture_output=True,
+        )
+        assert rejected.returncode != 0
+        rejected_report = json.loads(rejected.stdout)
+        assert rejected_report["passed"] is False
+        assert "README.md" in rejected_report["error"]
+
+    def test_lite6_runtime_snapshot_comparison_accepts_documented_deltas(self, tmp_path):
+        """The ManyMove runtime comparison gate allows only documented deltas."""
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(LITE6_RUNTIME_COMPARE_SCRIPT),
+                "--runtime-urdf",
+                str(LITE6_RUNTIME_CAPTURE_URDF_PATH),
+                "--runtime-srdf",
+                str(LITE6_RUNTIME_CAPTURE_SRDF_PATH),
+                "--snapshot-dir",
+                str(LITE6_MODEL_DIR),
+            ],
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+        report = yaml.safe_load(completed.stdout)
+        assert report["passed"] is True
+        assert report["failures"] == []
+
+    def test_lite6_runtime_capture_metadata_is_enforced(self, tmp_path):
+        """The ManyMove runtime comparison gate pins branch and capture source."""
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(LITE6_RUNTIME_COMPARE_SCRIPT),
+                "--runtime-urdf",
+                str(LITE6_RUNTIME_CAPTURE_URDF_PATH),
+                "--runtime-srdf",
+                str(LITE6_RUNTIME_CAPTURE_SRDF_PATH),
+                "--capture-json",
+                str(LITE6_RUNTIME_CAPTURE_JSON_PATH),
+                "--snapshot-dir",
+                str(LITE6_MODEL_DIR),
+            ],
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+        report = yaml.safe_load(completed.stdout)
+        assert report["passed"] is True
+        assert report["facts"]["runtime_capture_xarm_branch"] == "jazzy_no_gazebo"
+
+        bad_capture = tmp_path / "bad_capture.json"
+        payload = json.loads(LITE6_RUNTIME_CAPTURE_JSON_PATH.read_text(encoding="utf-8"))
+        payload["xarm_ros2"]["branch"] = "jazzy"
+        bad_capture.write_text(json.dumps(payload), encoding="utf-8")
+        rejected = subprocess.run(
+            [
+                sys.executable,
+                str(LITE6_RUNTIME_COMPARE_SCRIPT),
+                "--runtime-urdf",
+                str(LITE6_RUNTIME_CAPTURE_URDF_PATH),
+                "--runtime-srdf",
+                str(LITE6_RUNTIME_CAPTURE_SRDF_PATH),
+                "--capture-json",
+                str(bad_capture),
+                "--snapshot-dir",
+                str(LITE6_MODEL_DIR),
+            ],
+            text=True,
+            capture_output=True,
+        )
+        assert rejected.returncode != 0
+        rejected_report = yaml.safe_load(rejected.stdout)
+        assert rejected_report["passed"] is False
+        assert any("branch" in failure for failure in rejected_report["failures"])
+
+    def test_lite6_runtime_capture_resolves_xarm_commit_from_evidence(self, tmp_path):
+        """The capture helper must derive xarm provenance, not silently stale it."""
+        spec = importlib.util.spec_from_file_location(
+            "capture_manymove_lite6_descriptions",
+            LITE6_RUNTIME_CAPTURE_SCRIPT,
+        )
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        commit_file = tmp_path / ".xarm_ros2_commit"
+        commit_file.write_text(
+            "012731afb9ef1d4289ec45112e8d083ab59a5c1e\n",
+            encoding="utf-8",
+        )
+        assert module.resolve_xarm_commit(None, commit_file, tmp_path / "missing") == (
+            "012731afb9ef1d4289ec45112e8d083ab59a5c1e"
+        )
+        assert module.resolve_xarm_commit(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            commit_file,
+            tmp_path / "missing",
+        ) == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        missing_file = tmp_path / "missing_commit"
+        with pytest.raises(SystemExit):
+            module.resolve_xarm_commit(None, missing_file, tmp_path / "missing")
 
     def test_assistant_modes_example_deployment_validates(self, catalog):
         """The assistant-mode example validates against Robotiq program and catalogs."""

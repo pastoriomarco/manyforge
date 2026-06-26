@@ -24,6 +24,7 @@ import hashlib
 import io
 import logging
 import threading
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -85,9 +86,31 @@ class _LinkVisual:
 
 
 @dataclass(frozen=True)
+class _LinkCollision:
+    """One collision element of one URDF link.
+
+    Kept separate from `_LinkVisual` so the public manifest can expose
+    collision geometry without conflating it with operator-facing visual mesh
+    semantics. The viewer renders collisions only as an optional diagnostic
+    overlay; planning/collision validation continues to use the backend model.
+    """
+
+    link_name: str
+    collision_index: int
+    mesh_resource_uri: str | None
+    mesh_path: str | None
+    mesh_scale: tuple[float, float, float]
+    primitive: dict[str, Any] | None
+    collision_origin_xyz: tuple[float, float, float]
+    collision_origin_rpy: tuple[float, float, float]
+    collision_origin_xyzw: tuple[float, float, float, float]
+
+
+@dataclass(frozen=True)
 class _LinkEntry:
     name: str
     visuals: tuple[_LinkVisual, ...]
+    collisions: tuple[_LinkCollision, ...]
 
 
 @dataclass(frozen=True)
@@ -114,9 +137,9 @@ class _JointEntry:
     # independently and the jog UI must hide them — they follow the
     # master through FK.
     mimic: Optional[tuple[str, float, float]] = None  # (master, multiplier, offset)
-    # True when at least one other joint mimics this one. The jog UI
-    # also hides masters until a dedicated gripper widget exists, because
-    # the MoveIt planning-group command path has no command path to them.
+    # True when at least one other joint mimics this one. RMA metadata now
+    # decides commandability for Robot Control; this remains manifest metadata
+    # and a fallback for runtimes without an authority block.
     is_mimic_master: bool = False
 
 
@@ -129,7 +152,7 @@ class _UrdfCacheEntry:
     links: tuple[_LinkEntry, ...]
     joints: tuple[_JointEntry, ...]
     link_names_for_fk: tuple[str, ...]
-    mesh_glb_cache: dict[tuple[str, int, str, str], bytes]
+    mesh_glb_cache: dict[tuple[str, str, int, str, str], bytes]
     # yourdfpy.URDF model retained for on-demand FK queries
     # (e.g. gripper-root resolution + tcp→root transform for the
     # Move-To unreachable ghost). Loaded with `load_meshes=False` so
@@ -405,6 +428,99 @@ def _load_urdf_entry(urdf_path: str, package_paths: tuple[str, ...]) -> _UrdfCac
             )
         return None
 
+    def _build_collision(
+        link_name: str,
+        collision_index: int,
+        collision: Any,
+    ) -> _LinkCollision | None:
+        geometry = getattr(collision, "geometry", None)
+        if geometry is None:
+            return None
+        origin = getattr(collision, "origin", None)
+        origin_xyz, origin_rpy, origin_xyzw = _origin_decompose(origin)
+
+        mesh = getattr(geometry, "mesh", None)
+        if mesh is not None:
+            filename = getattr(mesh, "filename", None)
+            if not isinstance(filename, str) or not filename:
+                return None
+            scale = getattr(mesh, "scale", None)
+            if scale is not None and len(scale) == 3:
+                mesh_scale = (float(scale[0]), float(scale[1]), float(scale[2]))
+            else:
+                mesh_scale = (1.0, 1.0, 1.0)
+            return _LinkCollision(
+                link_name=link_name,
+                collision_index=collision_index,
+                mesh_resource_uri=filename,
+                mesh_path=_resolve_mesh_path(filename),
+                mesh_scale=mesh_scale,
+                primitive=None,
+                collision_origin_xyz=origin_xyz,
+                collision_origin_rpy=origin_rpy,
+                collision_origin_xyzw=origin_xyzw,
+            )
+
+        box = getattr(geometry, "box", None)
+        if box is not None:
+            size = getattr(box, "size", None)
+            if size is None or len(size) != 3:
+                return None
+            return _LinkCollision(
+                link_name=link_name,
+                collision_index=collision_index,
+                mesh_resource_uri=None,
+                mesh_path=None,
+                mesh_scale=(1.0, 1.0, 1.0),
+                primitive={
+                    "type": "box",
+                    "size_m": [float(size[0]), float(size[1]), float(size[2])],
+                },
+                collision_origin_xyz=origin_xyz,
+                collision_origin_rpy=origin_rpy,
+                collision_origin_xyzw=origin_xyzw,
+            )
+
+        cylinder = getattr(geometry, "cylinder", None)
+        if cylinder is not None:
+            radius = getattr(cylinder, "radius", None)
+            length = getattr(cylinder, "length", None)
+            if radius is None or length is None:
+                return None
+            return _LinkCollision(
+                link_name=link_name,
+                collision_index=collision_index,
+                mesh_resource_uri=None,
+                mesh_path=None,
+                mesh_scale=(1.0, 1.0, 1.0),
+                primitive={
+                    "type": "cylinder",
+                    "radius_m": float(radius),
+                    "length_m": float(length),
+                },
+                collision_origin_xyz=origin_xyz,
+                collision_origin_rpy=origin_rpy,
+                collision_origin_xyzw=origin_xyzw,
+            )
+
+        sphere = getattr(geometry, "sphere", None)
+        if sphere is not None:
+            radius = getattr(sphere, "radius", None)
+            if radius is None:
+                return None
+            return _LinkCollision(
+                link_name=link_name,
+                collision_index=collision_index,
+                mesh_resource_uri=None,
+                mesh_path=None,
+                mesh_scale=(1.0, 1.0, 1.0),
+                primitive={"type": "sphere", "radius_m": float(radius)},
+                collision_origin_xyz=origin_xyz,
+                collision_origin_rpy=origin_rpy,
+                collision_origin_xyzw=origin_xyzw,
+            )
+        return None
+
     links: list[_LinkEntry] = []
     fk_link_names: list[str] = []
     for link_name, link in link_map.items():
@@ -415,20 +531,32 @@ def _load_urdf_entry(urdf_path: str, package_paths: tuple[str, ...]) -> _UrdfCac
             built = _build_visual(str(link_name), index, visual)
             if built is not None:
                 link_visuals.append(built)
-        if link_visuals:
-            links.append(_LinkEntry(name=str(link_name), visuals=tuple(link_visuals)))
+        raw_collisions = getattr(link, "collisions", None) or []
+        link_collisions: list[_LinkCollision] = []
+        for index, collision in enumerate(raw_collisions):
+            built = _build_collision(str(link_name), index, collision)
+            if built is not None:
+                link_collisions.append(built)
+        if link_visuals or link_collisions:
+            links.append(
+                _LinkEntry(
+                    name=str(link_name),
+                    visuals=tuple(link_visuals),
+                    collisions=tuple(link_collisions),
+                )
+            )
 
     # Joint metadata for the Day-5 robot-control overlay. We capture
     # everything we need from `yourdfpy.Joint` here so the manifest
     # response doesn't have to re-parse the URDF on every request.
     #
     # URDF `<mimic>` joints are pinned to a master joint by a linear
-    # relation (multiplier·q_master + offset). They cannot be commanded
-    # independently — the jog UI must filter them out, and the master
-    # is also filtered until a dedicated gripper widget owns the chain
-    # (the MoveIt planning-group command path has no path to gripper
-    # joints anyway). We collect mimic data in a first pass
-    # and then back-fill `is_mimic_master` on the corresponding entries.
+    # relation (multiplier·q_master + offset). Followers cannot be commanded
+    # independently. RMA metadata provides the authoritative commandable
+    # group lists; mimic flags remain useful manifest metadata and a fallback
+    # for runtimes without an authority block. We collect mimic data in a
+    # first pass and then back-fill `is_mimic_master` on the corresponding
+    # entries.
     joint_map = getattr(urdf_model, "joint_map", {}) or {}
 
     def _extract_mimic(joint: Any) -> Optional[tuple[str, float, float]]:
@@ -534,12 +662,96 @@ def _mesh_stat_key(mesh_path: str | None) -> str:
     return f"{path.resolve()}|{stat.st_mtime_ns}|{stat.st_size}"
 
 
-def _entry_model_key(entry: _UrdfCacheEntry, robot_id: str | None) -> str:
+def robot_model_authority_metadata(state: ComposerState) -> dict[str, Any]:
+    """Return canonical Robot Model Authority metadata for the active runtime.
+
+    The C++/RoboPlan import path may consume a private joint-renamed view, but
+    Composer-facing structure must remain canonical. Runtime factories attach
+    this metadata to the kernel client; the URDF route only republishes it.
+    """
+
+    candidates: list[Any] = [getattr(state, "kernel", None), state.kernel_bundle]
+    bundle = state.kernel_bundle
+    native_bundle = getattr(bundle, "native_bundle", None) if bundle is not None else None
+    if native_bundle is not None:
+        candidates.append(native_bundle)
+    for candidate in candidates:
+        metadata = getattr(candidate, "robot_model_authority_metadata", None)
+        if isinstance(metadata, Mapping):
+            return dict(metadata)
+    return {}
+
+
+def _authority_fingerprint(metadata: Mapping[str, Any] | None) -> str | None:
+    if not metadata:
+        return None
+    value = metadata.get("canonical_fingerprint")
+    if isinstance(value, str) and value:
+        return value
+    return None
+
+
+def _authority_manifest(metadata: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    if not metadata:
+        return None
+
+    def string_map_list(raw: Any) -> dict[str, list[str]]:
+        if not isinstance(raw, Mapping):
+            return {}
+        out: dict[str, list[str]] = {}
+        for key, value in raw.items():
+            if isinstance(value, (list, tuple)):
+                out[str(key)] = [str(item) for item in value]
+        return out
+
+    raw_grippers = metadata.get("grippers")
+    grippers: dict[str, dict[str, Any]] = {}
+    if isinstance(raw_grippers, Mapping):
+        for gripper_id, raw_profile in raw_grippers.items():
+            if not isinstance(raw_profile, Mapping):
+                continue
+            derived = raw_profile.get("derived_joints", [])
+            presets = raw_profile.get("presets", {})
+            grippers[str(gripper_id)] = {
+                "group_id": str(raw_profile.get("group_id", "") or ""),
+                "command_joint": str(raw_profile.get("command_joint", "") or ""),
+                "derived_joints": (
+                    [str(item) for item in derived]
+                    if isinstance(derived, (list, tuple))
+                    else []
+                ),
+                "presets": dict(presets) if isinstance(presets, Mapping) else {},
+            }
+
+    return {
+        "canonical_fingerprint": str(metadata.get("canonical_fingerprint", "") or ""),
+        "view_fingerprint": str(metadata.get("view_fingerprint", "") or ""),
+        "view_changed": bool(metadata.get("view_changed", False)),
+        "commandable_joint_names": [
+            str(item)
+            for item in (metadata.get("commandable_joint_names", []) or [])
+            if str(item)
+        ],
+        "group_commandable_joint_names": string_map_list(
+            metadata.get("group_commandable_joint_names")
+        ),
+        "grippers": grippers,
+    }
+
+
+def _entry_model_key(
+    entry: _UrdfCacheEntry,
+    robot_id: str | None,
+    *,
+    authority_fingerprint: str | None = None,
+) -> str:
     """Stable public key for the active robot visual model content."""
     digest = hashlib.sha256()
     digest.update(_VISUAL_ASSET_SCHEMA_VERSION.encode("utf-8"))
     digest.update(b"\0")
     digest.update((robot_id or "").encode("utf-8"))
+    digest.update(b"\0")
+    digest.update((authority_fingerprint or "").encode("utf-8"))
     digest.update(b"\0")
     digest.update(str(Path(entry.urdf_path).resolve()).encode("utf-8", errors="replace"))
     digest.update(b"\0")
@@ -558,6 +770,13 @@ def _entry_model_key(entry: _UrdfCacheEntry, robot_id: str | None) -> str:
             digest.update(b"\0")
             digest.update(_mesh_stat_key(visual.mesh_path).encode("utf-8", errors="replace"))
             digest.update(b"\0")
+        for collision in link.collisions:
+            digest.update(str(collision.collision_index).encode("ascii"))
+            digest.update(b"\0")
+            digest.update((collision.mesh_resource_uri or "").encode("utf-8", errors="replace"))
+            digest.update(b"\0")
+            digest.update(_mesh_stat_key(collision.mesh_path).encode("utf-8", errors="replace"))
+            digest.update(b"\0")
     return digest.hexdigest()[:24]
 
 
@@ -570,7 +789,12 @@ def active_urdf_model_key(state: ComposerState) -> str | None:
     robot_id = None
     if deployment is not None and deployment.robot_config is not None:
         robot_id = deployment.robot_config.robot_id
-    return _entry_model_key(entry, robot_id)
+    metadata = robot_model_authority_metadata(state)
+    return _entry_model_key(
+        entry,
+        robot_id,
+        authority_fingerprint=_authority_fingerprint(metadata),
+    )
 
 
 @dataclass(frozen=True)
@@ -902,29 +1126,48 @@ def _find_visual(
     return None
 
 
-def _render_visual_glb(
+def _find_collision(
     entry: _UrdfCacheEntry,
-    visual: _LinkVisual,
-) -> bytes | None:
-    # Primitive-only visuals are rendered client-side via Three.js native
-    # geometries — no glTF needed. The mesh route returns 404 for these
-    # and the frontend uses the manifest's `primitive` block instead.
-    if visual.mesh_path is None:
+    link_name: str,
+    collision_index: int,
+) -> _LinkCollision | None:
+    for link in entry.links:
+        if link.name != link_name:
+            continue
+        for collision in link.collisions:
+            if collision.collision_index == collision_index:
+                return collision
         return None
-    mesh_file = Path(visual.mesh_path)
+    return None
+
+
+def _render_mesh_glb(
+    entry: _UrdfCacheEntry,
+    *,
+    kind: str,
+    link_name: str,
+    index: int,
+    mesh_path: str | None,
+    mesh_scale: tuple[float, float, float],
+) -> bytes | None:
+    if mesh_path is None:
+        return None
+    mesh_file = Path(mesh_path)
     if not mesh_file.exists():
         logger.warning(
-            "Mesh file missing for link %s visual %d at %s",
-            visual.link_name,
-            visual.visual_index,
+            "Mesh file missing for link %s %s %d at %s",
+            link_name,
+            kind,
+            index,
             mesh_file,
         )
         return None
     cache_key = (
-        visual.link_name,
-        visual.visual_index,
+        kind,
+        link_name,
+        index,
         _VISUAL_ASSET_SCHEMA_VERSION,
-        _mesh_stat_key(visual.mesh_path),
+        _mesh_stat_key(mesh_path),
     )
     with _cache_lock:
         cached = entry.mesh_glb_cache.get(cache_key)
@@ -946,7 +1189,7 @@ def _render_visual_glb(
             mesh = loaded.dump(concatenate=True)
         except Exception:
             mesh = loaded
-    sx, sy, sz = visual.mesh_scale
+    sx, sy, sz = mesh_scale
     if (abs(sx - 1.0) + abs(sy - 1.0) + abs(sz - 1.0)) > 1e-9:
         try:
             mesh.apply_scale([sx, sy, sz])
@@ -972,6 +1215,37 @@ def _render_visual_glb(
     return glb_bytes
 
 
+def _render_visual_glb(
+    entry: _UrdfCacheEntry,
+    visual: _LinkVisual,
+) -> bytes | None:
+    # Primitive-only visuals are rendered client-side via Three.js native
+    # geometries — no glTF needed. The mesh route returns 404 for these
+    # and the frontend uses the manifest's `primitive` block instead.
+    return _render_mesh_glb(
+        entry,
+        kind="visual",
+        link_name=visual.link_name,
+        index=visual.visual_index,
+        mesh_path=visual.mesh_path,
+        mesh_scale=visual.mesh_scale,
+    )
+
+
+def _render_collision_glb(
+    entry: _UrdfCacheEntry,
+    collision: _LinkCollision,
+) -> bytes | None:
+    return _render_mesh_glb(
+        entry,
+        kind="collision",
+        link_name=collision.link_name,
+        index=collision.collision_index,
+        mesh_path=collision.mesh_path,
+        mesh_scale=collision.mesh_scale,
+    )
+
+
 def create_urdf_router(state: ComposerState) -> APIRouter:
     """Create the URDF router. Mounted under /api/scene/urdf."""
     router = APIRouter()
@@ -993,10 +1267,17 @@ def create_urdf_router(state: ComposerState) -> APIRouter:
         # resolved URDF content identity, not just robot_id, so switching
         # UR5 <-> UR10e or editing a same-id deployment cannot reuse stale
         # link geometry at new FK poses.
-        model_key = _entry_model_key(entry, robot_id)
+        authority_metadata = robot_model_authority_metadata(state)
+        authority = _authority_manifest(authority_metadata)
+        model_key = _entry_model_key(
+            entry,
+            robot_id,
+            authority_fingerprint=_authority_fingerprint(authority_metadata),
+        )
         return {
             "robot_id": robot_id,
             "model_key": model_key,
+            "authority": authority,
             "root_link": entry.root_link,
             "links": [
                 {
@@ -1018,6 +1299,24 @@ def create_urdf_router(state: ComposerState) -> APIRouter:
                             },
                         }
                         for visual in link.visuals
+                    ],
+                    "collisions": [
+                        {
+                            "index": collision.collision_index,
+                            "mesh_url": (
+                                f"/api/scene/urdf/models/{model_key}/collision-meshes/"
+                                f"{quote(link.name, safe='')}/{collision.collision_index}"
+                                if collision.mesh_path is not None
+                                else None
+                            ),
+                            "primitive": collision.primitive,
+                            "collision_origin": {
+                                "position_m": list(collision.collision_origin_xyz),
+                                "orientation_rpy_rad": list(collision.collision_origin_rpy),
+                                "orientation_xyzw": list(collision.collision_origin_xyzw),
+                            },
+                        }
+                        for collision in link.collisions
                     ],
                 }
                 for link in entry.links
@@ -1063,7 +1362,12 @@ def create_urdf_router(state: ComposerState) -> APIRouter:
         robot_id = None
         if deployment is not None and deployment.robot_config is not None:
             robot_id = deployment.robot_config.robot_id
-        active_model_key = _entry_model_key(entry, robot_id)
+        authority_metadata = robot_model_authority_metadata(state)
+        active_model_key = _entry_model_key(
+            entry,
+            robot_id,
+            authority_fingerprint=_authority_fingerprint(authority_metadata),
+        )
         if requested_model_key is not None and requested_model_key != active_model_key:
             return JSONResponse(
                 status_code=409,
@@ -1103,11 +1407,82 @@ def create_urdf_router(state: ComposerState) -> APIRouter:
             },
         )
 
+    def _get_collision_mesh_for_model(
+        link_name: str,
+        collision_index: int,
+        requested_model_key: str | None,
+    ) -> Response:
+        entry = get_urdf_entry(state)
+        if entry is None:
+            return JSONResponse(
+                status_code=404,
+                content={"detail": "No URDF available for the active deployment"},
+            )
+        deployment = state.deployment
+        robot_id = None
+        if deployment is not None and deployment.robot_config is not None:
+            robot_id = deployment.robot_config.robot_id
+        authority_metadata = robot_model_authority_metadata(state)
+        active_model_key = _entry_model_key(
+            entry,
+            robot_id,
+            authority_fingerprint=_authority_fingerprint(authority_metadata),
+        )
+        if requested_model_key is not None and requested_model_key != active_model_key:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "detail": "Stale URDF collision mesh URL for inactive robot model",
+                    "active_model_key": active_model_key,
+                },
+            )
+        collision = _find_collision(entry, link_name, collision_index)
+        if collision is None:
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "detail": f"Unknown link/collision '{link_name}'/{collision_index}",
+                },
+            )
+        glb_bytes = _render_collision_glb(entry, collision)
+        if glb_bytes is None:
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "detail": (
+                        f"No renderable collision mesh for link '{link_name}' collision "
+                        f"{collision_index}"
+                    ),
+                },
+            )
+        return Response(
+            content=glb_bytes,
+            media_type="model/gltf-binary",
+            headers={
+                "Cache-Control": (
+                    "public, max-age=31536000, immutable"
+                    if requested_model_key is not None
+                    else "no-store"
+                ),
+                "ETag": f'"{active_model_key}-{link_name}-collision-{collision_index}"',
+            },
+        )
+
     @router.get("/models/{model_key}/meshes/{link_name}/{visual_index}")
     def get_model_mesh(model_key: str, link_name: str, visual_index: int) -> Response:
         return _get_mesh_for_model(
             link_name=link_name,
             visual_index=visual_index,
+            requested_model_key=model_key,
+        )
+
+    @router.get("/models/{model_key}/collision-meshes/{link_name}/{collision_index}")
+    def get_model_collision_mesh(
+        model_key: str, link_name: str, collision_index: int
+    ) -> Response:
+        return _get_collision_mesh_for_model(
+            link_name=link_name,
+            collision_index=collision_index,
             requested_model_key=model_key,
         )
 
@@ -1118,6 +1493,16 @@ def create_urdf_router(state: ComposerState) -> APIRouter:
         return _get_mesh_for_model(
             link_name=link_name,
             visual_index=visual_index,
+            requested_model_key=model,
+        )
+
+    @router.get("/collision-meshes/{link_name}/{collision_index}")
+    def get_collision_mesh(
+        link_name: str, collision_index: int, model: str | None = None
+    ) -> Response:
+        return _get_collision_mesh_for_model(
+            link_name=link_name,
+            collision_index=collision_index,
             requested_model_key=model,
         )
 

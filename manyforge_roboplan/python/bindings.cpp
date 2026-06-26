@@ -26,6 +26,149 @@ namespace ros2_exec = manyforge::ros2_control_execution;
 
 namespace {
 
+std::string canonical_joint_name(const NativeKernelBundle& bundle,
+                                 const std::string& view_joint_name) {
+  const auto it = bundle.view_to_canonical_joint_names.find(view_joint_name);
+  return it == bundle.view_to_canonical_joint_names.end() ? view_joint_name
+                                                         : it->second;
+}
+
+std::vector<std::string> canonical_joint_names(
+    const NativeKernelBundle& bundle,
+    const std::vector<std::string>& view_joint_names) {
+  std::vector<std::string> result;
+  result.reserve(view_joint_names.size());
+  for (const auto& name : view_joint_names) {
+    result.push_back(canonical_joint_name(bundle, name));
+  }
+  return result;
+}
+
+std::vector<double> compact_group_joint_positions(
+    NativeKernelBundle& bundle,
+    const std::string& group_name) {
+  const auto maybe_group_info = bundle.scene->getJointGroupInfo(group_name);
+  if (!maybe_group_info) {
+    throw std::runtime_error(
+        "Failed to get compact joint positions for group '" + group_name +
+        "': " + maybe_group_info.error());
+  }
+  const auto& group_info = *maybe_group_info;
+  const auto q = bundle.scene->getCurrentJointPositions();
+  std::vector<double> result;
+  result.reserve(group_info.q_indices.size());
+  for (Eigen::Index i = 0; i < group_info.q_indices.size(); ++i) {
+    result.push_back(q[group_info.q_indices[i]]);
+  }
+  return result;
+}
+
+std::vector<double> group_joint_positions_with_mimics(
+    NativeKernelBundle& bundle,
+    const std::string& group_name) {
+  const auto maybe_group_info = bundle.scene->getJointGroupInfo(group_name);
+  if (!maybe_group_info) {
+    throw std::runtime_error(
+        "Failed to get joint positions for group '" + group_name + "': " +
+        maybe_group_info.error());
+  }
+  const auto& group_info = *maybe_group_info;
+  if (group_info.joint_names.size() ==
+      static_cast<size_t>(group_info.q_indices.size())) {
+    return compact_group_joint_positions(bundle, group_name);
+  }
+
+  const auto q_with_mimics = bundle.scene->getCurrentJointPositionsWithMimics();
+  const auto& all_joint_names = bundle.scene->getJointNamesWithMimics();
+  std::map<std::string, Eigen::Index> index_by_name;
+  for (Eigen::Index i = 0; i < static_cast<Eigen::Index>(all_joint_names.size());
+       ++i) {
+    index_by_name[all_joint_names[static_cast<size_t>(i)]] = i;
+  }
+
+  std::vector<double> result;
+  result.reserve(group_info.joint_names.size());
+  for (const auto& joint_name : group_info.joint_names) {
+    const auto index_it = index_by_name.find(joint_name);
+    if (index_it == index_by_name.end() ||
+        index_it->second < 0 ||
+        index_it->second >= q_with_mimics.size()) {
+      throw std::runtime_error(
+          "Failed to get joint positions for group '" + group_name +
+          "': joint '" + joint_name +
+          "' is not present in the mimic-expanded model readout");
+    }
+    result.push_back(q_with_mimics[index_it->second]);
+  }
+  return result;
+}
+
+Eigen::VectorXd vector_from_std(const std::vector<double>& positions) {
+  Eigen::VectorXd q(static_cast<Eigen::Index>(positions.size()));
+  for (size_t i = 0; i < positions.size(); ++i) {
+    q[static_cast<Eigen::Index>(i)] = positions[i];
+  }
+  return q;
+}
+
+Eigen::VectorXd compact_group_positions_from_public_input(
+    NativeKernelBundle& bundle,
+    const std::string& group_name,
+    const std::vector<double>& positions) {
+  const auto maybe_group_info = bundle.scene->getJointGroupInfo(group_name);
+  if (!maybe_group_info) {
+    throw std::runtime_error(
+        "Failed to set joint positions for group '" + group_name + "': " +
+        maybe_group_info.error());
+  }
+  const auto& group_info = *maybe_group_info;
+  if (positions.size() == static_cast<size_t>(group_info.q_indices.size())) {
+    return vector_from_std(positions);
+  }
+  if (positions.size() != group_info.joint_names.size()) {
+    throw std::runtime_error(
+        "Failed to set joint positions for group '" + group_name +
+        "': expected either " +
+        std::to_string(static_cast<size_t>(group_info.q_indices.size())) +
+        " compact commandable positions or " +
+        std::to_string(group_info.joint_names.size()) +
+        " mimic-expanded group positions, got " +
+        std::to_string(positions.size()));
+  }
+
+  Eigen::VectorXd compact(group_info.q_indices.size());
+  Eigen::Index compact_index = 0;
+  for (size_t i = 0; i < group_info.joint_names.size(); ++i) {
+    const auto maybe_joint_info =
+        bundle.scene->getJointInfo(group_info.joint_names[i]);
+    if (!maybe_joint_info) {
+      throw std::runtime_error(
+          "Failed to set joint positions for group '" + group_name +
+          "': " + maybe_joint_info.error());
+    }
+    if (maybe_joint_info->mimic_info.has_value()) {
+      continue;
+    }
+    if (maybe_joint_info->num_position_dofs != 1) {
+      throw std::runtime_error(
+          "Failed to set joint positions for group '" + group_name +
+          "': expanded public input is only supported for scalar joints");
+    }
+    if (compact_index >= compact.size()) {
+      throw std::runtime_error(
+          "Failed to set joint positions for group '" + group_name +
+          "': expanded input contains more commandable joints than q slots");
+    }
+    compact[compact_index++] = positions[i];
+  }
+  if (compact_index != compact.size()) {
+    throw std::runtime_error(
+        "Failed to set joint positions for group '" + group_name +
+        "': expanded input did not cover every commandable q slot");
+  }
+  return compact;
+}
+
 py::dict error_details_to_python(
     const std::map<std::string, std::string>& details) {
   py::dict d;
@@ -1131,6 +1274,29 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
 
   // Expose NativeKernelBundle as opaque holder
   py::class_<NativeKernelBundle, std::shared_ptr<NativeKernelBundle>>(m, "NativeKernelBundle")
+      .def("set_robot_model_authority_metadata",
+           [](NativeKernelBundle& self, py::dict metadata) {
+             self.canonical_model_fingerprint =
+                 metadata.attr("get")("canonical_fingerprint", "")
+                     .cast<std::string>();
+             self.roboplan_view_fingerprint =
+                 metadata.attr("get")("view_fingerprint", "")
+                     .cast<std::string>();
+             self.canonical_to_view_joint_names =
+                 metadata
+                     .attr("get")("canonical_to_view_joint_names", py::dict())
+                     .cast<std::map<std::string, std::string>>();
+             self.view_to_canonical_joint_names =
+                 metadata
+                     .attr("get")("view_to_canonical_joint_names", py::dict())
+                     .cast<std::map<std::string, std::string>>();
+             self.group_commandable_joint_names =
+                 metadata
+                     .attr("get")("group_commandable_joint_names", py::dict())
+                     .cast<std::map<std::string, std::vector<std::string>>>();
+           },
+           py::arg("metadata"),
+           "Attach Robot Model Authority metadata for canonical public readout.")
       .def("execute", [](NativeKernelBundle& self, py::dict request) -> py::dict {
         // Build ExecuteRequestDTO from Python dict
         ExecuteRequestDTO req;
@@ -2226,8 +2392,11 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
         return self.context->get_scene_object_ids();
       })
       .def("get_joint_names", [](NativeKernelBundle& self) {
-        py::gil_scoped_release release;
-        return self.context->get_joint_names();
+        const auto names = [&]() {
+          py::gil_scoped_release release;
+          return self.context->get_joint_names();
+        }();
+        return canonical_joint_names(self, names);
       })
       .def("get_scene_objects", [](NativeKernelBundle& self) -> py::list {
         const auto objects = [&]() {
@@ -2470,34 +2639,24 @@ PYBIND11_MODULE(manyforge_roboplan_py, m) {
               "Failed to get joint names for group '" + group_name + "': " +
               maybe_group_info.error());
         }
-        return maybe_group_info->joint_names;
+        return canonical_joint_names(self, maybe_group_info->joint_names);
       }, py::arg("group_name"),
       "Get ordered joint names for a specific SRDF group.")
       .def("get_group_joint_positions", [](NativeKernelBundle& self,
                                            const std::string& group_name) {
-        const auto maybe_group_info = self.scene->getJointGroupInfo(group_name);
-        if (!maybe_group_info) {
-          throw std::runtime_error(
-              "Failed to get joint positions for group '" + group_name + "': " +
-              maybe_group_info.error());
-        }
-        const auto& group_info = *maybe_group_info;
-        const auto q = self.scene->getCurrentJointPositions();
-        std::vector<double> result;
-        result.reserve(group_info.q_indices.size());
-        for (int i = 0; i < group_info.q_indices.size(); ++i) {
-          result.push_back(q[group_info.q_indices[i]]);
-        }
-        return result;
+        return group_joint_positions_with_mimics(self, group_name);
       }, py::arg("group_name"),
-      "Get current joint positions for a specific SRDF group.")
+      "Get current canonical joint positions for a specific SRDF group, including mimics.")
+      .def("get_group_commandable_joint_positions",
+           [](NativeKernelBundle& self, const std::string& group_name) {
+             return compact_group_joint_positions(self, group_name);
+           }, py::arg("group_name"),
+           "Get compact commandable q-slot positions for a specific SRDF group.")
       .def("set_group_joint_positions", [](NativeKernelBundle& self,
                                            const std::string& group_name,
                                            const std::vector<double>& positions) {
-        Eigen::VectorXd q(positions.size());
-        for (size_t i = 0; i < positions.size(); ++i) {
-          q[i] = positions[i];
-        }
+        Eigen::VectorXd q =
+            compact_group_positions_from_public_input(self, group_name, positions);
         if (self.scene && q.size() != self.scene->getCurrentJointPositions().size()) {
           q = self.scene->toFullJointPositions(group_name, q);
         }

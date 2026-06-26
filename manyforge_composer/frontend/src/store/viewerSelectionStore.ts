@@ -64,6 +64,10 @@ interface ViewerSelectionStore {
   // (Isaac/perception measured state). Kept viewer-local and off by
   // default because it is an operator aid, not planning-scene truth.
   measuredStateGhostVisible: boolean;
+  // Optional diagnostics overlay for URDF collision geometry. It shows
+  // the geometry used by collision validation, which may intentionally
+  // differ from the visual meshes.
+  collisionMeshesVisible: boolean;
   setSelected: (id: string | null) => void;
   toggleLocked: (id: string) => void;
   isLocked: (id: string) => boolean;
@@ -78,6 +82,7 @@ interface ViewerSelectionStore {
   setCartesianGizmoMode: (mode: 'translate' | 'rotate') => void;
   setDraggingGizmo: (next: boolean) => void;
   setMeasuredStateGhostVisible: (visible: boolean) => void;
+  setCollisionMeshesVisible: (visible: boolean) => void;
 }
 
 export type {
@@ -120,6 +125,7 @@ export const useViewerSelectionStore = create<ViewerSelectionStore>((set, get) =
   cartesianGizmoMode: 'translate',
   isDraggingGizmo: false,
   measuredStateGhostVisible: false,
+  collisionMeshesVisible: false,
   setSelected: (id) => set({ selectedId: id }),
   toggleLocked: (id) =>
     set((state) => {
@@ -145,6 +151,7 @@ export const useViewerSelectionStore = create<ViewerSelectionStore>((set, get) =
   setCartesianGizmoMode: (mode) => set({ cartesianGizmoMode: mode }),
   setDraggingGizmo: (next) => set({ isDraggingGizmo: next }),
   setMeasuredStateGhostVisible: (visible) => set({ measuredStateGhostVisible: visible }),
+  setCollisionMeshesVisible: (visible) => set({ collisionMeshesVisible: visible }),
 }));
 
 /**

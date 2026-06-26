@@ -826,11 +826,11 @@ class CycleManager:
                     "srdf_presets": dict(config.srdf_presets),
                     "description": config.description,
                     "touch_links": list(config.touch_links),
-                "mount_frame": config.mount_frame,
-                "attach_frame": config.attach_frame,
-                "tcp_frame": config.tcp_frame,
-                "auxiliary_frames": list(config.auxiliary_frames),
-            }
+                    "mount_frame": config.mount_frame,
+                    "attach_frame": config.attach_frame,
+                    "tcp_frame": config.tcp_frame,
+                    "auxiliary_frames": list(config.auxiliary_frames),
+                }
             for gripper_id, config in deployment.grippers.items()
         }
 

@@ -13,6 +13,7 @@ import math
 import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from .models import SceneRobotResponse, VisualSceneSnapshotResponse
@@ -35,6 +36,48 @@ class _VisualFkModel:
     model_key: str
     model: Any
     joint_q_index: dict[str, tuple[int, int]]
+
+
+def _string_map(raw: Any) -> dict[str, str]:
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, str] = {}
+    for key, value in raw.items():
+        if key is None or value is None:
+            continue
+        out[str(key)] = str(value)
+    return out
+
+
+def _visual_fk_urdf_path(
+    *,
+    canonical_urdf_path: str,
+    metadata: dict[str, Any],
+) -> str:
+    """Return the URDF path the visual FK model should load.
+
+    Composer serves canonical visual meshes and public metadata, but Pinocchio
+    may need the same private import view as RoboPlan for parser-order-sensitive
+    mimic joints. The private view is a consumer artifact; public names remain
+    canonical through the joint-name maps below.
+    """
+
+    if not metadata:
+        return canonical_urdf_path
+    if not bool(metadata.get("view_changed", False)):
+        return canonical_urdf_path
+    view_urdf_path = str(metadata.get("view_urdf_path") or "")
+    if not view_urdf_path:
+        raise VisualSnapshotUnavailable(
+            "visual_model_view_unavailable",
+            "Robot Model Authority reports a private view but no view_urdf_path",
+        )
+    if not Path(view_urdf_path).exists():
+        raise VisualSnapshotUnavailable(
+            "visual_model_view_unavailable",
+            f"Robot Model Authority private view does not exist: {view_urdf_path}",
+        )
+    return view_urdf_path
 
 
 _cache_lock = threading.Lock()
@@ -66,6 +109,7 @@ def _load_visual_fk_model(state: ComposerState) -> _VisualFkModel:
     if entry is None:
         raise VisualSnapshotUnavailable("visual_model_unavailable")
 
+    metadata = routes_urdf.robot_model_authority_metadata(state)
     try:
         import pinocchio as pin
     except Exception as exc:  # pragma: no cover - depends on deployment image
@@ -75,20 +119,32 @@ def _load_visual_fk_model(state: ComposerState) -> _VisualFkModel:
         cached = _visual_fk_cache.get(model_key)
         if cached is not None:
             return cached
+        visual_urdf_path = _visual_fk_urdf_path(
+            canonical_urdf_path=entry.urdf_path,
+            metadata=metadata,
+        )
         try:
-            model = pin.buildModelFromUrdf(entry.urdf_path, True)
+            model = pin.buildModelFromUrdf(visual_urdf_path, True)
         except Exception as exc:
             raise VisualSnapshotUnavailable("visual_model_load_failed", str(exc)) from exc
+        view_to_canonical = _string_map(
+            metadata.get("view_to_canonical_joint_names")
+        )
         joint_q_index: dict[str, tuple[int, int]] = {}
         for joint_id, joint_name in enumerate(model.names):
             if joint_id == 0:
                 continue
+            model_joint_name = str(joint_name)
             try:
                 nq = int(model.nqs[joint_id])
                 q_index = int(model.idx_qs[joint_id])
             except Exception:
                 continue
-            joint_q_index[str(joint_name)] = (q_index, nq)
+            index_value = (q_index, nq)
+            joint_q_index[model_joint_name] = index_value
+            canonical_joint_name = view_to_canonical.get(model_joint_name)
+            if canonical_joint_name:
+                joint_q_index[canonical_joint_name] = index_value
         loaded = _VisualFkModel(
             model_key=model_key,
             model=model,

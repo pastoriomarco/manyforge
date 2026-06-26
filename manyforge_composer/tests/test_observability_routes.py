@@ -101,6 +101,60 @@ def _write_toy_visual_urdf(tmp_path: Path) -> Path:
     return urdf_path
 
 
+def _write_sibling_mimic_visual_urdfs(tmp_path: Path) -> tuple[Path, Path]:
+    canonical_path = tmp_path / "sibling_mimic_canonical.urdf"
+    view_path = tmp_path / "sibling_mimic_view.urdf"
+    canonical_path.write_text(
+        """<?xml version="1.0"?>
+<robot name="sibling_mimic_canonical">
+  <link name="base_link"/>
+  <joint name="right_finger_joint" type="prismatic">
+    <parent link="base_link"/>
+    <child link="right_link"/>
+    <axis xyz="1 0 0"/>
+    <limit lower="0" upper="1" effort="1" velocity="1"/>
+  </joint>
+  <link name="right_link"/>
+  <joint name="left_finger_joint" type="prismatic">
+    <parent link="base_link"/>
+    <child link="left_link"/>
+    <origin xyz="0 1 0" rpy="0 0 0"/>
+    <axis xyz="1 0 0"/>
+    <limit lower="0" upper="1" effort="1" velocity="1"/>
+    <mimic joint="right_finger_joint" multiplier="1" offset="0"/>
+  </joint>
+  <link name="left_link"/>
+</robot>
+""",
+        encoding="utf-8",
+    )
+    view_path.write_text(
+        """<?xml version="1.0"?>
+<robot name="sibling_mimic_view">
+  <link name="base_link"/>
+  <joint name="__rma_mimic_0000_right_finger_joint" type="prismatic">
+    <parent link="base_link"/>
+    <child link="right_link"/>
+    <axis xyz="1 0 0"/>
+    <limit lower="0" upper="1" effort="1" velocity="1"/>
+  </joint>
+  <link name="right_link"/>
+  <joint name="left_finger_joint" type="prismatic">
+    <parent link="base_link"/>
+    <child link="left_link"/>
+    <origin xyz="0 1 0" rpy="0 0 0"/>
+    <axis xyz="1 0 0"/>
+    <limit lower="0" upper="1" effort="1" velocity="1"/>
+    <mimic joint="__rma_mimic_0000_right_finger_joint" multiplier="1" offset="0"/>
+  </joint>
+  <link name="left_link"/>
+</robot>
+""",
+        encoding="utf-8",
+    )
+    return canonical_path, view_path
+
+
 def test_scene_state_no_program_returns_empty_world():
     client, state, kernel = make_client()
 
@@ -422,6 +476,82 @@ def test_visual_state_publisher_uses_cached_joint_names(
     assert snapshot is not None
     assert snapshot.robot is not None
     assert snapshot.robot.joint_names == ["joint_a"]
+
+
+@_REQUIRES_PINOCCHIO_VISUAL_FK
+def test_scene_state_visual_snapshot_uses_rma_private_view_for_sibling_mimic(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    """Visual FK uses the RMA view while public joint names stay canonical."""
+
+    canonical_path, view_path = _write_sibling_mimic_visual_urdfs(tmp_path)
+
+    class VisualMimicKernel(MockKernelClient):
+        def __init__(self) -> None:
+            super().__init__(joint_names=["right_finger_joint"])
+
+        def get_execution_snapshot(self):
+            return ExecutionSnapshot(joint_positions_rad=[0.25])
+
+        def get_link_poses(self, link_names: list[str], reference_frame: str):
+            raise AssertionError("visual snapshot must not use legacy kernel FK")
+
+        def get_link_pose(self, link_name: str, reference_frame: str):
+            raise AssertionError("visual snapshot must not use single-link FK")
+
+    entry = SimpleNamespace(urdf_path=str(canonical_path))
+    monkeypatch.setattr(routes_urdf, "get_urdf_entry", lambda _state: entry)
+    monkeypatch.setattr(routes_urdf, "active_urdf_model_key", lambda _state: "rma-view-key")
+    monkeypatch.setattr(
+        routes_urdf,
+        "visual_link_names_for_fk",
+        lambda _state: ("base_link", "right_link", "left_link"),
+    )
+    monkeypatch.setattr(
+        routes_urdf,
+        "robot_model_authority_metadata",
+        lambda _state: {
+            "view_changed": True,
+            "view_urdf_path": str(view_path),
+            "view_to_canonical_joint_names": {
+                "__rma_mimic_0000_right_finger_joint": "right_finger_joint",
+            },
+            "canonical_to_view_joint_names": {
+                "right_finger_joint": "__rma_mimic_0000_right_finger_joint",
+            },
+        },
+    )
+    kernel = VisualMimicKernel()
+    state = ComposerState(catalog_path=_CATALOG_PATH, kernel=kernel)
+    state.program = SimpleNamespace(
+        robot=SimpleNamespace(base_frame="base_link", tcp_frame="right_link", base_pose={}),
+        scene=[],
+    )
+    state.deployment = SimpleNamespace(
+        robot_config=SimpleNamespace(robot_id="sibling_mimic", group_id="lite6"),
+        adapters={},
+        grippers={},
+    )
+
+    result = _publish_visual_snapshot(state)
+    assert result["success"] is True, result
+
+    payload = routes_scene.build_scene_state_payload(state)
+
+    diagnostics = payload["visual_state_diagnostics"]
+    assert diagnostics["mode"] == "visual_snapshot"
+    assert diagnostics["served_from_visual_snapshot"] is True
+    assert payload["visual_state"]["model_key"] == "rma-view-key"
+    assert payload["robot"]["joint_names"] == ["right_finger_joint"]
+    assert payload["link_poses"]["right_link"]["position_m"] == pytest.approx(
+        [0.25, 0.0, 0.0],
+        abs=1e-6,
+    )
+    assert payload["link_poses"]["left_link"]["position_m"] == pytest.approx(
+        [0.25, 1.0, 0.0],
+        abs=1e-6,
+    )
 
 
 @_REQUIRES_PINOCCHIO_VISUAL_FK

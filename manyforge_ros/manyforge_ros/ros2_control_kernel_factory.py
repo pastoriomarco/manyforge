@@ -17,6 +17,10 @@ from manyforge_behavior.model_paths import (
     default_package_paths,
     resolve_robot_model,
 )
+from manyforge_behavior.robot_model_runtime import (
+    attach_robot_model_metadata,
+    prepare_roboplan_runtime_model_view,
+)
 
 
 @dataclass
@@ -68,6 +72,10 @@ def create_ros2_control_kernel(
         deployment_path=deployment.source_path,
         extra_package_paths=default_package_paths(),
     )
+    runtime_model = prepare_roboplan_runtime_model_view(
+        resolved_model=resolved_model,
+        grippers=deployment.grippers,
+    )
     kernel_config: dict[str, Any] = {}
     if collision_monitor_period_ns is not None:
         kernel_config["collision_monitor_period_ns"] = collision_monitor_period_ns
@@ -111,11 +119,11 @@ def create_ros2_control_kernel(
         ros_config["monitor_period_s"] = float(collision_monitor_period_ns) / 1e9
 
     native_bundle = manyforge_roboplan_py.create_ros2_control_kernel_from_paths(
-        resolved_model.model_name,
+        runtime_model.model_name,
         robot_config.group_id or "arm",
-        resolved_model.urdf_path,
-        resolved_model.srdf_path,
-        resolved_model.package_paths,
+        runtime_model.urdf_path,
+        runtime_model.srdf_path,
+        runtime_model.package_paths,
         ros_config,
         kernel_config_arg,
     )
@@ -126,7 +134,14 @@ def create_ros2_control_kernel(
         native_bundle=native_bundle,
         group_id=robot_config.group_id or "arm",
     )
-    return NativeKernelClient(native_bundle), bundle
+    kernel = NativeKernelClient(
+        native_bundle,
+        robot_model_authority_metadata=runtime_model.metadata,
+        robot_model_authority_temp_dir=runtime_model._temp_dir,
+    )
+    attach_robot_model_metadata(kernel, runtime_model)
+    attach_robot_model_metadata(bundle, runtime_model)
+    return kernel, bundle
 
 
 def _configure_ros_grippers(native_bundle: Any, deployment: Deployment, config: dict) -> None:

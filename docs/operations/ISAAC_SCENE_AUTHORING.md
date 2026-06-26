@@ -207,10 +207,12 @@ source is part of the cell authority model and its stale-data behavior is
 understood.
 
 For diagnostics, open **Tools > Sources** in the native viewer and enable
-**Measured-state ghost**. It renders fresh external object observations as
+**Measured-state ghosts**. It renders fresh external object observations as
 a cyan translucent overlay so you can compare Isaac/perception state with
-Composer's backend-authoritative planning scene. The overlay is viewer-only;
-it does not modify object poses.
+Composer's backend-authoritative planning scene. Enable **Robot collision
+meshes** in the same panel to overlay the URDF collision geometry used by
+trajectory validation. These overlays are viewer-only; they do not modify
+object poses or collision validation.
 
 ## 8. Qualify visual-state responsiveness during a live cycle
 

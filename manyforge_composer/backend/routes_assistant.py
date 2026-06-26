@@ -562,9 +562,12 @@ def create_assistant_router(state: ComposerState) -> APIRouter:
         """List assistant provider modes available to Composer."""
         configured = _configured_assistant_provider(state)
         configured_provider_id = configured.provider_id if configured is not None else "mock"
+        live_model, live_model_source = _live_bridge_model(configured)
         return {
             "providers": assistant_provider_catalog(configured),
             "configuredProviderId": configured_provider_id,
+            "liveModel": live_model,
+            "liveModelSource": live_model_source,
         }
 
     @router.get(
@@ -4906,6 +4909,61 @@ def _resolve_provider(state: ComposerState, request: AssistantChatRequest):
         if requested != configured:
             raise HTTPException(status_code=404, detail="Requested assistant provider is not configured")
     return provider
+
+
+def _live_bridge_model(provider: Any) -> tuple[str | None, str | None]:
+    """Best-effort live read of the model the configured bridge is running.
+
+    The configured provider's ``endpoint_url`` targets the bridge request
+    endpoint (e.g. ``http://127.0.0.1:8100/v1/manyforge/assistant``). The
+    bridge publishes the model it is actually serving at its root
+    ``/healthz`` (``{"model": ..., "modelSource": ...}``), which is decoupled
+    from the deployment's static model_id/profile_ref. We derive the bridge
+    base (scheme://host:port) from the endpoint URL and GET ``/healthz`` with a
+    short timeout.
+
+    Fully defensive: any failure (no endpoint, missing httpx, timeout, non-2xx,
+    bad JSON, missing field) returns ``(None, None)`` so the catalog response
+    degrades to the deployment-declared label and ``list_providers`` never
+    fails.
+    """
+    if provider is None:
+        return None, None
+    endpoint_url = getattr(provider, "endpoint_url", None)
+    if not isinstance(endpoint_url, str) or not endpoint_url.strip():
+        return None, None
+    try:
+        from urllib.parse import urlsplit, urlunsplit
+
+        parts = urlsplit(endpoint_url.strip())
+        if not parts.scheme or not parts.netloc:
+            return None, None
+        # Strip the request path; the bridge serves /healthz at its root.
+        base = urlunsplit((parts.scheme, parts.netloc, "", "", ""))
+        healthz_url = base.rstrip("/") + "/healthz"
+    except Exception:
+        return None, None
+
+    try:
+        import httpx
+    except Exception:
+        return None, None
+
+    try:
+        with httpx.Client(timeout=2.0) as client:
+            response = client.get(healthz_url)
+            response.raise_for_status()
+            payload = response.json()
+    except Exception:
+        return None, None
+
+    if not isinstance(payload, dict):
+        return None, None
+    model = payload.get("model")
+    source = payload.get("modelSource")
+    live_model = model if isinstance(model, str) and model.strip() else None
+    live_model_source = source if isinstance(source, str) and source.strip() else None
+    return live_model, live_model_source
 
 
 def _configured_assistant_provider(state: ComposerState):

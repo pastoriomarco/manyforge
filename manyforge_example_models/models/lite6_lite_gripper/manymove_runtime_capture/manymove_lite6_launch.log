@@ -1,0 +1,200 @@
+[bt_client_foundationpose-9]   </Sequence>
+[bt_client_foundationpose-9] </RetryPauseResetNode>
+[bt_client_foundationpose-9] <RetryPauseResetNode name="StopSafe_Retry_5"  collision_detected="{collision_detected}"  stop_execution="{stop_execution}"  reset="{reset}"  robot_prefix="">
+[bt_client_foundationpose-9]   <Sequence>
+[bt_client_foundationpose-9]     <MoveManipulatorAction    name="MoveManip_5"    robot_prefix=""    move_id="5"    max_tries="3"    trajectory="{trajectory_5}"    pose_key="drop_target_key"    collision_detected="{collision_detected}"    invalidate_traj_on_exec="false"     stop_execution="{stop_execution}"/>
+[bt_client_foundationpose-9]   </Sequence>
+[bt_client_foundationpose-9] </RetryPauseResetNode>
+[bt_client_foundationpose-9] 
+[bt_client_foundationpose-9]   </Sequence>
+[bt_client_foundationpose-9] 
+[bt_client_foundationpose-9]   <Sequence name="OpenGripper">
+[bt_client_foundationpose-9] <PublishJointStateAction topic="/isaac_joint_commands_gripper" joint_names="[right_finger_joint]" joint_positions="[0.0081]" joint_efforts="[5.0]" /><Delay delay_msec="1000"><PublishJointStateAction topic="/isaac_joint_commands_gripper" joint_names="[right_finger_joint]" joint_positions="[0.0081]" joint_efforts="[2.0]" /></Delay>
+[bt_client_foundationpose-9]   <Fallback name="detach_graspable_always_success">
+[bt_client_foundationpose-9] <AttachDetachObjectAction name="detach_graspable_AttachDetachObjectAction" object_id="{graspable_key}" link_name="{tcp_frame_name_key}" attach="false" />
+[bt_client_foundationpose-9] <AlwaysSuccess />
+[bt_client_foundationpose-9]   </Fallback>
+[bt_client_foundationpose-9] 
+[bt_client_foundationpose-9]   </Sequence>
+[bt_client_foundationpose-9] 
+[bt_client_foundationpose-9]   </Sequence>
+[bt_client_foundationpose-9] 
+[bt_client_foundationpose-9]   <Fallback name="remove_graspable_obj_always_success">
+[bt_client_foundationpose-9] <RemoveCollisionObjectAction name="remove_graspable_RemoveCollisionObjectAction" object_id="{graspable_key}" />
+[bt_client_foundationpose-9] <AlwaysSuccess />
+[bt_client_foundationpose-9]   </Fallback>
+[bt_client_foundationpose-9] 
+[bt_client_foundationpose-9] <SetKeyBoolValue robot_prefix="" name="SetGraspableDeleted_SetKey" key="graspable_created_key" value="false"/>
+[bt_client_foundationpose-9]     </Sequence>
+[bt_client_foundationpose-9]   </Repeat>
+[bt_client_foundationpose-9] 
+[bt_client_foundationpose-9]   </Parallel>
+[bt_client_foundationpose-9] 
+[bt_client_foundationpose-9]     </Sequence>
+[bt_client_foundationpose-9]   </RetryNode>
+[bt_client_foundationpose-9] 
+[bt_client_foundationpose-9]   </Sequence>
+[bt_client_foundationpose-9] 
+[bt_client_foundationpose-9]   </BehaviorTree>
+[bt_client_foundationpose-9] </root>
+[bt_client_foundationpose-9] 
+[object_manager_node-8] [INFO] [1782390030.320791580] [object_manager_node]: Waiting for /get_planning_scene service...
+[bt_client_foundationpose-9] [INFO] [1782390030.323622534] [bt_client_foundationpose]: CheckObjectExistsAction: Waiting for 'check_object_exists' server...
+[action_server_node-7] [INFO] [1782390030.351677280] [param_loader_node]: Action Server Node name: action_server_node
+[action_server_node-7] [INFO] [1782390030.371533533] [moveit_894002583.moveit.ros.rdf_loader]: Loaded robot model in 0.00593722 seconds
+[action_server_node-7] [INFO] [1782390030.371625357] [moveit_894002583.moveit.core.robot_model]: Loading robot model 'UF_ROBOT'...
+[action_server_node-7] [INFO] [1782390030.371640070] [moveit_894002583.moveit.core.robot_model]: No root/virtual joint specified in SRDF. Assuming fixed joint
+[action_server_node-7] [INFO] [1782390030.395603014] [moveit_894002583.moveit.kinematics.kdl_kinematics_plugin]: Joint weights for group 'lite6': 1 1 1 1 1 1
+[ros2_control_node-4] [INFO] [1782390030.727014655] [controller_manager]: Received robot description from topic.
+[ros2_control_node-4] [WARN] [1782390030.727078877] [controller_manager]: ResourceManager has already loaded a urdf. Ignoring attempt to reload a robot description.
+[object_manager_node-8] [INFO] [1782390030.818731193] [object_manager_node]: /get_planning_scene service is available.
+[object_manager_node-8] [INFO] [1782390030.818822137] [object_manager_node]: Requesting Planning Scene with components: 12
+[object_manager_node-8] [INFO] [1782390030.920392450] [object_manager_node]: Received Planning Scene:
+[object_manager_node-8] [INFO] [1782390030.920455191] [object_manager_node]:   No collision objects found in the planning scene.
+[object_manager_node-8] [INFO] [1782390030.920461182] [object_manager_node]:   No attached collision objects found in the planning scene.
+[bt_client_foundationpose-9] [INFO] [1782390030.939633229] [bt_client_foundationpose]: CheckObjectExistsAction: Connected to 'check_object_exists' server.
+[bt_client_foundationpose-9] [INFO] [1782390030.948620714] [bt_client_foundationpose]: AddCollisionObjectAction: Waiting for 'add_collision_object' server...
+[bt_client_foundationpose-9] [INFO] [1782390030.948872178] [bt_client_foundationpose]: AddCollisionObjectAction: Connected to 'add_collision_object' server.
+[object_manager_node-8] [INFO] [1782390030.950614545] [object_manager_node]: Object Manager Node initialized with frame_id: world.
+[bt_client_foundationpose-9] [INFO] [1782390030.953001275] [bt_client_foundationpose]: CheckObjectExistsAction: Waiting for 'check_object_exists' server...
+[bt_client_foundationpose-9] [INFO] [1782390030.953151711] [bt_client_foundationpose]: CheckObjectExistsAction: Connected to 'check_object_exists' server.
+[bt_client_foundationpose-9] [INFO] [1782390030.955825452] [bt_client_foundationpose]: AddCollisionObjectAction: Waiting for 'add_collision_object' server...
+[bt_client_foundationpose-9] [INFO] [1782390030.955934637] [bt_client_foundationpose]: AddCollisionObjectAction: Connected to 'add_collision_object' server.
+[bt_client_foundationpose-9] [INFO] [1782390030.959364982] [bt_client_foundationpose]: AttachDetachObjectAction: Waiting for 'attach_detach_object' server...
+[bt_client_foundationpose-9] [INFO] [1782390030.959492788] [bt_client_foundationpose]: AttachDetachObjectAction: Connected to 'attach_detach_object' server.
+[bt_client_foundationpose-9] [INFO] [1782390030.962725401] [bt_client_foundationpose]: RemoveCollisionObjectAction: Waiting for 'remove_collision_object' server...
+[bt_client_foundationpose-9] [INFO] [1782390030.962891985] [bt_client_foundationpose]: RemoveCollisionObjectAction: Connected to 'remove_collision_object' server.
+[bt_client_foundationpose-9] [INFO] [1782390030.966537516] [bt_client_foundationpose]: [MoveManipulatorAction] Waiting for move_manipulator server: move_manipulator
+[action_server_node-7] [INFO] [1782390031.645204834] [moveit_894002583.moveit.ros.move_group_interface]: Ready to take commands for planning group lite6.
+[action_server_node-7] [INFO] [1782390031.645279843] [action_server_node]: MoveGroupPlanner initialized with group: lite6
+[ros2_control_node-4] [INFO] [1782390031.647341110] [controller_manager]: Received robot description from topic.
+[ros2_control_node-4] [WARN] [1782390031.647394574] [controller_manager]: ResourceManager has already loaded a urdf. Ignoring attempt to reload a robot description.
+[action_server_node-7] [INFO] [1782390031.649821193] [moveit_894002583.moveit.ros.rdf_loader]: Loaded robot model in 0.00391172 seconds
+[action_server_node-7] [INFO] [1782390031.649870822] [moveit_894002583.moveit.core.robot_model]: Loading robot model 'UF_ROBOT'...
+[action_server_node-7] [INFO] [1782390031.649896406] [moveit_894002583.moveit.core.robot_model]: No root/virtual joint specified in SRDF. Assuming fixed joint
+[action_server_node-7] [INFO] [1782390031.674345444] [moveit_894002583.moveit.kinematics.kdl_kinematics_plugin]: Joint weights for group 'lite6': 1 1 1 1 1 1
+[action_server_node-7] [INFO] [1782390031.758985291] [moveit_894002583.moveit.ros.planning_scene_monitor]: Publishing maintained planning scene on 'monitored_planning_scene'
+[action_server_node-7] [INFO] [1782390031.759184338] [moveit_894002583.moveit.ros.planning_scene_monitor]: Starting planning scene monitor
+[action_server_node-7] [INFO] [1782390031.760396240] [moveit_894002583.moveit.ros.planning_scene_monitor]: Listening to '/monitored_planning_scene'
+[action_server_node-7] [INFO] [1782390031.762242867] [moveit_894002583.moveit.ros.current_state_monitor]: Listening to joint states on topic 'joint_states'
+[action_server_node-7] [INFO] [1782390031.763075055] [moveit_894002583.moveit.ros.planning_scene_monitor]: Listening to '/attached_collision_object' for attached collision objects
+[action_server_node-7] [INFO] [1782390031.763093712] [moveit_894002583.moveit.ros.planning_scene_monitor]: Starting world geometry update monitor for collision objects, attached objects, octomap updates.
+[action_server_node-7] [INFO] [1782390031.763730566] [moveit_894002583.moveit.ros.planning_scene_monitor]: Listening to 'collision_object'
+[action_server_node-7] [INFO] [1782390031.764365513] [moveit_894002583.moveit.ros.planning_scene_monitor]: Listening to 'planning_scene_world' for planning scene world geometry
+[action_server_node-7] [WARN] [1782390031.764815413] [moveit_894002583.moveit.ros.occupancy_map_monitor]: Resolution not specified for Octomap. Assuming resolution = 0.1 instead
+[action_server_node-7] [ERROR] [1782390031.764833153] [moveit_894002583.moveit.ros.occupancy_map_monitor]: No 3D sensor plugin(s) defined for octomap updates
+[ros2_control_node-4] [WARN] [1782390031.776790324] [controller_manager]: Overrun detected! The controller manager missed its desired rate of 150 Hz. The loop took 7.977283 ms (missed cycles : 2).
+[action_server_node-7] [INFO] [1782390031.779631223] [action_server_node]: PlanningSceneMonitor started: listening to /monitored_planning_scene
+[action_server_node-7] [INFO] [1782390031.789741675] [action_server_node]: FollowJointTrajectory action server available
+[action_server_node-7] [INFO] [1782390031.790682446] [action_server_node]: ===================================================
+[action_server_node-7] [INFO] [1782390031.790701372] [action_server_node]: Using MoveGroupPlanner.
+[action_server_node-7] [INFO] [1782390031.790705752] [action_server_node]: ===================================================
+[action_server_node-7] [WARN] [1782390031.796981209] [action_server_node]: Service '/controller_manager/unload_controller' not available at startup; will retry on demand.
+[action_server_node-7] [WARN] [1782390031.797031690] [action_server_node]: Service '/controller_manager/load_controller' not available at startup; will retry on demand.
+[action_server_node-7] [WARN] [1782390031.797046968] [action_server_node]: Service '/controller_manager/switch_controller' not available at startup; will retry on demand.
+[action_server_node-7] [WARN] [1782390031.797061246] [action_server_node]: Service '/controller_manager/configure_controller' not available at startup; will retry on demand.
+[bt_client_foundationpose-9] [INFO] [1782390031.893067364] [bt_client_foundationpose]: AddCollisionObjectAction: Waiting for 'add_collision_object' server...
+[bt_client_foundationpose-9] [INFO] [1782390031.893472254] [bt_client_foundationpose]: AddCollisionObjectAction: Connected to 'add_collision_object' server.
+[bt_client_foundationpose-9] [INFO] [1782390031.900599964] [bt_client_foundationpose]: [MoveManipulatorAction] Waiting for move_manipulator server: move_manipulator
+[bt_client_foundationpose-9] [INFO] [1782390031.905003238] [bt_client_foundationpose]: [MoveManipulatorAction] Waiting for move_manipulator server: move_manipulator
+[bt_client_foundationpose-9] [INFO] [1782390031.908676621] [bt_client_foundationpose]: AttachDetachObjectAction: Waiting for 'attach_detach_object' server...
+[bt_client_foundationpose-9] [INFO] [1782390031.908818538] [bt_client_foundationpose]: AttachDetachObjectAction: Connected to 'attach_detach_object' server.
+[bt_client_foundationpose-9] [INFO] [1782390031.911885188] [bt_client_foundationpose]: [MoveManipulatorAction] Waiting for move_manipulator server: move_manipulator
+[bt_client_foundationpose-9] [INFO] [1782390031.915322653] [bt_client_foundationpose]: [MoveManipulatorAction] Waiting for move_manipulator server: move_manipulator
+[bt_client_foundationpose-9] [INFO] [1782390031.919036120] [bt_client_foundationpose]: [MoveManipulatorAction] Waiting for move_manipulator server: move_manipulator
+[bt_client_foundationpose-9] [INFO] [1782390031.922998930] [bt_client_foundationpose]: AttachDetachObjectAction: Waiting for 'attach_detach_object' server...
+[bt_client_foundationpose-9] [INFO] [1782390031.923134411] [bt_client_foundationpose]: AttachDetachObjectAction: Connected to 'attach_detach_object' server.
+[bt_client_foundationpose-9] [INFO] [1782390031.929375035] [bt_client_foundationpose]: RemoveCollisionObjectAction: Waiting for 'remove_collision_object' server...
+[bt_client_foundationpose-9] [INFO] [1782390031.929555248] [bt_client_foundationpose]: RemoveCollisionObjectAction: Connected to 'remove_collision_object' server.
+[bt_client_foundationpose-9] [INFO] [1782390031.961164561] [hmi_service_node]: [hmi_service_node] HMIServiceNode started: service 'update_blackboard' is ready.
+[bt_client_foundationpose-9] [INFO] [1782390031.962664390] [bt_client_foundationpose]: HMI Service Node instantiated.
+[bt_client_foundationpose-9] [INFO] [1782390031.963234540] [bt_client_foundationpose]: CheckObjectExistsAction: Sending goal to check existence of object 'ground'.
+[object_manager_node-8] [INFO] [1782390031.963677014] [object_manager_node]: Received request to check existence of object: ground
+[object_manager_node-8] [INFO] [1782390031.964189062] [object_manager_node]: Checking if object 'ground' exists in the planning scene...
+[object_manager_node-8] [INFO] [1782390031.964551804] [object_manager_node]: Object 'ground' not found in the planning scene.
+[object_manager_node-8] [INFO] [1782390031.964682258] [object_manager_node]: Checking if object 'ground' is attached to any link...
+[object_manager_node-8] [INFO] [1782390031.964902824] [object_manager_node]: Object 'ground' is not attached to link 'any link'.
+[object_manager_node-8] [INFO] [1782390031.964911824] [object_manager_node]: CheckExist: Object 'ground' does NOT exist in the planning scene.
+[bt_client_foundationpose-9] [INFO] [1782390031.983105322] [bt_client_foundationpose]: CheckObjectExistsAction: Goal accepted by the server, waiting for result.
+[bt_client_foundationpose-9] [INFO] [1782390031.993147791] [bt_client_foundationpose]: CheckObjectExistsAction: Goal succeeded.
+[bt_client_foundationpose-9] [INFO] [1782390031.993224301] [bt_client_foundationpose]: CheckObjectExistsAction: Object 'ground' does not exist.
+[bt_client_foundationpose-9] [INFO] [1782390031.993265199] [bt_client_foundationpose]: AddCollisionObjectAction: Sending goal for object 'ground'.
+[object_manager_node-8] [INFO] [1782390031.993633451] [object_manager_node]: Received request to add object: ground
+[object_manager_node-8] [INFO] [1782390031.993978748] [object_manager_node]: Checking if object 'ground' exists in the planning scene...
+[object_manager_node-8] [INFO] [1782390031.994409258] [object_manager_node]: Object 'ground' not found in the planning scene.
+[object_manager_node-8] [INFO] [1782390031.994513991] [object_manager_node]: Checking if object 'ground' is attached to any link...
+[object_manager_node-8] [INFO] [1782390031.994701981] [object_manager_node]: Object 'ground' is not attached to link 'any link'.
+[object_manager_node-8] [INFO] [1782390031.995016993] [object_manager_node]: Published ADD operation for object 'ground'.
+[move_group-2] [INFO] [1782390031.995447744] [move_group.moveit.moveit.ros.planning_scene_monitor]: Published update collision object
+[action_server_node-7] [INFO] [1782390031.997212907] [moveit_894002583.moveit.ros.planning_scene_monitor]: Published update collision object
+[bt_client_foundationpose-9] [INFO] [1782390032.023028709] [bt_client_foundationpose]: AddCollisionObjectAction: Goal accepted by the server, waiting for result.
+[object_manager_node-8] [INFO] [1782390032.045441731] [object_manager_node]: Checking if object 'ground' exists in the planning scene...
+[object_manager_node-8] [INFO] [1782390032.046016529] [object_manager_node]: Object 'ground' found in the planning scene.
+[object_manager_node-8] [INFO] [1782390032.046151409] [object_manager_node]: Object 'ground' added successfully after 1 attempt(s).
+[bt_client_foundationpose-9] [INFO] [1782390032.063194125] [bt_client_foundationpose]: AddCollisionObjectAction: Goal succeeded.
+[bt_client_foundationpose-9] [INFO] [1782390032.063311922] [bt_client_foundationpose]: AddCollisionObjectAction: Successfully added object 'ground'.
+[bt_client_foundationpose-9] [INFO] [1782390032.063449144] [bt_client_foundationpose]: CheckObjectExistsAction: Sending goal to check existence of object 'wall'.
+[object_manager_node-8] [INFO] [1782390032.063672664] [object_manager_node]: Received request to check existence of object: wall
+[object_manager_node-8] [INFO] [1782390032.064087119] [object_manager_node]: Checking if object 'wall' exists in the planning scene...
+[object_manager_node-8] [INFO] [1782390032.064562639] [object_manager_node]: Object 'wall' not found in the planning scene.
+[object_manager_node-8] [INFO] [1782390032.064591167] [object_manager_node]: Checking if object 'wall' is attached to any link...
+[object_manager_node-8] [INFO] [1782390032.064826872] [object_manager_node]: Object 'wall' is not attached to link 'any link'.
+[object_manager_node-8] [INFO] [1782390032.064834779] [object_manager_node]: CheckExist: Object 'wall' does NOT exist in the planning scene.
+[bt_client_foundationpose-9] [INFO] [1782390032.083364602] [bt_client_foundationpose]: CheckObjectExistsAction: Goal accepted by the server, waiting for result.
+[bt_client_foundationpose-9] [INFO] [1782390032.093178996] [bt_client_foundationpose]: CheckObjectExistsAction: Goal succeeded.
+[bt_client_foundationpose-9] [INFO] [1782390032.093284396] [bt_client_foundationpose]: CheckObjectExistsAction: Object 'wall' does not exist.
+[bt_client_foundationpose-9] [INFO] [1782390032.093334599] [bt_client_foundationpose]: AddCollisionObjectAction: Sending goal for object 'wall'.
+[object_manager_node-8] [INFO] [1782390032.093828629] [object_manager_node]: Received request to add object: wall
+[object_manager_node-8] [INFO] [1782390032.094253584] [object_manager_node]: Checking if object 'wall' exists in the planning scene...
+[object_manager_node-8] [INFO] [1782390032.094856938] [object_manager_node]: Object 'wall' not found in the planning scene.
+[object_manager_node-8] [INFO] [1782390032.094973568] [object_manager_node]: Checking if object 'wall' is attached to any link...
+[object_manager_node-8] [INFO] [1782390032.095287690] [object_manager_node]: Object 'wall' is not attached to link 'any link'.
+[object_manager_node-8] [INFO] [1782390032.095573542] [object_manager_node]: Published ADD operation for object 'wall'.
+[action_server_node-7] [INFO] [1782390032.095989164] [moveit_894002583.moveit.ros.planning_scene_monitor]: Published update collision object
+[move_group-2] [INFO] [1782390032.095990275] [move_group.moveit.moveit.ros.planning_scene_monitor]: Published update collision object
+[bt_client_foundationpose-9] [INFO] [1782390032.123150906] [bt_client_foundationpose]: AddCollisionObjectAction: Goal accepted by the server, waiting for result.
+[object_manager_node-8] [INFO] [1782390032.146003420] [object_manager_node]: Checking if object 'wall' exists in the planning scene...
+[object_manager_node-8] [INFO] [1782390032.147400359] [object_manager_node]: Object 'wall' found in the planning scene.
+[object_manager_node-8] [INFO] [1782390032.147516175] [object_manager_node]: Object 'wall' added successfully after 1 attempt(s).
+[bt_client_foundationpose-9] [INFO] [1782390032.163121358] [bt_client_foundationpose]: AddCollisionObjectAction: Goal succeeded.
+[bt_client_foundationpose-9] [INFO] [1782390032.163265581] [bt_client_foundationpose]: AddCollisionObjectAction: Successfully added object 'wall'.
+[bt_client_foundationpose-9] [INFO] [1782390032.163380738] [bt_client_foundationpose]: [robot_start_execution_WaitForKey] WaitForKeyBool starting: key='stop_execution', expected='false', timeout=0.00, poll_rate=0.10
+[manymove_hmi_executable-10] qt.qpa.xcb: could not connect to display 
+[manymove_hmi_executable-10] qt.qpa.plugin: Could not load the Qt platform plugin "xcb" in "" even though it was found.
+[manymove_hmi_executable-10] This application failed to start because no Qt platform plugin could be initialized. Reinstalling the application may fix this problem.
+[manymove_hmi_executable-10] 
+[manymove_hmi_executable-10] Available platform plugins are: eglfs, linuxfb, minimal, minimalegl, offscreen, vnc, xcb.
+[manymove_hmi_executable-10] 
+[ERROR] [manymove_hmi_executable-10]: process has died [pid 172, exit code -6, cmd '/opt/manymove_ws/install/manymove_hmi/lib/manymove_hmi/manymove_hmi_executable --ros-args --params-file /tmp/launch_params_enfofgbl'].
+[ros2_control_node-4] [WARN] [1782390040.236608390] [controller_manager]: Overrun might occur, Total time : 7722.629 us (Expected < 6666.667 us) --> Read time : 7666.879 us, Update time : 45.398 us, Write time : 10.352 us
+[ros2_control_node-4] [WARN] [1782390040.236685751] [controller_manager]: Overrun detected! The controller manager missed its desired rate of 150 Hz. The loop took 7.873436 ms (missed cycles : 2).
+[spawner-5] [WARN] [1782390040.641144173] [spawner_joint_state_broadcaster]: Failed getting a result from calling /controller_manager/list_controllers in 10.0. (Attempt 1 of 3.)
+[ros2_control_node-4] [INFO] [1782390040.647660576] [controller_manager]: Loading controller : 'joint_state_broadcaster' of type 'joint_state_broadcaster/JointStateBroadcaster'
+[ros2_control_node-4] [INFO] [1782390040.647729502] [controller_manager]: Loading controller 'joint_state_broadcaster'
+[ros2_control_node-4] [INFO] [1782390040.651117514] [controller_manager]: Controller 'joint_state_broadcaster' node arguments: --ros-args --params-file /tmp/launch_params_bdipn6hm --params-file /tmp/launch_params_ooq5z0rz --params-file /opt/manymove_ws/install/xarm_api/share/xarm_api/config/xarm_params.yaml 
+[spawner-5] [INFO] [1782390040.691022966] [spawner_joint_state_broadcaster]: Loaded joint_state_broadcaster
+[ros2_control_node-4] [INFO] [1782390040.693948559] [controller_manager]: Configuring controller: 'joint_state_broadcaster'
+[ros2_control_node-4] [INFO] [1782390040.694084412] [joint_state_broadcaster]: 'joints' or 'interfaces' parameter is empty. All available state interfaces will be published
+[ros2_control_node-4] [INFO] [1782390040.705669091] [controller_manager]: Activating controllers: [ joint_state_broadcaster ]
+[ros2_control_node-4] [INFO] [1782390040.709310232] [controller_manager]: Successfully switched controllers!
+[spawner-5] [INFO] [1782390040.717903892] [spawner_joint_state_broadcaster]: Configured and activated joint_state_broadcaster
+[INFO] [spawner-5]: process has finished cleanly [pid 47]
+[ros2_control_node-4] [WARN] [1782390044.356032414] [controller_manager]: Overrun might occur, Total time : 7139.405 us (Expected < 6666.667 us) --> Read time : 1845.155 us, Update time : 4987.767 us, Write time : 306.483 us
+[ros2_control_node-4] [WARN] [1782390044.357259140] [controller_manager]: Overrun detected! The controller manager missed its desired rate of 150 Hz. The loop took 8.447014 ms (missed cycles : 2).
+[ros2_control_node-4] [WARN] [1782390062.652033974] [controller_manager]: Overrun detected! The controller manager missed its desired rate of 150 Hz. The loop took 9.890650 ms (missed cycles : 2).
+[ros2_control_node-4] [WARN] [1782390068.128995656] [controller_manager]: Overrun detected! The controller manager missed its desired rate of 150 Hz. The loop took 6.852852 ms (missed cycles : 2).
+[ros2_control_node-4] [WARN] [1782390073.996620356] [controller_manager]: Overrun might occur, Total time : 7747.192 us (Expected < 6666.667 us) --> Read time : 7681.610 us, Update time : 56.231 us, Write time : 9.351 us
+[ros2_control_node-4] [WARN] [1782390073.996695116] [controller_manager]: Overrun detected! The controller manager missed its desired rate of 150 Hz. The loop took 7.886353 ms (missed cycles : 2).
+[ros2_control_node-4] [WARN] [1782390076.036520151] [controller_manager]: Overrun might occur, Total time : 7651.164 us (Expected < 6666.667 us) --> Read time : 7579.822 us, Update time : 60.740 us, Write time : 10.602 us
+[ros2_control_node-4] [WARN] [1782390076.036594560] [controller_manager]: Overrun detected! The controller manager missed its desired rate of 150 Hz. The loop took 7.785982 ms (missed cycles : 2).
+[ros2_control_node-4] [WARN] [1782390090.588979617] [controller_manager]: Overrun might occur, Total time : 6776.079 us (Expected < 6666.667 us) --> Read time : 6704.977 us, Update time : 59.935 us, Write time : 11.167 us
+[ros2_control_node-4] [WARN] [1782390090.589078145] [controller_manager]: Overrun detected! The controller manager missed its desired rate of 150 Hz. The loop took 6.937504 ms (missed cycles : 2).
+[ros2_control_node-4] [WARN] [1782390140.623260346] [controller_manager]: Overrun might occur, Total time : 14392.699 us (Expected < 6666.667 us) --> Read time : 14299.236 us, Update time : 79.972 us, Write time : 13.491 us
+[ros2_control_node-4] [WARN] [1782390140.623367403] [controller_manager]: Overrun detected! The controller manager missed its desired rate of 150 Hz. The loop took 14.565199 ms (missed cycles : 3).
+[ros2_control_node-4] [WARN] [1782390151.104875464] [controller_manager]: Overrun detected! The controller manager missed its desired rate of 150 Hz. The loop took 9.407476 ms (missed cycles : 2).
+[ros2_control_node-4] [WARN] [1782390291.996625739] [controller_manager]: Overrun detected! The controller manager missed its desired rate of 150 Hz. The loop took 7.838405 ms (missed cycles : 2).
+[ros2_control_node-4] [WARN] [1782390305.796679408] [controller_manager]: Overrun might occur, Total time : 7819.601 us (Expected < 6666.667 us) --> Read time : 7734.314 us, Update time : 73.445 us, Write time : 11.842 us
+[ros2_control_node-4] [WARN] [1782390305.796759705] [controller_manager]: Overrun detected! The controller manager missed its desired rate of 150 Hz. The loop took 7.974002 ms (missed cycles : 2).
+[ros2_control_node-4] [WARN] [1782390310.615791968] [controller_manager]: Overrun detected! The controller manager missed its desired rate of 150 Hz. The loop took 7.006440 ms (missed cycles : 2).
+[ros2_control_node-4] [WARN] [1782390327.548883485] [controller_manager]: Overrun might occur, Total time : 6693.403 us (Expected < 6666.667 us) --> Read time : 6614.921 us, Update time : 69.166 us, Write time : 9.316 us
+[ros2_control_node-4] [WARN] [1782390327.548957790] [controller_manager]: Overrun detected! The controller manager missed its desired rate of 150 Hz. The loop took 6.840910 ms (missed cycles : 2).

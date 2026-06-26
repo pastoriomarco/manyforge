@@ -33,6 +33,11 @@ DEPLOYMENT_FIXTURE_PATH = (
 PROGRAM_FIXTURE_PATH = (
     Path(__file__).parent / "fixtures" / "pick_and_place.program.yaml"
 )
+LITE6_DEPLOYMENT_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "examples"
+    / "lite6_lite_gripper_pick_and_place.deployment.yaml"
+)
 
 
 def _write_yaml(data: dict, suffix: str = ".yaml") -> str:
@@ -41,6 +46,39 @@ def _write_yaml(data: dict, suffix: str = ".yaml") -> str:
     yaml.dump(data, f)
     f.close()
     return f.name
+
+
+def _write_one_joint_model(root: Path, *, urdf_name: str = "custom.urdf") -> tuple[Path, Path]:
+    robots = root / "robots"
+    robots.mkdir(parents=True, exist_ok=True)
+    urdf = robots / urdf_name
+    srdf = robots / urdf_name.replace(".urdf", ".srdf")
+    urdf.write_text(
+        """
+        <robot name="custom">
+          <link name="base"/>
+          <link name="tool"/>
+          <joint name="joint1" type="revolute">
+            <parent link="base"/>
+            <child link="tool"/>
+            <axis xyz="0 0 1"/>
+            <limit lower="-1" upper="1" effort="10" velocity="2"/>
+          </joint>
+        </robot>
+        """,
+        encoding="utf-8",
+    )
+    srdf.write_text(
+        """
+        <robot name="custom">
+          <group name="arm">
+            <joint name="joint1"/>
+          </group>
+        </robot>
+        """,
+        encoding="utf-8",
+    )
+    return urdf, srdf
 
 
 def _minimal_deployment(**overrides) -> dict:
@@ -251,7 +289,9 @@ class TestLauncherKernelCreation:
         with pytest.raises(RuntimeError, match="ROS 2 controller execution"):
             create_kernel(deployment)
 
-    def test_create_kernel_uses_explicit_bundle_paths_for_custom_model(self):
+    def test_create_kernel_uses_explicit_bundle_paths_for_custom_model(self, tmp_path):
+        _write_one_joint_model(tmp_path)
+        deploy_path = tmp_path / "deployment.yaml"
         data = _minimal_deployment(
             robot_config={
                 "robot_id": "ur5",
@@ -284,7 +324,7 @@ class TestLauncherKernelCreation:
                 },
             },
         )
-        deploy_path = _write_yaml(data)
+        deploy_path.write_text(yaml.safe_dump(data), encoding="utf-8")
 
         recorded: dict[str, object] = {}
         fake_bundle = object()
@@ -312,35 +352,103 @@ class TestLauncherKernelCreation:
         fake_client_module = ModuleType("native_kernel_client")
 
         class FakeNativeKernelClient:
-            def __init__(self, bundle):
+            def __init__(self, bundle, **kwargs):
                 self.bundle = bundle
+                self.kwargs = kwargs
 
         fake_client_module.NativeKernelClient = FakeNativeKernelClient
 
-        try:
-            deployment = Deployment(deploy_path)
-            with patch.dict(
-                sys.modules,
-                {
-                    "manyforge_roboplan_py": fake_roboplan,
-                    "native_kernel_client": fake_client_module,
-                },
-            ), patch("scripts.launch.default_package_paths", return_value=["/usr/local/share"]):
-                kernel = create_kernel(deployment)
+        deployment = Deployment(deploy_path)
+        with patch.dict(
+            sys.modules,
+            {
+                "manyforge_roboplan_py": fake_roboplan,
+                "native_kernel_client": fake_client_module,
+            },
+        ), patch("scripts.launch.default_package_paths", return_value=["/usr/local/share"]):
+            kernel = create_kernel(deployment)
 
-            assert isinstance(kernel, FakeNativeKernelClient)
-            assert kernel.bundle is fake_bundle
-            assert recorded["model_name"] == "custom"
-            assert recorded["group_name"] == "arm"
-            assert recorded["urdf_path"] == str(Path(deploy_path).parent / "robots" / "custom.urdf")
-            assert recorded["srdf_path"] == str(Path(deploy_path).parent / "robots" / "custom.srdf")
-            assert recorded["package_paths"] == [
-                str((Path(deploy_path).parent / "assets").resolve()),
-                str((Path(deploy_path).parent / "../shared_assets").resolve()),
-            ]
-            assert recorded["config"] == {}
-        finally:
-            os.unlink(deploy_path)
+        assert isinstance(kernel, FakeNativeKernelClient)
+        assert kernel.bundle is fake_bundle
+        assert recorded["model_name"] == "custom"
+        assert recorded["group_name"] == "arm"
+        assert recorded["urdf_path"] == str(tmp_path / "robots" / "custom.urdf")
+        assert recorded["srdf_path"] == str(tmp_path / "robots" / "custom.srdf")
+        assert recorded["package_paths"] == [
+            str((tmp_path / "assets").resolve()),
+            str((tmp_path / "../shared_assets").resolve()),
+        ]
+        assert recorded["config"] == {}
+        assert kernel.robot_model_authority_metadata["view_changed"] is False
+        assert kernel.robot_model_authority_metadata["canonical_urdf_path"] == (
+            str(tmp_path / "robots" / "custom.urdf")
+        )
+
+    def test_create_kernel_routes_lite6_through_private_roboplan_view(self):
+        recorded: dict[str, object] = {}
+        fake_bundle = object()
+
+        fake_roboplan = ModuleType("manyforge_roboplan_py")
+
+        def fake_create_native_kernel_from_paths(
+            model_name,
+            group_name,
+            urdf_path,
+            srdf_path,
+            package_paths,
+            config,
+        ):
+            recorded["model_name"] = model_name
+            recorded["group_name"] = group_name
+            recorded["urdf_path"] = urdf_path
+            recorded["srdf_path"] = srdf_path
+            recorded["package_paths"] = package_paths
+            recorded["config"] = config
+            return fake_bundle
+
+        fake_roboplan.create_native_kernel_from_paths = fake_create_native_kernel_from_paths
+
+        fake_client_module = ModuleType("native_kernel_client")
+
+        class FakeNativeKernelClient:
+            def __init__(self, bundle, **kwargs):
+                self.bundle = bundle
+                self.kwargs = kwargs
+
+        fake_client_module.NativeKernelClient = FakeNativeKernelClient
+
+        deployment = Deployment(LITE6_DEPLOYMENT_PATH)
+        with patch.dict(
+            sys.modules,
+            {
+                "manyforge_roboplan_py": fake_roboplan,
+                "native_kernel_client": fake_client_module,
+            },
+        ):
+            kernel = create_kernel(deployment)
+
+        assert isinstance(kernel, FakeNativeKernelClient)
+        assert recorded["model_name"] == "lite6_lite_gripper"
+        assert recorded["group_name"] == "lite6"
+        assert recorded["urdf_path"] != str(
+            LITE6_DEPLOYMENT_PATH.parent
+            / "../manyforge_example_models/models/lite6_lite_gripper/lite6_lite_gripper.urdf"
+        )
+        assert Path(str(recorded["urdf_path"])).exists()
+        assert "__rma_mimic_" in Path(str(recorded["urdf_path"])).read_text(
+            encoding="utf-8"
+        )
+        metadata = kernel.robot_model_authority_metadata
+        assert kernel.kwargs["robot_model_authority_metadata"] == metadata
+        assert kernel.kwargs["robot_model_authority_temp_dir"] is not None
+        assert metadata["view_changed"] is True
+        assert metadata["canonical_urdf_path"].endswith(
+            "lite6_lite_gripper/lite6_lite_gripper.urdf"
+        )
+        assert metadata["view_urdf_path"] == recorded["urdf_path"]
+        assert metadata["canonical_to_view_joint_names"]["right_finger_joint"] != (
+            "right_finger_joint"
+        )
 
 
 class TestLauncherValidation:

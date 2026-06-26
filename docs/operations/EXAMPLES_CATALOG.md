@@ -7,8 +7,7 @@ combination for a given test or demo.
 
 For the launcher itself, see
 [`LAUNCHER_QUICKSTART.md`](LAUNCHER_QUICKSTART.md). For the live source
-of truth on scenario definitions, see `scripts/lib/scenarios.sh`
-(`SCENARIOS` array at lines 16-25; deprecated aliases at lines 33-41).
+of truth on scenario definitions, see `scripts/lib/scenarios.sh`.
 
 ## How to pick a combination
 
@@ -32,7 +31,10 @@ Three operator-facing axes determine which scenario to pick:
   (`pick_and_place_ur10e_robotiq.deployment.yaml`,
   `assistant_modes_scene_authoring.deployment.yaml`,
   `isaac_manipulator_scene_light_*.deployment.yaml`) is the canonical
-  manipulator-with-gripper target and the Isaac lane's robot.
+  manipulator-with-gripper target and the Isaac lane's robot. UFACTORY
+  Lite6 + lite gripper (`lite6_lite_gripper_pick_and_place.*`,
+  `isaac_lite6_lite_gripper_pick_and_place.*`) is the compact-arm
+  bring-up target for the Robot Model Authority pipeline.
 - **Execution backend.** `execution.roboplan_native` for native
   simulated execution; `execution.ros2_control_follow_joint_trajectory`
   for the Isaac lane (commanded-sim, FJT action server,
@@ -45,22 +47,24 @@ Three operator-facing axes determine which scenario to pick:
   must declare `model_endpoint_profile_registry: model_endpoint_profiles.yaml`
   and reference profiles via `model_endpoints.<alias>.profile_ref`.
 
-## Catalogued scenarios (from `scripts/lib/scenarios.sh:16-25`)
+## Catalogued scenarios
 
 | Scenario | Lane | AI | Program | Deployment | What it demonstrates |
 | --- | --- | --- | --- | --- | --- |
 | `ur5-pick-place` | manyforge-only | off | [`pick_and_place.program.yaml`](../../examples/pick_and_place.program.yaml) | [`pick_and_place.deployment.yaml`](../../examples/pick_and_place.deployment.yaml) | UR5 + RoboPlan baseline (12-step approach/pick/retreat/drop). The default smoke target. |
 | `ur5-simple-pick-place` | manyforge-only | off | `manyforge_behavior/tests/fixtures/pick_and_place.program.yaml` | [`pick_and_place.deployment.yaml`](../../examples/pick_and_place.deployment.yaml) | UR5 3-step minimal fixture (was `demo.sh --simple`). Quickest sanity check; lives in `manyforge_behavior/tests/fixtures/`, not `examples/`. |
 | `ur10e-pick-place` | manyforge-only | off | [`pick_and_place_ur10e_robotiq.program.yaml`](../../examples/pick_and_place_ur10e_robotiq.program.yaml) | [`pick_and_place_ur10e_robotiq.deployment.yaml`](../../examples/pick_and_place_ur10e_robotiq.deployment.yaml) | UR10e + Robotiq 2F-140 self-contained preview. Exercises the gripper command/feedback capability keys (`tool.gripper.command`, `tool.gripper.feedback`). |
+| `lite6-pick-place` | manyforge-only | off | [`lite6_lite_gripper_pick_and_place.program.yaml`](../../examples/lite6_lite_gripper_pick_and_place.program.yaml) | [`lite6_lite_gripper_pick_and_place.deployment.yaml`](../../examples/lite6_lite_gripper_pick_and_place.deployment.yaml) | UFACTORY Lite6 + lite gripper native pick-and-place. Uses the canonical Lite6 model snapshot and a compact box scene sized for the shorter Lite6 reach. |
 | `ur5-semantic-shape-pick` | manyforge-only | on | [`semantic_shape_pick.program.yaml`](../../examples/semantic_shape_pick.program.yaml) | [`semantic_shape_pick.deployment.yaml`](../../examples/semantic_shape_pick.deployment.yaml) | UR5 semantic shape pick. Deterministic node builds a selection manifest, vision model picks one candidate, deterministic validator confirms before planning. Uses `thor_manyforge_qwen36` for selection + `thor_cosmos_reason2_8b` for chat. |
 | `ur5-vision-pose-pick` | manyforge-only | on | [`vision_guided_pose_pick.program.yaml`](../../examples/vision_guided_pose_pick.program.yaml) | [`vision_guided_pose_pick.deployment.yaml`](../../examples/vision_guided_pose_pick.deployment.yaml) | UR5 vision-guided pose pick. `query_model` returns validated `approach_pose` / `grasp_pose` in robot base frame; downstream `move_manipulator_action` nodes consume via typed blackboard refs. Requires a live viewer snapshot provider. |
 | `ur10e-scene-authoring` | manyforge-only | on | [`pick_and_place_ur10e_robotiq.program.yaml`](../../examples/pick_and_place_ur10e_robotiq.program.yaml) | [`assistant_modes_scene_authoring.deployment.yaml`](../../examples/assistant_modes_scene_authoring.deployment.yaml) | UR10e + Robotiq with the full Cosmos assistant + scene authoring deployment. The canonical assistant-on deployment that other AI deployments copy from. `composer-assistant.authority.review: required`. |
 | `isaac-ur10e-light-scene` | isaac-sim | off | [`isaac_manipulator_scene_light.program.yaml`](../../examples/isaac_manipulator_scene_light.program.yaml) | [`isaac_manipulator_scene_light_ros2_control.deployment.yaml`](../../examples/isaac_manipulator_scene_light_ros2_control.deployment.yaml) | Isaac commanded-sim with UR10e light manipulator scene. FJT action `/isaac_arm_controller/follow_joint_trajectory`, `pose_sources.isaac_scene_objects` with `apply_policy: continuous_unattached`, scene meshes from `examples/isaac_manipulator_scene_light/meshes/`. |
+| `isaac-lite6-pick-place` | isaac-sim | off | [`isaac_lite6_lite_gripper_pick_and_place.program.yaml`](../../examples/isaac_lite6_lite_gripper_pick_and_place.program.yaml) | [`isaac_lite6_lite_gripper_pick_and_place.deployment.yaml`](../../examples/isaac_lite6_lite_gripper_pick_and_place.deployment.yaml) | Isaac commanded-sim with UFACTORY Lite6 + lite gripper pick-and-place. Uses the Lite6 topic-control profile, lite gripper action bridge, and the same compact pick/drop scene as the native Lite6 example. |
 | `isaac-ur10e-light-scene-assistant` | isaac-sim | on | [`isaac_manipulator_scene_light.program.yaml`](../../examples/isaac_manipulator_scene_light.program.yaml) | [`isaac_manipulator_scene_light_assistant.deployment.yaml`](../../examples/isaac_manipulator_scene_light_assistant.deployment.yaml) | Isaac commanded-sim with the full Cosmos assistant overlay. `apply_policy: before_planning` (instead of `continuous_unattached`) because commanded_sim makes assistant edits authoritative for what Isaac sees. |
 
 Deprecated scenario aliases (still work, emit a one-time warning):
 `pick-place`, `ur10e`, `shape-pick`, `vision-pose`, `assistant-authoring`,
-`isaac-light`, `isaac-assistant`. See `scripts/lib/scenarios.sh:33-41`.
+`isaac-light`, `isaac-assistant`. See `scripts/lib/scenarios.sh`.
 
 ## Other files in `examples/` (not in any scenario)
 
@@ -111,9 +115,8 @@ To wire a new program/deployment pair into the launcher:
 
 1. Drop both YAMLs under `examples/`. Confirm `robot_id` and
    `group_id` match between them.
-2. Add a row to the `SCENARIOS` array in `scripts/lib/scenarios.sh`
-   (see the existing entries at lines 16-25 for the exact format —
-   pipe-separated: name, lane, assistant, program path, deployment
+2. Add a row to the scenario table in `scripts/lib/scenarios.sh`
+   (pipe-separated: name, lane, assistant, program path, deployment
    path, description).
 3. Verify with `./scripts/launch.sh --list-scenarios`.
 4. Smoke with `./scripts/launch.sh --scenario <name> smoke`.

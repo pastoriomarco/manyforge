@@ -18,6 +18,7 @@ import type {
 import { useDeploymentStore } from '../store/deploymentStore';
 import { useEditLocked } from '../store/cycleStore';
 import { useStatusPolling, useStatusStore } from '../store/statusStore';
+import { robotControlJointNamesForGroup } from '../utils/robotModelAuthority';
 import {
   DEFAULT_CONTROLLED_STOP_DECELERATION_TIME_S,
   DEFAULT_SOFT_ON_PATH_DECELERATION_LIMIT_RAD_S2,
@@ -1996,10 +1997,11 @@ export function DeploymentPanel() {
     };
   }, [deployment?.sourcePath]);
   const drivableJointNames = useMemo<string[]>(() => {
-    if (!urdfManifest?.joints) return [];
-    const DRIVABLE = new Set(['revolute', 'prismatic', 'continuous']);
-    return urdfManifest.joints.filter((j) => DRIVABLE.has(j.type)).map((j) => j.name);
-  }, [urdfManifest]);
+    return robotControlJointNamesForGroup(
+      urdfManifest,
+      deployment?.robotConfig.groupId ?? null,
+    );
+  }, [deployment?.robotConfig.groupId, urdfManifest]);
   const runtimeApplied = signature(deployment) === signature(appliedDeployment);
   const diskSaved = signature(deployment) === signature(savedDeployment);
   const endpointAliases = useMemo(

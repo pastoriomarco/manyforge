@@ -264,6 +264,9 @@ class RoboPlanPlanningContext final
   robot_snapshot_bodies_locked(const std::string& robot_id) const;
   std::vector<core::CollisionWorldBody>
   object_snapshot_bodies_locked(const std::string& robot_id) const;
+  std::string robot_model_frame_id_locked() const;
+  Eigen::Matrix4d robot_model_frame_world_matrix_locked(
+      const std::string& model_frame_id) const;
   core::CollisionGeometryDescriptor geometry_descriptor_for_shape_locked(
       const core::CollisionBodyId& body_id,
       core::CollisionOwnerKind owner_kind,

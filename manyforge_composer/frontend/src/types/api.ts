@@ -384,6 +384,10 @@ export interface AssistantProviderDescriptor {
 export interface AssistantProviderCatalog {
   providers: AssistantProviderDescriptor[];
   configuredProviderId?: string | null;
+  // Model the configured provider's bridge is actually running, read live from
+  // the bridge /healthz. null when unavailable (degrade to deployment label).
+  liveModel?: string | null;
+  liveModelSource?: string | null;
 }
 
 export interface LiveToolCall {
@@ -798,6 +802,7 @@ export interface SceneGripperVisualization {
 export interface SceneGripperState {
   gripper_id: string;
   joint_name: string;
+  derived_joints?: string[];
   state: string;
   current_position: number | null;
   target_position: number | null;
@@ -970,9 +975,21 @@ export interface SceneUrdfVisual {
   };
 }
 
+export interface SceneUrdfCollision {
+  index: number;
+  mesh_url: string | null;
+  primitive: SceneUrdfPrimitive | null;
+  collision_origin: {
+    position_m: number[];
+    orientation_rpy_rad: number[];
+    orientation_xyzw?: number[];
+  };
+}
+
 export interface SceneUrdfLink {
   name: string;
   visuals: SceneUrdfVisual[];
+  collisions?: SceneUrdfCollision[];
 }
 
 export type SceneUrdfJointType =
@@ -997,9 +1014,26 @@ export interface SceneUrdfJoint {
   is_mimic_master?: boolean;
 }
 
+export interface SceneRobotModelAuthorityGripper {
+  group_id: string;
+  command_joint: string;
+  derived_joints: string[];
+  presets?: Record<string, number>;
+}
+
+export interface SceneRobotModelAuthority {
+  canonical_fingerprint?: string;
+  view_fingerprint?: string;
+  view_changed?: boolean;
+  commandable_joint_names?: string[];
+  group_commandable_joint_names?: Record<string, string[]>;
+  grippers?: Record<string, SceneRobotModelAuthorityGripper>;
+}
+
 export interface SceneUrdfManifest {
   robot_id: string | null;
   model_key?: string | null;
+  authority?: SceneRobotModelAuthority | null;
   root_link: string;
   links: SceneUrdfLink[];
   joints?: SceneUrdfJoint[];

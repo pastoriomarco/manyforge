@@ -25,6 +25,14 @@ def generate_launch_description() -> LaunchDescription:
     return LaunchDescription(
         [
             DeclareLaunchArgument(
+                "isaac_profile",
+                default_value="ur10e",
+                description=(
+                    "Isaac topic-based robot profile to expose through "
+                    "ros2_control. Supported: ur10e, lite6."
+                ),
+            ),
+            DeclareLaunchArgument(
                 "joint_commands_topic",
                 default_value="/isaac_joint_commands",
                 description="Isaac Sim JointState command topic for arm joints.",
@@ -117,6 +125,36 @@ def generate_launch_description() -> LaunchDescription:
                 description="Initial wrist_3_joint position for commanded Isaac sim.",
             ),
             DeclareLaunchArgument(
+                "joint1_initial",
+                default_value="0.0",
+                description="Initial Lite6 joint1 position for commanded Isaac sim.",
+            ),
+            DeclareLaunchArgument(
+                "joint2_initial",
+                default_value="0.0",
+                description="Initial Lite6 joint2 position for commanded Isaac sim.",
+            ),
+            DeclareLaunchArgument(
+                "joint3_initial",
+                default_value="1.57",
+                description="Initial Lite6 joint3 position for commanded Isaac sim.",
+            ),
+            DeclareLaunchArgument(
+                "joint4_initial",
+                default_value="0.0",
+                description="Initial Lite6 joint4 position for commanded Isaac sim.",
+            ),
+            DeclareLaunchArgument(
+                "joint5_initial",
+                default_value="0.0",
+                description="Initial Lite6 joint5 position for commanded Isaac sim.",
+            ),
+            DeclareLaunchArgument(
+                "joint6_initial",
+                default_value="0.0",
+                description="Initial Lite6 joint6 position for commanded Isaac sim.",
+            ),
+            DeclareLaunchArgument(
                 "gripper_action_name",
                 default_value="/robotiq_gripper_controller/gripper_cmd",
                 description="Standard GripperCommand action exposed for the Robotiq gripper.",
@@ -182,9 +220,25 @@ def _launch_setup(context, *_, **__) -> list[object]:
     package_share = Path(
         FindPackageShare("manyforge_ros_bringup").find("manyforge_ros_bringup")
     )
-    urdf_template = (
-        package_share / "urdf" / "isaac_ur10e_topic_based.ros2_control.urdf"
-    ).read_text(encoding="utf-8")
+    isaac_profile = LaunchConfiguration("isaac_profile").perform(context).strip()
+    if isaac_profile == "ur10e":
+        urdf_file = "isaac_ur10e_topic_based.ros2_control.urdf"
+        controller_config_file = "isaac_ur10e_topic_based_controllers.yaml"
+        gripper_bridge_config_file = "isaac_robotiq_2f_140_gripper_bridge.yaml"
+        profile_default_gripper_action = "/robotiq_gripper_controller/gripper_cmd"
+        profile_default_gripper_command_topic = "/isaac_gripper_state"
+    elif isaac_profile == "lite6":
+        urdf_file = "isaac_lite6_topic_based.ros2_control.urdf"
+        controller_config_file = "isaac_lite6_topic_based_controllers.yaml"
+        gripper_bridge_config_file = "isaac_lite6_gripper_bridge.yaml"
+        profile_default_gripper_action = "/lite_gripper_controller/gripper_cmd"
+        profile_default_gripper_command_topic = "/isaac_joint_commands_gripper"
+    else:
+        raise ValueError(
+            f"unsupported isaac_profile={isaac_profile!r}; expected ur10e or lite6"
+        )
+
+    urdf_template = (package_share / "urdf" / urdf_file).read_text(encoding="utf-8")
     robot_description = urdf_template.format(
         joint_commands_topic=LaunchConfiguration("joint_commands_topic").perform(
             context
@@ -206,18 +260,26 @@ def _launch_setup(context, *_, **__) -> list[object]:
         wrist_1_initial=LaunchConfiguration("wrist_1_initial").perform(context),
         wrist_2_initial=LaunchConfiguration("wrist_2_initial").perform(context),
         wrist_3_initial=LaunchConfiguration("wrist_3_initial").perform(context),
+        joint1_initial=LaunchConfiguration("joint1_initial").perform(context),
+        joint2_initial=LaunchConfiguration("joint2_initial").perform(context),
+        joint3_initial=LaunchConfiguration("joint3_initial").perform(context),
+        joint4_initial=LaunchConfiguration("joint4_initial").perform(context),
+        joint5_initial=LaunchConfiguration("joint5_initial").perform(context),
+        joint6_initial=LaunchConfiguration("joint6_initial").perform(context),
     )
-    controller_config = (
-        package_share / "config" / "isaac_ur10e_topic_based_controllers.yaml"
-    )
-    gripper_bridge_config = (
-        package_share / "config" / "isaac_robotiq_2f_140_gripper_bridge.yaml"
-    )
+    controller_config = package_share / "config" / controller_config_file
+    gripper_bridge_config = package_share / "config" / gripper_bridge_config_file
     controller_manager_name = LaunchConfiguration("controller_manager_name").perform(
         context
     )
     arm_controller_name = LaunchConfiguration("arm_controller_name").perform(context)
     controller_manager_path = f"/{controller_manager_name}"
+    gripper_action_name = LaunchConfiguration("gripper_action_name").perform(context)
+    if gripper_action_name == "/robotiq_gripper_controller/gripper_cmd":
+        gripper_action_name = profile_default_gripper_action
+    gripper_command_topic = LaunchConfiguration("gripper_command_topic").perform(context)
+    if gripper_command_topic == "/isaac_gripper_state":
+        gripper_command_topic = profile_default_gripper_command_topic
 
     ros2_control_node = Node(
         package="controller_manager",
@@ -264,12 +326,8 @@ def _launch_setup(context, *_, **__) -> list[object]:
         parameters=[
             str(gripper_bridge_config),
             {
-                "action_name": LaunchConfiguration("gripper_action_name").perform(
-                    context
-                ),
-                "command_topic": LaunchConfiguration("gripper_command_topic").perform(
-                    context
-                ),
+                "action_name": gripper_action_name,
+                "command_topic": gripper_command_topic,
                 "state_topic": LaunchConfiguration("gripper_state_topic").perform(
                     context
                 ),
@@ -318,9 +376,7 @@ def _launch_setup(context, *_, **__) -> list[object]:
                 ).perform(context),
                 "controller_state_topic": f"/{arm_controller_name}/controller_state",
                 "arm_action_name": f"/{arm_controller_name}/follow_joint_trajectory",
-                "gripper_action_name": LaunchConfiguration(
-                    "gripper_action_name"
-                ).perform(context),
+                "gripper_action_name": gripper_action_name,
                 "supervisor_enable_topic": LaunchConfiguration(
                     "supervisor_command_gate_enable_topic"
                 ).perform(context),

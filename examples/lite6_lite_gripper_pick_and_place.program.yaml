@@ -1,0 +1,218 @@
+api_version: manyforge.program.v0
+program_profile: v0.1
+name: lite6_lite_gripper_pick_and_place
+description: >-
+  Basic ManyForge pick-and-place program for UFACTORY Lite6 + lite pneumatic
+  gripper. It adapts the standard ManyMove Lite6 example to ManyForge program
+  nodes: rest/scan joint poses are copied from ManyMove, the scene uses simple
+  primitive boxes, and pick/place goals are expressed as backend-resolved
+  relative moves plus runtime attach/detach.
+catalog_version: "0.2.0"
+robot:
+  robot_id: lite6
+  group_id: lite6
+  base_frame: link_base
+  tcp_frame: link_tcp
+scene:
+- object_id: ground
+  shape:
+    type: box
+    box_dimensions_m: [1.0, 1.0, 0.1]
+  pose:
+    frame_id: universe
+    position_m: [0.0, 0.0, -0.051]
+    orientation_rpy_deg: [0.0, 0.0, 0.0]
+- object_id: wall
+  shape:
+    type: box
+    box_dimensions_m: [1.0, 0.02, 0.2]
+  pose:
+    frame_id: universe
+    position_m: [0.0, -0.15, 0.1]
+    orientation_rpy_deg: [0.0, 0.0, 0.0]
+- object_id: graspable
+  shape:
+    type: box
+    box_dimensions_m: [0.06, 0.015, 0.015]
+  pose:
+    frame_id: universe
+    position_m: [0.18, -0.20, 0.08]
+    orientation_rpy_deg: [0.0, 0.0, 0.0]
+parameters:
+- name: velocity_scale
+  type: float
+  default: 0.4
+  constraints:
+    min_exclusive: 0.0
+    max_inclusive: 1.0
+  description: Velocity scale for all Lite6 pick-and-place moves.
+tree:
+  id: sequence
+  name: lite6_pick_and_place
+  children:
+  - id: command_gripper
+    name: open_gripper_start
+    params:
+      gripper_id: primary
+      position: 0.0081
+      max_effort: 10.0
+      duration_s: 0.8
+      timeout_s: 0.0
+  - id: move_manipulator_action
+    name: move_to_rest
+    params:
+      move_id: lite6_rest
+      motion_type: joint_goal
+      joint_goal_names: [joint1, joint2, joint3, joint4, joint5, joint6]
+      joint_goal_positions_rad: [0.0, -0.785, 0.785, 0.0, 1.57, 0.0]
+      velocity_scale: ${param:velocity_scale}
+      planning_timeout_s: 10
+      execution_timeout_s: 30
+  - id: move_manipulator_action
+    name: scan_left
+    params:
+      move_id: lite6_scan_left
+      motion_type: joint_goal
+      joint_goal_names: [joint1, joint2, joint3, joint4, joint5, joint6]
+      joint_goal_positions_rad: [-0.175, -0.419, 1.378, 0.349, 1.535, -0.977]
+      velocity_scale: ${param:velocity_scale}
+      planning_timeout_s: 10
+      execution_timeout_s: 30
+  - id: move_manipulator_action
+    name: scan_right
+    params:
+      move_id: lite6_scan_right
+      motion_type: joint_goal
+      joint_goal_names: [joint1, joint2, joint3, joint4, joint5, joint6]
+      joint_goal_positions_rad: [0.733, -0.297, 1.378, -0.576, 1.692, 1.291]
+      velocity_scale: ${param:velocity_scale}
+      planning_timeout_s: 10
+      execution_timeout_s: 30
+  - id: move_manipulator_action
+    name: move_to_pick_approach
+    params:
+      move_id: lite6_pick_approach
+      motion_type: relative_move
+      relative_move:
+        target_reference:
+          type: object
+          id: graspable
+        offset_reference:
+          type: frame
+          id: link_base
+        offset:
+          position_m: [0.0, 0.0, 0.08]
+          orientation_rpy_deg: [180.0, 0.0, 0.0]
+      velocity_scale: ${param:velocity_scale}
+      planning_timeout_s: 10
+      execution_timeout_s: 30
+  - id: move_manipulator_action
+    name: move_to_pick
+    params:
+      move_id: lite6_pick_down
+      motion_type: relative_move
+      relative_move:
+        target_reference:
+          type: object
+          id: graspable
+        offset_reference:
+          type: frame
+          id: link_base
+        offset:
+          position_m: [0.0, 0.0, 0.035]
+          orientation_rpy_deg: [180.0, 0.0, 0.0]
+      velocity_scale: ${param:velocity_scale}
+      planning_timeout_s: 10
+      execution_timeout_s: 30
+  - id: command_gripper
+    name: close_gripper
+    params:
+      gripper_id: primary
+      position: 0.0
+      max_effort: 10.0
+      duration_s: 0.8
+      timeout_s: 0.0
+  - id: attach_object_to_link
+    name: attach_graspable
+    params:
+      object_id: graspable
+      link_frame: link_tcp
+      gripper_id: primary
+  - id: move_manipulator_action
+    name: pick_retreat
+    params:
+      move_id: lite6_pick_retreat
+      motion_type: relative_move
+      relative_move:
+        target_reference:
+          type: robot_link
+          id: link_tcp
+        offset:
+          position_m: [0.0, 0.0, -0.08]
+          orientation_rpy_deg: [0.0, 0.0, 0.0]
+      velocity_scale: ${param:velocity_scale}
+      planning_timeout_s: 10
+      execution_timeout_s: 30
+  - id: reset_trajectories
+    name: invalidate_after_pick
+  - id: move_manipulator_action
+    name: move_to_drop_approach
+    params:
+      move_id: lite6_drop_approach
+      motion_type: pose_goal
+      pose_goal:
+        frame_id: link_base
+        position_m: [0.16, 0.08, 0.20]
+        orientation_rpy_deg: [180.0, 0.0, 0.0]
+      velocity_scale: ${param:velocity_scale}
+      planning_timeout_s: 10
+      execution_timeout_s: 30
+  - id: move_manipulator_action
+    name: move_to_drop
+    params:
+      move_id: lite6_drop_down
+      motion_type: pose_goal
+      pose_goal:
+        frame_id: link_base
+        position_m: [0.16, 0.08, 0.17]
+        orientation_rpy_deg: [180.0, 0.0, 0.0]
+      velocity_scale: ${param:velocity_scale}
+      planning_timeout_s: 10
+      execution_timeout_s: 30
+  - id: command_gripper
+    name: open_gripper_release
+    params:
+      gripper_id: primary
+      position: 0.0081
+      max_effort: 10.0
+      duration_s: 0.8
+      timeout_s: 0.0
+  - id: detach_object_from_link
+    name: detach_graspable
+    params:
+      object_id: graspable
+      link_frame: link_tcp
+  - id: move_manipulator_action
+    name: drop_retreat
+    params:
+      move_id: lite6_drop_retreat
+      motion_type: pose_goal
+      pose_goal:
+        frame_id: link_base
+        position_m: [0.16, 0.08, 0.22]
+        orientation_rpy_deg: [180.0, 0.0, 0.0]
+      velocity_scale: ${param:velocity_scale}
+      planning_timeout_s: 10
+      execution_timeout_s: 30
+  - id: reset_trajectories
+    name: invalidate_after_drop
+  - id: move_manipulator_action
+    name: return_rest
+    params:
+      move_id: lite6_return_rest
+      motion_type: joint_goal
+      joint_goal_names: [joint1, joint2, joint3, joint4, joint5, joint6]
+      joint_goal_positions_rad: [0.0, -0.785, 0.785, 0.0, 1.57, 0.0]
+      velocity_scale: ${param:velocity_scale}
+      planning_timeout_s: 10
+      execution_timeout_s: 30
