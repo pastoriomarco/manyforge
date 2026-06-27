@@ -167,6 +167,30 @@ because RoboPlan does not expose structured contact depth through the API used
 here. It enforces pair identity and motion phase. Numeric depth belongs in the
 future RoboPlan/MoveIt-style contact API tracked in the specs open points.
 
+## Robot Collision Mesh Preservation and AABB Proxy Warnings
+
+Status: active RoboPlan adapter behavior in `manyforge_roboplan`.
+
+Robot collision snapshots preserve backend mesh geometry when the model loader
+can expose a mesh resource. This is the preferred path: the validation and
+runtime-monitoring collision world should represent the URDF `<collision>`
+geometry, not a broad box approximation of thin links such as gripper fingers.
+
+If the adapter cannot preserve/load a mesh-like geometry and must fall back to a
+conservative AABB proxy, the exported `CollisionGeometryDescriptor` is marked
+with both:
+
+- `conservative_proxy`
+- `warning_conservative_aabb_proxy`
+
+Treat that warning as an explicit degraded-geometry signal. A collision reported
+against such a body may be a real collision, but it may also be a false positive
+caused by the proxy being larger than the real collision mesh. Operators should
+enable the Composer collision-mesh overlay and inspect the warning labels before
+tuning poses around a suspected proxy collision. Maintainers should prefer
+fixing mesh preservation or unsupported geometry handling over moving waypoints
+to work around a proxy.
+
 Current gaps to keep visible:
 
 - support-contact release is validated against the planned waypoints, not

@@ -47,6 +47,18 @@ class IPlanningContext {
     virtual ValidationResultDTO validate_trajectory(const TrajectoryDTO& trajectory, 
                                                     const ValidationOptionsDTO& options) = 0;
 
+    /// Expand a possibly partial/group trajectory into the robot-state shape
+    /// expected by authoritative collision engines.
+    ///
+    /// Implementations that own a full robot scene should preserve the current
+    /// non-commanded joints (for example gripper/tool joints) and overlay each
+    /// trajectory waypoint's commanded joints. The default keeps legacy/test
+    /// contexts unchanged.
+    virtual Result<TrajectoryDTO> expand_trajectory_for_collision_validation(
+        const TrajectoryDTO& trajectory) {
+        return Result<TrajectoryDTO>::Ok(trajectory);
+    }
+
     /// Check for collisions at the current state (spec 220 §3)
     /// 
     /// Real-time collision monitoring runs during execution at a policy-defined cadence

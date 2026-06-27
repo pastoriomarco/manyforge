@@ -54,7 +54,8 @@ run_in_container() {
   run_step ./scripts/models/validate_lite6_static_manifest.py
   run_step ./scripts/models/validate_lite6_authority_runtime_contract.py --json
 
-  export PYTHONPATH="${workspace}:${workspace}/manyforge_behavior:${workspace}/manyforge_roboplan/python:${PYTHONPATH:-}"
+  local build_dir="${MANYFORGE_BUILD_DIR:-/tmp/manyforge-build}"
+  export PYTHONPATH="${build_dir}/roboplan:${workspace}:${workspace}/manyforge_behavior:${workspace}/manyforge_roboplan/python:${PYTHONPATH:-}"
   run_step pytest -q \
     manyforge_behavior/tests/test_robot_model_authority.py \
     manyforge_behavior/tests/test_model_paths.py

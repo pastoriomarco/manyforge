@@ -959,6 +959,19 @@ bool validation_cancelled_by_interrupt(const ErrorDTO& error) {
          it->second == "collision_validation_cancelled";
 }
 
+bool authoritative_collision_replan_candidate(const ErrorDTO& error) {
+  if (error.code != kErrorValidationCollision ||
+      validation_cancelled_by_interrupt(error)) {
+    return false;
+  }
+  const auto decision_it = error.details.find("collision_result_decision");
+  if (decision_it == error.details.end() || decision_it->second != "fail") {
+    return false;
+  }
+  const auto status_it = error.details.find("collision_result_engine_status");
+  return status_it != error.details.end() && status_it->second == "ok";
+}
+
 std::optional<KernelEventType> interrupt_event_type_from_name(
     const std::string& name) {
   static const std::map<std::string, KernelEventType> kMap{
@@ -1367,6 +1380,9 @@ ExecutionKernel::ExecutionKernel(IPlannerBackend& planner,
       !std::isfinite(config_.planner_max_planning_time_s)) {
     throw std::invalid_argument(
         "planner_max_planning_time_s must be finite and > 0");
+  }
+  if (config_.authoritative_validation_collision_replan_attempts < 0) {
+    config_.authoritative_validation_collision_replan_attempts = 0;
   }
   if (config_.validation_collision_workers < 1) {
     config_.validation_collision_workers = 1;
@@ -3789,6 +3805,7 @@ void ExecutionKernel::async_execute_worker(
 
     TrajectoryDTO trajectory;
     const bool cache_hit = cached_trajectory.has_value();
+    bool active_trajectory_from_cache = cache_hit;
     if (cache_hit) {
       trajectory = std::move(*cached_trajectory);
     } else {
@@ -3931,9 +3948,333 @@ void ExecutionKernel::async_execute_worker(
       publish_execution_snapshot(std::move(validating_snapshot));
     }
 
-  emit_event({KernelEventType::kValidationStarted, exec_id, clock_.now(), {}, {}, std::nullopt, {}});
+    const int max_authoritative_validation_attempts =
+        std::max(1, 1 + config_.authoritative_validation_collision_replan_attempts);
+    int authoritative_validation_attempt = 0;
+    Result<CollisionWorldRevision> val_result =
+        Result<CollisionWorldRevision>::Err(ErrorCode::kInternalError);
+    while (true) {
+      emit_event({KernelEventType::kValidationStarted, exec_id, clock_.now(),
+                  {}, {}, std::nullopt,
+                  {{"attempt_index",
+                    std::to_string(authoritative_validation_attempt)},
+                   {"max_attempts",
+                    std::to_string(max_authoritative_validation_attempts)}}});
 
-    auto val_result = validate_trajectory(trajectory, request);
+      val_result = validate_trajectory(trajectory, request);
+      if (val_result.ok()) {
+        break;
+      }
+      const auto& validation_error = val_result.error();
+      const bool can_replan_authoritative_collision =
+          authoritative_collision_replan_candidate(validation_error) &&
+          authoritative_validation_attempt + 1 <
+              max_authoritative_validation_attempts &&
+          sm_.status().state == ExecutionState::kValidating &&
+          !st.stop_requested() && !stop_policy_.stop_requested();
+      if (!can_replan_authoritative_collision) {
+        break;
+      }
+
+      std::map<std::string, std::string> retry_details =
+          validation_error.details;
+      retry_details["reason"] = "authoritative_validation_replan";
+      retry_details["attempt_index"] =
+          std::to_string(authoritative_validation_attempt);
+      retry_details["next_attempt_index"] =
+          std::to_string(authoritative_validation_attempt + 1);
+      retry_details["max_attempts"] =
+          std::to_string(max_authoritative_validation_attempts);
+      retry_details["move_id"] = request.move_id;
+      emit_event({KernelEventType::kValidationFailed, exec_id, clock_.now(),
+                  {}, {}, std::nullopt, std::move(retry_details)});
+
+      if (request.cache_mode != CacheMode::kDisable &&
+          cache_.contains(request.move_id)) {
+        cache_.invalidate(request.move_id);
+        emit_event({KernelEventType::kCacheInvalidated,
+                    exec_id,
+                    clock_.now(),
+                    {},
+                    {},
+                    std::nullopt,
+                    {{"move_id", request.move_id},
+                     {"reason", "authoritative_validation_replan"}}});
+        {
+          std::lock_guard<std::mutex> lock(metrics_mutex_);
+          metrics_.cache_invalidations++;
+        }
+      }
+
+      auto retry_transition_from = sm_.status().state;
+      auto retry_transition = sm_.try_transition(ExecutionState::kPlanning);
+      if (!retry_transition.ok()) {
+        break;
+      }
+      emit_event({KernelEventType::kStateTransition,
+                  exec_id,
+                  clock_.now(),
+                  retry_transition_from,
+                  ExecutionState::kPlanning,
+                  std::nullopt,
+                  {{"reason", "authoritative_validation_replan"},
+                   {"attempt_index",
+                    std::to_string(authoritative_validation_attempt + 1)}}});
+      auto planning_retry_snapshot = get_execution_snapshot();
+      planning_retry_snapshot.timestamp_ns = clock_.now();
+      planning_retry_snapshot.execution_id = exec_id;
+      planning_retry_snapshot.move_id = request.move_id;
+      planning_retry_snapshot.state = ExecutionState::kPlanning;
+      planning_retry_snapshot.progress = 0.0;
+      publish_execution_snapshot(std::move(planning_retry_snapshot));
+
+      ++authoritative_validation_attempt;
+      emit_event({KernelEventType::kPlanStarted,
+                  exec_id,
+                  clock_.now(),
+                  {},
+                  {},
+                  std::nullopt,
+                  {{"reason", "authoritative_validation_replan"},
+                   {"attempt_index",
+                    std::to_string(authoritative_validation_attempt)}}});
+      ScheduleHandle replan_timeout_handle = 0;
+      const auto replan_start_ns = clock_.now();
+      const int64_t replan_timeout_ns =
+          (request.timeouts.planning_timeout_s > 0)
+              ? static_cast<int64_t>(request.timeouts.planning_timeout_s * 1e9)
+              : 0;
+      if (replan_timeout_ns > 0) {
+        const int64_t deadline = replan_start_ns + replan_timeout_ns;
+        replan_timeout_handle = scheduler_.schedule(
+            deadline,
+            [this]() { stop_policy_.request_hard_stop(); },
+            SchedulerPriority::Monitoring);
+      }
+      auto replan_result = plan_trajectory(request);
+      const bool replan_timed_out =
+          replan_timeout_ns > 0 &&
+          (clock_.now() - replan_start_ns) >= replan_timeout_ns;
+      if (replan_timeout_handle != 0) {
+        scheduler_.cancel(replan_timeout_handle);
+      }
+
+      const auto preserve_replan_terminal_authority =
+          [&](const std::string& reason) -> bool {
+        const auto current = sm_.status().state;
+        if (current == ExecutionState::kStopped ||
+            current == ExecutionState::kStopping) {
+          if (current == ExecutionState::kStopping) {
+            (void)sm_.try_transition(ExecutionState::kStopped);
+          }
+          auto stopped_snapshot = get_execution_snapshot();
+          stopped_snapshot.timestamp_ns = clock_.now();
+          stopped_snapshot.execution_id = exec_id;
+          stopped_snapshot.move_id = request.move_id;
+          stopped_snapshot.state = ExecutionState::kStopped;
+          publish_execution_snapshot(std::move(stopped_snapshot));
+          finalize_motion_execution_outcome(
+              motion_state, MotionExecutionTerminalCause::kStopped,
+              std::nullopt, std::nullopt, reason);
+          finish_worker();
+          return true;
+        }
+        if (current == ExecutionState::kInterrupted ||
+            interrupt_manager_.active_latch().has_value()) {
+          if (current != ExecutionState::kInterrupted) {
+            const auto before_interrupt = current;
+            if (sm_.try_transition(ExecutionState::kInterrupted).ok()) {
+              emit_event({KernelEventType::kStateTransition,
+                          exec_id,
+                          clock_.now(),
+                          before_interrupt,
+                          ExecutionState::kInterrupted,
+                          std::nullopt,
+                          {{"reason", reason}}});
+            }
+          }
+          auto interrupted_snapshot = get_execution_snapshot();
+          interrupted_snapshot.timestamp_ns = clock_.now();
+          interrupted_snapshot.execution_id = exec_id;
+          interrupted_snapshot.move_id = request.move_id;
+          interrupted_snapshot.state = ExecutionState::kInterrupted;
+          publish_execution_snapshot(std::move(interrupted_snapshot));
+          finalize_motion_execution_outcome(
+              motion_state, MotionExecutionTerminalCause::kInterruptedFault,
+              std::nullopt, std::nullopt, reason);
+          finish_worker();
+          return true;
+        }
+        if (current == ExecutionState::kInterventionRequired) {
+          auto intervention_snapshot = get_execution_snapshot();
+          intervention_snapshot.timestamp_ns = clock_.now();
+          intervention_snapshot.execution_id = exec_id;
+          intervention_snapshot.move_id = request.move_id;
+          intervention_snapshot.state = ExecutionState::kInterventionRequired;
+          if (!intervention_snapshot.error.has_value()) {
+            intervention_snapshot.error =
+                ErrorDTO{kErrorStopFailed,
+                         "Authoritative validation replan lost to intervention",
+                         {{"reason", reason}}};
+          }
+          const auto intervention_error = *intervention_snapshot.error;
+          publish_execution_snapshot(std::move(intervention_snapshot));
+          finalize_motion_execution_outcome(
+              motion_state, MotionExecutionTerminalCause::kFailed,
+              intervention_error, std::nullopt, reason);
+          finish_worker();
+          return true;
+        }
+        return false;
+      };
+
+      const auto post_replan_state = sm_.status().state;
+      if (replan_timed_out || stop_policy_.stop_requested() ||
+          post_replan_state == ExecutionState::kStopped ||
+          post_replan_state == ExecutionState::kStopping) {
+        auto prev = sm_.status().state;
+        const auto message = replan_timed_out
+                                 ? "Planning timed out"
+                                 : "Planning interrupted by stop";
+        if (replan_timed_out) {
+          sm_.set_last_error(ErrorCode::kPlanningTimeout);
+          emit_event({KernelEventType::kErrorRaised, exec_id, clock_.now(),
+                       {}, {},
+                       ErrorDTO{kErrorPlanningTimeout, message, {}},
+                       {}});
+        }
+        sm_.try_transition(ExecutionState::kStopped);
+        auto stopped_snapshot = get_execution_snapshot();
+        stopped_snapshot.timestamp_ns = clock_.now();
+        stopped_snapshot.execution_id = exec_id;
+        stopped_snapshot.move_id = request.move_id;
+        stopped_snapshot.state = ExecutionState::kStopped;
+        if (replan_timed_out) {
+          stopped_snapshot.error =
+              ErrorDTO{kErrorPlanningTimeout, message, {}};
+        } else {
+          stopped_snapshot.error.reset();
+        }
+        publish_execution_snapshot(std::move(stopped_snapshot));
+        emit_event({KernelEventType::kStateTransition, exec_id, clock_.now(),
+                     prev, ExecutionState::kStopped, std::nullopt,
+                     {{"reason", "authoritative_validation_replan_stop"}}});
+        finalize_motion_execution_outcome(
+            motion_state, MotionExecutionTerminalCause::kStopped,
+            std::nullopt, std::nullopt, "validation_replan_stop");
+        execution_complete_.store(true);
+        completion_cv_.notify_all();
+        return;
+      }
+      if (sm_.status().state == ExecutionState::kIdle) {
+        auto idle_snapshot = get_execution_snapshot();
+        idle_snapshot.timestamp_ns = clock_.now();
+        idle_snapshot.execution_id = 0;
+        idle_snapshot.move_id.clear();
+        idle_snapshot.state = ExecutionState::kIdle;
+        idle_snapshot.progress = 0.0;
+        publish_execution_snapshot(std::move(idle_snapshot));
+        finalize_motion_execution_outcome(
+            motion_state, MotionExecutionTerminalCause::kStopped,
+            std::nullopt, std::nullopt, "validation_replan_reset");
+        execution_complete_.store(true);
+        completion_cv_.notify_all();
+        return;
+      }
+      if (preserve_replan_terminal_authority(
+              "validation_replan_lost_to_terminal_authority")) {
+        return;
+      }
+      if (!replan_result.ok()) {
+        if (preserve_replan_terminal_authority(
+                "validation_replan_failure_lost_to_terminal_authority")) {
+          return;
+        }
+        emit_event({KernelEventType::kErrorRaised, exec_id, clock_.now(),
+                     {}, {}, replan_result.error(), {}});
+        {
+          std::lock_guard<std::mutex> lock(metrics_mutex_);
+          metrics_.plans_failed++;
+        }
+        sm_.set_last_error(error_code_from_dto(replan_result.error()));
+        sm_.try_transition(ExecutionState::kFailed);
+        auto failed_snapshot = get_execution_snapshot();
+        failed_snapshot.timestamp_ns = clock_.now();
+        failed_snapshot.execution_id = exec_id;
+        failed_snapshot.move_id = request.move_id;
+        failed_snapshot.state = ExecutionState::kFailed;
+        failed_snapshot.error = replan_result.error();
+        publish_execution_snapshot(std::move(failed_snapshot));
+        emit_event({KernelEventType::kStateTransition, exec_id, clock_.now(),
+                     ExecutionState::kPlanning, ExecutionState::kFailed,
+                     std::nullopt,
+                     {{"reason", "authoritative_validation_replan_failed"}}});
+        finalize_motion_execution_outcome(
+            motion_state, MotionExecutionTerminalCause::kFailed,
+            replan_result.error(), std::nullopt, "validation_replan_failed");
+        execution_complete_.store(true);
+        completion_cv_.notify_all();
+        return;
+      }
+
+      trajectory = std::move(replan_result.value());
+      active_trajectory_from_cache = false;
+      emit_event({KernelEventType::kPlanCompleted,
+                  exec_id,
+                  clock_.now(),
+                  {},
+                  {},
+                  std::nullopt,
+                  {{"reason", "authoritative_validation_replan"},
+                   {"attempt_index",
+                    std::to_string(authoritative_validation_attempt)}}});
+      {
+        std::lock_guard<std::mutex> lock(metrics_mutex_);
+        metrics_.plans_succeeded++;
+      }
+      auto retry_validating_from = sm_.status().state;
+      auto retry_validating_transition =
+          sm_.try_transition(ExecutionState::kValidating);
+      if (!retry_validating_transition.ok()) {
+        if (preserve_replan_terminal_authority(
+                "validation_replan_transition_lost_to_terminal_authority")) {
+          return;
+        }
+        sm_.set_last_error(ErrorCode::kInternalError);
+        sm_.try_transition(ExecutionState::kFailed);
+        emit_event({KernelEventType::kStateTransition,
+                    exec_id,
+                    clock_.now(),
+                    retry_validating_from,
+                    ExecutionState::kFailed,
+                    std::nullopt,
+                    {{"reason", "authoritative_replan_validating_failed"}}});
+        finalize_motion_execution_outcome(
+            motion_state, MotionExecutionTerminalCause::kFailed,
+            ErrorDTO{kErrorInternalError,
+                     "Failed to transition retry to Validating", {}},
+            std::nullopt, "validation_replan_transition_failed");
+        execution_complete_.store(true);
+        completion_cv_.notify_all();
+        return;
+      }
+      emit_event({KernelEventType::kStateTransition,
+                  exec_id,
+                  clock_.now(),
+                  retry_validating_from,
+                  ExecutionState::kValidating,
+                  std::nullopt,
+                  {{"reason", "authoritative_validation_replan"},
+                   {"attempt_index",
+                    std::to_string(authoritative_validation_attempt)}}});
+      auto retry_validating_snapshot = get_execution_snapshot();
+      retry_validating_snapshot.timestamp_ns = clock_.now();
+      retry_validating_snapshot.execution_id = exec_id;
+      retry_validating_snapshot.move_id = request.move_id;
+      retry_validating_snapshot.state = ExecutionState::kValidating;
+      retry_validating_snapshot.progress = 0.0;
+      publish_execution_snapshot(std::move(retry_validating_snapshot));
+    }
     if (!val_result.ok()) {
       if (validation_cancelled_by_interrupt(val_result.error()) &&
           sm_.status().state == ExecutionState::kInterrupted) {
@@ -4064,7 +4405,8 @@ void ExecutionKernel::async_execute_worker(
     // different caps — could pick up by move_id. The TrajectoryCache key does
     // not carry a dynamics-limit fingerprint, so the cache-safe behavior is to
     // not populate it from capped requests at all.
-    if (request.cache_mode != CacheMode::kDisable && !cache_hit &&
+    if (request.cache_mode != CacheMode::kDisable &&
+        !active_trajectory_from_cache &&
         request.per_joint_dynamics_limits.empty() && val_result.ok() &&
         collision_world_revision_is_set(val_result.value())) {
       // Tag every cache entry with the immutable snapshot revision that
@@ -6706,6 +7048,20 @@ Result<void> ExecutionKernel::collision_check_tick() {
       observed_snapshot.joint_positions_rad,
       {},
       {}});
+  auto expanded_one_state_result =
+      context_.expand_trajectory_for_collision_validation(one_state);
+  if (!expanded_one_state_result.ok()) {
+    const auto error = expanded_one_state_result.error();
+    monitor_details["reason"] = "runtime_state_expansion_failed";
+    monitor_details["expansion_error_code"] = error.code;
+    monitor_details["expansion_error_message"] = error.message;
+    for (const auto& [key, value] : error.details) {
+      monitor_details["expansion_" + key] = value;
+    }
+    return publish_runtime_monitor_fault(CollisionCheckResultDTO{},
+                                         monitor_details);
+  }
+  one_state = std::move(expanded_one_state_result.value());
 
   auto runtime_policy_snapshot = *policy_snapshot;
   for (auto& entry : runtime_policy_snapshot.support_contacts) {
@@ -6936,6 +7292,14 @@ Result<CollisionWorldRevision> ExecutionKernel::validate_trajectory(
         "missing_collision_query_engines"));
   }
 
+  auto collision_trajectory_result =
+      context_.expand_trajectory_for_collision_validation(trajectory);
+  if (!collision_trajectory_result.ok()) {
+    return Result<CollisionWorldRevision>::Err(
+        std::move(collision_trajectory_result.error()));
+  }
+  auto collision_trajectory = std::move(collision_trajectory_result.value());
+
   std::vector<ICollisionQueryEngine*> engine_ptrs;
   engine_ptrs.reserve(validation_engines.size());
   for (const auto& engine : validation_engines) {
@@ -7024,7 +7388,8 @@ Result<CollisionWorldRevision> ExecutionKernel::validate_trajectory(
 
     AuthoritativeValidationAttempt attempt;
     attempt.bundle =
-        pool.validate_trajectory(*world_snapshot, engine_ptrs, trajectory, *cancel);
+        pool.validate_trajectory(*world_snapshot, engine_ptrs,
+                                 collision_trajectory, *cancel);
     attempt.telemetry = pool.last_telemetry();
     return Result<AuthoritativeValidationAttempt>::Ok(std::move(attempt));
   };
@@ -7047,12 +7412,12 @@ Result<CollisionWorldRevision> ExecutionKernel::validate_trajectory(
         std::to_string(*bundle.decision.first_failing_waypoint);
     if (*bundle.decision.first_failing_waypoint >= 0 &&
         static_cast<std::size_t>(*bundle.decision.first_failing_waypoint) <
-            trajectory.waypoints.size()) {
+            collision_trajectory.waypoints.size()) {
       const auto first_failure_index =
           static_cast<std::size_t>(*bundle.decision.first_failing_waypoint);
-      const auto& waypoint = trajectory.waypoints[first_failure_index];
+      const auto& waypoint = collision_trajectory.waypoints[first_failure_index];
       details["collision_result_first_failure_joint_names"] =
-          comma_join_strings(trajectory.joint_names);
+          comma_join_strings(collision_trajectory.joint_names);
       details["collision_result_first_failure_positions_rad"] =
           comma_join_doubles(waypoint.positions_rad);
       details["collision_result_first_failure_time_from_start_s"] =

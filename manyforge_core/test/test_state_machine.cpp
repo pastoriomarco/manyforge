@@ -167,10 +167,11 @@ TEST_F(StateMachineTest, PlanningToPausedInvalid) {
   EXPECT_FALSE(sm.try_transition(ExecutionState::kPaused).ok());
 }
 
-TEST_F(StateMachineTest, ValidatingToPlanningInvalid) {
+TEST_F(StateMachineTest, ValidatingToPlanningForAuthoritativeReplan) {
   sm.try_transition(ExecutionState::kPlanning);
   sm.try_transition(ExecutionState::kValidating);
-  EXPECT_FALSE(sm.try_transition(ExecutionState::kPlanning).ok());
+  EXPECT_TRUE(sm.try_transition(ExecutionState::kPlanning).ok());
+  EXPECT_EQ(sm.status().state, ExecutionState::kPlanning);
 }
 
 TEST_F(StateMachineTest, ExecutingToPlanningInvalid) {

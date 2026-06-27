@@ -1,13 +1,12 @@
 api_version: manyforge.program.v0
 program_profile: v0.1
 name: lite6_lite_gripper_pick_and_place
-description: >-
-  Basic ManyForge pick-and-place program for UFACTORY Lite6 + lite pneumatic
-  gripper. It adapts the standard ManyMove Lite6 example to ManyForge program
-  nodes: rest/scan joint poses are copied from ManyMove, the scene uses simple
-  primitive boxes, and pick/place goals are expressed as backend-resolved
-  relative moves plus runtime attach/detach.
-catalog_version: "0.2.0"
+description: 'Basic ManyForge pick-and-place program for UFACTORY Lite6 + lite pneumatic
+  gripper. It adapts the standard ManyMove Lite6 example to ManyForge program nodes:
+  rest/scan joint poses are copied from ManyMove, the scene uses simple primitive
+  boxes, and pick/place goals are expressed as backend-resolved relative moves plus
+  runtime attach/detach.'
+catalog_version: 0.2.0
 robot:
   robot_id: lite6
   group_id: lite6
@@ -17,35 +16,67 @@ scene:
 - object_id: ground
   shape:
     type: box
-    box_dimensions_m: [1.0, 1.0, 0.1]
+    box_dimensions_m:
+    - 1
+    - 1
+    - 0.1
   pose:
     frame_id: universe
-    position_m: [0.0, 0.0, -0.051]
-    orientation_rpy_deg: [0.0, 0.0, 0.0]
+    position_m:
+    - 0
+    - 0
+    - -0.051
+    orientation_rpy_deg:
+    - 0
+    - 0
+    - 0
 - object_id: wall
   shape:
     type: box
-    box_dimensions_m: [1.0, 0.02, 0.2]
+    box_dimensions_m:
+    - 1
+    - 0.02
+    - 0.2
   pose:
     frame_id: universe
-    position_m: [0.0, -0.15, 0.1]
-    orientation_rpy_deg: [0.0, 0.0, 0.0]
+    position_m:
+    - 0
+    - -0.15
+    - 0.1
+    orientation_rpy_deg:
+    - 0
+    - 0
+    - 0
 - object_id: graspable
   shape:
     type: box
-    box_dimensions_m: [0.06, 0.015, 0.015]
+    box_dimensions_m:
+    - 0.06
+    - 0.015
+    - 0.015
   pose:
     frame_id: universe
-    position_m: [0.18, -0.20, 0.08]
-    orientation_rpy_deg: [0.0, 0.0, 0.0]
+    position_m:
+    - 0.18
+    - -0.25
+    - 0.08
+    orientation_xyzw:
+    - 0
+    - 0
+    - 0
+    - 1
 parameters:
 - name: velocity_scale
   type: float
   default: 0.4
   constraints:
-    min_exclusive: 0.0
-    max_inclusive: 1.0
+    min_exclusive: 0
+    max_inclusive: 1
   description: Velocity scale for all Lite6 pick-and-place moves.
+saved_with_deployment:
+  name: lite6_lite_gripper_pick_and_place
+  source_path: /workspace/examples/lite6_lite_gripper_pick_and_place.deployment.yaml
+  content_sha256: e1ee0d7c34e11d61e6c896ae8edd51e4ec94155c99457c5a897343698df73493
 tree:
   id: sequence
   name: lite6_pick_and_place
@@ -55,36 +86,28 @@ tree:
     params:
       gripper_id: primary
       position: 0.0081
-      max_effort: 10.0
+      max_effort: 10
       duration_s: 0.8
-      timeout_s: 0.0
+      timeout_s: 0
   - id: move_manipulator_action
     name: move_to_rest
     params:
       move_id: lite6_rest
       motion_type: joint_goal
-      joint_goal_names: [joint1, joint2, joint3, joint4, joint5, joint6]
-      joint_goal_positions_rad: [0.0, -0.785, 0.785, 0.0, 1.57, 0.0]
-      velocity_scale: ${param:velocity_scale}
-      planning_timeout_s: 10
-      execution_timeout_s: 30
-  - id: move_manipulator_action
-    name: scan_left
-    params:
-      move_id: lite6_scan_left
-      motion_type: joint_goal
-      joint_goal_names: [joint1, joint2, joint3, joint4, joint5, joint6]
-      joint_goal_positions_rad: [-0.175, -0.419, 1.378, 0.349, 1.535, -0.977]
-      velocity_scale: ${param:velocity_scale}
-      planning_timeout_s: 10
-      execution_timeout_s: 30
-  - id: move_manipulator_action
-    name: scan_right
-    params:
-      move_id: lite6_scan_right
-      motion_type: joint_goal
-      joint_goal_names: [joint1, joint2, joint3, joint4, joint5, joint6]
-      joint_goal_positions_rad: [0.733, -0.297, 1.378, -0.576, 1.692, 1.291]
+      joint_goal_names:
+      - joint1
+      - joint2
+      - joint3
+      - joint4
+      - joint5
+      - joint6
+      joint_goal_positions_rad:
+      - 0
+      - -0.785
+      - 0.785
+      - 0
+      - 1.57
+      - 0
       velocity_scale: ${param:velocity_scale}
       planning_timeout_s: 10
       execution_timeout_s: 30
@@ -97,12 +120,18 @@ tree:
         target_reference:
           type: object
           id: graspable
+        offset:
+          position_m:
+          - 0
+          - 0
+          - 0.1
+          orientation_rpy_deg:
+          - 180
+          - 0
+          - 0
         offset_reference:
           type: frame
           id: link_base
-        offset:
-          position_m: [0.0, 0.0, 0.08]
-          orientation_rpy_deg: [180.0, 0.0, 0.0]
       velocity_scale: ${param:velocity_scale}
       planning_timeout_s: 10
       execution_timeout_s: 30
@@ -115,12 +144,18 @@ tree:
         target_reference:
           type: object
           id: graspable
+        offset:
+          position_m:
+          - 0
+          - 0
+          - -0.0075
+          orientation_rpy_deg:
+          - 180
+          - 0
+          - 0
         offset_reference:
           type: frame
           id: link_base
-        offset:
-          position_m: [0.0, 0.0, 0.035]
-          orientation_rpy_deg: [180.0, 0.0, 0.0]
       velocity_scale: ${param:velocity_scale}
       planning_timeout_s: 10
       execution_timeout_s: 30
@@ -128,10 +163,10 @@ tree:
     name: close_gripper
     params:
       gripper_id: primary
-      position: 0.0
-      max_effort: 10.0
+      position: 0
+      max_effort: 10
       duration_s: 0.8
-      timeout_s: 0.0
+      timeout_s: 0
   - id: attach_object_to_link
     name: attach_graspable
     params:
@@ -148,13 +183,17 @@ tree:
           type: robot_link
           id: link_tcp
         offset:
-          position_m: [0.0, 0.0, -0.08]
-          orientation_rpy_deg: [0.0, 0.0, 0.0]
+          position_m:
+          - 0
+          - 0
+          - -0.08
+          orientation_rpy_deg:
+          - 0
+          - 0
+          - 0
       velocity_scale: ${param:velocity_scale}
       planning_timeout_s: 10
       execution_timeout_s: 30
-  - id: reset_trajectories
-    name: invalidate_after_pick
   - id: move_manipulator_action
     name: move_to_drop_approach
     params:
@@ -162,8 +201,14 @@ tree:
       motion_type: pose_goal
       pose_goal:
         frame_id: link_base
-        position_m: [0.16, 0.08, 0.20]
-        orientation_rpy_deg: [180.0, 0.0, 0.0]
+        position_m:
+        - 0.16
+        - 0.08
+        - 0.2
+        orientation_rpy_deg:
+        - 180
+        - 0
+        - 0
       velocity_scale: ${param:velocity_scale}
       planning_timeout_s: 10
       execution_timeout_s: 30
@@ -174,8 +219,14 @@ tree:
       motion_type: pose_goal
       pose_goal:
         frame_id: link_base
-        position_m: [0.16, 0.08, 0.17]
-        orientation_rpy_deg: [180.0, 0.0, 0.0]
+        position_m:
+        - 0.16
+        - 0.08
+        - 0.17
+        orientation_rpy_deg:
+        - 180
+        - 0
+        - 0
       velocity_scale: ${param:velocity_scale}
       planning_timeout_s: 10
       execution_timeout_s: 30
@@ -184,9 +235,9 @@ tree:
     params:
       gripper_id: primary
       position: 0.0081
-      max_effort: 10.0
+      max_effort: 10
       duration_s: 0.8
-      timeout_s: 0.0
+      timeout_s: 0
   - id: detach_object_from_link
     name: detach_graspable
     params:
@@ -199,20 +250,36 @@ tree:
       motion_type: pose_goal
       pose_goal:
         frame_id: link_base
-        position_m: [0.16, 0.08, 0.22]
-        orientation_rpy_deg: [180.0, 0.0, 0.0]
+        position_m:
+        - 0.16
+        - 0.08
+        - 0.22
+        orientation_rpy_deg:
+        - 180
+        - 0
+        - 0
       velocity_scale: ${param:velocity_scale}
       planning_timeout_s: 10
       execution_timeout_s: 30
-  - id: reset_trajectories
-    name: invalidate_after_drop
   - id: move_manipulator_action
     name: return_rest
     params:
       move_id: lite6_return_rest
       motion_type: joint_goal
-      joint_goal_names: [joint1, joint2, joint3, joint4, joint5, joint6]
-      joint_goal_positions_rad: [0.0, -0.785, 0.785, 0.0, 1.57, 0.0]
+      joint_goal_names:
+      - joint1
+      - joint2
+      - joint3
+      - joint4
+      - joint5
+      - joint6
+      joint_goal_positions_rad:
+      - 0
+      - -0.785
+      - 0.785
+      - 0
+      - 1.57
+      - 0
       velocity_scale: ${param:velocity_scale}
       planning_timeout_s: 10
       execution_timeout_s: 30

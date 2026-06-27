@@ -1034,6 +1034,18 @@ ExecutionKernelConfig kernel_config_from_python(const py::object& config_obj) {
   if (config.planner_max_planning_time_s <= 0.0) {
     throw std::invalid_argument("planner_max_planning_time_s must be > 0");
   }
+  if (config_dict.contains(
+          "authoritative_validation_collision_replan_attempts")) {
+    const double attempts = finite_scale_from_python(
+        config_dict["authoritative_validation_collision_replan_attempts"],
+        "authoritative_validation_collision_replan_attempts");
+    if (attempts < 0.0) {
+      throw std::invalid_argument(
+          "authoritative_validation_collision_replan_attempts must be >= 0");
+    }
+    config.authoritative_validation_collision_replan_attempts =
+        static_cast<int>(attempts);
+  }
   if (config_dict.contains("baseline_collision_policy_snapshot") &&
       !config_dict["baseline_collision_policy_snapshot"].is_none()) {
     config.baseline_collision_policy_snapshot =

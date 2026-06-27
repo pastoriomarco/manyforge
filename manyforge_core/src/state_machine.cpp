@@ -21,7 +21,8 @@ bool ExecutionStateMachine::is_valid_transition(ExecutionState from, ExecutionSt
                    to == ExecutionState::kStopped ||  // stop cancels in-flight
                    to == ExecutionState::kInterventionRequired;
         case ExecutionState::kValidating:
-            return to == ExecutionState::kExecuting ||
+            return to == ExecutionState::kPlanning ||  // replan after authoritative validation rejection
+                   to == ExecutionState::kExecuting ||
                    to == ExecutionState::kInterrupted ||
                    to == ExecutionState::kFailed ||
                    to == ExecutionState::kStopped ||  // stop cancels in-flight

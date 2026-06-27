@@ -107,9 +107,12 @@ package's parent directory to `package_paths` in the deployment YAML
 else `trimesh` rejects will return 404 from the mesh route and the
 link will skip rendering (the rest of the robot still renders fine).
 
-**Visual vs. collision.** The viewer renders `<visual>` only. SRDF
-disabled-collision pairs and explicit `<collision>` blocks are still
-consumed by the planner.
+**Visual vs. collision.** The default robot display renders `<visual>`
+geometry. For debugging, Composer's **Tools → Sources → Robot collision
+meshes** overlay renders the URDF `<collision>` geometry separately so you can
+compare what validation sees against the visible robot. SRDF disabled-collision
+pairs and explicit `<collision>` blocks are consumed by the planner regardless
+of whether the overlay is enabled.
 
 ## Step 2 — Author the deployment YAML
 

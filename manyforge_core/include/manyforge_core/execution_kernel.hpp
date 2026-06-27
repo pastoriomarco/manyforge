@@ -85,6 +85,15 @@ struct ExecutionKernelConfig {
   // is visible in the deployment artifact.
   double planner_max_planning_time_s = 5.0;
 
+  // Additional planning attempts allowed when the authoritative
+  // manyforge_collision validator rejects a freshly planned candidate for a
+  // blocking collision. RRT planning is probabilistic and its internal
+  // validity checker is not yet the same object as the final validation
+  // authority, so the kernel treats an authoritative rejection as "candidate
+  // invalid" and asks the planner for another candidate before failing
+  // closed. Zero preserves single-shot behavior.
+  int authoritative_validation_collision_replan_attempts = 2;
+
   // Optional deployment-baseline collision policy. Factories synthesize the
   // historical `default_free_space` policy only when this is absent.
   std::optional<CollisionPolicySnapshot> baseline_collision_policy_snapshot;

@@ -137,6 +137,7 @@ TEST_F(CollisionWorldPublisherTest, InitialSnapshotPublishesRobotBodies) {
                    1.0);
 
   bool found_robot_body = false;
+  bool found_robot_mesh = false;
   bool found_robot_proxy = false;
   for (const auto& body : snapshot->bodies) {
     if (body.owner_kind == CollisionOwnerKind::kRobotLink) {
@@ -145,15 +146,21 @@ TEST_F(CollisionWorldPublisherTest, InitialSnapshotPublishesRobotBodies) {
       ASSERT_FALSE(body.geometries.empty());
       EXPECT_EQ(body.geometries.front().body_id, body.body_id);
       EXPECT_EQ(body.geometries.front().owner_kind, CollisionOwnerKind::kRobotLink);
+      if (body.geometries.front().geometry_kind ==
+          CollisionGeometryKind::kTriangleMesh) {
+        found_robot_mesh = true;
+      }
       if (body.geometries.front().geometry_kind == CollisionGeometryKind::kBox &&
           has_label(body.geometries.front().quality_labels,
                     "conservative_proxy")) {
+        EXPECT_TRUE(has_label(body.geometries.front().quality_labels,
+                              "warning_conservative_aabb_proxy"));
         found_robot_proxy = true;
       }
     }
   }
   EXPECT_TRUE(found_robot_body);
-  EXPECT_TRUE(found_robot_proxy);
+  EXPECT_TRUE(found_robot_mesh || found_robot_proxy);
 }
 
 // --- Successful mutations bump the revision ------------------------------

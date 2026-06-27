@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 from pathlib import Path
+import time
 import xml.etree.ElementTree as ET
 
 import pytest
 
-from manyforge_behavior.kernel_client import GripperCommandRequest
+from manyforge_behavior.kernel_client import (
+    ExecuteRequest,
+    ExecutionState,
+    GripperCommandRequest,
+    SceneEditRequest,
+)
 from manyforge_behavior.model_paths import ResolvedRobotModel
 from manyforge_behavior.robot_model_authority import (
     MimicLaw,
@@ -305,6 +311,226 @@ def test_lite6_canonical_gripper_command_uses_roboplan_view_mapping_when_binding
     assert comparison["ok"] is True, comparison
     assert comparison["manyforge_collision"]["engine_status"] == "ok"
     assert comparison["manyforge_collision"]["decision"] == "pass"
+
+
+def test_lite6_arm_pick_validation_preserves_open_gripper_state_when_binding_available():
+    try:
+        import manyforge_roboplan_py
+        from native_kernel_client import NativeKernelClient
+    except ImportError:
+        pytest.skip("manyforge_roboplan_py/native client not available")
+
+    model_dir = MODEL_ROOT / "lite6_lite_gripper"
+    runtime_model = prepare_roboplan_runtime_model_view(
+        resolved_model=ResolvedRobotModel(
+            model_name="lite6_lite_gripper",
+            urdf_path=str(model_dir / "lite6_lite_gripper.urdf"),
+            srdf_path=str(model_dir / "lite6_lite_gripper.srdf"),
+            package_paths=[str(REPO_ROOT)],
+        ),
+        grippers={
+            "primary": {
+                "group_id": "lite_gripper",
+                "joint_name": "right_finger_joint",
+            }
+        },
+    )
+    bundle = manyforge_roboplan_py.create_native_kernel_from_paths(
+        runtime_model.model_name,
+        "lite6",
+        runtime_model.urdf_path,
+        runtime_model.srdf_path,
+        runtime_model.package_paths,
+    )
+    kernel = NativeKernelClient(
+        bundle,
+        robot_model_authority_metadata=runtime_model.metadata,
+        robot_model_authority_temp_dir=runtime_model._temp_dir,
+    )
+
+    def wait_for_terminal(timeout_s: float = 30.0):
+        deadline = time.monotonic() + timeout_s
+        last_status = kernel.get_status()
+        while time.monotonic() < deadline:
+            last_status = kernel.get_status()
+            if last_status.state in {
+                ExecutionState.COMPLETED,
+                ExecutionState.FAILED,
+                ExecutionState.STOPPED,
+            }:
+                return last_status
+            time.sleep(0.01)
+        pytest.fail(f"timed out waiting for terminal state: {last_status.state}")
+
+    def add_box(object_id: str, dimensions: list[float], position: list[float]) -> None:
+        result = kernel.scene_edit(
+            SceneEditRequest(
+                operation="add",
+                object_id=object_id,
+                shape_type="box",
+                box_dimensions_m=dimensions,
+                pose_position_m=position,
+                pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
+                frame_id="universe",
+            )
+        )
+        assert result.success, result.error
+
+    def execute_relative(move_id: str, z_offset_m: float) -> None:
+        request = ExecuteRequest(
+            robot_id="lite6",
+            group_id="lite6",
+            move_id=move_id,
+            base_frame="link_base",
+            tcp_frame="link_tcp",
+            motion_type="relative_move",
+            relative_move={
+                "target_reference": {"type": "object", "id": "graspable"},
+                "offset_reference": {"type": "frame", "id": "link_base"},
+                "offset": {
+                    "position_m": [0.0, 0.0, z_offset_m],
+                    "orientation_rpy_deg": [180.0, 0.0, 0.0],
+                },
+            },
+            velocity_scale=0.4,
+            planning_timeout_s=10.0,
+            execution_timeout_s=30.0,
+            cache_mode="disable",
+        )
+        result = kernel.execute(request)
+        assert result.ok, result.error
+        terminal = wait_for_terminal()
+        snapshot = kernel.get_execution_snapshot()
+        assert terminal.state == ExecutionState.COMPLETED, snapshot.error_details
+        ack = kernel.acknowledge_completed(terminal.execution_id)
+        assert ack.accepted, ack.error
+
+    bundle.set_joint_positions([0.0, 0.0, 1.57, 0.0, 0.0, 0.0])
+    add_box("ground", [1.0, 1.0, 0.1], [0.0, 0.0, -0.051])
+    add_box("wall", [1.0, 0.02, 0.2], [0.0, -0.15, 0.1])
+    add_box("graspable", [0.06, 0.015, 0.015], [0.18, -0.20, 0.08])
+
+    gripper = kernel.command_gripper(
+        GripperCommandRequest(
+            gripper_id="primary",
+            group_id="lite_gripper",
+            joint_name="right_finger_joint",
+            target_position=0.0081,
+            max_effort=10.0,
+            duration_s=0.0,
+        )
+    )
+    assert gripper.accepted, gripper.error
+    assert bundle.get_group_joint_positions("lite_gripper") == pytest.approx(
+        [0.0081, 0.0081],
+        abs=1e-4,
+    )
+
+    execute_relative("lite6_pick_approach", 0.08)
+    execute_relative("lite6_pick_down", 0.035)
+
+
+def test_lite6_manyforge_collision_matches_legacy_for_open_gripper_pick_waypoint():
+    try:
+        import manyforge_roboplan_py
+        from native_kernel_client import NativeKernelClient
+    except ImportError:
+        pytest.skip("manyforge_roboplan_py/native client not available")
+
+    model_dir = MODEL_ROOT / "lite6_lite_gripper"
+    runtime_model = prepare_roboplan_runtime_model_view(
+        resolved_model=ResolvedRobotModel(
+            model_name="lite6_lite_gripper",
+            urdf_path=str(model_dir / "lite6_lite_gripper.urdf"),
+            srdf_path=str(model_dir / "lite6_lite_gripper.srdf"),
+            package_paths=[str(REPO_ROOT)],
+        ),
+        grippers={
+            "primary": {
+                "group_id": "lite_gripper",
+                "joint_name": "right_finger_joint",
+            }
+        },
+    )
+    bundle = manyforge_roboplan_py.create_native_kernel_from_paths(
+        runtime_model.model_name,
+        "lite6",
+        runtime_model.urdf_path,
+        runtime_model.srdf_path,
+        runtime_model.package_paths,
+    )
+    kernel = NativeKernelClient(
+        bundle,
+        robot_model_authority_metadata=runtime_model.metadata,
+        robot_model_authority_temp_dir=runtime_model._temp_dir,
+    )
+
+    for request in (
+        SceneEditRequest(
+            operation="add",
+            object_id="ground",
+            shape_type="box",
+            box_dimensions_m=[1.0, 1.0, 0.1],
+            pose_position_m=[0.0, 0.0, -0.051],
+            pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
+            frame_id="universe",
+        ),
+        SceneEditRequest(
+            operation="add",
+            object_id="wall",
+            shape_type="box",
+            box_dimensions_m=[1.0, 0.02, 0.2],
+            pose_position_m=[0.0, -0.15, 0.1],
+            pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
+            frame_id="universe",
+        ),
+        SceneEditRequest(
+            operation="add",
+            object_id="graspable",
+            shape_type="box",
+            box_dimensions_m=[0.06, 0.015, 0.015],
+            pose_position_m=[0.18, -0.25, 0.08],
+            pose_orientation_xyzw=[0.0, 0.0, 0.0, 1.0],
+            frame_id="universe",
+        ),
+    ):
+        result = kernel.scene_edit(request)
+        assert result.success, result.error
+
+    result = kernel.command_gripper(
+        GripperCommandRequest(
+            gripper_id="primary",
+            group_id="lite_gripper",
+            joint_name="right_finger_joint",
+            target_position=0.0081,
+            max_effort=10.0,
+            duration_s=0.0,
+        )
+    )
+    assert result.accepted, result.error
+    assert bundle.get_group_joint_positions("lite_gripper") == pytest.approx(
+        [0.0081, 0.0081],
+        abs=1e-4,
+    )
+
+    # Regression for the live Lite6 false positive seen on lite6_pick_down:
+    # the legacy RoboPlan scene accepted this open-gripper waypoint while the
+    # snapshot-backed ManyForge collision engine used a conservative robot-mesh
+    # AABB proxy and reported graspable <-> finger collision.
+    failing_waypoint = [
+        -0.94676919298494788,
+        0.70804426974298251,
+        1.1681676704489288,
+        4.6425930722353571e-06,
+        0.46012187095654034,
+        -0.9467541851191329,
+        0.0081,
+    ]
+    comparison = bundle.collision_compare_positions(failing_waypoint, 66)
+    assert comparison["ok"] is True, comparison
+    assert comparison["legacy"]["decision"] == "pass"
+    assert comparison["manyforge_collision"]["decision"] == "pass", comparison
+    assert comparison["match"] is True, comparison
 
 
 def test_lite6_asset_descriptor_and_instance_view_preserve_mimic_gripper_maps():

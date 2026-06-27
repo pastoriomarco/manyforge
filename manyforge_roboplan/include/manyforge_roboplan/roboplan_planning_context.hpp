@@ -61,6 +61,9 @@ class RoboPlanPlanningContext final
       const core::TrajectoryDTO& trajectory,
       const core::ValidationOptionsDTO& options) override;
 
+  core::Result<core::TrajectoryDTO> expand_trajectory_for_collision_validation(
+      const core::TrajectoryDTO& trajectory) override;
+
   core::CollisionCheckResultDTO collision_check(
       const core::CollisionCheckRequestDTO& request) override;
 

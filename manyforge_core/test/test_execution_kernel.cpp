@@ -25,12 +25,22 @@ namespace {
 class MockPlanner : public IPlannerBackend {
  public:
   PlanResultDTO next_result;
+  std::vector<PlanResultDTO> result_sequence;
+  std::function<void(int)> on_plan;
   int plan_count = 0;
   PlanRequestDTO last_request;
 
   PlanResultDTO plan(const PlanRequestDTO& request) override {
     ++plan_count;
     last_request = request;
+    if (on_plan) {
+      on_plan(plan_count);
+    }
+    if (!result_sequence.empty()) {
+      auto result = result_sequence.front();
+      result_sequence.erase(result_sequence.begin());
+      return result;
+    }
     return next_result;
   }
 };
@@ -117,8 +127,11 @@ class MockContext : public IPlanningContext {
   int get_state_count = 0;
   int validate_count = 0;
   int collision_count = 0;
+  int expand_count = 0;
   int fk_count = 0;
   FkRequestDTO last_fk_request;
+  TrajectoryDTO last_expand_trajectory;
+  std::optional<Result<TrajectoryDTO>> next_expand_result;
   ValidationOptionsDTO last_validation_options;
   bool throw_get_state = false;
   bool throw_fk = false;
@@ -141,6 +154,16 @@ class MockContext : public IPlanningContext {
       on_validate();
     }
     return next_validation;
+  }
+
+  Result<TrajectoryDTO> expand_trajectory_for_collision_validation(
+      const TrajectoryDTO& trajectory) override {
+    ++expand_count;
+    last_expand_trajectory = trajectory;
+    if (next_expand_result.has_value()) {
+      return *next_expand_result;
+    }
+    return Result<TrajectoryDTO>::Ok(trajectory);
   }
 
   CollisionCheckResultDTO collision_check(
@@ -244,6 +267,9 @@ class MockCollisionEngine final : public ICollisionQueryEngine {
  public:
   CollisionResult default_result;
   std::map<std::int64_t, CollisionResult> result_by_waypoint;
+  std::vector<CollisionResult> result_sequence;
+  std::function<std::optional<CollisionResult>(const CollisionQuery&)>
+      result_for_query;
   std::function<void(const CollisionQuery&)> on_check;
   std::atomic<int> check_count{0};
 
@@ -275,7 +301,14 @@ class MockCollisionEngine final : public ICollisionQueryEngine {
       on_check(query);
     }
     CollisionResult result = default_result;
-    if (query.waypoint_index) {
+    if (result_for_query) {
+      if (auto custom = result_for_query(query)) {
+        result = *custom;
+      }
+    } else if (!result_sequence.empty()) {
+      result = result_sequence.front();
+      result_sequence.erase(result_sequence.begin());
+    } else if (query.waypoint_index) {
       auto it = result_by_waypoint.find(*query.waypoint_index);
       if (it != result_by_waypoint.end()) {
         result = it->second;
@@ -2119,6 +2152,294 @@ TEST_F(ExecutionKernelTest,
   EXPECT_TRUE(saw_validation_failed);
 }
 
+TEST_F(ExecutionKernelTest,
+       Execute_AuthoritativeCollisionReplansAndDispatchesSecondCandidate) {
+  ControlledExecution controlled_execution;
+  ThreadSafeFakeClock local_clock;
+  ThreadSafeManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  ExecutionKernelConfig config;
+  config.authoritative_validation_collision_replan_attempts = 1;
+  MockPlanner local_planner;
+  PlanResultDTO first_plan;
+  first_plan.trajectory =
+      make_test_trajectory_from({0.0, 0.0}, {1.0, 1.0});
+  PlanResultDTO second_plan;
+  second_plan.trajectory =
+      make_test_trajectory_from({0.0, 0.0}, {2.0, 2.0});
+  local_planner.result_sequence = {first_plan, second_plan};
+  MockContext local_context = context;
+  ExecutionKernel local_kernel{local_planner,
+                               local_context,
+                               controlled_execution,
+                               local_clock,
+                               local_scheduler,
+                               local_cache,
+                               config};
+  MockCollisionWorldPublisher local_publisher;
+  auto local_engine = std::make_shared<MockCollisionEngine>();
+  configure_authoritative_collision_validation(local_kernel, local_publisher,
+                                                local_engine);
+  local_engine->result_for_query = [&](const CollisionQuery&) {
+    if (local_planner.plan_count <= 1) {
+      return std::make_optional(make_authoritative_collision_result());
+    }
+    return std::make_optional(CollisionResult{});
+  };
+
+  std::mutex events_mutex;
+  std::vector<KernelEvent> events;
+  local_kernel.subscribe_events([&](const KernelEvent& event) {
+    std::lock_guard<std::mutex> lock(events_mutex);
+    events.push_back(event);
+  });
+
+  auto result = local_kernel.execute(make_test_request("replan_collision"));
+  ASSERT_TRUE(result.ok());
+  ASSERT_TRUE(controlled_execution.wait_until_execute_called())
+      << "wait_until_execute_called timed out";
+  controlled_execution.complete();
+  ASSERT_TRUE(local_kernel.wait_for_completion(1'000'000'000));
+
+  EXPECT_EQ(local_kernel.get_status().state, ExecutionState::kCompleted);
+  EXPECT_EQ(local_planner.plan_count, 2);
+  EXPECT_EQ(controlled_execution.execute_count, 1);
+  ASSERT_FALSE(controlled_execution.last_execute_trajectory.waypoints.empty());
+  EXPECT_EQ(controlled_execution.last_execute_trajectory.waypoints.back().positions_rad,
+            (std::vector<double>{2.0, 2.0}));
+
+  std::lock_guard<std::mutex> lock(events_mutex);
+  bool saw_retry_validation_failed = false;
+  bool saw_retry_plan_started = false;
+  bool saw_terminal_error = false;
+  for (const auto& event : events) {
+    if (event.type == KernelEventType::kValidationFailed) {
+      auto reason = event.details.find("reason");
+      if (reason != event.details.end() &&
+          reason->second == "authoritative_validation_replan") {
+        saw_retry_validation_failed = true;
+      }
+    }
+    if (event.type == KernelEventType::kPlanStarted) {
+      auto reason = event.details.find("reason");
+      if (reason != event.details.end() &&
+          reason->second == "authoritative_validation_replan") {
+        saw_retry_plan_started = true;
+      }
+    }
+    saw_terminal_error = saw_terminal_error ||
+                         event.type == KernelEventType::kErrorRaised;
+  }
+  EXPECT_TRUE(saw_retry_validation_failed);
+  EXPECT_TRUE(saw_retry_plan_started);
+  EXPECT_FALSE(saw_terminal_error);
+}
+
+TEST_F(ExecutionKernelTest,
+       Execute_AuthoritativeCollisionReplanBudgetExhaustedFailsClosed) {
+  ControlledExecution controlled_execution;
+  ThreadSafeFakeClock local_clock;
+  ThreadSafeManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  ExecutionKernelConfig config;
+  config.authoritative_validation_collision_replan_attempts = 1;
+  MockPlanner local_planner;
+  PlanResultDTO first_plan;
+  first_plan.trajectory =
+      make_test_trajectory_from({0.0, 0.0}, {1.0, 1.0});
+  PlanResultDTO second_plan;
+  second_plan.trajectory =
+      make_test_trajectory_from({0.0, 0.0}, {2.0, 2.0});
+  local_planner.result_sequence = {first_plan, second_plan};
+  MockContext local_context = context;
+  ExecutionKernel local_kernel{local_planner,
+                               local_context,
+                               controlled_execution,
+                               local_clock,
+                               local_scheduler,
+                               local_cache,
+                               config};
+  MockCollisionWorldPublisher local_publisher;
+  auto local_engine = std::make_shared<MockCollisionEngine>();
+  configure_authoritative_collision_validation(local_kernel, local_publisher,
+                                                local_engine);
+  local_engine->default_result = make_authoritative_collision_result();
+
+  auto result = local_kernel.execute(make_test_request("replan_exhausted"));
+  ASSERT_TRUE(result.ok());
+  ASSERT_TRUE(local_kernel.wait_for_completion(1'000'000'000));
+
+  EXPECT_EQ(local_kernel.get_status().state, ExecutionState::kFailed);
+  EXPECT_EQ(local_planner.plan_count, 2);
+  EXPECT_EQ(controlled_execution.execute_count, 0);
+  auto snapshot = local_kernel.get_execution_snapshot();
+  ASSERT_TRUE(snapshot.error.has_value());
+  EXPECT_EQ(snapshot.error->code, kErrorValidationCollision);
+  EXPECT_EQ(snapshot.error->details.at("collision_result_decision"), "fail");
+}
+
+TEST_F(ExecutionKernelTest,
+       Execute_AuthoritativeCollisionReplanStopPreservesStoppedTerminal) {
+  ControlledExecution controlled_execution;
+  ThreadSafeFakeClock local_clock;
+  ThreadSafeManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  ExecutionKernelConfig config;
+  config.authoritative_validation_collision_replan_attempts = 1;
+  MockPlanner local_planner;
+  PlanResultDTO first_plan;
+  first_plan.trajectory =
+      make_test_trajectory_from({0.0, 0.0}, {1.0, 1.0});
+  PlanResultDTO second_plan;
+  second_plan.trajectory =
+      make_test_trajectory_from({0.0, 0.0}, {2.0, 2.0});
+  local_planner.result_sequence = {first_plan, second_plan};
+  MockContext local_context = context;
+  ExecutionKernel local_kernel{local_planner,
+                               local_context,
+                               controlled_execution,
+                               local_clock,
+                               local_scheduler,
+                               local_cache,
+                               config};
+  ExecutionKernel* kernel_ptr = &local_kernel;
+  local_planner.on_plan = [&](int count) {
+    if (count == 2) {
+      auto stop = kernel_ptr->stop();
+      EXPECT_TRUE(stop.accepted);
+    }
+  };
+  MockCollisionWorldPublisher local_publisher;
+  auto local_engine = std::make_shared<MockCollisionEngine>();
+  configure_authoritative_collision_validation(local_kernel, local_publisher,
+                                                local_engine);
+  local_engine->result_for_query = [&](const CollisionQuery&) {
+    if (local_planner.plan_count <= 1) {
+      return std::make_optional(make_authoritative_collision_result());
+    }
+    return std::make_optional(CollisionResult{});
+  };
+
+  auto result = local_kernel.execute(make_test_request("replan_stop"));
+  ASSERT_TRUE(result.ok());
+  ASSERT_TRUE(local_kernel.wait_for_completion(1'000'000'000));
+
+  EXPECT_EQ(local_kernel.get_status().state, ExecutionState::kStopped);
+  EXPECT_EQ(local_planner.plan_count, 2);
+  EXPECT_EQ(controlled_execution.execute_count, 0);
+  auto outcome = local_kernel.get_execution_outcome(result.value());
+  ASSERT_TRUE(outcome.has_value());
+  EXPECT_EQ(outcome->terminal_cause, MotionExecutionTerminalCause::kStopped);
+}
+
+TEST_F(ExecutionKernelTest,
+       Execute_AuthoritativeCollisionReplanInterruptPreservesFaultTerminal) {
+  ControlledExecution controlled_execution;
+  ThreadSafeFakeClock local_clock;
+  ThreadSafeManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  ExecutionKernelConfig config;
+  config.authoritative_validation_collision_replan_attempts = 1;
+  MockPlanner local_planner;
+  PlanResultDTO first_plan;
+  first_plan.trajectory =
+      make_test_trajectory_from({0.0, 0.0}, {1.0, 1.0});
+  PlanResultDTO second_plan;
+  second_plan.trajectory =
+      make_test_trajectory_from({0.0, 0.0}, {2.0, 2.0});
+  local_planner.result_sequence = {first_plan, second_plan};
+  MockContext local_context = context;
+  ExecutionKernel local_kernel{local_planner,
+                               local_context,
+                               controlled_execution,
+                               local_clock,
+                               local_scheduler,
+                               local_cache,
+                               config};
+  auto source = make_interrupt_source("replan_fault");
+  ASSERT_TRUE(local_kernel.register_interrupt_source(source).ok());
+  auto policy = make_interrupt_policy("replan_fault_policy", "replan_fault");
+  policy.affected_phases = {InterruptExecutionPhase::kPlanning};
+  policy.preemption_action = InterruptPreemptionAction::kLatchHeld;
+  ASSERT_TRUE(local_kernel.register_interrupt_policy(policy).ok());
+  ExecutionKernel* kernel_ptr = &local_kernel;
+  local_planner.on_plan = [&](int count) {
+    if (count == 2) {
+      auto ingest =
+          kernel_ptr->publish_fast_interrupt_signal(
+              make_interrupt_signal("replan_fault"));
+      EXPECT_TRUE(ingest.latched);
+    }
+  };
+  MockCollisionWorldPublisher local_publisher;
+  auto local_engine = std::make_shared<MockCollisionEngine>();
+  configure_authoritative_collision_validation(local_kernel, local_publisher,
+                                                local_engine);
+  local_engine->result_for_query = [&](const CollisionQuery&) {
+    if (local_planner.plan_count <= 1) {
+      return std::make_optional(make_authoritative_collision_result());
+    }
+    return std::make_optional(CollisionResult{});
+  };
+
+  auto result = local_kernel.execute(make_test_request("replan_interrupt"));
+  ASSERT_TRUE(result.ok());
+  ASSERT_TRUE(local_kernel.wait_for_completion(1'000'000'000));
+
+  EXPECT_EQ(local_kernel.get_status().state, ExecutionState::kInterrupted);
+  EXPECT_EQ(local_planner.plan_count, 2);
+  EXPECT_EQ(controlled_execution.execute_count, 0);
+  auto latch = local_kernel.get_active_interrupt_latch();
+  ASSERT_TRUE(latch.has_value());
+  EXPECT_EQ(latch->source_id, "replan_fault");
+  EXPECT_EQ(latch->execution_phase_at_latch, InterruptExecutionPhase::kPlanning);
+  auto outcome = local_kernel.get_execution_outcome(result.value());
+  ASSERT_TRUE(outcome.has_value());
+  EXPECT_EQ(outcome->terminal_cause,
+            MotionExecutionTerminalCause::kInterruptedFault);
+}
+
+TEST_F(ExecutionKernelTest,
+       Execute_AuthoritativeValidationNonOkCollisionDoesNotReplan) {
+  ControlledExecution controlled_execution;
+  ThreadSafeFakeClock local_clock;
+  ThreadSafeManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  ExecutionKernelConfig config;
+  config.authoritative_validation_collision_replan_attempts = 2;
+  MockPlanner local_planner;
+  PlanResultDTO plan;
+  plan.trajectory = make_test_trajectory_from({0.0, 0.0}, {1.0, 1.0});
+  local_planner.result_sequence = {plan, plan, plan};
+  MockContext local_context = context;
+  ExecutionKernel local_kernel{local_planner,
+                               local_context,
+                               controlled_execution,
+                               local_clock,
+                               local_scheduler,
+                               local_cache,
+                               config};
+  MockCollisionWorldPublisher local_publisher;
+  auto local_engine = std::make_shared<MockCollisionEngine>();
+  configure_authoritative_collision_validation(local_kernel, local_publisher,
+                                                local_engine);
+  auto non_ok_collision = make_authoritative_collision_result();
+  non_ok_collision.engine_status = CollisionEngineStatus::kTimeout;
+  local_engine->default_result = non_ok_collision;
+
+  auto result = local_kernel.execute(make_test_request("replan_non_ok"));
+  ASSERT_TRUE(result.ok());
+  ASSERT_TRUE(local_kernel.wait_for_completion(1'000'000'000));
+
+  EXPECT_EQ(local_kernel.get_status().state, ExecutionState::kFailed);
+  EXPECT_EQ(local_planner.plan_count, 1);
+  EXPECT_EQ(controlled_execution.execute_count, 0);
+  auto snapshot = local_kernel.get_execution_snapshot();
+  ASSERT_TRUE(snapshot.error.has_value());
+  EXPECT_EQ(snapshot.error->details.at("collision_result_engine_status"),
+            "timeout");
+}
+
 // --- Execute requires bound acknowledgement from terminal success ---
 
 TEST_F(ExecutionKernelTest, Execute_FromCompleted_RequiresAcknowledgement) {
@@ -2916,6 +3237,84 @@ TEST_F(ExecutionKernelTest,
                            e.details.at("contact_b") ==
                                "robot/robot1/link/link1/collision/0";
                   }));
+}
+
+TEST_F(ExecutionKernelTest,
+       CollisionMonitoring_ExpandsObservedStateBeforeEngineQuery) {
+  ControlledExecution controlled_execution;
+  ThreadSafeFakeClock local_clock;
+  ThreadSafeManualScheduler local_scheduler;
+  TrajectoryCache local_cache{CacheConfig{10}};
+  ExecutionKernelConfig config;
+  config.collision_monitor_period_ns = 10'000'000;
+  config.runtime_collision_query_timeout_ns = 10'000'000;
+  MockCollisionWorldPublisher local_collision_world;
+  auto local_collision_engine = std::make_shared<MockCollisionEngine>();
+  ExecutionKernel controlled_kernel{planner,
+                                    context,
+                                    controlled_execution,
+                                    local_clock,
+                                    local_scheduler,
+                                    local_cache,
+                                    config};
+  configure_authoritative_collision_validation(
+      controlled_kernel, local_collision_world, local_collision_engine);
+
+  context.current_state.joint_names = {"j1", "j2"};
+  context.current_state.positions_rad = {0.0, 0.0};
+  controlled_execution.snapshot.timestamp_ns = local_clock.now();
+
+  TrajectoryDTO expanded;
+  expanded.joint_names = {"j1", "j2", "gripper_master"};
+  expanded.waypoints.push_back(TrajectoryWaypointDTO{
+      0.0,
+      {0.0, 0.0, 0.0081},
+      {},
+      {}});
+  context.next_expand_result = Result<TrajectoryDTO>::Ok(expanded);
+
+  std::vector<std::string> queried_joint_names;
+  std::vector<double> queried_positions;
+  local_collision_engine->on_check = [&](const CollisionQuery& query) {
+    queried_joint_names = query.robot_state.joint_names;
+    queried_positions = query.robot_state.positions_rad;
+  };
+
+  auto result = controlled_kernel.execute(make_test_request());
+  ASSERT_TRUE(result.ok());
+  ASSERT_TRUE(controlled_execution.wait_until_execute_called())
+      << "wait_until_execute_called timed out";
+  ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kExecuting));
+  auto live_snapshot = make_test_collision_world_snapshot();
+  live_snapshot.revision = CollisionWorldRevision{100, "expanded-runtime-state"};
+  local_collision_world.current_snapshot =
+      std::make_shared<const CollisionWorldSnapshot>(std::move(live_snapshot));
+
+  local_clock.advance(10'000'000);
+  local_scheduler.advance_to(local_clock.now());
+  for (int attempt = 0;
+       attempt < 100 && local_collision_engine->check_count.load() == 0;
+       ++attempt) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    local_scheduler.advance_to(local_clock.now());
+  }
+
+  controlled_execution.release();
+  EXPECT_TRUE(controlled_kernel.wait_for_completion(1'000'000'000));
+
+  EXPECT_GE(context.expand_count, 1);
+  ASSERT_EQ(context.last_expand_trajectory.joint_names,
+            (std::vector<std::string>{"j1", "j2"}));
+  ASSERT_EQ(context.last_expand_trajectory.waypoints.size(), 1u);
+  EXPECT_EQ(context.last_expand_trajectory.waypoints.front().positions_rad,
+            (std::vector<double>{0.0, 0.0}));
+  EXPECT_EQ(queried_joint_names,
+            (std::vector<std::string>{"j1", "j2", "gripper_master"}));
+  ASSERT_EQ(queried_positions.size(), 3u);
+  EXPECT_DOUBLE_EQ(queried_positions[0], 0.0);
+  EXPECT_DOUBLE_EQ(queried_positions[1], 0.0);
+  EXPECT_DOUBLE_EQ(queried_positions[2], 0.0081);
+  EXPECT_EQ(controlled_kernel.get_status().state, ExecutionState::kCompleted);
 }
 
 // When the deployment configures `default_fault_stop_profile`,

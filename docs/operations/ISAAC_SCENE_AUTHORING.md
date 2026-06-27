@@ -65,6 +65,12 @@ collider mesh, cooked convex collider, primitive collider — and the
 - `primitive` — force AABB/primitive recommendations and skip mesh
   transfer entirely.
 
+If a collision body falls back to a conservative AABB proxy because mesh-like
+geometry cannot be preserved or loaded, treat it as degraded collision geometry:
+diagnostics should carry `conservative_proxy` and
+`warning_conservative_aabb_proxy`, and you should inspect the collision overlay
+before tuning poses around a reported contact.
+
 For the current Isaac demo scenes we use `collider` per-object and
 accept the fidelity trade-off. The decision is the operator's; the
 file-naming convention in step 4 reflects what you pick (`*_collider.obj`

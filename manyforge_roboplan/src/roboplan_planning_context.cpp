@@ -348,6 +348,7 @@ core::CollisionGeometryDescriptor descriptor_from_coal_geometry(
     descriptor.box_dimensions_m = vector3_from_eigen(size);
     add_common_quality_label(descriptor, "primitive");
     add_common_quality_label(descriptor, "conservative_proxy");
+    add_common_quality_label(descriptor, "warning_conservative_aabb_proxy");
     add_common_quality_label(descriptor, source_label);
     return true;
   };
@@ -396,6 +397,22 @@ core::CollisionGeometryDescriptor descriptor_from_coal_geometry(
     return apply_points_proxy(convex->points,
                               static_cast<std::size_t>(convex->num_points),
                               "backend_vertex_aabb_proxy");
+  };
+
+  auto apply_mesh_resource = [&]() -> bool {
+    if (geometry_object.meshPath.empty()) {
+      return false;
+    }
+    if (!(geometry_object.meshScale.array().isFinite()).all() ||
+        !(geometry_object.meshScale.array() > 0.0).all()) {
+      return false;
+    }
+    descriptor.geometry_kind = core::CollisionGeometryKind::kTriangleMesh;
+    descriptor.source_uri = geometry_object.meshPath;
+    descriptor.mesh_scale = vector3_from_eigen(geometry_object.meshScale);
+    add_common_quality_label(descriptor, "mesh");
+    add_common_quality_label(descriptor, "backend_mesh");
+    return true;
   };
 
   switch (geometry->getNodeType()) {
@@ -454,7 +471,8 @@ core::CollisionGeometryDescriptor descriptor_from_coal_geometry(
       break;
     }
     case coal::GEOM_CONVEX:
-      if (apply_convex_points_proxy() || apply_backend_aabb_proxy()) {
+      if (apply_mesh_resource() || apply_convex_points_proxy() ||
+          apply_backend_aabb_proxy()) {
         return descriptor;
       }
       descriptor.geometry_kind = core::CollisionGeometryKind::kConvexMesh;
@@ -462,6 +480,10 @@ core::CollisionGeometryDescriptor descriptor_from_coal_geometry(
       return descriptor;
     default:
       break;
+  }
+
+  if (apply_mesh_resource()) {
+    return descriptor;
   }
 
   // Industrial manyforge_collision workers must not rely on backend mesh BVH
@@ -1352,6 +1374,133 @@ core::ValidationResultDTO RoboPlanPlanningContext::validate_trajectory(
   }
 
   return result;
+}
+
+core::Result<core::TrajectoryDTO>
+RoboPlanPlanningContext::expand_trajectory_for_collision_validation(
+    const core::TrajectoryDTO& trajectory) {
+  if (trajectory.waypoints.empty()) {
+    return core::Result<core::TrajectoryDTO>::Ok(trajectory);
+  }
+
+  try {
+    std::lock_guard<std::mutex> scene_lock(*scene_mutex_);
+    const auto current_q = scene_->getCurrentJointPositions();
+    const auto full_q_size = static_cast<std::size_t>(current_q.size());
+    if (full_q_size == 0) {
+      return core::Result<core::TrajectoryDTO>::Ok(trajectory);
+    }
+
+    bool positions_already_full = true;
+    for (const auto& waypoint : trajectory.waypoints) {
+      if (waypoint.positions_rad.size() != full_q_size) {
+        positions_already_full = false;
+        break;
+      }
+    }
+
+    const auto& model = scene_->getModel();
+    std::vector<std::string> full_joint_names(full_q_size);
+    for (pinocchio::JointIndex joint_id = 1;
+         joint_id < static_cast<pinocchio::JointIndex>(model.names.size());
+         ++joint_id) {
+      if (joint_id >= static_cast<pinocchio::JointIndex>(model.nqs.size()) ||
+          joint_id >= static_cast<pinocchio::JointIndex>(model.idx_qs.size()) ||
+          model.nqs[joint_id] != 1) {
+        continue;
+      }
+      const auto q_index = model.idx_qs[joint_id];
+      if (q_index >= 0 && static_cast<std::size_t>(q_index) < full_q_size) {
+        full_joint_names[static_cast<std::size_t>(q_index)] =
+            model.names[static_cast<std::size_t>(joint_id)];
+      }
+    }
+    for (std::size_t i = 0; i < full_joint_names.size(); ++i) {
+      if (full_joint_names[i].empty()) {
+        full_joint_names[i] = "q[" + std::to_string(i) + "]";
+      }
+    }
+
+    if (positions_already_full) {
+      auto expanded = trajectory;
+      expanded.joint_names = std::move(full_joint_names);
+      return core::Result<core::TrajectoryDTO>::Ok(std::move(expanded));
+    }
+
+    const auto maybe_group_info = scene_->getJointGroupInfo(group_name_);
+    if (!maybe_group_info) {
+      return core::Result<core::TrajectoryDTO>::Err(core::ErrorDTO{
+          core::kErrorValidationCollision,
+          "Failed to expand trajectory for collision validation",
+          {{"reason", "active_group_unavailable"},
+           {"group", group_name_},
+           {"detail", maybe_group_info.error()}}});
+    }
+    const auto& group_info = *maybe_group_info;
+    if (group_info.joint_names.size() !=
+        static_cast<std::size_t>(group_info.q_indices.size())) {
+      return core::Result<core::TrajectoryDTO>::Err(core::ErrorDTO{
+          core::kErrorValidationCollision,
+          "Failed to expand trajectory for collision validation",
+          {{"reason", "active_group_contains_mimic_or_fixed_entries"},
+           {"group", group_name_}}});
+    }
+
+    std::map<std::string, Eigen::Index> q_index_by_joint;
+    for (std::size_t i = 0; i < group_info.joint_names.size(); ++i) {
+      const auto q_index = group_info.q_indices[static_cast<Eigen::Index>(i)];
+      if (q_index < 0 || q_index >= current_q.size()) {
+        return core::Result<core::TrajectoryDTO>::Err(core::ErrorDTO{
+            core::kErrorValidationCollision,
+            "Failed to expand trajectory for collision validation",
+            {{"reason", "active_group_q_index_out_of_range"},
+             {"group", group_name_},
+             {"joint", group_info.joint_names[i]}}});
+      }
+      q_index_by_joint[group_info.joint_names[i]] = q_index;
+    }
+
+    core::TrajectoryDTO expanded;
+    expanded.joint_names = std::move(full_joint_names);
+    expanded.waypoints.reserve(trajectory.waypoints.size());
+    for (const auto& waypoint : trajectory.waypoints) {
+      if (waypoint.positions_rad.size() != trajectory.joint_names.size()) {
+        return core::Result<core::TrajectoryDTO>::Err(core::ErrorDTO{
+            core::kErrorValidationCollision,
+            "Failed to expand trajectory for collision validation",
+            {{"reason", "waypoint_position_count_mismatch"},
+             {"joint_count", std::to_string(trajectory.joint_names.size())},
+             {"position_count",
+              std::to_string(waypoint.positions_rad.size())}}});
+      }
+
+      auto expanded_waypoint = waypoint;
+      expanded_waypoint.positions_rad.resize(full_q_size);
+      for (std::size_t i = 0; i < full_q_size; ++i) {
+        expanded_waypoint.positions_rad[i] = current_q[static_cast<Eigen::Index>(i)];
+      }
+      for (std::size_t i = 0; i < trajectory.joint_names.size(); ++i) {
+        const auto index_it = q_index_by_joint.find(trajectory.joint_names[i]);
+        if (index_it == q_index_by_joint.end()) {
+          return core::Result<core::TrajectoryDTO>::Err(core::ErrorDTO{
+              core::kErrorValidationCollision,
+              "Failed to expand trajectory for collision validation",
+              {{"reason", "trajectory_joint_not_in_active_group"},
+               {"group", group_name_},
+               {"joint", trajectory.joint_names[i]}}});
+        }
+        expanded_waypoint.positions_rad[static_cast<std::size_t>(index_it->second)] =
+            waypoint.positions_rad[i];
+      }
+      expanded.waypoints.push_back(std::move(expanded_waypoint));
+    }
+    return core::Result<core::TrajectoryDTO>::Ok(std::move(expanded));
+  } catch (const std::exception& e) {
+    return core::Result<core::TrajectoryDTO>::Err(core::ErrorDTO{
+        core::kErrorValidationCollision,
+        "Failed to expand trajectory for collision validation",
+        {{"reason", "exception"}, {"exception", e.what()}}});
+  }
 }
 
 core::CollisionCheckResultDTO RoboPlanPlanningContext::collision_check(
