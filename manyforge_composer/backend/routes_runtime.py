@@ -8,6 +8,8 @@ Composer-only, Isaac commanded simulation, or a real ROS-controlled robot.
 """
 from __future__ import annotations
 
+import json
+import os
 import time
 from typing import Any
 
@@ -37,6 +39,100 @@ def _component(
         "requiredFor": list(required_for or []),
         "detail": detail,
     }
+
+
+# Out-of-band model-serving watcher (serving/vllm-status-watch.sh) writes this
+# file so the Composer — the reference interface — can distinguish a still-
+# loading model container from a crashed one (the HTTP probe alone cannot).
+_VLLM_STATUS_FILE = os.environ.get(
+    "MANYFORGE_VLLM_STATUS_FILE", "/tmp/manyforge-assistant-e2e/vllm-status.json"
+)
+# Past this multiple of the watcher's own poll interval (with a floor) the file
+# is treated as stale — the watcher is probably dead, so fail closed to
+# "waiting" rather than trust a frozen "running".
+_VLLM_STATUS_STALE_MULTIPLE = 3
+_VLLM_STATUS_STALE_FLOOR_MS = 10_000.0
+
+
+def _model_serving_component() -> tuple[dict[str, Any] | None, bool]:
+    """Build the model-serving component from the watcher status file.
+
+    Returns ``(component_or_None, is_fault)``. Fail-closed: any uncertainty
+    (missing/corrupt/stale file) maps to ``waiting`` — never a false ``ready``
+    or a false ``fault``. A missing file means no model launch was observed
+    (e.g. composer-only), so the component is omitted entirely.
+    """
+    try:
+        with open(_VLLM_STATUS_FILE, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        return None, False
+    except (OSError, ValueError):
+        return (
+            _component(
+                "model_serving", "Model serving", "serving", "waiting",
+                detail="Serving status file unreadable; crash monitor may be degraded.",
+            ),
+            False,
+        )
+
+    state_val = str(data.get("state", "") or "unknown")
+    reason = str(data.get("reason", "") or "")
+    exit_code = data.get("exitCode")
+    updated_at = data.get("updatedAt")
+    poll_ms = data.get("pollIntervalMs") or 2000
+
+    # "absent" = watcher is up but no serving container has ever appeared
+    # (composer-only): omit the component rather than show perpetual "waiting".
+    if state_val == "absent":
+        return None, False
+
+    try:
+        now_ms = time.time() * 1000.0
+        stale_after = max(_VLLM_STATUS_STALE_MULTIPLE * float(poll_ms), _VLLM_STATUS_STALE_FLOOR_MS)
+        if updated_at is None or (now_ms - float(updated_at)) > stale_after:
+            return (
+                _component(
+                    "model_serving", "Model serving", "serving", "waiting",
+                    detail=f"Serving status stale (watcher not reporting); last state '{state_val}'.",
+                ),
+                False,
+            )
+    except (TypeError, ValueError):
+        pass
+
+    if state_val == "failed":
+        suffix = f" (exit {exit_code})" if exit_code not in (None, "null", -1) else ""
+        return (
+            _component(
+                "model_serving", "Model serving", "serving", "fault",
+                detail=f"Model container crashed: {reason or 'unknown cause'}{suffix}.",
+            ),
+            True,
+        )
+    if state_val == "running":
+        return (
+            _component(
+                "model_serving", "Model serving", "serving", "healthy",
+                detail="Model container running.",
+            ),
+            False,
+        )
+    if state_val == "stopped":
+        return (
+            _component(
+                "model_serving", "Model serving", "serving", "disabled",
+                detail=reason or "Model container stopped.",
+            ),
+            False,
+        )
+    return (
+        _component(
+            "model_serving", "Model serving", "serving", "waiting",
+            detail=reason or f"Model container {state_val}.",
+        ),
+        False,
+    )
 
 
 def _execution_profile(state: ComposerState) -> tuple[str, str, str, dict[str, Any]]:
@@ -183,6 +279,13 @@ def build_runtime_status_payload(state: ComposerState) -> dict[str, Any]:
         ),
     ]
 
+    serving_component, serving_fault = _model_serving_component()
+    serving_fault_detail = ""
+    if serving_component is not None:
+        components.append(serving_component)
+        if serving_fault:
+            serving_fault_detail = str(serving_component.get("detail", ""))
+
     stop_cap = state.stop_capability_status
     stop_modes_unsupported = list(stop_cap.get("unsupported") or [])
     supported_stop_modes = stop_cap.get("supported_stop_modes")
@@ -301,14 +404,17 @@ def build_runtime_status_payload(state: ComposerState) -> dict[str, Any]:
         readiness = "fault"
         summary_label = "Fault"
         user_message = "Operator intervention is required before execution can continue."
-    elif kernel_fault or external_fault:
+    elif kernel_fault or external_fault or serving_fault:
         readiness = "fault"
         summary_label = "Fault"
-        user_message = (
-            f"Kernel reported unknown status '{kernel_status}'."
-            if not kernel_status_known
-            else external_user_message or "A runtime component reported a fault."
-        )
+        if serving_fault and not (kernel_fault or external_fault):
+            user_message = serving_fault_detail or "The model-serving container has crashed."
+        else:
+            user_message = (
+                f"Kernel reported unknown status '{kernel_status}'."
+                if not kernel_status_known
+                else external_user_message or "A runtime component reported a fault."
+            )
     elif stop_capability_unsupported:
         readiness = "degraded"
         summary_label = "Degraded"

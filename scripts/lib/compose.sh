@@ -72,8 +72,41 @@ compose_services_for_lane() {
 
 stop_known_conflicts() {
     # Remove stale demo containers across all lanes. Idempotent.
+    stop_vllm_status_watcher
     docker rm -f manyforge-e2e-composer >/dev/null 2>&1 || true
     docker rm -f manyforge-e2e-vllm >/dev/null 2>&1 || true
+}
+
+# vLLM status watcher — out-of-band crash monitor (lib/vllm-status-watch.sh).
+# Host-side sidecar, lifecycle-tied to the Composer (the reference interface) and
+# decoupled from the launcher (it observes the container by name, so it survives
+# a launcher swap). Writes a status file the Composer backend reads to tell
+# "loading" from "crashed". Idempotent: the watcher's own pidfile no-ops repeats.
+start_vllm_status_watcher() {
+    local watcher; watcher="$(dirname "${BASH_SOURCE[0]}")/vllm-status-watch.sh"
+    local container="${VLLM_CONTAINER:-manyforge-e2e-vllm}"
+    local status_dir="${MANYFORGE_VLLM_STATUS_DIR:-/tmp/manyforge-assistant-e2e}"
+    if [[ ! -x "${watcher}" ]]; then
+        info "vLLM status watcher missing at ${watcher}; crash monitor disabled"
+        return 0
+    fi
+    mkdir -p "${status_dir}" 2>/dev/null || true
+    nohup "${watcher}" "${container}" "${status_dir}/vllm-status.json" "${status_dir}/vllm-intended-stop" \
+        >"${status_dir}/vllm-status-watch.log" 2>&1 &
+    disown 2>/dev/null || true
+    info "vLLM crash monitor watching ${container} -> ${status_dir}/vllm-status.json"
+}
+
+stop_vllm_status_watcher() {
+    local status_dir="${MANYFORGE_VLLM_STATUS_DIR:-/tmp/manyforge-assistant-e2e}"
+    local pidfile="${status_dir}/vllm-status-watch.pid"
+    if [[ -f "${pidfile}" ]]; then
+        local pid; pid="$(cat "${pidfile}" 2>/dev/null || true)"
+        if [[ "${pid}" =~ ^[0-9]+$ ]] && kill -0 "${pid}" 2>/dev/null; then
+            kill "${pid}" 2>/dev/null || true
+        fi
+    fi
+    rm -f "${status_dir}/vllm-status.json" 2>/dev/null || true
 }
 
 # start_composer_dev_container — for the manyforge-only lane.
@@ -93,6 +126,7 @@ stop_known_conflicts() {
 start_composer_dev_container() {
     local container_name="${COMPOSER_CONTAINER:-manyforge-e2e-composer}"
     local composer_port="${COMPOSER_PORT:-9000}"
+    start_vllm_status_watcher  # idempotent; covers both reuse and fresh-start paths
     if container_running "${container_name}"; then
         info "Reusing existing ${container_name}"
         return 0
@@ -117,12 +151,15 @@ start_composer_dev_container() {
     if [[ -n "${MANYFORGE_FRONTEND_FORCE_REBUILD:-}" ]]; then
         assistant_env+=(-e "MANYFORGE_FRONTEND_FORCE_REBUILD=${MANYFORGE_FRONTEND_FORCE_REBUILD}")
     fi
+    local vllm_status_dir="${MANYFORGE_VLLM_STATUS_DIR:-/tmp/manyforge-assistant-e2e}"
+    mkdir -p "${vllm_status_dir}" 2>/dev/null || true
     info "Starting ${container_name} (detached dev container) on Composer ${composer_port}; native viewer is default"
     docker run -d --rm \
         --name "${container_name}" \
         --network host \
         -v "${MANYFORGE_ROOT:?MANYFORGE_ROOT not set}:/workspace" \
         -v manyforge_build-cache:/tmp/manyforge-build \
+        -v "${vllm_status_dir}:/tmp/manyforge-assistant-e2e:ro" \
         -w /workspace \
         -e MANYFORGE_COMPOSER_PORT="${composer_port}" \
         -e CTEST_TEST_TIMEOUT_S="${CTEST_TEST_TIMEOUT_S:-60}" \
@@ -153,5 +190,6 @@ start_composer_dev_container() {
 
 stop_composer_dev_container() {
     local container_name="${COMPOSER_CONTAINER:-manyforge-e2e-composer}"
+    stop_vllm_status_watcher
     docker rm -f "${container_name}" >/dev/null 2>&1 || true
 }
